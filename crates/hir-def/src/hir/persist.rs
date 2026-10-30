@@ -1,4 +1,4 @@
-//! How HIR values are written into a [`blaze_format`] buffer (docs/v2/format.md section 5),
+//! How HIR values are written into a [`blaze_format`] buffer (docs/v2/plan/lanes/format.md section 5),
 //! for the results the database keeps on disk once they are cold: item trees, expression
 //! stores, bodies and their source maps.
 //!

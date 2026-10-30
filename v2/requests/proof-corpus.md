@@ -39,7 +39,7 @@
 
 ## 5. One check request for a whole workspace that keeps going and reports per package
 
-- **Where:** the v2 check request in the agent API (`crates/blaze-api`, docs/v2/ci.md) and the
+- **Where:** the v2 check request in the agent API (`crates/blaze-api`, docs/v2/plan/lanes/ci.md) and the
   `blaze check` client.
 - **What:** `blaze check --workspace --keep-going --message-format=json` (or the request behind
   it) checks every member even after one fails, and says for each member whether it was

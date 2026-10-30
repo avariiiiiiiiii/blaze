@@ -84,8 +84,9 @@ where
         };
 
         if *completed_query.revisions.verified_final.get_mut() {
-            completed_query.revisions.fingerprint =
-                C::fingerprint(&new_value).unwrap_or(Fingerprint::NONE);
+            completed_query
+                .revisions
+                .set_value_fingerprint(C::fingerprint(&new_value).unwrap_or(Fingerprint::NONE));
         }
 
         if let Some(old_memo) = opt_old_memo {
@@ -1010,10 +1011,12 @@ fn flattened_edge_fingerprints(
                 .as_function()?
                 .memo(zalsa, input.key_index())?;
             let header = memo.header();
-            let fingerprint = header.revisions.fingerprint;
+            let fingerprint = header.revisions.value_fingerprint();
             (fingerprint.is_value() && !header.may_be_provisional()).then(|| EdgeFingerprint {
                 edge: u32::try_from(position)
-                    .expect("exceeded more than `u32::MAX` query edges; this should never happen"),
+                    .ok()
+                    .filter(|&edge| edge != EdgeFingerprint::VALUE)
+                    .expect("exceeded `u32::MAX - 1` query edges; this should never happen"),
                 fingerprint,
             })
         })

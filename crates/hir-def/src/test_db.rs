@@ -142,6 +142,24 @@ impl SourceDatabase for TestDB {
         Box::new(self.clone())
     }
 
+    fn set_appended_root_module(
+        &mut self,
+        file_id: base_db::FileId,
+        module: Option<&'static str>,
+        durability: Durability,
+    ) {
+        let files = Arc::clone(&self.files);
+        files.set_appended_root_module(self, file_id, module, durability);
+    }
+
+    fn set_view_root(
+        &mut self,
+        view: base_db::ViewRoot<'_>,
+    ) -> Result<base_db::ViewChange, base_db::ViewError> {
+        let files = Arc::clone(&self.files);
+        files.set_view_root(self, view)
+    }
+
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
         (self.nonce, salsa::plumbing::ZalsaDatabase::zalsa(self).current_revision())
     }

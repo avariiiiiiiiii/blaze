@@ -48,10 +48,8 @@ pub(crate) enum SymKey {
     Fde(InstanceKey),
     /// A function's Windows `UNWIND_INFO` and its language-specific data.
     WinInfo(InstanceKey),
-    /// A native object's call frame record: the byte it starts at in its `.eh_frame`.
+    /// A native object's call frame record: its section, and the byte it starts at in it.
     Frame(Obj, u32, u32),
-    /// The call frame records an incremental link adds, at one generation.
-    FrameGroup(u64),
     /// A GOT cell of a symbol, of a kind.
     Got(GotKind, Box<SymKey>),
     /// A PLT stub of an import.

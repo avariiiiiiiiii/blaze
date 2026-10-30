@@ -1,4 +1,4 @@
-//! Proc-macro servers blaze keeps warm (docs/v2/usercode.md section 6.5, #804, #805): each
+//! Proc-macro servers blaze keeps warm (docs/v2/plan/lanes/usercode.md section 6.5, #804, #805): each
 //! started once, in a sandbox that traces what it reads, by the daemon's pool
 //! ([`blaze_usercode::pool`]), and talked to over the Unix socket the pool listens on
 //! ([`Link`], [`Bridge`]).

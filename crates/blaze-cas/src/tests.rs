@@ -206,11 +206,11 @@ fn a_flipped_byte_of_a_value_is_never_served() {
     store.put(key(1), Kind::Query, vec![b'a'; 1000]).unwrap();
     store.put(key(2), Kind::Query, vec![b'b'; 1000]).unwrap();
     flush(&mut sim, &mut store);
+    let (loc, _) = store.tiers[0].delta[&key(2)];
     drop(store);
     let pack = name("store/pack-query-000000");
     let mut bytes = sim.contents(&pack);
-    let at = bytes.len() - 20;
-    bytes[at] ^= 1;
+    bytes[(loc.offset + RECORD_HEADER) as usize + 500] ^= 1;
     sim.change(&pack, &bytes);
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), vec![b'a'; 1000]);
@@ -470,10 +470,10 @@ fn index_tables_find_every_key_and_no_other() {
 fn a_head_round_trips_and_refuses_any_change() {
     let head = Head {
         generation: 7,
-        index: Some(IndexRef { slot: 1, len: 64 + 1024 * 64, hash: content_of(b"x"), count: 3 }),
+        index: Some(IndexRef { slot: 1, len: 64 + 1024 * 64, check: 0xdead_beef, count: 3 }),
         packs: vec![
             PackRef { kind: Kind::Code, number: 0, committed: 4096, indexed: 16 },
-            PackRef { kind: Kind::Run, number: 2, committed: 16, indexed: 16 },
+            PackRef { kind: Kind::Run, number: 2, committed: 3 * 4096, indexed: 4096 },
         ],
         dictionaries: vec![DictionaryRef { kind: Kind::Run, pack: 1, offset: 16 }],
         externals: vec![ExternalRef { content: content_of(b"y"), len: 9 }],
@@ -486,6 +486,9 @@ fn a_head_round_trips_and_refuses_any_change() {
         assert!(Head::decode(&changed).is_err(), "byte {at}");
     }
     assert!(Head::decode(&bytes[..bytes.len() - 1]).is_err());
+    let mut torn = head.clone();
+    torn.packs[0].committed = 4096 + 16;
+    assert!(Head::decode(&torn.encode()).is_err(), "a commit ends on a block");
 }
 
 #[test]
@@ -592,4 +595,128 @@ fn a_driver_may_hand_over_mappings_by_itself() {
     }
     assert!(store.ready(), "{:?}", store.broken());
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"mapped");
+}
+
+/// Every commit leaves each pack a whole number of blocks long, so every append can be written
+/// with `O_DIRECT`; the zeros that end a commit are read past at open and never anything else.
+#[test]
+fn every_commit_ends_each_pack_on_a_block() {
+    let mut sim = Sim::new(18, quiet());
+    let mut store = open(&mut sim, "store");
+    for round in 0..3u64 {
+        for n in 0..5 {
+            store.put(key(round * 10 + n), Kind::Code, noise(700 + n as usize * 300, n)).unwrap();
+        }
+        flush(&mut sim, &mut store);
+        for pack in &store.tiers[0].packs {
+            assert_eq!(pack.committed % disk::BLOCK, 0, "round {round}");
+            assert_eq!(sim.contents(&pack.file).len() as u64, pack.committed, "round {round}");
+        }
+    }
+    drop(store);
+    let store = open(&mut sim, "store");
+    for round in 0..3u64 {
+        for n in 0..5 {
+            let found = bytes_of(&store, &key(round * 10 + n)).unwrap();
+            assert_eq!(found, noise(700 + n as usize * 300, n));
+        }
+    }
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack() {
+    let mut sim = Sim::new(19, quiet());
+    let mut store = open(&mut sim, "store");
+    store.put(key(1), Kind::Code, vec![7; 100]).unwrap();
+    flush(&mut sim, &mut store);
+    drop(store);
+    let pack = name("store/pack-code-000000");
+    let mut bytes = sim.contents(&pack);
+    let last = bytes.len() - 1;
+    bytes[last] = 1;
+    sim.change(&pack, &bytes);
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    let broken = store.broken().expect("the zeros are checked");
+    assert_eq!(broken.file, pack);
+    assert!(broken.what.contains("zeros"), "{broken}");
+}
+
+#[test]
+fn an_index_that_does_not_match_its_crc_stops_the_store() {
+    let mut sim = Sim::new(20, quiet());
+    let mut store = open(&mut sim, "store");
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(n), Kind::Query, n.to_le_bytes().to_vec()).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    assert_eq!(store.tiers[0].head.index.unwrap().slot, 0);
+    drop(store);
+    let index = name("store/index-0");
+    let mut bytes = sim.contents(&index);
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0x10;
+    sim.change(&index, &bytes);
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    let broken = store.broken().expect("the index is checked at open");
+    assert_eq!(broken.file, index);
+    assert!(broken.what.contains("CRC-32C"), "{broken}");
+}
+
+#[test]
+fn a_long_cold_value_is_compressed_without_a_dictionary_over_a_long_window() {
+    let mut sim = Sim::new(21, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut long = Vec::new();
+    let mut n = 0;
+    while long.len() < cold::LONG_FROM + 1000 {
+        long.extend(run_output(n));
+        n += 1;
+    }
+    store.put(key(1), Kind::Debug, long.clone()).unwrap();
+    let (loc, _) = store.tiers[0].delta[&key(1)];
+    assert_eq!(loc.form, Form::Zstd);
+    assert!(loc.stored * 4 < loc.raw, "{} stored of {}", loc.stored, loc.raw);
+    let header = RecordHeader::decode(store.tiers[0].packs[0].bytes(loc.offset, RECORD_HEADER).unwrap());
+    assert_eq!(header.unwrap().dictionary, NO_DICTIONARY);
+    assert!(store.tiers[0].dictionaries.is_empty(), "a long value is not a sample");
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), long);
+    flush(&mut sim, &mut store);
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), long);
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn chunks_that_shrink_are_kept_in_lz4_and_the_rest_raw() {
+    let mut sim = Sim::new(22, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut text = Vec::new();
+    let mut n = 0;
+    while text.len() < 600 << 10 {
+        text.extend(run_output(n));
+        n += 1;
+    }
+    let mut both = text.clone();
+    both.extend(noise(600 << 10, 220));
+    store.put(key(1), Kind::Output, both.clone()).unwrap();
+    let forms: Vec<Form> = store.tiers[0]
+        .delta
+        .iter()
+        .filter(|(key, _)| **key != self::key(1))
+        .map(|(_, (loc, _))| loc.form)
+        .collect();
+    assert!(forms.contains(&Form::Lz4), "{forms:?}");
+    assert!(forms.contains(&Form::Raw), "{forms:?}");
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), both);
+    flush(&mut sim, &mut store);
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), both);
+    assert_eq!(store.verify(None), Vec::new());
 }

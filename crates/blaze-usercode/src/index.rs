@@ -1,4 +1,4 @@
-//! Finding a run's result in the store (docs/v2/usercode-notes.md, "Keys").
+//! Finding a run's result in the store (docs/v2/plan/lanes/usercode/notes.md, "Keys").
 //!
 //! A result is kept under [`RunKey::traced`]: the run's code, what it was given, and every
 //! input it read with its value then. To find one for a run about to happen, the store keeps
@@ -12,10 +12,7 @@
 //! The store never replaces a value, so the chain only grows, a slot at a time; two daemons
 //! that keep different shapes in one slot see the [`Mismatch`] and move to the next.
 
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-};
+use std::{ffi::OsString, path::PathBuf};
 
 use blaze_cas::{Corrupt, Key, Kind, Mismatch, Store, Ticket};
 use blaze_core::{Traced, Untraceable};
@@ -243,15 +240,6 @@ pub fn keep(
 pub fn untraceable(traced: &Traced) -> bool {
     !traced.untraceable.is_empty()
 }
-
-/// `path` made whole against `dir`, as a sandbox names what a process opened.
-pub fn whole(dir: &Path, path: &Path) -> PathBuf {
-    match path.is_absolute() {
-        true => path.to_owned(),
-        false => dir.join(path),
-    }
-}
-
 /// The content ID of a shape, for an explanation of a rerun.
 pub fn shape_id(shape: &Shape) -> ContentId {
     ContentId::of("blaze v2 shape id 1", &shape.encode())
@@ -259,6 +247,8 @@ pub fn shape_id(shape: &Shape) -> ContentId {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]

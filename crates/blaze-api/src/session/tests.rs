@@ -104,11 +104,16 @@ fn targets() -> Targets {
         features: Vec::new(),
         all_features: false,
         no_default_features: false,
+        cargo: None,
     }
 }
 
 fn head(name: &str) -> ViewRef {
     ViewRef::Head(name.to_owned())
+}
+
+fn root_of(root: ContentId) -> ViewRef {
+    ViewRef::Root(View { root })
 }
 
 fn to(conn: u64, id: u64) -> RequestRef {
@@ -131,6 +136,8 @@ fn diagnostic(level: Level) -> Response {
         spans: Vec::new(),
         children: Vec::new(),
         facts: Vec::new(),
+        rendered: "a diagnostic".to_owned(),
+        unit: None,
     })
 }
 
@@ -207,6 +214,30 @@ fn test_run_and_verify_start_their_work() {
             Work::Test { targets: targets(), filter, all: true },
             Work::Run { targets: targets(), bin: None, args: vec!["-v".to_owned()] },
             Work::Verify(targets()),
+        ]
+    );
+}
+
+#[test]
+fn the_proofs_requests_start_their_work_on_the_view() {
+    let mut world = World::new();
+    let root = world.commit(&[("src/lib.rs", "")]);
+    world.request(1, 1, Request::CodegenInputs { view: head("main"), targets: targets() });
+    world.request(1, 2, Request::Trace { view: head("main"), targets: targets() });
+    world.request(1, 3, Request::Tables { view: head("main") });
+    let started: Vec<(Option<View>, Work)> = world
+        .builder
+        .started
+        .iter()
+        .map(|(_, opened, work)| (opened.map(|opened| opened.view), work.clone()))
+        .collect();
+    let view = Some(View { root });
+    assert_eq!(
+        started,
+        [
+            (view, Work::CodegenInputs(targets())),
+            (view, Work::Trace(targets())),
+            (view, Work::Tables),
         ]
     );
 }
@@ -297,14 +328,38 @@ fn a_diff_lists_the_changes() {
 }
 
 #[test]
-fn why_of_a_query_that_did_not_rerun_names_it() {
+fn why_reads_the_last_build_of_the_root_and_names_a_query_that_did_not_rerun() {
     let mut world = World::new();
+    let root = world.commit(&[("src/lib.rs", "")]);
     let query = QueryKey { kind: QueryKind(0x2001), input: ContentId([1; 32]) };
     let replies = world.request(1, 1, Request::Why { view: head("main"), query });
+    assert_eq!(error_at(&replies), Some(format!("root {root:x}")));
+    assert_eq!(replies[1], done(1, 1, false));
+
+    world.request(1, 2, Request::Check { view: head("main"), targets: targets() });
+    world.finish(world.last_job(), true, None);
+    let replies = world.request(1, 3, Request::Why { view: head("main"), query });
     assert_eq!(error_at(&replies), Some(super::query_name(&query)));
     let Response::Error(error) = &replies[0].response else { panic!("{replies:?}") };
     assert!(error.what.contains("did not rerun in the last build of"), "{}", error.what);
-    assert_eq!(replies[1], done(1, 1, false));
+    assert_eq!(replies[1], done(1, 3, false));
+}
+
+#[test]
+fn a_reach_keeps_no_build_for_why() {
+    let mut world = World::new();
+    let from = world.commit(&[("src/lib.rs", "")]);
+    world.request(1, 1, Request::Check { view: head("main"), targets: targets() });
+    world.finish(world.last_job(), true, None);
+    let to = world.commit(&[("src/lib.rs", "fn f() {}")]);
+    let reach = Request::Reach { from: root_of(from), to: root_of(to), targets: targets() };
+    world.request(1, 2, reach);
+    world.finish(world.last_job(), true, None);
+    let query = QueryKey { kind: QueryKind(0x2001), input: ContentId([1; 32]) };
+    let replies = world.request(1, 3, Request::Why { view: root_of(from), query });
+    assert_eq!(error_at(&replies), Some(super::query_name(&query)));
+    let replies = world.request(1, 4, Request::Why { view: root_of(to), query });
+    assert_eq!(error_at(&replies), Some(format!("root {to:x}")));
 }
 
 #[test]

@@ -370,9 +370,13 @@ where
                         UNDERSCORE => make_ident!(),
                         k if k.is_literal() => {
                             // The compiler reads a source file with `\n` line endings.
-                            let text = token.to_text(conv).replace("\r\n", "\n");
+                            let text = token.to_text(conv);
                             let span = conv.span_for(abs_range);
-                            token_to_literal(&text, span).into()
+                            match text.contains('\r') {
+                                true => token_to_literal(&text.replace("\r\n", "\n"), span),
+                                false => token_to_literal(&text, span),
+                            }
+                            .into()
                         }
                         LIFETIME_IDENT => {
                             let apostrophe = tt::Leaf::from(tt::Punct {

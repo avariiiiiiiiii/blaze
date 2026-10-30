@@ -24,3 +24,40 @@
   then `run::elided(unit, stdout)` and `Ran::finish` as for any run.
 - Why: #804 (cold load spends its time reloading the sysroot per script) and #1296 (scripts
   that need no compile).
+
+## 2. Cargo's rule watches the package only when nothing was printed
+
+- What: `rule::of_directives` sets `package` whenever no `rerun-if-changed` was printed. Cargo
+  watches the whole package only when neither `rerun-if-changed` nor `rerun-if-env-changed`
+  was printed. A script that prints only `rerun-if-env-changed` (common:
+  `cargo:rerun-if-env-changed=FOO_NO_PKG_CONFIG`) watches its variables and no file. Today a
+  run like that which also read something untraceable reruns whenever any file of its package
+  changes, which cargo would not do. Use `blaze_build_script::watched(&output, package_dir)`,
+  which has the rule from cargo 1.99 with tests: `paths`, `whole_package`, `env`. Also,
+  `trace::package` already skips `target/` and hidden directories, but cargo's walk also
+  leaves out sub-packages (any directory below the root with a `Cargo.toml`), so an edit
+  there reruns the script today. `blaze_build_script::watch::skipped` has both cases.
+- Where: `crates/blaze-usercode/src/rule.rs` (`of_directives`) and `script.rs` (`cargo_rule`),
+  `trace::package`. Parent's paths.
+- Why: fewer reruns than now, never fewer than cargo's.
+
+## 3. Keep a probe's verdict, keyed by what it depends on
+
+- What: 196 of the 931 build scripts in the local registry probe the compiler (`autocfg`,
+  `version_check`, `rustversion`, `rustc_version`). `as_rustc` answers every probe with
+  `check::once` in a fresh `blaze` process started as `rustc`, which loads the toolchain's
+  std each time. The verdict depends only on the toolchain (pinned), the probe's source bytes,
+  its arguments (`--edition`, `--cfg`, `--target`, `-C` flags, `--crate-type`) and the files
+  it names. The same few probes (`autocfg`'s `probe_rustc_version`, `probe_type("i128")`,
+  `probe_path(...)`) recur in crate after crate. Proposed:
+  - Put the verdict and the files written in the store, under the hash of those inputs and
+    the toolchain's content ID. A repeat probe is then one store read and no std load.
+  - On a miss, ask the daemon over its socket, where std is already loaded, rather than
+    loading it in the probe's process.
+  - An input that the key can't cover (a probe that reads a file outside its arguments, or
+    links) keeps today's path. That is not a fallback, because the answer is the same; it is
+    just not kept.
+- Where: `crates/blaze-engine/src/as_rustc.rs` and the daemon's socket in
+  `crates/blaze-cargo/src/cargo/daemon.rs`. Coordinator's paths.
+- Why: the probe scripts are the largest group of scripts that can't be elided, and the
+  docs/v2/plan/goals/principles.md rule (everything is ours, for the best performance possible).

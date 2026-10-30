@@ -1,4 +1,4 @@
-//! Facts recorded where they are read (docs/v2/items.md section 6.2): each test runs a query,
+//! Facts recorded where they are read (docs/v2/plan/lanes/items.md section 6.2): each test runs a query,
 //! edits, runs it again and checks what reran. A query that reads a narrow fact reruns only
 //! when that fact changed; the narrow query itself reruns and comes out equal.
 

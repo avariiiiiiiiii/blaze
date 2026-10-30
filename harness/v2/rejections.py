@@ -1,4 +1,4 @@
-"""rejections.py: what rustc rejects, blaze has to reject with the same error codes (docs/v2/proof.md
+"""rejections.py: what rustc rejects, blaze has to reject with the same error codes (docs/v2/plan/lanes/proof.md
 section 11, "Rejections"; #1522, #1440).
 
     uv run --frozen python harness/v2/rejections.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/rejections.json", "rust": "/path/to/rust"}'

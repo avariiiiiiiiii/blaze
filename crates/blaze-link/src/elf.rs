@@ -38,8 +38,7 @@ pub(crate) const RELA_DYN: &str = ".rela.dyn";
 pub(crate) const DYNAMIC: &str = ".dynamic";
 pub(crate) const EH_FRAME_HDR: &str = ".eh_frame_hdr";
 
-/// The `Class::Named` sections the loader writes before the program starts, so relro.
-const DATA_REL_RO: &str = ".data.rel.ro";
+/// The `Class::Named` section the loader reads before the program starts, so relro.
 const PREINIT_ARRAY: &str = ".preinit_array";
 
 pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
@@ -72,12 +71,16 @@ impl Segment {
             Class::Synthetic(DYNAMIC) => Segment::Relro,
             Class::Synthetic(_) | Class::Rodata | Class::EhFrame => Segment::Read,
             Class::Text | Class::Patch | Class::Stubs | Class::Plt | Class::Veneers => Segment::Code,
-            Class::InitArray | Class::FiniArray | Class::Got => Segment::Relro,
-            Class::Table | Class::Data | Class::PatchData | Class::Tdata | Class::Tbss | Class::Bss => {
-                Segment::Write
-            }
+            Class::RelRo | Class::InitArray | Class::FiniArray | Class::Got => Segment::Relro,
+            Class::Table
+            | Class::Data
+            | Class::PatchData
+            | Class::ThreadVars
+            | Class::Tdata
+            | Class::Tbss
+            | Class::Bss => Segment::Write,
             Class::Named { name, write, exec } => match (name.as_str(), *write, *exec) {
-                (DATA_REL_RO | PREINIT_ARRAY, _, _) => Segment::Relro,
+                (PREINIT_ARRAY, _, _) => Segment::Relro,
                 (_, _, true) => Segment::Code,
                 (_, true, false) => Segment::Write,
                 (_, false, false) => Segment::Read,
@@ -136,7 +139,7 @@ fn order_key(class: &Class) -> (Segment, u32, &str) {
         (Segment::Code, Class::Veneers) => 5,
         (Segment::Code, _) => 1,
 
-        (Segment::Relro, Class::Named { name, .. }) if name == DATA_REL_RO => 0,
+        (Segment::Relro, Class::RelRo) => 0,
         (Segment::Relro, Class::Named { .. }) => 1,
         (Segment::Relro, Class::InitArray) => 2,
         (Segment::Relro, Class::FiniArray) => 3,
@@ -147,6 +150,7 @@ fn order_key(class: &Class) -> (Segment, u32, &str) {
         (Segment::Write, Class::Table) => 0,
         (Segment::Write, Class::Data) => 1,
         (Segment::Write, Class::PatchData) => 3,
+        (Segment::Write, Class::ThreadVars) => 4,
         (Segment::Write, Class::Tdata) => 4,
         (Segment::Write, Class::Tbss) => 5,
         (Segment::Write, Class::Bss) => 6,
@@ -193,8 +197,8 @@ pub(crate) fn section(name: &str, write: bool, exec: bool, tls: bool) -> Result<
         (Class::FiniArray, priority(".dtors", true))
     } else if under(PREINIT_ARRAY) {
         (Class::Named { name: PREINIT_ARRAY.into(), write: true, exec: false }, 0)
-    } else if under(DATA_REL_RO) {
-        (Class::Named { name: DATA_REL_RO.into(), write: true, exec: false }, 0)
+    } else if under(".data.rel.ro") {
+        (Class::RelRo, 0)
     } else if (under(".rodata") || under(".gcc_except_table")) && !write && !exec {
         (Class::Rodata, 0)
     } else if under(".data") && !exec {

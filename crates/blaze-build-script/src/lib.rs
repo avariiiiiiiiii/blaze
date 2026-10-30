@@ -9,7 +9,7 @@
 //! A script is any executable the caller places (`Unit::script`); nothing here assumes where
 //! or by what it was compiled.
 //!
-//! For blaze v2 (docs/v2/usercode.md): scripts that only print constant directives are read
+//! For blaze v2 (docs/v2/plan/lanes/usercode.md): scripts that only print constant directives are read
 //! rather than run ([`elide`](mod@elide), #1296); the environment says what cargo sets from the unit and
 //! what it passes through ([`Env::from_unit`], #805); and what cargo's rule watches of a run
 //! is data ([`watch`]), for a run keyed as cargo keys it (#1450).

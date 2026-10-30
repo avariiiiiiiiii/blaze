@@ -170,7 +170,7 @@ impl Prepare for Machine {
             unused: Vec::new(),
             attrs: Attrs::default(),
             body: Attrs::default(),
-            external: false,
+            external: true,
         };
         Ok((summary, prepared.body))
     }

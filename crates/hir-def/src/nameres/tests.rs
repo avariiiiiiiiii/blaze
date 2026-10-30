@@ -856,7 +856,7 @@ pub fn f() {}
 /// `#![cfg(target_arch = "wasm32")]` still has the harness's `main` (astral-experiments/blaze#35).
 #[test]
 fn cfg_the_entire_crate_keeps_the_appended_module() {
-    use base_db::{SourceDatabase as _, salsa::Setter as _};
+    use base_db::{SourceDatabase as _, salsa::Durability};
     let mut db = TestDB::with_files(
         r#"
 //- /main.rs
@@ -875,7 +875,7 @@ mod __blaze_test_harness {
         crate
     "#]]
     .assert_eq(&crate_def_map(&db, krate).dump(&db));
-    db.file_text(root).set_appended_root_module(&mut db).to(Some("__blaze_test_harness"));
+    db.set_appended_root_module(root, Some("__blaze_test_harness"), Durability::LOW);
     expect![[r#"
         crate
         - __blaze_test_harness : type
@@ -884,7 +884,7 @@ mod __blaze_test_harness {
         - main : value
     "#]]
     .assert_eq(&crate_def_map(&db, krate).dump(&db));
-    db.file_text(root).set_appended_root_module(&mut db).to(None);
+    db.set_appended_root_module(root, None, Durability::LOW);
     expect![[r#"
         crate
     "#]]

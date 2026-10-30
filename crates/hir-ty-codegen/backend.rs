@@ -108,6 +108,11 @@ pub(super) fn whole_program() -> bool {
     WHOLE_PROGRAM.load(Ordering::Relaxed)
 }
 
+/// Whether compiles go to LLVM above `-O0`, where rustc generates code from MIR of its level 2.
+pub(super) fn above_o0() -> bool {
+    matches!(Backend::from_env(), Ok(Backend::Llvm(it)) if it.passes != Passes::None)
+}
+
 /// Whether compiles go to LLVM at `-O2` or above.
 pub(super) fn optimizing() -> bool {
     matches!(

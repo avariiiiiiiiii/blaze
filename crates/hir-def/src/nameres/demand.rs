@@ -273,6 +273,7 @@ const ROOT_WORDS: &[&str] = &[
     "panic_handler",
     "lang",
     "global_allocator",
+    "alloc_error_handler",
     "GlobalAlloc",
 ];
 

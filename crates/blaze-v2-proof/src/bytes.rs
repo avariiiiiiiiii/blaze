@@ -1,4 +1,4 @@
-//! Byte comparison for the oracle (docs/v2/plan/hardware.md): where two outputs first
+//! Byte comparison for the oracle (docs/v2/plan/design/hardware.md): where two outputs first
 //! differ, 64 bytes at a time with AVX-512BW, 32 with AVX2, 16 with NEON. The path is chosen
 //! at run time by CPU feature; every path gives the same answer as [`Simd::Scalar`], so the
 //! choice is dispatch, never a different result.

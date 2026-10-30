@@ -74,13 +74,22 @@ pub type Expand = fn(kind: SyntaxKind, text: &str, data: u32) -> FlatTree;
 pub struct FlatTree {
     source: Arc<str>,
     words: Box<[u32]>,
-    /// The parent's number, [`NO_PARENT`] for the root.
-    parents: Box<[u32]>,
+    /// Bit `at % 64` of word `at / 64`: whether element `at` is a node (not a token or a lazy
+    /// node, whose parents are in their words).
+    nodes: Box<[u64]>,
+    /// How many nodes are before each word of `nodes`.
+    ranks: Box<[u32]>,
+    /// Each node's parent, by the node's rank among the nodes; [`NO_PARENT`] for the root.
+    node_parents: Box<[u32]>,
+    /// The parents of the tokens and lazy nodes [`FAR`] or more elements back, by element.
+    far: Box<[(u32, u32)]>,
+    /// The kinds of [`FAR_KIND`] or more, by element.
+    kinds: Box<[(u32, u16)]>,
+    /// The lengths of [`LONG`] or more and the sizes of [`HUGE`] or more, by element.
+    big: Box<[(u32, u32)]>,
     /// The start of every [`MARK`]th element, and of the end when the elements are a multiple
     /// of it: `len / MARK + 1` of them.
     marks: Box<[u32]>,
-    /// The lengths and sizes that do not fit a word, by element.
-    big: Box<[(u32, u32)]>,
     lazy: Option<Box<Lazy>>,
 }
 
@@ -109,6 +118,7 @@ impl PartialEq for FlatTree {
     fn eq(&self, other: &FlatTree) -> bool {
         self.words == other.words
             && self.big == other.big
+            && self.kinds == other.kinds
             && self.marks.first() == other.marks.first()
             && self.lazy.as_ref().map(|it| it.data) == other.lazy.as_ref().map(|it| it.data)
             && (Arc::ptr_eq(&self.source, &other.source) || self.source == other.source)
@@ -122,21 +132,112 @@ impl Hash for FlatTree {
         self.source.hash(state);
         self.words.hash(state);
         self.big.hash(state);
+        self.kinds.hash(state);
         self.marks.first().hash(state);
         self.lazy.as_ref().map(|it| it.data).hash(state);
     }
 }
 
-#[inline]
-fn pack(kind: SyntaxKind, tag: u32, value: u32, at: u32, big: &mut Vec<(u32, u32)>) -> u32 {
-    let payload = match value < BIG {
-        true => value,
-        false => {
-            big.push((at, value));
-            BIG
+/// The arrays of a tree being made, element by element in preorder.
+#[derive(Default, Debug)]
+struct Packer {
+    words: Vec<u32>,
+    node_parents: Vec<u32>,
+    far: Vec<(u32, u32)>,
+    kinds: Vec<(u32, u16)>,
+    big: Vec<(u32, u32)>,
+}
+
+impl Packer {
+    fn with_capacity(elements: usize) -> Packer {
+        Packer {
+            words: Vec::with_capacity(elements),
+            node_parents: Vec::with_capacity(elements / 2),
+            ..Packer::default()
         }
-    };
-    kind.0 as u32 | tag | payload << SHIFT
+    }
+
+    /// The next element's number and its kind's bits.
+    fn start(&mut self, kind: SyntaxKind) -> (u32, u32) {
+        assert!(self.words.len() < NO_PARENT as usize, "a tree of 2^32 - 1 elements or more");
+        let at = self.words.len() as u32;
+        let kind = match (kind.0 as u32) < FAR_KIND {
+            true => kind.0 as u32,
+            false => {
+                self.kinds.push((at, kind.0));
+                FAR_KIND
+            }
+        };
+        (at, kind)
+    }
+
+    /// A node of `size` elements (0 while not known), under `parent` ([`NO_PARENT`] for none).
+    fn node(&mut self, kind: SyntaxKind, size: u32, parent: u32) -> u32 {
+        let (at, kind) = self.start(kind);
+        self.words.push(kind | NODE);
+        self.node_parents.push(parent);
+        self.set_size(at, size);
+        at
+    }
+
+    fn set_size(&mut self, at: u32, size: u32) {
+        let size = match size < HUGE {
+            true => size,
+            false => {
+                self.big.push((at, size));
+                HUGE
+            }
+        };
+        let word = &mut self.words[at as usize];
+        *word = (*word & (FAR_KIND | TAG)) | size << VALUE;
+    }
+
+    /// A token or a lazy node of `len` bytes, under `parent` ([`NO_PARENT`] for none).
+    fn leaf(&mut self, kind: SyntaxKind, tag: u32, len: u32, parent: u32) -> u32 {
+        let (at, kind) = self.start(kind);
+        let len = match len < LONG {
+            true => len,
+            false => {
+                self.big.push((at, len));
+                LONG
+            }
+        };
+        let up = match parent {
+            NO_PARENT => 0,
+            parent if at - parent < FAR => at - parent,
+            parent => {
+                self.far.push((at, parent));
+                FAR
+            }
+        };
+        self.words.push(kind | tag | len << VALUE | up << UP);
+        at
+    }
+
+    /// The tree, its first element starting at `base` in `source`.
+    fn finish(mut self, source: Arc<str>, base: u32, lazy: Option<Box<Lazy>>) -> FlatTree {
+        self.big.sort_unstable_by_key(|it| it.0);
+        let marks = marks(&self.words, &self.big, base);
+        self.tree(source, marks, lazy)
+    }
+
+    /// The tree, with the [`FlatTree::marks`] made while its elements were pushed.
+    fn tree(mut self, source: Arc<str>, marks: Box<[u32]>, lazy: Option<Box<Lazy>>) -> FlatTree {
+        self.big.sort_unstable_by_key(|it| it.0);
+        let (nodes, ranks) = nodes(&self.words);
+        FlatTree {
+            source,
+            words: exact(self.words),
+            nodes,
+            ranks,
+            node_parents: exact(self.node_parents),
+            far: exact(self.far),
+            kinds: exact(self.kinds),
+            big: exact(self.big),
+            marks,
+            lazy,
+        }
+    }
 }
 
 /// The starts [`FlatTree::marks`] keeps of `words`, the first element starting at `base`.
@@ -149,8 +250,8 @@ fn marks(words: &[u32], big: &[(u32, u32)], base: u32) -> Box<[u32]> {
             marks.push(offset);
         }
         if word & TAG != NODE {
-            offset += match word >> SHIFT {
-                BIG => big.find(|it| it.0 == at as u32).expect("a length in the side table").1,
+            offset += match (word >> VALUE) & LONG {
+                LONG => big.find(|it| it.0 == at as u32).expect("a length in the side table").1,
                 len => len,
             };
         }
@@ -159,6 +260,32 @@ fn marks(words: &[u32], big: &[(u32, u32)], base: u32) -> Box<[u32]> {
         marks.push(offset);
     }
     marks.into_boxed_slice()
+}
+
+/// [`FlatTree::nodes`] and [`FlatTree::ranks`] of `words`.
+fn nodes(words: &[u32]) -> (Box<[u64]>, Box<[u32]>) {
+    let mut nodes = Vec::with_capacity(words.len().div_ceil(64));
+    let mut ranks = Vec::with_capacity(words.len().div_ceil(64));
+    let mut before = 0;
+    for chunk in words.chunks(64) {
+        let mut bits = 0u64;
+        for (bit, &word) in chunk.iter().enumerate() {
+            if word & TAG == NODE {
+                bits |= 1 << bit;
+            }
+        }
+        ranks.push(before);
+        nodes.push(bits);
+        before += bits.count_ones();
+    }
+    (nodes.into_boxed_slice(), ranks.into_boxed_slice())
+}
+
+/// The entries of a side table sorted by element of the elements from `lo` to `hi`.
+fn in_range<T>(table: &[(u32, T)], lo: u32, hi: u32) -> &[(u32, T)] {
+    let from = table.partition_point(|it| it.0 < lo);
+    let to = table.partition_point(|it| it.0 < hi);
+    &table[from..to]
 }
 
 /// `part`, parsed or not, as the part of a lazy node whose text moved from `from` to `to`,
@@ -209,12 +336,25 @@ impl FlatTree {
                 + lazy.parts.len() * std::mem::size_of::<OnceLock<Arc<FlatTree>>>()
                 + lazy.parts.iter().filter_map(|it| it.get()).map(|it| it.heap_size()).sum::<usize>()
         });
-        (self.words.len() + self.parents.len() + self.marks.len()) * 4 + self.big.len() * 8 + lazy
+        let columns = self.words.len() + self.ranks.len() + self.node_parents.len() + self.marks.len();
+        let tables = self.far.len() + self.kinds.len() + self.big.len();
+        columns * 4 + self.nodes.len() * 8 + tables * 8 + lazy
     }
 
     #[inline]
     pub fn kind(&self, at: u32) -> SyntaxKind {
-        SyntaxKind(self.words[at as usize] as u16)
+        match self.words[at as usize] & FAR_KIND {
+            FAR_KIND => self.far_kind(at),
+            kind => SyntaxKind(kind as u16),
+        }
+    }
+
+    #[cold]
+    fn far_kind(&self, at: u32) -> SyntaxKind {
+        match self.kinds.binary_search_by_key(&at, |it| it.0) {
+            Ok(it) => SyntaxKind(self.kinds[it].1),
+            Err(_) => unreachable!("element {at}'s kind is not in the side table"),
+        }
     }
 
     #[inline]
@@ -228,18 +368,40 @@ impl FlatTree {
         self.words[at as usize] & TAG == LAZY
     }
 
+    /// How many nodes come before element `at`, which is an element.
+    #[inline]
+    fn rank(&self, at: u32) -> usize {
+        let (word, bit) = (at as usize / 64, at % 64);
+        self.ranks[word] as usize + (self.nodes[word] & ((1u64 << bit) - 1)).count_ones() as usize
+    }
+
+    /// How many nodes come before element `at`, or are in the tree for `len()`.
+    fn nodes_before(&self, at: u32) -> usize {
+        match at == self.len() {
+            true => self.node_parents.len(),
+            false => self.rank(at),
+        }
+    }
+
     #[inline]
     pub fn parent(&self, at: u32) -> Option<u32> {
-        let parent = self.parents[at as usize];
+        let word = self.words[at as usize];
+        let parent = match word & TAG {
+            NODE => self.node_parents[self.rank(at)],
+            _ => match word >> UP {
+                0 => NO_PARENT,
+                FAR => self.far_parent(at),
+                up => at - up,
+            },
+        };
         (parent != NO_PARENT).then_some(parent)
     }
 
-    /// A token's or lazy node's length, a node's subtree size.
-    #[inline]
-    fn value(&self, at: u32) -> u32 {
-        match self.words[at as usize] >> SHIFT {
-            BIG => self.big_value(at),
-            value => value,
+    #[cold]
+    fn far_parent(&self, at: u32) -> u32 {
+        match self.far.binary_search_by_key(&at, |it| it.0) {
+            Ok(it) => self.far[it].1,
+            Err(_) => unreachable!("element {at}'s parent is not in the side table"),
         }
     }
 
@@ -254,19 +416,36 @@ impl FlatTree {
     /// The bytes of text the element holds itself: a token's or lazy node's, none for a node.
     #[inline]
     fn text_len(&self, at: u32) -> u32 {
-        match self.words[at as usize] & TAG == NODE {
-            true => 0,
-            false => self.value(at),
+        let word = self.words[at as usize];
+        if word & TAG == NODE {
+            return 0;
+        }
+        match (word >> VALUE) & LONG {
+            LONG => self.big_value(at),
+            len => len,
         }
     }
 
     /// The number after the element's subtree.
     #[inline]
     pub fn end(&self, at: u32) -> u32 {
-        match self.words[at as usize] & TAG == NODE {
-            true => at + self.value(at),
-            false => at + 1,
+        let word = self.words[at as usize];
+        if word & TAG != NODE {
+            return at + 1;
         }
+        match word >> VALUE {
+            HUGE => at + self.big_value(at),
+            size => at + size,
+        }
+    }
+
+    /// Pushes element `at` to `packer` as a node of `size` elements or a token or lazy node,
+    /// under `parent`.
+    fn repack(&self, at: u32, packer: &mut Packer, parent: u32, size: u32) {
+        match self.words[at as usize] & TAG {
+            NODE => packer.node(self.kind(at), size, parent),
+            tag => packer.leaf(self.kind(at), tag, self.text_len(at), parent),
+        };
     }
 
     /// The children and tokens of `at`, in order.
@@ -297,21 +476,24 @@ impl FlatTree {
 
     /// Hashes what the subtree of `at` is made of, as the same subtree is hashed anywhere in
     /// any tree: its text, and its elements' kinds and shape, numbered from `at`. A lazy node
-    /// is hashed as its kind and text, so an outline's hash is not a full tree's.
+    /// is hashed as its kind and text, so an outline's hash is not a full tree's. A token's
+    /// word holds how far back its parent is, which is the same wherever the subtree is, but
+    /// for the root's, which is its parent's in place and none in a copy, so it is left out.
     pub fn hash_subtree<H: Hasher>(&self, at: u32, state: &mut H) {
         let end = self.end(at);
         self.source[self.range(at)].hash(state);
-        self.words[at as usize..end as usize].hash(state);
-        for &(it, value) in self.big_in(at, end) {
+        let root = self.words[at as usize];
+        match root & TAG {
+            NODE => root.hash(state),
+            _ => (root & !(FAR << UP)).hash(state),
+        }
+        self.words[at as usize + 1..end as usize].hash(state);
+        for &(it, value) in in_range(&self.big, at, end) {
             (it - at, value).hash(state);
         }
-    }
-
-    /// The side table's entries of the elements from `lo` to `hi`.
-    fn big_in(&self, lo: u32, hi: u32) -> &[(u32, u32)] {
-        let from = self.big.partition_point(|it| it.0 < lo);
-        let to = self.big.partition_point(|it| it.0 < hi);
-        &self.big[from..to]
+        for &(it, kind) in in_range(&self.kinds, at, end) {
+            (it - at, kind).hash(state);
+        }
     }
 
     /// Where element `at` starts; `len()` for where the last ends.
@@ -329,7 +511,7 @@ impl FlatTree {
     pub fn range(&self, at: u32) -> TextRange {
         let start = self.offset(at);
         let end = match self.words[at as usize] & TAG == NODE {
-            false => start + self.value(at),
+            false => start + self.text_len(at),
             true => {
                 let end = self.end(at);
                 match end / MARK == at / MARK {
@@ -518,13 +700,24 @@ impl FlatTree {
         let (lo, hi) = (at, self.end(at));
         let range = self.range(at);
         let source: Arc<str> = Arc::from(&self.source[range]);
-        let words: Box<[u32]> = self.words[lo as usize..hi as usize].into();
+        let mut words: Box<[u32]> = self.words[lo as usize..hi as usize].into();
+        if words[0] & TAG != NODE {
+            words[0] &= !(FAR << UP);
+        }
         let big: Box<[(u32, u32)]> =
-            self.big_in(lo, hi).iter().map(|&(it, value)| (it - at, value)).collect();
-        let marks = marks(&words, &big, 0);
-        let parents = std::iter::once(NO_PARENT)
-            .chain(self.parents[lo as usize + 1..hi as usize].iter().map(|it| it - at))
+            in_range(&self.big, lo, hi).iter().map(|&(it, value)| (it - at, value)).collect();
+        let kinds: Box<[(u32, u16)]> =
+            in_range(&self.kinds, lo, hi).iter().map(|&(it, kind)| (it - at, kind)).collect();
+        let far = in_range(&self.far, lo + 1, hi).iter().map(|&(it, p)| (it - at, p - at)).collect();
+        let node_parents = self.node_parents[self.nodes_before(lo)..self.nodes_before(hi)]
+            .iter()
+            .map(|&it| match it == NO_PARENT || it < at {
+                true => NO_PARENT,
+                false => it - at,
+            })
             .collect();
+        let marks = marks(&words, &big, 0);
+        let (nodes, ranks) = nodes(&words);
         let lazy = self.lazy.as_ref().and_then(|lazy| {
             let from = lazy.nodes.partition_point(|&it| it < lo);
             let to = lazy.nodes.partition_point(|&it| it < hi);
@@ -540,7 +733,7 @@ impl FlatTree {
                 })
             })
         });
-        FlatTree { source, words, parents, marks, big, lazy }
+        FlatTree { source, words, nodes, ranks, node_parents, far, kinds, big, marks, lazy }
     }
 
     /// This tree, which has no lazy nodes, with its text at `to` in `source` instead of at
@@ -594,33 +787,32 @@ impl FlatTree {
         assert!(len < NO_PARENT as u64, "a tree of 2^32 - 1 elements or more");
         let after = |it: u32| it - removed + added;
 
-        let ancestors: Vec<u32> = std::iter::successors(self.parent(at), |&it| self.parent(it))
-            .collect();
-        let mut words = Vec::with_capacity(len as usize);
-        let mut big: Vec<(u32, u32)> = self
-            .big_in(0, lo)
-            .iter()
-            .filter(|it| !ancestors.contains(&it.0))
-            .copied()
-            .collect();
-        words.extend_from_slice(&self.words[..lo as usize]);
-        for &it in &ancestors {
-            let size = self.end(it) - it - removed + added;
-            words[it as usize] = pack(self.kind(it), NODE, size, it, &mut big);
+        // Repacked element by element: the ancestors' sizes change, and so does how far back
+        // the parent is of every token after `at` that is a child of an ancestor.
+        let mut packer = Packer::with_capacity(len as usize);
+        for it in 0..lo {
+            let parent = self.parent(it).unwrap_or(NO_PARENT);
+            let end = self.end(it);
+            let size = match end > lo {
+                true => end - it - removed + added,
+                false => end - it,
+            };
+            self.repack(it, &mut packer, parent, size);
         }
-        words.extend_from_slice(&with.words);
-        big.extend(with.big.iter().map(|&(it, value)| (it + lo, value)));
-        words.extend_from_slice(&self.words[hi as usize..]);
-        big.extend(self.big_in(hi, self.len()).iter().map(|&(it, value)| (after(it), value)));
-        big.sort_unstable_by_key(|it| it.0);
-
-        let mut parents = Vec::with_capacity(len as usize);
-        parents.extend_from_slice(&self.parents[..=lo as usize]);
-        parents.extend(with.parents[1..].iter().map(|it| it + lo));
-        parents.extend(self.parents[hi as usize..].iter().map(|&it| match it < lo {
-            true => it,
-            false => after(it),
-        }));
+        for it in 0..added {
+            let parent = match it {
+                0 => self.parent(at).unwrap_or(NO_PARENT),
+                _ => with.parent(it).expect("only the root has no parent") + lo,
+            };
+            with.repack(it, &mut packer, parent, with.end(it) - it);
+        }
+        for it in hi..self.len() {
+            let parent = match self.parent(it).expect("only the root has no parent") {
+                parent if parent < lo => parent,
+                parent => after(parent),
+            };
+            self.repack(it, &mut packer, parent, self.end(it) - it);
+        }
 
         let ours = self.lazy.as_ref().map(|lazy| {
             let before = lazy.nodes.partition_point(|&it| it < lo);
@@ -664,15 +856,7 @@ impl FlatTree {
             Box::new(Lazy { nodes: nodes.into(), parts: parts.into(), expand, data })
         });
 
-        let marks = marks(&words, &big, base);
-        FlatTree {
-            source,
-            words: words.into_boxed_slice(),
-            parents: parents.into_boxed_slice(),
-            marks,
-            big: big.into_boxed_slice(),
-            lazy,
-        }
+        packer.finish(source, base, lazy)
     }
 
     /// The lazy nodes, in preorder.
@@ -773,10 +957,8 @@ pub struct FlatTreeBuilder {
     source: Option<Arc<str>>,
     /// The next byte of `source`.
     next: usize,
-    words: Vec<u32>,
-    parents: Vec<u32>,
+    packer: Packer,
     marks: Vec<u32>,
-    big: Vec<(u32, u32)>,
     open: Vec<u32>,
     lazies: Vec<u32>,
     expand: Option<(Expand, u32)>,
@@ -793,8 +975,7 @@ impl FlatTreeBuilder {
         let elements = len / 2;
         FlatTreeBuilder {
             text: String::with_capacity(len),
-            words: Vec::with_capacity(elements),
-            parents: Vec::with_capacity(elements),
+            packer: Packer::with_capacity(elements),
             marks: Vec::with_capacity(elements / MARK as usize + 1),
             ..FlatTreeBuilder::default()
         }
@@ -806,8 +987,7 @@ impl FlatTreeBuilder {
     pub fn sourced(source: Arc<str>) -> FlatTreeBuilder {
         let elements = source.len() / 2;
         FlatTreeBuilder {
-            words: Vec::with_capacity(elements),
-            parents: Vec::with_capacity(elements),
+            packer: Packer::with_capacity(elements),
             marks: Vec::with_capacity(elements / MARK as usize + 1),
             source: Some(source),
             ..FlatTreeBuilder::default()
@@ -823,20 +1003,21 @@ impl FlatTreeBuilder {
         }
     }
 
-    fn push(&mut self, kind: SyntaxKind, tag: u32, value: u32) -> u32 {
-        assert!(self.words.len() < NO_PARENT as usize, "a tree of 2^32 - 1 elements or more");
-        let at = self.words.len() as u32;
-        if at % MARK == 0 {
+    /// Pushes a node (`NODE`, its size set when it is finished) or a token or lazy node of
+    /// `len` bytes.
+    fn push(&mut self, kind: SyntaxKind, tag: u32, len: u32) -> u32 {
+        if self.packer.words.len() % MARK as usize == 0 {
             self.marks.push(self.offset() as u32);
         }
-        let word = pack(kind, tag, value, at, &mut self.big);
-        self.words.push(word);
-        self.parents.push(self.open.last().copied().unwrap_or(NO_PARENT));
-        at
+        let parent = self.open.last().copied().unwrap_or(NO_PARENT);
+        match tag {
+            NODE => self.packer.node(kind, 0, parent),
+            _ => self.packer.leaf(kind, tag, len, parent),
+        }
     }
 
     pub fn start_node(&mut self, kind: SyntaxKind) {
-        assert!(!self.open.is_empty() || self.words.is_empty(), "a tree has one root");
+        assert!(!self.open.is_empty() || self.packer.words.is_empty(), "a tree has one root");
         let at = self.push(kind, NODE, 0);
         self.open.push(at);
     }
@@ -863,7 +1044,7 @@ impl FlatTreeBuilder {
     /// children in the arrays: inside a node, or as the whole tree. Only for a builder with a
     /// source, and the tree must be given its expander before `finish`.
     pub fn lazy(&mut self, kind: SyntaxKind, len: u32) {
-        assert!(!self.open.is_empty() || self.words.is_empty(), "a tree has one root");
+        assert!(!self.open.is_empty() || self.packer.words.is_empty(), "a tree has one root");
         let end = self.next + len as usize;
         match &self.source {
             None => panic!("a lazy {kind:?} in a tree built without a source"),
@@ -885,14 +1066,14 @@ impl FlatTreeBuilder {
 
     pub fn finish_node(&mut self) {
         let at = self.open.pop().expect("a node finished that was not started");
-        let size = self.words.len() as u32 - at;
-        let kind = SyntaxKind(self.words[at as usize] as u16);
-        self.words[at as usize] = pack(kind, NODE, size, at, &mut self.big);
+        let size = self.packer.words.len() as u32 - at;
+        self.packer.set_size(at, size);
     }
 
     pub fn finish(mut self) -> FlatTree {
-        assert!(self.open.is_empty() && !self.words.is_empty(), "the tree is not finished");
-        if self.words.len() % MARK as usize == 0 {
+        let len = self.packer.words.len();
+        assert!(self.open.is_empty() && len > 0, "the tree is not finished");
+        if len % MARK as usize == 0 {
             self.marks.push(self.offset() as u32);
         }
         let source: Arc<str> = match self.source {
@@ -907,7 +1088,6 @@ impl FlatTreeBuilder {
             }
             None => Arc::from(self.text),
         };
-        self.big.sort_unstable_by_key(|it| it.0);
         let lazy = match self.lazies.is_empty() {
             true => None,
             false => {
@@ -920,14 +1100,7 @@ impl FlatTreeBuilder {
                 }))
             }
         };
-        FlatTree {
-            source,
-            words: exact(self.words),
-            parents: exact(self.parents),
-            marks: exact(self.marks),
-            big: exact(self.big),
-            lazy,
-        }
+        self.packer.tree(source, exact(self.marks), lazy)
     }
 }
 
@@ -942,7 +1115,7 @@ mod tests {
         },
     };
 
-    use super::{Expand, FlatTree, BIG};
+    use super::{Expand, FlatTree, HUGE, LONG};
     use crate::{
         cursor::{SyntaxElement, SyntaxNode},
         FlatTreeBuilder, GreenNodeBuilder, NodeOrToken, SyntaxKind, TextRange, TextSize,
@@ -998,8 +1171,9 @@ mod tests {
         Shape::Node(kind, children, None)
     }
 
-    /// A tree past what an element's word holds: rows of 170 tokens, in nodes of more than
-    /// 2^14 elements, and a few tokens of more than 2^14 bytes.
+    /// A tree past what an element's word holds: rows of 170 tokens with a token between
+    /// them, so most of those are more than a thousand elements after their parent; a few
+    /// tokens of more than a thousand bytes; and some kinds past the word's.
     fn big_shape(seed: u64) -> Shape {
         let mut rng = Rng::new(seed);
         let mut rows = Vec::new();
@@ -1007,13 +1181,18 @@ mod tests {
             let mut tokens = Vec::new();
             for i in 0..170u16 {
                 let text = "abc"[..rng.below(4) as usize].to_owned();
-                tokens.push(Shape::Token(SyntaxKind(i % 5), text));
+                let kind = match rng.below(50) {
+                    0 => SyntaxKind(1023 + rng.below(2000) as u16),
+                    _ => SyntaxKind(i % 5),
+                };
+                tokens.push(Shape::Token(kind, text));
             }
             if row % 37 == seed % 37 {
-                let long = "x".repeat(BIG as usize + rng.below(3000) as usize);
+                let long = "x".repeat(LONG as usize + rng.below(3000) as usize);
                 tokens.insert(rng.below(170) as usize, Shape::Token(SyntaxKind(3), long));
             }
             rows.push(Shape::Node(SyntaxKind(101 + (row % 4) as u16), tokens, None));
+            rows.push(Shape::Token(SyntaxKind(0), " ".into()));
         }
         let rows = Shape::Node(SyntaxKind(102), rows, None);
         Shape::Node(SyntaxKind(100), vec![rows, Shape::Token(SyntaxKind(1), "ab".into())], None)
@@ -1333,7 +1512,8 @@ mod tests {
             let shape = big_shape(seed);
             let tree = build_flat(&shape, seed % 2 == 1);
             assert!(tree.big.iter().any(|&(it, _)| tree.is_token(it)), "a token past the word");
-            assert!(tree.big.iter().any(|&(it, _)| !tree.is_token(it)), "a node past the word");
+            assert!(tree.far.len() >= 50, "parents past the word: {}", tree.far.len());
+            assert!(!tree.kinds.is_empty(), "kinds past the word");
             compare(&build_green(&shape), &SyntaxNode::new_flat_root(Arc::new(tree)), false, seed);
         }
     }
@@ -1355,7 +1535,13 @@ mod tests {
         builder.finish_node();
         let tree = builder.finish();
         assert_eq!(tree.len(), 1 + ROWS * 100 + 1);
+        assert!(tree.len() > HUGE && tree.big.iter().any(|&(it, _)| it == 0), "a size past the word");
         assert_eq!(tree.end(0), tree.len());
+        assert_eq!(tree.parent(tree.len() - 1), Some(0));
+        assert_eq!(tree.far.len(), 1, "only the last token is far from its parent");
+        let (nodes, tokens) = (ROWS as usize + 1, tree.len() as usize - ROWS as usize - 1);
+        let budget = tokens * 4 + nodes * 8 + tree.len() as usize * 3 / 4 + 64;
+        assert!(tree.heap_size() <= budget, "{} bytes, past the budget of {budget}", tree.heap_size());
         for row in [0, 1, 7, 12_345, ROWS - 1] {
             let at = 1 + row * 100;
             assert_eq!((tree.kind(at), tree.end(at), tree.parent(at)), (SyntaxKind(101), at + 100, Some(0)));
@@ -1606,7 +1792,7 @@ mod tests {
             let shape = big_shape(seed);
             let tree = build_flat(&shape, true);
             let row = tree.children(tree.first_child(0).unwrap()).nth(seed as usize * 40).unwrap();
-            let with = Shape::Node(tree.kind(row), vec![Shape::Token(SyntaxKind(3), "z".repeat(BIG as usize + 5))], None);
+            let with = Shape::Node(tree.kind(row), vec![Shape::Token(SyntaxKind(3), "z".repeat(LONG as usize + 5))], None);
             let edited = replaced(&shape, row, &with, &mut 0);
             let mut text = String::new();
             text_of(&edited, &mut text);

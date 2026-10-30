@@ -139,7 +139,7 @@ pub enum NodeKind {
 }
 
 /// Where a node of the build's graph is. A node only moves down this list, from `Waiting`
-/// to one of the last four.
+/// to one of the last five.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeState {
     /// A node it waits for is not done.
@@ -160,6 +160,8 @@ pub enum NodeState {
     Skipped {
         because: u32,
     },
+    /// Never run: every request it was part of was cancelled before it started.
+    Cancelled,
 }
 
 impl NodeState {
@@ -171,6 +173,7 @@ impl NodeState {
                 | NodeState::Cached { .. }
                 | NodeState::Failed { .. }
                 | NodeState::Skipped { .. }
+                | NodeState::Cancelled
         )
     }
 }

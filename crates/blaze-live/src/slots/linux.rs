@@ -18,8 +18,14 @@ use super::{
 };
 
 unsafe extern "C" {
-    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64)
-    -> *mut c_void;
+    fn mmap(
+        addr: *mut c_void,
+        len: usize,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: i64,
+    ) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
     fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
     fn mremap(old: *mut c_void, old_len: usize, new_len: usize, flags: i32, ...) -> *mut c_void;
@@ -46,7 +52,8 @@ impl Os {
     pub(super) fn new(layout: &Layout) -> Result<Os, String> {
         // SAFETY: it takes no pointer.
         let page = unsafe { sysconf(SC_PAGESIZE) };
-        let page = u64::try_from(page).ok().filter(|it| it.is_power_of_two()).ok_or("no page size")?;
+        let page =
+            u64::try_from(page).ok().filter(|it| it.is_power_of_two()).ok_or("no page size")?;
         let code = layout.code_in_memory();
         if !code.start.is_multiple_of(page) || !code.end.is_multiple_of(page) {
             return Err(format!(
@@ -81,7 +88,10 @@ fn move_to_anonymous(code: &Range<u64>) -> Result<(), String> {
         mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
     };
     if fresh == MAP_FAILED {
-        return Err(format!("mapping a copy of the patch code: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "mapping a copy of the patch code: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: `code` is mapped and readable (checked by the caller), `fresh` is `len` bytes
     // of new memory; they don't overlap.
@@ -161,11 +171,7 @@ impl Memory for Os {
     }
 
     fn functions(&mut self, functions: &[(u64, u64, u64)]) -> Result<(), String> {
-        if functions.is_empty() {
-            Ok(())
-        } else {
-            Err("RUNTIME_FUNCTIONs on Linux".to_owned())
-        }
+        if functions.is_empty() { Ok(()) } else { Err("RUNTIME_FUNCTIONs on Linux".to_owned()) }
     }
 
     fn publish(&mut self, cell: u64, table: u64) -> Result<(), String> {
@@ -204,10 +210,17 @@ impl Os {
     /// # Safety
     ///
     /// `piece` is mapped and nothing else reads or writes it while it is written.
-    unsafe fn write(&self, piece: &Range<u64>, protection: i32, bytes: &[u8]) -> Result<(), String> {
+    unsafe fn write(
+        &self,
+        piece: &Range<u64>,
+        protection: i32,
+        bytes: &[u8],
+    ) -> Result<(), String> {
         let copy = || {
             // SAFETY: the caller's: mapped, and writable when this runs.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), piece.start as *mut u8, bytes.len()) }
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), piece.start as *mut u8, bytes.len())
+            }
         };
         if protection & PROT_WRITE != 0 {
             copy();
@@ -255,7 +268,8 @@ impl Maps {
                 continue;
             };
             let Some((start, end)) = range.split_once('-') else { continue };
-            let (Ok(start), Ok(end)) = (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
+            let (Ok(start), Ok(end)) =
+                (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
             else {
                 return Err(format!("/proc/self/maps has a line {line:?}"));
             };

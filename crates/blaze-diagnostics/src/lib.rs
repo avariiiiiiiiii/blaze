@@ -1,4 +1,4 @@
-//! Compile errors and warnings as rustc gives them (docs/v2/README.md section 18; #1522,
+//! Compile errors and warnings as rustc gives them (docs/v2/plan.md section 18; #1522,
 //! #1440, #780): computed from the front end's queries that found them, each with the facts
 //! it read, and written as rustc and cargo write them. Every error rustc gives is given: a
 //! program rustc rejects that blaze accepts is a bug of this crate or of the front end.

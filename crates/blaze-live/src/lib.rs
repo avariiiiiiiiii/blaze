@@ -33,6 +33,8 @@ fn setting(name: &str) -> Option<std::ffi::OsString> {
 }
 
 pub mod format;
+pub mod patch;
+pub mod slots;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux;

@@ -42,10 +42,7 @@ use blaze_core::{
 };
 use blaze_ids::ContentId;
 
-use super::{
-    select::Ignored,
-    wire::{self, End, Frame, Frames},
-};
+use super::wire::{self, End, Frame, Frames};
 use crate::{
     confine,
     trace::{self, Inputs, Line, Seen},
@@ -637,6 +634,26 @@ impl Queue {
                     return Err(format!("an end of {id}, which it does not run"));
                 }
                 self.busy -= 1;
+                let attempt = self.attempts.get(&id).expect("a test the server runs is an attempt");
+                let j = attempt.job;
+                let outcome = self.outcome(attempt, &end);
+                if outcome != Outcome::Passed {
+                    // Decided before a core is given to another test: a retry keeps its place in
+                    // the order, and fail-fast starts nothing more.
+                    if attempt.number <= self.bins[b].plan.jobs[j].retries && !self.stopping {
+                        let number = attempt.number;
+                        self.attempts.remove(&id);
+                        let tries = self.tries.entry((b, j)).or_default();
+                        tries.done = number;
+                        tries.output.extend_from_slice(format!("--- attempt {number} ---\n").as_bytes());
+                        tries.output.extend_from_slice(&output);
+                        self.pending.insert((Reverse(self.bins[b].plan.jobs[j].expected), b, j));
+                        return Ok(());
+                    }
+                    if self.config.fail_fast {
+                        self.stop();
+                    }
+                }
                 let ended = Ended { id, end, output, at: self.now };
                 let server = self.server(b);
                 match server.reading {
@@ -700,19 +717,13 @@ impl Queue {
             }
             _ => {}
         }
-        let server = self.server(b);
-        let waiting = std::mem::take(&mut server.waiting);
+        let broken = self.server(b).broken.clone();
+        let waiting = std::mem::take(&mut self.server(b).waiting);
         for ended in waiting {
-            let server = self.server(b);
-            let trace = match &server.broken {
+            let Some(attempt) = self.attempts.get(&ended.id) else { continue };
+            let trace = match &broken {
                 Some(why) => Trace::Unknown(why.clone()),
-                None => {
-                    let name = &self.bins[b].plan.jobs[self.attempts[&ended.id].job].name;
-                    let server = self.bins[b].server.as_ref().expect("a server");
-                    let mut lines = server.common.clone();
-                    lines.extend(server.scoped.get(name).into_iter().flatten().cloned());
-                    Trace::Lines(lines)
-                }
+                None => Trace::Lines(self.lines(b, attempt.job)),
             };
             self.attempt_ended(b, ended, trace, effects);
         }
@@ -723,30 +734,32 @@ impl Queue {
         }
     }
 
-    fn attempt_ended(&mut self, b: usize, ended: Ended, trace: Trace, effects: &mut Vec<Effect>) {
-        let Some(attempt) = self.attempts.remove(&ended.id) else { return };
-        let j = attempt.job;
-        let timeout = self.bins[b].plan.jobs[j].timeout;
-        let outcome = match (&ended.end, attempt.timed_out) {
+    /// The lines of the record a test of `b` read: those of every scope, then its own.
+    fn lines(&self, b: usize, j: usize) -> Vec<Line> {
+        let server = self.bins[b].server.as_ref().expect("a server");
+        let mut lines = server.common.clone();
+        lines.extend(server.scoped.get(&self.bins[b].plan.jobs[j].name).into_iter().flatten().cloned());
+        lines
+    }
+
+    /// How a run of a test that ended as `end` went.
+    fn outcome(&self, attempt: &Attempt, end: &End) -> Outcome {
+        let timeout = self.bins[attempt.binary].plan.jobs[attempt.job].timeout;
+        match (end, attempt.timed_out) {
             (_, true) => Outcome::Failed(Failure::TimedOut(timeout)),
             (End::Exited(0), false) => Outcome::Passed,
             (End::Exited(code), false) => Outcome::Failed(Failure::Code(*code)),
             (End::Signaled(signal), false) => Outcome::Failed(Failure::Signal(*signal)),
             (End::NotStarted(why), false) => Outcome::Failed(Failure::Lost(why.clone())),
-        };
-        let took = ended.at.saturating_sub(attempt.started);
-        let retry = outcome != Outcome::Passed
-            && attempt.number <= self.bins[b].plan.jobs[j].retries
-            && !self.stopping
-            && self.server(b).phase == Phase::Ready;
-        if retry {
-            let tries = self.tries.entry((b, j)).or_default();
-            tries.done = attempt.number;
-            tries.output.extend_from_slice(format!("--- attempt {} ---\n", attempt.number).as_bytes());
-            tries.output.extend_from_slice(&ended.output);
-            self.pending.insert((Reverse(self.bins[b].plan.jobs[j].expected), b, j));
-            return;
         }
+    }
+
+    /// A test whose run ended and is not run again, once what it read is known.
+    fn attempt_ended(&mut self, b: usize, ended: Ended, trace: Trace, effects: &mut Vec<Effect>) {
+        let Some(attempt) = self.attempts.remove(&ended.id) else { return };
+        let j = attempt.job;
+        let outcome = self.outcome(&attempt, &ended.end);
+        let took = ended.at.saturating_sub(attempt.started);
         let output = match self.tries.remove(&(b, j)) {
             Some(mut tries) => {
                 tries.output.extend_from_slice(format!("--- attempt {} ---\n", attempt.number).as_bytes());
@@ -802,9 +815,9 @@ impl Queue {
         self.stopping = true;
         for (_, b, j) in std::mem::take(&mut self.pending) {
             let job = (j != WHOLE).then_some(j);
-            let output = self.tries.remove(&(b, j)).map(|it| it.output).unwrap_or_default();
+            let tries = self.tries.remove(&(b, j)).unwrap_or_default();
             let why = "not run: an earlier failure or a cancel stopped the run".to_owned();
-            self.finish_attempts(b, job, Outcome::NotRun, 1, output, Duration::ZERO, Trace::Unknown(why));
+            self.finish_attempts(b, job, Outcome::NotRun, tries.done + 1, tries.output, Duration::ZERO, Trace::Unknown(why));
         }
     }
 
@@ -819,11 +832,13 @@ impl Queue {
                 self.send(b, &Frame::Quit, effects);
                 self.server(b).phase = Phase::Quitting;
             }
-            Phase::Starting => {
+            Phase::Starting if server.lost.is_none() => {
                 if let Some(spawn) = server.spawn {
                     effects.push(Effect::Kill { tag: spawn });
+                    self.server(b).lost = Some("nothing was left for it to run".to_owned());
                 }
             }
+            Phase::Starting => {}
             Phase::Writing | Phase::Quitting | Phase::Ended => {}
         }
     }
@@ -896,18 +911,22 @@ impl Queue {
     }
 
     /// Starts the first tests in the order whose servers are ready, while cores are free.
+    /// Servers with nothing left to run are let go.
     fn schedule(&mut self, effects: &mut Vec<Effect>) {
         while !self.stopping && self.busy < self.config.jobs.max(1) {
             let next = self.pending.iter().copied().find(|&(_, b, j)| {
                 j == WHOLE || self.bins[b].server.as_ref().is_some_and(|it| it.phase == Phase::Ready)
             });
-            let Some(entry) = next else { return };
+            let Some(entry) = next else { break };
             self.pending.remove(&entry);
             let (_, b, j) = entry;
             match j {
                 WHOLE => self.start_whole(b, effects),
                 _ => self.start_job(b, j, effects),
             }
+        }
+        for b in 0..self.bins.len() {
+            self.maybe_quit(b, effects);
         }
     }
 

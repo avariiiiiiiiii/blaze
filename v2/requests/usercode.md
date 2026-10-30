@@ -15,11 +15,7 @@ listings (`Traced::dirs`), and the check that reuses a result reads them in the 
 depend on them (`crates/blaze-usercode/src/inputs.rs`, `ViewInputs::dir` and `names`, already
 written against this signature). `Vfs::list` has the shape; `Input::Dir` the edge.
 
-## 2. coordinator: workspace dependency `blaze-build-script` (root Cargo.toml)
-
-What: `blaze-build-script = { path = "crates/blaze-build-script" }` in `[workspace.dependencies]`.
-Why: `blaze-usercode` builds a build script's run from `blaze_build_script::Unit`
-(`crates/blaze-usercode/src/script.rs`) and its `Cargo.toml` names it with `workspace = true`.
+## 2. (withdrawn: `blaze-build-script` is already a workspace dependency)
 
 ## 3. core: ask the confine of every sandboxed run (crates/blaze-core/src/process.rs)
 
@@ -42,9 +38,10 @@ What, at integration:
   the script binary the daemon compiled>, .. })`, then `run::Run::begin` / `complete` with
   `inputs::ViewInputs` (in a query of a kind in `blaze_query::kinds::USER`) or `inputs::Disk`
   set to `Prepared::env`, `script::cargo_rule` and `|traced| script::keyed(&prepared, traced)`.
-  Before compiling a script, `blaze_build_script::elide` (usercode-scripts) over its sources:
-  `Some(stdout)` is `script::elided(stdout)` and nothing is compiled; with `BLAZE_ELIDE=verify`
-  run it as well and compare (`run::differs`).
+  Before compiling a script, `script::inert(root, sources, flags)` (the flags blaze compiles
+  the script with): `Some(value)` is its result and nothing is compiled; with
+  `BLAZE_ELIDE=verify` run it as well and check with `script::verify_elided`. The value goes
+  to `blaze_build_script::run::elided` so cargo's output files are written as for a run.
 - Replace the v1 paths this supersedes: `cargo/script_sandbox.rs`, `cargo/sandboxed.rs`'s
   per-binary test run, and the build-script fingerprint by package in `cargo/script.rs`.
 Why: these files are the coordinator's; the pieces above are written and tested in usercode's

@@ -100,18 +100,17 @@ impl Put for Vec<u8> {
 }
 
 /// A string table: `\0` first, each string once.
-#[derive(Default)]
 pub(crate) struct Strings {
-    pub bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
     at: HashMap<String, u32>,
 }
 
 impl Strings {
-    pub fn new() -> Strings {
+    pub(crate) fn new() -> Strings {
         Strings { bytes: vec![0], at: HashMap::new() }
     }
 
-    pub fn add(&mut self, string: &str) -> u32 {
+    pub(crate) fn add(&mut self, string: &str) -> u32 {
         if string.is_empty() {
             return 0;
         }
@@ -129,15 +128,15 @@ impl Strings {
 /// One `Elf64_Sym`.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Sym {
-    pub name: u32,
-    pub info: u8,
-    pub shndx: u16,
-    pub value: u64,
-    pub size: u64,
+    pub(crate) name: u32,
+    pub(crate) info: u8,
+    pub(crate) shndx: u16,
+    pub(crate) value: u64,
+    pub(crate) size: u64,
 }
 
 impl Sym {
-    pub fn put(&self, out: &mut Vec<u8>) {
+    pub(crate) fn put(&self, out: &mut Vec<u8>) {
         out.u32(self.name);
         out.u8(self.info);
         out.u8(elf::STV_DEFAULT);
@@ -222,28 +221,28 @@ fn types(arch: Arch) -> Types {
 /// One `Elf64_Rela`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) struct Rela {
-    pub at: u64,
-    pub r_type: u32,
-    pub sym: u32,
-    pub addend: i64,
+    pub(crate) at: u64,
+    pub(crate) r_type: u32,
+    pub(crate) sym: u32,
+    pub(crate) addend: i64,
 }
 
 /// Every synthetic region's bytes, and what the headers need to know of them.
 pub(crate) struct Tables {
-    pub interp: Option<Vec<u8>>,
-    pub note: Vec<u8>,
-    pub dynsym: Vec<u8>,
-    pub dynstr: Vec<u8>,
-    pub gnu_hash: Vec<u8>,
-    pub versym: Vec<u8>,
-    pub verneed: Vec<u8>,
+    pub(crate) interp: Option<Vec<u8>>,
+    pub(crate) note: Vec<u8>,
+    pub(crate) dynsym: Vec<u8>,
+    pub(crate) dynstr: Vec<u8>,
+    pub(crate) gnu_hash: Vec<u8>,
+    pub(crate) versym: Vec<u8>,
+    pub(crate) verneed: Vec<u8>,
     /// The `Elf64_Verneed` entries in `verneed`: its section's `sh_info`.
-    pub verneeds: u32,
-    pub rela: Vec<u8>,
-    pub dynamic: Vec<u8>,
-    pub eh_frame_hdr: Vec<u8>,
+    pub(crate) verneeds: u32,
+    pub(crate) rela: Vec<u8>,
+    pub(crate) dynamic: Vec<u8>,
+    pub(crate) eh_frame_hdr: Vec<u8>,
     /// Whether `.eh_frame_hdr` indexes an `.eh_frame`, so `PT_GNU_EH_FRAME` points at it.
-    pub has_eh_frame: bool,
+    pub(crate) has_eh_frame: bool,
 }
 
 impl Tables {
@@ -570,9 +569,6 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<Vec<Re
                 let sym = index.map(import).transpose()?.unwrap_or(0);
                 other.push(Rela { at, r_type: types.tlsdesc, sym, addend: *offset as i64 });
             }
-            Holds::Tlv { .. } => {
-                return Err(error(format!("the GOT cell at {at:#x} holds a Mach-O TLV descriptor in an ELF image")));
-            }
         }
     }
     other.sort_unstable();
@@ -582,12 +578,12 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<Vec<Re
 
 const BLOOM_SHIFT: u32 = 26;
 
-fn gnu_hash(name: &[u8]) -> u32 {
+pub(super) fn gnu_hash(name: &[u8]) -> u32 {
     name.iter().fold(5381u32, |hash, &it| hash.wrapping_mul(33).wrapping_add(u32::from(it)))
 }
 
 /// The SysV ELF hash, of version names in `.gnu.version_r`.
-fn elf_hash(name: &[u8]) -> u32 {
+pub(super) fn elf_hash(name: &[u8]) -> u32 {
     let mut hash = 0u32;
     for &it in name {
         hash = (hash << 4).wrapping_add(u32::from(it));

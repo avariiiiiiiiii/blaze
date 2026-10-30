@@ -70,7 +70,8 @@ pub(super) fn descriptor() -> Result<u64, String> {
     }
     // A shared library that links blaze-live is found by its own path.
     // SAFETY: the loader's path of a loaded image ends in a zero and lives as long as it does.
-    let path = (!path.is_null()).then(|| unsafe { CStr::from_ptr(path) }).filter(|it| !it.is_empty());
+    let path =
+        (!path.is_null()).then(|| unsafe { CStr::from_ptr(path) }).filter(|it| !it.is_empty());
     if let Some(path) = path {
         // SAFETY: NOLOAD opens nothing new; the handle is closed below.
         let handle = unsafe { dlopen(path.as_ptr(), RTLD_LAZY | RTLD_NOLOAD) };
@@ -83,7 +84,8 @@ pub(super) fn descriptor() -> Result<u64, String> {
             return Ok(found);
         }
     }
-    let path = path.map_or("the program".into(), CStr::to_string_lossy);
+    let path =
+        path.map_or_else(|| "the program".to_owned(), |it| it.to_string_lossy().into_owned());
     Err(format!("{path} exports no {DESCRIPTOR}: blaze-link links it for live patches"))
 }
 

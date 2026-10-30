@@ -4603,6 +4603,12 @@ impl Declared {
         for id in scope.unnamed_consts() {
             self.body(id.into());
         }
+        // A discriminant is a body, whose blocks can declare a `#[used]` static.
+        for owner in hir_def::nameres::demand::scope_body_owners(db, scope) {
+            if let DefWithBodyId::VariantId(_) = owner {
+                self.body(owner);
+            }
+        }
         for imp in scope.impls() {
             for &(_, item) in imp.impl_items(db).items.iter() {
                 match item {
@@ -8038,7 +8044,6 @@ pub fn main() -> anyhow::Result<()> {
     if let Some(sources) = option_env!("BLAZE_SOURCES") {
         blaze_store::built_from(sources);
     }
-    syntax::set_green_trees(std::env::var_os("BLAZE_GREEN_TREES").is_some());
     project_model::answer_toolchain_questions_with(answers::ask);
     // A build script runs blaze as its `RUSTC`, whose load asks what it asks
     // rustc of [`answers`].

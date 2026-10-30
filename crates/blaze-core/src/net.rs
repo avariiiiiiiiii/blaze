@@ -43,6 +43,14 @@ impl Listener {
         }
     }
 
+    /// The address a TCP listen was given (its port, where it asked for port 0).
+    pub(crate) fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Listener::Unix { .. } => None,
+            Listener::Tcp(listener) => listener.local_addr().ok(),
+        }
+    }
+
     pub(crate) fn accept(&self) -> io::Result<Socket> {
         match self {
             Listener::Unix { listener, .. } => Ok(Socket::Unix(listener.accept()?.0)),

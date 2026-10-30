@@ -83,7 +83,8 @@ impl Memory for Os {
     const SEH: bool = false;
 
     fn code(&mut self, writes: &[(u64, Vec<u8>)]) -> Result<(), String> {
-        let mut writes: Vec<&(u64, Vec<u8>)> = writes.iter().filter(|it| !it.1.is_empty()).collect();
+        let mut writes: Vec<&(u64, Vec<u8>)> =
+            writes.iter().filter(|it| !it.1.is_empty()).collect();
         writes.sort_by_key(|it| it.0);
         // The writes in runs of pages, each swapped once.
         let mut runs: Vec<(Range<u64>, Vec<&(u64, Vec<u8>)>)> = Vec::new();
@@ -152,11 +153,7 @@ impl Memory for Os {
     }
 
     fn functions(&mut self, functions: &[(u64, u64, u64)]) -> Result<(), String> {
-        if functions.is_empty() {
-            Ok(())
-        } else {
-            Err("RUNTIME_FUNCTIONs on macOS".to_owned())
-        }
+        if functions.is_empty() { Ok(()) } else { Err("RUNTIME_FUNCTIONs on macOS".to_owned()) }
     }
 
     fn publish(&mut self, cell: u64, table: u64) -> Result<(), String> {

@@ -1,4 +1,4 @@
-//! Global interning in sharded, append-only arenas (docs/v2/format.md section 5, "IDs, two
+//! Global interning in sharded, append-only arenas (docs/v2/plan/lanes/format.md section 5, "IDs, two
 //! kinds"): an interned value is stored once, never moves and is never freed, and its handle is
 //! a `Copy` pointer compared by address.
 

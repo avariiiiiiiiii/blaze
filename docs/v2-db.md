@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # blaze v2: the query database (lane db)
 
-Design notes for [docs/v2/db.md](v2/db.md), as written on 2026-10-29. The code is
+Design notes for [docs/v2/plan/lanes/db.md](v2/plan/lanes/db.md), as written on 2026-10-29. The code is
 `crates/blaze-query/`; the front end's changes are in `vendor/salsa*`, `crates/base-db`,
 `crates/hir-expand`, `crates/hir-def`, `crates/hir-ty`, `crates/hir` and the borrow checker.
 

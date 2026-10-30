@@ -435,15 +435,14 @@ impl Entry {
             hasher.update((bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        // 12: an import of the standard library's unit is checked (#328).
-        field(b"blaze entry 12");
+        // 13: `ub_checks()` is the compiling crate's `debug-assertions`, as rustc has it.
+        field(b"blaze entry 13");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());
-        // Nor is code of an optimized body; the keys of the default level stay what they were.
-        let level = super::mir_opt_level().number();
-        if level != 0 {
-            field(&[b'M', level]);
+        // Nor is code of a body at a level asked for in place of rustc's.
+        if let Some(level) = super::mir_opt_level() {
+            field(&[b'M', level.number()]);
         }
         // Nor is code for one target what another runs.
         field(super::Target::selected().ok()?.triple().as_bytes());

@@ -1,4 +1,4 @@
-//! blaze v2's query database (docs/v2/db.md section 7, docs/v2/items.md section 6.2), remade
+//! blaze v2's query database (docs/v2/plan/lanes/db.md section 7, docs/v2/plan/lanes/items.md section 6.2), remade
 //! from `vendor/salsa`.
 //!
 //! - A query is asked of a [`QueryKey`]: its kind and the content ID of its arguments. Results
@@ -9,7 +9,7 @@
 //!   the fingerprint it had then. A rerun that produces the same fingerprint stops there
 //!   (early cutoff); fingerprints outlive evicted values, so eviction never breaks cutoff.
 //!   No result is reused unless every edge's fingerprint is equal (#350).
-//! - A **fact** is the narrowest thing a query read (docs/v2/items.md section 6.2's table): a
+//! - A **fact** is the narrowest thing a query read (docs/v2/plan/lanes/items.md section 6.2's table): a
 //!   query of its own whose value is small and whose fingerprint is the hash it stands for (an
 //!   interface hash, a layout hash, "N in S resolves to X"). The kinds of fact are
 //!   `blaze-items`'s.

@@ -119,15 +119,15 @@ where
                 #[cfg(feature = "accumulator")]
                 accumulated_inputs: Default::default(),
                 verified_final: AtomicBool::new(!is_provisional),
-                fingerprint: if is_provisional {
-                    Fingerprint::NONE
-                } else {
-                    C::fingerprint(&value).unwrap_or(Fingerprint::NONE)
-                },
-                edge_fingerprints: ThinVec::new(),
+                fingerprints: ThinVec::new(),
             },
             stale_tracked_structs: Vec::new(),
         };
+        if !is_provisional {
+            completed_query
+                .revisions
+                .set_value_fingerprint(C::fingerprint(&value).unwrap_or(Fingerprint::NONE));
+        }
         if is_provisional {
             // Assigned memos aren't cycle heads, so only their inherited head stamps matter.
             completed_query

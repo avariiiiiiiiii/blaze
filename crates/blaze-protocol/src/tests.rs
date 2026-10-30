@@ -475,3 +475,11 @@ fn a_record_of_functions_is_small() {
     assert_eq!(from_slice::<Record>(&bytes).unwrap(), record);
     assert!(bytes.len() < names + 1000 * 128, "{} bytes for {names} of names", bytes.len());
 }
+
+#[test]
+fn a_cancelled_node_is_settled_and_encodes_as_its_name() {
+    use crate::events::NodeState;
+    encodes(NodeState::Cancelled, "6943616e63656c6c6564");
+    assert!(NodeState::Cancelled.settled());
+    assert!(!NodeState::Ready.settled());
+}

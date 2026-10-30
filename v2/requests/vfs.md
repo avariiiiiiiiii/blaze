@@ -12,8 +12,9 @@ with `Watched::Lost`, and the caller must start it on a head that already holds 
 directory does. Once it exists, the vfs lane makes `lost` a rescan (diff of listing and head)
 and adds `Watcher::scan`.
 
-Status: core has added `Effect::List` and `Done::Listed`; the watcher does not use it yet
-(the vfs lane's next step, with item 6).
+Status: done. Core added `Effect::List` and `Done::Listed`; the watcher scans with it when a
+watch starts and rescans on `lost`. Note for core: the simulation's `List` fails for a
+directory that holds no file (it has no directory entries), where a real one lists nothing.
 
 ## 2. interface: `Vfs::apply` with an unknown base
 
@@ -65,6 +66,6 @@ rather than minting its own, and `blaze_api::build::Opened` drops its second fie
 fills `base_db::ViewFile` for the front end reads a source file with `Vfs::follow`, not
 `Vfs::read`: a symlink's own bytes are its target's path.
 
-Why: the vfs arena is the one every crate uses (`docs/v2/crates.md`). rustc opens a
+Why: the vfs arena is the one every crate uses (`docs/v2/plan/reference/crates.md`). rustc opens a
 symlinked `.rs` file as its target, so the front end must see the target's text
 (superset-of-rust).

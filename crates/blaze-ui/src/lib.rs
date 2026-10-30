@@ -164,7 +164,9 @@ fn crate_state(kind: NodeKind, state: &NodeState) -> CrateState {
         }
         (_, NodeState::Built) => CrateState::Built,
         (_, NodeState::Cached { .. }) => CrateState::UpToDate,
-        (_, NodeState::Failed { .. } | NodeState::Skipped { .. }) => CrateState::Failed,
+        (_, NodeState::Failed { .. } | NodeState::Skipped { .. } | NodeState::Cancelled) => {
+            CrateState::Failed
+        }
     }
 }
 

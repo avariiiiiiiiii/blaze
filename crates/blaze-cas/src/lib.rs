@@ -1,4 +1,4 @@
-//! blaze v2's store (docs/v2/store.md section 8). Replaces `blaze-store`.
+//! blaze v2's store (docs/v2/plan/lanes/store.md section 8). Replaces `blaze-store`.
 //!
 //! - A value is kept under a [`Key`]: the BLAKE3 hash of exactly what it was made from (the
 //!   source, cfg, features, target, toolchain, the layout facts read, the schema and code of
@@ -42,7 +42,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::disk::{
-    BLOCK, CHUNK_DOMAIN, DICTIONARY_DOMAIN, DictionaryRef, ExternalRef, Form, HEAD_FILE, Head,
+    CHUNK_DOMAIN, DICTIONARY_DOMAIN, DictionaryRef, ExternalRef, Form, HEAD_FILE, Head,
     IndexRef, Loc, NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, Table,
     content_of,
 };
@@ -568,8 +568,8 @@ impl Store {
                     let len = piece.len() as u64;
                     match cold::lz4(piece) {
                         Some(stored) => {
-                            let content = content_of(piece);
-                            self.append_value(chunk, Kind::Output, Form::Lz4, 0, content, len, &stored);
+                            let (kind, content) = (Kind::Output, content_of(piece));
+                            self.append_value(chunk, kind, Form::Lz4, 0, content, len, &stored);
                         }
                         None => {
                             self.append(chunk, Kind::Output, Form::Raw, 0, content_of(piece), piece);

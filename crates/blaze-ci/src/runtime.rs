@@ -353,10 +353,10 @@ pub(crate) fn save(path: &Path, state: &State) -> Result<(), String> {
         .map_err(|error| failed("writing the temporary file", &error))?;
     drop(file);
     fs::rename(&temp, path).map_err(|error| failed("renaming the temporary file over it", &error))?;
-    if let Some(dir) = path.parent().filter(|it| !it.as_os_str().is_empty())
-        && let Ok(dir) = fs::File::open(dir)
-    {
-        let _ = dir.sync_all();
+    if let Some(dir) = path.parent().filter(|it| !it.as_os_str().is_empty()) {
+        fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| failed("syncing its directory so the rename lasts", &error))?;
     }
     Ok(())
 }

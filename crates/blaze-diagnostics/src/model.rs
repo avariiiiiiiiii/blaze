@@ -294,7 +294,15 @@ pub struct Diag {
     /// The facts the query that found it read, narrowest first: what to change to make it go
     /// away, and why it came back after an edit (`blaze_api::Diagnostic::facts`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub facts: Vec<Fact>,
+    pub facts: Vec<Read>,
+}
+
+/// A fact a diagnostic read, and what it stands for in words, written where the names are
+/// known (a fact's key is a hash): "what `len` is on `Vec<u8>`".
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Read {
+    pub fact: Fact,
+    pub what: String,
 }
 
 impl Diag {
@@ -464,12 +472,20 @@ impl Diag {
         self
     }
 
-    /// Records a fact the query that found it read.
-    pub fn fact(&mut self, fact: Fact) -> &mut Diag {
-        if !self.facts.contains(&fact) {
-            self.facts.push(fact);
+    /// Records a fact the query that found it read, and what it stands for.
+    pub fn fact(&mut self, fact: Fact, what: impl Into<String>) -> &mut Diag {
+        if !self.facts.iter().any(|it| it.fact == fact) {
+            self.facts.push(Read { fact, what: what.into() });
         }
         self
+    }
+
+    /// [`Diag::fact`] of a fact that may not be had (a type with no simplified form).
+    pub fn fact_opt(&mut self, fact: Option<Fact>, what: impl Into<String>) -> &mut Diag {
+        match fact {
+            Some(fact) => self.fact(fact, what),
+            None => self,
+        }
     }
 
     /// rustc's note on a diagnostic in a macro's expansion: which macro it came from
@@ -544,7 +560,7 @@ mod tests {
     #[test]
     fn a_diagnostic_round_trips_in_json() {
         let mut diag = Diag::lint("unused_variables", "unused variable: `x`", span(8, 9));
-        diag.fact(Fact::Code(blaze_items::ItemKey(blaze_ids::ContentId([1; 32]))));
+        diag.fact(Fact::Code(blaze_items::ItemKey(blaze_ids::ContentId([1; 32]))), "the code of `f`");
         let text = serde_json::to_string(&diag).unwrap();
         let back: Diag = serde_json::from_str(&text).unwrap();
         assert_eq!(back, diag);

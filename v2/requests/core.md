@@ -6,7 +6,7 @@
   (already in `Cargo.lock` through rayon, so the lock does not change).
 - Where: root `Cargo.toml`; used by `crates/blaze-graph/Cargo.toml` (`crossbeam-deque.workspace
   = true`).
-- Why: the worker pool (docs/v2/core.md section 4) steals work between threads; each worker's
+- Why: the worker pool (docs/v2/plan/lanes/core.md section 4) steals work between threads; each worker's
   deque is crossbeam's Chase-Lev deque, so the hot path takes no lock.
 
 ---
@@ -33,7 +33,7 @@ Applied by the coordinator, 16:46.
   `blaze_graph::exec::Scheduler` as `Task`s with their `TaskKind`, the plane's budget from
   `blaze_graph::arena::machine_budget`.
 - Where: the crate holding the daemon's `main` (cargo or ci), `crates/blaze-cargo/src/memory.rs`.
-- Why: memory admission (docs/v2/core.md section 4) learns each kind's peak from what the
+- Why: memory admission (docs/v2/plan/lanes/core.md section 4) learns each kind's peak from what the
   counting allocator measures per task and holds the daemon's own arenas against the budget;
   without the allocator every measured peak is 0 and admission admits everything.
 

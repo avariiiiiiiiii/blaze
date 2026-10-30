@@ -224,7 +224,11 @@ fn a_request_split_across_many_receives_arrives_once() {
 fn receives_of_a_large_frame_grow_with_what_has_come_of_it() {
     let mut rig = Rig::new(config(true, false));
     let conn = rig.accept(true, 1);
-    let ops = vec![blaze_vfs::Op::Write { path: "big.rs".to_owned(), bytes: vec![0; 4 << 20] }];
+    let ops = vec![blaze_vfs::Op::Write {
+        path: "big.rs".to_owned(),
+        bytes: vec![0; 4 << 20],
+        mode: blaze_vfs::Mode::Regular,
+    }];
     let request = Request::Commit { head: "main".to_owned(), base: Default::default(), ops };
     let bytes = frame_of(1, request.clone());
     let mut at = 0;

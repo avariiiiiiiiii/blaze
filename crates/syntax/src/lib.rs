@@ -222,16 +222,15 @@ impl Parse<SourceFile> {
         edition: Edition,
     ) -> Option<Parse<SourceFile>> {
         // FIXME: validation errors are not handled here
-        let parsing::Reparsed { tree, errors, .. } = parsing::incremental_reparse(
+        let (tree, errors, _reparsed_range) = parsing::incremental_reparse(
             self.tree.as_ref().unwrap().flat(),
             delete,
             insert,
             self.errors.as_deref().unwrap_or_default().iter().cloned(),
             edition,
-            self.outline.is_some(),
+            self.outline,
         )?;
-        let outline = self.outline.map(|_| edition);
-        Some(Parse::with_outline(Tree::new(std::sync::Arc::new(tree)), errors, outline))
+        Some(Parse::with_outline(Tree::new(std::sync::Arc::new(tree)), errors, self.outline))
     }
 
     fn full_reparse(&self, delete: TextRange, insert: &str, edition: Edition) -> Parse<SourceFile> {

@@ -1,23 +1,23 @@
 # Requests of lane cargo
 
-Lane cargo's design is `docs/v2/cargo-notes.md`. Its children (cargo-load, cargo-std,
+Lane cargo's design is `docs/v2/plan/lanes/cargo/notes.md`. Its children (cargo-load, cargo-std,
 cargo-daemon, cargo-cli) append below, each request saying which child it comes from.
 
 ## 1. Ownership: blaze-manifest, blaze-metadata, blaze-resolve, blaze-registry, blaze-source to lane cargo
 
-What: in `docs/v2/crates.md`, add `crates/blaze-manifest/`, `crates/blaze-metadata/`,
+What: in `docs/v2/plan/reference/crates.md`, add `crates/blaze-manifest/`, `crates/blaze-metadata/`,
 `crates/blaze-resolve/`, `crates/blaze-registry/` and `crates/blaze-source/` to lane cargo's
 paths, and take `blaze-tree` and `blaze-units` out of the "Every other path" paragraph (the table
 already gives them to cargo; the paragraph says they are the coordinator's).
 
-Why: README section 18 gives cargo "everything cargo-shaped that no lane had", and the workspace
+Why: `docs/v2/plan/process/building.md` section 18 gives cargo "everything cargo-shaped that no lane had", and the workspace
 load as queries over a view can't be written without changing these crates. Today they read the
 machine's disk directly: `blaze_manifest::manifest::read_manifest` (`std::fs::read`), target
 autodiscovery (`targets.rs`: `exists`, `is_file`, `read_dir`), workspace member globs
 (`manifest.rs`: `glob::glob`, `is_dir`), config discovery (`config/mod.rs`:
 `read_to_string`, `exists`), blaze-metadata's reads of registry packages, and blaze-registry's
 fetches. A query must read every file through `blaze_query::Cx` (so each read is an edge and
-the result is keyed by what it read, docs/v2/README.md section 2), and a view is a Merkle root,
+the result is keyed by what it read, docs/v2/plan.md section 2), and a view is a Merkle root,
 not the disk (a what-if or a PR view has no directory). The change is one trait threaded
 through `blaze_manifest::Context`:
 
@@ -40,7 +40,7 @@ pub struct Disk;
 with `Context::with_files(config, files: Rc<dyn Files>)` and glob expansion done over `list`
 (cargo's `glob` semantics kept). blaze-metadata's registry reads take the same `Files`; fetching
 moves to the daemon (effects), which mounts each fetched package as a VFS root
-(`docs/v2/cargo-notes.md`, "Sources"). No behavior changes for a `Disk` context, which every
+(`docs/v2/plan/lanes/cargo/notes.md`, "Sources"). No behavior changes for a `Disk` context, which every
 v1 caller keeps; `harness/resolve.py` still holds them to cargo. Lane cargo writes all of it once
 granted; until then its child cargo-load writes everything else.
 
@@ -67,14 +67,14 @@ Why: a build reads files of more than the view: every registry and git dependenc
 and the standard library's are content-addressed roots of their own, mounted where cargo would
 have them (`$CARGO_HOME/registry/src/...`, the sysroot's `library/`). Keyed by the root's
 content ID, their results are shared by every view and project that uses the same version: the
-shared base layer (docs/v2/ci.md). Reading them through `Cx::file` would need every view to
+shared base layer (docs/v2/plan/lanes/ci.md). Reading them through `Cx::file` would need every view to
 contain every dependency's files. `Tree::file(root, path)` already reads any root; this only
 exposes it to a query, with an edge, so `Why` can still name the file.
 
 ## 3. `crates/blaze-api/src/lib.rs`: what cargo's command line and cargo's output need (schema 5)
 
 Why: the CLI (`blaze build|run|test|check`, `cargo blaze`) is a client of the agent API with
-cargo's flags, output and exit codes unchanged (README section 18). `Targets` holds six of
+cargo's flags, output and exit codes unchanged (`docs/v2/plan/process/building.md` section 18). `Targets` holds six of
 cargo's flags; a build also depends on target selection, `--workspace`, `--exclude`,
 `--config`, `-Z`, `--manifest-path`, `--locked`/`--offline`/`--frozen`, the environment cargo
 and build scripts read (`RUSTFLAGS`, `CARGO_*`, `PATH` for a script's `cc`), and config files
@@ -220,3 +220,35 @@ it the unit).
 `blaze_cargo::cargo::command`. At integration the `blaze` program (and `cargo-blaze`, which cargo
 runs for `cargo blaze`) runs `blaze_cargo::cli::main(std::env::args_os())` (lane cargo's v2
 client), and `blaze serve` runs `blaze_cargo::serve::main` (lane cargo's v2 daemon).
+
+## 5. From cargo-load: request 1 also covers the config chain, and two notes
+
+**What (addendum to request 1, `crates/blaze-manifest/src/config/mod.rs`):** the config chain reads
+through the same `Files` as manifests:
+
+```rust
+impl Config {
+    /// `Config::load`, every file (`.cargo/config.toml` up from `cwd`, `$CARGO_HOME/config.toml`,
+    /// `include`s, a `--config` file) read through `files`; `load` is `load_with(.., Rc::new(Disk))`.
+    pub fn load_with(cwd: &Path, env: impl IntoIterator<Item = (String, String)>, files: Rc<dyn Files>) -> anyhow::Result<Config>;
+}
+```
+
+and `Context::with_files(config, files)` is given the same `files`. cargo-load's
+`crates/blaze-units/src/load/` calls exactly `blaze_manifest::files::{Files, FileKind}`,
+`Config::load_with`, `Config::start`, `Context::with_files`, `read_manifest`, `Workspace::new`.
+cargo-load's `Files` are owned values (a snapshot of what the query read, filled between runs),
+so `Rc<dyn Files>` with its implied `'static` is fine. When request 1 is granted, cargo-load
+writes all of it.
+
+**Note (crates/blaze-query/src/lib.rs, coordinator):** `Database::prepare` and `run_query`
+encode and decode `Q::Key` with CBOR, but `Query::Key` is bounded only by `Clone + Send + Sync`;
+it needs `serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static` to compile.
+cargo-load's keys are all `String`, `()` or serde structs.
+
+**Note (crates/blaze-units/src/query.rs, lane cargo; for cargo-cli):** cargo-load writes
+`LoadError::what` without the leading `error: `: the message, then for each cause
+`\n\nCaused by:\n  <cause>` (each line of a cause indented two spaces), as cargo prints it after
+`error: `. `NUM_JOBS` of a build script's run is in `UnitPlan::env` only when `-j` or
+`build.jobs` names it; otherwise the daemon sets it to its own job count, as cargo's default is the
+machine's parallelism, which a view's configuration does not have.

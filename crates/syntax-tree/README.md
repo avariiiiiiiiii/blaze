@@ -4,11 +4,14 @@ blaze's syntax trees. It started as [rowan 0.17.0](https://github.com/rust-analy
 has a second, flat kind of tree behind its cursor (`src/flat.rs`, docs/flat-syntax.md), which is
 what every parse makes; green trees remain for editing (`clone_for_update`, the syntax editor).
 
-A flat tree is every node and token in preorder, packed: one `u32` an element (its kind, whether
-it is a node, token or lazy node, and a token's length or a node's subtree size, with values too
-large for it in a small side table), a parent per element and the start of every eighth element,
-about 8.5 bytes an element. Its text is not copied: the tree shares the file's source
-(`FlatTree::source`, `FlatTreeBuilder::sourced`).
+A flat tree is every node and token in preorder, packed to the budgets of
+docs/v2/plan/design/data.md, a token 4 bytes and a node 8. Each element has one `u32` holding its kind,
+whether it is a node, token or lazy node, and either a token's length and how far back its parent
+is, or a node's subtree size. Values too large for the word are in small sorted side tables. A
+node's parent is in a column of nodes only, found by its rank (a bit per element and a count per
+64), and the start of every eighth element is kept. That is about 6.5 bytes an element for Rust.
+Its text is not copied: the tree shares the file's source (`FlatTree::source`,
+`FlatTreeBuilder::sourced`).
 
 A flat tree may have lazy nodes (`FlatTreeBuilder::lazy`): a node whose text is not parsed, as
 an outline parse leaves the body of every `fn`. The arrays show it without children, so walks of

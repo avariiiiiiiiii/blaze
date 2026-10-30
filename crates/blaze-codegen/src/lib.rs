@@ -1,4 +1,4 @@
-//! Per-function codegen (docs/v2/codegen.md section 9, docs/v2/items.md section 6.4).
+//! Per-function codegen (docs/v2/plan/lanes/codegen.md section 9, docs/v2/plan/lanes/items.md section 6.4).
 //!
 //! The unit of codegen is a function [`Instance`]: a generic's code hash and the facts of its
 //! type arguments it reads, so identical instances across crates, branches and projects

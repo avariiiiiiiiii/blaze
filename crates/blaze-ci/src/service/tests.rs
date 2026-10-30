@@ -141,12 +141,19 @@ fn error(message: &str, file: &str) -> Response {
             end_line: 10,
             end_column: 9,
             label: Some("expected `u32`".to_owned()),
+            byte_start: 120,
+            byte_end: 124,
+            primary: true,
+            replacement: None,
+            applicability: None,
         }],
         children: Vec::new(),
         facts: vec![FactRead {
             key: blaze_query::QueryKey { kind: blaze_query::QueryKind(3), input: ContentId([4; 32]) },
             what: "the signature of `parser::Token::new`".to_owned(),
         }],
+        rendered: String::new(),
+        unit: None,
     })
 }
 
@@ -202,6 +209,8 @@ fn a_push_end_to_end() {
             spans: Vec::new(),
             children: Vec::new(),
             facts: Vec::new(),
+            rendered: String::new(),
+            unit: None,
         }),
     });
     let out = sim.step(Input::Ended { job, run: check_run, ok: true });

@@ -21,17 +21,20 @@ pub struct Opened {
     pub queries: ViewId,
 }
 
+/// What a job does, and what it reports. Every job that builds reports, as they come,
+/// [`crate::Response::Unit`] for each unit begun, [`crate::Response::BuildScript`] for each
+/// build script run and [`crate::Response::Diagnostic`]s (each naming its unit).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Work {
-    /// Reports [`crate::Response::Diagnostic`]s.
+    /// Then [`crate::Response::Built`] with an artifact for each unit that checked (its
+    /// metadata).
     Check(Targets),
-    /// Reports diagnostics, then [`crate::Response::Built`].
+    /// Then [`crate::Response::Built`] and [`crate::Response::Work`].
     Build(Targets),
-    /// Reports diagnostics, then a [`crate::Response::TestResult`] per test,
-    /// [`crate::TestOutcome::Unreached`] for each the change reached none of (all run with
-    /// `all`).
+    /// Then a [`crate::Response::TestResult`] per test, [`crate::TestOutcome::Unreached`] for
+    /// each the change reached none of (all run with `all`), and [`crate::Response::Work`].
     Test { targets: Targets, filter: Vec<String>, all: bool },
-    /// Reports diagnostics, then [`crate::Response::Ran`].
+    /// Then [`crate::Response::Ran`] and [`crate::Response::Work`].
     Run { targets: Targets, bin: Option<String>, args: Vec<String> },
     /// What the job's view's change from `from` reaches ([`crate::Response::Reached`]),
     /// building nothing. `changes` is the VFS's diff of the two.
@@ -42,6 +45,12 @@ pub enum Work {
     /// The daemon's state made durable (the image, the journal, the store), reported as
     /// [`crate::Response::Snapshotted`] once it is. Has no view.
     Snapshot,
+    /// [`crate::Response::CodegenInputs`] of the view's last build.
+    CodegenInputs(Targets),
+    /// [`crate::Response::Trace`] of the view's last build, from the database's memos.
+    Trace(Targets),
+    /// [`crate::Response::Tables`]: each table's owner reports its own.
+    Tables,
 }
 
 /// The daemon's build, as the session drives it.

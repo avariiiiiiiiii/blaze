@@ -1,4 +1,4 @@
-//! The rule for a wait inside a task (#1301, docs/v2/core.md "Issues this lane takes in"): a
+//! The rule for a wait inside a task (#1301, docs/v2/plan/lanes/core.md "Issues this lane takes in"): a
 //! thread that waits for what another task makes runs other ready jobs of its pool while it
 //! waits (it **pumps**), and a wait that would close a cycle gives way at once with
 //! [`Cancelled`], so the task that asked unwinds, releases what it holds and is posted again.

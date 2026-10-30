@@ -437,6 +437,7 @@ mod tests {
             live: None,
             tags: 0,
             stack: None,
+            name: "test".into(),
         }
     }
 

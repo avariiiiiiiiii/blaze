@@ -12,7 +12,7 @@ format-hir) append below with their name.
    `ast::SourceFile::parse_shared(text, edition)`; `parse_errors` of a dependency file uses
    `Parse::errors_with_bodies()` only when the build checks that crate (`blaze check` checks
    workspace crates fully; a dependency's body that is never reached is never parsed: see the
-   report's note on syntax errors in unreached bodies). Why: #1294, docs/v2/format.md
+   report's note on syntax errors in unreached bodies). Why: #1294, docs/v2/plan/lanes/format.md
    "Issues this lane takes in": dependency bodies are parsed only when reached. The parse
    query needs to know the file's crate; if it can't, a second query `parse_outline` beside
    `parse`, chosen by the caller that knows the crate, works as well.
@@ -20,7 +20,7 @@ format-hir) append below with their name.
    make it `std::sync::Arc<str>` instead of `triomphe::Arc<str>`, so `parse_shared` /
    `parse_outline` keep the file's own text in the tree instead of a copy (syntax-tree's
    `FlatTree::source` is a `std::sync::Arc<str>`; it can't take triomphe's without a copy).
-   Why: docs/v2/format.md "Syntax": text read from the source, not copied.
+   Why: docs/v2/plan/lanes/format.md "Syntax": text read from the source, not copied.
 3. **Drop the green-tree switch** — `crates/blaze-engine/src/lib.rs:8041` (lane codegen):
    delete `syntax::set_green_trees(std::env::var_os("BLAZE_GREEN_TREES").is_some());`.
    Why: parses make only flat trees now (no-fallback: no second path); `set_green_trees` is
@@ -29,12 +29,12 @@ format-hir) append below with their name.
    parse of the same file is at hand and the VFS gives the edit (`blaze_vfs::Change`), make
    the new parse with `Parse::reparse(delete, insert, edition)` rather than parsing the whole
    file. It gives the same tree as a full parse (format-parse's tests check it). Why:
-   docs/v2/format.md "an edit reparses the changed item".
+   docs/v2/plan/lanes/format.md "an edit reparses the changed item".
 
 ## format-span-intern
 
-`crates/intern/` is now sharded and append-only (docs/v2/format.md section 5, "IDs, two kinds";
-docs/v2/db.md: memory is bounded by the db's reachability GC rebuilding arenas, not by
+`crates/intern/` is now sharded and append-only (docs/v2/plan/lanes/format.md section 5, "IDs, two kinds";
+docs/v2/plan/lanes/db.md: memory is bounded by the db's reachability GC rebuilding arenas, not by
 refcounts). `Interned`, `InternedRef`, `InternedSlice`, `InternedSliceRef` and `Symbol` are
 `Copy` pointers with no reference count; nothing is ever freed. So the GC (`intern::GarbageCollector`,
 `GcInternedVisit`, `GcInternedSliceVisit`), `InternedRef::decrement_refcount`,
@@ -147,7 +147,7 @@ are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*
    ```
    Why: `hir/persist.rs`, `item_tree/persist.rs` and `expr_store/persist.rs` implement
    `blaze_format::Persist` for `ItemTree`, `ExpressionStore`, `Body` and their source maps
-   (docs/v2/format.md section 5). Both crates are already workspace dependencies
+   (docs/v2/plan/lanes/format.md section 5). Both crates are already workspace dependencies
    (`Cargo.toml`: `blaze-format = { path = "crates/blaze-format" }`, `blaze-ids = ...`).
    hir-def doesn't build without it.
 
@@ -182,3 +182,18 @@ are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*
    with `new_source_root:library` (so `CrateOrigin::Library`) and asserts its file is parsed
    as an outline: it fails, naming base-db's parse query, until the lead's request 1 above is
    applied.
+
+## format-span
+
+1. **Expect tests that print body ast ids, no edit until built** (hir-def, hir-expand, hir-ide
+   tests; owners: format-hir and the coordinator). `span::ast_id` gives ids inside a fn body a
+   new layout (`HASH 16 | INDEX 10 | BODY 1 | KIND 5`, the body bit set, the hash bits a slot
+   the outline reserves per body, the index counting that kind in the body). Ids outside bodies
+   print as before. Any expect test that prints an id of a node inside a fn body (Debug shows
+   `Kind[XXXX, n, body]`) changes: rerun it with `UPDATE_EXPECT=1` once built and check only ids
+   moved. The marker ids (root, fixup, no-downmap) keep their raw values, so
+   `proc-macro-api`'s `OLD_FIXUP_AST_ID` and the proc-macro wire format are unchanged.
+2. **Persisted ast ids** (`hir-def/src/nameres/frozen.rs`, `hir-def/src/hir/persist.rs`,
+   `load-cargo`; owners: format-hir, the coordinator): they write `ErasedFileAstId::into_raw`.
+   Raw ids from before this change decode to other nodes. If any of these encodings can be read
+   back across blaze versions without a version in their cache key, bump it; otherwise nothing.

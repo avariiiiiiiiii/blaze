@@ -1,4 +1,4 @@
-//! Proc-macro expansions kept in the store (docs/v2/usercode.md section 6.5), so that no
+//! Proc-macro expansions kept in the store (docs/v2/plan/lanes/usercode.md section 6.5), so that no
 //! macro is expanded twice for the same inputs, on this machine or, through the store's
 //! remote, another.
 //!
@@ -147,6 +147,18 @@ pub fn install(expansions: Expansions) -> Result<(), String> {
 
 fn installed() -> &'static Installed {
     INSTALLED.get().expect("an expander is wrapped only once install has been")
+}
+
+/// Where an expander that keys its own expansions (blaze-macro-wasm's) keeps them, and how.
+#[derive(Clone, Copy)]
+pub struct Keeping {
+    pub expansions: &'static Expansions,
+    pub mode: Mode,
+}
+
+/// Where expansions are kept: `None` before [`install`], as in a bench, which keeps nothing.
+pub fn keeping() -> Option<Keeping> {
+    INSTALLED.get().map(|it| Keeping { expansions: &it.expansions, mode: it.mode })
 }
 
 fn wrap(

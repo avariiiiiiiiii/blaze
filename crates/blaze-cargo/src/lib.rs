@@ -12,6 +12,9 @@ pub mod answers;
 pub mod as_rustc;
 pub mod cargo;
 pub mod check;
+/// blaze v2's CLI: a client of the agent API with cargo's flags, output and exit codes
+/// (docs/v2/plan/lanes/cargo/notes.md section 7).
+pub mod cli;
 pub mod content;
 pub mod dep_info;
 pub mod deps;
@@ -27,6 +30,9 @@ pub mod process;
 pub mod remote;
 pub mod renamed;
 pub mod sandbox;
+/// blaze v2's daemon: the plane, the agent API's server and session, the VFS, the database and
+/// the store in one loop (docs/v2/plan/lanes/cargo/notes.md section 6).
+pub mod serve;
 pub mod socket;
 pub mod stub;
 pub mod symbols;

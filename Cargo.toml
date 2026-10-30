@@ -104,7 +104,7 @@ blaze-graph = { path = "crates/blaze-graph" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-ui = { path = "crates/blaze-ui" }
 blaze-web = { path = "crates/blaze-web" }
-# v2 (docs/v2/crates.md)
+# v2 (docs/v2/plan/reference/crates.md)
 blaze-api = { path = "crates/blaze-api" }
 blaze-cas = { path = "crates/blaze-cas" }
 blaze-ci = { path = "crates/blaze-ci" }

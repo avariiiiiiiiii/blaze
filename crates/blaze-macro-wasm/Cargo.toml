@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blake3.workspace = true
 ra-ap-rustc_lexer.workspace = true
 rustc-hash.workspace = true
 sha2 = "0.10"
@@ -23,6 +24,10 @@ target-lexicon = "0.13"
 wasmtime = { version = "49", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std"] }
 
 base-db.workspace = true
+blaze-core.workspace = true
+blaze-expand.workspace = true
+blaze-ids.workspace = true
+blaze-usercode.workspace = true
 salsa.workspace = true
 hir-expand.workspace = true
 intern.workspace = true

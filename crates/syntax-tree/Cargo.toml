@@ -1,5 +1,5 @@
 # blaze's syntax trees: rowan 0.17.0 from crates.io, with a second kind of tree in its cursor,
-# a flat one (`flat.rs`): packed arrays of about 8.5 bytes an element over a shared source, with
+# a flat one (`flat.rs`): packed arrays (a token 4 bytes, a node 8) over a shared source, with
 # lazy nodes whose parts are parsed when a cursor enters them. Every parse makes a flat tree;
 # green trees remain for editing. Everything else is as published.
 [package]

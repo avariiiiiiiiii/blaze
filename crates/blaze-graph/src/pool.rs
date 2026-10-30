@@ -1,4 +1,4 @@
-//! The threads the plane's tasks run on (docs/v2/core.md section 4, docs/v2/plane.md "The
+//! The threads the plane's tasks run on (docs/v2/plan/lanes/core.md section 4, docs/v2/plan/lanes/core/plane.md "The
 //! executor"): one worker per CPU of a [`Topology`], stealing work nearest first.
 //!
 //! Each worker has a deque of its own and each group (the CPUs sharing a last-level cache or a
@@ -376,6 +376,9 @@ impl Shared {
 }
 
 impl Local {
+    /// The next job for this worker. A steal that leaves work where it took it from wakes
+    /// another worker for it: what moved into this deque, or stays in another's, was announced
+    /// by one wake only, and its worker is busy.
     fn find(&self) -> Option<Job> {
         if let Some(job) = self.deque.pop() {
             return Some(job);
@@ -386,7 +389,13 @@ impl Local {
             for &at in &shared.groups[self.group].order {
                 let group = &shared.groups[at];
                 match group.injector.steal_batch_with_limit_and_pop(&self.deque, BATCH) {
-                    Steal::Success(job) => return Some(job),
+                    Steal::Success(job) => {
+                        if !self.deque.is_empty() || !group.injector.is_empty() {
+                            fence(Ordering::SeqCst);
+                            shared.wake(self.group);
+                        }
+                        return Some(job);
+                    }
                     Steal::Retry => retry = true,
                     Steal::Empty => {}
                 }
@@ -394,8 +403,15 @@ impl Local {
                     if worker == self.index {
                         continue;
                     }
-                    match shared.slots[worker].stealer.steal() {
-                        Steal::Success(job) => return Some(job),
+                    let stealer = &shared.slots[worker].stealer;
+                    match stealer.steal() {
+                        Steal::Success(job) => {
+                            if !stealer.is_empty() {
+                                fence(Ordering::SeqCst);
+                                shared.wake(at);
+                            }
+                            return Some(job);
+                        }
                         Steal::Retry => retry = true,
                         Steal::Empty => {}
                     }
@@ -640,7 +656,7 @@ mod tests {
         let numbers: Vec<u64> = (0..100).collect();
         let total = pool.scope(|scope| {
             for chunk in numbers.chunks(10) {
-                scope.submit(None, || chunk.iter().sum::<u64>(), |it| {
+                scope.submit(None, move || chunk.iter().sum::<u64>(), |it| {
                     sums.lock().unwrap().push(it.unwrap());
                 });
             }

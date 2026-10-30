@@ -11,7 +11,7 @@ the codegen inputs of a build, the critical path of a cold build) is a method he
 
 - a method v1 has no answer to raises `Unmeasurable`, and the result says "unmeasured": a run
   against v1 still sets the bar;
-- a method whose v2 answer the agent API (`crates/blaze-api`, docs/v2/ci.md) has no request or
+- a method whose v2 answer the agent API (`crates/blaze-api`, docs/v2/plan/lanes/ci.md) has no request or
   response for raises `Missing`, naming it, which fails the script: the request for it is in
   `v2/requests/proof.md`. Nothing is guessed.
 
@@ -130,7 +130,7 @@ class Work:
 
 @dataclass(frozen=True)
 class Table:
-    """One of the daemon's long-lived tables (docs/v2/plan/data.md): how many elements
+    """One of the daemon's long-lived tables (docs/v2/plan/design/data.md): how many elements
     it holds and the bytes of all its columns and side tables together."""
 
     elements: int
@@ -297,7 +297,7 @@ class Engine(ABC):
     @abstractmethod
     def codegen_inputs(self, ws: Path, env: dict[str, str]) -> dict[str, str]:
         """The input of every function's code generation in the last build of `ws`, by the
-        instance's content key: what the oracle compares bit for bit (docs/v2/proof.md)."""
+        instance's content key: what the oracle compares bit for bit (docs/v2/plan/lanes/proof.md)."""
 
     @abstractmethod
     def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:
@@ -306,7 +306,7 @@ class Engine(ABC):
     @abstractmethod
     def tables(self, ws: Path, env: dict[str, str]) -> dict[str, Table]:
         """The daemon's tables for `ws` by name (`token`, `syntax-node`, `hir-expr`,
-        `mir-statement`, `memo`, `memo-edge`, `relocation`), for docs/v2/plan/data.md's size budgets."""
+        `mir-statement`, `memo`, `memo-edge`, `relocation`), for docs/v2/plan/design/data.md's size budgets."""
 
     @abstractmethod
     def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
@@ -403,7 +403,7 @@ class V1(Engine):
 
 
 class V2(Engine):
-    """blaze v2 (docs/v2/README.md): one daemon per machine, whose only interface is the agent
+    """blaze v2 (docs/v2/plan.md): one daemon per machine, whose only interface is the agent
     API; the command line is its client. Every build is its own (there is no path to cargo), so
     a build that exits 0 was blaze's."""
 

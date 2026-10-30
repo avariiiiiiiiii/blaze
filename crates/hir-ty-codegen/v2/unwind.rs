@@ -1,0 +1,223 @@
+//! A function's unwind information as v2 keeps it ([`Unwind`]): the instructions of its
+//! `.eh_frame` entry, apart from where the function is, and its landing pads as read-only
+//! data of its own. The linker writes the entries.
+
+use blaze_codegen::{Data, Target, Unwind};
+use cranelift_codegen::{
+    gimli::{
+        self, RunTimeEndian,
+        write::{Address, CommonInformationEntry, EhFrame, EndianVec, FrameTable},
+    },
+    isa::TargetIsa,
+};
+
+use crate::unwind::{FunctionUnwind, UnwindParts};
+
+/// `unwind` as v2 keeps it, with the data of its landing pads, if it has any. `personality`
+/// is the target of the routine that reads them.
+pub(crate) fn convert(
+    isa: &dyn TargetIsa,
+    unwind: &FunctionUnwind,
+    personality: impl FnOnce() -> Result<Target, String>,
+) -> Result<(Unwind, Option<Data>), String> {
+    match unwind.v2_parts() {
+        UnwindParts::Dwarf { fde, landing_pads } => {
+            let Some(cie) = isa.create_systemv_cie() else {
+                return Err(format!("{} has no DWARF call frame information", isa.triple()));
+            };
+            let entry = Entry::of(cie, fde)?;
+            let lsda = landing_pads.map(|pads| Data::new(4, pads.to_vec(), Vec::new()));
+            let personality = match lsda {
+                Some(_) => Some(personality()?),
+                None => None,
+            };
+            let unwind = Unwind::Dwarf {
+                code_align: entry.code_align,
+                data_align: entry.data_align,
+                return_address: entry.return_address,
+                cie: entry.cie,
+                fde: entry.fde,
+                personality,
+                lsda: lsda.as_ref().map(|it| it.id),
+            };
+            Ok((unwind, lsda))
+        }
+        UnwindParts::Windows { info, landing_pads: None, .. } => {
+            Ok((Unwind::Windows { info: info.to_vec(), handler: None, lsda: None }, None))
+        }
+        UnwindParts::Windows { landing_pads: Some(_), .. } => Err(
+            "a Windows function with landing pads: v2 has no SEH handler data yet".to_owned(),
+        ),
+    }
+}
+
+/// The fields of one CIE and FDE pair, as `.eh_frame` encodes them.
+#[derive(Debug, PartialEq, Eq)]
+struct Entry {
+    code_align: u32,
+    data_align: i32,
+    return_address: u16,
+    cie: Vec<u8>,
+    fde: Vec<u8>,
+}
+
+impl Entry {
+    /// Written by gimli, which keeps the instructions of both to itself, and read back.
+    fn of(
+        cie: CommonInformationEntry,
+        fde: gimli::write::FrameDescriptionEntry,
+    ) -> Result<Entry, String> {
+        let mut table = FrameTable::default();
+        let id = table.add_cie(cie);
+        table.add_fde(id, fde);
+        let mut eh_frame = EhFrame(EndianVec::new(RunTimeEndian::Little));
+        table.write_eh_frame(&mut eh_frame).map_err(|e| e.to_string())?;
+        Entry::read(eh_frame.0.slice())
+    }
+
+    /// The CIE and then the FDE of `bytes`, with no augmentation and absolute 8-byte
+    /// addresses, as [`Entry::of`] writes them.
+    fn read(bytes: &[u8]) -> Result<Entry, String> {
+        let mut at = Reader { bytes, at: 0 };
+        let cie_end = at.length()?;
+        if at.u32()? != 0 {
+            return Err("the first entry is no CIE".to_owned());
+        }
+        if at.u8()? != 1 {
+            return Err("a CIE of another version than 1".to_owned());
+        }
+        if at.u8()? != 0 {
+            return Err("a CIE with an augmentation".to_owned());
+        }
+        let code_align = u32::try_from(at.uleb()?).map_err(|e| e.to_string())?;
+        let data_align = i32::try_from(at.sleb()?).map_err(|e| e.to_string())?;
+        let return_address = u16::from(at.u8()?);
+        let cie = at.take(cie_end)?.to_vec();
+        let fde_end = at.length()?;
+        at.u32()?;
+        // Where the function starts and how long it is: the linker's to write.
+        at.skip(16)?;
+        let fde = at.take(fde_end)?.to_vec();
+        if at.at != bytes.len() {
+            return Err("more than one CIE and one FDE".to_owned());
+        }
+        Ok(Entry { code_align, data_align, return_address, cie, fde })
+    }
+}
+
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl Reader<'_> {
+    fn u8(&mut self) -> Result<u8, String> {
+        let byte = *self.bytes.get(self.at).ok_or("the entry ends early")?;
+        self.at += 1;
+        Ok(byte)
+    }
+
+    fn u32(&mut self) -> Result<u32, String> {
+        let bytes = self.bytes.get(self.at..self.at + 4).ok_or("the entry ends early")?;
+        self.at += 4;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+    }
+
+    /// The end of the entry whose length is next.
+    fn length(&mut self) -> Result<usize, String> {
+        let length = self.u32()?;
+        if length == u32::MAX {
+            return Err("a 64-bit entry".to_owned());
+        }
+        Ok(self.at + length as usize)
+    }
+
+    fn skip(&mut self, count: usize) -> Result<(), String> {
+        if self.at + count > self.bytes.len() {
+            return Err("the entry ends early".to_owned());
+        }
+        self.at += count;
+        Ok(())
+    }
+
+    fn take(&mut self, end: usize) -> Result<&[u8], String> {
+        let bytes = self.bytes.get(self.at..end).ok_or("the entry ends early")?;
+        self.at = end;
+        Ok(bytes)
+    }
+
+    fn uleb(&mut self) -> Result<u64, String> {
+        let (mut value, mut shift) = (0u64, 0u32);
+        loop {
+            let byte = self.u8()?;
+            if shift >= 64 {
+                return Err("a LEB128 of more than 64 bits".to_owned());
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+    }
+
+    fn sleb(&mut self) -> Result<i64, String> {
+        let (mut value, mut shift) = (0i64, 0u32);
+        loop {
+            let byte = self.u8()?;
+            if shift >= 64 {
+                return Err("a LEB128 of more than 64 bits".to_owned());
+            }
+            value |= i64::from(byte & 0x7f) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                if shift < 64 && byte & 0x40 != 0 {
+                    value |= -1i64 << shift;
+                }
+                return Ok(value);
+            }
+        }
+    }
+}
+
+/// Where an FDE for [`Entry::of`] starts: the linker writes the real address.
+pub(crate) const ANYWHERE: Address = Address::Constant(0);
+
+#[cfg(test)]
+mod tests {
+    use cranelift_codegen::gimli::{
+        Encoding, Format, Register,
+        write::{CallFrameInstruction, CommonInformationEntry, FrameDescriptionEntry},
+    };
+
+    use super::*;
+
+    fn x86_cie() -> CommonInformationEntry {
+        let encoding = Encoding { address_size: 8, format: Format::Dwarf32, version: 1 };
+        let mut cie = CommonInformationEntry::new(encoding, 1, -8, Register(16));
+        cie.add_instruction(CallFrameInstruction::Cfa(Register(7), 8));
+        cie.add_instruction(CallFrameInstruction::Offset(Register(16), -8));
+        cie
+    }
+
+    #[test]
+    fn reads_back_the_fields_and_instructions() {
+        let mut fde = FrameDescriptionEntry::new(ANYWHERE, 32);
+        fde.add_instruction(1, CallFrameInstruction::CfaOffset(16));
+        fde.add_instruction(1, CallFrameInstruction::Offset(Register(6), -16));
+        let entry = Entry::of(x86_cie(), fde).expect("an entry");
+        assert_eq!((entry.code_align, entry.data_align, entry.return_address), (1, -8, 16));
+        // DW_CFA_def_cfa r7 8, DW_CFA_offset r16 1, padded with DW_CFA_nop.
+        assert_eq!(&entry.cie[..5], &[0x0c, 7, 8, 0x80 | 16, 1]);
+        assert!(entry.cie[5..].iter().all(|&it| it == 0));
+        // DW_CFA_advance_loc 1, DW_CFA_def_cfa_offset 16, DW_CFA_offset r6 2.
+        assert_eq!(&entry.fde[..5], &[0x41, 0x0e, 16, 0x80 | 6, 2]);
+        assert!(entry.fde[5..].iter().all(|&it| it == 0));
+    }
+
+    #[test]
+    fn an_entry_does_not_depend_on_the_length_of_the_code() {
+        let entry = |len| Entry::of(x86_cie(), FrameDescriptionEntry::new(ANYWHERE, len));
+        assert_eq!(entry(16).expect("an entry"), entry(4096).expect("an entry"));
+    }
+}

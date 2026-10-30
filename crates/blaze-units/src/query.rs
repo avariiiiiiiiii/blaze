@@ -1,4 +1,4 @@
-//! The workspace load and the unit graph as queries of blaze's database (docs/v2/cargo-notes.md;
+//! The workspace load and the unit graph as queries of blaze's database (docs/v2/plan/lanes/cargo/notes.md;
 //! #1450's 238 s load): pure functions of a view's `Cargo.toml`s, lock file and config, and of
 //! the sources mounted beside it, so nothing is loaded again on start (the daemon's image has
 //! it) and an edit reruns only what read what changed.
@@ -84,7 +84,7 @@ impl<T: Versioned> Persist for Cbor<T> {
         let bytes = cbor::to_vec(&self.0).unwrap_or_else(|error| {
             panic!("a {} has no deterministic CBOR: {error}", std::any::type_name::<T>())
         });
-        let data = out.push_slice(&bytes);
+        let data = out.push_slice::<u8>(bytes.as_slice());
         let at = out.next::<Slice<u8>>();
         out.push(&Slice::<u8>::between(at, data, bytes.len()))
     }

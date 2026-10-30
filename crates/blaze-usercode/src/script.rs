@@ -6,20 +6,19 @@
 //!   of its environment that blaze sets from the unit. A variable passed through from the
 //!   environment the build was started with (`PATH`, `CC`, `HOME`) is not given: what the
 //!   script reads of those is traced, so a `PATH` that differs only where the script never
-//!   looks keeps its result (#805). A variable counts as passed through when the script sees
-//!   it with the value it had where the build started: either way the value the script saw
-//!   is in its key, given or traced.
+//!   looks keeps its result (#805). Which is which is [`blaze_build_script::Env::origin`].
 //! - **Traced**: every file, listing and variable the script and every program it ran read,
 //!   the C compiler and its headers among them (#1480).
 //! - The jobserver's variables ([`RUN_ONLY`]) are of this run alone, as they are not in
 //!   cargo's fingerprint: neither given nor traced.
 //! - **Elided** (#1296): a script that provably only prints constant cargo directives is not
-//!   compiled or run; what it prints is known from its source ([`elided`]).
+//!   compiled or run; what it prints is known from its source ([`inert`]). In verify mode it
+//!   is run as well, and the two must agree ([`verify_elided`]).
 
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use blaze_build_script::{Error, Unit, output};
@@ -28,7 +27,7 @@ use blaze_ids::ContentId;
 
 use crate::{
     Given, RunKey, RunKind,
-    rule::{self, CargoRule},
+    rule::CargoRule,
     run::{self, Mode, OutFile, Value},
 };
 
@@ -64,16 +63,11 @@ pub struct Prepared {
 /// [`blaze_build_script::env::cargo_started`]).
 pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -> Result<Prepared, Error> {
     let env = blaze_build_script::env(unit, inherited)?;
-    let inherited: BTreeMap<&OsStr, &OsStr> =
-        inherited.iter().map(|(name, value)| (name.as_os_str(), value.as_os_str())).collect();
     let mut given = Given::new(RunKind::BuildScript);
     let mut names = Vec::new();
-    for (name, value) in &env.vars {
-        if run_only(name) || inherited.get(name.as_os_str()) == Some(&value.as_os_str()) {
-            continue;
-        }
-        given.env(name.clone(), value.clone());
-        names.push(name.clone());
+    for (name, value) in env.set_from_unit().filter(|(name, _)| !run_only(name)) {
+        given.env(name.to_owned(), value.to_owned());
+        names.push(name.to_owned());
     }
     given.part("program", crate::trace::os_bytes(unit.script.as_os_str()));
     given.part("dir", crate::trace::os_bytes(unit.package.manifest_dir.as_os_str()));
@@ -114,18 +108,34 @@ pub fn cargo_rule(unit: &Unit, inherited: &[(OsString, OsString)], exit: &Exit) 
     let cx = output::Context::of(unit, inherited);
     let dir = &unit.package.manifest_dir;
     match output::parse(&exit.stdout, &cx) {
-        Ok(parsed) => {
-            let env: Vec<OsString> = parsed.rerun_if_env_changed.iter().map(OsString::from).collect();
-            rule::of_directives(dir, &parsed.rerun_if_changed, &env)
-        }
-        Err(_) => CargoRule { paths: Vec::new(), package: Some(dir.clone()), env: Vec::new() },
+        Ok(parsed) => CargoRule::of(blaze_build_script::watched(&parsed, dir)),
+        Err(_) => CargoRule::package(dir),
     }
 }
 
-/// The result of a script that [`blaze_build_script::elide`] proves prints `stdout` and does
-/// nothing else: what a run of it would have been, with an empty `OUT_DIR`.
+/// What the script whose root source file is `root` would have been as a run, when its source
+/// (`files`, by path) proves it only prints constant cargo directives and `flags`, what blaze
+/// compiles it with, can't fail that compile: it is then neither compiled nor run.
+pub fn inert(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>, flags: &[String]) -> Option<Value> {
+    if !blaze_build_script::elide::flags_allow(flags) {
+        return None;
+    }
+    blaze_build_script::elide(root, files).map(elided)
+}
+
+/// The result of a script that prints `stdout` and does nothing else: what a run of it would
+/// have been, with an empty `OUT_DIR`.
 pub fn elided(stdout: Vec<u8>) -> Value {
     Value { code: Some(0), signal: None, stdout, stderr: Vec::new(), files: Vec::<OutFile>::new() }
+}
+
+/// Whether the run of a script [`inert`] read agrees with what it said, for verify mode.
+pub fn verify_elided(elided: &Value, ran: &Value) -> Result<(), Error> {
+    blaze_build_script::verify(&elided.stdout, &ran.stdout)?;
+    match run::differs(elided, ran) {
+        Some(what) => Err(Error(format!("the elided build script's run differs from what elision said: {what}"))),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +212,27 @@ mod tests {
         assert_eq!(named.package, None);
         assert_eq!(named.paths, vec![PathBuf::from("/ws/p/build.rs")]);
         assert_eq!(named.env, vec![OsString::from("VERSION")]);
+        let env_only = cargo_rule(&unit(), &inherited("/a"), &exit(b"cargo:rerun-if-env-changed=VERSION\n"));
+        assert_eq!(env_only.package, None);
+        assert!(env_only.paths.is_empty());
+    }
+
+    #[test]
+    fn an_inert_script_is_read_and_checked_against_its_run() {
+        let root = PathBuf::from("/ws/p/build.rs");
+        let files: BTreeMap<PathBuf, Vec<u8>> =
+            [(root.clone(), b"fn main() {\n    println!(\"cargo:rustc-cfg=fast\");\n}\n".to_vec())].into();
+        let value = inert(&root, &files, &[]).unwrap();
+        assert_eq!(value.stdout, b"cargo:rustc-cfg=fast\n");
+        assert!(inert(&root, &files, &["-D".into(), "warnings".into()]).is_none());
+        let other: BTreeMap<PathBuf, Vec<u8>> =
+            [(root.clone(), b"fn main() { println!(\"cargo:rustc-env=T={}\", std::env::var(\"T\").unwrap()); }\n".to_vec())]
+                .into();
+        assert!(inert(&root, &other, &[]).is_none());
+        verify_elided(&value, &elided(b"cargo:rustc-cfg=fast\n".to_vec())).unwrap();
+        assert!(verify_elided(&value, &elided(b"cargo:rustc-cfg=slow\n".to_vec())).is_err());
+        let mut wrote = elided(b"cargo:rustc-cfg=fast\n".to_vec());
+        wrote.files.push(OutFile { path: "x".into(), executable: false, bytes: Some(Vec::new()) });
+        assert!(verify_elided(&value, &wrote).is_err());
     }
 }

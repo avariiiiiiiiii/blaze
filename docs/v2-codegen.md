@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # blaze v2: the codegen lane's design
 
-How [codegen.md](v2/codegen.md) is built, as of 2026-10-29. The crate is `blaze-codegen`
+How [codegen.md](v2/plan/lanes/codegen.md) is built, as of 2026-10-29. The crate is `blaze-codegen`
 (backend-agnostic, no front end); the backends are `hir-ty-codegen`'s `v2` module (Cranelift,
 LLVM) over the code generator that exists.
 
@@ -43,13 +43,28 @@ needs a reference the list lacks fails the unit: the list is what makes template
 call, or a direct address); a `Function` target is the callee's jump-table stub, which the
 linker owns. Which kind a place is changes no byte of the template.
 
+A function's unwind information is in its template too: the personality routine (or
+Windows handler) by place, so it must be among the refs, and the language-specific data
+area by its index among the function's data. Its lines (`Line`: code offset to
+`SpanRef`) are kept as they are, since spans are position-independent. Both are part of
+`code_id` and `Template::id`: functions that unwind differently, or show other lines in a
+backtrace, are never one function.
+
+A static's template is kept under its *definition*: the front end's value ID together with
+its mutability, thread-locality and `#[link_section]` (`DescribedStatic`), with the
+settings. A compiled `Static` that disagrees with what the front end described is an error.
+
+A store entry that is there but does not read is an error naming the unit, never a reason
+to compile again.
+
 ## The back-end memo up to callee renaming (#1291)
 
 Two instances whose IR, with references by place, is equal compile once: the backend gives
 the prepared IR's canonical bytes (`Shape`), and the memo maps `Shape::key` (with the
 settings and architecture) to the template. `Vec<A>::drop` and `Vec<B>::drop` differ only in
 which `drop_in_place` they call: one shape, one compile, two instantiations. Constants,
-layouts and symbols are in the shape, so the sharing is exact.
+layouts and symbols are in the shape, so the sharing is exact. Within one build, the first
+instance of a shape compiles and the others wait for its template.
 
 The store key of an instance's template is its `InstanceKey` (dev) or
 `Imports::blob_key` (release), so a warm build builds no IR for an unchanged instance.
@@ -98,8 +113,10 @@ Off by default for LLVM's levels. See [`fold`](../crates/blaze-codegen/src/fold.
    pipeline) and export (that IR, as importers link it), stored under its instance key.
 2. `imports::decide` over all summaries: which callees each function imports (ThinLTO's
    evolution factor, depth and budget), arguments every caller passes as one constant, callee
-   attributes, dead arguments. Only functions that nothing outside the build calls get
-   whole-program facts.
+   attributes, dead arguments. Only functions whose every caller has a summary get
+   whole-program facts. Before deciding, the driver marks external every function that
+   something without a summary refers to (a Cranelift unit, a fold thunk, a static's
+   value), along with exported, patchable and tiered ones.
 3. Each compile with its imports, its template stored under `Imports::blob_key`; the callees
    it built in are `CompiledFunction::inlined`.
 

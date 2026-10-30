@@ -29,7 +29,7 @@ shares them (not `&mut Vfs`) can answer both. Wire it in `Database::new(Config {
 
 - Make the daemon's database with `Database::new(Config { tree, dir, tags })` (or, at start,
   `Database::from_image_with(config, mapping)` of `<dir>/image`; on `DbError::Image` start from
-  `Database::new` and rebuild from the store's results, as `docs/v2/format.md` says).
+  `Database::new` and rebuild from the store's results, as `docs/v2/plan/lanes/format.md` says).
 - Hand it every completion whose tag it `owns`, through `Database::complete`.
 - After a cold build: `write_image`, then, once `complete` has mapped it, `settle(&mut effects)`
   swaps to the mapped image and drops the cold arenas (#1299). `reclaim` frees retired buffers

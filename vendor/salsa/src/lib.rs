@@ -182,8 +182,8 @@
 //! holds now regardless of the cap, and, for a function of one Salsa struct,
 //! `FUNCTION::evict_values_of(db, keys)`, which drops the values of those keys only. Both keep
 //! fingerprints and dependency edges and return how many values were dropped. Without `no_eq` a
-//! dropped value that recomputes equal is backdated by its fingerprint; with `no_eq` it counts as
-//! changed.
+//! dropped value that recomputes equal is backdated by its fingerprint; with `no_eq` it is
+//! backdated only when none of its inputs changed.
 //!
 //! The [return mode](#return-modes) controls whether callers receive an owned result or borrow it
 //! from the memo.

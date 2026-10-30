@@ -10,7 +10,7 @@ use syntax_tree::{FlatTree, TextRange, TextSize};
 
 use crate::{SyntaxError, SyntaxKind, SyntaxTreeBuilder, Tree, syntax_node::RustLanguage};
 
-pub(crate) use crate::parsing::reparsing::{Reparsed, incremental_reparse};
+pub(crate) use crate::parsing::reparsing::incremental_reparse;
 
 /// A source file's tree: in full, or as an outline whose `fn` bodies are lazy nodes.
 pub(crate) fn parse_text(
@@ -67,6 +67,37 @@ pub(crate) fn build_tree(
     let (tree, mut errors) = builder.finish_raw(edition);
     errors.extend(lexer_errors(lexed, TextSize::new(0)));
     (tree, errors, is_eof)
+}
+
+/// [`build_tree`] for a node of `kind` parsed again alone: `None` unless the parse took every
+/// token into one node of `kind`, its root.
+pub(crate) fn build_node(
+    source: Arc<str>,
+    lexed: &parser::LexedStr<'_>,
+    parser_output: &parser::Output,
+    edition: Edition,
+    kind: SyntaxKind,
+) -> Option<(FlatTree, Vec<SyntaxError>)> {
+    let (mut depth, mut roots, mut stray) = (0usize, 0usize, false);
+    let is_eof = lexed.intersperse_trivia_outline(parser_output, &mut |step| match step {
+        OutlineStrStep::Step(StrStep::Enter { kind: entered }) => {
+            if depth == 0 {
+                roots += 1;
+                stray |= entered != kind;
+            }
+            depth += 1;
+        }
+        OutlineStrStep::Step(StrStep::Exit) => depth = depth.saturating_sub(1),
+        OutlineStrStep::Step(StrStep::Token { .. }) | OutlineStrStep::Lazy { .. } => {
+            stray |= depth == 0
+        }
+        OutlineStrStep::Step(StrStep::Error { .. }) => (),
+    });
+    if !is_eof || stray || roots != 1 {
+        return None;
+    }
+    let (tree, errors, _eof) = build_tree(source, lexed, parser_output, edition);
+    Some((tree, errors))
 }
 
 /// The errors of `lexed`'s tokens, their ranges moved by `offset`.

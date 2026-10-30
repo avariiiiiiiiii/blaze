@@ -1,8 +1,8 @@
-//! Does what the plane asks (docs/driver.md, "The executor"; docs/v2/plane.md, "The executor").
+//! Does what the plane asks (docs/driver.md, "The executor"; docs/v2/plan/lanes/core/plane.md, "The executor").
 //!
 //! [`drive`] runs one build of a [`Machine`] on the thread that calls it, which is the only one
-//! that steps the machine: its work nodes on a worker pool made for the build, its IO nodes on
-//! threads of their own (they wait, they don't compute). [`Scheduler`] is the daemon's one
+//! that steps the machine: its work nodes on a worker pool lent to the build alone, its IO nodes
+//! on a second one (they wait, they don't compute). [`Scheduler`] is the daemon's one
 //! scheduler: it owns the [`Plane`] and steps it on a thread of its own, the owner thread, whose
 //! one wait is for the next input; it never waits for a worker. Its tasks run on the process's
 //! [`shared`] pool, near the group the plane names, inside [`arena::measure`], and what each
@@ -77,8 +77,10 @@ pub fn shared() -> &'static Workers {
 /// its pool, `said` hears every record as the machine says it, and `trace`, when given, gets
 /// every input the machine took, in order ([`crate::trace`]). Whether every node was done.
 ///
-/// The work nodes run on a pool of the machine's `work` workers made for the build (not bound
-/// to CPUs: several builds may run at once), so `work` may borrow what the caller has.
+/// The work nodes run on a pool of the machine's `work` workers and the IO nodes on one of its
+/// `io`, both lent to this build alone and kept for the next build of their size once it's
+/// over (not bound to CPUs: several builds may run at once). `work` may borrow what the caller
+/// has.
 ///
 /// A node whose work panics fails, and once the build is over the panic goes on on the calling
 /// thread, as from a thread of [`std::thread::scope`]: a panic that unwinds on purpose, as
@@ -96,8 +98,8 @@ where
     let start = Instant::now();
     let now = || ns(start);
     let config = machine.config();
-    let workers = Workers::new(&Topology::flat(config.work), false)
-        .unwrap_or_else(|why| panic!("the build's {} worker threads: {why}", config.work));
+    let workers = Lent::take(config.work, "worker");
+    let io = Lent::take(config.io, "IO");
     let (done_tx, done_rx) = unbounded::<(NodeId, Did, u64)>();
     let first_panic: Mutex<Option<Box<dyn Any + Send>>> = Mutex::new(None);
     let failed = |panic: Box<dyn Any + Send>| {
@@ -105,36 +107,22 @@ where
         lock(&first_panic).get_or_insert(panic);
         did
     };
-    let over = thread::scope(|threads| {
-        let (io_tx, io_rx) = unbounded::<NodeId>();
-        for _ in 0..config.io {
-            let (io_rx, done_tx, failed, now) = (io_rx.clone(), done_tx.clone(), &failed, &now);
-            threads.spawn(move || {
-                for id in io_rx {
-                    let did = catch_unwind(AssertUnwindSafe(|| work(id))).unwrap_or_else(failed);
-                    if done_tx.send((id, did, now())).is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-        let over = workers.scope(|jobs| {
-            let post = |id: NodeId, at: Pool| match at {
-                Pool::Io => _ = io_tx.send(id),
-                Pool::Work => {
-                    let (done_tx, failed, now) = (done_tx.clone(), &failed, &now);
-                    jobs.submit(None, move || work(id), move |did| {
-                        _ = done_tx.send((id, did.unwrap_or_else(failed), now()));
-                    });
+    let over = workers.pool().scope(|jobs| {
+        io.pool().scope(|waits| {
+            let post = |id: NodeId, at: Pool| {
+                let (done_tx, failed, now) = (done_tx.clone(), &failed, &now);
+                let done = move |did: thread::Result<Did>| {
+                    _ = done_tx.send((id, did.unwrap_or_else(failed), now()));
+                };
+                match at {
+                    Pool::Io => waits.submit(None, move || work(id), done),
+                    Pool::Work => jobs.submit(None, move || work(id), done),
                 }
             };
             run(machine, nodes, &post, &done_rx, &now, said, trace)
-        });
-        // The IO threads end once nothing more can be sent them, whether the build ended or not.
-        drop(io_tx);
-        over
+        })
     });
-    drop(workers);
+    drop((workers, io));
     if let Some(panic) = first_panic.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
     {
         resume_unwind(panic);
@@ -177,6 +165,39 @@ fn run(
         over = feed(Input::Done { at_ns, id, outcome: did.outcome, added: did.added })?;
     }
     Ok(over.unwrap_or(false))
+}
+
+/// The pools no [`drive`] is using, each kept for the next build of its size, so a build
+/// starts no thread once one of its size has run.
+static SPARE: Mutex<Vec<Workers>> = Mutex::new(Vec::new());
+
+/// A pool of `workers` threads that only one [`drive`] uses, handed back to [`SPARE`] when
+/// it's over: a build runs as many nodes at once as its machine says, whatever else runs.
+struct Lent(Option<Workers>);
+
+impl Lent {
+    fn take(workers: usize, what: &str) -> Lent {
+        let spare = {
+            let mut spare = lock(&SPARE);
+            spare.iter().position(|it| it.workers() == workers).map(|at| spare.swap_remove(at))
+        };
+        Lent(Some(spare.unwrap_or_else(|| {
+            Workers::new(&Topology::flat(workers), false)
+                .unwrap_or_else(|why| panic!("the build's {workers} {what} threads: {why}"))
+        })))
+    }
+
+    fn pool(&self) -> &Workers {
+        self.0.as_ref().expect("a lent pool is held until it's dropped")
+    }
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        if let Some(pool) = self.0.take() {
+            lock(&SPARE).push(pool);
+        }
+    }
 }
 
 fn ns(start: Instant) -> u64 {
@@ -319,7 +340,7 @@ impl Handle {
     }
 }
 
-/// The daemon's one scheduler (docs/v2/plane.md): requests from any thread, through
+/// The daemon's one scheduler (docs/v2/plan/lanes/core/plane.md): requests from any thread, through
 /// [`Handle`]s; the plane stepped on its owner thread; tasks on a worker pool, IO tasks on
 /// threads of their own. Dropping it stops the owner thread and waits for the IO tasks under
 /// way; pool tasks under way finish on the pool, and what came of them is not taken.
@@ -645,10 +666,12 @@ fn run_io(job: Arc<Job>) {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicU32, Ordering},
         },
+        thread::ThreadId,
         time::Duration,
     };
 
@@ -656,13 +679,14 @@ mod tests {
     use crossbeam_channel::bounded;
     use rustc_hash::FxHashMap;
 
-    use super::{Did, Heard, Opened, Scheduler, Task, Work, Workers, drive};
+    use super::{Did, Heard, Opened, SPARE, Scheduler, Task, Work, Workers, drive};
     use crate::{
         Cancelled, Key,
         admission::{Estimates, TaskKind},
         machine::{Config, Machine, NodeId, Outcome, Pool, Spec},
         plane::PlaneConfig,
         pool::group,
+        pump::lock,
         topology::Topology,
     };
 
@@ -707,24 +731,36 @@ mod tests {
     /// Work nodes run on the build's pool, IO nodes on threads of no pool, and the work borrows
     /// what the caller has.
     #[test]
-    fn drive_runs_work_on_the_pool_and_io_beside_it() {
-        let ran: Mutex<Vec<(u32, Option<u32>)>> = Mutex::new(Vec::new());
-        let mut machine = Machine::new(Config { io: 2, work: 3, keep_going: false }).unwrap();
-        let nodes = vec![
-            spec(0, &[], Pool::Io, None),
-            spec(1, &[0], Pool::Work, None),
-            spec(2, &[0], Pool::Work, None),
-            spec(3, &[1, 2], Pool::Io, None),
-        ];
-        let work = |id: NodeId| {
-            ran.lock().unwrap().push((id.0, group()));
-            Did::built()
+    fn drive_runs_work_and_io_on_pools_apart_and_keeps_them_for_the_next_build() {
+        // Sizes no other test drives, so no other build can borrow these pools in between.
+        let build = || {
+            let ran: Mutex<Vec<(u32, ThreadId)>> = Mutex::new(Vec::new());
+            let mut machine = Machine::new(Config { io: 3, work: 7, keep_going: false }).unwrap();
+            let nodes = vec![
+                spec(0, &[], Pool::Io, None),
+                spec(1, &[0], Pool::Work, None),
+                spec(2, &[0], Pool::Work, None),
+                spec(3, &[1, 2], Pool::Io, None),
+            ];
+            let work = |id: NodeId| {
+                assert_eq!(group(), Some(0), "node {id} runs on a pool");
+                ran.lock().unwrap().push((id.0, std::thread::current().id()));
+                Did::built()
+            };
+            assert!(drive(&mut machine, nodes, &work, &mut |_| {}, None).unwrap());
+            let ran = ran.into_inner().unwrap();
+            let on = |nodes: &[u32]| -> BTreeSet<ThreadId> {
+                ran.iter().filter(|(id, _)| nodes.contains(id)).map(|&(_, at)| at).collect()
+            };
+            assert_eq!(ran.len(), 4);
+            assert!(on(&[0, 3]).is_disjoint(&on(&[1, 2])), "IO and work share a thread");
         };
-        let ok = drive(&mut machine, nodes, &work, &mut |_| {}, None).unwrap();
-        assert!(ok);
-        let mut ran = ran.into_inner().unwrap();
-        ran.sort();
-        assert_eq!(ran, [(0, None), (1, Some(0)), (2, Some(0)), (3, None)]);
+        let spare = || lock(&SPARE).iter().filter(|it| [3, 7].contains(&it.workers())).count();
+        // A build that made its pools rather than borrowing the last one's would leave more.
+        for _ in 0..4 {
+            build();
+            assert_eq!(spare(), 2, "the build's two pools are kept for the next");
+        }
     }
 
     /// Two requests of weights 1 and 3 ask for the same ten keys: each key runs once, and both

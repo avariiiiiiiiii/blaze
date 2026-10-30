@@ -9,8 +9,11 @@
 //!   is named ([`Watched::Conflict`]).
 //! - A file whose bytes are those the head has already makes no op, so a file blaze wrote
 //!   itself is not taken back in as an edit.
-//! - Changes the system dropped (`lost`) stop the watch ([`Watched::Lost`]): the head no longer
-//!   follows the disk, and nothing guesses what changed.
+//! - A watch starts with a scan ([`Effect::List`], asked right after the [`Effect::Watch`] so
+//!   no change falls between them): every file on the disk is read, every file the head has
+//!   and the disk doesn't is deleted, as one batch, and [`Watched::Scanned`] says the head
+//!   holds what the directory did. Changes the system dropped (`lost`) are a rescan
+//!   ([`Watched::Lost`]), never a guess of what changed.
 //! - Modes: [`Effect::Stat`] says nothing of a file's executable bit or of a symlink, and
 //!   [`Effect::ReadAll`] reads through a symlink. So a file the head has keeps its mode, a new
 //!   one is [`Mode::Regular`], and a chmod alone is not seen, until the driver reports modes
@@ -18,7 +21,7 @@
 
 use std::collections::VecDeque;
 
-use blaze_core::{Completion, Done, Effect, FileName, IoError, Tag};
+use blaze_core::{Completion, Done, Effect, FileName, IoError, Meta, Tag};
 use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
 
@@ -34,8 +37,11 @@ fn seen(tree: &Tree, root: NodeId, path: &str) -> Seen {
     tree.entry(root, path).map(|(node, mode)| (tree.id(node), mode))
 }
 
-/// How many tags a watcher uses: its watch, then one per path being read, reused in turn.
+/// How many tags a watcher uses: its watch, its listing, then one per path being read, reused
+/// in turn.
 const TAGS: u64 = 1 << 32;
+const LIST: u64 = 1;
+const FIRST_READ: u64 = 2;
 
 /// What a watcher's completion did.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -46,9 +52,10 @@ pub enum Watched {
     Conflict { path: String },
     /// `path` changed and could not be read: the head keeps what it had.
     Unreadable { path: String, error: IoError },
-    /// The system dropped changes, so the head no longer follows the disk; the watch is being
-    /// stopped.
+    /// The system dropped changes; a rescan is under way, and ends with [`Watched::Scanned`].
     Lost,
+    /// A scan was committed: the head holds what the directory did when it was listed.
+    Scanned,
     /// The watch ended: stopped, or failed with the error.
     Ended(Option<IoError>),
 }
@@ -73,6 +80,11 @@ struct Slot {
 
 struct Batch {
     slots: Vec<Slot>,
+    /// A scan's: every file of the directory.
+    scan: bool,
+    /// A scan's place, taken when the listing was asked: what is told after commits after it.
+    /// Its slots come with the listing.
+    waiting: bool,
 }
 
 pub struct Watcher {
@@ -80,7 +92,9 @@ pub struct Watcher {
     dir: FileName,
     tags: u64,
     watching: bool,
-    lost: bool,
+    /// A listing is in flight; `again`: another is wanted once it is in.
+    listing: bool,
+    again: bool,
     /// Batches in the order their changes were told; the first is number `first`.
     batches: VecDeque<Batch>,
     first: u64,
@@ -92,15 +106,16 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// A watcher of `dir` (under the driver's root) committing to `head`, which must hold what
-    /// `dir` holds when the watch starts. Tags it asks with are `tags..tags + 2^32`.
+    /// A watcher of `dir` (under the driver's root) committing to `head`. Tags it asks with are
+    /// `tags..tags + 2^32`.
     pub fn new(head: &str, dir: FileName, tags: u64) -> Watcher {
         Watcher {
             head: head.into(),
             dir,
             tags,
             watching: false,
-            lost: false,
+            listing: false,
+            again: false,
             batches: VecDeque::new(),
             first: 0,
             reading: FxHashMap::default(),
@@ -112,8 +127,19 @@ impl Watcher {
     pub fn start(&mut self, effects: &mut Vec<Effect>) {
         assert!(!self.watching, "{} is watched already", self.dir);
         self.watching = true;
-        self.lost = false;
         effects.push(Effect::Watch { dir: self.dir.clone(), tag: Tag(self.tags) });
+        self.list(effects);
+    }
+
+    /// Asks for a listing of the directory, or for one more after the one in flight.
+    fn list(&mut self, effects: &mut Vec<Effect>) {
+        if self.listing {
+            self.again = true;
+        } else {
+            self.listing = true;
+            effects.push(Effect::List { dir: self.dir.clone(), tag: Tag(self.tags + LIST) });
+            self.batches.push_back(Batch { slots: Vec::new(), scan: true, waiting: true });
+        }
     }
 
     /// Stops the watch: it ends with [`Watched::Ended`]. Reads in flight still commit.
@@ -129,7 +155,7 @@ impl Watcher {
         tag.0.checked_sub(self.tags).is_some_and(|it| it < TAGS)
     }
 
-    /// Whether nothing it was told is waiting to be read or committed.
+    /// Whether nothing it was told is waiting to be listed, read or committed.
     pub fn idle(&self) -> bool {
         self.batches.is_empty()
     }
@@ -145,11 +171,9 @@ impl Watcher {
         let mut out = Vec::new();
         if completion.tag == Tag(self.tags) {
             match completion.done {
-                Done::Changed { .. } if self.lost => {}
                 Done::Changed { lost: true, .. } => {
-                    self.lost = true;
-                    self.stop(effects);
                     out.push(Watched::Lost);
+                    self.list(effects);
                 }
                 Done::Changed { files, lost: false } => self.told(vfs, files, effects),
                 Done::Unwatched => {
@@ -162,6 +186,26 @@ impl Watcher {
                 }
                 done => unreachable!("a watch completed with {done:?}"),
             }
+            return out;
+        }
+        if completion.tag == Tag(self.tags + LIST) {
+            self.listing = false;
+            match completion.done {
+                Done::Listed(listed) => self.scanned(vfs, listed, effects),
+                Done::Failed(error) => {
+                    let place = self.scan_place();
+                    let batch = &mut self.batches[place];
+                    (batch.waiting, batch.scan) = (false, false);
+                    out.push(Watched::Unreadable { path: String::new(), error });
+                    self.again = false;
+                    self.stop(effects);
+                }
+                done => unreachable!("a listing completed with {done:?}"),
+            }
+            if std::mem::take(&mut self.again) {
+                self.list(effects);
+            }
+            self.drain(vfs, &mut out, effects);
             return out;
         }
         let (batch, at) = self.reading.remove(&completion.tag).expect("a path being read");
@@ -181,16 +225,78 @@ impl Watcher {
             }
             done => unreachable!("a read of {} completed with {done:?}", slot.file),
         });
-        while self.batches.front().is_some_and(|it| it.slots.iter().all(|it| it.disk.is_some())) {
+        self.drain(vfs, &mut out, effects);
+        out
+    }
+
+    /// Commits every batch read in full that waits for none told before it.
+    fn drain(&mut self, vfs: &mut Vfs, out: &mut Vec<Watched>, effects: &mut Vec<Effect>) {
+        while self
+            .batches
+            .front()
+            .is_some_and(|it| !it.waiting && it.slots.iter().all(|it| it.disk.is_some()))
+        {
             let batch = self.batches.pop_front().expect("a batch");
             self.first += 1;
-            self.commit(vfs, batch, &mut out);
+            let scan = batch.scan;
+            self.commit(vfs, batch, out);
+            if scan {
+                out.push(Watched::Scanned);
+            }
         }
         if self.batches.is_empty() {
             self.ours.clear();
         }
         vfs.flush(effects);
-        out
+    }
+
+    /// A tag for one path's read.
+    fn read_tag(&mut self, number: u64, at: usize) -> Tag {
+        let tag = Tag(self.tags + FIRST_READ + self.next_tag);
+        self.next_tag = (self.next_tag + 1) % (TAGS - FIRST_READ);
+        assert!(!self.reading.contains_key(&tag), "2^32 paths are being read at once");
+        self.reading.insert(tag, (number, at));
+        tag
+    }
+
+    /// Where in `batches` the scan whose listing is in flight waits.
+    fn scan_place(&self) -> usize {
+        self.batches.iter().position(|it| it.waiting).expect("a scan waits for its listing")
+    }
+
+    /// A listing of the directory: its scan's batch, of every file in it, read, and of every
+    /// file the head has that it doesn't, gone.
+    fn scanned(&mut self, vfs: &Vfs, listed: Vec<(FileName, Meta)>, effects: &mut Vec<Effect>) {
+        let head = vfs.heads.get(&*self.head).copied().unwrap_or(vfs.tree.empty());
+        let below = format!("{}/", self.dir);
+        let place = self.scan_place();
+        let number = self.first + place as u64;
+        let mut slots = Vec::new();
+        let mut on_disk = rustc_hash::FxHashSet::default();
+        for (file, meta) in listed {
+            // A directory is what the files under it make.
+            if meta.dir {
+                continue;
+            }
+            let Some(path) = file.as_str().strip_prefix(&below) else { continue };
+            let path = path.to_owned();
+            on_disk.insert(path.clone());
+            let tag = self.read_tag(number, slots.len());
+            effects.push(Effect::ReadAll { file: file.clone(), tag });
+            let was = seen(&vfs.tree, head, &path);
+            slots.push(Slot { path, file, was, disk: None });
+        }
+        for (path, node, mode) in vfs.tree.files(head, Mode::Regular, "") {
+            if on_disk.contains(&path) {
+                continue;
+            }
+            let file = FileName::new(&format!("{below}{path}")).expect("a head's path is a name");
+            let was = Some((vfs.tree.id(node), mode));
+            slots.push(Slot { path, file, was, disk: Some(Disk::Gone) });
+        }
+        let batch = &mut self.batches[place];
+        batch.slots = slots;
+        batch.waiting = false;
     }
 
     /// A report of changes: a batch of the paths under the watched directory, each looked at.
@@ -203,15 +309,12 @@ impl Watcher {
             let Some(path) = file.as_str().strip_prefix(&below) else { continue };
             let path = path.to_owned();
             let was = seen(&vfs.tree, head, &path);
-            let tag = Tag(self.tags + 1 + self.next_tag);
-            self.next_tag = (self.next_tag + 1) % (TAGS - 1);
-            assert!(!self.reading.contains_key(&tag), "2^32 paths are being read at once");
-            self.reading.insert(tag, (number, slots.len()));
+            let tag = self.read_tag(number, slots.len());
             effects.push(Effect::Stat { file: file.clone(), tag });
             slots.push(Slot { path, file, was, disk: None });
         }
         if !slots.is_empty() {
-            self.batches.push_back(Batch { slots });
+            self.batches.push_back(Batch { slots, scan: false, waiting: false });
         }
     }
 

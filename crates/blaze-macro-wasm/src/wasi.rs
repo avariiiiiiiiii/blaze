@@ -1,15 +1,27 @@
 //! The part of WASI's first snapshot (`wasi_snapshot_preview1`) a proc macro's module is
 //! given: its package's directory to read, at [`PACKAGE`] and nothing else, its arguments and
-//! environment, a clock that always says the same and random bytes that are always the same,
-//! and stdout and stderr kept for its errors. Every read of the package is recorded with what
-//! it found ([`Files::reads`]), for the second key of what the expansion made
-//! ([`crate::keyed`]). A function this does not have answers `ENOSYS`.
+//! environment, the clock, random bytes, and stdout and stderr kept for its errors. This host
+//! is the module's sandbox, and it grants no more than a native one: nothing is written,
+//! nothing outside the package is read, no network. It sees every call, so it records what
+//! the module read exactly, as a sandbox's trace has it ([`Files::traced`]): each file
+//! opened or looked at with the hash of the bytes it gave, each listing with the hash of its
+//! names, by their paths under [`PACKAGE`], which are the same on every machine; a read of
+//! the clock or of randomness is [`Untraceable`]. A function this does not have answers
+//! `ENOSYS`.
 
 use std::{
-    collections::BTreeMap,
+    ffi::OsString,
+    hash::{BuildHasher as _, Hasher as _},
     path::{Path, PathBuf},
+    sync::OnceLock,
+    time::{Instant, SystemTime},
 };
 
+use blaze_core::{Traced, Untraceable};
+use blaze_usercode::{
+    inputs::{SPECIAL, hash_reader},
+    trace::{self, DIRECTORY},
+};
 use wasmtime::{Caller, Extern, FuncType, Linker, Memory, Module, Val, ValType};
 
 use crate::{State, keyed};
@@ -26,6 +38,7 @@ const MODULE: &str = "wasi_snapshot_preview1";
 const SUCCESS: i32 = 0;
 const EBADF: i32 = 8;
 const EINVAL: i32 = 28;
+const EIO: i32 = 29;
 const EISDIR: i32 = 31;
 const ENOENT: i32 = 44;
 const ENOSYS: i32 = 52;
@@ -56,10 +69,12 @@ enum Open {
 pub(crate) struct Files {
     root: PathBuf,
     fds: Vec<Option<Open>>,
-    /// Each read of the package, as a read set has it (`keyed`), and what it found.
-    pub(crate) reads: BTreeMap<String, String>,
+    /// What the module read, by the paths it has under [`PACKAGE`], as it was when it read it.
+    pub(crate) traced: Traced,
+    /// What of the package is there and could not be read: an expansion that met one is not
+    /// kept, as it can't say what it read.
+    pub(crate) unreadable: Option<String>,
     pub(crate) output: Vec<u8>,
-    random: u64,
 }
 
 impl Files {
@@ -73,10 +88,17 @@ impl Files {
         Files {
             root: root.map(Path::to_path_buf).unwrap_or_default(),
             fds,
-            reads: BTreeMap::new(),
+            traced: Traced::default(),
+            unreadable: None,
             output: Vec::new(),
-            random: 0x9e37_79b9_7f4a_7c15,
         }
+    }
+
+    /// What the module read, each entry once, sorted.
+    pub(crate) fn take_traced(&mut self) -> Traced {
+        let mut traced = std::mem::take(&mut self.traced);
+        trace::normalize(&mut traced);
+        traced
     }
 
     fn insert(&mut self, open: Open) -> u32 {
@@ -135,21 +157,91 @@ impl Files {
         self.resolve(rel, path).map(|(rel, _)| rel)
     }
 
-    fn record(&mut self, read: String, found: String) {
-        self.reads.entry(read).or_insert(found);
+    /// Notes that the module found `found` at the package's `rel`: a file's hash, [`DIRECTORY`]
+    /// for a directory, [`SPECIAL`] for neither, `None` for nothing there. The first of each
+    /// path is what it found.
+    fn found(&mut self, rel: &str, found: Option<[u8; 32]>) {
+        self.traced.files.push((placed(rel), found));
     }
 
-    fn next_random(&mut self) -> u64 {
-        self.random ^= self.random << 13;
-        self.random ^= self.random >> 7;
-        self.random ^= self.random << 17;
-        self.random
+    /// Notes that the module listed the package's directory `rel`, whose names are `names`.
+    pub(crate) fn listed(&mut self, rel: &str, names: &[OsString]) {
+        self.traced.dirs.push((placed(rel), trace::listing(names.iter().map(OsString::as_os_str))));
+    }
+
+    /// Notes what a look at `real`, the package's `rel`, finds, as [`Self::found`] has it.
+    pub(crate) fn looked(&mut self, rel: &str, real: &Path) -> Option<std::fs::Metadata> {
+        match std::fs::metadata(real) {
+            Ok(meta) if meta.is_dir() => {
+                self.found(rel, Some(DIRECTORY));
+                Some(meta)
+            }
+            Ok(meta) if meta.is_file() => {
+                match std::fs::File::open(real).and_then(hash_reader) {
+                    Ok(hash) => self.found(rel, Some(hash)),
+                    Err(error) => self.cant(real, error),
+                }
+                Some(meta)
+            }
+            Ok(meta) => {
+                self.found(rel, Some(SPECIAL));
+                Some(meta)
+            }
+            Err(error) if missing(&error) => {
+                self.found(rel, None);
+                None
+            }
+            Err(error) => {
+                self.cant(real, error);
+                None
+            }
+        }
+    }
+
+    fn cant(&mut self, real: &Path, error: std::io::Error) {
+        self.unreadable.get_or_insert_with(|| format!("{}: {error}", real.display()));
     }
 }
 
-/// What a read set calls the read of the package's `rel`, the whole of what is there.
-fn read_of(rel: &str) -> String {
-    if rel.is_empty() { ".".to_owned() } else { rel.to_owned() }
+fn missing(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+}
+
+/// The path the module has for the package's `rel`.
+pub(crate) fn placed(rel: &str) -> PathBuf {
+    match rel.is_empty() {
+        true => PathBuf::from(PACKAGE),
+        false => PathBuf::from(format!("{PACKAGE}/{rel}")),
+    }
+}
+
+/// The package's `rel` of a path the module has, `None` for one not under [`PACKAGE`].
+pub(crate) fn rel_of(path: &Path) -> Option<&Path> {
+    path.strip_prefix(PACKAGE).ok()
+}
+
+/// The nanoseconds the clock `id` says now: the real clock for `CLOCK_REALTIME` (0), else the
+/// time since this process first asked.
+fn now(id: i32) -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    match id {
+        0 => SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |it| it.as_nanos() as u64),
+        _ => START.get_or_init(Instant::now).elapsed().as_nanos() as u64,
+    }
+}
+
+/// Random bytes, from a hasher the standard library seeds from the system's randomness.
+pub(crate) fn random(len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        let mut hasher = std::hash::RandomState::new().build_hasher();
+        hasher.write_usize(out.len());
+        out.extend_from_slice(&hasher.finish().to_le_bytes());
+    }
+    out.truncate(len);
+    out
 }
 
 fn memory(caller: &mut Caller<'_, State>) -> wasmtime::Result<Memory> {
@@ -213,20 +305,13 @@ fn ino(rel: &str) -> u64 {
 /// What the package has at `real`, as the module is told and as its read is recorded: a
 /// file's type and size are the file's, so a look at one is a read of all of it.
 fn stat(files: &mut Files, rel: &str, real: &Path) -> Result<[u8; 64], i32> {
-    match std::fs::metadata(real) {
-        Ok(meta) if meta.is_dir() => {
-            files.record(keyed::kind(&read_of(rel)), "d".to_owned());
-            Ok(filestat(ino(rel), FILETYPE_DIRECTORY, 0))
-        }
-        Ok(meta) => {
-            files.record(read_of(rel), keyed::digest_of(real));
+    match files.looked(rel, real) {
+        Some(meta) if meta.is_dir() => Ok(filestat(ino(rel), FILETYPE_DIRECTORY, 0)),
+        Some(meta) => {
             let filetype = if meta.is_file() { FILETYPE_REGULAR_FILE } else { FILETYPE_UNKNOWN };
             Ok(filestat(ino(rel), filetype, meta.len()))
         }
-        Err(_) => {
-            files.record(keyed::kind(&read_of(rel)), "-".to_owned());
-            Err(ENOENT)
-        }
+        None => Err(ENOENT),
     }
 }
 
@@ -298,9 +383,11 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     linker.func_wrap(
         MODULE,
         "clock_time_get",
-        |mut caller: Caller<'_, State>, _id: i32, _precision: i64, out: i32| {
+        |mut caller: Caller<'_, State>, id: i32, _precision: i64, out: i32| {
             let memory = memory(&mut caller)?;
-            Ok(errno(put(memory.data_mut(&mut caller), out, &0u64.to_le_bytes())))
+            let (mem, state) = memory.data_and_store_mut(&mut caller);
+            state.files.traced.untraceable.push(Untraceable::Clock);
+            Ok(errno(put(mem, out, &now(id).to_le_bytes())))
         },
     )?;
     linker.func_wrap(
@@ -309,12 +396,8 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         |mut caller: Caller<'_, State>, buf: i32, len: i32| {
             let memory = memory(&mut caller)?;
             let (mem, state) = memory.data_and_store_mut(&mut caller);
-            let mut random = Vec::with_capacity(len as u32 as usize);
-            while random.len() < len as u32 as usize {
-                random.extend_from_slice(&state.files.next_random().to_le_bytes());
-            }
-            random.truncate(len as u32 as usize);
-            Ok(errno(put(mem, buf, &random)))
+            state.files.traced.untraceable.push(Untraceable::Random);
+            Ok(errno(put(mem, buf, &random(len as u32 as usize))))
         },
     )?;
     linker.func_wrap(MODULE, "sched_yield", || SUCCESS)?;
@@ -523,20 +606,39 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                 if oflags & (OFLAGS_CREAT | OFLAGS_TRUNC) != 0 || rights & RIGHTS_FD_WRITE != 0 {
                     return Err(EROFS);
                 }
-                let Ok(meta) = std::fs::metadata(&real) else {
-                    files.record(read_of(&rel), "-".to_owned());
-                    return Err(ENOENT);
+                let meta = match std::fs::metadata(&real) {
+                    Ok(meta) => meta,
+                    Err(error) if missing(&error) => {
+                        files.found(&rel, None);
+                        return Err(ENOENT);
+                    }
+                    Err(error) => {
+                        files.cant(&real, error);
+                        return Err(EIO);
+                    }
                 };
                 if meta.is_dir() {
-                    files.record(keyed::kind(&read_of(&rel)), "d".to_owned());
+                    files.found(&rel, Some(DIRECTORY));
                     return Ok(files.insert(Open::Dir { rel }));
                 }
                 if oflags & OFLAGS_DIRECTORY != 0 {
-                    files.record(keyed::kind(&read_of(&rel)), "o".to_owned());
+                    files.looked(&rel, &real);
                     return Err(ENOTDIR);
                 }
-                let bytes = std::fs::read(&real).map_err(|_| ENOENT)?;
-                files.record(read_of(&rel), keyed::digest_bytes(&bytes));
+                if !meta.is_file() {
+                    // A pipe or a device would give what is in it to whoever reads it first,
+                    // or never end: a native sandbox lets no proc macro read one either.
+                    files.found(&rel, Some(SPECIAL));
+                    return Err(ENOTCAPABLE);
+                }
+                let bytes = match std::fs::read(&real) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        files.cant(&real, error);
+                        return Err(EIO);
+                    }
+                };
+                files.found(&rel, Some(*blake3::hash(&bytes).as_bytes()));
                 Ok(files.insert(Open::File { bytes, at: 0 }))
             })();
             Ok(match opened {
@@ -581,12 +683,29 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                 Err(e) => return Ok(e),
             };
             let real = files.root.join(&rel);
-            files.record(read_of(&rel), keyed::digest_of(&real));
-            let mut names: Vec<_> = std::fs::read_dir(&real)
-                .into_iter()
-                .flatten()
-                .filter_map(|it| it.ok().and_then(|it| it.file_name().into_string().ok()))
-                .collect();
+            let mut all = Vec::new();
+            match std::fs::read_dir(&real) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(entry) => all.push(entry.file_name()),
+                            Err(error) => {
+                                files.cant(&real, error);
+                                return Ok(EIO);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    files.cant(&real, error);
+                    return Ok(EIO);
+                }
+            }
+            // Recorded with every name, as a native sandbox's listing is, though a name that is
+            // not UTF-8 can't be given to the module.
+            files.listed(&rel, &all);
+            let mut names: Vec<String> =
+                all.into_iter().filter_map(|it| it.into_string().ok()).collect();
             names.sort();
             let mut out = Vec::new();
             for (index, name) in names.iter().enumerate().skip(cookie as u64 as usize) {

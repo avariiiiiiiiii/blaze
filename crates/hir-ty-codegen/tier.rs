@@ -816,13 +816,14 @@ fn build_body(
             refused("naked or opaque");
             return None;
         }
-        super::inline(&mut ctx, &cg.inlined).map_err(|e| refused(&e.to_string())).ok()?;
         // Its size is measured with its locals out of the frame, as the caller has them.
-        super::promote::promote(&mut ctx.func, cg.named_slots());
+        super::settle(&mut ctx, &cg).map_err(|e| refused(&e.to_string())).ok()?;
         fold_known_branches(&mut ctx, cg.isa);
         let pointees = std::mem::take(&mut cg.pointees);
         let seen = std::mem::take(&mut cg.seen);
-        let inlinable = super::fragment::Inlinable::of(ctx.func, cg.finish().0, pointees, seen);
+        let built_in = std::mem::take(&mut cg.built_in);
+        let inlinable =
+            super::fragment::Inlinable::of(ctx.func, cg.finish().0, pointees, seen, built_in);
         if inlinable.is_none() {
             refused("its data is out of order");
         }

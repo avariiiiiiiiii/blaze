@@ -17,7 +17,7 @@ Where: `crates/ide-db/src/lib.rs` (`impl SourceDatabase for RootDatabase`, coord
 `impl SourceDatabase for` that lands before integration (`rg 'impl.*SourceDatabase for' crates`).
 `hir-def`'s `TestDB` already has it.
 
-Why: the def-map collector expands each round's macros in parallel (docs/v2/db.md, "Parallel
+Why: the def-map collector expands each round's macros in parallel (docs/v2/plan/lanes/db.md, "Parallel
 macro expansion"); each worker thread reads through its own fork.
 
 ---
@@ -143,6 +143,35 @@ Also: a crate's content ID names its root file by path, so `CrateGraphBuilder::s
 `FileSet`) and stop with a panic naming the file otherwise. Every caller found sets the roots
 first (`FileChange::apply`, load-cargo, test-fixture, blaze-wasm, the doctest crates).
 
-Why: docs/v2/README.md section 2 and docs/v2/crates.md "IDs": results keyed by input hashes,
+Why: docs/v2/plan.md section 2 and docs/v2/plan/reference/crates.md "IDs": results keyed by input hashes,
 never by revision, so views with equal inputs share them; a setter that changes a value without
 its ID would let a stale result be reused.
+
+## `Hash` for the values of db-expand's `lru` queries (db-expand, for format)
+
+What: db-salsa's fingerprints (`v2/requests/db-salsa.md`, first section) need `Output: Hash` on
+every `lru` tracked function without `no_eq`, a hash of everything `PartialEq` compares and of no
+address that can be reused. db-expand's sites and what each still lacks:
+
+- `crates/base-db/src/editioned_file_id.rs:22` `EditionedFileId::parse`, `lru = 128`, returns
+  `syntax::Parse<ast::SourceFile>`: **`impl<T> Hash for syntax::Parse<T>`** (format,
+  `crates/syntax/src/lib.rs`), hashing what its derived `PartialEq` compares: the tree's content
+  (`Tree`/`FlatTree`: kinds, subtree sizes, token lengths and text), the errors (`SyntaxError`
+  already derives `Hash`) and `outline`. Written by hand: a derive would bound `T: Hash`, and the
+  `T`s (`ast::SourceFile`, `SyntaxNode`) are markers.
+- `crates/hir-expand/src/lib.rs:503` `MacroCallId::parse_macro_expansion`, `lru = 512`, returns
+  `ExpandResult<(Parse<SyntaxNode>, ExpansionSpanMap)>` = `mbe::ValueResult<_, ExpandError>`:
+  the `Parse` impl above, and **`Hash` added to `mbe::ValueResult`'s derive** (format,
+  `crates/mbe/src/lib.rs:341`). `span::SpanMap` and hir-expand's `ExpandError` already derive it.
+- `crates/hir-expand/src/lib.rs:1775` `HirFileId::ast_id_map`, `lru = 1024`, `span::AstIdMap`:
+  done (format's hand-written `Hash` matches its `PartialEq`).
+- `crates/hir-def/src/attrs.rs:1316`, `:1328`, `:1377`, `:1401` (`cfgs`, `fields_cfgs`, `docs`,
+  `fields_docs`): done; `CfgExpr`, `la_arena::ArenaMap` and `Docs` derive `Hash` beside
+  `PartialEq`, and `Symbol` hashes a pointer that is never freed (`intern`'s arena), so it is
+  stable within a process, which is all a fingerprint needs.
+
+`crates/hir-def/src/expr_store/body.rs:94` and `:144`, on db-salsa's list, are format's.
+
+Why: without them these four queries don't compile under db-salsa's macros; with them an evicted
+parse or expansion that recomputes to the same value is backdated, so its readers don't rerun
+(docs/v2/plan/lanes/db.md, "The LRU caps go away as a correctness problem").

@@ -490,7 +490,8 @@ impl Writer for MachO {
         let (at, bytes) = self.thin(name, bytes)?;
         let magic = bytes.get(..4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]));
         match kind {
-            NativeKind::Object => input::read(name, bytes, self.output.arch).map(NativeFile::Object),
+            NativeKind::Object => aligned(bytes, |bytes| input::read(name, bytes, self.output.arch))
+                .map(NativeFile::Object),
             NativeKind::Archive { .. } => {
                 let mut archive = archive::read(name, bytes)?;
                 for member in &mut archive.members {
@@ -499,7 +500,8 @@ impl Writer for MachO {
                 Ok(NativeFile::Archive(archive))
             }
             NativeKind::Shared { .. } if magic == Some(macho::MH_MAGIC_64) => {
-                dylib::read(name, bytes, self.output.arch).map(NativeFile::Shared)
+                aligned(bytes, |bytes| dylib::read(name, bytes, self.output.arch))
+                    .map(NativeFile::Shared)
             }
             NativeKind::Shared { .. } => {
                 let text = std::str::from_utf8(bytes).map_err(|_| {
@@ -541,6 +543,21 @@ impl Writer for MachO {
     fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError> {
         self.image(placed)
     }
+}
+
+/// `f` of `bytes` at an address `object`'s Mach-O structures may be read at (8), copied
+/// when they aren't there: an archive's member starts where its header and name end.
+fn aligned<T>(bytes: &[u8], f: impl FnOnce(&[u8]) -> T) -> T {
+    if (bytes.as_ptr() as usize).is_multiple_of(8) {
+        return f(bytes);
+    }
+    let mut words = vec![0u64; bytes.len().div_ceil(8)];
+    // SAFETY: `words` is at least `bytes.len()` bytes long and is borrowed for as long as
+    // `copy`; every byte of a `u64` is a valid `u8`.
+    let copy =
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), bytes.len()) };
+    copy.copy_from_slice(bytes);
+    f(copy)
 }
 
 /// A segment as its load command says it.
@@ -660,16 +677,21 @@ impl MachO {
                     segment.name()
                 )));
             }
-            let mut vmend = base + placed.plan.headers;
-            let mut filend = vmend;
+            let start = match segment {
+                Segment::Text => base + placed.plan.headers,
+                _ => vmaddr,
+            };
+            let (mut vmend, mut filend) = (start, start);
             let mut zero_seen = None;
             let mut sections = Vec::new();
             for &(index, region) in &regions {
                 let end = region.addr + region.capacity;
-                if region.addr < vmend.min(vmaddr.max(vmend)) && segment == Segment::Text {
+                if region.addr < start {
                     return Err(error(format!(
-                        "the region of {:?} at {:#x} is in the headers' room",
-                        region.class, region.addr
+                        "the region of {:?} at {:#x} is before its segment {} (at {start:#x})",
+                        region.class,
+                        region.addr,
+                        segment.name()
                     )));
                 }
                 if let Some(last) = segments.last().filter(|_| segment != Segment::Text)
@@ -740,9 +762,6 @@ impl MachO {
                     flags,
                     indirect: 0,
                 });
-            }
-            if segment != Segment::Text {
-                filend = filend.max(vmaddr);
             }
             let vmend = page_up(vmend, page);
             let filesize = (page_up(filend, page) - vmaddr).min(vmend - vmaddr);
@@ -855,10 +874,11 @@ impl MachO {
         let rebase = linkedit::rebases(placed.rebase, &spans).map_err(error)?;
         let mut binds = Vec::new();
         for bind in placed.binds {
+            let ordinal = ordinal(bind.import)?;
             let import = &placed.imports[bind.import as usize];
             binds.push(linkedit::Bind {
                 addr: bind.addr,
-                ordinal: ordinal(bind.import)?,
+                ordinal,
                 name: macho_name(&import.name).into_bytes(),
                 weak: import.weak,
                 addend: bind.addend,
@@ -869,12 +889,13 @@ impl MachO {
             match &cell.holds {
                 Holds::Local(_) => {}
                 &Holds::Import(import) => {
-                    let weak = placed.imports.get(import as usize).is_some_and(|it| it.weak);
+                    let ordinal = ordinal(import)?;
+                    let import = &placed.imports[import as usize];
                     binds.push(linkedit::Bind {
                         addr: cell.addr,
-                        ordinal: ordinal(import)?,
-                        name: macho_name(&placed.imports[import as usize].name).into_bytes(),
-                        weak,
+                        ordinal,
+                        name: macho_name(&import.name).into_bytes(),
+                        weak: import.weak,
                         addend: 0,
                     });
                 }
@@ -927,7 +948,7 @@ impl MachO {
         // `__LINKEDIT`, laid out as ld64 does: the signature last, at 16 bytes.
         let linkedit_at = file_next;
         let mut linkedit = Out::default();
-        let mut table = |bytes: &[u8], linkedit: &mut Out| -> Result<(u32, u32), LinkError> {
+        let table = |bytes: &[u8], linkedit: &mut Out| -> Result<(u32, u32), LinkError> {
             if bytes.is_empty() {
                 return Ok((0, 0));
             }
@@ -1131,7 +1152,12 @@ impl MachO {
         let text = &segments[usize::from(!shared)];
         let signature =
             sign::signature(&file, identifier, text.fileoff, text.filesize, !shared);
-        debug_assert_eq!(signature.len() as u64, signature_len);
+        if signature.len() as u64 != signature_len {
+            return Err(error(format!(
+                "a code signature of {} bytes where {signature_len} were kept for it",
+                signature.len()
+            )));
+        }
         linkedit.0.extend_from_slice(&signature);
 
         let mut parts = vec![(0, headers.0)];
@@ -1210,15 +1236,15 @@ impl MachO {
         undefined.sort_unstable();
         let first_undefined = (locals.len() + defined.len()) as u32;
         let mut index_of = vec![0u32; placed.imports.len()];
-        for (nth, (name, import)) in undefined.iter().enumerate() {
-            let import_ = &placed.imports[*import as usize];
-            let library = match import_.library {
+        for (nth, (name, index)) in undefined.iter().enumerate() {
+            let import = &placed.imports[*index as usize];
+            let library = match import.library {
                 Some(library) => ordinals[library as usize] as u16,
                 None => u16::from(macho::DYNAMIC_LOOKUP_ORDINAL),
             };
-            let weak = if import_.weak { macho::N_WEAK_REF } else { 0 };
+            let weak = if import.weak { macho::N_WEAK_REF } else { 0 };
             entry(name, macho::N_UNDF | macho::N_EXT, 0, library << 8 | weak, 0);
-            index_of[*import as usize] = first_undefined + nth as u32;
+            index_of[*index as usize] = first_undefined + nth as u32;
         }
         strings.align(8);
 

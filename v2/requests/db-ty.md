@@ -48,7 +48,7 @@ Why: `InferenceResult::for_body`/`for_anon_const` are now free tracked fns `infe
 ## 5. Link (live patch)
 
 Before committing a speculative patch, run `hir_ty_borrowck::Pending::finish(db)` as a plane
-task beside the patch, sharing the database by reference (docs/v2/decisions.md: no per-thread
+task beside the patch, sharing the database by reference (docs/v2/plan/process/decisions.md: no per-thread
 handles), and roll the patch back on `Err(Refused)`; the
 `Refused` names the body and the errors to report.
 
@@ -81,7 +81,7 @@ What: compute a memo's value fingerprint (`Fingerprint::of_value`) when the valu
 the old value is still there.
 Where: `vendor/salsa/src/function/` (memo store, eviction, backdate), not yet wired to
 `fingerprint.rs`'s probe.
-Why: under "everything is ours, for the best performance" (docs/v2/plan/principles.md), hashing
+Why: under "everything is ours, for the best performance" (docs/v2/plan/goals/principles.md), hashing
 every `InferenceResult` and `MirBody` as it is stored walks the whole value with SipHash on every
 body's first computation, the hot path of a cold build, to serve only the values later evicted.
 Hashing at eviction costs one walk per evicted value, and only for values that are evicted. The

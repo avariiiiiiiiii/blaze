@@ -5,7 +5,7 @@
 //! does what it asks, every ready node at once as the pools allow, and feeds back what came of
 //! it. [`trace`] keeps a build's inputs, so a build replays as a test.
 //!
-//! [`plane`] is the same graph for every request a daemon has under way (docs/v2/plane.md):
+//! [`plane`] is the same graph for every request a daemon has under way (docs/v2/plan/lanes/core/plane.md):
 //! memo by key, single flight, fair share, critical path and memory admission, with
 //! [`admission`]'s estimates of what each task holds and [`arena`]'s measure and cap of what it
 //! does hold. [`Machine`] is the plane with one request.

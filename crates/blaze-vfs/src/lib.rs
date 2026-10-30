@@ -1,4 +1,4 @@
-//! blaze v2's files (docs/v2/vfs.md section 2, docs/v2/core.md section 3): a persistent, content-addressed Merkle
+//! blaze v2's files (docs/v2/plan/lanes/vfs.md section 2, docs/v2/plan/lanes/core.md section 3): a persistent, content-addressed Merkle
 //! tree, ported from blaze-next's `blaze-vfs` (`git show origin/blaze-next:crates/blaze-vfs`).
 //!
 //! - A file's [`ContentId`] is the hash of its bytes (domain [`FILE_DOMAIN`]); a directory's

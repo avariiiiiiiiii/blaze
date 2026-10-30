@@ -74,10 +74,7 @@ fn module_of(address: *const c_void) -> Result<*mut c_void, String> {
     let found =
         unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, address as _, &mut module) };
     if found == 0 || module.is_null() {
-        return Err(format!(
-            "no module has {address:?}: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("no module has {address:?}: {}", std::io::Error::last_os_error()));
     }
     Ok(module)
 }
@@ -148,11 +145,7 @@ impl Memory for Os {
     }
 
     fn frames(&mut self, starts: &[u64]) -> Result<(), String> {
-        if starts.is_empty() {
-            Ok(())
-        } else {
-            Err("DWARF unwind entries on Windows".to_owned())
-        }
+        if starts.is_empty() { Ok(()) } else { Err("DWARF unwind entries on Windows".to_owned()) }
     }
 
     fn functions(&mut self, functions: &[(u64, u64, u64)]) -> Result<(), String> {
@@ -160,10 +153,9 @@ impl Memory for Os {
             return Ok(());
         }
         let relative = |address: u64| {
-            address
-                .checked_sub(self.base)
-                .and_then(|it| u32::try_from(it).ok())
-                .ok_or_else(|| format!("{address:#x}, out of reach of the image at {:#x}", self.base))
+            address.checked_sub(self.base).and_then(|it| u32::try_from(it).ok()).ok_or_else(|| {
+                format!("{address:#x}, out of reach of the image at {:#x}", self.base)
+            })
         };
         let mut table = functions
             .iter()
@@ -278,7 +270,9 @@ unsafe fn writable(range: &Range<u64>, protect: u32, f: impl FnOnce()) -> Result
 unsafe fn write(piece: &Range<u64>, protect: u32, bytes: &[u8]) -> Result<(), String> {
     let copy = || {
         // SAFETY: the caller's; writable when this runs.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), piece.start as *mut u8, bytes.len()) }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), piece.start as *mut u8, bytes.len())
+        }
     };
     if protect & WRITABLE != 0 {
         copy();
@@ -289,11 +283,7 @@ unsafe fn write(piece: &Range<u64>, protect: u32, bytes: &[u8]) -> Result<(), St
     if protect & EXECUTABLE != 0 {
         // SAFETY: the range was just written.
         unsafe {
-            FlushInstructionCache(
-                GetCurrentProcess(),
-                piece.start as *const c_void,
-                bytes.len(),
-            )
+            FlushInstructionCache(GetCurrentProcess(), piece.start as *const c_void, bytes.len())
         };
     }
     Ok(())

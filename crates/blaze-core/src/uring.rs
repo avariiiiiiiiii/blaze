@@ -5,13 +5,14 @@
 //! made where it is submitted.
 //!
 //! A spawned process is watched through the ring too: a poll of its pidfd for its exit, its
-//! output pipes read and its input written by the ring. A listen's accepts, a connect, and a
-//! connection's receives and sends are the ring's; mapping a file is a call made where it is
-//! submitted.
+//! output pipes read and its input written by the ring. A listen's accepts (one multishot
+//! request for all of them), a connect, and a connection's receives and sends are the ring's;
+//! mapping a file is a call made where it is submitted. A listing, which may take long, runs on
+//! a thread of its own, which wakes the ring through an eventfd it reads.
 //!
 //! The ring is set up with the system calls themselves (`io_uring_setup`, `io_uring_enter` and
-//! three `mmap`s), the layouts as `linux/io_uring.h` has them. Kernel 5.11 or later: a wait with
-//! a timeout is `IORING_ENTER_EXT_ARG`.
+//! three `mmap`s), the layouts as `linux/io_uring.h` has them, for one issuing thread whose
+//! waits run the kernel's completion work (`IORING_SETUP_DEFER_TASKRUN`). Kernel 6.1 or later.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -26,6 +27,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -45,15 +47,26 @@ const OP_WRITE: u8 = 23;
 const OP_SEND: u8 = 26;
 const OP_RECV: u8 = 27;
 
+const SETUP_CQSIZE: u32 = 1 << 3;
+const SETUP_SUBMIT_ALL: u32 = 1 << 7;
+const SETUP_SINGLE_ISSUER: u32 = 1 << 12;
+const SETUP_DEFER_TASKRUN: u32 = 1 << 13;
 const FEAT_SINGLE_MMAP: u32 = 1 << 0;
 const FEAT_EXT_ARG: u32 = 1 << 8;
 const ENTER_GETEVENTS: u32 = 1 << 0;
 const ENTER_EXT_ARG: u32 = 1 << 3;
 const OFF_SQ_RING: libc::off_t = 0;
 const OFF_SQES: libc::off_t = 0x1000_0000;
+/// In an accept's `ioprio`: one request takes every connection until it is cancelled.
+const ACCEPT_MULTISHOT: u16 = 1 << 0;
+/// In a completion's flags: the request goes on and will complete again.
+const CQE_F_MORE: u32 = 1 << 1;
 
-/// Requests the ring holds at once; more wait in the driver until there is room.
-const ENTRIES: u32 = 256;
+/// Requests the ring holds at once, enough to keep an NVMe queue full; more wait in the
+/// driver until there is room.
+const ENTRIES: u32 = 4096;
+/// Completions it holds unreaped: a multishot request may post many for one request.
+const COMPLETIONS: u32 = 4 * ENTRIES;
 
 /// What one read of a spawned process's pipe takes at most.
 const PIPE: usize = 64 << 10;
@@ -210,14 +223,32 @@ struct Ring {
 }
 
 impl Ring {
-    fn new(entries: u32) -> io::Result<Ring> {
-        let mut params = Params::default();
+    /// Set up for the one thread that makes it (a [`Uring`] is not `Send`): the kernel does a
+    /// completion's work when that thread waits, in a batch, rather than interrupting it for
+    /// each.
+    fn new(entries: u32, completions: u32) -> io::Result<Ring> {
+        let mut params = Params {
+            flags: SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_SINGLE_ISSUER | SETUP_DEFER_TASKRUN,
+            cq_entries: completions,
+            ..Params::default()
+        };
         // SAFETY: `params` is the `io_uring_params` the call reads and fills.
         let fd = unsafe {
             libc::syscall(libc::SYS_io_uring_setup, entries, &raw mut params as *mut libc::c_void)
         };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "io_uring_setup with IORING_SETUP_DEFER_TASKRUN: {error}: Linux 6.1 or \
+                         later has it, and this is Linux {}",
+                        crate::cgroup::kernel()
+                    ),
+                ));
+            }
+            return Err(error);
         }
         // SAFETY: the call returned a file descriptor of its own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
@@ -319,8 +350,9 @@ impl Ring {
         }
     }
 
-    /// Every completion the kernel has posted.
-    fn reap(&mut self, mut each: impl FnMut(u64, i32)) {
+    /// Every completion the kernel has posted: its `user_data`, its result and whether its
+    /// request goes on ([`CQE_F_MORE`]).
+    fn reap(&mut self, mut each: impl FnMut(u64, i32, bool)) {
         // SAFETY: the counters are the kernel's and this thread's; the kernel moves the tail.
         let (mut head, tail) = unsafe {
             ((*self.cq_head).load(Ordering::Relaxed), (*self.cq_tail).load(Ordering::Acquire))
@@ -328,11 +360,11 @@ impl Ring {
         while head != tail {
             // SAFETY: the entries between the head and the tail are posted and not reaped.
             let cqe = unsafe { &*self.cqes.add((head & self.cq_mask) as usize) };
-            let (user_data, res) = (cqe.user_data, cqe.res);
+            let (user_data, res, more) = (cqe.user_data, cqe.res, cqe.flags & CQE_F_MORE != 0);
             head = head.wrapping_add(1);
             // SAFETY: as above; the entry is the kernel's again once the head is past it.
             unsafe { (*self.cq_head).store(head, Ordering::Release) };
-            each(user_data, res);
+            each(user_data, res, more);
         }
     }
 }
@@ -429,6 +461,40 @@ enum Op {
         bytes: Vec<u8>,
         put: usize,
     },
+    /// A read of the eventfd that threads doing work off the ring bump once they have sent
+    /// its completion; in flight while any such work is.
+    Wake {
+        fd: RawFd,
+        count: Box<[u8; 8]>,
+    },
+}
+
+/// Work done on threads of its own rather than through the ring (a listing, which may take
+/// long): their completions, and the eventfd that wakes the ring when one is sent.
+struct Offload {
+    sender: mpsc::Sender<Completion>,
+    receiver: mpsc::Receiver<Completion>,
+    /// Shared with the threads, so a write of one that ends after the driver is dropped
+    /// still reaches an open descriptor.
+    wake: Arc<OwnedFd>,
+    /// Work handed to threads whose completion has not been received.
+    out: usize,
+    /// The request reading `wake`, while there is one.
+    reading: Option<u64>,
+}
+
+impl Offload {
+    fn new() -> io::Result<Offload> {
+        // SAFETY: no pointers.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (sender, receiver) = mpsc::channel();
+        // SAFETY: the call returned a descriptor of its own.
+        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+        Ok(Offload { sender, receiver, wake, out: 0, reading: None })
+    }
 }
 
 struct Pending {
@@ -510,6 +576,7 @@ pub struct Uring {
     /// Requests the kernel may still hold after the ring failed: kept, never freed, so it
     /// writes into nothing else.
     abandoned: Vec<Pending>,
+    offload: Offload,
     in_flight: usize,
 }
 
@@ -519,7 +586,7 @@ impl Uring {
         Ok(Uring {
             start: Instant::now(),
             root: root.into(),
-            ring: Ring::new(ENTRIES)?,
+            ring: Ring::new(ENTRIES, COMPLETIONS)?,
             files: BTreeMap::new(),
             pending: FxHashMap::default(),
             next: 0,
@@ -532,6 +599,7 @@ impl Uring {
             next_conn: 0,
             confine: None,
             abandoned: Vec::new(),
+            offload: Offload::new()?,
             in_flight: 0,
         })
     }
@@ -690,6 +758,7 @@ impl Uring {
             },
             Op::Accept { listener, .. } => Sqe {
                 opcode: OP_ACCEPT,
+                ioprio: ACCEPT_MULTISHOT,
                 fd: listener.fd(),
                 op_flags: libc::SOCK_CLOEXEC as u32,
                 user_data,
@@ -721,6 +790,50 @@ impl Uring {
                 user_data,
                 ..Sqe::default()
             },
+            Op::Wake { fd, count } => Sqe {
+                opcode: OP_READ,
+                fd: *fd,
+                off: u64::MAX,
+                addr: count.as_ptr() as u64,
+                len: count.len() as u32,
+                user_data,
+                ..Sqe::default()
+            },
+        }
+    }
+
+    /// `effect` done by [`crate::threads::run`] on a thread of its own, its completion taken
+    /// in at a poll once the thread wakes the ring.
+    fn off_ring(&mut self, effect: Effect) -> io::Result<()> {
+        let tag = effect.tag();
+        let root = self.root.clone();
+        let sender = self.offload.sender.clone();
+        let wake = Arc::clone(&self.offload.wake);
+        std::thread::Builder::new().name("blaze-uring-off".into()).spawn(move || {
+            let done = crate::threads::run(&root, effect)
+                .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
+            // A driver dropped meanwhile takes nothing.
+            if sender.send(Completion { tag, done }).is_ok() {
+                let one = 1u64.to_ne_bytes();
+                // SAFETY: eight bytes, which an eventfd write takes; the descriptor is kept
+                // open by this thread's `Arc`.
+                unsafe { libc::write(wake.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+            }
+        })?;
+        self.offload.out += 1;
+        if self.offload.reading.is_none() {
+            let fd = self.offload.wake.as_raw_fd();
+            let id = self.start(tag, Op::Wake { fd, count: Box::new([0; 8]) });
+            self.offload.reading = Some(id);
+        }
+        Ok(())
+    }
+
+    /// The completions the threads off the ring have sent.
+    fn take_offloaded(&mut self) {
+        while let Ok(completion) = self.offload.receiver.try_recv() {
+            self.offload.out -= 1;
+            self.ready.push(completion);
         }
     }
 
@@ -754,8 +867,13 @@ impl Uring {
         let pending: Vec<Pending> = self.pending.drain().map(|(_, it)| it).collect();
         for pending in pending {
             match pending.op {
-                // A spawn fails once, below.
-                Op::Cancel { .. } | Op::Exit { .. } | Op::Output { .. } | Op::Input { .. } => {}
+                // A spawn fails once, below; work off the ring still completes through its
+                // thread.
+                Op::Cancel { .. }
+                | Op::Exit { .. }
+                | Op::Output { .. }
+                | Op::Input { .. }
+                | Op::Wake { .. } => {}
                 _ => self.ready.push(failed(pending.tag)),
             }
             self.abandoned.push(pending);
@@ -773,24 +891,30 @@ impl Uring {
         });
         self.watches.clear();
         self.listens.clear();
+        self.offload.reading = None;
         self.waiting.clear();
         self.ring.unsubmitted = 0;
     }
 
     /// Takes the completion of the request `id`: its effect's completion, or the rest of it
-    /// asked for.
-    fn completed(&mut self, id: u64, res: i32) {
+    /// asked for. With `more`, the kernel still holds the request (a multishot one), so it is
+    /// kept and not asked again.
+    fn completed(&mut self, id: u64, res: i32, more: bool) {
         let Some(mut pending) = self.pending.remove(&id) else { return };
         let tag = pending.tag;
-        match self.step(tag, &mut pending.op, res) {
+        match self.step(tag, &mut pending.op, res, more) {
             Step::Again => {
                 self.pending.insert(id, pending);
-                self.queue(id);
+                if !more {
+                    self.queue(id);
+                }
             }
             Step::Goes(done) => {
                 self.ready.push(Completion { tag, done });
                 self.pending.insert(id, pending);
-                self.queue(id);
+                if !more {
+                    self.queue(id);
+                }
             }
             Step::Ends(done) => {
                 if let Some(done) = done {
@@ -810,7 +934,7 @@ impl Uring {
     }
 
     /// What the result `res` of a request of the effect `tag` means for it.
-    fn step(&mut self, tag: Tag, op: &mut Op, res: i32) -> Step {
+    fn step(&mut self, tag: Tag, op: &mut Op, res: i32, more: bool) -> Step {
         let error = |res: i32| io::Error::from_raw_os_error(-res).to_string();
         let failed = |res: i32| Some(Done::Failed(IoError(error(res))));
         match op {
@@ -937,12 +1061,18 @@ impl Uring {
                     let fd = unsafe { OwnedFd::from_raw_fd(res) };
                     let conn = self.add(crate::net::Socket::from_fd(fd, listener.is_unix()));
                     let done = Done::Accepted { conn };
-                    if !*stopping {
+                    // Stopping, it ends only at the completion that says the kernel let go of
+                    // it: until then it may accept more.
+                    if !*stopping || more {
                         return Step::Goes(done);
                     }
                     self.listens.remove(&tag);
                     self.ready.push(Completion { tag, done });
                     return Step::Ends(Some(Done::Unlistened));
+                }
+                if more {
+                    // The kernel goes on accepting with it: it has not ended.
+                    return Step::Again;
                 }
                 if res == -libc::ECANCELED || *stopping {
                     self.listens.remove(&tag);
@@ -988,6 +1118,16 @@ impl Uring {
                 bytes.truncate(res as usize);
                 Step::Ends(Some(Done::Read(bytes)))
             }
+            Op::Wake { .. } => {
+                self.take_offloaded();
+                if res >= 0 && self.offload.out > 0 {
+                    return Step::Again;
+                }
+                // Nothing more is off the ring, or the read failed: what is still out is taken
+                // in at the polls that follow, and the next work off the ring reads again.
+                self.offload.reading = None;
+                Step::Ends(None)
+            }
             Op::Send { bytes, put, .. } => {
                 if res < 0 {
                     return Step::Ends(failed(res));
@@ -1003,10 +1143,11 @@ impl Uring {
     }
 
     fn reap(&mut self) {
+        self.take_offloaded();
         let mut posted = Vec::new();
-        self.ring.reap(|user_data, res| posted.push((user_data, res)));
-        for (id, res) in posted {
-            self.completed(id, res);
+        self.ring.reap(|user_data, res, more| posted.push((user_data, res, more)));
+        for (id, res, more) in posted {
+            self.completed(id, res, more);
         }
         self.flush_waiting();
         self.submit_ring();
@@ -1183,12 +1324,22 @@ impl Drop for Uring {
             };
             while alive && !self.ring.push(cancel) {
                 alive = Instant::now() < deadline && self.ring.enter(None).is_ok();
-                self.ring.reap(|user_data, _| posted.push(user_data));
+                self.ring.reap(|user_data, res, more| posted.push((user_data, res, more)));
             }
         }
         while alive {
-            for id in posted.drain(..) {
-                self.pending.remove(&id);
+            for (id, res, more) in posted.drain(..) {
+                if res >= 0
+                    && let Some(Pending { op: Op::Accept { .. }, .. }) = self.pending.get(&id)
+                {
+                    // SAFETY: a connection the accept made after it was cancelled, owned here
+                    // and closed.
+                    drop(unsafe { OwnedFd::from_raw_fd(res) });
+                }
+                // A multishot request the kernel still holds is not given back yet.
+                if !more {
+                    self.pending.remove(&id);
+                }
             }
             let left = deadline.saturating_duration_since(Instant::now());
             let lent = self.pending.values().any(|it| !matches!(it.op, Op::Cancel { .. }));
@@ -1196,7 +1347,7 @@ impl Drop for Uring {
                 break;
             }
             alive = self.ring.enter(Some(left)).is_ok();
-            self.ring.reap(|user_data, _| posted.push(user_data));
+            self.ring.reap(|user_data, res, more| posted.push((user_data, res, more)));
         }
         for (_, spawn) in std::mem::take(&mut self.spawns) {
             _ = spawn.end();
@@ -1333,9 +1484,7 @@ impl Driver for Uring {
                     crate::fs::link(&at(&from), &at(&to)).map(|()| Some(Done::Linked))
                 }
                 Effect::Stat { file, .. } => crate::fs::stat(&at(&file)).map(|it| Some(Done::Stat(it))),
-                Effect::List { dir, .. } => {
-                    crate::fs::list(&at(&dir), &dir).map(|it| Some(Done::Listed(it)))
-                }
+                list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
                 Effect::WriteAt { file, at: offset, bytes, .. } => {
                     open_to_write(&at(&file), 0).map(|fd| match bytes.is_empty() {
                         true => Some(Done::Written),
@@ -1911,6 +2060,49 @@ mod tests {
         );
         let root = dir("uring-map-threads");
         assert_eq!(ours, maps(&mut Threads::new(&root, 2), &root));
+    }
+
+    /// Listings done off the ring: many at once, one of a missing directory; each wakes the
+    /// poll that waits, with a timer far off in flight beside them.
+    #[test]
+    fn listings_wake_the_ring_from_their_threads() {
+        let root = dir("uring-list");
+        for file in ["tree/a", "tree/b/c", "tree/b/d/e"] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, file).unwrap();
+        }
+        let mut driver = Uring::new(&root).unwrap();
+        let name = |it: &str| FileName::new(it).unwrap();
+        let mut effects: Vec<Effect> =
+            (0..16).map(|n| Effect::List { dir: name("tree"), tag: Tag(n) }).collect();
+        effects.push(Effect::List { dir: name("missing"), tag: Tag(16) });
+        effects.push(Effect::Timer { after: Duration::from_secs(60), tag: Tag(17) });
+        driver.submit(&mut effects);
+        let started = Instant::now();
+        let mut seen = BTreeMap::new();
+        let mut done = Vec::new();
+        while seen.len() < 17 && started.elapsed() < Duration::from_secs(20) {
+            driver.poll(&mut done, Duration::from_secs(10));
+            for completion in done.drain(..) {
+                let shown = match completion.done {
+                    Done::Listed(found) => {
+                        found.iter().map(|(it, _)| it.as_str()).collect::<Vec<_>>().join(" ")
+                    }
+                    Done::Failed(_) => "failed".to_owned(),
+                    other => panic!("{other:?}"),
+                };
+                seen.insert(completion.tag.0, shown);
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        let all = "tree/a tree/b tree/b/c tree/b/d tree/b/d/e";
+        let mut expected: BTreeMap<u64, String> = (0..16).map(|n| (n, all.to_owned())).collect();
+        expected.insert(16, "failed".to_owned());
+        assert_eq!(seen, expected);
+        assert_eq!(driver.in_flight(), 1);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Dropping the driver with a process, a listen and a receive in flight kills the process

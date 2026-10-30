@@ -14,7 +14,7 @@ where
     /// then update `revisions.changed_at` to match `self.revisions.changed_at`. This is invoked
     /// on an old memo when a new memo has been produced to check whether there have been changed.
     ///
-    /// `revisions.fingerprint` must already hold the new value's fingerprint. When the old value
+    /// `revisions` must already hold the new value's fingerprint. When the old value
     /// was evicted, the values are the same if both have value fingerprints and they are equal.
     /// Without value fingerprints, an evicted value is only known to be the same when the old memo
     /// was verified in `now`, the current revision: every input was unchanged, so executing again
@@ -33,8 +33,8 @@ where
         let same = match old_memo.value() {
             Some(old_value) => C::values_equal(old_value, value),
             None => {
-                let old = old_memo.header.revisions.fingerprint;
-                let new = revisions.fingerprint;
+                let old = old_memo.header.revisions.value_fingerprint();
+                let new = revisions.value_fingerprint();
                 if old.is_value() && new.is_value() {
                     old == new
                 } else {

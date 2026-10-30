@@ -1,4 +1,4 @@
-//! The parallel, in-place linker (docs/v2/link.md; #275, #232).
+//! The parallel, in-place linker (docs/v2/plan/lanes/link.md; #275, #232).
 //!
 //! An [`Image`] is an executable (or a running program's code, for live patching) kept
 //! linked. A [`Change`] says which functions are new or changed; each is placed in a

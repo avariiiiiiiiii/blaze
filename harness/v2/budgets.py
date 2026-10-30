@@ -1,4 +1,4 @@
-"""budgets.py: the performance budgets of docs/v2/plan/targets.md, and docs/v2/proof.md's release
+"""budgets.py: the performance budgets of docs/v2/plan/goals/targets.md, and docs/v2/plan/lanes/proof.md's release
 code speed against rustc's, each an outcome with the number measured, the budget, today's figure from the
 table, and pass or fail.
 
@@ -64,11 +64,11 @@ their pinned revisions, except blaze, which is the files of this checkout as the
     memory         (also) nushell: the cold peak per thousand lines of the workspace's .rs files,
                    at most cargo's
     layout         nushell after its cold build: bytes per element of each table
-                   docs/v2/plan/data.md sizes (Engine.tables): a token 4, a syntax node 8,
+                   docs/v2/plan/design/data.md sizes (Engine.tables): a token 4, a syntax node 8,
                    a HIR expression 12, a MIR statement 16, a memo 24 and an edge 4, a
                    relocation 16
     cache-misses   nushell: the machine's cache misses over the build of bench's `body` edit
-                   (`perf stat -a`, Linux); docs/v2/plan/data.md asks for it and sets no budget
+                   (`perf stat -a`, Linux); docs/v2/plan/design/data.md asks for it and sets no budget
 
 Each project's checkout has a blaze home and store of its own and a cargo target directory
 outside the checkout (engine.reference_env). A build blaze did not serve (`Engine.not_blazes`)
@@ -206,7 +206,7 @@ ROWS = (
     Row("dev-speed", "dev-speed", "ripgrep", "dev-build code speed (ripgrep): blaze's dev program against cargo's debug "
         "build", 1.0, True, "x cargo's time", "ripgrep's dev build runs 5.8x slower than cargo's debug build (#1404)"),
     Row("release-speed", "release-speed", "ripgrep", "release code speed (ripgrep): `blaze build --release` against "
-        "`cargo build --release`", 1.0, True, "x cargo's time", "no figure in docs/v2/plan/targets.md"),
+        "`cargo build --release`", 1.0, True, "x cargo's time", "no figure in docs/v2/plan/goals/targets.md"),
     Row("big-crate", "big-crate", "ruff", "body edit of a big top crate (ruff)", 50, True, "ms",
         "ruff 75 s, ty 147 s; cargo 7 s; Astral's fork 0.3 s (#1450)"),
     Row("cold-busy", "cold-blaze", "blaze", "cold build of blaze: the share of the machine's cores busy", 0.8, False,
@@ -879,7 +879,7 @@ class Lane:
             finally:
                 revert(n)
             self.build(f"body edit {n + 1} taken back", False)
-        return Measured(statistics.median(misses), detail="docs/v2/plan/data.md asks for the number and sets no budget",
+        return Measured(statistics.median(misses), detail="docs/v2/plan/design/data.md asks for the number and sets no budget",
                         numbers=dict(samples=samples(misses), references_median=statistics.median(references)))
 
     def items(self, rep: report.Report, rows: dict[str, Row]) -> None:
@@ -1210,7 +1210,7 @@ def selftest() -> None:
     except engine.Failed:
         pass
     expect(set(TABLES.values()) == {"token", "syntax-node", "hir-expr", "mir-statement", "memo", "memo-edge",
-                                    "relocation"}, f"the tables of docs/v2/plan/data.md: {TABLES}")
+                                    "relocation"}, f"the tables of docs/v2/plan/design/data.md: {TABLES}")
     print(f"{SCRIPT} selftest: ok")
 
 

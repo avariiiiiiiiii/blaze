@@ -1,5 +1,7 @@
-//! The plane's tests (docs/v2/plane.md): what each rule does alone, the plane as the machine
+//! The plane's tests (docs/v2/plan/lanes/core/plane.md): what each rule does alone, the plane as the machine
 //! with one request, and random requests under a seeded generator, checked after every step.
+
+use std::sync::{Arc, Mutex};
 
 use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -263,23 +265,88 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
     }
 }
 
+/// What the query database has, as the plane's [`crate::plane::Memo`] sees it: the test puts a
+/// task's value in it before its `Done`, as the work does.
+type Db = Arc<Mutex<FxHashMap<Key, Outcome>>>;
+
+fn with_db(config: PlaneConfig) -> (Plane, Db) {
+    let db = Db::default();
+    let memo = {
+        let db = db.clone();
+        move |key: Key| db.lock().expect("the test's database").get(&key).cloned()
+    };
+    (Plane::with_memo(config, Box::new(memo)).unwrap(), db)
+}
+
 #[test]
-fn a_key_done_before_runs_nothing_in_another_request() {
-    let mut plane = Plane::new(config(1, 2)).unwrap();
+fn a_key_the_database_has_runs_nothing() {
+    let (mut plane, db) = with_db(config(1, 2));
     open(&mut plane, 1, 1, false);
     assert_eq!(runs(&add(&mut plane, 1, vec![keyed(1, &[], 1, 7)])), [1]);
     close(&mut plane, 1);
+    db.lock().unwrap().insert(key(7), Outcome::Built);
     assert_eq!(finished(&built(&mut plane, 1)), [(1, true)]);
-    assert!(plane.remembers(&key(7)));
     open(&mut plane, 2, 1, false);
     let out = add(&mut plane, 2, vec![keyed(2, &[], 1, 7), work(3, &[2], 1)]);
     assert_eq!(runs(&out), [3]);
     assert_eq!(plane.state(NodeId(2)), Some(&NodeState::Cached { remote: false }));
     assert_eq!(plane.counts().remembered, 1);
-    // Forgotten, the key runs again.
-    plane.forget(&key(7));
-    open(&mut plane, 3, 1, false);
-    assert_eq!(runs(&add(&mut plane, 3, vec![keyed(4, &[], 1, 7)])), [4]);
+    // A failure the database keeps fails the node, and what waits for it is skipped.
+    db.lock().unwrap().insert(key(8), Outcome::Failed { why: "it failed before".to_owned() });
+    open(&mut plane, 3, 1, true);
+    let out = add(&mut plane, 3, vec![keyed(4, &[], 1, 8), work(5, &[4], 1)]);
+    assert!(runs(&out).is_empty());
+    assert_eq!(
+        moves(&out),
+        [
+            (5, NodeState::Waiting),
+            (4, NodeState::Failed { why: "it failed before".to_owned() }),
+            (5, NodeState::Skipped { because: 4 }),
+        ]
+    );
+    // Gone from the database, the key runs again.
+    db.lock().unwrap().remove(&key(7));
+    open(&mut plane, 4, 1, false);
+    assert_eq!(runs(&add(&mut plane, 4, vec![keyed(6, &[], 1, 7)])), [6]);
+}
+
+/// The plane keeps no results of its own: without a database a key done before runs again.
+#[test]
+fn without_a_database_a_key_done_before_runs_again() {
+    let mut plane = Plane::new(config(1, 2)).unwrap();
+    open(&mut plane, 1, 1, false);
+    assert_eq!(runs(&add(&mut plane, 1, vec![keyed(1, &[], 1, 7)])), [1]);
+    close(&mut plane, 1);
+    assert_eq!(finished(&built(&mut plane, 1)), [(1, true)]);
+    open(&mut plane, 2, 1, false);
+    assert_eq!(runs(&add(&mut plane, 2, vec![keyed(2, &[], 1, 7)])), [2]);
+    assert_eq!(plane.counts().remembered, 0);
+}
+
+/// A released request gives its room back once it finishes: its nodes and its id are no longer
+/// known, and the id can be opened again.
+#[test]
+fn a_released_request_is_forgotten_once_it_finishes() {
+    let mut plane = Plane::new(config(1, 1)).unwrap();
+    open(&mut plane, 1, 1, false);
+    assert_eq!(runs(&add(&mut plane, 1, vec![work(1, &[], 1), work(2, &[1], 1)])), [1]);
+    close(&mut plane, 1);
+    plane.release(RequestId(1)).unwrap();
+    // Not yet finished: it is still known.
+    assert_eq!(plane.state(NodeId(1)), Some(&NodeState::Running));
+    assert_eq!(runs(&built(&mut plane, 1)), [2]);
+    assert_eq!(finished(&built(&mut plane, 2)), [(1, true)]);
+    assert_eq!(plane.state(NodeId(1)), None);
+    assert_eq!(plane.state(NodeId(2)), None);
+    let close_again = PlaneInput::Close { at_ns: 0, request: RequestId(1) };
+    assert_eq!(plane.step(close_again), Err(Error::UnknownRequest(1)));
+    // Its id and its nodes' ids are free again; the plane reuses the room.
+    open(&mut plane, 1, 1, false);
+    assert_eq!(runs(&add(&mut plane, 1, vec![work(2, &[], 1), work(1, &[2], 1)])), [2]);
+    close(&mut plane, 1);
+    assert_eq!(runs(&built(&mut plane, 2)), [1]);
+    assert_eq!(finished(&built(&mut plane, 1)), [(1, true)]);
+    assert_eq!(plane.release(RequestId(9)), Err(Error::UnknownRequest(9)));
 }
 
 #[test]
@@ -541,8 +608,9 @@ struct Model {
     running: Vec<u32>,
     running_keys: FxHashSet<Key>,
     granted: u64,
-    /// Keys whose task ended well, and not forgotten since.
-    remembered: FxHashSet<Key>,
+    /// What the database has: keys whose task ended well, some that failed, less those
+    /// dropped since.
+    db: Db,
     finished: FxHashMap<u32, bool>,
     cancelled: FxHashSet<u32>,
     outputs: Vec<PlaneOutput>,
@@ -645,8 +713,8 @@ impl Model {
                     if let Some(key) = spec.key {
                         assert!(self.running_keys.insert(key), "seed {seed}: {key:?} runs twice");
                         assert!(
-                            !self.remembered.contains(&key),
-                            "seed {seed}: #{id} runs a remembered key"
+                            !self.db.lock().unwrap().contains_key(&key),
+                            "seed {seed}: #{id} runs a key the database has"
                         );
                     }
                     self.granted += spec.memory;
@@ -708,22 +776,24 @@ impl Model {
         self.outputs.extend(outputs);
     }
 
-    /// A running task is done: what the plane is told, and what the model keeps of it.
-    fn finish(&mut self, id: u32, outcome: &Outcome) {
+    /// A running task is done: what the plane is told, and what the model keeps of it. Its
+    /// work puts the value in the database first, and a failure too if `keep_failure`.
+    fn finish(&mut self, id: u32, outcome: &Outcome, keep_failure: bool) {
         self.running.retain(|&it| it != id);
         let spec = &self.specs[&id];
         self.granted -= spec.memory;
         if let Some(key) = spec.key {
             self.running_keys.remove(&key);
-            if !matches!(outcome, Outcome::Failed { .. }) {
-                self.remembered.insert(key);
+            if keep_failure || !matches!(outcome, Outcome::Failed { .. }) {
+                self.db.lock().unwrap().insert(key, outcome.clone());
             }
         }
     }
 }
 
 /// One random run of many requests: the outputs the plane gave, and how many steps it took.
-fn simulate(seed: u64) -> (Vec<PlaneOutput>, u64) {
+/// With `release`, each request is released as it is opened.
+fn simulate(seed: u64, release: bool) -> (Vec<PlaneOutput>, u64) {
     let mut random = SplitMix(seed);
     let budget = (!random.one_in(3)).then(|| 100 + random.below(900));
     let starve_after = random.below(5) as u32;
@@ -733,7 +803,7 @@ fn simulate(seed: u64) -> (Vec<PlaneOutput>, u64) {
         budget: budget.and_then(self::budget),
         starve_after,
     };
-    let mut plane = Plane::new(config).unwrap();
+    let (mut plane, db) = with_db(config);
     let keys = 1 + random.below(12) as u8;
     let memory = |random: &mut SplitMix| match budget {
         None => random.below(1000),
@@ -744,7 +814,7 @@ fn simulate(seed: u64) -> (Vec<PlaneOutput>, u64) {
     let by_key: Vec<(u64, Pool)> = (0..keys)
         .map(|_| (memory(&mut random), if random.one_in(3) { Pool::Io } else { Pool::Work }))
         .collect();
-    let mut model = Model { seed, budget, ..Model::default() };
+    let mut model = Model { seed, budget, db, ..Model::default() };
     let mut planned: Vec<Planned> = (0..1 + random.below(5))
         .map(|_| Planned {
             weight: 1 + random.below(4) as u32,
@@ -805,12 +875,11 @@ fn simulate(seed: u64) -> (Vec<PlaneOutput>, u64) {
             let budget = budget.unwrap_or(0);
             let bytes = if random.one_in(10) { random.below(budget * 2) } else { random.below(budget / 3) };
             plane.step(PlaneInput::Held { at_ns: at, bytes }).unwrap()
-        } else if roll < 10 && !model.remembered.is_empty() {
-            let mut remembered: Vec<Key> = model.remembered.iter().copied().collect();
-            remembered.sort_unstable();
-            let key = remembered[random.below(remembered.len() as u64) as usize];
-            plane.forget(&key);
-            model.remembered.remove(&key);
+        } else if roll < 10 && !model.db.lock().unwrap().is_empty() {
+            let mut db = model.db.lock().unwrap();
+            let mut kept: Vec<Key> = db.keys().copied().collect();
+            kept.sort_unstable();
+            db.remove(&kept[random.below(kept.len() as u64) as usize]);
             Vec::new()
         } else if roll < 45 || model.running.is_empty() {
             let unopened = planned.iter().position(|it| !it.opened);
@@ -821,14 +890,19 @@ fn simulate(seed: u64) -> (Vec<PlaneOutput>, u64) {
             {
                 let it = &mut planned[r];
                 it.opened = true;
-                plane
+                let request = RequestId(r as u32);
+                let outputs = plane
                     .step(PlaneInput::Open {
                         at_ns: at,
-                        request: RequestId(r as u32),
+                        request,
                         weight: it.weight,
                         keep_going: it.keep_going,
                     })
-                    .unwrap()
+                    .unwrap();
+                if release {
+                    plane.release(request).unwrap();
+                }
+                outputs
             } else if !unclosed.is_empty() {
                 let r = unclosed[random.below(unclosed.len() as u64) as usize];
                 if planned[r].batches > 0 {
@@ -865,7 +939,8 @@ fn simulate(seed: u64) -> (Vec<PlaneOutput>, u64) {
                 Vec::new()
             };
             model.register(r, &added);
-            model.finish(id, &outcome);
+            let keep_failure = random.one_in(2);
+            model.finish(id, &outcome, keep_failure);
             let group = (!random.one_in(3)).then(|| random.below(4) as u32);
             let input = PlaneInput::Done {
                 at_ns: at,
@@ -884,19 +959,23 @@ fn simulate(seed: u64) -> (Vec<PlaneOutput>, u64) {
         assert!(state.settled(), "seed {seed}: #{id} {state:?} after every request finished");
     }
     assert_eq!(model.states.len(), model.specs.len(), "seed {seed}");
+    for id in model.specs.keys() {
+        assert_eq!(plane.state(NodeId(*id)).is_some(), !release, "seed {seed}: #{id}");
+    }
     (model.outputs, steps)
 }
 
 /// Random requests under many seeds, checked after every step: nothing runs before its deps;
-/// no key runs twice at once; a remembered key never runs; granted memory never exceeds the
-/// budget; a held task starts before any other with memory; a failure for memory names its
-/// node; the critical path goes first within a request; every request ends, ok exactly when
-/// nothing of it failed and it was not cancelled.
+/// no key runs twice at once; a key the database has never runs; granted memory never exceeds
+/// the budget; a held task starts before any other with memory; a failure for memory names its
+/// node; the critical path goes first within a request, as priorities kept as nodes are added
+/// match those counted again from the whole graph; every request ends, ok exactly when nothing
+/// of it failed and it was not cancelled.
 #[test]
 fn random_requests_keep_the_rules() {
     let mut steps = 0;
     for seed in 0..600u64 {
-        steps += simulate(seed).1;
+        steps += simulate(seed, false).1;
     }
     assert!(steps > 5_000, "{steps} steps");
 }
@@ -904,8 +983,19 @@ fn random_requests_keep_the_rules() {
 #[test]
 fn the_same_seed_gives_the_same_outputs() {
     for seed in 0..60u64 {
-        let (a, steps) = simulate(seed);
-        let (b, _) = simulate(seed);
+        let (a, steps) = simulate(seed, false);
+        let (b, _) = simulate(seed, false);
         assert_eq!(a, b, "seed {seed} after {steps} steps");
+    }
+}
+
+/// Room given back and taken again changes nothing the plane says: each finished request's
+/// room is reused by the next, and the outputs are those of a plane that keeps everything.
+#[test]
+fn releasing_requests_changes_no_output() {
+    for seed in 0..300u64 {
+        let (kept, steps) = simulate(seed, false);
+        let (released, _) = simulate(seed, true);
+        assert_eq!(kept, released, "seed {seed} after {steps} steps");
     }
 }

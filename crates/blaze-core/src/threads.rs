@@ -82,6 +82,13 @@ impl Threads {
         self
     }
 
+    /// The address the TCP listen `listen` was given (its port, where it asked for port 0);
+    /// `None` for a Unix socket or a listen not in flight.
+    #[cfg(unix)]
+    pub fn local_addr(&self, listen: Tag) -> Option<std::net::SocketAddr> {
+        self.listens.get(&listen)?.local
+    }
+
     fn fire_timers(&mut self, out: &mut Vec<Completion>) -> usize {
         let now = Instant::now();
         let mut fired = 0;
@@ -473,6 +480,7 @@ mod world {
             net::set_cloexec(read_end.as_raw_fd())?;
             net::set_cloexec(write_end.as_raw_fd())?;
             listener.set_nonblocking(true)?;
+            let local = listener.local_addr();
             let world = self.clone();
             let thread = std::thread::Builder::new().name("blaze-listen".into()).spawn(move || {
                 loop {
@@ -520,7 +528,7 @@ mod world {
                     }
                 }
             })?;
-            Ok(Listening { stop: write_end, thread })
+            Ok(Listening { stop: write_end, thread, local })
         }
     }
 
@@ -551,6 +559,7 @@ mod world {
     pub(super) struct Listening {
         stop: OwnedFd,
         thread: JoinHandle<()>,
+        pub(super) local: Option<std::net::SocketAddr>,
     }
 
     impl Listening {

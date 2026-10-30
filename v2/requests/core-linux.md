@@ -21,13 +21,33 @@
   off a `Threads` listen; the Unix-socket round trip is compared on both. With it, the TCP one
   can be compared too (and a state machine that listens on port 0 can say where it listens).
 
-## 3. docs/v2/plane.md's watch row: what makes fanotify refuse
+## 3. `process::start` on Linux: `clone3`, not `fork` (performance)
+
+- What: start the child with `clone3(CLONE_VM | CLONE_VFORK | CLONE_PIDFD | CLONE_INTO_CGROUP)`
+  (Linux 5.7) on its own small stack, running only `dup2`s, `chdir` and `execve` before the
+  exec, in place of `std::process::Command::spawn` with a `pre_exec` (which makes std use
+  `fork`). `start` would return the pidfd in `Started` and drop `pre_exec(join)`.
+- Where: `crates/blaze-core/src/process.rs` (core's). `cgroup.rs` (mine) gains
+  `pub(crate) fn dir_fd(&self) -> io::Result<OwnedFd>` (an `O_PATH | O_DIRECTORY` open of the
+  cgroup) for `cgroup` in `clone_args` the day `start` uses it; tell me and I add it.
+- Why: with a `pre_exec`, std forks. A fork copies the page tables of the whole daemon (many GB
+  once warm), which costs milliseconds per spawn and grows with the daemon, where a vfork-style
+  clone is tens of microseconds whatever the daemon's size. `CLONE_INTO_CGROUP` starts the
+  child in its cgroup, so no write to `cgroup.procs` runs in the child, and nothing is ever
+  charged to the daemon's cgroup first. `CLONE_PIDFD` hands back the pidfd at creation, so
+  `uring.rs` drops its `pidfd_open` call, and no window remains in which the pid is unheld.
+
+## 4. docs/v2/plan/lanes/core/plane.md's watch row: what makes fanotify refuse
 
 - What: after "fanotify, inotify where fanotify needs a privilege the process lacks", add: "A
   file system that gives no file handles (fanotify reports changes by them) is an error naming
   it, not a quiet switch to inotify."
-- Where: `docs/v2/plane.md`, the IO core table.
+- Where: `docs/v2/plan/lanes/core/plane.md`, the IO core table.
 - Why: that is what `crate::watch::Tree::new` does (no-fallback): only `EPERM` (no
   `CAP_SYS_ADMIN` or `CAP_DAC_READ_SEARCH`) means inotify. A daemon running as root on a file
   system without handles (an overlayfs before 6.6, some FUSE or 9p mounts) will fail its
   watches with that error, which whoever runs the VMs should know.
+
+---
+Applied by core: 1 (`a_sandbox_is_made_by_the_confine_or_refused` runs on `Uring` and `Kqueue`
+too; the shared scripts already did), 2 (`Threads::local_addr`), 3 (in docs/v2/plan/lanes/core/plane.md).

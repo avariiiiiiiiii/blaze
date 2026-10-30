@@ -1,4 +1,4 @@
-//! Where a task's memory is measured and the daemon's is capped (docs/v2/core.md section 4,
+//! Where a task's memory is measured and the daemon's is capped (docs/v2/plan/lanes/core.md section 4,
 //! "Memory-budget admission" and "Hard backstop").
 //!
 //! [`Counting`] is the daemon's global allocator: it counts the bytes the process holds
@@ -6,7 +6,8 @@
 //! says what a task held at most. [`Bump`] is an arena for results built before they are
 //! written into the zero-copy format. [`Cap`] is the daemon's limit on its own arenas: past
 //! `spill_at` it asks for cold results to go to disk, and a reserve that would pass the limit
-//! waits. [`machine_budget`] is the memory the plane may grant: the machine's, less a margin.
+//! waits. [`machine_budget`] is the memory the plane may grant: the machine's limit, less what
+//! others use in blaze's own cgroup and a margin.
 
 use std::{
     alloc::{GlobalAlloc, Layout},
@@ -318,7 +319,7 @@ impl Arena for Bump {
     }
 }
 
-/// The daemon's cap on its own arenas (docs/v2/core.md, "Hard backstop"). Bytes are reserved
+/// The daemon's cap on its own arenas (docs/v2/plan/lanes/core.md, "Hard backstop"). Bytes are reserved
 /// before they are allocated and given back when the [`Grant`] is dropped. Past `spill_at`,
 /// `spill` is called with the bytes over it, once each time it is passed, so the query
 /// database moves cold values to the store; a reserve that would pass `limit` waits until
@@ -524,17 +525,40 @@ impl Drop for Grant {
     }
 }
 
-/// The memory the plane may grant: the machine's less `margin`. The machine's is the least of
-/// what it has and what the process may use: on Linux `/proc/meminfo`'s `MemTotal`, the
-/// `memory.max` of the process's cgroup and each one above it (cgroup v2; v1's
-/// `memory.limit_in_bytes`), and `RLIMIT_AS`; on macOS `sysctl hw.memsize` and `RLIMIT_AS`.
-/// The budget's `from` names which it was. An error where one cannot be read or the margin
-/// leaves nothing, never a guess.
+/// The memory the plane may grant: the machine's limit, less what others use within it, less
+/// `margin`.
+///
+/// The limit is the least of what the machine has and what the process may use: on Linux
+/// `/proc/meminfo`'s `MemTotal`, the `memory.max` of the process's cgroup and of each one above
+/// it (cgroup v2; v1's `memory.limit_in_bytes`), and `RLIMIT_AS`; on macOS `sysctl hw.memsize`
+/// and `RLIMIT_AS`.
+///
+/// What others use is what is in use in blaze's own cgroup (v2's `memory.current` of the group
+/// `/proc/self/cgroup` names; v1's `memory.usage_in_bytes` where the memory controller is
+/// v1's) less what blaze itself holds ([`held`]; 0 when [`Counting`] is not the global
+/// allocator, so the budget is then the smaller). It is not the machine's `MemTotal` less
+/// `MemAvailable`: that counts every process outside the cgroup against a limit they do not
+/// share, and a small cgroup on a busy machine would refuse builds that fit. The root cgroup
+/// keeps no count, and nothing is taken off there; nor on macOS, which has no cgroups.
+///
+/// The budget's `from` names the limit and what was taken off. An error where one cannot be
+/// read or nothing is left, never a guess.
 pub fn machine_budget(margin: u64) -> io::Result<Budget> {
     let mut limits = machine_limits()?;
     #[cfg(unix)]
     limits.extend(rlimit_as()?.map(|bytes| (bytes, "the process's RLIMIT_AS".to_owned())));
-    least(limits, margin)
+    let in_use = machine_in_use(held())?;
+    least(limits, in_use, margin)
+}
+
+#[cfg(target_os = "linux")]
+fn machine_in_use(own: u64) -> io::Result<Option<(u64, String)>> {
+    linux_in_use(Path::new("/"), own)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn machine_in_use(_own: u64) -> io::Result<Option<(u64, String)>> {
+    Ok(None)
 }
 
 #[cfg(target_os = "linux")]
@@ -662,24 +686,80 @@ fn linux_limits(root: &Path) -> io::Result<Vec<(u64, String)>> {
     Ok(limits)
 }
 
+/// What others use in the cgroup of the process, on a Linux machine whose file system is at
+/// `root`, when blaze itself holds `own`: the bytes and what says so. `None` in the root
+/// cgroup, which keeps no count.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_in_use(root: &Path, own: u64) -> io::Result<Option<(u64, String)>> {
+    let cgroup = root.join("proc/self/cgroup");
+    let (mut v1, mut v2) = (None, None);
+    let text = read(&cgroup)?;
+    for line in text.lines().filter(|it| !it.is_empty()) {
+        let mut parts = line.splitn(3, ':');
+        let (Some(hierarchy), Some(controllers), Some(path)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(invalid(&cgroup, format!("a line `{line}`")));
+        };
+        if hierarchy == "0" && controllers.is_empty() {
+            v2 = Some(path);
+        } else if controllers.split(',').any(|it| it == "memory") {
+            v1 = Some(path);
+        }
+    }
+    // Where the memory controller is v1's, the v2 hierarchy counts no memory.
+    let (mount, file, group) = match (v1, v2) {
+        (Some(group), _) => ("sys/fs/cgroup/memory", "memory.usage_in_bytes", group),
+        (None, Some(group)) => ("sys/fs/cgroup", "memory.current", group),
+        (None, None) => return Err(invalid(&cgroup, "no cgroup that counts memory")),
+    };
+    let count = root.join(mount).join(group.trim_start_matches('/')).join(file);
+    let current = match std::fs::read_to_string(&count) {
+        Ok(text) => text
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| invalid(&count, format!("a count of `{}`", text.trim())))?,
+        Err(why) if why.kind() == io::ErrorKind::NotFound && group == "/" => return Ok(None),
+        Err(why) => {
+            return Err(io::Error::new(why.kind(), format!("{}: {why}", count.display())));
+        }
+    };
+    let others = current.saturating_sub(own);
+    let from = format!(
+        "{} others use in cgroup {group} ({file} {} less blaze's own {})",
+        gb(others),
+        gb(current),
+        gb(own)
+    );
+    Ok(Some((others, from)))
+}
+
 fn gb(bytes: u64) -> String {
     format!("{:.2} GB", bytes as f64 / f64::from(1 << 30))
 }
 
-/// The least of `limits` less `margin`, named by what it was.
-fn least(limits: Vec<(u64, String)>, margin: u64) -> io::Result<Budget> {
+/// The least of `limits`, less what others use (`in_use`) and `margin`, named by what each was.
+fn least(
+    limits: Vec<(u64, String)>,
+    in_use: Option<(u64, String)>,
+    margin: u64,
+) -> io::Result<Budget> {
     let (bytes, from) = limits
         .into_iter()
         .reduce(|least, it| if it.0 < least.0 { it } else { least })
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no memory limit was read"))?;
-    match bytes.checked_sub(margin) {
-        Some(left) if left > 0 => Ok(Budget {
-            bytes: left,
-            from: format!("{from}, {}, less a margin of {}", gb(bytes), gb(margin)),
-        }),
+    let others = in_use.as_ref().map_or(0, |it| it.0);
+    let taken = match &in_use {
+        Some((_, used)) => format!("{used} and a margin of {}", gb(margin)),
+        None => format!("a margin of {}", gb(margin)),
+    };
+    match bytes.checked_sub(others).and_then(|it| it.checked_sub(margin)) {
+        Some(left) if left > 0 => {
+            Ok(Budget { bytes: left, from: format!("{from}, {}, less {taken}", gb(bytes)) })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("a margin of {} leaves no memory of the {} of {from}", gb(margin), gb(bytes)),
+            format!("no memory is left of the {} of {from} less {taken}", gb(bytes)),
         )),
     }
 }
@@ -939,12 +1019,78 @@ mod tests {
                 (8589934592, "memory.max of cgroup /user.slice".to_owned()),
             ]
         );
-        let budget = least(limits, 1 << 30).unwrap();
+        let budget = least(limits, None, 1 << 30).unwrap();
         assert_eq!(budget.bytes, 8589934592 - (1 << 30));
         assert_eq!(
             budget.from,
             "memory.max of cgroup /user.slice, 8.00 GB, less a margin of 1.00 GB"
         );
+    }
+
+    /// What others use is what blaze's own cgroup counts less what blaze holds, not what the
+    /// machine has in use: a busy machine does not shrink a small cgroup's budget.
+    #[test]
+    fn others_are_what_blazes_own_cgroup_uses_less_blaze() {
+        const GB: u64 = 1 << 30;
+        let busy = "MemTotal:       16384000 kB\nMemAvailable:     100000 kB\n";
+        let tree = Tree::new(
+            "current",
+            &[
+                ("proc/meminfo", busy),
+                ("proc/self/cgroup", "0::/lane.scope\n"),
+                ("sys/fs/cgroup/lane.scope/memory.max", "4294967296\n"),
+                ("sys/fs/cgroup/lane.scope/memory.current", "3221225472\n"),
+            ],
+        );
+        let in_use = linux_in_use(&tree.0, 2 * GB).unwrap();
+        assert_eq!(
+            in_use,
+            Some((
+                GB,
+                "1.00 GB others use in cgroup /lane.scope (memory.current 3.00 GB less blaze's \
+                 own 2.00 GB)"
+                    .to_owned()
+            ))
+        );
+        let budget = least(linux_limits(&tree.0).unwrap(), in_use, GB / 2).unwrap();
+        assert_eq!(budget.bytes, 4 * GB - GB - GB / 2);
+        assert_eq!(
+            budget.from,
+            "memory.max of cgroup /lane.scope, 4.00 GB, less 1.00 GB others use in cgroup \
+             /lane.scope (memory.current 3.00 GB less blaze's own 2.00 GB) and a margin of 0.50 \
+             GB"
+        );
+        // Blaze holding more than the count says (it counts late) leaves others none.
+        assert_eq!(linux_in_use(&tree.0, 4 * GB).unwrap().map(|it| it.0), Some(0));
+        // Others that leave nothing are an error naming them.
+        let full = least(vec![(4 * GB, "x".to_owned())], Some((4 * GB, "y".to_owned())), 0);
+        let why = full.unwrap_err();
+        assert_eq!(why.kind(), io::ErrorKind::InvalidInput);
+        assert!(why.to_string().contains("less y and a margin"), "{why}");
+    }
+
+    #[test]
+    fn others_are_counted_by_v1_where_memory_is_v1s_and_not_in_the_root_cgroup() {
+        let tree = Tree::new(
+            "current-v1",
+            &[
+                ("proc/self/cgroup", "4:memory:/a/b\n0::/\n"),
+                ("sys/fs/cgroup/memory/a/b/memory.usage_in_bytes", "1073741824\n"),
+            ],
+        );
+        assert_eq!(linux_in_use(&tree.0, 0).unwrap().map(|it| it.0), Some(1 << 30));
+        let tree = Tree::new("current-root", &[("proc/self/cgroup", "0::/\n")]);
+        assert_eq!(linux_in_use(&tree.0, 0).unwrap(), None);
+        // A group below the root has a count; one missing is an error, never a guess.
+        let tree = Tree::new("current-none", &[("proc/self/cgroup", "0::/x\n")]);
+        assert!(linux_in_use(&tree.0, 0).unwrap_err().to_string().contains("memory.current"));
+        let tree = Tree::new(
+            "current-bad",
+            &[("proc/self/cgroup", "0::/x\n"), ("sys/fs/cgroup/x/memory.current", "lots\n")],
+        );
+        assert!(linux_in_use(&tree.0, 0).unwrap_err().to_string().contains("a count of `lots`"));
+        let tree = Tree::new("current-nogroup", &[("proc/self/cgroup", "3:cpu:/a\n")]);
+        assert!(linux_in_use(&tree.0, 0).unwrap_err().to_string().contains("counts memory"));
     }
 
     #[test]
@@ -963,7 +1109,7 @@ mod tests {
         let mut bytes: Vec<u64> = limits.iter().map(|it| it.0).collect();
         bytes.sort_unstable();
         assert_eq!(bytes, [2147483648, 4294967296, 16384000 * 1024, 9223372036854771712]);
-        assert_eq!(least(limits, 0).unwrap().bytes, 2147483648);
+        assert_eq!(least(limits, None, 0).unwrap().bytes, 2147483648);
     }
 
     #[test]
@@ -982,7 +1128,7 @@ mod tests {
         let tree = Tree::new("nototal", &[("proc/meminfo", "MemFree: 1 kB\n")]);
         assert!(linux_limits(&tree.0).unwrap_err().to_string().contains("no MemTotal"));
         assert_eq!(
-            least(vec![(1 << 30, "x".to_owned())], 1 << 30).unwrap_err().kind(),
+            least(vec![(1 << 30, "x".to_owned())], None, 1 << 30).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
     }
@@ -992,6 +1138,8 @@ mod tests {
     fn the_machine_budget_is_read() {
         let budget = machine_budget(1 << 20).unwrap();
         assert!(budget.bytes > 0);
-        assert!(budget.from.contains("less a margin of"), "{}", budget.from);
+        assert!(budget.from.contains("a margin of 0.00 GB"), "{}", budget.from);
+        #[cfg(target_os = "linux")]
+        assert!(budget.from.contains("others use in cgroup") || budget.from.contains("less a"));
     }
 }

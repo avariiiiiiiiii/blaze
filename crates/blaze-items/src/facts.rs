@@ -1,0 +1,754 @@
+//! What each [`Fact`] stands for (docs/v2/plan/lanes/items.md section 6.2): [`value`] computes it from the
+//! current database, and a query that read the fact is reused while its [`fingerprint`] stays
+//! the same. A fact names its subject by key; a key that names nothing now gives the value
+//! "absent", never an error, so a deleted item is a changed fact like any other.
+//!
+//! The rules that reach across items are each read through a fact:
+//!
+//! | rule | fact |
+//! |---|---|
+//! | coherence, orphan check | `Coherence(impl)` |
+//! | specialization | `Specializes(impl)` |
+//! | inference fallback | `Implements` for the fallback type: `assert_eq!(1.5, s.parse().unwrap())` reads the impls of `PartialEq` for `f64`; integer and `!` fallback are the edition's, in the crate's config |
+//! | drop check | `DropCheck(T)` |
+//! | vtable layout | `Vtable { trait_, self_ty }` |
+//! | derives | `Derive(T)` |
+//! | glob imports, shadowing | `Resolves { scope, name }` |
+//! | macro hygiene | `Resolves` in the def-site scope for def-site names; mixed-site names resolve at the call site |
+//! | auto-trait leakage | `AutoTraits(opaque)` |
+
+use blaze_ids::{ContentId, Fingerprint, Hasher};
+use either::Either;
+use hir_def::{
+    AdtId, AssocItemId, ConstId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, HasModule,
+    ImplId, Lookup, ModuleId, TraitId, VariantId,
+    attrs::AttrFlags,
+    expr_store::{Body, ExpressionStore},
+    hir::{ClosureKind, ExprId},
+    item_scope::ItemScope,
+    lang_item::lang_items,
+    unstable_features::UnstableFeatures,
+};
+use hir_expand::{AstId, HirFileId, MacroCallId, name::Name};
+use hir_ty::{
+    InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, all_super_traits,
+    check_orphan_rules,
+    consteval::ConstEvalError,
+    db::{AnonConstId, HirDatabase, InternedClosure, InternedClosureId},
+    generics::generics,
+    layout::{RustcEnumVariantIdx, Variants},
+    next_solver::{GenericArgs, SimplifiedType as HirSimplifiedType, Ty},
+    traits::is_inherent_impl_coherent,
+};
+use syntax::ast;
+
+use crate::{
+    Fact, InterfaceHash, ItemId, ItemKey, NameHash, ScopeIndexKey, SimplifiedType,
+    hash::{self, Unhashable},
+    index::{
+        AnyImpl, ScopeEntry, entry, impl_interface, impl_self_ty, implements_value,
+        inherent_impls_of, resolve_trait, scope, trait_impls, traits_with,
+    },
+    key::{self, Resolved},
+};
+
+const SIGNATURE: &str = "blaze v2 fact signature 1";
+const LAYOUT: &str = "blaze v2 fact layout 1";
+const FIELD: &str = "blaze v2 fact field 1";
+const METHOD: &str = "blaze v2 fact method 1";
+const IMPLEMENTS: &str = "blaze v2 fact implements 1";
+const RESOLVES: &str = "blaze v2 fact resolves 1";
+const CODE: &str = "blaze v2 fact code 1";
+const CONST_VALUE: &str = "blaze v2 fact const value 1";
+const NAME: &str = "blaze v2 fact name 1";
+const CAPTURES: &str = "blaze v2 fact captures 1";
+const AUTO_TRAITS: &str = "blaze v2 fact auto traits 1";
+const COHERENCE: &str = "blaze v2 fact coherence 1";
+const SPECIALIZES: &str = "blaze v2 fact specializes 1";
+const DROP_CHECK: &str = "blaze v2 fact drop check 1";
+const VTABLE: &str = "blaze v2 fact vtable 1";
+const DERIVE: &str = "blaze v2 fact derive 1";
+const CONST_TYPE: &str = "blaze v2 fact const value type 1";
+
+fn domain(fact: &Fact) -> &'static str {
+    match fact {
+        Fact::Signature(_) => SIGNATURE,
+        Fact::Layout(_) => LAYOUT,
+        Fact::Field { .. } => FIELD,
+        Fact::Method { .. } => METHOD,
+        Fact::Implements { .. } => IMPLEMENTS,
+        Fact::Resolves { .. } => RESOLVES,
+        Fact::Code(_) => CODE,
+        Fact::ConstValue(_) => CONST_VALUE,
+        Fact::Name(_) => NAME,
+        Fact::Captures(_) => CAPTURES,
+        Fact::AutoTraits(_) => AUTO_TRAITS,
+        Fact::Coherence(_) => COHERENCE,
+        Fact::Specializes(_) => SPECIALIZES,
+        Fact::DropCheck(_) => DROP_CHECK,
+        Fact::Vtable { .. } => VTABLE,
+        Fact::Derive(_) => DERIVE,
+    }
+}
+
+/// What `fact` stands for in the current database (see the module doc).
+pub fn value(db: &dyn HirDatabase, fact: &Fact) -> Result<ContentId, Unhashable> {
+    hir_ty::attach_db(db, || value_in(db, fact))
+}
+
+fn value_in(db: &dyn HirDatabase, fact: &Fact) -> Result<ContentId, Unhashable> {
+    let domain = domain(fact);
+    let absent = || Ok(Hasher::new(domain).part(b"absent").finish());
+    let mut h = Hasher::new(domain);
+    h.part(b"present");
+    match *fact {
+        Fact::Signature(key) => {
+            let Some(id) = item(db, key, fact) else { return absent() };
+            h.id(&hash::interface_hash(db, id)?.0);
+        }
+        Fact::Layout(key) => {
+            let Some(adt) = adt(db, key, fact) else { return absent() };
+            h.id(&hash::layout_hash(db, adt)?.0);
+        }
+        Fact::Field { ty, field } => {
+            let variant = match key::resolve(db, ty) {
+                None => return absent(),
+                Some(Resolved::Item(ItemId::Adt(AdtId::StructId(it)))) => VariantId::from(it),
+                Some(Resolved::Item(ItemId::Adt(AdtId::UnionId(it)))) => VariantId::from(it),
+                Some(Resolved::Variant(it)) => VariantId::from(it),
+                Some(other) => unreachable!("{fact:?} names {other:?}, which has no fields"),
+            };
+            let Some((local, _)) =
+                variant.fields(db).fields().iter().find(|(it, _)| u32::from(it.into_raw()) == field)
+            else {
+                return absent();
+            };
+            let adt = variant.adt_id(db);
+            let sub = crate::form::Cx::new(db).field(variant, local);
+            h.id(&hash::filled(db, domain, &sub, ItemId::Adt(adt))?);
+            field_offset(db, &mut h, adt, variant, local)?;
+        }
+        Fact::Method { self_ty, name } => write_method(db, &mut h, self_ty, name)?,
+        Fact::Implements { trait_, self_ty } => {
+            let Some(trait_) = resolve_trait(db, trait_) else { return absent() };
+            h.id(&implements_value(db, IMPLEMENTS, trait_, self_ty)?);
+        }
+        Fact::Resolves { scope: at, name } => match scope(db, ScopeIndexKey { scope: at, name })? {
+            ScopeEntry::ScopeAbsent => return absent(),
+            found => {
+                h.id(&found.value());
+            }
+        },
+        Fact::Code(key) => {
+            let Some(id) = item(db, key, fact) else { return absent() };
+            write_code(&mut h, hash::code_hash(db, id)?.map(|it| it.0));
+        }
+        Fact::ConstValue(subject) => {
+            let konst = match key::resolve(db, subject) {
+                None => return absent(),
+                Some(Resolved::Item(ItemId::Const(it))) => it,
+                Some(other) => unreachable!("{fact:?} names {other:?}, which is no const"),
+            };
+            write_const_value(db, &mut h, konst)?;
+        }
+        Fact::Name(key) => {
+            let Some(id) = item(db, key, fact) else { return absent() };
+            name_of(db, &mut h, id);
+        }
+        Fact::Captures(subject) => {
+            let (store, expr, kind) = match key::resolve(db, subject) {
+                None => return absent(),
+                Some(Resolved::Closure { store, expr, kind }) => (store, expr, kind),
+                Some(other) => unreachable!("{fact:?} names {other:?}, which is no closure"),
+            };
+            let closure = match kind {
+                ClosureKind::Closure | ClosureKind::CoroutineClosure(_) => {
+                    let owner = closure_owner(db, store, expr);
+                    InternedClosureId::new(db, InternedClosure { owner, expr, kind })
+                }
+                ClosureKind::OldCoroutine(_) | ClosureKind::Coroutine { .. } => {
+                    unreachable!("{fact:?} names a coroutine, which has no closure captures")
+                }
+            };
+            let sub = crate::form::Cx::new(db).captures(closure);
+            h.id(&hash::filled(db, domain, &sub, infer_owner_item(db, closure.loc(db).owner))?);
+        }
+        Fact::AutoTraits(subject) => {
+            let (owner, index) = match key::resolve(db, subject) {
+                None => return absent(),
+                Some(Resolved::Opaque { owner, index }) => (owner, index),
+                Some(other) => unreachable!("{fact:?} names {other:?}, which is no opaque type"),
+            };
+            let sub = crate::form::Cx::new(db).auto_traits(owner, index);
+            h.id(&hash::filled(db, domain, &sub, owner)?);
+        }
+        Fact::Coherence(key) => {
+            let Some(imp) = impl_of(db, key, fact) else { return absent() };
+            write_coherence(db, &mut h, imp)?;
+        }
+        Fact::Specializes(key) => {
+            let Some(imp) = impl_of(db, key, fact) else { return absent() };
+            h.id(&hash::interface_hash(db, ItemId::Impl(imp))?.0);
+            write_coherence(db, &mut h, imp)?;
+            let features = UnstableFeatures::query(db, imp.krate(db));
+            h.update(&[features.specialization as u8, features.min_specialization as u8]);
+        }
+        Fact::DropCheck(key) => {
+            let Some(adt) = adt(db, key, fact) else { return absent() };
+            write_drop_check(db, &mut h, adt)?;
+        }
+        Fact::Vtable { trait_, self_ty } => {
+            let Some(trait_) = resolve_trait(db, trait_) else { return absent() };
+            h.id(&hash::interface_hash(db, ItemId::Trait(trait_))?.0);
+            let supers = all_super_traits(db, trait_);
+            h.update(&(supers.len() as u64).to_le_bytes());
+            for &it in supers {
+                h.id(&hash::interface_hash(db, ItemId::Trait(it))?.0)
+                    .id(&implements_value(db, IMPLEMENTS, it, self_ty)?);
+                // A vtable's slots are its methods in declaration order, which the trait's
+                // interface hash leaves out.
+                let methods: Vec<(&Name, FunctionId)> = it
+                    .trait_items(db)
+                    .items
+                    .iter()
+                    .filter_map(|(name, item)| match *item {
+                        AssocItemId::FunctionId(f) => Some((name, f)),
+                        _ => None,
+                    })
+                    .collect();
+                h.update(&(methods.len() as u64).to_le_bytes());
+                for (name, f) in methods {
+                    h.id(&key::name_hash(name.as_str()).0)
+                        .id(&hash::interface_hash(db, ItemId::Function(f))?.0);
+                }
+            }
+        }
+        Fact::Derive(key) => {
+            let Some(adt) = adt(db, key, fact) else { return absent() };
+            write_derive(db, &mut h, adt)?;
+        }
+    }
+    Ok(h.finish())
+}
+
+/// The first 128 bits of [`value`]: what a dependency edge records.
+pub fn fingerprint(db: &dyn HirDatabase, fact: &Fact) -> Result<Fingerprint, Unhashable> {
+    Ok(value(db, fact)?.fingerprint())
+}
+
+pub fn signature(db: &dyn HirDatabase, f: FunctionId) -> Fact {
+    Fact::Signature(key::item_key(db, ItemId::Function(f)))
+}
+
+pub fn layout(db: &dyn HirDatabase, ty: AdtId) -> Fact {
+    Fact::Layout(key::item_key(db, ItemId::Adt(ty)))
+}
+
+pub fn field(db: &dyn HirDatabase, variant: VariantId, field: hir_def::LocalFieldId) -> Fact {
+    let ty = match variant {
+        VariantId::StructId(it) => key::item_key(db, ItemId::Adt(it.into())),
+        VariantId::UnionId(it) => key::item_key(db, ItemId::Adt(it.into())),
+        VariantId::EnumVariantId(it) => key::variant_key(db, it),
+    };
+    Fact::Field { ty, field: u32::from(field.into_raw()) }
+}
+
+pub fn method(db: &dyn HirDatabase, self_ty: &HirSimplifiedType<'_>, name: &Name) -> Fact {
+    Fact::Method { self_ty: key::simplified(db, self_ty), name: key::name_hash(name.as_str()) }
+}
+
+pub fn implements(db: &dyn HirDatabase, trait_: TraitId, self_ty: &HirSimplifiedType<'_>) -> Fact {
+    Fact::Implements {
+        trait_: key::item_key(db, ItemId::Trait(trait_)),
+        self_ty: key::simplified(db, self_ty),
+    }
+}
+
+pub fn resolves(db: &dyn HirDatabase, scope: ModuleId, name: &Name) -> Fact {
+    Fact::Resolves { scope: key::module_key(db, scope), name: key::name_hash(name.as_str()) }
+}
+
+pub fn code(db: &dyn HirDatabase, id: ItemId) -> Fact {
+    Fact::Code(key::item_key(db, id))
+}
+
+pub fn const_value(db: &dyn HirDatabase, konst: ConstId) -> Fact {
+    Fact::ConstValue(key::item_key(db, ItemId::Const(konst)))
+}
+
+pub fn name(db: &dyn HirDatabase, id: ItemId) -> Fact {
+    Fact::Name(key::item_key(db, id))
+}
+
+pub fn captures(db: &dyn HirDatabase, closure: InternedClosureId<'_>) -> Fact {
+    Fact::Captures(key::closure_key(db, closure))
+}
+
+pub fn auto_traits(db: &dyn HirDatabase, owner: ItemId, index: u32) -> Fact {
+    Fact::AutoTraits(key::opaque_key(db, owner, index))
+}
+
+pub fn coherence(db: &dyn HirDatabase, imp: ImplId) -> Fact {
+    Fact::Coherence(key::item_key(db, ItemId::Impl(imp)))
+}
+
+pub fn specializes(db: &dyn HirDatabase, imp: ImplId) -> Fact {
+    Fact::Specializes(key::item_key(db, ItemId::Impl(imp)))
+}
+
+pub fn drop_check(db: &dyn HirDatabase, ty: AdtId) -> Fact {
+    Fact::DropCheck(key::item_key(db, ItemId::Adt(ty)))
+}
+
+pub fn vtable(db: &dyn HirDatabase, trait_: TraitId, self_ty: &HirSimplifiedType<'_>) -> Fact {
+    Fact::Vtable {
+        trait_: key::item_key(db, ItemId::Trait(trait_)),
+        self_ty: key::simplified(db, self_ty),
+    }
+}
+
+pub fn derive(db: &dyn HirDatabase, ty: AdtId) -> Fact {
+    Fact::Derive(key::item_key(db, ItemId::Adt(ty)))
+}
+
+/// The item `subject` names, `None` if none does.
+fn item(db: &dyn HirDatabase, subject: ItemKey, fact: &Fact) -> Option<ItemId> {
+    match key::resolve(db, subject)? {
+        Resolved::Item(id) => Some(id),
+        other => unreachable!("{fact:?} names {other:?}, which is no item"),
+    }
+}
+
+fn adt(db: &dyn HirDatabase, key: ItemKey, fact: &Fact) -> Option<AdtId> {
+    match item(db, key, fact)? {
+        ItemId::Adt(it) => Some(it),
+        other => unreachable!("{fact:?} names {other:?}, which is no type"),
+    }
+}
+
+fn impl_of(db: &dyn HirDatabase, key: ItemKey, fact: &Fact) -> Option<ImplId> {
+    match item(db, key, fact)? {
+        ItemId::Impl(it) => Some(it),
+        other => unreachable!("{fact:?} names {other:?}, which is no impl"),
+    }
+}
+
+fn write_code(h: &mut Hasher, code: Option<ContentId>) {
+    match code {
+        Some(code) => h.update(&[1]).id(&code),
+        None => h.update(&[0]),
+    };
+}
+
+fn write_symbol(h: &mut Hasher, symbol: Option<intern::Symbol>) {
+    match symbol {
+        Some(symbol) => h.update(&[1]).part(symbol.as_str().as_bytes()),
+        None => h.update(&[0]),
+    };
+}
+
+/// The offset of a field of a type without generics, from its layout. A generic type has a
+/// layout per instance: its layout hash stands for all of them.
+fn field_offset(
+    db: &dyn HirDatabase,
+    h: &mut Hasher,
+    adt: AdtId,
+    variant: VariantId,
+    field: hir_def::LocalFieldId,
+) -> Result<(), Unhashable> {
+    if generics(db, adt.into()).iter(true).next().is_some() {
+        h.part(b"generic").id(&hash::layout_hash(db, adt)?.0);
+        return Ok(());
+    }
+    let param_env = db.trait_environment(adt.into());
+    let env = ParamEnvAndCrate { param_env, krate: adt.krate(db) };
+    let layout = match db.layout_of_adt(adt, GenericArgs::empty().store(), env.store()) {
+        Ok(layout) => layout,
+        Err(err) => {
+            h.part(b"layout error").part(err.to_string().as_bytes());
+            return Ok(());
+        }
+    };
+    let at = u32::from(field.into_raw()) as usize;
+    let offset = match (&layout.variants, variant) {
+        (Variants::Multiple { variants, .. }, VariantId::EnumVariantId(it)) => variants
+            .iter()
+            .nth(it.index(db))
+            .and_then(|kept| kept.field_offsets.iter().nth(at).copied()),
+        (Variants::Single { index: RustcEnumVariantIdx(single) }, VariantId::EnumVariantId(it))
+            if *single != it.index(db) =>
+        {
+            None
+        }
+        (Variants::Empty, _) => None,
+        _ => (at < layout.fields.count()).then(|| layout.fields.offset(at)),
+    };
+    match offset {
+        Some(offset) => h.part(b"offset").update(&offset.bytes().to_le_bytes()),
+        None => h.part(b"uninhabited"),
+    };
+    Ok(())
+}
+
+/// The interface hashes of the items of `items` named `name`, sorted.
+fn named(
+    db: &dyn HirDatabase,
+    items: &[(Name, AssocItemId)],
+    name: NameHash,
+) -> Result<Vec<ContentId>, Unhashable> {
+    let mut found = items
+        .iter()
+        .filter(|(it, _)| key::name_hash(it.as_str()) == name)
+        .map(|&(_, it)| Ok(hash::interface_hash(db, ItemId::from(it))?.0))
+        .collect::<Result<Vec<_>, Unhashable>>()?;
+    found.sort_unstable();
+    Ok(found)
+}
+
+/// The inherent impls for the type with an item of the name, and the traits with an item of
+/// the name with whether the type implements them: every candidate method probing may find.
+fn write_method(
+    db: &dyn HirDatabase,
+    h: &mut Hasher,
+    self_ty: SimplifiedType,
+    name: NameHash,
+) -> Result<(), Unhashable> {
+    let mut inherent = Vec::new();
+    for &(_, imp) in inherent_impls_of(db, self_ty, ()) {
+        let items = named(db, &imp.impl_items(db).items, name)?;
+        if !items.is_empty() {
+            inherent.push((hash::interface_hash(db, ItemId::Impl(imp))?.0, items));
+        }
+    }
+    inherent.sort_unstable();
+    let mut traits = Vec::new();
+    for &(_, trait_) in traits_with(db, name, ()) {
+        let items = named(db, &trait_.trait_items(db).items, name)?;
+        traits.push((items, implements_value(db, IMPLEMENTS, trait_, self_ty)?));
+    }
+    traits.sort_unstable();
+    h.part(b"inherent").update(&(inherent.len() as u64).to_le_bytes());
+    for (imp, items) in &inherent {
+        h.id(imp).update(&(items.len() as u64).to_le_bytes());
+        for it in items {
+            h.id(it);
+        }
+    }
+    h.part(b"traits").update(&(traits.len() as u64).to_le_bytes());
+    for (items, implements) in &traits {
+        h.update(&(items.len() as u64).to_le_bytes());
+        for it in items {
+            h.id(it);
+        }
+        h.id(implements);
+    }
+    Ok(())
+}
+
+/// A const's value: evaluated for one without generics, else its code (each instance is
+/// evaluated where it is used, from that code).
+fn write_const_value(
+    db: &dyn HirDatabase,
+    h: &mut Hasher,
+    konst: ConstId,
+) -> Result<(), Unhashable> {
+    let owner = ItemId::Const(konst);
+    if generics(db, konst.into()).iter(true).next().is_some() {
+        h.part(b"generic");
+        write_code(h, hash::code_hash(db, owner)?.map(|it| it.0));
+        return Ok(());
+    }
+    let value = match db.const_eval(konst, GenericArgs::empty(), None) {
+        Ok(value) => value,
+        Err(err) => {
+            h.part(b"error").part(eval_error_kind(&err).as_bytes());
+            return Ok(());
+        }
+    };
+    h.part(b"value").id(&ty_hash(db, owner, value.ty)?).part(&value.memory);
+    match &value.memory_map {
+        MemoryMap::Empty => {
+            h.part(b"empty");
+        }
+        MemoryMap::Simple(bytes) => {
+            h.part(b"simple").part(bytes);
+        }
+        MemoryMap::Complex(map) => {
+            h.part(b"complex");
+            let mut blocks: Vec<(usize, &[u8])> =
+                map.memory.iter().map(|(&at, bytes)| (at, &**bytes)).collect();
+            blocks.sort_unstable_by_key(|&(at, _)| at);
+            h.update(&(blocks.len() as u64).to_le_bytes());
+            for (at, bytes) in blocks {
+                h.update(&(at as u64).to_le_bytes()).part(bytes);
+                match value.memory_map.align_at(at) {
+                    Some(align) => h.update(&[1]).update(&(align as u64).to_le_bytes()),
+                    None => h.update(&[0]),
+                };
+            }
+            h.update(&(map.statics.len() as u64).to_le_bytes());
+            for it in &map.statics {
+                h.update(&(it.start as u64).to_le_bytes())
+                    .update(&(it.size as u64).to_le_bytes())
+                    .id(&key::item_key(db, ItemId::Static(it.id)).0);
+            }
+            // Vtable ids start past an offset `VTableMap` keeps to itself, and are dense
+            // from there.
+            let mut vtables = Vec::new();
+            if !map.vtable.is_empty() {
+                let mut id = 0;
+                while map.vtable.ty(id).is_err() {
+                    id += 1;
+                }
+                h.update(&(id as u64).to_le_bytes());
+                while let Ok(ty) = map.vtable.ty(id) {
+                    vtables.push(ty_hash(db, owner, ty)?);
+                    id += 1;
+                }
+            }
+            h.update(&(vtables.len() as u64).to_le_bytes());
+            for it in &vtables {
+                h.id(it);
+            }
+            h.update(&(map.type_ids.len() as u64).to_le_bytes());
+            for it in &map.type_ids {
+                match it {
+                    Some(ty) => h.update(&[1]).id(&ty_hash(db, owner, *ty)?),
+                    None => h.update(&[0]),
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ty_hash<'db>(
+    db: &'db dyn HirDatabase,
+    owner: ItemId,
+    ty: Ty<'db>,
+) -> Result<ContentId, Unhashable> {
+    let sub = crate::form::Cx::new(db).ty(ty);
+    hash::filled(db, CONST_TYPE, &sub, owner)
+}
+
+/// Which error stopped an evaluation: its stage and kind, never its text, which names spans.
+fn eval_error_kind(err: &ConstEvalError<'_>) -> String {
+    let (stage, detail) = match err {
+        ConstEvalError::MirLowerError(it) => ("lower", format!("{it:?}")),
+        ConstEvalError::MirEvalError(it) => ("eval", format!("{it:?}")),
+    };
+    let kind: String = detail.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    format!("{stage} {kind}")
+}
+
+fn name_of(db: &dyn HirDatabase, h: &mut Hasher, id: ItemId) {
+    h.part(key::path(db, id).as_bytes());
+    let owner: hir_def::AttrDefId = match id {
+        ItemId::Function(it) => it.into(),
+        ItemId::Adt(it) => it.into(),
+        ItemId::Trait(it) => it.into(),
+        ItemId::Impl(it) => it.into(),
+        ItemId::Const(it) => it.into(),
+        ItemId::Static(it) => it.into(),
+        ItemId::Alias(it) => it.into(),
+        ItemId::Macro(it) => it.into(),
+    };
+    h.update(&[AttrFlags::query(db, owner).contains(AttrFlags::NO_MANGLE) as u8]);
+    write_symbol(h, AttrFlags::export_name(db, owner));
+    write_symbol(h, AttrFlags::link_name(db, owner));
+}
+
+/// What inferred the closure at `expr` of `store`: the innermost anonymous const it is in, else
+/// the body.
+fn closure_owner<'db>(
+    db: &'db dyn HirDatabase,
+    store: ExpressionStoreOwnerId,
+    expr: ExprId,
+) -> InferBodyId<'db> {
+    let anon_consts: Vec<AnonConstId<'db>> = match store {
+        ExpressionStoreOwnerId::Body(body) => {
+            InferenceResult::of(db, body).defined_anon_consts().to_vec()
+        }
+        ExpressionStoreOwnerId::Signature(def) => {
+            AnonConstId::all_from_signature(db, def).collect()
+        }
+        ExpressionStoreOwnerId::VariantFields(variant) => {
+            db.field_types_with_diagnostics(variant).defined_anon_consts().to_vec()
+        }
+    };
+    let exprs = ExpressionStore::of(db, store);
+    let innermost = anon_consts
+        .into_iter()
+        .filter(|anon| anon.loc(db).owner == store)
+        .filter_map(|anon| Some((subtree_containing(exprs, anon.loc(db).expr, expr)?, anon)))
+        .min_by_key(|&(size, _)| size);
+    match (innermost, store) {
+        (Some((_, anon)), _) => InferBodyId::AnonConstId(anon),
+        (None, ExpressionStoreOwnerId::Body(body)) => InferBodyId::DefWithBodyId(body),
+        (None, _) => unreachable!("closure {expr:?} of {store:?} is in no anonymous const"),
+    }
+}
+
+/// The number of expressions under `root` if `target` is one of them.
+fn subtree_containing(store: &ExpressionStore, root: ExprId, target: ExprId) -> Option<usize> {
+    let (mut stack, mut size, mut found) = (vec![root], 0, false);
+    while let Some(at) = stack.pop() {
+        size += 1;
+        found |= at == target;
+        store.walk_child_exprs(at, |child| stack.push(child));
+    }
+    found.then_some(size)
+}
+
+fn infer_owner_item(db: &dyn HirDatabase, owner: InferBodyId<'_>) -> ItemId {
+    match owner {
+        InferBodyId::DefWithBodyId(body) => ItemId::of_body(db, body),
+        InferBodyId::AnonConstId(anon) => key::generic_def_item(anon.loc(db).owner.generic_def(db)),
+    }
+}
+
+/// The orphan and coherence checks' results for `imp`, and every impl it could overlap: those
+/// of its trait for its simplified self type and the blanket ones, all of the trait's for a
+/// blanket impl, or the inherent impls for its self type.
+fn write_coherence(db: &dyn HirDatabase, h: &mut Hasher, imp: ImplId) -> Result<(), Unhashable> {
+    let self_ty = impl_self_ty(db, imp);
+    match db.impl_trait(imp) {
+        Some(trait_ref) => {
+            let trait_ = trait_ref.skip_binder().def_id.0;
+            h.part(b"trait").update(&[check_orphan_rules(db, imp) as u8]);
+            match self_ty {
+                Some(self_ty) => h.id(&implements_value(db, IMPLEMENTS, trait_, self_ty)?),
+                None => {
+                    let all = trait_impls(db, trait_).iter().map(|it| (it.key, it.imp));
+                    h.part(b"blanket").id(&entry(db, all)?.value())
+                }
+            };
+        }
+        None => {
+            let def_map = imp.lookup(db).container.def_map(db);
+            h.part(b"inherent").update(&[is_inherent_impl_coherent(db, def_map, imp) as u8]);
+            match self_ty {
+                Some(self_ty) => {
+                    let all = inherent_impls_of(db, self_ty, ())
+                        .iter()
+                        .map(|&(key, it)| (key, AnyImpl::Impl(it)));
+                    h.update(&[1]).id(&entry(db, all)?.value())
+                }
+                None => h.update(&[0]),
+            };
+        }
+    }
+    Ok(())
+}
+
+/// The type, its `Drop` impl if it has one, and that impl's `#[may_dangle]` parameters.
+fn write_drop_check(db: &dyn HirDatabase, h: &mut Hasher, adt: AdtId) -> Result<(), Unhashable> {
+    h.id(&hash::interface_hash(db, ItemId::Adt(adt))?.0);
+    let Some(imp) = hir_ty::drop::destructor(db, adt) else {
+        h.part(b"no drop");
+        return Ok(());
+    };
+    h.part(b"drop").id(&hash::interface_hash(db, ItemId::Impl(imp))?.0);
+    let (lifetimes, types) = AttrFlags::query_generic_params(db, imp.into());
+    for (param, flags) in lifetimes.iter() {
+        if flags.contains(AttrFlags::MAY_DANGLE) {
+            h.part(b"lifetime").update(&u32::from(param.into_raw()).to_le_bytes());
+        }
+    }
+    for (param, flags) in types.iter() {
+        if flags.contains(AttrFlags::MAY_DANGLE) {
+            h.part(b"type").update(&u32::from(param.into_raw()).to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+/// Every impl a derive on `adt` wrote, sorted by trait key: the built-in derives' and those in
+/// the expansions of derive macros, at the top of the expansion or in the blocks of its
+/// unnamed consts (`const _: () = { impl .. };`).
+fn write_derive(db: &dyn HirDatabase, h: &mut Hasher, adt: AdtId) -> Result<(), Unhashable> {
+    let at: AstId<ast::Adt> = match adt {
+        AdtId::StructId(it) => it.lookup(db).id.map(|it| it.upcast()),
+        AdtId::EnumId(it) => it.lookup(db).id.map(|it| it.upcast()),
+        AdtId::UnionId(it) => it.lookup(db).id.map(|it| it.upcast()),
+    };
+    let module = adt.module(db);
+    let scope = module.def_map(db).module(db, module).scope(db);
+    let mut wrote: Vec<(Option<ItemKey>, InterfaceHash)> = Vec::new();
+    for (ast, invocations) in scope.derive_macro_invocs() {
+        if ast != at {
+            continue;
+        }
+        for (_, _, calls) in invocations {
+            for call in calls.iter().flatten() {
+                match *call {
+                    Either::Left(call) => expansion_impls(db, scope, call, &mut wrote)?,
+                    Either::Right(builtin) => {
+                        let loc = builtin.loc(db);
+                        let lang = lang_items(db, loc.adt.krate(db));
+                        // hir-ty's `TraitImpls` has no impl for a derive whose trait is not a
+                        // lang item of the crate.
+                        let Some(trait_) = loc.trait_.get_id(lang) else { continue };
+                        let trait_key = key::item_key(db, ItemId::Trait(trait_));
+                        let interface = impl_interface(db, AnyImpl::BuiltinDerive(builtin))?;
+                        wrote.push((Some(trait_key), interface));
+                    }
+                }
+            }
+        }
+    }
+    wrote.sort_unstable();
+    h.update(&(wrote.len() as u64).to_le_bytes());
+    for (trait_, interface) in &wrote {
+        match trait_ {
+            Some(trait_key) => h.update(&[1]).id(&trait_key.0),
+            None => h.update(&[0]),
+        };
+        h.id(&interface.0);
+    }
+    Ok(())
+}
+
+fn expansion_impls(
+    db: &dyn HirDatabase,
+    scope: &ItemScope,
+    call: MacroCallId,
+    wrote: &mut Vec<(Option<ItemKey>, InterfaceHash)>,
+) -> Result<(), Unhashable> {
+    let mut push = |imp: ImplId| -> Result<(), Unhashable> {
+        let trait_ = db
+            .impl_trait(imp)
+            .map(|it| key::item_key(db, ItemId::Trait(it.skip_binder().def_id.0)));
+        wrote.push((trait_, hash::interface_hash(db, ItemId::Impl(imp))?));
+        Ok(())
+    };
+    for imp in scope.impls() {
+        if written_by(db, imp.lookup(db).id.file_id, call) {
+            push(imp)?;
+        }
+    }
+    for konst in scope.unnamed_consts() {
+        if !written_by(db, konst.lookup(db).id.file_id, call) {
+            continue;
+        }
+        for (_, block) in Body::of(db, DefWithBodyId::from(konst)).blocks(db) {
+            for (_, data) in block.modules(db) {
+                for imp in data.scope(db).impls() {
+                    push(imp)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `file` is the expansion of `call` or of a macro call inside it.
+fn written_by(db: &dyn HirDatabase, mut file: HirFileId, call: MacroCallId) -> bool {
+    while let HirFileId::MacroFile(inner) = file {
+        if inner == call {
+            return true;
+        }
+        file = inner.loc(db).kind.file_id();
+    }
+    false
+}

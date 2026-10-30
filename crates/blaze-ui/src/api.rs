@@ -1,9 +1,14 @@
 //! The agent API's responses ([`blaze_api::Response`]) as text for people: what a client of
 //! the API (the CLI, a CI log) prints. Diagnostics as rustc writes them, with the facts they
-//! read; tests as libtest writes them. JSON for programs is [`blaze_api::json`]'s.
+//! read; tests as libtest writes them. JSON for programs is [`blaze_api::json`]'s, but for the
+//! forms lane proof's harness reads: [`work_json`], [`codegen_inputs_json`] and [`trace_cbor`].
 
-use blaze_api::{Diagnostic, Level, Ranked, Response, TestOutcome, TestResult};
+use blaze_api::{
+    Diagnostic, Level, LinkKind, Ranked, Response, TestOutcome, TestResult, Traced, Verb, Worked,
+};
+use blaze_ids::ContentId;
 use blaze_query::QueryKey;
+use blaze_v2_proof::TraceBuilder;
 use blaze_vfs::ChangeKind;
 
 use crate::{CYAN, DIM, GREEN, RED, YELLOW, paint};
@@ -26,7 +31,7 @@ fn write(out: &mut String, response: &Response, color: bool) {
             line(out, format!("{} {root}{rebased}", paint(GREEN, "committed", color)));
         }
         Response::Diagnostic(diagnostic) => diagnostic_lines(out, diagnostic, 0, color),
-        Response::Built { artifacts } => {
+        Response::Built { artifacts, profile } => {
             for artifact in artifacts {
                 let word = paint(GREEN, &format!("{:>12}", "Built"), color);
                 line(
@@ -36,6 +41,56 @@ fn write(out: &mut String, response: &Response, color: bool) {
                         artifact.package, artifact.kind, artifact.path, artifact.content
                     ),
                 );
+            }
+            let word = paint(GREEN, &format!("{:>12}", "Finished"), color);
+            line(out, format!("{word} {profile}"));
+        }
+        Response::Unit(unit) => {
+            let verb = match unit.verb {
+                Verb::Compiling => "Compiling",
+                Verb::Checking => "Checking",
+                Verb::Fresh => "Fresh",
+            };
+            let word = paint(GREEN, &format!("{verb:>12}"), color);
+            let source = unit.source.as_deref().map(|it| format!(" {it}")).unwrap_or_default();
+            line(out, format!("{word} {} v{}{source}", unit.name, unit.version));
+        }
+        Response::BuildScript(_) => {}
+        Response::Work(worked) => {
+            let link = match worked.link {
+                LinkKind::Patched => "patched in place",
+                LinkKind::Placed => "placed whole",
+            };
+            line(
+                out,
+                format!(
+                    "{} {} queries ran, {} green; {} functions compiled, {} found; {link}; \
+                     critical path {} us",
+                    paint(DIM, "work:", color),
+                    worked.reran,
+                    worked.green,
+                    worked.compiled,
+                    worked.found,
+                    worked.critical_path_us
+                ),
+            );
+        }
+        Response::CodegenInputs(inputs) => {
+            for (instance, code) in inputs {
+                line(out, format!("{instance:x} {code:x}"));
+            }
+        }
+        Response::Trace(traced) => {
+            for result in traced {
+                let ran = if result.ran { "ran" } else { "kept" };
+                let (edges, fingerprint) = (result.edges.len(), result.fingerprint);
+                line(out, format!("{} {ran}, {edges} edges, {fingerprint:?}", key(&result.key)));
+            }
+        }
+        Response::Tables(tables) => {
+            for table in tables {
+                let (name, elements, bytes) = (&table.name, table.elements, table.bytes);
+                line(out, format!("{name}: {elements} elements, {bytes} bytes"));
             }
         }
         Response::TestResult(result) => test_lines(out, result, color),
@@ -174,7 +229,16 @@ fn write(out: &mut String, response: &Response, color: bool) {
     }
 }
 
+/// rustc's own text when the diagnostic carries it, else made from its parts; then the facts.
 fn diagnostic_lines(out: &mut String, diagnostic: &Diagnostic, depth: usize, color: bool) {
+    if depth == 0 && !diagnostic.rendered.is_empty() {
+        out.push_str(&diagnostic.rendered);
+        if !diagnostic.rendered.ends_with('\n') {
+            out.push('\n');
+        }
+        facts_lines(out, diagnostic, color);
+        return;
+    }
     let (word, color_of) = match diagnostic.level {
         Level::Error => ("error", RED),
         Level::Warning => ("warning", YELLOW),
@@ -196,6 +260,10 @@ fn diagnostic_lines(out: &mut String, diagnostic: &Diagnostic, depth: usize, col
     for child in &diagnostic.children {
         diagnostic_lines(out, child, depth + 1, color);
     }
+    facts_lines(out, diagnostic, color);
+}
+
+fn facts_lines(out: &mut String, diagnostic: &Diagnostic, color: bool) {
     for fact in &diagnostic.facts {
         line(out, format!("   = {} {}", paint(DIM, "read:", color), fact.what));
     }
@@ -233,6 +301,38 @@ fn ranked_line(out: &mut String, place: usize, ranked: &Ranked, color: bool) {
 
 fn key(key: &QueryKey) -> String {
     format!("query {:#06x}:{}", key.kind.0, key.input)
+}
+
+/// What a request did, as the CLI prints it under `--message-format=json`: one line, newline
+/// ended, in cargo's `reason` style.
+pub fn work_json(worked: &Worked) -> String {
+    let link = match worked.link {
+        LinkKind::Patched => "patched",
+        LinkKind::Placed => "placed",
+    };
+    format!(
+        "{{\"reason\": \"blaze-work\", \"reran\": {}, \"green\": {}, \"compiled\": {}, \
+         \"found\": {}, \"link\": \"{link}\", \"critical_path_us\": {}}}\n",
+        worked.reran, worked.green, worked.compiled, worked.found, worked.critical_path_us
+    )
+}
+
+/// `blaze codegen-inputs --format=json`: one object from each instance key's hex to its code
+/// hash's hex, in the response's order (sorted by key), newline ended.
+pub fn codegen_inputs_json(inputs: &[(ContentId, ContentId)]) -> String {
+    let pairs: Vec<String> =
+        inputs.iter().map(|(instance, code)| format!("\"{instance:x}\": \"{code:x}\"")).collect();
+    format!("{{{}}}\n", pairs.join(", "))
+}
+
+/// `blaze trace --out PATH`: the deterministic CBOR of the [`blaze_v2_proof::Trace`] the
+/// results make, what the `blaze-v2-proof` binary compares.
+pub fn trace_cbor(traced: &[Traced]) -> Result<Vec<u8>, blaze_protocol::cbor::Error> {
+    let mut trace = TraceBuilder::default();
+    for result in traced {
+        trace.insert(result.key, result.fingerprint, &result.edges, result.ran);
+    }
+    blaze_protocol::cbor::to_vec(&trace.finish())
 }
 
 /// Output of user code: lossily as text, its last [`OUTPUT`] bytes, each line ended.
@@ -278,6 +378,11 @@ mod tests {
                 end_line: 3,
                 end_column: 19,
                 label: Some("expected `u32`, found `&str`".to_owned()),
+                byte_start: 40,
+                byte_end: 42,
+                primary: true,
+                replacement: None,
+                applicability: None,
             }],
             children: vec![Diagnostic {
                 level: Level::Note,
@@ -286,8 +391,12 @@ mod tests {
                 spans: Vec::new(),
                 children: Vec::new(),
                 facts: Vec::new(),
+                rendered: String::new(),
+                unit: None,
             }],
             facts: vec![fact("the signature of `main::parse`")],
+            rendered: String::new(),
+            unit: None,
         };
         assert_eq!(
             lines(&Response::Diagnostic(diagnostic), false),
@@ -295,6 +404,25 @@ mod tests {
              \x20 --> src/main.rs:3:17: expected `u32`, found `&str`\n\
              \x20  = note: expected due to this\n\
              \x20  = read: the signature of `main::parse`\n"
+        );
+    }
+
+    #[test]
+    fn rustcs_own_text_is_printed_as_it_is_then_the_facts() {
+        let diagnostic = Diagnostic {
+            level: Level::Warning,
+            code: None,
+            message: "unused variable: `x`".to_owned(),
+            spans: Vec::new(),
+            children: Vec::new(),
+            facts: vec![fact("what `x` in `main` resolves to")],
+            rendered: "warning: unused variable: `x`\n --> src/main.rs:2:9\n".to_owned(),
+            unit: None,
+        };
+        assert_eq!(
+            lines(&Response::Diagnostic(diagnostic), false),
+            "warning: unused variable: `x`\n --> src/main.rs:2:9\n\
+             \x20  = read: what `x` in `main` resolves to\n"
         );
     }
 

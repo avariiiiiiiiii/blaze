@@ -11,8 +11,8 @@
   `{"reason": "blaze-work", "reran": N, "green": N, "compiled": N, "found": N, "link":
   "patched"|"placed", "critical_path_us": N}`.
 - Where: `crates/blaze-api/src/lib.rs` (ci), the plane's request accounting (core), the CLI.
-- Why: docs/v2/plan/targets.md's budgets ("a format or comment edit compiles nothing", "a signature edit
-  compiles its callers") and docs/v2/proof.md's "over-invalidation is measured and budgeted"
+- Why: docs/v2/plan/goals/targets.md's budgets ("a format or comment edit compiles nothing", "a signature edit
+  compiles its callers") and docs/v2/plan/lanes/proof.md's "over-invalidation is measured and budgeted"
   need the count per request. `harness/v2/engine.py`'s `V2.mark`/`work_since` and
   `critical_path_s` raise `engine.Missing` until this exists, which fails every v2 run of
   oracle.py and budgets.py naming it.
@@ -24,7 +24,7 @@
   view's last build compiled or found, with the hash its code was generated from. CLI: `blaze
   codegen-inputs --format=json` printing `{"<instance key hex>": "<code hash hex>", ...}`.
 - Where: `crates/blaze-api` (ci), answered by the codegen queries (codegen).
-- Why: docs/v2/proof.md: "the incremental result must equal a from-scratch build, bit for bit
+- Why: docs/v2/plan/lanes/proof.md: "the incremental result must equal a from-scratch build, bit for bit
   for the codegen inputs". `V2.codegen_inputs` raises `engine.Missing` until then.
 
 ## 3. blaze-api: a view's trace
@@ -34,11 +34,11 @@
   last build ran or kept, its fingerprint, its edges in read order, and whether that build ran
   it. CLI: `blaze trace --out PATH` writing it as the deterministic CBOR of
   `blaze_v2_proof::Trace` (`crates/blaze-v2-proof`: columns over `u32` key indices, edges as
-  CSR, per docs/v2/plan/data.md; made with `TraceBuilder::record` from each `Memo`),
+  CSR, per docs/v2/plan/design/data.md; made with `TraceBuilder::record` from each `Memo`),
   which the `blaze-v2-proof` binary compares.
 - Where: `crates/blaze-api` (ci), from `blaze_query::Database::memo` (db).
 - Why: the oracle names the query that went stale and the read it missed (a fact missing from
-  docs/v2/items.md section 6.2), not only the wrong program. `V2.trace` raises
+  docs/v2/plan/lanes/items.md section 6.2), not only the wrong program. `V2.trace` raises
   `engine.Missing` until then.
 
 ## 4. pyproject.toml: lint and type-check harness/v2
@@ -63,8 +63,8 @@
 - What: a row for `harness/v2/proof.py` (one entry, one report: oracle, corpus, rejections,
   determinism, tight memory, budgets) and one per script, each run as `uv run --frozen python
   harness/v2/<script>.py '<json>'` with `"engine": {"kind": "v1"|"v2", "blaze": PATH}`;
-  `docs/v2/proof.md` can link it.
-- Where: `docs/harness.md`, `docs/v2/proof.md` (coordinator).
+  `docs/v2/plan/lanes/proof.md` can link it.
+- Where: `docs/harness.md`, `docs/v2/plan/lanes/proof.md` (coordinator).
 - Why: docs-say-what-they-are; the harnesses are otherwise undocumented.
 
 ---
@@ -85,7 +85,7 @@ The children's own files (`v2/requests/proof-corpus.md`, `v2/requests/proof-perf
 folded in here: what they asked of `proof` (engine, fixture, proof.py) is done in
 `harness/v2/`; what they asked of the coordinator is items 4 and 7 above.
 
-## 8. blaze-api: the size of each long-lived table (docs/v2/plan/data.md)
+## 8. blaze-api: the size of each long-lived table (docs/v2/plan/design/data.md)
 
 - What: `Request::Tables { view: ViewRef }` answered with `Response::Tables(Vec<(String, u64,
   u64)>)`: per table its name, elements and bytes (all columns and side tables), at least
@@ -93,7 +93,7 @@ folded in here: what they asked of `proof` (engine, fixture, proof.py) is done i
   CLI: `blaze tables --format=json` printing `{"<name>": {"elements": N, "bytes": N}}`.
 - Where: `crates/blaze-api` (ci), each table's owner reporting its own (format, db, codegen,
   link).
-- Why: docs/v2/plan/data.md has proof report bytes per token, node, expression, statement, memo and
+- Why: docs/v2/plan/design/data.md has proof report bytes per token, node, expression, statement, memo and
   relocation against its size budgets (`budgets.py`'s `layout` rows). `V2.tables` raises
   `engine.Missing` until then.
 
@@ -108,6 +108,6 @@ folded in here: what they asked of `proof` (engine, fixture, proof.py) is done i
   record moved hot to warm to cold and back by the tier mover.
 - Where: root `Cargo.toml` (coordinator); `crates/blaze-format`, `crates/blaze-cas` (format,
   store).
-- Why: docs/v2/plan/data.md: "Every encoding round-trips exactly, which the proof
+- Why: docs/v2/plan/design/data.md: "Every encoding round-trips exactly, which the proof
   checks." `shapes` holds the columns each tier is chosen for and their edges (empty, runs,
   sorted, CSR offsets, every narrow range, a frame far from zero, the extremes).

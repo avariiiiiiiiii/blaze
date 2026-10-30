@@ -911,12 +911,13 @@ fn committed(out: &[Watched]) -> bool {
 fn the_disk_becomes_transactions_on_its_head() {
     let mut sim = Sim::new(1, Faults::default());
     let mut vfs = new_vfs();
+    sim.change(&name("ws/Cargo.toml"), b"[package]");
     let mut watcher = Watcher::new("disk", name("ws"), 100);
     let mut effects = Vec::new();
     watcher.start(&mut effects);
-    sim.submit(&mut effects);
+    let out = pump(&mut sim, &mut vfs, &mut watcher, &mut effects);
+    assert!(matches!(out[..], [Watched::Committed(_), Watched::Scanned]), "{out:?}");
     sim.change(&name("ws/src/lib.rs"), b"fn a() {}");
-    sim.change(&name("ws/Cargo.toml"), b"[package]");
     sim.change(&name("elsewhere"), b"x");
     let out = pump(&mut sim, &mut vfs, &mut watcher, &mut effects);
     assert!(committed(&out), "{out:?}");
@@ -972,6 +973,75 @@ fn a_file(len: u64) -> Done {
     Done::Stat(Some(Meta { len, dir: false, modified_ns: 0 }))
 }
 
+/// Answers the scan `start` asked for as a directory holding just what the head does.
+fn scan_as_head(vfs: &mut Vfs, watcher: &mut Watcher, effects: &mut Vec<Effect>) {
+    let at = effects.iter().position(|it| matches!(it, Effect::List { .. })).expect("a listing");
+    let Effect::List { tag, .. } = effects.remove(at) else { unreachable!() };
+    let files = vfs.head("disk").map(|root| contents(vfs, root)).unwrap_or_default();
+    let listed = files
+        .iter()
+        .map(|(path, bytes)| {
+            (name(&format!("ws/{path}")), Meta { len: bytes.len() as u64, dir: false, modified_ns: 0 })
+        })
+        .collect();
+    let mut out = watcher.complete(vfs, Completion { tag, done: Done::Listed(listed) }, effects);
+    let mut reads = Vec::new();
+    effects.retain(|it| match it {
+        Effect::ReadAll { file, tag } => {
+            reads.push((*tag, file.as_str()["ws/".len()..].to_owned()));
+            false
+        }
+        _ => true,
+    });
+    for (tag, path) in reads {
+        let done = Done::Read(files[&path].clone());
+        out.extend(watcher.complete(vfs, Completion { tag, done }, effects));
+    }
+    assert_eq!(out, vec![Watched::Scanned]);
+}
+
+#[test]
+fn a_watch_starts_by_making_the_head_what_the_directory_holds() {
+    let mut sim = Sim::new(2, Faults::default());
+    let mut vfs = new_vfs();
+    let stale = vfs.commit("disk", vfs.empty(), &[write("gone", "1"), write("same", "s"), write("old", "o")]);
+    let stale = stale.unwrap().root;
+    sim.change(&name("ws/same"), b"s");
+    sim.change(&name("ws/old"), b"new");
+    sim.change(&name("ws/d/added"), b"a");
+    let mut watcher = Watcher::new("disk", name("ws"), 100);
+    let mut effects = Vec::new();
+    watcher.start(&mut effects);
+    assert_eq!(
+        effects,
+        vec![
+            Effect::Watch { dir: name("ws"), tag: Tag(100) },
+            Effect::List { dir: name("ws"), tag: Tag(101) },
+        ]
+    );
+    assert!(!watcher.idle(), "the listing is in flight");
+    let out = pump(&mut sim, &mut vfs, &mut watcher, &mut effects);
+    assert!(matches!(out[..], [Watched::Committed(_), Watched::Scanned]), "{out:?}");
+    let head = vfs.head("disk").unwrap();
+    assert_eq!(
+        vfs.diff(stale, head),
+        vec![
+            Change { path: "d/added".into(), kind: ChangeKind::Added },
+            Change { path: "gone".into(), kind: ChangeKind::Removed },
+            Change { path: "old".into(), kind: ChangeKind::Modified },
+        ]
+    );
+    assert!(watcher.idle());
+
+    // A directory that can't be listed stops the watch, naming the root.
+    let mut lone = Watcher::new("other", name("nowhere"), 1 << 33);
+    lone.start(&mut effects);
+    let out = pump(&mut sim, &mut vfs, &mut lone, &mut effects);
+    assert!(matches!(&out[..], [Watched::Unreadable { path, .. }, ..] if path.is_empty()), "{out:?}");
+    assert!(matches!(out.last(), Some(Watched::Ended(_))), "{out:?}");
+    assert_eq!(vfs.head("other"), None);
+}
+
 #[test]
 fn a_path_changed_since_the_report_is_a_conflict() {
     let mut vfs = new_vfs();
@@ -979,6 +1049,7 @@ fn a_path_changed_since_the_report_is_a_conflict() {
     let mut watcher = Watcher::new("disk", name("ws"), 100);
     let mut effects = Vec::new();
     watcher.start(&mut effects);
+    scan_as_head(&mut vfs, &mut watcher, &mut effects);
     effects.clear();
     assert_eq!(watcher.complete(&mut vfs, told(&["ws/c", "ws/d"]), &mut effects), vec![]);
     let tags = stats(&mut effects);
@@ -1009,6 +1080,7 @@ fn reports_commit_in_the_order_they_were_told() {
     let mut watcher = Watcher::new("disk", name("ws"), 100);
     let mut effects = Vec::new();
     watcher.start(&mut effects);
+    scan_as_head(&mut vfs, &mut watcher, &mut effects);
     effects.clear();
     watcher.complete(&mut vfs, told(&["ws/a"]), &mut effects);
     watcher.complete(&mut vfs, told(&["ws/a"]), &mut effects);
@@ -1041,7 +1113,7 @@ fn an_unreadable_path_or_lost_changes_are_named() {
     assert!(watcher.owns(Tag(100 + (1 << 32) - 1)) && !watcher.owns(Tag(100 + (1 << 32))));
     let mut effects = Vec::new();
     watcher.start(&mut effects);
-    assert_eq!(effects, vec![Effect::Watch { dir: name("ws"), tag: Tag(100) }]);
+    scan_as_head(&mut vfs, &mut watcher, &mut effects);
     effects.clear();
 
     watcher.complete(&mut vfs, told(&["ws/a"]), &mut effects);
@@ -1056,13 +1128,37 @@ fn an_unreadable_path_or_lost_changes_are_named() {
     assert_eq!(vfs.head("disk"), None);
     assert!(watcher.idle());
 
-    let lost = Completion { tag: Tag(100), done: Done::Changed { files: Vec::new(), lost: true } };
-    assert_eq!(watcher.complete(&mut vfs, lost, &mut effects), vec![Watched::Lost]);
-    assert_eq!(effects, vec![Effect::Unwatch { tag: Tag(100) }]);
+    // Dropped changes are a rescan; a second loss while it lists asks for one more after.
+    let lost = || Completion { tag: Tag(100), done: Done::Changed { files: Vec::new(), lost: true } };
+    let list = Effect::List { dir: name("ws"), tag: Tag(101) };
+    assert_eq!(watcher.complete(&mut vfs, lost(), &mut effects), vec![Watched::Lost]);
+    assert_eq!(effects, vec![list.clone()]);
+    assert_eq!(watcher.complete(&mut vfs, lost(), &mut effects), vec![Watched::Lost]);
+    assert_eq!(effects, vec![list.clone()]);
+    assert!(!watcher.idle());
     effects.clear();
-    // What is told after is not taken: the head no longer follows the disk.
-    assert_eq!(watcher.complete(&mut vfs, told(&["ws/b"]), &mut effects), vec![]);
-    assert!(effects.is_empty() && watcher.idle());
+    let b = (name("ws/b"), Meta { len: 1, dir: false, modified_ns: 0 });
+    let listed = || Completion { tag: Tag(101), done: Done::Listed(vec![b.clone()]) };
+    let read_b = |effects: &mut Vec<Effect>| {
+        let at = effects.iter().position(|it| matches!(it, Effect::ReadAll { .. })).expect("a read");
+        let Effect::ReadAll { file, tag } = effects.remove(at) else { unreachable!() };
+        assert_eq!(file, name("ws/b"));
+        Completion { tag, done: Done::Read(b"b".to_vec()) }
+    };
+    assert_eq!(watcher.complete(&mut vfs, listed(), &mut effects), vec![]);
+    assert!(effects.contains(&list), "the second rescan: {effects:?}");
+    let read = read_b(&mut effects);
+    let out = watcher.complete(&mut vfs, read, &mut effects);
+    assert!(matches!(out[..], [Watched::Committed(_), Watched::Scanned]), "{out:?}");
+    assert_eq!(text(&vfs, vfs.head("disk").unwrap(), "b").as_deref(), Some("b"));
+    effects.retain(|it| !matches!(it, Effect::List { .. }));
+    assert_eq!(watcher.complete(&mut vfs, listed(), &mut effects), vec![]);
+    let read = read_b(&mut effects);
+    assert_eq!(watcher.complete(&mut vfs, read, &mut effects), vec![Watched::Scanned]);
+    assert!(watcher.idle());
+
+    watcher.stop(&mut effects);
+    assert!(effects.contains(&Effect::Unwatch { tag: Tag(100) }));
     let ended = Completion { tag: Tag(100), done: Done::Unwatched };
     assert_eq!(watcher.complete(&mut vfs, ended, &mut effects), vec![Watched::Ended(None)]);
 }
@@ -1073,14 +1169,17 @@ fn an_unreadable_path_or_lost_changes_are_named() {
 fn the_head_follows_the_disk() {
     const PATHS: &[&str] = &["a", "b", "d/x", "d/y", "d/e/z"];
     for seed in 0..300 {
-        let mut sim = Sim::new(seed, Faults::default());
+        let lose = if seed % 2 == 0 { 0 } else { 5 };
+        let mut sim = Sim::new(seed, Faults { lose_change_one_in: lose, ..Faults::default() });
         let mut rng = Rng::new(seed ^ 0xd15c);
         let mut vfs = new_vfs();
+        // The simulation lists only a directory that holds a file.
+        sim.change(&name("ws/keep"), b"k");
         let mut watcher = Watcher::new("disk", name("ws"), 1 << 40);
         let mut effects = Vec::new();
         watcher.start(&mut effects);
         sim.submit(&mut effects);
-        let mut disk: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut disk: BTreeMap<String, Vec<u8>> = BTreeMap::from([("keep".into(), b"k".to_vec())]);
         let mut done = Vec::new();
         let mut out = Vec::new();
         for step in 0..60 {
@@ -1107,7 +1206,11 @@ fn the_head_follows_the_disk() {
             }
         }
         out.extend(pump(&mut sim, &mut vfs, &mut watcher, &mut effects));
-        assert!(out.iter().all(|it| matches!(it, Watched::Committed(_))), "seed {seed}: {out:?}");
+        assert!(
+            out.iter().all(|it| matches!(it, Watched::Committed(_) | Watched::Lost | Watched::Scanned)),
+            "seed {seed}: {out:?}"
+        );
+        assert!(out.contains(&Watched::Scanned), "seed {seed}: the first scan");
         assert!(watcher.idle());
         let head = vfs.head("disk").unwrap_or(vfs.empty());
         assert_eq!(contents(&vfs, head), disk, "seed {seed}");

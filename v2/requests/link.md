@@ -87,7 +87,7 @@ and to `Target`:
 ```
 
 What the linker does with each relocation kind, so codegen emits the right one, is in
-`docs/v2/link-notes.md` ("Relocations codegen emits").
+`docs/v2/plan/lanes/link/notes.md` ("Relocations codegen emits").
 
 ## 2. `blaze-link`: what a change carries, and the output's target
 

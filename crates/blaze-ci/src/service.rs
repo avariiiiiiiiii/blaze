@@ -1,4 +1,4 @@
-//! What each event makes happen (docs/v2/ci.md section 10), as a state machine with no IO, no
+//! What each event makes happen (docs/v2/plan/lanes/ci.md section 10), as a state machine with no IO, no
 //! clock and no threads: [`Service::step`] takes an [`Input`] and the time and says what to do
 //! in [`Output`]s. [`crate::runtime`] does it.
 //!
@@ -839,7 +839,8 @@ impl Report {
                     }
                 }
             },
-            Response::Built { artifacts } => self.artifacts += artifacts.len(),
+            Response::Built { artifacts, .. } => self.artifacts += artifacts.len(),
+            Response::Unit(_) | Response::BuildScript(_) | Response::Work(_) => {}
             Response::Verified { mismatches } => self.verified = Some(mismatches),
             Response::Error(error) => self.said.push(match error.at {
                 Some(at) => format!("{} (at {at})", error.what),

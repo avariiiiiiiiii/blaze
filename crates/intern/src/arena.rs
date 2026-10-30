@@ -2,9 +2,9 @@
 //!
 //! A value is written once into a chunk of its shard's arena and never moves or is freed: the
 //! stores are statics, so a pointer to a value is good for the life of the process. Memory is
-//! bounded by the database rebuilding what it keeps (docs/v2/db.md), not by counting references.
+//! bounded by the database rebuilding what it keeps (docs/v2/plan/lanes/db.md), not by counting references.
 //!
-//! A shard's table maps a hash to the values with it, SwissTable-style (docs/v2/plan/hardware.md,
+//! A shard's table maps a hash to the values with it, SwissTable-style (docs/v2/plan/design/hardware.md,
 //! "interner and memo lookups"): slots in groups of eight, each group with one control word of
 //! eight tag bytes, so one load and a few word operations check eight slots. Finding a value
 //! takes no lock; interning one takes its shard's lock only to look again and insert. A table
@@ -12,7 +12,7 @@
 //! kept, as a reader may be probing one, so a shard's tables cost at most twice its last.
 //!
 //! Chunks grow to 2 MiB; on Linux those are aligned to 2 MiB and backed by huge pages
-//! (docs/v2/plan/hardware.md, "memory").
+//! (docs/v2/plan/design/hardware.md, "memory").
 
 use std::{
     alloc::{self, Layout},

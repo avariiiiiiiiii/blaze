@@ -115,11 +115,14 @@ pub fn run(spec: &Spec) -> Result<i32, String> {
     let _running = Running::start();
     on_interrupt()?;
     let mut made = make(spec.network)?;
-    let temp = std::env::temp_dir().join(format!(
-        "blaze-sandbox-{}-{:016x}",
-        std::process::id(),
-        random("the run's temporary directory")?
-    ));
+    let temp = temporary(spec)?;
+    // What is there was left by a launcher that was killed: the scheduler runs a spec once at a
+    // time.
+    if temp.exists() {
+        std::fs::remove_dir_all(&temp).map_err(|error| {
+            format!("removing a killed run's temporary directory {}: {error}", temp.display())
+        })?;
+    }
     std::fs::create_dir(&temp)
         .map_err(|error| format!("making the run's temporary directory {}: {error}", temp.display()))?;
     let mut granted = Granted { sid: made.run.sid(), writes: Vec::new(), temp: temp.clone() };
@@ -298,6 +301,16 @@ fn failed(what: impl Display, call: &str) -> String {
 
 fn failed_with(what: impl Display, call: &str, code: i32) -> String {
     format!("{what} ({call}): {}", std::io::Error::from_raw_os_error(code))
+}
+
+/// The run's temporary directory, which the program sees as TMP and TEMP: named by what the spec
+/// is, so the same spec sees the same path.
+fn temporary(spec: &Spec) -> Result<PathBuf, String> {
+    use sha2::Digest as _;
+    let bytes = serde_json::to_vec(spec).map_err(|error| format!("the spec: {error}"))?;
+    let digest = sha2::Sha256::digest(&bytes);
+    let name: String = digest[..8].iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(std::env::temp_dir().join(format!("blaze-sandbox-{name}")))
 }
 
 fn random(what: &str) -> Result<u64, String> {
@@ -1066,14 +1079,11 @@ mod tests {
         assert_ne!(run(&spec(&[c, echo, hi, outside.as_os_str()])), Ok(0));
         assert!(!outside.exists());
 
-        assert_eq!(run(&spec(&[c, OsStr::new("exit"), OsStr::new("7")])), Ok(7));
-
-        let prefix = format!("blaze-sandbox-{}-", std::process::id());
-        let left = std::fs::read_dir(std::env::temp_dir())
-            .unwrap()
-            .flatten()
-            .any(|it| it.file_name().to_string_lossy().starts_with(&prefix));
-        assert!(!left, "a run's temporary directory was left behind");
+        let exit = spec(&[c, OsStr::new("exit"), OsStr::new("7")]);
+        assert_eq!(run(&exit), Ok(7));
+        assert_eq!(temporary(&exit), temporary(&exit.clone()));
+        assert_ne!(temporary(&exit), temporary(&spec(&[c, OsStr::new("exit"), OsStr::new("8")])));
+        assert!(!temporary(&exit).unwrap().exists(), "the run's temporary directory was left behind");
         _ = std::fs::remove_dir_all(&base);
     }
 }

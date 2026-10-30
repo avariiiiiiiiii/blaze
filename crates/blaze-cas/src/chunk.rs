@@ -133,7 +133,7 @@ unsafe fn cut_avx512(bytes: &[u8]) -> usize {
     cut_from(bytes, at, hash, middle, end)
 }
 
-/// [`cut_avx512`] in NEON: the 8 lanes of a block as 4 pairs, and the table words loaded one at
+/// The AVX-512 path in NEON: the 8 lanes of a block as 4 pairs, and the table words loaded one at
 /// a time, as there is no gather.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
@@ -301,5 +301,153 @@ mod tests {
     fn the_same_bytes_cut_the_same() {
         let bytes = noise(2 << 20, 13);
         assert_eq!(chunks(&bytes), chunks(&bytes.clone()));
+    }
+
+    /// Every path cuts `bytes` where the scalar `cut` does, at every chunk start.
+    fn every_path_agrees(bytes: &[u8], what: &str) {
+        let paths = paths();
+        let mut start = 0;
+        loop {
+            let rest = &bytes[start..];
+            let expected = cut_scalar(rest);
+            for (name, path) in &paths {
+                assert_eq!(path(rest), expected, "{name} on {what} at {start} of {}", bytes.len());
+            }
+            if rest.is_empty() {
+                break;
+            }
+            start += expected;
+        }
+    }
+
+    fn lengths() -> Vec<usize> {
+        let mut out = vec![0, 1, 7, 8, 9, 1000, MIN - 1, MIN, MAX - 1, MAX, MAX + 1, 5 << 20];
+        for around in [MIN, AVERAGE, MAX] {
+            out.extend(around - 9..=around + 9);
+        }
+        out.extend([MIN + 8 * 100 + 3, AVERAGE + 8 * 100 + 5, 2 * MAX + 13]);
+        out
+    }
+
+    #[test]
+    fn every_path_cuts_random_data_like_the_scalar_one() {
+        for len in lengths() {
+            for seed in 0..4 {
+                every_path_agrees(&noise(len, seed * 1000 + len as u64), "noise");
+            }
+        }
+    }
+
+    #[test]
+    fn every_path_agrees_over_many_seeds() {
+        for seed in 100..164 {
+            let mut rng = blaze_core::sim::Rng::new(seed);
+            let len = MIN + rng.below((3 * MAX) as u64) as usize;
+            every_path_agrees(&noise(len, seed), "noise");
+        }
+    }
+
+    #[test]
+    fn constant_bytes_never_cut_early() {
+        for byte in [0x00, 0xFF] {
+            for len in lengths() {
+                let bytes = vec![byte; len];
+                for (name, path) in paths() {
+                    assert_eq!(path(&bytes), len.min(MAX), "{name} on {byte:#x} * {len}");
+                }
+                every_path_agrees(&bytes, "constant bytes");
+            }
+        }
+    }
+
+    /// Zeros of length `len` (which never cut) with the four bytes ending at `at` chosen so the
+    /// first cut is the test at `at`.
+    fn planted(len: usize, at: usize, seed: u64) -> Vec<u8> {
+        let end = len.min(MAX);
+        let middle = end.min(AVERAGE);
+        assert!(at >= MIN + 64 + 4 && at < end, "{at} in {len}");
+        let mask = |pos: usize| if pos < middle { MASK_SMALL } else { MASK_LARGE };
+        let mut saturated = 0u64;
+        for _ in 0..64 {
+            saturated = (saturated << 1).wrapping_add(GEAR[0]);
+        }
+        let mut rng = blaze_core::sim::Rng::new(seed);
+        for _ in 0..1u64 << 26 {
+            let chosen = rng.next_u64().to_le_bytes();
+            let mut hash = saturated;
+            let mut first = None;
+            for (k, byte) in chosen[..4].iter().enumerate() {
+                let pos = at - 3 + k;
+                hash = (hash << 1).wrapping_add(GEAR[*byte as usize]);
+                if hash & mask(pos) == 0 {
+                    first = Some(pos);
+                    break;
+                }
+            }
+            if first == Some(at) {
+                let mut bytes = vec![0; len];
+                bytes[at - 3..=at].copy_from_slice(&chosen[..4]);
+                assert_eq!(cut_scalar(&bytes), at + 1);
+                return bytes;
+            }
+        }
+        panic!("no four bytes make the first cut at {at}");
+    }
+
+    #[test]
+    fn every_path_finds_a_cut_in_each_lane() {
+        let len = 3 * MAX;
+        for block in [MIN + 8 * 10, MIN + 8 * 1000, AVERAGE + 8 * 10, MAX - 8 * 10] {
+            for lane in 0..8 {
+                let at = block + lane;
+                let bytes = planted(len, at, at as u64);
+                for (name, path) in paths() {
+                    assert_eq!(path(&bytes), at + 1, "{name}: lane {lane} of the block at {block}");
+                }
+                every_path_agrees(&bytes, "a planted cut");
+            }
+        }
+    }
+
+    #[test]
+    fn every_path_finds_a_cut_at_the_edges() {
+        let short = MIN + 8 * 100 + 5;
+        for (len, at) in [
+            (3 * MAX, AVERAGE - 1),
+            (3 * MAX, AVERAGE),
+            (3 * MAX, AVERAGE + 1),
+            (3 * MAX, MAX - 2),
+            (3 * MAX, MAX - 1),
+            (MAX, MAX - 1),
+            (short, short - 1),
+            (short, short - 2),
+            (short, short - 9),
+        ] {
+            let bytes = planted(len, at, (len + at) as u64);
+            for (name, path) in paths() {
+                assert_eq!(path(&bytes), at + 1, "{name}: a cut at {at} of {len}");
+            }
+            every_path_agrees(&bytes, "a planted cut");
+        }
+    }
+
+    #[test]
+    fn chunks_match_scalar_chunks() {
+        let scalar = |bytes: &[u8]| -> Vec<Range<usize>> {
+            let mut out = Vec::new();
+            let mut start = 0;
+            while start < bytes.len() {
+                let len = cut_scalar(&bytes[start..]);
+                out.push(start..start + len);
+                start += len;
+            }
+            out
+        };
+        for (len, seed) in [(0, 1), (MIN + 3, 2), (5 << 20, 3), (16 << 20, 4)] {
+            let bytes = noise(len, seed);
+            assert_eq!(chunks(&bytes), scalar(&bytes), "{len}");
+        }
+        let zeros = vec![0; 3 * MAX + 5];
+        assert_eq!(chunks(&zeros), scalar(&zeros));
     }
 }

@@ -510,8 +510,9 @@ mod persistence {
             // Only final memos are serialized (`Memo::should_serialize`), and the fingerprint of
             // a value is not persisted but computed again from it.
             let mut revisions = memo.revisions;
-            revisions.fingerprint = C::fingerprint(&memo.value.0)
-                .unwrap_or(crate::fingerprint::Fingerprint::NONE);
+            revisions.set_value_fingerprint(
+                C::fingerprint(&memo.value.0).unwrap_or(crate::fingerprint::Fingerprint::NONE),
+            );
 
             Ok(Memo::new(
                 Some(memo.value.0),
@@ -643,9 +644,9 @@ mod _memory_usage {
 
     // Memos are stored a lot, make sure their size doesn't randomly increase.
     const _: [(); std::mem::size_of::<super::MemoHeader>()] =
-        [(); std::mem::size_of::<[usize; 7]>()];
+        [(); std::mem::size_of::<[usize; 5]>()];
     const _: [(); std::mem::size_of::<super::Memo<DummyConfiguration>>()] =
-        [(); std::mem::size_of::<[usize; 8]>()];
+        [(); std::mem::size_of::<[usize; 6]>()];
     const _: [(); std::mem::size_of::<super::ErasedMemo<'static>>()] =
         [(); std::mem::size_of::<[usize; 4]>()];
 

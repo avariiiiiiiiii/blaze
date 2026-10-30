@@ -104,6 +104,7 @@ mod backend;
 use backend::Step;
 pub use backend::{Backend, builds_edits, links_own, sections_of_their_own};
 mod cached;
+mod copies;
 mod debuginfo;
 pub use debuginfo::Sidecar;
 pub mod counted;
@@ -3404,23 +3405,37 @@ impl Variadic {
     }
 }
 
-/// The MIR optimization level the environment asks for with `BLAZE_MIR_OPT`: 0, the default,
-/// compiles the runtime body; 1 and 2 that body after rustc's MIR passes at its
-/// `-Zmir-opt-level` 1 and 2 (`hir_ty_mir::mir::MirOptLevel`).
-pub fn mir_opt_level() -> MirOptLevel {
-    static LEVEL: LazyLock<MirOptLevel> = LazyLock::new(|| {
-        let Some(asked) = std::env::var_os(MIR_OPT) else { return MirOptLevel::Off };
+/// The MIR optimization level the environment asks for with `BLAZE_MIR_OPT` in place of
+/// rustc's ([`mir_opt_level_of`]): 0 compiles the runtime body; 1 and 2 that body after
+/// rustc's MIR passes at its `-Zmir-opt-level` 1 and 2 (`hir_ty_mir::mir::MirOptLevel`).
+pub fn mir_opt_level() -> Option<MirOptLevel> {
+    static LEVEL: LazyLock<Option<MirOptLevel>> = LazyLock::new(|| {
+        let asked = std::env::var_os(MIR_OPT)?;
         let level =
             asked.to_str().and_then(|it| it.parse().ok()).and_then(MirOptLevel::from_number);
-        level.unwrap_or_else(|| {
-            eprintln!("blaze: {MIR_OPT}={}: expected 0, 1 or 2; using 0", asked.display());
-            MirOptLevel::Off
-        })
+        if level.is_none() {
+            eprintln!("blaze: {MIR_OPT}={}: expected 0, 1 or 2; using rustc's", asked.display());
+        }
+        level
     });
     *LEVEL
 }
 
 pub const MIR_OPT: &str = "BLAZE_MIR_OPT";
+
+/// The MIR optimization level of the bodies of `krate`: [`mir_opt_level`] where it is asked
+/// for, else rustc's ([`rustc_mir_opt_level`]).
+fn mir_opt_level_of(db: &dyn HirDatabase, krate: Crate) -> MirOptLevel {
+    mir_opt_level().unwrap_or_else(|| {
+        rustc_mir_opt_level(krate.data(db).origin.is_lang(), backend::above_o0())
+    })
+}
+
+/// The `-Zmir-opt-level` rustc's code of a crate is generated from: 1 at `-Copt-level=0`, 2
+/// above it, and 2 for the library's crates, whose MIR rustc ships optimized for release.
+fn rustc_mir_opt_level(lang: bool, optimized: bool) -> MirOptLevel {
+    if lang || optimized { MirOptLevel::Release } else { MirOptLevel::Debug }
+}
 
 /// Says whether rustc builds the program with `-C link-dead-code`, before anything of it is
 /// compiled: rustc then keeps every function, `#[inline(always)]` ones too, as one copy in
@@ -3430,12 +3445,12 @@ pub fn rustc_links_dead_code(links: bool) {
 }
 
 /// The body the code generator compiles of `def`: the runtime body, optimized at
-/// [`mir_opt_level`].
+/// [`mir_opt_level_of`] its crate.
 fn compiled_mir_body<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
 ) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
-    match mir_opt_level() {
+    match mir_opt_level_of(db, def.module(db).krate(db)) {
         MirOptLevel::Off => db.runtime_mir_body(def),
         level => db.optimized_mir_body(def, level),
     }
@@ -3445,7 +3460,7 @@ fn compiled_mir_body_for_closure<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
 ) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
-    match mir_opt_level() {
+    match mir_opt_level_of(db, closure.loc(db).owner.module(db).krate(db)) {
         MirOptLevel::Off => db.runtime_mir_body_for_closure(closure),
         level => db.optimized_mir_body_for_closure(closure, level),
     }
@@ -3466,8 +3481,9 @@ fn instance_body<'db>(
     let filled = |body, args: &StoredGenericArgs, env: &StoredParamEnvAndCrate| {
         tally.step(Step::Monomorphize, || monomorphized(db, body, args, env).map(Cow::Owned))
     };
-    // The database keeps a monomorphized body of the runtime body only.
-    let lean = *LEAN || mir_opt_level() != MirOptLevel::Off;
+    // The database keeps a monomorphized body of the runtime body only, which only
+    // `BLAZE_MIR_OPT=0` compiles.
+    let lean = *LEAN || mir_opt_level() != Some(MirOptLevel::Off);
     let body = match instance.def {
         InstanceDef::Fn(func) if lean => tally
             .step(Step::Mir, || compiled_mir_body(db, func.into()))
@@ -4885,6 +4901,30 @@ fn panics_abort(db: &dyn HirDatabase, krate: Crate) -> bool {
     !krate.data(db).origin.is_lang() && krate.cfg_options(db).check_atom(&abort)
 }
 
+/// `-C debug-assertions` of `krate`: the library's crates are as rustc ships them, without.
+fn debug_assertions(db: &dyn HirDatabase, krate: Crate) -> bool {
+    !krate.data(db).origin.is_lang()
+        && krate.cfg_options(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::debug_assertions))
+}
+
+/// What `intrinsics::ub_checks()` is in a body of the crate `written`, compiled by a crate
+/// whose `-C debug-assertions` is `compiling`: see [`ub_checks_in`].
+fn ub_checks_of(db: &dyn HirDatabase, compiling: bool, written: Crate) -> bool {
+    use base_db::{CrateOrigin, LangCrateOrigin};
+    let preserves = matches!(
+        written.data(db).origin,
+        CrateOrigin::Lang(LangCrateOrigin::Core | LangCrateOrigin::Alloc | LangCrateOrigin::Std)
+    );
+    ub_checks_in(compiling, preserves, debug_assertions(db, written))
+}
+
+/// rustc's rule for `ub_checks()`: InstSimplify folds it to the `-C debug-assertions` of the
+/// crate whose MIR it is (`written`), unless that crate has `#![rustc_preserve_ub_checks]`
+/// (core, alloc and std do), whose MIR keeps it for codegen to make the compiling crate's.
+fn ub_checks_in(compiling: bool, preserves: bool, written: bool) -> bool {
+    if preserves { compiling } else { written }
+}
+
 fn build<'db>(
     cg: &mut Recorder<'db>,
     env: ParamEnvAndCrate<'db>,
@@ -4900,6 +4940,11 @@ fn build<'db>(
     ctx.func.params.ensure_base_srcloc(ir::SourceLoc::new(0));
     let mut builder_ctx = FunctionBuilderContext::new();
     let aborts = panics_abort(cg.db, env.krate);
+    let compiling = cg.debug_assertions.unwrap_or_else(|| debug_assertions(cg.db, env.krate));
+    let ub_checks = match body {
+        Some(body) => ub_checks_of(cg.db, compiling, body.owner.module(cg.db).krate(cg.db)),
+        None => compiling,
+    };
     let mut fx = FunctionCx {
         cg,
         body,
@@ -4921,6 +4966,8 @@ fn build<'db>(
         block: None,
         in_cleanup: false,
         aborts,
+        debug_assertions: compiling,
+        ub_checks,
         guarded: false,
         ret_mode: PassMode::Ignore,
         tracked,
@@ -4956,6 +5003,7 @@ fn build<'db>(
 pub fn set_code_capacity(db: &mut dyn HirDatabase, compiled: usize, inlinable_bodies: usize) {
     compiled_instance::set_lru_capacity(db, compiled);
     inlinable::set_lru_capacity(db, inlinable_bodies);
+    always_inlinable::set_lru_capacity(db, inlinable_bodies);
 }
 
 /// The body of a small function, built to be put where the function is called.
@@ -4965,30 +5013,47 @@ fn inlinable(
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Option<fragment::Inlinable> {
-    tier::plain(|| small_body(db, instance, env))
-}
-
-fn small_body(
-    db: &dyn HirDatabase,
-    instance: Instance,
-    env: StoredParamEnvAndCrate,
-) -> Option<fragment::Inlinable> {
     /// The most blocks and statements the body of a function that is inlined has, and
     /// the most instructions it is built to with what it calls inlined into it.
     const BLOCKS: usize = 4;
     const STATEMENTS: usize = 12;
     const INSTRUCTIONS: usize = 64;
+    tier::plain(|| {
+        let InstanceDef::Fn(func) = instance.def else { return None };
+        let generic = db.mir_body(func.into()).ok()?;
+        let statements: usize = generic.basic_blocks.iter().map(|it| it.1.statements.len()).sum();
+        if generic.basic_blocks.len() > BLOCKS || statements > STATEMENTS {
+            return None;
+        }
+        built_in_body(db, &instance, env, INSTRUCTIONS)
+    })
+}
+
+/// The body of an `#[inline(always)]` function of any size, built to be put where the function
+/// is called, as LLVM's always-inliner puts it at every level rustc compiles at.
+#[salsa::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle, lru = 0)]
+fn always_inlinable(
+    db: &dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+) -> Option<fragment::Inlinable> {
+    tier::plain(|| built_in_body(db, &instance, env, usize::MAX))
+}
+
+/// The body of the function `instance`, with what it calls built into it, where it is at
+/// most `instructions` long: none of a closure or coroutine, or of a body that defines one.
+fn built_in_body(
+    db: &dyn HirDatabase,
+    instance: &Instance,
+    env: StoredParamEnvAndCrate,
+    instructions: usize,
+) -> Option<fragment::Inlinable> {
     let InstanceDef::Fn(func) = instance.def else { return None };
     let generic = db.mir_body(func.into()).ok()?;
-    let statements: usize = generic.basic_blocks.iter().map(|it| it.1.statements.len()).sum();
-    if generic.basic_blocks.len() > BLOCKS
-        || statements > STATEMENTS
-        || !generic.closures.is_empty()
-        || generic.coroutine.is_some()
-    {
+    if !generic.closures.is_empty() || generic.coroutine.is_some() {
         return None;
     }
-    let body = instance_body(db, &instance, env.clone()).ok()?;
+    let body = instance_body(db, instance, env.clone()).ok()?;
     let mut cg = Recorder::new(db, &**target().ok()?, selected_target().ok()?, instance.checked);
     cg.unlocated = true;
     let args = instance.args.clone();
@@ -5000,12 +5065,14 @@ fn small_body(
     if cg.naked.is_some() || cg.opaque {
         return None;
     }
-    inline(&mut ctx, &cg.inlined).ok()?;
-    if ctx.func.dfg.num_insts() > INSTRUCTIONS {
+    settle(&mut ctx, &cg).ok()?;
+    let layout = &ctx.func.layout;
+    if layout.blocks().map(|it| layout.block_insts(it).count()).sum::<usize>() > instructions {
         return None;
     }
     let pointees = std::mem::take(&mut cg.pointees);
-    fragment::Inlinable::of(ctx.func, cg.finish().0, pointees, Vec::new())
+    let built_in = std::mem::take(&mut cg.built_in);
+    fragment::Inlinable::of(ctx.func, cg.finish().0, pointees, Vec::new(), built_in)
 }
 
 fn inlinable_cycle(
@@ -5235,7 +5302,7 @@ fn root_body<'db>(
     let body = if opaque {
         let args = GenericArgs::new_from_slice(&[]).store();
         tally
-            .step(Step::Monomorphize, || match mir_opt_level() {
+            .step(Step::Monomorphize, || match mir_opt_level_of(db, krate) {
                 MirOptLevel::Off => db.monomorphized_runtime_mir_body(owner, args, env.store()),
                 level => db.monomorphized_optimized_mir_body(owner, level, args, env.store()),
             })
@@ -8115,6 +8182,11 @@ struct FunctionCx<'cx, 'db> {
     /// The crate it is compiled for has `panic = "abort"`: no call of it unwinds (rustc's
     /// `fn_can_unwind`), and so none has a landing pad.
     aborts: bool,
+    /// `-C debug-assertions` of the crate it is compiled for: what `check_language_ub()` and
+    /// `check_library_ub()` of core are at run time.
+    debug_assertions: bool,
+    /// What `intrinsics::ub_checks()` is in the body ([`ub_checks_in`]).
+    ub_checks: bool,
     /// Whether a call was made by [`Self::guarded_call`].
     guarded: bool,
     ret_mode: PassMode,
@@ -10329,7 +10401,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// The locals of `body` that only a call of a check that is off here assigns, once:
-    /// `ub_checks()` and the like are false, and what they guard is not compiled, nor asks
+    /// `contract_checks()`, and `ub_checks()` and the like without debug assertions, are
+    /// false, and what they guard is not compiled, nor asks
     /// for the bodies of what it calls (`precondition_check`, the panics), which would else
     /// use up what a compile may build in before the code that runs is reached.
     fn checks_off(&mut self, body: &MirBody<'db>) -> FxHashSet<LocalId> {
@@ -10356,10 +10429,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let TyKind::FnDef(def, _) = ty.kind() else { continue };
             let CallableDefId::FunctionId(callee) = def.0 else { continue };
             let check = callee.krate(db).data(db).origin.is_lang()
-                && matches!(
-                    FunctionSignature::of(db, callee).name.as_str(),
-                    "ub_checks" | "contract_checks" | "check_language_ub" | "check_library_ub"
-                );
+                && match FunctionSignature::of(db, callee).name.as_str() {
+                    "contract_checks" => true,
+                    "ub_checks" => !self.ub_checks,
+                    "check_language_ub" | "check_library_ub" => !self.debug_assertions,
+                    _ => false,
+                };
             if check && destination.projection.as_slice().is_empty() {
                 off.insert(destination.local);
             }
@@ -13291,15 +13366,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.call_direct(runtime, runtime_args, &values, dst, dst_ty.ty)?;
             return self.finish_call(destination, target);
         }
-        // Each is `ub_checks() && ..`, and `ub_checks()` is false here: the check that asks is
-        // then a branch on a constant, which `tier::fold_known_branches` takes out.
+        // Each is `ub_checks() && ..` in core, and the rest is true at run time: the check that
+        // asks is then a branch on a constant, which `tier::fold_known_branches` takes out
+        // where it is off.
         if func.krate(db).data(db).origin.is_lang()
             && matches!(
                 FunctionSignature::of(db, func).name.as_str(),
                 "check_language_ub" | "check_library_ub"
             )
         {
-            let value = self.builder.ins().iconst(types::I8, 0);
+            let value = self.builder.ins().iconst(types::I8, i64::from(self.debug_assertions));
             self.builder.ins().store(MEM, value, dst, 0);
             return self.finish_call(destination, target);
         }
@@ -14707,7 +14783,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let limit = tier::inline_limit(db, &instance)?;
             let body = tier::hot_body(db, &instance, &self.env.store(), limit, false)?;
             return (body.func.signature == *sig)
-                .then(|| self.cg.declare_inlined(&body, self.builder.func));
+                .then(|| self.cg.declare_inlined(&instance, &body, self.builder.func));
         }
         let InstanceDef::Fn(func) = def else { return None };
         let own =
@@ -14731,10 +14807,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 tier::hot_body(db, &instance, &self.env.store(), limit, track_caller(db, func))
             && body.func.signature == *sig
         {
-            return Some(self.cg.declare_inlined(&body, self.builder.func));
+            return Some(self.cg.declare_inlined(&instance, &body, self.builder.func));
         }
         if track_caller(db, func) || tier::builds_in_nothing() {
             return None;
+        }
+        if let Some(callee) = self.always_inlined(def, args, sig) {
+            return Some(callee);
         }
         if !func.krate(db).data(db).origin.is_lang() {
             return None;
@@ -14745,15 +14824,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !flags.contains(AttrFlags::IS_INLINE) && args.iter().all(|it| it.region().is_some()) {
             return None;
         }
-        let body = inlinable(db, instance, self.env.store()).as_ref()?;
+        let body = inlinable(db, instance.clone(), self.env.store()).as_ref()?;
         if body.func.signature != *sig {
             return None;
         }
-        Some(self.cg.declare_inlined(body, self.builder.func))
+        Some(self.cg.declare_inlined(&instance, body, self.builder.func))
     }
 
     /// The body of an `#[inline(always)]` callee of a crate no edit changes, which rustc
-    /// builds into every caller at every level. What reads a wasm module counts on it:
+    /// builds into every caller at every level: LLVM's always-inliner runs at -O0 too, and
+    /// the hot loops of a dependency (`memchr`'s, `aho-corasick`'s, `regex-automata`'s with
+    /// `perf-inline`) are written as such callees. What reads a wasm module counts on it:
     /// wasm-bindgen finds each of its descriptor shims by the call of its marker import,
     /// which `describe_generic_import` has to put in the shim itself.
     fn always_inlined(
@@ -14776,8 +14857,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let args = erase_regions(DbInterner::new_with(db, self.env.krate), args);
         let instance = Instance { def, args: args.store(), checked: self.cg.checked };
-        let body = inlinable(db, instance, self.env.store()).as_ref()?;
-        (body.func.signature == *sig).then(|| self.cg.declare_inlined(body, self.builder.func))
+        let body = always_inlinable(db, instance.clone(), self.env.store()).as_ref()?;
+        (body.func.signature == *sig)
+            .then(|| self.cg.declare_inlined(&instance, body, self.builder.func))
     }
 
     /// Shows LLVM the body of the callee `id` a compile at a level above 1 calls, where
@@ -15189,12 +15271,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let value = self.builder.ins().iconst(types::I8, i64::from(needs));
                 self.builder.ins().store(MEM, value, dst, 0);
             }
-            ("ub_checks" | "contract_checks" | "is_val_statically_known", _) => {
+            ("ub_checks", []) => {
+                let value = self.builder.ins().iconst(types::I8, i64::from(self.ub_checks));
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("contract_checks" | "is_val_statically_known", _) => {
                 let value = self.builder.ins().iconst(types::I8, 0);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
+            // rustc's MIR keeps it for codegen only where the body checks overflow itself or
+            // inherits its caller's checks, and is false everywhere else.
             ("overflow_checks", []) => {
-                let value = self.builder.ins().iconst(types::I8, i64::from(self.cg.checked));
+                let checks = self.checks_overflow()?;
+                let value = self.builder.ins().iconst(types::I8, i64::from(checks));
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("va_arg", [list])
@@ -15528,6 +15617,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("raw_eq" | "compare_bytes", [a, b, ..]) => {
                 let (a, _) = self.load_scalar(a)?;
                 let (b, _) = self.load_scalar(b)?;
+                if name == "raw_eq" {
+                    let size = self.layout(generic_args.type_at(0))?.size.bytes();
+                    if let Some(equal) =
+                        copies::equal_bytes(&mut self.builder, ptr(), a, b, size)
+                    {
+                        self.builder.ins().store(MEM, equal, dst, 0);
+                        return Ok(Intrinsic::Inline);
+                    }
+                }
                 let len = match args {
                     [_, _, len] => self.load_scalar(len)?.0,
                     _ => {
@@ -19716,5 +19814,186 @@ mod tests {
                 assert_eq!((section.name(), symbol.address()), (Ok(name), 0));
             }
         }
+    }
+
+    /// An ISA for `triple`, as an object of it is written with.
+    fn isa_of(triple: &str) -> &'static dyn cranelift_codegen::isa::TargetIsa {
+        use cranelift_codegen::settings::{self, Configurable};
+        let mut flags = settings::builder();
+        flags.set("is_pic", "true").unwrap();
+        let isa = cranelift_codegen::isa::lookup(triple.parse().unwrap())
+            .unwrap()
+            .finish(settings::Flags::new(flags))
+            .unwrap();
+        &**Box::leak(Box::new(isa))
+    }
+
+    /// The relocations of `func` compiled for `isa`.
+    fn relocs_of(
+        isa: &dyn cranelift_codegen::isa::TargetIsa,
+        func: ir::Function,
+    ) -> Vec<cranelift_codegen::binemit::Reloc> {
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        let compiled = ctx.compile(isa, &mut Default::default()).unwrap();
+        compiled.buffer.relocs().iter().map(|it| it.kind).collect()
+    }
+
+    /// Each call names its callee in place, a `bl` or a `call`, as rustc's do, on every
+    /// format: an AArch64 ELF or Mach-O call loaded the callee's address from the GOT first
+    /// and branched to the register, an instruction and a load more on each call.
+    #[test]
+    fn a_call_names_its_callee_in_place_on_every_format() {
+        use cranelift_codegen::binemit::Reloc;
+        for (triple, call) in [
+            ("aarch64-unknown-linux-gnu", Reloc::Arm64Call),
+            ("aarch64-apple-darwin", Reloc::Arm64Call),
+            ("x86_64-apple-darwin", Reloc::X86CallPCRel4),
+            ("x86_64-unknown-linux-gnu", Reloc::X86CallPCRel4),
+        ] {
+            let isa = isa_of(triple);
+            let mut wants = super::fragment::Wants::new(isa);
+            let sig = ir::Signature::new(isa.default_call_conv());
+            let callee = wants.import("callee", &sig).unwrap();
+            let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+            let called = wants.declare_func_in_func(callee, &mut func);
+            assert!(func.dfg.ext_funcs[called].colocated, "{triple}");
+            let mut builder_ctx = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            builder.ins().call(called, &[]);
+            builder.ins().return_(&[]);
+            builder.finalize(isa.frontend_config());
+            assert_eq!(relocs_of(isa, func), [call], "{triple}");
+        }
+    }
+
+    /// A function of two pointers that `copy`s `size` bytes from the second to the first
+    /// with `memcpy`, or `memmove` where `overlap`, as `copy_nonoverlapping::<[u64; 3]>(.., 1)`
+    /// is built: the count times the size of the type.
+    fn copying(size: (i64, i64), overlap: bool) -> ir::Function {
+        let isa = super::target().unwrap();
+        let pointer = isa.pointer_type();
+        let mut sig = ir::Signature::new(isa.default_call_conv());
+        sig.params.extend([AbiParam::new(pointer), AbiParam::new(pointer)]);
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let &[to, from] = builder.block_params(entry) else { unreachable!() };
+        let count = builder.ins().iconst(pointer, size.0);
+        let bytes = builder.ins().imul_imm(count, size.1);
+        let config = isa.frontend_config();
+        if overlap {
+            builder.call_memmove(config, to, from, bytes);
+        } else {
+            builder.call_memcpy(config, to, from, bytes);
+        }
+        builder.ins().return_(&[]);
+        builder.finalize(config);
+        func
+    }
+
+    /// The opcodes of `func` that load, store or call, in order.
+    fn accesses(func: &ir::Function) -> Vec<(ir::Opcode, Option<ir::Type>)> {
+        let insts = func.layout.blocks().flat_map(|it| func.layout.block_insts(it));
+        insts
+            .filter_map(|inst| {
+                let opcode = func.dfg.insts[inst].opcode();
+                let ty = match opcode {
+                    ir::Opcode::Load => Some(func.dfg.value_type(func.dfg.first_result(inst))),
+                    ir::Opcode::Store => Some(func.dfg.value_type(func.dfg.inst_args(inst)[0])),
+                    ir::Opcode::Call => None,
+                    _ => return None,
+                };
+                Some((opcode, ty))
+            })
+            .collect()
+    }
+
+    /// A copy of a size known once the function is built, and at most 128 bytes, is loads
+    /// and stores, as LLVM's -O0 makes it, not a call of `memcpy`; one of `memmove` loads all
+    /// it copies before it stores any.
+    #[test]
+    fn a_small_copy_of_a_known_size_is_loads_and_stores() {
+        use ir::Opcode::{Load, Store};
+        let mut func = copying((1, 24), false);
+        assert!(super::copies::lower_small(&mut func));
+        let i64 = Some(types::I64);
+        assert_eq!(accesses(&func), [(Load, i64), (Store, i64)].repeat(3));
+
+        let mut func = copying((7, 1), true);
+        assert!(super::copies::lower_small(&mut func));
+        let loads = [(Load, Some(types::I32)), (Load, Some(types::I16)), (Load, Some(types::I8))];
+        let stores = loads.map(|(_, ty)| (Store, ty));
+        assert_eq!(accesses(&func), [&loads[..], &stores[..]].concat());
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        assert!(!super::emit(&mut ctx).unwrap().bytes.is_empty());
+    }
+
+    /// One of more than 128 bytes stays a call, of `memcpy` named in place.
+    #[test]
+    fn a_large_copy_stays_a_call_named_in_place() {
+        let mut func = copying((17, 8), false);
+        assert!(!super::copies::lower_small(&mut func));
+        assert_eq!(accesses(&func), [(ir::Opcode::Call, None)]);
+        assert!(func.dfg.ext_funcs.values().all(|it| it.colocated));
+    }
+
+    /// `raw_eq` of at most two words compares integers, as rustc's does, not bytes with
+    /// `memcmp`; of more, it has no such comparison.
+    #[test]
+    fn raw_eq_of_two_words_compares_integers() {
+        let isa = super::target().unwrap();
+        let pointer = isa.pointer_type();
+        let mut sig = ir::Signature::new(isa.default_call_conv());
+        sig.params.extend([AbiParam::new(pointer), AbiParam::new(pointer)]);
+        sig.returns.push(AbiParam::new(types::I8));
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let &[a, b] = builder.block_params(entry) else { unreachable!() };
+        let words = 2 * u64::from(pointer.bytes());
+        assert!(super::copies::equal_bytes(&mut builder, pointer, a, b, words + 1).is_none());
+        let equal = super::copies::equal_bytes(&mut builder, pointer, a, b, 12).unwrap();
+        builder.ins().return_(&[equal]);
+        builder.finalize(isa.frontend_config());
+        let loads: Vec<_> = accesses(&func).into_iter().map(|it| it.1).collect();
+        let (i64, i32) = (Some(types::I64), Some(types::I32));
+        assert_eq!(loads, [i64, i64, i32, i32]);
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        assert!(super::emit(&mut ctx).unwrap().relocs.is_empty());
+    }
+
+    /// `ub_checks()` is what rustc makes it: in core, alloc and std the compiling crate's
+    /// debug assertions, in any other crate its own, whoever compiles the body. It was
+    /// false everywhere, and a debug build ran none of the library's precondition checks.
+    #[test]
+    fn ub_checks_are_the_compiling_crates_in_the_library_and_the_writing_crates_elsewhere() {
+        use super::ub_checks_in;
+        for compiling in [false, true] {
+            assert_eq!(ub_checks_in(compiling, true, false), compiling);
+            assert_eq!(ub_checks_in(compiling, true, true), compiling);
+            assert!(!ub_checks_in(compiling, false, false));
+            assert!(ub_checks_in(compiling, false, true));
+        }
+    }
+
+    /// Code is generated from MIR at rustc's level: 1 for a crate at -O0, 2 for the library's
+    /// crates and above -O0. It was the runtime body, unoptimized, unless `BLAZE_MIR_OPT`.
+    #[test]
+    fn mir_is_optimized_at_rustcs_level() {
+        use hir_ty_mir::mir::MirOptLevel::{Debug, Release};
+        assert_eq!(super::rustc_mir_opt_level(false, false), Debug);
+        assert_eq!(super::rustc_mir_opt_level(true, false), Release);
+        assert_eq!(super::rustc_mir_opt_level(false, true), Release);
     }
 }

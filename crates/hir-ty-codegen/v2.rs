@@ -1,4 +1,4 @@
-//! blaze v2's codegen of the front end (docs/v2/codegen.md): this crate's IR builder behind
+//! blaze v2's codegen of the front end (docs/v2/plan/lanes/codegen.md): this crate's IR builder behind
 //! [`blaze_codegen`]'s per-function interfaces.
 //!
 //! [`HirFrontend`] says what an instance is and what it refers to, without compiling it: its
@@ -15,12 +15,17 @@ use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemId, ItemKey};
 use cranelift_codegen::ir;
 use hir_def::{DefWithBodyId, FunctionId, StaticId};
-use hir_ty::{db::HirDatabase, next_solver::Ty, traits::StoredParamEnvAndCrate};
+use hir_ty::{
+    db::HirDatabase,
+    next_solver::{Const, Ty},
+    traits::StoredParamEnvAndCrate,
+};
 use hir_ty_mir::mir::MirSpan;
 
 use crate::{Instance, Pending, fragment};
 
 pub(crate) mod backend;
+pub(crate) mod build;
 pub(crate) mod convert;
 pub(crate) mod fold;
 pub(crate) mod frontend;
@@ -36,7 +41,7 @@ pub(crate) mod unwind;
 pub use backend::Backends;
 pub use frontend::{Databases, HirFrontend};
 
-/// What the items lane says of the front end's items by content (docs/v2/items.md): the
+/// What the items lane says of the front end's items by content (docs/v2/plan/lanes/items.md): the
 /// keys the code generator puts in place of the database's dense ids, which differ from one
 /// run to the next.
 pub trait Hashes: Sync {
@@ -47,6 +52,8 @@ pub trait Hashes: Sync {
     /// A type by content: an ADT by its item and its layout's facts, never by its name.
     /// Regions are erased.
     fn ty<'db>(&self, db: &'db dyn HirDatabase, ty: Ty<'db>) -> Result<ContentId, String>;
+    /// A const generic argument by its value and type.
+    fn konst<'db>(&self, db: &'db dyn HirDatabase, konst: Const<'db>) -> Result<ContentId, String>;
     /// Where a statement or expression of `owner`'s body is, in its item's span table.
     fn span(
         &self,

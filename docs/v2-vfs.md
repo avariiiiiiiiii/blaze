@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # blaze v2: the vfs lane's design
 
-How [vfs.md](v2/vfs.md) is built in `crates/blaze-vfs`, as of 2026-10-29. The tree, rebase and
+How [vfs.md](v2/plan/lanes/vfs.md) is built in `crates/blaze-vfs`, as of 2026-10-29. The tree, rebase and
 journal are blaze-next's `blaze-vfs` (`git show origin/blaze-next:crates/blaze-vfs`) behind the
 v2 interface; what changed from it is below.
 
@@ -77,9 +77,16 @@ v2 interface; what changed from it is below.
   file now there.
 - A path whose head changed after the report, by anyone but this watcher, is not taken:
   `Watched::Conflict` names it and the head keeps its version.
-- `lost` (the system dropped changes) stops the watch with `Watched::Lost`. A rescan needs a
-  directory listing; `blaze-core` now has `Effect::List`, which the watcher does not use yet.
-  Until it does, the head must already hold what the directory does when the watch starts.
+- A watch starts with a scan: `Effect::List`, asked right after `Effect::Watch` so no change
+  falls between them. Every file listed is read, and every file the head has that the listing
+  doesn't is deleted, as one batch through the same conflict check; `Watched::Scanned` follows
+  its commit. The scan's place in line is taken when the listing is asked, so a change told
+  after it commits after it (a read of a file deleted since reads as empty, and the deletion's
+  report then wins). A directory that can't be listed stops the watch, naming `""`.
+- `lost` (the system dropped changes) is `Watched::Lost` and a rescan; a loss while a listing
+  is in flight asks for one more after it. Every file is read on each scan: the drivers give
+  no content hash, and `modified_ns` is not a safe skip (0 in the simulation, coarse on some
+  file systems).
 - Modes: `Stat` reports no executable bit or symlink and `ReadAll` reads through a link, so a
   file the head has keeps its mode, a new one is regular, and a chmod alone is not seen
   (requested from core: v2/requests/vfs.md item 6). A path's mode counts in the conflict check.

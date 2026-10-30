@@ -332,14 +332,40 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
         run_until_idle(driver, &mut effects, |it, _| done = Some(it.done));
         done.expect("the spawn ended")
     };
+    let check = |root: &std::path::Path, refused: Done, confined: Done| {
+        assert!(matches!(&refused, Done::Failed(why) if why.0.contains("Confine")), "{refused:?}");
+        let Done::Exited(exit) = confined else { panic!("{confined:?}") };
+        assert_eq!((exit.code, exit.stdout.as_slice()), (Some(0), &b"confined ok\n"[..]));
+        assert_eq!(
+            exit.traced.expect("traced").env,
+            vec![(std::ffi::OsString::from("HOME"), None)],
+        );
+        assert!(!root.join(".blaze-spawn").read_dir().is_ok_and(|mut it| it.next().is_some()));
+    };
     let root = dir("unconfined");
-    let refused = run(&mut Threads::new(&root, 1));
-    assert!(matches!(&refused, Done::Failed(why) if why.0.contains("Confine")), "{refused:?}");
-    let confined = run(&mut Threads::new(&root, 1).confined(Arc::new(Shell)));
-    let Done::Exited(exit) = confined else { panic!("{confined:?}") };
-    assert_eq!((exit.code, exit.stdout.as_slice()), (Some(0), &b"confined ok\n"[..]));
-    assert_eq!(exit.traced.expect("traced").env, vec![(std::ffi::OsString::from("HOME"), None)]);
-    assert!(!root.join(".blaze-spawn").read_dir().is_ok_and(|mut it| it.next().is_some()));
+    check(
+        &root,
+        run(&mut Threads::new(&root, 1)),
+        run(&mut Threads::new(&root, 1).confined(Arc::new(Shell))),
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let root = dir("uring-unconfined");
+        check(
+            &root,
+            run(&mut crate::uring::Uring::new(&root).unwrap()),
+            run(&mut crate::uring::Uring::new(&root).unwrap().confined(Arc::new(Shell))),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let root = dir("kqueue-unconfined");
+        check(
+            &root,
+            run(&mut crate::kqueue::Kqueue::new(&root, 1).unwrap()),
+            run(&mut crate::kqueue::Kqueue::new(&root, 1).unwrap().confined(Arc::new(Shell))),
+        );
+    }
 }
 
 #[test]

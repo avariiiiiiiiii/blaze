@@ -528,45 +528,72 @@ pub(crate) struct QueryRevisions {
     /// free anyways due to padding.
     pub(super) verified_final: AtomicBool,
 
-    /// The hash of the memo's value, kept when the value is evicted, or
-    /// [`Fingerprint::NONE`] when the function's output has no stable hash (see
-    /// [`QueryRevisions::fingerprint`]) or the value is provisional.
-    pub(crate) fingerprint: Fingerprint,
-
     /// The value fingerprints the inputs had when this query read them, for the inputs that
-    /// have one, sorted by the input's position in the origin's edges. An input without an entry
-    /// is compared by revision alone.
-    pub(crate) edge_fingerprints: ThinVec<EdgeFingerprint>,
+    /// have one, sorted by the input's position in the origin's edges; an input without an entry
+    /// is compared by revision alone. Then, at [`EdgeFingerprint::VALUE`], the hash of the memo's
+    /// own value, kept when the value is evicted; there is none when the function's output has
+    /// no stable hash or the value is provisional. Most memos have neither, and an empty
+    /// `ThinVec` does not allocate.
+    pub(crate) fingerprints: ThinVec<EdgeFingerprint>,
 }
 
 /// The value fingerprint a dependency had when it was read.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EdgeFingerprint {
-    /// Position of the input in [`QueryOriginRef::edges`].
+    /// Position of the input in [`QueryOriginRef::edges`], or [`EdgeFingerprint::VALUE`].
     pub(crate) edge: u32,
     pub(crate) fingerprint: Fingerprint,
 }
 
+impl EdgeFingerprint {
+    /// The position of the memo's own value fingerprint. It sorts after every edge, and no
+    /// query reads this many inputs (`ActiveQuery::add_read` refuses to record it).
+    pub(crate) const VALUE: u32 = u32::MAX;
+}
+
 impl QueryRevisions {
-    /// The memo's fingerprint: the hash of its value where the output has a stable hash,
-    /// otherwise the revision the value last changed in.
+    /// The hash of the memo's value, or [`Fingerprint::NONE`] if it has none.
     #[inline]
-    pub(crate) fn fingerprint(&self) -> Fingerprint {
-        if self.fingerprint.is_value() {
-            self.fingerprint
-        } else {
-            Fingerprint::of_revision(self.changed_at)
+    pub(crate) fn value_fingerprint(&self) -> Fingerprint {
+        match self.fingerprints.last() {
+            Some(last) if last.edge == EdgeFingerprint::VALUE => last.fingerprint,
+            _ => Fingerprint::NONE,
+        }
+    }
+
+    /// Sets the hash of the memo's value; [`Fingerprint::NONE`] removes it.
+    pub(crate) fn set_value_fingerprint(&mut self, fingerprint: Fingerprint) {
+        let has_value = self
+            .fingerprints
+            .last()
+            .is_some_and(|last| last.edge == EdgeFingerprint::VALUE);
+        match (has_value, fingerprint.is_value()) {
+            (true, true) => {
+                let last = self.fingerprints.len() - 1;
+                self.fingerprints[last].fingerprint = fingerprint;
+            }
+            (true, false) => {
+                self.fingerprints.pop();
+            }
+            (false, true) => self.fingerprints.push(EdgeFingerprint {
+                edge: EdgeFingerprint::VALUE,
+                fingerprint,
+            }),
+            (false, false) => {}
         }
     }
 
     /// The fingerprint recorded for the input at `edge` in [`QueryOriginRef::edges`], if it was
     /// read with a value fingerprint.
     pub(crate) fn edge_fingerprint(&self, edge: usize) -> Option<Fingerprint> {
+        let edge = u32::try_from(edge)
+            .ok()
+            .filter(|&edge| edge != EdgeFingerprint::VALUE)?;
         let position = self
-            .edge_fingerprints
-            .binary_search_by_key(&edge, |entry| entry.edge as usize)
+            .fingerprints
+            .binary_search_by_key(&edge, |entry| entry.edge)
             .ok()?;
-        Some(self.edge_fingerprints[position].fingerprint)
+        Some(self.fingerprints[position].fingerprint)
     }
 
     /// Returns the semantic origin of this query.
@@ -601,7 +628,9 @@ impl QueryRevisions {
         }
 
         self.origin_and_extra.clear_edges();
-        self.edge_fingerprints = ThinVec::new();
+        let value = self.value_fingerprint();
+        self.fingerprints = ThinVec::new();
+        self.set_value_fingerprint(value);
     }
 
     #[cfg(feature = "salsa_unstable")]
@@ -613,16 +642,15 @@ impl QueryRevisions {
             origin_and_extra,
             #[cfg(feature = "accumulator")]
                 accumulated_inputs: _,
-            fingerprint: _,
-            edge_fingerprints,
+            fingerprints,
         } = self;
 
-        let edge_fingerprints = if edge_fingerprints.is_empty() {
+        let fingerprints = if fingerprints.is_empty() {
             0
         } else {
-            2 * std::mem::size_of::<usize>() + std::mem::size_of_val(edge_fingerprints.as_slice())
+            2 * std::mem::size_of::<usize>() + std::mem::size_of_val(fingerprints.as_slice())
         };
-        origin_and_extra.allocation_size() + edge_fingerprints
+        origin_and_extra.allocation_size() + fingerprints
     }
 }
 
@@ -794,7 +822,7 @@ impl fmt::Debug for QueryRevisionsExtraInner {
 
 #[cfg(not(feature = "shuttle"))]
 #[cfg(target_pointer_width = "64")]
-const _: [(); std::mem::size_of::<QueryRevisions>()] = [(); std::mem::size_of::<[usize; 6]>()];
+const _: [(); std::mem::size_of::<QueryRevisions>()] = [(); std::mem::size_of::<[usize; 4]>()];
 
 const _: [(); std::mem::size_of::<EdgeFingerprint>()] = [(); 20];
 
@@ -822,8 +850,7 @@ impl QueryRevisions {
             #[cfg(feature = "accumulator")]
             accumulated_inputs: Default::default(),
             verified_final: AtomicBool::new(false),
-            fingerprint: Fingerprint::NONE,
-            edge_fingerprints: ThinVec::new(),
+            fingerprints: ThinVec::new(),
         }
     }
 
@@ -2129,7 +2156,6 @@ pub(crate) mod persistence {
 
     use super::{OriginAndExtra, QueryEdge, QueryEdges, QueryRevisions, QueryRevisionsExtra};
     use crate::DatabaseKeyIndex;
-    use crate::fingerprint::Fingerprint;
     use crate::sync::atomic::{AtomicBool, Ordering};
     use crate::{Durability, Revision};
 
@@ -2258,8 +2284,7 @@ pub(crate) mod persistence {
                 ref origin_and_extra,
                 // The value fingerprint is computed again from the deserialized value, and the
                 // serialized origin's edges are not the recorded ones, so neither is persisted.
-                fingerprint: _,
-                edge_fingerprints: _,
+                fingerprints: _,
             } = *self;
 
             MappedQueryRevisions {
@@ -2297,8 +2322,7 @@ pub(crate) mod persistence {
                 #[cfg(feature = "accumulator")]
                 accumulated_inputs: Default::default(), // TODO: Support serializing accumulators
                 verified_final: revisions.verified_final,
-                fingerprint: Fingerprint::NONE,
-                edge_fingerprints: ThinVec::new(),
+                fingerprints: ThinVec::new(),
             })
         }
     }

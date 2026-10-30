@@ -252,7 +252,7 @@ fn test() {
                 IngredientInfo {
                     debug_name: "memory_usage::MyInterned<'_>",
                     count: 3,
-                    size_of_metadata: 216,
+                    size_of_metadata: 168,
                     size_of_fields: 24,
                     heap_size_of_fields: None,
                     page_info: None,
@@ -263,7 +263,7 @@ fn test() {
                 IngredientInfo {
                     debug_name: "alloc::string::String",
                     count: 1,
-                    size_of_metadata: 56,
+                    size_of_metadata: 40,
                     size_of_fields: 24,
                     heap_size_of_fields: None,
                     page_info: None,
@@ -274,7 +274,7 @@ fn test() {
                 IngredientInfo {
                     debug_name: "alloc::string::String",
                     count: 1,
-                    size_of_metadata: 56,
+                    size_of_metadata: 40,
                     size_of_fields: 24,
                     heap_size_of_fields: Some(
                         1000,
@@ -287,7 +287,7 @@ fn test() {
                 IngredientInfo {
                     debug_name: "memory_usage::MyTracked<'_>",
                     count: 2,
-                    size_of_metadata: 288,
+                    size_of_metadata: 256,
                     size_of_fields: 16,
                     heap_size_of_fields: None,
                     page_info: None,
@@ -298,7 +298,7 @@ fn test() {
                 IngredientInfo {
                     debug_name: "(memory_usage::MyTracked<'_>, memory_usage::MyTracked<'_>)",
                     count: 1,
-                    size_of_metadata: 168,
+                    size_of_metadata: 152,
                     size_of_fields: 16,
                     heap_size_of_fields: None,
                     page_info: None,

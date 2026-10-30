@@ -1,4 +1,4 @@
-//! The four hashes of an item (docs/v2/items.md section 6.1): its forms (`form`) with every
+//! The four hashes of an item (docs/v2/plan/lanes/items.md section 6.1): its forms (`form`) with every
 //! slot filled by the hash of what it refers to.
 //!
 //! - **interface**: the interface form, each ref by its interface hash.

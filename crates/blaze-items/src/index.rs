@@ -1,4 +1,4 @@
-//! The negative-fact indexes (docs/v2/items.md section 6.2): the impls of a trait by simplified
+//! The negative-fact indexes (docs/v2/plan/lanes/items.md section 6.2): the impls of a trait by simplified
 //! self type, and what a name is in a scope, each answering its question both ways ("no impl",
 //! "nothing by that name" are answers too).
 //!
@@ -26,8 +26,8 @@ use base_db::Crate;
 use blaze_ids::{ContentId, Hasher};
 use either::Either;
 use hir_def::{
-    AdtId, AssocItemId, BuiltinDeriveImplId, EnumId, HasModule, ImplId, ModuleDefId, ModuleId,
-    TraitId, VariantId,
+    AdtId, AssocItemId, BuiltinDeriveImplId, EnumId, ImplId, ModuleDefId, ModuleId, TraitId,
+    VariantId,
     builtin_type::BuiltinType,
     item_scope::{ImportOrExternCrate, ImportOrGlob},
     nameres::crate_def_map,
@@ -235,7 +235,7 @@ fn write_binding(hasher: &mut Hasher, binding: Option<&Binding>) {
     });
 }
 
-pub(crate) fn write_vis(hasher: &mut Hasher, vis: Vis) {
+fn write_vis(hasher: &mut Hasher, vis: Vis) {
     match vis {
         Vis::Public => hasher.part(b"pub"),
         Vis::Crate(krate) => hasher.part(b"pub(crate)").id(&krate),
@@ -243,7 +243,7 @@ pub(crate) fn write_vis(hasher: &mut Hasher, vis: Vis) {
     };
 }
 
-pub(crate) fn vis(db: &dyn HirDatabase, visibility: Visibility) -> Vis {
+fn vis(db: &dyn HirDatabase, visibility: Visibility) -> Vis {
     match visibility {
         Visibility::Public => Vis::Public,
         Visibility::PubCrate(krate) => Vis::Crate(key::crate_key(db, krate)),
@@ -256,22 +256,6 @@ pub(crate) fn vis(db: &dyn HirDatabase, visibility: Visibility) -> Vis {
 pub(crate) enum AnyImpl {
     Impl(ImplId),
     BuiltinDerive(BuiltinDeriveImplId),
-}
-
-impl AnyImpl {
-    pub(crate) fn key(self, db: &dyn HirDatabase) -> ItemKey {
-        match self {
-            AnyImpl::Impl(it) => key::item_key(db, ItemId::Impl(it)),
-            AnyImpl::BuiltinDerive(it) => key::builtin_derive_key(db, it),
-        }
-    }
-
-    pub(crate) fn krate(self, db: &dyn HirDatabase) -> Crate {
-        match self {
-            AnyImpl::Impl(it) => it.krate(db),
-            AnyImpl::BuiltinDerive(it) => it.loc(db).adt.krate(db),
-        }
-    }
 }
 
 /// An impl's interface hash. A built-in derive impl has no item of its own: it is what the
@@ -323,9 +307,13 @@ pub(crate) fn resolve_trait(db: &dyn HirDatabase, trait_: ItemKey) -> Option<Tra
     }
 }
 
-/// The hash of an impl's simplified self type, as hir-ty finds it: `None` for a blanket impl.
+/// The hash of an impl's simplified self type, as hir-ty's `TraitImpls` and `InherentImpls`
+/// find it: `None` for a blanket impl.
 pub(crate) fn impl_self_ty(db: &dyn HirDatabase, imp: ImplId) -> Option<SimplifiedType> {
-    let self_ty = db.impl_self_ty(imp).instantiate_identity().skip_norm_wip();
+    let self_ty = match db.impl_trait(imp) {
+        Some(trait_ref) => trait_ref.instantiate_identity().skip_norm_wip().self_ty(),
+        None => db.impl_self_ty(imp).instantiate_identity().skip_norm_wip(),
+    };
     let simplified =
         simplify_type(DbInterner::new_no_crate(db), self_ty, TreatParams::InstantiateWithInfer)?;
     Some(key::simplified(db, &simplified))
@@ -390,7 +378,10 @@ pub(crate) fn impls_of(
 
 /// The blanket impls of `trait_`, sorted by key.
 #[salsa::tracked(returns(deref))]
-pub(crate) fn blanket_impls_of(db: &dyn HirDatabase, trait_: TraitId) -> Box<[(ItemKey, AnyImpl)]> {
+pub(crate) fn blanket_impls_of(
+    db: &dyn HirDatabase,
+    trait_: TraitId,
+) -> Box<[(ItemKey, AnyImpl)]> {
     trait_impls(db, trait_)
         .iter()
         .filter(|it| it.self_ty.is_none())
@@ -400,7 +391,10 @@ pub(crate) fn blanket_impls_of(db: &dyn HirDatabase, trait_: TraitId) -> Box<[(I
 
 /// The inherent impls of `krate`, by the hash of their simplified self type, then key.
 #[salsa::tracked(returns(deref))]
-fn inherent_impls_in(db: &dyn HirDatabase, krate: Crate) -> Box<[(SimplifiedType, ItemKey, ImplId)]> {
+fn inherent_impls_in(
+    db: &dyn HirDatabase,
+    krate: Crate,
+) -> Box<[(SimplifiedType, ItemKey, ImplId)]> {
     let mut found: Vec<_> = InherentImpls::for_crate(db, krate)
         .iter()
         .flat_map(|(self_ty, impls)| {
@@ -460,7 +454,11 @@ fn traits_in(db: &dyn HirDatabase, krate: Crate) -> Box<[(NameHash, ItemKey, Tra
 
 /// The traits of every crate with an item whose name hashes to `name`, sorted by key.
 #[salsa::tracked(returns(deref))]
-pub(crate) fn traits_with(db: &dyn HirDatabase, name: NameHash, _: ()) -> Box<[(ItemKey, TraitId)]> {
+pub(crate) fn traits_with(
+    db: &dyn HirDatabase,
+    name: NameHash,
+    _: (),
+) -> Box<[(ItemKey, TraitId)]> {
     let mut found: Vec<_> = base_db::all_crates(db)
         .iter()
         .flat_map(|&krate| {
@@ -512,10 +510,10 @@ fn scope_names(db: &dyn HirDatabase, owner: ScopeOwner, _: ()) -> Box<[(NameHash
                 .fields()
                 .iter()
                 .map(|(field, data)| {
-                    let visibility = *visibilities.get(field).expect("every field has a visibility");
+                    let visibility = visibilities.get(field).expect("every field has a visibility");
                     let entry = ScopeEntry::Field {
                         position: u32::from(field.into_raw()),
-                        visibility: vis(db, visibility),
+                        visibility: vis(db, *visibility),
                     };
                     (key::name_hash(data.name.as_str()), entry)
                 })
@@ -609,7 +607,7 @@ fn module_names(db: &dyn HirDatabase, module: ModuleId) -> Vec<(NameHash, ScopeE
         .collect()
 }
 
-pub(crate) fn target(db: &dyn HirDatabase, def: ModuleDefId) -> Target {
+fn target(db: &dyn HirDatabase, def: ModuleDefId) -> Target {
     let item = |id| Target::Item(key::item_key(db, id));
     match def {
         ModuleDefId::ModuleId(it) => Target::Item(key::module_key(db, it)),

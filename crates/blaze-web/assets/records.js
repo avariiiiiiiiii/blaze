@@ -84,7 +84,7 @@ const how = (v, path) => enumOf(v, path, { Compiled: { ns: num }, Unit: null, Un
 const fn = (v, path) => struct(v, path, { id: u32, key: u64, krate: text, name: text, calls: array(u32), how });
 const nodeState = (v, path) => enumOf(v, path, {
   Waiting: null, Ready: null, Running: null, Built: null,
-  Cached: { remote: bool }, Failed: { why: text }, Skipped: { because: u32 },
+  Cached: { remote: bool }, Failed: { why: text }, Skipped: { because: u32 }, Cancelled: null,
 });
 const cache = (v, path) => struct(v, path, { found: num, fetched: num, compiled: num, cold: option(text) });
 const slow = (v, path) => struct(v, path, { krate: text, name: text, ns: num });

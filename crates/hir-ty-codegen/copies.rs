@@ -29,9 +29,18 @@ pub(super) fn lower_small(func: &mut ir::Function) -> bool {
             else {
                 continue;
             };
-            let overlap = match cursor.func.dfg.ext_funcs[func_ref].name {
-                ir::ExternalName::LibCall(ir::LibCall::Memcpy) => false,
-                ir::ExternalName::LibCall(ir::LibCall::Memmove) => true,
+            let callee = &mut cursor.func.dfg.ext_funcs[func_ref];
+            let ir::ExternalName::LibCall(
+                call @ (ir::LibCall::Memcpy | ir::LibCall::Memmove | ir::LibCall::Memset),
+            ) = callee.name
+            else {
+                continue;
+            };
+            // Called in place, as every other function is (`Recorder::declare_func_in_func`).
+            callee.colocated = true;
+            let overlap = match call {
+                ir::LibCall::Memcpy => false,
+                ir::LibCall::Memmove => true,
                 _ => continue,
             };
             let &[to, from, size] = cursor.func.dfg.inst_args(inst) else { continue };
@@ -40,14 +49,14 @@ pub(super) fn lower_small(func: &mut ir::Function) -> bool {
                 continue;
             }
             let chunks = chunks(size as u32);
-            let mut loaded = Vec::with_capacity(chunks.len());
-            for (i, &(at, ty)) in chunks.iter().enumerate() {
+            // What `memmove` copies may overlap where it goes: every byte is read first.
+            let mut loaded = Vec::new();
+            for &(at, ty) in &chunks {
                 let value = cursor.ins().load(ty, super::MEM, from, at);
                 if overlap {
                     loaded.push(value);
                 } else {
                     cursor.ins().store(super::MEM, value, to, at);
-                    debug_assert!(loaded.len() <= i);
                 }
             }
             for (&(at, _), value) in chunks.iter().zip(loaded) {

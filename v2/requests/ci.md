@@ -2,7 +2,7 @@
 
 ## 1. `crates/blaze-api/src/lib.rs`: the agent API's missing calls (schema 4)
 
-Why: the brief and docs/v2/ci.md (#277) name calls step 0's `Request` lacks: open a view, what
+Why: the brief and docs/v2/plan/lanes/ci.md (#277) name calls step 0's `Request` lacks: open a view, what
 an edit reaches, best-of-N, the production oracle, snapshots; and diagnostics "with their
 facts". The types these name (`FactRead`, `Reach`, `ReachedItem`, `Ranked`, `Mismatch`) are
 already in `lib.rs` (new public items, mine). Only the variants, the field and the number are
@@ -105,7 +105,27 @@ symlinked file, needs `Op::Write` to carry a mode (lane vfs).
 Done by the coordinator (lane vfs): `blaze_vfs::Mode` is on `Op::Write` and `File`, and
 hashed into the tree as git's code. The checkout writes each file with its mode, a symlink as
 its target, and a mode-only change as a write; only submodules are refused. Item 4: the vfs
-arena is the one (`docs/v2/crates.md`); db drops its own, then `Opened` loses its field.
+arena is the one (`docs/v2/plan/reference/crates.md`); db drops its own, then `Opened` loses its field.
 
 ---
-Applied by the coordinator, 16:46.
+Applied by the coordinator, 16:46 (items 2, 3, 5). Item 1's `SCHEMA` was bumped but its
+variants and `Diagnostic::facts` were not; lane ci added them in `lib.rs` (its own file).
+
+## 6. Applied by ci in its own crates (for the other lanes to know)
+
+- `blaze-api` is at schema 5: cargo's request 3 (`Targets.cargo`, `Response::Built.profile`,
+  `Unit`, `BuildScript`, the cargo-shaped `Artifact`, `Diagnostic.rendered`/`unit`, rustc's
+  span fields) and proof's items 1, 2, 3 and 8 (`Response::Work`, `Request::CodegenInputs`,
+  `Trace`, `Tables`). Proof's item 7 is the `Targets.cargo` docs: `--keep-going`, one
+  `Built` per checked unit. The daemon's `blaze_api::build::Builder` reports all of these.
+- `blaze-protocol`: core-plane's request 1, `NodeState::Cancelled` (unit, settled), drawn
+  as a skip by `blaze-ui` and decoded by `blaze-web`. `Plane::add` counts a dependency in a
+  state it doesn't list as waiting; when the plane moves to `Cancelled` it must skip such a
+  node instead.
+
+## 7. `crates/blaze-query`: open and why by the VFS view (lane db)
+
+- `Database::open` takes the `blaze_vfs::ViewId` the VFS gave (decisions.md: one arena);
+  then `build::Opened.queries` goes and the session keeps one id per view.
+- `Database::why` takes the view's root as well as the key, so why-did-this-rerun answers
+  for a view that is no longer open. The session answers `Why` today only for open views.

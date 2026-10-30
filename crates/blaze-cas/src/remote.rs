@@ -1,4 +1,4 @@
-//! The remote tier (docs/v2/store.md section 8, "Remote"): a machine outside the pool (a laptop)
+//! The remote tier (docs/v2/plan/lanes/store.md section 8, "Remote"): a machine outside the pool (a laptop)
 //! reads values from the store of a project's VM daemon, read-through. It is never on the VM's
 //! hot path. [`Server`] runs in the VM's daemon and answers from its [`Store`]; [`Client`] runs
 //! on the laptop as the store's [`Remote`]. Both are sans-IO: they push [`Effect`]s and take
@@ -210,7 +210,7 @@ fn write_value(out: &mut Vec<u8>, key: &Key, kind: Kind, content: &ContentId, by
     out.push(kind.code());
     out.extend_from_slice(&content.0);
     out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
+    crate::copy::append(out, bytes);
 }
 
 fn write_ask(out: &mut Vec<u8>, key: &Key) {

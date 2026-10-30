@@ -1,12 +1,12 @@
 //! Folding functions that differ only in constants (#1292), after Relax's `merge_similar`.
 //!
 //! Monomorphic copies of one generic body are often the same IR except for a few constants:
-//! element sizes, alignments, the addresses of the functions and statics they name. A backend
-//! gives each prepared function with those constants masked ([`Masked`]); [`groups`] puts
-//! together the functions whose masked IR and settings are equal, and a group whose members
-//! differ in few enough constants, and save more than their thunks cost, becomes one body
-//! that takes the differing constants as trailing parameters, with each member a thunk that
-//! calls it with its own ([`Merged`]).
+//! element sizes, alignments, the addresses of the functions, statics and vtables they name.
+//! A backend gives each prepared function with those constants masked ([`Masked`]);
+//! [`groups`] puts together the functions whose masked IR and settings are equal, and a group
+//! whose members differ in few enough constants, and save more than their thunks cost,
+//! becomes one body that takes the differing constants as trailing parameters, with each
+//! member a thunk that calls it with its own ([`Merged`]).
 //!
 //! Every member becomes a thunk: callers name members by their keys and are never rewritten,
 //! so a member's address, key and signature stay what they were.
@@ -32,6 +32,10 @@ pub enum Constant {
     /// The address of the `n`th of the function's references (a function or a static): whether
     /// two members' are equal is whether their targets are, not their places.
     Place(u32),
+    /// The address of one of the function's own data objects (a vtable, a type's info, a
+    /// constant), by its content with what it points at by target. A varying one is made by
+    /// each thunk, which then has the member's object among its data.
+    Data(ContentId),
 }
 
 /// A prepared function's IR with its constants masked: what [`groups`] compares.
@@ -135,7 +139,8 @@ impl Default for Limits {
 /// only places whose targets are equal for every member, the varying ones being parameters).
 /// Thunk `i`'s key is `group.members[i]`; its references are [`Group::thunk_refs`] of member
 /// `i`'s: its own, then [`Target::Direct`] of the body. The driver makes their templates
-/// against exactly those.
+/// against exactly those. A thunk's data are the member's objects of the varying
+/// [`Constant::Data`]; the body's, the objects equal for every member.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Merged {
     pub body: Emitted,
@@ -169,6 +174,7 @@ fn cell_into(hasher: &mut Hasher, cell: &Cell) {
         Cell::Value(Constant::F32(bits)) => hasher.update(&[1]).update(&bits.to_le_bytes()),
         Cell::Value(Constant::F64(bits)) => hasher.update(&[2]).update(&bits.to_le_bytes()),
         Cell::Value(Constant::Place(at)) => hasher.update(&[3]).update(&at.to_le_bytes()),
+        Cell::Value(Constant::Data(id)) => hasher.update(&[6]).id(&id),
         Cell::Target(id) => hasher.update(&[4]).id(&id),
     };
 }
@@ -180,6 +186,7 @@ fn kind(constant: &Constant) -> [u8; 2] {
         Constant::F32(_) => [1, 0],
         Constant::F64(_) => [2, 0],
         Constant::Place(_) => [3, 0],
+        Constant::Data(_) => [4, 0],
     }
 }
 
@@ -392,6 +399,21 @@ mod tests {
         assert_eq!(groups_other[0].varying, vec![0, 2]);
         assert_eq!(groups_other[0].constants[1], vec![int(4), Constant::Place(0)]);
         assert_ne!(groups_same[0].key(), groups_other[0].key());
+    }
+
+    #[test]
+    fn a_data_object_varies_by_content() {
+        let vtable = |n| {
+            let mut it = grow(8, 8);
+            it.constants.push(Constant::Data(ContentId([n; 32])));
+            it
+        };
+        let items = [(key(1), vtable(1), refs(9, 10)), (key(2), vtable(2), refs(9, 10))];
+        let group = &groups(&of(&items), &Limits::default())[0];
+        assert_eq!(group.varying, vec![4]);
+        assert_eq!(group.constants[1], vec![Constant::Data(ContentId([2; 32]))]);
+        let items = [(key(1), vtable(1), refs(9, 10)), (key(2), vtable(1), refs(9, 10))];
+        assert!(groups(&of(&items), &Limits::default()).is_empty());
     }
 
     #[test]

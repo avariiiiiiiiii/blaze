@@ -1,4 +1,4 @@
-//! What a task is expected to hold, for the plane's memory admission (docs/v2/core.md section 4).
+//! What a task is expected to hold, for the plane's memory admission (docs/v2/plan/lanes/core.md section 4).
 //!
 //! Every task runs in a bump arena of its own, so what it held at most is measured, not
 //! guessed. [`Estimates`] keeps, for each kind of task (a query kind), what tasks of it held,

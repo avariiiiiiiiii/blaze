@@ -1,5 +1,5 @@
 //! The daemon image: every memo of the database in one file, mapped at start and read in
-//! place, so a start is an mmap that pages in only what it touches (docs/v2/db.md section 7).
+//! place, so a start is an mmap that pages in only what it touches (docs/v2/plan/lanes/db.md section 7).
 //!
 //! Layout, little-endian, every section at a 16-byte boundary:
 //!

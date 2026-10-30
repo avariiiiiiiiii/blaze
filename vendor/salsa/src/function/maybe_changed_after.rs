@@ -247,7 +247,7 @@ where
 
                 // An evicted value with a value fingerprint is computed again and backdated
                 // when its fingerprint is the kept one. Without one it can't be compared.
-                if old_memo.value.is_none() && !old_memo.header.revisions.fingerprint.is_value() {
+                if old_memo.value.is_none() && !old_memo.header.revisions.value_fingerprint().is_value() {
                     return Some(VerifyResult::changed());
                 }
 
@@ -678,7 +678,7 @@ fn unchanged_by_fingerprint(
     (header.verified_at.load() == zalsa.current_revision()
         && !header.may_be_provisional()
         && revisions.durability >= reader.durability
-        && revisions.fingerprint == saw)
+        && revisions.value_fingerprint() == saw)
         .then(|| VerifyResult::unchanged_for_memo(revisions))
 }
 

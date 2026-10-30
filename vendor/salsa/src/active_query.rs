@@ -145,7 +145,9 @@ impl ActiveQuery {
             if inserted && fingerprint.is_value() {
                 self.edge_fingerprints.push(EdgeFingerprint {
                     edge: u32::try_from(edge)
-                        .expect("exceeded more than `u32::MAX` query edges; this should never happen"),
+                        .ok()
+                        .filter(|&edge| edge != EdgeFingerprint::VALUE)
+                        .expect("exceeded `u32::MAX - 1` query edges; this should never happen"),
                     fingerprint,
                 });
             }
@@ -518,8 +520,7 @@ impl QueryCompletion {
                 #[cfg(feature = "accumulator")]
                 accumulated_inputs: self.accumulated_inputs,
                 verified_final: AtomicBool::new(self.verified_final),
-                fingerprint: Fingerprint::NONE,
-                edge_fingerprints: self.edge_fingerprints,
+                fingerprints: self.edge_fingerprints,
             },
             stale_tracked_structs: self.stale_tracked_structs,
         }

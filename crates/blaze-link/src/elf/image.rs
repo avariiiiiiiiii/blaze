@@ -54,6 +54,8 @@ pub(crate) fn section_name(class: &Class) -> Cow<'_, str> {
         Class::Plt => ".plt",
         Class::Veneers => ".blaze.veneers",
         Class::Rodata => ".rodata",
+        Class::RelRo => ".data.rel.ro",
+        Class::ThreadVars => ".blaze.thread_vars",
         Class::EhFrame => ".eh_frame",
         Class::Data => ".data",
         Class::Table => ".blaze.table",
@@ -65,7 +67,7 @@ pub(crate) fn section_name(class: &Class) -> Cow<'_, str> {
         Class::Tdata => ".tdata",
         Class::Tbss => ".tbss",
         Class::Bss => ".bss",
-        Class::Synthetic(name) => name,
+        Class::Synthetic(name) => *name,
     })
 }
 
@@ -284,7 +286,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         .fold(plan.headers, u64::max)
         .next_multiple_of(8);
     let mut bytes = Vec::new();
-    let mut put = |bytes: &mut Vec<u8>, align: usize, data: &[u8]| {
+    let put = |bytes: &mut Vec<u8>, align: usize, data: &[u8]| {
         bytes.align(align);
         let offset = tail + bytes.len() as u64;
         bytes.extend_from_slice(data);
@@ -379,7 +381,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     for phdr in &phdrs {
         head.u32(phdr.p_type);
         head.u32(phdr.flags);
-        head.u64(phdr.vaddr - plan.base);
+        head.u64(phdr.vaddr.saturating_sub(plan.base));
         head.u64(phdr.vaddr);
         head.u64(phdr.vaddr);
         head.u64(phdr.filesz);

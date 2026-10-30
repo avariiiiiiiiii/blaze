@@ -1,4 +1,4 @@
-//! Code dedupe (docs/v2/items.md section 6.4): functions of a build that run the same
+//! Code dedupe (docs/v2/plan/lanes/items.md section 6.4): functions of a build that run the same
 //! instructions against the same addresses are one function.
 //!
 //! Functions are grouped by [`code_id`]; each group's least key is kept and callers'

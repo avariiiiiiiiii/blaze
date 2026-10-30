@@ -1,12 +1,13 @@
-//! What each request does (docs/v2/ci.md, #277): a state machine over the VFS, the database and
+//! What each request does (docs/v2/plan/lanes/ci.md, #277): a state machine over the VFS, the database and
 //! the [`Builder`], with no IO, clock or threads.
 //!
 //! Every request ends with exactly one [`Response::Done`], after a [`Response::Error`] naming
 //! what and where when it failed. A request that needs the build runs as jobs ([`JobId`], one
 //! per candidate of a best-of-N) whose reports are forwarded under the request's id; the views a
-//! job builds stay open in both the VFS and the database until it finishes. A commit is
-//! answered once its ticket is durable. A connection that is gone has its requests cancelled
-//! and its views closed, and nothing more is sent to it.
+//! job builds stay open in both the VFS and the database until it finishes, and the database's
+//! view of the last incremental build of each of the latest [`KEPT`] roots stays open after,
+//! for [`Request::Why`]. A commit is answered once its ticket is durable. A connection that is
+//! gone has its requests cancelled and its views closed, and nothing more is sent to it.
 //!
 //! The daemon flushes the VFS ([`blaze_vfs::Vfs::flush`]) after each call, so what a call
 //! committed is on its way to durability when the call returns.
@@ -15,7 +16,7 @@ mod best_of;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use blaze_core::Conn;
 use rustc_hash::FxHashMap;
@@ -58,7 +59,13 @@ pub struct Session {
     tickets: FxHashMap<Ticket, u64>,
     /// The views each connection opened with [`Request::Open`], by root, one per open.
     held: BTreeMap<Conn, BTreeMap<ContentId, Vec<ViewId>>>,
+    /// The database's view of the last job that ended on each of the latest [`KEPT`] roots,
+    /// oldest first: what [`Request::Why`] reads, since a view's reruns are its own.
+    kept: VecDeque<(ContentId, ViewId)>,
 }
+
+/// How many roots' last builds [`Session`] keeps for [`Request::Why`].
+pub const KEPT: usize = 64;
 
 struct Pending {
     sink: Sink,
@@ -83,8 +90,9 @@ impl Sink {
 
 enum Kind {
     Commit { root: ContentId, rebased: bool, ticket: Ticket, head: String },
-    /// One job of the build, with the views it holds.
-    Job { job: JobId, cancelled: bool, views: Vec<Opened> },
+    /// One job of the build, with the views it holds, and the one whose database view is kept
+    /// for [`Request::Why`] when it ends.
+    Job { job: JobId, cancelled: bool, views: Vec<Opened>, kept: Option<Opened> },
     BestOf(BestOf),
 }
 
@@ -127,6 +135,7 @@ impl Session {
             jobs: FxHashMap::default(),
             tickets: FxHashMap::default(),
             held: BTreeMap::new(),
+            kept: VecDeque::new(),
         }
     }
 
@@ -191,8 +200,13 @@ impl Session {
         let over = match (&mut pending.what, candidate) {
             (Kind::BestOf(best), Some(candidate)) => {
                 let ran = error.is_none();
-                if let Some(opened) = best.finish(candidate, ok, ran) {
-                    close(cx, opened);
+                match best.finish(candidate, ok, ran) {
+                    Some(opened) if ran => {
+                        cx.vfs.close(opened.files);
+                        keep(&mut self.kept, cx.db, opened);
+                    }
+                    Some(opened) => close(cx, opened),
+                    None => {}
                 }
                 if let Some(error) = error {
                     sink.send(out, of(candidate, Response::Error(error)));
@@ -206,9 +220,14 @@ impl Session {
                     false
                 }
             }
-            (Kind::Job { views, .. }, None) => {
+            (Kind::Job { views, kept, .. }, None) => {
                 for opened in views.drain(..) {
-                    close(cx, opened);
+                    if error.is_none() && *kept == Some(opened) {
+                        cx.vfs.close(opened.files);
+                        keep(&mut self.kept, cx.db, opened);
+                    } else {
+                        close(cx, opened);
+                    }
                 }
                 if let Some(error) = error {
                     sink.send(out, Response::Error(error));
@@ -247,8 +266,10 @@ impl Session {
     ) -> Result<(), ApiError> {
         match request {
             Request::Commit { head, base, ops } => {
-                let commit =
-                    cx.vfs.commit(&head, base, &ops).map_err(|error| commit_error(&head, base, &error))?;
+                let commit = cx
+                    .vfs
+                    .commit(&head, base, &ops)
+                    .map_err(|error| commit_error(&head, base, &error))?;
                 let serial = self.begin(
                     req,
                     Kind::Commit {
@@ -271,6 +292,11 @@ impl Session {
             Request::Verify { view, targets } => {
                 self.build(cx, req, &view, Work::Verify(targets))?
             }
+            Request::CodegenInputs { view, targets } => {
+                self.build(cx, req, &view, Work::CodegenInputs(targets))?
+            }
+            Request::Trace { view, targets } => self.build(cx, req, &view, Work::Trace(targets))?,
+            Request::Tables { view } => self.build(cx, req, &view, Work::Tables)?,
             Request::Reach { from, to, targets } => {
                 let from = resolve(cx.vfs, &from)?;
                 let to = resolve(cx.vfs, &to)?;
@@ -341,10 +367,16 @@ impl Session {
             }
             Request::Why { view, query } => {
                 let root = resolve(cx.vfs, &view)?;
-                let queries = cx.db.open(View { root });
-                let why = cx.db.why(queries, &query);
-                cx.db.close(queries);
-                let Some(why) = why else {
+                let Some(&(_, queries)) = self.kept.iter().find(|(kept, _)| *kept == root) else {
+                    return Err(ApiError::new(
+                        format!(
+                            "no build of {root:x} has ended among the latest {KEPT} roots built: \
+                             build it, then ask why"
+                        ),
+                        Some(format!("root {root:x}")),
+                    ));
+                };
+                let Some(why) = cx.db.why(queries, &query) else {
                     return Err(ApiError::new(
                         format!("{} did not rerun in the last build of {root:x}", query_name(&query)),
                         Some(query_name(&query)),
@@ -436,7 +468,8 @@ impl Session {
         work: Work,
     ) {
         let job = self.job();
-        let serial = self.begin(req, Kind::Job { job, cancelled: false, views });
+        let kept = view.filter(|_| incremental(&work));
+        let serial = self.begin(req, Kind::Job { job, cancelled: false, views, kept });
         self.jobs.insert(job, (serial, None));
         cx.builder.start(job, view, work);
     }
@@ -546,6 +579,35 @@ fn close(cx: &mut Daemon<'_>, opened: Opened) {
     cx.db.close(opened.queries);
 }
 
+/// Whether `work` runs the view's queries incrementally, so their reruns answer
+/// [`Request::Why`]: a reach builds nothing, a verify builds from nothing, tables only count.
+fn incremental(work: &Work) -> bool {
+    match work {
+        Work::Check(_)
+        | Work::Build(_)
+        | Work::Test { .. }
+        | Work::Run { .. }
+        | Work::CodegenInputs(_)
+        | Work::Trace(_) => true,
+        Work::Reach { .. } | Work::Verify(_) | Work::Snapshot | Work::Tables => false,
+    }
+}
+
+/// `opened`'s database view kept as its root's last build, closing the one it replaces and,
+/// past [`KEPT`] roots, the oldest.
+fn keep(kept: &mut VecDeque<(ContentId, ViewId)>, db: &blaze_query::Database, opened: Opened) {
+    let root = opened.view.root;
+    if let Some(at) = kept.iter().position(|(it, _)| *it == root) {
+        let (_, old) = kept.remove(at).expect("a kept root");
+        db.close(old);
+    }
+    if kept.len() == KEPT {
+        let (_, oldest) = kept.pop_front().expect("KEPT roots are kept");
+        db.close(oldest);
+    }
+    kept.push_back((root, opened.queries));
+}
+
 fn open_error(root: ContentId, error: &CommitError) -> ApiError {
     ApiError::new(format!("opening {root:x}: {error}"), Some(format!("root {root:x}")))
 }
@@ -577,7 +639,8 @@ fn op_path(error: &OpError) -> &str {
         | OpError::IsADirectory(path)
         | OpError::NotADirectory(path)
         | OpError::Exists(path)
-        | OpError::OutOfRange { path, .. } => path,
+        | OpError::OutOfRange { path, .. }
+        | OpError::BadLink { path, .. } => path,
     }
 }
 

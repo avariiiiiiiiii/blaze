@@ -850,18 +850,24 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Err(why) => out.errors.push(why),
             }
         }
-        // What only this build knows of a function: whether anything outside it calls it, or
+        // What only this build knows of a function: whether code outside it calls it, or
         // anything without a summary (another phase's unit, a static's value) refers to it.
         for (name, summary) in &mut summaries {
             summary.key = *name;
-            summary.external |= by_name[name].node.external();
         }
-        let outside = nodes
+        let outside: BTreeSet<InstanceKey> = jobs
             .iter()
-            .filter(|(key, _)| !by_name.contains_key(*key))
-            .flat_map(|(_, node)| node.refs.iter().filter_map(callee))
-            .chain(self.static_callees.iter().copied());
-        imports::called_from_outside(&mut summaries, outside);
+            .filter(|job| job.node.external())
+            .map(|job| job.name)
+            .chain(
+                nodes
+                    .iter()
+                    .filter(|(key, _)| !by_name.contains_key(*key))
+                    .flat_map(|(_, node)| node.refs.iter().filter_map(callee)),
+            )
+            .chain(self.static_callees.iter().copied())
+            .collect();
+        imports::close(&mut summaries, &outside);
         let decided = match imports::decide(&summaries, &imports::Limits::default()) {
             Ok(it) => it,
             Err(why) => {

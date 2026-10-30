@@ -6,20 +6,23 @@
 //! value, block, signature, stack slot, pool constant, function and global value numbered by
 //! its first use, so two functions built alike are equal whatever their entities' numbers.
 //! `iconst`, `f32const` and `f64const` print their immediate as its index among the
-//! constants, and a function or global value named by a place prints the place's index there.
+//! constants, and so does every named function and global value: one named by a place, and a
+//! data object of the function's own (a vtable, a type's info, a constant), which is told by
+//! its content with what it points at by target.
 //!
 //! The merged body is the first member's IR with each varying constant read from a trailing
 //! parameter: an immediate's uses read the parameter, a varying function is called through
-//! it (`call_indirect`) and its address is the parameter, a varying static's address is the
-//! parameter. Each thunk has its member's signature and calls the body with its arguments and
-//! its constants: a plain call and return, as Cranelift tail-calls only under `tail`, which
-//! no member is.
+//! it (`call_indirect`) and its address is the parameter, a varying static's or data object's
+//! address is the parameter. Each thunk has its member's signature and calls the body with
+//! its arguments and its constants: a plain call and return, as Cranelift tail-calls only
+//! under `tail`, which no member is.
 
 use std::collections::HashMap;
 
 use blaze_codegen::{
     CodegenError, Unit,
     backend::Emitted,
+    content::target_id,
     fold::{Constant, Group, Masked, Merged},
     settings::Spec,
     template::Refs,
@@ -42,21 +45,20 @@ pub(crate) const BODY: u32 = u32::MAX - 1;
 pub(crate) enum Name {
     /// The `n`th of the instance's references: a function or a static.
     Place(u32),
-    /// Anything else, by what it is: a data object by its bytes and what it points at, a
-    /// position by its span. Equal for two functions only when it is the same thing in both.
-    Fixed(ContentId),
+    /// A data object of its own, a position or a text, by content: its bytes, and what it
+    /// points at by target. Equal for two functions only when it is the same object in both.
+    Data(ContentId),
 }
 
-/// The constants of a prepared Cranelift function masked, for
+/// The constants of a prepared Cranelift function, prepared against `refs`, masked for
 /// [`blaze_codegen::fold::groups`]. `None` for one that can't take parameters: an assembly
-/// function, one without a body or with a dynamic stack slot, one naming a static by a place
-/// that is the base of another global value or a patchable callee by a place, and one with
-/// data whose content can't be told without the build's targets (data of its own that points
-/// at a function or static, or is not shared by content). A C-variadic function, and one
-/// whose address is significant ([`blaze_codegen::backend::Address::Significant`]), are the
-/// caller's to leave out.
-pub(crate) fn masked(function: &Function) -> Option<Masked> {
-    masked_ir(function.ir()?, &|it| name(function, it))
+/// function, one without a body or with a dynamic stack slot, one whose global value has
+/// a named symbol for its base, one naming a patchable callee, and one with data whose
+/// content isn't final (a `TypeId` still to be written) or that is not shared by content. A
+/// C-variadic function, and one whose address is significant
+/// ([`blaze_codegen::backend::Address::Significant`]), are the caller's to leave out.
+pub(crate) fn masked(function: &Function, refs: &Refs) -> Option<Masked> {
+    masked_ir(function.ir()?, &|it| name(function, refs, it))
 }
 
 /// [`masked`] of `func`, whose names `names` says.
@@ -71,18 +73,30 @@ const FOLD_DATA_DOMAIN: &str = "blaze v2 fold data 1";
 
 /// What a name of `function`'s IR is: namespace 0 its function requests, 1 its data
 /// requests. `None` for a callee still to be inlined, and for data [`masked`] refuses.
-pub(crate) fn name(function: &Function, name: ir::UserExternalName) -> Option<Name> {
+pub(crate) fn name(
+    function: &Function,
+    refs: &Refs,
+    name: ir::UserExternalName,
+) -> Option<Name> {
+    let index = name.index as usize;
     match name.namespace {
-        0 => function.places.funcs.get(name.index as usize).map(|&it| Name::Place(it)),
-        1 => data(function, name.index as usize),
+        0 => function.places.funcs.get(index).map(|&it| Name::Place(it)),
+        1 => match function.places.datas.get(index)? {
+            DataPlace::Place(place) => Some(Name::Place(*place)),
+            _ => data(function, refs, index).map(Name::Data),
+        },
         _ => None,
     }
 }
 
-fn data(function: &Function, index: usize) -> Option<Name> {
+/// A data request's content: what it points at by target, so equal IDs in two functions are
+/// one object whatever their places.
+fn data(function: &Function, refs: &Refs, index: usize) -> Option<ContentId> {
     let mut hasher = Hasher::new(FOLD_DATA_DOMAIN);
     match function.places.datas.get(index)? {
-        DataPlace::Place(place) => return Some(Name::Place(*place)),
+        DataPlace::Place(place) => {
+            hasher.update(&[3]).id(&target_id(refs.get(*place as usize)?));
+        }
         DataPlace::Position(span) => {
             hasher.update(&[0]).id(&span.anchor).update(&span.index.to_le_bytes());
         }
@@ -95,9 +109,8 @@ fn data(function: &Function, index: usize) -> Option<Name> {
             else {
                 return None;
             };
-            // A function's or static's address in it is a place, which is another target in
-            // another member; a `TypeId`'s bytes are not written yet.
-            if !blob.fn_relocs.is_empty() || !blob.type_ids.is_empty() {
+            // A `TypeId`'s bytes are not written yet.
+            if !blob.type_ids.is_empty() {
                 return None;
             }
             hasher.update(&[2]).update(&blob.align.to_le_bytes()).part(&blob.bytes);
@@ -108,12 +121,17 @@ fn data(function: &Function, index: usize) -> Option<Name> {
                 if target >= index {
                     return None;
                 }
-                let Name::Fixed(id) = data(function, target)? else { return None };
+                let id = data(function, refs, target)?;
                 hasher.update(&at.to_le_bytes()).id(&id).update(&addend.to_le_bytes());
+            }
+            hasher.update(&(blob.fn_relocs.len() as u64).to_le_bytes());
+            for &(at, func) in &blob.fn_relocs {
+                let place = *function.places.funcs.get(func.as_u32() as usize)?;
+                hasher.update(&at.to_le_bytes()).id(&target_id(refs.get(place as usize)?));
             }
         }
     }
-    Some(Name::Fixed(hasher.finish()))
+    Some(hasher.finish())
 }
 
 /// Where a masked constant is in the function.
@@ -303,13 +321,13 @@ impl Canon<'_> {
                         self.text.push_str(&format!(" {offset} {colocated} {tls}"));
                     }
                     ir::GlobalValueData::Load { base, offset, global_type, flags } => {
-                        self.refused |= self.is_place(base);
+                        self.refused |= self.is_named(base);
                         self.text.push_str(&format!("load.{global_type} {flags} "));
                         self.entity(Kind::Global, base.as_u32());
                         self.text.push_str(&format!("{offset}"));
                     }
                     ir::GlobalValueData::IAddImm { base, offset, global_type } => {
-                        self.refused |= self.is_place(base);
+                        self.refused |= self.is_named(base);
                         self.text.push_str(&format!("iadd_imm.{global_type} "));
                         self.entity(Kind::Global, base.as_u32());
                         self.text.push_str(&format!(", {offset}"));
@@ -333,44 +351,39 @@ impl Canon<'_> {
         }
     }
 
-    /// Prints a function's or global value's name; whether it is a place, which is then a
-    /// constant.
+    /// Prints a function's or global value's name; whether it is a constant (a place or a
+    /// data object).
     fn name(&mut self, name: &ir::ExternalName, site: Site) -> bool {
         let ir::ExternalName::User(user) = name else {
             self.text.push_str(&name.display(None).to_string());
             return false;
         };
-        match (self.names)(self.func.params.user_named_funcs()[*user].clone()) {
-            Some(Name::Place(place)) => {
-                self.text.push_str(&format!("#{}", self.constants.len()));
-                self.constants.push(Constant::Place(place));
-                self.sites.push(site);
-                true
-            }
-            Some(Name::Fixed(id)) => {
-                self.text.push_str(&format!("={id}"));
-                false
-            }
+        let constant = match (self.names)(self.func.params.user_named_funcs()[*user].clone()) {
+            Some(Name::Place(place)) => Constant::Place(place),
+            Some(Name::Data(id)) => Constant::Data(id),
             None => {
                 self.refused = true;
-                false
+                return false;
             }
-        }
+        };
+        self.text.push_str(&format!("#{}", self.constants.len()));
+        self.constants.push(constant);
+        self.sites.push(site);
+        true
     }
 
-    fn is_place(&self, global: ir::GlobalValue) -> bool {
-        let ir::GlobalValueData::Symbol { name: ir::ExternalName::User(user), .. } =
-            &self.func.global_values[global]
-        else {
-            return false;
-        };
-        let name = self.func.params.user_named_funcs()[*user].clone();
-        matches!((self.names)(name), Some(Name::Place(_)))
+    /// Whether `global` is a symbol with a name: a constant, which can't be another global
+    /// value's base, as a parameter is no global value.
+    fn is_named(&self, global: ir::GlobalValue) -> bool {
+        matches!(
+            self.func.global_values[global],
+            ir::GlobalValueData::Symbol { name: ir::ExternalName::User(_), .. }
+        )
     }
 }
 
 /// A group's body and thunks, built and not compiled.
-pub(crate) struct Built {
+pub(crate) struct Folded {
     pub(crate) body: ir::Function,
     /// In the group's order.
     pub(crate) thunks: Vec<ir::Function>,
@@ -387,7 +400,7 @@ pub(crate) fn build(
     group: &Group,
     members: &[Member<'_>],
     pointer: ir::Type,
-) -> Result<Built, String> {
+) -> Result<Folded, String> {
     if members.is_empty()
         || members.len() != group.members.len()
         || members.len() != group.constants.len()
@@ -460,7 +473,7 @@ pub(crate) fn build(
             thunk(func, walk, group, constants, &reads, params, &body.signature, pointer)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(Built { body, thunks })
+    Ok(Folded { body, thunks })
 }
 
 fn body(
@@ -598,7 +611,7 @@ fn thunk(
                     patchable: false,
                 }))
             }
-            (Site::Global(global), Constant::Place(_)) => {
+            (Site::Global(global), Constant::Place(_) | Constant::Data(_)) => {
                 let ir::GlobalValueData::Symbol { ref name, offset, colocated, tls } =
                     member.global_values[global]
                 else {
@@ -670,7 +683,7 @@ pub(crate) fn merge(
     }
     let names: Vec<_> = members
         .iter()
-        .map(|&(_, _, prepared, _)| move |it: ir::UserExternalName| name(prepared, it))
+        .map(|&(_, _, prepared, refs)| move |it: ir::UserExternalName| name(prepared, refs, it))
         .collect();
     let mut sources: Vec<Member<'_>> = Vec::with_capacity(members.len());
     for (at, (&(_, _, prepared, refs), names)) in members.iter().zip(&names).enumerate() {
@@ -679,7 +692,7 @@ pub(crate) fn merge(
         };
         sources.push((func, names as &dyn Fn(ir::UserExternalName) -> Option<Name>, refs));
     }
-    let Built { body, thunks } = build(group, &sources, pointer).map_err(fail)?;
+    let Folded { body, thunks } = build(group, &sources, pointer).map_err(fail)?;
     let (unit, spec, prepared, refs) = members[0];
     let mut body = emit(unit, spec, prepared, body, refs)?;
     body.function.key = group.key();
@@ -715,7 +728,7 @@ mod tests {
     fn names(name: ir::UserExternalName) -> Option<Name> {
         match name.namespace {
             0 => Some(Name::Place(name.index)),
-            1 => Some(Name::Fixed(ContentId([name.index as u8; 32]))),
+            1 => Some(Name::Data(ContentId([name.index as u8; 32]))),
             _ => None,
         }
     }
@@ -728,10 +741,15 @@ mod tests {
     }
 
     /// `Vec<T>::grow`-like: multiplies its argument by `T`'s size, calls place `callee` with
-    /// it, adds that function's address, a static's (place `stat`) and a data object's.
+    /// it, adds that function's address, a static's (place `stat`) and data object 7's.
     /// `shuffled` declares an unused signature and name first and builds the constant last,
     /// so its entities have other numbers.
     fn grow(size: i64, callee: u32, stat: u32, shuffled: bool) -> ir::Function {
+        grow_with(size, callee, stat, 7, shuffled)
+    }
+
+    /// [`grow`] adding data object `data`'s address.
+    fn grow_with(size: i64, callee: u32, stat: u32, data: u32, shuffled: bool) -> ir::Function {
         let ptr = types::I64;
         let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), signature());
         if shuffled {
@@ -754,7 +772,7 @@ mod tests {
             colocated: true,
             tls: false,
         });
-        let name = user(&mut func, 1, 7);
+        let name = user(&mut func, 1, data);
         let data = func.create_global_value(ir::GlobalValueData::Symbol {
             name,
             offset: 0.into(),
@@ -793,6 +811,7 @@ mod tests {
             Constant::Int { bits: 64, value: 8 },
             Constant::Place(0),
             Constant::Place(1),
+            Constant::Data(ContentId([7; 32])),
         ]);
         assert_eq!(a.size, 10);
     }
@@ -858,7 +877,7 @@ mod tests {
         let group = &found[0];
         assert_eq!(group.varying, vec![0, 1]);
         let members: [Member<'_>; 2] = [(&a, &names, &refs_a[..]), (&b, &names, &refs_b[..])];
-        let Built { body, thunks } = build(group, &members, pointer).unwrap();
+        let Folded { body, thunks } = build(group, &members, pointer).unwrap();
 
         let mut want = signature();
         want.params.push(AbiParam::new(types::I64));
@@ -873,7 +892,7 @@ mod tests {
         assert!(opcodes.contains(&Opcode::CallIndirect));
         assert!(!opcodes.contains(&Opcode::Call) && !opcodes.contains(&Opcode::FuncAddr));
         assert!(!opcodes.contains(&Opcode::Iconst));
-        // The static is equal for both: still named, not a parameter.
+        // The static and the data are equal for both: still named, not parameters.
         assert_eq!(opcodes.iter().filter(|&&it| it == Opcode::SymbolValue).count(), 2);
         verified(&body);
 
@@ -907,6 +926,51 @@ mod tests {
             verified(thunk);
         }
         assert_eq!(group.thunk_refs(&refs_b).last(), Some(&Target::Direct(group.key())));
+    }
+
+    #[test]
+    fn differing_data_is_made_by_the_thunks() {
+        let pointer = crate::target().unwrap().pointer_type();
+        // One body for two vtables: data objects 7 and 9.
+        let (a, b) = (grow_with(8, 0, 1, 7, false), grow_with(8, 0, 1, 9, true));
+        let refs = vec![Target::Function(key(10)), Target::Extern("STATIC".to_owned())];
+        let (ma, mb) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
+        let settings = Settings(ContentId([1; 32]));
+        let limits = Limits { thunk_size: 0, ..Limits::default() };
+        let found = groups(
+            &[(key(1), settings, &ma, &refs[..]), (key(2), settings, &mb, &refs[..])],
+            &limits,
+        );
+        let group = &found[0];
+        assert_eq!(group.varying, vec![3]);
+        assert_eq!(group.constants[1], vec![Constant::Data(ContentId([9; 32]))]);
+        let members: [Member<'_>; 2] = [(&a, &names, &refs[..]), (&b, &names, &refs[..])];
+        let Folded { body, thunks } = build(group, &members, pointer).unwrap();
+        assert_eq!(body.signature.params.last(), Some(&AbiParam::new(pointer)));
+        let symbols = body
+            .layout
+            .blocks()
+            .flat_map(|block| body.layout.block_insts(block))
+            .filter(|&inst| body.dfg.insts[inst].opcode() == Opcode::SymbolValue)
+            .count();
+        assert_eq!(symbols, 1);
+        verified(&body);
+        for (thunk, data) in thunks.iter().zip([7, 9]) {
+            let block = thunk.layout.entry_block().unwrap();
+            let first = thunk.layout.first_inst(block).unwrap();
+            let InstructionData::UnaryGlobalValue { opcode, global_value } = thunk.dfg.insts[first]
+            else {
+                panic!("the thunk makes the data's address")
+            };
+            assert_eq!(opcode, Opcode::SymbolValue);
+            let ir::GlobalValueData::Symbol { name: ir::ExternalName::User(name), .. } =
+                thunk.global_values[global_value]
+            else {
+                panic!("the data is named as the member names it")
+            };
+            assert_eq!(thunk.params.user_named_funcs()[name], ir::UserExternalName::new(1, data));
+            verified(thunk);
+        }
     }
 
     #[test]

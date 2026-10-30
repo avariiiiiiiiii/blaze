@@ -38,7 +38,7 @@ where
             database_key_index,
             revisions.durability,
             revisions.changed_at,
-            revisions.fingerprint,
+            revisions.value_fingerprint(),
             memo.header.cycle_heads(),
             #[cfg(feature = "accumulator")]
             revisions.accumulated().is_some(),
@@ -152,7 +152,7 @@ where
                     // still valid for the current revision.
                     return unsafe { Some(self.extend_memo_lifetime(old_memo)) };
                 }
-            } else if !old_memo.header.revisions.fingerprint.is_value()
+            } else if !old_memo.header.revisions.value_fingerprint().is_value()
                 && !old_memo.header.may_be_provisional()
             {
                 // An evicted value without a value fingerprint can only be backdated when the

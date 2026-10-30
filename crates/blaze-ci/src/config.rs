@@ -140,6 +140,7 @@ impl TargetsConfig {
             features: self.features.clone(),
             all_features: self.all_features,
             no_default_features: self.no_default_features,
+            cargo: None,
         }
     }
 }

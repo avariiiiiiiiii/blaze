@@ -9,8 +9,7 @@ use std::{
 
 use super::{Outcome, hook};
 use crate::patch::{
-    ARCH_AARCH64, ARCH_X86_64, Answer, DESCRIPTOR, DESCRIPTOR_VERSION, Descriptor,
-    FIRST_GENERATION, Message, Patch,
+    ARCH_AARCH64, ARCH_X86_64, Answer, DESCRIPTOR, DESCRIPTOR_VERSION, Descriptor, Message, Patch,
 };
 
 /// How many generations are kept to roll back to, as Relax keeps.
@@ -32,6 +31,8 @@ pub(crate) const HOST_ARCH: u32 = if cfg!(target_arch = "x86_64") {
 #[derive(Clone, Debug)]
 pub(crate) struct Layout {
     pub(crate) id: [u8; 16],
+    /// The generation the image was linked at.
+    pub(crate) generation: u64,
     pub(crate) slide: u64,
     /// The cell holding the current table's address.
     pub(crate) table: u64,
@@ -73,10 +74,14 @@ impl Layout {
         }
         let slide = at.wrapping_sub(descriptor.this);
         if !descriptor.table.wrapping_add(slide).is_multiple_of(8) {
-            return Err(format!("{DESCRIPTOR}'s table cell at {:#x} is not aligned", descriptor.table));
+            return Err(format!(
+                "{DESCRIPTOR}'s table cell at {:#x} is not aligned",
+                descriptor.table
+            ));
         }
         Ok(Layout {
             id: descriptor.id,
+            generation: descriptor.generation,
             slide,
             table: descriptor.table,
             slots: descriptor.slots,
@@ -179,13 +184,14 @@ impl<M: Memory> Switch<M> {
         if table == 0 || !table.is_multiple_of(8) {
             return Err(format!("the jump table cell at {cell:#x} holds {table:#x}"));
         }
+        let start = layout.generation;
         Ok(Switch {
             memory,
             layout,
-            current: FIRST_GENERATION,
+            current: start,
             kept: vec![Generation {
-                number: FIRST_GENERATION,
-                base: FIRST_GENERATION,
+                number: start,
+                base: start,
                 table: Table::Image(table),
                 code: Vec::new(),
             }],
@@ -196,10 +202,6 @@ impl<M: Memory> Switch<M> {
 
     pub(crate) fn current(&self) -> u64 {
         self.current
-    }
-
-    pub(crate) fn layout(&self) -> &Layout {
-        &self.layout
     }
 
     /// Takes one message: what became of it, and what to answer the linker, if anything.
@@ -289,8 +291,11 @@ impl<M: Memory> Switch<M> {
             return Err(format!("generation {} was applied already", patch.generation));
         }
         let layout = &self.layout;
-        let code_ranges: Vec<Range<u64>> =
-            patch.code.iter().map(|(at, bytes)| span(*at, bytes.len())).collect::<Result<_, _>>()?;
+        let code_ranges: Vec<Range<u64>> = patch
+            .code
+            .iter()
+            .map(|(at, bytes)| span(*at, bytes.len()))
+            .collect::<Result<_, _>>()?;
         for range in &code_ranges {
             if !inside(range, &layout.code) {
                 return Err(format!(
@@ -299,8 +304,11 @@ impl<M: Memory> Switch<M> {
                 ));
             }
         }
-        let data_ranges: Vec<Range<u64>> =
-            patch.data.iter().map(|(at, bytes)| span(*at, bytes.len())).collect::<Result<_, _>>()?;
+        let data_ranges: Vec<Range<u64>> = patch
+            .data
+            .iter()
+            .map(|(at, bytes)| span(*at, bytes.len()))
+            .collect::<Result<_, _>>()?;
         let cell = layout.table..layout.table + 8;
         for range in &data_ranges {
             if overlap(range, &layout.code) {
@@ -583,8 +591,9 @@ fn frames<M: Memory>(
     }
     let bytes = |at: u64, len: u64| find(code, at, len).or_else(|| find(data, at, len));
     let length = |at: u64| -> Result<u32, String> {
-        let field = bytes(at, 4)
-            .ok_or_else(|| format!("unwind entries reach {at:#x}, in none of the patch's writes"))?;
+        let field = bytes(at, 4).ok_or_else(|| {
+            format!("unwind entries reach {at:#x}, in none of the patch's writes")
+        })?;
         let mut value = [0; 4];
         value.copy_from_slice(field);
         Ok(u32::from_le_bytes(value))

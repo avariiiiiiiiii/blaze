@@ -1219,7 +1219,7 @@ impl PartialOrd for UpvarCapture {
 
 /// The inference of a body. Free functions rather than methods of a tracked impl, so that
 /// [`crate::evict`] can name them to drop their values.
-#[salsa::tracked(returns(ref), cycle_result = infer_cycle_result)]
+#[salsa::tracked(returns(ref), cycle_result = infer_cycle_result, lru = 0)]
 pub(crate) fn infer_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: DefWithBodyId,
@@ -1232,7 +1232,7 @@ pub(crate) fn infer_body_query<'db>(
 /// Returns an `InferenceResult` containing type information for array lengths,
 /// const generic arguments, and other const expressions appearing in type
 /// positions within the item's signature.
-#[salsa::tracked(returns(ref), cycle_result = infer_anon_const_cycle_result)]
+#[salsa::tracked(returns(ref), cycle_result = infer_anon_const_cycle_result, lru = 0)]
 pub(crate) fn infer_anon_const_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: AnonConstId<'db>,

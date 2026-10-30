@@ -1,5 +1,5 @@
 """corpus.py: real crates built, run and tested by blaze and by plain cargo with the pinned
-nightly, and what each program prints and how each test ends compared (docs/v2/proof.md,
+nightly, and what each program prints and how each test ends compared (docs/v2/plan/lanes/proof.md,
 "Differential against rustc").
 
     uv run --frozen python harness/v2/corpus.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/corpus.json"}'

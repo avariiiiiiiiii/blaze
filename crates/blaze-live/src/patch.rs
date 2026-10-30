@@ -14,14 +14,14 @@
 pub const DESCRIPTOR: &str = "__blaze_live";
 pub const DESCRIPTOR_MAGIC: [u8; 8] = *b"BLZLIVE2";
 /// The version of [`Descriptor`] this crate reads and writes.
-pub const DESCRIPTOR_VERSION: u32 = 1;
+pub const DESCRIPTOR_VERSION: u32 = 2;
 
 /// [`Descriptor::arch`] of x86-64 and of AArch64.
 pub const ARCH_X86_64: u32 = 0;
 pub const ARCH_AARCH64: u32 = 1;
 
-/// The generation of an image as it was linked: a program starts at it, and a commit of the
-/// image counts up from it.
+/// The generation of an image's first full link; each commit of the image counts up from it.
+/// A program starts at the generation its descriptor says ([`Descriptor::generation`]).
 pub const FIRST_GENERATION: u64 = 0;
 
 /// What the symbol `__blaze_live` of an image blaze-link made is: written by the linker in
@@ -35,10 +35,15 @@ pub struct Descriptor {
     /// 0 x86-64, 1 AArch64.
     pub arch: u32,
     pub id: [u8; 16],
+    /// The generation the image was linked at: the program starts there, and accepts a patch
+    /// whose `base` is the generation it is at.
+    pub generation: u64,
     pub this: u64,
     /// The cell holding the address of the current jump table (an array of `slots` code
     /// addresses, slid by the loader); every call through a slot loads this cell first.
     pub table: u64,
+    /// The table's capacity: every slot has its stub from the full link on, so a patch only
+    /// sets cells.
     pub slots: u64,
     /// `[start, end)` of the region new code is placed in, and of new data's.
     pub patch_code: [u64; 2],
@@ -49,7 +54,7 @@ pub struct Descriptor {
 
 impl Descriptor {
     /// Its encoded size, which is also its size in memory: every field is aligned as it is.
-    pub const SIZE: usize = 8 + 4 + 4 + 16 + 8 + 8 + 8 + 16 + 16 + 16;
+    pub const SIZE: usize = 8 + 4 + 4 + 16 + 8 + 8 + 8 + 8 + 16 + 16 + 16;
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Writer(Vec::with_capacity(Self::SIZE));
@@ -57,7 +62,7 @@ impl Descriptor {
         out.u32(self.version);
         out.u32(self.arch);
         out.0.extend_from_slice(&self.id);
-        for value in [self.this, self.table, self.slots]
+        for value in [self.generation, self.this, self.table, self.slots]
             .into_iter()
             .chain(self.patch_code)
             .chain(self.patch_data)
@@ -85,6 +90,7 @@ impl Descriptor {
             version,
             arch,
             id,
+            generation: next()?,
             this: next()?,
             table: next()?,
             slots: next()?,
@@ -124,9 +130,16 @@ pub struct Patch {
 pub enum Message {
     Patch(Patch),
     /// Back to the table of `to` (a generation the program applied or started at).
-    RollBack { id: [u8; 16], to: u64 },
+    RollBack {
+        id: [u8; 16],
+        to: u64,
+    },
     /// The edit can't be applied to a running program: start it again.
-    Restart { id: [u8; 16], generation: u64, why: String },
+    Restart {
+        id: [u8; 16],
+        generation: u64,
+        why: String,
+    },
 }
 
 const MESSAGE_MAGIC: [u8; 8] = *b"BLZLMSG2";
@@ -408,6 +421,7 @@ mod tests {
             version: DESCRIPTOR_VERSION,
             arch: ARCH_AARCH64,
             id: [0x5a; 16],
+            generation: 9,
             this: 0x1_0000_8000,
             table: 0x1_0004_0000,
             slots: 1234,

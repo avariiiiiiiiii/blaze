@@ -1,4 +1,4 @@
-//! blaze's sans-IO core (docs/v2/core.md section 3, docs/v2/plane.md).
+//! blaze's sans-IO core (docs/v2/plan/lanes/core.md section 3, docs/v2/plan/lanes/core/plane.md).
 //!
 //! A state machine of blaze's (the build's plane, a journal, the store's index) does no IO,
 //! reads no clock and starts no thread. It asks for IO by pushing [`Effect`]s, each with a
@@ -23,6 +23,8 @@ mod footprint;
 mod fs;
 #[cfg(target_os = "macos")]
 mod fsevents;
+#[cfg(windows)]
+pub mod iocp;
 #[cfg(target_os = "macos")]
 pub mod kqueue;
 #[cfg(unix)]
@@ -254,7 +256,7 @@ pub enum Sandbox {
 }
 
 /// What a sandboxed process read, recorded by its sandbox: its result is keyed by exactly
-/// these (docs/v2/usercode.md section 6.5), so the paths are as the process named them.
+/// these (docs/v2/plan/lanes/usercode.md section 6.5), so the paths are as the process named them.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Traced {
     /// Each file it opened to read, and the BLAKE3 hash of its bytes then; `None` for a file

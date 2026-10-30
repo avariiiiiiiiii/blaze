@@ -88,6 +88,60 @@ fn main() {
     });
 }
 
+/// A crate names the dependencies its paths look up in the extern prelude, at the level of
+/// items, in bodies and in what macros expand to, and those it names with `extern crate`:
+/// not one a false `#[cfg]` leaves out, a local of the same name, or one never written.
+#[test]
+fn a_crate_names_the_dependencies_rustc_loads_for_it() {
+    let db = fixture::db(
+        r#"
+//- /main.rs crate:main deps:imported,called,externed,mac,expanded,tokens,cfgd,value,unused
+use imported::Item;
+extern crate externed;
+#[cfg(any())]
+use cfgd as _;
+mac::make!();
+macro_rules! local {
+    () => { tokens::T };
+}
+fn f() -> u32 {
+    let value = called::g();
+    value
+}
+//- /imported.rs crate:imported
+pub struct Item;
+//- /called.rs crate:called
+pub fn g() -> u32 { 0 }
+//- /externed.rs crate:externed
+//- /mac.rs crate:mac
+#[macro_export]
+macro_rules! make {
+    () => { pub use expanded::E; };
+}
+//- /expanded.rs crate:expanded
+pub struct E;
+//- /tokens.rs crate:tokens
+//- /cfgd.rs crate:cfgd
+//- /value.rs crate:value
+//- /unused.rs crate:unused
+"#,
+    )
+    .into_db();
+    crate::attach_db(&db, || {
+        let krate = all_crates(&db)
+            .iter()
+            .map(|&it| crate::Crate::from(it))
+            .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))
+            .expect("the fixture's crate `main`");
+        let mut named: Vec<String> = crate::named_dependencies(&db, krate)
+            .into_iter()
+            .map(|it| it.display_name(&db).expect("a fixture's crate has a name").to_string())
+            .collect();
+        named.sort();
+        assert_eq!(named, ["called", "expanded", "externed", "imported", "mac", "tokens"]);
+    });
+}
+
 const MODULES: &str = r#"
 //- minicore: sized, copy
 //- /main.rs crate:main

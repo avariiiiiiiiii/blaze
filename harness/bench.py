@@ -55,7 +55,7 @@ The blaze of a backend is `BLAZE_BIN` (cranelift) or `BLAZE_LLVM_BIN` (llvm, a b
 `--features llvm`). A backend is a profile, as v2 picks it: `cranelift` builds the dev profile,
 `llvm` the release profile (`--release`), on both sides.
 """
-import glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
+import csv, glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
 import blaze_cli, memory, storelib
 from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, fetch, how_built, program_output, test_results, test_verdict, timed, wait_warm
@@ -234,9 +234,11 @@ PROJECTS = {
         test=["-p", "util"],
     ),
     # A browser engine. SpiderMonkey comes as mozjs's prebuilt archive; `--version` is answered
-    # before anything opens a window.
+    # before anything opens a window. servoprep.py takes stylo's build script out of the
+    # sandbox: it writes into the target directory. Measured only when named.
     "servo": dict(
         repo="servo/servo", tag="v0.7.0", rev="aac43a3f31a259f04a574f5ec4e959c943ad7cc7",
+        prepare="servoprep",
         build=["-p", "servoshell", "--bin", "servoshell"], run=["--version"],
         edits=dict(
             body=body("ports/servoshell/main.rs", "fn main() {"),
@@ -581,13 +583,20 @@ def cold_steps(text):
     return steps
 
 
-def thread_steps(text):
-    """What the daemon's threads spent on each step of compiling a function and on each of
-    the producer's, in seconds summed over the threads and the builds in `text`."""
+# The steps of compiling one function, as the profile's spans name them.
+COMPILE_STEPS = ("infer", "mir", "monomorphize", "translate", "describe", "store read", "store write")
+
+
+def thread_steps(text, profile=None):
+    """What the daemon's threads spent on each producer in `text`, and with the directory of a
+    build's profile (BLAZE_PROFILE) on each step of compiling a function: seconds summed
+    over the threads."""
     steps = {}
-    for line in re.findall(r"^steps: (.*)$", text, re.M):
-        for name, took in re.findall(r"([a-z ]+) ([0-9.]+(?:ns|µs|ms|s))(?:,|$)", line):
-            steps[name.strip()] = round(steps.get(name.strip(), 0) + seconds(took), 3)
+    phases = os.path.join(profile, "phases.tsv") if profile else None
+    if phases and os.path.exists(phases):
+        for row in csv.DictReader(open(phases), delimiter="\t"):
+            if row["phase"] in COMPILE_STEPS:
+                steps[row["phase"]] = round(float(row["wall_ms"]) / 1000, 3)
     for producer, took in re.findall(r"^backend: (\w+) compiled \d+ functions, \d+ bytes, (\S+) ", text, re.M):
         steps[producer] = round(steps.get(producer, 0) + seconds(took), 3)
     return steps

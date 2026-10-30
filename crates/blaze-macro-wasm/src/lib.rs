@@ -1436,7 +1436,9 @@ fn write_whole(path: &Path, bytes: &[u8]) {
 /// in `store`, and writes the list of its macros beside it, so that a load with the store
 /// compiles nothing and reads the list without running it.
 pub fn prepare(path: &Path, store: Option<&blaze_cas::Handle>) -> Result<(), String> {
-    let start = Instant::now();
+    let _span =
+        tracing::info_span!(target: "blaze", "prepare proc macro", subject = %path.display())
+            .entered();
     if let Some((known, _)) = listing(path)
         && let Some(store) = store
         && has_code(store, &known.digest)?
@@ -1448,13 +1450,6 @@ pub fn prepare(path: &Path, store: Option<&blaze_cas::Handle>) -> Result<(), Str
     let known = Known { digest: keyed::sha256(&bytes), identity: None };
     let wasm = Wasm::known(path, known, Some(&bytes), store, kind_for(&known.digest)?)?;
     list(path, wasm, &wasm.list()?);
-    if std::env::var_os("BLAZE_STATS").is_some() {
-        eprintln!(
-            "blaze: the proc-macro module {} ready in {:.1?}",
-            path.display(),
-            start.elapsed()
-        );
-    }
     Ok(())
 }
 
@@ -1479,16 +1474,13 @@ pub fn prepare_soon(path: &Path, store: Option<&'static blaze_cas::Handle>) -> R
     let known = Known { digest, identity: Some(identity) };
     let kind = kind_for(&digest)?;
     std::thread::spawn(move || {
-        let start = Instant::now();
-        let done = Wasm::known(&path, known, Some(&bytes), store, kind);
-        if std::env::var_os("BLAZE_STATS").is_some() {
-            // alloc: the edge: what the statistics print.
-            let how = done.map_or_else(|e| format!("failed: {e}"), |_| "ready".to_owned());
-            eprintln!(
-                "blaze: the proc-macro module {} {how} in {:.1?}",
-                path.display(),
-                start.elapsed()
-            );
+        let span =
+            tracing::info_span!(target: "blaze", "prepare proc macro", subject = %path.display());
+        let done = span.in_scope(|| Wasm::known(&path, known, Some(&bytes), store, kind));
+        if let Err(why) = &done
+            && std::env::var_os("BLAZE_STATS").is_some()
+        {
+            eprintln!("blaze: the proc-macro module {} failed: {why}", path.display());
         }
     });
     Ok(())

@@ -16,6 +16,7 @@ path = "mod.rs"
 doctest = false
 
 [dependencies]
+blaze-profile.workspace = true
 bumpalo.workspace = true
 either.workspace = true
 hashbrown.workspace = true

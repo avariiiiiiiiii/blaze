@@ -43,6 +43,12 @@ IDENTS = {"identifier", "field_identifier", "type_identifier", "shorthand_field_
 LITERALS = {"integer_literal", "float_literal", "string_content", "char_literal", "boolean_literal"}
 COMMENTS = {"line_comment", "block_comment", "doc_comment"}
 WHOLE = {"struct_item", "enum_item", "union_item", "trait_item", "macro_definition"}
+# Where a lowercase identifier is a new local binding: the `pattern` field of these...
+FIELD_BINDERS = {"let_declaration", "parameter", "for_expression", "let_condition"}
+# ...or any identifier inside these patterns but their `type` or `name`.
+PATTERNS = {"tuple_pattern", "mut_pattern", "ref_pattern", "captured_pattern", "or_pattern",
+            "slice_pattern", "tuple_struct_pattern", "reference_pattern", "closure_parameters",
+            "match_pattern", "field_pattern"}
 TEST_ATTR = re.compile(r"#\[\s*(cfg\s*\(\s*test\s*\)|(\w+::)*(test|bench)\b)")
 
 
@@ -82,6 +88,9 @@ class Chunk:
     kind: str
     name: str
     text: str
+    # The text with local bindings renamed `v0`, `v1`, ... by first use and a function's own
+    # name as `f`: types, fields, methods and paths stay, since they carry the meaning.
+    canon: str
     shape: str
     tokens: int
 
@@ -115,6 +124,54 @@ def shape(node: Node) -> tuple[str, int]:
     return digest, len(tokens)
 
 
+def bound_names(scope: Node) -> set[str]:
+    names: set[str] = set()
+    stack = [scope]
+    while stack:
+        n = stack.pop()
+        stack.extend(n.children)
+        if n.type != "identifier" or not n.text or n.parent is None:
+            continue
+        text = n.text.decode(errors="ignore")
+        if not (text[:1].islower() or text[:1] == "_"):
+            continue
+        p = n.parent
+        binds = p.type in FIELD_BINDERS and p.child_by_field_name("pattern") == n
+        if binds or (p.type in PATTERNS and n not in (p.child_by_field_name("type"), p.child_by_field_name("name"))):
+            names.add(text)
+    return names
+
+
+def canon(scope: Node, source: bytes, lo: int, hi: int) -> str:
+    """`source[lo:hi]` with `scope`'s local bindings renamed in order of first use."""
+    names = bound_names(scope)
+    own = scope.child_by_field_name("name") if scope.type == "function_item" else None
+    idents: list[Node] = []
+    stack = [scope]
+    while stack:
+        n = stack.pop()
+        if n.end_byte <= lo or n.start_byte >= hi:
+            continue
+        if n.type == "identifier":
+            idents.append(n)
+        stack.extend(n.children)
+    rename: dict[str, str] = {}
+    pieces: list[bytes] = []
+    at = lo
+    for n in sorted(idents, key=lambda it: it.start_byte):
+        text = n.text.decode(errors="ignore") if n.text else ""
+        if own is not None and n == own:
+            new = "f"
+        elif text in names:
+            new = rename.setdefault(text, f"v{len(rename)}")
+        else:
+            continue
+        pieces += [source[at:n.start_byte], new.encode()]
+        at = n.end_byte
+    pieces.append(source[at:hi])
+    return b"".join(pieces).decode(errors="ignore")
+
+
 def name_of(node: Node) -> str:
     named = node.child_by_field_name("name")
     return named.text.decode(errors="ignore") if named is not None and named.text else node.type
@@ -138,7 +195,8 @@ def chunks_of(args: tuple[str, str, str, int, int]) -> list[Chunk]:
             parts = [shape(n) for n in _between(a, b)]
             digest = hashlib.blake2b("".join(d for d, _ in parts).encode(), digest_size=12).hexdigest()
             count = sum(c for _, c in parts)
-        out.append(Chunk(crate, rel, start, end, kind, name, text, digest, count))
+        out.append(Chunk(crate, rel, start, end, kind, name, text,
+                         canon(node, source, a.start_byte, b.end_byte), digest, count))
 
     def function(node: Node) -> None:
         name = name_of(node)
@@ -206,21 +264,21 @@ def device_of(choice: str) -> str:
     return "mps" if torch.backends.mps.is_available() else "cpu"
 
 
-def embed(inp: Input, chunks: list[Chunk], out: Path, device: str) -> NDArray[np.float32]:
-    keys = [hashlib.blake2b(f"{inp.model}\x00{inp.max_tokens}\x00{c.text}".encode(), digest_size=12).hexdigest() for c in chunks]
+def embed(inp: Input, texts: list[str], out: Path, device: str) -> NDArray[np.float32]:
+    keys = [hashlib.blake2b(f"{inp.model}\x00{inp.max_tokens}\x00{t}".encode(), digest_size=12).hexdigest() for t in texts]
     cache_path = out / "cache.npz"
     cached: dict[str, NDArray[np.float32]] = {}
     if cache_path.exists():
         with np.load(cache_path) as saved:
             cached = dict(zip(saved["keys"].tolist(), saved["vectors"], strict=True))
     missing = sorted({k for k in keys if k not in cached})
-    log(f"embedding {len(missing)} new texts for {len(chunks)} chunks on {device}")
+    log(f"embedding {len(missing)} new of {len(texts)} texts on {device}")
     if missing:
         from sentence_transformers import SentenceTransformer
 
         model = SentenceTransformer(inp.model, device=device, trust_remote_code=False)
         model.max_seq_length = inp.max_tokens
-        text_of = {k: c.text for k, c in zip(keys, chunks, strict=True)}
+        text_of = dict(zip(keys, texts, strict=True))
         vectors = model.encode([text_of[k] for k in missing], batch_size=inp.batch, normalize_embeddings=True,
                                convert_to_numpy=True, show_progress_bar=True)
         cached.update(zip(missing, np.asarray(vectors, dtype=np.float32), strict=True))
@@ -269,13 +327,12 @@ def clones(inp: Input, chunks: list[Chunk]) -> list[list[int]]:
     return groups
 
 
-def near(inp: Input, chunks: list[Chunk], vectors: NDArray[np.float32], device: str) -> tuple[list[list[int]], dict[tuple[int, int], float]]:
+def near(inp: Input, chunks: list[Chunk], vectors: NDArray[np.float32], device: str) -> dict[tuple[int, int], float]:
+    """Pairs of chunks at cosine `threshold` or more among each other's nearest neighbours."""
     import torch
 
     e = torch.from_numpy(vectors).to(device)
     k = min(inp.neighbours + 1, len(chunks))
-    groups = Groups(len(chunks))
-    joined: set[int] = set()
     score: dict[tuple[int, int], float] = {}
     for lo in range(0, len(chunks), 2048):
         sims, idx = torch.topk(e[lo:lo + 2048] @ e.T, k, dim=1)
@@ -286,10 +343,8 @@ def near(inp: Input, chunks: list[Chunk], vectors: NDArray[np.float32], device: 
                     break
                 if j == i or overlaps(chunks[i], chunks[j]):
                     continue
-                groups.join(i, j)
-                joined.update((i, j))
                 score[(min(i, j), max(i, j))] = s
-    return groups.sets(joined), score
+    return score
 
 
 def concepts(inp: Input, chunks: list[Chunk], vectors: NDArray[np.float32], device: str) -> list[tuple[list[int], float]]:
@@ -337,6 +392,8 @@ def saved_lines(chunks: list[Chunk], members: list[int]) -> int:
 class Group:
     kind: str
     title: str
+    # For near duplicates, which embeddings matched: "raw" text, "canon" (locals renamed), or both.
+    via: str
     saved: int
     crates: list[str]
     score: float
@@ -375,10 +432,10 @@ def report(inp: Input, root: Path, out: Path, chunks: list[Chunk], groups: list[
         shown = "".join(code(chunks[i]) for i in g.members[:2])
         sections[g.kind].append(
             f"<section><h3>{html.escape(g.title)} <small>{len(g.members)} copies, {len(g.crates)} crates, "
-            f"~{g.saved} lines, score {g.score:.3f}</small></h3><ul>{rows}</ul>"
+            f"~{g.saved} lines, score {g.score:.3f}{', via ' + g.via if g.via else ''}</small></h3><ul>{rows}</ul>"
             f"<details><summary>code</summary><div class=pair>{shown}</div></details></section>")
     heads = {"clone": "Clones: same code with names changed",
-             "near": f"Near duplicates: embeddings at cosine ≥ {inp.threshold}",
+             "near": f"Near duplicates: raw or locals-renamed embeddings at cosine ≥ {inp.threshold}",
              "concept": f"Concepts written in {inp.min_crates}+ crates (k-means, cohesion ≥ {inp.cohesion})"}
     body = "".join(
         f"<h2 id={kind}>{heads[kind]} <small>({counts[kind]})</small></h2>" + "".join(sections[kind])
@@ -418,24 +475,35 @@ def main() -> None:
     if len(chunks) < 2:
         fail(SCRIPT, f"found {len(chunks)} chunks under {root}: nothing to compare")
     device = device_of(inp.device)
-    vectors = embed(inp, chunks, out, device)
+    both = embed(inp, [c.text for c in chunks] + [c.canon for c in chunks], out, device)
+    vectors, canon_vectors = both[:len(chunks)], both[len(chunks):]
 
     groups: list[Group] = []
     for members in clones(inp, chunks):
-        groups.append(Group("clone", words(chunks, members), saved_lines(chunks, members),
+        groups.append(Group("clone", words(chunks, members), "", saved_lines(chunks, members),
                             sorted({chunks[i].crate for i in members}), 1.0, members))
-    near_groups, score = near(inp, chunks, vectors, device)
+    passes = {"raw": near(inp, chunks, vectors, device), "canon": near(inp, chunks, canon_vectors, device)}
+    joined = Groups(len(chunks))
+    touched: set[int] = set()
+    for pairs in passes.values():
+        for a, b in pairs:
+            joined.join(a, b)
+            touched.update((a, b))
+    near_groups = joined.sets(touched)
     group_of = {i: g for g, members in enumerate(near_groups) for i in members}
     inside: dict[int, list[float]] = defaultdict(list)
-    for (a, _), s in score.items():
-        inside[group_of[a]].append(s)
+    via: dict[int, set[str]] = defaultdict(set)
+    for name, pairs in passes.items():
+        for (a, _), s in pairs.items():
+            inside[group_of[a]].append(s)
+            via[group_of[a]].add(name)
     for g, members in enumerate(near_groups):
-        groups.append(Group("near", words(chunks, members), saved_lines(chunks, members),
+        groups.append(Group("near", words(chunks, members), "+".join(sorted(via[g])), saved_lines(chunks, members),
                             sorted({chunks[i].crate for i in members}), float(np.mean(inside[g])), members))
     log(f"{sum(g.kind == 'clone' for g in groups)} clone groups, {len(near_groups)} near-duplicate groups")
     for members, tight in concepts(inp, chunks, vectors, device):
         crates = sorted({chunks[i].crate for i in members})
-        groups.append(Group("concept", words(chunks, members), saved_lines(chunks, members), crates, tight, members))
+        groups.append(Group("concept", words(chunks, members), "", saved_lines(chunks, members), crates, tight, members))
     groups.sort(key=lambda g: (g.kind, -(g.saved if g.kind != "concept" else len(g.crates) * g.score)))
     report(inp, root, out, chunks, groups)
     log(f"wrote {out / 'report.html'}")

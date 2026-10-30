@@ -887,7 +887,7 @@ pub(crate) struct Placed<'a> {
 
 /// One run of a `Placed` list replaced since the last link: `old` in the last link's list,
 /// `new` in this one's.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Splice {
     pub old: Range<u32>,
     pub new: Range<u32>,

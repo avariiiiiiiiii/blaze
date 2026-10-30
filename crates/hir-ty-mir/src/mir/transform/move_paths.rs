@@ -24,7 +24,7 @@ use crate::{
         BasicBlockId, BorrowKind, FieldIndex, LocalId, MirBody, OperandKind, Place, PlaceElem,
         PlaceTy, Projection, ProjectionElem, Rvalue, StatementKind, StoredPlace, SwitchTargets,
         TerminatorKind,
-        framed::{Bits, bits_in},
+        framed::{Bits, bits_in, block_index, local_index},
     },
     next_solver::TyKind,
 };
@@ -32,14 +32,6 @@ use crate::{
 use super::Ctx;
 
 pub(super) type PathId = usize;
-
-pub(super) fn block_index(id: BasicBlockId) -> usize {
-    id.into_raw().into_u32() as usize
-}
-
-fn local_index(local: LocalId) -> usize {
-    local.into_raw().into_u32() as usize
-}
 
 /// The blocks control goes to from `kind` when nothing unwinds, in the order of
 /// [`TerminatorKind::successors`], without its `SmallVec`, which spills for a switch of more

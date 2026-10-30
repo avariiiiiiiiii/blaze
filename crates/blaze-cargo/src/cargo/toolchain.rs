@@ -127,8 +127,14 @@ pub fn sysroot() -> Option<PathBuf> {
 /// `RUSTC`, `RUSTDOC`, `RUSTUP_TOOLCHAIN` and [`library::VAR`] and are first on `PATH`, for
 /// the processes this one starts and not the user's shell, whatever the user set them to or a
 /// toolchain file names. `Err` is why the command can't be built, said for the user to act on.
-/// Before any thread starts: it sets the environment, once the threads it starts are done.
-pub fn settle() -> Result<Chosen, String> {
+///
+/// # Safety
+///
+/// No other thread of the process may run during the call: it sets the process's
+/// environment, once the threads it starts are done, and a thread reading it meanwhile
+/// through the C library's `getenv` (which std's lock does not cover) could read a variable
+/// as it is freed.
+pub unsafe fn settle() -> Result<Chosen, String> {
     let library = std::thread::scope(|scope| {
         let library = scope.spawn(library::fetch);
         let chosen = release();
@@ -136,8 +142,13 @@ pub fn settle() -> Result<Chosen, String> {
         chosen.map(|chosen| (chosen, library))
     });
     let (chosen, library) = library?;
-    library::publish_fetched(&library?);
-    use_toolchain(chosen.dir());
+    let library = library?;
+    // SAFETY: no other thread runs, by this function's contract: the one it started ended
+    // with the scope, which joins it, and the workers of the runtimes a download starts are
+    // joined as each drops.
+    unsafe { library::publish_fetched(&library) };
+    // SAFETY: as above.
+    unsafe { use_toolchain(chosen.dir()) };
     Ok(chosen)
 }
 
@@ -170,21 +181,30 @@ fn release() -> Result<Chosen, String> {
 /// Has every process this one starts run blaze's release at `dir`: cargo and the daemon from
 /// it, and a rustc, rustdoc or cargo a build script finds on the path, or reaches through a
 /// rustup proxy, from it too.
-fn use_toolchain(dir: &Path) {
+///
+/// # Safety
+///
+/// No other thread of the process may run during the call: it sets the process's
+/// environment, and a thread reading it meanwhile through the C library's `getenv` (which
+/// std's lock does not cover) could read a variable as it is freed.
+unsafe fn use_toolchain(dir: &Path) {
     let bin = dir.join("bin");
     let exe = |name: &str| bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     let path = std::env::var_os("PATH");
     let path = std::iter::once(bin.clone()).chain(path.iter().flat_map(std::env::split_paths));
-    // SAFETY: before any thread is started.
-    unsafe {
-        std::env::set_var("CARGO", exe("cargo"));
-        std::env::set_var("RUSTC", exe("rustc"));
-        std::env::set_var("RUSTDOC", exe("rustdoc"));
-        std::env::set_var("RUSTUP_TOOLCHAIN", dir);
-        std::env::remove_var("RUSTUP_TOOLCHAIN_SOURCE");
-        if let Ok(path) = std::env::join_paths(path) {
-            std::env::set_var("PATH", path);
-        }
+    // SAFETY: no other thread runs, by this function's contract.
+    unsafe { std::env::set_var("CARGO", exe("cargo")) };
+    // SAFETY: as above.
+    unsafe { std::env::set_var("RUSTC", exe("rustc")) };
+    // SAFETY: as above.
+    unsafe { std::env::set_var("RUSTDOC", exe("rustdoc")) };
+    // SAFETY: as above.
+    unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", dir) };
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("RUSTUP_TOOLCHAIN_SOURCE") };
+    if let Ok(path) = std::env::join_paths(path) {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("PATH", path) };
     }
 }
 

@@ -2243,6 +2243,10 @@ drops `ra-ap-rustc_index`; `hir-ty-codegen` keeps it for `rustc_index::Idx`.
    `fill(0)`). The calls `insert`, `remove` and `contains` in `set` and `of` and in
    `holds_nothing` (`state.maybe_init.contains(it)`) are unchanged.
 
+   > done by codegen-mir-store-drops (2026-10-29), uncompiled: with mem-codegen-mir §4.5, so
+   > the sets are `framed::Bits<'f>` (`blaze_ids::bits::Bits` over frame words, `bits_in`)
+   > rather than `BitSet`; the `Bits` copy is gone, `union_with`/`clear`/`insert` as above.
+
 2. `crates/hir-ty-mir/src/mir/optimize/dse.rs`: the `Bits` copy goes.
 
    Before:
@@ -2295,6 +2299,11 @@ drops `ra-ap-rustc_index`; `hir-ty-codegen` keeps it for `rustc_index::Idx`.
                    live.union_with(&entry[block_index(target)]);
 
    Every other `insert`/`remove`/`contains` call there is already a statement or a test.
+
+   > done by codegen-mir-store-opt (2026-10-29), uncompiled: the copy is gone; `dse.rs` uses
+   > `framed::Bits` (`blaze_ids::bits`' `Bits` over words in the task's frame, made by
+   > `framed::bits_in`) instead of `BitSet`, per `mem-codegen-mir.md` §6.5, with the `transfer`
+   > arms and `union_with` as written here.
 
 3. `crates/hir-ty-mir/src/mir/storage.rs`: rustc_index's `DenseBitSet`/`BitMatrix` (local to the
    pass; `StorageConflicts`' fields are private) become `BitSet`/`BitMatrix`. `DenseBitSet` keeps
@@ -3713,12 +3722,19 @@ applies to the tree as of 2026-10-29 (`git apply --check`).
 
 > applied by codegen-v2 (2026-10-29): the `blaze-codegen` hunks (`blob.rs`, `summary.rs`) applied as written (`git apply --check` clean, hot lint clean on both); the `blaze-engine` hunks (`Cargo.toml`, `manifest.rs`) are codegen-engine's, asked in `codegen-v2.requests.md` "To codegen-engine".
 
+> applied by codegen-engine (2026-10-29): the `blaze-engine` hunks (`Cargo.toml`, `manifest.rs`)
+> as written. Only the import line's context had moved (`RootDatabaseExt as _` was added since).
+
 ## dedyn: crates/hir-ty-codegen (outside `v2/`): the `dyn` sites (from dedyn-codegen, 2026-10-29)
+
+> applied by dedyn-codegen (2026-10-29): dedyn 1 to 12 as written; hot_lint finds no `dyn` in hir-ty-codegen. Not built: check it builds and the tests pass.
 
 From `dedyn-codegen` (child of lane `dedyn`, report `/tmp/blaze-lanes/v2-dedyn-codegen.md`). Every
 `dyn` in these files outside tests, by what it becomes. Anchored on code text: the line numbers are
 as of 2026-10-29 21:30 and move. Nothing here changes behavior; the tests named are updated in the
 same item. hot_lint accepts a `// dyn:` on the line or the line above.
+
+> forwarded to codegen (codegen-next1) (requests, pass 20; told by tmux).
 
 ### dedyn 1: `unwind.rs`, `unwind/seh.rs`: `dyn Module` becomes `ObjectModule`
 

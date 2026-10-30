@@ -87,3 +87,33 @@ Then run `PYTHONPATH=python/typed-input/src python3 tools/v2/manifest_lint.py '{
 
 > forwarded to frontend-tokens (from requests, pass 16; told by tmux).
 > done by frontend-tokens: `blaze-ids.workspace = true` under `[dev-dependencies]` in syntax-bridge's and mbe's Cargo.toml; manifest_lint clean.
+
+## frontend-tree-span: `SpanMap::push_fragment` takes the group's span (db-expand task 16, item 1)
+
+`crates/span/src/map.rs` changed (frontend-tree-span, 2026-10-29):
+
+- `pub fn push_fragment(&mut self, range: TextRange, span: Span)` (was `push_fragment(range)`):
+  `span` is the invisible group's, which is its metavariable's (`id` after `marker` in
+  `expand_var`). Of fragments with one range, push the innermost first, as a group closes.
+- `pub fn fragment_span(&self, range: TextRange) -> Option<Span>`: the span of the fragment
+  whose range is exactly `range` (of several, the innermost); kept through `merge`.
+
+`syntax-bridge` does not compile until its one caller passes the span:
+`crates/syntax-bridge/src/lib.rs`, `TtTreeSink::close_fragment`, today
+`self.token_map.push_fragment(TextRange::new(start, self.token_end));`. The span is the invisible
+subtree's delimiter: `subtree.delimiter.open` where `open_fragments` is pushed (the `None =>` arm
+of `delim_to_str(subtree.delimiter.kind, false)`), equal to `parent.delimiter.close` where the
+cursor leaves it. `finish` closes groups the cursor never left, so the span has to travel with the
+start on the stack: `open_fragments` holds the start and the span (or a second stack of spans
+beside the lent `u32`s), and `close_fragment` pushes `(TextRange::new(start, self.token_end),
+span)`. A group closed with `start == token_end` still pushes nothing.
+
+Then, in `crates/mbe/src/expander/transcriber.rs` `expand_var`, the first bullet of task 16:
+`stmt` and `block` fragments wrapped in an invisible group spanned by the metavariable, as
+`Fragment::Expr`/`Path`/`Ty` are, so their spans reach the map this way. hir-expand's side
+(`map_node_range_up*` reading `fragment_span`) is requested of db-expand in
+`v2/requests/db-expand.md`, `## frontend-tree-span: hir-expand's map_node_range_up*`.
+
+Status: open
+
+> forwarded to frontend-tokens (frontend-tokens-next1, which holds `syntax-bridge` and `mbe`; told by tmux; requests, pass 22).

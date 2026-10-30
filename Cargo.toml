@@ -235,7 +235,6 @@ inventory = "0.3.24"
 itertools = "0.15.0"
 libc = "0.2.172"
 memchr = "2.8.1"
-memmap2 = "0.9"
 # The `blaze` binary's general-purpose allocator (docs/v2/plan/design/memory.md).
 mimalloc = { version = "0.1.52", default-features = false }
 nohash-hasher = "0.2.0"

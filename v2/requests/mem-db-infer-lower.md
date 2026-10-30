@@ -1664,6 +1664,7 @@ fn exact<T>(items: &mut Vec<T, &Frame>) -> Box<[T]> {
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:16): as written; `Frame` is `blaze_mem::Frame`.
 
 ### 15b. `Batch::build`: one task per item
 
@@ -1726,6 +1727,7 @@ microseconds of lowering per item. mem-db-infer has been told.
 value.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:16): as written (task tag `crate::db::INFER_TAG`, mem-db-infer 3).
 
 ### 15c. `CrateFieldTypes::build`
 
@@ -1787,6 +1789,7 @@ After:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:16): as written.
 
 ### 15d. `module_variants`, `module_impls`: in the caller's allocator
 
@@ -1812,6 +1815,7 @@ blaze-radix's `sort_copy_by_key_in` takes a `&mut Vec<T>` (Global), so it is lef
 `Vec<T, A>` form there (fix-radix's file) would make it a frame list.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:16): as written (`radix::sort_copy_by_key` takes `&mut [T]`, so the frame list sorts in place).
 
 ### 15e. The four queries
 
@@ -1921,6 +1925,7 @@ Plus each item's own owned parts, which it moves into the values: a `TyLoweringD
 boxed sites, made once when the diagnostic is.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:16): the four queries, with `mem_tag = Infer` in place of `mem_tag = crate::db::INFER_TAG` (salsa's option as filed, mem-db-salsa M2, takes a bare `blaze_mem::Tag` variant). `FrameLowered::empty` made `pub(crate)` with 4 in `lower.rs`.
 
 ### 15f. Tests
 
@@ -1965,6 +1970,7 @@ A batch's result must equal the per-item queries'. The existing persist round-tr
 `hir` batch tests (`crates/hir/src/tests.rs:794`) compare them. Keep them.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:16): as written, all three tests.
 
 ## 16. lane db: `crates/hir-ty/src/lower/persist.rs`
 
@@ -2033,6 +2039,7 @@ exact already, and the other two go through `exact(len, ..)`. Test: the existing
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:20): as written; the readers' closures name their error (`Ok::<_, FormatError>` or `-> Result<_, FormatError>`) where the old `collect` turbofish did.
 
 ## 17. lane db: `crates/hir-ty/src/lower/diagnostics.rs`, `generics.rs`, `utils.rs`: no change
 

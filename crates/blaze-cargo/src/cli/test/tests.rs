@@ -42,7 +42,7 @@ fn asked(command: Command, words: &[&str]) -> Invocation {
 }
 
 fn speaking() -> Speaking<'static> {
-    Speaking { cwd: Path::new("/w"), color: false, quiet: false, verbose: 0 }
+    Speaking { cwd: Path::new("/w"), color: false, quiet: false, verbose: 0, json: false }
 }
 
 fn tested(asked: &Invocation, fake: &mut Fake, speaking: Speaking<'_>) -> (i32, String) {
@@ -125,6 +125,62 @@ fn no_fail_fast_runs_them_all() {
     let (code, err) = tested(&asked(Command::Test, &["-p", "foo"]), &mut fake, speaking());
     assert_eq!(code, 101);
     assert!(err.ends_with("error: doctest failed, to rerun pass `-p foo --doc`\n"), "{err}");
+}
+
+#[test]
+fn no_fail_fast_with_one_failure_is_its_own_error() {
+    let mut fake = Fake { ends: vec![("x-4567", Ended::Code(2))], ..Fake::default() };
+    let (code, err) = tested(&asked(Command::Test, &["--no-fail-fast"]), &mut fake, speaking());
+    assert_eq!(code, 101, "cargo's `no_fail_fast_err` is a plain error, not the test's code");
+    assert_eq!(fake.ran.len(), 4);
+    assert!(err.ends_with("error: 1 target failed:\n    `--test x`\n"), "{err}");
+}
+
+#[test]
+fn doc_tests_by_the_targets_own_name_and_command_under_verbose() {
+    let doc = Artifact { kind: "doctest".to_owned(), ..artifact("foo", "lib", "my-lib", true, Some("deps/my_lib-doctests")) };
+    let mut err = Vec::new();
+    let code = run(&asked(Command::Test, &[]), &[doc.clone()], 1, speaking(), &mut err, &mut Fake::default()).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8(err).unwrap(), "   Doc-tests my-lib\n");
+
+    let mut err = Vec::new();
+    let verbose = Speaking { verbose: 1, ..speaking() };
+    run(&asked(Command::Test, &[]), &[doc], 1, verbose, &mut err, &mut Fake::default()).unwrap();
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "   Doc-tests my-lib\n     Running `/w/target/debug/deps/my_lib-doctests`\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn extra_verbose_shows_the_variables_cargo_sets() {
+    let mut fake = Fake { ends: vec![("foo-0123abcd", Ended::Code(3))], ..Fake::default() };
+    let (_, err) = tested(&asked(Command::Test, &[]), &mut fake, Speaking { verbose: 2, ..speaking() });
+    let shown = "`CARGO_PKG_NAME=foo /w/target/debug/deps/foo-0123abcd`";
+    assert!(err.starts_with(&format!("     Running {shown}\n")), "{err}");
+    assert!(err.contains(&format!("process didn't exit successfully: {shown} (exit status: 3)")), "{err}");
+
+    let (_, err) = tested(&asked(Command::Test, &[]), &mut Fake::default(), Speaking { verbose: 1, ..speaking() });
+    assert!(err.starts_with("     Running `/w/target/debug/deps/foo-0123abcd`\n"), "{err}");
+}
+
+#[test]
+fn no_run_under_json_lists_nothing() {
+    let (code, err) = tested(&asked(Command::Test, &["--no-run"]), &mut Fake::default(), Speaking { json: true, ..speaking() });
+    assert_eq!(code, 0);
+    assert_eq!(err, "");
+}
+
+#[cfg(unix)]
+#[test]
+fn quiet_keeps_the_error_and_drops_the_note() {
+    let mut fake = Fake { ends: vec![("foo-0123abcd", Ended::Code(3))], ..Fake::default() };
+    let (code, err) = tested(&asked(Command::Test, &[]), &mut fake, Speaking { quiet: true, ..speaking() });
+    assert_eq!(code, 3);
+    assert!(err.starts_with("error: test failed, to rerun pass `--lib`\n\nCaused by:\n"), "{err}");
+    assert!(!err.contains("note:"), "{err}");
 }
 
 #[cfg(unix)]

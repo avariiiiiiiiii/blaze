@@ -18,9 +18,13 @@ In `crates/syntax-tree/src/view.rs` (module `syntax_tree::view`, re-exported by 
   or in the part of lazy node `part`. 8 bytes, `Copy + Ord + Hash`: what a caller stores, with
   the `FileId`, to find a node again (`Node::at`). `AstId`/`AstPtr` stay for what must survive a
   reparse.
-- `Node<'t>`, `Token<'t>`: `{ file: &'t FlatTree, tree: &'t FlatTree, id: NodeId }`, 24 bytes,
-  `Copy + Send + Sync`. `tree` is `file` or the part the element is in, so no step looks a part
-  up. Equality and hashing are `(file address, id)`, as the cursors' identity was.
+- `Node<'t>`, `Token<'t>`: `{ file: &'t Arc<FlatTree>, tree: &'t FlatTree, id: NodeId }`, 24
+  bytes, `Copy + Send + Sync`. `tree` is `file` or the part the element is in, so no step looks
+  a part up. Equality and hashing are `(the file tree's address, id)`, as the cursors' identity
+  was: two `Arc`s of one tree view the same elements. `file()` is `&'t FlatTree`;
+  `shared_file()` is the `&'t Arc<FlatTree>`, so something that must walk the tree after the
+  view's borrow ends (an `AstIdMap`'s unwalked bodies) keeps a count of it. `Node::root` and
+  `Node::at` take `&'t Arc<FlatTree>` (a `Parse` holds one).
   `Element<'t> = NodeOrToken<Node<'t>, Token<'t>>`.
 - Every cursor method, same name and meaning, taking `self`: `kind`, `text_range`, `index`,
   `parent`, `ancestors`, `children`, `children_with_tokens`, `first_child`, `last_child`,

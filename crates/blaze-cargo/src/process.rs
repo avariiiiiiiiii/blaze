@@ -3,7 +3,7 @@
 //! the daemon's are those of whoever started it.
 
 use ide_db::{
-    RootDatabase,
+    RootDatabase, RootDatabaseExt as _,
     base_db::{Crate, Env, ProcessEnv, process_env_var, set_process_env},
 };
 

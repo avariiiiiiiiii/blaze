@@ -18,7 +18,8 @@ use super::config::{ConfigChain, ConfigOf, ConfigRead};
 use super::files::{Fill, Reads, Snapshot, run_over};
 use super::invocation::Asking;
 use super::{load_error, unmounted_error};
-use crate::query::{Cbor, LoadError, Versioned, key_input, producer};
+use super::key_id;
+use crate::query::{Cbor, LoadError, Versioned, producer};
 
 /// A manifest by absolute path, read with a configuration, as the package of `source` (the
 /// source as a lock file writes it; `None` for the path package in its directory).
@@ -52,7 +53,7 @@ impl Query for ManifestQuery {
     type Value = Cbor<ManifestRead>;
 
     fn input(key: &ManifestKey) -> ContentId {
-        key_input("blaze v2 cargo manifest key 2", key)
+        key_id("blaze v2 cargo manifest key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &ManifestKey) -> Result<Cbor<ManifestRead>, Cancelled> {
@@ -134,7 +135,7 @@ impl Query for WorkspaceQuery {
     type Value = Cbor<Result<WorkspaceRead, LoadError>>;
 
     fn input(key: &WorkspaceKey) -> ContentId {
-        key_input("blaze v2 cargo workspace key 2", key)
+        key_id("blaze v2 cargo workspace key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &WorkspaceKey) -> Result<Cbor<Result<WorkspaceRead, LoadError>>, Cancelled> {

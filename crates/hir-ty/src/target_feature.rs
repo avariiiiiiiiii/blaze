@@ -11,6 +11,7 @@
 use std::fmt;
 
 use base_db::{Db, Crate};
+use blaze_ids::bits::{BitArray, BitIndex};
 use hir_def::attrs::AttrFlags;
 use hir_def::{FunctionId, HasModule};
 use intern::Symbol;
@@ -160,14 +161,27 @@ impl fmt::Debug for TargetFeature {
     }
 }
 
-/// A set of target features, one bit each: 72 bytes, a test is one load and a shift.
+impl BitIndex for TargetFeature {
+    #[inline]
+    fn to_bit(self) -> usize {
+        self.index()
+    }
+
+    #[inline]
+    fn from_bit(bit: usize) -> Self {
+        Self(<u16 as BitIndex>::from_bit(bit))
+    }
+}
+
+/// A set of target features, one bit each: 72 bytes, a test is one load and a shift. A struct
+/// of its own for a `Debug` that names the features.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct TargetFeatureSet([u64; WORDS]);
+pub struct TargetFeatureSet(BitArray<WORDS, TargetFeature>);
 
 const _: () = assert!(size_of::<TargetFeatureSet>() == 72);
 
 impl TargetFeatureSet {
-    pub const EMPTY: Self = Self([0; WORDS]);
+    pub const EMPTY: Self = Self(BitArray::<WORDS, TargetFeature>::EMPTY);
 
     pub const fn of(features: &[TargetFeature]) -> Self {
         let mut set = Self::EMPTY;
@@ -180,41 +194,34 @@ impl TargetFeatureSet {
     }
 
     #[inline]
-    pub const fn with(mut self, feature: TargetFeature) -> Self {
-        self.0[feature.index() / 64] |= 1 << (feature.index() % 64);
-        self
+    pub const fn with(self, feature: TargetFeature) -> Self {
+        Self(self.0.with_bit(feature.index()))
     }
 
     #[inline]
     pub fn insert(&mut self, feature: TargetFeature) {
-        self.0[feature.index() / 64] |= 1 << (feature.index() % 64);
+        self.0.insert(feature);
     }
 
     #[inline]
     pub const fn contains(&self, feature: TargetFeature) -> bool {
-        (self.0[feature.index() / 64] >> (feature.index() % 64)) & 1 != 0
+        self.0.has_bit(feature.index())
     }
 
     #[inline]
     pub const fn union(&self, other: &Self) -> Self {
-        let mut out = *self;
-        let mut i = 0;
-        while i < WORDS {
-            out.0[i] |= other.0[i];
-            i += 1;
-        }
-        out
+        Self(self.0.or(&other.0))
     }
 
     /// Whether every feature of `other` is in `self`.
     #[inline]
     pub fn is_superset(&self, other: &Self) -> bool {
-        self.0.iter().zip(&other.0).all(|(mine, theirs)| theirs & !mine == 0)
+        other.0.is_subset(&self.0)
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.0.iter().all(|&word| word == 0)
+        self.0.is_empty()
     }
 
     /// The set and every feature its features imply on `arch`, transitively.
@@ -224,17 +231,7 @@ impl TargetFeatureSet {
 
     /// The features, in the order of their names' bytes.
     pub fn iter(&self) -> impl Iterator<Item = TargetFeature> + '_ {
-        self.0.iter().enumerate().flat_map(|(at, &word)| {
-            let mut rest = word;
-            std::iter::from_fn(move || {
-                if rest == 0 {
-                    return None;
-                }
-                let bit = rest.trailing_zeros();
-                rest &= rest - 1;
-                Some(TargetFeature((at * 64) as u16 + bit as u16))
-            })
-        })
+        self.0.iter()
     }
 
     /// The names of the features, sorted by their bytes.
@@ -243,9 +240,10 @@ impl TargetFeatureSet {
     }
 
     const fn same(&self, other: &Self) -> bool {
+        let (ours, theirs) = (self.0.array(), other.0.array());
         let mut i = 0;
         while i < WORDS {
-            if self.0[i] != other.0[i] {
+            if ours[i] != theirs[i] {
                 return false;
             }
             i += 1;

@@ -238,7 +238,7 @@ pub(super) fn encode(placed: &Placed<'_>, page: u64) -> Result<Vec<(u64, u64)>, 
 }
 
 /// How many slots [`encode`] gives for `placed`: what [`fixups`] checks `Placed::encoded` by.
-pub(super) fn count(placed: &Placed<'_>) -> usize {
+fn slots_of(placed: &Placed<'_>) -> usize {
     placed.rebase.len()
         + placed.binds.len()
         + placed.got.iter().filter(|it| matches!(it.holds, Holds::Import(_))).count()
@@ -257,12 +257,12 @@ pub(super) fn fixups<'n>(
     out: &mut Vec<u8>,
 ) -> Result<usize, LinkError> {
     let base = placed.plan.base;
-    if slots.len() != count(placed) {
+    if slots.len() != slots_of(placed) {
         // alloc: error path
         return Err(error(format!(
             "{} chained slots for {} pointers dyld fixes up: `Placed::encoded` is not this image's",
             slots.len(),
-            count(placed)
+            slots_of(placed)
         )));
     }
     let binds = binds(placed)?;
@@ -330,6 +330,7 @@ pub(super) fn fixups<'n>(
     out.resize(table + entries * entry_len, 0);
     let symbols_at = out.len() - start;
     // By import: its name's offset among the symbols.
+    // alloc: one table per link, sized once by the imports
     let mut named = vec![u32::MAX; imports.count as usize];
     for (nth, (import, addend)) in imports.entries().enumerate() {
         let offset = match named[import as usize] {

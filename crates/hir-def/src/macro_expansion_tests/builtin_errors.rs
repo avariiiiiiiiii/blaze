@@ -2,7 +2,8 @@
 //! rustc ignores after the expression a macro other than a `macro_rules!` one expands to: each as
 //! rustc prints it, its message and code, the text at each of its primary spans, and the notes and
 //! helps under it. The macros' cases are rustc's `tests/ui/macros/macros-nonfatal-errors.rs`.
-//! Also what a `macro_rules!` call no rule matches carries of the rule that got furthest.
+//! Also what a `macro_rules!` call no rule matches carries of the rule that got furthest, and
+//! where a macro fragment's node maps up to.
 
 use expect_test::{Expect, expect};
 use hir_expand::{
@@ -412,6 +413,33 @@ n!(x y);
             ),
         ]
     );
+}
+
+/// rustc lints a `$x:stmt`'s statement at the metavariable
+/// (`suggest-remove-semi-in-macro-expansion-issue-142143.rs`): the node that is exactly the
+/// fragment maps up to the `$s` in the rule, not to the call's tokens.
+#[test]
+fn a_fragments_node_maps_up_to_its_metavariable() {
+    let text = r#"
+macro_rules! m { ($s:stmt) => { $s } }
+
+fn main() {
+    m!(let x = 1);
+}
+"#;
+    let db = TestDB::with_files(text);
+    let [call] = macro_calls(&db)[..] else { panic!("one call") };
+    let (parse, map) = &call.parse_macro_expansion(&db).value;
+    let stmt = parse
+        .syntax_node()
+        .descendants()
+        .find(|it| it.kind() == SyntaxKind::LET_STMT)
+        .expect("a `let` statement");
+    let (FileRange { file_id, range }, _) =
+        hir_expand::map_node_range_up(&db, map, stmt.text_range()).expect("the node maps up");
+    let written = file_id.parse(&db).syntax_node().text().to_string();
+    let metavariable = written.find("{ $s }").expect("m's body") + 2;
+    assert_eq!((usize::from(range.start()), &written[range]), (metavariable, "$s"));
 }
 
 #[test]

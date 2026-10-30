@@ -6,8 +6,12 @@
 //! target named, and an addend kept in [`Relocs::wide`] exactly when it doesn't fit the row.
 //! So two tables of the same relocations are equal, serialize alike and hash alike.
 
-use std::hash::{BuildHasher, Hash};
+use std::{
+    alloc::{Allocator, Global},
+    hash::{BuildHasher, Hash},
+};
 
+use blaze_mem::Frame;
 use hashbrown::HashTable;
 use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
@@ -85,6 +89,23 @@ pub struct Relocs<T = Target> {
     wide: Vec<(u32, i64)>,
 }
 
+/// A [`Relocs`] borrowed: its rows, targets and wide addends where they lie (in a table, or
+/// read out of stored bytes), in a table's one order.
+#[derive(PartialEq, Eq, Hash, Debug)]
+pub struct RelocsView<'a, T> {
+    rows: &'a [Reloc],
+    targets: &'a [T],
+    wide: &'a [(u32, i64)],
+}
+
+impl<T> Clone for RelocsView<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for RelocsView<'_, T> {}
+
 #[derive(Deserialize)]
 struct Parts<T> {
     rows: Vec<Reloc>,
@@ -127,20 +148,25 @@ impl<T: Eq + Hash> Distinct<T> {
     }
 
     fn index(&mut self, target: T) -> u32 {
-        let hash = FxBuildHasher.hash_one(&target);
-        let Distinct { targets, index } = self;
-        if let Some(&at) = index.find(hash, |&at| targets[at as usize] == target) {
-            return at;
-        }
-        let at = u32::try_from(targets.len()).expect("fewer than 2^32 targets");
-        targets.push(target);
-        index.insert_unique(hash, at, |&at| FxBuildHasher.hash_one(&targets[at as usize]));
-        at
+        index_in(&mut self.targets, &mut self.index, target)
     }
+}
+
+/// The index of `target` among `targets`, pushed when it is new; `index` finds each by hash.
+fn index_in<T: Eq + Hash, A: Allocator>(targets: &mut Vec<T>, index: &mut HashTable<u32, A>, target: T) -> u32 {
+    let hash = FxBuildHasher.hash_one(&target);
+    if let Some(&at) = index.find(hash, |&at| targets[at as usize] == target) {
+        return at;
+    }
+    let at = u32::try_from(targets.len()).expect("fewer than 2^32 targets");
+    targets.push(target);
+    index.insert_unique(hash, at, |&at| FxBuildHasher.hash_one(&targets[at as usize]));
+    at
 }
 
 impl<T> Relocs<T> {
     pub const fn new() -> Relocs<T> {
+        // alloc: none; an empty `Vec` allocates nothing
         Relocs { rows: Vec::new(), targets: Vec::new(), wide: Vec::new() }
     }
 
@@ -191,20 +217,27 @@ impl<T> Relocs<T> {
         Iter { rows: self.rows.iter(), targets: &self.targets, wide: &self.wide }
     }
 
+    /// The table borrowed.
+    pub fn view(&self) -> RelocsView<'_, T> {
+        RelocsView { rows: &self.rows, targets: &self.targets, wide: &self.wide }
+    }
+
     /// The parts, in the one order [`Relocs::from_parts`] takes back.
     pub fn into_parts(self) -> (Vec<Reloc>, Vec<T>, Vec<(u32, i64)>) {
         (self.rows, self.targets, self.wide)
     }
 
     /// Puts rows in order (stably by `at`), and targets in the order they are first named,
-    /// dropping any not named. `targets` are distinct.
-    fn assemble(mut pending: Vec<Pending>, targets: Vec<T>) -> Relocs<T> {
+    /// dropping any not named. `targets` are distinct. What only the assembly needs is in
+    /// `scratch`.
+    fn assemble<A: Allocator + Copy>(pending: &mut [Pending], targets: Vec<T>, scratch: A) -> Relocs<T> {
         if !pending.is_sorted_by_key(|it| it.at) {
-            blaze_ids::radix::sort_copy_by_key(&mut pending, |it| it.at);
+            blaze_ids::radix::sort_copy_by_key(pending, |it| it.at);
         }
-        let mut order = vec![u32::MAX; targets.len()];
+        let mut order = Vec::with_capacity_in(targets.len(), scratch);
+        order.resize(targets.len(), u32::MAX);
         let mut named = 0u32;
-        for it in &pending {
+        for it in pending.iter() {
             let slot = &mut order[it.target as usize];
             if *slot == u32::MAX {
                 *slot = named;
@@ -215,16 +248,20 @@ impl<T> Relocs<T> {
         let targets = if in_order {
             targets
         } else {
-            let mut by_order = vec![u32::MAX; named as usize];
+            let mut by_order = Vec::with_capacity_in(named as usize, scratch);
+            by_order.resize(named as usize, u32::MAX);
             for (old, &new) in order.iter().enumerate() {
                 if new != u32::MAX {
                     by_order[new as usize] = old as u32;
                 }
             }
-            let mut slots: Vec<Option<T>> = targets.into_iter().map(Some).collect();
+            let mut slots = Vec::with_capacity_in(targets.len(), scratch);
+            slots.extend(targets.into_iter().map(Some));
+            // alloc: the table's targets, in the order rows first name them
             by_order.iter().map(|&old| slots[old as usize].take().expect("each target once")).collect()
         };
         let mut rows = Vec::with_capacity(pending.len());
+        // alloc: the table's wide addends; none when every addend fits its row
         let mut wide = Vec::new();
         for (row, it) in pending.iter().enumerate() {
             let addend = match i32::try_from(it.addend) {
@@ -255,17 +292,110 @@ impl<T> Relocs<T> {
         }
         if distinct.targets.len() == self.targets.len() {
             let targets = distinct.targets;
+            // clone: the new table's rows and wide addends; `self` is borrowed
             return Ok(Relocs { rows: self.rows.clone(), targets, wide: self.wide.clone() });
         }
-        let pending = self
+        let mut pending: Vec<Pending> = self
+            .view()
             .iter_rows()
             .map(|(row, addend)| Pending { at: row.at, target: remap[row.target as usize], kind: row.kind, addend })
+            // alloc: only when `f` makes two targets one
             .collect();
-        Ok(Relocs::assemble(pending, distinct.targets))
+        Ok(Relocs::assemble(&mut pending, distinct.targets, Global))
+    }
+}
+
+impl<T: Eq + Hash> Relocs<T> {
+    /// The table of `relocs`, stopping at the first error: [`FromIterator`]'s, with what only
+    /// building it needs in `frame`.
+    pub fn try_from_iter_in<E>(
+        frame: &Frame,
+        relocs: impl IntoIterator<Item = Result<Relocation<T>, E>>,
+    ) -> Result<Relocs<T>, E> {
+        let relocs = relocs.into_iter();
+        let len = relocs.size_hint().0;
+        // alloc: the table's targets
+        let mut targets = Vec::with_capacity(len);
+        let mut index = HashTable::with_capacity_in(len, frame);
+        let mut pending = Vec::with_capacity_in(len, frame);
+        for it in relocs {
+            let it = it?;
+            let target = index_in(&mut targets, &mut index, it.target);
+            pending.push(Pending { at: it.at, target, kind: it.kind, addend: it.addend });
+        }
+        Ok(Relocs::assemble(&mut pending, targets, frame))
+    }
+}
+
+impl<'a, T> RelocsView<'a, T> {
+    pub const fn empty() -> RelocsView<'a, T> {
+        RelocsView { rows: &[], targets: &[], wide: &[] }
+    }
+
+    pub fn len(self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The rows, sorted by `at`.
+    pub fn rows(self) -> &'a [Reloc] {
+        self.rows
+    }
+
+    /// Each target once, in the order the rows first name them.
+    pub fn targets(self) -> &'a [T] {
+        self.targets
+    }
+
+    /// The addends that don't fit a row, by row index.
+    pub fn wide(self) -> &'a [(u32, i64)] {
+        self.wide
+    }
+
+    pub fn iter(self) -> Iter<'a, T> {
+        Iter { rows: self.rows.iter(), targets: self.targets, wide: self.wide }
+    }
+
+    /// The table, each part copied at its exact length.
+    pub fn to_relocs(self) -> Relocs<T>
+    where
+        T: Clone,
+    {
+        // alloc: a table its caller keeps
+        Relocs { rows: self.rows.to_vec(), targets: self.targets.to_vec(), wide: self.wide.to_vec() }
+    }
+
+    /// [`Relocs::try_map`] of the table viewed, its index and remap in `frame`: it allocates
+    /// only the new table's parts.
+    pub fn try_map_in<U: Eq + Hash, E>(
+        self,
+        frame: &Frame,
+        mut f: impl FnMut(&'a T) -> Result<U, E>,
+    ) -> Result<Relocs<U>, E> {
+        // alloc: the new table's targets, at their exact length
+        let mut targets = Vec::with_capacity(self.targets.len());
+        let mut index = HashTable::with_capacity_in(self.targets.len(), frame);
+        let mut remap = Vec::with_capacity_in(self.targets.len(), frame);
+        for target in self.targets {
+            remap.push(index_in(&mut targets, &mut index, f(target)?));
+        }
+        if targets.len() == self.targets.len() {
+            // alloc: the new table's rows and wide addends, at their exact length
+            return Ok(Relocs { rows: self.rows.to_vec(), targets, wide: self.wide.to_vec() });
+        }
+        let mut pending = Vec::with_capacity_in(self.rows.len(), frame);
+        pending.extend(
+            self.iter_rows()
+                .map(|(row, addend)| Pending { at: row.at, target: remap[row.target as usize], kind: row.kind, addend }),
+        );
+        Ok(Relocs::assemble(&mut pending, targets, frame))
     }
 
     /// Each row with its whole addend.
-    fn iter_rows(&self) -> impl Iterator<Item = (&Reloc, i64)> {
+    fn iter_rows(self) -> impl Iterator<Item = (&'a Reloc, i64)> {
         let mut wide = self.wide.iter();
         self.rows.iter().map(move |row| match row.addend {
             WIDE => (row, wide.next().expect("a wide row has its addend").1),
@@ -274,48 +404,24 @@ impl<T> Relocs<T> {
     }
 }
 
+impl<'a, T: Eq + Hash> RelocsView<'a, T> {
+    /// A view of `rows`, `targets` and `wide` in a table's one order, else what is out of it
+    /// ([`Relocs::from_parts`]'s checks and words), its index in `frame`.
+    pub fn from_parts(
+        rows: &'a [Reloc],
+        targets: &'a [T],
+        wide: &'a [(u32, i64)],
+        frame: &Frame,
+    ) -> Result<RelocsView<'a, T>, &'static str> {
+        check_parts(rows, targets, wide, frame)?;
+        Ok(RelocsView { rows, targets, wide })
+    }
+}
+
 impl<T: Eq + Hash> Relocs<T> {
     /// A table of `rows`, `targets` and `wide` in their one order, else what is out of it.
     pub fn from_parts(rows: Vec<Reloc>, targets: Vec<T>, wide: Vec<(u32, i64)>) -> Result<Relocs<T>, &'static str> {
-        if !rows.is_sorted_by_key(|it| it.at) {
-            return Err("relocations not sorted by offset");
-        }
-        let mut named = 0u32;
-        let mut wide_rows = 0usize;
-        for row in &rows {
-            if row.pad != [0; 3] {
-                return Err("a relocation with nonzero padding");
-            }
-            match row.target.cmp(&named) {
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal if (named as usize) < targets.len() => named += 1,
-                _ => return Err("a relocation target out of first-use order or past the end"),
-            }
-            wide_rows += usize::from(row.addend == WIDE);
-        }
-        if named as usize != targets.len() {
-            return Err("a relocation target no relocation names");
-        }
-        let mut distinct = Distinct::with_capacity(targets.len());
-        for (at, target) in targets.iter().enumerate() {
-            if distinct.index(target) as usize != at {
-                return Err("a relocation target listed twice");
-            }
-        }
-        if wide.len() != wide_rows {
-            return Err("wide addends not one for each wide relocation");
-        }
-        for (at, &(row, addend)) in wide.iter().enumerate() {
-            if at > 0 && wide[at - 1].0 >= row {
-                return Err("wide addends out of order");
-            }
-            if rows.get(row as usize).is_none_or(|it| it.addend != WIDE) {
-                return Err("a wide addend of a relocation that is not wide");
-            }
-            if i32::try_from(addend).is_ok_and(|it| it != WIDE) {
-                return Err("a wide addend that fits its relocation");
-            }
-        }
+        check_parts(&rows, &targets, &wide, Global)?;
         Ok(Relocs { rows, targets, wide })
     }
 
@@ -326,24 +432,79 @@ impl<T: Eq + Hash> Relocs<T> {
         T: Clone,
     {
         let rows: Vec<Relocation<T>> =
+            // clone: off the hot path, as above
             self.iter().map(|it| Relocation { target: it.target.clone(), ..it }).chain([reloc]).collect();
+        // alloc: off the hot path, as above
         *self = rows.into_iter().collect();
     }
+}
+
+/// [`Relocs::from_parts`]'s checks, in its order, the distinct-target index in `alloc`.
+fn check_parts<T: Eq + Hash, A: Allocator>(
+    rows: &[Reloc],
+    targets: &[T],
+    wide: &[(u32, i64)],
+    alloc: A,
+) -> Result<(), &'static str> {
+    if !rows.is_sorted_by_key(|it| it.at) {
+        return Err("relocations not sorted by offset");
+    }
+    let mut named = 0u32;
+    let mut wide_rows = 0usize;
+    for row in rows {
+        if row.pad != [0; 3] {
+            return Err("a relocation with nonzero padding");
+        }
+        match row.target.cmp(&named) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal if (named as usize) < targets.len() => named += 1,
+            _ => return Err("a relocation target out of first-use order or past the end"),
+        }
+        wide_rows += usize::from(row.addend == WIDE);
+    }
+    if named as usize != targets.len() {
+        return Err("a relocation target no relocation names");
+    }
+    let mut index = HashTable::with_capacity_in(targets.len(), alloc);
+    for (at, target) in targets.iter().enumerate() {
+        let hash = FxBuildHasher.hash_one(target);
+        if index.find(hash, |&it: &u32| targets[it as usize] == *target).is_some() {
+            return Err("a relocation target listed twice");
+        }
+        index.insert_unique(hash, at as u32, |&it| FxBuildHasher.hash_one(&targets[it as usize]));
+    }
+    if wide.len() != wide_rows {
+        return Err("wide addends not one for each wide relocation");
+    }
+    for (at, &(row, addend)) in wide.iter().enumerate() {
+        if at > 0 && wide[at - 1].0 >= row {
+            return Err("wide addends out of order");
+        }
+        if rows.get(row as usize).is_none_or(|it| it.addend != WIDE) {
+            return Err("a wide addend of a relocation that is not wide");
+        }
+        if i32::try_from(addend).is_ok_and(|it| it != WIDE) {
+            return Err("a wide addend that fits its relocation");
+        }
+    }
+    Ok(())
 }
 
 impl<T: Eq + Hash> FromIterator<Relocation<T>> for Relocs<T> {
     fn from_iter<I: IntoIterator<Item = Relocation<T>>>(relocs: I) -> Relocs<T> {
         let relocs = relocs.into_iter();
         let mut distinct = Distinct::with_capacity(relocs.size_hint().0);
-        let pending: Vec<Pending> = relocs
+        let mut pending: Vec<Pending> = relocs
             .map(|it| Pending { at: it.at, target: distinct.index(it.target), kind: it.kind, addend: it.addend })
+            // alloc: the rows before their order; a hot caller uses `Relocs::try_from_iter_in`
             .collect();
-        Relocs::assemble(pending, distinct.targets)
+        Relocs::assemble(&mut pending, distinct.targets, Global)
     }
 }
 
 impl<T: Eq + Hash> From<Vec<Relocation<T>>> for Relocs<T> {
     fn from(relocs: Vec<Relocation<T>>) -> Relocs<T> {
+        // alloc: the table made of them
         relocs.into_iter().collect()
     }
 }
@@ -390,6 +551,7 @@ impl<'a, T> IntoIterator for &'a Relocs<T> {
 #[cfg(test)]
 mod tests {
     use blaze_ids::ContentId;
+    use blaze_mem::{Tag, frame};
 
     use super::*;
     use crate::InstanceKey;
@@ -469,5 +631,26 @@ mod tests {
         assert_eq!(merged.targets(), [call(1), call(2)]);
         assert_eq!(owned(&merged), [reloc(1, call(1), 0), reloc(2, call(2), 1 << 40), reloc(3, call(1), 0)]);
         assert_eq!(table.map(Clone::clone), table);
+    }
+
+    #[test]
+    fn a_view_maps_and_checks_as_the_table_does() {
+        let table: Relocs = vec![reloc(1, call(1), 0), reloc(2, call(2), 1 << 40), reloc(3, call(3), 0)].into();
+        let merge = |it: &Target| match it {
+            Target::Function(key) if key.0.0[0] == 3 => Ok::<_, ()>(call(1)),
+            other => Ok(other.clone()),
+        };
+        frame::task(Tag::Codegen, |frame| {
+            assert_eq!(table.view().try_map_in(frame, merge), table.try_map(merge));
+            assert_eq!(table.view().try_map_in(frame, |it| Ok::<_, ()>(it.clone())), Ok(table.clone()));
+            assert_eq!(table.view().to_relocs(), table);
+            let (rows, targets, wide) = table.clone().into_parts();
+            assert_eq!(RelocsView::from_parts(&rows, &targets, &wide, frame), Ok(table.view()));
+            let twice = [call(1), call(1), call(3)];
+            assert_eq!(
+                RelocsView::from_parts(&rows, &twice, &wide, frame),
+                Err("a relocation target listed twice")
+            );
+        });
     }
 }

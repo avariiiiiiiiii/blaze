@@ -26,7 +26,7 @@ use crate::{
 /// adjustments, or one past them for the pattern's own `deref!`.
 pub(super) type DerefKey = (PatId, u32);
 
-impl<'db> MirLowerCtx<'_, 'db> {
+impl<'db> MirLowerCtx<'_, '_, 'db> {
     /// The place a deref pattern at `key` matches its inner pattern against, given the place
     /// of the pointer, `place` of type `pointer`. `test` is set when the pattern is being
     /// tested, where the call is made; binding after reads through the temporary it wrote.
@@ -73,6 +73,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             CallableDefId::FunctionId(method).into(),
             GenericArgs::new_from_slice(&[pointer.into()]),
         ));
+        // alloc: the call's arguments, kept in the body
         let args = Box::new([Operand {
             kind: OperandKind::Move(Place::from(source).store()),
             span: None,

@@ -530,10 +530,12 @@ impl Sim {
         for (file, sim) in self.files.iter().filter(|(it, _)| it.is_under(dir)) {
             for (at, _) in file.as_str()[start..].match_indices('/') {
                 let inner = FileName::new(&file.as_str()[..start + at]).expect("a part of a name");
-                listed.push((inner, Meta { len: 0, dir: true, modified_ns: 0 }));
+                let modified_ns = self.disk.mtime(&inner).unwrap_or(0);
+                listed.push((inner, Meta { len: 0, dir: true, modified_ns }));
             }
+            let modified_ns = self.disk.mtime(file).unwrap_or(0);
             // clone: a name of the listing.
-            listed.push((file.clone(), Meta { len: sim.len(), dir: false, modified_ns: 0 }));
+            listed.push((file.clone(), Meta { len: sim.len(), dir: false, modified_ns }));
         }
         if listed.is_empty() {
             // alloc: an error's message.
@@ -803,6 +805,14 @@ impl Sim {
                 // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{file}: no such file"))),
             },
+            Effect::Times { file, modified_ns, .. } => match self.disk.times(&file, modified_ns, &self.files) {
+                true => {
+                    self.tell_journals();
+                    Done::Timed
+                }
+                // alloc: an error's message.
+                false => Done::Failed(IoError(format!("{file}: no such file or directory"))),
+            },
             Effect::Clone { from, to, .. } | Effect::Link { from, to, .. }
                 if !self.files.contains_key(&from) =>
             {
@@ -827,12 +837,15 @@ impl Sim {
                 self.copy(&from, &to);
                 Done::Linked
             }
-            Effect::Stat { file, .. } => Done::Stat(match self.files.get(&file) {
-                Some(it) => Some(Meta { len: it.len(), dir: false, modified_ns: 0 }),
-                None if self.files.keys().any(|it| it != &file && it.is_under(&file)) => {
-                    Some(Meta { len: 0, dir: true, modified_ns: 0 })
+            Effect::Stat { file, .. } => Done::Stat({
+                let modified_ns = self.disk.mtime(&file).unwrap_or(0);
+                match self.files.get(&file) {
+                    Some(it) => Some(Meta { len: it.len(), dir: false, modified_ns }),
+                    None if self.files.keys().any(|it| it != &file && it.is_under(&file)) => {
+                        Some(Meta { len: 0, dir: true, modified_ns })
+                    }
+                    None => None,
                 }
-                None => None,
             }),
             Effect::List { dir, .. } => self.list(&dir),
             Effect::Stamp { files, .. } => Done::Stamped(
@@ -860,7 +873,7 @@ impl Sim {
             Effect::Timer { .. } => Done::Fired,
             Effect::Map { file, .. } => {
                 // alloc: the mapping, which the completion carries.
-                Done::Mapped(crate::Mapping(std::sync::Arc::new(self.contents(&file))))
+                Done::Mapped(crate::Mapping::copy(&self.contents(&file)))
             }
             Effect::Spawn { .. } => match spawn.and_then(|id| self.spawns.remove_id(id)) {
                 // alloc: the exit, which the completion carries.
@@ -1330,6 +1343,84 @@ mod tests {
         );
         let mut effects = vec![Effect::WriteAt { file: to, at: 0, bytes: vec![1], tag: Tag(3) }];
         run_until_idle(&mut sim, &mut effects, |it, _| assert!(matches!(it.done, Done::Failed(_))));
+    }
+
+    /// A file's times set: its stamp's mtime is the time given and its change time moves, its
+    /// inode, bytes and mode do not; a stat and a listing read the time, a crash keeps it, and
+    /// a later write moves it on. A name not there, never made or renamed away, fails naming
+    /// it, and changes nothing. On every seed, with failures injected: one that fails leaves
+    /// the time as it was.
+    #[test]
+    fn times_set_the_mtime_a_stat_reads_on_every_seed() {
+        let (file, moved) = (name("target/build/output"), name("target/moved"));
+        for seed in 0..200 {
+            let mut sim = Sim::new(seed, Faults { fail_one_in: 4, ..Faults::default() });
+            sim.change(&file, b"cargo::rerun-if-changed=build.rs\n");
+            let before = sim.stamp(&file);
+            let at = 1_700_000_000_123_456_789 + seed;
+            let mut done = None;
+            let mut effects = vec![Effect::Times { file: file.clone(), modified_ns: at, tag: Tag(1) }];
+            run_until_idle(&mut sim, &mut effects, |it, _| done = Some(it.done));
+            let after = sim.stamp(&file);
+            assert_eq!((after.ino, after.size, after.mode), (before.ino, before.size, before.mode), "seed {seed}");
+            match done.expect("completed") {
+                Done::Timed => {
+                    assert_eq!(after.mtime_ns, at, "seed {seed}");
+                    assert!(after.ctime_ns > before.ctime_ns, "seed {seed}");
+                }
+                Done::Failed(_) => {
+                    assert_eq!(after, before, "seed {seed}: a failed set changed the stamp");
+                    continue;
+                }
+                other => panic!("seed {seed}: {other:?}"),
+            }
+            assert_eq!(sim.contents(&file), b"cargo::rerun-if-changed=build.rs\n", "seed {seed}");
+            let mut seen = BTreeMap::new();
+            let mut effects = vec![
+                Effect::Stat { file: file.clone(), tag: Tag(2) },
+                Effect::List { dir: name("target"), tag: Tag(3) },
+            ];
+            run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag.0, it.done));
+            if let Some(Done::Stat(stat)) = seen.get(&2) {
+                assert_eq!(*stat, Some(Meta { len: 33, dir: false, modified_ns: at }), "seed {seed}");
+            }
+            if let Some(Done::Listed(listed)) = seen.get(&3) {
+                assert!(listed.contains(&(file.clone(), Meta { len: 33, dir: false, modified_ns: at })), "seed {seed}");
+            }
+            sim.crash();
+            assert_eq!(sim.stamp(&file).mtime_ns, at, "seed {seed}: the time is the inode's, which a crash keeps");
+            let mut seen = BTreeMap::new();
+            let mut effects = vec![
+                Effect::Times { file: name("target/never-written"), modified_ns: at, tag: Tag(4) },
+                Effect::Rename { from: file.clone(), to: moved.clone(), tag: Tag(5) },
+            ];
+            run_until_idle(&mut sim, &mut effects, |it, effects| {
+                if it.tag == Tag(5) {
+                    effects.push(Effect::Times { file: file.clone(), modified_ns: 1, tag: Tag(6) });
+                }
+                seen.insert(it.tag.0, it.done);
+            });
+            assert!(
+                matches!(&seen[&4], Done::Failed(why) if why.0.contains("target/never-written")),
+                "seed {seed}: {:?}",
+                seen[&4]
+            );
+            if seen[&5] == Done::Renamed {
+                assert!(
+                    matches!(&seen[&6], Done::Failed(why) if why.0.contains("target/build/output")),
+                    "seed {seed}: {:?}",
+                    seen[&6]
+                );
+                assert_eq!(sim.stamp(&moved).mtime_ns, at, "seed {seed}: a rename keeps the time");
+                assert_eq!(sim.stamp(&file), Stamp::GONE, "seed {seed}: a failed set makes nothing");
+            }
+            let mut effects = vec![Effect::Write { file: moved.clone(), bytes: b"again".to_vec(), tag: Tag(7) }];
+            let mut written = false;
+            run_until_idle(&mut sim, &mut effects, |it, _| written = it.done == Done::Written);
+            if written {
+                assert_ne!(sim.stamp(&moved).mtime_ns, at, "seed {seed}: a write moves the mtime on");
+            }
+        }
     }
 
     /// A whole-file write is all or nothing over a crash at any point, on every seed.

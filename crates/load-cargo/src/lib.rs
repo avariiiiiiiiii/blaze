@@ -437,7 +437,6 @@ impl Loaded {
         }
         step("read", &mut steps);
 
-        db.enable_proc_attr_macros();
         let mut fsc = FileSetConfig::builder();
         for (paths, _) in &self.file_sets {
             fsc.add_file_set(paths.clone());
@@ -467,8 +466,15 @@ impl Loaded {
             }
             db.set_source_root_with_durability(root_id, triomphe::Arc::new(root), durability);
         }
-        LocalRoots::get(db).set_roots(db).to(local_roots);
-        LibraryRoots::get(db).set_roots(db).to(library_roots);
+        // A build's database (`Db::new`) has no roots until its first workspace is loaded.
+        match LocalRoots::try_get(db) {
+            Some(it) => _ = it.set_roots(db).to(local_roots),
+            None => _ = LocalRoots::builder(local_roots).durability(Durability::MEDIUM).new(db),
+        }
+        match LibraryRoots::try_get(db) {
+            Some(it) => _ = it.set_roots(db).to(library_roots),
+            None => _ = LibraryRoots::builder(library_roots).durability(Durability::MEDIUM).new(db),
+        }
         step("roots", &mut steps);
 
         let mut change = ChangeWithProcMacros::default();

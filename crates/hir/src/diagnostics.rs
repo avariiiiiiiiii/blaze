@@ -151,10 +151,12 @@ diagnostics![AnyDiagnostic<'db> ->
     CannotImplicitlyDerefTraitObject<'db>,
     CannotIndexInto<'db>,
     CastToUnsized<'db>,
+    EditionDependentMethodCall,
     ExpectedArrayOrSlicePat<'db>,
     ExpectedFunction<'db>,
     ExplicitDropMethodUse,
     FruInDestructuringAssignment,
+    FullyQualifiedCallFrom2018<'db>,
     MissingBody,
     FunctionalRecordUpdateOnNonStruct,
     GenericDefaultRefersToSelf,
@@ -1268,6 +1270,31 @@ pub struct MethodCallIllegalSizedBound {
     pub candidates: Vec<crate::Trait>,
 }
 
+/// rustc's `lint_edition_dependent_dot_call`: a method call that a later edition's prelude or
+/// `IntoIterator` impl resolves to another method.
+#[derive(Debug)]
+pub struct EditionDependentMethodCall {
+    pub call_expr: InFile<AstPtr<ast::MethodCallExpr>>,
+    pub receiver: InFile<ExprOrPatPtr>,
+    pub lint: crate::EditionLint,
+    /// The picked method, which the suggestion calls by its trait's or type's path.
+    pub method: Function,
+    /// An inherent or trait object pick: the suggestion only adjusts the receiver.
+    pub inherent: bool,
+    pub autoderefs: u32,
+    pub autoref: Option<crate::ReceiverAdjustment>,
+}
+
+/// rustc's `lint_fully_qualified_call_from_2018`: a type-relative path to `try_from`,
+/// `try_into` or `from_iter` that the 2021 prelude makes ambiguous.
+#[derive(Debug)]
+pub struct FullyQualifiedCallFrom2018<'db> {
+    pub expr_or_pat: InFile<ExprOrPatPtr>,
+    /// The picked item, whose trait the suggestion names.
+    pub item: AssocItem,
+    pub self_ty: Type<'db>,
+}
+
 #[derive(Debug)]
 pub struct PatternArgInExternFn {
     pub node: InFile<AstPtr<ast::Pat>>,
@@ -1983,6 +2010,8 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     Ok(it) => it,
                     Err(_) => return block(),
                 },
+                // Only an optimized body inlines; the borrow checker reads built ones.
+                MirSpan::Inlined(_) => return None,
             };
             Some(source.map(|it| it.syntax_node_ptr()))
         };
@@ -2813,6 +2842,37 @@ impl<'db> AnyDiagnostic<'db> {
                 candidates: candidates.iter().map(|&id| crate::Trait { id }).collect(),
             }
             .into(),
+            &InferenceDiagnostic::EditionDependentMethodCall {
+                call_expr,
+                receiver,
+                lint,
+                method,
+                inherent,
+                autoderefs,
+                autoref,
+            } => {
+                let call_expr = expr_syntax(call_expr)?;
+                let call_expr =
+                    call_expr.with_value(call_expr.value.cast::<ast::MethodCallExpr>()?);
+                EditionDependentMethodCall {
+                    call_expr,
+                    receiver: expr_syntax(receiver)?,
+                    lint,
+                    method: method.into(),
+                    inherent,
+                    autoderefs,
+                    autoref,
+                }
+                .into()
+            }
+            InferenceDiagnostic::FullyQualifiedCallFrom2018 { node, item, self_ty } => {
+                FullyQualifiedCallFrom2018 {
+                    expr_or_pat: expr_or_pat_syntax(node.unpack())?,
+                    item: (*item).into(),
+                    self_ty: new_ty(self_ty.as_ref()),
+                }
+                .into()
+            }
             &InferenceDiagnostic::TypeMustBeKnown { at_point, ref top_term, kind, ref ambiguity } => {
                 let at_point = span_syntax(at_point)?;
                 let target = DisplayTarget::from_crate_and_edition(db, krate, edition);

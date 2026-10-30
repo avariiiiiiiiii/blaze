@@ -16,6 +16,8 @@ doctest = false
 rustc-hash.workspace = true
 la-arena.workspace = true
 smallvec.workspace = true
+blaze-mem.workspace = true
+hashbrown.workspace = true
 salsa.workspace = true
 
 ra-ap-rustc_ast_ir.workspace = true
@@ -33,6 +35,7 @@ syntax.workspace = true
 
 [dev-dependencies]
 test-fixture.workspace = true
+blaze-alloc-count.workspace = true
 
 [features]
 in-rust-tree = ["hir-ty/in-rust-tree"]

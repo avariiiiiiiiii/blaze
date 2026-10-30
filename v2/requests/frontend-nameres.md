@@ -273,6 +273,14 @@ A source file's item tree is now assembled from per-item queries (`crates/hir-de
 
 > forwarded to db (hir-def's nameres tests are its; told by tmux). Refreshing needs a test run: at the first build, as the hir-ide half (requests.md).
 
+> frontend-nameres (21:16): not ours to apply (`nameres/tests/incremental.rs` is db's), and it
+> can't be refreshed by hand without a run. Note for the same refresh: since db applied
+> `frontend-nameres-core`'s hook, `crate_local_def_map` runs the per-module resolver, so the
+> executed lists also gain its queries (`module_decls`, `round_modules`, `partition`,
+> `round_active`, `scc_state`, `fact_handle`, `macro_step`, `module_round` and the rest of
+> `facts/kinds.rs`). Each test's `required` counts on `crate_local_def_map` still hold; one
+> `UPDATE_EXPECT=1` pass at the first build takes both changes.
+
 ## core-macros
 
 - db (`v2/requests/db.md`, `## frontend-nameres-core-macros: PerNsGlobImports::of_scope`): one
@@ -382,6 +390,19 @@ importers only.
 > `~/restart-2026-10-28/briefs/v2/frontend-nameres-active.md`), with the 50-module test in
 > `facts/tests/active.rs`; it answers here when done.
 
+> answered by frontend-nameres-active (2026-10-29), all four points, unbuilt
+> (`nameres-core.md` §9, report `/tmp/blaze-lanes/v2-frontend-nameres-active.md`). `RoundModules`
+> gained `active` (the modules that step or gain ops), `since`, `ran` and `last_step`. Which
+> components run is a query of its own, `round_active` (kind `0x2218`), because it needs
+> `partition(r)`, which is built from `RoundModules`. Readers of an idle module ask
+> `fact_handle(fact_key)`, which names the `since` round. `macro_step`, `module_round` and
+> `unresolved_named` run only for active modules. `child_key` is now a look-up, with kind
+> `0x2210` unused. `subtree_macro_exports` reads a leaf child in place and returns at once
+> without children or root writes; the root still asks it of each child, as the firewall.
+> `legacy_exports` was already asked only of `#[macro_use]` children. The test asserts that
+> round 2 runs `macro_step` and `module_round` for `leaf` only, and `scc_state` for `leaf` and
+> `m1`-`m4` only.
+
 ### 2. hot_lint, per file
 
 - `collect.rs`, `visibility: visibility.clone(),` (~L1234): the `// clone:` comment spans two
@@ -463,3 +484,7 @@ marked):
   (`for_each_crate_and_block_trait_and_type` passes `for_each` last, by move: unchanged.)
 
 > applied: `method_resolution.rs` is items' (DONE): the five `for_each` parameters are `&mut impl FnMut(..)`, and `TraitImpls::for_each_crate_and_block` passes `&mut *for_each` to `for_each_block`; every caller passes a closure (hir two, next_solver two) (requests, pass 18).
+
+## frontend-nameres-active: owner hooks
+
+- `v2/requests/frontend-nameres-core-collect.md`, `## frontend-nameres-active: find_key's SAFETY comment names child_key as a query`: one comment line in `collect.rs` `find_key`, now that `child_key` is no query.

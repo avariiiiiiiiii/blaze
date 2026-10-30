@@ -556,11 +556,12 @@ impl<'a> ColdBatchRef<'a> {
     }
 
     fn impl_keys(&self) -> Result<Box<[ImplId]>, FormatError> {
-        let keys: Box<[ImplId]> = self
-            .keys
-            .iter()
-            .map(|&bits| salsa_id(bits).map(ImplId::from_id).ok_or(self.invalid("an impl of id 0")))
-            .collect::<Result<_, _>>()?;
+        let keys: Box<[ImplId]> = exact(
+            self.keys.len(),
+            self.keys.iter().map(|&bits| {
+                salsa_id(bits).map(ImplId::from_id).ok_or(self.invalid("an impl of id 0"))
+            }),
+        )?;
         self.ensure(keys.is_sorted_by(|a, b| a < b), "impls that are not ascending")?;
         Ok(keys)
     }
@@ -571,27 +572,25 @@ impl<'a> ColdBatchRef<'a> {
     ) -> Result<CrateFieldTypes<'db>, FormatError> {
         self.expect(BatchKind::FieldTypes)?;
         let tys = self.table(interner)?;
-        let variants: Box<[VariantId]> = self
-            .key_tags
-            .iter()
-            .zip(self.keys)
-            .map(|(&tag, &bits)| variant_of(tag, bits).ok_or(self.invalid("a variant of no kind or id 0")))
-            .collect::<Result<_, _>>()?;
+        let variants: Box<[VariantId]> = exact(
+            self.keys.len(),
+            self.key_tags.iter().zip(self.keys).map(|(&tag, &bits)| {
+                variant_of(tag, bits).ok_or(self.invalid("a variant of no kind or id 0"))
+            }),
+        )?;
         self.ensure(variants.is_sorted_by(|a, b| a < b), "variants that are not ascending")?;
-        let fields = self
-            .tys
-            .iter()
-            .zip(self.defaults)
-            .map(|(&ty, &default)| {
-                Ok(FieldType {
+        let fields = exact(
+            self.tys.len(),
+            self.tys.iter().zip(self.defaults).map(|(&ty, &default)| {
+                Ok::<_, FormatError>(FieldType {
                     ty: StoredEarlyBinder::bind(interner, tys.ty(ty)?.store()),
                     default: match default {
                         0 => None,
                         at => Some(StoredEarlyBinder::bind(interner, tys.konst(at - 1)?.store())),
                     },
                 })
-            })
-            .collect::<Result<_, FormatError>>()?;
+            }),
+        )?;
         Ok(CrateFieldTypes {
             variants,
             starts: Box::from(self.starts),
@@ -606,11 +605,12 @@ impl<'a> ColdBatchRef<'a> {
     ) -> Result<CrateImplSelfTys<'db>, FormatError> {
         self.expect(BatchKind::ImplSelfTys)?;
         let tys = self.table(interner)?;
-        let values = self
-            .tys
-            .iter()
-            .map(|&ty| Ok(StoredEarlyBinder::bind(interner, tys.ty(ty)?.store())))
-            .collect::<Result<_, FormatError>>()?;
+        let values = exact(
+            self.tys.len(),
+            self.tys
+                .iter()
+                .map(|&ty| Ok::<_, FormatError>(StoredEarlyBinder::bind(interner, tys.ty(ty)?.store()))),
+        )?;
         Ok(Batch { keys: self.impl_keys()?, values, side: self.side_table()? })
     }
 
@@ -620,21 +620,19 @@ impl<'a> ColdBatchRef<'a> {
     ) -> Result<CrateImplTraits<'db>, FormatError> {
         self.expect(BatchKind::ImplTraits)?;
         let tys = self.table(interner)?;
-        let values = self
-            .trait_ids
-            .iter()
-            .zip(self.trait_args)
-            .map(|(&trait_id, &args)| {
+        let values = exact(
+            self.trait_ids.len(),
+            self.trait_ids.iter().zip(self.trait_args).map(|(&trait_id, &args)| {
                 if trait_id == 0 {
-                    return Ok(None);
+                    return Ok::<_, FormatError>(None);
                 }
                 let trait_id = salsa_id(trait_id)
                     .map(TraitId::from_id)
                     .ok_or(self.invalid("a trait of id index 0"))?;
                 let trait_ref = TraitRef::new_from_args(interner, trait_id.into(), tys.args(args)?);
                 Ok(Some(StoredEarlyBinder::bind(interner, StoredTraitRef::new(trait_ref))))
-            })
-            .collect::<Result<_, FormatError>>()?;
+            }),
+        )?;
         Ok(Batch { keys: self.impl_keys()?, values, side: self.side_table()? })
     }
 
@@ -644,10 +642,9 @@ impl<'a> ColdBatchRef<'a> {
     ) -> Result<CrateImplPredicates<'db>, FormatError> {
         self.expect(BatchKind::ImplPredicates)?;
         let tys = self.table(interner)?;
-        let values = self
-            .predicates
-            .iter()
-            .map(|it| {
+        let values = exact(
+            self.predicates.len(),
+            self.predicates.iter().map(|it| -> Result<_, FormatError> {
                 let clauses = tys.clauses(it.clauses)?;
                 let has_trait_implied_predicate = match it.has_trait_implied_predicate {
                     0 => false,
@@ -668,29 +665,33 @@ impl<'a> ColdBatchRef<'a> {
                     own_predicates_start: it.own_predicates_start,
                     own_assoc_ty_bounds_start: it.own_assoc_ty_bounds_start,
                 })
-            })
-            .collect::<Result<_, FormatError>>()?;
+            }),
+        )?;
         Ok(Batch { keys: self.impl_keys()?, values, side: self.side_table()? })
     }
 
     fn side_table<'db>(&self) -> Result<SideTable<'db>, FormatError> {
         let side = &self.side;
         let mut words = Words { words: side.diagnostics, next: 0, at: self.at };
-        let mut diagnostics = Vec::new();
-        while !words.is_done() {
-            diagnostics.push(words.diagnostic()?);
-        }
+        // A reader is an entry point called outside queries, so it opens a task (R1).
+        let diagnostics: Box<[TyLoweringDiagnostic]> =
+            blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+                let mut diagnostics = Vec::new_in(frame);
+                while !words.is_done() {
+                    diagnostics.push(words.diagnostic()?);
+                }
+                Ok::<_, FormatError>(diagnostics.drain(..).collect()) // alloc: the column, exact size
+            })?;
         self.ensure(
             side.diagnostics_at.last().is_none_or(|&it| it as usize <= diagnostics.len()),
             "a side table start past its diagnostics",
         )?;
-        let anon_consts: Box<[AnonConstId<'db>]> = side
-            .anon_consts
-            .iter()
-            .map(|&bits| {
+        let anon_consts: Box<[AnonConstId<'db>]> = exact(
+            side.anon_consts.len(),
+            side.anon_consts.iter().map(|&bits| {
                 salsa_id(bits).map(AnonConstId::from_id).ok_or(self.invalid("a constant of id 0"))
-            })
-            .collect::<Result<_, _>>()?;
+            }),
+        )?;
         let range = |starts: &[u32], at: usize, len: usize| {
             starts[at] as usize..starts.get(at + 1).map_or(len, |&it| it as usize)
         };
@@ -705,10 +706,20 @@ impl<'a> ColdBatchRef<'a> {
             rows: Box::from(side.rows),
             diagnostics_at: Box::from(side.diagnostics_at),
             anon_consts_at: Box::from(side.anon_consts_at),
-            diagnostics: diagnostics.into_boxed_slice(),
+            diagnostics,
             anon_consts,
         })
     }
+}
+
+/// A read batch's own column of `len` items, allocated once: `collect::<Result<Box<[_]>, _>>`
+/// would grow it from nothing and copy it again to fit.
+fn exact<T, E>(len: usize, items: impl Iterator<Item = Result<T, E>>) -> Result<Box<[T]>, E> {
+    let mut column = Vec::with_capacity(len); // alloc: a read batch's own column, exact size
+    for it in items {
+        column.push(it?);
+    }
+    Ok(column.into_boxed_slice())
 }
 
 impl ColdSide {
@@ -1020,7 +1031,7 @@ impl Words<'_> {
                     return Err(self.invalid("more placeholders than words"));
                 }
                 // alloc: an error's sites.
-                let sources = (0..len).map(|_| self.span()).collect::<Result<_, _>>()?;
+                let sources = exact(len, (0..len).map(|_| self.span()))?;
                 TyLoweringDiagnostic::InferVarsNotAllowed { sources }
             }
             2 => {
@@ -1074,7 +1085,7 @@ impl Words<'_> {
                     return Err(self.invalid("more prohibited segments than words"));
                 }
                 // alloc: an error's segments.
-                let segments = (0..len).map(|_| self.u32()).collect::<Result<_, _>>()?;
+                let segments = exact(len, (0..len).map(|_| self.u32()))?;
                 PathLoweringDiagnostic::GenericArgsProhibited { segments, reason }
             }
             1 => PathLoweringDiagnostic::ParenthesizedGenericArgsWithoutFnTrait {
@@ -1151,6 +1162,14 @@ mod tests {
             let copied: Vec<u8> = words.iter().flat_map(|it| it.to_ne_bytes()).collect();
             assert_eq!(bytes_of(&words), &copied[..], "{len} words");
         }
+    }
+
+    #[test]
+    fn a_read_column_is_one_allocation() {
+        let (column, used) = blaze_alloc_count::measure(|| {
+            exact::<u32, ()>(1000, (0..1000).map(Ok))
+        });
+        assert_eq!((used.allocations, column.unwrap().len()), (1, 1000));
     }
 
     fn id(index: u32) -> salsa::Id {

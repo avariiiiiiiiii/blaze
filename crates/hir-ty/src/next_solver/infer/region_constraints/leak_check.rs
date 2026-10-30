@@ -363,39 +363,9 @@ impl Sccs {
     /// `O(nodes + edges)`: the edges go to CSR by two stable counting passes (by target, then
     /// by source), which is the `(source, target)` order of rustc's sort without comparing.
     fn new(num_nodes: usize, edges: Vec<(u32, u32)>) -> Sccs {
-        /// A stable counting sort of `input` by `key` (below `num_nodes`), with where each
-        /// key's run starts.
-        fn counting_pass(
-            num_nodes: usize,
-            input: &[(u32, u32)],
-            key: fn(&(u32, u32)) -> u32,
-        ) -> (Vec<(u32, u32)>, Vec<u32>) {
-            // alloc: per leak check past a binder, sized to its region graph.
-            let mut starts = vec![0u32; num_nodes + 1];
-            for edge in input {
-                starts[key(edge) as usize + 1] += 1;
-            }
-            for at in 0..num_nodes {
-                starts[at + 1] += starts[at];
-            }
-            // alloc: per leak check past a binder, sized to its region graph.
-            let mut output = vec![(0u32, 0u32); input.len()];
-            // alloc: per leak check past a binder, sized to its region graph.
-            let mut next = starts.clone();
-            for edge in input {
-                let slot = &mut next[key(edge) as usize];
-                output[*slot as usize] = *edge;
-                *slot += 1;
-            }
-            (output, starts)
-        }
-        let (by_target, _) = counting_pass(num_nodes, &edges, |edge| edge.1);
-        drop(edges);
-        let (sorted, starts) = counting_pass(num_nodes, &by_target, |edge| edge.0);
-        drop(by_target);
         // alloc: per leak check past a binder, sized to its region graph.
-        let targets: Vec<u32> = sorted.iter().map(|&(_, target)| target).collect();
-        drop(sorted);
+        let (starts, targets) = radix::Csr::graph(num_nodes, edges.iter().copied()).into_parts();
+        drop(edges);
 
         const UNVISITED: u32 = u32::MAX;
         // alloc: per leak check past a binder, sized to its region graph.

@@ -12,7 +12,7 @@ use crate::{
     lints::code_fact,
     lower::{
         Found, Phase,
-        break_outside_of_loop::{ancestors, is_item},
+        break_outside_of_loop::{edges, is_item},
     },
     model::Diag,
 };
@@ -38,9 +38,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::AwaitOutsideOfAsync) -> Vec<Found>
 /// signature, a closure's head (`move |x| -> T`), a `gen` block, an anonymous const's
 /// expression; none in a `const` or `static` item's own body.
 fn scope(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<InFile<TextRange>> {
-    let chain = ancestors(cx, node);
-    for (i, ancestor) in chain.iter().enumerate().skip(1) {
-        let child = &chain[i - 1].value;
+    for (ancestor, child) in edges(cx, node) {
+        let child = &child.value;
         let value = &ancestor.value;
         if let Some(it) = ast::Fn::cast(value.clone()) {
             return Some(ancestor.with_value(signature_range(&it)));

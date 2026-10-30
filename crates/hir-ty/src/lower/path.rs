@@ -60,7 +60,7 @@ pub(crate) struct PathDiagnosticCallback<'a, 'db> {
 pub(crate) struct PathLoweringContext<'a, 'b, 'db> {
     ctx: &'a mut TyLoweringContext<'db, 'b>,
     on_diagnostic: PathDiagnosticCallback<'a, 'db>,
-    path: &'a Path,
+    path: Path<'a>,
     segments: PathSegments<'a>,
     current_segment_idx: usize,
     /// Contains the previous segment if `current_segment_idx == segments.len()`
@@ -74,7 +74,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
     pub(crate) fn new(
         ctx: &'a mut TyLoweringContext<'db, 'b>,
         on_diagnostic: PathDiagnosticCallback<'a, 'db>,
-        path: &'a Path,
+        path: Path<'a>,
     ) -> Self {
         let segments = path.segments();
         let first_segment = segments.first().unwrap_or(PathSegment::MISSING);
@@ -761,7 +761,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
 
     pub(super) fn substs_from_args_and_bindings(
         &mut self,
-        args_and_bindings: Option<&HirGenericArgs>,
+        args_and_bindings: Option<HirGenericArgs<'_>>,
         def: GenericDefId,
         infer_args: bool,
         explicit_self_ty: Option<Ty<'db>>,
@@ -1022,7 +1022,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         // that method to optionally take parent `Substitution` as we already know them at
                         // this point (`super_trait_ref.substitution`).
                         this.substs_from_args_and_bindings(
-                            binding.args.as_ref(),
+                            binding.args,
                             associated_ty.into(),
                             false, // this is not relevant
                             Some(super_trait_args.type_at(0)),
@@ -1124,7 +1124,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
 /// A const that were parsed like a type.
 pub(crate) enum TypeLikeConst<'a> {
     Infer,
-    Path(&'a Path),
+    Path(Path<'a>),
 }
 
 pub(crate) trait GenericArgsLowerer<'db> {
@@ -1195,7 +1195,7 @@ pub(crate) trait GenericArgsLowerer<'db> {
 /// Returns whether there was an error, and whether the lifetime arguments are ignored as `def`
 /// has late-bound lifetimes (rustc's `ExplicitLateBound::Yes`).
 fn check_generic_args_len<'db>(
-    args_and_bindings: Option<&HirGenericArgs>,
+    args_and_bindings: Option<HirGenericArgs<'_>>,
     def: GenericDefId,
     def_generics: &Generics<'db>,
     has_late_bound_lifetimes: bool,
@@ -1311,7 +1311,7 @@ fn has_late_bound_lifetimes(
 pub(crate) fn substs_from_args_and_bindings<'db>(
     db: &'db Db,
     store: &ExpressionStore,
-    args_and_bindings: Option<&HirGenericArgs>,
+    args_and_bindings: Option<HirGenericArgs<'_>>,
     def: GenericDefId,
     mut infer_args: bool,
     lifetime_elision: LifetimeElisionKind<'db>,
@@ -1329,7 +1329,7 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
     // - Lifetime parameters
     // - Type or Const parameters
     let def_generics = generics(db, def);
-    let args_slice = args_and_bindings.map(|it| &*it.args).unwrap_or_default();
+    let args_slice = args_and_bindings.map(|it| it.args).unwrap_or_default();
 
     // We do not allow inference if there are specified args, i.e. we do not allow partial inference.
     let has_non_lifetime_args =

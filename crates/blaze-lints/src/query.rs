@@ -18,7 +18,7 @@ use hir_def::{
 use rustc_hash::FxHashSet;
 use syntax::TextRange;
 
-use crate::{blaze, check, conf::Conf, diag::Diagnostic, lints};
+use crate::{blaze, check, conf::Conf, diag::Diag, lints};
 
 /// The lints a query runs, which may be above `allow` where it looks, and the configuration
 /// they read.
@@ -51,7 +51,7 @@ pub(crate) struct Finding {
     /// Where rustc's walk over the crate comes to it.
     pub(crate) place: Place,
     /// Its spans are of the query's tree, but for those of other files.
-    pub(crate) diagnostic: Diagnostic,
+    pub(crate) diagnostic: Diag,
 }
 
 /// Which lint a finding is of.

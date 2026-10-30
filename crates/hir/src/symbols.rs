@@ -1,13 +1,14 @@
 //! File symbol extraction.
 
 use salsa::Database as _;
-use std::marker::PhantomData;
+use std::{hash::BuildHasher as _, marker::PhantomData};
 
-use base_db::{Db, FxIndexSet, salsa::SalsaValue};
+use base_db::{Db, salsa::SalsaValue};
+use blaze_mem::Frame;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, AstIdLoc, Complete, DefWithBodyId, ExternCrateId, HasModule, ImplId,
-    Lookup, MacroId, ModuleDefId, ModuleId, TraitId,
+    Lookup, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
     expr_store::Body,
     item_scope::{ImportId, ImportOrExternCrate, ImportOrGlob},
     nameres::crate_def_map,
@@ -22,10 +23,13 @@ use hir_ide::{
     display::{HirDisplay, hir_display_with_store},
 };
 use intern::Symbol;
-use rustc_hash::FxHashMap;
-use syntax::{AstNode, AstPtr, SyntaxNode, SyntaxNodePtr, ToSmolStr, ast::HasName};
+use rustc_hash::FxBuildHasher;
+use syntax::{
+    AstNode, AstPtr, SyntaxNode, SyntaxNodePtr, ToSmolStr,
+    ast::{self, HasName},
+};
 
-use crate::{Crate, HasCrate, Module, ModuleDef, Semantics};
+use crate::{Crate, HasCrate, InFile, Module, ModuleDef, Semantics};
 
 /// The actual data that is stored in the index. It should be as compact as
 /// possible.
@@ -93,22 +97,36 @@ struct SymbolCollectorWork {
     parent: Option<Name>,
 }
 
-pub struct SymbolCollector<'db> {
+pub struct SymbolCollector<'db, 'f> {
     db: &'db Db,
-    symbols: FxIndexSet<FileSymbol<'db>>,
-    work: Vec<SymbolCollectorWork>,
+    /// The symbols so far, first found first.
+    order: Vec<FileSymbol<'db>, &'f Frame>,
+    /// `order`'s indices, by the symbol's hash: a symbol found again is not pushed again.
+    seen: hashbrown::HashTable<u32, &'f Frame>,
+    work: Vec<SymbolCollectorWork, &'f Frame>,
+    /// A `use` item's child sources, for the module being collected.
+    import_child_sources: ImportChildSources<'f>,
     current_container_name: Option<Symbol>,
     collect_pub_only: bool,
 }
 
+type ImportChildSources<'f> = hashbrown::HashMap<
+    UseId,
+    InFile<la_arena::ArenaMap<la_arena::Idx<ast::UseTree>, ast::UseTree>>,
+    FxBuildHasher,
+    &'f Frame,
+>;
+
 /// Given a [`ModuleId`] and a [`HirDatabase`], use the DefMap for the module's crate to collect
 /// all symbols that should be indexed for the given module.
-impl<'a> SymbolCollector<'a> {
-    pub fn new(db: &'a Db, collect_pub_only: bool) -> Self {
+impl<'a, 'f> SymbolCollector<'a, 'f> {
+    pub fn new(db: &'a Db, frame: &'f Frame, collect_pub_only: bool) -> Self {
         SymbolCollector {
             db,
-            symbols: Default::default(),
-            work: Default::default(),
+            order: Vec::new_in(frame),
+            seen: hashbrown::HashTable::new_in(frame),
+            work: Vec::new_in(frame),
+            import_child_sources: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
             current_container_name: None,
             collect_pub_only,
         }
@@ -116,12 +134,25 @@ impl<'a> SymbolCollector<'a> {
 
     pub fn new_module(
         db: &'a Db,
+        frame: &'f Frame,
         module: Module,
         collect_pub_only: bool,
     ) -> Box<[FileSymbol<'a>]> {
-        let mut symbol_collector = SymbolCollector::new(db, collect_pub_only);
+        let mut symbol_collector = SymbolCollector::new(db, frame, collect_pub_only);
         symbol_collector.collect(module);
         symbol_collector.finish()
+    }
+
+    /// Pushes `symbol` unless it was found before: `FxIndexSet::insert`'s order and dedup.
+    fn push_symbol(&mut self, symbol: FileSymbol<'a>) {
+        let hash = FxBuildHasher.hash_one(&symbol);
+        let order = &self.order;
+        if self.seen.find(hash, |&at| order[at as usize] == symbol).is_some() {
+            return;
+        }
+        let at = u32::try_from(self.order.len()).expect("more than u32::MAX symbols in a module");
+        self.seen.insert_unique(hash, at, |&at| FxBuildHasher.hash_one(&self.order[at as usize]));
+        self.order.push(symbol);
     }
 
     pub fn collect(&mut self, module: Module) {
@@ -155,7 +186,7 @@ impl<'a> SymbolCollector<'a> {
         let loc = DeclarationLocation { hir_file_id, ptr, name_ptr: None };
         let root_module = krate.root_module(self.db);
 
-        self.symbols.insert(FileSymbol {
+        self.push_symbol(FileSymbol {
             name: crate_name.symbol().clone(),
             def: ModuleDef::Module(root_module),
             loc,
@@ -168,7 +199,7 @@ impl<'a> SymbolCollector<'a> {
         });
 
         if canonical_name != crate_name.symbol() {
-            self.symbols.insert(FileSymbol {
+            self.push_symbol(FileSymbol {
                 name: canonical_name.clone(),
                 def: ModuleDef::Module(root_module),
                 loc,
@@ -182,8 +213,8 @@ impl<'a> SymbolCollector<'a> {
         }
     }
 
-    pub fn finish(self) -> Box<[FileSymbol<'a>]> {
-        self.symbols.into_iter().collect()
+    pub fn finish(mut self) -> Box<[FileSymbol<'a>]> {
+        self.order.drain(..).collect()
     }
 
     fn do_work(&mut self, work: SymbolCollectorWork) {
@@ -253,7 +284,7 @@ impl<'a> SymbolCollector<'a> {
         };
 
         // Nested trees are very common, so a cache here will hit a lot.
-        let import_child_source_cache = &mut FxHashMap::default();
+        self.import_child_sources.clear();
 
         let is_explicit_import = |vis| match vis {
             Visibility::Public => true,
@@ -262,11 +293,12 @@ impl<'a> SymbolCollector<'a> {
             Visibility::Module(_, VisibilityExplicitness::Implicit) => false,
         };
 
-        let mut push_import = |this: &mut Self, i: ImportId, name: &Name, def: ModuleDefId, vis| {
+        let push_import = |this: &mut Self, i: ImportId, name: &Name, def: ModuleDefId, vis| {
             if collect_pub_only && vis != Visibility::Public {
                 return;
             }
-            let source = import_child_source_cache
+            let source = this
+                .import_child_sources
                 .entry(i.use_)
                 .or_insert_with(|| i.use_.child_source(this.db));
             if is_block_module && source.file_id.is_macro() {
@@ -290,7 +322,7 @@ impl<'a> SymbolCollector<'a> {
                 ptr: SyntaxNodePtr::new(use_tree_src.syntax()),
                 name_ptr: Some(AstPtr::new(&name_syntax)),
             };
-            this.symbols.insert(FileSymbol {
+            this.push_symbol(FileSymbol {
                 name: name.symbol().clone(),
                 def: def.into(),
                 container_name: this.current_container_name.clone(),
@@ -331,7 +363,7 @@ impl<'a> SymbolCollector<'a> {
                     ptr: SyntaxNodePtr::new(source.value.syntax()),
                     name_ptr: Some(AstPtr::new(&name_syntax)),
                 };
-                this.symbols.insert(FileSymbol {
+                this.push_symbol(FileSymbol {
                     name: name.symbol().clone(),
                     def: def.into(),
                     container_name: this.current_container_name.clone(),
@@ -514,7 +546,7 @@ impl<'a> SymbolCollector<'a> {
             }
 
             for alias in attrs.doc_aliases(self.db) {
-                self.symbols.insert(FileSymbol {
+                self.push_symbol(FileSymbol {
                     name: alias.clone(),
                     def,
                     loc,
@@ -528,7 +560,7 @@ impl<'a> SymbolCollector<'a> {
             }
         }
 
-        self.symbols.insert(FileSymbol {
+        self.push_symbol(FileSymbol {
             name: name.symbol().clone(),
             def,
             container_name: self.current_container_name.clone(),
@@ -562,7 +594,7 @@ impl<'a> SymbolCollector<'a> {
             do_not_complete = Complete::extract(matches!(def, ModuleDef::Trait(_)), attrs.attrs);
 
             for alias in attrs.doc_aliases(self.db) {
-                self.symbols.insert(FileSymbol {
+                self.push_symbol(FileSymbol {
                     name: alias.clone(),
                     def,
                     loc,
@@ -576,7 +608,7 @@ impl<'a> SymbolCollector<'a> {
             }
         }
 
-        self.symbols.insert(FileSymbol {
+        self.push_symbol(FileSymbol {
             name: name.symbol().clone(),
             def: ModuleDef::Module(module_id.into()),
             container_name: self.current_container_name.clone(),

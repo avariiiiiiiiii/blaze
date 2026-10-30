@@ -186,7 +186,7 @@ impl<T: Typed> Parse<T> {
 
 /// Typed views of the root of any flat tree, for trees not held by a [`Parse`].
 #[inline]
-pub fn root<'t, N: AstNode<'t>>(tree: &'t FlatTree) -> Option<N> {
+pub fn root<'t, N: AstNode<'t>>(tree: &'t Arc<FlatTree>) -> Option<N> {
     N::cast(Node::root(tree))
 }
 

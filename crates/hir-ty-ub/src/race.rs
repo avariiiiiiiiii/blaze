@@ -40,7 +40,6 @@
 mod cells;
 mod error;
 mod range_map;
-mod rng;
 mod vclock;
 mod weak;
 
@@ -49,6 +48,7 @@ mod tests;
 
 pub use error::{Action, DataRace, Deadlock, RaceError, RaceErrorKind, RacingOp};
 
+use blaze_ids::rng::SplitMix64;
 use rustc_hash::FxHashMap;
 
 use crate::ids::{AccessKind, AllocId, AtomicOrd, SiteId, Span, ThreadId};
@@ -56,7 +56,6 @@ use crate::ids::{AccessKind, AllocId, AtomicOrd, SiteId, Span, ThreadId};
 use self::{
     cells::{AccessType, MemoryCellClocks, NaWriteType, ThreadClockSet},
     range_map::RangeMap,
-    rng::SplitMix64,
     vclock::{NaReadType, VClock, VTimestamp, VectorIdx, is_dummy},
     weak::{StoreBuffers, Value},
 };

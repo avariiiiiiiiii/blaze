@@ -4,10 +4,12 @@
 //! escapes them. Each message is written straight into the caller's buffer, which it reuses:
 //! no tree, no copy of a field, no allocation per message once the buffer has grown.
 
+use std::hash::BuildHasher as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use blaze_api::{Artifact, BuildScriptRan, Diagnostic, Level, Span, UnitOf, UnitTarget};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -221,9 +223,10 @@ pub fn build_finished(out: &mut String, success: bool) {
 
 /// `compiler-message` of `unit`, without its newline. With `ansi`
 /// (`json-diagnostic-rendered-ansi`) rustc's message passes as rustc wrote it; without, cargo
-/// takes the colors out of `rendered` and writes the message again through a
-/// `serde_json::Value` (`CompilerMessage { rendered, #[serde(flatten)] other: BTreeMap }`):
-/// `rendered` first, then every other field sorted by key, at every depth.
+/// takes the colors out of `rendered` and writes the message again through
+/// `CompilerMessage { rendered, #[serde(flatten)] other: BTreeMap, code: Option<DiagnosticCode> }`:
+/// `rendered` first, then every other field sorted by key (at every depth, as `serde_json::Value`
+/// maps are), then the outermost `code` last.
 pub fn compiler_message(out: &mut String, unit: &UnitOf, diagnostic: &Diagnostic, ansi: bool, sources: &mut Sources) {
     let dir = unit.manifest_path.rsplit_once(['/', '\\']).map_or("", |(dir, _)| dir);
     out.push_str(r#"{"reason":"compiler-message","package_id":"#);
@@ -318,14 +321,14 @@ fn diagnostic_json(out: &mut String, diagnostic: &Diagnostic, outermost: bool, o
             quote_with(out, &diagnostic.rendered, true);
             out.push_str(r#","$message_type":"diagnostic","children":"#);
             children(out, sources);
-            out.push_str(r#","code":"#);
-            code(out, diagnostic.code.as_deref());
             out.push_str(r#","level":""#);
             out.push_str(level(diagnostic.level));
             out.push_str(r#"","message":"#);
             quote(out, &diagnostic.message);
             out.push_str(r#","spans":"#);
             spans(out, sources);
+            out.push_str(r#","code":"#);
+            code(out, diagnostic.code.as_deref());
             out.push('}');
         }
         (Order::Sorted, false) => {
@@ -451,90 +454,136 @@ fn span_text(out: &mut String, span: &Span, order: Order, sources: &Sources, fil
     out.push(']');
 }
 
-/// One source file as on disk, read once: its text and where each line starts. Lines as rustc
-/// keeps them: no BOM, no `\r` before a newline. 4 bytes per line beside the text.
+/// One source file as on disk, read once, as a range of [`Sources`]' text and line starts.
+/// Lines as rustc keeps them: no BOM, no `\r` before a newline.
 struct Source {
-    text: String,
-    /// The byte offset of each line's start; as many as `split('\n')` has lines.
-    starts: Vec<u32>,
-}
-
-impl Source {
-    fn new(bytes: Vec<u8>) -> Source {
-        let text = String::from_utf8(bytes).unwrap_or_else(|it| String::from_utf8_lossy(it.as_bytes()).into_owned());
-        let begin = if text.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
-        let mut starts = Vec::with_capacity(text.len() / 32 + 1);
-        starts.push(begin as u32);
-        starts.extend(text[begin..].match_indices('\n').map(|(at, _)| (begin + at + 1) as u32));
-        Source { text, starts }
-    }
-
-    fn line(&self, number: usize) -> &str {
-        let start = self.starts[number - 1] as usize;
-        let end = self.starts.get(number).map_or(self.text.len(), |next| *next as usize - 1);
-        let line = &self.text[start..end];
-        line.strip_suffix('\r').unwrap_or(line)
-    }
+    /// Its first line's index in `Sources::starts`.
+    first: u32,
+    /// As many as `split('\n')` has lines.
+    lines: u32,
+    /// Its text's end in `Sources::text`.
+    end: u32,
 }
 
 /// The source files spans point into, as on disk, each read once: rustc's JSON carries the
-/// text of the lines a span covers. A name is looked up by the directory of its unit's manifest
-/// and the name as the span has it, both `&str`: two Fx lookups and no allocation once seen.
+/// text of the lines a span covers. A name is looked up by the Fx hash of the directory of its
+/// unit's manifest and the name as the span has it; every file's text goes into one buffer and
+/// every line start into another, 4 bytes a line, so that once the buffers have grown a lookup
+/// or a read allocates nothing.
 pub struct Sources {
     root: PathBuf,
-    /// Each name's file, by manifest directory; `None` for a name that is no file.
-    named: FxHashMap<Box<str>, FxHashMap<Box<str>, Option<u32>>>,
-    /// Each file read, by path, so that two names of one file read it once.
-    at: FxHashMap<PathBuf, u32>,
+    /// Each (manifest directory, name)'s file, by hash; `None` for a name that is no file.
+    named: FxHashMap<u64, Option<u32>>,
+    /// Each file read, by the hash of its path, so that two names of one file read it once.
+    at: FxHashMap<u64, u32>,
     files: Vec<Source>,
+    text: String,
+    starts: Vec<u32>,
+    /// The path being looked for, and the bytes of the file being read.
+    path: PathBuf,
+    bytes: Vec<u8>,
 }
+
+const FILES: usize = 256;
+const TEXT: usize = 1 << 20;
 
 impl Sources {
     /// `root` is the checkout's: a relative file name is looked for no higher.
     pub fn new(root: &Path) -> Sources {
-        Sources { root: root.to_owned(), named: FxHashMap::default(), at: FxHashMap::default(), files: Vec::new() }
+        Sources {
+            // alloc: once a request.
+            root: root.to_owned(),
+            named: FxHashMap::with_capacity_and_hasher(FILES, FxBuildHasher),
+            at: FxHashMap::with_capacity_and_hasher(FILES, FxBuildHasher),
+            files: Vec::with_capacity(FILES),
+            text: String::with_capacity(TEXT),
+            starts: Vec::with_capacity(TEXT / 32),
+            path: PathBuf::with_capacity(1024),
+            bytes: Vec::with_capacity(TEXT / 4),
+        }
     }
 
     /// The file `name` is, as rustc names it: absolute, or relative to the directory rustc ran
     /// in, which is the workspace root, an ancestor of the unit's manifest directory `dir`: the
     /// nearest one that has it.
     pub fn file(&mut self, name: &str, dir: &str) -> Option<u32> {
-        if let Some(&found) = self.named.get(dir).and_then(|it| it.get(name)) {
+        let key = FxBuildHasher.hash_one((dir, name));
+        if let Some(&found) = self.named.get(&key) {
             return found;
         }
-        let found = self.find(Path::new(name), Path::new(dir)).and_then(|path| self.read(path));
-        self.named.entry(dir.into()).or_default().insert(name.into(), found);
+        let found = match self.find(Path::new(name), Path::new(dir)) {
+            true => self.read(),
+            false => None,
+        };
+        self.named.insert(key, found);
         found
     }
 
-    fn read(&mut self, path: PathBuf) -> Option<u32> {
-        if let Some(&at) = self.at.get(&path) {
+    /// The file at `path`, read the first time.
+    fn read(&mut self) -> Option<u32> {
+        let key = FxBuildHasher.hash_one(&self.path);
+        if let Some(&at) = self.at.get(&key) {
             return Some(at);
         }
-        let bytes = std::fs::read(&path).ok()?;
+        self.bytes.clear();
+        std::fs::File::open(&self.path).and_then(|mut file| file.read_to_end(&mut self.bytes)).ok()?;
+        let begin = self.text.len();
+        match std::str::from_utf8(&self.bytes) {
+            Ok(text) => self.text.push_str(text),
+            // alloc: a file that is not UTF-8, as rustc reads it.
+            Err(_) => self.text.push_str(&String::from_utf8_lossy(&self.bytes)),
+        }
+        let first = self.starts.len();
+        let start = match self.text[begin..].starts_with('\u{feff}') {
+            true => begin + '\u{feff}'.len_utf8(),
+            false => begin,
+        };
+        self.starts.push(start as u32);
+        let text = &self.text[start..];
+        self.starts.extend(text.match_indices('\n').map(|(at, _)| (start + at + 1) as u32));
         let at = self.files.len() as u32;
-        self.files.push(Source::new(bytes));
-        self.at.insert(path, at);
+        let lines = (self.starts.len() - first) as u32;
+        self.files.push(Source { first: first as u32, lines, end: self.text.len() as u32 });
+        self.at.insert(key, at);
         Some(at)
     }
 
-    fn find(&self, file: &Path, dir: &Path) -> Option<PathBuf> {
+    /// Puts where `file` is into `path`; false for nowhere.
+    fn find(&mut self, file: &Path, dir: &Path) -> bool {
+        self.path.clear();
         if file.is_absolute() {
-            return Some(file.to_owned());
+            self.path.push(file);
+            return true;
         }
-        dir.ancestors()
-            .take_while(|it| it.starts_with(&self.root))
-            .map(|it| it.join(file))
-            .find(|it| std::fs::metadata(it).is_ok_and(|it| it.is_file()))
+        for it in dir.ancestors() {
+            if !it.starts_with(&self.root) {
+                break;
+            }
+            self.path.clear();
+            self.path.push(it);
+            self.path.push(file);
+            if std::fs::metadata(&self.path).is_ok_and(|it| it.is_file()) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn line_count(&self, file: u32) -> usize {
-        self.files[file as usize].starts.len()
+        self.files[file as usize].lines as usize
     }
 
     /// Line `number` (1-based, at most [`Sources::line_count`]) of `file`.
     pub fn line(&self, file: u32, number: usize) -> &str {
-        self.files[file as usize].line(number)
+        let source = &self.files[file as usize];
+        let at = source.first as usize + number - 1;
+        let start = self.starts[at] as usize;
+        let end = match number < source.lines as usize {
+            true => self.starts[at + 1] as usize - 1,
+            false => source.end as usize,
+        };
+        let line = &self.text[start..end];
+        line.strip_suffix('\r').unwrap_or(line)
     }
 }
 

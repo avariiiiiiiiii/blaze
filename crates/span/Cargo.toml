@@ -19,6 +19,7 @@ unicode-width.workspace = true
 # local deps
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 vfs.workspace = true
 syntax.workspace = true
 stdx.workspace = true

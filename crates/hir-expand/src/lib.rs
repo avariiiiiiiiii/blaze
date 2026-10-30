@@ -62,7 +62,7 @@ use crate::{
         BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander,
         include_input_to_file_id, pseudo_derive_attr_expansion,
     },
-    cfg_process::attr_macro_input_to_token_tree,
+    cfg_process::{attr_macro_input_to_token_tree, attr_macro_input_to_token_tree_handle},
     fixup::SyntaxFixupUndoInfo,
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt, span_with_mixed_site_ctxt},
     proc_macro::{CustomProcMacroExpander, ProcMacroKind, ProcMacros},
@@ -410,7 +410,7 @@ impl MacroDefKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct EagerCallInfo {
     /// The expanded argument of the eager macro.
     pub arg: tt::TopSubtree,
@@ -430,7 +430,8 @@ pub enum MacroCallKind {
         /// for the eager input macro file.
         // FIXME: This is being interned, subtrees can vary quickly differing just slightly causing
         // leakage problems here
-        eager: Option<Box<EagerCallInfo>>,
+        // Shared, as `attr_args` is: salsa clones an interned key, and a token tree is never cloned.
+        eager: Option<Arc<EagerCallInfo>>,
     },
     Derive {
         ast_id: AstId<ast::Adt>,
@@ -445,7 +446,7 @@ pub enum MacroCallKind {
     Attr {
         ast_id: AstId<ast::Item>,
         // FIXME: This shouldn't be here, we can derive this from `invoc_attr_index`.
-        attr_args: Option<Box<tt::TopSubtree>>,
+        attr_args: Option<Arc<tt::TopSubtree>>,
         /// This contains the list of all *active* attributes (derives and attr macros) preceding this
         /// attribute, including this attribute. You can retrieve the [`AttrId`] of the current attribute
         /// by calling [`invoc_attr()`] on this.
@@ -670,6 +671,8 @@ impl MacroCallId {
     #[salsa::tracked(returns(ref))]
     #[deprecated = "calling this is incorrect, call `macro_arg_considering_derives` instead"]
     fn macro_arg(self, db: &Db) -> MacroArgResult {
+        use syntax::view::AstNode as _;
+
         let loc = self.loc(db);
 
         if let MacroCallKind::FnLike { eager: Some(_), .. } = &loc.kind {
@@ -680,7 +683,7 @@ impl MacroCallId {
 
         let (is_derive, censor_item_tree_attr_ids, item_node, span) = match &loc.kind {
             MacroCallKind::FnLike { ast_id, .. } => {
-                let node = &ast_id.to_ptr(db).to_node(&root);
+                let node = ast_id.to_view(db);
                 let path_range = node
                     .path()
                     .map_or_else(|| node.syntax().text_range(), |path| path.syntax().text_range());
@@ -737,19 +740,14 @@ impl MacroCallId {
                 // `compiler/rustc_expand/src/mbe/transcribe.rs`).
                 let mut tt = match loc.def.kind {
                     MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => {
-                        syntax_bridge::syntax_node_to_token_tree(
+                        syntax_bridge::call_input(
                             tt.syntax(),
                             MacroRulesArgs(InOrder::new(map)),
                             span,
                             mode,
                         )
                     }
-                    _ => syntax_bridge::syntax_node_to_token_tree(
-                        tt.syntax(),
-                        InOrder::new(map),
-                        span,
-                        mode,
-                    ),
+                    _ => syntax_bridge::call_input(tt.syntax(), InOrder::new(map), span, mode),
                 };
                 if loc.def.is_proc_macro() {
                     // proc macros expect their inputs without parentheses, MBEs expect it with them included
@@ -772,7 +770,7 @@ impl MacroCallId {
                 let span = map.span_for_range(range);
 
                 let is_derive = matches!(loc.def.kind, MacroDefKind::BuiltInAttr(_, expander) if expander.is_derive());
-                (is_derive, &**attr_ids, node, span)
+                (is_derive, &**attr_ids, ast_id.to_view(db), span)
             }
         };
 
@@ -949,7 +947,7 @@ impl MacroCallId {
                 else {
                     unreachable!("`derive_macro_id` should be `MacroCallKind::Attr`");
                 };
-                attr_macro_input_to_token_tree(
+                attr_macro_input_to_token_tree_handle(
                     db,
                     speculative_args,
                     span_map,
@@ -961,7 +959,7 @@ impl MacroCallId {
                 )
             }
             MacroCallKind::Attr { censored_attr_ids: attr_ids, .. } => {
-                attr_macro_input_to_token_tree(
+                attr_macro_input_to_token_tree_handle(
                     db,
                     speculative_args,
                     span_map,
@@ -1606,6 +1604,12 @@ pub fn map_node_range_up_rooted(
 /// [`map_node_range_up_rooted`] as a span, relative to its anchor: what does not change while
 /// edits around the anchor move it.
 pub fn map_node_range_up_rooted_span(exp_map: &ExpansionSpanMap, range: TextRange) -> Option<Span> {
+    // A node that is exactly a macro fragment is at its metavariable, which no token holds.
+    if let Some(span) = exp_map.fragment_span(range)
+        && span.ctx.is_root()
+    {
+        return Some(span);
+    }
     let mut spans = exp_map.spans_for_range(range).filter(|span| span.ctx.is_root());
     let Span { range, anchor, ctx } = spans.next()?;
     let mut start = range.start();
@@ -1629,6 +1633,10 @@ pub fn map_node_range_up(
     exp_map: &ExpansionSpanMap,
     range: TextRange,
 ) -> Option<(FileRange, SyntaxContext)> {
+    // A node that is exactly a macro fragment is at its metavariable, which no token holds.
+    if let Some(span) = exp_map.fragment_span(range) {
+        return Some((resolve_span(db, span), span.ctx));
+    }
     let mut spans = exp_map.spans_for_range(range);
     let Span { range, anchor, ctx } = spans.next()?;
     let mut start = range.start();

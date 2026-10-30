@@ -465,6 +465,8 @@ pub trait Put {
     fn put_bytes_uleb(&mut self, bytes: &[u8]);
     /// `bytes`, then a NUL. Panics when `bytes` holds one: [`Reader::cstr`] would stop there.
     fn put_cstr(&mut self, bytes: &[u8]);
+    /// Zeros up to the next multiple of `multiple` bytes (not 0) of what is written.
+    fn pad_to(&mut self, multiple: usize);
     /// Writes `value` over the 4 bytes at `at`, written before: a length or an offset known
     /// only once what follows it is. Panics past the end.
     fn patch_u32(&mut self, at: usize, value: u32);
@@ -557,6 +559,11 @@ impl Put for Vec<u8> {
         assert!(!bytes.contains(&0), "a C string holding a NUL");
         self.extend_from_slice(bytes);
         self.push(0);
+    }
+
+    #[inline]
+    fn pad_to(&mut self, multiple: usize) {
+        self.resize(self.len().next_multiple_of(multiple), 0);
     }
 
     #[inline]

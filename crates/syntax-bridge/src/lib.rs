@@ -6,10 +6,11 @@
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
 
-use std::{cell::Cell, collections::VecDeque, fmt};
+use std::{collections::VecDeque, fmt};
 
 use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use span::{Edition, Span, SpanAnchor, SpanMap, SyntaxContext};
 use stdx::never;
 use syntax::{
@@ -242,37 +243,22 @@ where
 // * AssocItems(SmallVec<[ast::AssocItem; 1]>)
 // * ForeignItems(SmallVec<[ast::ForeignItem; 1]>
 
-thread_local! {
-    /// The parser input [`token_tree_to_syntax_node`] fills, kept for the next expansion.
-    static INPUT: Cell<Option<parser::Input>> = const { Cell::new(None) };
-}
-
-/// The most tokens an input kept for the next expansion holds; a larger one is freed.
-const KEEP_INPUT: usize = 1 << 16;
-
 /// Converts a [`tt::Subtree`] back to a [`SyntaxNode`].
 /// The produced `SpanMap` contains a mapping from the syntax nodes offsets to the subtree's spans.
 ///
 /// The parser reads the words the tree keeps ([`view_tokens`]; made once, the first time it is
 /// parsed), where they are, and the tree is built straight from its events and the tokens:
-/// nothing is converted or parsed twice and no text is lexed. The input kept per thread is
-/// only filled when the words must be made afresh for other editions.
+/// nothing is converted or parsed twice and no text is lexed. The input, whose words are the
+/// thread's (`parser::Input`), is only filled when the words must be made afresh for other
+/// editions.
 pub fn token_tree_to_syntax_node<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     tt: &tt::TopSubtree,
     entry_point: parser::TopEntryPoint,
     span_to_edition: &mut F,
 ) -> (Parse<SyntaxNode>, SpanMap) {
     let buffer = tt.view().strip_invisible();
-    let mut copy = INPUT.take().unwrap_or_else(|| parser::Input::with_capacity(0));
-    let parsed = parse_tokens(
-        buffer,
-        entry_point,
-        view_tokens(buffer, false, span_to_edition, &mut copy),
-    );
-    if copy.len() <= KEEP_INPUT {
-        INPUT.set(Some(copy));
-    }
-    parsed
+    let mut copy = parser::Input::with_capacity(0);
+    parse_tokens(buffer, entry_point, view_tokens(buffer, false, span_to_edition, &mut copy))
 }
 
 /// The tree of the tokens of `buffer`, `tokens` being their input.
@@ -1032,12 +1018,12 @@ struct FlatTok<'t> {
 struct FlatTokens<'t> {
     /// The trees being walked, the innermost last: each with its next element, the element its
     /// walk ends before, and where the next element starts.
-    stack: Vec<(&'t FlatTree, u32, u32, u32)>,
+    stack: SmallVec<[(&'t FlatTree, u32, u32, u32); 4]>,
 }
 
 impl<'t> FlatTokens<'t> {
     fn new(tree: &'t FlatTree, at: u32) -> FlatTokens<'t> {
-        let mut tokens = FlatTokens { stack: Vec::with_capacity(4) };
+        let mut tokens = FlatTokens { stack: SmallVec::new() };
         tokens.enter(tree, at);
         tokens
     }
@@ -1427,13 +1413,13 @@ where
 }
 
 struct TtTreeSink<'a> {
-    buf: String,
+    buf: blaze_mem::scratch::Lent<String>,
     cursor: Cursor<'a>,
     text_pos: TextSize,
     inner: SyntaxTreeBuilder,
     token_map: SpanMap,
-    /// Where the token trees without delimiters start that the cursor is in.
-    open_fragments: Vec<TextSize>,
+    /// Where the token trees without delimiters start that the cursor is in, as `u32` offsets.
+    open_fragments: blaze_mem::scratch::Lent<Vec<u32>>,
     /// Where the last token ends, before the whitespace that may follow it.
     token_end: TextSize,
 }
@@ -1442,21 +1428,19 @@ impl<'a> TtTreeSink<'a> {
     /// A sink for the parse of the `tokens` input tokens `cursor` walks.
     fn new(cursor: Cursor<'a>, tokens: usize) -> Self {
         TtTreeSink {
-            // alloc: one buffer per parse, for the text of the token being written.
-            buf: String::new(),
+            buf: blaze_mem::scratch::lend_string(),
             cursor,
             text_pos: 0.into(),
             inner: SyntaxTreeBuilder::default(),
             token_map: SpanMap::with_capacity(tokens),
-            // alloc: one buffer per parse, at its first fragment, as deep as they nest.
-            open_fragments: Vec::new(),
+            open_fragments: blaze_mem::scratch::lend_u32s(),
             token_end: 0.into(),
         }
     }
 
     /// Records the token tree without delimiters that the cursor leaves as a macro fragment.
     fn close_fragment(&mut self) {
-        if let Some(start) = self.open_fragments.pop()
+        if let Some(start) = self.open_fragments.pop().map(TextSize::new)
             && start < self.token_end
         {
             self.token_map.push_fragment(TextRange::new(start, self.token_end));
@@ -1566,7 +1550,7 @@ impl TtTreeSink<'_> {
                                 self.text_pos += TextSize::of("r#");
                             }
                             let text = ident.sym.as_str();
-                            self.buf += text;
+                            self.buf.push_str(text);
                             self.text_pos += TextSize::of(text);
                             combined_span = match combined_span {
                                 None => Some(ident.span),
@@ -1603,7 +1587,7 @@ impl TtTreeSink<'_> {
                         match delim_to_str(subtree.delimiter.kind, false) {
                             Some(it) => (it, subtree.delimiter.open),
                             None => {
-                                self.open_fragments.push(self.text_pos);
+                                self.open_fragments.push(u32::from(self.text_pos));
                                 continue;
                             }
                         }
@@ -1620,7 +1604,7 @@ impl TtTreeSink<'_> {
                     }
                 };
             };
-            self.buf += text;
+            self.buf.push_str(text);
             self.text_pos += TextSize::of(text);
             combined_span = match combined_span {
                 None => Some(span),

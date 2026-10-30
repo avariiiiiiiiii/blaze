@@ -399,15 +399,17 @@ mod tests {
 
     #[test]
     fn estimates_predict_peaks_and_keep_the_specs_costs() {
-        let mut predict: Box<dyn Predict> = Box::new(Estimates::new(64));
+        // Through the trait, as the scheduler asks: the inherent methods take no key.
+        let mut predict = Estimates::new(64);
         let key = Some(crate::Key([1; 32]));
-        assert_eq!(predict.predict(TaskKind(2), key), Prediction { cost: None, peak: 64 });
-        predict.observe(TaskKind(2), key, 5_000, 900);
-        let prediction = predict.predict(TaskKind(2), None);
+        let peak = Predict::predict(&predict, TaskKind(2), key);
+        assert_eq!(peak, Prediction { cost: None, peak: 64 });
+        Predict::observe(&mut predict, TaskKind(2), key, 5_000, 900);
+        let prediction = Predict::predict(&predict, TaskKind(2), None);
         assert_eq!(prediction, Prediction { cost: None, peak: 900 });
         let mut estimates = Estimates::new(64);
         estimates.observe(TaskKind(2), 900);
-        assert_eq!(predict.encode(), estimates.encode());
+        assert_eq!(Predict::encode(&predict), estimates.encode());
 
         let mut spec = crate::Spec {
             id: crate::NodeId(0),

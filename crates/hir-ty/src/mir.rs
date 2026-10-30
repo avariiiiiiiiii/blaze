@@ -11,10 +11,10 @@ use either::Either;
 use hir_def::{
     ExpressionStoreOwnerId, FieldId, FunctionId, GenericParamId, LocalFieldId, StaticId, TraitId,
     UnionId, VariantId,
-    expr_store::{ExpressionStore, path::Path},
+    expr_store::ExpressionStore,
     hir::{BindingId, ClosureKind, CoroutineSource, Expr, ExprId, Ordering, PatId},
 };
-use hir_expand::name::Name;
+use hir_expand::{mod_path::ModPath, name::Name};
 use intern::Symbol;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
@@ -1348,6 +1348,21 @@ impl TerminatorKind {
         }
     }
 
+    /// Every block this terminator may go to: its successors, the imaginary edge of a
+    /// `FalseEdge`, and the block it unwinds to, last.
+    pub fn all_successors(&self) -> SmallVec<[BasicBlockId; 2]> {
+        match self {
+            TerminatorKind::FalseEdge { real_target, imaginary_target } => {
+                smallvec![*real_target, *imaginary_target]
+            }
+            _ => {
+                let mut all = self.successors();
+                all.extend(self.unwind());
+                all
+            }
+        }
+    }
+
     pub fn unwind_mut(&mut self) -> Option<&mut Option<BasicBlockId>> {
         match self {
             TerminatorKind::Drop { unwind, .. }
@@ -1375,6 +1390,83 @@ pub struct UnreachableAfterCall {
     /// "definition" for a `FakeRead` (a `let`), else "expression".
     pub descr: &'static str,
     pub ty: StoredTy,
+}
+
+/// A body whose code an optimized body has in it: rustc's `Instance` of an inlined callee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+pub enum InlinedBody<'db> {
+    Fn(FunctionId),
+    Closure(InternedClosureId<'db>),
+}
+
+/// One instance an optimized body inlined, listed once however often it was.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
+pub struct InlinedCallee<'db> {
+    pub body: InlinedBody<'db>,
+    /// With regions erased, in the caller's generic parameters (instantiated by
+    /// monomorphization like the rest of the body).
+    pub args: StoredGenericArgs,
+    /// The callee's arithmetic is checked: its crate checks overflow, or it is
+    /// `#[rustc_inherit_overflow_checks]` and the caller's crate does.
+    pub written_checked: bool,
+}
+
+/// rustc's inlined `SourceScope`: the code of `callees[callee]`, inlined at `call_site` (a span
+/// of the body, itself `Inlined` when the call was in an inlined body).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+pub struct InlinedScope {
+    pub callee: u32,
+    pub call_site: MirSpan,
+}
+
+/// What `MirSpan::Inlined(n)` is, `n` indexing [`Inlined::spans`]: `span` of the body of the
+/// callee of `scopes[scope]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+pub struct InlinedSpan {
+    pub scope: u32,
+    pub span: MirSpan,
+}
+
+/// The local an inlined callee's binding is in (its debug info).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+pub struct InlinedBinding {
+    pub scope: u32,
+    pub binding: BindingId,
+    pub local: LocalId,
+}
+
+/// `promoted_locals` of an inlined callee: `expr` is of the expression store of
+/// `callees[callee]`, evaluated with its `args`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+pub struct InlinedPromoted {
+    pub local: LocalId,
+    pub callee: u32,
+    pub expr: ExprId,
+}
+
+/// What an optimized body inlined. Empty in every body as it is built.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, SalsaValue)]
+pub struct Inlined<'db> {
+    pub callees: Vec<InlinedCallee<'db>>,
+    pub scopes: Vec<InlinedScope>,
+    pub spans: Vec<InlinedSpan>,
+    pub bindings: Vec<InlinedBinding>,
+    pub promoted: Vec<InlinedPromoted>,
+}
+
+impl Inlined<'_> {
+    pub fn is_empty(&self) -> bool {
+        self.callees.is_empty()
+    }
+
+    fn shrink_to_fit(&mut self) {
+        let Inlined { callees, scopes, spans, bindings, promoted } = self;
+        callees.shrink_to_fit();
+        scopes.shrink_to_fit();
+        spans.shrink_to_fit();
+        bindings.shrink_to_fit();
+        promoted.shrink_to_fit();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
@@ -1424,6 +1516,8 @@ pub struct MirBody<'db> {
     /// In a built body, in the order of the calls' blocks: the calls of an uninhabited type
     /// lowering gave no target, for the `unreachable_code` lint.
     pub unreachable_after_calls: Vec<UnreachableAfterCall>,
+    /// What the optimizer inlined into this body; `MirSpan::Inlined` indexes its spans.
+    pub inlined: Inlined<'db>,
 }
 
 impl Hash for MirBody<'_> {
@@ -1447,6 +1541,7 @@ impl Hash for MirBody<'_> {
             panic_unwinds,
             promoted_constants,
             unreachable_after_calls,
+            inlined,
         } = self;
         basic_blocks.hash(state);
         locals.hash(state);
@@ -1466,6 +1561,7 @@ impl Hash for MirBody<'_> {
         panic_unwinds.hash(state);
         promoted_constants.hash(state);
         unreachable_after_calls.hash(state);
+        inlined.hash(state);
     }
 }
 
@@ -1773,7 +1869,9 @@ impl MirBody<'_> {
             panic_unwinds,
             promoted_constants,
             unreachable_after_calls,
+            inlined,
         } = self;
+        inlined.shrink_to_fit();
         promoted_constants.shrink_to_fit();
         unreachable_after_calls.shrink_to_fit();
         upvars_in_place.shrink_to_fit();
@@ -1803,6 +1901,8 @@ pub enum MirSpan {
     BindingId(BindingId),
     SelfParam,
     Unknown,
+    /// A span of a body inlined into this one: [`Inlined::spans`]`[n]`.
+    Inlined(u32),
 }
 impl_from!(ExprId, PatId for MirSpan);
 
@@ -2039,6 +2139,10 @@ pub enum MirEvalError<'db> {
     /// then use this type of error.
     UndefinedBehavior(String),
     Panic(String),
+    /// The program aborted, as rustc's `panic_cannot_unwind`/`panic_in_cleanup` abort it: a
+    /// panic in a cleanup block, while unwinding, or out of a frame that cannot unwind. Holds
+    /// the message std's abort prints; nothing catches it.
+    Aborted(String),
     // FIXME: This should be folded into ConstEvalError?
     MirLowerError(FunctionId, MirLowerError<'db>),
     MirLowerErrorForClosure(InternedClosureId<'db>, MirLowerError<'db>),
@@ -2086,6 +2190,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
                 f.debug_tuple("UndefinedBehavior").field(arg0).finish()
             }
             Self::Panic(msg) => write!(f, "Panic with message:\n{msg:?}"),
+            Self::Aborted(msg) => write!(f, "the program aborted: {msg}"),
             Self::TargetDataLayoutNotAvailable(arg0) => {
                 f.debug_tuple("TargetDataLayoutNotAvailable").field(arg0).finish()
             }
@@ -2177,7 +2282,8 @@ pub enum MirLowerError<'db> {
     TraitFunctionDefinition(TraitId, Name),
     UnresolvedName {
         owner: ExpressionStoreOwnerId,
-        path: Path,
+        /// `None` for a lang item path.
+        path: Option<ModPath>,
     },
     RecordLiteralWithoutPath,
     UnresolvedMethod(String),
@@ -2275,12 +2381,21 @@ pub struct MirOptions {
     pub level: MirOptLevel,
     pub ub_checks: bool,
     pub lifetime_markers: bool,
+    /// rustc's `Inline::is_enabled`, which the level alone does not give: rustc inlines at
+    /// mir-opt-level 2 only at `-Copt-level` 2 or 3, and not in an incremental build.
+    pub inline: bool,
 }
 
 impl MirOptions {
-    /// The interpreter's: no UB checks, markers as rustc keeps them without a code generator.
+    /// The interpreter's: no UB checks, markers as rustc keeps them without a code generator,
+    /// nothing inlined (rustc's CTFE MIR is not, and the interpreter reads no [`Inlined`]).
     pub fn at(level: MirOptLevel) -> MirOptions {
-        MirOptions { level, ub_checks: false, lifetime_markers: level >= MirOptLevel::Release }
+        MirOptions {
+            level,
+            ub_checks: false,
+            lifetime_markers: level >= MirOptLevel::Release,
+            inline: false,
+        }
     }
 }
 

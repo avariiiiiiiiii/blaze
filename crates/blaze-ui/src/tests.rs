@@ -1331,3 +1331,29 @@ fn a_warm_record_to_the_terminal_allocates_nothing() {
         assert!(live.drawn() > 0, "graph {graph}: the region is drawn");
     }
 }
+
+/// The daemon's memory, one line a tag and the committed total, with no budget said as none.
+#[test]
+fn memory_is_a_line_a_tag_and_the_committed_total() {
+    use blaze_api::{Memory, Response, TagMemory};
+    let tag = |tag: &str, budget: u64| TagMemory {
+        tag: tag.to_owned(),
+        live: 4096,
+        rate: 10,
+        budget,
+        allocated: 8192,
+        task_peak: 512,
+        high_water: 6000,
+    };
+    let memory = Memory {
+        tags: vec![tag("parse", u64::MAX), tag("link", 1 << 20)],
+        committed: 1 << 21,
+        committed_high_water: 3 << 20,
+    };
+    assert_eq!(
+        crate::api::lines(&Response::Memory(memory), false),
+        "parse: 4096 bytes live, 6000 at most, 10 bytes/s, task peak 512, budget none\n\
+         link: 4096 bytes live, 6000 at most, 10 bytes/s, task peak 512, budget 1048576\n\
+         committed: 2097152 bytes, 3145728 at most\n"
+    );
+}

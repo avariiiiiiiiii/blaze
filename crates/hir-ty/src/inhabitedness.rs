@@ -2,14 +2,16 @@
 use std::ops::ControlFlow::{self, Break, Continue};
 
 use base_db::Db;
+use blaze_mem::Frame;
 use hir_def::{
     AdtId, EnumVariantId, ModuleId, VariantId, signatures::VariantFields, visibility::Visibility,
 };
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor, inherent::IntoKind};
 
 use crate::{
+    FrameSet,
     consteval::try_const_usize,
+    frame_set,
     db::HirDatabase,
     next_solver::{
         DbInterner, EarlyBinder, GenericArgs, ParamEnv, Ty, TyKind,
@@ -26,8 +28,21 @@ pub fn is_ty_uninhabited_from<'db>(
     target_mod: ModuleId,
     env: ParamEnv<'db>,
 ) -> bool {
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+        is_ty_uninhabited_from_in(frame, infcx, ty, target_mod, env)
+    })
+}
+
+/// [`is_ty_uninhabited_from`], its set of the types being visited in the caller's `frame`.
+pub fn is_ty_uninhabited_from_in<'db>(
+    frame: &Frame,
+    infcx: &InferCtxt<'db>,
+    ty: Ty<'db>,
+    target_mod: ModuleId,
+    env: ParamEnv<'db>,
+) -> bool {
     let _p = tracing::info_span!("is_ty_uninhabited_from", ?ty).entered();
-    let mut uninhabited_from = UninhabitedFrom::new(infcx, target_mod, env);
+    let mut uninhabited_from = UninhabitedFrom::new(frame, infcx, target_mod, env);
     let inhabitedness = ty.visit_with(&mut uninhabited_from);
     inhabitedness == BREAK_VISIBLY_UNINHABITED
 }
@@ -41,16 +56,31 @@ pub fn is_enum_variant_uninhabited_from<'db>(
     target_mod: ModuleId,
     env: ParamEnv<'db>,
 ) -> bool {
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+        is_enum_variant_uninhabited_from_in(frame, infcx, variant, subst, target_mod, env)
+    })
+}
+
+/// [`is_enum_variant_uninhabited_from`], its set of the types being visited in the caller's
+/// `frame`.
+pub fn is_enum_variant_uninhabited_from_in<'db>(
+    frame: &Frame,
+    infcx: &InferCtxt<'db>,
+    variant: EnumVariantId,
+    subst: GenericArgs<'db>,
+    target_mod: ModuleId,
+    env: ParamEnv<'db>,
+) -> bool {
     let _p = tracing::info_span!("is_enum_variant_uninhabited_from").entered();
 
-    let mut uninhabited_from = UninhabitedFrom::new(infcx, target_mod, env);
+    let mut uninhabited_from = UninhabitedFrom::new(frame, infcx, target_mod, env);
     let inhabitedness = uninhabited_from.visit_variant(variant.into(), subst);
     inhabitedness == BREAK_VISIBLY_UNINHABITED
 }
 
 struct UninhabitedFrom<'a, 'db> {
     target_mod: ModuleId,
-    recursive_ty: FxHashSet<Ty<'db>>,
+    recursive_ty: FrameSet<'a, Ty<'db>>,
     // guard for preventing stack overflow in non trivial non terminating types
     max_depth: usize,
     infcx: &'a InferCtxt<'db>,
@@ -99,8 +129,13 @@ impl<'db> TypeVisitor<DbInterner<'db>> for UninhabitedFrom<'_, 'db> {
 }
 
 impl<'a, 'db> UninhabitedFrom<'a, 'db> {
-    fn new(infcx: &'a InferCtxt<'db>, target_mod: ModuleId, env: ParamEnv<'db>) -> Self {
-        Self { target_mod, recursive_ty: FxHashSet::default(), max_depth: 500, infcx, env }
+    fn new(
+        frame: &'a Frame,
+        infcx: &'a InferCtxt<'db>,
+        target_mod: ModuleId,
+        env: ParamEnv<'db>,
+    ) -> Self {
+        Self { target_mod, recursive_ty: frame_set(frame), max_depth: 500, infcx, env }
     }
 
     #[inline]

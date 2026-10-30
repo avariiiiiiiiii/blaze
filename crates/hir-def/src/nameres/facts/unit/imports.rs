@@ -154,25 +154,38 @@ impl Default for Imports {
 impl Imports {
     pub(super) fn new() -> Self {
         Imports {
+            // alloc: empty, grows with the unit's imports
             directives: Vec::new(),
+            // alloc: as `directives`
             list: Vec::new(),
+            // alloc: as `directives`
             generation: Vec::new(),
+            // alloc: as `directives`
             queued: Vec::new(),
+            // alloc: as `directives`
             seq: Vec::new(),
+            // alloc: as `directives`
             indeterminate: Vec::new(),
             named: FxHashMap::default(),
+            // alloc: as `directives`
             next_named: Vec::new(),
             phase: Phase::Idle,
             pending_unresolved: BinaryHeap::new(),
+            // alloc: empty, grows with the imports a pass defers
             deferred_unresolved: Vec::new(),
             pending_indeterminate: BinaryHeap::new(),
+            // alloc: as `deferred_unresolved`
             deferred_indeterminate: Vec::new(),
             waits: FxHashMap::default(),
+            // alloc: empty, grows with the reads imports wait on
             edges: Vec::new(),
             free_edge: NONE,
+            // alloc: as `edges`
             any_waiters: Vec::new(),
+            // alloc: empty scratch, reused across attempts
             keys: Vec::new(),
             keys_any: false,
+            // alloc: as `keys`
             woken: Vec::new(),
         }
     }
@@ -443,6 +456,7 @@ pub(super) struct ImporterLists<K, T> {
 impl<K, T> Default for ImporterLists<K, T> {
     fn default() -> Self {
         ImporterLists {
+            // alloc: empty, grows with the importer edges
             edges: Vec::new(),
             heads: FxHashMap::default(),
             by_pair: FxHashMap::default(),

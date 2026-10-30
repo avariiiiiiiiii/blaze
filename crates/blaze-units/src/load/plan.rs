@@ -9,6 +9,7 @@ mod outputs;
 #[cfg(test)]
 mod tests;
 
+use std::collections::hash_map::Entry;
 use std::path::Path;
 
 use blaze_manifest::Config;
@@ -61,6 +62,9 @@ pub(crate) struct PlanInput<'a> {
     /// `Profiles::base_profile`: the requested profile, for its root and the `Finished` text.
     pub base_profile: &'a BaseProfile,
     pub jobs: Option<u32>,
+    /// The packages, by the unit's `pkg_id`, whose build scripts run outside the sandbox
+    /// (`UnitPlan::unsandboxed`).
+    pub unsandboxed: &'a FxHashSet<&'a str>,
 }
 
 pub(crate) struct PlanOutput {
@@ -112,6 +116,15 @@ struct Facts<'a> {
     target_kind: TargetKind,
     mode: CompileMode,
     profile: HashedProfile<'a>,
+}
+
+/// What every unit of a package planned here shares, made once per package.
+struct PackageFlags {
+    env: Vec<(String, String)>,
+    /// `[lints]`' flags: a local package's only.
+    lints: Vec<String>,
+    /// What follows each `--check-cfg`: the features', then `[lints]`'.
+    check_cfg: Vec<String>,
 }
 
 /// What is the same for every unit.
@@ -194,10 +207,16 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
         layouts.push(Layout::new(input.target_dir, input.build_dir, Some(target), input.profile_dir));
     }
     let mut linkers = Vec::with_capacity(kinds.len());
+    let mut runners = Vec::with_capacity(kinds.len());
     for (at, info) in kinds.iter().enumerate() {
         let kind = if at == 0 { CompileKind::Host } else { CompileKind::Target(info.triple.clone()) };
         let linker = config.target_linker(&kind, input.host, &info.cfgs).map_err(|e| load_error(&e, None))?;
         linkers.push(linker.map(|it| it.display().to_string()));
+        let runner = config.target_runner(&kind, input.host, &info.cfgs).map_err(|e| load_error(&e, None))?;
+        runners.push(match runner {
+            Some((program, args)) => std::iter::once(program.display().to_string()).chain(args).collect(),
+            None => Vec::new(),
+        });
     }
 
     let mut config_env = Vec::new();
@@ -315,10 +334,13 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
         })
         .collect();
 
-    let roots: FxHashSet<usize> = input.roots.iter().copied().collect();
+    let mut roots = vec![false; units.len()];
+    for &at in input.roots {
+        roots[at] = true;
+    }
     let primary: FxHashSet<&str> = input.roots.iter().map(|&at| units[at].pkg_id.as_str()).collect();
-    let mut package_envs: FxHashMap<&str, Vec<(String, String)>> = FxHashMap::default();
-    let mut package_lints: FxHashMap<&str, (Vec<String>, Vec<String>)> = FxHashMap::default();
+    let mut per_package: FxHashMap<&str, PackageFlags> =
+        FxHashMap::with_capacity_and_hasher(input.packages.len(), Default::default());
     let artifact_dir = !matches!(input.intent, Intent::Check { .. });
 
     let mut plans = Vec::with_capacity(units.len());
@@ -331,12 +353,24 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
         let meta = &metas[at];
         let info = &shared.kinds[it.kind];
         let layout = &layouts[it.kind];
-        if !package_envs.contains_key(unit.pkg_id.as_str()) {
-            let env = env::package_env(it.pkg.id, it.pkg.manifest, it.pkg.manifest_path)?;
-            package_envs.insert(unit.pkg_id.as_str(), env);
-        }
-        let package_env = &package_envs[unit.pkg_id.as_str()];
+        let package = match per_package.entry(unit.pkg_id.as_str()) {
+            Entry::Occupied(found) => found.into_mut(),
+            Entry::Vacant(slot) => {
+                let env = env::package_env(it.pkg.id, it.pkg.manifest, it.pkg.manifest_path)?;
+                // A package's units are all the standard library's or all not.
+                let (lints, lint_check_cfg) = match it.pkg.id.source_id().is_path() && !unit.is_std {
+                    true => flags::lints(it.pkg.manifest)?,
+                    false => (Vec::new(), Vec::new()),
+                };
+                let mut check_cfg = flags::check_cfg(it.pkg.manifest);
+                check_cfg.extend(lint_check_cfg);
+                slot.insert(PackageFlags { env, lints, check_cfg })
+            }
+        };
+        let package_env = &package.env;
         let links = it.pkg.manifest.metadata.links.clone();
+        let unsandboxed = input.unsandboxed.contains(unit.pkg_id.as_str());
+        let target = manifest_target(it.pkg.manifest, &it.target_kind, &unit.target.name)?;
 
         if it.mode == CompileMode::RunCustomBuild {
             let (out_dir, files) = outputs::run_files(layout, shared.new_layout, &pkg_dirs[at]);
@@ -375,27 +409,16 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
                 outputs: files,
                 out_dir: Some(out_dir),
                 links,
+                unsandboxed,
+                runner: Vec::new(),
+                harness: target.harness,
             });
             continue;
         }
 
-        let target = manifest_target(it.pkg.manifest, &it.target_kind, &unit.target.name)?;
         let crate_name = unit.target.name.replace('-', "_");
-        let is_local = it.pkg.id.source_id().is_path() && !unit.is_std;
-        let (lints, lint_check_cfg) = if is_local {
-            match package_lints.get(unit.pkg_id.as_str()) {
-                Some(found) => found.clone(),
-                None => {
-                    let found = flags::lints(it.pkg.manifest)?;
-                    package_lints.insert(unit.pkg_id.as_str(), found.clone());
-                    found
-                }
-            }
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let mut check_cfg = flags::check_cfg(it.pkg.manifest);
-        check_cfg.extend(lint_check_cfg);
+        // clone: each plan owns its flags (`UnitPlan`), made once per package.
+        let (lints, check_cfg) = (package.lints.clone(), package.check_cfg.clone());
 
         let out_dir = unit
             .dependencies
@@ -444,10 +467,11 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
             new_layout: shared.new_layout,
             artifact_dir,
             stop_rlib_uplift,
-            is_root: roots.contains(&at),
+            is_root: roots[at],
         })?;
 
-        let mut rustflags = unit.profile.rustflags.clone();
+        let mut rustflags = Vec::with_capacity(unit.profile.rustflags.len() + info.rustflags.len());
+        rustflags.extend(unit.profile.rustflags.iter().cloned());
         rustflags.extend(info.rustflags.iter().cloned());
         plans.push(UnitPlan {
             checked_as_test: unit.checked_as_test,
@@ -461,6 +485,13 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
             outputs: files,
             out_dir: None,
             links,
+            unsandboxed,
+            runner: match it.mode {
+                CompileMode::Test => runners[it.kind].clone(),
+                CompileMode::Build if it.target_kind.is_executable() => runners[it.kind].clone(),
+                _ => Vec::new(),
+            },
+            harness: target.harness,
         });
     }
 

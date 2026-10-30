@@ -339,7 +339,7 @@ struct DropScopeToken;
 impl DropScopeToken {
     fn pop_and_drop<'db>(
         self,
-        ctx: &mut MirLowerCtx<'_, 'db>,
+        ctx: &mut MirLowerCtx<'_, '_, 'db>,
         current: BasicBlockId,
         span: MirSpan,
     ) -> BasicBlockId {
@@ -351,7 +351,7 @@ impl DropScopeToken {
     /// code. Either when the control flow is diverging (so drop code doesn't reached) or when drop is handled
     /// for us (for example a block that ended with a return statement. Return will drop everything, so the block shouldn't
     /// do anything)
-    fn pop_assume_dropped(self, ctx: &mut MirLowerCtx<'_, '_>) {
+    fn pop_assume_dropped(self, ctx: &mut MirLowerCtx<'_, '_, '_>) {
         std::mem::forget(self);
         ctx.pop_drop_scope_assume_dropped_internal();
     }
@@ -390,34 +390,36 @@ macro_rules! implementation_error {
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
-impl<'a, 'db> MirLowerCtx<'a, 'db> {
+impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     fn new(
         db: &'db Db,
         owner: InferBodyId<'db>,
         store: &'a ExpressionStore,
         infer: &'a InferenceResult<'db>,
+        frame: &'f Frame,
     ) -> Self {
-        let mut basic_blocks = Arena::new();
-        let start_block = basic_blocks.alloc(BasicBlock {
-            statements: vec![],
+        let mut building = Building::new_in(frame);
+        building.blocks.push(FrameBlock {
+            statements: Vec::new_in(frame),
             terminator: None,
             is_cleanup: false,
         });
-        let locals = Arena::new();
-        let binding_locals: ArenaMap<BindingId, LocalId> = ArenaMap::new();
+        let start_block = BasicBlockId::from_raw(RawIdx::from_u32(0));
+        let mut drop_scopes = Vec::new_in(frame);
+        drop_scopes.push(DropScope::new_in(frame));
         let mir = MirBody {
-            basic_blocks,
-            locals,
+            basic_blocks: Arena::new(),
+            locals: Arena::new(),
             start_block,
-            binding_locals,
+            binding_locals: ArenaMap::new(),
             upvar_locals: FxHashMap::default(),
-            param_locals: vec![],
-            promoted_locals: vec![],
+            param_locals: Vec::with_capacity(0),
+            promoted_locals: Vec::with_capacity(0),
             owner,
-            closures: vec![],
+            closures: Vec::with_capacity(0),
             coroutine: None,
-            unreached: vec![],
-            scope_ends: vec![],
+            unreached: Vec::with_capacity(0),
+            scope_ends: Vec::with_capacity(0),
             inherits_overflow_checks: match owner {
                 InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
                     hir_def::attrs::AttrFlags::query(db, func.into())
@@ -426,9 +428,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 _ => false,
             },
             phase: MirPhase::Built,
-            upvars_in_place: Vec::new(),
-            panic_unwinds: Vec::new(),
-            promoted_constants: Vec::new(),
+            upvars_in_place: Vec::with_capacity(0),
+            panic_unwinds: Vec::with_capacity(0),
+            promoted_constants: Vec::with_capacity(0),
+            unreachable_after_calls: Vec::with_capacity(0),
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
@@ -439,6 +442,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
         MirLowerCtx {
             result: mir,
+            frame,
+            building,
             db,
             infer,
             store,
@@ -447,34 +452,134 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             store_owner,
             resolver,
             current_loop_blocks: None,
-            labeled_loop_blocks: Default::default(),
+            labeled_loop_blocks: framed::map_in(frame),
             discr_temp: None,
-            drop_scopes: vec![DropScope::default()],
-            extended_temporaries: FxHashMap::default(),
-            extended_blocks: FxHashMap::default(),
+            drop_scopes,
+            extended_temporaries: framed::map_in(frame),
+            extended_blocks: framed::map_in(frame),
             super_let: None,
             inline_consts: 0,
-            ends_temporaries: FxHashSet::default(),
-            drop_temps: FxHashSet::default(),
-            undeclared: FxHashSet::default(),
-            unwind_nodes: FxHashMap::default(),
+            ends_temporaries: framed::set_in(frame),
+            drop_temps: framed::set_in(frame),
+            undeclared: framed::set_in(frame),
+            unwind_nodes: framed::map_in(frame),
             unwind_resume: None,
-            exit_nodes: FxHashMap::default(),
+            exit_nodes: framed::map_in(frame),
             returned: None,
             coroutine_dropped: None,
-            operand_locals: FxHashSet::default(),
-            unscheduled: FxHashSet::default(),
+            operand_locals: framed::set_in(frame),
+            unscheduled: framed::set_in(frame),
             arm_unreached: false,
-            or_choices: FxHashMap::default(),
+            or_choices: framed::map_in(frame),
             guarded_moves: None,
-            guard_refs: FxHashMap::default(),
-            deref_temps: FxHashMap::default(),
-            assigned: Vec::new(),
+            guard_refs: framed::map_in(frame),
+            deref_temps: framed::map_in(frame),
+            assigned: Vec::new_in(frame),
             assigned_from: MirSpan::Unknown,
             copy: FxHashMap::default(),
             env,
             infcx,
+            in_scope_buf: Vec::new_in(frame),
+            order_buf: Vec::new_in(frame),
+            written_buf: Vec::new_in(frame),
+            picked_buf: Vec::new_in(frame),
+            exit_storage_buf: Vec::new_in(frame),
+            exit_locals_buf: Vec::new_in(frame),
+            exit_ended_buf: Vec::new_in(frame),
+            exit_before_buf: Vec::new_in(frame),
         }
+    }
+
+    fn block(&self, id: BasicBlockId) -> &FrameBlock<'f> {
+        &self.building.blocks[id.into_raw().into_u32() as usize]
+    }
+
+    fn block_mut(&mut self, id: BasicBlockId) -> &mut FrameBlock<'f> {
+        &mut self.building.blocks[id.into_raw().into_u32() as usize]
+    }
+
+    fn alloc_block(
+        &mut self,
+        statements: impl IntoIterator<Item = Statement>,
+        terminator: Option<Terminator>,
+        is_cleanup: bool,
+    ) -> BasicBlockId {
+        let id = BasicBlockId::from_raw(RawIdx::from_u32(self.building.blocks.len() as u32));
+        let mut block = FrameBlock { statements: Vec::new_in(self.frame), terminator, is_cleanup };
+        block.statements.extend(statements);
+        self.building.blocks.push(block);
+        id
+    }
+
+    fn alloc_local(&mut self, local: Local) -> LocalId {
+        let id = LocalId::from_raw(RawIdx::from_u32(self.building.locals.len() as u32));
+        self.building.locals.push(local);
+        id
+    }
+
+    fn local(&self, id: LocalId) -> &Local {
+        &self.building.locals[id.into_raw().into_u32() as usize]
+    }
+
+    /// How many locals there are so far: a local of a higher index is made after now.
+    fn local_count(&self) -> usize {
+        self.building.locals.len()
+    }
+
+    fn local_of_binding(&self, binding: BindingId) -> Option<LocalId> {
+        self.building.binding_locals.get(binding.into_raw().into_u32() as usize).copied().flatten()
+    }
+
+    fn set_binding_local(&mut self, binding: BindingId, local: LocalId) {
+        let at = binding.into_raw().into_u32() as usize;
+        if at >= self.building.binding_locals.len() {
+            self.building.binding_locals.resize(at + 1, None);
+        }
+        self.building.binding_locals[at] = Some(local);
+    }
+
+    /// The body lowering built, each list of it allocated once at its length, with what
+    /// `mark_moves` asks for.
+    fn finish(mut self) -> (MirBody<'db>, InferCtxt<'db>, ParamEnv<'db>, FxHashMap<Ty<'db>, bool>) {
+        let Building {
+            blocks,
+            locals,
+            binding_locals,
+            param_locals,
+            promoted_locals,
+            closures,
+            unreached,
+            scope_ends,
+            panic_unwinds,
+        } = self.building;
+        let mut basic_blocks = Arena::with_capacity(blocks.len());
+        for FrameBlock { statements, terminator, is_cleanup } in blocks {
+            let mut kept = Vec::with_capacity(statements.len());
+            kept.extend(statements);
+            basic_blocks.alloc(BasicBlock { statements: kept, terminator, is_cleanup });
+        }
+        let mut kept_locals = Arena::with_capacity(locals.len());
+        for local in locals {
+            kept_locals.alloc(local);
+        }
+        let last = binding_locals.iter().rposition(Option::is_some).map_or(0, |it| it + 1);
+        let mut bindings = ArenaMap::with_capacity(last);
+        for (at, local) in binding_locals.iter().enumerate() {
+            if let Some(local) = local {
+                bindings.insert(BindingId::from_raw(RawIdx::from_u32(at as u32)), *local);
+            }
+        }
+        let body = &mut self.result;
+        body.basic_blocks = basic_blocks;
+        body.locals = kept_locals;
+        body.binding_locals = bindings;
+        body.param_locals = exact(&param_locals);
+        body.promoted_locals = exact(&promoted_locals);
+        body.closures = exact(&closures);
+        body.unreached = exact(&unreached);
+        body.scope_ends = exact(&scope_ends);
+        body.panic_unwinds = exact(&panic_unwinds);
+        (self.result, self.infcx, self.env, self.copy)
     }
 
     #[inline]
@@ -491,7 +596,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     /// that is moved out of an unsized place (`*s;`, `[a[..]]`): borrow checking reports the
     /// move (E0507, E0508), and nothing that compiles has one.
     fn temp(&mut self, ty: Ty<'db>, current: BasicBlockId, span: MirSpan) -> Result<'db, LocalId> {
-        let l = self.result.locals.alloc(Local { ty: ty.store() });
+        let l = self.alloc_local(Local { ty: ty.store() });
         self.push_storage_live_for_local(l, current, span)?;
         Ok(l)
     }
@@ -514,7 +619,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         };
         // rustc moves out of a temporary, as it reads it once. Only a `Copy` one here: what
         // a temporary with drop glue moves out of is how drops are elaborated.
-        let kind = if self.is_copy(self.result.locals[p.local].ty.as_ref()) {
+        let kind = if self.is_copy(self.local(p.local).ty.as_ref()) {
             OperandKind::Move(p.store())
         } else {
             OperandKind::Copy(p.store())
@@ -530,7 +635,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         expr_id: ExprId,
         current: BasicBlockId,
     ) -> Result<'db, Option<(Place<'db>, BasicBlockId)>> {
-        let locals = self.result.locals.len();
+        let locals = self.local_count();
         let Some((p, current)) = self.lower_expr_as_place(current, expr_id, true)? else {
             return Ok(None);
         };
@@ -621,7 +726,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         rest: &[Adjustment],
         bk: BorrowKind,
     ) -> Result<'db, Option<BasicBlockId>> {
-        let locals = self.result.locals.len();
+        let locals = self.local_count();
         let Some((p, current)) =
             self.lower_expr_as_place_with_adjust(current, expr_id, true, rest)?
         else {
@@ -643,7 +748,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             && p.projection.as_slice().is_empty()
             && self.is_promotable_unadjusted(expr_id)
         {
-            self.result.promoted_locals.push((p.local, expr_id));
+            self.building.promoted_locals.push((p.local, expr_id));
         }
         self.push_assignment(current, place, Rvalue::Ref(bk, p.store()), expr_id.into());
         Ok(Some(current))
@@ -729,7 +834,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         not_supported!("`global_asm!` in a body")
                     }
                 };
-                let mut labels = Vec::new();
+                let mut labels = Vec::new_in(self.frame);
+                // alloc: the operands are kept in the body, at their final size
                 let mut operands = Vec::with_capacity(asm.operands.len());
                 for (index, (_, operand)) in asm.operands.iter().enumerate() {
                     let written = !matches!(operand, AsmOperand::In { .. });
@@ -828,6 +934,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         None => None,
                     };
                     operands.push(super::AsmOperand::Reg {
+                        // clone: kept in the body
                         reg: reg.clone(),
                         input,
                         output,
@@ -842,7 +949,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 };
                 self.push_statement(
                     current,
+                    // alloc: kept in the body
                     StatementKind::InlineAsm(Box::new(super::InlineAsm {
+                        // clone: kept in the body
                         template: template.clone(),
                         operands: operands.into(),
                         options: asm.options,
@@ -865,7 +974,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     self.set_terminator(end, TerminatorKind::Unreachable, expr_id.into());
                 }
                 let mut ends = (!noreturn).then_some(end);
-                let mut targets = Vec::with_capacity(labels.len());
+                let mut targets = Vec::with_capacity_in(labels.len(), self.frame);
                 for (at, label) in labels.into_iter().enumerate() {
                     let start = self.new_basic_block();
                     targets.push((at as u128 + 1, start));
@@ -1075,6 +1184,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         (start_of_then, start_of_else)
                     }
                 };
+                // clone: frame lists; the scope stays open while both branches drop what it holds
                 let bound = bindings.is_some().then(|| self.drop_scopes.last().cloned()).flatten();
                 let drop_bound = |this: &mut Self, mut block: BasicBlockId| {
                     if let Some(bound) = &bound {
@@ -1277,10 +1387,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let mut end = None;
                 let resolver_guard =
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
-                let reached = self.reached_arms(arms);
-                for (index, (MatchArm { pat, guard, expr }, reached)) in
-                    arms.iter().zip(reached).enumerate()
-                {
+                let reached_arms = self.reached_arms(arms);
+                for (index, MatchArm { pat, guard, expr }) in arms.iter().enumerate() {
+                    let reached = reached_arms.contains(index);
                     // Each way an arm can match is linked to the next by a false edge, but for
                     // the last way of the last arm.
                     let last_arm = index + 1 == arms.len();
@@ -1288,7 +1397,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     // the arm can match, and runs the guard again for it.
                     let expansions = match guard {
                         Some(_) => self.or_expansions(*pat),
-                        None => Vec::new(),
+                        None => Vec::new_in(self.frame),
                     };
                     // What the arm binds is dropped at the end of the arm.
                     let arm = self.push_drop_scope();
@@ -1298,9 +1407,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         let body = self.new_basic_block();
                         let count = expansions.len();
                         for (expansion, choice) in expansions.into_iter().enumerate() {
-                            self.or_choices = choice.into_iter().collect();
-                            let outer = self.guarded_moves.replace(Vec::new());
+                            self.or_choices.clear();
+                            self.or_choices.extend(choice.iter().copied());
+                            let outer = self.guarded_moves.replace(Vec::new_in(self.frame));
                             // A nested guard must preserve the enclosing guard's references.
+                            // clone: a frame map, saved around the arm
                             let outer_refs = self.guard_refs.clone();
                             self.arm_unreached = !reached;
                             let matched = match last_arm && expansion + 1 == count {
@@ -1319,7 +1430,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             if let Some((held, failed)) = guarded? {
                                 let failed = self.guard_failed(failed, bound, guard.into());
                                 self.set_goto(failed, otherwise, expr_id.into());
-                                self.guard_held(held, moves.unwrap_or_default(), bound)?;
+                                self.guard_held(held, moves, bound)?;
                                 self.set_goto(held, body, expr_id.into());
                             }
                             current = otherwise;
@@ -1334,9 +1445,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         continue;
                     }
                     let outer = match guard {
-                        Some(_) => self.guarded_moves.replace(Vec::new()),
+                        Some(_) => self.guarded_moves.replace(Vec::new_in(self.frame)),
                         None => self.guarded_moves.take(),
                     };
+                    // clone: a frame map, saved around the arm
                     let outer_refs = self.guard_refs.clone();
                     self.arm_unreached = !reached;
                     let matched = match last_arm {
@@ -1356,7 +1468,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         if let Some((held, failed)) = guarded? {
                             let failed = self.guard_failed(failed, bound, guard.into());
                             self.set_goto(failed, o, expr_id.into());
-                            self.guard_held(held, moves.unwrap_or_default(), bound)?;
+                            self.guard_held(held, moves, bound)?;
                             self.set_goto(held, next, expr_id.into());
                         }
                         next
@@ -1483,7 +1595,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let variant_fields = variant_id.fields(self.db);
                 match variant_id {
                     VariantId::EnumVariantId(_) | VariantId::StructId(_) => {
-                        let mut operands = vec![None; variant_fields.fields().len()];
+                        let count = variant_fields.fields().len();
+                        let mut operands = Vec::with_capacity_in(count, self.frame);
+                        operands.resize_with(count, || None);
                         let declared = self.declared_locals();
                         for RecordLitField { name, expr } in fields.iter() {
                             let field_id =
@@ -1530,15 +1644,23 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                             }
                                         }
                                     })
+                                    // alloc: the fields, kept in the body at their final size
                                     .collect(),
                                 Some(_) => {
                                     return Err(MirLowerError::TypeError(
                                         "functional record update syntax requires a struct",
                                     ));
                                 }
-                                None => operands.into_iter().collect::<Option<_>>().ok_or(
-                                    MirLowerError::TypeError("missing field in record literal"),
-                                )?,
+                                None => {
+                                    // alloc: the fields, kept in the body
+                                    let mut fields = Vec::with_capacity(operands.len());
+                                    for it in operands {
+                                        fields.push(it.ok_or(MirLowerError::TypeError(
+                                            "missing field in record literal",
+                                        ))?);
+                                    }
+                                    fields.into()
+                                }
                             },
                         );
                         self.push_assignment(current, place, rvalue, expr_id.into());
@@ -1574,7 +1696,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 // are declared where the block binds them.
                 for (binding, _) in self.store.bindings() {
                     if self.store.binding_owner(binding) == Some(expr_id)
-                        && !self.result.binding_locals.contains_idx(binding)
+                        && self.local_of_binding(binding).is_none()
                     {
                         self.undeclared.insert(binding);
                     }
@@ -1675,7 +1797,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(Some(current))
             }
             Expr::Ref { expr, rawness: _, mutability } => {
-                let locals = self.result.locals.len();
+                let locals = self.local_count();
                 let Some((p, current)) = self.lower_expr_as_place(current, expr, true)? else {
                     return Ok(None);
                 };
@@ -1695,7 +1817,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     {
                         constant = base;
                     }
-                    self.result.promoted_locals.push((p.local, constant));
+                    self.building.promoted_locals.push((p.local, constant));
                 }
                 let bk = BorrowKind::from_hir_mutability(mutability);
                 self.push_assignment(current, place, Rvalue::Ref(bk, p.store()), expr_id.into());
@@ -1975,9 +2097,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             } => {
                 let ty = self.expr_ty_without_adjust(expr_id);
                 match ty.kind() {
-                    TyKind::Closure(id, _) => self.result.closures.push(id.0),
+                    TyKind::Closure(id, _) => self.building.closures.push(id.0),
                     TyKind::CoroutineClosure(id, _) => {
-                        self.result.closures.push(id.0.as_closure(self.db))
+                        self.building.closures.push(id.0.as_closure(self.db))
                     }
                     TyKind::Coroutine(..) => (),
                     _ => not_supported!("closure with non closure type"),
@@ -2021,8 +2143,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     self.push_fake_read(current, p.as_ref(), span(sources));
                 }
 
+                let count = closure_data.min_captures.values().map(|it| it.len()).sum();
                 let captures = closure_data.min_captures.values().flatten();
-                let mut operands = vec![];
+                // alloc: the captures, kept in the body at their final size
+                let mut operands = Vec::with_capacity(count);
                 for capture in captures {
                     let p = convert_place(self, &capture.place)?;
                     match capture.info.capture_kind {
@@ -2064,21 +2188,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::Closure { closure_kind, .. } => not_supported!("{closure_kind:?} closure"),
             Expr::Tuple { exprs } => {
                 let declared = self.declared_locals();
-                let Some(values): Option<Box<[Operand]>> = exprs
-                    .iter()
-                    .map(|it| {
-                        let Some((o, c)) = self.lower_expr_to_some_operand(*it, current)? else {
-                            return Ok(None);
-                        };
-                        current = c;
-                        // What unwinds from the next operand drops this one first.
-                        self.declare_operands_last(expr_id, declared, std::iter::once(&o));
-                        Ok(Some(o))
-                    })
-                    .collect::<Result<'_, Option<_>>>()?
-                else {
-                    return Ok(None);
-                };
+                // alloc: the operands, kept in the body at their final size
+                let mut values = Vec::with_capacity(exprs.len());
+                for &it in exprs.iter() {
+                    let Some((o, c)) = self.lower_expr_to_some_operand(it, current)? else {
+                        return Ok(None);
+                    };
+                    current = c;
+                    // What unwinds from the next operand drops this one first.
+                    self.declare_operands_last(expr_id, declared, std::iter::once(&o));
+                    values.push(o);
+                }
+                let values: Box<[Operand]> = values.into_boxed_slice();
                 self.declare_operands_last(expr_id, declared, values.iter());
                 let r = Rvalue::Aggregate(
                     AggregateKind::Tuple(self.expr_ty_without_adjust(expr_id).store()),
@@ -2098,22 +2219,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         }
                     };
                     let declared = self.declared_locals();
-                    let Some(values): Option<Box<[Operand]>> = elements
-                        .iter()
-                        .map(|it| {
-                            let Some((o, c)) = self.lower_expr_to_some_operand(*it, current)?
-                            else {
-                                return Ok(None);
-                            };
-                            current = c;
-                            // What unwinds from the next element drops this one first.
-                            self.declare_operands_last(expr_id, declared, std::iter::once(&o));
-                            Ok(Some(o))
-                        })
-                        .collect::<Result<'_, Option<_>>>()?
-                    else {
-                        return Ok(None);
-                    };
+                    // alloc: the operands, kept in the body at their final size
+                    let mut values = Vec::with_capacity(elements.len());
+                    for &it in elements.iter() {
+                        let Some((o, c)) = self.lower_expr_to_some_operand(it, current)? else {
+                            return Ok(None);
+                        };
+                        current = c;
+                        // What unwinds from the next element drops this one first.
+                        self.declare_operands_last(expr_id, declared, std::iter::once(&o));
+                        values.push(o);
+                    }
+                    let values: Box<[Operand]> = values.into_boxed_slice();
                     self.declare_operands_last(expr_id, declared, values.iter());
                     let r = Rvalue::Aggregate(AggregateKind::Array(elem_ty.store()), values);
                     self.push_assignment(current, place, r, expr_id.into());
@@ -2187,7 +2304,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             .type_of_type_placeholder(offset.container)
             .ok_or(MirLowerError::TypeError("unknown type in offset_of"))?;
         let base = self.temp(Ty::new_ptr(interner, ty, Mutability::Not), current, span)?;
-        let null = Operand::from_bytes(word_bytes(0), self.result.locals[base].ty.as_ref());
+        let null = Operand::from_bytes(word_bytes(0), self.local(base).ty.as_ref());
         self.push_assignment(current, base.into(), null.into(), span);
         let mut place = Place::from(base).project(ProjectionElem::Deref);
         let mut variant = None;
@@ -2353,7 +2470,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     }
 
     fn new_basic_block(&mut self) -> BasicBlockId {
-        self.result.basic_blocks.alloc(BasicBlock::default())
+        self.alloc_block([], None, false)
     }
 
     fn lower_const(
@@ -2634,14 +2751,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
         }
         let Some(scope) = self.drop_scopes.last_mut() else { return };
-        let Some(since) = scope.locals.get(declared..) else { return };
+        if declared > scope.locals.len() {
+            return;
+        }
         // The operands of an expression inside this one stay behind its own, in the order
         // they were made: they were made later and are dropped earlier.
-        let (operands, temporaries): (Vec<LocalId>, Vec<LocalId>) =
-            since.iter().partition(|it| self.operand_locals.contains(it));
-        scope.locals.truncate(declared);
-        scope.locals.extend(temporaries);
-        scope.locals.extend(operands);
+        let operands = &self.operand_locals;
+        let picked = &mut self.picked_buf;
+        move_to_end(&mut scope.locals, declared, |it| operands.contains(&it), picked);
     }
 
     fn lower_call_and_args(
@@ -2654,35 +2771,37 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         call: ExprId,
     ) -> Result<'db, Option<BasicBlockId>> {
         let declared = self.declared_locals();
-        let Some(args) = args
-            .map(|arg| {
-                if let Some((temp, c)) = self.lower_call_operand(arg, current)? {
-                    current = c;
-                    // What unwinds from the next argument drops this one first.
-                    self.declare_operands_last(call, declared, std::iter::once(&temp));
-                    Ok(Some(temp))
-                } else {
-                    Ok(None)
-                }
-            })
-            .collect::<Result<'_, Option<Vec<_>>>>()?
-        else {
-            return Ok(None);
-        };
-        self.declare_operands_last(call, declared, args.iter());
-        let temps: Vec<LocalId> = args
-            .iter()
-            .filter_map(|arg| match &arg.kind {
-                OperandKind::Copy(place) | OperandKind::Move(place)
-                    if place.projection.as_slice().is_empty() =>
-                {
-                    Some(place.local)
-                }
-                _ => None,
-            })
-            .collect();
-        let after =
-            self.lower_call(func, args.into(), place, current, is_uninhabited, call.into())?;
+        let mut staged = Vec::new_in(self.frame);
+        for arg in args {
+            let Some((temp, c)) = self.lower_call_operand(arg, current)? else {
+                return Ok(None);
+            };
+            current = c;
+            // What unwinds from the next argument drops this one first.
+            self.declare_operands_last(call, declared, std::iter::once(&temp));
+            staged.push(temp);
+        }
+        self.declare_operands_last(call, declared, staged.iter());
+        let mut temps = Vec::new_in(self.frame);
+        temps.extend(staged.iter().filter_map(|arg| match &arg.kind {
+            OperandKind::Copy(place) | OperandKind::Move(place)
+                if place.projection.as_slice().is_empty() =>
+            {
+                Some(place.local)
+            }
+            _ => None,
+        }));
+        // alloc: the arguments, kept in the body at their final size
+        let mut args = Vec::with_capacity(staged.len());
+        args.extend(staged.drain(..));
+        let after = self.lower_call(
+            func,
+            args.into_boxed_slice(),
+            place,
+            current,
+            is_uninhabited,
+            call.into(),
+        )?;
         if let Some(after) = after {
             self.end_arguments(declared, &temps, after, call.into());
         }
@@ -2756,17 +2875,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
     ) {
         let Some(scope) = self.drop_scopes.last_mut() else { return };
-        let Some(since) = scope.locals.get(declared..) else { return };
-        let (ended, kept): (Vec<LocalId>, Vec<LocalId>) =
-            since.iter().partition(|it| temps.contains(it));
-        if ended.is_empty() {
+        if declared > scope.locals.len() {
             return;
         }
-        scope.locals.truncate(declared);
-        scope.locals.extend(kept);
-        for local in ended.into_iter().rev() {
+        let mut ended = mem::replace(&mut self.picked_buf, Vec::new_in(self.frame));
+        let kept = move_to_end(&mut scope.locals, declared, |it| temps.contains(&it), &mut ended);
+        scope.locals.truncate(kept);
+        for &local in ended.iter().rev() {
             self.push_statement(after, StatementKind::StorageDead(local).with_span(span));
         }
+        self.picked_buf = ended;
     }
 
     fn lower_call(
@@ -2813,11 +2931,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     }
 
     fn is_unterminated(&mut self, source: BasicBlockId) -> bool {
-        self.result.basic_blocks[source].terminator.is_none()
+        self.block(source).terminator.is_none()
     }
 
     fn set_terminator(&mut self, source: BasicBlockId, terminator: TerminatorKind, span: MirSpan) {
-        self.result.basic_blocks[source].terminator = Some(Terminator { span, kind: terminator });
+        self.block_mut(source).terminator = Some(Terminator { span, kind: terminator });
     }
 
     fn set_goto(&mut self, source: BasicBlockId, target: BasicBlockId, span: MirSpan) {
@@ -3112,51 +3230,72 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     fn push_statement(&mut self, block: BasicBlockId, statement: Statement) {
         // A statement that panics unwinds as the `Assert` rustc has before it would.
-        if statement.kind.may_panic() && !self.result.basic_blocks[block].is_cleanup {
-            let at = self.result.basic_blocks[block].statements.len();
+        if statement.kind.may_panic() && !self.block(block).is_cleanup {
+            let at = self.block(block).statements.len();
             if let Some(unwind) = self.unwind_here() {
-                self.result.panic_unwinds.push((block, at, unwind));
+                self.building.panic_unwinds.push((block, at, unwind));
             }
         }
-        self.result.basic_blocks[block].statements.push(statement);
+        self.block_mut(block).statements.push(statement);
     }
 
     /// The unwind drop tree's way out from where lowering is: every scope's drops.
     fn unwind_here(&mut self) -> Option<BasicBlockId> {
-        let in_scope: Vec<LocalId> =
-            (0..self.drop_scopes.len()).flat_map(|index| self.leaving_order(index)).collect();
-        self.unwind_through(&in_scope, None)
+        let mut in_scope = mem::replace(&mut self.in_scope_buf, Vec::new_in(self.frame));
+        in_scope.clear();
+        for index in 0..self.drop_scopes.len() {
+            self.leaving_order_into(index, &mut in_scope);
+        }
+        let unwind = self.unwind_through(&in_scope, None);
+        self.in_scope_buf = in_scope;
+        unwind
     }
 
-    /// The locals of the scope at `index` in the reverse of the order leaving it early drops
-    /// them in. rustc keeps the operands of an expression being lowered in that expression's
-    /// own scope, inside the temporaries that live to the end of the statement: in
+    /// Appends the locals of the scope at `index` in the reverse of the order leaving it early
+    /// drops them in. rustc keeps the operands of an expression being lowered in that
+    /// expression's own scope, inside the temporaries that live to the end of the statement: in
     /// `boom().extend(&String::from(..))` a panic in the deref drops `boom()` first, and a
     /// `?` in a field of a struct literal drops the fields before it first.
-    fn leaving_order(&self, index: usize) -> Vec<LocalId> {
+    fn leaving_order_into(&self, index: usize, out: &mut Vec<LocalId, &Frame>) {
         let operands = &self.operand_locals;
-        let (pending, mut rest): (Vec<LocalId>, Vec<LocalId>) =
-            self.drop_scopes[index].in_order(operands).iter().partition(|it| operands.contains(it));
-        rest.extend(pending);
-        rest
+        let start = out.len();
+        self.drop_scopes[index].in_order_into(operands, out);
+        // The scope's order with its pending operands moved to the end, each part in its order.
+        let end = out.len();
+        let mut kept = start;
+        for at in start..end {
+            let local = out[at];
+            if operands.contains(&local) {
+                out.push(local);
+            } else {
+                out[kept] = local;
+                kept += 1;
+            }
+        }
+        out.drain(kept..end);
     }
 
-    /// What every scope has declared, outermost first, in the order it was declared.
-    fn in_scope(&self) -> Vec<LocalId> {
-        let operands = &self.operand_locals;
-        self.drop_scopes.iter().flat_map(|it| it.in_order(operands).into_owned()).collect()
+    /// Appends what every scope has declared, outermost first, in the order it was declared.
+    fn in_scope_into(&self, out: &mut Vec<LocalId, &Frame>) {
+        for scope in &self.drop_scopes {
+            scope.in_order_into(&self.operand_locals, out);
+        }
     }
 
     /// The way out of a drop of `locals[at]` of a scope that drops `locals`: what is declared
     /// before it, then, in a coroutine, its own storage.
     fn unwind_from_drop(&mut self, locals: &[LocalId], at: usize) -> Option<BasicBlockId> {
         let local = locals[at];
-        let mut in_scope = self.in_scope();
+        let mut in_scope = mem::replace(&mut self.in_scope_buf, Vec::new_in(self.frame));
+        in_scope.clear();
+        self.in_scope_into(&mut in_scope);
         match in_scope.iter().position(|&it| it == local) {
             Some(position) => in_scope.truncate(position),
             None => in_scope.extend_from_slice(&locals[..at]),
         }
-        self.unwind_through(&in_scope, Some(local))
+        let unwind = self.unwind_through(&in_scope, Some(local));
+        self.in_scope_buf = in_scope;
+        unwind
     }
 
     /// The node of the unwind drop tree that drops `locals` last first, and before them ends
@@ -3174,7 +3313,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             if storage {
                 at = Some(self.unwind_node(at, local, false));
             }
-            if !self.is_copy(self.result.locals[local].ty.as_ref())
+            if !self.is_copy(self.local(local).ty.as_ref())
                 && !self.unscheduled.contains(&local)
             {
                 at = Some(self.unwind_node(at, local, true));
@@ -3205,9 +3344,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         if let Some(&node) = self.unwind_nodes.get(&(parent, local, value)) {
             return node;
         }
-        let (statements, kind) = match value {
+        let (statement, kind) = match value {
             true => (
-                Vec::new(),
+                None,
                 TerminatorKind::Drop {
                     place: Place::from(local).store(),
                     target: parent,
@@ -3215,15 +3354,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 },
             ),
             false => (
-                vec![StatementKind::StorageDead(local).with_span(MirSpan::Unknown)],
+                Some(StatementKind::StorageDead(local).with_span(MirSpan::Unknown)),
                 TerminatorKind::Goto { target: parent },
             ),
         };
-        let node = self.result.basic_blocks.alloc(BasicBlock {
-            statements,
-            terminator: Some(Terminator { span: MirSpan::Unknown, kind }),
-            is_cleanup: true,
-        });
+        let terminator = Some(Terminator { span: MirSpan::Unknown, kind });
+        let node = self.alloc_block(statement, terminator, true);
         self.unwind_nodes.insert((parent, local, value), node);
         node
     }
@@ -3232,14 +3368,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         if let Some(resume) = self.unwind_resume {
             return resume;
         }
-        let resume = self.result.basic_blocks.alloc(BasicBlock {
-            statements: Vec::new(),
-            terminator: Some(Terminator {
-                span: MirSpan::Unknown,
-                kind: TerminatorKind::UnwindResume,
-            }),
-            is_cleanup: true,
-        });
+        let terminator =
+            Some(Terminator { span: MirSpan::Unknown, kind: TerminatorKind::UnwindResume });
+        let resume = self.alloc_block([], terminator, true);
         self.unwind_resume = Some(resume);
         resume
     }
@@ -3299,7 +3430,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         place: Place<'db>,
         label: Option<LabelId>,
         span: MirSpan,
-        f: impl FnOnce(&mut MirLowerCtx<'_, 'db>, BasicBlockId) -> Result<'db, ()>,
+        f: impl FnOnce(&mut MirLowerCtx<'_, 'f, 'db>, BasicBlockId) -> Result<'db, ()>,
     ) -> Result<'db, Option<BasicBlockId>> {
         let begin = self.new_basic_block();
         let prev = self.current_loop_blocks.replace(LoopBlocks {
@@ -3773,15 +3904,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         if declared > scope.locals.len() {
             return;
         }
-        let (operands, temporaries): (Vec<LocalId>, Vec<LocalId>) =
-            scope.locals.drain(declared..).partition(|it| self.operand_locals.contains(it));
+        let operands = &self.operand_locals;
+        let ops = move_to_end(
+            &mut scope.locals,
+            declared,
+            |it| operands.contains(&it),
+            &mut self.picked_buf,
+        );
+        // `scope.locals` is now its own, then the tail's temporaries, then the tail's operands.
         match outer.last_mut() {
-            Some(outer) => outer.locals.extend(temporaries),
-            None => {
-                scope.locals.splice(0..0, temporaries);
+            Some(outer) => {
+                outer.locals.extend_from_slice(&scope.locals[declared..ops]);
+                scope.locals.drain(declared..ops);
             }
+            None => scope.locals[..ops].rotate_right(ops - declared),
         }
-        scope.locals.extend(operands);
     }
 
     /// Lowers the `else` of a `let`, which runs when the pattern did not match. The temporaries
@@ -3795,16 +3932,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         declared: usize,
         span: MirSpan,
     ) -> Result<'db, ()> {
+        let frame = self.frame;
         let [.., block, temporaries] = &mut self.drop_scopes[..] else {
             return Err(MirLowerError::ImplementationError("`let` outside a block".into()));
         };
         let extended = block.locals.split_off(declared.min(block.locals.len()));
         let held = [
-            DropScope { locals: extended, temporaries: true, ..Default::default() },
+            DropScope { locals: extended, temporaries: true, ..DropScope::new_in(frame) },
             DropScope {
-                locals: std::mem::take(&mut temporaries.locals),
+                locals: mem::replace(&mut temporaries.locals, Vec::new_in(frame)),
                 temporaries: true,
-                ..Default::default()
+                ..DropScope::new_in(frame)
             },
         ];
         for scope in held.iter().rev() {
@@ -3828,19 +3966,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         self_binding: Option<(BindingId, Ty<'db>)>,
         pick_binding: impl Fn(BindingId) -> bool,
     ) -> Result<'db, BasicBlockId> {
-        let base_param_count = self.result.param_locals.len();
+        let base_param_count = self.building.param_locals.len();
         let self_binding = match self_binding {
             Some((self_binding, ty)) => {
-                let local_id = self.result.locals.alloc(Local { ty: ty.store() });
+                let local_id = self.alloc_local(Local { ty: ty.store() });
                 self.drop_scopes.last_mut().unwrap().locals.push(local_id);
-                self.result.binding_locals.insert(self_binding, local_id);
-                self.result.param_locals.push(local_id);
+                self.set_binding_local(self_binding, local_id);
+                self.building.param_locals.push(local_id);
                 Some(self_binding)
             }
             None => None,
         };
-        self.result.param_locals.extend(params.clone().map(|(it, ty)| {
-            let local_id = self.result.locals.alloc(Local { ty: ty.store() });
+        for (it, ty) in params.clone() {
+            let local_id = self.alloc_local(Local { ty: ty.store() });
             self.drop_scopes.last_mut().unwrap().locals.push(local_id);
             if let Pat::Bind { id, subpat: None } = self.store.pat(it)
                 && matches!(
@@ -3848,19 +3986,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     BindingAnnotation::Unannotated | BindingAnnotation::Mutable
                 )
             {
-                self.result.binding_locals.insert(id, local_id);
+                self.set_binding_local(id, local_id);
             }
-            local_id
-        }));
+            self.building.param_locals.push(local_id);
+        }
         // The rest of the bindings get a local where they are declared.
         for (id, _) in self.store.bindings() {
-            if pick_binding(id) && !self.result.binding_locals.contains_idx(id) {
+            if pick_binding(id) && self.local_of_binding(id).is_none() {
                 self.undeclared.insert(id);
             }
         }
         let mut current = self.result.start_block;
         if let Some(self_binding) = self_binding {
-            let local = self.result.param_locals.clone()[base_param_count];
+            let local = self.building.param_locals[base_param_count];
             if local != self.binding_local(self_binding)? {
                 let r = self.match_self_param(self_binding, current, local)?;
                 if let Some(b) = r.1 {
@@ -3869,13 +4007,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 current = r.0;
             }
         }
-        let local_params = self
-            .result
-            .param_locals
-            .clone()
-            .into_iter()
-            .skip(base_param_count + self_binding.is_some() as usize);
-        for ((param, _), local) in params.zip(local_params) {
+        let first_param = base_param_count + self_binding.is_some() as usize;
+        for (index, (param, _)) in params.enumerate() {
+            let Some(&local) = self.building.param_locals.get(first_param + index) else { break };
             if let Pat::Bind { id, .. } = self.store.pat(param)
                 && local == self.binding_local(id)?
             {
@@ -3902,7 +4036,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     /// Gives each binding of `pat` that has none a local, in the order of the pattern.
     fn declare_bindings(&mut self, pat: PatId) {
-        let mut bindings = Vec::new();
+        let mut bindings = Vec::new_in(self.frame);
         self.store.walk_bindings_in_pat(pat, |b| bindings.push(b));
         for b in bindings {
             self.declare_binding(b);
@@ -3911,8 +4045,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     fn declare_binding(&mut self, b: BindingId) {
         if self.undeclared.remove(&b) {
-            let local = self.result.locals.alloc(Local { ty: self.infer.binding_ty(b).store() });
-            self.result.binding_locals.insert(b, local);
+            let local = self.alloc_local(Local { ty: self.infer.binding_ty(b).store() });
+            self.set_binding_local(b, local);
         }
     }
 
@@ -3920,8 +4054,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         // A binding not declared by its `let` is declared where it is first bound or used:
         // a match arm's when the arm binds, as rustc declares it.
         self.declare_binding(b);
-        match self.result.binding_locals.get(b) {
-            Some(it) => Ok(*it),
+        match self.local_of_binding(b) {
+            Some(it) => Ok(it),
             None => {
                 // FIXME: It should never happens, but currently it will happen in some cases, not sure when exactly.
                 // never!("Using inaccessible local for binding is always a bug");
@@ -3962,7 +4096,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let lang_items = self.lang_items();
         let variant = if ready { lang_items.PollReady } else { lang_items.PollPending };
         let variant = variant.ok_or(MirLowerError::LangItemNotFound)?;
-        let output = self.result.locals[return_slot()].ty.as_ref();
+        let output = self.local(return_slot()).ty.as_ref();
         let args = GenericArgs::new_from_slice(&[output.into()]);
         Ok(AggregateKind::Adt(variant.into(), args.store()))
     }
@@ -4000,7 +4134,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let awaitee_ty = self.expr_ty_after_adjustments(awaitee);
         let future_ty = Ty::new_projection(interner, future_alias.into(), [awaitee_ty]);
         // rustc's `into_future(e)` writes to a temporary made before what `e` makes.
-        let future = self.result.locals.alloc(Local { ty: future_ty.store() });
+        let future = self.alloc_local(Local { ty: future_ty.store() });
         let Some((awaitee_value, current)) = self.lower_expr_to_some_operand(awaitee, current)?
         else {
             return Ok(None);
@@ -4065,7 +4199,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             ),
             span,
         );
-        let context_ty = self.result.locals[context].ty.as_ref();
+        let context_ty = self.local(context).ty.as_ref();
         let reborrowed: Place<'db> = self.temp(context_ty, again, MirSpan::Unknown)?.into();
         self.push_assignment(
             again,
@@ -4151,11 +4285,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         mut current: BasicBlockId,
         span: MirSpan,
     ) -> BasicBlockId {
+        let mut order = mem::replace(&mut self.order_buf, Vec::new_in(self.frame));
+        let mut written = mem::replace(&mut self.written_buf, Vec::new_in(self.frame));
         for index in (scope_index..self.drop_scopes.len()).rev() {
-            let scope = self.drop_scopes[index].clone();
-            let written = self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span);
-            self.drop_scopes[index].exits.extend(written);
+            order.clear();
+            written.clear();
+            self.drop_scopes[index].in_order_into(&self.operand_locals, &mut order);
+            self.emit_drops(&order, &mut current, span, Some(&mut written));
+            self.drop_scopes[index].exits.extend_from_slice(&written);
         }
+        self.order_buf = order;
+        self.written_buf = written;
         current
     }
 
@@ -4173,24 +4313,32 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let mut at = target;
         // The locals whose storage ends after the drop that comes next and before `at`, in the
         // order they were declared, with their scope.
-        let mut storage: Vec<(usize, LocalId)> = Vec::new();
+        let mut storage = mem::replace(&mut self.exit_storage_buf, Vec::new_in(self.frame));
+        let mut locals = mem::replace(&mut self.exit_locals_buf, Vec::new_in(self.frame));
+        let mut ended = mem::replace(&mut self.exit_ended_buf, Vec::new_in(self.frame));
+        let mut before = mem::replace(&mut self.exit_before_buf, Vec::new_in(self.frame));
+        storage.clear();
         for index in scope_index..self.drop_scopes.len() {
-            let locals = self.leaving_order(index);
-            for (position, &local) in locals.iter().enumerate() {
-                if self.is_copy(self.result.locals[local].ty.as_ref()) {
+            locals.clear();
+            self.leaving_order_into(index, &mut locals);
+            for position in 0..locals.len() {
+                let local = locals[position];
+                if self.is_copy(self.local(local).ty.as_ref()) {
                     storage.push((index, local));
                     continue;
                 }
-                let ended: Vec<LocalId> = storage.iter().map(|it| it.1).collect();
-                let key = (at, local, ended);
-                if let Some(&node) = self.exit_nodes.get(&key) {
+                ended.clear();
+                ended.extend(storage.iter().map(|it| it.1));
+                if let Some(&node) = self.exit_nodes.get(&ExitKey(at, local, &ended)) {
                     at = node;
                     storage.clear();
                     continue;
                 }
                 let (node, dropped) = (self.new_basic_block(), self.new_basic_block());
-                let mut before: Vec<LocalId> =
-                    (0..index).flat_map(|outer| self.leaving_order(outer)).collect();
+                before.clear();
+                for outer in 0..index {
+                    self.leaving_order_into(outer, &mut before);
+                }
                 before.extend_from_slice(&locals[..position]);
                 let unwind = self.unwind_through(&before, Some(local));
                 self.set_terminator(
@@ -4206,12 +4354,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 self.drop_scopes[index].exits.extend([node, dropped]);
                 self.end_storage(dropped, &mut storage, span);
                 self.set_goto(dropped, at, span);
+                let frame = self.frame;
+                let key = (at, local, &*frame.alloc_slice_copy(&ended));
                 self.exit_nodes.insert(key, node);
                 at = node;
             }
         }
         self.end_storage(current, &mut storage, span);
         self.set_goto(current, at, span);
+        self.exit_storage_buf = storage;
+        self.exit_locals_buf = locals;
+        self.exit_ended_buf = ended;
+        self.exit_before_buf = before;
     }
 
     /// Ends the storage of `storage`, the locals of an exit's scopes with their scope, in
@@ -4219,7 +4373,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     fn end_storage(
         &mut self,
         block: BasicBlockId,
-        storage: &mut Vec<(usize, LocalId)>,
+        storage: &mut Vec<(usize, LocalId), &'f Frame>,
         span: MirSpan,
     ) {
         let mut last_scope = None;
@@ -4233,16 +4387,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     }
 
     /// Writes the drops that left `scope` early at its `end`.
-    fn exits_end_at(&mut self, scope: &DropScope, end: MirSpan) {
+    fn exits_end_at(&mut self, scope: &DropScope<'f>, end: MirSpan) {
         if scope.exits.is_empty() {
             return;
         }
-        let locals: FxHashSet<LocalId> = scope.locals.iter().copied().collect();
-        let mut exits = scope.exits.clone();
-        radix::sort_copy_by_key(&mut exits, |it| it.into_raw().into_u32());
-        exits.dedup();
-        for block in exits {
-            let block = &mut self.result.basic_blocks[block];
+        let mut locals: FrameSet<'f, LocalId> = framed::set_in(self.frame);
+        locals.extend(scope.locals.iter().copied());
+        // A block met twice gets the same spans again.
+        for &block in &scope.exits {
+            let block = self.block_mut(block);
             for statement in &mut block.statements {
                 if let StatementKind::StorageDead(local) = statement.kind
                     && locals.contains(&local)
@@ -4272,13 +4425,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
     ) -> BasicBlockId {
         if let Some(arm) = self.drop_scopes.last() {
-            let by_pattern = arm.locals.get(..bound_by_pattern).unwrap_or_default().to_vec();
-            let by_guard = DropScope {
-                locals: arm.locals.get(bound_by_pattern..).unwrap_or_default().to_vec(),
-                ..Default::default()
-            };
-            self.emit_drop_and_storage_dead_for_scope(&by_guard, &mut current, span);
-            for &local in by_pattern.iter().rev() {
+            let by_pattern = arm.locals.get(..bound_by_pattern).unwrap_or_default();
+            let by_guard = arm.locals.get(bound_by_pattern..).unwrap_or_default();
+            let mut pattern = Vec::with_capacity_in(by_pattern.len(), self.frame);
+            pattern.extend_from_slice(by_pattern);
+            let mut guard = Vec::with_capacity_in(by_guard.len(), self.frame);
+            guard.extend_from_slice(by_guard);
+            self.emit_drops(&guard, &mut current, span, None);
+            for &local in pattern.iter().rev() {
                 self.push_statement(current, StatementKind::StorageDead(local).with_span(span));
             }
         }
@@ -4291,11 +4445,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     fn guard_held(
         &mut self,
         current: BasicBlockId,
-        moves: Vec<GuardedMove<'db>>,
+        moves: Option<Vec<GuardedMove<'db>, &'f Frame>>,
         bound: usize,
     ) -> Result<'db, ()> {
         let mut at = bound;
-        for GuardedMove { binding, local, place, span } in moves {
+        for GuardedMove { binding, local, place, span } in moves.into_iter().flatten() {
             let known = self.drop_scopes.last().is_some_and(|it| it.locals.contains(&local));
             self.push_storage_live(binding, current)?;
             if let Some(arm) = self.drop_scopes.last_mut()
@@ -4351,14 +4505,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     }
 
     fn push_drop_scope(&mut self) -> DropScopeToken {
-        self.drop_scopes.push(DropScope::default());
+        self.drop_scopes.push(DropScope::new_in(self.frame));
         DropScopeToken
     }
 
     /// Don't call directly
     fn pop_drop_scope_assume_dropped_internal(&mut self) {
         if let Some(scope) = self.drop_scopes.pop() {
-            self.result.scope_ends.extend(scope.locals.iter().rev());
+            self.building.scope_ends.extend(scope.locals.iter().rev());
         }
     }
 
@@ -4369,7 +4523,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
     ) -> BasicBlockId {
         let scope = self.drop_scopes.pop().unwrap();
-        self.result.scope_ends.extend(scope.locals.iter().rev());
+        self.building.scope_ends.extend(scope.locals.iter().rev());
         self.exits_end_at(&scope, span.end());
         self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span.end());
         current
@@ -4408,11 +4562,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Some(it) => it,
                 None => self.resume_block(),
             };
-            unwind = Some(self.result.basic_blocks.alloc(BasicBlock {
-                statements: vec![StatementKind::Assign(place.store(), value).with_span(span)],
-                terminator: Some(Terminator { span, kind: TerminatorKind::Goto { target } }),
-                is_cleanup: true,
-            }));
+            let assign = StatementKind::Assign(place.store(), value).with_span(span);
+            let terminator = Some(Terminator { span, kind: TerminatorKind::Goto { target } });
+            unwind = Some(self.alloc_block([assign], terminator, true));
         }
         self.set_terminator(
             current,
@@ -4424,17 +4576,37 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     fn emit_drop_and_storage_dead_for_scope(
         &mut self,
-        scope: &DropScope,
+        scope: &DropScope<'f>,
         current: &mut Idx<BasicBlock>,
         span: MirSpan,
-    ) -> Vec<BasicBlockId> {
-        let locals = scope.in_order(&self.operand_locals).into_owned();
-        let mut written = vec![*current];
+    ) {
+        let mut order = mem::replace(&mut self.order_buf, Vec::new_in(self.frame));
+        order.clear();
+        scope.in_order_into(&self.operand_locals, &mut order);
+        self.emit_drops(&order, current, span, None);
+        self.order_buf = order;
+    }
+
+    /// Drops `locals`, a scope's in the order they were declared, and ends their storage, the
+    /// last first, from `current` on. `written` gets each block a drop or a storage end of
+    /// them is written in.
+    fn emit_drops(
+        &mut self,
+        locals: &[LocalId],
+        current: &mut Idx<BasicBlock>,
+        span: MirSpan,
+        mut written: Option<&mut Vec<BasicBlockId, &'f Frame>>,
+    ) {
+        if let Some(written) = written.as_deref_mut() {
+            written.push(*current);
+        }
         for (at, &l) in locals.iter().enumerate().rev() {
-            if !self.is_copy(self.result.locals[l].ty.as_ref()) {
-                let unwind = self.unwind_from_drop(&locals, at);
+            if !self.is_copy(self.local(l).ty.as_ref()) {
+                let unwind = self.unwind_from_drop(locals, at);
                 let prev = std::mem::replace(current, self.new_basic_block());
-                written.push(*current);
+                if let Some(written) = written.as_deref_mut() {
+                    written.push(*current);
+                }
                 self.set_terminator(
                     prev,
                     TerminatorKind::Drop {
@@ -4447,7 +4619,6 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             self.push_statement(*current, StatementKind::StorageDead(l).with_span(span));
         }
-        written
     }
 }
 
@@ -4710,8 +4881,17 @@ enum CoroutineCaptures {
 
 fn lower_closure_body<'db>(
     db: &'db Db,
+    closure: InternedClosure<'db>,
+    held: CoroutineCaptures,
+) -> Result<'db, MirBody<'db>> {
+    frame::task(Tag::Mir, |frame| lower_closure_body_in(db, closure, held, frame))
+}
+
+fn lower_closure_body_in<'db>(
+    db: &'db Db,
     InternedClosure { owner: body_owner, expr, .. }: InternedClosure<'db>,
     held: CoroutineCaptures,
+    frame: &Frame,
 ) -> Result<'db, MirBody<'db>> {
     let store = ExpressionStore::of(db, body_owner.expression_store_owner(db));
     let infer = InferenceResult::of(db, body_owner);
@@ -4722,8 +4902,9 @@ fn lower_closure_body<'db>(
     let Some(closure_data) = infer.closures_data.get(&expr) else {
         not_supported!("closure without capture analysis");
     };
-    let captures: Vec<&CapturedPlace> = match held {
-        CoroutineCaptures::Own => closure_data.min_captures.values().flatten().collect(),
+    let mut captures: Vec<&CapturedPlace, &Frame> = Vec::new_in(frame);
+    match held {
+        CoroutineCaptures::Own => captures.extend(closure_data.min_captures.values().flatten()),
         CoroutineCaptures::OfClosure => {
             let closure = ExpressionStore::closure_for_coroutine(expr);
             let (Expr::Closure { args, .. }, Some(of_closure)) =
@@ -4732,10 +4913,10 @@ fn lower_closure_body<'db>(
                 implementation_error!("async block of a closure that is not one");
             };
             let arguments = closure_data.min_captures.values().flatten().take(args.len());
-            arguments.chain(of_closure.min_captures.values().flatten()).collect()
+            captures.extend(arguments.chain(of_closure.min_captures.values().flatten()));
         }
-    };
-    let mut ctx = MirLowerCtx::new(db, body_owner, store, infer);
+    }
+    let mut ctx = MirLowerCtx::new(db, body_owner, store, infer, frame);
     ctx.result.inherits_overflow_checks = store.inherits_overflow_checks(expr);
     let interner = ctx.interner();
     let by_ref = |mutability| {
@@ -4748,7 +4929,7 @@ fn lower_closure_body<'db>(
             // The body's own type can still be waiting for a coercion to the declared return
             // type.
             let sig = closure_data.liberated_sig.get();
-            ctx.result.locals.alloc(Local { ty: sig.output().store() });
+            ctx.alloc_local(Local { ty: sig.output().store() });
             let (receiver, ty) = match substs.as_closure().kind() {
                 rustc_type_ir::ClosureKind::FnOnce => (Receiver::Owned, infer.expr_ty(expr)),
                 rustc_type_ir::ClosureKind::FnMut => (Receiver::Borrowed, by_ref(Mutability::Mut)),
@@ -4759,7 +4940,7 @@ fn lower_closure_body<'db>(
         crate::next_solver::TyKind::CoroutineClosure(_, substs) => {
             // Returns the future of its `async` block.
             let sig = closure_data.liberated_sig.get();
-            ctx.result.locals.alloc(Local { ty: sig.output().store() });
+            ctx.alloc_local(Local { ty: sig.output().store() });
             let (receiver, ty) = match substs.as_coroutine_closure().kind() {
                 rustc_type_ir::ClosureKind::FnOnce => (Receiver::Owned, infer.expr_ty(expr)),
                 rustc_type_ir::ClosureKind::FnMut => (Receiver::Borrowed, by_ref(Mutability::Mut)),
@@ -4769,7 +4950,7 @@ fn lower_closure_body<'db>(
         }
         crate::next_solver::TyKind::Coroutine(id, substs) => {
             let own = substs.as_coroutine();
-            ctx.result.locals.alloc(Local { ty: own.return_ty().store() });
+            ctx.alloc_local(Local { ty: own.return_ty().store() });
             let future = match held {
                 CoroutineCaptures::Own => infer.expr_ty(expr),
                 CoroutineCaptures::OfClosure => {
@@ -4794,8 +4975,8 @@ fn lower_closure_body<'db>(
         }
         _ => implementation_error!("closure expression is not closure"),
     };
-    let closure_local = ctx.result.locals.alloc(Local { ty: receiver_ty.store() });
-    ctx.result.param_locals.push(closure_local);
+    let closure_local = ctx.alloc_local(Local { ty: receiver_ty.store() });
+    ctx.building.param_locals.push(closure_local);
     if receiver == Receiver::Coroutine {
         let lang_items = ctx.lang_items();
         let (Some(context), Some(poll)) = (lang_items.Context, lang_items.Poll) else {
@@ -4808,17 +4989,15 @@ fn lower_closure_body<'db>(
             GenericArgs::new_from_slice(&[erased.into()]),
         );
         let context = ctx
-            .result
-            .locals
-            .alloc(Local { ty: Ty::new_ref(interner, erased, context, Mutability::Mut).store() });
-        ctx.result.param_locals.push(context);
-        let output = ctx.result.locals[return_slot()].ty.as_ref();
+            .alloc_local(Local { ty: Ty::new_ref(interner, erased, context, Mutability::Mut).store() });
+        ctx.building.param_locals.push(context);
+        let output = ctx.local(return_slot()).ty.as_ref();
         let poll = Ty::new_adt(
             interner,
             AdtId::EnumId(poll),
             GenericArgs::new_from_slice(&[output.into()]),
         );
-        let poll = ctx.result.locals.alloc(Local { ty: poll.store() });
+        let poll = ctx.alloc_local(Local { ty: poll.store() });
         ctx.result.coroutine = Some(CoroutineLocals { poll, context });
     }
     let resolver_guard = ctx.resolver.update_to_inner_scope(db, ctx.store_owner, expr);
@@ -4831,9 +5010,13 @@ fn lower_closure_body<'db>(
     // Push local for every upvar in the closure. rustc doesn't do that, but we have to so we have locals
     // to associate with upvars for borrowck.
     let is_by_ref_closure = receiver == Receiver::Borrowed;
-    let mut upvar_map: FxHashMap<LocalId, Vec<Capture<'_>>> = FxHashMap::default();
+    let mut upvar_map: FrameMap<'_, LocalId, Vec<Capture<'_>, &Frame>> = framed::map_in(frame);
+    let mut upvar_counts: FrameMap<'_, BindingId, usize> = framed::map_in(frame);
+    for capture in &captures {
+        *upvar_counts.entry(capture.captured_local()).or_default() += 1;
+    }
     for (capture_idx, capture) in captures.into_iter().enumerate() {
-        let capture_local = ctx.result.locals.alloc(Local { ty: capture.captured_ty(db).store() });
+        let capture_local = ctx.alloc_local(Local { ty: capture.captured_ty(db).store() });
         ctx.push_storage_live_for_local(capture_local, current, MirSpan::Unknown)?;
         let mut projections = Vec::with_capacity(2);
         if receiver != Receiver::Owned {
@@ -4863,12 +5046,18 @@ fn lower_closure_body<'db>(
 
         let local = capture.captured_local();
         let local = ctx.binding_local(local)?;
-        upvar_map.entry(local).or_default().push((capture, capture_local, capture_idx));
+        upvar_map
+            .entry(local)
+            .or_insert_with(|| Vec::new_in(frame))
+            .push((capture, capture_local, capture_idx));
 
+        let count = upvar_counts.get(&capture.captured_local()).copied().unwrap_or(0);
         ctx.result
             .upvar_locals
             .entry(capture.captured_local())
-            .or_default()
+            // alloc: kept in the body, at its final size
+            .or_insert_with(|| Vec::with_capacity(count))
+            // clone: kept in the body
             .push((capture_local, capture.place.clone()));
     }
 
@@ -4886,7 +5075,7 @@ fn lower_closure_body<'db>(
     }
     if let Some(CoroutineLocals { poll, .. }) = ctx.result.coroutine {
         let ready = ctx.poll_variant(true)?;
-        for (_, block) in ctx.result.basic_blocks.iter_mut() {
+        for block in ctx.building.blocks.iter_mut() {
             if let Some(Terminator { kind: TerminatorKind::Return, span }) = &block.terminator {
                 let output = Operand {
                     kind: OperandKind::Move(Place::from(return_slot()).store()),
@@ -4895,6 +5084,7 @@ fn lower_closure_body<'db>(
                 block.statements.push(
                     StatementKind::Assign(
                         Place::from(poll).store(),
+                        // clone, alloc: kept in the body
                         Rvalue::Aggregate(ready.clone(), Box::new([output])),
                     )
                     .with_span(*span),
@@ -4904,7 +5094,7 @@ fn lower_closure_body<'db>(
     }
     // What a pattern without bindings matches on is not read, so it is not captured either.
     // The statement becomes a `Nop`, so that `panic_unwinds` still finds the others.
-    for (_, block) in ctx.result.basic_blocks.iter_mut() {
+    for block in ctx.building.blocks.iter_mut() {
         for statement in &mut block.statements {
             if let StatementKind::FakeRead(place) = &statement.kind
                 && upvar_map
@@ -4915,8 +5105,14 @@ fn lower_closure_body<'db>(
             }
         }
     }
+    for (at, local) in ctx.building.binding_locals.iter_mut().enumerate() {
+        if store.binding_owner(BindingId::from_raw(RawIdx::from_u32(at as u32))) != Some(expr) {
+            *local = None;
+        }
+    }
+    let (mut body, infcx, env, mut copy) = ctx.finish();
     let mut err = None;
-    ctx.result.walk_places(|mir_place| {
+    body.walk_places(|mir_place| {
         if let Some(hir_places) = upvar_map.get(&mir_place.local) {
             let projections = captured_place(db, hir_places, mir_place);
             let mir_projections = mir_place.projection.as_slice();
@@ -4946,22 +5142,16 @@ fn lower_closure_body<'db>(
                     )
                     .store();
                 }
+                // clone: error path
                 None => err = Some(mir_place.clone()),
             }
         }
     });
-    ctx.result.binding_locals = ctx
-        .result
-        .binding_locals
-        .into_iter()
-        .filter(|it| ctx.store.binding_owner(it.0) == Some(expr))
-        .collect();
     if let Some(err) = err {
         return Err(MirLowerError::UnresolvedUpvar(err));
     }
-    ctx.result.mark_moves(&ctx.infcx, ctx.env, &mut ctx.copy);
-    ctx.result.shrink_to_fit();
-    Ok(ctx.result)
+    body.mark_moves(&infcx, env, &mut copy);
+    Ok(body)
 }
 
 /// A capture of a closure, the local it is in while the closure runs, and which capture it is.
@@ -5033,6 +5223,11 @@ pub(crate) fn compute_mir_body<'db>(
         span.record("detail", tracing::field::debug(&detail));
     }
     let _p = span.entered();
+    lower_body(db, def)
+}
+
+/// The body of `def`, lowered as `mir_body_query` does, without its span.
+pub(crate) fn lower_body<'db>(db: &'db Db, def: InferBodyId<'db>) -> Result<'db, MirBody<'db>> {
     let (store, root_expr, self_param, params) = match def {
         InferBodyId::DefWithBodyId(def) => {
             let body = Body::of(db, def);
@@ -5045,9 +5240,7 @@ pub(crate) fn compute_mir_body<'db>(
         }
     };
     let infer = InferenceResult::of(db, def);
-    let mut result = lower_body_to_mir(db, def, store, infer, root_expr, self_param, params)?;
-    result.shrink_to_fit();
-    Ok(result)
+    lower_body_to_mir(db, def, store, infer, root_expr, self_param, params)
 }
 
 /// The body of the constant behind a promoted `&expr` of `def`, which evaluates `expr` alone.
@@ -5066,19 +5259,22 @@ pub fn promoted_mir_body_query<'db>(
         return Err(MirLowerError::HasErrors);
     }
     check_expansions(db, def)?;
-    let mut ctx = MirLowerCtx::new(db, def, store, infer);
-    // The value itself, before what borrowing or indexing it adjusts it to.
-    ctx.result.locals.alloc(Local { ty: ctx.expr_ty_without_adjust(expr).store() });
-    let current = ctx.lower_params_and_bindings(iter::empty(), None, |_| false)?;
-    if let Some(current) =
-        ctx.lower_expr_to_place_without_adjust(expr, return_slot().into(), current)?
-    {
-        let current = ctx.pop_drop_scope_assert_finished(current, expr.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(expr).end());
-    }
-    ctx.result.mark_moves(&ctx.infcx, ctx.env, &mut ctx.copy);
-    ctx.result.shrink_to_fit();
-    Ok(ctx.result)
+    frame::task(Tag::Mir, |frame| {
+        let mut ctx = MirLowerCtx::new(db, def, store, infer, frame);
+        // The value itself, before what borrowing or indexing it adjusts it to.
+        let ty = ctx.expr_ty_without_adjust(expr).store();
+        ctx.alloc_local(Local { ty });
+        let current = ctx.lower_params_and_bindings(iter::empty(), None, |_| false)?;
+        if let Some(current) =
+            ctx.lower_expr_to_place_without_adjust(expr, return_slot().into(), current)?
+        {
+            let current = ctx.pop_drop_scope_assert_finished(current, expr.into())?;
+            ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(expr).end());
+        }
+        let (mut body, infcx, env, mut copy) = ctx.finish();
+        body.mark_moves(&infcx, env, &mut copy);
+        Ok(body)
+    })
 }
 
 /// Extracts params from `body.params`/`body.self_param` and the callable signature,
@@ -5158,34 +5354,37 @@ pub fn lower_to_mir_with_store<'db>(
     if infer.diagnostics().iter().any(miscounted) {
         return Err(MirLowerError::HasErrors);
     }
-    let mut ctx = MirLowerCtx::new(db, owner, store, infer);
-    // An inline const's value is its block's: the adjustments recorded on the `const { .. }`
-    // expression (the autoref of `x <= const { .. }`) are the enclosing function's, which
-    // applies them to the constant.
-    let inline = matches!(owner, InferBodyId::AnonConstId(it) if it.is_inline_const(db));
-    // 0 is return local
-    let ty = if inline {
-        ctx.expr_ty_without_adjust(root_expr)
-    } else {
-        ctx.expr_ty_after_adjustments(root_expr)
-    };
-    ctx.result.locals.alloc(Local { ty: ty.store() });
-    let expected_binding_owner =
-        if matches!(owner, InferBodyId::DefWithBodyId(_)) { None } else { Some(root_expr) };
-    let binding_picker = |b: BindingId| ctx.store.binding_owner(b) == expected_binding_owner;
-    let current = ctx.lower_params_and_bindings(params, self_param, binding_picker)?;
-    ctx.ends_temporaries.insert(root_expr);
-    let current = if inline {
-        ctx.lower_expr_to_place_without_adjust(root_expr, return_slot().into(), current)?
-    } else {
-        ctx.lower_expr_to_place(root_expr, return_slot().into(), current)?
-    };
-    if let Some(current) = current {
-        let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(root_expr).end());
-    }
-    ctx.result.mark_moves(&ctx.infcx, ctx.env, &mut ctx.copy);
-    Ok(ctx.result)
+    frame::task(Tag::Mir, |frame| {
+        let mut ctx = MirLowerCtx::new(db, owner, store, infer, frame);
+        // An inline const's value is its block's: the adjustments recorded on the `const { .. }`
+        // expression (the autoref of `x <= const { .. }`) are the enclosing function's, which
+        // applies them to the constant.
+        let inline = matches!(owner, InferBodyId::AnonConstId(it) if it.is_inline_const(db));
+        // 0 is return local
+        let ty = if inline {
+            ctx.expr_ty_without_adjust(root_expr)
+        } else {
+            ctx.expr_ty_after_adjustments(root_expr)
+        };
+        ctx.alloc_local(Local { ty: ty.store() });
+        let expected_binding_owner =
+            if matches!(owner, InferBodyId::DefWithBodyId(_)) { None } else { Some(root_expr) };
+        let binding_picker = |b: BindingId| store.binding_owner(b) == expected_binding_owner;
+        let current = ctx.lower_params_and_bindings(params, self_param, binding_picker)?;
+        ctx.ends_temporaries.insert(root_expr);
+        let current = if inline {
+            ctx.lower_expr_to_place_without_adjust(root_expr, return_slot().into(), current)?
+        } else {
+            ctx.lower_expr_to_place(root_expr, return_slot().into(), current)?
+        };
+        if let Some(current) = current {
+            let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
+            ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(root_expr).end());
+        }
+        let (mut body, infcx, env, mut copy) = ctx.finish();
+        body.mark_moves(&infcx, env, &mut copy);
+        Ok(body)
+    })
 }
 
 /// `value` as a `usize` of the target.

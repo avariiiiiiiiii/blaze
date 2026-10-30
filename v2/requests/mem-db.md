@@ -914,11 +914,15 @@ frame::task(Tag::Infer, |outer| {
   inner task returns. The second pass allocates nothing (`assert_at_most(0, ..)`), and
   `chunks::carved_bytes()` doesn't grow between the second and third passes.
 
+> forwarded to mem (mem-next1) (requests, pass 21; told by tmux).
+
 ## 11. lane mem (`crates/blaze-mem/src/column.rs`): `Column::get_mut` (mem-db-salsa's M9)
 
 Forwarded as written in `v2/requests/mem-db-salsa.md`, M9: the code and its test are there.
 salsa's page table (M5) needs the published value at an index under `&mut` for its `&mut` walks.
 Sound as written: `&mut self` excludes every reader and appender.
+
+> forwarded to mem (mem-next1) (requests, pass 21; told by tmux).
 
 ## 12. lane mem (`crates/blaze-mem/src/scratch.rs`): `Shelf<B, N>` public (mem-db-solver's request 11)
 
@@ -926,3 +930,5 @@ Forwarded as written in `v2/requests/mem-db-solver.md`, request 11. The solver k
 (`InferTables`, `SearchStorage`, `Pending`) on per-thread shelves deeper than `DEPTH = 4`,
 because canonical goals nest 3 to 10 deep. mem-db prefers the `Option<B>` slots form
 (`[const { None }; N]`): it needs no const `Default`.
+
+> forwarded to mem (mem-next1) (requests, pass 21; told by tmux).

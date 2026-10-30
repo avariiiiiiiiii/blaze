@@ -515,7 +515,7 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
                     Unsafe::No => self.context,
                 };
                 for statement in statements {
-                    match *statement {
+                    match statement {
                         Statement::Let { pat, initializer, else_branch, .. } => {
                             if let Some(initializer) = initializer {
                                 self.walk_expr(initializer);
@@ -897,7 +897,7 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
     }
 
     /// A path to a `static mut`, or to a static of an `extern` block not declared `safe`.
-    fn check_static(&mut self, current: ExprId, path: &Path) {
+    fn check_static(&mut self, current: ExprId, path: Path<'_>) {
         if matches!(path, Path::LangItem(..))
             || self.infer.variant_resolution_for_expr(current).is_some()
             || self.infer.assoc_resolutions_for_expr(current).is_some()

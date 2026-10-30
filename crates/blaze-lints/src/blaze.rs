@@ -14,6 +14,7 @@ mod clone;
 mod dispatch;
 mod exempt;
 mod hashmap;
+mod parallel;
 #[cfg(test)]
 mod tests;
 
@@ -33,6 +34,12 @@ macro_rules! docs {
     };
 }
 
+macro_rules! parallel_docs {
+    () => {
+        "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/lanes/lints/parallel.md"
+    };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Lint {
@@ -40,15 +47,24 @@ pub enum Lint {
     HotAlloc,
     HotDyn,
     StdHashmap,
+    Parallelizable,
+    SerialDependence,
 }
 
 /// The group `blaze::hot`: every lint of hot code, SipHash maps included as `hot_lint.py`
 /// checks them.
-pub(crate) const HOT: &[Lint] = Lint::ALL;
+pub(crate) const HOT: &[Lint] = &[Lint::HotClone, Lint::HotAlloc, Lint::HotDyn, Lint::StdHashmap];
 
 impl Lint {
     /// In discriminant order.
-    pub(crate) const ALL: &[Lint] = &[Lint::HotClone, Lint::HotAlloc, Lint::HotDyn, Lint::StdHashmap];
+    pub(crate) const ALL: &[Lint] = &[
+        Lint::HotClone,
+        Lint::HotAlloc,
+        Lint::HotDyn,
+        Lint::StdHashmap,
+        Lint::Parallelizable,
+        Lint::SerialDependence,
+    ];
 
     /// The name after `blaze::`.
     pub(crate) const fn name(self) -> &'static str {
@@ -57,6 +73,8 @@ impl Lint {
             Lint::HotAlloc => "hot_alloc",
             Lint::HotDyn => "hot_dyn",
             Lint::StdHashmap => "std_hashmap",
+            Lint::Parallelizable => "parallelizable",
+            Lint::SerialDependence => "serial_dependence",
         }
     }
 
@@ -72,6 +90,8 @@ impl Lint {
             Lint::HotAlloc => concat!(docs!(), "#hot_alloc"),
             Lint::HotDyn => concat!(docs!(), "#hot_dyn"),
             Lint::StdHashmap => concat!(docs!(), "#std_hashmap"),
+            Lint::Parallelizable => concat!(parallel_docs!(), "#parallelizable"),
+            Lint::SerialDependence => concat!(parallel_docs!(), "#serial_dependence"),
         }
     }
 
@@ -84,6 +104,10 @@ impl Lint {
             }
             Lint::HotDyn => "use a concrete type, a generic, or a `match` on a tag",
             Lint::StdHashmap => "use `rustc_hash::FxHashMap` (or `FxHashSet`), or index by content hash",
+            Lint::Parallelizable => "run the iterations with rayon's parallel iterators or blaze's pool",
+            Lint::SerialDependence => {
+                "make the dependence a reduction to run the iterations in parallel, or keep it serial"
+            }
         }
     }
 }
@@ -162,6 +186,7 @@ struct Finding {
 }
 
 fn check_body(cx: &mut Cx<'_, '_>) {
+    parallel::check(cx);
     let on = |lint| cx.on_blaze(lint);
     let (on_clone, on_alloc, on_dyn, on_map) =
         (on(Lint::HotClone), on(Lint::HotAlloc), on(Lint::HotDyn), on(Lint::StdHashmap));

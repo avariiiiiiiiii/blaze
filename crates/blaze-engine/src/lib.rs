@@ -74,7 +74,7 @@ use hir_ty_codegen::{
     Backend, CodegenError, CodegenUnit, ContentId, ParallelWork, Rejections, Roots, SymbolResolver,
     exported_static, exported_symbol, linked_symbol, tier as codegen_tier,
 };
-use ide_db::{ChangeWithProcMacros, RootDatabase};
+use ide_db::{ChangeWithProcMacros, RootDatabase, RootDatabaseExt as _};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
 use project_model::{
     CargoConfig, CargoFeatures, CargoWorkspace, ProjectManifest, ProjectWorkspace,
@@ -2624,7 +2624,7 @@ fn load(
         beside,
         scripts_said,
     };
-    let mut db = RootDatabase::new(None);
+    let mut db = RootDatabase::new();
     let mut vfs = vfs::Vfs::default();
     checkouts.add(projects, &mut db, &mut vfs)?;
     Ok((db, vfs, checkouts))
@@ -6811,9 +6811,13 @@ impl WatchedFile {
     fn include_sources(
         files: &mut Vec<WatchedFile>,
         tree: &mut tree::Tree,
-        db: &mut RootDatabase,
+        db: &mut ide_db::base_db::Shared,
     ) -> Loaded {
-        let added = tree.included(db);
+        // Without one to add, `included` writes nothing: no reader is stopped for it.
+        if !tree.includes_more(db) {
+            return Loaded::Nothing;
+        }
+        let added = tree.included(db.write());
         if added.is_empty() {
             return Loaded::Nothing;
         }
@@ -6847,7 +6851,7 @@ impl WatchedFile {
             .any(|it| !watched.contains(it) && !WatchedFile::immutable(it))
     }
 
-    fn watch_included(files: &mut Vec<WatchedFile>, db: &mut RootDatabase) -> bool {
+    fn watch_included(files: &mut Vec<WatchedFile>, db: &mut ide_db::base_db::Shared) -> bool {
         let watched: FxHashSet<&Path> = files.iter().map(|it| &*it.path).collect();
         let new: Vec<AbsPathBuf> = db
             .included_files()
@@ -6867,7 +6871,7 @@ impl WatchedFile {
                 path: AsRef::<Path>::as_ref(&path).to_owned(),
                 mtime: mtime.ok(),
             });
-            changed |= db.reload_included_file(&path);
+            changed |= db.write().reload_included_file(&path);
         }
         prepare_macro_sessions(db);
         changed
@@ -9054,16 +9058,18 @@ fn run_holding(
         held.checkouts.scripts_said = scripts_said.clone();
         held.with(&projects, &cargo_config, &selection)
     });
-    let (mut db, mut vfs, mut checkouts) = match held {
+    let (db, mut vfs, mut checkouts) = match held {
         Some(Held { db, vfs, checkouts }) => (db, vfs, checkouts),
         None => {
             let beside = said.as_ref().map(beside);
             load(&projects, &cargo_config, load_config(), selection, beside, scripts_said)?
         }
     };
+    // Detached builds and tiering read it from threads of their own, so a write stops them.
+    let mut db = ide_db::base_db::Shared::new(db);
     let loaded_at = start.elapsed();
     let listed = Arc::new(Listed::default());
-    ide_db::base_db::set_process_env(&mut db, process::own());
+    ide_db::base_db::set_process_env(db.write(), process::own());
     // What is compiled ahead is stored too, so the store is told the toolchain first. A build
     // told ahead of cargo's links the library of the toolchain that was loaded, or is not the
     // daemon's.
@@ -9079,7 +9085,7 @@ fn run_holding(
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
     let following_at = start.elapsed();
-    let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
+    let built = follow_cargo(db.write(), &mut vfs, &mut checkouts, &args, &listed)?;
     if std::env::var_os("BLAZE_STATS").is_some() {
         let (loaded, toolchain) = (loaded_at.as_micros(), (following_at - loaded_at).as_micros());
         let cargo = (start.elapsed() - following_at).as_micros();
@@ -9103,13 +9109,13 @@ fn run_holding(
     eprintln!("load workspace: {:.1?}", start.elapsed());
     memory::checkpoint("load");
     if args.run_tool {
-        run_tool_std(&mut db)?;
+        run_tool_std(db.write())?;
     }
     prepare_macro_sessions(&db);
 
     if args.out.is_dir() {
         let texts = harnesses(&db, [&args], None);
-        write_harnesses(&mut db, texts);
+        write_harnesses(db.write(), texts);
         return build_batch(&db, args);
     }
 
@@ -9137,12 +9143,12 @@ fn run_holding(
     events::at(events::Step::Resolve, None);
     let built = built_crates(&db, &args)?;
     events::graph(&db, &built);
-    let mut served = frozen::serve(&mut db, &built);
+    let mut served = frozen::serve(db.write(), &built);
     // What is frozen names the files its `include!`s read: those not loaded yet are, and
     // what named them is read again.
     if WatchedFile::include_sources(&mut files, &mut tree, &mut db) != Loaded::Nothing {
         listed.touch(&db, None);
-        served = frozen::serve(&mut db, &built);
+        served = frozen::serve(db.write(), &built);
     }
     let mut resolved = resolve_crates(&db, &args, cores())?;
     // Resolving the names finds the files `include!` names that were not loaded. With those
@@ -9154,7 +9160,7 @@ fn run_holding(
     }
     // A tests' program starts in blaze's harness.
     let texts = harnesses(&db, [&args], None);
-    write_harnesses(&mut db, texts);
+    write_harnesses(db.write(), texts);
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
     events::at(events::Step::Store, Some("the resolved names"));
     frozen::store(&db, &served)?;
@@ -9195,7 +9201,7 @@ fn run_holding(
     // the names are resolved: a compile started now would hold up readiness past that.
     if !beside {
         events::at(events::Step::Codegen, Some("ahead"));
-        lower_until(&mut db, &args, &listed, cores(), true, &|| table.is_finished())?;
+        lower_until(db.write(), &args, &listed, cores(), true, &|| table.is_finished())?;
     }
     let (table, whole) =
         table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
@@ -9228,7 +9234,7 @@ fn run_holding(
             listed: &listed,
             sysroot: sysroot.as_deref(),
         };
-        let code = doctest::run_all(&mut db, &building, libraries, emits.triple());
+        let code = doctest::run_all(db.write(), &building, libraries, emits.triple());
         blaze_store::settled();
         std::process::exit(code);
     }
@@ -9322,7 +9328,7 @@ fn run_holding(
                     let named: Vec<String> = including
                         .iter()
                         .map(|&it| {
-                            let name = it.extra_data(&db).display_name.as_ref();
+                            let name = it.extra_data(&*db).display_name.as_ref();
                             name.map_or_else(|| "?".to_owned(), ToString::to_string)
                         })
                         .collect();
@@ -9420,7 +9426,7 @@ fn run_holding(
                 bail!("{why}");
             }
         }
-        memory::report(&mut db, "build")?;
+        memory::report(db.write(), "build")?;
         report_stats(&known.stats);
         let named = shown_crate(&db, &args);
         events::at(events::Step::Link, Some(&named));
@@ -9531,7 +9537,7 @@ fn run_holding(
                 return None;
             }
             let inside = it.path.strip_prefix(&args.checkout).ok()?;
-            Some((inside.to_owned(), db.file_text(id).text(&db).clone()))
+            Some((inside.to_owned(), db.file_text(id).text(&*db).clone()))
         })
         .collect();
     events::idle();
@@ -9560,18 +9566,18 @@ fn run_holding(
     // Paid here, the first edit does not.
     {
         use ide_db::base_db::salsa::{Database, Durability};
-        db.synthetic_write(Durability::LOW);
+        db.write().synthetic_write(Durability::LOW);
         prepare_macro_sessions(&db);
     }
     // Only a worker that serves builds again and lets go after; the bookkeeping of an `lru`
     // costs every fetch of its queries.
     if listener.is_some() {
-        memo_capacities(&mut db)?;
+        memo_capacities(db.write())?;
     }
-    memory::report(&mut db, "warm-up")?;
+    memory::report(db.write(), "warm-up")?;
     trace::finish_cold("watch ready");
     eprintln!("watching {} files", files.len());
-    ide_db::executions::take(&db);
+    ide_db::base_db::executions::take(&db);
     // Requests wait here while a build is under way, and those that have come by the time it
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
@@ -9727,7 +9733,10 @@ fn run_holding(
                         Ok(event) => {
                             if builds.take(event, &mut programs)? {
                                 let_go(&mut db, &builds, &programs);
-                                memory::served(&mut db)?;
+                                if let Some(db) = db.idle() {
+                                    // Only while no build reads it: a report needs the database alone.
+                                    memory::served(db)?;
+                                }
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => own_base = Some(at),
@@ -9739,7 +9748,10 @@ fn run_holding(
                         let event = builds.events.recv()?;
                         if builds.take(event, &mut programs)? {
                             let_go(&mut db, &builds, &programs);
-                            memory::served(&mut db)?;
+                            if let Some(db) = db.idle() {
+                                // Only while no build reads it: a report needs the database alone.
+                                memory::served(db)?;
+                            }
                         }
                     }
                     _ => {}
@@ -9753,7 +9765,10 @@ fn run_holding(
                     while let Ok(event) = builds.events.try_recv() {
                         if builds.take(event, &mut programs)? {
                             let_go(&mut db, &builds, &programs);
-                            memory::served(&mut db)?;
+                            if let Some(db) = db.idle() {
+                                // Only while no build reads it: a report needs the database alone.
+                                memory::served(db)?;
+                            }
                         }
                     }
                     let Some((request, target, stream)) = builds.waiting.pop_front() else {
@@ -9788,8 +9803,8 @@ fn run_holding(
                             let before = CratesAsLoaded::of(&db);
                             let read_from = SystemTime::now();
                             let reloaded =
-                                checkouts.reload(&stale, &stream.env, &mut db, tree.vfs());
-                            watch_loaded(&mut db, &mut tree, &mut files, read_from);
+                                checkouts.reload(&stale, &stream.env, db.write(), tree.vfs());
+                            watch_loaded(db.write(), &mut tree, &mut files, read_from);
                             let new = before.changed(&db);
                             eprintln!(
                                 "reload: {} crates are others in {:.1?}",
@@ -9832,7 +9847,7 @@ fn run_holding(
                             continue;
                         }
                         builds.settle(&mut db, &mut programs)?;
-                        let reading = process::turn(&mut db, stream.env.clone());
+                        let reading = process::turn(db.write(), stream.env.clone());
                         prepare_macro_sessions(&db);
                         if !reading.is_empty() {
                             for program in &mut programs {
@@ -9972,7 +9987,7 @@ fn run_holding(
                             builds.settle(&mut db, &mut programs)?;
                             let start = Instant::now();
                             let joined =
-                                join(project, &mut checkouts, &mut db, &mut tree, &mut files);
+                                join(project, &mut checkouts, db.write(), &mut tree, &mut files);
                             eprintln!("join {}: {:.1?}", project.display(), start.elapsed());
                             joined
                         }
@@ -10147,12 +10162,12 @@ fn run_holding(
                     let rust = path.extension().is_some_and(|it| it == "rs");
                     let text = std::mem::take(&mut edited.text);
                     let text = if rust { load_cargo::source_text(text) } else { text };
-                    if *text != **db.file_text(id).text(&db) {
+                    if *text != **db.file_text(id).text(&*db) {
                         sent.insert(id, (text, edited.at));
                     }
                     // Built for the process the last build was for.
-                    edited.client.env = ide_db::base_db::ProcessEnv::try_get(&db)
-                        .map(|it| it.vars(&db).clone())
+                    edited.client.env = ide_db::base_db::ProcessEnv::try_get(&*db)
+                        .map(|it| it.vars(&*db).clone())
                         .unwrap_or_default();
                     // Asked as a client of each would: one interrupted asks again.
                     let target = |at: usize| (at != 0).then(|| Target::of(&programs[at].args));
@@ -10188,8 +10203,8 @@ fn run_holding(
                 if !differences.is_empty() {
                     builds.settle(&mut db, &mut programs)?;
                     let read_from = SystemTime::now();
-                    checkouts.share(&mut db, tree.vfs(), differences)?;
-                    watch_loaded(&mut db, &mut tree, &mut files, read_from);
+                    checkouts.share(db.write(), tree.vfs(), differences)?;
+                    watch_loaded(db.write(), &mut tree, &mut files, read_from);
                     for program in &mut programs {
                         let Parts { base, members, .. } = checkouts.parts(&program.args.project)?;
                         program.moved |= program.args.members != members;
@@ -10217,7 +10232,7 @@ fn run_holding(
                 turned.extend(viewed.get(&base).map(|it| (base.clone(), it.clone())));
                 turned.extend((base != over).then(|| (base.clone(), over.clone())));
                 db.set_view(&base, &over, built_in(&db, &base));
-                moved.extend(place(&mut db, &base, &over, &mut placed));
+                moved.extend(place(db.write(), &base, &over, &mut placed));
                 tree.relist(&base);
                 if base == over {
                     viewed.remove(&base);
@@ -10270,7 +10285,7 @@ fn run_holding(
                 builds.settle(&mut db, &mut programs)?;
             }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
-            for (file, path) in tree.added(&mut db).added {
+            for (file, path) in tree.added(db.write()).added {
                 files.push(WatchedFile { file: Watched::Source(file), path, mtime: None });
             }
             let before = touched.len() + gone.len();
@@ -10297,7 +10312,7 @@ fn run_holding(
                     file.mtime = Some(now);
                     let same = match file.file {
                         Watched::Source(id) => source_on_disk(&on_disk)
-                            .is_ok_and(|text| *text == **db.file_text(id).text(&db)),
+                            .is_ok_and(|text| *text == **db.file_text(id).text(&*db)),
                         Watched::Included(ref path) => db.included_is_read(path),
                     };
                     if !same {
@@ -10311,7 +10326,7 @@ fn run_holding(
                         Watched::Source(id) if was.is_some() => {
                             !sent.contains_key(&id)
                                 && source_on_disk(&on_disk)
-                                    .is_ok_and(|text| *text == **db.file_text(id).text(&db))
+                                    .is_ok_and(|text| *text == **db.file_text(id).text(&*db))
                         }
                         _ => false,
                     };
@@ -10382,7 +10397,7 @@ fn run_holding(
                         Some((text, _)) => text,
                         None => source_on_disk(&db.on_disk(path))?,
                     };
-                    let text = test_harness::kept(&db.file_text(*id).text(&db), text);
+                    let text = test_harness::kept(&db.file_text(*id).text(&*db), text);
                     texts.push((*id, text));
                 }
                 Watched::Included(path) => included.push(path.clone()),
@@ -10414,7 +10429,7 @@ fn run_holding(
         let start = Instant::now();
         // A write stops the builds under way, so nothing is written when nothing changed.
         if changed != 0 || !background {
-            db.apply_change(change);
+            db.write().apply_change(change);
             prepare_macro_sessions(&db);
         }
         // The tests of a crate an edited file is of are listed again after the edit, and those
@@ -10437,7 +10452,7 @@ fn run_holding(
             take_first_values(&db, &mut programs, &untouched);
             home_in_rustcs(&db, &listed, &mut programs, &untouched);
             outlines.before_edit(&db, &listed, &untouched);
-            for file in write_harnesses(&mut db, texts) {
+            for file in write_harnesses(db.write(), texts) {
                 if !sources.contains(&file) {
                     sources.push(file);
                 }
@@ -10445,7 +10460,7 @@ fn run_holding(
         }
         let applied_change = start.elapsed();
         if !removed.is_empty() {
-            tree.remove(&mut db, &removed);
+            tree.remove(db.write(), &removed);
             prepare_macro_sessions(&db);
             let mut index = 0;
             files.retain(|_| {
@@ -10594,7 +10609,7 @@ fn run_holding(
                 let mut program = Box::new(std::mem::replace(program, away));
                 builds.running.insert(at, Running { clients, kept, own_base });
                 let (db, listed, paths, sender) =
-                    (db.clone(), listed.clone(), paths.clone(), sender.clone());
+                    (db.reader(), listed.clone(), paths.clone(), sender.clone());
                 let wanted = outputs.remove(&at);
                 let done = Arc::new(AtomicBool::new(false));
                 if own_base && let Some(budget) = own_base_budget() {
@@ -10688,7 +10703,7 @@ fn run_holding(
             // checkout.
             let late: Vec<_> = viewed
                 .iter()
-                .flat_map(|(base, over)| place(&mut db, base, over, &mut placed))
+                .flat_map(|(base, over)| place(db.write(), base, over, &mut placed))
                 .collect();
             if late.is_empty() {
                 break answers;
@@ -10702,13 +10717,13 @@ fn run_holding(
         };
         events::idle();
         if std::env::var_os("BLAZE_QUERIES").is_some() {
-            let ran: Vec<String> = ide_db::executions::take(&db)
+            let ran: Vec<String> = ide_db::base_db::executions::take(&db)
                 .iter()
                 .take(400)
                 .map(|(query, count)| format!("{query}={count}"))
                 .collect();
             eprintln!("ran: {}", ran.join(" "));
-            eprintln!("order: {}", ide_db::executions::order(&db).join(" > ").replace(' ', ""));
+            eprintln!("order: {}", ide_db::base_db::executions::order(&db).join(" > ").replace(' ', ""));
         }
         // Turning from one that is given up on is the last time it is paid for.
         if !turned.iter().any(|it| given_up.contains(&it.1)) {
@@ -10808,7 +10823,10 @@ fn run_holding(
             links.insert(out, linked);
         }
         let_go(&mut db, &builds, &programs);
-        memory::served(&mut db)?;
+        if let Some(db) = db.idle() {
+            // Only while no build reads it: a report needs the database alone.
+            memory::served(db)?;
+        }
     }
 }
 
@@ -12000,7 +12018,7 @@ mod user {
         let dir = std::env::temp_dir().join(format!("blaze-loaded-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let read_from = SystemTime::now();
-        let (mut db, mut vfs) = (RootDatabase::new(None), vfs::Vfs::default());
+        let (mut db, mut vfs) = (RootDatabase::new(), vfs::Vfs::default());
         let (mut change, mut root) =
             (ChangeWithProcMacros::default(), vfs::file_set::FileSet::default());
         for name in ["same.rs", "written.rs"] {

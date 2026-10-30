@@ -432,6 +432,11 @@ impl Flags {
                     flags.frame_pointers = on.unwrap_or(matches!(value, "always" | "non-leaf"));
                 }
                 "link-dead-code" => flags.links_dead_code = on != Some(false),
+                // An uninstrumented binary, or one built without its profile, is not what was
+                // asked for.
+                "profile-generate" | "profile-use" => anyhow::bail!(
+                    "the flags for rustc have `-C {option}`; blaze's code generator takes no profile yet, so blaze does not build with it"
+                ),
                 _ => {}
             }
         }
@@ -790,5 +795,14 @@ mod tests {
         assert_eq!(flags.unwrap().opt_level.as_deref(), Some("1"));
         let refused = Flags::parse("-Zthreads=8 -Z location-detail=none".split_whitespace());
         assert!(refused.unwrap_err().to_string().contains("-Z location-detail=none"));
+    }
+
+    #[test]
+    fn a_profile_to_make_or_use_is_refused_naming_the_flag() {
+        let refused = |flags: &str| Flags::parse(flags.split_whitespace()).unwrap_err().to_string();
+        assert!(refused("-Cprofile-generate=/tmp/pgo").contains("`-C profile-generate=/tmp/pgo`"));
+        assert!(refused("-C profile-generate").contains("`-C profile-generate`"));
+        let used = refused("-C opt-level=3 -Cprofile-use=/tmp/merged.profdata");
+        assert!(used.contains("`-C profile-use=/tmp/merged.profdata`"));
     }
 }

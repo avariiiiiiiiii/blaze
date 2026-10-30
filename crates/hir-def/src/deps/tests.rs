@@ -1,13 +1,23 @@
-use std::{sync::Arc, sync::Mutex};
+use std::{
+    any::TypeId,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering::SeqCst},
+    },
+};
 
-use base_db::Crate;
+use base_db::{Crate, CrateOrigin, Db, Env};
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
+use hir_expand::proc_macro::{
+    ExpansionReads, ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
+    report_reads,
+};
 use rustc_hash::FxHashMap;
 use test_fixture::WithFixture;
 
 use super::*;
-use crate::{nameres::frozen, test_db::TestDB};
+use crate::{nameres::frozen, test_db::TestDB, tt::TopSubtree};
 
 const FIXTURE: &str = r#"
 //- /main.rs crate:main deps:lib new_source_root:local
@@ -58,9 +68,13 @@ struct Memory {
 }
 
 impl ImageStore for Memory {
-    fn get(&self, key: &ContentId) -> Result<Option<Arc<Aligned>>, String> {
+    fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
         *self.gets.lock().unwrap() += 1;
-        Ok(self.images.lock().unwrap().get(key).cloned())
+        Ok(self.images.lock().unwrap().get(key).map(|it| it.clone() as ImageBuf))
+    }
+
+    fn reads_now(&self, _: &Env, shape: &[u8]) -> Result<ContentId, String> {
+        Ok(values_of(shape))
     }
 
     fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
@@ -133,7 +147,8 @@ fn keys_are_the_same_in_every_database() {
 fn a_key_covers_every_input() {
     let lib = key_of(FIXTURE, "lib", BUILD);
     let core = key_of(FIXTURE, "core", BUILD);
-    let changed = |fixture: String, name| assert_ne!(key_of(&fixture, name, BUILD), lib, "{fixture}");
+    let changed =
+        |fixture: String, name| assert_ne!(key_of(&fixture, name, BUILD), lib, "{fixture}");
     // A file of the crate that is not its root.
     changed(FIXTURE.replace("pub mod deeper", "pub mod other"), "lib");
     // A dependency's text, which the crate's content ID leaves out.
@@ -277,10 +292,11 @@ fn an_image_written_under_another_key_is_an_error() {
     let other = ContentId([3; 32]);
     let image = memory.images.lock().unwrap()[&key].clone();
     memory.images.lock().unwrap().insert(other, image.clone());
-    memory.images.lock().unwrap().insert(key, Arc::new(Aligned::copy_from(&write_image(
-        other,
-        [b"", b"", b""],
-    ))));
+    memory
+        .images
+        .lock()
+        .unwrap()
+        .insert(key, Arc::new(Aligned::copy_from(&write_image(other, [b"", b"", b""]))));
     let mut db = TestDB::with_files(FIXTURE);
     let crates = all(&db);
     let error = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap_err();
@@ -288,19 +304,284 @@ fn an_image_written_under_another_key_is_an_error() {
     assert!(error.contains("written under key"), "{error}");
 }
 
+/// An expansion whose server said nothing of what it read leaves an input out: its crate is
+/// refused, and a library of macros with no known code is not keyed at all.
 #[test]
-fn a_crate_with_an_item_from_a_proc_macro_is_refused() {
+fn a_crate_with_an_expansion_of_unknown_reads_is_refused() {
     let db = TestDB::with_files(
         "//- proc_macros: identity\n\
-         //- /lib.rs\n\
+         //- /lib.rs crate:lib new_source_root:library\n\
          pub mod inner { #[proc_macros::identity] pub fn f() {} }\n",
     );
-    let refused: Vec<Refused> =
-        all(&db).into_iter().filter_map(|krate| serve::refusal(&db, krate)).collect();
+    let lib = crate_named(&db, "lib");
+    assert!(!eligible(&db, lib), "the fixture's macros have no library");
+    let refused = Reads::of(&db, lib, &[]).unwrap_err();
     assert!(
-        matches!(refused.as_slice(), [Refused::ProcMacro { call }] if call.contains("proc_macros")),
+        matches!(&refused, Refused::ProcMacro { call, .. } if call.contains("proc_macros")),
         "{refused:?}"
     );
+}
+
+/// The value of the inputs [`Reading`]'s expansions read: it stands for a file the macro
+/// reads, which a test changes. The tests that change it or [`LIBRARY`] take [`TURN`].
+static VALUE: AtomicU8 = AtomicU8::new(0);
+/// The byte [`Reading`]'s library is made of, which a test changes as a rebuild of it would.
+static LIBRARY: AtomicU8 = AtomicU8::new(1);
+const SHAPE: &[u8] = b"the names a test expansion reads";
+
+fn values_of(shape: &[u8]) -> ContentId {
+    ContentId::of("blaze v2 deps test values", &[shape, &[VALUE.load(SeqCst)]].concat())
+}
+
+/// An attribute that gives back its item and reads [`SHAPE`], as a traced server reports it.
+#[derive(Debug)]
+struct Reading;
+
+impl ProcMacroExpander for Reading {
+    fn expand(
+        &self,
+        _: &Db,
+        subtree: &TopSubtree,
+        _: Option<&TopSubtree>,
+        _: &Env,
+        _: span::Span,
+        _: span::Span,
+        _: span::Span,
+        _: String,
+    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+        report_reads(ExpansionReads::Traced { shape: SHAPE.into(), values: values_of(SHAPE) });
+        Ok(subtree.clone())
+    }
+
+    fn code(&self) -> Option<ContentId> {
+        Some(ContentId([LIBRARY.load(SeqCst); 32]))
+    }
+
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        other.type_id() == TypeId::of::<Self>()
+    }
+}
+
+const READING: &str = r#"
+//- proc_macros: reading
+//- /lib.rs crate:lib new_source_root:library
+#[proc_macros::reading]
+pub struct Shown;
+#[proc_macros::reading]
+pub fn f() -> Shown { Shown }
+pub mod inner { #[proc_macros::reading] pub trait T {} }
+"#;
+
+/// A database of [`READING`], its library of macros a dependency as a registry's would be.
+fn reading_db() -> TestDB {
+    let source = "#[proc_macro_attribute]\n\
+                  pub fn reading(_attr: TokenStream, item: TokenStream) -> TokenStream { item }\n";
+    let reading = ProcMacro {
+        name: intern::Symbol::intern("reading"),
+        kind: ProcMacroKind::Attr,
+        expander: Arc::new(Reading),
+        disabled: false,
+    };
+    let mut db = TestDB::with_files_extra_proc_macros(READING, vec![(source.into(), reading)]);
+    let macros = crate_named(&db, "proc_macros");
+    let mut data = macros.data(&db).clone();
+    data.origin = CrateOrigin::Library { repo: None, name: intern::Symbol::intern("proc_macros") };
+    macros.set_data(&mut db, data);
+    db
+}
+
+/// Stores the images of a fresh [`reading_db`] in `memory`: the names of the crates written.
+fn store_reading(memory: &Memory) -> Vec<String> {
+    let mut db = reading_db();
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, memory, Mode::Serve).unwrap();
+    names(&db, &store(&db, &served, memory).unwrap().written)
+}
+
+/// A crate with items from proc-macro expansions that read files is imaged, filed by what
+/// they read, and resolves from its image as a fresh one does: its def map, its diagnostics
+/// and every signature, byte for byte in their portable encodings.
+#[test]
+fn a_crate_with_traced_expansions_resolves_from_its_image_as_a_fresh_one() {
+    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    VALUE.store(0, SeqCst);
+    let memory = Memory::default();
+    let written = store_reading(&memory);
+    assert!(written.contains(&"lib".to_owned()), "{written:?}");
+    let fresh = reading_db();
+    let live = crate_named(&fresh, "lib");
+    let reads = Reads::of(&fresh, live, &[]).unwrap();
+    assert_eq!(reads, Reads::for_tests(&[], &[(SHAPE, values_of(SHAPE))]));
+    for mode in [Mode::Serve, Mode::Verify, Mode::Check] {
+        let mut db = reading_db();
+        let crates = all(&db);
+        let served = serve(&mut db, &crates, BUILD, &memory, mode).unwrap();
+        let lib = crate_named(&db, "lib");
+        assert!(served.hits.contains(&lib), "{mode:?}");
+        let raw: &Db = &db;
+        let filed = DepImages::try_get(raw).unwrap().images(raw)[&lib].key();
+        assert_ne!(filed, served.keys[&lib], "an image with reads is filed by them, not the key");
+        let def_map = crate::nameres::crate_def_map(&db, lib);
+        let fresh_map = crate::nameres::crate_def_map(&fresh, live);
+        assert_eq!(def_map.diagnostics.len(), fresh_map.diagnostics.len(), "{mode:?}");
+        assert_eq!(frozen::encode(&db, lib), frozen::encode(&fresh, live), "{mode:?}");
+        assert_eq!(
+            signatures::encode(&db, lib, &mut Vec::new()),
+            signatures::encode(&fresh, live, &mut Vec::new()),
+            "{mode:?}"
+        );
+        assert_eq!(frozen::differences(), Vec::<String>::new(), "{mode:?}");
+    }
+}
+
+/// Once a value an expansion read is another, the image is not found and the crate is stale;
+/// imaged again, it is filed in the same slot under the new value and found.
+#[test]
+fn a_changed_read_misses_the_image_and_the_next_one_is_found() {
+    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    VALUE.store(0, SeqCst);
+    let memory = Memory::default();
+    store_reading(&memory);
+    VALUE.store(1, SeqCst);
+    let mut db = reading_db();
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    let lib = crate_named(&db, "lib");
+    assert!(!served.hits.contains(&lib));
+    assert!(served.stale.contains(&lib));
+    let stored = store(&db, &served, &memory).unwrap();
+    assert!(stored.written.contains(&lib), "{stored:?}");
+    let key = served.keys[&lib];
+    let images = memory.images.lock().unwrap();
+    assert!(images.contains_key(&reads::slot(key, 0)));
+    assert!(!images.contains_key(&reads::slot(key, 1)), "the same names share a slot");
+    drop(images);
+    let mut db = reading_db();
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    assert!(served.hits.contains(&crate_named(&db, "lib")));
+    VALUE.store(0, SeqCst);
+}
+
+/// A rebuilt library of macros is another library: its dependents' keys change with it.
+#[test]
+fn a_key_covers_the_library_of_its_macros() {
+    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let key = || {
+        let db = reading_db();
+        let lib = crate_named(&db, "lib");
+        keys(&db, &[lib], BUILD)[&lib]
+    };
+    let before = key();
+    LIBRARY.store(2, SeqCst);
+    let after = key();
+    LIBRARY.store(1, SeqCst);
+    assert_ne!(before, after);
+    assert_eq!(before, key());
+}
+
+/// The process variables a crate's `env!`s read are its reads, and their values file it.
+#[test]
+fn process_variables_read_file_the_image_by_their_values() {
+    let mut db = TestDB::with_files(FIXTURE);
+    let reads = Reads::for_tests(&["BLAZE_DEPS_TEST"], &[]);
+    let unset = reads.values_then(&db);
+    base_db::set_process_env(&mut db, Env::from_iter([("BLAZE_DEPS_TEST".into(), "1".into())]));
+    let one = reads.values_then(&db);
+    base_db::set_process_env(&mut db, Env::from_iter([("BLAZE_DEPS_TEST".into(), "2".into())]));
+    let two = reads.values_then(&db);
+    assert!(unset != one && one != two && unset != two);
+    let record = reads.encode();
+    let key = ContentId([4; 32]);
+    assert_ne!(reads::image_key(key, &record, one), reads::image_key(key, &record, two));
+    let lib = crate_named(&db, "lib");
+    assert_eq!(reads.values_now(&db, lib, &Memory::default()).unwrap(), two);
+}
+
+#[test]
+fn reads_read_back_and_damaged_ones_do_not_panic() {
+    let reads = Reads::for_tests(
+        &["A", "B"],
+        &[(b"one", ContentId([1; 32])), (b"two", ContentId([2; 32]))],
+    );
+    let bytes = reads.encode();
+    let back = Reads::decode(&bytes).unwrap();
+    assert_eq!(back.encode(), bytes);
+    assert!(!back.is_empty() && Reads::default().is_empty());
+    for at in 0..bytes.len() {
+        let mut damaged = bytes.clone();
+        damaged[at] ^= 0xff;
+        if let Ok(read) = Reads::decode(&damaged) {
+            assert_eq!(read.encode(), damaged, "what decodes encodes back to its bytes");
+        }
+        assert!(Reads::decode(&bytes[..at]).is_err(), "{at} bytes of {}", bytes.len());
+    }
+}
+
+/// Two checkouts of the same crates at different paths, with different `OUT_DIR`s and other
+/// paths in their variables, have the same keys; any other input gives other keys.
+#[test]
+fn keys_hold_no_path_of_the_checkout() {
+    let checkout = |dir: &str, out: &str, text: &str| {
+        let cargo =
+            if dir.contains("alice") { "/home/alice/.cargo/bin/cargo" } else { "/usr/bin/cargo" };
+        format!(
+            "//- {dir}/src/lib.rs crate:lib deps:core new_source_root:library \
+             env:CARGO_MANIFEST_DIR={dir},OUT_DIR={out},CARGO={cargo}\n\
+             {text}\n\
+             pub mod deep;\n\
+             //- {dir}/src/deep.rs\n\
+             pub fn f() {{}}\n\
+             //- /sysroot/core/lib.rs crate:core new_source_root:library\n\
+             pub struct Core;\n"
+        )
+    };
+    let alice = checkout("/home/alice/work", "/home/alice/work/target/out", "pub struct A;");
+    let bob = checkout("/srv/build/bob/deps/x", "/tmp/target-77/out", "pub struct A;");
+    assert_eq!(key_of(&alice, "lib", BUILD), key_of(&bob, "lib", BUILD));
+    assert_eq!(key_of(&alice, "core", BUILD), key_of(&bob, "core", BUILD));
+    let other = checkout("/home/alice/work", "/home/alice/work/target/out", "pub struct B;");
+    assert_ne!(key_of(&alice, "lib", BUILD), key_of(&other, "lib", BUILD));
+    let moved = alice.replace("//- /home/alice/work/src/deep.rs", "//- /home/alice/work/deep.rs");
+    assert_ne!(key_of(&alice, "lib", BUILD), key_of(&moved, "lib", BUILD));
+    let unset = alice.replace(",CARGO=", ",NOT_CARGO=");
+    assert_ne!(key_of(&alice, "lib", BUILD), key_of(&unset, "lib", BUILD));
+}
+
+/// A part that holds a path its key writes as a marker refuses the image.
+#[test]
+fn an_image_holding_a_path_of_the_checkout_is_refused() {
+    let base = key::base_for_tests("/home/alice/work", Some("/home/alice/target/out"));
+    let clean = [b"def map".to_vec(), b"lang".to_vec(), b"signatures".to_vec()];
+    assert_eq!(base.held_by(&clean), None);
+    let mut held = clean.clone();
+    held[2] = b"..\x01/home/alice/work/src/gen.rs..".to_vec();
+    assert_eq!(
+        base.held_by(&held),
+        Some(Refused::MachinePath { part: Part::Signatures, path: "/home/alice/work".to_owned() })
+    );
+    assert_eq!(base.portable("/home/alice/work/src/a.rs"), b"\0PKG/src/a.rs");
+    assert_eq!(base.portable("/home/alice/target/out/x.rs"), b"\0OUT_DIR/x.rs");
+    assert_eq!(base.portable("/elsewhere"), b"/elsewhere");
+}
+
+/// The global cache is asked only for what the local store lacks, and what it gives is kept
+/// locally, so the next session asks the global cache nothing.
+#[test]
+fn the_global_cache_is_read_through_the_local_store() {
+    let (global, _) = stored(FIXTURE);
+    let local = Memory::default();
+    *global.gets.lock().unwrap() = 0;
+    let through = ReadThrough { local: &local, global: &global };
+    let mut db = TestDB::with_files(FIXTURE);
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &through, Mode::Serve).unwrap();
+    assert_eq!(names(&db, &served.hits), ["core", "lib"]);
+    assert_eq!(*global.gets.lock().unwrap(), 2);
+    assert_eq!(contents(&local), contents(&global));
+    let mut db = TestDB::with_files(FIXTURE);
+    let served = serve(&mut db, &crates, BUILD, &through, Mode::Serve).unwrap();
+    assert_eq!(names(&db, &served.hits), ["core", "lib"]);
+    assert_eq!(*global.gets.lock().unwrap(), 2, "the second session reads the local store alone");
 }
 
 #[test]
@@ -327,8 +608,12 @@ fn serving_asks_the_store_once_a_crate() {
 struct Threads(Memory);
 
 impl ImageStore for Threads {
-    fn get(&self, key: &ContentId) -> Result<Option<Arc<Aligned>>, String> {
+    fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
         self.0.get(key)
+    }
+
+    fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {
+        self.0.reads_now(env, shape)
     }
 
     fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {

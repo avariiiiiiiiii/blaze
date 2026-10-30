@@ -316,7 +316,7 @@ pub(crate) fn path_to_const<'a, 'db>(
     resolver: &Resolver<'db>,
     generics: &dyn Fn() -> &'a Generics<'db>,
     forbid_params_after: Option<u32>,
-    path: &Path,
+    path: Path<'_>,
 ) -> Result<Const<'db>, CreateConstError<'db>> {
     let interner = DbInterner::new_no_crate(db);
     let resolution = resolver

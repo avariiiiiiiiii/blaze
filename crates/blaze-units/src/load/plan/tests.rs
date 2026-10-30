@@ -6,7 +6,7 @@ use blaze_manifest::manifest::{Context, EitherManifest, Manifest, read_manifest}
 use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
 use blaze_resolve::{InternedString, PackageId, SourceId};
 use cargo_util_schemas::manifest::TomlManifest;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::hash::{self, CrateType, StableHasher, TargetKind};
 use super::outputs::{self, CompileFiles, Layout};
@@ -561,6 +561,7 @@ fn app_units(target: Option<&str>) -> Vec<Unit> {
 const APP: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n\
                    [features]\ndefault = [\"foo-bar\"]\nfoo-bar = []\n\n\
                    [dependencies]\nserde = \"1\"\npm = { path = \"pm\" }\n\n\
+                   [[test]]\nname = \"it\"\nharness = false\n\n\
                    [lints.rust]\nunsafe_code = \"forbid\"\nunexpected_cfgs = { level = \"warn\", check-cfg = ['cfg(has_foo)'] }\n";
 const PM: &str = "[package]\nname = \"pm\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n";
 const SERDE: &str = "[package]\nname = \"serde\"\nversion = \"1.0.219\"\nedition = \"2018\"\n\n[features]\ndefault = [\"std\"]\nstd = []\n";
@@ -578,7 +579,13 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
     let serde_path = dir.write("registry/serde-1.0.219/Cargo.toml", SERDE);
     dir.write("registry/serde-1.0.219/src/lib.rs", "");
 
-    let config = || config(&ws, &[], &["env.FROM_CONFIG='1'"]);
+    let config = || {
+        config(
+            &ws,
+            &[("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER", "valgrind -q")],
+            &["env.FROM_CONFIG='1'", "target.aarch64-unknown-linux-gnu.runner=['qemu-aarch64', '-L', '/sysroot']"],
+        )
+    };
     let crates_io = blaze_manifest::source::SourceId::for_registry(&"https://github.com/rust-lang/crates.io-index".parse().unwrap());
     let app = manifest(&app_path, blaze_manifest::source::SourceId::for_manifest_path(&app_path).unwrap(), config());
     let pm = manifest(&pm_path, blaze_manifest::source::SourceId::for_manifest_path(&pm_path).unwrap(), config());
@@ -610,6 +617,7 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
     let config = config();
     let base_profile = BaseProfile { root: ProfileRoot::Debug, ..BaseProfile::default() };
     let target_dir = ws.join("target");
+    let unsandboxed: FxHashSet<&str> = ["app"].into_iter().collect();
     let input = PlanInput {
         units: &units,
         std_plans: &std_plans,
@@ -630,6 +638,7 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
         profile_dir: "debug",
         base_profile: &base_profile,
         jobs: Some(4),
+        unsandboxed: &unsandboxed,
     };
     let planned = plan(&input).unwrap();
     (ws, planned.plans, planned.finished)
@@ -734,6 +743,17 @@ fn plans_of_a_workspace() {
     );
     assert_eq!(get(&test.env, "CARGO_BIN_EXE_app"), Some(format!("{t}/debug/app").as_str()));
     assert_eq!(get(&test.env, "CARGO_TARGET_TMPDIR"), Some(format!("{t}/tmp").as_str()));
+
+    // `CARGO_TARGET_<TRIPLE>_RUNNER` of the host runs what is run: the binary and the test, not
+    // a library or a build script.
+    let unsandboxed: Vec<bool> = plans.iter().map(|it| it.unsandboxed).collect();
+    assert_eq!(unsandboxed, [false, false, true, true, true, true, true]);
+    let runners: Vec<&[String]> = plans.iter().map(|it| it.runner.as_slice()).collect();
+    let valgrind = strings(&["valgrind", "-q"]);
+    let (none, valgrind): (&[String], &[String]) = (&[], valgrind.as_slice());
+    assert_eq!(runners, [none, none, none, none, none, valgrind, valgrind]);
+    let harness: Vec<bool> = plans.iter().map(|it| it.harness).collect();
+    assert_eq!(harness, [true, true, true, true, true, true, false]);
 }
 
 #[test]
@@ -755,6 +775,12 @@ fn plans_for_a_target() {
     assert_eq!(plans[5].outputs[1], format!("{t}/{TARGET}/debug/app"));
     assert_eq!(get(&plans[6].env, "CARGO_TARGET_TMPDIR"), Some(format!("{t}/{TARGET}/tmp").as_str()));
     assert_eq!(get(&plans[6].env, "CARGO_BIN_EXE_app"), Some(format!("{t}/{TARGET}/debug/app").as_str()));
+    // The target's runner is the config's `target.<triple>.runner`; the host's goes to no
+    // target unit.
+    let qemu = strings(&["qemu-aarch64", "-L", "/sysroot"]);
+    assert_eq!(plans[5].runner, qemu);
+    assert_eq!(plans[6].runner, qemu);
+    assert!(plans[..5].iter().all(|it| it.runner.is_empty()));
 }
 
 // What can't be planned as cargo plans it is an error naming it, never a guess.

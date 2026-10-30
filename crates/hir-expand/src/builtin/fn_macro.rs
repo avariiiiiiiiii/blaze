@@ -11,6 +11,7 @@ use intern::{Symbol, sym};
 use itertools::Itertools;
 use mbe::{DelimiterKind, expect_fragment};
 use span::{Edition, FileId, Span};
+use stdx::edit_distance::edit_distance;
 use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 use syntax_bridge::syntax_node_to_token_tree;
 
@@ -1393,59 +1394,6 @@ fn similar_cargo_var(var: &str) -> Option<&'static str> {
         }
     }
     best
-}
-
-/// rustc's `edit_distance` (`rustc_span/src/edit_distance.rs`): the restricted
-/// Damerau-Levenshtein distance between `a` and `b` in code points, if at most `limit`.
-fn edit_distance(a: &str, b: &str, limit: usize) -> Option<usize> {
-    // alloc: an error's suggestion, on the error path
-    let a: Vec<char> = a.chars().collect();
-    // alloc: as above
-    let b: Vec<char> = b.chars().collect();
-    let (mut a, mut b) = if a.len() < b.len() { (&b[..], &a[..]) } else { (&a[..], &b[..]) };
-    let min_dist = a.len() - b.len();
-    if min_dist > limit {
-        return None;
-    }
-    while let (Some((a_first, a_rest)), Some((b_first, b_rest))) = (a.split_first(), b.split_first())
-        && a_first == b_first
-    {
-        a = a_rest;
-        b = b_rest;
-    }
-    while let (Some((a_last, a_rest)), Some((b_last, b_rest))) = (a.split_last(), b.split_last())
-        && a_last == b_last
-    {
-        a = a_rest;
-        b = b_rest;
-    }
-    if b.is_empty() {
-        return Some(min_dist);
-    }
-    // alloc: as above
-    let mut prev_prev = vec![usize::MAX; b.len() + 1];
-    // alloc: as above
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    // alloc: as above
-    let mut current = vec![0; b.len() + 1];
-    for i in 1..=a.len() {
-        current[0] = i;
-        let a_idx = i - 1;
-        for j in 1..=b.len() {
-            let b_idx = j - 1;
-            let substitution_cost = usize::from(a[a_idx] != b[b_idx]);
-            current[j] = std::cmp::min(
-                prev[j] + 1,
-                std::cmp::min(current[j - 1] + 1, prev[j - 1] + substitution_cost),
-            );
-            if i > 1 && j > 1 && a[a_idx] == b[b_idx - 1] && a[a_idx - 1] == b[b_idx] {
-                current[j] = std::cmp::min(current[j], prev_prev[j - 2] + 1);
-            }
-        }
-        [prev_prev, prev, current] = [prev, current, prev_prev];
-    }
-    let distance = prev[b.len()];
-    (distance <= limit).then_some(distance)
 }
 
 fn option_env_expand(

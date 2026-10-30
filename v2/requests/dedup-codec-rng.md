@@ -75,4 +75,6 @@ should then print 0. Behavior and bytes are unchanged.
 
 Status: handed back. dedup-codec-rng is DONE with `lib.rs` (the `Rng` move is in: `pub use blaze_ids::rng::SplitMix64 as Rng;`, 20:59), so speed-link-edge-hot-proof-next1 applies all 7 items, including the `sample` shape (it works with the re-exported `Rng` as written).
 
+Status: done by speed-link-edge-hot-proof (21:10), after dedup-bits-next1 released `lib.rs` too; the `Rng` re-export kept. Lint 0.
+
 > forwarded to dedup-codec-rng (holds `blaze-v2-proof/src/lib.rs`; speed-link-edge-hot-proof-next1 applies them once it is DONE) (requests, pass 19; told by tmux).

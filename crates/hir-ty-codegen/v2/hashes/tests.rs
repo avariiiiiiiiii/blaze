@@ -12,7 +12,7 @@ use hir_ty_mir::mir::MirSpan;
 use test_fixture::WithFixture;
 
 use super::ItemHashes;
-use crate::v2::{Body, Hashes};
+use crate::v2::{Body, HashSource, Hashes, by_id::ById};
 use db::TestDB;
 
 fn hashes() -> ItemHashes {
@@ -78,6 +78,22 @@ fn two_runs_of_one_source_give_one_key() {
         assert_eq!(ty(&a, name), ty(&b, name), "the type `{name}`");
     }
     assert_eq!(ty(&a, "Bytes"), ty(&a, "Bytes"), "one run asked twice");
+}
+
+#[test]
+fn a_hash_source_says_what_the_hashes_it_holds_say() {
+    let (db, _) = fixture("sized", CALLS);
+    let (items, by_id) = (HashSource::Items(hashes()), HashSource::ById(ById));
+    for name in ["callee", "caller"] {
+        let func = function(&db, name);
+        let (item, body) = (ItemId::Function(func), Body::Item(func.into()));
+        assert_eq!(items.item(&db, item), hashes().item(&db, item));
+        assert_eq!(items.code(&db, body), hashes().code(&db, body));
+        assert_eq!(items.declaration(&db, func), hashes().declaration(&db, func));
+        assert_eq!(by_id.item(&db, item), ById.item(&db, item));
+        assert_eq!(by_id.code(&db, body), ById.code(&db, body));
+        assert_eq!(by_id.declaration(&db, func), ById.declaration(&db, func));
+    }
 }
 
 #[test]

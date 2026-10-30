@@ -37,6 +37,14 @@ None of these crates was free, so each change is written out, code and budget te
   blocks; a warm body walk allocates only its ids. `map.rs` and `lines.rs` already build exact
   results, and their remaining sorts are lazy or of macro fragments only.
 - **`const-ast`** allocates nothing outside its tests: nothing to move.
+- **`hir-def`, applied here** (the paths were free once speed-hir-store was DONE):
+  - `ExpressionStore::has_closures`, a request from speed-hir.
+  - The `hir.rs` and `expr_store/path.rs` size asserts fixed for a 4-byte `Name`
+    (`intern::Symbol` is a `NonZeroU32`): `Label` 4, `RecordLitField` and `RecordFieldPat` 8,
+    `Binding` 12, `Name` 4.
+- **`intern`'s `Bump` stays.** It is not an `ArenaLocal`: under `blaze_check`, `blaze_mem::Arena`
+  reaches the chunk cache, whose links are model atomics in process-wide statics. Answered in
+  `v2/requests/mem.md`.
 
 Memo values (`AstIdMap`, `SpanMap`, `ItemTree`, expression stores) stay global-allocator blocks
 per lane mem's answer, until memos live in the image.
@@ -108,8 +116,9 @@ in `v2/requests/mem-format-tree.md`; the item tree is `## tree items (mem-format
 ## hir (mem-format-hir)
 
 hir-def's expression store and HIR (`expr_store.rs`, `expr_store/`, `hir.rs`, `hir/`). The
-paths are speed-hir-store's, which is not done, so every change is an exact request in
-`v2/requests/mem-format-hir.md`. This section is the design those requests implement.
+changes were written as exact requests in `v2/requests/mem-format-hir.md` while
+speed-hir-store held the paths, and applied once it was done (see the end of this section).
+This section is the design those requests implement.
 
 ### Lifetimes, and the allocator for each
 
@@ -119,7 +128,8 @@ paths are speed-hir-store's, which is not done, so every change is an exact requ
 | `finish`'s sort buffers and gathered side columns | one `finish` | the same pool (`FreezeScratch::sort`, `Packing`) |
 | a finished store's `Copy` columns | the memo value | one slab for the HIR columns, now with the match arms, record fields, field patterns and names; one for the type columns; one for the five side columns (`hir/col.rs` `Col`) |
 | the store's arenas (bindings, labels, lifetimes) and its cold tables (paths, literals, asm, offset_of, generic args) | the memo value | one exact allocation each, none when empty |
-| encode's words, names and gathered columns | one encode | per-thread spares (`Words`, `EncodeScratch`) |
+| encode's gathered columns | one encode | the per-thread `EncodeScratch` (`expr_store/persist.rs`) |
+| encode's words and names | one encode | per-thread spares of `Words` (`hir/persist.rs`, held: see below) |
 
 A store, a body and a source map are memo values. Lane mem's ruling (`v2/requests/mem.md`) is
 that a memo value has no revision-arena lifetime: salsa drops each one on its own when it is
@@ -144,8 +154,11 @@ packed into one block. Nothing here uses a revision arena or a task frame:
   box, the column slab, the side slab, three arenas, the type slab and the type hygiene.
 - Reading a store, a memo hit and a scope lookup: 0 (`expr_store/tests/alloc.rs`,
   speed-hir-store's).
-- Warm encode: 0 into an output with room (`a_warm_encode_allocates_nothing`), and names cost
-  0 on warm `Words` (`names_are_one_index_per_text_on_warm_words`).
+- Warm encode: the same bytes as a cold one, no kept buffer grown, and fewer allocations than
+  cold (`a_warm_encode_reuses_its_scratch`). What is left is `Words`, which starts empty on
+  each encode until its per-thread spares land. Then a warm encode is 0 into an output with
+  room, and names are 0 on warm `Words` (`names_are_one_index_per_text_on_warm_words`, in the
+  held request).
 
 ### Speed of light
 
@@ -164,6 +177,22 @@ What is left, and why:
 - Decode still copies once per column. Making it borrow the mapped bytes is speed-hir-store's
   queued "borrowed decode columns" (it needs frontend-deps-sigs' `Arc` owner of the image).
 - The source maps' encode is next, once srcmap's schema 4 is settled.
+
+### applied (mem-format-hir-apply)
+
+Five of the six requests are in the tree (2026-10-29):
+- the builder's tables on the pooled scratch, the side columns in one slab, and exact arenas
+  (`expr_store.rs`);
+- `finish`'s stable sorts in `FreezeScratch::sort` (`expr_store/source_map.rs`);
+- the arms, record fields, field patterns and names in the HIR slab (`hir.rs`,
+  `hir/columns.rs`);
+- the three lowering budget tests;
+- the store's and body's encode on `EncodeScratch` (`expr_store/persist.rs`).
+
+`Words` on per-thread spares (`hir/persist.rs`) is held, because frontend-deps-sigs owns that
+file and is running. The budget tests need hir-def's `blaze-alloc-count` dev-dependency, which
+is still a request to lane db. The adaptations are noted under each section of
+`v2/requests/mem-format-hir.md`.
 
 ## tree items (mem-format-tree-items)
 

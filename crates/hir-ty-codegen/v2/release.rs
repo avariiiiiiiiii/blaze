@@ -283,6 +283,7 @@ fn emitted(
     requests: &Requests,
     refs: &Refs,
 ) -> Result<Emitted, CodegenError> {
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     let isa: &dyn cranelift_codegen::isa::TargetIsa = &**crate::target().map_err(|e| failed(unit, e))?;
     let (converted, extra) = super::places::resolve_owning(places, refs, |resolve| {
         let side = super::side::of(variables, scopes, &code, resolve.frame())?;

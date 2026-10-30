@@ -76,6 +76,8 @@ part in parallel (`.symtab`/`.strtab` by prefix sums).
    (`dynamic::first_error`'s rule). `defined` and `undefined` stay serial after it (they are the
    exports and imports, a few hundred), appending as now. Same bytes.
 
+> applied by requests (child requests-link-next): checked, as requested (`locals_into` fills the locals in parallel, first error in order); unchanged but for `symbols` now taking the section ranges and recording `locals_of` for 19.5's patch.
+
 ### A2. `macho.rs`: `Writer::encode` for chained fixups (`model.rs` has it now; `file.rs` lays the slots)
 
 The core side of `v2/requests/link.md` item 6 is in: `Writer::encode` returns (address, value)
@@ -110,12 +112,16 @@ change). The edit, as ld64 writes `DYLD_CHAINED_PTR_64_OFFSET` (format 6):
   back with `object`'s chained-fixup reader, every slot decoded to the address or import the
   opcode form gives at 11.0; and a relink that adds one bind rewrites two slots.
 
+> applied by requests (child requests-link-next): `macho/chained.rs` + `MachO::encode`: `DYLD_CHAINED_PTR_64_OFFSET` slots, the `LC_DYLD_CHAINED_FIXUPS` table (IMPORT, or IMPORT_ADDEND past a signed byte) and `LC_DYLD_EXPORTS_TRIE` in place of `LC_DYLD_INFO_ONLY`; the signature hashes the slots. Differs: chosen per platform as ld-prime does (macOS 12, iOS/tvOS/Catalyst 15, watchOS 8, DriverKit 21, visionOS) rather than one `minimum >= 0x000c_0000`; GOT `Holds::Local` cells are already in `placed.rebase`, so not added again; the workspace's `object` 0.37 has no chained-fixup reader, so `chained_fixups_slide_and_bind_what_the_opcodes_do` decodes the chains by hand against the opcodes at 11.0; `a_bind_added_rewrites_two_slots`. Default target 11.0: no default bytes change. Not built.
+
 ### A3. `macho.rs` `image`: the signature as one part (after `link.md` item 19.1)
 
 `parts.push((at, piece.to_vec()))` per 4 KiB of signature (one `Vec` per page, 25,000 for a
 100 MB image) exists so a relink rewrites only the changed hashes. Once `file.rs` diffs parts by
 block (`v2/requests/link.md` item 19.1), push the signature once:
 `parts.push((code_limit, signature))`, with the same writes on a relink and no allocation per page.
+
+> applied by requests (child requests-link-next): checked, as requested: the signature is one part at `code_limit`.
 
 ### A4. `macho/sign.rs` `hash_cached`: hash what the core wrote, not what compares unequal (after `link.md` item 19.5)
 
@@ -134,6 +140,7 @@ store is sized on the first sign and reused, never grown on a re-sign of the sam
 
 > requests-link-fuzz-macho-input (2026-10-29 20:23): DONE; `macho/sign.rs` is
 > speed-link-edge-sol-link's for A4 once `Placed::delta` (`link.md` 19.5) exists. It doesn't yet.
+> applied by requests (child requests-link-next): `sign::Cache` keeps every hash and only the headers' and `__LINKEDIT`'s pages; a page is rehashed when it overlaps `Since::written` (the delta's `written` in file offsets, plus the pages of chained slots that changed and of debug sections that aren't the same buffers) or is kept and differs, only for `Since::from` equal to the cache's synthesis. `signing_allocates_nothing_per_page` keeps its budget with a delta; `the_signing_cache_writes_the_same_file` relinks with deltas at macOS 11 and 12 against an uncached writer. Not built.
 
 ### A5. `macho.rs` `image`: the debug info not copied (after `link.md` item 19.2)
 
@@ -162,6 +169,7 @@ signature's `View` takes `(offset, &placed.debug[nth].1[..])` in place of `&dwar
 > tests assemble parts generically), and a relink writes the same 4 KiB blocks, cut from the
 > part's start as the pieces were. hot_lint: `macho.rs` at 0 outside `core_name`. A4 and A5
 > wait on core-model-next1's `Placed::delta` and `File::debug`.
+> applied by requests (child requests-link-next): `image` pushes `(offset, nth)` per non-empty debug section to `File::debug` (same offsets) and the signature's `View` borrows `placed.debug`; no `dwarf` buffer. Test `macho/tests.rs` `the_debug_sections_are_the_cores_not_copies`. Not built.
 
 ### A6. `macho/tbd.rs`: the documents in parallel
 

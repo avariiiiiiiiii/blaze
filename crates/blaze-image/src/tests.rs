@@ -362,9 +362,9 @@ fn a_whole_section_is_a_checked_range_of_the_shared_bytes() {
     use blaze_core::Mapping;
     let contents = contents();
     let file = build(12, &contents);
-    let mapping = Mapping(Arc::new(file.clone()));
+    let mapping = Mapping::copy(&file);
     let image = Arc::new(Image::open(mapping.clone()).unwrap());
-    assert!(Arc::ptr_eq(&image.owner().0, &mapping.0));
+    assert!(image.owner().same(&mapping));
     for (id, bytes) in &contents {
         let section = image.section(*id, schema_a()).unwrap();
         let range = image.whole_range(&section).unwrap();
@@ -377,7 +377,7 @@ fn a_whole_section_is_a_checked_range_of_the_shared_bytes() {
     let mut corrupt = file;
     let section = open(corrupt.clone()).section(A, schema_a()).unwrap();
     corrupt[section.at as usize + 2 * 4096 + 5] ^= 1;
-    let image = Image::open(Mapping(Arc::new(corrupt))).unwrap();
+    let image = Image::open(Mapping::copy(&corrupt)).unwrap();
     let failed = image.whole_range(&image.section(A, schema_a()).unwrap()).unwrap_err();
     assert_eq!((failed.section, failed.group), (A, 2));
 }

@@ -6,7 +6,8 @@ use base_db::{Crate, Db};
 use hir_def::{
     AdtId, AttrDefId, HasModule,
     diagnostic_item::diagnostic_items,
-    hir::{ExprId, ExprOrPatIdPacked},
+    hir::{Expr, ExprId, ExprOrPatIdPacked},
+    signatures::FunctionSignature,
 };
 use hir_expand::name::Name;
 use intern::{Symbol, sym};
@@ -67,18 +68,25 @@ fn is_stdlib_stable_crate(db: &Db, krate: Crate) -> bool {
 }
 
 impl<'db> InferenceContext<'db> {
-    /// rustc's `lint_edition_dependent_dot_call`: the method `name`, called as `call_expr` on
-    /// `receiver` of type `self_ty`, picked as `pick`.
+    /// rustc's `lint_edition_dependent_dot_call`: the method call `call_expr` on `receiver` of
+    /// type `self_ty`, picked as `pick`.
     pub(crate) fn lint_edition_dependent_dot_call(
         &mut self,
         self_ty: Ty<'db>,
-        name: &Name,
         call_expr: ExprId,
         receiver: ExprId,
         pick: &Pick<'db>,
     ) {
+        // A field access with no field is looked up as a method too, which rustc does not lint.
+        if !matches!(self.store.expr(call_expr), Expr::MethodCall { .. }) {
+            return;
+        }
+        let CandidateId::FunctionId(method) = pick.item else {
+            unreachable!("a method call picks a function")
+        };
         let edition = self.edition;
-        let name = name.symbol();
+        let signature = FunctionSignature::of(self.db, method);
+        let name = signature.name.symbol();
         let lint = if *name == sym::try_into && !edition.at_least_2021() {
             EditionLint::Rust2021PreludeCollisions
         } else if *name == sym::poll && !edition.at_least_2024() && self.is_pin_of_mut_ref(self_ty)
@@ -98,9 +106,6 @@ impl<'db> InferenceContext<'db> {
             return;
         };
 
-        let CandidateId::FunctionId(method) = pick.item else {
-            unreachable!("a method call picks a function")
-        };
         if is_stdlib_stable_crate(self.db, method.krate(self.db)) {
             return;
         }

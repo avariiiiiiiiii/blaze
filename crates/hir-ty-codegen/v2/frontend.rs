@@ -25,7 +25,7 @@ use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
 use salsa::plumbing::FromId;
 use smallvec::{SmallVec, smallvec};
 
-use super::{Body, BuildTime, Hashes, HirInstance, HirStatic, Kind, build::Build, refs, undescribed};
+use super::{Body, BuildTime, HashSource, Hashes, HirInstance, HirStatic, Kind, build::Build, refs, undescribed};
 use crate::{
     Instance, InstanceDef, exported_static, exported_symbol, fncache, home::Homes,
     linked_symbol,
@@ -50,7 +50,7 @@ impl<'db> Databases<'db> {
 /// The front end of a v2 build.
 pub struct HirFrontend<'db> {
     pub(crate) databases: Databases<'db>,
-    pub(crate) hashes: Box<dyn Hashes>,
+    pub(crate) hashes: HashSource,
     pub(crate) build_time: BuildTime,
     /// Which origins' units MIR-inline: what a function's references are walked for.
     inlining: Option<Inlining>,
@@ -117,7 +117,7 @@ impl Inlining {
 }
 
 impl<'db> HirFrontend<'db> {
-    pub fn new(databases: Databases<'db>, hashes: Box<dyn Hashes>, build_time: BuildTime) -> Self {
+    pub fn new(databases: Databases<'db>, hashes: HashSource, build_time: BuildTime) -> Self {
         HirFrontend { databases, hashes, build_time, inlining: None }
     }
 
@@ -201,7 +201,7 @@ impl<'db> HirFrontend<'db> {
         instance: &HirInstance,
         requester: &Origin,
     ) -> Result<Described<HirInstance, HirStatic>, CodegenError> {
-        let hashes = &*self.hashes;
+        let hashes = &self.hashes;
         let item = match &instance.0 {
             Kind::Asm(text) => Ok(ItemKey(ContentId::of(ASM_ITEM_DOMAIN, text.as_bytes()))),
             Kind::Allocator(forward) => Ok(super::allocator::item(forward)),
@@ -261,7 +261,7 @@ impl<'db> HirFrontend<'db> {
         homes: &mut Homes,
         value: &HirStatic,
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
-        let hashes = &*self.hashes;
+        let hashes = &self.hashes;
         let item = hashes
             .item(db, ItemId::Static(value.0))
             .map_err(|what| undescribed(value, None, what))?;
@@ -308,7 +308,7 @@ impl Frontend for HirFrontend<'_> {
 /// are: what was inlined into a callee was inlined with it.
 pub(crate) fn inlined<'a>(
     db: &'a Db,
-    hashes: &dyn Hashes,
+    hashes: &HashSource,
     (instance, inlined): (&'a HirInstance, bool),
 ) -> Result<Vec<CodeHash>, String> {
     let mut found = Vec::new();
@@ -409,7 +409,7 @@ const ARGS_DOMAIN: &str = "blaze v2 args 1";
 
 /// What an instance's code is. A shim's is what kind of shim it is, with the code of the
 /// function whose signature it adapts: what else it reads is its type argument's.
-fn code_of(db: &Db, hashes: &dyn Hashes, kind: &Kind) -> Result<CodeHash, String> {
+fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String> {
     let instance = match kind {
         Kind::Code(instance, _) => instance,
         Kind::Asm(text) => return Ok(CodeHash(ContentId::of(ASM_DOMAIN, text.as_bytes()))),
@@ -451,7 +451,7 @@ fn code_of(db: &Db, hashes: &dyn Hashes, kind: &Kind) -> Result<CodeHash, String
 }
 
 /// The content ID of an instance's generic arguments, regions left out.
-fn args_of(db: &Db, hashes: &dyn Hashes, kind: &Kind) -> Result<ContentId, String> {
+fn args_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<ContentId, String> {
     let Kind::Code(instance, _) = kind else { return Ok(ContentId::default()) };
     let mut hasher = Hasher::new(ARGS_DOMAIN);
     for arg in instance.args.as_ref().iter() {

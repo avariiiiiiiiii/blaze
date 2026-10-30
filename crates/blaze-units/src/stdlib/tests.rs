@@ -4,7 +4,7 @@ use blaze_ids::ContentId;
 use blaze_query::{Database, MemTree};
 use blaze_vfs::View;
 
-use super::target::{CfgArgs, cargo_cfg_env, file_name, target_cfg, target_facts};
+use super::target::{CfgArgs, cargo_cfg_env, data_layout, file_name, target_cfg, target_facts};
 use super::*;
 use crate::query::{StdGraph, StdKey, StdPlanned, StdUnits};
 use crate::schema::{Mode, Unit};
@@ -177,6 +177,32 @@ fn a_targets_facts_and_file_names() {
     assert!(target::triples().any(|it| it == "aarch64-unknown-linux-gnu"));
 }
 
+/// `rustc +nightly --print target-spec-json -Z unstable-options --target <triple>`'s
+/// `data-layout` of the pinned nightly (1.101.0-nightly 16d1ffac1), for each tier-1 target.
+#[test]
+fn a_targets_data_layout_is_its_specs() {
+    let tier_one = [
+        ("aarch64-apple-darwin", "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"),
+        (
+            "aarch64-pc-windows-msvc",
+            "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32",
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
+        ),
+        ("x86_64-pc-windows-gnu", "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"),
+        ("x86_64-pc-windows-msvc", "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"),
+        ("x86_64-unknown-linux-gnu", "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"),
+    ];
+    for (triple, layout) in tier_one {
+        assert_eq!(data_layout(triple).unwrap(), layout, "{triple}");
+    }
+    assert_eq!(data_layout("wasm32-wasip1").unwrap(), "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20");
+    let unknown = data_layout("riscv64gc-unknown-plan9").unwrap_err();
+    assert!(unknown.contains("riscv64gc-unknown-plan9"), "{unknown}");
+}
+
 #[test]
 fn the_library_is_named_as_rustcs() {
     let commit = library_commit(include_str!("../../../../library/UPSTREAM")).unwrap();
@@ -304,7 +330,7 @@ fn project(db: &Database, tree: &MemTree, name: &str) -> blaze_vfs::ViewId {
 }
 
 fn planned(db: &Database, view: blaze_vfs::ViewId, key: &StdKey) -> StdPlanned {
-    db.get::<StdUnits>(view, key).unwrap().get()
+    db.pin().get::<StdUnits>(view, key).unwrap().get()
 }
 
 fn ready(planned: StdPlanned) -> StdGraph {
@@ -370,6 +396,33 @@ fn every_view_shares_one_standard_library() {
     let again = planned(&db, second, &key(root));
     assert_eq!(once, again);
     assert_eq!(RUNS.with(|it| it.get()), 1);
+}
+
+#[test]
+fn a_kept_standard_library_is_read_without_allocating() {
+    let (db, tree, root) = setup();
+    let view = project(&db, &tree, "a");
+    let key = key(root);
+    let graph = ready(planned(&db, view, &key));
+    let pinned = db.pin();
+    let hit = blaze_alloc_count::assert_at_most(0, "a StdUnits hit", || pinned.get::<StdUnits>(view, &key).is_ok());
+    assert!(hit);
+    assert_eq!(ready(pinned.get::<StdUnits>(view, &key).unwrap().get()), graph);
+    assert_eq!(RUNS.with(|it| it.get()), 1);
+    // Its key's ID is `StdKey::id`, made without the encoding's buffer once the thread has one.
+    let id = blaze_alloc_count::assert_at_most(0, "a std key's ID", || <StdUnits as blaze_query::Query>::input(&key));
+    assert_eq!(id, key.id());
+}
+
+#[test]
+fn a_standard_library_plan_says_what_the_daemon_runs_it_by() {
+    let (db, tree, root) = setup();
+    let view = project(&db, &tree, "a");
+    let graph = ready(planned(&db, view, &key(root)));
+    assert!(graph.plans.iter().all(|it| !it.unsandboxed && it.runner.is_empty()), "nothing of library/ runs outside");
+    assert!(graph.packages.iter().all(|it| it.default_run.is_none()));
+    let std_lib = graph.units.iter().position(|it| std::ptr::eq(it, lib_of(&graph, "std"))).unwrap();
+    assert!(graph.plans[std_lib].harness);
 }
 
 #[test]

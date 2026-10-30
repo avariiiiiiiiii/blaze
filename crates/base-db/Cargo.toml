@@ -16,6 +16,7 @@ doctest = false
 la-arena.workspace = true
 salsa.workspace = true
 rustc-hash.workspace = true
+hashbrown.workspace = true
 smallvec.workspace = true
 triomphe.workspace = true
 semver.workspace = true

@@ -85,7 +85,7 @@
 //! active crate for a given position, and then provide an API to resolve all
 //! syntax nodes against this specific crate.
 
-use std::sync::Arc;
+use std::{collections::hash_map::Entry, sync::Arc};
 
 use base_db::{Db, Crate, relevant_crates};
 use either::Either;
@@ -124,7 +124,9 @@ use crate::{
 #[derive(Default)]
 pub(super) struct SourceToDefCache<'db> {
     pub(super) dynmap_cache: FxHashMap<(ChildContainer, HirFileId), DynMap>,
-    expansion_info_cache: FxHashMap<MacroCallId, ExpansionInfo<'db>>,
+    /// Where each macro file's expansion is in `expansions`.
+    expansion_at: FxHashMap<MacroCallId, u32>,
+    expansions: Vec<ExpansionInfo<'db>>,
     pub(super) file_to_def_cache: FxHashMap<FileId, SmallVec<[ModuleId; 1]>>,
     pub(super) included_file_cache: FxHashMap<EditionedFileId, Option<MacroCallId>>,
     /// Rootnode to HirFileId cache
@@ -136,14 +138,16 @@ pub(super) struct SourceToDefCache<'db> {
 /// The crates `file` may be a module of: those `within` first, then the others. The file of a
 /// package is in the source root of each of its targets, and each would otherwise have its
 /// module tree built.
-fn crates_of(
-    db: &Db,
-    within: Option<&FxHashSet<Crate>>,
+fn crates_of<'a>(
+    db: &'a Db,
+    within: Option<&'a FxHashSet<Crate>>,
     file: FileId,
-) -> [Vec<Crate>; 2] {
-    let (some, rest) = (relevant_crates(db, file).iter())
-        .partition(|it| within.is_some_and(|within| within.contains(it)));
-    [some, rest]
+    first: bool,
+) -> impl Iterator<Item = Crate> + 'a {
+    relevant_crates(db, file)
+        .iter()
+        .copied()
+        .filter(move |it| within.is_some_and(|within| within.contains(it)) == first)
 }
 
 impl<'db> SourceToDefCache<'db> {
@@ -166,8 +170,9 @@ impl<'db> SourceToDefCache<'db> {
             return m;
         }
         self.included_file_cache.insert(file, None);
-        for crates in crates_of(db, self.within.as_deref(), file.file_id(db)) {
-            for crate_id in crates {
+        let within = self.within.as_deref();
+        for first in [true, false] {
+            for crate_id in crates_of(db, within, file.file_id(db), first) {
                 for &(macro_call_id, file_id) in hir_def::include_macro_invoc(db, crate_id) {
                     self.included_file_cache.insert(file_id, Some(macro_call_id));
                 }
@@ -184,26 +189,33 @@ impl<'db> SourceToDefCache<'db> {
         db: &'db Db,
         macro_file: MacroCallId,
     ) -> &ExpansionInfo<'db> {
-        self.expansion_info_cache.entry(macro_file).or_insert_with(|| {
-            let exp_info = macro_file.expansion_info(db);
+        let at = match self.expansion_at.entry(macro_file) {
+            Entry::Occupied(it) => *it.get(),
+            Entry::Vacant(it) => {
+                let exp_info = macro_file.expansion_info(db);
 
-            // Ensure that the cache contains syntax nodes from expanded macros,
-            // whose root may be in another file.
-            let InMacroFile { file_id, value } = exp_info.expanded();
-            Self::cache(&mut self.root_to_file_cache, value, file_id.into());
+                // Ensure that the cache contains syntax nodes from expanded macros,
+                // whose root may be in another file.
+                let InMacroFile { file_id, value } = exp_info.expanded();
+                Self::cache(&mut self.root_to_file_cache, value, file_id.into());
 
-            // include!("foo.rs") invocations are awkward: in addition to the
-            // expansion site there's the included file (foo.rs), so we need to
-            // ensure that it exists in the cache too.
-            if macro_file.is_include_macro(db) {
-                let arg = exp_info.arg();
-                if let Some(arg_node) = arg.value {
-                    Self::cache(&mut self.root_to_file_cache, arg_node.tree_top(), arg.file_id);
+                // include!("foo.rs") invocations are awkward: in addition to the
+                // expansion site there's the included file (foo.rs), so we need to
+                // ensure that it exists in the cache too.
+                if macro_file.is_include_macro(db) {
+                    let arg = exp_info.arg();
+                    if let Some(arg_node) = arg.value {
+                        Self::cache(&mut self.root_to_file_cache, arg_node.tree_top(), arg.file_id);
+                    }
                 }
-            }
 
-            exp_info
-        })
+                let at = u32::try_from(self.expansions.len())
+                    .expect("more than u32::MAX macro expansions in one `Semantics`");
+                self.expansions.push(exp_info);
+                *it.insert(at)
+            }
+        };
+        &self.expansions[at as usize]
     }
 }
 
@@ -216,19 +228,23 @@ impl<'db> SourceToDefCtx<'db, '_> {
     pub(super) fn file_to_def(&mut self, file: FileId) -> &SmallVec<[ModuleId; 1]> {
         let _p = tracing::info_span!("SourceToDefCtx::file_to_def").entered();
         if !self.cache.file_to_def_cache.contains_key(&file) {
-            let [some, rest] = crates_of(self.db, self.cache.within.as_deref(), file);
-            let mut mods = self.modules_in(&some, file);
+            let within = self.cache.within.clone();
+            let mut mods = self.modules_in(crates_of(self.db, within.as_deref(), file, true), file);
             if mods.is_empty() {
-                mods = self.modules_in(&rest, file);
+                mods = self.modules_in(crates_of(self.db, within.as_deref(), file, false), file);
             }
             self.cache.file_to_def_cache.insert(file, mods);
         }
         &self.cache.file_to_def_cache[&file]
     }
 
-    fn modules_in(&mut self, crates: &[Crate], file: FileId) -> SmallVec<[ModuleId; 1]> {
+    fn modules_in(
+        &mut self,
+        crates: impl Iterator<Item = Crate>,
+        file: FileId,
+    ) -> SmallVec<[ModuleId; 1]> {
         let mut mods = SmallVec::new();
-        for &crate_id in crates {
+        for crate_id in crates {
             // Note: `mod` declarations in block modules cannot be supported here
             let crate_def_map = crate_def_map(self.db, crate_id);
             let n_mods = mods.len();
@@ -806,5 +822,93 @@ impl ChildContainer {
             ChildContainer::VariantId(_) => None,
             ChildContainer::GenericDefId(it) => Some(it.into()),
         }
+    }
+}
+
+/// What a `Semantics` leaves to the next one made on its thread, at the database nonce and
+/// revision it was made at. A request's `Semantics` would otherwise grow every table from
+/// empty and rebuild every `DynMap` it reads.
+#[derive(Default)]
+struct Carry {
+    at: Option<(base_db::Nonce, salsa::Revision)>,
+    dynmap_cache: FxHashMap<(ChildContainer, HirFileId), DynMap>,
+    expansion_at: FxHashMap<MacroCallId, u32>,
+    /// Always empty: its storage, for the next `Semantics`' expansions.
+    expansions: Vec<ExpansionInfo<'static>>,
+    file_to_def_cache: FxHashMap<FileId, SmallVec<[ModuleId; 1]>>,
+    included_file_cache: FxHashMap<EditionedFileId, Option<MacroCallId>>,
+    root_to_file_cache: FxHashMap<SyntaxNode, HirFileId>,
+    macro_call_cache: FxHashMap<InFile<ast::MacroCall>, MacroCallId>,
+}
+
+/// More dyn maps than this are not carried: a thread that walked many files keeps their
+/// tables' storage but not the maps.
+const CARRIED_DYN_MAPS: usize = 4096;
+
+thread_local! {
+    static CARRY: std::cell::RefCell<Option<Carry>> = const { std::cell::RefCell::new(None) };
+}
+
+impl<'db> SourceToDefCache<'db> {
+    /// The thread's carried caches for a `Semantics` of `db`, and its macro call cache: whole
+    /// when the last `Semantics` on this thread was of the same database at the same
+    /// revision, else empty with their capacity.
+    pub(super) fn take(
+        db: &'db Db,
+    ) -> (SourceToDefCache<'db>, FxHashMap<InFile<ast::MacroCall>, MacroCallId>) {
+        let mut carry =
+            CARRY.try_with(|it| it.borrow_mut().take()).ok().flatten().unwrap_or_default();
+        if carry.at != Some(db.nonce_and_revision()) {
+            carry.dynmap_cache.clear();
+            carry.file_to_def_cache.clear();
+            carry.included_file_cache.clear();
+            carry.macro_call_cache.clear();
+        }
+        let cache = SourceToDefCache {
+            dynmap_cache: carry.dynmap_cache,
+            expansion_at: carry.expansion_at,
+            expansions: crate::scratch::recycle(carry.expansions),
+            file_to_def_cache: carry.file_to_def_cache,
+            included_file_cache: carry.included_file_cache,
+            root_to_file_cache: carry.root_to_file_cache,
+            within: None,
+        };
+        (cache, carry.macro_call_cache)
+    }
+
+    /// Leaves `self` and `macro_call_cache` to the next `Semantics` on this thread. A cache
+    /// that answered for some crates only (`within`) leaves no file answers.
+    pub(super) fn give(
+        mut self,
+        db: &Db,
+        macro_call_cache: FxHashMap<InFile<ast::MacroCall>, MacroCallId>,
+    ) {
+        if self.within.is_some() {
+            self.file_to_def_cache.clear();
+            self.included_file_cache.clear();
+        }
+        if self.dynmap_cache.len() > CARRIED_DYN_MAPS {
+            self.dynmap_cache.clear();
+        }
+        self.expansion_at.clear();
+        self.root_to_file_cache.clear();
+        let carry = Carry {
+            at: Some(db.nonce_and_revision()),
+            dynmap_cache: self.dynmap_cache,
+            expansion_at: self.expansion_at,
+            expansions: crate::scratch::recycle(self.expansions),
+            file_to_def_cache: self.file_to_def_cache,
+            included_file_cache: self.included_file_cache,
+            root_to_file_cache: self.root_to_file_cache,
+            macro_call_cache,
+        };
+        // A `Semantics` alive inside another one's request leaves nothing: the outer one's
+        // tables are the larger.
+        let _ = CARRY.try_with(|it| {
+            let mut slot = it.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(carry);
+            }
+        });
     }
 }

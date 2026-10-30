@@ -67,7 +67,7 @@ fn workspace() -> [(&'static str, &'static str); 6] {
 }
 
 fn printed(db: &Database, view: ViewId, ask: &TreeAsk) -> String {
-    match db.get::<Tree>(view, ask).expect("printed").get() {
+    match db.pin().get::<Tree>(view, ask).expect("printed").get() {
         Printed::Ready { out, warnings } => {
             assert!(warnings.is_empty(), "{warnings:?}");
             out
@@ -112,7 +112,7 @@ fn a_registry_dependency_is_fetched_first() {
     let manifest = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nserde = \"1\"\n";
     let view = open(&db, &tree, &[("ws/Cargo.toml", manifest), ("ws/src/lib.rs", "")]);
     assert_eq!(
-        db.get::<Tree>(view, &asked()).expect("printed").get(),
+        db.pin().get::<Tree>(view, &asked()).expect("printed").get(),
         Printed::Needs(vec![Fetch {
             what: "crates.io index".to_owned(),
             url: "https://index.crates.io/se/rd/serde".to_owned(),
@@ -129,7 +129,7 @@ fn features_and_duplicates_are_cargos_error() {
     let view = open(&db, &tree, &workspace());
     let both = TreeAsk { edges: vec![Edge::Features], duplicates: true, ..asked() };
     assert_eq!(
-        db.get::<Tree>(view, &both).expect("printed").get(),
+        db.pin().get::<Tree>(view, &both).expect("printed").get(),
         Printed::Failed(LoadError {
             what: "the `-e features` flag does not support `--duplicates`".to_owned(),
             at: None

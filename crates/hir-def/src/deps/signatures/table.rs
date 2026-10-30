@@ -39,6 +39,16 @@ fn id<T: FromId>(bits: u64) -> T {
     T::from_id(salsa::Id::from_bits(bits))
 }
 
+/// Appends to `out` the macro calls `table` names: what a record of it is made from beyond
+/// its crate's syntax.
+pub(super) fn calls(table: &Relocation, out: &mut Vec<MacroCallId>) {
+    for &(kind, bits) in table.entries() {
+        if kind == Kind::MacroCall {
+            out.push(id(bits));
+        }
+    }
+}
+
 /// The bytes of `table`, empty for an empty table.
 pub(super) fn encode(db: &Db, krate: Crate, table: &Relocation) -> R<Vec<u8>> {
     if table.is_empty() {
@@ -81,13 +91,7 @@ pub(super) fn encode(db: &Db, krate: Crate, table: &Relocation) -> R<Vec<u8>> {
 }
 
 /// Writes `block`, entry `index` of `table`.
-fn block(
-    enc: &mut Enc<'_>,
-    db: &Db,
-    table: &Relocation,
-    index: usize,
-    block: BlockId,
-) -> R {
+fn block(enc: &mut Enc<'_>, db: &Db, table: &Relocation, index: usize, block: BlockId) -> R {
     enc.ast_id(block.ast_id(db))?;
     let module = block.module(db);
     let Some(outer) = module.block(db) else {

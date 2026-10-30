@@ -228,3 +228,8 @@ propagating writes go (per run: none); with 5, process creations go from 2 to 1.
 > daemon the run's job objects and console handler would be the daemon's, a fault while launching
 > would end it, and `confine` would stop being one `Command` on every platform, for one
 > `CreateProcessW` of a few milliseconds against a build script's run.
+
+> checked by lane cargo (request 4, forwarded again 2026-10-29): in place. `build.rs` calls
+> `linux_interpose()` from `main` (and now hashes with `blaze-sha256`); blaze-cargo's
+> `windows-sys = { workspace = true, features = [Authorization, Isolation, Console] }` with the
+> root's features covers every one usercode-sandbox-windows.md 1 lists.

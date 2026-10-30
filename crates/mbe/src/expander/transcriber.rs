@@ -1,6 +1,7 @@
 //! Transcriber takes a template, like `fn $ident() {}`, a set of bindings like
 //! `$ident => foo`, interpolates variables in the template, to get `fn foo() {}`
 
+use blaze_mem::frame::Frame;
 use intern::{Symbol, sym};
 use span::{Edition, Span};
 use stdx::itertools::Itertools;
@@ -127,14 +128,14 @@ impl<'t> Bindings<'t> {
     }
 }
 
-pub(super) fn transcribe(
+pub(super) fn transcribe<'a>(
     template: &MetaTemplate,
-    bindings: &Bindings<'_>,
+    bindings: &'a Bindings<'a>,
+    frame: &'a Frame,
     marker: impl Fn(&mut Span) + Copy,
     call_site: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    // alloc: the repetition stack, once a transcription.
-    let mut ctx = ExpandCtx { bindings, nesting: Vec::new(), call_site };
+    let mut ctx = ExpandCtx { bindings, nesting: Vec::new_in(frame), call_site };
     let mut builder = tt::TopSubtreeBuilder::with_capacity(
         tt::Delimiter::invisible_spanned(ctx.call_site),
         template.0.len() + bindings.token_trees(),
@@ -156,7 +157,7 @@ struct NestingState {
 #[derive(Debug)]
 struct ExpandCtx<'a> {
     bindings: &'a Bindings<'a>,
-    nesting: Vec<NestingState>,
+    nesting: Vec<NestingState, &'a Frame>,
     call_site: Span,
 }
 
@@ -301,8 +302,7 @@ fn expand_subtree(
                 }));
             }
             Op::Concat { elements, span: concat_span } => {
-                // alloc: the text of a `${concat}` identifier, interned at once.
-                let mut concatenated = String::new();
+                let mut concatenated = blaze_mem::scratch::lend_string();
                 for element in elements {
                     match element {
                         ConcatMetaVarExprElem::Ident(ident) => {

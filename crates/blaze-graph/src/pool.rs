@@ -1300,11 +1300,11 @@ mod tests {
         assert_eq!((size_of::<Placed<[u8; 2048 - size_of::<Placed<()>>()]>>(), class(&largest)), (2048, 2));
     }
 
-    /// Jobs of every cell size, against the same closures boxed and called in place: each runs
-    /// once with what it captured intact, gives what the boxed one gives, and drops its
+    /// Jobs of every cell size, against the same closures called in place: each runs once
+    /// with what it captured intact, gives what the one called in place gives, and drops its
     /// capture once.
     #[test]
-    fn a_job_in_a_cell_runs_as_the_same_closure_boxed() {
+    fn a_job_in_a_cell_runs_as_the_same_closure_called_in_place() {
         fn one<const N: usize>(
             pool: &Pool,
             fill: u64,
@@ -1312,12 +1312,11 @@ mod tests {
             tx: crossbeam_channel::Sender<(usize, u64)>,
             job: usize,
         ) -> u64 {
-            // dyn: the test's reference, the same closure boxed
-            let boxed: Box<dyn FnOnce() -> u64> = Box::new(closure::<N>(fill, Dropped(drops.clone())));
+            let in_place = closure::<N>(fill, Dropped(drops.clone()));
             pool.submit(None, closure::<N>(fill, Dropped(drops.clone())), move |it| {
                 _ = tx.send((job, it.unwrap()));
             });
-            boxed()
+            in_place()
         }
         let pool = Pool::new(&groups_of(2, 2), false).unwrap();
         for seed in 0..20u64 {

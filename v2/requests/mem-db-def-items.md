@@ -118,6 +118,17 @@ At 21:00, mem-format-hir has reported DONE without this change, so it was resent
 `with_maps` is at 761.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> mem-format (holds `expr_store*` now), 21:10: not applied, and I1.6 need not wait for it.
+> `ExprCollector`'s per-lowering temporaries (its arenas, maps, block scopes, hygiene, back maps
+> and the side columns' packing) are on hir-def's pooled thread-local `Scratch` since
+> mem-format-hir-apply (`v2/requests/mem-format-hir.md` 1-2, lane mem's ruling that hir-def's
+> scratch stays in its own thread-locals). A warm lowering is held to 0 allocations
+> (`a_warm_lowering_allocates_nothing`). So a `frame` handed to `with_maps` would be unused. It
+> also can't compile yet: hir-def has no `blaze-mem` dependency (H1) and `frame::current` is not
+> in blaze-mem. Signatures' own temporaries (I1.1-I1.4, I1.6's `relative`/`with_source_map`)
+> open the frame in signatures.rs and keep it there; the `lower_*` calls stay as they are. If a
+> lowering temporary turns up that the pooled scratch can't hold, name it here and the parameter
+> goes in with the code that uses it.
 
 ## I1. `signatures.rs`
 
@@ -1468,6 +1479,20 @@ pub fn search_dependencies_into(
     query: &Query,
     found: &mut FxHashSet<(ItemInNs, Complete)>,
 ) {
+    search_dependencies_each(db, krate, query, |item, complete| {
+        found.insert((item, complete));
+    });
+}
+
+/// Calls `f` on each importable name of `krate`'s dependencies that matches `query`, in the
+/// order the search finds them (dependencies in order, then each map's runs in key order, each
+/// run's infos in order); an item can come more than once.
+pub fn search_dependencies_each(
+    db: &Db,
+    krate: Crate,
+    query: &Query,
+    mut f: impl FnMut(ItemInNs, Complete),
+) {
     let _p = tracing::info_span!("search_dependencies", ?query).entered();
     let lowercased = query.lowercased.as_bytes();
     for dep in krate.data(db).dependencies.iter() {
@@ -1481,7 +1506,7 @@ pub fn search_dependencies_into(
                 }
                 let row = map.row_of_info(info_idx);
                 if query.matches_assoc_mode(map.is_trait_assoc_item(row)) {
-                    found.insert((map.items[row], info.complete));
+                    f(map.items[row], info.complete);
                 }
             }
         });
@@ -1489,8 +1514,11 @@ pub fn search_dependencies_into(
 }
 ```
 
-The `hir` wrapper (`hir/src/lib.rs:369-375`, `query_external_importables`) can keep a
-per-worker set and call `search_dependencies_into` (mem-db-def-hir's, told). `Query::new` (518)
+The `hir` wrapper (`hir/src/lib.rs:376`, `query_external_importables`) calls
+`search_dependencies_each`. It hands items out in the order found, deduplicated by a per-worker
+seen-set, so the completion order never depends on how far a reused set's table has grown on
+earlier requests (`v2/requests/mem-db-def-hir.md` R10b, which asked for `_each`). Visiting an
+`ItemInNs` and a `Complete`, both `Copy`, allocates nothing. `Query::new` (518)
 lowercases into a `String` once per request: the edge.
 
 Manifest (owner's): `fst` moves from `[dependencies]` to `[dev-dependencies]` of
@@ -1791,6 +1819,41 @@ MacroReachable::new_in(frame); .. })`. `symbol_attr` (38) is attrs.rs's (no buff
   `bytes: SmallVec` (101): inline.
 - `builtin_derive.rs`, `builtin_type.rs`, `test_db.rs`: no allocation on a query or hit path.
 
+### I11.1 `unstable_features.rs`: built at its size (mem-db-def-collect's H9 ask 4)
+
+The collector's H4 (`v2/requests/mem-db-def-collect.md`) counts the crate's `#![feature]`s and
+reserves the set once before enabling them (`crate_data.unstable_features.reserve(features.len())`),
+so the set is never regrown or shrunk. In `impl UnstableFeatures` (28-42), 39-41
+
+```rust
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.all.shrink_to_fit();
+    }
+```
+
+become
+
+```rust
+    /// Room for `additional` more features: the collector reserves the crate's count once,
+    /// before it enables them.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        // alloc: the def map's feature set, once per crate, at the count written
+        self.all.reserve(additional);
+    }
+
+    /// The heap buffers this owns, for the def map's budget tests: the set's table, if it has one.
+    #[cfg(test)]
+    pub(crate) fn owned_allocations(&self) -> u64 {
+        u64::from(self.all.capacity() > 0)
+    }
+```
+
+Order: `shrink_to_fit`'s one caller, `DefMapCrateData::shrink_to_fit` (`nameres.rs:349`), goes in
+mem-db-def-collect's A5 (which makes it `settle`). Apply this together with A5 or after it, never
+before, or `nameres.rs` stops building. A feature written twice leaves one slot spare: still one
+table, never a regrow. `query` (51) clones the def map's set: `FxHashSet::clone` allocates one
+table at the source's bucket count, so the memo is the same size as the def map's.
+
 > forwarded to db (from requests, pass 16; told by tmux).
 
 ## I12. Budget tests (written in full)
@@ -1966,6 +2029,45 @@ pub mod fmt {
             });
             assert_eq!(found, search_dependencies(&db, main, query), "{query:?}");
         }
+    }
+
+    /// `search_dependencies_each` allocates nothing of its own, visits what
+    /// `search_dependencies` returns, and visits it in the same order every time, whatever
+    /// was searched before.
+    #[test]
+    fn each_is_free_and_in_a_fixed_order() {
+        let db = TestDB::with_files(
+            r#"
+//- /main.rs crate:main deps:dep,other
+//- /dep.rs crate:dep
+pub struct Fmt;
+pub mod fmt { pub fn format() {} pub use super::Fmt as Formatter; }
+//- /other.rs crate:other
+pub fn fmt() {}
+"#,
+        );
+        let main = *all_crates(&db)
+            .iter()
+            .find(|krate| {
+                krate.extra_data(&db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "main")
+            })
+            .unwrap();
+        let query = Query::new("f".to_owned()).prefix();
+        // alloc: test, room for every visit, so the measure counts only the search
+        let mut first = Vec::with_capacity(64);
+        search_dependencies_each(&db, main, &query, |item, complete| first.push((item, complete)));
+        assert!(first.len() < 64);
+        let _ = search_dependencies(&db, main, &Query::new("fmt".to_owned()).fuzzy());
+        // alloc: test, as `first`
+        let mut again = Vec::with_capacity(64);
+        blaze_alloc_count::assert_at_most(0, "a visiting import-map search", || {
+            search_dependencies_each(&db, main, &query, |item, complete| {
+                again.push((item, complete))
+            })
+        });
+        assert_eq!(first, again);
+        let visited: FxHashSet<_> = first.iter().copied().collect();
+        assert_eq!(visited, search_dependencies(&db, main, &query));
     }
 
     /// A build of a crate's import map, its inputs warm, allocates its nine columns and nothing

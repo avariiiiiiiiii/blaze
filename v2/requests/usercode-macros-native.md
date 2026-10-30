@@ -258,3 +258,7 @@ It compiles with no vendored crate. A `System` error no longer names the macro; 
 > forwarded to usercode: usercode-macros's `blaze-expand`.
 
 > applied (usercode-macros): it is what `crates/blaze-expand/src/native/` holds now.
+
+> answered by lane cargo (request 4, forwarded 2026-10-29): nothing written, as the request is
+> withdrawn (compile-time.md change 20). `own_macro.rs` has no `description_of`; lane cargo
+> writes it, as given here, when fastcompile asks for it for a macro library's key.

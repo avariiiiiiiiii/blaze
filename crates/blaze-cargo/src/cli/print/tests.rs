@@ -219,10 +219,109 @@ fn a_unit_that_failed() {
         err,
         format!(
             "   Compiling foo v0.1.0 (/w/foo)\n{UNUSED}error[E0308]: mismatched types\n\nFor more information \
-             about this error, try `rustc --explain E0308`.\nerror: could not compile `foo` (lib) due to 1 \
-             previous error; 1 warning emitted\n"
+             about this error, try `rustc --explain E0308`.\nwarning: `foo` (lib) generated 1 warning\nerror: \
+             could not compile `foo` (lib) due to 1 previous error; 1 warning emitted\n"
         )
     );
+    let (_, quiet) = printed(Shown { color: false, quiet: true, ..Shown::default() }, &responses, false);
+    assert!(quiet.ends_with("`rustc --explain E0308`.\nerror: could not compile `foo` (lib) due to 1 previous error; 1 warning emitted\n"), "{quiet}");
+}
+
+#[test]
+fn levels_in_color_as_cargos_shell_writes_them() {
+    let error = diagnostic(Level::Error, "mismatched types", "error[E0308]: mismatched types\n", Some(lib_of("foo")));
+    let warning = diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of("foo")));
+    let responses = [Response::Diagnostic(warning), Response::Diagnostic(error), Response::Done { ok: false }];
+    let (_, err) = printed(Shown { color: true, ..Shown::default() }, &responses, false);
+    assert!(
+        err.ends_with(&format!(
+            "{}warning{}: `foo` (lib) generated 1 warning\n{}error{}: could not compile `foo` (lib) due to 1 \
+             previous error; 1 warning emitted\n",
+            say::WARN,
+            say::RESET,
+            say::ERROR,
+            say::RESET
+        )),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn rustcs_summary_is_skipped_under_json_too() {
+    let json = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: false }, ..Shown::default() };
+    let emitted = diagnostic(Level::Warning, "1 warning emitted", "warning: 1 warning emitted\n\n", Some(lib_of("foo")));
+    let (out, _) = printed(json, &[Response::Diagnostic(emitted), Response::Done { ok: true }], true);
+    assert_eq!(out, "{\"reason\":\"build-finished\",\"success\":true}\n");
+}
+
+#[test]
+fn one_rendered_text_is_printed_once_with_or_without_its_newline() {
+    let first = diagnostic(Level::Warning, "unused variable: `x`", "warning: a\n", Some(lib_of("foo")));
+    let second = diagnostic(Level::Warning, "unused variable: `x`", "warning: a", Some(lib_of("foo")));
+    let responses = [Response::Diagnostic(first), Response::Diagnostic(second), Response::Done { ok: true }];
+    let (_, err) = printed(Shown::default(), &responses, true);
+    assert_eq!(err, "warning: a\nwarning: `foo` (lib) generated 2 warnings (1 duplicate)\n");
+}
+
+#[test]
+fn units_of_one_package_are_told_apart() {
+    let lib = diagnostic(Level::Warning, "a", "warning: a\n", Some(lib_of("foo")));
+    let test = diagnostic(Level::Warning, "a", "warning: b\n", Some(UnitOf { test: true, ..lib_of("foo") }));
+    let responses = [Response::Diagnostic(lib), Response::Diagnostic(test), Response::Done { ok: true }];
+    let (_, err) = printed(Shown::default(), &responses, true);
+    assert_eq!(
+        err,
+        "warning: a\nwarning: b\nwarning: `foo` (lib) generated 1 warning\nwarning: `foo` (lib test) generated 1 warning\n"
+    );
+}
+
+/// A build's responses: each unit starting, warnings, artifacts, a unit ending.
+fn a_build(n: usize) -> Vec<Response> {
+    let mut responses = Vec::new();
+    for at in 0..n {
+        let name = format!("p{at}");
+        responses.push(started(&name, Verb::Compiling));
+        let warning = fixable(diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of(&name))));
+        responses.push(Response::Diagnostic(warning.clone()));
+        responses.push(Response::Diagnostic(warning));
+        responses.push(Response::UnitEnded(lib_of(&name)));
+    }
+    responses.push(Response::Fetched { verb: FetchVerb::Downloaded, what: "serde v1.0.219".to_owned() });
+    responses.push(Response::Error(ApiError::new("no package `nope` in the workspace", None)));
+    responses
+}
+
+/// The printer allocates per request, not per response: once its buffers have grown and the
+/// units are known, printing a build's responses allocates nothing, in every format.
+#[test]
+fn printing_responses_warm_allocates_nothing() {
+    let formats = [
+        Format::Human,
+        Format::Short,
+        Format::Json { short: false, ansi: false, render_diagnostics: false },
+        Format::Json { short: false, ansi: true, render_diagnostics: true },
+    ];
+    for format in formats {
+        for verbose in [0, 1] {
+            let shown = Shown { format, verbose, color: true, ..Shown::default() };
+            let (mut out, mut err) = (Vec::with_capacity(1 << 20), Vec::with_capacity(1 << 20));
+            let mut printer = Printer::new(shown, Path::new("/w"), &mut out, &mut err);
+            for response in a_build(64) {
+                printer.on(response).unwrap();
+            }
+            printer.printed.clear();
+            printer.named.clear();
+            for seen in &mut printer.units {
+                seen.counted = Counted::default();
+            }
+            let responses = a_build(64);
+            blaze_alloc_count::assert_at_most(0, "printing a warm build's responses", || {
+                for response in responses {
+                    printer.on(response).unwrap();
+                }
+            });
+        }
+    }
 }
 
 #[test]

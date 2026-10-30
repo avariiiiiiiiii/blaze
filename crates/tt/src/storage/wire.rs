@@ -16,6 +16,7 @@
 //! tree's block, its one allocation, no larger than the bytes it is read from; the checks' own
 //! buffers are the only others.
 
+use blaze_format::cursor::Reader;
 use intern::Symbol;
 use span::{SpanAnchor, SyntaxContext, TextRange, TextSize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -150,7 +151,7 @@ impl TopSubtree {
         bytes: &[u8],
         part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
     ) -> Result<(TopSubtree, usize), WireError> {
-        let mut words = Words { bytes, at: 0 };
+        let mut words = Words { read: Reader::new(bytes) };
         let [magic, nodes_len, wide_len, parts_len, symbols_len, symbol_bytes] =
             words.rows::<6>(1)?.next().expect("one header row is read");
         if magic != MAGIC {
@@ -179,7 +180,7 @@ impl TopSubtree {
         check_spans(span_words.as_chunks::<2>().0, wide_len, parts_len)?;
         let wire_parts = words.rows::<3>(parts_len)?;
         // Read twice from the bytes, checked now and used once the text is read.
-        let mut ends = Words { bytes, at: words.at };
+        let mut ends = Words { read: words.read };
         let mut last = 0;
         for (at, [end]) in words.rows::<1>(symbols_len)?.enumerate() {
             let end = end as usize;
@@ -247,7 +248,7 @@ impl TopSubtree {
         let columns = tree.columns();
         check_literals(columns)?;
         check_canonical(columns)?;
-        Ok((tree, words.at))
+        Ok((tree, words.read.at()))
     }
 }
 
@@ -463,19 +464,12 @@ fn put_rows<const N: usize>(out: &mut Vec<u8>, rows: impl IntoIterator<Item = [u
 
 /// A cursor over the bytes' words.
 struct Words<'a> {
-    bytes: &'a [u8],
-    at: usize,
+    read: Reader<'a>,
 }
 
 impl<'a> Words<'a> {
     fn bytes(&mut self, len: usize) -> Result<&'a [u8], WireError> {
-        match self.bytes.get(self.at..).and_then(|it| it.get(..len)) {
-            Some(it) => {
-                self.at += len;
-                Ok(it)
-            }
-            None => Err(WireError::Truncated { at: self.at, needed: len }),
-        }
+        self.read.take(len).map_err(|error| WireError::Truncated { at: error.at, needed: len })
     }
 
     /// The next `count` rows of `N` words, taken whole first.
@@ -497,7 +491,7 @@ impl<'a> Words<'a> {
         &mut self,
         count: usize,
     ) -> Result<&'a [T], WireError> {
-        let at = self.at;
+        let at = self.read.at();
         let bytes = self.bytes(count.saturating_mul(size_of::<T>()))?;
         if !bytes.as_ptr().addr().is_multiple_of(align_of::<T>()) {
             return Err(WireError::Malformed { what: "bytes not starting at a 4-byte boundary", at });
@@ -507,9 +501,9 @@ impl<'a> Words<'a> {
 
     /// Skips the zeros up to the next word.
     fn pad(&mut self) -> Result<(), WireError> {
-        let pad = self.at.next_multiple_of(4) - self.at;
+        let pad = self.read.at().next_multiple_of(4) - self.read.at();
         if self.bytes(pad)?.iter().any(|&it| it != 0) {
-            return malformed("padding that is not zero", self.at);
+            return malformed("padding that is not zero", self.read.at());
         }
         Ok(())
     }

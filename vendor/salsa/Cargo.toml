@@ -641,6 +641,9 @@ name = "query_fetch"
 path = "benches/query_fetch.rs"
 harness = false
 
+[dependencies.blaze-ids]
+path = "../../crates/blaze-ids"
+
 [dependencies.blaze-mem]
 path = "../../crates/blaze-mem"
 
@@ -734,9 +737,6 @@ version = "=0.12.16"
 
 [dev-dependencies.blaze-alloc-count]
 path = "../../crates/blaze-alloc-count"
-
-[dev-dependencies.blaze-ids]
-path = "../../crates/blaze-ids"
 
 [dev-dependencies.crossbeam-channel]
 version = "=0.5.17"

@@ -23,7 +23,7 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
     min_same      fail unless at least this many units of `tests/ui` have rustc's codes (0)
     max_accepted  fail if more than this many units of `tests/ui` are accepted (no limit)
     keep          keep every workspace, not only those of units that did not pass
-    cache         where rustc's answers are kept across runs ("~/.cache/blaze-v2-proof"; "" keeps
+    cache         where rustc's answers (keys and spans) are kept across runs ("~/.cache/blaze-v2-proof"; "" keeps
                   none): by the toolchain (`rustc -vV`, `cargo -vV`) and the unit's argv, and
                   used again only while every file and environment variable its dep-info names
                   has the content it had, so a rerun runs rustc on what changed alone
@@ -43,11 +43,17 @@ checked with `--tests`, of the unit's edition; the files it names with `mod` and
 beside it), up to `batch` of the same kind and flags in one workspace, the flags in
 `RUSTFLAGS`, and checked with `blaze check --message-format=json` through the engine under that
 workspace's one daemon. An error is keyed by its code (E0277, or a denied lint's name), or, for
-an error with no code, by the start of its message with what is in backticks taken out. A unit:
+an error with no code, by the start of its message with what is in backticks taken out. Each
+error's primary spans (those its JSON marks `is_primary`: file, first and last line and column)
+are kept by key; a file is named by its path beside the unit's root file (the root itself
+`<root>`), a file of the standard library by its path under `library/` (`<std>/core/...`). A
+unit:
 
-    pass   blaze rejects it with the same set of keys
+    pass   blaze rejects it with the same set of keys, and with the same primary spans for each
+           key (as a multiset: two errors of one code are two spans)
     fail   blaze accepts it ("accepted what rustc rejects"), rejects it with another set ("other
-           codes"), or the engine says the check was not blaze's
+           codes"), puts a key's errors at other places ("other spans", each key that differs
+           named with both sides' spans), or the engine says the check was not blaze's
     error  the harness could not say: rustc or blaze timed out, or blaze failed without an error
 
 Units it can say nothing about (an auxiliary crate, a `-Z` flag that changes what is rejected,
@@ -63,6 +69,7 @@ import concurrent.futures
 import hashlib
 import importlib
 import json
+import os
 import platform
 import re
 import shutil
@@ -121,8 +128,15 @@ VALUED_SHORT = "CZAWDFLl"
 KIND_ARGS: dict[Kind, tuple[str, ...]] = {"lib": ("--lib",), "bin": ("--bins",), "test": ("--tests",)}
 MESSAGE = "message: "
 MESSAGE_START = 60
+ACCEPTED = "rustc accepts it as `cargo check` runs it (`--emit=dep-info,metadata`)"
+CRASHES = "rustc crashes on it"
+CHECK_EMIT = "dep-info,metadata"
+ROOT_FILE = "<root>"
+STD_FILE = "<std>/"
 RUSTC_SECS = 120
 CHECK_SECS = 1800
+# The kept answers of rustc, with their spans; those of before spans are never read.
+KEPT_KIND = "rustc-spans"
 WORKSPACE = '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n'
 
 
@@ -187,24 +201,46 @@ class Classified:
     passing: int = 0
 
 
+@dataclass(frozen=True, order=True)
+class Span:
+    """A primary span: its file (`place`), and its first and last line and column, 1-based, the
+    last column one past the span as rustc's JSON gives it."""
+
+    file: str
+    line: int
+    column: int
+    end_line: int
+    end_column: int
+
+    def __str__(self) -> str:
+        return f"{self.file}:{self.line}:{self.column}-{self.end_line}:{self.end_column}"
+
+
+# Each error's key with one of its primary spans, sorted; a key repeats once a span.
+type Placed = tuple[tuple[str, Span], ...]
+
+
 @dataclass(frozen=True)
 class Reference:
-    """What rustc said of a unit: the keys of its errors; or why the unit is out of scope; or
-    why the harness could not say."""
+    """What rustc said of a unit: the keys of its errors and their primary spans; or why the
+    unit is out of scope; or why the harness could not say."""
 
     keys: frozenset[str] = frozenset()
     out: str | None = None
     error: str | None = None
+    spans: Placed = ()
 
 
 @dataclass(frozen=True)
 class Said:
-    """What blaze said of a unit: the keys of its errors (none: it accepted the unit), or why
-    nothing can be read from it, and who did the check when it was not blaze (`not_blazes`)."""
+    """What blaze said of a unit: the keys of its errors (none: it accepted the unit) and their
+    primary spans, or why nothing can be read from it, and who did the check when it was not
+    blaze (`not_blazes`)."""
 
     keys: frozenset[str] = frozenset()
     error: str | None = None
     who: str | None = None
+    spans: Placed = ()
 
 
 @dataclass(frozen=True)
@@ -416,30 +452,73 @@ def error_key(diagnostic: Any) -> str | None:
     return key_of(name if isinstance(name, str) else None, message)
 
 
-def reference_of(returncode: int, stderr: str) -> Reference:
-    """What rustc's run on a unit says (`--error-format=json`)."""
+def place(file_name: str, base: Path, root: Path) -> str:
+    """How a span's file is compared: `<root>` for the unit's root file, a path beside it
+    relative to the root's directory, a file of the standard library by its path under
+    `library/` (each side has its own copy of the same sources); anything else as it is. A
+    relative `file_name` is under `base`, the compiler's working directory."""
+    given = Path(file_name)
+    path = os.path.realpath(given if given.is_absolute() else base / given)
+    home = os.path.realpath(root)
+    if path == home:
+        return ROOT_FILE
+    beside = os.path.dirname(home)
+    if path.startswith(beside + os.sep):
+        return Path(os.path.relpath(path, beside)).as_posix()
+    _, found, under = file_name.replace("\\", "/").partition("/library/")
+    return STD_FILE + under if found else file_name
+
+
+def primary_spans(diagnostic: dict[str, Any], base: Path, root: Path) -> list[Span]:
+    """The spans of a diagnostic (rustc's JSON) marked primary, as compared (`place`)."""
+    found: list[Span] = []
+    spans: Any = diagnostic.get("spans")
+    for s in cast(list[Any], spans) if isinstance(spans, list) else []:
+        if not isinstance(s, dict) or not cast(dict[str, Any], s).get("is_primary"):
+            continue
+        d = cast(dict[str, Any], s)
+        where = (d.get("line_start"), d.get("column_start"), d.get("line_end"), d.get("column_end"))
+        if not isinstance(d.get("file_name"), str) or not all(isinstance(n, int) for n in where):
+            continue
+        found.append(Span(place(d["file_name"], base, root), *cast(tuple[int, int, int, int], where)))
+    return found
+
+
+def placed_of(pairs: Sequence[tuple[str, Span]]) -> Placed:
+    return tuple(sorted(pairs))
+
+
+def reference_of(returncode: int, stderr: str, root: Path) -> Reference:
+    """What rustc's run on a unit says (`--error-format=json`), its spans placed against `root`,
+    the unit's root file (rustc runs in its directory)."""
     keys: set[str] = set()
+    spans: list[tuple[str, Span]] = []
     for line in stderr.splitlines():
         d = json_line(line)
         if d is None:
             continue
         if "internal compiler error" in str(d.get("level", "")):
-            return Reference(out="rustc crashes on it")
+            return Reference(out=CRASHES)
         if key := error_key(d):
             keys.add(key)
+            spans += [(key, span) for span in primary_spans(d, root.parent, root)]
     if "thread 'rustc' panicked" in stderr:
-        return Reference(out="rustc crashes on it")
+        return Reference(out=CRASHES)
     if keys:
-        return Reference(frozenset(keys))
+        return Reference(frozenset(keys), spans=placed_of(spans))
     if returncode == 0:
-        return Reference(out="rustc accepts it as `cargo check` runs it (`--emit=dep-info,metadata`)")
+        return Reference(out=ACCEPTED)
     return Reference(error=f"rustc exited {returncode} with no error:\n{stderr[-600:]}")
 
 
-def rustc_argv(unit: Unit, out_dir: str) -> list[str]:
+def rustc_argv(unit: Unit, out_dir: str, emit: str = CHECK_EMIT, output: str | None = None,
+               extra: Sequence[str] = ()) -> list[str]:
+    """rustc on `unit` as compiletest runs it; `output` names the one output (`-o`) in place of
+    `--out-dir`, and `extra` comes before the unit's own flags."""
     kind = {"lib": ["--crate-type", "lib"], "bin": ["--crate-type", "bin"], "test": ["--test"]}[unit.kind]
-    return ["rustc", unit.path, "--edition", unit.edition, *kind, "--error-format=json", "--emit=dep-info,metadata",
-            "-Zui-testing", *COMMON, *unit.flags, "--out-dir", out_dir]
+    to = ["-o", output] if output is not None else ["--out-dir", out_dir]
+    return ["rustc", unit.path, "--edition", unit.edition, *kind, "--error-format=json", f"--emit={emit}",
+            "-Zui-testing", *COMMON, *extra, *unit.flags, *to]
 
 
 type Read = tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str | None], ...]]
@@ -487,9 +566,17 @@ def kept_reference(entry: object, env: dict[str, str], where: str) -> Reference 
         raise engine.Failed(f"the kept answer of rustc {where} is not one rejections.py wrote: {entry!r:.300}")
     fields = cast(dict[str, object], entry)
     files, variables, keys, out = fields.get("files"), fields.get("env"), fields.get("keys"), fields.get("out")
+    spans = fields.get("spans")
     if not (isinstance(files, list) and isinstance(variables, list) and isinstance(keys, list)
-            and "out" in fields and (out is None or isinstance(out, str))):
+            and isinstance(spans, list) and "out" in fields and (out is None or isinstance(out, str))):
         raise engine.Failed(f"the kept answer of rustc {where} is not one rejections.py wrote: {entry!r:.300}")
+    placed: list[tuple[str, Span]] = []
+    for item in cast(list[object], spans):
+        row = cast(list[object], item) if isinstance(item, list) else []
+        if not (len(row) == 6 and isinstance(row[0], str) and isinstance(row[1], str)
+                and all(isinstance(n, int) for n in row[2:])):
+            raise engine.Failed(f"the kept answer of rustc {where} has the span {item!r}")
+        placed.append((row[0], Span(row[1], *cast(list[int], row[2:]))))
     for pair in cast(list[object], files):
         if not (isinstance(pair, list) and len(pair) == 2 and all(isinstance(p, str) for p in pair)):
             raise engine.Failed(f"the kept answer of rustc {where} has the file {pair!r}")
@@ -505,70 +592,121 @@ def kept_reference(entry: object, env: dict[str, str], where: str) -> Reference 
         name, value = cast(list[Any], pair)
         if env.get(name) != value:
             return None
-    return Reference(frozenset(str(k) for k in cast(list[object], keys)), cast(str | None, out))
+    return Reference(frozenset(str(k) for k in cast(list[object], keys)), cast(str | None, out),
+                     spans=placed_of(placed))
 
 
-def cargo_messages(stdout: str) -> tuple[dict[str, frozenset[str]], frozenset[str], frozenset[str]]:
+def kept_spans(spans: Placed) -> list[list[object]]:
+    """`spans` as `kept_reference` reads them back."""
+    return [[key, s.file, s.line, s.column, s.end_line, s.end_column] for key, s in spans]
+
+
+@dataclass(frozen=True)
+class Messages:
     """Of `cargo check --message-format=json`'s lines: the keys of the errors of each target (by
-    its name), the keys of every error, and the targets checked (a `compiler-artifact`)."""
+    its name) and their primary spans, the keys and spans of every error, and the targets
+    checked (a `compiler-artifact`)."""
+
+    errors: dict[str, frozenset[str]]
+    spans: dict[str, Placed]
+    every: frozenset[str]
+    every_span: Placed
+    checked: frozenset[str]
+
+
+def cargo_messages(stdout: str, base: Path, roots: dict[str, Path]) -> Messages:
+    """`Messages` of a run in the workspace `base`: each error's spans placed against the root
+    file of its target in `roots` (the one root when there is one, for a message of no target)."""
     errors: dict[str, set[str]] = {}
+    spans: dict[str, list[tuple[str, Span]]] = {}
     every: set[str] = set()
+    every_span: list[tuple[str, Span]] = []
     checked: set[str] = set()
+    only = next(iter(roots.values())) if len(roots) == 1 else None
     for line in stdout.splitlines():
         m = json_line(line)
         if m is None:
             continue
         target: Any = m.get("target")
         name: Any = target.get("name") if isinstance(target, dict) else None
-        if m.get("reason") == "compiler-message" and (key := error_key(m.get("message"))):
+        message: Any = m.get("message")
+        if m.get("reason") == "compiler-message" and (key := error_key(message)):
+            root = roots.get(name, only) if isinstance(name, str) else only
+            found = [(key, s) for s in primary_spans(message, base, root)] if root is not None else []
             every.add(key)
+            every_span += found
             if isinstance(name, str):
                 errors.setdefault(name, set()).add(key)
+                spans.setdefault(name, []).extend(found)
         elif m.get("reason") == "compiler-artifact" and isinstance(name, str):
             checked.add(name)
-    return {k: frozenset(v) for k, v in errors.items()}, frozenset(every), frozenset(checked)
+    return Messages({k: frozenset(v) for k, v in errors.items()}, {k: placed_of(v) for k, v in spans.items()},
+                    frozenset(every), placed_of(every_span), frozenset(checked))
 
 
-def said_alone(returncode: int, stdout: str, tail: str, who: str | None) -> Said:
-    """What a `blaze check -p` of one unit's package says of it: every error of the run is its."""
-    _, every, _ = cargo_messages(stdout)
-    if every:
-        return Said(every, who=who)
+def said_alone(returncode: int, stdout: str, tail: str, who: str | None, base: Path, root: Path,
+               command: str = "check") -> Said:
+    """What a `blaze check -p` (or `build -p`) of one unit's package, whose root file is `root`,
+    says of it: every error of the run is its."""
+    m = cargo_messages(stdout, base, {"": root})
+    if m.every:
+        return Said(m.every, who=who, spans=m.every_span)
     if returncode == 0:
         return Said(who=who)
-    return Said(error=f"`blaze check` exited {returncode} with no error of the test:\n{tail}")
+    return Said(error=f"`blaze {command}` exited {returncode} with no error of the test:\n{tail}")
 
 
-def said_together(stdout: str, members: Sequence[str], tail: str, who: str | None) -> dict[str, Said]:
-    """What one `blaze check --workspace` says of each member: its errors; accepted only when it
-    was checked (a `compiler-artifact` for it), never for having said nothing."""
-    errors, _, checked = cargo_messages(stdout)
+def said_together(stdout: str, members: dict[str, Path], base: Path, tail: str, who: str | None,
+                  command: str = "check") -> dict[str, Said]:
+    """What one `blaze check --workspace` says of each member (by its name, with its root
+    file): its errors; accepted only when it was checked (a `compiler-artifact` for it), never
+    for having said nothing."""
+    m = cargo_messages(stdout, base, members)
     said: dict[str, Said] = {}
     for member in members:
-        if errors.get(member):
-            said[member] = Said(errors[member], who=who)
-        elif member in checked:
+        if m.errors.get(member):
+            said[member] = Said(m.errors[member], who=who, spans=m.spans.get(member, ()))
+        elif member in m.checked:
             said[member] = Said(who=who)
         else:
-            said[member] = Said(error=f"`blaze check` said nothing of {member}: no error, no artifact:\n{tail}")
+            said[member] = Said(error=f"`blaze {command}` said nothing of {member}: no error, no artifact:\n{tail}")
     return said
 
 
-Category = Literal["same", "accepted", "other codes", "not blaze's", "error"]
+def span_mismatches(rustc: Placed, blaze: Placed) -> list[str]:
+    """Each key both sides gave whose primary spans differ (as multisets), with both sides'."""
+    theirs: dict[str, list[Span]] = {}
+    ours: dict[str, list[Span]] = {}
+    for key, span in rustc:
+        theirs.setdefault(key, []).append(span)
+    for key, span in blaze:
+        ours.setdefault(key, []).append(span)
+    found: list[str] = []
+    for key in sorted(theirs.keys() | ours.keys()):
+        a, b = sorted(theirs.get(key, [])), sorted(ours.get(key, []))
+        if a != b:
+            found.append(f"{key}: rustc at {', '.join(map(str, a)) or 'no span'}; "
+                         f"blaze at {', '.join(map(str, b)) or 'no span'}")
+    return found
 
 
-def verdict(rustc: frozenset[str], said: Said) -> tuple[report.Verdict, Category, str]:
+Category = Literal["same", "accepted", "other codes", "other spans", "not blaze's", "error"]
+
+
+def verdict(rustc: Reference, said: Said) -> tuple[report.Verdict, Category, str]:
     if said.error is not None:
         return "error", "error", said.error
     if said.who is not None:
         return "fail", "not blaze's", f"not blaze's: {said.who}"
-    shown = ", ".join(sorted(rustc))
+    shown = ", ".join(sorted(rustc.keys))
     if not said.keys:
         return "fail", "accepted", f"accepted what rustc rejects ({shown})"
-    if said.keys != rustc:
+    if said.keys != rustc.keys:
         return "fail", "other codes", (f"other codes: rustc {shown}; blaze {', '.join(sorted(said.keys))}"
-                                       f" (only blaze: {', '.join(sorted(said.keys - rustc)) or '-'}; "
-                                       f"only rustc: {', '.join(sorted(rustc - said.keys)) or '-'})")
+                                       f" (only blaze: {', '.join(sorted(said.keys - rustc.keys)) or '-'}; "
+                                       f"only rustc: {', '.join(sorted(rustc.keys - said.keys)) or '-'})")
+    if wrong := span_mismatches(rustc.spans, said.spans):
+        return "fail", "other spans", "other spans: " + "; ".join(wrong)
     return "pass", "same", shown
 
 
@@ -604,9 +742,15 @@ def manifest(name: str, unit: Unit) -> str:
 
 
 def check_args(unit: Unit, member: str | None) -> list[str]:
-    """`blaze check`'s arguments for one member (`-p`), or for the whole workspace (None)."""
+    """`blaze check`'s (or `build`'s) arguments for one member (`-p`), or for the whole
+    workspace (None)."""
     picked = ["-p", member] if member is not None else ["--workspace", "--keep-going"]
     return [*picked, *KIND_ARGS[unit.kind], "--message-format=json"]
+
+
+def root_of(ws: Path, name: str, unit: Unit) -> Path:
+    """The root file of the package `name` of `unit` in the workspace `ws`."""
+    return ws / "crates" / name / "src" / ("main.rs" if unit.kind == "bin" else "lib.rs")
 
 
 def batches_of(units: Sequence[Unit], size: int) -> list[list[Unit]]:
@@ -626,7 +770,7 @@ def write_workspace(ws: Path, index: int, units: Sequence[Unit]) -> tuple[dict[s
         name = f"u{index}_{i}"
         crate = ws / "crates" / name
         (crate / "src").mkdir(parents=True)
-        root = crate / "src" / ("main.rs" if unit.kind == "bin" else "lib.rs")
+        root = root_of(ws, name, unit)
         shutil.copyfile(unit.path, root)
         why: str | None = uitest.copy_named(unit.path, str(root), unit.path)
         if why:
@@ -652,36 +796,41 @@ def reference(unit: Unit, scratch: Path, env: dict[str, str], kept: engine.Kept,
             ran = engine.run(f"rustc {unit.label}", rustc_argv(unit, out), cwd, env, RUSTC_SECS)
         except engine.Failed as e:
             return Reference(error=str(e)), False
-        ref = reference_of(ran.returncode, ran.stderr)
+        ref = reference_of(ran.returncode, ran.stderr, Path(unit.path))
         if ref.error is None and (read := what_was_read(Path(out), cwd)) is not None:
             files, variables = read
             kept.put(key, dict(files=[list(f) for f in files], env=[list(v) for v in variables],
-                               keys=sorted(ref.keys), out=ref.out))
+                               keys=sorted(ref.keys), out=ref.out, spans=kept_spans(ref.spans)))
     return ref, False
 
 
-def run_batch(eng: engine.Engine, index: int, units: Sequence[Unit], work: Path, store: Path, whole: bool) -> Batch:
+def run_batch(eng: engine.Engine, index: int, units: Sequence[Unit], work: Path, store: Path, whole: bool,
+              command: Literal["check", "build"] = "check") -> Batch:
+    """`blaze COMMAND` (check, or build where the programs are to be run) of a workspace of
+    `units`, under its own daemon; the daemon is stopped at the end."""
     ws, home = work / "ws" / str(index), work / "h" / str(index)
     shutil.rmtree(ws, ignore_errors=True)
     members, out = write_workspace(ws, index, units)
     packages = {unit.label: str(ws / "crates" / name) for name, unit in members.items()}
     if not members:
         return Batch(str(ws), out=tuple(out), packages=packages)
+    roots = {name: root_of(ws, name, unit) for name, unit in members.items()}
     env = eng.env(home, store, extra={"RUSTFLAGS": " ".join((*COMMON, *units[0].flags))})
     said: list[tuple[Unit, Said]] = []
     stopped: str | None = None
     try:
         if whole:
             first = next(iter(members.values()))
-            ran = eng.build(f"blaze check of workspace {index}", ws, env, check_args(first, None), command="check",
-                            timeout=CHECK_SECS)
-            got = said_together(ran.stdout, list(members), ran.said(600), eng.not_blazes(ran))
+            ran = eng.build(f"blaze {command} of workspace {index}", ws, env, check_args(first, None),
+                            command=command, timeout=CHECK_SECS)
+            got = said_together(ran.stdout, roots, ws, ran.said(600), eng.not_blazes(ran), command)
             said += [(unit, got[name]) for name, unit in members.items()]
         else:
             for name, unit in members.items():
-                ran = eng.build(f"blaze check of {unit.label}", ws, env, check_args(unit, name), command="check",
+                ran = eng.build(f"blaze {command} of {unit.label}", ws, env, check_args(unit, name), command=command,
                                 timeout=CHECK_SECS)
-                said.append((unit, said_alone(ran.returncode, ran.stdout, ran.said(600), eng.not_blazes(ran))))
+                said.append((unit, said_alone(ran.returncode, ran.stdout, ran.said(600), eng.not_blazes(ran), ws,
+                                              roots[name], command)))
     except (engine.Unmeasurable, engine.Failed) as e:
         why = f"unmeasured: {e}" if isinstance(e, engine.Unmeasurable) else str(e)
         done = {unit.label for unit, _ in said}
@@ -765,7 +914,7 @@ def main(args: Input) -> None:
     fixed = fixed_cases(host) if args.fixed else []
     rep = report.Report(SCRIPT, args.engine, args.out)
     every = [*candidates, *(unit for unit, _, _ in fixed)]
-    kept = engine.Kept(args.cache, "rustc")
+    kept = engine.Kept(args.cache, KEPT_KIND)
     try:
         toolchain = engine.toolchain_identity(env)
     except engine.Failed as e:
@@ -806,7 +955,7 @@ def main(args: Input) -> None:
                 rep.add(f"stopping the daemon of {batch.ws}", "error", batch.stopped)
             passed = True
             for unit, said in batch.said:
-                result, category, detail = verdict(references[unit.label].keys, said)
+                result, category, detail = verdict(references[unit.label], said)
                 (fixed_categories if unit.label in issues else categories)[category] += 1
                 passed &= result == "pass"
                 if unit.label in issues:
@@ -817,10 +966,12 @@ def main(args: Input) -> None:
             if passed and not args.keep:
                 shutil.rmtree(batch.ws, ignore_errors=True)
     in_scope = sum(categories.values())
-    same, accepted = categories["same"], categories["accepted"]
+    # The floor counts rustc's codes; a unit with them at other places is a fail of its own.
+    same, accepted = categories["same"] + categories["other spans"], categories["accepted"]
     if args.rust:
         rep.add("floor: units of tests/ui with rustc's codes", "pass" if same >= args.min_same else "fail",
-                f"{same} of {in_scope}; the floor is {args.min_same}", same=same, floor=args.min_same)
+                f"{same} of {in_scope} ({categories['same']} at rustc's primary spans too); the floor is "
+                f"{args.min_same}", same=same, same_spans=categories["same"], floor=args.min_same)
         rep.add("ceiling: units of tests/ui accepted that rustc rejects", "pass" if accepted <= args.max_accepted
                 else "fail", f"{accepted} of {in_scope}; the ceiling is {args.max_accepted}", accepted=accepted,
                 ceiling=args.max_accepted)
@@ -922,9 +1073,19 @@ def test_shard() -> None:
     assert all(shards), "a shard of 200 files is empty"
 
 
-def diagnostic(level: str, message: str, code: str | None = None) -> str:
+def span_json(file_name: str, line: int, column: int, end_line: int, end_column: int,
+              primary: bool = True) -> dict[str, Any]:
+    return {"file_name": file_name, "byte_start": 0, "byte_end": 1, "line_start": line, "line_end": end_line,
+            "column_start": column, "column_end": end_column, "is_primary": primary, "text": [], "label": None,
+            "suggested_replacement": None, "suggestion_applicability": None, "expansion": None}
+
+
+def diagnostic(level: str, message: str, code: str | None = None, spans: Sequence[dict[str, Any]] = ()) -> str:
     return json.dumps({"$message_type": "diagnostic", "level": level, "message": message,
-                       "code": {"code": code, "explanation": None} if code else None, "spans": []})
+                       "code": {"code": code, "explanation": None} if code else None, "spans": list(spans)})
+
+
+UI_ROOT = Path("/ui/t.rs")
 
 
 def test_keys() -> None:
@@ -935,10 +1096,45 @@ def test_keys() -> None:
     stderr = "\n".join([diagnostic("error", "mismatched types", "E0308"), diagnostic("warning", "unused", "unused"),
                         diagnostic("error", "`f` is not yet stable as a const fn"),
                         diagnostic("error", "aborting due to 2 previous errors"), "not json"])
-    assert reference_of(1, stderr) == Reference(frozenset({"E0308", "message: `_` is not yet stable as a const fn"}))
-    assert reference_of(0, "").out is not None and reference_of(0, "").error is None
-    assert reference_of(1, "error: linking failed").error is not None
-    assert reference_of(101, diagnostic("error: internal compiler error", "boom")).out == "rustc crashes on it"
+    assert reference_of(1, stderr, UI_ROOT) == Reference(
+        frozenset({"E0308", "message: `_` is not yet stable as a const fn"}))
+    assert reference_of(0, "", UI_ROOT).out == ACCEPTED and reference_of(0, "", UI_ROOT).error is None
+    assert reference_of(1, "error: linking failed", UI_ROOT).error is not None
+    assert reference_of(101, diagnostic("error: internal compiler error", "boom"), UI_ROOT).out == CRASHES
+
+
+def test_spans() -> None:
+    root = Path("/ui/sub/t.rs")
+    assert place("/ui/sub/t.rs", Path("/elsewhere"), root) == ROOT_FILE
+    assert place("t.rs", Path("/ui/sub"), root) == ROOT_FILE
+    assert place("/ui/sub/helper/m.rs", Path("/"), root) == "helper/m.rs"
+    assert place("crates/u0_0/src/m.rs", Path("/ws"), Path("/ws/crates/u0_0/src/main.rs")) == "m.rs"
+    assert place("/rustc/0123abcd/library/core/src/fmt/mod.rs", Path("/"), root) == STD_FILE + "core/src/fmt/mod.rs"
+    assert place("/home/me/.rustup/lib/rustlib/src/rust/library/core/src/fmt/mod.rs", Path("/"), root) == \
+        STD_FILE + "core/src/fmt/mod.rs"
+    assert place("/ui/other/t.rs", Path("/"), root) == "/ui/other/t.rs", "a file outside the unit's directory"
+    rustc = diagnostic("error", "cannot find value `x` in this scope", "E0425",
+                       [span_json(str(root), 3, 5, 3, 6), span_json(str(root), 1, 1, 1, 2, primary=False)])
+    ref = reference_of(1, rustc, root)
+    assert ref.spans == (("E0425", Span(ROOT_FILE, 3, 5, 3, 6)),), ref
+    # The same error as blaze prints it through cargo: relative to the workspace, at the package's copy.
+    ws = Path("/ws")
+    stdout = message("compiler-message", "u0_0", diagnostic("error", "cannot find value", "E0425",
+                                                            [span_json("crates/u0_0/src/main.rs", 3, 5, 3, 6)]))
+    said = said_alone(101, stdout, "", None, ws, root_of(ws, "u0_0", Unit("t.rs", "", None, "bin", "2021")))
+    assert said.keys == {"E0425"} and said.spans == ref.spans, said
+    assert verdict(ref, said)[:2] == ("pass", "same")
+    moved = Said(said.keys, spans=(("E0425", Span(ROOT_FILE, 3, 5, 3, 7)),))
+    result, category, detail = verdict(ref, moved)
+    assert (result, category) == ("fail", "other spans"), (result, category)
+    assert "E0425: rustc at <root>:3:5-3:6; blaze at <root>:3:5-3:7" in detail, detail
+    twice = Reference(frozenset({"E0425"}), spans=(("E0425", Span(ROOT_FILE, 1, 1, 1, 2)),) * 2)
+    once = Said(frozenset({"E0425"}), spans=(("E0425", Span(ROOT_FILE, 1, 1, 1, 2)),))
+    assert verdict(twice, once)[1] == "other spans", "two errors of one code at one place are two spans"
+    assert span_mismatches((), ()) == []
+    bad = json.dumps({"level": "error", "message": "m", "code": None,
+                      "spans": [{"is_primary": True, "file_name": 3}, "x", {"is_primary": True}]})
+    assert reference_of(1, bad, root).spans == (), "a malformed span is not read"
 
 
 def message(reason: str, target: str, body: str | None = None) -> str:
@@ -949,26 +1145,33 @@ def message(reason: str, target: str, body: str | None = None) -> str:
 
 
 def test_cargo_messages() -> None:
-    stdout = "\n".join([message("compiler-message", "u0_0", diagnostic("error", "missing field", "E0063")),
+    ws = Path("/ws")
+    lib = Unit("a.rs", "", None, "lib", "2021")
+    roots = {name: root_of(ws, name, lib) for name in ("u0_0", "u0_1", "u0_2")}
+    at = [span_json("crates/u0_0/src/lib.rs", 2, 1, 2, 9)]
+    stdout = "\n".join([message("compiler-message", "u0_0", diagnostic("error", "missing field", "E0063", at)),
                         message("compiler-message", "u0_0", diagnostic("warning", "unused", "dead_code")),
                         message("compiler-artifact", "u0_1"), '{"reason":"build-finished","success":false}'])
-    errors, every, checked = cargo_messages(stdout)
-    assert errors == {"u0_0": frozenset({"E0063"})} and every == frozenset({"E0063"}) and checked == {"u0_1"}
-    together = said_together(stdout, ["u0_0", "u0_1", "u0_2"], "", None)
+    m = cargo_messages(stdout, ws, roots)
+    assert m.errors == {"u0_0": frozenset({"E0063"})} and m.every == frozenset({"E0063"}) and m.checked == {"u0_1"}
+    assert m.spans == {"u0_0": (("E0063", Span(ROOT_FILE, 2, 1, 2, 9)),)}, m.spans
+    together = said_together(stdout, roots, ws, "", None)
     assert together["u0_0"].keys == {"E0063"} and together["u0_1"] == Said() and together["u0_2"].error
-    assert said_alone(101, stdout, "", None).keys == {"E0063"}
-    assert said_alone(0, "", "", None) == Said()
-    assert said_alone(101, "", "", None).error is not None
+    assert together["u0_0"].spans == m.spans["u0_0"]
+    assert said_alone(101, stdout, "", None, ws, roots["u0_0"]).keys == {"E0063"}
+    assert said_alone(0, "", "", None, ws, roots["u0_0"]) == Said()
+    assert said_alone(101, "", "", None, ws, roots["u0_0"]).error is not None
+    assert "`blaze build` exited" in str(said_alone(101, "", "", None, ws, roots["u0_0"], "build").error)
 
 
 def test_verdict() -> None:
-    rustc = frozenset({"E0063"})
+    rustc = Reference(frozenset({"E0063"}))
     assert verdict(rustc, Said(frozenset({"E0063"})))[:2] == ("pass", "same")
     assert verdict(rustc, Said())[:2] == ("fail", "accepted")
     assert verdict(rustc, Said())[2].startswith("accepted what rustc rejects")
     assert verdict(rustc, Said(frozenset({"E0308"})))[:2] == ("fail", "other codes")
     assert verdict(rustc, Said(frozenset({"E0063", "E0308"})))[1] == "other codes"
-    assert verdict(rustc, Said(rustc, who="cargo"))[:2] == ("fail", "not blaze's")
+    assert verdict(rustc, Said(rustc.keys, who="cargo"))[:2] == ("fail", "not blaze's")
     assert verdict(rustc, Said(error="timed out"))[:2] == ("error", "error")
 
 
@@ -1038,10 +1241,11 @@ def test_kept_answers() -> None:
         assert read is not None and [p for p, _ in read[0]] == sorted([str(main), str(module)]), read
         kept = engine.Kept(str(root / "kept"), "rustc")
         files_read, env_read = read
+        spans: Placed = (("E0063", Span(ROOT_FILE, 2, 1, 2, 9)), ("E0063", Span("a b/m.rs", 1, 1, 1, 3)))
         kept.put("k", dict(files=[list(f) for f in files_read], env=[list(v) for v in env_read],
-                           keys=["E0063"], out=None))
+                           keys=["E0063"], out=None, spans=kept_spans(spans)))
         env = {"SET": "1"}
-        assert kept_reference(kept.get("k"), env, "k") == Reference(frozenset({"E0063"}))
+        assert kept_reference(kept.get("k"), env, "k") == Reference(frozenset({"E0063"}), spans=placed_of(spans))
         assert kept_reference(kept.get("k"), {"SET": "2"}, "k") is None, "a variable changed"
         assert kept_reference(kept.get("k"), {"SET": "1", "UNSET": "x"}, "k") is None, "a variable unset is set"
         module.write_text("fn g() {}\n")
@@ -1049,19 +1253,26 @@ def test_kept_answers() -> None:
         module.unlink()
         assert kept_reference(kept.get("k"), env, "k") is None, "a module it read is gone"
         assert kept_reference(None, env, "k") is None
-        for bad in ([], {"files": [["a"]], "env": [], "keys": [], "out": None}, {"files": [], "env": [], "keys": []}):
+        for bad in ([], {"files": [["a"]], "env": [], "keys": [], "out": None, "spans": []},
+                    {"files": [], "env": [], "keys": [], "spans": []},
+                    {"files": [], "env": [], "keys": [], "out": None},
+                    {"files": [], "env": [], "keys": [], "out": None, "spans": [["E0063", "f", 1, 2]]}):
             try:
                 kept_reference(bad, env, "k")
             except engine.Failed:
                 continue
             raise AssertionError(f"a kept answer of another shape was taken: {bad}")
-    unit = Unit("t.rs", "/x/t.rs", None, "lib", "2021")
-    assert "--emit=dep-info,metadata" in rustc_argv(unit, "/o")
+    unit = Unit("t.rs", "/x/t.rs", None, "lib", "2021", ("--cfg", "a"))
+    argv = rustc_argv(unit, "/o")
+    assert "--emit=dep-info,metadata" in argv and argv[-2:] == ["--out-dir", "/o"], argv
+    built = rustc_argv(unit, "/o", emit="dep-info,link", output="/o/p", extra=("-C", "debug-assertions=on"))
+    assert "--emit=dep-info,link" in built and built[-2:] == ["-o", "/o/p"] and "--out-dir" not in built, built
+    assert built.index("debug-assertions=on") < built.index("a"), "the unit's own flags come last"
 
 
 SELFTESTS = (test_directives, test_classify_modes, test_classify_scope, test_classify_shape, test_flag_of,
-             test_host_names, test_shard, test_keys, test_cargo_messages, test_verdict, test_header, test_packages,
-             test_fixed_cases, test_kept_answers)
+             test_host_names, test_shard, test_keys, test_spans, test_cargo_messages, test_verdict, test_header,
+             test_packages, test_fixed_cases, test_kept_answers)
 
 
 def selftest() -> int:

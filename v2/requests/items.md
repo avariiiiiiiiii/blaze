@@ -780,6 +780,8 @@ which never changes. `for_crate` merges the module tables in module order, so ev
 its impls in the order the old walk found them (same order of modules, same order inside each
 module, blocks of bodies inside their module), and `frozen::encode`/`check` see the same table.
 
+> taken by requests (pass 22): the preconditions are in the tree (`mod facts;`, `module_impls` re-export, db-ty nine kinds); child `requests-impls` applies parts 1 to 4 and writes its outcome here.
+
 ### 1. `crates/hir-ty/src/method_resolution.rs`
 
 1a. Import (L35). Old:

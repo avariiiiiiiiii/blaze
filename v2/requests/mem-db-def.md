@@ -71,27 +71,12 @@ API is safe).
 
 A test binary has one global allocator, and every budget test of a crate shares it.
 
-- **hir-def**: `crates/hir-def/src/nameres/tests/paths.rs:718-778` installs its own
-  (`#[global_allocator] static ALLOCATOR: alloc_count::Counting` and `mod alloc_count`, a copy
-  of what `blaze-alloc-count` is). Delete those lines, and in `crates/hir-def/src/lib.rs`
-  after `mod test_db;` (`:53-54`) add:
-  ```rust
-  #[cfg(test)]
-  #[global_allocator]
-  static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
-  ```
-  `resolved_path_allocates_nothing` (`paths.rs:696-716`) changes its count to the crate's:
-  ```rust
-  // before
-  let (res, allocations) = alloc_count::count(resolve);
-  assert_eq!(Res::from(res), Res::from(warm));
-  assert_eq!(allocations, 0);
-  // after
-  let res = blaze_alloc_count::assert_at_most(0, "resolving a path on a warm def map", resolve);
-  assert_eq!(Res::from(res), Res::from(warm));
-  ```
-  `speed-hir-sol-defs`' `src/alloc_budgets.rs` (its `mod` line requested by it) measures with
-  `blaze_alloc_count` and needs this allocator too: with it, nothing else is to add.
+- **hir-def**: the same change as `v2/requests/db-expand.md` "1. The crate's allocation-budget
+  harness" (a) to (c), filed first by speed-hir-sol-defs: the dev-dependency, one
+  `#[cfg(test)] #[global_allocator] static ALLOC: blaze_alloc_count::Counting` in `lib.rs` after
+  `mod test_db;` (with its `mod alloc_budgets;`), and `nameres/tests/paths.rs:718-778`'s own
+  allocator and `mod alloc_count` deleted, its one use moved to `blaze_alloc_count::measure`.
+  Apply it once, from there; nothing here adds to it.
 - **hir-expand**: the same three lines inside `crates/hir-expand/src/lib.rs`'s
   `#[cfg(test)] mod tests` (`:1977-1978`), at its top.
 - **hir**: the same three lines in `crates/hir/src/lib.rs` after `mod tests;` (`:41-42`).
@@ -935,70 +920,71 @@ and `an_unchanged_view_allocates_nothing` (`:130-141`) also sets its view with
 that has one): `set_view` there gains a `built: &[AbsPathBuf]` parameter, passed `&[]` by the
 other test.
 
-**`crates/base-db/src/tests.rs`** (which installs `blaze_alloc_count::Counting`; add
-`use crate::Files;` only if needed, everything below goes through `Db`):
+**The rest of B's budget tests, also in `budget_tests.rs`** (one set of budget tests for
+base-db, on that file's helpers; nothing goes in `tests.rs`). A view edit needs no test of its
+own: `a_changed_file_costs_a_constant` with one edited file holds it at
+`PER_CALL + PER_CHANGED_FILE` = 3.
+
+Imports (`:13-16`) gain `CrateBuilderId`, `CrateName`, `DependencyBuilder` and `FileText`.
+`loaded`'s `graph.add_crate_root(..)` call (`:33-50`) moves into a helper it calls as
+`lib_root(&mut graph, files[0]);`:
 ```rust
-/// Sets each of `texts` in turn on `file`, `rounds` times: what a warm editor does.
-fn type_into(db: &mut Db, file: FileId, texts: &[&str], rounds: usize) {
-    for _ in 0..rounds {
-        for text in texts {
-            db.set_file_text(file, text);
-        }
-    }
+/// A library crate rooted at `root`, with no cfg, env or dependencies.
+fn lib_root(graph: &mut CrateGraphBuilder, root: FileId) -> CrateBuilderId {
+    graph.add_crate_root(
+        root,
+        Edition::Edition2021,
+        None,
+        None,
+        Default::default(),
+        None,
+        Env::default(),
+        CrateOrigin::Local { repo: None, name: None },
+        Vec::new(),
+        TargetKind::Lib { is_proc_macro: false },
+        Arc::new(AbsPathBuf::assert_utf8(std::env::temp_dir())),
+        Arc::new(CrateWorkspaceData {
+            target: Err("no target in budget tests".into()),
+            toolchain: None,
+            const_eval: Default::default(),
+        }),
+    )
 }
 
 #[test]
 fn a_keystroke_allocates_only_its_text_and_slot() {
-    let mut db = Db::for_tests();
-    let files = load(&mut db, 0, FILES);
-    type_into(&mut db, files[1], &["pub fn f() {}", "pub fn fg() {}"], 4);
-    let content = db.source_root(SourceRootId(0)).content(&db);
-    blaze_alloc_count::assert_at_most(2, "a keystroke: the text's Arc and its Reparse slot", || {
-        db.set_file_text(files[1], "pub fn f() {}")
-    });
-    assert_ne!(db.source_root(SourceRootId(0)).content(&db), content);
-    assert_eq!(db.file_text(files[1]).content(&db), FileText::content_of("pub fn f() {}", None));
-}
-
-#[test]
-fn a_view_edit_allocates_only_its_text_slot_and_change() {
-    let mut db = Db::for_tests();
-    let (base, partition) = checkout(&mut db);
-    let edited: &[(&str, &[u8])] =
-        &[("src/lib.rs", b"mod a;"), ("src/a.rs", b"fn g() {}"), ("README.md", b"hello")];
+    let (mut db, files) = loaded();
     for _ in 0..4 {
-        set_view(&mut db, &base, &partition, VIEW).unwrap();
-        set_view(&mut db, &base, &partition, edited).unwrap();
+        db.set_file_text(files[1], "fn f() { 2 }\n");
+        db.set_file_text(files[1], "fn f() { 1 }\n");
     }
-    let files: Vec<ViewFile<'_>> =
-        VIEW.iter().map(|&(path, bytes)| ViewFile { path, file: vfs_file(bytes) }).collect();
-    let view = ViewRoot { base: &base, built: &[], partition: &partition, other: SourceRootId(1), files: &files };
-    let a = file_at(&db, &base, "src/a.rs").unwrap();
-    let change = blaze_alloc_count::assert_at_most(
-        3,
-        "a view with one file edited: the text's Arc, its Reparse slot and `ViewChange::set`",
-        || db.set_view_root(view).unwrap(),
-    );
-    assert_eq!(change, ViewChange { set: vec![a], ..ViewChange::default() });
+    let content = db.source_root(SourceRootId(0)).content(&db);
+    let ((), used) = blaze_alloc_count::measure(|| db.set_file_text(files[1], "fn f() { 2 }\n"));
+    // The file's `Arc<str>` and its reparse slot; the setter's batches are in its frame.
+    assert!(used.allocations <= 2, "a keystroke in a root of {FILES} files: {used:?}");
+    assert_ne!(db.source_root(SourceRootId(0)).content(&db), content);
+    assert_eq!(db.file_text(files[1]).content(&db), FileText::content_of("fn f() { 2 }\n", None));
 }
 
 #[test]
 fn crate_deps_are_memo_hits() {
-    let mut db = Db::for_tests();
-    let files = load(&mut db, 0, FILES);
+    let (mut db, files) = loaded();
     let mut graph = CrateGraphBuilder::default();
-    let a = add(&mut graph, files[0], cfg(&[]), Env::default());
-    let c = add(&mut graph, files[2], cfg(&[]), Env::default());
-    depend(&mut graph, a, c, "c");
+    let a = lib_root(&mut graph, files[0]);
+    let c = lib_root(&mut graph, files[2]);
+    graph.add_dep(a, DependencyBuilder::new(CrateName::new("c").unwrap(), c)).unwrap();
     let ids = graph.set_in_db(&mut db);
     let (a, c) = (ids[&a], ids[&c]);
     assert_eq!(a.transitive_deps(&db), &[a, c]);
     assert_eq!(c.transitive_rev_deps(&db), &[c, a]);
-    blaze_alloc_count::assert_at_most(0, "transitive deps, warm", || a.transitive_deps(&db).len());
-    blaze_alloc_count::assert_at_most(0, "transitive reverse deps, warm", || c.transitive_rev_deps(&db).len());
+    let (_, used) = blaze_alloc_count::measure(|| {
+        a.transitive_deps(&db).len() + c.transitive_rev_deps(&db).len()
+    });
+    assert_eq!(used.allocations, 0, "crate deps, warm: {used:?}");
 }
 ```
-plus, beside `a_table_finds_what_a_hash_map_does`, the `Column` and `Log` tests of B4.
+The `Column` and `Log` reference tests of B4 are tests of `table.rs`, not budgets: they go
+beside `a_table_finds_what_a_hash_map_does` (`tests.rs:422`).
 
 **`crates/base-db/src/db/tests.rs`**, beside `run_all_of_nothing_runs_nothing`:
 ```rust
@@ -1050,6 +1036,11 @@ the same heading. The RNG is `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/src
   (it now also refuses a 5th byte carrying bits past 32, which the loop dropped).
 
 > forwarded to mem-db-def (from requests, pass 17; told by tmux).
+> applied by db-expand-names (owner of `frozen.rs`; checked by mem-db-def, 2026-10-29 21:16): nothing left to do. The cursor request
+> below covers both bullets and db-expand-names applied it: `frozen.rs:575-576` `Enc::u32` is
+> `self.out.put_uleb(it.into())` and `:2133-2134` `Dec::u32` is `Ok(self.r.uleb32()?)`
+> (`blaze_format::leb::read_u32`, refusing a 5th byte past 32 bits); no `self.bytes`/`self.at`
+> is left. The seeded-RNG half names no site in mem-db-def's crates.
 
 ## dedup: byte cursor onto blaze_format::cursor
 

@@ -456,7 +456,7 @@ pub(crate) fn round_active(db: &Db, round: RoundKey) -> RoundActive {
 
 /// Whether the component of the module at `at` of the round runs at the round.
 pub(crate) fn runs(db: &Db, round: RoundKey, at: u32) -> bool {
-    round_active(db, round).runs(partition(db, round).of(at))
+    unit::component_runs(db, round, partition(db, round).of(at))
 }
 
 /// The key that names the facts of the module at `at` of the round: the round's own while its

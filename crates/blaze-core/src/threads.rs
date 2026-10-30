@@ -920,6 +920,10 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::set_mode(path, mode)?;
             Ok(Done::Moded)
         }),
+        Effect::Times { file, modified_ns, .. } => at(root, &file, |path| {
+            fs::set_times(path, modified_ns)?;
+            Ok(Done::Timed)
+        }),
         Effect::Clone { from, to, .. } => at(root, &from, |from| {
             at(root, &to, |to| fs::clone(from, to))?;
             Ok(Done::Cloned)

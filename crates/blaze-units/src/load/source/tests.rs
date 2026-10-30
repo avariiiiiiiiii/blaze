@@ -13,9 +13,9 @@ use super::index::{Status, crate_url, dep_path, index_path, parse_line};
 use super::{Index, Located, Sources};
 use crate::load::files::{LoadDir, LoadFile, Mounts};
 use crate::load::invocation::Invocation as InvocationQuery;
+use crate::load::key_id;
 use crate::query::{
-    BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LoadError, Mount, Origin, Versioned,
-    key_input, producer,
+    BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LoadError, Mount, Origin, Versioned, producer,
 };
 
 const HOME: &str = "/home/u/.cargo";
@@ -77,7 +77,7 @@ impl Query for Locate {
     type Value = Cbor<Answer>;
 
     fn input(key: &Asked) -> ContentId {
-        key_input("blaze v2 cargo test locate key 1", key)
+        key_id("blaze v2 cargo test locate key 1", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &Asked) -> Result<Cbor<Answer>, Cancelled> {
@@ -115,7 +115,7 @@ impl Query for IndexQuery {
     type Value = Cbor<Versions>;
 
     fn input(key: &(bool, String, String)) -> ContentId {
-        key_input("blaze v2 cargo test index query key 1", key)
+        key_id("blaze v2 cargo test index query key 1", key)
     }
 
     fn execute(cx: &mut Cx<'_>, (offline, name, req): &(bool, String, String)) -> Result<Cbor<Versions>, Cancelled> {
@@ -181,7 +181,7 @@ fn locate(files: &[(&str, &str)], mounts: Vec<Mount>, asked: &Asked) -> Answer {
     let tree = Arc::new(MemTree::default());
     let db = database(&tree);
     let view = open(&db, &tree, files, mounts);
-    db.get::<Locate>(view, asked).expect("located").get()
+    db.pin().get::<Locate>(view, asked).expect("located").get()
 }
 
 fn needs(answer: Answer) -> Fetch {
@@ -355,7 +355,7 @@ fn versions(files: &[(&str, &str)], mounts: Vec<Mount>, offline: bool) -> Versio
     let tree = Arc::new(MemTree::default());
     let db = database(&tree);
     let view = open(&db, &tree, files, mounts);
-    db.get::<IndexQuery>(view, &(offline, "serde".to_owned(), "^1.0".to_owned())).expect("queried").get()
+    db.pin().get::<IndexQuery>(view, &(offline, "serde".to_owned(), "^1.0".to_owned())).expect("queried").get()
 }
 
 #[test]

@@ -5,7 +5,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
     time::Duration,
 };
 
@@ -117,7 +116,7 @@ impl Run {
         let mut bytes = Vec::new();
         self.vfs.disks.encode(&mut bytes);
         let len = bytes.len();
-        let section = Section::new(Mapping(Arc::new(bytes)), 0..len).expect("a section");
+        let section = Section::new(Mapping::copy(&bytes), 0..len).expect("a section");
         self.vfs.disks = Disks::open(section).expect("the column reopens");
         self.watcher = Watcher::new("disk", name("ws"), TAGS);
         (self.reads.clear(), self.stamped.clear(), self.out.clear());

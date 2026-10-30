@@ -7,6 +7,7 @@
 //! orders what the notes' §8 lets differ in order, and keeps everything else as it is.
 //! [`compare`] says, field by field, where two such forms differ.
 
+mod active;
 mod differential;
 mod generated;
 mod graph;

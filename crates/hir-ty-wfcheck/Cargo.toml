@@ -13,6 +13,7 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+hashbrown.workspace = true
 intern.workspace = true
 la-arena.workspace = true
 rustc-hash.workspace = true
@@ -24,10 +25,12 @@ rustc_type_ir.workspace = true
 # local deps
 base-db.workspace = true
 blaze-format.workspace = true
+blaze-mem.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 # The tests' database links hir-ty-mir for the MIR providers.
 hir-ty-mir.workspace = true
 test-fixture.workspace = true

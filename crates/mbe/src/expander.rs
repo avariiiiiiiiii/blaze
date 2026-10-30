@@ -8,6 +8,7 @@ pub(crate) mod model;
 mod transcriber;
 
 use base_db::Db;
+use blaze_mem::frame::Frame;
 use span::Span;
 
 pub(crate) use self::matcher::Matcher;
@@ -27,25 +28,40 @@ pub(crate) fn expand_rules(
     call_style: MacroCallStyle,
     call_site: Span,
 ) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex)> {
-    // One arena for every rule tried, and two matches swapped between the best so far and the
-    // one being made, so a rule after the first allocates only where it outgrows them.
-    let mut arena = matcher::Arena::default();
-    let mut scratch = matcher::Match::default();
-    let mut best: Option<(matcher::Match<'_>, usize)> = None;
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        expand_rules_in(frame, db, rules, input, marker, call_style, call_site)
+    })
+}
+
+/// [`expand_rules`] with every match and transcription temporary in `frame`.
+fn expand_rules_in<'t>(
+    frame: &'t Frame,
+    db: &Db,
+    rules: &[crate::Rule],
+    input: &'t tt::TopSubtree,
+    marker: impl Fn(&mut Span) + Copy,
+    call_style: MacroCallStyle,
+    call_site: Span,
+) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex)> {
+    // One set of buffers for every rule tried, and two matches swapped between the best so far
+    // and the one being made, so a rule after the first allocates only where it outgrows them.
+    let mut buffers = matcher::Buffers::new_in(frame);
+    let mut scratch = matcher::Match::new_in(frame);
+    let mut best: Option<(matcher::Match<'t>, usize)> = None;
     for (idx, rule) in rules.iter().enumerate() {
         // Skip any rules that aren't relevant to the call style (fn-like/attr/derive).
         if call_style != rule.style {
             continue;
         }
 
-        matcher::match_(db, &rule.matcher, input, &mut arena, &mut scratch);
+        matcher::match_(db, &rule.matcher, input, &mut buffers, &mut scratch);
 
         if scratch.err.is_none() {
             // If we find a rule that applies without errors, we're done.
             // Unconditionally returning the transcription here makes the
             // `test_repeat_bad_var` test fail.
             let ExpandResult { value, err: transcribe_err } =
-                transcriber::transcribe(&rule.rhs, &scratch.bindings, marker, call_site);
+                transcriber::transcribe(&rule.rhs, &scratch.bindings, frame, marker, call_site);
             if transcribe_err.is_none() {
                 return ExpandResult::ok((value, Some(idx as u32)));
             }
@@ -60,17 +76,19 @@ pub(crate) fn expand_rules(
                     *prev_idx = idx;
                 }
             }
-            None => best = Some((std::mem::take(&mut scratch), idx)),
+            None => {
+                best = Some((std::mem::replace(&mut scratch, matcher::Match::new_in(frame)), idx))
+            }
         }
     }
     if let Some((match_, idx)) = best {
         // if we got here, there was no match without errors
         let rule = &rules[idx];
         let ExpandResult { value, err: transcribe_err } =
-            transcriber::transcribe(&rule.rhs, &match_.bindings, marker, call_site);
+            transcriber::transcribe(&rule.rhs, &match_.bindings, frame, marker, call_site);
         // What rustc says when no rule matches; its ambiguity errors are the matcher's own.
         let match_err = match_.err.map(|err| {
-            matcher::match_failure(db, rules, input, call_style).unwrap_or(err)
+            matcher::match_failure(db, frame, rules, input, call_style).unwrap_or(err)
         });
         ExpandResult { value: (value, idx.try_into().ok()), err: match_err.or(transcribe_err) }
     } else {
@@ -111,21 +129,21 @@ pub(crate) fn expand_rules(
 /// e -> [[1, 2, 3], [4, 5, 6]]
 /// ```
 ///
-/// The matcher builds the trees once a match is over ([`matcher::Arena`]). The transcriber
+/// The matcher builds the trees once a match is over ([`matcher::Buffers`]). The transcriber
 /// substitutes them, keeping a `nesting` stack of indices which says which occurrence it takes
 /// at each level; it pushes to the stack when it enters a repetition.
 ///
 /// A variable is its [`Binder`], numbered when the macro was defined, so a lookup indexes
 /// `roots` and never hashes a name. The trees are flat: `nodes` (12 bytes each) with each
 /// `Nested` node's iterations a CSR range of `children`; a step down a level is one index.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Bindings<'a> {
     /// Per binder: its tree, an index into `nodes`, or [`NONE`] when the match bound nothing
     /// to it.
-    roots: Vec<u32>,
-    nodes: Vec<Binding>,
-    children: Vec<u32>,
-    fragments: Vec<Fragment<'a>>,
+    roots: Vec<u32, &'a Frame>,
+    nodes: Vec<Binding, &'a Frame>,
+    children: Vec<u32, &'a Frame>,
+    fragments: Vec<Fragment<'a>, &'a Frame>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +162,15 @@ enum Binding {
 const _: () = assert!(size_of::<Binding>() == 12);
 
 impl<'a> Bindings<'a> {
+    fn new_in(frame: &'a Frame) -> Self {
+        Bindings {
+            roots: Vec::new_in(frame),
+            nodes: Vec::new_in(frame),
+            children: Vec::new_in(frame),
+            fragments: Vec::new_in(frame),
+        }
+    }
+
     fn clear(&mut self) {
         self.roots.clear();
         self.nodes.clear();

@@ -36,7 +36,9 @@ compare with the storage's nonce), the memo's page and slot (3 to 4 dependent lo
 query: 25 to 30 cycles, 6 to 8 ns at 4 GHz. The target is that a hit compiles to exactly that,
 inlined into its caller, with no call of any kind on the path (the miss paths stay out of line,
 as salsa has them: `fetch_unclaimed`, `fetch_cold`). The four indirect calls above are what is
-between today and that bound; with them gone, nothing else is on the path.
+between today and that bound; with them gone, nothing else is on the path. The check for a
+stop (`stop_readers`, below) adds one load from the `Runtime` the revision check already reads
+and a branch that is never taken: about 1 cycle, inside the 10%.
 
 The state of the art is rustc's query system: `tcx.type_of(def)` is a static call of
 `query_get_at`, whose hit is a `VecCache` probe (2 to 3 dependent loads) and a dependency-graph
@@ -103,9 +105,9 @@ hir-ty's queries can't be inherent methods of a type base-db declares. `HirDatab
 name callers import, but it is now a sealed extension trait implemented once, `impl HirDatabase for
 base_db::Db`, in hir-ty. A call `db.ty(def)` on `db: &Db` resolves statically to that impl, and
 every method is `#[inline]` over the tracked function. The trait gets an associated const
-(`const SEALED: Sealed;`), which makes it not dyn-compatible: `dyn HirDatabase` no longer compiles,
-so it cannot come back. The `hir_database_is_dyn_compatible` test becomes its opposite, a
-`compile_fail` doc test.
+(`const NOT_DYN: ();`), which makes it not dyn-compatible: `dyn HirDatabase` no longer compiles,
+so it cannot come back. The `hir_database_is_dyn_compatible` test is deleted, and no test
+replaces it: the const enforces it, and hir-ty keeps `doctest = false`.
 
 `as_dyn()` is deleted (35 uses become `db`).
 
@@ -182,6 +184,33 @@ rust-analyzer's switch for not expanding attribute macros in an editor; rustc al
 them, so hir-def's `ExpandProcAttrMacros` input and the check in `nameres/collector.rs` are
 deleted, and attribute macros always expand.
 
+### Readers that outlive a borrow, and the write that stops them
+
+`Db` has no `Clone`: there is one database, never a fork. Scoped work borrows `&Db`, and the
+borrow checker keeps every write (`&mut Db`) out until it ends. The daemon also reads from
+threads that outlive any borrow: a detached build, a tiering thread. Under rust-analyzer's
+salsa each took a clone, and a write to the owner's handle cancelled the clones and waited for
+them to drop. Both halves are now explicit:
+
+- Stopping: `salsa::Database::stop_readers(&self)` sets a flag in salsa's `Runtime` that every
+  query call checks, the same call that checks a task's own `CancellationToken`. A set flag
+  unwinds with `Cancelled::PendingWrite`, inside cycle heads too. A task's own token is
+  disabled there, and inference and MIR building, which take the time, run there. The next
+  `&mut` access (`prepare_write`) clears the flag, and its cancellation epoch tells apart the
+  provisional memos the stopped readers left behind (salsa's `cancellation_in_fixpoint.rs`).
+  Upstream salsa's pending-write flag was checked at the same point. The hit pays one
+  `Relaxed` load from `Runtime`, which it reads anyway for the current revision, plus a branch
+  that is never taken: about 0.3 ns.
+- Waiting: `base_db::Shared` owns the `Db` in an `Arc` and hands out `Reader`s. `write()` stops
+  the readers if any is held, waits on a condvar until the last `Reader` drops, and clears a
+  stop made since the last write. `idle()` returns the database only when no reader holds it,
+  and stops none: for a write that can wait, such as a memory report. There is no `DerefMut`,
+  because an `&mut` taken only to read would stop every reader.
+- In blaze-engine, `lower_until` stops its scoped workers with `stop_readers` once the build
+  stops waiting, and clears the stop after the scope. `run_holding`'s database is a `Shared`:
+  the detached builds and `compile_tiered` hold `Reader`s, `Builds::settle` stops them where it
+  called `trigger_cancellation`, and every write says `db.write()`.
+
 ## The migration
 
 The work is mechanical at 2,745 sites, and the rest is a short list per crate.
@@ -221,8 +250,13 @@ From the moment base-db's `Db` exists, new front-end code takes `&Db`.
   - a build's database keeps no log;
   - `a_memo_hit_makes_no_indirect_call` (`#[ignore]` until compiling is allowed): disassembles
     the test binary's own out-of-line hit and fails on any `call`/`jmp` through a pointer.
-- hir-ty: a `compile_fail` doc test that `dyn HirDatabase` is rejected, replacing the
-  `hir_database_is_dyn_compatible` test.
+- `crates/base-db/src/db/shared/tests.rs`: a write stops a reader that is querying on another
+  thread (it unwinds with `PendingWrite`) and waits for it to let go, then clears the stop. A
+  write with no reader left neither waits nor stops. `idle()` returns nothing while a reader
+  holds the database, and stops none. A stop holds until the next write, for readers made
+  after it too. Lane db's `vendor/salsa/tests/parallel/stop_readers.rs` checks that the stop
+  reaches a cycle head, where a token alone doesn't.
+- hir-ty: `dyn HirDatabase` is rejected, enforced by `NOT_DYN`.
 - hir: `the_mir_and_display_providers_are_linked`, in a test binary that links `hir` and names
   nothing of hir-ty-mir: `hir_ty::providers::mir()` and `display()` find exactly one table.
 - The front-end test suites run unchanged on the test databases above, which now share the

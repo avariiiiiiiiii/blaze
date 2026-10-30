@@ -24,7 +24,6 @@ use hir_def::{
 };
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{TypeFlags, TypeVisitableExt as _, Variance, inherent::IntoKind};
-use smallvec::{SmallVec, smallvec};
 use stdx::never;
 
 use crate::{
@@ -45,6 +44,7 @@ pub(crate) fn variances_of(db: &Db, def: GenericDefId) -> VariancesOf<'_> {
     returns(ref),
     cycle_fn = crate::variance::variances_of_cycle_fn,
     cycle_initial = crate::variance::variances_of_cycle_initial,
+    mem_tag = Infer,
 )]
 fn variances_of_query(db: &Db, def: GenericDefId) -> StoredVariancesOf {
     tracing::debug!("variances_of(def={:?})", def);
@@ -71,10 +71,10 @@ fn variances_of_query(db: &Db, def: GenericDefId) -> StoredVariancesOf {
     if count == 0 {
         return VariancesOf::empty().store();
     }
-    let variances =
-        Context { generics, variances: smallvec![Variance::Bivariant; count], db }.solve();
-
-    VariancesOf::new_from_slice(&variances).store()
+    blaze_mem::frame::current(|frame| {
+        let variances = frame.alloc_slice_fill_with(count, |_| Variance::Bivariant);
+        VariancesOf::new_from_slice(Context { generics, variances, db }.solve()).store()
+    })
 }
 
 /// The variances of a tuple struct's or tuple variant's constructor function item, as rustc's
@@ -86,7 +86,7 @@ pub fn ctor_variances(db: &Db, ctor: VariantId) -> VariancesOf<'_> {
     ctor_variances_query(db, ctor).as_ref()
 }
 
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
 fn ctor_variances_query(db: &Db, ctor: VariantId) -> StoredVariancesOf {
     let adt: GenericDefId = match ctor {
         VariantId::StructId(s) => AdtId::StructId(s).into(),

@@ -9,15 +9,17 @@ use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey, plan::Mode, plan::OptLevel};
 use blaze_inproc::frame::Kind;
+use blaze_inproc::CodeMemory;
 use blaze_items::ItemKey;
-use rustc_hash::FxHashMap;
+use blaze_stencil::tier::{self, CALLS, Policy, Tier};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{Rng, compiled, function, key, policy};
 use crate::{
     LazyId, Purpose, Session,
     fetch::Priority,
     plan::{Function, Plan},
-    runner::{self, Answers, Closed, Compiler, Config, Placer, Runner},
+    runner::{self, Answers, Closed, Compiler, Config, Placer, Runner, TierUp},
     stub::{Abi, Isa, X86Save},
     wire::{self, ASK_KIND, Frame, READY_KIND},
 };
@@ -87,6 +89,10 @@ impl Compiler for Counting {
         function.key = key;
         Ok(function)
     }
+
+    fn tier_up(&self, key: InstanceKey, to: Tier) -> Result<CompiledFunction, String> {
+        Err(format!("{key:?} at {to:?}: these runs are not tiered"))
+    }
 }
 
 impl Counting {
@@ -101,6 +107,14 @@ pub(crate) struct Addresses(pub(crate) FxHashMap<InstanceKey, u64>);
 impl Placer for Addresses {
     fn place(&mut self, function: &CompiledFunction) -> Result<u64, String> {
         self.0.get(&function.key).copied().ok_or_else(|| format!("no address for {:?}", function.key))
+    }
+
+    fn cells(&self, _: &InstanceKey) -> Option<u64> {
+        None
+    }
+
+    fn replace(&mut self, slot: InstanceKey, _: &CompiledFunction) -> Result<u64, String> {
+        Err(format!("{slot:?}: these runs are not tiered"))
     }
 }
 
@@ -145,6 +159,7 @@ fn many_threads_asking_at_once_compile_each_function_once() {
         addresses(FUNCTIONS),
         Mail(Arc::clone(&mail)),
         Config { workers: 4, idle: false },
+        None,
     )
     .unwrap();
     std::thread::scope(|scope| {
@@ -194,6 +209,7 @@ fn a_failed_or_panicking_compile_answers_every_asker_and_stops_the_run_once() {
         addresses(6),
         Mail(Arc::clone(&mail)),
         Config { workers: 3, idle: false },
+        None,
     )
     .unwrap();
     let seq = AtomicU32::new(1);
@@ -245,6 +261,7 @@ fn an_id_past_the_session_is_answered_failed_and_stops_the_run() {
         addresses(1),
         Mail(Arc::clone(&mail)),
         Config { workers: 1, idle: false },
+        None,
     )
     .unwrap();
     let (kind, _) = ask(&runner, &mail, 0, 1, 7);
@@ -267,6 +284,7 @@ fn idle_workers_compile_the_rest_and_close_reports_what_failed_unasked() {
         addresses(10),
         Mail(Arc::clone(&mail)),
         Config { workers: 2, idle: true },
+        None,
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -282,6 +300,185 @@ fn idle_workers_compile_the_rest_and_close_reports_what_failed_unasked() {
     for n in 0..10 {
         assert!(compiler.times(key(n)) <= 1);
     }
+}
+
+/// Compiles at tier 0, and records every tier-up; with `fail`, a tier-up fails.
+#[derive(Clone, Default)]
+struct Tiers {
+    ups: Arc<Mutex<Vec<(InstanceKey, Tier)>>>,
+    fail: bool,
+}
+
+impl Compiler for Tiers {
+    fn compile(&self, key: InstanceKey) -> Result<CompiledFunction, String> {
+        Counting::default().compile(key)
+    }
+
+    fn tier_up(&self, key: InstanceKey, to: Tier) -> Result<CompiledFunction, String> {
+        self.ups.lock().unwrap().push((key, to));
+        if self.fail {
+            return Err("its MIR could not be built".to_owned());
+        }
+        Counting::default().compile(key)
+    }
+}
+
+const TIERED: u64 = 0x1000_0000;
+
+/// Where blaze-inproc's [`CodeMemory`] is made.
+const CODE_MEMORY: bool = cfg!(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64"),
+));
+
+/// Places function `n` at [`target_of`], its tier-up [`TIERED`] past it; its tier-0 cells are
+/// `n`'s pair of cells from `cells`, its tier-up's the pair after them.
+struct Slots {
+    addresses: Addresses,
+    cells: u64,
+    replaced: FxHashSet<InstanceKey>,
+}
+
+impl Slots {
+    fn of(&self, key: &InstanceKey) -> u64 {
+        let n = (0..64).find(|&n| super::key(n) == *key).unwrap();
+        self.cells + u64::from(n) * 2 * u64::from(tier::CELLS)
+    }
+}
+
+impl Placer for Slots {
+    fn place(&mut self, function: &CompiledFunction) -> Result<u64, String> {
+        self.addresses.place(function)
+    }
+
+    fn cells(&self, key: &InstanceKey) -> Option<u64> {
+        let tiered = if self.replaced.contains(key) { u64::from(tier::CELLS) } else { 0 };
+        Some(self.of(key) + tiered)
+    }
+
+    fn replace(&mut self, slot: InstanceKey, function: &CompiledFunction) -> Result<u64, String> {
+        assert_eq!(slot, function.key);
+        self.replaced.insert(slot);
+        Ok(self.addresses.place(function)? + TIERED)
+    }
+}
+
+fn wait_for(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what} within a minute");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn hot_cells_tier_a_function_up_and_its_late_asks_get_the_new_code() {
+    let Ok(mut memory) = CodeMemory::with_cells("lazy-tier", 1, 1, 1) else {
+        assert!(!CODE_MEMORY);
+        return;
+    };
+    let cells = memory.cells().offset;
+    let functions: Vec<Function> = (0..3).map(function).collect();
+    let compiler = Tiers::default();
+    let mail = Arc::new(Mailbox::default());
+    let up = TierUp {
+        cells: memory.cell_view().unwrap(),
+        policy: Policy { warm: 10, hot: u64::MAX, back_edge_weight: 1, highest: Tier::Cranelift },
+        config: tier::Config { period: Duration::from_millis(1), workers: 1 },
+    };
+    let runner = Runner::start(
+        session(&functions),
+        &[],
+        compiler.clone(),
+        Slots { addresses: addresses(3), cells, replaced: FxHashSet::default() },
+        Mail(Arc::clone(&mail)),
+        Config { workers: 1, idle: false },
+        Some(up),
+    )
+    .unwrap();
+    runner.remembered(LazyId(2), Tier::Cranelift).unwrap();
+    assert!(runner.remembered(LazyId(3), Tier::Cranelift).is_err());
+    for lazy in 0..3 {
+        let (kind, _) = ask(&runner, &mail, 0, lazy + 1, lazy);
+        assert_eq!(kind, READY_KIND);
+    }
+    memory.store_word(cells + CALLS as u64, 100).unwrap();
+    wait_for("the tier-ups", || {
+        [0, 2].iter().all(|&n| runner.target(&key(n)) == Some(target_of(n) + TIERED))
+    });
+    let (_, body) = ask(&runner, &mail, 0, 4, 0);
+    assert_eq!(Frame::decode(&body).unwrap(), Frame::Ready { request: 4 << 8, lazy: 0, target: target_of(0) + TIERED });
+    assert_eq!(runner.target(&key(1)), Some(target_of(1)), "nothing counted in function 1");
+    assert_eq!(runner.tier_stopped(), None);
+    let closed = runner.close();
+    let tiered = closed.tier.unwrap();
+    assert_eq!(tiered.tiers, [Tier::Cranelift, Tier::Stencil, Tier::Cranelift]);
+    assert_eq!((tiered.promotions, tiered.landed), (2, 2));
+    assert!(tiered.failures.is_empty() && tiered.stopped.is_none(), "{tiered:?}");
+    assert!(closed.unbound.is_empty() && closed.failures.is_empty());
+    let mut ups = compiler.ups.lock().unwrap().clone();
+    ups.sort_by_key(|it| (0..3).position(|n| key(n) == it.0));
+    assert_eq!(ups, [(key(0), Tier::Cranelift), (key(2), Tier::Cranelift)]);
+    assert!(mail.stops().is_empty());
+}
+
+#[test]
+fn a_failed_tier_up_leaves_the_first_code_and_is_reported() {
+    let Ok(memory) = CodeMemory::with_cells("lazy-tier-fail", 1, 1, 1) else {
+        assert!(!CODE_MEMORY);
+        return;
+    };
+    let cells = memory.cells().offset;
+    let compiler = Tiers { fail: true, ..Tiers::default() };
+    let mail = Arc::new(Mailbox::default());
+    let up = TierUp {
+        cells: memory.cell_view().unwrap(),
+        policy: Policy { highest: Tier::Cranelift, ..Policy::default() },
+        config: tier::Config { period: Duration::from_millis(1), workers: 1 },
+    };
+    let runner = Runner::start(
+        session(&[function(0)]),
+        &[],
+        compiler.clone(),
+        Slots { addresses: addresses(1), cells, replaced: FxHashSet::default() },
+        Mail(Arc::clone(&mail)),
+        Config { workers: 1, idle: false },
+        Some(up),
+    )
+    .unwrap();
+    runner.remembered(LazyId(0), Tier::Cranelift).unwrap();
+    let (kind, _) = ask(&runner, &mail, 0, 1, 0);
+    assert_eq!(kind, READY_KIND);
+    wait_for("the tier-up", || !compiler.ups.lock().unwrap().is_empty());
+    assert_eq!(runner.target(&key(0)), Some(target_of(0)));
+    let closed = runner.close();
+    let tiered = closed.tier.unwrap();
+    assert_eq!(tiered.tiers, [Tier::Stencil]);
+    assert_eq!(tiered.failures.len(), 1, "{tiered:?}");
+    let failure = &tiered.failures[0];
+    assert_eq!((failure.function, failure.to), (0, Tier::Cranelift));
+    assert!(failure.why.contains("its MIR could not be built") && failure.why.contains("recompiling"), "{failure:?}");
+    assert!(closed.failures.is_empty() && mail.stops().is_empty());
+}
+
+#[test]
+fn an_untiered_run_refuses_remembered_tiers() {
+    let mail = Arc::new(Mailbox::default());
+    let runner = Runner::start(
+        session(&[function(0)]),
+        &[],
+        Counting::default(),
+        addresses(1),
+        Mail(Arc::clone(&mail)),
+        Config { workers: 1, idle: false },
+        None,
+    )
+    .unwrap();
+    assert!(runner.remembered(LazyId(0), Tier::Cranelift).unwrap_err().contains("not tiered"));
+    assert_eq!(runner.tier_stopped(), None);
+    let closed = runner.close();
+    assert!(closed.tier.is_none() && closed.unbound.is_empty());
 }
 
 /// Threads calling through real entries, whose hook asks a runner.
@@ -348,6 +545,7 @@ mod through_stubs {
                 Addresses(places),
                 Mail(Arc::clone(&mail)),
                 Config { workers: 2, idle: false },
+                None,
             )
             .unwrap();
             let isa = Isa::host().unwrap();

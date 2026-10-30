@@ -172,11 +172,26 @@ pub fn result_key(run: &RunKey, traced: &Traced) -> Key {
     Key(run.traced(traced))
 }
 
+/// The run key [`values`] hashes under: no library and no call, which the image of the
+/// calling crate keys itself (`hir_def::deps`).
+pub const VALUES: RunKey = RunKey { code: ContentId([0; 32]), given: ContentId([0; 32]) };
+
+/// The hash of the values the names of the shape `bytes` have as `inputs` has them now, as
+/// [`VALUES`]`.traced` hashes a run's: equal exactly when every name has the value it had.
+/// `None` when a directory of the shape is no longer one.
+pub fn values<I: Inputs>(bytes: &[u8], inputs: &mut I) -> Result<Option<ContentId>, FindError<I::Error>> {
+    keyed(bytes, &VALUES, inputs).map_err(|error| match error {
+        Keyed::NotAShape(why) => FindError::NotAShape { key: Key(ContentId([0; 32])), why },
+        Keyed::Inputs(error) => FindError::Inputs(error),
+    })
+}
+
 /// What [`find`] found.
 #[derive(Debug)]
 pub enum Found<'s> {
-    /// A result whose every input is as it is now: its key, and the value kept, in place.
-    Hit { key: Key, value: &'s [u8] },
+    /// A result whose every input is as it is now: its key, the value kept and the shape it
+    /// was found by, in place.
+    Hit { key: Key, value: &'s [u8], shape: &'s [u8] },
     /// No result of a shape the run has had is for the inputs as they are now; `shapes` is
     /// how many it has had.
     Miss { shapes: u32 },
@@ -229,7 +244,7 @@ pub(crate) fn search<'s, I: Inputs>(
         if let Some(key) = keyed.map(Key)
             && let Some(value) = get(&key).map_err(FindError::Corrupt)?
         {
-            return Ok(Found::Hit { key, value });
+            return Ok(Found::Hit { key, value, shape: bytes });
         }
         n += 1;
     }

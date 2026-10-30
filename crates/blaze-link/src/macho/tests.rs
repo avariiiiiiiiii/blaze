@@ -8,19 +8,27 @@ use object::read::macho::{MachHeader as _, Section as _, Segment as _};
 
 use super::{core_name, linkedit, macho_name, sha256, sign};
 use crate::model::{
-    Bind, Class, Export, Function, GotEntry, Holds, Import, Library, Placed, Plan, Prot, Region,
-    SectionKind, Special, SymbolKind, Tls, Writer,
+    Bind, Class, Delta, Export, Function, GotEntry, Holds, Import, Library, Placed, Plan, Prot,
+    Region, SectionKind, Special, Splice, SymbolKind, Tls, Writer,
 };
 use crate::output::{Debug, Platform};
 use crate::{Format, Output, OutputKind};
 
+/// macOS 11: the opcodes' deployment target, before chained fixups (12).
+const OPCODES: u32 = 0x000b_0000;
+const CHAINED: u32 = 0x000c_0000;
+
 fn output(arch: Arch, kind: OutputKind) -> Output {
+    output_at(arch, kind, OPCODES)
+}
+
+fn output_at(arch: Arch, kind: OutputKind, minimum: u32) -> Output {
     Output {
         format: Format::MachO,
         arch,
         kind,
         interpreter: None,
-        platform: Some(Platform { platform: 1, minimum: 0x000e_0000, sdk: 0x000f_0000 }),
+        platform: Some(Platform { platform: 1, minimum, sdk: 0x000f_0000 }),
         incremental: false,
         debug: Debug::Lines,
         live: None,
@@ -38,18 +46,30 @@ fn region(class: Class, addr: u64, size: u64, capacity: u64, prot: Prot) -> Regi
     Region { class, addr, capacity, size, prot, align: 8 }
 }
 
-/// The file as the core writes it: the regions at their offsets, then the writer's parts.
+/// The file as the core writes it: the regions at their offsets, the encoded slots over them
+/// (`Writer::encode`, which `file` sees as `Placed::encoded`), then the writer's parts and
+/// the core's debug sections where the writer says.
 fn written(writer: &dyn Writer, placed: &Placed<'_>) -> Vec<u8> {
-    let file = writer.file(placed).expect("the file");
+    let encoded = writer.encode(placed).expect("the slots");
+    let placed = Placed { encoded: &encoded, ..*placed };
+    let file = writer.file(&placed).expect("the file");
     let mut bytes = vec![0u8; file.len as usize];
     for (index, region) in placed.regions.iter().enumerate() {
-        if let Some(at) = writer.offset(placed, region) {
+        if let Some(at) = writer.offset(&placed, region) {
             let content = placed.bytes(index);
             bytes[at as usize..at as usize + content.len()].copy_from_slice(content);
         }
     }
+    for &(addr, value) in &encoded {
+        let at = (addr - placed.plan.base) as usize;
+        bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
     for (at, part) in &file.parts {
         bytes[*at as usize..*at as usize + part.len()].copy_from_slice(part);
+    }
+    for &(at, nth) in &file.debug {
+        let section = &placed.debug[nth].1;
+        bytes[at as usize..at as usize + section.len()].copy_from_slice(section);
     }
     bytes
 }
@@ -568,6 +588,9 @@ impl Parts {
             id: [7; 16],
             debug: &self.debug,
             symbol: &no_symbol,
+            synthesis: 0,
+            delta: None,
+            encoded: &[],
         }
     }
 }
@@ -646,13 +669,13 @@ fn hello(output: Output) -> Parts {
             kind: SymbolKind::Function,
         }],
         functions: vec![
-            Function { addr: TEXT, size: 4, fde: None, windows: None, name: Some("main".to_owned()) },
+            Function { addr: TEXT, size: 4, fde: None, windows: None, name: Some("main".into()) },
             Function {
                 addr: TEXT + 4,
                 size: 4,
                 fde: None,
                 windows: None,
-                name: Some("_ZN5hello6helper17h0123456789abcdefE".to_owned()),
+                name: Some("_ZN5hello6helper17h0123456789abcdefE".into()),
             },
         ],
         entry: Some(TEXT),
@@ -681,6 +704,8 @@ struct Read {
     starts: Option<(u32, u32)>,
     in_code: Option<(u32, u32)>,
     signature: Option<(u32, u32)>,
+    chained: Option<(u32, u32)>,
+    exports_trie: Option<(u32, u32)>,
 }
 
 fn name16(bytes: &[u8; 16]) -> String {
@@ -764,6 +789,8 @@ fn read(file: &[u8]) -> Read {
                     macho::LC_FUNCTION_STARTS => read.starts = it,
                     macho::LC_DATA_IN_CODE => read.in_code = it,
                     macho::LC_CODE_SIGNATURE => read.signature = it,
+                    macho::LC_DYLD_CHAINED_FIXUPS => read.chained = it,
+                    macho::LC_DYLD_EXPORTS_TRIE => read.exports_trie = it,
                     other => panic!("linkedit data command {other:#x}"),
                 }
             }
@@ -870,7 +897,8 @@ fn executable_reads_back() {
     assert_eq!(read.dylinker.as_deref(), Some("/usr/lib/dyld"));
     assert_eq!(read.dylibs, [(macho::LC_LOAD_DYLIB, "/usr/lib/libSystem.B.dylib".to_owned())]);
     assert_eq!(read.uuid, Some([7; 16]));
-    assert_eq!(read.build, Some((1, 0x000e_0000, 0x000f_0000)));
+    assert_eq!(read.build, Some((1, OPCODES, 0x000f_0000)));
+    assert_eq!((read.chained, read.exports_trie), (None, None), "macOS 11 has no chained fixups");
     assert_eq!(read.entry, Some(0x4000));
 
     let info = read.info.unwrap();
@@ -1312,30 +1340,106 @@ fn rebases_and_starts_sorted_or_not_are_the_same() {
     assert_eq!(encode_starts(0x1_0000_0000, &twice), encode_starts(0x1_0000_0000, &sorted));
 }
 
-/// A writer that keeps the last signature's pages writes the same file as one that doesn't,
-/// link after link, as the code and the data change.
+/// What the core says changed since the link `from`: nothing moved, `written` rewritten.
+fn delta<'a>(from: u64, same_names: bool, written: &'a [(u64, u64)], functions: &'a [Splice]) -> Delta<'a> {
+    Delta { functions, rebase: &[], got: &[], binds: &[], same_names, same_regions: true, written, from }
+}
+
+/// A writer that keeps its last link writes the same file as one that doesn't, link after
+/// link, as the code and the data change: the signature hashes only the pages the core says
+/// it wrote and the headers' and `__LINKEDIT`'s that differ, and the tables are the kept
+/// ones where their inputs didn't change. Again at chained fixups' deployment target.
 #[test]
 fn the_signing_cache_writes_the_same_file() {
+    for minimum in [OPCODES, CHAINED] {
+        let mut incremental = output_at(Arch::Aarch64, OutputKind::Executable { entry: "main".to_owned() }, minimum);
+        incremental.incremental = true;
+        let cached = super::writer(&incremental).unwrap();
+        let mut parts = hello(output_at(Arch::Aarch64, OutputKind::Executable { entry: "main".to_owned() }, minimum));
+        for round in 0..5u8 {
+            let (wrote, same_names): (&[(u64, u64)], bool) = match round {
+                1 => {
+                    parts.contents[0][0] ^= 0x10;
+                    (&[(TEXT, 1)], true)
+                }
+                2 => {
+                    parts.contents[4][3] = 0x42;
+                    (&[(DATA + 3, 1)], true)
+                }
+                3 => {
+                    parts.exports[0].name = "main2".to_owned();
+                    (&[], false)
+                }
+                // The slid pointer in `__DATA` changes its target: its slot, chained, too.
+                4 => {
+                    parts.contents[4][..8].copy_from_slice(&(TEXT + 4).to_le_bytes());
+                    (&[(DATA, 8)], true)
+                }
+                _ => (&[], true),
+            };
+            let fresh = super::writer(&parts.output).unwrap();
+            let slices = parts.slices();
+            let since = delta(u64::from(round), same_names, wrote, &[]);
+            let placed = Placed {
+                synthesis: u64::from(round) + 1,
+                delta: (round != 0).then_some(&since),
+                ..parts.placed(&slices)
+            };
+            let file = written(&*cached, &placed);
+            assert_eq!(file, written(&*fresh, &parts.placed(&slices)), "round {round} at {minimum:#x}");
+            let read = read(&file);
+            let (at, len) = read.signature.unwrap();
+            check_signature(range(&file, (at, len)), &file[..at as usize], "hello");
+        }
+    }
+}
+
+/// A relink that changes a function in place patches the kept symbol table (its buffer the
+/// same) and keeps the rebase opcodes, and the file is a full build's.
+#[test]
+fn a_relink_patches_the_symbol_table_as_a_full_build_writes_it() {
     let mut incremental = executable(Arch::Aarch64);
     incremental.incremental = true;
     let cached = super::writer(&incremental).unwrap();
     let mut parts = hello(executable(Arch::Aarch64));
-    for round in 0..4u8 {
-        match round {
-            1 => parts.contents[0][0] ^= 0x10,
-            2 => parts.contents[4][3] = 0x42,
-            3 => parts.exports[0].name = "main2".to_owned(),
-            _ => {}
-        }
-        let fresh = super::writer(&parts.output).unwrap();
-        let slices = parts.slices();
-        let placed = parts.placed(&slices);
-        let file = written(&*cached, &placed);
-        assert_eq!(file, written(&*fresh, &placed), "round {round}");
-        let read = read(&file);
-        let (at, len) = read.signature.unwrap();
-        check_signature(range(&file, (at, len)), &file[..at as usize], "hello");
-    }
+    let slices = parts.slices();
+    let first = Placed { synthesis: 1, ..parts.placed(&slices) };
+    written(&cached, &first);
+    let nlist = |writer: &super::MachO| {
+        let kept = writer.cache.as_ref().unwrap().lock().unwrap();
+        kept.symbols.as_ref().map(|it| it.nlist.as_ptr() as usize)
+    };
+    let before = nlist(&cached);
+    assert!(before.is_some());
+
+    // The helper moves and is renamed to a name of the same length.
+    parts.functions[1].addr = TEXT + 6;
+    parts.functions[1].name = Some("_ZN5hello6helper17hfedcba9876543210E".into());
+    let splices = [Splice { old: 1..2, new: 1..2 }];
+    let since = delta(1, true, &[], &splices);
+    let slices = parts.slices();
+    let second = Placed { synthesis: 2, delta: Some(&since), ..parts.placed(&slices) };
+    let file = written(&cached, &second);
+    assert_eq!(nlist(&cached), before, "patched in place, not built again");
+    let fresh = super::writer(&parts.output).unwrap();
+    assert_eq!(file, written(&fresh, &parts.placed(&slices)));
+    let read = read(&file);
+    let names: Vec<(String, u64)> = symbols(&file, &read).into_iter().map(|it| (it.0, it.4)).collect();
+    assert!(names.contains(&("__ZN5hello6helper17hfedcba9876543210E".to_owned(), TEXT + 6)));
+
+    // A name of another length is built again, and still a full build's bytes.
+    parts.functions[1].name = Some("_ZN5hello5other17hfedcba9876543210E".into());
+    let since = delta(2, true, &[], &splices);
+    let slices = parts.slices();
+    let third = Placed { synthesis: 3, delta: Some(&since), ..parts.placed(&slices) };
+    let file = written(&cached, &third);
+    assert_ne!(nlist(&cached), before);
+    assert_eq!(file, written(&super::writer(&parts.output).unwrap(), &parts.placed(&slices)));
+
+    // A delta from a link the writer didn't keep (a rollback) patches nothing.
+    let since = delta(1, true, &[], &[]);
+    let fourth = Placed { synthesis: 4, delta: Some(&since), ..parts.placed(&slices) };
+    assert_eq!(written(&cached, &fourth), written(&super::writer(&parts.output).unwrap(), &parts.placed(&slices)));
 }
 
 #[test]
@@ -1391,8 +1495,11 @@ fn signing_allocates_nothing_per_page() {
         let view = sign::View::new(file.len() as u64, vec![(0, a), (a.len() as u64, b)]).unwrap();
         let mut cache = sign::Cache::default();
         let len = sign::len("x", file.len() as u64);
+        // The pages kept: the headers' and the last two (as `__LINKEDIT`'s).
+        let kept = [(0, 0x4000), (file.len() as u64 - 2 * sign::PAGE as u64, 2 * sign::PAGE as u64)];
         pool.install(|| {
-            sign::signature(&view, "x", 0, 0x4000, true, Some(&mut cache), &mut Vec::new());
+            let cold = sign::Cached { cache: &mut cache, synthesis: 1, since: None, kept: &kept };
+            sign::signature(&view, "x", 0, 0x4000, true, Some(cold), &mut Vec::new());
             let mut out = Vec::new();
             let ((), plain) =
                 blaze_alloc_count::measure(|| sign::signature(&view, "x", 0, 0x4000, true, None, &mut out));
@@ -1401,7 +1508,9 @@ fn signing_allocates_nothing_per_page() {
             let want = std::mem::take(&mut out);
             out.reserve(want.len());
             let ((), cached) = blaze_alloc_count::measure(|| {
-                sign::signature(&view, "x", 0, 0x4000, true, Some(&mut cache), &mut out);
+                let since = Some(sign::Since { from: 1, written: &[] });
+                let warm = sign::Cached { cache: &mut cache, synthesis: 2, since, kept: &kept };
+                sign::signature(&view, "x", 0, 0x4000, true, Some(warm), &mut out);
             });
             assert_eq!(cached.allocations, 0, "{pages} pages, cached, into a buffer of room");
             assert_eq!(out, want);
@@ -1499,4 +1608,158 @@ fn the_locals_in_parallel_are_the_locals_one_by_one() {
         let theirs = locals_one_by_one(&locals, &failing, &mut Vec::new(), &mut Vec::new());
         assert_eq!(ours.map_err(|it| it.what), theirs.map_err(|it| it.what), "{count} locals: the first error");
     }
+}
+
+fn chained_executable() -> Output {
+    output_at(Arch::Aarch64, OutputKind::Executable { entry: "main".to_owned() }, CHAINED)
+}
+
+/// What dyld makes of one fixed-up slot: the address it slides to, or the import it binds
+/// (name, library ordinal, weak, addend).
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Fixup {
+    Rebase(u64),
+    Bind(Vec<u8>, i64, bool, i64),
+}
+
+/// What dyld does with `LC_DYLD_CHAINED_FIXUPS` of `DYLD_CHAINED_PTR_64_OFFSET`, decoded by
+/// hand (the workspace's `object` reads no chains): each page's chain from its start, each
+/// slot's fixup by address.
+fn decode_chained(file: &[u8], read: &Read, base: u64) -> Vec<(u64, Fixup)> {
+    let blob = range(file, read.chained.expect("LC_DYLD_CHAINED_FIXUPS"));
+    let u16_at = |at: usize| u16::from_le_bytes(blob[at..at + 2].try_into().unwrap());
+    let u32_at = |at: usize| u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
+    assert_eq!(u32_at(0), 0, "fixups_version");
+    let (starts, imports_at, symbols_at) = (u32_at(4) as usize, u32_at(8) as usize, u32_at(12) as usize);
+    let (count, format) = (u32_at(16) as usize, u32_at(20));
+    assert_eq!(u32_at(24), 0, "uncompressed names");
+    let imports: Vec<(Vec<u8>, i64, bool, i64)> = (0..count)
+        .map(|nth| {
+            let (word, addend) = match format {
+                1 => (u32_at(imports_at + 4 * nth), 0),
+                2 => (u32_at(imports_at + 8 * nth), i64::from(u32_at(imports_at + 8 * nth + 4) as i32)),
+                other => panic!("import format {other}"),
+            };
+            let mut at = symbols_at + (word >> 9) as usize;
+            (c_string(blob, &mut at), i64::from(word as u8 as i8), word & 0x100 != 0, addend)
+        })
+        .collect();
+    let segments = u32_at(starts) as usize;
+    assert_eq!(segments, read.segments.len(), "a start for every segment");
+    let mut found = Vec::new();
+    for segment in 0..segments {
+        let offset = u32_at(starts + 4 + 4 * segment) as usize;
+        if offset == 0 {
+            continue;
+        }
+        let at = starts + offset;
+        assert_eq!((u16_at(at + 4), u16_at(at + 6)), (0x4000, 6), "16 KiB pages of 64-bit offsets");
+        let segment_offset = u64::from_le_bytes(blob[at + 8..at + 16].try_into().unwrap());
+        assert_eq!(base + segment_offset, read.segments[segment].1, "the segment's start");
+        for page in 0..u64::from(u16_at(at + 20)) {
+            let start = u16_at(at + 22 + 2 * page as usize);
+            if start == 0xffff {
+                continue;
+            }
+            let mut addr = base + segment_offset + page * 0x4000 + u64::from(start);
+            loop {
+                let at = (addr - base) as usize;
+                let raw = u64::from_le_bytes(file[at..at + 8].try_into().unwrap());
+                if raw >> 63 == 1 {
+                    let (name, ordinal, weak, addend) = imports[(raw & 0xff_ffff) as usize].clone();
+                    let addend = addend + i64::from((raw >> 24) as u8 as i8);
+                    found.push((addr, Fixup::Bind(name, ordinal, weak, addend)));
+                } else {
+                    let high8 = (raw >> 36) & 0xff;
+                    found.push((addr, Fixup::Rebase(base + (raw & 0xf_ffff_ffff) + (high8 << 56))));
+                }
+                let next = (raw >> 51) & 0xfff;
+                if next == 0 {
+                    break;
+                }
+                addr += next * 4;
+            }
+        }
+    }
+    found
+}
+
+/// At macOS 12 an arm64 executable is fixed up by chains: the slots slide and bind what the
+/// opcodes of the same image at macOS 11 do, and the trie is the same.
+#[test]
+fn chained_fixups_slide_and_bind_what_the_opcodes_do() {
+    let file_of = |parts: &Parts| {
+        let writer = super::writer(&parts.output).unwrap();
+        let slices = parts.slices();
+        written(&writer, &parts.placed(&slices))
+    };
+    let (old, new) = (file_of(&hello(executable(Arch::Aarch64))), file_of(&hello(chained_executable())));
+    let (old_read, new_read) = (read(&old), read(&new));
+    assert_eq!(new_read.info, None, "no LC_DYLD_INFO_ONLY");
+    assert_eq!(new_read.build, Some((1, CHAINED, 0x000f_0000)));
+
+    let segments: Vec<u64> = old_read.segments.iter().map(|it| it.1).collect();
+    let info = old_read.info.unwrap();
+    let held = |addr: u64| u64::from_le_bytes(old[(addr - BASE) as usize..][..8].try_into().unwrap());
+    let mut want: Vec<(u64, Fixup)> =
+        decode_rebases(range(&old, info[0]), &segments).into_iter().map(|it| (it, Fixup::Rebase(held(it)))).collect();
+    want.extend(decode_binds(range(&old, info[1]), &segments).into_iter().map(|(addr, ordinal, name, flags, addend)| {
+        (addr, Fixup::Bind(name, ordinal, flags & macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT != 0, addend))
+    }));
+    want.sort_by_key(|it| it.0);
+    assert_eq!(want.len(), 6);
+    assert_eq!(decode_chained(&new, &new_read, BASE), want);
+    assert_eq!(decode_trie(range(&new, new_read.exports_trie.unwrap())), decode_trie(range(&old, info[4])));
+    let (at, len) = new_read.signature.unwrap();
+    check_signature(range(&new, (at, len)), &new[..at as usize], "hello");
+}
+
+/// A bind added after the last slot of a page rewrites two slots: its own, and the one
+/// before it, whose `next` now reaches it. The rest are as they were.
+#[test]
+fn a_bind_added_rewrites_two_slots() {
+    let mut parts = hello(chained_executable());
+    let writer = super::writer(&parts.output).unwrap();
+    let slices = parts.slices();
+    let before = writer.encode(&parts.placed(&slices)).unwrap();
+    parts.binds.push(Bind { addr: VARS + 16, import: 0, addend: 0 });
+    let slices = parts.slices();
+    let after = writer.encode(&parts.placed(&slices)).unwrap();
+    assert_eq!(after.len(), before.len() + 1);
+    let changed: Vec<u64> = after.iter().filter(|it| !before.contains(it)).map(|it| it.0).collect();
+    assert_eq!(changed, [VARS, VARS + 16]);
+}
+
+/// The debug sections are the core's, laid where `File::debug` says: the file has their
+/// bytes, and writing it allocates as many buffers of the same sizes (but the signature's,
+/// a hash per page) whatever their size.
+#[test]
+fn the_debug_sections_are_the_cores_not_copies() {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let sizes = [1usize << 20, 3 << 20];
+    let used = sizes.map(|size| {
+        let mut parts = hello(executable(Arch::Aarch64));
+        parts.debug = vec![(".debug_line", vec![3; size]), (".debug_abbrev", Vec::new()), (".debug_str", vec![5; size / 2])];
+        let writer = super::writer(&parts.output).unwrap();
+        let slices = parts.slices();
+        let placed = parts.placed(&slices);
+        let (file, used) = pool.install(|| blaze_alloc_count::measure(|| writer.file(&placed)));
+        let laid: Vec<usize> = file.unwrap().debug.iter().map(|it| it.1).collect();
+        assert_eq!(laid, [0, 2], "the empty section isn't laid");
+        let bytes = written(&writer, &placed);
+        let read = read(&bytes);
+        let dwarf = read.segments.iter().find(|it| it.0 == "__DWARF").unwrap();
+        let sections: Vec<_> = read.sections.iter().filter(|it| it.0 == "__DWARF").collect();
+        assert_eq!(sections.len(), 2);
+        for (section, nth) in sections.into_iter().zip([0, 2]) {
+            let at = (section.2 - dwarf.1 + dwarf.3) as usize;
+            assert_eq!(&bytes[at..at + section.3 as usize], &parts.debug[nth].1[..]);
+        }
+        let (at, len) = read.signature.unwrap();
+        check_signature(range(&bytes, (at, len)), &bytes[..at as usize], "hello");
+        (used.allocations, used.bytes)
+    });
+    assert_eq!(used[0].0, used[1].0, "as many buffers");
+    let pages = (sizes[1] + sizes[1] / 2 - sizes[0] - sizes[0] / 2) / sign::PAGE;
+    assert!(used[1].1 - used[0].1 <= (pages * 32 + 16) as u64, "{used:?}: only the signature grows");
 }

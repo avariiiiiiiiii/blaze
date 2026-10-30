@@ -43,7 +43,8 @@ bytes (a `const` assertion), `Display`s as `at byte 12: 4 bytes wanted, 2 left`,
 
 `Put`, implemented for `Vec<u8>`: `put_u8` … `put_i64`, `put_u128`, `put_uleb`, `put_sleb`,
 `put_bytes` (no length), `put_bytes_u32` (panics past `u32::MAX` bytes: the format can't say it),
-`put_bytes_u64`, `put_bytes_uleb`, `put_cstr` (panics on a NUL inside), `patch_u32`/`patch_u64`
+`put_bytes_u64`, `put_bytes_uleb`, `put_cstr` (panics on a NUL inside), `pad_to(multiple)`
+(zeros to the next multiple, what `blaze-link`'s three `align`s were), `patch_u32`/`patch_u64`
 (write over bytes written before, for a length known only after what follows). Every
 `Reader` read has its `Put` write.
 
@@ -91,8 +92,21 @@ Against the state of the art: this is the shape of `bytes::Buf`'s `get_u32_le` o
 
 ## What moved and what stays
 
-The callers and their moves are in the report, `/tmp/blaze-lanes/v2-dedup-cursor.md`, and its
-children's reports (`v2-dedup-cursor-*.md`).
+The callers and their moves, file by file, are in the report, `/tmp/blaze-lanes/v2-dedup-cursor.md`,
+and its children's reports (`v2-dedup-cursor-{link,store,run,front}.md`). Edited directly (free):
+`blaze-splice` (`lib.rs`, `macho.rs`, `pe.rs`), `blaze-vfs` (`journal.rs`, `disk.rs`, `tree.rs`),
+`blaze-history` (`codec.rs`), `blaze-global` (`wire.rs` and its users). Requested of their
+owners: `blaze-link` (every `.eh_frame`, wasm, dylib, span-table and writer copy, and one
+`.eh_frame` pointer decoder in place of two), `blaze-cas`, `blaze-graph` (`admission.rs`),
+`blaze-cargo`, `blaze-usercode` (`trace.rs`, `index.rs`, `test/select.rs`), `blaze-codegen`
+(`blob.rs`, `summary.rs`), `blaze-engine` (`manifest.rs`), `hir-def` (`frozen.rs`), `hir-ty`
+(`method_resolution/frozen.rs`), `hir-ty-codegen` (`v2/unwind.rs`, `codeview.rs`, `split.rs`,
+`seh.rs`, `asm.rs`, `wasm.rs`, `v2/{shape,hashes,fold}.rs`), `base-db`, and tt's new wire.
+
+Several copies were looser than the cursor, and the move tightens them: LEB loops that dropped
+bits past 64 (or 32), `as u32` lengths that wrapped past 4 GiB (one of them a hash input), walks
+that stopped quietly at a record running past its section, a LEB skip with no length limit.
+Each is listed in the child report that moved it.
 
 Stays, on purpose:
 
@@ -103,6 +117,17 @@ Stays, on purpose:
 - The proc-macro wires (`blaze-expand/src/native/wire.rs`, `blaze-macro-wasm/src/wire.rs`):
   being replaced by tt's `read_wire`/`write_wire` (lane `usercode-wire-macros`), which was asked
   to read with `Reader`.
+- `blaze-inproc/src/frame.rs`'s `Reader` and `Writer`, `blaze-lazy/src/wire.rs`'s field reads,
+  and `blaze-usercode/src/test/wire.rs`'s `Cursor` (with `fork_server/recorded.rs`): the first two
+  run in the program's process, which links them with nothing but `blaze-mem`; the last is
+  `include_str!`'d into every test binary's harness, which links nothing of blaze. Each gets a
+  comment saying so (requested).
+- `blaze-core`: no `blaze-format` dependency; it sits below `blaze-cas` and `blaze-vfs`, and has
+  no cursor (fixed-size records and kernel structs at their offsets).
+- `hir-def/src/deps/signatures/key.rs`'s writers: they write into a `SmallVec<[u8; 64]>` so
+  building a key never allocates, and `Put` is on `Vec<u8>`.
+- `blaze-registry/src/index.rs`'s `Split`: cargo's lenient index rule accepts a last string
+  without its NUL, which `cstr` refuses.
 - `tt/src/storage/varint.rs`'s `Reader`: native-endian and infallible over bytes it wrote itself
   in the same process; a different invariant.
 - `blaze-format/src/schema.rs`'s `Reader`: a `const fn` byte stream feeding BLAKE3 over parts,

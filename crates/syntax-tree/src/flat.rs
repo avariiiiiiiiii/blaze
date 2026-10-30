@@ -40,7 +40,11 @@
 //! asked for, not while the tree is built: an edit would make every ancestor's again, the
 //! root's the whole file.
 
+#[allow(unsafe_code)]
+mod block;
+
 use std::{
+    cell::Cell,
     fmt,
     hash::{Hash, Hasher},
     sync::{
@@ -51,6 +55,7 @@ use std::{
 
 use blaze_ids::{radix, Domain};
 
+use self::block::{Block, Col};
 use crate::{SyntaxKind, Text, TextRange, TextSize};
 
 /// Every how many elements a start is kept.
@@ -137,59 +142,27 @@ impl Slot {
     }
 }
 
-/// The nodes of a tree that [`keeps`] their hashes, and the hashes made so far.
+/// The nodes of a tree that [`keeps`] their hashes, and the hashes made so far: columns of the
+/// tree's block ([`FlatTree::pack`] makes them).
 #[derive(Default)]
 struct Kept {
     /// The nodes, ascending.
-    elements: Box<[u32]>,
+    elements: Col<u32>,
     /// Bit `n % 64` of word `n / 64`: whether the node of rank `n` among the nodes is kept.
     /// Empty when none is.
-    bits: Box<[u64]>,
+    bits: Col<u64>,
     /// How many are kept before each word of `bits`.
-    ranks: Box<[u32]>,
+    ranks: Col<u32>,
     /// Their hashes, as `elements`.
-    hashes: Box<[Slot]>,
+    hashes: Col<Slot>,
 }
 
-impl Clone for Kept {
-    fn clone(&self) -> Kept {
-        let Kept { elements, bits, ranks, hashes } = self;
-        let hashes = hashes.iter().map(|it| Slot::new(it.value()));
-        // clone: a tree copied whole (a part moved by an edit) copies its columns
-        let (elements, bits, ranks) = (elements.clone(), bits.clone(), ranks.clone());
-        // alloc: a column of the copy, as those above
-        Kept { elements, bits, ranks, hashes: hashes.collect() }
-    }
+/// No column moves out of it: each points into its tree's block (`block`'s invariant).
+impl Drop for Kept {
+    fn drop(&mut self) {}
 }
 
 impl Kept {
-    /// The kept nodes `kept`, ascending, each with its hash or 0, of a tree whose
-    /// [`FlatTree::nodes`] and [`FlatTree::ranks`] are `nodes` and `ranks`, of `count` nodes.
-    fn new(nodes: &[u64], ranks: &[u32], count: usize, kept: &[(u32, u128)]) -> Kept {
-        if kept.is_empty() {
-            return Kept::default();
-        }
-        debug_assert!(kept.windows(2).all(|it| it[0].0 < it[1].0), "kept nodes ascending");
-        // alloc: the tree's columns of kept nodes, made once with the tree
-        let mut bits = vec![0u64; count.div_ceil(64)];
-        for &(at, _) in kept {
-            debug_assert!((nodes[at as usize / 64] >> (at % 64)) & 1 == 1, "element {at} is a node");
-            let rank = rank_in(nodes, ranks, at);
-            bits[rank / 64] |= 1 << (rank % 64);
-        }
-        let mut before = 0;
-        let ranks = bits.iter().map(|it| {
-            let rank = before;
-            before += it.count_ones();
-            rank
-        });
-        // alloc: as `bits`
-        let (ranks, elements) = (ranks.collect(), kept.iter().map(|it| it.0).collect());
-        // alloc: as `bits`
-        let hashes = kept.iter().map(|it| Slot::new(it.1)).collect();
-        Kept { elements, bits: bits.into_boxed_slice(), ranks, hashes }
-    }
-
     /// The slot of the node of rank `rank`, when it is kept.
     #[inline]
     fn slot(&self, rank: usize) -> Option<&Slot> {
@@ -206,10 +179,6 @@ impl Kept {
         let from = self.elements.partition_point(|&it| it < lo);
         let to = self.elements.partition_point(|&it| it < hi);
         self.elements[from..to].iter().zip(&self.hashes[from..to]).map(|(&it, slot)| (it, slot.value()))
-    }
-
-    fn heap_size(&self) -> usize {
-        (self.elements.len() + self.ranks.len()) * 4 + self.bits.len() * 8 + self.hashes.len() * 16
     }
 }
 
@@ -232,28 +201,152 @@ pub type Expand = fn(
     data: u32,
 ) -> (FlatTree, Vec<(TextRange, Box<str>)>);
 
-#[derive(Clone)]
 pub struct FlatTree {
     source: Text,
-    words: Box<[u32]>,
+    words: Col<u32>,
     /// Bit `at % 64` of word `at / 64`: whether element `at` is a node (not a token or a lazy
     /// node, whose parents are in their words).
-    nodes: Box<[u64]>,
+    nodes: Col<u64>,
     /// How many nodes are before each word of `nodes`.
-    ranks: Box<[u32]>,
+    ranks: Col<u32>,
     /// Each node's parent, by the node's rank among the nodes; [`NO_PARENT`] for the root.
-    node_parents: Box<[u32]>,
+    node_parents: Col<u32>,
     /// The parents of the tokens and lazy nodes [`FAR`] or more elements back, by element.
-    far: Box<[(u32, u32)]>,
+    far: Col<(u32, u32)>,
     /// The kinds of [`FAR_KIND`] or more, by element.
-    kinds: Box<[(u32, u16)]>,
+    kinds: Col<(u32, u16)>,
     /// The lengths of [`LONG`] or more and the sizes of [`HUGE`] or more, by element.
-    big: Box<[(u32, u32)]>,
+    big: Col<(u32, u32)>,
     /// The start of every [`MARK`]th element, and of the end when the elements are a multiple
     /// of it: `len / MARK + 1` of them.
-    marks: Box<[u32]>,
+    marks: Col<u32>,
     lazy: Option<Box<Lazy>>,
     kept: Kept,
+    /// The one allocation every column above and `kept`'s are in ([`FlatTree::pack`]).
+    block: Block,
+}
+
+/// No column moves out of a tree: each points into its block (`block`'s invariant).
+impl Drop for FlatTree {
+    fn drop(&mut self) {}
+}
+
+/// A copy is packed again, into a block of its own, with the hashes made so far.
+impl Clone for FlatTree {
+    fn clone(&self) -> FlatTree {
+        let Kept { elements, hashes, .. } = &self.kept;
+        // alloc: a copy of a tree, its block and lazy nodes (a part moved by an edit)
+        let lazy = self.lazy.clone();
+        // clone: a count of the shared text
+        let source = self.source.clone();
+        FlatTree::pack(source, self.columns(), lazy, elements.len(), |n| {
+            (elements[n], hashes[n].value())
+        })
+    }
+}
+
+/// A tree's columns before they are packed ([`FlatTree::pack`]).
+#[derive(Clone, Copy)]
+struct Columns<'a> {
+    words: &'a [u32],
+    nodes: &'a [u64],
+    node_parents: &'a [u32],
+    far: &'a [(u32, u32)],
+    kinds: &'a [(u32, u16)],
+    big: &'a [(u32, u32)],
+    marks: &'a [u32],
+}
+
+/// A node of [`FlatTree::subtree_without`]'s copy whose elements are being pushed: its number,
+/// where its text starts, the number after its subtree here, its kept hash here, and whether an
+/// elided node is under it.
+#[derive(Debug)]
+struct Open {
+    new: u32,
+    start: u32,
+    end: u32,
+    hash: Option<u128>,
+    cut: bool,
+}
+
+/// Where a tree's columns are finished: its node bits, and room to sort its side tables and
+/// kept nodes in.
+#[derive(Debug)]
+struct Spare {
+    nodes: Vec<u64>,
+    pairs: Vec<(u32, u32)>,
+    hashes: Vec<(u32, u128)>,
+}
+
+/// Every buffer a tree is made in before [`FlatTree::pack`] copies it into its block, kept by
+/// each thread at the most it ever held: a warm build, copy or edit allocates its block alone.
+#[derive(Debug)]
+struct Buffers {
+    packer: Packer,
+    marks: Vec<u32>,
+    open: Vec<u32>,
+    starts: Vec<u32>,
+    lazies: Vec<u32>,
+    kept: Vec<(u32, u128)>,
+    text: String,
+    opened: Vec<Open>,
+    spare: Spare,
+}
+
+thread_local! {
+    static BUFFERS: Cell<Buffers> = const { Cell::new(Buffers::new()) };
+}
+
+impl Default for Buffers {
+    fn default() -> Buffers {
+        Buffers::new()
+    }
+}
+
+impl Buffers {
+    const fn new() -> Buffers {
+        Buffers {
+            packer: Packer::new(),
+            marks: Vec::new(),   // alloc: none, an empty vector
+            open: Vec::new(),    // alloc: none, an empty vector
+            starts: Vec::new(),  // alloc: none, an empty vector
+            lazies: Vec::new(),  // alloc: none, an empty vector
+            kept: Vec::new(),    // alloc: none, an empty vector
+            text: String::new(), // alloc: none, an empty string
+            opened: Vec::new(),  // alloc: none, an empty vector
+            // alloc: none, empty vectors
+            spare: Spare { nodes: Vec::new(), pairs: Vec::new(), hashes: Vec::new() },
+        }
+    }
+
+    /// The calling thread's, empty; new ones while another build on the thread has them.
+    fn take() -> Buffers {
+        BUFFERS.try_with(Cell::take).unwrap_or_default()
+    }
+
+    /// Back to the calling thread, emptied: of these and any it was given meanwhile, it keeps
+    /// the larger.
+    fn give(mut self) {
+        self.packer.clear();
+        self.marks.clear();
+        self.open.clear();
+        self.starts.clear();
+        self.lazies.clear();
+        self.kept.clear();
+        self.text.clear();
+        self.opened.clear();
+        self.spare.nodes.clear();
+        self.spare.pairs.clear();
+        self.spare.hashes.clear();
+        // A thread that is ending: they are freed.
+        let _ = BUFFERS.try_with(|shelf| {
+            let held = shelf.take();
+            shelf.set(match held.packer.words.capacity() > self.packer.words.capacity() {
+                true => held,
+                false => self,
+            });
+        });
+    }
 }
 
 /// A tree's lazy nodes, in preorder, and their parts.
@@ -339,12 +432,28 @@ struct Packer {
 }
 
 impl Packer {
-    fn with_capacity(elements: usize) -> Packer {
+    const fn new() -> Packer {
         Packer {
-            words: Vec::with_capacity(elements),
-            node_parents: Vec::with_capacity(elements / 2),
-            ..Packer::default()
+            words: Vec::new(),        // alloc: none, an empty vector
+            node_parents: Vec::new(), // alloc: none, an empty vector
+            far: Vec::new(),          // alloc: none, an empty vector
+            kinds: Vec::new(),        // alloc: none, an empty vector
+            big: Vec::new(),          // alloc: none, an empty vector
         }
+    }
+
+    /// Room for about `elements` elements.
+    fn reserve(&mut self, elements: usize) {
+        self.words.reserve(elements);
+        self.node_parents.reserve(elements / 2);
+    }
+
+    fn clear(&mut self) {
+        self.words.clear();
+        self.node_parents.clear();
+        self.far.clear();
+        self.kinds.clear();
+        self.big.clear();
     }
 
     /// The next element's number and its kind's bits.
@@ -405,49 +514,49 @@ impl Packer {
     }
 
     /// The tree, its first element starting at `base` in `source`, its kept nodes `kept`
-    /// ([`Kept::new`]).
+    /// ascending ([`FlatTree::pack`]), its marks made in `marks` and its node bits in `spare`.
     fn finish(
-        mut self,
+        &mut self,
         source: Text,
         base: u32,
+        marks: &mut Vec<u32>,
+        spare: &mut Spare,
         lazy: Option<Box<Lazy>>,
         kept: &[(u32, u128)],
     ) -> FlatTree {
-        radix::sort_copy_by_key(&mut self.big, |it| it.0);
-        let marks = marks(&self.words, &self.big, base);
-        self.tree(source, marks, lazy, kept)
+        radix::sort_copy_by_key_in(&mut self.big, |it| it.0, &mut spare.pairs);
+        marks_of(&self.words, &self.big, base, marks);
+        self.tree(source, marks, spare, lazy, kept)
     }
 
     /// The tree, with the [`FlatTree::marks`] made while its elements were pushed.
     fn tree(
-        mut self,
+        &mut self,
         source: Text,
-        marks: Box<[u32]>,
+        marks: &[u32],
+        spare: &mut Spare,
         lazy: Option<Box<Lazy>>,
         kept: &[(u32, u128)],
     ) -> FlatTree {
-        radix::sort_copy_by_key(&mut self.big, |it| it.0);
-        let (nodes, ranks) = nodes(&self.words);
-        let kept = Kept::new(&nodes, &ranks, self.node_parents.len(), kept);
-        FlatTree {
-            source,
-            words: exact(self.words),
-            nodes,
-            ranks,
-            node_parents: exact(self.node_parents),
-            far: exact(self.far),
-            kinds: exact(self.kinds),
-            big: exact(self.big),
+        radix::sort_copy_by_key_in(&mut self.big, |it| it.0, &mut spare.pairs);
+        node_bits(&self.words, &mut spare.nodes);
+        let columns = Columns {
+            words: &self.words,
+            nodes: &spare.nodes,
+            node_parents: &self.node_parents,
+            far: &self.far,
+            kinds: &self.kinds,
+            big: &self.big,
             marks,
-            lazy,
-            kept,
-        }
+        };
+        FlatTree::pack(source, columns, lazy, kept.len(), |n| kept[n])
     }
 }
 
-/// The starts [`FlatTree::marks`] keeps of `words`, the first element starting at `base`.
-fn marks(words: &[u32], big: &[(u32, u32)], base: u32) -> Box<[u32]> {
-    let mut marks = Vec::with_capacity(words.len() / MARK as usize + 1);
+/// The starts [`FlatTree::marks`] keeps of `words`, the first element starting at `base`,
+/// pushed to `marks`.
+fn marks_of(words: &[u32], big: &[(u32, u32)], base: u32, marks: &mut Vec<u32>) {
+    marks.reserve(words.len() / MARK as usize + 1);
     let mut big = big.iter();
     let mut offset = base;
     for (at, &word) in words.iter().enumerate() {
@@ -464,26 +573,20 @@ fn marks(words: &[u32], big: &[(u32, u32)], base: u32) -> Box<[u32]> {
     if words.len() % MARK as usize == 0 {
         marks.push(offset);
     }
-    marks.into_boxed_slice()
 }
 
-/// [`FlatTree::nodes`] and [`FlatTree::ranks`] of `words`.
-fn nodes(words: &[u32]) -> (Box<[u64]>, Box<[u32]>) {
-    let mut nodes = Vec::with_capacity(words.len().div_ceil(64));
-    let mut ranks = Vec::with_capacity(words.len().div_ceil(64));
-    let mut before = 0;
-    for chunk in words.chunks(64) {
+/// [`FlatTree::nodes`] of `words`, into `nodes`.
+fn node_bits(words: &[u32], nodes: &mut Vec<u64>) {
+    nodes.clear();
+    nodes.extend(words.chunks(64).map(|chunk| {
         let mut bits = 0u64;
         for (bit, &word) in chunk.iter().enumerate() {
             if word & TAG == NODE {
                 bits |= 1 << bit;
             }
         }
-        ranks.push(before);
-        nodes.push(bits);
-        before += bits.count_ones();
-    }
-    (nodes.into_boxed_slice(), ranks.into_boxed_slice())
+        bits
+    }));
 }
 
 /// Appends bits `from..to` of `src` to `dst`, which holds `len` bits, up to 64 at a time.
@@ -522,6 +625,98 @@ fn moved_part(part: &OnceLock<Part>, source: &Text, from: u32, to: u32) -> OnceL
 }
 
 impl FlatTree {
+    /// The tree over `source` of `columns`, with [`FlatTree::ranks`] counted from its node bits,
+    /// its `kept` nodes that [`keeps`] their hashes (ascending, the `n`th `kept_at(n)` with its
+    /// hash or 0) and its lazy nodes: every column in one allocation, the block. The columns
+    /// aligned to 8 are placed first, so the block has no padding.
+    fn pack(
+        source: Text,
+        columns: Columns<'_>,
+        lazy: Option<Box<Lazy>>,
+        kept: usize,
+        kept_at: impl Fn(usize) -> (u32, u128),
+    ) -> FlatTree {
+        let Columns { words, nodes, node_parents, far, kinds, big, marks } = columns;
+        debug_assert_eq!(nodes.len(), words.len().div_ceil(64), "node bits for every 64 elements");
+        debug_assert!((1..kept).all(|n| kept_at(n - 1).0 < kept_at(n).0), "kept nodes ascending");
+        let kept_words = match kept {
+            0 => 0,
+            _ => node_parents.len().div_ceil(64),
+        };
+        let mut room = block::room::<u64>(0, nodes.len());
+        room = block::room::<u64>(room, kept_words);
+        room = block::room::<Slot>(room, kept);
+        room = block::room::<u32>(room, words.len());
+        room = block::room::<u32>(room, nodes.len());
+        room = block::room::<u32>(room, node_parents.len());
+        room = block::room::<(u32, u32)>(room, far.len());
+        room = block::room::<(u32, u16)>(room, kinds.len());
+        room = block::room::<(u32, u32)>(room, big.len());
+        room = block::room::<u32>(room, marks.len());
+        room = block::room::<u32>(room, kept_words);
+        room = block::room::<u32>(room, kept);
+        // alloc: the tree's one block
+        let mut block = Block::new(room);
+        let nodes = block.put(nodes);
+        let mut bits = block.fill(kept_words, |_| 0u64);
+        let hashes = block.fill(kept, |n| Slot::new(kept_at(n).1));
+        let words = block.put(words);
+        let mut before = 0;
+        let ranks = block.fill(nodes.len(), |word| {
+            let rank = before;
+            before += nodes[word].count_ones();
+            rank
+        });
+        debug_assert_eq!(before as usize, node_parents.len(), "a node bit for each node");
+        let node_parents = block.put(node_parents);
+        let far = block.put(far);
+        let kinds = block.put(kinds);
+        let big = block.put(big);
+        let marks = block.put(marks);
+        for n in 0..kept {
+            let at = kept_at(n).0;
+            let node = (nodes[at as usize / 64] >> (at % 64)) & 1 == 1;
+            debug_assert!(node, "element {at} is a node");
+            let rank = rank_in(&nodes, &ranks, at);
+            bits[rank / 64] |= 1 << (rank % 64);
+        }
+        let mut before = 0;
+        let kept_ranks = block.fill(kept_words, |word| {
+            let rank = before;
+            before += bits[word].count_ones();
+            rank
+        });
+        let elements = block.fill(kept, |n| kept_at(n).0);
+        let kept = Kept { elements, bits, ranks: kept_ranks, hashes };
+        FlatTree {
+            source,
+            words,
+            nodes,
+            ranks,
+            node_parents,
+            far,
+            kinds,
+            big,
+            marks,
+            lazy,
+            kept,
+            block,
+        }
+    }
+
+    /// The tree's columns, to pack into another block.
+    fn columns(&self) -> Columns<'_> {
+        Columns {
+            words: &self.words,
+            nodes: &self.nodes,
+            node_parents: &self.node_parents,
+            far: &self.far,
+            kinds: &self.kinds,
+            big: &self.big,
+            marks: &self.marks,
+        }
+    }
+
     /// How many nodes and tokens the tree has; the root is number 0.
     #[inline]
     pub fn len(&self) -> u32 {
@@ -555,9 +750,7 @@ impl FlatTree {
                 + lazy.parts.len() * std::mem::size_of::<OnceLock<Part>>()
                 + lazy.parts.iter().filter_map(|it| it.get()).map(Part::heap_size).sum::<usize>()
         });
-        let columns = self.words.len() + self.ranks.len() + self.node_parents.len() + self.marks.len();
-        let tables = self.far.len() + self.kinds.len() + self.big.len();
-        columns * 4 + self.nodes.len() * 8 + tables * 8 + lazy + self.kept.heap_size()
+        self.block.size() + lazy
     }
 
     #[inline]
@@ -729,35 +922,35 @@ impl FlatTree {
         hash
     }
 
-    /// The kept nodes, each with its hash or 0 ([`Kept::new`]), of the tree an edit of element
+    /// Pushes to `kept`, empty, the kept nodes, each with its hash or 0, of the tree an edit of element
     /// `at` makes: the elements `lo..hi` replaced by `with`'s (as they are for `None`), and the
-    /// text of `at`'s ancestors `grown` bytes longer. The ancestors are hashed again when
-    /// asked; every other kept node keeps its hash.
+    /// text of `at`'s ancestors `grown` bytes longer; `sorting` is room to sort them in. The
+    /// ancestors are hashed again when asked; every other kept node keeps its hash.
     fn kept_around(
         &self,
         at: u32,
         grown: i64,
         (lo, hi): (u32, u32),
         with: Option<&FlatTree>,
-    ) -> Vec<(u32, u128)> {
+        kept: &mut Vec<(u32, u128)>,
+        sorting: &mut Vec<(u32, u128)>,
+    ) {
         let added = with.map_or(hi - lo, FlatTree::len);
-        // alloc: the new tree's kept nodes, once per edit
         let theirs = with.map_or(0, |it| it.kept.elements.len());
-        let mut kept = Vec::with_capacity(self.kept.elements.len() + theirs + 64);
+        kept.reserve(self.kept.elements.len() + theirs + 64);
         // Before `lo`, a node whose subtree ends past it is an ancestor.
         kept.extend(self.kept.between(0, lo).filter(|&(it, _)| self.end(it) <= lo));
         let mut up = self.parent(at);
         while let Some(ancestor) = up {
-            self.keep_grown(ancestor, grown, hi - lo, added, &mut kept);
+            self.keep_grown(ancestor, grown, hi - lo, added, kept);
             up = self.parent(ancestor);
         }
-        radix::sort_copy_by_key(&mut kept, |it| it.0);
+        radix::sort_copy_by_key_in(kept, |it| it.0, sorting);
         match with {
             Some(with) => kept.extend(with.kept.between(0, with.len()).map(|(it, hash)| (it + lo, hash))),
             None => kept.extend(self.kept.between(lo, hi)),
         }
         kept.extend(self.kept.between(hi, self.len()).map(|(it, hash)| (it - (hi - lo) + added, hash)));
-        kept
     }
 
     /// Pushes ancestor `at` of an edit, with no hash yet, when it keeps one with its text
@@ -973,44 +1166,45 @@ impl FlatTree {
     pub(crate) fn subtree(&self, at: u32) -> FlatTree {
         let (lo, hi) = (at, self.end(at));
         let range = self.range(at);
+        // alloc: the copy's text
         let source = Text::from(&self.source[range]);
-        let mut words: Box<[u32]> = self.words[lo as usize..hi as usize].into();
-        if words[0] & TAG != NODE {
-            words[0] &= !(FAR << UP);
+        let mut buffers = Buffers::take();
+        let Buffers { packer, marks, kept, spare, .. } = &mut buffers;
+        packer.words.extend_from_slice(&self.words[lo as usize..hi as usize]);
+        if packer.words[0] & TAG != NODE {
+            packer.words[0] &= !(FAR << UP);
         }
-        let big: Box<[(u32, u32)]> =
-            in_range(&self.big, lo, hi).iter().map(|&(it, value)| (it - at, value)).collect();
-        let kinds: Box<[(u32, u16)]> =
-            in_range(&self.kinds, lo, hi).iter().map(|&(it, kind)| (it - at, kind)).collect();
-        let far = in_range(&self.far, lo + 1, hi).iter().map(|&(it, p)| (it - at, p - at)).collect();
-        let node_parents = self.node_parents[self.nodes_before(lo)..self.nodes_before(hi)]
-            .iter()
-            .map(|&it| match it == NO_PARENT || it < at {
-                true => NO_PARENT,
-                false => it - at,
-            })
-            .collect();
-        let marks = marks(&words, &big, 0);
-        let (nodes, ranks) = nodes(&words);
-        // alloc: the copy's kept nodes, once per copy
-        let kept: Vec<(u32, u128)> = self.kept.between(lo, hi).map(|(it, hash)| (it - at, hash)).collect();
-        let kept = Kept::new(&nodes, &ranks, node_parents.len(), &kept);
+        packer.big.extend(in_range(&self.big, lo, hi).iter().map(|&(it, value)| (it - at, value)));
+        let kinds = in_range(&self.kinds, lo, hi).iter().map(|&(it, kind)| (it - at, kind));
+        packer.kinds.extend(kinds);
+        packer.far.extend(in_range(&self.far, lo + 1, hi).iter().map(|&(it, p)| (it - at, p - at)));
+        let parents = &self.node_parents[self.nodes_before(lo)..self.nodes_before(hi)];
+        packer.node_parents.extend(parents.iter().map(|&it| match it == NO_PARENT || it < at {
+            true => NO_PARENT,
+            false => it - at,
+        }));
+        marks_of(&packer.words, &packer.big, 0, marks);
+        kept.extend(self.kept.between(lo, hi).map(|(it, hash)| (it - at, hash)));
         let lazy = self.lazy.as_ref().and_then(|lazy| {
             let from = lazy.nodes.partition_point(|&it| it < lo);
             let to = lazy.nodes.partition_point(|&it| it < hi);
             (from < to).then(|| {
+                // alloc: an outline's lazy nodes in the copy, once per copy
                 Box::new(Lazy {
+                    // alloc: as the `Lazy`
                     nodes: lazy.nodes[from..to].iter().map(|it| it - at).collect(),
                     parts: lazy.parts[from..to]
                         .iter()
                         .map(|part| moved_part(part, &source, range.start().into(), 0))
-                        .collect(),
+                        .collect(), // alloc: as the `Lazy`
                     expand: lazy.expand,
                     data: lazy.data,
                 })
             })
         });
-        FlatTree { source, words, nodes, ranks, node_parents, far, kinds, big, marks, lazy, kept }
+        let tree = packer.tree(source, marks, spare, lazy, kept);
+        buffers.give();
+        tree
     }
 
     /// [`Self::subtree`] of node `at` with the nodes `elided` under it, ascending and
@@ -1031,28 +1225,20 @@ impl FlatTree {
             from = self.end(it);
         }
         let range = self.range(at);
-        // alloc: the elided ranges, once per copy
-        let ranges: Vec<TextRange> = elided.iter().map(|&it| self.range(it)).collect();
-        let cut: u32 = ranges.iter().map(|it| u32::from(it.len())).sum();
-        let mut text = String::with_capacity((u32::from(range.len()) - cut) as usize);
+        let cut: u32 = elided.iter().map(|&it| u32::from(self.range(it).len())).sum();
+        let mut buffers = Buffers::take();
+        let Buffers { packer, marks, kept, text, opened: open, spare, .. } = &mut buffers;
+        text.reserve((u32::from(range.len()) - cut) as usize);
         let mut start = range.start();
-        for it in &ranges {
+        for &it in elided {
+            let it = self.range(it);
             text.push_str(&self.source[TextRange::new(start, it.start())]);
             start = it.end();
         }
         text.push_str(&self.source[TextRange::new(start, range.end())]);
-        let source = Text::from(text);
+        // alloc: the copy's text
+        let source = Text::from(text.as_str());
 
-        /// A node of the copy whose elements are being pushed: its number, where its text
-        /// starts, the number after its subtree here, its kept hash here, and whether an
-        /// elided node is under it.
-        struct Open {
-            new: u32,
-            start: u32,
-            end: u32,
-            hash: Option<u128>,
-            cut: bool,
-        }
         fn close(top: Open, open: &mut [Open], packer: &mut Packer, kept: &mut Vec<(u32, u128)>, offset: u32) {
             let size = packer.words.len() as u32 - top.new;
             packer.set_size(top.new, size);
@@ -1067,10 +1253,8 @@ impl FlatTree {
         }
 
         let removed: u32 = elided.iter().map(|&it| self.end(it) - it - 1).sum();
-        let mut packer = Packer::with_capacity((hi - lo - removed) as usize);
-        // alloc: the copy's open nodes and kept hashes, once per copy
-        let (mut open, mut kept) = (Vec::with_capacity(32), Vec::new());
-        // alloc: the copy's lazy nodes, once per copy
+        packer.reserve((hi - lo - removed) as usize);
+        // alloc: an outline's lazy nodes in the copy, once per copy
         let (mut lazy_nodes, mut lazy_parts) = (Vec::new(), Vec::new());
         let mut olds = self.kept.between(lo, hi).peekable();
         let base = u32::from(range.start());
@@ -1080,14 +1264,14 @@ impl FlatTree {
         while it < hi {
             while open.last().is_some_and(|top: &Open| top.end <= it) {
                 let top = open.pop().expect("a node open");
-                close(top, &mut open, &mut packer, &mut kept, offset);
+                close(top, open, packer, kept, offset);
             }
             let parent = open.last().map_or(NO_PARENT, |top| top.new);
             let kind = self.kind(it);
             if elided.get(next) == Some(&it) {
                 packer.node(kind, 1, parent);
                 open.last_mut().expect("an elided node is under the root").cut = true;
-                cut += u32::from(ranges[next].len());
+                cut += u32::from(self.range(it).len());
                 next += 1;
                 it = self.end(it);
                 continue;
@@ -1114,9 +1298,9 @@ impl FlatTree {
             it += 1;
         }
         while let Some(top) = open.pop() {
-            close(top, &mut open, &mut packer, &mut kept, offset);
+            close(top, open, packer, kept, offset);
         }
-        radix::sort_copy_by_key(&mut kept, |it| it.0);
+        radix::sort_copy_by_key_in(kept, |it| it.0, &mut spare.hashes);
         let lazy = self.lazy.as_deref().filter(|_| !lazy_nodes.is_empty()).map(|lazy| {
             // alloc: the copy's lazy nodes, once per copy
             Box::new(Lazy {
@@ -1126,7 +1310,9 @@ impl FlatTree {
                 data: lazy.data,
             })
         });
-        packer.finish(source, 0, lazy, &kept)
+        let tree = packer.finish(source, 0, marks, spare, lazy, kept);
+        buffers.give();
+        tree
     }
 
     /// This tree, which has no lazy nodes, with its text at `to` in `source` instead of at
@@ -1185,13 +1371,14 @@ impl FlatTree {
 
         // Copied around `at`, not repacked: what changes is the ancestors' sizes, how far back
         // the parent is of their tokens after `at`, and the numbers past it in the tables.
-        // alloc: the new tree's columns and tables, once per edit
-        let mut words = Vec::with_capacity(len as usize);
+        let mut buffers = Buffers::take();
+        let Buffers { packer, marks, kept: hashes, spare, .. } = &mut buffers;
+        let Packer { words, node_parents, far, kinds, big } = packer;
+        words.reserve(len as usize);
         words.extend_from_slice(&self.words[..lo as usize]);
         words.extend_from_slice(&with.words);
         words.extend_from_slice(&self.words[hi as usize..]);
-        // alloc: as `words`
-        let mut far = Vec::with_capacity(self.far.len() + with.far.len() + 1);
+        far.reserve(self.far.len() + with.far.len() + 1);
         far.extend_from_slice(in_range(&self.far, 0, lo));
         let root = &mut words[lo as usize];
         if *root & TAG != NODE {
@@ -1209,8 +1396,7 @@ impl FlatTree {
         // Those after `hi` under an ancestor are pushed as the ancestors are walked.
         let rest = in_range(&self.far, hi, self.len()).iter().filter(|it| it.1 >= lo);
         far.extend(rest.map(|&(it, parent)| (after(it), after(parent))));
-        // alloc: as `words`
-        let mut big = Vec::with_capacity(self.big.len() + with.big.len());
+        big.reserve(self.big.len() + with.big.len());
         // Before `lo`, a node whose subtree ends past it is an ancestor, its size set below.
         big.extend(in_range(&self.big, 0, lo).iter().filter(|&&(it, _)| self.end(it) <= lo));
         big.extend(with.big.iter().map(|&(it, value)| (it + lo, value)));
@@ -1246,10 +1432,9 @@ impl FlatTree {
             }
             (child, ancestor) = (it, self.parent(it));
         }
-        radix::sort_copy_by_key(&mut far, |it| it.0);
-        radix::sort_copy_by_key(&mut big, |it| it.0);
-        // alloc: as `words`
-        let mut kinds = Vec::with_capacity(self.kinds.len() + with.kinds.len());
+        radix::sort_copy_by_key_in(far, |it| it.0, &mut spare.pairs);
+        radix::sort_copy_by_key_in(big, |it| it.0, &mut spare.pairs);
+        kinds.reserve(self.kinds.len() + with.kinds.len());
         kinds.extend_from_slice(in_range(&self.kinds, 0, lo));
         kinds.extend(with.kinds.iter().map(|&(it, kind)| (it + lo, kind)));
         kinds.extend(in_range(&self.kinds, hi, self.len()).iter().map(|&(it, kind)| (after(it), kind)));
@@ -1257,8 +1442,7 @@ impl FlatTree {
         let (ranked, past) = (self.rank(lo), self.nodes_before(hi));
         let parent = up.unwrap_or(NO_PARENT);
         let count = ranked + with.node_parents.len() + self.node_parents.len() - past;
-        // alloc: as `words`
-        let mut node_parents = Vec::with_capacity(count);
+        node_parents.reserve(count);
         node_parents.extend_from_slice(&self.node_parents[..ranked]);
         node_parents.extend(with.node_parents.iter().map(|&it| match it {
             NO_PARENT => parent,
@@ -1268,28 +1452,17 @@ impl FlatTree {
             it if it < lo || it == NO_PARENT => it,
             it => after(it),
         }));
-        // alloc: as `words`
-        let mut nodes = Vec::with_capacity((len as usize).div_ceil(64));
+        spare.nodes.reserve((len as usize).div_ceil(64));
         let mut bits = 0;
-        append_bits(&mut nodes, &mut bits, &self.nodes, 0, lo as usize);
-        append_bits(&mut nodes, &mut bits, &with.nodes, 0, added as usize);
-        append_bits(&mut nodes, &mut bits, &self.nodes, hi as usize, self.len() as usize);
-        let mut counted = 0;
-        let ranks = nodes.iter().map(|it| {
-            let rank = counted;
-            counted += it.count_ones();
-            rank
-        });
-        // alloc: as `words`
-        let ranks: Box<[u32]> = ranks.collect();
-        debug_assert_eq!(counted as usize, node_parents.len(), "a node bit for each node");
+        append_bits(&mut spare.nodes, &mut bits, &self.nodes, 0, lo as usize);
+        append_bits(&mut spare.nodes, &mut bits, &with.nodes, 0, added as usize);
+        append_bits(&mut spare.nodes, &mut bits, &self.nodes, hi as usize, self.len() as usize);
 
         // A start past `lo` is `with`'s, moved to `at`'s start, or that of the element it was
         // before the edit, moved by what the text grew: a mark and up to seven lengths.
         let first = lo.div_ceil(MARK);
         let with_start = u32::from(new.start());
-        // alloc: as `words`
-        let mut marks = Vec::with_capacity((len / MARK + 1) as usize);
+        marks.reserve((len / MARK + 1) as usize);
         marks.extend_from_slice(&self.marks[..first as usize]);
         marks.extend((first..=len / MARK).map(|mark| match mark * MARK {
             it if it < lo + added => with.offset(it - lo) - with_start + start,
@@ -1316,6 +1489,7 @@ impl FlatTree {
             (None, None) => None,
         };
         let lazy = expander.map(|(expand, data)| {
+            // alloc: an outline's lazy nodes, once per edit
             let (mut nodes, mut parts) = (Vec::new(), Vec::new());
             if let Some((ours, before, _)) = ours {
                 for (&it, part) in ours.nodes[..before].iter().zip(&ours.parts[..before]) {
@@ -1335,25 +1509,24 @@ impl FlatTree {
                     parts.push(moved_part(part, &source, old_end, new_end));
                 }
             }
+            // alloc: as `nodes` above
             Box::new(Lazy { nodes: nodes.into(), parts: parts.into(), expand, data })
         });
 
         let grown = u32::from(new.len()) as i64 - u32::from(old.len()) as i64;
-        let hashes = self.kept_around(at, grown, (lo, hi), Some(with));
-        let kept = Kept::new(&nodes, &ranks, node_parents.len(), &hashes);
-        FlatTree {
-            source,
-            words: exact(words),
-            nodes: exact(nodes),
-            ranks,
-            node_parents: exact(node_parents),
-            far: exact(far),
-            kinds: exact(kinds),
-            big: exact(big),
-            marks: exact(marks),
-            lazy,
-            kept,
-        }
+        self.kept_around(at, grown, (lo, hi), Some(with), hashes, &mut spare.hashes);
+        let columns = Columns {
+            words: words.as_slice(),
+            nodes: &spare.nodes,
+            node_parents: node_parents.as_slice(),
+            far: far.as_slice(),
+            kinds: kinds.as_slice(),
+            big: big.as_slice(),
+            marks: marks.as_slice(),
+        };
+        let tree = FlatTree::pack(source, columns, lazy, hashes.len(), |n| hashes[n]);
+        buffers.give();
+        tree
     }
 
     /// The tree with token `at`'s text replaced by `text` (its kind stays), over `source`, the
@@ -1387,8 +1560,10 @@ impl FlatTree {
         let new_end = new_end as u32;
         let len = text.len() as u32;
 
-        let mut words = self.words.clone();
-        let mut big = self.big.to_vec();
+        let mut buffers = Buffers::take();
+        let Buffers { packer, kept, spare, .. } = &mut buffers;
+        let big = &mut packer.big;
+        big.extend_from_slice(&self.big);
         if let Ok(it) = big.binary_search_by_key(&at, |it| it.0) {
             big.remove(it);
         }
@@ -1399,42 +1574,33 @@ impl FlatTree {
                 LONG
             }
         };
-        let word = &mut words[at as usize];
-        *word = (*word & !(LONG << VALUE)) | stored << VALUE;
-        let mut marks = self.marks.clone();
-        for (mark, start) in marks.iter_mut().enumerate() {
-            if mark as u32 * MARK > at {
-                *start = *start - old_end + new_end;
-            }
-        }
         let lazy = self.lazy.as_ref().map(|lazy| {
             let parts = lazy.nodes.iter().zip(lazy.parts.iter()).map(|(&it, part)| match it < at {
                 true => moved_part(part, &source, 0, 0),
                 false => moved_part(part, &source, old_end, new_end),
             });
+            // alloc: an outline's lazy nodes, once per edit
             Box::new(Lazy {
-                nodes: lazy.nodes.clone(),
-                parts: parts.collect(),
+                nodes: lazy.nodes.clone(), // alloc: as the `Lazy`
+                parts: parts.collect(),    // alloc: as the `Lazy`
                 expand: lazy.expand,
                 data: lazy.data,
             })
         });
         let grown = len as i64 - u32::from(old.len()) as i64;
-        let kept = self.kept_around(at, grown, (at, at + 1), None);
-        let kept = Kept::new(&self.nodes, &self.ranks, self.node_parents.len(), &kept);
-        FlatTree {
-            source,
-            words,
-            nodes: self.nodes.clone(),
-            ranks: self.ranks.clone(),
-            node_parents: self.node_parents.clone(),
-            far: self.far.clone(),
-            kinds: self.kinds.clone(),
-            big: exact(big),
-            marks,
-            lazy,
-            kept,
+        self.kept_around(at, grown, (at, at + 1), None, kept, &mut spare.hashes);
+        let columns = Columns { big: big.as_slice(), ..self.columns() };
+        let mut tree = FlatTree::pack(source, columns, lazy, kept.len(), |n| kept[n]);
+        buffers.give();
+        // No element but the token changes: its word, and the starts kept after it.
+        let word = &mut tree.words[at as usize];
+        *word = (*word & !(LONG << VALUE)) | stored << VALUE;
+        for (mark, start) in tree.marks.iter_mut().enumerate() {
+            if mark as u32 * MARK > at {
+                *start = *start - old_end + new_end;
+            }
         }
+        tree
     }
 
     /// The lazy nodes, in preorder.
@@ -1506,18 +1672,9 @@ impl FlatTree {
     }
 }
 
-/// The vector's elements in an allocation of their size: an allocator may keep a block that
-/// is shrunk to more than half of it whole (mimalloc does), so a vector grown by doubling
-/// and boxed holds up to twice what it needs.
-fn exact<T: Copy>(vec: Vec<T>) -> Box<[T]> {
-    match vec.capacity() == vec.len() {
-        true => vec.into_boxed_slice(),
-        false => vec.as_slice().into(),
-    }
-}
-
 /// Makes a [`FlatTree`] in preorder: nodes are started and finished around their children.
-#[derive(Default, Debug)]
+/// Its buffers are the calling thread's ([`Buffers`]), given back by `finish`.
+#[derive(Debug)]
 pub struct FlatTreeBuilder {
     /// The text appended so far, when the builder has no source.
     text: String,
@@ -1535,23 +1692,47 @@ pub struct FlatTreeBuilder {
     expand: Option<(Expand, u32)>,
     /// The nodes finished that [`keeps`] their hashes, in the order they were finished.
     kept: Vec<(u32, u128)>,
+    /// The rest of the thread's buffers, given back with the others.
+    opened: Vec<Open>,
+    spare: Spare,
+}
+
+impl Default for FlatTreeBuilder {
+    fn default() -> FlatTreeBuilder {
+        FlatTreeBuilder::new()
+    }
 }
 
 impl FlatTreeBuilder {
     pub fn new() -> FlatTreeBuilder {
-        FlatTreeBuilder::default()
+        let Buffers { packer, marks, open, starts, lazies, kept, text, opened, spare } =
+            Buffers::take();
+        FlatTreeBuilder {
+            text,
+            source: None,
+            next: 0,
+            end: 0,
+            packer,
+            marks,
+            open,
+            starts,
+            lazies,
+            expand: None,
+            kept,
+            opened,
+            spare,
+        }
     }
 
     /// A builder for a text of about `len` bytes.
     pub fn with_capacity(len: usize) -> FlatTreeBuilder {
         // About one element for every two bytes of Rust.
         let elements = len / 2;
-        FlatTreeBuilder {
-            text: String::with_capacity(len),
-            packer: Packer::with_capacity(elements),
-            marks: Vec::with_capacity(elements / MARK as usize + 1),
-            ..FlatTreeBuilder::default()
-        }
+        let mut builder = FlatTreeBuilder::new();
+        builder.text.reserve(len);
+        builder.packer.reserve(elements);
+        builder.marks.reserve(elements / MARK as usize + 1);
+        builder
     }
 
     /// A builder whose tokens are consecutive slices of `source`, which the tree keeps instead
@@ -1573,14 +1754,12 @@ impl FlatTreeBuilder {
             source.len(),
         );
         let elements = (end - start) / 2;
-        FlatTreeBuilder {
-            packer: Packer::with_capacity(elements),
-            marks: Vec::with_capacity(elements / MARK as usize + 1),
-            source: Some(source),
-            next: start,
-            end,
-            ..FlatTreeBuilder::default()
-        }
+        let mut builder = FlatTreeBuilder::new();
+        builder.packer.reserve(elements);
+        builder.marks.reserve(elements / MARK as usize + 1);
+        builder.source = Some(source);
+        (builder.next, builder.end) = (start, end);
+        builder
     }
 
     /// Where the next element starts.
@@ -1674,7 +1853,7 @@ impl FlatTreeBuilder {
         if len % MARK as usize == 0 {
             self.marks.push(self.offset() as u32);
         }
-        let source = match self.source {
+        let source = match self.source.take() {
             Some(source) => {
                 assert!(
                     self.next == self.end,
@@ -1685,22 +1864,29 @@ impl FlatTreeBuilder {
                 );
                 source
             }
-            None => Text::from(self.text),
+            // alloc: the tree's own text, appended (one copy, as `Text::from(String)` makes)
+            None => Text::from(self.text.as_str()),
         };
         let lazy = match self.lazies.is_empty() {
             true => None,
             false => {
                 let (expand, data) = self.expand.expect("a tree with lazy nodes has no expander");
+                // alloc: an outline's lazy nodes and their parts' slots, once a tree
                 Some(Box::new(Lazy {
-                    parts: self.lazies.iter().map(|_| OnceLock::new()).collect(),
-                    nodes: exact(self.lazies),
+                    parts: self.lazies.iter().map(|_| OnceLock::new()).collect(), // alloc: as the `Lazy`
+                    nodes: self.lazies.as_slice().into(),
                     expand,
                     data,
                 }))
             }
         };
-        radix::sort_copy_by_key(&mut self.kept, |it| it.0);
-        self.packer.tree(source, exact(self.marks), lazy, &self.kept)
+        radix::sort_copy_by_key_in(&mut self.kept, |it| it.0, &mut self.spare.hashes);
+        let tree = self.packer.tree(source, &self.marks, &mut self.spare, lazy, &self.kept);
+        let FlatTreeBuilder {
+            text, packer, marks, open, starts, lazies, kept, opened, spare, ..
+        } = self;
+        Buffers { packer, marks, open, starts, lazies, kept, text, opened, spare }.give();
+        tree
     }
 }
 
@@ -1716,25 +1902,14 @@ mod tests {
         },
     };
 
+    use blaze_ids::rng::SplitMix64;
+
     use super::{keeps, Expand, FlatTree, HUGE, LONG};
     use crate::{
         cursor::{SyntaxElement, SyntaxNode},
         FlatTreeBuilder, NodeOrToken, SyntaxKind, Text, TextRange, TextSize, TokenAtOffset,
         WalkEvent,
     };
-
-    struct Rng(u64);
-
-    impl Rng {
-        fn new(seed: u64) -> Rng {
-            Rng(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407))
-        }
-
-        fn below(&mut self, below: u64) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) % below
-        }
-    }
 
     /// A tree to build each way: a node is its kind, its children and, when it is lazy in an
     /// outline, the number of its part in [`PARTS`].
@@ -1750,7 +1925,7 @@ mod tests {
             let (kind, children) = open.pop().unwrap();
             open.last_mut().unwrap().1.push(Shape::Node(kind, children, None));
         }
-        let mut rng = Rng::new(seed);
+        let mut rng = SplitMix64::new(seed);
         let mut open = vec![(SyntaxKind(100), Vec::new())];
         for _ in 0..rng.below(60) {
             match rng.below(4) {
@@ -1776,7 +1951,7 @@ mod tests {
     /// them, so most of those are more than a thousand elements after their parent; a few
     /// tokens of more than a thousand bytes; and some kinds past the word's.
     fn big_shape(seed: u64) -> Shape {
-        let mut rng = Rng::new(seed);
+        let mut rng = SplitMix64::new(seed);
         let mut rows = Vec::new();
         for row in 0..100u64 {
             let mut tokens = Vec::new();
@@ -1813,7 +1988,7 @@ mod tests {
     }
 
     /// Makes some nodes below the root of `shape` lazy, none inside another.
-    fn make_lazy(shape: &mut Shape, rng: &mut Rng) {
+    fn make_lazy(shape: &mut Shape, rng: &mut SplitMix64) {
         let Shape::Node(_, children, _) = shape else { return };
         for child in children.iter_mut() {
             if let Shape::Node(kind, grandchildren, None) = child {
@@ -2374,7 +2549,7 @@ mod tests {
                 true => big_shape(seed),
                 false => random_shape(seed),
             };
-            make_lazy(&mut shape, &mut Rng::new(seed ^ 0x1a2b));
+            make_lazy(&mut shape, &mut SplitMix64::new(seed ^ 0x1a2b));
             let tree = build_outline(&shape, expand);
             let lazies: Vec<u32> = tree.lazies().collect();
             let outline = SyntaxNode::new_flat_root(tree.clone());
@@ -2603,7 +2778,7 @@ mod tests {
     #[test]
     fn replacing_a_subtree_is_building_the_edited_tree() {
         for seed in 0..1000 {
-            let mut rng = Rng::new(seed ^ 0x9e37);
+            let mut rng = SplitMix64::new(seed ^ 0x9e37);
             let mut shape = random_shape(seed);
             make_lazy(&mut shape, &mut rng);
             let tree = build_outline(&shape, expand);
@@ -2669,7 +2844,7 @@ mod tests {
     #[test]
     fn replacing_a_token_is_building_the_edited_tree() {
         for seed in 0..1000 {
-            let mut rng = Rng::new(seed ^ 0x7f4a);
+            let mut rng = SplitMix64::new(seed ^ 0x7f4a);
             let mut shape = random_shape(seed);
             let outline = seed % 2 == 1;
             if outline {
@@ -2801,7 +2976,7 @@ mod tests {
     #[test]
     fn splicing_children_is_building_the_edited_tree() {
         for seed in 0..1000 {
-            let mut rng = Rng::new(seed ^ 0x5bd1);
+            let mut rng = SplitMix64::new(seed ^ 0x5bd1);
             let mut shape = random_shape(seed);
             let outline = seed % 2 == 1;
             if outline {
@@ -2841,7 +3016,7 @@ mod tests {
     /// A tree from a seed whose nodes are on both sides of what keeps a hash: up to five deep,
     /// each node with up to 20 children, a quarter of them nodes, and tokens of up to 60 bytes.
     fn nested_shape(seed: u64) -> Shape {
-        fn grow(rng: &mut Rng, depth: u32) -> Shape {
+        fn grow(rng: &mut SplitMix64, depth: u32) -> Shape {
             let mut children = Vec::new();
             for _ in 0..rng.below(20) {
                 match rng.below(4) {
@@ -2854,7 +3029,7 @@ mod tests {
             }
             Shape::Node(SyntaxKind(100 + rng.below(5) as u16), children, None)
         }
-        grow(&mut Rng::new(seed), 0)
+        grow(&mut SplitMix64::new(seed), 0)
     }
 
     /// One BLAKE3 pass over [`FlatTree::hash_subtree`]'s writes from `at`, made apart from
@@ -2920,7 +3095,7 @@ mod tests {
             let tree = build_flat(&shape, seed % 2 == 1);
             check_hashes(&tree, seed);
             kept += tree.kept.elements.len();
-            make_lazy(&mut shape, &mut Rng::new(seed ^ 0x51ab));
+            make_lazy(&mut shape, &mut SplitMix64::new(seed ^ 0x51ab));
             let outline = build_outline(&shape, expand);
             check_hashes(&outline, seed);
             for at in outline.lazies() {
@@ -2949,7 +3124,7 @@ mod tests {
     #[test]
     fn an_edit_keeps_the_hashes_of_what_it_does_not_change() {
         for seed in 0..100 {
-            let mut rng = Rng::new(seed ^ 0x3c6e);
+            let mut rng = SplitMix64::new(seed ^ 0x3c6e);
             let shape = nested_shape(seed);
             let tree = build_flat(&shape, true);
             hash_all(&tree);
@@ -3068,7 +3243,7 @@ mod tests {
     #[test]
     fn a_subtree_without_nodes_is_the_subtree_with_them_replaced() {
         for seed in 0..200 {
-            let mut rng = Rng::new(seed ^ 0x2f1d);
+            let mut rng = SplitMix64::new(seed ^ 0x2f1d);
             let nested = seed % 2 == 1;
             let mut shape = match nested {
                 true => nested_shape(seed),
@@ -3178,5 +3353,69 @@ mod tests {
         assert_eq!(**copy.flat_tree().unwrap(), without_in_turn(&tree, at, &numbers));
         let alone = rows.clone_subtree_without(std::iter::empty::<&SyntaxNode>());
         assert_eq!(**alone.flat_tree().unwrap(), tree.subtree(at));
+    }
+
+    /// With the thread's buffers warm, a build, a copy of a subtree, a splice and a token's
+    /// replacement each allocate the new tree's block alone (and a copy its text): small trees
+    /// and one with every side table and kept hashes, whose arrays are those of the trees made
+    /// cold.
+    #[test]
+    fn a_warm_build_copy_or_edit_allocates_its_block_alone() {
+        for seed in 0..40 {
+            let shape = match seed % 4 {
+                3 => big_shape(seed),
+                _ => random_shape(seed),
+            };
+            let mut text = String::new();
+            text_of(&shape, &mut text);
+            let source = Text::from(text.as_str());
+            let build = || {
+                let mut builder = FlatTreeBuilder::sourced(source.clone());
+                to_flat(&shape, &mut builder, false);
+                builder.finish()
+            };
+            let cold = build();
+            let (tree, used) = blaze_alloc_count::measure(build);
+            assert_eq!(used.allocations, 1, "seed {seed}: a warm build, {} bytes", used.bytes);
+            same_arrays(&tree, &cold, seed);
+            assert_eq!(tree.heap_size(), used.bytes as usize, "seed {seed}: the block is the tree");
+
+            let at = (0..tree.len()).rev().find(|&it| !tree.is_token(it)).expect("a node");
+            let copy = tree.subtree(at);
+            let (again, used) = blaze_alloc_count::measure(|| tree.subtree(at));
+            assert_eq!(used.allocations, 2, "seed {seed}: a warm copy, its text and its block");
+            same_arrays(&again, &copy, seed);
+
+            let spliced = tree.replace_subtree(at, &copy, source.clone());
+            let (again, used) =
+                blaze_alloc_count::measure(|| tree.replace_subtree(at, &copy, source.clone()));
+            assert_eq!(used.allocations, 1, "seed {seed}: a warm splice, {} bytes", used.bytes);
+            same_arrays(&again, &spliced, seed);
+            same_arrays(&again, &tree, seed);
+
+            if let Some(token) = (0..tree.len()).find(|&it| tree.is_token(it)) {
+                let replaced = tree.replace_token(token, tree.token_text(token), source.clone());
+                let (again, used) = blaze_alloc_count::measure(|| {
+                    tree.replace_token(token, tree.token_text(token), source.clone())
+                });
+                assert_eq!(used.allocations, 1, "seed {seed}: a warm token, {} bytes", used.bytes);
+                same_arrays(&again, &replaced, seed);
+                same_arrays(&again, &tree, seed);
+            }
+        }
+    }
+
+    /// A tree and its clone hold the same columns in two blocks, and the clone keeps the hashes
+    /// made before it.
+    #[test]
+    fn a_clone_is_the_tree_in_a_block_of_its_own() {
+        let tree = build_flat(&big_shape(5), true);
+        hash_all(&tree);
+        let clone = tree.clone();
+        same_arrays(&clone, &tree, 5);
+        assert_eq!(clone.kept.elements, tree.kept.elements);
+        let hashes = |tree: &FlatTree| tree.kept.hashes.iter().map(|it| it.value()).collect::<Vec<_>>();
+        assert_eq!(hashes(&clone), hashes(&tree));
+        assert!(!std::ptr::eq(clone.words.as_ptr(), tree.words.as_ptr()));
     }
 }

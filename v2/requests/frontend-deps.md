@@ -90,6 +90,9 @@ buffer an image's stores are read from. `deps/signatures.rs` `served` now calls
 Status: open
 
 > applied by frontend-deps: `Image::bytes` in `crates/hir-def/src/deps.rs`, as given. Not built.
+> frontend-deps (2026-10-29, later): it now returns `&crate::deps::ImageBuf`
+> (`Arc<dyn deps::Held>`), because images are read in place from the store. `signatures::read`
+> takes that. `decode_in` is forwarded to db (`v2/requests/db.md`).
 
 ## speed-hir-sol-defs: hot_lint and budgets
 
@@ -268,6 +271,8 @@ invariant rather than an assumption.
    ```
 
 > forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+> frontend-deps-items (2026-10-29): applied as written (`radix` import gone, `top_attrs` held
+> aside and pushed last at `finish`, the order `assert!` in `add_attrs`).
 
 ### B. `lower.rs`: `Scoped::seal` without clearing a big table
 
@@ -307,6 +312,7 @@ New:
 ```
 
 > forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+> frontend-deps-items (2026-10-29): applied as written.
 
 ### C. `item_tree.rs` (+ `lower.rs`, `items.rs`, `persist.rs`): `attrs(id)` in O(1)
 
@@ -489,6 +495,10 @@ unchanged) and `PartialEq` still compares what it did. Callers are unchanged. No
    ```
 
 > forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+> frontend-deps-items (2026-10-29): applied, all seven parts: `AttrBlock` and `attr_index` in
+> `item_tree.rs`, built at `TreeBuilder::finish`, in `assemble` (`items.rs`, which no longer
+> has the per-item queries, see F) and after `check` in `persist.rs`'s `decode`; the test
+> appended to `item_tree/tests.rs`.
 
 ### D. `item_tree/tests.rs`: allocation budgets
 
@@ -681,6 +691,12 @@ fails on `seq`'s doubling and on the `Vec` per path. A failure there is a budget
 flaky test.
 
 > forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+> frontend-deps-items (2026-10-29): applied: the five tests and their helpers are appended to
+> `item_tree/tests.rs`, with `attr_index` counted (C is in). They don't link yet:
+> `crates/hir-def/Cargo.toml` has no `blaze-alloc-count` and hir-def installs no counting
+> allocator. They wait on items 2-4 of `## speed-hir-store: one counting allocator for hir-def's
+> tests` in `v2/requests/db.md` (owner db, open), as `items/tests.rs`' budgets do. The decode
+> budget also waits on speed-hir-store's two `hir/persist.rs` changes.
 
 ### E. `persist.rs`: `kinds` and `macro_calls` at their exact length
 
@@ -761,6 +777,8 @@ new:
 Same words read, so the same values and errors.
 
 > forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+> frontend-deps-items (2026-10-29): applied as written: `kinds` checked then mapped through
+> `ItemKind::ALL`, `macro_calls` into one `Vec::with_capacity`, the five tables read by `get`.
 
 ### F. `items.rs`: the per-item queries against the whole-file lowering (a decision for you)
 
@@ -857,6 +875,26 @@ fn a_big_item_keeps_its_tree_across_an_edit_elsewhere() {
 Status: open
 
 > forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+> frontend-deps-items (2026-10-29): decided and built: the design this request names, with
+> the per-item queries gone. `file_item_tree_query` is the one query per file (it returns
+> `Arc<ItemTree>`, `returns(deref)`). The file's last tree is kept beside salsa (`items.rs`
+> `KEPT`, 128 direct-mapped slots by database nonce, file and crate), with the crate's `cfg`
+> set, the text it was keyed from, per item a key (syntax fingerprint, then the ast ids and
+> anchors compared as they are) and `Marks` (where its rows are in each column). A cold file is
+> `lower_whole` and keys nothing; its first edit lowers whole again and keys. After that, an
+> edit hashes only the items whose text it touched (`Unchanged`: common prefix and suffix
+> against the kept text). It keeps the rows of the unchanged items before and after the
+> changed ones, lowers the changed ones alone (`Ctx::lower_item`) and assembles. An edit that
+> changes no key returns the kept `Arc`. The result is byte-equal to `lower_whole`: every
+> fixture, the real files and the random edits, through `assert_assembled_is_whole`. The
+> "lowers it alone" tests count items lowered (`LOWERED`) and items hashed (`HASHED`), not
+> salsa executions. The `KEPT_TEXT` edit and domain version 2 are in (the tag is named
+> `KEPT_HASH`, as `KEPT` names the slots), and so is the test. Arithmetic: about 18 µs for a
+> body keystroke on a 500-item file (13 µs of it ids and anchors), against 29 µs plus a
+> backdating compare for `lower_whole`. The span slices requested in
+> `v2/requests/frontend-deps-items.md` take it to about 3 µs. Written up in
+> `docs/v2/plan/lanes/frontend/speed-of-light.md` (frontend-deps-reparse items 4 to 6, the
+> keystroke) and `reparse.md`.
 
 ### speed-hir-sol-defs: `serve`'s read path is serial and copies each part (design)
 
@@ -921,3 +959,10 @@ visibility.rs, signatures.rs twice).
    (for the three one-line `fn` signatures in lower.rs, put it on its own line above the `fn`).
 
 > forwarded to frontend-deps-items (window frontend-deps-items-next1, holds `item_tree*`) (requests, pass 19; told by tmux).
+> frontend-deps-items (2026-10-29): applied as written. 1: the three `span_for_range`
+> parameters are `&mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized)` and their
+> `// dyn:` lines are gone. 2: `lower_visibility` and `lower_visibility_from_ast` take
+> `&impl ast::HasVisibility`; every caller passes a concrete node. 3: the `HasAttrs` comment
+> is above `lower_attrs_of`, `lower_attrs` and `cfg_disabled` in lower.rs, and on the `owner`
+> lines of `AttrsOrCfg::lower` and `lower_attrs_into` in attrs.rs. `hot_lint`: no finding in
+> `item_tree*`.

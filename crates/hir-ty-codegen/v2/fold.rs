@@ -64,15 +64,12 @@ pub(crate) enum Name {
 /// C-variadic function, and one whose address is significant
 /// ([`blaze_codegen::backend::Address::Significant`]), are the caller's to leave out.
 pub(crate) fn masked(function: &Function, refs: &Refs) -> Option<Masked> {
-    masked_ir(function.ir()?, &|it| name(function, refs, it))
+    masked_ir(function.ir()?, Names::Of(function, refs))
 }
 
 /// [`masked`] of `func`, whose names `names` says. `names` masks no function itself: the
 /// walk's buffers are the thread's.
-pub(crate) fn masked_ir(
-    func: &ir::Function,
-    names: &dyn Fn(ir::UserExternalName) -> Option<Name>,
-) -> Option<Masked> {
+pub(crate) fn masked_ir(func: &ir::Function, names: Names<'_>) -> Option<Masked> {
     WORDS.with_borrow_mut(|words| {
         let size = canon(func, names, words)?;
         Some(Masked { shape: shape(&words.bytes), constants: words.constants.clone(), size })
@@ -96,6 +93,25 @@ pub(crate) fn name(
             _ => data(function, refs, index).map(Name::Data),
         },
         _ => None,
+    }
+}
+
+/// What the names of a prepared function's IR are: its requests' places among the references
+/// ([`name`]), or a test's fixed rule.
+#[derive(Clone, Copy)]
+pub(crate) enum Names<'a> {
+    Of(&'a Function, &'a Refs),
+    #[cfg(test)]
+    Plain(fn(ir::UserExternalName) -> Option<Name>),
+}
+
+impl Names<'_> {
+    pub(crate) fn of(self, it: ir::UserExternalName) -> Option<Name> {
+        match self {
+            Names::Of(function, refs) => name(function, refs, it),
+            #[cfg(test)]
+            Names::Plain(names) => names(it),
+        }
     }
 }
 
@@ -221,7 +237,7 @@ fn shape(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// [`masked_ir`] with the sites of its constants, for [`build`].
-fn walk(func: &ir::Function, names: &dyn Fn(ir::UserExternalName) -> Option<Name>) -> Option<Walk> {
+fn walk(func: &ir::Function, names: Names<'_>) -> Option<Walk> {
     WORDS.with_borrow_mut(|words| {
         let size = canon(func, names, words)?;
         let masked =
@@ -232,11 +248,7 @@ fn walk(func: &ir::Function, names: &dyn Fn(ir::UserExternalName) -> Option<Name
 
 /// Writes `func` masked into `words`; its number of instructions, `None` where [`masked`]
 /// refuses.
-fn canon(
-    func: &ir::Function,
-    names: &dyn Fn(ir::UserExternalName) -> Option<Name>,
-    words: &mut Words,
-) -> Option<u32> {
+fn canon(func: &ir::Function, names: Names<'_>, words: &mut Words) -> Option<u32> {
     words.bytes.clear();
     words.numbers.iter_mut().for_each(Vec::clear);
     words.counts = [0; KINDS];
@@ -285,7 +297,7 @@ impl std::hash::Hasher for Le<'_> {
 
 struct Canon<'a> {
     func: &'a ir::Function,
-    names: &'a dyn Fn(ir::UserExternalName) -> Option<Name>,
+    names: Names<'a>,
     words: &'a mut Words,
 }
 
@@ -630,7 +642,7 @@ impl Canon<'_> {
             self.plain(name);
             return Some(false);
         };
-        let constant = match (self.names)(self.func.params.user_named_funcs()[*user].clone())? {
+        let constant = match self.names.of(self.func.params.user_named_funcs()[*user].clone())? {
             Name::Place(place) => Constant::Place(place),
             Name::Data(id) => Constant::Data(id),
         };
@@ -657,8 +669,7 @@ pub(crate) struct Folded {
 }
 
 /// A member of a group: its prepared IR, what its names are, its references.
-pub(crate) type Member<'a> =
-    (&'a ir::Function, &'a dyn Fn(ir::UserExternalName) -> Option<Name>, &'a Refs);
+pub(crate) type Member<'a> = (&'a ir::Function, Names<'a>, &'a Refs);
 
 /// Builds `group`'s body from its first member and a thunk for each. Every member's masked IR
 /// must be the group's, with the group's values of its varying constants and equal values
@@ -949,16 +960,12 @@ pub(crate) fn merge(
             return Err(fail(format!("member {at} is not the group's")));
         }
     }
-    let names: Vec<_> = members
-        .iter()
-        .map(|&(_, _, prepared, refs)| move |it: ir::UserExternalName| name(prepared, refs, it))
-        .collect();
     let mut sources: Vec<Member<'_>> = Vec::with_capacity(members.len());
-    for (at, (&(_, _, prepared, refs), names)) in members.iter().zip(&names).enumerate() {
+    for (at, &(_, _, prepared, refs)) in members.iter().enumerate() {
         let Some(func) = prepared.ir() else {
             return Err(fail(format!("member {at} is assembly, which has no IR to fold")));
         };
-        sources.push((func, names as &dyn Fn(ir::UserExternalName) -> Option<Name>, refs));
+        sources.push((func, Names::Of(prepared, refs), refs));
     }
     let Folded { body, thunks } = build(group, &sources, pointer).map_err(fail)?;
     let (unit, spec, prepared, refs) = members[0];
@@ -1000,6 +1007,16 @@ mod tests {
             0 => Some(Name::Place(name.index)),
             1 => Some(Name::Data(ContentId([name.index as u8; 32]))),
             _ => None,
+        }
+    }
+
+    const PLAIN: Names<'static> = Names::Plain(names);
+
+    #[test]
+    fn plain_names_are_what_their_rule_says() {
+        for (namespace, index) in [(0, 3), (1, 5), (2, 0)] {
+            let name = ir::UserExternalName::new(namespace, index);
+            assert_eq!(PLAIN.of(name.clone()), names(name));
         }
     }
 
@@ -1075,7 +1092,7 @@ mod tests {
     #[test]
     fn numbering_is_not_the_shape() {
         let (a, b) = (grow(8, 0, 1, false), grow(8, 0, 1, true));
-        let (a, b) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
+        let (a, b) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         assert_eq!(a, b);
         assert_eq!(a.constants, vec![
             Constant::Int { bits: 64, value: 8 },
@@ -1089,7 +1106,7 @@ mod tests {
     #[test]
     fn constants_are_masked() {
         let (a, b) = (grow(8, 0, 1, false), grow(-4, 2, 3, false));
-        let (a, b) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
+        let (a, b) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         assert_eq!(a.shape, b.shape);
         assert_eq!(b.constants[0], Constant::Int { bits: 64, value: u128::from(-4i64 as u64) });
         assert_eq!(b.constants[1], Constant::Place(2));
@@ -1109,13 +1126,13 @@ mod tests {
         cursor.func.layout.remove_inst(ret);
         let mut cursor = cursor.at_bottom(next);
         cursor.ins().return_(&[sum]);
-        let a = masked_ir(&grow(8, 0, 1, false), &names).unwrap();
-        assert_ne!(masked_ir(&other, &names).unwrap().shape, a.shape);
+        let a = masked_ir(&grow(8, 0, 1, false), PLAIN).unwrap();
+        assert_ne!(masked_ir(&other, PLAIN).unwrap().shape, a.shape);
     }
 
     #[test]
     fn what_has_no_parameters_is_not_masked() {
-        assert!(masked_ir(&ir::Function::new(), &names).is_none());
+        assert!(masked_ir(&ir::Function::new(), PLAIN).is_none());
         assert!(masked_ir(&grow(8, 0, 1, false), &|_| None).is_none());
     }
 
@@ -1662,7 +1679,7 @@ mod tests {
         for seed in 0..300u64 {
             let base = random(seed, None, None);
             let want = text::masked(&base, &names);
-            let got = masked_ir(&base, &names);
+            let got = masked_ir(&base, PLAIN);
             assert_eq!(want.is_some(), got.is_some(), "seed {seed}");
             let renumbered = random(seed, None, Some(seed ^ 0x5eed));
             if let (Some((text, _)), Some((renumbered, _))) = (&want, text::masked(&renumbered, &names))
@@ -1675,7 +1692,7 @@ mod tests {
             }
             variants.push(random(seed + 10_000, None, None));
             for variant in &variants {
-                let (theirs, ours) = (text::masked(variant, &names), masked_ir(variant, &names));
+                let (theirs, ours) = (text::masked(variant, &names), masked_ir(variant, PLAIN));
                 assert_eq!(theirs.is_some(), ours.is_some(), "seed {seed}");
                 let (Some((text_a, constants_a)), Some((text_b, constants_b))) = (&want, &theirs)
                 else {
@@ -1709,7 +1726,7 @@ mod tests {
         let (a, b) = (atomic(trusted), atomic(trusted.with_endianness(ir::Endianness::Big)));
         // The printer leaves them out.
         assert_eq!(text::masked(&a, &names), text::masked(&b, &names));
-        let (a, b) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
+        let (a, b) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         assert_ne!(a.shape, b.shape);
     }
 
@@ -1739,17 +1756,17 @@ mod tests {
         let (a, b) = (global_load(trusted), global_load(trusted.with_readonly()));
         // The text named the flags by their handle, the same number in both.
         assert_eq!(text::masked(&a, &names), text::masked(&b, &names));
-        let (a, b) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
+        let (a, b) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         assert_ne!(a.shape, b.shape);
-        assert_eq!(masked_ir(&global_load(trusted), &names).unwrap().shape, a.shape);
+        assert_eq!(masked_ir(&global_load(trusted), PLAIN).unwrap().shape, a.shape);
     }
 
     #[test]
     fn masking_reuses_the_threads_buffers() {
         let (big, small) = (random(7, None, None), grow(8, 0, 1, false));
-        let first = masked_ir(&small, &names);
-        masked_ir(&big, &names);
-        assert_eq!(masked_ir(&small, &names), first);
+        let first = masked_ir(&small, PLAIN);
+        masked_ir(&big, PLAIN);
+        assert_eq!(masked_ir(&small, PLAIN), first);
     }
 
     fn verified(func: &ir::Function) {
@@ -1769,7 +1786,7 @@ mod tests {
         let (a, b) = (grow(8, 0, 1, false), grow(24, 0, 1, true));
         let refs_a = vec![Target::Function(key(10)), Target::Extern("STATIC".to_owned())];
         let refs_b = vec![Target::Function(key(11)), Target::Extern("STATIC".to_owned())];
-        let (ma, mb) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
+        let (ma, mb) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         let settings = Settings(ContentId([1; 32]));
         let limits = Limits { thunk_size: 0, ..Limits::default() };
         let found = groups(
@@ -1778,7 +1795,7 @@ mod tests {
         );
         let group = &found[0];
         assert_eq!(group.varying, vec![0, 1]);
-        let members: [Member<'_>; 2] = [(&a, &names, &refs_a[..]), (&b, &names, &refs_b[..])];
+        let members: [Member<'_>; 2] = [(&a, PLAIN, &refs_a[..]), (&b, PLAIN, &refs_b[..])];
         let Folded { body, thunks } = build(group, &members, pointer).unwrap();
 
         let mut want = signature();
@@ -1836,7 +1853,7 @@ mod tests {
         // One body for two vtables: data objects 7 and 9.
         let (a, b) = (grow_with(8, 0, 1, 7, false), grow_with(8, 0, 1, 9, true));
         let refs = vec![Target::Function(key(10)), Target::Extern("STATIC".to_owned())];
-        let (ma, mb) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
+        let (ma, mb) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         let settings = Settings(ContentId([1; 32]));
         let limits = Limits { thunk_size: 0, ..Limits::default() };
         let found = groups(
@@ -1846,7 +1863,7 @@ mod tests {
         let group = &found[0];
         assert_eq!(group.varying, vec![3]);
         assert_eq!(group.constants[1], vec![Constant::Data(ContentId([9; 32]))]);
-        let members: [Member<'_>; 2] = [(&a, &names, &refs[..]), (&b, &names, &refs[..])];
+        let members: [Member<'_>; 2] = [(&a, PLAIN, &refs[..]), (&b, PLAIN, &refs[..])];
         let Folded { body, thunks } = build(group, &members, pointer).unwrap();
         assert_eq!(body.signature.params.last(), Some(&AbiParam::new(pointer)));
         let symbols = body
@@ -1881,7 +1898,7 @@ mod tests {
         let (a, b) = (grow(8, 0, 1, false), grow(24, 0, 1, false));
         let refs = vec![Target::Function(key(10)), Target::Extern("STATIC".to_owned())];
         let other = vec![Target::Function(key(10)), Target::Extern("OTHER".to_owned())];
-        let (ma, mb) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
+        let (ma, mb) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         let settings = Settings(ContentId([1; 32]));
         let limits = Limits { thunk_size: 0, ..Limits::default() };
         let found = groups(
@@ -1891,7 +1908,7 @@ mod tests {
         let group = &found[0];
         assert_eq!(group.varying, vec![0]);
         // The static differs, but the group was made with it equal.
-        let members: [Member<'_>; 2] = [(&a, &names, &refs[..]), (&b, &names, &other[..])];
+        let members: [Member<'_>; 2] = [(&a, PLAIN, &refs[..]), (&b, PLAIN, &other[..])];
         assert!(build(group, &members, pointer).unwrap_err().contains("varies"));
         assert!(build(group, &members[..1], pointer).is_err());
     }

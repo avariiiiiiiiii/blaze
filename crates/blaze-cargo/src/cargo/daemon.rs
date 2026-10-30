@@ -1119,12 +1119,8 @@ fn own_group(command: &mut Command) {
 
 /// Ends a worker, and on Unix the processes it started.
 fn kill(child: &mut Child) {
-    // One that has exited already has nothing to kill, and its pid may be another's by now.
     #[cfg(unix)]
-    if let (Ok(None), Ok(group)) = (child.try_wait(), libc::pid_t::try_from(child.id())) {
-        // SAFETY: it takes no pointer; the group is the worker's, which has not been waited for.
-        unsafe { libc::killpg(group, libc::SIGKILL) };
-    }
+    crate::raw::process::kill_group(child);
     let _ = child.kill();
     let _ = child.wait();
 }

@@ -117,40 +117,10 @@ pub fn gone(socket: &Path) {
 #[cfg(windows)]
 fn on_its_own(daemon: &mut Command) -> impl Drop + use<> {
     use std::os::windows::process::CommandExt as _;
-    use windows_sys::Win32::{
-        Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation},
-        System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW},
-    };
-
-    /// Handles are multiples of four, and a command as short as this one has few.
-    const HANDLES: std::ops::RangeInclusive<usize> = 4..=0x1_0000;
-
-    struct Inherited(Vec<HANDLE>);
-    impl Drop for Inherited {
-        fn drop(&mut self) {
-            for &handle in &self.0 {
-                // SAFETY: the handle was open and inheritable when it was listed, and
-                // nothing closed one of this command's since.
-                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
-            }
-        }
-    }
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 
     daemon.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    let mut inherited = Vec::new();
-    for handle in HANDLES.step_by(4).map(|it| it as HANDLE) {
-        let mut flags = 0;
-        // SAFETY: a number that is no open handle is refused, and `flags` is only written.
-        let held = unsafe {
-            GetHandleInformation(handle, &mut flags) != 0
-                && flags & HANDLE_FLAG_INHERIT != 0
-                && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0
-        };
-        if held {
-            inherited.push(handle);
-        }
-    }
-    Inherited(inherited)
+    crate::raw::process::withhold_inheritance()
 }
 
 /// Why no daemon answered: there is none, or one ended without taking its socket with it.

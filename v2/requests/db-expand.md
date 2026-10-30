@@ -430,6 +430,17 @@ crates; doing it first would break hir-expand's build.
 > forwarded to db (db-expand; window `db-next2`, told by tmux).
 > left for db-expand-macros-next2 (frontend-hooks, 2026-10-29): its edits are in `crates/hir-expand/`,
 > all of which the running db-expand-macros-next2 owns; not in yet. Told by tmux.
+> applied by db-expand-macros (2026-10-29, not built): `Clone` dropped from `DeclarativeMacroExpander`,
+> `AttrInput`, `SyntaxFixupUndoInfo` and `EagerCallInfo` (every reader borrows them). The
+> `builtin/derive_macro.rs` structs never derived it. `MacroCallKind` stays `Clone` (salsa's
+> `InternedData` asks for it, `vendor/salsa/src/interned.rs:89`), so its trees are shared:
+> `eager: Option<Arc<EagerCallInfo>>`, `attr_args: Option<Arc<tt::TopSubtree>>`. hir-def builds
+> them with `Box::new` in three lines, requested of db-expand-names ("an eager call's info and an
+> attribute's args as `.into()`"); until those are in, hir-def doesn't build. Left as is:
+> `builtin/derive_macro/reference.rs` (test-only, the old derives kept to compare against) derives
+> `Clone` on `BasicAdtInfo`/`AdtParam` and clones trees into `quote!`, and the built-ins'
+> `tt.clone()` writes of an input as its expansion (`attr_macro.rs:181` and the like). Both need
+> `TopSubtree: Clone` or a named copy (`TopSubtree::to_owned_tree`, say) from tt before you drop it.
 
 
 ## frontend-deps-reparse: `Attr::input` shared, `Option<Arc<AttrInput>>` (speed of light; 2026-10-29)
@@ -687,6 +698,15 @@ can't take an edition function or a `FlatTree` there.
 > forwarded to db-expand (hir-expand is db's; told by tmux).
 > left for db-expand-macros-next2 (frontend-hooks, 2026-10-29): its edits are in `crates/hir-expand/`,
 > all of which the running db-expand-macros-next2 owns; not in yet. Told by tmux.
+> applied by db-expand-macros (2026-10-29, not built): 1. `macro_arg`'s fn-like arm is on
+> `call_input` (section "a macro's input from a view"), and the attribute arm on
+> `call_input_modified`. 2. `declarative.rs` computes `edition` before `mac`, ready for
+> `parse_macro_rules`/`parse_macro2` to take it (they still take only `ctx_edition`). 3. Every
+> hand-built tree has a span, and so `|ctx| ctx.edition(db)`. That covers the built-ins' `quote!`,
+> fixup leaves, the eager input made from its expansions, and proc-macro answers, whose spans come
+> back through the `FlatTree`. The one place that can't read a `FlatTree` is `expand_speculative`
+> (IDE, an edited tree): it and `derive_macro.rs:1087` stay on `syntax_node_to_token_tree_modified`
+> over handles, so that entry needs the edition function too.
 
 ## db-expand-macros: persist `ExpandErrorKind::Builtin` (db-expand-names, `crates/hir-def/src/nameres/frozen.rs`)
 
@@ -1562,6 +1582,8 @@ input never pays for them. Nothing built.
 > forwarded to db (from requests, pass 17; told by tmux).
 > left for db-expand-macros-next2 (frontend-hooks, 2026-10-29): its edits are in `crates/hir-expand/`,
 > all of which the running db-expand-macros-next2 owns; not in yet. Told by tmux.
+> applied by db-expand-macros (2026-10-29, not built): both edits as written. The arm reads
+> `ast_id.to_view(db)`, and both of its token-tree branches call `syntax_bridge::call_input`.
 
 ## speed-hir: four edits in db-expand's files (dedup, upvars, `ModPath`; 2026-10-29)
 
@@ -1634,6 +1656,11 @@ twice. Tests of the hir-def half: `nameres/tests/uses.rs` (`a_method_of_...`, `t
 then reads `hir_ty::used_imports_with_traits` in place of `used_imports`.
 
 > forwarded to db (db-ty-next2, which holds hir-ty's inference; the hir-def half to db-expand-names-next2) (requests, pass 18; told by tmux).
+> applied by db-expand-names (2026-10-29 ~21:08), hir-def half: in place since the request was
+> written. `Resolver::record_trait_uses` (`resolver.rs`), `uses::trait_uses` and the public
+> `uses::used_imports_with` (`nameres/uses.rs`), `Use`/`UsedImports` public, and the tests in
+> `nameres/tests/uses.rs`. `demand::crate_body_owners` and `resolver::resolver_for_scope`, which
+> the hir-ty query calls, are public. Nothing left on hir-def's side. Items 1-2 are db-ty's.
 
 ## db-expand-names: an unnamed trait binding names its own import (frontend-nameres, `crates/hir-def/src/nameres/facts/`)
 
@@ -1721,6 +1748,23 @@ Nothing built.
 > forwarded to frontend-hooks (frontend applies its own `## frontend-*` sections in db's files, db.md's notice of 20:45; it tells db-expand-macros-next1, which holds `crates/hir-expand/`) (requests, pass 18, corrected; told by tmux).
 > left for db-expand-macros-next2 (frontend-hooks, 2026-10-29): its edits are in `crates/hir-expand/`,
 > all of which the running db-expand-macros-next2 owns; not in yet. Told by tmux.
+> frontend-hooks (2026-10-29 21:10, requests pass 18): not applied, left for db-expand-macros-next2.
+> It is working in `crates/hir-expand/` right now, and the change needs `attrs.rs` (changed 4 min
+> before) and `lib.rs` (changed under 1 min before) as well as `cfg_process.rs`/`fixup.rs`; under
+> Andrew's rule a file a running db child touched in the last 20 minutes isn't frontend's to edit.
+> Told by tmux. Notes for the port: the view side has `AnyHasAttrs`, `attrs_including_inner`,
+> `inner_attributes_node`, `Meta`/`CfgMeta`/`cfg_predicate` (`syntax/src/view/traits.rs`,
+> `generated/nodes.rs`), `NodeId` and `PreorderWithTokens` (`syntax/src/view.rs`), and
+> `cfg::CfgExpr::parse_from_view` (`cfg/src/cfg_expr.rs:161`). What is missing is in hir-expand
+> itself: view versions of `attrs::expand_cfg_attr` (and `_with_doc_comments`) and
+> `with_one_segment`, which `macro_input_callback` calls with handles, plus `fixup.rs` keyed by
+> `NodeId`.
+> applied by db-expand-macros (2026-10-29, not built): all four steps. `macro_input_callback` and
+> `fixup_syntax` are each one `macro_rules!` body instantiated for views and for handles
+> (`macro_input_callback_handle`, `fixup_syntax_handle`), so the two can't drift. `fixup.rs`'s
+> tests also hold the handle fixups (undo info and tree) equal to the view's. New in `attrs.rs`:
+> `expand_view_cfg_attr` and `with_one_segment_view`. `attr_macro_input_to_token_tree` takes a view;
+> `expand_speculative` calls `attr_macro_input_to_token_tree_handle`.
 
 ## dedyn: hir-def and hir-expand: generics for the small per-node callbacks, the rest justified
 
@@ -1792,6 +1836,8 @@ the two functions (about 210 lines together). Call sites unchanged (`&|| ..`).
 before `            let display_name: &dyn fmt::Display = match &name {`
 after  `            let display_name: &dyn fmt::Display = match &name { // dyn: the debug dump, formatting text anyway`
 
+> applied by db-expand-names (2026-10-29 ~21:10): as written (`item_scope.rs` ~L2052).
+
 ### crates/hir-expand/src/attrs.rs: `&dyn ast::HasAttrs`, justified
 
 These three take an item-tree owner once per item and hand it to syntax's
@@ -1830,6 +1876,33 @@ State at 10-29 21:10. Format's best failure (task 13), `SpanMap::dropped_semicol
    `MatchFailure { token, remaining, remaining_span, missing_comma }`). Please encode it, so a
    frozen def map keeps a `macro_rules!` call's error rather than refusing the map.
 
+> forwarded (requests, pass 20; each told by tmux): the `crates/mbe/` parts to frontend-tokens (frontend-tokens-next1, holds mbe; format is DONE), `crates/span/` to frontend-tree (holds span's `ast_id.rs` since frontend-text), `nameres/frozen.rs` to db-expand-names-next2.
+
+> applied by db-expand-names (2026-10-29 ~21:15), item 3 (`nameres/frozen.rs`):
+> `ExpandErrorKind::Mbe` is encoded as macro-error tag 10, then one byte for mbe's kind. 0 is
+> `BindingError`, then its message; 1 is `UnresolvedBinding`, then its name; 2-5 are
+> `LeftoverTokens`, `LimitExceeded`, `NoMatchingRule` and `UnexpectedToken`; 6 is
+> `MatchFailure`: an optional `token`, `remaining`, an optional `remaining_span`, then an
+> optional `missing_comma` span. Both matches are exhaustive, so a new mbe variant won't compile
+> until it is encoded. A frozen map now keeps a `macro_rules!` call's error instead of refusing the
+> map. `ENCODING` is "blaze frozen def map 11". The test `a_builtin_macro_error_reads_back_whole`
+> round-trips two `MatchFailure`s (one mid-input, one at the end with a missing comma), a
+> `BindingError` and `NoMatchingRule`. Types come through hir-expand's
+> `MbeErrorKind`/`MatchFailure` re-exports (no new dependency). Not built.
+
+> frontend-tree (2026-10-29): I take the `crates/span/src/map.rs` part of task 16 (a fragment's
+> span in `SpanMap`, kept through `merge`). Child `frontend-tree-span` writes it, tells
+> frontend-tokens and db-expand the new signatures, and files the hir-expand edit here.
+
+> frontend-tree-span (2026-10-29): applied the `map.rs` part. `push_fragment(range, span)` keeps
+> the invisible group's span in a column sorted by range; `fragment_span(range) -> Option<Span>` is a
+> binary search for exactly `range` (of several, the innermost); `merge` keeps a fragment while its
+> start and end both stay, shifts it like they are shifted, and moves the merged map's fragments in;
+> equality and hashing include the spans. Tests: `a_fragment_keeps_its_groups_span`,
+> `a_merge_keeps_the_fragments_spans_by_their_starts_and_ends`. The one `push_fragment` caller is
+> `syntax-bridge`'s `TtTreeSink::close_fragment` (not mbe's `expand_var`); told frontend-tokens. The
+> hir-expand edit is the request `## frontend-tree-span: hir-expand's map_node_range_up*` below.
+
 ## frontend-hooks: `FileRange::file_text` returns `&syntax::Text` (db-expand-macros, `crates/hir-expand/src/files.rs`; 2026-10-29)
 
 From frontend-hooks, which applied base-db's side of frontend-text's "the parse tree's source is
@@ -1866,3 +1939,200 @@ request above, applied in `crates/hir-expand/src/attrs.rs`), and `item_tree/pers
 puts and gets `self.input`. hir-def does not compile until this impl is in; the bytes written don't change.
 Nothing else needs editing: the builders in `item_tree/attrs.rs` use `.into()` (triomphe has `From<T>`),
 and the readers (`pretty.rs:102`, `attr_resolution.rs:121`, `attrs.rs`) go through `as_ref`/`as_deref`.
+
+> forwarded to frontend-deps (frontend-deps-next2, for frontend-deps-sigs, which holds `hir-def/src/hir/persist.rs`) (requests, pass 20; told by tmux).
+
+## frontend-tree-span: hir-expand's `map_node_range_up*` give a fragment's span (task 16, item 1, third bullet)
+
+`span::SpanMap` (`crates/span/src/map.rs`) now keeps each macro fragment's invisible-group span:
+`pub fn push_fragment(&mut self, range: TextRange, span: Span)` and
+`pub fn fragment_span(&self, range: TextRange) -> Option<Span>` (the span of the fragment whose
+range is exactly `range`; of several with that range, the innermost; kept through `merge`). The
+spans reach the map once frontend-tokens passes them (`syntax-bridge`'s `TtTreeSink::close_fragment`,
+told by tmux). Why: rustc lints a `$x:stmt`'s statement at the metavariable
+(`suggest-remove-semi-in-macro-expansion-issue-142143.rs`).
+
+In `crates/hir-expand/src/lib.rs`:
+
+1. `map_node_range_up_rooted_span`, before:
+
+```rust
+pub fn map_node_range_up_rooted_span(exp_map: &ExpansionSpanMap, range: TextRange) -> Option<Span> {
+    let mut spans = exp_map.spans_for_range(range).filter(|span| span.ctx.is_root());
+```
+
+after:
+
+```rust
+pub fn map_node_range_up_rooted_span(exp_map: &ExpansionSpanMap, range: TextRange) -> Option<Span> {
+    // A node that is exactly a macro fragment is at its metavariable, which no token holds.
+    if let Some(span) = exp_map.fragment_span(range)
+        && span.ctx.is_root()
+    {
+        return Some(span);
+    }
+    let mut spans = exp_map.spans_for_range(range).filter(|span| span.ctx.is_root());
+```
+
+(A fragment span whose context is not root is not one this function gives, by its rule, so its
+tokens' root spans are used as before.)
+
+2. `map_node_range_up` (the free fn), before:
+
+```rust
+) -> Option<(FileRange, SyntaxContext)> {
+    let mut spans = exp_map.spans_for_range(range);
+    let Span { range, anchor, ctx } = spans.next()?;
+```
+
+after:
+
+```rust
+) -> Option<(FileRange, SyntaxContext)> {
+    // A node that is exactly a macro fragment is at its metavariable, which no token holds.
+    if let Some(span) = exp_map.fragment_span(range) {
+        return Some((resolve_span(db, span), span.ctx));
+    }
+    let mut spans = exp_map.spans_for_range(range);
+    let Span { range, anchor, ctx } = spans.next()?;
+```
+
+`map_node_range_up_rooted` and `ExpansionInfo::map_node_range_up` call these two, so they follow.
+A test beside the existing `map_node_range_up` ones: a `macro_rules! m { ($s:stmt) => { $s } }`
+called as `m!(let x = 1)`; the expansion's `LET_STMT` maps up to the `$s` in the rule, not to the
+`let x = 1` in the call.
+
+Status: open
+
+> forwarded to db (db-expand-macros-next2, which holds `crates/hir-expand/`; told by tmux; requests, pass 22).
+
+## frontend-deps: what a proc-macro expansion read, for dependency images (frontend.md item 5; 2026-10-29)
+
+`hir_def::deps` (lane frontend-deps) keeps a dependency crate's def map, lang items and
+signatures as one image under a key of every input. A crate whose items come from proc-macro
+expansions can be imaged only if the key covers the macro's code and the image records what
+each expansion read besides its call (files, listings, process variables), as the expansion
+server traced it. On serve those reads are worked out again, and an image is used only when
+they are unchanged; a change is a miss, never a stale image. `crates/hir-def/src/deps/key.rs`
+and `deps/reads.rs` are written against the four edits below and don't compile until they
+land. The server side (`blaze-expand` reports the reads) is asked of usercode in
+`v2/requests/usercode.md`, same heading.
+
+1. `crates/hir-expand/src/proc_macro.rs`, in `pub trait ProcMacroExpander`, after
+   `fn requires_session`:
+   ```rust
+       /// The content ID of the library the macro is code of: what the key of a crate that
+       /// uses it covers (`hir_def::deps`). `None` when it is not known, which keeps the crates
+       /// that use the macro out of dependency images.
+       fn code(&self) -> Option<base_db::ContentId> {
+           None
+       }
+   ```
+
+2. `crates/hir-expand/src/proc_macro.rs`, after `pub enum ProcMacroExpansionError { .. }`:
+   ```rust
+   /// What an expansion read besides its call and the variables it was given, as its server
+   /// traced it: what the image of the calling crate is filed by (`hir_def::deps`).
+   #[derive(Clone, Debug, PartialEq, Eq)]
+   pub enum ExpansionReads {
+       /// Nothing else.
+       Nothing,
+       /// The names it read, as the server encodes them, and the hash of the values they had.
+       Traced { shape: std::sync::Arc<[u8]>, values: base_db::ContentId },
+       /// Not known, and why: the calling crate gets no image.
+       Unknown(&'static str),
+   }
+
+   thread_local! {
+       static READS: std::cell::Cell<Option<ExpansionReads>> = const { std::cell::Cell::new(None) };
+   }
+
+   /// What the expansion running on this thread read: called by an expander before `expand`
+   /// returns. An expander that does not call it has reads [`ExpansionReads::Unknown`].
+   pub fn report_reads(reads: ExpansionReads) {
+       READS.set(Some(reads));
+   }
+
+   /// What the expander reported since the last call, cleared.
+   pub(crate) fn take_reads() -> Option<ExpansionReads> {
+       READS.take()
+   }
+   ```
+   (`std::sync::Arc`, not the file's `triomphe::Arc`: the shape bytes are shared with the
+   server's store reads. If the vendored salsa wants `salsa::Update` on a tracked return type
+   beyond its `'static + Eq` fallback, add it to the derive.)
+
+3. `crates/hir-expand/src/lib.rs`, in `#[salsa::tracked] impl MacroCallId` (L610):
+   rename `fn expand_proc_macro(self, db: &Db) -> ExpandResult<tt::TopSubtree>` to
+   ```rust
+       #[salsa::tracked(returns(ref))]
+       fn proc_macro_expansion(
+           self,
+           db: &Db,
+       ) -> (ExpandResult<tt::TopSubtree>, proc_macro::ExpansionReads) {
+   ```
+   keeping its doc comment and body, with three changes to the body:
+   - right before `let ExpandResult { value: mut tt, err } = {`, add
+     `proc_macro::take_reads();` (a report left by an expansion that panicked is not this one's);
+   - right after that block (before `fixup::reverse_fixups`), add
+     ```rust
+             let reads = match expander.requires_session(db, loc.def.krate) {
+                 true => proc_macro::ExpansionReads::Unknown(
+                     "its macro keeps a session: an expansion depends on the calls before it",
+                 ),
+                 false => proc_macro::take_reads().unwrap_or(proc_macro::ExpansionReads::Unknown(
+                     "its expander reported nothing of what it read",
+                 )),
+             };
+     ```
+     (for a session macro, call `proc_macro::take_reads();` first as well, so nothing is left);
+   - the last line `ExpandResult { value: tt, err }` becomes
+     `(ExpandResult { value: tt, err }, reads)`.
+
+   Then in the plain `impl MacroCallId` (L903), add:
+   ```rust
+       /// Special case of [`Self::macro_expand`] for procedural macros.
+       fn expand_proc_macro(self, db: &Db) -> &ExpandResult<tt::TopSubtree> {
+           &self.proc_macro_expansion(db).0
+       }
+
+       /// What the expansion of this proc-macro call read besides its call, as its expander
+       /// reported it (`proc_macro::report_reads`). Panics for a call of another kind of macro.
+       pub fn expansion_reads(self, db: &Db) -> &proc_macro::ExpansionReads {
+           &self.proc_macro_expansion(db).1
+       }
+   ```
+   The caller at L806 (`self.expand_proc_macro(db).as_ref()`) is unchanged.
+
+Why: AGENTS.md's cache-key rule. Today a crate with any item from a proc-macro expansion is
+refused an image, so most of crates.io's dependency graph (every crate that uses `serde_derive`,
+`thiserror`, `clap_derive`, ...) is resolved from source on every build. A key that covered the
+macro's library but not what its expansions read would serve a stale def map after
+`include_str!`'d files or variables changed. A thread-local hand-off keeps the trait's
+signatures unchanged for every existing expander.
+
+Tests (in `crates/hir-def/src/deps/tests.rs`, written): a test expander that implements `code`
+and calls `report_reads` is imaged and resolves from its image exactly as a fresh database does
+(def map, diagnostics, signatures). A changed read value misses, and the next image is found. A
+rebuilt library changes the key. The fixture's expanders, which report nothing, are refused.
+
+Status: open
+
+## db-expand-macros: an eager call's info and an attribute's args as `.into()`, not `Box::new` (db-expand-names, `crates/hir-def/src/nameres/frozen.rs`, `crates/hir-def/src/nameres/attr_resolution.rs`)
+
+What: three one-line edits, each compiling against hir-expand both before and after its change
+(`From<T>` is implemented for `Box<T>` and `triomphe::Arc<T>` alike):
+
+1. `frozen.rs:2294`: `Some(Box::new(EagerCallInfo { arg, arg_id, error: None, span }))` becomes
+   `Some(EagerCallInfo { arg, arg_id, error: None, span }.into())`.
+2. `frozen.rs:2309`: `_ => Some(Box::new(self.subtree()?)),` becomes `_ => Some(self.subtree()?.into()),`.
+3. `attr_resolution.rs:136`: `attr_args: arg.map(Box::new),` becomes `attr_args: arg.map(Into::into),`.
+
+The encode side (`&*eager`, `self.subtree(&args)`) reads through deref and needs no change.
+
+Why: frontend-tokens' "stop deriving `Clone` on what holds a `DeclarativeMacro` or a
+`tt::TopSubtree`". `MacroCallLoc` is salsa-interned, and salsa's `InternedData` asks for `Clone`
+(`vendor/salsa/src/interned.rs:89`), so `MacroCallKind` must stay `Clone`. Its two token trees are
+now shared, not owned: `crates/hir-expand/src/lib.rs` has `eager: Option<Arc<EagerCallInfo>>`
+(`EagerCallInfo` no longer derives `Clone`) and `attr_args: Option<Arc<tt::TopSubtree>>`. That
+change is in the working tree already, so hir-def doesn't build until these three lines are in.

@@ -194,3 +194,19 @@ purpose. Its doc `/// The earliest deadline of an open intent.` gains a second l
 `/// A scan, not a timing wheel: one intent per waiting client, a few at once.`
 
 > applied by requests (ci DONE): the second doc line on `Intents::deadline` in `crates/blaze-api/src/session/intent.rs`.
+
+## From cargo: `JobId` as a slab slot (2026-10-29)
+
+lane cargo, `crates/blaze-api/src/build.rs` and `session.rs`: make `JobId` a slab slot,
+`pub struct JobId { pub slot: u32, pub generation: u32 }` (8 bytes, `const` size assert), handed
+out by the session from a free list (a finished job's slot is reused with the generation plus
+one) instead of `next_job: u64`. The daemon (`serve/job.rs`) then keeps its jobs in a
+`Vec<Slot<Job>>` indexed by `slot`, checks `generation`, and drops its `FxHashMap<JobId, Job>`
+and the `.expect` on every lookup (coordinator's ask; principles.md "no hash lookups where an
+index works"). The session's own `jobs: FxHashMap<JobId, ..>` can be the same slab. Order by
+start, where needed, stays the session's `order` list, not the id. Tell lane cargo when it lands;
+cargo-jobs writes the daemon side against this shape now.
+
+> taken by requests (ci is DONE): child `requests-jobid` applies it in blaze-api's `build.rs` and `session*`, and writes the blaze-cargo side as an exact request to cargo; its outcome follows (requests, pass 21).
+
+> applied by requests-jobid: `build::JobId` is `{ slot: u32, generation: u32 }` (8 bytes, const-asserted, `Display` as `{slot}v{generation}`, derives kept). The session's `jobs` is a `blaze_mem::Slab<Job>` (`Job::Request { serial, candidate }` or `Job::Intent`, so intents get their slots from it too): freed slots are reused first, the generation odd while live and stepping on each finish and reuse, a slot retired at `u32::MAX`, so no id is handed out twice; a report or finish of a stale, unknown or even-generation id is dropped with no hash and no `.expect`. Start order no longer comes from ids: `Intents` keeps its intents in a `Vec` in start order (its `FxHashMap` and radix sort are gone), and the best-of numbers candidates by `BestOf::next`, not by id. A request's serial is now reserved before its jobs (`Session::serial`, `begin_as`). Tests: `session/tests.rs` and `session/intent/tests.rs` use ids taken from the builder, plus tests that a reused slot's old id is refused, that intents are taken over in start order after reuse, and that a warm start and finish allocates nothing. `SCHEMA` needs no bump (`JobId` is in no `Envelope` body). The blaze-cargo side is in `v2/requests/requests-jobid.md` "cargo: serve/job.rs onto the JobId slab", and a `blaze_mem::Slab` soundness hole (a forged even generation reads an empty slot) under "mem".

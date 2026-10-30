@@ -48,6 +48,7 @@ test-fixture.workspace = true
 on base-db, hir-expand and span, not on hir-ty, so this is no cycle. Run the manifest lint after.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a (21:16): `hashbrown.workspace = true` (the workspace entry has `nightly` on); covers solver-sync-glue 6 and 10's `Cargo.toml` lines (one line each). Manifest lint clean.
 
 ## 2. lane db: `crates/hir-ty/src/lib.rs`
 
@@ -151,7 +152,7 @@ use hir_def::{AssocItemId, DefWithBodyId, LoweringMode, ModuleDefId, nameres::cr
 use salsa::{Database, Durability};
 use test_fixture::ChangeFixture;
 
-use crate::{InferenceResult, infer::infer_query_with_inspect};
+use crate::{InferenceResult, infer::infer_body_in};
 
 const FIXTURE: &str = r#"
 //- minicore: sized, copy, clone, add, mul, fn, option, deref
@@ -258,9 +259,9 @@ fn a_cold_infer_allocates_its_result_alone() {
     // below allocates is its own.
     infer_all(&db, &bodies);
     for &body in &bodies {
-        frame::task(Tag::Infer, |_| {
+        frame::task(Tag::Infer, |frame| {
             let (result, used) =
-                measure(|| infer_query_with_inspect(&db, body, None, LoweringMode::Analysis));
+                measure(|| infer_body_in(&db, body, None, LoweringMode::Analysis, frame));
             let (copy, owned) = measure(|| result.clone());
             assert!(copy == result, "a run gives the memoized result: {body:?}");
             assert!(
@@ -292,7 +293,7 @@ fn peak_of_chain(lets: usize) -> usize {
     assert_eq!(bodies.len(), 1);
     infer_all(&db, &bodies);
     frame::task(Tag::Infer, |frame| {
-        let _ = infer_query_with_inspect(&db, bodies[0], None, LoweringMode::Analysis);
+        let _ = infer_body_in(&db, bodies[0], None, LoweringMode::Analysis, frame);
         frame.peak()
     })
 }
@@ -308,28 +309,198 @@ fn frame_use_is_linear_in_the_body() {
 ```
 
 Notes for whoever applies it:
-- `infer_query_with_inspect` (`infer.rs:136`) is `pub`; the test calls it as it is when applied
-  (frontend-db changes its `db` to `&Db`, which `&db` is either way). Under mem-db-infer-ctx's
-  change it opens `frame::current` itself (rule R1), which inside the test's `frame::task` is the
-  test's frame: that is what makes `frame.peak()` the run's.
+- `infer_body_in(db, def, inspect, lowering_mode, frame)` is the body of inference that
+  mem-db-infer-ctx's A2 moves out of `infer_query_with_inspect` (`pub(crate)` in `infer.rs`); the
+  tests call it in a `frame::task` of their own, so `frame.peak()` is the run's and the run is not
+  salsa's (it always executes). Its `db` is `&Db` (frontend-db's), which `&db` is.
 - The first test needs mem-db-salsa's zero-allocation deep verify and mem-db-def's hit paths as
   well as this part's: it holds all of them for inference's dependencies.
-- The second holds mem-db-solver's part too (inference variables and goals in the frame).
+- The second holds mem-db-solver's part too (inference variables, goals and the search graph in
+  its recycled per-worker storage, warm after the first run).
 - `peak()` is the most the frame's cursor was since the task began (`frame.rs:88`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
 
+## 5. lane db: one definition of the frame map and set, `crates/hir-ty/src/lib.rs`
+
+(5 to 7 and the two sections after them are new since pass 16: written once every part was done.)
+
+Three parts define the same aliases (ctx C2 in `infer/columns.rs` with the constructors
+`frame_map`/`frame_set`, method S1 in `method_resolution.rs`, lower 1 in `lower.rs`). Apply them
+once, in `lib.rs`, after the `use` block:
+
+```rust
+use blaze_mem::Frame;
+use rustc_hash::FxBuildHasher;
+
+/// A map of a query run's temporaries, in its frame (docs/v2/plan/lanes/mem/db-infer.md, R3).
+pub(crate) type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
+/// A set of a query run's temporaries, in its frame.
+pub(crate) type FrameSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;
+
+pub(crate) fn frame_map<K, V>(frame: &Frame) -> FrameMap<'_, K, V> {
+    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)
+}
+
+pub(crate) fn frame_set<T>(frame: &Frame) -> FrameSet<'_, T> {
+    hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame)
+}
+```
+
+and in place of each part's own definition: ctx C2 (`infer/columns.rs`) writes
+`pub(crate) use crate::{FrameMap, FrameSet, frame_map, frame_set};`, method S1
+(`method_resolution.rs`) and lower 1 (`lower.rs`) write `pub(crate) use crate::{FrameMap, FrameSet};`
+(lower keeps its `exact_thin` there). Every path the parts use (`columns::FrameMap`,
+`crate::method_resolution::FrameMap`, `crate::lower::FrameSet`) still resolves. `blaze_mem::Frame`
+and `blaze_mem::frame::Frame` are the same type (`crates/blaze-mem/src/lib.rs:59`). If `lib.rs`
+already imports `FxBuildHasher` or `Frame` when this is applied, drop the repeated `use`.
+
+> forwarded to db (db-ty-next2) (requests, pass 21; told by tmux).
+
+## 6. lane db: where two parts' entries meet
+
+Each is a site that two parts' entries both change, or that one part's signature change reaches
+in another part's file without an entry of that part. The resolution is written out.
+
+1. **`infer/closure.rs` `lower_closure_params` (about line 1020):** lower 22 makes
+   `lower_closure_params` fill a caller's list and return the bound vars; closure C2 keeps the old
+   call and turns the `collect` into an iterator. Both, together, after:
+
+   ```rust
+        let mut supplied = Vec::with_capacity_in(decl_inputs.len(), self.frame);
+        let bound_vars =
+            self.with_ty_lowering(|ctx| ctx.lower_closure_params(decl_inputs, &mut supplied));
+        let supplied_arguments = supplied.into_iter().map(|input| match input {
+            // The solver takes no type with a lifetime bound outside it.
+            Some(ty) if ty.has_escaping_bound_vars() => self.table.insert_type_vars(ty),
+            Some(ty) => self.process_user_written_ty(ty),
+            None => self.table.next_ty_var(closure_expr.into()),
+        });
+   ```
+
+   and the rest as closure C2 has it (`interner.mk_fn_sig(supplied_arguments, ..)`).
+   `supplied` borrows the frame, not `self`, so the map's `self.table` borrows don't conflict.
+2. **`infer.rs` `resolve_all`'s closure-data loop:** ctx A8 keeps the `shrink_to_fit` calls on
+   the closure data; closure X3 replaces that loop, since closure A4 builds each list once at its
+   length. Apply ctx A8, then closure X3 over the same loop.
+3. **`infer/coerce.rs` `reified_sig` (line 963 now):** lower 12 adds `frame: &Frame` last to
+   `bind_elided_lifetimes`; expr has no entry for its caller. Before:
+   `crate::lower::bind_elided_lifetimes(self.db, function, sig)`, after:
+   `crate::lower::bind_elided_lifetimes(self.db, function, sig, self.frame)`. `reified_sig` takes
+   `&self` of an `InferenceContext<'db, 'f>`, so `self.frame` is there.
+4. **`method_resolution/confirm.rs` (line 463 now):** lower 14a adds `frame: &Frame` last to the
+   free fn `substs_from_args_and_bindings`; method has no entry for this caller. The argument
+   list reborrows `self.ctx` mutably (`&mut LowererCtx { ctx: self.ctx, .. }`), so the frame is
+   read first. Before:
+
+   ```rust
+        substs_from_args_and_bindings(
+            self.db(),
+   ```
+
+   After:
+
+   ```rust
+        let frame = self.ctx.frame;
+        substs_from_args_and_bindings(
+            self.db(),
+   ```
+
+   and after the last argument (`&mut LowererCtx { .. },`) a new last argument `frame,`.
+5. **`method_resolution.rs` `with_method_resolution` (about line 200):** method P1 adds
+   `frame: self.frame` to the `MethodResolutionContext` literal and ctx M1 turns
+   `traits_in_scope` into `TraitsInScope::Inference(self.get_traits_in_scope())`. ctx M1's "after"
+   already has both; apply method P1's field, then ctx M1. `TraitsInScope` is only iterated
+   (`probe.rs:1220`), which its `IntoIterator` covers; `crates/hir`'s two literals take
+   `TraitsInScope::Caller` (ctx M1).
+6. **`remove_deferred_call_resolutions`:** closure's "Notes for other parts" says it returns a
+   global `Vec`; expr X4 (taken by ctx A11) makes it a frame `Vec`. Its one caller
+   (`infer/closure/analysis.rs:532`, a `for` loop calling `resolve(self)`) compiles with either:
+   the list borrows the frame, not `self`.
+7. **`autoderef.rs` steps:** method P6 makes the default `Steps` an `ArrayVec` of 20
+   (`AutoderefSteps<'db>`); ctx's `adjust_steps_as_infer_ok` (expr X2) reads `self.steps()` with
+   `len`, `is_empty` and `iter`, which the `ArrayVec` gives through `Deref<Target = [_]>`. No
+   change beyond the two entries.
+8. **`method_resolution.rs` `crates_containing_incoherent_inherent_impls` (line 1170 now):**
+   mem-db-def's B6 (`v2/requests/mem-db-def.md`) memoizes `Crate::transitive_deps`, which then
+   returns `&[Crate]`; method's entry for this query (I6) still calls `.into_iter()` on the old
+   owned `Vec`. With B6, method's "after" keeps its frame list (a `filter` has no exact length, so
+   a direct `collect` into `Box<[Crate]>` would grow and shrink, against R4) and changes one line,
+   before:
+   `lang.extend(krate.transitive_deps(db).into_iter().filter(|krate| krate.data(db).origin.is_lang()));`
+   after:
+   `lang.extend(krate.transitive_deps(db).iter().copied().filter(|krate| krate.data(db).origin.is_lang()));`
+   (If B6 lands without method's entry, line 1170 is mem-db-def's form,
+   `.iter().copied().filter(..).collect()`.) Method's "Left as is" note on `transitive_deps`
+   (its line 2892) no longer applies once B6 is in: a hit is a memo read.
+9. **dedup-cursor-front's `frozen.rs` change** (below, applied in pass 18) touches `part` and the
+   writer only; method I5 (`trait_impls`, `inherent_impls` readers, lines 80 to 122) quotes code
+   it left as it was, so both apply.
+
+> forwarded to db (db-ty-next2) (requests, pass 21; told by tmux).
+
+## 7. Order to apply
+
+1. This file's 1 to 3 and 5 (dependencies, feature, tags, the shared aliases).
+2. ctx A0 (every `InferenceContext<'db>` header, one mechanical edit across files), then the rest
+   of ctx with expr X1 to X4 (ctx takes them as written).
+3. lower (it changes `TyLoweringContext::new`, which ctx B4, method T1/C1 and `crates/hir`'s
+   three callers follow; lower 22 lists them).
+4. expr, closure, method, eval, with 6's resolutions at the sites it names.
+5. This file's 4 (the tests) last.
+
+mem-db-salsa's `mem_tag` option and lane mem's `frame::current` (mem-db's request 1) are needed
+by every part; until they exist nothing here compiles, so the parts land after them.
+
+> forwarded to db (db-ty-next2) (requests, pass 21; told by tmux).
+
 ## Tags of every query
 
-Filled in from the parts (each part lists its tracked fns with line and tag).
+Every `#[salsa::tracked]` fn of hir-ty outside `next_solver/` adds
+`mem_tag = crate::db::INFER_TAG`, last in its options. None is a MIR query: hir-ty's MIR queries
+are `HirDatabase` methods implemented in hir-ty-mir, and `mir/held.rs`'s entry point opens its own
+`task(crate::db::MIR_TAG, ..)` (eval H1). The fns, by the part that lists each with its line and
+memoized result:
 
-> forwarded to db (from requests, pass 16; told by tmux).
+| file | fns | part entry |
+|---|---|---|
+| `db.rs` | `closure_exprs` | 3 above |
+| `infer.rs` | `infer_body_query`, `infer_anon_const_body_query` | ctx A2 |
+| `lower.rs` | `impl_trait_of_impl`, `type_for_const_with_diagnostics`, `type_for_static_with_diagnostics`, `type_for_type_alias_with_diagnostics`, `impl_self_ty_of_impl`, `const_param_types_with_diagnostics`, `field_types_of_variant`, `supertraits_info`, `resolve_type_param_assoc_type_shorthand`, `type_alias_bounds_with_diagnostics`, `generic_predicates_of`, `trait_environment_query`, `const_conditions_query`, `generic_defaults_with_diagnostics`, `fn_sig_for_fn`, `elided_lifetimes`, `fn_sig_for_struct_constructor`, `fn_sig_for_enum_variant_constructor` | lower 10, 25 |
+| `lower/batch.rs` | `crate_field_types`, `crate_impl_self_tys`, `crate_impl_traits`, `crate_impl_predicates` | lower 15e |
+| `variance.rs` | `variances_of_query`, `ctor_variances_query` | lower 18, 25 |
+| `dyn_compatibility.rs` | `dyn_compatibility_of_trait_query`, `generics_require_sized_self` | lower 25 |
+| `builtin_derive.rs`, `effects.rs` | `predicates`, `const_param_env_query` | lower 21, 25 |
+| `method_resolution.rs` | the 25 of `InherentImpls`, `TraitImpls` and the free queries | method "Tracked functions" |
+| `traits.rs` | `inherent_impl_coherent`, `orphan_rules_hold` | method T2 |
+| `specialization.rs`, `opaques.rs`, `drop.rs`, `representability.rs` | `specializes_query`, `impl_has_unconstrained_params`, the seven of `opaques.rs`, `destructor`, `representability`, `params_in_repr` | method "Tracked functions" |
+| `layout.rs`, `layout/adt.rs`, `layout/target.rs`, `consteval.rs`, `target_feature.rs` | 14 | eval "Tracked fns of these files" |
+
+> forwarded to db (db-ty-next2) (requests, pass 21; told by tmux).
 
 ## What the parts found
 
-Filled in when the parts are done.
+- **The solver gets no frame** (mem-db-solver's decision, `v2/requests/mem-db-solver.md`, "The
+  one design decision"): `InferCtxt`, goals and the search graph use recycled per-worker
+  storage. So `could_unify`/`could_unify_deeply` need no task (ctx U8), and the cold-infer test
+  (4) holds the solver to zero allocations warm through that storage, not through a frame.
+- **A frame can't roll back under `&Frame`** (`scope`/`reset_to` take `&mut`), so every per-node
+  and per-probe temporary stays until the run ends: the frame's peak is the sum of a run's
+  temporaries, about 400 KB for a 1,000-expression body (method's probes 250 KB, closure 45 KB,
+  ctx 40 KB, expr 35 KB, lower 8 KB), written once and linear in the body (4's third test holds
+  the linearity).
+- **Frames past nesting depth 8** map and unmap a 4 GiB region per run (eval's objection);
+  forwarded to mem-db for lane mem: one frame per thread with a nested task as `mark`/`reset_to`.
+  With that, a probe could also run as a nested task and give its 1 KB back at once.
+- **New files since the split** (`infer/sized_bound.rs`, `infer/prelude_lints.rs`): ctx A13 and
+  G6 cover them.
+- **Outside hir-ty**: `crates/hir`'s callers of `TyLoweringContext::new` (lower 22),
+  `MethodResolutionContext` (ctx M1, method H1/H2) and `adt_unused_params` (lower 24); hir-def's
+  `Resolver::traits_in_scope_into` (mem-db-def-resolve, filed); borrowck's and wfcheck's
+  lowering calls (lower 22, mem-db-checks'); a frame-generic radix sort (method, lower:
+  blaze-radix, lane mem's, only if a sort here shows up in a profile).
 
-> forwarded to db (from requests, pass 16; told by tmux).
+> applied: nothing to apply (notes) (requests, pass 21).
 
 ## dedup: byte cursor onto blaze_format::cursor
 

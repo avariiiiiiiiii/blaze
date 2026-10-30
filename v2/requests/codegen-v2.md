@@ -1,10 +1,14 @@
 
 ## dedyn: crates/hir-ty-codegen/v2 and crates/blaze-codegen: the `dyn` sites (from dedyn-codegen, 2026-10-29)
 
+> applied by dedyn-codegen (2026-10-29): dedyn-v2 1 to 5 as written (`HashSource` with `v2/by_id.rs` and its test, fold `Names` with its test, the comments); hot_lint finds no `dyn` in hir-ty-codegen or blaze-codegen. Not built: check it builds and the tests pass.
+
 From `dedyn-codegen` (child of lane `dedyn`, report `/tmp/blaze-lanes/v2-dedyn-codegen.md`). Every
 `dyn` in these paths outside tests, by what it becomes. Anchored on code text: line numbers are as
 of 2026-10-29 21:30 and move. Nothing changes behavior. hot_lint accepts a `// dyn:` on the line or
 the line above.
+
+> forwarded to codegen (codegen-v2-next1) (requests, pass 20; told by tmux).
 
 ### dedyn-v2 1: `blaze-codegen/src/driver.rs`: `&dyn Lookup` becomes `&impl Lookup`
 

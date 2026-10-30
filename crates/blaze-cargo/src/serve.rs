@@ -13,6 +13,7 @@
 mod daemon;
 mod fetch;
 mod heads;
+mod image;
 mod job;
 mod mounts;
 mod plane;
@@ -31,7 +32,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use blaze_core::{Confine, Driver, FileName};
+use blaze_core::{Confine, FileName};
 
 pub use daemon::{Daemon, Options};
 
@@ -197,33 +198,17 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     let steps: Arc<dyn work::Steps> = Arc::new(unit::Real::new(&paths).map_err(|why| anyhow::anyhow!(why))?);
     let scratch = paths.state.join("spawn");
     let runner = Box::new(plane::Threads::new(options.io));
-    #[cfg(target_os = "linux")]
-    {
-        let driver = blaze_core::uring::Uring::new("/").context("starting io_uring")?;
-        run(driver.confined(confine).scratch(scratch), options, steps, runner)
-    }
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-    {
-        let driver = blaze_core::kqueue::Kqueue::new("/", threads).context("starting kqueue")?;
-        run(driver.confined(confine).scratch(scratch), options, steps, runner)
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    )))]
-    {
-        let driver = blaze_core::threads::Threads::new("/", threads);
-        run(driver.confined(confine).scratch(scratch), options, steps, runner)
-    }
+    let driver = blaze_core::native(std::path::Path::new("/"), threads)
+        .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?;
+    run(driver.confined(confine).scratch(scratch), options, steps, runner)
 }
 
-/// The loop over the platform's driver (io_uring on Linux, kqueue on macOS and the BSDs,
-/// threads elsewhere), its root `/`, until it stops.
-fn run<D: Driver>(
-    driver: D,
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!("blaze serve runs on a native driver: io_uring (Linux), kqueue (macOS) or IOCP (Windows)");
+
+/// The loop over this target's native driver, its root `/`, until it stops.
+fn run(
+    driver: blaze_core::Native,
     options: Options,
     steps: Arc<dyn work::Steps>,
     runner: Box<dyn plane::Runner<job::Value>>,

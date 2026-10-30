@@ -295,8 +295,9 @@ pub(crate) fn value_id(bytes: &[u8]) -> ContentId {
 /// A key handed to a query's runner: the caller's own, or the bytes the database kept.
 #[derive(Clone, Copy)]
 enum KeySource<'a> {
-    // Kinds register at run time, so a typed key is erased once a run and read back by one
-    // dyn: `TypeId` compare.
+    // dyn: kinds register at run time into a table of `Runner` fn pointers, so the caller's
+    // key is erased; read back by one `TypeId` compare when the query runs, never on a lookup
+    // that finds its memo.
     Typed(&'a (dyn Any + Send + Sync)),
     Bytes(&'a [u8]),
 }

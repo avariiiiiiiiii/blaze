@@ -32,6 +32,7 @@
 > `impl_def`, `adt_source`, `item_range`, `expansion()` (plus `cx.def(ast::Node) ->
 > Option<hir::ModuleDef>`); `macro_def`, `macro_source`, `resolve_name` awaiting an answer.
 > forwarded to lints (from requests, pass 16; told by tmux).
+> applied by lints-driver: in `check.rs` and `lints/mod.rs` (checked by lane `lints`, 2026-10-29).
 
 ## lints-driver: `lints/mod.rs` call shapes
 
@@ -48,3 +49,4 @@ ast::MatchExpr), check_if_let(cx, ast::IfExpr)}`, `bool_assert_comparison::check
 take `cx: &mut Cx<'_, 't>`.
 
 > forwarded to lints (from requests, pass 16; told by tmux).
+> applied by lints-driver: in `check.rs` and `lints/mod.rs` (checked by lane `lints`, 2026-10-29).

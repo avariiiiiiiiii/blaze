@@ -191,6 +191,7 @@ impl Platformed {
 }
 
 /// A package of the resolve, as read from its manifest.
+#[derive(Clone, Copy)]
 pub struct Package<'a> {
     pub manifest: &'a Manifest,
     /// Whether it is a member of the workspace.

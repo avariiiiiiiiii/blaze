@@ -16,8 +16,9 @@ pub enum Cancelled {
 
     /// The query was operating on revision R, but there is a pending write to move to revision R+1.
     ///
-    /// Salsa never throws it: a write takes the database by `&mut`, so no query runs during one.
-    /// Hosts throw it to abandon work for a write they are about to make.
+    /// Thrown at a query call after [`Database::stop_readers`](crate::Database::stop_readers),
+    /// until the next write; hosts also throw it to abandon work for a write they are about to
+    /// make.
     PendingWrite,
 
     /// The query was blocked on another thread, and that thread panicked.

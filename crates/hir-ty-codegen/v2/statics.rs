@@ -8,7 +8,7 @@ use blaze_items::{ItemId, ItemKey};
 use hir_def::{HasModule, StaticId, attrs::AttrFlags};
 
 use super::{
-    Hashes, Places,
+    HashSource, Hashes, Places,
     places::{Placer, Ref, fill_type_ids, place_requests, resolve, weak_symbol},
 };
 use crate::{
@@ -37,7 +37,7 @@ pub(crate) struct Value {
 pub(crate) fn value(
     db: &Db,
     homes: &mut Homes,
-    hashes: &dyn Hashes,
+    hashes: &HashSource,
     id: StaticId,
 ) -> Result<Value, String> {
     let thread_local = is_thread_local(db, id);
@@ -88,7 +88,7 @@ pub(crate) fn value(
 pub(crate) fn compile(
     db: &Db,
     homes: &mut Homes,
-    hashes: &dyn Hashes,
+    hashes: &HashSource,
     arch: Arch,
     id: StaticId,
     refs: &Refs,

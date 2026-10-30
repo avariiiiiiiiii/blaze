@@ -692,8 +692,8 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
         Ok(())
     }
 
-    fn walk_stmt(&mut self, stmt: &Statement) -> Result {
-        match *stmt {
+    fn walk_stmt(&mut self, stmt: Statement<'_>) -> Result {
+        match stmt {
             Statement::Let { pat, initializer: Some(expr), else_branch: els, .. } => {
                 self.walk_local(expr, pat, els)?;
             }

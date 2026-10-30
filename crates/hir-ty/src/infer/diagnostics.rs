@@ -135,7 +135,7 @@ impl<'db, 'a> InferenceTyLoweringContext<'db, 'a> {
     #[inline]
     pub(super) fn at_path<'b>(
         &'b mut self,
-        path: &'b Path,
+        path: Path<'b>,
         node: ExprOrPatIdPacked,
     ) -> PathLoweringContext<'b, 'a, 'db> {
         let on_diagnostic = PathDiagnosticCallback {
@@ -152,7 +152,7 @@ impl<'db, 'a> InferenceTyLoweringContext<'db, 'a> {
     #[inline]
     pub(super) fn at_path_forget_diagnostics<'b>(
         &'b mut self,
-        path: &'b Path,
+        path: Path<'b>,
     ) -> PathLoweringContext<'b, 'a, 'db> {
         let on_diagnostic = PathDiagnosticCallback {
             data: Either::Right(PathDiagnosticCallbackData {

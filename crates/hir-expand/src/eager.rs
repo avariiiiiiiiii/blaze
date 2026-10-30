@@ -24,6 +24,7 @@ use syntax::{
     AstPtr, SyntaxElement, SyntaxNode, TextSize, WalkEvent, syntax_editor::SyntaxEditor,
 };
 use syntax_bridge::DocCommentDesugarMode;
+use triomphe::Arc;
 
 use crate::{
     AstId, EagerCallInfo, ExpandError, ExpandErrorKind, ExpandResult, ExpandTo, ExpansionSpanMap,
@@ -118,7 +119,7 @@ pub fn expand_eager_macro_input(
         kind: MacroCallKind::FnLike {
             ast_id,
             expand_to,
-            eager: Some(Box::new(EagerCallInfo { // alloc: the eager call's interned key, once per eager call
+            eager: Some(Arc::new(EagerCallInfo { // alloc: the eager call's interned key, once per eager call
                 arg: subtree,
                 arg_id,
                 error: err.clone(), // clone: an `Option<ExpandError>`: an `Arc` count, only on error

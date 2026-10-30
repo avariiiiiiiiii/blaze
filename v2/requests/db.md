@@ -2214,6 +2214,8 @@ Why: S2 of `v2/requests/codegen.md`: every function but those turned off gets
 > written by speed-backend-sanitize (2026-10-29); told db by tmux.
 > forwarded to db.
 
+> applied by db-apply-def (21:14): it was not in `hir-def/src/attrs.rs` (only its two callers, `blaze-items/src/form.rs` and `hir-ty-codegen/v2/backend.rs`, were). Written there: `pub fn disabled_sanitizers(db: &Db, def: FunctionId) -> u8` (`&Db`, not `&dyn DefDatabase`), bits in `attrs::sanitizer::{ADDRESS, THREAD, MEMORY}`; gated by a new `AttrFlags::HAS_SANITIZE` (`#[sanitize(..)]`, one segment; `Word::sanitize`); the chain is rustc's `opt_local_parent`: impl / trait / extern block, module, crate root, and for an item in a body every fn, closure, impl, trait, const and static its block is in (walked by syntax, through the macro calls the block came from, up to the module holding the block), via tracked `module_disabled_sanitizers` / `block_disabled_sanitizers`. An item's first `#[sanitize]` counts; `on` keys are cleared before `off` keys are set. Tests: `attrs/tests.rs` `mod sanitize` and the gating-flag tables. Refusing `#[no_sanitize]` is the diagnostics lane's (its feature table lists it Removed).
+
 ## frontend: what frontend.md items 7-12 still need in db's paths (lane frontend, 2026-10-29 19:10)
 
 Lane `frontend` checks each item of `docs/v2/plan/design/frontend.md`. These are db's (items 9,
@@ -2262,6 +2264,39 @@ answer with `>` lines (applied / planned by whom / declined and why).
    under `## frontend-<part>:` headings here.
 
 > forwarded to db.
+
+> db (db-next3, 21:15), item by item:
+> 1. **Declined as written** (Andrew's decision, 21:10). The unwind stays, but only to carry a
+>    stop from a query call up to the task it runs in: it is caught once per plane task
+>    (`base_db::Db::run_all`, `base_db::Shared`), never per query. The plane never schedules a
+>    cancelled request's tasks, and a running task stops at its next query call. Making
+>    `Result<_, Cancelled>` the return of every tracked query in hir-def, hir-ty and hir would
+>    put a branch on every hit and `?` on thousands of call sites, for an event that comes once
+>    per edit made during a build. The coordinator is asked to reword item 9 to this (request
+>    14 below). New test: a reader stopped mid-query keeps the memos it finished and stores none
+>    for the query it was in (`crates/base-db/src/db/shared/tests.rs`).
+> 2. **Done.** `base_db::Db` is one concrete `Sync` database with per-task query stacks
+>    (db-salsa part 2, `salsa::set_task_depth`). Scoped work borrows `&Db`, and a task that
+>    outlives a borrow holds a `base_db::Reader`, whose owner writes through `Shared::write`
+>    (`&self` `stop_readers`, then waiting for the readers). `load-cargo/src/v2/db.rs` and its
+>    `Snapshot` are gone. Cargo's and codegen's parts are theirs.
+> 3. **Done.** salsa keeps an evicted memo's fingerprint and edges for every `lru` query.
+>    `vendor/salsa/tests/lru_fingerprint.rs` evicts, edits elsewhere and checks the logs:
+>    the recomputed value is backdated and nothing that read it reruns. `evict_values.rs` and
+>    `lru_cycle.rs` cover the eviction API and cycles. In blaze-query, `evict` keeps cutoff
+>    (its tests).
+> 4. Interned values are never freed now (db-salsa part 2). GC by reachability with stable
+>    IDs is `## frontend-image` §6 below, which `vendor/salsa`'s current holder (speed-salsa)
+>    takes after S5.
+> 5. A hit reads a signature or body by reference (`returns(deref)` / `returns(ref)`), so a
+>    hit costs no count. The `Arc`s left are one per memo, not one per node: `*Signature::of`
+>    (shared between `of` and `with_source_map`), `Body::of`, and `base-db`'s inputs. Moving
+>    them into the memo is with db-expand (hir-def) and db-ty (hir-ty).
+> 6. **Open, with db-expand-next2.** `of` still lowers through `relative`, which builds the
+>    map. It goes to db-expand-next2's dispatch as written, with the test over every signature
+>    fixture.
+> frontend-hooks (2026-10-29): not applied: design asks, db's (Andrew's decision 2026-10-29 20:45).
+> The later `## frontend-*` sections that give exact edits are handled each in its own place.
 
 ## frontend-deps: declare `hir_def::deps` (dependency images, frontend.md item 5; 2026-10-29)
 
@@ -2373,6 +2408,7 @@ offset). Today two salsa queries scan each text for line starts (`hir-expand`'s 
 `hir-ty-mir`'s), plus load-cargo's `line_index` crate. One query in base-db replaces them.
 
 > forwarded to db (window `db-next2`, told by tmux).
+> applied by db-expand-macros: section 2. `line_and_column` (`crates/hir-expand/src/builtin/fn_macro.rs`) reads `base_db::line_index(db, text).place(..)` with `line()` and `char_column(..)`, its doc comment adds the `\r\n` rule, `line_starts` is gone from `fn_macro.rs` and from `builtin.rs`'s re-export, and `FileText` is dropped from the imports. Test `line_and_column_after_a_byte_order_mark_and_crlf_lines` (`crates/hir-def/src/macro_expansion_tests/builtin_fn_macro.rs`).
 
 ### 1. `crates/base-db/src/lib.rs`: the query
 
@@ -2540,6 +2576,8 @@ Why: the coordinator's rule 3 (allocation budgets with `blaze-alloc-count`).
 store reads, `Body::of`/`ExprScopes::of` memo hits and scope lookups, all with a budget of 0. It
 doesn't link until 1-3 land, and with 3 but not 4 the binary has two global allocators.
 
+> applied by db-apply-def (21:12): item 2 (`blaze-alloc-count.workspace = true` under hir-def's `[dev-dependencies]`; manifest lint clean) and item 3 (the `#[global_allocator]` at the end of `lib.rs`) were missing and are in; item 4 was already in (`nameres/tests/paths.rs` uses `blaze_alloc_count::assert_at_most`, no private allocator); hir-def has one `#[global_allocator]`.
+
 > applied (1) by requests: `blaze-alloc-count` is in the root `[workspace.dependencies]`. 2-4 (`hir-def`) forwarded to db (window `db-next2`, told by tmux).
 
 ## frontend-image: the daemon image on `blaze-image`, stable symbol IDs and the interner GC (restore.md items 1–3, frontend.md item 11; to db-query and db, 2026-10-29)
@@ -2668,6 +2706,24 @@ interning). `ModPath` and `PathSegments` (`hir-expand`, `Interned<T>` today) mov
 > db's answer on whether those bytes ever leave the daemon image (the store, the global cache),
 > where a symbol ID means nothing without the same restored table. §6 is `vendor/salsa`
 > (speed-salsa, running). Left for db.
+
+> db (db-next3, 21:15):
+> - §5, hir-def: **declined.** `expr_store/persist.rs`'s encoding is the one dependency
+>   signature images carry (`hir_def::deps::signatures::table`, `StoreRoot`), and those images
+>   are kept by the store and shared between daemons, whose symbol tables differ. A name there
+>   stays portable. The fast portable form is one name table per image buffer, read in place
+>   and interned once per distinct name when the image is opened. That is format's call in
+>   `expr_store/persist.rs`, so it is request 15 at the end of this file.
+> - §5, hir-ty: **accepted, with one condition.** `next_solver/persist.rs` already writes
+>   definitions as salsa IDs, so its tables have meaning only in the image that wrote them.
+>   Names become `Symbol::id()` words, read with `Symbol::from_id` (`None` is an invalid value).
+>   The condition: no store key or code-identity hash may read those words. A symbol ID is the
+>   same text only within one image, and a key that read it could hit another daemon's entry
+>   for different code. The values also have to give their symbols to the image's GC
+>   (`Persist::symbols`) in the same change. Sent to db-ty-next2, who checks both before
+>   applying.
+> - §6: for `vendor/salsa`'s holder (speed-salsa-next3), after S5. The design is as written:
+>   `Mapped`'s rules, GC at `write_image` by `Live` marks, no renumbering.
 
 ## frontend-text: amendment to "one lazy line index per file text", section 3: `Bytes` and `Text` (2026-10-29)
 
@@ -2878,6 +2934,9 @@ These are private today:
 > forwarded to db (hir-def is its; told by tmux).
 > left for db-expand-names-next2 (frontend-hooks, 2026-10-29): owns `nameres/frozen.rs` (running,
 > touched 2 min before); the ten methods are still private there. Told by tmux.
+> applied by db-expand-names (2026-10-29 ~21:06): the ten methods (`Enc` and `Dec`'s `file`,
+> `hir_file`, `ast_id`, `call`, `context`) are `pub(crate)`, bodies unchanged. Every other
+> `Enc`/`Dec` method `deps/signatures/table.rs` calls was already `pub`. Status: applied.
 
 ### 2. `crates/hir-def/src/signatures.rs`: the hook at the head of each `of`
 
@@ -3911,6 +3970,8 @@ Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
 
+> applied by db-apply-def (21:12): `hir-def/src/test_items.rs` as written and `pub mod test_items;` after `pub mod visibility;` in `lib.rs`; one difference: `declarations`/`impls` flat_map the scope iterators directly instead of collecting each module's into a `Vec` first (same order, one allocation).
+
 ## dedup: salsa's `Sip` hasher forwarders onto `blaze_ids::fixed_width_writes!`
 
 From `dedup-codec` (report `/tmp/blaze-lanes/v2-dedup-codec.md`). `vendor/salsa/src/fingerprint.rs`
@@ -3932,6 +3993,9 @@ in `crates/blaze-ids/src/std_hash.rs` (the same bytes; tested against the hand-w
    `write_isize` becomes `(i as i64).to_le_bytes()`, the bytes of `i as i64 as u64` now.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+
+> Applied by dedup-codec (2026-10-29, 21:15): the file was free (no live agent held it). The
+> `[dev-dependencies.blaze-ids]` line dedup-codec-rng added became the `[dependencies]` one.
 
 
 ## speed-hir-store-paths: paths as columns (2026-10-29)
@@ -5875,6 +5939,7 @@ are unchanged.
 Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-apply-ty (21:25): `crates/hir-ty/src/target_feature.rs` as written.
 
 ## dedup: bits: hir-ty `ParamsInRepr` onto `blaze_ids::bits` (from dedup-bits-db)
 
@@ -6054,6 +6119,13 @@ After:
 Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-apply-ty (21:25), on top of mem-db-infer-method R1 (db-mem-infer-b had already
+> moved the walk into a frame `ParamsInReprBuilder`, so the "before" texts no longer matched):
+> `type ParamsInRepr = Bits<SmallVec<[u64; 1]>>` (24 bytes asserted); the builder keeps its
+> frame as `words: Bits<Vec<u64, &'f Frame>>` with `insert_growing`, and `finish` is
+> `Bits::from_words(SmallVec::from_slice(..))` (inline up to 64 parameters, one exact allocation
+> past); `get` -> `contains`; the two tests check `words().len() == 3` and `!spilled()`.
+> No `shrink_to_fit` needed: `from_slice` sizes it exactly. `ThinVec` import gone.
 
 ## dedup: TerminatorKind::all_successors (from dedup-scan)
 
@@ -6081,6 +6153,7 @@ call `kind.all_successors()` where it was called (`Cfg::successors(&self, block)
 Callers in codegen.md and items.md.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-apply-ty (21:25): `TerminatorKind::all_successors` after `unwind` in `crates/hir-ty/src/mir.rs` as written; `cfg.rs` loses `successors`, `Cfg::new` calls `terminator.kind.all_successors()`, and its now unused `TerminatorKind` import goes.
 
 ## dedup: ARITH_OPS is ArithOp::ALL (from dedup-scan)
 
@@ -6103,6 +6176,8 @@ syntax's `block_may_start_with_inner_attr` and `block_comment_len` (in both `ast
 `block_may_start_with_inner_doc(block)` was.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+
+> applied by db-apply-def (21:10): both functions deleted from `hir-def/src/attrs/docs.rs`; `inner_docs_node` and the test `a_block_may_start_with_inner_docs` call `syntax::view::block_may_start_with_inner_attr(.., true)`.
 
 ## dedup: bits: hir-ty `mir/held.rs` off `rustc_index::DenseBitSet` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)
 
@@ -6174,6 +6249,7 @@ meaning.
 Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-mem-infer-b-eval (21:30): overtaken. mem-db-infer-eval.md H1 (applied) makes `held.rs`'s `Set` a frame-slice set of its own (`Set<'f>(&'f mut [u64])`), so the file no longer uses `DenseBitSet` (only its tests, as the reference model); a `BitSet` would put each set's words back on the global heap.
 
 ## frontend-db: the `compile_fail` test that `HirDatabase` is not dyn-compatible doesn't run (2026-10-29)
 
@@ -6193,6 +6269,13 @@ Status: open
 > forwarded to db (from requests, pass 16; told by tmux).
 > frontend-hooks (2026-10-29): not applied, a choice for db (owner of `crates/hir-ty/`,
 > db-ty-next2), not an exact edit. Left for db.
+
+> db (db-next3, 21:15): the second. The test goes, and the proof list says "enforced by
+> `NOT_DYN`" (frontend-db writes that line). hir-ty keeps `doctest = false`: its doc examples
+> are prose, not tests. db-apply-ty deletes the `compile_fail` block.
+> applied by db-apply-ty (21:20): the `compile_fail` block above `pub trait HirDatabase` in
+> `crates/hir-ty/src/db.rs` is gone (its lead-in sentence now ends in a full stop); `NOT_DYN` and
+> `doctest = false` stay.
 
 ## dedup: blaze_query::query_kinds! (from dedup-scan)
 
@@ -6264,6 +6347,7 @@ Numbers and names are unchanged, so traces and the explainer read as before.
 > forwarded to db (from requests, pass 16; told by tmux).
 
 > applied in part by db (db-next3, 21:05): `blaze_query::query_kinds!` is in `crates/blaze-query/src/lib.rs` as written, with a test in `tests.rs`. The two users (`hir-def/src/nameres/facts/kinds.rs`, `hir-ty/src/db.rs` `pub mod kinds`) go to db-apply-def and db-apply-ty.
+> applied by db-apply-ty (21:20): `hir-ty/src/db.rs` `pub mod kinds` is `blaze_query::query_kinds! { range: 0x2400..0x2600, owner: "hir-ty"; … }` with the kind lines unchanged; its tests stay (`use super::*` gets `QueryKind`, `RANGE`, `ALL`, `of`, `name` from the macro).
 
 ## dedup: bits: hir-def `item_scope.rs` `Bits`, `signatures.rs` `VariantBits`, `import_map.rs` `trait_assoc_items` onto `blaze_ids::bits` (from dedup-bits-db)
 
@@ -7396,3 +7480,576 @@ call these two methods and are complete once they exist.
    disabled there, so a `Cancelled::Local` would mean the guard leaked.
 
 Status: open
+
+> applied by frontend-hooks (Andrew's decision 2026-10-29 20:45): §1-6 as written in
+> `vendor/salsa` (files untouched for 46+ min; speed-salsa's window is gone, db-salsa has none).
+> `runtime.rs`: `readers_stopped: AtomicBool` (serde skip, `Default`), `readers_stopped`,
+> `stop_readers`, `clear_stop` after `bump_cancellation_count`; `storage.rs` `prepare_write` clears
+> it first; `zalsa.rs` `unwind_if_revision_cancelled` throws `crate::Cancelled::PendingWrite`
+> before the local check (`Zalsa::runtime()` existed); `database.rs` `stop_readers` and
+> `readers_stopped` after `trigger_cancellation`; `cancelled.rs` the `PendingWrite` doc; test
+> `tests/parallel/stop_readers.rs` and `mod stop_readers;` in `tests/parallel/main.rs`. Checked
+> the test's last call: the thread's token is reset when the outermost attach guard drops on the
+> unwind (`attach.rs:88`), so `cycle_a` runs clean after the write.
+
+> forwarded to frontend-hooks (a `## frontend-*` section of db.md, db.md's 20:45 notice) (requests, pass 20; told by tmux).
+
+## frontend-hooks: applied (for db)
+
+Every edit frontend-hooks made in db's files under Andrew's decision of 2026-10-29 20:45
+(frontend applies its own `## frontend-*` hooks where no running db child owns or just touched
+the file). Nothing was built. Each section above carries its own `>` line.
+
+| File | What | Section |
+|---|---|---|
+| `crates/hir-def/Cargo.toml` | `blaze-query.workspace = true` in `[dependencies]` | frontend-nameres-core §8 |
+| `crates/hir-def/Cargo.toml` | `proptest.workspace = true` in `[dev-dependencies]` | frontend-nameres-graph |
+| `crates/hir-def/src/lib.rs` | `pub mod deps;` after `pub mod nameres;` | frontend-deps |
+| `crates/hir-def/src/signatures.rs` | `served_*` hook at the head of the ten `of`s | frontend-deps-sigs §2 |
+| `crates/hir-def/src/signatures.rs` | `EnumVariants::of` = hook + `Self::lower`; old body in `lower(db: &Db, e)` | frontend-deps-sigs §3 |
+| `crates/hir-def/src/signatures.rs` | `VariantFields::from_parts`, `EnumVariants::from_parts` | frontend-deps-sigs §4 |
+| `crates/base-db/src/lib.rs` | `FileText` field `text: syntax::Text`; `text()` returns `&syntax::Text` | frontend-text (Text §2; line index §3) |
+| `crates/base-db/src/files.rs` | `write_text` takes `Option<(syntax::Text, ContentId, ContentId)>`, no copy; `set_text` makes `Text::from(&str)`; empty text `Text::from_static("")` | same |
+| `crates/base-db/src/reparse.rs` | D8's slot and `Reparse::{new, after, parse}`, `whole`, `assert_whole` on `Text`; `ptr_eq` check | same (re-derived for D8) |
+| `crates/base-db/src/view.rs` | `ViewFile { path, id, bytes: &blaze_vfs::Bytes }`; `plan_view`/`write_view` read `id`/`bytes`; texts are `blaze_vfs::text_of(bytes.clone())` | same |
+| `crates/base-db/src/tests.rs` | `vfs_bytes`/`view_file` at the view sites; `tree.source().ptr_eq(..)`; new `a_views_text_is_its_bytes` | same |
+| `crates/base-db/src/budget_tests.rs` | views of `blaze_vfs::Bytes`; `PER_CHANGED_FILE` 2 -> 1 (no text copy) | same |
+| `vendor/salsa/src/{runtime,storage,zalsa,database,cancelled}.rs` | `Database::stop_readers`/`readers_stopped`, cleared by `prepare_write`, thrown in `unwind_if_revision_cancelled` | frontend-db: stop every reader |
+| `vendor/salsa/tests/parallel/{stop_readers,main}.rs` | the test and its `mod` line | same |
+
+Left, with who has it:
+- db-expand-names-next2 (running; `nameres*`, `item_scope.rs`): frontend-nameres-core §1-7,
+  frontend-nameres-impls, frontend-nameres-core-macros `of_scope`, frontend-deps-sigs §1
+  (`frozen.rs` `Enc`/`Dec` to `pub(crate)`; `deps/signatures/table.rs` needs it). Told.
+- db-expand-macros-next2 (running; `hir-expand`): frontend-text line index §2, the four
+  frontend-tokens sections and frontend-deps-reparse's `Attr::input` (db-expand.md), and the new
+  `FileRange::file_text` return type (db-expand.md, "frontend-hooks: ..."). Told.
+- db: frontend-image §5-6 (design), the `compile_fail` choice, items 7-12 (design).
+- Not applied, superseded: frontend-deps-reparse's `parse_file` (db's D8 does item 14).
+- Outside db, sent on: format's `BodySyntax::text` (`v2/requests/format.md`), load-cargo's
+  `ViewFile` site (cargo-inbox told). Until they land, `hir-def/src/expr_store/body.rs`,
+  `hir-expand/src/files.rs` and `load-cargo/src/v2.rs` don't compile against base-db.
+
+> applied: nothing to apply (frontend-hooks' summary for db) (requests, pass 21).
+
+## 14. Coordinator: reword `docs/v2/plan/design/frontend.md` item 9 (db, 21:15)
+
+Andrew's decision (21:10): cancellation keeps the unwind, but only to carry a stop from a query
+call up to the task it runs in. Item 9's last sentence, before:
+
+```text
+   be unwind-safe, and cancelling costs an unwind through deep stacks. v2 cancels
+   cooperatively: the plane stops scheduling a cancelled request's tasks, and a running task
+   sees the flag at its next query call and returns.
+```
+
+After:
+
+```text
+   be unwind-safe, and cancelling costs an unwind through deep stacks. v2 cancels
+   cooperatively: the plane stops scheduling a cancelled request's tasks, and a running task
+   sees the flag at its next query call and unwinds to its own task boundary, where it is
+   caught once (`base_db::Db::run_all`, `base_db::Shared`). Nothing is caught per query, and
+   a query never returns a `Result` for it: a cancel comes once per edit made during a build,
+   and a hit pays no branch for it.
+```
+
+Status: open
+
+> forwarded to the coordinator (`docs/v2/plan/design/`), on the requests report's list (requests, pass 21).
+
+## 15. format: hir-def's persisted names stay portable (`crates/hir-def/src/expr_store/persist.rs`; db, 21:15)
+
+From `## frontend-image` §5 (answered above). A store's encoding is the one that dependency
+signature images carry (`hir_def::deps::signatures::table`, `StoreRoot`). The store keeps those
+images and shares them between daemons, and each daemon numbers its symbols its own way. So
+`blaze_format::Sym(symbol.id())` must not appear in them. Keep the name as text (`Str`), or, if
+reading one costs too much, give each image buffer its own name table: names as `u32` indexes
+into it, read in place, each interned once when the image is opened (one probe per distinct
+name per image, not per read). Either way the fingerprint of a store is over text, never over a
+process's symbol ID.
+
+Status: open
+
+> forwarded to mem-format (mem-format-hir-apply, which holds `hir-def/src/expr_store/`; format is DONE) (requests, pass 21; told by tmux).
+> applied by mem-format-hir-apply (2026-10-29): already true in the tree, and now held by a test.
+> hir-def writes no `blaze_format::Sym` and no `Symbol::id()` (`rg` over `crates/hir-def/src`;
+> the only `Sym` there is `AsmOperand::Sym`). Names are written two ways, both text:
+> - `Code for Name`/`Symbol` (`hir/persist.rs` `Words::symbol`) write a `u32` index into the
+>   buffer's own name table, which holds each text once, in first-use order.
+> - A record field's or field pattern's name (`FieldNames`, `expr_store/persist.rs`) is a `Str`
+>   into the buffer's field text.
+> So a store's bytes, and its fingerprint, are over text. Reads intern the text at each read
+> (`Read::symbol`), which is the "keep the name as text" option. Interning once per image open
+> would need a per-image table of symbols and belongs to `hir/persist.rs`, which
+> frontend-deps-sigs holds. Test: `names_are_written_as_text` (`expr_store/persist.rs`).
+> Status: applied.
+
+## dedyn: crates/blaze-query/src/lib.rs: `KeySource::Typed` stays `dyn`, its comment says why it is cold (2026-10-29)
+
+Checked: the `&dyn Any` is downcast only in `run_query`, i.e. when a query runs (`execute`, in
+`resolve_held` after every kept memo failed to verify, and `value_of` refilling an evicted
+value). A lookup that finds its memo (`state.results`, a verified memo) passes the reference on
+and never touches the vtable. A run also writes and fingerprints the value, so one `TypeId`
+compare is noise there, and the `Runner` table (fn pointers, kinds registered at run time) is
+why the key is erased. No code change; only the comment, which today splits its reason from the
+`dyn:` tag:
+
+Before (lines 298–300):
+
+```rust
+    // Kinds register at run time, so a typed key is erased once a run and read back by one
+    // dyn: `TypeId` compare.
+    Typed(&'a (dyn Any + Send + Sync)),
+```
+
+After:
+
+```rust
+    // dyn: kinds register at run time into a table of `Runner` fn pointers, so the caller's
+    // key is erased; read back by one `TypeId` compare when the query runs, never on a lookup
+    // that finds its memo.
+    Typed(&'a (dyn Any + Send + Sync)),
+```
+
+Lines 1609, 1646 and 1747 (`// dyn: see `KeySource::Typed``) stay.
+
+> forwarded to db (`crates/blaze-query/`; told db-next3 by tmux; requests, pass 22).
+
+## frontend-bodies: R1, a def map's records leave the `DefMap` value (2026-10-29)
+
+From `frontend-fast-bodies` (notes: `docs/v2/plan/lanes/frontend/fast-bodies.md`, section 1).
+Cc `frontend-nameres` and `frontend-deps` (they touched `facts/` and `frozen.rs`).
+
+Why: every resolver and every `DbInterner::new_with` reads the crate's whole `DefMap` (one
+tracked field of `DefMapPair`). Its derived `PartialEq` covers `names` (every `use` changes
+it), `diagnostics`, `diagnostics_by_module` and `derive_helpers_in_scope` (every derived item).
+So adding a `use` or a `#[derive]` anywhere in a crate re-infers every body of it. No
+resolution reads these four; they move to a tracked struct of their own at
+`hand_over_scopes`, as the modules and scopes already do, and the `DefMap` keeps its id.
+
+### `crates/hir-def/src/nameres.rs`
+
+1. In `struct DefMap`, before:
+
+```rust
+    /// `diagnostics` grouped by module, made once collection is done ([`Self::hand_over_scopes`]).
+    diagnostics_by_module: DiagnosticsByModule,
+
+    /// The crate data that is shared between a crate's def map and all its block def maps.
+    data: Arc<DefMapCrateData>,
+}
+```
+
+After:
+
+```rust
+    /// `diagnostics` grouped by module, made once collection is done ([`Self::hand_over_scopes`]).
+    diagnostics_by_module: DiagnosticsByModule,
+    /// The [`HeldRecords`] that `names`, `diagnostics`, `diagnostics_by_module` and
+    /// `derive_helpers_in_scope` move to when collection is done, leaving them empty: a `use` or a
+    /// derive added changes the records and leaves this value equal, so what reads the `DefMap`
+    /// (every resolver, every solver) is not run again for it.
+    records: Option<salsa::Id>,
+
+    /// The crate data that is shared between a crate's def map and all its block def maps.
+    data: Arc<DefMapCrateData>,
+}
+
+type DeriveHelpers =
+    FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>;
+
+/// What a collected def map recorded that no resolution reads: how its imports and macro calls
+/// resolved, its diagnostics and the derive helpers in scope of its items.
+#[salsa::tracked]
+struct HeldRecords<'db> {
+    root: ModuleIdLt<'db>,
+    #[tracked]
+    #[returns(ref)]
+    records: OwnedRecords,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OwnedRecords {
+    names: uses::NameRecords,
+    diagnostics: Vec<DefDiagnostic>,
+    diagnostics_by_module: DiagnosticsByModule,
+    derive_helpers_in_scope: DeriveHelpers,
+}
+
+/// A def map's records wherever they are ([`DefMap::records`]).
+#[derive(Clone, Copy)]
+pub struct Records<'a> {
+    pub names: &'a uses::NameRecords,
+    pub diagnostics: &'a [DefDiagnostic],
+    diagnostics_by_module: &'a DiagnosticsByModule,
+    derive_helpers_in_scope: &'a DeriveHelpers,
+}
+```
+
+(and the field's own type in the struct, `derive_helpers_in_scope:
+FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>,`,
+becomes `derive_helpers_in_scope: DeriveHelpers,`).
+
+2. `DefMap::empty`'s literal, before `            diagnostics_by_module: DiagnosticsByModule::default(),
+            data: crate_data,`, after:
+
+```rust
+            diagnostics_by_module: DiagnosticsByModule::default(),
+            records: None,
+            data: crate_data,
+```
+
+3. `shrink_to_fit`'s exhaustive `let Self { .. }`: add `records: _,` after `names: _,`.
+
+4. `hand_over_scopes`, before:
+
+```rust
+        let ModulesSlot::Building(modules) = &mut self.modules else { return };
+        self.diagnostics_by_module = DiagnosticsByModule::of(&self.diagnostics);
+```
+
+After:
+
+```rust
+        let ModulesSlot::Building(modules) = &mut self.modules else { return };
+        let diagnostics = std::mem::take(&mut self.diagnostics);
+        let records = OwnedRecords {
+            names: std::mem::take(&mut self.names),
+            diagnostics_by_module: DiagnosticsByModule::of(&diagnostics),
+            diagnostics,
+            derive_helpers_in_scope: std::mem::take(&mut self.derive_helpers_in_scope),
+        };
+        let held = HeldRecords::new(db, self.root, records);
+        self.records = Some(salsa::plumbing::AsId::as_id(&held));
+```
+
+(`shrink_to_fit` runs before `hand_over_scopes` at both call sites in `facts/driver.rs`, lines
+726 and 1055, so the moved vectors are already shrunk.)
+
+5. The accessors. Before:
+
+```rust
+    pub fn derive_helpers_in_scope(
+        &self,
+        id: AstId<ast::Adt>,
+    ) -> Option<&[(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)]> {
+        self.derive_helpers_in_scope.get(&id.map(|it| it.upcast())).map(Deref::deref)
+    }
+
+    /// What the paths of this def map's imports and macro calls resolved through, and how its
+    /// macro calls and derive helpers resolved.
+    pub fn name_records(&self) -> &uses::NameRecords {
+        &self.names
+    }
+```
+
+After:
+
+```rust
+    /// This def map's records: its own while it is collected, the database's once handed over,
+    /// so that a read of them depends on them and not on the `DefMap`.
+    pub fn records<'a>(&'a self, db: &'a Db) -> Records<'a> {
+        match self.records {
+            Some(id) => {
+                let held = <HeldRecords<'a> as salsa::plumbing::FromId>::from_id(id).records(db);
+                Records {
+                    names: &held.names,
+                    diagnostics: &held.diagnostics,
+                    diagnostics_by_module: &held.diagnostics_by_module,
+                    derive_helpers_in_scope: &held.derive_helpers_in_scope,
+                }
+            }
+            None => Records {
+                names: &self.names,
+                diagnostics: &self.diagnostics,
+                diagnostics_by_module: &self.diagnostics_by_module,
+                derive_helpers_in_scope: &self.derive_helpers_in_scope,
+            },
+        }
+    }
+
+    pub fn derive_helpers_in_scope<'a>(
+        &'a self,
+        db: &'a Db,
+        id: AstId<ast::Adt>,
+    ) -> Option<&'a [(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)]> {
+        self.records(db).derive_helpers_in_scope.get(&id.map(|it| it.upcast())).map(Deref::deref)
+    }
+
+    /// What the paths of this def map's imports and macro calls resolved through, and how its
+    /// macro calls and derive helpers resolved.
+    pub fn name_records<'a>(&'a self, db: &'a Db) -> &'a uses::NameRecords {
+        self.records(db).names
+    }
+```
+
+Before:
+
+```rust
+    pub fn diagnostics(&self) -> &[DefDiagnostic] {
+        self.diagnostics.as_slice()
+    }
+
+    /// The diagnostics of `module` ([`DefDiagnostic::in_module`]), in the order of
+    /// [`Self::diagnostics`]: a binary search, not a scan of them all.
+    pub fn diagnostics_of(
+        &self,
+        module: ModuleId,
+    ) -> impl ExactSizeIterator<Item = &DefDiagnostic> + '_ {
+        self.diagnostics_by_module
+            .of_module(module)
+            .iter()
+            .map(|&at| &self.diagnostics[at as usize])
+    }
+```
+
+After:
+
+```rust
+    pub fn diagnostics<'a>(&'a self, db: &'a Db) -> &'a [DefDiagnostic] {
+        self.records(db).diagnostics
+    }
+
+    /// The diagnostics of `module` ([`DefDiagnostic::in_module`]), in the order of
+    /// [`Self::diagnostics`]: a binary search, not a scan of them all.
+    pub fn diagnostics_of<'a>(
+        &'a self,
+        db: &'a Db,
+        module: ModuleId,
+    ) -> impl ExactSizeIterator<Item = &'a DefDiagnostic> + 'a {
+        let records = self.records(db);
+        records
+            .diagnostics_by_module
+            .of_module(module)
+            .iter()
+            .map(move |&at| &records.diagnostics[at as usize])
+    }
+```
+
+### `crates/hir-def/src/nameres/facts/driver.rs`, `facts/macros.rs`, `facts/unit.rs`
+
+Each `DefMap { .. }` literal (driver.rs about line 663, macros.rs 957, unit.rs 248): after its
+`diagnostics_by_module: DiagnosticsByModule::default(),` line add `records: None,`.
+
+### `crates/hir-def/src/nameres/frozen.rs`, `fn def_map` (encoder, line 1817)
+
+Before:
+
+```rust
+            derive_helpers_in_scope,
+            diagnostics,
+            diagnostics_by_module: _,
+            data,
+            session_macros,
+            names,
+        } = it;
+        let db = self.db;
+```
+
+After:
+
+```rust
+            derive_helpers_in_scope: _,
+            diagnostics: _,
+            diagnostics_by_module: _,
+            records: _,
+            data,
+            session_macros,
+            names: _,
+        } = it;
+        let db = self.db;
+        let Records { names, diagnostics, derive_helpers_in_scope, .. } = it.records(db);
+```
+
+(and `Records` joins the `super::` / `crate::nameres::` import of `DefMap` there). The decoder
+(line 3193, 3227–3228) keeps setting the fields: `decode` calls `hand_over_scopes` after, which
+moves them. Test at line 3495: `main(&live).name_records()` becomes
+`main(&live).name_records(&live)`.
+
+### `crates/hir-def/src/nameres/facts/tests.rs`, `fn project` (line 861)
+
+In the `let DefMap { .. } = def_map;`: `derive_helpers_in_scope,` → `derive_helpers_in_scope: _,`,
+`diagnostics,` → `diagnostics: _,`, `diagnostics_by_module,` → `diagnostics_by_module: _,`, and
+add `records: _,`. After `} = def_map;` add:
+
+```rust
+    let Records { diagnostics, diagnostics_by_module, derive_helpers_in_scope, .. } =
+        def_map.records(db);
+```
+
+(`Records`'s private fields are visible here, a child module of `nameres`.)
+
+### Call sites taking `db` now (each line exactly)
+
+- `hir-def/src/nameres/tests/worklist.rs:26`: `def_map.diagnostics()` → `def_map.diagnostics(&db)`.
+- `hir-def/src/nameres/tests/uses.rs:91`: `def_map.name_records();` → `def_map.name_records(db);`.
+- `tests/uses.rs:325, 351, 379`: `def_map.name_records()` → `def_map.name_records(&db)`.
+- `tests/uses.rs:386`: `def_map.diagnostics()` → `def_map.diagnostics(&db)`.
+- `tests/batch_order.rs:15`: `def_map.diagnostics()` → `def_map.diagnostics(&db)`.
+- `facts/driver.rs:1381`: `new.diagnostics()` → `new.diagnostics(&db)`.
+- `facts/driver.rs:1430–1431`: `.def_map(&db).name_records()` → `.def_map(&db).name_records(&db)`.
+- `hir-ide/src/tests/consteval/const_macro.rs:279`: `def_map.diagnostics()` → `def_map.diagnostics(db)`.
+- `hir/src/diagnostics.rs:1754`: `def_map.diagnostics_of(def)` → `def_map.diagnostics_of(self.db, def)`.
+- `hir/src/semantics.rs:691, 714`: `.derive_helpers_in_scope(InFile::new(sa.file_id, id))?` →
+  `.derive_helpers_in_scope(self.db, InFile::new(sa.file_id, id))?`.
+- `hir/src/semantics.rs:1488`: `.derive_helpers_in_scope(InFile::new(expansion, id))?;` →
+  `.derive_helpers_in_scope(db, InFile::new(expansion, id))?;`.
+- `hir/src/source_analyzer.rs:1383`: `.derive_helpers_in_scope(InFile::new(self.file_id, ast_id))`
+  → `.derive_helpers_in_scope(db, InFile::new(self.file_id, ast_id))`.
+
+Test: `crates/hir/src/tests/bodies.rs` (below) `a_use_reinfers_no_body`,
+`a_derived_item_reinfers_no_body`.
+
+> frontend-db (2026-10-29): no objection. Its new accessors (`records`, `name_records`,
+> `diagnostics`) take `&Db`, as every query does now; nothing of the `&Db` migration touches
+> `frozen.rs`'s def-map encoder or `deps/` images.
+
+## frontend-bodies: R2, `crate_recursion_limit` firewall for the interner (2026-10-29)
+
+Why: `DbInterner::new_with` reads the whole `DefMap` for one `u32`, so every body and signature
+that solves depends on it. Even with R1 the `DefMap` changes with the crate's features and
+prelude; the limit alone changes only with `#![recursion_limit]`.
+
+`crates/hir-def/src/nameres.rs`, after `pub fn crate_def_map`:
+
+```rust
+/// The recursion limit of `krate` (`#![recursion_limit]`, 128 by default): what the solver
+/// reads of the def map, so that it depends on that alone.
+#[salsa::tracked]
+pub fn crate_recursion_limit(db: &Db, krate: Crate) -> u32 {
+    crate_def_map(db, krate).recursion_limit()
+}
+```
+
+`crates/hir-ty/src/next_solver/interner.rs:436`, before:
+
+```rust
+            recursion_limit: hir_def::nameres::crate_def_map(db, krate).recursion_limit(),
+```
+
+After:
+
+```rust
+            recursion_limit: hir_def::nameres::crate_recursion_limit(db, krate),
+```
+
+## frontend-bodies: R3, `probe_all_traits` reads one bucket per crate (2026-10-29)
+
+Why: `infer/sized_bound.rs` `probe_all_traits` (rustc's `ProbeScope::AllTraits`, for
+`MethodCallIllegalSizedBound`) walks every module scope of every crate, so a body with that
+error re-infers on any item added anywhere. `in_crate_trait_value_items(db, krate, name)` is
+the same set (traits declared in a module, not a block, with a fn or const item named `name`),
+already a per-name bucket. It needs `pub(crate)` in `method_resolution.rs` (asked of
+`frontend-fast-method`, owner of that file, in `v2/requests/frontend-fast-method.md`).
+
+`crates/hir-ty/src/infer/sized_bound.rs`, before:
+
+```rust
+        let has_value_item = |trait_: TraitId| {
+            trait_.trait_items(db).items.iter().any(|(item_name, item)| {
+                *item_name == name
+                    && matches!(item, AssocItemId::FunctionId(_) | AssocItemId::ConstId(_))
+            })
+        };
+        for &krate in all_crates(db).iter() {
+            for (_, module) in crate_def_map(db, krate).modules(db) {
+                traits.extend(module.scope(db).declarations().filter_map(|def| match def {
+                    ModuleDefId::TraitId(it) if has_value_item(it) => Some(it),
+                    _ => None,
+                }));
+            }
+        }
+```
+
+After:
+
+```rust
+        for &krate in all_crates(db).iter() {
+            traits.extend(in_crate_trait_value_items(db, krate, name).iter().map(|&(it, _)| it));
+        }
+```
+
+Imports: `AssocItemId`, `ModuleDefId` and `nameres::crate_def_map` leave the `hir_def::` list;
+`in_crate_trait_value_items` joins the `method_resolution::{..}` list.
+
+## frontend-bodies: `mod bodies;` in `crates/hir/src/tests.rs` (2026-10-29)
+
+After line 3 `mod infer;` add `mod bodies;` (sorted: before `mod db;`, i.e. lines 1–4 become
+`mod api;`, `mod bodies;`, `mod db;`, `mod infer;`, `mod lower;`). The file
+`crates/hir/src/tests/bodies.rs` is new and mine: incremental tests that no edit of one kind
+re-infers another body.
+
+## frontend-deps: `ExpressionStoreRef::decode_in`, borrowing a dependency image (frontend.md item 5; 2026-10-29)
+
+Forwarded from `v2/requests/speed-hir-store.md` ("For frontend-deps-sigs: decode a signature's
+store borrowing the image"): speed-hir-store is DONE without it, and `hir-def` is yours.
+`crates/hir-def/src/deps/signatures.rs` `read` already calls
+`ExpressionStore::read(store)?.decode_in(image)?` for `StoreBytes::InPlace`, so hir-def does not
+compile until this lands. `Moved` stores keep `decode()`.
+
+The owner type has changed from the one in that request: images are now read in place from the
+store (`blaze_cas::Reader::pinned`, a mapping), so the owner is
+`crate::deps::ImageBuf = Arc<dyn crate::deps::Held>`, not `Arc<Aligned>`. Its
+`bytes()` stay at the same address, unchanged, while any count lives, and start at a
+16-byte boundary.
+
+1. `crates/hir-def/src/hir/col.rs`: a `Col` may hold a count of an image:
+   - `owner: Option<SlabBytes>` becomes an owner that is a slab or an `ImageBuf`. The invariant
+     gains a third case: `owner` is an image, `T: Copy`, and the elements lie inside
+     `owner.bytes()`.
+   - `pub(crate) fn borrowed(owner: &crate::deps::ImageBuf, elements: &[T]) -> Option<Col<T>>`
+     where `T: Copy` returns `None` unless `elements`' byte range is inside `owner.bytes()`.
+     The `&[T]` is already aligned, since `Slice` checks it.
+   - Keep `size_of::<Col<u32>>() == 32` if it can be kept, e.g. by making the slab a `Held`
+     too. Otherwise move the assertion and say so.
+2. `crates/hir-def/src/expr_store/persist.rs`: add
+   `pub fn decode_in(self, owner: &crate::deps::ImageBuf) -> Result<ExpressionStore, FormatError>`
+   beside `decode` (L1262). It is the same decode, with each `Copy` column made by
+   `Col::borrowed(owner, slice)` instead of the slab copy. A `None` from `borrowed` is a
+   `FormatError` ("a column outside its image"), never a copy.
+3. Test beside `decode`'s round trips: `decode_in` of a store written into an `Aligned` held
+   as an `ImageBuf` equals `decode`, and its `Copy` columns point into the buffer.
+
+Why: principles.md's zero-copy reads of mapped bytes. A served dependency's signature stores
+are read where the store maps them; a copy is about 11% over decode's bound
+(`docs/v2/plan/lanes/format/speed-of-light.md`, "Encoding and decoding a store").
+
+Status: open
+
+## mem-db-infer-method, for lane items: `method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs`, `drop.rs` (from db-mem-infer-b, 2026-10-29)
+
+Lane mem's allocation requests for lane items' files of hir-ty, in
+`v2/requests/mem-db-infer-method.md` (exact before/after code there; this lists them, it does not
+copy them). Lane db's own entries of that file (P6 `autoderef.rs`, N1 `inhabitedness.rs`, R1
+`representability.rs`, H1/H2 in `crates/hir`) are db-mem-infer-b's.
+
+- S1 (line 81): the frame map and set aliases. `v2/requests/mem-db-infer.md` section 5 defines
+  them once in hir-ty's `lib.rs`; `method_resolution.rs` writes `pub(crate) use crate::{FrameMap, FrameSet};`
+  instead of S1's own definitions.
+- P1 (104): `MethodResolutionContext` gains `frame: &'a Frame`. db's H1 (`hir/src/attrs.rs`) and
+  H2 (`hir/src/lib.rs` `Type::with_method_resolution`) fill it and wait on P1; tell db-mem-infer-b
+  when P1 is in.
+- P2 to P5 (172, 253, 352, 414): `probe.rs`' candidate lists, `impl_dups`, autoderef steps,
+  `TraitValueItems::runs` and `ProbeAllChoice` in the frame.
+- C1, C2 (673, 724): `ConfirmContext` and its lowerer carry `'f`; the receiver's adjustments
+  stay in the frame (with mem-db-infer-expr X1/X2, db-mem-infer-a's).
+- I1 to I6 (796 to 1356): the impl tables built once at exact size by frame builders; frozen
+  reads push into the builders (`frozen.rs`); the many-crate lookups collect exactly.
+- M1 to M8 (1517 to 1998): `trait_value_items`, `in_crate_trait_value_items`, `loaded_crates`,
+  `macros_writing_impls`/`macro_definitions`, `impls_in_bodies`, `impl_holders`, `impl_work`
+  (an entry point opening `frame::task`), tags.
+- O1 to O4 (2013 to 2168): `opaques.rs`' queries in the frame, results exact.
+- SP1 (2179): `constrained_params`/`parameters_for` in the frame.
+- D1 (2318): `has_drop_glue`'s visited set in the frame, with `has_drop_glue_in(frame, ..)`.
+- T1, T2 (2606, 2657): `where_predicate_must_hold` opens a task and passes the frame to
+  `TyLoweringContext::new` (waits on mem-db-infer-lower's R2 change of `new`, db-mem-infer-b-lower's);
+  tags.
+- "Tracked functions" (2755), "Entry points" (2805), "R7" (2831), "Tests" (2901: `columns_tests`
+  and `macro_definitions_iterate_their_runs`) for these files.
+- Where two parts meet in these files: `v2/requests/mem-db-infer.md` section 6, items 4
+  (`confirm.rs`), 5 (`with_method_resolution`), 8 (`crates_containing_incoherent_inherent_impls`)
+  and 9 (`frozen.rs`).
+- Tag form: salsa's `mem_tag` option as filed (`v2/requests/mem-db-salsa.md` M2) takes a bare
+  `blaze_mem::Tag` variant, so lane db writes `mem_tag = Infer` where the request file says
+  `mem_tag = crate::db::INFER_TAG`; lane items should match.

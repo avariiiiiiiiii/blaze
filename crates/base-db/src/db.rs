@@ -79,6 +79,7 @@ pub fn set_run_order(order: RunOrder) -> RunOrder {
 
 type EventLog = Mutex<Option<Vec<salsa::Event>>>;
 
+pub mod executions;
 mod shared;
 #[cfg(test)]
 mod tests;
@@ -97,7 +98,7 @@ impl Db {
     /// [`RunOrder`], it keeps salsa's events while [`Db::log`] runs, and it has empty library
     /// and local roots and an empty crate graph, as a fixture expects to find them.
     pub fn for_tests() -> Db {
-        let log = std::sync::Arc::new(EventLog::default());
+        let log = std::sync::Arc::new(EventLog::default()); // alloc: a test database's setup
         let mut db = Db::with(Run::Here, Some(log));
         _ = LibraryRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&db);
         _ = LocalRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&db);
@@ -106,9 +107,17 @@ impl Db {
     }
 
     fn with(run: Run, log: Option<std::sync::Arc<EventLog>>) -> Db {
-        let callback = log.clone().map(|log| {
+        let traced = executions::traced();
+        let callback = (log.is_some() || traced).then(|| {
+            let log = log.clone(); // clone: an `Arc` of the test log, once per database
+            // alloc: setup, once per database: salsa's event hook
             Box::new(move |event: salsa::Event| {
-                if let Some(events) = &mut *log.lock().unwrap_or_else(|it| it.into_inner()) {
+                if traced {
+                    executions::record(&event);
+                }
+                if let Some(log) = &log
+                    && let Some(events) = &mut *log.lock().unwrap_or_else(|it| it.into_inner())
+                {
                     events.push(event);
                 }
             }) as Box<dyn Fn(salsa::Event) + Send + Sync> // dyn: salsa's event hook, set once at setup
@@ -338,7 +347,7 @@ impl Db {
     /// On a database not made by [`Db::for_tests`]: a build's keeps no events.
     pub fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
         let log = self.log.as_ref().expect("`Db::log` on a database not made by `Db::for_tests`");
-        *log.lock().unwrap_or_else(|it| it.into_inner()) = Some(Vec::new());
+        *log.lock().unwrap_or_else(|it| it.into_inner()) = Some(Vec::new()); // alloc: tests only
         f();
         log.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default()
     }
@@ -354,7 +363,7 @@ impl Db {
                 ),
                 _ => None,
             })
-            .collect()
+            .collect() // alloc: tests only
     }
 }
 

@@ -14,10 +14,8 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-# The version rustc 1.101 renders its diagnostics with (`rustc_errors`'s
-# `annotate_snippet_emitter_writer.rs`), so that ours read byte for byte as clippy's do.
-annotate-snippets = "=0.12.16"
 base-db.workspace = true
+blaze-diagnostics.workspace = true
 blaze-ids.workspace = true
 blaze-phf.workspace = true
 cfg.workspace = true
@@ -41,6 +39,7 @@ triomphe.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 expect-test.workspace = true
+proptest.workspace = true
 test-fixture.workspace = true
 
 [lints]

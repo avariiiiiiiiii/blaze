@@ -8,7 +8,7 @@
 //! when both are `#[must_use]`.
 
 use hir::{InFile, ModuleDef, PathResolution};
-use hir_def::attrs::AttrFlags;
+use hir_def::{Lookup as _, attrs::AttrFlags};
 use syntax::{AstNode, SyntaxKind, SyntaxNodePtr, ast};
 
 use crate::{
@@ -107,22 +107,27 @@ fn unused_def(
 /// uninhabited error".
 fn must_use_adt<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>, post: &str) -> Option<(hir::Adt, String)> {
     let adt = ty.as_adt()?;
-    let lang = matches!(adt.module(cx.db).krate(cx.db).origin(cx.db), base_db::CrateOrigin::Lang(_));
-    let name = adt.name(cx.db);
     let two = |ty: &hir::Type<'db>| {
         let mut args = ty.type_arguments();
         let pair = (args.next()?, args.next()?);
         args.next().is_none().then_some(pair)
     };
-    if lang
-        && name.as_str() == "Result"
+    // `Result` and `ControlFlow` by their lang items, as hir's check found the value.
+    let enum_ = match hir_def::AdtId::from(adt) {
+        hir_def::AdtId::EnumId(it) => Some(it),
+        _ => None,
+    };
+    let lang = hir_def::lang_item::lang_items(cx.db, cx.krate.base());
+    let is = |variant: Option<hir_def::EnumVariantId>| {
+        enum_.is_some() && variant.map(|it| it.lookup(cx.db).parent) == enum_
+    };
+    if is(lang.ResultOk)
         && let Some((ok, err)) = two(ty)
         && err.is_never()
     {
         return must_use_adt(cx, &ok, &format!(" in a `Result` with an uninhabited error{post}"));
     }
-    if lang
-        && name.as_str() == "ControlFlow"
+    if is(lang.ControlFlowContinue)
         && let Some((brk, cont)) = two(ty)
         && brk.is_never()
     {

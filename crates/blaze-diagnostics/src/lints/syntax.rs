@@ -116,6 +116,10 @@ pub(crate) struct Tree {
     /// The kind of each of `nodes`, by index: a pass that looks at a few kinds scans these 2
     /// bytes a node, not the nodes ([`Tree::of_kind`]).
     pub(crate) kinds: Vec<SyntaxKind>,
+    /// Of each of `nodes`, by index, whether it may have an attribute, its own or inner: false
+    /// is certain. An attribute is a child of its owner or of a list at most two nodes below it
+    /// (`fn f() { #![..] }`), so this is true of the three nodes above each `ATTR`.
+    pub(crate) attrs: Vec<bool>,
     /// The outermost nodes `cfg` removes: their `cfg`s are evaluated, nothing in them is.
     pub(crate) off: Vec<SyntaxNode>,
     /// The items an attribute macro replaces with its expansion.
@@ -144,6 +148,14 @@ impl Tree {
     /// read only when it is wanted.
     pub(crate) fn of_kind(&self, wanted: impl Fn(SyntaxKind) -> bool) -> impl Iterator<Item = &SyntaxNode> {
         self.kinds.iter().zip(&self.nodes).filter(move |(kind, _)| wanted(**kind)).map(|(_, node)| node)
+    }
+
+    /// The nodes whose kind `wanted` holds and which may have an attribute ([`Tree::attrs`]),
+    /// in pre-order: a scan of two columns, each node read only when it is wanted.
+    pub(crate) fn with_attrs(&self, wanted: impl Fn(SyntaxKind) -> bool) -> impl Iterator<Item = &SyntaxNode> {
+        (self.kinds.iter().zip(&self.attrs).zip(&self.nodes))
+            .filter(move |((kind, attrs), _)| **attrs && wanted(**kind))
+            .map(|(_, node)| node)
     }
 
     /// `node` of the tree, as the [`InFile`] the rest of the crate takes.
@@ -202,12 +214,23 @@ impl<'db> Walk<'db> {
         // About one node per 16 bytes of Rust source.
         let mut nodes = Vec::with_capacity(usize::from(root.text_range().len()) / 16);
         let mut kinds = Vec::with_capacity(nodes.capacity());
+        let mut attrs = Vec::with_capacity(nodes.capacity());
+        // The indices in `nodes` of the nodes the walk is in, innermost last.
+        let mut open: Vec<u32> = Vec::new();
         let mut off = Vec::new();
         let mut replaced = Vec::new();
         let mut expansions: Vec<((u32, u32), InFile<SyntaxNode>)> = Vec::new();
         let mut events = root.preorder();
         while let Some(event) = events.next() {
-            let WalkEvent::Enter(node) = event else { continue };
+            let node = match event {
+                WalkEvent::Enter(node) => node,
+                WalkEvent::Leave(node) => {
+                    if open.last().is_some_and(|&at| nodes[at as usize] == node) {
+                        open.pop();
+                    }
+                    continue;
+                }
+            };
             let kind = node.kind();
             if ast::AnyHasAttrs::can_cast(kind)
                 && !self.on(&ast::AnyHasAttrs::cast(node.clone()).expect("checked by kind"))
@@ -252,8 +275,16 @@ impl<'db> Walk<'db> {
                     }
                 }
             }
+            // What holds an attribute is in `nodes`: the walk skips no node above one it enters.
+            if kind == SyntaxKind::ATTR {
+                for &at in open.iter().rev().take(3) {
+                    attrs[at as usize] = true;
+                }
+            }
+            open.push(u32::try_from(nodes.len()).expect("a tree has fewer than 2^32 nodes"));
             nodes.push(node);
             kinds.push(kind);
+            attrs.push(false);
         }
         let mut skips: Vec<TextRange> = off.iter().chain(&replaced).map(|it| it.text_range()).collect();
         radix::sort_copy_by_key(&mut skips, |it| radix::pack_32(it.start().into(), it.end().into()));
@@ -263,6 +294,7 @@ impl<'db> Walk<'db> {
             call: file.macro_file(),
             nodes,
             kinds,
+            attrs,
             off,
             replaced,
             skips,
@@ -639,6 +671,53 @@ fn after() {}
                 let fns: Vec<_> = tree.of_kind(|it| it == SyntaxKind::FN).collect();
                 assert_eq!(fns.len(), 3);
             }
+        });
+    }
+
+    /// Every node with an attribute, its own or inner, is marked in the attribute column, and a
+    /// crate with none marks nothing.
+    #[test]
+    fn the_attrs_column_holds_every_owner() {
+        const FIXTURE: &str = r#"
+//- /lib.rs crate:main edition:2021
+#![allow(unused)]
+#[inline]
+fn f(#[allow(unused)] x: u8) {
+    #![allow(unused)]
+    let y = { #![allow(unused)] 1 };
+    match x {
+        #![allow(unused)]
+        #[allow(unused)]
+        _ => {}
+    }
+}
+mod m {
+    #![allow(unused)]
+}
+struct S;
+impl S {
+    #![allow(unused)]
+}
+extern "C" {
+    #![allow(unused)]
+}
+"#;
+        walked(FIXTURE, |_, walk| {
+            let mut owners = 0;
+            for tree in &walk.trees {
+                assert_eq!(tree.attrs.len(), tree.nodes.len());
+                for (node, &marked) in tree.nodes.iter().zip(&tree.attrs) {
+                    let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) else { continue };
+                    if ast::attrs_including_inner(&owner).next().is_some() {
+                        assert!(marked, "{node:?} has an attribute");
+                        owners += 1;
+                    }
+                }
+            }
+            assert!(owners >= 10, "{owners}");
+        });
+        walked(&crate::lints::quiet_crate(3), |_, walk| {
+            assert!(walk.trees.iter().all(|tree| tree.attrs.iter().all(|&it| !it)));
         });
     }
 

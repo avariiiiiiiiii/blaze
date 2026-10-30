@@ -14,6 +14,8 @@
 //! the file calls on threads, and timers in a [`wheel::Wheel`] its wait ends at, as every
 //! driver does. A process of [`Effect::Spawn`] in a sandbox is made
 //! by the [`Confine`] a driver is given; a driver given none refuses it.
+//!
+//! On Windows [`iocp::Iocp`]. Each target's is its [`Native`] driver.
 
 #[cfg(target_os = "linux")]
 mod cgroup;
@@ -142,6 +144,14 @@ pub enum Effect {
     /// The file's permission bits set to `mode` (0o755 for an executable). Completes with
     /// [`Done::Moded`].
     Mode { file: FileName, mode: u32, tag: Tag },
+    /// The file's access and modification times both set to `modified_ns`, nanoseconds since
+    /// the Unix epoch, as cargo gives a build script's `output` the time its run began. Of the
+    /// file as it is when this runs, so asked once the write that made it has completed; a
+    /// symbolic link's target. Durable once a later [`Effect::Sync`] of the file completes.
+    /// Completes with [`Done::Timed`]. A file that is not there fails, and so does a time the
+    /// system's call cannot say (past a 32-bit `time_t`), naming the file; what is kept is the
+    /// file system's resolution of it (100 ns on NTFS, 1 s on HFS+).
+    Times { file: FileName, modified_ns: u64, tag: Tag },
     /// `to` made a file with `from`'s contents that shares its blocks (`FICLONE`,
     /// `clonefile`). Fails where the file system cannot share blocks, naming it: nothing
     /// copies instead.
@@ -231,6 +241,7 @@ impl Effect {
             | Effect::WriteAt { tag, .. }
             | Effect::Rename { tag, .. }
             | Effect::Mode { tag, .. }
+            | Effect::Times { tag, .. }
             | Effect::Clone { tag, .. }
             | Effect::Link { tag, .. }
             | Effect::Stat { tag, .. }
@@ -352,13 +363,53 @@ pub struct Exit {
 /// as any clone of it lives (the store and the image only ever replace a file by renaming
 /// another over it, never write one in place).
 #[derive(Clone)]
-// dyn: who keeps the bytes (a mapped file, an owned buffer), dropped with the last clone; a
-// read is one call for the slice
-pub struct Mapping(pub std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>);
+pub struct Mapping(std::sync::Arc<Held>);
+
+/// Who keeps a [`Mapping`]'s bytes, dropped with its last clone.
+enum Held {
+    /// A file mapped by [`Effect::Map`].
+    File(fs::Mapped),
+    /// Bytes copied into blocks of [`Block`]'s alignment, the first `len` of them the mapping.
+    Copied { blocks: Box<[Block]>, len: usize },
+}
+
+/// Sixteen bytes on a sixteen-byte boundary: an image's records need their buffer that aligned
+/// (`blaze_format::ALIGN`), as a mapped file's page is.
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct Block([u8; 16]);
 
 impl Mapping {
+    pub(crate) fn file(mapped: fs::Mapped) -> Mapping {
+        Mapping(std::sync::Arc::new(Held::File(mapped))) // alloc: one per file mapped, at open
+    }
+
+    /// `bytes` copied, starting on a sixteen-byte boundary: a file's contents read into memory,
+    /// for the simulator, a file too small to map, or a test.
+    pub fn copy(bytes: &[u8]) -> Mapping {
+        // alloc: the copy, once per mapping made from bytes
+        let mut blocks = vec![Block([0; 16]); bytes.len().div_ceil(16)].into_boxed_slice();
+        for (block, chunk) in blocks.iter_mut().zip(bytes.chunks(16)) {
+            block.0[..chunk.len()].copy_from_slice(chunk);
+        }
+        // alloc: the shared owner, once per mapping made from bytes
+        Mapping(std::sync::Arc::new(Held::Copied { blocks, len: bytes.len() }))
+    }
+
     pub fn bytes(&self) -> &[u8] {
-        (*self.0).as_ref()
+        match &*self.0 {
+            Held::File(mapped) => mapped.bytes(),
+            Held::Copied { blocks, len } => {
+                // SAFETY: `Block` is sixteen `u8`s with no padding (`repr(C)`), so `blocks` is
+                // `16 * blocks.len()` initialized bytes, and `copy` made `len` at most that.
+                unsafe { std::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), *len) }
+            }
+        }
+    }
+
+    /// Whether `other` is a clone of this mapping, not just the same bytes.
+    pub fn same(&self, other: &Mapping) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -381,8 +432,9 @@ impl fmt::Debug for Mapping {
 pub struct Meta {
     pub len: u64,
     pub dir: bool,
-    /// Nanoseconds since the epoch of its last change, where the file system keeps it; 0 in a
-    /// simulation, which has no clock of the world.
+    /// Nanoseconds since the epoch of its last change, where the file system keeps it. A
+    /// simulation has no clock of the world: there it is the simulated disk's count of changes,
+    /// or the time an [`Effect::Times`] gave the file.
     pub modified_ns: u64,
 }
 
@@ -397,6 +449,8 @@ pub enum Done {
     Listed(Vec<(FileName, Meta)>),
     Renamed,
     Moded,
+    /// Of an [`Effect::Times`].
+    Timed,
     Cloned,
     Linked,
     Stat(Option<Meta>),
@@ -444,7 +498,8 @@ pub struct Completion {
 }
 
 /// Runs effects and reports their completions, in any order. Every method is called from the
-/// one thread that runs the state machines.
+/// one thread that runs the state machines. Code takes a driver as a type parameter (`impl
+/// Driver`), never `dyn Driver`: production has one per target, [`Native`].
 pub trait Driver {
     /// Starts every effect in `effects`, leaving it empty.
     fn submit(&mut self, effects: &mut Vec<Effect>);
@@ -462,7 +517,7 @@ pub trait Driver {
 /// effects all complete; a timer far ahead holds it until it fires, and a watch until it is
 /// unwatched.
 pub fn run_until_idle(
-    driver: &mut (impl Driver + ?Sized),
+    driver: &mut impl Driver,
     effects: &mut Vec<Effect>,
     mut on: impl FnMut(Completion, &mut Vec<Effect>),
 ) {
@@ -477,6 +532,32 @@ pub fn run_until_idle(
             on(completion, effects);
         }
     }
+}
+
+/// The one driver of this target. The build path is monomorphized over it and never picks
+/// another at run time: a kernel that refuses it (io_uring blocked by a seccomp policy) is an
+/// error naming it, not a slower driver. [`sim::Sim`] and [`threads::Threads`] stay for tests
+/// and for the effects a native driver hands off (`threads::run`).
+#[cfg(target_os = "linux")]
+pub type Native = uring::Uring;
+#[cfg(target_os = "macos")]
+pub type Native = kqueue::Kqueue;
+#[cfg(windows)]
+pub type Native = iocp::Iocp;
+
+/// This target's [`Native`] driver over `root`. `threads` sizes the pool kqueue and IOCP run
+/// file calls on; io_uring's off-ring errands start their own.
+#[cfg(target_os = "linux")]
+pub fn native(root: &std::path::Path, _threads: usize) -> std::io::Result<Native> {
+    uring::Uring::new(root)
+}
+#[cfg(target_os = "macos")]
+pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native> {
+    kqueue::Kqueue::new(root, threads)
+}
+#[cfg(windows)]
+pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native> {
+    iocp::Iocp::new(root, threads)
 }
 
 #[cfg(test)]

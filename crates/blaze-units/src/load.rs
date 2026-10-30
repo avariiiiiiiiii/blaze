@@ -16,6 +16,7 @@ mod invocation;
 mod manifest;
 mod plan;
 mod resolve;
+mod sandbox;
 mod source;
 mod summary;
 #[cfg(test)]
@@ -23,7 +24,10 @@ mod tests;
 mod units;
 mod view;
 
+use std::cell::RefCell;
+
 use blaze_ids::ContentId;
+use blaze_protocol::cbor;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
 use serde::{Deserialize, Serialize};
 
@@ -33,12 +37,30 @@ use self::invocation::{Asked, Asking};
 use self::manifest::{WorkspaceKey, WorkspaceQuery, replay};
 use self::units::Built;
 use crate::query::{
-    Cbor, Command, Fetch, LoadError, Mount, Plan, Planned, StdGraph, StdPlanned, Units, key_input, kinds, producer,
+    Cbor, Command, Fetch, LoadError, Mount, Plan, Planned, StdGraph, StdPlanned, Units, kinds, producer,
 };
 use crate::{Filter, Intent};
 
 pub use self::summary::Read;
 pub use self::view::{ResolveAsk, Resolving, ViewResolved, platform_cfg, resolve_view};
+
+thread_local! {
+    // alloc: grown once to the largest key the thread hashes, then reused by every key.
+    static KEY_BYTES: RefCell<(cbor::Writer, Vec<u8>)> = RefCell::new((cbor::Writer::new(), Vec::new()));
+}
+
+/// [`crate::query::key_input`] without its allocation: the key's deterministic CBOR is written
+/// into this thread's buffer and hashed there, so a memo hit, which asks for the key's ID
+/// first, allocates nothing. The same ID as `key_input` of the same domain and key.
+pub fn key_id<K: Serialize>(domain: &'static str, key: &K) -> ContentId {
+    KEY_BYTES.with(|held| {
+        let mut held = held.borrow_mut();
+        let (writer, bytes) = &mut *held;
+        bytes.clear();
+        writer.append(bytes, key).unwrap_or_else(|error| panic!("a query key has no CBOR: {error}"));
+        ContentId::of(domain, bytes)
+    })
+}
 
 /// What a load step came to: its value, what it would read that no mount covers yet, or
 /// cargo's error.
@@ -257,12 +279,12 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 1");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 2");
     type Key = ();
     type Value = Cbor<Planned>;
 
     fn input(key: &()) -> ContentId {
-        key_input("blaze v2 cargo plan key 1", key)
+        key_id("blaze v2 cargo plan key 1", key)
     }
 
     fn execute(cx: &mut Cx<'_>, _: &()) -> Result<Cbor<Planned>, Cancelled> {
@@ -285,6 +307,7 @@ impl Query for Plan {
                 target_dir: built.target_dir,
                 build_dir: built.build_dir,
                 finished: built.finished,
+                link_dirs: built.link_dirs,
             }),
             Staged::Needs(fetches) => Planned::Needs(fetches),
             Staged::Failed(error) => Planned::Failed(error),
@@ -354,12 +377,12 @@ pub struct ForeignProfile {
 impl Query for Foreign {
     const KIND: QueryKind = QueryKind(0x601a);
     const NAME: &'static str = "cargo foreign";
-    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 1");
+    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 2");
     type Key = ForeignAsk;
     type Value = Cbor<StdPlanned>;
 
     fn input(key: &ForeignAsk) -> ContentId {
-        key_input("blaze v2 cargo foreign key 2", key)
+        key_id("blaze v2 cargo foreign key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, ask: &ForeignAsk) -> Result<Cbor<StdPlanned>, Cancelled> {

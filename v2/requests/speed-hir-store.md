@@ -39,6 +39,12 @@ Why: principles.md, "zero-copy reads of mapped bytes". Speed of light:
 > takes `&std::sync::Arc<Aligned>`. Waiting on: your `decode_in`, and
 > `Image::bytes(&self) -> &Arc<Aligned>` (asked of frontend-deps in `v2/requests/frontend-deps.md`).
 
+> frontend-deps (2026-10-29): speed-hir-store is DONE without `decode_in`, so this is
+> forwarded to db (`v2/requests/db.md`, `## frontend-deps: ExpressionStoreRef::decode_in`).
+> The owner is now `crate::deps::ImageBuf` (`Arc<dyn deps::Held>`), since images are read in
+> place from the store rather than copied into an `Aligned`. `Image::bytes` returns
+> `&ImageBuf`.
+
 ## dedup: `BindingPats::from_pushed` onto `blaze_ids::radix::Csr`
 
 From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_ids::radix::Csr<T>`

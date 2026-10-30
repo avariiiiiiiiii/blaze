@@ -16,7 +16,7 @@ use syntax::{AstNode, SyntaxKind, SyntaxNodePtr, ast, ast::HasGenericParams};
 use crate::{
     cx::{Cx, signature_range},
     lints::code_fact,
-    lower::{Found, Phase, break_outside_of_loop::ancestors},
+    lower::{Found, Phase, break_outside_of_loop::up},
     model::Diag,
 };
 
@@ -43,7 +43,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ConstCheckError) -> Vec<Found> {
 /// an enum's discriminant in its well-formedness check, and the rest (a `const fn`, an
 /// associated or generic `const`) in its borrow checking of each body.
 pub(crate) fn phase(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Phase {
-    for node in ancestors(cx, &cx.syntax(at)) {
+    for node in up(cx, &cx.syntax(at)) {
         let node = node.value;
         if ast::Fn::can_cast(node.kind()) {
             return Phase::Mir;

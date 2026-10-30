@@ -26,9 +26,14 @@ fn level_of(opt_level: &str) -> Option<&'static str> {
 
 /// Has every process this one starts compile the build `asked` with the backend its profile's
 /// `opt-level` asks for: LLVM at that level for 2, 3, `s` and `z`, with `BLAZE_OPT` the level
-/// when it is unset. `BLAZE_BACKEND` set is the backend, whatever the profile. Before any
-/// thread is started.
-pub(crate) fn follow_profile(asked: &Invocation) -> Result<(), String> {
+/// when it is unset. `BLAZE_BACKEND` set is the backend, whatever the profile.
+///
+/// # Safety
+///
+/// No other thread of the process may run during the call: it sets the process's
+/// environment, and a thread reading it meanwhile through the C library's `getenv` (which
+/// std's lock does not cover) could read a variable as it is freed.
+pub(crate) unsafe fn follow_profile(asked: &Invocation) -> Result<(), String> {
     if std::env::var_os(BACKEND).is_some() {
         return Ok(());
     }
@@ -44,12 +49,12 @@ pub(crate) fn follow_profile(asked: &Invocation) -> Result<(), String> {
              with Cranelift"
         ));
     }
-    // SAFETY: before any thread is started.
-    unsafe {
-        std::env::set_var(BACKEND, "llvm");
-        if std::env::var_os(OPTIMIZATION).is_none() {
-            std::env::set_var(OPTIMIZATION, level);
-        }
+    // SAFETY: no other thread runs, by this function's contract, and reading the profile
+    // starts none.
+    unsafe { std::env::set_var(BACKEND, "llvm") };
+    if std::env::var_os(OPTIMIZATION).is_none() {
+        // SAFETY: as above.
+        unsafe { std::env::set_var(OPTIMIZATION, level) };
     }
     Ok(())
 }

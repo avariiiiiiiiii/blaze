@@ -21,6 +21,7 @@
 //! leading `\x01`, as LLVM writes a name taken as it is.
 
 mod archive;
+mod chained;
 mod dylib;
 mod input;
 mod linkedit;
@@ -45,7 +46,7 @@ use object::macho;
 use rayon::prelude::*;
 
 use crate::model::{
-    Class, Counts, Data, File, Holds, Name, NativeFile, Names, Placed, Plan, Prot, Region,
+    Class, Counts, Data, Delta, File, Holds, Name, NativeFile, Names, Placed, Plan, Prot, Region,
     SectionKind, SectionName, Special, Writer,
 };
 use smallvec::SmallVec;
@@ -90,10 +91,11 @@ pub(crate) struct MachO {
     subtype: u32,
     page: u64,
     platform: Platform,
-    /// The last signature's pages, for an image linked again in place. Locked only by
-    /// [`Writer::file`], which the core calls once per link of the image, so never contended
-    /// and never held across a call out of the writer.
-    cache: Option<Mutex<sign::Cache>>,
+    /// What the last link made, for an image linked again in place. Locked only by
+    /// [`Writer::synthesize`] and [`Writer::file`], each called once per link of the image
+    /// one after the other, so never contended and never held across a call out of the
+    /// writer.
+    cache: Option<Mutex<Kept>>,
 }
 
 /// [`push_core_name`] as a `String`: the readers' tests compare against it.
@@ -699,8 +701,20 @@ impl Writer for MachO {
     }
 
     fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
+        let unwind = match &self.cache {
+            Some(cache) => unwind::build_kept(placed, self.output.arch, &mut lock(cache).unwind)?,
+            None => unwind::build(placed, self.output.arch)?,
+        };
         // alloc: `Writer::synthesize` returns a `Vec`: one entry, once per link
-        Ok(vec![(Class::Synthetic(UNWIND_INFO), unwind::build(placed, self.output.arch)?)])
+        Ok(vec![(Class::Synthetic(UNWIND_INFO), unwind)])
+    }
+
+    fn encode(&self, placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkError> {
+        if !chained::chained(&self.platform) {
+            // alloc: none: an empty `Vec` holds no buffer
+            return Ok(Vec::new());
+        }
+        chained::encode(placed, self.page)
     }
 
     fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64> {
@@ -825,13 +839,16 @@ struct Symbols {
     locals: u32,
     defined: u32,
     undefined: u32,
-    indirect: Vec<u8>,
-    indirect_count: u32,
     /// Each import's Mach-O name in `strings` (offset, length), by import.
     import_names: Vec<(u32, u32)>,
+    /// Each import's symbol, by import: what the indirect symbol table names.
+    index_of: Vec<u32>,
     /// What the export trie holds: the defined symbols in name order, each its name in
     /// `strings`, its `EXPORT_SYMBOL_FLAGS_*` and its offset from the image's start.
     exports: Vec<((u32, u32), u64, u64)>,
+    /// By function (in `Placed::functions`), its local's entry or `u32::MAX` for none:
+    /// filled for an image linked again in place, whose locals are in the functions' order.
+    locals_of: Vec<u32>,
 }
 
 impl MachO {
@@ -1080,19 +1097,23 @@ impl MachO {
             Vec::with_capacity(segments.iter().map(|it| it.sections.len()).sum());
         sections.extend(segments.iter_mut().flat_map(|it| it.sections.iter_mut()));
         let ranges = section_ranges(&sections)?;
-        let symbols = match (kept.as_deref_mut().and_then(|it| it.symbols.take()), delta) {
-            (Some(mut symbols), Some(delta))
-                if delta.same_names
+        let mut symbols = kept.as_deref_mut().and_then(|it| it.symbols.take());
+        let patched = match (&mut symbols, delta) {
+            (Some(symbols), Some(delta)) => {
+                delta.same_names
                     && delta.patches(last, &[delta.functions])
-                    && patch_locals(&mut symbols, placed, delta, &ranges)? =>
-            {
-                symbols
+                    && patch_locals(symbols, placed, delta, &ranges)?
             }
+            _ => false,
+        };
+        let symbols = match symbols {
+            Some(symbols) if patched => symbols,
             _ => self.symbols(placed, &ranges, &ordinals, kept.is_some())?,
         };
         let (indirect, indirect_count) = indirect(placed, &mut sections, &symbols.index_of)?;
         let name_at = |(at, len): (u32, u32)| &symbols.strings[at as usize..(at + len) as usize];
         // Each segment before `__LINKEDIT`, (start, size): the chained fixups' page starts.
+        // alloc: none: at most six segments, inline
         let laid: SmallVec<[(u64, u64); 6]> = segments.iter().map(|it| (it.vmaddr, it.vmsize)).collect();
 
         // alloc: none for a chained image, whose binds are its slots
@@ -1471,7 +1492,7 @@ impl MachO {
         keep: bool,
     ) -> Result<Symbols, LinkError> {
         let base = placed.plan.base;
-        let section_at = |addr: u64, what: &str| section_in(ranges, addr, what);
+        let section_at = |addr: u64, what: &str| -> Result<u8, LinkError> { section_in(ranges, addr, what) };
 
         let exported: rustc_hash::FxHashSet<&str> =
             // alloc: one set per link, sized once by the exports
@@ -1491,7 +1512,7 @@ impl MachO {
         if !locals.is_sorted() {
             locals.sort_unstable();
             // The locals aren't in the functions' order: a patch can't find them by it.
-            locals_of = Vec::new();
+            locals_of.clear();
         }
 
         // The defined: what the image exports and, in an executable, its header.
@@ -1580,43 +1601,6 @@ impl MachO {
         }
         strings.align(8);
 
-        // The GOT's cells by address, walked alongside each `__got` section's cells.
-        // alloc: one buffer per link, of exactly the GOT's cells
-        let mut got: Vec<(u64, &Holds)> = placed.got.iter().map(|it| (it.addr, &it.holds)).collect();
-        if !got.is_sorted_by_key(|it| it.0) {
-            radix::sort_by_key(&mut got, |it| it.0);
-        }
-        let mut indirect = Out::default();
-        let mut indirect_count = 0u32;
-        for section in sections.iter_mut() {
-            if section.flags != macho::S_NON_LAZY_SYMBOL_POINTERS {
-                continue;
-            }
-            if section.size % 8 != 0 {
-                // alloc: error path
-                return Err(error(format!(
-                    "the `__got` at {:#x} is {} bytes, not of whole cells",
-                    section.addr, section.size
-                )));
-            }
-            section.indirect = indirect_count;
-            indirect.0.reserve(section.size as usize / 2);
-            let mut next = got.partition_point(|it| it.0 < section.addr);
-            for nth in 0..section.size / 8 {
-                let addr = section.addr + nth * 8;
-                while got.get(next).is_some_and(|it| it.0 < addr) {
-                    next += 1;
-                }
-                let cell = got.get(next).filter(|it| it.0 == addr).map(|it| it.1);
-                indirect.u32(match cell {
-                    Some(&Holds::Import(import)) => index_of[import as usize],
-                    Some(Holds::Local(_)) => macho::INDIRECT_SYMBOL_LOCAL,
-                    _ => macho::INDIRECT_SYMBOL_ABS,
-                });
-                indirect_count += 1;
-            }
-        }
-
         Ok(Symbols {
             count: count as u32,
             locals: locals.len() as u32,
@@ -1624,12 +1608,276 @@ impl MachO {
             undefined: undefined.len() as u32,
             nlist: nlist.0,
             strings: strings.0,
-            indirect: indirect.0,
-            indirect_count,
             import_names,
+            index_of,
             exports,
+            locals_of,
         })
     }
+}
+
+/// The indirect symbol table of the `__got`s, and how many entries it has; each `__got`'s
+/// first entry is set in its section. `index_of` is each import's symbol.
+fn indirect(
+    placed: &Placed<'_>,
+    sections: &mut [&mut SectionOut],
+    index_of: &[u32],
+) -> Result<(Vec<u8>, u32), LinkError> {
+    // The GOT's cells by address, walked alongside each `__got` section's cells.
+    // alloc: one buffer per link, of exactly the GOT's cells
+    let mut got: Vec<(u64, &Holds)> = placed.got.iter().map(|it| (it.addr, &it.holds)).collect();
+    if !got.is_sorted_by_key(|it| it.0) {
+        radix::sort_by_key(&mut got, |it| it.0);
+    }
+    let mut indirect = Out::default();
+    let mut indirect_count = 0u32;
+    for section in sections.iter_mut() {
+        if section.flags != macho::S_NON_LAZY_SYMBOL_POINTERS {
+            continue;
+        }
+        if section.size % 8 != 0 {
+            // alloc: error path
+            return Err(error(format!(
+                "the `__got` at {:#x} is {} bytes, not of whole cells",
+                section.addr, section.size
+            )));
+        }
+        section.indirect = indirect_count;
+        indirect.0.reserve(section.size as usize / 2);
+        let mut next = got.partition_point(|it| it.0 < section.addr);
+        for nth in 0..section.size / 8 {
+            let addr = section.addr + nth * 8;
+            while got.get(next).is_some_and(|it| it.0 < addr) {
+                next += 1;
+            }
+            let cell = got.get(next).filter(|it| it.0 == addr).map(|it| it.1);
+            indirect.u32(match cell {
+                Some(&Holds::Import(import)) => index_of[import as usize],
+                Some(Holds::Local(_)) => macho::INDIRECT_SYMBOL_LOCAL,
+                _ => macho::INDIRECT_SYMBOL_ABS,
+            });
+            indirect_count += 1;
+        }
+    }
+    Ok((indirect.0, indirect_count))
+}
+
+/// Each section that symbols can name, (start, end, its ordinal), by start: every section
+/// but `__DWARF`'s, numbered from 1 in load-command order.
+fn section_ranges(sections: &[&mut SectionOut]) -> Result<Vec<(u64, u64, u8)>, LinkError> {
+    let mut ranges: Vec<(u64, u64, u8)> = Vec::with_capacity(sections.len());
+    for (nth, section) in sections.iter().enumerate() {
+        if section.segment != "__DWARF" {
+            let ordinal = u8::try_from(nth + 1)
+                .map_err(|_| error("more than 255 sections: symbols can't name them"))?;
+            ranges.push((section.addr, section.addr + section.size, ordinal));
+        }
+    }
+    radix::sort_copy_by_key(&mut ranges, |&(start, end, _)| radix::pack_64(start, end));
+    Ok(ranges)
+}
+
+/// The ordinal of the section of `ranges` holding the symbol `what` at `addr`.
+fn section_in(ranges: &[(u64, u64, u8)], addr: u64, what: &str) -> Result<u8, LinkError> {
+    let at = ranges.partition_point(|it| it.0 <= addr);
+    (ranges[..at].iter().rev())
+        .find(|it| addr <= it.1)
+        .map(|it| it.2)
+        // alloc: error path
+        .ok_or_else(|| error(format!("the symbol {what} at {addr:#x} is in no section")))
+}
+
+/// Patches the kept symbol table's locals for the functions that changed in place
+/// ([`Delta::functions`], every run of the same length): each local or not as before, with a
+/// name of the same length, and the locals still in order. `false` where one isn't, and
+/// `symbols` is then to be built again; its bytes are a full build's either way.
+fn patch_locals(
+    symbols: &mut Symbols,
+    placed: &Placed<'_>,
+    delta: &Delta<'_>,
+    ranges: &[(u64, u64, u8)],
+) -> Result<bool, LinkError> {
+    let functions = placed.functions;
+    if symbols.locals_of.len() != functions.len() {
+        return Ok(false);
+    }
+    // Whether the image exports `name`: the defined symbols are by Mach-O name.
+    let exported = |strings: &[u8], name: &str| {
+        let (prefix, rest) = spelled(name);
+        (symbols.exports.binary_search_by(|&((at, len), _, _)| {
+            let stored = &strings[at as usize..(at + len) as usize];
+            stored.iter().cmp(prefix.as_bytes().iter().chain(rest.as_bytes()))
+        }))
+        .is_ok()
+    };
+    let changed = || delta.functions.iter().flat_map(|it| it.new.start as usize..it.new.end as usize);
+    for nth in changed() {
+        let function = &functions[nth];
+        let local = symbols.locals_of[nth];
+        let name = function.name.as_deref();
+        // An executable's header is a defined symbol no export names.
+        if name == Some("mh_execute_header") {
+            return Ok(false);
+        }
+        let name = name.filter(|it| !exported(&symbols.strings, it));
+        let Some(name) = name else {
+            if local != u32::MAX {
+                return Ok(false);
+            }
+            continue;
+        };
+        if local == u32::MAX {
+            return Ok(false);
+        }
+        let entry = local as usize * NLIST;
+        let strx = u32::from_le_bytes(symbols.nlist[entry..entry + 4].try_into().expect("4 bytes")) as usize;
+        let (prefix, rest) = spelled(name);
+        let len = prefix.len() + rest.len();
+        let Some(stored) = symbols.strings.get(strx..strx + len + 1) else { return Ok(false) };
+        if stored[len] != 0 || stored[..len].contains(&0) {
+            return Ok(false);
+        }
+        let sect = section_in(ranges, function.addr, name)?;
+        let entry = &mut symbols.nlist[entry..entry + NLIST];
+        entry[5] = sect;
+        entry[8..16].copy_from_slice(&function.addr.to_le_bytes());
+        symbols.strings[strx..strx + prefix.len()].copy_from_slice(prefix.as_bytes());
+        symbols.strings[strx + prefix.len()..strx + len].copy_from_slice(rest.as_bytes());
+    }
+    // In order: a full build sorts the locals by (address, name) only when they aren't.
+    let key = |nth: usize| (functions[nth].addr, functions[nth].name.as_deref().unwrap_or_default());
+    let locals_of = &symbols.locals_of;
+    for nth in changed().filter(|&it| locals_of[it] != u32::MAX) {
+        let before = (0..nth).rev().find(|&it| locals_of[it] != u32::MAX);
+        let after = (nth + 1..functions.len()).find(|&it| locals_of[it] != u32::MAX);
+        if before.is_some_and(|it| key(it) > key(nth)) || after.is_some_and(|it| key(nth) > key(it)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// A kept table's bytes appended to `out`; their length.
+fn copy_into(out: &mut Vec<u8>, bytes: &[u8]) -> usize {
+    out.extend_from_slice(bytes);
+    bytes.len()
+}
+
+/// What an incremental image keeps from its last link, behind [`MachO::cache`], for the next
+/// to reuse or patch: only when that link's changes are from this one ([`Delta::from`]
+/// equal to `synthesis`), so a rolled-back link never patches what it didn't make.
+#[derive(Default)]
+struct Kept {
+    sign: sign::Cache,
+    unwind: unwind::Last,
+    /// The synthesis the tables are of; 0 for none.
+    synthesis: u64,
+    /// The rebase and bind opcodes, the export trie and the function starts, one after
+    /// another, and each one's length.
+    tables: Vec<u8>,
+    lengths: [usize; 4],
+    symbols: Option<Symbols>,
+    /// The chained slots, which a page is signed again for when one of them changed.
+    slots: Vec<(u64, u64)>,
+    /// The debug sections, by where their bytes are and how many. The state the next link's
+    /// changes are from holds them, so a buffer at the same place is the same buffer.
+    debug: Vec<(usize, usize)>,
+}
+
+impl Kept {
+    /// Keeps what this link made: `tables` are (start, length) in `linkedit`.
+    fn keep(
+        &mut self,
+        placed: &Placed<'_>,
+        linkedit: &[u8],
+        tables: [(usize, usize); 4],
+        symbols: Symbols,
+        debug_at: &[(u64, usize)],
+    ) {
+        self.tables.clear();
+        for (nth, &(start, len)) in tables.iter().enumerate() {
+            self.tables.extend_from_slice(&linkedit[start..start + len]);
+            self.lengths[nth] = len;
+        }
+        self.symbols = Some(symbols);
+        self.slots.clear();
+        self.slots.extend_from_slice(placed.encoded);
+        self.debug.clear();
+        self.debug.extend(debug_at.iter().map(|&(_, nth)| buffer(&placed.debug[nth].1)));
+        self.synthesis = placed.synthesis;
+    }
+}
+
+fn buffer(bytes: &[u8]) -> (usize, usize) {
+    (bytes.as_ptr() as usize, bytes.len())
+}
+
+/// The file's byte ranges the core wrote since the link `kept` is of, (offset, length), by
+/// offset and merged: the delta's addresses in the file, each chained slot that changed, and
+/// the debug sections that aren't the same buffers. `None` when the core doesn't say.
+fn written_since(placed: &Placed<'_>, kept: &Kept, debug_at: &[(u64, usize)]) -> Option<Vec<(u64, u64)>> {
+    let delta = placed.delta.filter(|it| it.same_regions)?;
+    let base = placed.plan.base;
+    // alloc: one buffer per incremental link, of the ranges written
+    let mut out = Vec::with_capacity(delta.written.len() + debug_at.len() + 16);
+    for &(addr, len) in delta.written {
+        let at = placed.regions.partition_point(|it| it.addr <= addr);
+        if at.checked_sub(1).is_some_and(|at| !zeroed(&placed.regions[at].class)) {
+            out.push((addr - base, len));
+        }
+    }
+    let (old, new) = (&kept.slots[..], placed.encoded);
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() || j < new.len() {
+        let at = match (old.get(i), new.get(j)) {
+            (Some(a), Some(b)) if a.0 == b.0 => {
+                (i, j) = (i + 1, j + 1);
+                if a.1 == b.1 {
+                    continue;
+                }
+                a.0
+            }
+            (Some(a), b) if b.is_none_or(|b| a.0 < b.0) => {
+                i += 1;
+                a.0
+            }
+            (_, Some(b)) => {
+                j += 1;
+                b.0
+            }
+            (_, None) => unreachable!("one of the two lists has a slot left"),
+        };
+        out.push((at - base, 8));
+    }
+    let same_debug = kept.debug.len() == debug_at.len()
+        && (debug_at.iter().zip(&kept.debug)).all(|(&(_, nth), &old)| buffer(&placed.debug[nth].1) == old);
+    if !same_debug {
+        out.extend(debug_at.iter().map(|&(at, nth)| (at, placed.debug[nth].1.len() as u64)));
+    }
+    radix::sort_copy_by_key(&mut out, |&(at, len)| radix::pack_64(at, len));
+    let mut merged = 0;
+    for nth in 0..out.len() {
+        let (at, len) = out[nth];
+        match merged.checked_sub(1).map(|it| &mut out[it]) {
+            Some(last) if at <= last.0 + last.1 => last.1 = last.1.max(at + len - last.0),
+            _ => {
+                out[merged] = (at, len);
+                merged += 1;
+            }
+        }
+    }
+    out.truncate(merged);
+    Some(out)
+}
+
+/// The kept state, started over after a panic while it was held: a page may be without its
+/// hash, a table half patched.
+fn lock(cache: &Mutex<Kept>) -> std::sync::MutexGuard<'_, Kept> {
+    cache.lock().unwrap_or_else(|poisoned| {
+        let mut kept = poisoned.into_inner();
+        *kept = Kept::default();
+        kept
+    })
 }
 
 /// A load command of a path at `at`, after `fields`: `LC_LOAD_DYLINKER`, `LC_*_DYLIB`.

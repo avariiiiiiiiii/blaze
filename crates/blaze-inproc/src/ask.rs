@@ -42,7 +42,7 @@ use crate::{Error, sys};
 
 #[cfg(test)]
 mod model;
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;
 
 /// The asks one run process has in flight at most.

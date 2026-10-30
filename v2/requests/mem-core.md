@@ -75,6 +75,10 @@ Beside the `Response::Tables` arm:
 
 > forwarded to mem-core (from requests, pass 16; told by tmux).
 
+> done by speed-link-edge (2026-10-29): the arm is in `crates/blaze-ui/src/api.rs` beside
+> `Response::Tables`, with the same lines, and the budget written in place rather than through
+> `to_owned`/`to_string`. Test: `tests.rs` `memory_is_a_line_a_tag_and_the_committed_total`.
+
 ## C4 (blaze-query `src/lib.rs` `kinds`, lane db): the front and back sub-ranges
 
 `blaze_graph::admission::tag_of` places a query kind in a subsystem by these ranges; the ones in
@@ -149,6 +153,8 @@ From `mem-core-macos` (report `/tmp/blaze-lanes/v2-mem-core-macos.md`), for whoe
 > applied by mem-core: `FileName::is_valid` in `lib.rs`, `FileName::new` and `fsevents.rs` use it, `file_name_ok` and its agreement loop are gone.
 
 ## dedyn: crates/blaze-graph/src/plane.rs: the memo is a type parameter, `Plane<M: Memo = NoMemo>`
+
+APPLIED by dedyn-graph 2026-10-29: `Plane<M = NoMemo>`, `Plane::new` (no memo) and `Plane::with_memo(config, memo)`; `NoMemo` exported.
 
 From `dedyn-graph` (report `/tmp/blaze-lanes/v2-dedyn-graph.md`). Why: `memo: Option<Box<dyn Memo + Send>>` is asked once per keyed node that becomes ready (`became_ready`), so once per query, through a box and a vtable, behind an `Option` test. A plane has one database for its whole life, so the memo is a type parameter: the ask is a static call that inlines, and with `NoMemo` (every plane made by `Plane::new`: the cargo daemon's `Graph`, `Machine`) it folds to nothing. Code size: `impl Plane` (~1,450 lines) is instantiated once per memo type; v2's path has two (`NoMemo`, and the database's memo behind `Scheduler`), tests add their own. An enum is not possible: the database's type is above `blaze-graph`. `Plane` written bare stays `Plane<NoMemo>`, so `machine.rs`, `blaze-cargo/src/serve/plane.rs` (`Plane as Graph`, `Graph::new`), `blaze-history/src/tests.rs` and every `Plane::new` caller compile unchanged (as `HashMap::new` lives in `impl HashMap<K, V, RandomState>`).
 
@@ -241,6 +247,8 @@ Nothing else in `plane.rs` names `Plane` as a type (checked: `rg -n '\bPlane\b' 
 
 ## dedyn: crates/blaze-graph/src/{plane_tests.rs, build.rs, plane_tests/reference.rs}: call sites of `Plane<M>`
 
+APPLIED by dedyn-graph 2026-10-29 (the tests' memo is `DbMemo(Db)`).
+
 Same change; these are the tests that make a plane with a memo.
 
 `plane_tests.rs`:
@@ -318,6 +326,8 @@ and the same comment on the line above `pub(crate) fn with_memo(config: PlaneCon
 > applied by mem-core-dedyn (2026-10-29): already in the tree (mem-core), checked line by line.
 
 ## dedyn: crates/blaze-graph/src/exec.rs: the scheduler's predictor and memo are type parameters
+
+APPLIED by dedyn-graph 2026-10-29, further than written here: the work is data too. A task's work is `R::Work` of an `exec::Runner` (`trait Runner { type Work; fn run(&self, &Work) }`), so `Arc<dyn Fn>` per task is gone; `Scheduler<W>::new(config, runner, predict, memo)`; `Entry` moves its work out when run (no clone). Test `a_runner_reads_each_tasks_work_as_data`.
 
 Why: `Owner` held `predict: Box<dyn Predict>` (asked per task added and found, told per run that ends) and handed `Box<dyn Memo + Send>` to the plane (asked per keyed node). The daemon has one predictor and one database, so both are type parameters. `Scheduler` itself stays non-generic: only its two constructors and the owner thread's `Owner<P, M>` (~240 lines, one instance per pair; v2 makes one) are generic, so `Handle`, `Opened` and every holder of a `Scheduler` are unchanged. No production caller of `Scheduler::new`/`with_pool` exists yet (`rg 'Scheduler::(new|with_pool)' crates`), so only the tests below change.
 
@@ -426,6 +436,8 @@ and in its body `Scheduler::with_pool(config, predict, Box::new(memo), pool)` be
 > applied by mem-core-dedyn (2026-10-29): already in the tree (mem-core), checked line by line.
 
 ## dedyn: crates/blaze-graph/src/exec.rs: `drive`'s callbacks are generic; the rest justified
+
+APPLIED by dedyn-graph 2026-10-29.
 
 Why: `run` calls `post` once per node run, `now` once per input and `said` once per record, through vtables; `drive` is generic over the work already, so one more parameter adds no instance (`drive` + `run`, ~90 lines, once per caller: `blaze-engine`, `blaze-cargo/src/cargo/compile_time.rs`, tests). Every caller compiles unchanged (`&mut |_| {}`, `&mut said`, `&mut |record| ...`).
 
@@ -545,6 +557,8 @@ pub type Work = Arc<dyn Fn() -> Result<Did, Cancelled> + Send + Sync>;
 
 ## dedyn: crates/blaze-graph/src/arena.rs: `Cap`'s spill, justified
 
+SUPERSEDED, applied by dedyn-graph 2026-10-29: not justified after all. `Cap::new(limit, spill_at) -> (Cap, Spills)`: the spill is a channel the spiller reads (`Spills::next`/`ready`), so `Cap`, `Grant` and `Bump` stay concrete with no boxed callback. Tests `spills_hear_once_each_time_spill_at_is_passed`, `a_cap_with_no_spiller_still_grants`, `a_spiller_gives_grants_back_and_a_waiting_reserve_goes_on`.
+
 `spill` is called only when `held` passes `spill_at` (once each time it is passed, `reserve` ~line 745), not per reserve; a generic would put a parameter on `Cap`, `Shared` and every holder of a `Cap` for a call that is rare. Before:
 
 ```rust
@@ -568,6 +582,8 @@ and before `pub fn new(limit: u64, spill_at: u64, spill: Box<dyn Fn(u64) + Send 
 
 ## dedyn: crates/blaze-graph/src/pool.rs: the test's boxed reference, justified
 
+SUPERSEDED, applied by dedyn-graph 2026-10-29: the reference is the same closure called in place, no box (`a_job_in_a_cell_runs_as_the_same_closure_called_in_place`). `Local::sleep`, `pool::park` and `pump::wait_until` take `&impl Fn() -> bool`; `history::write` takes `&impl Predict`.
+
 In `a_job_in_a_cell_runs_as_the_same_closure_boxed`, before `let boxed: Box<dyn FnOnce() -> u64> = Box::new(closure::<N>(fill, Dropped(drops.clone())));` add `            // dyn: the test's reference, the same closure boxed`. The other `dyn`s in `pool.rs` and `pump.rs` (`radix::Workers`'s signature, panic payloads, a wait's `ended`, read once per look before parking) are justified on their lines already and stay.
 
 > forwarded to mem-core (requests, pass 19; told by tmux).
@@ -575,6 +591,8 @@ In `a_job_in_a_cell_runs_as_the_same_closure_boxed`, before `let boxed: Box<dyn 
 > applied by mem-core-dedyn (2026-10-29).
 
 ## dedyn: crates/blaze-core/src/lib.rs: `run_until_idle` is generic over the driver; `Mapping` justified
+
+SUPERSEDED, applied by dedyn-graph 2026-10-29: `Mapping` is not justified. It is `Mapping(Arc<Held>)` with `enum Held { File(fs::Mapped), Copied { .. } }`: `Mapping::copy(&[u8])` (16-byte aligned, as images need) and `Mapping::same`; the field is private. Callers moved in blaze-vfs, blaze-query, blaze-image, blaze-cas. Test `a_copied_mapping_reads_as_the_file_mapped`.
 
 `run_until_idle` calls `submit`, `in_flight` and `poll` once per batch through `&mut dyn Driver`. Generic with `?Sized`, a caller holding a concrete driver (`&mut sim`, `&mut driver` in `sim.rs`, `kqueue.rs`) gets static calls, and a caller holding `&mut dyn Driver` (`tests.rs`, `examples/drivers.rs`) still compiles. ~15 lines per instance. Before:
 
@@ -758,9 +776,13 @@ Status: open
 
 > forwarded to mem-core (holds those blaze-api files) (requests, pass 19; told by tmux).
 
+> applied by mem-core-api (2026-10-29).
+
 ## Restored: three dedup requests a rewrite of this file dropped (applied 2026-10-29, mem-core)
 
 mem-core applied all three below. `plane.rs` `Batch` is on `radix::Csr` (the Kahn loop walks `then.row(at)`); `wheel.rs` has `slots()` and `mod differential_tests`; the exec throttle test draws from `SplitMix64`. The texts are as filed.
+
+> applied by mem-core (its heading says so) (requests, pass 20).
 
 ### dedup: the plane's Kahn order onto `radix::Csr`
 
@@ -869,3 +891,297 @@ yet declared in `wheel.rs`) the same way: its xorshift in `the_wheel_fires_what_
 is now `let mut rng = SplitMix64::new(seed);` with `rng.below(..)`/`rng.index(..)`, and the
 file has `use blaze_ids::rng::SplitMix64;` (blaze-core has `blaze-ids` as a dev-dependency now).
 If it is declared as a module of the library, keep it under `#[cfg(test)]`.
+
+## dedyn: crates/blaze-core: `Driver` is never a trait object; one `Native` driver per target (user's call, 2026-10-29)
+
+APPLIED by dedyn-graph 2026-10-29 as written (sections 1-3 and the test); `rg 'dyn\s+(crate::|blaze_core::)?Driver\b' crates` finds only the trait's doc sentence.
+
+Supersedes the `?Sized` in "## dedyn: crates/blaze-core/src/lib.rs: `run_until_idle` is generic
+over the driver" above (already applied): no caller may hold a `&mut dyn Driver`, so the
+`?Sized` goes. `Driver` stays a trait; production gets one native driver per target by `cfg`,
+so the build path is monomorphized with no runtime choice. `Sim` and `Threads` stay as
+implementations for tests and for the effects a native driver hands off (`threads::run`).
+Choosing `Threads` instead of `Uring` at run time (io_uring refused by a seccomp policy, say) is
+not added: `Uring::new` failing stays an error (no-fallback), raised to the coordinator.
+
+Holders when written: blaze-core is named by `dedup` and `dedup-codec` (IN PROGRESS); mem-core
+and its children are DONE. Code size: every function below is generic over one driver type in
+production (`Native`) and over 2-4 in tests.
+
+> applied by dedyn-graph (its note at the top of the section) (requests, pass 21).
+
+### 1. `src/lib.rs`
+
+`run_until_idle`:
+before `    driver: &mut (impl Driver + ?Sized),`
+after  `    driver: &mut impl Driver,`
+
+Add to the `Driver` trait's doc comment, after "Every method is called from the one thread that
+runs the state machines.", the sentence: "Code takes a driver as a type parameter (`impl
+Driver`), never `dyn Driver`: production has one per target, [`Native`]."
+
+After `pub fn run_until_idle(..) { .. }` add:
+
+```rust
+/// The one driver of this target. The build path is monomorphized over it and never picks
+/// another at run time: a kernel that refuses it (io_uring blocked by a seccomp policy) is an
+/// error naming it, not a slower driver. [`sim::Sim`] and [`threads::Threads`] stay for tests
+/// and for the effects a native driver hands off ([`threads::run`]).
+#[cfg(target_os = "linux")]
+pub type Native = uring::Uring;
+#[cfg(target_os = "macos")]
+pub type Native = kqueue::Kqueue;
+#[cfg(windows)]
+pub type Native = iocp::Iocp;
+
+/// This target's [`Native`] driver over `root`. `threads` sizes the pool kqueue and IOCP run
+/// file calls on; io_uring's off-ring errands start their own.
+#[cfg(target_os = "linux")]
+pub fn native(root: &std::path::Path, _threads: usize) -> std::io::Result<Native> {
+    uring::Uring::new(root)
+}
+#[cfg(target_os = "macos")]
+pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native> {
+    kqueue::Kqueue::new(root, threads)
+}
+#[cfg(windows)]
+pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native> {
+    iocp::Iocp::new(root, threads)
+}
+```
+
+In the crate doc at the top, after the kqueue paragraph, add: "On Windows [`iocp::Iocp`]. Each
+target's is its [`Native`] driver."
+
+Test, in `src/tests.rs`:
+
+```rust
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn the_native_driver_runs_the_shared_script_as_threads_does() {
+    let root = dir("native-script");
+    let threads = script(&mut Threads::new(&root, 2));
+    let root = dir("native-script-native");
+    assert_eq!(script(&mut crate::native(&root, 2).unwrap()), threads);
+}
+```
+
+(`script` and `dir` are that file's; the script's output never names its root, as
+`every_driver_ends_the_script_the_same` relies on.)
+
+### 2. Plain functions: `&mut dyn Driver` becomes `&mut impl Driver`, bodies unchanged
+
+Every caller passes a concrete driver (`&mut sim`, `&mut Threads::new(..)`, `&mut
+Uring::new(..).unwrap()`, ...). In each line below replace `driver: &mut dyn Driver` with
+`driver: &mut impl Driver`:
+- `src/tests.rs`: `fn script(driver: &mut dyn Driver) -> BTreeMap<u64, String> {`,
+  `fn flushes_follow_the_changes_before_them(driver: &mut dyn Driver, root: &std::path::Path) {`,
+  `fn processes_and_sockets(driver: &mut dyn Driver) -> Vec<String> {`
+- `src/kqueue.rs` (tests): `fn run(driver: &mut dyn Driver, effects: Vec<Effect>) -> BTreeMap<u64, Done> {`
+- `src/iocp.rs` (tests): `fn run(driver: &mut dyn Driver, effects: Vec<Effect>) -> BTreeMap<u64, Done> {`
+- `src/uring.rs` (tests): `fn processes(driver: &mut dyn Driver) -> BTreeMap<u64, Done> {`,
+  `fn round_trip(driver: &mut dyn Driver, at: Address) -> BTreeMap<u64, Vec<String>> {`,
+  `fn maps(driver: &mut dyn Driver, root: &Path) -> BTreeMap<u64, String> {`
+- `examples/drivers.rs`: `fn commit(..)`, `fn batch(..)`, `fn reads(.., dir)`,
+  `fn measure(name, dir, driver)`. Its `main` choosing `threads` or `uring` from its arguments
+  is a benchmark comparing drivers, not the build path: it stays (two instances of `measure`).
+
+### 3. Closures taking `&mut dyn Driver` become nested generic `fn`s
+
+A closure cannot be generic, and each is called with two or more driver types, so each becomes
+a `fn` item in the same block, its captures passed as parameters. Bodies are unchanged but for
+the lines named.
+
+a. `src/kqueue.rs` `files_end_as_on_threads` and `src/iocp.rs` `files_end_as_on_threads` (the
+   same shape): `let script = |driver: &mut dyn Driver| {` becomes
+   `fn script(driver: &mut impl Driver, file: &FileName) -> Vec<String> {`, the closing `};`
+   after `seen` becomes `}`, and the calls pass the file:
+   kqueue `let kqueue = script(&mut Kqueue::new(&ours, 2).unwrap(), &file);` and
+   `let threads = script(&mut Threads::new(&theirs, 2), &file);`;
+   iocp `let ran = script(&mut iocp, &file);` and
+   `let threads = script(&mut Threads::new(&theirs, 2), &file);`.
+   (`name` is the test module's `fn`, visible from a nested `fn`; `file.clone()` inside works on
+   `&FileName`.)
+b. `src/uring.rs` `as_threads_do`: `let script = |driver: &mut dyn Driver| {` becomes
+   `fn script(driver: &mut impl Driver, file: &FileName) -> Vec<Done> {`, the closing `};` `}`;
+   calls `let ring = script(&mut Uring::new(&ours).unwrap(), &file);` and
+   `let threads = script(&mut Threads::new(&theirs, 2), &file);`.
+c. `src/tests.rs` `every_driver_fires_timers_in_their_order`: `let run = |driver: &mut dyn Driver| {`
+   becomes `fn run(driver: &mut impl Driver) -> Vec<u64> {`, `};` becomes `}`; calls unchanged.
+d. `src/tests.rs` `watches_hear_a_file_written_under_them`:
+   `let run = |driver: &mut dyn Driver, root: Option<&std::path::Path>| {` becomes
+   `fn run(driver: &mut impl Driver, root: Option<&std::path::Path>) -> Vec<FileName> {`,
+   `};` becomes `}`; calls unchanged.
+e. `src/tests.rs` (the spawn test around line 437): `let command = || {` becomes
+   `fn command() -> Box<Command> {` with its `};` becoming `}`; `let run = |driver: &mut dyn Driver| {`
+   becomes `fn run(driver: &mut impl Driver) -> Done {`, `};` becomes `}`; calls unchanged.
+f. `src/tests.rs` `a_warm_file_cycle_allocates_only_the_reads_bytes`:
+   `let write = |driver: &mut dyn Driver| {` becomes `fn write(driver: &mut impl Driver) {`,
+   `};` becomes `}`; calls unchanged.
+
+After this `rg -n 'dyn\s+(crate::|blaze_core::)?Driver\b' crates` finds nothing.
+
+## dedyn: crates/blaze-core/src/uring.rs: io_uring refused is an error naming the errno, the likely cause and the fix (user's call, 2026-10-29)
+
+APPLIED by dedyn-graph 2026-10-29: `Ring::new` as in section 1 and both tests as in section 3. `setup_refused` gives the same text, but it writes into one `String` with `write!` instead of the `format!`/`to_owned` per arm, so the error path is one allocation and hot_lint stays clean (`fmt::Write as _` imported).
+
+Decided by the user: on Linux, when io_uring is unavailable (kernel too old, disabled by the
+`kernel.io_uring_disabled` sysctl, or blocked by a seccomp policy such as Docker's default),
+blaze stops with an error saying what failed (the `io_uring_setup` errno), the likely cause and
+the fix. Never `Threads` as a runtime alternative. Today no code picks `Threads` when
+`Uring::new` fails (checked: `serve.rs`'s `Threads` branch is the compile-time one for other
+targets, removed by the cargo request "## dedyn: crates/blaze-cargo/src/serve.rs"). What is
+missing is the text: only `EINVAL` names a cause today; `EPERM`/`ENOSYS` come back as the bare OS
+error. Goes with "## dedyn: crates/blaze-core: `Driver` is never a trait object" above.
+
+> forwarded to mem-core (holds `crates/blaze-core/`; asked whether it takes this or hands it back to requests) (requests, pass 21; told by tmux).
+
+### 1. In `Ring::new`, replace the whole `if fd < 0 { .. }` block with
+
+```rust
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            let errno = error.raw_os_error().unwrap_or(0);
+            let disabled = std::fs::read_to_string("/proc/sys/kernel/io_uring_disabled")
+                .ok()
+                .and_then(|it| it.trim().parse().ok());
+            let kind = match errno {
+                libc::ENOSYS | libc::EINVAL => io::ErrorKind::Unsupported,
+                _ => error.kind(),
+            };
+            let why = setup_refused(errno, &error, disabled, &crate::cgroup::kernel());
+            return Err(io::Error::new(kind, why));
+        }
+```
+
+### 2. After `impl Ring { .. }`, add
+
+```rust
+/// What blaze says when `io_uring_setup` fails with `errno`: what failed, the likely cause and
+/// the fix. `disabled` is `/proc/sys/kernel/io_uring_disabled` (absent before Linux 6.6),
+/// `kernel` the running kernel's release. On Linux the build runs on io_uring and on nothing
+/// else, so this is where it stops.
+fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &str) -> String {
+    let name = match errno {
+        libc::ENOSYS => "ENOSYS",
+        libc::EPERM => "EPERM",
+        libc::EACCES => "EACCES",
+        libc::EINVAL => "EINVAL",
+        libc::ENOMEM => "ENOMEM",
+        libc::EMFILE => "EMFILE",
+        libc::ENFILE => "ENFILE",
+        _ => "",
+    };
+    // alloc: the error of a setup that failed, once.
+    let failed = match name {
+        "" => format!("io_uring_setup failed with errno {errno} ({error})"),
+        name => format!("io_uring_setup failed with {name} ({error})"),
+    };
+    let seccomp = "a seccomp policy that refuses io_uring_setup, such as Docker's default profile \
+                   (Docker 25 and later) or a systemd unit's SystemCallFilter";
+    let allow = "run under a seccomp profile that allows io_uring_setup, io_uring_enter and \
+                 io_uring_register (Docker: --security-opt seccomp=<that profile>)";
+    // alloc: the error of a setup that failed, once.
+    let (cause, fix) = match (errno, disabled) {
+        (libc::EPERM | libc::EACCES, Some(2)) => (
+            "the sysctl kernel.io_uring_disabled is 2, which disables io_uring for every process"
+                .to_owned(),
+            "sysctl -w kernel.io_uring_disabled=0 as root (and set it in /etc/sysctl.d to keep it)"
+                .to_owned(),
+        ),
+        (libc::EPERM | libc::EACCES, Some(1)) => (
+            "the sysctl kernel.io_uring_disabled is 1, which allows io_uring only to processes \
+             in the group kernel.io_uring_group names or with CAP_SYS_ADMIN"
+                .to_owned(),
+            "sysctl -w kernel.io_uring_disabled=0 as root, or add this user to the group \
+             kernel.io_uring_group names"
+                .to_owned(),
+        ),
+        (libc::EPERM | libc::EACCES, _) => (seccomp.to_owned(), allow.to_owned()),
+        (libc::ENOSYS, _) => (
+            format!(
+                "this kernel (Linux {kernel}) has no io_uring: older than 5.1 or built without \
+                 CONFIG_IO_URING; or {seccomp}, answering ENOSYS"
+            ),
+            format!("run on Linux 6.0 or later built with io_uring, or {allow}"),
+        ),
+        (libc::EINVAL, _) => (
+            format!(
+                "this kernel (Linux {kernel}) lacks IORING_SETUP_SQPOLL with \
+                 IORING_SETUP_SINGLE_ISSUER, which Linux 6.0 and later have"
+            ),
+            "run on Linux 6.0 or later".to_owned(),
+        ),
+        (libc::ENOMEM, _) => (
+            "the locked-memory limit (RLIMIT_MEMLOCK), which kernels before 5.12 charge a ring \
+             to, is too small, or the machine is out of memory"
+                .to_owned(),
+            "raise the limit (ulimit -l unlimited, or LimitMEMLOCK= for a systemd unit), or run \
+             on Linux 6.0 or later"
+                .to_owned(),
+        ),
+        (libc::EMFILE | libc::ENFILE, _) => (
+            "no file descriptor is left for the ring, in this process or the system".to_owned(),
+            "raise the open-file limit (ulimit -n)".to_owned(),
+        ),
+        _ => (
+            format!("an answer io_uring_setup is not known to give on Linux {kernel}"),
+            format!(
+                "check that the kernel is Linux 6.0 or later, that kernel.io_uring_disabled is 0, \
+                 and {allow}"
+            ),
+        ),
+    };
+    // alloc: the error of a setup that failed, once.
+    format!(
+        "blaze runs its build on io_uring on Linux and cannot start without it: {failed}. \
+         Likely cause: {cause}. Fix: {fix}."
+    )
+}
+```
+
+### 3. Tests, in `mod tests` of `uring.rs` (the module is Linux-only already)
+
+```rust
+    #[test]
+    fn a_ring_refused_by_seccomp_says_what_failed_why_and_the_fix() {
+        let error = io::Error::from_raw_os_error(libc::EPERM);
+        assert_eq!(
+            super::setup_refused(libc::EPERM, &error, Some(0), "6.8.0"),
+            "blaze runs its build on io_uring on Linux and cannot start without it: \
+             io_uring_setup failed with EPERM (Operation not permitted (os error 1)). \
+             Likely cause: a seccomp policy that refuses io_uring_setup, such as Docker's \
+             default profile (Docker 25 and later) or a systemd unit's SystemCallFilter. \
+             Fix: run under a seccomp profile that allows io_uring_setup, io_uring_enter and \
+             io_uring_register (Docker: --security-opt seccomp=<that profile>)."
+        );
+    }
+
+    #[test]
+    fn each_refusal_names_its_errno_cause_and_fix() {
+        let says = |errno: i32, disabled: Option<u8>| {
+            super::setup_refused(errno, &io::Error::from_raw_os_error(errno), disabled, "5.0.0")
+        };
+        let cases: [(i32, Option<u8>, &str, &str, &str); 7] = [
+            (libc::EPERM, Some(2), "with EPERM", "kernel.io_uring_disabled is 2", "sysctl -w kernel.io_uring_disabled=0"),
+            (libc::EPERM, Some(1), "with EPERM", "kernel.io_uring_group", "sysctl -w kernel.io_uring_disabled=0"),
+            (libc::EPERM, None, "with EPERM", "seccomp", "io_uring_setup, io_uring_enter and io_uring_register"),
+            (libc::ENOSYS, None, "with ENOSYS", "Linux 5.0.0", "Linux 6.0 or later"),
+            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SINGLE_ISSUER", "Linux 6.0 or later"),
+            (libc::ENOMEM, None, "with ENOMEM", "RLIMIT_MEMLOCK", "ulimit -l"),
+            (libc::EBADF, None, "with errno 9", "not known", "kernel.io_uring_disabled is 0"),
+        ];
+        for (errno, disabled, failed, cause, fix) in cases {
+            let text = says(errno, disabled);
+            let (head, rest) = text.split_once(" Likely cause: ").expect("a cause");
+            let (because, how) = rest.split_once(" Fix: ").expect("a fix");
+            assert!(head.contains(failed), "{text}");
+            assert!(because.contains(cause), "{text}");
+            assert!(how.contains(fix), "{text}");
+        }
+    }
+```
+
+(`io` and `libc` are in scope in `uring.rs`; if `mod tests` does not `use std::io;`, add it.)
+`hot_lint`: the four `format!`s and `to_owned`s are on the error path, under the
+`// alloc:` lines above them.

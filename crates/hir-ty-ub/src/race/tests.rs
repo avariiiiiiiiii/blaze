@@ -14,10 +14,11 @@
 
 use std::{cmp::Ordering, collections::BTreeSet, fmt::Debug};
 
+use blaze_ids::rng::SplitMix64;
+
 use super::{
     Config, Deadlock, RaceError, RaceErrorKind, Races, Slot,
     range_map::{Overlap, RangeMap, RangeObjectMap},
-    rng::SplitMix64,
     vclock::{VClock, VectorIdx},
     weak::STORE_BUFFER_LIMIT,
 };
@@ -333,7 +334,7 @@ fn rng_is_seeded() {
 
     let mut rng = SplitMix64::new(9);
     assert!((0..1000).all(|_| !rng.chance(0.0) && rng.chance(1.0)));
-    assert!((0..1000).all(|_| rng.below(7) < 7));
+    assert!((0..1000).all(|_| rng.index(7) < 7));
     let hits = (0..10_000).filter(|_| rng.chance(0.5)).count();
     assert!((4_500..5_500).contains(&hits), "{hits}");
 }

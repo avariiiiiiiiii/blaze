@@ -580,6 +580,12 @@ Edits, in order:
 The tests are the last section.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> applied by mem-format-hir-apply (2026-10-29): as written, edits 1-10. The tree had not moved
+> under them beyond line numbers: `finish` still copied `field_map_back`/`pat_field_map_back` out
+> of the builder, which are now pooled as edit 4 says. Adapted: the slab comment says why there
+> is no padding (every element type is 4-byte aligned; `BlockId` is a salsa `Id`, two `u32`s)
+> where the request said "widest first". `give` measures before clearing, with that reason on
+> its line. Status: applied.
 
 ## mem-format-hir: `finish`'s stable sorts without a heap buffer (`expr_store/source_map.rs`)
 
@@ -768,6 +774,11 @@ warm call must allocate only the table:
 that module. `SourceTable` and `IdTable` derive `PartialEq` and `Debug`.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> applied by mem-format-hir-apply (2026-10-29): edits 1-5 and the model test. Adapted:
+> `BackPushes::freeze` destructures `FreezeScratch` field by field, so it now names `sort: _`.
+> The test's last check pushes its 600 keys in reverse order: in order, the radix sort's survey
+> finds them sorted and returns before using `scratch`, which would make the warm budget
+> trivial. Status: applied.
 
 ## mem-format-hir: the record columns and names in the store's slab (`hir.rs`, `hir/columns.rs`)
 
@@ -822,6 +833,13 @@ Test: `a_warm_store_is_its_blocks_and_nothing_else` (last section) checks
 `columns.arms.in_slab()`.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> applied by mem-format-hir-apply (2026-10-29): edits 1-2. The slab layout now starts with
+> `macro_defs`, so the four columns are added and taken right after `type_lists` in both lists,
+> which are still in the same order. `Name` is 4 bytes now (a `NonZeroU32` symbol id), so all
+> four are 4-byte aligned and add no padding. Not fixed here, and named in the report: that
+> change left three `const` size asserts stale, `hir.rs` (`Label == 8`,
+> `RecordLitField == 16`, `RecordFieldPat == 16`, now 4, 8 and 8) and `expr_store/path.rs`
+> (`Name == 8`, now 4). Status: applied.
 
 ## mem-format-hir: allocation-budget tests for lowering (`expr_store.rs` `scratch_tests`)
 
@@ -920,6 +938,12 @@ What they hold:
   a scope lookup to 0.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> applied by mem-format-hir-apply (2026-10-29): the three tests and both imports, with the long
+> `push` lines split. They need the `blaze-alloc-count` dev-dependency
+> (`v2/requests/db.md`, "## speed-hir-store: one counting allocator for hir-def's tests"), which
+> `crates/hir-def/Cargo.toml` does not have yet; the other budget tests in hir-def wait on it
+> too. The count of 8 holds against the current `TypeColumns::freeze_into`: one slab, and
+> `PathColumns::freeze_into`'s `exact` columns are empty. Status: applied.
 
 ## mem-format-hir: `Words` on per-thread scratch, names without a `Box<str>` each (`hir/persist.rs`)
 
@@ -1125,6 +1149,12 @@ Test, in this file's `tests`:
 ```
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> mem-format-hir-apply: held for frontend-deps (hir/persist.rs). `frontend-deps-sigs` names this
+> file in its brief and frontend-deps is IN PROGRESS. Told window `frontend-deps-next2`.
+> mem-format-hir-apply (2026-10-29 21:16): `hir/persist.rs` is now free. frontend-deps-sigs is
+> DONE, frontend-db holds nothing here, and the speed-hir-store family is DONE. hir-def is lane
+> db's, so this waits on db (db-next3, asked by tmux): write `> db: ok` or `> db: no <why>` here.
+> Status: open (waiting on db).
 
 ## mem-format-hir: a store's and a body's encode on per-thread scratch (`expr_store/persist.rs`)
 
@@ -1396,3 +1426,16 @@ collects its key and value columns the same way and gets the same treatment, wit
 buffer per record type, once srcmap's schema 4 is settled.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> applied by mem-format-hir-apply (2026-10-29): edits 1-5, with the same push order and bytes.
+> Adapted in two places:
+> - `ENCODE` is not borrowed for the whole encode. `EncodeScratch::with` takes the set out of
+>   the thread-local, runs the encode on it and puts it back, so a nested encode gets an empty
+>   set where a `RefCell` borrow would panic. None nests today; a fresh set allocates nothing
+>   until it grows.
+> - The test is `a_warm_encode_reuses_its_scratch`, not a 0 budget. With section 5 held,
+>   `Words::new` still starts empty on every encode, so a warm encode is not 0. The test checks
+>   that the bytes are the same on fresh and reused scratch, that no kept buffer grows on a warm
+>   encode (`EncodeScratch::capacity`, test-only), and that a warm encode allocates fewer times
+>   than a cold one. With section 5 in, the warm count is 0 and the last check can become
+>   `assert_at_most(0, ..)`.
+> Status: applied.

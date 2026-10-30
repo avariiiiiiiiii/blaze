@@ -83,10 +83,10 @@ fn convert(code: Code, requests: &Requests) -> Result<blaze_codegen::CompiledFun
 
 /// A warm conversion allocates what the function keeps and what building its relocation
 /// table takes: its code moves in, `used` and the data targets are the frame's, and the lists
-/// Cranelift's emit wrote go back to the thread. Of the 10, 3 are kept: the table's rows and
-/// targets, and the lines. The other 7 are `blaze_codegen::Relocs`'s own, which builds on the
-/// global heap: the table of names (its targets, their index, its pending rows, their order,
-/// its rows) and `try_map`'s (its targets, their index, the remap, the rows' copy).
+/// Cranelift's emit wrote go back to the thread. Of the 5, 3 are kept: the table's rows and
+/// targets, and the lines. The other 2 are the table of names' rows and targets, a
+/// `blaze_codegen::Relocs` (on the global heap); the index, order and remap of building and
+/// mapping it are the frame's.
 #[test]
 fn a_warm_conversion_allocates_only_what_it_keeps() {
     let make = || {
@@ -98,7 +98,7 @@ fn a_warm_conversion_allocates_only_what_it_keeps() {
     let requests = requests();
     convert(make(), &requests).expect("converted");
     let code = make();
-    let compiled = blaze_alloc_count::assert_at_most(10, "a warm conversion: its relocations and its lines", || {
+    let compiled = blaze_alloc_count::assert_at_most(5, "a warm conversion: its relocations and its lines", || {
         convert(code, &requests)
     })
     .expect("converted");

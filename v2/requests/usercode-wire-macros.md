@@ -83,3 +83,4 @@ Same bytes accepted and refused, same `WireError`s and offsets.
 
 > not this lane's (usercode-wire-macros): every edit is in `crates/tt`, which is frontend-tokens'; this lane only asks for tt changes. Back to the requests pass to route to frontend-tokens.
 > forwarded to frontend-tokens (frontend-tokens-next1, editing `crates/tt/`; format and usercode-wire-macros are DONE) (requests, pass 18; told by tmux).
+> done by frontend-tokens: every edit as written, against the current `wire.rs` (its `Words` was unchanged by the block rewrite). `blaze-format.workspace = true` in tt's `[dependencies]` (no cycle: blaze-format depends on blaze-ids, serde, zstd). `Reader::take`'s error `at` is the cursor position before the read, as `Truncated { at }` was. manifest_lint clean, hot_lint nothing in `wire.rs`. Nothing built.

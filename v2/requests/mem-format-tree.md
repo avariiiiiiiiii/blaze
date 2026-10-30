@@ -1960,6 +1960,9 @@ so delete it (the 8 lines from `/// A builder whose tokens are consecutive slice
 "over `range` of `source` only": change it to `/// A builder whose tokens are consecutive
 slices of `range` of `source`, which the tree shares.`
 
+   > frontend-tree (2026-10-29): applied: `SyntaxTreeBuilder::sourced` deleted and `sourced_range`'s
+   > doc reworded.
+
 11. The budget test (append to `mod tests`; `Text` already comes in by `use super::*`):
 
 ```rust
@@ -2013,3 +2016,114 @@ Two files (also tell `frontend-deps-items`, which holds `flat.rs` too).
 > forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 > frontend-tree (2026-10-29): `reparsing.rs` and `flat.rs` are under the grant to mem-format-tree
 > (section 2), which applies this with its own edits there.
+
+## mem-format: a parse's errors at their exact length, its lazies list kept (to frontend-tree; from mem-db-def B7; 2026-10-29)
+
+`base-db`'s `EditionedFileId::parse_errors` (and its with-bodies twin) turns `Parse::errors()`'s
+`Vec` into a `Box<[SyntaxError]>` with `.into()`, which reallocates whenever validation left spare
+capacity: on each edit of a file with errors, a common state while typing. `errors_of` also
+collects `lazies` into a fresh `Vec` per call of an outline. Depends on this file's section 3
+(`syntax` gets `blaze-mem`).
+
+`crates/syntax/src/lib.rs`: `errors_of` becomes `errors_of_into`, filling the caller's list, with
+`lazies` on a kept buffer; `errors_of` and two exact forms wrap it.
+
+```rust
+thread_local! {
+    /// The lists a parse's errors are gathered in, kept at the largest they grew to.
+    static ERRORS: RefCell<Scratch<SyntaxError>> = const { RefCell::new(Scratch::new()) };
+    static LAZIES: RefCell<Scratch<(TextRange, u32)>> = const { RefCell::new(Scratch::new()) };
+}
+
+    /// [`Parse::errors`] at its exact length, `None` for none: what a memo keeps.
+    pub fn errors_exact(&self) -> Option<Box<[SyntaxError]>> {
+        self.exact_of(false)
+    }
+
+    /// [`Parse::errors_with_bodies`] at its exact length, `None` for none.
+    pub fn errors_with_bodies_exact(&self) -> Option<Box<[SyntaxError]>> {
+        self.exact_of(true)
+    }
+
+    fn errors_of(&self, all_bodies: bool) -> Vec<SyntaxError> {
+        let mut errors = Vec::new();
+        self.errors_of_into(all_bodies, &mut errors);
+        errors
+    }
+
+    fn exact_of(&self, all_bodies: bool) -> Option<Box<[SyntaxError]>> {
+        // Taken, not borrowed: a body's parse inside validation then starts from an empty list.
+        let mut kept = ERRORS.take();
+        let errors = kept.take();
+        self.errors_of_into(all_bodies, errors);
+        // alloc: the result, at its exact length; the errors move, none is cloned
+        let exact = (!errors.is_empty()).then(|| errors.drain(..).collect());
+        ERRORS.set(kept);
+        exact
+    }
+
+    fn errors_of_into(&self, all_bodies: bool, errors: &mut Vec<SyntaxError>) {
+        if let Some(e) = self.errors.as_deref() {
+            errors.extend_from_slice(e);
+        }
+        let root = self.syntax_node();
+        let Some(edition) = self.outline else {
+            validation::validate(&root, errors);
+            return;
+        };
+        let tree = self.tree.as_ref().unwrap().flat();
+        let mut kept = LAZIES.take();
+        let lazies = kept.take();
+        lazies.extend(tree.lazies().map(|at| (tree.range(at), at)));
+        validation::validate_outline(
+            &root,
+            lazies,
+            &mut |at, errors| {
+                if !all_bodies && !tree.is_parsed(at) {
+                    return false;
+                }
+                errors.extend(parsing::body_errors(tree, at, edition));
+                true
+            },
+            errors,
+        );
+        LAZIES.set(kept);
+    }
+```
+
+(Imports: `std::cell::RefCell`, `blaze_mem::scratch::Scratch`. `Scratch` derives `Default`, which
+`LocalKey::take` needs. `extend_from_slice` clones the stored errors as `to_vec` did. Check
+`validate_outline`'s parameter types against the tree: `&lazies` was a `&Vec<(TextRange, u32)>`
+and `lazies` is now `&mut Vec<..>`, so pass `&lazies[..]` if it takes a slice.)
+
+The callers then make one allocation, the exact box: in `crates/base-db/src/editioned_file_id.rs`
+(lane db; mem-db-def's to forward), `parse_errors` becomes
+`self.parse(db).errors_exact()`, and the with-bodies query `...errors_with_bodies_exact()`.
+
+Budget test, in `crates/syntax` beside section 1's:
+
+```rust
+    /// A warm exact list of a parse's errors is one allocation (the box), however many there
+    /// are; none for a parse without errors.
+    #[test]
+    fn exact_errors_allocate_only_their_box() {
+        let text = "fn f() { let = ; } fn g( { } struct S { a: }";
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        let want = parse.errors();
+        assert!(!want.is_empty());
+        assert_eq!(parse.errors_exact().as_deref(), Some(&want[..]));
+        blaze_alloc_count::assert_at_most(1 + want.len() as u64, "exact errors", || {
+            std::hint::black_box(parse.errors_exact());
+        });
+        let clean = SourceFile::parse("fn f() {}", Edition::CURRENT);
+        assert_eq!(clean.errors_exact(), None);
+        blaze_alloc_count::assert_at_most(0, "no errors", || {
+            std::hint::black_box(clean.errors_exact());
+        });
+    }
+```
+
+(The `want.len()` is each stored error's message, cloned as today; the list itself is the one
+box. Validation's own errors move.)
+
+> forwarded to frontend-tree (holds `crates/syntax/`; the `base-db` callers are db's; told by tmux; requests, pass 22).

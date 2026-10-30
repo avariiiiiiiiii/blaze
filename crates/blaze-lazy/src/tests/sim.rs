@@ -299,3 +299,27 @@ fn an_ask_of_a_published_function_is_answered_at_once() {
     assert_eq!(fetcher.target(LazyId(1)), Some(0x1230));
     assert_eq!(fetcher.next(), None);
 }
+
+#[test]
+fn only_published_code_is_retargeted() {
+    let mut fetcher = Fetcher::new(4, 1);
+    let mut actions = Vec::new();
+    assert!(!fetcher.retarget(LazyId(0), 0x40), "lazy");
+    assert!(!fetcher.retarget(LazyId(9), 0x40), "past the session");
+    fetcher.want(LazyId(0), Priority::Asked);
+    fetcher.want(LazyId(1), Priority::Asked);
+    assert!(!fetcher.retarget(LazyId(0), 0x40), "queued");
+    assert_eq!(fetcher.next(), Some((LazyId(0), Priority::Asked)));
+    assert!(!fetcher.retarget(LazyId(0), 0x40), "compiling");
+    fetcher.done(LazyId(0), Ok(0x10), &mut actions);
+    assert_eq!(fetcher.next(), Some((LazyId(1), Priority::Asked)));
+    fetcher.done(LazyId(1), Err("no MIR"), &mut actions);
+    assert!(!fetcher.retarget(LazyId(1), 0x40), "failed");
+    assert!(fetcher.retarget(LazyId(0), 0x40));
+    assert_eq!(fetcher.target(LazyId(0)), Some(0x40));
+    actions.clear();
+    let to = Waiter { client: 1, seq: 1, request: 1 };
+    fetcher.ask(to, 0, &mut actions);
+    assert_eq!(actions, vec![Action::Answer { to, lazy: 0, outcome: Outcome::Ready(0x40) }]);
+    assert_eq!(fetcher.compiles(), 2);
+}

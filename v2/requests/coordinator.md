@@ -745,6 +745,7 @@ gains those edges.
 Status: open
 
 > held by requests: the root `memmap2` line goes once codegen.md, proof.md and cargo.md's "dedup: ... memmap2" requests have outcomes and `rg memmap2 crates --glob Cargo.toml` finds nothing; the lock is the first compile's.
+> applied: no crate manifest or source names memmap2 any more (codegen's is applied, cargo's and proof's are in), so the root `memmap2 = "0.9"` line is deleted; the lock change is the first compile's (requests, pass 22).
 
 
 ## speed-hir-store-paths: paths as columns (2026-10-29)
@@ -922,6 +923,7 @@ line as it is); `level::Level` is `blaze_diagnostics::lints::Level` (whose `of_c
 `blaze-diagnostics` depends on neither `blaze-lints` nor anything that does.
 
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+> applied by lints, 2026-10-29 (see Status under part 8).
 
 ### 1. `crates/blaze-lints/Cargo.toml`
 
@@ -929,6 +931,7 @@ Add `blaze-diagnostics.workspace = true` to `[dependencies]`; remove the line
 `annotate-snippets = "=0.12.16"` and the two comment lines above it (only `emit.rs` used it).
 
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+> applied by lints, 2026-10-29 (see Status under part 8).
 
 ### 2. `crates/blaze-lints/src/diag.rs`: the whole file becomes
 
@@ -1055,6 +1058,7 @@ here, and this naming is the lint queries' own, not the model's. `Diag` derives 
 so the queries' values still backdate.
 
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+> applied by lints, 2026-10-29 (see Status under part 8).
 
 ### 3. `crates/blaze-lints/src/emit.rs`: delete the file
 
@@ -1064,6 +1068,7 @@ data, written by [`blaze_diagnostics::emit`] as rustc writes it, in text and in 
 outside the crate names `blaze_lints::emit` or `blaze_lints::diag`.
 
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+> applied by lints, 2026-10-29 (see Status under part 8).
 
 ### 4. `crates/blaze-lints/src/level.rs`
 
@@ -1128,6 +1133,7 @@ outside the crate names `blaze_lints::emit` or `blaze_lints::diag`.
   and `proptest.workspace = true` to `Cargo.toml`'s `[dev-dependencies]`.
 
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+> applied by lints, 2026-10-29 (see Status under part 8).
 
 ### 5. `crates/blaze-lints/src/check.rs`
 
@@ -1226,6 +1232,7 @@ fn written_at(level: Level) -> model::Level {
   own name (`view_item_range`), and only the `SyntaxNode` ones go.
 
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+> applied by lints, 2026-10-29 (see Status under part 8).
 
 ### 6. `crates/blaze-lints/src/serve.rs`
 
@@ -1324,6 +1331,7 @@ mod tests {
   of its own after the flattened map, so it comes last.)
 
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+> applied by lints, 2026-10-29 (see Status under part 8).
 
 ### 7. `crates/blaze-lints/src/tests.rs`
 
@@ -1333,6 +1341,7 @@ has a macro expansion, and on what they have the two emitters write the same byt
 (`blaze_diagnostics::emit::reference`'s proptest).
 
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+> applied by lints, 2026-10-29 (see Status under part 8).
 
 ### 8. `docs/v2/plan/lanes/lints/cx.md`
 
@@ -1343,9 +1352,17 @@ lint files call (`suggestion`, `multipart_suggestion`, `suggestion_with_style`, 
 `span_note`, `span_help`, `span_label`, `sub`) have the same signatures on `Diag` (`span_note`
 and `span_help` take `impl Into<MultiSpan>`, which a `Span` is).
 
-Status: open
+Status: applied by lane `lints`, 2026-10-29. Parts 1-4 and 6-8 as written. In `serve.rs`,
+`blaze_diagnostics::emit::Sources` has no reading constructor, so `written` also takes a `read`
+function and gives `Sources::add` each file `Sources::unread` names before it writes a build.
+`check.rs` is on views, so its `item_range`, `signature_range` and `derive_paths` stay, with
+no `SyntaxNode` copies to delete. `blaze_diagnostics::cx` isn't imported, `empty_enums` keeps
+`crate::check::item_range`, and a declarative or built-in macro's def site is
+`item_range(self.node_of(id)?)`, which is `None` (not the whole expansion) when its node isn't
+found.
 
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+> applied by lints, 2026-10-29 (see Status under part 8).
 
 ## dedup: the v1 cargo crates call blaze-units' copies (from dedup-scan-cargo, 2026-10-29)
 
@@ -1646,3 +1663,29 @@ pub fn rust_files(dir: &Path) -> Vec<PathBuf> {
 dissimilar, text-size and rustc-hash, so no caller makes a cycle.
 
 > forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).
+
+## dedyn: crates/blaze-fmt: `&mut dyn Write` stays, with `// dyn:` (a CLI output writer, per file, not per token)
+
+Checked against the second sweep's item 4: the formatter does not write through these. It
+builds each file's text in a `String` (`rewrite` → `String`), and `source_file.rs::write_file`
+hands the whole text to the session's emitter once per file; the emitters write it with one
+`write!` (stdout, files) or a line per mismatch (diff, checkstyle, json, modified lines).
+`print_docs` is `--print-config`'s output. These are CLI output writers, on the user's leave-alone
+list. `Session<'b, T: Write>` is already generic; only the emitter's boundary is erased. Making
+`Emitter` an enum of its seven modes to make the writer generic would move upstream rustfmt's
+structure for one indirect call per file. So: no code change, a comment on each.
+
+Add the line `// dyn: the session's output, written once per formatted file, never per token.`
+directly above each of these (today's line numbers):
+
+- `src/emitter.rs:34` (`fn emit_formatted_file(`), `:40` (`fn emit_header`), `:44` (`fn emit_footer`)
+- `src/emitter/stdout.rs:20`, `src/emitter/files.rs:22`, `src/emitter/files_with_backup.rs:12`,
+  `src/emitter/diff.rs:20`, `src/emitter/modified_lines.rs:12`, `src/emitter/json.rs:30` and `:37`,
+  `src/emitter/checkstyle.rs:13`, `:19` and `:25` (each `output: &mut dyn Write` parameter line)
+- `src/config/config_type.rs:388`: `// dyn: --print-config's output, written once.`
+
+`emitter: Box<dyn Emitter + 'b>` (`lib.rs:441`, `create_emitter` `:516`) and
+`source_file.rs:23` (`&mut dyn Emitter`): `// dyn: the emit mode, chosen once per session from
+the config; called once per formatted file.` above each.
+
+> forwarded to the coordinator: `crates/blaze-fmt` is the coordinator's own (crates.md "every other path"), not requests'; on requests' coordinator list (requests, pass 22).

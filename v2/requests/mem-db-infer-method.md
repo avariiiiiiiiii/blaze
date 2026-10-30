@@ -77,6 +77,7 @@ own.
 ## Shared helpers (method_resolution.rs, lane db and lane items)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> forwarded by db-mem-infer-b (21:25): every entry in `method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs` and `drop.rs` (S1, P1 to P5, C1, C2, I1 to I6, M1 to M8, O1 to O4, SP1, D1, T1, T2 and their rows of the tables and tests below) is lane items', filed in `v2/requests/db.md` "mem-db-infer-method, for lane items". Lane db's entries here are P6, N1, R1, H1, H2.
 
 ### S1. Frame map and set aliases
 
@@ -665,6 +666,7 @@ The `XXX` comment's "`Vec::contains()`" reads "`contains`". The return type `imp
 Ty<'db>> + use<'db>` holds: `arrayvec::IntoIter` owns its items.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b (21:25): the `AutoderefSteps` `ArrayVec`, the three `Steps` defaults and the pub `autoderef`'s `ArrayVec` of 21, as written. Not yet the R2 part (`'f` on `InferenceContextAutoderefCtx`/`InferenceContextAutoderef`): waits on mem-db-infer-ctx A0 (`InferenceContext<'db, 'f>`) and lands with expr X3's callers (db-mem-infer-a's).
 
 ## Confirm
 
@@ -790,6 +792,16 @@ the frame `Vec` at most once. `use blaze_mem::Frame;` in confirm.rs.
 > forwarded to db (from requests, pass 17; told by tmux).
 
 ## Impl tables: built once at exact size (method_resolution.rs:1220-1530, 1651-1711; frozen.rs:78-122; lane db + items)
+
+> **Hold (2026-10-29 21:17):** `requests-impls` is applying `v2/requests/items.md`
+> "frontend-nameres-impls" parts 1 to 4 in `method_resolution.rs` now. That change builds the
+> tables per module (`for_module`, `merge_into`, `modules_by_trait` and the other bucket queries)
+> and moves `InherentImpls`/`TraitImpls::for_crate`, `collect_def_map` and the `in_crate_*` memos.
+> Do not apply I1 to I6, or M6's `collect` callers, until requests-impls reports done. The design
+> (frame builders, flat records, one counting pass, exact columns, frozen reads pushed straight
+> in) carries over: the per-module tables and the crate merge become the builders' inputs. The
+> "before" quotes here are of the old per-crate walk and will be refreshed against the new code
+> then.
 
 > forwarded to db (from requests, pass 17; told by tmux).
 
@@ -2477,6 +2489,7 @@ this differs from rustc for an alias reached twice is a correctness question for
 here only as a note.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b (21:25): as written, with mem-db-infer.md section 5's `crate::{FrameSet, frame_set}` (`frame_set(frame)` for `FrameSet::with_hasher_in`) in place of `crate::method_resolution::FrameSet`. Callers' moves to the `_in` forms are their parts'.
 
 ## representability.rs (lane db)
 
@@ -2598,6 +2611,7 @@ and `rest` assertions (both tests keep their assertions: bits 0, 5, 63, 64, 130 
 `use blaze_mem::Frame;`. `representability` (28): tag only.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b (21:25): as written, tags as `mem_tag = Infer` (salsa M2 takes a variant ident). The dedup request onto `blaze_ids::bits` (`v2/requests/db.md` "dedup: bits: hir-ty `ParamsInRepr`") is still pending; db-apply-ty told to apply it to the builder form.
 
 ## traits.rs (lane db + items)
 
@@ -2708,6 +2722,7 @@ After:
 (`PickResult<'db>` borrows nothing of the frame.)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> not applied by db-mem-infer-b (21:25): waits on P1 (`MethodResolutionContext::frame`, lane items' `method_resolution.rs`; filed in `v2/requests/db.md` "mem-db-infer-method, for lane items") and on `blaze-mem` in `crates/hir/Cargo.toml`.
 
 ### H2. `crates/hir/src/lib.rs:5782-5814` (`Type::with_method_resolution`)
 
@@ -2751,6 +2766,7 @@ After:
 iterator is consumed inside `f` at both call sites (5871, 5972).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> not applied by db-mem-infer-b (21:25): waits on P1, as H1.
 
 ## Tracked functions: tag and memo result
 

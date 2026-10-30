@@ -4753,7 +4753,9 @@ pub fn stand_in_section(format: object::BinaryFormat) -> (&'static str, &'static
 /// gigabytes is not in memory twice. Where no such file can be made they are made in memory.
 fn write_object(product: cranelift_object::ObjectProduct) -> Result<Vec<u8>> {
     use std::io::{Read as _, Seek as _, Write as _};
-    let failed = |e: &dyn fmt::Display| CodegenError::Backend(format!("writing the object: {e}"));
+    fn failed(e: impl fmt::Display) -> CodegenError {
+        CodegenError::Backend(format!("writing the object: {e}"))
+    }
     let Some(mut file) = unnamed_file() else {
         return product.emit().map_err(|e| failed(&e));
     };
@@ -20357,6 +20359,7 @@ mod tests {
     }
 
     /// An ISA for `triple`, as an object of it is written with.
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     fn isa_of(triple: &str) -> &'static dyn cranelift_codegen::isa::TargetIsa {
         use cranelift_codegen::settings::{self, Configurable};
         let mut flags = settings::builder();
@@ -20370,6 +20373,7 @@ mod tests {
 
     /// The relocations of `func` compiled for `isa`.
     fn relocs_of(
+        // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
         isa: &dyn cranelift_codegen::isa::TargetIsa,
         func: ir::Function,
     ) -> Vec<cranelift_codegen::binemit::Reloc> {

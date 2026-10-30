@@ -2807,6 +2807,7 @@ impl<'db> ExprCollector<'db> {
                     self.krate,
                     resolver,
                     &mut |ptr, call| {
+                        self.store.macro_calls.push(call);
                         if self.store.record {
                             self.store.expansions.push((ptr.map(|(it, _)| it), call));
                         }
@@ -2833,10 +2834,11 @@ impl<'db> ExprCollector<'db> {
             Some((mark, expansion)) => {
                 // Keep collecting even with expansion errors so we can provide completions and
                 // other services in incomplete macro expressions.
-                if let Some(macro_file) = self.expander.current_file_id().macro_file()
-                    && self.store.record
-                {
-                    self.store.expansions.push((macro_call_ptr, macro_file));
+                if let Some(macro_file) = self.expander.current_file_id().macro_file() {
+                    self.store.macro_calls.push(macro_file);
+                    if self.store.record {
+                        self.store.expansions.push((macro_call_ptr, macro_file));
+                    }
                 }
 
                 let id = collector(self, expansion.map(|it| it.tree()));

@@ -16,7 +16,7 @@ use blaze_resolve::resolver::{CompileKind, FeatureOpts, FeatureResolver, ForceAl
 use blaze_resolve::{Cfg, InternedString, PackageId, Platform};
 use cargo_util_schemas::manifest::{TomlProfile, TomlProfiles};
 use cargo_util_schemas::restricted_names::ProfileName;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::manifest::WorkspaceRead;
 use super::resolve::Resolved;
@@ -41,6 +41,8 @@ pub(crate) struct Built {
     pub finished: String,
     /// A foreign workspace's roots by name, with their units' indexes.
     pub roots: Vec<(String, usize)>,
+    /// The workspace's `build-script-link-dirs`, absolute.
+    pub link_dirs: Vec<String>,
 }
 
 /// The units of `resolved`, as `spec` asks for them.
@@ -119,16 +121,33 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
-    let by_id: FxHashMap<PackageId, Package<'_>> = resolved
-        .manifests
-        .iter()
-        .filter(|(id, _)| all_ids.contains(id))
-        .map(|(id, (_, manifest))| (*id, Package { manifest, is_member: resolved.member_ids.contains(id) }))
-        .collect();
-    let packages_by_spec: BySpec<'_> = by_id
-        .iter()
-        .map(|(id, package)| (id.to_spec().to_string(), (*id, Package { manifest: package.manifest, is_member: package.is_member })))
-        .collect();
+    let members: FxHashSet<PackageId> = resolved.member_ids.iter().copied().collect();
+    let mut by_id: FxHashMap<PackageId, Package<'_>> = FxHashMap::with_capacity_and_hasher(all_ids.len(), Default::default());
+    let mut packages_by_spec: BySpec<'_> = FxHashMap::with_capacity_and_hasher(all_ids.len(), Default::default());
+    for id in &all_ids {
+        let Some((_, manifest)) = resolved.manifests.get(id) else { continue };
+        let package = Package { manifest, is_member: members.contains(id) };
+        by_id.insert(*id, package);
+        // alloc: the spec is how a unit names its package (`Unit::pkg_id`), once per package.
+        packages_by_spec.insert(id.to_spec().to_string(), (*id, package));
+    }
+    let opt_out = match super::sandbox::workspace(ws.custom_metadata(), ws.root_manifest()) {
+        Ok(it) => it,
+        Err(error) => return Ok(Staged::Failed(error)),
+    };
+    let mut unsandboxed: FxHashSet<&str> = FxHashSet::default();
+    for (spec, (id, package)) in &packages_by_spec {
+        let own = match package.is_member {
+            true => match super::sandbox::build_script_outside(package.manifest.custom_metadata.as_ref(), resolved.manifests[id].0) {
+                Ok(it) => it,
+                Err(error) => return Ok(Staged::Failed(error)),
+            },
+            false => false,
+        };
+        if own || opt_out.unsandboxed(id.name().as_str()) {
+            unsandboxed.insert(spec.as_str());
+        }
+    }
     let request = Request {
         packages: &by_id,
         resolve: &resolved.resolve,
@@ -251,6 +270,7 @@ pub(crate) fn units(
         profile_dir: &dir_name,
         base_profile: &base_profile,
         jobs,
+        unsandboxed: &unsandboxed,
     };
     let planned = match super::plan::plan(&input) {
         Ok(it) => it,
@@ -285,6 +305,7 @@ pub(crate) fn units(
         build_dir: build_dir.display().to_string(),
         finished: planned.finished,
         roots: named_roots,
+        link_dirs: opt_out.link_dirs,
     }))
 }
 
@@ -318,26 +339,27 @@ fn jobs(config: &blaze_manifest::Config, asked: Option<u32>) -> anyhow::Result<O
 const FOREIGN_TARGET: &str = "/@blaze-foreign-target";
 
 /// Each path of `plan` under one of `prefixes` put under `out` instead.
-fn rebase(plan: &mut UnitPlan, prefixes: &[String], out: &str) {
-    let moved = |path: &str| -> String {
+fn rebase<P: AsRef<str>>(plan: &mut UnitPlan, prefixes: &[P], out: &str) {
+    let rebased = |path: &mut String| {
         for prefix in prefixes {
-            if let Some(rest) = path.strip_prefix(prefix.as_str())
+            let prefix = prefix.as_ref();
+            if let Some(rest) = path.strip_prefix(prefix)
                 && (rest.is_empty() || rest.starts_with('/'))
             {
-                return format!("{out}{rest}");
+                path.replace_range(..prefix.len(), out);
+                return;
             }
         }
-        path.to_owned()
     };
     for output in &mut plan.outputs {
-        *output = moved(output);
+        rebased(output);
     }
     if let Some(dir) = &mut plan.out_dir {
-        *dir = moved(dir);
+        rebased(dir);
     }
     for (name, value) in &mut plan.env {
         if name == "OUT_DIR" {
-            *value = moved(value);
+            rebased(value);
         }
     }
 }
@@ -614,17 +636,20 @@ fn merge_std(
     let users: Vec<usize> = (0..offset)
         .filter(|at| &graph.units[*at].platform == platform && graph.units[*at].mode != Mode::RunCustomBuild)
         .collect();
+    graph.units.reserve(std.units.len());
     for mut unit in std.units {
         for dep in &mut unit.dependencies {
             dep.index += offset;
         }
         graph.units.push(unit);
     }
+    plans.reserve(std.plans.len());
     for mut plan in std.plans {
-        rebase(&mut plan, &[STD_OUT.to_owned()], out);
+        rebase(&mut plan, &[STD_OUT], out);
         plans.push(Some(plan));
     }
     for at in users {
+        graph.units[at].dependencies.reserve(std.roots.len());
         for (name, index) in &std.roots {
             graph.units[at].dependencies.push(UnitDep {
                 index: index + offset,
@@ -687,5 +712,6 @@ fn package_plan(id: PackageId, manifest: &Manifest, manifest_path: &Path, is_mem
         manifest_path: manifest_path.display().to_string(),
         source,
         is_member,
+        default_run: manifest.default_run.clone(),
     }
 }

@@ -31,18 +31,52 @@ it once it runs.
 - **Which crates.** `deps::eligible`: a crate whose origin is not local and none of whose
   transitive dependencies is local. Workspace members, and anything built on one, resolve from
   source; `blaze check` of the workspace checks them fully.
-- **Key** (`deps/key.rs`). A hash of `build` (the blaze reading, from the driver), the encodings'
-  versions (`PRODUCER`: image schema, `frozen::ENCODING`, `signatures::SCHEMA`),
-  `Crate::content` (root path, edition, cfg and features, env, crate attributes, target and
-  toolchain, dependencies' content IDs), the content of the crate's source root (every file's
-  path and text, `OUT_DIR` files included, since the v2 load puts them there), the process env
-  (`env!` reads it when the crate's env has no value) and each dependency's own key (its texts,
-  which `Crate::content` leaves out).
-- **What the key does not cover is refused** (`deps::store`, `Refused`): a crate with an item
-  from a procedural macro (its expansion may read files and variables the expansion server
-  traces per expansion, not in hir), a def map that uses the session's macros, a module file or
-  `include!` outside the crate's source root. Such a crate resolves from source every build,
-  and the driver shows why under `-v`.
+- **Key** (`deps/key.rs`), portable: no absolute path of the machine is hashed, so two
+  checkouts at different paths, on one machine or two, have the same keys. It hashes:
+  - `build` (the blaze reading, from the driver) and the encodings' versions (`PRODUCER`: image
+    schema, `frozen::ENCODING`, `signatures::SCHEMA`, the reads' domain);
+  - every field of the crate's `BuiltCrateData` and `ExtraCrateData`, destructured with no `..`,
+    so a field added to either fails to compile until the key covers it. These are the root
+    path, edition, dependencies (name, flags and their keys), origin, crate attributes, target
+    kind and crate types, the proc-macro cwd, version, display name, potential cfg, workspace
+    data (toolchain, target layout) and cfg, and the crate's variables sorted;
+  - the source root's files, each as its path and its text's content ID, sorted (`OUT_DIR` files
+    included, since the v2 load puts them there);
+  - for a proc-macro crate, each macro's name, kind, disabled flag and library content ID
+    (`ProcMacroExpander::code`). A proc-macro crate with a macro of unknown code is not
+    eligible, and neither is any crate built on one.
+
+  It is computed here rather than from base-db's `Crate::content` and source-root content IDs,
+  which name files by absolute path. Paths and variable values are written relative
+  (`Base`): the package directory (`CARGO_MANIFEST_DIR`, else the root file's directory)
+  becomes `\0PKG`, `OUT_DIR` becomes `\0OUT_DIR`, and any other absolute value of a variable
+  (`CARGO`, `RUSTC`, a home directory) becomes `\0ABSOLUTE`. An image whose parts hold one of
+  those paths, at least 8 bytes long, would depend on what the key left out, so it is refused
+  (`Refused::MachinePath`).
+- **Reads** (`deps/reads.rs`): what a crate read that is known only once it is resolved, kept
+  as `blaze_usercode::index` keeps a run's shapes. It is two lists:
+  - the process variables its `env!` and `option_env!` read that its own variables lack (from
+    base-db's `Files::env_read` log, which notes every such expansion, nested ones too);
+  - each proc-macro expansion's `ExpansionReads::Traced { shape, values }`, as its server
+    reported it.
+
+  The names (`Reads::encode`) go in the first free of 16 slots under the key
+  (`reads::slot(K, n)`). The image goes under `reads::image_key(K, names, values)`, where
+  `values` hashes the variables' values and each expansion's values hash. A crate that read
+  nothing of the kind has its image under `K`, which is one get. Serving asks `K`, then each
+  slot in turn: it decodes the names and works out their values now (the database's process
+  variables, `ImageStore::reads_now` for each shape with the crate's variables), then gets the
+  image they name. A value that changed is a miss (`Served::stale`); the crate is resolved and
+  imaged again under the same slot, never served from an older image.
+- **What the key and reads do not cover is refused** (`deps::store`, `Refused`):
+  - an expansion whose reads are not known (`ExpansionReads::Unknown`: untraced, it asked the
+    database, it read the clock, or its macro keeps a session);
+  - two expansions that read the same names and found other values;
+  - a def map that uses the session's macros;
+  - a module file or `include!` outside the crate's source root;
+  - a part holding a machine path.
+
+  Such a crate resolves from source every build, and the driver shows why under `-v`.
 - **Image** (`deps/image.rs`). One `blaze_format` buffer: a `Root { key, parts }` and three
   parts (`Part::DefMap`, `LangItems`, `Signatures`), each 16-aligned so the signatures part,
   a buffer itself, is opened in place. `ImageRef::open` checks the header and schema, that the
@@ -56,6 +90,13 @@ it once it runs.
   naming the crate: never a crate resolved instead.
 - **Store.** `deps::store(db, served, store)` writes the image of each eligible crate not
   served, after the refusals; a store that keeps other bytes under the key is an error.
+- **In place.** `ImageStore::get` returns an `ImageBuf` (`Arc<dyn Held>`, where `Held` lends
+  the bytes). The driver gives `blaze_cas::Reader::pinned`, a verified range of the store's
+  mapping at a 16-byte boundary, so an image is never copied; parts (`PartBytes::In`) and
+  signature stores borrow it.
+- **Global cache.** `ReadThrough { local, global }` is an `ImageStore` that asks the local
+  store, then the global one, and keeps what the global one gave locally. Puts and `reads_now`
+  go to the local store. Portable keys are what make a global image usable.
 - **Modes.** `Mode::Serve` reads the image; `Mode::Check` resolves as well and records each
   difference; `Mode::Verify` re-encodes what was read and records a difference from the bytes.
 
@@ -85,23 +126,42 @@ In `crates/hir-def/src/deps/tests.rs`:
   difference.
 - `an_edit_to_a_dependency_misses_its_image_and_its_dependents`,
   `an_image_written_under_another_key_is_an_error`,
-  `a_crate_with_an_item_from_a_proc_macro_is_refused`,
   `a_crate_with_no_outside_input_is_not_refused`, `serving_asks_the_store_once_a_crate`.
+- Proc macros, with a test expander (`Reading`) that reports its library and its reads:
+  - `a_crate_with_traced_expansions_resolves_from_its_image_as_a_fresh_one` (each mode) is the
+    differential test. A crate of attribute expansions is filed by its reads and gives the
+    same def map, diagnostics and signatures, byte for byte, as resolving it.
+  - `a_changed_read_misses_the_image_and_the_next_one_is_found`: a changed value is stale,
+    and the new image shares the slot.
+  - `a_key_covers_the_library_of_its_macros`: a rebuilt library changes the key.
+  - `a_crate_with_an_expansion_of_unknown_reads_is_refused`: the fixture's expanders, which
+    report nothing, are refused, and their users are not eligible.
+- `process_variables_read_file_the_image_by_their_values`,
+  `reads_read_back_and_damaged_ones_do_not_panic`: the reads' values and encoding.
+- `keys_hold_no_path_of_the_checkout`: two checkouts with different package directories,
+  `OUT_DIR`s and tool paths have equal keys, while a changed text, a moved file or a renamed
+  variable gives another. `an_image_holding_a_path_of_the_checkout_is_refused` covers
+  `Base`.
+- `the_global_cache_is_read_through_the_local_store`: the global store is asked once per
+  crate, and the next session asks it nothing.
 - Outline signatures against full-parse signatures (fixtures and a proptest) and served
   signatures against computed ones are `frontend-deps-sigs`'s, in `deps/signatures/`.
 
 ## Left, with who
 
-- db: declare `pub mod deps;` in `crates/hir-def/src/lib.rs` (`v2/requests/db.md`); the
-  signature hooks `frontend-deps-sigs` sent (notes: [signatures.md](signatures.md)); and
+- db: the signature hooks `frontend-deps-sigs` sent (notes: [signatures.md](signatures.md)); and
   `parse_file` in `EditionedFileId::parse` from `frontend-deps-reparse` (notes:
   [reparse.md](reparse.md)).
 - cargo-daemon: the `ImageStore` adapter over `blaze-cas`, `serve` once inputs are final,
   `store` after the build, a daily `Mode::Check` run (`v2/requests/cargo.md`).
-- usercode and db: a content ID of each proc-macro expansion's traced inputs, kept with the
-  expansion, so crates with proc-macro items can be imaged too (today they are refused).
-- store: an aligned in-place read of an entry, so `ImageStore::get` need not copy the image
-  once per crate (`Aligned::copy_from` in the adapter today).
-- Keys hold absolute paths (`Crate::content` and source-root content name files by path), so
-  images are shared between checkouts at one path, not across machines: a portable content ID
-  (paths from the package root) is db's to add before the global cache serves images.
+- db-expand (`v2/requests/db-expand.md`): `ProcMacroExpander::code`, `ExpansionReads`,
+  `report_reads`, and `proc_macro_expansion` with `MacroCallId::expansion_reads`. `deps/key.rs`
+  and `deps/reads.rs` compile once they land.
+- usercode (`v2/requests/usercode.md`): `Kept::code`, `report_reads` on every path of
+  `Kept::kept`, `index::values`, `Found::Hit`'s shape, and `blaze_expand::reads_now`.
+- db (`v2/requests/db.md`): `ExpressionStoreRef::decode_in` over an `ImageBuf`, which
+  `deps/signatures.rs` already calls (forwarded from speed-hir-store, which is done).
+- cargo (`v2/requests/cargo.md`, amended): the adapter over `Reader::pinned`, `reads_now`, and
+  `ReadThrough` once the global adapter exists.
+- fastcompile (`v2/requests/fastcompile.md`): a public proof for dependency-image keys and an
+  `ImageStore` over the global client.

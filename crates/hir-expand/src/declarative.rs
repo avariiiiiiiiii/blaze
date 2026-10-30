@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Old-style `macro_rules` or the new macros 2.0
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct DeclarativeMacroExpander {
     pub mac: mbe::DeclarativeMacro,
     pub transparency: Transparency,
@@ -129,6 +129,10 @@ impl AstId<ast::Macro> {
                 krate.data(db).edition
             }
         };
+        let edition = ctx_edition(match id.file_id {
+            HirFileId::MacroFile(macro_file) => macro_file.lookup(db).ctxt,
+            HirFileId::FileId(file) => SyntaxContext::root(file.edition(db)),
+        });
         let (mac, transparency) = match id.to_ptr(db).to_node(&root) {
             ast::Macro::MacroRules(macro_rules) => (
                 match macro_rules.token_tree() {
@@ -180,10 +184,6 @@ impl AstId<ast::Macro> {
                 transparency(macro_def.into()).unwrap_or(Transparency::Opaque),
             ),
         };
-        let edition = ctx_edition(match id.file_id {
-            HirFileId::MacroFile(macro_file) => macro_file.lookup(db).ctxt,
-            HirFileId::FileId(file) => SyntaxContext::root(file.edition(db)),
-        });
         DeclarativeMacroExpander { mac, transparency, edition }
     }
 }

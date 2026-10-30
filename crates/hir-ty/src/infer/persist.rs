@@ -50,6 +50,7 @@ use crate::{
             Csr, DenseKey, ExprOrPatColumn, ExprOrPatMap, ExprOrPatSet, FieldColumn, IdxSet, IndexColumn,
             ModeColumn, SortedMap, TyColumn,
         },
+        prelude_lints::{EditionLint, ReceiverAdjustment},
     },
     lower::{
         diagnostics::IncorrectGenericsLenKind,
@@ -707,6 +708,7 @@ impl InferenceRecord {
             field_resolutions,
             variant_resolutions,
             value_resolutions,
+            unstable_candidates,
             assoc_resolutions,
             tuple_field_access_types,
             type_of_expr,
@@ -819,6 +821,15 @@ impl InferenceRecord {
             words.node(node);
             words.value_ns(value);
         });
+        words.len(unstable_candidates.iter().count());
+        unstable_candidates.iter().for_each(|(node, candidates)| {
+            words.node(node);
+            words.len(candidates.len());
+            candidates.iter().for_each(|(candidate, feature)| {
+                words.candidate(*candidate);
+                words.symbol(feature);
+            });
+        });
         record.put32(C32::Words, words.words);
         record.put8(C8::Text, words.text);
 
@@ -872,7 +883,7 @@ impl Placed {
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(5),
+        Part::U64(6),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -1195,7 +1206,20 @@ impl<'a> InferenceRecordRef<'a> {
             }
             map.freeze()
         };
-        self.ensure(words.is_done(), "words after the last value path resolution")?;
+        let unstable_candidates = {
+            let mut map = ExprOrPatMap::default();
+            for _ in 0..words.len()? {
+                let node = words.node()?;
+                let len = words.len()?;
+                self.ensure(len != 0, "a node that passed over no unstable items")?;
+                let candidates = (0..len)
+                    .map(|_| Ok((words.candidate()?, words.symbol()?)))
+                    .collect::<Result<Box<[_]>, FormatError>>()?;
+                self.ensure(map.insert(node, candidates).is_none(), "a node with two unstable item lists")?;
+            }
+            map.freeze()
+        };
+        self.ensure(words.is_done(), "words after the last unstable item list")?;
 
         let defined_anon_consts = self
             .u64s(C64::AnonConsts)
@@ -1209,6 +1233,7 @@ impl<'a> InferenceRecordRef<'a> {
             field_resolutions,
             variant_resolutions,
             value_resolutions,
+            unstable_candidates,
             assoc_resolutions,
             tuple_field_access_types,
             type_of_expr: self.ty_column(tys, [C32::ExprTyAt, C32::ExprTys])?,
@@ -1301,10 +1326,20 @@ impl Sink {
     }
 
     fn name(&mut self, name: &Name) {
-        let text = name.as_str().as_bytes();
+        self.symbol(name.symbol());
+    }
+
+    fn symbol(&mut self, symbol: &Symbol) {
+        let text = symbol.as_str().as_bytes();
         self.len(self.text.len());
         self.len(text.len());
         self.text.extend_from_slice(text);
+    }
+
+    fn candidate(&mut self, candidate: CandidateId) {
+        let (tag, bits) = candidate_key(candidate);
+        self.word(u32::from(tag));
+        self.u64(bits);
     }
 
     fn node(&mut self, node: ExprOrPatIdPacked) {
@@ -1820,6 +1855,40 @@ impl Sink {
                     self.id(trait_);
                 }
             }
+            D::EditionDependentMethodCall {
+                call_expr,
+                receiver,
+                lint,
+                method,
+                inherent,
+                autoderefs,
+                autoref,
+            } => {
+                let lint = match lint {
+                    EditionLint::Rust2021PreludeCollisions => 0,
+                    EditionLint::Rust2024PreludeCollisions => 1,
+                    EditionLint::ArrayIntoIter => 2,
+                    EditionLint::BoxedSliceIntoIter => 3,
+                };
+                self.words.extend([61, local(*call_expr), local(*receiver), lint]);
+                self.id(*method);
+                self.bool(*inherent);
+                self.word(*autoderefs);
+                match autoref {
+                    None => self.word(0),
+                    Some(ReceiverAdjustment::Autoref(mutability)) => {
+                        self.word(1);
+                        self.mutability(*mutability);
+                    }
+                    Some(ReceiverAdjustment::ToConstPtr) => self.word(2),
+                }
+            }
+            D::FullyQualifiedCallFrom2018 { node, item, self_ty } => {
+                self.word(62);
+                self.node(*node);
+                self.candidate(*item);
+                self.ty(tys, self_ty);
+            }
             D::MethodCallIncorrectGenericsOrder { expr, param_id, arg_idx, has_self_arg } => {
                 self.words.extend([34, local(*expr)]);
                 self.generic_param(*param_id);
@@ -2148,10 +2217,23 @@ impl Source<'_> {
     }
 
     fn name(&mut self) -> Result<Name, FormatError> {
+        self.symbol().map(Name::new_symbol_root)
+    }
+
+    fn symbol(&mut self) -> Result<Symbol, FormatError> {
         let (start, len) = (self.word()? as usize, self.word()? as usize);
         let bytes = self.text.get(start..).and_then(|it| it.get(..len)).ok_or(self.invalid("a name past the text"))?;
         let text = std::str::from_utf8(bytes).map_err(|_| self.invalid("a name that is not UTF-8"))?;
-        Ok(Name::new_symbol_root(Symbol::intern(text)))
+        Ok(Symbol::intern(text))
+    }
+
+    fn candidate(&mut self) -> Result<CandidateId, FormatError> {
+        let tag = self.word()?;
+        let bits = self.u64()?;
+        u8::try_from(tag)
+            .ok()
+            .and_then(|tag| candidate_of(tag, bits))
+            .ok_or(self.invalid("an item of no kind or id 0"))
     }
 
     fn expr_or_pat(&mut self) -> Result<ExprOrPatId, FormatError> {
@@ -2592,6 +2674,31 @@ impl Source<'_> {
                     let len = self.len()?;
                     (0..len).map(|_| self.id()).collect::<Result<_, _>>()?
                 },
+            },
+            61 => D::EditionDependentMethodCall {
+                call_expr: self.local()?,
+                receiver: self.local()?,
+                lint: match self.word()? {
+                    0 => EditionLint::Rust2021PreludeCollisions,
+                    1 => EditionLint::Rust2024PreludeCollisions,
+                    2 => EditionLint::ArrayIntoIter,
+                    3 => EditionLint::BoxedSliceIntoIter,
+                    _ => return Err(self.invalid("an edition lint of no kind")),
+                },
+                method: self.id()?,
+                inherent: self.bool()?,
+                autoderefs: self.word()?,
+                autoref: match self.word()? {
+                    0 => None,
+                    1 => Some(ReceiverAdjustment::Autoref(self.mutability()?)),
+                    2 => Some(ReceiverAdjustment::ToConstPtr),
+                    _ => return Err(self.invalid("a receiver adjustment of no kind")),
+                },
+            },
+            62 => D::FullyQualifiedCallFrom2018 {
+                node: self.node()?,
+                item: self.candidate()?,
+                self_ty: self.ty(tys)?,
             },
             34 => D::MethodCallIncorrectGenericsOrder {
                 expr: self.local()?,
@@ -3116,6 +3223,52 @@ mod tests {
                 needs_mut: false,
                 candidates: Box::new([]),
             },
+            D::EditionDependentMethodCall {
+                call_expr: expr(18),
+                receiver: expr(19),
+                lint: EditionLint::Rust2021PreludeCollisions,
+                method: FunctionId::from_id(id(40)),
+                inherent: false,
+                autoderefs: 0,
+                autoref: None,
+            },
+            D::EditionDependentMethodCall {
+                call_expr: expr(19),
+                receiver: expr(20),
+                lint: EditionLint::Rust2024PreludeCollisions,
+                method: FunctionId::from_id(id(41)),
+                inherent: true,
+                autoderefs: 2,
+                autoref: Some(ReceiverAdjustment::Autoref(Mutability::Mut)),
+            },
+            D::EditionDependentMethodCall {
+                call_expr: expr(20),
+                receiver: expr(21),
+                lint: EditionLint::ArrayIntoIter,
+                method: FunctionId::from_id(id(40)),
+                inherent: true,
+                autoderefs: 1,
+                autoref: Some(ReceiverAdjustment::Autoref(Mutability::Not)),
+            },
+            D::EditionDependentMethodCall {
+                call_expr: expr(21),
+                receiver: expr(18),
+                lint: EditionLint::BoxedSliceIntoIter,
+                method: FunctionId::from_id(id(41)),
+                inherent: false,
+                autoderefs: 0,
+                autoref: Some(ReceiverAdjustment::ToConstPtr),
+            },
+            D::FullyQualifiedCallFrom2018 {
+                node: expr(18).into(),
+                item: FunctionId::from_id(id(42)).into(),
+                self_ty: ty(types.u8),
+            },
+            D::FullyQualifiedCallFrom2018 {
+                node: pat(4).into(),
+                item: ConstId::from_id(id(43)).into(),
+                self_ty: ty(types.bool),
+            },
             D::MethodCallIncorrectGenericsOrder {
                 expr: expr(19),
                 param_id: LifetimeParamId { parent: def, local_id: local_of(0) }.into(),
@@ -3400,6 +3553,18 @@ mod tests {
                 values.insert(pat(6).into(), ValueNs::EnumVariantId(EnumVariantId::from_id(id(39))));
                 values.insert(expr(17).into(), ValueNs::GenericParam(ConstParamId::from_unchecked(param)));
                 values.freeze()
+            },
+            unstable_candidates: {
+                let mut candidates = ExprOrPatMap::default();
+                let call: Box<[(CandidateId, Symbol)]> = Box::new([
+                    (CandidateId::FunctionId(FunctionId::from_id(id(44))), Symbol::intern("iter_flatten")),
+                    (CandidateId::ConstId(ConstId::from_id(id(45))), Symbol::intern("int_roundings")),
+                ]);
+                let path: Box<[(CandidateId, Symbol)]> =
+                    Box::new([(CandidateId::ConstId(ConstId::from_id(id(46))), Symbol::intern("f16"))]);
+                candidates.insert(expr(12).into(), call);
+                candidates.insert(pat(6).into(), path);
+                candidates.freeze()
             },
             assoc_resolutions: ExprOrPatColumn {
                 exprs: IndexColumn::from_entries([(expr(6), (ConstId::from_id(id(25)).into(), args(&[types.u8])))]),

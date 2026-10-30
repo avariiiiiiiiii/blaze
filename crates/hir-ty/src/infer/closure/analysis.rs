@@ -321,7 +321,7 @@ impl<'db> InferenceContext<'db> {
                 panic!();
             };
             for stmt in statements {
-                let Statement::Let { pat, initializer: Some(init), .. } = *stmt else {
+                let Statement::Let { pat, initializer: Some(init), .. } = stmt else {
                     panic!();
                 };
                 let Pat::Bind { .. } = self.store.pat(pat) else {

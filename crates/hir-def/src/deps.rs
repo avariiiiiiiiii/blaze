@@ -33,7 +33,7 @@ mod tests;
 
 use std::sync::Arc;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use rustc_hash::FxHashMap;
 
 pub use crate::deps::{

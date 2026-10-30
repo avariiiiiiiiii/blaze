@@ -21,6 +21,7 @@ bitflags.workspace = true
 cov-mark = "2.0.0"
 drop_bomb = "0.1.5"
 either.workspace = true
+hashbrown.workspace = true
 fst = { version = "0.4.7", default-features = false }
 indexmap.workspace = true
 itertools.workspace = true
@@ -48,6 +49,7 @@ thin-vec.workspace = true
 syntax-bridge.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 blaze-phf.workspace = true
 blaze-query.workspace = true
 
@@ -56,6 +58,7 @@ blaze-query.workspace = true
 unicode-ident.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 expect-test.workspace = true
 proptest.workspace = true
 

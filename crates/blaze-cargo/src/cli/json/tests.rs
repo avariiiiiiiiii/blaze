@@ -153,8 +153,9 @@ fn a_compiler_message_as_cargo_writes_it_again() {
             r#""message":{{"rendered":"warning: unused variable: `x`\n\n","$message_type":"diagnostic","#,
             r#""children":[{{"children":[],"code":null,"level":"help","message":"if this is intentional, prefix it with an underscore","rendered":null,"#,
             r#""spans":[{{"byte_end":21,"byte_start":20,"column_end":10,"column_start":9,"expansion":null,"file_name":"src/main.rs","is_primary":true,"label":null,"line_end":2,"line_start":2,"suggested_replacement":"_x","suggestion_applicability":"MachineApplicable","text":{text}}}]}}],"#,
-            r#""code":{{"code":"unused_variables","explanation":null}},"level":"warning","message":"unused variable: `x`","#,
-            r#""spans":[{{"byte_end":21,"byte_start":20,"column_end":10,"column_start":9,"expansion":null,"file_name":"src/main.rs","is_primary":true,"label":null,"line_end":2,"line_start":2,"suggested_replacement":null,"suggestion_applicability":null,"text":{text}}}]}}}}"#,
+            r#""level":"warning","message":"unused variable: `x`","#,
+            r#""spans":[{{"byte_end":21,"byte_start":20,"column_end":10,"column_start":9,"expansion":null,"file_name":"src/main.rs","is_primary":true,"label":null,"line_end":2,"line_start":2,"suggested_replacement":null,"suggestion_applicability":null,"text":{text}}}],"#,
+            r#""code":{{"code":"unused_variables","explanation":null}}}}}}"#,
         ),
         root = root,
         target = target,
@@ -214,9 +215,50 @@ fn a_span_over_lines_and_one_of_no_file() {
 
 #[test]
 fn lines_without_bom_and_carriage_returns() {
-    let source = Source::new(b"\xef\xbb\xbfa\r\nb\n\nc".to_vec());
-    let lines: Vec<&str> = (1..=source.starts.len()).map(|it| source.line(it)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), b"\xef\xbb\xbfa\r\nb\n\nc").unwrap();
+    std::fs::write(dir.path().join("b.rs"), b"x\n").unwrap();
+    let root = dir.path().display().to_string();
+    let mut sources = Sources::new(dir.path());
+    let a = sources.file("a.rs", &root).unwrap();
+    let b = sources.file("b.rs", &root).unwrap();
+    let lines: Vec<&str> = (1..=sources.line_count(a)).map(|it| sources.line(a, it)).collect();
     assert_eq!(lines, ["a", "b", "", "c"]);
+    let lines: Vec<&str> = (1..=sources.line_count(b)).map(|it| sources.line(b, it)).collect();
+    assert_eq!(lines, ["x", ""], "a second file's lines are its own");
+}
+
+#[test]
+fn a_file_not_utf8_as_rustc_reads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), b"a\xff\nb").unwrap();
+    let mut sources = Sources::new(dir.path());
+    let a = sources.file("a.rs", &dir.path().display().to_string()).unwrap();
+    assert_eq!(sources.line(a, 1), "a\u{fffd}");
+    assert_eq!(sources.line(a, 2), "b");
+}
+
+/// Once the buffer has grown and the source is read, a compiler message allocates nothing.
+#[test]
+fn a_compiler_message_warm_allocates_nothing() {
+    let (_dir, root) = checkout();
+    let unit = UnitOf {
+        package_id: format!("path+file://{root}#0.1.0"),
+        manifest_path: format!("{root}/Cargo.toml"),
+        target: bin_target(&root),
+        test: false,
+    };
+    let diagnostic = unused("\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n");
+    let mut sources = Sources::new(std::path::Path::new(&root));
+    let mut out = String::with_capacity(16 * 1024);
+    for ansi in [false, true] {
+        compiler_message(&mut out, &unit, &diagnostic, ansi, &mut sources);
+        out.clear();
+        blaze_alloc_count::assert_at_most(0, "a warm compiler-message", || {
+            compiler_message(&mut out, &unit, &diagnostic, ansi, &mut sources);
+            out.clear();
+        });
+    }
 }
 
 /// The escape's stripping of colors against the reference: `say::strip_ansi`, then serde_json.

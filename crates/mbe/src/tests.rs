@@ -525,7 +525,7 @@ fn minus_belongs_to_literal() {
 }
 
 /// Taking a fragment allocates the same however much of its level follows it: the parser reads a
-/// window of the level, not the rest of it, into the input kept from the last fragment.
+/// window of the level, not the rest of it, into the thread's input words.
 #[test]
 fn a_fragment_allocates_the_same_however_much_follows_it() {
     let db = base_db::Db::for_tests();
@@ -555,5 +555,40 @@ fn a_fragment_allocates_the_same_however_much_follows_it() {
     let (short, long) = (used(100), used(10_000));
     assert_eq!(short, long);
     assert_eq!(short.allocations, 0, "a warm fragment allocates nothing");
+}
+
+/// A warm expansion allocates as often for ten token trees as for a thousand: the matcher's
+/// buffers, the bindings and the transcriber's nesting stack are the task's frame, so only the
+/// output's columns, sized once from the bindings, reach the allocator. `$($e)*` gives an
+/// output exactly as long as its input, which the builder's capacity covers. The output's bytes
+/// grow with it, so the counts are compared, not the bytes.
+#[test]
+fn a_warm_expansion_allocates_the_same_for_any_input() {
+    let db = base_db::Db::for_tests();
+    let anchor = SpanAnchor {
+        file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
+        ast_id: ROOT_ERASED_FILE_AST_ID,
+    };
+    let ctx = SyntaxContext::root(Edition::CURRENT);
+    let decl = "($($e:tt)*) => { $($e)* }";
+    let decl = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, decl).unwrap();
+    let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| Edition::CURRENT);
+    let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
+    let used = |trees: usize| {
+        let text = "x ".repeat(trees);
+        let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, &text).unwrap();
+        let expand = || {
+            let expanded =
+                mac.expand(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+            assert!(expanded.err.is_none());
+            expanded.value.0.view().token_trees().len()
+        };
+        // The first commits the frame's pages and makes the thread's buffers; a warm one reuses them.
+        expand();
+        let (len, used) = blaze_alloc_count::measure(expand);
+        assert_eq!(len, trees, "the expansion is its input");
+        used
+    };
+    assert_eq!(used(10).allocations, used(1_000).allocations);
 }
 

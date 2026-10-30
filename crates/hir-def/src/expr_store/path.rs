@@ -273,7 +273,7 @@ const _: () = {
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(size_of::<ModPath>() == 16);
-    assert!(size_of::<Name>() == 8);
+    assert!(size_of::<Name>() == 4);
     assert!(size_of::<TypeBound>() == 16);
 };
 

@@ -27,6 +27,7 @@ mod tests;
 
 use std::fmt;
 
+use blaze_ids::bits::below;
 use text_size::TextSize;
 use unicode_width::UnicodeWidthChar;
 
@@ -39,7 +40,8 @@ const BLOCK: usize = 8;
 /// no copy of it, so a [`Place`]'s columns are asked of the text it was built from.
 #[derive(PartialEq, Eq)]
 pub struct LineIndex {
-    /// Bit `i % 64` of word `i / 64` is set when byte `i` is `\n`. 1 bit a byte.
+    /// Bit `i % 64` of word `i / 64` is set when byte `i` is `\n`. 1 bit a byte. Ranked a
+    /// block of [`BLOCK`] words at a time, not a word at a time as a `blaze_ids::bits::Ranked`.
     bits: Box<[u64]>,
     /// The newlines before each [`BLOCK`] words, then all of them. 4 bytes per 512 of text.
     ranks: Box<[u32]>,
@@ -196,7 +198,7 @@ impl LineIndex {
             count += bits.count_ones();
         }
         if let Some(bits) = self.bits.get(word) {
-            count += (bits & below(at % 64)).count_ones();
+            count += (bits & below(at)).count_ones();
         }
         count
     }
@@ -206,7 +208,7 @@ impl LineIndex {
     fn start_before(&self, at: usize, line: u32) -> u32 {
         let word = at / 64;
         if let Some(bits) = self.bits.get(word) {
-            let found = bits & below(at % 64);
+            let found = bits & below(at);
             if found != 0 {
                 return (word * 64 + 64 - found.leading_zeros() as usize) as u32;
             }
@@ -236,11 +238,6 @@ impl LineIndex {
         }
         unreachable!("newline {nth} of {} is in the bitmap", self.newlines())
     }
-}
-
-/// The bits of a word below bit `n`, for `n` below 64.
-fn below(n: usize) -> u64 {
-    (1u64 << n) - 1
 }
 
 /// The place of set bit `nth` (from 0) of `bits`, which has more than `nth` set.

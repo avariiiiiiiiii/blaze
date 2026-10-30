@@ -183,6 +183,9 @@ pub(crate) struct KeptSymtab {
     /// By function, in [`Placed::functions`] order.
     locals: Vec<Local>,
     bytes: Vec<u8>,
+    /// How many builds were patches.
+    #[cfg(test)]
+    pub(crate) patched: u32,
 }
 
 /// A function's local symbol: its index in `.symtab` (0 for an unnamed function, which has
@@ -601,6 +604,10 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
             let mut bytes = Vec::with_capacity(size);
             bytes.extend_from_slice(&kept.bytes);
             kept.synthesis = placed.synthesis;
+            #[cfg(test)]
+            {
+                kept.patched += 1;
+            }
             bytes
         }
         mut kept => {

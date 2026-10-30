@@ -23,6 +23,7 @@ use super::*;
 type Made<S> = (Vec<u8>, S);
 
 /// Gives a field of a value being made, from its name and type.
+// dyn: once per reflected field (`type_info`, once per constant), which allocates; ~20 closures would each copy the walkers
 type FieldBytes<'a, 'db, M> = &'a mut dyn FnMut(
     &mut Evaluator<'db, M>,
     &str,
@@ -480,6 +481,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         &mut self,
         slice_ref: Ty<'db>,
         len: usize,
+        // dyn: once per element of a reflected slice, which allocates; as `FieldBytes`
         element: &mut dyn FnMut(&mut Self, Ty<'db>, usize) -> Result<'db, Made<M::Shadow>>,
     ) -> Result<'db, Made<M::Shadow>> {
         let elem = match slice_ref.kind() {

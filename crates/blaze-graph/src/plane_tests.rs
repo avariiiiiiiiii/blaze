@@ -623,18 +623,18 @@ fn nodes_read_from_a_trace_are_checked() {
     let nodes = as_nodes(7, &[work(7, &[], 1), work(8, &[7], 2), keyed(9, &[7, 8], 3, 1)]);
     let json = serde_json::to_value(&nodes).unwrap();
     assert_eq!(serde_json::from_value::<Nodes>(json.clone()).unwrap(), nodes);
-    let broken = |edit: &dyn Fn(&mut serde_json::Value)| {
+    fn broken(json: &serde_json::Value, edit: impl FnOnce(&mut serde_json::Value)) -> String {
         let mut it = json.clone();
         edit(&mut it);
         serde_json::from_value::<Nodes>(it).unwrap_err().to_string()
-    };
-    let refused = broken(&|it| it["costs"].as_array_mut().unwrap().truncate(2));
+    }
+    let refused = broken(&json, |it| it["costs"].as_array_mut().unwrap().truncate(2));
     assert!(refused.contains("3 nodes but 2 costs"), "{refused}");
-    let refused = broken(&|it| it["deps_at"][1] = 3.into());
+    let refused = broken(&json, |it| it["deps_at"][1] = 3.into());
     assert!(refused.contains("deps_at goes back"), "{refused}");
-    let refused = broken(&|it| it["name_at"].as_array_mut().unwrap().pop().map(drop).unwrap());
+    let refused = broken(&json, |it| it["name_at"].as_array_mut().unwrap().pop().map(drop).unwrap());
     assert!(refused.contains("name_at of 3 offsets"), "{refused}");
-    let refused = broken(&|it| it["first"] = u32::MAX.into());
+    let refused = broken(&json, |it| it["first"] = u32::MAX.into());
     assert!(refused.contains("past u32"), "{refused}");
 }
 

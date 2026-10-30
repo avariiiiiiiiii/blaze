@@ -2,12 +2,12 @@
 //! ones of `FalseEdge` and `FalseUnwind` included, and a number for each location.
 
 use la_arena::RawIdx;
-use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
-use hir_ty_mir::mir::{BasicBlockId, MirBody, TerminatorKind};
+use hir_ty_mir::mir::{BasicBlockId, MirBody};
 
 use super::relation::Csr;
+use crate::mem::{FSet, FVec, Frame, collect, filled, set};
 
 /// A statement of a block, or its terminator when `statement` is the number of statements.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -18,15 +18,15 @@ pub(super) struct Location {
 
 /// The graph as two CSRs over block indices: 4 bytes per block and 4 per edge each way, a
 /// block's successors or predecessors one slice.
-pub(super) struct Cfg {
+pub(super) struct Cfg<'f> {
     /// The number of the first location of each block, by its index.
-    starts: Vec<usize>,
+    starts: FVec<'f, usize>,
     pub(super) points: usize,
-    successors: Csr<BasicBlockId>,
-    predecessors: Csr<BasicBlockId>,
+    successors: Csr<'f, BasicBlockId>,
+    predecessors: Csr<'f, BasicBlockId>,
     /// The blocks reachable from the start, in reverse postorder.
-    pub(super) order: Vec<BasicBlockId>,
-    pub(super) reachable: Vec<bool>,
+    pub(super) order: FVec<'f, BasicBlockId>,
+    pub(super) reachable: FVec<'f, bool>,
 }
 
 pub(super) fn index(block: BasicBlockId) -> usize {
@@ -37,32 +37,18 @@ pub(super) fn block(index: usize) -> BasicBlockId {
     BasicBlockId::from_raw(RawIdx::from_u32(index as u32))
 }
 
-/// Where control may go after `kind`, unwinding and the edges that never run included.
-pub(super) fn successors(kind: &TerminatorKind) -> SmallVec<[BasicBlockId; 2]> {
-    match kind {
-        TerminatorKind::FalseEdge { real_target, imaginary_target } => {
-            smallvec::smallvec![*real_target, *imaginary_target]
-        }
-        _ => {
-            let mut all = kind.successors();
-            all.extend(kind.unwind());
-            all
-        }
-    }
-}
-
-impl Cfg {
-    pub(super) fn new(body: &MirBody<'_>) -> Self {
+impl<'f> Cfg<'f> {
+    pub(super) fn new(frame: &'f Frame, body: &MirBody<'_>) -> Self {
         let count = body.basic_blocks.len();
-        let mut starts = Vec::with_capacity(count);
+        let mut starts = Vec::with_capacity_in(count, frame);
         let mut points = 0;
-        let mut edges: Vec<(u32, BasicBlockId)> = Vec::with_capacity(count * 2);
+        let mut edges: FVec<'_, (u32, BasicBlockId)> = Vec::with_capacity_in(count * 2, frame);
         for (id, data) in body.basic_blocks.iter() {
             starts.push(points);
             points += data.statements.len() + 1;
             if let Some(terminator) = &data.terminator {
                 let first = edges.len();
-                for target in self::successors(&terminator.kind) {
+                for target in terminator.kind.all_successors() {
                     if !edges[first..].iter().any(|&(_, it)| it == target) {
                         edges.push((index(id) as u32, target));
                     }
@@ -72,7 +58,7 @@ impl Cfg {
         // The edges to cleanup blocks, each once, after the block's own; those are in block
         // order, so a block's are found by two binary searches.
         let own = edges.len();
-        let mut unwinds: FxHashSet<(u32, BasicBlockId)> = FxHashSet::default();
+        let mut unwinds: FSet<'_, (u32, BasicBlockId)> = set(frame);
         for &(from, _, cleanup) in &body.panic_unwinds {
             let edge = (index(from) as u32, cleanup);
             let low = edges[..own].partition_point(|&(it, _)| it < edge.0);
@@ -81,44 +67,46 @@ impl Cfg {
                 edges.push(edge);
             }
         }
-        Self::of_edges(starts, points, &edges, body.start_block)
+        Self::of_edges(frame, starts, points, &edges, body.start_block)
     }
 
     /// The graph from its edges, each once, in the order a block's successors and a block's
     /// predecessors are listed.
     fn of_edges(
-        starts: Vec<usize>,
+        frame: &'f Frame,
+        starts: FVec<'f, usize>,
         points: usize,
         edges: &[(u32, BasicBlockId)],
         start: BasicBlockId,
     ) -> Self {
         let count = starts.len();
-        let successors = Csr::build(count, edges.iter().copied());
+        let successors = Csr::build(frame, count, edges.iter().copied());
         let predecessors = Csr::build(
+            frame,
             count,
             edges.iter().map(|&(from, to)| (index(to) as u32, block(from as usize))),
         );
-        let (order, reachable) = reverse_postorder(&successors, start);
+        let (order, reachable) = reverse_postorder(frame, &successors, start);
         Cfg { starts, points, successors, predecessors, order, reachable }
     }
 
     /// The graph of blocks of `lens[b]` points each with these edges, from block 0: for the
     /// tests of the analyses over it.
     #[cfg(test)]
-    pub(super) fn from_edges(lens: &[usize], edges: &[(usize, usize)]) -> Self {
-        let mut starts = Vec::with_capacity(lens.len());
+    pub(super) fn from_edges(frame: &'f Frame, lens: &[usize], edges: &[(usize, usize)]) -> Self {
+        let mut starts = Vec::with_capacity_in(lens.len(), frame);
         let mut points = 0;
         for &len in lens {
             starts.push(points);
             points += len;
         }
-        let mut unique: Vec<(u32, BasicBlockId)> = Vec::new();
+        let mut unique: FVec<'_, (u32, BasicBlockId)> = Vec::new_in(frame);
         for &(from, to) in edges {
             if !unique.contains(&(from as u32, block(to))) {
                 unique.push((from as u32, block(to)));
             }
         }
-        Self::of_edges(starts, points, &unique, block(0))
+        Self::of_edges(frame, starts, points, &unique, block(0))
     }
 
     pub(super) fn successors(&self, block: BasicBlockId) -> &[BasicBlockId] {

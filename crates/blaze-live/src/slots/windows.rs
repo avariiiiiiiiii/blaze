@@ -4,7 +4,9 @@
 //! back, once per run of pages of one protection that a patch writes; code stays runnable
 //! while written, for a thread running an older generation's code on the same pages.
 //! Unwinding goes by `RUNTIME_FUNCTION`s, added with `RtlAddFunctionTable`. Data is written
-//! with atomic stores ([`Writes::store`]), since other threads may read it meanwhile.
+//! with atomic stores ([`Writes::store`]), since other threads may read it meanwhile. Address
+//! space for the switch's columns is reserved and committed with `VirtualAlloc`
+//! ([`Reserved`]).
 
 #![allow(unsafe_code)]
 
@@ -52,6 +54,8 @@ unsafe extern "system" {
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     fn GetCurrentProcess() -> *mut c_void;
     fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
+    fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
+    fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
     fn VirtualQuery(address: *const c_void, info: *mut MemoryBasicInformation, len: usize)
     -> usize;
     fn FlushInstructionCache(process: *mut c_void, address: *const c_void, size: usize) -> i32;
@@ -71,6 +75,8 @@ unsafe extern "system" {
 const FROM_ADDRESS: u32 = 0x4;
 const UNCHANGED_REFCOUNT: u32 = 0x2;
 const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_RELEASE: u32 = 0x8000;
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_GUARD: u32 = 0x100;
 const PAGE_READWRITE: u32 = 0x04;
@@ -521,4 +527,151 @@ unsafe fn writable(range: &Range<u64>, protect: u32, f: impl FnOnce()) -> Result
         ));
     }
     Ok(())
+}
+
+/// What a reservation's length and commits are multiples of: the allocation granularity
+/// (64 KiB), so every commit is whole pages.
+pub(super) const GRAIN: usize = 64 << 10;
+
+/// Address space reserved with no access and no memory behind it (`MEM_RESERVE`), committed
+/// read and write from its start as it grows (`MEM_COMMIT`), never moved, and released when
+/// dropped. A committed page is charged to the commit limit, and costs memory only once
+/// written.
+///
+/// Invariant, which [`image::rows`] relies on: `at..at + committed` is committed read and
+/// write, zero where never written, and no one else's; `at` is page-aligned.
+pub(super) struct Reserved {
+    at: u64,
+    len: usize,
+    committed: usize,
+}
+
+impl Reserved {
+    /// Reserves `len` bytes, a nonzero multiple of [`GRAIN`].
+    pub(super) fn new(len: usize) -> Result<Reserved, String> {
+        assert!(len != 0 && len.is_multiple_of(GRAIN), "a reservation of whole grains");
+        // SAFETY: a new reservation anywhere, with no access: it changes no memory there is.
+        let at = unsafe { VirtualAlloc(std::ptr::null_mut(), len, MEM_RESERVE, PAGE_NOACCESS) };
+        if at.is_null() {
+            // alloc: error path, once at start
+            return Err(format!(
+                "VirtualAlloc of {len} bytes of address space: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Reserved { at: at as u64, len, committed: 0 })
+    }
+
+    pub(super) fn base(&self) -> u64 {
+        self.at
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(super) fn committed(&self) -> usize {
+        self.committed
+    }
+
+    /// Commits the first `upto` bytes, a multiple of [`GRAIN`] no more than the length: one
+    /// `VirtualAlloc` of what was not committed yet.
+    pub(super) fn commit(&mut self, upto: usize) -> Result<(), String> {
+        if upto <= self.committed {
+            return Ok(());
+        }
+        assert!(upto <= self.len && upto.is_multiple_of(GRAIN), "a commit of whole grains");
+        let (start, len) = (self.at + self.committed as u64, upto - self.committed);
+        // SAFETY: `start..start + len` is whole pages of this reservation (asserted), past what
+        // is committed, which nothing reads or writes: committing it changes no byte.
+        let done = unsafe { VirtualAlloc(start as *mut c_void, len, MEM_COMMIT, PAGE_READWRITE) };
+        if done.is_null() {
+            // alloc: error path
+            return Err(format!(
+                "VirtualAlloc of {len} bytes at {start:#x}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        self.committed = upto;
+        Ok(())
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        // SAFETY: this reservation's own, released whole (size 0 with MEM_RELEASE), which no
+        // view borrows any more (views borrow the reservation, and it is being dropped).
+        unsafe { VirtualFree(self.at as *mut c_void, 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+
+    use super::{
+        super::column::{Column, STEP},
+        GetCurrentProcess, MEM_COMMIT, MEM_RESERVE, MemoryBasicInformation, PAGE, VirtualQuery,
+    };
+
+    /// `PSAPI_WORKING_SET_EX_INFORMATION`: bit 0 of `attributes` is whether the page is in
+    /// the working set.
+    #[repr(C)]
+    struct WorkingSetEx {
+        address: *mut c_void,
+        attributes: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn K32QueryWorkingSetEx(process: *mut c_void, info: *mut WorkingSetEx, len: u32) -> i32;
+    }
+
+    /// The state of the region at `at`, and how many bytes from `at` it runs.
+    fn region(at: u64) -> (u32, u64) {
+        let mut info = MemoryBasicInformation {
+            base: std::ptr::null_mut(),
+            allocation_base: std::ptr::null_mut(),
+            allocation_protect: 0,
+            partition: 0,
+            size: 0,
+            state: 0,
+            protect: 0,
+            kind: 0,
+        };
+        let len = size_of::<MemoryBasicInformation>();
+        // SAFETY: `info` is a whole MEMORY_BASIC_INFORMATION.
+        assert_eq!(unsafe { VirtualQuery(at as *const c_void, &mut info, len) }, len);
+        (info.state, info.base as u64 + info.size as u64 - at)
+    }
+
+    /// How many pages of `at..at + len` are in the working set.
+    fn resident(at: u64, len: usize) -> usize {
+        let mut pages: Vec<WorkingSetEx> = (0..len as u64 / PAGE)
+            .map(|it| WorkingSetEx { address: (at + it * PAGE) as *mut c_void, attributes: 0 })
+            .collect();
+        let size = (pages.len() * size_of::<WorkingSetEx>()) as u32;
+        // SAFETY: it takes no pointer; the handle stands for this process.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: `pages` is `size` bytes of entries, each naming the page to ask about.
+        let read = unsafe { K32QueryWorkingSetEx(process, pages.as_mut_ptr(), size) };
+        assert_ne!(read, 0, "QueryWorkingSetEx: {}", std::io::Error::last_os_error());
+        pages.iter().filter(|it| it.attributes & 1 != 0).count()
+    }
+
+    /// A column costs no memory for what it reserves, nor for what it commits, until a row is
+    /// written: then the page the row is on.
+    #[test]
+    fn a_column_costs_memory_only_where_written() {
+        let mut column = Column::<u64>::new("a test column", 1 << 20).expect("reserved");
+        let (at, len) = column.reserved();
+        assert_eq!(region(at), (MEM_RESERVE, len as u64), "reserved whole, nothing committed");
+        assert_eq!(resident(at, len), 0);
+        column.room(2 * STEP / 8).expect("committed");
+        assert_eq!(region(at), (MEM_COMMIT, 2 * STEP as u64));
+        assert_eq!(resident(at, len), 0, "committed, nothing written");
+        column.push(7).expect("room");
+        assert_eq!(resident(at, len), 1, "one row written");
+        assert_eq!(column[0], 7);
+    }
 }

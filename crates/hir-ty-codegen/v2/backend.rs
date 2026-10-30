@@ -31,7 +31,7 @@ use hir_ty::{ParamEnvAndCrate, db::HirDatabase, next_solver::ParamEnv};
 use hir_ty_mir::mir::MirSpan;
 
 use super::{
-    Built, DataPlace, Function, Hashes, HirFrontend, HirInstance, Kind, Places, Prepared,
+    Built, DataPlace, Function, HashSource, Hashes, HirFrontend, HirInstance, Kind, Places, Prepared,
     build::{self, Build},
     failed,
     places::{Placer, Ref, evaluated, place_requests, resolve},
@@ -156,7 +156,7 @@ impl Backends<'_> {
         &self,
         db: &Db,
         homes: &mut Homes,
-        hashes: &dyn Hashes,
+        hashes: &HashSource,
         unit: &Unit,
         spec: &Spec,
         (instance, inlined): (&HirInstance, bool),
@@ -373,7 +373,7 @@ fn assembled(text: &str) -> Result<Built, String> {
 /// body it was inlined from.
 fn written_spans(
     db: &Db,
-    hashes: &dyn Hashes,
+    hashes: &HashSource,
     source: &fragment::Source,
 ) -> Result<Vec<SpanRef>, String> {
     let mut spans = Vec::with_capacity(source.spans.len());
@@ -390,7 +390,7 @@ fn written_spans(
 /// site, and which of them each statement is of.
 fn inlined_scopes(
     db: &Db,
-    hashes: &dyn Hashes,
+    hashes: &HashSource,
     source: &fragment::Source,
     scopes: &mut side::Scopes,
 ) -> Result<(), String> {
@@ -420,7 +420,7 @@ fn inlined_scopes(
 /// `krate`.
 fn named(
     db: &Db,
-    hashes: &dyn Hashes,
+    hashes: &HashSource,
     krate: Crate,
     owner: DefWithBodyId,
     variables: &[fragment::Variable],
@@ -759,7 +759,7 @@ impl<'db> Prepare for Backends<'db> {
         check_spec(unit, spec)?;
         frontend.with(|db, homes| {
             let inlined = frontend.inlines(db, instance).map_err(|e| failed(unit, e))?;
-            self.prepared(db, homes, &*frontend.hashes, unit, spec, (instance, inlined), refs)
+            self.prepared(db, homes, &frontend.hashes, unit, spec, (instance, inlined), refs)
         })
     }
 
@@ -843,7 +843,7 @@ impl<'db> Prepare for Backends<'db> {
         refs: &Refs,
     ) -> Result<Static, CodegenError> {
         frontend.with(|db, homes| {
-            let hashes = &*frontend.hashes;
+            let hashes = &frontend.hashes;
             super::statics::compile(db, homes, hashes, spec.toolchain.arch, value.0, refs)
                 .map_err(|what| super::undescribed(value, None, what))
         })

@@ -4,13 +4,13 @@
 //!
 //! [`registry`] is clippy's table of lints and groups; [`level`] decides a lint's level as
 //! rustc does; [`check`] runs the lints over a crate through the queries of `query`; [`diag`]
-//! is a diagnostic as data and [`emit`] writes it as rustc does, in text and in JSON.
+//! is a diagnostic as data, written by [`blaze_diagnostics::emit`] as rustc writes it, in text
+//! and in JSON.
 
 mod blaze;
 pub mod check;
 pub mod conf;
 pub mod diag;
-pub mod emit;
 mod famous;
 pub mod level;
 mod lints;

@@ -2,7 +2,7 @@
 //! and every type's requirements, `wf_into` against a walk of every type that instantiates
 //! every predicate.
 
-mod db;
+pub(crate) mod db;
 
 use hir_ty::db::HirDatabase;
 use base_db::{Db, all_crates};

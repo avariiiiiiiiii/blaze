@@ -186,6 +186,7 @@ fn a_lex_dropped_on_another_thread_gives_it_the_columns() {
 thread of its own, so its shelf is cold, and a cold lex grows the columns as before.
 
 > forwarded to frontend-tokens (from requests, pass 16; told by tmux).
+> done (found applied by frontend-tokens-next1, 21:20): `lexed_str.rs` columns are `Lent` (`checkpoints` before `tokens`), `Converter::new` lends both, tests `a_warm_lex_allocates_nothing` and `a_lex_dropped_on_another_thread_gives_it_the_columns` in `tests.rs`. Nothing built.
 
 ## mem-format-tokens: the parser input's words on a per-thread shelf
 
@@ -305,6 +306,8 @@ The syntax-bridge budgets "a parser's input into a used one" and "a matcher's in
 used one" (`tests.rs` 504, 509) stay 0.
 
 > forwarded to frontend-tokens (from requests, pass 16; told by tmux).
+> done by frontend-tokens: `input.rs` as written (`Lent<InputWords>`, `per_thread_buffer!` kind `INPUT_WORDS`, `with_capacity` lends, `into_words` copies out with its `// alloc:`), test `a_warm_input_allocates_nothing`. syntax-bridge's `INPUT`/`KEEP_INPUT` dropped, `token_tree_to_syntax_node` takes `Input::with_capacity(0)` (the now-unused `Cell` import removed). The mbe bullet (`MATCHER_INPUT`) is applied by the child `frontend-tokens-frame` with the frame section. manifest_lint clean. Nothing built.
+> done by frontend-tokens (frontend-tokens-frame): mbe bullet applied in `crates/mbe/src/lib.rs`: `MATCHER_INPUT`, `KEEP_MATCHER_INPUT` and the now-unused `std::cell::Cell` import dropped; `expect_fragment` takes `parser::Input::with_capacity(4 * window_trees)` once a call (each window refills it through `view_tokens`, as before) and drops it at the end of the function. `a_fragment_allocates_the_same_however_much_follows_it`'s doc reads "into the thread's input words"; its assertions are unchanged. hot_lint shows nothing new in `crates/mbe/`. Nothing built.
 
 ## mem-format-tokens: an expansion's matcher and transcriber in the task's frame
 
@@ -719,6 +722,7 @@ it); an expansion inside another task on the same thread (hir-expand under a que
 the next level's frame. Nothing here is shared between threads.
 
 > forwarded to frontend-tokens (from requests, pass 16; told by tmux).
+> done by frontend-tokens (frontend-tokens-frame): applied as written, with the rename below, against today's code (`db: &Db` kept everywhere): `blaze-mem` in mbe's `[dependencies]`, `#![feature(allocator_api)]`, `expand_rules` opening `frame::task(Tag::Expand, ..)` around `expand_rules_in`, `Bindings`/`Match`/`Buffers`/`touched`/`nesting` as `Vec<_, &Frame>` with `new_in`, `${concat}` on `scratch::lend_string()`, and the budget test. Adapted: (1) `matcher::match_failure` (called only from `expand_rules`, and it built its own `Arena::default()`/`Match::default()` twice, once in `missing_comma`) now takes `frame: &Frame` after `db` and passes it to `missing_comma`, so its buffers are in the call's frame too; their `// alloc:` notes went. (2) The test uses `base_db::Db::for_tests()` instead of `salsa::DatabaseImpl`, and compares `used(10).allocations == used(1_000).allocations`: `blaze_alloc_count::Used` also counts bytes, and the output's bytes grow with the input, so the section's whole-`Used` `assert_eq!` could not hold. Manifest lint clean; hot_lint shows nothing new in `crates/mbe/`. Not built (common.md).
 
 ## mem-format-tokens: tt's walk stack as a Scratch
 
@@ -797,6 +801,7 @@ columns kept together under one size cap, not one `Vec<T>`, so neither `Scratch<
 kind fits it.
 
 > forwarded to frontend-tokens (from requests, pass 16; told by tmux).
+> done by frontend-tokens: as written against the current `storage.rs` (the block rewrite moved it to ~L752 and ~L817-859; text unchanged). `blaze-mem.workspace = true` in tt's `[dependencies]` (blaze-mem depends only on blaze-reclaim). Nothing built.
 
 ## mem-format-tokens: the tree sink's buffers lent
 
@@ -920,6 +925,7 @@ Each test runs on a thread of its own, so the shelf held no string before the co
 today's `String::new()` leaves it empty and the assertion fails.
 
 > forwarded to frontend-tokens (from requests, pass 16; told by tmux).
+> done by frontend-tokens: as written (`Lent<String>`, `Lent<Vec<u32>>` fragments, both `+=` to `push_str`, `FlatTokens` on `SmallVec<[..; 4]>`, `smallvec` and `blaze-mem` in `[dependencies]`), test `a_sink_gives_its_text_buffer_back`. The `finish` loop's `is_empty` needs no change. manifest_lint clean, hot_lint nothing. Nothing built.
 
 ## mem-format: rename mbe's matcher `Arena` to `Buffers` (with the frame section above; 2026-10-29)
 
@@ -949,3 +955,6 @@ changes.
 
 Budget test: the frame section's (a warm `$($e:tt)*` expansion allocates the same for 10 and
 1000 trees); a rename changes no count.
+
+> forwarded to frontend-tokens (frontend-tokens-next1, holds `crates/mbe/`) (requests, pass 20; told by tmux).
+> done by frontend-tokens (frontend-tokens-frame): applied together with the frame section. `Arena<'t>` is `Buffers<'t>` (struct, impl, `match_`'s `buffers` parameter, `match_loop`/`match_loop_inner`'s `a: &mut Buffers<'t>`), every `Arena::`/[`Arena`] in matcher.rs's comments is `Buffers`, "in the arena" reads "in the buffers", and `match_loop_inner`'s doc names its parameter `a` (it said `arena`). In failure.rs the import and both locals are `buffers` (`Buffers::new_in(frame)`); in expander.rs the comment, local and doc link are renamed. `expander/model.rs` is untouched. `rg 'Arena|arena' crates/mbe/src` now finds only the model.

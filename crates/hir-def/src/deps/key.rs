@@ -110,7 +110,8 @@ fn walk(
 /// Whether every proc macro of `krate` (none, for a crate that is not a proc-macro crate) has
 /// the content ID of its library.
 fn libraries_known(db: &Db, krate: Crate) -> bool {
-    let is_proc_macro = matches!(krate.data(db).target_kind, TargetKind::Lib { is_proc_macro: true });
+    let is_proc_macro =
+        matches!(krate.data(db).target_kind, TargetKind::Lib { is_proc_macro: true });
     match ProcMacros::get_for_crate(db, krate) {
         None => !is_proc_macro,
         Some(macros) => macros
@@ -236,6 +237,7 @@ fn files(db: &Db, krate: Crate, base: &Base, hasher: &mut Hasher) {
     let mut files: Vec<(Vec<u8>, ContentId)> = root
         .iter()
         .map(|file| {
+            // alloc: setup: one path a file, once per crate per session
             let path = root.path_for_file(&file).map(|it| it.to_string()).unwrap_or_default();
             let content = match db.has_file_text(file) {
                 true => db.file_text(file).content(db),
@@ -243,6 +245,7 @@ fn files(db: &Db, krate: Crate, base: &Base, hasher: &mut Hasher) {
             };
             (base.portable(&path), content)
         })
+        // alloc: setup, as above
         .collect();
     files.sort_unstable();
     hasher.update(&(files.len() as u64).to_le_bytes());
@@ -296,21 +299,23 @@ const SHORTEST_HELD: usize = 8;
 
 impl Base {
     pub(crate) fn of(db: &Db, krate: Crate) -> Base {
-        let trimmed = |it: String| -> Option<String> {
+        let trimmed = |it: &str| -> Option<String> {
             let it = it.trim_end_matches(['/', '\\']);
             // alloc: setup: once per crate per session
             (!it.is_empty()).then(|| it.to_owned())
         };
         let env = krate.env(db);
-        let dir = env.get("CARGO_MANIFEST_DIR").and_then(&trimmed).or_else(|| {
+        let dir = env.get("CARGO_MANIFEST_DIR").and_then(|it| trimmed(&it)).or_else(|| {
             let root = krate.data(db).root_file_id;
             let source_root = db.file_source_root(root).source_root_id(db);
             let path = db.source_root(source_root).source_root_ref(db).path_for_file(&root)?;
+            // alloc: setup, as above
             let path = path.to_string();
             let (dir, _) = path.rsplit_once('/')?;
-            trimmed(dir.to_owned())
+            trimmed(dir)
         });
-        let out = env.get("OUT_DIR").and_then(&trimmed);
+        let out = env.get("OUT_DIR").and_then(|it| trimmed(&it));
+        // alloc: setup, as above
         let mut base = Base { dir, out, others: Vec::new() };
         for (_, value) in env.iter() {
             if base.marked(value.as_bytes()).is_none() && absolute(value) {
@@ -404,7 +409,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let (&first, rest) = needle.split_first()?;
     let mut at = 0;
     while at + needle.len() <= haystack.len() {
-        let found = haystack[at..=haystack.len() - needle.len()].iter().position(|&it| it == first)?;
+        let found =
+            haystack[at..=haystack.len() - needle.len()].iter().position(|&it| it == first)?;
         let start = at + found;
         if haystack[start + 1..start + needle.len()] == *rest {
             return Some(start);

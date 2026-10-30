@@ -25,7 +25,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ide_db::{RootDatabase, base_db::Crate};
+use blaze_format::cursor::{Put, Reader};
+use ide_db::{RootDatabase, RootDatabaseExt as _, base_db::Crate};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
@@ -292,110 +293,73 @@ struct Manifest {
 
 const MAGIC: &[u8] = b"blaze manifest 1\n";
 
-struct Encoder(Vec<u8>);
-
-impl Encoder {
-    fn bytes(&mut self, bytes: &[u8]) {
-        self.0.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        self.0.extend_from_slice(bytes);
-    }
-
-    fn count(&mut self, count: usize) {
-        self.0.extend_from_slice(&(count as u64).to_le_bytes());
-    }
-
-    fn option(&mut self, bytes: Option<&[u8]>) {
-        match bytes {
-            Some(bytes) => {
-                self.0.push(1);
-                self.bytes(bytes);
-            }
-            None => self.0.push(0),
+/// A tag, then the bytes when there are some.
+fn put_option(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
+    match bytes {
+        Some(bytes) => {
+            out.put_u8(1);
+            out.put_bytes_u64(bytes);
         }
+        None => out.put_u8(0),
     }
 }
 
-struct Decoder<'a>(&'a [u8]);
-
-impl<'a> Decoder<'a> {
-    fn count(&mut self) -> Option<usize> {
-        let (it, rest) = self.0.split_first_chunk::<8>()?;
-        self.0 = rest;
-        usize::try_from(u64::from_le_bytes(*it)).ok()
-    }
-
-    fn bytes(&mut self) -> Option<&'a [u8]> {
-        let len = self.count()?;
-        let (it, rest) = self.0.split_at_checked(len)?;
-        self.0 = rest;
-        Some(it)
-    }
-
-    fn string(&mut self) -> Option<String> {
-        String::from_utf8(self.bytes()?.to_vec()).ok()
-    }
-
-    fn hash(&mut self) -> Option<Hash> {
-        self.bytes()?.try_into().ok()
-    }
-
-    fn option(&mut self) -> Option<Option<&'a [u8]>> {
-        let (&tag, rest) = self.0.split_first()?;
-        self.0 = rest;
-        match tag {
-            0 => Some(None),
-            1 => Some(Some(self.bytes()?)),
-            _ => None,
-        }
+fn option<'a>(input: &mut Reader<'a>) -> Option<Option<&'a [u8]>> {
+    match input.u8().ok()? {
+        0 => Some(None),
+        1 => Some(Some(input.bytes_u64().ok()?)),
+        _ => None,
     }
 }
 
 impl Manifest {
     fn encode(&self) -> Vec<u8> {
-        let mut out = Encoder(MAGIC.to_vec());
-        out.count(self.reads.vars.len());
+        let mut out = MAGIC.to_vec();
+        out.put_u64(self.reads.vars.len() as u64);
         for (name, value) in &self.reads.vars {
-            out.bytes(name.as_bytes());
-            out.option(value.as_deref().map(str::as_bytes));
+            out.put_bytes_u64(name.as_bytes());
+            put_option(&mut out, value.as_deref().map(str::as_bytes));
         }
-        out.count(self.reads.files.len());
+        out.put_u64(self.reads.files.len() as u64);
         for (path, hash) in &self.reads.files {
-            out.bytes(path.as_bytes());
-            out.option(hash.as_ref().map(|it| &it[..]));
+            out.put_bytes_u64(path.as_bytes());
+            put_option(&mut out, hash.as_ref().map(|it| &it[..]));
         }
-        out.count(self.files.len());
+        out.put_u64(self.files.len() as u64);
         for file in &self.files {
-            out.bytes(file.path.as_bytes());
-            out.bytes(&file.content);
+            out.put_bytes_u64(file.path.as_bytes());
+            out.put_bytes_u64(&file.content);
         }
-        out.0
+        out
     }
 
+    /// Each list's count is checked against the bytes left at one byte an entry.
     fn decode(bytes: &[u8]) -> Option<Manifest> {
-        let mut input = Decoder(bytes.strip_prefix(MAGIC)?);
+        let mut input = Reader::new(bytes.strip_prefix(MAGIC)?);
         let mut vars = Vec::new();
-        for _ in 0..input.count()? {
-            let name = input.string()?;
-            let value = match input.option()? {
-                Some(it) => Some(String::from_utf8(it.to_vec()).ok()?),
+        for _ in 0..input.count_u64(1).ok()? {
+            let name = input.str_u64().ok()?.to_owned();
+            let value = match option(&mut input)? {
+                Some(it) => Some(std::str::from_utf8(it).ok()?.to_owned()),
                 None => None,
             };
             vars.push((name, value));
         }
         let mut files = Vec::new();
-        for _ in 0..input.count()? {
-            let path = input.string()?;
-            let hash = match input.option()? {
+        for _ in 0..input.count_u64(1).ok()? {
+            let path = input.str_u64().ok()?.to_owned();
+            let hash = match option(&mut input)? {
                 Some(it) => Some(it.try_into().ok()?),
                 None => None,
             };
             files.push((path, hash));
         }
         let mut written = Vec::new();
-        for _ in 0..input.count()? {
-            written.push(Written { path: input.string()?, content: input.hash()? });
+        for _ in 0..input.count_u64(1).ok()? {
+            let path = input.str_u64().ok()?.to_owned();
+            written.push(Written { path, content: input.bytes_u64().ok()?.try_into().ok()? });
         }
-        input.0.is_empty().then_some(Manifest { reads: Reads { vars, files }, files: written })
+        input.is_done().then_some(Manifest { reads: Reads { vars, files }, files: written })
     }
 }
 

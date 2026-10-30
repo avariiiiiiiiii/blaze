@@ -1001,7 +1001,7 @@ impl<'db> InferenceContext<'db> {
         Ok(())
     }
 
-    fn resolve_record_pat(&mut self, pat: PatId, path: &Path) -> Result<ResolvedPat<'db>, ()> {
+    fn resolve_record_pat(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {
         // Resolve the path and check the definition for errors.
         let (pat_ty, Some(variant)) = self.resolve_variant(pat.into(), path, false) else {
             return Err(());
@@ -1028,7 +1028,7 @@ impl<'db> InferenceContext<'db> {
         pat_ty
     }
 
-    fn resolve_pat_path(&mut self, pat: PatId, path: &Path) -> Result<ResolvedPat<'db>, ()> {
+    fn resolve_pat_path(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {
         let (res, pat_ty) = self.infer_path(path, pat.into()).ok_or(())?;
         match res {
             ValueNs::FunctionId(_)
@@ -1058,7 +1058,7 @@ impl<'db> InferenceContext<'db> {
     fn resolve_tuple_struct_pat(
         &mut self,
         pat: PatId,
-        path: &Path,
+        path: Path<'_>,
     ) -> Result<ResolvedPat<'db>, ()> {
         // Resolve the path and check the definition for errors.
         let (pat_ty, Some(variant)) = self.resolve_variant(pat.into(), path, true) else {

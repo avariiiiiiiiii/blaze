@@ -23,8 +23,7 @@ pub const SCHEMA: SchemaHash =
     blaze_format::schema("blaze plane history 1: Estimates::encode bytes, version blzest01");
 
 /// Writes `predict`'s history into `builder`'s image.
-// dyn: once an image written; `Predict` is the plane's predictor interface
-pub fn write(predict: &dyn Predict, builder: &mut Builder) {
+pub fn write(predict: &impl Predict, builder: &mut Builder) {
     builder.add(SectionId::PLANE_HISTORY, SCHEMA, &predict.encode());
 }
 

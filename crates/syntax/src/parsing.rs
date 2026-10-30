@@ -87,10 +87,12 @@ fn build_parsed(
     (tree, errors, is_eof)
 }
 
-/// [`build_tree`] for a node of `kind` parsed again alone: `None` unless the parse took every
-/// token into one node of `kind`, its root.
+/// [`build_tree`] for a node of `kind` parsed again alone, over `range` of `source` (`lexed`
+/// is its lexing), its errors' ranges from the node's start: `None` unless the parse took
+/// every token into one node of `kind`, its root.
 pub(crate) fn build_node(
     source: Text,
+    range: TextRange,
     lexed: &parser::LexedStr<'_>,
     parser_output: &parser::Output,
     edition: Edition,
@@ -114,7 +116,17 @@ pub(crate) fn build_node(
     if !is_eof || stray || roots != 1 {
         return None;
     }
-    let (tree, errors, _eof) = build_tree(source, lexed, parser_output, edition);
+    let (tree, errors, _eof) = build_parsed(source, range, lexed, parser_output, edition);
+    let start = range.start();
+    // A parser error is at its offset in `source`; the node's are given from its start.
+    let mut errors: Vec<SyntaxError> = errors
+        .into_iter()
+        .map(|it| {
+            let range = it.range() - start;
+            it.with_range(range)
+        })
+        .collect(); // alloc: none, collected in place (and none without errors)
+    errors.extend(lexer_errors(lexed, TextSize::new(0)));
     Some((tree, errors))
 }
 

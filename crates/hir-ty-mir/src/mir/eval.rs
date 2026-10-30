@@ -264,21 +264,21 @@ impl Origin {
     }
 }
 
-/// A block of the heap: the size and alignment it was asked for, the bytes it takes, of a
-/// size class ([`size_class`]) a freed block of the same class and alignment is reused for,
-/// and what made it.
 /// What is left of a drop ([`Evaluator::run_drop_glue`]).
 enum DropStep<'db> {
     /// The drop glue of a value: its type, where it is, and its metadata if unsized.
-    Glue(Ty<'db>, Address, Vec<u8>),
+    Glue(Ty<'db>, Address, OwnedBytes),
     /// The parts of an ADT, once its `Drop` impl ran: read then, as the impl may change
     /// them (an enum's variant).
-    Fields(Ty<'db>, Address, Vec<u8>),
+    Fields(Ty<'db>, Address, OwnedBytes),
     /// The `Drop` impl of a value: an ADT's before its parts, a `Box`'s once what it points
     /// to is dropped.
     DropImpl(Ty<'db>, Address),
 }
 
+/// A block of the heap: the size and alignment it was asked for, the bytes it takes, of a
+/// size class ([`size_class`]) a freed block of the same class and alignment is reused for,
+/// and what made it.
 #[derive(Debug, Clone, Copy)]
 struct HeapBlock {
     size: usize,
@@ -336,6 +336,8 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     spare_code_stacks: Vec<Vec<StackFrame<'db>>>,
     /// Emptied buffers of a call's evaluated arguments, one per call being made at once.
     spare_args: Vec<Vec<IntervalAndTy<'db>>>,
+    /// Emptied stacks of drop steps ([`DropStep`]), one per drop under way at once.
+    spare_drops: Vec<Vec<DropStep<'db>>>,
     /// The `callee` and `span` of the frame being run, which is not on `code_stack`.
     running: Option<Running<'db>>,
     /// The body of the frame being run.
@@ -681,9 +683,11 @@ pub struct MirOutput {
 
 impl MirOutput {
     pub fn stdout(&self) -> Cow<'_, str> {
+        // alloc: the program's output, at the edge, and only when it is not UTF-8
         String::from_utf8_lossy(&self.stdout)
     }
     pub fn stderr(&self) -> Cow<'_, str> {
+        // alloc: the program's output, at the edge, and only when it is not UTF-8
         String::from_utf8_lossy(&self.stderr)
     }
 }
@@ -704,8 +708,10 @@ pub fn interpret_mir<'db>(
     loop {
         let mut evaluator =
             Evaluator::new(db, body.owner, assert_placeholder_ty_is_unused, trait_env)?;
-        evaluator.read_statics = Some(read_statics.clone());
+        // The evaluator only asks of it, so it comes back as it went in.
+        evaluator.read_statics = Some(mem::take(&mut read_statics));
         let it = evaluator.evaluate(body, ty);
+        read_statics = evaluator.read_statics.take().unwrap_or_default();
         if let Some(read) = evaluator.missing_static.take()
             && read_statics.insert(read)
         {
@@ -776,6 +782,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 TypeIdOf::Ty(ty) => Some(ty),
                 TypeIdOf::Field { .. } => None,
             };
+            // alloc: the constant's map, kept with it
             memory_map.type_ids = self.type_ids.iter().map(of).collect();
         }
         let bytes = Box::from(bytes);
@@ -788,6 +795,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         } else {
             memory_map.vtable = mem::take(&mut self.vtable_map);
             memory_map.vtable.shrink_to_fit();
+            // alloc: the constant's map, kept with it
             MemoryMap::Complex(Box::new(memory_map))
         };
         Ok(Allocation::new(AllocationData { ty, memory: bytes, memory_map }))
@@ -839,7 +847,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             machine: Hooks::new(machine),
             provs: RefCell::default(),
             target_data_layout,
+            // alloc: one evaluation's stack and heap, reused across its calls
             stack: vec![0],
+            // alloc: one evaluation's stack and heap, reused across its calls
             heap: vec![0],
             stack_allocations: Vec::new(),
             heap_blocks: BTreeMap::new(),
@@ -850,6 +860,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             code_stack: vec![],
             spare_code_stacks: Vec::new(),
             spare_args: Vec::new(),
+            spare_drops: Vec::new(),
             running: None,
             body_running: None,
             threads: Vec::new(),
@@ -1082,12 +1093,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     fn layout(&self, ty: Ty<'db>) -> Result<'db, Arc<Layout>> {
         if let Some(x) = self.layout_cache.borrow().get(&ty) {
+            // clone: an `Arc`
             return Ok(x.clone());
         }
         let r = self
             .db
             .layout_of_ty(ty.store(), self.param_env.store())
             .map_err(|e| MirEvalError::LayoutError(e, ty.store()))?;
+        // clone: an `Arc`
         self.layout_cache.borrow_mut().insert(ty, r.clone());
         Ok(r)
     }
@@ -1189,6 +1202,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let f = frame.locals.body.owner.as_function()?;
                     Some((Either::Left(f), frame.span.0, frame.span.1))
                 })
+                // alloc: error path
                 .collect();
             // alloc: error path
             MirEvalError::InFunction(Box::new(e), error_stack)
@@ -1419,8 +1433,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 return Ok(Some(Ran::Called(callee)));
             }
             let Some(target) = target else {
-                // alloc: error path
                 return Err(MirEvalError::UndefinedBehavior(
+                    // alloc: error path
                     "Diverging function returned".to_owned(),
                 ));
             };
@@ -1514,6 +1528,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         block: &mut BasicBlockId,
     ) -> Result<'db, bool> {
         if drops.is_empty() {
+            self.keep_drops(drops);
             return Ok(false);
         }
         let Some(mut caller) = self.code_stack.pop() else {
@@ -1650,6 +1665,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn storage_marked(&self, body: &'db MirBody<'db>) -> Arc<FxHashSet<LocalId>> {
         let key = std::ptr::from_ref(body) as usize;
         if let Some(it) = self.storage_marked.borrow().get(&key) {
+            // clone: an `Arc`
             return it.clone();
         }
         let marked: FxHashSet<LocalId> = body
@@ -1660,8 +1676,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 StatementKind::StorageLive(local) => Some(local),
                 _ => None,
             })
+            // alloc: once per body an evaluation runs, reused for each of its calls
             .collect();
+        // alloc: once per body an evaluation runs, reused for each of its calls
         let marked = Arc::new(marked);
+        // clone: an `Arc`
         self.storage_marked.borrow_mut().insert(key, marked.clone());
         marked
     }
@@ -1848,7 +1867,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     match f {
                         rustc_type_ir::FloatTy::F16 => {
                             let c = -from_bytes!(f16, u16, c);
-                            Owned(OwnedBytes::from_slice(&u16::try_from(c.to_bits()).unwrap().to_le_bytes()))
+                            let bits = u16::try_from(c.to_bits()).unwrap();
+                            Owned(OwnedBytes::from_slice(&bits.to_le_bytes()))
                         }
                         rustc_type_ir::FloatTy::F32 => {
                             let c = -from_bytes!(f32, c);
@@ -2386,8 +2406,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         }
                     };
                     match target_ty {
-                        rustc_type_ir::FloatTy::F32 => Owned(OwnedBytes::from_slice(&(value as f32).to_le_bytes())),
-                        rustc_type_ir::FloatTy::F64 => Owned(OwnedBytes::from_slice(&value.to_le_bytes())),
+                        rustc_type_ir::FloatTy::F32 => {
+                            Owned(OwnedBytes::from_slice(&(value as f32).to_le_bytes()))
+                        }
+                        rustc_type_ir::FloatTy::F64 => {
+                            Owned(OwnedBytes::from_slice(&value.to_le_bytes()))
+                        }
                         rustc_type_ir::FloatTy::F16 | rustc_type_ir::FloatTy::F128 => {
                             unreachable!("converted above")
                         }
@@ -2417,10 +2441,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     }
                     let signed = matches!(current_ty.kind(), TyKind::Int(_));
                     match target_ty {
-                        rustc_type_ir::FloatTy::F32 => Owned(OwnedBytes::from_slice(&single.to_le_bytes())),
-                        rustc_type_ir::FloatTy::F64 => Owned(OwnedBytes::from_slice(&double.to_le_bytes())),
+                        rustc_type_ir::FloatTy::F32 => {
+                            Owned(OwnedBytes::from_slice(&single.to_le_bytes()))
+                        }
+                        rustc_type_ir::FloatTy::F64 => {
+                            Owned(OwnedBytes::from_slice(&double.to_le_bytes()))
+                        }
                         rustc_type_ir::FloatTy::F16 => {
-                            Owned(OwnedBytes::from_slice(&(of::<f16>(value, signed) as u16).to_le_bytes()))
+                            let bits = of::<f16>(value, signed) as u16;
+                            Owned(OwnedBytes::from_slice(&bits.to_le_bytes()))
                         }
                         rustc_type_ir::FloatTy::F128 => {
                             Owned(OwnedBytes::from_slice(&of::<f128>(value, signed).to_le_bytes()))
@@ -2453,11 +2482,16 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let index = self.eval_operand(index, locals)?;
                     from_bytes!(usize, self.read_scalar(index)?)
                 };
+                // alloc: the panic's message, only when an assert fails
                 format!("index out of bounds: the len is {len} but the index is {index}")
             }
+            // alloc: the panic's message, only when an assert fails
             AssertKind::Overflow(op, ..) => format!("Overflow in {op:?}"),
+            // alloc: the panic's message, only when an assert fails
             AssertKind::OverflowNeg(_) => "Overflow in Neg".to_owned(),
+            // alloc: the panic's message, only when an assert fails
             AssertKind::DivisionByZero(_) => "Overflow in Div".to_owned(),
+            // alloc: the panic's message, only when an assert fails
             AssertKind::RemainderByZero(_) => "Overflow in Rem".to_owned(),
             // core's words for the panics of the UB checks (`core::panicking`).
             AssertKind::MisalignedPointerDereference { required, found } => {
@@ -2469,17 +2503,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let found = self.eval_operand(found, locals)?;
                     from_bytes!(usize, self.read_scalar(found)?)
                 };
+                // alloc: the panic's message, only when an assert fails
                 format!(
                     "misaligned pointer dereference: address must be a multiple of {required:#x} but is {found:#x}"
                 )
             }
+            // alloc: the panic's message, only when an assert fails
             AssertKind::NullPointerDereference => "null pointer dereference occurred".to_owned(),
+            // alloc: the panic's message, only when an assert fails
             AssertKind::NullReferenceConstructed => "null reference produced".to_owned(),
             AssertKind::InvalidEnumConstruction(source) => {
                 let source = {
                     let source = self.eval_operand(source, locals)?;
                     u128::from_le_bytes(pad16(self.read_scalar(source)?, IsSigned::No))
                 };
+                // alloc: the panic's message, only when an assert fails
                 format!("trying to construct an enum from an invalid value {source:#x}")
             }
         })
@@ -4607,7 +4645,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let mut frame =
             StackFrame::new(callee_locals, then, prev_stack_ptr, (span, locals.body.owner), None);
         if let Some(closure_ty) = dropped {
-            frame.drops.push(DropStep::Glue(closure_ty, closure_addr, Vec::new()));
+            frame.drops = self.spare_drops.pop().unwrap_or_default();
+            frame.drops.push(DropStep::Glue(closure_ty, closure_addr, OwnedBytes::new()));
         }
         Ok(Some(frame))
     }
@@ -5032,6 +5071,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let db = self.db;
                 let loc = variant.lookup(db);
                 let edition = self.crate_id.data(self.db).edition;
+                // alloc: error path
                 let name = format!(
                     "{}::{}",
                     EnumSignature::of(self.db, loc.parent).name.display(db, edition),
@@ -5079,7 +5119,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         span: MirSpan,
         then: Then,
     ) -> Result<'db, Option<StackFrame<'db>>> {
-        self.drop_steps(vec![DropStep::Glue(ty, addr, metadata.to_vec())], locals, span, then)
+        let mut steps = self.spare_drops.pop().unwrap_or_default();
+        steps.push(DropStep::Glue(ty, addr, OwnedBytes::from_slice(metadata)));
+        self.drop_steps(steps, locals, span, then)
+    }
+
+    /// `steps`, done with, back to [`Self::spare_drops`] if it holds memory.
+    fn keep_drops(&mut self, mut steps: Vec<DropStep<'db>>) {
+        if steps.capacity() != 0 {
+            steps.clear();
+            self.spare_drops.push(steps);
+        }
     }
 
     /// Runs `steps`, last first, until one calls a `Drop` impl: the frame of that call, with
@@ -5092,6 +5142,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         then: Then,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         if self.lang_items().Drop_drop.is_none() {
+            self.keep_drops(steps);
             return Ok(None);
         }
         while let Some(step) = steps.pop() {
@@ -5110,11 +5161,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
             }
         }
+        self.keep_drops(steps);
         Ok(None)
     }
 
     /// One step of [`Self::drop_steps`]: pushes what dropping the value does onto `steps`,
-    /// last first. With `fields_only`, an ADT's `Drop` impl ran already.
+    /// last first, in place: they go on in order, then that run is reversed. With
+    /// `fields_only`, an ADT's `Drop` impl ran already.
     fn drop_glue_step(
         &mut self,
         ty: Ty<'db>,
@@ -5150,7 +5203,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             _ => ty,
         };
-        let mut parts = Vec::new();
+        let base = steps.len();
         match ty.kind() {
             TyKind::Adt(adt_def, subst) => {
                 let id = adt_def.def_id();
@@ -5171,16 +5224,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let pointer = pointer.ty().instantiate(self.interner(), subst).skip_norm_wip();
                     let size = self.size_of_sized(pointer, locals, "pointer of a box")?;
                     let offset = layout.fields.offset(0).bytes_usize();
-                    let bytes = self.read_memory(addr.offset(offset), size)?.to_vec();
+                    let bytes = self.read_memory(addr.offset(offset), size)?;
                     let (data, contents_metadata) = bytes.split_at(self.ptr_size());
-                    parts.push(DropStep::Glue(
-                        subst.type_at(0),
-                        Address::from_bytes(data)?,
-                        contents_metadata.to_vec(),
-                    ));
-                    parts.push(DropStep::DropImpl(ty, addr));
+                    let contents = Address::from_bytes(data)?;
+                    let contents_metadata = OwnedBytes::from_slice(contents_metadata);
+                    steps.push(DropStep::Glue(subst.type_at(0), contents, contents_metadata));
+                    steps.push(DropStep::DropImpl(ty, addr));
                 } else if !fields_only {
-                    steps.push(DropStep::Fields(ty, addr, metadata.to_vec()));
+                    steps.push(DropStep::Fields(ty, addr, OwnedBytes::from_slice(metadata)));
                     steps.push(DropStep::DropImpl(ty, addr));
                     return Ok(());
                 }
@@ -5189,12 +5240,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     AdtId::StructId(s) => (s.into(), Cow::Borrowed(&*layout)),
                     AdtId::UnionId(_) => return Ok(()),
                     AdtId::EnumId(e) => {
-                        bytes = self.read_memory(addr, layout.size.bytes_usize())?.to_vec();
+                        bytes = self.read_memory(addr, layout.size.bytes_usize())?;
                         match detect_variant_from_bytes(
                             &layout,
                             self.db,
                             self.target_data_layout,
-                            &bytes,
+                            bytes,
                             e,
                         ) {
                             Some((variant, layout)) => (variant.into(), layout),
@@ -5211,35 +5262,38 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let ty =
                         field_types[field].ty().instantiate(self.interner(), subst).skip_norm_wip();
                     // The metadata of an unsized struct is its last field's (`RefCell<dyn FnMut()>`).
-                    let metadata = if Some(index) == last { metadata.to_vec() } else { Vec::new() };
-                    parts.push(DropStep::Glue(ty, addr.offset(offset), metadata));
+                    let metadata = match Some(index) == last {
+                        true => OwnedBytes::from_slice(metadata),
+                        false => OwnedBytes::new(),
+                    };
+                    steps.push(DropStep::Glue(ty, addr.offset(offset), metadata));
                 }
             }
-            TyKind::Tuple(fields) => self.field_steps(ty, fields.iter(), addr, &mut parts)?,
+            TyKind::Tuple(fields) => self.field_steps(ty, fields.iter(), addr, steps)?,
             TyKind::Closure(_, args) => {
                 let upvars = args.as_closure().tupled_upvars_ty();
-                self.field_steps(ty, upvars.tuple_fields().iter(), addr, &mut parts)?;
+                self.field_steps(ty, upvars.tuple_fields().iter(), addr, steps)?;
             }
             TyKind::Array(inner, len) => {
                 let Some(len) = try_const_usize(self.db, len) else {
                     not_supported!("dropping an array of no evaluated length");
                 };
-                self.element_steps(inner, len as usize, locals, addr, &mut parts)?;
+                self.element_steps(inner, len as usize, locals, addr, steps)?;
             }
             TyKind::Slice(inner) => {
                 let len = from_bytes!(usize, metadata);
-                self.element_steps(inner, len, locals, addr, &mut parts)?;
+                self.element_steps(inner, len, locals, addr, steps)?;
             }
             TyKind::Dynamic(..) => {
                 if metadata.is_empty() {
                     not_supported!("dropping {ty:?} with no vtable");
                 }
                 let concrete_ty = self.vtable_map.ty_of_bytes(metadata)?;
-                parts.push(DropStep::Glue(concrete_ty, addr, Vec::new()));
+                steps.push(DropStep::Glue(concrete_ty, addr, OwnedBytes::new()));
             }
             _ => not_supported!("drop glue of {ty:?}"),
         }
-        steps.extend(parts.into_iter().rev());
+        steps[base..].reverse();
         Ok(())
     }
 
@@ -5305,7 +5359,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let layout = self.layout(ty)?;
         for (i, field) in fields.enumerate() {
             let offset = layout.fields.offset(i).bytes_usize();
-            parts.push(DropStep::Glue(field, addr.offset(offset), Vec::new()));
+            parts.push(DropStep::Glue(field, addr.offset(offset), OwnedBytes::new()));
         }
         Ok(())
     }
@@ -5323,16 +5377,19 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             return Ok(());
         }
         let size = self.size_of_sized(inner, locals, "element to drop")?;
-        parts.extend((0..len).map(|i| DropStep::Glue(inner, addr.offset(i * size), Vec::new())));
+        let element = |i: usize| DropStep::Glue(inner, addr.offset(i * size), OwnedBytes::new());
+        parts.extend((0..len).map(element));
         Ok(())
     }
 
     fn write_to_stdout(&mut self, interval: Interval) -> Result<'db, ()> {
+        // alloc: the program's output, at the edge
         self.stdout.extend(interval.get(self)?.to_vec());
         Ok(())
     }
 
     fn write_to_stderr(&mut self, interval: Interval) -> Result<'db, ()> {
+        // alloc: the program's output, at the edge
         self.stderr.extend(interval.get(self)?.to_vec());
         Ok(())
     }
@@ -5407,6 +5464,7 @@ pub fn render_const_using_debug_impl<'db>(
     let Some(addr) = words.into_iter().map(Address::from_usize).find(|it| matches!(it.at(), Heap(_)))
     else {
         // No heap buffer means the formatted string is empty.
+        // alloc: the formatted text is the result, and an empty `String` holds nothing
         return Ok(String::new());
     };
     let size = words
@@ -5414,6 +5472,7 @@ pub fn render_const_using_debug_impl<'db>(
         .filter(|&it| !matches!(Address::from_usize(it).at(), Heap(_)))
         .min()
         .unwrap_or(0);
+    // alloc: the formatted text is the result
     Ok(std::string::String::from_utf8_lossy(evaluator.read_memory(addr, size)?).into_owned())
 }
 

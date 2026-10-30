@@ -128,6 +128,8 @@ pub struct Speaking<'a> {
     pub color: bool,
     pub quiet: bool,
     pub verbose: u32,
+    /// `--message-format` is one of the JSON ones.
+    pub json: bool,
 }
 
 impl Speaking<'_> {
@@ -135,6 +137,15 @@ impl Speaking<'_> {
         match self.quiet {
             true => Ok(()),
             false => err.write_all(say::status(word, rest, self.color).as_bytes()),
+        }
+    }
+
+    /// `Running` or `Executable` and what runs: cargo's `exe_display` (`concise`), or under `-v`
+    /// the command itself (`verbose`).
+    fn running(&self, err: &mut dyn Write, word: &str, artifact: &Artifact, kind: Kind, shown: &str) -> io::Result<()> {
+        match self.verbose {
+            0 => self.status(err, word, &running(artifact, self.cwd, kind)),
+            _ => self.status(err, word, shown),
         }
     }
 }
@@ -165,25 +176,22 @@ pub fn run(
     let unit_kind = if bench { Kind::Bench } else { Kind::Test };
     let (tests, docs) = executables(artifacts);
     let spec_flag = needs_spec_flag(asked, members);
+    // cargo's `display_no_run_information`, which JSON leaves out: its artifacts name them.
     if asked.flags.no_run {
-        for test in &tests {
-            let shown = match speaking.verbose {
-                0 => running(test, speaking.cwd, unit_kind),
-                _ => exec_of(test, asked, speaking).shown(),
-            };
-            speaking.status(err, "Executable", &shown)?;
+        if !speaking.json {
+            for test in &tests {
+                let exec = exec_of(test, asked, speaking);
+                speaking.running(err, "Executable", test, unit_kind, &exec.shown())?;
+            }
         }
         return Ok(0);
     }
     let mut failed = Vec::new();
     for test in &tests {
         let exec = exec_of(test, asked, speaking);
-        let shown = match speaking.verbose {
-            0 => running(test, speaking.cwd, unit_kind),
-            _ => exec.shown(),
-        };
-        speaking.status(err, "Running", &shown)?;
-        if let Some(failure) = ran(test, unit_kind, &exec, asked, spec_flag, speaking, err, programs)? {
+        let shown = exec.shown_at(speaking.verbose);
+        speaking.running(err, "Running", test, unit_kind, &shown)?;
+        if let Some(failure) = ran(test, unit_kind, &exec, &shown, asked, spec_flag, speaking, err, programs)? {
             failed.push(failure);
             if !asked.flags.no_fail_fast {
                 return Ok(failed[0].code.unwrap_or(FAILED));
@@ -193,8 +201,12 @@ pub fn run(
     if !bench {
         for doc in &docs {
             let exec = exec_of(doc, asked, speaking);
-            speaking.status(err, "Doc-tests", &doc.target.name.replace('-', "_"))?;
-            if let Some(failure) = ran(doc, Kind::Doctest, &exec, asked, spec_flag, speaking, err, programs)? {
+            let shown = exec.shown_at(speaking.verbose);
+            speaking.status(err, "Doc-tests", &doc.target.name)?;
+            if speaking.verbose > 0 {
+                speaking.status(err, "Running", &shown)?;
+            }
+            if let Some(failure) = ran(doc, Kind::Doctest, &exec, &shown, asked, spec_flag, speaking, err, programs)? {
                 failed.push(failure);
                 if !asked.flags.no_fail_fast {
                     return Ok(failed[0].code.unwrap_or(FAILED));
@@ -202,16 +214,22 @@ pub fn run(
             }
         }
     }
-    match failed.as_slice() {
-        [] => Ok(0),
-        [one] => Ok(one.code.unwrap_or(FAILED)),
-        several => {
-            let listed: Vec<String> = several.iter().map(|it| format!("    `{}`", it.rerun)).collect();
-            let said = format!("{} targets failed:\n{}", several.len(), listed.join("\n"));
-            err.write_all(say::error(&said, speaking.color).as_bytes())?;
-            Ok(FAILED)
-        }
+    // cargo's `no_fail_fast_err`: under `--no-fail-fast` any failure is its own error, code 101.
+    if failed.is_empty() {
+        return Ok(0);
     }
+    let mut said = String::new();
+    let _ = match failed.len() {
+        1 => write!(said, "1 target failed:"),
+        n => write!(said, "{n} targets failed:"),
+    };
+    for failure in &failed {
+        said.push_str("\n    `");
+        said.push_str(&failure.rerun);
+        said.push('`');
+    }
+    err.write_all(say::error(&said, speaking.color).as_bytes())?;
+    Ok(FAILED)
 }
 
 /// A test executable as cargo runs it: in its package's directory, with the filter and what
@@ -225,12 +243,13 @@ fn exec_of(artifact: &Artifact, asked: &Invocation, speaking: Speaking<'_>) -> E
     Exec::of(artifact, executable, args, package_root(artifact))
 }
 
-/// Runs one; what failed, said as cargo's `report_test_error` says it.
+/// Runs one, `shown` as the command; what failed, said as cargo's `report_test_error` says it.
 #[expect(clippy::too_many_arguments, reason = "one run of a test, and everything cargo's report of it names")]
 fn ran(
     artifact: &Artifact,
     kind: Kind,
     exec: &Exec,
+    shown: &str,
     asked: &Invocation,
     spec_flag: bool,
     speaking: Speaking<'_>,
@@ -242,7 +261,7 @@ fn ran(
     let ended = match programs.run(exec) {
         Ok(ended) => ended,
         Err(error) => {
-            let never = format!("could not execute process {} (never executed)", exec.shown());
+            let never = format!("could not execute process {shown} (never executed)");
             err.write_all(caused(&what, &[never, error.to_string()], speaking.color).as_bytes())?;
             return Ok(Some(Failed { rerun, code: None }));
         }
@@ -256,12 +275,12 @@ fn ran(
         err.write_all(say::error(&what, speaking.color).as_bytes())?;
         return Ok(Some(Failed { rerun, code }));
     }
-    let cause = format!("process didn't exit successfully: {} ({})", exec.shown(), say::ended(ended));
+    let cause = format!("process didn't exit successfully: {shown} ({})", say::ended(ended));
     err.write_all(caused(&what, &[cause], speaking.color).as_bytes())?;
-    let program = asked.program.iter().any(|it| it == "--nocapture" || it == "--no-capture");
-    if code.is_some() && artifact.harness && !program {
-        let note = "test exited abnormally; to see the full output pass --no-capture to the harness.";
-        let said = format!("{}{} {note}\n", say::paint(say::GOOD, "note", speaking.color), say::paint(say::BOLD, ":", speaking.color));
+    let nocapture = asked.program.iter().any(|it| it == "--nocapture" || it == "--no-capture");
+    if code.is_some() && artifact.harness && !nocapture && !speaking.quiet {
+        let mut said = String::new();
+        say::note_into(&mut said, "test exited abnormally; to see the full output pass --no-capture to the harness.", speaking.color);
         err.write_all(said.as_bytes())?;
     }
     Ok(Some(Failed { rerun, code }))

@@ -12,6 +12,7 @@ All to `lints-driver` (via lane `lints`) unless said.
   `hir_ty` does not re-export the trait.
 
 > forwarded to lints (from requests, pass 17; told by tmux).
+> applied by lints-driver (`rustc_type_ir.workspace = true` in `crates/blaze-lints/Cargo.toml`); checked by lane `lints`, 2026-10-29.
 
 ## 2. `crate::lints::On` wide enough for blaze's bits
 
@@ -21,6 +22,7 @@ All to `lints-driver` (via lane `lints`) unless said.
 - Why: `Lint::bit` is `const` and overflows a `u32` at compile time.
 
 > forwarded to lints (from requests, pass 17; told by tmux).
+> applied by lints-driver (`On = u64`, blaze's bits at 48..52 (`lints/mod.rs`)); checked by lane `lints`, 2026-10-29.
 
 ## 3. Where `blaze::check_node` is called, and with what
 
@@ -33,6 +35,7 @@ All to `lints-driver` (via lane `lints`) unless said.
 - Why: one entry point, as clippy's lints have.
 
 > forwarded to lints (from requests, pass 17; told by tmux).
+> applied by lints-driver (the walk calls `blaze::check_node(self, node)` for every node, root included; cx.md says so); checked by lane `lints`, 2026-10-29.
 
 ## 4. Levels: `blaze::<name>` and the group `blaze::hot`
 
@@ -47,6 +50,7 @@ All to `lints-driver` (via lane `lints`) unless said.
 - Why: the tests in `blaze/tests.rs` run with both forms.
 
 > forwarded to lints (from requests, pass 17; told by tmux).
+> applied by lints-driver (`level.rs` `Target::blaze`, `BLAZE_HOT` of all four, allow by default; group note as rustc's); checked by lane `lints`, 2026-10-29.
 
 ## 5. `cx.blaze` adds no help line of its own
 
@@ -57,6 +61,7 @@ All to `lints-driver` (via lane `lints`) unless said.
 - Why: otherwise every finding has two such lines.
 
 > forwarded to lints (from requests, pass 17; told by tmux).
+> applied by lints-driver (`Cx::blaze` adds only the level note; the driver adds clippy's docs help for clippy lints only); checked by lane `lints`, 2026-10-29.
 
 ## 6. `cx.path` outside a body
 
@@ -69,6 +74,7 @@ All to `lints-driver` (via lane `lints`) unless said.
   `blaze/tests.rs` (`std_hashmap`) expects those findings.
 
 > forwarded to lints (from requests, pass 17; told by tmux).
+> applied by lints-driver (`Cx::path` resolves through `Semantics` at item level, through `BodyAnalysis` in a body); checked by lane `lints`, 2026-10-29.
 
 ## 7. What blaze reads of `hir::BodyAnalysis` (to `db-ty-hir`, via `lints`)
 
@@ -82,3 +88,4 @@ All to `lints-driver` (via lane `lints`) unless said.
   a `format!` whose expansion makes several allocating calls is one finding at the call.
 
 > forwarded to lints (from requests, pass 17; told by tmux).
+> applied by lints-driver (carried to db in `v2/requests/lints.md` (`hir::BodyAnalysis`, the exact API)); checked by lane `lints`, 2026-10-29.

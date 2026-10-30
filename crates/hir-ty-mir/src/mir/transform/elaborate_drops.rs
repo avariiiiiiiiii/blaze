@@ -29,7 +29,7 @@ use crate::{
         BasicBlock, BasicBlockId, BorrowKind, FieldIndex, Local, LocalId, MirBody, MirLowerError,
         MirSpan, MutBorrowKind, Operand, OperandKind, Place, PlaceElem, Projection, ProjectionElem,
         Rvalue, Statement, StatementKind, StoredPlace, SwitchTargets, Terminator, TerminatorKind,
-        framed::bits_in,
+        framed::{bits_in, block_index},
     },
     next_solver::{GenericArgs, Region, Ty, TyKind},
 };
@@ -38,7 +38,7 @@ use super::{
     Ctx,
     move_paths::{
         self, Change, Effects, InitAnalysis, InitState, Lookup, MoveData, PathId, Step,
-        block_index, edge_effects, successors,
+        edge_effects, successors,
     },
 };
 
@@ -354,11 +354,11 @@ pub(super) fn elaborate_drops<'db>(
             _ => grouped.push(((block, at), end)),
         }
     }
-    let mut start = 0;
+    let mut from = 0;
     let mut block_total: Option<(BasicBlockId, usize)> = None;
     for &((block, _), end) in &grouped {
-        let n = end as usize - start;
-        start = end as usize;
+        let n = end as usize - from;
+        from = end as usize;
         match &mut block_total {
             Some((current, total)) if *current == block => *total += n,
             _ => {
@@ -376,13 +376,13 @@ pub(super) fn elaborate_drops<'db>(
     // tail of `run`.
     for group in (0..grouped.len()).rev() {
         let ((block, at), end) = grouped[group];
-        let start = if group == 0 { 0 } else { grouped[group - 1].1 as usize };
-        if start == end as usize {
+        let from = if group == 0 { 0 } else { grouped[group - 1].1 as usize };
+        if from == end as usize {
             continue;
         }
         let block = &mut body.basic_blocks[block];
         let at = (at + 1).min(block.statements.len());
-        block.statements.splice(at..at, run.drain(start..end as usize));
+        block.statements.splice(at..at, run.drain(from..end as usize));
     }
     // Every flag starts clear, but those of what the body is given.
     let mut n = flag_count;
@@ -422,7 +422,12 @@ fn set<'db>(
     value: bool,
     bool_ty: Ty<'db>,
 ) {
-    out.extend(paths.iter().filter_map(|&path| flags[path]).map(|flag| write_flag(flag, value, bool_ty)));
+    out.extend(
+        paths
+            .iter()
+            .filter_map(|&path| flags[path])
+            .map(|flag| write_flag(flag, value, bool_ty)),
+    );
 }
 
 fn write_flag(flag: LocalId, value: bool, bool_ty: Ty<'_>) -> Statement {
@@ -768,9 +773,9 @@ impl<'c, 'f, 'db> Elaborator<'_, 'c, 'f, 'db> {
             // clone: an interned place, a refcount
             fields_succ = self.drop_block(field.clone(), fields_succ, unwind_here);
             if let Unwind::To(target) = fields_unwind {
-                fields_unwind =
-                    // clone: an interned place, a refcount
-                    Unwind::To(self.drop_block(field.clone(), target, Unwind::InCleanup));
+                // clone: an interned place, a refcount
+                let cleanup = self.drop_block(field.clone(), target, Unwind::InCleanup);
+                fields_unwind = Unwind::To(cleanup);
             }
         }
         let destructor = self.destructor_call_block(place, ty, fields_succ, fields_unwind)?;

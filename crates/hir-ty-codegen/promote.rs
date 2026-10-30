@@ -201,6 +201,7 @@ fn dominator_tree(func: &ir::Function) -> DominatorTree {
         use cranelift_codegen::timing::{Pass, Profiler, set_thread_profiler};
         struct Untimed;
         impl Profiler for Untimed {
+            // dyn: cranelift's `Profiler::start_pass` returns `Box<dyn Any>`; a `()` is no allocation
             fn start_pass(&self, _: Pass) -> Box<dyn std::any::Any> {
                 Box::new(())
             }

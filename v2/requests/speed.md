@@ -448,3 +448,17 @@ that body except a person looking at the delivery in GitHub's settings.
 > serde_json. Not yet run.
 
 > applied by requests: root `sonic-rs = { version = "0.5", default-features = false }` after `serde_json`, with a comment. New to the lock: on requests' lock additions list. The blaze-ci side is speed-link-edge-sol-ci's (told).
+
+## codegen-mir: `tools/v2/hot_lint.py`'s fresh-`Vec` rule matches inside `smallvec![` (2026-10-29)
+
+What: the rule `\bVec::new\(\)|vec!\[|\.to_vec\(\)` (`hot_lint.py:28`) has no word boundary
+before `vec!`, so every `smallvec![..]` is reported as a fresh `Vec`, though a `SmallVec` is
+what the rule's own message asks for. Seven of the interpreter's per-operation results
+(`eval.rs`, `Owned(smallvec![r])` in `eval_rvalue`) and the computed aggregate
+(`construct_shadowed`) are reported now that they are inline `SmallVec`s.
+Ask: `\bvec!\[` in place of `vec!\[`. While there: `Vec::new()` and `vec![]` allocate nothing
+until pushed to, so reporting them (an `Evaluator::new` has 20 such fields) hides the real
+`vec![0; n]`s; `vec!\[\]` and `Vec::new\(\)` could leave the rule.
+Where: `tools/v2/hot_lint.py:28`.
+
+> forwarded to the coordinator (`tools/`): on requests' coordinator list (requests, pass 22).

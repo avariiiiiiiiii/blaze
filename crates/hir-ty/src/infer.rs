@@ -68,6 +68,7 @@ use hir_def::{
 };
 use hir_expand::{mod_path::ModPath, name::Name};
 use indexmap::IndexSet;
+use intern::Symbol;
 use la_arena::ArenaMap;
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_ast_ir::Mutability;
@@ -112,7 +113,7 @@ use crate::{
         ImplTraitIdx, LifetimeElisionKind, LifetimeLoweringMode, LoweringMode,
         diagnostics::TyLoweringDiagnostic,
     },
-    method_resolution::CandidateId,
+    method_resolution::{CandidateId, Pick},
     next_solver::{
         AliasConstKind, AliasTy, AnonConstIdWrapper, Const, ConstKind, DbInterner, ErrorGuaranteed,
         GenericArgs, IsRigid, Region, RegionExt, StoredFnSig, StoredGenericArg, StoredGenericArgs,
@@ -719,6 +720,8 @@ impl InferenceDiagnostic {
             | InferenceDiagnostic::TyDiagnostic {
                 diag: TyLoweringDiagnostic::PathDiagnostic { diag, .. },
             } => !is_lint(diag),
+            InferenceDiagnostic::EditionDependentMethodCall { .. }
+            | InferenceDiagnostic::FullyQualifiedCallFrom2018 { .. } => false,
             _ => true,
         }
     }
@@ -1018,6 +1021,9 @@ pub struct InferenceResult<'db> {
     /// For each value path, expression or pattern, what it resolves to (an associated item's
     /// path as its function or const, which [`Self::assoc_resolutions`] gives with arguments).
     pub(crate) value_resolutions: ExprOrPatColumn<ValueNs>,
+    /// For each method call or type-relative path, the unstable items its probe passed over and
+    /// each one's feature, which a later toolchain may resolve it to instead.
+    pub(crate) unstable_candidates: ExprOrPatColumn<Box<[(CandidateId, Symbol)]>>,
     /// For each associated item record what it resolves to
     pub(crate) assoc_resolutions: ExprOrPatColumn<(CandidateId, StoredGenericArgs)>,
     /// Whenever a tuple field expression access a tuple field, we allocate a tuple id in
@@ -1112,6 +1118,7 @@ pub(crate) struct InferenceTables<'db> {
     field_resolutions: ArenaMap<ExprId, Either<FieldId, TupleFieldId>>,
     variant_resolutions: ExprOrPatMap<VariantId>,
     value_resolutions: ExprOrPatMap<ValueNs>,
+    unstable_candidates: ExprOrPatMap<Box<[(CandidateId, Symbol)]>>,
     assoc_resolutions: ExprOrPatMap<(CandidateId, StoredGenericArgs)>,
     type_of_expr: ArenaMap<ExprId, StoredTy>,
     type_of_pat: ArenaMap<PatId, StoredTy>,
@@ -1139,6 +1146,7 @@ impl<'db> InferenceTables<'db> {
             field_resolutions: ArenaMap::default(),
             variant_resolutions: ExprOrPatMap::default(),
             value_resolutions: ExprOrPatMap::default(),
+            unstable_candidates: ExprOrPatMap::default(),
             assoc_resolutions: ExprOrPatMap::default(),
             type_of_expr: ArenaMap::default(),
             type_of_pat: ArenaMap::default(),
@@ -1237,6 +1245,7 @@ impl<'db> InferenceTables<'db> {
             field_resolutions,
             variant_resolutions,
             value_resolutions,
+            unstable_candidates,
             assoc_resolutions,
             type_of_expr,
             type_of_pat,
@@ -1266,6 +1275,7 @@ impl<'db> InferenceTables<'db> {
             field_resolutions: FieldColumn::from_entries(field_resolutions),
             variant_resolutions: variant_resolutions.freeze(),
             value_resolutions: value_resolutions.freeze(),
+            unstable_candidates: unstable_candidates.freeze(),
             assoc_resolutions: assoc_resolutions.freeze(),
             tuple_field_access_types,
             type_of_expr: TyColumn::from_entries(type_of_expr),
@@ -1653,6 +1663,7 @@ impl<'db> InferenceResult<'db> {
             field_resolutions: Default::default(),
             variant_resolutions: Default::default(),
             value_resolutions: Default::default(),
+            unstable_candidates: Default::default(),
             assoc_resolutions: Default::default(),
             tuple_field_access_types: Default::default(),
             diagnostics: Default::default(),
@@ -1703,6 +1714,15 @@ impl<'db> InferenceResult<'db> {
             ExprOrPatId::PatId(id) => id.into(),
         };
         self.value_resolutions.get(node).copied()
+    }
+    /// The unstable items, with their features, that the probe of the method call or
+    /// type-relative path `id` passed over: rustc's `Pick::unstable_candidates`.
+    pub fn unstable_candidates(&self, id: ExprOrPatId) -> &[(CandidateId, Symbol)] {
+        let node = match id {
+            ExprOrPatId::ExprId(id) => id.into(),
+            ExprOrPatId::PatId(id) => id.into(),
+        };
+        self.unstable_candidates.get(node).map_or(&[], |it| &**it)
     }
     pub fn assoc_resolutions_for_expr<'a>(
         &self,
@@ -2033,6 +2053,7 @@ impl<'db> InferenceContext<'db> {
             field_resolutions,
             variant_resolutions,
             value_resolutions,
+            unstable_candidates,
             assoc_resolutions,
             type_of_expr,
             type_of_pat,
@@ -2060,6 +2081,11 @@ impl<'db> InferenceContext<'db> {
         for (node, value) in other.value_resolutions.iter() {
             debug_assert!(value_resolutions.get(node).is_none_or(|it| it == value));
             value_resolutions.insert(node, *value);
+        }
+        for (node, candidates) in other.unstable_candidates.iter() {
+            debug_assert!(unstable_candidates.get(node).is_none_or(|it| it == candidates));
+            // clone: a nested body's few passed-over items, once per merge.
+            unstable_candidates.insert(node, candidates.clone());
         }
         for (node, resolution) in other.assoc_resolutions.iter() {
             debug_assert!(assoc_resolutions.get(node).is_none_or(|it| it == resolution));
@@ -2214,6 +2240,7 @@ impl<'db> InferenceContext<'db> {
             field_resolutions: _,
             variant_resolutions: _,
             value_resolutions: _,
+            unstable_candidates: _,
             assoc_resolutions,
             type_of_expr,
             type_of_pat,
@@ -2463,6 +2490,12 @@ impl<'db> InferenceContext<'db> {
 
     fn write_value_resolution(&mut self, id: ExprOrPatIdPacked, value: ValueNs) {
         self.result.value_resolutions.insert(id, value);
+    }
+
+    pub(crate) fn write_unstable_candidates(&mut self, id: ExprOrPatIdPacked, pick: &Pick<'db>) {
+        if !pick.unstable_candidates.is_empty() {
+            self.result.unstable_candidates.insert(id, pick.unstable_candidates.as_slice().into());
+        }
     }
 
     fn write_assoc_resolution(

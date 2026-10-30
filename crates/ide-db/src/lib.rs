@@ -120,8 +120,6 @@ pub trait RootDatabaseExt {
     /// Whether such a file is on disk what was read of it.
     fn included_is_read(&self, path: &vfs::AbsPath) -> bool;
 
-    fn enable_proc_attr_macros(&mut self);
-
     /// Cancels every query in flight and applies `change`; returns how long the cancellation
     /// took.
     fn apply_change(&mut self, change: ChangeWithProcMacros) -> Duration;
@@ -181,10 +179,6 @@ impl RootDatabaseExt for Db {
     #[inline]
     fn included_is_read(&self, path: &vfs::AbsPath) -> bool {
         self.files().included_is_read(self, path)
-    }
-
-    fn enable_proc_attr_macros(&mut self) {
-        hir::db::set_expand_proc_attr_macros(self, true);
     }
 
     fn apply_change(&mut self, change: ChangeWithProcMacros) -> Duration {

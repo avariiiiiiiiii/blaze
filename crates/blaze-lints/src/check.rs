@@ -13,6 +13,7 @@ use std::{
 };
 
 use base_db::{Db, EditionedFileId};
+use blaze_diagnostics::model;
 use cfg::{CfgAtom, CfgDiff, CfgExpr, CfgOptions};
 use hir::{HasAttrs as _, HirFileId, InFile};
 use hir_def::{
@@ -33,7 +34,7 @@ use syntax::{
 use crate::{
     Level, blaze,
     conf::Conf,
-    diag::{Diagnostic, Expansion, MacroKind, MultiSpan, Span, Sublevel},
+    diag::{self, Code, Diag, Expansion, MacroKind, MultiSpan, Span, Sublevel},
     famous::Famous,
     level::{CommandLine, Levels, Lint, Set, Source, Spec, Target},
     lints::{self, Implemented, On},
@@ -53,7 +54,7 @@ pub struct Setup {
 /// the crate without its tests does not see.
 #[derive(Clone, Debug)]
 pub struct Found {
-    pub diagnostic: Diagnostic,
+    pub diagnostic: Diag,
     pub test_only: bool,
 }
 
@@ -100,7 +101,7 @@ struct Pending {
     file: usize,
     /// Where its level is asked for.
     at: TextRange,
-    diagnostic: Diagnostic,
+    diagnostic: Diag,
     /// The order rustc emits it in: by pass (pre-expansion over the root file, early, late,
     /// after late), then by where the node it was found at is in the walk over the crate,
     /// outer nodes first.
@@ -278,7 +279,7 @@ impl<'q> Driver<'q> {
         for Finding { lint, at: found_at, place, diagnostic } in &lints.findings {
             // clone: a finding's diagnostic, out of the query's value, to be given its level
             let mut diagnostic = diagnostic.clone();
-            if !diagnostic.place(offset, &file.name, self.name_of) {
+            if !diag::place_diag(&mut diagnostic, offset, &file.name, self.name_of) {
                 continue;
             }
             let place = match *place {
@@ -388,17 +389,16 @@ impl<'q> Driver<'q> {
                 }
                 _ => {}
             }
-            diagnostic.level = spec.level;
+            diagnostic.level = written_at(spec.level);
             if let Some(docs) = docs {
                 diagnostic.help(format!("for further information visit {docs}"));
             }
             crate::level::explain(&mut diagnostic, asked, &spec);
-            originates_in(&mut diagnostic);
             if diagnostic
                 .span
                 .primary
                 .iter()
-                .any(|it| it.expansion.as_ref().is_some_and(|it| it.def_site.is_some()))
+                .any(|it| it.expansion.as_ref().is_some_and(|it| it.kind != MacroKind::Bang))
             {
                 diagnostic.suggestions_disabled = true;
             }
@@ -414,15 +414,9 @@ impl<'q> Driver<'q> {
             if matches!(spec.level, Level::Allow | Level::Expect) {
                 continue;
             }
-            let mut diagnostic = Diagnostic {
-                lint: "unfulfilled_lint_expectations".to_owned(),
-                level: spec.level,
-                message: "this lint expectation is unfulfilled".to_owned(),
-                span: MultiSpan::of(expectation.span),
-                children: Vec::new(),
-                suggestions: Vec::new(),
-                suggestions_disabled: false,
-            };
+            let code = Code::Lint("unfulfilled_lint_expectations".to_owned());
+            let mut diagnostic = Diag::new(written_at(spec.level), Some(code), "this lint expectation is unfulfilled");
+            diagnostic.span = MultiSpan::of(expectation.span);
             if let Some(reason) = expectation.reason {
                 diagnostic.sub(Sublevel::Note, reason, MultiSpan::default(), false);
             }
@@ -1064,7 +1058,7 @@ impl<'q, 't> Cx<'q, 't> {
         };
         let file = file.file_id()?;
         let source = self.adt_source(adt)?;
-        Some(Span::of_file(file.file_id(db), item_range(source.syntax())))
+        Some(diag::of_file(file.file_id(db), item_range(source.syntax())))
     }
 
     /// rustc's `effective_visibilities.is_exported` of the item, associated item or field at
@@ -1134,7 +1128,7 @@ impl<'q, 't> Cx<'q, 't> {
 
     /// The span of `range` of [`Cx::text`], with the expansion the walk is in.
     pub(crate) fn span(&self, range: TextRange) -> Span {
-        let mut span = Span::in_query(range);
+        let mut span = diag::in_query(range);
         // clone: the expansion a span is in, once per span of a lint found in one
         span.expansion = self.walking.expansion.clone().map(Box::new);
         span
@@ -1160,7 +1154,7 @@ impl<'q, 't> Cx<'q, 't> {
         at: ast::Node<'t>,
         span: impl Into<MultiSpan>,
         message: impl Into<String>,
-    ) -> &mut Diagnostic {
+    ) -> &mut Diag {
         self.lint_when(lint, at, at, span, message)
     }
 
@@ -1173,7 +1167,7 @@ impl<'q, 't> Cx<'q, 't> {
         when: ast::Node<'t>,
         span: impl Into<MultiSpan>,
         message: impl Into<String>,
-    ) -> &mut Diagnostic {
+    ) -> &mut Diag {
         let span: MultiSpan = span.into();
         // rustc's passes run a lint as they come to a node, outer nodes before inner ones.
         let place = match self.original_range(when) {
@@ -1192,7 +1186,7 @@ impl<'q, 't> Cx<'q, 't> {
         after: ast::Node<'t>,
         span: impl Into<MultiSpan>,
         message: impl Into<String>,
-    ) -> &mut Diagnostic {
+    ) -> &mut Diag {
         let span: MultiSpan = span.into();
         let place = match self.original_range(after) {
             Some(range) => Place::At { at: u32::from(range.end()).saturating_sub(1), then: u32::MAX },
@@ -1208,7 +1202,7 @@ impl<'q, 't> Cx<'q, 't> {
         at: ast::Node<'t>,
         span: impl Into<MultiSpan>,
         message: impl Into<String>,
-    ) -> &mut Diagnostic {
+    ) -> &mut Diag {
         let span: MultiSpan = span.into();
         let place = match self.original_range(at) {
             Some(range) => Place::Node(range),
@@ -1224,7 +1218,7 @@ impl<'q, 't> Cx<'q, 't> {
         place: Place,
         span: MultiSpan,
         message: impl Into<String>,
-    ) -> &mut Diagnostic {
+    ) -> &mut Diag {
         let at = self.range(at).or(self.walking.call_at).unwrap_or(self.root.text_range());
         let name = match lint {
             FoundLint::Clippy(lint) => format!("clippy::{}", lint.name()),
@@ -1234,14 +1228,10 @@ impl<'q, 't> Cx<'q, 't> {
             lint,
             at,
             place,
-            diagnostic: Diagnostic {
-                lint: name,
-                level: Level::Warn,
-                message: message.into(),
-                span,
-                children: Vec::new(),
-                suggestions: Vec::new(),
-                suggestions_disabled: false,
+            diagnostic: {
+                let mut diag = Diag::new(model::Level::Warning, Some(Code::Lint(name)), message);
+                diag.span = span;
+                diag
             },
         });
         &mut self.found.last_mut().expect("just pushed").diagnostic
@@ -1380,16 +1370,20 @@ impl<'q, 't> Cx<'q, 't> {
     ) -> Option<Expansion> {
         let call_site = self.range_in_base(call_site)?;
         let db = self.db;
+        let named = |file: HirFileId, range: TextRange| Some(diag::of_file(file.file_id()?.file_id(db), range));
         let def_site = match call.loc(db).def.kind {
-            MacroDefKind::ProcMacro(id, ..) => {
-                let file = id.file_id.file_id()?;
-                let item = self.view_of(id)?;
-                Some(Span::of_file(file.file_id(db), signature_range(item)))
+            MacroDefKind::ProcMacro(id, ..) => Some(named(id.file_id, signature_range(self.view_of(id)?))?),
+            MacroDefKind::Declarative(id, _)
+            | MacroDefKind::BuiltIn(id, _)
+            | MacroDefKind::BuiltInAttr(id, _)
+            | MacroDefKind::BuiltInDerive(id, _)
+            | MacroDefKind::BuiltInEager(id, _)
+            | MacroDefKind::UnimplementedBuiltIn(id) => {
+                self.node_of(id).and_then(|node| named(id.file_id, item_range(node)))
             }
-            _ => None,
         };
         let name = name.rsplit("::").next()?.trim().to_owned();
-        Some(Expansion { call_site: Span::in_query(call_site), kind, name, def_site })
+        Some(Expansion { call_site: diag::in_query(call_site), kind, name, def_site })
     }
 
     /// `range` of the tree walked, when that is the tree of [`Cx::text`].
@@ -1759,32 +1753,12 @@ fn for_each_meta<'t>(
     }
 }
 
-/// rustc's note on a diagnostic in a macro's expansion: which macro it came from.
-fn originates_in(diagnostic: &mut Diagnostic) {
-    let level = if diagnostic.is_error() { "error" } else { "warning" };
-    let spans = diagnostic
-        .span
-        .primary
-        .iter()
-        .chain(diagnostic.children.iter().flat_map(|it| &it.span.primary));
-    let backtrace: Vec<&Expansion> = spans
-        .flat_map(|span| {
-            std::iter::successors(span.expansion.as_deref(), |it| it.call_site.expansion.as_deref())
-        })
-        .collect();
-    let (Some(first), Some(last)) = (backtrace.first(), backtrace.last()) else { return };
-    let and_then = match last.name != first.name {
-        true => {
-            format!(" which comes from the expansion of the {} `{}`", last.kind.descr(), last.name)
-        }
-        false => String::new(),
-    };
-    let note = format!(
-        "this {level} originates in the {} `{}`{and_then} (in Nightly builds, run with -Z macro-backtrace for more info)",
-        first.kind.descr(),
-        first.name
-    );
-    diagnostic.note(note);
+/// The level a diagnostic of a lint at `level` is written at.
+fn written_at(level: Level) -> model::Level {
+    match level.is_error() {
+        true => model::Level::Error,
+        false => model::Level::Warning,
+    }
 }
 
 /// A lint attribute's level set on one name.

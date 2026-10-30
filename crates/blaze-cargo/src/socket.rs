@@ -20,8 +20,13 @@ use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 #[cfg(windows)]
 use uds_windows::{UnixListener, UnixStream};
 
+#[cfg(unix)]
+mod unix;
 #[cfg(windows)]
 pub mod windows;
+
+#[cfg(unix)]
+use unix::{peer_user, user};
 
 /// The longest request: a build names every file rustc linked and every source it read.
 pub const LONGEST_REQUEST: u64 = 16 << 20;
@@ -288,40 +293,6 @@ fn only_the_user_connects(socket: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn only_the_user_connects(socket: &Path) -> io::Result<()> {
     windows::only_the_user_opens(socket)
-}
-
-#[cfg(unix)]
-fn user() -> u32 {
-    // SAFETY: `geteuid` takes nothing and can't fail.
-    unsafe { libc::geteuid() }
-}
-
-/// The user at the other end of `stream`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn peer_user(stream: &UnixStream) -> io::Result<u32> {
-    use std::os::fd::AsRawFd as _;
-    let mut peer = libc::ucred { pid: 0, uid: 0, gid: 0 };
-    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `peer` is a `ucred` and `len` its size, which is what `SO_PEERCRED` writes.
-    let failed = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut peer).cast(),
-            &raw mut len,
-        )
-    };
-    if failed != 0 { Err(io::Error::last_os_error()) } else { Ok(peer.uid) }
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn peer_user(stream: &UnixStream) -> io::Result<u32> {
-    use std::os::fd::AsRawFd as _;
-    let (mut uid, mut gid) = (0, 0);
-    // SAFETY: both point at integers of the types `getpeereid` writes.
-    let failed = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
-    if failed != 0 { Err(io::Error::last_os_error()) } else { Ok(uid) }
 }
 
 /// Turns away a peer that is another user.

@@ -27,11 +27,10 @@ use std::mem::offset_of;
 
 use base_db::{Crate, Db};
 use blaze_format::{
-    ALIGN, Aligned, FormatError, Part as SchemaPart, Persist, Record, SchemaHash, Slice, Writer,
-    open_as,
+    ALIGN, FormatError, Part as SchemaPart, Persist, Record, SchemaHash, Slice, Writer, open_as,
 };
 use blaze_ids::ContentId;
-use hir_expand::name::Name;
+use hir_expand::{MacroCallId, name::Name};
 use thin_vec::ThinVec;
 use triomphe::Arc;
 
@@ -115,7 +114,8 @@ const RECORD_SCHEMA: SchemaHash = blaze_format::schema_of(&[
 
 /// The signatures part of the image of `krate`: a record of every signature query of every item
 /// of its modules. An item that cannot be written portably fails the whole part, with why.
-pub(crate) fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
+/// Appends to `calls` each macro call a record names.
+pub(crate) fn encode(db: &Db, krate: Crate, calls: &mut Vec<MacroCallId>) -> R<Vec<u8>> {
     let items = items(db, krate);
     let mut keyed = Vec::with_capacity(items.len());
     for item in items {
@@ -134,7 +134,7 @@ pub(crate) fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
     // alloc: the error that fails the part.
     let place = |it: usize| u32::try_from(it).map_err(|_| "a part of 4 GiB or more".to_owned());
     for &(_, item) in &keyed {
-        let record = record_of(db, krate, item)
+        let record = record_of(db, krate, item, calls)
             // alloc: the error that fails the part.
             .map_err(|why| format!("the signature of {item:?}: {why}"))?;
         let at = out.bytes.len().next_multiple_of(ALIGN);
@@ -210,24 +210,46 @@ fn assoc(items: &mut Vec<Item>, assoc: &[(Name, AssocItemId)]) {
 }
 
 /// The record of `item` of `krate`, from its signature as this database has it.
-fn record_of(db: &Db, krate: Crate, item: Item) -> R<Vec<u8>> {
+fn record_of(db: &Db, krate: Crate, item: Item, calls: &mut Vec<MacroCallId>) -> R<Vec<u8>> {
     let what = item.what();
     match item {
-        Item::Struct(id) => record::<codes::Struct>(db, krate, what, StructSignature::of(db, id)),
-        Item::Union(id) => record::<codes::Union>(db, krate, what, UnionSignature::of(db, id)),
-        Item::Enum(id) => record::<codes::Enum>(db, krate, what, EnumSignature::of(db, id)),
-        Item::Const(id) => record::<codes::Const>(db, krate, what, ConstSignature::of(db, id)),
-        Item::Static(id) => record::<codes::Static>(db, krate, what, StaticSignature::of(db, id)),
-        Item::Impl(id) => record::<codes::Impl>(db, krate, what, ImplSignature::of(db, id)),
-        Item::Trait(id) => record::<codes::Trait>(db, krate, what, TraitSignature::of(db, id)),
+        Item::Struct(id) => {
+            record_naming::<codes::Struct>(db, krate, what, StructSignature::of(db, id), calls)
+        }
+        Item::Union(id) => {
+            record_naming::<codes::Union>(db, krate, what, UnionSignature::of(db, id), calls)
+        }
+        Item::Enum(id) => {
+            record_naming::<codes::Enum>(db, krate, what, EnumSignature::of(db, id), calls)
+        }
+        Item::Const(id) => {
+            record_naming::<codes::Const>(db, krate, what, ConstSignature::of(db, id), calls)
+        }
+        Item::Static(id) => {
+            record_naming::<codes::Static>(db, krate, what, StaticSignature::of(db, id), calls)
+        }
+        Item::Impl(id) => {
+            record_naming::<codes::Impl>(db, krate, what, ImplSignature::of(db, id), calls)
+        }
+        Item::Trait(id) => {
+            record_naming::<codes::Trait>(db, krate, what, TraitSignature::of(db, id), calls)
+        }
         Item::Function(id) => {
-            record::<codes::Function>(db, krate, what, FunctionSignature::of(db, id))
+            record_naming::<codes::Function>(db, krate, what, FunctionSignature::of(db, id), calls)
         }
-        Item::TypeAlias(id) => {
-            record::<codes::TypeAlias>(db, krate, what, TypeAliasSignature::of(db, id))
+        Item::TypeAlias(id) => record_naming::<codes::TypeAlias>(
+            db,
+            krate,
+            what,
+            TypeAliasSignature::of(db, id),
+            calls,
+        ),
+        Item::Fields(id) => {
+            record_naming::<codes::Fields>(db, krate, what, VariantFields::of(db, id), calls)
         }
-        Item::Fields(id) => record::<codes::Fields>(db, krate, what, VariantFields::of(db, id)),
-        Item::Variants(id) => record::<codes::Variants>(db, krate, what, EnumVariants::of(db, id)),
+        Item::Variants(id) => {
+            record_naming::<codes::Variants>(db, krate, what, EnumVariants::of(db, id), calls)
+        }
     }
 }
 
@@ -235,6 +257,19 @@ fn record_of(db: &Db, krate: Crate, item: Item) -> R<Vec<u8>> {
 /// same bytes in every process: the table lists the ids in the order they are first written,
 /// the store first.
 fn record<S: Sig>(db: &Db, krate: Crate, what: u8, of: &S::Of) -> R<Vec<u8>> {
+    // alloc: none: an empty list, which nothing reads
+    record_naming::<S>(db, krate, what, of, &mut Vec::new())
+}
+
+/// [`record`], appending to `calls` the macro calls the record names: the image's reads
+/// cover what their expansions read ([`super::Reads`]).
+fn record_naming<S: Sig>(
+    db: &Db,
+    krate: Crate,
+    what: u8,
+    of: &S::Of,
+    calls: &mut Vec<MacroCallId>,
+) -> R<Vec<u8>> {
     let mut table = Relocation::new();
     let mut store =
         S::store(of).map(|store| relocating(&mut table, || blaze_format::to_bytes(store)));
@@ -243,6 +278,7 @@ fn record<S: Sig>(db: &Db, krate: Crate, what: u8, of: &S::Of) -> R<Vec<u8>> {
     }
     let mut words = Words::new();
     relocating(&mut table, || S::put(of, &mut words));
+    table::calls(&table, calls);
     let table = table::encode(db, krate, &table)?;
 
     let mut out = Writer::new(RECORD_SCHEMA);
@@ -301,7 +337,7 @@ fn read<S: Sig>(
     db: &Db,
     krate: Crate,
     what: u8,
-    image: &std::sync::Arc<Aligned>,
+    image: &crate::deps::ImageBuf,
     bytes: &[u8],
 ) -> R<S::Value> {
     let rec = open_as::<RecordRoot>(bytes, RECORD_SCHEMA).map_err(format_error)?;
@@ -348,11 +384,7 @@ fn corrupt(db: &Db, krate: Crate, item: Item, why: &str) -> ! {
 /// An image with no record of the item, or one that does not read, is a corrupt image: a panic
 /// naming the crate, the item and why. Serving only gives a database images whose bytes the
 /// store checked against their key, so lowering the item instead would hide a bug.
-fn served<S: Sig>(
-    db: &Db,
-    item: Item,
-    live: impl FnOnce(Crate) -> R<Vec<u8>>,
-) -> Option<S::Value> {
+fn served<S: Sig>(db: &Db, item: Item, live: impl FnOnce(Crate) -> R<Vec<u8>>) -> Option<S::Value> {
     let module = item.module(db);
     if module.block(db).is_some() {
         return None;
@@ -362,9 +394,8 @@ fn served<S: Sig>(
     let what = item.what();
     let part = image.view().part(Part::Signatures);
     let record = find(db, part, item).unwrap_or_else(|why| corrupt(db, krate, item, &why));
-    let value =
-        read::<S>(db, krate, what, image.bytes(), record)
-            .unwrap_or_else(|why| corrupt(db, krate, item, &why));
+    let value = read::<S>(db, krate, what, image.bytes(), record)
+        .unwrap_or_else(|why| corrupt(db, krate, item, &why));
     match image.mode() {
         Mode::Serve => {}
         Mode::Check => {
@@ -381,14 +412,7 @@ fn served<S: Sig>(
 
 /// Records a difference between `written`, the record of `what` of `item`, and `record`, the
 /// image's.
-fn compare(
-    db: &Db,
-    krate: Crate,
-    item: Item,
-    what: &str,
-    written: R<Vec<u8>>,
-    record: &[u8],
-) {
+fn compare(db: &Db, krate: Crate, item: Item, what: &str, written: R<Vec<u8>>, record: &[u8]) {
     match written {
         Ok(written) if written == record => {}
         Ok(written) => {

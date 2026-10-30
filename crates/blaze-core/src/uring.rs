@@ -28,6 +28,7 @@ use std::{
     cell::{RefCell, UnsafeCell},
     collections::VecDeque,
     ffi::CStr,
+    fmt::Write as _,
     io::{self, Write as _},
     mem::ManuallyDrop,
     os::{
@@ -727,18 +728,16 @@ impl Ring {
         };
         if fd < 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINVAL) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    // alloc: the error of a setup that failed.
-                    format!(
-                        "io_uring_setup with IORING_SETUP_SQPOLL and IORING_SETUP_SINGLE_ISSUER: \
-                         {error}: Linux 6.0 or later has them, and this is Linux {}",
-                        crate::cgroup::kernel()
-                    ),
-                ));
-            }
-            return Err(error);
+            let errno = error.raw_os_error().unwrap_or(0);
+            let disabled = std::fs::read_to_string("/proc/sys/kernel/io_uring_disabled")
+                .ok()
+                .and_then(|it| it.trim().parse().ok());
+            let kind = match errno {
+                libc::ENOSYS | libc::EINVAL => io::ErrorKind::Unsupported,
+                _ => error.kind(),
+            };
+            let why = setup_refused(errno, &error, disabled, &crate::cgroup::kernel());
+            return Err(io::Error::new(kind, why));
         }
         // SAFETY: the call returned a file descriptor of its own.
         let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }); // alloc: setup, once per driver.
@@ -910,6 +909,81 @@ impl Ring {
             each(user_data, res, flags);
         }
     }
+}
+
+/// What blaze says when `io_uring_setup` fails with `errno`: what failed, the likely cause and
+/// the fix. `disabled` is `/proc/sys/kernel/io_uring_disabled` (absent before Linux 6.6),
+/// `kernel` the running kernel's release. On Linux the build runs on io_uring and on nothing
+/// else, so this is where it stops.
+fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &str) -> String {
+    let name = match errno {
+        libc::ENOSYS => "ENOSYS",
+        libc::EPERM => "EPERM",
+        libc::EACCES => "EACCES",
+        libc::EINVAL => "EINVAL",
+        libc::ENOMEM => "ENOMEM",
+        libc::EMFILE => "EMFILE",
+        libc::ENFILE => "ENFILE",
+        _ => "",
+    };
+    let seccomp = "a seccomp policy that refuses io_uring_setup, such as Docker's default profile \
+                   (Docker 25 and later) or a systemd unit's SystemCallFilter";
+    let allow = "run under a seccomp profile that allows io_uring_setup, io_uring_enter and \
+                 io_uring_register (Docker: --security-opt seccomp=<that profile>)";
+    // alloc: the error of a setup that failed, once; the rest writes into it.
+    let mut out = String::with_capacity(512);
+    out.push_str("blaze runs its build on io_uring on Linux and cannot start without it: io_uring_setup failed with ");
+    _ = match name {
+        "" => write!(out, "errno {errno} ({error}). Likely cause: "),
+        name => write!(out, "{name} ({error}). Likely cause: "),
+    };
+    _ = match (errno, disabled) {
+        (libc::EPERM | libc::EACCES, Some(2)) => write!(
+            out,
+            "the sysctl kernel.io_uring_disabled is 2, which disables io_uring for every process. \
+             Fix: sysctl -w kernel.io_uring_disabled=0 as root (and set it in /etc/sysctl.d to keep it)"
+        ),
+        (libc::EPERM | libc::EACCES, Some(1)) => write!(
+            out,
+            "the sysctl kernel.io_uring_disabled is 1, which allows io_uring only to processes \
+             in the group kernel.io_uring_group names or with CAP_SYS_ADMIN. \
+             Fix: sysctl -w kernel.io_uring_disabled=0 as root, or add this user to the group \
+             kernel.io_uring_group names"
+        ),
+        (libc::EPERM | libc::EACCES, _) => write!(out, "{seccomp}. Fix: {allow}"),
+        (libc::ENOSYS, _) => write!(
+            out,
+            "this kernel (Linux {kernel}) has no io_uring: older than 5.1 or built without \
+             CONFIG_IO_URING; or {seccomp}, answering ENOSYS. \
+             Fix: run on Linux 6.0 or later built with io_uring, or {allow}"
+        ),
+        (libc::EINVAL, _) => write!(
+            out,
+            "this kernel (Linux {kernel}) lacks IORING_SETUP_SQPOLL with \
+             IORING_SETUP_SINGLE_ISSUER, which Linux 6.0 and later have. \
+             Fix: run on Linux 6.0 or later"
+        ),
+        (libc::ENOMEM, _) => write!(
+            out,
+            "the locked-memory limit (RLIMIT_MEMLOCK), which kernels before 5.12 charge a ring \
+             to, is too small, or the machine is out of memory. \
+             Fix: raise the limit (ulimit -l unlimited, or LimitMEMLOCK= for a systemd unit), or run \
+             on Linux 6.0 or later"
+        ),
+        (libc::EMFILE | libc::ENFILE, _) => write!(
+            out,
+            "no file descriptor is left for the ring, in this process or the system. \
+             Fix: raise the open-file limit (ulimit -n)"
+        ),
+        _ => write!(
+            out,
+            "an answer io_uring_setup is not known to give on Linux {kernel}. \
+             Fix: check that the kernel is Linux 6.0 or later, that kernel.io_uring_disabled is 0, \
+             and {allow}"
+        ),
+    };
+    out.push('.');
+    out
 }
 
 /// A request in flight, in its slot of [`Uring::pending`], which never moves (a [`Slab`]'s
@@ -3241,6 +3315,12 @@ impl Driver for Uring {
                 Effect::Mode { file, mode, .. } => {
                     under(&self.root, &file, |path| crate::fs::set_mode(path, mode)).map(|()| Some(Done::Moded))
                 }
+                // No io_uring op sets a file's times: one `utimensat` here on the driver's
+                // thread, as a mode is set, its path in the thread's scratch buffers. A thread
+                // of its own (`off_ring`) would cost a spawn per file for a call of microseconds.
+                Effect::Times { file, modified_ns, .. } => {
+                    under(&self.root, &file, |path| crate::fs::set_times(path, modified_ns)).map(|()| Some(Done::Timed))
+                }
                 Effect::Remove { file, .. } => {
                     self.forget(&file);
                     under(&self.root, &file, crate::fs::remove).map(|()| Some(Done::Removed))
@@ -3418,7 +3498,7 @@ mod tests {
     #[test]
     fn as_threads_do() {
         let file = FileName::new("vfs/journal").unwrap();
-        let script = |driver: &mut dyn Driver| {
+        fn script(driver: &mut impl Driver, file: &FileName) -> Vec<Done> {
             let mut effects =
                 vec![Effect::Append { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
             let mut seen = Vec::new();
@@ -3453,10 +3533,10 @@ mod tests {
                 }
             });
             seen
-        };
+        }
         let (ours, theirs) = (dir("uring"), dir("uring-threads"));
-        let ring = script(&mut Uring::new(&ours).unwrap());
-        let threads = script(&mut Threads::new(&theirs, 2));
+        let ring = script(&mut Uring::new(&ours).unwrap(), &file);
+        let threads = script(&mut Threads::new(&theirs, 2), &file);
         assert_eq!(&ring[..7], &threads[..7]);
         assert_eq!(
             &ring[..7],
@@ -3567,7 +3647,7 @@ mod tests {
 
     /// Processes with input, output, an exit code and a signal; one killed; one in a sandbox
     /// no driver was given the means to make; one whose program is not there.
-    fn processes(driver: &mut dyn Driver) -> BTreeMap<u64, Done> {
+    fn processes(driver: &mut impl Driver) -> BTreeMap<u64, Done> {
         let unconfined = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false };
         let mut effects = vec![
             Effect::Spawn { command: sh("tr a-z A-Z; echo oops >&2; exit 3", b"hello\n"), tag: Tag(1) },
@@ -3684,7 +3764,7 @@ mod tests {
     /// A connection to the listen `Tag(1)`, submitted already, at `at`: a ping and a pong, each
     /// side hung up, a receive on a connection gone, the listen ended and an unlisten of
     /// nothing. What each step did, by its tag, with connections by their role.
-    fn round_trip(driver: &mut dyn Driver, at: Address) -> BTreeMap<u64, Vec<String>> {
+    fn round_trip(driver: &mut impl Driver, at: Address) -> BTreeMap<u64, Vec<String>> {
         let mut seen: BTreeMap<u64, Vec<String>> = BTreeMap::new();
         let (mut server, mut client, mut pinged) = (None, None, false);
         let mut effects = vec![Effect::Timer { after: Duration::from_millis(20), tag: Tag(2) }];
@@ -3786,7 +3866,7 @@ mod tests {
         assert!(matches!(&seen[..], [Done::Failed(_)]), "{seen:?}");
     }
 
-    fn maps(driver: &mut dyn Driver, root: &Path) -> BTreeMap<u64, String> {
+    fn maps(driver: &mut impl Driver, root: &Path) -> BTreeMap<u64, String> {
         std::fs::create_dir_all(root.join("store")).unwrap();
         std::fs::write(root.join("store/pack"), b"packed").unwrap();
         std::fs::write(root.join("store/empty"), b"").unwrap();
@@ -4675,5 +4755,43 @@ mod tests {
         assert!(ring.conns.is_empty());
         drop(ring);
         _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_ring_refused_by_seccomp_says_what_failed_why_and_the_fix() {
+        let error = io::Error::from_raw_os_error(libc::EPERM);
+        assert_eq!(
+            super::setup_refused(libc::EPERM, &error, Some(0), "6.8.0"),
+            "blaze runs its build on io_uring on Linux and cannot start without it: \
+             io_uring_setup failed with EPERM (Operation not permitted (os error 1)). \
+             Likely cause: a seccomp policy that refuses io_uring_setup, such as Docker's \
+             default profile (Docker 25 and later) or a systemd unit's SystemCallFilter. \
+             Fix: run under a seccomp profile that allows io_uring_setup, io_uring_enter and \
+             io_uring_register (Docker: --security-opt seccomp=<that profile>)."
+        );
+    }
+
+    #[test]
+    fn each_refusal_names_its_errno_cause_and_fix() {
+        let says = |errno: i32, disabled: Option<u8>| {
+            super::setup_refused(errno, &io::Error::from_raw_os_error(errno), disabled, "5.0.0")
+        };
+        let cases: [(i32, Option<u8>, &str, &str, &str); 7] = [
+            (libc::EPERM, Some(2), "with EPERM", "kernel.io_uring_disabled is 2", "sysctl -w kernel.io_uring_disabled=0"),
+            (libc::EPERM, Some(1), "with EPERM", "kernel.io_uring_group", "sysctl -w kernel.io_uring_disabled=0"),
+            (libc::EPERM, None, "with EPERM", "seccomp", "io_uring_setup, io_uring_enter and io_uring_register"),
+            (libc::ENOSYS, None, "with ENOSYS", "Linux 5.0.0", "Linux 6.0 or later"),
+            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SINGLE_ISSUER", "Linux 6.0 or later"),
+            (libc::ENOMEM, None, "with ENOMEM", "RLIMIT_MEMLOCK", "ulimit -l"),
+            (libc::EBADF, None, "with errno 9", "not known", "kernel.io_uring_disabled is 0"),
+        ];
+        for (errno, disabled, failed, cause, fix) in cases {
+            let text = says(errno, disabled);
+            let (head, rest) = text.split_once(" Likely cause: ").expect("a cause");
+            let (because, how) = rest.split_once(" Fix: ").expect("a fix");
+            assert!(head.contains(failed), "{text}");
+            assert!(because.contains(cause), "{text}");
+            assert!(how.contains(fix), "{text}");
+        }
     }
 }

@@ -19,10 +19,7 @@ use std::{
     ffi::{OsStr, OsString, c_void},
     io,
     marker::PhantomPinned,
-    os::windows::{
-        ffi::OsStrExt as _,
-        io::{AsRawHandle as _, OwnedHandle},
-    },
+    os::windows::io::{AsRawHandle as _, OwnedHandle},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -176,8 +173,8 @@ fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
     let inherited = [child_stdin.as_raw_handle(), child_stdout.as_raw_handle(), child_stderr.as_raw_handle()];
     // alloc: what the process is started with, made once as it starts.
     let program = sys::wide(launch.program.as_os_str())?;
-    let mut line = command_line(launch.program, launch.args)?;
-    let env = environment(launch.env)?;
+    let mut line = crate::create_process::command_line(launch.program, launch.args)?;
+    let env = crate::create_process::environment(launch.env)?;
     let dir = sys::wide(launch.dir.as_os_str())?;
     let attributes = Attributes::new(&inherited)?;
     // SAFETY: all zeros is a valid `STARTUPINFOEXW` before its fields are set.
@@ -396,110 +393,6 @@ impl Drop for Attributes {
     }
 }
 
-/// The program and its arguments as one command line, each quoted as the C runtime's
-/// parser (`CommandLineToArgvW`) reads it back.
-fn command_line(program: &Path, args: &[OsString]) -> io::Result<Vec<u16>> {
-    // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
-    let mut line = Vec::new();
-    quote(program.as_os_str(), &mut line)?;
-    for arg in args {
-        line.push(u16::from(b' '));
-        quote(arg, &mut line)?;
-    }
-    line.push(0);
-    Ok(line)
-}
-
-fn quote(arg: &OsStr, line: &mut Vec<u16>) -> io::Result<()> {
-    // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
-    let wide: Vec<u16> = arg.encode_wide().collect();
-    if wide.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            // alloc: an error path.
-            format!("{}: a NUL inside an argument", arg.to_string_lossy()),
-        ));
-    }
-    let special = |c: u16| matches!(c, 0x20 | 0x09 | 0x0A | 0x0B | 0x22);
-    if !wide.is_empty() && !wide.iter().copied().any(special) {
-        line.extend(wide);
-        return Ok(());
-    }
-    let (quote, backslash) = (u16::from(b'"'), u16::from(b'\\'));
-    line.push(quote);
-    let mut backslashes = 0;
-    for c in wide {
-        if c == backslash {
-            backslashes += 1;
-        } else {
-            // Backslashes before a quote are doubled, and the quote escaped.
-            if c == quote {
-                line.extend(std::iter::repeat_n(backslash, backslashes + 1));
-            }
-            backslashes = 0;
-        }
-        line.push(c);
-    }
-    // And before the closing quote.
-    line.extend(std::iter::repeat_n(backslash, backslashes));
-    line.push(quote);
-    Ok(())
-}
-
-/// The whole environment as a block: `NAME=value` each, NUL-terminated, sorted by name as
-/// Windows sorts them (names are of no case), a later one of a name replacing the earlier,
-/// then a NUL.
-fn environment(env: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
-    // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
-    let mut by_name: Vec<(Vec<u16>, &OsString, &OsString)> = Vec::new();
-    for (name, value) in env {
-        // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
-        let wide: Vec<u16> = name.encode_wide().collect();
-        if wide.is_empty() || wide[1..].contains(&u16::from(b'=')) || wide.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                // alloc: an error path.
-                format!("{}: not a name an environment holds", name.to_string_lossy()),
-            ));
-        }
-        if value.encode_wide().any(|it| it == 0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                // alloc: an error path.
-                format!("{}: a NUL inside its value", name.to_string_lossy()),
-            ));
-        }
-        // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
-        let key: Vec<u16> = wide.iter().map(|&c| upper(c)).collect();
-        by_name.retain(|(it, ..)| *it != key);
-        by_name.push((key, name, value));
-    }
-    by_name.sort_by(|a, b| a.0.cmp(&b.0));
-    // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
-    let mut block = Vec::new();
-    for (_, name, value) in by_name {
-        block.extend(name.encode_wide());
-        block.push(u16::from(b'='));
-        block.extend(value.encode_wide());
-        block.push(0);
-    }
-    // An empty block is two NULs.
-    if block.is_empty() {
-        block.push(0);
-    }
-    block.push(0);
-    Ok(block)
-}
-
-/// `c` in upper case where it is an ASCII letter: names in an environment are compared
-/// without case.
-fn upper(c: u16) -> u16 {
-    match char::from_u32(u32::from(c)) {
-        Some(it) if it.is_ascii_lowercase() => it.to_ascii_uppercase() as u16,
-        _ => c,
-    }
-}
-
 /// What the thread pool's wait posts once the process has ended: [`KEY_EXIT`] with the bits
 /// of its spawn's handle, to the driver's port. Inline in the spawn's entry of the driver's
 /// slab, which never moves while it is there, and read by a thread of the pool's while the
@@ -623,36 +516,4 @@ fn peak(job: &OwnedHandle) -> io::Result<u64> {
         )
     })?;
     Ok(limits.PeakJobMemoryUsed as u64)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn line(args: &[&str]) -> String {
-        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-        let wide = command_line(Path::new(r"C:\Program Files\x.exe"), &args).unwrap();
-        String::from_utf16(&wide[..wide.len() - 1]).unwrap()
-    }
-
-    #[test]
-    fn arguments_are_quoted_as_the_runtime_reads_them() {
-        assert_eq!(line(&["plain", ""]), r#""C:\Program Files\x.exe" plain """#);
-        assert_eq!(line(&["a b", r#"say "hi""#]), r#""C:\Program Files\x.exe" "a b" "say \"hi\"""#);
-        assert_eq!(line(&[r"dir\", r"a\\b c\"]), r#""C:\Program Files\x.exe" dir\ "a\\b c\\""#);
-        assert_eq!(line(&[r#"\"x"#]), r#""C:\Program Files\x.exe" "\\\"x""#);
-    }
-
-    #[test]
-    fn the_environment_is_sorted_its_later_names_kept() {
-        let env: Vec<(OsString, OsString)> = [("Path", "a"), ("HOME", "h"), ("PATH", "b"), ("=C:", "C:\\")]
-            .iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-            .collect();
-        let block = environment(&env).unwrap();
-        let text = String::from_utf16(&block).unwrap();
-        assert_eq!(text, "=C:=C:\\\0HOME=h\0PATH=b\0\0");
-        assert_eq!(environment(&[]).unwrap(), [0, 0]);
-        assert!(environment(&[(OsString::from("A=B"), OsString::new())]).is_err());
-    }
 }

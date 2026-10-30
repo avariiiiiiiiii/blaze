@@ -855,8 +855,8 @@ fn find_key(
     // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
     // `parent` is the parent of a module of this crate's round-0 tree, made by the
     // `module_decls` that declared it (nameres-core.md §3): it goes only into this query's
-    // comparisons and into the keys of this crate's resolver queries (`child_key`), which are
-    // recomputed whenever the creating query is, as every value naming it is.
+    // comparisons, which are recomputed whenever the creating query is, as every value naming
+    // it is.
     let parent = unsafe { parent.to_static() };
     if parent == decl.module {
         return queries::child_key(db, key, module);

@@ -146,6 +146,7 @@
 
 > forwarded to format: the `blaze_cas::Columns` impls per persisted schema.
 > forwarded to cargo: the daemon calls `Store::encode_columns` right after `Store::open`.
+> answered by lane cargo: done at `crates/blaze-cargo/src/serve/daemon.rs` right after `Store::open`: `encode_columns` of `blaze_format::Spans::columns()` and `hir_def::item_tree::ItemTree::columns()`, the two schemas with columns today; a schema given columns later is one more line there. `blaze-format` added to `blaze-cargo/Cargo.toml`.
 
 ## Vendor zstd-safe and mark its dictionaries `Send` and `Sync` (everything is ours)
 

@@ -9,7 +9,7 @@ use crate::{
     next_solver::Region,
 };
 
-impl<'db> MirLowerCtx<'_, 'db> {
+impl<'db> MirLowerCtx<'_, '_, 'db> {
     /// A temporary is dropped before the ones that were made while computing its value.
     fn declare_last(&mut self, local: LocalId) {
         let scope = self.drop_scopes.iter_mut().rev().find(|it| it.locals.contains(&local));
@@ -64,7 +64,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         upgrade_rvalue: bool,
         adjustments: &[Adjustment],
     ) -> Result<'db, Option<(Place<'db>, BasicBlockId)>> {
-        let try_rvalue = |this: &mut MirLowerCtx<'_, 'db>| {
+        let try_rvalue = |this: &mut MirLowerCtx<'_, '_, 'db>| {
             if !upgrade_rvalue {
                 return Err(MirLowerError::MutatingRvalue);
             }
@@ -134,7 +134,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         expr_id: ExprId,
         upgrade_rvalue: bool,
     ) -> Result<'db, Option<(Place<'db>, BasicBlockId)>> {
-        let try_rvalue = |this: &mut MirLowerCtx<'_, 'db>| {
+        let try_rvalue = |this: &mut MirLowerCtx<'_, '_, 'db>| {
             if !upgrade_rvalue {
                 return Err(MirLowerError::MutatingRvalue);
             }
@@ -305,6 +305,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         ));
         let Some(current) = self.lower_call(
             index_fn_op,
+            // alloc: the call's arguments, kept in the body
             Box::new([
                 Operand { kind: OperandKind::Copy(place.store()), span: None },
                 index_operand,
@@ -354,6 +355,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         let mut result = self.temp(target_ty_ref, current, span)?.into();
         let Some(current) = self.lower_call(
             deref_fn_op,
+            // alloc: the call's arguments, kept in the body
             Box::new([Operand { kind: OperandKind::Copy(ref_place.store()), span: None }]),
             result,
             current,

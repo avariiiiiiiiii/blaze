@@ -64,6 +64,18 @@ impl SplitMix64 {
         n != 0 && self.below(n) == 0
     }
 
+    /// True with probability `p`: never at `p <= 0` and always at `p >= 1`, neither drawing.
+    #[inline]
+    pub fn chance(&mut self, p: f64) -> bool {
+        if p <= 0.0 {
+            false
+        } else if p >= 1.0 {
+            true
+        } else {
+            self.unit_f64() < p
+        }
+    }
+
     /// The low bit of a draw.
     #[inline]
     pub fn coin(&mut self) -> bool {
@@ -143,6 +155,11 @@ mod tests {
         assert!(!(0..1000).any(|_| rng.one_in(0)));
         assert!((0..1000).all(|_| rng.one_in(1)));
         assert!((0..1000).all(|_| (0.0..1.0).contains(&rng.unit_f64())));
+        let before = rng.state();
+        assert!(!rng.chance(0.0) && !rng.chance(-1.0) && rng.chance(1.0) && rng.chance(2.0));
+        assert_eq!(rng.state(), before, "the certain cases draw nothing");
+        let hits = (0..10_000).filter(|_| rng.chance(0.25)).count();
+        assert!((2000..3000).contains(&hits), "{hits} of 10000 at 0.25");
         assert_eq!(rng.pick::<u8>(&[]), None);
         assert_eq!(rng.pick(&[9]), Some(&9));
     }

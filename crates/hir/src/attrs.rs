@@ -430,8 +430,8 @@ fn resolve_assoc_or_field(
     name: Name,
     ns: Option<Namespace>,
 ) -> Option<DocLinkDef> {
-    let path = Path::from_known_path_with_no_generic(path);
-    let base_def = resolver.resolve_path_in_type_ns_fully(db, &path)?;
+    let path = Path::from_known_path_with_no_generic(&path);
+    let base_def = resolver.resolve_path_in_type_ns_fully(db, path)?;
 
     let handle_trait = |id: TraitId| {
         // Doc paths in this context may only resolve to an item of this trait
@@ -586,7 +586,7 @@ fn resolve_field(
     if let Some(Namespace::Types | Namespace::Macros) = ns {
         return None;
     }
-    def.fields(db).into_iter().find(|f| f.name(db) == name).map(DocLinkDef::Field)
+    def.fields_iter(db).find(|f| f.name(db) == name).map(DocLinkDef::Field)
 }
 
 fn as_module_def_if_namespace_matches(

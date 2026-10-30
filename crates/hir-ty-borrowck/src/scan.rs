@@ -175,7 +175,6 @@ impl<'db> Scan<'db> {
                     for statement in statements.iter() {
                         match statement {
                             Statement::Let { pat, type_ref, initializer, .. } => {
-                                let (pat, initializer) = (*pat, *initializer);
                                 let whole = store.pat(pat);
                                 if let Some(init) = initializer {
                                     let simple =
@@ -185,7 +184,7 @@ impl<'db> Scan<'db> {
                                         scrutinees.insert(binding, scrutinee);
                                     });
                                 }
-                                match *type_ref {
+                                match type_ref {
                                     Some(type_ref) => lets.push(Annotation {
                                         pat,
                                         type_ref,
@@ -198,15 +197,15 @@ impl<'db> Scan<'db> {
                                     None => (),
                                 }
                             }
-                            Statement::Expr { expr, .. } => match store.expr(*expr) {
+                            Statement::Expr { expr, .. } => match store.expr(expr) {
                                 Expr::Match { expr: of, .. } => {
-                                    let value = erased(infer.expr_ty(*expr));
+                                    let value = erased(infer.expr_ty(expr));
                                     if value != erased(infer.expr_ty(of)) {
-                                        statement_values.insert(*expr, Some(value));
+                                        statement_values.insert(expr, Some(value));
                                     }
                                 }
                                 _ => {
-                                    statement_values.insert(*expr, None);
+                                    statement_values.insert(expr, None);
                                 }
                             },
                             _ => (),

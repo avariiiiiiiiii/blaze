@@ -2,13 +2,34 @@
 //! and the database alone. The daemon implements [`Builder`] over the plane; the session drives
 //! it and turns what it reports into responses.
 
+use std::fmt;
+
 use blaze_vfs::{Change, View, ViewId};
 
 use crate::{Edit, Targets, Ub};
 
-/// A job of the build, one per request (one per candidate of a best-of-N).
+/// A job of the build, one per request (one per candidate of a best-of-N): a slot of the
+/// session's table of jobs ([`blaze_mem::Slab`]) and the generation the slot had when the job
+/// started.
+///
+/// A slot's generation is odd while it holds a job and goes up by one when the job finishes
+/// and again when the slot is reused, so a reused slot's job has its last one's generation
+/// plus two; a slot whose generation reaches `u32::MAX` is retired, never reused. No id is
+/// ever handed out twice, and one naming a finished job names nothing. Ids don't grow in start
+/// order: a freed slot is reused before a new one is made.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct JobId(pub u64);
+pub struct JobId {
+    pub slot: u32,
+    pub generation: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<JobId>() == 8);
+
+impl fmt::Display for JobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}v{}", self.slot, self.generation)
+    }
+}
 
 /// A view the session opened for a job, in both arenas that name open views. It stays open
 /// until the job finishes.

@@ -152,6 +152,33 @@ fn main() {
     );
 }
 
+/// rustc's `lookup_char_pos`: a byte order mark that starts the file is no column, and a `\r\n`
+/// ends a line as a `\n` does.
+#[test]
+fn line_and_column_after_a_byte_order_mark_and_crlf_lines() {
+    let first = "#[rustc_builtin_macro] macro_rules! column {() => {}} \
+        #[rustc_builtin_macro] macro_rules! line {() => {}} fn a() -> u32 { ";
+    let second = "fn b() -> (u32, u32) { (line!(), ";
+    let text = format!("\u{feff}{first}column!() }}\r\n{second}column!()) }}\r\n");
+    let db = TestDB::with_files(&text);
+    let mut placed = super::builtin_errors::macro_calls(&db)
+        .into_iter()
+        .map(|call| {
+            let written = call.loc(&db).to_node(&db).value.to_string();
+            (written, call.parse_macro_expansion(&db).value.0.syntax_node().to_string())
+        })
+        .collect::<Vec<_>>();
+    placed.sort();
+    let column = |before: &str| format!("{}u32", before.chars().count() + 1);
+    let mut expected = vec![
+        ("column!()".to_owned(), column(first)),
+        ("column!()".to_owned(), column(second)),
+        ("line!()".to_owned(), "2u32".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(placed, expected);
+}
+
 #[test]
 fn test_stringify_expand() {
     check(

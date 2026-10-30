@@ -2154,6 +2154,7 @@ coroutine body would make it once; that is a new query in `db.rs` (mem-db-infer'
 callers' files, so it is only noted here.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:30): `mir/held.rs` as written, except the tests draw from `blaze_ids::rng::SplitMix64` (the file's tests had moved to it; a `members` helper in place of the local `Rng`), and `// alloc:` notes on the result's three exact-size lists. `task(crate::db::MIR_TAG, ..)` as written. db.md's "dedup: bits: hir-ty `mir/held.rs`" had not landed; this replaces its `DenseBitSet` set with frame sets, so that section is met (no `DenseBitSet` outside the tests' reference). Waits on mem-db-infer.md 2 (`allocator_api`) and 3 (`MIR_TAG`), db-mem-infer-a's.
 
 ## `target_feature.rs` and `target_feature/tests.rs`
 

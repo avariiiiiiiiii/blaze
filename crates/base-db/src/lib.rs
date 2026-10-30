@@ -2,6 +2,7 @@
 //! roots and the crate graph.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(allocator_api)]
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]
@@ -35,7 +36,7 @@ use std::{
 pub use crate::{
     change::FileChange,
     content::{CFG_OPTIONS_DOMAIN, InputId, cfg_options_content},
-    db::{Db, Reader, RunOrder, Shared, run_on_pool, set_run_order},
+    db::{Db, Reader, RunOrder, Shared, executions, run_on_pool, set_run_order},
     editioned_file_id::EditionedFileId,
     files::Files,
     input::{

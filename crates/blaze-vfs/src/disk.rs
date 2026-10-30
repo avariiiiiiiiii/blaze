@@ -376,7 +376,7 @@ mod tests {
         let mut bytes = Vec::new();
         disks.encode(&mut bytes);
         let len = bytes.len();
-        let map = blaze_core::Mapping(std::sync::Arc::new(bytes));
+        let map = blaze_core::Mapping::copy(&bytes);
         Disks::open(Section::new(map, 0..len).unwrap()).unwrap()
     }
 
@@ -497,7 +497,7 @@ mod tests {
         let mut bytes = Vec::new();
         disks.encode(&mut bytes);
         for cut in 0..bytes.len() {
-            let map = blaze_core::Mapping(std::sync::Arc::new(bytes[..cut].to_vec()));
+            let map = blaze_core::Mapping::copy(&bytes[..cut]);
             assert!(Disks::open(Section::new(map, 0..cut).unwrap()).is_err(), "cut at {cut}");
         }
     }

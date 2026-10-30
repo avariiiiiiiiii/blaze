@@ -192,6 +192,20 @@ fn token_tree(node: &SyntaxNode) -> tt::TopSubtree {
     syntax_node_to_token_tree(node, DummyTestSpanMap, DUMMY, DocCommentDesugarMode::Mbe)
 }
 
+/// The sink's text buffer is the thread's string scratch: after a conversion it is back on the
+/// shelf, as long as the longest token it wrote, for the next conversion to take instead of
+/// allocating its own.
+#[test]
+fn a_sink_gives_its_text_buffer_back() {
+    let text = "fn f() { let a_long_identifier = 1; }";
+    let node = ast::SourceFile::parse(text, Edition::CURRENT).syntax_node();
+    let tree = token_tree(&node);
+    let mut edition = |_: span::SyntaxContext| Edition::CURRENT;
+    drop(token_tree_to_syntax_node(&tree, parser::TopEntryPoint::SourceFile, &mut edition));
+    let buf = blaze_mem::scratch::lend_string();
+    assert!(buf.capacity() >= "a_long_identifier".len(), "the sink's buffer is on the shelf");
+}
+
 #[test]
 fn an_outline_has_the_token_trees_of_a_full_parse() {
     for (path, text) in corpus() {

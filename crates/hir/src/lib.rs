@@ -18,6 +18,7 @@
 //! <https://www.tedinski.com/2018/02/06/system-boundaries.html>.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(allocator_api)]
 #![recursion_limit = "512"]
 
 extern crate rustc_type_ir;
@@ -37,9 +38,13 @@ pub mod symbols;
 pub mod term_search;
 
 mod display;
+mod scratch;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 #[doc(hidden)]
 pub use hir_def::ModuleId;
@@ -221,7 +226,8 @@ pub use {
     // FIXME: Properly encapsulate mir
     hir_ide::mir,
     hir_ide::{
-        CastError, PointerCast, attach_db, attach_db_allow_change, const_macro,
+        CastError, EditionLint, PointerCast, ReceiverAdjustment, attach_db,
+        attach_db_allow_change, const_macro,
         consteval::ConstEvalError,
         display::{ClosureStyle, DisplayTarget, HirDisplay, HirDisplayError, HirWrite},
         drop::DropGlue,
@@ -287,16 +293,16 @@ impl Crate {
     }
 
     pub fn dependencies(self, db: &Db) -> Vec<CrateDependency> {
-        self.id
-            .data(db)
-            .dependencies
-            .iter()
-            .map(|dep| {
-                let krate = Crate { id: dep.crate_id };
-                let name = dep.as_name();
-                CrateDependency { krate, name }
-            })
-            .collect()
+        self.dependencies_iter(db).collect()
+    }
+
+    /// [`Crate::dependencies`], without the vector.
+    pub fn dependencies_iter(self, db: &Db) -> impl ExactSizeIterator<Item = CrateDependency> + '_ {
+        self.id.data(db).dependencies.iter().map(|dep| {
+            let krate = Crate { id: dep.crate_id };
+            let name = dep.as_name();
+            CrateDependency { krate, name }
+        })
     }
 
     pub fn reverse_dependencies(self, db: &Db) -> Vec<Crate> {
@@ -329,8 +335,12 @@ impl Crate {
     }
 
     pub fn modules(self, db: &Db) -> Vec<Module> {
-        let def_map = crate_def_map(db, self.id);
-        def_map.modules(db).map(|(id, _)| id.into()).collect()
+        self.modules_iter(db).collect()
+    }
+
+    /// [`Crate::modules`], without the vector.
+    pub fn modules_iter(self, db: &Db) -> impl Iterator<Item = Module> + '_ {
+        crate_def_map(db, self.id).modules(db).map(|(id, _)| id.into())
     }
 
     pub fn root_file(self, db: &Db) -> FileId {
@@ -645,13 +655,7 @@ impl Module {
     /// Iterates over all child modules.
     pub fn children(self, db: &Db) -> impl Iterator<Item = Module> {
         let def_map = self.id.def_map(db);
-        let children = def_map
-            .module(db, self.id)
-            .children(db)
-            .values()
-            .map(|module_id| Module { id: *module_id })
-            .collect::<Vec<_>>();
-        children.into_iter()
+        def_map.module(db, self.id).children(db).values().map(|module_id| Module { id: *module_id })
     }
 
     /// Finds a parent module.
@@ -775,19 +779,26 @@ impl Module {
     }
 
     pub fn declarations(self, db: &Db) -> Vec<ModuleDef> {
-        let def_map = self.id.def_map(db);
-        let scope = def_map.module(db, self.id).scope(db);
+        self.declarations_iter(db).collect()
+    }
+
+    /// [`Module::declarations`], without the vector.
+    pub fn declarations_iter(self, db: &Db) -> impl Iterator<Item = ModuleDef> + '_ {
+        let scope = self.id.def_map(db).module(db, self.id).scope(db);
         scope
             .declarations()
             .map(ModuleDef::from)
             .chain(scope.unnamed_consts().map(|id| ModuleDef::Const(Const::from(id))))
-            .collect()
     }
 
     pub fn legacy_macros(self, db: &Db) -> Vec<Macro> {
-        let def_map = self.id.def_map(db);
-        let scope = def_map.module(db, self.id).scope(db);
-        scope.legacy_macros().flat_map(|(_, it)| it).map(|&it| it.into()).collect()
+        self.legacy_macros_iter(db).collect()
+    }
+
+    /// [`Module::legacy_macros`], without the vector.
+    pub fn legacy_macros_iter(self, db: &Db) -> impl Iterator<Item = Macro> + '_ {
+        let scope = self.id.def_map(db).module(db, self.id).scope(db);
+        scope.legacy_macros().flat_map(|(_, it)| it).map(|&it| it.into())
     }
 
     pub fn extern_blocks(self, db: &Db) -> Vec<ExternBlock> {
@@ -811,9 +822,13 @@ impl Module {
     }
 
     pub fn impl_defs(self, db: &Db) -> Vec<Impl> {
-        let def_map = self.id.def_map(db);
-        let scope = def_map.module(db, self.id).scope(db);
-        scope.impls().map(Impl::from).chain(scope.builtin_derive_impls().map(Impl::from)).collect()
+        self.impl_defs_iter(db).collect()
+    }
+
+    /// [`Module::impl_defs`], without the vector.
+    pub fn impl_defs_iter(self, db: &Db) -> impl Iterator<Item = Impl> + '_ {
+        let scope = self.id.def_map(db).module(db, self.id).scope(db);
+        scope.impls().map(Impl::from).chain(scope.builtin_derive_impls().map(Impl::from))
     }
 
     /// Finds a path that can be used to refer to the given item from within
@@ -989,12 +1004,12 @@ impl Struct {
     }
 
     pub fn fields(self, db: &Db) -> Vec<Field> {
-        self.id
-            .fields(db)
-            .fields()
-            .iter()
-            .map(|(id, _)| Field { parent: self.into(), id })
-            .collect()
+        self.fields_iter(db).collect()
+    }
+
+    /// [`Self::fields`], without the vector.
+    pub fn fields_iter(self, db: &Db) -> impl ExactSizeIterator<Item = Field> + '_ {
+        self.id.fields(db).fields().iter().map(move |(id, _)| Field { parent: self.into(), id })
     }
 
     pub fn ty(self, db: &Db) -> Type<'_> {
@@ -1065,12 +1080,12 @@ impl Union {
     }
 
     pub fn fields(self, db: &Db) -> Vec<Field> {
-        self.id
-            .fields(db)
-            .fields()
-            .iter()
-            .map(|(id, _)| Field { parent: self.into(), id })
-            .collect()
+        self.fields_iter(db).collect()
+    }
+
+    /// [`Self::fields`], without the vector.
+    pub fn fields_iter(self, db: &Db) -> impl ExactSizeIterator<Item = Field> + '_ {
+        self.id.fields(db).fields().iter().map(move |(id, _)| Field { parent: self.into(), id })
     }
     pub fn is_unstable(self, db: &Db) -> bool {
         AttrFlags::query(db, self.id.into()).contains(AttrFlags::IS_UNSTABLE)
@@ -1100,7 +1115,12 @@ impl Enum {
     }
 
     pub fn variants(self, db: &Db) -> Vec<EnumVariant> {
-        self.id.enum_variants(db).variants.values().map(|&(id, _)| EnumVariant { id }).collect()
+        self.variants_iter(db).collect()
+    }
+
+    /// [`Enum::variants`], without the vector.
+    pub fn variants_iter(self, db: &Db) -> impl ExactSizeIterator<Item = EnumVariant> + '_ {
+        self.id.enum_variants(db).variants.values().map(|&(id, _)| EnumVariant { id })
     }
 
     pub fn num_variants(self, db: &Db) -> usize {
@@ -1154,7 +1174,7 @@ impl Enum {
 
     /// Returns true if at least one variant of this enum is a non-unit variant.
     pub fn is_data_carrying(self, db: &Db) -> bool {
-        self.variants(db).iter().any(|v| !matches!(v.kind(db), StructKind::Unit))
+        self.variants_iter(db).any(|v| !matches!(v.kind(db), StructKind::Unit))
     }
 
     pub fn layout<'db>(self, db: &'db Db) -> Result<Layout<'db>, LayoutError> {
@@ -1197,12 +1217,12 @@ impl EnumVariant {
     }
 
     pub fn fields(self, db: &Db) -> Vec<Field> {
-        self.id
-            .fields(db)
-            .fields()
-            .iter()
-            .map(|(id, _)| Field { parent: self.into(), id })
-            .collect()
+        self.fields_iter(db).collect()
+    }
+
+    /// [`Self::fields`], without the vector.
+    pub fn fields_iter(self, db: &Db) -> impl ExactSizeIterator<Item = Field> + '_ {
+        self.id.fields(db).fields().iter().map(move |(id, _)| Field { parent: self.into(), id })
     }
 
     pub fn kind(self, db: &Db) -> StructKind {
@@ -1363,6 +1383,15 @@ impl Variant {
             Variant::Union(it) => it.fields(db),
             Variant::EnumVariant(it) => it.fields(db),
         }
+    }
+
+    /// [`Variant::fields`], without the vector.
+    pub fn fields_iter(self, db: &Db) -> impl ExactSizeIterator<Item = Field> + '_ {
+        VariantId::from(self)
+            .fields(db)
+            .fields()
+            .iter()
+            .map(move |(id, _)| Field { parent: self, id })
     }
 
     pub fn module(self, db: &Db) -> Module {
@@ -2439,11 +2468,16 @@ impl Trait {
     }
 
     pub fn items(self, db: &Db) -> Vec<AssocItem> {
-        self.id.trait_items(db).items.iter().map(|(_name, it)| (*it).into()).collect()
+        self.items_iter(db).collect()
+    }
+
+    /// [`Trait::items`], without the vector.
+    pub fn items_iter(self, db: &Db) -> impl ExactSizeIterator<Item = AssocItem> + '_ {
+        self.id.trait_items(db).items.iter().map(|(_name, it)| (*it).into())
     }
 
     pub fn items_with_supertraits(self, db: &Db) -> Vec<AssocItem> {
-        self.all_supertraits(db).into_iter().flat_map(|tr| tr.items(db)).collect()
+        self.all_supertraits(db).into_iter().flat_map(|tr| tr.items_iter(db)).collect()
     }
 
     pub fn is_auto(self, db: &Db) -> bool {
@@ -4172,21 +4206,22 @@ impl Impl {
     }
 
     pub fn items(self, db: &Db) -> Vec<AssocItem> {
+        self.items_iter(db).collect()
+    }
+
+    /// [`Impl::items`], without the vector.
+    pub fn items_iter(self, db: &Db) -> impl Iterator<Item = AssocItem> + '_ {
         match self.id {
             AnyImplId::ImplId(id) => {
-                id.impl_items(db).items.iter().map(|&(_, it)| it.into()).collect()
+                Either::Left(id.impl_items(db).items.iter().map(|&(_, it)| it.into()))
             }
-            AnyImplId::BuiltinDeriveImplId(impl_) => impl_
-                .loc(db)
-                .trait_
-                .all_methods()
-                .iter()
-                .map(|&method| {
+            AnyImplId::BuiltinDeriveImplId(impl_) => Either::Right(
+                impl_.loc(db).trait_.all_methods().iter().map(move |&method| {
                     AssocItem::Function(Function {
                         id: AnyFunctionId::BuiltinDeriveImplMethod { method, impl_ },
                     })
-                })
-                .collect(),
+                }),
+            ),
         }
     }
 

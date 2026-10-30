@@ -357,9 +357,9 @@ fn let_bound_block_value(ctx: &Ctx<'_, '_>, expr: ExprId) -> bool {
             matches!(
                 statement,
                 Statement::Let { pat, initializer: Some(init), .. }
-                    if matches!(ctx.store.pat(*pat), Pat::Bind { subpat: None, .. })
-                        && matches!(ctx.store.expr(*init), Expr::Block { .. })
-                        && value(*init) == expr
+                    if matches!(ctx.store.pat(pat), Pat::Bind { subpat: None, .. })
+                        && matches!(ctx.store.expr(init), Expr::Block { .. })
+                        && value(init) == expr
             )
         })
     })
@@ -3217,7 +3217,7 @@ fn guard_borrows(
                 Expr::Let { pat, .. } => pats.push(pat),
                 Expr::Block { statements, .. } => {
                     pats.extend(statements.iter().filter_map(|statement| match statement {
-                        Statement::Let { pat, .. } => Some(*pat),
+                        Statement::Let { pat, .. } => Some(pat),
                         _ => None,
                     }))
                 }

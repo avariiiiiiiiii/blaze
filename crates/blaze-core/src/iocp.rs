@@ -569,6 +569,17 @@ impl Iocp {
                 self.put(request);
                 Ok(())
             }
+            // On this thread, as the port's files are opened: its path made in the driver's
+            // buffers, where a thread's `sys::path` would allocate one per call.
+            Effect::Times { file, modified_ns, tag } => {
+                let set = self.paths.of(&file).and_then(|wide| files::set_times_of(wide, modified_ns));
+                set.map_err(|error| {
+                    // alloc: an error path.
+                    io::Error::new(error.kind(), format!("{}: {error}", self.root.join(file.as_str()).display()))
+                })?;
+                self.ready.push(Completion { tag, done: Done::Timed });
+                Ok(())
+            }
             effect @ (Effect::Write { .. }
             | Effect::Rename { .. }
             | Effect::Clone { .. }
@@ -1614,7 +1625,7 @@ mod tests {
         })
     }
 
-    fn run(driver: &mut dyn Driver, effects: Vec<Effect>) -> BTreeMap<u64, Done> {
+    fn run(driver: &mut impl Driver, effects: Vec<Effect>) -> BTreeMap<u64, Done> {
         let mut effects = effects;
         let mut seen = BTreeMap::new();
         run_until_idle(driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
@@ -1872,7 +1883,7 @@ mod tests {
     #[test]
     fn files_end_as_on_threads() {
         let file = name("vfs/journal");
-        let script = |driver: &mut dyn Driver| {
+        fn script(driver: &mut impl Driver, file: &FileName) -> Vec<String> {
             let mut effects = vec![Effect::Write { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
             let mut seen = Vec::new();
             run_until_idle(driver, &mut effects, |done, effects| {
@@ -1913,11 +1924,11 @@ mod tests {
                 effects.push(next);
             });
             seen
-        };
+        }
         let (ours, theirs) = (dir("files"), dir("files-threads"));
         let mut iocp = Iocp::new(&ours, 2).unwrap();
-        let ran = script(&mut iocp);
-        let threads = script(&mut Threads::new(&theirs, 2));
+        let ran = script(&mut iocp, &file);
+        let threads = script(&mut Threads::new(&theirs, 2), &file);
         // Shared blocks on ReFS; elsewhere an error naming the file system.
         assert!(ran[8] == "failed" || ran[8] == format!("{:?}", Done::Cloned), "{}", ran[8]);
         assert_eq!(ran, threads);

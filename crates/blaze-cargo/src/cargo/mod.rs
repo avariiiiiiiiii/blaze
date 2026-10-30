@@ -52,7 +52,14 @@ pub use toolchain::{ours_commit, ours_says};
 pub use units::Record;
 
 /// `blaze-engine cargo ...`: runs the command and ends with the status cargo would end with.
-pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+///
+/// # Safety
+///
+/// No other thread of the process may run when it is called: before it starts any, it sets
+/// the process's environment for the processes it starts, and a thread reading it meanwhile
+/// through the C library's `getenv` (which std's lock does not cover) could read a variable
+/// as it is freed.
+pub unsafe fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let args: Vec<String> = args.collect();
     let asked = Asked::parse(own::subcommand_first(args));
     if !matches!(asked, Asked::Build(_) | Asked::Cache(_)) {
@@ -74,13 +81,21 @@ pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
             std::process::exit(FAILED);
         }
         let cwd = std::env::current_dir()?;
-        layout::first_unless_chosen(&cwd, &asked.flags.config, &asked.flags.unstable);
+        // SAFETY: no other thread runs, by this function's contract, and nothing above starts
+        // one.
+        unsafe { layout::first_unless_chosen(&cwd, &asked.flags.config, &asked.flags.unstable) };
     }
-    if let Asked::Build(asked) = &asked
-        && let Err(why) = toolchain::settle().and_then(|_| backend::follow_profile(asked))
-    {
-        say::error(&why);
-        std::process::exit(FAILED);
+    if let Asked::Build(asked) = &asked {
+        // SAFETY: as above.
+        let settled = unsafe { toolchain::settle() };
+        let followed = settled.and_then(|_| {
+            // SAFETY: as above: `settle` joined the threads it started.
+            unsafe { backend::follow_profile(asked) }
+        });
+        if let Err(why) = followed {
+            say::error(&why);
+            std::process::exit(FAILED);
+        }
     }
     if let Asked::Build(build) = &asked
         && let Ok(cwd) = std::env::current_dir()
@@ -100,20 +115,25 @@ pub fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         Asked::Why(args) => why::command(&args)?,
         Asked::Watch => watch()?,
         Asked::Ui { open } => ui(open)?,
-        Asked::Toolchain { path } => match toolchain::settle() {
-            Ok(chosen) if path => {
-                println!("{}", chosen.dir().display());
-                0
+        Asked::Toolchain { path } => {
+            // SAFETY: no other thread runs, by this function's contract, and nothing above
+            // starts one for this command.
+            let settled = unsafe { toolchain::settle() };
+            match settled {
+                Ok(chosen) if path => {
+                    println!("{}", chosen.dir().display());
+                    0
+                }
+                Ok(chosen) => {
+                    println!("blaze builds with {chosen}");
+                    0
+                }
+                Err(why) => {
+                    say::error(&why);
+                    FAILED
+                }
             }
-            Ok(chosen) => {
-                println!("blaze builds with {chosen}");
-                0
-            }
-            Err(why) => {
-                say::error(&why);
-                FAILED
-            }
-        },
+        }
         Asked::Lock(args) => fetches::command(&args)?,
         Asked::Pin(args) => (crate::engine::get().pin)(&args)?,
         Asked::Help => {

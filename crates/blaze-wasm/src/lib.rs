@@ -36,7 +36,7 @@ use hir_ty_codegen::{
     CodegenError, CodegenUnit, Rejections, Roots, SymbolResolver, exported_symbol,
 };
 use ide_db::{
-    ChangeWithProcMacros, RootDatabase,
+    ChangeWithProcMacros, RootDatabase, RootDatabaseExt as _,
     base_db::{
         CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, DependencyBuilder, Env,
         LangCrateOrigin, SourceRoot, TargetKind,
@@ -214,7 +214,6 @@ impl Compiler {
         change.set_crate_graph(project.graph);
         change.set_proc_macros(project.macros);
         self.db.apply_change(change);
-        self.db.enable_proc_attr_macros();
         self.missed = project.missed;
         Ok(())
     }

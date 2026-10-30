@@ -10,6 +10,11 @@
 //! one merge of four sorted columns (compact entries, FDEs, functions, ends of covered ranges)
 //! into the entries; a second-level page is compressed (4-byte entries indexing the common
 //! encodings or the page's own, as ld64 writes) unless a regular page holds more entries.
+//!
+//! An image linked again in place ([`build_kept`]) keeps the columns, rows and pages of its last
+//! table ([`Last`]) and, when every change keeps each row in its place, rewrites only the rows,
+//! LSDA entries, pages and first-level entries the change touched: O(change) but for the copy
+//! of the table returned.
 
 #![forbid(unsafe_code)]
 
@@ -21,7 +26,7 @@ use blaze_ids::radix;
 use smallvec::SmallVec;
 
 use crate::LinkError;
-use crate::model::{Bind, Class, Function, Placed, Region};
+use crate::model::{Bind, Class, Delta, Function, Placed, Region};
 
 const VERSION: u32 = 1;
 const HEADER: u64 = 28;
@@ -75,20 +80,128 @@ pub(super) fn bound(functions: u64, fdes: u64, compact: u64) -> u64 {
         + (COMPRESSED_HEADER - PAGE_HEADER)
 }
 
+/// What the last `__unwind_info` was made of, for an image linked again in place.
+#[derive(Default)]
+pub(super) struct Last {
+    /// The [`Placed::synthesis`] the table is of: 0, which no synthesis is, when there is none.
+    synthesis: u64,
+    base: u64,
+    dwarf_mode: u32,
+    bytes: Vec<u8>,
+    /// Each function's address and size in [`Placed::functions`]' order, which was address
+    /// order when `sorted`.
+    functions: Vec<(u64, u64)>,
+    sorted: bool,
+    /// `__eh_frame`'s records in order, its CIEs' FDE pointer encodings by offset, where its
+    /// scan stopped, and whether two FDEs started at one address.
+    records: Vec<Record>,
+    cies: Vec<(usize, u8)>,
+    eh_end: usize,
+    dups: bool,
+    /// The merge's columns, as [`full`] sorts them.
+    fdes: Vec<Fde>,
+    covered: Vec<Covered>,
+    ends: Vec<u64>,
+    /// The `__compact_unwind` regions, and each of their entries' function (0: dead) and end
+    /// in input order; whether [`Placed::binds`] was in address order.
+    compact: Vec<CompactRegion>,
+    entries: Vec<(u64, u64)>,
+    binds_sorted: bool,
+    personalities: Vec<(Held, u32)>,
+    rows: Vec<Row>,
+    lsdas: Vec<(u32, u32)>,
+    /// The address the sentinel is the offset of.
+    end: u64,
+    encodings: Encodings,
+    common: Vec<(u32, u32)>,
+    pages: Vec<Page>,
+    index_at: u64,
+    lsda_at: u64,
+    /// A patch's buffers, kept for the next: the addresses whose entries changed, a window's
+    /// rows and LSDAs, the rows rewritten, the common encodings counted again.
+    changed: Vec<u64>,
+    window: Vec<Row>,
+    window_lsdas: Vec<(u32, u32)>,
+    dirty: Vec<usize>,
+    recount: Vec<(u32, u32)>,
+}
+
+/// A `__compact_unwind` region: its index in [`Placed::regions`], its range, its first
+/// entry's index in [`Last::entries`], and the range of [`Placed::binds`] in it.
+#[derive(Clone, Copy)]
+struct CompactRegion {
+    index: usize,
+    addr: u64,
+    size: u64,
+    first: usize,
+    binds: (usize, usize),
+}
+
+/// A record of `__eh_frame`: its offset and, of an FDE, the range it covers (0..0 for a dead
+/// one); a CIE's `start` is past its `end`.
+#[derive(Clone, Copy)]
+struct Record {
+    at: u64,
+    start: u64,
+    end: u64,
+}
+
+impl Record {
+    fn cie(&self) -> bool {
+        self.start > self.end
+    }
+}
+
 /// `__unwind_info` for `placed`, whose `__TEXT` starts at `placed.plan.base`.
 pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkError> {
-    let dwarf_mode = match arch {
-        Arch::Aarch64 => ARM64_MODE_DWARF,
-        Arch::X86_64 => X86_64_MODE_DWARF,
-        Arch::Wasm32 => {
-            // alloc: error path
-            return Err(error("__unwind_info: wasm32 has no compact unwind encoding".into()));
-        }
-    };
+    full(placed, arch, None)
+}
+
+/// `build`, patching `last`'s table when `placed.delta` allows it; `last` then holds this one.
+pub(super) fn build_kept(
+    placed: &Placed<'_>,
+    arch: Arch,
+    last: &mut Last,
+) -> Result<Vec<u8>, LinkError> {
+    kept(placed, arch, last).map(|(bytes, _)| bytes)
+}
+
+/// [`build_kept`]'s table, and whether it was patched rather than built whole.
+fn kept(placed: &Placed<'_>, arch: Arch, last: &mut Last) -> Result<(Vec<u8>, bool), LinkError> {
+    let from = std::mem::take(&mut last.synthesis);
+    if let Some(delta) = placed.delta
+        && delta.patches(from, &[delta.functions])
+        && patch(placed, arch, delta, last).is_some()
+    {
+        last.synthesis = placed.synthesis;
+        // alloc: the table the writer returns, once per link at its exact size
+        return Ok((last.bytes.to_vec(), true));
+    }
+    let bytes = full(placed, arch, Some(&mut *last))?;
+    last.synthesis = placed.synthesis;
+    Ok((bytes, false))
+}
+
+fn dwarf_mode(arch: Arch) -> Result<u32, LinkError> {
+    match arch {
+        Arch::Aarch64 => Ok(ARM64_MODE_DWARF),
+        Arch::X86_64 => Ok(X86_64_MODE_DWARF),
+        // alloc: error path
+        Arch::Wasm32 => Err(error("__unwind_info: wasm32 has no compact unwind encoding".into())),
+    }
+}
+
+/// The whole table, and into `keep` what [`patch`] needs of it.
+fn full(
+    placed: &Placed<'_>,
+    arch: Arch,
+    mut keep: Option<&mut Last>,
+) -> Result<Vec<u8>, LinkError> {
+    let dwarf_mode = dwarf_mode(arch)?;
     let base = placed.plan.base;
-    let fdes = fdes(placed)?;
+    let fdes = fdes(placed, keep.as_deref_mut())?;
     let Compact { mut covered, mut ends, personalities, bytes: compact_bytes } =
-        compact(placed, dwarf_mode, &fdes)?;
+        compact(placed, dwarf_mode, &fdes, keep.as_deref_mut())?;
     ends.extend(fdes.iter().map(|it| it.end));
     if !covered.is_sorted_by_key(|it| it.addr) {
         radix::sort_copy_by_key(&mut covered, |it| it.addr);
@@ -96,8 +209,8 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
     if !ends.is_sorted() {
         radix::sort(&mut ends);
     }
-    let Rows { rows, lsdas, last } = rows(placed, dwarf_mode, &covered, &fdes, &ends)?;
-    let sentinel = offset(base, last, "the end of the last function")?;
+    let Rows { rows, lsdas, last: end, sorted } = rows(placed, dwarf_mode, &covered, &fdes, &ends)?;
+    let sentinel = offset(base, end, "the end of the last function")?;
     if rows.len() as u64 > u64::from(u32::MAX) / COMPRESSED_ENTRY {
         // alloc: error path
         return Err(error(format!(
@@ -110,15 +223,20 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
     for row in rows.iter().filter(|it| it.encoding & MODE_MASK != dwarf_mode) {
         encodings.count(row.encoding);
     }
-    let common = encodings.common();
-    let pages = encodings.pages(&rows, common.len(), dwarf_mode);
+    let mut common = Vec::with_capacity(encodings.len);
+    encodings.common(&mut common);
+    let mut pages = encodings.pages(&rows, common.len(), dwarf_mode);
 
     let common_at = HEADER;
     let personalities_at = common_at + 4 * common.len() as u64;
     let index_at = personalities_at + 4 * personalities.len() as u64;
     let lsda_at = index_at + INDEX_ENTRY * (pages.len() as u64 + 1);
     let pages_at = lsda_at + LSDA_ENTRY * lsdas.len() as u64;
-    let len = pages_at + pages.iter().map(Page::len).sum::<u64>();
+    let mut len = pages_at;
+    for page in &mut pages {
+        page.at = len;
+        len += page.len();
+    }
     let limit = bound(placed.functions.len() as u64, fdes.len() as u64, compact_bytes);
     if len > limit {
         // alloc: error path
@@ -159,7 +277,6 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
     for &(_, cell) in &personalities {
         out.u32(cell);
     }
-    let mut page_at = pages_at;
     let mut lsda_index = 0usize;
     for page in &pages {
         let first = rows[page.first].function;
@@ -167,9 +284,8 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
             lsda_index += 1;
         }
         out.u32(first);
-        out.u32(small(page_at));
+        out.u32(small(page.at));
         out.u32(small(lsda_at + LSDA_ENTRY * lsda_index as u64));
-        page_at += page.len();
     }
     out.u32(sentinel);
     out.u32(0);
@@ -179,41 +295,514 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
         out.u32(lsda);
     }
     for page in &pages {
-        let rows = &rows[page.first..page.first + page.count];
-        if !page.compressed {
-            out.u32(SECOND_LEVEL_REGULAR);
-            out.u16(PAGE_HEADER as u16);
-            out.u16(rows.len() as u16);
-            for row in rows {
-                out.u32(row.function);
-                out.u32(row.encoding);
-            }
-            continue;
-        }
-        let entries = COMPRESSED_ENTRY as usize * rows.len();
-        out.u32(SECOND_LEVEL_COMPRESSED);
-        out.u16(COMPRESSED_HEADER as u16);
-        out.u16(rows.len() as u16);
-        out.u16((COMPRESSED_HEADER as usize + entries) as u16);
-        out.u16(page.locals as u16);
-        let locals_at = out.at + entries;
-        let first = rows[0].function;
-        let mut next = common.len();
-        encodings.stamp += 1;
-        for row in rows {
-            let dwarf = row.encoding & MODE_MASK == dwarf_mode;
-            let (index, new) = encodings.index(row.encoding, dwarf, next);
-            if new {
-                out.put(locals_at + 4 * (next - common.len()), row.encoding);
-                next += 1;
-            }
-            out.u32((row.function - first) | (u32::from(index) << 24));
-        }
-        debug_assert_eq!(next - common.len(), page.locals);
-        out.at = locals_at + 4 * page.locals;
+        write_page(&mut out, &rows, page, common.len(), &mut encodings, dwarf_mode);
     }
     debug_assert_eq!(out.at as u64, len);
+    if let Some(last) = keep {
+        last.base = base;
+        last.dwarf_mode = dwarf_mode;
+        last.bytes.clear();
+        last.bytes.extend_from_slice(&bytes);
+        last.functions.clear();
+        last.functions.extend(placed.functions.iter().map(|it| (it.addr, it.size)));
+        last.sorted = sorted;
+        last.fdes = fdes;
+        last.covered = covered;
+        last.ends = ends;
+        last.personalities = personalities;
+        last.rows = rows;
+        last.lsdas = lsdas;
+        last.end = end;
+        last.encodings = encodings;
+        last.common = common;
+        last.pages = pages;
+        last.index_at = index_at;
+        last.lsda_at = lsda_at;
+    }
     Ok(bytes)
+}
+
+/// Writes `page` of `rows` at `out.at`, and moves `out.at` past it.
+fn write_page(
+    out: &mut Out<'_>,
+    rows: &[Row],
+    page: &Page,
+    common: usize,
+    encodings: &mut Encodings,
+    dwarf_mode: u32,
+) {
+    let rows = &rows[page.first..page.first + page.count];
+    if !page.compressed {
+        out.u32(SECOND_LEVEL_REGULAR);
+        out.u16(PAGE_HEADER as u16);
+        out.u16(rows.len() as u16);
+        for row in rows {
+            out.u32(row.function);
+            out.u32(row.encoding);
+        }
+        return;
+    }
+    let entries = COMPRESSED_ENTRY as usize * rows.len();
+    out.u32(SECOND_LEVEL_COMPRESSED);
+    out.u16(COMPRESSED_HEADER as u16);
+    out.u16(rows.len() as u16);
+    out.u16((COMPRESSED_HEADER as usize + entries) as u16);
+    out.u16(page.locals as u16);
+    let locals_at = out.at + entries;
+    let first = rows[0].function;
+    let mut next = common;
+    encodings.stamp += 1;
+    for row in rows {
+        let dwarf = row.encoding & MODE_MASK == dwarf_mode;
+        let (index, new) = encodings.index(row.encoding, dwarf, next);
+        if new {
+            out.put(locals_at + 4 * (next - common), row.encoding);
+            next += 1;
+        }
+        out.u32((row.function - first) | (u32::from(index) << 24));
+    }
+    debug_assert_eq!(next - common, page.locals);
+    out.at = locals_at + 4 * page.locals;
+}
+
+/// Patches `last`'s table into `placed`'s, which `delta` says how it differs from; `None` where
+/// a patch would not be exact, and `last` is to be built again. Exact when every row the
+/// changes touch keeps its place: as many rows from each changed address to the first
+/// unchanged entry after it, each with an LSDA where it had one, every page split as before
+/// over the same common encodings and personalities, and each changed FDE and compact entry
+/// alone at its address and still in order in its column.
+fn patch(placed: &Placed<'_>, arch: Arch, delta: &Delta<'_>, last: &mut Last) -> Option<()> {
+    let dwarf_mode = dwarf_mode(arch).ok()?;
+    let functions = placed.functions;
+    if dwarf_mode != last.dwarf_mode
+        || placed.plan.base != last.base
+        || !last.sorted
+        || !last.binds_sorted
+        || functions.len() != last.functions.len()
+    {
+        return None;
+    }
+    last.changed.clear();
+    // The greatest end the changes removed and the greatest they made: the sentinel's.
+    let (mut gone, mut came) = (0u64, 0u64);
+    for splice in delta.functions {
+        let (from, to) = (splice.new.start as usize, splice.new.end as usize);
+        let old = last.functions.get_mut(splice.old.start as usize..splice.old.end as usize)?;
+        let new = functions.get(from..to)?;
+        for (old, new) in old.iter_mut().zip(new) {
+            if old.0 != new.addr {
+                last.changed.push(old.0);
+                last.changed.push(new.addr);
+            }
+            gone = gone.max(old.0.saturating_add(old.1));
+            came = came.max(new.addr.saturating_add(new.size));
+            *old = (new.addr, new.size);
+        }
+        let edges = &functions[from.saturating_sub(1)..(to + 1).min(functions.len())];
+        if !edges.is_sorted_by_key(|it| it.addr) {
+            return None;
+        }
+    }
+
+    // A personality cell's bind is part of its entry: none may come, go or move.
+    let binds = placed.binds;
+    for splice in delta.binds {
+        let (old_from, old_to) = (splice.old.start as usize, splice.old.end as usize);
+        if last.compact.iter().any(|it| old_from < it.binds.1 && it.binds.0 < old_to) {
+            return None;
+        }
+        let (from, to) = (splice.new.start as usize, splice.new.end as usize);
+        let new = binds.get(from..to)?;
+        let in_compact = |addr: u64| {
+            last.compact.iter().any(|it| addr >= it.addr && addr - it.addr < it.size)
+        };
+        if new.iter().any(|it| in_compact(it.addr)) {
+            return None;
+        }
+        let edges = &binds[from.saturating_sub(1)..(to + 1).min(binds.len())];
+        if !edges.is_sorted_by_key(|it| it.addr) {
+            return None;
+        }
+    }
+    if !delta.binds.is_empty() {
+        for region in &mut last.compact {
+            let from = binds.partition_point(|it| it.addr < region.addr);
+            let to = binds.partition_point(|it| it.addr < region.addr.saturating_add(region.size));
+            if to - from != region.binds.1 - region.binds.0 {
+                return None;
+            }
+            region.binds = (from, to);
+        }
+    }
+
+    if let Some((index, region)) = placed.region(&Class::EhFrame) {
+        let bytes = region_bytes(placed, index, region, "__eh_frame").ok()?;
+        for (start, stop) in overlaps(delta.written, region.addr, region.size) {
+            if stop > last.eh_end as u64 {
+                return None;
+            }
+            let mut at = last.records.partition_point(|it| it.at <= start).checked_sub(1)?;
+            while last.records.get(at).is_some_and(|it| it.at < stop) {
+                last.refresh_fde(bytes, region.addr, at, &mut gone, &mut came)?;
+                at += 1;
+            }
+        }
+    }
+    for k in 0..last.compact.len() {
+        let region = last.compact[k];
+        let placed_region = placed
+            .regions
+            .get(region.index)
+            .filter(|it| it.addr == region.addr && it.size == region.size)?;
+        let bytes = region_bytes(placed, region.index, placed_region, "__compact_unwind").ok()?;
+        for (start, stop) in overlaps(delta.written, region.addr, region.size) {
+            let to = stop.div_ceil(COMPACT_ENTRY).min(region.size / COMPACT_ENTRY);
+            for n in start / COMPACT_ENTRY..to {
+                let n = n as usize;
+                last.refresh_entry(placed, bytes, region, n, dwarf_mode, &mut gone, &mut came)?;
+            }
+        }
+    }
+    let end = if gone < last.end {
+        last.end.max(came)
+    } else if came >= last.end {
+        came
+    } else {
+        return None;
+    };
+
+    last.changed.sort_unstable();
+    last.changed.dedup();
+    last.dirty.clear();
+    let mut recount = false;
+    let mut i = 0;
+    while i < last.changed.len() {
+        let mut j = i;
+        let hi = loop {
+            match last.after(functions, last.changed[j]) {
+                Some(next) if last.changed.get(j + 1).is_some_and(|it| *it <= next) => j += 1,
+                Some(next) => break Some(next),
+                None => {
+                    j = last.changed.len() - 1;
+                    break None;
+                }
+            }
+        };
+        let lo = last.changed[i];
+        recount |= last.window(placed, dwarf_mode, lo, hi)?;
+        i = j + 1;
+    }
+
+    let common = last.common.len();
+    if recount {
+        last.encodings.common(&mut last.recount);
+        let same = last.recount.len() == common
+            && last.recount.iter().zip(&last.common).all(|(new, old)| new.1 == old.1);
+        if !same {
+            return None;
+        }
+        std::mem::swap(&mut last.common, &mut last.recount);
+    }
+    // Each page a rewritten row is in splits as before, and so does the one before it, whose
+    // end its first row may decide.
+    let mut previous = usize::MAX;
+    for k in 0..last.dirty.len() {
+        let row = last.dirty[k];
+        let page = last.pages.partition_point(|it| it.first <= row).checked_sub(1)?;
+        if page == previous {
+            continue;
+        }
+        previous = page;
+        for page in [page.checked_sub(1), Some(page)].into_iter().flatten() {
+            let kept = last.pages[page];
+            let split = last.encodings.page(&last.rows, kept.first, common, dwarf_mode);
+            let same = (split.count, split.compressed, split.locals)
+                == (kept.count, kept.compressed, kept.locals);
+            if !same {
+                return None;
+            }
+        }
+    }
+    let mut previous = usize::MAX;
+    for k in 0..last.dirty.len() {
+        let row = last.dirty[k];
+        let page = last.pages.partition_point(|it| it.first <= row).checked_sub(1)?;
+        if page == previous {
+            continue;
+        }
+        previous = page;
+        let kept = last.pages[page];
+        let mut out = Out { bytes: &mut last.bytes, at: kept.at as usize };
+        write_page(&mut out, &last.rows, &kept, common, &mut last.encodings, dwarf_mode);
+        let at = last.index_at + INDEX_ENTRY * page as u64;
+        put(&mut last.bytes, at as usize, last.rows[kept.first].function);
+    }
+    if end != last.end {
+        let sentinel = offset(last.base, end, "the end of the last function").ok()?;
+        let at = last.index_at + INDEX_ENTRY * last.pages.len() as u64;
+        put(&mut last.bytes, at as usize, sentinel);
+        last.end = end;
+    }
+    Some(())
+}
+
+impl Last {
+    /// Reads again the record of `__eh_frame` (`bytes`, at `section`) at `records[at]`, which
+    /// must keep its length and its kind, and of a CIE its FDE pointer encoding (all of it an
+    /// FDE reads); moves an FDE in the columns.
+    fn refresh_fde(
+        &mut self,
+        bytes: &[u8],
+        section: u64,
+        at: usize,
+        gone: &mut u64,
+        came: &mut u64,
+    ) -> Option<()> {
+        let old = self.records[at];
+        let next = self.records.get(at + 1).map_or(self.eh_end as u64, |it| it.at);
+        let (parsed, stop) = record(bytes, old.at as usize, section, &self.cies).ok()?;
+        if stop as u64 != next {
+            return None;
+        }
+        let (start, end) = match parsed {
+            Parsed::Cie(encoding) if old.cie() => {
+                let cie = self.cies.binary_search_by_key(&(old.at as usize), |it| it.0).ok()?;
+                return (self.cies[cie].1 == encoding).then_some(());
+            }
+            Parsed::Fde { start, end } if !old.cie() => (start, end),
+            _ => return None,
+        };
+        if (start, end) == (old.start, old.end) {
+            return Some(());
+        }
+        if self.dups || start == 0 || old.start == 0 {
+            return None;
+        }
+        // A DWARF-mode compact entry names the FDE at its address.
+        for addr in [old.start, start] {
+            let covered = span(&self.covered, addr, Some(addr), |it| it.addr);
+            if covered.iter().any(|it| matches!(it.kind, Kind::Dwarf { .. })) {
+                return None;
+            }
+        }
+        let pos = self.fdes.binary_search_by_key(&old.start, |it| it.addr).ok()?;
+        let ordered = (pos == 0 || self.fdes[pos - 1].addr < start)
+            && self.fdes.get(pos + 1).is_none_or(|it| start < it.addr);
+        if self.fdes[pos].offset != old.at || !ordered {
+            return None;
+        }
+        self.fdes[pos] = Fde { addr: start, end, offset: old.at };
+        replace(&mut self.ends, old.end, end)?;
+        self.records[at] = Record { at: old.at, start, end };
+        self.changed.extend_from_slice(&[old.start, old.end, start, end]);
+        *gone = (*gone).max(old.end);
+        *came = (*came).max(end);
+        Some(())
+    }
+
+    /// Reads again entry `n` of the `__compact_unwind` region `region` (`bytes`), which must
+    /// stay alive or dead, keep its personality, and stay alone at its address in its column.
+    #[allow(clippy::too_many_arguments)]
+    fn refresh_entry(
+        &mut self,
+        placed: &Placed<'_>,
+        bytes: &[u8],
+        region: CompactRegion,
+        n: usize,
+        dwarf_mode: u32,
+        gone: &mut u64,
+        came: &mut u64,
+    ) -> Option<()> {
+        let size = COMPACT_ENTRY as usize;
+        let entry = bytes.get(n * size..(n + 1) * size)?;
+        let index = region.first + n;
+        let (old_function, old_end) = *self.entries.get(index)?;
+        let function = u64_at(entry, 0);
+        if (function == 0) != (old_function == 0) {
+            return None;
+        }
+        if function == 0 {
+            return Some(());
+        }
+        let end = function.checked_add(u64::from(u32_at(entry, 8)))?;
+        let encoding = u32_at(entry, 12);
+        let (kind, personality) = if encoding & MODE_MASK == dwarf_mode {
+            let at = self.fdes.partition_point(|it| it.addr < function);
+            let fde = self.fdes.get(at).filter(|it| it.addr == function)?;
+            (Kind::Dwarf { fde: fde.offset }, 0)
+        } else {
+            let cell = region.addr + COMPACT_ENTRY * n as u64 + 16;
+            let personality = match held(placed.binds, cell, u64_at(entry, 16)) {
+                Some(held) => self.personalities.iter().position(|(it, _)| *it == held)? as u32 + 1,
+                None => 0,
+            };
+            let lsda = u64_at(entry, 24);
+            let mut encoding =
+                (encoding & !(PERSONALITY_MASK | HAS_LSDA)) | (personality << PERSONALITY_SHIFT);
+            if lsda != 0 {
+                encoding |= HAS_LSDA;
+            }
+            (Kind::Compact { encoding, lsda }, personality)
+        };
+        let pos = self.covered.binary_search_by_key(&old_function, |it| it.addr).ok()?;
+        let (low, high) = (old_function.min(function), old_function.max(function));
+        let alone = (pos == 0 || self.covered[pos - 1].addr < low)
+            && self.covered.get(pos + 1).is_none_or(|it| high < it.addr);
+        if !alone {
+            return None;
+        }
+        let old = self.covered[pos].kind;
+        let old_personality = match old {
+            Kind::Compact { encoding, .. } => (encoding & PERSONALITY_MASK) >> PERSONALITY_SHIFT,
+            Kind::Dwarf { .. } => 0,
+        };
+        if personality != old_personality {
+            return None;
+        }
+        if (function, end, kind) == (old_function, old_end, old) {
+            return Some(());
+        }
+        self.covered[pos] = Covered { addr: function, kind };
+        replace(&mut self.ends, old_end, end)?;
+        self.entries[index] = (function, end);
+        self.changed.extend_from_slice(&[old_function, old_end, function, end]);
+        *gone = (*gone).max(old_end);
+        *came = (*came).max(end);
+        Some(())
+    }
+
+    /// The first address past `addr` a function or a column's entry is at.
+    fn after(&self, functions: &[Function], addr: u64) -> Option<u64> {
+        let starts = functions.partition_point(|it| it.addr <= addr);
+        let covered = self.covered.partition_point(|it| it.addr <= addr);
+        let fdes = self.fdes.partition_point(|it| it.addr <= addr);
+        let ends = self.ends.partition_point(|it| *it <= addr);
+        [
+            functions.get(starts).map(|it| it.addr),
+            self.covered.get(covered).map(|it| it.addr),
+            self.fdes.get(fdes).map(|it| it.addr),
+            self.ends.get(ends).copied(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Merges the entries from `lo` to `hi` (to the end: `None`) again over the rows there,
+    /// which they must match in number and in which have an LSDA; whether an encoding changed.
+    fn window(
+        &mut self,
+        placed: &Placed<'_>,
+        dwarf_mode: u32,
+        lo: u64,
+        hi: Option<u64>,
+    ) -> Option<bool> {
+        let lo_offset = u32::try_from(lo.checked_sub(self.base)?).ok()?;
+        let hi_offset = match hi {
+            Some(hi) => u32::try_from(hi.checked_sub(self.base)?).ok()?,
+            None => u32::MAX,
+        };
+        let columns = Columns {
+            covered: span(&self.covered, lo, hi, |it| it.addr),
+            fdes: span(&self.fdes, lo, hi, |it| it.addr),
+            starts: Starts::Placed(span(placed.functions, lo, hi, |it| it.addr)),
+            ends: span(&self.ends, lo, hi, |it| *it),
+        };
+        let from = self.rows.partition_point(|it| it.function < lo_offset);
+        let to = self.rows.partition_point(|it| it.function <= hi_offset);
+        let before = from.checked_sub(1).map(|at| self.rows[at]);
+        self.window.clear();
+        self.window_lsdas.clear();
+        merge(placed, dwarf_mode, columns, before, &mut self.window, &mut self.window_lsdas).ok()?;
+        if self.window.len() != to - from {
+            return None;
+        }
+        let lsdas_from = self.lsdas.partition_point(|it| it.0 < lo_offset);
+        let mut recount = false;
+        for (k, &new) in self.window.iter().enumerate() {
+            let old = self.rows[from + k];
+            if (old.encoding ^ new.encoding) & HAS_LSDA != 0 {
+                return None;
+            }
+            if old == new {
+                continue;
+            }
+            if old.encoding != new.encoding {
+                if old.encoding & MODE_MASK != dwarf_mode {
+                    self.encodings.uncount(old.encoding);
+                }
+                if new.encoding & MODE_MASK != dwarf_mode {
+                    self.encodings.count(new.encoding);
+                }
+                recount = true;
+            }
+            self.rows[from + k] = new;
+            self.dirty.push(from + k);
+        }
+        let lsdas = self.lsdas.get_mut(lsdas_from..lsdas_from + self.window_lsdas.len())?;
+        for (k, (old, &new)) in lsdas.iter_mut().zip(&self.window_lsdas).enumerate() {
+            if *old != new {
+                *old = new;
+                let at = (self.lsda_at + LSDA_ENTRY * (lsdas_from + k) as u64) as usize;
+                put(&mut self.bytes, at, new.0);
+                put(&mut self.bytes, at + 4, new.1);
+            }
+        }
+        Some(recount)
+    }
+}
+
+/// The part of the sorted `items` whose `key` is from `lo` to `hi` (to the end: `None`).
+fn span<T>(items: &[T], lo: u64, hi: Option<u64>, key: impl Fn(&T) -> u64) -> &[T] {
+    let from = items.partition_point(|it| key(it) < lo);
+    let to = match hi {
+        Some(hi) => items.partition_point(|it| key(it) <= hi),
+        None => items.len(),
+    };
+    &items[from..to.max(from)]
+}
+
+/// The parts of `written` (by address, none overlapping) within `size` bytes from `addr`, as
+/// offsets from it.
+fn overlaps(written: &[(u64, u64)], addr: u64, size: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let end = addr.saturating_add(size);
+    let from = written.partition_point(|it| it.0.saturating_add(it.1) <= addr);
+    written[from..]
+        .iter()
+        .take_while(move |it| it.0 < end)
+        .map(move |it| (it.0.max(addr) - addr, it.0.saturating_add(it.1).min(end) - addr))
+}
+
+/// Replaces one `old` of the sorted `values` with `new`, where that keeps them sorted.
+fn replace(values: &mut [u64], old: u64, new: u64) -> Option<()> {
+    if old == new {
+        return Some(());
+    }
+    let from = values.partition_point(|it| *it < old);
+    let to = values.partition_point(|it| *it <= old);
+    if from == to {
+        return None;
+    }
+    let (at, sorted) = if new > old {
+        (to - 1, values.get(to).is_none_or(|it| new <= *it))
+    } else {
+        (from, from == 0 || values[from - 1] <= new)
+    };
+    if !sorted {
+        return None;
+    }
+    values[at] = new;
+    Some(())
+}
+
+/// What holds the personality of the compact unwind entry whose personality cell is `cell`:
+/// the bind there, else the address the cell holds (0: none).
+fn held(binds: &[Bind], cell: u64, personality: u64) -> Option<Held> {
+    let upto = binds.partition_point(|it| it.addr <= cell);
+    match upto.checked_sub(1).map(|at| binds[at]).filter(|it| it.addr == cell) {
+        Some(bind) => Some(Held::Import { import: bind.import, addend: bind.addend }),
+        None => (personality != 0).then_some(Held::Address(personality)),
+    }
 }
 
 /// What a personality cell holds: the loader slides an address of the image, or binds an
@@ -233,7 +822,7 @@ struct Covered {
 
 const _: () = assert!(size_of::<Covered>() == 24);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// The encoding with its personality index and `UNWIND_HAS_LSDA`, and the LSDA's address
     /// (0: none).
@@ -253,7 +842,7 @@ struct Fde {
 const _: () = assert!(size_of::<Fde>() == 24);
 
 /// A second-level entry, offsets from the image's base: 8 bytes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Row {
     function: u32,
     encoding: u32,
@@ -271,7 +860,12 @@ struct Compact {
     bytes: u64,
 }
 
-fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact, LinkError> {
+fn compact(
+    placed: &Placed<'_>,
+    dwarf_mode: u32,
+    fdes: &[Fde],
+    mut keep: Option<&mut Last>,
+) -> Result<Compact, LinkError> {
     let base = placed.plan.base;
     let binds: Cow<'_, [Bind]> = if placed.binds.is_sorted_by_key(|it| it.addr) {
         Cow::Borrowed(placed.binds)
@@ -281,6 +875,11 @@ fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact
         radix::sort_copy_by_key(&mut binds, |it| it.addr);
         Cow::Owned(binds)
     };
+    if let Some(last) = keep.as_deref_mut() {
+        last.compact.clear();
+        last.entries.clear();
+        last.binds_sorted = matches!(binds, Cow::Borrowed(_));
+    }
     let class = super::compact_unwind();
     // Every entry's start and end, and the FDEs' ends: each column allocated once.
     let mut entries = 0;
@@ -302,9 +901,20 @@ fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact
             )));
         }
         compact_bytes += bytes.len() as u64;
+        if let Some(last) = keep.as_deref_mut() {
+            let end = region.addr.saturating_add(region.size);
+            let from = binds.partition_point(|it| it.addr < region.addr);
+            let to = binds.partition_point(|it| it.addr < end);
+            let first = last.entries.len();
+            let (addr, size) = (region.addr, region.size);
+            last.compact.push(CompactRegion { index, addr, size, first, binds: (from, to) });
+        }
         for (n, entry) in bytes.chunks_exact(COMPACT_ENTRY as usize).enumerate() {
             let function = u64_at(entry, 0);
             if function == 0 {
+                if let Some(last) = keep.as_deref_mut() {
+                    last.entries.push((0, 0));
+                }
                 continue;
             }
             let length = u64::from(u32_at(entry, 8));
@@ -333,13 +943,7 @@ fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact
             } else {
                 let mut encoding = encoding & !(PERSONALITY_MASK | HAS_LSDA);
                 let cell = region.addr + COMPACT_ENTRY * n as u64 + 16;
-                let upto = binds.partition_point(|it| it.addr <= cell);
-                let bind = upto.checked_sub(1).map(|at| binds[at]).filter(|it| it.addr == cell);
-                let held = match bind {
-                    Some(bind) => Some(Held::Import { import: bind.import, addend: bind.addend }),
-                    None => (personality != 0).then_some(Held::Address(personality)),
-                };
-                if let Some(held) = held {
+                if let Some(held) = held(&binds, cell, personality) {
                     let index = match personalities.iter().position(|(it, _)| *it == held) {
                         Some(index) => index,
                         None => {
@@ -366,6 +970,9 @@ fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact
             };
             covered.push(Covered { addr: function, kind });
             ends.push(end);
+            if let Some(last) = keep.as_deref_mut() {
+                last.entries.push((function, end));
+            }
         }
     }
     Ok(Compact { covered, ends, personalities, bytes: compact_bytes })
@@ -388,16 +995,23 @@ impl Starts<'_> {
 }
 
 /// The second-level entries in address order, the LSDA index (function and LSDA offsets),
-/// and the end of the last function.
+/// the end of the last function, and whether [`Placed::functions`] was in address order.
 struct Rows {
     rows: Vec<Row>,
     lsdas: Vec<(u32, u32)>,
     last: u64,
+    sorted: bool,
 }
 
-/// One merge of the sorted columns: of one address the compact entry wins, then the FDE, then
-/// a function without either (encoding 0), then the end of a covered range (encoding 0); an
-/// entry with the encoding of the one before and neither with an LSDA adds nothing (as ld64).
+/// The sorted columns [`merge`] reads.
+struct Columns<'c> {
+    covered: &'c [Covered],
+    fdes: &'c [Fde],
+    starts: Starts<'c>,
+    ends: &'c [u64],
+}
+
+/// The rows of every entry, by [`merge`].
 fn rows(
     placed: &Placed<'_>,
     dwarf_mode: u32,
@@ -427,8 +1041,30 @@ fn rows(
         Vec::with_capacity(placed.functions.len() + covered.len() + fdes.len() + ends.len());
     // An LSDA is a compact entry's: at most one each.
     let mut lsdas = Vec::with_capacity(covered.len());
+    let columns = Columns { covered, fdes, starts, ends };
+    let greatest = merge(placed, dwarf_mode, columns, None, &mut rows, &mut lsdas)?;
+    Ok(Rows { rows, lsdas, last: last.max(greatest), sorted })
+}
+
+/// One merge of the sorted columns into `rows` and `lsdas`, after `before`, the row before
+/// them: of one address the compact entry wins, then the FDE, then a function without either
+/// (encoding 0), then the end of a covered range (encoding 0); an entry with the encoding of
+/// the one before and neither with an LSDA adds nothing (as ld64). The greatest address seen.
+fn merge(
+    placed: &Placed<'_>,
+    dwarf_mode: u32,
+    columns: Columns<'_>,
+    before: Option<Row>,
+    rows: &mut Vec<Row>,
+    lsdas: &mut Vec<(u32, u32)>,
+) -> Result<u64, LinkError> {
+    let base = placed.plan.base;
+    let Columns { covered, fdes, starts, ends } = columns;
+    // The row before has an LSDA only as the entry just before: the next is never merged.
+    let mut previous = before.map(|it| it.encoding);
+    let mut lsda_last = before.is_some_and(|it| it.encoding & HAS_LSDA != 0);
+    let mut greatest = 0;
     let (mut c, mut f, mut s, mut e) = (0, 0, 0, 0);
-    let mut lsda_last = false;
     loop {
         let heads = [
             covered.get(c).map(|it| it.addr),
@@ -458,7 +1094,7 @@ fn rows(
         while ends.get(e) == Some(&at) {
             e += 1;
         }
-        last = last.max(at);
+        greatest = greatest.max(at);
         let (encoding, lsda) = match kind {
             Some(Kind::Compact { encoding, lsda }) => (encoding, lsda),
             Some(Kind::Dwarf { fde }) => {
@@ -475,7 +1111,7 @@ fn rows(
             }
             None => (0, 0),
         };
-        if rows.last().is_some_and(|it| it.encoding == encoding) && !lsda_last && lsda == 0 {
+        if previous == Some(encoding) && !lsda_last && lsda == 0 {
             continue;
         }
         let lsda_offset = match lsda {
@@ -487,9 +1123,10 @@ fn rows(
             lsdas.push((function, lsda));
         }
         rows.push(Row { function, encoding });
+        previous = Some(encoding);
         lsda_last = lsda_offset.is_some();
     }
-    Ok(Rows { rows, lsdas, last })
+    Ok(greatest)
 }
 
 const NO_COMMON: u8 = u8::MAX;
@@ -515,6 +1152,7 @@ const EMPTY: Slot =
 /// The distinct encodings but DWARF mode's, open-addressed with Fibonacci hashing and at most
 /// half full: one multiply and about one probe a lookup. A DWARF-mode encoding names its FDE,
 /// so it is of one entry: never common, new to its page, never looked up.
+#[derive(Default)]
 struct Encodings {
     slots: Vec<Slot>,
     len: usize,
@@ -567,20 +1205,27 @@ impl Encodings {
         }
     }
 
-    /// The common encodings: of those of more than one entry the most frequent, ties by value,
-    /// at most 127. One of a single entry is no smaller common than the page's own.
-    /// Each as (its count, the encoding).
-    fn common(&mut self) -> Vec<(u32, u32)> {
-        let mut common: Vec<(u32, u32)> = Vec::with_capacity(self.len);
+    /// One entry fewer of `encoding`, which was counted.
+    fn uncount(&mut self, encoding: u32) {
+        let at = self.find(encoding);
+        let slot = &mut self.slots[at];
+        debug_assert!(slot.used && slot.count > 0, "{encoding:#010x} was counted");
+        slot.count = slot.count.saturating_sub(1);
+    }
+
+    /// The common encodings, into `common`: of those of more than one entry the most frequent,
+    /// ties by value, at most 127. One of a single entry is no smaller common than the page's
+    /// own. Each as (its count, the encoding).
+    fn common(&mut self, common: &mut Vec<(u32, u32)>) {
+        common.clear();
         let repeated = self.slots.iter().filter(|it| it.used && it.count > 1);
         common.extend(repeated.map(|it| (it.count, it.encoding)));
-        radix::sort_copy_by_key(&mut common, |&(count, encoding)| radix::pack_32(!count, encoding));
+        radix::sort_copy_by_key(common, |&(count, encoding)| radix::pack_32(!count, encoding));
         common.truncate(COMMON_MAX);
         for (index, &(_, encoding)) in common.iter().enumerate() {
             let at = self.find(encoding);
             self.slots[at].common = index as u8;
         }
-        common
     }
 
     /// `encoding`'s index in the compressed page being laid out, and whether it is new to the
@@ -611,45 +1256,54 @@ impl Encodings {
         let mut pages = Vec::with_capacity(rows.len() / PAGE_ENTRIES + 1);
         let mut i = 0;
         while i < rows.len() {
-            let first = i;
-            let limit = u64::from(rows[i].function) + u64::from(COMPRESSED_OFFSET_MASK);
-            let mut words = (PAGE - COMPRESSED_HEADER) / 4;
-            let mut next = common;
-            self.stamp += 1;
-            while words >= 1 && i < rows.len() {
-                let row = rows[i];
-                if u64::from(row.function) >= limit {
-                    break;
-                }
-                let dwarf = row.encoding & MODE_MASK == dwarf_mode;
-                let (_, new) = self.index(row.encoding, dwarf, next);
-                let cost = 1 + u64::from(new);
-                if words < cost || (new && next == ENCODINGS_MAX) {
-                    break;
-                }
-                words -= cost;
-                next += usize::from(new);
-                i += 1;
-            }
-            let count = i - first;
-            if i < rows.len() && count < PAGE_ENTRIES {
-                let count = PAGE_ENTRIES.min(rows.len() - first);
-                i = first + count;
-                pages.push(Page { first, count, compressed: false, locals: 0 });
-            } else {
-                pages.push(Page { first, count, compressed: true, locals: next - common });
-            }
+            let page = self.page(rows, i, common, dwarf_mode);
+            i += page.count;
+            pages.push(page);
         }
         pages
     }
+
+    /// The page [`Encodings::pages`] starts at `rows[first]`, its `at` unset.
+    fn page(&mut self, rows: &[Row], first: usize, common: usize, dwarf_mode: u32) -> Page {
+        let mut i = first;
+        let limit = u64::from(rows[i].function) + u64::from(COMPRESSED_OFFSET_MASK);
+        let mut words = (PAGE - COMPRESSED_HEADER) / 4;
+        let mut next = common;
+        self.stamp += 1;
+        while words >= 1 && i < rows.len() {
+            let row = rows[i];
+            if u64::from(row.function) >= limit {
+                break;
+            }
+            let dwarf = row.encoding & MODE_MASK == dwarf_mode;
+            let (_, new) = self.index(row.encoding, dwarf, next);
+            let cost = 1 + u64::from(new);
+            if words < cost || (new && next == ENCODINGS_MAX) {
+                break;
+            }
+            words -= cost;
+            next += usize::from(new);
+            i += 1;
+        }
+        let count = i - first;
+        if i < rows.len() && count < PAGE_ENTRIES {
+            let count = PAGE_ENTRIES.min(rows.len() - first);
+            Page { first, count, compressed: false, locals: 0, at: 0 }
+        } else {
+            Page { first, count, compressed: true, locals: next - common, at: 0 }
+        }
+    }
 }
 
-/// A second-level page: its rows, and of a compressed one how many encodings of its own.
+/// A second-level page: its rows, of a compressed one how many encodings of its own, and its
+/// offset in the table.
+#[derive(Clone, Copy)]
 struct Page {
     first: usize,
     count: usize,
     compressed: bool,
     locals: usize,
+    at: u64,
 }
 
 impl Page {
@@ -668,9 +1322,13 @@ struct Out<'a> {
     at: usize,
 }
 
+fn put(bytes: &mut [u8], at: usize, value: u32) {
+    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
 impl Out<'_> {
     fn put(&mut self, at: usize, value: u32) {
-        self.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        put(self.bytes, at, value);
     }
 
     fn u32(&mut self, value: u32) {
@@ -688,72 +1346,117 @@ impl Out<'_> {
 /// address, the first. One pass over the records, reading of a CIE only its FDE pointer
 /// encoding and of an FDE only `pc_begin` and `pc_range`, under gimli's rules for both (CIE
 /// versions 1, 3 and 4; `z`, `L`, `P`, `R`, `S` augmentations; pointers absolute or relative
-/// to where they are, indirection ignored); an FDE at 0 was of a dead function.
-fn fdes(placed: &Placed<'_>) -> Result<Vec<Fde>, LinkError> {
+/// to where they are, indirection ignored); an FDE at 0 was of a dead function. Into `keep`,
+/// every record, the CIEs, where the scan stopped and whether two FDEs started at one address.
+fn fdes(placed: &Placed<'_>, mut keep: Option<&mut Last>) -> Result<Vec<Fde>, LinkError> {
+    if let Some(last) = keep.as_deref_mut() {
+        last.records.clear();
+        last.cies.clear();
+        last.eh_end = 0;
+        last.dups = false;
+    }
     let Some((index, region)) = placed.region(&Class::EhFrame) else {
         // alloc: empty, which allocates nothing
         return Ok(Vec::new());
     };
     let bytes = region_bytes(placed, index, region, "__eh_frame")?;
-    let bad = |at: usize, what: &str| {
-        // alloc: error path
-        error(format!("__eh_frame at {:#x}: the entry at offset {at:#x}: {what}", region.addr))
-    };
     // An FDE takes at least 10 bytes and the core's take 24 or more: this grows at most twice.
     let mut fdes = Vec::with_capacity(bytes.len() / 32);
     // A CIE per distinct one the core made and per native object's: on the stack up to 16.
     let mut cies: SmallVec<[(usize, u8); 16]> = SmallVec::new();
     let mut at = 0;
     while at < bytes.len() {
-        let record = at;
-        let mut reader = Reader { bytes, at };
-        let length = match reader.u32().map_err(|it| bad(record, it))? {
-            0 => break,
-            0xffff_fff0..=0xffff_fffe => return Err(bad(record, "a reserved initial length")),
-            0xffff_ffff => reader.u64().map_err(|it| bad(record, it))?,
-            length => u64::from(length),
+        let (parsed, next) = record(bytes, at, region.addr, &cies)?;
+        let kept = match parsed {
+            Parsed::End => break,
+            Parsed::Cie(encoding) => {
+                cies.push((at, encoding));
+                Record { at: at as u64, start: u64::MAX, end: 0 }
+            }
+            Parsed::Fde { start, end } => {
+                if start != 0 {
+                    fdes.push(Fde { addr: start, end, offset: at as u64 });
+                }
+                Record { at: at as u64, start, end }
+            }
         };
-        let body = reader.at;
-        let end = usize::try_from(length)
-            .ok()
-            .and_then(|it| body.checked_add(it))
-            .filter(|it| *it <= bytes.len())
-            .ok_or_else(|| bad(record, "longer than the section"))?;
-        let mut reader = Reader { bytes: &bytes[..end], at: body };
-        let id = reader.u32().map_err(|it| bad(record, it))?;
-        at = end;
-        if id == 0 {
-            let encoding = cie_encoding(&mut reader, region.addr).map_err(|it| bad(record, it))?;
-            cies.push((record, encoding));
-            continue;
+        if let Some(last) = keep.as_deref_mut() {
+            last.records.push(kept);
         }
-        let Some(cie) = body.checked_sub(id as usize) else {
-            return Err(bad(record, "its CIE pointer is before the section"));
-        };
-        let Ok(found) = cies.binary_search_by_key(&cie, |it| it.0) else {
-            return Err(bad(record, "its CIE pointer names no CIE"));
-        };
-        let encoding = cies[found].1;
-        let start = reader.pointer(encoding, region.addr).map_err(|it| bad(record, it))?;
-        let len = reader.value(encoding).map_err(|it| bad(record, it))?;
-        if start == 0 {
-            continue;
-        }
-        let end = start.checked_add(len).ok_or_else(|| {
-            // alloc: error path
-            error(format!(
-                "__eh_frame at {:#x}: the FDE at offset {record:#x} covers past the end of the \
-                 address space",
-                region.addr
-            ))
-        })?;
-        fdes.push(Fde { addr: start, end, offset: record as u64 });
+        at = next;
     }
     if !fdes.is_sorted_by_key(|it| it.addr) {
         radix::sort_copy_by_key(&mut fdes, |it| it.addr);
     }
+    let found = fdes.len();
     fdes.dedup_by_key(|it| it.addr);
+    if let Some(last) = keep {
+        last.cies.extend_from_slice(&cies);
+        last.eh_end = at;
+        last.dups = fdes.len() != found;
+    }
     Ok(fdes)
+}
+
+/// A record of `__eh_frame`: the terminator, a CIE with its FDE pointer encoding, or an FDE
+/// with the range it covers (0..0 for a dead one).
+enum Parsed {
+    End,
+    Cie(u8),
+    Fde { start: u64, end: u64 },
+}
+
+/// The record at offset `record` of `__eh_frame` (`bytes`, at address `section`), and the
+/// offset after it; `cies` holds the CIEs before it, by offset.
+fn record(
+    bytes: &[u8],
+    record: usize,
+    section: u64,
+    cies: &[(usize, u8)],
+) -> Result<(Parsed, usize), LinkError> {
+    let bad = |what: &str| {
+        // alloc: error path
+        error(format!("__eh_frame at {section:#x}: the entry at offset {record:#x}: {what}"))
+    };
+    let mut reader = Reader { bytes, at: record };
+    let length = match reader.u32().map_err(bad)? {
+        0 => return Ok((Parsed::End, record)),
+        0xffff_fff0..=0xffff_fffe => return Err(bad("a reserved initial length")),
+        0xffff_ffff => reader.u64().map_err(bad)?,
+        length => u64::from(length),
+    };
+    let body = reader.at;
+    let end = usize::try_from(length)
+        .ok()
+        .and_then(|it| body.checked_add(it))
+        .filter(|it| *it <= bytes.len())
+        .ok_or_else(|| bad("longer than the section"))?;
+    let mut reader = Reader { bytes: &bytes[..end], at: body };
+    let id = reader.u32().map_err(bad)?;
+    if id == 0 {
+        let encoding = cie_encoding(&mut reader, section).map_err(bad)?;
+        return Ok((Parsed::Cie(encoding), end));
+    }
+    let Some(cie) = body.checked_sub(id as usize) else {
+        return Err(bad("its CIE pointer is before the section"));
+    };
+    let Ok(found) = cies.binary_search_by_key(&cie, |it| it.0) else {
+        return Err(bad("its CIE pointer names no CIE"));
+    };
+    let encoding = cies[found].1;
+    let start = reader.pointer(encoding, section).map_err(bad)?;
+    let len = reader.value(encoding).map_err(bad)?;
+    if start == 0 {
+        return Ok((Parsed::Fde { start: 0, end: 0 }, end));
+    }
+    let stop = start.checked_add(len).ok_or_else(|| {
+        // alloc: error path
+        error(format!(
+            "__eh_frame at {section:#x}: the FDE at offset {record:#x} covers past the end of the \
+             address space"
+        ))
+    })?;
+    Ok((Parsed::Fde { start, end: stop }, end))
 }
 
 /// The FDE pointer encoding of the CIE `reader` is in (past its ID), its other fields checked
@@ -952,10 +1655,10 @@ mod tests {
         ARM64_MODE_DWARF, COMMON_MAX, COMPACT_ENTRY, DWARF_OFFSET_MASK, HAS_LSDA, HEADER,
         Held, INDEX_ENTRY, LSDA_ENTRY, MODE_MASK, PAGE_ENTRY, PAGE_HEADER, PERSONALITY_MASK,
         PERSONALITY_MAX, PERSONALITY_SHIFT, SECOND_LEVEL_REGULAR, VERSION, X86_64_MODE_DWARF,
-        bound, build, error, named, offset, region_bytes, u32_at, u64_at,
+        Last, bound, build, error, kept, named, offset, region_bytes, u32_at, u64_at,
     };
     use crate::LinkError;
-    use crate::model::{Bind, Class, Function, Placed, Plan, Prot, Region};
+    use crate::model::{Bind, Class, Delta, Function, Placed, Plan, Prot, Region, Splice};
     use crate::output::{Debug, Format, Output, OutputKind};
 
     const BASE: u64 = 0x1_0000_0000;
@@ -1430,6 +2133,213 @@ mod tests {
         assert!(table.entries().is_empty());
     }
 
+    /// What changed since synthesis `from`: `functions`' splices and the `written` ranges.
+    fn delta<'a>(from: u64, functions: &'a [Splice], written: &'a [(u64, u64)]) -> Delta<'a> {
+        Delta {
+            functions,
+            rebase: &[],
+            got: &[],
+            binds: &[],
+            same_names: true,
+            same_regions: true,
+            written,
+            from,
+        }
+    }
+
+    /// Ten functions with compact entries, each followed by a gap but the fourth, which ends
+    /// where the fifth's gap starts, and an eleventh covered by an FDE.
+    struct Image {
+        functions: Vec<Function>,
+        eh: Vec<u8>,
+        cu: Vec<u8>,
+    }
+
+    /// The fourth function at `fourth`, the seventh's LSDA at `lsda`, the eleventh `size` long.
+    fn image(fourth: u64, lsda: u64, size: u64) -> Image {
+        let mut functions = Vec::with_capacity(11);
+        let mut entries = Vec::with_capacity(10);
+        for i in 0..10u64 {
+            let (addr, len) =
+                if i == 3 { (fourth, TEXT + 0xf0 - fourth) } else { (TEXT + 0x40 * i, 0x30) };
+            functions.push(function(addr, len, "f"));
+            let encoding = if i % 2 == 0 { FRAME } else { FRAMELESS };
+            let lsda = match i {
+                6 => lsda,
+                i if i % 3 == 0 => LSDA + 0x10 * i,
+                _ => 0,
+            };
+            entries.push((addr, len as u32, encoding, 0, lsda));
+        }
+        let eleventh = TEXT + 0x280;
+        functions.push(function(eleventh, size, "eleventh"));
+        let (eh, _) = eh_frame(&[(eleventh, size as u32)]);
+        Image { functions, eh, cu: compact(&entries) }
+    }
+
+    fn image_regions(image: &Image) -> [Region; 3] {
+        [
+            region(Class::Text, TEXT, 0x400),
+            region(Class::EhFrame, EH_FRAME, image.eh.len() as u64),
+            compact_region(&image.cu),
+        ]
+    }
+
+    /// `image` linked first, by synthesis `synthesis`, into `last`.
+    fn first_link(image: &Image, synthesis: u64, last: &mut Last) {
+        let output = output(Arch::Aarch64);
+        let plan = plan();
+        let regions = image_regions(image);
+        let contents: [&[u8]; 3] = [&[], &image.eh, &image.cu];
+        let placed = placed(&output, &plan, &regions, &contents, &image.functions, &[]);
+        let placed = Placed { synthesis, ..placed };
+        let (bytes, patched) = kept(&placed, Arch::Aarch64, last).unwrap();
+        assert!(!patched, "a link without a delta builds whole");
+        assert_eq!(bytes, build(&placed, Arch::Aarch64).unwrap());
+    }
+
+    /// `image` linked again by synthesis `synthesis` with `delta`: the table and whether it was
+    /// patched, the table checked against `build`'s.
+    fn relink(
+        image: &Image,
+        synthesis: u64,
+        delta: &Delta<'_>,
+        last: &mut Last,
+    ) -> (Vec<u8>, bool) {
+        let output = output(Arch::Aarch64);
+        let plan = plan();
+        let regions = image_regions(image);
+        let contents: [&[u8]; 3] = [&[], &image.eh, &image.cu];
+        let placed = placed(&output, &plan, &regions, &contents, &image.functions, &[]);
+        let placed = Placed { synthesis, delta: Some(delta), ..placed };
+        let (bytes, patched) = kept(&placed, Arch::Aarch64, last).unwrap();
+        assert_eq!(bytes, build(&placed, Arch::Aarch64).unwrap(), "the bytes `build` makes");
+        (bytes, patched)
+    }
+
+    #[test]
+    fn a_relink_patches_moved_functions_and_lsdas_as_build_makes_them() {
+        let mut last = Last::default();
+        let first = image(TEXT + 0xc0, LSDA + 0x60, 0x30);
+        first_link(&first, 7, &mut last);
+
+        // The fourth function moves up its gap and shrinks, the seventh's LSDA moves, and the
+        // eleventh, the last, grows with its FDE: the sentinel moves.
+        let second = image(TEXT + 0xc8, LSDA + 0x68, 0x40);
+        assert_eq!(second.eh.len(), first.eh.len(), "an FDE of the same length");
+        let splices = [Splice { old: 3..4, new: 3..4 }, Splice { old: 10..11, new: 10..11 }];
+        let written =
+            [(EH_FRAME, second.eh.len() as u64), (COMPACT + 32 * 3, 32), (COMPACT + 32 * 6, 32)];
+        let (bytes, patched) = relink(&second, 8, &delta(7, &splices, &written), &mut last);
+        assert!(patched, "every row kept its place");
+        let table = Table { bytes: &bytes };
+        assert_eq!(table.lookup(off(TEXT + 0xc4)), Some((0, None)), "the gap before the fourth");
+        assert_eq!(
+            table.lookup(off(TEXT + 0x180)),
+            Some((FRAME | HAS_LSDA, Some(off(LSDA + 0x68)))),
+            "the seventh's new LSDA"
+        );
+        let grown = table.lookup(off(TEXT + 0x2b8)).unwrap().0;
+        assert_eq!(grown & MODE_MASK, ARM64_MODE_DWARF, "the eleventh's FDE covers what it grew");
+        assert_eq!(table.index().last().unwrap().0, off(TEXT + 0x2c0), "the sentinel moved");
+
+        // And back, from the patched table, but for the eleventh.
+        let third = image(TEXT + 0xc0, LSDA + 0x60, 0x40);
+        let splices = [Splice { old: 3..4, new: 3..4 }];
+        let written = [(COMPACT + 32 * 3, 32), (COMPACT + 32 * 6, 32)];
+        let (_, patched) = relink(&third, 9, &delta(8, &splices, &written), &mut last);
+        assert!(patched, "a patched table patches again");
+    }
+
+    #[test]
+    fn a_delta_from_another_synthesis_builds_whole() {
+        let mut last = Last::default();
+        first_link(&image(TEXT + 0xc0, LSDA + 0x60, 0x30), 7, &mut last);
+        let second = image(TEXT + 0xc8, LSDA + 0x60, 0x30);
+        let splices = [Splice { old: 3..4, new: 3..4 }];
+        let written = [(COMPACT + 32 * 3, 32)];
+        let (_, patched) = relink(&second, 8, &delta(6, &splices, &written), &mut last);
+        assert!(!patched, "the table is not of the synthesis the delta is from");
+
+        // Built whole, it is this link's: the next delta, from it, patches.
+        let third = image(TEXT + 0xc4, LSDA + 0x60, 0x30);
+        let (_, patched) = relink(&third, 9, &delta(8, &splices, &written), &mut last);
+        assert!(patched);
+    }
+
+    #[test]
+    fn an_unequal_splice_builds_whole() {
+        let mut last = Last::default();
+        let first = image(TEXT + 0xc0, LSDA + 0x60, 0x30);
+        first_link(&first, 7, &mut last);
+        let mut second = image(TEXT + 0xc0, LSDA + 0x60, 0x30);
+        second.functions.push(function(TEXT + 0x300, 0x10, "new"));
+        let splices = [Splice { old: 11..11, new: 11..12 }];
+        let (_, patched) = relink(&second, 8, &delta(7, &splices, &[]), &mut last);
+        assert!(!patched, "a function more");
+    }
+
+    #[test]
+    fn a_change_of_the_rows_builds_whole() {
+        let mut last = Last::default();
+        first_link(&image(TEXT + 0xc0, LSDA + 0x60, 0x30), 7, &mut last);
+        // The fourth now starts where the third ends: the gap's row goes.
+        let second = image(TEXT + 0xb0, LSDA + 0x60, 0x30);
+        let splices = [Splice { old: 3..4, new: 3..4 }];
+        let written = [(COMPACT + 32 * 3, 32)];
+        let (_, patched) = relink(&second, 8, &delta(7, &splices, &written), &mut last);
+        assert!(!patched, "a row fewer");
+
+        // Nor does an LSDA appear where there was none.
+        let mut third = image(TEXT + 0xb0, LSDA + 0x60, 0x30);
+        third.cu[32 * 4 + 24..32 * 5].copy_from_slice(&(LSDA + 0x40).to_le_bytes());
+        let written = [(COMPACT + 32 * 4, 32)];
+        let (_, patched) = relink(&third, 9, &delta(8, &[], &written), &mut last);
+        assert!(!patched, "an LSDA more");
+    }
+
+    #[test]
+    fn moved_lsdas_patch_as_build_makes_them() {
+        let mut patches = 0;
+        for seed in 0..32 {
+            let case = case(seed);
+            let output = output(case.arch);
+            let plan = plan();
+            let regions = [
+                region(Class::EhFrame, EH_FRAME, case.eh.len() as u64),
+                compact_region(&case.cu),
+            ];
+            let contents: [&[u8]; 2] = [&case.eh, &case.cu];
+            let first = placed(&output, &plan, &regions, &contents, &case.functions, &case.binds);
+            let first = Placed { synthesis: 1, ..first };
+            let mut last = Last::default();
+            let Ok((bytes, _)) = kept(&first, case.arch, &mut last) else {
+                continue;
+            };
+            assert_eq!(bytes, build(&first, case.arch).unwrap(), "seed {seed}");
+
+            let mut rng = Rng::new(seed ^ 0x5eed);
+            let mut cu = case.cu.clone();
+            let mut written = Vec::new();
+            for n in 0..cu.len() / 32 {
+                let entry = &mut cu[32 * n..32 * n + 32];
+                if u64_at(entry, 0) != 0 && u64_at(entry, 24) != 0 && rng.below(2) == 0 {
+                    let lsda = u64_at(entry, 24) + 4;
+                    entry[24..].copy_from_slice(&lsda.to_le_bytes());
+                    written.push((COMPACT + 32 * n as u64, 32));
+                }
+            }
+            let contents: [&[u8]; 2] = [&case.eh, &cu];
+            let delta = delta(1, &[], &written);
+            let second = placed(&output, &plan, &regions, &contents, &case.functions, &case.binds);
+            let second = Placed { synthesis: 2, delta: Some(&delta), ..second };
+            let (bytes, patched) = kept(&second, case.arch, &mut last).unwrap();
+            assert_eq!(bytes, build(&second, case.arch).unwrap(), "seed {seed}");
+            patches += usize::from(patched);
+        }
+        assert!(patches > 0, "some relinks patched");
+    }
+
     /// The bytes of a CIE or FDE whose body is `body`.
     fn record(body: &[u8]) -> Vec<u8> {
         let mut record = (body.len() as u32).to_le_bytes().to_vec();
@@ -1455,7 +2365,7 @@ mod tests {
     }
 
     fn scanned(placed: &Placed<'_>) -> Result<Vec<(u64, u64, u64)>, LinkError> {
-        Ok(super::fdes(placed)?.iter().map(|it| (it.addr, it.offset, it.end)).collect())
+        Ok(super::fdes(placed, None)?.iter().map(|it| (it.addr, it.offset, it.end)).collect())
     }
 
     fn parsed(placed: &Placed<'_>) -> Result<Vec<(u64, u64, u64)>, LinkError> {
@@ -1500,7 +2410,7 @@ mod tests {
         let contents: [&[u8]; 1] = [&bad];
         let regions = [region(Class::EhFrame, EH_FRAME, bad.len() as u64)];
         let placed = eh_placed(&output, &plan, &regions, &contents);
-        let error = super::fdes(&placed).unwrap_err();
+        let error = super::fdes(&placed, None).unwrap_err();
         assert!(error.what.contains("names no CIE"), "{}", error.what);
         assert!(gimli_fdes(&placed).is_err());
 
@@ -1508,7 +2418,7 @@ mod tests {
         let contents: [&[u8]; 1] = [&version];
         let regions = [region(Class::EhFrame, EH_FRAME, version.len() as u64)];
         let placed = eh_placed(&output, &plan, &regions, &contents);
-        let error = super::fdes(&placed).unwrap_err();
+        let error = super::fdes(&placed, None).unwrap_err();
         assert!(error.what.contains("unknown version"), "{}", error.what);
         assert!(gimli_fdes(&placed).is_err());
     }

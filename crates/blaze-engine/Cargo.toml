@@ -76,6 +76,7 @@ blaze-expand.workspace = true
 blaze-macro-wasm.workspace = true
 blaze-store.workspace = true
 blaze-doc.workspace = true
+blaze-format.workspace = true
 blaze-lints.workspace = true
 blaze-graph.workspace = true
 blaze-ids.workspace = true

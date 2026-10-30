@@ -22,6 +22,7 @@
 
 use std::{cell::Cell, hash::Hash, sync::LazyLock};
 
+use blaze_mem::scratch::Scratch as Stack;
 use intern::Symbol;
 use rustc_hash::FxHashMap;
 use span::{
@@ -751,9 +752,10 @@ impl TopSubtree {
 
 thread_local! {
     /// The subtrees a [`TopSubtree::for_each_token`] walk is in, each as the index of the node
-    /// after it and its own, kept for the next walk.
+    /// after it and its own, kept for the next walk. `Scratch` has no `Default` for a `T`
+    /// without one, so it is taken with `replace`, not `take`.
     // alloc: one buffer per thread, grown to the deepest nesting walked.
-    static OPEN: Cell<Vec<(u32, u32)>> = const { Cell::new(Vec::new()) };
+    static OPEN: Cell<Stack<(u32, u32)>> = const { Cell::new(Stack::new()) };
 }
 
 impl TopSubtree {
@@ -814,8 +816,8 @@ impl TopSubtree {
             };
             (slot as u32, FlatToken::Close(node.delimiter_kind()), ctx)
         };
-        let mut open = OPEN.take();
-        open.clear();
+        let mut stack = OPEN.replace(Stack::new());
+        let open = stack.take();
         let mut from = start as usize;
         if start == 0 && end > 0 {
             let top = columns.node(0);
@@ -856,7 +858,7 @@ impl TopSubtree {
             let (slot, token, ctx) = close(subtree);
             f(slot, token, ctx);
         }
-        OPEN.set(open);
+        OPEN.set(stack);
     }
 }
 

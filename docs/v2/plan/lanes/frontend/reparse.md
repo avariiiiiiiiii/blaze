@@ -59,14 +59,23 @@ whole-file lowering. A source file's tree is made from its last one instead
   top-level item a key and its `Marks`. A slot is taken out under its lock while its tree is
   worked from; one another file took, or another thread holds, is a whole lowering, never a
   wrong one.
-- A key (`item_keys`) is a BLAKE3 fingerprint of what lowering reads of the item: its syntax
+- A key (`item_keys`) is what lowering reads of the item: a BLAKE3 fingerprint of its syntax
   (the flat tree's position-free subtree hash, with the bodies of `fn`s, `const`s and `static`s
   and the items of `impl`s and `trait`s left out but for the inner attributes at their start,
   and a subtree of 4 KiB of text or more fed as its kept `subtree_hash`, so a big
-  `macro_rules!` is read once, not on every edit), the ast ids of the items it is made of
-  (`[start, kind, id]` from its start) and the span anchors lowering looks up in it
-  (`[start, id]`, the anchors of an `impl`'s or `trait`'s items left out). All from the item's
-  start, so an item keeps its key wherever an edit moves it.
+  `macro_rules!` is read once, not on every edit), and, as they are, the ast ids of the items
+  it is made of (`[start, kind, id]` from its start) and the span anchors lowering looks up in
+  it (`[start, id]`, the anchors of an `impl`'s or `trait`'s items left out), in two arrays all
+  the items share (`Keys`). All from the item's start, so an item keeps its key wherever an
+  edit moves it.
+- Only the items an edit touched are hashed (`Unchanged`). The slot keeps the text its keys
+  were made of; the edit's text is compared with it from each end (`common_ends`, 4 KiB
+  `memcmp`s). An item in the common suffix at its old place moved by the edit, or in the common
+  prefix with two whole items after it there, keeps its old fingerprint: a file's parse is a
+  function of its text, the lexer starts a token at an item's start the same way whatever came
+  before, and the parser reads a top-level item from the item list's state, its own tokens and
+  at most three tokens past its position, which the two items hold. Its ids and anchors are
+  still read and compared, as an edit elsewhere can renumber them.
 - `Marks` are where an item's rows begin in each of the tree's 28 columns (`kinds` standing
   for `data` and `ast_ids` too), then where the last item's end. The whole-file lowering
   records them at each top-level item (`Ctx::lower_module_items_marked`), and assembly at each
@@ -105,10 +114,12 @@ expansion is made anew and a block's tree is small.
 Known costs, all bounded (the bounds and the arithmetic are in
 [speed-of-light.md](speed-of-light.md), section frontend-deps-reparse):
 
-- Every edit keys every item of the file again: one walk and one BLAKE3 pass over each item's
-  lowered syntax, ids and anchors.
-- A slot holds up to 116 bytes of marks and 16 of key per item of its file, and only for a file
-  edited at least once.
+- Every edit reads every item's ast ids and anchors again, one hash probe and one binary search
+  for a typical item (about 13 µs for 500 items), until span lends the two maps' arrays
+  (requested in `v2/requests/frontend-deps-items.md`). Only the touched items and the two before
+  them are hashed.
+- A slot holds 32 bytes of key, about 25 of ids and anchors and 112 of marks per item of its
+  file, and a count of the text the keys were made of, only for a file edited at least once.
 - An edit inside a `fn` of an inline module re-lowers the module: it moves the module's later
   items, whose starts are in its key.
 - Attributes are cloned on assembly, which allocates for those holding paths or inputs.
@@ -150,6 +161,11 @@ crates/hir-def/src/item_tree:
   an inner attribute to a `fn` body each lower exactly one item; `removing_an_item_lowers_none`.
 - `a_big_item_keeps_its_tree_across_an_edit_elsewhere`: a `macro_rules!` of more than 4 KiB is
   not lowered again for an edit of another item, and is for an edit of its own.
+- `an_edit_hashes_only_the_items_it_touched`: an edit inside one of 40 items' bodies hashes 3
+  items (it and the two before it), an item appended hashes 3, the first item removed hashes 1,
+  each tree still whole; `common_ends_are_the_longest_that_do_not_overlap` holds the compare to
+  a byte-by-byte one. The counting tests see their own slots: under `cfg(test)` the slots are
+  per thread.
 - `attributes_are_found_as_a_search_of_their_owners_finds_them`: the rank index `attrs` reads
   gives what a binary search of the owners gives, for every item of a tree of more than two
   blocks of 64.

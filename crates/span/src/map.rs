@@ -38,6 +38,17 @@ pub struct SpanMap {
     /// token tree to the macro it is passed on to, which the text does not show.
     fragment_starts: Vec<TextSize>,
     fragment_ends: Vec<TextSize>,
+    /// Each fragment's range and the span of the invisible group it was (its metavariable's),
+    /// which no piece of the text holds: an invisible delimiter has no text. Sorted by start,
+    /// then end; of fragments with one range (a fragment passed on whole to another macro), the
+    /// innermost first.
+    fragment_spans: Vec<(TextRange, Span)>,
+}
+
+/// What [`SpanMap::fragment_spans`] is sorted by: where a fragment starts, then where it ends.
+#[inline]
+fn fragment_key(range: TextRange) -> u64 {
+    radix::pack_32(u32::from(range.start()), u32::from(range.end()))
 }
 
 /// How many of the sorted `offsets` are `offset`.
@@ -90,6 +101,7 @@ impl PartialEq for SpanMap {
             && self.dropped_semicolon == other.dropped_semicolon
             && self.fragment_starts == other.fragment_starts
             && self.fragment_ends == other.fragment_ends
+            && self.fragment_spans == other.fragment_spans
     }
 }
 
@@ -103,6 +115,7 @@ impl Hash for SpanMap {
         self.dropped_semicolon.hash(state);
         self.fragment_starts.hash(state);
         self.fragment_ends.hash(state);
+        self.fragment_spans.hash(state);
     }
 }
 
@@ -115,6 +128,7 @@ impl fmt::Debug for SpanMap {
             .field("dropped_semicolon", &self.dropped_semicolon)
             .field("fragment_starts", &self.fragment_starts)
             .field("fragment_ends", &self.fragment_ends)
+            .field("fragment_spans", &self.fragment_spans)
             .finish()
     }
 }
@@ -137,6 +151,8 @@ impl SpanMap {
             fragment_starts: Vec::new(),
             // alloc: as `fragment_starts`
             fragment_ends: Vec::new(),
+            // alloc: as `fragment_starts`
+            fragment_spans: Vec::new(),
         }
     }
 
@@ -148,6 +164,7 @@ impl SpanMap {
         self.spans.shrink_to_fit();
         radix::sort_copy_by_key(&mut self.fragment_starts, |it| u32::from(*it));
         radix::sort_copy_by_key(&mut self.fragment_ends, |it| u32::from(*it));
+        radix::sort_copy_by_key(&mut self.fragment_spans, |&(range, _)| fragment_key(range));
     }
 
     /// Pushes a new span onto the [`SpanMap`].
@@ -194,10 +211,24 @@ impl SpanMap {
         idx.checked_sub(1).map_or(TextSize::new(0), |prev| self.ends[prev])
     }
 
-    /// Records that the tokens of `range` are one macro fragment.
-    pub fn push_fragment(&mut self, range: TextRange) {
+    /// Records that the tokens of `range` are one macro fragment, an invisible group of `span`.
+    /// Of fragments with one range, push the innermost first (as a group closes).
+    pub fn push_fragment(&mut self, range: TextRange, span: Span) {
         self.fragment_starts.push(range.start());
         self.fragment_ends.push(range.end());
+        self.fragment_spans.push((range, span));
+    }
+
+    /// The span of the fragment whose range is `range`, exactly: the invisible group's, which
+    /// is its metavariable's. Of fragments with that range, the innermost's. `None` when no
+    /// fragment is exactly `range`. A binary search of the fragments.
+    pub fn fragment_span(&self, range: TextRange) -> Option<Span> {
+        let key = fragment_key(range);
+        let first = self.fragment_spans.partition_point(|&(it, _)| fragment_key(it) < key);
+        match self.fragment_spans.get(first) {
+            Some(&(it, span)) if it == range => Some(span),
+            _ => None,
+        }
     }
 
     /// How many macro fragments start at `offset`.
@@ -342,11 +373,30 @@ impl SpanMap {
             }
             true
         });
+        // A fragment keeps its span while both its start and its end stay, by the two rules
+        // above: one that holds the replaced text or is apart from it.
+        self.fragment_spans.retain_mut(|(range, _)| {
+            let (mut start, mut end) = (range.start(), range.end());
+            if other_range.contains(start) || (other_range.start() < end && end <= other_range.end())
+            {
+                return false;
+            }
+            if start >= other_range.end() {
+                shift(&mut start);
+            }
+            if end > other_range.end() {
+                shift(&mut end);
+            }
+            *range = TextRange::new(start, end);
+            true
+        });
         let start = other_range.start();
         self.fragment_starts.extend(other.fragment_starts.iter().map(|&offset| offset + start));
         self.fragment_ends.extend(other.fragment_ends.iter().map(|&offset| offset + start));
+        self.fragment_spans.extend(other.fragment_spans.iter().map(|&(range, span)| (range + start, span)));
         radix::sort_copy_by_key(&mut self.fragment_starts, |it| u32::from(*it));
         radix::sort_copy_by_key(&mut self.fragment_ends, |it| u32::from(*it));
+        radix::sort_copy_by_key(&mut self.fragment_spans, |&(range, _)| fragment_key(range));
 
         // Matched arm info is no longer correct once we have multiple macros.
         self.matched_arm = None;
@@ -1044,6 +1094,113 @@ mod tests {
                     let hash = |it: &SpanMap| rustc_hash::FxBuildHasher.hash_one(it);
                     assert_eq!(hash(a), hash(b));
                 }
+            }
+        }
+    }
+
+    /// A metavariable's span, `n` past the start of anchor 7's text.
+    #[cfg(feature = "salsa")]
+    fn group(n: u32) -> Span {
+        let anchor = crate::SpanAnchor { file_id: file(), ast_id: id(7) };
+        Span { range: range(n, n + 2), anchor, ctx: SyntaxContext::root(crate::Edition::CURRENT) }
+    }
+
+    /// A fragment's span is found by its exact range only; of two with one range, the innermost
+    /// (pushed first, as groups close) is found; pushing out of order changes nothing once
+    /// finished; and the spans are part of what the map is.
+    #[cfg(feature = "salsa")]
+    #[test]
+    fn a_fragment_keeps_its_groups_span() {
+        let (mut map, _) = spans(&mut SplitMix64::new(9), 20);
+        map.push_fragment(range(10, 14), group(1));
+        map.push_fragment(range(3, 8), group(2));
+        map.push_fragment(range(3, 8), group(3));
+        map.push_fragment(range(3, 20), group(4));
+        let plain = map.fragment_spans.is_sorted_by_key(|&(it, _)| fragment_key(it));
+        assert!(!plain, "pushed as groups close, not in order");
+        map.finish();
+        assert_eq!(map.fragment_span(range(10, 14)), Some(group(1)));
+        assert_eq!(map.fragment_span(range(3, 8)), Some(group(2)), "the innermost");
+        assert_eq!(map.fragment_span(range(3, 20)), Some(group(4)));
+        for missing in [range(3, 7), range(3, 9), range(4, 8), range(10, 15), range(0, 0), range(30, 40)] {
+            assert_eq!(map.fragment_span(missing), None, "{missing:?}");
+        }
+        assert_eq!(map.fragments_starting_at(at(3)), 3);
+        assert_eq!(map.fragments_ending_at(at(8)), 2);
+
+        let (mut other, _) = spans(&mut SplitMix64::new(9), 20);
+        other.push_fragment(range(10, 14), group(1));
+        other.push_fragment(range(3, 8), group(2));
+        other.push_fragment(range(3, 8), group(5));
+        other.push_fragment(range(3, 20), group(4));
+        other.finish();
+        assert!(map != other, "the spans are part of the map");
+        assert_eq!(SpanMap::empty().fragment_span(range(0, 0)), None);
+    }
+
+    /// What a merge keeps of the fragments' spans, by the rules of its fragment starts and ends
+    /// taken one at a time: the moved fragments of the map merged in, and of this map's those
+    /// whose start and end both stay, shifted past the replaced text.
+    #[cfg(feature = "salsa")]
+    #[test]
+    fn a_merge_keeps_the_fragments_spans_by_their_starts_and_ends() {
+        let mut rng = SplitMix64::new(12);
+        let fragments = |rng: &mut SplitMix64, map: &mut SpanMap, len: u32, n: u32| {
+            let mut pushed = Vec::new();
+            for i in 0..n {
+                let start = rng.below(u64::from(len)) as u32;
+                let end = start + 1 + rng.below(u64::from(len - start)) as u32;
+                map.push_fragment(range(start, end), group(i));
+                pushed.push((range(start, end), group(i)));
+            }
+            pushed
+        };
+        for _ in 0..200 {
+            let (n, other_n) = (1 + rng.below(30) as usize, 1 + rng.below(10) as usize);
+            let (mine_n, theirs_n) = (rng.below(6) as u32, rng.below(4) as u32);
+            let (mut map, pairs) = spans(&mut rng, n);
+            let len = u32::from(pairs.0.last().expect("a span").0);
+            let mine = fragments(&mut rng, &mut map, len, mine_n);
+            map.finish();
+            let (mut other, other_pairs) = spans(&mut rng, other_n);
+            let size = other_pairs.0.last().expect("a span").0;
+            let theirs = fragments(&mut rng, &mut other, u32::from(size), theirs_n);
+            other.finish();
+            let start = rng.below(u64::from(len + 1)) as u32;
+            let end = start + rng.below(u64::from(len - start + 1)) as u32;
+            let replaced = range(start, end);
+            map.merge(replaced, size, &other);
+
+            let shift = |offset: TextSize| match offset > replaced.end() {
+                true => offset + size - replaced.len(),
+                false => offset,
+            };
+            let mut want: Vec<(TextRange, Span)> = mine
+                .iter()
+                .filter(|(it, _)| {
+                    let start_stays = !replaced.contains(it.start());
+                    let end_stays = !(replaced.start() < it.end() && it.end() <= replaced.end());
+                    start_stays && end_stays
+                })
+                .map(|&(it, span)| {
+                    let start = match it.start() >= replaced.end() {
+                        true => it.start() + size - replaced.len(),
+                        false => it.start(),
+                    };
+                    (TextRange::new(start, shift(it.end())), span)
+                })
+                .chain(theirs.iter().map(|&(it, span)| (it + replaced.start(), span)))
+                .collect();
+            want.sort_by_key(|&(it, _)| (it.start(), it.end()));
+            for &(it, _) in &want {
+                let innermost = want.iter().find(|(other, _)| *other == it).map(|&(_, span)| span);
+                assert_eq!(map.fragment_span(it), innermost, "{it:?} after replacing {replaced:?}");
+            }
+            let ranges: Vec<TextRange> = map.fragment_spans.iter().map(|&(it, _)| it).collect();
+            assert_eq!(ranges, want.iter().map(|&(it, _)| it).collect::<Vec<_>>());
+            for &(it, _) in &map.fragment_spans {
+                assert!(map.fragments_starting_at(it.start()) > 0, "{it:?}: its start is kept");
+                assert!(map.fragments_ending_at(it.end()) > 0, "{it:?}: its end is kept");
             }
         }
     }

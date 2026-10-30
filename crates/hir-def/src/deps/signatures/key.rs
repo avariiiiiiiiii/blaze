@@ -20,8 +20,7 @@ use smallvec::SmallVec;
 
 use crate::{
     AdtId, AstId, ConstId, EnumId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup,
-    ModuleId, StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId,
-    nameres::crate_def_map,
+    ModuleId, StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId, nameres::crate_def_map,
 };
 
 /// The domain of an item's key.

@@ -1476,6 +1476,21 @@ R10 replaces R2's in-place `settle` with a settle that consumes the building sco
 table builders (`sorted_table`, `by_def_table`, `by_name`, `sorted_small`) are reused as they are.
 
 > forwarded to db (db-expand-names-next2; R10.4 `visibility.rs` to db-expand-next2) (requests, pass 19; told by tmux).
+> outcome (requests pass 19, R10.1-R10.3, R10.5): deferred, not applied; reasons below.
+> (21:20) mem-db-def-collect's Part H (H6 sends facts to frontend-nameres) answers reason (1) for
+> the building side; reason (2) stands, and R10 and Part H land together once the base has built.
+> deferred by db-expand-names (2026-10-29 21:05, Andrew's decision): not started. Two reasons.
+> (1) The premise is partly stale. Since frontend-nameres-core's switch-over (`v2/requests/db.md`,
+> applied 21:00), a cold `crate_local_def_map` runs through `nameres/facts/` (`facts::collect_crate`
+> in `facts/driver.rs`, frontend-nameres's), and `collector.rs` is `#[cfg(test)]`, kept only as the
+> differential reference. R10.3's `BuildingDefMap<'f>` and its 33 collector call sites would land
+> on the test-only path. The cold path T5 measures is facts'. Please retarget the building side:
+> say which facts queries hold the building scopes and def map (`unit.rs`, `macros.rs`,
+> `driver.rs`), and send that part to frontend-nameres. R10.1 (`DefMapRead`/`ResolvePath`) and
+> R10.2 (`ItemScope<S>`) still stand as the shared base.
+> (2) hir-def does not build yet: H1-H3, R1-R5, T1-T3 and the facts switch-over are all unbuilt.
+> R10 rewrites `item_scope.rs` and `path_resolution.rs` over them. It waits until that tree has
+> built and run once in an ix VM.
 
 ### R10.1 The view (`nameres/path_resolution.rs`)
 
@@ -1999,7 +2014,290 @@ The callers (`resolver.rs`, `collector.rs`, `facts/unit.rs`, `path_resolution.rs
   `Modules` take owned values, and `frame::task` resets the frame after the query returns. A
   `BuildingDefMap<'f>` can't outlive `'f`, so the borrow checker enforces this.
 
+### R10.6 The ruling's names, and the exact types (2026-10-29, after mem-db-def's ruling)
+
+mem-db-def's ruling (`docs/v2/plan/lanes/mem/db-def.md`, "Ruling: the scopes a collection
+builds live in its frame") takes the full fix: the building map in the frame, not a
+reservation. Its tmux text names the parameter `A: Allocator + Copy = Global` on `ItemScope`,
+`ModuleData`, `ModulesMap` and `DefMap`, with the `ThinVec`s becoming `Vec<T, A>`. The ruling's
+text keeps R10's `ItemScope<S: ScopeStore = Settled>`. mem-db-def-collect has written its Part H
+(H1 to H9, `v2/requests/mem-db-def-collect.md`) against R10's names exactly. So the names stay
+R10's. How each name in the tmux text maps, and why:
+
+| Asked | Is, in R10 | Why |
+|---|---|---|
+| `ItemScope<A: Allocator + Copy = Global>`, `ThinVec` becoming `Vec<T, A>` | `ItemScope<S: ScopeStore = Settled>`: `S::Vec<T>` is `Vec<T, &'f Frame>` for `Building<'f>` and `ThinVec<T>` for `Settled` | `ThinVec` takes no allocator, and a settled `Vec<T, Global>` is 24 bytes where a `ThinVec` is 8. The scope has 22 lists and 8 maps, so that is about 350 bytes more per module in every memo, about 70 MB for 200 000 modules. A settled scope also needs different tables (exact boxes, not remade cells), which an allocator parameter cannot select. `ScopeStore` is the allocator plus those three choices. |
+| `ModuleData<A>`, `ModulesMap<A>` | `BuildingModule<'f>` (inline scope and children in the frame), and `BuildingDefMap::modules`/`module_at`; the collected `ModuleData` holds a `ModuleScope` id | A collected module's scope is a salsa `ModuleScope`, not an inline scope. One type for both would keep today's `ScopeSlot` branch in every read of every collected module. |
+| `DefMap<A = Global>` | `BuildingDefMap<'f>` while collecting; `DefMap` once settled | the same: the building map holds scopes and the settled one holds ids |
+| path resolution as `impl<A: Allocator + Copy> DefMap<A>` | `trait ResolvePath: DefMapRead`, `impl<M: DefMapRead> ResolvePath for M` | One body compiled for each, as asked. It serves the building map and the settled maps it walks into (dependencies, enclosing blocks, the prelude's crate). |
+| `per_ns` | unchanged | `PerNs` and `Item` own nothing |
+
+The exact types, before and after (`item_scope.rs`):
+
+```rust
+// before (158, 542, 607, 744)
+pub(crate) struct Index { slots: ThinVec<u32> }
+pub(crate) struct Column<D, I> { entries: ThinVec<Entry>, of: PhantomData<fn() -> Item<D, I>> }
+pub(crate) struct Keyed<K, V> { entries: ThinVec<(K, V)>, index: Index }
+pub(crate) struct Bits(ThinVec<u64>);
+
+// after
+pub(crate) struct Index<S: ScopeStore = Settled> { slots: S::Vec<u32> }
+pub(crate) struct Column<D, I, S: ScopeStore = Settled> {
+    entries: S::Vec<Entry>,
+    of: PhantomData<fn() -> Item<D, I>>,
+}
+pub(crate) struct Keyed<K, V, S: ScopeStore = Settled> { entries: S::Vec<(K, V)>, index: Index<S> }
+pub(crate) struct Bits<S: ScopeStore = Settled>(S::Vec<u64>);
+```
+
+`ItemScope` (773 to 842), every field. Before:
+
+```rust
+pub struct ItemScope {
+    pub(crate) types: Column<ModuleDefId, ImportOrExternCrate>,
+    pub(crate) values: Column<ModuleDefId, ImportOrGlob>,
+    pub(crate) macros: Column<MacroId, ImportOrExternCrate>,
+    pub(crate) unresolved: ThinVec<Name>,
+    pub(crate) names: Index,
+    pub(crate) sorted: OnceLock<Box<[u32]>>,
+    pub(crate) by_def: OnceLock<Box<[u32]>>,
+    pub(crate) declarations: ThinVec<ModuleDefId>,
+    pub(crate) impls: ThinVec<ImplId>,
+    pub(crate) trait_impl: Bits,
+    pub(crate) reservation_impl: Bits,
+    pub(crate) builtin_derive_impls: ThinVec<BuiltinDeriveImplId>,
+    pub(crate) extern_blocks: ThinVec<ExternBlockId>,
+    pub(crate) unnamed_consts: ThinVec<ConstId>,
+    pub(crate) unnamed_trait_imports: ThinVec<(TraitId, Item<(), ImportOrExternCrate>)>,
+    pub(crate) underscore_imports: ThinVec<UnderscoreImport>,
+    pub(crate) glob_ambiguities: ThinVec<GlobAmbiguity>,
+    pub(crate) shadowed_imports: ThinVec<ShadowedImport>,
+    pub(crate) use_imports_types: Keyed<ImportOrExternCrate, ImportOrDef>,
+    pub(crate) use_imports_values: Keyed<ImportOrGlob, ImportOrDef>,
+    pub(crate) use_imports_macros: Keyed<ImportOrExternCrate, ImportOrDef>,
+    pub(crate) use_decls: ThinVec<UseId>,
+    pub(crate) extern_crate_decls: ThinVec<ExternCrateId>,
+    pub(crate) legacy_macros: Keyed<Name, SmallVec<[MacroId; 1]>>,
+    pub(crate) attr_macros: Keyed<AstId<ast::Item>, MacroCallId>,
+    pub(crate) macro_invocations: Keyed<AstId<ast::MacroCall>, MacroCallId>,
+    pub(crate) derive_macros: Keyed<AstId<ast::Adt>, SmallVec<[DeriveMacroInvocation; 1]>>,
+}
+```
+
+After (the doc comments of today's fields stay on each; the `sorted` and `by_def` comments
+move to `SettledTables` and `BuildingTables`):
+
+```rust
+pub struct ItemScope<S: ScopeStore = Settled> {
+    pub(crate) types: Column<ModuleDefId, ImportOrExternCrate, S>,
+    pub(crate) values: Column<ModuleDefId, ImportOrGlob, S>,
+    pub(crate) macros: Column<MacroId, ImportOrExternCrate, S>,
+    pub(crate) unresolved: S::Vec<Name>,
+    pub(crate) names: Index<S>,
+    pub(crate) tables: S::Tables,
+    pub(crate) declarations: S::Vec<ModuleDefId>,
+    pub(crate) impls: S::Vec<ImplId>,
+    pub(crate) trait_impl: Bits<S>,
+    pub(crate) reservation_impl: Bits<S>,
+    pub(crate) builtin_derive_impls: S::Vec<BuiltinDeriveImplId>,
+    pub(crate) extern_blocks: S::Vec<ExternBlockId>,
+    pub(crate) unnamed_consts: S::Vec<ConstId>,
+    pub(crate) unnamed_trait_imports: S::Vec<(TraitId, Item<(), ImportOrExternCrate>)>,
+    pub(crate) underscore_imports: S::Vec<UnderscoreImport>,
+    pub(crate) glob_ambiguities: S::Vec<GlobAmbiguity>,
+    pub(crate) shadowed_imports: S::Vec<ShadowedImport>,
+    pub(crate) use_imports_types: Keyed<ImportOrExternCrate, ImportOrDef, S>,
+    pub(crate) use_imports_values: Keyed<ImportOrGlob, ImportOrDef, S>,
+    pub(crate) use_imports_macros: Keyed<ImportOrExternCrate, ImportOrDef, S>,
+    pub(crate) use_decls: S::Vec<UseId>,
+    pub(crate) extern_crate_decls: S::Vec<ExternCrateId>,
+    pub(crate) legacy_macros: Keyed<Name, S::List<MacroId>, S>,
+    pub(crate) attr_macros: Keyed<AstId<ast::Item>, MacroCallId, S>,
+    pub(crate) macro_invocations: Keyed<AstId<ast::MacroCall>, MacroCallId, S>,
+    pub(crate) derive_macros: Keyed<AstId<ast::Adt>, S::List<DeriveMacroInvocation<S>>, S>,
+}
+```
+
+Each struct's `impl` blocks split into three:
+
+- `impl<.., S: ScopeStore>` holds the reads: `Index::probe`, `Column::iter`/`get`/`len`,
+  `Keyed::get`/`iter`/`keys`/`values`/`len`, `Bits::get`.
+- `impl<.., 'f> .. <.., Building<'f>>` holds the writes: `push`, `insert`, `set`, `reserve`, and
+  `new_in(frame)` in place of `Default`.
+- `impl ..` on `Settled` holds the frozen read's `reserve`/`push_unindexed` and `reindex`.
+
+The rules for `ItemScope` itself are R10.2's. The `ScopeSlot` and `ModulesSlot` building arms
+and `BuildingScope` go, as R10.3 says.
+
+### R10.7 `ItemScope::owned_allocations` (asked by mem-db-def-collect, H9.1; `item_scope.rs`)
+
+```rust
+#[cfg(test)]
+impl Index {
+    fn owned_allocations(&self) -> u64 {
+        u64::from(!self.slots.is_empty())
+    }
+}
+
+#[cfg(test)]
+impl<K, V> Keyed<K, V> {
+    fn owned_allocations(&self) -> u64 {
+        u64::from(!self.entries.is_empty()) + self.index.owned_allocations()
+    }
+}
+
+#[cfg(test)]
+impl ItemScope {
+    /// The heap buffers this settled scope owns, as `settle` makes them: one per non-empty list,
+    /// map, index and table, and one per map value that left its inline slot.
+    pub(crate) fn owned_allocations(&self) -> u64 {
+        let Self {
+            types,
+            values,
+            macros,
+            unresolved,
+            names,
+            tables,
+            declarations,
+            impls,
+            trait_impl,
+            reservation_impl,
+            builtin_derive_impls,
+            extern_blocks,
+            unnamed_consts,
+            unnamed_trait_imports,
+            underscore_imports,
+            glob_ambiguities,
+            shadowed_imports,
+            use_imports_types,
+            use_imports_values,
+            use_imports_macros,
+            use_decls,
+            extern_crate_decls,
+            legacy_macros,
+            attr_macros,
+            macro_invocations,
+            derive_macros,
+        } = self;
+        let list = |len: usize| u64::from(len > 0);
+        let spilled = |len: usize| u64::from(len > 1);
+        let lists = [
+            types.entries.len(),
+            values.entries.len(),
+            macros.entries.len(),
+            unresolved.len(),
+            tables.sorted.len(),
+            tables.by_def.len(),
+            declarations.len(),
+            impls.len(),
+            trait_impl.0.len(),
+            reservation_impl.0.len(),
+            builtin_derive_impls.len(),
+            extern_blocks.len(),
+            unnamed_consts.len(),
+            unnamed_trait_imports.len(),
+            underscore_imports.len(),
+            glob_ambiguities.len(),
+            shadowed_imports.len(),
+            use_decls.len(),
+            extern_crate_decls.len(),
+        ];
+        let maps = [
+            use_imports_types.owned_allocations(),
+            use_imports_values.owned_allocations(),
+            use_imports_macros.owned_allocations(),
+            legacy_macros.owned_allocations(),
+            attr_macros.owned_allocations(),
+            macro_invocations.owned_allocations(),
+            derive_macros.owned_allocations(),
+        ];
+        let macro_lists: u64 = legacy_macros.values().map(|it| spilled(it.len())).sum();
+        let derive_lists: u64 = derive_macros
+            .values()
+            .map(|calls| {
+                spilled(calls.len())
+                    + calls.iter().map(|it| spilled(it.derive_call_ids.len())).sum::<u64>()
+            })
+            .sum();
+        lists.into_iter().map(list).sum::<u64>()
+            + maps.into_iter().sum::<u64>()
+            + names.owned_allocations()
+            + macro_lists
+            + derive_lists
+    }
+}
+```
+
+A settled list is exact, so it is allocated exactly when it is non-empty. An empty `ThinVec` and
+an empty box allocate nothing, and a `SmallVec<[_; 1]>` allocates only past one element.
+
+### R10.8 `Declared` and `reserve_declared` (asked by mem-db-def-collect, H9.2; `item_scope.rs`)
+
+Collect's `Declared` struct, as its H9.2 gives it, goes in `item_scope.rs`. Then:
+
+```rust
+impl Bits<Building<'_>> {
+    fn reserve(&mut self, bits: usize) {
+        self.0.reserve(bits.div_ceil(64));
+    }
+}
+
+impl<'f> ItemScope<Building<'f>> {
+    /// Room for the items one list declares into this scope: a capacity hint in the frame, so
+    /// the lists the item tree already counts grow once.
+    pub(crate) fn reserve_declared(&mut self, d: &Declared) {
+        let n = |it: u32| it as usize;
+        self.declarations.reserve(n(d.named));
+        self.types.entries.reserve(n(d.named));
+        self.values.entries.reserve(n(d.named));
+        self.impls.reserve(n(d.impls));
+        self.trait_impl.reserve(n(d.impls));
+        self.reservation_impl.reserve(n(d.impls));
+        self.use_decls.reserve(n(d.uses));
+        self.extern_crate_decls.reserve(n(d.extern_crates));
+        self.macro_invocations.reserve(n(d.macro_calls));
+        self.legacy_macros.reserve(n(d.macro_rules));
+        self.unnamed_consts.reserve(n(d.unnamed_consts));
+        self.extern_blocks.reserve(n(d.extern_blocks));
+    }
+}
+```
+
+`named` reserves both `types` and `values`. A named item lands in one of them, or both for a
+unit or tuple struct, so this over-reserves in the frame by at most `named` entries, which costs
+no global allocation.
+
+### R10.9 `Visibility::max` and `min` (asked by mem-db-def-collect, H9.3; `visibility.rs` 159, 222; db-expand)
+
+In both, `def_map: &DefMap,` becomes `def_map: &impl DefMapRead,`. The bodies read only
+`def_map.krate()` and `def_map.block_id()`, which `DefMapRead` provides, and are unchanged.
+Callers pass `&DefMap` (resolver, facts) or `&BuildingDefMap` (`collector.rs` 1716, 1857).
+
+### R10.10 After db-expand-names' deferral
+
+- **(1) The cold path is facts'.** mem-db-def-collect's Part H has retargeted the building side:
+  - H2 covers the two queries.
+  - H6: `facts::collect_crate` assembles the crate's map from the final round's `ModuleScope`
+    handles, so it never holds a building map. It builds through `DefMap::from_table`, and
+    `collect_block` takes and settles a `BuildingDefMap<'f>`.
+  - H7 covers the frozen read, through `from_settled`.
+  - The facts unit's own types are frontend-nameres'.
+
+  R10.3's collector sites stay on `collector.rs`, the `#[cfg(test)]` differential reference,
+  which has to compile against the same types. T5 measures whichever path
+  `crate_local_def_map` runs, and mem-db-def-collect's T6 sits beside it.
+- **(2) Order: agreed.** R10 lands after hir-def has built and run once with H1 to H3, R1 to R5,
+  T1 to T3 and the facts switch-over. R10.1 (`DefMapRead`/`ResolvePath`) and R10.2 plus R10.6
+  (`ItemScope<S>`) go first, since collect's Part H builds on them. R10.3, R10.7 to R10.9 and
+  collect's Part H follow.
+- **Two corrections to R10.3, from collect's H1.** `BuildingDefMap::new_in` takes the root's
+  `(ModuleOrigin, Visibility)`, since there is no building `ModuleData` to pass. `child` keys
+  `child_at` by `(module, *name)` (`Name` is `Copy`).
+
 ## T5. A cold `crate_local_def_map` allocates the same for any width (`nameres/tests/budget.rs`, collect's Part F file; db-expand-names)
+
+> deferred by db-expand-names (2026-10-29 21:05) with R10; see R10's note.
 
 With R10, a cold collection's global allocations are the settled tables (one per non-empty list,
 map, index and table) plus salsa's own costs for the query and the ids it makes. Neither depends

@@ -20,6 +20,22 @@ pub enum ProcMacroKind {
     Attr,
 }
 
+/// One call of a proc macro: what every expander is given.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcMacroCall<'a> {
+    /// The input: the item for a derive or attribute, the arguments for a bang macro.
+    pub subtree: &'a tt::TopSubtree,
+    /// The attribute's own arguments, for [`ProcMacroKind::Attr`].
+    pub attrs: Option<&'a tt::TopSubtree>,
+    /// The calling crate's environment variables.
+    pub env: &'a Env,
+    pub def_site: Span,
+    pub call_site: Span,
+    pub mixed_site: Span,
+    /// The calling crate's proc-macro working directory.
+    pub current_dir: &'a str,
+}
+
 /// A proc-macro expander implementation.
 pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
     /// Whether calls share mutable state within one calling crate's compilation.
@@ -27,18 +43,11 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
         false
     }
 
-    /// Run the expander with the given input subtree, optional attribute input subtree (for
-    /// [`ProcMacroKind::Attr`]), environment variables, and span information.
+    /// Run the expander on one call.
     fn expand(
         &self,
         db: &Db,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        current_dir: String,
+        call: ProcMacroCall<'_>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError>;
 
     /// Run in the calling crate's compilation session. Native expanders use `expand`.
@@ -46,15 +55,9 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
         &self,
         db: &Db,
         _calling_crate: Crate,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        current_dir: String,
+        call: ProcMacroCall<'_>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
-        self.expand(db, subtree, attrs, env, def_site, call_site, mixed_site, current_dir)
+        self.expand(db, call)
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool; // dyn: comparing expanders when a crate's macros are set, not per expansion
@@ -387,19 +390,17 @@ impl CustomProcMacroExpander {
 
                 // Proc macros have access to the environment variables of the invoking crate.
                 let env = calling_crate.env(db);
-                let current_dir = calling_crate.data(db).proc_macro_cwd.to_string(); // alloc: one path per proc-macro call, the `String` that `ProcMacroExpander::expand_in` takes (implemented in six crates); the expansion costs far more
-
-                match proc_macro.expander.expand_in(
-                    db,
-                    calling_crate,
-                    tt,
-                    attr_arg,
+                let call = ProcMacroCall {
+                    subtree: tt,
+                    attrs: attr_arg,
                     env,
                     def_site,
                     call_site,
                     mixed_site,
-                    current_dir,
-                ) {
+                    current_dir: calling_crate.data(db).proc_macro_cwd.as_str(),
+                };
+
+                match proc_macro.expander.expand_in(db, calling_crate, call) {
                     Ok(t) => ExpandResult::ok(t),
                     Err(err) => match err {
                         // Don't discard the item in case something unexpected happened while expanding attributes

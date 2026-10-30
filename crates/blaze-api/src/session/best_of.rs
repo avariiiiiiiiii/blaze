@@ -55,10 +55,15 @@ impl BestOf {
         BestOf { base, candidates: Vec::new(), running: 0 }
     }
 
-    /// The next candidate, whose job runs on `opened`.
-    pub(super) fn started(&mut self, job: JobId, opened: Opened) -> u32 {
+    /// The number the next candidate gets.
+    pub(super) fn next(&self) -> u32 {
+        u32::try_from(self.candidates.len()).expect("fewer than 2^32 candidates")
+    }
+
+    /// The next candidate ([`BestOf::next`]), whose job runs on `opened`.
+    pub(super) fn started(&mut self, job: JobId, opened: Opened) {
         self.running += 1;
-        self.push(Candidate::new(Some(opened.view.root), Some(job), Some(opened)))
+        self.push(Candidate::new(Some(opened.view.root), Some(job), Some(opened)));
     }
 
     /// The next candidate, whose ops did not apply: it ends at once, ranked after every one that
@@ -68,7 +73,7 @@ impl BestOf {
     }
 
     fn push(&mut self, candidate: Candidate) -> u32 {
-        let at = u32::try_from(self.candidates.len()).expect("fewer than 2^32 candidates");
+        let at = self.next();
         self.candidates.push(candidate);
         at
     }

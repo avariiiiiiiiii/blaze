@@ -23,9 +23,9 @@ use span::{ErasedFileAstId, FileAstId, Span};
 
 use super::{
     AliasId, AttrOwner, Const, Enum, ExternBlock, ExternCrate, FieldsShape, Function, IdRange,
-    Impl, ImportAlias, ItemKind, ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId, NameId,
-    PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias, Union, Use,
-    UseTree, UseTreeId, VisibilityExplicitness,
+    Impl, ImportAlias, ItemKind, ItemTree, ItemTreeLens, Macro2, MacroCall, MacroRules, Mod,
+    ModItemId, NameId, PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias,
+    Union, Use, UseTree, UseTreeId, VisibilityExplicitness,
 };
 use crate::hir::persist::{Code, Column, Read, Words, WordsRec, syntax_context};
 
@@ -123,77 +123,141 @@ impl<'a> ItemTreeRef<'a> {
         self.len() == 0
     }
 
-    /// The owned tree, equal to the one written.
+    /// The owned tree, equal to the one written: its one block, sized from the buffer's column
+    /// lengths and table counts before a value is read.
     pub fn decode(self) -> Result<ItemTree, FormatError> {
         let (root, buffer) = (self.root, self.buffer);
         let invalid = |what| FormatError::Invalid { at: self.position(root), what };
-        if self.kinds.iter().any(|&kind| ItemKind::from_u8(kind).is_none()) {
-            return Err(invalid("an item kind out of range"));
+        macro_rules! follow {
+            ($($column:ident),+) => { $( let $column = root.$column.follow(buffer)?; )+ };
         }
-        let kinds: Box<[ItemKind]> = (self.kinds.iter())
-            .map(|&kind| ItemKind::ALL[kind as usize])
-            .collect(); // alloc: the tree's column, once a store read, the edge
-        let ast_ids = (self.ast_ids.iter())
-            .map(|&raw| FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(raw)))
-            .collect(); // alloc: the tree's column, once a store read, the edge
-        let calls = root.macro_calls.follow(buffer)?;
-        // alloc: the tree's column, once a store read, the edge
-        let mut macro_calls = Vec::with_capacity(calls.len());
-        for call in calls {
-            let expand_to = expand_to_of(call.expand_to)
-                .ok_or_else(|| invalid("a macro expansion kind out of range"))?;
-            let ctxt =
-                syntax_context(call.ctxt).ok_or_else(|| invalid("a syntax context of u32::MAX"))?;
-            macro_calls.push(MacroCall { path: call.path, ctxt, expand_to });
-        }
-        let macro_calls = macro_calls.into_boxed_slice();
-        let words = Read::new(&root.words, buffer);
-        let mut tree = ItemTree {
-            top_level: self.top_level.into(),
-            kinds,
-            data: column(&root.data, buffer)?,
-            ast_ids,
-            children: self.children.into(),
-            consts: column(&root.consts, buffer)?,
-            enums: column(&root.enums, buffer)?,
-            extern_blocks: column(&root.extern_blocks, buffer)?,
-            extern_crates: column(&root.extern_crates, buffer)?,
-            functions: column(&root.functions, buffer)?,
-            impls: column(&root.impls, buffer)?,
-            macro2s: column(&root.macro2s, buffer)?,
+        follow!(
+            data,
+            consts,
+            enums,
+            extern_blocks,
+            extern_crates,
+            functions,
+            impls,
+            macro2s,
             macro_calls,
-            macro_rules: column(&root.macro_rules, buffer)?,
-            mods: column(&root.mods, buffer)?,
-            statics: column(&root.statics, buffer)?,
-            structs: column(&root.structs, buffer)?,
-            traits: column(&root.traits, buffer)?,
-            type_aliases: column(&root.type_aliases, buffer)?,
-            unions: column(&root.unions, buffer)?,
-            uses: column(&root.uses, buffer)?,
-            use_trees: column(&root.use_trees, buffer)?,
-            use_tree_lists: column(&root.use_tree_lists, buffer)?,
-            ctor_vis: column(&root.ctor_vis, buffer)?,
-            names: words.from(root.names_at).get()?,
-            paths: words.from(root.paths_at).get()?,
-            vis: words.from(root.vis_at).get()?,
-            attr_owners: column(&root.attr_owners, buffer)?,
-            attr_index: Box::default(),
-            attrs: words.from(root.attrs_at).get()?,
-            cfgs: words.from(root.cfgs_at).get()?,
+            macro_rules,
+            mods,
+            statics,
+            structs,
+            traits,
+            type_aliases,
+            unions,
+            uses,
+            use_trees,
+            use_tree_lists,
+            ctor_vis,
+            attr_owners
+        );
+        let words = Read::new(&root.words, buffer);
+        let mut names = words.from(root.names_at);
+        let mut paths = words.from(root.paths_at);
+        let mut vis = words.from(root.vis_at);
+        let mut attrs = words.from(root.attrs_at);
+        let mut cfgs = words.from(root.cfgs_at);
+        let lens = ItemTreeLens {
+            top_level: self.top_level.len(),
+            kinds: self.kinds.len(),
+            data: data.len(),
+            ast_ids: self.ast_ids.len(),
+            children: self.children.len(),
+            consts: consts.len(),
+            enums: enums.len(),
+            extern_blocks: extern_blocks.len(),
+            extern_crates: extern_crates.len(),
+            functions: functions.len(),
+            impls: impls.len(),
+            macro2s: macro2s.len(),
+            macro_calls: macro_calls.len(),
+            macro_rules: macro_rules.len(),
+            mods: mods.len(),
+            statics: statics.len(),
+            structs: structs.len(),
+            traits: traits.len(),
+            type_aliases: type_aliases.len(),
+            unions: unions.len(),
+            uses: uses.len(),
+            use_trees: use_trees.len(),
+            use_tree_lists: use_tree_lists.len(),
+            ctor_vis: ctor_vis.len(),
+            names: names.len()?,
+            paths: paths.len()?,
+            vis: vis.len()?,
+            attr_owners: attr_owners.len(),
+            attr_index: self.kinds.len().div_ceil(64),
+            attr_list: attrs.len()?,
+            cfgs: cfgs.len()?,
         };
+        // alloc: the tree's block, once a store read, the edge
+        let tree = ItemTree::try_build(lens, |s| {
+            s.top_level.extend_from_slice(self.top_level);
+            for &kind in self.kinds {
+                let kind =
+                    ItemKind::from_u8(kind).ok_or_else(|| invalid("an item kind out of range"))?;
+                s.kinds.push(kind);
+            }
+            s.data.extend_from_slice(data);
+            s.ast_ids.extend(
+                (self.ast_ids.iter())
+                    .map(|&raw| FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(raw))),
+            );
+            s.children.extend_from_slice(self.children);
+            s.consts.extend_from_slice(consts);
+            s.enums.extend_from_slice(enums);
+            s.extern_blocks.extend_from_slice(extern_blocks);
+            s.extern_crates.extend_from_slice(extern_crates);
+            s.functions.extend_from_slice(functions);
+            s.impls.extend_from_slice(impls);
+            s.macro2s.extend_from_slice(macro2s);
+            for call in macro_calls {
+                let expand_to = expand_to_of(call.expand_to)
+                    .ok_or_else(|| invalid("a macro expansion kind out of range"))?;
+                let ctxt = syntax_context(call.ctxt)
+                    .ok_or_else(|| invalid("a syntax context of u32::MAX"))?;
+                s.macro_calls.push(MacroCall { path: call.path, ctxt, expand_to });
+            }
+            s.macro_rules.extend_from_slice(macro_rules);
+            s.mods.extend_from_slice(mods);
+            s.statics.extend_from_slice(statics);
+            s.structs.extend_from_slice(structs);
+            s.traits.extend_from_slice(traits);
+            s.type_aliases.extend_from_slice(type_aliases);
+            s.unions.extend_from_slice(unions);
+            s.uses.extend_from_slice(uses);
+            s.use_trees.extend_from_slice(use_trees);
+            s.use_tree_lists.extend_from_slice(use_tree_lists);
+            s.ctor_vis.extend_from_slice(ctor_vis);
+            for _ in 0..lens.names {
+                s.names.push(names.get()?);
+            }
+            for _ in 0..lens.paths {
+                s.paths.push(paths.get()?);
+            }
+            for _ in 0..lens.vis {
+                s.vis.push(vis.get()?);
+            }
+            s.attr_owners.extend_from_slice(attr_owners);
+            s.attr_index.extend(super::attr_blocks(attr_owners, self.kinds.len()));
+            for _ in 0..lens.attr_list {
+                s.attr_list.push(attrs.get()?);
+            }
+            for _ in 0..lens.cfgs {
+                s.cfgs.push(cfgs.get()?);
+            }
+            Ok(())
+        })?;
         check(&tree).map_err(invalid)?;
-        tree.attr_index = super::attr_index(&tree.attr_owners, tree.kinds.len());
         Ok(tree)
     }
 
     fn position<T>(&self, value: &T) -> u64 {
         (value as *const T as usize).wrapping_sub(self.buffer.as_ptr() as usize) as u64
     }
-}
-
-/// The records of a column, copied out of the buffer.
-fn column<T: Record>(slice: &Slice<T>, buffer: &[u8]) -> Result<Box<[T]>, FormatError> {
-    Ok(slice.follow(buffer)?.into())
 }
 
 /// Whether every id the tree's records hold names something the tree has, every list is within

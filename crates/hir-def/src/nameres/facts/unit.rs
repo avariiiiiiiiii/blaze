@@ -52,7 +52,8 @@ use super::{
     graph::Partition,
     ops::{DeclOp, ImportOp, MacroOp, OpLog},
     queries::{
-        self, CrateEnvKey, FactKey, RoundKey, RoundKind, Rows, RowsKey, SccKey, SccState,
+        self, CrateEnvKey, FactKey, RoundActive, RoundKey, RoundKind, Rows, RowsKey, SccKey,
+        SccState,
     },
 };
 
@@ -219,10 +220,13 @@ impl<'db> Unit<'db> {
             local,
             state,
             check,
+            // alloc: empty, allocates nothing until a block's collection makes a directive
             macros: Vec::new(),
+            // alloc: empty, allocates nothing until a read is held
             held: Vec::new(),
             touched: FxHashSet::default(),
             unresolved_extern_crates: FxHashSet::default(),
+            // alloc: empty, allocates nothing until a block's collection makes a record
             records: Vec::new(),
         }
     }
@@ -251,6 +255,7 @@ impl<'db> Unit<'db> {
             derive_helpers_in_scope: FxHashMap::default(),
             session_macros: false,
             names: uses::NameRecords::default(),
+            // alloc: empty, a component's view keeps no diagnostics
             diagnostics: Vec::new(),
             diagnostics_by_module: DiagnosticsByModule::default(),
             // clone: one count of the crate's shared data.
@@ -317,19 +322,28 @@ impl<'db> Unit<'db> {
 
     /// The members' ops of `round`, as the contract's §3 says a unit applies them: from a
     /// round-0 log those that target the module (and, in the root's, the `Splice`s); from a
-    /// later round's every resolution op.
+    /// later round's every resolution op. A later round at which it gains nothing
+    /// (`RoundModules::GAINS`) has none, and its `module_round` is not asked.
     pub(super) fn replay_round(&mut self, module: ModuleId, round: u32) {
         let db = self.db;
         let is_root = module == self.def_map.root;
+        let rows = queries::round_modules(db, RoundKey::new(db, self.def_map.krate, round));
         let ops: &'db OpLog = match round {
             0 => {
-                let rows = queries::round_modules(db, RoundKey::new(db, self.def_map.krate, 0));
                 let key = rows.row(module).and_then(|row| row.decl).unwrap_or_else(|| {
                     panic!("nameres facts: {module:?} is a module of round 0 without a round-0 key")
                 });
                 &queries::module_decls(db, key).ops
             }
-            round => &queries::module_round(db, FactKey::new(db, module, self.def_map.krate, round)).ops,
+            round => {
+                let at = rows.at(module).unwrap_or_else(|| {
+                    panic!("nameres facts: {module:?} is not a module of round {round}")
+                });
+                if !rows.gains(at) {
+                    return;
+                }
+                &queries::module_round(db, FactKey::new(db, module, self.def_map.krate, round)).ops
+            }
         };
         for op in ops.iter() {
             let applies = match op {
@@ -1243,6 +1257,7 @@ pub(crate) fn local_scope(
         derive_helpers_in_scope: FxHashMap::default(),
         session_macros: false,
         names: uses::NameRecords::default(),
+        // alloc: empty, a scope's view keeps no diagnostics
         diagnostics: Vec::new(),
         diagnostics_by_module: DiagnosticsByModule::default(),
         // clone: one count of the crate's shared data.
@@ -1284,17 +1299,112 @@ fn prelude_holder(db: &Db, round: RoundKey) -> Option<u32> {
 }
 
 /// The std prelude the round's `#[prelude_import]` resolved to, if one did: what every other
-/// component installs. Backdates while it stays.
+/// component installs, from the holder's state at the last round its component ran.
+/// Backdates while it stays.
 #[salsa::tracked]
 fn round_prelude(db: &Db, round: RoundKey) -> Option<(ModuleId, Option<UseId>)> {
     let holder = prelude_holder(db, round)?;
+    let krate = round.krate(db);
     let modules = queries::round_modules(db, round);
-    let partition = queries::partition(db, round);
+    let ran = queries::ran_by(db, round, holder);
+    // A component that does not run has the members it had when it last ran.
+    let partition = queries::partition(db, RoundKey::new(db, krate, ran));
     let anchor = modules.order[partition.anchor(partition.of(holder)) as usize];
-    queries::scc_state(db, SccKey::new(db, anchor, round.krate(db), round.round(db))).prelude
+    queries::scc_state(db, SccKey::new(db, anchor, krate, ran)).prelude
 }
 
-/// One component's resolution at one round (`nameres-core.md` §5).
+/// Whether every component runs at the round: round 0, the final round, and a round whose
+/// crate env or `#[prelude_import]` module is not the round before's.
+fn all_run(db: &Db, round: RoundKey) -> bool {
+    let (krate, r) = (round.krate(db), round.round(db));
+    if r == 0 || queries::round_kind(db, round) == RoundKind::Final {
+        return true;
+    }
+    let before = RoundKey::new(db, krate, r - 1);
+    queries::round_env(db, round) != queries::round_env(db, before)
+        || prelude_holder(db, round) != prelude_holder(db, before)
+}
+
+/// Whether component `component` of the round runs for what its members are: one gains ops or
+/// is new, or its members are not those it had when it last ran. Not whether what it read
+/// changes: `round_active` adds that.
+fn members_change(db: &Db, round: RoundKey, component: u32) -> bool {
+    let krate = round.krate(db);
+    let modules = queries::round_modules(db, round);
+    let partition = queries::partition(db, round);
+    let members = partition.members(component);
+    if members.iter().any(|&at| modules.gains(at) || modules.ran(at).is_none()) {
+        return true;
+    }
+    let anchor = partition.anchor(component);
+    let Some(ran) = modules.ran(anchor) else { return true };
+    let then = queries::partition(db, RoundKey::new(db, krate, ran));
+    let at_then = then.of(anchor);
+    then.anchor(at_then) != anchor || then.members(at_then) != members
+}
+
+/// Whether component `component` of the round runs (`queries::RoundActive`). The component of
+/// the `#[prelude_import]` is upstream of every other and reads none, so whether it runs is
+/// known without `round_active`, which reads its state when it runs.
+pub(crate) fn component_runs(db: &Db, round: RoundKey, component: u32) -> bool {
+    let partition = queries::partition(db, round);
+    match prelude_holder(db, round) {
+        Some(holder) if partition.of(holder) == component => {
+            all_run(db, round) || members_change(db, round, component)
+        }
+        _ => queries::round_active(db, round).runs(component),
+    }
+}
+
+/// Which components of the round run (`nameres-core.md` §9), upstream first: every one when
+/// [`all_run`] or the std prelude the holder resolves changes; else each one whose members
+/// change ([`members_change`]) or that read a module of one that runs, by the `upstream` of
+/// its state at the round it last ran.
+pub(crate) fn round_active(db: &Db, round: RoundKey) -> RoundActive {
+    let (krate, r) = (round.krate(db), round.round(db));
+    let modules = queries::round_modules(db, round);
+    let partition = queries::partition(db, round);
+    let n = partition.len();
+    if all_run(db, round) {
+        return RoundActive::all(n);
+    }
+    let holder = prelude_holder(db, round).map(|at| partition.of(at));
+    if let Some(component) = holder
+        && members_change(db, round, component)
+        && round_prelude(db, round) != round_prelude(db, RoundKey::new(db, krate, r - 1))
+    {
+        return RoundActive::all(n);
+    }
+
+    // alloc: the query's value, one word per 64 components.
+    let mut bits = vec![0u64; (n as usize).div_ceil(64)];
+    let runs = |bits: &[u64], c: u32| bits[(c / 64) as usize] & (1 << (c % 64)) != 0;
+    for component in 0..n {
+        let on = match holder == Some(component) {
+            true => members_change(db, round, component),
+            false => members_change(db, round, component) || {
+                let anchor = partition.anchor(component);
+                let ran = modules.ran(anchor).expect("a component whose members did not change ran before");
+                let anchor = modules.order[anchor as usize];
+                let then = queries::scc_state(db, SccKey::new(db, anchor, krate, ran));
+                then.upstream.iter().any(|&(module, _)| {
+                    let Some(at) = modules.at(module) else {
+                        panic!("nameres facts: {anchor:?} read {module:?} at round {ran}, which is not a module of round {r}")
+                    };
+                    let upstream = partition.of(at);
+                    upstream >= component || runs(&bits, upstream)
+                })
+            },
+        };
+        if on {
+            bits[(component / 64) as usize] |= 1 << (component % 64);
+        }
+    }
+    RoundActive { bits: bits.into_boxed_slice() }
+}
+
+/// One component's resolution at one round (`nameres-core.md` §5). Only a component the round
+/// runs has one (`round_active`); its state carries on from the last round it ran at.
 pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
     let (anchor, krate, r) = (key.anchor(db), key.krate(db), key.round(db));
     let round = RoundKey::new(db, krate, r);
@@ -1309,6 +1419,10 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
         anchor_at,
         "nameres facts: {anchor:?} is not the anchor of its component at round {r}"
     );
+    assert!(
+        component_runs(db, round, component),
+        "nameres facts: scc_state of {anchor:?} at round {r}, a component the round does not run"
+    );
     let member_at = partition.members(component);
     let kind = queries::round_kind(db, round);
     let env = queries::round_env(db, round);
@@ -1316,19 +1430,16 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
 
     let (holds_prelude, prelude) = installed_prelude(db, round, member_at);
 
-    // The same component at the round before: its state carries on.
-    let prev = match r {
-        0 => None,
-        _ => {
-            let prev_round = RoundKey::new(db, krate, r - 1);
+    // The same component at the last round it ran at: its state carries on.
+    let prev = match modules.ran(anchor_at) {
+        None => None,
+        Some(ran) => {
+            let prev_round = RoundKey::new(db, krate, ran);
             let prev_partition = queries::partition(db, prev_round);
-            let in_prev = (anchor_at as usize) < queries::round_modules(db, prev_round).order.len();
-            let same = in_prev && {
-                let prev_component = prev_partition.of(anchor_at);
-                prev_partition.anchor(prev_component) == anchor_at
-                    && prev_partition.members(prev_component) == member_at
-            };
-            same.then(|| (prev_round, queries::scc_state(db, SccKey::new(db, anchor, krate, r - 1))))
+            let prev_component = prev_partition.of(anchor_at);
+            let same = prev_partition.anchor(prev_component) == anchor_at
+                && prev_partition.members(prev_component) == member_at;
+            same.then(|| (prev_round, queries::scc_state(db, SccKey::new(db, anchor, krate, ran))))
         }
     };
 
@@ -1338,10 +1449,10 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
         && installed_prelude(db, prev_round, member_at) == (holds_prelude, prelude)
         && member_at.iter().all(|&at| {
             let module = modules.order[at as usize];
-            queries::module_round(db, FactKey::new(db, module, krate, r)).ops.is_empty()
+            !modules.gains(at) || queries::module_round(db, FactKey::new(db, module, krate, r)).ops.is_empty()
         })
         && prev.upstream.iter().all(|&(module, handle)| {
-            check.may_read(module) && queries::fact_handle(db, FactKey::new(db, module, krate, r)) == handle
+            check.may_read(module) && queries::fact_handle(db, fact_key_of(db, round, module)) == handle
         })
     {
         return SccState {
@@ -1419,8 +1530,9 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
     for (at, &module) in members.iter().enumerate() {
         let before = match prev {
             Some((_, prev)) => Some(prev.handles[at]),
-            None if r > 0 && queries::round_modules(db, RoundKey::new(db, krate, r - 1)).index.contains_key(&module) => {
-                Some(queries::fact_handle(db, FactKey::new(db, module, krate, r - 1)))
+            None if modules.ran(member_at[at]).is_some() => {
+                let before = RoundKey::new(db, krate, r - 1);
+                Some(queries::fact_handle(db, queries::fact_key(db, before, member_at[at])))
             }
             None => None,
         };
@@ -1450,7 +1562,7 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
     }
 
     let state = unit.into_state();
-    let handle_of = |module| queries::fact_handle(db, FactKey::new(db, module, krate, r));
+    let handle_of = |module| queries::fact_handle(db, fact_key_of(db, round, module));
     let upstream = state.upstream.iter().map(|&module| (module, handle_of(module)));
     // alloc: the value's upstream list, once per run that is not the quick path.
     let mut upstream: Vec<(ModuleId, salsa::Id)> = upstream.collect();
@@ -1470,6 +1582,14 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
         // alloc: the state the next round carries on from, once per run that is not the quick path.
         state: Arc::new(state),
     }
+}
+
+/// `queries::fact_key` of `module` of the round.
+fn fact_key_of(db: &Db, round: RoundKey, module: ModuleId) -> FactKey {
+    let Some(at) = queries::round_modules(db, round).at(module) else {
+        panic!("nameres facts: {module:?} is not a module of round {}", round.round(db))
+    };
+    queries::fact_key(db, round, at)
 }
 
 /// Whether the component of `members` (ascending module indices of `round`) holds the round's
@@ -1505,7 +1625,8 @@ impl<'db> Unit<'db> {
 }
 
 /// Where `key`'s module is: its component's state at the round, and its place among the
-/// members. A module not in the round stops, naming it.
+/// members. A module not in the round stops, naming it, and so does one whose component the
+/// round does not run (`scc_state`): its readers name it by `queries::fact_key`.
 fn member_state(db: &Db, key: FactKey) -> (&SccState, usize) {
     let (module, krate, r) = (key.module(db), key.krate(db), key.round(db));
     let round = RoundKey::new(db, krate, r);

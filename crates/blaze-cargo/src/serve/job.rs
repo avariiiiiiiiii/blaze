@@ -63,6 +63,7 @@ use crate::cli::print::Format;
 
 use super::{
     heads::Heads,
+    image::{Images, Parts},
     mounts::Mounts,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds},
     work::{
@@ -105,6 +106,7 @@ pub struct World<'a> {
     pub plane: &'a mut Plane<Value>,
     pub mounts: &'a mut Mounts,
     pub heads: &'a Heads,
+    pub images: &'a mut Images,
     pub steps: &'a Arc<dyn Steps>,
     pub effects: &'a mut Vec<Effect>,
     pub said: &'a mut Vec<Said>,
@@ -1190,7 +1192,7 @@ impl Jobs {
             name.push(' ');
             name.push_str(&unit.target.name);
             let (kind, task) = match unit.mode {
-                UnitMode::RunCustomBuild => (NodeKind::ScriptRun, Task::Loop),
+                UnitMode::RunCustomBuild => (NodeKind::ScriptRun, Task::Loop { kind: plane::loops::SCRIPT_RUN }),
                 _ => (kind, Task::Thread { kind: kinds::COMPILE, arg: at }),
             };
             w.plane.push(&mut nodes, node(kind, &name, &deps, Pool::Work, None), task);
@@ -1763,13 +1765,18 @@ impl Jobs {
         for id in &order {
             let job = self.jobs.get_mut(id).expect("a job in the order");
             if let Stage::Snapshot { ticket: None, heads, store } = &mut job.stage
-                && w.db.settled()
+                && w.images.done()
                 && store.is_none_or(|it| w.store.durable(it))
             {
                 let heads = std::mem::take(heads);
-                w.said.push(Said::Report(*id, Response::Snapshotted { heads }));
                 job.stage = Stage::Over;
-                job.over = Some((true, None));
+                match w.images.failed() {
+                    None => {
+                        w.said.push(Said::Report(*id, Response::Snapshotted { heads }));
+                        job.over = Some((true, None));
+                    }
+                    Some(why) => job.over = Some((false, Some(ApiError::new(why, None)))),
+                }
             }
             let Some((ok, error)) = &mut job.over else { continue };
             if job.finished && job.placing == 0 && job.runs == 0 && !matches!(job.stage, Stage::Runs(..)) {
@@ -1815,7 +1822,7 @@ impl Jobs {
     /// A snapshot: the image written, the journal and the store flushed, and every head as it
     /// stands, reported once all of it is durable.
     fn snapshot(&mut self, w: &mut World<'_>) -> Stage {
-        w.db.write_image(w.effects);
+        w.images.ask(Parts { db: w.db, vfs: &mut *w.vfs, predict: w.plane.predict(), effects: &mut *w.effects });
         w.store.flush(w.effects);
         let heads: Vec<(String, ContentId)> = w.vfs.heads().into_iter().map(|(head, root)| (head.to_owned(), root)).collect();
         let ticket = heads.first().and_then(|(head, root)| w.vfs.set_head(head, *root).ok());

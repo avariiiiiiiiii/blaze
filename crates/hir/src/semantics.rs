@@ -1805,6 +1805,24 @@ impl<'db> SemanticsImpl<'db> {
         self.analyze(call.syntax())?.resolve_method_call(self.db, call)
     }
 
+    /// The unstable items, each with its feature, that the method call or type-relative path
+    /// `node` passed over (rustc's `unstable_name_collisions`); empty when it passed over none.
+    pub fn unstable_candidates(
+        &self,
+        node: Either<ast::Expr, ast::Pat>,
+    ) -> Vec<(crate::AssocItem, Symbol)> {
+        let syntax = match &node {
+            Either::Left(expr) => expr.syntax(),
+            Either::Right(pat) => pat.syntax(),
+        };
+        let Some(candidates) = self.analyze(syntax).and_then(|it| it.unstable_candidates(node))
+        else {
+            return Vec::new();
+        };
+        // clone: the few passed-over items of one call, for a lint.
+        candidates.iter().map(|(item, feature)| ((*item).into(), feature.clone())).collect()
+    }
+
     /// Attempts to resolve this call expression as a method call falling back to resolving it as a field.
     pub fn resolve_method_call_fallback(
         &self,
@@ -2462,7 +2480,7 @@ impl<'db> SemanticsImpl<'db> {
         let mut resolver = sa.resolver.clone();
         let def = resolver.expression_store_owner()?;
 
-        let is_not_generated = |path: &Path| {
+        let is_not_generated = |path: Path<'_>| {
             !path.mod_path().and_then(|path| path.as_ident()).is_some_and(Name::is_generated)
         };
 
@@ -2824,7 +2842,7 @@ impl<'db> SemanticsScope<'db> {
             self.db,
             &self.resolver,
             self.infer_body,
-            &Path::BarePath(ModPath::from_segments(kind, segments)),
+            Path::BarePath(&ModPath::from_segments(kind, segments)),
             HygieneId::ROOT,
             None,
         )
@@ -2892,7 +2910,7 @@ struct RenameConflictsVisitor<'a> {
 }
 
 impl RenameConflictsVisitor<'_> {
-    fn resolve_path(&mut self, node: ExprOrPatId, path: &Path) {
+    fn resolve_path(&mut self, node: ExprOrPatId, path: Path<'_>) {
         if let Path::BarePath(path) = path
             && let Some(name) = path.as_ident()
         {

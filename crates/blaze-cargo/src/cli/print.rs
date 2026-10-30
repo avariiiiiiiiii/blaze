@@ -4,11 +4,17 @@
 //! `core/compiler/mod.rs`).
 //!
 //! Per response: one write to its stream, built in a buffer the printer reuses; a package or a
-//! unit seen before costs one Fx lookup by `&str` and allocates nothing; a diagnostic is
-//! deduplicated by a 64-bit hash of its text, as cargo's `DiagDedupe` does, never a copy of it.
+//! unit seen before costs one Fx lookup and allocates nothing, and one seen first keeps the
+//! response's own strings, moved, never copied; a diagnostic is deduplicated by a 64-bit hash of
+//! its text, as cargo's `DiagDedupe` does, never a copy of it. Once the printer's tables have
+//! grown to the build's size, printing a response allocates nothing.
+//!
+//! `--message-format=short` prints as `human` does (cargo's `on_stderr_line_inner` takes both
+//! one way): the daemon renders each diagnostic in rustc's short form, `file:line:col: level:
+//! message`, from the `--message-format` in `Cargo::args`, and cargo's own lines are the same.
 
 use std::{
-    hash::BuildHasher as _,
+    hash::{BuildHasher as _, Hash as _, Hasher as _},
     io::{self, Write},
     path::Path,
     time::Duration,
@@ -104,6 +110,21 @@ struct Built {
     members: u32,
 }
 
+/// One unit with diagnostics, its counts, and the next unit of the same hash.
+struct Seen {
+    unit: UnitOf,
+    counted: Counted,
+    next: u32,
+}
+
+/// No next unit in a hash's chain.
+const END: u32 = u32::MAX;
+
+/// What the tables are made for before the first response: a build of a few hundred units
+/// fits, so none of them grows while it prints.
+const PACKAGES: usize = 256;
+const DIAGNOSTICS: usize = 1024;
+
 /// cargo's lines of a build, as its responses come.
 pub struct Printer<'a, O: Write, E: Write> {
     shown: Shown,
@@ -112,36 +133,48 @@ pub struct Printer<'a, O: Write, E: Write> {
     /// Each line or batch of lines is built here, then written in one call.
     line: String,
     sources: json::Sources,
-    /// The packages a status line was printed for.
-    named: FxHashSet<Box<str>>,
-    /// Each unit with diagnostics, in the order its first came, and its counts.
-    units: Vec<(UnitOf, Counted)>,
-    /// The units of each package, by index into `units`: a package has few.
-    of_package: FxHashMap<Box<str>, Vec<u32>>,
+    /// The packages a status line was printed for, each the id its `Unit` response brought.
+    named: FxHashSet<String>,
+    /// Each unit with diagnostics, in the order its first came.
+    units: Vec<Seen>,
+    /// The first unit in `units` of each hash of a unit ([`unit_hash`]); the rest chain on.
+    by_hash: FxHashMap<u64, u32>,
     /// The hash of every diagnostic printed, as cargo's `DiagDedupe` keeps them.
     printed: FxHashSet<u64>,
     built: Option<Built>,
 }
 
+/// What tells units apart, hashed: their package, target and mode.
+fn unit_hash(unit: &UnitOf) -> u64 {
+    let mut hasher = FxBuildHasher.build_hasher();
+    unit.package_id.hash(&mut hasher);
+    unit.target.name.hash(&mut hasher);
+    unit.target.kind.hash(&mut hasher);
+    unit.test.hash(&mut hasher);
+    hasher.finish()
+}
+
 impl<'a, O: Write, E: Write> Printer<'a, O, E> {
     /// `root` is the checkout's, which the files spans name are under.
     pub fn new(shown: Shown, root: &Path, out: &'a mut O, err: &'a mut E) -> Printer<'a, O, E> {
+        let fx = FxBuildHasher;
         Printer {
             shown,
             out,
             err,
-            line: String::with_capacity(4096),
+            line: String::with_capacity(16 * 1024),
             sources: json::Sources::new(root),
-            named: FxHashSet::default(),
-            units: Vec::new(),
-            of_package: FxHashMap::default(),
-            printed: FxHashSet::default(),
+            named: FxHashSet::with_capacity_and_hasher(PACKAGES, fx),
+            units: Vec::with_capacity(PACKAGES),
+            by_hash: FxHashMap::with_capacity_and_hasher(PACKAGES, fx),
+            printed: FxHashSet::with_capacity_and_hasher(DIAGNOSTICS, fx),
             built: None,
         }
     }
 
     /// What the build placed, once it said, taken out of the printer.
     pub fn take_artifacts(&mut self) -> Vec<Artifact> {
+        // alloc: none; an empty `Vec` holds no memory.
         self.built.as_mut().map_or_else(Vec::new, |built| std::mem::take(&mut built.artifacts))
     }
 
@@ -182,21 +215,20 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                 if !shows || self.named.contains(unit.package_id.as_str()) {
                     return Ok(());
                 }
-                self.named.insert(unit.package_id.into_boxed_str());
-                if self.shown.quiet {
-                    return Ok(());
+                if !self.shown.quiet {
+                    self.line.clear();
+                    say::status_word(&mut self.line, word, self.shown.color);
+                    self.line.push_str(&unit.name);
+                    self.line.push_str(" v");
+                    self.line.push_str(&unit.version);
+                    if let Some(source) = &unit.source {
+                        self.line.push(' ');
+                        self.line.push_str(source);
+                    }
+                    self.line.push('\n');
+                    self.err.write_all(self.line.as_bytes())?;
                 }
-                self.line.clear();
-                say::status_word(&mut self.line, word, self.shown.color);
-                self.line.push_str(&unit.name);
-                self.line.push_str(" v");
-                self.line.push_str(&unit.version);
-                if let Some(source) = &unit.source {
-                    self.line.push(' ');
-                    self.line.push_str(source);
-                }
-                self.line.push('\n');
-                self.err.write_all(self.line.as_bytes())?;
+                self.named.insert(unit.package_id);
             }
             // cargo's `Updating crates.io index`, `Downloaded serde v1.0.219`.
             Response::Fetched { verb, what } if !self.shown.quiet => {
@@ -210,7 +242,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                 self.line.push('\n');
                 self.err.write_all(self.line.as_bytes())?;
             }
-            Response::Diagnostic(diagnostic) => self.diagnostic(&diagnostic)?,
+            Response::Diagnostic(diagnostic) => self.diagnostic(diagnostic)?,
             Response::BuildScript(ran) if self.shown.format.json() => {
                 self.line.clear();
                 json::build_script(&mut self.line, &ran);
@@ -230,67 +262,62 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             }
             // cargo prints a unit's "generated N warnings" or "could not compile" as it ends.
             Response::UnitEnded(unit) => {
-                let at = self.unit(&unit);
-                let (unit, counted) = &mut self.units[at];
-                if counted.ended {
+                let at = self.unit(unit);
+                let seen = &mut self.units[at];
+                if seen.counted.ended {
                     return Ok(());
                 }
-                counted.ended = true;
+                seen.counted.ended = true;
                 self.line.clear();
-                summary(&mut self.line, unit, counted, self.shown);
+                summary(&mut self.line, &seen.unit, &seen.counted, self.shown);
                 self.err.write_all(self.line.as_bytes())?;
             }
             // blaze's own, for the proof harness: what the request did.
             Response::Work(worked) if self.shown.format.json() => {
+                // alloc: one line a request, at its end.
                 self.out.write_all(blaze_ui::api::work_json(&worked).as_bytes())?;
             }
             Response::Error(error) => {
-                self.err.write_all(say::error(&error.what, self.shown.color).as_bytes())?;
+                self.line.clear();
+                say::error_into(&mut self.line, &error.what, self.shown.color);
+                self.err.write_all(self.line.as_bytes())?;
             }
             _ => {}
         }
         Ok(())
     }
 
-    fn diagnostic(&mut self, diagnostic: &Diagnostic) -> io::Result<()> {
+    fn diagnostic(&mut self, mut diagnostic: Diagnostic) -> io::Result<()> {
         let message = &diagnostic.message;
-        // rustc's own summary, which cargo replaces with its own.
-        let summary = message.starts_with("aborting due to")
-            || message.ends_with("warning emitted")
-            || message.ends_with("warnings emitted");
-        let renders = self.shown.format.renders();
-        if summary && renders {
+        // rustc's own summary, which cargo skips in every format and replaces with its own.
+        if message.starts_with("aborting due to") || message.ends_with("warning emitted") || message.ends_with("warnings emitted") {
             return Ok(());
         }
+        let renders = self.shown.format.renders();
         if let Format::Json { ansi, render_diagnostics: false, .. } = self.shown.format
             && let Some(unit) = &diagnostic.unit
         {
             self.line.clear();
-            json::compiler_message(&mut self.line, unit, diagnostic, ansi, &mut self.sources);
+            json::compiler_message(&mut self.line, unit, &diagnostic, ansi, &mut self.sources);
             self.line.push('\n');
             self.out.write_all(self.line.as_bytes())?;
         }
+        // cargo takes one newline off the end, then writes the text and a newline.
+        let rendered = diagnostic.rendered.strip_suffix('\n').unwrap_or(&diagnostic.rendered);
         let printed = match renders {
-            true => self.printed.insert(FxBuildHasher.hash_one(diagnostic.rendered.as_str())),
+            true => self.printed.insert(FxBuildHasher.hash_one(rendered)),
             false => true,
         };
         if renders && printed {
-            match diagnostic.rendered.ends_with('\n') {
-                true => self.err.write_all(diagnostic.rendered.as_bytes())?,
-                false => {
-                    self.line.clear();
-                    self.line.push_str(&diagnostic.rendered);
-                    self.line.push('\n');
-                    self.err.write_all(self.line.as_bytes())?;
-                }
-            }
+            self.line.clear();
+            self.line.push_str(rendered);
+            self.line.push('\n');
+            self.err.write_all(self.line.as_bytes())?;
         }
-        if summary {
-            return Ok(());
-        }
-        let Some(unit) = &diagnostic.unit else { return Ok(()) };
+        let Some(unit) = diagnostic.unit.take() else { return Ok(()) };
+        let fixable = fixable(&diagnostic);
         let at = self.unit(unit);
-        let counted = &mut self.units[at].1;
+        let counted = &mut self.units[at].counted;
         match diagnostic.level {
             Level::Warning => {
                 counted.warnings += 1;
@@ -298,7 +325,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                     counted.warned.total += 1;
                     match printed {
                         false => counted.warned.duplicates += 1,
-                        true if fixable(diagnostic) => {
+                        true if fixable => {
                             counted.warned.fixable = counted.warned.fixable.map(|it| it + 1);
                         }
                         true => {}
@@ -314,22 +341,22 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         Ok(())
     }
 
-    /// The index of `unit` in `units`, added the first time it comes.
-    fn unit(&mut self, unit: &UnitOf) -> usize {
-        if let Some(indices) = self.of_package.get(unit.package_id.as_str())
-            && let Some(&at) = indices.iter().find(|&&at| self.units[at as usize].0 == *unit)
-        {
-            return at as usize;
+    /// The index of `unit` in `units`, which keeps it the first time it comes.
+    fn unit(&mut self, unit: UnitOf) -> usize {
+        let hash = unit_hash(&unit);
+        let head = self.by_hash.get(&hash).copied().unwrap_or(END);
+        let mut at = head;
+        while at != END {
+            let seen = &self.units[at as usize];
+            if seen.unit == unit {
+                return at as usize;
+            }
+            at = seen.next;
         }
         let at = self.units.len();
         let counted = Counted { warned: say::Warned { fixable: Some(0), ..say::Warned::default() }, ..Counted::default() };
-        self.units.push((unit.clone(), counted));
-        match self.of_package.get_mut(unit.package_id.as_str()) {
-            Some(indices) => indices.push(at as u32),
-            None => {
-                self.of_package.insert(unit.package_id.as_str().into(), vec![at as u32]);
-            }
-        }
+        self.units.push(Seen { unit, counted, next: head });
+        self.by_hash.insert(hash, at as u32);
         at
     }
 
@@ -338,9 +365,9 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
     pub fn finish(&mut self, ok: bool, took: Duration) -> io::Result<()> {
         let color = self.shown.color;
         self.line.clear();
-        for (unit, counted) in &self.units {
-            if !counted.ended {
-                summary(&mut self.line, unit, counted, self.shown);
+        for seen in &self.units {
+            if !seen.counted.ended {
+                summary(&mut self.line, &seen.unit, &seen.counted, self.shown);
             }
         }
         if ok
@@ -348,7 +375,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             && let Some(built) = &self.built
         {
             say::status_word(&mut self.line, "Finished", color);
-            self.line.push_str(&say::finished(&built.profile, took));
+            say::finished_into(&mut self.line, &built.profile, took);
             self.line.push('\n');
         }
         self.err.write_all(self.line.as_bytes())?;
@@ -363,19 +390,21 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
     }
 }
 
-/// A unit's "could not compile" or "generated N warnings", into `line`.
+/// A unit's "generated N warnings" (`JobQueue::report_warning_count` as the unit finishes, a
+/// failed one too, silent under `-q`), then its "could not compile" (the unit's error, which
+/// `-q` does not silence), into `line`.
 fn summary(line: &mut String, unit: &UnitOf, counted: &Counted, shown: Shown) {
     let package = say::package_name(&unit.package_id);
-    if counted.errors > 0 {
-        let said = say::could_not_compile(package, &unit.target, unit.test, counted.errors, counted.warnings);
-        line.push_str(&say::error(&said, shown.color));
-        return;
-    }
     let local = unit.package_id.starts_with("path+");
-    if let Some(said) = say::generated(package, &unit.target, unit.test, local, counted.warned)
-        && !shown.quiet
-    {
-        line.push_str(&say::warning(&said, shown.color));
+    if !shown.quiet && counted.warned.total > 0 {
+        say::leveled_with(line, say::WARN, "warning", shown.color, |line| {
+            say::generated_into(line, package, &unit.target, unit.test, local, counted.warned);
+        });
+    }
+    if counted.errors > 0 {
+        say::leveled_with(line, say::ERROR, "error", shown.color, |line| {
+            say::could_not_compile_into(line, package, &unit.target, unit.test, counted.errors, counted.warnings);
+        });
     }
 }
 

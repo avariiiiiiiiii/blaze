@@ -932,11 +932,11 @@ impl<'db> InferenceContext<'db> {
                         self.infer_expr(expr, &Expectation::None, ExprIsRead::No);
                     }
                     // FIXME: `sym` should report for things that are not functions or statics.
-                    AsmOperand::Sym(ref path) => {
+                    AsmOperand::Sym(path) => {
                         // rustc type checks a `sym` as a path to a value, with the generic
                         // arguments it spells out.
                         if let Some((ValueNs::FunctionId(_), ty)) =
-                            self.infer_path(path, tgt_expr.into())
+                            self.infer_path(self.store.path_at(path), tgt_expr.into())
                         {
                             self.result.asm_sym_tys.insert((tgt_expr, index as u32), ty.store());
                         }
@@ -1055,7 +1055,7 @@ impl<'db> InferenceContext<'db> {
         &mut self,
         expr: ExprId,
         expected: &Expectation<'db>,
-        path: &Path,
+        path: Path<'_>,
         fields: &[RecordLitField],
         base_expr: RecordSpread,
     ) -> Ty<'db> {
@@ -1362,7 +1362,7 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
-    fn infer_expr_path(&mut self, path: &Path, id: ExprOrPatIdPacked, scope_id: ExprId) -> Ty<'db> {
+    fn infer_expr_path(&mut self, path: Path<'_>, id: ExprOrPatIdPacked, scope_id: ExprId) -> Ty<'db> {
         let g = self.resolver.update_to_inner_scope(self.db, self.store_owner, scope_id);
         let ty = match self.infer_path(path, id) {
             Some((_, ty)) => ty,
@@ -1909,7 +1909,7 @@ impl<'db> InferenceContext<'db> {
         receiver: ExprId,
         args: &[ExprId],
         method_name: &Name,
-        generic_args: Option<&HirGenericArgs>,
+        generic_args: Option<HirGenericArgs<'_>>,
         expected: &Expectation<'db>,
     ) -> Ty<'db> {
         let receiver_ty = self.infer_expr_inner(receiver, &Expectation::none(), ExprIsRead::Yes);

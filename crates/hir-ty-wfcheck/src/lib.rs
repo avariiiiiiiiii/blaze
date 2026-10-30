@@ -11,16 +11,27 @@
 //! `docs/borrowck.md` in the repository describes what is checked.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 extern crate rustc_type_ir;
 
 mod compare;
+mod mem;
 mod outlives;
 mod persist;
 
+#[cfg(test)]
+mod budget;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use std::sync::LazyLock;
 
+use crate::mem::{self, FVec};
 use base_db::Db;
+use blaze_mem::frame::Frame;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, FunctionId, GenericDefId, ImplId, ItemContainerId,
     LocalFieldId, Lookup as _, TraitId, TypeAliasId, VariantId,
@@ -92,19 +103,26 @@ pub struct WfResult {
 /// The well-formedness errors of the item `def`: an ADT, an impl, a trait or a function.
 #[salsa::tracked(returns(ref))]
 pub fn wfcheck(db: &Db, def: GenericDefId) -> WfResult {
-    let mut result = WfResult::default();
+    check_item(db, def)
+}
+
+/// [`wfcheck`] of `def`, not cached: what it reads is asked through the database as before.
+fn check_item(db: &Db, def: GenericDefId) -> WfResult {
     if off() {
-        return result;
+        return WfResult::default();
     }
-    let mut check = Check { db, inferred: Inferred::default(), found: &mut result.diagnostics };
-    match def {
-        GenericDefId::AdtId(adt) => check.adt(adt),
-        GenericDefId::ImplId(impl_) => check.impl_(impl_),
-        GenericDefId::TraitId(trait_) => check.trait_(trait_),
-        GenericDefId::FunctionId(function) => check.function(function),
-        _ => (),
-    }
-    result
+    blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+        let mut found = Vec::new_in(frame);
+        let mut check = Check { db, frame, inferred: Inferred::default(), found: &mut found };
+        match def {
+            GenericDefId::AdtId(adt) => check.adt(adt),
+            GenericDefId::ImplId(impl_) => check.impl_(impl_),
+            GenericDefId::TraitId(trait_) => check.trait_(trait_),
+            GenericDefId::FunctionId(function) => check.function(function),
+            _ => (),
+        }
+        WfResult { diagnostics: mem::owned(found.drain(..)) }
+    })
 }
 
 /// `BLAZE_BORROWCK=off`, read once for the process as the borrow checker reads it, so a
@@ -115,13 +133,14 @@ fn off() -> bool {
     *OFF
 }
 
-struct Check<'a, 'db> {
+struct Check<'a, 'f, 'db> {
     db: &'db Db,
+    frame: &'f Frame,
     inferred: Inferred<'db>,
-    found: &'a mut Vec<WfDiagnostic>,
+    found: &'a mut FVec<'f, WfDiagnostic>,
 }
 
-impl<'db> Check<'_, 'db> {
+impl<'f, 'db> Check<'_, 'f, 'db> {
     fn interner(&self) -> DbInterner<'db> {
         DbInterner::new_no_crate(self.db)
     }
@@ -134,7 +153,7 @@ impl<'db> Check<'_, 'db> {
     /// so only what it needs of `'static` can fail. Its where clauses must be well-formed
     /// given its bounds, those rustc infers included.
     fn adt(&mut self, adt: AdtId) {
-        let mut known = Known::new(self.clauses(adt.into()));
+        let mut known = Known::new(self.frame, self.clauses(adt.into()));
         known.add(self.inferred.of(self.db, adt).filter_map(|it| {
             let rustc_type_ir::OutlivesClause(arg, region) = it;
             match arg.kind() {
@@ -143,11 +162,11 @@ impl<'db> Check<'_, 'db> {
                 GenericArgKind::Const(_) => None,
             }
         }));
-        let mut needs = Vec::new();
+        let mut needs = Vec::new_in(self.frame);
         // One inference context for the whole item, as rustc's `enter_wf_checking_ctxt`, and
         // one buffer for what each field needs.
         let mut wfcx = None;
-        let mut found = Vec::new();
+        let mut found = Vec::new_in(self.frame);
         for variant in outlives::variants(self.db, adt) {
             for (field, ty) in self.db.field_types(variant).iter() {
                 let ty = ty.ty().instantiate_identity().skip_norm_wip();
@@ -170,7 +189,7 @@ impl<'db> Check<'_, 'db> {
                 if !ty.has_aliases() {
                     continue;
                 }
-                let wfcx = wfcx.get_or_insert_with(|| Wfcx::new(self.db, adt.into()));
+                let wfcx = wfcx.get_or_insert_with(|| Wfcx::new(self.frame, self.db, adt.into()));
                 outlives::projection_needs(self.db, wfcx, ty, &mut found);
                 needs.extend(found.drain(..).map(|it| (it, site)));
             }
@@ -181,10 +200,11 @@ impl<'db> Check<'_, 'db> {
 
     /// The self type and trait arguments of an impl, which it and its items assume
     /// well-formed. `None` when they have an error.
-    fn header(&self, impl_: ImplId) -> Option<Vec<Ty<'db>>> {
+    fn header(&self, impl_: ImplId) -> Option<FVec<'f, Ty<'db>>> {
         let db = self.db;
         let self_ty = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
-        let mut header = vec![self_ty];
+        let mut header = Vec::new_in(self.frame);
+        header.push(self_ty);
         if let Some(trait_ref) = db.impl_trait(impl_) {
             let trait_ref = trait_ref.instantiate_identity().skip_norm_wip();
             header.extend(trait_ref.args.iter().skip(1).filter_map(|arg| match arg.kind() {
@@ -200,14 +220,14 @@ impl<'db> Check<'_, 'db> {
 
     /// The impl's header, when it has no associated type: what normalizing it would imply
     /// is not reasoned about for the impl itself and its associated types.
-    fn plain_header(&self, impl_: ImplId) -> Option<Vec<Ty<'db>>> {
+    fn plain_header(&self, impl_: ImplId) -> Option<FVec<'f, Ty<'db>>> {
         self.header(impl_).filter(|header| !header.iter().any(|ty| ty.has_aliases()))
     }
 
     /// What an item knows: its where clauses and what the types it assumes well-formed imply.
-    fn known(&mut self, def: GenericDefId, assumed: &[Ty<'db>]) -> Known<'db> {
-        let mut known = Known::new(self.clauses(def));
-        let mut implied = Vec::new();
+    fn known(&mut self, def: GenericDefId, assumed: &[Ty<'db>]) -> Known<'f, 'db> {
+        let mut known = Known::new(self.frame, self.clauses(def));
+        let mut implied = Vec::new_in(self.frame);
         for &ty in assumed {
             outlives::wf(self.db, &mut self.inferred, ty, &mut implied);
         }
@@ -221,8 +241,8 @@ impl<'db> Check<'_, 'db> {
         let known = self.known(impl_.into(), &header);
         let mut needs = self.where_needs(impl_.into());
         // The header is well-formed: the trait bounds that asks hold.
-        let wfcx = Wfcx::new(db, impl_.into());
-        let mut found = Vec::new();
+        let wfcx = Wfcx::new(self.frame, db, impl_.into());
+        let mut found = Vec::new_in(self.frame);
         for (index, &ty) in header.iter().enumerate() {
             let site = match index {
                 0 => Site::SelfTy(impl_),
@@ -235,7 +255,7 @@ impl<'db> Check<'_, 'db> {
         // The trait's outlives bounds hold of the impl's arguments.
         if let Some(trait_ref) = db.impl_trait(impl_) {
             let trait_ref = trait_ref.instantiate_identity().skip_norm_wip();
-            let mut found = Vec::new();
+            let mut found = Vec::new_in(self.frame);
             outlives::predicate_needs(
                 db,
                 trait_ref.def_id.0.into(),
@@ -263,10 +283,10 @@ impl<'db> Check<'_, 'db> {
                 continue;
             }
             let known = self.known(alias.into(), &header);
-            let mut found = Vec::new();
+            let mut found = Vec::new_in(self.frame);
             outlives::wf(db, &mut self.inferred, ty, &mut found);
-            let mut needs: Vec<_> =
-                found.into_iter().map(|it| (it, Site::AssocType(alias))).collect();
+            let mut needs =
+                mem::collect(self.frame, found.into_iter().map(|it| (it, Site::AssocType(alias))));
             needs.extend(self.where_needs(alias.into()));
             self.resolve(&known, needs);
         }
@@ -292,12 +312,11 @@ impl<'db> Check<'_, 'db> {
         // each a lifetime parameter of its own.
         let interner = self.interner();
         let mut anonymous = 0;
+        // alloc: hir-ty's ElidedLifetimes::regions takes vectors (asked of mem-db)
         let mut errors = vec![Vec::new(); sig.inputs().len()];
-        let inputs: Vec<Ty<'db>> = sig
-            .inputs()
-            .iter()
-            .zip(&mut errors)
-            .map(|(&ty, errors)| {
+        let inputs = mem::collect(
+            self.frame,
+            sig.inputs().iter().zip(&mut errors).map(|(&ty, errors)| {
                 rustc_type_ir::fold_regions(interner, ty, |region, _| {
                     if !region.is_error() {
                         return region;
@@ -309,19 +328,28 @@ impl<'db> Check<'_, 'db> {
                     errors.push(region);
                     region
                 })
-            })
-            .collect();
+            }),
+        );
         if inputs.iter().any(|ty| ty.references_error()) {
             return;
         }
-        let wfcx = Wfcx::new(db, function.into());
+        let wfcx = Wfcx::new(self.frame, db, function.into());
         // What it assumes well-formed is normalized for what that implies apart from the
         // normalizing of its signature for its well-formedness, as rustc's implied bounds.
-        let mut assumed: Vec<Ty<'db>> =
-            inputs.iter().map(|&ty| wfcx.normalize(ty, &mut Vec::new())).collect();
+        let mut dropped = Vec::new_in(self.frame);
+        let mut assumed = mem::collect(
+            self.frame,
+            inputs.iter().map(|&ty| {
+                dropped.clear();
+                wfcx.normalize(ty, &mut dropped)
+            }),
+        );
         if let ItemContainerId::ImplId(impl_) = function.lookup(db).container {
             let Some(header) = self.header(impl_) else { return };
-            assumed.extend(header.into_iter().map(|ty| wfcx.normalize(ty, &mut Vec::new())));
+            assumed.extend(header.into_iter().map(|ty| {
+                dropped.clear();
+                wfcx.normalize(ty, &mut dropped)
+            }));
         }
         assumed.retain(|ty| !ty.references_error());
         // An `impl Trait` it returns has those lifetimes too.
@@ -341,7 +369,11 @@ impl<'db> Check<'_, 'db> {
         }
         if !output.has_opaque_types() {
             assumed.extend(
-                Some(wfcx.normalize(output, &mut Vec::new())).filter(|ty| !ty.references_error()),
+                Some({
+                    dropped.clear();
+                    wfcx.normalize(output, &mut dropped)
+                })
+                .filter(|ty| !ty.references_error()),
             );
             let known = self.known(function.into(), &assumed);
             let mut needs = self.where_needs(function.into());
@@ -351,8 +383,9 @@ impl<'db> Check<'_, 'db> {
             let sites = (0..inputs.len() as u32)
                 .map(|it| Site::Param(function, it))
                 .chain([Site::Output(function)]);
+            let mut found = Vec::new_in(self.frame);
             for (&ty, site) in inputs.iter().chain([&output]).zip(sites) {
-                let mut found = Vec::new();
+                found.clear();
                 let normalized = wfcx.normalize(ty, &mut found);
                 if !normalized.references_error() {
                     if ty.has_aliases() {
@@ -360,12 +393,12 @@ impl<'db> Check<'_, 'db> {
                     }
                     outlives::trait_needs(db, &wfcx, normalized, &mut found);
                 }
-                needs.extend(found.into_iter().map(|it| (it, site)));
+                needs.extend(found.drain(..).map(|it| (it, site)));
             }
             self.resolve(&known, needs);
         } else if !FunctionSignature::of(db, function).is_async() {
             let known = self.known(function.into(), &assumed);
-            let elided = elided_output(db, function, &inputs);
+            let elided = elided_output(self.frame, db, function, &inputs);
             self.opaques(function, output, &known, elided);
         }
     }
@@ -379,15 +412,16 @@ impl<'db> Check<'_, 'db> {
         &mut self,
         function: FunctionId,
         output: Ty<'db>,
-        known: &Known<'db>,
+        known: &Known<'f, 'db>,
         elided: Option<Region<'db>>,
     ) {
         let db = self.db;
         let interner = self.interner();
         let infer = InferenceResult::of(db, InferBodyId::from(function));
-        let hidden: Vec<_> = infer.return_position_impl_trait_types(db).collect();
-        let mut opaques = Vec::new();
+        let hidden = mem::collect(self.frame, infer.return_position_impl_trait_types(db));
+        let mut opaques = Vec::new_in(self.frame);
         outlives::opaques(output, &mut opaques);
+        let mut found = Vec::new_in(self.frame);
         for alias in opaques {
             let AliasTyKind::Opaque { def_id: OpaqueTyIdWrapper(opaque) } = alias.kind else {
                 continue;
@@ -591,7 +625,7 @@ impl<'db> Check<'_, 'db> {
             };
             let names = match (bound, &trait_name) {
                 (TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path), Some(name)) => {
-                    store[*path].segments().last().is_some_and(|it| it.name == name)
+                    store.path(*path).segments().last().is_some_and(|it| it.name == name)
                 }
                 (TypeBound::Lifetime(_), None) => true,
                 _ => false,

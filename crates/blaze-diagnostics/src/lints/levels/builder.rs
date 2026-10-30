@@ -228,15 +228,15 @@ impl Levels {
         }
     }
 
-    /// Every node of the crate with attributes, as rustc's walk comes to it. A node of a kind
-    /// that has none costs a read of the tree's kind column; one that may, a look at its
-    /// attributes.
+    /// Every node of the crate with attributes, as rustc's walk comes to it. A node without
+    /// costs a read of the tree's two columns, kind and `Tree::attrs`; only the rest are looked
+    /// at.
     pub(super) fn walk(&mut self, sh: &mut Shared<'_, '_, '_>, walk: &Walk<'_>) {
         self.walking = true;
         let early = self.early;
         for tree in &walk.trees {
-            for node in tree.of_kind(|kind| attrs::may_be_owner(kind, early)) {
-                if attrs::owns(node, self.early) {
+            for node in tree.with_attrs(|kind| attrs::may_be_owner(kind, early)) {
+                if attrs::owns(node, early) {
                     self.set_at(sh, InFile::new(tree.file, node.clone()));
                 }
             }

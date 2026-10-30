@@ -8,14 +8,14 @@
 //! Apache-2.0).
 
 use hir::InFile;
-use syntax::{AstNode, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{AstNode, SyntaxNode, TextRange, TextSize, WalkEvent, ast};
 
 use crate::{
     cx::{Cx, signature_range},
     lints::code_fact,
     lower::{
         Found, Phase,
-        break_outside_of_loop::{ancestors, is_item},
+        break_outside_of_loop::{edges, is_item},
     },
     model::{Applicability, Diag},
 };
@@ -51,9 +51,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::YieldOutsideCoroutine) -> Vec<Foun
 /// there, if it is set: a function's signature, an anonymous or inline const's expression; not
 /// in a `const` or `static` item's own body.
 fn lowered_body(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<(InFile<SyntaxNode>, Option<InFile<TextSize>>)> {
-    let chain = ancestors(cx, node);
-    for (i, ancestor) in chain.iter().enumerate().skip(1) {
-        let child = &chain[i - 1];
+    for (ancestor, child) in edges(cx, node) {
         if !is_body(&ancestor.value, &child.value) {
             continue;
         }
@@ -71,7 +69,7 @@ fn lowered_body(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<(InFile<Sy
         } else {
             None
         };
-        return Some((ancestor.clone(), item));
+        return Some((ancestor, item));
     }
     None
 }
@@ -93,23 +91,83 @@ fn is_body(node: &SyntaxNode, child: &SyntaxNode) -> bool {
 
 /// Whether `node` is the first `yield` of `body` as rustc lowers it: none of the body before
 /// it, outside the bodies within it. A `yield` from a macro's expansion is taken to be the
-/// first.
+/// first. One pre-order walk of `body` up to its first `yield`, the bodies within it skipped.
 fn first_yield(body: &InFile<SyntaxNode>, node: &InFile<SyntaxNode>) -> bool {
     if body.file_id != node.file_id {
         return true;
     }
-    let first = body.value.descendants().filter_map(ast::YieldExpr::cast).find(|it| {
-        let mut child = it.syntax().clone();
-        for ancestor in it.syntax().ancestors().skip(1) {
-            if ancestor == body.value {
-                return true;
-            }
-            if is_body(&ancestor, &child) {
-                return false;
-            }
-            child = ancestor;
+    let mut walk = body.value.preorder();
+    while let Some(event) = walk.next() {
+        let WalkEvent::Enter(it) = event else { continue };
+        if it == body.value {
+            continue;
         }
-        false
-    });
-    first.is_some_and(|it| it.syntax() == &node.value)
+        let Some(parent) = it.parent() else { continue };
+        if parent != body.value && is_body(&parent, &it) {
+            walk.skip_subtree();
+            continue;
+        }
+        if ast::YieldExpr::can_cast(it.kind()) {
+            return it == node.value;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lower::break_outside_of_loop::tests::with_file;
+
+    /// [`first_yield`] by the plain rule: the first `yield` of the body whose walk up to the
+    /// body meets no body of its own.
+    fn plain(body: &InFile<SyntaxNode>, node: &InFile<SyntaxNode>) -> bool {
+        let first = body.value.descendants().filter_map(ast::YieldExpr::cast).find(|it| {
+            let mut child = it.syntax().clone();
+            for ancestor in it.syntax().ancestors().skip(1) {
+                if ancestor == body.value {
+                    return true;
+                }
+                if is_body(&ancestor, &child) {
+                    return false;
+                }
+                child = ancestor;
+            }
+            false
+        });
+        first.is_some_and(|it| it.syntax() == &node.value)
+    }
+
+    /// The walk that stops at the first `yield` agrees with the plain rule for each `yield`,
+    /// in bodies with closures, `async` and `const` blocks and items within them.
+    #[test]
+    fn the_first_yield_is_that_of_the_plain_rule() {
+        let source = r#"
+fn f() {
+    let _ = || { yield 1; };
+    async { yield 2; };
+    yield 3;
+    let _ = [0; { yield 4; 1 }];
+    yield yield 5;
+    const { yield 6; };
+    fn g() { yield 7; }
+    let _ = || yield 8;
+}
+fn main() {}
+"#;
+        with_file(source, |cx, root| {
+            let mut compared = 0;
+            let mut first = 0;
+            for it in root.value.descendants().filter(|it| ast::YieldExpr::can_cast(it.kind())) {
+                let node = root.with_value(it);
+                let Some((body, _)) = lowered_body(cx, &node) else { continue };
+                let fast = first_yield(&body, &node);
+                assert_eq!(fast, plain(&body, &node), "at {:?}", node.value);
+                compared += 1;
+                first += usize::from(fast);
+            }
+            assert!(compared >= 8, "each `yield` has a body: {compared}");
+            assert!(first >= 5 && first < compared, "some `yield`s are first and some are not: {first}");
+        });
+    }
 }

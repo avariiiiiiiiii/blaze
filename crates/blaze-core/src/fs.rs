@@ -168,8 +168,41 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+/// The access and modification times of `path` (through a symbolic link) both `modified_ns`
+/// since the epoch, for [`crate::Effect::Times`]: one `utimensat`, the path made in the
+/// thread's byte buffer. An error names `path`.
+#[cfg(unix)]
+pub(crate) fn set_times(path: &Path, modified_ns: u64) -> io::Result<()> {
+    let Ok(seconds) = libc::time_t::try_from(modified_ns / 1_000_000_000) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            // alloc: an error path.
+            format!(
+                "{}: {modified_ns} ns since the epoch is past what this system's time_t holds",
+                path.display()
+            ),
+        ));
+    };
+    // SAFETY: `timespec` is integers, and padding on some targets: all zeros is a valid one.
+    let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+    time.tv_sec = seconds;
+    // Below 10^9, which every target's `tv_nsec` holds.
+    time.tv_nsec = (modified_ns % 1_000_000_000) as _;
+    let times = [time, time];
+    with_c_path(path, |c| {
+        // SAFETY: a NUL-terminated path and the two `timespec`s (access, then modification) the
+        // call reads, both alive across it; no flags, so a link is followed.
+        match unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) } {
+            0 => Ok(()),
+            _ => Err(io::Error::last_os_error()),
+        }
+    })
+    // alloc: an error path.
+    .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+}
+
 #[cfg(windows)]
-pub(crate) use crate::iocp::files::{clone, rename, set_mode, write_atomically};
+pub(crate) use crate::iocp::files::{clone, rename, set_mode, set_times, write_atomically};
 
 #[cfg(unix)]
 fn sync_dir_of(path: &Path) -> io::Result<()> {
@@ -323,7 +356,7 @@ pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
     // appends to or truncates it in place; the store and the image replace a file only by
     // renaming another over it.
     let mapped = unsafe { Mapped::open(path) }?;
-    Ok(crate::Mapping(std::sync::Arc::new(mapped))) // alloc: one per file mapped, at open
+    Ok(crate::Mapping::file(mapped))
 }
 
 /// The [`Stamp`] of a `stat` of a name, not followed through a symlink.

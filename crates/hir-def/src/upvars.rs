@@ -148,7 +148,7 @@ struct UpvarsMentionedVisitor<'db> {
 }
 
 impl UpvarsMentionedVisitor<'_> {
-    fn resolve_maybe_upvar(&mut self, expr: ExprId, path: &Path) {
+    fn resolve_maybe_upvar(&mut self, expr: ExprId, path: Path<'_>) {
         let Some((current_closure, _)) = self.current_closure else { return };
 
         if let Path::BarePath(mod_path) = path

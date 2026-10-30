@@ -28,7 +28,7 @@ fn check(done: &Completion) {
     assert!(!matches!(done.done, Done::Failed(_)), "{done:?}");
 }
 
-fn commit(driver: &mut dyn Driver) -> Vec<f64> {
+fn commit(driver: &mut impl Driver) -> Vec<f64> {
     let file = FileName::new("commit/journal").unwrap();
     let bytes = vec![7u8; 3 << 10];
     (0..2000)
@@ -47,7 +47,7 @@ fn commit(driver: &mut dyn Driver) -> Vec<f64> {
         .collect()
 }
 
-fn batch(driver: &mut dyn Driver) -> Vec<f64> {
+fn batch(driver: &mut impl Driver) -> Vec<f64> {
     let files: Vec<FileName> =
         (0..8).map(|n| FileName::new(&format!("batch/{n}")).unwrap()).collect();
     let bytes = vec![9u8; 4 << 10];
@@ -80,7 +80,7 @@ fn batch(driver: &mut dyn Driver) -> Vec<f64> {
         .collect()
 }
 
-fn reads(driver: &mut dyn Driver, dir: &std::path::Path) -> Vec<f64> {
+fn reads(driver: &mut impl Driver, dir: &std::path::Path) -> Vec<f64> {
     let name = "reads/data";
     let path = dir.join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -106,7 +106,7 @@ fn reads(driver: &mut dyn Driver, dir: &std::path::Path) -> Vec<f64> {
         .collect()
 }
 
-fn measure(name: &str, dir: &std::path::Path, driver: &mut dyn Driver) {
+fn measure(name: &str, dir: &std::path::Path, driver: &mut impl Driver) {
     let mut commits = commit(driver);
     let mut batches = batch(driver);
     let mut read = reads(driver, dir);

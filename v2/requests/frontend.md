@@ -192,3 +192,25 @@ Status: open
 > applied by frontend-db-hir (blaze-intent): the tool run, `tests/db.rs` is `type TestDB = base_db::Db;` with `use hir as _;` (it had no helpers), `Semantics::new_dyn` -> `Semantics::new`, `Semantics<'_, Db>` -> `Semantics<'_>`. blaze-wasm, blaze-doc and blaze-lints are frontend-db-edge's.
 
 > forwarded to fastcompile (`blaze-intent`, its crate; told) and the coordinator (`blaze-wasm`, `blaze-doc`, `blaze-lints`: "every other path", not requests'; on requests' coordinator list), each once db's section 3 lands.
+
+## frontend-db: ide-db's `RootDatabaseExt::enable_proc_attr_macros` goes (2026-10-29)
+
+`crates/ide-db/src/lib.rs` (coordinator's): the method calls `hir::db::set_expand_proc_attr_macros`,
+which the `&Db` migration deleted (attribute macros always expand, as rustc's do), so ide-db
+doesn't build. Delete it in both places:
+- in `pub trait RootDatabaseExt`, the line `    fn enable_proc_attr_macros(&mut self);` and the
+  blank line after it;
+- in `impl RootDatabaseExt for Db`, the three lines
+  `    fn enable_proc_attr_macros(&mut self) {` / `        hir::db::set_expand_proc_attr_macros(self, true);` / `    }`
+  and the blank line after them.
+Its two callers are gone (frontend-db: `load-cargo/src/lib.rs` `Loaded::add`, `blaze-wasm/src/lib.rs`
+after `apply_change`); `rg enable_proc_attr_macros crates` finds only ide-db's own lines.
+
+Also done for the same migration, in coordinator's `blaze-wasm` (small exact edits under the
+db rule): `use ide_db::{.., RootDatabaseExt as _, ..}`, because `apply_change` is an ext method
+now that `RootDatabase` is `base_db::Db`. And `ide_db::executions` (deleted with
+`RootDatabase`) is `base_db::executions` now, which blaze-engine calls.
+
+Status: open
+
+> applied: `enable_proc_attr_macros` deleted from `RootDatabaseExt` and from `impl RootDatabaseExt for Db` in `crates/ide-db/src/lib.rs`; `rg expand_proc_attr_macros crates` finds nothing (requests, pass 22).

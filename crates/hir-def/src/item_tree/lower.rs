@@ -26,9 +26,9 @@ use syntax::{
 
 use crate::item_tree::{
     AliasId, AttrOwner, Const, Enum, ExternBlock, ExternCrate, Function, IdRange, Impl,
-    ImportAlias, ItemKind, ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId, ModPath,
-    NameId, PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias, Union, Use,
-    UseTree, UseTreeId, VisibilityExplicitness, attrs::lower_attrs_into, items::Marks,
+    ImportAlias, ItemKind, ItemTree, ItemTreeLens, Macro2, MacroCall, MacroRules, Mod, ModItemId,
+    ModPath, NameId, PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias,
+    Union, Use, UseTree, UseTreeId, VisibilityExplicitness, attrs::lower_attrs_into, items::Marks,
 };
 
 /// The index of the next element of an array `len` long, as a tree's `u32` ids count. The top
@@ -44,12 +44,6 @@ fn push<T>(column: &mut Vec<T>, value: T) -> u32 {
     let at = id(column.len());
     column.push(value);
     at
-}
-
-/// Every column moved out into an exact-size one, `column` left empty with its capacity: one
-/// allocation per non-empty column, none for an empty one.
-fn column<T>(column: &mut Vec<T>) -> Box<[T]> {
-    column.drain(..).collect() // alloc: the tree's column, once a tree at its length
 }
 
 thread_local! {
@@ -151,9 +145,10 @@ impl<T: Hash + Eq> Scoped<T> {
         }
     }
 
-    fn finish(&mut self) -> Box<[T]> {
-        self.seal();
-        self.done.drain(..).collect() // alloc: the tree's table, once a tree at its length
+    /// Empties the table, keeping its capacity.
+    fn clear(&mut self) {
+        self.done.clear();
+        self.scope.clear();
     }
 }
 
@@ -194,7 +189,7 @@ impl TreeBuilder {
             paths: self.paths.len(),
             vis: self.vis.len(),
             attr_owners: id(self.attr_owners.len()),
-            attrs: id(self.attrs.len()),
+            attr_list: id(self.attrs.len()),
             cfgs: id(self.cfgs.len()),
         }
     }
@@ -206,45 +201,88 @@ impl TreeBuilder {
         self.vis.seal();
     }
 
-    /// The tree built, the pending items its top level; leaves the builder empty, its capacity
-    /// kept.
+    /// The tree built, the pending items its top level, in one allocation (none for a tree with
+    /// no values); leaves the builder empty, its capacity kept.
     fn finish(&mut self) -> ItemTree {
         debug_assert!(self.pending_use_trees.is_empty() && self.ctor_scratch.is_empty());
         self.attr_owners.extend(self.top_attrs.take());
-        let attr_index = super::attr_index(&self.attr_owners, self.kinds.len());
-        ItemTree {
-            top_level: column(&mut self.pending_items),
-            kinds: column(&mut self.kinds),
-            data: column(&mut self.data),
-            ast_ids: column(&mut self.ast_ids),
-            children: column(&mut self.children),
-            consts: column(&mut self.consts),
-            enums: column(&mut self.enums),
-            extern_blocks: column(&mut self.extern_blocks),
-            extern_crates: column(&mut self.extern_crates),
-            functions: column(&mut self.functions),
-            impls: column(&mut self.impls),
-            macro2s: column(&mut self.macro2s),
-            macro_calls: column(&mut self.macro_calls),
-            macro_rules: column(&mut self.macro_rules),
-            mods: column(&mut self.mods),
-            statics: column(&mut self.statics),
-            structs: column(&mut self.structs),
-            traits: column(&mut self.traits),
-            type_aliases: column(&mut self.type_aliases),
-            unions: column(&mut self.unions),
-            uses: column(&mut self.uses),
-            use_trees: column(&mut self.use_trees),
-            use_tree_lists: column(&mut self.use_tree_lists),
-            ctor_vis: column(&mut self.ctor_vis),
-            names: self.names.finish(),
-            paths: self.paths.finish(),
-            vis: self.vis.finish(),
-            attr_owners: column(&mut self.attr_owners),
-            attr_index,
-            attrs: column(&mut self.attrs),
-            cfgs: column(&mut self.cfgs),
-        }
+        self.seal();
+        let lens = ItemTreeLens {
+            top_level: self.pending_items.len(),
+            kinds: self.kinds.len(),
+            data: self.data.len(),
+            ast_ids: self.ast_ids.len(),
+            children: self.children.len(),
+            consts: self.consts.len(),
+            enums: self.enums.len(),
+            extern_blocks: self.extern_blocks.len(),
+            extern_crates: self.extern_crates.len(),
+            functions: self.functions.len(),
+            impls: self.impls.len(),
+            macro2s: self.macro2s.len(),
+            macro_calls: self.macro_calls.len(),
+            macro_rules: self.macro_rules.len(),
+            mods: self.mods.len(),
+            statics: self.statics.len(),
+            structs: self.structs.len(),
+            traits: self.traits.len(),
+            type_aliases: self.type_aliases.len(),
+            unions: self.unions.len(),
+            uses: self.uses.len(),
+            use_trees: self.use_trees.len(),
+            use_tree_lists: self.use_tree_lists.len(),
+            ctor_vis: self.ctor_vis.len(),
+            names: self.names.done.len(),
+            paths: self.paths.done.len(),
+            vis: self.vis.done.len(),
+            attr_owners: self.attr_owners.len(),
+            attr_index: self.kinds.len().div_ceil(64),
+            attr_list: self.attrs.len(),
+            cfgs: self.cfgs.len(),
+        };
+        ItemTree::build(lens, |s| {
+            s.attr_index.extend(super::attr_blocks(&self.attr_owners, self.kinds.len()));
+            s.top_level.move_from(&mut self.pending_items);
+            s.kinds.move_from(&mut self.kinds);
+            s.data.move_from(&mut self.data);
+            s.ast_ids.move_from(&mut self.ast_ids);
+            s.children.move_from(&mut self.children);
+            s.consts.move_from(&mut self.consts);
+            s.enums.move_from(&mut self.enums);
+            s.extern_blocks.move_from(&mut self.extern_blocks);
+            s.extern_crates.move_from(&mut self.extern_crates);
+            s.functions.move_from(&mut self.functions);
+            s.impls.move_from(&mut self.impls);
+            s.macro2s.move_from(&mut self.macro2s);
+            s.macro_calls.move_from(&mut self.macro_calls);
+            s.macro_rules.move_from(&mut self.macro_rules);
+            s.mods.move_from(&mut self.mods);
+            s.statics.move_from(&mut self.statics);
+            s.structs.move_from(&mut self.structs);
+            s.traits.move_from(&mut self.traits);
+            s.type_aliases.move_from(&mut self.type_aliases);
+            s.unions.move_from(&mut self.unions);
+            s.uses.move_from(&mut self.uses);
+            s.use_trees.move_from(&mut self.use_trees);
+            s.use_tree_lists.move_from(&mut self.use_tree_lists);
+            s.ctor_vis.move_from(&mut self.ctor_vis);
+            s.names.move_from(&mut self.names.done);
+            s.paths.move_from(&mut self.paths.done);
+            s.vis.move_from(&mut self.vis.done);
+            s.attr_owners.move_from(&mut self.attr_owners);
+            s.attr_list.move_from(&mut self.attrs);
+            s.cfgs.move_from(&mut self.cfgs);
+        })
+    }
+
+    /// Empties what lowering a `use` tree alone fills ([`lower_use_tree`]), keeping its
+    /// capacity: the rest of a builder between trees is empty already.
+    fn clear_use_trees(&mut self) {
+        self.pending_use_trees.clear();
+        self.use_trees.clear();
+        self.use_tree_lists.clear();
+        self.names.clear();
+        self.paths.clear();
     }
 
     /// A new item of `kind`, its payload at `data` of its column.
@@ -373,6 +411,7 @@ impl<'db> Ctx<'db> {
 
     /// Lowers `node`'s attributes into the tree's, and returns where they start and the `cfg`
     /// that disables `node`, if one does.
+    // dyn: once per item, into hir-expand's collect_item_tree_attrs; a generic would copy the attribute lowering per node type
     fn lower_attrs_of(&mut self, node: &dyn ast::HasAttrs) -> (usize, Option<CfgExpr>) {
         let span_map = self.span_map();
         let (db, krate, cfg_options) = (self.db, self.krate, &self.cfg_options);
@@ -387,12 +426,14 @@ impl<'db> Ctx<'db> {
         (start, cfg)
     }
 
+    // dyn: once per item, into hir-expand's collect_item_tree_attrs; a generic would copy the attribute lowering per node type
     fn lower_attrs(&mut self, owner: ModItemId, node: &dyn ast::HasAttrs) {
         let (start, cfg) = self.lower_attrs_of(node);
         self.tree.add_attrs(owner, start, cfg);
     }
 
     /// Whether a `cfg` among `node`'s attributes is false; the attributes are not kept.
+    // dyn: once per item, into hir-expand's collect_item_tree_attrs; a generic would copy the attribute lowering per node type
     fn cfg_disabled(&mut self, node: &dyn ast::HasAttrs) -> bool {
         let (start, cfg) = self.lower_attrs_of(node);
         self.tree.attrs.truncate(start);
@@ -848,12 +889,12 @@ impl<'db> Ctx<'db> {
         self.tree.item(ItemKind::ExternBlock, ast_id.upcast(), data)
     }
 
-    fn lower_visibility(&mut self, item: &dyn ast::HasVisibility) -> RawVisibilityId {
+    fn lower_visibility(&mut self, item: &impl ast::HasVisibility) -> RawVisibilityId {
         let vis = self.lower_visibility_from_ast(item);
         self.tree.visibility(vis)
     }
 
-    fn lower_visibility_from_ast(&self, item: &dyn ast::HasVisibility) -> RawVisibility {
+    fn lower_visibility_from_ast(&self, item: &impl ast::HasVisibility) -> RawVisibility {
         visibility_from_ast(self.db, item.visibility(), &mut |range| {
             self.span_map().span_for_range(range).ctx
         })
@@ -898,8 +939,7 @@ impl UseTreeLowering<'_> {
     fn lower_use_tree(
         &mut self,
         tree: ast::UseTree,
-        // dyn: `ModPath::from_src`'s callback (hir-expand), once a path
-        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
+        span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
     ) -> Option<UseTreeId> {
         if let Some(use_tree_list) = tree.use_tree_list() {
             let prefix = match tree.path() {
@@ -995,13 +1035,17 @@ impl UseTreeLowering<'_> {
 pub(crate) fn lower_use_tree(
     db: &Db,
     tree: ast::UseTree,
-    // dyn: `ModPath::from_src`'s callback (hir-expand), once a path
-    span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
+    span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
 ) -> Option<Arena<ast::UseTree>> {
-    let mut scratch = TreeBuilder::default();
+    let mut scratch = SCRATCH.take();
     let mut mapping = Arena::new();
     let mut lowering = UseTreeLowering { db, mapping: Some(&mut mapping), tree: &mut scratch };
-    lowering.lower_use_tree(tree, span_for_range)?;
+    let lowered = lowering.lower_use_tree(tree, span_for_range);
+    scratch.clear_use_trees();
+    if scratch.kinds.capacity() <= SCRATCH_ITEMS {
+        SCRATCH.set(scratch);
+    }
+    lowered?;
     Some(mapping)
 }
 
@@ -1012,8 +1056,7 @@ fn private_vis() -> RawVisibility {
 pub(crate) fn visibility_from_ast(
     db: &Db,
     node: Option<ast::Visibility>,
-    // dyn: `ModPath::from_src`'s callback (hir-expand), once a path
-    span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
+    span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
 ) -> RawVisibility {
     let Some(node) = node else { return private_vis() };
     let path = match node.kind() {

@@ -19,3 +19,7 @@ After:
     let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
 ```
 and `let pick = next();` -> `let pick = rng.next_u64();`. No assertion depends on the stream's values.
+
+> forwarded to speed-link-edge-hot-ci (holds `crates/blaze-ci/`) (requests, pass 20; told by tmux).
+
+> DONE (speed-link-edge-hot-ci, 2026-10-29 21:05): applied as written; `runtime/tests.rs` now uses `blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15)` and `rng.next_u64()`. No other local RNG is left in blaze-ci (service and github tests already use SplitMix64).

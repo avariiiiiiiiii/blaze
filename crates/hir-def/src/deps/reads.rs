@@ -20,10 +20,7 @@ use std::sync::Arc;
 
 use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
-use hir_expand::{
-    HirFileId, MacroCallId, MacroCallKind, MacroDefKind, builtin::env_input_to_key,
-    proc_macro::ExpansionReads,
-};
+use hir_expand::{HirFileId, MacroCallId, MacroDefKind, proc_macro::ExpansionReads};
 use rustc_hash::FxHashSet;
 
 use crate::{
@@ -38,6 +35,9 @@ pub const READS_DOMAIN: &str = "blaze v2 dependency image reads 1";
 /// How many sets of names one key keeps: a crate's expansions read other names only as what
 /// they read decides it, so one or two in practice.
 pub const SLOTS: u32 = 16;
+
+/// The first byte of a slot's bytes: the version of [`Reads::encode`].
+const VERSION: u8 = 1;
 
 /// What a crate read besides the inputs of its key: each sorted, with no repeats.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -54,10 +54,10 @@ impl Reads {
         self.env.is_empty() && self.macros.is_empty()
     }
 
-    /// The reads of `krate` as it is resolved in `db`: of every macro call of its modules,
-    /// `calls` (those its signatures name, [`super::signatures::encode`]), and each call any of
-    /// them is in the expansion of; and every process variable the database noted the crate's
-    /// `env!`s read, which covers an `env!` in the argument of another eager macro.
+    /// The reads of `krate` as it is resolved in `db`: the proc-macro expansions of every macro
+    /// call of its modules, of `calls` (those its signatures name,
+    /// [`super::signatures::encode`]) and of each call any of them is in the expansion of; and
+    /// every process variable the database noted the crate's `env!`s read.
     pub(crate) fn of(db: &Db, krate: Crate, calls: &[MacroCallId]) -> Result<Reads, Refused> {
         // alloc: setup: the calls of one crate, walked once as its image is written
         let mut todo: Vec<MacroCallId> = calls.to_vec();
@@ -78,30 +78,24 @@ impl Reads {
             if let HirFileId::MacroFile(parent) = loc.kind.file_id() {
                 todo.push(parent);
             }
-            match &loc.def.kind {
-                MacroDefKind::ProcMacro(..) => match call.expansion_reads(db) {
-                    ExpansionReads::Nothing => {}
-                    ExpansionReads::Traced { shape, values } => {
-                        // clone: a count of the expansion's names, once per expansion
-                        reads.macros.push((shape.clone(), Some(*values)));
-                    }
-                    &ExpansionReads::Unknown(why) => {
-                        // alloc: why a crate is refused, once per refused crate
-                        let call = format!("{:?} of crate {}", call, crate_name(db, loc.def.krate));
-                        return Err(Refused::ProcMacro { call, why });
-                    }
-                },
-                MacroDefKind::BuiltInEager(_, expander) if expander.is_env_or_option_env() => {
-                    if let MacroCallKind::FnLike { eager: Some(eager), .. } = &loc.kind
-                        && let Some(name) = env_input_to_key(db, &eager.arg)
-                        && own.get(name.as_str()).is_none()
-                    {
-                        reads.env.push(name.as_str().into());
-                    }
+            if !matches!(loc.def.kind, MacroDefKind::ProcMacro(..)) {
+                continue;
+            }
+            match call.expansion_reads(db) {
+                ExpansionReads::Nothing => {}
+                ExpansionReads::Traced { shape, values } => {
+                    // clone: a count of the expansion's names, once per expansion
+                    reads.macros.push((shape.clone(), Some(*values)));
                 }
-                _ => {}
+                &ExpansionReads::Unknown(why) => {
+                    // alloc: why a crate is refused, once per refused crate
+                    let call = format!("{:?} of crate {}", call, crate_name(db, loc.def.krate));
+                    return Err(Refused::ProcMacro { call, why });
+                }
             }
         }
+        // Every `env!` and `option_env!` expansion notes its variable as it runs, nested ones
+        // too, and the log is never cleared: what the crate's resolution read is in it.
         for (read, name) in db.files().env_read() {
             if read == krate && own.get(&name).is_none() {
                 reads.env.push(name.into_boxed_str());
@@ -146,32 +140,33 @@ impl Reads {
     /// What [`Reads::encode`] wrote, its lengths checked against the bytes, its order and its
     /// names checked: the bytes came from a store, which checked only their hash.
     pub fn decode(bytes: &[u8]) -> Result<Reads, &'static str> {
-        let mut rest = bytes;
-        let mut take = |len: usize| -> Result<&[u8], &'static str> {
+        fn take<'b>(rest: &mut &'b [u8], len: usize) -> Result<&'b [u8], &'static str> {
             if rest.len() < len {
                 return Err("reads shorter than their lengths");
             }
             let (taken, after) = rest.split_at(len);
-            rest = after;
+            *rest = after;
             Ok(taken)
-        };
-        let count = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().expect("four bytes")) as usize;
-        if take(1)? != [VERSION] {
+        }
+        fn count(rest: &mut &[u8]) -> Result<usize, &'static str> {
+            let bytes = take(rest, 4)?;
+            Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")) as usize)
+        }
+        let mut rest = bytes;
+        if take(&mut rest, 1)? != [VERSION] {
             return Err("reads of another version");
         }
         let mut reads = Reads::default();
-        let variables = count(take(4)?);
-        for _ in 0..variables {
-            let len = count(take(4)?);
-            let name = std::str::from_utf8(take(len)?).map_err(|_| "a variable not UTF-8")?;
+        for _ in 0..count(&mut rest)? {
+            let len = count(&mut rest)?;
+            let name =
+                std::str::from_utf8(take(&mut rest, len)?).map_err(|_| "a variable not UTF-8")?;
             reads.env.push(name.into()); // alloc: setup: a slot read, once per crate per session
         }
-        let macros = count(take(4)?);
-        for _ in 0..macros {
-            let len = count(take(4)?);
-            reads.macros.push((take(len)?.into(), None)); // alloc: setup, as above
+        for _ in 0..count(&mut rest)? {
+            let len = count(&mut rest)?;
+            reads.macros.push((take(&mut rest, len)?.into(), None)); // alloc: setup, as above
         }
-        drop(take);
         if !rest.is_empty() {
             return Err("bytes after the reads");
         }
@@ -190,10 +185,18 @@ impl Reads {
             .expect("values made in this database do not fail")
     }
 
-    /// The values the reads have now: the process variables in `db`, each expansion's names
-    /// worked out again by the driver ([`ImageStore::reads_now`]).
-    pub(crate) fn values_now(&self, db: &Db, store: &dyn ImageStore) -> Result<ContentId, String> { // dyn: the driver's store, once per slot read
-        self.values(db, |shape, _| store.reads_now(shape))
+    /// The values the reads of `krate` have now: the process variables in `db`, each
+    /// expansion's names worked out again by the driver ([`ImageStore::reads_now`]) with the
+    /// crate's variables, which its expansions were given.
+    pub(crate) fn values_now(
+        &self,
+        db: &Db,
+        krate: Crate,
+        // dyn: the driver's store, once per slot read
+        store: &dyn ImageStore,
+    ) -> Result<ContentId, String> {
+        let env = krate.env(db);
+        self.values(db, |shape, _| store.reads_now(&env, shape))
     }
 
     fn values(

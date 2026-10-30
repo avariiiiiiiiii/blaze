@@ -1,12 +1,13 @@
 //! A source file's [`ItemTree`], made from the file's last tree where the file was edited.
 //!
 //! One query per file ([`super::file_item_tree_query`]) and no query per item. Beside salsa,
-//! a few files' last trees are kept ([`KEPT`]), each with a key per top-level item: the
-//! fingerprint of all that lowering the item reads ([`item_keys`]: its syntax but for its
-//! bodies, its ast ids and its span anchors) and where its rows are in the tree ([`Marks`]).
-//! An edit keys the new parse's items, keeps the rows of the unchanged items before and after
-//! the changed ones (copied, their ids moved), lowers the changed ones alone and assembles
-//! the file's tree from them ([`assemble`]). An edit inside a top-level `fn`'s body, or an
+//! a few files' last trees are kept ([`KEPT`]), with the text they were made of and a key per
+//! top-level item: all that lowering the item reads ([`item_keys`]: a fingerprint of its
+//! syntax but for its bodies, its ast ids and its span anchors) and where its rows are in the
+//! tree ([`Marks`]). An edit keys the new parse's items, hashing only those whose text it
+//! touched ([`Unchanged`]), keeps the rows of the unchanged items before and after the changed
+//! ones (copied, their ids moved), lowers the changed ones alone and assembles the file's tree
+//! from them ([`assemble`]). An edit inside a top-level `fn`'s body, or an
 //! `impl`'s or `trait`'s, changes no key and returns the last tree itself. A file's first
 //! lowering is [`super::lower_whole`] and makes no keys, so a file never edited never pays for
 //! them; its first edit lowers it whole again, keying it. The tree is the one `lower_whole`
@@ -29,7 +30,7 @@ use cfg::CfgOptions;
 use hir_expand::{HirFileId, span_map::SpanMap};
 use span::{AstIdMap, ErasedFileAstId, RealSpanMap};
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize,
+    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, Text, TextRange, TextSize,
     ast::{self, HasModuleItem},
 };
 
@@ -49,8 +50,8 @@ mod tests;
 /// rows and the changed items', or a whole lowering ([`self`]).
 pub(super) fn file_item_tree(db: &Db, file: EditionedFileId, krate: Crate) -> Arc<ItemTree> {
     let db_nonce = db.nonce_and_revision().0;
-    let slot = slot(db_nonce, file, krate);
-    let kept = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    let kept =
+        with_slot(db_nonce, file, krate, |it| it.lock().unwrap_or_else(PoisonError::into_inner).take());
     let kept = kept.filter(|it| (it.db, it.file, it.krate) == (db_nonce, file, krate));
     // Read on every path, so the query depends on it even where nothing lowered reads it.
     let cfg = krate.cfg_options(db);
@@ -69,8 +70,10 @@ pub(super) fn file_item_tree(db: &Db, file: EditionedFileId, krate: Crate) -> Ar
             (keyed.tree.clone(), Some(keyed)) // clone: an `Arc`, the tree the slot keeps
         }
     };
-    let replaced = (slot.lock().unwrap_or_else(PoisonError::into_inner))
-        .replace(Kept { db: db_nonce, file, krate, keyed });
+    let replaced = with_slot(db_nonce, file, krate, |it| {
+        (it.lock().unwrap_or_else(PoisonError::into_inner))
+            .replace(Kept { db: db_nonce, file, krate, keyed })
+    });
     // Dropped after the lock: a tree let go of may be a whole file's columns.
     drop(replaced);
     tree
@@ -83,13 +86,25 @@ type Slot = Mutex<Option<Kept>>;
 
 /// The files' last trees, direct-mapped by database, file and crate: a lookup is one hash, one
 /// index and one short lock, and the slot is empty while its tree is worked from.
+#[cfg(not(test))]
 static KEPT: [Slot; SLOTS] = [const { Mutex::new(None) }; SLOTS];
 
-fn slot(db: Nonce, file: EditionedFileId, krate: Crate) -> &'static Slot {
+#[cfg(test)]
+thread_local! {
+    /// A test thread's own slots: a test that counts what an edit lowers sees no other test's
+    /// file take its slot between its edits.
+    static KEPT: [Slot; SLOTS] = const { [const { Mutex::new(None) }; SLOTS] };
+}
+
+fn with_slot<R>(db: Nonce, file: EditionedFileId, krate: Crate, f: impl FnOnce(&Slot) -> R) -> R {
     let mut hasher = rustc_hash::FxHasher::default();
     (db, file, krate).hash(&mut hasher);
     // The multiply leaves its best bits at the top.
-    &KEPT[(hasher.finish() >> (64 - SLOTS.trailing_zeros())) as usize]
+    let at = (hasher.finish() >> (64 - SLOTS.trailing_zeros())) as usize;
+    #[cfg(not(test))]
+    return f(&KEPT[at]);
+    #[cfg(test)]
+    return KEPT.with(|kept| f(&kept[at]));
 }
 
 /// A file's last lowering in a crate, of a database: the ids are that database's.
@@ -106,11 +121,64 @@ struct Keyed {
     /// The crate's `cfg` set the tree was lowered under: lowering an item's attributes reads it.
     cfg: CfgOptions,
     tree: Arc<ItemTree>,
-    /// Per top-level item of the file, in order: the fingerprint of what lowering it reads.
-    keys: Vec<u128>,
+    /// The file's text the keys were made of: what the next edit's text is compared with.
+    text: Text,
+    /// Per top-level item of the file, in order: what lowering it reads.
+    keys: Keys,
     /// Per top-level item, where its rows begin in each of `tree`'s columns; then where the
-    /// last item's end. One more than `keys`.
+    /// last item's end. One more than `keys.items`.
     marks: Vec<Marks>,
+}
+
+/// What lowering reads of each top-level item of a file ([`item_keys`]): its syntax, as a
+/// fingerprint, and the ast ids and span anchors within it, as they are, all items' in two
+/// arrays one after the other.
+#[derive(Default)]
+struct Keys {
+    items: Vec<ItemKey>,
+    ids: Vec<[u32; 3]>,
+    anchors: Vec<[u32; 2]>,
+}
+
+#[derive(Clone, Copy)]
+struct ItemKey {
+    /// Where the item is in the text it was keyed in.
+    range: TextRange,
+    /// The fingerprint of the item's syntax but for what lowering does not read ([`hash_item`]).
+    syntax: u128,
+    /// Where the item's ids end in [`Keys::ids`], and its anchors in [`Keys::anchors`].
+    ids_end: u32,
+    anchors_end: u32,
+}
+
+impl Keys {
+    fn clear(&mut self) {
+        self.items.clear();
+        self.ids.clear();
+        self.anchors.clear();
+    }
+
+    fn ids(&self, item: usize) -> &[[u32; 3]] {
+        let from = item.checked_sub(1).map_or(0, |it| self.items[it].ids_end);
+        &self.ids[from as usize..self.items[item].ids_end as usize]
+    }
+
+    fn anchors(&self, item: usize) -> &[[u32; 2]] {
+        let from = item.checked_sub(1).map_or(0, |it| self.items[it].anchors_end);
+        &self.anchors[from as usize..self.items[item].anchors_end as usize]
+    }
+
+    /// Whether lowering `item` of these keys reads what lowering `theirs` of `other` does.
+    fn same(&self, item: usize, other: &Keys, theirs: usize) -> bool {
+        self.items[item].syntax == other.items[theirs].syntax
+            && self.ids(item) == other.ids(theirs)
+            && self.anchors(item) == other.anchors(theirs)
+    }
+}
+
+/// The text of `source_file`'s tree: the file's, shared.
+fn text_of(source_file: &ast::SourceFile) -> &Text {
+    source_file.syntax().flat().expect("a source file's flat tree").0.source()
 }
 
 /// The tree of an edited file from its kept one: the rows of the items whose keys are the
@@ -119,20 +187,26 @@ fn reuse(db: &Db, file: EditionedFileId, krate: Crate, mut keyed: Keyed) -> Keye
     let source_file = file.parse(db).tree();
     let mut scratch = SCRATCH.take();
     scratch.keys.clear();
-    item_keys(db, file, &source_file, &mut scratch);
-    let (old, new) = (&keyed.keys[..], &scratch.keys[..]);
-    let before = old.iter().zip(new).take_while(|(a, b)| a == b).count();
-    let after = (old[before..].iter().rev().zip(new[before..].iter().rev()))
-        .take_while(|(a, b)| a == b)
+    item_keys(db, file, &source_file, &mut scratch, Some(&keyed));
+    keyed.text = text_of(&source_file).clone(); // clone: one count of the file's text
+    let (old, new) = (&keyed.keys, &scratch.keys);
+    let (old_items, new_items) = (old.items.len(), new.items.len());
+    let before = (0..old_items.min(new_items)).take_while(|&it| old.same(it, new, it)).count();
+    let after = (0..(old_items - before).min(new_items - before))
+        .take_while(|&it| old.same(old_items - 1 - it, new, new_items - 1 - it))
         .count();
     let top = top_attrs(db, file, krate);
-    if before == old.len() && before == new.len() && same_top(&keyed.tree, &keyed.marks[0], &top)
+    if before == old_items
+        && before == new_items
+        && same_top(&keyed.tree, &keyed.marks[0], &top)
     {
+        // The tree and its marks stand; the items' ranges moved with the edit.
+        mem::swap(&mut keyed.keys, &mut scratch.keys);
         release(scratch);
         return keyed;
     }
 
-    let changed = new.len() - before - after;
+    let changed = new_items - before - after;
     count_lowered(|| changed);
     let fresh: Vec<ItemTree> = (source_file.items().skip(before).take(changed))
         .map(|item| lower::Ctx::new(db, file.into(), krate).lower_item(&item))
@@ -148,7 +222,7 @@ fn reuse(db: &Db, file: EditionedFileId, krate: Crate, mut keyed: Keyed) -> Keye
         }
         parts.extend(fresh.iter().zip(&fresh_marks).map(|(tree, marks)| Rows { tree, marks }));
         if after > 0 {
-            parts.push(Rows { tree: kept, marks: &marks[old.len() - after..] });
+            parts.push(Rows { tree: kept, marks: &marks[old_items - after..] });
         }
         scratch.marks.clear();
         assemble(&top, &parts, &mut scratch.marks)
@@ -191,8 +265,8 @@ fn lower_keyed(
     }
     scratch.keys.clear();
     scratch.marks.clear();
-    item_keys(db, file, &source_file, &mut scratch);
-    count_lowered(|| scratch.keys.len());
+    item_keys(db, file, &source_file, &mut scratch, None);
+    count_lowered(|| scratch.keys.items.len());
 
     let root_file_id = krate.root_file_id(db);
     let extra = (file == root_file_id)
@@ -205,6 +279,7 @@ fn lower_keyed(
     let keyed = Keyed {
         cfg: cfg.clone(), // clone: once a file's first edit or a new `cfg` set
         tree: Arc::new(tree), // alloc: the tree's handle, once a lowering
+        text: text_of(&source_file).clone(), // clone: one count of the file's text
         keys: mem::take(&mut scratch.keys),
         marks: mem::take(&mut scratch.marks),
     };
@@ -240,6 +315,8 @@ thread_local! {
     /// How many top-level items this thread lowered, whole or alone, for the tests that count
     /// what an edit lowers.
     pub(super) static LOWERED: Cell<usize> = const { Cell::new(0) };
+    /// How many top-level items' syntax this thread hashed ([`item_keys`]).
+    pub(super) static HASHED: Cell<usize> = const { Cell::new(0) };
 }
 
 fn count_lowered(items: impl FnOnce() -> usize) {
@@ -247,6 +324,11 @@ fn count_lowered(items: impl FnOnce() -> usize) {
     LOWERED.set(LOWERED.get() + items());
     #[cfg(not(test))]
     let _ = items;
+}
+
+fn count_hashed() {
+    #[cfg(test)]
+    HASHED.set(HASHED.get() + 1);
 }
 
 /// The domain of an item's key.
@@ -278,10 +360,8 @@ impl Hasher for Feed<'_> {
 /// past [`SCRATCH_IDS`] (a generated file) is dropped, so a worker keeps a bounded amount.
 #[derive(Default)]
 struct Scratch {
-    ids: Vec<[u32; 3]>,
-    anchors: Vec<[u32; 2]>,
     bytes: Vec<u8>,
-    keys: Vec<u128>,
+    keys: Keys,
     marks: Vec<Marks>,
 }
 
@@ -293,47 +373,129 @@ thread_local! {
 const SCRATCH_IDS: usize = 1 << 14;
 
 fn release(mut scratch: Scratch) {
-    scratch.ids.clear();
-    scratch.anchors.clear();
-    if scratch.ids.capacity() <= SCRATCH_IDS && scratch.keys.capacity() <= SCRATCH_IDS {
+    scratch.keys.clear();
+    scratch.marks.clear();
+    let keys = &scratch.keys;
+    if keys.ids.capacity() <= SCRATCH_IDS && keys.items.capacity() <= SCRATCH_IDS {
         SCRATCH.set(scratch);
     }
 }
 
-/// Pushes onto `scratch.keys` the key of each of `source_file`'s top-level items, in order:
-/// the fingerprint of the item's syntax but for what lowering does not read ([`hash_item`]),
-/// of the ast ids of the items it is made of and of the span anchors within it, all from
-/// where it starts, so an item keeps its key wherever it moves in the file. One walk of the
-/// items, which allocates nothing once the scratch is grown.
+/// Pushes onto `scratch.keys` what lowering reads of each of `source_file`'s top-level items,
+/// in order: the fingerprint of the item's syntax but for what lowering does not read
+/// ([`hash_item`]), the ast ids of the items it is made of and the span anchors within it, all
+/// from where it starts, so an item keeps its key wherever it moves in the file. An item whose
+/// text `last`'s also had, unchanged ([`Unchanged`]), takes the fingerprint it had there, so an
+/// edit hashes only the items it touched. Two walks of the items, which allocate nothing once
+/// the scratch is grown.
 fn item_keys(
     db: &Db,
     file: EditionedFileId,
     source_file: &ast::SourceFile,
     scratch: &mut Scratch,
+    last: Option<&Keyed>,
 ) {
     let hir_file = HirFileId::from(file);
     let ast_id_map = hir_file.ast_id_map(db);
     let SpanMap::RealSpanMap(span_map) = hir_file.span_map(db) else {
         unreachable!("a source file's span map is a real file's")
     };
-    let file_id = file.span_file_id(db);
-    let Scratch { ids, anchors, bytes, keys, .. } = scratch;
+    let Scratch { bytes, keys, .. } = scratch;
     for item in source_file.items() {
-        let node = item.syntax();
-        let item_range = node.text_range();
-        ids.clear();
-        item_ids(&item, ast_id_map, item_range.start(), ids);
-        anchors.clear();
-        item_anchors(span_map, item_range, &ids[..], anchors);
-
-        bytes.clear();
-        let mut feed = Feed(&mut *bytes);
-        file_id.hash(&mut feed);
-        hash_item(node, &mut feed);
-        ids[..].hash(&mut feed);
-        anchors[..].hash(&mut feed);
-        keys.push(feed.fingerprint());
+        let range = item.syntax().text_range();
+        keys.items.push(ItemKey { range, syntax: 0, ids_end: 0, anchors_end: 0 });
     }
+    let unchanged = last.map(|last| Unchanged::new(last, text_of(source_file), &keys.items));
+    for (at, item) in source_file.items().enumerate() {
+        let range = keys.items[at].range;
+        let ids_from = keys.ids.len();
+        item_ids(&item, ast_id_map, range.start(), &mut keys.ids);
+        item_anchors(span_map, range, &keys.ids[ids_from..], &mut keys.anchors);
+        let kept = last.zip(unchanged.as_ref()).and_then(|(last, unchanged)| {
+            unchanged.kept(&last.keys.items, &keys.items, at).map(|it| it.syntax)
+        });
+        let syntax = kept.unwrap_or_else(|| {
+            count_hashed();
+            bytes.clear();
+            let mut feed = Feed(&mut *bytes);
+            hash_item(item.syntax(), &mut feed);
+            feed.fingerprint()
+        });
+        keys.items[at] =
+            ItemKey { range, syntax, ids_end: id(keys.ids.len()), anchors_end: id(keys.anchors.len()) };
+    }
+}
+
+fn id(len: usize) -> u32 {
+    u32::try_from(len).expect("a file of more than `u32` ast ids")
+}
+
+/// What an edit left of a file's text: the longest prefix and suffix its text before and after
+/// share. The parse of a file is a function of its text ([`syntax::Parse::reparse_to`]), and
+/// the parser reads a top-level item from the item list's state, its tokens and at most three
+/// tokens after the one it is at; the lexer starts a token at an item's start the same way
+/// whatever came before. So an item with the same text at the same place in the suffix, which
+/// runs to the end, is the same syntax; and so is one in the prefix with two whole items after
+/// it there, which hold the three tokens the parser may look at past it.
+struct Unchanged {
+    /// The new parse's leading items that are in the prefix with two items after them.
+    prefix_items: usize,
+    /// Where the suffix begins in the new text.
+    suffix_from: TextSize,
+    /// The old text's length less the new's: where an item of the suffix was, from where it is.
+    shift: i64,
+}
+
+impl Unchanged {
+    fn new(last: &Keyed, text: &Text, items: &[ItemKey]) -> Unchanged {
+        let (old, new) = (last.text.as_bytes(), text.as_bytes());
+        let (prefix, suffix) = common_ends(old, new);
+        let in_prefix = items.iter().take_while(|it| usize::from(it.range.end()) <= prefix).count();
+        Unchanged {
+            prefix_items: in_prefix.saturating_sub(2),
+            suffix_from: TextSize::new(id(new.len() - suffix)),
+            shift: old.len() as i64 - new.len() as i64,
+        }
+    }
+
+    /// The key `old` had for item `at` of `new`, if the item is one this edit left unchanged.
+    fn kept<'a>(&self, old: &'a [ItemKey], new: &[ItemKey], at: usize) -> Option<&'a ItemKey> {
+        let range = new[at].range;
+        let (was, start) = if at < self.prefix_items {
+            (old.get(at)?, i64::from(u32::from(range.start())))
+        } else if range.start() >= self.suffix_from {
+            let from_end = new.len() - at;
+            let was = old.get(old.len().checked_sub(from_end)?)?;
+            (was, i64::from(u32::from(range.start())) + self.shift)
+        } else {
+            return None;
+        };
+        let same = i64::from(u32::from(was.range.start())) == start && was.range.len() == range.len();
+        same.then_some(was)
+    }
+}
+
+/// The lengths of the longest common prefix of `old` and `new` and of their longest common
+/// suffix in what is left: one `memcmp` per 4 KiB at memory bandwidth, then per 64 bytes and
+/// per byte to find where they differ.
+fn common_ends(old: &[u8], new: &[u8]) -> (usize, usize) {
+    let len = old.len().min(new.len());
+    let mut prefix = 0;
+    for step in [4096, 64, 1] {
+        while prefix + step <= len && old[prefix..prefix + step] == new[prefix..prefix + step] {
+            prefix += step;
+        }
+    }
+    let (most, a, b) = (len - prefix, old.len(), new.len());
+    let mut suffix = 0;
+    for step in [4096, 64, 1] {
+        while suffix + step <= most
+            && old[a - suffix - step..a - suffix] == new[b - suffix - step..b - suffix]
+        {
+            suffix += step;
+        }
+    }
+    (prefix, suffix)
 }
 
 macro_rules! marks {
@@ -869,7 +1031,7 @@ const NODE: u8 = 0;
 const TOKEN: u8 = 1;
 const SKIPPED: u8 = 2;
 const END: u8 = 3;
-const HASHED: u8 = 4;
+const KEPT_HASH: u8 = 4;
 
 /// Subtrees of this much text keep their hash in their tree ([`syntax::FlatTree::subtree_hash`]),
 /// across edits that don't touch them.
@@ -878,7 +1040,7 @@ const KEPT_TEXT: u32 = 4096;
 fn hash_full(node: &SyntaxNode, state: &mut Feed<'_>) {
     let (tree, at) = node.flat().expect("a node of a flat tree");
     if u32::from(node.text_range().len()) >= KEPT_TEXT {
-        return (HASHED, tree.subtree_hash(at)).hash(state);
+        return (KEPT_HASH, tree.subtree_hash(at)).hash(state);
     }
     NODE.hash(state);
     tree.hash_subtree(at, state);

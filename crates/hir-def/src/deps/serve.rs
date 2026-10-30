@@ -1,26 +1,30 @@
 //! Giving a database the images a store has ([`serve`]) and writing those it lacks
 //! ([`store`]).
 //!
-//! The store is the driver's ([`ImageStore`]): the local store or the global cache, which
-//! checks an image's content hash on every read, so the front end does not depend on either.
+//! The store is the driver's ([`ImageStore`]): the local store, or the local store over the
+//! global cache ([`ReadThrough`]), each checking a value's content hash on every read and
+//! giving it in place, so the front end depends on neither.
+//!
+//! A crate's image is under its key ([`keys`]) when it has no [`Reads`]; else under its key,
+//! the names it read (a slot's bytes) and their values ([`reads::image_key`]).
 
 use std::{
     ops::Range,
     sync::{Arc, OnceLock},
 };
 
-use base_db::{Crate, Db};
-use blaze_format::Aligned;
+use base_db::{Crate, Db, Env};
 use blaze_ids::ContentId;
-use hir_expand::{MacroCallKind, MacroDefKind, builtin::include_input_to_file_id};
+use hir_expand::{MacroCallId, MacroCallKind, MacroDefKind, builtin::include_input_to_file_id};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     Lookup,
     deps::{
         DepImages, Image,
-        image::{ImageRef, Part, PartBytes, write_image},
-        key::keys,
+        image::{ImageBuf, ImageRef, Part, PartBytes, write_image},
+        key::{Base, keys},
+        reads::{self, Reads, SLOTS},
         signatures,
     },
     nameres::{
@@ -30,15 +34,22 @@ use crate::{
 };
 
 /// Where images are kept, and the threads that read and write them: what the driver adapts the
-/// store or the global cache and its pool to. `get` and `put` are called from those threads.
+/// store or the global cache and its pool to. Every method is called from those threads.
 pub trait ImageStore: Sync {
-    /// The image kept under `key`, its bytes checked against the content hash it was put
-    /// with; `Err` when the store could not be read.
-    fn get(&self, key: &ContentId) -> Result<Option<Arc<Aligned>>, String>;
+    /// The value kept under `key` (an image or a crate's reads), its bytes checked against the
+    /// content hash it was put with and held where the store keeps them; `Err` when the store
+    /// could not be read.
+    fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String>;
 
-    /// Keeps `image` under `key`. A second put of a key with other bytes is an error: a key
-    /// names one image.
-    fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String>;
+    /// Keeps `value` under `key`. A second put of a key with other bytes is an error: a key
+    /// names one value.
+    fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String>;
+
+    /// The hash of the values that the names `shape` an expansion server encoded (an
+    /// `ExpansionReads::Traced` shape) have now, as the server hashed them when the expansion
+    /// ran: `blaze_expand::reads_now`. A variable is the calling crate's (`env`, what the
+    /// expansion was given) before the process's. `Err` when one of them can't be read.
+    fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String>;
 
     /// Runs `task(at)` for each `at` in `0..count`, on every core the driver has: a crate's
     /// image is checked and encoded by one task, so [`serve`] and [`store`] take the larger of
@@ -50,6 +61,42 @@ pub trait ImageStore: Sync {
     }
 }
 
+/// The local store over the global cache: a value the local store lacks is asked of the
+/// global cache, and kept in the local store once found, so the next session reads it in place
+/// from the local store. What is written is written to the local store only: the global cache
+/// is written by blaze's builders, which publish what passes its rule for public keys.
+pub struct ReadThrough<'s> {
+    // dyn: the driver's stores, one call per crate per session
+    pub local: &'s dyn ImageStore,
+    // dyn: as above
+    pub global: &'s dyn ImageStore,
+}
+
+impl ImageStore for ReadThrough<'_> {
+    fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
+        if let Some(found) = self.local.get(key)? {
+            return Ok(Some(found));
+        }
+        let Some(found) = self.global.get(key)? else { return Ok(None) };
+        // alloc: a value fetched from the global cache, copied once into the local store
+        self.local.put(*key, found.bytes().to_vec())?;
+        Ok(Some(found))
+    }
+
+    fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
+        self.local.put(key, value)
+    }
+
+    fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {
+        self.local.reads_now(env, shape)
+    }
+
+    // dyn: as `ImageStore::for_each`
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
+        self.local.for_each(count, task)
+    }
+}
+
 /// What [`serve`] did.
 #[derive(Debug, Default)]
 pub struct Served {
@@ -58,23 +105,30 @@ pub struct Served {
     ///
     /// [`eligible`]: super::eligible
     pub keys: FxHashMap<Crate, ContentId>,
-    /// The crates read from an image, in the order of `keys`' crates.
+    /// The crates read from an image, in the order of their keys.
     pub hits: Vec<Crate>,
+    /// The crates with reads kept under their key but no image for the values those reads
+    /// have now: something they read changed, so they are resolved and imaged again.
+    pub stale: Vec<Crate>,
 }
 
-/// Why [`store`] wrote no image of a crate. Each is an input the key does not cover, so the
-/// image would be served where the crate resolves otherwise.
+/// Why [`store`] wrote no image of a crate. Each is an input the key and the reads do not
+/// cover, so the image would be served where the crate resolves otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
     /// Its def map depends on the macros of the session (`#[macro_export]` from a proc macro
     /// crate of the session): what they expand to is not in the key.
     SessionMacros,
-    /// An item of it comes from a procedural macro, whose output may read files and
-    /// variables the expansion server traces per expansion, which the key does not cover.
-    ProcMacro { call: String },
+    /// A procedural macro's expansion of it whose reads are not known, and why.
+    ProcMacro { call: String, why: &'static str },
     /// A module or an `include!` of it is a file outside the crate's source root, whose text
     /// the key does not cover (`OUT_DIR`, a `#[path]` out of the crate).
     OutsideSourceRoot { what: String },
+    /// A part of it holds a path its key writes as a marker ([`Base`]): the image would not be
+    /// the same in another checkout with the same key.
+    MachinePath { part: Part, path: String },
+    /// Its reads can't be kept.
+    Reads { why: &'static str },
     /// An encoding refused a part of it.
     Encode { part: Part, why: String },
 }
@@ -83,10 +137,16 @@ impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refused::SessionMacros => f.write_str("its def map uses the session's macros"),
-            Refused::ProcMacro { call } => write!(f, "an item comes from procedural macro {call}"),
+            Refused::ProcMacro { call, why } => {
+                write!(f, "what procedural macro {call} read is not known: {why}")
+            }
             Refused::OutsideSourceRoot { what } => {
                 write!(f, "{what} is outside the crate's source root")
             }
+            Refused::MachinePath { part, path } => {
+                write!(f, "its {} hold the path {path}, which its key does not", part.name())
+            }
+            Refused::Reads { why } => write!(f, "its reads can't be kept: {why}"),
             Refused::Encode { part, why } => write!(f, "its {} do not encode: {why}", part.name()),
         }
     }
@@ -112,12 +172,13 @@ pub(crate) fn crate_name(db: &Db, krate: Crate) -> String {
 }
 
 /// Reads each of `crates` that is [`eligible`] (and its dependencies) from the image `images`
-/// keep under its key, by `build`, the blaze reading: `mode` says what is done with each
-/// image. Replaces the frozen def maps and lang items `db` was given.
+/// keep for it, by `build`, the blaze reading: `mode` says what is done with each image.
+/// Replaces the frozen def maps and lang items `db` was given.
 ///
-/// An image that does not read under its key is an error naming the crate and why, never a
-/// crate resolved instead: the key covers what the image was made from and the store checked
-/// the bytes, so such an image is a bug in the key or in an encoding.
+/// An image that does not read under the key it is filed by, or reads that do not decode, are
+/// an error naming the crate and why, never a crate resolved instead: the key covers what the
+/// image was made from and the store checked the bytes, so such an image is a bug in the key or
+/// an encoding.
 ///
 /// [`eligible`]: super::eligible
 pub fn serve(
@@ -129,8 +190,9 @@ pub fn serve(
     mode: Mode,
 ) -> Result<Served, String> {
     let keys = keys(&*db, crates, build);
-    // alloc: setup: once per session
-    let mut order: Vec<(Crate, ContentId)> = keys.iter().map(|(&krate, &key)| (krate, key)).collect();
+    let mut order: Vec<(Crate, ContentId)> =
+        // alloc: setup: once per session
+        keys.iter().map(|(&krate, &key)| (krate, key)).collect();
     order.sort_unstable_by_key(|&(_, key)| key);
     // alloc: setup: one slot per crate, once per session
     let found: Vec<OnceLock<Fetched>> = order.iter().map(|_| OnceLock::new()).collect();
@@ -146,51 +208,92 @@ pub fn serve(
     let mut lang_items = FxHashMap::default();
     // alloc: setup: once per session
     let mut hits = Vec::with_capacity(order.len());
-    for (&(krate, key), found) in order.iter().zip(found) {
+    // alloc: setup, as above
+    let mut stale = Vec::new();
+    for (&(krate, _), found) in order.iter().zip(found) {
         let found = found.into_inner().unwrap_or_else(|| {
             panic!("`ImageStore::for_each` did not run the task of crate {}", crate_name(db, krate))
         });
-        let Some((bytes, parts)) = found? else { continue };
+        let (bytes, parts, filed) = match found? {
+            Found::Hit { bytes, parts, filed } => (bytes, parts, filed),
+            Found::Miss { stale: true } => {
+                stale.push(krate);
+                continue;
+            }
+            Found::Miss { stale: false } => continue,
+        };
         let part = |part| PartBytes::of(&bytes, &parts, part).into();
         maps.insert(krate, Frozen { bytes: part(Part::DefMap), mode });
         lang_items.insert(krate, Frozen { bytes: part(Part::LangItems), mode });
-        served.insert(krate, Image { key, bytes, parts, mode });
+        served.insert(krate, Image { key: filed, bytes, parts, mode });
         hits.push(krate);
     }
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
     set_images(db, served);
-    Ok(Served { keys, hits })
+    Ok(Served { keys, hits, stale })
 }
 
-/// An image found, and where its parts are in it.
-type Fetched = Result<Option<(Arc<Aligned>, [Range<usize>; Part::ALL.len()])>, String>;
+/// What one task of [`serve`] found of a crate.
+enum Found {
+    /// Its image, where its parts are in it, and the key it is filed under.
+    Hit { bytes: ImageBuf, parts: [Range<usize>; Part::ALL.len()], filed: ContentId },
+    /// No image; `stale` when reads were kept under its key.
+    Miss { stale: bool },
+}
 
-/// The image of `krate` under `key`, opened and its def map's files checked: one task of
-/// [`serve`].
+type Fetched = Result<Found, String>;
+
+/// The image of `krate`, whose key is `key`: under the key, or under the reads of one of its
+/// slots and their values now; opened and its def map's files checked.
 // dyn: the driver's store, one call per crate per session
 fn fetch(db: &Db, krate: Crate, key: ContentId, images: &dyn ImageStore) -> Fetched {
     let name = || crate_name(db, krate);
-    let Some(bytes) = images
-        .get(&key)
-        // alloc: error text
-        .map_err(|why| format!("reading the image of crate {} (key {key:?}): {why}", name()))?
-    else {
-        return Ok(None);
+    let get = |at: &ContentId, what: &str| {
+        images
+            .get(at)
+            // alloc: error text
+            .map_err(|why| format!("reading the {what} of crate {} (key {at:?}): {why}", name()))
     };
-    let image = ImageRef::open(&bytes, key)
+    if let Some(bytes) = get(&key, "image")? {
+        return open(db, krate, key, bytes);
+    }
+    let mut stale = false;
+    for n in 0..SLOTS {
+        let Some(record) = get(&reads::slot(key, n), "reads")? else { break };
+        let reads = Reads::decode(record.bytes()).map_err(|why| {
+            // alloc: error text
+            format!("the reads of crate {} in slot {n} of key {key:?}: {why}", name())
+        })?;
+        let values = reads.values_now(db, krate, images).map_err(|why| {
+            // alloc: error text
+            format!("the values of the reads of crate {} in slot {n}: {why}", name())
+        })?;
+        let filed = reads::image_key(key, record.bytes(), values);
+        if let Some(bytes) = get(&filed, "image")? {
+            return open(db, krate, filed, bytes);
+        }
+        stale = true;
+    }
+    Ok(Found::Miss { stale })
+}
+
+/// The image `bytes`, filed under `filed`, opened and its def map's files checked.
+fn open(db: &Db, krate: Crate, filed: ContentId, bytes: ImageBuf) -> Fetched {
+    let image = ImageRef::open(bytes.bytes(), filed).map_err(|why| {
         // alloc: error text
-        .map_err(|why| format!("the image of crate {} (key {key:?}): {why}", name()))?;
+        format!("the image of crate {} (key {filed:?}): {why}", crate_name(db, krate))
+    })?;
     if let Some(why) = frozen::unreadable(db, krate, image.part(Part::DefMap)) {
         // alloc: error text
         return Err(format!(
-            "the image of crate {} (key {key:?}) names files that are not the crate's: \
+            "the image of crate {} (key {filed:?}) names files that are not the crate's: \
              {why}; the key leaves out an input",
-            name()
+            crate_name(db, krate)
         ));
     }
-    let parts = image.ranges(&bytes);
-    Ok(Some((bytes, parts)))
+    let parts = image.ranges(bytes.bytes());
+    Ok(Found::Hit { bytes, parts, filed })
 }
 
 fn set_images(db: &mut Db, images: FxHashMap<Crate, Image>) {
@@ -241,7 +344,8 @@ pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored
     Ok(stored)
 }
 
-/// Writes the image of `krate` under `key`, or says why it is refused: one task of [`store`].
+/// Writes the image of `krate`, whose key is `key`, or says why it is refused: one task of
+/// [`store`].
 fn make(
     db: &Db,
     krate: Crate,
@@ -249,30 +353,89 @@ fn make(
     // dyn: the driver's store, one call per crate per session
     images: &dyn ImageStore,
 ) -> Result<Option<Refused>, String> {
-    let parts = match refusal(db, krate).map_or_else(|| encode(db, krate), Err) {
+    if let Some(why) = refusal(db, krate) {
+        return Ok(Some(why));
+    }
+    // alloc: setup: the macro calls the crate's signatures name, once per crate imaged
+    let mut calls = Vec::new();
+    let parts = match encode(db, krate, &mut calls) {
         Ok(parts) => parts,
         Err(why) => return Ok(Some(why)),
     };
-    let image = write_image(key, [&parts[0], &parts[1], &parts[2]]);
+    if let Some(why) = Base::of(db, krate).held_by(&parts) {
+        return Ok(Some(why));
+    }
+    let reads = match Reads::of(db, krate, &calls) {
+        Ok(reads) => reads,
+        Err(why) => return Ok(Some(why)),
+    };
+    let put = |at: ContentId, value: Vec<u8>| {
+        images.put(at, value).map_err(|why| {
+            // alloc: error text
+            format!("keeping the image of crate {} (key {at:?}): {why}", crate_name(db, krate))
+        })
+    };
+    let filed = match reads.is_empty() {
+        true => key,
+        false => {
+            let record = reads.encode();
+            if let Some(why) = keep_reads(db, krate, key, &record, images)? {
+                return Ok(Some(why));
+            }
+            reads::image_key(key, &record, reads.values_then(db))
+        }
+    };
+    let image = write_image(filed, [&parts[0], &parts[1], &parts[2]]);
     drop(parts);
-    images.put(key, image).map_err(|why| {
-        // alloc: error text
-        format!("keeping the image of crate {} (key {key:?}): {why}", crate_name(db, krate))
-    })?;
+    put(filed, image)?;
     Ok(None)
 }
 
-/// The parts of the image of `krate`, in the order of [`Part::ALL`].
-fn encode(db: &Db, krate: Crate) -> Result<[Vec<u8>; 3], Refused> {
+/// Keeps `record`, the reads of `krate`, in the first slot of `key` that holds it or is free.
+/// Two writers that keep other reads in one slot at once each see the other's and move on.
+fn keep_reads(
+    db: &Db,
+    krate: Crate,
+    key: ContentId,
+    record: &[u8],
+    // dyn: the driver's store, one call per crate per session
+    images: &dyn ImageStore,
+) -> Result<Option<Refused>, String> {
+    let error = |what: &str, why: String| {
+        // alloc: error text
+        format!("{what} the reads of crate {} (key {key:?}): {why}", crate_name(db, krate))
+    };
+    for n in 0..SLOTS {
+        let at = reads::slot(key, n);
+        match images.get(&at).map_err(|why| error("reading", why))? {
+            Some(kept) if kept.bytes() == record => return Ok(None),
+            Some(_) => continue,
+            // alloc: the slot's bytes, once per crate imaged
+            None => match images.put(at, record.to_vec()) {
+                Ok(()) => return Ok(None),
+                Err(why) => match images.get(&at).map_err(|why| error("reading", why))? {
+                    Some(kept) if kept.bytes() == record => return Ok(None),
+                    Some(_) => continue,
+                    None => return Err(error("keeping", why)),
+                },
+            },
+        }
+    }
+    Ok(Some(Refused::Reads { why: "every slot of its key holds other reads" }))
+}
+
+/// The parts of the image of `krate`, in the order of [`Part::ALL`], and in `calls` the macro
+/// calls its signatures name.
+fn encode(db: &Db, krate: Crate, calls: &mut Vec<MacroCallId>) -> Result<[Vec<u8>; 3], Refused> {
     let refused = |part| move |why| Refused::Encode { part, why };
     Ok([
         frozen::encode(db, krate).map_err(refused(Part::DefMap))?,
         frozen::encode_lang_items(db, krate).map_err(refused(Part::LangItems))?,
-        signatures::encode(db, krate).map_err(refused(Part::Signatures))?,
+        signatures::encode(db, krate, calls).map_err(refused(Part::Signatures))?,
     ])
 }
 
-/// Why the image of `krate` would leave out an input, if it would.
+/// Why the image of `krate` would leave out an input its reads do not cover, if it would.
 pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
     let def_map = crate_def_map(db, krate);
     if def_map.session_macros {
@@ -289,19 +452,12 @@ pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
         }
         for call in module.scope(db).all_macro_calls() {
             let loc = call.lookup(db);
-            match &loc.def.kind {
-                MacroDefKind::ProcMacro(..) => {
-                    // alloc: why a crate is refused, once per refused crate
-                    let call = format!("{:?} of crate {}", call, crate_name(db, loc.def.krate));
-                    return Some(Refused::ProcMacro { call });
-                }
-                MacroDefKind::BuiltInEager(_, expander)
-                    if expander.is_include_like() && include_outside(db, call, root) =>
-                {
-                    // alloc: why a crate is refused, once per refused crate
-                    return Some(Refused::OutsideSourceRoot { what: format!("include {call:?}") });
-                }
-                _ => {}
+            if let MacroDefKind::BuiltInEager(_, expander) = &loc.def.kind
+                && expander.is_include_like()
+                && include_outside(db, call, root)
+            {
+                // alloc: why a crate is refused, once per refused crate
+                return Some(Refused::OutsideSourceRoot { what: format!("include {call:?}") });
             }
         }
     }
@@ -310,11 +466,7 @@ pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
 
 /// Whether the file the eager `include!`, `include_str!` or `include_bytes!` `call` reads is
 /// outside the source root `root`, or not known: its eager argument, expanded, is the path.
-fn include_outside(
-    db: &Db,
-    call: hir_expand::MacroCallId,
-    root: base_db::SourceRootId,
-) -> bool {
+fn include_outside(db: &Db, call: MacroCallId, root: base_db::SourceRootId) -> bool {
     let MacroCallKind::FnLike { eager: Some(eager), .. } = &call.lookup(db).kind else {
         return true;
     };

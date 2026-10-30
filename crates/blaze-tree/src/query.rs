@@ -5,8 +5,8 @@
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
-use blaze_units::load::{ResolveAsk, Resolving, ViewResolved, load_error, platform_cfg, resolve_view};
-use blaze_units::query::{Cbor, Fetch, LoadError, Versioned, key_input, producer};
+use blaze_units::load::{ResolveAsk, Resolving, ViewResolved, key_id, load_error, platform_cfg, resolve_view};
+use blaze_units::query::{Cbor, Fetch, LoadError, Versioned, producer};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
@@ -128,7 +128,7 @@ impl Query for Tree {
     type Value = Cbor<Printed>;
 
     fn input(key: &TreeAsk) -> ContentId {
-        key_input("blaze v2 cargo tree key 1", key)
+        key_id("blaze v2 cargo tree key 1", key)
     }
 
     fn execute(cx: &mut Cx<'_>, ask: &TreeAsk) -> Result<Cbor<Printed>, Cancelled> {

@@ -103,6 +103,28 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 put!(out, "{name}: {elements} elements, {bytes} bytes\n");
             }
         }
+        Response::Memory(memory) => {
+            for it in &memory.tags {
+                put!(
+                    out,
+                    "{}: {} bytes live, {} at most, {} bytes/s, task peak {}, budget ",
+                    it.tag,
+                    it.live,
+                    it.high_water,
+                    it.rate,
+                    it.task_peak
+                );
+                match it.budget {
+                    u64::MAX => put!(out, "none\n"),
+                    bytes => put!(out, "{bytes}\n"),
+                }
+            }
+            put!(
+                out,
+                "committed: {} bytes, {} at most\n",
+                memory.committed, memory.committed_high_water
+            );
+        }
         Response::Edited(edited) => {
             let (items, ops) = (edited.items.len(), edited.ops.len());
             put!(out, "{} {items} items, {ops} ops\n", status("Edited"));

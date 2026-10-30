@@ -692,6 +692,14 @@ Pass `-Zsanitizer-coverage=...` and `-Csanitizer-coverage-level=N` through to co
 
 > forwarded to cargo.
 
+> answered by lane cargo (2026-10-29): the flags are parsed and passed through, as rustc names
+> them (`unstable.rs:470` `sanitize`, `:561` coverage, into `Policy::sanitize` in
+> `serve/unit/codegen.rs`; cargo.md "From speed-backend-sanitize", answered). They stay refused,
+> and a build with a non-empty set stops naming it, until link's runtimes land (link.md "From
+> speed-backend-sanitize", unanswered); then cargo-inbox-exec lifts the refusal. `cfg(sanitize =
+> ...)` for every unit, std's included, is being written by cargo-units in blaze-units so it is in
+> before the refusal goes.
+
 ## From safety-race
 
 `crate::race` is in `crates/hir-ty-ub/src/race.rs` (+ `src/race/`). Its API follows the brief

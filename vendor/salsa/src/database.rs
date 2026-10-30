@@ -63,6 +63,20 @@ pub trait Database: Send + Sync + ZalsaDatabase + AsDynDatabase {
         let _ = self.zalsa_mut();
     }
 
+    /// Has every query running on this database, on any thread and inside cycles too, unwind
+    /// with [`Cancelled::PendingWrite`](crate::Cancelled::PendingWrite) at its next query call,
+    /// and every query started after it as well, until the next write (`&mut`,
+    /// [`Self::trigger_cancellation`] included) clears it. For an owner that must write while
+    /// other threads read through `&Self`: it stops them, waits for them to let go, then writes.
+    fn stop_readers(&self) {
+        self.zalsa().runtime().stop_readers();
+    }
+
+    /// Whether [`Self::stop_readers`] was called since the last write.
+    fn readers_stopped(&self) -> bool {
+        self.zalsa().runtime().readers_stopped()
+    }
+
     /// Retrieves a [`CancellationToken`] for the task the current thread runs.
     fn cancellation_token(&self) -> CancellationToken {
         self.zalsa_local().cancellation_token()

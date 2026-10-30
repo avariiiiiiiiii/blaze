@@ -86,3 +86,59 @@ fn a_stop_holds_until_the_next_write() {
     assert!(!db.readers_stopped());
     assert_eq!(text_len(&db, text), 13);
 }
+
+mod stopped_mid_query {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    use salsa::Database as _;
+
+    use super::*;
+
+    static INNER_RUNS: AtomicU32 = AtomicU32::new(0);
+    static OUTER_RUNS: AtomicU32 = AtomicU32::new(0);
+    static OUTER_READ: AtomicBool = AtomicBool::new(false);
+
+    #[salsa::tracked]
+    fn counted_len(db: &Db, text: FileText) -> u32 {
+        INNER_RUNS.fetch_add(1, Ordering::Relaxed);
+        text.text(db).len() as u32
+    }
+
+    /// Reads [`counted_len`], and on its first run waits to be stopped before it returns.
+    #[salsa::tracked]
+    fn len_once_stopped(db: &Db, text: FileText) -> u32 {
+        let first = OUTER_RUNS.fetch_add(1, Ordering::Relaxed) == 0;
+        let len = counted_len(db, text);
+        if first {
+            OUTER_READ.store(true, Ordering::Release);
+            while !db.readers_stopped() {
+                std::thread::yield_now();
+            }
+            db.unwind_if_revision_cancelled();
+            unreachable!("a stopped reader unwinds at its next check");
+        }
+        len
+    }
+
+    /// A stop unwinds a reader to its task, where it is caught once. The query the reader was in
+    /// stores nothing and runs again when next asked, and the query it had finished is kept.
+    #[test]
+    fn a_reader_stopped_mid_query_keeps_what_it_finished_and_stores_nothing_else() {
+        let (mut shared, file) = shared_with("fn main() {}\n");
+        let text = shared.file_text(file);
+        let reader = shared.reader();
+        let thread = std::thread::spawn(move || {
+            let ran = Cancelled::catch(AssertUnwindSafe(|| len_once_stopped(&reader, text)));
+            drop(reader);
+            ran
+        });
+        while !OUTER_READ.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let db = shared.write();
+        assert!(matches!(thread.join().unwrap(), Err(Cancelled::PendingWrite)));
+        assert_eq!(len_once_stopped(&*db, text), 13);
+        assert_eq!(OUTER_RUNS.load(Ordering::Relaxed), 2, "the stopped run stored no memo");
+        assert_eq!(INNER_RUNS.load(Ordering::Relaxed), 1, "the finished read is kept");
+    }
+}

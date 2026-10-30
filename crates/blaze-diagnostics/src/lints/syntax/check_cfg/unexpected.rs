@@ -219,15 +219,9 @@ enum Read {
 
 impl Lints<'_, '_> {
     fn tree(&mut self, tree: &Tree) {
-        // An attribute is a child of its owner or, inner, of a list at most two nodes below it
-        // (`fn f() { #![..] }`): the owners with one are within three nodes above an `ATTR`.
-        let mut owners: FxHashSet<SyntaxNodePtr> = FxHashSet::default();
-        for attr in tree.of_kind(|it| it == SyntaxKind::ATTR) {
-            owners.extend(attr.ancestors().skip(1).take(3).map(|it| SyntaxNodePtr::new(&it)));
-        }
         let mut read: Vec<(&SyntaxNode, Read)> = Vec::new();
-        for (node, &kind) in tree.nodes.iter().zip(&tree.kinds) {
-            if ast::AnyHasAttrs::can_cast(kind) && !owners.is_empty() && owners.contains(&SyntaxNodePtr::new(node)) {
+        for ((node, &kind), &attrs) in tree.nodes.iter().zip(&tree.kinds).zip(&tree.attrs) {
+            if attrs && ast::AnyHasAttrs::can_cast(kind) {
                 read.push((node, Read::Attrs));
             }
             if matches!(kind, SyntaxKind::CFG_PRED_EXPR | SyntaxKind::CFG_PRED_PAT) {

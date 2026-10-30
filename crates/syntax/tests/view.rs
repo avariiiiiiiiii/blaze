@@ -105,7 +105,7 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
         assert!(same(v.parent().map(NodeOrToken::Node), h.parent().map(NodeOrToken::Node)), "{}", at());
         assert!(same(v.next_sibling_or_token(), h.next_sibling_or_token()), "{}", at());
         assert!(same(v.prev_sibling_or_token(), h.prev_sibling_or_token()), "{}", at());
-        assert!(view::Node::at(root.file(), v.id()) == v, "{}", at());
+        assert!(view::Node::at(root.shared_file(), v.id()) == v, "{}", at());
         match (h, v) {
             (NodeOrToken::Node(h), NodeOrToken::Node(v)) => {
                 assert_eq!(h.text().to_string(), v.text(), "{}", at());

@@ -71,16 +71,7 @@ impl Default for SyntaxTreeBuilder {
 }
 
 impl SyntaxTreeBuilder {
-    /// A builder whose tokens are consecutive slices of `source`, which the tree shares.
-    pub(crate) fn sourced(source: Text) -> SyntaxTreeBuilder {
-        SyntaxTreeBuilder {
-            errors: Vec::new(),
-            inner: FlatTreeBuilder::sourced(source),
-            lazy: false,
-        }
-    }
-
-    /// [`Self::sourced`] over `range` of `source` only, as a lazy node's part is.
+    /// A builder whose tokens are consecutive slices of `range` of `source`, which the tree shares.
     pub(crate) fn sourced_range(source: Text, range: TextRange) -> SyntaxTreeBuilder {
         SyntaxTreeBuilder {
             errors: Vec::new(),

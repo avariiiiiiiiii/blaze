@@ -51,3 +51,4 @@ walks, and six `Cx` additions (`path` at item level, `resolve_type`, `fn_def`/`a
 `is_exported`, `is_in_test`, `def_span`).
 
 > forwarded to lints (from requests, pass 16; told by tmux).
+> applied by lints-driver: in `check.rs` and `lints/mod.rs` (checked by lane `lints`, 2026-10-29).

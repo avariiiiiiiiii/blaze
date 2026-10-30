@@ -30,7 +30,8 @@ use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 
 use super::invocation::Invocation;
-use crate::query::{Cbor, Mount, Origin, Versioned, key_input, producer};
+use super::key_id;
+use crate::query::{Cbor, Mount, Origin, Versioned, producer};
 
 /// What a path is.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -438,7 +439,7 @@ impl Query for Mounts {
     type Value = MountIndex;
 
     fn input(key: &()) -> ContentId {
-        key_input("blaze v2 cargo mounts key 1", key)
+        key_id("blaze v2 cargo mounts key 1", key)
     }
 
     fn execute(cx: &mut Cx<'_>, _: &()) -> Result<MountIndex, Cancelled> {
@@ -458,7 +459,7 @@ impl Query for LoadFile {
     type Value = Cbor<Found<Vec<u8>>>;
 
     fn input(key: &String) -> ContentId {
-        key_input("blaze v2 cargo file key 1", key)
+        key_id("blaze v2 cargo file key 1", key)
     }
 
     fn execute(cx: &mut Cx<'_>, path: &String) -> Result<Cbor<Found<Vec<u8>>>, Cancelled> {
@@ -497,7 +498,7 @@ impl Query for LoadDir {
     type Value = Cbor<Found<Vec<(String, bool)>>>;
 
     fn input(key: &String) -> ContentId {
-        key_input("blaze v2 cargo dir key 1", key)
+        key_id("blaze v2 cargo dir key 1", key)
     }
 
     fn execute(cx: &mut Cx<'_>, path: &String) -> Result<Cbor<Found<Vec<(String, bool)>>>, Cancelled> {
@@ -583,7 +584,7 @@ impl Query for FixedFile {
     type Value = Cbor<Found<Vec<u8>>>;
 
     fn input(key: &FixedPath) -> ContentId {
-        key_input("blaze v2 cargo fixed file key 2", key)
+        key_id("blaze v2 cargo fixed file key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &FixedPath) -> Result<Cbor<Found<Vec<u8>>>, Cancelled> {
@@ -601,7 +602,7 @@ impl Query for FixedDir {
     type Value = Cbor<Found<Names>>;
 
     fn input(key: &FixedPath) -> ContentId {
-        key_input("blaze v2 cargo fixed dir key 2", key)
+        key_id("blaze v2 cargo fixed dir key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &FixedPath) -> Result<Cbor<Found<Names>>, Cancelled> {

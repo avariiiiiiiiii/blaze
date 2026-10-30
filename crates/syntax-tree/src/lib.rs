@@ -7,6 +7,10 @@
 )]
 #![deny(unsafe_code)]
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 #[allow(unsafe_code)]
 pub mod cursor;
 

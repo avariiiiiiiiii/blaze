@@ -177,21 +177,27 @@ fn has_mir<'db>(
 fn cyclic<'db>(db: &'db Db, root: InlinedBody<'db>) -> Option<Callgraph<'db>> {
     let owner = owner_of(db, root);
     let krate = owner.krate(db);
-    let ctx = Ctx::new(db, owner);
-    let env = ParamEnvAndCrate { param_env: ctx.env, krate };
-    let identity = GenericArgs::identity_for_item(ctx.infcx.interner, owner.generic_def(db).into());
-    let limit = crate_def_map(db, krate).recursion_limit() as usize / 8;
-    let callees = |(body, args): (InlinedBody<'db>, GenericArgs<'db>)| {
-        let mut out: SmallVec<[((InlinedBody<'db>, GenericArgs<'db>), bool); 8]> = SmallVec::new();
-        for (func, callee_args) in inliner_callees(db, body) {
-            let Some(callee_args) = instantiate(&ctx, callee_args.as_ref(), args) else { continue };
-            let Some(callee) = resolve(&ctx, env, *func, callee_args) else { continue };
-            out.push((callee, has_mir(db, krate, callee.0, callee.1)));
-        }
-        out
-    };
-    let local = |body: InlinedBody<'db>| owner_of(db, body).krate(db) == krate;
-    walk((root, identity), root, limit, |node| node.0, callees, local).map(Callgraph::new)
+    blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
+        let ctx = Ctx::new(db, owner, frame);
+        let env = ParamEnvAndCrate { param_env: ctx.env, krate };
+        let generic_def = owner.generic_def(db).into();
+        let identity = GenericArgs::identity_for_item(ctx.infcx.interner, generic_def);
+        let limit = crate_def_map(db, krate).recursion_limit() as usize / 8;
+        let callees = |(body, args): (InlinedBody<'db>, GenericArgs<'db>)| {
+            let mut out: SmallVec<[((InlinedBody<'db>, GenericArgs<'db>), bool); 8]> =
+                SmallVec::new();
+            for (func, callee_args) in inliner_callees(db, body) {
+                let Some(callee_args) = instantiate(&ctx, callee_args.as_ref(), args) else {
+                    continue;
+                };
+                let Some(callee) = resolve(&ctx, env, *func, callee_args) else { continue };
+                out.push((callee, has_mir(db, krate, callee.0, callee.1)));
+            }
+            out
+        };
+        let local = |body: InlinedBody<'db>| owner_of(db, body).krate(db) == krate;
+        walk((root, identity), root, limit, |node| node.0, callees, local).map(Callgraph::new)
+    })
 }
 
 struct Frame<N> {

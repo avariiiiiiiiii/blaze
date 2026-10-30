@@ -10,7 +10,7 @@ use blaze_core::{
     sim::{Faults, Rng, Sim},
 };
 use blaze_ids::ContentId;
-use blaze_image::{Builder, Image, MIN_GROUP_SHIFT, SectionId, bytes_of};
+use blaze_image::{Builder, Image, MIN_GROUP_SHIFT, SectionId};
 
 use super::{BLOBS_SCHEMA, ImageError, ImageMark, ImageUse, TREE_SCHEMA};
 use crate::{Change, Mode, Op, OpError, Vfs, journal::base_of, store::Source, tree::NodeId};
@@ -20,27 +20,8 @@ fn file() -> FileName {
 }
 
 /// Bytes at an address aligned for every column, as a mapped file's are.
-struct Words {
-    words: Vec<u64>,
-    len: usize,
-}
-
-impl AsRef<[u8]> for Words {
-    fn as_ref(&self) -> &[u8] {
-        &bytes_of(&self.words)[..self.len]
-    }
-}
-
 fn mapping(bytes: &[u8]) -> Mapping {
-    let words = bytes
-        .chunks(8)
-        .map(|chunk| {
-            let mut word = [0; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            u64::from_ne_bytes(word)
-        })
-        .collect();
-    Mapping(Arc::new(Words { words, len: bytes.len() }))
+    Mapping::copy(bytes)
 }
 
 /// The image of `vfs` as it is now, in groups of the smallest size, so files span several.

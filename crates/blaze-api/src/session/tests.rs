@@ -453,6 +453,42 @@ fn status_lists_every_connections_requests_sorted() {
     assert_eq!(world.request(3, 1, Request::Status), [reply(3, 1, Response::Status(status)), done(3, 1, true)]);
 }
 
+/// A warm Status, with one build under way, allocates only its reply's own: the one allocation
+/// is the `requests` list of [`Status`], which goes out in the reply. The session's sort,
+/// its views' count and the replies' pushes into the daemon's kept `out` allocate nothing.
+#[test]
+fn a_warm_status_allocates_only_its_replys_list_of_requests() {
+    let mut world = World::new();
+    world.request(1, 1, Request::Build { view: head("main"), targets: targets() });
+    let mut out = Vec::with_capacity(4);
+    for id in 0..8u64 {
+        out.clear();
+        let World { vfs, db, builder, session } = &mut world;
+        let mut cx = Daemon {
+            vfs,
+            db: &*db,
+            builder,
+            pid: 30,
+            memory_bytes: 10,
+            budget_bytes: 20,
+            memory: counters,
+        };
+        let from = to(2, id);
+        let arrived = Arrived::Request { from, request: Request::Status };
+        blaze_alloc_count::assert_at_most(1, "a warm Status: its reply's list of requests", || {
+            session.arrive(&mut cx, arrived, &mut out)
+        });
+        let status = Status {
+            pid: 30,
+            requests: vec![1],
+            views: 1,
+            memory_bytes: 10,
+            budget_bytes: 20,
+        };
+        assert_eq!(out, [reply(2, id, Response::Status(status)), done(2, id, true)]);
+    }
+}
+
 /// How many times [`counters`] was read: the parse tag hands out 3 MB between reads.
 static READS: AtomicU64 = AtomicU64::new(0);
 
@@ -638,7 +674,7 @@ fn a_build_test_or_run_that_ends_without_its_work_fails_naming_the_job() {
         world.request(1, id, request);
         let job = world.last_job();
         let replies = world.finish(job, true, None);
-        assert_eq!(error_at(&replies), Some(format!("job {}", job.0)));
+        assert_eq!(error_at(&replies), Some(format!("job {job}")));
         assert_eq!(replies.last(), Some(&done(1, id, false)));
     }
 }
@@ -662,19 +698,117 @@ fn a_report_or_finish_after_the_finish_is_dropped() {
     world.finish(job, true, None);
     assert_eq!(world.report(job, diagnostic(Level::Error)), []);
     assert_eq!(world.finish(job, false, None), []);
-    assert_eq!(world.report(JobId(99), diagnostic(Level::Error)), []);
+    let unknown = JobId { slot: job.slot + 99, ..job };
+    assert_eq!(world.report(unknown, diagnostic(Level::Error)), [], "a slot never made");
+    assert_eq!(world.finish(unknown, true, None), []);
+    let free = JobId { generation: job.generation + 1, ..job };
+    assert_eq!(world.report(free, diagnostic(Level::Error)), [], "the free slot's generation");
+    assert_eq!(world.finish(free, true, None), []);
 }
 
 #[test]
-fn job_ids_increase_and_are_never_reused() {
+fn a_finished_jobs_slot_is_reused_and_its_old_id_refused() {
     let mut world = World::new();
-    for id in 0..4 {
+    world.request(1, 1, Request::Check { view: head("main"), targets: targets() });
+    let old = world.last_job();
+    assert_eq!(world.finish(old, true, None), [done(1, 1, true)]);
+    world.request(1, 2, Request::Check { view: head("main"), targets: targets() });
+    let new = world.last_job();
+    assert_eq!(new.slot, old.slot, "the freed slot, before a new one");
+    assert_ne!(new, old);
+
+    assert_eq!(world.report(old, diagnostic(Level::Error)), [], "a report naming the old id");
+    assert_eq!(world.finish(old, false, None), [], "a finish naming the old id");
+    assert_eq!(world.session.views(), 1, "the new job still holds its view");
+    let warning = diagnostic(Level::Warning);
+    assert_eq!(world.report(new, warning.clone()), [reply(1, 2, warning)]);
+    assert_eq!(world.finish(new, true, None), [done(1, 2, true)]);
+
+    for id in 3..40 {
         world.request(1, id, Request::Snapshot);
-        let job = world.last_job();
-        world.finish(job, true, None);
+        if id % 3 != 0 {
+            world.finish(world.last_job(), true, None);
+        }
     }
-    let jobs: Vec<JobId> = world.builder.started.iter().map(|it| it.0).collect();
-    assert_eq!(jobs, [JobId(0), JobId(1), JobId(2), JobId(3)]);
+    let jobs: BTreeSet<JobId> = world.builder.started.iter().map(|it| it.0).collect();
+    assert_eq!(jobs.len(), world.builder.started.len(), "no id handed out twice");
+}
+
+/// Intents are taken over in the order their jobs started, though reused slots put their ids
+/// out of that order.
+#[test]
+fn intents_are_taken_over_in_start_order_after_slots_are_reused() {
+    let mut world = World::new();
+    world.commit(&[("src/lib.rs", "")]);
+    for id in 1..=3 {
+        world.request(5, id, Request::Snapshot);
+    }
+    let snapshots: Vec<JobId> = world.builder.started.iter().map(|it| it.0).collect();
+    world.finish(snapshots[0], true, None);
+    world.finish(snapshots[1], true, None);
+
+    for conn in 1..=3 {
+        let will = Request::WillTest { view: head("main"), filter: Vec::new(), targets: targets(), wait_ms: 100 };
+        world.request(conn, 1, will);
+    }
+    let intents: Vec<JobId> = world.builder.speculated.iter().map(|it| it.0).collect();
+    let mut by_id = intents.clone();
+    by_id.sort_unstable();
+    assert_ne!(intents, by_id, "reused slots put the ids out of start order");
+
+    world.request(4, 1, Request::Check { view: head("main"), targets: targets() });
+    assert_eq!(world.builder.promoted, intents, "taken over in start order");
+    for job in intents {
+        assert_eq!(world.finish(job, true, None), []);
+    }
+    let check = world.last_job();
+    assert_eq!(world.finish(check, true, None), [done(4, 1, true)]);
+    assert_eq!(world.finish(snapshots[2], true, None), [done(5, 3, true)]);
+    assert_eq!(world.session.views(), 0);
+}
+
+/// A warm start and finish of a job allocates nothing: its id is a slot of the session's table
+/// of jobs, freed and reused, and the request's own entries go back to maps that keep their room.
+#[test]
+fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
+    let mut world = World::new();
+    world.request(1, 0, Request::Snapshot);
+    world.finish(world.last_job(), true, None);
+    world.builder.started.reserve(16);
+    let mut out = Vec::with_capacity(4);
+    for id in 1..8u64 {
+        out.clear();
+        let World { vfs, db, builder, session } = &mut world;
+        let mut cx = Daemon {
+            vfs: &mut *vfs,
+            db: &*db,
+            builder: &mut *builder,
+            pid: 30,
+            memory_bytes: 10,
+            budget_bytes: 20,
+            memory: counters,
+        };
+        let arrived = Arrived::Request { from: to(1, id), request: Request::Snapshot };
+        blaze_alloc_count::assert_at_most(0, "a warm start of a job", || {
+            session.arrive(&mut cx, arrived, &mut out)
+        });
+        let job = builder.started.last().expect("a job started").0;
+        let mut cx = Daemon {
+            vfs: &mut *vfs,
+            db: &*db,
+            builder: &mut *builder,
+            pid: 30,
+            memory_bytes: 10,
+            budget_bytes: 20,
+            memory: counters,
+        };
+        blaze_alloc_count::assert_at_most(0, "a warm finish of a job", || {
+            session.finish(&mut cx, job, true, None, &mut out)
+        });
+        assert_eq!(out, [done(1, id, true)]);
+    }
+    let slots: BTreeSet<u32> = world.builder.started.iter().map(|it| it.0.slot).collect();
+    assert_eq!(slots.len(), 1, "one slot, reused");
 }
 
 #[test]
@@ -960,7 +1094,7 @@ fn an_edit_that_fails_is_cancelled_or_reports_nothing_commits_nothing() {
     world.request(1, 4, edit_request(base));
     let job = world.last_job();
     let replies = world.finish(job, true, None);
-    assert_eq!(error_at(&replies), Some(format!("job {}", job.0)), "no `Edited` reported");
+    assert_eq!(error_at(&replies), Some(format!("job {job}")), "no `Edited` reported");
     assert_eq!(replies.last(), Some(&done(1, 4, false)));
 
     world.request(2, 1, edit_request(base));

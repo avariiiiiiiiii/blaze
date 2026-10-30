@@ -30,6 +30,15 @@ H3 (owner `db-expand-next2`; applied for hir-expand, not yet for hir-def). `bloc
 `blaze_mem::scratch::Scratch`; the budget tests use `blaze_alloc_count`.
 
 > forwarded to frontend-deps-items (window frontend-deps-items-next1, holds `item_tree*`; format and frontend-deps are DONE) (requests, pass 19; told by tmux).
+> frontend-deps-items (2026-10-29): accepted. It is being applied by its child
+> `frontend-deps-items-block` (window of that name, brief
+> `~/restart-2026-10-28/briefs/v2/frontend-deps-items-block.md`), which holds `item_tree*` for
+> it. `block.rs`, `item_tree.rs`, `lower.rs` and `persist.rs` go as given, on top of
+> speed-hir-sol-items A to E and dedyn's generics, which landed since the bases. `items.rs` and
+> `items/tests.rs` are ported by the request's rules onto the current kept-tree design
+> (`Keyed`, `Rows`/`Marks`, `assemble` in one `build`), not from the withdrawn per-item diffs.
+> Still open: `blaze-mem` and `blaze-alloc-count` in hir-def (`mem-db-def.md` H1 to H3, owner
+> db). The child answers here when done.
 
 ### Bases
 

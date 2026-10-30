@@ -170,7 +170,7 @@ fn unwinds_out(body: &MirBody<'_>) -> bool {
 /// rustc's `Inline` pass over the body of `caller` with `options`; says whether it inlined
 /// anything, after which rustc's `SimplifyCfg` runs.
 pub(super) fn inline<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     body: &mut MirBody<'db>,
     caller: InlinedBody<'db>,
     options: MirOptions,
@@ -206,8 +206,8 @@ pub(super) fn inline<'db>(
 }
 
 /// rustc's `NormalInliner` and its `CallSite`s.
-struct Inliner<'a, 'db> {
-    ctx: &'a Ctx<'db>,
+struct Inliner<'a, 'f, 'db> {
+    ctx: &'a Ctx<'f, 'db>,
     db: &'db Db,
     caller: InlinedBody<'db>,
     caller_attrs: Attrs,
@@ -239,7 +239,7 @@ struct CallSite<'db> {
     spread: bool,
 }
 
-impl<'a, 'db> Inliner<'a, 'db> {
+impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
     fn past_depth_limit(&self) -> bool {
         self.history.len() > HISTORY_DEPTH_LIMIT || self.top_down_counter > TOP_DOWN_DEPTH_LIMIT
     }
@@ -531,7 +531,7 @@ fn has_asm(body: &MirBody<'_>) -> bool {
 /// `sub_types` of the return type and of each argument. Lifetimes make no difference to the
 /// code, and are erased on both sides.
 fn check_signature<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     site: &CallSite<'db>,
     callee: &MirBody<'db>,
     arg_tys: &[Ty<'db>],
@@ -631,9 +631,11 @@ fn cross_crate_inlinable(db: &Db, func: FunctionId, options: MirOptions) -> bool
         return false;
     }
     let Ok(body) = db.optimized_mir_body(func.into(), options) else { return false };
-    let ctx = Ctx::new(db, func.into());
-    cost::is_small_leaf(body, written_checker(db, body), |place| {
-        place.as_ref().ty(body, &ctx.infcx, ctx.env).ty.is_trivially_pure_clone_copy()
+    blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
+        let ctx = Ctx::new(db, func.into(), frame);
+        cost::is_small_leaf(body, written_checker(db, body), |place| {
+            place.as_ref().ty(body, &ctx.infcx, ctx.env).ty.is_trivially_pure_clone_copy()
+        })
     })
 }
 
@@ -717,7 +719,7 @@ pub(super) fn fn_def<'db>(
 /// to an item with MIR. A virtual call, an intrinsic, a shim and a call whose impl is not
 /// known resolve to nothing.
 pub(super) fn resolve<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     env: ParamEnvAndCrate<'db>,
     func: FunctionId,
     args: GenericArgs<'db>,
@@ -781,7 +783,7 @@ pub(super) fn resolve<'db>(
 }
 
 /// The type of `operand` in `body`, normalized with its lifetimes erased.
-pub(super) fn operand_ty<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>, operand: &Operand) -> Ty<'db> {
+pub(super) fn operand_ty<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, operand: &Operand) -> Ty<'db> {
     let ty = match &operand.kind {
         OperandKind::Copy(place) | OperandKind::Move(place) => {
             place.as_ref().ty(body, &ctx.infcx, ctx.env).ty
@@ -801,19 +803,19 @@ pub(super) fn operand_ty<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>, operand: &Ope
 /// `value`, of the body `args` instantiate, in the terms of the body `args` are of: `None`
 /// where `args` lacks a parameter `value` names or an alias does not normalize.
 pub(super) fn instantiate<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     value: GenericArgs<'db>,
     args: GenericArgs<'db>,
 ) -> Option<GenericArgs<'db>> {
     fold(ctx, value, Some(args))
 }
 
-fn normalize_ty<'db>(ctx: &Ctx<'db>, ty: Ty<'db>) -> Ty<'db> {
+fn normalize_ty<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Ty<'db> {
     ty.fold_with(&mut Instantiate { ctx, args: None, missing: false })
 }
 
 fn fold<'db, T: TypeFoldable<DbInterner<'db>>>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     value: T,
     args: Option<GenericArgs<'db>>,
 ) -> Option<T> {
@@ -824,13 +826,13 @@ fn fold<'db, T: TypeFoldable<DbInterner<'db>>>(
 
 /// Replaces the generic parameters by `args` where there are some, normalizes each alias
 /// where `ctx` can and erases the lifetimes not bound inside.
-struct Instantiate<'a, 'db> {
-    ctx: &'a Ctx<'db>,
+struct Instantiate<'a, 'f, 'db> {
+    ctx: &'a Ctx<'f, 'db>,
     args: Option<GenericArgs<'db>>,
     missing: bool,
 }
 
-impl<'db> TypeFolder<DbInterner<'db>> for Instantiate<'_, 'db> {
+impl<'db> TypeFolder<DbInterner<'db>> for Instantiate<'_, '_, 'db> {
     fn cx(&self) -> DbInterner<'db> {
         self.ctx.infcx.interner
     }

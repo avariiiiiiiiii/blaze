@@ -133,19 +133,13 @@ fn the_oldest_delivery_ids_are_forgotten() {
 /// seeded ids, with repeats, ids longer than a slot's room, and every size from one.
 #[test]
 fn the_ring_of_ids_answers_as_a_queue_and_a_set_did() {
-    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     for most in [1, 2, 3, 7, 64, 500] {
         let mut seen = Seen::new(most);
         let mut order = std::collections::VecDeque::new();
         let mut ids = std::collections::HashSet::new();
         for step in 0..20 * most + 200 {
-            let pick = next();
+            let pick = rng.next_u64();
             let id = match pick % 3 {
                 0 => format!("{:08x}-cc78-11e3-81ab-4c9367dc0958", pick % (3 * most as u64)),
                 1 => format!("{}", pick % (2 * most as u64)),

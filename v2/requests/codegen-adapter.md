@@ -489,6 +489,11 @@ own `Homes`. Devspeed item 1 holds: `backend::built` goes through `instance_code
    test that the referenced items at `Release` are a subset of those at `Debug`, over the
    `hir-ide` MIR fixtures, would hold the property.
 
+> applied by codegen-mir (2026-10-29): said in `optimize`'s doc; `hir-ty-mir/tests/mir/references.rs`
+> checks it (constants, statics, drops, coercions, closures) with `inline` off. Once the inliner
+> is registered, an inlined body's references are its callees', so the walk keeps the property
+> only transitively: it must visit each `inlined.callees` body as it visits a call.
+
 ### To codegen (parent)
 
 7. `Build` carries `optimized`, not one level, because rustc's level is the body's crate's (a

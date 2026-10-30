@@ -45,10 +45,10 @@ are the CLI edge and run once a process.
 - `wire.rs` tests: a trace written, 1 (its one column buffer); parsed and checked in place on one
   piece, 0; copied out, 8 (one a column).
 
-## Left
+## `lib.rs`
 
-`lib.rs` holds the remaining 20 lint findings: range clones in `TraceBuilder::finish` and
-`Trace::edges`, the once-a-trace buffers of `finish`, and the answers of `under`, `over`, `apart`
-and `sample`. The fixes are written out in `v2/requests/dedup-codec-rng.md`, because lane
-`dedup-codec-rng` holds the file while it moves `Rng`. `Trace` keeps `Clone` for the tests only.
-`Stale` owns no heap.
+`Trace::edges`, called per key in every join, and `TraceBuilder::finish` index by two `usize`s
+rather than cloning a `Range`. `finish`'s buffers are each sized once a trace. `sample` sorts
+its truncated index list in place instead of copying it out first. The answers of `under`,
+`over` and `apart` stay unallocated while empty. `Trace` keeps `Clone` for the tests only;
+`Stale` owns no heap. The hot lint finds nothing in the crate.

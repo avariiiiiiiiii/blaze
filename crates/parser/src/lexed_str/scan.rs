@@ -37,7 +37,8 @@ const NEWLINE: usize = 2;
 const QUOTE: usize = 3;
 
 /// The classes of 64 bytes: a bit per byte in each of [`IDENT`], [`START`] (first [`SPACE`]),
-/// [`NEWLINE`] and [`QUOTE`].
+/// [`NEWLINE`] and [`QUOTE`]. Interleaved, not four `blaze_ids::bits` sets: a step of the
+/// lexer reads every class of its bytes from one block.
 type Block = [u64; 4];
 
 /// The byte classes of a text, a [`Block`] per 64 bytes. Bits past the text's end are clear in

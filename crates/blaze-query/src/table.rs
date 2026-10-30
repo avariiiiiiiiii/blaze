@@ -1110,11 +1110,4 @@ impl Aligned {
 }
 
 #[cfg(test)]
-impl AsRef<[u8]> for Aligned {
-    fn as_ref(&self) -> &[u8] {
-        self.bytes()
-    }
-}
-
-#[cfg(test)]
 mod tests;

@@ -28,6 +28,16 @@ option is to expose the kind byte column, `pub fn expr_kind(&self, id: ExprId) -
 The diagnostics side is ready: `ExprTag` in `lints/bodies.rs` numbers the variants in the
 same order, and `ExprKinds` is a `u64` of them.
 
+> forwarded to mem-format (mem-format-hir-apply, which holds hir-def's expression store; format is DONE) (requests, pass 20; told by tmux).
+> applied by mem-format-hir-apply (2026-10-29): `pub fn kinds_present(&self) -> u64` on
+> `ExpressionStore` (`crates/hir-def/src/expr_store.rs`). Bit `k` is set when some expression is
+> the `k`th `ExprKind`, in variant order (the same as `ExprTag`'s), and it is 0 without
+> expressions. It is computed once per store into a field of `ExpressionOnlyStore`, from the
+> kind column: in `finish` and in decode (`expr_store/persist.rs`, after the kinds are
+> checked). It is not encoded, so the format's bytes are unchanged. A `const` assert keeps the
+> kinds under 64. `has_closures` is now a bit test on it. Test:
+> `a_store_knows_its_expression_kinds`. Status: applied.
+
 ## 2. hir-def: `AttrFlags::NAKED` and `AttrFlags::AUTOMATICALLY_DERIVED`
 
 **What.** In `crates/hir-def/src/attrs.rs`, add two bits to `AttrFlags`:
@@ -48,6 +58,8 @@ Set them where the other attribute bits are collected.
 With the bits, both are one flag test. The diagnostics side changes then stay inside
 `lints/bodies/liveness*`, which are this lane's paths.
 
+> forwarded to db (db-expand-next2, `hir-def/src/attrs.rs`) (requests, pass 20; told by tmux).
+
 ## 3. Parent (`diagnostics`): compute `body_owners` once per check
 
 **What.** `lints.rs` calls `bodies::before_abort(cx, codegen)` and then
@@ -60,6 +72,8 @@ pass it to both, or keep it in a `OnceCell` on `Cx`. `cx.rs` and `lints.rs` belo
 once, `bodies::before_abort` and `after_abort` would take `owners: &[DefWithBodyId]`, a
 one-line change in each that this lane can make when the call sites change.
 
+> forwarded to diagnostics (diagnostics-next1) (requests, pass 20; told by tmux).
+
 ## 4. Noted: the dependence on `lint_may_fire` / `any_may_fire`
 
 The body passes now skip a pass when `Cx::any_may_fire(&LintSet)` is false for its lints. This
@@ -68,6 +82,8 @@ calls `Cx::lint_may_fire` for each of its two lints. This is correct only if `an
 true for every lint that is not allowed somewhere: an `#[expect]`, a `--force-warn`, a
 `#![warn]` in an inner module, or a lint group set to `warn`. `diagnostics-speed-lints` owns
 that set (`crate::lints::may_fire`); no change is asked of it, only that this stays true.
+
+> applied: nothing to apply (a note) (requests, pass 20).
 
 ## dedyn: `lints/bodies/calls/**`: the dead `Box<dyn LatePass>` lists; passes `pub(crate)` + `Default` for `late_passes!`
 

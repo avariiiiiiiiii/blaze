@@ -1056,6 +1056,11 @@ Lines as of 2026-10-29 20:50 (UTC-7); the file moves while others edit it, so ea
 its "before" code.
 
 > forwarded to db (db-ty-next2, owner of hir-ty's inference files) (requests, pass 18; told by tmux).
+> handed back by db-ty-next2 (21:20): not started by db-ty. db-mem-infer-a (lane db's applier)
+> applies A0 to A13, together with G6 item 1. db-ty-d-infer2 is still editing `infer.rs` and
+> has added `impl InferenceContext<'db>` headers in new files (`infer/ambiguity.rs`,
+> `infer/callee.rs`), so A0 ends with `rg -n "InferenceContext<'db>" crates/hir-ty/src`
+> finding nothing.
 
 ### A0. Every `InferenceContext<'db>` in the crate, for one mechanical edit
 
@@ -2071,6 +2076,8 @@ and its `diagnostics` and `defined_anon_consts` are frame lists (`Vec<_, &'a Fra
 entry for `TyLoweringContext`'s fields). The two structs here hold the inference's frame tables
 by `&mut`/`&RefCell`, both invariant, so they gain the `'f` of those tables.
 
+> forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
+
 ### B1. Imports (lines 17 to 31)
 
 Before:
@@ -2282,6 +2289,8 @@ The callers: `infer.rs` `with_ty_lowering` and `resolve_variant` (A9, whose
 Lines as of 2026-10-29 21:00 (UTC-7). `InferenceTable<'db>` keeps no frame lifetime (R2): it is a
 field of `InferenceContext` and is moved into `WriteBackCtxt`, and its only buffers of its own
 are an error-path list and the diverging set.
+
+> forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
 
 ### U1. Imports (lines 12 and 13)
 
@@ -2687,6 +2696,8 @@ list, empty for a body that compiles.
 Per body with unsolved variables (every body with an integer literal of no other type, a `!`
 coercion, or `Default::default()`-like calls resolved late).
 
+> forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
+
 ### E1. Imports (lines 3 to 13)
 
 Before:
@@ -2792,7 +2803,11 @@ Vec<Adjustment, &'f Frame>>`, one frame list of exactly the step count, `use bla
 the whole change to this file; taken as written there. `autoderef` and `autoderef_with_tracking`
 build the solver-side `Autoderef` (mem-db-infer-method's `autoderef.rs`) and allocate nothing here.
 
+> forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
+
 ## G. The small files: `ambiguity.rs`, `at_error.rs`, `mutability.rs`, `opaques.rs`, `path.rs`
+
+> forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
 
 ### G1. `infer/ambiguity.rs`
 
@@ -2871,6 +2886,8 @@ writes into the thread's `scratch` buffers (R7), warm across records, and copies
 its length. Decoding builds `Ty<'db>` lists and the closure decoder's frame lists (X4), so `decode`
 opens `blaze_mem::frame::task(crate::db::INFER_TAG, ..)`; a call inside a query's task is one level
 deeper, and resets only its own memory.
+
+> forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
 
 ### P1. Imports (lines 11 to 70)
 
@@ -3388,6 +3405,8 @@ refcount): unchanged.
 
 ## Entries in other parts' files
 
+> forwarded to db (db-ty-next2), M1 included: `method_resolution.rs` is items' (DONE) and requests gives db-ty-next2 M1's lines there so they land with A10 in `infer.rs` and compile together; M1's `crates/hir` lines are db's too. D1, S1, S2, N1 are notes (requests, pass 20; told by tmux).
+
 ### M1. `TraitsInScope<'a>` (mem-db-infer-method: `method_resolution.rs`; lane db: `crates/hir`)
 
 Per method call. A10 hands out the inference's `&FrameSet<'f, TraitId>`; the two callers in
@@ -3532,6 +3551,8 @@ diagnostic. `infer/path.rs:350, 368` `name.clone()`: a `Name` (an interned symbo
 once per path with an associated item (G4). `infer/autoderef.rs:35, 53`: mem-db-infer-expr's X2.
 `diagnostics.rs`, `ambiguity.rs`, `mutability.rs`, `opaques.rs`: none.
 
+> applied: nothing to apply (a list for db-ty-next2, told) (requests, pass 20).
+
 ## Tracked functions, tags and entry points (R1, R6)
 
 - `infer_body_query` and `infer_anon_const_body_query`: `#[salsa::tracked(.., mem_tag =
@@ -3543,6 +3564,8 @@ once per path with an associated item (G4). `infer/autoderef.rs:35, 53`: mem-db-
 - `InferenceResult::to_record`: no frame, scratch only (P3, P4). `InferenceRecordRef::to_result`
   and `decode`: `frame::task(crate::db::INFER_TAG, ..)` (P5).
 - Test-only `from_entries` builders: their own `frame::task` (C4 to C11).
+
+> forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
 
 ## Speed
 
@@ -3567,3 +3590,50 @@ Speed of light: a run must write its result once, which is ~25 owned columns, ea
 allocation (~0.5 µs) and its bytes written once (~40 KB, ~2 µs at memory bandwidth). Everything
 else here is a frame bump and one reset. Decoding is bounded the same way: ~25 exact allocations
 and one pass over the record's words.
+
+> applied: nothing to apply (notes) (requests, pass 20).
+
+## G6. `infer/prelude_lints.rs` (new since A0 was written; for db-ty-next2 with A0)
+
+Lines as of 2026-10-29 21:05 (UTC-7). `infer.rs` has moved by about 42 lines since A was written
+(`impl<'db> InferenceContext<'db> {` is now line 1980, the struct line 1882); the entries quote
+their "before" code, so they still apply.
+
+1. A0's list gains two headers, each `impl<'db> InferenceContext<'db> {` becoming
+   `impl<'db, 'f> InferenceContext<'db, 'f> {`: `infer/prelude_lints.rs:69` and
+   `infer/sized_bound.rs:31` (the latter is also A13 item 1). With them, `rg -n
+   "InferenceContext<'db>" crates/hir-ty/src` finds nothing after A0.
+2. The file makes no temporaries: both lints read the pick and push one diagnostic
+   (`push_diagnostic`, an error path into the result's `Diagnostics`). Nothing else changes for
+   memory.
+3. Speed, not memory (for whoever owns `crates/intern`): `lint_fully_qualified_call_from_2018`
+   compares `name.as_str() == "from_iter"` and calls `Symbol::intern("FromIterator")` (a lookup in
+   the global interner) on every type-relative path named `try_from`/`try_into`/`from_iter` in a
+   pre-2021 crate. Add `from_iter` and `FromIterator` to `crates/intern/src/symbol/symbols.rs`'
+   pre-interned list and write, before:
+
+```rust
+        let from_iter = name.as_str() == "from_iter";
+```
+
+```rust
+                diagnostic_items(self.db, self.krate()).get(&Symbol::intern("FromIterator"))
+```
+
+   after:
+
+```rust
+        let from_iter = *name.symbol() == sym::from_iter;
+```
+
+```rust
+                diagnostic_items(self.db, self.krate()).get(&sym::FromIterator)
+```
+
+   (`Symbol` is then unused in the import `use intern::{Symbol, sym};`, which becomes
+   `use intern::sym;`; `DiagnosticItems::get` takes `&Symbol`, so `&sym::FromIterator` fits.)
+   No test covers these two lints yet (`rg` finds none for `EditionDependentMethodCall` or
+   `FullyQualifiedCallFrom2018`); the swap compares the same interned symbols, so the truth of
+   each condition is unchanged.
+
+> forwarded to db (db-ty-next2) (requests, pass 21; told by tmux).

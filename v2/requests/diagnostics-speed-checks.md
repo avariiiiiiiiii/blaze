@@ -13,6 +13,8 @@ check, once by `checks::check` and once by the attribute lints. That is about 0.
 reference crate, paid twice (docs/v2/plan/lanes/diagnostics/speed-of-light.md, "The checks
 hir does not make").
 
+> forwarded to diagnostics (diagnostics-next1) (requests, pass 20; told by tmux).
+
 ## 2. A per-crate "nothing shadows a primitive type" fact (frontend: `hir` / `hir-def`)
 
 What: a query in `hir-def` (or a method on `hir::Crate`), computed once from the crate's def
@@ -26,6 +28,8 @@ It can't be ruled out from the syntax, because a `mod u8` or a `use core::*` cha
 resolves it to. With this bit, every such path in a crate that shadows nothing would be
 ruled out by one test, which takes the names check from about 14 ms to its 10 ms bound.
 
+> forwarded to db (db-next2, window 158: `crates/hir`, `crates/hir-def`) (requests, pass 20; told by tmux).
+
 ## 3. `#[rustc_deny_explicit_impl]` in `TraitFlags` (frontend: `crates/hir-def/src/signatures.rs`)
 
 What: a `TraitFlags::RUSTC_DENY_EXPLICIT_IMPL` set from the attribute when the trait's
@@ -34,6 +38,8 @@ signature is lowered, exposed on `hir::Trait` (for example `is_deny_explicit_imp
 Why: `checks/impls.rs`' `denies_explicit_impls` asks for each implemented trait's source
 (`trait_.source(db)`), which parses the file the trait is in (std's, for `Clone` or `Debug`),
 only to look for this one attribute. With the flag, the check is a bit test per trait.
+
+> forwarded to db (db-expand-next2, `hir-def/src/signatures.rs`) (requests, pass 20; told by tmux).
 
 ## 4. `Cx::modules()`, made once per check (parent: `crates/blaze-diagnostics/src/cx.rs`)
 
@@ -46,3 +52,18 @@ Why: each call walks the module tree again and allocates its result. Once per ch
 enough, because the module tree does not change during a check.
 
 > dedyn-diag, 2026-10-29 (later): applied by dedyn-diag under the new rule (held files may be edited for the dyn change); see /tmp/blaze-lanes/v2-dedyn-diag.md. The `// dyn:` keeps proposed for `cx.rs` were replaced by a concrete `Files`: no `dyn` remains.
+> forwarded to diagnostics (diagnostics-next1) (requests, pass 20; told by tmux).
+
+## Outcomes of requests forwarded to diagnostics-speed-checks (pass 19)
+
+- dedyn: `checks/ast_validation/fns.rs`: already applied by dedyn-diag (the `&mut dyn Iterator`
+  closure was replaced by collecting the spans inline). Kept as is.
+- diagnostics-speed-lower 4: applied. `checks/names/paths.rs` calls
+  `lower::unresolved_ident::{typo, imports, show_imports, def_descr}` with `Ns::Type`,
+  `PathSource::{Type, Trait}` and `Names::{Scope, Module}`, and its copies are deleted.
+  `variant_enums` reads `cx.paths().decls(cx).named(name)`. `privacy.rs` uses the shared
+  `def_descr` and `def_span`. `param_span` stays local because `lower`'s is private.
+- diagnostics-speed-lower 5: applied. `checks::modules` reads the crate def map, with no `Vec`
+  per module.
+
+> applied: nothing to apply (diagnostics-speed-checks' outcomes) (requests, pass 21).

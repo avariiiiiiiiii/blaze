@@ -8,6 +8,7 @@
 //! actually true.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(allocator_api)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_parse_format;
@@ -49,6 +50,7 @@ pub mod src;
 pub mod find_path;
 pub mod import_map;
 pub mod visibility;
+pub mod test_items;
 
 #[cfg(test)]
 mod macro_expansion_tests;
@@ -1964,3 +1966,7 @@ mod loc_hash_tests {
         check(&locs);
     }
 }
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

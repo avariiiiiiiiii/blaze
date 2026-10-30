@@ -76,7 +76,7 @@ Design: docs/v2/plan/lanes/lints.md, docs/v2/plan/lanes/lints/cx.md.
   - `blaze::hot_alloc`: "detects a call that reaches the global allocator in hot code";
   - `blaze::hot_dyn`: "detects a call through `dyn` in hot code";
   - `blaze::std_hashmap`: "detects std's `HashMap` and `HashSet` with their default hasher";
-  - group `blaze::hot` = `hot_clone`, `hot_alloc`, `hot_dyn`.
+  - group `blaze::hot` = all four (`hot_clone`, `hot_alloc`, `hot_dyn`, `std_hashmap`).
   The command line accepts `--warn=blaze::hot_alloc` and the rest (from `[lints.blaze]`).
 - Why: they run in blaze-lints (`blaze clippy`), but rustc's level machinery in
   blaze-diagnostics sees `#[deny(blaze::hot)]` and `--deny=blaze::hot_alloc`: without them
@@ -195,3 +195,16 @@ for `Db`.
 > forwarded to lints: an answer for its asker, nothing to apply.
 
 > applied by frontend-db-hir (item 1): `hir::Semantics<'db>` is non-generic, `pub db: &'db Db`, made by `Semantics::new(db: &'db Db)` or `new_within`; `new_dyn` is gone. `blaze-lints/src/check.rs`'s `Semantics<'db, RootDatabase>` became `Semantics<'db>`.
+
+## dedyn: crates/blaze-lints: `dyn Fn` sweep (second sweep item 5, 2026-10-29): none is per item; `// dyn:` lines
+
+Read for where each is called: once per diagnostic span or per file, never per node a lint
+walks. No code change; add the line above each:
+
+- `src/diag.rs:56`, `:106`, `:175`, `:326` (`name_of`): `// dyn: the driver's file names, asked once per span of a diagnostic, and only for one that leaves its file.`
+- `src/check.rs:62` (`NameOf`): `// dyn: as `diag.rs`'s `name_of`: once per diagnostic span.`
+- `src/emit.rs:32` (`read`): `// dyn: the source a diagnostic quotes, read once per file shown.`
+- `src/serve.rs:83` (`path_of`): `// dyn: one call per crate root and per file a finding names.`
+
+(`src/blaze/tests.rs:512` and `src/lints/more_types_tests.rs:258` are lint test fixtures: text
+about the Rust being checked, left alone.)

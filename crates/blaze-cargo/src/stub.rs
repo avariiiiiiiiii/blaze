@@ -119,23 +119,36 @@ mod __blaze_global_allocator_{n} {
     extern crate core;
     use core::alloc::{GlobalAlloc, Layout};
     struct Allocator;
+    // SAFETY: these are the functions blaze compiles from the crate's own `#[global_allocator]`,
+    // with these signatures: each passes its arguments to the crate's allocator's method of the
+    // same name. A signature that differed would pass them in the wrong registers.
     unsafe extern "C" {
         fn __blaze_global_alloc(size: usize, align: usize) -> *mut u8;
         fn __blaze_global_dealloc(ptr: *mut u8, size: usize, align: usize);
         fn __blaze_global_realloc(ptr: *mut u8, size: usize, align: usize, new_size: usize) -> *mut u8;
         fn __blaze_global_alloc_zeroed(size: usize, align: usize) -> *mut u8;
     }
+    // SAFETY: each method is the crate's own allocator's, so it keeps the `GlobalAlloc`
+    // contract exactly as far as the crate's allocator does.
     unsafe impl GlobalAlloc for Allocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller keeps `alloc`'s contract, which the crate's allocator is given
+            // unchanged.
             unsafe { __blaze_global_alloc(layout.size(), layout.align()) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` was allocated by this allocator with `layout`, by the caller's
+            // contract, and so by the crate's.
             unsafe { __blaze_global_dealloc(ptr, layout.size(), layout.align()) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // SAFETY: `ptr` was allocated by this allocator with `layout`, and `new_size` is
+            // valid for it, by the caller's contract, which the crate's allocator is given.
             unsafe { __blaze_global_realloc(ptr, layout.size(), layout.align(), new_size) }
         }
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller keeps `alloc_zeroed`'s contract, which the crate's allocator is
+            // given unchanged.
             unsafe { __blaze_global_alloc_zeroed(layout.size(), layout.align()) }
         }
     }

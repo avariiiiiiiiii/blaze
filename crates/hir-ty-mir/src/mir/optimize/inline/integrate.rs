@@ -56,7 +56,7 @@ impl Temps {
 
     /// rustc's `create_temp_if_necessary`: a temporary the argument is moved out of is the
     /// parameter itself.
-    fn argument<'db>(&mut self, ctx: &Ctx<'db>, body: &mut MirBody<'db>, arg: Operand) -> LocalId {
+    fn argument<'db>(&mut self, ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>, arg: Operand) -> LocalId {
         if let OperandKind::Move(place) = &arg.kind
             && place.projection.is_empty()
             && place.local != return_slot()
@@ -105,7 +105,7 @@ impl Spans<'_> {
 /// the call, whose parameters the caller checked the arguments against. Says which blocks
 /// are the callee's now.
 pub(super) fn inline_call<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     body: &mut MirBody<'db>,
     site: Site<'_>,
     mut callee: MirBody<'db>,

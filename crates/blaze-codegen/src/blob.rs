@@ -252,7 +252,7 @@ impl<'a> In<'a> {
         for _ in 0..count {
             wide.push(self.wide()?);
         }
-        RelocsView::from_parts_in(rows.leak(), targets.leak(), wide.leak(), frame)
+        RelocsView::from_parts(rows.leak(), targets.leak(), wide.leak(), frame)
             .map_err(|what| BlobError { at: self.0.at(), what })
     }
 

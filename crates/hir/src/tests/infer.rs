@@ -11,7 +11,9 @@ use hir_def::{
     signatures::{StructSignature, TraitSignature},
 };
 use hir_ide::{
-    CastError, InferBodyId, InferenceDiagnostic, InferenceResult, Unreachable, UnreachableAt,
+    CastError, EditionLint, InferBodyId, InferenceDiagnostic, InferenceResult, Unreachable,
+    UnreachableAt,
+    method_resolution::CandidateId,
     next_solver::{TyKind, default_types},
     solver_errors::{StoredGoal, TypeAnnotationNeeded},
 };
@@ -856,5 +858,134 @@ fn a_sized_bound_on_a_trait_object_carries_the_pick() {
         assert_eq!(bound, Some(method.into()), "the bound is in `wait`'s where clause");
         assert!(!needs_mut);
         assert_eq!(&candidates[..], [future], "a probe of every trait picks `Future`'s `wait` for `B`");
+    });
+}
+
+/// rustc's `unstable_name_collisions`: the probe passes over `S::gated`, whose feature `main`
+/// does not enable, and picks the trait's.
+const UNSTABLE: &str = r#"
+//- minicore: sized
+//- /main.rs crate:main deps:dep
+trait Ext {
+    fn gated(&self) -> u8;
+}
+impl Ext for dep::S {
+    fn gated(&self) -> u8 { 0 }
+}
+fn call(s: dep::S) {
+    s.gated();
+}
+fn path(s: dep::S) {
+    dep::S::gated(&s);
+}
+//- /lib.rs crate:dep
+pub struct S;
+impl S {
+    #[unstable(feature = "gated", issue = "none")]
+    pub fn gated(&self) -> u16 { 0 }
+}
+"#;
+
+#[test]
+fn a_probe_records_the_unstable_items_it_passed_over() {
+    let db = TestDB::with_files(UNSTABLE);
+    crate::attach_db(&db, || {
+        for name in ["call", "path"] {
+            let (body, result) = infer(&db, name);
+            let call = find_expr(&body, |it| matches!(it, Expr::MethodCall { .. } | Expr::Call { .. }));
+            let node = match body.expr(call) {
+                Expr::Call { callee, .. } => callee,
+                _ => call,
+            };
+            let candidates = result.unstable_candidates(node.into());
+            let [(CandidateId::FunctionId(passed), ref feature)] = *candidates else {
+                panic!("`{name}` passed over `S::gated`, not {candidates:?}");
+            };
+            assert_eq!(feature.as_str(), "gated");
+            let ItemContainerId::ImplId(_) = passed.lookup(&db).container else {
+                panic!("the passed-over `gated` is the inherent one");
+            };
+        }
+    });
+}
+
+/// rustc's `lint_edition_dependent_dot_call` and `lint_fully_qualified_call_from_2018`: the 2021
+/// prelude's `TryInto` and `TryFrom` would make a 2018 crate's own `try_into` and `try_from`
+/// ambiguous.
+const EDITIONS: &str = r#"
+//- minicore: sized
+//- /main.rs crate:main edition:2018 deps:new
+trait MyTryInto {
+    fn try_into(self) -> u8;
+}
+impl MyTryInto for u16 {
+    fn try_into(self) -> u8 { 0 }
+}
+trait MyTryFrom: Sized {
+    fn try_from(x: i32) -> Self;
+}
+impl MyTryFrom for u8 {
+    fn try_from(_: i32) -> Self { 0 }
+}
+fn old_call() {
+    let _ = 1u16.try_into();
+}
+fn old_path() {
+    let _ = u8::try_from(1);
+}
+//- /lib.rs crate:new edition:2021
+trait MyTryInto {
+    fn try_into(self) -> u8;
+}
+impl MyTryInto for u16 {
+    fn try_into(self) -> u8 { 0 }
+}
+fn new_call() {
+    let _ = 1u16.try_into();
+}
+"#;
+
+#[test]
+fn a_2018_crate_records_the_calls_the_2021_prelude_makes_ambiguous() {
+    let db = TestDB::with_files(EDITIONS);
+    crate::attach_db(&db, || {
+        let lints = |name: &str| -> Vec<InferenceDiagnostic> {
+            let (_, result) = infer(&db, name);
+            let lint = |it: &&InferenceDiagnostic| {
+                matches!(
+                    it,
+                    InferenceDiagnostic::EditionDependentMethodCall { .. }
+                        | InferenceDiagnostic::FullyQualifiedCallFrom2018 { .. }
+                )
+            };
+            result.diagnostics().iter().filter(lint).cloned().collect()
+        };
+
+        let call = lints("old_call");
+        let [
+            InferenceDiagnostic::EditionDependentMethodCall {
+                lint: EditionLint::Rust2021PreludeCollisions,
+                method,
+                inherent: false,
+                autoderefs: 0,
+                autoref: None,
+                ..
+            },
+        ] = call[..]
+        else {
+            panic!("`1u16.try_into()` is linted as a 2021 prelude collision, not {call:?}");
+        };
+        let ItemContainerId::TraitId(_) = method.lookup(&db).container else {
+            panic!("a trait pick is the trait's `try_into`");
+        };
+
+        let path = lints("old_path");
+        let [InferenceDiagnostic::FullyQualifiedCallFrom2018 { item: CandidateId::FunctionId(_), .. }] =
+            path[..]
+        else {
+            panic!("`u8::try_from` is linted as a 2021 prelude collision, not {path:?}");
+        };
+
+        assert!(lints("new_call").is_empty(), "a 2021 crate has the new prelude already");
     });
 }

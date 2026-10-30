@@ -10,6 +10,14 @@
 //!   blaze-inproc's code memory, whose publish does the cache maintenance).
 //! - [`Answers`] sends a frame to a run process and stops one; [`Runs`] is blaze-inproc's, and
 //!   [`Runner::serve`] reads one run process's asks.
+//! - With a [`TierUp`], a run whose functions start at tier 0 (blaze-stencil) is tiered up:
+//!   blaze-stencil's tier [`tier::Runner`] reads each function's counter cells through a
+//!   [`Cells`] view, and recompiles a hot one with [`Compiler::tier_up`], which
+//!   [`Placer::replace`] publishes in the function's slot, retiring the code it replaced
+//!   behind blaze-inproc's fence; the fetcher is retargeted, so a late ask gets the new code.
+//!   A function is bound to the tier runner once its first code is published, so a
+//!   promotion never races its first compile; [`Runner::close`] stops the tier runner before
+//!   the workers whose placer it uses.
 //!
 //! Workers take compiles from the fetcher, compile with no lock held, place one at a time,
 //! and send the answers after the fetcher's lock is let go. A compile that panics or fails
@@ -18,13 +26,15 @@
 //! take or record a compile, never across one; the placer's only across one placement.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::JoinHandle;
 
 use blaze_codegen::{CompiledFunction, InstanceKey};
+use blaze_inproc::CellView;
 use blaze_inproc::ask::{self, Reader, Sender};
 use blaze_inproc::frame::Kind;
 use blaze_items::{CodeHash, ItemKey};
+use blaze_stencil::tier::{self, Tier};
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -37,11 +47,21 @@ use crate::{
 /// Compiles one instance of the build.
 pub trait Compiler: Send + Sync + 'static {
     fn compile(&self, key: InstanceKey) -> Result<CompiledFunction, String>;
+    /// The instance whose first code `key` is, compiled again at `to` (its backend,
+    /// [`Tier::backend`], counting calls and back edges in cells when [`Tier::counts`]).
+    fn tier_up(&self, key: InstanceKey, to: Tier) -> Result<CompiledFunction, String>;
 }
 
 /// Places one function in the running image and publishes its slot; the address it runs at.
 pub trait Placer: Send + 'static {
     fn place(&mut self, function: &CompiledFunction) -> Result<u64, String>;
+    /// Where the placed `key`'s counter cells are, as an offset of the code memory's cells
+    /// part ([`CellView::load`]); none for a function that doesn't count.
+    fn cells(&self, key: &InstanceKey) -> Option<u64>;
+    /// Places `function`, a tier-up of the function whose first code is `slot`, and publishes
+    /// it in `slot`'s slot: the address it runs at. The code it replaces is retired behind
+    /// blaze-inproc's fence, freed only once every thread of the run was seen past it.
+    fn replace(&mut self, slot: InstanceKey, function: &CompiledFunction) -> Result<u64, String>;
 }
 
 /// The run processes' asks.
@@ -64,13 +84,54 @@ pub struct Config {
     pub idle: bool,
 }
 
+/// A tier-up of a run whose functions start at tier 0: the code memory's cells and how hot
+/// a function must be for each tier.
+pub struct TierUp {
+    pub cells: CellView,
+    pub policy: tier::Policy,
+    pub config: tier::Config,
+}
+
+/// The run's counter cells as the tier runner reads them.
+pub struct Cells(pub CellView);
+
+impl tier::Cells for Cells {
+    fn load(&self, offset: u64) -> Result<u64, String> {
+        self.0.load(offset).map_err(|it| it.to_string())
+    }
+}
+
+type TierRunner<C, P, A> = tier::Runner<Cells, Recompiler<C, P, A>>;
+
+/// What the tier runner recompiles through: the lazy runner's compiler, placer and fetcher,
+/// weakly, so the runner owning the tier runner is not kept by it.
+struct Recompiler<C: Compiler, P: Placer, A: Answers>(Weak<Shared<C, P, A>>);
+
+impl<C: Compiler, P: Placer, A: Answers> tier::Recompile for Recompiler<C, P, A> {
+    fn recompile(&self, function: u32, to: Tier) -> Result<Option<u64>, String> {
+        let shared = self
+            .0
+            .upgrade()
+            .ok_or_else(|| format!("tier-up of lazy function {function}: the lazy runner closed"))?;
+        shared.recompile(LazyId(function), to)
+    }
+}
+
+struct Tiered<C: Compiler, P: Placer, A: Answers> {
+    runner: TierRunner<C, P, A>,
+    /// Per function: bound to the runner, once its first code was published.
+    bound: Vec<bool>,
+    /// The tiers the daemon's history remembered for functions not bound yet.
+    remembered: FxHashMap<u32, Tier>,
+}
+
 struct State {
     fetcher: Fetcher,
     closing: bool,
     idle_queued: bool,
 }
 
-struct Shared<C, P, A> {
+struct Shared<C: Compiler, P: Placer, A: Answers> {
     session: Session,
     /// The fetcher's state: held only to take or record a compile, never across one.
     state: Mutex<State>,
@@ -80,10 +141,15 @@ struct Shared<C, P, A> {
     placer: Mutex<P>,
     answers: A,
     idle: bool,
+    /// The tier-up, taken out (and closed) before the workers stop. Held across a bind,
+    /// never with the fetcher's or the placer's lock.
+    tier: Mutex<Option<Tiered<C, P, A>>>,
+    /// The functions whose first code could not be bound to the tier runner, and why.
+    unbound: Mutex<Vec<(LazyId, String)>>,
 }
 
 /// One lazy run's daemon side.
-pub struct Runner<C, P, A> {
+pub struct Runner<C: Compiler, P: Placer, A: Answers> {
     shared: Arc<Shared<C, P, A>>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -93,6 +159,10 @@ pub struct Runner<C, P, A> {
 pub struct Closed {
     pub failures: Vec<(InstanceKey, ItemKey, String)>,
     pub compiles: u64,
+    /// What the tier runner did, for a run started with a [`TierUp`].
+    pub tier: Option<tier::Closed>,
+    /// The functions whose first code could not be bound to the tier runner, and why.
+    pub unbound: Vec<(LazyId, String)>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -100,7 +170,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
-    /// Starts `config.workers` threads fetching `session`'s functions, `first` queued.
+    /// Starts `config.workers` threads fetching `session`'s functions, `first` queued, and
+    /// with `tier`, the tier runner over its cells.
     pub fn start(
         session: Session,
         first: &[(LazyId, Priority)],
@@ -108,9 +179,11 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         placer: P,
         answers: A,
         config: Config,
+        tier: Option<TierUp>,
     ) -> Result<Runner<C, P, A>, String> {
         let workers = config.workers.max(1);
-        let mut fetcher = Fetcher::new(session.plan().len(), workers);
+        let functions = session.plan().len();
+        let mut fetcher = Fetcher::new(functions, workers);
         for &(id, priority) in first {
             fetcher.want(id, priority);
         }
@@ -122,7 +195,18 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
             placer: Mutex::new(placer),
             answers,
             idle: config.idle,
+            tier: Mutex::new(None),
+            unbound: Mutex::new(Vec::new()),
         });
+        if let Some(up) = tier {
+            let recompiler = Recompiler(Arc::downgrade(&shared));
+            let runner = tier::Runner::start(functions, up.policy, up.config, Cells(up.cells), recompiler)?;
+            *lock(&shared.tier) = Some(Tiered {
+                runner,
+                bound: vec![false; functions as usize],
+                remembered: FxHashMap::default(),
+            });
+        }
         let mut threads = Vec::with_capacity(workers as usize);
         for n in 0..workers {
             let worker = Arc::clone(&shared);
@@ -186,6 +270,33 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         lock(&self.shared.state).fetcher.target(id)
     }
 
+    /// The daemon's history says `id` reached `tier` in an earlier run: it is recompiled to
+    /// it at once, or once its first code is published.
+    pub fn remembered(&self, id: LazyId, tier: Tier) -> Result<(), String> {
+        let mut tiered = lock(&self.shared.tier);
+        let Some(tiered) = tiered.as_mut() else {
+            return Err(format!("remembering {tier:?} for lazy function {}: the run is not tiered", id.0));
+        };
+        match tiered.bound.get(id.index()) {
+            None => {
+                Err(format!("remembering {tier:?} for lazy function {}, of {}", id.0, tiered.bound.len()))
+            }
+            Some(true) => {
+                tiered.runner.remembered(id.0, tier);
+                Ok(())
+            }
+            Some(false) => {
+                tiered.remembered.insert(id.0, tier);
+                Ok(())
+            }
+        }
+    }
+
+    /// Why tiering stopped before a close, once it has: for the daemon to report at once.
+    pub fn tier_stopped(&self) -> Option<String> {
+        lock(&self.shared.tier).as_ref()?.runner.stopped()
+    }
+
     /// The ids of the lazy functions whose code is among `reached`.
     pub fn reached(&self, reached: &[CodeHash]) -> Vec<LazyId> {
         let mut out = Vec::new();
@@ -193,8 +304,11 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         out
     }
 
-    /// Stops the workers once the compiles running end, and says what failed.
+    /// Stops the tier runner, then the workers once the compiles running end, and says what
+    /// failed.
     pub fn close(mut self) -> Closed {
+        let tiered = lock(&self.shared.tier).take();
+        let tier = tiered.map(|it| it.runner.close());
         lock(&self.shared.state).closing = true;
         self.shared.wake.notify_all();
         for thread in self.threads.drain(..) {
@@ -209,12 +323,16 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
                 .map(|(id, why)| (plan.key(id), plan.item(id), why.to_owned()))
                 .collect(),
             compiles: state.fetcher.compiles(),
+            tier,
+            unbound: std::mem::take(&mut *lock(&self.shared.unbound)),
         }
     }
 }
 
-impl<C, P, A> Drop for Runner<C, P, A> {
+impl<C: Compiler, P: Placer, A: Answers> Drop for Runner<C, P, A> {
     fn drop(&mut self) {
+        let tiered = lock(&self.shared.tier).take();
+        drop(tiered);
         if self.threads.is_empty() {
             return;
         }
@@ -267,7 +385,7 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
             };
             let placed = self.compile_and_place(id);
             callees.clear();
-            if let Ok((_, function)) = &placed {
+            if let Ok((_, function, _)) = &placed {
                 self.session.plan().callees(function, &mut callees);
             }
             actions.clear();
@@ -279,13 +397,54 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
             }
             drop(state);
             self.wake.notify_all();
+            if let Ok((_, _, cells)) = placed {
+                self.bind(id, cells);
+            }
             self.act(&actions, &mut frame);
         }
     }
 
-    /// `id`'s code, compiled, placed and published: where it runs and the function, or why
-    /// not, naming it.
-    fn compile_and_place(&self, id: LazyId) -> Result<(u64, CompiledFunction), String> {
+    /// `id`'s first code was published (the fetcher has it ready), counting in `cells`.
+    fn bind(&self, id: LazyId, cells: Option<u64>) {
+        let mut tiered = lock(&self.tier);
+        let Some(tiered) = tiered.as_mut() else { return };
+        if let Err(why) = tiered.runner.bind(id.0, cells) {
+            lock(&self.unbound).push((id, why));
+            return;
+        }
+        tiered.bound[id.index()] = true;
+        if let Some(tier) = tiered.remembered.remove(&id.0) {
+            tiered.runner.remembered(id.0, tier);
+        }
+    }
+
+    /// `id` recompiled at `to` and published in its slot, the fetcher retargeted: where its
+    /// new code counts, for the tier runner.
+    fn recompile(&self, id: LazyId, to: Tier) -> Result<Option<u64>, String> {
+        let plan = self.session.plan();
+        if id.0 >= plan.len() {
+            return Err(format!("tier-up of lazy function {}, of {}", id.0, plan.len()));
+        }
+        let (key, item) = (plan.key(id), plan.item(id));
+        let named = |why: &str| format!("recompiling {key:?} (item {item:?}) at {to:?}: {why}");
+        let function = self.compiler.tier_up(key, to).map_err(|why| named(&why))?;
+        let (target, cells) = {
+            let mut placer = lock(&self.placer);
+            let target = placer.replace(key, &function).map_err(|why| named(&format!("placing it: {why}")))?;
+            (target, placer.cells(&function.key))
+        };
+        if target == 0 {
+            return Err(named("placed at address 0"));
+        }
+        if !lock(&self.state).fetcher.retarget(id, target) {
+            return Err(named("its first code was never published"));
+        }
+        Ok(cells)
+    }
+
+    /// `id`'s code, compiled, placed and published: where it runs, the function and where it
+    /// counts, or why not, naming it.
+    fn compile_and_place(&self, id: LazyId) -> Result<(u64, CompiledFunction, Option<u64>), String> {
         let plan = self.session.plan();
         let (key, item) = (plan.key(id), plan.item(id));
         let named = |why: &str| format!("compiling {key:?} (item {item:?}) on its first call: {why}");
@@ -295,10 +454,13 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
             Ok(Err(why)) => return Err(named(&why)),
             Err(payload) => return Err(named(&format!("the compiler panicked: {}", panic_text(&*payload)))),
         };
-        let placed = catch_unwind(AssertUnwindSafe(|| lock(&self.placer).place(&function)));
+        let placed = catch_unwind(AssertUnwindSafe(|| {
+            let mut placer = lock(&self.placer);
+            placer.place(&function).map(|target| (target, placer.cells(&function.key)))
+        }));
         match placed {
-            Ok(Ok(0)) => Err(named("placed at address 0")),
-            Ok(Ok(target)) => Ok((target, function)),
+            Ok(Ok((0, _))) => Err(named("placed at address 0")),
+            Ok(Ok((target, cells))) => Ok((target, function, cells)),
             Ok(Err(why)) => Err(named(&format!("placing it: {why}"))),
             Err(payload) => Err(named(&format!("placing it panicked: {}", panic_text(&*payload)))),
         }

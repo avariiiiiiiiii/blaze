@@ -4,6 +4,7 @@
 
 use std::{
     ffi::OsString,
+    fmt::Write as _,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -50,8 +51,27 @@ pub fn pick<'a>(artifacts: &'a [Artifact], flags: &Flags) -> Result<&'a Artifact
                 names.join(", ")
             ))
         }
-        _ => Err("`cargo run` can run at most one executable, but multiple were specified".to_owned()),
+        several => {
+            let mut said = "`cargo run` can run at most one executable, but multiple were specified\nhelp: available targets:".to_owned();
+            for it in several {
+                let kind = it.target.kind.first().map_or("bin", String::as_str);
+                let package = say::package_name(&it.package);
+                let _ = write!(said, "\n    {kind} `{}` in package `{package}`", it.target.name);
+            }
+            Err(said)
+        }
     }
+}
+
+/// What `run` refuses of its command line before anything is built: a glob pattern among the
+/// packages (`commands/run.rs`) or the targets (`ops::run`), as cargo's `is_glob_pattern` sees one.
+pub fn refused(flags: &Flags) -> Option<String> {
+    let glob = |it: &str| it.contains(['*', '?', '[', ']']);
+    if let Some(pattern) = flags.packages.iter().find(|it| glob(it)) {
+        return Some(format!("`cargo run` does not support glob pattern `{pattern}` on package selection"));
+    }
+    let mut targets = flags.bins.iter().chain(&flags.examples).flatten();
+    targets.any(|it| glob(it)).then(|| "`cargo run` does not support glob patterns on target selection".to_owned())
 }
 
 /// The executable as cargo runs it from `cwd`: below it, relative, and `./foo` for one in it.
@@ -89,13 +109,21 @@ impl Exec {
 
     /// As cargo-util's `ProcessBuilder` shows it, without the variables.
     pub fn shown(&self) -> String {
+        self.shown_at(0)
+    }
+
+    /// As cargo shows it under `verbose` `-v`s: with the variables it sets from `-vv`
+    /// (`display_env_vars`, which `run` and `test` turn on under `extra_verbose`).
+    pub fn shown_at(&self, verbose: u32) -> String {
         let args: Vec<String> = self.args.iter().map(|it| it.to_string_lossy().into_owned()).collect();
-        say::command_line(&self.program.to_string_lossy(), &args)
+        let env: &[(String, String)] = if verbose >= 2 { &self.env } else { &[] };
+        say::command_line_with(env, &self.program.to_string_lossy(), &args)
     }
 
     pub fn command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
-        command.args(&self.args).envs(self.env.iter().map(|(name, value)| (name, value))).current_dir(&self.cwd);        command
+        command.args(&self.args).envs(self.env.iter().map(|(name, value)| (name, value))).current_dir(&self.cwd);
+        command
     }
 }
 
@@ -108,24 +136,34 @@ pub fn planned(artifact: &Artifact, program_args: &[OsString], cwd: &Path) -> Re
     Ok(Exec::of(artifact, shown, program_args.iter().cloned(), cwd.to_owned()))
 }
 
+/// How `run` speaks of its program: colored, `-q`, how many `-v`s.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Told {
+    pub color: bool,
+    pub quiet: bool,
+    pub verbose: u32,
+}
+
 /// cargo's `exec_replace`: on Unix this process becomes the program, which ends the command as
-/// it ends (with its code, or by its signal); elsewhere it waits for it and exits with its code.
-pub fn exec(exec: &Exec, err: &mut dyn Write, color: bool) -> i32 {
+/// it ends (with its code, or by its signal); elsewhere it waits for it and exits with its code,
+/// saying nothing of it under `-q` (`to_run_error`).
+pub fn exec(exec: &Exec, err: &mut dyn Write, told: Told) -> i32 {
     let mut command = exec.command();
     #[cfg(unix)]
     {
         let error = std::os::unix::process::CommandExt::exec(&mut command);
-        never_executed(exec, &error, err, color)
+        never_executed(exec, &error, err, told)
     }
     #[cfg(not(unix))]
     {
         match command.status() {
-            Err(error) => never_executed(exec, &error, err, color),
+            Err(error) => never_executed(exec, &error, err, told),
             Ok(status) => match say::Ended::of(status) {
                 say::Ended::Code(0) => 0,
+                say::Ended::Code(code) if told.quiet => code,
                 ended => {
-                    let what = format!("process didn't exit successfully: {} ({})", exec.shown(), say::ended(ended));
-                    let _ = err.write_all(say::error(&what, color).as_bytes());
+                    let what = format!("process didn't exit successfully: {} ({})", exec.shown_at(told.verbose), say::ended(ended));
+                    let _ = err.write_all(say::error(&what, told.color).as_bytes());
                     match ended {
                         say::Ended::Code(code) => code,
                         say::Ended::Signal(_) => super::FAILED,
@@ -136,10 +174,11 @@ pub fn exec(exec: &Exec, err: &mut dyn Write, color: bool) -> i32 {
     }
 }
 
-/// cargo's `ProcessError` for a program that could not be started, with its cause.
-fn never_executed(exec: &Exec, error: &std::io::Error, err: &mut dyn Write, color: bool) -> i32 {
-    let what = format!("could not execute process {} (never executed)", exec.shown());
-    let _ = err.write_all(caused(&what, &[error.to_string()], color).as_bytes());
+/// cargo's `ProcessError` for a program that could not be started, with its cause; said under
+/// `-q` too.
+fn never_executed(exec: &Exec, error: &std::io::Error, err: &mut dyn Write, told: Told) -> i32 {
+    let what = format!("could not execute process {} (never executed)", exec.shown_at(told.verbose));
+    let _ = err.write_all(caused(&what, &[error.to_string()], told.color).as_bytes());
     super::FAILED
 }
 
@@ -148,8 +187,13 @@ pub fn caused(what: &str, causes: &[String], color: bool) -> String {
     let mut said = say::error(what, color);
     for cause in causes {
         said.push_str("\nCaused by:\n");
+        // cargo's `indented_lines`: an empty line stays empty, without the indent.
         for line in cause.lines() {
-            said.push_str(&format!("  {line}\n"));
+            if !line.is_empty() {
+                said.push_str("  ");
+                said.push_str(line);
+            }
+            said.push('\n');
         }
     }
     said

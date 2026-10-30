@@ -803,6 +803,11 @@ cargo-load-source's `tree.rs` (request 10); `#![forbid(unsafe_code)]` in
 
 > forwarded to coordinator: `blaze-resolve` and `blaze-manifest` are "every other path" in `crates.md`, the coordinator's, and go with request 1's grant to lane cargo; not among the paths `requests` applies.
 
+> answered by lane cargo (forwarded 2026-10-29): waits on request 1. `blaze-resolve` and
+> `blaze-manifest` are the coordinator's until request 1 grants them to lane cargo; cargo-units
+> writes all three changes (offline flag, `Config::cli_unstable`/`bindeps`, `Dependency::artifact`)
+> the moment `crates.md` lists them under lane cargo.
+
 ## From cargo-daemon-units (`crates/blaze-cargo/src/serve/unit.rs`, `serve/unit/`)
 
 `serve/unit*` calls each item below by this signature already; each waits on the lane named.
@@ -871,6 +876,16 @@ build script is given as `RUSTC`/`RUSTDOC`, `<state>/tools/`) must answer as bla
 
 > forwarded to cargo (its own children), codegen, link and usercode: every item names a lane that is still running (`ItemHashes::new` is now codegen-hashes', codegen.md 6). Nothing asked of the coordinator's paths.
 
+> answered by lane cargo (the items inside lane cargo, 2026-10-29): `Lowered::identity` is in
+> (`load-cargo/src/v2.rs:483`); `UnitPlan::{unsandboxed, runner, harness}`,
+> `PackagePlan::default_run` and `Units::link_dirs` are in `query.rs` and filled by cargo-units
+> (`load/plan.rs`, `load/units.rs`); `stdlib::library` was replaced by v1's finder,
+> `cargo::toolchain::library::fetch` (`serve/unit.rs` `Steps::library`); the five dependencies are
+> in `blaze-cargo/Cargo.toml`; the proc-macro loop hook is `Lowered::macros` (`v2.rs:608`), and
+> running proc macros at all is compile-time.md change 20 (fastcompile's, with cargo-inbox-user).
+> The `rustc`/`rustdoc` stand-ins answering as v2 are cargo-inbox's (`serve/unit/script.rs`).
+> The other lanes' items stay theirs.
+
 ## From speed-runtime-plane: `crates/blaze-cargo/src/serve/plane.rs`, one output buffer (2026-10-29)
 
 - What: `blaze_graph::Plane` gained `step_into(&mut self, PlaneInput, &mut Vec<PlaneOutput>) ->
@@ -916,6 +931,11 @@ build script is given as `RUSTC`/`RUSTDOC`, `<state>/tools/`) must answer as bla
 > answered by lane cargo (cargo-inbox-exec), item 2: not done, waits on link's sanitizer runtimes (link.md "From speed-backend-sanitize"). Codegen's side has landed (`Spec::sanitize`), and the flags are parsed (`crates/blaze-cargo/src/unstable.rs:470`), but they stay `Refused(INSTRUMENTS)` (`unstable.rs:242,252,253`) as this item says; CFI, KCFI, dataflow and the ignorelist stay refused for good. v2's daemon now asks the table too (`serve/unit/codegen.rs:188`), so no refused `-Z` flag is ignored there.
 
 > answered by lane cargo (cargo-inbox-tests): item 1 done at `crates/blaze-cargo/src/serve/unit/test.rs:217` (`evaluate`: `hir_ty_ub::run_test` with `ub_config`, outcomes judged as libtest judges them with `#[should_panic]`, and `Ub`/`Unsupported`/`Error` always fail), `:153` (`ub_tests`: the same selection as `blaze test`), and `serve/job.rs:1190`/`:1229` (one plane task per test, nothing compiled). Its result now carries `cached: None` (SCHEMA 8). Tests: `serve/unit/tests.rs:572` and `:586`. Item 2 (`-Zsanitizer`) is cargo-inbox-exec's (`unstable.rs`).
+
+> checked by lane cargo (forwarded again by lane safety, 2026-10-29): item 1 is in, as
+> cargo-inbox-tests' answer says. Item 2 still waits: link.md "From speed-backend-sanitize" (the
+> runtimes linked) has no answer from link yet; cargo-inbox-exec moves the flags from
+> `Refused(INSTRUMENTS)` to passed the moment it does.
 
 ## 15. From cargo-cli (to the coordinator and ci, `crates/blaze-api/src/lib.rs`; and to cargo-daemon): `blaze test --ub` (answers lane safety's item 1)
 
@@ -1208,6 +1228,13 @@ before any thread starts", so safe code could misuse them (`docs/v2/plan/design/
 project-model, blaze-units and blaze-tree: no unsafe, and each already has
 `#![forbid(unsafe_code)]` in its only target root. Nothing to do.
 
+> answered by lane cargo (2026-10-29): `crates/blaze-cargo/build.rs` has
+> `#![forbid(unsafe_code)]` after its doc (lane cargo). `serve/signals.rs`'s split and load-cargo's
+> three items (`v2.rs` `forbid`, the two `from_u32` comments) are in (cargo-inbox). The rest of
+> blaze-cargo's (`cargo/`, `socket/windows.rs`) is being applied by cargo-unsafe as proposed;
+> `keyed.rs:255`'s test moves to a child process rather than keeping `set_var`, and the
+> before-any-thread functions become `unsafe fn` where lane cargo has every caller.
+
 ## 17. From cargo-daemon (2026-10-29): safety-audit's items on `serve.rs` and `load-cargo`, done; one to format
 
 Done (answering the safety-audit entries above):
@@ -1287,6 +1314,13 @@ Asked (each call is written and waits on the lane named):
 > forwarded to cargo (cargo-daemon, cargo-daemon-lower), codegen (`Roots::tests` `function`, `Built::inputs`), safety (`hir-ty-ub` `check.rs`), link (`Image::tables`). Usercode's `index::find(&Reader, &Guard, ..)` is applied (section 16).
 
 > applied (cargo-daemon): `serve/plane.rs` adds every batch as one `PlaneInput::AddNodes`. `Plane::fresh(count, name_bytes, deps)` reserves the ids and sizes the columns; `Plane::push(&mut Fresh, NodeRef, Task)` raises a thread task's memory to its kind's estimate. `serve/job.rs` sizes each batch exactly (names and deps summed first) and builds names and deps in one scratch `String` and `Vec` a batch, so planning a build of n units makes O(1) allocations, not 2n. `Spec` and `plane::Node` are gone from `serve`.
+
+> answered by lane cargo (the asks of its children, forwarded again 2026-10-29): cargo-daemon's
+> two dependencies are in (`crates/blaze-cargo/Cargo.toml`: `hir-def.workspace = true`,
+> `hir-ty-ub.workspace = true`). cargo-daemon-lower's `Lowered::tables` is in
+> (`load-cargo/src/v2.rs:590`) with `&mut self`, not `&self`: salsa's `memory_usage` measures only
+> with the database exclusive, so it runs where writes run (the daemon's drain point, through
+> `serve/unit.rs`'s writer), never beside a reader.
 
 ## From cargo-load-plan (2026-10-29)
 
@@ -3851,3 +3885,235 @@ take `blaze_core::Native`; keeping `D` lets a test daemon run on `Sim`.
 > copies the bytes once, `CborBytes::encode` encodes. `StdUnits` (cargo-units, `stdlib.rs`)
 > moves to it: the checks still decode, the re-encode goes. Test
 > `passed_on_bytes_are_the_value_as_written`.
+
+> answered by lane cargo (requests' forward of 10 forbid, 12 data_layout, 7, 10 sha2, dedup
+> blaze-sha256): cargo-std's 10 is in (`crates/blaze-units/src/lib.rs` has
+> `#![forbid(unsafe_code)]`); 12 is in (`stdlib::target::data_layout`); 7 is in (`blaze-source`
+> in blaze-cargo's dependencies); cargo-load-source's 10 is in (`sha2` optional in blaze-units'
+> `query` feature). The blaze-sha256 dedup is applied: `crates/blaze-cargo/build.rs` uses
+> `blaze_sha256::Sha256` and its copy is deleted; `[build-dependencies] blaze-sha256` added.
+> "From safety-audit": given to cargo-unsafe (blaze-cargo outside `serve/`) and cargo-inbox
+> (`serve.rs`, `load-cargo`).
+> forwarded to cargo (requests, pass 21; told by tmux).
+
+> checked by lane cargo (speed-runtime-plane's `step_into`, forwarded again 2026-10-29): in
+> place at `serve/plane.rs` `step` (565-570) and `cancel` (485-490), one reused `said` buffer;
+> `outputs` drains it.
+
+## dedyn: `Files` is never `dyn` (blaze-manifest `files.rs`, blaze-units `load/`; user's call, 2026-10-29)
+
+Answers the coordinator's note on request 1 ("Use a closed set for `Files` ... (lane dedyn)").
+Each `Files` call reads, lists or stats one path of the workspace load, many per load (every
+manifest, config file, target candidate and glob directory). The set is closed: `Disk` (v1's
+callers) and blaze-units' `Snap` (every query). blaze-manifest can't name `Snap` (blaze-units
+depends on it), so: a generic with a default, and blaze-units concrete.
+
+> forwarded to cargo (blaze-units and, once crates.md grants it, blaze-manifest; the grant is on requests' coordinator list; told by tmux; requests, pass 22).
+
+### blaze-manifest (lane cargo writes `files.rs`, `Context::with_files`, `Config::load_with`)
+
+- `Context` and `Config` take the files by type, defaulting to `Disk` so v1's callers
+  (`blaze-cargo/src/cargo/compile_time.rs`, blaze-manifest's own) are unchanged:
+
+```rust
+pub struct Context<F: Files = Disk> {
+    pub config: Config<F>,
+    pub(crate) ws_roots: RefCell<FxHashMap<PathBuf, WorkspaceRootConfig>>,
+}
+impl<F: Files> Context<F> {
+    pub fn with_files(config: Config<F>, files: Rc<F>) -> Context<F>;
+}
+impl Context { pub fn new(config: Config) -> Context { .. } } // Disk, as today
+pub struct Config<F: Files = Disk> { .., files: Rc<F> }
+impl<F: Files> Config<F> {
+    pub fn load_with(cwd: &Path, env: BTreeMap<String, String>, files: Rc<F>) -> anyhow::Result<Config<F>>;
+}
+```
+
+- Code size: each function that holds `F` is compiled twice (Disk, Snap), once after v1 goes.
+  Keep that part thin: read the bytes or names in the generic function and hand them to a
+  non-generic one that parses (TOML, targets, globs), so the parsers are compiled once.
+- No `Rc<dyn Files>` or `&dyn Files` anywhere.
+
+> forwarded to cargo (waits on the coordinator's blaze-manifest grant; requests, pass 22).
+
+### blaze-units (`crates/blaze-units/src/load/`, today's text)
+
+- `files.rs:893`: `struct Snap(..)` → `pub(crate) struct Snap(..)`.
+- `files.rs:1058`: `mut step: impl FnMut(&mut Cx<'db>, Rc<dyn Files>, &Reads<'_>) -> ..` →
+  `mut step: impl FnMut(&mut Cx<'db>, Rc<Snap>, &Reads<'_>) -> ..`; doc line "its `Files` is a
+  fresh handle" stays.
+- `files.rs:1063`: `let files: Rc<dyn Files> = Rc::new(Snap(state.clone()));` →
+  `let files = Rc::new(Snap(state.clone()));`
+- `manifest.rs:79`, `manifest.rs:173`: `files: Rc<dyn Files>,` → `files: Rc<Snap>,`
+- `manifest.rs:206`: `files: &dyn Files` → `files: &Snap`
+- `manifest.rs:254`: `Rc<dyn Files>` → `Rc<Snap>`
+- `config.rs:136`: `files: Rc<dyn Files>` → `files: Rc<Snap>`, returning `Config<Snap>`
+- `resolve.rs:74`: `files: &Rc<dyn Files>,` → `files: &Rc<Snap>,`
+- Each of `manifest.rs`, `config.rs`, `resolve.rs` adds `Snap` to its `use super::files::{..}`
+  (resolve.rs: `use super::files::{Reads, Snap};`), and keeps `use blaze_manifest::files::Files;`
+  for the trait's methods.
+
+Nothing in blaze-units stays generic: it has one implementation.
+
+> forwarded to cargo (requests, pass 22).
+
+## From cargo-units (2026-10-29): interface, db and doc follow-ups of the units/plan fields
+
+1. To lane cargo, `crates/blaze-units/src/query.rs` (not mine):
+   - `key_input(domain: &str, ..)` passes a non-`'static` `&str` to `ContentId::of(&'static str, ..)`
+     and allocates a `Vec` per call. Every caller in blaze-units and blaze-tree now uses
+     `blaze_units::load::key_id(domain: &'static str, key)`, which gives the same IDs from a
+     per-thread buffer. Remove `key_input`, or make it `domain: &'static str` and forward to
+     `key_id`. `StdKey::id` should forward to `key_id` too, so a std key's ID allocates nothing
+     wherever it's made (`StdUnits::input` already does, under a zero budget in
+     `a_kept_standard_library_is_read_without_allocating`).
+   - The module doc should say `StdUnits`' value is `CborBytes<StdPlanned>` (the bytes of
+     `Foreign`'s value passed on, never decoded and encoded again).
+   - speed-of-light's "plan decoded whole by each reader": `Plan`'s value stays `Cbor<Planned>`.
+     A reader that changed nothing should read the `Ref` in place, without the whole decode. That is
+     an interface change, so it's yours to make.
+2. To lane db (blaze-query):
+   - Request 2 is still open: `Cx::file_at(root, path)` and `Cx::dir_at(root, path)` don't exist,
+     and `load/files.rs:478,527,546` calls them, so blaze-units doesn't build until they land.
+   - A plan verified in a new view must allocate nothing. The test
+     `load::tests::a_warm_load_allocates_nothing` holds it to zero. Today `read_input` allocates
+     an `Arc` per directory listing and a `Vec` from `tree.list`, and a new `ViewState`'s results
+     table grows as it fills. Read the listing borrowed, and size the table from the previous
+     view's count.
+3. To cargo-sol, `docs/v2/plan/lanes/cargo/speed-of-light.md` (not mine):
+   - In "The standard library's graph", the extra decode and encode of `StdUnits` is closed:
+     its value is `Foreign`'s bytes passed on.
+   - In "The workspace load", a memo hit no longer allocates: every load query's
+     `input` hashes its key through `key_id`'s per-thread buffer, with zero-budget tests for a
+     file query hit, a `Plan` hit and a `StdUnits` hit.
+4. Request 1 is not granted: `docs/v2/plan/reference/crates.md`'s cargo row has no blaze-manifest,
+   so I made no `Files` change and the "`Files` is never `dyn`" request's blaze-units part waits
+   on it. The manifest's three parses and the resolve reruns in speed-of-light wait on it too.
+
+## dedyn: crates/blaze-cargo: `dyn Fn` sweep (second sweep item 5, 2026-10-29): none is per item; `// dyn:` lines
+
+Each was read for where it is called. None is called per item of a hot loop: each runs once per
+run, request, package, path or job, next to a process spawn, a file read, a hash of a file or a
+download. No code change; add the line above each (today's numbers):
+
+- `src/serve/plane.rs:47` `Work<T>`: `// dyn: a batch's task, one call per plane task (a whole node's work); batches of different closures share the pool's queue.`
+- `src/serve/image.rs:176` `on_pool`: `// dyn: one call per image job, each a whole object's work, on the worker pool.`
+- `src/cargo/keyed.rs:138`, `:164`, `:182` (`now`): `// dyn: one call per path a run read, each a stat or hash of the file.`
+- `src/cargo/hermetic/mod.rs:413` (`unplace`): `// dyn: one call per dependency directory of a key, once per run.`
+- `src/cargo/fetches.rs:153` (`dependency`) and `:1072` (`fetch`): `// dyn: one call per package, each a download or a lookup of one.`
+- `src/cargo/own_script.rs:266`, `:303` (`rustc_had`): `// dyn: one call per build script's dep-info line, once per script run.`
+- `src/cargo/run.rs:545`, `:611` (`bare`): `// dyn: makes one command per run.`
+- `src/answers.rs:157`, `src/answers/own.rs:495`, `:505` (`var`): `// dyn: the environment, read a few times per rustc question answered.`
+- `src/answers/cargo.rs:149` (`rustc`): `// dyn: asks rustc's host once per answer.`
+- `src/cargo/daemon.rs:2427` (`ask`): `// dyn: one boxed answer per daemon request.`
+- `src/deps.rs:514` (`archives`): `// dyn: three archive writers, each run once.`
+
+## frontend-deps: the dependency image adapter, amended: in place, reads, read-through (frontend.md item 5; 2026-10-29)
+
+Amends `## frontend-deps: serve dependency images from the store` above (open). Three changes
+to `hir_def::deps::ImageStore`:
+- `get` returns `hir_def::deps::ImageBuf` (`Arc<dyn Held>`, where `Held` is
+  `fn bytes(&self) -> &[u8]`), not `Arc<Aligned>`;
+- `reads_now` is new;
+- the global cache goes in front through `ReadThrough`.
+
+1. In place: read with `blaze_cas::Reader::pinned`, which verifies the value and maps it at a
+   16-byte boundary (a copy only for a value that had to be made whole). Nothing is copied
+   into an `Aligned`:
+   ```rust
+   /// A store value held for `hir_def::deps`: the image's parts are read where it lies.
+   struct HeldImage(blaze_cas::Pinned);
+
+   impl hir_def::deps::Held for HeldImage {
+       fn bytes(&self) -> &[u8] {
+           &self.0
+       }
+   }
+
+   // in `impl hir_def::deps::ImageStore for DepImages<'_>`:
+   fn get(&self, key: &ContentId) -> Result<Option<hir_def::deps::ImageBuf>, String> {
+       let guard = blaze_cas::enter();
+       match self.reader.pinned(&guard, &blaze_cas::Key(*key)) {
+           // alloc: one count per crate image per session
+           Ok(Some(pinned)) => Ok(Some(std::sync::Arc::new(HeldImage(pinned)))),
+           Ok(None) => Ok(None),
+           Err(corrupt) => Err(format!("{corrupt:?}")), // alloc: error path
+       }
+   }
+   ```
+2. `reads_now`: the expansion server's own rehash (asked of usercode in
+   `v2/requests/usercode.md`, `## frontend-deps: report what each kept expansion read`):
+   ```rust
+   fn reads_now(&self, env: &base_db::Env, shape: &[u8]) -> Result<ContentId, String> {
+       blaze_expand::reads_now(env, shape)
+   }
+   ```
+3. Global cache: once fastcompile gives its adapter (asked in `v2/requests/fastcompile.md`,
+   `## frontend-deps: dependency images through the global cache`), pass
+   `&hir_def::deps::ReadThrough { local: &adapter, global: &global }` to `serve`, and the
+   same to `store`, whose puts go to the local store.
+4. `Stored::refused` now has `Refused::ProcMacro { call, why }` (an expansion whose reads are
+   unknown), `Refused::MachinePath { part, path }` (a part holds a path of this checkout) and
+   `Refused::Reads { why }`. Show them under `-v` as before.
+
+Status: open
+
+## frontend-tree: `without_tests` reads the tree through views (2026-10-29)
+
+frontend.md item 16 (notes `docs/v2/plan/lanes/frontend/tree.md`): the `SyntaxNode`/`ast`
+handles are being deleted; this is blaze-cargo's only caller. Same items, same ranges, same
+tokens, so the same hash; no handle made, no refcount per node, and the attribute's text is a
+borrowed slice instead of a `String` per attribute.
+
+File `crates/blaze-cargo/src/cargo/state.rs`, `fn without_tests`.
+
+Old:
+```rust
+    use syntax::{AstNode as _, ast};
+```
+New:
+```rust
+    use syntax::view::{self as ast, AstNode as _, HasAttrs as _};
+```
+
+Old:
+```rust
+    let only_tests = |item: &ast::Item| {
+        ast::HasAttrs::attrs(item).any(|attr| {
+            let attr: String =
+                attr.syntax().text().to_string().chars().filter(|it| !it.is_whitespace()).collect();
+            attr == "#[test]" || attr == "#[cfg(test)]"
+        })
+    };
+    for item in parse.tree().syntax().descendants().filter_map(ast::Item::cast) {
+        if only_tests(&item) {
+```
+New:
+```rust
+    let only_tests = |item: ast::Item<'_>| {
+        item.attrs().any(|attr| {
+            let attr = attr.syntax().text().chars().filter(|it| !it.is_whitespace());
+            let is = |want: &str| attr.clone().eq(want.chars());
+            is("#[test]") || is("#[cfg(test)]")
+        })
+    };
+    let root = parse.root();
+    for item in root.descendants().filter_map(ast::Item::cast) {
+        if only_tests(item) {
+```
+
+Old:
+```rust
+    let last = parse.tree().syntax().last_token();
+```
+New:
+```rust
+    let last = root.last_token();
+```
+
+The rest of the function is unchanged: `item.syntax().text_range()`, `token.prev_token()`,
+`token.text_range()` and `token.kind()` are the views' methods of the same names and types.
+`attr` is a `Filter<Chars, _>` whose closure captures nothing, so it is `Clone`.
+
+Status: open

@@ -32,7 +32,7 @@ use hir_ty::{
 use rustc_type_ir::{TypeFoldable, TypeVisitableExt};
 
 use super::{
-    DataPlace, Hashes, HirInstance, HirStatic, Kind, Places,
+    DataPlace, HashSource, Hashes, HirInstance, HirStatic, Kind, Places,
     convert::{DataTarget, Resolver},
 };
 use crate::{
@@ -270,7 +270,7 @@ impl<'a, A: Allocator> Placer<'a, A> {
 pub(crate) fn place_requests<A: Allocator>(
     db: &Db,
     homes: &mut Homes,
-    hashes: &dyn Hashes,
+    hashes: &HashSource,
     krate: Option<Crate>,
     placer: &mut Placer<'_, A>,
     requests: &mut Requests,
@@ -351,7 +351,7 @@ where
 /// is the crate whose code holds the constant.
 pub(crate) fn fill_type_ids(
     db: &Db,
-    hashes: &dyn Hashes,
+    hashes: &HashSource,
     krate: Option<Crate>,
     blob: &mut ConstBlob,
 ) -> Result<(), String> {

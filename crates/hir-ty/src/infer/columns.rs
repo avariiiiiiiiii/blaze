@@ -14,7 +14,10 @@ use std::{
     ops::Index,
 };
 
-use blaze_ids::radix;
+use blaze_ids::{
+    bits::{BitSet, Ranked},
+    radix,
+};
 use hir_def::{
     FieldId, TupleFieldId,
     hir::{ExprId, ExprOrPatIdPacked, PatId},
@@ -55,67 +58,42 @@ fn place(index: usize) -> u32 {
     place
 }
 
-/// Which keys of a sparse column have a row, and where it is: a bit per key, and per word of
-/// bits how many keys before it have one, so a row's place is one popcount (rank as in
-/// Vigna's rank9). That is 1.5 bits a key where a `u32` place per key is 32, and the ranks are
-/// made again from the bits, never stored.
+/// Which keys of a sparse column have a row, and where it is: a bit per key, ranked, so a
+/// row's place is one popcount. Not a bare [`Ranked`]: its last word is never zero, so a column
+/// has one form and two that hold the same keys are equal. The ranks are made again from the
+/// bits, never stored.
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
-struct Presence {
-    /// Its last word is never zero.
-    words: Box<[u64]>,
-    ranks: Box<[u32]>,
-}
+struct Presence(Ranked);
 
 impl Presence {
     fn new(words: Vec<u64>) -> Result<Presence, &'static str> {
         if words.last() == Some(&0) {
             return Err("a sparse column whose last word of keys has none");
         }
-        let mut ranks = Vec::with_capacity(words.len());
-        let mut before = 0u32;
-        for &word in &words {
-            ranks.push(before);
-            before = before.checked_add(word.count_ones()).ok_or("a column of 2^32 rows")?;
-        }
-        Ok(Presence { words: words.into_boxed_slice(), ranks: ranks.into_boxed_slice() })
+        let len = words.len() * 64;
+        Ranked::from_words(words, len).map(Presence).ok_or("a column of 2^32 rows")
+    }
+
+    /// Which keys have a row: bit `key % 64` of word `key / 64`.
+    fn words(&self) -> &[u64] {
+        self.0.words()
     }
 
     /// How many keys have a row.
     fn count(&self) -> usize {
-        match (self.ranks.last(), self.words.last()) {
-            (Some(&rank), Some(word)) => rank as usize + word.count_ones() as usize,
-            _ => 0,
-        }
+        self.0.count()
     }
 
     /// The place of `index`'s row among the rows, if it has one.
     #[inline]
     fn place(&self, index: usize) -> Option<usize> {
-        let (at, bit) = (index / 64, index % 64);
-        let word = *self.words.get(at)?;
-        if word & (1 << bit) == 0 {
-            return None;
-        }
-        Some(self.ranks[at] as usize + (word & ((1u64 << bit) - 1)).count_ones() as usize)
+        self.0.place(index)
     }
 
     /// Each key with a row and the row's place, in key order.
     fn keys(&self) -> impl DoubleEndedIterator<Item = (usize, usize)> + '_ {
-        self.words.iter().zip(&self.ranks).enumerate().flat_map(|(at, (&word, &rank))| {
-            (0..64usize).filter(move |&bit| word & (1 << bit) != 0).map(move |bit| {
-                (at * 64 + bit, rank as usize + (word & ((1u64 << bit) - 1)).count_ones() as usize)
-            })
-        })
+        self.0.iter_ranked()
     }
-}
-
-/// Sets `index`'s bit in `words`, growing them.
-fn set_bit(words: &mut Vec<u64>, index: usize) {
-    let at = index / 64;
-    if at >= words.len() {
-        words.resize(at + 1, 0);
-    }
-    words[at] |= 1 << (index % 64);
 }
 
 /// The values of `entries` by key, in key order.
@@ -256,14 +234,14 @@ impl<K, V> Default for IndexColumn<K, V> {
 
 impl<K: DenseKey, V> IndexColumn<K, V> {
     pub(crate) fn from_entries(entries: impl IntoIterator<Item = (K, V)>) -> Self {
-        let (mut words, mut rows) = (Vec::new(), Vec::new());
+        let (mut words, mut rows) = (BitSet::<usize>::default(), Vec::new());
         for (index, row) in dense(entries).into_iter().enumerate() {
             if let Some(row) = row {
-                set_bit(&mut words, index);
+                words.insert_growing(index);
                 rows.push(row);
             }
         }
-        let present = Presence::new(words).expect("a bit is set in every word that is made");
+        let present = Presence::new(words.into_words()).expect("a bit is set in every word that is made");
         IndexColumn { present, rows: rows.into_boxed_slice(), key: PhantomData }
     }
 
@@ -279,7 +257,7 @@ impl<K: DenseKey, V> IndexColumn<K, V> {
 
     /// Which keys have a row: bit `key % 64` of word `key / 64`, the last word never zero.
     pub fn present(&self) -> &[u64] {
-        &self.present.words
+        self.present.words()
     }
 
     /// The rows, in key order.
@@ -608,7 +586,7 @@ impl<K: DenseKey, T> Csr<K, T> {
 
     /// Which keys have a list: bit `key % 64` of word `key / 64`, the last word never zero.
     pub fn present(&self) -> &[u64] {
-        &self.present.words
+        self.present.words()
     }
 
     /// Where each list ends in [`Self::items`], in key order.
@@ -752,7 +730,7 @@ impl<K: DenseKey, T> CsrBuilder<K, T> {
     /// array is kept as it is), else one move of every live item.
     pub(crate) fn freeze(self) -> Csr<K, T> {
         let CsrBuilder { ranges, items, .. } = self;
-        let mut words = Vec::new();
+        let mut words = BitSet::<usize>::default();
         let mut ends = Vec::new();
         let mut next = 0usize;
         let mut in_order = true;
@@ -760,12 +738,12 @@ impl<K: DenseKey, T> CsrBuilder<K, T> {
             if range.is_absent() {
                 continue;
             }
-            set_bit(&mut words, index);
+            words.insert_growing(index);
             in_order &= range.start as usize == next;
             next += range.len as usize;
             ends.push(place(next));
         }
-        let present = Presence::new(words).expect("a bit is set in every word that is made");
+        let present = Presence::new(words.into_words()).expect("a bit is set in every word that is made");
         let ends = ends.into_boxed_slice();
         if in_order && next == items.len() {
             return Csr { present, ends, items: items.into_boxed_slice(), key: PhantomData };
@@ -779,61 +757,51 @@ impl<K: DenseKey, T> CsrBuilder<K, T> {
     }
 }
 
-/// A set of keys as a bitset, its last word never zero.
+/// A set of keys as a bitset, its last word never zero, so two that hold the same keys are
+/// equal.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct IdxSet<K> {
-    words: Vec<u64>,
+    words: BitSet,
     key: PhantomData<fn() -> K>,
 }
 
 impl<K> Default for IdxSet<K> {
     fn default() -> Self {
-        IdxSet { words: Vec::new(), key: PhantomData }
+        IdxSet { words: BitSet::default(), key: PhantomData }
     }
 }
 
 impl<K: DenseKey> IdxSet<K> {
     /// Adds `key`, returning whether it was not in the set.
     pub(crate) fn insert(&mut self, key: K) -> bool {
-        let index = key.to_index();
-        let word = index / 64;
-        if word >= self.words.len() {
-            self.words.resize(word + 1, 0);
-        }
-        let bit = 1u64 << (index % 64);
-        let new = self.words[word] & bit == 0;
-        self.words[word] |= bit;
-        new
+        self.words.insert_growing(key.to_index())
     }
 
     #[inline]
     pub fn contains(&self, key: &K) -> bool {
-        let index = key.to_index();
-        self.words.get(index / 64).is_some_and(|word| word & (1 << (index % 64)) != 0)
+        self.words.contains(key.to_index())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = K> + '_ {
-        self.words.iter().enumerate().flat_map(|(at, &word)| {
-            (0..64).filter(move |bit| word & (1 << bit) != 0).map(move |bit| K::from_index(at * 64 + bit))
-        })
+        self.words.iter().map(K::from_index)
     }
 
     pub fn len(&self) -> usize {
-        self.words.iter().map(|word| word.count_ones() as usize).sum()
+        self.words.count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.words.is_empty()
+        self.words.words().is_empty()
     }
 
     pub fn words(&self) -> &[u64] {
-        &self.words
+        self.words.words()
     }
 
     pub(crate) fn from_words(words: Vec<u64>) -> Result<Self, &'static str> {
         match words.last() {
             Some(0) => Err("a set whose last word is zero"),
-            _ => Ok(IdxSet { words, key: PhantomData }),
+            _ => Ok(IdxSet { words: BitSet::from_words(words), key: PhantomData }),
         }
     }
 
@@ -1088,34 +1056,6 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for SortedMap<K, V> {
     }
 }
 
-/// The type variables a coercion of `!` reached, by their index: rustc's
-/// `diverging_type_vars`, which only ever holds type variables.
-#[derive(Clone, Default, Debug)]
-pub(crate) struct VarSet {
-    words: Vec<u64>,
-}
-
-impl VarSet {
-    pub(crate) fn insert(&mut self, var: u32) {
-        let (word, bit) = (var as usize / 64, var % 64);
-        if word >= self.words.len() {
-            self.words.resize(word + 1, 0);
-        }
-        self.words[word] |= 1 << bit;
-    }
-
-    #[inline]
-    pub(crate) fn contains(&self, var: u32) -> bool {
-        self.words.get(var as usize / 64).is_some_and(|word| word & (1 << (var % 64)) != 0)
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.words.iter().enumerate().flat_map(|(at, &word)| {
-            (0..64u32).filter(move |bit| word & (1 << bit) != 0).map(move |bit| at as u32 * 64 + bit)
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1259,9 +1199,8 @@ mod tests {
         for seed in 0..32 {
             let keys: std::collections::BTreeSet<u32> =
                 writes(seed, 120, 700, 1).into_iter().map(|(k, _)| k).collect();
-            let mut words = Vec::new();
-            keys.iter().for_each(|&k| set_bit(&mut words, k as usize));
-            let present = Presence::new(words).unwrap();
+            let words: BitSet = keys.iter().map(|&k| k as usize).collect();
+            let present = Presence::new(words.into_words()).unwrap();
             assert_eq!(present.count(), keys.len());
             for k in 0..800u32 {
                 let naive = keys.contains(&k).then(|| keys.range(..k).count());
@@ -1431,9 +1370,9 @@ mod tests {
 
     #[test]
     fn var_set_lists_what_it_holds() {
-        let mut set = VarSet::default();
+        let mut set = BitSet::<u32>::default();
         for var in [0, 63, 64, 200, 3, 63] {
-            set.insert(var);
+            set.insert_growing(var);
         }
         assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 3, 63, 64, 200]);
         for var in 0..300 {

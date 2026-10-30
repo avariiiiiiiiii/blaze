@@ -31,18 +31,19 @@
 
 use std::{
     any::type_name,
+    cell::RefCell,
     fmt,
     hash::{BuildHasher, Hash, Hasher},
     marker::PhantomData,
     sync::{Arc, OnceLock},
 };
 
-use blaze_ids::radix;
+use blaze_ids::{bits::BitArray, radix};
+use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use syntax::{
-    AstNode, AstPtr, FlatTree, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
-    ast::{self, HasName},
-    match_ast,
+    AstNode, AstPtr, FlatTree, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize, ast,
+    view::NodeId,
 };
 
 // The first index is always the root node's AstId
@@ -279,7 +280,7 @@ impl ErasedFileAstId {
     }
 
     fn ast_id_for(
-        node: &SyntaxNode,
+        node: syntax::view::Node<'_>,
         index_map: &mut ErasedAstIdNextIndexMap,
         parent: Option<&ErasedFileAstId>,
     ) -> Option<ErasedFileAstId> {
@@ -417,9 +418,10 @@ struct BlockExprFileAstId {
 impl AstIdNode for ast::ExternBlock {}
 
 fn extern_block_ast_id(
-    node: &SyntaxNode,
+    node: syntax::view::Node<'_>,
     index_map: &mut ErasedAstIdNextIndexMap,
 ) -> Option<ErasedFileAstId> {
+    use syntax::view::{self as ast, AstNode};
     if ast::ExternBlock::can_cast(node.kind()) {
         Some(index_map.new_id(ErasedFileAstIdKind::ExternBlock, ()))
     } else {
@@ -430,9 +432,10 @@ fn extern_block_ast_id(
 impl AstIdNode for ast::Use {}
 
 fn use_ast_id(
-    node: &SyntaxNode,
+    node: syntax::view::Node<'_>,
     index_map: &mut ErasedAstIdNextIndexMap,
 ) -> Option<ErasedFileAstId> {
+    use syntax::view::{self as ast, AstNode};
     if ast::Use::can_cast(node.kind()) {
         Some(index_map.new_id(ErasedFileAstIdKind::Use, ()))
     } else {
@@ -443,9 +446,10 @@ fn use_ast_id(
 impl AstIdNode for ast::AsmExpr {}
 
 fn asm_expr_ast_id(
-    node: &SyntaxNode,
+    node: syntax::view::Node<'_>,
     index_map: &mut ErasedAstIdNextIndexMap,
 ) -> Option<ErasedFileAstId> {
+    use syntax::view::{self as ast, AstNode};
     if ast::AsmExpr::can_cast(node.kind()) {
         Some(index_map.new_id(ErasedFileAstIdKind::AsmExpr, ()))
     } else {
@@ -455,29 +459,21 @@ fn asm_expr_ast_id(
 
 impl AstIdNode for ast::Impl {}
 
-fn impl_ast_id(
-    node: &SyntaxNode,
+fn impl_ast_id<'t>(
+    node: syntax::view::Node<'t>,
     index_map: &mut ErasedAstIdNextIndexMap,
 ) -> Option<ErasedFileAstId> {
-    if !ast::Impl::can_cast(node.kind()) {
-        return None;
-    }
-    // clone: a node handle's count, once per impl when the map is built
-    if let Some(node) = ast::Impl::cast(node.clone()) {
-        let type_as_name = |ty: Option<ast::Type>| match ty? {
-            ast::Type::PathType(it) => Some(it.path()?.segment()?.name_ref()?),
-            _ => None,
-        };
-        let self_ty_name = type_as_name(node.self_ty());
-        let trait_name = type_as_name(node.trait_());
-        let data = ImplFileAstId {
-            self_ty_name: self_ty_name.as_ref().map(|it| it.text()),
-            trait_name: trait_name.as_ref().map(|it| it.text()),
-        };
-        Some(index_map.new_id(ErasedFileAstIdKind::Impl, data))
-    } else {
-        None
-    }
+    use syntax::view::{self as ast, AstNode};
+    let node = ast::Impl::cast(node)?;
+    let type_as_name = |ty: Option<ast::Type<'t>>| match ty? {
+        ast::Type::PathType(it) => Some(it.path()?.segment()?.name_ref()?),
+        _ => None,
+    };
+    let data = ImplFileAstId {
+        self_ty_name: type_as_name(node.self_ty()).map(|it| it.text()),
+        trait_name: type_as_name(node.trait_()).map(|it| it.text()),
+    };
+    Some(index_map.new_id(ErasedFileAstIdKind::Impl, data))
 }
 
 // Blocks aren't `AstIdNode`s deliberately, because unlike other nodes, not all blocks get their own
@@ -559,22 +555,19 @@ macro_rules! register_has_name_ast_id {
             impl $AstIdNode for ast::$ident {}
         )+
 
-        fn has_name_ast_id(node: &SyntaxNode, index_map: &mut ErasedAstIdNextIndexMap) -> Option<ErasedFileAstId> {
-            match_ast! {
-                match node {
-                    $(
-                        ast::$ident(node) => {
-                            let name = node.$name_method();
-                            let name = name.as_ref().map_or("", |it| it.text());
-                            let result = ErasedHasNameFileAstId {
-                                name,
-                            };
-                            Some(index_map.new_id(ErasedFileAstIdKind::$ident, result))
-                        },
-                    )*
-                    _ => None,
+        fn has_name_ast_id(
+            node: syntax::view::Node<'_>,
+            index_map: &mut ErasedAstIdNextIndexMap,
+        ) -> Option<ErasedFileAstId> {
+            use syntax::view::{self as ast, AstNode, HasName};
+            $(
+                if let Some(node) = ast::$ident::cast(node) {
+                    let name = node.$name_method().map_or("", |it| it.text());
+                    let result = ErasedHasNameFileAstId { name };
+                    return Some(index_map.new_id(ErasedFileAstIdKind::$ident, result));
                 }
-            }
+            )*
+            None
         }
 
         fn should_alloc_has_name(kind: SyntaxKind) -> Option<ErasedFileAstIdKind> {
@@ -596,35 +589,26 @@ register_has_name_ast_id! {
 }
 
 macro_rules! register_assoc_item_ast_id {
-    (impl $AstIdNode:ident for $($ident:ident = $name_callback:expr),+ ) => {
+    (impl $AstIdNode:ident for $($ident:ident = |$it:ident| $name:expr),+ ) => {
         $(
             impl $AstIdNode for ast::$ident {}
         )+
 
         fn assoc_item_ast_id(
-            node: &SyntaxNode,
+            node: syntax::view::Node<'_>,
             index_map: &mut ErasedAstIdNextIndexMap,
             parent: Option<&ErasedFileAstId>,
         ) -> Option<ErasedFileAstId> {
-            match_ast! {
-                match node {
-                    $(
-                        ast::$ident(node) => {
-                            let name = $name_callback(node);
-                            let name = name.as_ref().map_or("", |it| it.text());
-                            let properties = ErasedHasNameFileAstId {
-                                name,
-                            };
-                            let result = ErasedAssocItemFileAstId {
-                                parent: parent.copied(),
-                                properties,
-                            };
-                            Some(index_map.new_id(ErasedFileAstIdKind::$ident, result))
-                        },
-                    )*
-                    _ => None,
+            use syntax::view::{self as ast, AstNode, HasName};
+            $(
+                if let Some($it) = ast::$ident::cast(node) {
+                    let name = $name.map_or("", |it| it.text());
+                    let properties = ErasedHasNameFileAstId { name };
+                    let result = ErasedAssocItemFileAstId { parent: parent.copied(), properties };
+                    return Some(index_map.new_id(ErasedFileAstIdKind::$ident, result));
                 }
-            }
+            )*
+            None
         }
 
         fn should_alloc_assoc_item(kind: SyntaxKind) -> Option<ErasedFileAstIdKind> {
@@ -634,11 +618,11 @@ macro_rules! register_assoc_item_ast_id {
 }
 register_assoc_item_ast_id! {
     impl AstIdNode for
-    Variant = |it: ast::Variant| it.name(),
-    Const = |it: ast::Const| it.name(),
-    Fn = |it: ast::Fn| it.name(),
-    MacroCall = |it: ast::MacroCall| it.path().and_then(|path| path.segment()?.name_ref()),
-    TypeAlias = |it: ast::TypeAlias| it.name()
+    Variant = |it| it.name(),
+    Const = |it| it.name(),
+    Fn = |it| it.name(),
+    MacroCall = |it| it.path().and_then(|path| path.segment()?.name_ref()),
+    TypeAlias = |it| it.name()
 }
 
 /// Maps items' `SyntaxNode`s to `ErasedFileAstId`s and back.
@@ -773,6 +757,35 @@ fn home(word: u32, bits: u32) -> usize {
     (u64::from(word).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
 }
 
+thread_local! {
+    /// The sorts' scratch of the maps built on this thread, kept at the largest they grew to.
+    static ENTRY_SCRATCH: RefCell<Scratch<Entry>> = const { RefCell::new(Scratch::new()) };
+    static PAIR_SCRATCH: RefCell<Scratch<[u32; 2]>> = const { RefCell::new(Scratch::new()) };
+    static PLACED_SCRATCH: RefCell<Scratch<Placed>> = const { RefCell::new(Scratch::new()) };
+    /// The next index of each kind and hash, cleared and reused by each map built here.
+    static NEXT_INDEX: RefCell<ErasedAstIdNextIndexMap> = RefCell::default();
+}
+
+/// Sorts entries by all four words, in this thread's scratch.
+fn sort_entries(entries: &mut [Entry]) {
+    ENTRY_SCRATCH.with_borrow_mut(|scratch| {
+        radix::sort_copy_by_key_in(
+            entries,
+            |&[a, b, c, d]| {
+                (u128::from(a) << 96) | (u128::from(b) << 64) | (u128::from(c) << 32) | u128::from(d)
+            },
+            scratch.take(),
+        );
+    });
+}
+
+/// Sorts pairs by both words, in this thread's scratch.
+fn sort_pairs(pairs: &mut [[u32; 2]]) {
+    PAIR_SCRATCH.with_borrow_mut(|scratch| {
+        radix::sort_copy_by_key_in(pairs, |&[a, b]| radix::pack_32(a, b), scratch.take());
+    });
+}
+
 /// A map's fn bodies, as columns in the order of their text. A body's ids are made by a walk of
 /// it alone, when something in it is first asked about. 60 bytes per body until then.
 struct Bodies {
@@ -806,6 +819,7 @@ fn column<T>(rows: impl Iterator<Item = T>) -> Box<[T]> {
 }
 
 /// A fn body and where it is: what [`Bodies::new`] is made of.
+#[derive(Clone, Copy)]
 struct Placed {
     range: TextRange,
     first_slot: u32,
@@ -816,11 +830,13 @@ struct Placed {
 
 impl Bodies {
     /// The bodies `placed`, elements of `tree`.
-    fn new(tree: &Arc<FlatTree>, mut placed: Vec<Placed>) -> Bodies {
+    fn new(tree: &Arc<FlatTree>, placed: &mut [Placed]) -> Bodies {
         // Bodies don't overlap, so no two begin at one place.
-        radix::sort_by_key(&mut placed, |it| u32::from(it.range.start()));
+        PLACED_SCRATCH.with_borrow_mut(|scratch| {
+            radix::sort_copy_by_key_in(placed, |it| u32::from(it.range.start()), scratch.take());
+        });
         let mut by_slot = column(placed.iter().zip(0u32..).map(|(it, body)| [it.first_slot, body]));
-        radix::sort_copy_by_key(&mut by_slot, |&[slot, body]| radix::pack_32(slot, body));
+        sort_pairs(&mut by_slot);
         let row = |it: &Placed| -> Row {
             [
                 u32::from(it.range.end()),
@@ -1033,16 +1049,16 @@ enum Step<P> {
 /// a block is left once the walk is past its end. A lazy node has no children in the arrays,
 /// so the walk never parses one.
 fn walk<P: Copy>(
+    frame: &Frame,
     tree: &FlatTree,
     root: u32,
     bodies_apart: bool,
     mut visit: impl FnMut(Step<P>) -> Option<P>,
 ) {
-    // alloc: once per walk (a map or a body's ids built), and only for a block holding items
-    let mut blocks: Vec<(u32, ContainsItems)> = Vec::new();
-    let mut curr_layer: Vec<(u32, Option<P>)> = Vec::with_capacity(32);
+    let mut blocks: Vec<(u32, ContainsItems), &Frame> = Vec::new_in(frame);
+    let mut curr_layer: Vec<(u32, Option<P>), &Frame> = Vec::with_capacity_in(32, frame);
     curr_layer.push((root, None));
-    let mut next_layer = Vec::with_capacity(32);
+    let mut next_layer = Vec::with_capacity_in(32, frame);
     while !curr_layer.is_empty() {
         for (layer, parent) in curr_layer.drain(..) {
             let end = tree.end(layer);
@@ -1122,54 +1138,55 @@ fn walk<P: Copy>(
 /// on, as [`BodyIds`] words: each node's is its number among the body's nodes of its kind, in
 /// the walk's order.
 fn body_ids(tree: &FlatTree, root: u32, first_slot: u32, slots: u32) -> Box<[u32]> {
-    let mut next = [0u32; ErasedFileAstIdKind::Root as usize + 1];
-    // alloc: the body's ids, the result, made once per body the first time it is asked about
-    let mut words: Vec<u32> = Vec::new();
-    walk::<()>(tree, root, false, |step| {
-        let (at, kind) = match step {
-            Step::Block { at, .. } => (at, ErasedFileAstIdKind::BlockExpr),
-            Step::Item { at, kind, .. } => (at, kind),
-            Step::Body { .. } => unreachable!("a body's own walk leaves no body apart"),
-        };
-        let n = next[kind as usize];
-        next[kind as usize] += 1;
-        let slot = n >> INDEX_BITS;
-        // Each node of a kind has a token of its own, so there are fewer than the body has
-        // bytes, which its slots were counted from.
-        assert!(slot < slots, "more {kind:?} nodes in a fn body than it has bytes");
-        let id = pack((first_slot + slot) as u16, n & INDEX_MASK, true, kind as u32);
-        words.extend_from_slice(&entry(kind_of(tree, at), tree.range(at), ErasedFileAstId(id)));
-        Some(())
-    });
-    let n = words.len() / 4;
-    radix::sort_copy_by_key(words.as_chunks_mut::<4>().0, |&[a, b, c, d]| {
-        (u128::from(a) << 96) | (u128::from(b) << 64) | (u128::from(c) << 32) | u128::from(d)
-    });
-    words.reserve_exact(2 * n);
-    for number in 0..n {
-        let id = words[4 * number + ID];
-        words.extend_from_slice(&[id, number as u32]);
-    }
-    radix::sort_copy_by_key(words[4 * n..].as_chunks_mut::<2>().0, |&[a, b]| radix::pack_32(a, b));
-    words.into_boxed_slice()
+    frame::task(Tag::Parse, |frame| {
+        let mut next = [0u32; ErasedFileAstIdKind::Root as usize + 1];
+        let mut words: Vec<u32, &Frame> = Vec::new_in(frame);
+        walk::<()>(frame, tree, root, false, |step| {
+            let (at, kind) = match step {
+                Step::Block { at, .. } => (at, ErasedFileAstIdKind::BlockExpr),
+                Step::Item { at, kind, .. } => (at, kind),
+                Step::Body { .. } => unreachable!("a body's own walk leaves no body apart"),
+            };
+            let n = next[kind as usize];
+            next[kind as usize] += 1;
+            let slot = n >> INDEX_BITS;
+            // Each node of a kind has a token of its own, so there are fewer than the body has
+            // bytes, which its slots were counted from.
+            assert!(slot < slots, "more {kind:?} nodes in a fn body than it has bytes");
+            let id = pack((first_slot + slot) as u16, n & INDEX_MASK, true, kind as u32);
+            words.extend_from_slice(&entry(kind_of(tree, at), tree.range(at), ErasedFileAstId(id)));
+            Some(())
+        });
+        let n = words.len() / 4;
+        sort_entries(words.as_chunks_mut::<4>().0);
+        words.reserve_exact(2 * n);
+        for number in 0..n {
+            let id = words[4 * number + ID];
+            words.extend_from_slice(&[id, number as u32]);
+        }
+        sort_pairs(words[4 * n..].as_chunks_mut::<2>().0);
+        // alloc: the body's ids, the result, once per body the first time it is asked about, at
+        // its exact length
+        Box::from(&words[..])
+    })
 }
+
+/// A bit per hash value a body may be named by: taken or not.
+type Slots = BitArray<{ (SLOTS / 64) as usize }, u32>;
 
 /// The first of `slots` hash values in a row none of which is in `used`, looked for from
 /// `start` on, marked used.
-fn take_slots(used: &mut [u64], start: u16, slots: u32) -> u32 {
+fn take_slots(used: &mut Slots, start: u16, slots: u32) -> u32 {
     assert!(slots <= SLOTS, "a fn body too long to number its nodes ({slots} slots)");
-    let taken = |used: &[u64], it: u32| used[(it / 64) as usize] & (1 << (it % 64)) != 0;
     let mut first = u32::from(start);
     for _ in 0..2 * SLOTS {
         if first + slots > SLOTS {
             first = 0;
         }
-        match (first..first + slots).rfind(|&it| taken(used, it)) {
+        match (first..first + slots).rfind(|&it| used.contains(it)) {
             Some(it) => first = it + 1,
             None => {
-                for it in first..first + slots {
-                    used[(it / 64) as usize] |= 1 << (it % 64);
-                }
+                used.insert_range(first..first + slots);
                 return first;
             }
         }
@@ -1179,87 +1196,134 @@ fn take_slots(used: &mut [u64], start: u16, slots: u32) -> u32 {
 
 /// `found`'s bodies of `tree`, each with the owner it was found in, given their slots in the
 /// order they were found.
-fn place_bodies(tree: &Arc<FlatTree>, found: Vec<(u32, ErasedFileAstId)>) -> Bodies {
-    let mut used = [0u64; (SLOTS / 64) as usize];
+fn place_bodies(frame: &Frame, tree: &Arc<FlatTree>, found: &[(u32, ErasedFileAstId)]) -> Bodies {
+    let mut used = Slots::EMPTY;
     let source = tree.source();
-    let placed = found
-        .into_iter()
-        .map(|(at, owner)| {
-            let range = tree.range(at);
-            let slots = u32::from(range.len()) / (INDEX_MASK + 1) + 1;
-            let first_slot = take_slots(&mut used, u16_hash(FxBuildHasher.hash_one(owner)), slots);
-            Placed { range, first_slot, slots, text_hash: FxBuildHasher.hash_one(&source[range]), at }
-        })
-        // alloc: once per map built, at its exact length
-        .collect();
-    Bodies::new(tree, placed)
+    let mut placed: Vec<Placed, &Frame> = Vec::with_capacity_in(found.len(), frame);
+    placed.extend(found.iter().map(|&(at, owner)| {
+        let range = tree.range(at);
+        let slots = u32::from(range.len()) / (INDEX_MASK + 1) + 1;
+        let first_slot = take_slots(&mut used, u16_hash(FxBuildHasher.hash_one(owner)), slots);
+        Placed { range, first_slot, slots, text_hash: FxBuildHasher.hash_one(&source[range]), at }
+    }));
+    Bodies::new(tree, &mut placed)
+}
+
+/// What an item's id is made in: the parent it is told of, but none under an extern block.
+fn parent_of(parent: Option<u32>, entries: &[Entry]) -> Option<ErasedFileAstId> {
+    let parent = entry_id(&entries[parent? as usize]);
+    // See the comment on `ErasedAssocItemFileAstId` for why is this.
+    // FIXME: Technically there could be an extern block inside another item, e.g.:
+    // ```
+    // fn foo() {
+    //     extern "C" {
+    //         fn bar();
+    //     }
+    // }
+    // ```
+    // Here we want to make `foo()` the parent of `bar()`, but we make it `None`.
+    // Shouldn't be a big deal though.
+    (parent.kind() != ErasedFileAstIdKind::ExternBlock as u32).then_some(parent)
+}
+
+/// The tree `node` is in, shared, and its number there: [`syntax::view::Node::flat`], with the
+/// count a map keeps of the tree to walk its bodies when asked. The same `(tree, at)` a
+/// cursor's `flat` gives. A node in a part is in a parsed part, so nothing is parsed.
+#[inline]
+fn shared(node: syntax::view::Node<'_>) -> (&Arc<FlatTree>, u32) {
+    let file = node.shared_file();
+    let NodeId { part, at } = node.id();
+    match part {
+        NodeId::FILE => (file, at),
+        part => (file.part(part), at),
+    }
+}
+
+/// A cursor's tree and its number there, as [`shared`] gives a view's.
+#[inline]
+fn flat_of(node: &SyntaxNode) -> (&Arc<FlatTree>, u32) {
+    node.flat().expect("a flat tree")
 }
 
 impl AstIdMap {
+    /// [`AstIdMap::from_view`] of a cursor of the file's root.
     pub fn from_source(node: &SyntaxNode) -> AstIdMap {
         assert!(node.parent().is_none());
-        let mut index_map = ErasedAstIdNextIndexMap::default();
+        let (tree, at) = flat_of(node);
+        debug_assert_eq!(at, 0, "a root is its tree's first element");
+        AstIdMap::from_view(syntax::view::Node::root(tree))
+    }
 
-        // Ensure we allocate the root.
-        // alloc: the map's entries, the result, once per parse
-        let mut entries = vec![entry(node.kind(), node.text_range(), ROOT_ERASED_FILE_AST_ID)];
+    /// The map of the file whose root is `root`. A view is made only of an item, to name it,
+    /// and a fn's body is not walked into, but kept to be walked when asked about.
+    pub fn from_view(root: syntax::view::Node<'_>) -> AstIdMap {
+        assert!(root.parent().is_none(), "a map is of a file's root");
+        let (tree, at) = shared(root);
+        frame::task(Tag::Parse, |frame| {
+            // Taken, so a map built inside a build (none is today) starts from an empty one.
+            let mut index_map = NEXT_INDEX.take();
+            index_map.0.clear();
 
-        // A cursor is made only of an item, to name it; a fn's body is not walked into, but
-        // kept to be walked when asked about.
-        let root = node.to_flat();
-        let (tree, at) = root.flat().expect("a flat tree");
-        // alloc: the bodies found, once per parse, made into the map's body columns
-        let mut found = Vec::new();
-        walk::<u32>(tree, at, true, |step| match step {
-            Step::Block { at, parent } => {
-                let parent = parent_of(parent, &entries);
-                let kind = kind_of(tree, at);
-                let id = block_expr_ast_id(kind, &mut index_map, parent.as_ref())
-                    .expect("not a BlockExpr");
-                entries.push(entry(kind, tree.range(at), id));
-                None
-            }
-            Step::Item { at, kind: _, parent } => {
-                let parent = parent_of(parent, &entries);
-                let item = root.flat_element(at).into_node().expect("a node");
-                let id = ErasedFileAstId::ast_id_for(&item, &mut index_map, parent.as_ref())
-                    .expect("this node should have an ast id");
-                entries.push(entry(kind_of(tree, at), tree.range(at), id));
-                Some(entries.len() as u32 - 1)
-            }
-            Step::Body { at, parent } => {
-                let owner =
-                    parent.map_or(ROOT_ERASED_FILE_AST_ID, |it| entry_id(&entries[it as usize]));
-                found.push((at, owner));
-                None
-            }
-        });
-        let bodies = place_bodies(tree, found);
-        return AstIdMap::new(entries, bodies);
+            // Ensure we allocate the root.
+            let mut entries: Vec<Entry, &Frame> = Vec::new_in(frame);
+            entries.push(entry(kind_of(tree, at), tree.range(at), ROOT_ERASED_FILE_AST_ID));
 
-        fn parent_of(parent: Option<u32>, entries: &[Entry]) -> Option<ErasedFileAstId> {
-            let parent = entry_id(&entries[parent? as usize]);
-            // See the comment on `ErasedAssocItemFileAstId` for why is this.
-            // FIXME: Technically there could be an extern block inside another item, e.g.:
-            // ```
-            // fn foo() {
-            //     extern "C" {
-            //         fn bar();
-            //     }
-            // }
-            // ```
-            // Here we want to make `foo()` the parent of `bar()`, but we make it `None`.
-            // Shouldn't be a big deal though.
-            (parent.kind() != ErasedFileAstIdKind::ExternBlock as u32).then_some(parent)
-        }
+            let mut found: Vec<(u32, ErasedFileAstId), &Frame> = Vec::new_in(frame);
+            walk::<u32>(frame, tree, at, true, |step| match step {
+                Step::Block { at, parent } => {
+                    let parent = parent_of(parent, &entries);
+                    let kind = kind_of(tree, at);
+                    let id = block_expr_ast_id(kind, &mut index_map, parent.as_ref())
+                        .expect("not a BlockExpr");
+                    entries.push(entry(kind, tree.range(at), id));
+                    None
+                }
+                Step::Item { at, kind: _, parent } => {
+                    let parent = parent_of(parent, &entries);
+                    // Outside bodies, so in the file's tree, not a part.
+                    let item = syntax::view::Node::at(tree, NodeId { part: NodeId::FILE, at })
+                        .into_node()
+                        .expect("a node");
+                    let id = ErasedFileAstId::ast_id_for(item, &mut index_map, parent.as_ref())
+                        .expect("this node should have an ast id");
+                    entries.push(entry(kind_of(tree, at), tree.range(at), id));
+                    Some(entries.len() as u32 - 1)
+                }
+                Step::Body { at, parent } => {
+                    let owner =
+                        parent.map_or(ROOT_ERASED_FILE_AST_ID, |it| entry_id(&entries[it as usize]));
+                    found.push((at, owner));
+                    None
+                }
+            });
+            NEXT_INDEX.set(index_map);
+            let bodies = place_bodies(frame, tree, &found);
+            AstIdMap::new(&entries, bodies)
+        })
     }
 
     /// The map of `entries`, the root's first, and `bodies`.
-    fn new(entries: Vec<Entry>, bodies: Bodies) -> AstIdMap {
-        let entries = entries.into_boxed_slice();
+    fn new(entries: &[Entry], bodies: Bodies) -> AstIdMap {
+        // alloc: the map's entries, its result, once per map built, at their exact length
+        let entries: Box<[Entry]> = Box::from(entries);
         let by_start = Index::new(entries.len(), |it| entries[it][START]);
         let by_id = Index::new(entries.len(), |it| entries[it][ID]);
         AstIdMap { entries, by_start, by_id, bodies }
+    }
+
+    /// [`AstIdMap::relative_to_view`] of cursors.
+    pub fn relative_to(&self, node: &SyntaxNode, relative: &SyntaxNode) -> AstIdMap {
+        self.relative(flat_of(node), flat_of(relative), &[])
+    }
+
+    /// [`AstIdMap::relative_without_view`] of cursors.
+    pub fn relative_without(
+        &self,
+        node: &SyntaxNode,
+        relative: &SyntaxNode,
+        elided: &[SyntaxNodePtr],
+    ) -> AstIdMap {
+        self.relative(flat_of(node), flat_of(relative), elided)
     }
 
     /// The ids of the nodes of `node`, a node of the tree this map is of, as nodes of
@@ -1270,107 +1334,111 @@ impl AstIdMap {
     /// Either tree may be an outline or a full parse. A fn body in `node` is not walked: the
     /// map made keeps it, with its slots, to be walked in `relative` when asked about, so
     /// lowering one body of an item parses no other.
-    pub fn relative_to(&self, node: &SyntaxNode, relative: &SyntaxNode) -> AstIdMap {
-        self.relative(node, relative, &[])
+    pub fn relative_to_view(
+        &self,
+        node: syntax::view::Node<'_>,
+        relative: syntax::view::Node<'_>,
+    ) -> AstIdMap {
+        self.relative(shared(node), shared(relative), &[])
     }
 
-    /// [`AstIdMap::relative_to`] for a `relative` that is `node` with each node of `elided`
+    /// [`AstIdMap::relative_to_view`] for a `relative` that is `node` with each node of `elided`
     /// (nodes under `node`, in this map's tree, sorted by where they begin and disjoint)
     /// replaced by an empty node of its kind: nothing in them has an id or a body in the map
     /// made, and what follows each is moved back by the lengths elided before it. What an
     /// item's signature or a file's outline is lowered from, bodies left out, so that the map
     /// stays the same while the bodies change.
-    pub fn relative_without(
+    pub fn relative_without_view(
         &self,
-        node: &SyntaxNode,
-        relative: &SyntaxNode,
+        node: syntax::view::Node<'_>,
+        relative: syntax::view::Node<'_>,
         elided: &[SyntaxNodePtr],
     ) -> AstIdMap {
-        self.relative(node, relative, elided)
+        self.relative(shared(node), shared(relative), elided)
     }
 
+    /// What [`AstIdMap::relative_without_view`] is, of the trees `node` and `relative` are in
+    /// and their numbers there.
     fn relative(
         &self,
-        node: &SyntaxNode,
-        relative: &SyntaxNode,
+        (tree, at): (&Arc<FlatTree>, u32),
+        (relative_tree, relative_at): (&Arc<FlatTree>, u32),
         elided: &[SyntaxNodePtr],
     ) -> AstIdMap {
-        let (node, relative) = (node.to_flat(), relative.to_flat());
-        let (tree, at) = node.flat().expect("a flat tree");
         let (tree, at) = expanded(tree, at);
-        let (relative_tree, relative_at) = relative.flat().expect("a flat tree");
         let (start, relative_range) = (tree.range(at).start(), relative_tree.range(relative_at));
         debug_assert!(
             elided.windows(2).all(|it| it[0].text_range().end() <= it[1].text_range().start()),
             "elided nodes are sorted and disjoint"
         );
-        // Where each elided node ends, and the lengths elided up to and with it: an offset
-        // moves back by the lengths of every elided node ending at or before it.
-        // alloc: one entry per elided node, once per map made
-        let mut cut = Vec::with_capacity(elided.len());
-        let mut removed = TextSize::new(0);
-        for ptr in elided {
-            removed += ptr.text_range().len();
-            cut.push((ptr.text_range().end(), removed));
-        }
-        debug_assert!(
-            tree.kind(at) == relative_tree.kind(relative_at)
-                && tree.range(at).len() - removed == relative_range.len(),
-            "not the same node"
-        );
-        // Each end is moved on its own: a node holding an elided one keeps its start and
-        // loses the elided length from its end.
-        let shift = |offset: TextSize| match cut.partition_point(|&(end, _)| end <= offset) {
-            0 => offset,
-            ends => offset - cut[ends - 1].1,
-        };
-        let moved = |range: TextRange| {
-            TextRange::new(shift(range.start()), shift(range.end())) - start + relative_range.start()
-        };
-        // Under a node in a body, everything is that body's.
-        let in_body = self.bodies.holding(tree.range(at)).is_some();
-        // alloc: the relative map's entries and bodies, the result, once per item lowered
-        let mut entries = Vec::new();
-        // alloc: as `entries`
-        let mut placed = Vec::new();
-        let end = tree.end(at);
-        let mut it = at;
-        // The next elided node: the walk meets them in the order they begin.
-        let mut next = 0;
-        while it < end {
-            if tree.is_token(it) {
+        frame::task(Tag::Parse, |frame| {
+            // Where each elided node ends, and the lengths elided up to and with it: an offset
+            // moves back by the lengths of every elided node ending at or before it.
+            let mut cut = Vec::with_capacity_in(elided.len(), frame);
+            let mut removed = TextSize::new(0);
+            for ptr in elided {
+                removed += ptr.text_range().len();
+                cut.push((ptr.text_range().end(), removed));
+            }
+            debug_assert!(
+                tree.kind(at) == relative_tree.kind(relative_at)
+                    && tree.range(at).len() - removed == relative_range.len(),
+                "not the same node"
+            );
+            // Each end is moved on its own: a node holding an elided one keeps its start and
+            // loses the elided length from its end.
+            let shift = |offset: TextSize| match cut.partition_point(|&(end, _)| end <= offset) {
+                0 => offset,
+                ends => offset - cut[ends - 1].1,
+            };
+            let moved = |range: TextRange| {
+                TextRange::new(shift(range.start()), shift(range.end())) - start
+                    + relative_range.start()
+            };
+            // Under a node in a body, everything is that body's.
+            let in_body = self.bodies.holding(tree.range(at)).is_some();
+            let mut entries: Vec<Entry, &Frame> = Vec::new_in(frame);
+            let mut placed: Vec<Placed, &Frame> = Vec::new_in(frame);
+            let end = tree.end(at);
+            let mut it = at;
+            // The next elided node: the walk meets them in the order they begin.
+            let mut next = 0;
+            while it < end {
+                if tree.is_token(it) {
+                    it += 1;
+                    continue;
+                }
+                let kind = kind_of(tree, it);
+                let range = tree.range(it);
+                if elided.get(next).is_some_and(|ptr| ptr.kind() == kind && ptr.text_range() == range)
+                {
+                    next += 1;
+                    it = tree.end(it);
+                    continue;
+                }
+                if !in_body && is_body(tree, it, kind) {
+                    let body = self
+                        .bodies
+                        .holding(range)
+                        .filter(|&body| self.bodies.range(body) == range)
+                        .expect("a fn body of the node is one of the map's");
+                    let range = moved(range);
+                    let relative_at = find_node(relative_tree, relative_at, kind, range)
+                        .expect("the relative node has the body");
+                    placed.push(self.bodies.moved(body, range, relative_at));
+                    it = tree.end(it);
+                    continue;
+                }
+                let may_have_id =
+                    ast::BlockExpr::can_cast(kind) || ErasedFileAstId::should_alloc(kind).is_some();
+                if may_have_id && let Some(id) = self.id_at(key_of(kind, range)) {
+                    entries.push(entry(kind, moved(range), id));
+                }
                 it += 1;
-                continue;
             }
-            let kind = kind_of(tree, it);
-            let range = tree.range(it);
-            if elided.get(next).is_some_and(|ptr| ptr.kind() == kind && ptr.text_range() == range) {
-                next += 1;
-                it = tree.end(it);
-                continue;
-            }
-            if !in_body && is_body(tree, it, kind) {
-                let body = self
-                    .bodies
-                    .holding(range)
-                    .filter(|&body| self.bodies.range(body) == range)
-                    .expect("a fn body of the node is one of the map's");
-                let range = moved(range);
-                let relative_at = find_node(relative_tree, relative_at, kind, range)
-                    .expect("the relative node has the body");
-                placed.push(self.bodies.moved(body, range, relative_at));
-                it = tree.end(it);
-                continue;
-            }
-            let may_have_id =
-                ast::BlockExpr::can_cast(kind) || ErasedFileAstId::should_alloc(kind).is_some();
-            if may_have_id && let Some(id) = self.id_at(key_of(kind, range)) {
-                entries.push(entry(kind, moved(range), id));
-            }
-            it += 1;
-        }
-        assert_eq!(next, elided.len(), "every elided node is a node under the one mapped");
-        AstIdMap::new(entries, Bodies::new(relative_tree, placed))
+            assert_eq!(next, elided.len(), "every elided node is a node under the one mapped");
+            AstIdMap::new(&entries, Bodies::new(relative_tree, &mut placed))
+        })
     }
 
     /// The root node.
@@ -1385,6 +1453,22 @@ impl AstIdMap {
     /// Blocks may not be allocated (if they have no items), so they have a different API.
     pub fn ast_id_for_block(&self, block: &ast::BlockExpr) -> Option<FileAstId<ast::BlockExpr>> {
         self.ast_id_for_ptr_for_block(AstPtr::new(block))
+    }
+
+    /// [`AstIdMap::ast_id`] of a view of an `N`.
+    pub fn ast_id_of_view<N: AstIdNode + syntax::view::Typed>(
+        &self,
+        item: N::Of<'_>,
+    ) -> FileAstId<N> {
+        self.ast_id_for_ptr(AstPtr::of(item))
+    }
+
+    /// [`AstIdMap::ast_id_for_block`] of a view.
+    pub fn ast_id_for_block_view(
+        &self,
+        block: syntax::view::BlockExpr<'_>,
+    ) -> Option<FileAstId<ast::BlockExpr>> {
+        self.ast_id_for_ptr_for_block(AstPtr::of(block))
     }
 
     pub fn ast_id_for_ptr<N: AstIdNode>(&self, ptr: AstPtr<N>) -> FileAstId<N> {
@@ -1475,6 +1559,7 @@ mod tests {
         sync::Arc,
     };
 
+    use blaze_ids::rng::SplitMix64;
     use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
     use syntax::{
         AstNode, AstPtr, Edition, FlatTreeBuilder, SourceFile, SyntaxKind, SyntaxNode,
@@ -1653,6 +1738,11 @@ fn foo() {
             rust_files(&crates.join(dir), &mut paths);
         }
         assert!(paths.len() > 300, "the corpus is {} files", paths.len());
+        read_all(paths)
+    }
+
+    /// Each of `paths` with its text.
+    fn read_all(paths: Vec<PathBuf>) -> Vec<(PathBuf, Arc<str>)> {
         paths
             .into_iter()
             .map(|path| {
@@ -1661,6 +1751,25 @@ fn foo() {
                 (path, Arc::from(text))
             })
             .collect()
+    }
+
+    /// What the views are checked on: every file of the parser's test data and `span`'s own
+    /// sources (`src/*.rs`).
+    fn view_corpus() -> Vec<(PathBuf, Arc<str>)> {
+        let span = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths = Vec::new();
+        rust_files(&span.join("../parser/test_data"), &mut paths);
+        assert!(paths.len() > 500, "the parser's test data is {} files", paths.len());
+        let src = span.join("src");
+        let mut own: Vec<PathBuf> = std::fs::read_dir(&src)
+            .unwrap_or_else(|e| panic!("{}: {e}", src.display()))
+            .map(|it| it.expect("a directory entry").path())
+            .filter(|it| it.is_file() && it.extension().is_some_and(|it| it == "rs"))
+            .collect();
+        own.sort();
+        assert!(own.len() >= 5, "span's sources are {} files", own.len());
+        paths.extend(own);
+        read_all(paths)
     }
 
     /// Each node a map has an id of, with it.
@@ -1952,15 +2061,6 @@ fn foo() {
         }
     }
 
-    /// splitmix64: the seeded inputs of the tests below.
-    fn next(state: &mut u64) -> u64 {
-        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
     /// What a map keeps, read from its columns and not its indexes: each node it has an id
     /// of, with the id (walking every body).
     fn stored(map: &AstIdMap) -> Vec<(SyntaxNodePtr, ErasedFileAstId)> {
@@ -1995,13 +2095,54 @@ fn foo() {
         }
     }
 
+    /// A warm build of a map allocates its result and nothing else: the entries and two
+    /// indexes, and the five body columns of a map with bodies.
+    #[test]
+    fn a_warm_build_allocates_only_its_map() {
+        for (path, text) in corpus() {
+            for node in [full_of(&text), outline_of(&text)] {
+                let map = AstIdMap::from_source(&node);
+                let columns = if map.bodies.len() == 0 { 3 } else { 8 };
+                let what = format!("{}: a warm map build", path.display());
+                blaze_alloc_count::assert_at_most(columns, &what, || {
+                    std::hint::black_box(AstIdMap::from_source(&node));
+                });
+            }
+        }
+    }
+
+    /// A warm walk of a body allocates its ids and nothing else.
+    #[test]
+    fn a_warm_body_walk_allocates_only_its_ids() {
+        for (path, text) in corpus() {
+            let map = AstIdMap::from_source(&outline_of(&text));
+            let bodies = &map.bodies;
+            let Some(tree) = bodies.tree.as_deref() else { continue };
+            for body in 0..bodies.len() {
+                let (tree, at) = super::expanded(tree, bodies.ats[body]);
+                let row = bodies.rows[body];
+                let walk = || {
+                    std::hint::black_box(super::body_ids(
+                        tree,
+                        at,
+                        row[super::ROW_FIRST_SLOT],
+                        row[super::ROW_SLOTS],
+                    ));
+                };
+                walk();
+                let what = format!("{}: a warm walk of body {body}", path.display());
+                blaze_alloc_count::assert_at_most(1, &what, walk);
+            }
+        }
+    }
+
     #[test]
     fn an_index_finds_what_a_linear_search_does() {
-        let mut state = 1;
+        let mut rng = SplitMix64::new(1);
         for len in [0usize, 1, 2, 3, 7, 8, 9, 100, 1000, 5000] {
             // Few distinct keys, so most are shared by many entries.
             let keys: Vec<u32> =
-                (0..len).map(|_| (next(&mut state) % (len as u64 / 2 + 1)) as u32).collect();
+                (0..len).map(|_| rng.below(len as u64 / 2 + 1) as u32).collect();
             let index = super::Index::new(len, |it| keys[it]);
             assert!(index.slots.len() * 3 > len * 4, "{len} entries fill the table past 3/4");
             for key in 0..len as u32 + 10 {
@@ -2133,10 +2274,10 @@ fn foo() {
 
         let kinds = [Kind::Fn, Kind::Struct, Kind::MacroCall, Kind::Use, Kind::Impl, Kind::Root];
         let (mut packed, mut pairs) = (ErasedAstIdNextIndexMap::default(), Pairs::default());
-        let mut state = 2;
+        let mut rng = SplitMix64::new(2);
         for _ in 0..60_000 {
-            let kind = kinds[(next(&mut state) % kinds.len() as u64) as usize];
-            let data = next(&mut state) % 4;
+            let kind = kinds[rng.index(kinds.len())];
+            let data = rng.below(4);
             assert_eq!(packed.new_id(kind, data), pairs.new_id(kind, data));
         }
     }

@@ -19,7 +19,7 @@ use std::{
 
 use anyhow::Context as _;
 use hir::{AssocItem, HasSource as _, ModuleDef};
-use ide_db::{ChangeWithProcMacros, RootDatabase};
+use ide_db::{ChangeWithProcMacros, RootDatabase, RootDatabaseExt as _};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
 use project_model::{CargoConfig, RustLibSource};
 use syntax::AstNode as _;

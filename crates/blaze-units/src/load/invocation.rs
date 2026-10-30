@@ -9,7 +9,8 @@ use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use serde::{Deserialize, Serialize};
 
 use super::files::{MountTable, ancestors};
-use crate::query::{BuildConfig, Cbor, Command, LoadError, Versioned, key_input, producer};
+use super::key_id;
+use crate::query::{BuildConfig, Cbor, Command, LoadError, Versioned, producer};
 
 /// The command line as cargo reads it, and what of the environment cargo reads.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
@@ -120,7 +121,7 @@ impl Query for Invocation {
     type Value = Cbor<Configured>;
 
     fn input(key: &()) -> ContentId {
-        key_input("blaze v2 cargo invocation key 1", key)
+        key_id("blaze v2 cargo invocation key 1", key)
     }
 
     fn execute(cx: &mut Cx<'_>, _: &()) -> Result<Cbor<Configured>, Cancelled> {
@@ -140,7 +141,7 @@ impl Query for Asking {
     type Value = Cbor<Result<Asked, LoadError>>;
 
     fn input(key: &()) -> ContentId {
-        key_input("blaze v2 cargo asked key 1", key)
+        key_id("blaze v2 cargo asked key 1", key)
     }
 
     fn execute(cx: &mut Cx<'_>, _: &()) -> Result<Cbor<Result<Asked, LoadError>>, Cancelled> {

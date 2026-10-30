@@ -29,7 +29,7 @@ use syntax::{
 use crate::{
     cx::{Cx, item_range, signature_range},
     lints::{body_item, code_fact, registry::LintId},
-    lower::{Found, Phase, break_outside_of_loop::ancestors},
+    lower::{Found, Phase, break_outside_of_loop::up},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
@@ -52,16 +52,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingUnsafe) -> Vec<Found> {
             code_fact(cx, &mut diag, ptr);
             Found::lint(diag, Phase::Mir, lint_at(cx, &node))
         }
-        // Allowed everywhere, a call whose attribute says what to audit gives nothing; one
-        // without is E0133 whatever the lint's level.
-        UnsafeLint::DeprecatedSafe2024
-            if !cx.lint_may_fire(DEPRECATED_SAFE)
-                && matches!(op, Op::Call(Some(function)) if audit_that(cx, function).is_some()) =>
-        {
-            return Vec::new();
-        }
-        UnsafeLint::DeprecatedSafe2024 => match deprecated_safe(cx, &op, span.clone()) {
-            Some(mut diag) => {
+        UnsafeLint::DeprecatedSafe2024 => match deprecated_audit(cx, &op) {
+            // Allowed everywhere, a call whose attribute says what to audit gives nothing; one
+            // without is E0133 whatever the lint's level.
+            Some(_) if !cx.lint_may_fire(DEPRECATED_SAFE) => return Vec::new(),
+            Some((function, audit)) => {
+                let mut diag = deprecated_safe(cx, function, &audit, span);
                 op.facts(cx, &mut diag);
                 code_fact(cx, &mut diag, ptr);
                 Found::lint(diag, Phase::Mir, lint_at(cx, &node))
@@ -228,7 +224,7 @@ fn op_in_unsafe_fn_allowed(cx: &Cx<'_, '_>) -> bool {
 /// item: rustc's `UnsafeNotInheritedNote`. Closures and inline consts are checked with their
 /// body, so one in a block is never in error.
 fn not_inherited(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<Span> {
-    let around = ancestors(cx, node).into_iter().skip(1).find(|it| is_unsafe(&it.value))?;
+    let around = up(cx, node).skip(1).find(|it| is_unsafe(&it.value))?;
     Some(cx.span(around.with_value(head_range(&around.value))))
 }
 
@@ -241,15 +237,28 @@ fn is_unsafe(node: &SyntaxNode) -> bool {
 }
 
 /// rustc's `guess_head_span` of `node` (from after its attributes): up to its first `{`,
-/// without the white space before it, when that is on one line and not empty.
+/// without the white space before it, when that is on one line and not empty. Read from the
+/// tokens in place, up to the `{`: nothing of the body is read or copied.
 fn head_range(node: &SyntaxNode) -> TextRange {
     let range = item_range(node);
-    let text = node.to_string();
-    let base = node.text_range().start();
-    let written = &text[usize::from(range.start() - base)..usize::from(range.end() - base)];
-    let head = written.split('{').next().unwrap_or("").trim_end();
-    match !head.is_empty() && !head.contains('\n') {
-        true => TextRange::at(range.start(), TextSize::of(head)),
+    let written = node.text().slice(range - node.text_range().start());
+    let head = written.slice(..written.find_char('{').unwrap_or(written.len()));
+    // The length up to its last character that is not white space, and whether a line ends
+    // before that.
+    let (mut len, mut at, mut newline, mut multiline) = (TextSize::new(0), TextSize::new(0), false, false);
+    head.for_each_chunk(|chunk| {
+        for c in chunk.chars() {
+            at += TextSize::of(c);
+            if c == '\n' {
+                newline = true;
+            } else if !c.is_whitespace() {
+                multiline |= newline;
+                len = at;
+            }
+        }
+    });
+    match len > TextSize::new(0) && !multiline {
+        true => TextRange::at(range.start(), len),
         false => range,
     }
 }
@@ -258,7 +267,7 @@ fn head_range(node: &SyntaxNode) -> TextRange {
 /// in each closure and inline const it, from what it was where that starts): the function's
 /// signature, and the tool-only suggestion to wrap its body in an `unsafe` block.
 fn unsafe_fn_note(cx: &Cx<'_, '_>, diag: &mut Diag, node: &InFile<SyntaxNode>) {
-    let function = ancestors(cx, node).into_iter().find_map(|it| ast::Fn::cast(it.value.clone()).map(|f| it.with_value(f)));
+    let function = up(cx, node).find_map(|it| ast::Fn::cast(it.value.clone()).map(|f| it.with_value(f)));
     let Some(function) = function else { return };
     if function.value.unsafe_token().is_none() || !first_in_function(cx, node, &function) {
         return;
@@ -280,10 +289,19 @@ fn unsafe_fn_note(cx: &Cx<'_, '_>, diag: &mut Diag, node: &InFile<SyntaxNode>) {
 /// outside an `unsafe` block comes before it in its closure (or inline const), or before that
 /// in what that is in, up to `function`. rustc checks a closure with a copy of the flag, so
 /// what is linted in one leaves the flag of what it is in set.
+///
+/// Each other operation is tested cheapest first: where it is (one comparison when it is in
+/// the same file or expansion), then the body it is checked in, a walk up with nothing
+/// allocated. hir's list of the body's operations is made again for each lint; hir giving
+/// the flag with the diagnostic would make this one read (v2/requests/diagnostics.md,
+/// diagnostics-lints-mir-unsafe and diagnostics-lints-mir-speed).
 fn first_in_function(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, function: &InFile<ast::Fn>) -> bool {
     let Some(def) = cx.sema.to_def2(function.as_ref()) else { return true };
-    let Some(chain) = scopes(cx, node) else { return true };
-    let at = position(cx, node);
+    let mut chain = Vec::new();
+    if !scopes(cx, node, |scope| chain.push(scope)) {
+        return true;
+    }
+    let mut at = None;
     let own = key(node);
     let ops = cx.sema.get_unsafe_ops(hir::DefWithBody::Function(def).into());
     !ops.iter().any(|other| {
@@ -291,8 +309,17 @@ fn first_in_function(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, function: &InFi
         if key(&other) == own {
             return false;
         }
-        let Some(other_chain) = scopes(cx, &other) else { return false };
-        other_chain.first().is_some_and(|scope| chain.contains(scope)) && position(cx, &other) < at
+        let before = match other.file_id == node.file_id {
+            true => order(&other.value) < order(&node.value),
+            false => position(cx, &other) < *at.get_or_insert_with(|| position(cx, node)),
+        };
+        if !before {
+            return false;
+        }
+        let mut first = None;
+        scopes(cx, &other, |scope| {
+            first.get_or_insert(scope);
+        }) && first.is_some_and(|scope| chain.contains(&scope))
     })
 }
 
@@ -301,26 +328,32 @@ fn key(node: &InFile<SyntaxNode>) -> (HirFileId, TextRange) {
     (node.file_id, node.value.text_range())
 }
 
-/// The bodies rustc checks `node` in, from its own: each closure and inline const around it,
-/// then the function; none when it is in an `unsafe` block, where rustc lints nothing.
-fn scopes(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<Vec<(HirFileId, TextRange)>> {
-    let mut scopes = Vec::new();
-    for it in ancestors(cx, node).into_iter().skip(1) {
+/// Gives `scope` the bodies rustc checks `node` in, from its own: each closure and inline
+/// const around it, then the function. False when it is in an `unsafe` block, where rustc
+/// lints nothing.
+fn scopes(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, mut scope: impl FnMut((HirFileId, TextRange))) -> bool {
+    for it in up(cx, node).skip(1) {
         if let Some(block) = ast::BlockExpr::cast(it.value.clone()) {
             if block.unsafe_token().is_some() {
-                return None;
+                return false;
             }
             if block.const_token().is_some() {
-                scopes.push(key(&it));
+                scope(key(&it));
             }
         } else if ast::ClosureExpr::can_cast(it.value.kind()) {
-            scopes.push(key(&it));
+            scope(key(&it));
         } else if ast::Fn::can_cast(it.value.kind()) {
-            scopes.push(key(&it));
-            return Some(scopes);
+            scope(key(&it));
+            return true;
         }
     }
-    Some(scopes)
+    true
+}
+
+/// [`position`] within one file or expansion.
+fn order(node: &SyntaxNode) -> (TextSize, Reverse<TextSize>) {
+    let range = node.text_range();
+    (range.start(), Reverse(range.end()))
 }
 
 /// The order rustc visits operations in: by where each starts in the file and in each
@@ -338,12 +371,16 @@ fn position(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<(TextSize, Revers
     position
 }
 
-/// rustc's `CallToDeprecatedSafeFnRequiresUnsafe`, when the callee's
-/// `#[rustc_deprecated_safe_2024(audit_that = "..")]` says what to audit.
-fn deprecated_safe(cx: &Cx<'_, '_>, op: &Op, span: Span) -> Option<Diag> {
+/// The callee of a call rustc lints as `deprecated_safe_2024`, and what its
+/// `#[rustc_deprecated_safe_2024(audit_that = "..")]` says to audit.
+fn deprecated_audit(cx: &Cx<'_, '_>, op: &Op) -> Option<(hir::Function, String)> {
     let Op::Call(Some(function)) = op else { return None };
-    let audit = audit_that(cx, *function)?;
-    let path = untrimmed_path(cx, *function);
+    Some((*function, audit_that(cx, *function)?))
+}
+
+/// rustc's `CallToDeprecatedSafeFnRequiresUnsafe`.
+fn deprecated_safe(cx: &Cx<'_, '_>, function: hir::Function, audit: &str, span: Span) -> Diag {
+    let path = untrimmed_path(cx, function);
     let message = format!("call to deprecated safe function `{path}` is unsafe and requires unsafe block");
     let mut diag = Diag::lint("deprecated_safe_2024", message, span.clone());
     diag.span_label(span.clone(), "call to unsafe function");
@@ -357,7 +394,7 @@ fn deprecated_safe(cx: &Cx<'_, '_>, op: &Op, span: Span) -> Option<Diag> {
         ],
         Applicability::MachineApplicable,
     );
-    Some(diag)
+    diag
 }
 
 /// The start of the line `span` starts on, and the white space it starts with before `span`
@@ -472,8 +509,7 @@ fn union_of(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<hir::Union> {
 /// for a pattern, the expression it is in (a `let`'s block, a `match`, a closure), or the item
 /// of a parameter.
 fn lint_at(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> InFile<SyntaxNodePtr> {
-    ancestors(cx, node)
-        .into_iter()
+    up(cx, node)
         .find(|it| ast::Expr::can_cast(it.value.kind()) || ast::Item::can_cast(it.value.kind()))
         .unwrap_or_else(|| node.clone())
         .map(|it| SyntaxNodePtr::new(&it))
@@ -544,8 +580,48 @@ fn and_list(items: &[Symbol]) -> String {
 #[cfg(test)]
 mod tests {
     use intern::Symbol;
+    use syntax::{AstNode, Edition, SourceFile, TextRange, TextSize};
 
-    use super::and_list;
+    use super::{and_list, head_range, is_unsafe};
+    use crate::cx::item_range;
+
+    /// [`head_range`] by the text: the node's text copied out and cut at its first `{`.
+    fn plain_head_range(node: &syntax::SyntaxNode) -> TextRange {
+        let range = item_range(node);
+        let text = node.to_string();
+        let base = node.text_range().start();
+        let written = &text[usize::from(range.start() - base)..usize::from(range.end() - base)];
+        let head = written.split('{').next().unwrap_or("").trim_end();
+        match !head.is_empty() && !head.contains('\n') {
+            true => TextRange::at(range.start(), TextSize::of(head)),
+            false => range,
+        }
+    }
+
+    /// The head read from the tokens is the one the text gives, for heads on one line, over
+    /// several, empty, after attributes and with a `{` in a comment.
+    #[test]
+    fn the_head_read_in_place_is_the_texts() {
+        let text = r#"
+#[inline]
+unsafe fn one(x: u8) -> u8 { x }
+unsafe fn two(
+    x: u8,
+) { unsafe { let _ = x; } }
+unsafe fn three /* { */ () {}
+pub unsafe fn four()   
+{}
+fn five() { unsafe {} ; unsafe
+{ } }
+"#;
+        let file = SourceFile::parse(text, Edition::Edition2021).tree();
+        let mut compared = 0;
+        for node in file.syntax().descendants().filter(is_unsafe) {
+            assert_eq!(head_range(&node), plain_head_range(&node), "at {node:?}");
+            compared += 1;
+        }
+        assert!(compared >= 7, "the text has `unsafe` blocks and functions: {compared}");
+    }
 
     #[test]
     fn lists_are_joined_as_rustc_joins_them() {

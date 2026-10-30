@@ -7,18 +7,20 @@
 //! Only the items of a crate's modules are in its batch. An item declared in a block is in a
 //! body, and a signature query reads no body, so such items keep a query of their own.
 
+use std::alloc::Allocator;
+
 use base_db::{Db, Crate};
 use blaze_ids::radix;
+use blaze_mem::Frame;
 use hir_def::{AdtId, ImplId, ModuleDefId, ModuleId, VariantId, nameres::crate_def_map};
 use rustc_type_ir::inherent::Ty as _;
 use salsa::{SalsaValue, plumbing::AsId};
-use thin_vec::ThinVec;
 
 use crate::{
     TyLoweringDiagnostic,
     db::{AnonConstId, HirDatabase},
     lower::{
-        FieldType, FieldTypes, GenericPredicates, Lowered, TyLoweringResult, generic_predicates,
+        FieldType, FieldTypes, FrameLowered, GenericPredicates, Lowered, generic_predicates,
         lower_field_types, lower_impl_self_ty, lower_impl_trait,
     },
     next_solver::{
@@ -81,17 +83,26 @@ impl<'db> SideTable<'db> {
     }
 }
 
-/// Builds a [`SideTable`], rows pushed in ascending order.
-#[derive(Default)]
-pub(crate) struct SideTableBuilder<'db> {
-    rows: Vec<u32>,
-    diagnostics_at: Vec<u32>,
-    anon_consts_at: Vec<u32>,
-    diagnostics: Vec<TyLoweringDiagnostic>,
-    anon_consts: Vec<AnonConstId<'db>>,
+/// Builds a [`SideTable`], rows pushed in ascending order, in the frame of the run building it.
+pub(crate) struct SideTableBuilder<'f, 'db> {
+    rows: Vec<u32, &'f Frame>,
+    diagnostics_at: Vec<u32, &'f Frame>,
+    anon_consts_at: Vec<u32, &'f Frame>,
+    diagnostics: Vec<TyLoweringDiagnostic, &'f Frame>,
+    anon_consts: Vec<AnonConstId<'db>, &'f Frame>,
 }
 
-impl<'db> SideTableBuilder<'db> {
+impl<'f, 'db> SideTableBuilder<'f, 'db> {
+    pub(crate) fn new(frame: &'f Frame) -> Self {
+        SideTableBuilder {
+            rows: Vec::new_in(frame),
+            diagnostics_at: Vec::new_in(frame),
+            anon_consts_at: Vec::new_in(frame),
+            diagnostics: Vec::new_in(frame),
+            anon_consts: Vec::new_in(frame),
+        }
+    }
+
     pub(crate) fn push(
         &mut self,
         row: u32,
@@ -113,15 +124,20 @@ impl<'db> SideTableBuilder<'db> {
         self.anon_consts_at.push(anon_consts_at);
     }
 
-    pub(crate) fn finish(self) -> SideTable<'db> {
+    pub(crate) fn finish(mut self) -> SideTable<'db> {
         SideTable {
-            rows: self.rows.into_boxed_slice(),
-            diagnostics_at: self.diagnostics_at.into_boxed_slice(),
-            anon_consts_at: self.anon_consts_at.into_boxed_slice(),
-            diagnostics: self.diagnostics.into_boxed_slice(),
-            anon_consts: self.anon_consts.into_boxed_slice(),
+            rows: exact(&mut self.rows),
+            diagnostics_at: exact(&mut self.diagnostics_at),
+            anon_consts_at: exact(&mut self.anon_consts_at),
+            diagnostics: exact(&mut self.diagnostics),
+            anon_consts: exact(&mut self.anon_consts),
         }
     }
+}
+
+/// A batch's own column of `items`, allocated once at their length: nothing when empty.
+fn exact<T>(items: &mut Vec<T, &Frame>) -> Box<[T]> {
+    items.drain(..).collect() // alloc: a batch's own column, exact size
 }
 
 /// One kind of signature of a crate's items: the items ascending, a value for each.
@@ -133,24 +149,33 @@ pub struct Batch<'db, K, V> {
 }
 
 impl<'db, K: Ord + Copy, V> Batch<'db, K, V> {
-    /// `lower` of each of `keys`, which are ascending and distinct.
-    fn build(keys: Vec<K>, mut lower: impl FnMut(K) -> TyLoweringResult<'db, V>) -> Self {
-        let mut values = Vec::with_capacity(keys.len());
-        let mut side = SideTableBuilder::default();
+    /// `lower` of each of `keys`, which are ascending and distinct, each item in a task of its
+    /// own: an item's temporaries are gone before the next, so a crate of 10,000 items peaks at
+    /// its largest item's, in warm memory. What an item found is copied to `frame`'s side table.
+    fn build(
+        keys: &[K],
+        frame: &Frame,
+        mut lower: impl for<'f> FnMut(K, &'f Frame) -> FrameLowered<'f, 'db, V>,
+    ) -> Self {
+        let mut values = Vec::with_capacity(keys.len()); // alloc: the batch's own column, exact size
+        let mut side = SideTableBuilder::new(frame);
         for (row, &key) in keys.iter().enumerate() {
-            let (value, diagnostics, anon_consts) = lower(key).into_parts();
-            side.push(row as u32, diagnostics, anon_consts);
-            values.push(value);
+            blaze_mem::frame::task(crate::db::INFER_TAG, |item| {
+                let lowered = lower(key, item);
+                side.push(row as u32, lowered.diagnostics, lowered.anon_consts);
+                values.push(lowered.value);
+            });
         }
-        Batch { keys: keys.into_boxed_slice(), values: values.into_boxed_slice(), side: side.finish() }
+        // alloc: the batch's keys, exact size; `values` is at its capacity, so boxing it moves
+        Batch { keys: Box::from(keys), values: values.into_boxed_slice(), side: side.finish() }
     }
 
     /// `value()` for each of `keys`: the batch when computing it reached itself, which only code
     /// rustc rejects does (an impl header naming its own self type or trait). Each row is what
     /// the per-item query's cycle result gives.
-    fn filled(keys: Vec<K>, value: impl Fn() -> V) -> Self {
-        let values = keys.iter().map(|_| value()).collect();
-        Batch { keys: keys.into_boxed_slice(), values, side: SideTable::default() }
+    fn filled(keys: &[K], value: impl Fn() -> V) -> Self {
+        let values = keys.iter().map(|_| value()).collect(); // alloc: the batch's column, exact size
+        Batch { keys: Box::from(keys), values, side: SideTable::default() }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -250,32 +275,41 @@ impl<'db> CrateFieldTypes<'db> {
     }
 
     /// The batch of `lower` of each of `variants`, which are ascending and distinct.
+    /// Each variant is lowered in a task of its own, as [`Batch::build`]'s items are.
     pub(crate) fn build(
-        variants: Vec<VariantId>,
-        mut lower: impl FnMut(VariantId) -> TyLoweringResult<'db, ThinVec<FieldType>>,
+        variants: &[VariantId],
+        frame: &Frame,
+        mut lower: impl for<'f> FnMut(
+            VariantId,
+            &'f Frame,
+        ) -> FrameLowered<'f, 'db, Vec<FieldType, &'f Frame>>,
     ) -> Self {
-        let mut starts = Vec::with_capacity(variants.len() + 1);
-        let mut fields = Vec::new();
-        let mut side = SideTableBuilder::default();
+        let mut starts = Vec::with_capacity(variants.len() + 1); // alloc: the batch's column, exact size
+        let mut fields = Vec::new_in(frame);
+        let mut side = SideTableBuilder::new(frame);
         starts.push(0);
         for (row, &variant) in variants.iter().enumerate() {
-            let (types, diagnostics, anon_consts) = lower(variant).into_parts();
-            fields.extend(types);
-            starts.push(u32::try_from(fields.len()).expect("more than 2^32 fields in one crate"));
-            side.push(row as u32, diagnostics, anon_consts);
+            blaze_mem::frame::task(crate::db::INFER_TAG, |item| {
+                let lowered = lower(variant, item);
+                fields.extend(lowered.value);
+                starts.push(
+                    u32::try_from(fields.len()).expect("more than 2^32 fields in one crate"),
+                );
+                side.push(row as u32, lowered.diagnostics, lowered.anon_consts);
+            });
         }
         CrateFieldTypes {
-            variants: variants.into_boxed_slice(),
+            variants: Box::from(variants), // alloc: the batch's column, exact size
             starts: starts.into_boxed_slice(),
-            fields: fields.into_boxed_slice(),
+            fields: fields.drain(..).collect(), // alloc: the batch's column, exact size
             side: side.finish(),
         }
     }
 }
 
-/// The variants of a crate's modules, ascending.
-fn module_variants(db: &Db, krate: Crate) -> Vec<VariantId> {
-    let mut variants = Vec::new();
+/// The variants of a crate's modules, ascending, in `alloc`.
+fn module_variants<A: Allocator>(db: &Db, krate: Crate, alloc: A) -> Vec<VariantId, A> {
+    let mut variants = Vec::new_in(alloc);
     for (_, module) in crate_def_map(db, krate).modules(db) {
         for def in module.scope(db).declarations() {
             match def {
@@ -300,9 +334,9 @@ fn module_variants(db: &Db, krate: Crate) -> Vec<VariantId> {
     variants
 }
 
-/// The impls of a crate's modules, ascending.
-fn module_impls(db: &Db, krate: Crate) -> Vec<ImplId> {
-    let mut impls = Vec::new();
+/// The impls of a crate's modules, ascending, in `alloc`.
+fn module_impls<A: Allocator>(db: &Db, krate: Crate, alloc: A) -> Vec<ImplId, A> {
+    let mut impls = Vec::new_in(alloc);
     for (_, module) in crate_def_map(db, krate).modules(db) {
         impls.extend(module.scope(db).impls());
     }
@@ -314,14 +348,22 @@ fn module_impls(db: &Db, krate: Crate) -> Vec<ImplId> {
     impls
 }
 
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
 fn crate_field_types<'db>(db: &'db Db, krate: Crate) -> CrateFieldTypes<'db> {
-    CrateFieldTypes::build(module_variants(db, krate), |variant| lower_field_types(db, variant))
+    blaze_mem::frame::current(|frame| {
+        let variants = module_variants(db, krate, frame);
+        CrateFieldTypes::build(&variants, frame, |variant, item| {
+            lower_field_types(db, variant, item)
+        })
+    })
 }
 
-#[salsa::tracked(returns(ref), cycle_result = crate_impl_self_tys_cycle)]
+#[salsa::tracked(returns(ref), cycle_result = crate_impl_self_tys_cycle, mem_tag = Infer)]
 fn crate_impl_self_tys<'db>(db: &'db Db, krate: Crate) -> CrateImplSelfTys<'db> {
-    Batch::build(module_impls(db, krate), |impl_id| lower_impl_self_ty(db, impl_id))
+    blaze_mem::frame::current(|frame| {
+        let impls = module_impls(db, krate, frame);
+        Batch::build(&impls, frame, |impl_id, item| lower_impl_self_ty(db, impl_id, item))
+    })
 }
 
 fn crate_impl_self_tys_cycle<'db>(
@@ -332,23 +374,25 @@ fn crate_impl_self_tys_cycle<'db>(
     let error = StoredEarlyBinder::bind_no_rigid_aliases(
         Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed).store(),
     );
-    Batch::filled(module_impls(db, krate), || error.clone())
+    Batch::filled(&module_impls(db, krate, std::alloc::Global), || error.clone())
 }
 
 /// Reads the crate's self types: a trait's arguments may name `Self`.
-#[salsa::tracked(returns(ref), cycle_result = crate_impl_traits_cycle)]
+#[salsa::tracked(returns(ref), cycle_result = crate_impl_traits_cycle, mem_tag = Infer)]
 fn crate_impl_traits<'db>(db: &'db Db, krate: Crate) -> CrateImplTraits<'db> {
     let self_tys = CrateImplSelfTys::of(db, krate);
-    let keys = self_tys.keys.to_vec();
-    Batch::build(keys, |impl_id| {
-        let self_ty = self_tys.get(impl_id).expect("the self types have every impl");
-        match lower_impl_trait(db, impl_id, self_ty.value.get().skip_binder()) {
-            Some(result) => {
-                let (value, diagnostics, anon_consts) = result.into_parts();
-                TyLoweringResult::new(Some(value), diagnostics, anon_consts)
+    blaze_mem::frame::current(|frame| {
+        Batch::build(&self_tys.keys, frame, |impl_id, item| {
+            let self_ty = self_tys.get(impl_id).expect("the self types have every impl");
+            match lower_impl_trait(db, impl_id, self_ty.value.get().skip_binder(), item) {
+                Some(lowered) => FrameLowered {
+                    value: Some(lowered.value),
+                    diagnostics: lowered.diagnostics,
+                    anon_consts: lowered.anon_consts,
+                },
+                None => FrameLowered::empty(None, item),
             }
-            None => TyLoweringResult::empty(None),
-        }
+        })
     })
 }
 
@@ -357,14 +401,18 @@ fn crate_impl_traits_cycle<'db>(
     _: salsa::Id,
     krate: Crate,
 ) -> CrateImplTraits<'db> {
-    Batch::filled(module_impls(db, krate), || None)
+    Batch::filled(&module_impls(db, krate, std::alloc::Global), || None)
 }
 
 /// Reads the crate's self types and traits: a where clause may name `Self` and `Self::Assoc`.
-#[salsa::tracked(returns(ref), cycle_result = crate_impl_predicates_cycle)]
+#[salsa::tracked(returns(ref), cycle_result = crate_impl_predicates_cycle, mem_tag = Infer)]
 fn crate_impl_predicates<'db>(db: &'db Db, krate: Crate) -> CrateImplPredicates<'db> {
-    let keys = CrateImplSelfTys::of(db, krate).keys.to_vec();
-    Batch::build(keys, |impl_id| generic_predicates(db, impl_id.into()))
+    let self_tys = CrateImplSelfTys::of(db, krate);
+    blaze_mem::frame::current(|frame| {
+        Batch::build(&self_tys.keys, frame, |impl_id, item| {
+            generic_predicates(db, impl_id.into(), item)
+        })
+    })
 }
 
 fn crate_impl_predicates_cycle<'db>(
@@ -373,7 +421,7 @@ fn crate_impl_predicates_cycle<'db>(
     krate: Crate,
 ) -> CrateImplPredicates<'db> {
     let empty = StoredEarlyBinder::bind_no_rigid_aliases(Clauses::empty().store());
-    Batch::filled(module_impls(db, krate), || {
+    Batch::filled(&module_impls(db, krate, std::alloc::Global), || {
         GenericPredicates::from_explicit_own_predicates(empty.clone())
     })
 }
@@ -398,26 +446,46 @@ mod tests {
 
     #[test]
     fn a_side_table_keeps_only_rows_with_something() {
-        let mut side = SideTableBuilder::<'static>::default();
-        side.push(0, [], []);
-        side.push(1, [diagnostic(1), diagnostic(2)], []);
-        side.push(2, [], []);
-        side.push(5, [diagnostic(5)], []);
-        side.push(9, [], []);
-        let side = side.finish();
-        assert_eq!(side.len(), 2);
-        assert_eq!(side.get(0), (&[][..], &[][..]));
-        assert_eq!(side.get(1).0, &[diagnostic(1), diagnostic(2)]);
-        assert_eq!(side.get(2).0, &[]);
-        assert_eq!(side.get(5).0, &[diagnostic(5)]);
-        assert_eq!(side.get(9).0, &[]);
-        assert_eq!(side.get(100).0, &[]);
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+            let mut side = SideTableBuilder::<'_, 'static>::new(frame);
+            side.push(0, [], []);
+            side.push(1, [diagnostic(1), diagnostic(2)], []);
+            side.push(2, [], []);
+            side.push(5, [diagnostic(5)], []);
+            side.push(9, [], []);
+            let side = side.finish();
+            assert_eq!(side.len(), 2);
+            assert_eq!(side.get(0), (&[][..], &[][..]));
+            assert_eq!(side.get(1).0, &[diagnostic(1), diagnostic(2)]);
+            assert_eq!(side.get(2).0, &[]);
+            assert_eq!(side.get(5).0, &[diagnostic(5)]);
+            assert_eq!(side.get(9).0, &[]);
+            assert_eq!(side.get(100).0, &[]);
+        });
     }
 
     #[test]
     fn an_empty_side_table_allocates_nothing_and_has_nothing() {
-        let side = SideTableBuilder::<'static>::default().finish();
-        assert_eq!(side.len(), 0);
-        assert!(side.get(0).0.is_empty() && side.get(0).1.is_empty());
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+            let (side, used) = blaze_alloc_count::measure(|| {
+                SideTableBuilder::<'_, 'static>::new(frame).finish()
+            });
+            assert_eq!(used.allocations, 0);
+            assert_eq!(side.len(), 0);
+            assert!(side.get(0).0.is_empty() && side.get(0).1.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_side_table_column_is_its_exact_length() {
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+            let mut side = SideTableBuilder::<'_, 'static>::new(frame);
+            for row in 0..5 {
+                side.push(row, [diagnostic(row)], []);
+            }
+            let (side, used) = blaze_alloc_count::measure(|| side.finish());
+            assert_eq!(used.allocations, 4, "rows, two starts, diagnostics; no constants");
+            assert_eq!(side.len(), 5);
+        });
     }
 }

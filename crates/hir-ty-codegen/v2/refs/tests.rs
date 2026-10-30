@@ -11,16 +11,10 @@ use blaze_codegen::{
     backend::FrontRef,
     settings::{DebugInfo, Panic, Relocation, Sanitize, Spec, Toolchain},
 };
-use blaze_format::SpanRef;
 use blaze_ids::ContentId;
-use blaze_items::{CodeHash, ItemId, ItemKey};
 use cranelift_codegen::ir;
-use hir_def::{DefWithBodyId, FunctionId, StaticId, signatures::FunctionSignature};
-use hir_ty::{
-    db::HirDatabase,
-    next_solver::{Const, Ty},
-};
-use hir_ty_mir::mir::MirSpan;
+use hir_def::{FunctionId, StaticId, signatures::FunctionSignature};
+use hir_ty::db::HirDatabase;
 use rustc_hash::FxHashSet;
 use test_fixture::WithFixture;
 
@@ -29,61 +23,19 @@ use crate::{
     Instance, InstanceDef,
     home::Homes,
     v2::{
-        Body, BuildTime, Built, Databases, Hashes, HirFrontend, HirInstance, HirStatic, Kind,
+        BuildTime, Built, Databases, HashSource, HirFrontend, HirInstance, HirStatic, Kind,
         backend::{built, compiled_in},
+        by_id::ById,
         build::{self, Build},
         places::{self, Placer, Ref, place_requests},
     },
 };
 use db::TestDB;
 
-/// Content IDs of the database's own ids: stable within one database, which is all a test
-/// compares.
-struct ById;
-
-fn by_id(domain: &'static str, what: impl std::fmt::Debug) -> ContentId {
-    ContentId::of(domain, format!("{what:?}").as_bytes())
-}
-
-impl Hashes for ById {
-    fn item(&self, _: &Db, item: ItemId) -> Result<ItemKey, String> {
-        Ok(ItemKey(by_id("test item", item)))
-    }
-
-    fn code(&self, _: &Db, body: Body) -> Result<CodeHash, String> {
-        Ok(CodeHash(by_id("test code", body)))
-    }
-
-    fn ty<'db>(&self, _: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
-        Ok(by_id("test type", ty))
-    }
-
-    fn konst<'db>(&self, _: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
-        Ok(by_id("test const", konst))
-    }
-
-    fn span(
-        &self,
-        _: &Db,
-        owner: DefWithBodyId,
-        span: MirSpan,
-    ) -> Result<SpanRef, String> {
-        Ok(SpanRef { anchor: by_id("test span", (owner, span)), index: 0 })
-    }
-
-    fn declaration(&self, _: &Db, func: FunctionId) -> Result<SpanRef, String> {
-        Ok(SpanRef { anchor: by_id("test declaration", func), index: 0 })
-    }
-
-    fn file_name(&self, _: &Db, file: base_db::FileId) -> Result<String, String> {
-        Ok(format!("{file:?}"))
-    }
-}
-
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(TestDB::with_single_file(text).0));
-    (db, HirFrontend::new(Databases::new(db), Box::new(ById), BuildTime(Default::default())))
+    (db, HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime(Default::default())))
 }
 
 #[track_caller]
@@ -187,7 +139,7 @@ fn placed(
         Built::Assembled(_, requests) => requests,
     };
     let mut placer = Placer::listed(walked.to_vec());
-    place_requests(db, homes, &ById, compiled_in(db, instance), &mut placer, requests).unwrap_or_else(|e| {
+    place_requests(db, homes, &HashSource::ById(ById), compiled_in(db, instance), &mut placer, requests).unwrap_or_else(|e| {
         panic!("{instance:?} with {setting} asks for what its walk has not: {e}")
     });
 }
@@ -586,7 +538,7 @@ fn extern_and_variadic_calls_list_their_symbols() {
         assert_eq!(walk(db, assembly, false, homes), Ok(Vec::new()));
         let mut code = built(db, assembly, false).expect("the assembly");
         let Built::Assembled(_, requests) = &mut code else { panic!("IR of assembly") };
-        place_requests(db, homes, &ById, None, &mut Placer::listed(Vec::new()), requests)
+        place_requests(db, homes, &HashSource::ById(ById), None, &mut Placer::listed(Vec::new()), requests)
             .expect("assembly that names nothing");
     });
 }

@@ -84,7 +84,7 @@ pub struct Cx<'a, 'db> {
     /// The file each name shown stands for, as spans were made.
     named: RefCell<FxHashMap<String, FileId>>,
     /// The paths types are printed by, made the first time one is printed.
-    paths: OnceCell<crate::print::Paths>,
+    paths: OnceCell<crate::print::Paths<'a>>,
     /// The crate as rustc's early lint pass walks it, made the first time a pass asks.
     walk: OnceCell<Walk<'db>>,
     /// The crate's items as rustc's item passes visit them, made the first time a pass asks.
@@ -131,8 +131,9 @@ impl<'a, 'db> Cx<'a, 'db> {
         self.files
     }
 
-    /// What rustc's printing of paths reads: the crate's visible names, for trimmed paths.
-    pub(crate) fn paths(&self) -> &crate::print::Paths {
+    /// What rustc's printing of paths and the import suggestions read: the crate's visible
+    /// names and its declarations by name, built in the check's frame when first read.
+    pub(crate) fn paths(&self) -> &crate::print::Paths<'a> {
         self.paths.get_or_init(|| crate::print::Paths::new(self))
     }
 

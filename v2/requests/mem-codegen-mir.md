@@ -215,6 +215,17 @@ unchanged where a map is iterated.
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
+> codegen-mir (2026-10-29), on mem-codegen-mir's step-2 review: `framed.rs` follows the
+> one-bit-set-family agreement with codegen-mir-store (its requests file): `Bits<'f, I>` is
+> `blaze_ids::bits::BitSliceMut` over words from `bits_in(len, frame)`.
+> - `is_empty` is `blaze_ids`' (`bits.rs:313`).
+> - `Clone` can't be had on a `&mut [u64]` view. A copy is `let mut copy = bits_in(len, frame);
+>   copy.copy_from(&set);`: one bump of the frame, as before.
+> - `FrameMap`/`map_in` and `FrameSet`/`set_in` are in. codegen-mir-store added the set back
+>   for `lower.rs`.
+> - hashbrown's `nightly` is on in the root `Cargo.toml` (`features = ["inline-more",
+>   "nightly"]`).
+
 ## 3. The runtime pipeline: `src/mir/transform.rs`
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
@@ -723,6 +734,12 @@ the cost: `named.contains` was already linear.
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
+> applied by codegen-mir-store-drops (2026-10-29), uncompiled: all of §4.5 is in
+> `move_paths.rs` on `framed::Bits` (no `Bits::clone`: `InitState::copy_in(frame)` makes the
+> one copy per block), `effects_at` pushes straight into `Effects::all`, and a local
+> `successors()` iterator replaces `TerminatorKind::successors()`, whose `SmallVec` spills on a
+> switch of more than two targets.
+
 ### 4.6 What the tests hold `move_paths` to
 
 The `Pass::DropAnalysis` warm test (§10, `warm_runtime_analyses_allocate_nothing`): live blocks,
@@ -730,6 +747,12 @@ The `Pass::DropAnalysis` warm test (§10, `warm_runtime_analyses_allocate_nothin
 body with moves, drops, a conditional move and a `match` on an enum.
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> applied by codegen-mir-store-drops (2026-10-29), uncompiled: `elaborate_drops::analyse` is
+> what `Pass::DropAnalysis` runs (returning `()`, so `run_one`'s arms agree); the warm test
+> itself is §10.3's text for `tests/mir/alloc_budget.rs` (codegen-mir-store's file), and
+> `move_paths.rs` adds database-free unit tests (subtree table against the old walk, `Edges`,
+> `InitState`).
 
 ### 4.7 `elaborate_drops.rs`
 
@@ -831,6 +854,10 @@ Budgets:
   count.
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> applied by codegen-mir-store-drops (2026-10-29), uncompiled: all of §4.7, except that
+> `Elaborator` is `<'a, 'c, 'f, 'db>` with `ctx: &'a Ctx<'c, 'db>`, since `Ctx` is invariant in
+> its frame (a `RefCell`) and the pass's frame is shorter than the pipeline's.
 
 ## 5. Lowering: `src/mir/lower.rs`, `lower/match_tree.rs`, `lower/pattern_matching.rs`
 
@@ -1440,6 +1467,28 @@ pub(super) fn run_one<'db>(
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
+> applied by codegen-mir (2026-10-29), uncompiled, §6.1 and §6.2 in `optimize.rs`:
+> - `optimize` makes the copy and runs `passes` in one `frame::task`. Each `run!` is a
+>   `frame::task` of its own, with `validate(body, frame)` in debug builds. `optimize::run_one`
+>   is as written, and its `other` arm goes to `transform::run_one`.
+> - `validate`'s reachable set is a `Bits`. `reverse_postorder(body, frame)` keeps
+>   `(block, next index)` on a frame stack sized to the block count.
+> - `Dominators<'f>` keeps its predecessors in a frame CSR (`starts` and `preds`), in reverse
+>   postorder and then successor order, as before.
+> - `map_place` passes the iterator straight to `Projection::new_from_iter`.
+> - `renumber_locals` filters every list in place with `retain_mut`. `binding_locals` is
+>   renumbered in place when every binding is kept; otherwise it is made again at
+>   `last + 1`, as the trailing-`None` note says.
+> - `renumber_blocks(body, map)` takes the arena the caller filled, rewrites its targets in
+>   place, and filters `unreached`/`panic_unwinds` with `retain_mut`. cfg.rs's caller
+>   (`renumber_blocks(body, kept, &map)`, §6.3) moves to the new signature.
+> - One step past the text: `successors(kind)` is now a non-allocating double-ended iterator
+>   (a slice of targets chained with two `Option`s), in the order the `SmallVec` had. So no
+>   switch spills anywhere, and the index-based walk is `.nth(at)`. Every caller compiles
+>   unchanged: `for`, `.into_iter()`, `.rev()`, `.extend(..)`, `.find(..)`.
+> - `passes` and `run_one` call every pass with `frame` last, as listed (for
+>   codegen-mir-store's §6.3-6.8), and `Ctx<'_, 'db>`.
+
 ### 6.3 `optimize/cfg.rs`
 
 - **`simplify_cfg`** (lines 53-59) moves every block out of the arena into a fresh `Vec`
@@ -1498,6 +1547,8 @@ pub(super) fn run_one<'db>(
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
+> applied by codegen-mir-store-opt (2026-10-29), uncompiled: as written, every pass taking `frame` last, with `framed::{Bits, bits_in, block_index, block_id}`; `remove_dead_blocks` returns before touching the arena when every block is kept (`kept == count`), and otherwise moves the kept blocks into `Arena::with_capacity(kept)` and calls `renumber_blocks(body, map)`.
+
 ### 6.4 `optimize/locals.rs`
 
 - `UsedLocals { count: Vec<u32>, always: Vec<bool> }` (lines 27-48) becomes
@@ -1537,6 +1588,8 @@ pub(super) fn run_one<'db>(
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
+> applied by codegen-mir-store-opt (2026-10-29), uncompiled: as written; `remove_unused_definitions` (copy_prop's) takes `frame` too, and `simplify_locals` passes `renumber_locals` the frame slice `map`.
+
 ### 6.5 `optimize/dse.rs`
 
 - `struct Bits(Vec<u64>)` (lines 21-42) goes; it uses `framed::Bits<'f>`.
@@ -1559,6 +1612,8 @@ pub(super) fn run_one<'db>(
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
+> applied by codegen-mir-store-opt (2026-10-29), uncompiled: as written, on `framed::Bits` (`blaze_ids::bits` over frame words, which also does `v2/requests/codegen.md`'s dedup item 2), with `exit_into` a function and one `mentions` frame `Vec` for the whole pass.
+
 ### 6.6 `optimize/copy_prop.rs`
 
 - `Ssa { assignments: Vec<Assignments>, order: Vec<LocalId>, borrowed: Vec<bool> }` (lines
@@ -1579,6 +1634,8 @@ pub(super) fn run_one<'db>(
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
+> applied by codegen-mir-store-opt (2026-10-29), uncompiled: as written, except that `check_dominates` takes `&mut [Assignments]` (a slice of the frame `Vec`) and `order` is made `with_capacity_in(count)`, since a local enters it at most once.
+
 ### 6.7 `optimize/inst_simplify.rs`
 
 - `single_use_consts(body)` (lines 238-300) becomes `single_use_consts(body, frame)`:
@@ -1589,6 +1646,8 @@ pub(super) fn run_one<'db>(
 - `lower_slice_len_calls`: in place; unchanged.
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> applied by codegen-mir-store-opt (2026-10-29), uncompiled: as written; `ineligible` is a `Bits`, the other four are frame slices, and `inst_simplify`/`lower_slice_len_calls` take an unused `frame` for the uniform `run!`.
 
 ### 6.8 `optimize/check_pointers.rs`, `optimize/check_enums.rs`
 
@@ -1604,6 +1663,8 @@ pub(super) fn run_one<'db>(
   the same treatment as `check_pointers`' `setup`.
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> applied by codegen-mir-store-opt (2026-10-29), uncompiled: as written, one frame `Setup` per pass moved in by `check_pointers::append` (`reserve_exact` then `drain`), with `check_enums`' trailing statements going through it too; beyond the text, `sites()` returns its iterator (`+ use<>`, no borrow of the body) instead of a `SmallVec` that spilled past 8 statements, and `transmute_at` borrows its operand so only `find` copies it.
 
 ## 7. The inliner (`optimize/inline.rs`, `optimize/inline/*`): not compiled yet
 
@@ -1632,6 +1693,12 @@ Budget: `Pass::Inline` joins `budget::OPTIMIZATIONS` when it is registered, and 
 (`warm_optimizations_allocate_nothing`) then covers it.
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> codegen-mir (2026-10-29): not applied yet. The inliner is still not declared (`mod inline;`)
+> because its registration waits on db's `Inlined`/`InlinedBody`/`MirOptions::inline`/
+> `MirSpan::Inlined` (`v2/requests/codegen-inline.md` 1-2). These frame moves land with it.
+> Its uses of `successors`, `map_place` and `successors_mut` already compile against
+> §6.2's helpers.
 
 ## 8. Monomorphization: `src/mir/monomorphization.rs`
 
@@ -1768,6 +1835,33 @@ its caller. Its per-call work is made allocation-free by reuse instead:
 Budget: `warm_interpreter_calls_allocate_nothing` (§10).
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> applied by codegen-mir (2026-10-29), uncompiled, in `eval.rs` and `eval/`:
+> - `type OwnedBytes = SmallVec<[u8; 16]>` holds `Owned` and `Shadowed`. Every producer builds
+>   it in place: `from_slice`, `smallvec!`, `IntValue::to_bytes` and `convert_apfloat`
+>   return it, and `with_metadata`, `construct_shadowed` and `pointer_value` build one. The
+>   `Cow` at the constant write is now a `&[u8]` with a padded local. The shims' `Location`
+>   fields and the `with_overflow` intrinsic build `OwnedBytes`. `reflection.rs`'s and
+>   `macro_call.rs`'s setup-path `Vec`s go in through `from_vec`.
+> - `exec_call` takes its argument buffer from `spare_args` and gives it back on every path
+>   (the rest runs in a closure). The error from an argument comes back as before.
+> - The `CHECKS` frame-entry walk goes over `body.locals` with `locals.ptr.get`, and
+>   `frame_start` is computed once.
+> - `interpret_mir` takes `code_stack` from `spare_code_stacks` and gives a run's stack back
+>   when it succeeds. A failing run keeps it for the error's stack, as before.
+> - `DropStep::Glue`/`Fields` take `OwnedBytes`. Drop step stacks come from `spare_drops`
+>   (`run_drop_glue`, `exec_fn_def`'s `FnOnce` frame) and go back through `keep_drops` when
+>   done (`drop_steps`, `finish_drops`), if they hold memory. `drop_glue_step` pushes its
+>   parts onto `steps` and reverses that run in place: no `parts` `Vec`, the same order. The
+>   box and enum reads borrow memory instead of copying it.
+> - The public `interpret_mir` moves `read_statics` into each round's evaluator and takes it
+>   back (the evaluator only reads it): no clone.
+> - §12 for `eval.rs`'s error, edge and setup sites: the assert messages, `MirOutput`,
+>   stdout/stderr, the formatted result, the constant's map, the layout cache's and
+>   `storage_marked`'s `Arc`s, and `Evaluator::new`'s stack and heap.
+> - The hot lint for codegen-mir's paths went from 312 to 169. Many of those left are the
+>   lint's own false positives (`smallvec![` and `Vec::new()`, `v2/requests/speed.md`). The
+>   rest are shim and call paths §9.1 doesn't list.
 
 ### 9.2 `src/mir/storage.rs`, `frame_storage_conflicts` (codegen calls it per function)
 
@@ -2073,6 +2167,10 @@ Notes:
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 > applied by codegen-mir-store (2026-10-29), uncompiled: `src/mir/budget.rs` and `#[doc(hidden)] pub mod budget;` in `mir.rs`, with `db: &'db Db`; without `lower` and `lowering_setup`, which come with §5's lowering test (step 6), as nothing names `lower::lower_body` yet. `Passes::run` calls `optimize::run_one` (codegen-mir's, §6.1).
+
+> codegen-mir (2026-10-29): `budget.rs` is as written and takes `db: &Db`. `with_passes` and
+> `Passes::run` go through `optimize::run_one` (§6.1). `lower`/`lowering_setup` are left
+> out until the lowering budget test that calls them lands (§5, after D1/D2).
 
 ### 10.2 `tests/mir/main.rs`
 

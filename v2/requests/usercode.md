@@ -2230,3 +2230,107 @@ applies to the tree as of 2026-10-29 (`git apply --check`).
 ```
 
 > applied (usercode): the diff as written (`git apply`, clean against the tree after usercode-mem's edits). `At` is gone; `trace`, `index` and `test/select` read with `blaze_format::cursor::Reader` and write with `Put`. Lint 0 in those files; manifest lint passes. Not built.
+
+> checked by lane cargo (request 6, forwarded again 2026-10-29): in place, as cargo-inbox's
+> answer says (`library/std/src/sys/env/unix.rs` `walked`, and the spawn in
+> `library/std/src/sys/process/unix/unix.rs`). Part 2 (the marker) is link's.
+
+## frontend-deps: report what each kept expansion read, for dependency images (frontend.md item 5; 2026-10-29)
+
+`hir_def::deps` (lane frontend-deps) images a dependency crate whose items come from
+proc-macro expansions only when every expansion reports what it read besides its call; on
+serve those names are worked out again and must hash the same. hir-expand gets
+`ProcMacroExpander::code`, `ExpansionReads` and `report_reads` (asked of db-expand in
+`v2/requests/db-expand.md`, same heading). This is the server's side, in your `blaze-expand`
+and `blaze-usercode`. The values hash is the one `index` already uses for a result's key,
+computed with a run key of zeros, so the call and the library are left out: they are in the
+crate's key already.
+
+1. `crates/blaze-usercode/src/index.rs`:
+   - `Found::Hit` also lends the shape it was found by:
+     `Hit { key: Key, value: &'s [u8], shape: &'s [u8] }`, set in `search` from the slot's
+     `bytes` (`return Ok(Found::Hit { key, value, shape: bytes });`). Existing matches use
+     `..`, so they are unchanged.
+   - New, after `result_key`:
+     ```rust
+     /// The run key [`values`] hashes under: no library and no call, which the image of the
+     /// calling crate keys itself (`hir_def::deps`).
+     pub const VALUES: RunKey = RunKey { code: ContentId([0; 32]), given: ContentId([0; 32]) };
+
+     /// The hash of the values the names of the shape `bytes` have as `inputs` has them now,
+     /// as [`VALUES`]`.traced` hashes a run's: equal exactly when every name has the value
+     /// it had. `None` when a directory of the shape is no longer one.
+     pub fn values<I: Inputs>(
+         bytes: &[u8],
+         inputs: &mut I,
+     ) -> Result<Option<ContentId>, FindError<I::Error>> {
+         keyed(bytes, &VALUES, inputs).map_err(|error| match error {
+             // alloc: error path
+             Keyed::NotAShape(why) => FindError::NotAShape { key: Key(ContentId([0; 32])), why },
+             Keyed::Inputs(error) => FindError::Inputs(error),
+         })
+     }
+     ```
+   - Test beside `keyed`'s: for a traced run, `values(&Shape::of(&traced).encode(), &mut same)`
+     is `Some(VALUES.traced(&traced))`, and one changed file or variable gives another.
+
+2. `crates/blaze-expand/src/lib.rs`, `impl ProcMacroExpander for Kept`:
+   ```rust
+       fn code(&self) -> Option<ContentId> {
+           self.dylib.code().ok()
+       }
+   ```
+   (An unreadable library gives `None`: its users get no image, and `kept` reports the error.)
+
+3. `crates/blaze-expand/src/lib.rs`, `Kept::kept`, report on every path that returns `Ok`
+   (`use hir_expand::proc_macro::{ExpansionReads, report_reads};`):
+   - a hit, `Lookup::Read` and `Lookup::Hashed` alike: in the `find` match, keep the hit's
+     `shape` (`Ok(Found::Hit { value, shape, .. })`) and, still under the guard, report
+     `ExpansionReads::Traced { shape: shape.into(), values }` with `values` from
+     `index::values(shape, &mut now)` (it is `Some`: the hit was found by it). For `Hashed`,
+     report it after the check passes.
+   - a miss whose expansion is kept or unspanned (`keepable` gave `Some(traced)`): report
+     `Traced { shape: index::Shape::of(&traced).encode().into(), values: index::VALUES.traced(&traced) }`
+     before `put` (and before the `Unspanned` return).
+   - `keepable` gave `None`: `report_reads(ExpansionReads::Unknown(why))`, with `why` by the
+     count it records: `Untraced` "its server did not trace it", `Asked` "it asked the
+     database", `Untraceable` "it read what can't be traced (the clock, a socket, a process)".
+   - The two `compare` paths and `expand_in` of a session macro report nothing (hir-expand
+     makes that `Unknown`).
+
+4. `crates/blaze-expand/src/lib.rs`, new public function, beside `keeping`:
+   ```rust
+   /// The hash of the values the names of `shape` (an `ExpansionReads::Traced` shape) have
+   /// now, for an expansion given the variables `env`: what `hir_def::deps` files a crate's
+   /// image by. The same hash the expansion reported when its values were these.
+   pub fn reads_now(env: &Env, shape: &[u8]) -> Result<ContentId, String> {
+       let installed = installed();
+       let mut now = Seen {
+           passed: installed.expansions.environment.passed(),
+           call: env,
+           made: None,
+           none: inputs::Env::default(),
+       };
+       match index::values(shape, &mut now) {
+           Ok(Some(values)) => Ok(values),
+           // A directory that is no longer one: no value it had is this.
+           Ok(None) => Ok(ContentId::of("blaze v2 expansion reads gone", shape)),
+           Err(FindError::NotAShape { why, .. }) => Err(format!("a shape that does not read: {why}")), // alloc: error path
+           Err(FindError::Inputs(unreadable)) => Err(format!("{unreadable}")), // alloc: error path
+           Err(FindError::Corrupt(corrupt)) => Err(format!("{corrupt:?}")), // alloc: error path
+       }
+   }
+   ```
+   (Adjust the error texts to the `Display`/`Debug` the types have.)
+
+Why: AGENTS.md's cache-key rule, and frontend.md item 5. Most of crates.io's graph uses a
+derive, so without this almost no dependency is read from an image. With it, a crate whose
+expansions read `Cargo.toml`, an `include_str!`'d file or `OUT_DIR` is served only while
+those are unchanged.
+
+Tests: `crates/hir-def/src/deps/tests.rs` drives a test expander through the same protocol.
+Here, a test in `blaze-expand` beside `puts.rs`'s: an expansion that reads a file reports
+`Traced`, `reads_now` of its shape equals the reported values, and after the file changes it
+does not.
+
+Status: open

@@ -167,12 +167,12 @@ pub type LabelId = Idx<Label>;
 // them is 24 bytes.
 #[cfg(target_pointer_width = "64")]
 const _: () = {
-    assert!(mem::size_of::<Label>() == 8);
+    assert!(mem::size_of::<Label>() == 4);
     assert!(mem::size_of::<MatchArm>() == 16);
-    assert!(mem::size_of::<RecordLitField>() == 16);
-    assert!(mem::size_of::<RecordFieldPat>() == 16);
+    assert!(mem::size_of::<RecordLitField>() == 8);
+    assert!(mem::size_of::<RecordFieldPat>() == 8);
     assert!(mem::size_of::<Statements<'static>>() == 24);
-    assert!(mem::size_of::<Binding>() == 16);
+    assert!(mem::size_of::<Binding>() == 12);
 };
 
 // We leave float values as a string to avoid double rounding.

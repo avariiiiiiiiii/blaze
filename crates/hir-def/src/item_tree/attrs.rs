@@ -44,7 +44,7 @@ impl Default for AttrsOrCfg {
 impl AttrsOrCfg {
     pub(crate) fn lower<'a, S>(
         db: &Db,
-        owner: &dyn ast::HasAttrs,
+        owner: &dyn ast::HasAttrs, // dyn: once per item, into hir-expand's collect_item_tree_attrs; a generic would copy the attribute lowering per node type
         cfg_options: &impl Fn() -> &'a CfgOptions,
         span_map: S,
     ) -> AttrsOrCfg
@@ -68,7 +68,7 @@ impl AttrsOrCfg {
 /// need), so lowering a second owner after a disabled one is never needed.
 pub(super) fn lower_attrs_into<'a, S>(
     db: &Db,
-    owner: &dyn ast::HasAttrs,
+    owner: &dyn ast::HasAttrs, // dyn: once per item, into hir-expand's collect_item_tree_attrs; a generic would copy the attribute lowering per node type
     cfg_options: &impl Fn() -> &'a CfgOptions,
     span_map: S,
     attrs: &mut Vec<Attr>,

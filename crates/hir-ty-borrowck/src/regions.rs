@@ -329,7 +329,7 @@ pub(super) fn opaque_captures<'db>(
     });
     let listed = nested.and_then(|bounds| {
         bounds.iter().find_map(|bound| match bound {
-            TypeBound::Use(args) => Some(args),
+            TypeBound::Use(args) => Some(signature.store.use_args(*args)),
             _ => None,
         })
     });
@@ -472,9 +472,9 @@ fn nth_impl_trait<'s>(
     index: &mut usize,
 ) -> Option<&'s [hir_def::hir::type_ref::TypeBound]> {
     use hir_def::hir::type_ref::{TypeBound, TypeRef};
-    let in_path = |path: &'s hir_def::expr_store::path::Path, index: &mut usize| {
+    let in_path = |path: hir_def::expr_store::path::Path<'s>, index: &mut usize| {
         for args in path.generic_args().into_iter().flatten().flatten() {
-            for arg in &args.args {
+            for arg in args.args {
                 if let hir_def::expr_store::path::GenericArg::Type(it) = arg
                     && let Some(found) = nth_impl_trait(store, *it, index)
                 {
@@ -494,7 +494,7 @@ fn nth_impl_trait<'s>(
     let in_bounds = |bounds: &'s [TypeBound], index: &mut usize| {
         bounds.iter().find_map(|bound| match bound {
             TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path) => {
-                in_path(&store[*path], index)
+                in_path(store.path(*path), index)
             }
             _ => None,
         })
@@ -4182,7 +4182,7 @@ impl<'db> Builder<'_, '_, 'db> {
     /// `Foo::<'a>::new`, that type equal to the impl's or the trait's self type.
     fn written_self(
         &mut self,
-        path: &hir_def::expr_store::path::Path,
+        path: hir_def::expr_store::path::Path<'_>,
         container: ItemContainerId,
         args: GenericArgs<'db>,
         span: MirSpan,
@@ -4395,7 +4395,7 @@ impl<'db> Builder<'_, '_, 'db> {
     fn spelled_positions(
         &self,
         expr: hir_def::hir::ExprId,
-        path: &hir_def::expr_store::path::Path,
+        path: hir_def::expr_store::path::Path<'_>,
     ) -> Option<Vec<(hir_def::type_ref::TypeRefId, usize)>> {
         use hir_def::expr_store::path::GenericArg;
         use rustc_type_ir::inherent::GenericArg as _;
@@ -4417,8 +4417,7 @@ impl<'db> Builder<'_, '_, 'db> {
             CallableDefId::EnumVariantId(_) if last || at + 2 == generic_args.len() => 0,
             _ => return None,
         };
-        let written: Vec<_> = args
-            .as_ref()?
+        let written: Vec<_> = args?
             .args
             .iter()
             .filter_map(|it| match it {
@@ -4443,7 +4442,7 @@ impl<'db> Builder<'_, '_, 'db> {
     fn spelled_projections(
         &mut self,
         expr: hir_def::hir::ExprId,
-        path: &hir_def::expr_store::path::Path,
+        path: hir_def::expr_store::path::Path<'_>,
         args: GenericArgs<'db>,
     ) {
         use rustc_type_ir::inherent::GenericArg as _;
@@ -4642,7 +4641,7 @@ impl<'db> Builder<'_, '_, 'db> {
     /// `A::<'a>::C`, lowered as `lower_written` lowers.
     fn lower_written_qualifier(
         &self,
-        path: &hir_def::expr_store::path::Path,
+        path: hir_def::expr_store::path::Path<'_>,
         span: MirSpan,
     ) -> Option<Ty<'db>> {
         let segments = path.segments();
@@ -6613,18 +6612,18 @@ fn writes_self(
         expr_store::path::{GenericArg, GenericArgs, Path},
         hir::type_ref::{TypeBound, TypeRef},
     };
-    fn args(store: &hir_def::expr_store::ExpressionStore, generic: &GenericArgs) -> bool {
+    fn args(store: &hir_def::expr_store::ExpressionStore, generic: GenericArgs<'_>) -> bool {
         generic
             .args
             .iter()
             .any(|arg| matches!(arg, GenericArg::Type(it) if writes_self(store, *it)))
             || generic.bindings.iter().any(|binding| {
                 binding.type_ref.is_some_and(|it| writes_self(store, it))
-                    || binding.args.as_ref().is_some_and(|it| args(store, it))
+                    || binding.args.is_some_and(|it| args(store, it))
                     || binding.bounds.iter().any(|it| bound(store, it))
             })
     }
-    fn path(store: &hir_def::expr_store::ExpressionStore, path: &Path) -> bool {
+    fn path(store: &hir_def::expr_store::ExpressionStore, path: Path<'_>) -> bool {
         path.is_self_type()
             || path.qualifier().is_some_and(|it| it.is_self_type())
             || path.type_anchor().is_some_and(|it| writes_self(store, it))
@@ -6658,7 +6657,7 @@ fn writes_elided(
         hir::type_ref::{LifetimeRef, LifetimeRefId, TypeBound, TypeRef},
     };
     let lifetime = |it: LifetimeRefId| matches!(store[it], LifetimeRef::Placeholder);
-    let path = |path: &Path| {
+    let path = |path: Path<'_>| {
         path.generic_args().into_iter().flatten().flatten().any(|args| {
             matches!(args.parenthesized, GenericArgsParentheses::No)
                 && args.args.iter().any(|arg| match arg {
@@ -6677,7 +6676,7 @@ fn writes_elided(
         TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
             bounds.iter().any(|bound| match bound {
                 TypeBound::Lifetime(it) => lifetime(*it),
-                TypeBound::Path(it, _) => path(&store[*it]),
+                TypeBound::Path(it, _) => path(store.path(*it)),
                 _ => false,
             })
         }
@@ -6725,7 +6724,7 @@ fn elided_lifetimes(
                 if !args.bindings.is_empty() {
                     return None;
                 }
-                for arg in &args.args {
+                for arg in args.args {
                     match arg {
                         GenericArg::Lifetime(it) => {
                             written += 1;
@@ -6771,7 +6770,7 @@ fn writes_static_object(store: &hir_def::expr_store::ExpressionStore) -> bool {
 /// annotation whose generic arguments, and an inherent impl's self type, must be well-formed.
 fn names_through_type(
     db: &Db,
-    path: &hir_def::expr_store::path::Path,
+    path: hir_def::expr_store::path::Path<'_>,
     container: ItemContainerId,
 ) -> bool {
     if path.type_anchor().is_some() {
@@ -6850,9 +6849,9 @@ pub(super) fn path_binding(
     }
 }
 
-pub(super) fn spells_generics(path: &hir_def::expr_store::path::Path) -> bool {
+pub(super) fn spells_generics(path: hir_def::expr_store::path::Path<'_>) -> bool {
     path.type_anchor().is_some()
-        || path.generic_args().is_some_and(|args| args.iter().any(Option::is_some))
+        || path.generic_args().is_some_and(|args| args.iter().any(|it| it.is_some()))
 }
 
 pub(super) fn adt_variants(

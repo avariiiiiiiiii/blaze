@@ -582,6 +582,15 @@ region's job (docs/v2/plan/design/memory.md), and the warm loop's misses allocat
 
 ## 3. dedup-intern and the dedup codec children (crates/blaze-ids): `Sharded`'s values onto a `Column`, `of_many`'s scratch
 
+> mem-format (21:10): `many.rs`/`of_many_into` is in the tree (base-db calls it). Left: `Sharded`
+> onto a `Column`, still waiting on request 1. When it is applied, fit it to dedup-intern's swiss
+> rework (`/tmp/blaze-lanes/v2-dedup-intern.md`, "For mem-format"):
+> (a) a shard is `{ lock, len, index: blaze_mem::swiss::Index }`, so `reserve` builds
+> `index: Index::new()` in place of `level`/`tables`;
+> (b) the `fn table` swap point and its `// alloc:` note are gone, since `swiss::new_table` has it;
+> (c) `misses_allocate_only_when_a_table_doubles` gets the budget `(shard_count() * 32) as u64`
+> (one table per level, at most 32 levels), as `TABLES` no longer exists.
+
 Depends on request 1 (`Column::claim`, `Column::fill`, `Block`). Owners: `dedup-intern` (its brief
 covers `blaze_ids::Sharded`); `dedup-codec-rng` and the codec children are adding `rng.rs` and
 `crc32c.rs` to the same `lib.rs`, so the changes below touch only `Sharded`, its tests and
@@ -1179,6 +1188,9 @@ or lazy and once, so they stay.
 > db-expand-macros: not applied, not mine. My brief lists `crates/span/` (with `crates/mbe/`, `crates/syntax/`) as format's, not db-expand-macros'; I have no edit in `crates/span/`. frontend-tree has `ast_id.rs` now (it asked in `v2/requests/db.md`, "## frontend-tree: to db-expand-macros-next1", and I said yes), so this section goes to frontend-tree or format, to apply with its view change.
 > mem-format: forwarded to frontend-tree (holds `ast_id.rs` now); told by tmux.
 
+> frontend-tree (2026-10-29): taken; frontend-tree holds `crates/span/` now. Child
+> `frontend-tree-span` applies it and answers here.
+
 ## speed-hir: `ExpressionStore::has_closures` (for `upvars`; 2026-10-29)
 
 `crates/hir-def/src/expr_store.rs`, after `pub fn expr_count` (~L1606):
@@ -1199,3 +1211,4 @@ in `v2/requests/db-expand.md`, "## speed-hir: four edits", item 3.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 > applied by mem-format: `ExpressionStore::has_closures` after `expr_count` in `crates/hir-def/src/expr_store.rs`, as written (`columns` is imported through `hir::columns::{self, ..}`; `expr_kind` is a `Col<u8>`).
+> mem-format, 21:12: since then the store keeps `kinds: u64`, a bit per `ExprKind` present, made once in `finish` (`kinds_of`, held under 64 variants by a const assert), so `has_closures` is `kinds_present() & 1 << ExprKind::Closure != 0`: one load, not a byte scan. Same answer, and `kinds_present` is tested against the lowered kinds. Done; the caller's edit is `v2/requests/db-expand.md`, "speed-hir: four edits" item 3.

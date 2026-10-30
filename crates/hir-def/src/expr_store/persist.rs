@@ -21,7 +21,10 @@
 
 mod source_map;
 
-use std::mem::{offset_of, size_of};
+use std::{
+    cell::RefCell,
+    mem::{offset_of, size_of},
+};
 
 use blaze_format::{
     FormatError, Part, Persist, Record, SchemaHash, Slice, Str, Writer, open_as, schema_of,
@@ -48,7 +51,7 @@ use crate::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
     expr_store::{
         Body, ExprRoot, ExpressionOnlyStore, ExpressionStore, HygieneId, MissingBodyItemKind,
-        NO_OWNER,
+        NO_OWNER, kinds_of,
         body::Param,
         path::{BindingRow, GenericArg, GenericArgsRow, Names, PathColumns, PathTag, UseArgs},
     },
@@ -114,7 +117,7 @@ blaze_format::record! {
     /// are in memory, each id a raw `u32`, the side tables in the words from `side` and
     /// `ty_side` on.
     #[derive(Clone, Copy)]
-    pub(crate) struct StoreRoot: 5 {
+    pub(crate) struct StoreRoot: 6 {
         pub(crate) expr_kind: Slice<u8>,
         pub(crate) expr_data: Slice<u32>,
         pub(crate) pat_kind: Slice<u8>,
@@ -465,20 +468,77 @@ impl Ids<'_> {
     }
 }
 
-/// Writes each value's fields and returns the column of their nodes.
+/// Writes each value's fields and appends the node of each to `nodes`.
 fn column<'v, T: 'v>(
     w: &mut Words,
     values: impl Iterator<Item = &'v T>,
     put: fn(&T, &mut Words) -> u32,
-) -> Vec<Node> {
-    values
-        .map(|value| {
-            let at = w.at();
-            let kind = put(value, w);
-            Node { kind, at }
-        })
-        // alloc: the encode's one copy of the column, once per store.
-        .collect()
+    nodes: &mut Vec<Node>,
+) {
+    nodes.extend(values.map(|value| {
+        let at = w.at();
+        let kind = put(value, w);
+        Node { kind, at }
+    }));
+}
+
+/// Writes `values`, each as `f` makes its record, as a column gathered in `buffer` (a kept
+/// one, left holding them).
+fn push_mapped<T, R: Record>(
+    out: &mut Writer,
+    buffer: &mut Vec<R>,
+    values: &[T],
+    f: impl FnMut(&T) -> R,
+) -> Column {
+    buffer.clear();
+    buffer.extend(values.iter().map(f));
+    Column::push(out, buffer)
+}
+
+/// The columns an encode gathers before it pushes them, kept per thread so that a warm encode
+/// grows none of them.
+#[derive(Default)]
+struct EncodeScratch {
+    nodes: Vec<Node>,
+    u32s: Vec<u32>,
+    u64s: Vec<u64>,
+    pairs: Vec<IdPair>,
+    arms: Vec<ArmRec>,
+    roots: Vec<ExprRootRec>,
+    fields: Vec<FieldRec>,
+    names: FieldNames,
+}
+
+thread_local! {
+    // alloc: empty, once per thread.
+    static ENCODE: RefCell<EncodeScratch> = RefCell::new(EncodeScratch::default());
+}
+
+impl EncodeScratch {
+    /// Runs `f` on this thread's scratch, taken out for the call: an encode nested in it (none
+    /// is today) gets an empty set of its own instead of a second borrow.
+    fn with<R>(f: impl FnOnce(&mut EncodeScratch) -> R) -> R {
+        let taken = ENCODE.try_with(|it| std::mem::take(&mut *it.borrow_mut()));
+        let mut scratch = taken.unwrap_or_default();
+        let result = f(&mut scratch);
+        // A thread that is ending frees it.
+        let _exiting = ENCODE.try_with(move |it| *it.borrow_mut() = scratch);
+        result
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        let EncodeScratch { nodes, u32s, u64s, pairs, arms, roots, fields, names } = self;
+        nodes.capacity()
+            + u32s.capacity()
+            + u64s.capacity()
+            + pairs.capacity()
+            + arms.capacity()
+            + roots.capacity()
+            + fields.capacity()
+            + names.text.capacity()
+            + names.by_symbol.capacity()
+    }
 }
 
 /// Reads the arena of `nodes`, the fields of each from its word.
@@ -623,6 +683,11 @@ struct FieldNames {
 }
 
 impl FieldNames {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.by_symbol.clear();
+    }
+
     fn add(&mut self, name: &Name) {
         let symbol = name.symbol();
         if self.by_symbol.contains_key(symbol) {
@@ -635,29 +700,27 @@ impl FieldNames {
         self.by_symbol.insert(*symbol, (start, len));
     }
 
-    /// Writes `fields`, each a name and an id, as a column of [`FieldRec`]s, their names in
-    /// this text, which was written at `text_at`.
+    /// Writes `fields`, each a name and an id, as a column of [`FieldRec`]s gathered in
+    /// `records` (a kept buffer), their names in this text, which was written at `text_at`.
     fn column<'f>(
         &self,
         out: &mut Writer,
         text_at: u64,
         fields: impl Iterator<Item = (&'f Name, u32)>,
+        records: &mut Vec<FieldRec>,
     ) -> Column {
         let at = out.next::<FieldRec>();
-        let records: Vec<FieldRec> = (fields.enumerate())
-            .map(|(index, (name, id))| {
-                let (start, len) = self.by_symbol[name.symbol()];
-                let field_at =
-                    at + (index * size_of::<FieldRec>() + offset_of!(FieldRec, name)) as u64;
-                let name = match len {
-                    0 => Str::EMPTY,
-                    len => Str::between(field_at, text_at + u64::from(start), len as usize),
-                };
-                FieldRec { name, id }
-            })
-            // alloc: the encode's one copy of the column, once per store.
-            .collect();
-        let column = Column::push(out, &records);
+        records.clear();
+        records.extend((fields.enumerate()).map(|(index, (name, id))| {
+            let (start, len) = self.by_symbol[name.symbol()];
+            let field_at = at + (index * size_of::<FieldRec>() + offset_of!(FieldRec, name)) as u64;
+            let name = match len {
+                0 => Str::EMPTY,
+                len => Str::between(field_at, text_at + u64::from(start), len as usize),
+            };
+            FieldRec { name, id }
+        }));
+        let column = Column::push(out, records);
         debug_assert_eq!(column.at, at, "`Writer::next` is not where `push_slice` writes");
         column
     }
@@ -728,22 +791,37 @@ struct StoreColumns {
 
 impl StoreColumns {
     fn write(store: &ExpressionStore, out: &mut Writer) -> StoreColumns {
+        EncodeScratch::with(|scratch| Self::write_in(store, out, scratch))
+    }
+
+    /// [`Self::write`]: each column gathered in `scratch` and pushed in turn, in the order of
+    /// the buffer (the words, the field names and field columns, then the rest in field order).
+    fn write_in(
+        store: &ExpressionStore,
+        out: &mut Writer,
+        scratch: &mut EncodeScratch,
+    ) -> StoreColumns {
         let ExpressionStore { expr_only, types, lifetimes, type_hygiene } = store;
         let expr_only = expr_only.as_deref();
         let hir = expr_only.map(|it| &it.columns);
+        let EncodeScratch { nodes, u32s, u64s, pairs, arms: arm_recs, roots, fields, names } =
+            scratch;
         let mut w = Words::new();
         let side = SideTables::put(&mut w, hir);
         let ty_side = TypeSide::put(&mut w, types);
-        let bindings =
-            column(&mut w, expr_only.into_iter().flat_map(|it| it.bindings.values()), put_binding);
-        let labels =
-            column(&mut w, expr_only.into_iter().flat_map(|it| it.labels.values()), put_label);
-        let lifetimes = column(&mut w, lifetimes.values(), put_lifetime);
+        nodes.clear();
+        let bindings = expr_only.into_iter().flat_map(|it| it.bindings.values());
+        column(&mut w, bindings, put_binding, nodes);
+        let bindings_end = nodes.len();
+        let labels = expr_only.into_iter().flat_map(|it| it.labels.values());
+        column(&mut w, labels, put_label, nodes);
+        let labels_end = nodes.len();
+        column(&mut w, lifetimes.values(), put_lifetime, nodes);
         let words = w.place(out);
 
         let (record_fields, field_pats) =
             (slice(hir, |c| &c.record_fields[..]), slice(hir, |c| &c.field_pats[..]));
-        let mut names = FieldNames::default();
+        names.clear();
         record_fields.iter().for_each(|field| names.add(&field.name));
         field_pats.iter().for_each(|field| names.add(&field.name));
         let text_at = out.push_str(&names.text);
@@ -751,107 +829,108 @@ impl StoreColumns {
             out,
             text_at,
             record_fields.iter().map(|field| (&field.name, raw(field.expr))),
+            fields,
         );
-        let field_pats =
-            names.column(out, text_at, field_pats.iter().map(|field| (&field.name, raw(field.pat))));
-        let arms: Vec<ArmRec> = (slice(hir, |c| &c.arms[..]).iter())
-            .map(|arm| ArmRec { pat: raw(arm.pat), guard: opt_raw(arm.guard), expr: raw(arm.expr) })
-            // `Writer` takes slices, and pushing each column as it is made would reorder the buffer.
-            // alloc: the encode's one copy of each column, once per store.
-            .collect();
-        let expr_lists: Vec<u32> =
-            // alloc: the encode's one copy of the column, once per store.
-            slice(hir, |c| &c.expr_lists[..]).iter().map(|&expr| raw(expr)).collect();
-        let pat_lists: Vec<u32> =
-            // alloc: the encode's one copy of the column, once per store.
-            slice(hir, |c| &c.pat_lists[..]).iter().map(|&pat| raw(pat)).collect();
-        let type_lists: Vec<u32> =
-            // alloc: the encode's one copy of the column, once per store.
-            slice(hir, |c| &c.type_lists[..]).iter().map(|&ty| opt_raw(ty)).collect();
-        // alloc: the encode's one copy of the column, once per store.
-        let ty_lists: Vec<u32> = types.lists.iter().map(|&ty| raw(ty)).collect();
+        let field_pats = names.column(
+            out,
+            text_at,
+            field_pats.iter().map(|field| (&field.name, raw(field.pat))),
+            fields,
+        );
 
-        // alloc: empty unless the store has expressions; then each is the column's one copy.
-        let (mut binding_owners, mut block_scopes, mut ident_hygiene) = (vec![], vec![], vec![]);
-        // alloc: empty unless the store has expressions; then each is the column's one copy.
-        let (mut block_editions, mut overflow_inheriting, mut expr_roots) = (vec![], vec![], vec![]);
-        if let Some(it) = expr_only {
-            let ExpressionOnlyStore {
-                columns: _,
-                bindings: _,
-                labels: _,
-                binding_owners: owners,
-                block_scopes: blocks,
-                ident_hygiene: hygiene,
-                block_editions: editions,
-                overflow_inheriting: inheriting,
-                expr_roots: roots,
-            } = it;
-            // alloc: the encode's one copy of the column, once per store.
-            binding_owners = owners.to_vec();
-            // alloc: the encode's one copy of the column, once per store.
-            block_scopes = blocks.iter().map(|&block| bits(block)).collect();
-            ident_hygiene = (hygiene.iter())
-                .map(|&(id, hygiene)| IdPair { a: packed_bits(id), b: hygiene_bits(hygiene) })
-                // alloc: the encode's one copy of the column, once per store.
-                .collect();
-            block_editions = (editions.iter())
-                .map(|&(block, edition)| IdPair { a: raw(block), b: edition as u32 })
-                // alloc: the encode's one copy of the column, once per store.
-                .collect();
-            // alloc: the encode's one copy of the column, once per store.
-            overflow_inheriting = inheriting.iter().map(|&closure| raw(closure)).collect();
-            expr_roots = (roots.iter())
-                .map(|root| ExprRootRec {
-                    root: raw(root.root),
-                    exprs_end: raw(root.exprs_end),
-                    pats_end: raw(root.pats_end),
-                    bindings_end: raw(root.bindings_end),
-                })
-                // alloc: the encode's one copy of the column, once per store.
-                .collect();
-        }
-        let type_hygiene_pairs: Vec<IdPair> = (type_hygiene.iter().flat_map(|it| it.iter()))
-            .map(|&(ty, hygiene)| IdPair { a: raw(ty), b: hygiene_bits(hygiene) })
-            // alloc: the encode's one copy of the column, once per store.
-            .collect();
+        let expr_kind = Column::push(out, slice(hir, |c| &c.expr_kind[..]));
+        let expr_data = Column::push(out, slice(hir, |c| &c.expr_data[..]));
+        let pat_kind = Column::push(out, slice(hir, |c| &c.pat_kind[..]));
+        let pat_data = Column::push(out, slice(hir, |c| &c.pat_data[..]));
+        let extra = Column::push(out, slice(hir, |c| &c.extra[..]));
+        let expr_lists = push_mapped(out, u32s, slice(hir, |c| &c.expr_lists[..]), |&e| raw(e));
+        let pat_lists = push_mapped(out, u32s, slice(hir, |c| &c.pat_lists[..]), |&p| raw(p));
+        let stmt_kind = Column::push(out, slice(hir, |c| &c.stmt_kind[..]));
+        let stmt_data = Column::push(out, slice(hir, |c| &c.stmt_data[..]));
+        let arms = push_mapped(out, arm_recs, slice(hir, |c| &c.arms[..]), |arm| ArmRec {
+            pat: raw(arm.pat),
+            guard: opt_raw(arm.guard),
+            expr: raw(arm.expr),
+        });
+        let type_lists =
+            push_mapped(out, u32s, slice(hir, |c| &c.type_lists[..]), |&ty| opt_raw(ty));
+        let bindings = Column::push(out, &nodes[..bindings_end]);
+        let labels = Column::push(out, &nodes[bindings_end..labels_end]);
+        let ty_kind = Column::push(out, &types.kind[..]);
+        let ty_data = Column::push(out, &types.data[..]);
+        let ty_extra = Column::push(out, &types.extra[..]);
+        let ty_lists = push_mapped(out, u32s, &types.lists[..], |&ty| raw(ty));
+        let path_kind = Column::push(out, &types.paths.kind[..]);
+        let path_data = Column::push(out, &types.paths.data[..]);
+        let path_extra = Column::push(out, &types.paths.extra[..]);
+        let path_slots = Column::push(out, &types.paths.slots[..]);
+        let lifetimes = Column::push(out, &nodes[labels_end..]);
+        let owners = expr_only.map_or(&[][..], |it| &*it.binding_owners);
+        let binding_owners = Column::push(out, owners);
+        let blocks = expr_only.map_or(&[][..], |it| &*it.block_scopes);
+        let block_scopes = push_mapped(out, u64s, blocks, |&block| bits(block));
+        let hygiene = expr_only.map_or(&[][..], |it| &*it.ident_hygiene);
+        let ident_hygiene = push_mapped(out, pairs, hygiene, |&(id, hygiene)| IdPair {
+            a: packed_bits(id),
+            b: hygiene_bits(hygiene),
+        });
+        let editions = expr_only.map_or(&[][..], |it| &*it.block_editions);
+        let block_editions = push_mapped(out, pairs, editions, |&(block, edition)| IdPair {
+            a: raw(block),
+            b: edition as u32,
+        });
+        let inheriting = expr_only.map_or(&[][..], |it| &*it.overflow_inheriting);
+        let overflow_inheriting = push_mapped(out, u32s, inheriting, |&closure| raw(closure));
+        let expr_roots = expr_only.map_or(&[][..], |it| &it.expr_roots[..]);
+        let expr_roots = push_mapped(out, roots, expr_roots, |root| ExprRootRec {
+            root: raw(root.root),
+            exprs_end: raw(root.exprs_end),
+            pats_end: raw(root.pats_end),
+            bindings_end: raw(root.bindings_end),
+        });
+        let type_hygiene_pairs = type_hygiene.as_deref().unwrap_or(&[]);
+        let type_hygiene_column =
+            push_mapped(out, pairs, type_hygiene_pairs, |&(ty, hygiene)| IdPair {
+                a: raw(ty),
+                b: hygiene_bits(hygiene),
+            });
         let flags = (if expr_only.is_some() { HAS_EXPRS } else { 0 })
             | (if type_hygiene.is_some() { HAS_TYPE_HYGIENE } else { 0 });
         StoreColumns {
             words,
             side,
             ty_side,
-            expr_kind: Column::push(out, slice(hir, |c| &c.expr_kind[..])),
-            expr_data: Column::push(out, slice(hir, |c| &c.expr_data[..])),
-            pat_kind: Column::push(out, slice(hir, |c| &c.pat_kind[..])),
-            pat_data: Column::push(out, slice(hir, |c| &c.pat_data[..])),
-            extra: Column::push(out, slice(hir, |c| &c.extra[..])),
-            expr_lists: Column::push(out, &expr_lists),
-            pat_lists: Column::push(out, &pat_lists),
-            stmt_kind: Column::push(out, slice(hir, |c| &c.stmt_kind[..])),
-            stmt_data: Column::push(out, slice(hir, |c| &c.stmt_data[..])),
-            arms: Column::push(out, &arms),
+            expr_kind,
+            expr_data,
+            pat_kind,
+            pat_data,
+            extra,
+            expr_lists,
+            pat_lists,
+            stmt_kind,
+            stmt_data,
+            arms,
             record_fields,
             field_pats,
-            type_lists: Column::push(out, &type_lists),
-            bindings: Column::push(out, &bindings),
-            labels: Column::push(out, &labels),
-            ty_kind: Column::push(out, &types.kind[..]),
-            ty_data: Column::push(out, &types.data[..]),
-            ty_extra: Column::push(out, &types.extra[..]),
-            ty_lists: Column::push(out, &ty_lists),
-            path_kind: Column::push(out, &types.paths.kind[..]),
-            path_data: Column::push(out, &types.paths.data[..]),
-            path_extra: Column::push(out, &types.paths.extra[..]),
-            path_slots: Column::push(out, &types.paths.slots[..]),
-            lifetimes: Column::push(out, &lifetimes),
-            binding_owners: Column::push(out, &binding_owners),
-            block_scopes: Column::push(out, &block_scopes),
-            ident_hygiene: Column::push(out, &ident_hygiene),
-            block_editions: Column::push(out, &block_editions),
-            overflow_inheriting: Column::push(out, &overflow_inheriting),
-            expr_roots: Column::push(out, &expr_roots),
-            type_hygiene: Column::push(out, &type_hygiene_pairs),
+            type_lists,
+            bindings,
+            labels,
+            ty_kind,
+            ty_data,
+            ty_extra,
+            ty_lists,
+            path_kind,
+            path_data,
+            path_extra,
+            path_slots,
+            lifetimes,
+            binding_owners,
+            block_scopes,
+            ident_hygiene,
+            block_editions,
+            overflow_inheriting,
+            expr_roots,
+            type_hygiene: type_hygiene_column,
             flags,
         }
     }
@@ -1317,6 +1396,7 @@ impl<'a> ExpressionStoreRef<'a> {
             false => None,
             // alloc: once per decoded store, as `finish` boxes it.
             true => Some(Box::new(ExpressionOnlyStore {
+                kinds: kinds_of(&columns.expr_kind),
                 columns,
                 bindings,
                 labels,
@@ -1443,9 +1523,8 @@ impl Persist for Body {
     fn write(&self, out: &mut Writer) -> u64 {
         let Body { store, params, self_param } = self;
         let columns = StoreColumns::write(store, out);
-        // alloc: the encode's one copy of the column, once per body.
-        let params: Vec<IdPair> = params.iter().map(param_pair).collect();
-        let params = Column::push(out, &params);
+        let params =
+            EncodeScratch::with(|scratch| push_mapped(out, &mut scratch.pairs, params, param_pair));
         let self_param = self_param.as_ref().map(param_pair);
         let self_param = Column::push(out, self_param.as_slice());
         let at = out.next::<BodyRoot>();
@@ -2798,5 +2877,61 @@ fn f() -> u32 {
         let past = with_word(&bytes, data_at, store.types.paths.mod_paths.len() as u32);
         let past = ExpressionStore::read(&past).expect("only a path's data word changed");
         assert!(past.decode().is_err(), "a bare path's mod path past its table");
+    }
+
+    /// Names are in the buffer as their text, which every process reads the same, and not as
+    /// this process's symbol ids: dependency signature images carry this encoding and are
+    /// shared between daemons that number their symbols each their own way.
+    #[test]
+    fn names_are_written_as_text() {
+        let (db, defs) = bodies(EVERY_KIND);
+        let body = Body::of(&db, defs[0]);
+        let bytes = blaze_format::to_bytes(&*body);
+        let mut names = Vec::new();
+        for (_, expr) in body.store.exprs() {
+            match expr {
+                Expr::MethodCall { method_name, .. } => names.push(method_name),
+                Expr::RecordLit { fields, .. } => names.extend(fields.iter().map(|it| it.name)),
+                _ => {}
+            }
+        }
+        // A text of a byte or two could be in the buffer by chance.
+        let long: Vec<&str> =
+            names.iter().map(|name| name.symbol().as_str()).filter(|it| it.len() >= 3).collect();
+        assert!(!long.is_empty(), "the fixture calls a method of a long name");
+        for text in long {
+            let text = text.as_bytes();
+            assert!(bytes.windows(text.len()).any(|it| it == text), "{text:?} written as text");
+        }
+    }
+
+    /// An encode on warm per-thread scratch writes the same bytes as on cold and grows none of
+    /// the scratch's buffers, so into an output that has the room it allocates only what
+    /// [`Words`] does, which a fresh `Words` does on every encode.
+    #[test]
+    fn a_warm_encode_reuses_its_scratch() {
+        let (db, defs) = bodies(EVERY_KIND);
+        let body = Body::of(&db, defs[0]);
+        let reference = blaze_format::to_bytes(&*body);
+        let room = || {
+            Writer::with_buffer(<Body as Persist>::SCHEMA, Vec::with_capacity(2 * reference.len()))
+        };
+        ENCODE.with(|it| *it.borrow_mut() = EncodeScratch::default());
+        let mut out = room();
+        let (root, cold) = blaze_alloc_count::measure(|| body.write(&mut out));
+        assert_eq!(out.finish(root), reference, "the same bytes on fresh scratch");
+        let held = ENCODE.with(|it| it.borrow().capacity());
+        assert_ne!(held, 0, "the encode kept its buffers");
+
+        let mut out = room();
+        let (root, warm) = blaze_alloc_count::measure(|| body.write(&mut out));
+        assert_eq!(out.finish(root), reference, "the same bytes on reused scratch");
+        assert_eq!(ENCODE.with(|it| it.borrow().capacity()), held, "a buffer grew on a warm encode");
+        assert!(
+            warm.allocations < cold.allocations,
+            "a warm encode allocated {} times, a cold one {}",
+            warm.allocations,
+            cold.allocations
+        );
     }
 }

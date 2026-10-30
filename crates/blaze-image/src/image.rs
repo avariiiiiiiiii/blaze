@@ -51,9 +51,9 @@ unsafe impl Stable for blaze_format::Aligned {
 }
 
 // SAFETY: a `Mapping` is what `Effect::Map` made (a read-only mmap of a file the store or the
-// daemon only ever replaces by renaming another over it, never writes in place) or owned bytes
-// in an `Arc` with no way to write them; its contract (blaze-core's `Mapping`) is that its
-// bytes stay as they are while any clone lives, and `as_ref` of either returns one slice.
+// daemon only ever replaces by renaming another over it, never writes in place) or bytes
+// copied into an `Arc` with no way to write them; its contract (blaze-core's `Mapping`) is that
+// its bytes stay as they are while any clone lives, and `bytes` of either returns one slice.
 // The daemon, the db and the VFS all open the mapped image as `Image<Mapping>`, and a section
 // they keep is `(image.owner().clone(), image.whole_range(&section)?)`.
 unsafe impl Stable for blaze_core::Mapping {

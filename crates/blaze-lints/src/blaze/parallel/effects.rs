@@ -866,6 +866,13 @@ fn drop_effects<'db>(
     }
 }
 
+/// What dropping a value of `ty` does.
+pub(crate) fn drop_summary<'db>(db: &'db Db, env: ParamEnvAndCrate<'db>, ty: Ty<'db>) -> Effects {
+    let mut out = Effects::NONE;
+    drop_effects(db, env, ty, &mut out, 0);
+    out
+}
+
 pub(crate) fn infer_ctxt(db: &Db, krate: base_db::Crate) -> InferCtxt<'_> {
     DbInterner::new_with(db, krate).with_regions().infer_ctxt().build(TypingMode::non_body_analysis())
 }

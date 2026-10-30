@@ -354,6 +354,19 @@ fn a_bad_leb_names_its_byte() {
     assert_eq!(read.uleb().unwrap_err().as_str(), LebError::Overflow.as_str());
 }
 
+/// `blaze-link`'s Mach-O dylib reader's `uleb_limits`: the largest value reads back, and a 10th
+/// byte past bit 63 is refused.
+#[test]
+fn uleb_limits() {
+    let mut max = Vec::new();
+    max.put_uleb(u64::MAX);
+    let mut read = Reader::new(&max);
+    assert_eq!(read.uleb(), Ok(u64::MAX));
+    assert!(read.is_done());
+    let over = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+    assert_eq!(Reader::new(&over).uleb(), Err(Error { at: 0, wanted: Wanted::Leb(LebError::Overflow) }));
+}
+
 #[test]
 fn patches_write_over_what_was_written() {
     let mut out = Vec::new();
@@ -364,6 +377,21 @@ fn patches_write_over_what_was_written() {
     let mut read = Reader::new(&out);
     assert_eq!(read.u32(), Ok(0xdead_beef));
     assert_eq!(read.u64(), Ok(7));
+}
+
+/// `blaze-link`'s three `align`s (Mach-O, ELF, PE writers), which this replaced.
+#[test]
+fn padding_reaches_the_next_multiple() {
+    let mut out = vec![1u8; 5];
+    out.pad_to(8);
+    assert_eq!(out, [1, 1, 1, 1, 1, 0, 0, 0]);
+    out.pad_to(8);
+    assert_eq!(out.len(), 8, "already a multiple: nothing added");
+    out.pad_to(1);
+    assert_eq!(out.len(), 8);
+    let mut empty = Vec::<u8>::new();
+    empty.pad_to(16);
+    assert!(empty.is_empty());
 }
 
 #[test]

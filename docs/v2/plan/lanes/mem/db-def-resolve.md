@@ -82,6 +82,15 @@ for a view that lets them live in the collector's frame. R10 is that view:
   `ModuleScope`. `DefMap` keeps only collected ids, so the `Building` arms of `ModulesSlot` and
   `ScopeSlot` go.
 
+mem-db-def's ruling (`db-def.md`, "Ruling: the scopes a collection builds live in its frame")
+takes this full fix rather than a reservation. Its tmux wording, `ItemScope<A: Allocator>` with
+`Vec<T, A>` lists and `DefMap<A>`, maps onto R10's names (request R10.6). An allocator parameter
+alone cannot keep the memo's 8-byte `ThinVec`s, which a `Vec<T, Global>` would make about 350
+bytes larger per module. Nor can it select the settled scope's exact tables, or a collected
+module's `ModuleScope` id in place of an inline scope. `ScopeStore` is the allocator plus those
+choices. mem-db-def-collect's Part H is written against these names, and it moves the cold path
+onto the facts driver, since `collector.rs` is now the `#[cfg(test)]` reference.
+
 Growth in the frame makes no global allocation: the frame grows in place in memory it reserved
 up front. A cold `crate_local_def_map` therefore makes one global allocation per non-empty table
 of its result, plus salsa's own, and none per name. T5 asserts that the count is identical for

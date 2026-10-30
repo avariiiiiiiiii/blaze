@@ -670,7 +670,7 @@ fn a_driver_may_hand_over_mappings_by_itself() {
     for effect in maps {
         let Effect::Map { file, .. } = effect else { unreachable!() };
         let bytes = sim.contents(&file);
-        store.mapped(file, Mapping(std::sync::Arc::new(bytes)));
+        store.mapped(file, Mapping::copy(&bytes));
     }
     assert!(store.ready(), "{:?}", store.broken());
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"mapped");

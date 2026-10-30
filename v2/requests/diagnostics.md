@@ -1709,6 +1709,7 @@ method/probe.rs`, `emit_unstable_name_collision_hint`) is reported from exactly 
 only hir-ty's probe has it. Until it is there blaze doesn't give this warning where rustc does.
 
 > forwarded to db: `Semantics` (`crates/hir`) is lane db's. The probe's half (`method_resolution/probe.rs`, items' with lane items DONE) db writes in the same change: `pick_core` keeps the set-aside candidates and the method result carries them out.
+> applied by db-ty-d-infer2: `Pick::unstable_candidates` as rustc's (collected in the stable-only pass only, after the collapse to a trait pick; not by the private or shadowing searches), recorded per method call and type-relative path as `InferenceResult::unstable_candidates(ExprOrPatId) -> &[(CandidateId, Symbol)]` (persisted). The hir API is `Semantics::unstable_candidates(Either<ast::Expr, ast::Pat>) -> Vec<(hir::AssocItem, Symbol)>` (an `AssocItem`, as a path can pass over a const; the method call is its `ast::Expr`). The lowering is requested in `v2/requests/db-ty.md` `## db-ty-d-infer2` item 8.
 
 ## diagnostics-lints-syntax-attrs-doc: attributes on a struct expression (format, `crates/syntax/rust.ungram`)
 
@@ -2025,6 +2026,7 @@ warn there; `ShadowedIntoIter` is a different lint and sees `MyIntoIter::into_it
 in `tests/lints/bodies/calls/desugar.rs` is `#[ignore]`d until this lands.
 
 > forwarded to db (inference and `hir`; `method_resolution.rs` is items' file, held now by speed-types-probe, which db asks for the pick).
+> applied by db-ty-d-infer2: `hir::EditionDependentMethodCall { call_expr, receiver, lint: EditionLint, method, inherent, autoderefs, autoref: Option<ReceiverAdjustment> }` and `hir::FullyQualifiedCallFrom2018<'db> { expr_or_pat, item: AssocItem, self_ty }`, pushed by `crates/hir-ty/src/infer/prelude_lints.rs` (a port of both rustc functions: the std/core/alloc/proc_macro skip, the inherent `&*` and by-value skips, `from_iter` only where `FromIterator` may hold). They do not taint the body. The crate's edition stands for the span's; rustc's `ReborrowPin` adjustment has no blaze counterpart. The lowering and un-ignoring the test are requested in `v2/requests/db-ty.md` `## db-ty-d-infer2` item 8.
 
 ## diagnostics-lints-bodies-calls-desugar: the UI harness's `std` ignores its `#[lang]` items (crates/blaze-diagnostics `tests/lints/bodies/calls.rs`, `tests/lints/bodies/calls/items.rs`)
 
@@ -4132,3 +4134,4 @@ in HIR carries its `Res` and `TypeckResults` holds the rest. Together with impor
 (`used_imports`), it takes the names passes to their bound.
 
 > dedyn-diag, 2026-10-29 (later): superseded and applied by dedyn-diag: `Files` is now a concrete struct and `emit::Sources` holds no reader (the caller reads `Sources::unread` into `Sources::add`); no `// dyn:` keep remains in check.rs or emit.rs. See /tmp/blaze-lanes/v2-dedyn-diag.md.
+> forwarded to db (db-next2, window 158: `crates/hir` semantics) (requests, pass 20; told by tmux).

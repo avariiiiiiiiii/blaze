@@ -66,6 +66,8 @@ blaze-metadata.workspace = true
 blaze-new.workspace = true
 blaze-expand.workspace = true
 blaze-graph.workspace = true
+blaze-history.workspace = true
+blaze-image.workspace = true
 blaze-mem.workspace = true
 blaze-protocol.workspace = true
 proc-macro-api.workspace = true
@@ -135,6 +137,7 @@ blaze-core.workspace = true
 blaze-vfs.workspace = true
 blaze-query.workspace = true
 blaze-cas.workspace = true
+blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-usercode.workspace = true
 blaze-codegen.workspace = true
@@ -148,6 +151,8 @@ libc.workspace = true
 tikv-jemalloc-ctl = "0.5.4"
 tikv-jemalloc-sys = "0.5.4"
 
+[build-dependencies]
+blaze-sha256.workspace = true
 
 [dev-dependencies]
 # The in-process fake of the cache gateway that `remote/gateway/tests.rs` talks to.

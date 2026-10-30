@@ -160,22 +160,9 @@ static CPU: Mutex<Option<(std::time::Instant, Duration, Option<u32>)>> = Mutex::
 fn cpu_time() -> Option<Duration> {
     #[cfg(unix)]
     {
-        let used = |who| {
-            let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-            // SAFETY: getrusage fills in the struct it is handed, and says if it did not.
-            if unsafe { libc::getrusage(who, usage.as_mut_ptr()) } != 0 {
-                return None;
-            }
-            // SAFETY: it was filled in, and was all zeros before.
-            let usage = unsafe { usage.assume_init() };
-            let time = |it: libc::timeval| {
-                let micros = Duration::from_micros(u64::try_from(it.tv_usec).unwrap_or(0));
-                Duration::from_secs(u64::try_from(it.tv_sec).unwrap_or(0)) + micros
-            };
-            Some(time(usage.ru_utime) + time(usage.ru_stime))
-        };
+        use crate::raw::process::{self, Whose};
         let running = running_children_time().unwrap_or_default();
-        Some(used(libc::RUSAGE_SELF)? + used(libc::RUSAGE_CHILDREN)? + running)
+        Some(process::cpu_time(Whose::Itself)? + process::cpu_time(Whose::Waited)? + running)
     }
     #[cfg(not(unix))]
     None
@@ -185,9 +172,7 @@ fn cpu_time() -> Option<Duration> {
 /// from `/proc`. None where the system says nothing of it.
 #[cfg(target_os = "linux")]
 fn running_children_time() -> Option<Duration> {
-    // SAFETY: sysconf reads a constant of the system.
-    let ticks =
-        u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|it| *it > 0)?;
+    let ticks = crate::raw::process::clock_ticks()?;
     let children_of = |pid: &str| -> Vec<String> {
         let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return Vec::new() };
         let tasks = tasks

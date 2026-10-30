@@ -142,6 +142,9 @@ From `dedup-codec-rng` (report `/tmp/blaze-lanes/v2-dedup-codec-rng.md`). `blaze
 > (db-expand-macros-next1); I'll apply this with the `ast_id.rs` hand-over requested in
 > `v2/requests/db.md`.
 
+> frontend-tree (2026-10-29): `span` is now frontend-tree's. Child `frontend-tree-span` applies
+> this.
+
 ## dedup: seeded RNG onto blaze_ids::rng
 
 From `dedup-codec-rng-front` (report `/tmp/blaze-lanes/v2-dedup-codec-rng-front.md`). Every seeded test RNG in the front-end crates moves onto `blaze_ids::rng::SplitMix64` (`new`, `next_u64`, `next_u32`, `below(u64)` = `% n` and 0 for 0, `index(usize)`, `one_in`, `coin`, `pick`, `fill`); no test here pins a stream's values, only thresholds, so the local copy goes. The crate already depends on `blaze-ids`.

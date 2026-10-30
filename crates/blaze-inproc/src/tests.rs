@@ -793,7 +793,7 @@ mod linux {
         assert_eq!(unsafe { std::slice::from_raw_parts(code as *const u8, 6) }, &returning(7)[..6]);
 
         let control = granted[1].map_anywhere(&mut hook, Access::Shared).unwrap();
-        let words = sys::adopt_words(control, granted[1].len()).unwrap();
+        let words = sys::adopt_words(control, granted[1].len(), crate::fence::CONTROL_BYTES).unwrap();
         assert!(crate::fence::Thread::ready(&words));
         assert_eq!(crate::fence::Thread::epoch(&words), memory.fences.epoch());
         memory.announce(41);
@@ -913,8 +913,9 @@ mod linux {
         }
 
         /// Plays the start hook of `command` in this process: hello at a slid header, the
-        /// grant checked against the image's own layout, the control words mapped, STARTED.
-        fn play_hook(command: &Command, own: &Layout, slide: u64) -> (Channel, Grant) {
+        /// grant checked against the image's own layout, the control words and the asks
+        /// mapped, STARTED.
+        fn play_hook(command: &Command, own: &Layout, slide: u64) -> (Channel, Grant, &'static [std::sync::atomic::AtomicU64]) {
             let var = command.env.iter().find(|(name, _)| name == HOST_VAR).unwrap().1.to_str().unwrap().to_owned();
             let (address, token) = host_var(var.as_bytes()).unwrap();
             let mut channel = Channel::new(sys::connect(address).unwrap());
@@ -929,11 +930,15 @@ mod linux {
             grant.check(own, sys::page()).unwrap();
             let granted = sys::recv_objects(&mut channel, grant.objects.len()).unwrap();
             let control = granted[1].map_anywhere(&mut channel, Access::Shared).unwrap();
-            assert!(crate::fence::Thread::ready(&sys::adopt_words(control, granted[1].len()).unwrap()));
+            let control = sys::adopt_words(control, granted[1].len(), crate::fence::CONTROL_BYTES).unwrap();
+            assert!(crate::fence::Thread::ready(&control));
+            let asks = granted[2].map_anywhere(&mut channel, Access::Shared).unwrap();
+            let asks = sys::adopt_words(asks, granted[2].len(), crate::ask::BYTES).unwrap();
+            assert!(crate::ask::ready(&asks));
             let mut started = Vec::new();
             Writer::new(&mut started).u64(sys::thread_id());
             channel.send(kinds::STARTED, 0, &started).unwrap();
-            (channel, grant)
+            (channel, grant, asks)
         }
 
         #[test]
@@ -966,15 +971,30 @@ mod linux {
 
             let slide = 0x5555_0000_0000;
             let own = memory.layout().unwrap().clone();
-            let (_channel, grant) = play_hook(&command, &own, slide);
-            assert_eq!(grant.objects.iter().map(|it| it.1).collect::<Vec<_>>(), [Rights::Code, Rights::Words, Rights::Words]);
+            let (mut channel, grant, asks) = play_hook(&command, &own, slide);
+            assert_eq!(
+                grant.objects.iter().map(|it| it.1).collect::<Vec<_>>(),
+                [Rights::Code, Rights::Words, Rights::Words, Rights::Words]
+            );
             assert_eq!(grant.overlays, [
                 Overlay { object: 0, offset: page, len: page, at: page, access: Access::Execute, place: Place::Code },
                 Overlay { object: 0, offset: 2 * page, len: page, at: 4 * page, access: Access::Execute, place: Place::Reserved },
-                Overlay { object: 2, offset: 0, len: page, at: 6 * page, access: Access::Shared, place: Place::Reserved },
+                Overlay { object: 3, offset: 0, len: page, at: 6 * page, access: Access::Shared, place: Place::Reserved },
             ]);
             let session = pending.wait(Duration::from_secs(10)).unwrap();
             assert_eq!((session.pid, session.slide, session.thread), (std::process::id(), slide, sys::thread_id()));
+            assert_eq!(session.killed(), None);
+            let (mut reader, sender) = session.split();
+            assert_eq!(sender.pid(), std::process::id());
+            let answering = std::thread::spawn(move || {
+                let frame = reader.recv().unwrap();
+                assert_eq!((frame.kind, frame.body), (Kind(0x300), &b"ask"[..]));
+                sender.send(Kind(0x301), frame.seq, b"answer").unwrap();
+            });
+            let mut answer = [0u8; 16];
+            let asked = crate::ask::request(&asks, channel.stream(), Kind(0x300), b"ask", &mut answer).unwrap();
+            assert_eq!((asked, &answer[..6]), ((Kind(0x301), 6), &b"answer"[..]));
+            answering.join().unwrap();
 
             let (stale, wrong) = host.launch(&launch).unwrap();
             let var = stale.env.iter().find(|(name, _)| name == HOST_VAR).unwrap().1.to_str().unwrap().to_owned();

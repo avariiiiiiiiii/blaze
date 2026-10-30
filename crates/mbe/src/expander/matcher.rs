@@ -62,16 +62,17 @@
 //! The data, for speed. A rule's pattern is flattened once, when the macro is defined, into a
 //! [`Matcher`] (rustc's `MatcherLoc`): the dot of a position is an index into its `locs`, so
 //! descending into a group or a repetition pushes no frame. A position ([`Pos`]) is 24 bytes,
-//! `Copy`, kept in buffers of the [`Arena`] reused for every step and every rule of a call. Its
-//! bindings are cons cells in the arena, never changed once pushed, so forking a position
+//! `Copy`, kept in the [`Buffers`] reused for every step and every rule of a call. Its
+//! bindings are cons cells in the buffers, never changed once pushed, so forking a position
 //! copies two `u32`s (rustc shares an `Rc<Vec<NamedMatch>>` and copies it on write; the old
 //! code here copied or linked a `Vec` per fork and an `Rc` per binding). The parent of a
-//! repetition is one copy in the arena, not a boxed clone per exit. Only a rule's first error
+//! repetition is one copy in the buffers, not a boxed clone per exit. Only a rule's first error
 //! is built. The trees the transcriber reads are built from the cells once, when the match is
-//! over ([`Arena::build`]).
+//! over ([`Buffers::build`]).
 
 use base_db::Db;
 use arrayvec::ArrayVec;
+use blaze_mem::frame::Frame;
 use intern::sym;
 use tt::{
     DelimSpan, DelimiterKind, MAX_GLUED_PUNCT_LEN,
@@ -295,7 +296,7 @@ fn collect_vars(pattern: &MetaTemplate, vars: &mut Vec<Binder>) {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Match<'t> {
     pub(super) bindings: Bindings<'t>,
     /// We currently just keep the first error.
@@ -306,7 +307,11 @@ pub(super) struct Match<'t> {
     pub(super) bound_count: usize,
 }
 
-impl Match<'_> {
+impl<'t> Match<'t> {
+    pub(super) fn new_in(frame: &'t Frame) -> Self {
+        Match { bindings: Bindings::new_in(frame), err: None, unmatched_tts: 0, bound_count: 0 }
+    }
+
     fn clear(&mut self) {
         self.bindings.clear();
         self.err = None;
@@ -334,16 +339,16 @@ impl Match<'_> {
 struct Pos {
     /// An index into `Matcher::locs`.
     dot: u32,
-    /// The position its repetition was entered from, `Arena::ups[_]`, or [`NONE`] outside
+    /// The position its repetition was entered from, `Buffers::ups[_]`, or [`NONE`] outside
     /// repetitions.
     up: u32,
     /// What it bound in the current iteration of its repetition (or outside any), the newest
-    /// of a list of `Arena::entries`.
+    /// of a list of `Buffers::entries`.
     cur: u32,
-    /// The finished iterations of its repetition, the newest of a list of `Arena::iterations`.
+    /// The finished iterations of its repetition, the newest of a list of `Buffers::iterations`.
     iterations: u32,
     /// A matched separator, glued punctuation or fragment the next step goes on after,
-    /// `Arena::metas[_]`, or [`NONE`].
+    /// `Buffers::metas[_]`, or [`NONE`].
     meta: u32,
     sep_matched: bool,
     /// Is error occurred in this state, will `poised` to "parent"
@@ -381,10 +386,10 @@ enum EntryKind {
     Empty,
     /// A fragment that may be empty (`vis`) and is.
     Optional,
-    /// `Arena::fragments[_]`.
+    /// `Buffers::fragments[_]`.
     Fragment(u32),
     Missing(MetaVarKind),
-    /// What a repetition bound: its finished iterations (`Arena::iterations`) and the last.
+    /// What a repetition bound: its finished iterations (`Buffers::iterations`) and the last.
     Nested { iterations: u32, last: u32 },
 }
 
@@ -402,11 +407,11 @@ struct Iteration {
 #[derive(Debug)]
 struct Meta<'t> {
     iter: TtIter<'t>,
-    /// `Arena::fragments[_]` for a fragment, else [`NONE`].
+    /// `Buffers::fragments[_]` for a fragment, else [`NONE`].
     fragment: u32,
 }
 
-/// A list of a `Nested` binding's iterations while [`Arena::build`] makes it.
+/// A list of a `Nested` binding's iterations while [`Buffers::build`] makes it.
 #[derive(Clone, Copy, Debug)]
 struct List {
     head: u32,
@@ -423,31 +428,57 @@ struct Link {
 /// Everything a match allocates, reused for each rule of a call and each step of a match. The
 /// positions' lists (`ups`, `entries`, `iterations`, `fragments`, `metas`) only grow during a
 /// match, and what is pushed is never changed, so any number of positions share them.
-#[derive(Debug, Default)]
-pub(super) struct Arena<'t> {
-    cur_items: Vec<Pos>,
-    next_items: Vec<Pos>,
-    bb_items: Vec<Pos>,
-    eof_items: Vec<Pos>,
-    error_items: Vec<Pos>,
-    ups: Vec<Pos>,
-    entries: Vec<Entry>,
-    iterations: Vec<Iteration>,
-    fragments: Vec<Fragment<'t>>,
-    metas: Vec<Meta<'t>>,
+#[derive(Debug)]
+pub(super) struct Buffers<'t> {
+    /// Where every list below lives: the frame of the call's [`expand_rules`].
+    ///
+    /// [`expand_rules`]: super::expand_rules
+    frame: &'t Frame,
+    cur_items: Vec<Pos, &'t Frame>,
+    next_items: Vec<Pos, &'t Frame>,
+    bb_items: Vec<Pos, &'t Frame>,
+    eof_items: Vec<Pos, &'t Frame>,
+    error_items: Vec<Pos, &'t Frame>,
+    ups: Vec<Pos, &'t Frame>,
+    entries: Vec<Entry, &'t Frame>,
+    iterations: Vec<Iteration, &'t Frame>,
+    fragments: Vec<Fragment<'t>, &'t Frame>,
+    metas: Vec<Meta<'t>, &'t Frame>,
     /// The input levels around the one being matched, innermost last.
-    stack: Vec<TtIter<'t>>,
-    /// `Arena::build`'s scratch, empty (or all [`NONE`]) between builds.
-    order: Vec<u32>,
+    stack: Vec<TtIter<'t>, &'t Frame>,
+    /// `Buffers::build`'s scratch, empty (or all [`NONE`]) between builds.
+    order: Vec<u32, &'t Frame>,
     /// Per level of repetition and binder, its binding at that level while it is being built.
-    slots: Vec<u32>,
+    slots: Vec<u32, &'t Frame>,
     /// Per level, the binders with a slot set.
-    touched: Vec<Vec<Binder>>,
-    lists: Vec<List>,
-    links: Vec<Link>,
+    touched: Vec<Vec<Binder, &'t Frame>, &'t Frame>,
+    lists: Vec<List, &'t Frame>,
+    links: Vec<Link, &'t Frame>,
 }
 
-impl<'t> Arena<'t> {
+impl<'t> Buffers<'t> {
+    pub(super) fn new_in(frame: &'t Frame) -> Self {
+        Buffers {
+            frame,
+            cur_items: Vec::new_in(frame),
+            next_items: Vec::new_in(frame),
+            bb_items: Vec::new_in(frame),
+            eof_items: Vec::new_in(frame),
+            error_items: Vec::new_in(frame),
+            ups: Vec::new_in(frame),
+            entries: Vec::new_in(frame),
+            iterations: Vec::new_in(frame),
+            fragments: Vec::new_in(frame),
+            metas: Vec::new_in(frame),
+            stack: Vec::new_in(frame),
+            order: Vec::new_in(frame),
+            slots: Vec::new_in(frame),
+            touched: Vec::new_in(frame),
+            lists: Vec::new_in(frame),
+            links: Vec::new_in(frame),
+        }
+    }
+
     fn clear(&mut self) {
         self.cur_items.clear();
         self.next_items.clear();
@@ -522,7 +553,8 @@ impl<'t> Arena<'t> {
     /// The bindings `head` into the slots of `level`.
     fn build_level(&mut self, head: u32, level: usize, binders: usize, out: &mut Bindings<'t>) {
         if self.touched.len() <= level {
-            self.touched.resize_with(level + 1, Vec::new);
+            let frame = self.frame;
+            self.touched.resize_with(level + 1, || Vec::new_in(frame));
         }
         if self.slots.len() < (level + 1) * binders {
             self.slots.resize((level + 1) * binders, NONE);
@@ -585,7 +617,8 @@ impl<'t> Arena<'t> {
             let head = if idx + 1 == count { last } else { self.order[base + count - 2 - idx] };
             self.build_level(head, level + 1, binders, out);
             let inner = (level + 1) * binders;
-            let mut touched = std::mem::take(&mut self.touched[level + 1]);
+            let mut touched =
+                std::mem::replace(&mut self.touched[level + 1], Vec::new_in(self.frame));
             for &binder in &touched {
                 let value = std::mem::replace(&mut self.slots[inner + binder as usize], NONE);
                 let slot = level * binders + binder as usize;
@@ -648,10 +681,10 @@ pub(super) fn match_<'t>(
     db: &Db,
     matcher: &Matcher,
     input: &'t tt::TopSubtree,
-    arena: &mut Arena<'t>,
+    buffers: &mut Buffers<'t>,
     res: &mut Match<'t>,
 ) {
-    match_loop(db, matcher, input, arena, res, None);
+    match_loop(db, matcher, input, buffers, res, None);
     let bindings = &res.bindings;
     res.bound_count = bindings
         .roots
@@ -676,8 +709,8 @@ fn token_span(token: &Option<TtElement<'_>>, delim_span: DelimSpan) -> span::Spa
 ///
 /// - `src`: the current token of the parser.
 /// - `res`: the match result to store errors
-/// - `arena`: holds the sets of items: `cur_items`, the set of current items to be processed.
-///   This should be empty by the end of a successful execution of this function. `next_items`,
+/// - `a`: the [`Buffers`], which hold the sets of items: `cur_items`, the set of current items
+///   to be processed. This should be empty by the end of a successful execution of this function. `next_items`,
 ///   the set of newly generated items, used to replenish `cur_items` in `match_loop`;
 ///   `eof_items`, the set of items that would be valid if this was the EOF; `bb_items`, the set
 ///   of items that are waiting for the black-box parser; `error_items`, the set of items in
@@ -688,7 +721,7 @@ fn match_loop_inner<'t>(
     matcher: &Matcher,
     src: &TtIter<'t>,
     res: &mut Match<'t>,
-    a: &mut Arena<'t>,
+    a: &mut Buffers<'t>,
     delim_span: DelimSpan,
     mut track: Option<&mut Tracker>,
 ) {
@@ -929,7 +962,7 @@ fn match_loop<'t>(
     db: &Db,
     matcher: &Matcher,
     input: &'t tt::TopSubtree,
-    a: &mut Arena<'t>,
+    a: &mut Buffers<'t>,
     res: &mut Match<'t>,
     mut track: Option<&mut Tracker>,
 ) {

@@ -30,9 +30,15 @@ const NEW_LAYOUT_KEY: &str = "build-dir-new-layout";
 /// that finds its package's programs from its own path (`current_exe()`'s grandparent) finds
 /// them only from `deps`, where blaze's own build puts it too, and the user's stable cargo
 /// shares what blaze's cargo built.
-pub fn first_unless_chosen(cwd: &Path, config: &[String], unstable: &[String]) {
+///
+/// # Safety
+///
+/// No other thread of the process may run during the call: it sets the process's
+/// environment, and a thread reading it meanwhile through the C library's `getenv` (which
+/// std's lock does not cover) could read a variable as it is freed.
+pub unsafe fn first_unless_chosen(cwd: &Path, config: &[String], unstable: &[String]) {
     if !chosen(cwd, std::env::vars(), config, unstable) {
-        // SAFETY: before any thread is started.
+        // SAFETY: no other thread runs, by this function's contract, and `chosen` starts none.
         unsafe { std::env::set_var(NEW_LAYOUT, "false") };
     }
 }

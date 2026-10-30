@@ -1,129 +1,186 @@
-//! Gen/kill dataflow over the blocks of a body, as rustc's `rustc_mir_dataflow` solves it:
-//! each block's effect is one gen set and one kill set, `out = (in & !kill) | gen`, found once
-//! from its statements, and a work queue (forwards in reverse postorder, backwards in
-//! postorder) joins by union until nothing changes. Effects on one edge only, a call's return
-//! or what may be initialized leaving a block, are a callback on the edge.
-
-use std::collections::VecDeque;
+//! Gen/kill dataflow over the blocks of a body: each block's effect is `(word, gen, kill)`
+//! triples ([`Effects`]), `out = (in & !kill) | gen`, and the least fixed point, unreachable
+//! blocks empty, is found by difference propagation. A block keeps, besides its entry set, the
+//! bits it gained and has not sent on; a visit sends only those, through its kill, to its
+//! successors (forwards) or predecessors (backwards), and a block whose entry gains nothing is
+//! not queued. Every transfer here, a block's and an edge's ([`Edge`]), is `x -> (x & !k) | g`
+//! or a mask, which distributes over union, so sending the parts sends the whole once the
+//! constant `g` has gone once: a block's gens and its edges' gens go on its first visit, and
+//! every reachable block is visited. The fixed point is the one rustc's
+//! `rustc_mir_dataflow` reaches by joining whole sets (it is unique), at a cost of the bits
+//! that change, not the rows times the passes.
 
 use hir_ty_mir::mir::BasicBlockId;
 
-use super::{
-    bitset::{BitMatrix, BitSet, Transfer, masks, union_words, words_for},
+use crate::{
     cfg::{Cfg, index},
+    mem::{FDeque, FVec, Frame},
+    rows::{
+        DENSE_WORDS, Dense, Edge, Effects, LINE, Line, Lined, Rows, Store, ZERO_LINE, line_of,
+        lines_for,
+    },
 };
 
-/// The effect of each block (or of anything else with a row) as a gen and a kill set: per
-/// word, the gen word and the kill word side by side, so applying a row reads one stream.
-/// 16 bytes per 64 bits per row.
-pub(super) struct GenKill {
-    words: usize,
-    data: Vec<[u64; 2]>,
-}
-
-impl GenKill {
-    /// The identity effect for `rows` rows over sets of `domain` bits.
-    pub(super) fn new(rows: usize, domain: usize) -> Self {
-        let words = words_for(domain);
-        GenKill { words, data: vec![[0; 2]; rows * words] }
-    }
-
-    /// The row as a [`Transfer`]: each effect applied to it comes after those before.
-    pub(super) fn row(&mut self, row: usize) -> Row<'_> {
-        Row { data: &mut self.data[row * self.words..(row + 1) * self.words] }
-    }
-
-    pub(super) fn apply(&self, row: usize, state: &mut [u64]) {
-        let data = &self.data[row * self.words..(row + 1) * self.words];
-        for (word, [gen_, kill]) in state.iter_mut().zip(data) {
-            *word = (*word & !kill) | gen_;
-        }
-    }
-}
-
-/// One row of a [`GenKill`], composing what is applied to it in order.
-pub(super) struct Row<'g> {
-    data: &'g mut [[u64; 2]],
-}
-
-impl Transfer for Row<'_> {
-    #[inline]
-    fn gen_range(&mut self, range: std::ops::Range<usize>) {
-        masks(range, |word, mask| {
-            let [gen_, kill] = &mut self.data[word];
-            *gen_ |= mask;
-            *kill &= !mask;
-        });
-    }
-
-    #[inline]
-    fn kill_range(&mut self, range: std::ops::Range<usize>) {
-        masks(range, |word, mask| {
-            let [gen_, kill] = &mut self.data[word];
-            *kill |= mask;
-            *gen_ &= !mask;
-        });
-    }
-}
-
 /// rustc's `WorkQueue`: each block at most once in the queue.
-struct WorkQueue {
-    queue: VecDeque<BasicBlockId>,
-    queued: BitSet,
+struct WorkQueue<'f> {
+    queue: FDeque<'f, BasicBlockId>,
+    queued: &'f mut [bool],
 }
 
-impl WorkQueue {
-    fn new(blocks: usize, initial: impl Iterator<Item = BasicBlockId>) -> Self {
-        let mut out =
-            WorkQueue { queue: VecDeque::with_capacity(blocks), queued: BitSet::new(blocks) };
+impl<'f> WorkQueue<'f> {
+    fn new(frame: &'f Frame, blocks: usize, initial: impl Iterator<Item = BasicBlockId>) -> Self {
+        let mut out = WorkQueue {
+            queue: FDeque::with_capacity_in(blocks, frame),
+            queued: frame.alloc_slice_fill_with(blocks, |_| false),
+        };
         for it in initial {
             out.push(it);
         }
         out
     }
 
+    #[inline]
     fn push(&mut self, it: BasicBlockId) {
-        if self.queued.insert(index(it)) {
+        let queued = &mut self.queued[index(it)];
+        if !*queued {
+            *queued = true;
             self.queue.push_back(it);
         }
     }
 
     fn pop(&mut self) -> Option<BasicBlockId> {
         let it = self.queue.pop_front()?;
-        self.queued.remove(index(it));
+        self.queued[index(it)] = false;
         Some(it)
     }
 }
 
+/// A row of [`Effects`] read a line at a time, lines in increasing order.
+#[derive(Clone, Copy)]
+struct Triples<'e> {
+    words: &'e [u32],
+    bits: &'e [[u64; 2]],
+}
+
+impl Triples<'_> {
+    /// Applies the row's words of line `line` to it, their gens only when `gens`.
+    #[inline]
+    fn line(&mut self, line: usize, bits: &mut Line, gens: bool) {
+        let start = (line * LINE) as u32;
+        let end = start + LINE as u32;
+        let skip = self.words.iter().take_while(|&&it| it < start).count();
+        let take = self.words[skip..].iter().take_while(|&&it| it < end).count();
+        for (&word, &[gen_, kill]) in
+            self.words[skip..skip + take].iter().zip(&self.bits[skip..skip + take])
+        {
+            let word = &mut bits[word as usize % LINE];
+            *word &= !kill;
+            if gens {
+                *word |= gen_;
+            }
+        }
+        self.words = &self.words[skip + take..];
+        self.bits = &self.bits[skip + take..];
+    }
+}
+
+/// An [`Edge`] read a line at a time.
+#[derive(Clone, Copy)]
+enum Along<'e> {
+    Same,
+    Nothing,
+    Mask(&'e [u64]),
+    Effect(Triples<'e>),
+}
+
+impl<'e> Along<'e> {
+    fn of(edge: Edge<'e>) -> Self {
+        match edge {
+            Edge::Same => Along::Same,
+            Edge::Nothing => Along::Nothing,
+            Edge::Mask(mask) => Along::Mask(mask),
+            Edge::Effect { words, bits } => Along::Effect(Triples { words, bits }),
+        }
+    }
+
+    #[inline]
+    fn line(&mut self, line: usize, bits: &mut Line, gens: bool) {
+        match self {
+            Along::Same => (),
+            Along::Nothing => *bits = ZERO_LINE,
+            Along::Mask(mask) => {
+                for (word, mask) in bits.iter_mut().zip(line_of(mask, line)) {
+                    *word &= mask;
+                }
+            }
+            Along::Effect(triples) => triples.line(line, bits, gens),
+        }
+    }
+}
+
 /// The state at the start of each block of a forward analysis whose start block begins with
-/// `boundary`: the least fixed point, unreachable blocks empty. `edge(from, to, state)`
-/// changes what leaves `from` for `to`.
-pub(super) fn forward(
-    cfg: &Cfg,
-    blocks: &GenKill,
+/// `boundary` (a row's length): the least fixed point, unreachable blocks empty. `edge(from,
+/// to)` is what happens to what leaves `from` for `to`.
+pub(super) fn forward<'f, 'e>(
+    frame: &'f Frame,
+    cfg: &Cfg<'_>,
+    blocks: &Effects<'_>,
     start: BasicBlockId,
-    boundary: &BitSet,
-    mut edge: impl FnMut(BasicBlockId, BasicBlockId, &mut [u64]),
-) -> BitMatrix {
+    boundary: &[u64],
+    edge: impl FnMut(BasicBlockId, BasicBlockId) -> Edge<'e>,
+) -> Rows<'f> {
+    if blocks.words() <= DENSE_WORDS {
+        Rows::Dense(forward_in(frame, cfg, blocks, start, boundary, edge))
+    } else {
+        Rows::Lined(forward_in(frame, cfg, blocks, start, boundary, edge))
+    }
+}
+
+pub(super) fn forward_in<'f, 'e, S: Store<'f>>(
+    frame: &'f Frame,
+    cfg: &Cfg<'_>,
+    blocks: &Effects<'_>,
+    start: BasicBlockId,
+    boundary: &[u64],
+    mut edge: impl FnMut(BasicBlockId, BasicBlockId) -> Edge<'e>,
+) -> S {
     let count = cfg.reachable.len();
-    let mut entry = BitMatrix::new(count, blocks.words * 64);
+    let words = blocks.words();
+    let lines = lines_for(words);
+    let mut entry = S::new(frame, count, words);
     if count == 0 {
         return entry;
     }
-    for (word, from) in entry.row_mut(index(start)).iter_mut().zip(boundary.words()) {
-        *word = *from;
+    let mut pending = S::new(frame, count, words);
+    for line in 0..lines {
+        let bits = line_of(boundary, line);
+        entry.merge(index(start), line, &bits);
+        pending.merge(index(start), line, &bits);
     }
-    let mut out = vec![0u64; blocks.words];
-    let mut along = vec![0u64; blocks.words];
-    let mut queue = WorkQueue::new(count, cfg.order.iter().copied());
+    let visited = frame.alloc_slice_fill_with(count, |_| false);
+    let mut out: FVec<'_, (BasicBlockId, Along<'e>)> = FVec::new_in(frame);
+    let mut queue = WorkQueue::new(frame, count, cfg.order.iter().copied());
     while let Some(at) = queue.pop() {
-        out.copy_from_slice(entry.row(index(at)));
-        blocks.apply(index(at), &mut out);
-        for &to in cfg.successors(at) {
-            along.copy_from_slice(&out);
-            edge(at, to, &mut along);
-            if union_words(entry.row_mut(index(to)), &along) {
-                queue.push(to);
+        let first = !std::mem::replace(&mut visited[index(at)], true);
+        out.clear();
+        out.extend(cfg.successors(at).iter().map(|&to| (to, Along::of(edge(at, to)))));
+        let (words, bits) = blocks.of(index(at));
+        let mut transfer = Triples { words, bits };
+        for line in 0..lines {
+            let mut sent = ZERO_LINE;
+            pending.take(index(at), line, &mut sent);
+            transfer.line(line, &mut sent, first);
+            if !first && sent == ZERO_LINE {
+                continue;
+            }
+            for (to, along) in out.iter_mut() {
+                let mut bits = sent;
+                along.line(line, &mut bits, first);
+                let new = entry.merge(index(*to), line, &bits);
+                if new != ZERO_LINE {
+                    pending.merge(index(*to), line, &new);
+                    queue.push(*to);
+                }
             }
         }
     }
@@ -131,31 +188,63 @@ pub(super) fn forward(
 }
 
 /// The state at the start of each block of a backward analysis, nothing live past the end:
-/// the least fixed point, unreachable blocks empty. `edge(from, to, state)` changes what
+/// the least fixed point, unreachable blocks empty. `edge(from, to)` is what happens to what
 /// comes back from `to` to the end of `from`.
-pub(super) fn backward(
-    cfg: &Cfg,
-    blocks: &GenKill,
-    mut edge: impl FnMut(BasicBlockId, BasicBlockId, &mut [u64]),
-) -> BitMatrix {
+pub(super) fn backward<'f, 'e>(
+    frame: &'f Frame,
+    cfg: &Cfg<'_>,
+    blocks: &Effects<'_>,
+    edge: impl FnMut(BasicBlockId, BasicBlockId) -> Edge<'e>,
+) -> Rows<'f> {
+    if blocks.words() <= DENSE_WORDS {
+        Rows::Dense(backward_in(frame, cfg, blocks, edge))
+    } else {
+        Rows::Lined(backward_in(frame, cfg, blocks, edge))
+    }
+}
+
+pub(super) fn backward_in<'f, 'e, S: Store<'f>>(
+    frame: &'f Frame,
+    cfg: &Cfg<'_>,
+    blocks: &Effects<'_>,
+    mut edge: impl FnMut(BasicBlockId, BasicBlockId) -> Edge<'e>,
+) -> S {
     let count = cfg.reachable.len();
-    let mut entry = BitMatrix::new(count, blocks.words * 64);
-    let mut exit = vec![0u64; blocks.words];
-    let mut along = vec![0u64; blocks.words];
-    let mut queue = WorkQueue::new(count, cfg.order.iter().rev().copied());
+    let words = blocks.words();
+    let lines = lines_for(words);
+    let mut entry = S::new(frame, count, words);
+    if count == 0 {
+        return entry;
+    }
+    // What has reached each block's exit and not yet been through it.
+    let mut pending = S::new(frame, count, words);
+    let visited = frame.alloc_slice_fill_with(count, |_| false);
+    let mut into: FVec<'_, (BasicBlockId, Along<'e>)> = FVec::new_in(frame);
+    let mut queue = WorkQueue::new(frame, count, cfg.order.iter().rev().copied());
     while let Some(at) = queue.pop() {
-        exit.fill(0);
-        for &to in cfg.successors(at) {
-            along.copy_from_slice(entry.row(index(to)));
-            edge(at, to, &mut along);
-            union_words(&mut exit, &along);
-        }
-        blocks.apply(index(at), &mut exit);
-        if entry.row(index(at)) != exit.as_slice() {
-            entry.row_mut(index(at)).copy_from_slice(&exit);
-            for &from in cfg.predecessors(at) {
-                if cfg.reachable[index(from)] {
-                    queue.push(from);
+        let first = !std::mem::replace(&mut visited[index(at)], true);
+        into.clear();
+        into.extend(
+            cfg.predecessors(at)
+                .iter()
+                .filter(|&&from| cfg.is_reachable(from))
+                .map(|&from| (from, Along::of(edge(from, at)))),
+        );
+        let (words, bits) = blocks.of(index(at));
+        let mut transfer = Triples { words, bits };
+        for line in 0..lines {
+            let mut exit = ZERO_LINE;
+            pending.take(index(at), line, &mut exit);
+            transfer.line(line, &mut exit, first);
+            let new = entry.merge(index(at), line, &exit);
+            if !first && new == ZERO_LINE {
+                continue;
+            }
+            for (from, along) in into.iter_mut() {
+                let mut bits = new;
+                along.line(line, &mut bits, first);
+                if pending.merge(index(*from), line, &bits) != ZERO_LINE {
+                    queue.push(*from);
                 }
             }
         }
@@ -165,56 +254,71 @@ pub(super) fn backward(
 
 #[cfg(test)]
 mod tests {
-    use blaze_ids::rng::SplitMix64;
+    use std::ops::Range;
 
-    use super::{GenKill, backward, forward};
+    use blaze_ids::rng::SplitMix64;
+    use blaze_mem::{Tag, frame};
+
+    use super::{backward_in, forward_in};
     use crate::{
-        bitset::{BitSet, Transfer, iter_words},
+        bitset::Transfer,
         cfg::{Cfg, block, index},
+        mem::Frame,
+        rows::{Dense, Edge, Effects, Lined, Store},
     };
 
-    /// What one point does: bits it removes, then bits it adds.
+    /// What one point does: ranges it kills or gens, in order.
     #[derive(Clone, Default)]
     struct Effect {
-        kill: Vec<usize>,
-        gen_: Vec<usize>,
+        ops: Vec<(bool, Range<usize>)>,
     }
 
     impl Effect {
-        fn apply(&self, state: &mut Vec<bool>) {
-            for &it in &self.kill {
-                state[it] = false;
-            }
-            for &it in &self.gen_ {
-                state[it] = true;
+        fn apply(&self, state: &mut [bool]) {
+            for (gen_, range) in &self.ops {
+                state[range.clone()].fill(*gen_);
             }
         }
     }
 
     fn effect(rng: &mut SplitMix64, domain: usize) -> Effect {
         let mut out = Effect::default();
-        for _ in 0..rng.index(3) {
-            out.kill.push(rng.index(domain));
-        }
-        for _ in 0..rng.index(3) {
-            out.gen_.push(rng.index(domain));
+        for _ in 0..rng.index(4) {
+            let from = rng.index(domain);
+            // Mostly single bits, as statements touch; sometimes a run of lines, as a
+            // storage-dead of a large place kills.
+            let len = match rng.index(6) {
+                0 => rng.index(domain - from + 1),
+                _ => 1,
+            };
+            out.ops.push((rng.index(2) == 0, from..from + len));
         }
         out
     }
 
-    struct Case {
-        cfg: Cfg,
+    enum EdgeKind {
+        Effect(Effect),
+        Mask(Vec<bool>),
+        Nothing,
+    }
+
+    struct Case<'f> {
+        cfg: Cfg<'f>,
         domain: usize,
         /// Each block's points, in the order the block runs them.
         points: Vec<Vec<Effect>>,
-        /// An edge's own effect, applied to what crosses it.
-        edges: Vec<((usize, usize), Effect)>,
+        edges: Vec<((usize, usize), EdgeKind)>,
         boundary: Vec<usize>,
     }
 
-    fn case(rng: &mut SplitMix64) -> Case {
-        let blocks = 1 + rng.index(16);
-        let domain = 1 + rng.index(150);
+    fn case<'f>(
+        frame: &'f Frame,
+        rng: &mut SplitMix64,
+        max_blocks: usize,
+        max_domain: usize,
+    ) -> Case<'f> {
+        let blocks = 1 + rng.index(max_blocks);
+        let domain = 1 + rng.index(max_domain);
         let mut edges = Vec::new();
         for b in 1..blocks {
             if rng.index(5) != 0 {
@@ -225,32 +329,40 @@ mod tests {
             edges.push((rng.index(blocks), rng.index(blocks)));
         }
         let lens: Vec<usize> = (0..blocks).map(|_| 1 + rng.index(5)).collect();
-        let cfg = Cfg::from_edges(&lens, &edges);
+        let cfg = Cfg::from_edges(frame, &lens, &edges);
         let points =
             lens.iter().map(|&len| (0..len).map(|_| effect(rng, domain)).collect()).collect();
-        let mut edge_effects = Vec::new();
+        let mut kinds = Vec::new();
         for (from, to) in edges {
-            if rng.index(3) == 0 && !edge_effects.iter().any(|(it, _)| *it == (from, to)) {
-                edge_effects.push(((from, to), effect(rng, domain)));
+            if kinds.iter().any(|(it, _)| *it == (from, to)) {
+                continue;
             }
+            let kind = match rng.index(6) {
+                0 | 1 => EdgeKind::Effect(effect(rng, domain)),
+                2 => EdgeKind::Mask((0..domain).map(|_| rng.index(3) != 0).collect()),
+                3 => EdgeKind::Nothing,
+                _ => continue,
+            };
+            kinds.push(((from, to), kind));
         }
         let boundary = (0..rng.index(4)).map(|_| rng.index(domain)).collect();
-        Case { cfg, domain, points, edges: edge_effects, boundary }
+        Case { cfg, domain, points, edges: kinds, boundary }
     }
 
-    fn edge_effect(case: &Case, from: usize, to: usize) -> Option<&Effect> {
+    fn edge_kind(case: &Case<'_>, from: usize, to: usize) -> Option<&EdgeKind> {
         case.edges.iter().find(|(it, _)| *it == (from, to)).map(|(_, it)| it)
     }
 
-    fn apply_words(effect: &Effect, domain: usize, words: &mut [u64]) {
-        let mut state: Vec<bool> =
-            (0..domain).map(|it| words[it / 64] & (1 << (it % 64)) != 0).collect();
-        effect.apply(&mut state);
-        words.fill(0);
-        for (it, &set) in state.iter().enumerate() {
-            if set {
-                words[it / 64] |= 1 << (it % 64);
+    fn cross(case: &Case<'_>, from: usize, to: usize, state: &mut [bool]) {
+        match edge_kind(case, from, to) {
+            None => (),
+            Some(EdgeKind::Effect(it)) => it.apply(state),
+            Some(EdgeKind::Mask(mask)) => {
+                for (it, keep) in state.iter_mut().zip(mask) {
+                    *it &= keep;
+                }
             }
+            Some(EdgeKind::Nothing) => state.fill(false),
         }
     }
 
@@ -258,13 +370,13 @@ mod tests {
         state.iter().enumerate().filter(|(_, it)| **it).map(|(at, _)| at).collect()
     }
 
-    fn reachable(case: &Case) -> Vec<usize> {
+    fn reachable(case: &Case<'_>) -> Vec<usize> {
         case.cfg.order.iter().map(|&it| index(it)).collect()
     }
 
     /// The forward fixed point taken a point at a time, every reachable point again until
     /// nothing changes.
-    fn naive_forward(case: &Case) -> Vec<Vec<usize>> {
+    fn naive_forward(case: &Case<'_>) -> Vec<Vec<usize>> {
         let blocks = case.points.len();
         let mut entry = vec![vec![false; case.domain]; blocks];
         for &it in &case.boundary {
@@ -280,9 +392,7 @@ mod tests {
                 }
                 for &to in case.cfg.successors(block(b)) {
                     let mut along = state.clone();
-                    if let Some(it) = edge_effect(case, b, index(to)) {
-                        it.apply(&mut along);
-                    }
+                    cross(case, b, index(to), &mut along);
                     for (into, from) in entry[index(to)].iter_mut().zip(&along) {
                         changed |= *from && !*into;
                         *into |= from;
@@ -296,7 +406,7 @@ mod tests {
         entry.iter().map(|it| as_set(it)).collect()
     }
 
-    fn naive_backward(case: &Case) -> Vec<Vec<usize>> {
+    fn naive_backward(case: &Case<'_>) -> Vec<Vec<usize>> {
         let blocks = case.points.len();
         let mut entry = vec![vec![false; case.domain]; blocks];
         let order = reachable(case);
@@ -306,9 +416,7 @@ mod tests {
                 let mut state = vec![false; case.domain];
                 for &to in case.cfg.successors(block(b)) {
                     let mut along = entry[index(to)].clone();
-                    if let Some(it) = edge_effect(case, b, index(to)) {
-                        it.apply(&mut along);
-                    }
+                    cross(case, b, index(to), &mut along);
                     for (into, from) in state.iter_mut().zip(&along) {
                         *into |= from;
                     }
@@ -328,93 +436,167 @@ mod tests {
         entry.iter().map(|it| as_set(it)).collect()
     }
 
+    fn compose(row: &mut impl Transfer, point: &Effect) {
+        for (gen_, range) in &point.ops {
+            if *gen_ {
+                row.gen_range(range.clone());
+            } else {
+                row.kill_range(range.clone());
+            }
+        }
+    }
+
     /// Each block's effect composed point by point, as the analyses build theirs.
-    fn composed(case: &Case, backward: bool) -> GenKill {
-        let mut out = GenKill::new(case.points.len(), case.domain);
+    fn composed<'f>(frame: &'f Frame, case: &Case<'_>, backward: bool) -> Effects<'f> {
+        let mut out = Effects::new(frame, case.points.len(), case.domain);
         for (b, points) in case.points.iter().enumerate() {
             let mut row = out.row(b);
-            let mut run = |point: &Effect| {
-                for &it in &point.kill {
-                    row.kill(it);
-                }
-                for &it in &point.gen_ {
-                    row.gen_(it);
-                }
-            };
             if backward {
-                points.iter().rev().for_each(&mut run);
+                points.iter().rev().for_each(|it| compose(&mut row, it));
             } else {
-                points.iter().for_each(&mut run);
+                points.iter().for_each(|it| compose(&mut row, it));
             }
         }
         out
     }
 
-    /// A block's transfer composed from single bits and ranges does to any set what applying
-    /// them to it one after another does.
-    #[test]
-    fn composed_ranges_match_walking() {
-        let mut rng = SplitMix64::new(0x9e3779b97f4a7c15);
-        for round in 0..2000 {
-            let domain = 1 + rng.index(300);
-            let mut walked = BitSet::new(domain);
-            for _ in 0..rng.index(domain) {
-                walked.insert(rng.index(domain));
+    /// The case's edges: their effects as rows, their masks as words.
+    struct Edges<'f> {
+        effects: Effects<'f>,
+        masks: Vec<Vec<u64>>,
+    }
+
+    fn edges<'f>(frame: &'f Frame, case: &Case<'_>, words: usize) -> Edges<'f> {
+        let mut effects = Effects::new(frame, case.edges.len(), case.domain);
+        let mut masks = Vec::new();
+        for (at, (_, kind)) in case.edges.iter().enumerate() {
+            let mut mask = vec![0u64; words];
+            match kind {
+                EdgeKind::Effect(it) => compose(&mut effects.row(at), it),
+                EdgeKind::Mask(keep) => {
+                    for (bit, _) in keep.iter().enumerate().filter(|(_, it)| **it) {
+                        mask[bit / 64] |= 1 << (bit % 64);
+                    }
+                }
+                EdgeKind::Nothing => (),
             }
-            let mut start = walked.words().to_vec();
-            let mut transfer = GenKill::new(1, domain);
-            let mut row = transfer.row(0);
-            for _ in 0..rng.index(12) {
-                let from = rng.index(domain);
-                let to = from + rng.index(domain - from + 1);
-                match rng.index(4) {
-                    0 => (walked.gen_(from), row.gen_(from)),
-                    1 => (walked.kill(from), row.kill(from)),
-                    2 => (walked.gen_range(from..to), row.gen_range(from..to)),
-                    _ => (walked.kill_range(from..to), row.kill_range(from..to)),
-                };
-            }
-            transfer.apply(0, &mut start);
-            assert_eq!(start, walked.words(), "round {round}");
+            masks.push(mask);
+        }
+        Edges { effects, masks }
+    }
+
+    fn edge<'a>(case: &Case<'_>, edges: &'a Edges<'_>, from: usize, to: usize) -> Edge<'a> {
+        match case.edges.iter().position(|(it, _)| *it == (from, to)) {
+            None => Edge::Same,
+            Some(at) => match case.edges[at].1 {
+                EdgeKind::Effect(_) => edges.effects.edge(at),
+                EdgeKind::Mask(_) => Edge::Mask(&edges.masks[at]),
+                EdgeKind::Nothing => Edge::Nothing,
+            },
         }
     }
 
-    fn rows(entry: &crate::bitset::BitMatrix, blocks: usize) -> Vec<Vec<usize>> {
-        (0..blocks).map(|b| iter_words(entry.row(b)).collect()).collect()
+    fn sets<'f, S: Store<'f>>(rows: &S, blocks: usize, words: usize) -> Vec<Vec<usize>> {
+        let mut out = vec![0u64; words];
+        (0..blocks)
+            .map(|b| {
+                rows.load(b, &mut out);
+                crate::bitset::iter_words(&out).collect()
+            })
+            .collect()
+    }
+
+    fn forward_case<'f, S: Store<'f>>(frame: &'f Frame, case: &Case<'_>) -> Vec<Vec<usize>> {
+        let blocks = composed(frame, case, false);
+        let words = blocks.words();
+        let edges = edges(frame, case, words);
+        let mut boundary = vec![0u64; words];
+        for &it in &case.boundary {
+            boundary[it / 64] |= 1 << (it % 64);
+        }
+        let entry: S = forward_in(frame, &case.cfg, &blocks, block(0), &boundary, |from, to| {
+            edge(case, &edges, index(from), index(to))
+        });
+        sets(&entry, case.points.len(), words)
+    }
+
+    fn backward_case<'f, S: Store<'f>>(frame: &'f Frame, case: &Case<'_>) -> Vec<Vec<usize>> {
+        let blocks = composed(frame, case, true);
+        let words = blocks.words();
+        let edges = edges(frame, case, words);
+        let entry: S = backward_in(frame, &case.cfg, &blocks, |from, to| {
+            edge(case, &edges, index(from), index(to))
+        });
+        sets(&entry, case.points.len(), words)
+    }
+
+    /// Runs `check` on random cases of up to `blocks` blocks and `domain` bits, a frame each.
+    fn rounds(
+        seed: u64,
+        count: usize,
+        blocks: usize,
+        domain: usize,
+        check: impl for<'f> Fn(&'f Frame, usize, &Case<'f>),
+    ) {
+        let mut rng = SplitMix64::new(seed);
+        for round in 0..count {
+            frame::task(Tag::Mir, |frame| {
+                let case = case(frame, &mut rng, blocks, domain);
+                check(frame, round, &case);
+            });
+        }
     }
 
     #[test]
     fn forward_matches_a_point_at_a_time() {
-        let mut rng = SplitMix64::new(0x2545f4914f6cdd1d);
-        for round in 0..400 {
-            let case = case(&mut rng);
-            let want = naive_forward(&case);
-            let mut boundary = BitSet::new(case.domain);
-            for &it in &case.boundary {
-                boundary.insert(it);
-            }
-            let blocks = composed(&case, false);
-            let entry = forward(&case.cfg, &blocks, block(0), &boundary, |from, to, state| {
-                if let Some(it) = edge_effect(&case, index(from), index(to)) {
-                    apply_words(it, case.domain, state);
-                }
-            });
-            assert_eq!(rows(&entry, case.points.len()), want, "round {round}");
-        }
+        rounds(0x2545_f491_4f6c_dd1d, 400, 16, 150, |frame, round, case| {
+            let want = naive_forward(case);
+            assert_eq!(forward_case::<Dense<'_>>(frame, case), want, "dense, round {round}");
+            assert_eq!(forward_case::<Lined<'_>>(frame, case), want, "lined, round {round}");
+        });
     }
 
     #[test]
     fn backward_matches_a_point_at_a_time() {
-        let mut rng = SplitMix64::new(0x853c49e6748fea9b);
-        for round in 0..400 {
-            let case = case(&mut rng);
-            let want = naive_backward(&case);
-            let entry = backward(&case.cfg, &composed(&case, true), |from, to, state| {
-                if let Some(it) = edge_effect(&case, index(from), index(to)) {
-                    apply_words(it, case.domain, state);
+        rounds(0x853c_49e6_748f_ea9b, 400, 16, 150, |frame, round, case| {
+            let want = naive_backward(case);
+            assert_eq!(backward_case::<Dense<'_>>(frame, case), want, "dense, round {round}");
+            assert_eq!(backward_case::<Lined<'_>>(frame, case), want, "lined, round {round}");
+        });
+    }
+
+    /// Domains of many lines, where uniform lines stay slots and runs fill whole lines.
+    #[test]
+    fn large_domains_match_a_point_at_a_time() {
+        rounds(0x9e37_79b9_7f4a_7c15, 40, 40, 3000, |frame, round, case| {
+            let forward = naive_forward(case);
+            let backward = naive_backward(case);
+            assert_eq!(forward_case::<Lined<'_>>(frame, case), forward, "round {round}");
+            assert_eq!(backward_case::<Lined<'_>>(frame, case), backward, "round {round}");
+        });
+    }
+
+    /// A block's effect composed from ranges does to any set what applying them one after
+    /// another does.
+    #[test]
+    fn composed_ranges_match_walking() {
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+        for round in 0..2000 {
+            frame::task(Tag::Mir, |frame| {
+                let domain = 1 + rng.index(300);
+                let mut walked: Vec<bool> = (0..domain).map(|_| rng.index(2) == 0).collect();
+                let mut start = vec![0u64; domain.div_ceil(64)];
+                for (bit, _) in walked.iter().enumerate().filter(|(_, it)| **it) {
+                    start[bit / 64] |= 1 << (bit % 64);
                 }
+                let mut transfer = Effects::new(frame, 1, domain);
+                let point = effect(&mut rng, domain);
+                compose(&mut transfer.row(0), &point);
+                point.apply(&mut walked);
+                transfer.apply(0, &mut start);
+                let got: Vec<usize> = crate::bitset::iter_words(&start).collect();
+                assert_eq!(got, as_set(&walked), "round {round}");
             });
-            assert_eq!(rows(&entry, case.points.len()), want, "round {round}");
         }
     }
 }

@@ -19,8 +19,17 @@ use crate::SyntaxKind;
 /// [`Tokens`] does. Every word is made by [`word`] from `SyntaxKind`s or appended by
 /// [`Input::extend_from_words`] with its kinds checked, and only the flag bits [`JOINT`] and
 /// [`FRAGMENT`], above both kinds, are set after.
+///
+/// The words are the thread's [`InputWords`], back on its shelf when the input is dropped, so a
+/// warm input allocates nothing.
 pub struct Input {
-    words: Vec<u32>,
+    words: blaze_mem::scratch::Lent<InputWords>,
+}
+
+crate::event::per_thread_buffer! {
+    /// An input's words: kept per thread at the most they ever held, back on the shelf of the
+    /// thread that drops the input.
+    InputWords, INPUT_WORDS: u32
 }
 
 /// The `EOF` words at the end of every [`Tokens`]: the parser looks at most 3 tokens past a
@@ -79,15 +88,18 @@ fn kind_of(bits: u32) -> SyntaxKind {
 impl Input {
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        let mut words = Vec::with_capacity(capacity + PAD);
+        let mut words = blaze_mem::scratch::lend::<InputWords>();
+        words.reserve(capacity + PAD);
         words.extend([EOF_WORD; PAD]);
         Self { words }
     }
 
-    /// The input's words, as [`Tokens::new`] reads them.
+    /// The input's words, as [`Tokens::new`] reads them, copied out: the buffer goes back to
+    /// the thread's shelf.
     #[inline]
     pub fn into_words(self) -> Vec<u32> {
-        self.words
+        // alloc: the words a token tree keeps (`tree_words`), exactly as long as they are.
+        self.words.to_vec()
     }
 
     /// Empties the input, keeping its buffer for the next one.
@@ -478,6 +490,18 @@ mod tests {
     fn reading_past_the_pad_panics() {
         let input = Input::with_capacity(0);
         input.kind(PAD);
+    }
+
+    /// A warm input allocates nothing: its words are the thread's, back on the shelf since
+    /// the input before.
+    #[test]
+    fn a_warm_input_allocates_nothing() {
+        let text = "fn f(a: u32) -> u32 { a + 1 }\n".repeat(100);
+        let lexed = crate::LexedStr::new(Edition::CURRENT, &text);
+        drop(lexed.to_input(Edition::CURRENT));
+        blaze_alloc_count::assert_at_most(0, "a warm input of a lexed text", || {
+            drop(lexed.to_input(Edition::CURRENT))
+        });
     }
 
     /// Refilling a cleared input as long as before allocates nothing.

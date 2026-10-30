@@ -340,9 +340,11 @@ fn gating_flags(meta: &ast::Meta) -> AttrFlags {
         ("rustc_comptime", AttrFlags::RUSTC_COMPTIME),
         ("panic_handler", AttrFlags::PANIC_HANDLER),
     ];
+    const TOKEN_TREE: &[(&str, AttrFlags)] = &[("sanitize", AttrFlags::HAS_SANITIZE)];
     let (path, names) = match meta {
         ast::Meta::KeyValueMeta(meta) => (meta.path(), KEY_VALUE),
         ast::Meta::PathMeta(meta) => (meta.path(), WORD),
+        ast::Meta::TokenTreeMeta(meta) if meta.token_tree().is_some() => (meta.path(), TOKEN_TREE),
         _ => return AttrFlags::empty(),
     };
     names
@@ -358,7 +360,8 @@ const GATING: AttrFlags = AttrFlags::HAS_EXPORT_NAME
     .union(AttrFlags::HAS_DIAGNOSTIC_ITEM)
     .union(AttrFlags::RUSTC_NOUNWIND)
     .union(AttrFlags::RUSTC_COMPTIME)
-    .union(AttrFlags::PANIC_HANDLER);
+    .union(AttrFlags::PANIC_HANDLER)
+    .union(AttrFlags::HAS_SANITIZE);
 
 fn meta_of(attr: &str) -> ast::Meta {
     let text = format!("{attr} fn f() {{}}");
@@ -464,6 +467,11 @@ fn gating_flags_of_known_shapes() {
         ("#[inline(always)]", AttrFlags::IS_INLINE | AttrFlags::INLINE_ALWAYS),
         ("#[inline(never)]", AttrFlags::INLINE_NEVER),
         ("#[inline]", AttrFlags::IS_INLINE),
+        ("#[sanitize(address = \"off\")]", AttrFlags::HAS_SANITIZE),
+        ("#[r#sanitize(thread = \"on\")]", AttrFlags::HAS_SANITIZE),
+        ("#[sanitize]", AttrFlags::empty()),
+        ("#[a::sanitize(address = \"off\")]", AttrFlags::empty()),
+        ("#[a::b::sanitize(address = \"off\")]", AttrFlags::empty()),
     ] {
         let mut new = AttrFlags::empty();
         let _ = match_attr_flags(&mut new, meta_of(attr));
@@ -1199,5 +1207,136 @@ pub fn without_note() {}
         let version = RustcVersion { major: 1, minor: 5, patch: 0 };
         assert_eq!(*since, DeprecatedSince::RustcVersion(version));
         assert_eq!(origin(&db, def(&db, "without_note")), None, "a staged crate's needs a note");
+    }
+}
+
+mod sanitize {
+    use hir_expand::Lookup;
+    use syntax::ast::HasName;
+    use test_fixture::WithFixture;
+
+    use crate::{
+        AssocItemId, DefWithBodyId, FunctionId, ModuleDefId,
+        attrs::{
+            disabled_sanitizers,
+            sanitizer::{ADDRESS, MEMORY, THREAD},
+        },
+        expr_store::Body,
+        nameres::{DefMap, crate_def_map},
+        src::HasSource,
+        test_db::{TestDB, TestDBExt},
+    };
+
+    const FIXTURE: &str = r#"
+#![sanitize(memory = "off")]
+pub fn crate_level() {}
+
+#[sanitize(address = "off")]
+pub mod m {
+    pub fn inherits() {}
+    #[sanitize(address = "on", thread = "off")]
+    pub fn turned_back_on() {}
+    #[sanitize(address = "off", address = "on")]
+    pub fn both_ways() {}
+    #[cfg_attr(all(), sanitize(thread = "off"))]
+    pub fn via_cfg_attr() {}
+    #[cfg_attr(any(), sanitize(thread = "off"))]
+    pub fn cfg_attr_off() {}
+    #[sanitize(cfi = "off", r#memory = "on")]
+    pub fn other_keys() {}
+
+    pub struct S;
+    #[sanitize(thread = "off")]
+    impl S {
+        pub fn method() {}
+        #[sanitize(kernel_address = "on", memory = "on")]
+        pub fn method_on() {}
+    }
+
+    #[sanitize(address = "on")]
+    pub fn outer() {
+        fn in_body() {}
+        let _ = #[sanitize(thread = "off")] || {
+            fn in_closure() {}
+        };
+    }
+
+    pub fn inner_attr() {
+        #![sanitize(memory = "on")]
+        fn in_inner_attr() {}
+    }
+
+    macro_rules! make {
+        () => {
+            pub fn made() {
+                fn made_inner() {}
+            }
+        };
+    }
+    make!();
+}
+"#;
+
+    fn name(db: &TestDB, func: FunctionId) -> String {
+        func.lookup(db).source(db).value.name().map_or_else(String::new, |it| it.text().to_string())
+    }
+
+    /// Every function of `def_map`'s modules and their impls, and of the blocks of their bodies,
+    /// by name.
+    fn every_function(db: &TestDB, def_map: &DefMap, out: &mut Vec<(String, FunctionId)>) {
+        for (_, module) in def_map.modules(db) {
+            let scope = module.scope(db);
+            let declared = scope.declarations().filter_map(|it| match it {
+                ModuleDefId::FunctionId(it) => Some(it),
+                _ => None,
+            });
+            let methods = scope.impls().flat_map(|it| it.impl_items(db).items.iter()).filter_map(
+                |&(_, item)| match item {
+                    AssocItemId::FunctionId(it) => Some(it),
+                    _ => None,
+                },
+            );
+            for func in declared.chain(methods) {
+                out.push((name(db, func), func));
+                let body = Body::of(db, DefWithBodyId::FunctionId(func));
+                for (_, block) in body.blocks(db) {
+                    every_function(db, block, out);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_sanitizers_take_the_nearest_sanitize_of_each_parent() {
+        let db = TestDB::with_single_file(FIXTURE).0;
+        let mut functions = Vec::new();
+        every_function(&db, crate_def_map(&db, db.test_crate()), &mut functions);
+        let off = |name: &str| {
+            let (_, func) = functions
+                .iter()
+                .find(|(it, _)| it == name)
+                .unwrap_or_else(|| panic!("no fn {name}"));
+            disabled_sanitizers(&db, *func)
+        };
+        for (name, expected) in [
+            ("crate_level", MEMORY),
+            ("inherits", ADDRESS | MEMORY),
+            ("turned_back_on", THREAD | MEMORY),
+            ("both_ways", ADDRESS | MEMORY),
+            ("via_cfg_attr", ADDRESS | THREAD | MEMORY),
+            ("cfg_attr_off", ADDRESS | MEMORY),
+            ("other_keys", ADDRESS),
+            ("method", ADDRESS | THREAD | MEMORY),
+            ("method_on", THREAD),
+            ("outer", MEMORY),
+            ("in_body", MEMORY),
+            ("in_closure", THREAD | MEMORY),
+            ("inner_attr", ADDRESS),
+            ("in_inner_attr", ADDRESS),
+            ("made", ADDRESS | MEMORY),
+            ("made_inner", ADDRESS | MEMORY),
+        ] {
+            assert_eq!(off(name), expected, "{name}");
+        }
     }
 }

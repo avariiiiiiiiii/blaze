@@ -349,7 +349,7 @@ pub struct BodySyntax {
     tree: u128,
     /// The text of the file when this was made, with where the anchor is in it, and what kind
     /// of node it is. Only what is there is read: where it is changes without this changing.
-    text: Arc<str>,
+    text: syntax::Text,
     range: TextRange,
     kind: SyntaxKind,
     edition: Edition,
@@ -415,7 +415,7 @@ impl BodySyntax {
     /// it is one, its bodies left to be parsed when they are entered.
     fn reparse(&self) -> Option<SyntaxNode> {
         let file = match self.outline {
-            true => ast::SourceFile::parse_outline(std::sync::Arc::from(self.text()), self.edition),
+            true => ast::SourceFile::parse_outline(self.text(), self.edition),
             false => ast::SourceFile::parse(self.text(), self.edition),
         };
         let file = file.syntax_node();
@@ -632,7 +632,7 @@ pub fn body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
     Some(BodySyntax {
         file_id: src.file_id,
         tree,
-        // clone: an `Arc<str>` of the file's text (a refcount)
+        // clone: a count of the file's text
         text: db.file_text(file).text(db).clone(),
         range: anchor.text_range(),
         kind: anchor.kind(),

@@ -19,6 +19,9 @@ text-size = "1.1.0"
 
 serde = { version = "1.0.89", optional = true, default-features = false }
 
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
 [features]
 serde1 = ["serde", "text-size/serde"]
 

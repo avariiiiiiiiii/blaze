@@ -278,7 +278,7 @@ fn double(db: &Database, view: ViewId, name: &str) -> u64 {
 }
 
 fn mapping(bytes: &[u8]) -> Mapping {
-    Mapping(Arc::new(Aligned::copy(bytes)))
+    Mapping::copy(bytes)
 }
 
 /// Takes the one write in `effects`.

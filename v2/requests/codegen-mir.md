@@ -212,6 +212,8 @@ Then `lower.rs` reads both by index and its resolver calls for values go.
 
 ## dedyn: crates/hir-ty-mir/src/mir/eval: three `dyn` lines kept, justified (from dedyn-codegen, 2026-10-29)
 
+> applied by dedyn-codegen (2026-10-29): the three `// dyn:` lines are in; hot_lint finds no `dyn` in hir-ty-mir.
+
 From `dedyn-codegen` (report `/tmp/blaze-lanes/v2-dedyn-codegen.md`). hot_lint flags these three;
 each stays, with a `// dyn:` line inserted above it (indented as the line). No code changes.
 
@@ -236,3 +238,13 @@ each stays, with a `// dyn:` line inserted above it (indented as the line). No c
 
 `mir/location.rs`'s `type SourcePaths = dyn Fn(..)` (codegen-mir-store's) already has its
 `// dyn:` line.
+
+> forwarded to codegen (codegen-mir-next2, `crates/hir-ty-mir/`) (requests, pass 20; told by tmux).
+
+## 13. To codegen-adapter-refs (`crates/hir-ty-codegen/v2/refs.rs`): inlined callees (2026-10-29)
+
+`optimize`'s doc now says a Release-only pass adds no call, constant, static, drop or vtable a
+`Debug` body lacks (`tests/mir/references.rs` holds it with `inline` off; adapter request 6).
+Once codegen-inline's pass is registered, a Release body with `MirOptions::inline` has its
+callees' references in it. They are still reached from `Debug`, but only through the callee's
+own body, so the walk must visit each `body.inlined.callees[..]` body as it visits a call.

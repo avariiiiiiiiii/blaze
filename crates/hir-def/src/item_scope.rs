@@ -2049,7 +2049,7 @@ impl ItemScope {
         };
 
         for (name, def) in entries {
-            let display_name: &dyn fmt::Display = match &name {
+            let display_name: &dyn fmt::Display = match &name { // dyn: the debug dump, formatting text anyway
                 Some(name) => &name.display(db, Edition::LATEST),
                 None => &"_",
             };

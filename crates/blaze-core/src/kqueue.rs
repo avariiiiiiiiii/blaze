@@ -414,6 +414,7 @@ impl Kqueue {
             | Effect::WriteAt { .. }
             | Effect::Rename { .. }
             | Effect::Mode { .. }
+            | Effect::Times { .. }
             | Effect::Clone { .. }
             | Effect::Link { .. }
             | Effect::Stat { .. }
@@ -1330,7 +1331,7 @@ mod tests {
     }
 
     /// Runs `effects` to their ends: what each tag ended with.
-    fn run(driver: &mut dyn Driver, effects: Vec<Effect>) -> BTreeMap<u64, Done> {
+    fn run(driver: &mut impl Driver, effects: Vec<Effect>) -> BTreeMap<u64, Done> {
         let mut effects = effects;
         let mut seen = BTreeMap::new();
         run_until_idle(driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
@@ -1585,7 +1586,7 @@ mod tests {
     #[test]
     fn files_end_as_on_threads() {
         let file = name("vfs/journal");
-        let script = |driver: &mut dyn Driver| {
+        fn script(driver: &mut impl Driver, file: &FileName) -> Vec<String> {
             let mut effects =
                 vec![Effect::Write { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
             let mut seen = Vec::new();
@@ -1627,10 +1628,10 @@ mod tests {
                 effects.push(next);
             });
             seen
-        };
+        }
         let (ours, theirs) = (dir("files"), dir("files-threads"));
-        let kqueue = script(&mut Kqueue::new(&ours, 2).unwrap());
-        let threads = script(&mut Threads::new(&theirs, 2));
+        let kqueue = script(&mut Kqueue::new(&ours, 2).unwrap(), &file);
+        let threads = script(&mut Threads::new(&theirs, 2), &file);
         assert_eq!(kqueue, threads);
         assert_eq!(kqueue[5], format!("{:?}", Done::Read(b"onet".to_vec())));
         assert_eq!(kqueue[3], format!("{:?}", Done::Read(b"etw".to_vec())));

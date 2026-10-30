@@ -33,12 +33,7 @@ pub fn held_by(pid: u32) -> Option<u64> {
 /// Activity Monitor shows, and which still counts pages macOS has compressed.
 #[cfg(target_os = "macos")]
 pub fn held_by(pid: u32) -> Option<u64> {
-    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-    let pid = libc::c_int::try_from(pid).ok()?;
-    // SAFETY: `info` has room for the `RUSAGE_INFO_V4` record the call writes.
-    let ok = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) };
-    // SAFETY: the call wrote the record when it returned 0, and zeroes are a record too.
-    (ok == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
+    crate::raw::memory::footprint(pid)
 }
 
 /// Bytes of memory the machine has, where the system says, or the fewer the control group of
@@ -223,19 +218,7 @@ fn in_use() -> Option<u64> {
 /// Bytes of memory the machine has.
 #[cfg(target_os = "macos")]
 pub fn of_the_machine() -> Option<u64> {
-    let mut bytes: u64 = 0;
-    let mut size = size_of::<u64>();
-    // SAFETY: `hw.memsize` is a 64-bit integer, and `bytes` and `size` say where it goes.
-    let ok = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut bytes).cast(),
-            &raw mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (ok == 0 && bytes != 0).then_some(bytes)
+    crate::raw::memory::machine_bytes()
 }
 
 /// The bytes a line of `/proc` such as `VmRSS:   1234 kB` says.
@@ -260,18 +243,7 @@ pub fn live() -> Option<u64> {
 /// to reuse otherwise.
 pub fn give_back() {
     #[cfg(unix)]
-    // SAFETY: `arena.<i>.purge` reads and writes nothing, and 4096 (`MALLCTL_ARENAS_ALL`)
-    // is every arena.
-    unsafe {
-        use std::ptr::null_mut;
-        tikv_jemalloc_sys::mallctl(
-            c"arena.4096.purge".as_ptr(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            0,
-        );
-    }
+    crate::raw::memory::purge_freed_pages();
 }
 
 /// Reports what the process holds now that `step` is done.
@@ -331,22 +303,20 @@ fn ingredients(db: &mut RootDatabase) -> String {
 #[cfg(feature = "heap-profile")]
 fn write_heap_profile(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
+    use tikv_jemalloc_ctl::{Access, AsName as _};
 
-    // SAFETY: `opt.prof` is a `bool`.
-    if !unsafe { tikv_jemalloc_ctl::raw::read::<bool>(b"opt.prof\0") }.unwrap_or(false) {
+    if !Access::<bool>::read(b"opt.prof\0".name()).unwrap_or(false) {
         return Ok(());
     }
     // A profile has the addresses of the code that allocated, and on macOS nothing of where
     // the program was loaded, which `harness/heapfold.py` needs to name them.
     #[cfg(target_os = "macos")]
     {
-        // SAFETY: image 0 is the program itself, which is loaded for as long as it runs.
-        let header = unsafe { libc::_dyld_get_image_header(0) } as usize;
+        let header = crate::raw::memory::program_image_base();
         std::fs::write(path.with_extension("load"), format!("{header:#x}\n"))?;
     }
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: `prof.dump` takes a C string, which `path` is for the length of the call.
-    unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", path.as_ptr()) }
+    crate::raw::memory::dump_heap_profile(&path)
         .map_err(|e| anyhow::anyhow!("writing the heap profile: {e}"))
 }
 

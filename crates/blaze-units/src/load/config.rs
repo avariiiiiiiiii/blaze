@@ -17,7 +17,8 @@ use super::files::{
 };
 use super::invocation::Asking;
 use super::load_error;
-use crate::query::{Cbor, LoadError, Mount, Versioned, key_input, producer};
+use super::key_id;
+use crate::query::{Cbor, LoadError, Mount, Versioned, producer};
 
 /// Which configuration a workspace is read with.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
@@ -93,7 +94,7 @@ impl Query for ConfigChain {
     type Value = Cbor<Result<ConfigRead, LoadError>>;
 
     fn input(key: &ConfigOf) -> ContentId {
-        key_input("blaze v2 cargo config key 2", key)
+        key_id("blaze v2 cargo config key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &ConfigOf) -> Result<Cbor<Result<ConfigRead, LoadError>>, Cancelled> {

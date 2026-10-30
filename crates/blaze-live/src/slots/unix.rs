@@ -1,5 +1,6 @@
 //! What Linux and macOS share: finding the descriptor with `dlsym`, walking a stack with
-//! `_Unwind_Backtrace`, and the unwinder's `__register_frame`.
+//! `_Unwind_Backtrace`, the unwinder's `__register_frame`, and address space reserved with
+//! `mmap` and committed with `mprotect` ([`Reserved`]).
 
 #![allow(unsafe_code)]
 
@@ -31,7 +32,31 @@ unsafe extern "C" {
     ) -> c_int;
     fn _Unwind_GetIP(context: *mut c_void) -> usize;
     pub(super) fn __register_frame(frame: *const u8);
+    pub(super) fn mmap(
+        addr: *mut c_void,
+        len: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        offset: i64,
+    ) -> *mut c_void;
+    pub(super) fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    pub(super) fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
 }
+
+const PROT_NONE: c_int = 0;
+const PROT_READ: c_int = 1;
+const PROT_WRITE: c_int = 2;
+const MAP_PRIVATE: c_int = 2;
+#[cfg(target_os = "linux")]
+const MAP_ANONYMOUS: c_int = 0x20;
+#[cfg(target_os = "macos")]
+const MAP_ANONYMOUS: c_int = 0x1000;
+#[cfg(target_os = "linux")]
+const MAP_NORESERVE: c_int = 0x4000;
+#[cfg(target_os = "macos")]
+const MAP_NORESERVE: c_int = 0x40;
+const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
 const RTLD_LAZY: c_int = 1;
 #[cfg(target_os = "linux")]
@@ -354,4 +379,116 @@ pub(super) fn loaders(at: u64, slots: u64) -> &'static [u64] {
     // SAFETY: `Switch::new` checked `at..at + slots * 8` is in the image and `at` 8-aligned
     // before the first call; nothing writes it (the switch refuses data over it).
     unsafe { image::words(at, slots as usize) }
+}
+
+/// What a reservation's length and commits are multiples of: the largest page of the
+/// platforms (64 KiB, AArch64 Linux built for it), so every commit is whole pages.
+pub(super) const GRAIN: usize = 64 << 10;
+
+/// Address space reserved with no access and no memory behind it (`PROT_NONE`,
+/// `MAP_NORESERVE`), committed read and write from its start as it grows, never moved, and
+/// unmapped when dropped. A committed page costs memory only once written.
+///
+/// Invariant, which [`image::rows`] relies on: `at..at + committed` is mapped read and write,
+/// zero where never written, and no one else's; `at` is page-aligned.
+pub(super) struct Reserved {
+    at: u64,
+    len: usize,
+    committed: usize,
+}
+
+impl Reserved {
+    /// Reserves `len` bytes, a nonzero multiple of [`GRAIN`].
+    pub(super) fn new(len: usize) -> Result<Reserved, String> {
+        assert!(len != 0 && len.is_multiple_of(GRAIN), "a reservation of whole grains");
+        let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+        // SAFETY: a new private mapping anywhere, with no access: it changes no memory there is.
+        let at = unsafe { mmap(std::ptr::null_mut(), len, PROT_NONE, flags, -1, 0) };
+        if at == MAP_FAILED {
+            // alloc: error path, once at start
+            return Err(format!(
+                "mmap of {len} bytes of address space: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Reserved { at: at as u64, len, committed: 0 })
+    }
+
+    pub(super) fn base(&self) -> u64 {
+        self.at
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(super) fn committed(&self) -> usize {
+        self.committed
+    }
+
+    /// Commits the first `upto` bytes, a multiple of [`GRAIN`] no more than the length: one
+    /// `mprotect` of what was not committed yet.
+    pub(super) fn commit(&mut self, upto: usize) -> Result<(), String> {
+        if upto <= self.committed {
+            return Ok(());
+        }
+        assert!(upto <= self.len && upto.is_multiple_of(GRAIN), "a commit of whole grains");
+        let (start, len) = (self.at + self.committed as u64, upto - self.committed);
+        // SAFETY: `start..start + len` is whole pages of this reservation (asserted), past what
+        // is committed, which nothing reads or writes: giving it access changes no byte.
+        if unsafe { mprotect(start as *mut c_void, len, PROT_READ | PROT_WRITE) } != 0 {
+            // alloc: error path
+            return Err(format!(
+                "mprotect of {len} bytes at {start:#x}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        self.committed = upto;
+        Ok(())
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        // SAFETY: this reservation's own mapping, which no view borrows any more (views borrow
+        // the reservation, and it is being dropped).
+        unsafe { munmap(self.at as *mut c_void, self.len) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::{c_int, c_void};
+
+    use super::super::column::{Column, STEP};
+
+    unsafe extern "C" {
+        fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> c_int;
+    }
+
+    /// How many pages of `at..at + len` are resident.
+    fn resident(at: u64, len: usize) -> usize {
+        // One byte per 4 KiB is room for a byte per page of any page size.
+        let mut pages = vec![0u8; len / 4096];
+        // SAFETY: `at..at + len` is one reservation, mapped; `pages` has a byte per page.
+        let read = unsafe { mincore(at as *mut c_void, len, pages.as_mut_ptr()) };
+        assert_eq!(read, 0, "mincore: {}", std::io::Error::last_os_error());
+        pages.iter().filter(|it| **it & 1 != 0).count()
+    }
+
+    /// A column costs no memory for what it reserves, nor for what it commits, until a row is
+    /// written: then the page the row is on.
+    #[test]
+    fn a_column_costs_memory_only_where_written() {
+        let mut column = Column::<u64>::new("a test column", 1 << 20).expect("reserved");
+        let (at, len) = column.reserved();
+        assert_eq!(len, 8 << 20);
+        assert_eq!(resident(at, len), 0, "reserved, nothing committed");
+        column.room(2 * STEP / 8).expect("committed");
+        assert_eq!(column.committed(), 2 * STEP);
+        assert_eq!(resident(at, len), 0, "committed, nothing written");
+        column.push(7).expect("room");
+        assert_eq!(resident(at, len), 1, "one row written");
+        assert_eq!(column[0], 7);
+    }
 }

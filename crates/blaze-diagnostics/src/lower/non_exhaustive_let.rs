@@ -13,7 +13,7 @@
 use syntax::{AstNode, TextRange, ast};
 
 use super::missing_match_arms::{
-    DefinedHere, Uncovered, Witnesses, adt_fact, const_that_looks_like_binding, plural,
+    DefinedHere, Uncovered, Witnesses, adt_fact, all_chars, const_that_looks_like_binding, plural,
 };
 use crate::{
     cx::Cx,
@@ -111,7 +111,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::NonExhaustiveLet) -> Vec<Fou
     }
     if constant.is_none()
         && let ast::Pat::LiteralPat(literal) = &pat.value
-        && literal.syntax().text().to_string().chars().all(|c| c.is_ascii_digit())
+        && all_chars(literal.syntax(), |c| c.is_ascii_digit())
     {
         diag.suggestion(
             span.shrink_to_lo(),

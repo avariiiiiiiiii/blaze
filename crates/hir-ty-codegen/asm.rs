@@ -1577,7 +1577,9 @@ fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, 
     let name: String =
         key[..8].iter().map(|it| format!("{it:02x}")).chain([format!("-{run}.o")]).collect();
     let dir = std::env::temp_dir().join(format!("blaze-asm-{}", std::process::id()));
-    let failed = |what: &str, e: &dyn std::fmt::Display| format!("inline assembly: {what}: {e}");
+    fn failed(what: &str, e: impl std::fmt::Display) -> String {
+        format!("inline assembly: {what}: {e}")
+    }
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Some(Err(failed("no directory to assemble in", &e)));
     }
@@ -1612,7 +1614,9 @@ fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, 
 
 /// The function in an object that defines it alone.
 fn code(object: &[u8]) -> Result<Assembled, String> {
-    let failed = |e: &dyn std::fmt::Display| format!("inline assembly: {e}");
+    fn failed(e: impl std::fmt::Display) -> String {
+        format!("inline assembly: {e}")
+    }
     let file = object::File::parse(object).map_err(|e| failed(&e))?;
     let symbol = file
         .symbols()

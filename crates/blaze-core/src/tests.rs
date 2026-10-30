@@ -25,7 +25,7 @@ fn dir(what: &str) -> PathBuf {
 
 /// What became of each step, by its tag. A clone is either done or refused for the file
 /// system, which the drivers on disk may differ in; it reads back the same either way.
-fn script(driver: &mut dyn Driver) -> BTreeMap<u64, String> {
+fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
     let mut seen = BTreeMap::new();
     let mut effects = vec![Effect::Write {
         file: name("store/a/value"),
@@ -129,11 +129,159 @@ fn every_driver_ends_the_script_the_same() {
     }
 }
 
+/// This target's [`crate::Native`] driver, as the build path makes it, ends the script as the
+/// threads driver does.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn the_native_driver_runs_the_shared_script_as_threads_does() {
+    let root = dir("native-script");
+    let threads = script(&mut Threads::new(&root, 2));
+    let root = dir("native-script-native");
+    assert_eq!(script(&mut crate::native(&root, 2).unwrap()), threads);
+}
+
+/// A time with nanoseconds below the second, and a whole number of NTFS's 100 ns, so every
+/// file system the tests run on keeps it exactly.
+const TIME: u64 = 1_700_000_000_123_456_700;
+
+/// A file written and its times set to `TIME`, then a directory's set to an earlier time, read
+/// back by a stat and a listing; then a name never written and one renamed away are each set,
+/// and fail naming it. What came of each step, by its tag.
+fn times(driver: &mut impl Driver) -> BTreeMap<u64, String> {
+    let earlier = TIME - 86_400 * 1_000_000_000;
+    let mut seen = BTreeMap::new();
+    let mut effects =
+        vec![Effect::Write { file: name("target/build/output"), bytes: b"cargo::rerun-if-changed=build.rs\n".to_vec(), tag: Tag(1) }];
+    run_until_idle(driver, &mut effects, |done, effects| {
+        let shown = match &done.done {
+            // A directory's own length is the file system's.
+            Done::Stat(Some(meta)) if meta.dir => format!("stat a directory {}", meta.modified_ns),
+            Done::Stat(Some(meta)) => format!("stat {} bytes {}", meta.len, meta.modified_ns),
+            Done::Listed(found) => found
+                .iter()
+                .filter(|(_, meta)| !meta.dir)
+                .map(|(file, meta)| format!("{file} {}", meta.modified_ns))
+                .collect::<Vec<_>>()
+                .join(", "),
+            Done::Failed(why) if why.0.contains("never-written") || why.0.contains("output") => "failed, named".to_owned(),
+            other => format!("{other:?}"),
+        };
+        seen.insert(done.tag.0, shown);
+        let next = match done.tag.0 {
+            1 => Effect::Times { file: name("target/build/output"), modified_ns: TIME, tag: Tag(2) },
+            2 => Effect::Stat { file: name("target/build/output"), tag: Tag(3) },
+            3 => Effect::Times { file: name("target/build"), modified_ns: earlier, tag: Tag(4) },
+            4 => Effect::Stat { file: name("target/build"), tag: Tag(5) },
+            5 => Effect::List { dir: name("target"), tag: Tag(6) },
+            6 => Effect::Times { file: name("target/never-written"), modified_ns: TIME, tag: Tag(7) },
+            7 => Effect::Rename { from: name("target/build/output"), to: name("target/moved"), tag: Tag(8) },
+            8 => Effect::Times { file: name("target/build/output"), modified_ns: TIME, tag: Tag(9) },
+            9 => Effect::Stat { file: name("target/moved"), tag: Tag(10) },
+            _ => return,
+        };
+        effects.push(next);
+    });
+    seen
+}
+
+/// A file's times read back as they were set, on every driver that runs here; a name not
+/// there, never written or renamed away, fails and is named.
+#[test]
+fn every_driver_sets_a_files_times_as_asked() {
+    let earlier = TIME - 86_400 * 1_000_000_000;
+    let simulated = times(&mut Sim::new(5, Faults::default()));
+    assert_eq!(simulated[&2], format!("{:?}", Done::Timed));
+    assert_eq!(simulated[&3], format!("stat 33 bytes {TIME}"));
+    assert_eq!(simulated[&4], format!("{:?}", Done::Timed));
+    assert_eq!(simulated[&5], format!("stat a directory {earlier}"));
+    assert_eq!(simulated[&6], format!("target/build/output {TIME}"));
+    assert_eq!((&simulated[&7][..], &simulated[&9][..]), ("failed, named", "failed, named"));
+    // A rename keeps the inode, and with it the time.
+    assert_eq!(simulated[&10], format!("stat 33 bytes {TIME}"));
+    let root = dir("times-threads");
+    assert_eq!(times(&mut Threads::new(&root, 2)), simulated, "threads");
+    #[cfg(target_os = "linux")]
+    assert_eq!(times(&mut crate::uring::Uring::new(dir("times-uring")).unwrap()), simulated, "io_uring");
+    #[cfg(target_os = "macos")]
+    assert_eq!(times(&mut crate::kqueue::Kqueue::new(dir("times-kqueue"), 2).unwrap()), simulated, "kqueue");
+    #[cfg(windows)]
+    assert_eq!(times(&mut crate::iocp::Iocp::new(&dir("times-iocp"), 2).unwrap()), simulated, "IOCP");
+}
+
+/// `rounds` of the file `f`'s times set: what they allocated on the polling thread.
+fn times_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
+    let file = name("f");
+    let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(4));
+    let mut used = 0;
+    for round in 0..rounds {
+        // The caller's: made before the cycle.
+        effects.push(Effect::Times { file: file.clone(), modified_ns: TIME + 100 * round, tag: Tag(round) });
+        let ((), cycle) = blaze_alloc_count::measure(|| {
+            driver.submit(&mut effects);
+            poll_for(driver, &mut out, 1);
+        });
+        used += cycle.allocations;
+        assert_eq!(out.as_slice(), [Completion { tag: Tag(round), done: Done::Timed }]);
+        out.clear();
+    }
+    assert_eq!(driver.in_flight(), 0);
+    used
+}
+
+/// A file's times set, once the driver has grown to it: nothing allocated by the drivers on
+/// disk, on the polling thread or a file thread. The simulation's disk keeps a journal of
+/// every change, which a set of times is: one entry each (its name), and the journal's growth.
+#[test]
+fn a_warm_times_set_allocates_nothing() {
+    fn write(driver: &mut impl Driver) {
+        let mut effects = vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
+        run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
+    }
+    let mut sim = Sim::new(15, Faults::default());
+    write(&mut sim);
+    times_rounds(&mut sim, WARM);
+    let used = times_rounds(&mut sim, ROUNDS);
+    let journal = ROUNDS + u64::from(ROUNDS.ilog2());
+    assert!(
+        used <= journal,
+        "the simulation: {used} allocations over {ROUNDS} warm sets of times; its journal's entries and growth are {journal}"
+    );
+    let root = dir("budget-times");
+    let mut threads = Threads::new(&root, 1);
+    write(&mut threads);
+    times_rounds(&mut threads, WARM);
+    threads.off_thread();
+    assert_eq!(times_rounds(&mut threads, ROUNDS), 0, "threads: {ROUNDS} warm sets of times, on the polling thread");
+    assert_eq!(threads.off_thread(), (0, 0), "threads: the file thread's utimensat or SetFileTime");
+    drop(threads);
+    std::fs::remove_dir_all(root).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        let root = dir("budget-times-uring");
+        let mut ring = crate::uring::Uring::new(&root).unwrap();
+        write(&mut ring);
+        times_rounds(&mut ring, WARM);
+        assert_eq!(times_rounds(&mut ring, ROUNDS), 0, "io_uring: {ROUNDS} warm sets of times, its utimensat inline");
+        drop(ring);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let root = dir("budget-times-iocp");
+        let mut iocp = crate::iocp::Iocp::new(&root, 1).unwrap();
+        write(&mut iocp);
+        times_rounds(&mut iocp, WARM);
+        assert_eq!(times_rounds(&mut iocp, ROUNDS), 0, "IOCP: {ROUNDS} warm sets of times, SetFileTime inline");
+        drop(iocp);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// Timers asked for out of order, some due at once and one never in the test's time, fire in
 /// the order they are due on every driver, each counted out of what is in flight.
 #[test]
 fn every_driver_fires_timers_in_their_order() {
-    let run = |driver: &mut dyn Driver| {
+    fn run(driver: &mut impl Driver) -> Vec<u64> {
         let mut effects: Vec<Effect> = [9u64, 0, 4, 0, 13, 2, 7]
             .into_iter()
             .enumerate()
@@ -155,7 +303,7 @@ fn every_driver_fires_timers_in_their_order() {
         // The two due at once may fire together, in either order on a real clock.
         fired[..2].sort_unstable();
         fired
-    };
+    }
     let want = vec![1, 3, 5, 2, 6, 0, 4];
     assert_eq!(run(&mut Sim::new(3, Faults::default())), want);
     assert_eq!(run(&mut Threads::new(&dir("timers-threads"), 1)), want);
@@ -171,7 +319,7 @@ fn every_driver_fires_timers_in_their_order() {
 #[cfg(target_os = "linux")]
 #[test]
 fn watches_hear_a_file_written_under_them() {
-    let run = |driver: &mut dyn Driver, root: Option<&std::path::Path>| {
+    fn run(driver: &mut impl Driver, root: Option<&std::path::Path>) -> Vec<FileName> {
         let mut effects = vec![
             Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) },
         ];
@@ -208,7 +356,7 @@ fn watches_hear_a_file_written_under_them() {
         assert!(ended, "the watch never ended; heard {heard:?}");
         assert_eq!(driver.in_flight(), 0);
         heard
-    };
+    }
     let root = dir("watch-threads");
     let heard = run(&mut Threads::new(&root, 2), Some(&root));
     assert!(heard.contains(&name("src/keep")), "{heard:?}");
@@ -220,7 +368,7 @@ fn watches_hear_a_file_written_under_them() {
 /// A file written by someone else before a flush is heard of before the flush completes, every
 /// round; a flush of a watch not in flight fails; nothing is left in flight once the watch ends.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn flushes_follow_the_changes_before_them(driver: &mut dyn Driver, root: &std::path::Path) {
+fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::path::Path) {
     let mut effects = vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
     run_until_idle(driver, &mut effects, |_, _| {});
     driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
@@ -280,7 +428,7 @@ fn every_watching_driver_tells_a_flush_after_the_changes_before_it() {
 /// A file mapped, a process run with input, and a connection made, used and hung up: what
 /// came of each, by step.
 #[cfg(unix)]
-fn processes_and_sockets(driver: &mut dyn Driver) -> Vec<String> {
+fn processes_and_sockets(driver: &mut impl Driver) -> Vec<String> {
     use crate::{Address, Command, Sandbox};
     let at = Address::Unix(name("run/daemon.sock"));
     let sh = Box::new(Command {
@@ -423,7 +571,7 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
             Ok(Traced { env, ..Traced::default() })
         }
     }
-    let command = || {
+    fn command() -> Box<Command> {
         Box::new(Command {
             program: "/bin/echo".into(),
             args: vec![" ok".into()],
@@ -433,13 +581,13 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
             sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true },
             memory: None,
         })
-    };
-    let run = |driver: &mut dyn Driver| {
+    }
+    fn run(driver: &mut impl Driver) -> Done {
         let mut effects = vec![Effect::Spawn { command: command(), tag: Tag(1) }];
         let mut done = None;
         run_until_idle(driver, &mut effects, |it, _| done = Some(it.done));
         done.expect("the spawn ended")
-    };
+    }
     let check = |root: &std::path::Path, refused: Done, confined: Done| {
         assert!(matches!(&refused, Done::Failed(why) if why.0.contains("Confine")), "{refused:?}");
         let Done::Exited(exit) = confined else { panic!("{confined:?}") };
@@ -545,10 +693,10 @@ fn file_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
 /// Read's `Vec<u8>`.
 #[test]
 fn a_warm_file_cycle_allocates_only_the_reads_bytes() {
-    let write = |driver: &mut dyn Driver| {
+    fn write(driver: &mut impl Driver) {
         let mut effects = vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
         run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
-    };
+    }
     let mut sim = Sim::new(11, Faults::default());
     write(&mut sim);
     file_rounds(&mut sim, WARM);
@@ -790,5 +938,26 @@ fn a_warm_send_and_receive_allocates_only_the_bytes_received() {
     assert!(payload <= ROUNDS, "threads: {payload} allocations of received bytes over {ROUNDS} receives");
     hung_up_conns_name_nothing(&mut threads, &at, conns);
     drop(threads);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A mapping copied reads as the file mapped with the same bytes, on a sixteen-byte boundary
+/// like the file's page, at every length around a block's; equal bytes are equal mappings, and
+/// only a clone is the same one.
+#[test]
+fn a_copied_mapping_reads_as_the_file_mapped() {
+    let root = dir("mapping");
+    for len in [0usize, 1, 15, 16, 17, 31, 4097] {
+        let bytes: Vec<u8> = (0..len).map(|at| (at * 7 + 3) as u8).collect();
+        let path = root.join(len.to_string());
+        std::fs::write(&path, &bytes).unwrap();
+        let file = crate::fs::map(&path).unwrap();
+        let copied = crate::Mapping::copy(&bytes);
+        assert_eq!((file.bytes(), copied.bytes()), (&bytes[..], &bytes[..]), "{len} bytes");
+        assert!((copied.bytes().as_ptr() as usize).is_multiple_of(16), "{len} bytes");
+        assert_eq!(file, copied, "{len} bytes");
+        assert!(!file.same(&copied) && file.same(&file.clone()) && copied.same(&copied.clone()));
+        assert!(!copied.same(&crate::Mapping::copy(&bytes)));
+    }
     std::fs::remove_dir_all(root).unwrap();
 }

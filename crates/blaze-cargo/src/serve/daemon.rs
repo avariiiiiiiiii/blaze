@@ -2,16 +2,18 @@
 //!
 //! - A completion goes to what asked for it, by its tag: the server, the VFS, the database, the
 //!   store, the checkouts' watchers and cookies and the watches outside views, the jobs (their lock writes, modes and user
-//!   code), or the loop's own (the start, the estimates).
+//!   code), the image, or the loop's own (the start).
 //! - What arrives goes through [`Heads`] (a request on a checkout waits for its watcher) to the
 //!   session; what the session answers goes to the server. The VFS is flushed after every
 //!   session call, so what a call committed is on its way to durability when it returns.
 //! - The plane is stepped after every completion; what it did goes to the jobs, and what the
 //!   jobs say to the session.
 //! - Between requests the database and the VFS are collected, keeping each view's plan and
-//!   every mount; after a cold build the image is written and the database settles onto it.
-//! - A stop writes the image and the estimates, waits for the image to be mapped, then stops
-//!   listening and hangs up.
+//!   every mount; after a cold build the daemon image ([`Images`]: the database, the VFS, the
+//!   plane's history and their symbols) is written and the database settles onto it.
+//! - A start maps that image once: the symbols are restored from it first, then the VFS, the
+//!   database and the plane's history each open their sections of it.
+//! - A stop writes the image, waits for it to be mapped, then stops listening and hangs up.
 
 #![forbid(unsafe_code)]
 
@@ -28,12 +30,15 @@ use blaze_api::{
 };
 use blaze_cas::Store;
 use blaze_core::{Address, Completion, Done, Driver, Effect, FileName, Mapping, Tag};
-use blaze_graph::{Budget, PlaneConfig, admission::Estimates, arena};
-use blaze_query::{Database, DbError};
-use blaze_vfs::{Outside, Ticket, Vfs};
+use blaze_graph::{Budget, PlaneConfig, arena};
+use blaze_history::{Config as HistoryConfig, History};
+use blaze_image::Image;
+use blaze_query::Database;
+use blaze_vfs::{ImageUse, Outside, Ticket, Vfs};
 
 use super::{
     heads::{Heads, Out},
+    image::{Images, Parts, on_pool},
     job::{Jobs, Said, Setup, Value, World},
     mounts::Mounts,
     plane::{Happened, Plane, Runner},
@@ -60,15 +65,12 @@ const STAT_JOURNAL: Tag = Tag(OWN);
 const READ_JOURNAL: Tag = Tag(OWN + 1);
 const STAT_IMAGE: Tag = Tag(OWN + 2);
 const MAP_IMAGE: Tag = Tag(OWN + 3);
-const STAT_ESTIMATES: Tag = Tag(OWN + 4);
-const READ_ESTIMATES: Tag = Tag(OWN + 5);
 const DIAL: Tag = Tag(OWN + 6);
 const UNLINK: Tag = Tag(OWN + 7);
 const HANG_UP: Tag = Tag(OWN + 8);
-const WRITE_ESTIMATES: Tag = Tag(OWN + 9);
+/// The image's write and its map ([`Images`]).
+const IMAGE: u64 = OWN + 10;
 
-/// What a task of a kind never measured is taken to hold.
-const UNSEEN: u64 = 64 << 20;
 /// How long a stop waits for the driver's last effects once it hung up.
 const LAST_EFFECTS: Duration = Duration::from_secs(2);
 
@@ -98,6 +100,7 @@ macro_rules! world {
             plane: &mut $daemon.plane,
             mounts: &mut $daemon.mounts,
             heads: &$daemon.heads,
+            images: &mut $daemon.images,
             steps: &$daemon.steps,
             effects: &mut $daemon.effects,
             said: &mut $said,
@@ -135,7 +138,7 @@ fn under(dir: &FileName, name: &str) -> FileName {
 }
 
 enum Stopping {
-    /// The image and estimates are being written.
+    /// The image is being written.
     Image,
     /// Hung up: the driver's last effects end.
     Hangup { at: Duration },
@@ -147,7 +150,6 @@ pub struct Daemon<D: Driver> {
     effects: Vec<Effect>,
     done: Vec<Completion>,
     listening: String,
-    estimates_file: FileName,
     server: Server,
     session: Session,
     vfs: Vfs,
@@ -157,6 +159,7 @@ pub struct Daemon<D: Driver> {
     plane: Plane<Value>,
     mounts: Mounts,
     heads: Heads,
+    images: Images,
     jobs: Jobs,
     steps: Arc<dyn Steps>,
     replies: Vec<Reply>,
@@ -167,6 +170,10 @@ pub struct Daemon<D: Driver> {
     settling: bool,
     failed: Option<String>,
     pid: u32,
+    /// The database started from the image, not empty.
+    warm: bool,
+    /// The VFS's image group last found corrupt, reported and rescanned once.
+    vfs_corrupt: Option<blaze_image::Corrupt>,
 }
 
 /// The buffers the loop's calls borrow and give back, so a warm turn allocates none: a call
@@ -184,7 +191,6 @@ struct Spare {
 struct Read {
     journal: Option<Vec<u8>>,
     image: Option<Option<Mapping>>,
-    estimates: Option<Option<Vec<u8>>>,
     socket_free: bool,
 }
 
@@ -201,7 +207,6 @@ impl<D: Driver> Daemon<D> {
         let journal = under(&state, "journal");
         let db_dir = under(&state, "db");
         let image = under(&db_dir, "image");
-        let estimates_file = under(&state, "estimates");
         // A passed socket is neither dialed (that reaches this daemon's own backlog) nor
         // unlinked (its file is the manager's).
         #[cfg(unix)]
@@ -211,18 +216,19 @@ impl<D: Driver> Daemon<D> {
         let mut effects = vec![
             Effect::Stat { file: journal.clone(), tag: STAT_JOURNAL },
             Effect::Stat { file: image.clone(), tag: STAT_IMAGE },
-            Effect::Stat { file: estimates_file.clone(), tag: STAT_ESTIMATES },
         ];
         if !activated {
             effects.push(Effect::Connect { at: Address::Unix(options.socket.clone()), tag: DIAL });
         }
         let store_config = blaze_cas::Config { dir: under(&state, "store"), layers: Vec::new(), tags: STORE };
         let mut store = Store::open(store_config, &mut effects);
+        store.encode_columns(blaze_format::Spans::columns());
+        store.encode_columns(hir_def::item_tree::ItemTree::columns());
         let mut read = Read { socket_free: activated, ..Read::default() };
         let mut done = Vec::new();
         let socket = format!("/{}", options.socket);
         loop {
-            let read_all = read.journal.is_some() && read.image.is_some() && read.estimates.is_some() && read.socket_free;
+            let read_all = read.journal.is_some() && read.image.is_some() && read.socket_free;
             if read_all && (store.ready() || store.broken().is_some()) {
                 break;
             }
@@ -241,11 +247,6 @@ impl<D: Driver> Daemon<D> {
                     (STAT_IMAGE, Done::Stat(None)) => read.image = Some(None),
                     (STAT_IMAGE, Done::Stat(Some(_))) => effects.push(Effect::Map { file: image.clone(), tag: MAP_IMAGE }),
                     (MAP_IMAGE, Done::Mapped(mapping)) => read.image = Some(Some(mapping)),
-                    (STAT_ESTIMATES, Done::Stat(None)) => read.estimates = Some(None),
-                    (STAT_ESTIMATES, Done::Stat(Some(_))) => {
-                        effects.push(Effect::ReadAll { file: estimates_file.clone(), tag: READ_ESTIMATES });
-                    }
-                    (READ_ESTIMATES, Done::Read(bytes)) => read.estimates = Some(Some(bytes)),
                     (DIAL, Done::Connected { conn }) => {
                         effects.push(Effect::Hangup { conn, tag: HANG_UP });
                         driver.submit(&mut effects);
@@ -254,11 +255,8 @@ impl<D: Driver> Daemon<D> {
                     (DIAL, Done::Failed(_)) => effects.push(Effect::Remove { file: options.socket.clone(), tag: UNLINK }),
                     (UNLINK, Done::Removed | Done::Failed(_)) => read.socket_free = true,
                     (READ_JOURNAL, Done::Failed(error)) => return Err(format!("reading the VFS's journal /{journal}: {error}")),
-                    (MAP_IMAGE, Done::Failed(error)) => return Err(format!("mapping the database's image /{image}: {error}")),
-                    (READ_ESTIMATES, Done::Failed(error)) => {
-                        return Err(format!("reading the plane's estimates /{estimates_file}: {error}"));
-                    }
-                    (STAT_JOURNAL | STAT_IMAGE | STAT_ESTIMATES, Done::Failed(error)) => {
+                    (MAP_IMAGE, Done::Failed(error)) => return Err(format!("mapping the daemon image /{image}: {error}")),
+                    (STAT_JOURNAL | STAT_IMAGE, Done::Failed(error)) => {
                         return Err(format!("the daemon's state in /{state}: {error}"));
                     }
                     (tag, done) => return Err(format!("the start was answered {done:?} for tag {}", tag.0)),
@@ -268,35 +266,55 @@ impl<D: Driver> Daemon<D> {
         if let Some(broken) = store.broken() {
             return Err(broken.to_string());
         }
-        let (vfs, recovered) = Vfs::recover(journal.clone(), VFS, &read.journal.unwrap_or_default());
+        let mapping = read.image.flatten();
+        // clone: a count of the mapping, shared by the VFS and the image the rest read.
+        let opened = match mapping.clone().map(Image::open).transpose() {
+            Ok(opened) => opened.map(Arc::new),
+            Err(error) => {
+                eprintln!("blaze serve: the daemon image /{image} is not one this blaze opens ({error}): starting with an empty database");
+                None
+            }
+        };
+        // First: every other section names symbols by their IDs in this table.
+        let restored = opened.as_ref().map(|it| (it.clone(), intern::restore_symbols(it.clone(), &on_pool)));
+        let (vfs, recovered) = Vfs::restore(journal.clone(), VFS, &read.journal.unwrap_or_default(), mapping);
         if recovered.skipped > 0 || recovered.heads_dropped > 0 {
             eprintln!(
                 "blaze serve: the journal /{journal} ended in {} bytes that were no whole record, and {} heads whose root was lost were dropped",
                 recovered.skipped, recovered.heads_dropped
             );
         }
+        if let Some(why) = image_use(&recovered.image) {
+            eprintln!("blaze serve: the VFS and the daemon image /{image}: {why}");
+        }
         let config = blaze_query::Config { tree: Some(Arc::new(vfs.reader())), dir: Some(db_dir), tags: DB };
-        let mut db = match read.image.flatten() {
+        let mut warm = false;
+        let mut db = match restored {
             None => Database::new(config),
-            Some(mapping) => match Database::from_image_with(config.clone(), mapping) {
-                Ok(db) => db,
-                Err(DbError::Image(error)) => {
-                    eprintln!("blaze serve: the database's image /{image} is not this blaze's ({error}): starting with an empty database");
+            Some((_, Err(error))) => {
+                eprintln!("blaze serve: the symbols of the daemon image /{image}: {error}; starting with an empty database");
+                Database::new(config)
+            }
+            Some((opened, Ok(()))) => match Database::from_image_with(config.clone(), opened) {
+                Ok(db) => {
+                    warm = true;
+                    db
+                }
+                Err(error) if error.is_image() => {
+                    eprintln!("blaze serve: the database's sections of the daemon image /{image}: {error}; starting with an empty database");
                     Database::new(config)
                 }
-                Err(error) => return Err(format!("the database's image /{image}: {error}")),
+                Err(error) => return Err(format!("the database's sections of the daemon image /{image}: {error}")),
             },
         };
         steps.register(&mut db);
-        let estimates = match read.estimates.flatten() {
-            None => Estimates::new(UNSEEN),
-            Some(bytes) => Estimates::decode(&bytes).unwrap_or_else(|error| {
-                eprintln!("blaze serve: the plane's estimates /{estimates_file} do not decode ({error:?}): starting from none");
-                Estimates::new(UNSEEN)
-            }),
+        let history = match opened.as_deref() {
+            None => History::new(HistoryConfig::default()),
+            Some(opened) => super::image::history(opened, HistoryConfig::default())
+                .map_err(|error| format!("the daemon image /{image}: {error}"))?,
         };
         let plane_config = PlaneConfig { io: options.io, work: options.threads.max(1), budget: options.budget, starve_after: 8 };
-        let plane = Plane::new(plane_config, estimates, runner).map_err(|error| format!("the plane: {error}"))?;
+        let plane = Plane::new(plane_config, Box::new(history), runner).map_err(|error| format!("the plane: {error}"))?;
         let mounts = Mounts::recover(&vfs);
         let mut listening = socket.clone();
         #[cfg(unix)]
@@ -333,7 +351,6 @@ impl<D: Driver> Daemon<D> {
             effects,
             done,
             listening,
-            estimates_file,
             server,
             session: Session::new(),
             vfs,
@@ -342,6 +359,7 @@ impl<D: Driver> Daemon<D> {
             plane,
             mounts,
             heads: Heads::new(COOKIES, WATCHERS, RUNS, Outside::new(options.outside, "/", OUTSIDE)),
+            images: Images::new(image, IMAGE),
             jobs,
             steps,
             replies: Vec::new(),
@@ -351,12 +369,20 @@ impl<D: Driver> Daemon<D> {
             settling: false,
             failed: None,
             pid: std::process::id(),
+            warm,
+            vfs_corrupt: None,
         })
     }
 
     /// Where it listens, for people.
     pub fn listening(&self) -> &str {
         &self.listening
+    }
+
+    /// Whether its database started from the image: an image's symbols are restored once a
+    /// process, before any is interned, so one started again in a process starts it empty.
+    pub fn warm(&self) -> bool {
+        self.warm
     }
 
     /// Why it stopped when it was not asked to.
@@ -403,15 +429,14 @@ impl<D: Driver> Daemon<D> {
         }
         self.stopping = Some(Stopping::Image);
         self.heads.stop(&mut self.effects);
-        self.db.write_image(&mut self.effects);
-        self.write_estimates();
+        self.ask_image();
         self.store.flush(&mut self.effects);
         self.vfs.flush(&mut self.effects);
     }
 
-    fn write_estimates(&mut self) {
-        let bytes = self.plane.estimates().encode();
-        self.effects.push(Effect::Write { file: self.estimates_file.clone(), bytes, tag: WRITE_ESTIMATES });
+    fn ask_image(&mut self) {
+        let parts = Parts { db: &self.db, vfs: &mut self.vfs, predict: self.plane.predict(), effects: &mut self.effects };
+        self.images.ask(parts);
     }
 
     /// One turn of the loop: what is asked submitted, what completed taken, the plane and the
@@ -435,6 +460,9 @@ impl<D: Driver> Daemon<D> {
         }
         self.done = done;
         self.step_plane();
+        let idle = self.effects.is_empty() && self.driver.in_flight() == 0;
+        let parts = Parts { db: &self.db, vfs: &mut self.vfs, predict: self.plane.predict(), effects: &mut self.effects };
+        self.images.step(parts, idle);
         self.between();
         self.stepping_stop();
         self.driver.submit(&mut self.effects);
@@ -445,11 +473,7 @@ impl<D: Driver> Daemon<D> {
     /// no part asked and no lock taken.
     fn dispatch(&mut self, completion: Completion) {
         match completion.tag.0 {
-            tag if tag == WRITE_ESTIMATES.0 => {
-                if let Done::Failed(error) = completion.done {
-                    eprintln!("blaze serve: writing the plane's estimates /{}: {error}", self.estimates_file);
-                }
-            }
+            _ if self.images.owns(completion.tag) => self.images.complete(&mut self.vfs, completion, &mut self.effects),
             SERVER..VFS => {
                 let mut arrived = self.spare.arrived.pop().unwrap_or_default();
                 self.server.complete(completion, &mut self.effects, &mut arrived);
@@ -497,7 +521,7 @@ impl<D: Driver> Daemon<D> {
 
     fn arrive(&mut self, arrived: Arrived) {
         let mut out = self.spare.out.pop().unwrap_or_default();
-        self.heads.arrive(arrived, &mut self.effects, &mut out);
+        self.heads.arrive(&self.vfs, arrived, &mut self.effects, &mut out);
         self.outs(out);
     }
 
@@ -594,29 +618,40 @@ impl<D: Driver> Daemon<D> {
             self.db.collect(&[self.steps.plan_key()], &mut self.effects);
             self.vfs.collect(&self.mounts.roots());
             self.heads.sweep(&mut self.effects);
+            for corrupt in self.db.take_corrupt() {
+                eprintln!("blaze serve: the daemon image: {corrupt}; what it held was computed again");
+            }
+            let corrupt = self.vfs.corrupt();
+            if let Some(found) = &corrupt
+                && corrupt != self.vfs_corrupt
+            {
+                eprintln!("blaze serve: the daemon image: {found}; every checkout is scanned again");
+                self.heads.rescan(&self.vfs, &mut self.effects);
+            }
+            self.vfs_corrupt = corrupt;
         }
         if self.jobs.cold && !self.settling {
             self.jobs.cold = false;
             self.settling = true;
-            self.db.write_image(&mut self.effects);
-            self.write_estimates();
+            self.ask_image();
         }
-        if self.settling
-            && self.db.settled()
+        if self.images.done()
             && let Some(db) = Arc::get_mut(&mut self.db)
         {
-            self.settling = false;
-            match db.settle(&mut self.effects) {
-                Ok(_) => db.reclaim(),
-                Err(error) => eprintln!("blaze serve: the database could not settle onto its image: {error}"),
+            if let Some(image) = self.images.take_mapped() {
+                match db.settle(image, &mut self.effects) {
+                    Ok(()) => db.reclaim(),
+                    Err(error) => eprintln!("blaze serve: the database could not settle onto its image: {error}"),
+                }
             }
+            self.settling = false;
         }
     }
 
     fn stepping_stop(&mut self) {
         let now = self.driver.now();
         match self.stopping {
-            Some(Stopping::Image) if self.db.settled() => {
+            Some(Stopping::Image) if self.images.done() => {
                 self.server.stop(&mut self.effects);
                 self.stopping = Some(Stopping::Hangup { at: now });
             }
@@ -626,4 +661,27 @@ impl<D: Driver> Daemon<D> {
             _ => {}
         }
     }
+}
+
+/// Why the VFS did not use the daemon image as it should, or why its watchers rescan; `None`
+/// when it used it whole, or there was none.
+fn image_use(used: &ImageUse) -> Option<String> {
+    Some(match used {
+        ImageUse::None | ImageUse::Used { disks: None, .. } => return None,
+        ImageUse::Used { disks: Some(why), .. } => format!("its tree was used and its checkouts are scanned again ({why})"),
+        ImageUse::Resumed { disks, .. } => match disks {
+            None => "a stop came between the image and its journal's rewrite: the whole journal was loaded over the image".to_owned(),
+            Some(why) => format!(
+                "a stop came between the image and its journal's rewrite: the whole journal was loaded over the image, and its checkouts are scanned again ({why})"
+            ),
+        },
+        ImageUse::Unopened(error) => format!("the image is not one this blaze opens ({error}): the journal was loaded alone"),
+        ImageUse::Refused(refused) => format!("{refused}: the journal was loaded alone"),
+        ImageUse::Corrupt(corrupt) => format!("{corrupt}: the journal was loaded alone"),
+        ImageUse::Malformed(what) => format!("its tree is not one this blaze writes ({what}): the journal was loaded alone"),
+        ImageUse::Unnamed { image, journal } => match journal {
+            Some(journal) => format!("the journal starts from the image {journal}, not this one ({image}): it was loaded alone"),
+            None => format!("the journal starts from no image, not this one ({image}): it was loaded alone"),
+        },
+    })
 }

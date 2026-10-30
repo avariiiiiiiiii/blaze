@@ -14,17 +14,17 @@ use crate::{
     FxIndexMap,
     expr_store::ExpressionStore,
     hir::{
+        columns::{Checked, below, raw},
         generics::{
             ConstParamData, GenericParams, LifetimeBoundType, LifetimeParamData,
             TypeOrConstParamData, TypeParamData, TypeParamProvenance, WherePredicate,
         },
-        columns::{Checked, below, raw},
         persist::{Code, Read, Words},
     },
     signatures::{
-        ConstSignature, EnumSignature, EnumVariants, FieldData, FunctionSignature,
-        ImplSignature, InactiveEnumVariantCode, StaticSignature, StructSignature,
-        TraitSignature, TypeAliasSignature, UnionSignature, VariantFields,
+        ConstSignature, EnumSignature, EnumVariants, FieldData, FunctionSignature, ImplSignature,
+        InactiveEnumVariantCode, StaticSignature, StructSignature, TraitSignature,
+        TypeAliasSignature, UnionSignature, VariantFields,
     },
     type_ref::{ConstRef, LifetimeRefId, PathId, TraitRef, TypeBound, TypeRef, TypeRefId},
 };
@@ -259,11 +259,9 @@ impl Code for WherePredicate {
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         Ok(match r.tag(2, "a where predicate kind out of range")? {
-            0 => WherePredicate::TypeBound {
-                lifetimes: r.get()?,
-                target: r.get()?,
-                bound: r.get()?,
-            },
+            0 => {
+                WherePredicate::TypeBound { lifetimes: r.get()?, target: r.get()?, bound: r.get()? }
+            }
             _ => WherePredicate::Lifetime { target: r.get()?, bound: r.get()? },
         })
     }

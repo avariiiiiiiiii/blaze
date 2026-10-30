@@ -140,6 +140,8 @@ sandbox"). A small client command in front of the launcher would be a process ag
 driver has to reach a running launcher, which `Confine` can't say today. The same two methods
 serve cargo's request 14 on Linux and macOS (the descriptors go with `SCM_RIGHTS`, `job` is 0).
 
+> forwarded to mem-core (holds `crates/blaze-core/`; core is DONE) (requests, pass 20; told by tmux).
+
 ## 2. core: the IOCP driver hands sandboxed spawns to the warm launcher (`crates/blaze-core/src/iocp.rs`, `iocp/process.rs`)
 
 What: when the confine has a warm launcher, a sandboxed `Effect::Spawn` is handed to it instead
@@ -213,6 +215,8 @@ Why: as 1. With it a sandboxed run on Windows is one process creation, and `wind
 keeps its SIDs, its lock handle and its read checks across runs: about 176 system calls a run
 down to about 70 (docs/v2/plan/lanes/usercode/speed-of-light.md, "The Windows sandbox").
 
+> forwarded to mem-core (holds `iocp.rs`, `iocp/*`) (requests, pass 20; told by tmux).
+
 ## 3. cargo: the daemon on Windows runs the IOCP driver (`crates/blaze-cargo/src/serve.rs`, `serve`)
 
 What: the last arm (`not(any(linux, macos, bsd))`) starts `blaze_core::threads::Threads`, which
@@ -233,6 +237,8 @@ windows))`. (`Iocp::scratch` is cargo's request to core for every driver, cargo.
 
 Why: without it no sandboxed run happens on Windows at all, warm launcher or not.
 
+> forwarded to cargo (requests, pass 20; told by tmux).
+
 ## Notes for cargo (`crates/blaze-cargo/src/serve.rs`), nothing to change
 
 - `blaze_usercode::confine::Launcher { program }` is unchanged; on Windows its `warm()` is
@@ -241,3 +247,5 @@ Why: without it no sandboxed run happens on Windows at all, warm launcher or not
   and `USERPROFILE` (`confine::LAUNCHER_READS`), for `--v2` as for `--v2-serve`: with an empty
   environment it made each run's temporary directory in the Windows directory, which a user
   can't write, and made the AppContainer profile again every run.
+
+> applied: nothing to change (notes; cargo told with 3) (requests, pass 20).

@@ -38,6 +38,7 @@ use itertools::Itertools;
 use la_arena::ArenaMap;
 use rustc_abi::ReprOptions;
 use rustc_hash::FxHashSet;
+use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
 use syntax::{
     AstNode, AstToken, NodeOrToken, SmolStr, SourceFile, SyntaxKind, T,
@@ -46,8 +47,9 @@ use syntax::{
 use tt::TextSize;
 
 use crate::{
-    AdtId, AstIdLoc, AttrDefId, ExternBlockId, FieldId, FunctionId, GenericDefId, HasModule,
-    LifetimeParamId, LocalFieldId, MacroId, ModuleId, TraitId, TypeOrConstParamId, VariantId,
+    AdtId, AstIdLoc, AttrDefId, BlockId, ExternBlockId, FieldId, FunctionId, GenericDefId,
+    HasModule, ItemContainerId, LifetimeParamId, LocalFieldId, MacroId, ModuleId, TraitId,
+    TypeOrConstParamId, VariantId,
     hir::generics::{GenericParams, LocalLifetimeParamId, LocalTypeOrConstParamId},
     nameres::ModuleOrigin,
     resolver::{HasResolver, Resolver},
@@ -238,6 +240,11 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     }
                     Some(Word::rustc_must_implement_one_of) => {
                         attr_flags.insert(AttrFlags::HAS_RUSTC_MUST_IMPLEMENT_ONE_OF)
+                    }
+                    Some(Word::sanitize)
+                        if attr.path().is_some_and(|path| path.qualifier().is_none()) =>
+                    {
+                        attr_flags.insert(AttrFlags::HAS_SANITIZE)
                     }
                     _ => {}
                 },
@@ -576,6 +583,7 @@ name_set! {
     rustc_skip_array_during_method_dispatch,
     rustc_skip_during_method_dispatch,
     rustc_std_internal_symbol,
+    sanitize,
     skip,
     stable,
     target_feature,
@@ -706,6 +714,8 @@ bitflags::bitflags! {
         const RUSTC_NEVER_RETURNS_NULL_PTR = 1 << 76;
         /// `#[rustc_canonical_symbol]` on a foreign function of `core` or `std`.
         const RUSTC_CANONICAL_SYMBOL = 1 << 77;
+        /// `#[sanitize(..)]`, one segment: [`disabled_sanitizers`].
+        const HAS_SANITIZE = 1 << 78;
     }
 }
 
@@ -2015,6 +2025,170 @@ impl AttrFlags {
             })
         }
     }
+}
+
+/// The bits of [`disabled_sanitizers`]: the sanitizers blaze instruments, numbered as
+/// `blaze_codegen::settings::Sanitizers` numbers them. rustc's other keys (`cfi`, `kcfi`,
+/// `hwaddress`, `memtag`, `shadow_call_stack`, `safestack`, `realtime`) are read and left out.
+pub mod sanitizer {
+    /// `address`, and `kernel_address`, which rustc turns on and off with it.
+    pub const ADDRESS: u8 = 1 << 0;
+    pub const THREAD: u8 = 1 << 1;
+    pub const MEMORY: u8 = 1 << 2;
+}
+
+/// The sanitizers `#[sanitize(address = "off", ..)]` turns off for `def` ([`sanitizer`] bits):
+/// rustc's `sanitizer_settings_for`. It starts from its parent's set (the crate root's parent
+/// has none) and each `#[sanitize]` on the way down clears what it turns on, then sets what it
+/// turns off. The parents are rustc's: the impl or trait, the module, and for an item in a
+/// body the items and closures that body is in.
+pub fn disabled_sanitizers(db: &Db, def: FunctionId) -> u8 {
+    let inherited = match def.lookup(db).container {
+        ItemContainerId::ModuleId(it) => module_disabled_sanitizers(db, it),
+        ItemContainerId::ImplId(it) => {
+            let module = module_disabled_sanitizers(db, it.lookup(db).container);
+            own_disabled_sanitizers(db, it.into(), module)
+        }
+        ItemContainerId::TraitId(it) => {
+            let module = module_disabled_sanitizers(db, it.lookup(db).container);
+            own_disabled_sanitizers(db, it.into(), module)
+        }
+        ItemContainerId::ExternBlockId(it) => {
+            let module = module_disabled_sanitizers(db, it.lookup(db).container);
+            own_disabled_sanitizers(db, AttrDefId::ExternBlockId(it), module)
+        }
+    };
+    own_disabled_sanitizers(db, def.into(), inherited)
+}
+
+/// [`disabled_sanitizers`] of the items of `module`.
+#[salsa::tracked(returns(copy))]
+fn module_disabled_sanitizers(db: &Db, module: ModuleId) -> u8 {
+    let inherited = match module.containing_module_inside_def_map(db) {
+        Some(parent) => module_disabled_sanitizers(db, ModuleId::from_id(parent.as_id())),
+        None => match module.block(db) {
+            // A block is no item of rustc's: its items' parent is what the block is in.
+            Some(block) => return block_disabled_sanitizers(db, BlockId::from_id(block.as_id())),
+            None => 0,
+        },
+    };
+    own_disabled_sanitizers(db, module.into(), inherited)
+}
+
+/// [`disabled_sanitizers`] of the items of `block`: the set of the module holding it, then the
+/// `#[sanitize]` of each item and closure between the two, outermost first, through the macro
+/// calls the block was expanded from.
+#[salsa::tracked(returns(copy))]
+fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
+    let outer = block.module(db);
+    let krate = outer.krate(db);
+    // The block the module holding `block` is, if it is a block's: the walk stops there, as it
+    // does at a `mod` or a file, which bound every other module.
+    let stop = match (outer.block(db), outer.containing_module_inside_def_map(db)) {
+        (Some(it), None) => {
+            let ast_id = it.ast_id(db);
+            Some((ast_id.file_id, ast_id.to_range(db)))
+        }
+        _ => None,
+    };
+    let ast_id = block.ast_id(db);
+    let mut file_id = ast_id.file_id;
+    let mut node = ast_id.to_node(db).syntax().parent();
+    let mut cfg_options = None;
+    let mut sets = SmallVec::<[SanitizeSets; 4]>::new();
+    'walk: loop {
+        while let Some(it) = node {
+            let kind = it.kind();
+            if kind == SyntaxKind::BLOCK_EXPR
+                && stop.is_some_and(|(file, range)| file == file_id && range == it.text_range())
+            {
+                break 'walk;
+            }
+            node = it.parent();
+            match kind {
+                SyntaxKind::MODULE | SyntaxKind::SOURCE_FILE => break 'walk,
+                SyntaxKind::FN
+                | SyntaxKind::CLOSURE_EXPR
+                | SyntaxKind::IMPL
+                | SyntaxKind::TRAIT
+                | SyntaxKind::CONST
+                | SyntaxKind::STATIC => {
+                    if let Some(owner) = ast::AnyHasAttrs::cast(it) {
+                        sets.extend(expand_cfg_attr(
+                            ast::attrs_including_inner(&owner),
+                            || cfg_options.get_or_insert_with(|| krate.cfg_options(db)),
+                            |meta, _| sanitize_sets(meta),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(call) = file_id.call_node(db) else { break };
+        file_id = call.file_id;
+        node = call.value.parent();
+    }
+    let module = module_disabled_sanitizers(db, ModuleId::from_id(outer.as_id()));
+    sets.iter().rev().fold(module, |disabled, sets| sets.apply(disabled))
+}
+
+/// What `owner`'s own `#[sanitize]` leaves of `inherited`.
+fn own_disabled_sanitizers(db: &Db, owner: AttrDefId, inherited: u8) -> u8 {
+    if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_SANITIZE) {
+        return inherited;
+    }
+    collect_attrs(db, owner, sanitize_sets).map_or(inherited, |sets| sets.apply(inherited))
+}
+
+/// One `#[sanitize(..)]`: the sanitizers it turns on and those it turns off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SanitizeSets {
+    on: u8,
+    off: u8,
+}
+
+impl SanitizeSets {
+    /// rustc's order: what it turns on is cleared first, so a sanitizer named both ways is off.
+    #[inline]
+    fn apply(self, inherited: u8) -> u8 {
+        (inherited & !self.on) | self.off
+    }
+}
+
+/// The sets of `attr` if it is `#[sanitize(..)]`, which ends the walk: rustc reads an item's
+/// first (a second is an error). Its arguments are `key = "on" | "off"`, comma separated.
+fn sanitize_sets(attr: ast::Meta) -> ControlFlow<SanitizeSets> {
+    let ast::Meta::TokenTreeMeta(attr) = attr else { return ControlFlow::Continue(()) };
+    if !path_is(attr.path(), "sanitize") {
+        return ControlFlow::Continue(());
+    }
+    let Some(tt) = attr.token_tree() else { return ControlFlow::Continue(()) };
+    let mut sets = SanitizeSets::default();
+    let mut tt = TokenTreeChildren::new(&tt);
+    while let Some(NodeOrToken::Token(key)) = tt.next()
+        && let Some(NodeOrToken::Token(eq_token)) = tt.next()
+        && eq_token.kind() == T![=]
+        && let Some(NodeOrToken::Token(value)) = tt.next()
+        && let Some(value) = ast::String::cast(value)
+        && let Ok(value) = value.value()
+    {
+        let key = key.text();
+        let set = match key.strip_prefix("r#").unwrap_or(key) {
+            "address" | "kernel_address" => sanitizer::ADDRESS,
+            "thread" => sanitizer::THREAD,
+            "memory" => sanitizer::MEMORY,
+            _ => 0,
+        };
+        match &*value {
+            "on" => sets.on |= set,
+            "off" => sets.off |= set,
+            _ => {}
+        }
+        if tt.next().and_then(NodeOrToken::into_token).is_none_or(|it| it.kind() != T![,]) {
+            break;
+        }
+    }
+    ControlFlow::Break(sets)
 }
 
 fn merge_repr(this: &mut ReprOptions, other: ReprOptions) {

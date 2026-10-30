@@ -25,7 +25,8 @@ use cfg::{CfgAtom, CfgExpr};
 use either::Either;
 use hir_expand::{
     BuiltinChild, BuiltinError, EagerCallInfo, ExpandErrorKind, ExpandTo, HirFileId, MacroCallId,
-    MacroCallKind, MacroCallLoc, MacroCallStyles, MacroDefId, MacroDefKind,
+    MacroCallKind, MacroCallLoc, MacroCallStyles, MacroDefId, MacroDefKind, MatchFailure,
+    MbeErrorKind,
     attrs::AttrId,
     builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
     mod_path::{ModPath, PathKind},
@@ -77,7 +78,7 @@ type R<T = ()> = Result<T, String>;
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 10";
+pub const ENCODING: &str = "blaze frozen def map 11";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -662,7 +663,7 @@ impl Enc<'_> {
         Ok(name)
     }
 
-    fn file(&mut self, file: base_db::EditionedFileId) -> R {
+    pub(crate) fn file(&mut self, file: base_db::EditionedFileId) -> R {
         let (file_id, edition) = file.unpack(self.db);
         self.edition(edition);
         if self.fingerprinting {
@@ -684,7 +685,7 @@ impl Enc<'_> {
         Ok(())
     }
 
-    fn hir_file(&mut self, it: HirFileId) -> R {
+    pub(crate) fn hir_file(&mut self, it: HirFileId) -> R {
         match it {
             HirFileId::FileId(file) => {
                 self.u8(0);
@@ -697,7 +698,7 @@ impl Enc<'_> {
         }
     }
 
-    fn ast_id<N: syntax::AstNode>(&mut self, it: AstId<N>) -> R {
+    pub(crate) fn ast_id<N: syntax::AstNode>(&mut self, it: AstId<N>) -> R {
         self.hir_file(it.file_id)?;
         self.u32(it.value.erase().into_raw());
         Ok(())
@@ -707,7 +708,7 @@ impl Enc<'_> {
         self.u32(it.into_raw());
     }
 
-    fn call(&mut self, call: MacroCallId) -> R {
+    pub(crate) fn call(&mut self, call: MacroCallId) -> R {
         if self.fingerprinting {
             let print = self.call_hash(call)?;
             self.out.put_u128(print);
@@ -865,7 +866,7 @@ impl Enc<'_> {
         Ok(())
     }
 
-    fn context(&mut self, ctx: SyntaxContext) -> R {
+    pub(crate) fn context(&mut self, ctx: SyntaxContext) -> R {
         if ctx.is_root() {
             self.u8(0);
             self.edition(ctx.edition(self.db));
@@ -1777,10 +1778,37 @@ impl Enc<'_> {
                         self.u8(9);
                         self.str(message)?;
                     }
-                    ExpandErrorKind::Mbe(_) => {
-                        return Err(format!("a macro_rules! error: {err:?}"));
+                    ExpandErrorKind::Mbe(it) => {
+                        self.u8(10);
+                        self.mbe_error(it)?;
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn mbe_error(&mut self, it: &MbeErrorKind) -> R {
+        match it {
+            MbeErrorKind::BindingError(message) => {
+                self.u8(0);
+                self.str(message)?;
+            }
+            MbeErrorKind::UnresolvedBinding(name) => {
+                self.u8(1);
+                self.str(name)?;
+            }
+            MbeErrorKind::LeftoverTokens => self.u8(2),
+            MbeErrorKind::LimitExceeded => self.u8(3),
+            MbeErrorKind::NoMatchingRule => self.u8(4),
+            MbeErrorKind::UnexpectedToken => self.u8(5),
+            MbeErrorKind::MatchFailure(it) => {
+                let MatchFailure { token, remaining, remaining_span, missing_comma } = &**it;
+                self.u8(6);
+                self.option(token.as_deref(), |enc, it| enc.str(it))?;
+                self.str(remaining)?;
+                self.option(*remaining_span, |enc, it| enc.span(it))?;
+                self.option(*missing_comma, |enc, it| enc.span(it))?;
             }
         }
         Ok(())
@@ -2188,14 +2216,14 @@ impl Dec<'_> {
         not_loaded.map_or(Ok(()), Err)
     }
 
-    fn file(&mut self) -> R<base_db::EditionedFileId> {
+    pub(crate) fn file(&mut self) -> R<base_db::EditionedFileId> {
         let edition = self.edition()?;
         let index = self.len()?;
         let file = *self.files.get(index).ok_or("a file not in the header")?;
         Ok(base_db::EditionedFileId::new(self.db, file, edition))
     }
 
-    fn hir_file(&mut self) -> R<HirFileId> {
+    pub(crate) fn hir_file(&mut self) -> R<HirFileId> {
         match self.u8()? {
             0 => Ok(HirFileId::FileId(self.file()?)),
             1 => Ok(HirFileId::MacroFile(self.call()?)),
@@ -2203,7 +2231,7 @@ impl Dec<'_> {
         }
     }
 
-    fn ast_id<N: syntax::AstNode>(&mut self) -> R<AstId<N>> {
+    pub(crate) fn ast_id<N: syntax::AstNode>(&mut self) -> R<AstId<N>> {
         let file = self.hir_file()?;
         let raw = ErasedFileAstId::from_raw(self.u32()?);
         Ok(AstId::new(file, FileAstId::from_erased_unchecked(raw)))
@@ -2213,7 +2241,7 @@ impl Dec<'_> {
         Ok(ErasedFileAstId::from_raw(self.u32()?))
     }
 
-    fn call(&mut self) -> R<MacroCallId> {
+    pub(crate) fn call(&mut self) -> R<MacroCallId> {
         match self.u8()? {
             SEEN => {
                 let index = self.len()?;
@@ -2320,7 +2348,7 @@ impl Dec<'_> {
         Ok(MacroDefId { krate, edition, kind, local_inner, allow_internal_unsafe, edition_panic })
     }
 
-    fn context(&mut self) -> R<SyntaxContext> {
+    pub(crate) fn context(&mut self) -> R<SyntaxContext> {
         match self.u8()? {
             0 => Ok(SyntaxContext::root(self.edition()?)),
             1 => {
@@ -3052,6 +3080,7 @@ impl Dec<'_> {
                         }))
                     }
                     9 => ExpandErrorKind::ProcMacroPanic(self.str()?.into()),
+                    10 => ExpandErrorKind::Mbe(self.mbe_error()?),
                     it => return Err(format!("macro error {it}")),
                 };
                 DefDiagnosticKind::MacroError { ast, path, err }
@@ -3059,6 +3088,30 @@ impl Dec<'_> {
             it => return Err(format!("diagnostic {it}")),
         };
         Ok(DefDiagnostic { in_module, kind })
+    }
+
+    fn mbe_error(&mut self) -> R<MbeErrorKind> {
+        Ok(match self.u8()? {
+            0 => MbeErrorKind::BindingError(Box::new(self.str()?.into())),
+            1 => MbeErrorKind::UnresolvedBinding(Box::new(self.str()?.into())),
+            2 => MbeErrorKind::LeftoverTokens,
+            3 => MbeErrorKind::LimitExceeded,
+            4 => MbeErrorKind::NoMatchingRule,
+            5 => MbeErrorKind::UnexpectedToken,
+            6 => {
+                let token = self.option(|dec| Ok(Box::<str>::from(dec.str()?)))?;
+                let remaining = self.str()?.into();
+                let remaining_span = self.option(Self::span)?;
+                let missing_comma = self.option(Self::span)?;
+                MbeErrorKind::MatchFailure(Box::new(MatchFailure {
+                    token,
+                    remaining,
+                    remaining_span,
+                    missing_comma,
+                }))
+            }
+            it => return Err(format!("macro_rules! error {it}")),
+        })
     }
 
     fn def_map(&mut self) -> R<DefMap> {
@@ -3372,7 +3425,8 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
             .collect()
     }
 
-    /// A builtin macro's error and a proc macro's panic read back field for field.
+    /// A builtin macro's error, a proc macro's panic and `macro_rules!` errors read back field
+    /// for field.
     #[test]
     fn a_builtin_macro_error_reads_back_whole() {
         let db = TestDB::with_files(FIXTURE);
@@ -3397,9 +3451,27 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
             derive: true,
         }));
         let panicked = ExpandErrorKind::ProcMacroPanic("it panicked".into());
+        let unmatched = ExpandErrorKind::Mbe(MbeErrorKind::MatchFailure(Box::new(MatchFailure {
+            token: Some("`x`".into()),
+            remaining: "`,`".into(),
+            remaining_span: Some(span),
+            missing_comma: None,
+        })));
+        let at_end = ExpandErrorKind::Mbe(MbeErrorKind::MatchFailure(Box::new(MatchFailure {
+            token: None,
+            remaining: "end of macro".into(),
+            remaining_span: None,
+            missing_comma: Some(span),
+        })));
+        let binding = ExpandErrorKind::Mbe(MbeErrorKind::BindingError(Box::new("a binding".into())));
+        let no_rule = ExpandErrorKind::Mbe(MbeErrorKind::NoMatchingRule);
         let diagnostics = [
             DefDiagnostic::macro_error(root, ast, path.clone(), builtin),
-            DefDiagnostic::macro_error(root, ast, path, panicked),
+            DefDiagnostic::macro_error(root, ast, path.clone(), panicked),
+            DefDiagnostic::macro_error(root, ast, path.clone(), unmatched),
+            DefDiagnostic::macro_error(root, ast, path.clone(), at_end),
+            DefDiagnostic::macro_error(root, ast, path.clone(), binding),
+            DefDiagnostic::macro_error(root, ast, path, no_rule),
         ];
         let mut enc = Enc::new(&db, krate);
         for it in &diagnostics {

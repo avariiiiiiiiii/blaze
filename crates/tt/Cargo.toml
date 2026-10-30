@@ -14,7 +14,9 @@ doctest = false
 
 [dependencies]
 arrayvec.workspace = true
+blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 text-size.workspace = true
 rustc-hash.workspace = true
 

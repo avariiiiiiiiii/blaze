@@ -376,8 +376,14 @@ pub fn built_commit() -> &'static str {
 /// Says where the library is to the processes this one starts ([`VAR`]), and to the front
 /// end of this one, when no one did: what was found, else blaze's own copy made from the
 /// checkout this blaze was built in (nothing is downloaded), else empty for none, which the
-/// front end turns down saying so. Before any thread starts: it sets the environment.
-pub fn publish() {
+/// front end turns down saying so.
+///
+/// # Safety
+///
+/// No other thread of the process may run during the call: it sets the process's
+/// environment, and a thread reading it meanwhile through the C library's `getenv` (which
+/// std's lock does not cover) could read a variable as it is freed.
+pub unsafe fn publish() {
     if std::env::var_os(VAR).is_some_and(|it| !it.is_empty()) {
         return;
     }
@@ -393,13 +399,18 @@ pub fn publish() {
     };
     let dir = found().ok().cloned().or_else(copied);
     let dir = dir.map(|it| it.dir.into_os_string()).unwrap_or_default();
-    // SAFETY: before any thread is started.
+    // SAFETY: no other thread runs, by this function's contract: the workers of the runtime a
+    // download starts (`download`) are joined as it drops, before this.
     unsafe { std::env::set_var(VAR, dir) };
 }
 
 /// [`publish`] of `library`, which [`fetch`] gave.
-pub fn publish_fetched(library: &Library) {
-    // SAFETY: before any thread is started.
+///
+/// # Safety
+///
+/// As [`publish`]'s: no other thread of the process may run during the call.
+pub unsafe fn publish_fetched(library: &Library) {
+    // SAFETY: no other thread runs, by this function's contract.
     unsafe { std::env::set_var(VAR, &library.dir) };
 }
 

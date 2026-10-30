@@ -83,10 +83,7 @@ pub fn digest(path: &str) -> String {
         };
     }
     if let Some(name) = path.strip_prefix(VAR) {
-        return match std::env::var_os(name) {
-            Some(value) => format!("={}", hex(&Sha256::digest(value.as_encoded_bytes()))),
-            None => "-".to_owned(),
-        };
+        return value_digest(std::env::var_os(name).as_deref());
     }
     if let Some(rest) = path.strip_prefix("/nix/store/") {
         let top = rest.split('/').next().unwrap_or_default();
@@ -95,6 +92,14 @@ pub fn digest(path: &str) -> String {
         }
     }
     super::sandboxed::digest(Path::new(path))
+}
+
+/// What a read of a variable whose value is `value`, None when it is unset, has now.
+fn value_digest(value: Option<&std::ffi::OsStr>) -> String {
+    match value {
+        Some(value) => format!("={}", hex(&Sha256::digest(value.as_encoded_bytes()))),
+        None => "-".to_owned(),
+    }
 }
 
 /// The read of `path` as a read set has it when only what kind of file is there counts: a

@@ -6,15 +6,16 @@
 use std::path::{Path, PathBuf};
 
 use base_db::{Crate, Db, FileId};
+use blaze_diagnostics::{
+    emit::{self, Sources, Style},
+    model::{Child, Diag},
+};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Level,
     check::{Found, Setup},
     conf::{self, Conf},
-    diag::Diagnostic,
-    emit::{self, Sources, Style},
     level::CommandLine,
 };
 
@@ -90,9 +91,9 @@ pub fn answer(
             Err(_) => path.to_string_lossy().into_owned(),
         })
     };
-    let style = Style { short: ask.short, ansi: ask.ansi, width: ask.width.unwrap_or(emit::WIDTH) };
-    let root_owned = root.to_owned();
-    let mut sources = Sources::new(move |name| std::fs::read_to_string(root_owned.join(name)).ok());
+    let style = Style { short: ask.short, ansi: ask.ansi, width: ask.width.unwrap_or(emit::WIDTH), ui_testing: false };
+    let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
+    let mut sources = Sources::default();
     let mut answer = Answer::default();
     let mut setups: Vec<Option<Setup>> = Vec::new();
     for package in &ask.packages {
@@ -131,11 +132,11 @@ pub fn answer(
         let Some(root_path) = path_of(hir_crate.root_file(db)) else { continue };
         let found = crate::check(db, hir_crate, setup, &name_of);
         let plain: Vec<&Found> = found.iter().filter(|it| !it.test_only).collect();
-        let test = has_tests.then(|| written(found.iter(), &mut sources, style));
+        let test = has_tests.then(|| written(found.iter(), &mut sources, &read, style));
         answer.crates.push(Linted {
             package: ask.packages[at].name.clone(),
             root: root_path,
-            plain: written(plain.into_iter(), &mut sources, style),
+            plain: written(plain.into_iter(), &mut sources, &read, style),
             test,
         });
     }
@@ -150,36 +151,91 @@ fn setup(package: &Package) -> Result<Setup, String> {
 }
 
 /// The diagnostics of one build, as rustc writes them: what is said once a build is said with
-/// the first diagnostic that has it, and a diagnostic said again is not.
+/// the first diagnostic that has it, and a diagnostic said again is not. The files they point
+/// into that `sources` has not read yet are read by `read`.
 fn written<'a>(
     found: impl Iterator<Item = &'a Found>,
     sources: &mut Sources,
+    read: &dyn Fn(&str) -> Option<String>,
     style: Style,
 ) -> Vec<Message> {
-    let mut once = FxHashSet::default();
+    let found: Vec<&Found> = found.collect();
+    for name in sources.unread(found.iter().map(|it| &it.diagnostic)) {
+        sources.add(name, read(name));
+    }
+    let mut once: FxHashSet<Child> = FxHashSet::default();
     let mut seen = FxHashSet::default();
     let mut messages = Vec::new();
     for Found { diagnostic, .. } in found {
-        let mut diagnostic: Diagnostic = diagnostic.clone();
-        diagnostic.children.retain(|child| {
-            !child.once
-                || once.insert((
-                    child.level.name(),
-                    child.message.clone(),
-                    format!("{:?}", child.span),
-                ))
-        });
+        // clone: a diagnostic of the crate, once per build it is written in
+        let mut diagnostic: Diag = diagnostic.clone();
+        diagnostic.children.retain(|child| !child.once || once.insert(child.clone()));
         let rendered = emit::written(&diagnostic, sources, style);
         if !seen.insert(rendered.clone()) {
             continue;
         }
-        let json = emit::json(&diagnostic, sources, rendered.clone());
+        let json = emit::json_rendered(&diagnostic, sources, rendered.clone());
         messages.push(Message {
-            json: serde_json::to_string(&json).unwrap_or_default(),
+            json: if style.ansi { json } else { cargo_order(&json) },
             rendered,
-            error: diagnostic.level >= Level::Deny,
+            error: diagnostic.is_error(),
             fixable: diagnostic.is_fixable(),
         });
     }
     messages
+}
+
+/// rustc's JSON line `line` as cargo writes it again when it takes the colours out of
+/// `rendered` (`on_stderr_line_inner` under `MessageFormat::Json`): `rendered`, every other key
+/// but `code` sorted at every depth, then `code`. With colours cargo passes rustc's line as it
+/// is.
+fn cargo_order(line: &str) -> String {
+    #[derive(Deserialize, Serialize)]
+    struct CompilerMessage {
+        rendered: String,
+        #[serde(flatten)]
+        other: std::collections::BTreeMap<String, serde_json::Value>,
+        code: Option<serde_json::Value>,
+    }
+    let mut message: CompilerMessage = serde_json::from_str(line)
+        .unwrap_or_else(|error| panic!("blaze-lints: rustc's JSON of a diagnostic: {error}"));
+    message.other.values_mut().for_each(sort_keys);
+    message.code.iter_mut().for_each(sort_keys);
+    serde_json::to_string(&message)
+        .unwrap_or_else(|error| panic!("blaze-lints: a diagnostic as cargo writes it: {error}"))
+}
+
+/// Sorts the keys of every object in `value`, as serde_json's `Map` without `preserve_order`
+/// has them, whatever features the build unifies.
+fn sort_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = std::mem::take(map).into_iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for (key, mut it) in entries {
+                sort_keys(&mut it);
+                map.insert(key, it);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sort_keys),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_diagnostic_is_written_as_cargo_writes_it_again() {
+        let line = concat!(
+            r#"{"$message_type":"diagnostic","message":"m","code":{"code":"clippy::x","explanation":null},"#,
+            r#""level":"warning","spans":[{"file_name":"a.rs","byte_start":0,"expansion":null}],"children":[],"rendered":"r"}"#,
+        );
+        let expected = concat!(
+            r#"{"rendered":"r","$message_type":"diagnostic","children":[],"level":"warning","message":"m","#,
+            r#""spans":[{"byte_start":0,"expansion":null,"file_name":"a.rs"}],"code":{"code":"clippy::x","explanation":null}}"#,
+        );
+        assert_eq!(cargo_order(line), expected);
+    }
 }

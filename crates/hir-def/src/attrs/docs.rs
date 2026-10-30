@@ -756,69 +756,15 @@ pub(super) fn inner_docs_node(owner: &ast::AnyHasAttrs) -> Option<SyntaxNode> {
         return None;
     }
     let (tree, at) = body.syntax().flat()?;
-    if !block_may_start_with_inner_doc(&tree.source()[tree.range(at)]) {
+    if !syntax::view::block_may_start_with_inner_attr(&tree.source()[tree.range(at)], true) {
         return None;
     }
     Some(body.stmt_list()?.syntax().clone())
 }
 
-/// Whether the text of a block, its `{` included, may start with an inner doc comment or an
-/// inner attribute after whitespace and other comments, as the parser takes a body's leading
-/// run of them: false only when it surely does not.
-fn block_may_start_with_inner_doc(block: &str) -> bool {
-    let Some(mut rest) = block.strip_prefix('{') else { return true };
-    loop {
-        rest = rest
-            .trim_start_matches(|c: char| matches!(c, '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' '));
-        if let Some(comment) = rest.strip_prefix("//") {
-            if comment.starts_with('!') {
-                return true;
-            }
-            match comment.find('\n') {
-                Some(end) => rest = &comment[end..],
-                None => return true,
-            }
-        } else if let Some(comment) = rest.strip_prefix("/*") {
-            if comment.starts_with('!') {
-                return true;
-            }
-            match block_comment_len(comment) {
-                Some(end) => rest = &comment[end..],
-                None => return true,
-            }
-        } else {
-            return rest.chars().next().is_none_or(|c| c == '#' || !c.is_ascii());
-        }
-    }
-}
-
 /// The offsets at which a char of `utf8` starts, as `str::char_indices` gives them.
 fn char_starts(utf8: &[u8]) -> impl Iterator<Item = usize> + '_ {
     utf8.iter().enumerate().filter(|&(_, &byte)| byte & 0xC0 != 0x80).map(|(at, _)| at)
-}
-
-/// How long the rest of a block comment is, after its opening `/*`, to just past the `*/` that
-/// closes it, nested comments included as the lexer counts them.
-fn block_comment_len(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let (mut depth, mut at) = (1usize, 0);
-    while at + 1 < bytes.len() {
-        match (bytes[at], bytes[at + 1]) {
-            (b'/', b'*') => {
-                depth += 1;
-                at += 2;
-            }
-            (b'*', b'/') => {
-                depth -= 1;
-                at += 2;
-                if depth == 0 {
-                    return Some(at);
-                }
-            }
-            _ => at += 1,
-        }
-    }
-    None
 }
 
 pub(crate) fn extract_docs<'a, 'db>(
@@ -903,14 +849,14 @@ mod tests {
     use blaze_ids::rng::SplitMix64;
     use expect_test::expect;
     use hir_expand::InFile;
-    use syntax::{AstNode, AstToken, ast};
+    use syntax::{AstNode, AstToken, ast, view::block_may_start_with_inner_attr};
     use test_fixture::WithFixture;
     use thin_vec::ThinVec;
     use tt::{TextRange, TextSize};
 
     use crate::test_db::TestDB;
 
-    use super::{DocCommentKind, Docs, Indent, IsInnerDoc, block_may_start_with_inner_doc};
+    use super::{DocCommentKind, Docs, Indent, IsInnerDoc};
 
     #[test]
     fn a_block_may_start_with_inner_docs() {
@@ -927,7 +873,7 @@ mod tests {
             "not a block",
             "{",
         ] {
-            assert!(block_may_start_with_inner_doc(maybe), "{maybe:?}");
+            assert!(block_may_start_with_inner_attr(maybe, true), "{maybe:?}");
         }
         for not in [
             "{}",
@@ -937,7 +883,7 @@ mod tests {
             "{ /** outer docs */ x }",
             "{ /* //! */ x }",
         ] {
-            assert!(!block_may_start_with_inner_doc(not), "{not:?}");
+            assert!(!block_may_start_with_inner_attr(not, true), "{not:?}");
         }
     }
 

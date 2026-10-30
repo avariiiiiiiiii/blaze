@@ -428,3 +428,5 @@ and variable names compare in Unicode upper case per code unit (as Windows' ordi
 not ASCII only. Why: two copies of the same rules (the other in blaze-cargo's sandbox).
 
 > forwarded to mem-core (holds `crates/blaze-core/`; core is DONE) (from requests, pass 16; told by tmux).
+
+> applied by mem-core (2026-10-29): iocp/process.rs calls `crate::create_process::{command_line, environment}`; its copies, their two tests and the `OsStrExt` import are gone.

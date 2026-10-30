@@ -4,9 +4,11 @@
 
 use std::ops::Range;
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub(super) struct BitSet {
-    words: Vec<u64>,
+use crate::mem::Frame;
+
+#[derive(PartialEq, Eq, Debug, Default)]
+pub(super) struct BitSet<'f> {
+    words: &'f mut [u64],
 }
 
 /// How many words a set of `size` bits takes.
@@ -52,16 +54,26 @@ pub(super) trait Transfer {
     }
 }
 
-impl BitSet {
-    pub(super) fn new(size: usize) -> Self {
-        BitSet { words: vec![0; words_for(size)] }
+impl<'f> BitSet<'f> {
+    pub(super) fn new(frame: &'f Frame, size: usize) -> Self {
+        BitSet { words: frame.alloc_slice_fill_with(words_for(size), |_| 0) }
+    }
+
+    /// An empty set of a row's size of `matrix`, to [`BitSet::load`] its rows into.
+    pub(super) fn for_rows_of(frame: &'f Frame, matrix: &BitMatrix<'_>) -> Self {
+        BitSet { words: frame.alloc_slice_fill_with(matrix.words, |_| 0) }
     }
 
     /// The set of every bit below `size`.
-    pub(super) fn filled(size: usize) -> Self {
-        let mut out = BitSet::new(size);
+    pub(super) fn filled(frame: &'f Frame, size: usize) -> Self {
+        let mut out = BitSet::new(frame, size);
         out.gen_range(0..size);
         out
+    }
+
+    /// A copy in `frame`.
+    pub(super) fn clone_in(&self, frame: &'f Frame) -> Self {
+        BitSet { words: frame.alloc_slice_copy(self.words) }
     }
 
     pub(super) fn contains(&self, bit: usize) -> bool {
@@ -80,8 +92,8 @@ impl BitSet {
     }
 
     /// Adds the bits of `other`, and says whether that added any.
-    pub(super) fn union(&mut self, other: &BitSet) -> bool {
-        union_words(&mut self.words, &other.words)
+    pub(super) fn union(&mut self, other: &BitSet<'_>) -> bool {
+        union_words(self.words, other.words)
     }
 
     pub(super) fn clear(&mut self) {
@@ -89,7 +101,7 @@ impl BitSet {
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        iter_words(&self.words)
+        iter_words(self.words)
     }
 
     /// The smallest bit of the set in `range`.
@@ -107,21 +119,21 @@ impl BitSet {
     }
 
     pub(super) fn words(&self) -> &[u64] {
-        &self.words
+        self.words
     }
 
     pub(super) fn words_mut(&mut self) -> &mut [u64] {
-        &mut self.words
+        self.words
     }
 
-    /// Makes this the set whose words are `words`, reusing its allocation.
+    /// Makes this the set whose words are `words`, which are as many as its own (a row of a
+    /// matrix of its size).
     pub(super) fn load(&mut self, words: &[u64]) {
-        self.words.clear();
-        self.words.extend_from_slice(words);
+        self.words.copy_from_slice(words);
     }
 }
 
-impl Transfer for BitSet {
+impl Transfer for BitSet<'_> {
     #[inline]
     fn gen_range(&mut self, range: Range<usize>) {
         masks(range, |word, mask| self.words[word] |= mask);
@@ -159,16 +171,16 @@ pub(super) fn iter_words(words: &[u64]) -> impl Iterator<Item = usize> + '_ {
 
 /// A set of `columns` bits per row, every row in one array: the entry sets of every block,
 /// `columns / 64` words a row, a row found by one multiply.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub(super) struct BitMatrix {
+#[derive(PartialEq, Eq, Debug, Default)]
+pub(super) struct BitMatrix<'f> {
     words: usize,
-    data: Vec<u64>,
+    data: &'f mut [u64],
 }
 
-impl BitMatrix {
-    pub(super) fn new(rows: usize, columns: usize) -> Self {
+impl<'f> BitMatrix<'f> {
+    pub(super) fn new(frame: &'f Frame, rows: usize, columns: usize) -> Self {
         let words = words_for(columns);
-        BitMatrix { words, data: vec![0; rows * words] }
+        BitMatrix { words, data: frame.alloc_slice_fill_with(rows * words, |_| 0) }
     }
 
     pub(super) fn row(&self, row: usize) -> &[u64] {
@@ -207,71 +219,96 @@ impl BitMatrix {
 #[cfg(test)]
 mod tests {
     use blaze_ids::rng::SplitMix64;
+    use blaze_mem::{Tag, frame};
 
     use super::{BitMatrix, BitSet, Transfer, iter_words};
 
     #[test]
     fn filled_holds_exactly_the_bits_below_its_size() {
-        for size in [0, 1, 63, 64, 65, 127, 128, 200] {
-            let set = BitSet::filled(size);
-            assert_eq!(set.iter().collect::<Vec<_>>(), (0..size).collect::<Vec<_>>(), "{size}");
-            assert_eq!(set.words().len(), size.div_ceil(64));
-        }
+        frame::task(Tag::Mir, |frame| {
+            for size in [0, 1, 63, 64, 65, 127, 128, 200] {
+                let set = BitSet::filled(frame, size);
+                assert_eq!(set.iter().collect::<Vec<_>>(), (0..size).collect::<Vec<_>>(), "{size}");
+                assert_eq!(set.words().len(), size.div_ceil(64));
+            }
+        });
     }
 
     #[test]
     fn ranges_match_a_bit_at_a_time() {
-        let mut rng = SplitMix64::new(0x9e3779b97f4a7c15);
-        for _ in 0..2000 {
-            let size = 1 + rng.index(300);
-            let mut fast = BitSet::new(size);
-            let mut slow = vec![false; size];
-            for _ in 0..8 {
-                let start = rng.index(size + 1);
-                let end = start + rng.index(size + 1 - start);
-                let on = rng.index(2) == 0;
-                if on {
-                    fast.gen_range(start..end);
-                } else {
-                    fast.kill_range(start..end);
+        frame::task(Tag::Mir, |frame| {
+            let mut rng = SplitMix64::new(0x9e3779b97f4a7c15);
+            for _ in 0..2000 {
+                let size = 1 + rng.index(300);
+                let mut fast = BitSet::new(frame, size);
+                let mut slow = vec![false; size];
+                for _ in 0..8 {
+                    let start = rng.index(size + 1);
+                    let end = start + rng.index(size + 1 - start);
+                    let on = rng.index(2) == 0;
+                    if on {
+                        fast.gen_range(start..end);
+                    } else {
+                        fast.kill_range(start..end);
+                    }
+                    slow[start..end].fill(on);
+                    let start = rng.index(size + 1);
+                    let end = start + rng.index(size + 1 - start);
+                    let want = (start..end).find(|&it| slow[it]);
+                    assert_eq!(fast.first_in(start..end), want);
                 }
-                slow[start..end].fill(on);
-                let start = rng.index(size + 1);
-                let end = start + rng.index(size + 1 - start);
-                let want = (start..end).find(|&it| slow[it]);
-                assert_eq!(fast.first_in(start..end), want);
+                let want: Vec<usize> = (0..size).filter(|&it| slow[it]).collect();
+                assert_eq!(fast.iter().collect::<Vec<_>>(), want);
             }
-            let want: Vec<usize> = (0..size).filter(|&it| slow[it]).collect();
-            assert_eq!(fast.iter().collect::<Vec<_>>(), want);
-        }
+        });
     }
 
     #[test]
     fn union_says_whether_it_added_a_bit() {
-        let mut a = BitSet::new(130);
-        let mut b = BitSet::new(130);
-        b.insert(3);
-        b.insert(129);
-        assert!(a.union(&b));
-        assert!(!a.union(&b));
-        assert_eq!(a.iter().collect::<Vec<_>>(), vec![3, 129]);
-        a.remove(3);
-        let mut c = a.clone();
-        c.load(b.words());
-        assert_eq!(c, b);
+        frame::task(Tag::Mir, |frame| {
+            let mut a = BitSet::new(frame, 130);
+            let mut b = BitSet::new(frame, 130);
+            b.insert(3);
+            b.insert(129);
+            assert!(a.union(&b));
+            assert!(!a.union(&b));
+            assert_eq!(a.iter().collect::<Vec<_>>(), vec![3, 129]);
+            a.remove(3);
+            let mut c = a.clone_in(frame);
+            c.load(b.words());
+            assert_eq!(c, b);
+        });
     }
 
     #[test]
     fn matrix_rows_are_independent() {
-        let mut m = BitMatrix::new(3, 70);
-        m.insert(1, 69);
-        m.insert(2, 0);
-        assert_eq!(m.words, 2);
-        assert!(m.contains(1, 69) && !m.contains(0, 69));
-        assert_eq!(iter_words(m.row(0)).collect::<Vec<_>>(), Vec::<usize>::new());
-        assert_eq!(iter_words(m.row(1)).collect::<Vec<_>>(), vec![69]);
-        assert!(m.union_rows(0, 2) && !m.union_rows(0, 2) && m.union_rows(2, 1));
-        assert_eq!(iter_words(m.row(0)).collect::<Vec<_>>(), vec![0]);
-        assert_eq!(iter_words(m.row(2)).collect::<Vec<_>>(), vec![0, 69]);
+        frame::task(Tag::Mir, |frame| {
+            let mut m = BitMatrix::new(frame, 3, 70);
+            m.insert(1, 69);
+            m.insert(2, 0);
+            assert_eq!(m.words, 2);
+            assert!(m.contains(1, 69) && !m.contains(0, 69));
+            assert_eq!(iter_words(m.row(0)).collect::<Vec<_>>(), Vec::<usize>::new());
+            assert_eq!(iter_words(m.row(1)).collect::<Vec<_>>(), vec![69]);
+            assert!(m.union_rows(0, 2) && !m.union_rows(0, 2) && m.union_rows(2, 1));
+            assert_eq!(iter_words(m.row(0)).collect::<Vec<_>>(), vec![0]);
+            assert_eq!(iter_words(m.row(2)).collect::<Vec<_>>(), vec![0, 69]);
+        });
+    }
+
+    #[test]
+    fn a_set_and_a_matrix_take_no_global_memory() {
+        frame::task(Tag::Mir, |frame| {
+            let _ = BitSet::new(frame, 1);
+            let _ = BitMatrix::new(frame, 1, 1);
+            blaze_alloc_count::assert_at_most(0, "a bitset and a matrix in the frame", || {
+                let mut set = BitSet::new(frame, 1000);
+                let mut matrix = BitMatrix::new(frame, 64, 1000);
+                set.gen_range(3..900);
+                matrix.insert(63, 999);
+                set.load(matrix.row(63));
+                assert!(set.contains(999));
+            });
+        });
     }
 }

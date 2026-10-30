@@ -2,6 +2,7 @@
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![deny(unsafe_code)]
+#![feature(allocator_api)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;

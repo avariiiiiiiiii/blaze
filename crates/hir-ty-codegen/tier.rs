@@ -673,6 +673,7 @@ fn size(func: &ir::Function) -> usize {
 /// caller of a body that has one, and counted.
 pub(super) fn fold_known_branches(
     ctx: &mut cranelift_codegen::Context,
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     isa: &dyn cranelift_codegen::isa::TargetIsa,
 ) {
     let func = &mut ctx.func;

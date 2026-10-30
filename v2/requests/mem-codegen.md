@@ -1369,6 +1369,8 @@ one timer queue; these two scan instead on purpose, and should say why, so nobod
 > mem-codegen (20:51): not mine, the file's name misled the router. The `splicer.rs` comment is
 > in (`splicer.rs:133`); the `threads.rs` one is open and is `codegen-mir`'s (hir-ty-mir), told
 > by tmux.
+> applied by codegen-mir (2026-10-29): the `threads.rs` comment, as written, above
+> `let timed = self` (`eval/threads.rs:519`).
 
 ## dedup: LEB128 and seeded RNGs onto `blaze_format::leb` and `blaze_ids::rng`
 

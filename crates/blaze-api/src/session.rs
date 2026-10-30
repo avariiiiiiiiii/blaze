@@ -27,14 +27,15 @@ use blaze_core::Conn;
 use rustc_hash::FxHashMap;
 use blaze_ids::{ContentId, radix};
 use blaze_mem::{
-    Tag,
+    Handle, Slab, Tag,
     tag::{Rate, Snapshot},
 };
 use blaze_query::QueryKey;
 use blaze_vfs::{CommitError, OpError, Ticket, View, ViewId, Vfs};
 
 use crate::{
-    ApiError, Arrived, Memory, Reply, Request, RequestRef, Response, Status, TagMemory, ViewRef,
+    ApiError, Arrived, Memory, Reply, Request, RequestRef, Response, Status, TagMemory, Targets,
+    ViewRef,
     build::{Builder, JobId, Opened, Work},
     session::{best_of::BestOf, intent::Intents},
 };
@@ -43,6 +44,7 @@ use crate::{
 pub struct Daemon<'a> {
     pub vfs: &'a mut Vfs,
     pub db: &'a blaze_query::Database,
+    // dyn: the daemon's one builder, chosen at startup; one call per job.
     pub builder: &'a mut dyn Builder,
     /// For [`Response::Status`].
     pub pid: u32,
@@ -58,7 +60,6 @@ pub struct Daemon<'a> {
 /// Each call adds to `out` the replies it makes, in order. The daemon flushes the VFS after
 /// each call.
 pub struct Session {
-    next_job: u64,
     next_serial: u64,
     /// Every request not yet over, by the session's own number for it; a gone connection's
     /// stay until their jobs finish.
@@ -67,8 +68,8 @@ pub struct Session {
     /// found by a walk and put in order of id; a request's begin and end touch one slot and
     /// allocate nothing.
     live: FxHashMap<RequestRef, u64>,
-    /// Each job's request, and its candidate for a best-of-N.
-    jobs: FxHashMap<JobId, (u64, Option<u32>)>,
+    /// Every job not finished, by its slot ([`JobId`]): what it is for.
+    jobs: Slab<Job>,
     /// Commits waiting to be durable.
     tickets: FxHashMap<Ticket, u64>,
     /// The views each connection opened with [`Request::Open`], by root, one per open; sorted
@@ -82,10 +83,43 @@ pub struct Session {
     now_ns: u64,
     /// Each subsystem's allocation rate since the last [`Request::Memory`].
     rate: Rate,
+    buffers: Buffers,
+}
+
+/// Buffers kept between calls, cleared and refilled, so a warm call allocates none of them.
+#[derive(Default)]
+struct Buffers {
+    /// A best-of's started candidates.
+    starts: Vec<(JobId, Opened)>,
+    /// A gone connection's requests, and their sort's scratch.
+    going: Vec<(RequestRef, u64)>,
+    going_scratch: Vec<(RequestRef, u64)>,
+    /// A gone connection's held views, by root.
+    closing: Vec<(ContentId, Vec<ViewId>)>,
+    /// [`Request::Status`]'s sort's scratch.
+    ids_scratch: Vec<u64>,
 }
 
 /// How many roots' last builds [`Session`] keeps for [`Request::Why`].
 pub const KEPT: usize = 64;
+
+/// The most jobs under way at once: the room [`Session`]'s table of jobs reserves.
+const JOBS: u32 = 1 << 20;
+
+/// What a job is the session's for.
+enum Job {
+    /// A request's, by its number, and its candidate for a best-of-N.
+    Request { serial: u64, candidate: Option<u32> },
+    /// Declared intent's ([`intent`]).
+    Intent,
+}
+
+/// The table's handle of `job`; `None` for an even generation, which no job has (a free or
+/// retired slot's).
+fn handle(job: JobId) -> Option<Handle<Job>> {
+    (job.generation & 1 == 1)
+        .then(|| Handle::from_bits((u64::from(job.generation) << 32) | u64::from(job.slot)))
+}
 
 struct Pending {
     sink: Sink,
@@ -116,7 +150,8 @@ enum Kind {
     Job {
         job: JobId,
         cancelled: bool,
-        views: Vec<Opened>,
+        /// At most two: a reach's from and to, else the one it builds (none for a snapshot).
+        views: [Option<Opened>; 2],
         kept: Option<Opened>,
         owes_work: bool,
     },
@@ -133,6 +168,7 @@ enum Kind {
 }
 
 impl Kind {
+    // dyn: the daemon's one builder, chosen at startup; one call per job.
     fn cancel(&mut self, builder: &mut dyn Builder) {
         match self {
             Kind::Commit { .. } => {}
@@ -149,7 +185,7 @@ impl Kind {
     fn views(&self) -> usize {
         match self {
             Kind::Commit { .. } => 0,
-            Kind::Job { views, .. } => views.len(),
+            Kind::Job { views, .. } => views.iter().flatten().count(),
             Kind::Edit { .. } => 1,
             Kind::BestOf(best) => best.views(),
         }
@@ -165,17 +201,21 @@ impl Default for Session {
 impl Session {
     pub fn new() -> Session {
         Session {
-            next_job: 0,
             next_serial: 0,
             pending: FxHashMap::default(),
             live: FxHashMap::default(),
-            jobs: FxHashMap::default(),
+            // alloc: none, address space reserved.
+            jobs: match Slab::new(JOBS, Tag::Api) {
+                Ok(it) => it,
+                Err(error) => panic!("the session's table of jobs: {error}"),
+            },
             tickets: FxHashMap::default(),
             held: FxHashMap::default(),
             kept: VecDeque::new(),
             intents: Intents::default(),
             now_ns: 0,
             rate: Rate::new(),
+            buffers: Buffers::default(),
         }
     }
 
@@ -194,6 +234,7 @@ impl Session {
             .map(|tag| {
                 let it = snapshot.get(tag);
                 TagMemory {
+                    // alloc: the wire value's own name, once per tag per Memory request.
                     tag: tag.name().to_owned(),
                     live: it.live,
                     rate: rates[tag.index()],
@@ -203,6 +244,7 @@ impl Session {
                     high_water: it.high_water,
                 }
             })
+            // alloc: the response's list of tags, once per Memory request.
             .collect();
         Memory {
             tags,
@@ -227,8 +269,9 @@ impl Session {
             Arrived::Request { from, request } => {
                 if self.live.contains_key(&from) {
                     let error = ApiError::new(
+                        // alloc: error path, a request id already under way.
                         format!("request {} is already under way on this connection", from.id),
-                        Some(format!("request {}", from.id)),
+                        Some(format!("request {}", from.id)), // alloc: as above.
                     );
                     fail(out, from, error);
                     return;
@@ -254,7 +297,10 @@ impl Session {
             !matches!(response, Response::Done { .. } | Response::Error(_)),
             "job {job:?} reported {response:?}: a job ends through `Session::finish`"
         );
-        let Some(&(serial, candidate)) = self.jobs.get(&job) else { return };
+        let Some(&Job::Request { serial, candidate }) = handle(job).and_then(|it| self.jobs.get(it))
+        else {
+            return;
+        };
         let pending = self.pending.get_mut(&serial).expect("a job's request is pending");
         let sink = pending.sink;
         match (&mut pending.what, candidate) {
@@ -268,12 +314,17 @@ impl Session {
                 }
                 sink.send(out, response);
             }
-            (Kind::Edit { ops, .. }, _) => {
-                if let Response::Edited(edited) = &response {
-                    *ops = Some(edited.ops.clone());
+            (Kind::Edit { ops, .. }, _) => match response {
+                Response::Edited(edited) if sink.gone => *ops = Some(edited.ops),
+                response => {
+                    if let Response::Edited(edited) = &response {
+                        // The ops go both to the client, in the reply, and into the commit.
+                        // clone: the reply's ops and the commit's; moved when the client is gone.
+                        *ops = Some(edited.ops.clone());
+                    }
+                    sink.send(out, response);
                 }
-                sink.send(out, response);
-            }
+            },
             _ => sink.send(out, response),
         }
     }
@@ -303,14 +354,11 @@ impl Session {
         mut queries: Option<ViewId>,
         out: &mut Vec<Reply>,
     ) {
-        if let Some(opened) = self.intents.finish(job) {
-            close(cx, opened);
-            if let Some(queries) = queries {
-                cx.db.close(queries);
+        let Some(Job::Request { serial, candidate }) = handle(job).and_then(|it| self.jobs.remove(it))
+        else {
+            if let Some(opened) = self.intents.finish(job) {
+                close(cx, opened);
             }
-            return;
-        }
-        let Some((serial, candidate)) = self.jobs.remove(&job) else {
             if let Some(queries) = queries {
                 cx.db.close(queries);
             }
@@ -355,17 +403,18 @@ impl Session {
             (Kind::Job { views, kept, owes_work, cancelled, .. }, None) => {
                 let error = match error {
                     None if *owes_work && !*cancelled => Some(ApiError::new(
+                        // alloc: error path, a build that did not report its work.
                         format!(
                             "the build of {:x} ended without reporting what it did \
                              (`Response::Work`)",
-                            views.first().expect("a build, test or run has its view").view.root
+                            views[0].expect("a build, test or run has its view").view.root
                         ),
-                        Some(format!("job {}", job.0)),
+                        Some(format!("job {job}")), // alloc: as above.
                     )),
                     error => error,
                 };
                 let ok = ok && error.is_none();
-                for opened in views.drain(..) {
+                for opened in views.iter_mut().filter_map(Option::take) {
                     if error.is_none() && *kept == Some(opened) {
                         cx.vfs.close(opened.files);
                         let opened = built_in(cx.db, opened, queries.take());
@@ -411,11 +460,12 @@ impl Session {
             (Some(error), _) => Err(error),
             (None, _) if !ok || *cancelled => Ok(None),
             (None, None) => Err(ApiError::new(
+                // alloc: error path, edits that did not report their ops.
                 format!(
                     "the edits of {base:x} ended without reporting what they changed \
                      (`Response::Edited`)"
                 ),
-                Some(format!("job {}", job.0)),
+                Some(format!("job {job}")), // alloc: as above.
             )),
             (None, Some(ops)) => Ok(Some(ops)),
         };
@@ -521,19 +571,20 @@ impl Session {
                     }
                 };
                 let changes = cx.vfs.diff(from.view.root, to.view.root);
-                self.start(cx, req, Some(to), vec![from, to], Work::Reach { from, changes, targets });
+                let work = Work::Reach { from, changes, targets };
+                self.start(cx, req, Some(to), [Some(from), Some(to)], work);
             }
-            Request::Snapshot => self.start(cx, req, None, Vec::new(), Work::Snapshot),
+            Request::Snapshot => self.start(cx, req, None, [None, None], Work::Snapshot),
             Request::Stop => out.push(Reply { to: req, response: Response::Done { ok: true } }),
             Request::Edit { base, head, edits } => {
                 if !cx.vfs.has(base) {
                     return Err(commit_error(&head, base, &CommitError::UnknownBase(base)));
                 }
                 let opened = open(cx, base)?;
-                let job = self.job();
+                let serial = self.serial();
+                let job = self.job(Job::Request { serial, candidate: None });
                 let edit = Kind::Edit { job, cancelled: false, opened, head, ops: None };
-                let serial = self.begin(req, edit);
-                self.jobs.insert(job, (serial, None));
+                self.begin_as(serial, req, edit);
                 cx.builder.start(job, Some(opened), Work::Edit(edits));
             }
             Request::WillTest { view, filter, targets, wait_ms } => {
@@ -545,11 +596,13 @@ impl Session {
                 let base = cx.vfs.head(&head).unwrap_or_else(|| cx.vfs.empty());
                 let root = cx.vfs.apply(base, &ops).map_err(|error| {
                     ApiError::new(
+                        // alloc: error path, a save whose ops don't apply.
                         format!("the save's ops don't apply to head `{head}` at {base:x}: {error}"),
                         Some(op_path(&error)),
                     )
                 })?;
                 let work = if test {
+                    // alloc: none, empty lists.
                     Work::Test { targets, filter: Vec::new(), all: false, args: Vec::new(), ub: None }
                 } else {
                     Work::Check(targets)
@@ -560,16 +613,20 @@ impl Session {
                 let base = resolve(cx.vfs, &base)?;
                 if candidates.is_empty() {
                     return Err(ApiError::new(
+                        // alloc: error path, a best-of of no candidates.
                         format!("a best-of on {base:x} has no candidates"),
-                        Some(format!("root {base:x}")),
+                        Some(format!("root {base:x}")), // alloc: as above.
                     ));
                 }
                 let sink = Sink { to: req, gone: false };
+                let serial = self.serial();
                 let mut best = BestOf::new(base);
-                let mut starts = Vec::new();
+                let mut starts = std::mem::take(&mut self.buffers.starts);
+                starts.clear();
                 for ops in &candidates {
                     let root = cx.vfs.apply(base, ops).map_err(|error| {
                         ApiError::new(
+                            // alloc: error path, a candidate whose ops don't apply.
                             format!("the candidate's ops don't apply to {base:x}: {error}"),
                             Some(op_path(&error)),
                         )
@@ -577,9 +634,9 @@ impl Session {
                     match root.and_then(|root| open(cx, root)) {
                         Ok(opened) => {
                             self.intents.take_over(cx.builder, opened.view.root);
-                            let job = self.job();
-                            let candidate = best.started(job, opened);
-                            starts.push((job, candidate, opened));
+                            let job = self.job(Job::Request { serial, candidate: Some(best.next()) });
+                            best.started(job, opened);
+                            starts.push((job, opened));
                         }
                         Err(error) => {
                             let candidate = best.refused();
@@ -589,26 +646,30 @@ impl Session {
                     }
                 }
                 if starts.is_empty() {
+                    self.buffers.starts = starts;
                     sink.send(out, Response::Ranked(best.ranked()));
                     sink.send(out, Response::Done { ok: false });
                     return Ok(());
                 }
-                let serial = self.begin(req, Kind::BestOf(best));
-                for (job, candidate, opened) in starts {
-                    self.jobs.insert(job, (serial, Some(candidate)));
-                    let work = if test {
-                        Work::Test {
-                            targets: targets.clone(),
-                            filter: filter.clone(),
-                            all: false,
-                            args: Vec::new(),
-                            ub: None,
-                        }
+                let (&(job, opened), rest) = starts.split_last().expect("a candidate started");
+                let work = |targets: Targets, filter: Vec<String>| {
+                    if test {
+                        // alloc: none, an empty list.
+                        Work::Test { targets, filter, all: false, args: Vec::new(), ub: None }
                     } else {
-                        Work::Check(targets.clone())
-                    };
-                    cx.builder.start(job, Some(opened), work);
+                        Work::Check(targets)
+                    }
+                };
+                self.begin_as(serial, req, Kind::BestOf(best));
+                for &(job, opened) in rest {
+                    // Each candidate's job owns its work; the last is given the request's own.
+                    // clone: one per candidate but the last; a check copies no filter.
+                    let filter = if test { filter.clone() } else { Vec::new() };
+                    // clone: as above.
+                    cx.builder.start(job, Some(opened), work(targets.clone(), filter));
                 }
+                cx.builder.start(job, Some(opened), work(targets, filter));
+                self.buffers.starts = starts;
             }
             Request::Diff { from, to } => {
                 let from = resolve(cx.vfs, &from)?;
@@ -620,15 +681,17 @@ impl Session {
                 let root = resolve(cx.vfs, &view)?;
                 let Some(&(_, queries)) = self.kept.iter().find(|(kept, _)| *kept == root) else {
                     return Err(ApiError::new(
+                        // alloc: error path, a root with no kept build.
                         format!(
                             "no build of {root:x} has ended among the latest {KEPT} roots built: \
                              build it, then ask why"
                         ),
-                        Some(format!("root {root:x}")),
+                        Some(format!("root {root:x}")), // alloc: as above.
                     ));
                 };
                 let Some(why) = cx.db.why(queries, &query) else {
                     return Err(ApiError::new(
+                        // alloc: error path, a query that did not rerun.
                         format!("{} did not rerun in the last build of {root:x}", query_name(&query)),
                         Some(query_name(&query)),
                     ));
@@ -636,8 +699,10 @@ impl Session {
                 answer(out, req, Response::Why(why));
             }
             Request::Status => {
-                let mut requests: Vec<u64> = self.live.keys().map(|it| it.id).collect();
-                radix::sort(&mut requests);
+                // alloc: the reply's own list of requests, once per Status; none when idle.
+                let mut requests: Vec<u64> = Vec::with_capacity(self.live.len());
+                requests.extend(self.live.keys().map(|it| it.id));
+                radix::sort_copy_by_key_in(&mut requests, |it| *it, &mut self.buffers.ids_scratch);
                 let status = Status {
                     pid: cx.pid,
                     requests,
@@ -661,8 +726,9 @@ impl Session {
                 let Some(held) = self.held.get_mut(&req.conn).filter(|it| it.contains_key(&root))
                 else {
                     return Err(ApiError::new(
+                        // alloc: error path, a close of a view not held.
                         format!("this connection holds no open view of {root:x}"),
-                        Some(format!("root {root:x}")),
+                        Some(format!("root {root:x}")), // alloc: as above.
                     ));
                 };
                 let views = held.get_mut(&root).expect("a held root");
@@ -680,18 +746,20 @@ impl Session {
                 let target = RequestRef { conn: req.conn, id };
                 let Some(&serial) = self.live.get(&target) else {
                     return Err(ApiError::new(
+                        // alloc: error path, a cancel of no request under way.
                         format!("no request {id} is under way on this connection"),
-                        Some(format!("request {id}")),
+                        Some(format!("request {id}")), // alloc: as above.
                     ));
                 };
                 let pending = self.pending.get_mut(&serial).expect("a live request is pending");
                 if let Kind::Commit { head, .. } = &pending.what {
                     return Err(ApiError::new(
+                        // alloc: error path, a cancel of a commit already made.
                         format!(
                             "request {id} is a commit to head `{head}` that is made and waiting \
                              to be durable: it can't be cancelled"
                         ),
-                        Some(format!("request {id}")),
+                        Some(format!("request {id}")), // alloc: as above.
                     ));
                 }
                 pending.what.cancel(cx.builder);
@@ -711,7 +779,7 @@ impl Session {
     ) -> Result<(), ApiError> {
         let root = resolve(cx.vfs, view)?;
         let opened = open(cx, root)?;
-        self.start(cx, req, Some(opened), vec![opened], work);
+        self.start(cx, req, Some(opened), [Some(opened), None], work);
         Ok(())
     }
 
@@ -720,18 +788,17 @@ impl Session {
         cx: &mut Daemon<'_>,
         req: RequestRef,
         view: Option<Opened>,
-        views: Vec<Opened>,
+        views: [Option<Opened>; 2],
         work: Work,
     ) {
-        let job = self.job();
+        let serial = self.serial();
+        let job = self.job(Job::Request { serial, candidate: None });
         let kept = view.filter(|_| incremental(&work));
         if let Some(kept) = kept {
             self.intents.take_over(cx.builder, kept.view.root);
         }
         let owes_work = matches!(work, Work::Build(_) | Work::Test { .. } | Work::Run { .. });
-        let serial =
-            self.begin(req, Kind::Job { job, cancelled: false, views, kept, owes_work });
-        self.jobs.insert(job, (serial, None));
+        self.begin_as(serial, req, Kind::Job { job, cancelled: false, views, kept, owes_work });
         cx.builder.start(job, view, work);
     }
 
@@ -748,25 +815,36 @@ impl Session {
         out: &mut Vec<Reply>,
     ) -> Result<(), ApiError> {
         let opened = open(cx, root)?;
-        let job = self.job();
+        let job = self.job(Job::Intent);
         self.intents.add(cx.builder, req.conn, job, opened, head, wait_ms);
         cx.builder.speculate(job, opened, work);
         answer(out, req, Response::Announced { root });
         Ok(())
     }
 
-    fn job(&mut self) -> JobId {
-        let job = JobId(self.next_job);
-        self.next_job += 1;
-        job
+    /// A slot of the table for `job`, a freed one before a new one ([`JobId`]): an index, no
+    /// hash, and no allocation once the table has grown to the jobs under way at once.
+    fn job(&mut self, job: Job) -> JobId {
+        let handle = self.jobs.insert(job);
+        JobId { slot: handle.index(), generation: handle.generation() }
+    }
+
+    /// The number of a request about to begin ([`Session::begin_as`]), for its jobs to name.
+    fn serial(&mut self) -> u64 {
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        serial
     }
 
     fn begin(&mut self, req: RequestRef, what: Kind) -> u64 {
-        let serial = self.next_serial;
-        self.next_serial += 1;
+        let serial = self.serial();
+        self.begin_as(serial, req, what);
+        serial
+    }
+
+    fn begin_as(&mut self, serial: u64, req: RequestRef, what: Kind) {
         self.pending.insert(serial, Pending { sink: Sink { to: req, gone: false }, what });
         self.live.insert(req, serial);
-        serial
     }
 
     fn end(&mut self, serial: u64) -> Pending {
@@ -778,15 +856,13 @@ impl Session {
     }
 
     fn gone(&mut self, cx: &mut Daemon<'_>, conn: Conn) {
-        // alloc: once per connection's end, not per request.
-        let mut requests: Vec<(RequestRef, u64)> = self
-            .live
-            .iter()
-            .filter(|(req, _)| req.conn == conn)
-            .map(|(req, serial)| (*req, *serial))
-            .collect();
-        radix::sort_copy_by_key(&mut requests, |it| it.0.id);
-        for (req, serial) in requests {
+        let mut requests = std::mem::take(&mut self.buffers.going);
+        requests.clear();
+        requests.extend(
+            self.live.iter().filter(|(req, _)| req.conn == conn).map(|(req, serial)| (*req, *serial)),
+        );
+        radix::sort_copy_by_key_in(&mut requests, |it| it.0.id, &mut self.buffers.going_scratch);
+        for &(req, serial) in &requests {
             self.live.remove(&req);
             let pending = self.pending.get_mut(&serial).expect("a live request is pending");
             pending.sink.gone = true;
@@ -797,11 +873,14 @@ impl Session {
                 pending.what.cancel(cx.builder);
             }
         }
+        self.buffers.going = requests;
         self.intents.gone(cx.builder, conn);
-        let mut held: Vec<(ContentId, Vec<ViewId>)> =
-            self.held.remove(&conn).into_iter().flatten().collect();
-        held.sort_unstable_by_key(|&(root, _)| root);
-        for files in held.into_iter().flat_map(|(_, views)| views) {
+        let Some(held) = self.held.remove(&conn) else { return };
+        let closing = &mut self.buffers.closing;
+        closing.clear();
+        closing.extend(held);
+        closing.sort_unstable_by_key(|&(root, _)| root);
+        for files in closing.drain(..).flat_map(|(_, views)| views) {
             cx.vfs.close(files);
         }
     }
@@ -820,6 +899,7 @@ fn answer(out: &mut Vec<Reply>, to: RequestRef, response: Response) {
 }
 
 fn of(candidate: u32, response: Response) -> Response {
+    // alloc: the wire type's box of a candidate's response.
     Response::Of { candidate, response: Box::new(response) }
 }
 
@@ -837,8 +917,9 @@ fn resolve(vfs: &mut Vfs, view: &ViewRef) -> Result<ContentId, ApiError> {
                 Ok(view.root)
             } else {
                 Err(ApiError::new(
+                    // alloc: error path, an unknown root.
                     format!("no root {:x} is known", view.root),
-                    Some(format!("root {:x}", view.root)),
+                    Some(format!("root {:x}", view.root)), // alloc: as above.
                 ))
             }
         }
@@ -846,6 +927,7 @@ fn resolve(vfs: &mut Vfs, view: &ViewRef) -> Result<ContentId, ApiError> {
             let base = resolve(vfs, base)?;
             vfs.apply(base, ops).map_err(|error| {
                 ApiError::new(
+                    // alloc: error path, a what-if whose ops don't apply.
                     format!("the what-if's ops don't apply to {base:x}: {error}"),
                     Some(op_path(&error)),
                 )
@@ -914,23 +996,27 @@ fn keep(kept: &mut VecDeque<(ContentId, ViewId)>, db: &blaze_query::Database, op
 }
 
 fn open_error(root: ContentId, error: &CommitError) -> ApiError {
+    // alloc: error path, a view that could not be opened.
     ApiError::new(format!("opening {root:x}: {error}"), Some(format!("root {root:x}")))
 }
 
 fn commit_error(head: &str, base: ContentId, error: &CommitError) -> ApiError {
     match error {
         CommitError::UnknownBase(root) => ApiError::new(
+            // alloc: error path, a commit on an unknown base.
             format!("the base {root:x} of a commit to head `{head}` is no root this daemon has"),
-            Some(head.to_owned()),
+            Some(head.to_owned()), // alloc: as above.
         ),
         CommitError::Conflict { path } => ApiError::new(
+            // alloc: error path, a commit that conflicts.
             format!(
                 "head `{head}` moved past {base:x} and changed {path} in a way the commit's ops \
                  can't be moved past"
             ),
-            Some(path.clone()),
+            Some(path.clone()), // clone: as above, the error's own path.
         ),
         CommitError::Op(error) => ApiError::new(
+            // alloc: error path, a commit whose op failed.
             format!("a commit to head `{head}` on {base:x}: {error}"),
             Some(op_path(error)),
         ),
@@ -946,11 +1032,14 @@ fn op_path(error: &OpError) -> String {
         | OpError::NotADirectory(path)
         | OpError::Exists(path)
         | OpError::OutOfRange { path, .. }
+        // clone: error path, the error's own path.
         | OpError::BadLink { path, .. } => path.clone(),
+        // alloc: error path, the root an op was given.
         OpError::UnknownRoot(root) => format!("root {root:x}"),
     }
 }
 
 fn query_name(query: &QueryKey) -> String {
+    // alloc: error path, a query's name for a Why that found nothing.
     format!("the query of kind {:#06x} on {:x}", query.kind.0, query.input)
 }

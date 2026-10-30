@@ -2,6 +2,8 @@
 //! patch's bytes put where they go ([`Writes`]), and views of the descriptor, the table cell
 //! and the loader's table. Only the platform modules call the unsafe functions here, after
 //! checking the addresses against the image's mappings; the switch itself has no unsafe.
+//! Also the typed rows of the address space the switch's columns reserve ([`rows`]), whose
+//! safety rests on the platform's [`Reserved`].
 
 #![allow(unsafe_code)]
 
@@ -10,7 +12,46 @@ use std::{
     sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering},
 };
 
-use super::switch::{Writes, le64};
+use super::{
+    os::Reserved,
+    switch::{Writes, le64},
+};
+
+/// What a reserved column holds: a type every pattern of its bytes is a value of, zeroes
+/// included, with no padding, and an alignment no more than a page's. Implementing it takes
+/// `unsafe impl`, which only this module allows, so its list is the one below.
+///
+/// # Safety
+///
+/// Every `size_of::<T>()` bytes are a valid `T`, and `T`'s alignment divides 4096.
+pub(super) unsafe trait Plain: Copy {}
+
+// SAFETY: any byte is a `u8`.
+unsafe impl Plain for u8 {}
+// SAFETY: any 4 bytes are a `u32`, aligned to 4.
+unsafe impl Plain for u32 {}
+// SAFETY: any 8 bytes are a `u64`, aligned to 8.
+unsafe impl Plain for u64 {}
+
+/// The first `len` rows of `T` of `reserved`, which has them committed (asserted).
+pub(super) fn rows<T: Plain>(reserved: &Reserved, len: usize) -> &[T] {
+    let bytes = len.checked_mul(size_of::<T>());
+    assert!(bytes.is_some_and(|it| it <= reserved.committed()), "{len} rows past the committed");
+    // SAFETY: the first `committed` bytes of the reservation are committed, readable, and its
+    // alone (`Reserved`'s invariant), and `len` rows are within them (asserted). Its base is
+    // page-aligned, so aligned for `T`, and any bytes there, written or zero, are a `T`
+    // (`Plain`). The borrow of `reserved` keeps it from being written or unmapped meanwhile.
+    unsafe { std::slice::from_raw_parts(reserved.base() as *const T, len) }
+}
+
+/// [`rows`], to write.
+pub(super) fn rows_mut<T: Plain>(reserved: &mut Reserved, len: usize) -> &mut [T] {
+    let bytes = len.checked_mul(size_of::<T>());
+    assert!(bytes.is_some_and(|it| it <= reserved.committed()), "{len} rows past the committed");
+    // SAFETY: as in `rows`, and committed writable; the mutable borrow of `reserved` makes
+    // this the only view of its rows.
+    unsafe { std::slice::from_raw_parts_mut(reserved.base() as *mut T, len) }
+}
 
 /// How many bytes [`Writes::store`] makes on the stack before storing them.
 const CHUNK: usize = 256;

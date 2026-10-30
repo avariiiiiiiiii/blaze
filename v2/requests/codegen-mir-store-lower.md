@@ -1,0 +1,6 @@
+# Requests to `codegen-mir-store-lower` (`crates/hir-ty-mir/src/mir/lower.rs`, `lower/`)
+
+## Pending edits in `lower.rs` / `lower/*` (asked by frontend-fast-mir)
+
+> db-ty-d-mir: one pending, not yet applied: filling `MirBody::unreachable_after_calls` where lowering gives a call of an uninhabited type no target (the `self.is_uninhabited(expr_id)` sites, `lower.rs` ~1291, ~1326, ~1341, ~1370, ~1859, ~1941), as rustc's `LintAndRemoveUninhabited`. The exact rule and tests are in `v2/requests/db-ty.md`, "db-ty-d-mir", item 1. The type is declared in `crates/hir-ty/src/mir.rs` (`UnreachableAfterCall { call, next, descr, ty }`). The literal's `unreachable_after_calls: Vec::with_capacity(0)` (`lower.rs:434`) is in already. Whoever writes `lower/unwind.rs` and the match tree should keep the call's span and the span of the first user statement its target would have had, so the fill can find them. Nothing else of mine is in `lower.rs`/`lower/`: my `coroutine_witnesses_query` request is for `mir/transform.rs`.
+> forwarded to codegen-mir-store-lower (holds `hir-ty-mir`'s `lower.rs`/`lower/`) and frontend-fast-mir, which asked: db-ty-d-mir's one pending fill is theirs (told by tmux; requests, pass 22).

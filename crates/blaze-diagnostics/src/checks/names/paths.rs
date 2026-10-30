@@ -254,9 +254,9 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, 
         Some(PathResolution::Def(def)) => Some(*def),
         _ => None,
     };
-    let found = single.then(|| imports(cx, current, source.path(), &last.name, own)).filter(|it| !it.is_empty());
+    let to_import = single.then(|| imports(cx, current, source.path(), &last.name, own)).filter(|it| !it.is_empty());
     let mut suggested: Vec<String> = Vec::new();
-    if found.is_none() && source == Source::Type {
+    if to_import.is_none() && source == Source::Type {
         suggested = variant_enums(cx, &mut diag, current, &last.name, res.is_none(), &span);
     }
     let at = cx.span(InFile::new(file, last.range));
@@ -282,8 +282,8 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, 
     }
 
     // `report_with_use_injections`: the imports, else a generic parameter to add.
-    if let Some(found) = found {
-        show_imports(cx, &mut diag, current, found, res.is_some());
+    if let Some(to_import) = to_import {
+        show_imports(cx, &mut diag, current, to_import, res.is_some());
     } else if res.is_none()
         && source == Source::Type
         && single

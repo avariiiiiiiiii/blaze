@@ -8,8 +8,7 @@
 //! when its deadline passes. A taken-over intent runs to its end.
 
 use blaze_core::Conn;
-use blaze_ids::{ContentId, radix};
-use rustc_hash::FxHashMap;
+use blaze_ids::ContentId;
 
 use crate::build::{Builder, JobId, Opened};
 
@@ -32,12 +31,12 @@ impl Intent {
 
 #[derive(Default)]
 pub(super) struct Intents {
-    by_job: FxHashMap<JobId, Intent>,
+    /// Every intent whose job has not finished, in the order their jobs started, which is the
+    /// order they are taken over and cancelled in ([`JobId`]s don't follow it). A list, scanned:
+    /// one intent per waiting client, a few at once.
+    started: Vec<(JobId, Intent)>,
     /// The daemon's clock as [`super::Session::tick`] last gave it.
     now_ns: u64,
-    /// The jobs a call picked ([`Intents::pick`]) and their sort's scratch, kept between calls.
-    picked: Vec<JobId>,
-    scratch: Vec<JobId>,
 }
 
 impl Intents {
@@ -55,14 +54,13 @@ impl Intents {
         self.cancel_where(builder, |intent| intent.conn == conn);
         let deadline_ns = self.now_ns.saturating_add(wait_ms.saturating_mul(1_000_000));
         let intent = Intent { conn, opened, head, deadline_ns: Some(deadline_ns), cancelled: false };
-        self.by_job.insert(job, intent);
+        self.started.push((job, intent));
     }
 
     /// A request builds `root`: every open intent on it is taken over.
     // dyn: as `add`'s.
     pub(super) fn take_over(&mut self, builder: &mut dyn Builder, root: ContentId) {
-        let jobs = self.pick(|intent| intent.opened.view.root == root);
-        self.promote(builder, jobs);
+        self.promote_where(builder, |intent| intent.opened.view.root == root);
     }
 
     /// `head` moved to `root`: its open intents on `root` are taken over, the rest cancelled.
@@ -71,8 +69,9 @@ impl Intents {
         self.cancel_where(builder, |intent| {
             intent.head.as_deref() == Some(head) && intent.opened.view.root != root
         });
-        let jobs = self.pick(|intent| intent.head.as_deref() == Some(head) && intent.opened.view.root == root);
-        self.promote(builder, jobs);
+        self.promote_where(builder, |intent| {
+            intent.head.as_deref() == Some(head) && intent.opened.view.root == root
+        });
     }
 
     // dyn: as `add`'s.
@@ -91,45 +90,39 @@ impl Intents {
     /// The earliest deadline of an open intent.
     /// A scan, not a timing wheel: one intent per waiting client, a few at once.
     pub(super) fn deadline(&self) -> Option<u64> {
-        self.by_job.values().filter(|it| it.open()).filter_map(|it| it.deadline_ns).min()
+        self.started.iter().filter(|(_, it)| it.open()).filter_map(|(_, it)| it.deadline_ns).min()
     }
 
-    /// The view of `job` when it is an intent's, the intent removed.
+    /// The view of `job` when it is an intent's, the intent removed; the rest keep their order.
     pub(super) fn finish(&mut self, job: JobId) -> Option<Opened> {
-        self.by_job.remove(&job).map(|intent| intent.opened)
+        let at = self.started.iter().position(|(it, _)| *it == job)?;
+        Some(self.started.remove(at).1.opened)
     }
 
     pub(super) fn views(&self) -> usize {
-        self.by_job.len()
+        self.started.len()
     }
 
-    /// The open intents' jobs `keep` picks, in job order, in the buffer kept for it: handed
-    /// back to `picked` once gone through.
-    fn pick(&mut self, mut keep: impl FnMut(&Intent) -> bool) -> Vec<JobId> {
-        let mut jobs = std::mem::take(&mut self.picked);
-        jobs.clear();
-        jobs.extend(self.by_job.iter().filter(|(_, it)| it.open() && keep(it)).map(|(job, _)| *job));
-        radix::sort_copy_by_key_in(&mut jobs, |it| it.0, &mut self.scratch);
-        jobs
-    }
-
+    /// Takes over the open intents `keep` picks, in start order.
     // dyn: as `add`'s.
-    fn promote(&mut self, builder: &mut dyn Builder, jobs: Vec<JobId>) {
-        for &job in &jobs {
-            self.by_job.get_mut(&job).expect("a job just found").deadline_ns = None;
-            builder.promote(job);
+    fn promote_where(&mut self, builder: &mut dyn Builder, mut keep: impl FnMut(&Intent) -> bool) {
+        for (job, intent) in &mut self.started {
+            if intent.open() && keep(&*intent) {
+                intent.deadline_ns = None;
+                builder.promote(*job);
+            }
         }
-        self.picked = jobs;
     }
 
+    /// Cancels the open intents `keep` picks, in start order.
     // dyn: as `add`'s.
-    fn cancel_where(&mut self, builder: &mut dyn Builder, keep: impl FnMut(&Intent) -> bool) {
-        let jobs = self.pick(keep);
-        for &job in &jobs {
-            self.by_job.get_mut(&job).expect("a job just found").cancelled = true;
-            builder.cancel(job);
+    fn cancel_where(&mut self, builder: &mut dyn Builder, mut keep: impl FnMut(&Intent) -> bool) {
+        for (job, intent) in &mut self.started {
+            if intent.open() && keep(&*intent) {
+                intent.cancelled = true;
+                builder.cancel(*job);
+            }
         }
-        self.picked = jobs;
     }
 }
 

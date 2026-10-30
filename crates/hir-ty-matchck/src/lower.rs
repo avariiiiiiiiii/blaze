@@ -355,7 +355,7 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
     }
 
     /// What a path expression at [`Self::scope`] names in the value namespace.
-    pub(crate) fn resolve_value(&self, path: &Path, hygiene: HygieneId) -> Option<ValueNs> {
+    pub(crate) fn resolve_value(&self, path: Path<'_>, hygiene: HygieneId) -> Option<ValueNs> {
         self.resolver().resolve_path_in_value_ns_fully(self.cx.db, path, hygiene)
     }
 
@@ -363,7 +363,7 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
     pub(crate) fn path_const(
         &self,
         node: ExprOrPatId,
-        path: &Path,
+        path: Path<'_>,
         hygiene: HygieneId,
     ) -> Option<(ConstId, GenericArgs<'db>)> {
         if let Some((CandidateId::ConstId(konst), args)) =

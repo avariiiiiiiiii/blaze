@@ -22,6 +22,7 @@ bitflags.workspace = true
 
 # local deps
 base-db.workspace = true
+blaze-mem.workspace = true
 parser.workspace = true
 tt.workspace = true
 stdx.workspace = true

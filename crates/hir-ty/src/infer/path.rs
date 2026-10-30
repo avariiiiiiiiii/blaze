@@ -30,7 +30,7 @@ use super::InferenceContext;
 impl<'db> InferenceContext<'db> {
     pub(super) fn infer_path(
         &mut self,
-        path: &Path,
+        path: Path<'_>,
         id: ExprOrPatIdPacked,
     ) -> Option<(ValueNs, Ty<'db>)> {
         let (value, self_subst) = self.resolve_value_path_inner(path, id, false)?;
@@ -62,7 +62,7 @@ impl<'db> InferenceContext<'db> {
 
     fn resolve_value_path(
         &mut self,
-        path: &Path,
+        path: Path<'_>,
         id: ExprOrPatIdPacked,
         value: ValueNs,
         self_subst: Option<GenericArgs<'db>>,
@@ -147,7 +147,7 @@ impl<'db> InferenceContext<'db> {
 
     pub(super) fn resolve_value_path_inner(
         &mut self,
-        path: &Path,
+        path: Path<'_>,
         id: ExprOrPatIdPacked,
         no_diagnostics: bool,
     ) -> Option<(ValueNs, Option<GenericArgs<'db>>)> {
@@ -355,7 +355,11 @@ impl<'db> InferenceContext<'db> {
             }
         });
         let (item, visible) = match res {
-            Ok(res) => (res.item, true),
+            Ok(res) => {
+                self.write_unstable_candidates(id, &res);
+                self.lint_fully_qualified_call_from_2018(id, name, ty, &res);
+                (res.item, true)
+            }
             Err(error) => match error {
                 MethodError::PrivateMatch(candidate_id) => (candidate_id.item, false),
                 _ => {

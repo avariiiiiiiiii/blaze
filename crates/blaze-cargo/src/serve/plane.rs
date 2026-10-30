@@ -5,9 +5,11 @@
 //!
 //! A node's task runs where its [`Task`] says: on a thread ([`Task::Thread`]: the process's
 //! worker pool for [`Pool::Work`], an IO thread for [`Pool::Io`]) through a [`Runner`], or on
-//! the loop itself ([`Task::Loop`]: user code, which runs as the driver's spawns). What each
-//! thread task held at most is measured ([`arena::measure`]) and teaches the [`Estimates`] the
-//! next task of its kind is admitted by.
+//! the loop itself ([`Task::Loop`]: user code, which runs as the driver's spawns). Every node is
+//! given its cost and memory by the plane's [`Predict`] (the daemon's is a
+//! `blaze_history::History`) from its kind and key, and each one's own run teaches it: a
+//! thread task's time and what it held at most ([`arena::measure`]), a loop task's time from
+//! its start to its end.
 
 #![forbid(unsafe_code)]
 
@@ -15,15 +17,15 @@ use std::{
     collections::{BTreeMap, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use blaze_graph::{
     Budget, Error, Plane as Graph, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
-    admission::{Estimates, TaskKind},
+    admission::{Predict, Prediction, TaskKind},
     arena,
     machine::{NodeId, Outcome, Pool},
-    plane::{NodeRef, Nodes},
+    plane::{Key, NodeRef, Nodes},
 };
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_protocol::events::{Event, NodeState};
@@ -33,6 +35,15 @@ use super::work::Readers;
 
 /// The kinds of the daemon's own tasks, for their estimates and their subsystems' budgets.
 pub use blaze_graph::admission::kinds;
+
+/// The kinds of the loop's tasks, past every one of [`kinds`]: they hold none of the daemon's
+/// memory, so only their times are learned.
+pub mod loops {
+    use blaze_graph::admission::TaskKind;
+
+    /// A build script run.
+    pub const SCRIPT_RUN: TaskKind = TaskKind(0x2_0001);
+}
 
 /// What a thread task came to: how the plane settles its node, and its value for the loop.
 pub struct Did<T> {
@@ -52,7 +63,7 @@ pub enum Task {
     Thread { kind: TaskKind, arg: u32 },
     /// Run by the loop once the plane says so ([`Happened::Run`]); it ends with
     /// [`Plane::ended`].
-    Loop,
+    Loop { kind: TaskKind },
     /// Settled, or never added.
     Gone,
 }
@@ -65,6 +76,7 @@ const _: () = assert!(std::mem::size_of::<Task>() == 12);
 pub struct Fresh {
     nodes: Nodes,
     tasks: Vec<Task>,
+    keys: Vec<Option<Key>>,
     count: u32,
 }
 
@@ -104,6 +116,9 @@ pub struct Ran<T> {
     pub task: Posting,
     pub ended: Ended<T>,
     pub peak: u64,
+    /// How long its last run took, the one that ended or gave way; none under the simulation,
+    /// whose tasks take no time.
+    pub ran_ns: u64,
     /// What the task's expansions left for the store's owner to keep.
     pub puts: Vec<blaze_expand::Put>,
 }
@@ -177,14 +192,16 @@ impl<T: Send + 'static> Threads<T> {
                         // the world, not on another task. One that reads goes back for new
                         // readers.
                         let mut readers = Some(job.readers);
-                        let (ended, peak, puts) = loop {
+                        let (ended, peak, ran_ns, puts) = loop {
                             match run_measured(&job.work, job.task.arg, readers.take().unwrap_or_default()) {
-                                (Some(ended), peak, puts) => break (ended, peak, puts),
-                                (None, peak, puts) if job.task.reads => break (Ended::GaveWay { group: None }, peak, puts),
+                                (Some(ended), peak, ran_ns, puts) => break (ended, peak, ran_ns, puts),
+                                (None, peak, ran_ns, puts) if job.task.reads => {
+                                    break (Ended::GaveWay { group: None }, peak, ran_ns, puts);
+                                }
                                 (None, ..) => {}
                             }
                         };
-                        _ = job.done.send(Ran { task: job.task, ended, peak, puts });
+                        _ = job.done.send(Ran { task: job.task, ended, peak, ran_ns, puts });
                     }
                 })
                 .unwrap_or_else(|why| panic!("an IO thread of the daemon's plane: {why}"));
@@ -194,15 +211,17 @@ impl<T: Send + 'static> Threads<T> {
 }
 
 /// Runs `work` inside a measure: `None` when it gave way (its readers dropped with it), else
-/// its value or its panic; and what its expansions put once it ended. A task that gave way
+/// its value or its panic; how long it ran; and what its expansions put once it ended. A task that gave way
 /// leaves its puts in its thread's buffer, handed on by that thread's next take (or as
 /// orphans, if the thread ends), so none is lost or kept twice.
-fn run_measured<T>(work: &Work<T>, arg: u32, readers: Readers) -> (Option<Ended<T>>, u64, Vec<blaze_expand::Put>) {
+fn run_measured<T>(work: &Work<T>, arg: u32, readers: Readers) -> (Option<Ended<T>>, u64, u64, Vec<blaze_expand::Put>) {
+    let start = Instant::now();
     let (result, peak) = arena::measure(|| catch_unwind(AssertUnwindSafe(|| work(arg, readers))));
+    let ran_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     match result {
-        Ok(None) => (None, peak, Vec::new()),
-        Ok(Some(did)) => (Some(Ended::Did(did)), peak, blaze_expand::take_puts()),
-        Err(panic) => (Some(Ended::Panicked(panicked(&*panic))), peak, blaze_expand::take_puts()),
+        Ok(None) => (None, peak, ran_ns, Vec::new()),
+        Ok(Some(did)) => (Some(Ended::Did(did)), peak, ran_ns, blaze_expand::take_puts()),
+        Err(panic) => (Some(Ended::Panicked(panicked(&*panic))), peak, ran_ns, blaze_expand::take_puts()),
     }
 }
 
@@ -220,9 +239,10 @@ fn post_work<T: Send + 'static>(task: Posting, work: Work<T>, readers: Readers, 
     let again = work.clone();
     let run = move || run_measured(&work, task.arg, readers);
     let then = move |result: std::thread::Result<_>| match result {
-        Ok((Some(ended), peak, puts)) => _ = done.send(Ran { task, ended, peak, puts }),
-        Ok((None, peak, puts)) if task.reads => {
-            _ = done.send(Ran { task, ended: Ended::GaveWay { group: blaze_graph::pool::group() }, peak, puts });
+        Ok((Some(ended), peak, ran_ns, puts)) => _ = done.send(Ran { task, ended, peak, ran_ns, puts }),
+        Ok((None, peak, ran_ns, puts)) if task.reads => {
+            let ended = Ended::GaveWay { group: blaze_graph::pool::group() };
+            _ = done.send(Ran { task, ended, peak, ran_ns, puts });
         }
         // Gave way: posted again behind what is ready on the group it ran on.
         Ok((None, ..)) => {
@@ -230,7 +250,7 @@ fn post_work<T: Send + 'static>(task: Posting, work: Work<T>, readers: Readers, 
         }
         // A panic outside the measure: its puts stay in the thread's buffer.
         Err(panic) => {
-            _ = done.send(Ran { task, ended: Ended::Panicked(panicked(&*panic)), peak: 0, puts: Vec::new() });
+            _ = done.send(Ran { task, ended: Ended::Panicked(panicked(&*panic)), peak: 0, ran_ns: 0, puts: Vec::new() });
         }
     };
     match task.critical {
@@ -303,8 +323,10 @@ impl<T: Send + 'static> Runner<T> for Inline<T> {
         self.queue.extend(posted.drain(now..));
         for (task, work, readers) in posted.drain(..) {
             match run_measured(&work, task.arg, readers) {
-                (Some(ended), peak, puts) => out.push(Ran { task, ended, peak, puts }),
-                (None, peak, puts) if task.reads => out.push(Ran { task, ended: Ended::GaveWay { group: None }, peak, puts }),
+                (Some(ended), peak, _, puts) => out.push(Ran { task, ended, peak, ran_ns: 0, puts }),
+                (None, peak, _, puts) if task.reads => {
+                    out.push(Ran { task, ended: Ended::GaveWay { group: None }, peak, ran_ns: 0, puts });
+                }
                 (None, ..) => self.queue.push_back((task, work, Readers::default())),
             }
         }
@@ -325,6 +347,8 @@ impl<T: Send + 'static> Runner<T> for Inline<T> {
 /// go once every node of it settled.
 struct Batch<T> {
     tasks: Vec<Task>,
+    /// Each node's key, read once when it ends, for what its run teaches.
+    keys: Vec<Option<Key>>,
     live: u32,
     work: Option<Work<T>>,
     reads: bool,
@@ -332,7 +356,7 @@ struct Batch<T> {
 
 pub struct Plane<T> {
     graph: Graph,
-    estimates: Estimates,
+    predict: Box<dyn Predict>,
     runner: Box<dyn Runner<T>>,
     /// By first id: a node's batch is the last one starting at or below it, O(log batches).
     // BTreeMap: range queries by node id.
@@ -342,6 +366,10 @@ pub struct Plane<T> {
     happened: Vec<Happened<T>>,
     ran: Vec<Ran<T>>,
     said: Vec<PlaneOutput>,
+    /// The time of the input being stepped.
+    now_ns: u64,
+    /// When each loop task that runs started.
+    loops: BTreeMap<NodeId, u64>,
 }
 
 fn ns(at: Duration) -> u64 {
@@ -349,10 +377,10 @@ fn ns(at: Duration) -> u64 {
 }
 
 impl<T: Send + 'static> Plane<T> {
-    pub fn new(config: PlaneConfig, estimates: Estimates, runner: Box<dyn Runner<T>>) -> Result<Plane<T>, Error> {
+    pub fn new(config: PlaneConfig, predict: Box<dyn Predict>, runner: Box<dyn Runner<T>>) -> Result<Plane<T>, Error> {
         Ok(Plane {
             graph: Graph::new(config)?,
-            estimates,
+            predict,
             runner,
             batches: BTreeMap::new(),
             next_node: 0,
@@ -360,6 +388,8 @@ impl<T: Send + 'static> Plane<T> {
             happened: Vec::new(),
             ran: Vec::new(),
             said: Vec::new(),
+            now_ns: 0,
+            loops: BTreeMap::new(),
         })
     }
 
@@ -367,8 +397,9 @@ impl<T: Send + 'static> Plane<T> {
         self.graph.config().budget.as_ref()
     }
 
-    pub fn estimates(&self) -> &Estimates {
-        &self.estimates
+    /// What the plane predicts by, for the daemon's image.
+    pub fn predict(&self) -> &dyn Predict {
+        &*self.predict
     }
 
     pub fn stats(&self, request: RequestId) -> Option<RequestStats> {
@@ -384,21 +415,28 @@ impl<T: Send + 'static> Plane<T> {
     pub fn fresh(&mut self, count: u32, name_bytes: usize, deps: usize) -> Fresh {
         let first = self.reserve(count);
         let nodes = Nodes::with_capacity(first, count as usize, name_bytes, deps);
-        Fresh { nodes, tasks: Vec::with_capacity(count as usize), count }
+        Fresh { nodes, tasks: Vec::with_capacity(count as usize), keys: Vec::with_capacity(count as usize), count }
     }
 
-    /// The next node of `fresh`, its id; a thread task's memory raised to what its kind is
-    /// predicted to hold.
+    /// The next node of `fresh`, its id; its memory raised to what its kind and key are
+    /// predicted to hold, its cost the predicted one where there is one.
     ///
     /// # Panics
     ///
-    /// When `fresh` has all the nodes it was made for.
+    /// When `fresh` has all the nodes it was made for, or `task` is [`Task::Gone`].
     pub fn push(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, task: Task) -> NodeId {
         assert!((fresh.tasks.len() as u32) < fresh.count, "a batch of {} nodes given another", fresh.count);
-        if let Task::Thread { kind, .. } = task {
-            node.memory = node.memory.max(self.estimates.predict(kind));
+        let kind = match task {
+            Task::Thread { kind, .. } | Task::Loop { kind } => kind,
+            Task::Gone => panic!("node {} is pushed with no task", node.name),
+        };
+        let Prediction { cost, peak } = self.predict.predict(kind, node.key);
+        node.memory = node.memory.max(peak);
+        if let Some(cost) = cost {
+            node.cost = cost;
         }
         fresh.tasks.push(task);
+        fresh.keys.push(node.key);
         fresh.nodes.push(node)
     }
 
@@ -417,6 +455,11 @@ impl<T: Send + 'static> Plane<T> {
     fn task(&self, id: NodeId) -> Option<(&Batch<T>, Task)> {
         let (first, batch) = self.batches.range(..=id.0).next_back()?;
         batch.tasks.get((id.0 - first) as usize).map(|task| (batch, *task))
+    }
+
+    fn key(&self, id: NodeId) -> Option<Key> {
+        let (first, batch) = self.batches.range(..=id.0).next_back()?;
+        batch.keys.get((id.0 - first) as usize).copied().flatten()
     }
 
     fn settled(&mut self, id: NodeId) {
@@ -455,7 +498,7 @@ impl<T: Send + 'static> Plane<T> {
         work: Option<Work<T>>,
         reads: bool,
     ) -> Result<(), Error> {
-        let Fresh { nodes, tasks, count } = fresh;
+        let Fresh { nodes, tasks, keys, count } = fresh;
         assert_eq!(tasks.len() as u32, count, "a batch is added with every node it was made for");
         assert!(
             work.is_some() || !tasks.iter().any(|it| matches!(it, Task::Thread { .. })),
@@ -463,7 +506,7 @@ impl<T: Send + 'static> Plane<T> {
         );
         let first = nodes.first();
         if count > 0 {
-            self.batches.insert(first.0, Batch { tasks, live: count, work, reads });
+            self.batches.insert(first.0, Batch { tasks, keys, live: count, work, reads });
         }
         match self.step(PlaneInput::AddNodes { at_ns: ns(at), request, nodes }) {
             Ok(()) => Ok(()),
@@ -482,6 +525,7 @@ impl<T: Send + 'static> Plane<T> {
 
     /// Skips what of `request` has not started; it finishes not ok once what runs is done.
     pub fn cancel(&mut self, at: Duration, request: RequestId) {
+        self.now_ns = ns(at);
         let mut said = std::mem::take(&mut self.said);
         self.graph
             .cancel_into(ns(at), request, &mut said)
@@ -490,8 +534,16 @@ impl<T: Send + 'static> Plane<T> {
         self.said = said;
     }
 
-    /// A loop task is over.
+    /// A loop task is over: the time since it started teaches the predictor.
     pub fn ended(&mut self, at: Duration, id: NodeId, outcome: Outcome) {
+        let kind = match self.task(id) {
+            Some((_, Task::Loop { kind })) => Some(kind),
+            _ => None,
+        };
+        if let (Some(start), Some(kind)) = (self.loops.remove(&id), kind) {
+            let key = self.key(id);
+            self.predict.observe(kind, key, ns(at).saturating_sub(start), 0);
+        }
         let input = PlaneInput::Done { at_ns: ns(at), id, outcome, added: Vec::new(), group: None, peak: 0 };
         self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of loop task {id}: {error}"));
     }
@@ -518,7 +570,7 @@ impl<T: Send + 'static> Plane<T> {
     pub fn poll(&mut self, at: Duration) {
         let mut ran = std::mem::take(&mut self.ran);
         self.runner.take(&mut ran);
-        for Ran { task, ended, peak, puts } in ran.drain(..) {
+        for Ran { task, ended, peak, ran_ns, puts } in ran.drain(..) {
             let id = task.id;
             if !puts.is_empty() {
                 self.happened.push(Happened::Kept { id, puts });
@@ -534,7 +586,8 @@ impl<T: Send + 'static> Plane<T> {
                 }
                 Ended::Panicked(why) => Outcome::Failed { why },
             };
-            self.estimates.observe(task.kind, peak);
+            let key = self.key(id);
+            self.predict.observe(task.kind, key, ran_ns, peak);
             let input = PlaneInput::Done { at_ns: ns(at), id, outcome, added: Vec::new(), group: None, peak };
             self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
         }
@@ -562,6 +615,7 @@ impl<T: Send + 'static> Plane<T> {
 
     /// One input, its outputs taken through `said`, which is reused by every step.
     fn step(&mut self, input: PlaneInput) -> Result<(), Error> {
+        self.now_ns = input.at_ns();
         let mut said = std::mem::take(&mut self.said);
         let taken = self.graph.step_into(input, &mut said);
         if taken.is_ok() {
@@ -603,7 +657,10 @@ impl<T: Send + 'static> Plane<T> {
                             self.runner.post(task, work, Readers::default());
                         }
                     }
-                    Some((_, Task::Loop)) => self.happened.push(Happened::Run { id }),
+                    Some((_, Task::Loop { .. })) => {
+                        self.loops.insert(id, self.now_ns);
+                        self.happened.push(Happened::Run { id });
+                    }
                     Some((_, Task::Gone)) | None => panic!("the plane runs node {id}, which the daemon gave no task"),
                 },
                 PlaneOutput::Finished { request, ok } => {
@@ -627,6 +684,7 @@ mod tests {
 
     use blaze_core::Traced;
     use blaze_ids::ContentId;
+    use blaze_protocol::events::NodeKind;
     use blaze_usercode::RunKey;
 
     use super::*;
@@ -685,5 +743,58 @@ mod tests {
         let [Ran { ended: Ended::GaveWay { .. }, puts, .. }] = ran.as_slice() else { panic!("the task gives way") };
         assert!(puts.is_empty());
         assert_eq!(ours(&blaze_expand::take_puts(), "plane-b"), ["plane-b gave way"]);
+    }
+
+    type Asked = Vec<(TaskKind, Option<Key>)>;
+    type Observed = Vec<(TaskKind, Option<Key>, u64, u64)>;
+
+    struct Recording {
+        asked: Arc<std::sync::Mutex<Asked>>,
+        observed: Arc<std::sync::Mutex<Observed>>,
+    }
+
+    impl Predict for Recording {
+        fn predict(&self, kind: TaskKind, key: Option<Key>) -> Prediction {
+            self.asked.lock().unwrap().push((kind, key));
+            Prediction { cost: Some(1000), peak: 0 }
+        }
+
+        fn observe(&mut self, kind: TaskKind, key: Option<Key>, ran_ns: u64, peak: u64) {
+            self.observed.lock().unwrap().push((kind, key, ran_ns, peak));
+        }
+
+        fn encode(&self) -> Vec<u8> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn every_node_is_predicted_and_its_own_run_teaches_the_predictor() {
+        let (asked, observed) = (Arc::default(), Arc::default());
+        let predict = Recording { asked: Arc::clone(&asked), observed: Arc::clone(&observed) };
+        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
+        let mut plane = Plane::<()>::new(config, Box::new(predict), Box::new(Inline::new(9))).unwrap();
+        let request = plane.open(Duration::ZERO, false);
+        let key = Key([3; 32]);
+        let node = |kind, name, key| NodeRef { kind, name, deps: &[], pool: Pool::Work, cost: 1, key, memory: 0 };
+        let mut fresh = plane.fresh(2, 16, 0);
+        plane.push(&mut fresh, node(NodeKind::Std, "thread", Some(key)), Task::Thread { kind: kinds::COMPILE, arg: 0 });
+        let looped = plane.push(&mut fresh, node(NodeKind::ScriptRun, "loop", None), Task::Loop { kind: loops::SCRIPT_RUN });
+        let work: Work<()> = Arc::new(|_, _| Some(Did { outcome: Outcome::Built, value: () }));
+        plane.add(Duration::ZERO, request, fresh, Some(work), false).unwrap();
+        assert_eq!(*asked.lock().unwrap(), [(kinds::COMPILE, Some(key)), (loops::SCRIPT_RUN, None)]);
+
+        let (mut happened, mut ran_loop) = (Vec::new(), false);
+        while !ran_loop || observed.lock().unwrap().is_empty() {
+            plane.poll(Duration::ZERO);
+            plane.happened(&mut happened);
+            ran_loop |= happened.iter().any(|it| matches!(it, Happened::Run { id } if *id == looped));
+            happened.clear();
+        }
+        let seen: Vec<_> = observed.lock().unwrap().iter().map(|&(kind, key, ran_ns, _)| (kind, key, ran_ns)).collect();
+        assert_eq!(seen, [(kinds::COMPILE, Some(key), 0)], "the simulation's tasks take no time");
+        plane.ended(Duration::from_millis(5), looped, Outcome::Built);
+        let last = observed.lock().unwrap().last().copied();
+        assert_eq!(last, Some((loops::SCRIPT_RUN, None, 5_000_000, 0)));
     }
 }

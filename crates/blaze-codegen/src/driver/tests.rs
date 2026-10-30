@@ -518,6 +518,57 @@ fn a_store_entry_that_does_not_read_is_an_error_not_a_compile() {
     assert_eq!(machine.emitted.load(Ordering::Relaxed), 0);
 }
 
+/// A read of the store hands its bytes to the decoder in place: a warm hit allocates nothing
+/// the decoder does not.
+#[test]
+fn a_store_hit_is_read_in_place() {
+    let key = keys::template(&InstanceKey(ContentId([1; 32])));
+    let mut store = Store::default();
+    store.0.insert(key, vec![7; 4096]);
+    let unit = Unit {
+        instance: Instance {
+            code: CodeHash(ContentId::default()),
+            args: ContentId::default(),
+            settings: crate::Settings(ContentId::default()),
+        },
+        backend: Backend::Cranelift { speed: false },
+        arch: Arch::X86_64,
+        item: item(0),
+    };
+    let mut out = Out::default();
+    let sum = |bytes: &[u8]| Ok::<u64, String>(bytes.iter().map(|&it| u64::from(it)).sum());
+    assert!(matches!(out.read(&store, &key, &unit, sum), Read::Hit(28672)));
+    let read = blaze_alloc_count::assert_at_most(0, "a warm store hit", || out.read(&store, &key, &unit, sum));
+    assert!(matches!(read, Read::Hit(28672)));
+    let missing = keys::template(&InstanceKey(ContentId([2; 32])));
+    assert!(matches!(out.read(&store, &missing, &unit, sum), Read::Miss));
+    assert!(out.errors.is_empty());
+}
+
+/// A stored template's function, read in place, is the one decoding it and instantiating
+/// gives, and bytes that are no template are the outer error.
+#[test]
+fn a_stored_function_is_the_decoded_templates() {
+    let (program, policy) = (program(), policy(OptLevel::O0, Mode::Output));
+    let mut store = Store::default();
+    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
+    store.keep(&cold.puts);
+    let key = InstanceKey(ContentId([1; 32]));
+    let mut templates = 0;
+    for bytes in store.0.values() {
+        let Ok(template) = blob::decode(bytes) else { continue };
+        templates += 1;
+        for count in [template.refs, template.refs + 1] {
+            let refs: Vec<Target> =
+                (0..count).map(|n| Target::Function(InstanceKey(ContentId([n as u8 + 2; 32])))).collect();
+            let made = stored_function(bytes, key, &refs).expect("a template");
+            assert_eq!(made, template.instantiate(key, &refs));
+        }
+    }
+    assert_eq!(templates, cold.functions.len());
+    assert!(stored_function(&[0; 3], key, &[]).is_err());
+}
+
 #[test]
 fn a_level_without_its_backend_names_the_function() {
     let mut policy = policy(OptLevel::O3, Mode::Output);

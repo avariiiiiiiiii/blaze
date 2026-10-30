@@ -17,7 +17,7 @@ use crate::{
 fn item(db: &TestDB, name: &str) -> ModuleDef {
     Crate::all(db)
         .into_iter()
-        .flat_map(|krate| krate.root_module(db).declarations(db))
+        .flat_map(|krate| krate.root_module(db).declarations_iter(db))
         .find(|it| it.name(db).is_some_and(|it| it.as_str() == name))
         .unwrap_or_else(|| panic!("no item `{name}` in the fixture"))
 }
@@ -34,7 +34,7 @@ fn impl_method(db: &TestDB, name: &str) -> Function {
     Crate::all(db)
         .into_iter()
         .flat_map(|krate| Impl::all_in_crate(db, krate))
-        .flat_map(|it| it.items(db))
+        .flat_map(|it| it.items_iter(db))
         .find_map(|it| match it {
             AssocItem::Function(it) if it.name(db).as_str() == name => Some(it),
             _ => None,

@@ -28,6 +28,8 @@ the crate); the cursor's `Display` (`at byte 12: 4 bytes wanted, 2 left`) or `as
 A missed rename in C6 would compile and misread (the cursor's `u32()` is 4 fixed bytes, wasm's
 was a LEB128), so C6 lists every line; every other rename fails to build if missed.
 
+> forwarded to requests-link-next (holds `crates/blaze-link/`) (requests, pass 20; told by tmux).
+
 ### C1. `position.rs`: `Reader` (the span table's)
 
 Add `use blaze_format::cursor::{Put, Reader};`. Delete `struct Reader` and its `impl` (`take`,
@@ -671,3 +673,22 @@ impl std::ops::DerefMut for Out {
 - `pe/coff.rs` `Reader` and `macho/input.rs` `Reader`: object readers over `object`'s parsed
   headers, not byte cursors.
 - `src/tests.rs` `at`/`u32`/`u64` readers: test reads of a linked image at addresses.
+
+## dedup: byte cursor onto blaze_format::cursor (addendum C10: `align` -> `Put::pad_to`)
+
+From `dedup-cursor`, adding to C4 and C9 above: `blaze_format::cursor::Put` now has
+`fn pad_to(&mut self, multiple: usize)` (`self.resize(self.len().next_multiple_of(multiple), 0)`),
+the body all three writers' `align` had. With C9's `Deref`/`DerefMut` to `Vec<u8>`, `Out` and
+`Buf` get it through `Put`.
+
+- `macho.rs`: delete `Out::align` (~789); `linkedit.align(16)` (~1244) -> `linkedit.pad_to(16)`,
+  `strings.align(8)` (~1601) -> `strings.pad_to(8)`.
+- `pe/image.rs`: delete `Buf::align` (~100); `out.align(8)` (~503) -> `out.pad_to(8)`,
+  `out.align(2)` (~521) -> `out.pad_to(2)`.
+- `pe/tests.rs`: `buf.align(8)` (~801) and the three `out.align(2)` (~1293, ~1306, ~1310) ->
+  `pad_to`, with `use blaze_format::cursor::Put;` (C9 adds it there already).
+- `elf/dynamic.rs`: C4 deletes its `Put` trait with `align` (no caller); nothing more.
+
+Same bytes. A missed `.align(` on an `Out` or `Buf` fails to build.
+
+> forwarded to requests-link-next (requests, pass 21; told by tmux).

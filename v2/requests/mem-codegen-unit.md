@@ -3441,6 +3441,8 @@ Existing ones that change:
 partial `Vec` back into the frame. As before, a count is checked against what is left before
 anything is reserved, so a hostile length reserves nothing.
 
+> applied by codegen-v2 (2026-10-29): on `blaze_format::cursor`'s `Reader`, with `slice`, `relocs_in`, `data_in`, `unwind_view` and `lines_in` added and the row, target, wide-addend and line readers shared with the owned ones. Relocations are a table, so `relocs_in` reads the rows, targets and wide addends into the frame and checks them with mem-template's `RelocsView::from_parts(.., frame)` (requested of `relocs.rs`), with `from_parts`' words at the same byte. The owned `unwind` and `lines` go, since only the old `decode` used them.
+
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 #### `decode` (350-381)
@@ -3523,6 +3525,8 @@ Every check, its order and its `BlobError { at, what }` are the old `decode`'s. 
 UTF-8 fails at the byte after it, as `String::from_utf8` of `input.bytes()?` did. `decode` gives
 the `Template` it gave.
 
+> applied by codegen-v2 (2026-10-29): as written, on the cursor's `Reader` (`input.0.u8()` and the rest), with `relocs: RelocsView<'a, Ref>`. `decode` is `decode_view` and then `TemplateView::owned`, inside a `Codegen` task.
+
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 #### `encode` (320-348): one allocation of the exact size
@@ -3601,6 +3605,8 @@ Each term is the matching `Out` call of `encode`:
 | externs | `len` and `bytes` each |
 | coverage | `u8`, three `u32`, `len`, 12 bytes per PC |
 
+> applied by codegen-v2 (2026-10-29): `encode` is `Vec::with_capacity(encoded_len(template))`, with a `debug_assert_eq!` of the length it wrote. A relocation term is the table's: `len` and 16 bytes a row, `len` and 5 bytes a target (37 for a `Position`), `len` and 12 bytes a wide addend.
+
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 ### 2.5 `driver.rs`: store hits read in place, compiles taken over
@@ -3661,6 +3667,8 @@ per build, is unchanged; its call is one virtual call per read, as `get` was.
 
 `blaze-cargo`'s implementor changes with it (0.4).
 
+> applied by codegen-v2 (2026-10-29): as written. `blaze-cargo`'s `Reading` still has `get` in the tree, though 0.4 is marked DONE; it is requested of cargo-units (told by tmux).
+
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 #### `Out::read` (309-330)
@@ -3697,6 +3705,8 @@ After (316-317 change; the rest is as it is):
 
 The outcomes and messages are today's. `decode` gets the store's bytes in place rather than an
 owned copy. `decode` stays a generic `impl FnOnce`, which is monomorphized, not a `dyn`.
+
+> applied by codegen-v2 (2026-10-29): with `store: &impl Lookup` in place of `&dyn Lookup` (dedyn-v2 1 in `v2/requests/codegen-v2.md`, applied in the same change, for `read`, `run`, `tier_up`, `dev`, `folded`, `release` and `statics`), so the `// dyn:` note isn't needed.
 
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
@@ -3763,6 +3773,8 @@ fn stored_function(
     })
 }
 ```
+
+> applied by codegen-v2 (2026-10-29): as written. `Out::instantiate` now goes through `made`.
 
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
@@ -3901,6 +3913,8 @@ What a warm dev build does per unit after this:
 - **Compile.** The function's parts move into the template. The side bytes move to the put. The
   blob is encoded at its exact size.
 
+> applied by codegen-v2 (2026-10-29): every call site as written: `dev`'s store reads, shapes and compiles, `folded`'s merges (the stored bodies and thunks keep `blob::decode`), and `release`'s store reads and compiles. `unkept_inline` also returns before building its set when the function builds nothing in.
+
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 ### 2.6 Tests (`blaze-codegen`)
@@ -3972,6 +3986,8 @@ What the test relies on:
   67, 84). If `driver/tests.rs` already has a `Unit` helper, use it.
 - **Keys.** `Key` is `Copy` (`crates/blaze-cas/src/lib.rs:129`).
 - **`Out::default()`.** `Out` derives `Default` (`driver.rs:277`).
+
+> applied by codegen-v2 (2026-10-29): the test store, the prepare and `a_store_hit_is_read_in_place` as written, with `Backend::Cranelift { speed: false }` and the file's `item(0)`. A new `a_stored_function_is_the_decoded_templates` checks that `stored_function` gives what `blob::decode` and `instantiate` give for every stored template of a cold build, with the right number of references and with one too many.
 
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
@@ -4104,6 +4120,8 @@ The existing tests stay as they are and keep checking that `decode` and `instant
 they gave: every `decode(..)`/`encode(..)` round trip, `unwinding_names_its_personality..` and
 the coverage tests.
 
+> applied by codegen-v2 (2026-10-29): both tests as written. The fixture has DWARF unwind information already, so `encode_writes_into_one_allocation_of_its_length` loops over DWARF, Windows and none, each with and without coverage, and checks each round trip. A new `a_short_field_fails_where_its_read_starts` checks `BlobError::at` by the cursor's rule: a cut `align` fails at byte 5, where its read starts, from `decode` and from `decode_view` alike.
+
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 ### 2.7 `// alloc:`, `// clone:`, `// dyn:` notes for the lines the hot lint flags
@@ -4139,6 +4157,8 @@ Their state after the changes above:
   memory.
 
 > applied by codegen-v2 (2026-10-29): `template.rs` and `backend.rs` have their notes, and `hot_lint.py` finds nothing in them; `driver.rs` and `blob.rs` are codegen-v2-mem-blob's.
+
+> applied by codegen-v2 (2026-10-29): `driver.rs` and `blob.rs` have every note, and `hot_lint.py` finds nothing in them. The `dyn Lookup` lines are gone, not noted (`&impl Lookup`, see `Out::read`). Clones in the walk (front-end handles, origins), the per-tier-up lists and the daemon's memo `Arc` are noted as per build, per tier-up or once a daemon.
 
 ---
 

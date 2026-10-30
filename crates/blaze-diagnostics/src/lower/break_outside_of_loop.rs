@@ -168,6 +168,97 @@ fn block_breaks(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, block: InFile<TextSi
     Some(diag)
 }
 
+/// The `break`s in `block_node` that rustc's `require_break_cx` finds in the context of the
+/// unlabeled block at `block` (`block_node` itself), in the order the checker visits them;
+/// none as soon as the first of them is not `node`, which then gives no diagnostic.
+///
+/// One pre-order walk of the block, the checker's stack pushed and popped as the walk goes
+/// down and up, as rustc's `CheckLoopVisitor` visits it: one `visit` per node, and a subtree
+/// skipped once nothing in it can be in the block's context (it is a body of its own, or a
+/// loop, closure or labeled block is between). The stack at the block is made once, from its
+/// ancestors.
+fn breaks_of_block(
+    cx: &Cx<'_, '_>,
+    node: &InFile<SyntaxNode>,
+    block_node: &ast::BlockExpr,
+    block: InFile<TextSize>,
+) -> Option<Vec<ast::BreakExpr>> {
+    /// What entering a node changed, undone on leaving it; `contents_only` and `live` are of
+    /// the node, for its children.
+    struct Entered {
+        len: usize,
+        floor: usize,
+        contents_only: bool,
+        live: bool,
+    }
+    let root = block_node.syntax();
+    let (mut stack, root_contents_only) = state(cx, &node.with_value(root.clone()));
+    // The stack starts again at `floor` in a body of its own.
+    let mut floor = 0;
+    // alloc: two buffers per diagnostic, as deep as the block and as long as what it reports
+    let mut entered: Vec<Entered> = Vec::new();
+    let mut breaks = Vec::new();
+    let wanted = Context::UnlabeledBlock(block);
+    let mut walk = root.preorder();
+    while let Some(event) = walk.next() {
+        let child = match event {
+            WalkEvent::Enter(it) => it,
+            WalkEvent::Leave(_) => {
+                let Some(left) = entered.pop() else { break };
+                stack.truncate(left.len);
+                floor = left.floor;
+                continue;
+            }
+        };
+        let (skip, parent_live) = match entered.last().map(|it| (it.contents_only, it.live)) {
+            Some(it) => it,
+            None => {
+                entered.push(Entered { len: stack.len(), floor, contents_only: root_contents_only, live: false });
+                continue;
+            }
+        };
+        let mut now = Entered { len: stack.len(), floor, contents_only: false, live: false };
+        let Some(parent) = child.parent() else { break };
+        let parent = node.with_value(parent);
+        now.live = match base(&parent, &child) {
+            Some(owner) => {
+                floor = stack.len();
+                stack.extend([Context::Normal, owner]);
+                false
+            }
+            None => {
+                let pushed = visit(&stack[floor..], &parent, &child, skip, &mut now.contents_only);
+                if let Some(pushed) = pushed {
+                    stack.push(pushed);
+                    if pushed == Context::ConstBlock {
+                        stack.push(Context::Normal);
+                    }
+                }
+                match pushed {
+                    Some(it) if it == wanted => true,
+                    None | Some(Context::UnlabeledIfBlock) => parent_live,
+                    Some(_) => false,
+                }
+            }
+        };
+        let live = now.live;
+        entered.push(now);
+        if !live {
+            walk.skip_subtree();
+            continue;
+        }
+        if let Some(it) = ast::BreakExpr::cast(child)
+            && required(&stack[floor..], true) == Some(wanted)
+        {
+            if breaks.is_empty() && it.syntax() != &node.value {
+                return None;
+            }
+            breaks.push(it);
+        }
+    }
+    Some(breaks)
+}
+
 /// rustc's `BreakNonLoop`: a `break` with a value whose target is a `while` or `for` loop.
 fn break_non_loop(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<Diag> {
     let break_expr = ast::BreakExpr::cast(node.value.clone())?;
@@ -206,7 +297,9 @@ fn break_non_loop(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<Diag> {
         let redundant = match &value {
             ast::Expr::PathExpr(path) => path.path().is_some_and(|path| {
                 path.qualifier().is_none()
-                    && path.segment().is_some_and(|it| format!("'{}", it.syntax().text()) == label)
+                    && path.segment().is_some_and(|it| {
+                        label.strip_prefix('\'').is_some_and(|name| it.syntax().text() == name)
+                    })
                     && cx.sema.resolve_path(&path).is_none()
             }),
             _ => false,
@@ -246,49 +339,41 @@ enum Target {
 }
 
 fn target(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, label: Option<&str>) -> Option<Target> {
-    let chain = ancestors(cx, node);
-    for (i, ancestor) in chain.iter().enumerate().skip(1) {
-        let child = &chain[i - 1].value;
+    for (ancestor, child) in edges(cx, node) {
+        let child = child.value;
         let kind = ancestor.value.kind();
         if ast::ClosureExpr::can_cast(kind) || is_item(kind) || ast::ConstArg::can_cast(kind) {
             return None;
         }
-        let in_body = |body: Option<ast::BlockExpr>| body.is_some_and(|it| it.syntax() == child);
+        let in_body = |body: Option<ast::BlockExpr>| body.is_some_and(|it| it.syntax() == &child);
         let found = match ast::Expr::cast(ancestor.value.clone()) {
-            Some(ast::Expr::LoopExpr(it)) if in_body(it.loop_body()) => {
-                Some((label_of(it.label()), false, ast::Expr::LoopExpr(it)))
-            }
-            Some(ast::Expr::WhileExpr(it)) if it.condition().is_some_and(|it| it.syntax() == child) => {
+            Some(ast::Expr::LoopExpr(it)) if in_body(it.loop_body()) => Some((it.label(), false, ast::Expr::LoopExpr(it))),
+            Some(ast::Expr::WhileExpr(it)) if it.condition().is_some_and(|it| it.syntax() == &child) => {
                 if label.is_none() {
                     return Some(Target::WhileCondition);
                 }
-                Some((label_of(it.label()), false, ast::Expr::WhileExpr(it)))
+                Some((it.label(), false, ast::Expr::WhileExpr(it)))
             }
-            Some(ast::Expr::WhileExpr(it)) if in_body(it.loop_body()) => {
-                Some((label_of(it.label()), false, ast::Expr::WhileExpr(it)))
-            }
-            Some(ast::Expr::ForExpr(it)) if in_body(it.loop_body()) => {
-                Some((label_of(it.label()), false, ast::Expr::ForExpr(it)))
-            }
+            Some(ast::Expr::WhileExpr(it)) if in_body(it.loop_body()) => Some((it.label(), false, ast::Expr::WhileExpr(it))),
+            Some(ast::Expr::ForExpr(it)) if in_body(it.loop_body()) => Some((it.label(), false, ast::Expr::ForExpr(it))),
             Some(ast::Expr::BlockExpr(it))
                 if it.async_token().is_some() || it.gen_token().is_some() || it.const_token().is_some() =>
             {
                 return None;
             }
-            Some(ast::Expr::BlockExpr(it)) if it.label().is_some() => {
-                Some((label_of(it.label()), true, ast::Expr::BlockExpr(it)))
-            }
+            Some(ast::Expr::BlockExpr(it)) if it.label().is_some() => Some((it.label(), true, ast::Expr::BlockExpr(it))),
             Some(ast::Expr::ArrayExpr(it))
-                if it.semicolon_token().is_some() && it.exprs().nth(1).is_some_and(|len| len.syntax() == child) =>
+                if it.semicolon_token().is_some() && it.exprs().nth(1).is_some_and(|len| len.syntax() == &child) =>
             {
                 return None;
             }
             _ => None,
         };
         if let Some((own, is_block, expr)) = found {
+            let named = |label: &str| own.as_ref().and_then(ast::Label::lifetime).is_some_and(|it| it.text() == label);
             match label {
                 None if !is_block => return Some(Target::Loop(ancestor.with_value(expr))),
-                Some(label) if own.as_deref() == Some(label) => return Some(Target::Loop(ancestor.with_value(expr))),
+                Some(label) if named(label) => return Some(Target::Loop(ancestor.with_value(expr))),
                 _ => {}
             }
         }
@@ -315,34 +400,100 @@ fn required(stack: &[Context], is_break: bool) -> Option<Context> {
             Context::LabeledBlock | Context::Loop => return None,
             Context::UnlabeledIfBlock if is_break && at > 0 => at -= 1,
             Context::UnlabeledBlock(_) if !is_break => return Some(Context::Normal),
-            other => return Some(other.clone()),
+            other => return Some(*other),
         }
     }
 }
 
-/// The nodes from `node` up, through each macro expansion to its call: `node` first.
+/// The nodes from `node` up, through each macro expansion to its call: `node` first. A walk
+/// that can stop early takes [`up`].
 pub(crate) fn ancestors(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<InFile<SyntaxNode>> {
-    let mut chain = Vec::new();
-    let mut at = node.clone();
-    loop {
-        chain.extend(at.value.ancestors().map(|it| at.with_value(it)));
-        let Some(call) = at.file_id.macro_file() else { return chain };
-        at = call.loc(cx.db).to_node(cx.db);
+    // alloc: the whole chain, for a caller that reads it more than once
+    up(cx, node).collect()
+}
+
+/// [`ancestors`] one at a time: a macro call's node is found (its file parsed or expanded)
+/// only when the walk goes past the top of its expansion, so a walk that stops at the first
+/// node it wants pays only for the nodes up to it, with nothing allocated.
+pub(crate) fn up<'db>(cx: &Cx<'_, 'db>, node: &InFile<SyntaxNode>) -> Up<'db> {
+    // clone: a reference count on the tree
+    Up { db: cx.db, file: node.file_id, next: Some(node.value.clone()) }
+}
+
+/// The iterator of [`up`].
+pub(crate) struct Up<'db> {
+    db: &'db Db,
+    file: HirFileId,
+    next: Option<SyntaxNode>,
+}
+
+impl Iterator for Up<'_> {
+    type Item = InFile<SyntaxNode>;
+
+    fn next(&mut self) -> Option<InFile<SyntaxNode>> {
+        let node = match self.next.take() {
+            Some(it) => it,
+            None => {
+                let call = self.file.macro_file()?.loc(self.db).to_node(self.db);
+                self.file = call.file_id;
+                call.value
+            }
+        };
+        self.next = node.parent();
+        Some(InFile::new(self.file, node))
+    }
+}
+
+/// [`up`] from above `node`, each node with the one before it in the walk: its child, or for
+/// a macro call the root of its expansion, in the expansion's file.
+pub(crate) fn edges<'db>(cx: &Cx<'_, 'db>, node: &InFile<SyntaxNode>) -> Edges<'db> {
+    let mut up = up(cx, node);
+    let child = up.next();
+    Edges { up, child }
+}
+
+/// The iterator of [`edges`].
+pub(crate) struct Edges<'db> {
+    up: Up<'db>,
+    child: Option<InFile<SyntaxNode>>,
+}
+
+impl Iterator for Edges<'_> {
+    type Item = (InFile<SyntaxNode>, InFile<SyntaxNode>);
+
+    fn next(&mut self) -> Option<(InFile<SyntaxNode>, InFile<SyntaxNode>)> {
+        let child = self.child.take()?;
+        let node = self.up.next()?;
+        // clone: a reference count on the tree
+        self.child = Some(node.clone());
+        Some((node, child))
     }
 }
 
 /// The stack of contexts rustc's loop checker has at `node`.
 fn contexts(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<Context> {
-    let chain = ancestors(cx, node);
-    let (boundary, base) = chain
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(i, it)| base(it, &chain[i - 1].value).map(|base| (i, base)))
-        .unwrap_or((chain.len(), Context::Normal));
-    let mut stack = vec![Context::Normal, base];
+    state(cx, node).0
+}
+
+/// [`contexts`] at `node`, and whether `node` is a block whose contents are visited as an
+/// `if`'s, nothing pushed for the block itself. Walks up only to the owner of the body `node`
+/// is in.
+fn state(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> (Vec<Context>, bool) {
+    // From `node` up to the owner of its body, the owner left out: replayed downwards.
+    // alloc: clone: one buffer per diagnostic, as deep as the body, of reference counts
+    let mut chain = vec![node.clone()];
+    let mut owner = Context::Normal;
+    for it in up(cx, node).skip(1) {
+        if let Some(found) = base(&it, &chain[chain.len() - 1].value) {
+            owner = found;
+            break;
+        }
+        chain.push(it);
+    }
+    // alloc: the checker's stack, one per diagnostic
+    let mut stack = vec![Context::Normal, owner];
     let mut contents_only = false;
-    for i in (1..boundary).rev() {
+    for i in (1..chain.len()).rev() {
         let (node, child) = (&chain[i], &chain[i - 1]);
         let skip = std::mem::take(&mut contents_only);
         if let Some(pushed) = visit(&stack, node, &child.value, skip, &mut contents_only) {
@@ -352,7 +503,7 @@ fn contexts(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<Context> {
             stack.extend(body);
         }
     }
-    stack
+    (stack, contents_only)
 }
 
 /// The context a body starts in, when `node` is the owner of a body `child` is: rustc's
@@ -501,4 +652,120 @@ fn block(top: &Context, node: &InFile<SyntaxNode>, it: &ast::BlockExpr) -> Optio
         return Some(Context::UnlabeledBlock(node.with_value(block_start(it))));
     }
     None
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use blaze_alloc_count::assert_at_most;
+    use hir::Semantics;
+
+    use super::*;
+
+    /// `check` given the context of the crate of the one file `source`, and the file's tree.
+    pub(crate) fn with_file(source: &str, check: impl FnOnce(&Cx<'_, '_>, InFile<SyntaxNode>)) {
+        let checked = crate::tests::checked(&format!("//- /main.rs crate:main\n{source}"));
+        let db = &checked.db;
+        hir::attach_db(db, || {
+            let sema = Semantics::new(db);
+            let krate = hir::check::workspace_crates(db)[0];
+            let frame = crate::tests::frame();
+            let cx = Cx::new(&sema, krate, checked.files(), &frame);
+            let source = krate.root_module(db).definition_source(db);
+            let root = source.with_value(source.value.node());
+            check(&cx, root);
+        });
+    }
+
+    /// Where rustc's loop checker has a `break` whose context is a plain block: in it, in an
+    /// `if` in it, and through what it leaves the block's context for (a loop, a closure, a
+    /// labeled block, an anonymous or inline const, an item, an `async` block, an `unsafe`
+    /// block, a `let`'s `else`).
+    const BLOCKS: &str = r#"
+fn f(c: bool) {
+    {
+        break;
+        if c { break; } else { { break; } }
+        loop { break; }
+        let _ = || { break; };
+        'a: { break; break 'a; }
+        let _ = [0; { break; 1 }];
+        const { break; };
+        fn g() { { break; } }
+        unsafe { break; }
+        async { break; };
+        let Some(_) = None::<u8> else { break };
+        { if c { break } }
+        break;
+    }
+    { if c { break; } break; }
+    { 'b: { if c { break 'b; } } }
+}
+fn main() {}
+"#;
+
+    /// [`breaks_of_block`] by the plain rule it stands for: each `break` of the block, its
+    /// stack made again from its ancestors.
+    fn plain(
+        cx: &Cx<'_, '_>,
+        node: &InFile<SyntaxNode>,
+        block_node: &ast::BlockExpr,
+        block: InFile<TextSize>,
+    ) -> Option<Vec<ast::BreakExpr>> {
+        let breaks: Vec<ast::BreakExpr> = block_node
+            .syntax()
+            .descendants()
+            .filter_map(ast::BreakExpr::cast)
+            .filter(|it| {
+                let stack = contexts(cx, &node.with_value(it.syntax().clone()));
+                let in_labeled = it.lifetime().is_none() && stack.last() == Some(&Context::LabeledBlock);
+                !in_labeled && required(&stack, true) == Some(Context::UnlabeledBlock(block))
+            })
+            .collect();
+        match breaks.first() {
+            Some(first) if first.syntax() != &node.value => None,
+            _ => Some(breaks),
+        }
+    }
+
+    /// The one walk of a block finds the `break`s the plain rule does, for each `break` that
+    /// is in a plain block's context.
+    #[test]
+    fn a_blocks_breaks_are_those_of_the_plain_rule() {
+        with_file(BLOCKS, |cx, root| {
+            let mut compared = 0;
+            let mut reported = 0;
+            for it in root.value.descendants().filter(|it| ast::BreakExpr::can_cast(it.kind())) {
+                let node = root.with_value(it);
+                let Some(Context::UnlabeledBlock(block)) = required(&contexts(cx, &node), true) else { continue };
+                let block_node = node
+                    .value
+                    .ancestors()
+                    .filter_map(ast::BlockExpr::cast)
+                    .find(|it| block_start(it) == block.value)
+                    .expect("the block of the context is around the `break`");
+                let ranges = |breaks: Option<Vec<ast::BreakExpr>>| {
+                    breaks.map(|it| it.iter().map(|it| it.syntax().text_range()).collect::<Vec<_>>())
+                };
+                let fast = ranges(breaks_of_block(cx, &node, &block_node, block));
+                assert_eq!(fast, ranges(plain(cx, &node, &block_node, block)), "at {:?}", node.value);
+                compared += 1;
+                reported += usize::from(fast.is_some_and(|it| it.len() > 1));
+            }
+            assert!(compared >= 8, "the fixture has `break`s in plain blocks: {compared}");
+            assert!(reported >= 2, "some block reports more than one `break`: {reported}");
+        });
+    }
+
+    /// A walk up a file's tree reads the nodes in place: nothing is allocated.
+    #[test]
+    fn a_walk_up_allocates_nothing() {
+        with_file(BLOCKS, |cx, root| {
+            let deepest = root.value.descendants().max_by_key(|it| it.ancestors().count()).expect("a node");
+            let node = root.with_value(deepest);
+            let depth = node.value.ancestors().count();
+            assert_eq!(up(cx, &node).count(), depth);
+            assert_eq!(edges(cx, &node).count(), depth - 1);
+            assert_at_most(0, "a walk up", || up(cx, &node).count() + edges(cx, &node).count());
+        });
+    }
 }

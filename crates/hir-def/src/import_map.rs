@@ -3,6 +3,7 @@
 use std::{cmp::Ordering, fmt};
 
 use base_db::{Db, Crate};
+use blaze_ids::bits::BitSet;
 use fst::{Automaton, Streamer, raw::IndexedValue};
 use hir_expand::name::Name;
 use indexmap::IndexSet;
@@ -57,7 +58,7 @@ pub struct ImportMap {
     /// Information of the imports that bring each item into scope, grouped by row.
     infos: Box<[ImportInfo]>,
     /// Bit `i` set: row `i` is an associated item of a trait.
-    trait_assoc_items: Box<[u64]>,
+    trait_assoc_items: BitSet,
     /// Indices into [`Self::infos`], sorted by their names lowercased (ASCII), ties in row
     /// order. Indexed by the values returned by running `fst`.
     ///
@@ -122,10 +123,10 @@ impl ImportMap {
         let infos: Box<[ImportInfo]> =
             order.iter().map(|&at| found.infos[at as usize].1.clone()).collect();
 
-        let mut trait_assoc_items = vec![0u64; rows.div_ceil(64)];
+        let mut trait_assoc_items = BitSet::new(rows);
         for (row, &is_trait_assoc_item) in found.trait_assoc_items.iter().enumerate() {
             if is_trait_assoc_item {
-                trait_assoc_items[row / 64] |= 1 << (row % 64);
+                trait_assoc_items.insert(row);
             }
         }
 
@@ -159,7 +160,7 @@ impl ImportMap {
             items: found.items,
             info_start: info_start.into_boxed_slice(),
             infos,
-            trait_assoc_items: trait_assoc_items.into_boxed_slice(),
+            trait_assoc_items,
             importables: importables.into_boxed_slice(),
             fst: builder.into_map(),
         }
@@ -179,7 +180,7 @@ impl ImportMap {
     }
 
     fn is_trait_assoc_item(&self, row: usize) -> IsTraitAssocItem {
-        if self.trait_assoc_items[row / 64] & (1 << (row % 64)) != 0 {
+        if self.trait_assoc_items.contains(row) {
             IsTraitAssocItem::Yes
         } else {
             IsTraitAssocItem::No

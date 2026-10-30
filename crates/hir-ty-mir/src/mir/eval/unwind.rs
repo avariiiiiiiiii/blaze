@@ -436,6 +436,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let bytes = self.read_memory(text, len)?;
             return Ok(String::from_utf8_lossy(bytes).into_owned());
         }
+        // dyn: rustc's text for a payload that is no string, not a trait object
         Ok("Box<dyn Any>".to_owned())
     }
 

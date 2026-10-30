@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2 lane fastcompile, idea 6 (no link and no rewrite for dev runs): crates/blaze-inproc, the dev executable written once per content key to cargo's path and started by the kernel, a start hook linked into the program that lays the daemon's code memory over its code before main with every byte equal at the swap, linked addresses and the slide, the handshake and its checks against the image's own headers, fences for running threads (epochs, stack walks, the OS thread list, model-checked), the arena allocator, the channel's frames, the platforms, the requests of link, cargo, usercode, core and the coordinator, and the speed of light.
+summary: blaze v2 lane fastcompile, idea 6 (no link and no rewrite for dev runs): crates/blaze-inproc, the dev executable written once per content key to cargo's path and started by the kernel, a start hook linked into the program that lays the daemon's code memory over its code before main with every byte equal at the swap, linked addresses and the slide, the handshake and its checks against the image's own headers, fences for running threads (epochs, stack walks, the OS thread list, model-checked), the arena allocator, the channel's frames, the run's lock-free asks (shared slots and a futex, model-checked), the platforms, the requests of link, cargo, usercode, core and the coordinator, and the speed of light.
 date: 2026-10-29
 ---
 # fastcompile: no link and no rewrite for dev runs (`crates/blaze-inproc`)
@@ -51,20 +51,21 @@ construction. What blaze adds is one swap of mappings whose bytes are equal.
    token names a waiting launch, the process ID is what the OS says of the peer
    (`SO_PEERCRED`, `LOCAL_PEERPID`, `GetNamedPipeClientProcessId`) and the peer is this user,
    then answers GRANT: the format, the linked header and span, the objects (the image and
-   arena's object, the fence's control words, the cells, the objects of fixed maps) and the
-   overlays.
+   arena's object, the fence's control words, the asks, the cells, the objects of fixed maps)
+   and the overlays.
 5. **The checks.** Before mapping anything the hook reads its own image's headers as the system
    loader mapped them (`image::layout`) and checks the grant against them, each relative to its
    own header: the same span; every overlay whole pages; an overlay over code is exactly one
    of the image's code segments, from the same file offset of the image object, executable;
    every other overlay is inside a reservation the executable carries; every code segment is
    covered. Decoding already refused any object or overlay a hook must not map: the image
-   object shared writable, the control words or cells executable, code from any object but the
-   image's, anything outside its object or the span, overlays out of order or overlapping.
-6. **The swap.** The hook maps the control words, then replaces each overlay's pages with the
-   mapping of its object at the linked address plus the slide (Linux `mmap` `MAP_FIXED`,
-   macOS `mach_vm_map` with `VM_FLAGS_OVERWRITE`; on Windows the daemon rebuilds the image's
-   region, below). The bytes are equal at the moment of the swap: the file was written from the
+   object shared writable, the control words, asks or cells executable, an overlay of the
+   control words or the asks, code from any object but the image's, anything outside its
+   object or the span, overlays out of order or overlapping.
+6. **The swap.** The hook maps the control words and the asks, then replaces each overlay's
+   pages with the mapping of its object at the linked address plus the slide (Linux `mmap`
+   `MAP_FIXED`, macOS `mach_vm_map` with `VM_FLAGS_OVERWRITE`; on Windows the daemon rebuilds
+   the image's region, below). The bytes are equal at the moment of the swap: the file was written from the
    object, and the daemon writes only code no thread can reach yet. The hook says STARTED and
    returns; the C runtime, the program's initializers and `main` run as anywhere.
 
@@ -118,6 +119,10 @@ PE section with no access and no raw data. So they slide with the image, and:
   through start and end maps hashed with one multiply.
 - **The channel** decodes frames in place from one reused buffer (no copy, no allocation per
   frame), with fixed little-endian headers and every read bounds-checked.
+- **Asks from the run** go through slots in shared memory and a futex, as io_uring's rings
+  and futex-based locks share memory across a boundary: no lock and no frame per ask, so a
+  signal handler that interrupts its own thread's ask asks too, which a lock around a framed
+  stream can't allow (below).
 
 ## The pieces
 
@@ -194,6 +199,53 @@ of at most 64 MiB, kinds partitioned by crate (`0x000` inproc, `0x100` `blaze-la
 trailing bytes, bad UTF-8 or a count larger than the bytes left are each an error, never a
 panic or an allocation for bytes that are not there (fuzzed in `tests.rs`, with the HELLO and
 GRANT bodies).
+
+### The asks (`ask.rs`)
+
+Once it runs, the program asks the daemon for things (`blaze-lazy`'s code on a lazy function's
+first call) with `runtime::Attached::request_into(kind, body, answer)`: any number at once,
+from any thread, from TLS destructors, and from a signal handler that interrupted its own
+thread in the middle of an ask. It takes no lock, allocates nothing until it fails, and leaves
+`errno` (the last error on Windows) as it found it.
+
+Each launch has an object of its own for them (object 2 of the grant, words, mapped shared by
+both ends): a header (a bitmap of claimed slots, a count of slots given back, a count of
+threads waiting for one, and what the run names its bells by), then 64 slots of 4 KiB. A slot's
+state word is a 24-bit generation and a phase (free, asked, taken, answering, answered), so it
+fits the 32 bits a futex compares. The asker claims a slot with one compare-and-swap on the
+bitmap, writes the kind, length and body, stores *asked* and rings the doorbell; it sleeps on
+the state word until *answered*, copies the answer into its buffer (the answer's whole length
+says when it did not fit), and gives the slot back under the next generation. The daemon's
+`ask::Reader` wakes on the doorbell, takes each asked slot (*taken*, one compare-and-swap) and
+hands it out as a frame whose sequence number is the slot and its generation; an `ask::Sender`
+(`Send + Sync`, cloned to any thread) takes the slot to *answering* (compare-and-swap: once,
+and never for another generation), writes the answer, stores *answered* and wakes the slot.
+`host::Session::split` gives the reader and the sender; `Session::kill` and `Sender::kill` end
+the process, the first reason kept as the run's error (`killed`).
+
+| Platform | Asker sleeps on | Doorbell | Kill |
+|---|---|---|---|
+| Linux | a futex that is not private, so the same in both processes | one byte on the socket | `pidfd_send_signal` on a pidfd opened at the grant |
+| macOS | `__ulock_wait` with `UL_COMPARE_AND_WAIT_SHARED` | one byte on the socket | `kill` of the process ID, so only before the launcher reaps it |
+| Windows | the slot's auto-reset event, which the daemon made and duplicated into the run | the doorbell event | `TerminateProcess` |
+
+A thread that finds all 64 slots claimed sleeps on the count of frees (in the process: a
+futex, `WaitOnAddress` on Windows). Other threads' slots come back as they are answered, so the
+one way to wait for ever is 64 asks nested on threads their own signal handlers interrupted.
+An asker whose daemon is gone wakes every second, finds the channel hung up and fails. The run
+is not trusted: the daemon reads each length once and bounds it to the slot, and refuses an
+answer to a slot not taken under that generation.
+
+Proof (`ask/model.rs`): an explicit-state model of the slots, the bitmap, the frees count and
+the waiters, with askers, one of them interrupted by a signal handler that asks inside its
+ask, a reader and a sender, at the grain of single shared accesses; every interleaving is
+explored. Checked: each asker gets its own answer, from every reachable state every asker can
+finish, the handler finishes while its thread is inside its ask, and with one slot it waits
+for ever exactly as stated above; a lock around the ask, a check-then-set claim or a sleep
+that does not compare the word first is each caught. `ask/tests.rs` runs the real code on
+Linux: 128 threads asking at once over 64 slots, a signal handler asking from inside its
+thread's ask (answered while that ask still waits), a long answer, stale and repeated answers,
+a hang-up, a bad length and a kill.
 
 ## Platforms
 

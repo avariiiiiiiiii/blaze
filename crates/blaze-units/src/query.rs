@@ -84,15 +84,60 @@ impl<T: Versioned> Persist for Cbor<T> {
         let bytes = cbor::to_vec(&self.0).unwrap_or_else(|error| {
             panic!("a {} has no deterministic CBOR: {error}", std::any::type_name::<T>())
         });
-        let data = out.push_slice::<u8>(bytes.as_slice());
-        let at = out.next::<Slice<u8>>();
-        out.push(&Slice::<u8>::between(at, data, bytes.len()))
+        write_bytes(out, &bytes)
     }
 
     fn read(buffer: &[u8]) -> Result<CborRef<'_, T>, FormatError> {
-        let slice = blaze_format::open_as::<Slice<u8>>(buffer, T::SCHEMA)?;
-        Ok(CborRef { bytes: slice.follow(buffer)?, of: PhantomData })
+        read_bytes(buffer)
     }
+}
+
+/// A [`Versioned`] value already encoded, as another query's [`CborRef::bytes`] gave it: the
+/// same schema and layout as [`Cbor<T>`], so readers get the same [`CborRef`]. A query that
+/// passes on another's value (`StdUnits` of `Foreign`'s) copies its bytes once instead of
+/// decoding and encoding it again.
+pub struct CborBytes<T> {
+    bytes: Vec<u8>,
+    of: PhantomData<fn() -> T>,
+}
+
+impl<T: Versioned> CborBytes<T> {
+    /// `value`'s bytes, as written under `T`'s schema.
+    pub fn of(value: CborRef<'_, T>) -> CborBytes<T> {
+        CborBytes { bytes: value.bytes.to_vec(), of: PhantomData }
+    }
+
+    /// A value encoded here, for a query whose answer is sometimes its own (an error).
+    pub fn encode(value: &T) -> CborBytes<T> {
+        let bytes = cbor::to_vec(value).unwrap_or_else(|error| {
+            panic!("a {} has no deterministic CBOR: {error}", std::any::type_name::<T>())
+        });
+        CborBytes { bytes, of: PhantomData }
+    }
+}
+
+impl<T: Versioned> Persist for CborBytes<T> {
+    const SCHEMA: SchemaHash = T::SCHEMA;
+    type Ref<'a> = CborRef<'a, T>;
+
+    fn write(&self, out: &mut Writer) -> u64 {
+        write_bytes(out, &self.bytes)
+    }
+
+    fn read(buffer: &[u8]) -> Result<CborRef<'_, T>, FormatError> {
+        read_bytes(buffer)
+    }
+}
+
+fn write_bytes(out: &mut Writer, bytes: &[u8]) -> u64 {
+    let data = out.push_slice::<u8>(bytes);
+    let at = out.next::<Slice<u8>>();
+    out.push(&Slice::<u8>::between(at, data, bytes.len()))
+}
+
+fn read_bytes<T: Versioned>(buffer: &[u8]) -> Result<CborRef<'_, T>, FormatError> {
+    let slice = blaze_format::open_as::<Slice<u8>>(buffer, T::SCHEMA)?;
+    Ok(CborRef { bytes: slice.follow(buffer)?, of: PhantomData })
 }
 
 /// Where a mounted directory's files are.
@@ -302,8 +347,8 @@ pub struct LockWrite {
 
 /// The standard library's units for one platform and profile, loaded from `library/` as one
 /// more workspace (`-Zbuild-std`'s graph), keyed by nothing of the view.
-/// `impl Query for StdUnits` (cargo-std, `crate::stdlib`): key [`StdKey`], value
-/// `Cbor<StdPlanned>`, kind [`kinds::STD_UNITS`].
+/// `impl Query for StdUnits` (`crate::stdlib`): key [`StdKey`], value `CborBytes<StdPlanned>`
+/// (`Foreign`'s bytes passed on once checked), kind [`kinds::STD_UNITS`].
 pub struct StdUnits;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
@@ -414,6 +459,16 @@ mod tests {
         round_trip(&[]);
         round_trip(&["serde", "v1.0.219"]);
         round_trip(&["x"; 1000]);
+    }
+
+    #[test]
+    fn passed_on_bytes_are_the_value_as_written() {
+        let value = Cbor(Words(vec!["core".to_owned(), "alloc".to_owned()]));
+        let bytes = blaze_format::to_bytes(&value);
+        let aligned = blaze_format::Aligned::copy_from(&bytes);
+        let read = <Cbor<Words> as Persist>::read(&aligned).unwrap();
+        assert_eq!(blaze_format::to_bytes(&CborBytes::of(read)), bytes);
+        assert_eq!(blaze_format::to_bytes(&CborBytes::encode(&value.0)), bytes);
     }
 
     #[test]

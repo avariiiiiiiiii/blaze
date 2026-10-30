@@ -115,7 +115,7 @@ fn scrutinees(store: &ExpressionStore) -> FxHashMap<BindingId, Option<ExprId>> {
             Expr::Block { statements, .. } => {
                 for statement in statements.iter() {
                     if let Statement::Let { pat, initializer: Some(init), .. } = statement {
-                        add(*pat, *init, true);
+                        add(pat, init, true);
                     }
                 }
             }
@@ -159,15 +159,15 @@ fn statement_values<'db>(
         let Expr::Block { statements, .. } = expr else { continue };
         for statement in statements.iter() {
             let Statement::Expr { expr, .. } = statement else { continue };
-            match store.expr(*expr) {
+            match store.expr(expr) {
                 Expr::Match { expr: matched, .. } => {
-                    let value = erased(infer.expr_ty(*expr));
+                    let value = erased(infer.expr_ty(expr));
                     if value != erased(infer.expr_ty(matched)) {
-                        found.insert(*expr, Some(value));
+                        found.insert(expr, Some(value));
                     }
                 }
                 _ => {
-                    found.insert(*expr, None);
+                    found.insert(expr, None);
                 }
             }
         }
@@ -182,9 +182,9 @@ fn lets(store: &ExpressionStore) -> Vec<Annotation> {
         for statement in statements.iter() {
             if let Statement::Let { pat, type_ref: Some(type_ref), initializer, .. } = statement {
                 found.push(Annotation {
-                    pat: *pat,
-                    type_ref: *type_ref,
-                    initializer: *initializer,
+                    pat,
+                    type_ref,
+                    initializer,
                     block,
                 });
             }
@@ -206,9 +206,9 @@ fn spelled_patterns(store: &ExpressionStore) -> Vec<(PatId, Option<ExprId>)> {
             Expr::Block { statements, .. } => {
                 for statement in statements.iter() {
                     if let Statement::Let { pat, type_ref: None, initializer, .. } = statement
-                        && spelled(store.pat(*pat))
+                        && spelled(store.pat(pat))
                     {
-                        found.push((*pat, *initializer));
+                        found.push((pat, initializer));
                     }
                 }
             }

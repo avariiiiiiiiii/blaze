@@ -135,29 +135,45 @@ use a::X;
     unit.resolve_imports();
 }
 
-#[test]
-fn an_unchanged_component_keeps_its_state() {
-    let db = fixture_db(
-        r#"
+/// The root's macro adds `g` to the root at round 1; `a` gains nothing and reads nothing.
+const UNCHANGED_A: &str = r#"
 //- /lib.rs
 #[macro_export]
 macro_rules! m { () => { pub fn g() {} } }
 crate::m!();
 mod a { pub fn x() {} }
-"#,
-    );
+"#;
+
+#[test]
+fn an_unchanged_component_keeps_its_state() {
+    let db = fixture_db(UNCHANGED_A);
     let krate = db.fetch_test_crate();
-    assert_eq!(queries::round_kind(&db, RoundKey::new(&db, krate, 1)), RoundKind::Normal);
-    let modules = queries::round_modules(&db, RoundKey::new(&db, krate, 1));
-    let a = modules.order[1];
+    let round = RoundKey::new(&db, krate, 1);
+    assert_eq!(queries::round_kind(&db, round), RoundKind::Normal);
+    let modules = queries::round_modules(&db, round);
+    let (root, a) = (modules.order[0], modules.order[1]);
+    assert_eq!(&*modules.active, &[0], "only the root gains ops at round 1");
+
+    // Round 1 does not run `a`: its readers name its round-0 facts.
+    assert!(!queries::runs(&db, round, 1));
+    assert_eq!(modules.ran(1), Some(0));
+    assert_eq!(modules.since(1), Some(0));
+    assert_eq!(queries::fact_key(&db, round, 1), FactKey::new(&db, a, krate, 0));
     let before = queries::scc_state(&db, SccKey::new(&db, a, krate, 0));
-    let after = queries::scc_state(&db, SccKey::new(&db, a, krate, 1));
-    assert!(triomphe::Arc::ptr_eq(&before.state, &after.state), "round 1 carried `a` as it was");
-    assert_eq!(after.handles, before.handles);
-    assert_eq!(queries::latest(&db, SccKey::new(&db, a, krate, 1)), 0);
+    assert_eq!(queries::fact_handle(&db, queries::fact_key(&db, round, 1)), before.handles[0]);
 
     // The root changed at round 1: the macro's `g` is in it.
-    let root = modules.order[0];
+    assert!(queries::runs(&db, round, 0));
     let root_state = queries::scc_state(&db, SccKey::new(&db, root, krate, 1));
     assert_eq!(root_state.round, 1);
+    assert_eq!(queries::latest(&db, SccKey::new(&db, root, krate, 1)), 1);
+}
+
+#[test]
+#[should_panic(expected = "a component the round does not run")]
+fn the_state_of_a_component_the_round_does_not_run_stops() {
+    let db = fixture_db(UNCHANGED_A);
+    let krate = db.fetch_test_crate();
+    let a = queries::round_modules(&db, RoundKey::new(&db, krate, 1)).order[1];
+    queries::scc_state(&db, SccKey::new(&db, a, krate, 1));
 }

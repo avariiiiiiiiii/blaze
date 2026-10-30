@@ -73,7 +73,7 @@ The check.rs sibling (`mem-db-checks-check`, B7) and the parent's B5 call these;
 | function | before | after |
 |---|---|---|
 | `build` (712) | `(ctx, body, &Cfg, &FxHashMap<ExprId, (usize, Vec<Requirement>)>) -> Regions<'db>` | `(ctx, body, &Cfg<'_>, &FMap<'_, ExprId, (usize, FVec<'_, Requirement<'db>>)>) -> Regions<'a, 'db>` |
-| `Regions::type_bounds_of` (229) | `-> Vec<Rv>` | deleted if check.rs reads `type_bounds` directly (B7.7, as `mem-db-checks-check` says); else `-> impl Iterator<Item = Rv> + '_` (check.rs 2087 drops its `.into_iter()`) |
+| `Regions::type_bounds_of` (229) | `-> Vec<Rv>` | `-> impl Iterator<Item = Rv> + '_` (check.rs 2087 drops its `.into_iter()`, B7.7) |
 | `opaque_captures` (293) | `(db, opaque, len) -> Option<Vec<bool>>` | `(frame, db, opaque, len) -> Option<FVec<'f, bool>>`; liveness.rs 812 passes `self.ctx.frame`, polonius.rs 280 `ctx.frame`, check.rs 2166 `self.ctx.frame` |
 | `regions_of` (699) | `(ty, &mut Vec<Rv>)` | `(ty, &mut FVec<'_, Rv>)` (liveness.rs 604/621 pass B5.1's `found: &mut FVec<'_, Rv>`; explain.rs 312 a frame vector) |
 | `outlives_components` (6873) | `(ty, &mut Vec<Rv>, &mut Vec<Ty>)` | `(ty, &mut FVec<'_, Rv>, &mut FVec<'_, Ty<'db>>)` |
@@ -202,10 +202,9 @@ impl<'f, 'db> Regions<'f, 'db> {
 (`knows`, `type_outlives_known` unchanged.) `type_bounds_of`'s one caller, check.rs 2087
 `self.regions.type_bounds_of(ty).into_iter().chain([fn_body]).any(..)`, becomes
 `self.regions.type_bounds_of(ty).chain([fn_body]).any(..)`: one vector per type test gone.
-Update from `mem-db-checks-check` (2026-10-29 20:53): their check.rs reads `type_bounds`
-directly, so `type_bounds_of` has no caller left; then delete lines 228-235 (the method and
-its doc comment) instead of the after above, in the same change as their B7.7, so no dead
-method is left. Whichever B7.7 lands, the vector per type test is gone.
+Settled with `mem-db-checks-check` (2026-10-29 21:09): their B7.7 chains
+`type_bounds_of(ty)` without `.into_iter()` at check.rs ~2087, so the iterator above is the
+change (their 20:53 note that check.rs reads `type_bounds` directly is withdrawn).
 
 Every other file that names `Regions<'db>` / `&Regions<'_>` names `Regions<'_, 'db>` /
 `&Regions<'_, '_>` (the parent's B5 already writes `liveness`, `loans`, `polonius`,
@@ -2853,3 +2852,32 @@ in place of the two `.with_infer_vars_behavior(..)`. Apply it with the hir-ty pa
 > forwarded to db (db-ty-d-borrowck) (requests, pass 19; told by tmux).
 > db-ty-d-borrowck (2026-10-29 20:59): not applied yet, `with_infer_ctxt_vars` is not in
 > `hir-ty/src/lower.rs`; applied with db-ty-next2's `lower.rs` part (see `v2/requests/db-ty.md`).
+
+> mem-db-checks-regions (2026-10-29 21:09): fits with R0-R9 in either order. It touches lines
+> 54-63 (`InferVars`), 4312/4323 and 4676/4687; R0 changes only the imports (20, 43-48), R7.5
+> rewrites 4326-4339 in `elided_groups`, and nothing here touches 4660-4693. No `dyn` is added
+> by R0-R9.
+
+## R10. What regions.rs uses of the dataflow files (for frontend-fast-borrowck)
+
+`frontend-fast-borrowck` takes `bitset`, `dataflow`, `relation`, `cfg`, `moves`, `liveness`,
+`loans`, `polonius` and `lib` and keeps B5's signature table. regions.rs, today and after
+R0-R9, relies on these of theirs and nothing else (`dataflow`, `relation`, `moves`, `loans`
+and `polonius` not at all):
+
+| file | what | where in regions.rs |
+|---|---|---|
+| `bitset.rs` | `BitMatrix::new(frame, rows, columns)`, `contains(row, bit)`, `insert(row, bit)`, `union_rows(into, from)` | `known` in `known_relations` (2590-2698, R6), `Regions::knows` (225) |
+| `bitset.rs` | `BitSet::new(frame, size)`, `contains(bit) -> bool` (false past the end), `insert(bit) -> bool` (true when newly set) | `aggregate_temps`, `synthesized` (R2), `universal_in_params` (R6), `constraint_path`'s `seen` (R8.6, relies on `insert`'s `bool`) |
+| `cfg.rs` | `Cfg` with `order: Vec<BlockId>`-like iterable of blocks (`for &block in &cfg.order`, 770); `Location { block, statement }` built by its fields (773, 777) and read by `Constraints::push` | `build` (712-784) |
+| `liveness.rs` | `live_regions(ctx, &regions, ty)` -> B5's `FVec<'a, Rv>`; only `.is_empty()` is read | 1447 |
+| `liveness.rs` | `normalize_erased(ctx, ty) -> Option<Ty>`, unchanged | 2706 |
+| `lib.rs` | `Ctx` with `pub(crate) frame: &'a Frame` (B1) and the fields read today (`db`, `infcx`, `owner`, `store`, `closure_expr`, ...); `return_slot()`; `debugging(db, owner)` | throughout; 1043, 1730-1830, 2423-2655, 3915-3979; 6215 |
+
+Outside their files: `constraints.rs` (`Constraints::new(frame)`, `push`, `get`, `sup`, `sub`,
+`of_sup -> &[u32]`, `Extend<Outlives>`) and `inference.rs` (`RegionValues`, `infer`,
+re-exported at 42), per B5.6. If `dedup: bits` renames `BitSet`/`BitMatrix` and their
+constructors (`bits`, `matrix`, per `mem-db-checks-check` B7.13), regions.rs takes the rename
+as written there; what it needs is the operations above.
+
+> forwarded to frontend-fast-borrowck (it holds those dataflow files now; told by tmux; requests, pass 22).

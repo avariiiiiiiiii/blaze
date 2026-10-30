@@ -11,20 +11,17 @@ use blaze_codegen::{
     settings::{Coverage, DebugInfo, Panic, Relocation, Sanitize, Sanitizers, Spec, Toolchain},
     template::Refs,
 };
-use blaze_format::SpanRef;
 use blaze_ids::ContentId;
-use blaze_items::{CodeHash, ItemId, ItemKey};
+use blaze_items::{CodeHash, ItemKey};
 use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
-use hir_ty::{
-    db::HirDatabase,
-    next_solver::{Const, Ty},
-};
+use hir_ty::db::HirDatabase;
 use hir_ty_mir::mir::MirSpan;
 use test_fixture::WithFixture;
 
 use super::{
-    Backends, Body, BuildTime, Databases, Hashes, HirFrontend, HirInstance, Kind,
+    Backends, BuildTime, Databases, HashSource, HirFrontend, HirInstance, Kind,
     allocator::{self, Forward},
+    by_id::ById,
     backend::{built, compiled_in},
     build::{self, Build},
     places::{self, Placer, place_requests},
@@ -32,49 +29,6 @@ use super::{
 };
 use crate::{InstanceDef, home::Homes};
 use db::TestDB;
-
-/// Content IDs of the database's own ids: stable within one database, which is all a test
-/// compares.
-struct ById;
-
-fn by_id(domain: &'static str, what: impl std::fmt::Debug) -> ContentId {
-    ContentId::of(domain, format!("{what:?}").as_bytes())
-}
-
-impl Hashes for ById {
-    fn item(&self, _: &Db, item: ItemId) -> Result<ItemKey, String> {
-        Ok(ItemKey(by_id("test item", item)))
-    }
-
-    fn code(&self, _: &Db, body: Body) -> Result<CodeHash, String> {
-        Ok(CodeHash(by_id("test code", body)))
-    }
-
-    fn ty<'db>(&self, _: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
-        Ok(by_id("test type", ty))
-    }
-
-    fn konst<'db>(&self, _: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
-        Ok(by_id("test const", konst))
-    }
-
-    fn span(
-        &self,
-        _: &Db,
-        owner: DefWithBodyId,
-        span: MirSpan,
-    ) -> Result<SpanRef, String> {
-        Ok(SpanRef { anchor: by_id("test span", (owner, span)), index: 0 })
-    }
-
-    fn declaration(&self, _: &Db, func: FunctionId) -> Result<SpanRef, String> {
-        Ok(SpanRef { anchor: by_id("test declaration", func), index: 0 })
-    }
-
-    fn file_name(&self, _: &Db, file: base_db::FileId) -> Result<String, String> {
-        Ok(format!("{file:?}"))
-    }
-}
 
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
@@ -88,7 +42,7 @@ fn held(db: TestDB) -> (&'static TestDB, HirFrontend<'static>) {
 fn held_as(db: TestDB, policy: &Policy) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(db));
     let frontend =
-        HirFrontend::new(Databases::new(db), Box::new(ById), BuildTime(Default::default()));
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime(Default::default()));
     (db, frontend.with_policy(policy))
 }
 
@@ -332,7 +286,7 @@ fn the_walk_lists_what_the_ir_asks_for() {
                 super::Built::Assembled(_, requests) => requests,
             };
             let mut placer = Placer::listed(walked.clone());
-            place_requests(db, homes, &ById, compiled_in(db, &instance), &mut placer, requests)
+            place_requests(db, homes, &HashSource::ById(ById), compiled_in(db, &instance), &mut placer, requests)
                 .unwrap_or_else(|e| panic!("{instance:?} asks for what its walk has not: {e}"));
             for it in walked {
                 if let FrontRef::Function(next) = it
@@ -361,7 +315,7 @@ fn a_reference_left_out_of_the_walk_is_an_error() {
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(Vec::new());
         let krate = compiled_in(db, &root);
-        let placed = place_requests(db, homes, &ById, krate, &mut placer, &mut pending.wants.requests);
+        let placed = place_requests(db, homes, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests);
         assert!(placed.is_err());
     });
 }
@@ -404,14 +358,14 @@ fn an_always_inline_callee_of_a_dependency_is_built_in() {
         };
         assert!(walked.iter().any(calls_helper), "{walked:?}");
         let inlined =
-            super::frontend::inlined(db, &ById, (&root, false)).expect("what is built in");
+            super::frontend::inlined(db, &HashSource::ById(ById), (&root, false)).expect("what is built in");
         assert_eq!(inlined.len(), 2, "outer and twice: {inlined:?}");
         let mut code = build::with(Build::of(&spec), || built(db, &root, false))
             .and_then(|it| it)
             .unwrap_or_else(|e| panic!("{root:?}: {e}"));
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(walked);
-        place_requests(db, homes, &ById, compiled_in(db, &root), &mut placer, &mut pending.wants.requests)
+        place_requests(db, homes, &HashSource::ById(ById), compiled_in(db, &root), &mut placer, &mut pending.wants.requests)
             .expect("the IR asks only for what the walk lists");
     });
 }
@@ -484,7 +438,7 @@ fn an_allocator_entry_calls_what_its_walk_lists() {
             .expect("the IR");
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(walked);
-        place_requests(db, homes, &ById, compiled_in(db, &ours), &mut placer, &mut pending.wants.requests)
+        place_requests(db, homes, &HashSource::ById(ById), compiled_in(db, &ours), &mut placer, &mut pending.wants.requests)
             .expect("what the walk lists");
     });
     // The fixture links no `alloc`: its program has no shim.
@@ -645,7 +599,7 @@ fn which_units_inline_is_the_policys() {
     let inlines = |policy: &Policy, instance: &HirInstance| {
         let build_time = BuildTime(Default::default());
         let frontend =
-            HirFrontend::new(Databases::new(db), Box::new(ById), build_time).with_policy(policy);
+            HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time).with_policy(policy);
         frontend.with(|db, _| frontend.inlines(db, instance)).expect("the policy")
     };
     assert!(!inlines(&policy(OptLevel::O0), &root));
@@ -663,7 +617,7 @@ fn which_units_inline_is_the_policys() {
     // Other members and the library's crates still inline, and any of them may ask for it.
     assert!(inlines(&set_apart, &generic));
     let unwalked =
-        HirFrontend::new(Databases::new(db), Box::new(ById), BuildTime(Default::default()));
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime(Default::default()));
     let refused = unwalked.with(|db, _| unwalked.inlines(db, &root));
     assert!(refused.is_err_and(|e| e.contains("with_policy")));
 }
@@ -701,7 +655,7 @@ fn the_walk_lists_what_inlined_code_calls() {
             let mut code = built_as(db, &llvm(2), &root);
             let super::Built::Ir(pending) = &mut code else { panic!("asm") };
             let mut placer = Placer::listed(refs);
-            place_requests(db, homes, &ById, krate, &mut placer, &mut pending.wants.requests)
+            place_requests(db, homes, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests)
                 .map(drop)
         };
         assert!(place(plain).is_err(), "the inlined IR asks only for what the plain walk lists");
@@ -733,7 +687,7 @@ fn a_callee_inlined_twice_is_built_in_once() {
         assert_ne!(one, two);
         let of = |func| built_in.iter().any(|&at| is_call(&walked[at as usize], func));
         assert!(of(leaf) && of(mid), "{built_in:?} of {walked:?}");
-        let inlined = super::frontend::inlined(db, &ById, (&root, true)).expect("the code");
+        let inlined = super::frontend::inlined(db, &HashSource::ById(ById), (&root, true)).expect("the code");
         assert_eq!(inlined.len(), 2, "leaf and mid: {inlined:?}");
     });
 }

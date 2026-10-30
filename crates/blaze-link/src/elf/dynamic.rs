@@ -610,6 +610,9 @@ pub(crate) struct KeptRela {
     /// `rebase[i]`'s).
     bytes: Vec<u8>,
     relative: usize,
+    /// How many builds were patches.
+    #[cfg(test)]
+    pub(crate) patched: u32,
 }
 
 /// `.rela.dyn`'s bytes, how many of its entries are `RELATIVE`, and whether another is a
@@ -642,6 +645,10 @@ fn rela_dyn(writer: &Elf, placed: &Placed<'_>, shared: bool, kept: Option<&mut K
         let mut bytes = Vec::with_capacity(kept.bytes.len());
         bytes.extend_from_slice(&kept.bytes);
         kept.synthesis = placed.synthesis;
+        #[cfg(test)]
+        {
+            kept.patched += 1;
+        }
         return Ok((bytes, kept.relative, others.iter().any(|it| it.r_type == tpoff64)));
     }
     let (relocations, relative, in_order) = relocations(writer, placed, shared)?;
@@ -894,6 +901,10 @@ fn eh_frame_hdr(placed: &Placed<'_>, kept: Option<&mut KeptHdr>) -> Result<Vec<u
         let mut bytes = Vec::with_capacity(kept.bytes.len());
         bytes.extend_from_slice(&kept.bytes);
         kept.synthesis = placed.synthesis;
+        #[cfg(test)]
+        {
+            kept.patched += 1;
+        }
         return Ok(bytes);
     }
     let (bytes, table, in_order) = build_hdr(placed, hdr)?;
@@ -916,6 +927,9 @@ pub(crate) struct KeptHdr {
     bytes: Vec<u8>,
     /// The FDEs of the records walked again, reused.
     scratch: Vec<(u64, u64)>,
+    /// How many builds were patches.
+    #[cfg(test)]
+    pub(crate) patched: u32,
 }
 
 /// Whether every FDE a function names in `.eh_frame` is one of `table` (sorted by FDE): then

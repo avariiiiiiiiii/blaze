@@ -885,11 +885,9 @@ pub fn rerun_is_same(out_dir: &Path) -> Result<(), String> {
 /// of the last tick.
 #[cfg(target_os = "linux")]
 fn file_clock_tick() -> Duration {
-    let mut tick = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `tick` is a timespec to write to.
-    match unsafe { libc::clock_getres(libc::CLOCK_REALTIME_COARSE, &mut tick) } {
-        0 => Duration::new(tick.tv_sec as u64, tick.tv_nsec as u32).max(Duration::from_millis(1)),
-        _ => Duration::from_millis(20),
+    match crate::raw::system::coarse_clock_step() {
+        Some(step) => step.max(Duration::from_millis(1)),
+        None => Duration::from_millis(20),
     }
 }
 

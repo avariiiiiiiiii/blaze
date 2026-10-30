@@ -14,6 +14,7 @@ doctest = false
 
 [dependencies]
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 either.workspace = true
 itertools.workspace = true
 ra-ap-rustc_lexer.workspace = true

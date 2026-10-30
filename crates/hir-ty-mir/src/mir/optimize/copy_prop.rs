@@ -147,9 +147,9 @@ fn ssa_locals<'f, 'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, frame: &'f Frame
         }
         Mention::SharedBorrow => {
             borrowed.insert(local_index(local));
-            check_dominates(&mut assignments, local, at);
+            check_dominates(&mut assignments[..], local, at);
         }
-        Mention::Read => check_dominates(&mut assignments, local, at),
+        Mention::Read => check_dominates(&mut assignments[..], local, at),
         Mention::Storage => (),
     };
     let rpo = reverse_postorder(body, frame);

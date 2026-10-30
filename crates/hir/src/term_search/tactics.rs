@@ -90,7 +90,7 @@ pub(super) fn assoc_const<'a, 'lt, 'db>(
         })
         .flat_map(|it| Impl::all_for_type(db, it.ty(db)))
         .filter(|it| !it.is_unsafe(db))
-        .flat_map(|it| it.items(db))
+        .flat_map(|it| it.items_iter(db))
         .filter(move |it| it.is_visible_from(db, module))
         .filter_map(AssocItem::as_const)
         .filter_map(|it| {
@@ -207,13 +207,11 @@ pub(super) fn data_constructor<'a, 'lt, 'db>(
 
                 let generics: Vec<_> = ty.type_arguments().collect();
                 let exprs = enum_
-                    .variants(db)
-                    .into_iter()
+                    .variants_iter(db)
                     .filter_map(|variant| {
                         // Early exit if some param cannot be filled from lookup
                         let param_exprs: Vec<Vec<Expr<'_>>> = variant
-                            .fields(db)
-                            .into_iter()
+                            .fields_iter(db)
                             .map(|field| {
                                 let ty = field.ty(db).instantiate(db, generics.iter().cloned());
                                 lookup.find(db, &ty)
@@ -420,7 +418,7 @@ pub(super) fn impl_method<'a, 'lt, 'db>(
         .flat_map(|ty| {
             Impl::all_for_type(db, ty.clone()).into_iter().map(move |imp| (ty.clone(), imp))
         })
-        .flat_map(|(ty, imp)| imp.items(db).into_iter().map(move |item| (imp, ty.clone(), item)))
+        .flat_map(|(ty, imp)| imp.items_iter(db).map(move |item| (imp, ty.clone(), item)))
         .filter_map(|(imp, ty, it)| match it {
             AssocItem::Function(f) => Some((imp, ty, f)),
             _ => None,
@@ -620,7 +618,7 @@ pub(super) fn impl_static_method<'a, 'lt, 'db>(
             Impl::all_for_type(db, ty.clone()).into_iter().map(move |imp| (ty.clone(), imp))
         })
         .filter(|(_, imp)| !imp.is_unsafe(db))
-        .flat_map(|(ty, imp)| imp.items(db).into_iter().map(move |item| (imp, ty.clone(), item)))
+        .flat_map(|(ty, imp)| imp.items_iter(db).map(move |item| (imp, ty.clone(), item)))
         .filter_map(|(imp, ty, it)| match it {
             AssocItem::Function(f) => Some((imp, ty, f)),
             _ => None,

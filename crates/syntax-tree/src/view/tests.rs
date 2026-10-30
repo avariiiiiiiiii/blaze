@@ -236,6 +236,9 @@ fn check(tree: &Arc<FlatTree>) {
         assert_eq!(v.tree_top(), view);
         let id = v.id();
         assert!(View::at(tree, id) == v, "{i} found by its id");
+        // Identity is the tree's, not the `Arc` handle's: another count of it views the same.
+        let other = Arc::clone(tree);
+        assert!(View::at(&other, id) == v, "{i} found through another count of its tree");
         assert!(id.part == NodeId::FILE || tree.is_lazy(id.part));
         for (j, w) in views.iter().enumerate() {
             assert_eq!(*w == v, i == j, "views {i} and {j} are equal as their elements");
@@ -411,7 +414,7 @@ fn a_view_copies_into_a_builder() {
         let root = View::root(&tree);
         let mut builder = FlatTreeBuilder::new();
         builder.view(NodeOrToken::Node(root));
-        let copy = builder.finish();
+        let copy = Arc::new(builder.finish());
         let copy_root = View::root(&copy);
         let ours: Vec<_> = root.descendants_with_tokens().map(view_key).collect();
         let theirs: Vec<_> = copy_root.descendants_with_tokens().map(view_key).collect();

@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 /// What one build left in the database: every key it names (its results and what they read),
 /// sorted, and per key index whether there is a result, its fingerprint, whether this build
 /// ran it, and its edges in read order.
+// clone: tests only (join.rs's tests mutate a copy of a trace); nothing in the library clones one.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Trace {
     pub keys: Vec<QueryKey>,
@@ -114,27 +115,32 @@ impl TraceBuilder {
             row_of[id] = r as u32;
         }
         // Only the kept row of each key names its reads; a row inserted over is gone.
+        // alloc: once a trace, sized to its edges: the key ID each edge read.
         let mut read_ids = vec![NONE; self.edges.len()];
         for &r in &row_of {
             let row = &self.rows[r as usize];
-            let edges = row.from as usize..(row.from + row.len) as usize;
-            for (id, edge) in read_ids[edges.clone()].iter_mut().zip(&self.edges[edges]) {
+            let (from, to) = (row.from as usize, (row.from + row.len) as usize);
+            for (id, edge) in read_ids[from..to].iter_mut().zip(&self.edges[from..to]) {
                 *id = table.intern(&edge.read);
             }
         }
         let distinct = table.keys;
         row_of.resize(distinct.len(), NONE);
+        // alloc: once a trace, the sort's permutation of the distinct keys.
         let mut order: Vec<u32> = (0..distinct.len() as u32).collect();
         order.sort_unstable_by(|&x, &y| distinct[x as usize].cmp(&distinct[y as usize]));
+        // alloc: once a trace, each key ID's sorted index.
         let mut rank = vec![0u32; distinct.len()];
         for (at, &id) in order.iter().enumerate() {
             rank[id as usize] = at as u32;
         }
         let n = distinct.len();
         let mut trace = Trace {
+            // alloc: the trace's key column, once a trace.
             keys: order.iter().map(|&id| distinct[id as usize]).collect(),
             has: BitSet::new(n),
             ran: BitSet::new(n),
+            // alloc: the trace's fingerprint column, once a trace.
             fingerprints: vec![Fingerprint(0); n],
             edges_from: Vec::with_capacity(n + 1),
             reads: Vec::with_capacity(self.edges.len()),
@@ -151,9 +157,9 @@ impl TraceBuilder {
                     trace.ran.insert(i);
                 }
                 trace.fingerprints[i as usize] = row.fingerprint;
-                let edges = row.from as usize..(row.from + row.len) as usize;
-                trace.reads.extend(read_ids[edges.clone()].iter().map(|&read| rank[read as usize]));
-                trace.saw.extend(self.edges[edges].iter().map(|e| e.saw));
+                let (from, to) = (row.from as usize, (row.from + row.len) as usize);
+                trace.reads.extend(read_ids[from..to].iter().map(|&read| rank[read as usize]));
+                trace.saw.extend(self.edges[from..to].iter().map(|e| e.saw));
             }
             trace.edges_from.push(u32::try_from(trace.reads.len()).expect("a trace has fewer than 2^32 edges"));
         }
@@ -176,6 +182,7 @@ impl KeyTable {
 
     fn with_capacity(n: usize) -> KeyTable {
         let slots = (2 * n).next_power_of_two().max(16);
+        // alloc: once a trace, the table's slots, sized for its keys.
         KeyTable { keys: Vec::with_capacity(n), slots: vec![Self::EMPTY; slots], shift: 64 - slots.trailing_zeros() }
     }
 
@@ -257,8 +264,8 @@ impl Trace {
 
     /// Key `i`'s edges as (key index read, fingerprint seen).
     pub fn edges(&self, i: u32) -> impl Iterator<Item = (u32, Fingerprint)> + '_ {
-        let range = self.edges_from[i as usize] as usize..self.edges_from[i as usize + 1] as usize;
-        self.reads[range.clone()].iter().copied().zip(self.saw[range].iter().copied())
+        let (from, to) = (self.edges_from[i as usize] as usize, self.edges_from[i as usize + 1] as usize);
+        self.reads[from..to].iter().copied().zip(self.saw[from..to].iter().copied())
     }
 
     /// The key indices reachable from `roots` through edges, the roots included, as a bitset;
@@ -294,6 +301,7 @@ fn same_edges(a: &Trace, i: u32, b: &Trace, j: u32) -> bool {
 }
 
 /// A result of the incremental build that is not the one the build from scratch made.
+// clone: no heap, keys and fingerprints only; nameres's `Finding::Stale` carries one.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Stale {
     /// Kept from an earlier build though an edge's fingerprint is not that of what it read now
@@ -339,6 +347,7 @@ impl Stale {
 /// scratch reached from `roots` (every result when empty): the culprits first, then by key.
 pub fn under(incremental: &Trace, scratch: &Trace, roots: &[QueryKey]) -> Vec<Stale> {
     let reached = scratch.reachable(roots);
+    // alloc: the answer; unallocated while nothing is stale.
     let mut stale = Vec::new();
     let mut cursor = 0;
     for i in 0..scratch.keys.len() as u32 {
@@ -385,6 +394,7 @@ pub struct Work {
 /// What `after` ran, against `before`, and the needless reruns by key.
 pub fn over(before: &Trace, after: &Trace) -> (Work, Vec<QueryKey>) {
     let mut work = Work::default();
+    // alloc: the answer; unallocated while nothing reran for nothing.
     let mut needless = Vec::new();
     let mut cursor = 0;
     for i in 0..after.keys.len() as u32 {
@@ -420,6 +430,7 @@ pub fn apart<K: Ord + Clone, V: PartialEq + Clone>(
     second: &BTreeMap<K, V>,
 ) -> Vec<Apart<K, V>> {
     use std::cmp::Ordering;
+    // alloc: the answer; unallocated while the maps agree.
     let mut out = Vec::new();
     let (mut x, mut y) = (first.iter().peekable(), second.iter().peekable());
     loop {
@@ -432,15 +443,18 @@ pub fn apart<K: Ord + Clone, V: PartialEq + Clone>(
         };
         match (order, a, b) {
             (Ordering::Less, Some((key, value)), _) => {
+                // clone: the answer owns the keys and values where the maps differ, and only those.
                 out.push(Apart::OnlyFirst { key: key.clone(), value: value.clone() });
                 x.next();
             }
             (Ordering::Greater, _, Some((key, value))) => {
+                // clone: as above.
                 out.push(Apart::OnlySecond { key: key.clone(), value: value.clone() });
                 y.next();
             }
             (Ordering::Equal, Some((key, va)), Some((_, vb))) => {
                 if va != vb {
+                    // clone: as above.
                     out.push(Apart::Differ { key: key.clone(), first: va.clone(), second: vb.clone() });
                 }
                 x.next();
@@ -457,17 +471,20 @@ pub use blaze_ids::rng::SplitMix64 as Rng;
 /// `n` of `items` chosen by `seed` (all of them when there are no more), in their order.
 pub fn sample<T: Clone>(items: &[T], n: usize, seed: u64) -> Vec<T> {
     if n >= items.len() {
+        // alloc: the answer, once a sample: every item when there are no more.
         return items.to_vec();
     }
     let mut rng = Rng::new(seed);
+    // alloc: once a sample, the partial shuffle's indices.
     let mut at: Vec<usize> = (0..items.len()).collect();
     for i in 0..n {
         let j = i + rng.below((items.len() - i) as u64) as usize;
         at.swap(i, j);
     }
-    let mut chosen = at[..n].to_vec();
-    radix::sort(&mut chosen);
-    chosen.into_iter().map(|i| items[i].clone()).collect()
+    at.truncate(n);
+    radix::sort(&mut at);
+    // clone: the answer, the chosen items, once a sample.
+    at.iter().map(|&i| items[i].clone()).collect()
 }
 
 #[cfg(test)]

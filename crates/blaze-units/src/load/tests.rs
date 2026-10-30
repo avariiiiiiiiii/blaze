@@ -5,6 +5,7 @@ use blaze_query::{Config, Database, MemTree, Query, QueryKey};
 use blaze_vfs::{View, ViewId};
 
 use super::config::ConfigOf;
+use super::files::LoadFile;
 use super::invocation::{Asking, Invocation as InvocationQuery};
 use super::manifest::{ManifestKey, ManifestQuery, WorkspaceKey, WorkspaceQuery};
 use crate::query::{
@@ -149,7 +150,7 @@ impl Fixture {
     }
 
     fn plan(&self, view: ViewId) -> Planned {
-        self.db.get::<Plan>(view, &()).expect("planned").get()
+        self.db.pin().get::<Plan>(view, &()).expect("planned").get()
     }
 
     /// Whether `Q` of `key` ran in `view`, rather than being verified or reused.
@@ -377,7 +378,7 @@ impl Query for Rounds {
     type Value = crate::query::Cbor<Counted>;
 
     fn input(key: &()) -> ContentId {
-        crate::query::key_input("blaze v2 cargo test rounds key 1", key)
+        super::key_id("blaze v2 cargo test rounds key 1", key)
     }
 
     fn execute(cx: &mut blaze_query::Cx<'_>, _: &()) -> Result<crate::query::Cbor<Counted>, blaze_query::Cancelled> {
@@ -412,7 +413,7 @@ fn a_locked_workspace_resolves_in_one_run() {
         ("serde/src/lib.rs", ""),
     ];
     let view = fixture.open(&Ask { mounts: vec![mount(&serde_fetch().at, "serde")], ..ask(&files) });
-    let counted = fixture.db.get::<Rounds>(view, &()).expect("counted").get();
+    let counted = fixture.db.pin().get::<Rounds>(view, &()).expect("counted").get();
     assert_eq!(counted, Counted { rounds: 1, resolved: true });
     ready(fixture.plan(view));
 }
@@ -591,4 +592,83 @@ fn a_workspace_that_is_not_there_is_cargos_error() {
     assert!(failed(fixture.plan(fixture.open(&ask(&lowercase)))).contains("cargo.toml"));
     let exclude = Ask { args: &["--exclude", "a"], ..ask(&[("ws/Cargo.toml", A), ("ws/src/lib.rs", "")]) };
     assert_eq!(failed(fixture.plan(fixture.open(&exclude))), "--exclude can only be used together with --workspace");
+}
+
+// docs/cargo.md's opt-outs: the root manifest names `b`, the member `a` takes its own build
+// script out, and `d`, a path dependency outside the workspace, can't take itself out.
+#[test]
+fn the_sandbox_opt_outs_are_the_manifests() {
+    let fixture = Fixture::new();
+    let root = "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"3\"\n\n\
+                [workspace.metadata.blaze.sandbox]\nunsandboxed-build-scripts = [\"b\"]\n\
+                build-script-link-dirs = [\"vendor/lib\", \"/opt/x/lib\"]\n";
+    let with_script = |name: &str, extra: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n{extra}")
+    };
+    let a = with_script(
+        "a",
+        "default-run = \"a\"\n\n[package.metadata.blaze.sandbox]\nbuild-script = false\n\n\
+         [dependencies]\nd = { path = \"../../d\" }\n",
+    );
+    let (b, c) = (with_script("b", ""), with_script("c", ""));
+    let d = with_script("d", "\n[package.metadata.blaze.sandbox]\nbuild-script = false\n");
+    let files = [
+        ("ws/Cargo.toml", root),
+        ("ws/a/Cargo.toml", a.as_str()),
+        ("ws/a/build.rs", "fn main() {}\n"),
+        ("ws/a/src/main.rs", "fn main() {}\n"),
+        ("ws/b/Cargo.toml", b.as_str()),
+        ("ws/b/build.rs", "fn main() {}\n"),
+        ("ws/b/src/lib.rs", ""),
+        ("ws/c/Cargo.toml", c.as_str()),
+        ("ws/c/build.rs", "fn main() {}\n"),
+        ("ws/c/src/lib.rs", ""),
+        ("d/Cargo.toml", d.as_str()),
+        ("d/build.rs", "fn main() {}\n"),
+        ("d/src/lib.rs", ""),
+    ];
+    let units = ready(fixture.plan(fixture.open(&Ask { mounts: vec![mount("/home/u/d", "d")], ..ask(&files) })));
+    for (name, outside) in [("a", true), ("b", true), ("c", false), ("d", false)] {
+        let of = units_of(&units, name);
+        assert!(of.iter().any(|(_, it)| it.mode == Mode::RunCustomBuild), "{name} runs a build script");
+        assert!(of.iter().all(|(at, _)| units.plans[*at].unsandboxed == outside), "{name}");
+    }
+    assert!(units.plans.iter().zip(&units.graph.units).filter(|(_, it)| it.is_std).all(|(plan, _)| !plan.unsandboxed));
+    assert_eq!(units.link_dirs, ["/home/u/ws/vendor/lib", "/opt/x/lib"]);
+    let default_run = |name: &str| units.packages.iter().find(|it| it.name == name).unwrap().default_run.clone();
+    assert_eq!(default_run("a").as_deref(), Some("a"));
+    assert_eq!(default_run("c"), None);
+
+    let misspelt = "[workspace]\nmembers = [\"c\"]\nresolver = \"3\"\n\n\
+                    [workspace.metadata.blaze.sandbox]\nunsandboxed-build-script = [\"c\"]\n";
+    let files = [("ws/Cargo.toml", misspelt), ("ws/c/Cargo.toml", c.as_str()), ("ws/c/build.rs", ""), ("ws/c/src/lib.rs", "")];
+    let error = failed(fixture.plan(fixture.open(&ask(&files))));
+    assert!(
+        error.starts_with("[workspace.metadata.blaze.sandbox] in /home/u/ws/Cargo.toml: `unsandboxed-build-script` is not known"),
+        "{error}"
+    );
+}
+
+// The load's warm path: a file query found, the plan found, and the plan of an unchanged build
+// in a new view verified, none allocating.
+#[test]
+fn a_warm_load_allocates_nothing() {
+    let fixture = Fixture::new();
+    let files = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "")];
+    let view = fixture.open(&ask(&files));
+    ready(fixture.plan(view));
+    let manifest = format!("{WS}/Cargo.toml");
+    let file = QueryKey { kind: LoadFile::KIND, input: LoadFile::input(&manifest) };
+    assert!(fixture.reached().contains(&file), "the plan read its manifest as a file query");
+
+    let pinned = fixture.db.pin();
+    assert!(blaze_alloc_count::assert_at_most(0, "a file query found", || pinned.get::<LoadFile>(view, &manifest).is_ok()));
+    assert!(blaze_alloc_count::assert_at_most(0, "the plan found", || pinned.get::<Plan>(view, &()).is_ok()));
+    drop(pinned);
+
+    let again = fixture.open(&ask(&files));
+    let pinned = fixture.db.pin();
+    assert!(blaze_alloc_count::assert_at_most(0, "an unchanged plan verified", || pinned.get::<Plan>(again, &()).is_ok()));
+    drop(pinned);
+    assert!(!fixture.ran::<Plan>(again, &()), "verified, not run again");
 }

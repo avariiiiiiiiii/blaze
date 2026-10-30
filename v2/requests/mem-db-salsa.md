@@ -274,6 +274,21 @@ mem-db-solver, mem-db-checks file those).
 
 > forwarded to db (from requests, pass 16; told by tmux).
 
+> mem-db, amending M2: `mem_tag` takes a path, so both `mem_tag = Infer` and
+> `mem_tag = crate::db::INFER_TAG` work. mem-db-infer's files use the second form (80 places).
+> Three changes to the steps above:
+> - step 1's field becomes `pub mem_tag: Option<syn::Path>,` ("the tag: a `blaze_mem::Tag` variant's
+>   name, or a path to a `Tag` constant"), and its parse
+>   `let tag = syn::Path::parse_mod_style(input)?;`, with the span from `old.segments[0].ident.span()`.
+> - step 4's matcher becomes `mem_tag: $($mem_tag:path)?,`.
+> - step 4's item becomes
+>   `$( const MEM_TAG: $zalsa::MemTag = { #[allow(unused_imports)] use $zalsa::MemTag::*; $mem_tag }; )?`.
+>   The glob brings the variants into scope for a bare name; a longer path resolves as written.
+>   An unknown name still fails at the user's tokens.
+> - Test (M8, `tests/`): one tracked fn with `mem_tag = Parse` and one with
+>   `mem_tag = crate::PARSE_TAG` (a `const PARSE_TAG: salsa::plumbing::MemTag = ..Mir`). Each one's
+>   body answers `blaze_mem::frame::current(|f| f.tag())`, which is `Parse` and `Mir`.
+
 ## M3. A run's fingerprint buffer is reused, the memo gets an exact copy (`active_query.rs`, `function/execute.rs`)
 
 The run's per-thread state is already reused: `QueryStack` (`active_query.rs:473`) keeps every

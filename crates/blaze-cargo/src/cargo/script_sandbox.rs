@@ -522,16 +522,7 @@ fn emptied(dir: &Path) -> bool {
 /// The per-user cache directory of macOS, `None` elsewhere.
 #[cfg(target_os = "macos")]
 fn user_cache() -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let mut buffer = [0u8; 1024];
-    // SAFETY: `buffer` is writable for its length.
-    let len = unsafe {
-        libc::confstr(libc::_CS_DARWIN_USER_CACHE_DIR, buffer.as_mut_ptr().cast(), buffer.len())
-    };
-    if len == 0 || len > buffer.len() {
-        return None;
-    }
-    let dir = PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..len - 1]));
+    let dir = PathBuf::from(crate::raw::system::user_cache_dir()?);
     Some(std::fs::canonicalize(&dir).unwrap_or(dir))
 }
 

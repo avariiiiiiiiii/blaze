@@ -59,8 +59,8 @@ arithmetic, not yet measured: this pass ran no benchmarks.
 | synthesize `.eh_frame_hdr` | 0.05 ms | near the bound (was 12 ms) | none |
 | synthesize `.symtab`/`.strtab` | 0.1 ms | serial, about 1 ms | `Class::Named` strings |
 | synthesize `.dynsym`/`.dynstr`/`.gnu.hash` | under 10 µs | at the bound | none |
-| debug sections | 0 | 3 ms parallel copy (was 30 ms) | request 19.2 |
-| relink one function | about 3 µs | 3 to 20 ms | request 19.5 (19.1 landed) |
+| debug sections | 0 | at the bound: no copy (was 30 ms) | 19.2 made |
+| relink one function | about 3 µs | O(changes) patched, plus one copy of each kept table (about 3 ms) | `Writer::synthesize` and `File::parts` own their bytes |
 
 **Parse.** About 24 MB is touched: the headers, symbol tables, string tables and relocations of
 the pulled members, plus the archive indexes. At 400 GB/s a socket that is 0.06 ms; the decoding
@@ -103,25 +103,54 @@ so layout does constant work for each region.
   the core) lets the writer fill both tables in parallel from prefix sums of the name lengths.
 - `.dynsym`/`.dynstr`/`.gnu.hash`: 400 imports and a few exports, under 10 µs.
 - Debug sections: 300 MB. The bound for the linker is zero: the bytes are already in the inputs
-  and in the store. They were one serial copy into the tail buffer (300 MB at 10 GB/s = 30 ms);
-  now `elf/image.rs` makes each debug section its own part, copied in parallel 1 MiB chunks
-  (300 MB ÷ 160 GB/s ≈ 2 ms), so the file layer skips an unchanged debug section on a relink.
-  Request 19.2 (`File::debug` naming input ranges the file layer writes or clones itself)
-  removes the copy.
+  and in the store. They were one serial copy into the tail buffer (300 MB at 10 GB/s = 30 ms),
+  then a parallel copy into a part each (about 2 ms). Now (19.2) `File::debug` names where each
+  of the core's sections goes, (offset, index into `Placed::debug`), and `elf/image.rs` copies
+  none: `file.rs` lays and diffs them from the state's shared `lists.debug`, and an unchanged
+  section is the same buffer, compared by address. `elf/tests.rs`
+  `the_debug_sections_are_the_cores_not_copies` checks the file's bytes against the core's and
+  that 1 MiB and 3 MiB of debug info allocate the same buffers, under 4 KiB apart.
 
 **Incremental relink of one changed function.** What changes: the body (about 1 KB), its FDE
 (about 40 bytes), its `.eh_frame_hdr` entry (8 bytes), its `.symtab` entry (24 bytes) and a few
 relocations and slid addresses, about 2 KB in at most five 4 KiB blocks. The bound is writing
-those: five block writes at 0.15 µs a call plus 0.4 µs of copying, about 3 µs. Today the writer
-regenerates every synthetic region from `Placed` (O(image), 3 to 20 ms). `file.rs` now diffs
-parts at the same offset by 4 KiB block as well as synthetic regions (19.1, landed), so a moved
-`.symtab` entry rewrites its block of the tail part, not the 20 MB part. What is left is 19.5,
-which gives `Placed` a `Delta` (the functions
-spliced, the rebase, GOT and bind changes, and which names and regions are unchanged) so the
-writer overwrites in place. `.symtab` order is free, so a moved function's entry is rewritten
-where it is; a removed `.eh_frame_hdr` entry becomes a copy of its predecessor and the new entry
-goes at the end before a re-sort of only the changed tail, so the table keeps its length and the
-binary search stays valid.
+those: five block writes at 0.15 µs a call plus 0.4 µs of copying, about 3 µs. `file.rs` diffs
+parts at the same offset by 4 KiB block as well as synthetic regions (19.1), so a moved
+`.symtab` entry rewrites its block of the tail part, not the 20 MB part. With 19.5 `Placed`
+carries a `Delta` (the functions, slid addresses, GOT cells and binds spliced, the address
+ranges the core wrote, whether regions and names are unchanged, and the synthesis it is from),
+and an incremental output's writer keeps its last `.rela.dyn`, `.eh_frame_hdr` and tail
+(`Elf::last`, each table with the synthesis it was made in) and patches them when the delta is
+from that synthesis, no region moved and the lists it reads were spliced at equal lengths.
+Every patched table is the one a build of the same `Placed` makes, which the tests check
+byte for byte against a fresh writer's build; where that can't be shown cheaply the table is
+built.
+- `.rela.dyn`: the `RELATIVE` run is kept in the order of `Placed::rebase` (only when the
+  addresses came sorted, so entry `i` is `rebase[i]`'s). A patch rewrites the entries of each
+  rebase splice and of each slid address whose 8 bytes a `written` range or a spliced local GOT
+  cell covers, two binary searches a range, and checks each splice is in order with its
+  neighbours, so a build would sort nothing. The binds and GOT cells (a few hundred) are built
+  as before and `.dynamic` with them.
+- `.eh_frame_hdr`: the table is kept when it came in address order, so it is sorted by FDE as
+  well. For each `written` range in `.eh_frame` the records are walked again with the build's
+  own `entry`/`walk`, from the last kept FDE before the range to the first record start past
+  it where a kept FDE starts (or the section's end or its zero length): the walk a build makes
+  from there. Its FDEs replace that span's, and the patch holds only when no CIE was written,
+  the FDEs start where they did (so the build's parallel splits stay record starts), the table
+  stays sorted, and every FDE a spliced function names is one of the table (checked once on
+  the build, in parallel, for every function, where the build splits at all).
+- `.symtab`/`.strtab`: per function the writer keeps its local's index, name offset and stored
+  name length. A functions splice whose functions keep their name presence and name lengths
+  rewrites only those locals and names in the kept tail; the exports, imports, `.shstrtab`
+  and section headers are written whole (O(globals + sections)); any change of layout (tail
+  offset, debug length, counts, name totals) builds the tail.
+
+So a one-function relink does O(splices + written + globals) work in the tables. What it
+still spends is one copy of each kept table into the bytes it returns (7.2 MB of `.rela.dyn`,
+1.7 MB of `.eh_frame_hdr` and about 21 MB of tail, 3 ms at 10 GB/s on one core, overlapped by
+the core's block diff), because `Writer::synthesize` returns owned `Vec<u8>`s and
+`File::parts` owns its bytes. Returning shared bytes (the core's `CowBytes`) would remove it;
+that is an interface change in `model.rs` for the core's owner.
 
 **Proof.** Each phase is timed on the workload above, a full link and a one-function edit, against
 the bound × 1.1 in the table; the relink is also measured in bytes written, against the 2 KB.
@@ -131,8 +160,9 @@ parallel `memcpy` into a mapped output; it has no incremental relink. wild is pa
 and incremental linking is its stated aim but is not done. lld builds `.eh_frame_hdr` serially
 from its own `.eh_frame` parse. The MSVC incremental linker patches in place by padding functions
 and calling through thunks, which changes the code; blaze patches without thunks, so the image is
-the one a full link produces. After 19.1, 19.2 and 19.5, blaze is at the bound everywhere above,
-which neither mold nor wild reaches on a relink.
+the one a full link produces. With 19.1, 19.2 and 19.5, blaze's relink patches its tables in
+O(change) (neither mold nor wild relinks incrementally); the copy of each kept table into the
+returned bytes is what keeps it off the bound.
 
 ## Mach-O writer and readers: `crates/blaze-link/src/macho.rs`, `macho/` (speed-link-edge-sol-link)
 
@@ -151,12 +181,12 @@ than made. Budgets are the bound × 1.1; the figures are arithmetic, not yet mea
 | resolve | 0.15 ms | near the bound | link.md item 7 |
 | layout of synthetic sizes | O(1) | at the bound | none |
 | export trie | under 10 µs for an executable | at the bound | none |
-| rebases and binds | 0.02 ms | serial opcodes, 0.3 ms | A2 (chained fixups) |
-| `__unwind_info` | 0.06 ms | serial, about 1 ms | A8 |
+| rebases and binds | 0.02 ms | serial opcodes, 0.3 ms; chained (A2 made) O(slots) | none |
+| `__unwind_info` | 0.06 ms | serial, about 1 ms; a relink patches it (19.5 made) | A8 |
 | symbol table | 0.1 ms | locals parallel; `String` names | link.md item 11 |
 | code signature | 3.2 ms (16 cores) | about 1.05 × the bound | none (A3 made) |
-| `__DWARF` | 0 | 30 ms serial copy | A5, 19.2 |
-| relink one function | about 15 µs | 5 to 40 ms | 19.1, 19.5, A4 |
+| `__DWARF` | 0 | at the bound: no copy | none (A5 made) |
+| relink one function | about 15 µs | O(changes) hashed and patched, plus one copy of `__LINKEDIT` | none (19.5, A4 made) |
 
 **Parse.** Objects and archives cost as in the ELF section, and the core's input copy is the same
 (19.3, 19.4). A `.tbd` is about 1 MB scanned at about a byte a cycle: 0.3 ms of one core. Its
@@ -173,14 +203,37 @@ documents are independent, so parsing them in parallel is 0.3 ms ÷ 16 ≈ 0.02 
   (`LC_DYLD_CHAINED_FIXUPS`, pointer format `DYLD_CHAINED_PTR_64_OFFSET`) there is no rebase table:
   each slot carries its own fixup and the next slot's distance, written with the slot by
   `Writer::encode`, and the only table is a 2-byte page start for each of 25,600 pages, 51 KB.
-  The core already lays and diffs encoded slots (`file.rs` `changed_slots`); A2 specifies the
-  Mach-O `encode`. Chained fixups need a deployment target of macOS 12 or later, and rustc's
-  defaults are 11.0 (arm64) and 10.12 (x86-64), so opcodes stay the default for those, as ld64
-  chooses, and both paths must be at the bound.
+  The core lays and diffs encoded slots (`file.rs` `changed_slots`), and `macho/chained.rs`
+  (A2) is the Mach-O `encode` and the `LC_DYLD_CHAINED_FIXUPS` table, with
+  `LC_DYLD_EXPORTS_TRIE` in place of `LC_DYLD_INFO_ONLY`. It is chosen as ld-prime chooses:
+  macOS 12, iOS, tvOS and Mac Catalyst 15, watchOS 8, DriverKit 21 and every visionOS; other
+  platforms and earlier targets keep the opcodes. rustc's defaults are 11.0 (arm64) and 10.12
+  (x86-64), and blaze's is 11.0, so the default bytes are unchanged and both paths must be at
+  the bound. Imports use `DYLD_CHAINED_IMPORT`, or `_ADDEND` when an addend doesn't fit the
+  pointer's signed byte; a slot not 8-aligned, outside `__DATA_CONST`/`__DATA` or both slid
+  and bound is an error. `macho/tests.rs` `chained_fixups_slide_and_bind_what_the_opcodes_do`
+  decodes the chains by hand (the workspace's `object`, 0.37, reads none) against the opcodes
+  of the same image at 11.0, and `a_bind_added_rewrites_two_slots` checks that a new bind
+  changes its slot and its predecessor's only.
 - `__unwind_info`: 200,000 functions, 800 KB of second-level entries: about 0.06 ms. It is a serial
   `.eh_frame` walk and a serial build today, about 1 ms. A8 moves the split parallel scan now in
   `elf/dynamic.rs` into the core's `unwind.rs` as one function both writers use, and builds the
-  second-level pages in parallel.
+  second-level pages in parallel. On a relink (19.5) `unwind::build_kept` keeps the last
+  table's columns, rows and pages (`unwind::Last`, moved out of the full build, no copy but
+  the table's bytes and the functions' addresses) and patches it for a `Delta` from its
+  synthesis: it reads again only the `__eh_frame` records and `__compact_unwind` entries
+  `written` overlaps, moves each changed FDE or entry in its column in place, and merges again
+  only from each changed address to the first unchanged entry after it. It rewrites the rows,
+  LSDA entries, pages (at most 4 KiB each) and first-level entries that changed, and the
+  sentinel. It builds whole when a row would come or go, a row gains or loses its LSDA, a page
+  would split differently, the common encodings or a personality change, a changed FDE or entry
+  is not alone at its address or leaves its place in its column, a CIE's encoding or a record's
+  length changes, a bind of a personality cell changes, or the last end shrinks. That is
+  O(splices + entries written + pages touched × 1,021 rows) plus one 800 KB copy (about 40 µs),
+  because `Writer::synthesize` returns owned bytes. `unwind.rs`'s tests hold each patch to
+  `build`'s bytes: a moved function, a moved LSDA and the last FDE grown; a delta from another
+  synthesis; an unequal splice; a lost row and a new LSDA; and random LSDA moves over the
+  seeded images.
 - Symbol table: 200,000 `nlist_64` of 16 bytes (3.2 MB) and 16 MB of names: about 0.1 ms
   memory-bound. The locals were one serial loop, 3 to 5 ms. Now `macho.rs` `locals_into` fills
   them in parallel, one task per 4,096 locals at offsets from prefix sums of the name lengths,
@@ -194,17 +247,37 @@ documents are independent, so parsing them in parallel is 0.3 ms ÷ 16 ≈ 0.02 
   (0.8 ms on 64 cores), budget 3.5 ms. `macho/sign.rs` hashes 64 pages a task in parallel, about
   1.05 × the bound. `macho.rs` copied the signature into one part per 4 KiB page so a relink
   rewrote only changed pages; now that `file.rs` diffs a part by block (19.1), the signature is
-  one part with the same relink writes and no allocation per page (A3).
-- `__DWARF`: the bound is zero for the reason given in the ELF section; today one 300 MB serial
-  copy, 30 ms. A5 drops the copy once 19.2 lands.
+  one part with the same relink writes and no allocation per page (A3). The pages hash the
+  chained slots laid over the regions (`sign::View::with_slots`).
+- `__DWARF`: the bound is zero for the reason given in the ELF section. It was one 300 MB serial
+  copy, 30 ms; now (A5) `image` lays the core's sections through `File::debug` at the same
+  offsets and the signature hashes them where they are. `macho/tests.rs`
+  `the_debug_sections_are_the_cores_not_copies` checks their bytes and that only the
+  signature's hashes grow with them.
 
 **Incremental relink of one changed function.** The ELF changes, plus the rebase or chained slot
 words on the changed pages and the signature: about 2 KB in a few pages, and two to three pages
 to rehash at 4 KiB ÷ 2 GB/s = 2 µs each, plus one code-directory slot each. The bound is about
-15 µs. Today the writer regenerates every synthetic region (5 to 40 ms, most of it the
-`__DWARF` copy and the serial symbol table), and the signature cache compares all 25,600 pages
-(about 0.5 ms). With 19.5's `Delta`, A4 rehashes only the pages written, and chained fixups make
-a moved function's fixups the slot words it already rewrites.
+15 µs. The writer regenerated every synthetic region (5 to 40 ms, most of it the `__DWARF` copy
+and the serial symbol table), and the signature cache compared all 25,600 pages (about 0.5 ms).
+Now, for an incremental output, `macho.rs` keeps its last tables (`Kept`) and uses them only for
+a `Delta::from` equal to the synthesis they are of (a rollback brings back a state they are not
+of), with the same regions:
+- The rebase and bind opcodes, the trie and the function starts are the kept bytes when their
+  lists have no splice (and, for binds and the trie, the names are the same).
+- The symbol table's locals are patched in place (`patch_locals`) for equal-length function
+  splices with names of the same length, local or not alike and still in order; otherwise it
+  is built again. `__unwind_info` is patched by `unwind::build_kept`.
+- The signature (A4) rehashes the pages that overlap the delta's `written` (which includes the
+  synthetic regions' changed blocks), the pages of chained slots that changed, and the debug
+  sections that aren't the same buffers. It compares only the headers' and `__LINKEDIT`'s
+  pages, which are all it keeps, and keeps every other hash.
+
+`the_signing_cache_writes_the_same_file` checks five relinks, at macOS 11 and 12, against an
+uncached writer, and `a_relink_patches_the_symbol_table_as_a_full_build_writes_it` that a patch
+keeps the kept buffer and gives a full build's bytes. What a relink still spends is copying
+`__LINKEDIT` into the part it returns and into `Kept`'s page store (tens of MB at 10 GB/s,
+about 2 ms), and diffing the kept chained slots (16 bytes a slot).
 
 **Proof.** As for ELF: each phase timed on the workload, a full link and a one-function edit,
 against the bound × 1.1, with the signature also timed alone on 25,600 pages against 3.5 ms on 16
@@ -217,9 +290,9 @@ with serial symbol tables. mold's Mach-O port (sold) is parallel throughout. Non
 function in O(change); after 19.1, 19.5, A2 and A4 blaze does, and A5, A6, A8 and link.md item 11 bring each
 full-link phase within 10% of its bound.
 
-**Filed, not made.** A2 (chained fixups) is a new output form with its own reader test, left to
-the holder of `macho.rs`'s fuzz work to make with a build. A4 and A5 wait on link.md items 19.5
-and 19.2, whose types core-model-next1 is adding; 19.1 has landed. A6 and A8 are in `v2/requests/requests-link-fuzz.md`.
+**Made, and filed.** 19.1, 19.2, 19.5, A2, A4 and A5 are made (requests-link-next-writers, not
+yet built: the lane made them without a build, so the tests above are written and not yet run).
+A6 and A8 are in `v2/requests/requests-link-fuzz.md`.
 
 ## The live runtime: `crates/blaze-live/` (speed-link-edge-sol-live)
 

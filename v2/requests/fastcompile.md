@@ -262,6 +262,8 @@ output, so it is no fallback.
 
 > forwarded to cargo: `crates/blaze-cargo/` is lane cargo's.
 
+> answered by lane cargo: being written first by cargo-inbox (plane.rs, daemon.rs, plan.rs); `blaze-history.workspace = true` added to `crates/blaze-cargo/Cargo.toml`.
+
 ## fastcompile-sched 3: codegen: PGO in the LLVM backend (`crates/blaze-codegen/src/settings.rs`, the LLVM backend)
 
 What: `settings::Spec` gets `pgo: Pgo` with `enum Pgo { None, Generate, Use(ContentId) }`,
@@ -741,6 +743,8 @@ sees it, and the store checks the hash again as it does for any remote.
 
 > forwarded to cargo.
 
+> answered by lane cargo: being written first; the build-script half by cargo-inbox-user (`serve/unit/script/global.rs`), the daemon half by cargo-inbox (`serve/daemon.rs`); its needs outside lane cargo are in cargo.md ("what fastcompile-global 3's build-script half needs").
+
 ## fastcompile-global 4: ci: the builders publish, and the cache serves (`.github/`, `crates/blaze-global/src/sign.rs` `PINNED`)
 
 What:
@@ -791,6 +795,21 @@ that limit.
 
 > forwarded to fastcompile: between its own children.
 
+> fastcompile-inproc-exec (2026-10-29): done, with no lock at all in place of the send lock:
+> `Attached::request_into` as asked, over a new shared object per launch (`blaze_inproc::ask`,
+> object 2 of the grant, handshake version 3). 64 slots of 4 KiB in shared memory; an asker
+> claims one (a compare-and-swap on a bitmap), writes its ask there, rings a doorbell (one byte
+> on the socket; an event on Windows) and sleeps on the slot's word (a futex that is not
+> private, `__ulock_wait` shared, the slot's event on Windows). Nothing frames on the channel
+> after the start, so there is no stream to share and no reader role. A signal handler inside
+> its thread's ask takes another slot; `errno` is kept. An ask or answer is at most
+> `ask::MOST_BODY` (4064) bytes; a longer answer than the buffer gives its length. Model-checked
+> in `ask/model.rs` (with a lock, a check-then-set claim and an uncompared sleep caught), tested
+> on Linux in `ask/tests.rs` (128 threads over 64 slots, a SIGUSR1 handler asking mid-ask).
+> `blaze_lazy::hook::fetch` uses it with a stack buffer of `MOST_BODY`. Not built or run here:
+> the lane's build and the harnesses come next. `crates/blaze-lazy/src/plan.rs`'s sentence on
+> this limit is stale (its owner's).
+
 ## fastcompile-lazy 2: fastcompile-inproc: split a run's channel into a reader and a shared sender (`crates/blaze-inproc/src/host.rs`, `Session`)
 
 What: `Session::split(&mut self) -> (Reader, Sender)`, where `Reader::recv(&mut self) -> Result<Frame<'_>, Error>`
@@ -811,6 +830,18 @@ compile workers send answers (`Answers::send(client, seq, kind, body)`) from oth
 > `Attached::slide()` and `Session.slide` replace the base (a process has a linked address at it
 > plus its slide), and stub and cell words are shared by every process, so they must not depend
 > on the slide (name code relative to the word).
+
+> fastcompile-inproc-exec (2026-10-29): done, in `blaze_inproc::ask`, since `blaze-lazy` builds
+> blaze-inproc without `host`: `Session::split(self) -> (ask::Reader, ask::Sender)` (by value,
+> so a second split can't happen; `Session.pid` stays and `Sender::pid` gives it too),
+> `Reader::recv` and `Sender::send(kind, seq, body)` as asked (`Sender` is `Clone + Send +
+> Sync`, and a send is lock-free: a compare-and-swap on the ask's slot, so a second or a stale
+> answer is an error), `Session::kill(why)` and `Sender::kill(why)`, the first `why` kept
+> (`Session::killed`). Kill is a pidfd on Linux, `TerminateProcess` on Windows, and on macOS
+> `kill` of the process ID, so only until the launcher reaps it. `blaze_lazy::runner::Runs` is
+> the `Answers` over senders (kills a run whose answer can't be sent, and every run on `stop`),
+> `Runner::serve(client, &mut reader)` reads one run's asks until it ends, and a `Failed`
+> reason is cut to fit a slot (the whole of it stays in `Runner::close`).
 
 ## fastcompile-lazy 3: link: lazy images (`crates/blaze-link/src/stage.rs`, `place.rs`, `lib.rs`)
 
@@ -1137,6 +1168,8 @@ promote and cancel; the daemon runs the work.
 
 > forwarded to cargo.
 
+> answered by lane cargo: being written first by cargo-jobs (`serve/job.rs` `impl Builder for Jobs`), with the `serve/daemon.rs` hook through cargo-inbox.
+
 ## fastcompile-inproc 1: link: commit a staged image into a code memory, an in-process image's layout, and patches from the channel (`crates/blaze-link/src/{lib.rs,commit.rs,output.rs,elf.rs,pe.rs,macho.rs}`, `crates/blaze-live/src/lib.rs`, both `Cargo.toml`s)
 
 What:
@@ -1397,6 +1430,8 @@ it)". This allows a lookup of one service, of the daemon's own, and nothing else
 
 > forwarded to the coordinator: it widens the macOS sandbox (one `mach-lookup`, of the daemon's own service), which sandbox-everything asks the coordinator to allow first. Once allowed, `requests` adds `services` to `Sandbox::On` (core is DONE; frontend-journal holds blaze-core while it runs) and cargo the profile line.
 
+> noted by lane cargo: superseded by inproc-exec 4 item 2; the profile line is usercode's `sandbox/macos.rs` once the coordinator allows the lookup.
+
 ## fastcompile-inproc-macos 3: coordinator: how `blaze-inproc-run` is signed on macOS (packaging, beside fastcompile-inproc 4)
 
 What: sign `blaze-inproc-run` ad hoc or with a Developer ID, without the hardened runtime
@@ -1483,6 +1518,8 @@ Why: the file is written once per content key and never for a patch; a patch is 
 code memory the run's code is.
 
 > forwarded to cargo (from requests, pass 17; told by tmux).
+
+> answered by lane cargo: cargo-inbox-exec writes items 1, 3, 4 and 5 now; item 2 waits on link's `Image::commit_into` and the reservations of `fastcompile-inproc-exec 1` item 3.
 
 ## fastcompile-inproc-exec 3: usercode: nothing to change in the queue; what `Program::command` now does (`crates/blaze-usercode/src/test/queue.rs`)
 
@@ -1643,10 +1680,10 @@ What:
 5. From `fastcompile-stencil-a64 1` and `2` below: `FrameRule::RaSignState(bool)` in
    `unwind.rs`, written as Cranelift's `systemv.rs` writes `Aarch64SetPointerAuth`
    (`ValExpression(Register(34), [DW_OP_lit0 | DW_OP_lit1])`), mapped from
-   `code::Rule::RaSignState`; and for an AArch64 `code::Unwind::Windows`, whose `info` is
-   the unwind codes only as `winarm64::UnwindInfo::emit` writes them, the `.xdata` header
-   built as for Cranelift's `UnwindInfo::WindowsArm64`. On x86-64, `info` is the final
-   `UNWIND_INFO`, already through `seh.rs`'s `with_saves` (`fastcompile-stencil-x64 1`):
+   `code::Rule::RaSignState`; and for `code::Unwind::WindowsArm64 { len, codes }` (AArch64 only:
+   the unwind codes as `winarm64::UnwindInfo::emit` writes them), the `.xdata` header built
+   as for Cranelift's `UnwindInfo::WindowsArm64`. `code::Unwind::Windows { len, info }` is
+   x86-64 only: `info` is the final `UNWIND_INFO`, already through `seh.rs`'s `with_saves` (`fastcompile-stencil-x64 1`):
    codegen takes it as-is and never runs `with_saves` on it again.
 5. Counting Cranelift code (`spec.counted` on a `Backend::Cranelift` unit, request 1 item 4):
    `compiled` runs `blaze_stencil::tier::instrument(&mut func)` on the IR before
@@ -1880,6 +1917,31 @@ publishes through the slots that exist.
 > told lane fastcompile (window `fastcompile`, by tmux): blaze-lazy's owner reports DONE.
 
 > forwarded to fastcompile (fastcompile-lazy's paths; told by tmux).
+
+> done: (fastcompile-inproc-exec, 2026-10-29; nothing built or run, per the brief) 1 as
+> asked: `blaze-stencil`, optional, in `daemon`. 2 and 3: `Compiler::tier_up` and
+> `Placer::{cells, replace}` (no defaults), with `replace`'s contract (publish in `slot`,
+> retire behind the fence) documented on the trait. 4: `Fetcher::retarget(id, target) -> bool`
+> changes only a `Ready` function (false for lazy, queued, compiling, failed or past the
+> session). 5: `Runner::start` takes `tier: Option<runner::TierUp { cells: CellView, policy,
+> config }>` rather than reading the backend, because `Session` doesn't know it; the daemon
+> passes it for a Stencil run. The memory is `runner::Cells(CellView)`. The recompile type
+> holds a `Weak<Shared>`, not an `Arc`: an `Arc` would be a cycle, since `Shared` owns the
+> tier runner. It does `tier_up`, then under the placer's lock `replace` and `cells(&f.key)`,
+> then `retarget` under the fetcher's lock, and errors (a tier `Failure`) on address 0 or
+> on code that was never published. `compile_and_place` reads `cells` under the same placer
+> lock as `place`. The bind comes after `fetcher.done` records the function `Ready` and
+> before the answers are sent, so a promotion can't retarget a compile still running. A
+> bind error goes to `Closed::unbound`. `Runner::remembered(id, tier) -> Result` applies at
+> once to a bound function and holds the tier until the first bind otherwise (an error for
+> an untiered run or an id past the session). `Runner::tier_stopped` is added for the
+> daemon's report. Close order: `close` and `Drop` take the tier runner out and close it
+> before stopping the lazy workers, since its recompiles use their placer and fetcher.
+> `Closed` gains `tier: Option<tier::Closed>` and `unbound`. Tests: in `tests/sim.rs`,
+> `only_published_code_is_retargeted`. In `tests/flight.rs`, a real `CodeMemory` cells view:
+> hot calls tier function 0 up, a remembered tier lands on function 2 at its first bind,
+> late asks get the new address, and close reports the tiers; a failed tier-up keeps the
+> first code and is reported as a tier failure; an untiered run refuses remembered tiers.
 
 ## fastcompile-stencil-tier 3: cargo: tiered dev and test runs (`crates/blaze-cargo/src/serve/unit/{run.rs,test.rs,codegen.rs}`, the daemon's start)
 
@@ -2518,5 +2580,71 @@ is nothing else to move. The only edit is a comment saying why:
 +/// running program.
  fn head(out: &mut Vec<u8>, kind: u32, lazy: u32, request: u64) {
 ```
+
+Status: open
+
+## dedyn: crates/blaze-intent: `Files` by type, not `&dyn Files` (user's call, 2026-10-29)
+
+`Edits::files` is asked once per file a request's edits read or move (`lib.rs:147`,
+`rename.rs:105`, `:471`, `:496`), through `&dyn Files`. Its implementations: the test's `View`
+and the daemon's view, still to be written; neither is blaze-intent's to name, so a generic. Code
+size: `apply` and `rename.rs` are compiled once per implementation, once in a release build
+(the daemon's), twice in blaze-intent's test build.
+
+- `lib.rs:66`: `pub(crate) struct Edits<'a> {` → `pub(crate) struct Edits<'a, F: Files + ?Sized> {`
+- `lib.rs:69`: `pub files: &'a dyn Files,` → `pub files: &'a F,`
+- `lib.rs:81`: `pub fn apply(db: &Db, files: &dyn Files, edits: &[Edit]) -> Result<Applied, ApiError> {`
+  → `pub fn apply<F: Files + ?Sized>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, ApiError> {`
+- `lib.rs:120`: `impl Edits<'_> {` → `impl<F: Files + ?Sized> Edits<'_, F> {`
+- `rename.rs:61`: `cx: &mut Edits<'_>` → `cx: &mut Edits<'_, impl Files + ?Sized>`; the same for
+  `rename.rs:245` (`classify`), `:270` (`classify_one`), `:385` (`record_expr_field`) with
+  `cx: &Edits<'_, impl Files + ?Sized>`, and `:459` (`moves`) with `&mut`. Add `Files` to
+  `rename.rs`'s `use crate::{.., Edits}`.
+
+Callers (`tests/rename.rs`, and the daemon's when written) pass `&view` as today.
+
+> forwarded to fastcompile (`crates/blaze-intent/`; told by tmux; requests, pass 22).
+
+## frontend-deps: dependency images through the global cache (frontend.md item 5; 2026-10-29)
+
+`hir_def::deps` (lane frontend-deps) keeps each dependency crate's def map, lang items and
+signatures as one image under a portable key: no absolute path, the package directory and
+`OUT_DIR` written as markers. Two checkouts of the same crates at different paths have the
+same keys (test `keys_hold_no_path_of_the_checkout`), so an image made on one machine can be
+served on another. On hir-def's side the read-through is written:
+`hir_def::deps::ReadThrough { local, global }` is an `ImageStore` that asks `local`, then
+`global`, and puts what `global` gave into `local`. Puts and `reads_now` go to `local`. Asked
+of you, in `blaze-global`:
+
+1. **A public proof for an image's keys** (`public.rs`, beside `QueryMade`/`RunMade`). A key
+   `K` (`hir_def::deps::keys`) is public when every crate it covers is public: the crate and
+   each crate in its dependency closure is `Origin::CratesIo` or `Origin::Toolchain`, its
+   `build` is the blaze build's code identity, and its `OUT_DIR` is `Origin::Outputs`. Keys
+   derived from `K` are public under two conditions: the slots (`reads::slot(K, n)`) must hold
+   names that are all public, and the image (`reads::image_key(K, record, values)`) must have
+   such a record. A name is public when it is a file or listing under a public root, or a
+   variable in `Rule::public_env`.
+   hir-def can't be a dependency of `blaze-global`, so the key can't be made again inside
+   the rule. Say which form you want, and frontend-deps exposes it:
+   - (a) `hir_def::deps::KeyInputs` (the crate closure's origins in key order, the `build`,
+     the reads' names), made by the same walk as the key, which the driver passes to your
+     rule;
+   - (b) a `&dyn Fn(&KeyInputs) -> ContentId` your rule calls to make the key again.
+2. **An `ImageStore` over the client** for the driver (lane cargo wires it):
+   - `get`: when `key` has a `Public`, run `Client::fetch` into the local store and wait for
+     its completion, then read it with `Reader::pinned`. A key with no proof is `Ok(None)`
+     without asking the network.
+   - `put`: publish through `Client::publish` when the key has a proof and the builder is a
+     publisher. Otherwise it is a no-op `Ok(())`, since the local store already kept the
+     image.
+   - `reads_now` is never called on it (`ReadThrough` asks `local`); return an `Err` naming
+     that.
+
+   The bytes are verified by the local store as any fetched value is. A fetch that fails is
+   an `Err` (the build's error), never a quiet miss.
+
+Why: frontend.md item 5 says signatures are read "from the store or the global cache". With
+this, the first build of a crates.io dependency on a new machine reads its def map and
+signatures from the cache instead of parsing it.
 
 Status: open

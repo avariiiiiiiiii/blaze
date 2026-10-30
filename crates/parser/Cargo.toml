@@ -13,6 +13,7 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-phf.workspace = true
 ra-ap-rustc_lexer.workspace = true
@@ -26,7 +27,6 @@ winnow = { version = "0.7.13", default-features = false }
 expect-test = "1.5.1"
 
 blaze-alloc-count.workspace = true
-blaze-ids.workspace = true
 stdx.workspace = true
 
 [features]

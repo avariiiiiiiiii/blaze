@@ -7,13 +7,17 @@ use cfg::CfgExpr;
 use parser::T;
 use smallvec::SmallVec;
 use syntax::{
-    AstNode, PreorderWithTokens, SyntaxElement, SyntaxNode, SyntaxToken, WalkEvent,
+    AstNode, NodeOrToken, PreorderWithTokens, SyntaxElement, SyntaxNode, SyntaxToken, WalkEvent,
     ast::{self, HasAttrs},
+    view::{self, AstNode as _, HasAttrs as _},
 };
 use syntax_bridge::DocCommentDesugarMode;
 
 use crate::{
-    attrs::{AttrId, expand_cfg_attr, is_item_tree_filtered_attr, with_one_segment},
+    attrs::{
+        AttrId, expand_cfg_attr, expand_view_cfg_attr, is_item_tree_filtered_attr,
+        with_one_segment, with_one_segment_view,
+    },
     fixup::{self, SyntaxFixupUndoInfo},
     span_map::{InOrder, SpanMap},
     tt::{self, DelimSpan, Span},
@@ -27,9 +31,10 @@ const KEEP: (bool, Vec<tt::Leaf>) = (true, Vec::new());
 // alloc: none, an empty `Vec`
 const SKIP: (bool, Vec<tt::Leaf>) = (false, Vec::new());
 
+/// An attribute `cfg_attr` leaves: where its text is.
 #[derive(Debug)]
 struct ExpandedAttrToProcess {
-    attr: ast::Meta,
+    range: TextRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,259 +55,294 @@ struct AstAttrToProcess {
     excl_span: Option<Span>,
 }
 
-fn macro_input_callback(
-    db: &Db,
-    is_derive: bool,
-    censor_item_tree_attr_ids: &[AttrId],
-    krate: Crate,
-    default_span: Span,
-    span_map: SpanMap<'_>,
-) -> impl FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Vec<tt::Leaf>) {
-    let cfg_options = OnceCell::new();
-    let cfg_options = move || *cfg_options.get_or_init(|| krate.cfg_options(db));
+/// The callback that strips `cfg`s and censored attributes from an attribute or derive macro's
+/// input, written once for both trees: [`macro_input_callback`] over views (every build's
+/// input), [`macro_input_callback_handle`] over the handles of an edited tree
+/// (`expand_speculative`, IDE only).
+macro_rules! macro_input_callback_impl {
+    (
+        $name:ident, $Preorder:ty, $Element:ty, $Token:ty, $ast:ident,
+        $expand_cfg_attr:path, $parse_cfg:path, $with_one_segment:path
+    ) => {
+        #[allow(clippy::clone_on_copy, reason = "a view is `Copy`, a handle is not: one body for both")]
+        fn $name(
+            db: &Db,
+            is_derive: bool,
+            censor_item_tree_attr_ids: &[AttrId],
+            krate: Crate,
+            default_span: Span,
+            span_map: SpanMap<'_>,
+        ) -> impl FnMut(&mut $Preorder, &WalkEvent<$Element>) -> (bool, Vec<tt::Leaf>) {
+            let cfg_options = OnceCell::new();
+            let cfg_options = move || *cfg_options.get_or_init(|| krate.cfg_options(db));
 
-    let mut should_strip_attr = {
-        let mut item_tree_attr_id = 0;
-        let mut censor_item_tree_attr_ids_index = 0;
-        move || {
-            let mut result = false;
-            if let Some(&next_censor_attr_id) =
-                censor_item_tree_attr_ids.get(censor_item_tree_attr_ids_index)
-                && next_censor_attr_id.item_tree_index() == item_tree_attr_id
-            {
-                censor_item_tree_attr_ids_index += 1;
-                result = true;
-            }
-            item_tree_attr_id += 1;
-            result
-        }
-    };
-
-    // alloc: one list per input, reused for every node with attributes
-    let mut attrs = Vec::new();
-    let mut attrs_idx = 0;
-    let mut has_inner_attrs_owner = false;
-    let mut in_attr = false;
-    let mut done_with_attrs = false;
-    let mut did_top_attrs = false;
-    move |preorder, event| {
-        match event {
-            WalkEvent::Enter(SyntaxElement::Node(node)) => {
-                if done_with_attrs {
-                    return KEEP;
-                }
-
-                if ast::Attr::can_cast(node.kind()) {
-                    in_attr = true;
-                    let node_range = node.text_range();
-                    while attrs
-                        .get(attrs_idx)
-                        .is_some_and(|it: &AstAttrToProcess| it.range != node_range)
+            let mut should_strip_attr = {
+                let mut item_tree_attr_id = 0;
+                let mut censor_item_tree_attr_ids_index = 0;
+                move || {
+                    let mut result = false;
+                    if let Some(&next_censor_attr_id) =
+                        censor_item_tree_attr_ids.get(censor_item_tree_attr_ids_index)
+                        && next_censor_attr_id.item_tree_index() == item_tree_attr_id
                     {
-                        attrs_idx += 1;
+                        censor_item_tree_attr_ids_index += 1;
+                        result = true;
                     }
-                } else if !in_attr && let Some(has_attrs) = ast::AnyHasAttrs::cast(node.clone()) { // clone: a node handle, a non-atomic count
-                    // Attributes of the form `key = value` have `ast::Expr` in them, which returns `Some` for
-                    // `AnyHasAttrs::cast()`, so we also need to check `in_attr`.
-
-                    if has_inner_attrs_owner {
-                        has_inner_attrs_owner = false;
-                        return KEEP;
-                    }
-
-                    if did_top_attrs && !is_derive {
-                        // Derives need all attributes handled, but attribute macros need only the top attributes handled.
-                        done_with_attrs = true;
-                        return KEEP;
-                    }
-                    did_top_attrs = true;
-
-                    if let Some(inner_attrs_node) = has_attrs.inner_attributes_node()
-                        && inner_attrs_node != *node
-                    {
-                        has_inner_attrs_owner = true;
-                    }
-
-                    let node_attrs = ast::attrs_including_inner(&has_attrs);
-
-                    attrs.clear();
-                    // clone: an iterator of node handles
-                    node_attrs.clone().for_each(|attr| {
-                        let span_for = |token: Option<SyntaxToken>| {
-                            token
-                                .map(|token| span_map.span_for_range(token.text_range()))
-                                .unwrap_or(default_span)
-                        };
-                        attrs.push(AstAttrToProcess {
-                            range: attr.syntax().text_range(),
-                            pound_span: span_for(attr.pound_token()),
-                            brackets_span: DelimSpan {
-                                open: span_for(attr.l_brack_token()),
-                                close: span_for(attr.r_brack_token()),
-                            },
-                            excl_span: attr
-                                .excl_token()
-                                .map(|token| span_map.span_for_range(token.text_range())),
-                            expanded_attrs: SmallVec::new(),
-                            expanded_attrs_idx: 0,
-                            next_expanded_attr: NextExpandedAttrState::NotStarted,
-                        });
-                    });
-
-                    attrs_idx = 0;
-                    let strip_current_item =
-                        expand_cfg_attr(node_attrs, &cfg_options, |attr, top_attr| {
-                            // Find the attr.
-                            while attrs[attrs_idx].range != top_attr.syntax().text_range() {
-                                attrs_idx += 1;
-                            }
-
-                            let mut strip_current_attr = false;
-                            match &attr {
-                                ast::Meta::CfgMeta(attr) => {
-                                    if let Some(cfg_predicate) = attr.cfg_predicate() {
-                                        let cfg_expr = CfgExpr::parse_from_ast(cfg_predicate);
-                                        if cfg_options().check(&cfg_expr) == Some(false) {
-                                            return ControlFlow::Break(ItemIsCfgedOut);
-                                        }
-                                        strip_current_attr = true;
-                                    }
-                                }
-                                _ => {
-                                    if attr.path().and_then(|path| {
-                                        with_one_segment(&path, is_item_tree_filtered_attr)
-                                    }) != Some(true)
-                                    {
-                                        strip_current_attr = should_strip_attr();
-                                    }
-                                }
-                            }
-
-                            if !strip_current_attr {
-                                attrs[attrs_idx]
-                                    .expanded_attrs
-                                    .push(ExpandedAttrToProcess { attr });
-                            }
-
-                            ControlFlow::Continue(())
-                        });
-                    attrs_idx = 0;
-
-                    if strip_current_item.is_some() {
-                        preorder.skip_subtree();
-                        attrs.clear();
-
-                        'eat_comma: {
-                            // If there is a comma after this node, eat it too.
-                            let mut events_until_comma = 0;
-                            // clone: a cursor, for a cfg'd-out item only
-                            for event in preorder.clone() {
-                                match event {
-                                    WalkEvent::Enter(SyntaxElement::Node(_))
-                                    | WalkEvent::Leave(_) => {}
-                                    WalkEvent::Enter(SyntaxElement::Token(token)) => {
-                                        let kind = token.kind();
-                                        if kind == T![,] {
-                                            break;
-                                        } else if !kind.is_trivia() {
-                                            break 'eat_comma;
-                                        }
-                                    }
-                                }
-                                events_until_comma += 1;
-                            }
-                            preorder.nth(events_until_comma);
-                        }
-
-                        return SKIP;
-                    }
+                    item_tree_attr_id += 1;
+                    result
                 }
-            }
-            WalkEvent::Leave(SyntaxElement::Node(node)) => {
-                if ast::Attr::can_cast(node.kind()) {
-                    in_attr = false;
-                    attrs_idx += 1;
-                }
-            }
-            WalkEvent::Enter(SyntaxElement::Token(token)) => {
-                if !in_attr {
-                    return KEEP;
-                }
+            };
 
-                let Some(ast_attr) = attrs.get_mut(attrs_idx) else {
-                    return KEEP;
-                };
-                let token_range = token.text_range();
-                let Some(expanded_attr) = ast_attr.expanded_attrs.get(ast_attr.expanded_attrs_idx)
-                else {
-                    // No expanded attributes in this `ast::Attr`, or we finished them all already, either way
-                    // the remaining tokens should be discarded.
-                    return SKIP;
-                };
-                match ast_attr.next_expanded_attr {
-                    NextExpandedAttrState::NotStarted => {
-                        if token_range.start() >= expanded_attr.attr.syntax().text_range().start() {
-                            // We started the next attribute.
-                            let mut insert_tokens = Vec::with_capacity(3);
-                            insert_tokens.push(tt::Leaf::Punct(tt::Punct {
-                                char: '#',
-                                spacing: tt::Spacing::Alone,
-                                span: ast_attr.pound_span,
-                            }));
-                            if let Some(span) = ast_attr.excl_span {
-                                insert_tokens.push(tt::Leaf::Punct(tt::Punct {
-                                    char: '!',
-                                    spacing: tt::Spacing::Alone,
-                                    span,
-                                }));
-                            }
-                            insert_tokens.push(tt::Leaf::Punct(tt::Punct {
-                                char: '[',
-                                spacing: tt::Spacing::Alone,
-                                span: ast_attr.brackets_span.open,
-                            }));
-
-                            ast_attr.next_expanded_attr = NextExpandedAttrState::InTheMiddle;
-
-                            return (true, insert_tokens);
-                        } else {
-                            // Before any attribute or between the attributes.
-                            return SKIP;
-                        }
-                    }
-                    NextExpandedAttrState::InTheMiddle => {
-                        if token_range.start() >= expanded_attr.attr.syntax().text_range().end() {
-                            // Finished the current attribute.
-                            // alloc: the `]` after an expanded attribute: the bridge's callback takes a `Vec`
-                            let insert_tokens = vec![tt::Leaf::Punct(tt::Punct {
-                                char: ']',
-                                spacing: tt::Spacing::Alone,
-                                span: ast_attr.brackets_span.close,
-                            })];
-
-                            ast_attr.next_expanded_attr = NextExpandedAttrState::NotStarted;
-                            ast_attr.expanded_attrs_idx += 1;
-
-                            // It's safe to ignore the current token because between attributes
-                            // there is always at least one token we skip - either the closing bracket
-                            // in `#[]` or the comma in case of multiple attrs in `cfg_attr` expansion.
-                            return (false, insert_tokens);
-                        } else {
-                            // Still in the middle.
+            // alloc: one list per input, reused for every node with attributes
+            let mut attrs = Vec::new();
+            let mut attrs_idx = 0;
+            let mut has_inner_attrs_owner = false;
+            let mut in_attr = false;
+            let mut done_with_attrs = false;
+            let mut did_top_attrs = false;
+            move |preorder, event| {
+                match event {
+                    WalkEvent::Enter(NodeOrToken::Node(node)) => {
+                        if done_with_attrs {
                             return KEEP;
                         }
+
+                        if ast::Attr::can_cast(node.kind()) {
+                            in_attr = true;
+                            let node_range = node.text_range();
+                            while attrs
+                                .get(attrs_idx)
+                                .is_some_and(|it: &AstAttrToProcess| it.range != node_range)
+                            {
+                                attrs_idx += 1;
+                            }
+                        } else if !in_attr && let Some(has_attrs) = $ast::AnyHasAttrs::cast(node.clone()) { // clone: a node handle, a non-atomic count; a view's copy
+                            // Attributes of the form `key = value` have `ast::Expr` in them, which returns `Some` for
+                            // `AnyHasAttrs::cast()`, so we also need to check `in_attr`.
+
+                            if has_inner_attrs_owner {
+                                has_inner_attrs_owner = false;
+                                return KEEP;
+                            }
+
+                            if did_top_attrs && !is_derive {
+                                // Derives need all attributes handled, but attribute macros need only the top attributes handled.
+                                done_with_attrs = true;
+                                return KEEP;
+                            }
+                            did_top_attrs = true;
+
+                            if let Some(inner_attrs_node) = has_attrs.inner_attributes_node()
+                                && inner_attrs_node != *node
+                            {
+                                has_inner_attrs_owner = true;
+                            }
+
+                            let node_attrs = $ast::attrs_including_inner(&has_attrs);
+
+                            attrs.clear();
+                            // clone: an iterator of node handles
+                            node_attrs.clone().for_each(|attr| {
+                                let span_for = |token: Option<$Token>| {
+                                    token
+                                        .map(|token| span_map.span_for_range(token.text_range()))
+                                        .unwrap_or(default_span)
+                                };
+                                attrs.push(AstAttrToProcess {
+                                    range: attr.syntax().text_range(),
+                                    pound_span: span_for(attr.pound_token()),
+                                    brackets_span: DelimSpan {
+                                        open: span_for(attr.l_brack_token()),
+                                        close: span_for(attr.r_brack_token()),
+                                    },
+                                    excl_span: attr
+                                        .excl_token()
+                                        .map(|token| span_map.span_for_range(token.text_range())),
+                                    expanded_attrs: SmallVec::new(),
+                                    expanded_attrs_idx: 0,
+                                    next_expanded_attr: NextExpandedAttrState::NotStarted,
+                                });
+                            });
+
+                            attrs_idx = 0;
+                            let strip_current_item =
+                                $expand_cfg_attr(node_attrs, &cfg_options, |attr, top_attr| {
+                                    // Find the attr.
+                                    while attrs[attrs_idx].range != top_attr.syntax().text_range() {
+                                        attrs_idx += 1;
+                                    }
+
+                                    let mut strip_current_attr = false;
+                                    match &attr {
+                                        $ast::Meta::CfgMeta(attr) => {
+                                            if let Some(cfg_predicate) = attr.cfg_predicate() {
+                                                let cfg_expr = $parse_cfg(cfg_predicate);
+                                                if cfg_options().check(&cfg_expr) == Some(false) {
+                                                    return ControlFlow::Break(ItemIsCfgedOut);
+                                                }
+                                                strip_current_attr = true;
+                                            }
+                                        }
+                                        _ => {
+                                            if attr.path().and_then(|path| {
+                                                $with_one_segment(&path, is_item_tree_filtered_attr)
+                                            }) != Some(true)
+                                            {
+                                                strip_current_attr = should_strip_attr();
+                                            }
+                                        }
+                                    }
+
+                                    if !strip_current_attr {
+                                        attrs[attrs_idx]
+                                            .expanded_attrs
+                                            .push(ExpandedAttrToProcess { range: attr.syntax().text_range() });
+                                    }
+
+                                    ControlFlow::Continue(())
+                                });
+                            attrs_idx = 0;
+
+                            if strip_current_item.is_some() {
+                                preorder.skip_subtree();
+                                attrs.clear();
+
+                                'eat_comma: {
+                                    // If there is a comma after this node, eat it too.
+                                    let mut events_until_comma = 0;
+                                    // clone: a cursor, for a cfg'd-out item only
+                                    for event in preorder.clone() {
+                                        match event {
+                                            WalkEvent::Enter(NodeOrToken::Node(_))
+                                            | WalkEvent::Leave(_) => {}
+                                            WalkEvent::Enter(NodeOrToken::Token(token)) => {
+                                                let kind = token.kind();
+                                                if kind == T![,] {
+                                                    break;
+                                                } else if !kind.is_trivia() {
+                                                    break 'eat_comma;
+                                                }
+                                            }
+                                        }
+                                        events_until_comma += 1;
+                                    }
+                                    preorder.nth(events_until_comma);
+                                }
+
+                                return SKIP;
+                            }
+                        }
                     }
+                    WalkEvent::Leave(NodeOrToken::Node(node)) => {
+                        if ast::Attr::can_cast(node.kind()) {
+                            in_attr = false;
+                            attrs_idx += 1;
+                        }
+                    }
+                    WalkEvent::Enter(NodeOrToken::Token(token)) => {
+                        if !in_attr {
+                            return KEEP;
+                        }
+
+                        let Some(ast_attr) = attrs.get_mut(attrs_idx) else {
+                            return KEEP;
+                        };
+                        let token_range = token.text_range();
+                        let Some(expanded_attr) = ast_attr.expanded_attrs.get(ast_attr.expanded_attrs_idx)
+                        else {
+                            // No expanded attributes in this `ast::Attr`, or we finished them all already, either way
+                            // the remaining tokens should be discarded.
+                            return SKIP;
+                        };
+                        match ast_attr.next_expanded_attr {
+                            NextExpandedAttrState::NotStarted => {
+                                if token_range.start() >= expanded_attr.range.start() {
+                                    // We started the next attribute.
+                                    let mut insert_tokens = Vec::with_capacity(3);
+                                    insert_tokens.push(tt::Leaf::Punct(tt::Punct {
+                                        char: '#',
+                                        spacing: tt::Spacing::Alone,
+                                        span: ast_attr.pound_span,
+                                    }));
+                                    if let Some(span) = ast_attr.excl_span {
+                                        insert_tokens.push(tt::Leaf::Punct(tt::Punct {
+                                            char: '!',
+                                            spacing: tt::Spacing::Alone,
+                                            span,
+                                        }));
+                                    }
+                                    insert_tokens.push(tt::Leaf::Punct(tt::Punct {
+                                        char: '[',
+                                        spacing: tt::Spacing::Alone,
+                                        span: ast_attr.brackets_span.open,
+                                    }));
+
+                                    ast_attr.next_expanded_attr = NextExpandedAttrState::InTheMiddle;
+
+                                    return (true, insert_tokens);
+                                } else {
+                                    // Before any attribute or between the attributes.
+                                    return SKIP;
+                                }
+                            }
+                            NextExpandedAttrState::InTheMiddle => {
+                                if token_range.start() >= expanded_attr.range.end() {
+                                    // Finished the current attribute.
+                                    // alloc: the `]` after an expanded attribute: the bridge's callback takes a `Vec`
+                                    let insert_tokens = vec![tt::Leaf::Punct(tt::Punct {
+                                        char: ']',
+                                        spacing: tt::Spacing::Alone,
+                                        span: ast_attr.brackets_span.close,
+                                    })];
+
+                                    ast_attr.next_expanded_attr = NextExpandedAttrState::NotStarted;
+                                    ast_attr.expanded_attrs_idx += 1;
+
+                                    // It's safe to ignore the current token because between attributes
+                                    // there is always at least one token we skip - either the closing bracket
+                                    // in `#[]` or the comma in case of multiple attrs in `cfg_attr` expansion.
+                                    return (false, insert_tokens);
+                                } else {
+                                    // Still in the middle.
+                                    return KEEP;
+                                }
+                            }
+                        }
+                    }
+                    WalkEvent::Leave(NodeOrToken::Token(_)) => {}
                 }
+                KEEP
             }
-            WalkEvent::Leave(SyntaxElement::Token(_)) => {}
         }
-        KEEP
-    }
+    };
 }
 
+macro_input_callback_impl!(
+    macro_input_callback,
+    view::PreorderWithTokens<'_>,
+    view::Element<'_>,
+    view::Token<'_>,
+    view,
+    expand_view_cfg_attr,
+    CfgExpr::parse_from_view,
+    with_one_segment_view
+);
+macro_input_callback_impl!(
+    macro_input_callback_handle,
+    PreorderWithTokens,
+    SyntaxElement,
+    SyntaxToken,
+    ast,
+    expand_cfg_attr,
+    CfgExpr::parse_from_ast,
+    with_one_segment
+);
+
+/// An attribute or derive macro's input, read from a view of the item: `cfg`s and the attributes
+/// `censor_item_tree_attr_ids` names stripped, and syntax errors fixed up when `fix_errors`.
 pub(crate) fn attr_macro_input_to_token_tree(
     db: &Db,
-    node: &SyntaxNode,
+    node: view::Node<'_>,
     span_map: SpanMap<'_>,
     span: Span,
     is_derive: bool,
@@ -316,7 +356,7 @@ pub(crate) fn attr_macro_input_to_token_tree(
         fixup::SyntaxFixups::default()
     };
     (
-        syntax_bridge::syntax_node_to_token_tree_modified(
+        syntax_bridge::call_input_modified(
             node,
             InOrder::new(span_map),
             fixups.append,
@@ -324,6 +364,44 @@ pub(crate) fn attr_macro_input_to_token_tree(
             span,
             DocCommentDesugarMode::ProcMacro,
             macro_input_callback(db, is_derive, censor_item_tree_attr_ids, krate, span, span_map),
+        ),
+        fixups.undo_info,
+    )
+}
+
+/// [`attr_macro_input_to_token_tree`] of an edited tree's handle (`expand_speculative`), which
+/// no view reads.
+pub(crate) fn attr_macro_input_to_token_tree_handle(
+    db: &Db,
+    node: &SyntaxNode,
+    span_map: SpanMap<'_>,
+    span: Span,
+    is_derive: bool,
+    censor_item_tree_attr_ids: &[AttrId],
+    krate: Crate,
+    fix_errors: bool,
+) -> (tt::TopSubtree, SyntaxFixupUndoInfo) {
+    let fixups = if fix_errors {
+        fixup::fixup_syntax_handle(span_map, node, span, DocCommentDesugarMode::ProcMacro)
+    } else {
+        fixup::SyntaxFixups::default()
+    };
+    (
+        syntax_bridge::syntax_node_to_token_tree_modified(
+            node,
+            InOrder::new(span_map),
+            fixups.append,
+            fixups.remove,
+            span,
+            DocCommentDesugarMode::ProcMacro,
+            macro_input_callback_handle(
+                db,
+                is_derive,
+                censor_item_tree_attr_ids,
+                krate,
+                span,
+                span_map,
+            ),
         ),
         fixups.undo_info,
     )

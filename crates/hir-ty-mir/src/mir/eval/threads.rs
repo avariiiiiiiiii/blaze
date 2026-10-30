@@ -516,6 +516,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let running = self.thread;
             return Ok(self.machine.schedule(running, &runnable)?);
         }
+        // A scan, not a timing wheel: a few interpreted threads, and the order (deadline,
+        // then how long blocked, then index) is the schedule's, which must stay exact.
         let timed = self
             .threads
             .iter()

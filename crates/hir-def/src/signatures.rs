@@ -4,6 +4,7 @@ use std::cell::LazyCell;
 
 use base_db::{Db, EditionedFileId};
 use bitflags::bitflags;
+use blaze_ids::bits::Bits;
 use cfg::{CfgExpr, CfgOptions};
 use hir_expand::{
     AstId, HirFileId, InFile, Intern, Lookup,
@@ -13,7 +14,7 @@ use hir_expand::{
 use intern::{Symbol, sym};
 use la_arena::{Arena, Idx};
 use rustc_abi::{ExternAbi, IntegerType, ReprOptions};
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use span::{AstIdMap, AstIdNode, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
     AstNode, FlatTree, SyntaxKind, SyntaxNode, SyntaxNodePtr, T, TextRange,
@@ -1873,33 +1874,10 @@ pub struct EnumVariants {
 
 /// One bit per variant, by index, kept inline up to 64 variants: no allocation for almost
 /// every enum. Bits past the last variant are zero, so equal sets are equal words.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct VariantBits(SmallVec<[u64; 1]>);
+type VariantBits = Bits<SmallVec<[u64; 1]>>;
 
 // The inline word and its length, or a heap pointer and its length, plus the capacity.
 const _: () = assert!(size_of::<VariantBits>() == 24);
-
-impl VariantBits {
-    /// `len` bits, all clear.
-    fn with_len(len: usize) -> VariantBits {
-        VariantBits(smallvec![0; len.div_ceil(64)]) // alloc: inline up to 64 variants
-    }
-
-    fn get(&self, index: usize) -> bool {
-        (self.0[index / 64] >> (index % 64)) & 1 == 1
-    }
-
-    fn set(&mut self, index: usize, value: bool) {
-        let (word, bit) = (&mut self.0[index / 64], index % 64);
-        *word = (*word & !(1 << bit)) | (u64::from(value) << bit);
-    }
-
-    /// Keeps the words of the first `len` bits, the rest being clear.
-    fn truncate(&mut self, len: usize) {
-        self.0.truncate(len.div_ceil(64));
-        self.0.shrink_to_fit();
-    }
-}
 
 // The order of the variants is part of the enum: discriminants and layout follow it. Two
 // `IndexMap`s with the same entries are equal whatever their order.
@@ -1951,7 +1929,7 @@ impl EnumVariants {
         };
         let count = list.variants().count();
         let mut variants = FxIndexMap::with_capacity_and_hasher(count, Default::default());
-        let mut explicit_discriminant = VariantBits::with_len(count);
+        let mut explicit_discriminant = VariantBits::new(count); // alloc: inline up to 64 variants
         for variant in list.variants() {
             let ast_id = ast_id_map.ast_id(&variant);
             match AttrFlags::is_cfg_enabled_for(&variant, cfg_options) {
@@ -1980,6 +1958,7 @@ impl EnumVariants {
         if variants.len() < count {
             variants.shrink_to_fit();
             explicit_discriminant.truncate(variants.len());
+            explicit_discriminant.shrink_to_fit();
         }
         diagnostics.shrink_to_fit();
 
@@ -1992,7 +1971,7 @@ impl EnumVariants {
         variants: FxIndexMap<Name, (EnumVariantId, FieldsShape)>,
         explicit: &[bool],
     ) -> EnumVariants {
-        let mut explicit_discriminant = VariantBits::with_len(variants.len());
+        let mut explicit_discriminant = VariantBits::new(variants.len()); // alloc: inline up to 64 variants
         for (index, &it) in explicit.iter().enumerate() {
             explicit_discriminant.set(index, it);
         }
@@ -2007,7 +1986,7 @@ impl EnumVariants {
         self.variants
             .values()
             .position(|&(it, _)| it == variant)
-            .is_some_and(|index| self.explicit_discriminant.get(index))
+            .is_some_and(|index| self.explicit_discriminant.contains(index))
     }
 
     /// Each variant with whether it is written with an explicit discriminant.
@@ -2017,7 +1996,7 @@ impl EnumVariants {
         self.variants
             .values()
             .enumerate()
-            .map(|(index, &(id, shape))| (id, shape, self.explicit_discriminant.get(index)))
+            .map(|(index, &(id, shape))| (id, shape, self.explicit_discriminant.contains(index)))
     }
 
     pub fn variant(&self, name: &Name) -> Option<EnumVariantId> {
@@ -2341,7 +2320,7 @@ struct Q(pub u8, u8);
             // Only the first `kept` are ever set, as only the variants kept get a bit.
             let kept = if len == 0 { 0 } else { rng.index(len + 1) };
             let mut model = vec![false; kept];
-            let mut bits = VariantBits::with_len(len);
+            let mut bits = VariantBits::new(len);
             for _ in 0..3 * len {
                 if kept == 0 {
                     break;
@@ -2350,27 +2329,27 @@ struct Q(pub u8, u8);
                 let value = rng.coin();
                 model[index] = value;
                 bits.set(index, value);
-                assert_eq!(bits.get(index), value);
+                assert_eq!(bits.contains(index), value);
             }
             for (index, &value) in model.iter().enumerate() {
-                assert_eq!(bits.get(index), value, "len {len} index {index}");
+                assert_eq!(bits.contains(index), value, "len {len} index {index}");
             }
             for index in kept..len {
-                assert!(!bits.get(index), "len {len} index {index}");
+                assert!(!bits.contains(index), "len {len} index {index}");
             }
 
             bits.truncate(kept);
-            let mut fresh = VariantBits::with_len(kept);
+            let mut fresh = VariantBits::new(kept);
             for (index, &value) in model.iter().enumerate() {
                 fresh.set(index, value);
             }
             assert_eq!(bits, fresh, "len {len} kept {kept}");
             for (index, &value) in model.iter().enumerate() {
-                assert_eq!(bits.get(index), value, "len {len} kept {kept} index {index}");
+                assert_eq!(bits.contains(index), value, "len {len} kept {kept} index {index}");
             }
         }
-        assert!(!VariantBits::with_len(64).0.spilled());
-        assert!(VariantBits::with_len(65).0.spilled());
+        assert!(!VariantBits::new(64).into_words().spilled());
+        assert!(VariantBits::new(65).into_words().spilled());
     }
 }
 

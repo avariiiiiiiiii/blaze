@@ -4,7 +4,7 @@
 //! name, a command line as cargo quotes it. Every function here is pure; the caller writes the
 //! text to the stream cargo writes it to.
 
-use std::{path::Path, time::Duration};
+use std::{fmt::Write as _, path::Path, time::Duration};
 
 use blaze_api::UnitTarget;
 
@@ -51,29 +51,86 @@ pub fn status_word(out: &mut String, word: &str, color: bool) {
     out.push(' ');
 }
 
-/// `error: what`: cargo's `Shell::error`, with its newline.
-pub fn error(what: &str, color: bool) -> String {
-    format!("{}{} {what}\n", paint(ERROR, "error", color), paint(BOLD, ":", color))
+/// `level: what` and its newline into `out`, as cargo-util-terminal's `message_stderr` writes an
+/// unjustified status: the level in `style`, the colon plain.
+fn leveled(out: &mut String, style: &str, level: &str, what: &str, color: bool) {
+    leveled_with(out, style, level, color, |out| out.push_str(what));
 }
 
-/// `warning: what`: cargo's `Shell::warn`, with its newline.
-pub fn warning(what: &str, color: bool) -> String {
-    format!("{}{} {what}\n", paint(WARN, "warning", color), paint(BOLD, ":", color))
-}
-
-/// A time as cargo's `util::elapsed` writes it: `0.12s`, `1m 05s`.
-pub fn elapsed(took: Duration) -> String {
-    let secs = took.as_secs();
-    match secs >= 60 {
-        true => format!("{}m {:02}s", secs / 60, secs % 60),
-        false => format!("{secs}.{:02}s", took.subsec_nanos() / 10_000_000),
+/// [`leveled`] of the text `what` writes into `out`.
+pub fn leveled_with(out: &mut String, style: &str, level: &str, color: bool, what: impl FnOnce(&mut String)) {
+    if color {
+        out.push_str(style);
     }
+    out.push_str(level);
+    if color {
+        out.push_str(RESET);
+    }
+    out.push_str(": ");
+    what(out);
+    out.push('\n');
+}
+
+/// `error: what`: cargo's `Shell::error`, with its newline, into `out`.
+pub fn error_into(out: &mut String, what: &str, color: bool) {
+    leveled(out, ERROR, "error", what, color);
+}
+
+/// `warning: what`: cargo's `Shell::warn`, with its newline, into `out`.
+pub fn warning_into(out: &mut String, what: &str, color: bool) {
+    leveled(out, WARN, "warning", what, color);
+}
+
+/// `note: what`: cargo's `Shell::note` (annotate-snippets' secondary title: `note` in its note
+/// style, the colon and the text plain), with its newline, into `out`.
+pub fn note_into(out: &mut String, what: &str, color: bool) {
+    leveled(out, GOOD, "note", what, color);
+}
+
+/// [`error_into`] as its own text, for an error path.
+pub fn error(what: &str, color: bool) -> String {
+    let mut out = String::with_capacity(what.len() + 24);
+    error_into(&mut out, what, color);
+    out
+}
+
+/// [`warning_into`] as its own text, for a path off the per-response one.
+pub fn warning(what: &str, color: bool) -> String {
+    let mut out = String::with_capacity(what.len() + 24);
+    warning_into(&mut out, what, color);
+    out
+}
+
+/// A time as cargo's `util::elapsed` writes it: `0.12s`, `1m 05s`, into `out`.
+pub fn elapsed_into(out: &mut String, took: Duration) {
+    let secs = took.as_secs();
+    // Writing to a String cannot fail.
+    let _ = match secs >= 60 {
+        true => write!(out, "{}m {:02}s", secs / 60, secs % 60),
+        false => write!(out, "{secs}.{:02}s", took.subsec_nanos() / 10_000_000),
+    };
+}
+
+/// [`elapsed_into`] as its own text.
+pub fn elapsed(took: Duration) -> String {
+    let mut out = String::with_capacity(12);
+    elapsed_into(&mut out, took);
+    out
 }
 
 /// What follows `Finished`: `` `dev` profile [unoptimized + debuginfo] target(s) in 0.12s ``,
-/// of the daemon's `profile` (`Response::Built`).
+/// of the daemon's `profile` (`Response::Built`), into `out`.
+pub fn finished_into(out: &mut String, profile: &str, took: Duration) {
+    out.push_str(profile);
+    out.push_str(" target(s) in ");
+    elapsed_into(out, took);
+}
+
+/// [`finished_into`] as its own text.
 pub fn finished(profile: &str, took: Duration) -> String {
-    format!("{profile} target(s) in {}", elapsed(took))
+    let mut out = String::with_capacity(profile.len() + 24);
+    finished_into(&mut out, profile, took);
+    out
 }
 
 /// A package as cargo's status lines name it: `foo v0.1.0 (/w/foo)`, `serde v1.0.0`.
@@ -87,25 +144,48 @@ pub fn package(name: &str, version: &str, source: Option<&str>) -> String {
 /// A target as cargo's `Target::description_named` names it: `lib`, `bin "foo"`,
 /// `build script`.
 pub fn target_named(target: &UnitTarget) -> String {
-    match target.kind.first().map(String::as_str) {
-        Some("bin") => format!("bin \"{}\"", target.name),
-        Some("test") => format!("test \"{}\"", target.name),
-        Some("bench") => format!("bench \"{}\"", target.name),
-        Some("example") => format!("example \"{}\"", target.name),
-        Some("custom-build") => "build script".to_owned(),
-        _ => "lib".to_owned(),
-    }
+    let mut out = String::with_capacity(target.name.len() + 12);
+    target_named_into(&mut out, target);
+    out
+}
+
+/// [`target_named`] into `out`.
+pub fn target_named_into(out: &mut String, target: &UnitTarget) {
+    let kind = match target.kind.first().map(String::as_str) {
+        Some("custom-build") => return out.push_str("build script"),
+        Some(kind @ ("bin" | "test" | "bench" | "example")) => kind,
+        _ => return out.push_str("lib"),
+    };
+    out.push_str(kind);
+    out.push_str(" \"");
+    out.push_str(&target.name);
+    out.push('"');
+}
+
+/// Whether a unit compiled with `--test` is named a test of its target: it is no test or bench
+/// target (cargo's `mode.is_rustc_test() && !(target.is_test() || target.is_bench())`).
+fn test_of(target: &UnitTarget, test: bool) -> bool {
+    test && !matches!(target.kind.first().map(String::as_str), Some("test" | "bench"))
 }
 
 /// A unit as cargo's `descriptive_pkg_name` names it: `` `foo` (lib) ``, `` `foo` (lib test) ``
 /// for one compiled with `--test` that is no test or bench target.
 pub fn unit_named(package: &str, target: &UnitTarget, test: bool) -> String {
-    let kind = target.kind.first().map(String::as_str);
-    let mode = match test && !matches!(kind, Some("test" | "bench")) {
-        true => " test",
-        false => "",
-    };
-    format!("`{package}` ({}{mode})", target_named(target))
+    let mut out = String::with_capacity(package.len() + target.name.len() + 20);
+    unit_named_into(&mut out, package, target, test);
+    out
+}
+
+/// [`unit_named`] into `out`.
+pub fn unit_named_into(out: &mut String, package: &str, target: &UnitTarget, test: bool) {
+    out.push('`');
+    out.push_str(package);
+    out.push_str("` (");
+    target_named_into(out, target);
+    if test_of(target, test) {
+        out.push_str(" test");
+    }
+    out.push(')');
 }
 
 /// The package name in cargo's package id: `path+file:///w/foo#0.1.0` is `foo`,
@@ -136,58 +216,73 @@ pub struct Warned {
 }
 
 /// `` `foo` (lib) generated 2 warnings (1 duplicate) (run `cargo fix --lib -p foo` to apply 1
-/// suggestion) ``: what follows `warning:` for a unit with warnings, `None` for one without.
-/// The hint is for a local unit that is no build script.
+/// suggestion) ``: what follows `warning:` for a unit with warnings, `None` for one without
+/// (`JobQueue::report_warning_count`). The hint is for a local unit that is no build script,
+/// and always names the package (cargo since "fix(check): ... always using -p").
 pub fn generated(package: &str, target: &UnitTarget, test: bool, local: bool, warned: Warned) -> Option<String> {
+    let mut out = String::with_capacity(package.len() * 2 + target.name.len() + 96);
+    generated_into(&mut out, package, target, test, local, warned).then_some(out)
+}
+
+/// [`generated`] into `out`; false, with nothing written, for a unit without warnings.
+pub fn generated_into(out: &mut String, package: &str, target: &UnitTarget, test: bool, local: bool, warned: Warned) -> bool {
     if warned.total == 0 {
-        return None;
+        return false;
     }
-    let mut said = format!("{} generated ", unit_named(package, target, test));
-    match warned.total {
-        1 => said.push_str("1 warning"),
-        n => said.push_str(&format!("{n} warnings")),
-    }
-    match warned.duplicates {
-        0 => {}
-        1 => said.push_str(" (1 duplicate)"),
-        n => said.push_str(&format!(" ({n} duplicates)")),
-    }
+    unit_named_into(out, package, target, test);
+    // Writing to a String cannot fail.
+    let _ = match warned.total {
+        1 => write!(out, " generated 1 warning"),
+        n => write!(out, " generated {n} warnings"),
+    };
+    let _ = match warned.duplicates {
+        0 => Ok(()),
+        1 => write!(out, " (1 duplicate)"),
+        n => write!(out, " ({n} duplicates)"),
+    };
     let custom_build = target.kind.first().is_some_and(|it| it == "custom-build");
     if let Some(fixable @ 1..) = warned.fixable
         && local
         && !custom_build
     {
-        let named = target_named(target);
-        let mut args = match target.kind.first().map(String::as_str) {
-            Some("bin" | "test" | "bench" | "example") => named,
-            _ => format!("{named} -p {package}"),
-        };
-        if test && !target.kind.first().is_some_and(|it| it == "test" || it == "bench") {
-            args.push_str(" --tests");
+        out.push_str(" (run `cargo fix --");
+        target_named_into(out, target);
+        out.push_str(" -p ");
+        out.push_str(package);
+        if test_of(target, test) {
+            out.push_str(" --tests");
         }
-        let suggestions = match fixable {
-            1 => "1 suggestion".to_owned(),
-            n => format!("{n} suggestions"),
+        let _ = match fixable {
+            1 => write!(out, "` to apply 1 suggestion)"),
+            n => write!(out, "` to apply {n} suggestions)"),
         };
-        said.push_str(&format!(" (run `cargo fix --{args}` to apply {suggestions})"));
     }
-    Some(said)
+    true
 }
 
 /// `` could not compile `foo` (lib) due to 1 previous error; 1 warning emitted ``: what follows
 /// `error:` for a unit that failed (`core/compiler/mod.rs`, `rustc`).
 pub fn could_not_compile(package: &str, target: &UnitTarget, test: bool, errors: u32, warnings: u32) -> String {
-    let errors = match errors {
-        0 => String::new(),
-        1 => " due to 1 previous error".to_owned(),
-        n => format!(" due to {n} previous errors"),
+    let mut out = String::with_capacity(package.len() + target.name.len() + 80);
+    could_not_compile_into(&mut out, package, target, test, errors, warnings);
+    out
+}
+
+/// [`could_not_compile`] into `out`.
+pub fn could_not_compile_into(out: &mut String, package: &str, target: &UnitTarget, test: bool, errors: u32, warnings: u32) {
+    out.push_str("could not compile ");
+    unit_named_into(out, package, target, test);
+    // Writing to a String cannot fail.
+    let _ = match errors {
+        0 => Ok(()),
+        1 => write!(out, " due to 1 previous error"),
+        n => write!(out, " due to {n} previous errors"),
     };
-    let warnings = match warnings {
-        0 => String::new(),
-        1 => "; 1 warning emitted".to_owned(),
-        n => format!("; {n} warnings emitted"),
+    let _ = match warnings {
+        0 => Ok(()),
+        1 => write!(out, "; 1 warning emitted"),
+        n => write!(out, "; {n} warnings emitted"),
     };
-    format!("could not compile {}{errors}{warnings}", unit_named(package, target, test))
 }
 
 /// `arg` as cargo-util's `ProcessBuilder` shows it, quoted as `shell-escape` quotes it.
@@ -257,9 +352,30 @@ pub fn escape_windows(arg: &str) -> String {
 }
 
 /// `` `target/debug/foo a 'b c'` ``: a command as cargo's status lines show it, without the
-/// variables cargo set for it (whose values are never printed here).
+/// variables cargo set for it.
 pub fn command_line(program: &str, args: &[String]) -> String {
-    let mut line = format!("`{program}");
+    command_line_with(&[], program, args)
+}
+
+/// [`command_line`] with the variables cargo set for it first, sorted by name, as `-vv` shows
+/// them (`ProcessBuilder::display_env_vars`): `` `CARGO=x FOO='a b' target/debug/foo` ``, and
+/// `set K=V&& ` before each on Windows. Only cargo's own variables are ever here, never the
+/// user's environment.
+pub fn command_line_with(env: &[(String, String)], program: &str, args: &[String]) -> String {
+    let mut line = String::with_capacity(program.len() + 2 + args.iter().map(|it| it.len() + 3).sum::<usize>());
+    line.push('`');
+    let mut sorted: Vec<&(String, String)> = env.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (name, value) in sorted {
+        if cfg!(windows) {
+            line.push_str("set ");
+        }
+        line.push_str(name);
+        line.push('=');
+        line.push_str(&escape(value));
+        line.push_str(if cfg!(windows) { "&& " } else { " " });
+    }
+    line.push_str(program);
     for arg in args {
         line.push(' ');
         line.push_str(&escape(arg));

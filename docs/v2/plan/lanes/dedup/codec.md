@@ -75,7 +75,7 @@ they are bound by reading the files.
 
 About 45 copies of SplitMix64 (and some xorshift streams) in tests, simulations and jitter. The
 one copy has `new`, `next_u64`, `next_u32` (the high half), `below` (`% n`, the form most copies
-used, so their streams and seeds keep their meaning), `index`, `range`, `one_in`, `coin`,
+used, so their streams and seeds keep their meaning), `index`, `range`, `one_in`, `chance`, `coin`,
 `unit_f64`, `pick`, `fill`, `shuffle`, and the finalizer `mix` and `GAMMA` for the copies that
 hash with it. A draw is one add on the state chain (1 cycle) and two multiplies and three
 shift-xors off it: about 2 to 3 cycles a draw, the cost of the mixing itself. `below`'s

@@ -35,10 +35,18 @@ image. The PE loader that used to run programs (`load/pe.rs`) is gone.
   `sys::page()` returns. All offsets, lengths and addresses of the overlays are multiples of it.
 - **Objects:** after the GRANT, a second GRANT frame at sequence number 1 lists each object's
   length (u64) and rights (u8). The daemon keeps the handles.
-- **MAP frames:** the hook maps a whole object anywhere (the control words, shared) by asking the
-  daemon with MAP (object u32, access u8). The daemon checks the object's rights (never
-  executable anywhere, the image never shared writable) and answers MAPPED with the address, or
-  REFUSED with why.
+- **MAP frames:** the hook maps a whole object anywhere (the control words and the asks, shared)
+  by asking the daemon with MAP (object u32, access u8). The daemon checks the object's rights
+  (never executable anywhere, the image never shared writable) and answers MAPPED with the
+  address, or REFUSED with why.
+- **Asks** (`ask.rs`): Windows has no `WaitOnAddress` across processes, so right after the
+  objects the daemon makes 65 auto-reset events, the doorbell and one per slot, and duplicates
+  each into the run process (`DuplicateHandle`, so the process handle is opened with
+  `PROCESS_DUP_HANDLE` and `PROCESS_SYNCHRONIZE`); it writes their handle values into the asks
+  object's header before it answers any MAP. An asker sets the doorbell and waits on its slot's
+  event; the daemon's reader waits on the doorbell and the process handle at once, so a process
+  that ended ends it. A thread waiting for a free slot sleeps with `WaitOnAddress` in its own
+  process. `Session::kill` is `TerminateProcess`, and a process already gone counts as killed.
 - **Channel:** a named pipe `\\.\pipe\blaze-inproc-<pid>-<random>`, with remote clients rejected.
   - The DACL gives the user everything and gives ALL APPLICATION PACKAGES connect rights only, so
     a program in the `blaze.sandbox` AppContainer can connect.

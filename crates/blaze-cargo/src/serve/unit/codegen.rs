@@ -23,7 +23,7 @@ use blaze_items::ItemKey;
 use blaze_link::{Change, Image, Native, Output};
 use blaze_units::schema::{self, Mode, Unit};
 use hir_ty_codegen::v2::{
-    Backends, BuildTime, Databases, HirFrontend, HirInstance, ItemHashes, RootKind, Roots,
+    Backends, BuildTime, Databases, HashSource, HirFrontend, HirInstance, ItemHashes, RootKind, Roots,
 };
 
 use super::{Job, UnitReader, files::Mounted, graph::flag, script};
@@ -263,7 +263,7 @@ fn frontend<'db>(job: &Job, reader: &'db UnitReader, mounted: &Arc<Mounted>) -> 
         let (mounted, paths) = (Arc::clone(mounted), Arc::clone(reader.paths()));
         move |file: base_db::FileId| -> Option<String> { paths.get(&file).map(|path| mounted.name(path)) }
     };
-    HirFrontend::new(Databases::new(reader.db()), Box::new(ItemHashes::new(Box::new(names))), build_time(job))
+    HirFrontend::new(Databases::new(reader.db()), HashSource::Items(ItemHashes::new(Box::new(names))), build_time(job))
 }
 
 /// The tests of test unit `unit` as its harness lists them, compiling nothing: the same

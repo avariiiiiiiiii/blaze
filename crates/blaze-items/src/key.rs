@@ -55,7 +55,7 @@ use hir_ty::{
     next_solver::SolverDefId,
 };
 use span::ErasedFileAstId;
-use syntax::ast::HasName;
+use syntax::view::HasName;
 
 use crate::{ItemId, ItemKey, NAME_DOMAIN, NameHash, SimplifiedType};
 
@@ -553,22 +553,22 @@ fn item_preimage(db: &Db, id: ItemId, b: &mut Bytes) -> ItemKey {
         ItemId::Macro(MacroId::MacroRulesId(it)) => {
             let loc = it.lookup(db);
             let parent = module_key(db, loc.container);
-            let name = loc.id.to_node(db).name();
-            head(b, parent, b"", b"macro_rules", name.as_ref().map(|it| it.text()));
+            let name = loc.id.to_view(db).name();
+            head(b, parent, b"", b"macro_rules", name.map(|it| it.text()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Macro(MacroId::Macro2Id(it)) => {
             let loc = it.lookup(db);
             let parent = module_key(db, loc.container);
-            let name = loc.id.to_node(db).name();
-            head(b, parent, b"", b"macro", name.as_ref().map(|it| it.text()));
+            let name = loc.id.to_view(db).name();
+            head(b, parent, b"", b"macro", name.map(|it| it.text()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Macro(MacroId::ProcMacroId(it)) => {
             let loc = it.lookup(db);
             let parent = module_key(db, loc.container);
-            let name = loc.id.to_node(db).name();
-            head(b, parent, b"", b"proc_macro", name.as_ref().map(|it| it.text()));
+            let name = loc.id.to_view(db).name();
+            head(b, parent, b"", b"proc_macro", name.map(|it| it.text()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
     };
@@ -871,8 +871,8 @@ fn module_path<'db>(
 
 /// Writes an item's name, `_` for one without.
 fn item_name(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
-    fn macro_name(name: Option<syntax::ast::Name>, write: &mut impl FnMut(&str)) {
-        write(name.as_ref().map_or("_", |it| it.text()))
+    fn macro_name(name: Option<syntax::view::Name<'_>>, write: &mut impl FnMut(&str)) {
+        write(name.map_or("_", |it| it.text()))
     }
     match id {
         ItemId::Function(it) => write(FunctionSignature::of(db, it).name.as_str()),
@@ -888,11 +888,11 @@ fn item_name(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
         ItemId::Alias(it) => write(TypeAliasSignature::of(db, it).name.as_str()),
         // hir-def keeps no macro's name but in its syntax.
         ItemId::Macro(MacroId::MacroRulesId(it)) => {
-            macro_name(it.lookup(db).id.to_node(db).name(), write)
+            macro_name(it.lookup(db).id.to_view(db).name(), write)
         }
-        ItemId::Macro(MacroId::Macro2Id(it)) => macro_name(it.lookup(db).id.to_node(db).name(), write),
+        ItemId::Macro(MacroId::Macro2Id(it)) => macro_name(it.lookup(db).id.to_view(db).name(), write),
         ItemId::Macro(MacroId::ProcMacroId(it)) => {
-            macro_name(it.lookup(db).id.to_node(db).name(), write)
+            macro_name(it.lookup(db).id.to_view(db).name(), write)
         }
     }
 }

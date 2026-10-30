@@ -11,7 +11,8 @@
 //! it can't be on by the attribute parser, whose lints are emitted after the checks of each
 //! module (`emit_ast_lowering_delayed_lints`).
 //!
-//! Cost: one walk of the crate's syntax checks every use as it comes to it (`walk.rs`); a
+//! Cost: one pass over the crate walk every syntax pass shares (`cx.walk()`), reading only
+//! the nodes of the kinds it looks at, checks every use as it comes to it (`walk.rs`); a
 //! use is a probe of the per-check index (`lookup.rs`) and stores nothing. Text (paths,
 //! messages) is made here, only for what is reported, and only what is reported is sorted
 //! into rustc's order.

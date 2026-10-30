@@ -161,10 +161,14 @@ impl Edit<'_> {
         self.tree.is_token(at) || self.tree.is_lazy(at)
     }
 
+    /// Where the old `range`, which holds the edit, is in the new text.
+    fn new_range(&self, range: TextRange) -> TextRange {
+        TextRange::at(range.start(), range.len() + TextSize::of(self.insert) - self.delete.len())
+    }
+
     /// The text of the old `range`, which holds the edit, after it.
     fn new_text(&self, range: TextRange) -> &str {
-        let len = range.len() + TextSize::of(self.insert) - self.delete.len();
-        &self.new_source[TextRange::at(range.start(), len)]
+        &self.new_source[self.new_range(range)]
     }
 
     fn token(&self) -> Option<Spliced> {
@@ -209,17 +213,25 @@ impl Edit<'_> {
         // The edited token must not take the start of the next one, nor the previous one its
         // start: for source code `bruh"str"`, removing `ruh` makes `b"str"` one byte string.
         if let Some(next_char) = self.tree.source()[usize::from(range.end())..].chars().next() {
-            let with_next = format!("{new_text}{next_char}");
-            if LexedStr::single_token(self.edition, &with_next).is_some() {
+            let takes_next = blaze_mem::scratch::with_string(|with_next| {
+                with_next.push_str(new_text);
+                with_next.push(next_char);
+                LexedStr::single_token(self.edition, with_next).is_some()
+            });
+            if takes_next {
                 return None;
             }
         }
         if let Some(prev) = prev.filter(|&it| tree.is_token(it)) {
             let prev_text = tree.token_text(prev);
             let alone = LexedStr::new(self.edition, prev_text).len();
-            let joint = format!("{prev_text}{new_text}");
-            let joint = LexedStr::new(self.edition, &joint);
-            if joint.len() != alone + 1 || joint.text(joint.len() - 1) != new_text {
+            let joins = blaze_mem::scratch::with_string(|joint| {
+                joint.push_str(prev_text);
+                joint.push_str(new_text);
+                let joint = LexedStr::new(self.edition, joint);
+                joint.len() == alone + 1 && joint.text(joint.len() - 1) == new_text
+            });
+            if !joins {
                 return None;
             }
         }
@@ -237,16 +249,12 @@ impl Edit<'_> {
             true => tree.parent(covering)?,
             false => covering,
         };
-        let ancestors: Vec<u32> =
-            std::iter::successors(Some(start), |&it| tree.parent(it)).collect();
-        // In an outline, what is in a `fn` body that is not lazy is parsed in full.
-        let mut in_full = vec![!self.outline; ancestors.len()];
-        let mut in_body = false;
-        for (i, &it) in ancestors.iter().enumerate().rev() {
-            in_full[i] |= in_body;
-            in_body |= self.is_fn_body(it);
-        }
-        ancestors.iter().zip(in_full).find_map(|(&at, in_full)| {
+        let ancestors = || std::iter::successors(Some(start), |&it| tree.parent(it));
+        // In an outline, what is in a `fn` body that is not lazy is parsed in full: the
+        // ancestors below the outermost body.
+        let outermost = ancestors().enumerate().filter(|&(_, it)| self.is_fn_body(it)).last();
+        ancestors().enumerate().find_map(|(i, at)| {
+            let in_full = !self.outline || outermost.is_some_and(|(body, _)| i < body);
             let kind = self.kind(at);
             if !in_full && self.is_fn_body(at) {
                 return self.body(at);
@@ -271,7 +279,8 @@ impl Edit<'_> {
     /// leave it unparsed (`braced`), which it did or the full parse of the body would have
     /// to be checked too.
     fn body(&self, at: u32) -> Option<Spliced> {
-        let text = self.new_text(self.tree.range(at));
+        let range = self.new_range(self.tree.range(at));
+        let text = &self.new_source[range];
         let lexed = LexedStr::new(self.edition, text);
         if !braced(&lexed, self.edition)
             || !self.same_start(at, &lexed)
@@ -279,7 +288,8 @@ impl Edit<'_> {
         {
             return None;
         }
-        let mut builder = SyntaxTreeBuilder::sourced(Text::from(text));
+        // clone: a count of the new text, which the node's tree shares
+        let mut builder = SyntaxTreeBuilder::sourced_range(self.new_source.clone(), range);
         builder.lazy(BLOCK_EXPR, TextSize::of(text));
         let (with, _no_errors) = builder.finish_raw(self.edition);
         self.splice(at, with, lexer_errors(&lexed, TextSize::new(0)).collect())
@@ -287,8 +297,8 @@ impl Edit<'_> {
 
     fn block(&self, at: u32, reparser: Reparser, in_full: bool) -> Option<Spliced> {
         let kind = self.kind(at);
-        let text = self.new_text(self.tree.range(at));
-        let lexed = LexedStr::new(self.edition, text);
+        let range = self.new_range(self.tree.range(at));
+        let lexed = LexedStr::new(self.edition, &self.new_source[range]);
         // An expression's parse looks into the block or list after it (a `{` after a path is
         // a struct literal's when an identifier and a `:` follow); a list of items, fields or
         // variants is its parent's last part.
@@ -304,7 +314,9 @@ impl Edit<'_> {
             true => reparser.parse(&input),
             false => reparser.parse_outline(&input),
         };
-        let (with, errors) = build_node(Text::from(text), &lexed, &output, self.edition, kind)?;
+        // clone: a count of the new text, which the node's tree shares
+        let source = self.new_source.clone();
+        let (with, errors) = build_node(source, range, &lexed, &output, self.edition, kind)?;
         self.splice(at, with, errors)
     }
 
@@ -314,8 +326,8 @@ impl Edit<'_> {
         let tree = self.tree;
         let kind = self.kind(at);
         let range = tree.range(at);
-        let text = self.new_text(range);
-        let lexed = LexedStr::new(self.edition, text);
+        let new = self.new_range(range);
+        let lexed = LexedStr::new(self.edition, &self.new_source[new]);
         // Trivia after an item are its parent's; a parse of the item alone would take them.
         if lexed.is_empty()
             || lexed.kind(lexed.len() - 1).is_trivia()
@@ -345,7 +357,9 @@ impl Edit<'_> {
         if first != kind || n_tokens != tokens {
             return None;
         }
-        let (with, errors) = build_node(Text::from(text), &lexed, &output, self.edition, kind)?;
+        // clone: a count of the new text, which the node's tree shares
+        let source = self.new_source.clone();
+        let (with, errors) = build_node(source, new, &lexed, &output, self.edition, kind)?;
         self.splice(at, with, errors)
     }
 
@@ -369,7 +383,7 @@ impl Edit<'_> {
             return true;
         }
         let old = LexedStr::new(self.edition, &self.tree.source()[range]);
-        first_tokens(&old) == first_tokens(new)
+        first_tokens(&old).eq(first_tokens(new))
     }
 
     /// Whether `new`, the new text of node `at`, lexes alone as it does between the tokens
@@ -400,12 +414,16 @@ impl Edit<'_> {
         );
         let before = &source[TextRange::new(before, range.start())];
         let after = &source[TextRange::new(range.end(), after)];
-        let joint = format!("{before}{}{after}", new.as_str());
-        let joint = LexedStr::new(self.edition, &joint);
-        let (before, after) =
-            (LexedStr::new(self.edition, before), LexedStr::new(self.edition, after));
-        let alone = [&before, new, &after].into_iter().flat_map(token_lengths);
-        alone.eq(token_lengths(&joint))
+        blaze_mem::scratch::with_string(|joint| {
+            joint.push_str(before);
+            joint.push_str(new.as_str());
+            joint.push_str(after);
+            let joint = LexedStr::new(self.edition, joint);
+            let (before, after) =
+                (LexedStr::new(self.edition, before), LexedStr::new(self.edition, after));
+            let alone = [&before, new, &after].into_iter().flat_map(token_lengths);
+            alone.eq(token_lengths(&joint))
+        })
     }
 }
 
@@ -421,12 +439,11 @@ fn token_lengths<'a>(lexed: &'a LexedStr<'_>) -> impl Iterator<Item = (SyntaxKin
 }
 
 /// The first [`LOOKAHEAD`] tokens of `lexed` that are not trivia.
-fn first_tokens<'a>(lexed: &'a LexedStr<'_>) -> Vec<(SyntaxKind, &'a str)> {
+fn first_tokens<'a>(lexed: &'a LexedStr<'_>) -> impl Iterator<Item = (SyntaxKind, &'a str)> + 'a {
     (0..lexed.len())
         .filter(|&it| !lexed.kind(it).is_trivia())
         .take(LOOKAHEAD)
         .map(|it| (lexed.kind(it), lexed.text(it)))
-        .collect()
 }
 
 /// Whether `lexed` is a `{ ... }` that parses to its last `}`: its braces balance and it holds
@@ -499,6 +516,7 @@ fn merge_errors(
 mod tests {
     use std::ops::Range;
 
+    use blaze_ids::rng::SplitMix64;
     use parser::Edition;
     use test_utils::{assert_eq_text, extract_range};
 
@@ -850,18 +868,6 @@ enum Foo {
         check_same(&reparsed, &parsed);
     }
 
-    /// A small deterministic generator, for the edits of [`reparse_random_edits`].
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: usize) -> usize {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            (self.0 % n.max(1) as u64) as usize
-        }
-    }
-
     const INSERTS: &[&str] = &[
         "",
         " ",
@@ -919,7 +925,7 @@ enum Foo {
         }
         files.sort();
         assert!(files.len() > 100, "the sources and test data of syntax and parser");
-        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
         for file in &files {
             let text = std::fs::read_to_string(file).unwrap();
             let edits = if text.len() > 20_000 { 2 } else { 6 };
@@ -960,7 +966,7 @@ enum Foo {
         let mut files = Vec::new();
         collect_rs(&root.join("crates/syntax/src"), &mut files);
         files.sort();
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         for file in &files {
             let text = std::fs::read_to_string(file).unwrap();
             let full = SourceFile::parse(&text, Edition::CURRENT);
@@ -1049,22 +1055,22 @@ enum Foo {
         });
     }
 
-    fn random_edit(rng: &mut Rng, text: &str) -> (TextRange, String) {
+    fn random_edit(rng: &mut SplitMix64, text: &str) -> (TextRange, String) {
         let boundary = |mut at: usize| {
             while !text.is_char_boundary(at) {
                 at -= 1;
             }
             at
         };
-        let start = boundary(rng.below(text.len() + 1));
-        let end = boundary((start + rng.below(12)).min(text.len())).max(start);
-        let insert = match rng.below(4) {
+        let start = boundary(rng.index(text.len() + 1));
+        let end = boundary((start + rng.index(12)).min(text.len())).max(start);
+        let insert = match rng.index(4) {
             0 => {
-                let from = boundary(rng.below(text.len() + 1));
-                let to = boundary((from + rng.below(24)).min(text.len())).max(from);
+                let from = boundary(rng.index(text.len() + 1));
+                let to = boundary((from + rng.index(24)).min(text.len())).max(from);
                 text[from..to].to_owned()
             }
-            _ => INSERTS[rng.below(INSERTS.len())].to_owned(),
+            _ => INSERTS[rng.index(INSERTS.len())].to_owned(),
         };
         let delete = TextRange::new(start.try_into().unwrap(), end.try_into().unwrap());
         (delete, insert)
@@ -1078,6 +1084,31 @@ enum Foo {
             } else if path.extension().is_some_and(|it| it == "rs") {
                 files.push(path);
             }
+        }
+    }
+
+    /// A warm edit allocates the trees it makes alone: for a block parsed again, the block's
+    /// tree, the spliced tree and the parse's `Arc`; for a token, the last two. No buffer of
+    /// the reparse itself (the lexer's and parser input's columns are their shelves'), and the
+    /// same parse as the whole text's.
+    #[test]
+    fn a_warm_reparse_allocates_its_trees_alone() {
+        let before = "fn f() {\n    let x = 1 + 2;\n}\nfn foo() {}\n";
+        let edits = [
+            ("fn f() {\n    let x = 1 + 3;\n}\nfn foo() {}\n", 3, "a block parsed again"),
+            ("fn f() {\n    let x = 1 + 2;\n}\nfn fob() {}\n", 2, "a token replaced"),
+        ];
+        let parse = SourceFile::parse(before, Edition::CURRENT);
+        for (after, budget, what) in edits {
+            let after = Text::from(after);
+            let cold = parse.reparse_to(after.clone(), Edition::CURRENT);
+            let warm = blaze_alloc_count::assert_at_most(budget, what, || {
+                parse.reparse_to(after.clone(), Edition::CURRENT)
+            });
+            let whole = SourceFile::parse(&after, Edition::CURRENT);
+            let shown = format!("{:#?}", warm.tree().syntax());
+            assert_eq!(shown, format!("{:#?}", cold.tree().syntax()));
+            assert_eq!(shown, format!("{:#?}", whole.tree().syntax()));
         }
     }
 }

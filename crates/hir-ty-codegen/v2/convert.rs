@@ -89,23 +89,22 @@ pub(crate) fn function(
 ) -> Result<CompiledFunction, String> {
     let word = word(arch)?;
     let mut own = OwnData { data: Vec::new(), word };
-    let names: Relocs<RelocName> = code
-        .relocs
-        .iter()
-        .map(|reloc| {
+    let names: Relocs<RelocName> = Relocs::try_from_iter_in(
+        frame,
+        code.relocs.iter().map(|reloc| {
             let kind = match reloc.elf_type {
                 Some(elf) => elf_kind(elf)?,
                 None => reloc_kind(reloc.kind)?,
             };
-            Ok(Relocation { at: reloc.offset, kind, target: reloc.name, addend: reloc.addend })
-        })
-        .collect::<Result<_, String>>()?;
+            Ok::<_, String>(Relocation { at: reloc.offset, kind, target: reloc.name, addend: reloc.addend })
+        }),
+    )?;
     let named = names.targets().iter().filter_map(|name| match *name {
         RelocName::Data(index) => Some(index as usize),
         _ => None,
     });
     let datas = own.requests(frame, requests, resolve, named)?;
-    let relocs = names.try_map(|&name| reloc_target(name, requests, &datas, resolve))?;
+    let relocs = names.view().try_map_in(frame, |&name| reloc_target(name, requests, &datas, resolve))?;
     let unwind = match &code.unwind {
         Some(unwind) => {
             let personality = || resolve.symbol(PERSONALITY);

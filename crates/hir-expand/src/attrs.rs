@@ -24,7 +24,7 @@ use itertools::Itertools;
 use mbe::{DelimiterKind, Punct};
 use smallvec::SmallVec;
 use span::{RealSpanMap, Span, SyntaxContext};
-use syntax::{AstNode, SmolStr, ast, unescape};
+use syntax::{AstNode, SmolStr, ast, unescape, view};
 use syntax_bridge::DocCommentDesugarMode;
 
 use crate::{
@@ -44,6 +44,15 @@ pub trait AstPathExt {
 
 /// `f` of the text of the path's one segment, without `r#`, read in place.
 pub(crate) fn with_one_segment<R>(path: &ast::Path, f: impl FnOnce(&str) -> R) -> Option<R> {
+    let name_ref = path.as_single_name_ref()?;
+    Some(f(name_ref.text().trim_start_matches("r#")))
+}
+
+/// [`with_one_segment`] of a view.
+pub(crate) fn with_one_segment_view<R>(
+    path: &view::Path<'_>,
+    f: impl FnOnce(&str) -> R,
+) -> Option<R> {
     let name_ref = path.as_single_name_ref()?;
     Some(f(name_ref.text().trim_start_matches("r#")))
 }
@@ -159,6 +168,44 @@ pub fn expand_cfg_attr_with_doc_comments<'a, DocComment, BreakValue>(
     }
 }
 
+/// [`expand_cfg_attr`] over views: the callback is passed each attribute `cfg_attr` leaves,
+/// in order, and the outermost [`view::Attr`] it is in.
+pub(crate) fn expand_view_cfg_attr<'t, 'a, BreakValue>(
+    mut attrs: impl Iterator<Item = view::Attr<'t>>,
+    mut cfg_options: impl FnMut() -> &'a CfgOptions,
+    mut callback: impl FnMut(view::Meta<'t>, view::Attr<'t>) -> ControlFlow<BreakValue>,
+) -> Option<BreakValue> {
+    // alloc: none until a `cfg_attr` holds more than one attribute
+    let mut stack = SmallVec::<[(view::Meta<'t>, view::Attr<'t>); 1]>::new();
+    'process_attrs: loop {
+        let (mut meta, top_attr) = match stack.pop() {
+            Some(it) => it,
+            None => {
+                let attr = attrs.next()?;
+                let Some(meta) = attr.meta() else { continue };
+                (meta, attr)
+            }
+        };
+
+        while let view::Meta::UnsafeMeta(unsafe_meta) = meta {
+            let Some(inner) = unsafe_meta.meta() else { continue 'process_attrs };
+            meta = inner;
+        }
+
+        if let view::Meta::CfgAttrMeta(meta) = meta {
+            let Some(cfg_predicate) = meta.cfg_predicate() else { continue };
+            let cfg_predicate = CfgExpr::parse_from_view(cfg_predicate);
+            if cfg_options().check(&cfg_predicate) != Some(false) {
+                let prev_stack_len = stack.len();
+                stack.extend(meta.metas().map(|meta| (meta, top_attr)));
+                stack[prev_stack_len..].reverse();
+            }
+        } else if let ControlFlow::Break(break_value) = callback(meta, top_attr) {
+            return Some(break_value);
+        }
+    }
+}
+
 /// The builtin attributes the item tree leaves out.
 const ITEM_TREE_FILTERED_ATTRS: &[&str] = &[
     "doc",
@@ -231,7 +278,7 @@ pub struct Attr {
     pub ctxt: SyntaxContext,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub enum AttrInput {
     /// `#[attr = "string"]`
     Literal(tt::Literal),

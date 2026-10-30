@@ -21,31 +21,38 @@ receives every mutation as a `DeclOp` (`ops.rs`):
 | `Unit` | `unit.rs` | a block's whole map | `collect_block` |
 
 A crate is collected as rounds (§4 of nameres.md). Round 0: `module_decls` per module (DFS).
-Each round `r`: per component of `partition(r)`, `scc_state` replays its members' ops of `r` and
-runs the import worklist; then per module `macro_step(r)` resolves its pending macro directives
-against the round's facts and collects their expansions as ops of round `r + 1`.
+Each round `r`: per component of `partition(r)` that the round can change (§9), `scc_state`
+replays its members' ops of `r` and runs the import worklist; then per module with a directive
+`macro_step(r)` resolves its pending macro directives against the round's facts and collects
+their expansions as ops of round `r + 1`.
 
 ## 2. Query graph (acyclic by construction)
 
 ```text
 module_decls(key)        -> its children's keys, legacy_exports / subtree_macro_exports / decl_handle of earlier keys
-round_modules(r)         -> round_modules(r-1), macro_step(r-1, *)            (r = 0: the DFS of module_decls)
-module_round(r, M)       -> macro_step(r-1, M), macro_step(r-1, parent of M), (root: macro_step(r-1, *))
-import_shape(r)          -> module_decls, module_round(1..=r, *)
+round_modules(r)         -> round_modules(r-1), macro_step(r-1, stepping), round_kind(r),
+                            round_active(r-1), fact_handle(r-1, ran) (r = 0: the DFS of module_decls)
+module_round(r, M)       -> macro_step(r-1, M), macro_step(r-1, parent of M), (root: macro_step(r-1, stepping))
+import_shape(r)          -> module_decls, module_round(1..=r, gaining)
 partition(r)             -> import_shape(r)
 round_env(r)             -> root's crate-level ops of rounds < r (r = 0: root_decl + root's round-0 log)
 round_kind(r)            -> round_kind(r-1), round_progress(r-1)
-scc_state(r, anchor)     -> partition(r), module_round(r, members), round_env(r), round_kind(r),
-                            scc_state(r-1, same members) (carried), fact_handle(r, upstream) through path reads
-fact_handle(r, M)        -> partition(r), scc_state(r, comp(M))
-unresolved_named(r, M)   -> scc_state(r, comp(M))
-macro_step(r, M)         -> round_kind(r), fact_handle(r, *) through path reads, unresolved_named(r, M),
-                            macro_step(r-1, M) (pending, side), module_round(r, M) (macros it gained)
-round_progress(r)        -> macro_step(r, *)
+round_active(r)          -> round_modules(r), partition(r), partition(ran), scc_state(ran, *).upstream,
+                            round_env(r, r-1), the prelude holder's scc_state(r) when it runs
+scc_state(r, anchor)     -> partition(r), module_round(r, gaining members), round_env(r), round_kind(r),
+                            round_active(r), scc_state(ran, same members) (carried),
+                            fact_handle(fact_key(r, upstream)) through path reads
+fact_handle(r, M)        -> partition(r), scc_state(r, comp(M))          (only a round that runs comp(M))
+unresolved_named(r, M)   -> scc_state(r, comp(M))                        (as fact_handle)
+macro_step(r, M)         -> round_kind(r), fact_handle(fact_key(r, *)) through path reads,
+                            unresolved_named(ran_by(r, M), M), macro_step(last step, M) (pending, side),
+                            module_round(declared round, M) (macros it started with)
+round_progress(r)        -> macro_step(r, stepping), the carried directives of the rest
 ```
 
 No query of round `r` reads a `macro_step` of round `r`, so expansion effects cross modules only
-one round later (nameres.md §8.3).
+one round later (nameres.md §8.3). `round_active(r)` reads no `scc_state` of round `r` but the
+prelude holder's, whose component reads no other (§9).
 
 ## 3. Values and their invariants
 
@@ -171,10 +178,12 @@ pub(crate) fn fact_handle(db: &dyn SourceDatabase, key: FactKey) -> salsa::Id;
 pub(crate) fn unresolved_named(db: &dyn SourceDatabase, key: FactKey) -> Box<[(Name, ModPath)]>;
 ```
 
-`scc_state(r, anchor)`: members = `partition(r).members(comp)` mapped through
-`round_modules(r).order`. Start: if `r > 0` and `scc_state(r-1, anchor)` has the same members,
-its state (quick path first: no member gains an op at `r`, the env and prelude are the same,
-and every `upstream` entry is still `fact_handle(r, module)`: return that state's `round`,
+`scc_state(r, anchor)`, only for a component `round_active(r)` runs (else it stops, §9):
+members = `partition(r).members(comp)` mapped through `round_modules(r).order`. Start: if the
+component ran before (at `l = RoundModules::ran`) and `scc_state(l, anchor)` has the same
+members, its state (quick path first: no member gains an op at `r`, the env and prelude are the
+same, and every `upstream` entry is still that module's `fact_handle(fact_key(r, module))`:
+return that state's `round`,
 `handles` and `Arc` unchanged, no clone); else clone its `UnitState` (`// clone:` once per round
 a component changes) and replay `module_round(r, M)` per member, wake every unresolved and
 indeterminate import, re-pull every upstream glob source; else (merged or new) replay rounds
@@ -197,18 +206,27 @@ pub(crate) struct RoundResult { pub(crate) progress: bool, pub(crate) deferred_e
 pub(crate) fn resolve_round<'db, S: Sink<'db>>(cx: &CollectCx<'db>, sink: &mut S, side: &mut SideTables,
     pending: &mut Vec<MacroOp>, eager_with_errors: bool) -> RoundResult;
 /// The first `Attr` directive's position, for `RoundOutcome::first_attr`.
-pub(crate) fn first_attr(pending: &[MacroOp]) -> Option<u32>;
+pub(crate) fn first_attr<'p>(pending: impl IntoIterator<Item = &'p MacroOp>) -> Option<u32>;
 /// `reseed_with_unresolved_attribute` of `pending[index]`.
 pub(crate) fn reseed_at<'db, S: Sink<'db>>(cx: &CollectCx<'db>, sink: &mut S, side: &mut SideTables,
     pending: &mut Vec<MacroOp>, index: u32);
 /// `finish`'s unresolved-macro diagnostics for `pending`, as `Diagnostic` ops through `sink`.
-pub(crate) fn unresolved_macro_diagnostics<'db, S: Sink<'db>>(cx: &CollectCx<'db>, sink: &mut S, pending: &[MacroOp]);
+pub(crate) fn unresolved_macro_diagnostics<'db, 'p, S: Sink<'db>>(cx: &CollectCx<'db>, sink: &mut S,
+    pending: impl IntoIterator<Item = &'p MacroOp>);
+/// What a module has as a round starts: its last step's directives and tables, or what it
+/// started with (§9).
+pub(crate) struct Carried<'a>;
+impl<'a> Carried<'a> {
+    pub(crate) fn at(db: &'a dyn SourceDatabase, krate: Crate, modules: &RoundModules, at: u32) -> Carried<'a>;
+    pub(crate) fn directives(&self) -> impl Iterator<Item = &'a MacroOp> + 'a;
+    pub(crate) fn tables(&self) -> Arc<SideTables>;
+}
 ```
 
 `macro_step(r, M)` by `round_kind(r)`: `Normal` / `EagerWithErrors`: `resolve_round`;
 `Reseed { module, index }`: `reseed_at` when `module == M`, else nothing (`progress = true`
 for the reseeded module); `Final`: nothing. `StepSink`: own = `M`'s row with its scope cloned
-from `fact_handle(r, M)` (`// clone:` one module per step that has a directive; a step with no
+from `fact_handle(fact_key(r, M))` (`// clone:` one module per step that has a directive; a step with no
 pending directive and no reseed returns at once, cloning nothing) and the modules it declares
 (`ChildMode::Inline`, ids created here); every other module through `Rows::Round(r)`.
 
@@ -285,3 +303,78 @@ memoizes below the crate.
 | the round kinds follow the old loop | `driver.rs` tests: eager-with-errors and reseed fixtures |
 | the final scopes' glob ambiguities are settled as the old end of collection settled them | `driver.rs` `glob_ambiguities_are_settled_as_the_old_collector_settles_them` (the projection compares `glob_ambiguities`, `shadowed_imports`, `underscore_imports`) |
 | crate-wide equality, trace | `facts/tests/` (frontend-nameres-diff) |
+| a round runs only the modules it can change, and the map stays the old collector's | `facts/tests/active.rs` (§9) |
+| a component a round does not run keeps its facts, named by the round they changed at | `unit.rs` `an_unchanged_component_keeps_its_state` |
+| asking the state of a component the round does not run stops | `unit.rs` `the_state_of_a_component_the_round_does_not_run_stops` (`#[should_panic]`) |
+
+## 9. The active set
+
+A round after round 0 runs only over the modules it can change (request §1 of
+`v2/requests/frontend-nameres.md`). Same facts, same results: the assembled `DefMap` does not
+change, only which queries run.
+
+**What `round_modules(r)` knows before the fixed point.** Per module, `RoundModules` holds:
+
+- `STEP`: its macro step runs at `r`. At a `Normal` or `EagerWithErrors` round, a module steps
+  when it has directives. At `Reseed { module }`, only that module steps. At `Final`, none does.
+- `GAINS`: `module_round(r, M)` may have ops. At round 0 every module gains. Later, a module
+  gains when its own step of `r-1` made a resolution op in it or a step of `r-1` declared it.
+  The root also gains when another step of `r-1` made an op in it.
+- `PENDING`: it has directives as `r` starts.
+- `active`: the modules with `STEP` or `GAINS`, ascending.
+- `last_step`: the round of its last step.
+- `ran`: the last round its component ran at.
+- `since`: the last round its facts changed at, found by comparing `fact_handle(r-1)` with
+  `fact_handle(since)` for each module whose component ran at `r-1`.
+
+The columns are read off the steps of `r-1` that ran, so a module that no step touched costs a
+copy of its columns and no query. A module gains no directive after it starts, because
+`clone_resolution_op` and `clone_root_op` carry no `Macro`. So a module that does not step keeps
+its directives, and `macros::Carried::at` finds them: from its last step, or from what it
+started with (its round-0 log, or `module_round` of the round it was declared at).
+
+**Which components run: `round_active(r)`** (kind `0x2218`). It is its own query, not a column
+of `RoundModules`, because it needs `partition(r)`, which is built from `round_modules(r)`, and a
+merge can make a component run that no op or directive names. Every component runs at round 0,
+at `Final`, when `round_env` changes, and when the prelude holder or the prelude it resolves
+changes. Otherwise components are visited upstream first, and one runs when:
+
+- a member gains ops or is new;
+- its members are not those it had when it last ran;
+- a module in the `upstream` of its state from the last round it ran at is in a component that
+  runs.
+
+This is the cone of what can change, a superset taken from the reads actually made. The quick
+path still catches a component whose reads came back the same.
+
+The prelude holder's component is upstream of every other and reads none. So whether it runs
+needs only `GAINS` and its members (`unit::component_runs`, without `round_active`), and
+`round_active` may read its `scc_state(r)` to compare the prelude. A unit of that component that
+read a module outside it would show as a salsa cycle, as other unchecked reads do (§6).
+
+**Readers of an idle module.** A module whose component does not run keeps its facts. Every
+reader names them by `queries::fact_key(r, at)`, which is `FactKey(r)` when the component runs
+and `FactKey(since)` otherwise, so the read hits the memo that made them instead of a new key per
+round. The readers are `round_row`'s scope slots, `scc_state`'s upstream checks and handles, and
+the `StepSink`'s own scope. A step whose component does not run reads its unresolved imports at
+`ran_by(r, at)`. `scc_state`, `fact_handle` and `unresolved_named` of a component the round does
+not run stop with `"... a component the round does not run"`, so a missed reader shows at once
+and never makes a new key per round.
+
+**Only active modules run.** `macro_step` runs only for `STEP` modules. Every reader
+(`round_modules`, `module_round`, `round_env`, `round_progress`, `collect_crate`'s crate ops)
+iterates `RoundModules::stepping`. `module_round` runs only for `GAINS` modules: `import_shape`
+copies the old shape of any other module, and `replay_round` and the quick path skip them.
+`unresolved_named` is asked only by a step.
+
+**Round 0's macro queries.** `OpLog` keeps two flags as ops are pushed. `has_children` means a
+`Splice`. `writes_elsewhere` means a scope op of another module than the log's own, which in a
+round-0 log is a `#[macro_export]` or proc macro into the root. `subtree_macro_exports` returns
+at once for a log with neither flag. It reads a child without children of its own in place, and
+asks the query only of a child that has children. The root still asks it of each child, because
+that is the firewall between the root's collection and the subtrees. `legacy_exports` was
+already asked only of `#[macro_use]` children. `child_key` is a look-up in `module_decls`'
+children instead of a query. Its kind `0x2210` stays unused.
+
+**What still runs per round and module.** A `row` execution for each module an active view
+reads, and `RoundModules`' `O(m)` copy of its columns.

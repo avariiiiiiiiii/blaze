@@ -43,9 +43,12 @@
 //! (keyed by item, in [`ItemTree::attrs`]) sit in side tables. [`persist`] writes the columns as
 //! they are. Names, paths and visibilities are deduplicated within each top-level item, not
 //! across them, so a source file's tree is its items' rows one after the other: an edit keeps
-//! the rows of the items it did not change and lowers the others alone ([`items`]).
+//! the rows of the items it did not change and lowers the others alone ([`items`]). All the
+//! columns are one allocation: a header of where each ends, then the columns, placed by offsets
+//! (`block.rs`).
 
 mod attrs;
+mod block;
 mod items;
 mod lower;
 pub mod persist;
@@ -276,58 +279,64 @@ pub(crate) fn block_item_tree_query(
     ctx.lower_block(&block)
 }
 
-/// The item tree of a source file, as columns (the module's docs).
-#[derive(Debug, Default, Eq, PartialEq)]
-pub struct ItemTree {
-    top_level: Box<[ModItemId]>,
-    /// Per item: its kind, which payload column `data` indexes.
-    kinds: Box<[ItemKind]>,
-    /// Per item: its index in its kind's payload column.
-    data: Box<[u32]>,
-    /// Per item.
-    ast_ids: Box<[FileAstId<ast::Item>]>,
-    /// The items of inline modules and extern blocks, each list an [`IdRange`] of this.
-    children: Box<[ModItemId]>,
+block::columns! {
+    /// The item tree of a source file, as columns (the module's docs), all in one block: a salsa
+    /// memo has no lifetime group of its own, so it is one allocation of the global allocator,
+    /// made once a tree (none for a tree with no values).
+    pub struct ItemTree(ItemTreeColumn, ItemTreeLens, ItemTreeSinks) {
+        top_level: ModItemId,
+        /// Per item: its kind, which payload column `data` indexes.
+        kinds: ItemKind,
+        /// Per item: its index in its kind's payload column.
+        data: u32,
+        /// Per item.
+        ast_ids: FileAstId<ast::Item>,
+        /// The items of inline modules and extern blocks, each list an [`IdRange`] of this.
+        children: ModItemId,
 
-    consts: Box<[Const]>,
-    enums: Box<[Enum]>,
-    extern_blocks: Box<[ExternBlock]>,
-    extern_crates: Box<[ExternCrate]>,
-    functions: Box<[Function]>,
-    impls: Box<[Impl]>,
-    macro2s: Box<[Macro2]>,
-    macro_calls: Box<[MacroCall]>,
-    macro_rules: Box<[MacroRules]>,
-    mods: Box<[Mod]>,
-    statics: Box<[Static]>,
-    structs: Box<[Struct]>,
-    traits: Box<[Trait]>,
-    type_aliases: Box<[TypeAlias]>,
-    unions: Box<[Union]>,
-    uses: Box<[Use]>,
+        consts: Const,
+        enums: Enum,
+        extern_blocks: ExternBlock,
+        extern_crates: ExternCrate,
+        functions: Function,
+        impls: Impl,
+        macro2s: Macro2,
+        macro_calls: MacroCall,
+        macro_rules: MacroRules,
+        mods: Mod,
+        statics: Static,
+        structs: Struct,
+        traits: Trait,
+        type_aliases: TypeAlias,
+        unions: Union,
+        uses: Use,
 
-    /// Every `use` tree of the tree's `use` items, each child before its parent.
-    use_trees: Box<[UseTree]>,
-    /// The children of prefixed `use` trees, each list an [`IdRange`] of this.
-    use_tree_lists: Box<[UseTreeId]>,
-    /// The visibilities a struct's value-namespace constructor is the least of, each struct's an
-    /// [`IdRange`] of this.
-    ctor_vis: Box<[RawVisibilityId]>,
+        /// Every `use` tree of the tree's `use` items, each child before its parent.
+        use_trees: UseTree,
+        /// The children of prefixed `use` trees, each list an [`IdRange`] of this.
+        use_tree_lists: UseTreeId,
+        /// The visibilities a struct's value-namespace constructor is the least of, each
+        /// struct's an [`IdRange`] of this.
+        ctor_vis: RawVisibilityId,
 
-    names: Box<[Name]>,
-    paths: Box<[ModPath]>,
-    vis: Box<[RawVisibility]>,
+        names: Name,
+        paths: ModPath,
+        vis: RawVisibility,
 
-    /// Sorted by owner. The last, if its owner is [`ModItemId::TOP_OWNER`], is the top level's.
-    attr_owners: Box<[AttrOwner]>,
-    /// Which items have an owner in `attr_owners`, and where: made from it ([`attr_index`]),
-    /// so not written ([`persist`]).
-    attr_index: Box<[AttrBlock]>,
-    /// Every item's attributes, each item's an [`IdRange`] of this.
-    attrs: Box<[Attr]>,
-    /// The `cfg`s that disable items.
-    cfgs: Box<[CfgExpr]>,
+        /// Sorted by owner. The last, if its owner is [`ModItemId::TOP_OWNER`], is the top
+        /// level's.
+        attr_owners: AttrOwner,
+        /// Which items have an owner in `attr_owners`, and where: made from it ([`attr_blocks`]),
+        /// so not written ([`persist`]).
+        attr_index: AttrBlock,
+        /// Every item's attributes, each item's an [`IdRange`] of this.
+        attr_list: Attr,
+        /// The `cfg`s that disable items.
+        cfgs: CfgExpr,
+    }
 }
+
+const _: () = assert!(size_of::<ItemTree>() == size_of::<usize>());
 
 /// Bytes per item in the per-item columns (`kinds`, `data`, `ast_ids`); its kind's payload
 /// record (at most 16 bytes, [`Struct`] and [`Mod`]) is in its own column.
@@ -346,33 +355,40 @@ struct AttrBlock {
 const _: () = assert!(size_of::<AttrBlock>() == 16);
 
 /// The [`AttrBlock`]s of a tree of `items` items whose attribute owners are `owners`, sorted
-/// and in the tree (what `persist`'s `check` holds a decoded tree to).
-fn attr_index(owners: &[AttrOwner], items: usize) -> Box<[AttrBlock]> {
-    // alloc: the tree's column, once a tree at its length; none for a tree of no items
-    let mut blocks = vec![AttrBlock::default(); items.div_ceil(64)].into_boxed_slice();
-    for owner in owners.iter().filter(|owner| owner.owner != ModItemId::TOP_OWNER) {
-        let at = owner.owner.index as usize;
-        blocks[at / 64].bits |= 1 << (at % 64);
-    }
+/// and in the tree (what `persist`'s `check` holds a decoded tree to), in order: one pass, so
+/// they are written straight into the tree's block. Owners out of that order or past `items`
+/// (a buffer `check` refuses) make blocks that are wrong, never a panic.
+fn attr_blocks(owners: &[AttrOwner], items: usize) -> impl ExactSizeIterator<Item = AttrBlock> {
+    let mut owners = (owners.iter())
+        .filter(|owner| owner.owner != ModItemId::TOP_OWNER)
+        .map(|owner| owner.owner.index as usize)
+        .peekable();
     let mut before = 0;
-    for block in blocks.iter_mut() {
-        block.before = before;
-        before += block.bits.count_ones();
-    }
-    blocks
+    (0..items.div_ceil(64)).map(move |block| {
+        let mut bits = 0u64;
+        while let Some(&at) = owners.peek()
+            && at / 64 == block
+        {
+            bits |= 1 << (at % 64);
+            owners.next();
+        }
+        let it = AttrBlock { bits, before };
+        before += bits.count_ones();
+        it
+    })
 }
 
 impl ItemTree {
     /// Returns an iterator over all items located at the top level of the `HirFileId` this
     /// `ItemTree` was created from.
     pub(crate) fn top_level_items(&self) -> &[ModItemId] {
-        &self.top_level
+        self.top_level()
     }
 
     /// Returns the inner attributes of the source file.
     #[inline]
     pub(crate) fn top_level_attrs(&self) -> Option<AttrsOrCfgRef<'_>> {
-        self.attr_owners
+        self.attr_owners()
             .last()
             .filter(|owner| owner.owner == ModItemId::TOP_OWNER)
             .map(|owner| self.attrs_of(owner))
@@ -386,28 +402,28 @@ impl ItemTree {
 
     #[inline]
     pub(crate) fn attrs(&self, of: ModItemId) -> Option<AttrsOrCfgRef<'_>> {
-        let block = self.attr_index.get(of.index as usize / 64)?;
+        let block = self.attr_index().get(of.index as usize / 64)?;
         let bit = 1u64 << (of.index % 64);
         if block.bits & bit == 0 {
             return None;
         }
         let at = block.before + (block.bits & (bit - 1)).count_ones();
-        Some(self.attrs_of(&self.attr_owners[at as usize]))
+        Some(self.attrs_of(&self.attr_owners()[at as usize]))
     }
 
     #[inline]
     fn attrs_of(&self, owner: &AttrOwner) -> AttrsOrCfgRef<'_> {
-        let attrs = Attrs::new(&self.attrs[owner.attrs.range()]);
+        let attrs = Attrs::new(&self.attr_list()[owner.attrs.range()]);
         match owner.cfg {
             AttrOwner::ENABLED => AttrsOrCfgRef::Enabled { attrs },
-            cfg => AttrsOrCfgRef::CfgDisabled(&self.cfgs[cfg as usize], attrs),
+            cfg => AttrsOrCfgRef::CfgDisabled(&self.cfgs()[cfg as usize], attrs),
         }
     }
 
     /// The items of an inline module's or an extern block's list.
     #[inline]
     pub(crate) fn items(&self, list: IdRange) -> &[ModItemId] {
-        &self.children[list.range()]
+        &self.children()[list.range()]
     }
 
     /// Whether `m` is inline, and its items if so.
@@ -422,7 +438,7 @@ impl ItemTree {
     /// The visibility of a struct's constructor in the value namespace, if it has one.
     #[inline]
     pub(crate) fn value_ns_ctor(&self, s: &Struct) -> StructValueNsCtor<'_> {
-        let all = &self.ctor_vis[s.value_ns_ctor.range()];
+        let all = &self.ctor_vis()[s.value_ns_ctor.range()];
         match all {
             [] => StructValueNsCtor::NoValueNsCtor,
             [vis] => StructValueNsCtor::ValueNsCtorWithVis(vis),
@@ -451,7 +467,7 @@ impl ItemTree {
 
     #[inline]
     pub fn use_tree(&self, id: UseTreeId) -> &UseTree {
-        &self.use_trees[id.raw as usize]
+        &self.use_trees()[id.raw as usize]
     }
 
     /// Returns a count of a few, expensive items.
@@ -459,11 +475,11 @@ impl ItemTree {
     /// For more detail, see [`ItemTreeDataStats`].
     pub fn item_tree_stats(&self) -> ItemTreeDataStats {
         ItemTreeDataStats {
-            traits: self.traits.len(),
-            impls: self.impls.len(),
-            mods: self.mods.len(),
-            macro_calls: self.macro_calls.len(),
-            macro_rules: self.macro_rules.len(),
+            traits: self.traits().len(),
+            impls: self.impls().len(),
+            mods: self.mods().len(),
+            macro_calls: self.macro_calls().len(),
+            macro_rules: self.macro_rules().len(),
         }
     }
 
@@ -475,7 +491,7 @@ impl ItemTree {
     fn is_empty(&self) -> bool {
         // We don't need to check the rest since if those are empty, everything is empty.
         // `attr_owners` might hold the top-level attrs so we need to check it separately.
-        self.top_level.is_empty() && self.attr_owners.is_empty()
+        self.top_level().is_empty() && self.attr_owners().is_empty()
     }
 }
 
@@ -483,7 +499,7 @@ impl Index<NameId> for ItemTree {
     type Output = Name;
     #[inline]
     fn index(&self, id: NameId) -> &Name {
-        &self.names[id.raw as usize]
+        &self.names()[id.raw as usize]
     }
 }
 
@@ -491,7 +507,7 @@ impl Index<PathId> for ItemTree {
     type Output = ModPath;
     #[inline]
     fn index(&self, id: PathId) -> &ModPath {
-        &self.paths[id.raw as usize]
+        &self.paths()[id.raw as usize]
     }
 }
 
@@ -564,7 +580,7 @@ impl ModItemId {
 
     #[inline]
     pub(crate) fn ast_id(self, item_tree: &ItemTree) -> FileAstId<ast::Item> {
-        item_tree.ast_ids[self.index as usize]
+        item_tree.ast_ids()[self.index as usize]
     }
 }
 
@@ -597,16 +613,16 @@ macro_rules! mod_items {
             #[inline]
             pub(crate) fn index(&self, id: ModItemId) -> $mod_item<'_> {
                 let at = id.index as usize;
-                let (ast_id, data) = (self.ast_ids[at], self.data[at] as usize);
-                match self.kinds[at] {
-                    $( ItemKind::$typ => $mod_item::$typ(ast_id.downcast_unchecked(), &self.$column[data]), )+
+                let (ast_id, data) = (self.ast_ids()[at], self.data()[at] as usize);
+                match self.kinds()[at] {
+                    $( ItemKind::$typ => $mod_item::$typ(ast_id.downcast_unchecked(), &self.$column()[data]), )+
                 }
             }
 
             /// How long the payload column of `kind` is.
             fn column_len(&self, kind: ItemKind) -> usize {
                 match kind {
-                    $( ItemKind::$typ => self.$column.len(), )+
+                    $( ItemKind::$typ => self.$column().len(), )+
                 }
             }
         }
@@ -656,7 +672,7 @@ impl Index<RawVisibilityId> for ItemTree {
             RawVisibilityId::PRIV_EXPLICIT => &VIS_PRIV_EXPLICIT,
             RawVisibilityId::PUB => &VIS_PUB,
             RawVisibilityId::PUB_CRATE => &VIS_PUB_CRATE,
-            _ => &self.vis[index.raw as usize],
+            _ => &self.vis()[index.raw as usize],
         }
     }
 }
@@ -986,7 +1002,7 @@ impl UseTree {
             UseTree::GLOB => UseTreeKind::Glob { path },
             _ => UseTreeKind::Prefixed {
                 prefix: path,
-                list: &tree.use_tree_lists[self.list.range()],
+                list: &tree.use_tree_lists()[self.list.range()],
             },
         }
     }

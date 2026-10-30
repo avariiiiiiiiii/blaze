@@ -818,7 +818,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         })
     }
 
-    pub(crate) fn lower_path_as_const(&mut self, path: &Path, _const_type: Ty<'db>) -> Const<'db> {
+    pub(crate) fn lower_path_as_const(&mut self, path: Path<'_>, _const_type: Ty<'db>) -> Const<'db> {
         path_to_const(self.db, self.resolver, &|| self.generics(), self.forbid_params_after, path)
             .unwrap_or({
                 // FIXME: Report an error.
@@ -1221,12 +1221,12 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         PathLoweringContext::new(
             self,
             Self::on_path_diagnostic_callback(path_id.type_ref()),
-            &self.store[path_id],
+            self.store.path(path_id),
         )
         .with_hygiene(hygiene)
     }
 
-    pub(crate) fn lower_path(&mut self, path: &Path, path_id: PathId) -> (Ty<'db>, Option<TypeNs>) {
+    pub(crate) fn lower_path(&mut self, path: Path<'_>, path_id: PathId) -> (Ty<'db>, Option<TypeNs>) {
         // Resolve the path (in type namespace)
         if let Some(type_ref) = path.type_anchor() {
             let (ty, res) = self.lower_ty_ext(type_ref);
@@ -1252,7 +1252,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
     /// The type the qualifier of the value path `path` names, `A<'a>` of `A::<'a>::C`, where
     /// it is a struct, enum, union or type alias.
-    pub fn lower_value_path_qualifier(&mut self, path: &Path) -> Option<Ty<'db>> {
+    pub fn lower_value_path_qualifier(&mut self, path: Path<'_>) -> Option<Ty<'db>> {
         let qualifier = path.qualifier()?;
         let on_diagnostic = PathDiagnosticCallback {
             data: Either::Left(PathDiagnosticCallbackData(TypeRefId::from_raw(
@@ -1260,7 +1260,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             ))),
             callback: |_, _, _| {},
         };
-        let mut ctx = PathLoweringContext::new(self, on_diagnostic, &qualifier);
+        let mut ctx = PathLoweringContext::new(self, on_diagnostic, qualifier.path());
         match ctx.resolve_path_in_type_ns()? {
             (resolution @ (TypeNs::AdtId(_) | TypeNs::TypeAliasId(_)), None) => {
                 Some(ctx.lower_partly_resolved_path(resolution, false, Span::Dummy).0)
@@ -1317,7 +1317,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         match where_predicate {
             WherePredicate::TypeBound { lifetimes, target, bound } => match lifetimes {
                 Some(lifetimes) => {
-                    self.with_shifted_in(lifetimes, |ctx| lower_type_outlives(ctx, target, bound)).0
+                    self.with_shifted_in(self.store.names(*lifetimes), |ctx| lower_type_outlives(ctx, target, bound)).0
                 }
                 None => lower_type_outlives(self, target, bound),
             },
@@ -1392,10 +1392,11 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             // `for<'a, 'b> <T as A<'a>>::X: B<'a, 'b>`: a binder of its own would leave `'a`
             // escaping. The variables a level binds come before those left out of it, so a
             // level that already has one of those keeps the binder of its own.
-            &TypeBound::ForLifetime(ref binder, path)
+            &TypeBound::ForLifetime(binder, path)
                 if of_assoc_ty
                     && self.bound_vars_with_elided().len() == self.peek_bound_vars().len() =>
             {
+                let binder = self.store.names(binder);
                 let top = self.bound_vars.last_mut().unwrap();
                 let (names, kinds) = (top.0.len(), top.1);
                 top.0.extend(binder.iter().cloned());
@@ -1407,8 +1408,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 top.0.truncate(names);
                 top.1 = kinds;
             }
-            &TypeBound::ForLifetime(ref binder, path) => {
-                self.with_shifted_in(binder, |ctx| {
+            &TypeBound::ForLifetime(binder, path) => {
+                self.with_shifted_in(self.store.names(binder), |ctx| {
                     ctx.with_elision(false, |ctx| lower_path_bound(ctx, path))
                 })
                 .0
@@ -2762,7 +2763,7 @@ impl SupertraitsInfo {
                     _ => continue,
                 }
                 let Some(TypeNs::TraitId(bounded_trait)) =
-                    resolver.resolve_path_in_type_ns_fully(db, &signature.store[bounded_trait])
+                    resolver.resolve_path_in_type_ns_fully(db, signature.store.path(bounded_trait))
                 else {
                     continue;
                 };
@@ -4167,7 +4168,7 @@ fn input_lifetimes(
                 match bound {
                     TypeBound::Lifetime(it) => found.push(lifetime(Some(*it))?),
                     TypeBound::Path(path, _) => {
-                        path_lifetimes(db, resolver, store, &store[*path], found, self_references)?
+                        path_lifetimes(db, resolver, store, store.path(*path), found, self_references)?
                     }
                     _ => return None,
                 }
@@ -4183,7 +4184,7 @@ fn path_lifetimes(
     db: &Db,
     resolver: &Resolver<'_>,
     store: &ExpressionStore,
-    path: &Path,
+    path: Path<'_>,
     found: &mut Vec<Option<LifetimeRefId>>,
     self_references: &mut Vec<usize>,
 ) -> Option<()> {

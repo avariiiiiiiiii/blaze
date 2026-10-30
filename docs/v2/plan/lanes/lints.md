@@ -46,7 +46,8 @@ the same passes. v2 does that per body, as queries:
 
 ## Blaze's own lints (`blaze::`)
 
-`hot_clone`, `hot_alloc`, `hot_dyn` (the group `blaze::hot`) and `std_hashmap`, typed, in
+`hot_clone`, `hot_alloc`, `hot_dyn` and `std_hashmap` (all four the group `blaze::hot`, as
+hot_lint.py checks SipHash maps in hot crates too), typed, in
 `crates/blaze-lints/src/blaze/` ([lints/blaze.md](lints/blaze.md)). They are `allow` by
 default, so a crate that doesn't opt in sees nothing (superset-of-rust). A crate opts in by
 `[lints.blaze]` in its manifest (`hot_alloc = "deny"`), which blaze gives as

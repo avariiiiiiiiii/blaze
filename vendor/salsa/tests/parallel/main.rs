@@ -23,6 +23,7 @@ mod cycle_provisional_depending_on_itself;
 mod interned_reuse;
 mod lru_eviction_cancels_cycle;
 mod memo_table_first_insert;
+mod stop_readers;
 
 #[cfg(not(feature = "shuttle"))]
 pub(crate) mod sync {

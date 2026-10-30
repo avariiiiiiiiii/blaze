@@ -48,11 +48,7 @@ mod sealed {
 
 /// hir-ty's queries as methods of the one database, [`Db`]: `db.ty(def)` is a static call to a
 /// body the caller can inline. It has one impl, and it is not dyn-compatible, so no caller
-/// can take a `dyn` database and pay a vtable call on every hit:
-///
-/// ```compile_fail
-/// fn f(_: &Db) {}
-/// ```
+/// can take a `dyn` database and pay a vtable call on every hit.
 pub trait HirDatabase: sealed::Sealed {
     #[doc(hidden)]
     const NOT_DYN: () = ();
@@ -1220,52 +1216,9 @@ impl<'db> GeneralConstId<'db> {
 /// why-did-this-rerun explainer: hir-ty's part of blaze-query's `FRONT` range. A number is
 /// never given to another query, nor reused once its query is gone.
 pub mod kinds {
-    pub use blaze_query::QueryKind;
+    blaze_query::query_kinds! {
+        range: 0x2400..0x2600, owner: "hir-ty";
 
-    /// The numbers hir-ty may give.
-    pub const RANGE: std::ops::Range<u16> = 0x2400..0x2600;
-
-    macro_rules! kinds {
-        ($($(#[$meta:meta])* $name:ident = $number:literal, $query:literal;)*) => {
-            $($(#[$meta])* pub const $name: QueryKind = QueryKind($number);)*
-
-            /// Every kind, with its query as hir-ty names it: a function's name, or
-            /// `Type::method` for a method of a tracked `impl`.
-            pub const ALL: &[(QueryKind, &str)] = &[$(($name, $query)),*];
-
-            /// The kind of the query or interned id hir-ty names `name`, as [`ALL`] names it.
-            pub fn of(name: &str) -> Option<QueryKind> {
-                match name {
-                    $($query => Some($name),)*
-                    _ => None,
-                }
-            }
-        };
-    }
-
-    /// Each number of [`RANGE`] with the query it is given to, built when compiled: a lookup
-    /// is one bounds check and one load, 8 KiB. Building it refuses a number outside the range
-    /// or given twice.
-    const NAMES: [Option<&str>; (RANGE.end - RANGE.start) as usize] = {
-        let mut names = [None; (RANGE.end - RANGE.start) as usize];
-        let mut at = 0;
-        while at < ALL.len() {
-            let (kind, name) = ALL[at];
-            assert!(RANGE.start <= kind.0 && kind.0 < RANGE.end, "a kind outside hir-ty's range");
-            let slot = (kind.0 - RANGE.start) as usize;
-            assert!(names[slot].is_none(), "a kind given to two queries");
-            names[slot] = Some(name);
-            at += 1;
-        }
-        names
-    };
-
-    /// The query or interned id of `kind`, if it is hir-ty's.
-    pub fn name(kind: QueryKind) -> Option<&'static str> {
-        NAMES.get(kind.0.wrapping_sub(RANGE.start) as usize).copied().flatten()
-    }
-
-    kinds! {
         // Bodies.
         INFER = 0x2400, "infer_body_query";
         INFER_ANON_CONST = 0x2401, "infer_anon_const_body_query";
@@ -1399,6 +1352,17 @@ pub mod kinds {
             "monomorphized_optimized_mir_body_for_coroutine_query";
         MONOMORPHIZED_OPTIMIZED_MIR_BODY_FOR_COROUTINE_BY_MOVE = 0x24a7,
             "monomorphized_optimized_mir_body_for_coroutine_by_move_query";
+
+        // Per-module impl tables.
+        INHERENT_IMPLS_FOR_MODULE = 0x24b0, "InherentImpls::for_module";
+        INHERENT_IMPLS_MODULES_BY_SELF_TY = 0x24b1, "InherentImpls::modules_by_self_ty";
+        INHERENT_IMPLS_MODULES_OF_SELF_TY = 0x24b2, "InherentImpls::modules_of_self_ty";
+        INHERENT_IMPLS_IN_MODULE_FOR_SELF_TY = 0x24b3, "InherentImpls::in_module_for_self_ty";
+        TRAIT_IMPLS_FOR_MODULE = 0x24b4, "TraitImpls::for_module";
+        TRAIT_IMPLS_MODULES_BY_TRAIT = 0x24b5, "TraitImpls::modules_by_trait";
+        TRAIT_IMPLS_MODULES_OF_TRAIT = 0x24b6, "TraitImpls::modules_of_trait";
+        TRAIT_IMPLS_IN_MODULE_FOR_TRAIT = 0x24b7, "TraitImpls::in_module_for_trait";
+        TRAIT_IMPLS_FOR_CRATE_AND_TRAIT = 0x24b8, "TraitImpls::for_crate_and_trait";
 
         // Inputs.
         FROZEN_IMPLS = 0x25e0, "FrozenImpls";

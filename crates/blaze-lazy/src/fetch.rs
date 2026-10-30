@@ -229,6 +229,18 @@ impl Fetcher {
         }
     }
 
+    /// `id`'s code was published again, at `target` (a tier-up), so a late ask (a thread that
+    /// loaded the slot before its first store) is answered with code that is not retired.
+    /// `false`, and nothing changes, when `id` was not published.
+    pub fn retarget(&mut self, id: LazyId, target: u64) -> bool {
+        let at = id.index();
+        if self.state.get(at) != Some(&State::Ready) {
+            return false;
+        }
+        self.target[at] = target;
+        true
+    }
+
     /// Where `id`'s code was published, once it was.
     pub fn target(&self, id: LazyId) -> Option<u64> {
         (self.state.get(id.index()) == Some(&State::Ready)).then(|| self.target[id.index()])

@@ -11,7 +11,7 @@ use crate::{
     lints::code_fact,
     lower::{
         Found, Phase,
-        break_outside_of_loop::{ancestors, is_item},
+        break_outside_of_loop::{edges, is_item},
     },
     model::Diag,
 };
@@ -24,10 +24,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ReturnOutsideFunction) -> Vec<Foun
     };
     let span = cx.span_of(at);
     let mut diag = Diag::error(Some("E0572"), format!("{kind} statement outside of function body"), span);
-    let chain = ancestors(cx, &cx.syntax(at));
     let mut body = None;
-    for (i, it) in chain.iter().enumerate().skip(1) {
-        let child = &chain[i - 1];
+    for (it, child) in edges(cx, &cx.syntax(at)) {
         if body.is_none() {
             let is_body = ast::ConstArg::can_cast(it.value.kind())
                 || ast::BlockExpr::cast(it.value.clone()).is_some_and(|it| it.const_token().is_some())

@@ -179,6 +179,25 @@ impl Disk {
         self.cursor()
     }
 
+    /// A `utimensat` of `name`: its inode's mtime is `modified_ns` and its change time moves, as
+    /// on a real disk. `false`, and nothing done, where `name` is neither a file nor a directory.
+    pub(super) fn times(&mut self, name: &FileName, modified_ns: u64, files: &FxHashMap<FileName, SimFile>) -> bool {
+        if self.stamp(name, files) == Stamp::GONE {
+            return false;
+        }
+        let now = self.tick();
+        let inode = self.inodes.get_mut(name).expect("stamped, so it has an inode");
+        (inode.mtime, inode.ctime) = (modified_ns, now);
+        // clone: the simulated journal's entry.
+        self.log.push(Entry::Changed(name.clone()));
+        true
+    }
+
+    /// The mtime of `name`'s inode, where it has one, without making one.
+    pub(super) fn mtime(&self, name: &FileName) -> Option<u64> {
+        self.inodes.get(name).map(|it| it.mtime)
+    }
+
     /// What `name` is now.
     pub(super) fn stamp(&mut self, name: &FileName, files: &FxHashMap<FileName, SimFile>) -> Stamp {
         if let Some(file) = files.get(name) {

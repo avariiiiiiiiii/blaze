@@ -4,9 +4,11 @@ use object::{Endianness, SymbolIndex, elf};
 use super::dynamic::{elf_hash, gnu_hash};
 use super::image::section_name;
 use super::{Elf, Segment, in_file, section, writer};
+use std::sync::Mutex;
+
 use crate::model::{
-    Bind, Class, Counts, Export, Function, GotEntry, Holds, Import, Library, Placed, Plan, Region, Special, SymbolKind,
-    Tls, Writer,
+    Bind, Class, Counts, Delta, Export, Function, GotEntry, Holds, Import, Library, Placed, Plan, Region, Special, Splice,
+    SymbolKind, Tls, Writer,
 };
 use crate::output::Debug;
 use crate::{Format, Output, OutputKind};
@@ -55,8 +57,9 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// An incremental `output` gets a writer that keeps its tables.
     fn new(output: Output, pieces: &[(Class, u64, u64)], counts: &Counts) -> Fixture {
-        let writer = Elf { output };
+        let writer = Elf { last: output.incremental.then(Mutex::default), output };
         let plan = writer.plan();
         let mut wanted = pieces.to_vec();
         for (class, size) in writer.synthetic(counts) {
@@ -112,7 +115,19 @@ impl Fixture {
     }
 
     fn with<R>(&self, then: impl FnOnce(&Placed<'_>) -> R) -> R {
-        let contents: Vec<&[u8]> = self.contents.iter().map(Vec::as_slice).collect();
+        self.with_in(&self.contents, 0, None, then)
+    }
+
+    /// The `Placed` of the image with `contents` for its regions' bytes, of synthesis
+    /// `synthesis` with `delta`.
+    fn with_in<R>(
+        &self,
+        contents: &[Vec<u8>],
+        synthesis: u64,
+        delta: Option<&Delta<'_>>,
+        then: impl FnOnce(&Placed<'_>) -> R,
+    ) -> R {
+        let contents: Vec<&[u8]> = contents.iter().map(Vec::as_slice).collect();
         then(&Placed {
             output: &self.writer.output,
             name: "image",
@@ -133,10 +148,22 @@ impl Fixture {
             init: None,
             fini: None,
             symbol: &|_| None,
-            synthesis: 0,
-            delta: None,
+            synthesis,
+            delta,
             encoded: &[],
         })
+    }
+
+    /// Synthesizes with `writer`, then makes the file's parts with the synthetic regions'
+    /// bytes where the core puts them, both of synthesis `synthesis` with `delta`.
+    fn build(&self, writer: &Elf, synthesis: u64, delta: Option<&Delta<'_>>) -> (Vec<(Class, Vec<u8>)>, Vec<(u64, Vec<u8>)>) {
+        let tables = self.with_in(&self.contents, synthesis, delta, |placed| writer.synthesize(placed)).unwrap();
+        let mut contents = self.contents.clone();
+        for (class, bytes) in &tables {
+            contents[self.index(class)] = bytes.clone();
+        }
+        let file = self.with_in(&contents, synthesis, delta, |placed| writer.file(placed)).unwrap();
+        (tables, file.parts)
     }
 
     fn synthesize(&self) -> Result<Vec<(Class, Vec<u8>)>, crate::LinkError> {
@@ -634,7 +661,7 @@ fn sections_are_placed_as_lld_places_them() {
 
 #[test]
 fn order_makes_four_segments() {
-    let writer = Elf { output: executable() };
+    let writer = Elf { output: executable(), last: None };
     let mut classes = vec![
         Class::Bss,
         Class::Got,
@@ -667,7 +694,7 @@ fn order_makes_four_segments() {
 
 #[test]
 fn specials() {
-    let writer = Elf { output: executable() };
+    let writer = Elf { output: executable(), last: None };
     assert_eq!(writer.special("__ehdr_start"), Some(Special::ImageBase));
     assert_eq!(writer.special("__dso_handle"), Some(Special::ImageBase));
     assert_eq!(writer.special("__blaze_live"), Some(Special::LiveDescriptor));
@@ -948,8 +975,8 @@ fn many_functions_are_named_in_the_symbol_table() {
             windows: None,
             name: match at % 7 {
                 0 => None,
-                3 if at == 3 => Some(String::new()),
-                _ => Some(format!("_ZN4test8function{at}E")),
+                3 if at == 3 => Some("".into()),
+                _ => Some(format!("_ZN4test8function{at}E").into()),
             },
         })
         .collect();
@@ -1182,4 +1209,207 @@ fn dynamic_tables_allocate_nothing_per_symbol() {
     let (small, large) = (used(64), used(2000));
     assert_eq!(small.allocations, large.allocations, "the dynamic tables allocate per symbol");
     assert!(large.allocations <= 22, "the dynamic tables: {} allocations, budget 22", large.allocations);
+}
+
+/// The functions of [`relinked`].
+const RELINKED: usize = 40;
+
+fn incremental() -> Output {
+    let mut output = executable();
+    output.incremental = true;
+    output
+}
+
+/// Function `at`'s name, all of one length.
+fn relinked_name(at: usize, letter: char) -> String {
+    format!("_ZN4test1{letter}{at:02}E")
+}
+
+/// An incremental image of [`RELINKED`] functions of 16 bytes, each named and with its FDE,
+/// and a slid pointer to each in every other 8 bytes of `.data`; a GOT cell holding the
+/// first, and a bind between the pointers.
+fn relinked() -> Fixture {
+    let n = RELINKED;
+    let names: Vec<String> = (0..n).map(|at| relinked_name(at, 'f')).collect();
+    let eh_frame_len = eh_frame(&vec![(0, 16); n]).len() as u64;
+    let counts = Counts {
+        functions: n as u64,
+        function_names: names.iter().map(|it| it.len() as u64).sum(),
+        absolute: n as u64 + 4,
+        got: 1,
+        fdes: n as u64,
+        imports: 1,
+        import_names: 6,
+        libraries: 1,
+        library_names: 9,
+        ..Counts::default()
+    };
+    let pieces = [
+        (Class::Text, 16 * n as u64, 16),
+        (Class::Data, 16 * n as u64, 8),
+        (Class::Got, 8, 8),
+        (Class::EhFrame, eh_frame_len, 8),
+    ];
+    let mut image = Fixture::new(incremental(), &pieces, &counts);
+    let (text, data, got) = (image.at(&Class::Text), image.at(&Class::Data), image.at(&Class::Got));
+    image.entry = Some(text);
+    image.functions = (names.iter().enumerate())
+        .map(|(at, name)| Function { addr: text + 16 * at as u64, size: 16, fde: None, windows: None, name: Some(name.as_str().into()) })
+        .collect();
+    for at in 0..n {
+        image.put(&Class::Data, 16 * at, &(text + 16 * at as u64).to_le_bytes());
+    }
+    image.put(&Class::Got, 0, &text.to_le_bytes());
+    image.got = vec![GotEntry { addr: got, holds: Holds::Local(text) }];
+    image.rebase = std::iter::once(got).chain((0..n as u64).map(|at| data + 16 * at)).collect();
+    image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: false }];
+    image.imports = vec![import("malloc", Some(0), None, false)];
+    image.binds = vec![Bind { addr: data + 8, import: 0, addend: 0 }];
+    let fdes: Vec<(u64, u32)> = (0..n as u64).map(|at| (text + 16 * at, 16)).collect();
+    image.put(&Class::EhFrame, 0, &eh_frame(&fdes));
+    image
+}
+
+fn splice(old: std::ops::Range<u32>, new: std::ops::Range<u32>) -> Splice {
+    Splice { old, new }
+}
+
+fn delta<'a>(
+    from: u64,
+    functions: &'a [Splice],
+    rebase: &'a [Splice],
+    got: &'a [Splice],
+    written: &'a [(u64, u64)],
+) -> Delta<'a> {
+    Delta { functions, rebase, got, binds: &[], same_names: true, same_regions: true, written, from }
+}
+
+/// How many builds of `.rela.dyn`, `.eh_frame_hdr` and the symbol table the image's writer
+/// patched.
+fn patched(image: &Fixture) -> [u32; 3] {
+    let last = image.writer.last().unwrap();
+    [last.rela.patched, last.eh_frame_hdr.patched, last.symtab.patched]
+}
+
+fn table<'t>(tables: &'t [(Class, Vec<u8>)], name: &'static str) -> &'t [u8] {
+    &tables.iter().find(|it| it.0 == Class::Synthetic(name)).unwrap().1
+}
+
+/// The range of addresses where `new` differs from `old`, both at `at`.
+fn changed(old: &[u8], new: &[u8], at: u64) -> (u64, u64) {
+    let first = old.iter().zip(new).position(|(a, b)| a != b).unwrap();
+    let last = old.iter().zip(new).rposition(|(a, b)| a != b).unwrap();
+    (at + first as u64, (last + 1 - first) as u64)
+}
+
+/// Builds the image with its own writer, which kept its last tables, as synthesis
+/// `synthesis` with `delta`, and with a fresh writer from nothing: the same tables and
+/// file. The first's.
+fn relinks_as_built(image: &Fixture, synthesis: u64, delta: &Delta<'_>) -> (Vec<(Class, Vec<u8>)>, Vec<(u64, Vec<u8>)>) {
+    let relinked = image.build(&image.writer, synthesis, Some(delta));
+    let fresh = Elf { output: image.writer.output.clone(), last: None };
+    let built = image.build(&fresh, synthesis, None);
+    assert_eq!(relinked.0, built.0, "the synthetic regions");
+    assert_eq!(relinked.1, built.1, "the file's parts");
+    relinked
+}
+
+/// A pointer moved with its slid address, one pointing elsewhere, and a GOT cell holding
+/// another function: the `RELATIVE` run patched in place is the one a build makes.
+#[test]
+fn a_relink_patches_rela_dyn_as_a_build_makes_it() {
+    let mut image = relinked();
+    let (first, _) = image.build(&image.writer, 1, None);
+    assert_eq!(patched(&image), [0, 0, 0]);
+    let (text, data) = (image.at(&Class::Text), image.at(&Class::Data));
+    // Function 5's pointer moves 8 bytes on and to function 6; function 9's points at
+    // function 20; the GOT cell holds function 1.
+    image.put(&Class::Data, 16 * 5, &[0; 8]);
+    image.put(&Class::Data, 16 * 5 + 8, &(text + 16 * 6).to_le_bytes());
+    image.rebase[1 + 5] = data + 16 * 5 + 8;
+    image.put(&Class::Data, 16 * 9, &(text + 16 * 20).to_le_bytes());
+    image.put(&Class::Got, 0, &(text + 16).to_le_bytes());
+    image.got[0].holds = Holds::Local(text + 16);
+    let rebase = [splice(6..7, 6..7)];
+    let got = [splice(0..1, 0..1)];
+    let written = [(data + 16 * 5, 16), (data + 16 * 9, 8)];
+    let (tables, _) = relinks_as_built(&image, 2, &delta(1, &[], &rebase, &got, &written));
+    assert_ne!(table(&tables, super::RELA_DYN), table(&first, super::RELA_DYN));
+    assert_eq!(patched(&image), [1, 1, 1], "every table patched");
+}
+
+/// A function renamed to a name of its length and one resized: their local symbols
+/// rewritten in the kept tail are the tail a build makes; a name of another length is built.
+#[test]
+fn a_relink_patches_the_symbol_table_as_a_build_makes_it() {
+    let mut image = relinked();
+    let (_, first) = image.build(&image.writer, 1, None);
+    image.functions[7].name = Some(relinked_name(7, 'g').as_str().into());
+    image.functions[3].size = 12;
+    let functions = [splice(3..4, 3..4), splice(7..8, 7..8)];
+    let (_, parts) = relinks_as_built(&image, 2, &delta(1, &functions, &[], &[], &[]));
+    assert_ne!(parts, first);
+    assert_eq!(patched(&image)[2], 1);
+
+    image.functions[7].name = Some("_ZN4test1g7E".into());
+    relinks_as_built(&image, 3, &delta(2, &[splice(7..8, 7..8)], &[], &[], &[]));
+    assert_eq!(patched(&image)[2], 1, "a name of another length is built");
+    image.functions[7].name = None;
+    relinks_as_built(&image, 4, &delta(3, &[splice(7..8, 7..8)], &[], &[], &[]));
+    assert_eq!(patched(&image)[2], 1, "a name dropped is built");
+}
+
+/// An FDE's target moved: its `.eh_frame_hdr` entry patched from the FDEs walked again is the
+/// table a build makes; a written range before every FDE and an FDE out of address order are
+/// built.
+#[test]
+fn a_relink_patches_eh_frame_hdr_as_a_build_makes_it() {
+    let mut image = relinked();
+    let (first, _) = image.build(&image.writer, 1, None);
+    let (text, eh) = (image.at(&Class::Text), image.at(&Class::EhFrame));
+    let fdes = |moved: usize, to: u64| -> Vec<(u64, u32)> {
+        (0..RELINKED).map(|at| if at == moved { (to, 12) } else { (text + 16 * at as u64, 16) }).collect()
+    };
+    let old = image.contents[image.index(&Class::EhFrame)].clone();
+    let new = eh_frame(&fdes(12, text + 16 * 12 + 4));
+    image.put(&Class::EhFrame, 0, &new);
+    let written = [changed(&old, &new, eh)];
+    let (tables, _) = relinks_as_built(&image, 2, &delta(1, &[], &[], &[], &written));
+    assert_ne!(table(&tables, super::EH_FRAME_HDR), table(&first, super::EH_FRAME_HDR));
+    assert_eq!(patched(&image)[1], 1);
+
+    relinks_as_built(&image, 3, &delta(2, &[], &[], &[], &[(eh, 4)]));
+    assert_eq!(patched(&image)[1], 1, "a range before every FDE is built");
+
+    let old = new;
+    let new = eh_frame(&fdes(12, text + 16 * 30 + 4));
+    image.put(&Class::EhFrame, 0, &new);
+    let written = [changed(&old, &new, eh)];
+    relinks_as_built(&image, 4, &delta(3, &[], &[], &[], &written));
+    assert_eq!(patched(&image)[1], 1, "a table out of order is built");
+}
+
+/// A delta from a synthesis the writer's tables are not of, and one with splices of another
+/// length, are built whole.
+#[test]
+fn a_relink_from_another_synthesis_or_of_another_length_is_built() {
+    let mut image = relinked();
+    image.build(&image.writer, 1, None);
+    let (text, data) = (image.at(&Class::Text), image.at(&Class::Data));
+    image.put(&Class::Data, 16 * 9, &(text + 16 * 20).to_le_bytes());
+    image.functions[7].name = Some(relinked_name(7, 'g').as_str().into());
+    let functions = [splice(7..8, 7..8)];
+    let written = [(data + 16 * 9, 8)];
+    relinks_as_built(&image, 2, &delta(7, &functions, &[], &[], &written));
+    assert_eq!(patched(&image), [0, 0, 0], "the tables are of synthesis 1");
+
+    // A slid address added after function 6's pointer, and the last function dropped.
+    image.put(&Class::Data, 16 * 6 + 8, &(text + 16 * 6).to_le_bytes());
+    image.rebase.insert(8, data + 16 * 6 + 8);
+    image.functions.pop();
+    let rebase = [splice(8..8, 8..9)];
+    let functions = [splice(39..40, 39..39)];
+    let written = [(data + 16 * 6 + 8, 8)];
+    relinks_as_built(&image, 3, &delta(2, &functions, &rebase, &[], &written));
+    assert_eq!(patched(&image), [0, 0, 0], "a splice of another length is built");
 }

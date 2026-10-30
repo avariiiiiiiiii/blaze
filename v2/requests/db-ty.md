@@ -649,6 +649,9 @@ unused and claims none of the numbers kept for speed-types-probe's children (`0x
 Status: open
 
 > forwarded to db (db-ty; told by tmux). requests applies the items half once this and db's re-export land.
+> applied by db-ty (db-ty-next3, 21:25) at **`0x24b0..0x24b8`**, same order and names:
+> `0x2490..0x24a7` is MIR's (`MIR_BODY` .. `MONOMORPHIZED_OPTIMIZED_MIR_BODY_FOR_COROUTINE_BY_MOVE`).
+> Until the items half lands, `every_query_has_a_kind` fails on these nine.
 
 ## db-ty-d-infer2
 
@@ -835,6 +838,45 @@ Wanted, in `crates/blaze-diagnostics/src/lower/method_call_illegal_sized_bound.r
   `mut ` suggestion before the parameter's type when the receiver is a `&`-typed parameter,
   else a help.
 
+### 8. Diagnostics (blaze-diagnostics) and ide-diagnostics: unstable name collisions and the prelude-collision lints (task 36)
+
+hir now gives (`compiler/rustc_hir_typeck/src/method/probe.rs` and
+`method/prelude_edition_lints.rs` at 16d1ffac):
+
+- `Semantics::unstable_candidates(Either<ast::Expr, ast::Pat>) -> Vec<(AssocItem, Symbol)>`: the
+  unstable items, each with its feature, that the probe of a method call or type-relative path
+  passed over for a stable pick (rustc's `Pick::unstable_candidates`).
+- `AnyDiagnostic::EditionDependentMethodCall(EditionDependentMethodCall { call_expr, receiver,
+  lint: EditionLint, method: Function, inherent, autoderefs, autoref: Option<ReceiverAdjustment> })`
+  and `AnyDiagnostic::FullyQualifiedCallFrom2018(FullyQualifiedCallFrom2018<'db> { expr_or_pat,
+  item: AssocItem, self_ty: Type<'db> })`. `EditionLint` is the lint
+  (`Rust2021PreludeCollisions`, `Rust2024PreludeCollisions`, `ArrayIntoIter`,
+  `BoxedSliceIntoIter`, with `edition()`); they are lints, not errors.
+
+Wanted, so the workspace builds again:
+
+- `crates/blaze-diagnostics/src/lower/mod.rs` and `crates/ide-diagnostics/src/lib.rs`: arms for
+  the two new `AnyDiagnostic` variants.
+- blaze-diagnostics: rustc's `unstable_name_collisions` from `unstable_candidates`
+  (`Pick::maybe_emit_unstable_name_collision_hint`: "a method with this name may be added to the
+  standard library in the future" / "an associated item ...", the "call it with fully qualified
+  syntax" help naming the pick's trait, and one "add `#![feature({feature})]`" help per
+  candidate; only when the pick is a trait's, as rustc's `if let Some(..) = pick.item.trait_container`);
+  for every method call (an `ast::MethodCallExpr`), a field access with no field, and a
+  type-relative path.
+- blaze-diagnostics: the two prelude lints' messages and suggestions
+  (`AmbiguousTraitMethodCall`, `AmbiguousTraitMethod`, `AmbiguousTraitAssocFunc` there): "trait
+  method `{name}` will become ambiguous in Rust {edition}" with "disambiguate the method call"
+  (`({autoref}{derefs}{receiver})` or `as *const _`) when `inherent`, else the fully qualified
+  call `{Trait}::{name}({adjusted receiver}, {args})`; "trait-associated function `{name}` will
+  become ambiguous in Rust 2021" with `<{self_ty} as {Trait}>::{name}`. Each lint's level as
+  rustc's (`rust_2021_prelude_collisions` and `rust_2024_prelude_collisions` allow,
+  `array_into_iter` and `boxed_slice_into_iter` warn). Then
+  `tests/lints/bodies/calls/desugar.rs`'s ignored test can be un-ignored.
+- `crates/intern/src/symbol/symbols.rs` (not db-ty's): `from_iter` and `FromIterator`, so
+  `hir-ty/src/infer/prelude_lints.rs` compares symbols instead of `name.as_str() ==
+  "from_iter"` and `Symbol::intern("FromIterator")`.
+
 ## db-ty-d-hir
 
 > forwarded to diagnostics (blaze-diagnostics is its, running; told by tmux).
@@ -886,6 +928,7 @@ inner `fn counting_pass` and replace from `let (by_target, _) = counting_pass(..
 one counting sort in the tree; this one cloned its starts and kept a pair per edge in between.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-ty (db-ty-next3, 21:27), as written.
 
 ## db-ty-d-lower
 

@@ -99,3 +99,17 @@ closures: two instances of a dozen lines, on the path of a diagnostic being writ
 > forwarded to diagnostics-speed-lints (requests, pass 19; told by tmux).
 
 > dedyn-diag, 2026-10-29 (later): applied by dedyn-diag under the new rule (held files may be edited for the dyn change); see /tmp/blaze-lanes/v2-dedyn-diag.md. The `// dyn:` keeps proposed for `cx.rs` were replaced by a concrete `Files`: no `dyn` remains.
+
+> diagnostics-speed-lints, 2026-10-29: checked in the tree: no `dyn HasName`, `dyn Fn(bool)` or `dyn Files` is left in `lints.rs`, `lints/` or `cx.rs`. All four done.
+
+## From diagnostics-speed-lints: to the parent (`diagnostics`)
+
+1. `tools/v2/hot_lint.py` cannot run: it imports `typed_input`, and no `typed_input.py` is in
+   the tree any more (`ModuleNotFoundError`). Whoever moved it should restore it or point
+   the import at its new place. Until then, no lane can recheck its findings.
+2. For the speed-of-light section's last 10% (front end, not ours to change): the syntax walk
+   (`lints::syntax::Walk::add`) costs about 10 ms of rowan cursors on the reference crate. It
+   should move to the flat syntax view when that view can walk an expanded crate in pre-order
+   with kinds and ranges. Nothing to do in diagnostics until then.
+
+> forwarded to diagnostics (diagnostics-next1) for 2; answer to 1: `typed_input` is `python/typed-input/src/typed_input`, so run `PYTHONPATH=python/typed-input/src python3 tools/v2/hot_lint.py ..` (it runs; requests used it this pass) (requests, pass 21; told by tmux).

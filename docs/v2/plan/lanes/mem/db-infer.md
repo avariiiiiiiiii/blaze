@@ -41,7 +41,12 @@ its request file and to `mem-db-infer`, and does not invent another.
   which of its functions are entry points of this kind, by the callers it found
   (`rg -n '<fn>' crates/ -g '!crates/hir-ty/**'`).
 - `current` and `task` are not opened again below that: deep code takes the `&'f Frame` of the
-  context it is in.
+  context it is in. The one exception is a loop whose iterations keep nothing for the next,
+  where a nested `frame::task(INFER_TAG, ..)` per iteration gives each one's memory back:
+  `lower/batch.rs` runs each item of a crate's batch so (mem-db-infer-lower 15b), or a crate as
+  large as std would grow the frame by about 2 MB of cold memory.
+- Lane dedyn's agents may change these files to replace a hot `dyn` with a concrete type, enum
+  or generic; their edits stay, and no part adds a hot `dyn`.
 
 ### R2. How `&'f Frame` enters the contexts
 
@@ -139,7 +144,51 @@ counter `solver-sync-glue`'s request 6 installs in `lib.rs`.
 
 ## What each part found
 
-Filled in from the parts' request files as they finish: see `v2/requests/mem-db-infer.md`.
+Details, file by file, are in the part files; the summary and the places where two parts meet
+are in `v2/requests/mem-db-infer.md` (5 to 7, "What the parts found").
+
+- **The solver has no frame.** mem-db-solver chose recycled per-worker storage for `InferCtxt`,
+  goals and the search graph (`v2/requests/mem-db-solver.md`, "The one design decision"):
+  thousands of `InferCtxt`s per run would sum in a frame that can't roll back under `&Frame`.
+  So `InferenceTable` stays without `'f` (R2), and `could_unify` needs no task.
+- **Nothing rolls back within a run.** `Frame::scope` and `reset_to` take `&mut Frame`, and
+  contexts hold `&'f Frame`, so per-node and per-probe temporaries stay until the run ends. The
+  run's peak is the sum of its temporaries, linear in the body.
+- **Nesting past 8** (eval's objection, forwarded to mem-db): one task per query, and hir-ty's
+  queries nest deeper than `frame.rs`'s `DEPTH = 8` (layout per type level, discriminant eval per
+  implicit variant, const eval through MIR and inference), so each run past depth 8 maps and
+  unmaps its frame. Proposed to lane mem: one frame per thread, a nested task a `mark` and
+  `reset_to`. That would also let a method probe run as a nested task and give its memory back.
+- **Results made once.** Every part's memo is built at its exact length from frame vectors:
+  `InferenceTables::freeze` (ctx), the per-crate impl tables as sorted CSR (method I2), lowering's
+  predicate and field lists (lower 10), layout's field lists and `held`'s sets (eval), closure
+  captures (closure A4, which changes `ClosureData` to boxed slices).
+
+## Speed of light
+
+The work that can't go is the result: about 25 owned columns per `InferenceResult`, one
+allocation each (about 0.5 µs at 20 ns) and their bytes written once (about 40 KB for a
+1,000-expression body, about 2 µs at memory bandwidth). Every temporary is a frame bump of
+about 2 ns, written once to warm memory and freed by one reset at the end of the run.
+
+| part | frame bytes per 1,000-expression body | frame bumps | global allocations before |
+|---|---|---|---|
+| ctx (tables, freeze, context lists) | about 40 KB | about 40 | about 300 (about 6 µs) |
+| expr (call inputs, adjustments, field maps, coercions) | about 35 KB | about 1,500 | 1 to 4 per call (30 to 45 µs) |
+| closure (places, captures, min captures) | about 35 to 45 KB | about 345 | about 600 (about 12 µs) |
+| method (probe candidates, steps, dedup sets) | about 250 KB | about 1,500 | 40 to 75 µs |
+| lower (binders, generic args) | about 8 KB | about 400 | about 15 plus spills |
+| total | about 400 KB, in L2 | about 3,800 (about 8 µs) | about 100 to 150 µs |
+
+Inference of such a body costs milliseconds (solver goals of several µs per method candidate and
+coercion), so the allocator after this is under 1% of the run, against 5 to 10% before: within
+10% of a run that allocated nothing but its result. MIR's `held` sets (eval, about 155 KB per body)
+and layout's per-variant lists follow the same rule in their own tasks.
+
+Fastest known: rustc allocates typeck's temporaries from its `DroplessArena`/`TypedArena` for
+the whole `tcx`, freed only at the end of the session, and its `TypeckResults` grow `FxHashMap`s
+per node. Here the temporaries die with each run (the arena is reused hot by the next run on
+the worker) and the result is dense columns made once, so it is smaller and touched once.
 
 ## Budget tests
 
@@ -151,13 +200,9 @@ request 6) and `test-fixture` as a dev-dependency:
    `db.synthetic_write(Durability::LOW)` and `of` again (deep verification, nothing changed),
    twice; the second re-check is held to zero allocations (`assert_at_most(0, ..)`).
 2. **Cold infer, its owned result alone**: after (1) warmed every dependency and interned every
-   type, `infer_query` is called directly (not through salsa, so it runs) inside
-   `frame::task(Tag::Infer, ..)`; it is held to `result.owned_allocations()`, a test-only count of
-   the result's own heap blocks (each non-empty boxed column, each closure's capture lists).
-3. **Frame use**: the same cold run's `frame.peak()` is reported and bounded by the body's size
-   (bytes per expression times expressions), so a temporary that grows per node and is never
-   reset shows up.
+   type, inference's body (`infer_body_in`, not through salsa, so it runs) is called inside
+   `frame::task(Tag::Infer, ..)`; it is held to the allocations of cloning its result, which are
+   one per owned heap block of the result (interned types are reference counts).
+3. **Frame use is linear**: the frame's `peak()` for a body of 800 statements is at most four and
+   a half times that of 200, so a temporary that grows faster than the body shows up.
 
-## Speed of light
-
-Written below with the parts' numbers.

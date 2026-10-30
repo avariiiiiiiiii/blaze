@@ -47,7 +47,7 @@ use hir_ide::{
     traits::{WherePredicateEvaluation, structurally_normalize_ty, where_predicate_must_hold},
 };
 use hir_ty_unsafeck::{InsideUnsafeBlock, unsafe_operations};
-use intern::sym;
+use intern::{Symbol, sym};
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
@@ -652,6 +652,17 @@ impl<'db> SourceAnalyzer<'db> {
         Some(self.resolve_impl_method_or_trait_def(db, f_in_trait, substs))
     }
 
+    pub(crate) fn unstable_candidates(
+        &self,
+        node: Either<ast::Expr, ast::Pat>,
+    ) -> Option<&'db [(CandidateId, Symbol)]> {
+        let id = match node {
+            Either::Left(expr) => self.expr_id(expr)?,
+            Either::Right(pat) => self.pat_id(&pat)?,
+        };
+        Some(self.infer()?.unstable_candidates(id))
+    }
+
     pub(crate) fn resolve_method_call_fallback(
         &self,
         db: &'db Db,
@@ -959,13 +970,11 @@ impl<'db> SourceAnalyzer<'db> {
             None
         } else {
             // Shorthand syntax, resolve to the local
-            let path = Path::from_known_path_with_no_generic(ModPath::from_segments(
-                PathKind::Plain,
-                once(local_name.clone()),
-            ));
+            let mod_path = ModPath::from_segments(PathKind::Plain, once(local_name.clone()));
+            let path = Path::from_known_path_with_no_generic(&mod_path);
             match self.resolver.resolve_path_in_value_ns_fully(
                 db,
-                &path,
+                path,
                 name_hygiene(db, InFile::new(self.file_id, ast_name.syntax())),
             ) {
                 Some(ValueNs::LocalBinding(binding_id)) => Some(Local {
@@ -1291,13 +1300,15 @@ impl<'db> SourceAnalyzer<'db> {
             .parent_path()
             .and_then(|p| collector.lower_path(p, &mut ExprCollector::impl_trait_error_allocator));
         let (store, _) = collector.store.finish();
+        let hir_path = store.path_at(hir_path);
+        let parent_hir_path = parent_hir_path.map(|it| store.path_at(it));
 
         // Case where path is a qualifier of a use tree, e.g. foo::bar::{Baz, Qux} where we are
         // trying to resolve foo::bar.
         if let Some(use_tree) = parent().and_then(ast::UseTree::cast)
             && use_tree.coloncolon_token().is_some()
         {
-            return resolve_hir_path_qualifier(db, &self.resolver, &hir_path, &store)
+            return resolve_hir_path_qualifier(db, &self.resolver, hir_path, &store)
                 .map(|it| (it, None));
         }
 
@@ -1314,7 +1325,7 @@ impl<'db> SourceAnalyzer<'db> {
         // Case where path is a qualifier of another path, e.g. foo::bar::Baz where we are
         // trying to resolve foo::bar.
         if let Some(parent_hir_path) = parent_hir_path {
-            return match resolve_hir_path_qualifier(db, &self.resolver, &hir_path, &store) {
+            return match resolve_hir_path_qualifier(db, &self.resolver, hir_path, &store) {
                 None if meta_path.is_some() => path
                     .first_segment()
                     .and_then(|it| it.name_ref())
@@ -1402,7 +1413,7 @@ impl<'db> SourceAnalyzer<'db> {
                     }
                 }
             }
-            return match resolve_hir_path_as_attr_macro(db, &self.resolver, &hir_path) {
+            return match resolve_hir_path_as_attr_macro(db, &self.resolver, hir_path) {
                 Some(m) => Some((PathResolution::Def(ModuleDef::Macro(m)), None)),
                 // this labels any path that starts with a tool module as the tool itself, this is technically wrong
                 // but there is no benefit in differentiating these two cases for the time being
@@ -1418,14 +1429,14 @@ impl<'db> SourceAnalyzer<'db> {
         }
         if parent().is_some_and(|it| ast::Visibility::can_cast(it.kind())) {
             // No substitution because only modules can be inside visibilities, and those have no generics.
-            resolve_hir_path_qualifier(db, &self.resolver, &hir_path, &store).map(|it| (it, None))
+            resolve_hir_path_qualifier(db, &self.resolver, hir_path, &store).map(|it| (it, None))
         } else {
             // Probably a type, no need to show substitutions for those.
             let res = resolve_hir_path_(
                 db,
                 &self.resolver,
                 self.infer_body,
-                &hir_path,
+                hir_path,
                 prefer_value_ns,
                 name_hygiene(db, InFile::new(self.file_id, path.syntax())),
                 Some(&store),
@@ -1494,11 +1505,12 @@ impl<'db> SourceAnalyzer<'db> {
         let hir_path =
             collector.lower_path(path.clone(), &mut ExprCollector::impl_trait_error_allocator)?;
         let (store, _) = collector.store.finish();
+        let hir_path = store.path_at(hir_path);
         Some(resolve_hir_path_(
             db,
             &self.resolver,
             self.infer_body,
-            &hir_path,
+            hir_path,
             false,
             name_hygiene(db, InFile::new(self.file_id, path.syntax())),
             Some(&store),
@@ -1638,7 +1650,7 @@ impl<'db> SourceAnalyzer<'db> {
                     &self.resolver,
                     self.resolver.expression_store_owner(),
                     self.infer_body,
-                    &Path::from_known_path_with_no_generic(ModPath::from_segments(
+                    Path::from_known_path_with_no_generic(&ModPath::from_segments(
                         PathKind::Plain,
                         Some(name.clone()),
                     )),
@@ -1679,7 +1691,7 @@ impl<'db> SourceAnalyzer<'db> {
                     &self.resolver,
                     self.resolver.expression_store_owner(),
                     self.infer_body,
-                    &Path::from_known_path_with_no_generic(ModPath::from_segments(
+                    Path::from_known_path_with_no_generic(&ModPath::from_segments(
                         PathKind::Plain,
                         Some(name.clone()),
                     )),
@@ -1852,7 +1864,7 @@ pub(crate) fn resolve_hir_path<'db>(
     db: &'db Db,
     resolver: &Resolver<'db>,
     infer_body: Option<InferBodyId<'db>>,
-    path: &Path,
+    path: Path<'_>,
     hygiene: HygieneId,
     store: Option<&ExpressionStore>,
 ) -> Option<PathResolution<'db>> {
@@ -1863,7 +1875,7 @@ pub(crate) fn resolve_hir_path<'db>(
 pub(crate) fn resolve_hir_path_as_attr_macro(
     db: &Db,
     resolver: &Resolver<'_>,
-    path: &Path,
+    path: Path<'_>,
 ) -> Option<Macro> {
     resolver
         .resolve_path_as_macro(db, path.mod_path()?, Some(MacroSubNs::Attr))
@@ -1875,7 +1887,7 @@ fn resolve_hir_path_<'db>(
     db: &'db Db,
     resolver: &Resolver<'db>,
     infer_body: Option<InferBodyId<'db>>,
-    path: &Path,
+    path: Path<'_>,
     prefer_value_ns: bool,
     hygiene: HygieneId,
     store: Option<&ExpressionStore>,
@@ -2043,7 +2055,7 @@ fn resolve_hir_value_path<'db>(
     resolver: &Resolver<'db>,
     store_owner: Option<ExpressionStoreOwnerId>,
     infer_body: Option<InferBodyId<'db>>,
-    path: &Path,
+    path: Path<'_>,
     hygiene: HygieneId,
 ) -> Option<(PathResolution<'db>, Visibility)> {
     resolver.resolve_path_in_value_ns_with_prefix_info(db, path, hygiene).and_then(
@@ -2083,7 +2095,7 @@ fn resolve_hir_value_path<'db>(
 fn resolve_hir_path_qualifier<'db>(
     db: &'db Db,
     resolver: &Resolver<'db>,
-    path: &Path,
+    path: Path<'_>,
     store: &ExpressionStore,
 ) -> Option<PathResolution<'db>> {
     (|| {

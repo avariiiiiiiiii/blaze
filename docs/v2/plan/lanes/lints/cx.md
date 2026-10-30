@@ -72,18 +72,21 @@ impl<'q, 't> Cx<'q, 't> {
     pub(crate) fn span(&self, range: TextRange) -> crate::diag::Span;
     pub(crate) fn item_span(&self, node: ast::Node<'t>) -> Option<crate::diag::Span>;
     pub(crate) fn lint(&mut self, lint: Implemented, at: ast::Node<'t>,
-        span: impl Into<MultiSpan>, message: impl Into<String>) -> &mut Diagnostic;
+        span: impl Into<MultiSpan>, message: impl Into<String>) -> &mut Diag;
     pub(crate) fn lint_when(&mut self, lint: Implemented, at: ast::Node<'t>, when: ast::Node<'t>,
-        span: impl Into<MultiSpan>, message: impl Into<String>) -> &mut Diagnostic;
+        span: impl Into<MultiSpan>, message: impl Into<String>) -> &mut Diag;
     pub(crate) fn lint_after(&mut self, lint: Implemented, at: ast::Node<'t>, after: ast::Node<'t>,
-        span: impl Into<MultiSpan>, message: impl Into<String>) -> &mut Diagnostic;
+        span: impl Into<MultiSpan>, message: impl Into<String>) -> &mut Diag;
     pub(crate) fn blaze(&mut self, lint: blaze::Lint, at: ast::Node<'t>,
-        span: impl Into<MultiSpan>, message: impl Into<String>) -> &mut Diagnostic;
+        span: impl Into<MultiSpan>, message: impl Into<String>) -> &mut Diag;
 }
 ```
 
-`Diagnostic`, `MultiSpan`, `Span`, `Applicability` and their builders (`suggestion`, `help`,
-`note`, `span_note`, ...) are `crate::diag`'s as today; a lint builds them as it does now.
+`Diag` (`blaze_diagnostics::model`'s, re-exported by `crate::diag`), `MultiSpan`, `Span`,
+`Applicability` and their builders (`suggestion`, `multipart_suggestion`,
+`suggestion_with_style`, `help`, `note`, `span_note`, `span_help`, `span_label`, `sub`) are
+used as today; a lint builds them as it does now (`span_note` and `span_help` take
+`impl Into<MultiSpan>`, which a `Span` is).
 
 ## Where lints are run
 

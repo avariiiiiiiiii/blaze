@@ -140,14 +140,18 @@ struct Memory {
 }
 
 impl ImageStore for Memory {
-    fn get(&self, key: &ContentId) -> Result<Option<std::sync::Arc<Aligned>>, String> {
-        Ok(self.images.lock().unwrap().get(key).cloned())
+    fn get(&self, key: &ContentId) -> Result<Option<crate::deps::ImageBuf>, String> {
+        Ok(self.images.lock().unwrap().get(key).map(|it| it.clone() as crate::deps::ImageBuf))
     }
 
     fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
         let image = std::sync::Arc::new(Aligned::copy_from(&image));
         self.images.lock().unwrap().entry(key).or_insert(image);
         Ok(())
+    }
+
+    fn reads_now(&self, _: &base_db::Env, _: &[u8]) -> Result<ContentId, String> {
+        Err("these fixtures expand no proc macro".to_owned())
     }
 }
 
@@ -285,7 +289,7 @@ fn the_part_is_the_same_bytes_in_every_database() {
     for fixture in [FIXTURE, BLOCKS] {
         let part = || {
             let db = TestDB::with_files(fixture);
-            encode(&db, crate_named(&db, "lib"))
+            encode(&db, crate_named(&db, "lib"), &mut Vec::new())
         };
         let first = part();
         assert!(first.is_ok(), "{first:?}");
@@ -408,7 +412,8 @@ where
 {
     let record = record::<S>(db, krate, item.what(), of).unwrap();
     let bytes = std::sync::Arc::new(Aligned::copy_from(&record));
-    let value = read::<S>(db, krate, item.what(), &bytes, &bytes).unwrap();
+    let held: crate::deps::ImageBuf = bytes.clone();
+    let value = read::<S>(db, krate, item.what(), &held, &bytes).unwrap();
     assert_eq!(S::of(&value), of, "{item:?}");
     bytes
 }
@@ -516,7 +521,7 @@ fn with_signatures(fixture: &str, memory: &Memory, part: &[u8]) {
 /// The signatures part of `lib` in a fresh database of `fixture`.
 fn part_of(fixture: &str) -> Vec<u8> {
     let db = TestDB::with_files(fixture);
-    encode(&db, crate_named(&db, "lib")).unwrap()
+    encode(&db, crate_named(&db, "lib"), &mut Vec::new()).unwrap()
 }
 
 #[test]

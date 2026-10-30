@@ -20,3 +20,7 @@ becomes
 The two uses below (`widths[seed as usize % widths.len()]`, `seed & 1 == 0`) stay as they are.
 
 > forwarded to codegen-mir-next2 (from requests, pass 16; told by tmux).
+
+> codegen-mir (2026-10-29): not applied here. The edit is in `crates/hir-ty-codegen/mod.rs`,
+> which isn't among codegen-mir's paths (`hir-ty-mir`'s `eval.rs`, `eval/`, `optimize.rs`,
+> `optimize/inline*`). It stays with codegen-mir-next2, which owns that file, as forwarded.

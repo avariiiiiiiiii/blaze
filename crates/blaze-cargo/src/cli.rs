@@ -212,6 +212,9 @@ fn cargo(asked: &Invocation) -> i32 {
         Ok(format) => format,
         Err(what) => return refused(&what, color),
     };
+    if let Some(what) = args::refused(asked) {
+        return refused(&what, color);
+    }
     let (place, request) = match prepared(asked, color) {
         Ok(prepared) => prepared,
         Err(what) => return refused(&what, color),
@@ -229,7 +232,7 @@ fn cargo(asked: &Invocation) -> i32 {
         Ok(Then::Exit(code)) => code,
         Ok(Then::Exec(exec)) => {
             drop(out);
-            run::exec(&exec, &mut err, color)
+            run::exec(&exec, &mut err, run::Told { color, quiet: shown.quiet, verbose: shown.verbose })
         }
         // stdout or stderr closed under it: nothing more can be said.
         Err(_) => FAILED,
@@ -282,7 +285,8 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     if !ok {
         return Ok(Then::Exit(FAILED));
     }
-    let speaking = Speaking { cwd: &place.cwd, color: shown.color, quiet: shown.quiet, verbose: shown.verbose };
+    let speaking =
+        Speaking { cwd: &place.cwd, color: shown.color, quiet: shown.quiet, verbose: shown.verbose, json: shown.format.json() };
     let artifacts = printer.take_artifacts();
     let members = printer.members();
     match asked.command() {
@@ -292,7 +296,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             match exec {
                 Ok(exec) => {
                     if !shown.quiet {
-                        printer.err().write_all(say::status("Running", &exec.shown(), shown.color).as_bytes())?;
+                        printer.err().write_all(say::status("Running", &exec.shown_at(shown.verbose), shown.color).as_bytes())?;
                     }
                     printer.err().flush()?;
                     Ok(Then::Exec(exec))

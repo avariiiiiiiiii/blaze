@@ -222,6 +222,67 @@ fn a_big_item_keeps_its_tree_across_an_edit_elsewhere() {
     assert_eq!(items_lowered_by(&mut db, file, &renamed), 1);
 }
 
+/// How many top-level items' syntax making the file's tree hashes once it holds `text`, the
+/// file keyed at the text it holds before.
+fn items_hashed_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize {
+    let krate = db.test_crate();
+    let file_id = file.file_id(&*db);
+    let before = file.parse(&*db).tree().syntax().text().to_string();
+    for warm in [format!("{before}\n"), before] {
+        db.set_file_text(file_id, &warm);
+        crate::file_item_tree(&*db, file.into(), krate);
+    }
+    db.set_file_text(file_id, text);
+    super::HASHED.set(0);
+    crate::file_item_tree(&*db, file.into(), krate);
+    let hashed = super::HASHED.get();
+    assert_assembled_is_whole(db, file, text);
+    hashed
+}
+
+#[test]
+fn an_edit_hashes_only_the_items_it_touched() {
+    let items: String =
+        (0..40).map(|i| format!("pub fn f{i}(a: u8) -> u8 {{ a + {i} }}\n")).collect();
+    let (mut db, file) = db_of(&items);
+    // The item edited, and the two before it, past which the parser may have looked.
+    let edited = items.replace("{ a + 20 }", "{ a * 20 }");
+    assert_eq!(items_hashed_by(&mut db, file, &edited), 3);
+    // The item added at the end, and the two before it.
+    let appended = format!("{edited}struct S;\n");
+    assert_eq!(items_hashed_by(&mut db, file, &appended), 3);
+    // With the first item gone, the second begins where the text was the first's.
+    let removed = appended.replacen("pub fn f0(a: u8) -> u8 { a + 0 }\n", "", 1);
+    assert_eq!(items_hashed_by(&mut db, file, &removed), 1);
+}
+
+#[test]
+fn common_ends_are_the_longest_that_do_not_overlap() {
+    let long = "x".repeat(5000);
+    let mut cases: Vec<(String, String)> = [
+        ("abc", "abc"),
+        ("abc", "abXc"),
+        ("abc", "c"),
+        ("", "fn f() {}"),
+        ("fn f() {}", ""),
+        ("aaaa", "aaaaaa"),
+        ("é", "è"),
+    ]
+    .iter()
+    .map(|&(a, b)| (a.to_owned(), b.to_owned()))
+    .collect();
+    cases.push((format!("{long}a{long}"), format!("{long}bb{long}")));
+    cases.push((format!("{long}{long}"), format!("{long}y{long}")));
+    for (old, new) in &cases {
+        let (a, b) = (old.as_bytes(), new.as_bytes());
+        let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+        let most = a.len().min(b.len()) - prefix;
+        let suffix = (a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count())
+            .min(most);
+        assert_eq!(super::common_ends(a, b), (prefix, suffix), "{old:?} to {new:?}");
+    }
+}
+
 /// A tree asked again is a memo hit of its query, and a file whose items all kept their keys
 /// is its kept tree: neither allocates once the worker's scratch is grown.
 #[test]

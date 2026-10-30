@@ -112,10 +112,7 @@ pub fn terminal_width() -> Option<usize> {
     if !std::io::stderr().is_terminal() {
         return None;
     }
-    // SAFETY: `TIOCGWINSZ` writes a `winsize` and nothing else.
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    let got = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) };
-    (got == 0 && size.ws_col > 0).then_some(usize::from(size.ws_col))
+    crate::raw::system::stderr_columns().map(usize::from)
 }
 
 /// What `--events` asked: the records of the build on standard output, as JSON lines or as

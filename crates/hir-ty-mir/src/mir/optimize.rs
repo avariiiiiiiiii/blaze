@@ -51,7 +51,7 @@ use super::{
     BasicBlockId, LocalId, MirBody, MirLowerError, MirOptLevel, MirOptions, OperandKind,
     ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     budget::Pass,
-    framed::{Bits, bits_in},
+    framed::{Bits, bits_in, block_id, block_index, local_index},
     monomorphization::monomorphized,
     transform::Ctx,
 };
@@ -89,6 +89,12 @@ pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
 /// `body` after rustc's optimizations with `options`. Of a coroutine body only the UB checks
 /// run: what a future keeps across a yield is computed from the runtime body, and the checks'
 /// temporaries live within one block.
+///
+/// A pass run only at [`MirOptLevel::Release`] never adds a call, constant, static, drop or
+/// vtable the body does not have at [`MirOptLevel::Debug`]: those passes only remove code or
+/// replace a local by another holding the same value. The code generator's walk of what a unit
+/// references reads `Debug` bodies for every level and relies on this; `tests/mir/references.rs`
+/// holds it.
 pub(super) fn optimize<'db>(
     db: &'db Db,
     body: &MirBody<'db>,
@@ -477,18 +483,6 @@ pub(crate) fn abi_can_unwind(abi: rustc_abi::ExternAbi) -> bool {
         | ExternAbi::Win64 { unwind } => unwind,
         _ => false,
     }
-}
-
-fn block_index(block: BasicBlockId) -> usize {
-    block.into_raw().into_u32() as usize
-}
-
-fn block_id(index: usize) -> BasicBlockId {
-    Idx::from_raw(RawIdx::from_u32(index as u32))
-}
-
-fn local_index(local: LocalId) -> usize {
-    local.into_raw().into_u32() as usize
 }
 
 fn local_id(index: usize) -> LocalId {

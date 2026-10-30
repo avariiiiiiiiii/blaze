@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 
+use blaze_ids::rng::SplitMix64;
 use smallvec::SmallVec;
 
 use crate::ids::Span;
@@ -22,7 +23,6 @@ use crate::ids::Span;
 use super::{
     cells::ThreadClockSet,
     range_map::{Overlap, RangeObjectMap},
-    rng::SplitMix64,
     vclock::{VClock, VTimestamp, VectorIdx},
 };
 
@@ -164,7 +164,7 @@ impl StoreBuffer {
             false
         });
         assert!(count > 0, "store buffer cannot be empty");
-        let mut skip = rng.below(count);
+        let mut skip = rng.index(count);
         let mut chosen = usize::MAX;
         self.candidates(is_seqcst, clocks, |pos| {
             if skip == 0 {

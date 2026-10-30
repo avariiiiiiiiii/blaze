@@ -14,7 +14,7 @@ use std::{
     hash::{Hash, Hasher},
     iter,
     marker::PhantomData,
-    ptr,
+    sync::Arc,
 };
 
 use crate::{
@@ -41,14 +41,14 @@ const _: () = assert!(std::mem::size_of::<NodeId>() == 8);
 /// of the file's lazy node `part`.
 #[derive(Clone, Copy)]
 struct Place<'t> {
-    file: &'t FlatTree,
+    file: &'t Arc<FlatTree>,
     tree: &'t FlatTree,
     part: u32,
 }
 
 impl<'t> Place<'t> {
     #[inline]
-    fn file(file: &'t FlatTree) -> Place<'t> {
+    fn file(file: &'t Arc<FlatTree>) -> Place<'t> {
         Place { file, tree: file, part: NodeId::FILE }
     }
 
@@ -104,7 +104,7 @@ impl<'t> Place<'t> {
 
 /// A node of a flat tree, borrowed: 24 bytes, `Copy`.
 pub struct Node<'t, L: Language> {
-    file: &'t FlatTree,
+    file: &'t Arc<FlatTree>,
     tree: &'t FlatTree,
     part: u32,
     at: u32,
@@ -113,7 +113,7 @@ pub struct Node<'t, L: Language> {
 
 /// A token of a flat tree, borrowed: 24 bytes, `Copy`.
 pub struct Token<'t, L: Language> {
-    file: &'t FlatTree,
+    file: &'t Arc<FlatTree>,
     tree: &'t FlatTree,
     part: u32,
     at: u32,
@@ -143,7 +143,7 @@ impl<L: Language> Copy for Token<'_, L> {}
 impl<'t, L: Language> Node<'t, L> {
     /// The root of `tree`, which is a node.
     #[inline]
-    pub fn root(tree: &'t FlatTree) -> Node<'t, L> {
+    pub fn root(tree: &'t Arc<FlatTree>) -> Node<'t, L> {
         assert!(!tree.is_empty() && !tree.is_token(0), "a tree's root is a node");
         Place::file(tree).node(0)
     }
@@ -151,7 +151,7 @@ impl<'t, L: Language> Node<'t, L> {
     /// The element `id` names in the file's tree `file`, parsing its part if it is in one that
     /// was not parsed yet.
     #[inline]
-    pub fn at(file: &'t FlatTree, id: NodeId) -> Element<'t, L> {
+    pub fn at(file: &'t Arc<FlatTree>, id: NodeId) -> Element<'t, L> {
         let place = match id.part {
             NodeId::FILE => Place::file(file),
             part => Place { file, tree: file.part(part), part },
@@ -178,6 +178,13 @@ impl<'t, L: Language> Node<'t, L> {
     /// The file's tree this node is in, the root's for a node in a part.
     #[inline]
     pub fn file(self) -> &'t FlatTree {
+        self.file
+    }
+
+    /// [`Self::file`], shared: a count of it (`Arc::clone`) keeps the tree past this view's
+    /// borrow, to be viewed again by [`Node::at`].
+    #[inline]
+    pub fn shared_file(self) -> &'t Arc<FlatTree> {
         self.file
     }
 
@@ -501,6 +508,12 @@ impl<'t, L: Language> Token<'t, L> {
         self.file
     }
 
+    /// [`Self::file`], shared, as [`Node::shared_file`].
+    #[inline]
+    pub fn shared_file(self) -> &'t Arc<FlatTree> {
+        self.file
+    }
+
     #[inline]
     pub fn flat(self) -> (&'t FlatTree, u32) {
         (self.tree, self.at)
@@ -717,7 +730,7 @@ impl FlatTreeBuilder {
 impl<L: Language> PartialEq for Node<'_, L> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        ptr::eq(self.file, other.file) && self.part == other.part && self.at == other.at
+        Arc::ptr_eq(self.file, other.file) && self.part == other.part && self.at == other.at
     }
 }
 
@@ -726,14 +739,14 @@ impl<L: Language> Eq for Node<'_, L> {}
 impl<L: Language> Hash for Node<'_, L> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (self.file as *const FlatTree as usize, self.part, self.at).hash(state);
+        (Arc::as_ptr(self.file) as usize, self.part, self.at).hash(state);
     }
 }
 
 impl<L: Language> PartialEq for Token<'_, L> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        ptr::eq(self.file, other.file) && self.part == other.part && self.at == other.at
+        Arc::ptr_eq(self.file, other.file) && self.part == other.part && self.at == other.at
     }
 }
 
@@ -742,7 +755,7 @@ impl<L: Language> Eq for Token<'_, L> {}
 impl<L: Language> Hash for Token<'_, L> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (self.file as *const FlatTree as usize, self.part, self.at).hash(state);
+        (Arc::as_ptr(self.file) as usize, self.part, self.at).hash(state);
     }
 }
 

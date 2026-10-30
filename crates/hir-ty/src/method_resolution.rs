@@ -31,7 +31,7 @@ use hir_def::{
     hir::{ExprId, generics::GenericParams},
     item_scope::ItemScope,
     lang_item::LangItems,
-    nameres::{DefMap, block_def_map, crate_def_map},
+    nameres::{DefMap, block_def_map, crate_def_map, module_impls},
     resolver::Resolver,
     signatures::{ConstSignature, FunctionSignature},
     unstable_features::UnstableFeatures,
@@ -151,7 +151,11 @@ impl<'db> InferenceContext<'db> {
         call_expr: ExprId,
     ) -> Result<(MethodCallee<'db>, bool), MethodError<'db>> {
         let (pick, is_visible) = match self.lookup_probe(call_expr, receiver, name, self_ty) {
-            Ok(it) => (it, true),
+            Ok(it) => {
+                self.write_unstable_candidates(call_expr.into(), &it);
+                self.lint_edition_dependent_dot_call(self_ty, call_expr, receiver, &it);
+                (it, true)
+            }
             Err(MethodError::PrivateMatch(it)) => {
                 // FIXME: Report error.
                 (it, false)
@@ -583,7 +587,7 @@ fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)
 /// The run of [`trait_value_items`] named `name`, sorted by trait: an item of another name
 /// added to a trait of `krate` leaves it as it was.
 #[salsa::tracked(returns(deref))]
-fn in_crate_trait_value_items(
+pub(crate) fn in_crate_trait_value_items(
     db: &Db,
     krate: Crate,
     name: Name,
@@ -1338,20 +1342,77 @@ impl<'db> InherentImpls<'db> {
             return frozen;
         }
 
-        let crate_def_map = crate_def_map(db, krate);
-
-        Self::collect_def_map(db, crate_def_map)
+        let mut groups = SelfTyGroups::default();
+        for (module, _) in crate_def_map(db, krate).modules(db) {
+            Self::for_module(db, module).merge_into(&mut groups);
+        }
+        Self::from_groups(groups)
     }
 
-    /// The inherent impls of `krate` for one type. An impl added for another type changes
-    /// `for_crate()`, and leaves this as it was.
+    /// The inherent impls one module of a crate or block def map gives its table: its own
+    /// ([`module_impls`]) and those of the blocks in the bodies it holds, in the order
+    /// [`Self::for_crate`] holds them. Reruns when the module's scope changes, and is equal
+    /// unless one of those impls is added, removed or changes its self type.
+    #[salsa::tracked(returns(ref))]
+    pub fn for_module(db: &'db Db, module: ModuleId) -> InherentImpls<'db> {
+        let mut groups = SelfTyGroups::default();
+        Self::collect_module(db, module, &mut groups);
+        Self::from_groups(groups)
+    }
+
+    /// The modules of `krate` with an inherent impl for each simplified self type, in module
+    /// order. Equal unless a module gains its first impl for a type or loses its last.
+    #[salsa::tracked(returns(ref))]
+    fn modules_by_self_ty(db: &'db Db, krate: Crate) -> SelfTyModules<'db> {
+        let mut groups: SelfTyGroups<'db, Vec<ModuleId>> = SelfTyGroups::default();
+        for (module, _) in crate_def_map(db, krate).modules(db) {
+            for (self_ty, _) in Self::for_module(db, module).iter() {
+                groups.entry(*self_ty).push(module);
+            }
+        }
+        SelfTyModules::new(groups)
+    }
+
+    /// The modules of `krate` with an inherent impl for one type: equal unless that list
+    /// changes, whatever other types gain.
+    #[salsa::tracked(returns(deref))]
+    fn modules_of_self_ty(
+        db: &'db Db,
+        krate: Crate,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ModuleId]> {
+        Self::modules_by_self_ty(db, krate).of(&self_ty.0).into()
+    }
+
+    /// The inherent impls of `module` for one type: equal unless one for that type is added
+    /// there or removed.
+    #[salsa::tracked(returns(deref))]
+    fn in_module_for_self_ty(
+        db: &'db Db,
+        module: ModuleId,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ImplId]> {
+        Self::for_module(db, module).for_self_ty(&self_ty.0).into()
+    }
+
+    /// The inherent impls of `krate` for one type, in the order [`Self::for_crate`] holds
+    /// them. Reads only the modules with impls for the type, so an impl added for another type,
+    /// or anything else added anywhere, leaves this as it was. A frozen crate's are read from
+    /// its frozen table.
     #[salsa::tracked(returns(deref))]
     pub fn in_crate_for_self_ty(
         db: &'db Db,
         krate: Crate,
         self_ty: SelfTyKey<'db>,
     ) -> Box<[ImplId]> {
-        Self::for_crate(db, krate).for_self_ty(&self_ty.0).into()
+        if frozen::served(db, krate) {
+            return Self::for_crate(db, krate).for_self_ty(&self_ty.0).into();
+        }
+        let mut found = Vec::new();
+        for &module in Self::modules_of_self_ty(db, krate, self_ty) {
+            found.extend_from_slice(Self::in_module_for_self_ty(db, module, self_ty));
+        }
+        found.into()
     }
 
     #[salsa::tracked(returns(ref))]
@@ -1383,32 +1444,43 @@ impl<'db> InherentImpls<'db> {
 impl<'db> InherentImpls<'db> {
     fn collect_def_map(db: &'db Db, def_map: &'db DefMap) -> Self {
         let mut map = SelfTyGroups::default();
-        collect(db, def_map, &mut map);
-        return Self::from_groups(map);
+        for (module, _) in def_map.modules(db) {
+            Self::collect_module(db, module, &mut map);
+        }
+        Self::from_groups(map)
+    }
 
-        fn collect<'db>(
-            db: &'db Db,
-            def_map: &DefMap,
-            map: &mut SelfTyGroups<'db, Vec<ImplId>>,
-        ) {
-            for (_module_id, module_data) in def_map.modules(db) {
-                for impl_id in module_data.scope(db).inherent_impls() {
-                    let interner = DbInterner::new_no_crate(db);
-                    let self_ty = db.impl_self_ty(impl_id);
-                    let self_ty = self_ty.instantiate_identity().skip_norm_wip();
-                    if let Some(self_ty) =
-                        simplify_type(interner, self_ty, TreatParams::InstantiateWithInfer)
-                    {
-                        map.entry(self_ty).push(impl_id);
-                    }
-                }
+    /// Adds the inherent impls of `module` and of the blocks in the bodies it holds to `map`.
+    fn collect_module(
+        db: &'db Db,
+        module: ModuleId,
+        map: &mut SelfTyGroups<'db, Vec<ImplId>>,
+    ) {
+        let interner = DbInterner::new_no_crate(db);
+        for &impl_id in module_impls(db, module).inherent_impls.iter() {
+            let self_ty = db.impl_self_ty(impl_id);
+            let self_ty = self_ty.instantiate_identity().skip_norm_wip();
+            if let Some(self_ty) =
+                simplify_type(interner, self_ty, TreatParams::InstantiateWithInfer)
+            {
+                map.entry(self_ty).push(impl_id);
+            }
+        }
 
-                for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
-                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
-                        collect(db, block_def_map, map);
-                    }
+        let scope = module.def_map(db).module(db, module).scope(db);
+        for owner in impl_holders(db, module.krate(db), scope) {
+            for (_, block_def_map) in Body::of(db, owner).blocks(db) {
+                for (block_module, _) in block_def_map.modules(db) {
+                    Self::collect_module(db, block_module, map);
                 }
             }
+        }
+    }
+
+    /// Adds every impl of this table to `groups`, each type's after those already there.
+    fn merge_into(&self, groups: &mut SelfTyGroups<'db, Vec<ImplId>>) {
+        for (self_ty, impls) in self.iter() {
+            groups.entry(*self_ty).extend_from_slice(impls);
         }
     }
 

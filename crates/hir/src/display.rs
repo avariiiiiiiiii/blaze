@@ -250,16 +250,18 @@ fn write_function<'db>(f: &mut HirFormatter<'_, 'db>, func_id: FunctionId) -> Re
         match data.store.type_ref(ret_type) {
             TypeRef::ImplTrait(bounds) => match &bounds[0] {
                 &TypeBound::Path(path, _) => Some(
-                    *data.store[path]
+                    data.store
+                        .path(path)
                         .segments()
                         .iter()
                         .last()
                         .unwrap()
                         .args_and_bindings
                         .unwrap()
-                        .bindings[0]
+                        .bindings
+                        .get(0)
+                        .unwrap()
                         .type_ref
-                        .as_ref()
                         .unwrap(),
                 ),
                 _ => None,
@@ -295,7 +297,7 @@ fn write_impl_header<'db>(impl_: ImplId, f: &mut HirFormatter<'_, 'db>) -> Resul
     let impl_data = ImplSignature::of(db, impl_);
     if let Some(target_trait) = &impl_data.target_trait {
         f.write_char(' ')?;
-        hir_display_with_store(&impl_data.store[target_trait.path], impl_.into(), &impl_data.store)
+        hir_display_with_store(impl_data.store.path(target_trait.path), impl_.into(), &impl_data.store)
             .hir_fmt(f)?;
         f.write_str(" for")?;
     }
@@ -831,7 +833,7 @@ fn write_where_predicates<'db>(
             TypeBound { lifetimes, target, bound } => {
                 if let Some(lifetimes) = lifetimes {
                     let lifetimes =
-                        lifetimes.iter().map(|it| it.display(f.db, f.edition())).join(", ");
+                        store.names(*lifetimes).iter().map(|it| it.display(f.db, f.edition())).join(", ");
                     write!(f, "for<{lifetimes}> ")?;
                 }
                 target.hir_fmt(f, owner, store)?;

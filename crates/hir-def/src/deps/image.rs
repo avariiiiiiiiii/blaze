@@ -56,7 +56,8 @@ impl Held for Aligned {
 }
 
 /// The bytes a store gave, held where it keeps them.
-// dyn: the store's holder of one image, one per crate per session; parts are read through `ImageRef`
+/// Its parts are read through [`ImageRef`].
+// dyn: the store's holder of one image, one per crate per session
 pub type ImageBuf = Arc<dyn Held>;
 
 /// What a part of an image is.
@@ -88,7 +89,10 @@ impl Part {
 pub enum ImageError {
     Format(FormatError),
     /// The image was written under another key than the one it was found by.
-    Key { found: ContentId, wanted: ContentId },
+    Key {
+        found: ContentId,
+        wanted: ContentId,
+    },
     /// Its parts are not one of each of [`Part::ALL`], in order, with tags it knows.
     Parts(&'static str),
 }
@@ -181,7 +185,11 @@ pub enum PartBytes {
 
 impl PartBytes {
     /// Part `part` of the image in `buffer` whose parts are `ranges` ([`ImageRef::ranges`]).
-    pub fn of(buffer: &ImageBuf, ranges: &[Range<usize>; Part::ALL.len()], part: Part) -> PartBytes {
+    pub fn of(
+        buffer: &ImageBuf,
+        ranges: &[Range<usize>; Part::ALL.len()],
+        part: Part,
+    ) -> PartBytes {
         // clone: a count of the image buffer, which the part borrows, and a `Range<usize>`
         PartBytes::In { buffer: buffer.clone(), range: ranges[part as usize].clone() }
     }

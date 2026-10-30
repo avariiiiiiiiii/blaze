@@ -752,3 +752,123 @@ dependency it loads.
   check were audited, and what they run before a diagnostic is certain is fixed above. The
   findings inside the checks' own helpers (`attrs/args.rs`, `ast_validation/*`, `defs/*`,
   `impls/*`) have not been audited line by line, and none is marked `// alloc:` yet.
+
+## Levels, the registry and the early pass (`diagnostics-speed-lints`)
+
+`crates/blaze-diagnostics/src/lints/`, apart from `names/` (its own sections above): `cx.rs`'s
+per-check caches, `registry` (the lint table and `LintSet`), `levels` (lint levels from the
+command line and attributes), `syntax` (the walk every syntax pass reads, the early lint
+pass, the lexer's lints, delimiters, attributes, `check_cfg`). Reference crate as above:
+800,000 syntax nodes, of which about 400,000 are of a kind that can hold an attribute, and
+about 5,000 attributes, about 400 of them lint levels.
+
+**The state of the art** is rustc:
+
+- `ShallowLintLevelMap`: one map per HIR owner, made on first use, and a lookup that walks up
+  the owner's nodes to the nearest one with a level attribute;
+- `lints_that_dont_need_to_run`: the lints allowed everywhere, found once from the command
+  line and every level attribute, so their passes are skipped;
+- `BuiltinCombinedEarlyLintPass`: one AST walk calling every early lint at each node.
+
+### Bounds and where the parts stand
+
+| Component | Work | Bound | Now |
+| --- | --- | --- | --- |
+| Lint names | one perfect hash per name read | about 50 cycles a name | at the bound (`registry`, `LintId::named` const) |
+| `Cx::lint_may_fire` | one AND of a bit | under 1 ns | at the bound |
+| The set it reads (`levels::may_fire`) | one kind read per node, the names of each `ATTR` | about 0.4 ms | at the bound: one scan of the kind column |
+| `Cx::lint_level` | one probe per node asked about | about 50 cycles | at the bound after the first ask; zero allocations (budget test) |
+| Level maps of `decide` | one look at each node with an attribute | about 0.3 ms per map | at the bound: two columns read per node, the rest only where `Tree::attrs` is set |
+| The walk (`Walk::add`) | one visit per node | about 0.5 ms | about 10 ms: rowan's pre-order |
+| The early pass and the syntax passes | one kind read per node, a cast where a lint wants the kind | about 0.7 ms | about 2.5 ms: one scan of the columns per pass, about ten |
+| `check_cfg` | the `cfg`s of each node with an attribute | about 0.3 ms | at the bound: only nodes `Tree::attrs` marks are read |
+| The lexer's lints | one lex of each source that can fire | about 2 cycles a byte where it must | a SIMD ASCII scan, and no lex, where nothing can fire |
+
+The arithmetic behind each row follows.
+
+**Lint names and `lint_may_fire`.** A name is looked up by a perfect hash over the builtin
+table: one hash of a short string and one compare, about 50 cycles. The command line and
+400 level attributes name under 1,000 lints, under 0.02 ms. `LintSet` is a bitset of
+`LintId`s (a `u16` each). `cx.lint_may_fire(id)` is one bit test, and `cx.any_may_fire(&GIVES)`
+one AND per word against a `const` set each pass declares (`LintSet::of`).
+
+**The set it reads.** `levels::may_fire` runs once per check (a `OnceCell` in `Cx`). It reads
+the kind column (2 bytes a node, 1.6 MB, at about 1 cycle a node: 0.8 million cycles, about
+0.23 ms), and for each of the 5,000 `ATTR` nodes the hash of its path, about 100 cycles:
+0.5 million cycles, about 0.15 ms. That is rustc's walk of every attribute, without its HIR.
+Under `--cap-lints allow` (every dependency cargo builds) the set holds only what
+`--force-warn` names, so every gated pass costs one AND.
+
+**`Cx::lint_level`.** rustc builds an owner's map on first use and walks up to the nearest
+node with a level. `LevelMap` keeps each set it made in a `HashTable` keyed by the node's
+`SyntaxNodePtr`, hashed once with FxHash: a second ask at a node, or at any node below the
+same attribute, is one probe at about 50 cycles. Budget test:
+`a_level_seen_and_a_lint_that_may_fire_are_reads` (zero allocations).
+
+**Level maps of `decide`.** `decide` builds the early and the late `Levels` over the whole
+crate. Each goes over every node rustc's walk comes to, but now through two columns, kind and
+`Tree::attrs`: a node may have an attribute only if it is within three nodes above an `ATTR`
+(an outer attribute is a child of its owner, an inner one a child of a list at most two nodes
+below it, `fn f() { #![..] }`), and `Walk::add` marks those from its stack of open nodes as
+it goes. So the 400,000 nodes of owner kinds cost two byte reads each, about 0.8 million
+cycles (0.23 ms), and only the few thousand marked ones are cast and have their attributes
+read. Before, each of the 400,000 was cast, its parents looked at and its children scanned,
+at about 100 cycles: 40 million cycles, about 11 ms, twice.
+
+**The walk.** `Walk::add` visits the expanded crate once in pre-order and keeps four columns
+indexed alike: `nodes`, `kinds` (2 bytes), `attrs` (1 byte) and the trees' `off` and
+`replaced` lists. Every syntax pass of this part and `names::imports` reads it through
+`cx.walk()`; nothing walks a tree again. The bound is a flat syntax store's pre-order at
+about 2 cycles a node, 0.5 ms. Now each node costs a rowan cursor, made and freed, at about
+45 cycles: 36 million cycles, about 10 ms. What removes it is in the front end: the flat
+syntax view (`syntax::view`), once the walk can be made over it without `SyntaxNode`s.
+
+**The early pass and the syntax passes.** rustc's combined pass calls every early lint at
+each node of its type, enabled or not. Here the early pass is one loop over the columns,
+matching on the kind, and each lint runs only when its bit is set (`Builtin::unsafe_code`,
+`negative_literals`), so allowed lints cost nothing per node: that beats rustc's design.
+Each other syntax pass (delimiters, attributes, `check_cfg`, macros, the import scans, the two
+level maps) scans the columns again, about 10 scans of 0.23 ms, about 2.5 ms. Each scan reads
+1.6 to 2.4 MB, which stays in L2 between passes, and casts only the kinds it wants, each node
+once. Fused into one dispatch by kind, the scans would come to the 0.7 ms bound. That fusion
+is not made: each pass keeps its own state and order of what it reports, and a merged loop
+would mix them for about 2 ms.
+
+**`check_cfg`.** `unexpected_cfgs` reads the `cfg`s of every node with an attribute and of each
+`cfg!`. It used to push every node of an owner kind, radix-sort them and cast each (about
+17 ms). Now it reads only the nodes `Tree::attrs` marks, still in rustc's order, plus `off`,
+`replaced` and the `cfg!` predicates: the 5,000 attributes at about 200 cycles is 1 million
+cycles, about 0.3 ms.
+
+**The lexer's lints.** `keyword_idents`, the 2021 prefix and 2024 guarded-string lints, the
+confusable and non-ASCII ident lints need a lex of the source. Where none of them can fire,
+a source that is all ASCII is not lexed: the check is the standard library's SIMD
+`is_ascii`, at about 32 bytes a cycle, so the reference crate's 4 MB is 0.13 million cycles.
+Budget test: `an_ascii_crate_is_not_lexed` (the same allocations at 4 and 400 functions, at
+most 4).
+
+### The whole part
+
+Bound: about 3 ms for the reference crate on one core (the walk 0.5 ms, the fused scans
+0.7 ms, `may_fire` 0.4 ms, the level maps 0.6 ms, `check_cfg` 0.3 ms, the lexer where it
+must). Now: about 13 ms, of which 10 ms is rowan's walk and about 2 ms the unfused scans.
+
+**Budget tests.**
+
+- `levels`: `a_level_seen_and_a_lint_that_may_fire_are_reads`, zero allocations for
+  `lint_level` and `lint_may_fire` once the map is made.
+- `syntax::early::lexer`: `an_ascii_crate_is_not_lexed`.
+- `syntax`: `delims_allowed_everywhere_cost_nothing` (`-A unused`, 4 and 400 functions, zero
+  allocations), `the_kind_column_is_the_nodes_kinds`, `the_attrs_column_holds_every_owner`.
+- `names`: `dead_code_allowed_everywhere_cost_nothing`, `item_lints_capped_cost_nothing`.
+
+**What blocks the last 10%.**
+
+- The walk is rowan's (front end: the flat syntax view).
+- The syntax passes scan the columns once each, not once in all; fusing them is about 2 ms
+  and a change of every pass's loop.
+- `stability`, `imports` and `dead` resolve paths again (their sections above).
+- `hot_lint.py` findings in these paths are mostly where a diagnostic is built (the edge).
+  Those on the no-diagnostic path that were found have been fixed or gated on
+  `lint_may_fire`. The script can't run at the moment: `tools/typed_input.py`, which it
+  imports, is gone from the tree.

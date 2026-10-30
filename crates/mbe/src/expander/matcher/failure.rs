@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 
 use base_db::Db;
+use blaze_mem::frame::Frame;
 use intern::Symbol;
 use span::{Edition, Span, TextRange};
 use tt::{
@@ -15,7 +16,7 @@ use tt::{
     iter::{TtElement, TtIter},
 };
 
-use super::{Arena, Loc, Match, Matcher, NONE, match_loop};
+use super::{Buffers, Loc, Match, Matcher, NONE, match_loop};
 use crate::{ExpandError, ExpandErrorKind, MacroCallStyle, MatchFailure, Rule, parser::Separator};
 
 #[cfg(test)]
@@ -182,16 +183,17 @@ pub(super) fn tokens(view: tt::TokenTreesView<'_>) -> u32 {
 
 /// rustc's `failed_to_match_macro`, for a call of `rules` in `call_style` with `input`, which
 /// no rule matches: the error at the token where the rule that got furthest stopped. `None`
-/// when no rule failed as rustc's fail, which is where rustc gives its ambiguity error.
+/// when no rule failed as rustc's fail, which is where rustc gives its ambiguity error. The
+/// matches' buffers are in `frame`, the call's.
 pub(crate) fn match_failure(
     db: &Db,
+    frame: &Frame,
     rules: &[Rule],
     input: &tt::TopSubtree,
     call_style: MacroCallStyle,
 ) -> Option<ExpandError> {
-    // alloc: the tracked match's buffers, only when no rule matches.
-    let mut arena = Arena::default();
-    let mut res = Match::default();
+    let mut buffers = Buffers::new_in(frame);
+    let mut res = Match::new_in(frame);
     let mut track = Tracker {
         rule: 0,
         position: 0,
@@ -206,13 +208,13 @@ pub(crate) fn match_failure(
             continue;
         }
         track.rule = idx as u32;
-        match_loop(db, &rule.matcher, input, &mut arena, &mut res, Some(&mut track));
+        match_loop(db, &rule.matcher, input, &mut buffers, &mut res, Some(&mut track));
     }
     let best = track.best?;
     let (remaining, remaining_span) =
         describe(db, &rules[best.remaining.rule as usize].matcher, best.remaining);
     let missing_comma = match call_style {
-        MacroCallStyle::FnLike => missing_comma(db, rules, input),
+        MacroCallStyle::FnLike => missing_comma(db, frame, rules, input),
         MacroCallStyle::Attr | MacroCallStyle::Derive => None,
     };
     let failure = MatchFailure {
@@ -230,7 +232,7 @@ pub(crate) fn match_failure(
 /// input's top level that is a group, or an identifier or literal not joined to the identifier
 /// or literal after it, and is not followed by a `,`, a `,` makes some function-like rule
 /// match. The span is empty, at the end of that token tree.
-fn missing_comma(db: &Db, rules: &[Rule], input: &tt::TopSubtree) -> Option<Span> {
+fn missing_comma(db: &Db, frame: &Frame, rules: &[Rule], input: &tt::TopSubtree) -> Option<Span> {
     let mut iter = input.iter();
     let start = iter.savepoint();
     let mut at = None;
@@ -256,11 +258,10 @@ fn missing_comma(db: &Db, rules: &[Rule], input: &tt::TopSubtree) -> Option<Span
     builder.push(tt::Leaf::Punct(tt::Punct { char: ',', spacing: tt::Spacing::Alone, span: comma }));
     builder.extend_with_tt(after);
     let with_comma = builder.build();
-    // alloc: a match's buffers, only when no rule matches.
-    let mut arena = Arena::default();
-    let mut res = Match::default();
+    let mut buffers = Buffers::new_in(frame);
+    let mut res = Match::new_in(frame);
     let matches = rules.iter().filter(|rule| rule.style == MacroCallStyle::FnLike).any(|rule| {
-        match_loop(db, &rule.matcher, &with_comma, &mut arena, &mut res, None);
+        match_loop(db, &rule.matcher, &with_comma, &mut buffers, &mut res, None);
         res.err.is_none()
     });
     matches.then_some(comma)

@@ -19,8 +19,8 @@ use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
 use rustc_hash::FxHashMap;
 
-use crate::load::{Foreign, ForeignAsk, ForeignProfile};
-use crate::query::{Cbor, LoadError, Mount, Origin, StdGraph, StdKey, StdPlanned, StdUnits, kinds, producer};
+use crate::load::{Foreign, ForeignAsk, ForeignProfile, key_id};
+use crate::query::{CborBytes, LoadError, Mount, Origin, StdGraph, StdKey, StdPlanned, StdUnits, kinds, producer};
 use crate::schema::Mode;
 
 /// Where the library is named for a release of rustc at `commit`: rustc's own std has these
@@ -108,8 +108,8 @@ pub fn std_crates(asked: &[String]) -> Vec<String> {
 /// "panic_abort must always be compiled with panic=abort".
 const ALWAYS_ABORT: [&str; 1] = ["panic_abort"];
 
-fn failed(what: String, at: Option<String>) -> StdPlanned {
-    StdPlanned::Failed(LoadError { what, at })
+fn failed(what: String, at: Option<String>) -> CborBytes<StdPlanned> {
+    CborBytes::encode(&StdPlanned::Failed(LoadError { what, at }))
 }
 
 /// What [`StdUnits`] asks of the load for `key`, or why it can't be asked.
@@ -187,7 +187,7 @@ pub fn foreign_ask(key: &StdKey) -> Result<ForeignAsk, LoadError> {
 /// `graph` as the load made it, held to what a standard library's graph is: every unit
 /// `is_std`, a plan per unit, each root the library unit of the package it names, and
 /// `panic_abort` built to abort.
-fn checked(ask: &ForeignAsk, graph: StdGraph) -> Result<StdGraph, String> {
+fn checked(ask: &ForeignAsk, graph: &StdGraph) -> Result<(), String> {
     if graph.plans.len() != graph.units.len() {
         return Err(format!("the load planned {} of the standard library's {} units", graph.plans.len(), graph.units.len()));
     }
@@ -214,7 +214,7 @@ fn checked(ask: &ForeignAsk, graph: StdGraph) -> Result<StdGraph, String> {
             return Err(format!("root `{name}` is not the library unit of package `{name}`"));
         }
     }
-    Ok(graph)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -225,29 +225,32 @@ thread_local! {
 impl Query for StdUnits {
     const KIND: QueryKind = kinds::STD_UNITS;
     const NAME: &'static str = "std units";
-    const PRODUCER: ContentId = producer("blaze v2 cargo std units 1");
+    const PRODUCER: ContentId = producer("blaze v2 cargo std units 2");
     type Key = StdKey;
-    type Value = Cbor<StdPlanned>;
+    /// `Foreign`'s bytes as it wrote them once checked: read as a `CborRef<StdPlanned>`, as a
+    /// `Cbor<StdPlanned>` would be, with no second encoding.
+    type Value = CborBytes<StdPlanned>;
 
+    /// [`StdKey::id`], hashed without its allocation.
     fn input(key: &StdKey) -> ContentId {
-        key.id()
+        key_id(StdKey::DOMAIN, key)
     }
 
-    fn execute(cx: &mut Cx<'_>, key: &StdKey) -> Result<Cbor<StdPlanned>, Cancelled> {
+    fn execute(cx: &mut Cx<'_>, key: &StdKey) -> Result<CborBytes<StdPlanned>, Cancelled> {
         #[cfg(test)]
         RUNS.with(|it| it.set(it.get() + 1));
         let ask = match foreign_ask(key) {
             Ok(ask) => ask,
-            Err(error) => return Ok(Cbor(StdPlanned::Failed(error))),
+            Err(error) => return Ok(CborBytes::encode(&StdPlanned::Failed(error))),
         };
-        let planned = cx.get::<Foreign>(&ask)?.get();
-        Ok(Cbor(match planned {
-            StdPlanned::Ready(graph) => match checked(&ask, graph) {
-                Ok(graph) => StdPlanned::Ready(graph),
+        let found = cx.get::<Foreign>(&ask)?;
+        Ok(match found.get() {
+            StdPlanned::Ready(graph) => match checked(&ask, &graph) {
+                Ok(()) => CborBytes::of(found),
                 Err(what) => failed(format!("the standard library's units: {what}"), Some(ask.manifest.clone())),
             },
-            StdPlanned::Failed(error) => StdPlanned::Failed(error),
-        }))
+            StdPlanned::Failed(_) => CborBytes::of(found),
+        })
     }
 }
 

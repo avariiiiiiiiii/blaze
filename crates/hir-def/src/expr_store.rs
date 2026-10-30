@@ -137,6 +137,8 @@ struct ExprRoot {
 struct ExpressionOnlyStore {
     /// The expressions and patterns.
     columns: HirColumns<Frozen>,
+    /// [`kinds_of`] the expression kinds of `columns`.
+    kinds: u64,
     bindings: Arena<Binding>,
     labels: Arena<Label>,
     /// The closure/coroutine/anon const that owns each binding, by binding: [`NO_OWNER`] for a
@@ -190,6 +192,14 @@ struct ExpressionOnlyStore {
 /// The owner in [`ExpressionOnlyStore::binding_owners`] of a binding the top level owns.
 const NO_OWNER: u32 = u32::MAX;
 
+const _: () = assert!((columns::ExprKind::IncludeBytes as u32) < u64::BITS);
+
+/// A bit per kind byte of `expr_kind` (each an [`columns::ExprKind`], which the columns are
+/// checked to hold before a store is made of them), in variant order.
+fn kinds_of(expr_kind: &[u8]) -> u64 {
+    expr_kind.iter().fold(0, |kinds, &kind| kinds | 1 << kind)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpressionStore {
     expr_only: Option<Box<ExpressionOnlyStore>>,
@@ -198,6 +208,9 @@ pub struct ExpressionStore {
     pub lifetimes: Arena<LifetimeRef>,
     /// The hygiene of the plain type paths a `macro` wrote, by type in increasing order.
     type_hygiene: Option<Box<[(TypeRefId, HygieneId)]>>,
+    /// [`ExpressionStore::macro_calls`]: here rather than in `expr_only`, as a signature's
+    /// type macros make a store with calls and no expressions.
+    macro_calls: ThinVec<MacroCallId>,
 }
 
 /// The body of an item (function, const etc.) while it is lowered. Its columns, forward maps,
@@ -254,6 +267,9 @@ pub struct ExpressionStoreBuilder {
     template_map: Option<Box<PendingTemplate>>,
 
     expansions: Vec<(InFile<MacroCallPtr>, MacroCallId)>,
+    /// Each macro call lowered into the store, in lowering order, recorded with or without the
+    /// source map.
+    macro_calls: Vec<MacroCallId>,
 
     /// Diagnostics accumulated during lowering. These contain `AstPtr`s and so are stored in
     /// the source map (since they're just as volatile).
@@ -518,6 +534,7 @@ struct Scratch {
     types_map: Vec<(TypeSource, TypeRefId)>,
     lifetime_map: Vec<(LifetimeSource, LifetimeRefId)>,
     expansions: Vec<(InFile<MacroCallPtr>, MacroCallId)>,
+    macro_calls: Vec<MacroCallId>,
     expr_map_back: BackPushes<Expr<'static>, Either<ast::Expr, ast::Pat>>,
     pat_map_back: BackPushes<Pat<'static>, Either<ast::Expr, ast::Pat>>,
     label_map_back: BackPushes<Label, Either<ast::Label, ast::BlockExpr>>,
@@ -629,6 +646,7 @@ impl Scratch {
             types_map,
             lifetime_map,
             expansions,
+            macro_calls,
             expr_map_back,
             pat_map_back,
             label_map_back,
@@ -658,6 +676,7 @@ impl Scratch {
         types_map.clear();
         lifetime_map.clear();
         expansions.clear();
+        macro_calls.clear();
         expr_map_back.clear();
         pat_map_back.clear();
         label_map_back.clear();
@@ -689,6 +708,7 @@ impl Scratch {
             + self.types_map.capacity()
             + self.lifetime_map.capacity()
             + self.expansions.capacity()
+            + self.macro_calls.capacity()
             + self.expr_map_back.capacity()
             + self.pat_map_back.capacity()
             + self.label_map_back.capacity()
@@ -724,6 +744,7 @@ impl ExpressionStoreBuilder {
             types_map,
             lifetime_map,
             expansions,
+            macro_calls,
             expr_map_back,
             pat_map_back,
             label_map_back,
@@ -764,6 +785,7 @@ impl ExpressionStoreBuilder {
             pat_field_map_back,
             template_map: None,
             expansions,
+            macro_calls,
             // alloc: empty unless lowering reports one, the error path.
             diagnostics: Vec::new(),
             freeze,
@@ -1063,6 +1085,7 @@ impl ExpressionStoreBuilder {
             pat_field_map_back,
             template_map,
             expansions,
+            macro_calls,
             diagnostics,
             freeze,
             packing,
@@ -1088,6 +1111,7 @@ impl ExpressionStoreBuilder {
             types_map,
             lifetime_map,
             expansions,
+            macro_calls,
             expr_map_back,
             pat_map_back,
             label_map_back,
@@ -1229,6 +1253,7 @@ impl ExpressionStoreBuilder {
                 let overflow_inheriting = slab.copy(&packing.inheriting[..]);
                 // alloc: once per store, keeps signature-only stores small.
                 Some(Box::new(ExpressionOnlyStore {
+                    kinds: kinds_of(&columns.expr_kind),
                     columns,
                     bindings: exact_arena(bindings),
                     labels: exact_arena(labels),
@@ -1246,8 +1271,10 @@ impl ExpressionStoreBuilder {
         // alloc: the column's one exact copy, only for a store with macro-expanded types.
         let type_hygiene = (!scratch.type_hygiene.is_empty())
             .then(|| Box::<[_]>::from(&scratch.type_hygiene[..]));
+        // alloc: the column's one exact copy, only for a store that met a macro call.
+        let macro_calls = ThinVec::from_iter(scratch.macro_calls.iter().copied());
         scratch.give();
-        (ExpressionStore { expr_only, types, lifetimes, type_hygiene }, source_map)
+        (ExpressionStore { expr_only, types, lifetimes, type_hygiene, macro_calls }, source_map)
     }
 }
 
@@ -1261,6 +1288,7 @@ impl ExpressionStore {
             types: TypeColumns::default(),
             lifetimes: Arena::new(),
             type_hygiene: None,
+            macro_calls: ThinVec::new(),
         });
         &EMPTY
     }
@@ -1757,11 +1785,25 @@ impl ExpressionStore {
         self.expr_only.as_deref().map_or(0, |it| it.columns.expr_count())
     }
 
-    /// Whether any expression is a closure: a byte compare per expression over `expr_kind`.
+    /// A bit per variant of [`Expr`], in variant order: bit `k` is set when some expression of
+    /// the store is of the `k`th variant. Zero for a store without expressions. Made once, with
+    /// the store.
+    #[inline]
+    pub fn kinds_present(&self) -> u64 {
+        self.expr_only.as_deref().map_or(0, |it| it.kinds)
+    }
+
+    /// Whether any expression is a closure.
     #[inline]
     pub fn has_closures(&self) -> bool {
-        let closure = columns::ExprKind::Closure as u8;
-        self.expr_only.as_deref().is_some_and(|it| it.columns.expr_kind.contains(&closure))
+        self.kinds_present() & (1 << columns::ExprKind::Closure as u32) != 0
+    }
+
+    /// Every macro call lowered into the store, in the order lowering met them: the calls of
+    /// [`ExpressionStoreSourceMap::macro_calls`], without the map.
+    #[inline]
+    pub fn macro_calls(&self) -> &[MacroCallId] {
+        &self.macro_calls
     }
 
     /// How many patterns the store holds.
@@ -2113,6 +2155,22 @@ mod scratch_tests {
         assert!(only.columns.arms.in_slab(), "match arms are in the column slab");
         assert!(only.block_editions.in_slab() && only.binding_owners.in_slab());
         assert_eq!(&*only.overflow_inheriting, &[only.block_editions[0].0]);
+    }
+
+    /// A store's kinds are a bit for each variant some expression of it has, and no other.
+    #[test]
+    fn a_store_knows_its_expression_kinds() {
+        use columns::ExprKind;
+
+        empty_pool();
+        let mut builder = ExpressionStoreBuilder::new();
+        lower_every_table(&mut builder, 1);
+        let (store, _) = builder.finish();
+        let bit = |kind: ExprKind| 1u64 << kind as u32;
+        let lowered = [ExprKind::Missing, ExprKind::Tuple, ExprKind::Call, ExprKind::Match];
+        assert_eq!(store.kinds_present(), lowered.into_iter().map(bit).fold(0, |a, b| a | b));
+        assert!(!store.has_closures());
+        assert_eq!(ExpressionStore::empty().kinds_present(), 0, "no expressions, no kinds");
     }
 
     #[test]

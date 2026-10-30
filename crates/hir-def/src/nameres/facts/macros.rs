@@ -12,7 +12,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use base_db::Db;
+use base_db::{Crate, Db};
 use cfg::CfgAtom;
 use either::Either;
 use hir_expand::{
@@ -51,7 +51,9 @@ use super::{
     collect,
     env::{ChildMode, ChildRequest, CollectCx, CrateEnv, SideTables, Sink},
     ops::{DeclOp, DeferredDerive, MacroOp, MacroOpKind, OpLog},
-    queries::{self, FactKey, MacroStep, ModuleRow, RoundKey, RoundKind, Rows, RowsKey},
+    queries::{
+        self, FactKey, MacroStep, ModuleRow, RoundKey, RoundKind, RoundModules, Rows, RowsKey,
+    },
 };
 
 /// What one [`resolve_round`] did: whether a call resolved (the old `resolve_macros` returning
@@ -654,9 +656,9 @@ fn expand_round(cx: &CollectCx<'_>, limit: u32, resolved: &[ResolvedCall]) {
 }
 
 /// The first `Attr` directive's position, for `RoundOutcome::first_attr`.
-pub(crate) fn first_attr(pending: &[MacroOp]) -> Option<u32> {
+pub(crate) fn first_attr<'p>(pending: impl IntoIterator<Item = &'p MacroOp>) -> Option<u32> {
     pending
-        .iter()
+        .into_iter()
         .position(|it| matches!(it.kind, MacroOpKind::Attr { .. }))
         .map(|at| u32::try_from(at).expect("a module has 2^32 macro directives"))
 }
@@ -698,10 +700,10 @@ pub(crate) fn reseed_at<'db, S: Sink<'db>>(
 
 /// `finish`'s unresolved-macro diagnostics for `pending`, as `Diagnostic` ops through `sink`.
 /// Attribute directives are diagnosed by their reseed.
-pub(crate) fn unresolved_macro_diagnostics<'db, S: Sink<'db>>(
+pub(crate) fn unresolved_macro_diagnostics<'db, 'p, S: Sink<'db>>(
     cx: &CollectCx<'db>,
     sink: &mut S,
-    pending: &[MacroOp],
+    pending: impl IntoIterator<Item = &'p MacroOp>,
 ) {
     let db = cx.db;
     for directive in pending {
@@ -752,16 +754,19 @@ pub(crate) fn unresolved_macro_diagnostics<'db, S: Sink<'db>>(
 
 /// One module's macro resolution at one round (`nameres-core.md` §5). By the round's kind:
 /// `Normal` and `EagerWithErrors` run [`resolve_round`]; `Reseed` runs [`reseed_at`] in the
-/// module it names; `Final` runs nothing. A step with nothing to do carries the module's
-/// directives and tables on without building a view.
+/// module it names; `Final` runs nothing. The driver asks it only of a module the round steps
+/// (`RoundModules::STEP`); asked of another, it carries the module's directives and tables on
+/// without building a view.
 pub(crate) fn macro_step(db: &Db, key: FactKey) -> MacroStep {
     let (module, krate, round) = (key.module(db), key.krate(db), key.round(db));
     let round_key = RoundKey::new(db, krate, round);
-    let row = queries::round_modules(db, round_key).row(module).unwrap_or_else(|| {
+    let modules = queries::round_modules(db, round_key);
+    let Some(at) = modules.at(module) else {
         panic!("nameres facts: a macro step of {module:?} at round {round}, which the round does not have")
-    });
+    };
+    let row = &modules.rows[at as usize];
     let kind = queries::round_kind(db, round_key);
-    let carried = Carried::of(db, key, row);
+    let carried = Carried::at(db, krate, modules, at);
 
     let reseed = match kind {
         RoundKind::Reseed { module: reseeded, index } if reseeded == module => Some(index),
@@ -784,7 +789,7 @@ pub(crate) fn macro_step(db: &Db, key: FactKey) -> MacroStep {
     let mut side = carried.side();
     // clone: the step writes its module's tables, so it makes its own copy of them, once.
     let tables = Arc::make_mut(&mut side);
-    let mut sink = StepSink::new(&cx, key, round_key, row);
+    let mut sink = StepSink::new(&cx, round_key, at, row);
     let (progress, deferred_eager) = match reseed {
         Some(index) => {
             reseed_at(&cx, &mut sink, tables, &mut pending, index);
@@ -805,43 +810,57 @@ pub(crate) fn macro_step(db: &Db, key: FactKey) -> MacroStep {
 }
 
 /// Where a step's directives and tables come from (`nameres-core.md` §3, "Pending directives",
-/// "Side tables").
-struct Carried<'a> {
+/// "Side tables"): the module's last step, or, before its first, what it started with. A
+/// module gains no directive after its start (`DeclOp::clone_resolution_op` and
+/// `clone_root_op` carry none), so a round it does not step at leaves them as they were.
+pub(crate) struct Carried<'a> {
     module: ModuleId,
     /// The directives the module's last step left.
     before: &'a [MacroOp],
-    /// A log whose `Macro` ops of the module it has newly: its round-0 log, or what it gained at
-    /// this round.
-    log: &'a OpLog,
-    /// Its tables so far; `None` for a module declared at the round before, which starts from
-    /// empty tables and the directory its `SetModDir` in `log` names.
+    /// Before its first step, the log whose `Macro` ops of the module it started with: its
+    /// round-0 log, or what it gained at the round it was declared at.
+    log: Option<&'a OpLog>,
+    /// Its tables so far; `None` for a module declared after round 0 that has not stepped,
+    /// which starts from empty tables and the directory its `SetModDir` in `log` names.
     side: Option<&'a Arc<SideTables>>,
 }
 
 impl<'a> Carried<'a> {
-    fn of(db: &'a Db, key: FactKey, row: &ModuleRow) -> Carried<'a> {
-        let (module, krate, round) = (key.module(db), key.krate(db), key.round(db));
-        if round == 0 {
+    /// What the module at `at` of `modules` (a round of `krate`) has as the round starts.
+    pub(crate) fn at(db: &'a Db, krate: Crate, modules: &RoundModules, at: u32) -> Carried<'a> {
+        let module = modules.order[at as usize];
+        if let Some(last) = modules.last_step(at) {
+            let last = queries::macro_step(db, FactKey::new(db, module, krate, last));
+            return Carried { module, before: &last.pending, log: None, side: Some(&last.side) };
+        }
+        let row = &modules.rows[at as usize];
+        if row.since == 0 {
             let decl = row.decl.unwrap_or_else(|| {
                 panic!("nameres facts: {module:?} is a module of round 0 without its round-0 key")
             });
             let decls = queries::module_decls(db, decl);
-            return Carried { module, before: &[], log: &decls.ops, side: Some(&decls.side) };
+            return Carried { module, before: &[], log: Some(&decls.ops), side: Some(&decls.side) };
         }
-        let gained = &queries::module_round(db, key).ops;
-        if row.since == round {
-            return Carried { module, before: &[], log: gained, side: None };
-        }
-        let last = queries::macro_step(db, FactKey::new(db, module, krate, round - 1));
-        Carried { module, before: &last.pending, log: gained, side: Some(&last.side) }
+        let gained = &queries::module_round(db, FactKey::new(db, module, krate, row.since)).ops;
+        Carried { module, before: &[], log: Some(gained), side: None }
     }
 
     fn new_directives(&self) -> impl Iterator<Item = &'a MacroOp> + 'a {
-        let (module, log) = (self.module, self.log);
-        log.iter().filter_map(move |op| match op {
+        let module = self.module;
+        self.log.into_iter().flat_map(|log| log.iter()).filter_map(move |op| match op {
             DeclOp::Macro(it) if it.module == module => Some(it),
             _ => None,
         })
+    }
+
+    /// The directives the module has: the last step's, then the new ones.
+    pub(crate) fn directives(&self) -> impl Iterator<Item = &'a MacroOp> + 'a {
+        self.before.iter().chain(self.new_directives())
+    }
+
+    /// The module's tables as they are.
+    pub(crate) fn tables(&self) -> Arc<SideTables> {
+        self.side()
     }
 
     fn is_empty(&self) -> bool {
@@ -911,11 +930,15 @@ struct StepSink<'db> {
 }
 
 impl<'db> StepSink<'db> {
-    fn new(cx: &CollectCx<'db>, key: FactKey, round: RoundKey, row: &ModuleRow) -> StepSink<'db> {
+    /// The step of the module at `at` of `round`. A module can step at a round that does not run
+    /// its component (its calls wait on a module that does not change): it starts from its
+    /// facts as they last changed, and the imports its component's last run left unresolved.
+    fn new(cx: &CollectCx<'db>, round: RoundKey, at: u32, row: &ModuleRow) -> StepSink<'db> {
         let db = cx.db;
-        let module = key.module(db);
-        let krate = key.krate(db);
-        let handle = queries::fact_handle(db, key);
+        let krate = round.krate(db);
+        let module = queries::round_modules(db, round).order[at as usize];
+        let handle = queries::fact_handle(db, queries::fact_key(db, round, at));
+        let ran = FactKey::new(db, module, krate, queries::ran_by(db, round, at));
         let scope = <ModuleScope<'_> as salsa::plumbing::FromId>::from_id(handle);
         let data = ModuleData::with_scope(
             row.origin,
@@ -959,7 +982,7 @@ impl<'db> StepSink<'db> {
             log: OpLog::default(),
             macros: Vec::new(), // alloc: empty until the step collects a directive
             imports: Vec::new(), // alloc: empty until the step collects an import
-            unresolved: queries::unresolved_named(db, key),
+            unresolved: queries::unresolved_named(db, ran),
             new_modules: Vec::new(), // alloc: empty until an expansion declares a module
         }
     }
@@ -1357,12 +1380,13 @@ struct S;
         let key = FactKey::new(&db, root, krate, 0);
         let first = queries::macro_step(&db, key);
         assert!(!first.progress);
-        assert_eq!(first_attr(&first.pending), Some(0), "{:?}", first.pending);
+        assert_eq!(first_attr(first.pending.iter()), Some(0), "{:?}", first.pending);
 
         let cx = collect::cx(&db, krate, false);
         let round = RoundKey::new(&db, krate, 0);
-        let row = queries::round_modules(&db, round).row(root).expect("the root is a module of round 0");
-        let mut sink = StepSink::new(&cx, key, round, row);
+        let modules = queries::round_modules(&db, round);
+        let at = modules.at(root).expect("the root is a module of round 0");
+        let mut sink = StepSink::new(&cx, round, at, &modules.rows[at as usize]);
         let mut pending = first.pending.to_vec();
         let mut side = Arc::clone(&first.side);
         reseed_at(&cx, &mut sink, Arc::make_mut(&mut side), &mut pending, 0);
@@ -1391,6 +1415,7 @@ pub fn f() {}
         );
         let krate = db.fetch_test_crate();
         let modules = queries::round_modules(&db, RoundKey::new(&db, krate, 0));
+        assert_eq!(modules.stepping().count(), 0, "no module has a directive, so none steps");
         for &module in modules.order.iter() {
             let it = step(&db, module, krate, 0);
             assert!(it.ops.is_empty(), "{module:?}: {:?}", it.ops);

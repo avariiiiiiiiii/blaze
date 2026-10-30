@@ -1,5 +1,5 @@
 //! Files on Windows: the handles the port reads and appends through, and the calls of the
-//! effects that block (a whole-file write, a rename, a clone, a mapping, a mode), which are
+//! effects that block (a whole-file write, a rename, a clone, a mapping, a mode, times), which are
 //! `crate::fs`'s on Windows, so `Threads` and `Iocp` do the same.
 
 use std::{
@@ -9,14 +9,15 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE},
+    Foundation::{FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE},
     Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_END_OF_FILE_INFO,
-        FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileEndOfFileInfo, GetFileAttributesW, GetFileSizeEx, GetVolumeInformationByHandleW,
-        INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        OPEN_ALWAYS, OPEN_EXISTING, SetFileAttributesW, SetFileInformationByHandle,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileEndOfFileInfo, GetFileAttributesW,
+        GetFileSizeEx, GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS,
+        OPEN_EXISTING, SetFileAttributesW, SetFileInformationByHandle, SetFileTime,
     },
     System::{
         IO::DeviceIoControl,
@@ -158,6 +159,52 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     };
     // SAFETY: a NUL-terminated path.
     sys::check(unsafe { SetFileAttributesW(wide.as_ptr(), wanted) })
+        // alloc: an error path.
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+}
+
+/// 100 ns intervals from 1601, where a `FILETIME` counts from, to the Unix epoch.
+const UNIX_EPOCH_INTERVALS: u64 = 116_444_736_000_000_000;
+
+/// `modified_ns` since the Unix epoch as a `FILETIME`: 100 ns intervals since 1601, NTFS's
+/// resolution, so what is below 100 ns is what the file system cannot keep. Never 0 (which
+/// `SetFileTime` reads as "leave it") nor past `i64::MAX`: `u64::MAX / 100` plus the offset
+/// is some 3 * 10^17.
+fn file_time(modified_ns: u64) -> FILETIME {
+    let intervals = modified_ns / 100 + UNIX_EPOCH_INTERVALS;
+    FILETIME { dwLowDateTime: intervals as u32, dwHighDateTime: (intervals >> 32) as u32 }
+}
+
+/// The access and modification times of the file or directory at `wide` (NUL-terminated, as
+/// [`sys::Paths`] makes it) both `modified_ns` since the Unix epoch: a handle opened for its
+/// attributes alone, `SetFileTime`, closed. The error is the system's, unnamed: the caller
+/// names the file.
+pub(super) fn set_times_of(wide: &[u16], modified_ns: u64) -> io::Result<()> {
+    debug_assert_eq!(wide.last(), Some(&0));
+    // SAFETY: a NUL-terminated path; no security attributes or template. Backup semantics
+    // opens a directory as well as a file.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_WRITE_ATTRIBUTES,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    let handle = sys::owned(handle)?;
+    let time = file_time(modified_ns);
+    // SAFETY: an open handle with the right to write attributes, and a `FILETIME` alive across
+    // the call for both the access and the write time; the null creation time is left as is.
+    sys::check(unsafe { SetFileTime(handle.as_raw_handle(), std::ptr::null(), &time, &time) })
+}
+
+/// [`set_times_of`] of `path`, for the calls on threads; the error names `path`.
+pub(crate) fn set_times(path: &Path, modified_ns: u64) -> io::Result<()> {
+    let wide = sys::path(path)?;
+    set_times_of(&wide, modified_ns)
         // alloc: an error path.
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }

@@ -465,3 +465,9 @@ are lock-free maps sharded by `blaze_ids::shard_count()`, with views in an appen
 > applied by db (lane db's doc): `docs/v2/plan/lanes/db/query-database.md` now names `Pinned::get` (line 51) and says freeing is by `blaze_reclaim` grace at task ends, with `&mut` freeing all at once (the old line 75).
 
 > answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/serve/work.rs:199 (`db.pin().get::<Plan>`) and serve/tests.rs; blaze-units and blaze-tree are cargo-sol's.
+
+> answered by lane cargo (2026-10-29): done. `crates/blaze-cargo/src/serve/work.rs:218` and
+> `serve/tests.rs:339` call `db.pin().get`, and so do blaze-units' tests (`load/tests.rs:664`,
+> `:670`, `stdlib/tests.rs:407`). blaze-tree has no call. `rg` finds no `Database::get` left in
+> lane cargo's paths.
+

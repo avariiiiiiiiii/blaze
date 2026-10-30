@@ -103,6 +103,15 @@ impl Files {
         traced
     }
 
+    /// Forgets what the module read, keeping the room for what it reads next.
+    pub(crate) fn forget_traced(&mut self) {
+        let Traced { files, dirs, env, untraceable } = &mut self.traced;
+        files.clear();
+        dirs.clear();
+        env.clear();
+        untraceable.clear();
+    }
+
     fn insert(&mut self, open: Open) -> u32 {
         match self.fds.iter().position(Option::is_none) {
             Some(at) => {

@@ -1,5 +1,6 @@
 //! MIR lowering for patterns
 
+use blaze_mem::Frame;
 use hir_def::{
     hir::{ExprId, Literal, RecordFieldPat},
     signatures::VariantFields,
@@ -10,7 +11,7 @@ use crate::{
     Adjust, Adjustment, BindingMode, ByRef,
     infer::PatAdjust,
     mir::{
-        CastKind, FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place,
+        CastKind, FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place, PlaceTy,
         lower::{
             AssignTarget, Assigned, BasicBlockId, BinOp, BindingId, BorrowKind, Expr,
             MemoryMap, MirLowerCtx, MirLowerError, MirSpan, Pat, PatId, PlaceElem, ProjectionElem,
@@ -59,7 +60,7 @@ enum MatchingMode {
     Assign,
 }
 
-impl<'db> MirLowerCtx<'_, 'db> {
+impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
     /// It gets a `current` unterminated block, appends some statements and possibly a terminator to it to check if
     /// the pattern matches and write bindings, and returns two unterminated blocks, one for the matched path (which
     /// can be the `current` block) and one for the mismatched path. If the input pattern is irrefutable, the
@@ -141,7 +142,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         // Bindings are dropped in the reverse of the order the pattern names them, whichever
         // alternative of an or-pattern ends up binding them. Of a guarded arm, what the first
         // alternative binds by value is declared once the guard holds, after the rest.
-        let mut bindings = Vec::new();
+        let mut bindings = Vec::new_in(self.frame);
         let mut alternatives = false;
         self.store.walk_pats(pattern, &mut |pat| match self.store.pat(pat) {
             Pat::Or(_) => alternatives = true,
@@ -149,7 +150,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             _ => (),
         });
         if alternatives {
-            let mut by_value = Vec::new();
+            let mut by_value = Vec::new_in(self.frame);
             if self.guarded_moves.is_some() {
                 self.first_alternative_by_value(pattern, &mut by_value);
             }
@@ -171,7 +172,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
 
     /// The bindings `pattern` binds by value in the first alternative of each of its
     /// or-patterns, which rustc's binding modes for a guarded arm follow.
-    fn first_alternative_by_value(&self, pattern: PatId, found: &mut Vec<BindingId>) {
+    fn first_alternative_by_value(&self, pattern: PatId, found: &mut Vec<BindingId, &'f Frame>) {
         match self.store.pat(pattern) {
             Pat::Or(alternatives) => {
                 if let Some(&first) = alternatives.first() {
@@ -196,37 +197,43 @@ impl<'db> MirLowerCtx<'_, 'db> {
     fn unreached_block(&mut self, current: BasicBlockId, span: MirSpan) -> BasicBlockId {
         let block = self.new_basic_block();
         self.set_goto(current, block, span);
-        self.result.unreached.push(block);
+        self.building.unreached.push(block);
         block
     }
 
     /// Every way of choosing one alternative from each or-pattern in `pattern`, in the order
     /// rustc tries them. A choice maps an or-pattern to the index of its alternative.
-    pub(super) fn or_expansions(&self, pattern: PatId) -> Vec<Vec<(PatId, usize)>> {
+    pub(super) fn or_expansions(
+        &self,
+        pattern: PatId,
+    ) -> Vec<Vec<(PatId, usize), &'f Frame>, &'f Frame> {
+        let frame = self.frame;
+        let mut expansions = Vec::new_in(frame);
         if let Pat::Or(alternatives) = self.store.pat(pattern) {
-            return alternatives
-                .iter()
-                .enumerate()
-                .flat_map(|(i, &alternative)| {
-                    self.or_expansions(alternative).into_iter().map(move |mut choice| {
-                        choice.push((pattern, i));
-                        choice
-                    })
-                })
-                .collect();
+            for (i, &alternative) in alternatives.iter().enumerate() {
+                for mut choice in self.or_expansions(alternative) {
+                    choice.push((pattern, i));
+                    expansions.push(choice);
+                }
+            }
+            return expansions;
         }
-        let mut expansions = vec![Vec::new()];
+        expansions.push(Vec::new_in(frame));
         self.store.pat(pattern).walk_child_pats(|child| {
             let children = self.or_expansions(child);
             if children.len() == 1 && children[0].is_empty() {
                 return;
             }
-            expansions = expansions
-                .iter()
-                .flat_map(|choice| {
-                    children.iter().map(move |child| [&choice[..], &child[..]].concat())
-                })
-                .collect();
+            let mut product = Vec::with_capacity_in(expansions.len() * children.len(), frame);
+            for choice in &expansions {
+                for child in &children {
+                    let mut both = Vec::with_capacity_in(choice.len() + child.len(), frame);
+                    both.extend_from_slice(choice);
+                    both.extend_from_slice(child);
+                    product.push(both);
+                }
+            }
+            expansions = product;
         });
         expansions
     }
@@ -239,7 +246,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         pattern: PatId,
     ) -> Result<'db, BasicBlockId> {
         // Every part is read before any is assigned, so that `(t.1, t.0) = t` swaps.
-        let outer = std::mem::take(&mut self.assigned);
+        let outer = std::mem::replace(&mut self.assigned, Vec::new_in(self.frame));
         let outer_from = std::mem::replace(&mut self.assigned_from, value_span);
         let matched = self.pattern_match_inner(current, None, value, pattern, MatchingMode::Assign);
         let assigned = std::mem::replace(&mut self.assigned, outer);
@@ -247,7 +254,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         let (mut current, _) = matched?;
         for Assigned { target, part, span } in assigned {
             let (place, ty) = match target {
-                AssignTarget::Local(local) => (local.into(), self.result.locals[local].ty.as_ref()),
+                AssignTarget::Local(local) => (local.into(), self.local(local).ty.as_ref()),
                 AssignTarget::Place(expr) => {
                     let Some((place, next)) =
                         self.lower_expr_as_place_without_adjust(current, expr, false)?
@@ -260,6 +267,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             };
             let value: Rvalue =
                 Operand { kind: OperandKind::Move(Place::from(part).store()), span: None }.into();
+            // clone: kept in the body, once on the way out of the drop if it unwinds
             current = self.drop_assigned(place, ty, current, span, Some(value.clone()));
             self.push_assignment(current, place, value, span);
         }
@@ -362,6 +370,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 let mut imaginary = false;
                 for (index, pat) in pats.iter().enumerate() {
                     let held = imaginary.then(|| {
+                        // clone: a frame map, put back after the imaginary alternative
                         (self.guarded_moves.as_ref().map(Vec::len), self.guard_refs.clone())
                     });
                     let (mut next, mut next_else) = self.pattern_match_inner(
@@ -617,7 +626,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     ) = (mode, pr.as_ref())
                     {
                         let local = self.binding_local(*binding)?;
-                        let ty = self.result.locals[local].ty.as_ref();
+                        let ty = self.local(local).ty.as_ref();
                         let value =
                             Operand { kind: OperandKind::Copy(cond_place.store()), span: None };
                         let target = AssignTarget::Local(local);
@@ -800,6 +809,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         match adjustments {
             [] => Ok(part.into()),
             [Adjustment { kind: Adjust::Pointer(cast), target }] => {
+                // clone: kept in the body
                 Ok(Rvalue::Cast(CastKind::PointerCoercion(*cast), part, target.clone()))
             }
             _ => not_supported!("a coercion of a part of a destructuring assignment"),
@@ -816,7 +826,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         current_else: Option<BasicBlockId>,
     ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
         let target_place = self.binding_local(id)?;
-        let ty = self.result.locals[target_place].ty.as_ref();
+        let ty = self.local(target_place).ty.as_ref();
         if let BindingMode(ByRef::No, _) = mode
             && self.guarded_moves.is_some()
         {
@@ -908,7 +918,10 @@ impl<'db> MirLowerCtx<'_, 'db> {
 
     /// The type of a place, normalized: the local of a `?` has the type `<R as Try>::Residual`.
     fn place_ty(&self, place: &Place<'db>) -> Ty<'db> {
-        let ty = place.ty(&self.result, &self.infcx, self.env).ty;
+        let local = self.local(place.local).ty.as_ref();
+        let ty = PlaceTy::from_ty(local)
+            .multi_projection_ty(&self.infcx, self.env, place.projection.as_slice())
+            .ty;
         if !matches!(ty.kind(), TyKind::Alias(..)) {
             return ty;
         }
@@ -1013,14 +1026,12 @@ impl<'db> MirLowerCtx<'_, 'db> {
         };
         Ok(match shape {
             AdtPatternShape::Record { args } => {
-                let it = args
-                    .iter()
-                    .map(|x| {
-                        let field_id =
-                            variant_data.field(&x.name).ok_or(MirLowerError::UnresolvedField)?;
-                        Ok((PlaceElem::Field(field_id.into()), x.pat))
-                    })
-                    .collect::<Result<'db, Vec<_>>>()?;
+                let mut it = Vec::with_capacity_in(args.len(), self.frame);
+                for x in args {
+                    let field_id =
+                        variant_data.field(&x.name).ok_or(MirLowerError::UnresolvedField)?;
+                    it.push((PlaceElem::Field(field_id.into()), x.pat));
+                }
                 self.pattern_match_adt(
                     current,
                     current_else,

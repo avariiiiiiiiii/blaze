@@ -12,8 +12,8 @@
 
 use blaze_items::{Fact, ItemId};
 use hir::{Adt, HasSource, InFile, ModuleDef, StructKind, Type};
-use hir_def::attrs::AttrFlags;
-use syntax::{AstNode, SyntaxKind, TextRange, ast, ast::HasName};
+use hir_def::{Lookup as _, attrs::AttrFlags};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast, ast::HasName};
 
 use crate::{
     cx::{Cx, def_range, item_range},
@@ -281,18 +281,24 @@ pub(super) fn plural(count: usize) -> &'static str {
 /// rustc's `is_const_pat_that_looks_like_binding`: a plain name that is a constant, not a new
 /// binding; its name and the span of its definition.
 pub(super) fn const_that_looks_like_binding(cx: &Cx<'_, '_>, pat: &ast::IdentPat) -> Option<(String, Span)> {
-    if pat.ref_token().is_some() || pat.mut_token().is_some() || pat.pat().is_some() {
+    if pat.ref_token().is_some()
+        || pat.mut_token().is_some()
+        || pat.pat().is_some()
+        || !all_chars(pat.syntax(), |c| c.is_alphanumeric() || c == '_')
+    {
         return None;
     }
     let ModuleDef::Const(konst) = cx.sema.resolve_bind_pat_to_const(pat)? else { return None };
-    if !pat.syntax().text().to_string().chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
     let name = konst.name(cx.db)?.as_str().to_owned();
     let source = konst.source(cx.db)?;
     let start = item_range(source.value.syntax()).start();
     let end = source.value.name().map_or(start, |it| it.syntax().text_range().end());
     Some((name, cx.span(source.with_value(TextRange::new(start, end.max(start))))))
+}
+
+/// Whether every character of `node`'s text is one `f` takes, read from its tokens in place.
+pub(super) fn all_chars(node: &SyntaxNode, f: impl Fn(char) -> bool) -> bool {
+    node.text().try_for_each_chunk(|chunk| if chunk.chars().all(&f) { Ok(()) } else { Err(()) }).is_ok()
 }
 
 /// rustc's `variant_list_has_applicable_non_exhaustive`: an ADT of another crate marked
@@ -344,7 +350,9 @@ impl DefinedHere {
         let peeled = ty.strip_references();
         let adt = peeled.as_adt()?;
         let at = adt_span(cx, adt, non_local)?;
-        let variants = point_at_variants(adt, witnesses.iter().take(5))
+        let mut pointed = Vec::new();
+        point_at_variants(adt, witnesses.iter().take(5), &mut pointed);
+        let variants = pointed
             .into_iter()
             .filter_map(|variant| {
                 let source = variant.source(cx.db)?;
@@ -371,19 +379,24 @@ impl DefinedHere {
 }
 
 /// rustc's `maybe_point_at_variant`: the variants of `adt` the witnesses name, first of each,
-/// leaving out the fields of a variant of another enum and of one already named.
-fn point_at_variants<'a, 'db: 'a>(adt: Adt, witnesses: impl Iterator<Item = &'a Witness<'db>>) -> Vec<hir::EnumVariant> {
-    let mut covered = Vec::new();
+/// leaving out the fields of a variant of another enum and of one already named. Appended to
+/// `out`; what a call has appended (`out[start..]`) is its `covered`, as in rustc, where each
+/// call's list starts empty and takes in its fields' lists.
+fn point_at_variants<'a, 'db: 'a>(
+    adt: Adt,
+    witnesses: impl Iterator<Item = &'a Witness<'db>>,
+    out: &mut Vec<hir::EnumVariant>,
+) {
+    let start = out.len();
     for witness in witnesses {
         if let Witness::Adt { adt: of, variant: Some(variant), .. } = witness {
-            if *of != adt || covered.contains(variant) {
+            if *of != adt || out[start..].contains(variant) {
                 continue;
             }
-            covered.push(*variant);
+            out.push(*variant);
         }
-        covered.extend(point_at_variants(adt, witness.fields()));
+        point_at_variants(adt, witness.fields(), out);
     }
-    covered
 }
 
 /// What hir says is not covered: its text read back (`hir-ide`'s `missing_match_arms`, rustc's
@@ -607,10 +620,12 @@ impl<'w, 'db> Iterator for Fields<'w, 'db> {
     }
 }
 
-/// rustc names the variants of `Option` and `Result` (its diagnostic items) without their enum.
+/// rustc names the variants of `Option` and `Result` (its diagnostic items) without their enum:
+/// here by their lang items.
 fn is_option_or_result(cx: &Cx<'_, '_>, adt: Adt) -> bool {
-    let lang = matches!(adt.module(cx.db).krate(cx.db).origin(cx.db), base_db::CrateOrigin::Lang(_));
-    lang && matches!(adt.name(cx.db).as_str(), "Option" | "Result")
+    let hir_def::AdtId::EnumId(id) = hir_def::AdtId::from(adt) else { return false };
+    let lang = hir_def::lang_item::lang_items(cx.db, cx.krate.base());
+    lang.Option == Some(id) || lang.ResultOk.is_some_and(|it| it.lookup(cx.db).parent == id)
 }
 
 /// Reads rust-analyzer's printing of a witness back, the type of each part known from where it

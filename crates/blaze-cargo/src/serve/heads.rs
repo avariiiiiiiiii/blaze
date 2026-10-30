@@ -463,6 +463,15 @@ impl Heads {
         }
     }
 
+    /// Looks at every checkout again: what a read of the image found corrupt is mended by the
+    /// scan's writes.
+    pub fn rescan(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>) {
+        for checkout in self.checkouts.iter_mut().flatten() {
+            let dir = FileName::new(checkout.below.trim_end_matches('/')).expect("a checkout's directory is a name");
+            checkout.watcher.rescan(vfs, dir, effects);
+        }
+    }
+
     /// Stops every watch.
     pub fn stop(&mut self, effects: &mut Vec<Effect>) {
         for checkout in self.checkouts.iter_mut().flatten() {

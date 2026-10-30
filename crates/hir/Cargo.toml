@@ -17,6 +17,7 @@ rustc-hash.workspace = true
 either.workspace = true
 arrayvec.workspace = true
 itertools.workspace = true
+hashbrown.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
@@ -29,6 +30,7 @@ rustc_type_ir.workspace = true
 # local deps
 base-db.workspace = true
 blaze-hashcons.workspace = true
+blaze-mem.workspace = true
 cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
@@ -44,6 +46,7 @@ tt.workspace = true
 span.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 blaze-format.workspace = true
 expect-test.workspace = true
 tracing.workspace = true

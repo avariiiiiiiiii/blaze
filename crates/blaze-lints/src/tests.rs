@@ -2,13 +2,13 @@
 //! diagnostics compared with what clippy writes of the same source.
 
 use base_db::{Db, FileId};
+use blaze_diagnostics::emit::{self, Sources, Style};
 use rustc_hash::FxHashMap;
 use test_fixture::WithFixture as _;
 
 use crate::{
     check::{Setup, check},
     conf::Conf,
-    emit::{self, Sources, Style},
     level::CommandLine,
 };
 
@@ -97,10 +97,10 @@ pub(crate) fn lint_with(fixture: &str, flags: &str, conf: Conf) -> String {
         let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
         let name_of = |file: FileId| names.get(&file).cloned();
         let found = check(&db, krate, &setup, &name_of);
-        let mut sources = Sources::of(texts);
+        let sources = Sources::of(texts);
         found
             .iter()
-            .map(|it| emit::written(&it.diagnostic, &mut sources, Style::default()))
+            .map(|it| emit::written(&it.diagnostic, &sources, Style::default()))
             .collect()
     })
 }

@@ -42,9 +42,6 @@ pub(super) enum Target {
     Union,
     Trait,
     Impl { of_trait: bool },
-    Expression,
-    Statement,
-    Arm,
     AssocConst,
     Method(MethodKind),
     AssocTy,
@@ -95,9 +92,6 @@ impl Target {
             Target::Trait => "traits",
             Target::Impl { of_trait: false } => "inherent impl blocks",
             Target::Impl { of_trait: true } => "trait impl blocks",
-            Target::Expression => "expressions",
-            Target::Statement => "statements",
-            Target::Arm => "match arms",
             Target::AssocConst => "associated consts",
             Target::Method(MethodKind::Inherent) => "inherent methods",
             Target::Method(MethodKind::Trait { body: false }) => "required trait methods",
@@ -210,8 +204,7 @@ pub(super) fn extern_types(cx: &Cx<'_, '_>) -> bool {
 
 /// Whether the target check warns of a `#[deprecated]` on `target` with `useless_deprecated`.
 pub(super) fn is_useless(target: Target) -> bool {
-    let unused =
-        matches!(target, Target::Closure | Target::Expression | Target::Statement | Target::Arm | Target::MacroCall);
+    let unused = matches!(target, Target::Closure | Target::MacroCall);
     !(ALLOWED.contains(&target) || target == Target::WherePredicate || unused)
 }
 

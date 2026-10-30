@@ -77,10 +77,7 @@ pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// instead of failing on the closed pipe. Not for a process that writes to sockets.
 pub fn end_with_reader() {
     #[cfg(unix)]
-    // SAFETY: restores the default action of a signal, before any thread is started.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+    raw::process::die_on_closed_pipe();
 }
 
 /// `blaze 0.20261028.9 (fb82b09 2026-10-28)` for a release, `blaze 0.0.0-dev (fb82b09)` for a

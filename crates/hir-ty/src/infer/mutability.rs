@@ -101,14 +101,14 @@ impl<'db> InferenceContext<'db> {
                     match st {
                         Statement::Let { pat, type_ref: _, initializer, else_branch, .. } => {
                             if let Some(i) = initializer {
-                                self.infer_mut_expr(*i, self.pat_bound_mutability(*pat));
+                                self.infer_mut_expr(i, self.pat_bound_mutability(pat));
                             }
                             if let Some(e) = else_branch {
-                                self.infer_mut_expr(*e, Mutability::Not);
+                                self.infer_mut_expr(e, Mutability::Not);
                             }
                         }
                         Statement::Expr { expr, has_semi: _ } => {
-                            self.infer_mut_expr(*expr, Mutability::Not);
+                            self.infer_mut_expr(expr, Mutability::Not);
                         }
                         Statement::Item(_) => (),
                     }

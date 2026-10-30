@@ -72,6 +72,8 @@ struct RawTarget {
 struct RawSpec {
     #[serde(default, rename = "crt-static-respected")]
     crt_static_respected: bool,
+    #[serde(rename = "data-layout")]
+    data_layout: Option<String>,
     #[serde(default)]
     metadata: RawSpecMetadata,
 }
@@ -154,10 +156,11 @@ impl Bits {
 }
 
 /// What a target's spec says that a build needs, read once.
-#[derive(Clone, Copy)]
 struct SpecFacts {
     crt_static_respected: bool,
     std: Option<bool>,
+    /// LLVM's data layout of the target, as the spec has it.
+    data_layout: Option<Box<str>>,
 }
 
 /// One target's data, compiled. Lookups are binary searches of sorted columns (a few dozen
@@ -300,7 +303,11 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
     let spec = match target_spec_json.values().next() {
         None => Err(format!("blaze recorded no target spec of `{triple}`")),
         Some(text) => serde_json::from_str::<RawSpec>(text)
-            .map(|it| SpecFacts { crt_static_respected: it.crt_static_respected, std: it.metadata.std })
+            .map(|it| SpecFacts {
+                crt_static_respected: it.crt_static_respected,
+                std: it.metadata.std,
+                data_layout: it.data_layout.map(String::into_boxed_str),
+            })
             .map_err(|error| format!("the recorded target spec of `{triple}`: {error}")),
     };
     let crt_static = names.binary_search(&"crt-static").ok().map(|it| it as u16);
@@ -368,8 +375,9 @@ impl Compiled {
         self.names.binary_search_by(|it| (**it).cmp(name)).ok().map(|it| it as u16)
     }
 
-    fn spec(&self) -> Result<SpecFacts, String> {
-        self.spec.clone()
+    fn spec(&self) -> Result<&SpecFacts, String> {
+        // alloc: the error's text, only for a target whose recorded spec did not parse.
+        self.spec.as_ref().map_err(Clone::clone)
     }
 
     /// One `-C target-feature` (or, `from_host`, one of the host's for `target-cpu=native`)
@@ -823,6 +831,17 @@ pub fn target_facts(triple: &str) -> Result<TargetFacts, String> {
         needs_builtins_mem: !has_std,
         split_debuginfo: target.split_debuginfo.iter().map(|it| String::from(&**it)).collect(),
     })
+}
+
+/// The target's LLVM data layout, as the pinned nightly's target spec has it
+/// (`rustc --print target-spec-json`'s `data-layout`): what the front end lays types out by and
+/// the back end is given. A triple blaze has no spec of is an error naming it.
+pub fn data_layout(triple: &str) -> Result<String, String> {
+    let target = target(triple)?;
+    match &target.spec()?.data_layout {
+        Some(layout) => Ok(String::from(&**layout)),
+        None => Err(format!("the recorded target spec of `{triple}` has no `data-layout`")),
+    }
 }
 
 /// The name of the file rustc writes for a crate `name` of `crate_type` (`bin`, `lib`, `rlib`,

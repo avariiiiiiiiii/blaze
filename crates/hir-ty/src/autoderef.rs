@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use arrayvec::ArrayVec;
 use base_db::Db;
 use hir_def::{TraitId, TypeAliasId};
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
@@ -46,7 +47,7 @@ pub fn autoderef<'db>(
     let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
     let (ty, _) = infcx.instantiate_canonical(Span::Dummy, &ty);
     let autoderef = Autoderef::new(&infcx, env.param_env, ty, Span::Dummy);
-    let mut v = Vec::new();
+    let mut v = ArrayVec::<Ty<'db>, { AUTODEREF_RECURSION_LIMIT + 1 }>::new();
     for (ty, _steps) in autoderef {
         // `ty` may contain unresolved inference variables. Since there's no chance they would be
         // resolved, just replace with fallback type.
@@ -55,7 +56,7 @@ pub fn autoderef<'db>(
         // If the deref chain contains a cycle (e.g. `A` derefs to `B` and `B` derefs to `A`), we
         // would revisit some already visited types. Stop here to avoid duplication.
         //
-        // XXX: The recursion limit for `Autoderef` is currently 20, so `Vec::contains()` shouldn't
+        // XXX: The recursion limit for `Autoderef` is currently 20, so `contains` shouldn't
         // be too expensive. Replace this duplicate check with `FxHashSet` if it proves to be more
         // performant.
         if v.contains(&resolved) {
@@ -79,7 +80,11 @@ impl<'db> TrackAutoderefSteps<'db> for usize {
         *self += 1;
     }
 }
-impl<'db> TrackAutoderefSteps<'db> for Vec<(Ty<'db>, AutoderefKind)> {
+/// The steps of a walk, inline: [`GeneralAutoderef::next`] takes none past
+/// [`AUTODEREF_RECURSION_LIMIT`].
+pub(crate) type AutoderefSteps<'db> = ArrayVec<(Ty<'db>, AutoderefKind), AUTODEREF_RECURSION_LIMIT>;
+
+impl<'db> TrackAutoderefSteps<'db> for AutoderefSteps<'db> {
     fn len(&self) -> usize {
         self.len()
     }
@@ -149,7 +154,7 @@ impl<'db> AutoderefCtx<'db> for InferenceContextAutoderefCtx<'_, 'db> {
 /// dereferences (`*`) and the `Deref` trait.
 /// Although called `Autoderef` it can be configured to use the
 /// `Receiver` trait instead of the `Deref` trait.
-pub(crate) struct GeneralAutoderef<'db, Ctx, Steps = Vec<(Ty<'db>, AutoderefKind)>> {
+pub(crate) struct GeneralAutoderef<'db, Ctx, Steps = AutoderefSteps<'db>> {
     // Meta infos:
     ctx: Ctx,
     traits: Option<AutoderefTraits>,
@@ -163,9 +168,9 @@ pub(crate) struct GeneralAutoderef<'db, Ctx, Steps = Vec<(Ty<'db>, AutoderefKind
     span: Span,
 }
 
-pub(crate) type Autoderef<'a, 'db, Steps = Vec<(Ty<'db>, AutoderefKind)>> =
+pub(crate) type Autoderef<'a, 'db, Steps = AutoderefSteps<'db>> =
     GeneralAutoderef<'db, DefaultAutoderefCtx<'a, 'db>, Steps>;
-pub(crate) type InferenceContextAutoderef<'a, 'db, Steps = Vec<(Ty<'db>, AutoderefKind)>> =
+pub(crate) type InferenceContextAutoderef<'a, 'db, Steps = AutoderefSteps<'db>> =
     GeneralAutoderef<'db, InferenceContextAutoderefCtx<'a, 'db>, Steps>;
 
 impl<'db, Ctx, Steps> Iterator for GeneralAutoderef<'db, Ctx, Steps>

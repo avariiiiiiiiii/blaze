@@ -3,7 +3,7 @@ use crate::durability::Durability;
 use crate::function::{SyncGuard, SyncOwner};
 use crate::key::DatabaseKeyIndex;
 use crate::sync::Mutex;
-use crate::sync::atomic::{AtomicU8, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use crate::table::Table;
 use crate::task::TaskId;
 use crate::zalsa::Zalsa;
@@ -17,6 +17,12 @@ pub struct Runtime {
     /// revision. Reset when the revision advances.
     #[cfg_attr(feature = "persistence", serde(skip))]
     cancellation_count: AtomicU8,
+
+    /// Set by [`Database::stop_readers`](crate::Database::stop_readers): every query that
+    /// starts from now unwinds with [`Cancelled::PendingWrite`], cycle heads included, until
+    /// the next write clears it. Read on every query call next to `revisions[0]`.
+    #[cfg_attr(feature = "persistence", serde(skip))]
+    readers_stopped: AtomicBool,
 
     /// Stores the "last change" revision for values of each duration.
     /// This vector is always of length at least 1 (for Durability 0)
@@ -228,6 +234,7 @@ impl Default for Runtime {
         Runtime {
             revisions: [Revision::start(); Durability::LEN],
             cancellation_count: Default::default(),
+            readers_stopped: Default::default(),
             dependency_graph: Default::default(),
             table: Default::default(),
         }
@@ -292,6 +299,19 @@ impl Runtime {
         };
         *count = next;
         false
+    }
+
+    #[inline]
+    pub(crate) fn readers_stopped(&self) -> bool {
+        self.readers_stopped.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn stop_readers(&self) {
+        self.readers_stopped.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn clear_stop(&mut self) {
+        *self.readers_stopped.get_mut() = false;
     }
 
     /// Returns the [`Table`] used to store the value of salsa structs

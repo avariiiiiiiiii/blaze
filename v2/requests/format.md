@@ -1891,6 +1891,9 @@ Status: open
 
 > forwarded to db (db-expand-macros-next1 holds `crates/span/`) (from requests, pass 17; told by tmux).
 
+> frontend-tree (2026-10-29): taken; frontend-tree holds `crates/span/` now. Child
+> `frontend-tree-span` applies it and answers here.
+
 ## dedup: bits: parser `TokenSet` onto `blaze_ids::bits::BitArray`, and `scan.rs` kept
 
 From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
@@ -2024,6 +2027,7 @@ index panicked, and no kind reaches past them (each is at most `SHEBANG`, assert
 Status: open
 
 > forwarded to frontend-tokens (holds `crates/parser/`) (from requests, pass 17; told by tmux).
+> done by frontend-tokens: items 1-3 as written. `blaze-ids.workspace = true` moved to parser's `[dependencies]` (sorted, before `blaze-mem`); no cycle (blaze-ids also depends on blaze-mem, which parser already uses, and nothing of it reaches parser). `TokenSet` on `BitArray<3>` (`EMPTY`, `with_bit`, `or`, `has_bit`, all `const`, `Copy` for inline words), the test kept; `scan.rs` `Block` doc added. manifest_lint clean, hot_lint nothing in either file. Nothing built.
 
 ## dedup: bits: intern `table.rs` `Live` and the image's live bits onto `blaze_ids::bits`
 
@@ -2183,3 +2187,28 @@ From frontend-hooks, which applied db's side of frontend-text's "the parse tree'
 `&self.text[self.range]` (L411) compiles as is (`Text: Deref<Target = str>`). Why: frontend.md
 item 6, the file's text is the VFS's bytes from the VFS to the parse tree, with no copy; without
 the first line `body.rs` doesn't compile against base-db.
+
+> forwarded to mem-format (mem-format-hir-apply, which holds `hir-def/src/expr_store/`; format is DONE) (requests, pass 20; told by tmux).
+> applied by mem-format-hir-apply (2026-10-29): all three edits, as written (`body.rs` L352,
+> L418 and the comment at L635). `FileText::text` returns `&syntax::Text` as stated, and the
+> field's only other use, `&self.text[self.range]`, goes through `Deref<Target = str>`.
+> Status: applied.
+
+## dedup: ARITH_OPS is ArithOp::ALL, the hir-def half (from dedup-scan, filed by db-apply-ty 2026-10-29)
+
+From `v2/requests/db.md` `## dedup: ARITH_OPS is ArithOp::ALL`; db-apply-ty applies the hir-ty
+half (`crates/hir-ty/src/infer/persist.rs`). `syntax::ast::ArithOp::ALL` is in
+(`crates/syntax/src/ast/operators.rs:67`), in the same declaration order as the const below, so
+every persisted code decodes as before.
+
+`crates/hir-def/src/hir/columns.rs`:
+- delete `const ARITH_OPS: [ArithOp; 10] = [ ArithOp::Add, … ArithOp::BitAnd, ];` (~L520-531);
+- L571 `3..=12 => BinaryOp::ArithOp(ARITH_OPS[(word - 3) as usize]),` ->
+  `3..=12 => BinaryOp::ArithOp(ArithOp::ALL[(word - 3) as usize]),`
+- L578 `20..=29 => BinaryOp::Assignment { op: Some(ARITH_OPS[(word - 20) as usize]) },` ->
+  `20..=29 => BinaryOp::Assignment { op: Some(ArithOp::ALL[(word - 20) as usize]) },`
+- L2030-2031 `ARITH_OPS.into_iter()` -> `ArithOp::ALL.into_iter()` (both lines).
+The `use syntax::ast::{ArithOp, ..}` at L95 stays.
+Status: open
+
+> forwarded to mem-format (holds format's hir-def `hir/` files; format is DONE; told by tmux; requests, pass 22).

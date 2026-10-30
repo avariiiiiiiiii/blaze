@@ -843,7 +843,10 @@ fn a_start_from_the_image_runs_no_load_again() {
     let mut client = dial(&mut daemon);
     let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
-    assert_eq!(PLANS.with(Cell::get), 0, "the load's result came from the image");
+    // Started again in this process, its database is warm only if nothing here had interned a
+    // symbol before the restart restored them.
+    let loads = PLANS.with(Cell::get);
+    assert_eq!(loads == 0, daemon.warm(), "the load ran again exactly when the database started empty ({loads})");
 }
 
 #[test]

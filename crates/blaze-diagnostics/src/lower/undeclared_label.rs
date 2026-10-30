@@ -15,7 +15,7 @@ use syntax::{AstNode, SyntaxNode, TextRange, ast, ast::HasLoopBody};
 use crate::{
     cx::Cx,
     lints::{code_fact, edit_distance::find_best_match_for_name},
-    lower::{Found, Phase, break_outside_of_loop::ancestors, unreachable_label},
+    lower::{Found, Phase, break_outside_of_loop::edges, unreachable_label},
     model::{Applicability, Diag},
 };
 
@@ -68,29 +68,46 @@ pub(crate) enum Resolution {
 /// A rib of rustc's label ribs: a label, or a barrier labels are not reachable through
 /// (a function, a closure, an `async` or `gen` block, a constant).
 enum Rib {
-    Label { name: String, at: InFile<TextRange>, ctxt: SyntaxContext },
+    Label(ast::Lifetime),
     Barrier,
 }
 
 /// rustc's `resolve_label` of the label `name` used at `node`: a label is the one used when
 /// their names are the same as `macro_rules` hygiene sees them (`normalize_to_macro_rules`);
-/// one is similar only in the same syntax context (`eq_ctxt`).
+/// one is similar only in the same syntax context (`eq_ctxt`). The ribs are read as the walk
+/// goes up, innermost first, and it stops at the label used; a label's syntax context is
+/// looked up only when its name is the one used or like it.
 pub(crate) fn resolve(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, name: &str) -> Resolution {
-    let ribs = ribs(cx, node);
     let used = ctxt(cx, node.file_id, node.value.text_range());
     let used_hygiene = used.opaque_and_semiopaque(cx.db);
     let mut similar: Option<Similar> = None;
-    for (i, rib) in ribs.iter().enumerate() {
-        let reachable = !ribs[..i].iter().any(|it| matches!(it, Rib::Barrier));
-        let Rib::Label { name: label, at, ctxt } = rib else { continue };
-        if label == name && ctxt.opaque_and_semiopaque(cx.db) == used_hygiene {
+    let mut reachable = true;
+    for (it, child) in edges(cx, node) {
+        let lifetime = match rib(&it.value, &child.value) {
+            None => continue,
+            Some(Rib::Barrier) => {
+                reachable = false;
+                continue;
+            }
+            Some(Rib::Label(lifetime)) => lifetime,
+        };
+        let label = lifetime.text();
+        let same = label == name;
+        let close = similar.is_none() && find_best_match_for_name(&[label], name, None).is_some();
+        if !same && !close {
+            continue;
+        }
+        let range = lifetime.syntax().text_range();
+        let at = it.with_value(range);
+        let ctxt = ctxt(cx, it.file_id, range);
+        if same && ctxt.opaque_and_semiopaque(cx.db) == used_hygiene {
             return match reachable {
                 true => Resolution::Found,
-                false => Resolution::Unreachable { defined: *at, similar },
+                false => Resolution::Unreachable { defined: at, similar },
             };
         }
-        if similar.is_none() && *ctxt == used && find_best_match_for_name(&[label.as_str()], name, None).is_some() {
-            similar = Some(Similar { name: label.clone(), at: *at, reachable });
+        if close && ctxt == used {
+            similar = Some(Similar { name: label.to_owned(), at, reachable });
         }
     }
     Resolution::Undeclared { similar }
@@ -101,49 +118,36 @@ fn ctxt(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> SyntaxContext {
     file.span_map(cx.db).span_for_range(range).ctx
 }
 
-/// The label ribs around `node`, innermost first.
-fn ribs(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<Rib> {
-    let chain = ancestors(cx, node);
-    let mut ribs = Vec::new();
-    for (i, it) in chain.iter().enumerate().skip(1) {
-        let child = &chain[i - 1].value;
-        let label = |label: Option<ast::Label>| -> Option<Rib> {
-            let lifetime = label?.lifetime()?;
-            let range = lifetime.syntax().text_range();
-            let ctxt = ctxt(cx, it.file_id, range);
-            Some(Rib::Label { name: lifetime.text().to_owned(), at: it.with_value(range), ctxt })
-        };
-        let rib = match ast::Expr::cast(it.value.clone()) {
-            Some(ast::Expr::LoopExpr(loop_)) => label(loop_.label()),
-            Some(ast::Expr::WhileExpr(loop_)) => label(loop_.label()),
-            Some(ast::Expr::ForExpr(loop_)) => {
-                let in_body = loop_.loop_body().is_some_and(|it| it.syntax() == child);
-                if in_body { label(loop_.label()) } else { None }
+/// The label rib `it` makes for what is in its `child`, if any.
+fn rib(it: &SyntaxNode, child: &SyntaxNode) -> Option<Rib> {
+    let label = |label: Option<ast::Label>| Some(Rib::Label(label?.lifetime()?));
+    match ast::Expr::cast(it.clone()) {
+        Some(ast::Expr::LoopExpr(loop_)) => label(loop_.label()),
+        Some(ast::Expr::WhileExpr(loop_)) => label(loop_.label()),
+        Some(ast::Expr::ForExpr(loop_)) => {
+            let in_body = loop_.loop_body().is_some_and(|it| it.syntax() == child);
+            if in_body { label(loop_.label()) } else { None }
+        }
+        Some(ast::Expr::BlockExpr(block)) => {
+            let coroutine = block.async_token().is_some() || block.gen_token().is_some();
+            let constant = block.const_token().is_some();
+            match coroutine || constant {
+                true => Some(Rib::Barrier),
+                false => label(block.label()),
             }
-            Some(ast::Expr::BlockExpr(block)) => {
-                let coroutine = block.async_token().is_some() || block.gen_token().is_some();
-                let constant = block.const_token().is_some();
-                match coroutine || constant {
-                    true => Some(Rib::Barrier),
-                    false => label(block.label()),
-                }
-            }
-            Some(ast::Expr::ClosureExpr(closure)) => {
-                closure.body().is_some_and(|it| it.syntax() == child).then_some(Rib::Barrier)
-            }
-            _ => {
-                let barrier = ast::Fn::can_cast(it.value.kind())
-                    || ast::Const::can_cast(it.value.kind())
-                    || ast::Static::can_cast(it.value.kind())
-                    || ast::ConstArg::can_cast(it.value.kind())
-                    || ast::ArrayExpr::cast(it.value.clone()).is_some_and(|array| {
-                        array.semicolon_token().is_some()
-                            && array.exprs().nth(1).is_some_and(|len| len.syntax() == child)
-                    });
-                barrier.then_some(Rib::Barrier)
-            }
-        };
-        ribs.extend(rib);
+        }
+        Some(ast::Expr::ClosureExpr(closure)) => {
+            closure.body().is_some_and(|it| it.syntax() == child).then_some(Rib::Barrier)
+        }
+        _ => {
+            let barrier = ast::Fn::can_cast(it.kind())
+                || ast::Const::can_cast(it.kind())
+                || ast::Static::can_cast(it.kind())
+                || ast::ConstArg::can_cast(it.kind())
+                || ast::ArrayExpr::cast(it.clone()).is_some_and(|array| {
+                    array.semicolon_token().is_some() && array.exprs().nth(1).is_some_and(|len| len.syntax() == child)
+                });
+            barrier.then_some(Rib::Barrier)
+        }
     }
-    ribs
 }

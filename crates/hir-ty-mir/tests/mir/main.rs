@@ -1,11 +1,12 @@
 //! The MIR passes over fixtures, through the queries a build asks: rustc's UB checks, storage
-//! markers kept for a code generator that emits them, and `file!()` as the build names files.
-//! An integration test, so the test database's queries are of the one copy of this crate the
-//! tests call.
+//! markers kept for a code generator that emits them, `file!()` as the build names files, and
+//! that `Release` references nothing `Debug` doesn't. An integration test, so the test
+//! database's queries are of the one copy of this crate the tests call.
 
 mod alloc_budget;
 mod db;
 mod machine;
+mod references;
 mod source_maps;
 mod source_names;
 mod storage;

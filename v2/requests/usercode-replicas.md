@@ -28,6 +28,8 @@ once per connection until `Unlisten`, and cargo passes the queue's effects strai
 means all three already hold, so I expect no code change. Please confirm against the current
 `serve/unit/test.rs`, or name what breaks.
 
+> forwarded to cargo (requests, pass 20; told by tmux).
+
 ## usercode-replicas 2: codegen: the fork server's wire is version 3 (`crates/blaze-engine/src/test_harness.rs`)
 
 From `usercode-replicas`, 2026-10-29. Informational, no change expected. The harness text still
@@ -38,3 +40,5 @@ That supersedes "The wire version is 2" in `usercode-fast-tests` 3. If the harne
 checks the version anywhere outside that text, make it 3.
 
 No sandbox change: answered by usercode under `usercode-fast-tests` 7.
+
+> forwarded to codegen (codegen-next1, `crates/blaze-engine/`) (requests, pass 20; told by tmux).

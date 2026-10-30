@@ -289,6 +289,38 @@ Work: write \(B\) bytes through the page cache to NVMe, with a CRC each group.
   2. The write itself is one `Effect::Write` (temp file, fsync, rename, directory fsync).
      That is 4 syscalls plus the data's writes, the minimum for an atomic replace.
 
+## frontend-deps: dependencies from images (frontend.md item 5)
+
+What is matched: rustc's `.rmeta` load, which maps each dependency's metadata and decodes it
+lazily, checking only the SVH in its header. blaze also maps its images (`Reader::pinned`)
+and reads parts in place, but it verifies each image's BLAKE3 before use, as the store
+verifies every value. That check is the one cost rustc does not pay.
+
+A session start with 300 dependencies, images averaging 150 KB (45 MB). Figures assumed, not
+measured:
+- **Keys**: per crate, the crate's fields and about 100 files as path and content ID
+  (about 70 bytes each, so 7 KB). BLAKE3 runs at about 1 cycle a byte on short inputs, so
+  that is about 2 µs a crate and 0.7 ms for 300, on one thread (`keys` walks dependencies
+  first). The file content IDs are the VFS's, already made. `Base::of` and `portable` add
+  one scan for each path, which is noise next to the hash.
+- **Serve, hit**: one get per crate (`K`), a table lookup and a mapping, then BLAKE3 over the
+  image at about 4 GB/s a core: 11 ms on one core, 1.4 ms on 8 (`ImageStore::for_each`).
+  Opening is header and bounds checks (constant per crate), and `frozen::unreadable` is one
+  pass over the def map part's file names. Nothing is copied.
+- **Serve, crate with reads**: one get for `K` that misses, then one per slot up to the hit
+  (one in practice), plus `reads_now` per shape. That stats and hashes each file the
+  expansion read, the same work `blaze_expand`'s own cache does before it reuses an expansion.
+  It is bounded by the files read; for a derive that reads nothing, the hash of an empty shape.
+- **Bound**: the verification. 45 MB / (4 GB/s × 8 cores) ≈ 1.4 ms, against rustc's
+  ≈ 0.3 ms to map and check headers (300 × 1 µs). Every later lookup is a load from the
+  mapped part, as rustc's is. Avoiding the verification would mean trusting unverified bytes
+  from a store, which AGENTS.md's review rules forbid, so the gap stays.
+
+Store side: `make` per crate encodes the frozen def map and signatures, then scans the three
+parts once for each machine path of at least 8 bytes (`held_by`, a first-byte scan with
+`position`, about 0.3 cycles a byte for a 150 KB image). It runs once per new image, on
+`for_each`'s cores.
+
 ## frontend-deps-reparse: reparse and re-lower only what an edit touches (frontend.md item 14)
 
 Design: [reparse.md](reparse.md). An edit's bound is "recomputing only what changed, plus the
@@ -360,53 +392,70 @@ sections).
   the arrays in three runs and patches what the edit moves, with `repack` gone. Not yet
   measured; step 2 remains.
 
-### 4. Cutting out the items (`hir_def::item_tree::items::item_sources`)
+### 4. Finding the items an edit changed (`hir_def::item_tree::items::item_keys`)
 
-Work: on every edit of the file, one `ItemSource` for each top-level item, the same one as
-before for each item that did not change.
+Work: on every edit of the file, tell each top-level item that reads what it read before
+(syntax, ast ids, span anchors, the crate's `cfg` set) from one that does not. There is one
+query per file (`file_item_tree_query`) and no salsa query per item. A per-item tracked struct
+plus its memo costs about 250 cycles an item an edit, more than lowering the item (about 200),
+so per-item queries could at best tie a whole-file lowering (about 166 µs an edit and 1 950
+cycles an item cold by speed-hir-sol-items' count, against 29 µs and 170 cycles). Instead the
+file's last tree is kept beside salsa (`KEPT`, 128 direct-mapped slots, as
+`syntax::parsing::kept` keeps the last parse), with its text and a key per item.
 
-- **Bound.** Salsa must match each item to its tracked struct: hashing the key and probing the
-  table, about 150 cycles. Reading the item's ast id and its anchors costs about 50 more. That
-  makes about 200 cycles an item, \(200 I\) = 100 000 cycles, **29 µs**, while the query reruns
-  on every edit.
+- **Bound.** What changed is known from the text: the common prefix and suffix of the old and
+  new text, 0.9 µs (stage 1's bound). Each item outside them reads what it did, but for its ast
+  ids and anchors, which an edit elsewhere can renumber (a disambiguator). Comparing those as two
+  arrays, the map's entries in the prefix as they are and in the suffix moved by the edit's
+  length, is about 10 KB, about 0.3 µs. Then a compare per item to place it, about 5 cycles,
+  0.7 µs. That makes **about 2 µs**.
 - **Design, applied now.**
-  - It walks each item's signature through cursor nodes, which allocate nothing: about 15
-    elements, at about 10 cycles each.
-  - The fingerprint's writes go into one reused buffer (about 40 writes of a few bytes, at about
-    3 cycles each), which is hashed in one BLAKE3 pass. That is about 2 compressions of 64
-    bytes, about 300 cycles. Before this change, each write was an update of the BLAKE3 state,
-    about 25 cycles each, about 1 000 cycles an item.
-  - Bodies are left out of the hash, so it reads about 10 KB rather than 50 KB.
+  - `common_ends` compares the kept text with the new one in 4 KiB `memcmp`s, then 64 bytes,
+    then bytes: about 1 µs.
+  - One walk of the items takes their ranges (about 10 cycles an item, 1.4 µs).
+  - An item in the suffix, matched to the old item at its place moved by the edit, or in the
+    prefix with two whole items after it there, keeps its old syntax fingerprint. A file's parse
+    is a function of its text, and the parser reads an item from the item list's state, its own
+    tokens and at most three tokens past its position, so such an item's syntax is the same.
+    Only the items the edit touched, and the two before them, are hashed (about 850 cycles each:
+    the signature walk, about 40 writes into one reused buffer and one BLAKE3 pass, with bodies
+    left out). That is about 2 500 cycles, 0.7 µs.
+  - Every item's ast ids and anchors are read again and compared as they are (`Keys`, two
+    arrays shared by all items), not hashed: one hash probe of the ast id map and one binary
+    search of the span map's anchors for a typical item, about 90 cycles, \(90 I\) = 45 000
+    cycles, **13 µs**.
+  - The keys are compared from each end (about 10 cycles an item, 1.4 µs), and the top level's
+    attributes are lowered again and compared (about 0.3 µs).
 
-  That is about 200 + 150 + 120 + 300 + 80 cycles, about **850 cycles an item: 120 µs, about
-  25% of the bound** (before this change, about 11%).
-- **In the way, and what removes it.** Every edit hashes the signature of every item again,
-  including the 499 that did not change. The reparse knows which elements it kept, which is
-  everything outside the replaced node. The removal is to carry fingerprints across it:
-  1. `Parse` records the element range it replaced in the tree it came from.
-  2. `item_sources` keeps, for each file, the previous parse's per-item syntax hashes by element.
-  3. An item outside the replaced range copies its hash (about 10 cycles) and hashes only its ids
-     and anchors, which can change through the ast ids' index disambiguators.
+  That is about **18 µs, about 11% of the bound**. Before (one BLAKE3 fingerprint of every
+  item's syntax, ids and anchors on every edit) it was about 850 cycles an item, 120 µs.
+- **In the way, and what removes it.** The 13 µs of ids and anchors. `AstIdMap` and
+  `RealSpanMap` keep them as flat arrays (`[start, end, kind, id]` entries and `[id, len]`
+  anchors in text order) but give them out only per node. With the two arrays lent as slices
+  (requested from span in `v2/requests/frontend-deps-items.md`), the slot keeps the last ones,
+  the prefix's are compared with one `memcmp` and the suffix's with a moved compare, and an item
+  wholly in an unchanged run whose ids and anchors compared equal needs no per-item read at all.
+  That leaves the text compare, the walk and the placing, **about 3 µs, about 70%**. Placing the
+  prefix and suffix as runs, rather than item by item, is the last 1.4 µs.
 
-  That gives about 300 cycles an item, about 70% of the bound. The rest is salsa's tracked
-  struct per item; the floor below that is salsa recreating one struct for each item on each
-  run. This is mine and next. It changes `Parse`, which salsa compares to backdate, so the
-  recorded range must stay out of `Parse`'s equality.
-
-### 5. Lowering a changed item (`item_fragment`)
+### 5. Lowering a changed item (`Ctx::lower_item`)
 
 - **Bound:** the lowering itself: interning the item's names and paths and lowering its
   attributes and visibility, a few hundred instructions for a typical item, about 0.3 µs.
-- **Design:** the same lowering as the whole file's, through `Ctx::for_item`. It adds a binary
-  search of the item's ids for each node (about 4 steps), and a `RealSpanMap` of its anchors
-  (3 allocations). The fragment's `finish` makes one allocation for each non-empty column, about
-  7 for a `fn`. That is about 600 cycles more, so the design is **about 35% of the bound**,
-  about 0.5 µs, once per changed item.
-- **In the way:** a fragment's columns are separate boxes. One buffer for all of them (an
-  `ItemTree` made of one allocation) removes that cost. That is a layout change in `item_tree.rs`,
-  which is mine, and it only pays off once item 4 is done.
+- **Design:** the same lowering as the whole file's, in the file's own context (its ast id map
+  and span map, so no per-item map and no binary search of ids), on the worker's builder. Its
+  `finish` makes one allocation for each non-empty column, about 7 for a `fn`, about 300
+  cycles. That is about **0.4 µs, about 75% of the bound**, once per changed item. An edit
+  inside a body changes no key and lowers nothing: the kept `Arc` is the result, which salsa
+  compares by address (`Arc`'s `Eq` fast path) and backdates.
+- **In the way:** a changed item's columns are separate boxes. One buffer for all of them (an
+  `ItemTree` made of one allocation) removes most of that cost. That is a layout change in
+  `item_tree.rs`, mine, and worth it only once item 6 is near its bound.
 
 ### 6. Assembling the file's tree (`assemble`)
+
+Only an edit that changes a key assembles: the kept rows of the unchanged items before and after
+the changed ones, as two runs, and each changed item's rows.
 
 - **Bound.** The output's plain columns: about 40 bytes an item, so \(40I\) = 20 KB written plus
   as much read, about 1 300 cycles, **0.4 µs**. Then one reference for each part's non-plain
@@ -427,21 +476,35 @@ before for each item that did not change.
      change to `ItemTree`'s attribute column and its persisted form; it is mine and comes after
      item 4.
 
+Against a whole-file lowering on every edit (`lower_whole`: 29 µs today, about 11 µs at its
+bound by speed-hir-sol-items' count, then salsa comparing the equal tree to backdate it, about
+10 µs): a keystroke in a body is 18 µs here, about 3 µs with the span slices, and lowers nothing.
+A signature edit is 18 + 0.4 + 45 µs today, worse than `lower_whole` until `Attr::input` is
+shared, then about 26 µs, and about 11 µs with the span slices and shared attribute slices.
+
+Cold, a file is lowered whole (`lower_whole`) in one pass and keys nothing, so a file never
+edited (every dependency) never pays for keys. Its first edit lowers it whole again and keys
+every item: 29 µs plus about 940 cycles an item, about 160 µs once per file. A slot holds 32
+bytes of key, about 25 of ids and anchors and 112 of marks per item, and a count of the text the
+keys were made of, for the at most 128 files edited last.
+
 ### The keystroke, end to end
 
 The stages above are mine. The stages between them are not: the reparse itself, and base-db's
-`ast_id_map` and `real_span_map`, both \(O(F)\) passes. Mine, for a keystroke in a 50 KB file:
+`ast_id_map` and `real_span_map`, both \(O(F)\) passes. Mine, for a keystroke in a 50 KB file,
+a body edit (most keystrokes) and, in brackets, one that changes an item's signature:
 
 | Stage | Bound | Before | Now | With the removals |
 | --- | --- | --- | --- | --- |
 | edit | 0.9 µs | 4 µs | 1 µs | 1 µs |
 | splice | 3.5 µs | 170 µs | 170 µs | 40 µs, then under 1 µs shared |
-| item sources | 29 µs | 260 µs | 120 µs | 40 µs |
-| changed item | 0.3 µs | 0.9 µs | 0.9 µs | 0.4 µs |
-| assemble | 6 µs | 45 µs | 45 µs | 7 µs, then 2 µs |
-| **total** | **40 µs** | **480 µs** | **340 µs** | **90 µs, then 45 µs** |
+| changed items (4) | 2 µs | 260 µs | 18 µs | 3 µs |
+| changed item lowered (5) | 0 (0.3 µs) | 0.9 µs | 0 (0.4 µs) | 0 (0.4 µs) |
+| assemble (6) | 0 (6 µs) | 45 µs | 0 (45 µs) | 0 (7 µs, then 2 µs) |
+| **total** | **6 µs (13 µs)** | **480 µs** | **190 µs (235 µs)** | **45 µs (51 µs), then 5 µs (7 µs) shared** |
 
-Nothing has been measured. `proof`'s budgets time each row once things compile.
+The splice is the largest term left and is format's (stage 3). Nothing has been measured.
+`proof`'s budgets time each row once things compile.
 
 ## frontend-tree: borrowed views over the flat tree (frontend.md item 16)
 

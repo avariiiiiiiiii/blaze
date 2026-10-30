@@ -394,7 +394,7 @@ mod tests {
         let Report::Ran(Some(traced)) = report else { panic!("{report:?}") };
         // Every variable it was given, and the names' hash: a variable added is one it sees.
         let names: Vec<_> = traced.env.iter().map(|it| it.0.clone()).collect();
-        assert_eq!(names, [OsString::from(trace::ALL_ENV_NAME), "OUT".into(), "PATH".into()]);
+        assert_eq!(names, [std::ffi::OsString::from(trace::ALL_ENV_NAME), "OUT".into(), "PATH".into()]);
         assert!(!traced.files.iter().any(|it| it.0.as_path() == Path::new("/x")), "not this run's line");
         let untraced = self::spec(&dir, "/bin/true", &[], false);
         std::fs::write(&untraced.live, "").unwrap();

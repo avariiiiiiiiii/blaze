@@ -73,13 +73,57 @@ pub fn eligible(db: &Db, krate: Crate) -> bool {
 /// One walk of the crate graph: each crate is visited once, whether eligible and its key
 /// decided together, so the work is the crates' files and their dependency edges.
 pub fn keys(db: &Db, crates: &[Crate], build: ContentId) -> FxHashMap<Crate, ContentId> {
+    // alloc: setup: the keys of a session, once
+    walked(db, crates, build).into_iter().filter_map(|(krate, key)| Some((krate, key?))).collect()
+}
+
+/// What the key of a crate was made from that a rule for public keys looks at
+/// (`blaze_global::Rule::image`), from the walk that made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyInputs {
+    pub key: ContentId,
+    pub build: ContentId,
+    /// The crate, then each crate its key covers (its dependencies, theirs, and so on), each
+    /// once.
+    pub closure: Vec<Crate>,
+    /// The `OUT_DIR` of each crate of `closure` that has one, as its variables give it, in the
+    /// order of `closure`.
+    pub out_dirs: Vec<String>,
+}
+
+/// [`keys`], each with what it was made from: the same walk, so the closure is exactly the
+/// crates whose keys the key hashed.
+pub fn key_inputs(db: &Db, crates: &[Crate], build: ContentId) -> FxHashMap<Crate, KeyInputs> {
+    let memo = walked(db, crates, build);
+    let inputs = |(&krate, key): (&Crate, &Option<ContentId>)| {
+        // alloc: setup: once per crate a driver publishes
+        let mut closure = vec![krate];
+        let mut at = 0;
+        while let Some(&next) = closure.get(at) {
+            for dep in &next.data(db).dependencies {
+                if !closure.contains(&dep.crate_id) {
+                    closure.push(dep.crate_id);
+                }
+            }
+            at += 1;
+        }
+        // alloc: setup, as above
+        let out_dirs = closure.iter().filter_map(|it| it.env(db).get("OUT_DIR")).collect();
+        Some((krate, KeyInputs { key: (*key)?, build, closure, out_dirs }))
+    };
+    // alloc: setup, as above
+    memo.iter().filter_map(inputs).collect()
+}
+
+/// The walk of [`keys`] and [`key_inputs`]: each crate of `crates` and of their dependencies,
+/// with its key or `None` when it is not [`eligible`].
+fn walked(db: &Db, crates: &[Crate], build: ContentId) -> Memo {
     let mut memo = FxHashMap::default();
     let mut hash = |krate, memo: &Memo| key(db, krate, build, memo);
     for &krate in crates {
         walk(db, krate, &mut hash, &mut memo);
     }
-    // alloc: setup: the keys of a session, once
-    memo.into_iter().filter_map(|(krate, key)| Some((krate, key?))).collect()
+    memo
 }
 
 /// Each crate walked: its key, or `None` when it is not [`eligible`].

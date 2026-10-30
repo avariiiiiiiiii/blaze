@@ -116,7 +116,7 @@ use crate::{
     next_solver::{
         AliasConstKind, AliasTy, AnonConstIdWrapper, Const, ConstKind, DbInterner, ErrorGuaranteed,
         GenericArgs, IsRigid, Region, RegionExt, StoredFnSig, StoredGenericArg, StoredGenericArgs,
-        StoredTy, StoredTys, Term, Ty, TyKind, Tys,
+        StoredPredicate, StoredTy, StoredTys, Term, Ty, TyKind, Tys,
         abi::Safety,
         infer::{
             InferCtxt, ObligationInspector,
@@ -696,6 +696,15 @@ pub enum InferenceDiagnostic {
         /// for a trait's `Self`.
         #[type_visitable(ignore)]
         origin: Option<(Span, GenericParamId)>,
+        /// `top_term` with its variables made for parameters kept apart, for rustc's
+        /// "consider giving `x` an explicit type: `Vec<T>`"; `None` when `top_term` is.
+        #[type_visitable(ignore)]
+        named: Option<Box<crate::solver_errors::NamedTerm>>,
+        /// Why the ambiguous goal was required, for rustc's `note_obligation_cause` ("required
+        /// by a bound in `f`"); `Misc` where writeback or `structurally_resolve_type` found the
+        /// type undecided.
+        #[type_visitable(ignore)]
+        cause: ObligationCauseCode,
     },
     UnionExprMustHaveExactlyOneField {
         #[type_visitable(ignore)]
@@ -735,6 +744,15 @@ pub enum InferenceDiagnostic {
         expr: ExprId,
         #[type_visitable(ignore)]
         kind: ReturnKind,
+    },
+    /// rustc's `check_expr_unsafe_binder_cast`: `wrap_binder!` into `found`, or `unwrap_binder!`
+    /// of `found`, which is not an unsafe binder (`unsafe<..> T`). `expr` is the cast.
+    UnsafeBinderCastOfNonBinder {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        #[type_visitable(ignore)]
+        kind: hir_def::hir::UnsafeBinderCastKind,
+        found: StoredTy,
     },
     RecordMissingFields {
         #[type_visitable(ignore)]
@@ -933,7 +951,7 @@ pub enum AllowTwoPhase {
     No,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Adjust {
     /// Go from ! to any type.
     NeverToAny,
@@ -1093,6 +1111,10 @@ pub struct InferenceResult<'db> {
     /// (rustc's `used_trait_imports`), with the node that picked it, once each, in the order
     /// inference picked them.
     pub(crate) traits_in_scope_used: Box<[(ExprOrPatId, TraitId)]>,
+    /// The goals stalled on a coroutine the body defines, resolved, with where each was made:
+    /// rustc's `coroutine_stalled_predicates`, which [`crate::coroutine_obligations`] proves
+    /// once the coroutines' witnesses are known.
+    pub(crate) coroutine_stalled_predicates: Box<[(Span, StoredPredicate)]>,
     pub(crate) nodes_with_type_mismatches: ExprOrPatSet,
 
     /// Interned `Error` type to return references to.
@@ -1291,6 +1313,7 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
         diagnostics: Box<[InferenceDiagnostic]>,
         unreachable: Box<[Unreachable]>,
         traits_in_scope_used: Box<[(ExprOrPatId, TraitId)]>,
+        coroutine_stalled_predicates: Box<[(Span, StoredPredicate)]>,
         defined_anon_consts: Box<[AnonConstId<'db>]>,
         frame: &Frame,
     ) -> InferenceResult<'db> {
@@ -1339,6 +1362,7 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
             diagnostics,
             unreachable,
             traits_in_scope_used,
+            coroutine_stalled_predicates,
             nodes_with_type_mismatches: nodes_with_type_mismatches.freeze(),
             error_ty,
             expr_adjustments: expr_adjustments.freeze(),
@@ -1721,6 +1745,9 @@ pub(crate) fn infer_body_query<'db>(
     db: &'db Db,
     def: DefWithBodyId,
 ) -> InferenceResult<'db> {
+    if let Some(served) = crate::check_cache::served_inference(db, def) {
+        return served;
+    }
     infer_query(db, def)
 }
 
@@ -1777,6 +1804,7 @@ impl<'db> InferenceResult<'db> {
             diagnostics: Default::default(),
             unreachable: Default::default(),
             traits_in_scope_used: Default::default(),
+            coroutine_stalled_predicates: Default::default(),
             nodes_with_type_mismatches: Default::default(),
             type_of_expr: Default::default(),
             type_of_pat: Default::default(),
@@ -1919,6 +1947,10 @@ impl<'db> InferenceResult<'db> {
 
     pub fn traits_in_scope_used(&self) -> &[(ExprOrPatId, TraitId)] {
         &self.traits_in_scope_used
+    }
+
+    pub fn coroutine_stalled_predicates(&self) -> &[(Span, StoredPredicate)] {
+        &self.coroutine_stalled_predicates
     }
 
     /// The anonymous consts of the body this inferred, including those inside them.
@@ -2070,6 +2102,8 @@ pub(crate) struct InferenceContext<'db, 'f> {
     param_top_pat: Option<PatId>,
     /// What [`InferenceContext::record_trait_pick`] recorded, each pair once.
     traits_in_scope_used: Vec<(ExprOrPatId, TraitId), &'f Frame>,
+    /// The goals set aside as stalled on a coroutine of the body, resolved at writeback.
+    coroutine_stalled: Vec<(Span, StoredPredicate), &'f Frame>,
     breakables: Vec<BreakableContext<'db, 'f>, &'f Frame>,
     types: &'db crate::next_solver::DefaultAny<'db>,
 
@@ -2191,6 +2225,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             unreachable: Vec::new_in(frame),
             param_top_pat: None,
             traits_in_scope_used: Vec::new_in(frame),
+            coroutine_stalled: Vec::new_in(frame),
             breakables: Vec::new_in(frame),
             deferred_cast_checks: Vec::new_in(frame),
             diagnostics: Diagnostics::default(),
@@ -2280,6 +2315,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 self.traits_in_scope_used.push(used);
             }
         }
+        self.coroutine_stalled.extend(other.coroutine_stalled_predicates.iter().copied());
 
         #[cfg_attr(debug_assertions, track_caller)]
         fn merge_index<'a, K: columns::DenseKey, V: Clone + PartialEq + 'a>(
@@ -2390,6 +2426,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             defined_anon_consts,
             mut unreachable,
             mut traits_in_scope_used,
+            mut coroutine_stalled,
             db,
             owner,
             frame,
@@ -2485,6 +2522,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
             resolver.resolve_completely(liberated_sig);
         }
+        for (_, predicate) in coroutine_stalled.iter_mut() {
+            resolver.resolve_completely(predicate);
+        }
         // A slice's iterator is `TrustedLen`: the `Box` is made once at its length.
         let tuple_field_access_types: Box<[StoredTys]> = tuple_field_accesses_rev
             .tys
@@ -2508,6 +2548,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             unreachable.drain(..).collect(),
             // alloc: the result's own list, at its length
             traits_in_scope_used.drain(..).collect(),
+            // alloc: the result's own list, at its length
+            coroutine_stalled.drain(..).collect(),
             // alloc: the result's own list, at its length
             defined_anon_consts.drain(..).collect(),
             frame,
@@ -3030,6 +3072,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 kind: TypeAnnotationNeeded::E0282,
                 ambiguity: None,
                 origin: crate::solver_errors::variable_origin(&self.table.infer_ctxt, ty.into()),
+                named: None,
+                cause: ObligationCauseCode::Misc,
             });
         }
         self.types.types.error

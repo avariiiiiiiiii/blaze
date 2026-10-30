@@ -739,6 +739,14 @@ fn lib_of(spec: &str) -> Option<NativeLib> {
         verbatim: on("verbatim"),
         whole_archive: on("whole-archive"),
         bundle: !off("bundle"),
+        as_needed: if on("as-needed") {
+            Some(true)
+        } else if off("as-needed") {
+            Some(false)
+        } else {
+            None
+        },
+        import_name_type: None,
     })
 }
 
@@ -1052,6 +1060,8 @@ mod tests {
             verbatim: true,
             whole_archive: false,
             bundle: true,
+            as_needed: None,
+            import_name_type: None,
         };
         assert_eq!(windows_target().lib(&dll), ["api-ms-win-core-test-l1-1-0.lib"]);
         let upper = NativeLib { name: intern::Symbol::intern("SHELL32.DLL"), ..dll.clone() };
@@ -1069,6 +1079,9 @@ mod tests {
             kind: NativeLibKind::RawDylib,
             verbatim,
             whole_archive: false,
+            bundle: true,
+            as_needed: None,
+            import_name_type: None,
         };
         assert_eq!(raw_dylib_file(&lib("SHELL32.DLL", true)), "SHELL32.DLL");
         assert_eq!(raw_dylib_file(&lib("kernel32.dll", true)), "kernel32.dll");

@@ -21,6 +21,8 @@ pub mod generics;
 pub(crate) mod persist;
 pub mod type_ref;
 
+pub use columns::{ExprKind, PatKind};
+
 use std::{fmt, iter::FusedIterator, mem};
 
 use hir_expand::{MacroDefId, name::Name};
@@ -431,6 +433,13 @@ pub enum Expr<'a> {
     OffsetOf(&'a OffsetOf),
     InlineAsm(&'a InlineAsm),
     IncludeBytes,
+    /// `builtin # wrap_binder(expr[, ty])` or `builtin # unwrap_binder(expr[, ty])`, what core's
+    /// `wrap_binder!` and `unwrap_binder!` expand to (rustc's `ExprKind::UnsafeBinderCast`).
+    UnsafeBinderCast {
+        kind: UnsafeBinderCastKind,
+        expr: ExprId,
+        ty: Option<TypeRefId>,
+    },
 }
 
 impl Expr<'_> {
@@ -452,7 +461,8 @@ impl Expr<'_> {
             | Expr::Tuple { .. }
             | Expr::OffsetOf(_)
             | Expr::Underscore
-            | Expr::IncludeBytes => ExprPrecedence::Unambiguous,
+            | Expr::IncludeBytes
+            | Expr::UnsafeBinderCast { .. } => ExprPrecedence::Unambiguous,
 
             Expr::Await { .. }
             | Expr::Call { .. }
@@ -503,6 +513,15 @@ pub enum LoopSource {
     While,
     /// A `for _ in _ { .. }` loop.
     ForLoop,
+}
+
+/// Which way an [`Expr::UnsafeBinderCast`] goes (rustc's `UnsafeBinderCastKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnsafeBinderCastKind {
+    /// `wrap_binder!`: a value into an `unsafe<..> T`.
+    Wrap,
+    /// `unwrap_binder!`: an `unsafe<..> T` place or value out to `T`.
+    Unwrap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

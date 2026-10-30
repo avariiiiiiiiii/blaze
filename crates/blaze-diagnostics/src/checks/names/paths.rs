@@ -124,7 +124,7 @@ pub(super) fn check<'db>(
     }
     let offset = usize::from(first.coloncolon_token().is_some());
     let single = offset == 0 && prefixes.len() == 1;
-    if single && source == Source::Type && is_own_type_param(signature, path, first) {
+    if single && source == Source::Type && (is_own_type_param(signature, path, first) || is_primitive(signature, first)) {
         return None;
     }
     let segments = || segments(first, &prefixes);
@@ -481,6 +481,62 @@ fn is_own_type_param(signature: &Signature<'_>, path: ast::Path<'_>, first: ast:
             })
     };
     declares(item) || (inner != item && declares(inner))
+}
+
+/// Whether the one-segment path of first segment `first` names a primitive type, which the
+/// place expects: read from the syntax, with nothing asked of Semantics, where
+/// [`Signature::primitives`] holds and no generic parameter of the item (or the impl or trait
+/// around it) has the name. Only in a file of source, as [`is_own_type_param`].
+fn is_primitive(signature: &Signature<'_>, first: ast::PathSegment<'_>) -> bool {
+    if !signature.primitives || signature.node.file_id.is_macro() {
+        return false;
+    }
+    let Some(ast::PathSegmentKind::Name(name)) = first.kind() else { return false };
+    let name = name.text();
+    if !is_primitive_name(name) {
+        return false;
+    }
+    let item = signature.node.value;
+    let inner = outer::inner_item(item);
+    let declares = |node: ast::Node<'_>| {
+        ast::AnyHasGenericParams::can_cast(node.kind())
+            && node
+                .child_where(ast::GenericParamList::can_cast)
+                .and_then(ast::GenericParamList::cast)
+                .is_some_and(|list| {
+                    list.type_or_const_params().any(|it| match it {
+                        ast::TypeOrConstParam::Type(param) => param.name().is_some_and(|it| it.text() == name),
+                        ast::TypeOrConstParam::Const(_) => false,
+                    })
+                })
+    };
+    !declares(item) && (inner == item || !declares(inner))
+}
+
+/// rustc's `PrimTy::from_name`: the names of the primitive types.
+fn is_primitive_name(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "char"
+            | "str"
+            | "isize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "usize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "f16"
+            | "f32"
+            | "f64"
+            | "f128"
+    )
 }
 
 /// A segment as rustc's resolver names it: its keyword or its name.

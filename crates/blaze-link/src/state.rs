@@ -52,6 +52,10 @@ pub(crate) enum Def {
     /// An offset in the image's TLS block that is not a piece's (a native `Absolute`
     /// thread-local: the local-dynamic module base).
     TlsOffset(u64),
+    /// A thread-local of an image this one is linked beside ([`crate::Outside`]): its offset
+    /// from the thread pointer as the run's loader places it, which only thread-local
+    /// relocations read.
+    TpOff(i64),
     /// Whatever another symbol is.
     Alias(Sym),
     /// The linker's: [`State::specials`] at this index.
@@ -147,6 +151,8 @@ struct Lists {
     weak: ListRef,
     /// Symbols besides its own defined in it (a native section's), which move with it.
     defines: ListRef,
+    /// wasm: the names ([`NameId`]) whose import it declares ([`State::declare_wasm`]).
+    wasm: ListRef,
 }
 
 /// What its last write left for the loader: offsets in it of slid addresses, and binds.
@@ -271,6 +277,11 @@ impl<'s> PieceRef<'s> {
         self.state.syms.get(self.lists().defines)
     }
 
+    /// wasm: the names whose import it declares, each once, as [`NameId`]s.
+    pub fn wasm_names(self) -> &'s [u32] {
+        self.state.wasm_names.get(self.lists().wasm)
+    }
+
     pub fn rebase(self) -> &'s [u64] {
         let loader = self.state.loader.get(self.id as usize).expect("a piece's loader lists");
         self.state.rebase.get(loader.rebase)
@@ -338,6 +349,50 @@ pub(crate) struct Input {
     pub file: Arc<NativeFile>,
 }
 
+/// Where a name's per-name state is kept: names are numbered by shard as symbols are
+/// ([`Symbols::name`], [`Symbols::split`]).
+fn name_split(name: NameId) -> (usize, usize) {
+    Symbols::split(Sym(name.0))
+}
+
+/// No pair given ([`Pairs`]).
+const NO_PAIR: u32 = u32::MAX;
+
+/// The tier-up counter pairs of a dev run's cells ([`crate::counter`]): each instance's, by
+/// its interned key, in the order first given; never taken back or given to another key while
+/// the image lives.
+#[derive(Clone)]
+pub(crate) struct Pairs {
+    given: u32,
+    /// Per id shard ([`Symbols::split_id`]), [`NO_PAIR`] where none.
+    of: [CowVec<u32>; SHARDS],
+}
+
+impl Pairs {
+    fn new() -> Pairs {
+        Pairs { given: 0, of: std::array::from_fn(|_| CowVec::default()) }
+    }
+
+    /// How many are given out: the next one's index.
+    pub fn given(&self) -> u32 {
+        self.given
+    }
+
+    pub fn of(&self, id: IdNo) -> Option<u32> {
+        let (shard, at) = Symbols::split_id(id);
+        self.of[shard].get(at).copied().filter(|it| *it != NO_PAIR)
+    }
+
+    /// Gives `id` the next pair, which the caller checked is there; `id` has none.
+    pub fn give(&mut self, id: IdNo) -> u32 {
+        let pair = self.given;
+        let (shard, at) = Symbols::split_id(id);
+        self.of[shard].set(at, pair, || NO_PAIR);
+        self.given += 1;
+        pair
+    }
+}
+
 /// Every field is `Copy`, an `Arc`, or a copy-on-write container whose clone is a reference
 /// count, except `spaces` (a few dozen regions): see the module's comment for the cost.
 #[derive(Clone)]
@@ -349,7 +404,9 @@ pub(crate) struct State {
     /// The names Rust code defines (`#[no_mangle]`, `main`), each the symbol it is.
     // BTreeMap: changed by every stage and walked in order by each native resolve.
     pub names: Arc<BTreeMap<NameId, Sym>>,
-    /// wasm: what codegen's functions and statics say each name is imported as.
+    /// wasm: what codegen's live functions and statics say each name is imported as, the one
+    /// import every live piece declaring it agrees on ([`State::declare_wasm`]); a name no
+    /// live piece declares has none.
     pub wasm_imports: Arc<FxHashMap<NameId, blaze_codegen::wasm::Import>>,
     pub inputs: Arc<Vec<Input>>,
     pub resolved: Arc<Resolved>,
@@ -358,7 +415,13 @@ pub(crate) struct State {
     /// Each slot's symbol, by its index.
     pub slot_syms: CowVec<Sym>,
     pub capacity: u32,
+    pub pairs: Pairs,
     pub tls: Option<Tls>,
+    /// Where the run's loader puts the start of `tls`, as an offset from the thread pointer,
+    /// when the image's thread-locals are at a place fixed beside another image's
+    /// ([`crate::premap`]): every thread-local relocation then writes `tls_at` plus the
+    /// target's offset in `tls`. `None`: the format's own TLS model places them.
+    pub tls_at: Option<i64>,
     pub file_len: u64,
     /// The writer's parts ([`crate::model::File::parts`]): a kept table's pages are shared
     /// with the writer and the states before, so this state's copy stays as it was when the
@@ -391,6 +454,10 @@ pub(crate) struct State {
     users: CowVec<u32>,
     fixups: CowList<Fixup>,
     syms: CowList<Sym>,
+    /// Each piece's [`Lists::wasm`].
+    wasm_names: CowList<u32>,
+    /// wasm: per name shard ([`name_split`]), how many live pieces declare the name's import.
+    wasm_declarers: [CowVec<u32>; SHARDS],
     rebase: CowList<u64>,
     binds: CowList<Bind>,
     /// Per symbol shard ([`Symbols::split`]): inline, so a clone allocates nothing.
@@ -425,7 +492,9 @@ impl State {
             slots: 0,
             slot_syms: CowVec::default(),
             capacity: 0,
+            pairs: Pairs::new(),
             tls: None,
+            tls_at: None,
             file_len: 0,
             parts: Arc::default(),
             debug: Arc::default(),
@@ -443,6 +512,8 @@ impl State {
             users: CowVec::default(),
             fixups: CowList::default(),
             syms: CowList::default(),
+            wasm_names: CowList::default(),
+            wasm_declarers: std::array::from_fn(|_| CowVec::default()),
             rebase: CowList::default(),
             binds: CowList::default(),
             defs: std::array::from_fn(|_| CowVec::default()),
@@ -604,6 +675,49 @@ impl State {
         self.hot.len() as u32
     }
 
+    /// The state's tables as `(name, elements, bytes)` ([`crate::Image::tables`]): elements are
+    /// what is live, bytes what is held, garbage and removed pieces included, without the
+    /// chunk tables or the room left in a last chunk.
+    pub fn tables(&self) -> Vec<(&'static str, u64, u64)> {
+        fn vec<T: crate::cow::Chunked>(column: &CowVec<T>) -> u64 {
+            (column.len() * size_of::<T>()) as u64
+        }
+        fn list<T: crate::cow::Chunked>(lists: &CowList<T>) -> u64 {
+            ((lists.live() + lists.garbage()) * size_of::<T>()) as u64
+        }
+        let live = self.hot.iter().filter(|it| it.live()).count() as u64;
+        let pieces = vec(&self.hot)
+            + vec(&self.what)
+            + vec(&self.sort)
+            + vec(&self.piece_lists)
+            + vec(&self.users)
+            + vec(&self.removals)
+            + (self.classes.len() * size_of::<Class>()) as u64;
+        let symbols = self.defs.iter().map(|it| it.len() as u64).sum::<u64>();
+        let symbol_bytes = self.defs.iter().map(vec).sum::<u64>()
+            + self.cold.iter().map(vec).sum::<u64>()
+            + self.ids.iter().map(vec).sum::<u64>()
+            + list(&self.syms)
+            + list(&self.wasm_names)
+            + self.wasm_declarers.iter().map(vec).sum::<u64>()
+            + list(&self.ref_items)
+            + vec(&self.seen);
+        let loader = vec(&self.loader) + list(&self.rebase) + list(&self.binds);
+        let slots = vec(&self.slot_syms) + vec(&self.cells) + vec(&self.slot_next);
+        let file = self.parts.iter().map(|(_, bytes)| bytes.len() as u64).sum::<u64>();
+        // alloc: a report of eight rows, off any link's path
+        vec![
+            ("link-piece", live, pieces),
+            ("relocation", self.fixups.live() as u64, list(&self.fixups)),
+            ("link-symbol", symbols, symbol_bytes),
+            ("link-loader", (self.rebase.live() + self.binds.live()) as u64, loader),
+            ("link-function", self.functions.len() as u64, vec(&self.functions)),
+            ("link-line", self.lines.live() as u64, list(&self.lines)),
+            ("link-slot", u64::from(self.slots), slots),
+            ("link-file-part", self.parts.len() as u64, file),
+        ]
+    }
+
     /// A live piece.
     #[inline]
     pub fn piece(&self, id: PieceId) -> Option<PieceRef<'_>> {
@@ -657,6 +771,7 @@ impl State {
             fixups: self.fixups.push(piece.fixups),
             weak: self.syms.push(piece.weak),
             defines: self.syms.push(piece.defines),
+            wasm: ListRef::EMPTY,
         };
         self.piece_lists.push(lists);
         self.loader.push(Loader::default());
@@ -688,9 +803,19 @@ impl State {
             let sym = self.syms.get(lists.defines)[at];
             self.undefine_in(sym, id);
         }
+        for at in 0..lists.wasm.len() {
+            let name = NameId(self.wasm_names.get(lists.wasm)[at]);
+            let (shard, at) = name_split(name);
+            let declarers = self.wasm_declarers[shard].get_mut(at).expect("a declared name's count");
+            *declarers -= 1;
+            if *declarers == 0 {
+                Arc::make_mut(&mut self.wasm_imports).remove(&name);
+            }
+        }
         self.fixups.free(lists.fixups);
         self.syms.free(lists.weak);
         self.syms.free(lists.defines);
+        self.wasm_names.free(lists.wasm);
         self.rebase.free(loader.rebase);
         self.binds.free(loader.binds);
         if let Some(lines) = lines {
@@ -726,6 +851,26 @@ impl State {
         self.piece_lists.get_mut(id as usize).expect("a piece's lists").defines = list;
     }
 
+    /// wasm: how many live pieces declare `name`'s import.
+    pub fn wasm_declarers(&self, name: NameId) -> u32 {
+        let (shard, at) = name_split(name);
+        self.wasm_declarers[shard].get(at).copied().unwrap_or(0)
+    }
+
+    /// wasm: records that the live piece `id`, which declared none, declares the imports of
+    /// `names` (each once), which the caller has made agree with [`State::wasm_imports`].
+    /// Removing the piece takes them back: a name no live piece declares loses its import.
+    pub fn declare_wasm(&mut self, id: PieceId, names: &[u32]) {
+        debug_assert!(self.piece(id).is_some_and(|it| it.wasm_names().is_empty()));
+        for name in names {
+            let (shard, at) = name_split(NameId(*name));
+            let declarers = self.wasm_declarers[shard].get(at).copied().unwrap_or(0);
+            self.wasm_declarers[shard].set(at, declarers + 1, || 0);
+        }
+        let list = self.wasm_names.push(names);
+        self.piece_lists.get_mut(id as usize).expect("a piece's lists").wasm = list;
+    }
+
     pub fn set_weak(&mut self, id: PieceId, weak: &[Sym]) {
         let old = self.piece_lists.get(id as usize).expect("a piece's lists").weak;
         self.syms.free(old);
@@ -759,6 +904,7 @@ impl State {
         let over = |garbage: usize, live: usize| garbage > live + (1 << 16);
         over(self.fixups.garbage(), self.fixups.live())
             || over(self.syms.garbage(), self.syms.live())
+            || over(self.wasm_names.garbage(), self.wasm_names.live())
             || over(self.ref_items.garbage(), self.ref_items.live())
             || over(self.rebase.garbage(), self.rebase.live())
             || over(self.binds.garbage(), self.binds.live())
@@ -772,6 +918,7 @@ impl State {
         let old = self.clone();
         self.fixups = CowList::default();
         self.syms = CowList::default();
+        self.wasm_names = CowList::default();
         self.rebase = CowList::default();
         self.binds = CowList::default();
         self.ref_items = CowList::default();
@@ -795,6 +942,7 @@ impl State {
                     fixups: self.fixups.push(piece.fixups()),
                     weak: self.syms.push(piece.weak()),
                     defines: self.syms.push(piece.defines()),
+                    wasm: self.wasm_names.push(piece.wasm_names()),
                 };
                 let loader = Loader { rebase: self.rebase.push(piece.rebase()), binds: self.binds.push(piece.binds()) };
                 (lists, loader)

@@ -1817,6 +1817,10 @@ impl<'db> TyTableWriter<'db> {
         self.place(clauses)
     }
 
+    pub fn predicate(&mut self, predicate: Predicate<'db>) -> u32 {
+        self.place(predicate)
+    }
+
     /// Writes the table, returning where it is in `out` for [`TyTableReader::open`].
     pub fn write(self, out: &mut Writer) -> u64 {
         let nodes = out.push_slice(&self.nodes);
@@ -1969,6 +1973,10 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
     }
 
     pub fn clauses(&self, at: u32) -> Result<Clauses<'db>, FormatError> {
+        self.value(at)
+    }
+
+    pub fn predicate(&self, at: u32) -> Result<Predicate<'db>, FormatError> {
         self.value(at)
     }
 

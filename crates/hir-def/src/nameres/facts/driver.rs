@@ -743,6 +743,10 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
             import.source.use_tree,
         ));
     }
+    // Then what rustc reports of imports of a trait's associated items.
+    for &(_, import, status) in &imports {
+        trait_item_import_diagnostics(db, &def_map, import, status, |it| diagnostics.push(it));
+    }
     // alloc: the def map's own list, at exact size, once per def map.
     def_map.diagnostics = diagnostics.into_iter().collect();
     def_map.names = name_records(
@@ -759,6 +763,22 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
     def_map.shrink_to_fit();
     local.shrink_to_fit();
     (def_map, local)
+}
+
+/// What rustc's `finalize_imports` reports of `import`, resolved to `status` (`None` when it did
+/// not resolve): a trait's items imported without `import_trait_associated_functions`, or a glob
+/// of a trait whose items blaze cannot list (`DefMap::trait_item_import_reports`).
+fn trait_item_import_diagnostics(
+    db: &Db,
+    def_map: &DefMap,
+    import: &ImportOp,
+    status: Option<PerNs>,
+    mut push: impl FnMut(DefDiagnostic),
+) {
+    let ImportSource { use_tree, id, kind, .. } = import.source;
+    def_map.trait_item_import_reports(db, kind, status.unwrap_or_else(PerNs::none), |why| {
+        push(DefDiagnostic::trait_item_import(import.module, id.lookup(db).id, use_tree, why));
+    });
 }
 
 /// The crate-level ops of every log, in round then module order.
@@ -1103,6 +1123,9 @@ pub(crate) fn collect_block<'db>(
             .filter(|it| !in_unresolved_extern_crate(&it.path, unit.unresolved_extern_crates()))
             .map(|it| DefDiagnostic::unresolved_import(it.module, it.source.id.lookup(db).id, it.source.use_tree)),
     );
+    for (import, status) in unit.import_outcomes() {
+        trait_item_import_diagnostics(db, unit.def_map(), import, status, |it| diagnostics.push(it));
+    }
     let names = name_records(db, frame, unit.def_map(), local, unit.import_outcomes(), records);
     let mut def_map = unit.into_def_map();
     // alloc: the def map's own list, at exact size, once per block.

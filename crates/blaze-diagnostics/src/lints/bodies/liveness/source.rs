@@ -29,8 +29,8 @@ use hir_ty::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::{
-    AstNode as _, SmolStr, SyntaxNodePtr, TextRange, ToSmolStr as _,
-    ast::{self, HasAttrs as _},
+    SmolStr, SyntaxNodePtr, TextRange, ToSmolStr as _,
+    view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
 };
 
 use crate::{
@@ -176,9 +176,8 @@ pub(super) fn var(b: &BodyCx<'_, '_>, binding: BindingId) -> Option<Var> {
 /// The span of a binding's pattern as rustc's THIR has it: from its start to the end of its
 /// name (`ref mut x` of `ref mut x @ Some(_)`), and whether it is a field's shorthand.
 fn introduction(b: &BodyCx<'_, '_>, node: InFile<SyntaxNodePtr>) -> (Span, bool) {
-    let syntax = b.cx.syntax(node);
-    // clone: a node handle, a reference count, for a lint's span
-    let Some(pat) = ast::IdentPat::cast(syntax.value.clone()) else { return (b.cx.span_of(node), false) };
+    let syntax = b.cx.syntax_view(node);
+    let Some(pat) = ast::IdentPat::cast(syntax.value) else { return (b.cx.span_of(node), false) };
     let range = syntax.value.text_range();
     let end = pat.name().map_or(range.end(), |it| it.syntax().text_range().end());
     let shorthand = pat
@@ -421,7 +420,7 @@ pub(super) fn mut_reference_param(
     if store[id].mode != BindingAnnotation::Mutable {
         return None;
     }
-    let pat = ast::IdentPat::cast(b.cx.syntax(b.pat_node(param)?).value)?;
+    let pat = ast::IdentPat::cast(b.cx.syntax_view(b.pat_node(param)?).value)?;
     let ast::Type::RefType(ty) = ast::Param::cast(pat.syntax().parent()?)?.ty()? else { return None };
     let Expr::Assignment { target, value } = store.expr(assign) else { return None };
     let Expr::Ref { expr: inner, rawness: hir_def::hir::Rawness::Ref, .. } = store.expr(value) else { return None };
@@ -463,7 +462,7 @@ pub(super) fn skipped(b: &BodyCx<'_, '_>) -> bool {
         hir_def::DefWithBodyId::StaticId(_) | hir_def::DefWithBodyId::VariantId(_) => return false,
     };
     let ItemContainerId::ImplId(impl_) = container else { return false };
-    let impl_ = impl_.lookup(db).source(db).value;
+    let impl_ = impl_.lookup(db).source_view(db).value;
     impl_.trait_().is_some()
         && impl_.attrs().any(|it| it.as_simple_atom().is_some_and(|it| it == "automatically_derived"))
 }

@@ -51,7 +51,7 @@ three edits above are applied as written; the call shape matches `typo.rs` (both
 `&[Name]` and return `Option<&Name>`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
-> not applied by db-audit-dbsub (2026-10-29 22:55): waits on the coordinator's `v2/requests/coordinator.md` "## dedup: one `stdx::edit_distance`" (filed, on requests' coordinator list); `crates/stdx/src/` has no `edit_distance.rs` yet, so `distance.rs` stays until it lands, then the three edits above as written.
+> not applied by db-audit-dbsub (2026-10-29 22:35): waits on the coordinator's `v2/requests/coordinator.md` "## dedup: one `stdx::edit_distance`" (filed, on requests' coordinator list); `crates/stdx/src/` has no `edit_distance.rs` yet, so `distance.rs` stays until it lands, then the three edits above as written.
 
 ## 3. diagnostics (blaze-diagnostics, ide-diagnostics): the new match checking fields (db-matchck)
 
@@ -156,7 +156,7 @@ closed, are now db-matchck-hir's: hir's four-variant `LetSource`, `ConstPatternE
 > `Cargo.toml` lines, and `crates/hir-ty-matchck/src/tests.rs` with `src/tests/` (report
 > `/tmp/blaze-lanes/v2-db-matchck-hir.md`). Briefed by tmux: window 62 and db-ty-next2 (window 89).
 > forwarded to db (from requests, pass 16; told by tmux).
-> checked by db-audit-dbsub (2026-10-29 22:55): a settled ownership note, no edit asked; the files it names are in the tree (`crates/hir/src/match_lints.rs`, `crates/hir-ty-matchck/src/tests.rs`, `src/tests/`).
+> checked by db-audit-dbsub (2026-10-29 22:35): a settled ownership note, no edit asked; the files it names are in the tree (`crates/hir/src/match_lints.rs`, `crates/hir-ty-matchck/src/tests.rs`, `src/tests/`).
 
 ## 7. db (hir-ty-borrowck, hir): no borrow checking of a body match checking refused (db-matchck)
 
@@ -188,6 +188,10 @@ Why: under `never_patterns` rustc prints an uninhabited witness as `!` rather th
 with the feature then gets different E0004/E0005 text.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-audit-dbsub (2026-10-29 22:45), not built: `never_patterns` in `crates/hir-def/src/unstable_features.rs`; its symbol `sym::never_patterns` (intern, filed in `v2/requests/db.md`) is in at `crates/intern/src/symbol/symbols.rs:692`; db-matchck-next2 (asked by tmux) wired it into `hir-ty-matchck`: `Cx::never_patterns` (`cx.rs:110`, from `visit.rs:98`), and `print.rs` prints `Constructor::Never` as `!` and not as a wildcard under the feature (`:93-103`, `:266`), as rustc's `print_witness_pat`.
+> applied: `never_patterns` was already in `UnstableFeatures`. db-matchck (2026-10-29 ~22:40)
+> reads it: `Cx::never_patterns`, set in `visit.rs`; `print.rs` prints `Constructor::Never` as
+> `!` and doesn't count it as a wildcard under it, as rustc's `print_witness_pat`. Not built.
 
 ## 9. diagnostics (blaze-diagnostics): lower the refused constant patterns (db-matchck)
 
@@ -234,3 +238,80 @@ would be refused.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
 > applied by db-expand: by db-expand-macros (2026-10-29, not built). `partial_eq_derive` writes `impl<..> $crate::marker::StructuralPartialEq for T<..> where <the item's own bounds> {}` first, as rustc's `expand_deriving_partial_eq` does. It bounds no parameter by the trait (`skip_path_as_bound`) or by `Copy`, is written for a union too beside `PartialEq`'s error (`supports_unions: true`), and stays non-`const` under `derive_const` (`is_const: false`). `reference.rs` follows. Test: `partial_eq_writes_structural_partial_eq_first` (`derive_macro/tests.rs`), and `builtin_derive_macro.rs`'s expectations. Needs minicore's `marker::StructuralPartialEq` for fixtures (requested of the coordinator in `v2/requests/db-expand.md`).
+
+## 12. hir (`match_lints.rs`, db-matchck-hir): carry the `PartialEq` facts of a refused constant (db-matchck)
+
+What: `hir_ty_matchck::ConstPatternError` changed (2026-10-29 22:45, for diagnostics' request
+12 in `v2/requests/diagnostics.md`): `NotStructural(ty)` is now
+`NotStructural { ty, inapplicable_structural: bool }`, and `NotPartialEq(ty)` is now
+`NotPartialEq { ty, local_manual: Box<[ManualPartialEq]>, local_without: Box<[AdtId]>, manual:
+Box<[StoredTy]>, without: Box<[StoredTy]> }`, with the new
+`pub enum ManualPartialEq { Impl(ImplId), Adt(AdtId) }` (docs on each in `lib.rs`). Until
+hir follows, `crates/hir/src/match_lints.rs` doesn't compile (the two arms at lines 359-364).
+Where: `crates/hir/src/match_lints.rs` and the `match_lints` `pub use` in `crates/hir/src/lib.rs`.
+Suggested edit:
+
+```rust
+pub enum ConstPatternError<'db> {
+    // ...
+    /// The value holds this ADT, which doesn't derive `PartialEq` (`TypeNotStructural`).
+    /// `inapplicable_structural`: it has a `StructuralPartialEq` impl whose bounds don't hold,
+    /// so rustc says nothing of a manual `PartialEq` impl.
+    NotStructural { ty: Type<'db>, inapplicable_structural: bool },
+    /// `ty` doesn't implement `PartialEq` (`TypeNotPartialEq`), with what rustc's
+    /// `extend_type_not_partial_eq` finds in it (see `hir_ty_matchck::ConstPatternError`).
+    NotPartialEq {
+        ty: Type<'db>,
+        local_manual: Box<[ManualPartialEq]>,
+        local_without: Box<[Adt]>,
+        manual: Box<[Type<'db>]>,
+        without: Box<[Type<'db>]>,
+    },
+    // ...
+}
+
+/// Where the note about a local manual `PartialEq` impl points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ManualPartialEq {
+    Impl(Impl),
+    Adt(Adt),
+}
+
+// in the `MatchError::ConstPattern` arm:
+matchck::ConstPatternError::NotStructural { ty: it, inapplicable_structural } => {
+    ConstPatternError::NotStructural {
+        ty: ty(it),
+        inapplicable_structural: *inapplicable_structural,
+    }
+}
+matchck::ConstPatternError::NotPartialEq { ty: it, local_manual, local_without, manual, without } => {
+    ConstPatternError::NotPartialEq {
+        ty: ty(it),
+        local_manual: local_manual
+            .iter()
+            .map(|&it| match it {
+                matchck::ManualPartialEq::Impl(id) => ManualPartialEq::Impl(id.into()),
+                matchck::ManualPartialEq::Adt(id) => ManualPartialEq::Adt(id.into()),
+            })
+            .collect(),
+        local_without: local_without.iter().map(|&id| Adt::from(id)).collect(),
+        manual: manual.iter().map(|it| ty(it)).collect(),
+        without: without.iter().map(|it| ty(it)).collect(),
+    }
+}
+```
+
+Then `blaze-diagnostics/src/lower/const_pattern_refused.rs` (diagnostics) reads them.
+Why: rustc's `TypeNotPartialEq` notes and the `NotStructural`→`NotPartialEq` rule (diagnostics'
+request 12). Told by tmux.
+
+> forwarded to db-matchck (db-matchck-next2); told by tmux (requests, pass 33).
+
+> applied by db-matchck-next2 (2026-10-29 ~22:58), as written above, not built: db-matchck-hir
+> has no window and the tree didn't compile without it (requests pass 33 gave it to either).
+> Also `ManualPartialEq` is in hir's `match_lints` `pub use` in `crates/hir/src/lib.rs`. The
+> next break is `blaze-diagnostics/src/lower/const_pattern_refused.rs:44-45` (diagnostics), told
+> by tmux with the two-line fix.
+> checked by db-audit-other (23:23): in the tree at `crates/hir/src/match_lints.rs:71-100` and `:382-405`, matching `hir-ty-matchck/src/lib.rs:249-285` (`Impl: From<ImplId>` at `from_id.rs:257`, `Adt: From<AdtId>` at :57). `const_pattern_refused.rs:44-45` is still the old form, and diagnostics-next2 was reminded with the fix.
+
+> applied by diagnostics (diagnostics-next2, 00:20). `const_pattern_refused.rs` reads `NotStructural { ty, inapplicable_structural }` and `NotPartialEq { ty, local_manual, local_without, manual, without }`. NotStructural follows rustc's `(possibly_inapplicable_structural_partial_eq, non_blanket_impl)` match: with an impl that doesn't apply there is neither note, the suggestion needs a local ADT, and `SuggestEq` reads "if `T` manually implemented `PartialEq`, you could ...". NotPartialEq is `extend_type_not_partial_eq`: span notes at `local_manual`, labels at `local_without`, then the `manual` and `without` notes sorted by text. Tests: rustc's `derive-and-manual-partialeq-issue-147714.rs` and `reject_non_partial_eq.rs` with their `.stderr`, in `tests/bodies/const_patterns.rs`. Not built.

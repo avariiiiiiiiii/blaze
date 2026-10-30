@@ -271,240 +271,22 @@ fn projections<'db>(
     rustc_type_ir::TypeVisitable::visit_with(&ty, &mut Find(out));
 }
 
-/// Which arguments of the `impl Trait` `opaque`, of `len` of them, its hidden type may name: the
-/// others are bivariant in rustc's `variances_of` the opaque type, and its liveness skips
-/// them. Every one, unless `use<..>` lists them; before edition 2024, outside a trait and its
-/// impls and outside an `async fn`, the type parameters and the lifetimes its bounds name. In
-/// a trait or its impls the trait's or impl's own are always captured, as rustc relates an
-/// `impl Trait` there (a GAT of the trait) invariantly in all of them, whatever `use<..>` says.
-/// `None` where this does not work it out, which counts every argument captured.
+/// Which arguments of the `impl Trait` `opaque`, of `len` of them, its hidden type may name:
+/// those not bivariant in rustc's `variances_of` the opaque type (hir-ty's
+/// `next_solver::opaque_variances`), which its liveness skips. `None` when the opaque has another
+/// number of arguments, which counts every argument captured.
 pub(super) fn opaque_captures<'f, 'db>(
     frame: &'f Frame,
     db: &'db Db,
     opaque: OpaqueTyIdWrapper<'db>,
     len: usize,
 ) -> Option<FVec<'f, bool>> {
-    use hir_def::{
-        GenericParamId,
-        hir::{
-            generics::GenericParamDataRef,
-            type_ref::{LifetimeRef, TypeBound, TypeRef, UseArgRef},
-        },
-    };
     use rustc_type_ir::Interner as _;
-    let hir_ty::ImplTraitId::ReturnTypeImplTrait(function, index) = opaque.0.loc(db) else {
-        return None;
-    };
-    let params = mem::collect(frame, hir_ty::generics::generics(db, function.into()).iter(true));
-    // After the function's, a lifetime for each its parameters leave out.
-    let elided = hir_ty::elided_lifetimes(db, function).len() as usize;
-    if params.len() + elided != len {
+    let variances = hir_ty::next_solver::DbInterner::new_no_crate(db).variances_of(opaque.into());
+    if variances.len() != len {
         return None;
     }
-    let is_lifetime = |id: &GenericParamId| matches!(id, GenericParamId::LifetimeParamId(_));
-    let in_trait = match function.lookup(db).container {
-        ItemContainerId::TraitId(_) => true,
-        ItemContainerId::ImplId(it) => db.impl_trait(it).is_some(),
-        _ => false,
-    };
-    let signature = FunctionSignature::of(db, function);
-    let written = signature.ret_type.and_then(|ret| match signature.store.type_ref(ret) {
-        TypeRef::ImplTrait(bounds) if index.into_raw().into_u32() == 0 => Some(bounds),
-        _ => None,
-    });
-    // `use<..>` of one inside the return type too, `Option<impl Iterator + use<>>`.
-    let nested = signature.ret_type.and_then(|ret| {
-        nth_impl_trait(&signature.store, ret, &mut (index.into_raw().into_u32() as usize))
-    });
-    let listed = nested.and_then(|bounds| {
-        bounds.iter().find_map(|bound| match bound {
-            TypeBound::Use(args) => Some(signature.store.use_args(*args)),
-            _ => None,
-        })
-    });
-    let mut named = mem::set(frame);
-    let mut unknown = false;
-    let interner = hir_ty::next_solver::DbInterner::new_no_crate(db);
-    // A nested `impl Trait`, `impl Future<Output = impl Sized>`, names only what it captures.
-    let mut without_self = hir_ty::next_solver::util::BottomUpFolder {
-        interner,
-        ty_op: |ty: Ty<'_>| match ty.kind() {
-            TyKind::Alias(_, alias)
-                if alias.kind == rustc_type_ir::AliasTyKind::Opaque { def_id: opaque } =>
-            {
-                Ty::new_unit(interner)
-            }
-            TyKind::Alias(_, alias)
-                if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
-                    && let Some(captured) = opaque_captures(frame, db, def_id, alias.args.len()) =>
-            {
-                let named: FVec<'_, Ty<'_>> = mem::collect(
-                    frame,
-                    alias.args.iter().zip(captured).filter(|(_, captured)| *captured).filter_map(
-                        |(arg, _)| match arg.kind() {
-                            GenericArgKind::Type(ty) => Some(ty),
-                            GenericArgKind::Lifetime(region) => Some(Ty::new_ref(
-                                interner,
-                                region,
-                                Ty::new_unit(interner),
-                                rustc_ast_ir::Mutability::Not,
-                            )),
-                            _ => None,
-                        },
-                    ),
-                );
-                Ty::new_tup(interner, &named)
-            }
-            _ => ty,
-        },
-        lt_op: |region| region,
-        ct_op: |ct| ct,
-    };
-    for clause in interner.item_bounds(opaque.into()).skip_binder() {
-        let clause = rustc_type_ir::TypeFoldable::fold_with(clause, &mut without_self);
-        rustc_type_ir::fold_regions(interner, clause, |region, _| {
-            match region.kind() {
-                RegionKind::ReEarlyParam(it) => {
-                    named.insert(it.index as usize);
-                }
-                // `+ '_` where the lifetime elision finds no lifetime of the parameters.
-                RegionKind::ReStatic | RegionKind::ReBound(..) | RegionKind::ReError(_) => (),
-                _ => unknown = true,
-            }
-            region
-        });
-    }
-    if let Some(listed) = listed {
-        // `use<'_>` lists the lifetime the lifetime elision gives a return type.
-        let output = listed
-            .iter()
-            .any(|arg| {
-                matches!(arg, UseArgRef::Lifetime(it)
-                    if matches!(signature.store[*it], LifetimeRef::Placeholder))
-            })
-            .then(|| hir_ty::elided_lifetimes(db, function).output)
-            .flatten();
-        let names =
-            |lifetime: &LifetimeRef, param, data: &hir_def::hir::generics::LifetimeParamData| {
-                match lifetime {
-                    LifetimeRef::Named(name) => *name == data.name,
-                    LifetimeRef::Param(it) => *it == param,
-                    _ => false,
-                }
-            };
-        let captured = mem::collect(
-            frame,
-            params.iter().map(|(id, data)| {
-                let (
-                    &GenericParamId::LifetimeParamId(param),
-                    GenericParamDataRef::LifetimeParamData(data),
-                ) = (id, data)
-                else {
-                    return true;
-                };
-                if in_trait && param.parent != function.into() {
-                    return true;
-                }
-                let written = match output {
-                    Some(hir_ty::ElidedOutput::Written(it)) => names(
-                        &signature.store[hir_def::type_ref::LifetimeRefId::from_raw(
-                            la_arena::RawIdx::from_u32(it),
-                        )],
-                        param,
-                        data,
-                    ),
-                    _ => false,
-                };
-                written
-                    || listed.iter().any(|arg| match arg {
-                        UseArgRef::Lifetime(it) => names(&signature.store[*it], param, data),
-                        UseArgRef::Name(_) => false,
-                    })
-            })
-            .chain(
-                (0..elided as u32).map(|index| output == Some(hir_ty::ElidedOutput::Elided(index))),
-            ),
-        );
-        // A lifetime the bounds name and `use<..>` leaves out is an error before borrow
-        // checking.
-        let bounds_listed =
-            named.iter().all(|&index| captured.get(index).copied().unwrap_or(false));
-        return (!unknown && bounds_listed).then_some(captured);
-    }
-    if unknown {
-        return None;
-    }
-    let edition = hir_def::HasModule::krate(&function, db).data(db).edition;
-    // An `async fn`'s future captures everything; an `impl Trait` it declares it returns, the
-    // future's output, is as any other.
-    if edition.at_least_2024() || in_trait || signature.is_async() && written.is_some() {
-        return Some(filled(frame, len, true));
-    }
-    Some(mem::collect(
-        frame,
-        params
-            .iter()
-            .map(|(id, _)| !is_lifetime(id))
-            .chain(std::iter::repeat_n(false, elided))
-            .enumerate()
-            .map(|(index, not_lifetime)| not_lifetime || named.contains(&index)),
-    ))
-}
-
-/// The bounds of the `index`th `impl Trait` written in `ty`, counted in the order lowering
-/// numbers them: each before those in its bounds, `Option<impl Iterator<Item = impl Sized>>`
-/// has the `Iterator` one first.
-fn nth_impl_trait<'s>(
-    store: &'s hir_def::expr_store::ExpressionStore,
-    ty: hir_def::hir::type_ref::TypeRefId,
-    index: &mut usize,
-) -> Option<&'s [hir_def::hir::type_ref::TypeBound]> {
-    use hir_def::hir::type_ref::{TypeBound, TypeRef};
-    let in_path = |path: hir_def::expr_store::path::Path<'s>, index: &mut usize| {
-        for args in path.generic_args().into_iter().flatten().flatten() {
-            for arg in args.args {
-                if let hir_def::expr_store::path::GenericArg::Type(it) = arg
-                    && let Some(found) = nth_impl_trait(store, *it, index)
-                {
-                    return Some(found);
-                }
-            }
-            for binding in &args.bindings {
-                if let Some(it) = binding.type_ref
-                    && let Some(found) = nth_impl_trait(store, it, index)
-                {
-                    return Some(found);
-                }
-            }
-        }
-        None
-    };
-    let in_bounds = |bounds: &'s [TypeBound], index: &mut usize| {
-        bounds.iter().find_map(|bound| match bound {
-            TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path) => {
-                in_path(store.path(*path), index)
-            }
-            _ => None,
-        })
-    };
-    match store.type_ref(ty) {
-        TypeRef::ImplTrait(bounds) => {
-            if *index == 0 {
-                return Some(bounds);
-            }
-            *index -= 1;
-            in_bounds(bounds, index)
-        }
-        TypeRef::DynTrait(bounds) => in_bounds(bounds, index),
-        TypeRef::Path(path) => in_path(path, index),
-        TypeRef::Reference(it) => nth_impl_trait(store, it.ty, index),
-        TypeRef::RawPtr(it, _) | TypeRef::Slice(it) | TypeRef::PatternType(it, _) => {
-            nth_impl_trait(store, it, index)
-        }
-        TypeRef::Array(it) => nth_impl_trait(store, it.ty, index),
-        TypeRef::Tuple(tys) => tys.iter().find_map(|&it| nth_impl_trait(store, it, index)),
-        _ => None,
-    }
+    Some(mem::collect(frame, variances.iter().map(|variance| variance != Variance::Bivariant)))
 }
 
 /// Whether `ty` has an `impl Trait` in it.
@@ -5344,27 +5126,14 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
     }
 
     /// What a pointer to `ty` is wide for, with its regions: its struct's last field, and so on.
-    fn tail(&mut self, mut ty: Ty<'db>) -> Ty<'db> {
-        for _ in 0..16 {
-            match ty.kind() {
-                TyKind::Adt(def, args) => {
-                    let AdtId::StructId(id) = def.def_id() else { break };
-                    let types = self.ctx.db.field_types(hir_def::VariantId::StructId(id));
-                    let Some((_, last)) = types.iter().last() else { break };
-                    let field = last.ty().instantiate(self.interner(), args).skip_norm_wip();
-                    ty = match rustc_type_ir::TypeVisitableExt::has_aliases(&field) {
-                        true => self.normalize(field).unwrap_or(field),
-                        false => field,
-                    };
-                }
-                TyKind::Tuple(tys) => match tys.last() {
-                    Some(it) => ty = it,
-                    None => break,
-                },
-                _ => break,
+    fn tail(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        let db = self.ctx.db;
+        hir_ty::layout::struct_tail_erasing_lifetimes(db, ty, |field| {
+            match rustc_type_ir::TypeVisitableExt::has_aliases(&field) {
+                true => self.normalize(field).unwrap_or(field),
+                false => field,
             }
-        }
-        ty
+        })
     }
 
     fn unsize_pointee(&mut self, source: Ty<'db>, target: Ty<'db>, at: At) {
@@ -5428,7 +5197,15 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
     fn terminator(&mut self, kind: &TerminatorKind, span: MirSpan) {
         kind.for_each_operand(&mut |operand| self.copy_bound(operand, span));
         match kind {
-            TerminatorKind::Call { func, args, destination, .. } => {
+            TerminatorKind::Call { func, args, .. } | TerminatorKind::TailCall { func, args, .. } => {
+                // A tail call's callee writes this body's return place (rustc's
+                // `check_call_dest`).
+                let (dest_local, dest_projection) = match kind {
+                    TerminatorKind::Call { destination, .. } => {
+                        (destination.local, destination.projection.as_slice())
+                    }
+                    _ => (crate::return_slot(), &[][..]),
+                };
                 // A function item called through a variable, `let f = foo::<'a>; f()`, which
                 // rust-analyzer lowers as a call of the constant, has the variable's type.
                 // Through a reference to it too (`let f = &foo::<'a>; f()`).
@@ -5663,18 +5440,16 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                             }
                         }
                     }
-                    let projection = destination.projection.as_slice();
-                    let dest = self.place_ty(destination.local, projection).ty;
+                    let dest = self.place_ty(dest_local, dest_projection).ty;
                     let at = At {
-                        category: self.category_of_assignment(destination.local, projection),
+                        category: self.category_of_assignment(dest_local, dest_projection),
                         span,
                     };
                     self.relate(sig.output(), dest, Variance::Covariant, at);
                 }
-                let projection = destination.projection.as_slice();
-                let dest = self.place_ty(destination.local, projection).ty;
+                let dest = self.place_ty(dest_local, dest_projection).ty;
                 let at = At {
-                    category: self.category_of_assignment(destination.local, projection),
+                    category: self.category_of_assignment(dest_local, dest_projection),
                     span,
                 };
                 self.relate(output, dest, Variance::Covariant, at);

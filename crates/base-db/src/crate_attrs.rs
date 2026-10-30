@@ -21,11 +21,7 @@ use blaze_ids::ContentId;
 use blaze_mem::{Frame, Tag, frame};
 use salsa::Durability;
 use smallvec::SmallVec;
-use span::Edition;
-use syntax::{
-    LexedStr, SourceFile, SyntaxKind, T, TextRange, TextSize,
-    view::{self as ast, AstNode, HasAttrs, HasModuleItem},
-};
+use syntax::{LexedStr, SourceFile, SyntaxKind, T, TextRange, TextSize};
 use vfs::FileId;
 
 use crate::{
@@ -35,31 +31,33 @@ use crate::{
 
 /// The name rustc shows a crate attribute's file by (`FileName::CliCrateAttr`).
 pub const CRATE_ATTR_FILE_NAME: &str = "<crate attribute>";
-/// What a crate attribute's file has before the attribute as given: rustc's spans are in the
-/// attribute as given, so a column in the file is this many bytes past rustc's.
+/// What a crate attribute's file has before the attribute as given. rustc lexes and shows the
+/// attribute wrapped the same way (`#![<attr>]`), so a column in the file is rustc's column in
+/// [`CRATE_ATTR_FILE_NAME`], with nothing to subtract.
 pub const CRATE_ATTR_PREFIX: &str = "#![";
 /// What a crate attribute's file has after the attribute as given.
 pub const CRATE_ATTR_SUFFIX: &str = "]";
 
-/// Why rustc refuses a crate attribute, ranges in its file. rustc reports it and the crate
-/// does not build; the attribute is not applied.
+/// Why rustc refuses a crate attribute, ranges in its file (rustc's, see
+/// [`CRATE_ATTR_PREFIX`]). rustc reports it and the crate does not build; the attribute is not
+/// applied. Delimiters are matched over the whole file, the `[` and `]` around the attribute as
+/// given among them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CrateAttrError {
     /// The file's syntax errors ([`EditionedFileId::parse_errors`]) are the error, reported as
-    /// any file's are: a token rustc's lexer refuses, or an attribute rustc's `parse_attr_item`
-    /// refuses.
+    /// any file's are: a token rustc's lexer refuses, an attribute rustc's `parse_attribute`
+    /// refuses, or one not closed where its meta ends ("expected `]`").
     Syntax,
     /// A closing delimiter that closes nothing: rustc's lexer's "unexpected closing delimiter".
     UnexpectedClose { close: TextRange },
-    /// A closing delimiter of another kind than the one open: "mismatched closing delimiter".
+    /// A closing delimiter of another kind than the one open, the `[` around the attribute
+    /// included: "mismatched closing delimiter".
     MismatchedClose { open: TextRange, close: TextRange },
-    /// A delimiter never closed (the innermost): "this file contains an unclosed delimiter",
-    /// at the attribute's end.
+    /// A delimiter never closed (the innermost): "this file contains an unclosed delimiter".
     Unclosed { open: TextRange },
-    /// Tokens after a whole attribute (a second attribute, an item, anything): rustc's
-    /// "invalid crate attribute" (`InvalidCrateAttr`), from the attribute's first token to the
-    /// end of the first token after it.
-    Trailing { range: TextRange },
+    /// A token after an attribute that a `]` written in it closed: rustc's `parse_in`'s
+    /// `unexpected`, "unexpected token", at that token.
+    UnexpectedToken { token: TextRange },
 }
 
 impl Crate {
@@ -101,9 +99,9 @@ pub fn crate_attr_owner(db: &Db, file: FileId) -> Option<Crate> {
 
 /// Why rustc refuses the crate attribute of `file`, if it does: rustc's rule
 /// (`rustc_builtin_macros/src/cmdline_attrs.rs` `inject`) read off the file. rustc lexes the
-/// attribute as given into token trees (a lexer error or an unbalanced delimiter stops it), parses
-/// one attribute item off them (`parse_attr_item`: a path, then a delimited tree or `= expr`),
-/// and refuses anything after it.
+/// wrapped text `#![<attr>]` into token trees (a lexer error or an unbalanced delimiter stops
+/// it), parses one inner attribute off them (`parse_attribute`) and refuses any token after it
+/// (`unexpected`).
 #[salsa::tracked]
 pub fn crate_attr_error(db: &Db, file: EditionedFileId) -> Option<CrateAttrError> {
     let (file_id, edition) = file.unpack(db);
@@ -113,17 +111,19 @@ pub fn crate_attr_error(db: &Db, file: EditionedFileId) -> Option<CrateAttrError
     if lexed.errors().next().is_some() {
         return Some(CrateAttrError::Syntax);
     }
-    let end = text.len() - CRATE_ATTR_SUFFIX.len();
-    let mut first = None;
     let mut open: SmallVec<[(SyntaxKind, TextRange); 8]> = SmallVec::new();
-    for at in written_tokens(&lexed, end) {
+    let mut attr_close = None;
+    for at in (0..lexed.len()).filter(|&at| !lexed.kind(at).is_trivia()) {
         let (kind, range) = (lexed.kind(at), range_of(&lexed, at));
-        first.get_or_insert(range);
         match kind {
             T!['('] | T!['['] | T!['{'] => open.push((kind, range)),
             T![')'] | T![']'] | T!['}'] => match open.pop() {
                 None => return Some(CrateAttrError::UnexpectedClose { close: range }),
-                Some((opened, _)) if closer(opened) == kind => {}
+                Some((opened, _)) if closer(opened) == kind => {
+                    if open.is_empty() {
+                        attr_close.get_or_insert(at);
+                    }
+                }
                 Some((_, opened)) => {
                     return Some(CrateAttrError::MismatchedClose { open: opened, close: range });
                 }
@@ -134,57 +134,19 @@ pub fn crate_attr_error(db: &Db, file: EditionedFileId) -> Option<CrateAttrError
     if let Some(&(_, opened)) = open.last() {
         return Some(CrateAttrError::Unclosed { open: opened });
     }
-    let root = file.parse(db).view();
-    if file.parse_errors_with_bodies(db).is_some() {
-        let trailing = first.and_then(|first| trailing(text, edition, root, &lexed, end, first));
-        return Some(trailing.unwrap_or(CrateAttrError::Syntax));
-    }
-    let mut attrs = root.attrs();
-    let whole = match (attrs.next(), attrs.next()) {
-        (Some(attr), None) => {
-            attr.excl_token().is_some()
-                && attr.syntax().text_range() == TextRange::up_to(TextSize::of(text))
+    let attr_close = attr_close.expect("a crate attribute's file closes the `[` of its prefix");
+    if lexed.text_start(attr_close) < text.len() - CRATE_ATTR_SUFFIX.len() {
+        let attr_end = lexed.text_range(attr_close).end;
+        // alloc: a parse of the attribute up to its `]`, only for an attribute rustc refuses
+        if !SourceFile::parse(&text[..attr_end], edition).errors().is_empty() {
+            return Some(CrateAttrError::Syntax);
         }
-        _ => false,
-    };
-    if whole && root.items().next().is_none() {
-        return None;
+        let after = (attr_close + 1..lexed.len())
+            .find(|&at| !lexed.kind(at).is_trivia())
+            .expect("the suffix's `]` comes after a `]` written in the attribute");
+        return Some(CrateAttrError::UnexpectedToken { token: range_of(&lexed, after) });
     }
-    let written = TextRange::new(first.map_or(prefix_end(), TextRange::start), offset(end));
-    Some(CrateAttrError::Trailing { range: written })
-}
-
-/// The tokens of the attribute as given, not trivia: those between the prefix and the suffix.
-fn written_tokens<'a>(lexed: &'a LexedStr<'_>, end: usize) -> impl Iterator<Item = usize> + 'a {
-    (0..lexed.len()).filter(move |&at| {
-        let start = lexed.text_start(at);
-        start >= CRATE_ATTR_PREFIX.len() && start < end && !lexed.kind(at).is_trivia()
-    })
-}
-
-/// [`CrateAttrError::Trailing`] for a file whose attribute's meta parses whole on its own and is
-/// followed by a token of the attribute as given: rustc's `parse_attr_item` stops there.
-fn trailing(
-    text: &str,
-    edition: Edition,
-    root: ast::SourceFile<'_>,
-    lexed: &LexedStr<'_>,
-    end: usize,
-    first: TextRange,
-) -> Option<CrateAttrError> {
-    let meta = root.attrs().next()?.meta()?.syntax().text_range();
-    let meta_end = usize::from(meta.end());
-    let after = written_tokens(lexed, end).find(|&at| lexed.text_start(at) >= meta_end)?;
-    let alone = blaze_mem::scratch::with_string(|wrapped| {
-        wrapped.push_str(CRATE_ATTR_PREFIX);
-        wrapped.push_str(&text[meta]);
-        wrapped.push_str(CRATE_ATTR_SUFFIX);
-        // alloc: a parse of the attribute alone, only for an attribute rustc refuses
-        SourceFile::parse(wrapped, edition).errors().is_empty()
-    });
-    alone.then(|| CrateAttrError::Trailing {
-        range: TextRange::new(first.start(), range_of(lexed, after).end()),
-    })
+    file.parse_errors_with_bodies(db).is_some().then_some(CrateAttrError::Syntax)
 }
 
 fn closer(open: SyntaxKind) -> SyntaxKind {
@@ -197,10 +159,6 @@ fn closer(open: SyntaxKind) -> SyntaxKind {
 
 fn offset(at: usize) -> TextSize {
     TextSize::from(u32::try_from(at).expect("a crate attribute of 4 GiB or more"))
-}
-
-fn prefix_end() -> TextSize {
-    offset(CRATE_ATTR_PREFIX.len())
 }
 
 fn range_of(lexed: &LexedStr<'_>, at: usize) -> TextRange {
@@ -337,7 +295,7 @@ impl Files {
         if let Some(krate) = writer.crate_attrs.get(file) {
             panic!(
                 "{file:?} is the file of a crate attribute of {krate:?}, not one of the VFS: \
-                 file IDs of new files must come from base-db (`Files::set_view_root`)"
+                 file IDs of new files must come from base-db (`Db::new_file_id`)"
             );
         }
     }

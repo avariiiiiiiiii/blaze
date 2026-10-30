@@ -31,6 +31,7 @@ mod v128;
 
 pub use v128::{INSTRUCTION, Instruction};
 
+use blaze_codegen::wasm as format;
 use cranelift_codegen::{
     entity::{EntityRef, SecondaryMap},
     ir::{
@@ -83,7 +84,48 @@ pub struct WasmSignature {
     pub results: Vec<WasmType>,
 }
 
+impl WasmType {
+    fn format(self) -> format::ValType {
+        match self {
+            WasmType::I32 => format::ValType::I32,
+            WasmType::I64 => format::ValType::I64,
+            WasmType::F32 => format::ValType::F32,
+            WasmType::F64 => format::ValType::F64,
+            WasmType::V128 => format::ValType::V128,
+        }
+    }
+
+    fn of_format(ty: format::ValType) -> Result<WasmType, String> {
+        Ok(match ty {
+            format::ValType::I32 => WasmType::I32,
+            format::ValType::I64 => WasmType::I64,
+            format::ValType::F32 => WasmType::F32,
+            format::ValType::F64 => WasmType::F64,
+            format::ValType::V128 => WasmType::V128,
+            // alloc: an error
+            other => return Err(format!("wasm: a {other:?} in a signature, which Rust code has none of")),
+        })
+    }
+}
+
 impl WasmSignature {
+    /// As the linker's format has it.
+    pub fn format(&self) -> format::Signature {
+        format::Signature {
+            // alloc: per signature a function or an import has, a few bytes the format owns
+            params: self.params.iter().map(|&it| it.format()).collect(),
+            // alloc: as above
+            results: self.results.iter().map(|&it| it.format()).collect(),
+        }
+    }
+
+    fn of_format(signature: &format::Signature) -> Result<WasmSignature, String> {
+        let types = |values: &[format::ValType]| {
+            values.iter().map(|&it| WasmType::of_format(it)).collect::<Result<Vec<_>, _>>()
+        };
+        Ok(WasmSignature { params: types(&signature.params)?, results: types(&signature.results)? })
+    }
+
     pub fn of(sig: &Signature) -> Result<WasmSignature, String> {
         let mut params = Vec::new();
         let returned = Returned::of(sig)?;
@@ -160,36 +202,44 @@ pub struct WasmFunction {
 }
 
 impl WasmFunction {
-    /// The bytes that stand for the function where machine code would, and where in them
-    /// `body` starts: relocations are counted from the start of these.
+    /// The bytes that stand for the function where machine code would ([`format::Code`]),
+    /// and where in them `body` starts: relocations are counted from the start of these.
     pub fn encode(&self) -> Result<(Vec<u8>, u32), String> {
-        let header = WasmFunction { body: Vec::new(), ..self.clone_header() };
-        let header = postcard::to_allocvec(&header).map_err(|e| e.to_string())?;
-        let mut bytes = (header.len() as u32).to_le_bytes().to_vec();
-        bytes.extend(header);
-        let start = bytes.len() as u32;
-        bytes.extend(&self.body);
-        Ok((bytes, start))
+        Ok(self.code().encode(&self.body))
     }
 
     /// Reads what [`Self::encode`] wrote. The second value is where the body starts in
     /// `bytes`.
     pub fn decode(bytes: &[u8]) -> Result<(WasmFunction, usize), String> {
-        let len = bytes.first_chunk::<4>().ok_or("truncated function")?;
-        let start = 4 + u32::from_le_bytes(*len) as usize;
-        let header = bytes.get(4..start).ok_or("truncated function header")?;
-        let mut function: WasmFunction = postcard::from_bytes(header).map_err(|e| e.to_string())?;
-        function.body = bytes[start..].to_vec();
+        let (code, start) = format::Code::decode(bytes)?;
+        if !code.imports.is_empty() || code.export.is_some() {
+            // alloc: an error
+            return Err("wasm: a compiled function's header with imports or an export".to_owned());
+        }
+        let function = WasmFunction {
+            signature: WasmSignature::of_format(&code.ty)?,
+            types: code.types.iter().map(WasmSignature::of_format).collect::<Result<_, _>>()?,
+            type_fixups: code.type_fixups,
+            stack_pointer_fixups: code.stack_pointer,
+            // alloc: the readers patch the body in place, on their own copy
+            body: bytes[start..].to_vec(),
+        };
         Ok((function, start))
     }
 
-    fn clone_header(&self) -> WasmFunction {
-        WasmFunction {
-            signature: self.signature.clone(),
-            types: self.types.clone(),
+    /// The header the linker reads ahead of the body.
+    pub fn code(&self) -> format::Code {
+        format::Code {
+            ty: self.signature.format(),
+            // alloc: once a compiled function, its header: a few words beside the body
+            types: self.types.iter().map(WasmSignature::format).collect(),
+            // clone: as above
             type_fixups: self.type_fixups.clone(),
-            stack_pointer_fixups: self.stack_pointer_fixups.clone(),
-            body: Vec::new(),
+            // clone: as above
+            stack_pointer: self.stack_pointer_fixups.clone(),
+            // alloc: empty, allocates nothing
+            imports: Vec::new(),
+            export: None,
         }
     }
 }
@@ -2676,5 +2726,103 @@ impl Op {
             Op::LeS | Op::LeU => Op::LeU,
             _ => Op::GeU,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `WasmFunction::encode` wrote before the linker's format: a 4-byte length, then
+    /// the header as postcard, then the body. The reference the fields are checked against.
+    fn old_encode(function: &WasmFunction) -> (Vec<u8>, u32) {
+        let header = WasmFunction {
+            signature: function.signature.clone(),
+            types: function.types.clone(),
+            type_fixups: function.type_fixups.clone(),
+            stack_pointer_fixups: function.stack_pointer_fixups.clone(),
+            body: Vec::new(),
+        };
+        let header = postcard::to_allocvec(&header).unwrap();
+        let mut bytes = (header.len() as u32).to_le_bytes().to_vec();
+        bytes.extend(header);
+        let start = bytes.len() as u32;
+        bytes.extend(&function.body);
+        (bytes, start)
+    }
+
+    fn old_decode(bytes: &[u8]) -> (WasmFunction, usize) {
+        let start = 4 + u32::from_le_bytes(*bytes.first_chunk::<4>().unwrap()) as usize;
+        let mut function: WasmFunction = postcard::from_bytes(&bytes[4..start]).unwrap();
+        function.body = bytes[start..].to_vec();
+        (function, start)
+    }
+
+    fn function() -> WasmFunction {
+        let pair = WasmSignature { params: vec![WasmType::I64, WasmType::I64], results: vec![] };
+        WasmFunction {
+            signature: WasmSignature {
+                params: vec![WasmType::I32, WasmType::I64, WasmType::F32, WasmType::F64, WasmType::V128],
+                results: vec![WasmType::I32],
+            },
+            types: vec![pair, WasmSignature { params: vec![], results: vec![WasmType::F64] }],
+            type_fixups: vec![(7, 1), (300, 0)],
+            stack_pointer_fixups: vec![1, 200],
+            // One local declaration, `global.get` of a padded index, `call_indirect`, `end`.
+            body: vec![1, 2, 0x7f, 0x23, 0x80, 0x80, 0x80, 0x80, 0x00, 0x11, 0x81, 0x80, 0x80, 0x80, 0x00, 0x00, 0x0b],
+        }
+    }
+
+    fn same(a: &WasmFunction, b: &WasmFunction) {
+        assert_eq!(a.signature, b.signature);
+        assert_eq!(a.types, b.types);
+        assert_eq!(a.type_fixups, b.type_fixups);
+        assert_eq!(a.stack_pointer_fixups, b.stack_pointer_fixups);
+        assert_eq!(a.body, b.body);
+    }
+
+    #[test]
+    fn a_function_is_the_linkers_code_and_holds_what_the_old_header_did() {
+        let function = function();
+        let (bytes, start) = function.encode().unwrap();
+        assert_eq!((bytes.clone(), start), function.code().encode(&function.body));
+        let (code, at) = format::Code::decode(&bytes).unwrap();
+        assert_eq!(at, start as usize);
+        assert_eq!(&bytes[at..], &function.body[..]);
+
+        let (old_bytes, old_start) = old_encode(&function);
+        let (old, _) = old_decode(&old_bytes);
+        assert_eq!(code.ty, old.signature.format());
+        assert_eq!(code.types, old.types.iter().map(WasmSignature::format).collect::<Vec<_>>());
+        assert_eq!(code.type_fixups, old.type_fixups);
+        assert_eq!(code.stack_pointer, old.stack_pointer_fixups);
+        assert!(code.imports.is_empty() && code.export.is_none());
+
+        let (back, back_start) = WasmFunction::decode(&bytes).unwrap();
+        assert_eq!(back_start, start as usize);
+        same(&back, &old);
+        // A relocation counted from the start of the body lands on the same byte either way.
+        for at in [0, 4, 10, function.body.len() - 1] {
+            assert_eq!(bytes[start as usize + at], old_bytes[old_start as usize + at]);
+        }
+    }
+
+    #[test]
+    fn signatures_are_the_formats_value_types() {
+        let signature = function().signature;
+        let format = signature.format();
+        let bytes: Vec<u8> = format.params.iter().map(|&it| it as u8).collect();
+        assert_eq!(bytes, signature.params.iter().map(|&it| it as u8).collect::<Vec<_>>());
+        assert_eq!(WasmSignature::of_format(&format).unwrap(), signature);
+        let funcref = format::Signature { params: vec![format::ValType::FuncRef], results: vec![] };
+        assert!(WasmSignature::of_format(&funcref).is_err());
+    }
+
+    #[test]
+    fn a_header_with_an_export_is_not_a_compiled_function() {
+        let function = function();
+        let code = format::Code { export: Some("f".to_owned()), ..function.code() };
+        assert!(WasmFunction::decode(&code.encode(&function.body).0).is_err());
+        assert!(WasmFunction::decode(&function.encode().unwrap().0[..3]).is_err());
     }
 }

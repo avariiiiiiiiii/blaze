@@ -15,7 +15,7 @@ use syntax::SyntaxKind;
 
 use super::{can_be_used_for_suggestions, cast_ty_span, expr_span, ty_text};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set},
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set},
     lower::{Found, Phase},
     model::{Applicability, Diag, SuggestionStyle},
 };
@@ -27,7 +27,7 @@ pub(crate) struct ImplicitProvenanceCasts;
 
 impl LatePass for ImplicitProvenanceCasts {
     const LINTS: LintSet = lint_set(["implicit_provenance_casts"]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Cast]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Cast]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Cast { expr: from, .. } = b.store().expr(expr) else { return };
@@ -133,7 +133,7 @@ fn unambiguous(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
         | Expr::Let { .. }
         | Expr::UnaryOp { .. } => false,
         _ => match b.expr_node(expr) {
-            Some(node) => !b.cx.syntax(node).value.children().any(|it| it.kind() == SyntaxKind::ATTR),
+            Some(node) => !b.cx.syntax_view(node).value.children().any(|it| it.kind() == SyntaxKind::ATTR),
             None => true,
         },
     }

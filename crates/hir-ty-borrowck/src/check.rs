@@ -1191,6 +1191,14 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                 }
                 self.mutate_destination(location, PlaceRef::of(destination), span);
             }
+            TerminatorKind::TailCall { func, args, .. } => {
+                self.consume_operand(location, func, span);
+                for arg in args.iter() {
+                    self.consume_operand(location, arg, span);
+                }
+                // The frame is gone before the callee runs, as at a `return`.
+                self.check_for_invalidation_at_exit(location, span);
+            }
             TerminatorKind::Assert { cond, msg, .. } => {
                 self.consume_operand(location, cond, span);
                 msg.for_each_operand(&mut |operand| {

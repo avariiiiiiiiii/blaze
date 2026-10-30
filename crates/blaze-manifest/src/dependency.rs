@@ -150,7 +150,7 @@ impl Dependency {
             features: &self.features,
             artifact: self.artifact.as_ref(),
             target: self.platform.as_ref(),
-            registry: self.registry_id.as_ref().map(|id| id.url.to_string()),
+            registry: self.registry_id.map(|id| id.url().to_string()),
             path: self.source_id.local_path(),
         }
     }

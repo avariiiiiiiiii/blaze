@@ -10,17 +10,20 @@
 //! Cost: two reads of each pair, one write of each item and two of each row's counter; it is
 //! the radix sort's single pass with the digit as wide as the rows.
 
-use std::fmt;
+use std::{
+    alloc::{Allocator, Global},
+    fmt,
+};
 
 #[cfg(test)]
 mod tests;
 
-/// Lists of items by row, in compressed sparse row form.
-#[derive(PartialEq, Eq)]
-pub struct Csr<T> {
+/// Lists of items by row, in compressed sparse row form, both columns in `A` (a query's frame,
+/// say).
+pub struct Csr<T, A: Allocator = Global> {
     /// One more than the rows, or empty for no rows: row `r` is `starts[r]..starts[r + 1]`.
-    starts: Vec<u32>,
-    items: Vec<T>,
+    starts: Vec<u32, A>,
+    items: Vec<T, A>,
 }
 
 impl<T> Default for Csr<T> {
@@ -29,9 +32,25 @@ impl<T> Default for Csr<T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for Csr<T> {
+/// Equal when the rows are, wherever either is allocated.
+impl<T: PartialEq, A: Allocator, B: Allocator> PartialEq<Csr<T, B>> for Csr<T, A> {
+    fn eq(&self, other: &Csr<T, B>) -> bool {
+        self.starts == other.starts && self.items == other.items
+    }
+}
+
+impl<T: Eq, A: Allocator> Eq for Csr<T, A> {}
+
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for Csr<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries((0..self.rows()).map(|row| self.row(row))).finish()
+    }
+}
+
+impl<T, A: Allocator + Clone> Csr<T, A> {
+    /// No rows, its columns to be in `alloc`, allocating nothing yet.
+    pub fn new_in(alloc: A) -> Csr<T, A> {
+        Csr { starts: Vec::new_in(alloc.clone()), items: Vec::new_in(alloc) }
     }
 }
 
@@ -55,18 +74,34 @@ impl<T> Csr<T> {
         csr
     }
 
-    /// [`Csr::build`] in place, its columns and `cursors` (left unspecified) reused: no
-    /// allocation once they have the room.
-    pub fn rebuild<I>(&mut self, rows: usize, pairs: I, cursors: &mut Vec<u32>)
+    /// [`Csr::build`] with the walk's cursors in `scratch` (a query's frame, say): the two
+    /// columns are its only allocations on the heap.
+    pub fn build_in<I, A>(rows: usize, pairs: I, scratch: A) -> Csr<T>
     where
         I: IntoIterator<Item = (u32, T)>,
         I::IntoIter: Clone,
+        A: Allocator,
+    {
+        let mut csr = Csr::new();
+        csr.rebuild(rows, pairs, &mut Vec::with_capacity_in(rows, scratch));
+        csr
+    }
+}
+
+impl<T, A: Allocator> Csr<T, A> {
+    /// [`Csr::build`] in place, its columns and `cursors` (left unspecified, in any allocator)
+    /// reused: no allocation once they have the room.
+    pub fn rebuild<I, B>(&mut self, rows: usize, pairs: I, cursors: &mut Vec<u32, B>)
+    where
+        I: IntoIterator<Item = (u32, T)>,
+        I::IntoIter: Clone,
+        B: Allocator,
     {
         group_into(rows, pairs, &mut self.starts, &mut self.items, cursors);
     }
 
     /// From columns of the form [`Csr::into_parts`] gives; panics when they are not one.
-    pub fn from_parts(starts: Vec<u32>, items: Vec<T>) -> Csr<T> {
+    pub fn from_parts(starts: Vec<u32, A>, items: Vec<T, A>) -> Csr<T, A> {
         let ends = starts.last().map_or(0, |&it| it as usize);
         assert!(
             starts.first().is_none_or(|&it| it == 0)
@@ -126,7 +161,7 @@ impl<T> Csr<T> {
     }
 
     /// The starts and the items, as [`Csr::from_parts`] takes them back.
-    pub fn into_parts(self) -> (Vec<u32>, Vec<T>) {
+    pub fn into_parts(self) -> (Vec<u32, A>, Vec<T, A>) {
         (self.starts, self.items)
     }
 
@@ -170,11 +205,18 @@ impl Csr<u32> {
         graph.rebuild_graph(nodes, edges, &mut Csr::new(), &mut Vec::new());
         graph
     }
+}
 
+impl<A: Allocator> Csr<u32, A> {
     /// [`Csr::graph`] in place, with `by_target` and `cursors` as the reused scratch (left
-    /// unspecified).
-    pub fn rebuild_graph<I>(&mut self, nodes: usize, edges: I, by_target: &mut Csr<u32>, cursors: &mut Vec<u32>)
-    where
+    /// unspecified), each in any allocator.
+    pub fn rebuild_graph<I, S: Allocator, B: Allocator>(
+        &mut self,
+        nodes: usize,
+        edges: I,
+        by_target: &mut Csr<u32, S>,
+        cursors: &mut Vec<u32, B>,
+    ) where
         I: IntoIterator<Item = (u32, u32)>,
         I::IntoIter: Clone,
     {
@@ -187,9 +229,18 @@ impl Csr<u32> {
 }
 
 /// The counting sort under [`Csr::rebuild`], into bare columns: `starts` gets `rows + 1`
-/// entries, `items` the items in row order, `cursors` is scratch.
-pub fn group_into<T, I>(rows: usize, pairs: I, starts: &mut Vec<u32>, items: &mut Vec<T>, cursors: &mut Vec<u32>)
-where
+/// entries, `items` the items in row order, `cursors` is scratch; each in any allocator (a
+/// query's frame, say).
+pub fn group_into<T, I, S, V, B>(
+    rows: usize,
+    pairs: I,
+    starts: &mut Vec<u32, S>,
+    items: &mut Vec<T, V>,
+    cursors: &mut Vec<u32, B>,
+) where
+    S: Allocator,
+    V: Allocator,
+    B: Allocator,
     I: IntoIterator<Item = (u32, T)>,
     I::IntoIter: Clone,
 {

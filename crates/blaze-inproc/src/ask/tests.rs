@@ -3,7 +3,7 @@
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -87,6 +87,23 @@ impl Drop for Watchdog {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
     }
+}
+
+#[test]
+fn an_asker_spins_about_one_wake_up_and_no_longer() {
+    let words: Vec<AtomicU64> = (0..WORDS).map(|_| AtomicU64::new(0)).collect();
+    prepare(&words);
+    let index = claim(&words).unwrap();
+    let generation = ask(&words, index, Kind(7), b"x");
+    let start = Instant::now();
+    assert_eq!(answered_within(&words, index, generation, ASKER_SPIN), Err(state(generation, ASKED)));
+    let spun = start.elapsed();
+    assert!(spun >= ASKER_SPIN && spun < Duration::from_millis(100), "{spun:?}");
+    assert_eq!(take(&words, 0, &mut Vec::new()).unwrap().map(|it| it.0), Some(index));
+    answer_into(&words, seq(index, generation), Kind(8), b"y").unwrap();
+    let start = Instant::now();
+    assert_eq!(answered_within(&words, index, generation, Duration::from_secs(60)), Ok(()));
+    assert!(start.elapsed() < Duration::from_secs(1), "an answer already there ends the spin at once");
 }
 
 #[test]

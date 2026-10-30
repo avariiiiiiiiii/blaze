@@ -237,6 +237,13 @@ impl B<'_> {
         self.imm(HoleKind::Offset, Ty::I64, false)
     }
 
+    /// The `i64` `v` plus the low 12 bits of the hole `kind`: AArch64's `add #:lo12:`.
+    pub fn add_lo12(&mut self, kind: HoleKind, v: &str) -> String {
+        assert_eq!(self.isa, Isa::Aarch64, "an `add #:lo12:` on {:?}", self.isa);
+        let sym = kind.symbol();
+        self.val(&format!("call i64 asm \"add ${{0:x}}, ${{1:x}}, #:lo12:{sym}\", \"=r,r\"(i64 {v})"))
+    }
+
     /// `<op> <from> v to <to>`, or `v` when the types are LLVM's same type.
     pub fn cast(&mut self, op: &str, from: Ty, v: &str, to: Ty) -> String {
         if ir(from) == ir(to) {

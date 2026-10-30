@@ -76,17 +76,22 @@ impl Session {
     /// (`reached`, the code hashes of the functions the last run of this test executed), each
     /// once, at the higher of its priorities.
     pub fn first(&self, ahead: &[CompiledFunction], reached: &[CodeHash]) -> Vec<(LazyId, Priority)> {
-        let mut callees = Vec::new();
+        // alloc: setup, once per run before it starts.
+        let (mut callees, mut history, mut seen) = (Vec::new(), Vec::new(), self.plan.scratch());
         for function in ahead {
-            self.plan.callees(function, &mut callees);
+            self.plan.callees(function, &mut seen, &mut callees);
         }
-        let mut history = Vec::new();
         self.plan.reached(reached, &mut history);
+        // alloc: setup, as above.
         let mut out: Vec<(LazyId, Priority)> = Vec::with_capacity(callees.len() + history.len());
         out.extend(callees.into_iter().map(|id| (id, Priority::Callee)));
         out.extend(history.into_iter().map(|id| (id, Priority::History)));
-        let mut seen = vec![false; self.plan.len() as usize];
-        out.retain(|(id, _)| !std::mem::replace(&mut seen[id.index()], true));
+        out.retain(|(id, _)| {
+            let (word, bit) = (id.index() / 64, 1u64 << (id.0 % 64));
+            let first = seen[word] & bit == 0;
+            seen[word] |= bit;
+            first
+        });
         out
     }
 }

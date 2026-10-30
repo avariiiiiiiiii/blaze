@@ -15,7 +15,7 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 
-use super::{MirBody, MirLowerError, MirOptions, transform::Ctx};
+use super::{InlinedBody, MirBody, MirLowerError, MirOptions, transform::Ctx};
 
 /// A pass of the pipelines, by rustc's name for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,13 +116,15 @@ pub fn run_passes<'db>(
     super::transform::run_passes(db, built)
 }
 
-/// `optimize`, as its queries call it.
+/// `optimize`, as its queries call it: `caller` is the function the body is optimized as
+/// (`MirOwner::caller`), `None` for a body on its own.
 pub fn optimize<'db>(
     db: &'db Db,
     body: &MirBody<'db>,
     options: MirOptions,
+    caller: Option<InlinedBody<'db>>,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    super::optimize::optimize(db, body, options)
+    super::optimize::optimize(db, body, options, caller)
 }
 
 /// `monomorphized`, as its queries call it.

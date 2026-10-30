@@ -26,7 +26,7 @@ use object::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
-    Symbol, Unhandled,
+    Symbol, Unhandled, pgo,
     sanitize::{self, Covered},
 };
 use crate::{
@@ -59,6 +59,8 @@ pub(super) struct Emitted<'data, 'file> {
     elf_types: Vec<(u32, u32)>,
     /// Whether the code may count itself in SanitizerCoverage's arrays ([`read_covered`]).
     covered: bool,
+    /// Whether the code may count itself in its PGO counters ([`read_profiled`]).
+    profiled: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +71,15 @@ enum Placement {
     Blob(DataId),
     /// The function's SanitizerCoverage array of this index ([`sanitize::SECTIONS`]).
     Coverage(u32),
+    /// The function's PGO counters ([`pgo::COUNTERS`]).
+    Counters,
+}
+
+/// What an object is read with, besides its code.
+#[derive(Clone, Copy, Default)]
+struct Instrumented {
+    covered: bool,
+    profiled: bool,
 }
 
 /// The code of each of `functions`, by its name in the object and its signature. What is wrong
@@ -78,8 +89,8 @@ pub(super) fn read(
     functions: &[(&str, Signature)],
     recorder: &mut Wants,
 ) -> Result<Vec<Result<Code, Unhandled>>, Unhandled> {
-    let read = read_all(object, functions, recorder, false)?;
-    Ok(read.into_iter().map(|it| it.map(|(code, _)| code)).collect())
+    let read = read_all(object, functions, recorder, Instrumented::default())?;
+    Ok(read.into_iter().map(|it| it.map(|(code, ..)| code)).collect())
 }
 
 /// The code of the one function of an object LLVM instrumented with SanitizerCoverage, and
@@ -90,7 +101,24 @@ pub(super) fn read_covered(
     function: (&str, Signature),
     recorder: &mut Wants,
 ) -> Result<(Code, Covered), Unhandled> {
-    let mut read = read_all(object, std::slice::from_ref(&function), recorder, true)?;
+    let instrumented = Instrumented { covered: true, profiled: false };
+    let mut read = read_all(object, std::slice::from_ref(&function), recorder, instrumented)?;
+    let (code, covered, _) = read.pop().ok_or(Unhandled::Shape("an object without the function"))??;
+    Ok((code, covered))
+}
+
+/// The code of the one function of an object LLVM instrumented for PGO (and with
+/// SanitizerCoverage, if `covered`, as [`read_covered`] reads it), and how many bytes its
+/// counters take, which start zeroed: what it refers to of them are relocations at index 0
+/// of [`pgo::COUNTER_RELOCS`].
+pub(super) fn read_profiled(
+    object: &[u8],
+    function: (&str, Signature),
+    recorder: &mut Wants,
+    covered: bool,
+) -> Result<(Code, Covered, u32), Unhandled> {
+    let instrumented = Instrumented { covered, profiled: true };
+    let mut read = read_all(object, std::slice::from_ref(&function), recorder, instrumented)?;
     read.pop().ok_or(Unhandled::Shape("an object without the function"))?
 }
 
@@ -98,8 +126,8 @@ fn read_all(
     object: &[u8],
     functions: &[(&str, Signature)],
     recorder: &mut Wants,
-    covered: bool,
-) -> Result<Vec<Result<(Code, Covered), Unhandled>>, Unhandled> {
+    instrumented: Instrumented,
+) -> Result<Vec<Result<(Code, Covered, u32), Unhandled>>, Unhandled> {
     let file = object::File::parse(object)?;
     let mut found: Vec<Option<(SectionIndex, u64)>> = vec![None; functions.len()];
     for symbol in file.symbols() {
@@ -140,7 +168,7 @@ fn read_all(
             }
             Some((text, _)) => {
                 let name = functions[at].0;
-                Emitted::code(&file, text, &texts, &shared, name, signature.clone(), recorder, covered)
+                Emitted::code(&file, text, &texts, &shared, name, signature.clone(), recorder, instrumented)
             }
         };
         codes.push(code);
@@ -165,10 +193,14 @@ impl<'data, 'file> Emitted<'data, 'file> {
         name: &'file str,
         signature: Signature,
         recorder: &mut Wants,
-        covered: bool,
-    ) -> Result<(Code, Covered), Unhandled> {
+        instrumented: Instrumented,
+    ) -> Result<(Code, Covered, u32), Unhandled> {
+        let Instrumented { covered, profiled } = instrumented;
         if !covered && Self::has_coverage(file) {
             return Err(Unhandled::Shape("SanitizerCoverage in an object read without it"));
+        }
+        if !profiled && Self::has_counters(file) {
+            return Err(Unhandled::Shape("PGO counters in an object read without them"));
         }
         let mut emitted = Emitted {
             file,
@@ -184,6 +216,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             relocs: Vec::new(),
             elf_types: Vec::new(),
             covered,
+            profiled,
         };
         let unwind = match (emitted.file.format(), emitted.file.architecture()) {
             (BinaryFormat::MachO, _) => {
@@ -213,9 +246,38 @@ impl<'data, 'file> Emitted<'data, 'file> {
             true => emitted.coverage()?,
             false => Covered::default(),
         };
+        let counters = match profiled {
+            true => emitted.counters()?,
+            false => 0,
+        };
         let Emitted { bytes, align, relocs, elf_types, .. } = emitted;
         let relocs = Relocs::of_module(&relocs, &elf_types).map_err(|e| Unhandled::Llvm(e.to_string()))?;
-        Ok((Code { signature, bytes, align, relocs, unwind, lines, slots }, coverage))
+        Ok((Code { signature, bytes, align, relocs, unwind, lines, slots }, coverage, counters))
+    }
+
+    /// Whether `file` has a section of PGO's counters.
+    fn has_counters(file: &object::File<'_>) -> bool {
+        file.sections().any(|section| section.name().is_ok_and(|name| pgo::COUNTERS.contains(&name)))
+    }
+
+    /// Whether `section` is the function's PGO counters, if the object is read with them.
+    fn is_counters(&self, section: &object::Section<'data, '_>) -> Result<bool, Unhandled> {
+        Ok(self.profiled && pgo::COUNTERS.contains(&section.name()?))
+    }
+
+    /// How many bytes the function's PGO counters take, which start zeroed.
+    fn counters(&self) -> Result<u32, Unhandled> {
+        let mut sections = self.file.sections().filter(|it| it.name().is_ok_and(|it| pgo::COUNTERS.contains(&it)));
+        let Some(section) = sections.next() else {
+            return Err(Unhandled::Shape("an object instrumented for PGO without its counters"));
+        };
+        if sections.next().is_some() {
+            return Err(Unhandled::Shape("two sections of PGO counters"));
+        }
+        if section.relocations().next().is_some() || section.data()?.iter().any(|it| *it != 0) {
+            return Err(Unhandled::Shape("PGO counters that do not start zeroed"));
+        }
+        u32::try_from(section.size()).map_err(|_| Unhandled::Shape("PGO counters of 4 GiB"))
     }
 
     /// Whether `file` has a section of SanitizerCoverage's.
@@ -403,7 +465,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 _ => {}
             }
         }
-        (!places.frame_base.is_empty()).then_some(places)
+        (!places.frame_base.is_empty()).then(|| SlotPlaces::new(places.frame_base, places.slots))
     }
 
     /// Whether `place` says where a value is by registers, the frame and numbers alone, so
@@ -543,6 +605,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
             let section = self.file.section_by_index(index)?;
             if let Some(array) = self.array(&section)? {
                 self.placed.insert(index, Placement::Coverage(array));
+                continue;
+            }
+            if self.is_counters(&section)? {
+                self.placed.insert(index, Placement::Counters);
                 continue;
             }
             let addresses =
@@ -708,6 +774,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
                         ModuleRelocTarget::user(sanitize::COVERAGE, array),
                         addend + symbol.address() as i64,
                     ),
+                    (Some(Placement::Counters), _) => (
+                        ModuleRelocTarget::user(pgo::COUNTER_RELOCS, 0),
+                        addend + symbol.address() as i64,
+                    ),
                     (_, Destination::Named(name)) => (Self::target(name, recorder)?, addend),
                     (_, Destination::Section(_)) => {
                         return Err(Unhandled::Shape("code that holds an address of itself"));
@@ -791,6 +861,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
             let section = self.file.section_by_index(index)?;
             if let Some(array) = self.array(&section)? {
                 self.placed.insert(index, Placement::Coverage(array));
+                continue;
+            }
+            if self.is_counters(&section)? {
+                self.placed.insert(index, Placement::Counters);
                 continue;
             }
             let blob = match self.file.format() {
@@ -927,6 +1001,11 @@ impl<'data, 'file> Emitted<'data, 'file> {
                             ModuleRelocTarget::user(sanitize::COVERAGE, array),
                             relocation.addend() + within as i64,
                         )
+                    }
+                    Placement::Counters => {
+                        let within =
+                            symbol.address() - self.file.section_by_index(target)?.address();
+                        (ModuleRelocTarget::user(pgo::COUNTER_RELOCS, 0), relocation.addend() + within as i64)
                     }
                     Placement::Inline(_) => {
                         return Err(Unhandled::Shape("code that holds an address of itself"));

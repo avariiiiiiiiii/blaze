@@ -2042,6 +2042,34 @@ impl Union {
     #[inline]
     pub fn union_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![union]) }
 }
+pub struct UnsafeBinderCastExpr {
+    pub(crate) syntax: SyntaxNode,
+}
+impl ast::HasAttrs for UnsafeBinderCastExpr {}
+impl UnsafeBinderCastExpr {
+    #[inline]
+    pub fn expr(&self) -> Option<Expr> { support::child(&self.syntax) }
+    #[inline]
+    pub fn ty(&self) -> Option<Type> { support::child(&self.syntax) }
+    #[inline]
+    pub fn pound_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![#]) }
+    #[inline]
+    pub fn l_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['(']) }
+    #[inline]
+    pub fn r_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![')']) }
+    #[inline]
+    pub fn comma_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![,]) }
+    #[inline]
+    pub fn builtin_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![builtin]) }
+    #[inline]
+    pub fn unwrap_binder_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, T![unwrap_binder])
+    }
+    #[inline]
+    pub fn wrap_binder_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, T![wrap_binder])
+    }
+}
 pub struct UnsafeMeta {
     pub(crate) syntax: SyntaxNode,
 }
@@ -2300,6 +2328,7 @@ pub enum Expr {
     TryExpr(TryExpr),
     TupleExpr(TupleExpr),
     UnderscoreExpr(UnderscoreExpr),
+    UnsafeBinderCastExpr(UnsafeBinderCastExpr),
     WhileExpr(WhileExpr),
     YeetExpr(YeetExpr),
     YieldExpr(YieldExpr),
@@ -7570,6 +7599,38 @@ impl fmt::Debug for Union {
         f.debug_struct("Union").field("syntax", &self.syntax).finish()
     }
 }
+impl AstNode for UnsafeBinderCastExpr {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        UNSAFE_BINDER_CAST_EXPR
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == UNSAFE_BINDER_CAST_EXPR }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for UnsafeBinderCastExpr {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for UnsafeBinderCastExpr {}
+impl PartialEq for UnsafeBinderCastExpr {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for UnsafeBinderCastExpr {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for UnsafeBinderCastExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnsafeBinderCastExpr").field("syntax", &self.syntax).finish()
+    }
+}
 impl AstNode for UnsafeMeta {
     #[inline]
     fn kind() -> SyntaxKind
@@ -8398,6 +8459,10 @@ impl From<UnderscoreExpr> for Expr {
     #[inline]
     fn from(node: UnderscoreExpr) -> Expr { Expr::UnderscoreExpr(node) }
 }
+impl From<UnsafeBinderCastExpr> for Expr {
+    #[inline]
+    fn from(node: UnsafeBinderCastExpr) -> Expr { Expr::UnsafeBinderCastExpr(node) }
+}
 impl From<WhileExpr> for Expr {
     #[inline]
     fn from(node: WhileExpr) -> Expr { Expr::WhileExpr(node) }
@@ -8450,6 +8515,7 @@ impl AstNode for Expr {
                 | TRY_EXPR
                 | TUPLE_EXPR
                 | UNDERSCORE_EXPR
+                | UNSAFE_BINDER_CAST_EXPR
                 | WHILE_EXPR
                 | YEET_EXPR
                 | YIELD_EXPR
@@ -8493,6 +8559,9 @@ impl AstNode for Expr {
             TRY_EXPR => Expr::TryExpr(TryExpr { syntax }),
             TUPLE_EXPR => Expr::TupleExpr(TupleExpr { syntax }),
             UNDERSCORE_EXPR => Expr::UnderscoreExpr(UnderscoreExpr { syntax }),
+            UNSAFE_BINDER_CAST_EXPR => {
+                Expr::UnsafeBinderCastExpr(UnsafeBinderCastExpr { syntax })
+            }
             WHILE_EXPR => Expr::WhileExpr(WhileExpr { syntax }),
             YEET_EXPR => Expr::YeetExpr(YeetExpr { syntax }),
             YIELD_EXPR => Expr::YieldExpr(YieldExpr { syntax }),
@@ -8538,6 +8607,7 @@ impl AstNode for Expr {
             Expr::TryExpr(it) => &it.syntax,
             Expr::TupleExpr(it) => &it.syntax,
             Expr::UnderscoreExpr(it) => &it.syntax,
+            Expr::UnsafeBinderCastExpr(it) => &it.syntax,
             Expr::WhileExpr(it) => &it.syntax,
             Expr::YeetExpr(it) => &it.syntax,
             Expr::YieldExpr(it) => &it.syntax,
@@ -9355,6 +9425,7 @@ impl AstNode for AnyHasAttrs {
                 | TYPE_PARAM
                 | UNDERSCORE_EXPR
                 | UNION
+                | UNSAFE_BINDER_CAST_EXPR
                 | USE
                 | VARIANT
                 | WHILE_EXPR
@@ -9663,6 +9734,10 @@ impl From<UnderscoreExpr> for AnyHasAttrs {
 impl From<Union> for AnyHasAttrs {
     #[inline]
     fn from(node: Union) -> AnyHasAttrs { AnyHasAttrs { syntax: node.syntax } }
+}
+impl From<UnsafeBinderCastExpr> for AnyHasAttrs {
+    #[inline]
+    fn from(node: UnsafeBinderCastExpr) -> AnyHasAttrs { AnyHasAttrs { syntax: node.syntax } }
 }
 impl From<Use> for AnyHasAttrs {
     #[inline]
@@ -11036,6 +11111,11 @@ impl std::fmt::Display for UnderscoreExpr {
     }
 }
 impl std::fmt::Display for Union {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for UnsafeBinderCastExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self.syntax(), f)
     }

@@ -171,13 +171,13 @@ impl SparseIndex {
         if on_disk().is_some_and(|it| it.auth_required) {
             self.auth_required.store(true, Ordering::Relaxed);
         }
-        let fetched = match crate::block_on(self.fetch(RegistryConfig::NAME, None)) {
+        let fetched = match blaze_resolve::block_on(self.fetch(RegistryConfig::NAME, None)) {
             Err(e)
                 if !self.auth_required.load(Ordering::Relaxed)
                     && e.downcast_ref::<HttpNotSuccessful>().is_some_and(|it| it.code == 401) =>
             {
                 self.auth_required.store(true, Ordering::Relaxed);
-                crate::block_on(self.fetch(RegistryConfig::NAME, None))
+                blaze_resolve::block_on(self.fetch(RegistryConfig::NAME, None))
             }
             fetched => fetched,
         };

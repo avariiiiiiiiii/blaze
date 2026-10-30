@@ -17,8 +17,7 @@
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, Unhashable, interface_hash, item_key, key, layout_hash};
-use either::Either;
-use hir_def::{AdtId, CallableDefId, VariantId};
+use hir_def::{AdtId, CallableDefId};
 use hir_ty::{
     db::HirDatabase,
     mir::is_by_move_coroutine,
@@ -95,7 +94,7 @@ pub fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
             let interface = interface_hash(db, ItemId::Impl(imp)).map_err(unhashable(db))?;
             dropping.push((item_key(db, ItemId::Adt(at)), interface.0));
         }
-        for variant in variants(db, at) {
+        for variant in at.variants(db) {
             for field in db.field_types(variant).values() {
                 for arg in field.ty().skip_binder().walk() {
                     if let Some(ty) = arg.ty()
@@ -114,17 +113,6 @@ pub fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
         h.id(&key.0).id(interface);
     }
     Ok(h.finish())
-}
-
-/// The variants of `adt` in declaration order: one for a struct or union.
-pub(crate) fn variants<'db>(db: &'db Db, adt: AdtId) -> impl Iterator<Item = VariantId> + 'db {
-    match adt {
-        AdtId::StructId(it) => Either::Left(std::iter::once(it.into())),
-        AdtId::UnionId(it) => Either::Left(std::iter::once(it.into())),
-        AdtId::EnumId(it) => Either::Right(
-            it.enum_variants(db).variants.iter().map(|(_, (variant, _))| VariantId::from(*variant)),
-        ),
-    }
 }
 
 /// A type or constant spelled by content straight into its hash: nothing is buffered.

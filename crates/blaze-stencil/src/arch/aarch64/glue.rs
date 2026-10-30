@@ -41,6 +41,8 @@ const COUNT_LEN: u32 = 20;
 const RELAY_MAX: u32 = 4 * inst::LDST_MAX;
 /// The most bytes a thread-local's address takes: ELF's TLS descriptor call.
 const TLS_MAX: u32 = 28;
+/// How deep a chain of global values the glue follows.
+pub(super) const GV_DEPTH: u32 = 16;
 
 /// Whether the glue writes an instruction of `opcode`. AArch64 has no libcall operations:
 /// Cranelift lowers every arithmetic one inline on the baseline (`fma`, the roundings and
@@ -61,6 +63,7 @@ pub(super) fn takes(opcode: Opcode) -> bool {
             | Opcode::FuncAddr
             | Opcode::SymbolValue
             | Opcode::TlsValue
+            | Opcode::GlobalValue
             | Opcode::GetFramePointer
             | Opcode::GetStackPointer
             | Opcode::GetReturnAddress
@@ -89,6 +92,12 @@ pub(super) fn bound(func: &ir::Function, target: &Target, inst: ir::Inst) -> u32
         Opcode::Trap | Opcode::Debugtrap => 4,
         Opcode::FuncAddr | Opcode::SymbolValue => NAME_MAX + inst::LDST_MAX,
         Opcode::TlsValue => TLS_MAX + inst::LDST_MAX,
+        Opcode::GlobalValue => {
+            let Data::UnaryGlobalValue { global_value, .. } = func.dfg.insts[inst] else {
+                return 0;
+            };
+            gv_bound(func, global_value) + inst::LDST_MAX
+        }
         Opcode::GetFramePointer | Opcode::GetStackPointer | Opcode::GetReturnAddress => {
             4 + inst::LDST_MAX
         }
@@ -221,6 +230,13 @@ pub(super) fn inst<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<
         }
         Opcode::FuncAddr | Opcode::SymbolValue => address(cx, inst),
         Opcode::TlsValue => tls(cx, inst),
+        Opcode::GlobalValue => {
+            let Data::UnaryGlobalValue { global_value: gv, .. } = func.dfg.insts[inst] else {
+                return Err(Error::at(inst, "a `global_value` of another format"));
+            };
+            let reg = global_value(cx, inst, gv, GV_DEPTH)?;
+            result(cx, inst, reg)
+        }
         Opcode::GetFramePointer => result(cx, inst, FP),
         Opcode::GetStackPointer => {
             cx.buf().put4(inst::mov_from_sp(X16));
@@ -598,11 +614,9 @@ fn address<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Erro
     result(cx, inst, X16)
 }
 
-/// `tls_value`, as Cranelift's `ElfTlsGetAddr` (a TLS descriptor call, the thread pointer
-/// added after) and `MachOTlsGetAddr` (the variable's `tlv` thunk called with its descriptor
-/// in `x0`): each a call, recorded as one.
+/// `tls_value`: the [`thread_local`]'s address to the result's slot.
 fn tls<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
-    let (func, target) = (cx.func(), cx.target());
+    let func = cx.func();
     let Data::UnaryGlobalValue { global_value, .. } = func.dfg.insts[inst] else {
         return Err(Error::at(inst, "a `tls_value` of no global"));
     };
@@ -610,7 +624,21 @@ fn tls<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
     else {
         return Err(Error::at(inst, "`tls_value` of what is not a thread-local symbol"));
     };
-    if offset.bits() != 0 {
+    thread_local(cx, inst, name, offset.bits())?;
+    result(cx, inst, X0)
+}
+
+/// A thread-local's address into `x0`, as Cranelift's `ElfTlsGetAddr` (a TLS descriptor call,
+/// the thread pointer added after) and `MachOTlsGetAddr` (the variable's `tlv` thunk called
+/// with its descriptor in `x0`): each a call, recorded as one.
+fn thread_local<'f, 'm>(
+    cx: &mut impl Ctx<'f, 'm>,
+    inst: ir::Inst,
+    name: &ir::ExternalName,
+    offset: i64,
+) -> Result<(), Error> {
+    let target = cx.target();
+    if offset != 0 {
         return Err(Error::at(
             inst,
             "`tls_value` of a thread-local at an offset, which Cranelift's AArch64 backend drops",
@@ -657,5 +685,93 @@ fn tls<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
             ));
         }
     }
-    result(cx, inst, X0)
+    Ok(())
+}
+
+/// The value of global value `gv` into a register, which it returns, as Cranelift's legalizer
+/// expands `global_value`: a symbol's address through [`load_name`] (a thread-local's through
+/// [`thread_local`], into `x0`), plus an immediate, or loaded from.
+fn global_value<'f, 'm>(
+    cx: &mut impl Ctx<'f, 'm>,
+    inst: ir::Inst,
+    gv: ir::GlobalValue,
+    depth: u32,
+) -> Result<u8, Error> {
+    if depth == 0 {
+        // alloc: the error's message, once, as the function fails to compile.
+        return Err(Error::at(inst, format!("a chain of more than {GV_DEPTH} global values")));
+    }
+    let (func, target) = (cx.func(), cx.target());
+    match &func.global_values[gv] {
+        GlobalValueData::Symbol { name, offset, colocated, tls: false } => {
+            let name = cx.name(name)?;
+            load_name(cx.buf(), target, X16, name, *colocated, offset.bits());
+            Ok(X16)
+        }
+        GlobalValueData::Symbol { name, offset, tls: true, .. } => {
+            thread_local(cx, inst, name, offset.bits())?;
+            Ok(X0)
+        }
+        &GlobalValueData::IAddImm { base, offset, global_type } => {
+            pointer(inst, global_type)?;
+            let rd = global_value(cx, inst, base, depth - 1)?;
+            let offset = offset.bits();
+            if offset != 0 {
+                let tmp = if rd == X16 { X17 } else { X16 };
+                inst::add_any(cx.buf(), rd, rd, offset.unsigned_abs(), offset < 0, tmp);
+            }
+            Ok(rd)
+        }
+        &GlobalValueData::Load { base, offset, global_type, flags } => {
+            pointer(inst, global_type)?;
+            if func.dfg.mem_flags[flags].endianness(ir::Endianness::Little)
+                != ir::Endianness::Little
+            {
+                return Err(Error::at(inst, "a big-endian global value load on AArch64"));
+            }
+            let rd = global_value(cx, inst, base, depth - 1)?;
+            let tmp = if rd == X16 { X17 } else { X16 };
+            inst::ldst_any(cx.buf(), inst::LDRX, rd, rd, i32::from(offset), tmp);
+            Ok(rd)
+        }
+        GlobalValueData::VMContext => Err(Error::at(
+            inst,
+            "a `vmctx` global value: the function has no VM context parameter",
+        )),
+        GlobalValueData::DynScaleTargetConst { .. } => {
+            Err(Error::at(inst, "a dynamic vector scale global value"))
+        }
+    }
+}
+
+fn pointer(inst: ir::Inst, ty: ir::Type) -> Result<(), Error> {
+    if ty != types::I64 {
+        // alloc: the error's message, once, as the function fails to compile.
+        return Err(Error::at(inst, format!("a global value of {ty}, not a pointer")));
+    }
+    Ok(())
+}
+
+/// The most bytes [`global_value`] of `gv` writes.
+fn gv_bound(func: &ir::Function, gv: ir::GlobalValue) -> u32 {
+    let mut bytes = 0;
+    let mut gv = gv;
+    for _ in 0..GV_DEPTH {
+        match func.global_values[gv] {
+            GlobalValueData::Symbol { tls: false, .. } => return bytes + NAME_MAX,
+            GlobalValueData::Symbol { tls: true, .. } => return bytes + TLS_MAX,
+            GlobalValueData::IAddImm { base, .. } => {
+                bytes += inst::ADD_ANY_MAX;
+                gv = base;
+            }
+            GlobalValueData::Load { base, .. } => {
+                bytes += inst::LDST_MAX;
+                gv = base;
+            }
+            GlobalValueData::VMContext | GlobalValueData::DynScaleTargetConst { .. } => {
+                return bytes;
+            }
+        }
+    }
+    bytes
 }

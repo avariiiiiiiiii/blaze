@@ -18,6 +18,7 @@ pub trait Files {
     /// errors: one that can't be read, isn't UTF-8 or isn't TOML of a manifest names `path`.
     /// A `Files` that keeps manifests parsed answers from them, so nothing parses one twice.
     fn manifest(&self, path: &Path) -> anyhow::Result<TomlManifest> {
+        // alloc: an error's context, made only when the read fails.
         let bytes = self.read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
         crate::manifest::parse_manifest(path, &bytes)
     }

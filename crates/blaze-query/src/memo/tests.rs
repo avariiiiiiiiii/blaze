@@ -230,3 +230,293 @@ fn a_memo_made_on_a_warm_thread_allocates_nothing() {
     assert_eq!(read(store.edges(&task, memo)), read(&made));
     assert_eq!(store.bytes(&task, memo), Some(&8u64.to_le_bytes()[..]));
 }
+
+/// Model tests (docs/v2/plan/lanes/safety/model.md) of the store's lock-free parts: a memo's
+/// value word and the inline copy that follows it, and the segments' hold counts. The bytes
+/// segments copy in, read and free are tracked (`crate::sync`'s hooks), so a read the atomics
+/// don't order after its copy, or before its segment's free, is a finding.
+#[cfg(blaze_check)]
+mod model {
+    use std::sync::{Arc, atomic::Ordering::Relaxed};
+
+    use blaze_check::{
+        Builder,
+        linear::{History, Spec},
+        thread,
+    };
+    use blaze_ids::{ContentId, Fingerprint};
+
+    use super::{SCHEMA, key};
+    use crate::{
+        Stored,
+        memo::{MemoId, Shared, Store},
+        segment::{Segments, Span},
+    };
+
+    /// Where a memo's value is: in memory by its version, on disk, or nowhere.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum Held {
+        Memory(u8),
+        Disk,
+        Evicted,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ValueOp {
+        Evict,
+        Refill(u8),
+        /// Moves the value of this version to disk, if it is still the memo's.
+        ToDisk(u8),
+        Look,
+    }
+
+    impl Spec for Held {
+        type Op = ValueOp;
+        type Ret = Option<Held>;
+
+        fn apply(&mut self, op: &ValueOp) -> Option<Held> {
+            match *op {
+                ValueOp::Evict => matches!(self, Held::Memory(_)).then(|| {
+                    *self = Held::Evicted;
+                    Held::Evicted
+                }),
+                ValueOp::Refill(version) => {
+                    if *self == Held::Evicted {
+                        *self = Held::Memory(version);
+                    }
+                    None
+                }
+                ValueOp::ToDisk(version) => (*self == Held::Memory(version)).then(|| {
+                    *self = Held::Disk;
+                    Held::Disk
+                }),
+                ValueOp::Look => Some(*self),
+            }
+        }
+    }
+
+    const DISK: ContentId = ContentId([9; 32]);
+    static ON_DISK: &[u8] = b"dk";
+
+    /// Where the value of `bytes` is, checking it is read whole.
+    fn where_is(bytes: &[u8]) -> Held {
+        match bytes {
+            [b'm', version] => Held::Memory(version - b'0'),
+            b"dk" => Held::Disk,
+            other => panic!("a value read whole, not {other:?}"),
+        }
+    }
+
+    fn one_memo(value: &[u8]) -> (Store, MemoId) {
+        let store = Store::new();
+        let code = store.code(SCHEMA, ContentId([1; 32]));
+        let memo = store.make(key(0), Fingerprint(7), code, &[], value);
+        (store, memo)
+    }
+
+    /// The inline copy names the value the word names: checked once every swap is done.
+    fn copy_follows(store: &Store, memo: MemoId) {
+        let task = blaze_reclaim::enter();
+        let hot = store.hot(&task, memo);
+        assert_eq!(
+            hot.seen.load(Relaxed),
+            hot.value.load(Relaxed),
+            "the inline copy names the value the word names once every swap is done"
+        );
+    }
+
+    struct One {
+        store: Store,
+        memo: MemoId,
+        history: History<Held>,
+    }
+
+    impl One {
+        fn evict(&self) {
+            let task = blaze_reclaim::enter();
+            self.history.record(ValueOp::Evict, |_| self.store.evict(&task, self.memo).then_some(Held::Evicted));
+        }
+
+        fn refill(&self, version: u8) {
+            let task = blaze_reclaim::enter();
+            self.history.record(ValueOp::Refill(version), |_| {
+                self.store.refill(&task, self.memo, &[b'm', b'0' + version]);
+                None
+            });
+        }
+
+        /// A cold write: the value this thread sees (a lone load, outside the history), then the
+        /// swap that moves it to disk if the memo still has that value.
+        fn to_disk(&self) {
+            let task = blaze_reclaim::enter();
+            let Some((was, bytes)) = self.store.in_memory(&task, self.memo) else { return };
+            let Held::Memory(version) = where_is(bytes) else { panic!("`Store::in_memory` gave a mapped value") };
+            self.history.record(ValueOp::ToDisk(version), |_| {
+                // SAFETY: a static outlives the store.
+                let moved = unsafe { self.store.to_disk(&task, self.memo, was, ON_DISK, DISK) };
+                moved.then_some(Held::Disk)
+            });
+        }
+
+        fn look(&self) {
+            let task = blaze_reclaim::enter();
+            self.history.record(ValueOp::Look, |_| {
+                let held = self.store.bytes(&task, self.memo).map_or(Held::Evicted, where_is);
+                let stored = match held {
+                    Held::Memory(_) => Stored::Memory,
+                    Held::Disk => Stored::Disk(DISK),
+                    Held::Evicted => Stored::Evicted,
+                };
+                assert_eq!(self.store.stored(&task, self.memo), stored);
+                Some(held)
+            });
+        }
+    }
+
+    /// An eviction, a refill and two cold writes on one memo's value, against where the value
+    /// is: each swap is a compare-and-swap of the word, so each decision is made on the latest
+    /// value, a cold write of a value the memo no longer has is refused by the word's generation,
+    /// and every value read (inline copy or row) is read whole. Dropping the store frees each
+    /// value's segment once, after every read of it.
+    #[test]
+    fn model_a_value_row_evicts_refills_and_moves_to_disk_whole() {
+        blaze_check::model(|| {
+            let (store, memo) = one_memo(b"m0");
+            let one = Arc::new(One { store, memo, history: History::new() });
+            let evicter = {
+                let one = one.clone();
+                thread::spawn(move || one.evict())
+            };
+            let refiller = {
+                let one = one.clone();
+                thread::spawn(move || {
+                    one.refill(1);
+                    one.to_disk();
+                })
+            };
+            one.to_disk();
+            evicter.join().expect("the evicter");
+            refiller.join().expect("the refiller");
+            one.look();
+            one.history.check(Held::Memory(0));
+            copy_follows(&one.store, one.memo);
+        });
+    }
+
+    /// The finding: an eviction and a refill racing. The refill's swap lands while the
+    /// eviction's refresh holds the inline copy; the refill's refresh sees it held and leaves it
+    /// to the holder, whose reload of the word must then see the refill. With acquire and
+    /// release on those four accesses (store buffering) both could read the old value, and the
+    /// copy stayed stale until the next swap; SeqCst on them (`Store::refresh`) forbids it.
+    #[test]
+    fn model_a_hot_rows_copy_names_its_value_after_racing_swaps() {
+        blaze_check::model(|| {
+            let (store, memo) = one_memo(b"m0");
+            let store = Arc::new(store);
+            let evicter = {
+                let store = store.clone();
+                thread::spawn(move || {
+                    let task = blaze_reclaim::enter();
+                    store.evict(&task, memo);
+                })
+            };
+            let refiller = {
+                let store = store.clone();
+                thread::spawn(move || {
+                    let task = blaze_reclaim::enter();
+                    store.refill(&task, memo, b"m1");
+                })
+            };
+            evicter.join().expect("the evicter");
+            refiller.join().expect("the refiller");
+            copy_follows(&store, memo);
+            let task = blaze_reclaim::enter();
+            let bytes = store.bytes(&task, memo);
+            assert!(
+                bytes.is_none() || bytes == Some(&b"m1"[..]),
+                "evicted, or refilled after the eviction: {bytes:?}"
+            );
+        });
+    }
+
+    /// One memo of a shared kind lets go of its row while another thread makes an equal value
+    /// and a sweep retires rows no memo names: the maker takes a name on the row (the sweep's
+    /// exchange to `DEAD` then fails) or, once it is dead, makes a row of its own and puts it in
+    /// the dead one's place; exactly one of the maker and the sweep retires the dead row, and the
+    /// maker's value is read whole. Afterwards one row is shared, and none once its memo goes.
+    #[test]
+    fn model_a_shared_row_is_named_again_or_made_again_while_a_sweep_retires_it() {
+        let mut builder = Builder::new();
+        // The sweep loads each shard of the shared rows' map: each is a branch.
+        builder.max_branches = builder.max_branches.max(8 * blaze_ids::shard_count() + 10_000);
+        builder.check(|| {
+            const SHARED: Shared = Shared { name: "a model's", schema: SCHEMA };
+            let store = Arc::new(Store::new());
+            let code = store.code(SCHEMA, ContentId([1; 32]));
+            let first = store.make_shared(key(0), Fingerprint(7), code, &[], b"m7", SHARED);
+            let maker = {
+                let store = store.clone();
+                thread::spawn(move || {
+                    let memo = store.make_shared(key(1), Fingerprint(7), code, &[], b"m7", SHARED);
+                    let task = blaze_reclaim::enter();
+                    assert_eq!(store.bytes(&task, memo), Some(&b"m7"[..]), "a shared value read whole");
+                    memo
+                })
+            };
+            let leaver = {
+                let store = store.clone();
+                // Never published: freed at once, letting go of its name.
+                thread::spawn(move || store.discard(first))
+            };
+            // The one thread here in a `blaze_mem::frame::task`.
+            store.sweep();
+            let made = maker.join().expect("the maker");
+            leaver.join().expect("the leaver");
+            store.sweep();
+            assert_eq!(store.shared_rows(), 1, "the maker's memo names one shared row");
+            store.discard(made);
+            store.sweep();
+            assert_eq!(store.shared_rows(), 0, "no memo names it: retired");
+        });
+    }
+
+    /// Segments of 64 bytes, so four copies of 16 fill one and the fifth seals it; a copy over
+    /// 16 bytes gets a segment of its own, sealed at once. A span lent to another thread is read
+    /// whole there while its lane drops its own spans, seals the segment and opens another, and
+    /// two threads sweep: a segment is freed only once it is sealed and no span holds it (the
+    /// free is checked after every read of its bytes), and then it is freed.
+    #[test]
+    fn model_a_segment_is_freed_once_sealed_and_let_go_of() {
+        blaze_check::model(|| {
+            let segments = Arc::new(Segments::new(64, 64, 16));
+            let spans: Vec<Span> = (1..=4u8).map(|n| segments.copy(&[n; 16], 16)).collect();
+            let lent = spans[0].share();
+            let big = segments.copy(&[9; 32], 16);
+            let reader = {
+                let segments = segments.clone();
+                thread::spawn(move || {
+                    assert_eq!(lent.bytes(), &[1; 16], "a lent span read whole");
+                    assert_eq!(big.bytes(), &[9; 32], "a segment of its own read whole");
+                    drop(lent);
+                    drop(big);
+                    segments.sweep();
+                })
+            };
+            let sweeper = {
+                let segments = segments.clone();
+                thread::spawn(move || segments.sweep())
+            };
+            // The open segment stays held by its lane's bias whatever is let go of.
+            drop(spans);
+            let next = segments.copy(&[5; 16], 16);
+            assert_eq!(next.bytes(), &[5; 16]);
+            reader.join().expect("the reader");
+            sweeper.join().expect("the sweeper");
+            segments.sweep();
+            assert_eq!(segments.count(), 1, "the sealed segment and the big one are freed; the open one stays");
+            drop(next);
+            segments.sweep();
+            assert_eq!(segments.count(), 1, "an open segment stays while its lane may copy in");
+        });
+    }
+}

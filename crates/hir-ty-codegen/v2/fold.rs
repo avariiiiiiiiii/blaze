@@ -987,7 +987,7 @@ pub(crate) fn merge(
 mod tests {
     use blaze_codegen::{
         InstanceKey, Settings, Target,
-        fold::{Limits, groups},
+        fold::{Forms, Limits, Masking, groups},
     };
     use cranelift_codegen::{
         ir::{AbiParam, types},
@@ -1789,8 +1789,10 @@ mod tests {
         let (ma, mb) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         let settings = Settings(ContentId([1; 32]));
         let limits = Limits { thunk_size: 0, ..Limits::default() };
+        let forms = Forms::new();
+        let (ma, mb) = (Masking::of(&forms, &ma), Masking::of(&forms, &mb));
         let found = groups(
-            &[(key(1), settings, &ma, &refs_a[..]), (key(2), settings, &mb, &refs_b[..])],
+            &[(key(1), settings, ma, &refs_a[..]), (key(2), settings, mb, &refs_b[..])],
             &limits,
         );
         let group = &found[0];
@@ -1856,8 +1858,10 @@ mod tests {
         let (ma, mb) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         let settings = Settings(ContentId([1; 32]));
         let limits = Limits { thunk_size: 0, ..Limits::default() };
+        let forms = Forms::new();
+        let (ma, mb) = (Masking::of(&forms, &ma), Masking::of(&forms, &mb));
         let found = groups(
-            &[(key(1), settings, &ma, &refs[..]), (key(2), settings, &mb, &refs[..])],
+            &[(key(1), settings, ma, &refs[..]), (key(2), settings, mb, &refs[..])],
             &limits,
         );
         let group = &found[0];
@@ -1901,8 +1905,10 @@ mod tests {
         let (ma, mb) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         let settings = Settings(ContentId([1; 32]));
         let limits = Limits { thunk_size: 0, ..Limits::default() };
+        let forms = Forms::new();
+        let (ma, mb) = (Masking::of(&forms, &ma), Masking::of(&forms, &mb));
         let found = groups(
-            &[(key(1), settings, &ma, &refs[..]), (key(2), settings, &mb, &refs[..])],
+            &[(key(1), settings, ma, &refs[..]), (key(2), settings, mb, &refs[..])],
             &limits,
         );
         let group = &found[0];

@@ -57,7 +57,12 @@ pub trait Files {
 /// A file's tree after the edits, parsed in place: what the front end's parse of the file whose
 /// text has the content ID `content` (a [`FileText`]'s) and `edition` gives. Only a tree with
 /// no syntax errors is one: the errors of a tree reparsed in place may come in another order.
+/// It is for [`base_db::EditionedFileId::seed_parse`], which takes it only while `content` is
+/// the file's text.
 pub struct Seed {
+    /// The file in the database the edits were made against: the same file in a front end
+    /// moved on from it to the committed view.
+    pub file: FileId,
     pub content: ContentId,
     pub edition: Edition,
     pub parse: Parse<SourceFile>,
@@ -66,7 +71,30 @@ pub struct Seed {
 /// What [`apply`] made.
 pub struct Applied {
     pub edited: Edited,
-    pub seeds: Vec<Seed>,
+    reparsed: Vec<Reparsed>,
+}
+
+/// A file the edits changed, as they left it.
+struct Reparsed {
+    file: FileId,
+    parse: Parse<SourceFile>,
+    /// Where the view's bytes end in the tree's text.
+    end: usize,
+    edition: Edition,
+    appended: Option<&'static str>,
+}
+
+impl Applied {
+    /// The trees to seed the front end with, made when asked: each hashes its file's new bytes
+    /// and checks its whole tree for errors, which a caller that seeds nothing never pays.
+    pub fn seeds(&self) -> impl Iterator<Item = Seed> + '_ {
+        self.reparsed.iter().filter(|file| file.parse.errors().is_empty()).map(|file| Seed {
+            file: file.file,
+            content: FileText::content_of(&file.parse.root().file().text()[..file.end], file.appended),
+            edition: file.edition,
+            parse: file.parse.clone(), // clone: two `Arc` counts, the seed's own
+        })
+    }
 }
 
 /// The files a request's edits work in, as they leave them.
@@ -80,6 +108,7 @@ pub(crate) struct Edits<'a, F: Files> {
     /// answers for.
     pub roots: Vec<ast::Node<'a>>,
     pub by_path: FxHashMap<Box<str>, u32>,
+    pub by_id: FxHashMap<FileId, u32>,
     pub touches: Vec<Touch>,
     /// The moves of renamed modules' files, after every text edit.
     pub moves: Vec<Op>,
@@ -97,6 +126,7 @@ pub fn apply<F: Files>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, Ap
         ids: Vec::new(),
         roots: Vec::new(), // alloc: one view per file the request opens, beside `ids`
         by_path: FxHashMap::default(),
+        by_id: FxHashMap::default(),
         touches: Vec::new(),
         moves: Vec::new(),
     };
@@ -143,15 +173,12 @@ impl<F: Files> Edits<'_, F> {
 
     /// The working copy of the front end's `file`, opened on first use.
     pub fn open_id(&mut self, file: FileId) -> Result<u32, String> {
-        if let Some(at) = self.ids.iter().position(|it| *it == file) {
-            return Ok(at as u32);
+        if let Some(&at) = self.by_id.get(&file) {
+            return Ok(at);
         }
-        let path = self
-            .files
-            .path(file)
-            .ok_or_else(|| format!("file {file:?} the edit reaches is outside the view"))?
-            .to_owned();
-        self.load(file, &path)
+        let files = self.files;
+        let path = files.path(file).ok_or_else(|| format!("file {file:?} the edit reaches is outside the view"))?;
+        self.load(file, path)
     }
 
     fn load(&mut self, file: FileId, path: &str) -> Result<u32, String> {
@@ -160,41 +187,46 @@ impl<F: Files> Edits<'_, F> {
         let editioned = self.sema.attach_first_edition(file);
         let root = self.sema.parse(editioned).syntax();
         let text = self.db.file_text(file).text(self.db);
-        if !text.starts_with(bytes) {
+        if !begins_with(text, bytes) {
             return Err(format!(
                 "the front end's text of {path} is not the view's bytes: the job lowered another view"
             ));
         }
         let parse = editioned.parse(self.db).clone();
-        let working = Working::new(path, editioned.edition(self.db), text.to_string(), bytes.len(), parse);
+        let source = parse.root().file().source();
+        if !source.ptr_eq(text) && **source != **text {
+            return Err(format!("the front end's tree of {path} is not of its text"));
+        }
+        let working = Working::new(path, editioned.edition(self.db), bytes.len(), parse);
         let at = u32::try_from(self.working.len()).expect("fewer than 2^32 files");
         self.working.push(working);
         self.ids.push(file);
         self.roots.push(root);
         self.by_path.insert(path.into(), at);
+        self.by_id.insert(file, at);
         Ok(at)
     }
 
     /// The edits' ops, the items they touched, named and keyed in the view as it was, and the
-    /// trees to seed.
+    /// files they changed, to seed when asked.
     fn finish(self) -> Applied {
-        let mut ops: Vec<Op> = self.working.iter().flat_map(Working::ops).collect();
-        ops.extend(self.moves.iter().cloned());
-        let mut touches = self.touches;
+        let Edits { db, sema, working, ids, roots, mut touches, moves, .. } = self;
+        let mut ops: Vec<Op> = Vec::with_capacity(working.iter().map(|it| it.splices.len()).sum::<usize>() + moves.len());
+        ops.extend(working.iter().flat_map(Working::ops));
+        ops.extend(moves);
         touches.sort_unstable();
         touches.dedup();
         let mut items: Vec<EditedItem> = touches
             .iter()
             .map(|touch| {
-                let file = &self.working[touch.file as usize];
+                let file = &working[touch.file as usize];
                 let path = edit::path_at(file, &touch.at);
                 let key = match &touch.at {
                     At::Item(offset) => {
-                        let root = self.roots[touch.file as usize];
-                        let node = edit::item_at(root, *offset).expect("a touched item starts there");
-                        key_of(&self.sema, self.db, node)
+                        let node = edit::item_at(roots[touch.file as usize], *offset).expect("a touched item starts there");
+                        key_of(&sema, db, node)
                     }
-                    At::File => file_key(&self.sema, self.db, self.ids[touch.file as usize]),
+                    At::File => file_key(&sema, db, ids[touch.file as usize]),
                     At::Added(_) => None,
                 };
                 EditedItem { how: touch.how, key, file: file.path.to_string(), path }
@@ -202,22 +234,27 @@ impl<F: Files> Edits<'_, F> {
             .collect();
         items.sort_unstable_by(|a, b| (&a.file, &a.path, a.how).cmp(&(&b.file, &b.path, b.how)));
         items.dedup();
-        let seeds = self
-            .working
-            .iter()
-            .zip(&self.ids)
-            .filter(|(file, _)| !file.splices.is_empty() && file.parse.errors().is_empty())
-            .map(|(file, id)| {
-                let appended = self.db.file_text(*id).appended_root_module(self.db);
-                Seed {
-                    content: FileText::content_of(file.bytes(), appended),
-                    edition: file.edition,
-                    parse: file.parse.clone(),
-                }
+        let reparsed = working
+            .into_iter()
+            .zip(&ids)
+            .filter(|(file, _)| !file.splices.is_empty())
+            .map(|(file, id)| Reparsed {
+                file: *id,
+                appended: db.file_text(*id).appended_root_module(db),
+                end: file.end,
+                edition: file.edition,
+                parse: file.parse,
             })
             .collect();
-        Applied { edited: Edited { ops, items }, seeds }
+        Applied { edited: Edited { ops, items }, reparsed }
     }
+}
+
+/// Whether `text` begins with `bytes`: no compare when they are the same memory, as a view's
+/// file the front end reads in place is.
+fn begins_with(text: &str, bytes: &str) -> bool {
+    text.len() >= bytes.len()
+        && (std::ptr::eq(text.as_ptr(), bytes.as_ptr()) || text.as_bytes()[..bytes.len()] == *bytes.as_bytes())
 }
 
 /// The key ([`blaze_items::ItemKey`]) of the item `node` is, in the view the front end has;

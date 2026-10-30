@@ -4,7 +4,7 @@
 //! after each edit every test is chosen for, then run for the truth. A test not run must pass
 //! now, and a pass of it must have been kept at the same versions of what it executed and the
 //! same input. A run that ends with its record incomplete keeps its pass under what the test
-//! reaches.
+//! reaches. A [`Selector`] kept across the edits chooses as the store alone does.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -19,6 +19,7 @@ use crate::{
         Choice, Ran, Subject, choose, keep,
         tests::{Mem, World},
     },
+    selector::Selector,
     table::{
         Image, Version,
         tests::{bound, id},
@@ -217,6 +218,68 @@ fn record_edit_select_never_skips_what_would_run_otherwise() {
         }
     }
     assert!(skipped > ran / 4, "the simulation skips too little to say anything: {skipped} skipped, {ran} ran");
+}
+
+/// A selector kept across random edits, reverts, input changes, incomplete records, other
+/// attributes, outside tests and runs of all gives every test the choice the reference walk
+/// gives over the same store, every keep going through the selector; so does one made afresh
+/// over the store half-way, as after a daemon restart.
+#[test]
+fn a_selector_chooses_as_the_store_alone_does() {
+    let plain = Attrs::default();
+    let ignored = Attrs { ignore: true, ..Attrs::default() };
+    let names: Vec<String> = (0..TESTS).map(|t| format!("t{t}")).collect();
+    let (mut cached, mut ran) = (0u32, 0u32);
+    for seed in 0..16u64 {
+        let mut rng = Rng::new(seed ^ 0xd1ff);
+        let mut program = Program::new();
+        let mut data = rng.next_u64() as u8;
+        let mut store = Mem::default();
+        let mut selector = Selector::new(given(), program.image());
+        for step in 0..60u32 {
+            match step {
+                0 => {}
+                30 => selector = Selector::new(given(), program.image()),
+                _ => selector.advance(program.image()),
+            }
+            let image = program.image();
+            for t in 0..TESTS {
+                let root = t % SLOTS;
+                let reached = program.reached(root);
+                let attrs = if (t + step) % 7 == 0 { &ignored } else { &plain };
+                let outside = t == 5 && step % 9 == 0;
+                let subject = Subject { name: &names[t as usize], attrs, outside, reached: &reached };
+                let all = step % 13 == 12;
+                let want = choose(&store, given(), &image, &subject, all, &mut world(data)).unwrap();
+                let got = selector.choose(&store, &subject, all, &mut world(data)).unwrap();
+                assert_eq!(got, want, "seed {seed}, step {step}, test {t}");
+                if let Choice::Run { .. } = got {
+                    ran += 1;
+                    let truth = program.run(root, data);
+                    let traced = traced(&truth, data);
+                    let record = record(&truth, rng.below(6) != 0);
+                    let took = Duration::from_micros(1_500 + u64::from(t));
+                    let it = Ran { passed: truth.passed, took, traced: Some(&traced), record: &record };
+                    selector.keep(&mut store, &subject, &it).unwrap();
+                } else {
+                    cached += 1;
+                }
+            }
+            match rng.below(10) {
+                0 => data = rng.next_u64() as u8,
+                1 => program.beside += 1,
+                2 => {
+                    let n = rng.below(u64::from(FNS)) as usize;
+                    program.versions[n] = program.versions[n].saturating_sub(1);
+                }
+                _ => {
+                    let n = rng.below(u64::from(FNS)) as usize;
+                    program.versions[n] += 1;
+                }
+            }
+        }
+    }
+    assert!(cached > ran / 4 && ran > 100, "{cached} cached, {ran} ran");
 }
 
 /// Over synthetic histories of one whole pass: the test runs again exactly when a function it

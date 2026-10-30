@@ -6,8 +6,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
+use blaze_stencil::TlsModel;
 use cranelift_codegen::{
     ir::{Type, types},
     isa::{self, CallConv, OwnedTargetIsa},
@@ -16,9 +17,91 @@ use cranelift_codegen::{
 
 static SELECTED: OnceLock<Target> = OnceLock::new();
 
-/// The target features of the process's code past the baseline ([`Target::select_features`]).
-/// Read once by the first ISA made, after which they are what they are.
-static FEATURES: OnceLock<Box<[String]>> = OnceLock::new();
+/// The most sets of target features one process compiles with: each toolchain's
+/// (`Toolchain::features`: a dev job's host features, a release job's baseline) and each
+/// `#[target_feature]` set over one of them. A code generator is kept per set
+/// (`crate::target_of`).
+pub(crate) const MOST_FEATURE_SETS: usize = 128;
+
+const _: () = assert!(MOST_FEATURE_SETS <= u8::MAX as usize + 1);
+
+/// The sets [`Features`] number, past the baseline's (0, never set), in the order they were
+/// first named, each once. Only added to, under [`ADDING`], in order, so a slot that is not
+/// set yet ends the sets; read with no lock.
+static FEATURE_SETS: [OnceLock<Box<[String]>>; MOST_FEATURE_SETS] =
+    [const { OnceLock::new() }; MOST_FEATURE_SETS];
+
+/// Held while a set is added to [`FEATURE_SETS`].
+static ADDING: Mutex<()> = Mutex::new(());
+
+/// A set of target features past the baseline of [`Target::cpu`] that code is compiled with:
+/// `+name` and `-name` in rustc's names, sorted, each once, as `blaze_codegen::Toolchain::features`
+/// has them. Numbered for the process ([`Target::features_of`]), so that a code generator is
+/// one per set and a function's set is a byte. The set changes the code only: it is in a
+/// unit's key through `Toolchain::features` and a function's `#[target_feature]` through its
+/// shape, and never in `cfg(target_feature)`, which comes from the flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Features(u8);
+
+impl Features {
+    /// None past the baseline.
+    pub const BASELINE: Features = Features(0);
+
+    /// The features of the set, as [`Target::features_of`] was given them.
+    pub fn names(self) -> &'static [String] {
+        match FEATURE_SETS[self.index()].get() {
+            Some(set) => set,
+            None => &[],
+        }
+    }
+
+    pub fn is_baseline(self) -> bool {
+        self == Features::BASELINE
+    }
+
+    pub(crate) fn index(self) -> usize {
+        usize::from(self.0)
+    }
+
+    /// The number of `features`, given it is sorted and each once: a scan of the sets named so
+    /// far with no lock, and a new number under [`ADDING`] for a set first named. More than
+    /// [`MOST_FEATURE_SETS`] is an error naming the set.
+    fn interned(features: &[String]) -> Result<Features, String> {
+        if features.is_empty() {
+            return Ok(Features::BASELINE);
+        }
+        // The set's number, or the first slot not set yet from `from` on.
+        let find = |from: usize| -> Result<Features, usize> {
+            for at in from..MOST_FEATURE_SETS {
+                match FEATURE_SETS[at].get() {
+                    Some(set) if **set == *features => return Ok(Features(at as u8)),
+                    Some(_) => {}
+                    None => return Err(at),
+                }
+            }
+            Err(MOST_FEATURE_SETS)
+        };
+        let unset = match find(1) {
+            Ok(found) => return Ok(found),
+            Err(unset) => unset,
+        };
+        let _adding = ADDING.lock().unwrap_or_else(PoisonError::into_inner);
+        let free = match find(unset) {
+            Ok(found) => return Ok(found),
+            Err(free) => free,
+        };
+        if free == MOST_FEATURE_SETS {
+            // alloc: an error
+            return Err(format!(
+                "the target features {features:?}: one process compiles with at most \
+                 {MOST_FEATURE_SETS} sets of target features, and this is one more"
+            ));
+        }
+        // alloc: once per set a process compiles with, its names
+        FEATURE_SETS[free].get_or_init(|| features.into());
+        Ok(Features(free as u8))
+    }
+}
 
 /// rustc's names of the x86-64 features Cranelift has a setting for, and the setting.
 const X86_FEATURES: [(&str, &str); 18] = [
@@ -156,29 +239,57 @@ impl Target {
         }
     }
 
-    /// Names the target features of the process's code past the baseline of
-    /// [`Target::cpu`]: `-C target-feature` resolved and sorted, as
-    /// `blaze_codegen::Toolchain::features` has them (the host's for a dev build that runs
-    /// where it is built). Said once, before anything is compiled; nothing said is the
-    /// baseline. A feature that turns off what Cranelift's code of the target always uses
-    /// is refused, as is a name that is not `+` or `-` and a feature.
-    pub fn select_features(&self, features: &[String]) -> Result<(), String> {
+    /// The set of target features past the baseline of [`Target::cpu`] that `features` names:
+    /// `-C target-feature` resolved and sorted, as `blaze_codegen::Toolchain::features` has
+    /// them (the host's for a dev build that runs where it is built), or such a set with a
+    /// function's `#[target_feature]` added. Any number of sets may be named, one for each
+    /// toolchain a daemon builds with. A feature that turns off what Cranelift's code of the
+    /// target always uses is refused, as are a name that is not `+` or `-` and a feature, a
+    /// list that is not sorted with each once, and a feature both on and off.
+    pub fn features_of(&self, features: &[String]) -> Result<Features, String> {
+        if !features.is_sorted_by(|a, b| a < b) {
+            // alloc: an error
+            return Err(format!("the target features {features:?} are not sorted, each once"));
+        }
         for feature in features {
             self.cranelift_setting(feature)?;
+            if let Some(name) = feature.strip_prefix('+')
+                && features.iter().any(|it| it.strip_prefix('-') == Some(name))
+            {
+                // alloc: an error
+                return Err(format!("the target features {features:?} turn {name} on and off"));
+            }
         }
-        let selected = FEATURES.get_or_init(|| features.into());
-        if **selected == *features {
-            Ok(())
-        } else {
-            // alloc: an error at setup, once a process.
-            Err(format!("the target features are {selected:?} already, not {features:?}"))
-        }
+        Features::interned(features)
     }
 
-    /// The target features [`Target::select_features`] named, empty for the baseline. Once
-    /// read, they can no longer be named otherwise.
-    pub fn features(&self) -> &'static [String] {
-        FEATURES.get_or_init(Default::default)
+    /// `features` in LLVM's names, as its target machine and a function's `target-features`
+    /// are told them (`+name,-name`), after what the target has LLVM told of its own (`+cx16`
+    /// on Windows): rustc's `to_llvm_features` for LLVM 23. A function's `target-features`
+    /// replaces its target machine's, so it is told the whole of this. Empty for none. Made
+    /// once per set of the selected target (`llvm::told`).
+    pub fn llvm_features(&self, features: Features) -> String {
+        // alloc: per target machine or function told, a few names
+        let mut out: Vec<String> = Vec::new();
+        // 128-bit atomics are `lock cmpxchg16b`: Windows 8.1 and later require the
+        // instruction, and the library calls LLVM makes otherwise (`__atomic_*_16`) are
+        // nobody's here.
+        if self.arch == Arch::X86_64 && self.object_format == ObjectFormat::Coff {
+            // alloc: per target machine or function told, a few names
+            out.push("+cx16".to_owned());
+        }
+        for feature in features.names() {
+            let (sign, name) = feature.split_at(1);
+            let renamed = renamed_for_llvm(self.arch, name, sign == "+");
+            for llvm in renamed.unwrap_or(std::slice::from_ref(&name)) {
+                // alloc: per target machine or function told, a few names
+                let told = format!("{sign}{llvm}");
+                if !out.contains(&told) {
+                    out.push(told);
+                }
+            }
+        }
+        out.join(",")
     }
 
     /// The setting of Cranelift's ISA a feature of `-C target-feature` (`+name` or `-name`)
@@ -382,28 +493,26 @@ impl Target {
         }
     }
 
-    /// The code generator for the target, with the [`features`](Self::features) of the
-    /// process. `regalloc` names Cranelift's register allocator. With `frame_pointers` every
-    /// function it compiles keeps one, which a function that asks for its frame pointer
-    /// needs. `opt` is `None` for code an edit reaches, `Speed` for what no edit does (the
-    /// standard library's and dependencies').
+    /// The code generator for the target with `features`. `regalloc` names Cranelift's
+    /// register allocator. With `frame_pointers` every function it compiles keeps one, which
+    /// a function that asks for its frame pointer needs. `opt` is `None` for code an edit
+    /// reaches, `Speed` for what no edit does (the standard library's and dependencies').
     pub(super) fn isa(
         &self,
+        features: Features,
         regalloc: &str,
         frame_pointers: bool,
         opt: OptLevel,
     ) -> Result<OwnedTargetIsa, String> {
         let mut flags = settings::builder();
-        // An image of PE reaches all of itself relative to the instruction, and what it
-        // imports through the stubs the linker adds: there is no table of addresses to go
-        // through.
-        let (pic, tls_model) = match self.object_format {
-            ObjectFormat::Elf => ("true", "elf_gd"),
-            ObjectFormat::MachO => ("true", "macho"),
-            ObjectFormat::Coff => ("false", "coff"),
-            ObjectFormat::Wasm => ("true", "elf_gd"),
+        let (pic, tls_model) = self.addressing();
+        let tls_model = match tls_model {
+            TlsModel::ElfGd => "elf_gd",
+            TlsModel::MachO => "macho",
+            TlsModel::Coff => "coff",
         };
-        flags.set("is_pic", pic).map_err(|e| e.to_string())?;
+        // alloc: an error, once per ISA made
+        flags.set("is_pic", if pic { "true" } else { "false" }).map_err(|e| e.to_string())?;
         flags.set("tls_model", tls_model).map_err(|e| e.to_string())?;
         // A frame larger than a page touches each page on its way down, as rustc's code does
         // (`probe-stack=inline-asm`, [`Target::stack_probe`]). Windows commits a stack one
@@ -448,13 +557,49 @@ impl Target {
         for setting in self.baseline_settings() {
             isa.enable(setting).map_err(|e| e.to_string())?;
         }
-        for feature in self.features() {
+        for feature in features.names() {
             if let Some((setting, on)) = self.cranelift_setting(feature)? {
                 let value = if on { "true" } else { "false" };
                 isa.set(setting, value).map_err(|e| e.to_string())?;
             }
         }
         isa.finish(settings::Flags::new(flags)).map_err(|e| e.to_string())
+    }
+
+    /// Whether code is position-independent and how it finds a thread-local: Cranelift's
+    /// `is_pic` and `tls_model` ([`Self::isa`]), and the stencil backend's ([`Self::stencil`]).
+    fn addressing(&self) -> (bool, TlsModel) {
+        // An image of PE reaches all of itself relative to the instruction, and what it
+        // imports through the stubs the linker adds: there is no table of addresses to go
+        // through.
+        match self.object_format {
+            ObjectFormat::Elf | ObjectFormat::Wasm => (true, TlsModel::ElfGd),
+            ObjectFormat::MachO => (true, TlsModel::MachO),
+            ObjectFormat::Coff => (false, TlsModel::Coff),
+        }
+    }
+
+    /// The target as the stencil backend is told it (`blaze_stencil::Target`): each field
+    /// what [`Self::isa`] gives Cranelift. `None` for wasm, which has no stencils.
+    pub fn stencil(&self) -> Option<blaze_stencil::Target> {
+        let arch = match self.arch {
+            Arch::X86_64 => blaze_codegen::Arch::X86_64,
+            Arch::Aarch64 => blaze_codegen::Arch::Aarch64,
+            Arch::Wasm32 => return None,
+        };
+        let os = match self.object_format {
+            ObjectFormat::Elf => blaze_stencil::Os::Linux,
+            ObjectFormat::MachO => blaze_stencil::Os::MacOs,
+            ObjectFormat::Coff => blaze_stencil::Os::Windows,
+            ObjectFormat::Wasm => return None,
+        };
+        let cpu = match self.cpu() {
+            "apple-m1" => blaze_stencil::Cpu::AppleM1,
+            _ => blaze_stencil::Cpu::Baseline,
+        };
+        let (pic, tls) = self.addressing();
+        // `isa` leaves Cranelift's `probestack_size_log2` at its default: a page of 4 KiB.
+        Some(blaze_stencil::Target { arch, os, cpu, pic, tls, probe_stack: true, probe_log2: 12 })
     }
 
     /// The settings of Cranelift's ISA that the [`cpu`](Self::cpu) rustc compiles for has:
@@ -469,15 +614,143 @@ impl Target {
     }
 }
 
+/// LLVM's names of rustc's target feature `name` of `arch`, turned on or off (`on`), as
+/// rustc's `to_llvm_features` gives them for LLVM 23: what LLVM spells otherwise, what rustc
+/// ties to it (`neon` and `fp-armv8` both ways; `sse4.2` turns `crc32` on), and nothing for
+/// a feature this LLVM no longer has. `None` where LLVM spells it as rustc does.
+fn renamed_for_llvm(arch: Arch, name: &str, on: bool) -> Option<&'static [&'static str]> {
+    Some(match arch {
+        Arch::X86_64 => match name {
+            "sse4.2" if on => &["sse4.2", "crc32"],
+            "pclmulqdq" => &["pclmul"],
+            "rdrand" => &["rdrnd"],
+            "bmi1" => &["bmi"],
+            "cmpxchg16b" => &["cx16"],
+            "lahfsahf" => &["sahf"],
+            "apxf" => &["egpr", "push2pop2", "ppx", "ndd", "ccmp", "cf", "nf", "zu"],
+            _ => return None,
+        },
+        Arch::Aarch64 => match name {
+            "rcpc2" => &["rcpc-immo"],
+            "dpb" => &["ccpp"],
+            "dpb2" => &["ccdp"],
+            "frintts" => &["fptoint"],
+            "fcma" => &["complxnum"],
+            "pmuv3" => &["perfmon"],
+            "paca" | "pacg" => &["pauth"],
+            "flagm2" => &["altnzcv"],
+            "neon" => &["neon", "fp-armv8"],
+            "fhm" => &["fp16fml"],
+            "fp16" => &["fullfp16"],
+            "fpmr" | "tme" => &[],
+            _ => return None,
+        },
+        Arch::Wasm32 => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use cranelift_codegen::settings::OptLevel;
 
-    use super::{AARCH64_FEATURES, Arch, Target, X86_FEATURES};
+    use super::{AARCH64_FEATURES, Arch, Features, MOST_FEATURE_SETS, Target, X86_FEATURES};
 
     fn setting(target: &Target, name: &str) -> Option<bool> {
-        let isa = target.isa("backtracking", false, OptLevel::None).expect("the ISA");
+        setting_with(target, Features::BASELINE, name)
+    }
+
+    fn setting_with(target: &Target, features: Features, name: &str) -> Option<bool> {
+        let isa = target.isa(features, "backtracking", false, OptLevel::None).expect("the ISA");
         isa.isa_flags().iter().find(|it| it.name == name).and_then(|it| it.as_bool())
+    }
+
+    fn names(features: &[&str]) -> Vec<String> {
+        features.iter().map(|it| (*it).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_set_is_one_number_and_two_sets_two() {
+        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        assert_eq!(x86.features_of(&[]), Ok(Features::BASELINE));
+        let avx2 = x86.features_of(&names(&["+avx", "+avx2"])).expect("a set");
+        let again = x86.features_of(&names(&["+avx", "+avx2"])).expect("a set");
+        let ssse3 = x86.features_of(&names(&["+ssse3"])).expect("a set");
+        assert_eq!(avx2, again);
+        assert_ne!(avx2, ssse3);
+        assert!(!avx2.is_baseline() && Features::BASELINE.is_baseline());
+        assert_eq!(avx2.names(), ["+avx", "+avx2"]);
+        assert!(Features::BASELINE.names().is_empty());
+    }
+
+    #[test]
+    fn a_set_out_of_order_twice_or_on_and_off_is_refused() {
+        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        assert!(x86.features_of(&names(&["+avx2", "+avx"])).is_err());
+        assert!(x86.features_of(&names(&["+avx", "+avx"])).is_err());
+        assert!(x86.features_of(&names(&["+popcnt", "-popcnt"])).is_err());
+        assert!(x86.features_of(&names(&["-sse2"])).is_err());
+        assert!(x86.features_of(&names(&["avx2"])).is_err());
+    }
+
+    /// Sets are numbered from many threads at once: each set gets one number.
+    #[test]
+    fn sets_named_at_once_get_one_number_each() {
+        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let sets = [["+bmi1"], ["+bmi2"], ["+lzcnt"], ["+fma"]].map(|it| names(&it));
+        let numbered: Vec<Vec<Features>> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| sets.iter().map(|it| x86.features_of(it).expect("a set")).collect::<Vec<_>>())
+                })
+                .collect();
+            threads.into_iter().map(|it| it.join().expect("a thread")).collect()
+        });
+        for each in &numbered {
+            assert_eq!(each, &numbered[0]);
+        }
+        for (set, number) in sets.iter().zip(&numbered[0]) {
+            assert_eq!(number.names(), &set[..]);
+        }
+        assert!(numbered[0].iter().all(|it| it.index() < MOST_FEATURE_SETS));
+    }
+
+    /// One ISA per set: each has its set's settings and the baseline's has none of them.
+    #[test]
+    fn each_set_has_its_own_isa() {
+        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let avx2 = x86.features_of(&names(&["+avx", "+avx2", "+sse3", "+sse4.1", "+sse4.2", "+ssse3"])).expect("a set");
+        let ssse3 = x86.features_of(&names(&["+sse3", "+ssse3"])).expect("a set");
+        assert_eq!(setting_with(&x86, avx2, "has_avx2"), Some(true));
+        assert_eq!(setting_with(&x86, avx2, "has_sse41"), Some(true));
+        assert_eq!(setting_with(&x86, ssse3, "has_ssse3"), Some(true));
+        assert_eq!(setting_with(&x86, ssse3, "has_avx2"), Some(false));
+        assert_eq!(setting(&x86, "has_ssse3"), Some(false));
+        let arm = Target::parse("aarch64-apple-darwin").expect("a target");
+        let off = arm.features_of(&names(&["-lse"])).expect("a set");
+        assert_eq!(setting_with(&arm, off, "has_lse"), Some(false));
+        assert_eq!(setting(&arm, "has_lse"), Some(true));
+    }
+
+    /// rustc's `to_llvm_features` for LLVM 23, and Windows' `+cx16` first.
+    #[test]
+    fn llvm_is_told_the_features_in_its_names() {
+        let linux = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        assert_eq!(linux.llvm_features(Features::BASELINE), "");
+        let set = linux
+            .features_of(&names(&["+avx2", "+bmi1", "+lahfsahf", "+pclmulqdq", "+sse4.2", "-cmpxchg16b"]))
+            .expect("a set");
+        assert_eq!(linux.llvm_features(set), "+avx2,+bmi,+sahf,+pclmul,+sse4.2,+crc32,-cx16");
+        let off = linux.features_of(&names(&["-sse4.2"])).expect("a set");
+        assert_eq!(linux.llvm_features(off), "-sse4.2");
+        let windows = Target::parse("x86_64-pc-windows-msvc").expect("a target");
+        assert_eq!(windows.llvm_features(Features::BASELINE), "+cx16");
+        let avx = windows.features_of(&names(&["+avx"])).expect("a set");
+        assert_eq!(windows.llvm_features(avx), "+cx16,+avx");
+        let arm = Target::parse("aarch64-unknown-linux-gnu").expect("a target");
+        let set = arm.features_of(&names(&["+fp16", "+paca", "+pacg", "+rcpc2", "+tme"])).expect("a set");
+        assert_eq!(arm.llvm_features(set), "+fullfp16,+pauth,+rcpc-immo");
+        let neon = arm.features_of(&names(&["+fhm", "+neon"])).expect("a set");
+        assert_eq!(arm.llvm_features(neon), "+fp16fml,+neon,+fp-armv8");
     }
 
     #[test]
@@ -499,13 +772,48 @@ mod tests {
         }
     }
 
+    /// The stencil backend is told what Cranelift's ISA is set to, field by field.
+    #[test]
+    fn the_stencil_target_is_what_cranelift_is_given() {
+        use cranelift_codegen::settings::TlsModel as Cranelift;
+        let triples = [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ];
+        for triple in triples {
+            let target = Target::parse(triple).expect("a target");
+            let stencil = target.stencil().expect("a stencil target");
+            let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
+            let flags = isa.flags();
+            assert_eq!(stencil.pic, flags.is_pic(), "{triple}");
+            let tls = match flags.tls_model() {
+                Cranelift::ElfGd => blaze_stencil::TlsModel::ElfGd,
+                Cranelift::Macho => blaze_stencil::TlsModel::MachO,
+                Cranelift::Coff => blaze_stencil::TlsModel::Coff,
+                other => panic!("{triple}: tls_model {other:?}"),
+            };
+            assert_eq!(stencil.tls, tls, "{triple}");
+            assert!(stencil.probe_stack && flags.enable_probestack(), "{triple}");
+            assert_eq!(stencil.probe_log2, flags.probestack_size_log2(), "{triple}");
+            let lse = setting(&target, "has_lse") == Some(true);
+            assert_eq!(stencil.cpu == blaze_stencil::Cpu::AppleM1, lse, "{triple}");
+        }
+        let apple = Target::parse("aarch64-apple-darwin").expect("a target").stencil().expect("a stencil target");
+        assert_eq!((apple.arch, apple.os), (blaze_codegen::Arch::Aarch64, blaze_stencil::Os::MacOs));
+        let windows = Target::parse("x86_64-pc-windows-msvc").expect("a target").stencil().expect("a stencil target");
+        assert_eq!((windows.arch, windows.os), (blaze_codegen::Arch::X86_64, blaze_stencil::Os::Windows));
+        assert_eq!(Target::parse("wasm32-wasip1").expect("a target").stencil(), None);
+    }
+
     #[test]
     fn tests_verify_what_cranelift_is_given() {
         let target = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
-        let isa = target.isa("backtracking", false, OptLevel::None).expect("the ISA");
+        let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
         assert!(isa.flags().enable_verifier());
         assert_eq!(isa.flags().opt_level(), OptLevel::None);
-        let isa = target.isa("backtracking", false, OptLevel::Speed).expect("the ISA");
+        let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::Speed).expect("the ISA");
         assert_eq!(isa.flags().opt_level(), OptLevel::Speed);
     }
 

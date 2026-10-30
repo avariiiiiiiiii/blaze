@@ -218,9 +218,10 @@ pub(crate) fn decode(bytes: &[u8], config: &Config) -> Result<History, DecodeErr
         }
         records.push((slot as usize, record));
     }
-    // Each record's stamp and its index in `records`, which is in slot order.
+    // Each record's stamp and its index in `records`, which is in slot order; the sort is
+    // stable, so records of one stamp stay in slot order.
     let mut stamps: Vec<(u64, usize)> = records.iter().enumerate().map(|(at, (_, it))| (it.stamp, at)).collect(); // alloc: once per daemon start
-    radix::sort_copy_by_key(&mut stamps, |&(stamp, at)| radix::pack_64(stamp, at as u64));
+    radix::sort_copy_by_key(&mut stamps, |&(stamp, _)| stamp);
     if let Some(pair) = stamps.windows(2).find(|it| it[0].0 == it[1].0) {
         return Err(DecodeError::Unsound { slot: records[pair[1].1].0 as u32 });
     }

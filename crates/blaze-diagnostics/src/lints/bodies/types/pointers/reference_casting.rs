@@ -21,7 +21,7 @@ use rustc_type_ir::{
 
 use super::{Inits, LayoutFacts, callee_item, expr_or_init, layout, peel_casts, span, type_info};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -44,7 +44,7 @@ enum PatternKind {
 impl LatePass for InvalidReferenceCasting {
     const LINTS: LintSet = lint_set([LINT]);
     const EXPRS: ExprKinds =
-        ExprKinds::of(&[ExprTag::Ref, ExprTag::Assignment, ExprTag::BinaryOp, ExprTag::Call]);
+        ExprKinds::of(&[ExprKind::Ref, ExprKind::Assignment, ExprKind::BinaryOp, ExprKind::Call]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some((e, pat)) = borrow_or_assign(b, expr) else { return };

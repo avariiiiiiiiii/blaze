@@ -131,6 +131,10 @@ impl<A: Accumulator> Ingredient for IngredientImpl<A> {
         JarKind::Struct
     }
 
+    fn read_kind(&self) -> crate::ingredient::ReadKind {
+        crate::ingredient::ReadKind::Accumulator
+    }
+
     fn memo_table_types(&self) -> &Arc<MemoTableTypes> {
         unreachable!("accumulator does not allocate pages")
     }

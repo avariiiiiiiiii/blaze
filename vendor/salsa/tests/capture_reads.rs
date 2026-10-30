@@ -452,3 +452,57 @@ fn a_replayed_outer_capture_holds_what_it_replayed() {
     assert_eq!(nest_other(&db, x, y), 1014);
     assert_eq!(db.take_log(), ["nest_other", "goal nested", "goal y"]);
 }
+
+#[salsa::interned]
+struct Label<'db> {
+    #[returns(copy)]
+    key: u32,
+}
+
+#[salsa::tracked(returns(copy))]
+fn doubled(db: &dyn Db, x: Number) -> u32 {
+    x.value(db) * 2
+}
+
+/// Captures a read of an input field, of an interned value and of a query, then logs each read
+/// `for_each_read` gives as its kind and its ingredient's name.
+#[salsa::tracked(returns(copy))]
+fn walks_its_reads(db: &dyn Db, x: Number) -> u32 {
+    let (value, reads) = salsa::capture_reads(db, || {
+        x.value(db) + Label::new(db, 3).key(db) + doubled(db, x)
+    });
+    let reads = reads.expect("plain reads may be shared");
+    let mut seen = 0;
+    let walked = reads.for_each_read(db, |_, kind, name| {
+        seen += 1;
+        db.log(format!("{kind:?} {name}"));
+        std::ops::ControlFlow::Continue(())
+    });
+    assert_eq!(walked, std::ops::ControlFlow::Continue(()));
+    assert_eq!(seen, reads.len());
+    value
+}
+
+#[test]
+fn for_each_read_gives_each_read_with_its_kind_and_name_in_read_order() {
+    let db = CaptureDb::default();
+    let x = Number::new(&db, 1);
+    assert_eq!(walks_its_reads(&db, x), 1 + 3 + 2);
+    let log = db.take_log();
+    // An interned value's read records an edge only when its slot can be reused.
+    let without_interned: Vec<&str> = log
+        .iter()
+        .filter(|entry| !entry.starts_with("Interned"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(without_interned.len(), 2, "{log:?}");
+    assert!(without_interned[0].starts_with("Input ") && without_interned[0].contains("value"), "{log:?}");
+    assert!(without_interned[1].starts_with("Query ") && without_interned[1].contains("doubled"), "{log:?}");
+    for entry in log.iter().filter(|entry| entry.starts_with("Interned")) {
+        assert!(entry.contains("Label"), "{log:?}");
+    }
+    let interned = log.iter().position(|entry| entry.starts_with("Interned"));
+    if let Some(at) = interned {
+        assert_eq!(at, 1, "the interned read comes between the two others: {log:?}");
+    }
+}

@@ -153,4 +153,8 @@ impl Glue for Aarch64 {
     fn slot_base(frame: &Frame) -> (u16, i32) {
         frame::slot_base(frame)
     }
+
+    fn frame_size(frame: &Frame) -> u32 {
+        frame::SAVES + frame.stack
+    }
 }

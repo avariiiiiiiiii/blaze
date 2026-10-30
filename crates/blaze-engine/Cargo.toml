@@ -72,6 +72,7 @@ hir-ty.workspace = true
 hir-ty-mir.workspace = true
 hir-ty-codegen.workspace = true
 hir-ty-borrowck.workspace = true
+rustc-symbols.workspace = true
 blaze-expand.workspace = true
 blaze-macro-wasm.workspace = true
 blaze-store.workspace = true
@@ -82,7 +83,7 @@ blaze-graph.workspace = true
 blaze-ids.workspace = true
 blaze-protocol.workspace = true
 ide-db.workspace = true
-ide-diagnostics.workspace = true
+blaze-diagnostics.workspace = true
 pulldown-cmark.workspace = true
 load-cargo.workspace = true
 proc-macro-api.workspace = true
@@ -101,13 +102,15 @@ flate2 = { version = "1.1.9", default-features = false, features = ["rust_backen
 zstd = "0.13.3"
 blaze-live = { path = "../blaze-live" }
 blaze-mem.workspace = true
+mimalloc.workspace = true
 # blaze's std::process for build scripts compiled for wasm32-wasip1; its runner with the
 # feature `wasi`.
 blaze-wasi = { path = "../blaze-wasi" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-tikv-jemallocator = "0.5.4"
+# The global allocator only under `heap-profile`.
+tikv-jemallocator = { version = "0.5.4", optional = true }
 
 
 [build-dependencies]
@@ -121,14 +124,13 @@ test-fixture.workspace = true
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
-mimalloc = { version = "0.1.46", default-features = false }
 find-msvc-tools = "0.1"
 uds_windows = "1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_Threading"] }
 
 [features]
-# Profile jemalloc's heap and count its live bytes: see `memory.rs`. Not on Windows.
-heap-profile = ["tikv-jemallocator/profiling", "blaze-cargo/heap-profile"]
+# Serve from jemalloc and profile its heap: see blaze-cargo's `memory.rs`. Not on Windows.
+heap-profile = ["dep:tikv-jemallocator", "tikv-jemallocator/profiling", "blaze-cargo/heap-profile"]
 
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm`.
 llvm = ["hir-ty-codegen/llvm", "blaze-cargo/llvm"]

@@ -163,7 +163,7 @@ mod stable;
 use blaze_store as store;
 pub use stable::{block_place, function_place, lower_declared, static_place};
 mod target;
-pub use target::{Arch, Calls, ObjectFormat, Target, UnwindFormat, VariableArguments};
+pub use target::{Arch, Calls, Features, ObjectFormat, Target, UnwindFormat, VariableArguments};
 pub mod tier;
 
 pub use patch::{OutOfDate, Stale, StaleSteps};
@@ -1607,7 +1607,7 @@ impl Rejections {
     /// them, which an edit is about to reach: as rustc built them, while no edit has.
     /// Asked before the edit.
     pub fn take_first_values(&mut self, db: &Db, crates: &[Crate]) {
-        let reached = crates.iter().flat_map(|it| it.transitive_rev_deps(db)).collect();
+        let reached = crates.iter().flat_map(|it| it.transitive_rev_deps(db).iter().copied()).collect();
         self.frozen.take_values(db, reached);
     }
 
@@ -1677,7 +1677,7 @@ impl Rejections {
         if !crates.is_empty() {
             self.forget_rustc();
         }
-        self.frozen.distrust(crates.iter().flat_map(|it| it.transitive_rev_deps(db)));
+        self.frozen.distrust(crates.iter().flat_map(|it| it.transitive_rev_deps(db).iter().copied()));
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place. Every
@@ -1685,7 +1685,7 @@ impl Rejections {
     pub fn touch(&mut self, db: &Db, crates: Option<&[Crate]>) {
         match crates {
             Some(crates) => {
-                self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db)))
+                self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db).iter().copied()))
             }
             None => self.frozen.edit(base_db::all_crates(db).iter().copied()),
         }
@@ -1700,7 +1700,7 @@ impl Rejections {
     /// them, but a first value of a static only of `includers`, the crates that read them,
     /// and of what depends on them.
     pub fn touch_included(&mut self, db: &Db, includers: &[Crate]) {
-        let values = includers.iter().flat_map(|it| it.transitive_rev_deps(db));
+        let values = includers.iter().flat_map(|it| it.transitive_rev_deps(db).iter().copied());
         self.frozen.edit_apart(base_db::all_crates(db).iter().copied(), values);
         for base in [&mut self.base, &mut self.rustc].into_iter().flatten() {
             base.touch(db, None);
@@ -1739,7 +1739,7 @@ impl Rejections {
         crates: &[Crate],
         files: &[base_db::FileId],
     ) {
-        self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db)));
+        self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db).iter().copied()));
         if let Some(base) = &mut self.base {
             base.touch(db, Some(crates));
         }
@@ -1894,7 +1894,9 @@ enum Callee<'db> {
     Pointer(Value, ExternAbi, Option<usize>),
 }
 
-/// How rustc's demangled symbols spell the types and instances of the program.
+/// How rustc's symbols spell the types and instances of the program, with each crate as the
+/// resolver's path for it (`name[hash]`), the key [`SymbolResolver::path`] finds rustc's symbol
+/// by. Not `hir_ty_mir::mir::type_name::rustc_symbol_type`, which writes what a backtrace shows.
 struct Spelling<'a, 'db> {
     db: &'db Db,
     // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
@@ -2106,14 +2108,10 @@ impl<'db> Spelling<'_, 'db> {
     fn symbol_type(&self, ty: Ty<'db>) -> Option<String> {
         use std::fmt::Write;
         let db = self.db;
+        if let Some(name) = hir_ty_mir::mir::type_name::scalar_name(ty) {
+            return Some(name.to_owned());
+        }
         Some(match ty.kind() {
-            TyKind::Bool => "bool".to_owned(),
-            TyKind::Char => "char".to_owned(),
-            TyKind::Str => "str".to_owned(),
-            TyKind::Never => "!".to_owned(),
-            TyKind::Int(it) => it.name_str().to_owned(),
-            TyKind::Uint(it) => it.name_str().to_owned(),
-            TyKind::Float(it) => it.name_str().to_owned(),
             TyKind::Ref(_, pointee, Mutability::Not) => format!("&{}", self.symbol_type(pointee)?),
             TyKind::Ref(_, pointee, Mutability::Mut) => {
                 format!("&mut {}", self.symbol_type(pointee)?)
@@ -2495,9 +2493,16 @@ impl Resolved {
     }
 }
 
-/// The code generator of the one [`Target`] the process compiles for.
+/// The code generator of the one [`Target`] the process compiles for, with the baseline's
+/// features: what reads the target's conventions, pointer width and registers, which no set
+/// of features changes, and v1's compiles.
 fn target() -> Result<&'static isa::OwnedTargetIsa> {
-    target_of(Isa::Usual, false)
+    target_of(Features::BASELINE, Isa::Usual, false)
+}
+
+/// [`target`] with `features`: what a function of that set is compiled with.
+pub(crate) fn target_with(features: Features) -> Result<&'static isa::OwnedTargetIsa> {
+    target_of(features, Isa::Usual, false)
 }
 
 /// Which of the process's code generators a function is compiled with.
@@ -2514,11 +2519,14 @@ enum Isa {
     FramePointer,
 }
 
-/// The code generator of a kind, at Cranelift's `opt_level=speed` for code no edit reaches
-/// (`speed`) and at `none` for the rest. Each is made once, the first time it is asked for.
-fn target_of(kind: Isa, speed: bool) -> Result<&'static isa::OwnedTargetIsa> {
+/// The code generator of a kind for the target features `features`, at Cranelift's
+/// `opt_level=speed` for code no edit reaches (`speed`) and at `none` for the rest. Each is
+/// made once, the first time it is asked for: a few per process, one per set a function is
+/// compiled with (the toolchains' and the `#[target_feature]` sets over them).
+fn target_of(features: Features, kind: Isa, speed: bool) -> Result<&'static isa::OwnedTargetIsa> {
     type Made = std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>>;
-    static TARGETS: [[Made; 3]; 2] = [const { [const { Made::new() }; 3] }; 2];
+    static TARGETS: [[[Made; 3]; 2]; target::MOST_FEATURE_SETS] =
+        [const { [const { [const { Made::new() }; 3] }; 2] }; target::MOST_FEATURE_SETS];
     let (regalloc, frame_pointers) = match kind {
         Isa::Usual => (regalloc(), false),
         Isa::Large => ("single_pass", false),
@@ -2529,8 +2537,8 @@ fn target_of(kind: Isa, speed: bool) -> Result<&'static isa::OwnedTargetIsa> {
     } else {
         cranelift_codegen::settings::OptLevel::None
     };
-    TARGETS[usize::from(speed)][kind as usize]
-        .get_or_init(|| Target::selected()?.isa(regalloc, frame_pointers, opt))
+    TARGETS[features.index()][usize::from(speed)][kind as usize]
+        .get_or_init(|| Target::selected()?.isa(features, regalloc, frame_pointers, opt))
         .as_ref()
         .map_err(|e| CodegenError::Backend(e.clone()))
 }
@@ -5088,6 +5096,13 @@ fn build<'db>(
         Some(body) => ub_checks_of(cg.db, compiling, body.owner.module(cg.db).krate(cg.db)),
         None => compiling,
     };
+    let dl = cg.db.target_data_layout(env.krate).map_err(|error| {
+        // alloc: error path
+        CodegenError::Refused(format!(
+            "crate `{}` has no target data layout to compile for: {error}",
+            fncache::crate_name(cg.db, env.krate)
+        ))
+    })?;
     // The build's tables (its locals, blocks, layouts, drop glue, registers and the rest of
     // `FunctionCx`) are in a frame of the worker's, reset when the build returns.
     let guarded = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| -> Result<bool> {
@@ -5096,6 +5111,7 @@ fn build<'db>(
             frame,
             body,
             env,
+            dl,
             infcx: interner.infer_ctxt().build(TypingMode::PostAnalysis),
             interner,
             builder: FunctionBuilder::new(&mut ctx.func, &mut builder_ctx),
@@ -5358,20 +5374,21 @@ impl cranelift_codegen::incremental_cache::CacheKvStore for IncrementalCache {
 #[cfg(test)]
 fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
     // alloc: none until the code's rows are written, then exactly that many: the test keeps them
-    emit_with(ctx, None, false, Relocs::default(), Vec::new())
+    emit_with(ctx, None, false, Features::BASELINE, Relocs::default(), Vec::new())
 }
 
 /// Runs Cranelift on a finished function: v2's compile (`v2/backend.rs`), at
 /// `opt_level=speed` when `speed` (code no edit reaches, the standard library's and
-/// dependencies', whose unit's key says so: `blaze_codegen::Backend::Cranelift { speed }`).
+/// dependencies', whose unit's key says so: `blaze_codegen::Backend::Cranelift { speed }`),
+/// with the function's target features (its unit's and its `#[target_feature]`'s).
 /// v2 keeps what it compiles in the back-end memo by the function's shape, which is its printed
 /// IR with names by place, so Cranelift's incremental cache would be a second key over the same
 /// IR (a serialization and hash of the whole function, and a lookup in v1's store) that the
 /// memo already missed on. It compiles with none. The relocations and line rows are written
 /// into the thread's kept lists ([`spare::relocs`], [`spare::lines`]), which v2's conversion
 /// gives back ([`spare::keep_relocs`], [`spare::keep_lines`]).
-fn emit_lent(ctx: &mut cranelift_codegen::Context, speed: bool) -> Result<Code> {
-    emit_with(ctx, None, speed, spare::relocs(), spare::lines())
+fn emit_lent(ctx: &mut cranelift_codegen::Context, speed: bool, features: Features) -> Result<Code> {
+    emit_with(ctx, None, speed, features, spare::relocs(), spare::lines())
 }
 
 /// [`emit_lent`]'s compile for v1's build (`Backend::emit`), into lists of its own (v1 keeps
@@ -5379,7 +5396,7 @@ fn emit_lent(ctx: &mut cranelift_codegen::Context, speed: bool) -> Result<Code> 
 /// store when there is one.
 fn emit_cached(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
     // alloc: none until the code's rows are written, then exactly that many: v1 keeps them
-    emit_with(ctx, store::Store::global(), false, Relocs::default(), Vec::new())
+    emit_with(ctx, store::Store::global(), false, Features::BASELINE, Relocs::default(), Vec::new())
 }
 
 /// Runs Cranelift on a finished function, with `store` as its incremental cache, writing its
@@ -5390,6 +5407,7 @@ fn emit_with(
     ctx: &mut cranelift_codegen::Context,
     store: Option<&'static store::Store>,
     speed: bool,
+    features: Features,
     relocs: Relocs,
     lines: Vec<LineRow>,
 ) -> Result<Code> {
@@ -5398,17 +5416,27 @@ fn emit_with(
     }
     let large = ctx.func.dfg.num_insts() > SINGLE_PASS;
     let kind = if large { Isa::Large } else { Isa::Usual };
-    let mut isa = &**target_of(kind, speed)?;
+    let mut isa = &**target_of(features, kind, speed)?;
     let func = &ctx.func;
+    // Cranelift reads the return address from the function's frame record, which only a
+    // function compiled to keep its frame pointer has (`core::intrinsics::return_address`).
+    let reads_return_address = || {
+        func.layout.blocks().any(|block| {
+            func.layout
+                .block_insts(block)
+                .any(|inst| func.dfg.insts[inst].opcode() == ir::Opcode::GetReturnAddress)
+        })
+    };
     if !isa.flags().preserve_frame_pointers()
         && (backend::frame_pointers()
             || func.layout.entry_block().is_some_and(|entry| {
                 func.layout
                     .block_insts(entry)
                     .any(|inst| func.dfg.insts[inst].opcode() == ir::Opcode::GetFramePointer)
-            }))
+            })
+            || reads_return_address())
     {
-        isa = &**target_of(Isa::FramePointer, speed)?;
+        isa = &**target_of(features, Isa::FramePointer, speed)?;
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match store {
@@ -8415,6 +8443,8 @@ struct FunctionCx<'cx, 'db> {
     /// `None` while generating a shim that has no MIR.
     body: Option<&'db MirBody<'db>>,
     env: ParamEnvAndCrate<'db>,
+    /// The target layout of `env.krate`, read once in [`build`]: a crate without one stops it.
+    dl: &'db rustc_abi::TargetDataLayout,
     infcx: InferCtxt<'db>,
     interner: DbInterner<'db>,
     builder: FunctionBuilder<'cx>,
@@ -9761,7 +9791,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn dl(&self) -> &'db rustc_abi::TargetDataLayout {
-        self.cg.db.target_data_layout_or_default(self.env.krate)
+        self.dl
     }
 
     fn push_abi_params(&self, mode: PassMode, params: &mut Vec<AbiParam>) {
@@ -10043,9 +10073,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().stack_addr(ptr(), slot, 0)
     }
 
-    /// Storage for a temporary that is borrowed for `'static`. The function writes the same
-    /// constant there every time it runs.
-    // FIXME: evaluate the constant and make this read-only data.
+    /// Storage for a temporary that is borrowed for `'static` and that [`Self::promoted_constant`]
+    /// could not evaluate: one with a place in the source inside it that is not the whole of
+    /// it, or one const eval refused. The function writes the same constant there every time
+    /// it runs, so it is writable data, which a v2 unit refuses (`v2/places.rs`).
     fn promoted_slot(&mut self, layout: &Layout) -> Result<Value> {
         let align = layout.align.abi.bytes();
         if layout.size.bytes() == 0 {
@@ -10065,7 +10096,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// The read-only data a promoted `&expr` points to, when `expr` can be evaluated now.
     /// Equal constants share an address, as they do for rustc. A type that is not `plain` is
-    /// promoted when the value is: a `None` of an `Option<Box<T>>` has nothing to drop.
+    /// promoted when the value is: a `None` of an `Option<Box<T>>` has nothing to drop. A
+    /// `file!()` or a `concat!` with it is made here, where it is written, since const eval sees
+    /// only the path's placeholder.
     fn promoted_constant(
         &mut self,
         body: &'db MirBody<'db>,
@@ -10074,8 +10107,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         plain: bool,
     ) -> Option<Value> {
         let db = self.cg.db;
-        if layout.size.bytes() == 0 || self.mentions_location(promoted.owner, promoted.expr) {
+        if layout.size.bytes() == 0 {
             return None;
+        }
+        if self.mentions_location(promoted.owner, promoted.expr) {
+            return self.builtin_location(promoted.owner, promoted.expr).ok().flatten();
         }
         let constant = monomorphized_promoted_mir_body_query(
             db,
@@ -10563,7 +10599,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             let addr = if let Some(promoted) = promoted {
-                let plain = self.is_plain(data.ty.as_ref());
+                let ty = data.ty.as_ref();
+                let plain = self.is_plain(ty);
                 match self.promoted_constant(body, promoted, &layout, plain) {
                     Some(addr) => {
                         self.constant_locals.push(local);
@@ -11166,7 +11203,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             OperandKind::Constant { konst, ty } => {
                 let ty = ty.as_ref();
                 if let Some((owner, expr)) = self.written_expr(operand.span())
-                    && let Some(addr) = self.builtin_location(owner, expr, ty)?
+                    && let Some(addr) = self.builtin_location(owner, expr)?
                 {
                     return Ok((addr, ty));
                 }
@@ -11191,7 +11228,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let allocation = allocation.as_ref();
                 let ty = allocation.ty;
                 if let Some((owner, expr)) = self.written_expr(operand.span())
-                    && let Some(addr) = self.builtin_location(owner, expr, ty)?
+                    && let Some(addr) = self.builtin_location(owner, expr)?
                 {
                     return Ok((addr, ty));
                 }
@@ -13284,13 +13321,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
     }
 
-    /// Whether `expr` of the body of `owner` is what `line!()`, `column!()` or `file!()`
-    /// expanded to, and the expansion it is in.
-    fn location_macro(
-        &self,
-        owner: InferBodyId<'db>,
-        expr: ExprId,
-    ) -> Option<(BuiltinFnLikeExpander, HirFileId)> {
+    /// Whether `expr` of the body of `owner` is what `file!()` expanded to, and the expansion
+    /// it is in.
+    fn location_macro(&self, owner: InferBodyId<'db>, expr: ExprId) -> Option<HirFileId> {
         let InferBodyId::DefWithBodyId(owner) = owner else { return None };
         location_macros(self.cg.db, owner).get(&expr).copied()
     }
@@ -13310,9 +13343,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         found
     }
 
-    /// The `&str` of a literal that a `concat!` with `line!()`, `column!()` or `file!()`
-    /// among its arguments expanded to, in the body of `owner`: the expansion has their
-    /// placeholders in it.
+    /// The `&str` of a literal that a `concat!` with `file!()` among its arguments expanded
+    /// to, in the body of `owner`: the expansion has the path's placeholder in it, so the
+    /// arguments are read again, `line!()` and `column!()` among them.
     fn located_concat(&mut self, owner: InferBodyId<'db>, expr: ExprId) -> Result<Option<Value>> {
         let db = self.cg.db;
         let InferBodyId::DefWithBodyId(owner) = owner else { return Ok(None) };
@@ -13347,45 +13380,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(Some(self.builder.ins().symbol_value(ptr(), text)))
     }
 
-    /// The value of a literal that `line!()`, `column!()` or `file!()` expanded to.
-    /// rust-analyzer expands them to placeholders, since a real value would make every body
-    /// below an edit change.
-    fn builtin_location(
-        &mut self,
-        owner: InferBodyId<'db>,
-        expr: ExprId,
-        ty: Ty<'db>,
-    ) -> Result<Option<Value>> {
+    /// The `&str` of a literal that `file!()`, or a `concat!` with it, expanded to, in the body
+    /// of `owner`: the address of read-only data, which a `'static` borrow of a promoted one
+    /// may outlive the call with. The expansion has a placeholder for the path, which is the
+    /// build's rule's; `line!()` and `column!()` expand to their values.
+    fn builtin_location(&mut self, owner: InferBodyId<'db>, expr: ExprId) -> Result<Option<Value>> {
         let db = self.cg.db;
         if let Some(text) = self.located_concat(owner, expr)? {
             return Ok(Some(text));
         }
-        let Some((expander, file_id)) = self.location_macro(owner, expr) else {
+        let Some(file_id) = self.location_macro(owner, expr) else {
             return Ok(None);
         };
         let Some(site) = written_call(db, file_id) else { return Ok(None) };
         let range = InFile::new(site.file_id, written_range(&site.value));
         let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
-        let Some((file, line, col)) = macro_location_of(db, file_id.into(), range) else {
+        let Some((file, _, _)) = macro_location_of(db, file_id.into(), range) else {
             return Ok(None);
         };
-        let number = match expander {
-            BuiltinFnLikeExpander::Line => line,
-            BuiltinFnLikeExpander::Column => col,
-            _ => {
-                let path = self.cg.file_path(file);
-                let path = self.cg.declare_data_in_func(path, self.builder.func);
-                return Ok(Some(self.builder.ins().symbol_value(ptr(), path)));
-            }
-        };
-        if !matches!(ty.kind(), TyKind::Uint(UintTy::U32)) {
-            return Ok(None);
-        }
-        let layout = self.layout(ty)?;
-        let addr = self.stack_slot(&layout);
-        let value = self.builder.ins().iconst(types::I32, number as i64);
-        self.builder.ins().store(MEM, value, addr, 0);
-        Ok(Some(addr))
+        let path = self.cg.file_path(file);
+        let path = self.cg.declare_data_in_func(path, self.builder.func);
+        Ok(Some(self.builder.ins().symbol_value(ptr(), path)))
     }
 
     /// Tells `overlap` which of the slots of `shareable` and of the locals kept in registers
@@ -17005,17 +17020,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let value = self.caller_location()?;
                 self.builder.ins().store(MEM, value, dst, 0);
             }
-            // Cranelift finds the return address from the frame record, which only a function
-            // that keeps a frame pointer has.
+            // LLVM gives it as `llvm.returnaddress(0)`; Cranelift compiles a function that
+            // reads it keeping its frame pointer (`emit_with`).
             (I::ReturnAddress, []) => {
                 if Target::current().is_wasm() {
                     unsupported!("`return_address` on WebAssembly, which has no return address");
-                }
-                if !backend::frame_pointers() && !target()?.flags().preserve_frame_pointers() {
-                    unsupported!(
-                        "`return_address` needs frame pointers under Cranelift, and this unit \
-                         keeps none"
-                    );
                 }
                 let value = self.builder.ins().get_return_address(ptr());
                 self.builder.ins().store(MEM, value, dst, 0);
@@ -20610,6 +20619,30 @@ mod tests {
         assert_eq!(loads, [i64, i64, i32, i32]);
         let mut ctx = cranelift_codegen::Context::for_function(func);
         assert!(super::emit(&mut ctx).unwrap().relocs.is_empty());
+    }
+
+    /// A function that reads its return address, as the fuzz engine's comparison callbacks do,
+    /// compiles in a unit that keeps no frame pointers: it alone keeps one.
+    #[test]
+    fn a_function_reading_its_return_address_keeps_its_frame_pointer() {
+        if super::Target::current().is_wasm() {
+            return;
+        }
+        let isa = super::target().unwrap();
+        let pointer = isa.pointer_type();
+        let mut sig = ir::Signature::new(isa.default_call_conv());
+        sig.returns.push(AbiParam::new(pointer));
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+        let entry = builder.create_block();
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let address = builder.ins().get_return_address(pointer);
+        builder.ins().return_(&[address]);
+        builder.finalize(isa.frontend_config());
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        assert!(!super::emit(&mut ctx).unwrap().bytes.is_empty());
     }
 
     /// `ub_checks()` is what rustc makes it: in core, alloc and std the compiling crate's

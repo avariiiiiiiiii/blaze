@@ -152,6 +152,11 @@ impl Db {
         self.files.has_file_text(file_id)
     }
 
+    /// [`Files::new_file_id`]: where a caller that numbers its own files takes each new one.
+    pub fn new_file_id(&mut self) -> Option<FileId> {
+        self.files.new_file_id()
+    }
+
     pub fn set_file_text(&mut self, file_id: FileId, text: &str) {
         let files = Arc::clone(&self.files);
         files.set_file_text(self, file_id, text);

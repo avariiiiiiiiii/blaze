@@ -4,7 +4,7 @@
 //!
 //! | lifetime | allocator |
 //! |---|---|
-//! | a task (one query run, one codegen unit, one stencil emit) | [`Frame`]: a bump pointer per worker over a reserved [`Region`], with [`Marker`]s and reset; [`frame::task`] hands each task one |
+//! | a task (one query run, one codegen unit, one stencil emit) | [`Frame`]: a bump pointer over a chain of 2 MB chunks and spans, a frame per task (an inner task starts in the rest of its outer task's chunk), with [`Marker`]s and reset; [`frame::task`] hands each task one |
 //! | a request (an edit, a build, a test run) | [`Arena`]: chunked, shared by the request's tasks, each bumping in blocks of its own through an [`ArenaLocal`] |
 //! | a view's revision | [`Revisions`]: two arenas, the next revision built while the current one is read, the old one reused once no task can still read it ([`blaze_reclaim`]) |
 //! | fixed-size objects that come and go across workers | [`Pool`]: a slab per type with free lists, a worker's [`Cache`] in front, refilled and returned 64 at a time |

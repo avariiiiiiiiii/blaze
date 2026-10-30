@@ -12,17 +12,18 @@ use blaze_items::CodeHash;
 use blaze_mem::{Frame, Tag, frame};
 
 use crate::{
-    Covered, Line, Reloc, Relocs,
+    Covered, Line, ProfileRecord, Profiled, Reloc, Relocs,
     content::{arch_of, arch_tag},
     relocs::RelocsView,
     fold::{Constant, Masked},
     template::{
         DataView, Ref, StaticTemplate, Template, TemplateData, TemplateInit, TemplateUnwind, TemplateView, UnwindView,
     },
+    wasm,
 };
 
-const TEMPLATE_MAGIC: [u8; 4] = *b"BZT4";
-const STATIC_MAGIC: [u8; 4] = *b"BZS2";
+const TEMPLATE_MAGIC: [u8; 4] = *b"BZT5";
+const STATIC_MAGIC: [u8; 4] = *b"BZS3";
 
 /// Why bytes are not a template.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -83,6 +84,9 @@ fn put_relocs(out: &mut Vec<u8>, relocs: &Relocs<Ref>) {
                 out.put_u8(4);
                 out.put_u32(array);
             }
+            Ref::Counter => out.put_u8(5),
+            Ref::ProfileCounters => out.put_u8(6),
+            Ref::Own => out.put_u8(7),
         }
     }
     put_len(out, relocs.wide().len());
@@ -158,13 +162,34 @@ fn put_coverage(out: &mut Vec<u8>, covered: Option<&Covered>) {
     }
 }
 
+fn put_profile(out: &mut Vec<u8>, profiled: Option<&Profiled>) {
+    match profiled {
+        None => out.put_u8(0),
+        Some(Profiled::Counted(ProfileRecord { name, name_ref, hash, counters, version })) => {
+            out.put_u8(1);
+            out.put_bytes(name);
+            out.put_u64(*name_ref);
+            out.put_u64(*hash);
+            out.put_u32(*counters);
+            out.put_u64(*version);
+        }
+        Some(Profiled::Used { mismatched }) => {
+            out.put_u8(2);
+            out.put_u8(u8::from(*mismatched));
+        }
+    }
+}
+
+/// The bytes [`put_profile`] writes of a [`Profiled::Counted`], after its tag.
+const RECORD_BYTES: usize = 16 + 8 + 8 + 4 + 8;
+
 /// A template's fields read off a [`Reader`], each tag checked against what it can be.
 struct In<'a>(Reader<'a>);
 
 /// The bytes of one relocation row and one wide addend, and the least one reference and one
 /// data object take: what bounds a count.
 const RELOC_BYTES: usize = 16;
-const REF_BYTES: usize = 1 + 4;
+const REF_BYTES: usize = 1;
 const WIDE_BYTES: usize = 4 + 8;
 const LINE_BYTES: usize = 4 + 32 + 4;
 const DATA_BYTES: usize = 4 + 4 + 4 + 4 + 4;
@@ -183,6 +208,24 @@ impl<'a> In<'a> {
     fn bytes(&mut self) -> Result<Vec<u8>, BlobError> {
         let len = self.0.count_u32(1)?;
         Ok(self.0.take(len)?.to_vec()) // alloc: the template owns its bytes
+    }
+
+    /// A `u32` length, then that many bytes of UTF-8.
+    fn string(&mut self) -> Result<String, BlobError> {
+        let at = self.0.at();
+        // alloc: the template owns its names, moved out of the bytes read for them
+        String::from_utf8(self.bytes()?).map_err(|_| BlobError { at, what: "a name that is not UTF-8" })
+    }
+
+    /// A `u32` length, then that many wasm value types, a byte each.
+    fn values(&mut self) -> Result<Vec<wasm::ValType>, BlobError> {
+        let at = self.0.at();
+        let bytes = self.slice()?;
+        // alloc: the template owns its types
+        bytes
+            .iter()
+            .map(|&it| wasm::ValType::from_byte(it).ok_or(BlobError { at, what: "no such wasm value type" }))
+            .collect()
     }
 
     /// A `u32` length, then that many bytes, borrowed from the blob.
@@ -208,6 +251,9 @@ impl<'a> In<'a> {
                 array if array < Covered::ARRAYS => Ref::Coverage(array),
                 _ => return self.fail("no such coverage array"),
             },
+            5 => Ref::Counter,
+            6 => Ref::ProfileCounters,
+            7 => Ref::Own,
             _ => return self.fail("no such reference"),
         })
     }
@@ -341,6 +387,21 @@ impl<'a> In<'a> {
         Ok(Some(Covered { counters, flags, guards, pcs }))
     }
 
+    fn profile(&mut self) -> Result<Option<Profiled>, BlobError> {
+        Ok(match self.0.u8()? {
+            0 => None,
+            1 => Some(Profiled::Counted(ProfileRecord {
+                name: *self.0.array()?,
+                name_ref: self.0.u64()?,
+                hash: self.0.u64()?,
+                counters: self.0.u32()?,
+                version: self.0.u64()?,
+            })),
+            2 => Some(Profiled::Used { mismatched: self.bool()? }),
+            _ => return self.fail("no such profile"),
+        })
+    }
+
     fn magic(&mut self, magic: [u8; 4]) -> Result<(), BlobError> {
         if *self.0.array::<4>()? != magic {
             return self.fail("another kind of blob, or another version of this one");
@@ -381,6 +442,7 @@ pub fn encode(template: &Template) -> Vec<u8> {
         out.put_bytes_u32(name.as_bytes());
     }
     put_coverage(&mut out, template.coverage.as_ref());
+    put_profile(&mut out, template.profile.as_ref());
     debug_assert_eq!(out.len(), encoded_len(template));
     out
 }
@@ -391,7 +453,8 @@ fn encoded_len(template: &Template) -> usize {
     let relocs = |relocs: &Relocs<Ref>| {
         let targets = relocs.targets().iter().map(|it| match it {
             Ref::Position(_) => 1 + 32 + 4,
-            Ref::Place(_) | Ref::Data(_) | Ref::Extern(_) | Ref::Coverage(_) => REF_BYTES,
+            Ref::Place(_) | Ref::Data(_) | Ref::Extern(_) | Ref::Coverage(_) => 1 + 4,
+            Ref::Counter | Ref::ProfileCounters | Ref::Own => 1,
         });
         4 + RELOC_BYTES * relocs.len() + 4 + targets.sum::<usize>() + 4 + WIDE_BYTES * relocs.wide().len()
     };
@@ -409,6 +472,11 @@ fn encoded_len(template: &Template) -> usize {
         None => 1,
         Some(covered) => 1 + 3 * 4 + 4 + covered.pcs.len() * (4 + 8),
     };
+    let profile = match &template.profile {
+        None => 1,
+        Some(Profiled::Counted(_)) => 1 + RECORD_BYTES,
+        Some(Profiled::Used { .. }) => 1 + 1,
+    };
     TEMPLATE_MAGIC.len()
         + 1
         + 4
@@ -425,6 +493,7 @@ fn encoded_len(template: &Template) -> usize {
         + 4
         + externs
         + coverage
+        + profile
 }
 
 /// The template in `bytes`, borrowed from them, its lists in `frame`: what instantiating a
@@ -463,6 +532,7 @@ pub fn decode_view<'a>(bytes: &'a [u8], frame: &'a Frame) -> Result<TemplateView
     }
     // alloc: its PC table, which the function made of the view takes as it is
     let coverage = input.coverage()?;
+    let profile = input.profile()?;
     input.end()?;
     Ok(TemplateView {
         arch,
@@ -477,6 +547,7 @@ pub fn decode_view<'a>(bytes: &'a [u8], frame: &'a Frame) -> Result<TemplateView
         refs,
         externs: externs.leak(),
         coverage,
+        profile,
     })
 }
 
@@ -510,6 +581,16 @@ pub fn encode_static(template: &StaticTemplate) -> Vec<u8> {
         }
         None => out.put_u8(0),
     }
+    out.put_u32(template.imports.len() as u32);
+    for (name, import) in &template.imports {
+        out.put_bytes_u32(name.as_bytes());
+        out.put_bytes_u32(import.module.as_bytes());
+        out.put_bytes_u32(import.field.as_bytes());
+        for values in [&import.ty.params, &import.ty.results] {
+            // alloc: per import of a static, its types as bytes
+            out.put_bytes_u32(&values.iter().map(|&it| it as u8).collect::<Vec<u8>>());
+        }
+    }
     out.put_u32(template.refs);
     out
 }
@@ -537,9 +618,19 @@ pub fn decode_static(bytes: &[u8]) -> Result<StaticTemplate, BlobError> {
         },
         false => None,
     };
+    let count = input.0.count_u32(4 * 5)?;
+    let mut imports = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = input.string()?;
+        let module = input.string()?;
+        let field = input.string()?;
+        let params = input.values()?;
+        let results = input.values()?;
+        imports.push((name, wasm::Import { module, field, ty: wasm::Signature { params, results } }));
+    }
     let refs = input.0.u32()?;
     input.end()?;
-    Ok(StaticTemplate { align, init, data, mutable, thread_local, section, refs })
+    Ok(StaticTemplate { align, init, data, mutable, thread_local, section, imports, refs })
 }
 
 const MASKED_MAGIC: [u8; 4] = *b"BZM1";
@@ -644,6 +735,9 @@ mod tests {
                 reloc(Ref::Position(SpanRef { anchor: ContentId([4; 32]), index: 9 }), -8),
                 reloc(Ref::Extern(0), -8),
                 reloc(Ref::Coverage(2), i64::MIN),
+                reloc(Ref::Counter, 8),
+                reloc(Ref::ProfileCounters, 16),
+                reloc(Ref::Own, 24),
                 reloc(Ref::Place(2), 0),
             ]
             .into(),
@@ -663,6 +757,13 @@ mod tests {
             refs: 3,
             externs: vec!["bcmp".to_owned()],
             coverage: Some(Covered { counters: 2, flags: 0, guards: 8, pcs: vec![(0, 1), (4, 0)] }),
+            profile: Some(Profiled::Counted(ProfileRecord {
+                name: [8; 16],
+                name_ref: 1 << 60,
+                hash: 3,
+                counters: 5,
+                version: 10,
+            })),
         }
     }
 
@@ -693,6 +794,17 @@ mod tests {
             mutable: true,
             thread_local: true,
             section: Some("__DATA,__mod_init_func".to_owned()),
+            imports: vec![(
+                "fd_write".to_owned(),
+                crate::wasm::Import {
+                    module: "wasi_snapshot_preview1".to_owned(),
+                    field: "fd_write".to_owned(),
+                    ty: crate::wasm::Signature {
+                        params: vec![crate::wasm::ValType::I32; 4],
+                        results: vec![crate::wasm::ValType::I32],
+                    },
+                },
+            )],
             refs: 0,
         };
         let bytes = encode_static(&template);
@@ -766,13 +878,16 @@ mod tests {
     #[test]
     fn encode_writes_into_one_allocation_of_its_length() {
         let windows = TemplateUnwind::Windows { info: vec![1, 2], handler: Some(1), lsda: None };
+        let profiles = [template().profile, Some(Profiled::Used { mismatched: true }), None];
         for unwind in [template().unwind, Some(windows), None] {
             for coverage in [template().coverage, None] {
-                let template = Template { unwind: unwind.clone(), coverage, ..template() };
-                let (bytes, used) = blaze_alloc_count::measure(|| encode(&template));
-                assert_eq!(bytes.len(), encoded_len(&template));
-                assert_eq!(used.allocations, 1);
-                assert_eq!(decode(&bytes).expect("decoded"), template);
+                for profile in profiles {
+                    let template = Template { unwind: unwind.clone(), coverage: coverage.clone(), profile, ..template() };
+                    let (bytes, used) = blaze_alloc_count::measure(|| encode(&template));
+                    assert_eq!(bytes.len(), encoded_len(&template));
+                    assert_eq!(used.allocations, 1);
+                    assert_eq!(decode(&bytes).expect("decoded"), template);
+                }
             }
         }
     }

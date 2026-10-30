@@ -47,6 +47,7 @@ fn output(incremental: bool) -> Output {
         tags: 1 << 32,
         windows_subsystem: false,
         dev_run: None,
+        exec_log: false,
         triple: "x86_64-unknown-linux-gnu".into(),
         stack: None,
     }
@@ -69,6 +70,7 @@ fn function(n: u8, code: &[u8], relocs: Vec<blaze_codegen::Relocation>) -> Compi
         unwind: None,
         lines: Vec::new(),
         coverage: None,
+        profile: None,
     }
 }
 
@@ -424,6 +426,74 @@ fn a_rollback_gives_back_the_file_before_the_commit() {
 }
 
 #[test]
+fn bytes_gives_the_file_a_commit_writes_and_rolls_back_like_one() {
+    let (start, g) = program(Target::Function);
+    let g2 = function(3, &returns(2), Vec::new());
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let mut kept = Image::new(name(TO), output(true)).unwrap();
+    let mut disk = Disk::default();
+    let as_file = |bytes: &[u8]| {
+        let mut file = Sparse::default();
+        file.write(0, bytes);
+        file
+    };
+
+    disk.link(&mut image, first(&start, &g)).unwrap();
+    let staged = kept.stage(first(&start, &g)).unwrap();
+    let len = staged.len();
+    let full = kept.bytes(staged).unwrap();
+    assert_eq!(full.len() as u64, len);
+    assert!(as_file(&full).same(disk.file(TO)), "a full link's bytes are its file's");
+    assert_eq!(kept.generation(), image.generation());
+
+    disk.link(&mut image, edit(&g2)).unwrap();
+    let edited = kept.stage(edit(&g2)).unwrap();
+    let edited = kept.bytes(edited).unwrap();
+    assert!(as_file(&edited).same(disk.file(TO)), "an incremental link's bytes are the whole file");
+
+    let mut rolled = Disk::default();
+    rolled.files.insert(name(TO), as_file(&edited));
+    let mut effects = Vec::new();
+    kept.roll_back(&mut effects).unwrap();
+    assert_eq!(rolled.run(&mut kept, effects), Ok(1), "bytes keeps the history a commit keeps");
+    assert!(rolled.file(TO).same(&as_file(&full)), "the rollback gives back the first link's file");
+    let again = kept.stage(edit(&g2)).unwrap();
+    assert!(kept.bytes(again).is_ok(), "the edit applies again after the rollback");
+
+    let tables = kept.tables();
+    let relocations = tables.iter().find(|it| it.0 == "relocation").expect("a relocation table");
+    assert!(relocations.1 >= 1 && relocations.2 >= relocations.1, "{tables:?}");
+}
+
+#[test]
+fn a_function_instrumented_for_pgo_is_refused_until_the_link_places_its_counters() {
+    let (start, g) = program(Target::Function);
+    let record = blaze_codegen::ProfileRecord { name: [7; 16], name_ref: 1, hash: 2, counters: 1, version: 10 };
+    let counted = CompiledFunction { profile: Some(blaze_codegen::Profiled::Counted(record)), ..g.clone() };
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let error = image.stage(first(&start, &counted)).err().expect("an instrumented function is refused");
+    assert_eq!(error.function, Some(key(2)));
+    assert!(error.what.contains("-Cprofile-generate"), "{error}");
+
+    let naming = function(2, &returns(1), vec![rel32(1, Target::ProfileCounters)]);
+    let error = image.stage(first(&start, &naming)).err().expect("naming PGO counters is refused");
+    assert_eq!(error.function, Some(key(2)));
+}
+
+#[test]
+fn bytes_refuses_a_live_link_that_tells_running_programs() {
+    let (start, g) = program(Target::Function);
+    let g2 = function(3, &returns(2), Vec::new());
+    let mut image = Image::new(name(TO), live()).unwrap();
+    let staged = image.stage(first(&start, &g)).unwrap();
+    assert!(image.bytes(staged).is_ok(), "the first link tells no program");
+    let staged = image.stage(edit(&g2)).unwrap();
+    let error = image.bytes(staged).unwrap_err();
+    assert!(error.what.contains("tells running programs"), "{error}");
+    assert_eq!(image.generation(), 1, "a refused link leaves the image as it was");
+}
+
+#[test]
 fn a_commit_that_fails_leaves_the_image_as_it_was() {
     let (start, g) = program(Target::Function);
     let g2 = function(3, &returns(2), Vec::new());
@@ -749,6 +819,7 @@ fn start_and_stop_symbols_bound_a_named_section() {
         mutable: false,
         thread_local: false,
         section: Some("linkme_ITEMS".into()),
+        imports: Vec::new(),
     };
     let (one, two) = (item(10, 1), item(11, 2));
     // `lea rax, [rip + start]; lea rcx, [rip + stop]; ret`
@@ -1017,7 +1088,15 @@ fn slot_and_generation_allocate_nothing() {
 
 mod ties;
 
+mod counter;
+
+mod wasm_imports;
+
 mod dev_run;
+
+mod natives;
+
+mod premap;
 
 /// The state's columns, read and written as a stage does.
 mod columns {

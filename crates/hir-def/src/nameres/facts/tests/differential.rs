@@ -149,6 +149,10 @@ const NAMERES: &[(&str, &str)] = sources![
     "tests/macros.rs",
     "tests/mod_resolution.rs",
     "tests/paths.rs",
+    "tests/primitive_shadow.rs",
+    "tests/trait_imports.rs",
+    "tests/uses.rs",
+    "tests/views.rs",
     "tests/worklist.rs",
 ];
 

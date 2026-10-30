@@ -11,7 +11,7 @@ use super::tokens::{Ids, Kind, Punct, Tokens, Tt};
 
 /// The `expr`s of `$x:expr` in the body of a definition (matchers and transcribers alike), each
 /// in its token's edition.
-pub(super) fn exprs(tokens: &Tokens) -> Vec<TextRange> {
+pub(super) fn exprs(tokens: &Tokens<'_>) -> Vec<TextRange> {
     // alloc: empty until a lint fires; holds only what fires
     let mut out = Vec::new();
     walk(tokens, tokens.top, &mut out);
@@ -20,7 +20,7 @@ pub(super) fn exprs(tokens: &Tokens) -> Vec<TextRange> {
 
 /// `check_tokens`: `$`, an identifier, `:` and the specifier, as rustc's token cursor sees them
 /// (a group is one tree, after which nothing is pending).
-fn walk(tokens: &Tokens, tts: Ids, out: &mut Vec<TextRange>) {
+fn walk(tokens: &Tokens<'_>, tts: Ids, out: &mut Vec<TextRange>) {
     let (mut dollar, mut ident, mut colon) = (false, false, false);
     for tt in tokens.get(tts) {
         match tt {
@@ -52,14 +52,17 @@ fn walk(tokens: &Tokens, tts: Ids, out: &mut Vec<TextRange>) {
 
 #[cfg(test)]
 mod tests {
-    use syntax::{AstNode, SourceFile, ast};
+    use syntax::{
+        SourceFile,
+        view::{self as ast, AstNode as _},
+    };
 
     use super::*;
 
     fn linted(text: &str, edition: Edition) -> Vec<String> {
-        let file = SourceFile::parse(text, edition).tree();
-        let def = file.syntax().descendants().find_map(ast::Macro::cast).unwrap();
-        let tokens = Tokens::of(&def, &|_| (edition, true)).unwrap();
+        let file = SourceFile::parse(text, edition);
+        let def = file.root().descendants().find_map(ast::Macro::cast).unwrap();
+        let tokens = Tokens::of(def, &|_| (edition, true)).unwrap();
         exprs(&tokens).into_iter().map(|it| format!("{:?}", it)).collect()
     }
 

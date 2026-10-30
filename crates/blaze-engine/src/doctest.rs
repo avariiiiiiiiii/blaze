@@ -457,28 +457,31 @@ struct OfTheCrate {
 
 impl OfTheCrate {
     fn read(db: &RootDatabase, krate: hir::Crate) -> OfTheCrate {
-        use syntax::{AstNode, SyntaxKind, ast};
+        use syntax::{NodeOrToken, SyntaxKind, view as ast};
+        fn before(node: ast::Node<'_>) -> Option<&str> {
+            let mut prev = node.prev_sibling_or_token();
+            while prev.is_some_and(|it| it.kind().is_trivia()) {
+                prev = prev.and_then(|it| it.prev_sibling_or_token());
+            }
+            prev.map(|it| match it {
+                NodeOrToken::Node(it) => it.text(),
+                NodeOrToken::Token(it) => it.text(),
+            })
+        }
         let root = krate.root_file(db);
-        let file = ast::SourceFile::parse(db.file_text(root).text(db), Edition::CURRENT).tree();
+        let parse = syntax::SourceFile::parse(db.file_text(root).text(db), Edition::CURRENT);
         let mut of_the_crate = OfTheCrate::default();
-        let trees = file.syntax().descendants().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE);
+        let trees = parse.root().descendants().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE);
         // `test(..)` directly inside `doc(..)` of an attribute of the file itself.
         for tree in trees {
-            let before = |node: &syntax::SyntaxNode| {
-                let mut prev = node.prev_sibling_or_token();
-                while prev.as_ref().is_some_and(|it| it.kind().is_trivia()) {
-                    prev = prev.and_then(|it| it.prev_sibling_or_token());
-                }
-                prev.map(|it| it.to_string())
-            };
             let outer = tree.parent().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE);
-            let in_doc = outer.as_ref().is_some_and(|it| before(it).as_deref() == Some("doc"));
-            if before(&tree).as_deref() != Some("test") || !in_doc {
+            let in_doc = outer.is_some_and(|it| before(it) == Some("doc"));
+            if before(tree) != Some("test") || !in_doc {
                 continue;
             }
             for inner in tree.children().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE) {
-                if before(&inner).as_deref() == Some("attr") {
-                    let text = inner.text().to_string();
+                if before(inner) == Some("attr") {
+                    let text = inner.text();
                     of_the_crate.attrs.extend(split_attrs(&text[1..text.len() - 1]));
                 }
             }
@@ -813,6 +816,7 @@ fn plan(
     krate: hir::Crate,
     tests: &[Test],
     target: &str,
+    files: &mut Vec<vfs::FileId>,
 ) -> (Vec<Plan>, Option<PathBuf>) {
     let refused = |why: &str| tests.iter().map(|_| Plan::Refused(why.to_owned())).collect();
     let wanted: Vec<usize> = (0..tests.len()).filter(|&at| !tests[at].is_ignored(target)).collect();
@@ -826,7 +830,11 @@ fn plan(
     };
     let mut plans: Vec<Plan> = refused("blaze could not add it to the workspace");
     let mixing = with_another_copy(db, krate);
-    for (at, example) in add_crates(db, asked, krate, tests, &wanted) {
+    let added = match add_crates(db, asked, krate, tests, &wanted, files) {
+        Ok(added) => added,
+        Err(why) => return (refused(&why), None),
+    };
+    for (at, example) in added {
         let test = &tests[at];
         let source = &test.program.source;
         let names = |name: &String| {
@@ -852,115 +860,89 @@ fn plan(
     (plans, Some(unit))
 }
 
-/// What blaze's front end finds in an example's file. Where the program denies lints, as
-/// `#![doc(test(attr(deny(warnings))))]` has it do, a warning or a use of something
-/// deprecated is an error too: rustc has lints rust-analyzer does not.
+/// What blaze-diagnostics finds in an example's crate: the errors rustc gives, and what blaze
+/// cannot check, which refuses the example as an error would. Where the program denies lints,
+/// as `#![doc(test(attr(deny(warnings))))]` has it do, a use of something deprecated is an
+/// error too, which blaze-diagnostics does not give yet.
 #[derive(Default)]
 struct Found {
-    /// The errors as rustc would give them too, by code ([`crate::SURE`], the borrow
-    /// checker's, the lints a source denies), with what they say.
-    sure: Vec<(String, String)>,
-    /// The errors rust-analyzer finds where rustc need not.
-    unsure: Vec<(String, String)>,
-    /// Why a body was not borrow checked: an error rustc's borrow checker gives in it is not
-    /// found.
-    unchecked: Vec<String>,
+    /// rustc's errors, each by its code (an error's, a lint's name, or empty for none), with
+    /// what it says.
+    errors: Vec<(String, String)>,
+    /// What blaze cannot check, as its errors say it ("blaze cannot borrow-check ...").
+    cannot: Vec<String>,
     deprecated: bool,
 }
 
 impl Found {
     fn in_file(db: &RootDatabase, file: vfs::FileId, denies_lints: bool) -> Found {
-        use ide_db::Severity;
-        let config = ide_diagnostics::DiagnosticsConfig::test_sample();
-        let resolve = ide_db::assists::AssistResolveStrategy::None;
-        let borrowck = std::env::var_os("BLAZE_BORROWCK_REFUSE").is_none_or(|it| it != "0");
         let mut found = Found::default();
+        let Some(&krate) = ide_db::base_db::relevant_crates(db, file).first() else {
+            found.cannot.push("blaze cannot check the example: its file is in no crate".to_owned());
+            return found;
+        };
+        // An example's errors are told apart by their codes and messages, not their places.
+        let paths = std::collections::HashMap::new();
+        let files = blaze_diagnostics::Files::new(&paths, "");
+        let options = blaze_diagnostics::Options::default();
         hir::attach_db(db, || {
-            let syntax = ide_diagnostics::syntax_diagnostics(db, &config, file);
-            let semantic = ide_diagnostics::semantic_diagnostics(db, &config, &resolve, file);
-            for it in syntax.into_iter().chain(semantic) {
-                let code = it.code.as_str();
-                let lint = denies_lints && it.severity == Severity::Warning;
-                if it.severity != Severity::Error && !lint {
+            let diags = blaze_diagnostics::check_crate(db, hir::Crate::from(krate), files, &options);
+            let errors = diags.into_iter().filter(|it| it.is_error());
+            for diag in errors.filter(|it| !it.message.starts_with("aborting due to")) {
+                if diag.message.starts_with("blaze cannot") {
+                    found.cannot.push(diag.message);
                     continue;
                 }
-                let sure = crate::SURE.contains(&code)
-                    || borrowck && crate::BORROWCK.contains(&code)
-                    || crate::DENIED.contains(&code)
-                    || borrowck && crate::DENIED_BORROWCK.contains(&code);
-                let into = if sure { &mut found.sure } else { &mut found.unsure };
-                into.push((code.to_owned(), it.message));
+                let code = diag.code.as_ref().map_or_else(String::new, |it| it.as_str().to_owned());
+                found.errors.push((code, diag.message));
             }
             found.deprecated = denies_lints && uses_deprecated(db, file);
-            found.unchecked = unchecked(db, file);
         });
-        if !borrowck || hir_ty_borrowck::mode() == hir_ty_borrowck::Mode::Off {
-            found.unchecked.insert(0, "the borrow checker's errors are turned off".to_owned());
-        }
         found
     }
 
     /// The first error, as the example's refusal says it.
     fn first(&self) -> Option<String> {
-        let first = self.sure.iter().chain(&self.unsure).next();
-        match first {
-            Some((code, message)) => Some(format!("`{code}`: {message}")),
-            None => self.deprecated.then(|| "it uses something `#[deprecated]`".to_owned()),
+        if let Some((code, message)) = self.errors.first() {
+            return Some(match code.is_empty() {
+                true => message.clone(),
+                false => format!("`{code}`: {message}"),
+            });
         }
+        if let Some(cannot) = self.cannot.first() {
+            return Some(cannot.clone());
+        }
+        self.deprecated.then(|| "it uses something `#[deprecated]`".to_owned())
     }
 
     /// Whether the example fails to compile as one marked `compile_fail` with `codes` is to:
-    /// with an error rustc gives too, and every code among them, as rustdoc checks it. `Err`
-    /// is why blaze can't tell, which the example fails with.
+    /// with an error rustc gives, and every code among them, as rustdoc checks it. `Err` is
+    /// why it does not, or why blaze can't tell, which the example fails with.
     fn fails_as_marked(&self, codes: &[String]) -> Result<(), String> {
-        let found = |code: &String| self.sure.iter().any(|(it, _)| it == code);
+        let found = |code: &String| self.errors.iter().any(|(it, _)| it == code);
         let missing: Vec<&String> = codes.iter().filter(|it| !found(it)).collect();
-        if !self.sure.is_empty() && missing.is_empty() {
+        if !self.errors.is_empty() && missing.is_empty() {
             return Ok(());
         }
         let marked = std::iter::once("compile_fail").chain(codes.iter().map(String::as_str));
         let marked = format!("it is marked `{}`", marked.collect::<Vec<_>>().join(","));
-        if !self.sure.is_empty() {
-            let sure = quoted(self.sure.iter().map(|(code, _)| code));
-            let missing = quoted(missing);
-            return Err(format!("{marked}, and blaze finds {sure} in it but not {missing}"));
-        }
-        if let Some((code, message)) = self.unsure.first() {
-            return Err(format!(
-                "{marked}, and blaze finds only errors rustc need not give in it, as `{code}`: \
-                 {message}"
-            ));
-        }
-        let mut why = format!("{marked}, and blaze finds no error in it");
-        let checked = |it: &&String| {
-            crate::SURE.contains(&it.as_str()) || crate::BORROWCK.contains(&it.as_str())
+        let mut why = match self.errors.is_empty() {
+            true => format!("{marked}, and blaze finds no error in it"),
+            false => {
+                let coded: Vec<&String> =
+                    self.errors.iter().map(|(code, _)| code).filter(|it| !it.is_empty()).collect();
+                let named = match coded.is_empty() {
+                    true => "only errors with no code".to_owned(),
+                    false => quoted(coded),
+                };
+                format!("{marked}, and blaze finds {named} in it but not {}", quoted(missing))
+            }
         };
-        let unknown: Vec<&String> = codes.iter().filter(|it| !checked(it)).collect();
-        if !unknown.is_empty() {
-            why.push_str(&format!(": blaze's checker does not find {} yet", quoted(unknown)));
-        } else if let Some(unchecked) = self.unchecked.first() {
-            why.push_str(&format!(": {unchecked}"));
+        if let Some(cannot) = self.cannot.first() {
+            why.push_str(&format!(": {cannot}"));
         }
         Err(why)
     }
-}
-
-/// Why each function of the file the borrow checker did not check was not.
-fn unchecked(db: &RootDatabase, file: vfs::FileId) -> Vec<String> {
-    use syntax::{AstNode as _, ast};
-    let sema = hir::Semantics::new(db);
-    let functions = sema.parse_guess_edition(file).syntax().descendants().filter_map(ast::Fn::cast);
-    let mut why = Vec::new();
-    for function in functions {
-        let Some(function) = sema.to_def(&function) else { continue };
-        let Ok(id) = hir_def::DefWithBodyId::try_from(hir::DefWithBody::from(function)) else {
-            continue;
-        };
-        if let Some(skipped) = &hir_ty_borrowck::borrowck(db, id).skipped {
-            why.push(format!("a body is not borrow checked: {skipped}"));
-        }
-    }
-    why
 }
 
 /// Error codes as a refusal lists them.
@@ -977,22 +959,23 @@ fn denies_lints(source: &str) -> bool {
 /// Whether the file names an item, or calls a method, marked `#[deprecated]`, the arguments
 /// of its macros (`assert_eq!`) included.
 fn uses_deprecated(db: &RootDatabase, file: vfs::FileId) -> bool {
-    use syntax::{AstNode as _, ast};
-    let sema = hir::Semantics::new(db);
-    let mut trees = vec![sema.parse_guess_edition(file).syntax().clone()];
+    use syntax::view::{self as ast, AstNode as _};
+    let sema = hir::view::Semantics::new(db);
+    // alloc: the stack of an example's file and its expansions, once per example
+    let mut trees = vec![sema.parse_guess_edition(file).syntax()];
     while let Some(tree) = trees.pop() {
         for node in tree.descendants() {
-            let used = if let Some(call) = ast::MacroCall::cast(node.clone()) {
-                trees.extend(sema.expand_macro_call(&call).map(|it| it.value));
+            let used = if let Some(call) = ast::MacroCall::cast(node) {
+                trees.extend(sema.expand_macro_call(call).map(|it| it.value));
                 None
-            } else if let Some(path) = ast::Path::cast(node.clone()) {
-                match sema.resolve_path(&path) {
+            } else if let Some(path) = ast::Path::cast(node) {
+                match sema.resolve_path(path) {
                     Some(hir::PathResolution::Def(def)) => Some(def),
                     _ => None,
                 }
             } else {
                 ast::MethodCallExpr::cast(node)
-                    .and_then(|call| sema.resolve_method_call(&call))
+                    .and_then(|call| sema.resolve_method_call(call))
                     .map(hir::ModuleDef::Function)
             };
             if used.and_then(|it| it.attrs(db)).is_some_and(|it| it.is_deprecated()) {
@@ -1027,22 +1010,24 @@ struct Added {
     root_file: vfs::FileId,
 }
 
-/// The first of the files and source roots of the examples' crates, counted down from: ids no
-/// file or source root of the workspace has. A file's is the highest a span can name.
-const FIRST_FILE: u32 = 0x007f_ffff;
+/// The first of the source roots of the examples' crates, counted down from: ids no source root
+/// of the workspace has.
 const FIRST_SOURCE_ROOT: u32 = u32::MAX;
 
 /// Adds a crate for each example of `tests` at `wanted`: a binary whose one file has the
 /// program of the example, its lines numbered as rustdoc has rustc number them, under the path
 /// of the file the example is in, and that depends on the library and on what the library
-/// depends on, with its cfgs and variables.
+/// depends on, with its cfgs and variables. The `n`th example's file is `files[n]`, taken from
+/// base-db the first time a library has that many: the examples of each library replace the
+/// last one's, so their files are written again rather than numbered anew.
 fn add_crates(
     db: &mut RootDatabase,
     asked: &Asked,
     library: hir::Crate,
     tests: &[Test],
     wanted: &[usize],
-) -> Vec<(usize, Added)> {
+    files: &mut Vec<vfs::FileId>,
+) -> Result<Vec<(usize, Added)>, String> {
     use ide_db::base_db::{
         self, AbsPathBuf, BuiltCrateData, BuiltDependency, CrateDisplayName, CrateName,
         CrateOrigin, ExtraCrateData, FileSet, SourceRoot, SourceRootId, TargetKind, VfsPath,
@@ -1066,7 +1051,16 @@ fn add_crates(
         let Ok(vfs_path) = AbsPathBuf::try_from(path.to_string_lossy().as_ref()) else {
             continue;
         };
-        let file = vfs::FileId::from_raw(FIRST_FILE - n as u32);
+        let file = match files.get(n) {
+            Some(&file) => file,
+            None => {
+                let file = db.new_file_id().ok_or_else(|| {
+                    format!("base-db has no file ID left for example {n} of `{}`", asked.crate_name)
+                })?;
+                files.push(file);
+                file
+            }
+        };
         let root = SourceRootId(FIRST_SOURCE_ROOT - n as u32);
         db.set_file_text_with_durability(file, &test.program.source, Durability::LOW);
         db.set_file_source_root_with_durability(file, root, Durability::LOW);
@@ -1099,7 +1093,7 @@ fn add_crates(
     let all: Vec<base_db::Crate> = base_db::all_crates(db).iter().copied().chain(crates).collect();
     base_db::set_all_crates_with_durability(db, all, Durability::MEDIUM);
     crate::prepare_macro_sessions(db);
-    added
+    Ok(added)
 }
 
 /// What the examples of `library` are compiled from besides their own text, as a hash: each
@@ -1235,6 +1229,7 @@ pub(crate) fn run_all(
     target: &str,
 ) -> i32 {
     use ide_db::base_db::{self, salsa::Durability};
+    let mut files = Vec::new();
     let code = libraries.each(|recorded, asked| {
         let asked = match asked {
             Ok(asked) => asked,
@@ -1250,7 +1245,7 @@ pub(crate) fn run_all(
         let crates: Vec<base_db::Crate> = base_db::all_crates(db).iter().copied().collect();
         let ran = crate::crates_named(db, &args.krate, &args).and_then(|found| {
             let krate = *found.first().context("no such crate")?;
-            run(db, &building, asked, krate, target)
+            run(db, &building, asked, krate, target, &mut files)
         });
         // The examples of the next library are crates of the same names.
         base_db::set_all_crates_with_durability(db, crates, Durability::MEDIUM);
@@ -1272,6 +1267,7 @@ fn run(
     asked: &Asked,
     krate: hir::Crate,
     target: &str,
+    files: &mut Vec<vfs::FileId>,
 ) -> anyhow::Result<i32> {
     use ide_db::base_db::salsa::Setter as _;
     let start = Instant::now();
@@ -1284,7 +1280,7 @@ fn run(
     library.set_cfg_options(db).to(cfg);
     crate::prepare_macro_sessions(db);
     let built_from = built_from(db, library);
-    let (plans, unit) = plan(db, building, asked, krate, &tests, target);
+    let (plans, unit) = plan(db, building, asked, krate, &tests, target, files);
     let db: &RootDatabase = db;
     let out = std::io::stdout();
     writeln!(&out, "\nrunning {} test{}", tests.len(), if tests.len() == 1 { "" } else { "s" })?;
@@ -1420,12 +1416,10 @@ fn run(
 mod tests {
     use super::*;
 
-    fn found(sure: &[&str], unsure: &[&str], unchecked: &[&str]) -> Found {
-        let errors = |codes: &[&str]| codes.iter().map(|it| (it.to_string(), "m".into())).collect();
+    fn found(errors: &[&str], cannot: &[&str]) -> Found {
         Found {
-            sure: errors(sure),
-            unsure: errors(unsure),
-            unchecked: unchecked.iter().map(|it| it.to_string()).collect(),
+            errors: errors.iter().map(|it| (it.to_string(), "m".into())).collect(),
+            cannot: cannot.iter().map(|it| it.to_string()).collect(),
             deprecated: false,
         }
     }
@@ -1435,40 +1429,51 @@ mod tests {
     }
 
     #[test]
-    fn a_compile_fail_example_passes_on_an_error_rustc_gives_too() {
-        assert_eq!(found(&["E0308"], &[], &[]).fails_as_marked(&[]), Ok(()));
-        assert_eq!(found(&["E0499"], &[], &[]).fails_as_marked(&codes(&["E0499"])), Ok(()));
+    fn a_compile_fail_example_passes_on_an_error_rustc_gives() {
+        assert_eq!(found(&["E0308"], &[]).fails_as_marked(&[]), Ok(()));
+        assert_eq!(found(&["E0499"], &[]).fails_as_marked(&codes(&["E0499"])), Ok(()));
+        assert_eq!(found(&["unused_variables"], &[]).fails_as_marked(&[]), Ok(()));
     }
 
     #[test]
     fn every_code_it_is_marked_with_is_found() {
         assert_eq!(
-            found(&["E0308"], &[], &[]).fails_as_marked(&codes(&["E0308", "E0599"])),
+            found(&["E0308"], &[]).fails_as_marked(&codes(&["E0308", "E0599"])),
             Err("it is marked `compile_fail,E0308,E0599`, and blaze finds `E0308` in it but not \
                  `E0599`"
                 .to_owned())
         );
-    }
-
-    #[test]
-    fn an_error_rustc_need_not_give_is_no_pass() {
-        let why = found(&[], &["type-mismatch"], &[]).fails_as_marked(&[]).unwrap_err();
-        assert!(why.contains("only errors rustc need not give"), "{why}");
-    }
-
-    #[test]
-    fn no_error_says_what_blaze_does_not_check() {
         assert_eq!(
-            found(&[], &[], &[]).fails_as_marked(&codes(&["E0277"])),
-            Err("it is marked `compile_fail,E0277`, and blaze finds no error in it: blaze's \
-                 checker does not find `E0277` yet"
+            found(&[""], &[]).fails_as_marked(&codes(&["E0599"])),
+            Err("it is marked `compile_fail,E0599`, and blaze finds only errors with no code in \
+                 it but not `E0599`"
+                .to_owned())
+        );
+    }
+
+    /// What blaze cannot check is no error rustc gives: it passes no `compile_fail` example,
+    /// and it is why one with no error fails.
+    #[test]
+    fn what_blaze_cannot_check_is_no_pass() {
+        assert_eq!(
+            found(&[], &["blaze cannot borrow-check `f`: a closure"]).fails_as_marked(&[]),
+            Err("it is marked `compile_fail`, and blaze finds no error in it: blaze cannot \
+                 borrow-check `f`: a closure"
                 .to_owned())
         );
         assert_eq!(
-            found(&[], &[], &["not borrow checked: a closure"]).fails_as_marked(&[]),
-            Err("it is marked `compile_fail`, and blaze finds no error in it: not borrow \
-                 checked: a closure"
-                .to_owned())
+            found(&[], &[]).fails_as_marked(&codes(&["E0277"])),
+            Err("it is marked `compile_fail,E0277`, and blaze finds no error in it".to_owned())
         );
+    }
+
+    /// An example blaze cannot check is refused as one with an error is: it is never built.
+    #[test]
+    fn what_blaze_cannot_check_refuses_the_example() {
+        let cannot = "blaze cannot borrow-check `f`: a closure";
+        assert_eq!(found(&[], &[cannot]).first().as_deref(), Some(cannot));
+        assert_eq!(found(&["E0308"], &[cannot]).first().as_deref(), Some("`E0308`: m"));
+        assert_eq!(found(&[""], &[]).first().as_deref(), Some("m"));
+        assert_eq!(found(&[], &[]).first(), None);
     }
 }

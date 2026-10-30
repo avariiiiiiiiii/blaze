@@ -67,17 +67,37 @@ impl Levels {
 
     /// The level of `dead_code` at `node`.
     pub(super) fn at<'db>(&self, cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> LevelPlus {
-        let state = self.state(cx, node);
-        let level = state.dead_code.unwrap_or(LevelPlus { level: default_level(), expect: None });
-        if level.level == Level::Warn
-            && let Some(warnings) = state.warnings
-            && warnings.level != Level::Warn
-        {
-            return warnings;
-        }
-        level
+        resolve(self.state(cx, node))
     }
 
+    /// The level of `dead_code` at an impl a builtin derive of `adt` makes with no tokens:
+    /// rustc's `create_derived_impl` puts it beside the ADT and copies the ADT's `allow`,
+    /// `warn`, `deny` and `forbid` onto it (not `expect`, and not the ADT's other attributes).
+    pub(super) fn at_derived<'db>(&self, cx: &Cx<'_, 'db>, adt: InFile<ast::Node<'db>>) -> LevelPlus {
+        let mut state = match adt.value.parent() {
+            Some(parent) => self.state(cx, adt.with_value(parent)),
+            None => self.above_file(cx, adt.file_id, adt.value),
+        };
+        if let Some(owner) = ast::AnyHasAttrs::cast(adt.value) {
+            apply(cx, adt.with_value(owner), ast::ptr(adt.value), &mut state, Copied::ToDerives);
+        }
+        resolve(state)
+    }
+}
+
+/// `dead_code`'s level from what the attributes set: a `warn` that `warnings` changes.
+fn resolve(state: State) -> LevelPlus {
+    let level = state.dead_code.unwrap_or(LevelPlus { level: default_level(), expect: None });
+    if level.level == Level::Warn
+        && let Some(warnings) = state.warnings
+        && warnings.level != Level::Warn
+    {
+        return warnings;
+    }
+    level
+}
+
+impl Levels {
     /// What is set at `node`: the state of the nearest memoized node above it, then the
     /// attributes of the nodes with attributes between, outermost first, each memoized.
     fn state<'db>(&self, cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> State {
@@ -102,7 +122,7 @@ impl Levels {
             None => self.above_file(cx, node.file_id, top),
         };
         for (ptr, owner) in pending.into_iter().rev() {
-            apply(cx, node.with_value(owner), ptr, &mut state);
+            apply(cx, node.with_value(owner), ptr, &mut state, Copied::All);
             self.owners.borrow_mut().insert(node.with_value(ptr), state);
         }
         state
@@ -152,14 +172,29 @@ fn above<'db>(cx: &Cx<'_, 'db>, file: HirFileId, top: ast::Node<'db>) -> Option<
     Some(declaration.map(|it| it.syntax()))
 }
 
+/// Which of an owner's lint attributes count.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Copied {
+    All,
+    /// Those a builtin derive copies onto its impl: all but `expect`.
+    ToDerives,
+}
+
 /// The lint attributes of `owner` (whose node is `ptr`), in order, as they set `dead_code` and
 /// `warnings`.
-fn apply<'db>(cx: &Cx<'_, 'db>, owner: InFile<ast::AnyHasAttrs<'db>>, ptr: SyntaxNodePtr, state: &mut State) {
+fn apply<'db>(
+    cx: &Cx<'_, 'db>,
+    owner: InFile<ast::AnyHasAttrs<'db>>,
+    ptr: SyntaxNodePtr,
+    state: &mut State,
+    copied: Copied,
+) {
     let file = owner.file_id.original_file(cx.db).file_id(cx.db);
     let ptr = owner.with_value(ptr);
     for (index, (attr, name)) in cx.vsema.lint_attrs(file, cx.krate, owner.value).enumerate() {
         let level = match attr {
             hir::LintAttr::Allow => Level::Allow,
+            hir::LintAttr::Expect if copied == Copied::ToDerives => continue,
             hir::LintAttr::Expect => Level::Expect,
             hir::LintAttr::Warn => Level::Warn,
             hir::LintAttr::Deny => Level::Deny,

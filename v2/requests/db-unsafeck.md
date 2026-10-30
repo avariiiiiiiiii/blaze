@@ -28,7 +28,7 @@ Why: hir-ide's checker is deleted at integration, and the editor's highlighting 
 from the same walk as the diagnostics. Told in tmux window `db-ty-next1`.
 
 > forwarded to db (window `db-next2`, told by tmux).
-> checked by db-audit-dbsub (2026-10-29 22:45): in the tree at `crates/hir/src/semantics.rs:42` and `crates/hir/src/source_analyzer.rs:51` (`use hir_ty_unsafeck::..`); `crates/hir/src/lib.rs` no longer re-exports `diagnostics::UnsafetyReason`, and `crates/hir/src/diagnostics.rs:743` re-exports `hir_ty_unsafeck::{UnsafeLint, UnsafetyReason}`.
+> checked by db-audit-dbsub (2026-10-29 22:33): in the tree at `crates/hir/src/semantics.rs:42` and `crates/hir/src/source_analyzer.rs:51` (`use hir_ty_unsafeck::..`); `crates/hir/src/lib.rs` no longer re-exports `diagnostics::UnsafetyReason`, and `crates/hir/src/diagnostics.rs:743` re-exports `hir_ty_unsafeck::{UnsafeLint, UnsafetyReason}`.
 
 ## 3. diagnostics: `MissingUnsafe` and the new reasons
 
@@ -100,7 +100,7 @@ is one bit test (`docs/v2/plan/lanes/db/speed-of-light-unsafeck.md`, "The gap").
 > in place of the resolver, its scope guard and the hygiene lookup (and the `resolver` field
 > if nothing else reads it). A path inference could not resolve records nothing, so nothing is
 > reported for it, as rustc reports no unsafety for an unresolved path.
-> applied by db-audit-dbsub (2026-10-29 22:45): as db-ty-next3 wrote, in `crates/hir-ty-unsafeck/src/lib.rs` `check_static`: `self.infer.value_resolution(current.into())` in place of the resolver walk; the `resolver` field and the `HasResolver`/`ResolveValueResult`/`Resolver` imports go. `docs/v2/plan/lanes/db/speed-of-light-unsafeck.md` "The gap" becomes "Static paths". Not built.
+> applied by db-audit-dbsub (2026-10-29 22:33): as db-ty-next3 wrote, in `crates/hir-ty-unsafeck/src/lib.rs` `check_static`: `self.infer.value_resolution(current.into())` in place of the resolver walk; the `resolver` field and the `HasResolver`/`ResolveValueResult`/`Resolver` imports go. `docs/v2/plan/lanes/db/speed-of-light-unsafeck.md` "The gap" becomes "Static paths". Not built.
 
 ## 6. Tools: `tools/v2/hot_lint.py` cannot read its `crates` field
 

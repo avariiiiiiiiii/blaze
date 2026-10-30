@@ -11,8 +11,8 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use blaze_codegen::{
     Backend, InstanceKey, NativeLib, NativeLibKind, Target,
     driver::{Build, Built},
-    plan::{Mode as BuildMode, OptLevel, Origin, Override, Policy, Profile},
-    settings::{DebugInfo, Panic, Sanitize, Toolchain},
+    plan::{Mode as BuildMode, OptLevel, Origin, Override, Package, Policy, Profile},
+    settings::{DebugInfo, Panic, Pgo, Sanitize, Sanitizers, Toolchain},
 };
 use blaze_build_script::{
     apply::{Compile, Linked as LinkedTo},
@@ -24,7 +24,7 @@ use blaze_link::{Change, Image, Native, Output};
 use blaze_units::schema::{self, Mode, Unit};
 use hir_ty_codegen::v2::{
     Backends, BodyChecks, BuildTime, Databases, HashSource, HirFrontend, HirInstance, ItemHashes, LinkInputs,
-    RootKind, Roots,
+    RootKind, Roots, Runs,
 };
 
 use super::{Job, Real, UnitReader, files::Mounted, graph::flag, script};
@@ -86,11 +86,20 @@ pub(crate) fn triple<'a>(job: &'a Job, unit: &'a Unit) -> &'a str {
 }
 
 /// The toolchain `unit` is compiled with: its target, the `-C target-cpu`,
-/// `-C target-feature` of its rustflags, the backends of this blaze.
+/// `-C target-feature` of its rustflags, where it runs, the backends of this blaze.
 pub(crate) fn toolchain(job: &Job, unit: usize) -> Result<Toolchain, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let plan = job.plan(unit).map_err(|it| it.what)?;
-    hir_ty_codegen::v2::toolchain(triple(job, u), &plan.rustflags)
+    hir_ty_codegen::v2::toolchain(triple(job, u), &plan.rustflags, runs(u))
+}
+
+/// Where `unit`'s code runs. A dev build of the host's target (no `--target`) runs where it
+/// is built: `dev` and `test` are cargo's profiles of `build`, `run`, `test` and their
+/// build scripts and proc macros. A `--target` unit, a `release` or `bench` build, or one of a
+/// custom profile, which may be shipped, runs elsewhere: the target's baseline, as rustc's code.
+fn runs(unit: &Unit) -> Runs {
+    let dev = matches!(unit.profile.name.as_str(), "dev" | "test");
+    if unit.platform.is_none() && dev { Runs::Here } else { Runs::Elsewhere }
 }
 
 fn opt_level(level: &str) -> Result<OptLevel, String> {
@@ -131,7 +140,7 @@ fn panic(panic: &str) -> Result<Panic, String> {
 
 /// The crates compiled for build scripts and proc macros, not for the program, as the code
 /// generator takes them. Worked out once per job from [`Graph`](super::graph::Graph)'s bitset.
-fn build_time(job: &Job) -> BuildTime {
+fn build_time(job: &Job) -> std::sync::Arc<BuildTime> {
     let crates = job.build_time.get_or_init(|| {
         let mut crates = rustc_hash::FxHashSet::default();
         for at in 0..job.graph.len() as u32 {
@@ -141,9 +150,9 @@ fn build_time(job: &Job) -> BuildTime {
                 crates.insert(krate);
             }
         }
-        BuildTime(crates)
+        std::sync::Arc::new(BuildTime(crates))
     });
-    crates.clone()
+    std::sync::Arc::clone(crates)
 }
 
 fn is_build_time(unit: &Unit) -> bool {
@@ -155,9 +164,9 @@ pub(crate) fn origin(job: &Job, unit: &Unit) -> Result<Origin, String> {
     let package = job.package(unit).map_err(|it| it.what)?;
     Ok(match () {
         _ if unit.is_std => Origin::Std,
-        _ if is_build_time(unit) => Origin::BuildTime(package.name.clone()),
-        _ if package.is_member => Origin::Member(package.name.clone()),
-        _ => Origin::Dependency(package.name.clone()),
+        _ if is_build_time(unit) => Origin::BuildTime(Package::new(&package.name)),
+        _ if package.is_member => Origin::Member(Package::new(&package.name)),
+        _ => Origin::Dependency(Package::new(&package.name)),
     })
 }
 
@@ -172,7 +181,7 @@ pub(crate) fn codegen_backend(profile: &schema::Profile, package: &str, level: O
     };
     let name = &profile.name;
     match asked {
-        "cranelift" if level.backend(false) == Some(Backend::Cranelift) => Ok(()),
+        "cranelift" if level.backend(false).is_some_and(Backend::is_cranelift) => Ok(()),
         "cranelift" | "stencil" => Err(format!(
             "the profile `{name}` of `{package}` asks for codegen-backend `{asked}`, and blaze's code \
              generator takes no backend over the one opt-level {} compiles with",
@@ -185,16 +194,182 @@ pub(crate) fn codegen_backend(profile: &schema::Profile, package: &str, level: O
     }
 }
 
-/// The sanitizers of a build with `rustflags`, after refusing the `-Z` flags blaze does not do
-/// ([`crate::unstable`]). A sanitized build stops until blaze's linker links one.
-pub(crate) fn sanitize(rustflags: &[String]) -> Result<Sanitize, String> {
+/// The sanitizers of a build for `target` with `rustflags`, after refusing the `-Z` flags blaze
+/// does not do ([`crate::unstable`]) and checking that blaze's toolchain has their runtimes
+/// ([`crate::unstable::runtimes`]). A sanitized build stops until blaze's linker links one.
+pub(crate) fn sanitize(rustflags: &[String], target: &str) -> Result<Sanitize, String> {
     if let Some(why) = crate::unstable::refusal(rustflags) {
         return Err(why);
     }
     let sanitize = crate::unstable::sanitize(rustflags)?;
+    if sanitize.sanitizers != Sanitizers::NONE {
+        let sysroot = crate::cargo::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
+        crate::unstable::runtimes(sanitize.sanitizers, target, &sysroot)?;
+    }
     match sanitize.is_empty() {
         true => Ok(sanitize),
         false => Err(crate::unstable::UNLINKED.to_owned()),
+    }
+}
+
+/// What a build's rustflags ask of profile-guided optimization: nothing, or to build with the
+/// profile at a path as the flags give it (`-C profile-use=PATH`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PgoFlag<'a> {
+    None,
+    Use(&'a str),
+}
+
+/// The profile-guided optimization of a build with `rustflags`. The last `-C profile-use` is
+/// the one, as rustc takes a codegen option given twice; one naming no file is an error. A
+/// `-C profile-generate` is an error naming it: blaze's linker writes no profile sections yet,
+/// so an instrumented binary would count into nothing and write no profile.
+pub(crate) fn pgo(rustflags: &[String]) -> Result<PgoFlag<'_>, String> {
+    let mut asked = PgoFlag::None;
+    let mut flags = rustflags.iter().map(String::as_str);
+    while let Some(flag) = flags.next() {
+        let option = match flag {
+            "-C" | "--codegen" => flags.next().unwrap_or(""),
+            _ => match flag.strip_prefix("--codegen=").or_else(|| flag.strip_prefix("-C")) {
+                Some(option) => option,
+                None => continue,
+            },
+        };
+        let (name, value) = match option.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (option, None),
+        };
+        match name {
+            "profile-generate" | "profile_generate" => {
+                // alloc: an error
+                return Err(format!(
+                    "the flags for rustc have `-C {option}`; blaze's linker writes no profile sections yet \
+                     (`__llvm_prf_data`, `__llvm_prf_cnts`, `__llvm_prf_names` and the profile runtime), so an \
+                     instrumented binary would write no profile, and blaze does not build with it"
+                ));
+            }
+            "profile-use" | "profile_use" => match value {
+                Some(path) if !path.is_empty() => asked = PgoFlag::Use(path),
+                _ => {
+                    // alloc: an error
+                    return Err(format!(
+                        "the flags for rustc have `-C {option}`, which names no profile: it takes \
+                         `-C profile-use=PATH`, PATH a `.profdata`"
+                    ));
+                }
+            },
+            _ => {}
+        }
+    }
+    Ok(asked)
+}
+
+/// The profiles a job's `-C profile-use`s name, each read once for the job, by its path as the
+/// flags give it: a job has one or two (the target's `RUSTFLAGS` and the host's).
+pub(crate) struct Profiles(Box<[(String, Result<Profiled, String>)]>);
+
+/// A profile read for a job: its content ID, its bytes given to the code generator while the
+/// job lives, and those bytes again until a build puts them in the store.
+#[cfg_attr(not(feature = "llvm"), allow(dead_code))]
+pub(crate) struct Profiled {
+    id: ContentId,
+    unstored: std::sync::Mutex<Option<Vec<u8>>>,
+    #[cfg(feature = "llvm")]
+    _given: hir_ty_codegen::v2::Profile,
+}
+
+/// The job's profiles, read the first time a unit asks: every unit's flags, read once.
+fn profiles(job: &Job) -> &Profiles {
+    job.profiles.get_or_init(|| {
+        // alloc: once per job, one entry per profile its units name
+        let mut read: Vec<(String, Result<Profiled, String>)> = Vec::new();
+        for plan in &job.units().plans {
+            if let Ok(PgoFlag::Use(path)) = pgo(&plan.rustflags)
+                && !read.iter().any(|it| it.0 == path)
+            {
+                // alloc: once per job and profile
+                read.push((path.to_owned(), read_profile(&job.input.config.invocation.root, path)));
+            }
+        }
+        Profiles(read.into_boxed_slice())
+    })
+}
+
+/// The profile at `path`, relative to the workspace's root (where cargo runs rustc for its
+/// members), read off the machine and given to the code generator; an error naming the path
+/// when it can't be read or given.
+pub(crate) fn read_profile(root: &str, path: &str) -> Result<Profiled, String> {
+    let at = std::path::Path::new(root).join(path);
+    let bytes = std::fs::read(&at).map_err(|error| {
+        // alloc: an error
+        format!("the flags for rustc have `-C profile-use={path}`, and `{}` can't be read: {error}", at.display())
+    })?;
+    given(path, bytes)
+}
+
+#[cfg(feature = "llvm")]
+fn given(path: &str, bytes: Vec<u8>) -> Result<Profiled, String> {
+    let id = hir_ty_codegen::v2::profile_id(&bytes);
+    let given = hir_ty_codegen::v2::give_profile(id, &bytes)
+        // alloc: an error
+        .map_err(|what| format!("the profile of `-C profile-use={path}`: {what}"))?;
+    Ok(Profiled { id, unstored: std::sync::Mutex::new(Some(bytes)), _given: given })
+}
+
+#[cfg(not(feature = "llvm"))]
+fn given(path: &str, _bytes: Vec<u8>) -> Result<Profiled, String> {
+    // alloc: an error
+    Err(format!(
+        "the flags for rustc have `-C profile-use={path}`, and this blaze is built without LLVM \
+         (blaze-cargo's feature `llvm`), the one back end that builds with a profile"
+    ))
+}
+
+/// The [`Pgo`] of a unit whose flags ask `asked`: the content ID of the job's read of the
+/// profile, or the error that read stopped with.
+fn pgo_of(job: &Job, asked: PgoFlag<'_>) -> Result<Pgo, String> {
+    let PgoFlag::Use(path) = asked else { return Ok(Pgo::None) };
+    match profiles(job).0.iter().find(|it| it.0 == path) {
+        Some((_, Ok(read))) => Ok(Pgo::Use(read.id)),
+        // alloc: an error
+        Some((_, Err(what))) => Err(what.clone()),
+        // alloc: an error
+        None => Err(format!("`-C profile-use={path}` is in no unit's flags the job read its profiles from")),
+    }
+}
+
+/// The [`Pgo`] `unit` is built with, as its [`policy`] has it: what its record key holds of a
+/// profile to use, whose path in its flags says nothing of the bytes there.
+pub(crate) fn unit_pgo(job: &Job, unit: usize) -> Result<Pgo, String> {
+    pgo_of(job, pgo(&job.plan(unit).map_err(|it| it.what)?.rustflags)?)
+}
+
+/// What a build with `pgo` puts in the store beside its code: the profile's bytes under its
+/// content ID, so a build reads them by `Key(id)` without the path, put by the first build of
+/// the job that finds them missing. A profile the job did not give is an error naming
+/// `give_profile`.
+fn profile_put(job: &Job, pgo: Pgo) -> Result<Option<blaze_codegen::driver::Put>, String> {
+    let Pgo::Use(id) = pgo else { return Ok(None) };
+    let read = profiles(job).0.iter().find_map(|it| it.1.as_ref().ok().filter(|read| read.id == id)).ok_or_else(|| {
+        // alloc: an error
+        format!(
+            "the profile {id:x} the build uses was not given to the code generator \
+             (`hir_ty_codegen::v2::give_profile`)"
+        )
+    })?;
+    let key = blaze_cas::Key(id);
+    if job.input.store.has(&blaze_cas::enter(), &key) {
+        return Ok(None);
+    }
+    let bytes = read.unstored.lock().unwrap_or_else(|it| it.into_inner()).take();
+    Ok(bytes.map(|bytes| blaze_codegen::driver::Put { key, kind: blaze_cas::Kind::Output, bytes }))
+}
+
+/// Gives back the bytes of a profile put that a failed build will not hand to the store.
+fn unput_profile(job: &Job, put: blaze_codegen::driver::Put) {
+    let read = profiles(job).0.iter().find_map(|it| it.1.as_ref().ok().filter(|read| blaze_cas::Key(read.id) == put.key));
+    if let Some(read) = read {
+        *read.unstored.lock().unwrap_or_else(|it| it.into_inner()) = Some(put.bytes);
     }
 }
 
@@ -204,7 +379,9 @@ pub(crate) fn sanitize(rustflags: &[String]) -> Result<Sanitize, String> {
 /// `RUSTFLAGS` to every crate.
 pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Policy, String> {
     let root = job.unit(unit).map_err(|it| it.what)?;
-    let sanitize = sanitize(&job.plan(unit).map_err(|it| it.what)?.rustflags)?;
+    let rustflags = &job.plan(unit).map_err(|it| it.what)?.rustflags;
+    let sanitize = sanitize(rustflags, triple(job, root))?;
+    let pgo = pgo_of(job, pgo(rustflags)?)?;
     let base = &root.profile;
     let opt = opt_level(&base.opt_level)?;
     codegen_backend(base, &job.package(root).map_err(|it| it.what)?.name, opt)?;
@@ -246,6 +423,7 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
         mode: BuildMode::Output,
         fold: true,
         sanitize,
+        pgo,
     })
 }
 
@@ -341,7 +519,9 @@ pub(crate) fn generate<'db>(
         Err(error) => return Ok(Err(vec![error.what])),
     };
     let origin = origin(job, u)?;
-    let asked: Vec<(HirInstance, Origin)> = roots.roots.iter().map(|it| (it.clone(), origin.clone())).collect();
+    let asked: Vec<(HirInstance, Origin)> = roots.roots.iter().map(|it| (it.clone(), origin)).collect();
+    // The job holds the profile given for as long as it lives, so for the whole build.
+    let profile = profile_put(job, policy.pgo)?;
     let backends = Backends::default();
     let built = {
         let guard = blaze_cas::enter();
@@ -349,8 +529,16 @@ pub(crate) fn generate<'db>(
         Build::new(&backends, &frontend, &policy, &job.shared.memo).run_with_statics(&asked, &roots.statics, &store)
     };
     match built {
-        Ok(built) => Ok(Ok(Generated { built, roots, frontend, policy, side: std::cell::OnceCell::new() })),
-        Err(errors) => Ok(Err(errors.into_iter().map(|it| it.what).collect())),
+        Ok(mut built) => {
+            built.puts.extend(profile);
+            Ok(Ok(Generated { built, roots, frontend, policy, side: std::cell::OnceCell::new() }))
+        }
+        Err(errors) => {
+            if let Some(put) = profile {
+                unput_profile(job, put);
+            }
+            Ok(Err(errors.into_iter().map(|it| it.what).collect()))
+        }
     }
 }
 
@@ -487,9 +675,10 @@ fn natives(job: &Job, unit: usize, frontend: &HirFrontend<'_>) -> Result<(Vec<Na
 /// A native input a link read off the machine: its path, and the BLAKE3 hash of its contents.
 pub(crate) type Read = (String, ContentId);
 
-/// `generated` linked into the image at `path` as `makes` says: the file's bytes, and every
-/// native input the link read off the machine. The image kept at `path` is taken out of
-/// `images` and relinked, and what this link made put back; a link that fails puts none.
+/// `generated` linked into the image at `path` as `makes` says: the file's bytes, every
+/// native input the link read off the machine, and a test binary's execution table. The image
+/// kept at `path` is taken out of `images` and relinked, and what this link made put back; a
+/// link that fails puts none.
 pub(crate) fn link(
     job: &Job,
     unit: usize,
@@ -497,7 +686,7 @@ pub(crate) fn link(
     makes: &Makes,
     generated: &Generated<'_>,
     images: &mut Vec<KeptImage>,
-) -> Result<(Vec<u8>, Vec<Read>), String> {
+) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>), String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let built = &generated.built;
     let debug = match generated.policy.profile.debuginfo {
@@ -512,7 +701,9 @@ pub(crate) fn link(
         }
         _ => None,
     };
-    let output = blaze_link::target::output(triple(job, u), shared, debug, true).map_err(|it| it.to_string())?;
+    let test = job.graph.has(unit as u32, flag::TEST);
+    let mut output = blaze_link::target::output(triple(job, u), shared, debug, true).map_err(|it| it.to_string())?;
+    output.exec_log = test && blaze_codegen::exec::records(generated.policy.mode);
     let (libs, search) = natives(job, unit, &generated.frontend)?;
     let sysroot = crate::cargo::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
     let located =
@@ -611,12 +802,24 @@ pub(crate) fn link(
     };
     let staged = linked.image.stage(change).map_err(|it| it.to_string())?;
     let bytes = linked.image.bytes(staged).map_err(|it| it.to_string())?;
+    // A test binary's tests are selected by its table, which only its link numbers.
+    let table = match test {
+        true => Some(super::test::image::table(
+            path,
+            built,
+            linked.image.slots(),
+            |key| linked.image.slot(key).map(|it| it.0),
+            ContentId::default(),
+            &generated.roots.tests,
+        )?),
+        false => None,
+    };
     linked.functions = functions;
     linked.statics = statics;
     linked.natives = new_natives;
     linked.names = kept_names;
     images.push(KeptImage { path: path.to_owned(), kept: linked });
-    Ok((bytes, read))
+    Ok((bytes, read, table))
 }
 
 /// A `rustc-link-lib` as rustc takes `-l`: `[KIND[:MODIFIERS]=]NAME[:RENAME]`.

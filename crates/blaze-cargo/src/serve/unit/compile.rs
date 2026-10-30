@@ -5,14 +5,15 @@
 //! A unit's result is kept in the store as its record, under what it was made from: the
 //! front end's identity of the unit's inputs (its sources, cfgs, env, its dependencies' and
 //! their build scripts' results, deeply), its plan, its profile and target, the toolchain and
-//! blaze's own code ([`Toolchain::id`](blaze_codegen::settings::Toolchain)), the goal and the
-//! colour of its diagnostics. A unit whose record and outputs are all in the store is fresh:
+//! blaze's own code ([`Toolchain::id`](blaze_codegen::settings::Toolchain)), the bytes of a
+//! `-C profile-use` profile, the goal and the colour of its diagnostics. A unit whose record and outputs are all in the store is fresh:
 //! its diagnostics are replayed as cargo replays a fresh unit's, and nothing runs.
 
 #![forbid(unsafe_code)]
 
 use blaze_api::{ApiError, Artifact, Diagnostic, Level};
 use blaze_cas::{Key, Kind};
+use blaze_codegen::settings::Pgo;
 use blaze_diagnostics::{Options, lints::CommandLine};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
@@ -46,6 +47,10 @@ pub(crate) struct Made {
     /// Every instance its codegen compiled or found, with the code hash it was made from, as
     /// [`blaze_api::Response::CodegenInputs`] lists them: sorted by key.
     pub(crate) inputs: Vec<(ContentId, ContentId)>,
+    /// A test binary's execution table, made beside its link
+    /// ([`super::test::image::table`]), which its tests are selected by: kept with its record,
+    /// so a replayed binary selects by the table it was linked with.
+    pub(crate) table: Option<blaze_codegen::ExecTable>,
 }
 
 /// A test of a test binary, as selection sees it.
@@ -199,6 +204,12 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
         hash_cbor(&mut hasher, scratch, &runs.env, "run environment", unit)
     })?;
     hasher.id(&toolchain.id).update(&[goal, u8::from(job.input.color), u8::from(job.input.short), u8::from(verified)]);
+    // The flags name a profile by its path; its bytes are the input.
+    if let Pgo::Use(profile) = codegen::unit_pgo(job, unit).map_err(|what| ApiError::new(what, Some(u.target.name.clone())))? {
+        hasher.id(&profile);
+    }
+    // The rendered diagnostics' columns: none is rustc's default, apart from every width.
+    hasher.update(&job.input.width.map_or(0, |it| u64::from(it) + 1).to_le_bytes());
     Ok(Key(hasher.finish()))
 }
 
@@ -300,7 +311,7 @@ pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize, images: &mut 
             artifact,
             macros: None,
         };
-        compiled.macros = macros(job, unit, &compiled, &record.made);
+        compiled.macros = macros(job, reader, unit, &compiled);
         if let Some(slot) = job.made.get(unit) {
             let _ = slot.set(record.made);
         }
@@ -309,7 +320,7 @@ pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize, images: &mut 
     let made = make(job, reader, unit, images)?;
     let key = record_key(job, unit)?;
     let Made2 { mut compiled, made, natives } = made;
-    compiled.macros = macros(job, unit, &compiled, &made);
+    compiled.macros = macros(job, reader, unit, &compiled);
     if let Some(key) = key {
         let record = RecordRef {
             ok: compiled.ok,
@@ -337,52 +348,26 @@ struct Made2 {
     natives: Vec<(String, ContentId)>,
 }
 
-/// The expanders of proc-macro unit `unit` from the image it linked, for the crates that use
-/// it ([`crate::serve::work::Writer::macros`]); none for a unit that is no proc macro or did
-/// not build. blaze runs a proc macro only compiled to WebAssembly, in `blaze_macro_wasm`'s
-/// sandbox: an image of any other kind is an error naming it, which each use of its macros
-/// reports.
-fn macros(job: &Job, unit: usize, compiled: &Compiled, made: &Made) -> Option<ProcMacroLoadResult> {
+/// The expanders of proc-macro unit `unit`, for the crates that use it
+/// ([`crate::serve::work::Writer::macros`]); none for a unit that is no proc macro or did not
+/// build. Each runs the macro's own code on blaze's compiler in this process
+/// ([`blaze_macro_eval::load`], docs/v2/plan/design/compile-time.md change 20), isolated by
+/// construction: nothing it compiled to is loaded, and no process is started. Asked again each
+/// time the unit compiles or its record is reused, as the front end it reads may have changed.
+fn macros(job: &Job, reader: &UnitReader, unit: usize, compiled: &Compiled) -> Option<ProcMacroLoadResult> {
     if !compiled.ok || !job.crates.is_proc_macro(unit) {
         return None;
     }
     let name = job.unit(unit).map_or("", |it| it.target.name.as_str());
     let failed = |what: String| Some(Err(ProcMacroLoadingError::ProcMacroSrvError(what.into())));
-    let Some((path, id)) = &made.main else {
-        return failed(format!("proc macro `{name}` linked no image"));
+    let Some(krate) = job.crates.krate(unit) else {
+        return failed(format!("proc macro `{name}` has no crate in the front end"));
     };
-    let key = Key(*id);
-    let guard = blaze_cas::enter();
-    let bytes: &[u8] = match compiled.puts.iter().find(|it| it.key == key) {
-        Some(put) => &put.bytes,
-        None => match job.input.store.get(&guard, &key) {
-            Ok(Some(entry)) => entry.bytes,
-            Ok(None) => return failed(format!("proc macro `{name}`: the store has no image {path} under {key:?}")),
-            Err(corrupt) => return failed(format!("proc macro `{name}`: the image {path} in the store: {corrupt}")),
-        },
+    let toolchain = match codegen::toolchain(job, unit) {
+        Ok(it) => it.id,
+        Err(why) => return failed(format!("proc macro `{name}`: its toolchain: {why}")),
     };
-    if !bytes.starts_with(b"\0asm") {
-        return failed(format!(
-            "proc macro `{name}` was linked as a native library ({path}); blaze runs a proc macro only \
-             compiled to WebAssembly, in its sandbox, and never loads one into its own process"
-        ));
-    }
-    let dir = job.shared.state.join("macros");
-    let at = dir.join(format!("{:x}.wasm", id));
-    if !at.exists() {
-        let written = std::fs::create_dir_all(&dir).and_then(|()| {
-            let staged = dir.join(format!("{:x}.wasm.{}", id, std::process::id()));
-            std::fs::write(&staged, bytes)?;
-            std::fs::rename(&staged, &at)
-        });
-        if let Err(error) = written {
-            return failed(format!("proc macro `{name}`: writing its module to {}: {error}", at.display()));
-        }
-    }
-    match at.to_str().map(paths::AbsPathBuf::try_from) {
-        Some(Ok(at)) => Some(blaze_macro_wasm::load(&at)),
-        _ => failed(format!("proc macro `{name}`: {} is no absolute UTF-8 path to load it from", at.display())),
-    }
+    Some(blaze_macro_eval::load(reader.db(), krate, toolchain))
 }
 
 /// The lint flags of unit `unit`'s check, as `make` gives them.
@@ -392,43 +377,7 @@ pub(crate) fn unit_lint_flags(job: &Job, unit: usize) -> Result<Vec<String>, Api
     Ok(lint_flags(u, job.plan(unit)?, local(package.source.as_deref())))
 }
 
-/// The lint flags of `unit`'s rustc: cargo's `[lints]`, those of its rustflags, its
-/// `--check-cfg`s, and `--cap-lints allow` for a package cargo shows no warnings of (one not
-/// from a path, and the standard library).
-pub(crate) fn lint_flags(unit: &Unit, plan: &blaze_units::query::UnitPlan, local: bool) -> Vec<String> {
-    let mut out = plan.lints.clone();
-    let mut flags = plan.rustflags.iter();
-    while let Some(flag) = flags.next() {
-        let short = ["-A", "-W", "-D", "-F"];
-        let long = ["--allow", "--warn", "--deny", "--forbid", "--force-warn", "--cap-lints"];
-        let takes_next = short.contains(&flag.as_str()) || long.contains(&flag.as_str());
-        if takes_next {
-            out.push(flag.clone());
-            if let Some(value) = flags.next() {
-                out.push(value.clone());
-            }
-        } else if short.iter().any(|it| flag.starts_with(it)) || long.iter().any(|it| flag.starts_with(&format!("{it}="))) {
-            out.push(flag.clone());
-        }
-    }
-    for spec in &plan.check_cfg {
-        out.push("--check-cfg".to_owned());
-        out.push(spec.clone());
-    }
-    if unit.is_std || !local {
-        out.push("--cap-lints".to_owned());
-        out.push("allow".to_owned());
-    }
-    out
-}
-
-/// Whether cargo shows a package's warnings: one from a path (`(/abs/path)`).
-pub(crate) fn local(source: Option<&str>) -> bool {
-    source.is_some_and(|it| {
-        let path = it.trim_start_matches('(');
-        path.starts_with('/') || path.get(1..3) == Some(":\\") || path.starts_with("\\\\")
-    })
-}
+pub(crate) use load_cargo::v2::{lint_flags, local};
 
 /// Whether a diagnostic is one of rustc's closing lines cargo does not show: "aborting due to
 /// ...", "N warnings emitted" (`cargo/src/cargo/core/compiler/mod.rs`, `on_stderr_line_inner`).
@@ -500,7 +449,10 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
         }
     };
     let sources = mounted.sources(&diags);
-    let style = blaze_diagnostics::emit::Style { ansi: color, short: job.input.short, ..Default::default() };
+    let mut style = blaze_diagnostics::emit::Style { ansi: color, short: job.input.short, ..Default::default() };
+    if let Some(width) = job.input.width {
+        style.width = usize::try_from(width).unwrap_or(usize::MAX);
+    }
     let diagnostics: Vec<Diagnostic> = diags
         .iter()
         .filter(|it| !cargo_hides(&it.message))
@@ -604,8 +556,11 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
                     continue;
                 }
                 match codegen::link(job, unit, path, &makes, &generated, images) {
-                    Ok((bytes, read)) => {
+                    Ok((bytes, read, table)) => {
                         natives.extend(read);
+                        if table.is_some() {
+                            made.table = table;
+                        }
                         files.push((path.to_owned(), bytes, true));
                     }
                     Err(what) => {

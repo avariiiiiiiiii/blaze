@@ -48,7 +48,7 @@ use std::{
 
 use blaze_api::{
     ApiError, Artifact, Diagnostic, Edit, FetchVerb, Level, LinkKind, Mismatch, Response, Targets, TestOutcome,
-    ServedCrate, TestResult, Traced, Ub, UnitStarted, Verb, Worked,
+    ServedCrate, ServedPart, TestResult, Traced, Ub, UnitStarted, Verb, Worked,
     build::{Builder, JobId, Opened, Work},
 };
 use blaze_cas::{Placed, Store};
@@ -1535,6 +1535,7 @@ impl<S: Steps> Jobs<S> {
         };
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.built = job.queries.contains(&prep.queries).then_some(prep.queries);
+        let cargo = targets_of(&job.work).and_then(|it| it.cargo.as_ref());
         let input = JobInput {
             db: w.db.clone(), // clone: a refcount, once per view
             queries: prep.queries,
@@ -1543,8 +1544,10 @@ impl<S: Steps> Jobs<S> {
             config: prep.config,
             units,
             store: w.store.reader(),
-            color: targets_of(&job.work).and_then(|it| it.cargo.as_ref()).map_or(self.setup.color, |it| it.color),
+            color: cargo.map_or(self.setup.color, |it| it.color),
             short,
+            width: cargo.and_then(|it| it.width),
+            verbose: cargo.map_or(0, |it| it.verbose),
             goal: goal_of(&job.work),
             cancelled: job.cancelled.clone(), // clone: a refcount, once per view
         };
@@ -1784,6 +1787,7 @@ impl<S: Steps> Jobs<S> {
             name: package.name.clone(),     // clone: the report owns it, once per package
             version: package.version.clone(), // clone: the report owns it, once per package
             source: package.source.clone(), // clone: the report owns it, once per package
+            package: build.package_of[at],
             verb,
         };
         w.said.push(Said::Report(id, Response::Unit(started)));
@@ -2128,6 +2132,15 @@ impl<S: Steps> Jobs<S> {
         };
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.finished = true;
+        blaze_macro_eval::flush();
+        // The snapshot waits on the last ticket; a verdict the store refuses fails the job.
+        let published = blaze_expand::publish(w.store, blaze_expand::take_puts());
+        if let Some(ticket) = published.tickets.last() {
+            self.put = Some(*ticket);
+        }
+        if let Some(refused) = published.refused.into_iter().next() {
+            job.over.get_or_insert((false, Some(ApiError::new(refused, None))));
+        }
         job.stats = stats;
         if stats.ran > 0 {
             self.cold = true;
@@ -2150,6 +2163,11 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         };
+        if input.verbose > 0 {
+            for note in served.iter().filter_map(noted).chain(writer.goals_noted()) {
+                w.said.push(Said::Report(id, Response::Diagnostic(note)));
+            }
+        }
         if let Some(root) = root
             && let Some(kept) = writer.keep()
         {
@@ -2458,7 +2476,34 @@ fn warned(warning: &str) -> Diagnostic {
         facts: Vec::new(),           // alloc: none
         rendered: format!("warning: {warning}\n"), // alloc: the report owns it
         unit: None,
+        explanation: None,
     }
+}
+
+/// Under `-v`, what a build was refused of the store for dependency `served`, as a note; none
+/// when both its parts were served or checked.
+fn noted(served: &ServedCrate) -> Option<Diagnostic> {
+    let why = served.why.as_deref()?;
+    let refused = |part: ServedPart| part == ServedPart::Refused;
+    let parts = match (refused(served.outcome), refused(served.bodies)) {
+        (true, true) => "its check outcome and bodies are",
+        (true, false) => "its check outcome is",
+        (false, true) => "its bodies are",
+        (false, false) => return None,
+    };
+    // alloc: under `-v`, once per dependency refused
+    let message = format!("dependency `{}`: {parts} not kept in the store: {why}", served.package);
+    Some(Diagnostic {
+        level: Level::Note,
+        code: None,
+        rendered: format!("note: {message}\n"), // alloc: as above
+        message,
+        spans: Vec::new(),    // alloc: none
+        children: Vec::new(), // alloc: none
+        facts: Vec::new(),    // alloc: none
+        unit: None,
+        explanation: None,
+    })
 }
 
 /// Every memo reachable from `from` in `db`, each once, in the order it is reached.

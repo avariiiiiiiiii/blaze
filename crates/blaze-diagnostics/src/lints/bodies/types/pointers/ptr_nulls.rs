@@ -19,7 +19,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{Inits, callee_fn, callee_item, has_attr, is_zero, layout, method_item, peel_casts, span, ty_text};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -40,7 +40,7 @@ enum Useless {
 
 impl LatePass for PtrNullChecks {
     const LINTS: LintSet = lint_set(["useless_ptr_null_checks", "invalid_null_arguments"]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call, ExprTag::MethodCall, ExprTag::BinaryOp]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call, ExprKind::MethodCall, ExprKind::BinaryOp]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();

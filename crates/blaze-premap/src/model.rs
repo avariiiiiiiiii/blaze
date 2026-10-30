@@ -142,7 +142,7 @@ pub(crate) fn place(from: u64, tls_from: u64, functions: &[&CompiledFunction], s
         };
         if value.section.as_deref() == Some(".init_array") {
             let tie = InitEntry::tie_of(&value.item, &value.instance);
-            init.push(InitEntry { rank: u32::MAX, order: [u32::MAX; 3], tie, at: addr, count: (size / 8) as u32 });
+            init.push(InitEntry { rank: 65536, order: [u32::MAX; 3], tie, at: addr, count: (size / 8) as u32 });
         }
         out_statics.push(PlacedStatic { item: value.item, instance: value.instance, at: StaticAt::Addr(addr), size });
     }
@@ -190,7 +190,9 @@ impl Layout {
             Target::Extern(name) | Target::Weak(name) => {
                 self.cells.iter().find(|it| it.0 == *name).map(|it| (it.1, Kind::Data))
             }
-            Target::Position(_) => None,
+            // The model places no SanitizerCoverage arrays or tier counter cells: a site reaching
+            // one is `apply`'s "reaches no" error.
+            Target::Position(_) | Target::Coverage(_) | Target::Counter(_) | Target::ProfileCounters => None,
         }
     }
 
@@ -214,7 +216,7 @@ impl Layout {
         Ok(())
     }
 
-    fn names(&self, names: &[(String, Target)]) -> Result<Vec<(String, Def)>, PremapError> {
+    fn names(&self, names: &[&(String, Target)]) -> Result<Vec<(String, Def)>, PremapError> {
         let mut out = Vec::with_capacity(names.len());
         for (name, target) in names {
             let (value, kind) = self
@@ -250,6 +252,8 @@ fn libraries(natives: &[blaze_link::Native<'_>]) -> Vec<Library> {
 pub(crate) struct Model;
 
 impl Prelink for Model {
+    type Placed = Prelinked;
+
     fn prelink(&self, request: &Request<'_>) -> Result<Prelinked, PremapError> {
         assert_eq!(request.tls_bias, RESERVE.bias, "the model's run keeps its thread-locals at its bias");
         let mut layout = place(request.base, 0, request.functions, request.statics);
@@ -276,6 +280,7 @@ impl Prelink for Model {
             tls: layout.tls,
             unwind: Vec::new(),
             thread_vars: Vec::new(),
+            reached_directly: Vec::new(),
         })
     }
 }
@@ -317,8 +322,8 @@ fn library(libraries: Libraries<'_>, name: &str, weak: bool) -> Result<u64, Prem
 
 /// The whole link of the image's pieces then the workspace's, in one symbol space.
 pub(crate) fn whole(
-    image: (&[&CompiledFunction], &[&Static], &[(String, Target)]),
-    workspace: (&[&CompiledFunction], &[&Static], &[(String, Target)]),
+    image: (&[&CompiledFunction], &[&Static], &[&(String, Target)]),
+    workspace: (&[&CompiledFunction], &[&Static], &[&(String, Target)]),
     base: u64,
     libraries: Libraries<'_>,
 ) -> Result<Run, PremapError> {

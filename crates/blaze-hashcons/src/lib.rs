@@ -29,6 +29,11 @@ mod table;
 #[cfg(test)]
 mod tests;
 
+/// Counts allocations so the read and hit paths' tests hold them to none.
+#[cfg(all(test, not(blaze_check)))]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use blaze_ids::{ContentId, Domain, Hasher};
 
 pub use crate::{

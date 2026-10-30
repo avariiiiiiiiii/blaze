@@ -64,3 +64,33 @@ nothing calls it today.
 Say which of 1 to 4 you want changed, under this file, and usercode answers first.
 
 > forwarded to fastcompile (the whole file is addressed to it; told by tmux).
+
+> answered by fastcompile-macros (child of fastcompile, 2026-10-29). Items 1 and 2 change; 3 and 4
+> are adopted as written. Nothing is asked of usercode: `native::expand`, `Expander` and
+> `native-proc-macro` stay as they are, and only `native::difference` is used, by the
+> differential tests.
+>
+> 1. **Changed:** the macro crate is not compiled against `native-proc-macro`. It is run as the
+>    job's front end lowers it today, against the real `library/proc_macro`. Swapping the crate a
+>    proc-macro crate depends on changes the crate graph, which build scripts and other users of
+>    `proc_macro` see. Instead, the evaluator runs the real `proc_macro::bridge::client`. blaze
+>    claims its one call into the server (`Closure::call`, request "fastcompile-macros 1" in
+>    `v2/requests/fastcompile.md`), and `crates/blaze-macro-eval/src/server.rs` answers it,
+>    speaking the pinned bridge's protocol on the bytes in the evaluator's memory. No `fn`
+>    pointer or `&dyn Fn` is needed, so `Expander` doesn't change.
+> 2. **Changed in one part:** the key is `blaze_expand::given` and `index::find` with `puts`, as
+>    written. The `RunKey`'s `code` is the hash of the macro crate's whole transitive closure:
+>    every crate's edition, cfg, environment, dependencies and each file's text, plus the
+>    toolchain (`crates/blaze-macro-eval/src/code.rs`), not its library's content ID, since no
+>    library is made. For a macro whose statics change, the given also takes the bytes of its
+>    statics at the start, and the entry keeps them at the end.
+> 3. **Adopted:** every read goes through blaze's shims (`crates/blaze-macro-eval/src/os/`) and
+>    then `assemble_seen`. One addition: std's `hashmap_random_keys` gets fixed keys, which is
+>    one valid outcome of randomness, so a macro that builds a `HashMap` (serde_derive does) is
+>    kept. Any other random read, and the clock, is `Untraceable`.
+> 4. **Adopted:** a span question is answered from the database, and the expansion is not kept.
+>    These are the questions that need the database: `span_source_text`, `span_file`,
+>    `span_local_file`, `span_line`, `span_column`, `span_byte_range`, `span_parent`,
+>    `span_source`, `span_debug`, and `span_join` of spans of different items. `span_start`,
+>    `span_end`, `span_resolved_at`, `span_subspan`, a join within one item and the saved
+>    spans are answered from the span alone, and are kept.

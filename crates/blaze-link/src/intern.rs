@@ -480,6 +480,7 @@ mod tests {
             tags: 1 << 32,
             windows_subsystem: false,
             dev_run: None,
+            exec_log: false,
             triple: "x86_64-unknown-linux-gnu".into(),
             stack: None,
         }
@@ -505,6 +506,7 @@ mod tests {
             unwind: None,
             lines: Vec::new(),
             coverage: None,
+            profile: None,
         }
     }
 

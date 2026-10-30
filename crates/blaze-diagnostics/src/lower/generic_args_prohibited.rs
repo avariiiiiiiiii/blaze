@@ -362,15 +362,23 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
         found.push(Found::new(diag, phase_at(segment.syntax())));
     }
 
-    // Only the first constraint is an error, rustc's not to overload with them.
+    // Only the first constraint is an error, rustc's not to overload with them. A parenthesized
+    // segment's is its `Output` (`(A) -> B` is `<(A,), Output = B>` to rustc): at the return
+    // type, or just after `)` when it has none.
     let constraint = checked.iter().find_map(|&i| {
-        segs[i].segment.generic_arg_list()?.generic_args().find_map(|it| match it {
-            ast::GenericArg::AssocTypeArg(it) => Some(it),
+        let segment = segs[i].segment;
+        if let Some(list) = segment.parenthesized_arg_list() {
+            return Some(match segment.ret_type().and_then(|it| it.ty()) {
+                Some(ty) => ty.syntax().text_range(),
+                None => TextRange::empty(list.syntax().text_range().end()),
+            });
+        }
+        segment.generic_arg_list()?.generic_args().find_map(|it| match it {
+            ast::GenericArg::AssocTypeArg(it) => Some(it.syntax().text_range()),
             _ => None,
         })
     });
-    if let Some(constraint) = constraint {
-        let range = constraint.syntax().text_range();
+    if let Some(range) = constraint {
         let mut diag =
             Diag::error(Some("E0229"), "associated item constraints are not allowed here", span(range));
         diag.span_label(span(range), "associated item constraint not allowed here");

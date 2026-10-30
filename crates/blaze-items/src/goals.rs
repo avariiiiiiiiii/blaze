@@ -3,9 +3,11 @@
 //! definitions, its crate's key, and the facts its reads stand for.
 //!
 //! A read stands for a fact when its query is keyed by one item and what the query returns for
-//! that item is part of what the fact hashes (the notes' table, section 3.4). A read of a whole
-//! crate's batch or table, or of a query keyed by several arguments, names no one item: it
-//! stands for no fact, and the goal is not stored.
+//! that item is part of what the fact hashes (the notes' table, section 3.4). A read of a
+//! dependency's batch (its impls' traits, self types and predicates, its fields' types, lowered
+//! for the whole crate at once) stands for the crate's [`Fact::Crate`]. A read of another
+//! crate-wide table, or of a query keyed by several arguments, names no one item: it stands for
+//! no fact, and the goal is not stored.
 
 use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
@@ -100,8 +102,8 @@ fn lang_item_key(db: &Db, target: LangItemTarget) -> ItemKey {
 /// query here is keyed by one salsa struct, taken for one only when the key's page holds that
 /// struct, and returns part of an item's interface (its signature, bounds, fields, items,
 /// variances, attribute flags, an `impl Trait` return's hidden types: `crate::form`), the
-/// crate's target, the impls of one trait for one simplified self type, or whether an impl
-/// may specialize and what it specializes.
+/// crate's target, the impls of one trait for one simplified self type, whether an impl may
+/// specialize and what it specializes, or a dependency's batch, which stands for its crate.
 pub(crate) fn fact_of_read(db: &Db, name: &str, key: Id) -> Option<Fact> {
     let signature = |id: ItemId| Some(Fact::Signature(key::item_key(db, id)));
     match name {
@@ -136,6 +138,10 @@ pub(crate) fn fact_of_read(db: &Db, name: &str, key: Id) -> Option<Fact> {
         "ItemBounds::of" => signature(bounds_owner(db, key)?),
         "AttrFlags::query" => signature(attrs_owner(db, arg(db, key)?)?),
         "target_data_layout_query" => Some(Fact::Target(key::crate_key(db, arg(db, key)?))),
+        "crate_impl_traits"
+        | "crate_impl_self_tys"
+        | "crate_field_types"
+        | "crate_impl_predicates" => Some(facts::whole_crate(db, arg(db, key)?)),
         "relevant_impls" => {
             let read: RelevantImplsKey<'_> = arg(db, key)?;
             let trait_ = read.trait_(db);

@@ -8,7 +8,10 @@
 //!         | 20 array ty size:u8 data:u128 | 21 slice ty | 22 tuple n:u32 ty^n
 //!         | 23 ref region:u8 mutability:u8 ty | 24 raw-ptr mutability:u8 ty
 //! map    := 0 | 1 len:u32 bytes | 2 n:u32 (address:u64 len:u32 bytes)^n m:u32 (address:u64 align:u64)^m
+//!           v:u32 (offset:u64)^v p:u32 (address:u64)^p
 //! ```
+//!
+//! The last two columns of a complex map are where its pointers with provenance are, sorted.
 //!
 //! A value with a part this cannot write (a type naming a definition, another region, a map
 //! holding a static, a vtable or a `TypeId`) is not written at all: [`encode`] answers `None`
@@ -29,7 +32,7 @@ use crate::{
 };
 
 /// The version of what this writes: the first byte of a kept value and part of its key.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// The header of a kept value: [`VERSION`] and the key it is filed under.
 pub(super) const HEADER: usize = 1 + 32;
@@ -98,7 +101,8 @@ fn map_len(map: &MemoryMap<'_>) -> usize {
         MemoryMap::Simple(bytes) => 5 + bytes.len(),
         MemoryMap::Complex(map) => {
             let pieces = map.memory.iter().map(|(_, it)| 12 + it.len()).sum::<usize>();
-            9 + pieces + 16 * map.aligns.len()
+            let pointers = map.value_pointers.len() + map.memory_pointers.len();
+            17 + pieces + 16 * map.aligns.len() + 8 * pointers
         }
     }
 }
@@ -194,7 +198,15 @@ fn put_map(out: &mut Vec<u8>, map: &MemoryMap<'_>) -> Option<()> {
             put_bytes(out, bytes)?;
         }
         MemoryMap::Complex(map) => {
-            let ComplexMemoryMap { memory, vtable, statics, aligns, type_ids } = &**map;
+            let ComplexMemoryMap {
+                memory,
+                vtable,
+                statics,
+                aligns,
+                type_ids,
+                value_pointers,
+                memory_pointers,
+            } = &**map;
             if !statics.is_empty() || vtable.tys().len() != 0 || !type_ids.is_empty() {
                 return None;
             }
@@ -208,6 +220,12 @@ fn put_map(out: &mut Vec<u8>, map: &MemoryMap<'_>) -> Option<()> {
             for &(address, align) in aligns {
                 out.put_u64(u64::try_from(address).ok()?);
                 out.put_u64(u64::try_from(align).ok()?);
+            }
+            for column in [value_pointers, memory_pointers] {
+                put_len(out, column.len())?;
+                for &at in column {
+                    out.put_u64(u64::try_from(at).ok()?);
+                }
             }
         }
     }
@@ -313,11 +331,23 @@ fn get_map<'db>(at: &mut Reader<'_>) -> R<MemoryMap<'db>> {
                 }
                 aligns.push((address, word(at.u64().map_err(err)?)?));
             }
-            let map = ComplexMemoryMap {
+            let mut map = ComplexMemoryMap {
                 memory: MemoryPieces::from_columns(bytes, addresses, extents),
                 aligns,
                 ..ComplexMemoryMap::default()
             };
+            for column in [&mut map.value_pointers, &mut map.memory_pointers] {
+                let count = at.count_u32(8).map_err(err)?;
+                // alloc: as above
+                column.reserve_exact(count);
+                for _ in 0..count {
+                    let place = word(at.u64().map_err(err)?)?;
+                    if column.last().is_some_and(|&last| last >= place) {
+                        return Err("pointers with provenance out of the order of their places");
+                    }
+                    column.push(place);
+                }
+            }
             // alloc: as above
             Ok(MemoryMap::Complex(Box::new(map)))
         }

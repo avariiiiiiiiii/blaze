@@ -17,7 +17,10 @@ use base_db::{Db, Crate};
 use hir_expand::{ErasedAstId, InFile, name::Name};
 use intern::Symbol;
 use rustc_hash::FxHashSet;
-use syntax::{AstNode, SmolStr, SyntaxKind, SyntaxNode, T, TextRange, ast};
+use syntax::{
+    SmolStr, SyntaxKind, T, TextRange, ast as tag,
+    view::{self as ast, AstNode},
+};
 
 use crate::{
     AdtId, AssocItemId, AstId, BlockId, DefWithBodyId, HasModule, ItemContainerId, Lookup,
@@ -286,28 +289,32 @@ fn owner_in_module(
 /// where the expansion is, and the search goes on from there in the file of the call.
 fn owning_item(
     db: &Db,
-    block: AstId<ast::BlockExpr>,
+    block: AstId<tag::BlockExpr>,
 ) -> Result<ErasedAstId, String> {
-    fn range<N: AstNode>(it: N) -> TextRange {
+    fn range<'t, N: AstNode<'t>>(it: N) -> TextRange {
         it.syntax().text_range()
     }
     let mut file = block.file_id;
-    // clone: a node handle, a count bump
-    let mut node: SyntaxNode = block.to_node(db).syntax().clone();
+    let mut node: ast::Node<'_> = block.to_view(db).syntax();
     loop {
         let at = node.text_range();
         let map = file.ast_id_map(db);
         for ancestor in node.ancestors() {
-            // clone: a node handle, a count bump
-            if let Some(variant) = ast::Variant::cast(ancestor.clone()) {
+            if let Some(variant) = ast::Variant::cast(ancestor) {
                 within(variant.const_arg().map(range), at, "an enum variant's fields")?;
-                return Ok(InFile::new(file, map.ast_id(&variant).erase()));
+                return Ok(InFile::new(file, map.ast_id_of_view::<tag::Variant>(variant).erase()));
             }
             let Some(item) = ast::Item::cast(ancestor) else { continue };
-            let (body, item) = match &item {
-                ast::Item::Fn(it) => (it.body().map(range), map.ast_id(it).erase()),
-                ast::Item::Const(it) => (it.body().map(range), map.ast_id(it).erase()),
-                ast::Item::Static(it) => (it.body().map(range), map.ast_id(it).erase()),
+            let (body, item) = match item {
+                ast::Item::Fn(it) => {
+                    (it.body().map(range), map.ast_id_of_view::<tag::Fn>(it).erase())
+                }
+                ast::Item::Const(it) => {
+                    (it.body().map(range), map.ast_id_of_view::<tag::Const>(it).erase())
+                }
+                ast::Item::Static(it) => {
+                    (it.body().map(range), map.ast_id_of_view::<tag::Static>(it).erase())
+                }
                 // In a body these are expressions or statements, with the block around them:
                 // a macro call's arguments are tokens.
                 ast::Item::MacroCall(_) | ast::Item::AsmExpr(_) => continue,
@@ -317,7 +324,7 @@ fn owning_item(
             within(body, at, "the signature of an item")?;
             return Ok(InFile::new(file, item));
         }
-        let Some(call) = file.call_node(db) else {
+        let Some(call) = file.call_node_view(db) else {
             // alloc: error path
             return Err(format!("a block in no item with a body ({block:?})"));
         };
@@ -392,7 +399,7 @@ impl Look {
     ) -> bool {
         let Some(body) = body_syntax(db, owner) else { return false };
         let declaring = self.macros(db, owner.module(db).krate(db));
-        any_word(&body, |word| {
+        any_word(body, |word| {
             self.says(word) || local.contains(word) || {
                 let key = intern::order_key(word.as_bytes());
                 declaring
@@ -471,7 +478,7 @@ impl Look {
 /// Whether `f` accepts a word of `node`: an identifier, but those of a macro's metavariables
 /// (`$name`), without `r#`. Read in place from the tokens: a body's words are not interned, so
 /// scanning a dependency's bodies writes nothing to the symbol table.
-fn any_word(node: &SyntaxNode, mut f: impl FnMut(&str) -> bool) -> bool {
+fn any_word(node: ast::Node<'_>, mut f: impl FnMut(&str) -> bool) -> bool {
     let mut after_dollar = false;
     for token in node.descendants_with_tokens().filter_map(|it| it.into_token()) {
         let kind = token.kind();
@@ -490,7 +497,7 @@ fn any_word(node: &SyntaxNode, mut f: impl FnMut(&str) -> bool) -> bool {
 }
 
 /// The words of `node` ([`any_word`]), interned: for a macro's definition, read once per macro.
-fn words(node: &SyntaxNode) -> Vec<Symbol> {
+fn words(node: ast::Node<'_>) -> Vec<Symbol> {
     // alloc: the query's result, once per execution (per crate or per body)
     let mut words = Vec::new();
     any_word(node, |word| {
@@ -501,23 +508,19 @@ fn words(node: &SyntaxNode) -> Vec<Symbol> {
 }
 
 /// The expression of the body of `owner`, as it is written.
-fn body_syntax(db: &Db, owner: DefWithBodyId) -> Option<SyntaxNode> {
+fn body_syntax(db: &Db, owner: DefWithBodyId) -> Option<ast::Node<'_>> {
     match owner {
         DefWithBodyId::FunctionId(it) => {
-            // clone: a node handle, a count bump
-            it.lookup(db).source(db).value.body().map(|it| it.syntax().clone())
+            it.lookup(db).source_view(db).value.body().map(|it| it.syntax())
         }
         DefWithBodyId::ConstId(it) => {
-            // clone: a node handle, a count bump
-            it.lookup(db).source(db).value.body().map(|it| it.syntax().clone())
+            it.lookup(db).source_view(db).value.body().map(|it| it.syntax())
         }
         DefWithBodyId::StaticId(it) => {
-            // clone: a node handle, a count bump
-            it.lookup(db).source(db).value.body().map(|it| it.syntax().clone())
+            it.lookup(db).source_view(db).value.body().map(|it| it.syntax())
         }
         DefWithBodyId::VariantId(it) => {
-            // clone: a node handle, a count bump
-            it.lookup(db).source(db).value.const_arg().map(|it| it.syntax().clone())
+            it.lookup(db).source_view(db).value.const_arg().map(|it| it.syntax())
         }
     }
 }
@@ -547,11 +550,11 @@ fn macro_text(db: &Db, id: MacroId) -> MacroText {
         // The body only: the macro's own attributes are not in what it writes.
         MacroId::MacroRulesId(it) => {
             let loc = it.lookup(db);
-            (loc.expander, loc.id.to_node(db).token_tree())
+            (loc.expander, loc.id.to_view(db).token_tree())
         }
         MacroId::Macro2Id(it) => {
             let loc = it.lookup(db);
-            (loc.expander, loc.id.to_node(db).body())
+            (loc.expander, loc.id.to_view(db).body())
         }
     };
     match expander {
@@ -648,5 +651,27 @@ mod root_word_tests {
         }
         assert!(Look::DiagnosticItems.says("rustc_diagnostic_item"));
         assert!(!Look::DiagnosticItems.says("lang"));
+    }
+
+    /// Reading the words of a body allocates nothing: the walk reads the tree's columns and
+    /// each word is a slice of the source. A metavariable's name is no word, and `r#` is cut.
+    #[test]
+    fn reading_a_bodys_words_allocates_nothing() {
+        let parse = syntax::SourceFile::parse(
+            "fn f() { let r#x = 1; m!($y, z); { struct S; } }",
+            syntax::Edition::CURRENT,
+        );
+        let root = parse.root();
+        let expected = ["f", "x", "m", "z", "S"];
+        let mut at = 0;
+        let stopped = blaze_alloc_count::assert_at_most(0, "a body's words", || {
+            super::any_word(root, |word| {
+                assert_eq!(word, expected[at]);
+                at += 1;
+                false
+            })
+        });
+        assert!(!stopped);
+        assert_eq!(at, expected.len());
     }
 }

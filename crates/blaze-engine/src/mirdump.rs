@@ -104,10 +104,13 @@ struct Dump<'a> {
 impl<'a> Dump<'a> {
     /// Where a function is written: its file and offset, for the order rustc writes them in.
     fn position(&self, func: FunctionId) -> (String, u32) {
-        let Some(source) = hir::HasSource::source(hir::Function::from(func), self.db) else {
+        let Some(source) = hir::view::HasSourceView::source_view(hir::Function::from(func), self.db)
+        else {
             return (String::new(), 0);
         };
-        let range = source.syntax().original_file_range_rooted(self.db);
+        let range = source
+            .map(|it| syntax::view::AstNode::syntax(&it).text_range())
+            .original_node_file_range_rooted(self.db);
         let file = range.file_id.file_id(self.db);
         (self.vfs.file_path(file).to_string(), range.range.start().into())
     }

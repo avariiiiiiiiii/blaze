@@ -15,7 +15,7 @@ use test_fixture::WithFixture;
 
 use super::{codec, *};
 use crate::{
-    ComplexMemoryMap, MemoryMap,
+    ComplexMemoryMap, MemoryMap, PointerAt,
     next_solver::{
         AllocationData, Const, ConstExt as _, ConstKind, ScalarInt, Ty, TyKind, Tys, ValTree,
         ValTreeKind, ValueConst, default_types,
@@ -43,13 +43,15 @@ fn scalar(ty: Ty<'static>, memory: &[u8]) -> Allocation<'static> {
     alloc(ty, memory, MemoryMap::Empty)
 }
 
-/// Two pieces, inserted out of address order, with their alignments.
+/// Two pieces, inserted out of address order, with their alignments and the reference's
+/// pointer word with provenance.
 fn complex() -> MemoryMap<'static> {
     let mut map = ComplexMemoryMap::default();
     map.insert(0x2000, Box::new(*b"hello"));
     map.insert(0x1000, Box::new([1, 2, 3, 4]));
     map.note_align(0x1000, 4);
     map.note_align(0x2000, 1);
+    map.note_pointer(PointerAt::Value(0));
     MemoryMap::Complex(Box::new(map))
 }
 

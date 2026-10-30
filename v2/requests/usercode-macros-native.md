@@ -211,6 +211,7 @@ more than one step (bitflags' `__impl_*` macros are separate expansions, each wi
 contexts, so it could not be exact. The reasoning is in the notes.
 
 > forwarded to db: a note, nothing to change in `hir-expand`.
+> checked by db-audit-other (22:40): nothing to apply, a note. `crates/hir-expand/` has no `bitflags` expander, as it says.
 
 ## 6. To fastcompile (forwarded by the coordinator): what this lane has on the proc-macro bridge
 

@@ -10,12 +10,14 @@
 use blaze_codegen::{Arch, CompiledFunction, InstanceKey, Static, Target};
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
+use blaze_link::premap as link;
 use blaze_link::{Format, Native, Output, OutputKind};
+use rayon::prelude::*;
 
 use crate::PremapError;
-use crate::image::{self, Meta};
+use crate::image::{self, Meta, Pieces};
 use crate::key::ImageKey;
-use crate::table::{Def, Kind, Strength, SymbolId};
+use crate::table::{self, Def, Kind, Strength, SymbolId, TableView};
 
 /// What the prelink links.
 pub struct Request<'a> {
@@ -30,15 +32,212 @@ pub struct Request<'a> {
     pub tls_bias: i64,
     pub functions: &'a [&'a CompiledFunction],
     pub statics: &'a [&'a Static],
-    pub names: &'a [(String, Target)],
-    pub debug_names: &'a [(InstanceKey, String)],
+    pub names: &'a [&'a (String, Target)],
+    pub debug_names: &'a [&'a (InstanceKey, String)],
     pub natives: &'a [Native<'a>],
     pub spans: &'a [(ContentId, &'a [u8])],
+    /// Codegen's digests of `functions`, `statics` and `debug_names`, in their order: kept in
+    /// the image so a build checks its pieces against it with no hash of its own.
+    pub function_digests: &'a [ContentId],
+    pub static_digests: &'a [ContentId],
+    pub debug_digests: &'a [ContentId],
 }
 
 /// blaze-link, linking a dependency image.
 pub trait Prelink: Sync {
-    fn prelink(&self, request: &Request<'_>) -> Result<Prelinked, PremapError>;
+    type Placed: Placed;
+    fn prelink(&self, request: &Request<'_>) -> Result<Self::Placed, PremapError>;
+}
+
+/// A prelink placed and relocated, its segments' bytes written only into the image's value,
+/// so a cold prelink writes them once.
+pub trait Placed {
+    /// What the prelink says; its segments' `bytes` may be empty, [`Placed::len`] says how
+    /// many it has.
+    fn linked(&self) -> &Prelinked;
+    /// How many bytes segment `at` has from its start; zeroes follow to its size.
+    fn len(&self, at: usize) -> u64;
+    /// Writes each segment's bytes at its offset of `out`: one offset per segment, increasing,
+    /// each a multiple of the page and its segment inside `out`.
+    fn write_into(&self, out: &mut [u8], offsets: &[usize]) -> Result<(), PremapError>;
+}
+
+/// A prelink whose segments hold their bytes: written by a copy of each.
+impl Placed for Prelinked {
+    fn linked(&self) -> &Prelinked {
+        self
+    }
+
+    fn len(&self, at: usize) -> u64 {
+        self.segments[at].bytes.len() as u64
+    }
+
+    fn write_into(&self, out: &mut [u8], offsets: &[usize]) -> Result<(), PremapError> {
+        if offsets.len() != self.segments.len() {
+            return Err(PremapError::of(format_args!("{} offsets for {} segments", offsets.len(), self.segments.len())));
+        }
+        let mut rest = out;
+        let mut consumed = 0;
+        for (segment, offset) in self.segments.iter().zip(offsets) {
+            let len = segment.bytes.len();
+            let fits = *offset >= consumed && offset.checked_add(len).is_some_and(|end| end - consumed <= rest.len());
+            if !fits {
+                return Err(PremapError::of(format_args!(
+                    "the segment at {:#x} does not fit at offset {offset} of the image",
+                    segment.addr
+                )));
+            }
+            let (_, from) = std::mem::take(&mut rest).split_at_mut(offset - consumed);
+            let (into, after) = from.split_at_mut(len);
+            into.par_chunks_mut(COPY_PIECE)
+                .zip(segment.bytes.par_chunks(COPY_PIECE))
+                .for_each(|(into, from)| into.copy_from_slice(from));
+            rest = after;
+            consumed = offset + len;
+        }
+        Ok(())
+    }
+}
+
+/// Segment bytes are copied in pieces of this size, in parallel.
+const COPY_PIECE: usize = 1 << 20;
+
+/// blaze-link's prelink ([`blaze_link::premap::prelink_placed`]), whose types mirror these
+/// field for field.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Link;
+
+/// [`Link`]'s answer: blaze-link's placed prelink, which writes the segments itself.
+pub struct LinkPlaced {
+    placed: link::Placed,
+    linked: Prelinked,
+}
+
+impl Placed for LinkPlaced {
+    fn linked(&self) -> &Prelinked {
+        &self.linked
+    }
+
+    fn len(&self, at: usize) -> u64 {
+        self.placed.segments[at].len
+    }
+
+    fn write_into(&self, out: &mut [u8], offsets: &[usize]) -> Result<(), PremapError> {
+        self.placed
+            .write_into(out, offsets)
+            .map_err(|error| PremapError::of(format_args!("writing the dependency image's segments: {error}")))
+    }
+}
+
+impl Prelink for Link {
+    type Placed = LinkPlaced;
+
+    fn prelink(&self, request: &Request<'_>) -> Result<LinkPlaced, PremapError> {
+        // alloc: once per image made: blaze-link's request takes the names as values
+        let names: Vec<(String, Target)> = request.names.iter().map(|it| (*it).clone()).collect(); // clone: as above
+        // alloc: once per image made, as above
+        let debug_names: Vec<(InstanceKey, String)> = request.debug_names.iter().map(|it| (*it).clone()).collect(); // clone: as above
+        let mut placed = link::prelink_placed(&link::Request {
+            output: request.output,
+            base: request.base,
+            tls_bias: request.tls_bias,
+            functions: request.functions,
+            statics: request.statics,
+            names: &names,
+            debug_names: &debug_names,
+            natives: request.natives,
+            spans: request.spans,
+        })
+        .map_err(|error| PremapError::of(format_args!("the prelink of a dependency image: {error}")))?;
+        let mut linked = from_link(std::mem::take(&mut placed.linked));
+        linked.segments = placed
+            .segments
+            .iter()
+            .map(|it| Segment { addr: it.addr, size: it.size, prot: prot_of_link(it.prot), bytes: Vec::new() })
+            .collect(); // alloc: once per image made: its segments' places
+        Ok(LinkPlaced { placed, linked })
+    }
+}
+
+fn prot_of_link(prot: link::Prot) -> Prot {
+    match prot {
+        link::Prot::Code => Prot::Code,
+        link::Prot::ReadOnly => Prot::ReadOnly,
+        link::Prot::Data => Prot::Data,
+    }
+}
+
+/// What blaze-link gave back, as premap's types.
+fn from_link(linked: link::Prelinked) -> Prelinked {
+    let entry = |it: link::InitEntry| InitEntry { rank: it.rank, order: it.order, tie: it.tie, at: it.at, count: it.count };
+    let tls = |it: link::Tls| Tls { template: it.template, init: it.init, size: it.size, align: it.align };
+    let prot = prot_of_link;
+    let at = |it: link::StaticAt| match it {
+        link::StaticAt::Addr(addr) => StaticAt::Addr(addr),
+        link::StaticAt::ThreadLocal(offset) => StaticAt::ThreadLocal(offset),
+    };
+    let bind = |it: link::BindKind| match it {
+        link::BindKind::Addr => BindKind::Addr,
+        link::BindKind::TpOff => BindKind::TpOff,
+    };
+    Prelinked {
+        segments: linked
+            .segments
+            .into_iter()
+            .map(|it| Segment { addr: it.addr, size: it.size, prot: prot(it.prot), bytes: it.bytes })
+            .collect(), // alloc: once per image made: a list of the answer
+        functions: linked.functions,
+        statics: linked
+            .statics
+            .into_iter()
+            .map(|it| PlacedStatic { item: it.item, instance: it.instance, at: at(it.at), size: it.size })
+            .collect(), // alloc: once per image made, as above
+        names: linked.names.into_iter().map(|it| PlacedName { name: it.name, def: def_of_link(it.def) }).collect(), // alloc: as above
+        binds: linked
+            .binds
+            .into_iter()
+            .map(|it| Bind { place: it.place, name: it.name, addend: it.addend, kind: bind(it.kind), weak: it.weak })
+            .collect(), // alloc: once per image made, as above
+        libraries: linked
+            .libraries
+            .into_iter()
+            .map(|it| Library { name: it.name, order: it.order, as_needed: it.as_needed })
+            .collect(), // alloc: once per image made, as above
+        init: linked.init.into_iter().map(entry).collect(), // alloc: once per image made, as above
+        fini: linked.fini.into_iter().map(entry).collect(), // alloc: once per image made, as above
+        tls: linked.tls.map(tls),
+        unwind: linked.unwind,
+        thread_vars: linked.thread_vars,
+        reached_directly: linked.reached_directly,
+    }
+}
+
+/// blaze-link's definition of a name, as the table keeps it.
+pub(crate) fn def_of_link(def: link::Def) -> Def {
+    let kind = match def.kind {
+        link::Kind::Function => Kind::Function,
+        link::Kind::Data => Kind::Data,
+        link::Kind::ThreadLocal => Kind::ThreadLocal,
+    };
+    let strength = match def.strength {
+        link::Strength::Strong => Strength::Strong,
+        link::Strength::Weak => Strength::Weak,
+    };
+    Def { value: def.value, size: def.size, kind, strength, order: def.order }
+}
+
+/// A table definition, as blaze-link takes it: the inverse of [`def_of_link`].
+pub(crate) fn link_def(def: Def) -> link::Def {
+    let kind = match def.kind {
+        Kind::Function => link::Kind::Function,
+        Kind::Data => link::Kind::Data,
+        Kind::ThreadLocal => link::Kind::ThreadLocal,
+    };
+    let strength = match def.strength {
+        Strength::Strong => link::Strength::Strong,
+        Strength::Weak => link::Strength::Weak,
+    };
+    link::Def { value: def.value, size: def.size, kind, strength, order: def.order }
 }
 
 /// A run of the address space with one protection.
@@ -119,7 +318,7 @@ pub struct Library {
 }
 
 /// One piece of an init or fini array: `count` 8-byte function pointers at `at`. A whole
-/// link orders pieces by `rank` (`.init_array.NNNNN`'s priority; `u32::MAX` for none), then
+/// link orders pieces by `rank` (`.init_array.NNNNN`'s priority; 65536 for none), then
 /// by `order` (the input's place on the line, its member and its section; `u32::MAX` each
 /// for Rust's pieces, which go after natives), then by `tie` (Rust's: the static's item and
 /// instance); within a piece the pointers run in address order.
@@ -173,6 +372,9 @@ pub struct Prelinked {
     pub unwind: Vec<(u64, u64)>,
     /// Mach-O: the thread-local descriptors (`__thread_vars`) the run's loader fills.
     pub thread_vars: Vec<(u64, u64)>,
+    /// The names the image defines weakly and its own code reaches other than through a
+    /// bind, so no definition beside the image may win over them. Sorted, each once.
+    pub reached_directly: Vec<String>,
 }
 
 /// The addresses dependency images and the workspace images beside them take: just above
@@ -186,7 +388,7 @@ pub const IMAGES: std::ops::Range<u64> = blaze_inproc::BASES.end..0x80_0000_0000
 pub fn base(format: Format, arch: Arch) -> Result<u64, PremapError> {
     match (format, arch) {
         (Format::Wasm, _) | (_, Arch::Wasm32) => {
-            Err(PremapError::new("wasm has no dependency image: code is reached by index, not mapped".to_owned()))
+            Err(PremapError::of(format_args!("wasm has no dependency image: code is reached by index, not mapped")))
         }
         _ => Ok(IMAGES.start),
     }
@@ -210,7 +412,7 @@ pub fn output(dev: &Output, key_name: &str) -> Output {
     Output {
         format: dev.format,
         arch: dev.arch,
-        kind: OutputKind::Shared { name: key_name.to_owned(), exports: Vec::new() },
+        kind: OutputKind::Shared { name: key_name.to_owned(), exports: Vec::new() }, // alloc: setup, once per image made
         interpreter: None,
         platform: dev.platform,
         incremental: false,
@@ -219,23 +421,29 @@ pub fn output(dev: &Output, key_name: &str) -> Output {
         tags: dev.tags,
         stack: dev.stack,
         windows_subsystem: dev.windows_subsystem,
+        dev_run: None,
+        triple: dev.triple.clone(), // clone: setup, once per image made: the output owns it
+        exec_log: false,
     }
 }
 
 /// The image of `request`, through `linker`, checked and encoded under `key`.
 pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Result<Vec<u8>, PremapError> {
     if request.output.incremental || request.output.live.is_some() {
-        return Err(PremapError::new("a dependency image is linked whole: its output is neither incremental nor live".to_owned()));
+        return Err(PremapError::of(format_args!(
+            "a dependency image is linked whole: its output is neither incremental nor live"
+        )));
     }
     let page = page(request.output.format, request.output.arch);
     if request.base % page != 0 || !IMAGES.contains(&request.base) {
-        return Err(PremapError::new(format!(
+        return Err(PremapError::of(format_args!(
             "the image's base {:#x} is not page-aligned in {:#x}..{:#x}",
             request.base, IMAGES.start, IMAGES.end
         )));
     }
-    let linked = linker.prelink(request)?;
-    check(request, &linked, page)?;
+    let placed = linker.prelink(request)?;
+    check(request, &placed, page)?;
+    let linked = placed.linked();
 
     let mut entries: Vec<(SymbolId, Def)> =
         Vec::with_capacity(linked.functions.len() + linked.statics.len() + linked.names.len());
@@ -254,30 +462,76 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
     for name in &linked.names {
         entries.push((SymbolId::name(&name.name), name.def));
     }
+    let mut table = table::build(&entries)?;
+    let fail = |what: std::fmt::Arguments<'_>| Err(PremapError::of(format_args!("the prelink of the dependency image {what}")));
+    let placed = |table: &Vec<u8>, id: &SymbolId| TableView::trusted(table).get(id).is_some();
+
+    if request.function_digests.len() != request.functions.len()
+        || request.static_digests.len() != request.statics.len()
+        || request.debug_digests.len() != request.debug_names.len()
+    {
+        return Err(PremapError::of(format_args!(
+            "the dependency image was asked with digests not one per function, static and debug name"
+        )));
+    }
+    let mut contents = Vec::with_capacity(request.functions.len() + request.statics.len());
+    for (function, digest) in request.functions.iter().zip(request.function_digests) {
+        let id = SymbolId::function(&function.key);
+        if !placed(&table, &id) {
+            return fail(format_args!("placed no {:?}", function.key));
+        }
+        contents.push(*digest);
+        table::set_content(&mut table, &id, contents.len() as u32)?;
+    }
+    let mut statics = Vec::with_capacity(request.statics.len());
+    for (value, definition) in request.statics.iter().zip(request.static_digests) {
+        let id = SymbolId::of_static(&value.item, &value.instance);
+        if !placed(&table, &id) {
+            return fail(format_args!("placed no static {:?}", value.item));
+        }
+        contents.push(*definition);
+        table::set_content(&mut table, &id, contents.len() as u32)?;
+        statics.push(((value.item, value.instance), *definition));
+    }
+    statics.sort_unstable_by_key(|it| it.0);
+    for (name, _) in request.names {
+        if !placed(&table, &SymbolId::name(name)) {
+            return fail(format_args!("defined no `{name}`"));
+        }
+    }
+    for (at, (function, _)) in request.debug_names.iter().enumerate() {
+        table::set_debug(&mut table, &SymbolId::function(function), at as u32 + 1)?;
+    }
+    for name in &linked.reached_directly {
+        table::set_reached_directly(&mut table, &SymbolId::name(name))?;
+    }
     let meta = Meta { key, format: request.output.format, arch: request.output.arch, base: request.base, page };
-    image::encode(&meta, &linked, &entries)
+    let pieces = Pieces {
+        table: &table,
+        contents: &contents,
+        debug: request.debug_digests,
+        statics: &statics,
+        names: request.names.len() as u64,
+    };
+    image::encode(&meta, &placed, &pieces)
 }
 
 /// What came back is what was asked, and maps.
-fn check(request: &Request<'_>, linked: &Prelinked, page: u64) -> Result<(), PremapError> {
-    let fail = |what: String| Err(PremapError::new(format!("the prelink of the dependency image {what}")));
+fn check(request: &Request<'_>, placed: &impl Placed, page: u64) -> Result<(), PremapError> {
+    let fail = |what: std::fmt::Arguments<'_>| Err(PremapError::of(format_args!("the prelink of the dependency image {what}")));
+    let linked = placed.linked();
     let mut end = request.base;
-    for segment in &linked.segments {
+    for (at, segment) in linked.segments.iter().enumerate() {
         if segment.addr % page != 0 || segment.addr < end {
-            return fail(format!("placed a segment at {:#x}, not page-aligned after {end:#x}", segment.addr));
+            return fail(format_args!("placed a segment at {:#x}, not page-aligned after {end:#x}", segment.addr));
         }
-        if (segment.bytes.len() as u64) > segment.size || segment.size == 0 {
-            return fail(format!(
-                "made a segment at {:#x} of {} bytes in {}",
-                segment.addr,
-                segment.bytes.len(),
-                segment.size
-            ));
+        if placed.len(at) > segment.size || segment.size == 0 {
+            return fail(format_args!("made a segment at {:#x} of {} bytes in {}", segment.addr, placed.len(at), segment.size));
         }
         end = match segment.addr.checked_add(segment.size).filter(|end| *end <= IMAGES.end) {
             Some(end) => end,
             None => {
-                return fail(format!(
+                return fail(format_args!(
                     "made a segment at {:#x} reaching past {:#x}, where run processes map images",
                     segment.addr, IMAGES.end
                 ));
@@ -290,48 +544,34 @@ fn check(request: &Request<'_>, linked: &Prelinked, page: u64) -> Result<(), Pre
         })
     };
 
-    let mut placed: Vec<InstanceKey> = linked.functions.iter().map(|it| it.0).collect();
-    placed.sort_unstable();
-    for function in request.functions {
-        if placed.binary_search(&function.key).is_err() {
-            return fail(format!("placed no {:?}", function.key));
-        }
-    }
     for (key, addr, size) in &linked.functions {
         if !inside(*addr, (*size).max(1), false) {
-            return fail(format!("placed {key:?} at {addr:#x}, outside its segments"));
-        }
-    }
-    let mut statics: Vec<(ItemKey, ContentId)> = linked.statics.iter().map(|it| (it.item, it.instance)).collect();
-    statics.sort_unstable();
-    for value in request.statics {
-        if statics.binary_search(&(value.item, value.instance)).is_err() {
-            return fail(format!("placed no static {:?}", value.item));
+            return fail(format_args!("placed {key:?} at {addr:#x}, outside its segments"));
         }
     }
     for bind in &linked.binds {
         if bind.place % 8 != 0 || !inside(bind.place, 8, true) {
-            return fail(format!("binds `{}` at {:#x}, not an aligned cell of a writable segment", bind.name, bind.place));
+            return fail(format_args!("binds `{}` at {:#x}, not an aligned cell of a writable segment", bind.name, bind.place));
         }
     }
     for entry in linked.init.iter().chain(&linked.fini) {
         if entry.at % 8 != 0 || !inside(entry.at, u64::from(entry.count) * 8, false) {
-            return fail(format!("made an init or fini piece at {:#x} outside its segments", entry.at));
+            return fail(format_args!("made an init or fini piece at {:#x} outside its segments", entry.at));
         }
     }
     if let Some(tls) = linked.tls {
         if tls.init > tls.size || !tls.align.is_power_of_two() || (tls.init > 0 && !inside(tls.template, tls.init, false)) {
-            return fail(format!("made a thread-local template at {:#x} that is not one", tls.template));
+            return fail(format_args!("made a thread-local template at {:#x} that is not one", tls.template));
         }
     }
     for (addr, len) in &linked.unwind {
         if !inside(*addr, *len, false) {
-            return fail(format!("made call frame information at {addr:#x} outside its segments"));
+            return fail(format_args!("made call frame information at {addr:#x} outside its segments"));
         }
     }
     for (addr, len) in &linked.thread_vars {
         if addr % 8 != 0 || len % 24 != 0 || !inside(*addr, *len, true) {
-            return fail(format!("made thread-local descriptors at {addr:#x} outside its writable segments"));
+            return fail(format_args!("made thread-local descriptors at {addr:#x} outside its writable segments"));
         }
     }
     Ok(())

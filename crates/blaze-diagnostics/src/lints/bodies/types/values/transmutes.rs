@@ -25,7 +25,7 @@ use rustc_type_ir::{
 };
 
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
@@ -35,7 +35,7 @@ pub(crate) struct MutableTransmutes;
 
 impl LatePass for MutableTransmutes {
     const LINTS: LintSet = lint_set(["mutable_transmutes"]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Path]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Path]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some((from, to)) = transmute_types(b, expr) else { return };
@@ -148,7 +148,7 @@ impl LatePass for CheckTransmutes {
     const LINTS: LintSet =
         lint_set(["ptr_to_integer_transmute_in_consts", "unnecessary_transmutes", "integer_to_ptr_transmutes"]);
     const HOOKS: Hooks = Hooks::BODY;
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
 
     fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
         self.built = false;

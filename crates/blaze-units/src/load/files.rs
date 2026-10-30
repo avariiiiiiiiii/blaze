@@ -7,31 +7,31 @@
 //!   a fetch or an error naming it. Outside every mount only the files the client sent are
 //!   (`Invocation::files`), and a file of a directory above the view or the cwd, or of
 //!   `$CARGO_HOME`, that it did not send is absent.
-//! - blaze-manifest reads through a [`Snapshot`]: an owned `Files` that answers from what was
-//!   read so far and records what it was asked and did not have. [`run_over`] runs a step over
-//!   it, reads what it missed, and runs it again until it misses nothing; what the last run used
-//!   is the snapshot a query keeps, so a later query runs blaze-manifest again over exactly those
-//!   files, and a `Cargo.toml` kept in its canonical form makes a comment edit cut off.
+//! - blaze-manifest reads through a [`Snap`], which [`read_through`] makes over the step's
+//!   `Cx`: each file is asked of the database when blaze-manifest asks for it, once, and its
+//!   bytes are lent from where the database keeps them. A TOML file is read as its
+//!   [`TomlFile`], its canonical form, so a comment edit cuts off there, and a manifest is
+//!   parsed once, by its [`super::manifest::ManifestQuery`], whichever step reads it.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::{Component, Path};
-use std::rc::Rc;
 
 use blaze_ids::ContentId;
 use blaze_manifest::files::{FileKind, Files};
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use blaze_format::{FormatError, Persist, SchemaHash, Slice, Writer};
-use rustc_hash::{FxHashMap, FxHashSet};
+use cargo_util_schemas::manifest::TomlManifest;
+use rustc_hash::FxHashMap;
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 
+use super::config::ConfigOf;
 use super::invocation::Invocation;
 use super::key_id;
-use crate::query::{Cbor, Mount, Origin, Versioned, producer};
+use crate::query::{Cbor, LoadError, Mount, Origin, Versioned, producer};
 
 /// What a path is.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -720,64 +720,9 @@ pub(crate) fn ancestors(path: &str) -> Vec<String> {
     out
 }
 
-/// What a step read, by absolute path, and what it found.
-// BTreeMap: written into CBOR query values (`ManifestRead`).
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
-pub(crate) struct Snapshot {
-    pub files: BTreeMap<String, Found<Vec<u8>>>,
-    pub dirs: BTreeMap<String, Found<Vec<(String, bool)>>>,
-}
-
-impl Snapshot {
-    /// Adds what `other` has that this does not.
-    pub fn merge(&mut self, other: Snapshot) {
-        for (path, found) in other.files {
-            self.files.entry(path).or_insert(found);
-        }
-        for (path, found) in other.dirs {
-            self.dirs.entry(path).or_insert(found);
-        }
-    }
-
-    /// The first path it used that is under no mount.
-    pub fn unmounted(&self) -> Option<&str> {
-        let files = self.files.iter().filter(|(_, it)| **it == Found::Unmounted).map(|(p, _)| p);
-        let dirs = self.dirs.iter().filter(|(_, it)| **it == Found::Unmounted).map(|(p, _)| p);
-        files.chain(dirs).min().map(String::as_str)
-    }
-
-}
-
-/// What a [`run_over`] used, and which of its files it read as they are (`raw`); every other
-/// came from a snapshot a query kept, canonical already.
-pub(crate) struct Used {
-    snapshot: Snapshot,
-    raw: FxHashSet<String>,
-}
-
-impl Used {
-    /// The first path it used that is under no mount.
-    pub fn unmounted(&self) -> Option<&str> {
-        self.snapshot.unmounted()
-    }
-
-    /// The snapshot with every TOML file (manifests, config files) in its canonical form: its
-    /// parsed table written again, so an edit to a comment or the layout leaves the snapshot
-    /// equal. A file that does not parse stays as read, for its error. Only the files read
-    /// raw are parsed: one kept canonical is so already.
-    pub fn canonical(self) -> Snapshot {
-        let Used { mut snapshot, raw } = self;
-        for path in &raw {
-            let toml = path.ends_with(".toml") || path.ends_with("/.cargo/config");
-            if let (true, Some(found)) = (toml, snapshot.files.get_mut(path))
-                && let Found::Here(bytes) = &*found
-                && let Some(text) = canonical_toml(bytes)
-            {
-                *found = Found::Here(text.into_bytes());
-            }
-        }
-        snapshot
-    }
+/// Whether `path` is read as TOML: a manifest or a config file, kept in its canonical form.
+fn is_toml(path: &str) -> bool {
+    path.ends_with(".toml") || path.ends_with("/.cargo/config")
 }
 
 fn canonical_toml(bytes: &[u8]) -> Option<String> {
@@ -791,144 +736,271 @@ fn canonical_toml(bytes: &[u8]) -> Option<String> {
     (toml::from_str::<toml::Table>(&again).ok()? == table).then_some(again)
 }
 
-/// What a step was asked for that its snapshot did not have.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub(crate) enum Need {
-    File(String),
-    Dir(String),
+/// A path read with a configuration: the key of a [`TomlFile`] and of a
+/// [`super::manifest::ManifestQuery`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct PathKey {
+    pub path: String,
+    pub config: ConfigOf,
 }
 
-/// A snapshot's paths as sorted columns, each with whether this run used it: a read is a
-/// binary search and a flag, and nothing is copied until the run ends. What the run added
-/// while it ran ([`Reads`]) sits beside them in `late`, found by one Fx probe.
-struct Column<T> {
-    paths: Vec<String>,
-    found: Vec<Found<T>>,
-    used: Vec<bool>,
-    late: FxHashMap<String, (Found<T>, bool)>,
-}
+/// A TOML file (a manifest, a config file) through its configuration's mounts, in its
+/// canonical form: its table written again, so an edit to a comment or the layout cuts off
+/// here. A file that does not parse is kept as it is, for its error.
+pub(crate) struct TomlFile;
 
-impl<T> Default for Column<T> {
-    fn default() -> Self {
-        Column { paths: Vec::new(), found: Vec::new(), used: Vec::new(), late: FxHashMap::default() }
+impl Query for TomlFile {
+    const KIND: QueryKind = QueryKind(0x601e);
+    const NAME: &'static str = "cargo toml file";
+    const PRODUCER: ContentId = producer("blaze v2 cargo toml file 1");
+    type Key = PathKey;
+    type Value = Cbor<Found<Vec<u8>>>;
+
+    fn input(key: &PathKey) -> ContentId {
+        key_id("blaze v2 cargo toml file key 1", key)
+    }
+
+    fn execute(cx: &mut Cx<'_>, key: &PathKey) -> Result<Cbor<Found<Vec<u8>>>, Cancelled> {
+        Ok(Cbor(match key.config.read_file(cx, &key.path)? {
+            Found::Here(bytes) => Found::Here(canonical_toml(&bytes).map_or(bytes, String::into_bytes)),
+            other => other,
+        }))
     }
 }
 
-impl<T> Column<T> {
-    fn of(map: BTreeMap<String, Found<T>>) -> Column<T> {
-        let (paths, found): (Vec<String>, Vec<Found<T>>) = map.into_iter().unzip();
-        let used = vec![false; paths.len()];
-        Column { paths, found, used, late: FxHashMap::default() }
-    }
+/// A kept [`Found<Vec<u8>>`] read in place: the file's bytes are the database's.
+pub(crate) fn lent(kept: &[u8]) -> Found<&[u8]> {
+    let written = blaze_protocol::cbor::from_slice::<Written<Raw<'_>>>(kept)
+        .unwrap_or_else(|error| panic!("a kept file does not decode: {error}"));
+    Found::read(written, |raw| match raw.0 {
+        Cow::Borrowed(bytes) => bytes,
+        Cow::Owned(_) => panic!("a kept file's bytes were copied out of the database"),
+    })
+}
 
-    fn find(&self, path: &str) -> Option<usize> {
-        self.paths.binary_search_by(|it| it.as_str().cmp(path)).ok()
-    }
+/// A kept listing read in place: its names are the database's.
+fn lent_names(kept: &[u8]) -> Found<Vec<(&str, bool)>> {
+    let written = blaze_protocol::cbor::from_slice::<Written<Vec<(&str, bool)>>>(kept)
+        .unwrap_or_else(|error| panic!("a kept listing does not decode: {error}"));
+    Found::read(written, |names| names)
+}
 
-    fn has(&self, path: &str) -> bool {
-        self.find(path).is_some() || self.late.contains_key(path)
-    }
+/// What a step reads through: the step's `Cx`, lent to each read, and the keys a read asks by,
+/// kept so that a read of a file builds none.
+pub(crate) struct Reader<'r, 'db> {
+    cx: RefCell<&'r mut Cx<'db>>,
+    /// The key of a read through the view's mounts ([`LoadFile`], [`LoadDir`]).
+    path: RefCell<String>,
+    /// The key of a read through a fixed configuration's mounts ([`FixedFile`], [`FixedDir`]),
+    /// its table made once.
+    fixed: Option<RefCell<FixedPath>>,
+    /// The key of a [`TomlFile`] or a manifest.
+    keyed: RefCell<PathKey>,
+    /// Each listing read so far, decoded once.
+    dirs: RefCell<FxHashMap<String, Found<Vec<(&'db str, bool)>>>>,
+    /// A read was cancelled: every read after it is too, without asking.
+    cancelled: Cell<bool>,
+    /// The least path read that is under no mount.
+    unmounted: RefCell<Option<String>>,
+}
 
-    /// `path`'s entry, marked used.
-    fn get(&mut self, path: &str) -> Option<&Found<T>> {
-        if let Some(at) = self.find(path) {
-            self.used[at] = true;
-            return Some(&self.found[at]);
+impl<'r, 'db> Reader<'r, 'db> {
+    fn new(cx: &'r mut Cx<'db>, config: &ConfigOf) -> Reader<'r, 'db> {
+        let fixed = match config {
+            ConfigOf::View => None,
+            ConfigOf::Fixed { mounts, cwd, env } => {
+                // alloc: the fixed configuration's table, once a step.
+                Some(RefCell::new(FixedPath { table: ConfigOf::table(mounts, cwd, env), path: String::new() }))
+            }
+        };
+        Reader {
+            cx: RefCell::new(cx),
+            // alloc: grown to the longest path the step reads, then reused by every read.
+            path: RefCell::new(String::new()),
+            fixed,
+            // clone: the configuration, once a step, into the key its reads reuse.
+            keyed: RefCell::new(PathKey { path: String::new(), config: config.clone() }),
+            dirs: RefCell::new(FxHashMap::default()),
+            cancelled: Cell::new(false),
+            unmounted: RefCell::new(None),
         }
-        let (found, used) = self.late.get_mut(path)?;
-        *used = true;
-        Some(found)
     }
 
-    /// `found` at `path`, unless the column has `path` already.
-    fn add(&mut self, path: String, found: Found<T>) {
-        if self.find(&path).is_none() {
-            self.late.entry(path).or_insert((found, false));
-        }
-    }
-
-    /// Every path, for the next run to start from.
-    fn all(self) -> BTreeMap<String, Found<T>> {
-        let late = self.late.into_iter().map(|(path, (found, _))| (path, found));
-        self.paths.into_iter().zip(self.found).chain(late).collect()
-    }
-
-    /// The paths this run used.
-    fn used(self) -> BTreeMap<String, Found<T>> {
-        let used = self.used;
-        let late = self.late.into_iter().filter_map(|(path, (found, used))| used.then_some((path, found)));
-        self.paths.into_iter().zip(self.found).zip(used).filter_map(|(it, used)| used.then_some(it)).chain(late).collect()
-    }
-}
-
-#[derive(Default)]
-struct State {
-    files: Column<Vec<u8>>,
-    dirs: Column<Names>,
-    missed: FxHashSet<Need>,
-    /// The files [`Reads`] read as they are during the run.
-    raw: FxHashSet<String>,
-}
-
-impl State {
-    fn of(snapshot: Snapshot) -> State {
-        State { files: Column::of(snapshot.files), dirs: Column::of(snapshot.dirs), ..State::default() }
-    }
-
-    fn file(&mut self, path: &str) -> Option<&Found<Vec<u8>>> {
-        if !self.files.has(path) {
-            self.missed.insert(Need::File(path.to_owned()));
+    /// `ask` of the step's `Cx`; `None` once a read was cancelled.
+    fn ask<T>(&self, ask: impl FnOnce(&mut Cx<'db>) -> Result<T, Cancelled>) -> Option<T> {
+        if self.cancelled.get() {
             return None;
         }
-        self.files.get(path)
-    }
-
-    fn dir(&mut self, path: &str) -> Option<&Found<Names>> {
-        if !self.dirs.has(path) {
-            self.missed.insert(Need::Dir(path.to_owned()));
-            return None;
-        }
-        self.dirs.get(path)
-    }
-
-    /// What `snapshot` has that this run's does not.
-    fn add(&mut self, snapshot: Snapshot) {
-        for (path, found) in snapshot.files {
-            self.files.add(path, found);
-        }
-        for (path, found) in snapshot.dirs {
-            self.dirs.add(path, found);
+        let mut cx = self
+            .cx
+            .try_borrow_mut()
+            .unwrap_or_else(|_| panic!("a file is read while the load's `Cx` is lent (`Snap::with_cx`)"));
+        match ask(&mut cx) {
+            Ok(it) => Some(it),
+            Err(Cancelled) => {
+                self.cancelled.set(true);
+                None
+            }
         }
     }
 
-    /// What the run missed, each once, in order.
-    fn take_missed(&mut self) -> Vec<Need> {
-        let mut missed: Vec<Need> = self.missed.drain().collect();
-        missed.sort_unstable();
-        missed
+    fn saw_unmounted(&self, path: &str) {
+        let mut unmounted = self.unmounted.borrow_mut();
+        if unmounted.as_deref().is_none_or(|it| path < it) {
+            // alloc: the path an error names, once.
+            *unmounted = Some(path.to_owned());
+        }
+    }
+
+    /// The file at `path` (normal), where the database keeps it: a TOML file its [`TomlFile`],
+    /// any other as it is.
+    fn file(&self, path: &str) -> Option<Found<&'db [u8]>> {
+        if !is_toml(path) {
+            return self.raw(path);
+        }
+        let mut key = self.keyed.borrow_mut();
+        key.path.clear();
+        key.path.push_str(path);
+        let kept = self.ask(|cx| Ok(cx.get::<TomlFile>(&key)?.bytes()))?;
+        Some(self.seen(path, lent(kept)))
+    }
+
+    /// The file at `path` (normal) as it is, a TOML file too: what an error's line and column
+    /// are counted in.
+    fn raw(&self, path: &str) -> Option<Found<&'db [u8]>> {
+        let kept = match &self.fixed {
+            None => {
+                let mut key = self.path.borrow_mut();
+                key.clear();
+                key.push_str(path);
+                self.ask(|cx| Ok(cx.get::<LoadFile>(&key)?.bytes()))?
+            }
+            Some(fixed) => {
+                let mut key = fixed.borrow_mut();
+                key.path.clear();
+                key.path.push_str(path);
+                self.ask(|cx| Ok(cx.get::<FixedFile>(&key)?.bytes()))?
+            }
+        };
+        Some(self.seen(path, lent(kept)))
+    }
+
+    fn seen<T: PartialEq>(&self, path: &str, found: Found<T>) -> Found<T> {
+        if found == Found::Unmounted {
+            self.saw_unmounted(path);
+        }
+        found
+    }
+
+    /// `then` of the listing of the directory at `path` (normal), read once a step.
+    fn dir<T>(&self, path: &str, then: impl FnOnce(&Found<Vec<(&'db str, bool)>>) -> T) -> Option<T> {
+        if let Some(found) = self.dirs.borrow().get(path) {
+            return Some(then(found));
+        }
+        let kept = match &self.fixed {
+            None => {
+                let mut key = self.path.borrow_mut();
+                key.clear();
+                key.push_str(path);
+                self.ask(|cx| Ok(cx.get::<LoadDir>(&key)?.bytes()))?
+            }
+            Some(fixed) => {
+                let mut key = fixed.borrow_mut();
+                key.path.clear();
+                key.path.push_str(path);
+                self.ask(|cx| Ok(cx.get::<FixedDir>(&key)?.bytes()))?
+            }
+        };
+        let found = self.seen(path, lent_names(kept));
+        let answer = then(&found);
+        // alloc: the listing's path, once a step; its names stay the database's.
+        self.dirs.borrow_mut().insert(path.to_owned(), found);
+        Some(answer)
+    }
+
+    /// The manifest at `path` (normal), as its [`super::manifest::ManifestQuery`] parsed it.
+    fn manifest(&self, path: &str) -> Option<super::manifest::Parsed> {
+        let mut key = self.keyed.borrow_mut();
+        key.path.clear();
+        key.path.push_str(path);
+        // alloc: the manifest decoded, which blaze-manifest takes owned.
+        self.ask(|cx| Ok(cx.get::<super::manifest::ManifestQuery>(&key)?.get()))
     }
 }
 
-/// The `Files` blaze-manifest reads through in a load query: a [`Snapshot`] that records what
-/// it misses. A clone is another handle on the same snapshot.
-#[derive(Clone)]
-pub struct Snap(Rc<RefCell<State>>);
+/// The `Files` blaze-manifest reads through in a load query: each file read from the database
+/// when it is asked for, through the step's `Cx` (so its query's edges are the files it read),
+/// its bytes lent from where the database keeps them. A TOML file is its canonical form
+/// ([`TomlFile`]) and a manifest is parsed once ([`super::manifest::ManifestQuery`]).
+#[derive(Clone, Copy)]
+pub struct Snap<'r, 'db>(&'r Reader<'r, 'db>);
+
+impl fmt::Debug for Snap<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Snap")
+    }
+}
+
+impl<'db> Snap<'_, 'db> {
+    /// `f` of the step's `Cx`, for a query the step asks itself. No file is read while it has it.
+    pub(crate) fn with_cx<T>(self, f: impl FnOnce(&mut Cx<'db>) -> T) -> T {
+        let mut cx = self.0.cx.try_borrow_mut().unwrap_or_else(|_| panic!("the load's `Cx` is lent twice"));
+        f(&mut cx)
+    }
+}
 
 fn not_found() -> std::io::Error {
     std::io::Error::from_raw_os_error(2)
 }
 
+fn interrupted() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "the load was cancelled")
+}
+
 fn unmounted(path: &str) -> std::io::Error {
+    // alloc: an error's message.
     std::io::Error::other(format!("`{path}` is under no mount of the view"))
 }
 
-impl Files for Snap {
-    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+impl Snap<'_, '_> {
+    /// The manifest at `path` read as it is and parsed as blaze-manifest's own `manifest`
+    /// does: what gives the error of one that is not there or does not parse, its line and
+    /// column the file's, not its canonical form's.
+    fn parse(&self, path: &Path) -> anyhow::Result<TomlManifest> {
+        // alloc: an error's context, made only when the read fails.
+        let failed = |error: std::io::Error| anyhow::Error::new(error).context(format!("failed to read `{}`", path.display()));
+        let Some(normal) = normal_ref(path) else { return Err(failed(not_found())) };
+        match self.0.raw(&normal) {
+            Some(Found::Here(bytes)) => blaze_manifest::manifest::parse_manifest(path, bytes),
+            Some(Found::Unmounted) => Err(failed(unmounted(&normal))),
+            Some(Found::Absent) => Err(failed(not_found())),
+            None => Err(failed(interrupted())),
+        }
+    }
+}
+
+impl Files for Snap<'_, '_> {
+    fn read(&self, path: &Path) -> std::io::Result<Cow<'_, [u8]>> {
         let Some(path) = normal_ref(path) else { return Err(not_found()) };
-        match self.0.borrow_mut().file(&path) {
-            Some(Found::Here(bytes)) => Ok(bytes.clone()),
+        match self.0.file(&path) {
+            Some(Found::Here(bytes)) => Ok(Cow::Borrowed(bytes)),
             Some(Found::Unmounted) => Err(unmounted(&path)),
-            Some(Found::Absent) | None => Err(not_found()),
+            Some(Found::Absent) => Err(not_found()),
+            None => Err(interrupted()),
+        }
+    }
+
+    /// The manifest's [`super::manifest::ManifestQuery`]: parsed once, whichever step reads it.
+    /// One that is not there or does not parse is read again here for its error.
+    fn manifest(&self, path: &Path) -> anyhow::Result<TomlManifest> {
+        use super::manifest::Parsed;
+        let Some(normal) = normal_ref(path) else { return self.parse(path) };
+        match self.0.manifest(&normal) {
+            Some(Parsed::Here(manifest)) => Ok(manifest),
+            Some(Parsed::Absent | Parsed::Unmounted | Parsed::Unparsed) | None => {
+                self.parse(path)?;
+                anyhow::bail!("`{}` parses as it is but not in its manifest query", path.display())
+            }
         }
     }
 
@@ -937,18 +1009,23 @@ impl Files for Snap {
     /// directory) is asked of itself. A listing is sorted by name.
     fn kind(&self, path: &Path) -> Option<FileKind> {
         let path = normal_ref(path)?;
-        let mut state = self.0.borrow_mut();
         if let Some((parent, name)) = path.rsplit_once('/') {
             let parent = if parent.is_empty() { "/" } else { parent };
-            if let Found::Here(names) = state.dir(parent)? {
-                let at = names.binary_search_by(|(it, _)| it.as_str().cmp(name)).ok()?;
-                return Some(if names[at].1 { FileKind::Dir } else { FileKind::File });
+            let listed = self.0.dir(parent, |found| match found {
+                Found::Here(names) => Some(names.binary_search_by(|(it, _)| (*it).cmp(name)).ok().map(|at| match names[at].1 {
+                    true => FileKind::Dir,
+                    false => FileKind::File,
+                })),
+                Found::Absent | Found::Unmounted => None,
+            })?;
+            if let Some(kind) = listed {
+                return kind;
             }
         }
-        if let Found::Here(_) = state.dir(&path)? {
+        if self.0.dir(&path, |found| matches!(found, Found::Here(_)))? {
             return Some(FileKind::Dir);
         }
-        match state.file(&path)? {
+        match self.0.file(&path)? {
             Found::Here(_) => Some(FileKind::File),
             Found::Absent | Found::Unmounted => None,
         }
@@ -956,11 +1033,13 @@ impl Files for Snap {
 
     fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool)>> {
         let Some(path) = normal_ref(path) else { return Err(not_found()) };
-        match self.0.borrow_mut().dir(&path) {
-            Some(Found::Here(names)) => Ok(names.clone()),
-            Some(Found::Unmounted) => Err(unmounted(&path)),
-            Some(Found::Absent) | None => Err(not_found()),
-        }
+        let listed = self.0.dir(&path, |found| match found {
+            // alloc: the names, which the trait returns owned.
+            Found::Here(names) => Ok(names.iter().map(|(name, dir)| ((*name).to_owned(), *dir)).collect()),
+            Found::Unmounted => Err(unmounted(&path)),
+            Found::Absent => Err(not_found()),
+        });
+        listed.unwrap_or_else(|| Err(interrupted()))
     }
 
     /// A view has no links, so a path that is there is its own canonical path.
@@ -972,146 +1051,24 @@ impl Files for Snap {
     }
 }
 
-/// How a step's misses are read: through which configuration's mounts, and with which a
-/// `Cargo.toml` that is a manifest of its own is read.
-pub(crate) struct Fill<'k> {
-    pub config: &'k super::config::ConfigOf,
-    /// The manifest the step reads itself, as a file; every other `Cargo.toml` it reads is
-    /// taken from its own [`super::manifest::ManifestQuery`].
-    pub own: Option<&'k str>,
-    /// Whether the step finds a workspace's members, so a missed manifest's neighbours are
-    /// read with it ([`Fill::beside`]).
-    pub members: bool,
-}
-
-impl Fill<'_> {
-    fn of_its_own(&self, path: &str) -> bool {
-        path.ends_with("/Cargo.toml") && self.own != Some(path)
-    }
-
-    /// `need` read into `into`; a file read as it is (not from a kept snapshot) is put in `raw`.
-    fn read(&self, cx: &mut Cx<'_>, need: &Need, into: &mut Snapshot, raw: &mut FxHashSet<String>) -> Result<(), Cancelled> {
-        match need {
-            Need::File(path) => {
-                if self.of_its_own(path) {
-                    let key = super::manifest::ManifestKey {
-                        path: path.clone(),
-                        config: self.config.clone(),
-                        source: None,
-                    };
-                    let read = cx.get::<super::manifest::ManifestQuery>(&key)?.get();
-                    into.merge(read.snapshot);
-                }
-                if !into.files.contains_key(path) {
-                    let found = self.config.read_file(cx, path)?;
-                    into.files.insert(path.clone(), found);
-                    raw.insert(path.clone());
-                }
-            }
-            Need::Dir(path) => {
-                let found = self.config.read_dir(cx, path)?;
-                into.dirs.insert(path.clone(), found);
-            }
-        }
-        Ok(())
-    }
-
-    /// The manifests beside each manifest `missed` names, read in the same round: the
-    /// `Cargo.toml` of every other directory in its directory's parent. blaze-manifest stops at
-    /// the first workspace member it cannot read, so without these a workspace of N members
-    /// would take N runs; with them it takes as many as its members are deep. A manifest read
-    /// this way that the next run does not use is left out of what it keeps.
-    fn beside(&self, cx: &mut Cx<'_>, missed: &[Need], into: &mut Snapshot, raw: &mut FxHashSet<String>) -> Result<(), Cancelled> {
-        if !self.members {
-            return Ok(());
-        }
-        let mut more: Vec<Need> = Vec::new();
-        for need in missed {
-            let Need::File(path) = need else { continue };
-            if !self.of_its_own(path) {
-                continue;
-            }
-            let Some((dir, _)) = path.rsplit_once('/') else { continue };
-            let Some((above, _)) = dir.rsplit_once('/') else { continue };
-            let above = if above.is_empty() { "/" } else { above };
-            if !into.dirs.contains_key(above) {
-                let found = self.config.read_dir(cx, above)?;
-                into.dirs.insert(above.to_owned(), found);
-            }
-            let Some(Found::Here(names)) = into.dirs.get(above) else { continue };
-            let base = if above == "/" { "" } else { above };
-            for (name, _) in names.iter().filter(|(name, dir)| *dir && !name.starts_with('.')) {
-                let manifest = format!("{base}/{name}/Cargo.toml");
-                if !into.files.contains_key(&manifest) {
-                    more.push(Need::File(manifest));
-                }
-            }
-        }
-        more.sort_unstable();
-        more.dedup();
-        for need in &more {
-            self.read(cx, need, into, raw)?;
-        }
-        Ok(())
-    }
-}
-
-/// What a step of [`run_over`] reads ahead: a file it knows it will read, put into its snapshot
-/// through the database before blaze-manifest asks for it, so asking does not miss and the step
-/// does not run again for it. A `Cargo.toml` comes with what its own `ManifestQuery` read (its
-/// targets' directories), as a miss of it would.
-pub(crate) struct Reads<'r> {
-    state: Rc<RefCell<State>>,
-    fill: &'r Fill<'r>,
-}
-
-impl Reads<'_> {
-    /// `path`, read now unless the snapshot has it.
-    pub fn file(&self, cx: &mut Cx<'_>, path: &Path) -> Result<(), Cancelled> {
-        let Some(path) = normal_ref(path) else { return Ok(()) };
-        if self.state.borrow().files.has(&path) {
-            return Ok(());
-        }
-        let (mut read, mut raw) = (Snapshot::default(), FxHashSet::default());
-        self.fill.read(cx, &Need::File(path.into_owned()), &mut read, &mut raw)?;
-        let mut state = self.state.borrow_mut();
-        state.add(read);
-        state.raw.extend(raw);
-        Ok(())
-    }
-}
-
-/// Runs `step` over a snapshot that starts as `base`, reading what it misses as `fill` says and
-/// running it again, until a run misses nothing. Returns that run's answer and what it used.
-/// `step` may ask queries itself; its `Files` is a fresh handle on the snapshot each run, and
-/// what it reads ahead through [`Reads`] is never a miss.
-pub(crate) fn run_over<'db, R>(
+/// Runs `step` once over a [`Snap`] of `cx`, reading through `config`'s mounts. A path it read
+/// that is under no mount makes its answer the error naming the least such path; a read
+/// cancelled while it ran cancels it, whatever it answered.
+pub(crate) fn read_through<'db, R>(
     cx: &mut Cx<'db>,
-    base: Snapshot,
-    fill: &Fill<'_>,
-    mut step: impl FnMut(&mut Cx<'db>, Snap, &Reads<'_>) -> Result<R, Cancelled>,
-) -> Result<(R, Used), Cancelled> {
-    let mut snapshot = base;
-    let mut raw: FxHashSet<String> = FxHashSet::default();
-    loop {
-        let state = Rc::new(RefCell::new(State::of(snapshot)));
-        let files = Snap(state.clone());
-        let reads = Reads { state: state.clone(), fill };
-        let answer = step(cx, files, &reads)?;
-        drop(reads);
-        let mut state = std::mem::take(&mut *state.borrow_mut());
-        raw.extend(state.raw.drain());
-        let missed = state.take_missed();
-        if missed.is_empty() {
-            let snapshot = Snapshot { files: state.files.used(), dirs: state.dirs.used() };
-            return Ok((answer, Used { snapshot, raw }));
-        }
-        snapshot = Snapshot { files: state.files.all(), dirs: state.dirs.all() };
-        for need in &missed {
-            fill.read(cx, need, &mut snapshot, &mut raw)?;
-        }
-        fill.beside(cx, &missed, &mut snapshot, &mut raw)?;
+    config: &ConfigOf,
+    step: impl FnOnce(Snap<'_, 'db>) -> Result<R, Cancelled>,
+) -> Result<Result<R, LoadError>, Cancelled> {
+    let reader = Reader::new(cx, config);
+    let answer = step(Snap(&reader));
+    if reader.cancelled.get() {
+        return Err(Cancelled);
     }
+    let answer = answer?;
+    Ok(match reader.unmounted.take() {
+        Some(path) => Err(super::unmounted_error(&path)),
+        None => Ok(answer),
+    })
 }
 
 #[cfg(test)]
@@ -1234,27 +1191,32 @@ mod tests {
         assert!(blaze_alloc_count::assert_at_most(0, "a known file", || known_file(index, "/Cargo.toml")));
     }
 
+    /// A kept file and listing are read where the database keeps them, and read in place
+    /// allocate nothing past the listing's vector.
     #[test]
-    fn what_a_run_missed_is_read_once_each_in_order() {
-        let mut snapshot = Snapshot::default();
-        snapshot.files.insert("/w/a".to_owned(), Found::Absent);
-        snapshot.files.insert("/w/z".to_owned(), Found::Absent);
-        let mut state = State::of(snapshot);
-        assert_eq!(state.file("/w/c"), None);
-        assert_eq!(state.dir("/w"), None);
-        assert_eq!(state.file("/w/a"), Some(&Found::Absent));
-        assert_eq!(state.file("/w/b"), None);
-        assert_eq!(state.file("/w/c"), None);
-        assert_eq!(state.dir("/v"), None);
-        let want = vec![
-            Need::File("/w/b".to_owned()),
-            Need::File("/w/c".to_owned()),
-            Need::Dir("/v".to_owned()),
-            Need::Dir("/w".to_owned()),
-        ];
-        assert_eq!(state.take_missed(), want);
-        assert!(state.take_missed().is_empty());
-        assert_eq!(state.files.used().keys().collect::<Vec<_>>(), ["/w/a"]);
+    fn kept_bytes_and_names_are_lent() {
+        let file = blaze_protocol::cbor::to_vec(&Found::Here(b"[package]\n".to_vec())).unwrap();
+        let found = blaze_alloc_count::assert_at_most(0, "a kept file read in place", || lent(&file));
+        let Found::Here(bytes) = found else { panic!("{found:?}") };
+        assert_eq!(bytes, b"[package]\n");
+        assert!(file.as_ptr_range().contains(&bytes.as_ptr()), "the bytes are the kept bytes");
+        assert_eq!(lent(&blaze_protocol::cbor::to_vec(&Found::<Vec<u8>>::Unmounted).unwrap()), Found::Unmounted);
+
+        let names: Found<Names> = Found::Here(vec![("Cargo.toml".to_owned(), false), ("src".to_owned(), true)]);
+        let dir = blaze_protocol::cbor::to_vec(&names).unwrap();
+        let found = blaze_alloc_count::assert_at_most(1, "a kept listing read in place", || lent_names(&dir));
+        let Found::Here(listed) = found else { panic!("{found:?}") };
+        assert_eq!(listed, [("Cargo.toml", false), ("src", true)]);
+        assert!(dir.as_ptr_range().contains(&listed[1].0.as_ptr()), "the names are the kept bytes");
+    }
+
+    #[test]
+    fn manifests_and_config_files_are_toml() {
+        assert!(is_toml("/w/Cargo.toml"));
+        assert!(is_toml("/home/u/.cargo/config.toml"));
+        assert!(is_toml("/home/u/.cargo/config"));
+        assert!(!is_toml("/w/Cargo.lock"));
+        assert!(!is_toml("/w/config"));
     }
 
     #[test]

@@ -30,8 +30,8 @@ semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2 = { version = "0.10", optional = true }
-toml = { workspace = true, optional = true }
-url = { workspace = true, optional = true }
+toml.workspace = true
+url.workspace = true
 
 [features]
 # The workspace load and the unit graph as queries of blaze's database (`query`), for the
@@ -44,8 +44,6 @@ query = [
     "dep:blaze-source",
     "dep:rustc-stable-hash",
     "dep:sha2",
-    "dep:toml",
-    "dep:url",
 ]
 
 [dev-dependencies]

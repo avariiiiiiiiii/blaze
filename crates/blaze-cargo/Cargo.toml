@@ -58,6 +58,7 @@ typed-arena = "2.0.2"
 
 hir-ty-codegen.workspace = true
 blaze-macro-wasm.workspace = true
+blaze-macro-eval.workspace = true
 blaze-store.workspace = true
 blaze-fmt.workspace = true
 blaze-lints.workspace = true
@@ -149,11 +150,13 @@ blaze-link.workspace = true
 load-cargo.workspace = true
 base-db.workspace = true
 crossbeam-channel.workspace = true
+# `extended`: the `mi_collect` binding.
+libmimalloc-sys = { workspace = true, features = ["extended"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-tikv-jemalloc-ctl = "0.5.4"
-tikv-jemalloc-sys = "0.5.4"
+tikv-jemalloc-ctl = { version = "0.5.4", optional = true }
+tikv-jemalloc-sys = { version = "0.5.4", optional = true }
 
 [build-dependencies]
 blaze-sha256.workspace = true
@@ -174,7 +177,7 @@ windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "W
 
 [features]
 # Profile jemalloc's heap and count its live bytes: see `memory.rs`. Not on Windows.
-heap-profile = ["tikv-jemalloc-sys/profiling"]
+heap-profile = ["dep:tikv-jemalloc-ctl", "tikv-jemalloc-sys/profiling"]
 
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm` or a profile's `opt-level`.
 llvm = ["hir-ty-codegen/llvm"]

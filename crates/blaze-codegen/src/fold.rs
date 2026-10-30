@@ -13,10 +13,15 @@
 //!
 //! Dev builds only (Cranelift units with [`crate::settings::Spec::fold`]): a varying function
 //! becomes an indirect call in the body.
+//!
+//! What a bucket is, a masked IR without its constants' values ([`Form`]), is hash-consed
+//! (docs/v2/plan/lanes/fastcompile/hashcons.md): its content ID is computed once, when it is
+//! interned, and [`groups`] compares those IDs without hashing any IR.
 
 #![forbid(unsafe_code)]
 
-use blaze_ids::{ContentId, Hasher};
+use blaze_hashcons::{Consed, HashCons, Interned};
+use blaze_ids::{ContentId, Domain, Hasher};
 use serde::{Deserialize, Serialize};
 
 use crate::{InstanceKey, Settings, Target, backend::Emitted, content::target_id, template::Refs};
@@ -48,6 +53,73 @@ pub struct Masked {
     pub constants: Vec<Constant>,
     /// Its number of instructions.
     pub size: u32,
+}
+
+impl Masked {
+    /// Its form, which [`groups`] buckets by, and its constants' values.
+    pub fn into_parts(self) -> (Form, Vec<Constant>) {
+        // alloc: once per function the daemon first folds, two bytes a constant
+        let kinds = self.constants.iter().flat_map(kind).collect();
+        (Form { shape: self.shape, size: self.size, kinds }, self.constants)
+    }
+
+    /// [`Masked::into_parts`]'s form, copying the shape.
+    pub fn form(&self) -> Form {
+        // alloc: two bytes a constant, for a caller that keeps the masked IR
+        let kinds = self.constants.iter().flat_map(kind).collect();
+        Form { shape: self.shape.clone(), size: self.size, kinds } // clone: as above, the shape
+    }
+}
+
+/// A masked IR as [`groups`] buckets it: its shape, size and its constants' kinds, without
+/// their values. Two functions of one form differ only in constants.
+///
+/// Hash-consed under [`MASKED_DOMAIN`], fed what `groups` hashed before it was: its content
+/// ID is the bucket every group's shape and key are made from.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Form {
+    shape: Vec<u8>,
+    size: u32,
+    /// [`kind`] of each constant, in order: two bytes each.
+    kinds: Vec<u8>,
+}
+
+/// The forms of a build, or of every build of a daemon.
+pub type Forms = HashCons<Form>;
+
+#[cfg(test)]
+thread_local! {
+    /// How many forms this thread has hashed: what the tests count.
+    pub(crate) static HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Consed for Form {
+    fn domain() -> &'static Domain {
+        static MASKED: Domain = Domain::new(MASKED_DOMAIN);
+        &MASKED
+    }
+
+    fn hash_content(&self, hasher: &mut Hasher) {
+        #[cfg(test)]
+        HASHED.with(|it| it.set(it.get() + 1));
+        hasher.part(&self.shape).update(&self.size.to_le_bytes());
+        hasher.update(&((self.kinds.len() / 2) as u64).to_le_bytes()).update(&self.kinds);
+    }
+}
+
+/// A function as [`groups`] takes it: its masked IR's interned form and its constants' values,
+/// in the order the shape names them.
+#[derive(Clone, Copy, Debug)]
+pub struct Masking<'a> {
+    pub form: Interned<'a, Form>,
+    pub constants: &'a [Constant],
+}
+
+impl<'a> Masking<'a> {
+    /// `masked` with its form interned in `forms`: hashed here.
+    pub fn of(forms: &'a Forms, masked: &'a Masked) -> Masking<'a> {
+        Masking { form: forms.intern(masked.form()), constants: &masked.constants }
+    }
 }
 
 /// Functions that fold into one body.
@@ -186,14 +258,15 @@ fn kind(constant: &Constant) -> [u8; 2] {
     }
 }
 
-/// A candidate of [`groups`], with its bucket: its settings and `masked_id`, the hash of its
-/// masked IR, size and constants' kinds.
+/// A candidate of [`groups`], with its bucket: its settings and `masked_id`, its [`Form`]'s
+/// content ID.
 #[derive(Clone, Copy)]
 struct Candidate<'a> {
     key: InstanceKey,
     settings: Settings,
     masked_id: ContentId,
-    masked: &'a Masked,
+    size: u32,
+    constants: &'a [Constant],
     refs: &'a Refs,
 }
 
@@ -228,10 +301,10 @@ struct Split<'a> {
 impl<'a> Split<'a> {
     /// The groups of `self.members`, one bucket, into `out`.
     fn groups(&mut self, limits: &Limits, out: &mut Vec<Group>) {
-        let n = self.members[0].masked.constants.len();
+        let n = self.members[0].constants.len();
         self.cells.clear();
         for member in &self.members {
-            let cells = member.masked.constants.iter().map(|&it| cell(member.key, it, member.refs));
+            let cells = member.constants.iter().map(|&it| cell(member.key, it, member.refs));
             self.cells.extend(cells);
         }
         self.part_of.clear();
@@ -297,7 +370,7 @@ impl<'a> Split<'a> {
                 reads.push(*param);
             }
             let first = self.members[members[0] as usize];
-            if params == 0 || !profitable(first.masked.size, members.len(), params, limits) {
+            if params == 0 || !profitable(first.size, members.len(), params, limits) {
                 continue;
             }
             let mut hasher = Hasher::new(FOLD_SHAPE_DOMAIN);
@@ -314,7 +387,7 @@ impl<'a> Split<'a> {
             let constants = members
                 .iter()
                 .map(|&it| {
-                    let constants = &self.members[it as usize].masked.constants;
+                    let constants = self.members[it as usize].constants;
                     varying.iter().map(|&at| constants[at as usize]).collect()
                 })
                 .collect();
@@ -335,7 +408,7 @@ impl<'a> Split<'a> {
         let varying = &self.varying[part * n..][..n];
         let classes = &self.classes[part * n..][..n];
         let (mine, firsts) = (&self.cells[member * n..][..n], &self.cells[first * n..][..n]);
-        let values = &self.members[member].masked.constants;
+        let values = self.members[member].constants;
         self.reps.clear();
         for at in 0..n {
             if !varying[at] && mine[at] == firsts[at] {
@@ -365,7 +438,7 @@ impl<'a> Split<'a> {
                 self.varying[part * n + at] = true;
             }
         }
-        let values = &self.members[member].masked.constants;
+        let values = self.members[member].constants;
         let classes = &mut self.classes[part * n..][..n];
         self.positions.clear();
         self.positions.extend(0..n as u32);
@@ -406,27 +479,41 @@ fn profitable(size: u32, members: usize, params: u32, limits: &Limits) -> bool {
 /// equal in all are code dedupe's and the memo's) and in at most [`Limits::max_params`]
 /// parameters, and pass [`profitable`]. Functions of one masked IR whose constants differ in
 /// too many are split, each taking the first group, in key order, it fits.
+///
+/// Hashes no IR: a candidate's bucket is its form's content ID, computed when it was
+/// interned.
 pub fn groups(
-    candidates: &[(InstanceKey, Settings, &Masked, &Refs)],
+    candidates: &[(InstanceKey, Settings, Masking<'_>, &Refs)],
     limits: &Limits,
 ) -> Vec<Group> {
     let mut all: Vec<Candidate<'_>> = Vec::with_capacity(candidates.len());
-    // The constants' kinds, given to the hasher in one update.
-    let mut kinds: Vec<u8> = Vec::new();
     for &(key, settings, masked, refs) in candidates {
-        kinds.clear();
-        for constant in &masked.constants {
+        let form = masked.form.get();
+        if form.kinds.len() != 2 * masked.constants.len() {
+            panic!(
+                "{key:?}'s form has {} constants and its masking {}",
+                form.kinds.len() / 2,
+                masked.constants.len()
+            );
+        }
+        for (constant, of_form) in masked.constants.iter().zip(form.kinds.chunks_exact(2)) {
             if let Constant::Place(at) = *constant
                 && at as usize >= refs.len()
             {
                 panic!("{key:?}'s masked IR names place {at} of its {} references", refs.len());
             }
-            kinds.extend_from_slice(&kind(constant));
+            if kind(constant)[..] != *of_form {
+                panic!("{key:?}'s constant {constant:?} is not of its form's kind {of_form:?}");
+            }
         }
-        let mut hasher = Hasher::new(MASKED_DOMAIN);
-        hasher.part(&masked.shape).update(&masked.size.to_le_bytes());
-        hasher.update(&(masked.constants.len() as u64).to_le_bytes()).update(&kinds);
-        all.push(Candidate { key, settings, masked_id: hasher.finish(), masked, refs });
+        all.push(Candidate {
+            key,
+            settings,
+            masked_id: masked.form.content(),
+            size: form.size,
+            constants: masked.constants,
+            refs,
+        });
     }
     // One sort makes every bucket a run, its members in key order. Stable, so of candidates
     // given twice under one key in one bucket, the first given stays.
@@ -499,10 +586,16 @@ mod tests {
         vec![Target::Function(key(call)), Target::Direct(key(addr))]
     }
 
+    /// The forms of every test, as a daemon's are of every build.
+    fn masking(masked: &Masked) -> Masking<'_> {
+        static FORMS: std::sync::LazyLock<Forms> = std::sync::LazyLock::new(Forms::new);
+        Masking::of(&FORMS, masked)
+    }
+
     fn of<'a>(
         items: &'a [(InstanceKey, Masked, Vec<Target>)],
-    ) -> Vec<(InstanceKey, Settings, &'a Masked, &'a Refs)> {
-        items.iter().map(|(k, m, r)| (*k, settings(1), m, r.as_slice())).collect()
+    ) -> Vec<(InstanceKey, Settings, Masking<'a>, &'a Refs)> {
+        items.iter().map(|(k, m, r)| (*k, settings(1), masking(m), r.as_slice())).collect()
     }
 
     #[test]
@@ -535,7 +628,8 @@ mod tests {
     fn other_settings_do_not_fold() {
         let (a, b) = (grow(8, 8), grow(4, 4));
         let (ra, rb) = (refs(9, 10), refs(9, 10));
-        let candidates = [(key(1), settings(1), &a, &ra[..]), (key(2), settings(2), &b, &rb[..])];
+        let candidates =
+            [(key(1), settings(1), masking(&a), &ra[..]), (key(2), settings(2), masking(&b), &rb[..])];
         assert!(groups(&candidates, &Limits::default()).is_empty());
     }
 
@@ -826,10 +920,12 @@ mod tests {
             let items = random(&mut rng);
             let candidates: Vec<_> =
                 items.iter().map(|(k, s, m, r)| (*k, *s, m, r.as_slice())).collect();
+            let interned: Vec<_> =
+                items.iter().map(|(k, s, m, r)| (*k, *s, masking(m), r.as_slice())).collect();
             for limits in &limits {
                 let want = reference::groups(&candidates, limits);
                 found += want.len();
-                assert_eq!(groups(&candidates, limits), want, "{limits:?}");
+                assert_eq!(groups(&interned, limits), want, "{limits:?}");
                 for group in &want {
                     let columns: Vec<Vec<Constant>> = (0..group.varying.len())
                         .map(|at| group.constants.iter().map(|it| it[at]).collect())
@@ -866,6 +962,68 @@ mod tests {
             if a == b { equal += 1 } else { other += 1 }
         }
         assert!(equal > 50 && other > 50);
+    }
+
+    /// A form's content ID is the bucket `groups` hashed from the masked IR before forms were
+    /// interned, so every group's shape and key, and what the store keeps under them, stay.
+    #[test]
+    fn a_forms_content_id_is_the_bucket_groups_hashed() {
+        let mut rng = Rng::new(4);
+        let mut seen = 0;
+        for _ in 0..200 {
+            for (_, _, masked, _) in random(&mut rng) {
+                let mut hasher = Hasher::new("blaze v2 masked 2");
+                hasher.part(&masked.shape).update(&masked.size.to_le_bytes());
+                hasher.update(&(masked.constants.len() as u64).to_le_bytes());
+                for constant in &masked.constants {
+                    hasher.update(&kind(constant));
+                }
+                assert_eq!(blaze_hashcons::content_of(&masked.form()), hasher.finish());
+                assert_eq!(masked.clone().into_parts(), (masked.form(), masked.constants.clone()));
+                seen += 1;
+            }
+        }
+        assert!(seen > 1000);
+    }
+
+    /// Instances of one generic differ in constants: their masked IRs are one form, hashed once
+    /// each when interned and never by `groups`.
+    #[test]
+    fn functions_that_differ_in_constants_are_one_form_and_groups_hashes_none() {
+        let forms = Forms::new();
+        let (a, b, c) = (grow(8, 8), grow(4, 4), grow(16, 8));
+        let before = HASHED.with(std::cell::Cell::get);
+        let (ma, mb) = (Masking::of(&forms, &a), Masking::of(&forms, &b));
+        let mc = Masking::of(&forms, &c);
+        assert_eq!(HASHED.with(std::cell::Cell::get) - before, 3);
+        assert_eq!(forms.len(), 1);
+        assert!(ma.form == mb.form && mb.form == mc.form);
+        assert_eq!(mb.constants, &b.constants[..]);
+
+        let rs = refs(9, 10);
+        let candidates = [
+            (key(1), settings(1), ma, &rs[..]),
+            (key(2), settings(1), mb, &rs[..]),
+            (key(3), settings(1), mc, &rs[..]),
+        ];
+        let before = HASHED.with(std::cell::Cell::get);
+        let found = groups(&candidates, &Limits::default());
+        assert_eq!(HASHED.with(std::cell::Cell::get), before);
+        assert_eq!(found[0].members, vec![key(1), key(2), key(3)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not of its form's kind")]
+    fn a_masking_whose_constants_are_not_its_forms_stops() {
+        let forms = Forms::new();
+        let (a, b) = (grow(8, 8), grow(4, 4));
+        let mut other = b.constants.clone();
+        other[0] = Constant::F64(4);
+        let rs = refs(9, 10);
+        let ma = Masking::of(&forms, &a);
+        let wrong = Masking { form: Masking::of(&forms, &b).form, constants: &other };
+        let candidates = [(key(1), settings(1), ma, &rs[..]), (key(2), settings(1), wrong, &rs[..])];
+        groups(&candidates, &Limits::default());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use hir_def::{
     GenericDefId, LoweringMode, ModuleDefId, VariantId,
     expr_store::{
         Body, ExpressionStoreSourceMap, HygieneId,
-        lower::{ExprCollector, ImplTraitLowering},
+        lower::ImplTraitLowering,
         path::Path,
         scope::{ExprScopes, ScopeId},
     },
@@ -75,6 +75,7 @@ impl<'db> SourceAnalyzer<'db> {
             file_id,
             type_owner: def.generic_def(db).into(),
             infer_body: Some(def.into()),
+            maps: None,
         }
     }
 
@@ -109,6 +110,7 @@ impl<'db> SourceAnalyzer<'db> {
             file_id,
             type_owner: def.into(),
             infer_body,
+            maps: None,
         }
     }
 
@@ -147,6 +149,7 @@ impl<'db> SourceAnalyzer<'db> {
             file_id,
             type_owner: GenericDefId::from(def.adt_id(db)).into(),
             infer_body,
+            maps: None,
         }
     }
 
@@ -164,6 +167,7 @@ impl<'db> SourceAnalyzer<'db> {
             body_or_sig: None,
             file_id,
             infer_body: None,
+            maps: None,
         }
     }
 
@@ -634,22 +638,32 @@ impl<'db> SourceAnalyzer<'db> {
             return resolved;
         }
 
-        let mut collector =
-            ExprCollector::new(db, self.resolver.module(), self.file_id, LoweringMode::Ide);
+        let mut collector = self.path_collector(db);
         let hir_path = collector.lower_path_view(path, &mut ImplTraitLowering::Error)?;
         let parent_hir_path = path
             .parent_path()
             .and_then(|p| collector.lower_path_view(p, &mut ImplTraitLowering::Error));
-        let (store, _) = collector.store.finish();
-        let hir_path = store.path_at(hir_path);
-        let parent_hir_path = parent_hir_path.map(|it| store.path_at(it));
+        // The store is read only to lower the path's type anchor.
+        let lowered = if collector.store.path_at(hir_path).type_anchor().is_some() {
+            Either::Left(collector.store.finish().0)
+        } else {
+            Either::Right(collector.store)
+        };
+        let (hir_path, parent_hir_path, store) = match &lowered {
+            Either::Left(store) => {
+                (store.path_at(hir_path), parent_hir_path.map(|it| store.path_at(it)), Some(store))
+            }
+            Either::Right(builder) => {
+                (builder.path_at(hir_path), parent_hir_path.map(|it| builder.path_at(it)), None)
+            }
+        };
 
         // Case where path is a qualifier of a use tree, e.g. foo::bar::{Baz, Qux} where we are
         // trying to resolve foo::bar.
         if let Some(use_tree) = parent.and_then(ast::UseTree::cast)
             && use_tree.coloncolon_token().is_some()
         {
-            return resolve_hir_path_qualifier(db, &self.resolver, hir_path, &store)
+            return resolve_hir_path_qualifier(db, &self.resolver, hir_path, store)
                 .map(|it| (it, None));
         }
 
@@ -676,7 +690,7 @@ impl<'db> SourceAnalyzer<'db> {
         // Case where path is a qualifier of another path, e.g. foo::bar::Baz where we are
         // trying to resolve foo::bar.
         if let Some(parent_hir_path) = parent_hir_path {
-            return match resolve_hir_path_qualifier(db, &self.resolver, hir_path, &store) {
+            return match resolve_hir_path_qualifier(db, &self.resolver, hir_path, store) {
                 None if meta_path.is_some() => tool_module(),
                 // The type name conflicts with a module in scope (`use std::str;` then
                 // `str::from_utf8()`): the module when it has the next segment.
@@ -752,7 +766,7 @@ impl<'db> SourceAnalyzer<'db> {
         }
         if parent.is_some_and(|it| ast::Visibility::can_cast(it.kind())) {
             // Only modules can be inside visibilities, and those have no generics.
-            resolve_hir_path_qualifier(db, &self.resolver, hir_path, &store).map(|it| (it, None))
+            resolve_hir_path_qualifier(db, &self.resolver, hir_path, store).map(|it| (it, None))
         } else {
             let res = resolve_hir_path_(
                 db,
@@ -761,7 +775,7 @@ impl<'db> SourceAnalyzer<'db> {
                 hir_path,
                 prefer_value_ns,
                 name_hygiene_view(db, InFile::new(self.file_id, path.syntax())),
-                Some(&store),
+                store,
                 false,
             )
             .any()?;
@@ -821,11 +835,18 @@ impl<'db> SourceAnalyzer<'db> {
         db: &'db Db,
         path: ast::Path<'_>,
     ) -> Option<PathResolutionPerNs<'db>> {
-        let mut collector =
-            ExprCollector::new(db, self.resolver.module(), self.file_id, LoweringMode::Ide);
+        let mut collector = self.path_collector(db);
         let hir_path = collector.lower_path_view(path, &mut ImplTraitLowering::Error)?;
-        let (store, _) = collector.store.finish();
-        let hir_path = store.path_at(hir_path);
+        // The store is read only to lower the path's type anchor.
+        let lowered = if collector.store.path_at(hir_path).type_anchor().is_some() {
+            Either::Left(collector.store.finish().0)
+        } else {
+            Either::Right(collector.store)
+        };
+        let (hir_path, store) = match &lowered {
+            Either::Left(store) => (store.path_at(hir_path), Some(store)),
+            Either::Right(builder) => (builder.path_at(hir_path), None),
+        };
         Some(resolve_hir_path_(
             db,
             &self.resolver,
@@ -833,7 +854,7 @@ impl<'db> SourceAnalyzer<'db> {
             hir_path,
             false,
             name_hygiene_view(db, InFile::new(self.file_id, path.syntax())),
-            Some(&store),
+            store,
             true,
         ))
     }

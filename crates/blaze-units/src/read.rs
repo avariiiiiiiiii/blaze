@@ -290,7 +290,7 @@ pub fn path_packages<F: Files>(
             continue;
         }
         let manifest_path = dir.join("Cargo.toml");
-        let source = blaze_manifest::source::SourceId::for_path(&dir)?;
+        let source = SourceId::for_path(&dir)?;
         let EitherManifest::Real(manifest) = read_manifest(&manifest_path, source, ctx)? else {
             bail!("{} is a path dependency with no package", manifest_path.display());
         };
@@ -301,27 +301,18 @@ pub fn path_packages<F: Files>(
 }
 
 /// The source of a package a lock file pins to `source`, as blaze-manifest names it.
-pub fn manifest_source<F: Files>(source: &str, config: &Config<F>) -> Result<blaze_manifest::source::SourceId> {
-    use blaze_manifest::source::{CRATES_IO_INDEX, SourceId};
-    use cargo_util_schemas::core::GitReference;
+pub fn manifest_source<F: Files>(source: &str, config: &Config<F>) -> Result<SourceId> {
     let (kind, rest) = source.split_once('+').context("a source with no kind")?;
     match kind {
-        "registry" if rest == CRATES_IO_INDEX => SourceId::crates_io(config),
-        "registry" => Ok(SourceId::for_registry(&rest.parse()?)),
-        "sparse" => Ok(SourceId::for_registry(&source.parse()?)),
+        "registry" if rest == blaze_manifest::source::CRATES_IO_INDEX => blaze_manifest::source::crates_io(config),
+        "registry" => SourceId::for_registry(&rest.parse()?),
+        "sparse" => SourceId::for_registry(&source.parse()?),
         "git" => {
             let mut url: Url = rest.parse()?;
-            // alloc: a git source's query, once per locked git package per load
-            let query: rustc_hash::FxHashMap<String, String> = url.query_pairs().into_owned().collect();
-            let reference = match (query.get("branch"), query.get("tag"), query.get("rev")) {
-                (Some(branch), _, _) => GitReference::Branch(branch.clone()), // clone: as above
-                (_, Some(tag), _) => GitReference::Tag(tag.clone()), // clone: as above
-                (_, _, Some(rev)) => GitReference::Rev(rev.clone()), // clone: as above
-                _ => GitReference::DefaultBranch,
-            };
+            let reference = GitReference::from_query(url.query_pairs());
             url.set_fragment(None);
             url.set_query(None);
-            Ok(SourceId::for_git(&url, reference))
+            SourceId::for_git(&url, reference)
         }
         _ => bail!("the source {source} is not one blaze reads yet"),
     }

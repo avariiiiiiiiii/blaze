@@ -17,6 +17,12 @@
 //!   being that with the condition's arguments swapped. Either fusion is taken only when its
 //!   `icmp` is the instruction right before and has no other use, and only when the fused
 //!   shape exists; otherwise the two are written apart.
+//! - `LoadConfined`/`StoreConfined` is a load or store at offset 0 of the macro tier's
+//!   confined address, `iadd vmctx, uextend.i64 (ireduce.i32 (iadd p, iconst off))`, with
+//!   operands `[p, vmctx]` (a store's value first) and `off` wrapped to 32 bits in the
+//!   `Offset` hole. It is taken only when each value of the address has that one use and is a
+//!   stencil's in the access's block, and only when the fused shape exists; otherwise each
+//!   instruction is written apart.
 //!
 //! An instruction neither the glue nor a stencil writes is an error naming its opcode and
 //! type, never a compile by Cranelift.
@@ -35,7 +41,7 @@ use super::{
 use crate::{
     Error, Target,
     arch::Glue,
-    shape::{Aux, Dst, FloatCc, Info, IntCc, Op, RmwOp, Shape, Src, Ty},
+    shape::{Aux, Disp, Dst, FloatCc, Info, IntCc, Op, RmwOp, Shape, Src, Ty},
     table::format::Reader,
 };
 
@@ -54,6 +60,7 @@ pub(super) fn run<A: Glue>(
             let mut sel = one::<A>(plan, func, target, library, inst)?;
             if sel.kind == Kind::Stencil {
                 fuse(plan, func, library, inst, &mut sel);
+                confine(plan, func, library, inst, &mut sel);
             }
             plan.sels[inst.as_u32() as usize] = sel;
         }
@@ -318,6 +325,104 @@ fn fuse(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst: ir
     sel.args = [args[0], args[1], ir::Value::from_u32(NONE)];
     sel.nargs = 2;
     sel.cc = cc;
+}
+
+/// Fuses `inst`, a load or store at offset 0, with the confinement of its address,
+/// `iadd vmctx, uextend.i64 (ireduce.i32 (iadd p, iconst off))` (either `iadd` in either
+/// operand order; without the inner one `off` is 0), when each of those values has that one
+/// use, each is a stencil's in `inst`'s block, and the fused shape exists.
+fn confine(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst: ir::Inst, sel: &mut Sel) {
+    let access = sel.shape.op;
+    if !confinable(access) || sel.offset != 0 {
+        return;
+    }
+    let Some((op, _)) = Shape::confining(access, Disp::Zero) else { return };
+    let block = func.layout.inst_block(inst);
+    // The instruction of `opcode` that defines `value` of `ty`, a stencil's in `block`, when
+    // `value` has one use.
+    let def = |value: ir::Value, opcode: Opcode, ty: ir::Type| {
+        let ir::ValueDef::Result(it, 0) = func.dfg.value_def(value) else { return None };
+        let ok = func.dfg.insts[it].opcode() == opcode
+            && func.dfg.value_type(value) == ty
+            && plan.uses[value.as_u32() as usize] == 1
+            && func.layout.inst_block(it) == block
+            && plan.sels[it.as_u32() as usize].kind == Kind::Stencil;
+        ok.then_some(it)
+    };
+    let arg = |of: ir::Inst, n: usize| func.dfg.resolve_aliases(func.dfg.inst_args(of)[n]);
+    let store = op == Op::StoreConfined;
+    let Some(add) = def(sel.args[usize::from(store)], Opcode::Iadd, types::I64) else { return };
+    let Some((vmctx, extend)) = [(0, 1), (1, 0)].into_iter().find_map(|(v, e)| {
+        Some((arg(add, v), def(arg(add, e), Opcode::Uextend, types::I64)?))
+    }) else {
+        return;
+    };
+    let Some(reduce) = def(arg(extend, 0), Opcode::Ireduce, types::I32) else { return };
+    let wrapped = arg(reduce, 0);
+    if func.dfg.value_type(wrapped) != types::I64 {
+        return;
+    }
+    let sum = def(wrapped, Opcode::Iadd, types::I64).and_then(|sum| {
+        [(0, 1), (1, 0)].into_iter().find_map(|(p, k)| match plan.konst[arg(sum, k).as_u32() as usize] {
+            Konst::Int(off) => Some((sum, arg(sum, p), off as i32)),
+            _ => None,
+        })
+    });
+    let (p, off) = sum.map_or((wrapped, 0), |(_, p, off)| (p, off));
+    let disps: &[Disp] = match off {
+        0 => &[Disp::Zero],
+        1..4096 => &[Disp::Lo12, Disp::Imm32],
+        _ => &[Disp::Imm32],
+    };
+    let (args, nargs) =
+        if store { ([sel.args[0], p, vmctx], 3) } else { ([p, vmctx, ir::Value::from_u32(NONE)], 2) };
+    let Some(shape) = disps.iter().find_map(|&disp| {
+        let (op, aux) = Shape::confining(access, disp)?;
+        let shape = Shape { op, aux, srcs: [Src::None; 3], ..sel.shape };
+        base(plan, func, library, op.info(), shape, &args[..nargs])
+    }) else {
+        return;
+    };
+    let at = plan.ord[inst.as_u32() as usize];
+    for value in [p, vmctx] {
+        let last = &mut plan.last[value.as_u32() as usize];
+        if *last != GLOBAL {
+            *last = (*last).max(at);
+        }
+    }
+    for fused in [Some(add), Some(extend), Some(reduce), sum.map(|it| it.0)].into_iter().flatten() {
+        plan.sels[fused.as_u32() as usize].kind = Kind::Fused;
+    }
+    sel.shape = shape;
+    sel.args = args;
+    sel.nargs = nargs as u8;
+    sel.offset = i64::from(off);
+}
+
+/// Whether `op` is an access some confined op fuses.
+fn confinable(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Load
+            | Op::Uload8
+            | Op::Sload8
+            | Op::Uload16
+            | Op::Sload16
+            | Op::Uload32
+            | Op::Sload32
+            | Op::Uload8x8
+            | Op::Sload8x8
+            | Op::Uload16x4
+            | Op::Sload16x4
+            | Op::Uload32x2
+            | Op::Sload32x2
+            | Op::AtomicLoad
+            | Op::Store
+            | Op::Istore8
+            | Op::Istore16
+            | Op::Istore32
+            | Op::AtomicStore
+    )
 }
 
 /// The value whose type a stencil of `op` is named by: result 0, or for the ops whose

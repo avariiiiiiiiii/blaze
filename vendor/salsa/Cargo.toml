@@ -309,6 +309,10 @@ name = "hello_world"
 path = "tests/hello_world.rs"
 
 [[test]]
+name = "image"
+path = "tests/image.rs"
+
+[[test]]
 name = "input_default"
 path = "tests/input_default.rs"
 
@@ -645,8 +649,14 @@ name = "query_fetch"
 path = "benches/query_fetch.rs"
 harness = false
 
+[dependencies.blaze-format]
+path = "../../crates/blaze-format"
+
 [dependencies.blaze-ids]
 path = "../../crates/blaze-ids"
+
+[dependencies.blaze-image]
+path = "../../crates/blaze-image"
 
 [dependencies.blaze-mem]
 path = "../../crates/blaze-mem"
@@ -676,6 +686,9 @@ version = "0.12"
 
 [dependencies.indexmap]
 version = "2"
+
+[dependencies.intern]
+path = "../../crates/intern"
 
 [dependencies.intrusive-collections]
 version = "0.10.1"

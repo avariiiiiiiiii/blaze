@@ -20,11 +20,26 @@ use super::{super::HirFrontend, Listed, refused};
 use crate::home::Homes;
 
 /// The module's name in the crate's root.
-pub(super) const MODULE: &str = "__blaze_proc_macros";
+pub const MODULE: &str = "__blaze_proc_macros";
 
 /// What the module starts with, after the text of the root file: v1's mark.
-pub(super) const MARK: &str =
+pub const MARK: &str =
     "\n// blaze's list of the crate's proc macros, which is not in the file on disk.\n";
+
+/// What the loader looks the list up by (`load-cargo`'s `listed`): a slice of the macros, as
+/// rustc's `#[rustc_proc_macro_decls]` static is.
+pub const SYMBOL: &str = "BLAZE_PROC_MACROS";
+
+/// One macro of the list, as [`list_text`] writes it.
+pub struct ListedMacro<'a> {
+    /// As blaze-expand numbers them: a derive 0, an attribute 1, a function-like 2.
+    pub kind: u32,
+    /// What it is invoked by: a derive's trait, else its function's name.
+    pub name: &'a str,
+    pub helpers: &'a [String],
+    /// Its function, from the crate's root.
+    pub path: &'a str,
+}
 
 /// One macro of the list.
 struct Macro {
@@ -110,12 +125,19 @@ impl HirFrontend<'_> {
     pub fn proc_macro_list(&self, krate: Crate) -> Result<String, CodegenError> {
         self.with(|db, _| {
             let macros = macros(db, krate).map_err(|what| refused(db, krate, what))?;
-            Ok(text(&macros))
+            Ok(list_text(macros.iter().map(|it| ListedMacro {
+                kind: it.kind,
+                name: &it.name,
+                helpers: &it.helpers,
+                path: &it.path,
+            })))
         })
     }
 }
 
-fn text(macros: &[Macro]) -> String {
+/// The module [`MODULE`] listing `macros`, in the order given, which the server finds them in
+/// by name: the text v1 and v2 both append.
+pub fn list_text<'a>(macros: impl IntoIterator<Item = ListedMacro<'a>>) -> String {
     // alloc: once a proc-macro crate, the text cargo writes
     let mut text = String::from(MARK);
     _ = write!(
@@ -131,10 +153,10 @@ fn text(macros: &[Macro]) -> String {
          pub client: Client,\n    \
          }}\n\n    \
          #[unsafe(no_mangle)]\n    \
-         pub static BLAZE_PROC_MACROS: &[Macro] = &[\n",
+         pub static {SYMBOL}: &[Macro] = &[\n",
     );
-    for Macro { kind, name, helpers, path, .. } in macros {
-        let expand = if *kind == 1 { "expand2" } else { "expand1" };
+    for ListedMacro { kind, name, helpers, path } in macros {
+        let expand = if kind == 1 { "expand2" } else { "expand1" };
         _ = writeln!(
             text,
             "        Macro {{ kind: {kind}, name: {name:?}, helpers: &{helpers:?}, \

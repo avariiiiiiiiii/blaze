@@ -73,8 +73,8 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
         kinds::FETCH => Tag::Store,
         kinds::LIBRARY | kinds::COMPILE | kinds::REACH => Tag::Codegen,
         kinds::LOWER | kinds::UB_TESTS | kinds::EVALUATE => Tag::Mir,
-        kinds::WALK => Tag::Query,
-        TaskKind(1..=3) => Tag::Vfs,
+        kinds::WALK | TaskKind(4) => Tag::Query,
+        TaskKind(1..=3) | TaskKind(5..=6) => Tag::Vfs,
         TaskKind(0x1000..0x2000) => Tag::Nameres,
         TaskKind(0x2000..0x2200) => Tag::Parse,
         TaskKind(0x2200..0x2400) => Tag::Nameres,
@@ -133,7 +133,9 @@ pub struct Estimate {
 const _: () = assert!(size_of::<Estimate>() == 40);
 
 impl Estimate {
-    fn observe(&mut self, peak: u64) {
+    /// One more task held `peak` bytes at most: `predicted` rises to a peak at or above it at
+    /// once, and falls halfway to the window's most after [`WINDOW`] peaks below it in a row.
+    pub fn observe(&mut self, peak: u64) {
         self.seen = self.seen.saturating_add(1);
         self.most = self.most.max(peak);
         if peak >= self.predicted {
@@ -638,6 +640,9 @@ mod tests {
         let cases = [
             (1, Tag::Vfs),
             (3, Tag::Vfs),
+            (4, Tag::Query),
+            (5, Tag::Vfs),
+            (6, Tag::Vfs),
             (0x1000, Tag::Nameres),
             (0x1fff, Tag::Nameres),
             (0x2000, Tag::Parse),

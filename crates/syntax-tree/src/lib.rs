@@ -32,7 +32,7 @@ pub use crate::{
         Language, SyntaxElement, SyntaxElementChildren, SyntaxNode, SyntaxNodeChildren,
         SyntaxNodeChildrenWhere, SyntaxToken,
     },
-    flat::{Expand, FlatTree, FlatTreeBuilder},
+    flat::{Expand, FlatTree, FlatTreeBuilder, Splice},
     syntax_text::SyntaxText,
     utility_types::{Direction, NodeOrToken, TokenAtOffset, WalkEvent},
 };

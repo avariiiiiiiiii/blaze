@@ -92,6 +92,32 @@ shelves! {
     LintAttrs, LINT_ATTRS: (LintAttr, SmolStr);
     /// Clauses `display` writes, kept as `'static` and lent as `'db` through [`recycle`].
     Clauses, CLAUSES: hir_ide::next_solver::Clause<'static>;
+    /// `query_external_importables`' items, first found first.
+    Importables, IMPORTABLES: (hir_def::item_scope::ItemInNs, hir_def::Complete);
+}
+
+type ImportablesSeen = rustc_hash::FxHashSet<(hir_def::item_scope::ItemInNs, hir_def::Complete)>;
+
+thread_local! {
+    /// The items `query_external_importables` has handed out, to skip one found again.
+    static IMPORTABLES_SEEN: RefCell<ImportablesSeen> = RefCell::new(ImportablesSeen::default());
+}
+
+/// Takes the thread's seen-set, empty: taken rather than borrowed, so a search inside a search
+/// gets one of its own.
+pub(crate) fn take_importables_seen() -> ImportablesSeen {
+    IMPORTABLES_SEEN.try_with(|it| std::mem::take(&mut *it.borrow_mut())).unwrap_or_default()
+}
+
+/// Gives the set back, emptied, keeping its capacity.
+pub(crate) fn give_importables_seen(mut seen: ImportablesSeen) {
+    seen.clear();
+    let _ = IMPORTABLES_SEEN.try_with(|it| {
+        let mut slot = it.borrow_mut();
+        if slot.capacity() < seen.capacity() {
+            *slot = seen;
+        }
+    });
 }
 
 /// `buffer`, emptied, as a vector of `U`: the same allocation when `T` and `U` have one size and
@@ -146,5 +172,34 @@ impl<B: Shelved + DerefMut<Target = Vec<T>>, T: Default> DoubleEndedIterator for
             return None;
         }
         self.buffer.pop()
+    }
+}
+
+/// The items of a lent buffer of `Copy` items, first to last, the buffer going back to its
+/// shelf when this is dropped.
+pub(crate) struct LentCopied<B: Shelved, T> {
+    buffer: scratch::Lent<B>,
+    front: usize,
+    _item: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<B: Shelved + Deref<Target = Vec<T>>, T: Copy> LentCopied<B, T> {
+    pub(crate) fn new(buffer: scratch::Lent<B>) -> Self {
+        LentCopied { buffer, front: 0, _item: std::marker::PhantomData }
+    }
+}
+
+impl<B: Shelved + Deref<Target = Vec<T>>, T: Copy> Iterator for LentCopied<B, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        let item = *self.buffer.get(self.front)?;
+        self.front += 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.buffer.len() - self.front;
+        (left, Some(left))
     }
 }

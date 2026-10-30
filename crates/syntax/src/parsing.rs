@@ -11,7 +11,7 @@ use syntax_tree::{FlatTree, Text, TextRange, TextSize};
 use crate::{SyntaxError, SyntaxKind, SyntaxTreeBuilder, Tree, syntax_node::RustLanguage};
 
 pub(crate) use crate::parsing::reparsing::{
-    edit_between, incremental_reparse, incremental_reparse_onto,
+    edit_between, incremental_reparse, incremental_reparse_onto, reparse_all,
 };
 
 /// A source file's tree: in full, or as an outline whose `fn` bodies are lazy nodes.

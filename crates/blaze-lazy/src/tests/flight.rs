@@ -46,7 +46,12 @@ impl Mailbox {
         }
     }
 
-    fn stops(&self) -> Vec<(Option<(InstanceKey, ItemKey)>, String)> {
+    /// Whether `client`'s frame `seq` was answered yet, not waiting.
+    pub(crate) fn has(&self, client: u32, seq: u32) -> bool {
+        self.answers.lock().unwrap().contains_key(&(client, seq))
+    }
+
+    pub(crate) fn stops(&self) -> Vec<(Option<(InstanceKey, ItemKey)>, String)> {
         self.stops.lock().unwrap().clone()
     }
 }
@@ -73,6 +78,8 @@ pub(crate) struct Counting {
     pub(crate) fail: Vec<InstanceKey>,
     pub(crate) panic: Vec<InstanceKey>,
     pub(crate) delay: Duration,
+    /// What its probe finds compiled already; one also in `panic` panics the probe.
+    pub(crate) hits: Vec<InstanceKey>,
 }
 
 impl Compiler for Counting {
@@ -88,6 +95,18 @@ impl Compiler for Counting {
         let mut function = compiled(0, &[], &[]);
         function.key = key;
         Ok(function)
+    }
+
+    fn hit(&self, key: InstanceKey) -> Option<CompiledFunction> {
+        if !self.hits.contains(&key) {
+            return None;
+        }
+        if self.panic.contains(&key) {
+            panic!("boom");
+        }
+        let mut function = compiled(0, &[], &[]);
+        function.key = key;
+        Some(function)
     }
 
     fn tier_up(&self, key: InstanceKey, to: Tier) -> Result<CompiledFunction, String> {
@@ -312,6 +331,10 @@ struct Tiers {
 impl Compiler for Tiers {
     fn compile(&self, key: InstanceKey) -> Result<CompiledFunction, String> {
         Counting::default().compile(key)
+    }
+
+    fn hit(&self, _: InstanceKey) -> Option<CompiledFunction> {
+        None
     }
 
     fn tier_up(&self, key: InstanceKey, to: Tier) -> Result<CompiledFunction, String> {

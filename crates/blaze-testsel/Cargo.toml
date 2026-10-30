@@ -19,8 +19,10 @@ blaze-cas.workspace = true
 blaze-core.workspace = true
 blaze-ids.workspace = true
 blaze-usercode.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 blaze-protocol.workspace = true
 
 [lints]

@@ -11,7 +11,7 @@
 use std::fmt::Write as _;
 
 use base_db::{Crate, Db};
-use blaze_codegen::{CodegenError, settings::Panic};
+use blaze_codegen::{CodegenError, exec, plan::Mode, settings::Panic};
 use blaze_ids::Hasher;
 use cfg::{CfgAtom, CfgExpr};
 use hir_def::{
@@ -336,13 +336,17 @@ impl HirFrontend<'_> {
     /// The module of a test harness for `krate`, to add to the end of the text of its root
     /// file ([`Self::on_disk`] gives the text before); `None` when `krate` has no `cfg(test)`
     /// (a test with `harness = false`), whose `main` is its own. `fork_server` is
-    /// `blaze_usercode::test::fork_server`'s module.
+    /// `blaze_usercode::test::fork_server`, asked for the module that records what each test
+    /// ran when a binary built in `mode` has jump-table slots ([`exec::records`]): the text
+    /// differs by mode, so a harness written for one is written again for another.
     pub fn harness(
         &self,
         krate: Crate,
         panic: Panic,
-        fork_server: &str,
+        mode: Mode,
+        fork_server: fn(bool) -> &'static str,
     ) -> Result<Option<String>, CodegenError> {
+        let fork_server = fork_server(exec::records(mode));
         self.with(|db, _| {
             if !tested(db, krate) {
                 return Ok(None);

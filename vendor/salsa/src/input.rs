@@ -351,6 +351,10 @@ impl<C: Configuration> Ingredient for IngredientImpl<C> {
         JarKind::Struct
     }
 
+    fn read_kind(&self) -> crate::ingredient::ReadKind {
+        crate::ingredient::ReadKind::Input
+    }
+
     unsafe fn reclaim_memos(&self) {
         // SAFETY: Our caller's contract.
         unsafe { self.memo_table_types.reclaim() };

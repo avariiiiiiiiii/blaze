@@ -1628,6 +1628,7 @@ else uses `smallvec::SmallVec` in `path.rs`, its import goes.
 ## 15. lane db: `crates/hir-ty/src/lower/batch.rs`
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): 15a to 15f applied below (db-mem-infer-b-lower), in the tree at `crates/hir-ty/src/lower/batch.rs:87` (`SideTableBuilder<'f, 'db>`), `:163` and `:292` (a task per item), `:351` to `:409` (the four queries, `mem_tag = Infer`).
 
 ### 15a. `SideTableBuilder` in the frame, exact columns
 

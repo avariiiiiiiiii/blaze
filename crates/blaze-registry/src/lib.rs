@@ -136,25 +136,6 @@ impl PackageCacheLock {
     }
 }
 
-/// Runs `future` to its end on this thread, parked while it waits.
-pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    struct Unpark(std::thread::Thread);
-    impl std::task::Wake for Unpark {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let mut future = std::pin::pin!(future);
-    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut cx = std::task::Context::from_waker(&waker);
-    loop {
-        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-            return output;
-        }
-        std::thread::park();
-    }
-}
-
 /// Writes a file under a temporary name and renames it into place, so that a reader finds
 /// all of it or none.
 pub(crate) fn write_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {

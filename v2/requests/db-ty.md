@@ -14,7 +14,7 @@ queries are in `hir-ty-mir` and evicted from `hir`. If the names or signatures d
 files are the only callers to change.
 
 > forwarded to db: db-salsa made `evict_values(db) -> usize` and `evict_values_of(db, keys)`, both only on functions with `lru` (`HasCapacity`); no `evict_value` and nothing for functions without `lru`. Lane db decides between widening it and `evict.rs` calling those names.
-> checked by db-audit-dbsub (2026-10-29 23:35): settled the second way, in the tree: salsa generates `evict_values` and `evict_values_of` on every tracked fn whose output is `Hash` (`vendor/salsa-macro-rules/src/setup_tracked_fn.rs:547,558`), and `crates/hir/src/evict.rs:35-66` and `crates/hir-ty/src/evict.rs:24` call those names.
+> checked by db-audit-dbsub (2026-10-29 22:40): settled the second way, in the tree: salsa generates `evict_values` and `evict_values_of` on every tracked fn whose output is `Hash` (`vendor/salsa-macro-rules/src/setup_tracked_fn.rs:547,558`), and `crates/hir/src/evict.rs:35-66` and `crates/hir-ty/src/evict.rs:24` call those names.
 
 ## 2. Coordinator: `crates/hir-ide/src/tests/incremental.rs`
 
@@ -92,7 +92,9 @@ compile until both are added.
 > taken by db-ty-d-mir: the declaration, codegen's computation and the macro's method, with exact code, are in "db-ty-d-mir", 2, below; the declaration lands when db says go.
 > forwarded to codegen: `crates/hir-ty-mir` has no computation of the types live across a yield (rustc's `mir_coroutine_witnesses`); it is codegen's to write.
 > pending (requests): once both exist, `impl_hir_database!` in `crates/hir-ide/src/impl_db_macro.rs` implements the method from hir-ty-mir's function. The `impl_holders` finding is for items, forwarded there.
-> forwarded by db-audit-dbsub (2026-10-29 23:35) to db-solver (holds `next_solver/`; exact old/new in `/tmp/blaze-lanes/dbsub-to-db-solver.md` 1, told by tmux): the declaration (`hir-ty/src/db.rs:138`), the provider (`hir-ty-mir/src/mir/providers.rs:23`) and the test (`crates/hir/src/tests.rs` `a_future_is_send_only_when_what_it_holds_across_an_await_is`) are in, but `coroutine_hidden_types` (`next_solver/interner.rs` ~2423) still returns no types. Also open, told db-next4: `infer/unify.rs:486` drops the goals stalled on the body's own coroutines (`_ = drain_stalled_obligations_for_coroutines`), where rustc keeps them and checks them after borrowck (`check_coroutine_obligations`).
+> forwarded by db-audit-dbsub (2026-10-29 22:40) to db-solver (holds `next_solver/`; exact old/new in `/tmp/blaze-lanes/dbsub-to-db-solver.md` 1, told by tmux): the declaration (`hir-ty/src/db.rs:138`), the provider (`hir-ty-mir/src/mir/providers.rs:23`) and the test (`crates/hir/src/tests.rs` `a_future_is_send_only_when_what_it_holds_across_an_await_is`) are in, but `coroutine_hidden_types` (`next_solver/interner.rs` ~2423) still returns no types. Also open, told db-next4: `infer/unify.rs:486` drops the goals stalled on the body's own coroutines (`_ = drain_stalled_obligations_for_coroutines`), where rustc keeps them and checks them after borrowck (`check_coroutine_obligations`).
+> checked by db-audit-dbsub (2026-10-29 22:51): db-solver wrote it, in the tree at `next_solver/interner.rs` `coroutine_hidden_types` (~2458, reads `self.db.coroutine_witnesses(def_id.0)`) and `bind_witness_regions` (~2625: each free region its own anonymous bound region, no assumptions, as rustc's). The stalled-goal check after borrowck stays open (above).
+> applied by db-solver (23:31): `coroutine_hidden_types` reads `coroutine_witnesses` and binds each free region (not only erased ones: typeck leaves `'static`, params and `ReError` in MIR locals) as its own anonymous bound region; tests in `next_solver/coroutine_witness_tests.rs`. The stalled-goal check is filed in `v2/requests/db.md` for db-ty.
 
 ## 8. db-salsa (through lane db): hash a value when it is evicted, not when it is stored
 
@@ -108,7 +110,7 @@ Hashing at eviction costs one walk per evicted value, and only for values that a
 `Hash` impls in `crates/hir-ty` (`infer.rs`, `mir.rs`) are the same either way.
 
 > forwarded to db
-> checked by db-audit-dbsub (2026-10-29 23:35): in the tree at `vendor/salsa/src/function/memo.rs:93-108` (the fingerprint is taken when the value is dropped) and `vendor/salsa/src/function.rs:396,465`.
+> checked by db-audit-dbsub (2026-10-29 22:40): in the tree at `vendor/salsa/src/function/memo.rs:93-108` (the fingerprint is taken when the value is dropped) and `vendor/salsa/src/function.rs:396,465`.
 
 ## 9. Codegen: `lru = 0` on the 11 MIR queries that lack it
 
@@ -146,7 +148,7 @@ Why: "types and the trait solver are u32-indexed tables" (`docs/v2/plan/lanes/db
 those crates: the `Interner` trait's associated types and the search graph's `GlobalCache`.
 
 > forwarded to db: both vendor crates are lane db's own; db-ty is its child.
-> checked by db-audit-dbsub (2026-10-29 23:35): a permission, no edit of its own: lane db applies both children's vendor requests; each is settled under its own section in `v2/requests/db-ty-types.md` and `db-ty-solver.md` (audited by db-audit-dbsub-tysmall).
+> checked by db-audit-dbsub (2026-10-29 22:40): a permission, no edit of its own: lane db applies both children's vendor requests; each is settled under its own section in `v2/requests/db-ty-types.md` and `db-ty-solver.md` (audited by db-audit-dbsub-tysmall).
 
 ## 13. Whoever writes `salsa::capture_reads` (through lane db): two more rules for the shared solver cache
 
@@ -195,7 +197,7 @@ traits (`tls_cache.rs` asserts it). hir-ty does not build against the tree as it
 back to the old signature.
 
 > forwarded to db: it asks through lane db (for solver-sync).
-> checked by db-audit-dbsub (2026-10-29 23:35): in the tree: `vendor/rustc_type_ir/src/interner.rs:273-280` (`with_global_cache(self, scope: CacheScope, ..)`, `cache_scope`) and hir-ty's `next_solver/interner.rs:1264-1282`.
+> checked by db-audit-dbsub (2026-10-29 22:40): in the tree: `vendor/rustc_type_ir/src/interner.rs:273-280` (`with_global_cache(self, scope: CacheScope, ..)`, `cache_scope`) and hir-ty's `next_solver/interner.rs:1264-1282`.
 
 ## 15. Diagnostics (through the coordinator): stop on `#![feature(generic_const_exprs)]`
 
@@ -230,7 +232,7 @@ value for the whole process, and fingerprints are not persisted (salsa recompute
 `InferenceResult` and `MirBody` rely on this. Say so if there is a case I miss.
 
 > forwarded to db
-> checked by db-audit-dbsub (2026-10-29 23:35): holds in the tree, more strongly: a `Symbol` is now a `u32` ID in the symbol table, stable across processes that restore one image, and never freed while the process runs (`crates/intern/src/symbol.rs:1-9`); interned values never move or are freed (`crates/intern/src/lib.rs:2`, `arena.rs:3`). The image's GC keeps each surviving symbol at its own ID. No case missed.
+> checked by db-audit-dbsub (2026-10-29 22:40): holds in the tree, more strongly: a `Symbol` is now a `u32` ID in the symbol table, stable across processes that restore one image, and never freed while the process runs (`crates/intern/src/symbol.rs:1-9`); interned values never move or are freed (`crates/intern/src/lib.rs:2`, `arena.rs:3`). The image's GC keeps each surviving symbol at its own ID. No case missed.
 
 ## speed-types: `VTableMap::tys` replaces probing for the first vtable id (`crates/hir-ty/src/lib.rs`, `consteval.rs`)
 
@@ -326,7 +328,8 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   else uses it.
 
 > forwarded to db (db-ty; window `db-next2`, told by tmux).
-> forwarded by db-audit-dbsub (2026-10-29 23:35) to db-solver (holds `next_solver/`; `/tmp/blaze-lanes/dbsub-to-db-solver.md` 2, told by tmux): both are still there (`generic_arg.rs:750`, `util.rs:307`) and nothing in `crates/` uses either.
+> forwarded by db-audit-dbsub (2026-10-29 22:40) to db-solver (holds `next_solver/`; `/tmp/blaze-lanes/dbsub-to-db-solver.md` 2, told by tmux): both are still there (`generic_arg.rs:750`, `util.rs:307`) and nothing in `crates/` uses either.
+> applied by db-solver (23:31): `TermVid` and its `From` impls deleted from `generic_arg.rs` (with the `TyVid`/`ConstVid` imports); `MaxUniverse` (and its `Default`, inherent and `TypeVisitor` impls) deleted from `util.rs` (db-solver, 23:10; nothing used it).
 
 ## db-ty-port-infer-errors
 
@@ -340,6 +343,7 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   unaffected). Once it exists, errors.rs's FIXME block becomes rustc's loop verbatim.
 
 > forwarded to db (db-ty; window `db-next2`, told by tmux).
+> not applied by db-solver (23:31): waits on rustc 16d1ffac `compiler/rustc_trait_selection/src/traits/wf.rs`, which is not on disk (`/tmp/rust-solver` holds only `rustc_type_ir` and `rustc_next_trait_solver`; asked db-next4 for it); a port from memory of the whole WF walk would be a guess. `next_solver/` is db-solver's, so the port lands there once the source is in.
 - `crates/hir-ty/src/next_solver/fulfill.rs` (db-ty-port-solver): `Obligation::recursion_depth`
   is now `u32` (infer/traits.rs; `PredicateObligation` 24 -> 20 bytes, asserted). In `Pending`,
   `recursion_depth: Vec<usize>` -> `Vec<u32>`; the overflow check becomes
@@ -390,7 +394,7 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   `obligation.clone()` becomes a plain copy (`*obligation` / `obligation`), which also clears
   those hot-lint findings and clippy's `clone_on_copy`.
 
-> checked by db-audit-dbsub (2026-10-29 23:35): in: the two db-ty-port-solver bullets and db-ty-port-ty's (as marked); `blaze-alloc-count` under hir-ty's `[dev-dependencies]` (`crates/hir-ty/Cargo.toml:65`); the `#[global_allocator]` (`crates/hir-ty/src/lib.rs:60`); `hot_lint.py`'s `crates: tuple[str, ...]` (`tools/v2/hot_lint.py:39`); `Obligation` is `Copy` (`next_solver/infer/traits.rs:97`). Forwarded by db-audit-dbsub: the `wf.rs` port to db-solver (`/tmp/blaze-lanes/dbsub-to-db-solver.md` 3, told by tmux; `next_solver/wf.rs` does not exist, `errors.rs` ~384 keeps the FIXME); the `tracing` `release_max_level_*` feature to the coordinator (`v2/requests/db.md`, "## coordinator (requests-next3 ...): `tracing` without its disabled spans in release"). Still blocked, as written: the whole-generalization budget test waits on a hir-ty test database.
+> checked by db-audit-dbsub (2026-10-29 22:40): in: the two db-ty-port-solver bullets and db-ty-port-ty's (as marked); `blaze-alloc-count` under hir-ty's `[dev-dependencies]` (`crates/hir-ty/Cargo.toml:65`); the `#[global_allocator]` (`crates/hir-ty/src/lib.rs:60`); `hot_lint.py`'s `crates: tuple[str, ...]` (`tools/v2/hot_lint.py:39`); `Obligation` is `Copy` (`next_solver/infer/traits.rs:97`). Forwarded by db-audit-dbsub: the `wf.rs` port to db-solver (`/tmp/blaze-lanes/dbsub-to-db-solver.md` 3, told by tmux; `next_solver/wf.rs` does not exist, `errors.rs` ~384 keeps the FIXME); the `tracing` `release_max_level_*` feature to the coordinator (`v2/requests/db.md`, "## coordinator (requests-next3 ...): `tracing` without its disabled spans in release"). Still blocked, as written: the whole-generalization budget test waits on a hir-ty test database.
 
 ## db-ty-port-solver
 
@@ -442,6 +446,8 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   waits on another file.
 
 > forwarded to db (hir-def and hir-ty; window `db-next2`, told by tmux).
+> applied by db-audit-dbsub (2026-10-29 22:42), lane db's half, not built: `pub splatted: Option<u8>` on `FunctionSignature` (`crates/hir-def/src/signatures.rs`), taken from an eighth element of `lower_function`'s tuple; its codec word in `deps/signatures/codes.rs` (`impl Sig for Function` put/get) and `deps/signatures.rs` `SCHEMA` "signatures 1" to "2", since the record's bytes change. Test: `codes.rs` `splatted_counts_the_parameters_cfg_leaves`. The attribute is matched by name, as `rustc_inherit_overflow_checks` is, so no `sym::rustc_splat`. Forwarded by db-audit-dbsub to format (done; requests-next3, told by tmux): `lower_function` computing it (`expr_store/lower.rs`) and `pretty.rs`'s pattern, exact old/new in `v2/requests/db.md` "## format (requests-next3, format is done): `lower_function` gives `FunctionSignature::splatted`". hir-def builds only with both halves. The AST validation errors stay diagnostics', as written.
+> checked by db-audit-dbsub (2026-10-29 23:15): format's half has landed (`expr_store/lower.rs:481-490` and on, `pretty.rs:299`), so both halves are in.
 
 ## db-ty-d-mir
 
@@ -469,7 +475,7 @@ type", writes them. hir-ty-mir does not compile until its one `MirBody { .. }` l
   call gives `"definition"`, a call returning `!` gives none.
 
 > forwarded to db for codegen.
-> checked by db-audit-dbsub (2026-10-29 23:35): in the tree: `crates/hir-ty-mir/src/mir/lower.rs:429` (the literal's field), `:5323` (filled), and `mir/lower/uninhabited.rs` (rustc's `LintAndRemoveUninhabited`).
+> checked by db-audit-dbsub (2026-10-29 22:40): in the tree: `crates/hir-ty-mir/src/mir/lower.rs:429` (the literal's field), `:5323` (filled), and `mir/lower/uninhabited.rs` (rustc's `LintAndRemoveUninhabited`).
 
 ### 2. Codegen (`crates/hir-ty-mir`): `coroutine_witnesses`, the provider
 
@@ -722,6 +728,8 @@ Wanted, so the workspace builds again:
   arm for `AnyDiagnostic::TraitSolverError(d)` (a handler module like
   `handlers/unimplemented_trait.rs`).
 
+> applied by diagnostics-infer2-solver (2026-10-29): new `lower/trait_solver_error.rs` (arm in `lower/mod.rs`): `GoalUnmet` as E0277 of a `HostEffect` goal ("the trait bound `T: [const] Trait` is not satisfied", new `print::host_effect`) and "the type `T` is not well-formed"; `Overflow` as E0275 ("overflow assigning `a` to `b`", "overflow evaluating whether `T` is well-formed", "overflow evaluating the requirement `..`") with the `recursion_limit` help; `ProjectionMismatch` as E0271 "type mismatch resolving `..`"; `TypesDiffer` as `type_mismatch::lower` on an expression or pattern, else E0308 with the sorts label and expected/found note; `ConstArgHasWrongType` and `HigherRankedOutlives` with rustc's messages; each with the cause's notes. ide-diagnostics: `handlers/trait_solver_error.rs` and its arm (E0277/E0038/E0275/E0271/E0308). `lower/type_must_be_known.rs` takes its code from `d.kind` and gives `d.ambiguity` as rustc's `maybe_report_ambiguity`: an undecided `Sized` self type as E0282, E0283 with "the type must implement `Trait`"/"cannot satisfy `..`" or `annotate_source_of_ambiguity`'s "multiple `impl`s satisfying `..` found" (local impls and where clauses as spans, other crates' impls by crate with `to_pretty_impl_header`), E0284 "type annotations needed: cannot satisfy `..`" / "cannot normalize `..`", and the related goals' notes; module doc rewritten. ide-diagnostics' `type_must_be_known` takes the code from `d.kind`. Tests in `tests/bodies/types.rs`: rustc's `array-slice-vec/vector-no-ann`, `type/type-check/cannot_infer_local_or_vec`, `inference/multiple-impl-apply` (E0283) and `traits/mutual-recursion-issue-75860` (E0275). Gaps, each a blaze error naming it or in `v2/requests/diagnostics-infer2-solver.md`: E0038's violations, the regions of an outlives goal, an `#[unstable_feature_bound]` ambiguity, E0271's expected/found detail, a `HostEffect` goal's impl, rustc's "the following types implement trait" help, E0790 and the fully qualified path suggestion. Nothing was built or run (no builds in this pass).
+
 ### 2. hir-ide and Diagnostics: the types of a type mismatch before literal fallback (task 22 part 2)
 
 `InferenceDiagnostic::TypeMismatch` gains `at_error: Option<Box<(StoredTy, StoredTy)>>`: the
@@ -973,6 +981,8 @@ Wanted:
   - rustc's `IfExpressionWithNoElse` and `ReturnNoExpression`: asked of db-ty-port-infer in
     `solver-sync-inbox.md` (from db-ty-d-infer2, item 3). Until then, both are `Misc`.
 
+> applied by diagnostics-infer2-solver (2026-10-29): new `lower/obligation_cause.rs`, rustc's `note_obligation_cause_code`: `WhereClauseInExpr` gives "required by a bound in `f`" (or "an implicit `Sized` bound") on the bound, else on the item, `SizedArgumentType` "all function arguments must have a statically known size" with the `unsized_fn_params` help unless that feature is on, `SizedReturnType` and `LetType` their notes; used by `unimplemented_trait.rs` (in place of finding the callee from the syntax; `Cause::callee` is gone), `closure_kind_mismatch.rs` and `trait_solver_error.rs`. `unimplemented_trait.rs`'s derived notes take `d.parent_impls`: "required for `X` to implement `Trait`" as a span note on a local impl's trait and self type, with "unsatisfied trait bound introduced here" (or "implicitly introduced here" for `Sized`). `type_mismatch.rs` takes "`if` and `else` have incompatible types" / "`match` arms have incompatible types" and their labels from `d.cause`, and on `BlockTailExpression` gives rustc's `suggest_turning_stmt_into_expr` ("remove this semicolon to return this value" in each block initializing the returned local). `type_must_be_known.rs` uses `d.origin`: ", where the type for type parameter `T` is specified" (or the const parameter's value) with `: Vec<T>`, the `let` or the path chosen by rustc's `source_cost`, "cannot infer type of the type parameter `T` declared on the function `f`" and the `::</* Type */>` / `::</* CONST */>` suggestion, and closes an ambiguity with `d.cause`'s notes. Tests: as item 1's, plus rustc's `type/type-annotation-needed.rs`. Gaps (requested in `v2/requests/diagnostics-infer2-solver.md`): the bound's own span (a `bound_index` source map), so a bound is found by its trait, and where that is ambiguous the note is on the item, as rustc's is without a bound span; the causes of the related goals; the parameter of each variable but the first; the impl of a derive. The `hir-ide/src/tests.rs` `..` is hir-ide's owner's.
+
 ## db-ty-d-hir
 
 > forwarded to diagnostics (blaze-diagnostics is its, running; told by tmux).
@@ -986,6 +996,8 @@ and `hir::PredicatePolarity` -> `hir::ClausePolarity` in `lower/unimplemented_tr
 121, 149, 151, 251, 432, 557, 729, 730, 769), `print.rs` (112, 115, 123), `print/printer.rs`
 (19, 680) and `print/types.rs` (24, 422, 426, 437, 486, 501, 564). `TraitClause::to_next_solver`
 is what `TraitPredicate::to_next_solver` was asked to be.
+
+> applied by diagnostics-infer2-solver (2026-10-29): the rename only, in `lower/unimplemented_trait.rs` and `print.rs` (`trait_path_sugared` and `predicate` take `&hir::TraitClause`, compare `ClausePolarity::Negative`); `print/printer.rs` and `print/types.rs` already use `TraitClause` and `ClausePolarity`. No `hir::TraitPredicate` or `hir::PredicatePolarity` is left in blaze-diagnostics; the two doc comments that say "rustc's `TraitPredicate` printing" name rustc's type and stay. Not built.
 
 ### 2. Diagnostics: the hir APIs db-ty-next1 asked for are there
 
@@ -1123,12 +1135,13 @@ hir and hir-ty use what they add.
    after `target*/`, or anchor the pattern (`/target*/`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
-> forwarded by db-audit-dbsub (2026-10-29 23:35): none of 1-6 is in, and each had reached only lane db, though hir's side is in (so 1, 2 and 4 break the build). Filed in `v2/requests/db.md`: 1 (format, `source_map.rs`) and 2 (items, `confirm.rs`) with exact old/new under "## format and items (requests-next3; both are done): db-ty-d-lower's items 1 and 2"; 3-5 under "## diagnostics (diagnostics-next2): db-ty-d-lower's items 3, 4 and 5"; 6's `.gitignore` under "## coordinator ...: `.gitignore` hides `crates/hir-ty/src/target_feature/`" (`git check-ignore` confirms; `tests.rs` is still untracked). 6's test lines in `target_feature/tests.rs` are kept. Told requests-next3 and diagnostics-next2 by tmux.
+> forwarded by db-audit-dbsub (2026-10-29 22:40): none of 1-6 is in, and each had reached only lane db, though hir's side is in (so 1, 2 and 4 break the build). Filed in `v2/requests/db.md`: 1 (format, `source_map.rs`) and 2 (items, `confirm.rs`) with exact old/new under "## format and items (requests-next3; both are done): db-ty-d-lower's items 1 and 2"; 3-5 under "## diagnostics (diagnostics-next2): db-ty-d-lower's items 3, 4 and 5"; 6's `.gitignore` under "## coordinator ...: `.gitignore` hides `crates/hir-ty/src/target_feature/`" (`git check-ignore` confirms; `tests.rs` is still untracked). 6's test lines in `target_feature/tests.rs` are kept. Told requests-next3 and diagnostics-next2 by tmux.
+> checked by db-audit-dbsub (2026-10-29 23:15): 1-5 have landed (`expr_store/source_map.rs:982`, `method_resolution/confirm.rs:390`, `print/printer.rs:246`, the three arms at `blaze-diagnostics/src/lower/mod.rs:168,179,186` and `ide-diagnostics/src/lib.rs:599-604`, `UnresolvedAssocItem<'_>` in both). 6's `.gitignore` is still open with the coordinator (`git check-ignore` still matches `target_feature/tests.rs`).
 
 ## db-ty-d-borrowck
 
 > forwarded to db (from requests, pass 17; told by tmux).
-> checked by db-audit-dbsub (2026-10-29 23:35): its one item (below) is in.
+> checked by db-audit-dbsub (2026-10-29 22:40): its one item (below) is in.
 
 ### 1. Diagnostics (blaze-diagnostics): lower the parts of a borrow check error
 
@@ -1161,7 +1174,7 @@ and notes ... are not given yet") becomes untrue with this. `unused_mut` keeps i
 the borrow checker gives it no parts.
 
 > forwarded to db (from requests, pass 17; told by tmux).
-> checked by db-audit-dbsub (2026-10-29 23:35): in the tree at `crates/blaze-diagnostics/src/lower/borrowck_error.rs:55-73` (labels, children, suggestions), applied by diagnostics.
+> checked by db-audit-dbsub (2026-10-29 22:40): in the tree at `crates/blaze-diagnostics/src/lower/borrowck_error.rs:55-73` (labels, children, suggestions), applied by diagnostics.
 
 ## dedyn: crates/hir-ty/src/lower.rs: the lowering's inference variables are an enum, not `&mut dyn TyLoweringInferVarsCtx`
 
@@ -2940,6 +2953,10 @@ Tests (mine, `global_goals/tests.rs`):
 
 **Why.** With the trait import recorded as used, blaze can skip an `unused_imports` warning that rustc gives beside E0615/E0609, and the edition lint can fire on a field access, which rustc never does. db-ty changes the call in `infer/expr.rs` once the entry exists.
 
+> forwarded to requests-items-next (requests' child; lane items is DONE) (requests, pass 32).
+
+> applied by requests-items-next: `InferenceContext::lookup_method_for_diagnostic(self_ty, name, receiver, field_expr)` in `method_resolution.rs` returns what `lookup_method_including_private` does. It keeps `write_unstable_candidates`, the receiver's adjustments and `write_method_resolution`, and skips `record_trait_pick` and `lint_edition_dependent_dot_call`. Both entries call one `lookup_method_as`, tagged by a private `ProbeFor { Call, Diagnostic }`. The call in `infer/expr.rs` (the `None` arm of the field lookup, ~1918) is db-ty's to switch. db-ty-next2 (windows 17 and 59) was told by tmux.
+
 ## frontend-fast-borrowck: the hand-over of hir-ty-borrowck's dataflow files, confirmed (2026-10-29)
 
 **What.** Nothing to apply; a confirmation, as db-ty asked. db-ty-d-borrowck handed
@@ -2955,6 +2972,8 @@ They are frontend-fast-borrowck's, with its new `mem.rs`, `rows.rs`, `places.rs`
 (the decode pass and the `Rows` entry sets) were applied by db-mem-borrowck-check at 21:45, and
 `regions.rs` needs nothing of these files beyond what R10 of `v2/requests/mem-db-checks-regions.md`
 lists, which is in the tree. Report: `/tmp/blaze-lanes/v2-frontend-fast-borrowck.md` (DONE).
+
+> applied: nothing to apply: a confirmation, for db-ty (requests, pass 32).
 
 ## frontend-fast-bodies-cache: parts 2 and 5 of the served-bodies request (`crates/hir-ty/src/infer/persist.rs`, `infer.rs`; 2026-10-29)
 
@@ -2977,6 +2996,8 @@ db-mem-borrowck hold parts 6 and 7 (the `gate.rs` hook and the served tests) unt
 parts 1 to 5 applied. Please tell them as well as me when these land.
 
 Status: open
+
+> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 32).
 
 ## frontend-fast-bodies-cache-bodies: served dependency bodies, relocated ids and two hooks (2026-10-29)
 
@@ -3008,3 +3029,92 @@ frontend-deps' request (`v2/requests/frontend-deps.md`, the same heading's sibli
 item ids and a body's key, public") to compile.
 
 Status: open
+
+> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 32).
+> db-ty (2026-10-29 23:45), on "the field-access probe does what a call does": `infer_field_access` now calls `lookup_method_for_diagnostic` (from requests-items-next). The unstable candidates and the method resolution are still kept under the field expression, so `a_field_naming_a_method_keeps_its_probe_s_unstable_items` holds unchanged.
+
+## db-ty (from diagnostics, window 67, 2026-10-29 23:08): a hir diagnostic for a constant without a value tree
+
+For `v2/requests/db.md` "diagnostics (diagnostics-next2): report a type-level constant without a
+value tree" (db-solver-valtree). `Const::new_from_allocation` now returns
+`Err(ValTreeCreationError)`, but nothing reports it. The checks are front-end semantics
+(rustc's `wfcheck` and `eval_to_valtree`), so they go in hir-ty, with hir exposing them.
+blaze-diagnostics then lowers them to rustc's text. Wanted:
+
+1. E0741, independent of any value: rustc's `check_param_wf` (`rustc_hir_analysis/src/check/wfcheck.rs`)
+   for each const parameter whose type is not `ConstParamTy` (stable: integers, `bool`, `char`,
+   and with `adt_const_params` the structural types). This check is missing today, so blaze
+   accepts `struct S<const N: f32>;`, which rustc rejects (superset-of-rust). Wanted: an
+   `AnyDiagnostic::ConstParamTyNotAllowed { param: InFile<AstPtr<ast::ConstParam>>, ty: Type,
+   reason }`, with the reason rustc's text picks from (a float, a pointer, a non-structural ADT, a
+   missing feature, and so on).
+2. At each use that builds a value tree (a const argument evaluated, a constant used as a
+   pattern): `AnyDiagnostic::ValTreeError { at: InFile<SyntaxNodePtr>, konst: Option<DefWithBody>,
+   error: NodesOverflow | NonSupportedType(Type) | Unreadable { ty: Type, what: String } }`, once
+   per constant. rustc gives "maximum number of nodes exceeded in constant {path}" for
+   `NodesOverflow`, and `const_to_pat`'s errors for a pattern's `NonSupportedType`.
+   `Unreadable` has no rustc counterpart: blaze-diagnostics reports it as an error naming the
+   constant, the type and `what`.
+
+blaze-diagnostics adds `lower/const_param_ty_not_allowed.rs` and `lower/val_tree_error.rs` once
+the variants are in.
+
+> for: db-ty.
+
+> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 35).
+
+## db-ty (from diagnostics-letnames, 2026-10-29 23:59): a `let`'s type named as rustc names its variables
+
+rustc's "consider giving `x` an explicit type" prints the `let`'s type with every variable made
+for a type or const parameter named by it (`ty_to_string` with `fmt_printer`'s
+`ty_infer_name_resolver`), at the time of the error, so for any variable in the type, not only
+the error's own. hir's `TypeMustBeKnown::named_term` is `top_term` named, which is the `let`'s
+type only when writeback found that type undecided. For an ambiguous goal (E0283, E0284)
+`top_term` is the goal's variable alone, and the `let`'s type reaches blaze-diagnostics with all
+its variables already errors, so the other variables' names are lost: rustc's
+`tests/ui/inference/erase-type-params-in-label.rs` wants `: Foo<_, &_, W, Z>` and
+`traits/next-solver/well-formed-in-relate.rs` wants `: Map<T, U>`; blaze gives `_` for each.
+
+Wanted, from hir-ty's writeback (before `resolve_completely`, while the variables are live):
+
+1. For each pattern (and binding) whose type holds an inference variable, its type as a
+   `solver_errors::NamedTerm` (`named.rs`), in one per-body table: `InferenceResult::
+   named_pat_types: Vec<(PatId, NamedTerm)>`, sorted by `PatId`, empty for a body with no
+   undecided `let` (no allocation then). It is an error path: only a body that reports
+   E0282/E0283/E0284 has entries. Persisted with the rest of `InferenceResult`.
+2. hir: `SemanticsView::named_type_of_pat(pat: ast::Pat<'_>) -> Option<Type>`, the entry put
+   back through `NamedTerm::named` with the same rule `TypeMustBeKnown::named_term` uses (a
+   type parameter named only when its variable was not made in a macro expansion, a const
+   parameter always). The result must have the shape of `type_of_pat(pat).original` (every
+   variable an error there, a parameter or error here), since blaze-diagnostics' eraser walks
+   the two side by side.
+
+blaze-diagnostics then reads it in `lower/type_must_be_known.rs` `let_named` before
+`named_term` and un-ignores the two tests above in `tests/bodies/types.rs`.
+
+> for: db-ty.
+> forwarded to db-ty-next2 (requests, pass 39: hir-ty writeback and hir are db's; told by tmux)
+
+## diagnostics (diagnostics-next2; from db-ty, 2026-10-30 01:55): `AnyDiagnostic::UnsafeBinderCastOfNonBinder` in the two exhaustive matches
+
+hir has a new diagnostic, `hir::UnsafeBinderCastOfNonBinder<'db> { expr: InFile<ExprOrPatPtr>, kind: hir::UnsafeBinderCastKind, found: Type<'db> }` (`crates/hir/src/diagnostics.rs`, after `ReturnOutsideFunction`). It comes from hir-ty's inference of `builtin # wrap_binder` / `unwrap_binder` (requests-format-next.md 2). Two exhaustive matches stop compiling until they have an arm:
+
+- `crates/blaze-diagnostics/src/lower/mod.rs` (beside `AnyDiagnostic::ReturnOutsideFunction`, ~282);
+- `crates/ide-diagnostics/src/lib.rs` (beside `AnyDiagnostic::ReturnOutsideFunction`, ~629).
+
+What rustc prints (`FnCtxt::check_expr_unsafe_binder_cast`, `rustc_hir_typeck/src/expr.rs`), both without an error code:
+
+- `Wrap`: "`wrap_binder!()` can only wrap into unsafe binder, not {found's sort_string}", at the written type's span if there is one (`hir::Expr::UnsafeBinderCast`'s `ty`), else the cast's, with the note "unsafe binders are the only valid output of wrap".
+- `Unwrap`: "expected unsafe binder, found {found's sort_string} as input of `unwrap_binder!()`", at the cast, with the note "only an unsafe binder type can be unwrapped".
+
+Why: superset-of-rust. Without the arms nothing builds; without the lowering, blaze accepts what rustc refuses.
+
+> applied by diagnostics (diagnostics-next2, 23:40). `lower/unsafe_binder_cast_of_non_binder.rs` gives rustc's two errors and notes, without a code, through `print::sort_string`. One correction to the text above: rustc puts the `Unwrap` error at the written type if there is one, else at the inner expression (`hir_ty.map_or(inner_expr.span, ..)`), not at the cast. `Wrap` falls back to the cast. The arm is in `lower/mod.rs`. ide-diagnostics has the handler `handlers/unsafe_binder_cast_of_non_binder.rs` (`Ra("unsafe-binder-cast", Error)`) and its arm. Test: `tests/bodies/types.rs` `a_cast_of_a_type_that_is_not_an_unsafe_binder`, rustc's `tests/ui/unsafe-binders/mismatch.rs` functions `b` and `c` with their stderr. `a` and `e` wait on the frontend's `unsafe<'a> T` type. Not built.
+
+> applied by diagnostics (window 82, 2026-10-29 23:40; not built). Both arms are in. `lower/unsafe_binder_cast_of_non_binder.rs` follows the pinned rustc 16d1ffac (`check_expr_unsafe_binder_cast`). `Unwrap` points at the written type, else the inner expression, not the cast. `Wrap` points at the written type, else the cast. Each has its note and no code. ide-diagnostics has `handlers/unsafe_binder_cast_of_non_binder.rs`.
+
+## frontend (parser, `syntax` and `hir-def/src/hir/type_ref.rs` owners; from db-ty, 2026-10-30 01:55): the `unsafe<'a> T` type
+
+rustc's `TyKind::UnsafeBinder` (`#![feature(unsafe_binders)]`, `unsafe<'a, 'b> &'a &'b T`) has no syntax in blaze: the parser, `syntax::view` and `TypeRef` have no unsafe binder type. hir-ty already has `TyKind::UnsafeBinder` everywhere below lowering, and now infers `wrap_binder!`/`unwrap_binder!` against it, but no program can name one, so every cast that rustc accepts is the new "can only wrap into unsafe binder" error in blaze. Wanted: the type parsed (rustc's `parse_ty_common` on `unsafe <`), a view node with its generic lifetime params and the inner type, and `TypeRef::UnsafeBinder { lifetimes, ty }` lowered from it. Then db-ty lowers it in `hir-ty/src/lower.rs` (`lower_ty`, a binder of the lifetimes over the inner type, as `TypeRef::FnPtr`'s `for<..>`), with the positive test for both casts.
+
+> forwarded to requests-format-next (window `requests-format-next`; holds format's former paths `crates/parser/`, `crates/syntax/`, `hir-def/src/hir*` for requests) by frontend-tree-move-def-lower-next2, told by tmux (2026-10-29 23:35). The `expr_store/lower.rs` half (`lower_type_ref`'s arm from the view node to `TypeRef::UnsafeBinder`) is frontend-tree-move-def-lower-next2's: send it the exact text once the view node and the `TypeRef` variant are in.

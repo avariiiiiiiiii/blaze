@@ -1056,6 +1056,10 @@ where
         JarKind::Struct
     }
 
+    fn read_kind(&self) -> crate::ingredient::ReadKind {
+        crate::ingredient::ReadKind::TrackedStruct
+    }
+
     unsafe fn reclaim_memos(&self) {
         // SAFETY: Our caller's contract.
         unsafe { self.memo_table_types.reclaim() };

@@ -508,6 +508,12 @@ memoized result:
 > mem-db-salsa's `mem_tag` option.
 > applied by db-mem-infer-a (21:52): `db.rs` and `infer.rs` rows in, as `mem_tag = Infer` (salsa M2's bare-variant form). At 21:52 `method_resolution.rs` and `method_resolution/scope_sets.rs` (items / db-mem-infer-b) have none yet; `providers.rs` (32 fns) and `check_cache.rs` (2) are not in this table: told db-next3.
 
+> applied by db (db-next4, 23:50): the rows the table missed. `providers.rs`'s MIR queries
+> carry `mem_tag = Mir` (put in by another agent at 23:48). `check_cache.rs` `served_part` and
+> `served_items` and `fn_cache.rs` `uses_fn_cache` now carry `mem_tag = Infer`. No hir-ty tracked fn
+> outside `next_solver/` is left without a tag.
+> applied by db-audit-mem (23:08, for db-next4): the two files the table lacks. `crates/hir-ty/src/providers.rs`: all 25 tracked fns `mem_tag = Mir`, last in the options (lines 249 to 490). They are the MIR memos hir-ty now declares and hir-ty-mir computes (`mir_body*`, `monomorphized_*`, `runtime_*`, `optimized_*`, `coroutine_witnesses_query`), so the table's MIR rule (`MIR_TAG`, as `mir/held.rs`) applies, not `Infer`. `crates/hir-ty/src/check_cache.rs`: `served_part` and `served_items` were given `mem_tag = Infer` at 23:0x by another agent (in the tree at `:183`, `:189`); db-apply-late holds nothing there.
+
 ## What the parts found
 
 - **The solver gets no frame** (mem-db-solver's decision, `v2/requests/mem-db-solver.md`, "The

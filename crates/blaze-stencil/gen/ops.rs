@@ -18,7 +18,7 @@
 use crate::{
     format::HoleKind,
     generate::ir::{B, bits, float, icmp, ir, lane_bits, mangle, splat, vec_of, zero},
-    shape::{FloatCc, IntCc, Op, RmwOp, Shape, Ty},
+    shape::{Disp, FloatCc, IntCc, Op, RmwOp, Shape, Ty},
 };
 
 /// The results of `shape` computed from `args`, in [`super::ir::B`]'s stencil.
@@ -366,6 +366,7 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
             b.stmt("fence seq_cst");
             vec![]
         }
+        Op::LoadConfined | Op::StoreConfined => confined(b, shape, args),
 
         Op::Jump => vec![],
         Op::Brif => {
@@ -617,4 +618,72 @@ fn load(b: &mut B<'_>, mem: Ty, ty: Ty, ext: Option<&str>, p: &str) -> String {
 fn store(b: &mut B<'_>, ty: Ty, v: &str, p: &str) {
     let at = address(b, p);
     b.stmt(&format!("store {} {v}, ptr {at}, align 1", ir(ty)));
+}
+
+/// A confined access: the plain one at `vmctx + zext(trunc(p) + off)`, the 32-bit sum
+/// wrapping as `ireduce.i32 (iadd_imm p, off)` does.
+fn confined(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
+    let (access, disp) = shape.confined().expect("a confined access");
+    let ty = shape.ty;
+    let t = ir(ty);
+    let (value, p, vmctx) = match shape.op {
+        Op::StoreConfined => (args[0].as_str(), args[1].as_str(), args[2].as_str()),
+        _ => ("", args[0].as_str(), args[1].as_str()),
+    };
+    let sum = match disp {
+        Disp::Zero => b.cast("trunc", Ty::I64, p, Ty::I32),
+        Disp::Lo12 => {
+            let v = b.add_lo12(HoleKind::Offset, p);
+            b.cast("trunc", Ty::I64, &v, Ty::I32)
+        }
+        Disp::Imm32 => {
+            let p = b.cast("trunc", Ty::I64, p, Ty::I32);
+            let off = b.imm(HoleKind::Offset, Ty::I32, false);
+            b.val(&format!("add i32 {p}, {off}"))
+        }
+    };
+    let wide = b.cast("zext", Ty::I32, &sum, Ty::I64);
+    let addr = b.val(&format!("add i64 {vmctx}, {wide}"));
+    let at = pointer(b, &addr);
+    let load = |b: &mut B<'_>, mem: &str, ext: Option<&str>| {
+        let v = b.val(&format!("load {mem}, ptr {at}, align 1"));
+        match ext {
+            Some(ext) => vec![b.val(&format!("{ext} {mem} {v} to {t}"))],
+            None => vec![v],
+        }
+    };
+    let store = |b: &mut B<'_>, narrow: Ty| {
+        let v = b.cast("trunc", ty, value, narrow);
+        b.stmt(&format!("store {} {v}, ptr {at}, align 1", ir(narrow)));
+        vec![]
+    };
+    match access {
+        Op::Load => load(b, t, None),
+        Op::Uload8 | Op::Sload8 | Op::Uload16 | Op::Sload16 | Op::Uload32 | Op::Sload32 => {
+            let (mem, ext) = match access {
+                Op::Uload8 => (Ty::I8, "zext"),
+                Op::Sload8 => (Ty::I8, "sext"),
+                Op::Uload16 => (Ty::I16, "zext"),
+                Op::Sload16 => (Ty::I16, "sext"),
+                Op::Uload32 => (Ty::I32, "zext"),
+                _ => (Ty::I32, "sext"),
+            };
+            load(b, ir(mem), Some(ext))
+        }
+        Op::Uload8x8 | Op::Sload8x8 | Op::Uload16x4 | Op::Sload16x4 | Op::Uload32x2 | Op::Sload32x2 => {
+            let ext = if matches!(access, Op::Sload8x8 | Op::Sload16x4 | Op::Sload32x2) { "sext" } else { "zext" };
+            let narrow = vec_of(ty.lanes(), lane_bits(ty) / 2);
+            load(b, &narrow, Some(ext))
+        }
+        Op::AtomicLoad => vec![b.val(&format!("load atomic {t}, ptr {at} seq_cst, align {}", ty.bytes()))],
+        Op::Store => store(b, ty),
+        Op::Istore8 => store(b, Ty::I8),
+        Op::Istore16 => store(b, Ty::I16),
+        Op::Istore32 => store(b, Ty::I32),
+        Op::AtomicStore => {
+            b.stmt(&format!("store atomic {t} {value}, ptr {at} seq_cst, align {}", ty.bytes()));
+            vec![]
+        }
+        other => unreachable!("{shape} fuses `{}`, which no confined op does", other.info().name),
+    }
 }

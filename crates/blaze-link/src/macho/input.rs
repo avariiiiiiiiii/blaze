@@ -361,6 +361,164 @@ fn linker_option(name: &str, command: &[u8]) -> Result<String, String> {
     Ok(option)
 }
 
+/// A library an `LC_LINKER_OPTION` asks for, as ld64 follows one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Autolink<'a> {
+    /// `-lNAME`: `libNAME.tbd`, `.dylib`, `.so` or `.a`, as `-l` is searched.
+    Library(&'a str),
+    /// `-framework NAME`: `NAME.framework/NAME.tbd` or `NAME.framework/NAME`.
+    Framework(&'a str),
+}
+
+/// What the `LC_LINKER_OPTION` `option` asks for, its words joined by a space as
+/// [`Object::libraries`] holds them. ld64 also reads `-weak_framework NAME` and `-weak-lNAME`,
+/// which link the library weakly: the link line's `NativeKind` has no weak library, so they are
+/// refused, as is every other option (which ld64 warns of and drops). A name with a space is
+/// refused too, its words being ambiguous once joined.
+pub(crate) fn autolink(option: &str) -> Result<Autolink<'_>, String> {
+    let weak = |form: &str| {
+        // alloc: error path
+        format!(
+            "the LC_LINKER_OPTION `{option}`: ld64 links `{form}` weakly (LC_LOAD_WEAK_DYLIB), \
+             and blaze's link line has no weak library to put it on"
+        )
+    };
+    let (first, rest) = match option.split_once(' ') {
+        Some((first, rest)) => (first, Some(rest)),
+        None => (option, None),
+    };
+    let named = |name: &str| !name.is_empty() && !name.contains(' ');
+    match (first, rest) {
+        ("-framework", Some(name)) if named(name) => return Ok(Autolink::Framework(name)),
+        ("-weak_framework", Some(name)) if named(name) => return Err(weak("-weak_framework")),
+        (word, None) if word.starts_with("-weak-l") && word.len() > "-weak-l".len() => return Err(weak("-weak-l")),
+        (word, None) => {
+            if let Some(name) = word.strip_prefix("-l").filter(|it| !it.is_empty()) {
+                return Ok(Autolink::Library(name));
+            }
+        }
+        _ => {}
+    }
+    // alloc: error path
+    Err(format!(
+        "the LC_LINKER_OPTION `{option}`: blaze follows `-lNAME`, `-framework NAME`, \
+         `-weak-lNAME` and `-weak_framework NAME`, and this is none of them"
+    ))
+}
+
+/// The libraries the Mach-O object or archive `bytes` (`name` on the link line) asks for with
+/// `LC_LINKER_OPTION`, for finding what a link takes them with: `(member, option)` in member
+/// order (`member` empty for an object), each option once (the first member asking), every one
+/// checked with [`autolink`]. Only the header and the load commands are read. A universal file
+/// is read for `arch`'s slice. A member that is not a Mach-O object of `arch` asks for nothing:
+/// the engine refuses it if it is ever taken.
+pub(crate) fn asked_libraries(name: &str, bytes: &[u8], arch: Arch) -> Result<Vec<(String, String)>, String> {
+    let cpu = match arch {
+        Arch::Aarch64 => macho::CPU_TYPE_ARM64,
+        Arch::X86_64 => macho::CPU_TYPE_X86_64,
+        // alloc: error path
+        Arch::Wasm32 => return Err(format!("{name}: Mach-O linker options in a wasm32 link")),
+    };
+    let bytes = slice(name, bytes, cpu)?;
+    // alloc: once per file searched for its linker options (setup, kept per process)
+    let mut out: Vec<(String, String)> = Vec::new();
+    if !bytes.starts_with(&object::archive::MAGIC) {
+        if is_object(bytes, cpu) {
+            for option in options_of(name, bytes)? {
+                if !out.iter().any(|it| it.1 == option) {
+                    // alloc: once per library an object asks for (setup)
+                    out.push((String::new(), option));
+                }
+            }
+        }
+        return Ok(out);
+    }
+    use object::read::archive::ArchiveFile;
+    // alloc: error path
+    let file = ArchiveFile::parse(bytes).map_err(|e| format!("{name}: not an archive: {e}"))?;
+    if file.is_thin() {
+        // alloc: error path
+        return Err(format!("{name}: a thin archive, whose members are other files"));
+    }
+    for member in file.members() {
+        // alloc: error path
+        let member = member.map_err(|e| format!("{name}: {e}"))?;
+        let member_name = std::str::from_utf8(member.name())
+            // alloc: error path
+            .map_err(|_| format!("{name}: a member whose name isn't UTF-8: {:?}", member.name()))?;
+        // alloc: error path
+        let data = member.data(bytes).map_err(|e| format!("{name}({member_name}): {e}"))?;
+        if !is_object(data, cpu) {
+            continue;
+        }
+        // alloc: once per object member, what its errors call it (setup)
+        for option in options_of(&format!("{name}({member_name})"), data)? {
+            if !out.iter().any(|it| it.1 == option) {
+                // alloc: once per library an archive's members ask for (setup)
+                out.push((member_name.to_owned(), option));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `data` begins as a thin little-endian 64-bit Mach-O object (`MH_OBJECT`) for `cpu`.
+fn is_object(data: &[u8], cpu: u32) -> bool {
+    let word = |at: usize| data.get(at..at + 4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]));
+    word(0) == Some(macho::MH_MAGIC_64) && word(4) == Some(cpu) && word(12) == Some(macho::MH_OBJECT)
+}
+
+/// The `LC_LINKER_OPTION`s of the Mach-O object `data` ([`is_object`]), each checked with
+/// [`autolink`].
+fn options_of(name: &str, data: &[u8]) -> Result<SmallVec<[String; 2]>, String> {
+    // alloc: error path
+    let header = Header::parse(data, 0).map_err(|e| format!("{name}: {e}"))?;
+    // alloc: error path
+    let mut commands = header.load_commands(LE, data, 0).map_err(|e| format!("{name}: {e}"))?;
+    let mut options = SmallVec::new();
+    // alloc: error path
+    while let Some(command) = commands.next().map_err(|e| format!("{name}: {e}"))? {
+        if command.cmd() == macho::LC_LINKER_OPTION {
+            let option = linker_option(name, command.raw_data())?;
+            // alloc: error path
+            autolink(&option).map_err(|e| format!("{name}: {e}"))?;
+            options.push(option);
+        }
+    }
+    Ok(options)
+}
+
+/// `cpu`'s slice of a universal file, or the file.
+fn slice<'a>(name: &str, bytes: &'a [u8], cpu: u32) -> Result<&'a [u8], String> {
+    use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
+    let magic = bytes.get(..4).map(|it| u32::from_be_bytes([it[0], it[1], it[2], it[3]]));
+    // alloc: error path
+    let failed = |e: object::read::Error| format!("{name}: {e}");
+    let found = match magic {
+        Some(macho::FAT_MAGIC) => MachOFatFile32::parse(bytes)
+            .map_err(failed)?
+            .arches()
+            .iter()
+            .find(|it| it.cputype() == cpu)
+            .map(|it| (u64::from(it.offset()), u64::from(it.size()))),
+        Some(macho::FAT_MAGIC_64) => MachOFatFile64::parse(bytes)
+            .map_err(failed)?
+            .arches()
+            .iter()
+            .find(|it| it.cputype() == cpu)
+            .map(|it| (it.offset(), it.size())),
+        _ => return Ok(bytes),
+    };
+    // alloc: error path
+    let (offset, size) = found.ok_or_else(|| format!("{name} is a universal file without a slice for CPU type {cpu:#x}"))?;
+    usize::try_from(offset)
+        .ok()
+        .zip(usize::try_from(offset.saturating_add(size)).ok())
+        .and_then(|(start, end)| bytes.get(start..end))
+        // alloc: error path
+        .ok_or_else(|| format!("{name}: a universal file's slice past its end"))
+}
+
 /// ld64 starts no atom at an assembler-local label (`L…`, `l…`, `ltmp0`).
 fn local_label(name: &[u8]) -> bool {
     matches!(name.first(), Some(b'L' | b'l'))
@@ -1214,13 +1372,13 @@ fn x86_64_name(kind: u8) -> &'static str {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use blaze_codegen::Arch;
     use blaze_format::cursor::Put;
     use blaze_ids::rng::SplitMix64;
     use object::macho;
 
-    use super::read;
+    use super::{Autolink, asked_libraries, autolink, read};
     use crate::model::{Apply, Binding, Data, NativeFixup, Object, SectionKind, Symbol, SymbolDef, SymbolKind};
 
     const TEXT: u32 = macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
@@ -1818,6 +1976,96 @@ pub(super) mod tests {
         obj.options = vec![vec!["-lz"], vec!["-framework", "CoreFoundation"]];
         let object = obj.read(Arch::Aarch64).unwrap();
         assert_eq!(object.libraries, ["-lz", "-framework CoreFoundation"]);
+    }
+
+    /// An object for `cpu` defining each of `defines` (`_`-prefixed Mach-O names) as a `ret`,
+    /// with `options` as its `LC_LINKER_OPTION`s.
+    pub(crate) fn linking(cpu: u32, defines: &[&'static str], options: &[&[&'static str]]) -> Vec<u8> {
+        let mut obj = Obj::new(cpu);
+        let ret = match cpu {
+            macho::CPU_TYPE_ARM64 => words(&[0xd65f_03c0]),
+            _ => vec![0xc3, 0x90, 0x90, 0x90],
+        };
+        let text = obj.section("__TEXT", "__text", 0, ret.repeat(defines.len().max(1)), 2, TEXT);
+        for (at, &define) in defines.iter().enumerate() {
+            obj.symbol(define, SECT | EXT, text, 0, 4 * at as u64);
+        }
+        obj.options = options.iter().map(|it| it.to_vec()).collect();
+        obj.bytes()
+    }
+
+    #[test]
+    fn linker_options_are_read_as_ld64_follows_them() {
+        assert_eq!(autolink("-lz"), Ok(Autolink::Library("z")));
+        assert_eq!(autolink("-lc++"), Ok(Autolink::Library("c++")));
+        assert_eq!(autolink("-framework Security"), Ok(Autolink::Framework("Security")));
+        for weak in ["-weak_framework Security", "-weak-lz"] {
+            let error = autolink(weak).unwrap_err();
+            assert!(error.contains(weak) && error.contains("weakly") && error.contains("no weak library"), "{error}");
+        }
+        for other in ["-l", "-framework", "-needed_framework Security", "-lz extra", "-framework A B", "-force_load x.a", "-Wl,-x"] {
+            let error = autolink(other).unwrap_err();
+            assert!(error.contains(&format!("`{other}`")) && error.contains("none of them"), "{other}: {error}");
+        }
+    }
+
+    /// An archive of `members`, without an index: only the members' load commands are read.
+    fn ar(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        for (name, bytes) in members {
+            let header = format!("{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", format!("{name}/"), 0, 0, 0, 644, bytes.len());
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(bytes);
+            if out.len() % 2 != 0 {
+                out.push(b'\n');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_objects_and_an_archives_members_ask_for_their_libraries() {
+        let arm = macho::CPU_TYPE_ARM64;
+        let object = linking(arm, &["_f"], &[&["-lz"], &["-framework", "Security"], &["-lz"]]);
+        assert_eq!(
+            asked_libraries("f.o", &object, Arch::Aarch64).unwrap(),
+            [(String::new(), "-lz".to_owned()), (String::new(), "-framework Security".to_owned())],
+            "an object's own, each once"
+        );
+        assert!(asked_libraries("f.o", &object, Arch::X86_64).unwrap().is_empty(), "an object of another CPU asks nothing");
+
+        let a = linking(arm, &["_a"], &[&["-framework", "Security"]]);
+        let b = linking(arm, &["_b"], &[&["-lc++"], &["-framework", "Security"]]);
+        let x86 = linking(macho::CPU_TYPE_X86_64, &["_c"], &[&["-lnope"]]);
+        let archive = ar(&[("a.o", &a), ("b.o", &b), ("x86.o", &x86), ("notes.txt", b"not an object")]);
+        assert_eq!(
+            asked_libraries("libsec.a", &archive, Arch::Aarch64).unwrap(),
+            [("a.o".to_owned(), "-framework Security".to_owned()), ("b.o".to_owned(), "-lc++".to_owned())],
+            "every member's, each library once (the first member asking), other members asking nothing"
+        );
+
+        let bad = linking(arm, &["_d"], &[&["-needed_framework", "Security"]]);
+        let error = asked_libraries("libbad.a", &ar(&[("a.o", &a), ("d.o", &bad)]), Arch::Aarch64).unwrap_err();
+        assert!(error.contains("libbad.a(d.o)") && error.contains("-needed_framework Security"), "{error}");
+        let weak = linking(arm, &["_w"], &[&["-weak-lz"]]);
+        let error = asked_libraries("w.o", &weak, Arch::Aarch64).unwrap_err();
+        assert!(error.starts_with("w.o: ") && error.contains("-weak-lz"), "{error}");
+    }
+
+    #[test]
+    fn a_universal_file_is_read_for_its_slice() {
+        let arm = linking(macho::CPU_TYPE_ARM64, &["_f"], &[&["-lz"]]);
+        let mut fat = Vec::new();
+        fat.extend_from_slice(&macho::FAT_MAGIC.to_be_bytes());
+        fat.extend_from_slice(&1u32.to_be_bytes());
+        for word in [macho::CPU_TYPE_ARM64, 0, 0x4000, arm.len() as u32, 14] {
+            fat.extend_from_slice(&word.to_be_bytes());
+        }
+        fat.resize(0x4000, 0);
+        fat.extend_from_slice(&arm);
+        assert_eq!(asked_libraries("fat.o", &fat, Arch::Aarch64).unwrap(), [(String::new(), "-lz".to_owned())]);
+        let error = asked_libraries("fat.o", &fat, Arch::X86_64).unwrap_err();
+        assert!(error.contains("without a slice"), "{error}");
     }
 
     #[test]

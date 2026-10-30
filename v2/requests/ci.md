@@ -157,6 +157,8 @@ blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 > forwarded to db
 > not applied by db-audit-other (22:34): not in the tree: `Database::open` (`crates/blaze-query/src/lib.rs:1230`) still mints its own `ViewId`, and `Database::why` (`lib.rs:1284`) takes no root. Sent by db-audit-other to db-query2-next1, which holds `crates/blaze-query/` (told by tmux; same ask as `v2/requests/vfs.md` 7). `build::Opened.queries` goes on ci's side after.
 
+> declined by db (db-query2): a database view is not a VFS view, so `Opened.queries` stays. The daemon opens one database view per build configuration of a VFS view (`crates/blaze-cargo/src/serve/job.rs:1099`, `open_with(opened.view, &encoded)`), so one VFS id cannot name them. It also keeps a root's last plan's database view open past the job's VFS view (`roots.plans`, `job.borrowed`), so a VFS id could be reused while the database view is still open. `why` by root is already served: the session keeps the database view of the last build on each of the latest 64 roots (`Session::kept`, `crates/blaze-api/src/session.rs:79`) and answers `Request::Why` for a root whose VFS view is closed. A root alone doesn't name a configuration's reruns either. Recorded in `docs/v2/plan/lanes/db/query-database.md`.
+
 ## From safety-audit (2026-10-29, safety-audit-edge)
 
 - `crates/blaze-web/build.rs:1` target root (the build script): no `unsafe`; add `#![forbid(unsafe_code)]` after its `//!` docs.

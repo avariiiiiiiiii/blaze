@@ -124,6 +124,13 @@ pub(crate) struct Options<A: AllowedOptions> {
     /// a `Tag` constant.
     pub mem_tag: Option<syn::Path>,
 
+    /// The `image = <path>` option keeps an interned struct's values in the daemon image, at
+    /// their IDs.
+    ///
+    /// If this is `Some`, the value is a path to a `salsa::image::ImageCodec` constant of the
+    /// struct's fields.
+    pub image: Option<syn::Path>,
+
     /// Remember the `A` parameter, which plays no role after parsing.
     phantom: PhantomData<A>,
 }
@@ -166,6 +173,7 @@ impl<A: AllowedOptions> Default for Options<A> {
             heap_size_fn: Default::default(),
             self_ty: Default::default(),
             mem_tag: Default::default(),
+            image: Default::default(),
             persist: Default::default(),
         }
     }
@@ -192,6 +200,7 @@ pub(crate) trait AllowedOptions {
     const HEAP_SIZE: bool;
     const SELF_TY: bool;
     const MEM_TAG: bool;
+    const IMAGE: bool;
     const PERSIST: AllowedPersistOptions;
 }
 
@@ -554,6 +563,22 @@ impl<A: AllowedOptions> syn::parse::Parse for Options<A> {
                         "`mem_tag` option not allowed here",
                     ));
                 }
+            } else if ident == "image" {
+                if A::IMAGE {
+                    let _eq = Equals::parse(input)?;
+                    let path = syn::Path::parse(input)?;
+                    if let Some(old) = options.image.replace(path) {
+                        return Err(syn::Error::new(
+                            old.span(),
+                            "option `image` provided twice",
+                        ));
+                    }
+                } else {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        "`image` option not allowed here",
+                    ));
+                }
             } else {
                 return Err(syn::Error::new(
                     ident.span(),
@@ -628,6 +653,7 @@ impl<A: AllowedOptions> quote::ToTokens for Options<A> {
             heap_size_fn,
             self_ty,
             mem_tag,
+            image,
             persist,
             phantom: _,
         } = self;
@@ -687,6 +713,9 @@ impl<A: AllowedOptions> quote::ToTokens for Options<A> {
         }
         if let Some(mem_tag) = mem_tag {
             tokens.extend(quote::quote! { mem_tag = #mem_tag, });
+        }
+        if let Some(image) = image {
+            tokens.extend(quote::quote! { image = #image, });
         }
         if let Some(persist) = persist {
             let mut args = proc_macro2::TokenStream::new();

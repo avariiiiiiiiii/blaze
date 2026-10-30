@@ -11,6 +11,8 @@
 //! - [`select`]: [`select::choose`] whether a test runs, [`select::keep`] how it ran. A pass is
 //!   kept under the set of functions it executed, or, when its record is not whole, the set it
 //!   reaches, saying why ([`Basis`]); never under a set that is not one of these.
+//! - [`selector`]: the same choices for a whole suite across edits, each edit costing the
+//!   functions it changed times the sets that hold them ([`Selector`]).
 //! - [`api`]: the cached mark as the agent API carries it.
 //!
 //! The store, the shapes of what a run read and the traced inputs are `blaze-usercode`'s
@@ -21,11 +23,18 @@
 pub mod api;
 pub mod record;
 pub mod select;
+pub mod selector;
 pub mod table;
 
 pub use record::Record;
 pub use select::{Basis, Cached, Choice, Ran, Subject, Why};
+pub use selector::Selector;
 pub use table::{Bound, FnId, Image, Set, Version};
 
+/// Counts allocations so the hot paths' tests hold them to a budget.
+#[cfg(all(test, not(blaze_check)))]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 #[cfg(test)]
-mod sim;
+mod sim_tests;

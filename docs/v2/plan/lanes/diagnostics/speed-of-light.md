@@ -1082,3 +1082,16 @@ front end gives views and iterators (lanes frontend-tree and db). Two costs in e
 are inside the bound but worth a profile: `checks/impls/compare.rs` matches impl items to trait
 items by linear search (O(n·m) `name` calls per impl), and `lints/bodies/types/literal.rs`
 builds a `Span` for each literal that reaches `lint_literal`, which is already the gated path.
+
+## `-Z crate-attr` refused (`diagnostics-crateattr`)
+
+- **A crate with no refused attribute** (every crate in practice). `lower/parse/crate_attr.rs`
+  costs one memoized read of `base_db::crate_attr_files` (an empty slice for a crate given
+  none) and one memoized `crate_attr_error` per attribute, which is `None`. Nothing is
+  allocated: the bound is those reads, and it is met.
+- **Naming a span's file** (`Cx::file_name`). A file with a path costs what it did (one probe
+  of the path map); only a file with none asks `base_db::crate_attr_owner`, a scan of a
+  handful of attribute files, on the error path.
+- **Writing** (`emit.rs` `Carried`). A diagnostic with no file without a path allocates
+  nothing more: one `split_once` on `\0` per file name met. A crate attribute's file is
+  indexed from the text its name carries, a few dozen bytes, once per diagnostic written.

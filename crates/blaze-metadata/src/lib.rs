@@ -1139,11 +1139,10 @@ pub fn vendored(
 
 /// `[source]` and `[registries]` as blaze-registry takes them.
 fn source_config(config: &Config<Disk>) -> Result<blaze_registry::SourceConfig> {
-    use blaze_manifest::source::SourceId;
-    use cargo_util_schemas::core::{GitReference, SourceKind};
+    use blaze_resolve::{GitReference, SourceKind};
     let mut out = blaze_registry::SourceConfig::default();
     for (name, def) in config.source_configs()? {
-        let (replace_with, definition) = def.replace_with.clone().unzip();
+        let (replace_with, definition) = def.replace_with.unzip();
         let mut it = blaze_registry::SourceDef {
             replace_with,
             definition: definition.unwrap_or_default(),
@@ -1155,8 +1154,8 @@ fn source_config(config: &Config<Disk>) -> Result<blaze_registry::SourceConfig> 
             }
             continue;
         }
-        let SourceId { kind, url, .. } = &def.id;
-        match kind {
+        let url = def.id.url();
+        match def.id.kind() {
             SourceKind::Registry | SourceKind::SparseRegistry => {
                 it.registry = Some(url.to_string());
             }
@@ -1171,7 +1170,7 @@ fn source_config(config: &Config<Disk>) -> Result<blaze_registry::SourceConfig> 
                     GitReference::DefaultBranch => {}
                 }
             }
-            _ => bail!("`source.{name}` is not a source blaze reads yet"),
+            SourceKind::Path => bail!("`source.{name}` is not a source blaze reads yet"),
         }
         out.sources.push((name, it));
     }

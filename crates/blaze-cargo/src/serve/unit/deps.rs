@@ -26,7 +26,7 @@ use std::{
 };
 
 use base_db::{Crate, Db, Env};
-use blaze_api::{ApiError, ServedCrate, ServedPart};
+use blaze_api::{ApiError, Diagnostic, Level, ServedCrate, ServedPart};
 use blaze_cas::{Key, Kind};
 use blaze_diagnostics::{Diag, Options, cache};
 use blaze_ids::ContentId;
@@ -202,15 +202,16 @@ pub(crate) fn differences(kept: &Kept) -> Result<(), ApiError> {
 /// none of (a crate whose image would not cover every input is refused by
 /// [`hir_def::deps::store`] and resolved again in each build); the outcomes and checked bodies
 /// of the dependency crates it checked (`later`, their paths named from `root`), after their
-/// dependencies'; the constants' values they evaluated; the goals offered. Called when the
-/// head's next build lowers into the front end, which no task reads then.
+/// dependencies'; the constants' values they evaluated; the goals offered, with what their
+/// flush did ([`flushed`]). Called when the head's next build lowers into the front end, which
+/// no task reads then.
 pub(crate) fn store(
     lowered: &Lowered,
     kept: Option<Kept>,
     session: &mut Session,
     later: &[Later],
     root: &str,
-) -> Result<Vec<Put>, ApiError> {
+) -> Result<(Vec<Put>, goal_store::Flushed), ApiError> {
     let images = &*session.images;
     let stored = match &kept {
         Some(kept) => Some(lowered.store_deps(&kept.served, images).map_err(super::lower_error)?),
@@ -231,7 +232,7 @@ pub(crate) fn store(
     let mut bases = session.checks.keys.clone(); // clone: once per front end stored
     bases.extend(kept_checks.keys);
     hir_ty::consteval::deps::drain(db, &bases).map_err(error)?;
-    session.installed.flush().map_err(|why| error(format!("the persistent goal cache: {why}")))?; // alloc: error path
+    let flushed = session.installed.flush().map_err(|why| error(format!("the persistent goal cache: {why}")))?; // alloc: error path
     let puts = images.take_puts();
     if let Some(stored) = &stored {
         for krate in &stored.written {
@@ -240,7 +241,41 @@ pub(crate) fn store(
         // alloc: once per front end stored, one per crate refused an image
         session.refused.extend(stored.refused.iter().map(|(krate, why)| (*krate, why.to_string())));
     }
-    Ok(puts)
+    Ok((puts, flushed))
+}
+
+/// The `-v` note of what [`store`]'s flush of the persistent goal cache did with the goals the
+/// head's last build offered, and why any were kept out.
+pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
+    let goal_store::Flushed { written, kept, slots_full, inexpressible, unhashable, too_long, dropped } = flushed;
+    // alloc: under `-v`, once per build that stored a front end
+    let mut message = format!(
+        "the persistent goal cache, of the last build: {written} written, {kept} kept, {slots_full} with every slot full"
+    );
+    if !inexpressible.is_empty() {
+        let by: Vec<String> = inexpressible.iter().map(|(query, count)| format!("`{query}` ({count})")).collect(); // alloc: as above
+        message.push_str(&format!("; goals kept out by {}", by.join(", "))); // alloc: as above
+    }
+    for (count, why) in [
+        (unhashable, "with a fact that could not be hashed"),
+        (too_long, "too long to keep"),
+        (dropped, "dropped as their thread's buffer was full"),
+    ] {
+        if *count > 0 {
+            message.push_str(&format!("; {count} {why}")); // alloc: as above
+        }
+    }
+    Diagnostic {
+        level: Level::Note,
+        code: None,
+        rendered: format!("note: {message}\n"), // alloc: as above
+        message,
+        spans: Vec::new(),    // alloc: none
+        children: Vec::new(), // alloc: none
+        facts: Vec::new(),    // alloc: none
+        unit: None,
+        explanation: None,
+    }
 }
 
 /// What `job`'s build was served of each of its library crates that is no workspace member,
@@ -301,7 +336,7 @@ fn build() -> Result<ContentId, ApiError> {
     let worked_out = BUILD.get_or_init(|| {
         let host = crate::cargo::toolchain::host()
             .ok_or("blaze has no target triple for this machine's architecture and system")?;
-        hir_ty_codegen::v2::toolchain(host, &[]).map(|it| it.id)
+        hir_ty_codegen::v2::toolchain(host, &[], hir_ty_codegen::v2::Runs::Elsewhere).map(|it| it.id)
     });
     worked_out.clone().map_err(|why| ApiError::new(format!("the identity dependency images are keyed by: {why}"), None))
 }

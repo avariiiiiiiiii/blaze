@@ -5,7 +5,7 @@
 //! `Self: Sized` method called on a trait object picked.
 
 use hir_def::{
-    AdtId, GenericDefId, GenericParamId, ItemContainerId, Lookup,
+    AdtId, DefWithBodyId, GenericDefId, GenericParamId, ItemContainerId, Lookup,
     expr_store::Body,
     hir::{ArithOp, BinaryOp, Expr, ExprId, ExprOrPatId, generics::GenericParams},
     resolver::ValueNs,
@@ -19,16 +19,15 @@ use hir_ide::{
     solver_errors::{SolverDiagnostic, SolverDiagnosticKind, StoredGoal, TypeAnnotationNeeded},
 };
 use rustc_type_ir::{
-    InferTy,
+    InferTy, TypeVisitableExt as _,
     inherent::{GenericArgs as _, IntoKind as _},
 };
 use test_fixture::WithFixture;
-use triomphe::Arc;
 
 use super::{db::TestDB, function};
 
 /// The body of the function `name` and what inference found in it.
-fn infer<'db>(db: &'db TestDB, name: &str) -> (Arc<Body>, &'db InferenceResult<'db>) {
+fn infer<'db>(db: &'db TestDB, name: &str) -> (&'db Body, &'db InferenceResult<'db>) {
     let def = function(db, name);
     (Body::of(db, def), InferenceResult::of(db, InferBodyId::DefWithBodyId(def)))
 }
@@ -181,6 +180,31 @@ fn an_ambiguous_bound_is_e0283_with_its_goal() {
     });
 }
 
+/// rustc's `maybe_report_ambiguity` ends with `note_obligation_cause`: the ambiguous `_: Tr`
+/// of `need()` is required by a bound of `need`.
+#[test]
+fn an_ambiguity_keeps_why_its_goal_was_required() {
+    let db = TestDB::with_files(AMBIGUOUS);
+    crate::attach_db(&db, || {
+        let (_, result) = infer(&db, "ambiguous");
+        let DefWithBodyId::FunctionId(need) = function(&db, "need") else {
+            panic!("`need` is a function");
+        };
+        let causes: Vec<_> = result
+            .diagnostics()
+            .iter()
+            .filter_map(|it| match it {
+                InferenceDiagnostic::TypeMustBeKnown { cause, .. } => Some(*cause),
+                _ => None,
+            })
+            .collect();
+        let [ObligationCauseCode::WhereClauseInExpr { item, .. }] = causes[..] else {
+            panic!("one ambiguity, required by a bound in `need`, not {causes:?}");
+        };
+        assert_eq!(item, GenericDefId::FunctionId(need));
+    });
+}
+
 #[test]
 fn an_undecided_variable_names_the_parameter_it_was_made_for() {
     let db = TestDB::with_files(AMBIGUOUS);
@@ -250,6 +274,12 @@ fn returned() -> u8 {
 fn block_tail() {
     let _: u8 = { true };
 }
+fn no_else(c: bool) -> u8 {
+    if c { 1u8 }
+}
+fn bare_return() -> u8 {
+    return;
+}
 fn needs<T: Copy>(_: T) {}
 struct S;
 fn bound() {
@@ -275,6 +305,10 @@ fn bound() {
         assert_eq!(mismatches("later_arm"), [ObligationCauseCode::MatchExpressionArm { prior_arms: 1 }]);
         assert_eq!(mismatches("returned"), [ObligationCauseCode::ReturnValue]);
         assert_eq!(mismatches("block_tail"), [ObligationCauseCode::BlockTailExpression]);
+        // rustc's E0317 and E0069 causes, of the `()` an `if` without `else` and a bare
+        // `return` give.
+        assert_eq!(mismatches("no_else"), [ObligationCauseCode::IfExpressionWithNoElse]);
+        assert_eq!(mismatches("bare_return"), [ObligationCauseCode::ReturnNoExpression]);
 
         // rustc: "required by a bound in `needs`".
         let (_, result) = infer(&db, "bound");
@@ -316,6 +350,163 @@ fn unmet_causes(db: &TestDB, name: &str) -> Vec<ObligationCauseCode> {
             _ => None,
         })
         .collect()
+}
+
+/// rustc's "required by this bound in `need`": each `bound_index` of a `WhereClauseInExpr` is
+/// found again, a written bound as its syntax and the implicit `Sized` as its parameter.
+#[test]
+fn a_bound_index_finds_its_written_bound() {
+    use syntax::AstNode as _;
+
+    use crate::diagnostics::{BoundSource, bound_source};
+
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized, copy, clone
+trait Tr {}
+fn need<T: Copy + Tr>(_: T) where T: Clone {}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let DefWithBodyId::FunctionId(need) = function(&db, "need") else { unreachable!() };
+        let need = GenericDefId::FunctionId(need);
+        let written = |index| match bound_source(&db, need, index) {
+            Some(BoundSource::Written(ptr)) => {
+                let root = ptr.file_id.parse_or_expand(&db);
+                ptr.value.to_node(&root).syntax().text().to_string()
+            }
+            other => panic!("bound {index} is written, not {other:?}"),
+        };
+        assert_eq!([written(0), written(1), written(2)], ["Copy", "Tr", "Clone"]);
+        assert!(
+            matches!(bound_source(&db, need, 3), Some(BoundSource::ImplicitSized(_))),
+            "the fourth is `T`'s implicit `Sized`"
+        );
+        assert!(bound_source(&db, need, 4).is_none(), "`need` has four bounds");
+    });
+}
+
+/// rustc's `ty_infer_name_resolver`: an undecided `[T; N]` keeps both variables as their
+/// parameters, in printing order ("consider giving `_x` an explicit type: `[T; N]`").
+#[test]
+fn an_undecided_term_names_each_variable_by_its_parameter() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+fn make<T, const N: usize>() -> [T; N] { loop {} }
+fn undecided() { let _x = make(); }
+"#,
+    );
+    crate::attach_db(&db, || {
+        let (_, result) = infer(&db, "undecided");
+        let named = result
+            .diagnostics()
+            .iter()
+            .find_map(|it| match it {
+                InferenceDiagnostic::TypeMustBeKnown { named: Some(named), .. } => Some(named),
+                _ => None,
+            })
+            .expect("an undecided term");
+        let names: Vec<_> = named
+            .params
+            .iter()
+            .map(|&(_, param)| {
+                let param: hir_def::TypeOrConstParamId = match param {
+                    GenericParamId::TypeParamId(it) => it.into(),
+                    GenericParamId::ConstParamId(it) => it.into(),
+                    GenericParamId::LifetimeParamId(_) => panic!("a lifetime is never undecided"),
+                };
+                let params = GenericParams::of(&db, param.parent);
+                params[param.local_id].name().expect("a named parameter").as_str().to_owned()
+            })
+            .collect();
+        assert_eq!(names, ["T", "N"], "both variables of `[T; N]`, the element first");
+        let interner = hir_ide::next_solver::DbInterner::new_no_crate(&db);
+        let named_all = named.named(interner, |_, _| true);
+        assert!(!named_all.has_infer() && !named_all.references_error(), "{named_all:?}");
+        assert!(named.named(interner, |_, _| false).references_error(), "unnamed is unknown");
+    });
+}
+
+/// rustc's `report_projection_error`: E0271 keeps what the alias normalizes to ("expected `u8`,
+/// found `bool`").
+#[test]
+fn a_projection_mismatch_keeps_what_its_alias_normalized_to() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+trait Tr { type A; }
+struct S;
+impl Tr for S { type A = bool; }
+fn need<T: Tr<A = u8>>(_: T) {}
+fn mismatch() { need(S); }
+"#,
+    );
+    crate::attach_db(&db, || {
+        let (_, result) = infer(&db, "mismatch");
+        let normalized: Vec<_> = result
+            .diagnostics()
+            .iter()
+            .filter_map(|it| match it {
+                InferenceDiagnostic::SolverDiagnostic(SolverDiagnostic {
+                    kind: SolverDiagnosticKind::ProjectionMismatch { normalized, .. },
+                    ..
+                }) => Some(normalized.as_ref().map(|it| it.as_ref().expect_ty().kind())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(normalized[..], [Some(TyKind::Bool)]),
+            "one E0271 whose alias normalized to `bool`, not {normalized:?}"
+        );
+    });
+}
+
+/// rustc's `check_expr_unsafe_binder_cast`: `wrap_binder!` into a type that is not an unsafe
+/// binder and `unwrap_binder!` of one are each an error naming that type, and the operand of
+/// the failed wrap is checked against an error, so no mismatch follows.
+#[test]
+fn an_unsafe_binder_cast_of_a_type_that_is_no_binder_is_an_error() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+fn casts(x: &i32) {
+    let _ = unsafe { builtin # wrap_binder(x, u8) };
+    let _ = unsafe { builtin # unwrap_binder(1u8) };
+}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let (_, result) = infer(&db, "casts");
+        let casts: Vec<_> = result
+            .diagnostics()
+            .iter()
+            .filter_map(|it| match it {
+                InferenceDiagnostic::UnsafeBinderCastOfNonBinder { kind, found, .. } => {
+                    Some((*kind, found.as_ref().kind()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(
+                casts[..],
+                [
+                    (hir_def::hir::UnsafeBinderCastKind::Wrap, TyKind::Uint(_)),
+                    (hir_def::hir::UnsafeBinderCastKind::Unwrap, TyKind::Uint(_)),
+                ]
+            ),
+            "the wrap into `u8`, then the unwrap of `u8`, not {casts:?}"
+        );
+        assert!(
+            !result
+                .diagnostics()
+                .iter()
+                .any(|it| matches!(it, InferenceDiagnostic::TypeMismatch { .. })),
+            "{:?}",
+            result.diagnostics()
+        );
+    });
 }
 
 /// rustc's E0277 for an unsized parameter, return type and local (`check_fn`,
@@ -553,7 +744,7 @@ fn question(x: Option<u8>) -> Option<u8> {
 fn type_checking_finds_where_a_body_stops_being_reachable() {
     let db = TestDB::with_files(REACHABLE);
     crate::attach_db(&db, || {
-        let found = |name: &str| -> (Arc<Body>, Vec<Unreachable>) {
+        let found = |name: &str| -> (&Body, Vec<Unreachable>) {
             let (body, result) = infer(&db, name);
             (body, result.unreachable().to_vec())
         };

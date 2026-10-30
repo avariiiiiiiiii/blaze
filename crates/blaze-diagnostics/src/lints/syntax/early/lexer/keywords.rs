@@ -15,8 +15,8 @@
 use hir::InFile;
 use span::Edition;
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, TextSize, WalkEvent,
-    ast,
+    NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, WalkEvent,
+    view::{self as ast, AstNode as _},
 };
 
 use crate::{
@@ -34,7 +34,7 @@ const KEYWORD_IDENTS_2024: LintId = LintId::named("keyword_idents_2024");
 
 /// The lints of `tree`, a file of the crate, into `out`. Both are allowed by default: a file
 /// whose edition leaves no lint that may fire is not walked.
-pub(super) fn lints(cx: &Cx<'_, '_>, tree: &Tree, out: &mut Vec<Emitted>) {
+pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, tree: &Tree<'db>, out: &mut Vec<Emitted>) {
     let edition = tree.file.edition(cx.db);
     let may_fire = match edition {
         _ if edition.at_least_2024() => false,
@@ -45,12 +45,12 @@ pub(super) fn lints(cx: &Cx<'_, '_>, tree: &Tree, out: &mut Vec<Emitted>) {
         return;
     }
     let mut keywords = Keywords { cx, tree, edition, out };
-    keywords.walk(&tree.root);
+    keywords.walk(tree.root);
 }
 
 struct Keywords<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
-    tree: &'c Tree,
+    tree: &'c Tree<'db>,
     edition: Edition,
     out: &'c mut Vec<Emitted>,
 }
@@ -64,7 +64,7 @@ enum UnderMacro {
 
 impl Keywords<'_, '_, '_> {
     /// The identifiers of the AST `node`, as rustc's visitor comes to them.
-    fn walk(&mut self, node: &SyntaxNode) {
+    fn walk(&mut self, node: ast::Node<'_>) {
         let mut events = node.preorder_with_tokens();
         while let Some(event) = events.next() {
             let WalkEvent::Enter(element) = event else { continue };
@@ -80,25 +80,25 @@ impl Keywords<'_, '_, '_> {
                         if let Some(owner) = node.parent()
                             && matches!(owner.kind(), SyntaxKind::MACRO_CALL | SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF)
                         {
-                            self.tokens(&node, &owner);
+                            self.tokens(node, owner);
                         }
                         events.skip_subtree();
                     }
                     _ => {}
                 },
-                NodeOrToken::Token(token) => self.token(&token, UnderMacro::No, None),
+                NodeOrToken::Token(token) => self.token(token, UnderMacro::No, None),
             }
         }
     }
 
     /// What the visitor walks of an attribute: its path, and the expression of `path = expr`.
-    fn meta(&mut self, meta: ast::Meta) {
+    fn meta(&mut self, meta: ast::Meta<'_>) {
         match meta {
-            ast::Meta::PathMeta(it) => self.walk_opt(it.path()),
-            ast::Meta::TokenTreeMeta(it) => self.walk_opt(it.path()),
+            ast::Meta::PathMeta(it) => self.walk_opt(it.path().map(|it| it.syntax())),
+            ast::Meta::TokenTreeMeta(it) => self.walk_opt(it.path().map(|it| it.syntax())),
             ast::Meta::KeyValueMeta(it) => {
-                self.walk_opt(it.path());
-                self.walk_opt(it.expr());
+                self.walk_opt(it.path().map(|it| it.syntax()));
+                self.walk_opt(it.expr().map(|it| it.syntax()));
             }
             ast::Meta::UnsafeMeta(it) => {
                 if let Some(inner) = it.meta() {
@@ -109,15 +109,15 @@ impl Keywords<'_, '_, '_> {
         }
     }
 
-    fn walk_opt(&mut self, node: Option<impl AstNode>) {
+    fn walk_opt(&mut self, node: Option<ast::Node<'_>>) {
         if let Some(node) = node {
-            self.walk(node.syntax());
+            self.walk(node);
         }
     }
 
     /// `check_tokens` of the token tree `tt` of the macro call or definition `owner`: each
     /// identifier and lifetime not after a `$`.
-    fn tokens(&mut self, tt: &SyntaxNode, owner: &SyntaxNode) {
+    fn tokens(&mut self, tt: ast::Node<'_>, owner: ast::Node<'_>) {
         let mut prev_dollar = false;
         for token in tt.descendants_with_tokens().filter_map(|it| it.into_token()) {
             if token.kind().is_trivia() {
@@ -128,7 +128,7 @@ impl Keywords<'_, '_, '_> {
                 continue;
             }
             if !prev_dollar {
-                self.token(&token, UnderMacro::Yes, Some(owner));
+                self.token(token, UnderMacro::Yes, Some(owner));
             }
             prev_dollar = false;
         }
@@ -136,7 +136,7 @@ impl Keywords<'_, '_, '_> {
 
     /// `check_ident_token` of `token` if it is an identifier or a lifetime, the lint decided
     /// at `at`, or at the token's parent when `None`.
-    fn token(&mut self, token: &SyntaxToken, under_macro: UnderMacro, at: Option<&SyntaxNode>) {
+    fn token(&mut self, token: ast::Token<'_>, under_macro: UnderMacro, at: Option<ast::Node<'_>>) {
         let kind = token.kind();
         if kind != SyntaxKind::IDENT && kind != SyntaxKind::LIFETIME_IDENT {
             return;
@@ -162,13 +162,13 @@ impl Keywords<'_, '_, '_> {
         if self.edition >= keyword.0 {
             return;
         }
-        let Some(at) = at.cloned().or_else(|| token.parent()) else { return };
-        self.check(name, range, prefix, keyword, &at);
+        let Some(at) = at.or_else(|| token.parent()) else { return };
+        self.check(name, range, prefix, keyword, at);
     }
 
     /// `check_ident_token` of the identifier `name` at `range` (a lifetime's when `prefix` is
     /// `'`, its span the lifetime's), which a later edition makes the keyword `keyword`.
-    fn check(&mut self, name: &str, range: TextRange, prefix: &str, keyword: Keyword, at: &SyntaxNode) {
+    fn check(&mut self, name: &str, range: TextRange, prefix: &str, keyword: Keyword, at: ast::Node<'_>) {
         let (_, lint, year) = keyword;
         let cx = self.cx;
         let span = cx.span(InFile::new(self.tree.file, range));

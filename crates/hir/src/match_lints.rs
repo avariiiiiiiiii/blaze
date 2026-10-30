@@ -26,7 +26,7 @@ use syntax::{
 pub use hir_ty_matchck::{BindingOrigin, SpecialTy};
 
 use crate::{
-    Const, DefWithBody, Enum, EnumVariant, Module, Type, TypeOwnerId,
+    Adt, Const, DefWithBody, Enum, EnumVariant, Impl, Module, Type, TypeOwnerId,
     diagnostics::{
         AnyDiagnostic, ConstPatternRefused, EmptyRangePattern, MissingMatchArms, MixedDerefPatterns,
         NonExhaustiveLet, PatternComplexityLimit,
@@ -69,11 +69,34 @@ pub enum ConstPatternError<'db> {
     /// "{prefix} `{ty}` cannot be used in patterns", `ty` being the part of the value refused.
     Invalid(Type<'db>),
     /// The value holds this ADT, which doesn't derive `PartialEq` (`TypeNotStructural`).
-    NotStructural(Type<'db>),
-    /// The constant's type doesn't implement `PartialEq` (`TypeNotPartialEq`).
-    NotPartialEq(Type<'db>),
+    /// `inapplicable_structural`: it has a `StructuralPartialEq` impl whose bounds don't hold,
+    /// so rustc says nothing of a manual `PartialEq` impl.
+    NotStructural { ty: Type<'db>, inapplicable_structural: bool },
+    /// `ty` doesn't implement `PartialEq` (`TypeNotPartialEq`), with what rustc's
+    /// `extend_type_not_partial_eq` finds in it, as `hir_ty_matchck::ConstPatternError` lists
+    /// them: in the order met, without repeats; rustc sorts the type notes by their text.
+    NotPartialEq {
+        ty: Type<'db>,
+        /// A local ADT with a manual `PartialEq` impl: a span note.
+        local_manual: Box<[ManualPartialEq]>,
+        /// A local ADT with no `PartialEq` impl: a label at it.
+        local_without: Box<[Adt]>,
+        /// A foreign type with a manual `PartialEq` impl: a note.
+        manual: Box<[Type<'db>]>,
+        /// A foreign type with no `PartialEq` impl: a note.
+        without: Box<[Type<'db>]>,
+    },
     /// "cannot use NaN in patterns".
     NaN,
+}
+
+/// Where the note about a local manual `PartialEq` impl points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ManualPartialEq {
+    /// The impl written for the type.
+    Impl(Impl),
+    /// The ADT, whose `PartialEq` comes from a blanket or foreign impl.
+    Adt(Adt),
 }
 
 /// What rustc's `find_fallback_pattern_typo` finds for a catch-all binding.
@@ -356,12 +379,33 @@ impl<'db> Syntax<'_, 'db> {
                     matchck::ConstPatternError::Union => ConstPatternError::Union,
                     matchck::ConstPatternError::Pointer => ConstPatternError::Pointer,
                     matchck::ConstPatternError::Invalid(it) => ConstPatternError::Invalid(ty(it)),
-                    matchck::ConstPatternError::NotStructural(it) => {
-                        ConstPatternError::NotStructural(ty(it))
+                    matchck::ConstPatternError::NotStructural { ty: it, inapplicable_structural } => {
+                        ConstPatternError::NotStructural {
+                            ty: ty(it),
+                            inapplicable_structural: *inapplicable_structural,
+                        }
                     }
-                    matchck::ConstPatternError::NotPartialEq(it) => {
-                        ConstPatternError::NotPartialEq(ty(it))
-                    }
+                    matchck::ConstPatternError::NotPartialEq {
+                        ty: it,
+                        local_manual,
+                        local_without,
+                        manual,
+                        without,
+                    } => ConstPatternError::NotPartialEq {
+                        ty: ty(it),
+                        local_manual: local_manual
+                            .iter()
+                            .map(|&it| match it {
+                                matchck::ManualPartialEq::Impl(id) => ManualPartialEq::Impl(id.into()),
+                                matchck::ManualPartialEq::Adt(id) => ManualPartialEq::Adt(id.into()),
+                            })
+                            // alloc: the notes of an error that fired, once each.
+                            .collect(),
+                        // alloc: as above.
+                        local_without: local_without.iter().map(|&id| Adt::from(id)).collect(),
+                        manual: manual.iter().map(|it| ty(it)).collect(), // alloc: as above.
+                        without: without.iter().map(|it| ty(it)).collect(), // alloc: as above.
+                    },
                     matchck::ConstPatternError::NaN => ConstPatternError::NaN,
                 },
             }

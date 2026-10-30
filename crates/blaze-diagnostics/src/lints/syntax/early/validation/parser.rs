@@ -11,7 +11,7 @@
 //! `BreakWithLabelAndLoop`) (MIT or Apache-2.0).
 
 use hir::{HirFileId, InFile};
-use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, T, TextRange, TextSize, ast};
+use syntax::{NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextRange, TextSize, view::{self as ast, AstNode as _}};
 
 use super::{edition_at, emitted, span};
 use crate::{
@@ -41,14 +41,14 @@ impl Parsed {
             .root_module(cx.db)
             .as_source_file_id(cx.db)
             .and_then(|it| walk.tree(HirFileId::from(it)))
-            .map(|tree| tree.ptr(&tree.root));
+            .map(|tree| tree.ptr(tree.root));
         // alloc: empty until a lint fires; holds only what fires
         Parsed { crate_at, hits: Vec::new() }
     }
 
     /// Checks `node` of `tree`, the `index`th tree of the walk: one `kind` read for any node
     /// that is neither a parameter nor a `break`.
-    pub(super) fn check(&mut self, cx: &Cx<'_, '_>, tree: &Tree, index: u32, node: &SyntaxNode) {
+    pub(super) fn check(&mut self, cx: &Cx<'_, '_>, tree: &Tree<'_>, index: u32, node: ast::Node<'_>) {
         let Some(crate_at) = self.crate_at else { return };
         let found = match node.kind() {
             SyntaxKind::PARAM => varargs_without_pattern(cx, tree, node, crate_at),
@@ -72,8 +72,8 @@ impl Parsed {
 /// `...`); never of a foreign function, a function pointer or a closure.
 fn varargs_without_pattern(
     cx: &Cx<'_, '_>,
-    tree: &Tree,
-    param: &SyntaxNode,
+    tree: &Tree<'_>,
+    param: ast::Node<'_>,
     crate_at: InFile<SyntaxNodePtr>,
 ) -> Option<Emitted> {
     // Most parameters start with their pattern: the first element read decides.
@@ -111,15 +111,14 @@ fn varargs_without_pattern(
 /// `for` or plain block, which reads as an unlabeled `break` of a labeled loop.
 fn break_with_label_and_loop(
     cx: &Cx<'_, '_>,
-    tree: &Tree,
-    node: &SyntaxNode,
+    tree: &Tree<'_>,
+    node: ast::Node<'_>,
     crate_at: InFile<SyntaxNodePtr>,
 ) -> Option<Emitted> {
-    // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
-    let expr = ast::BreakExpr::cast(node.clone())?;
+    let expr = ast::BreakExpr::cast(node)?;
     let (Some(break_), Some(_), Some(value)) = (expr.break_token(), expr.lifetime(), expr.expr()) else { return None };
-    let unlabeled = |node: &SyntaxNode| !node.children().any(|it| it.kind() == SyntaxKind::LABEL);
-    let confusable = match &value {
+    let unlabeled = |node: ast::Node<'_>| !node.children().any(|it| it.kind() == SyntaxKind::LABEL);
+    let confusable = match value {
         ast::Expr::LoopExpr(it) => unlabeled(it.syntax()),
         ast::Expr::WhileExpr(it) => unlabeled(it.syntax()),
         ast::Expr::ForExpr(it) => unlabeled(it.syntax()),
@@ -147,6 +146,6 @@ fn break_with_label_and_loop(
     Some(emitted(cx, diag, Pass::Buffered, crate_at, tree.ptr(node)))
 }
 
-fn span_at(cx: &Cx<'_, '_>, tree: &Tree, offset: TextSize) -> Span {
+fn span_at(cx: &Cx<'_, '_>, tree: &Tree<'_>, offset: TextSize) -> Span {
     span(cx, tree, TextRange::empty(offset))
 }

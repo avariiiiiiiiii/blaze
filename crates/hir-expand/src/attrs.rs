@@ -275,6 +275,51 @@ pub fn expand_cfg_attr_with_doc_comments_view<'t, 'a, DocComment, BreakValue>(
     }
 }
 
+/// [`expand_cfg_attr_view`] as an iterator, for a caller with the cfg in hand: each attribute
+/// `cfg_attr` leaves, in order, with the outermost [`view::Attr`] it is in.
+pub fn cfg_attrs_view<'t, 'a, I: Iterator<Item = view::Attr<'t>>>(
+    attrs: I,
+    cfg_options: &'a CfgOptions,
+) -> CfgAttrsView<'t, 'a, I> {
+    CfgAttrsView { attrs, cfg_options, stack: SmallVec::new() }
+}
+
+/// What [`cfg_attrs_view`] gives.
+pub struct CfgAttrsView<'t, 'a, I> {
+    attrs: I,
+    cfg_options: &'a CfgOptions,
+    // alloc: none until a `cfg_attr` holds more than one attribute
+    stack: SmallVec<[(view::Meta<'t>, view::Attr<'t>); 1]>,
+}
+
+impl<'t, I: Iterator<Item = view::Attr<'t>>> Iterator for CfgAttrsView<'t, '_, I> {
+    type Item = (view::Meta<'t>, view::Attr<'t>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        'process_attrs: loop {
+            let (mut meta, top_attr) = match self.stack.pop() {
+                Some(it) => it,
+                None => {
+                    let attr = self.attrs.next()?;
+                    let Some(meta) = attr.meta() else { continue };
+                    (meta, attr)
+                }
+            };
+            while let view::Meta::UnsafeMeta(unsafe_meta) = meta {
+                let Some(inner) = unsafe_meta.meta() else { continue 'process_attrs };
+                meta = inner;
+            }
+            let view::Meta::CfgAttrMeta(meta) = meta else { return Some((meta, top_attr)) };
+            let Some(cfg_predicate) = meta.cfg_predicate() else { continue };
+            if self.cfg_options.check(&CfgExpr::parse_from_view(cfg_predicate)) != Some(false) {
+                let prev_stack_len = self.stack.len();
+                self.stack.extend(meta.metas().map(|meta| (meta, top_attr)));
+                self.stack[prev_stack_len..].reverse();
+            }
+        }
+    }
+}
+
 /// The builtin attributes the item tree leaves out.
 const ITEM_TREE_FILTERED_ATTRS: &[&str] = &[
     "doc",
@@ -789,5 +834,41 @@ struct S;
             assert_eq!(is_item_tree_filtered_attr(name), reference(name), "{name}");
         }
         assert!(ITEM_TREE_FILTERED_ATTRS.iter().all(|it| is_item_tree_filtered_attr(it)));
+    }
+
+    /// `cfg_attrs_view` gives what `expand_cfg_attr` gives over the handles: the same metas, by
+    /// kind and range, with the same outermost attributes, in the same order.
+    #[test]
+    fn cfg_attrs_view_matches_the_handle_expansion() {
+        use syntax::{
+            AstNode as _, SourceFile,
+            ast::{self, HasAttrs as _},
+            view::{self, AstNode as _, HasAttrs as _},
+        };
+
+        let text = r#"
+#[a]
+#[cfg_attr(all(), b, cfg_attr(all(), c, d), e)]
+#[cfg_attr(any(), f)]
+#[cfg_attr(all(), cfg_attr(any(), g), h)]
+#[unsafe(i)]
+#[cfg_attr(all(), unsafe(j))]
+#[cfg_attr(all())]
+fn f() {}
+"#;
+        let parse = SourceFile::parse(text, span::Edition::CURRENT);
+        let cfg = CfgOptions::default();
+        let handle = parse.tree().syntax().descendants().find_map(ast::Fn::cast).unwrap();
+        let mut expected = Vec::new();
+        expand_cfg_attr::<()>(handle.attrs(), || &cfg, |meta, attr| {
+            expected.push((meta.syntax().text_range(), attr.syntax().text_range()));
+            ControlFlow::Continue(())
+        });
+        let viewed = parse.root().descendants().find_map(view::Fn::cast).unwrap();
+        let got: Vec<_> = cfg_attrs_view(viewed.attrs(), &cfg)
+            .map(|(meta, attr)| (meta.syntax().text_range(), attr.syntax().text_range()))
+            .collect();
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 8, "{got:?}");
     }
 }

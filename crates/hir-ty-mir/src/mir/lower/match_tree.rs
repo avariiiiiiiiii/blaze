@@ -437,7 +437,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         let frame = *place.allocator();
         // A deref through a smart pointer that is not a `Box` is a call into a temporary, a
         // test of its own that is not followed here.
-        let adjustments = self.infer.pat_adjustments.get(&pattern).map_or(&[][..], |it| &**it);
+        let adjustments = self.infer.pat_adjustments.get(&pattern).unwrap_or_default();
         for adjustment in adjustments {
             if adjustment.kind == PatAdjust::OverloadedDeref && !adjustment.source.as_ref().is_box()
             {

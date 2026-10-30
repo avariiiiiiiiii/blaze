@@ -111,6 +111,10 @@ where
         JarKind::Struct
     }
 
+    fn read_kind(&self) -> crate::ingredient::ReadKind {
+        crate::ingredient::ReadKind::Input
+    }
+
     fn memo_table_types(&self) -> &Arc<MemoTableTypes> {
         unreachable!("input fields do not allocate pages")
     }

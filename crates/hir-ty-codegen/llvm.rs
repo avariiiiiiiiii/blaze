@@ -22,7 +22,8 @@ use inkwell::{
     llvm_sys::{
         support::LLVMParseCommandLineOptions,
         transforms::pass_builder::{
-            LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazeOpaquePasses, LLVMBlazeRunPasses,
+            LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazeHasFeature, LLVMBlazeOpaquePasses,
+            LLVMBlazeRunPasses,
         },
     },
     memory_buffer::MemoryBuffer,
@@ -44,6 +45,7 @@ use super::{
 
 mod emitted;
 mod lower;
+pub(crate) mod pgo;
 mod rebase;
 pub(crate) mod release;
 pub(crate) mod sanitize;
@@ -517,6 +519,35 @@ fn mark_hint<'ctx>(context: &'ctx Context, function: FunctionValue<'ctx>, hint: 
     function.add_attribute(AttributeLoc::Function, context.create_enum_attribute(hint, 0));
 }
 
+/// Gives `function` the `target-features` of `features`, as rustc gives each function its
+/// own: the whole set, since LLVM compiles a function that has one with it in place of its
+/// target machine's. The attribute goes with the function's export, so LLVM's inliner builds
+/// it only into a caller that has its features. Nothing for the target's baseline.
+fn mark_features<'ctx>(
+    context: &'ctx Context,
+    function: FunctionValue<'ctx>,
+    features: super::Features,
+) -> Result<(), Unhandled> {
+    let told = told(features)?;
+    if !told.is_empty() {
+        function.add_attribute(AttributeLoc::Function, context.create_string_attribute("target-features", told));
+    }
+    Ok(())
+}
+
+/// `features` in LLVM's names for the selected target ([`super::Target::llvm_features`]), made
+/// once per set a process compiles with, and read with no lock after.
+fn told(features: super::Features) -> Result<&'static str, Unhandled> {
+    static TOLD: [std::sync::OnceLock<Box<str>>; super::target::MOST_FEATURE_SETS] =
+        [const { std::sync::OnceLock::new() }; super::target::MOST_FEATURE_SETS];
+    let slot = &TOLD[features.index()];
+    if let Some(told) = slot.get() {
+        return Ok(told);
+    }
+    let made = super::Target::selected().map_err(Unhandled::Llvm)?.llvm_features(features);
+    Ok(slot.get_or_init(|| made.into_boxed_str()))
+}
+
 /// The passes an export is simplified by before compiles import it: ThinLTO's pre-link
 /// pipeline, which leaves loops to be unrolled and vectorized where the body is built in,
 /// after the slots are taken apart as for a compile ([`Optimization::pipeline`]).
@@ -887,6 +918,11 @@ fn set_options(arch: Arch) {
         let threshold = std::ffi::CString::new(format!("-inline-threshold={}", inline_threshold()))
             .expect("no NUL");
         arguments.push(threshold.as_ptr());
+        // Both are read by PGO's passes only, which run for a unit built with PGO alone
+        // (`pgo`): rustc's inliner before instrumentation is off, as rustc turns it off for
+        // `-Cprofile-generate` and `-Cprofile-use`; and value profiling is off (`pgo`'s notes).
+        arguments.push(c"-disable-preinline".as_ptr());
+        arguments.push(c"-disable-vp".as_ptr());
         // SAFETY: the arguments are C strings that outlive the call, and LLVM is given
         // their number.
         unsafe {
@@ -1021,6 +1057,51 @@ impl Kept {
         Kept(std::ptr::NonNull::new(made).expect("LLVM made no passes"))
     }
 
+    /// Passes whose pipelines instrument for PGO or use `profile` (the bytes of the profile
+    /// `wanted` names, with a NUL after them, as [`pgo::profile`] keeps them).
+    fn of_pgo(machine: &TargetMachine, wanted: pgo::Wanted, profile: Option<&[u8]>) -> Result<Kept, Unhandled> {
+        use inkwell::llvm_sys::transforms::pass_builder::{
+            LLVMBlazeCreatePgoPasses, LLVMBlazePgo, LLVMBlazePgoGenerate, LLVMBlazePgoUse,
+        };
+        let (action, bytes) = match (wanted, profile) {
+            (pgo::Wanted::Generate, _) => (LLVMBlazePgoGenerate, &[][..]),
+            (pgo::Wanted::Use(_), Some(bytes @ [.., 0])) => (LLVMBlazePgoUse, bytes),
+            (pgo::Wanted::Use(id), _) => {
+                return Err(Unhandled::Llvm(format!("the profile {id:x} without its bytes and their NUL")));
+            }
+        };
+        let pgo = LLVMBlazePgo {
+            Action: action,
+            Profile: bytes.as_ptr().cast(),
+            Length: bytes.len().saturating_sub(1),
+        };
+        // SAFETY: `machine` is live and outlives the passes, as in `Kept::of`; `pgo` is read
+        // during the call only, and the profile's bytes it points at, followed by their NUL
+        // (matched above), are kept by the `Machinery` after its passes, so they outlive them.
+        let made = unsafe { LLVMBlazeCreatePgoPasses(machine.as_mut_ptr(), &pgo) };
+        std::ptr::NonNull::new(made)
+            .map(Kept)
+            .ok_or_else(|| Unhandled::Llvm("LLVM made no passes for PGO".to_owned()))
+    }
+
+    /// Runs PGO's passes alone over `module`, as LLVM does at `-O0`.
+    fn run_pgo(&self, module: &Module<'_>) -> Result<(), Unhandled> {
+        use inkwell::llvm_sys::transforms::pass_builder::LLVMBlazeRunPgo;
+        // SAFETY: as in `run`: `self.0` is live and this thread's, `module` is live for the
+        // call and of the context the wrapper checks.
+        let failed = unsafe { LLVMBlazeRunPgo(self.0.as_ptr(), module.as_mut_ptr()) };
+        // SAFETY: `failed` is what LLVMBlazeRunPgo just returned, taken nowhere else.
+        unsafe { Kept::taken(failed) }
+    }
+
+    /// How many functions the passes found a record of under their name with another hash in
+    /// the profile they use, since this was last asked.
+    fn take_mismatched(&self) -> u32 {
+        use inkwell::llvm_sys::transforms::pass_builder::LLVMBlazeTakeMismatched;
+        // SAFETY: `self.0` is live and used by this thread only, as in `run`.
+        unsafe { LLVMBlazeTakeMismatched(self.0.as_ptr()) }
+    }
+
     /// Runs `passes` over `module`, vectorizing straight-line code if `slp`, as
     /// `Module::run_passes` would with `PassBuilderOptions::set_loop_slp_vectorization(slp)`
     /// and nothing else set.
@@ -1091,19 +1172,44 @@ impl Drop for Kept {
 
 /// A target machine and the passes kept for it ([`Kept`]).
 pub(super) struct Machinery {
-    // Before the machine, which has to outlive them.
+    // Before the profile and the machine, which have to outlive them.
     passes: Kept,
+    /// The profile the passes use (with a NUL after it), which they read from memory.
+    _profile: Option<std::sync::Arc<[u8]>>,
     machine: TargetMachine,
 }
 
 impl Machinery {
     fn new(machine: TargetMachine) -> Machinery {
-        Machinery { passes: Kept::of(&machine), machine }
+        Machinery { passes: Kept::of(&machine), _profile: None, machine }
+    }
+
+    /// Passes for `machine` that instrument for PGO or use the profile `wanted` names, which
+    /// [`pgo::give`] was given.
+    fn profiled(machine: TargetMachine, wanted: pgo::Wanted) -> Result<Machinery, Unhandled> {
+        let profile = match wanted {
+            pgo::Wanted::Generate => None,
+            pgo::Wanted::Use(id) => Some(pgo::profile(id)?),
+        };
+        let passes = Kept::of_pgo(&machine, wanted, profile.as_deref())?;
+        Ok(Machinery { passes, _profile: profile, machine })
     }
 
     /// Runs the pipeline `passes` over `module`, vectorizing straight-line code if `slp`.
     fn run(&self, module: &Module<'_>, passes: &str, slp: bool) -> Result<(), Unhandled> {
         self.passes.run(module, passes, slp)
+    }
+
+    /// Runs PGO's passes alone over `module`: for a [`Machinery::profiled`] one, at a level
+    /// whose pipeline has none ([`pgo::in_pipeline`]).
+    fn run_pgo(&self, module: &Module<'_>) -> Result<(), Unhandled> {
+        self.passes.run_pgo(module)
+    }
+
+    /// How many functions the passes found a record of under their name with another hash in
+    /// the profile they use, since this was last asked.
+    fn take_mismatched(&self) -> u32 {
+        self.passes.take_mismatched()
     }
 
     /// Instruments `module` for the sanitizers `wanted` ([`sanitize::instrument`]).
@@ -1131,8 +1237,10 @@ impl std::ops::Deref for Machinery {
 /// go of it at the next function, by when a context of that one module would be gone.
 #[derive(Default)]
 struct Machine {
-    // Before the context, which has to outlive them and their passes.
-    machines: FxHashMap<Optimization, Machinery>,
+    // Before the context, which has to outlive them and their passes. By level, what they
+    // build with for PGO and the target features they are told: a daemon builds a dev job
+    // with the host's and a release job with the baseline's.
+    machines: FxHashMap<(Optimization, Option<pgo::Wanted>, super::Features), Machinery>,
     context: Option<Context>,
     /// How many modules were made in the context.
     modules: usize,
@@ -1143,8 +1251,20 @@ impl Machine {
     /// of them stay in it.
     const MODULES: usize = 1024;
 
+    /// The thread's machine of `optimization` for the baseline: v1's compiles, the assembler.
     fn with<T>(
         optimization: Optimization,
+        work: impl FnOnce(&Context, &Machinery) -> Result<T, Unhandled>,
+    ) -> Result<T, Unhandled> {
+        Self::with_pgo(optimization, None, super::Features::BASELINE, work)
+    }
+
+    /// [`Machine::with`], with passes that build for `pgo` ([`Machinery::profiled`]), told the
+    /// target features `features` ([`Machine::create_for`]).
+    fn with_pgo<T>(
+        optimization: Optimization,
+        pgo: Option<pgo::Wanted>,
+        features: super::Features,
         work: impl FnOnce(&Context, &Machinery) -> Result<T, Unhandled>,
     ) -> Result<T, Unhandled> {
         thread_local! {
@@ -1155,9 +1275,15 @@ impl Machine {
                 *this = Machine::default();
             }
             this.modules += 1;
-            let machine = match this.machines.entry(optimization) {
+            let machine = match this.machines.entry((optimization, pgo, features)) {
                 Entry::Occupied(known) => known.into_mut(),
-                Entry::Vacant(slot) => slot.insert(Machinery::new(Self::create(optimization)?)),
+                Entry::Vacant(slot) => {
+                    let machine = Self::create_for(optimization, features)?;
+                    slot.insert(match pgo {
+                        None => Machinery::new(machine),
+                        Some(wanted) => Machinery::profiled(machine, wanted)?,
+                    })
+                }
             };
             let context = this.context.get_or_insert_with(diagnosed);
             DIAGNOSED.with_borrow_mut(Vec::clear);
@@ -1173,6 +1299,14 @@ impl Machine {
     }
 
     fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
+        Self::create_for(optimization, super::Features::BASELINE)
+    }
+
+    /// A target machine of the baseline CPU told `features` in LLVM's names
+    /// ([`super::Target::llvm_features`]), as rustc tells its own the features of
+    /// `-C target-feature` and `-C target-cpu`. A name LLVM's target lacks is an error naming
+    /// it, never left out.
+    fn create_for(optimization: Optimization, features: super::Features) -> Result<TargetMachine, Unhandled> {
         let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
         set_options(emitted.arch);
         match emitted.arch {
@@ -1187,20 +1321,32 @@ impl Machine {
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into()))?;
         // The baseline CPU, as rustc compiles for; position-independent, as the rest of
         // the program is.
-        // 128-bit atomics are `lock cmpxchg16b`: Windows 8.1 and later require the instruction,
-        // and the library calls LLVM makes otherwise (`__atomic_*_16`) are nobody's here.
-        let features =
-            if emitted.arch == Arch::X86_64 && name.contains("windows") { "+cx16" } else { "" };
-        target
+        let told = told(features)?;
+        let machine = target
             .create_target_machine(
                 &triple,
                 emitted.cpu(),
-                features,
+                told,
                 optimization.level(),
                 RelocMode::PIC,
                 CodeModel::Default,
             )
-            .ok_or_else(|| Unhandled::Llvm(format!("no target machine for {name}")))
+            // alloc: an error
+            .ok_or_else(|| Unhandled::Llvm(format!("no target machine for {name} with the features {told:?}")))?;
+        for feature in told.split(',').filter(|it| !it.is_empty()) {
+            let bare = &feature[1..];
+            // SAFETY: `machine` is a live target machine, and `bare` is read for its length
+            // during the call only.
+            let known = unsafe { LLVMBlazeHasFeature(machine.as_mut_ptr(), bare.as_ptr().cast(), bare.len()) };
+            if known == 0 {
+                // alloc: an error
+                return Err(Unhandled::Llvm(format!(
+                    "LLVM's {name} has no target feature {bare:?} (of {:?})",
+                    features.names()
+                )));
+            }
+        }
+        Ok(machine)
     }
 }
 
@@ -1747,6 +1893,32 @@ attributes #0 = { alwaysinline }
     fn assembly_llvm_cannot_encode_is_an_error() {
         let refused = assemble("mov ah, sil\nret").unwrap_err();
         assert!(refused.contains("can't encode 'ah'"), "{refused}");
+    }
+
+    /// A target machine is told its set in LLVM's names, one per set a thread compiles with,
+    /// and a name LLVM's target lacks is an error naming it, not a machine of fewer features.
+    #[test]
+    fn a_machine_is_told_its_features_and_refuses_one_llvm_lacks() {
+        let target = super::super::Target::selected().unwrap();
+        let wanted = match target.arch {
+            Arch::X86_64 => "+avx2",
+            Arch::Aarch64 => "+dotprod",
+            Arch::Wasm32 => return,
+        };
+        let set = target.features_of(&[wanted.to_owned()]).unwrap();
+        let machine = Machine::create_for(Optimization::NONE, set).unwrap();
+        let told = |it: &TargetMachine| it.get_feature_string().to_string_lossy().into_owned();
+        assert!(told(&machine).contains(wanted), "{}", told(&machine));
+        let baseline = Machine::create(Optimization::NONE).unwrap();
+        assert!(!told(&baseline).contains(wanted), "{}", told(&baseline));
+        let unknown = target.features_of(&["+no-such-feature".to_owned()]).unwrap();
+        let Err(Unhandled::Llvm(refused)) = Machine::create_for(Optimization::NONE, unknown) else {
+            panic!("a machine told a feature LLVM lacks");
+        };
+        assert!(refused.contains("no-such-feature"), "{refused}");
+        let with_set = Machine::with_pgo(Optimization::NONE, None, set, |_, it| Ok(told(it))).unwrap();
+        let without = Machine::with(Optimization::NONE, |_, it| Ok(told(it))).unwrap();
+        assert!(with_set.contains(wanted) && !without.contains(wanted), "{with_set} {without}");
     }
 
     /// What the kept passes make of a module is what LLVM's own run of the pipeline, with

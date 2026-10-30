@@ -34,7 +34,7 @@ use hir_def::{
     item_scope::{GlobId, ImportId, ImportOrExternCrate, ImportOrGlob},
     per_ns::PerNs,
     resolver::HasResolver,
-    src::HasChildSource,
+    src::use_tree_sources_view,
     visibility::Visibility,
 };
 use hir_expand::{
@@ -46,8 +46,8 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
 use span::Edition;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
-    ast::{self, HasAttrs, HasVisibility},
+    SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode as _, HasAttrs, HasVisibility, Node},
 };
 
 use super::Places;
@@ -133,8 +133,8 @@ pub(super) enum TreeKind {
 }
 
 /// A `use` tree.
-pub(super) struct Tree {
-    pub(super) node: ast::UseTree,
+pub(super) struct Tree<'db> {
+    pub(super) node: ast::UseTree<'db>,
     /// The index of the tree whose list it is in.
     pub(super) parent: Option<u32>,
     pub(super) kind: TreeKind,
@@ -156,20 +156,20 @@ pub(super) struct Tree {
 }
 
 /// A `use` item of the crate.
-pub(super) struct UseItem {
-    pub(super) node: InFile<ast::Use>,
+pub(super) struct UseItem<'db> {
+    pub(super) node: InFile<ast::Use<'db>>,
     pub(super) id: UseId,
     /// The module it is in, a block's when it is in one.
     pub(super) module: ModuleId,
     /// `pub use`.
     pub(super) public: bool,
     /// Its trees in pre-order, the root first.
-    pub(super) trees: Vec<Tree>,
+    pub(super) trees: Vec<Tree<'db>>,
 }
 
 /// An `extern crate` item of the crate.
-pub(super) struct ExternCrate {
-    pub(super) node: InFile<ast::ExternCrate>,
+pub(super) struct ExternCrate<'db> {
+    pub(super) node: InFile<ast::ExternCrate<'db>>,
     pub(super) id: ExternCrateId,
     pub(super) module: ModuleId,
     /// The name it binds.
@@ -191,12 +191,12 @@ pub(super) struct ExternCrate {
 /// module's imports or a binding's tree cost one probe and no scan. `lookups` memoizes scope
 /// lookups, hashed once over the borrowed key: a hit allocates nothing. `traits` memoizes the
 /// traits in scope as CSR ranges of `trait_rows` and `trait_chains`: a hit copies two `u32`s.
-pub(super) struct Uses<'f> {
+pub(super) struct Uses<'f, 'db> {
     frame: &'f Frame,
     /// The `use` items, in the order rustc's walk comes to them.
-    pub(super) items: Vec<UseItem, &'f Frame>,
+    pub(super) items: Vec<UseItem<'db>, &'f Frame>,
     /// The `extern crate` items, in that order.
-    pub(super) crates: Vec<ExternCrate, &'f Frame>,
+    pub(super) crates: Vec<ExternCrate<'db>, &'f Frame>,
     /// The local bindings used, each as it was used most: rustc's `import_use_map`.
     pub(super) used: FxHashMap<Binding, Used>,
     /// The trait imports a method call, field or type-relative path could use, in the order
@@ -241,8 +241,8 @@ pub(super) struct Uses<'f> {
     krate: base_db::Crate,
 }
 
-impl<'f> Uses<'f> {
-    pub(super) fn of(cx: &Cx<'f, '_>, walk: &Walk<'_>, places: &Places) -> Uses<'f> {
+impl<'f, 'db> Uses<'f, 'db> {
+    pub(super) fn of(cx: &Cx<'f, 'db>, walk: &Walk<'db>, places: &Places) -> Uses<'f, 'db> {
         let frame = cx.frame();
         let extern_prelude = cx
             .krate
@@ -284,19 +284,17 @@ impl<'f> Uses<'f> {
         for tree in &walk.trees {
             for node in tree.of_kind(|it| matches!(it, SyntaxKind::USE | SyntaxKind::EXTERN_CRATE)) {
                 match node.kind() {
-                    // clone: a rowan cursor's refcount; the item keeps its node
-                    SyntaxKind::USE => uses.use_item(cx, InFile::new(tree.file, ast::Use::cast(node.clone()).unwrap())),
+                    SyntaxKind::USE => uses.use_item(cx, InFile::new(tree.file, ast::Use::cast(node).unwrap())),
                     SyntaxKind::EXTERN_CRATE => {
-                        // clone: a rowan cursor's refcount; the item keeps its node
-                        uses.extern_crate(cx, walk, InFile::new(tree.file, ast::ExternCrate::cast(node.clone()).unwrap()))
+                        uses.extern_crate(cx, walk, InFile::new(tree.file, ast::ExternCrate::cast(node).unwrap()))
                     }
                     _ => {}
                 }
             }
         }
-        let place = |node: InFile<&SyntaxNode>| places.place(cx, node.map(SyntaxNodePtr::new));
-        uses.items.sort_by_cached_key(|it| place(it.node.as_ref().map(|it| it.syntax())));
-        uses.crates.sort_by_cached_key(|it| place(it.node.as_ref().map(|it| it.syntax())));
+        let place = |node: InFile<Node<'_>>| places.place(cx, node.map(ast::ptr));
+        uses.items.sort_by_cached_key(|it| place(it.node.map(|it| it.syntax())));
+        uses.crates.sort_by_cached_key(|it| place(it.node.map(|it| it.syntax())));
         let bindings = uses.items.iter().map(|it| it.trees.len()).sum();
         uses.trees.reserve(bindings);
         for (i, item) in uses.items.iter().enumerate() {
@@ -329,8 +327,7 @@ impl<'f> Uses<'f> {
             }
         }
         for tree in &walk.trees {
-            // clone: a rowan cursor's refcount, one per item an attribute macro replaces
-            for item in tree.replaced.iter().filter_map(|it| ast::Item::cast(it.clone())) {
+            for item in tree.replaced.iter().filter_map(|&it| ast::Item::cast(it)) {
                 uses.attr_macro(cx, InFile::new(tree.file, item));
             }
         }
@@ -339,7 +336,7 @@ impl<'f> Uses<'f> {
     }
 
     /// The tree `binding` is.
-    pub(super) fn tree(&self, binding: Binding) -> Option<(&UseItem, &Tree)> {
+    pub(super) fn tree(&self, binding: Binding) -> Option<(&UseItem<'db>, &Tree<'db>)> {
         let &(i, j) = self.trees.get(&binding)?;
         let item = &self.items[i as usize];
         Some((item, &item.trees[j as usize]))
@@ -366,12 +363,12 @@ impl<'f> Uses<'f> {
     }
 
     /// The `use` items of `module`.
-    pub(super) fn items_of(&self, module: ModuleId) -> impl Iterator<Item = &UseItem> + '_ {
+    pub(super) fn items_of(&self, module: ModuleId) -> impl Iterator<Item = &UseItem<'db>> + '_ {
         self.by_module.get(&module).into_iter().flatten().map(|&i| &self.items[i as usize])
     }
 
     /// The glob trees of `module`, each with its item.
-    pub(super) fn globs_of(&self, module: ModuleId) -> impl Iterator<Item = (&UseItem, &Tree)> + '_ {
+    pub(super) fn globs_of(&self, module: ModuleId) -> impl Iterator<Item = (&UseItem<'db>, &Tree<'db>)> + '_ {
         self.globs.get(&module).into_iter().flatten().map(|&(i, j)| {
             let item = &self.items[i as usize];
             (item, &item.trees[j as usize])
@@ -389,20 +386,20 @@ impl<'f> Uses<'f> {
     }
 
     /// The `extern crate` item `id`.
-    pub(super) fn extern_crate_of(&self, id: ExternCrateId) -> Option<&ExternCrate> {
+    pub(super) fn extern_crate_of(&self, id: ExternCrateId) -> Option<&ExternCrate<'db>> {
         self.crates.iter().find(|it| it.id == id)
     }
 
     /// Whether the root's `extern crate` item `it` is what puts its name in the extern
     /// prelude: rustc's `introduced_by_item`, when it renames the crate or `--extern` does not
     /// name it.
-    pub(super) fn introduces(&self, it: &ExternCrate) -> bool {
+    pub(super) fn introduces(&self, it: &ExternCrate<'_>) -> bool {
         it.renames || !self.extern_prelude.contains(&it.name)
     }
 
-    fn use_item(&mut self, cx: &Cx<'_, '_>, node: InFile<ast::Use>) {
+    fn use_item(&mut self, cx: &Cx<'_, 'db>, node: InFile<ast::Use<'db>>) {
         let db = cx.db;
-        let Some(scope) = cx.sema.scope(node.value.syntax()) else { return };
+        let Some(scope) = cx.vsema.scope(node.value.syntax()) else { return };
         let module = ModuleId::from(scope.module());
         if self.indexed.insert(module) {
             for id in module.def_map(db).module(db, module).scope(db).use_decls() {
@@ -411,12 +408,12 @@ impl<'f> Uses<'f> {
             }
         }
         let Some(&id) = self.use_ids.get(&(node.file_id, node.value.syntax().text_range().start())) else { return };
-        let sources = id.child_source(db);
+        let sources = use_tree_sources_view(db, id);
         let public = node
             .value
             .visibility()
             .is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub));
-        let mut trees: Vec<Tree> = Vec::with_capacity(sources.value.values().count());
+        let mut trees: Vec<Tree<'db>> = Vec::with_capacity(sources.value.values().count());
         // The trees enclosing the one being added, innermost last: pre-order makes the parent
         // the innermost that still contains it.
         let mut open: SmallVec<[(TextRange, u32); 4]> = SmallVec::new();
@@ -465,9 +462,9 @@ impl<'f> Uses<'f> {
         self.items.push(UseItem { node, id, module, public, trees });
     }
 
-    fn extern_crate(&mut self, cx: &Cx<'_, '_>, walk: &Walk<'_>, node: InFile<ast::ExternCrate>) {
+    fn extern_crate(&mut self, cx: &Cx<'_, 'db>, walk: &Walk<'db>, node: InFile<ast::ExternCrate<'db>>) {
         let db = cx.db;
-        let Some(decl) = cx.sema.to_def(&node.value) else { return };
+        let Some(decl) = cx.vsema.to_def(node.value) else { return };
         let id = ExternCrateId::from(decl);
         let module = id.lookup(db).container;
         let name = match node.value.rename() {
@@ -483,9 +480,8 @@ impl<'f> Uses<'f> {
         };
         // alloc: only `#[macro_use]` imports, almost never there; empty, it allocates nothing
         let mut macro_use = Vec::new();
-        // clone: a rowan cursor's refcount; `AnyHasAttrs` takes the node and has no borrowed form
-        let owner = ast::AnyHasAttrs::new(node.value.clone());
-        for (meta, attr) in walk.attrs(&owner) {
+        let owner = ast::AnyHasAttrs::new(node.value);
+        for (meta, attr) in walk.attrs(owner) {
             let path = match &meta {
                 ast::Meta::PathMeta(it) => it.path(),
                 ast::Meta::TokenTreeMeta(it) => it.path(),
@@ -620,15 +616,14 @@ impl<'f> Uses<'f> {
         let mut prefixes: SmallVec<[Option<(PathKind, u32, u32)>; 4]> = SmallVec::with_capacity(count);
         let mut flat: SmallVec<[Name; 8]> = SmallVec::new();
         for j in 0..count {
-            // clone: a rowan cursor's refcount; the tree is read while `self` is written
-            let tree = self.items[item].trees[j].node.clone();
+            let tree = self.items[item].trees[j].node;
             let base = match self.items[item].trees[j].parent {
                 Some(parent) => prefixes[parent as usize],
                 None => Some((PathKind::Plain, 0, 0)),
             };
             let inherited = base.map_or(0, |(_, start, end)| (end - start) as usize);
             let own = match tree.path() {
-                Some(path) => ModPath::from_src(cx.db, path, &mut |range| span_map.span_for_range(range).ctx),
+                Some(path) => ModPath::from_src_view(cx.db, path, &mut |range| span_map.span_for_range(range).ctx),
                 None => Some(ModPath::from_kind(if tree.coloncolon_token().is_some() {
                     PathKind::Abs
                 } else {
@@ -747,37 +742,33 @@ impl<'f> Uses<'f> {
     }
 
     /// Marks what the paths, method calls, macro calls and derives of `node` go through.
-    fn node(&mut self, cx: &Cx<'_, '_>, walk: &Walk<'_>, file: HirFileId, node: &SyntaxNode) {
+    fn node(&mut self, cx: &Cx<'_, 'db>, walk: &Walk<'db>, file: HirFileId, node: Node<'db>) {
         let kind = node.kind();
         if kind == SyntaxKind::PATH {
-            // clone: a rowan cursor's refcount, one per path; `cast` takes the node
-            let path = ast::Path::cast(node.clone()).unwrap();
-            self.path(cx, file, &path);
+            let path = ast::Path::cast(node).unwrap();
+            self.path(cx, file, path);
             if path.parent_path().is_none()
                 && let Some(parent) = path.syntax().parent()
                 && matches!(parent.kind(), SyntaxKind::PATH_EXPR | SyntaxKind::PATH_PAT | SyntaxKind::TUPLE_STRUCT_PAT)
             {
-                self.type_relative(cx, &path);
+                self.type_relative(cx, path);
             }
         } else if kind == SyntaxKind::METHOD_CALL_EXPR {
-            // clone: a rowan cursor's refcount, one per method call; `cast` takes the node
-            let call = ast::MethodCallExpr::cast(node.clone()).unwrap();
+            let call = ast::MethodCallExpr::cast(node).unwrap();
             let Some(name) = call.name_ref() else { return };
-            let resolved = cx.sema.resolve_method_call(&call).map(|it| it.as_assoc_item(cx.db));
+            let resolved = cx.vsema.resolve_method_call(call).map(|it| it.as_assoc_item(cx.db));
             self.lookup_trait_item(cx, call.syntax(), &name.as_name(), Some(resolved.flatten()));
         } else if kind == SyntaxKind::FIELD_EXPR {
-            // clone: a rowan cursor's refcount, one per field access; `cast` takes the node
-            let field = ast::FieldExpr::cast(node.clone()).unwrap();
+            let field = ast::FieldExpr::cast(node).unwrap();
             let Some(name) = field.name_ref() else { return };
             self.lookup_trait_item(cx, field.syntax(), &name.as_name(), None);
         } else if kind == SyntaxKind::MACRO_CALL {
-            // clone: a rowan cursor's refcount, one per macro call; `cast` takes the node
-            let call = ast::MacroCall::cast(node.clone()).unwrap();
-            match cx.sema.resolve_macro_call(&call) {
+            let call = ast::MacroCall::cast(node).unwrap();
+            match cx.vsema.resolve_macro_call(call) {
                 Some(it) => {
                     let id = MacroId::from(it);
                     self.macros.insert(id);
-                    match cx.sema.resolve_macro_call_arm(&call) {
+                    match cx.vsema.resolve_macro_call_arm(call) {
                         Some(arm) => {
                             self.arms.entry(id).or_default().insert_growing(arm as usize);
                         }
@@ -793,27 +784,26 @@ impl<'f> Uses<'f> {
                 }
             }
         } else if ast::Adt::can_cast(kind)
-            // clone: a rowan cursor's refcount, one per ADT; `cast` takes the node
-            && let Some(owner) = ast::AnyHasAttrs::cast(node.clone())
+            && let Some(owner) = ast::AnyHasAttrs::cast(node)
             && owner.attrs().next().is_some()
         {
-            for (meta, attr) in walk.attrs(&owner) {
+            for (meta, attr) in walk.attrs(owner) {
                 let ast::Meta::TokenTreeMeta(it) = &meta else { continue };
                 if it.path().and_then(|it| it.as_single_name_ref()).is_none_or(|it| it.text() != "derive") {
                     continue;
                 }
-                self.derive(cx, node, &meta, &attr);
+                self.derive(cx, node, meta, attr);
             }
         }
     }
 
     /// Marks what each path of a `#[derive(..)]` goes through.
-    fn derive(&mut self, cx: &Cx<'_, '_>, owner: &SyntaxNode, meta: &ast::Meta, attr: &ast::Attr) {
-        let Some(scope) = cx.sema.scope(owner) else { return };
+    fn derive(&mut self, cx: &Cx<'_, 'db>, owner: Node<'db>, meta: ast::Meta<'db>, attr: ast::Attr<'_>) {
+        let Some(scope) = cx.vsema.scope(owner) else { return };
         let module = ModuleId::from(scope.module());
-        let resolved = cx.sema.resolve_derive_macro(meta).unwrap_or_default();
+        let resolved = cx.vsema.resolve_derive_macro(meta).unwrap_or_default();
         let mut next = 0usize;
-        crate::cx::derive_path_tokens(attr, |_, tokens| {
+        crate::cx::derive_path_tokens_view(attr, |_, tokens| {
             let k = next;
             next += 1;
             let (kind, names) = Self::derive_path(tokens);
@@ -852,7 +842,7 @@ impl<'f> Uses<'f> {
     /// The kind and names of a derive path from its tokens: its text split on `::` (colons
     /// paired left to right, a `::` token as two), with a leading empty segment as `::`,
     /// `crate`/`self` first or `super` anywhere as the path's kind, and `r#` trimmed off names.
-    fn derive_path(tokens: &[syntax::SyntaxToken]) -> (PathKind, SmallVec<[Name; 4]>) {
+    fn derive_path(tokens: &[ast::Token<'_>]) -> (PathKind, SmallVec<[Name; 4]>) {
         let mut kind = PathKind::Plain;
         let mut names: SmallVec<[Name; 4]> = SmallVec::new();
         let mut i = 0usize;
@@ -913,8 +903,8 @@ impl<'f> Uses<'f> {
 
     /// Marks the attribute macro that replaces `item`, and what its attributes' paths go
     /// through.
-    fn attr_macro(&mut self, cx: &Cx<'_, '_>, item: InFile<ast::Item>) {
-        if let Some(it) = cx.sema.resolve_attr_macro_call(&item.value) {
+    fn attr_macro(&mut self, cx: &Cx<'_, 'db>, item: InFile<ast::Item<'db>>) {
+        if let Some(it) = cx.vsema.resolve_attr_macro_call(item.value) {
             let id = MacroId::from(it);
             self.macros.insert(id);
             self.arms_unknown.insert(id);
@@ -922,7 +912,7 @@ impl<'f> Uses<'f> {
         for attr in item.value.attrs() {
             if let Some(path) = attr.path() {
                 for path in path.syntax().descendants().filter_map(ast::Path::cast) {
-                    self.path(cx, item.file_id, &path);
+                    self.path(cx, item.file_id, path);
                 }
             }
         }
@@ -930,24 +920,22 @@ impl<'f> Uses<'f> {
 
     /// Marks what `path`, not a `use` tree's, goes through: each prefix in the type namespace
     /// as a module, the whole path in the namespaces hir resolves it in.
-    fn path(&mut self, cx: &Cx<'_, '_>, file: HirFileId, path: &ast::Path) {
+    fn path(&mut self, cx: &Cx<'_, 'db>, file: HirFileId, path: ast::Path<'db>) {
         if path.parent_path().is_some() || path.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::USE_TREE) {
             return;
         }
-        let Some(scope) = cx.sema.scope(path.syntax()) else { return };
+        let Some(scope) = cx.vsema.scope(path.syntax()) else { return };
         let module = ModuleId::from(scope.module());
         let span_map = file.span_map(cx.db);
-        let mut chain: SmallVec<[ast::Path; 4]> = SmallVec::new();
-        // clone: a rowan cursor's refcount; the chain owns its paths to walk up their qualifiers
-        chain.push(path.clone());
+        let mut chain: SmallVec<[ast::Path<'db>; 4]> = SmallVec::new();
+        chain.push(path);
         while let Some(qualifier) = chain.last().and_then(|it| it.qualifier()) {
             chain.push(qualifier);
         }
         chain.reverse();
         let mut done = 0;
-        for (i, prefix) in chain.iter().enumerate() {
-            // clone: a rowan cursor's refcount; `from_src` takes the path, read again below
-            let Some(mod_path) = ModPath::from_src(cx.db, prefix.clone(), &mut |range| span_map.span_for_range(range).ctx) else {
+        for (i, &prefix) in chain.iter().enumerate() {
+            let Some(mod_path) = ModPath::from_src_view(cx.db, prefix, &mut |range| span_map.span_for_range(range).ctx) else {
                 return;
             };
             let names = mod_path.segments();
@@ -973,7 +961,7 @@ impl<'f> Uses<'f> {
             let expected = if last {
                 expected(cx, path)
             } else {
-                match cx.sema.resolve_path(prefix) {
+                match cx.vsema.resolve_path(prefix) {
                     Some(PathResolution::Def(def)) => {
                         module_prefix = matches!(def, ModuleDef::Module(_));
                         match ModuleDefId::try_from(def) {
@@ -1018,15 +1006,15 @@ impl<'f> Uses<'f> {
 
     /// Records the traits in scope for a value path whose type rustc resolves only in type
     /// checking (`<T>::f`, `T::f`, `Self::f`, `Alias::f`).
-    fn type_relative(&mut self, cx: &Cx<'_, '_>, path: &ast::Path) {
+    fn type_relative(&mut self, cx: &Cx<'_, 'db>, path: ast::Path<'db>) {
         let Some(qualifier) = path.qualifier() else { return };
         let Some(name) = path.segment().and_then(|it| it.name_ref()) else { return };
         let deferred = match qualifier.segment().and_then(|it| it.kind()) {
             Some(ast::PathSegmentKind::Type { trait_ref: Some(_), .. }) => false,
             Some(ast::PathSegmentKind::Type { .. } | ast::PathSegmentKind::SelfTypeKw) => true,
-            _ => match cx.sema.resolve_path(&qualifier) {
+            _ => match cx.vsema.resolve_path(qualifier) {
                 Some(PathResolution::Def(ModuleDef::Adt(hir::Adt::Enum(_)))) => {
-                    !matches!(cx.sema.resolve_path(path), Some(PathResolution::Def(ModuleDef::EnumVariant(_))))
+                    !matches!(cx.vsema.resolve_path(path), Some(PathResolution::Def(ModuleDef::EnumVariant(_))))
                 }
                 Some(PathResolution::Def(
                     ModuleDef::Adt(_) | ModuleDef::TypeAlias(_) | ModuleDef::BuiltinType(_),
@@ -1038,7 +1026,7 @@ impl<'f> Uses<'f> {
         if !deferred {
             return;
         }
-        let resolved = match cx.sema.resolve_path(path) {
+        let resolved = match cx.vsema.resolve_path(path) {
             Some(PathResolution::Def(ModuleDef::Function(it))) => it.as_assoc_item(cx.db),
             Some(PathResolution::Def(ModuleDef::Const(it))) => it.as_assoc_item(cx.db),
             _ => None,
@@ -1049,8 +1037,8 @@ impl<'f> Uses<'f> {
     /// Records the trait imports a lookup of `name` at `at` could use, and for a method call
     /// or type-relative path (`picked` is `Some`) those type checking uses: the first
     /// candidate of the trait of what it resolves to; every candidate when it does not resolve.
-    fn lookup_trait_item(&mut self, cx: &Cx<'_, '_>, at: &SyntaxNode, name: &Name, picked: Option<Option<hir::AssocItem>>) {
-        let Some(scope) = cx.sema.scope(at) else { return };
+    fn lookup_trait_item(&mut self, cx: &Cx<'_, 'db>, at: Node<'db>, name: &Name, picked: Option<Option<hir::AssocItem>>) {
+        let Some(scope) = cx.vsema.scope(at) else { return };
         let module = ModuleId::from(scope.module());
         let (start, end) = self.traits_in_scope(cx, module, name);
         let rows = start as usize..end as usize;
@@ -1239,17 +1227,17 @@ impl Expected {
 }
 
 /// What hir resolves the whole of `path` to, in the namespaces it is used in.
-fn expected(cx: &Cx<'_, '_>, path: &ast::Path) -> Expected {
+fn expected<'db>(cx: &Cx<'_, 'db>, path: ast::Path<'db>) -> Expected {
     match path.syntax().parent() {
         Some(parent) if ast::MacroCall::can_cast(parent.kind()) => {
             let Some(call) = ast::MacroCall::cast(parent) else { return Expected::Unknown };
-            match cx.sema.resolve_macro_call(&call) {
+            match cx.vsema.resolve_macro_call(call) {
                 Some(it) => Expected::one(Ns::Macros, ModuleDefId::MacroId(it.into())),
                 None => Expected::Unknown,
             }
         }
-        Some(parent) if ast::Meta::can_cast(parent.kind()) => Expected::of([(Ns::Macros, cx.sema.resolve_path(path))]),
-        _ => match cx.sema.resolve_path_per_ns(path) {
+        Some(parent) if ast::Meta::can_cast(parent.kind()) => Expected::of([(Ns::Macros, cx.vsema.resolve_path(path))]),
+        _ => match cx.vsema.resolve_path_per_ns(path) {
             Some(it) => Expected::of([(Ns::Types, it.type_ns), (Ns::Values, it.value_ns), (Ns::Macros, it.macro_ns)]),
             None => Expected::Unknown,
         },

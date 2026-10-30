@@ -189,7 +189,7 @@ fn inverted(printed: &str, mutability: hir::Mutability) -> String {
 
 /// Where `mut ` goes in the `&T` type of the function parameter `receiver` names through
 /// `&` and `*`: rustc's `mut_ty.ty.span.shrink_to_lo()`.
-fn param_ref_type(cx: &Cx<'_, '_>, receiver: ast::Expr<'_>) -> Option<Span> {
+fn param_ref_type<'db>(cx: &Cx<'_, 'db>, receiver: ast::Expr<'db>) -> Option<Span> {
     let mut expr = receiver;
     loop {
         expr = match expr {

@@ -106,6 +106,10 @@ pub trait Glue: Sized + 'static {
     /// The DWARF register named slots are found from (the frame pointer), and where the
     /// frame register points from it.
     fn slot_base(frame: &Self::Frame) -> (u16, i32);
+
+    /// The bytes from the frame pointer down to the stack pointer in the body: Cranelift's
+    /// `fixed_frame_storage_size + clobber_size + outgoing_args_size`, its `frame_to_fp_offset`.
+    fn frame_size(frame: &Self::Frame) -> u32;
 }
 
 /// What the glue is given to write one piece of a function.

@@ -131,6 +131,23 @@ needs anything from safety-audit. `blaze-usercode` as a whole is the lead's (its
 
 ### C3. Forward to the evaluator's owner (codegen-mir, `crates/hir-ty-mir/src/mir/eval*`)
 
+> applied by codegen-rq-mir (2026-10-29): the items C7 doesn't mark done:
+> - 1: done already: `AtomicOrd` and `MResult` are in `mir.rs`'s `pub use eval::{machine::{..}}`.
+> - 3: done already: `enter_frame` calls `call`, then `protect`, then copies the arguments
+>   (`fill_locals_for_body`, `FnEntry` `typed`); `returned` and `unwind_out` call `ret` before
+>   the return slot's `typed` copy.
+> - 7: done already: `hir_ty::intrinsic::atomic_orderings` gives the suffix form
+>   (`AtomicOrders::named`) and the const-generic one (`atomic_ordering_of`) as one
+>   `AtomicOrdering`; `shim.rs` `atomic_ord` maps it (test `orderings_map_one_to_one`).
+> - 8: applied as `Machine::freeze(addr)`, called once a global's bytes are written, by rustc's
+>   `intern_const_alloc_recursive` rule: constants and all they point to; a static unless `static
+>   mut` or not `Freeze`; a static's pointees unless `static mut`. Promoted temporaries stay
+>   writable (blaze's body writes them itself). `Checker::freeze` is asked of safety in
+>   `v2/requests/codegen-rq-mir.md` R1 (exact edit); `hir-ty-ub` doesn't compile until it lands.
+> - 9: done already: a thread's start function is a frame like any other
+>   (`call_fn_pointer_word` → `exec_fn_pointer` → `enter_frame`, `Then::Thread` through
+>   `returned`, which calls `ret`).
+
 1. Export `AtomicOrd` and `MResult` from `hir_ty_mir::mir` beside the others (the trait's
    signatures name them).
 2. `Shadow::require_init` has no way to say *what* failed: it holds no machine. Add
@@ -685,6 +702,15 @@ Why: fuzz/README.md; without 1 the fuzz build recurses, without 2-3 it stops wit
 > 4 waits on cargo (`v2/requests/cargo.md`, same date). F3: cargo's request is written there
 > with the flags rustc actually has (`-Cpasses=sancov-module`, `-Cllvm-args`).
 
+> codegen (lead, 2026-10-29): codegen's part of F2 is done (1, and 2-3 in the LLVM back end, above). What is left is outside codegen: link's init calls and sections (link.md, "From speed-backend-sanitize" 5) and cargo's flags (4). The `mod.rs` half of 2 (emitting the return-address opcode) is with codegen-rq-features.
+
+> done by codegen-rq-features (2026-10-29, not built): the `mod.rs` half of 2. The IR builder
+> emits `get_return_address` with no frame-pointer refusal, so the engine's LLVM units get
+> `llvm.returnaddress(0)` and a Cranelift unit compiles that function with its frame pointer
+> (`v2/requests/speed-backend.md`). Nothing of F2 is left in codegen. Link's init calls and
+> sections (`link.md` 5) and cargo's flags (4) remain, plus the runtime rule asked of both in
+> `v2/requests/codegen.md` ("From codegen-rq-features: sanitizer runtimes ...").
+
 ### F3. Cargo (`v2/requests/cargo.md`, adds to item 2 of "From safety")
 
 Pass `-Zsanitizer-coverage=...` and `-Csanitizer-coverage-level=N` through to codegen (with
@@ -732,6 +758,8 @@ these (read the doc comment at the top of `race.rs` for the per-event protocol):
   plus `Machine::thread_name(&mut self, thread, name: &[u8])` for `pthread_setname_np`.
 
 > forwarded to codegen (codegen-mir, the evaluator's `Machine`).
+
+> applied by codegen (checked by the lead, 2026-10-29): `hir-ty-mir/src/mir/eval/machine.rs` has `atomic_store(ptr, ord, bytes, old)` (called with the old bytes at `shim.rs:1946`), `detach` (`threads.rs:245`), `yield_now` (`threads.rs:262`), `thread_name` (`shim/thread.rs:1118`, `pthread_setname_np`) and `Access::Atomic { cxchg_failed }` (`shim.rs:1844`). One open point, given to codegen-rq-mir: a failed compare-exchange first reads through `atomic_read(.., access(true))`, a read-modify-write at the success ordering, then the `cxchg_failed` read. `Access`'s doc and Miri (`atomic_compare_exchange_scalar` reads unchecked, then validates a load at the failure ordering) say the failure is the one read.
 
 ## From speed-hir-nameres: lifetime-erasing `unsafe` in hir-def name resolution (2026-10-29)
 

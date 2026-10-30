@@ -28,6 +28,7 @@ fn output(arch: blaze_codegen::Arch, kind: OutputKind, interpreter: Option<&str>
         stack: None,
         windows_subsystem: false,
         dev_run: None,
+        exec_log: false,
         triple: match arch { blaze_codegen::Arch::Aarch64 => "aarch64-unknown-linux-gnu", _ => "x86_64-unknown-linux-gnu" }.into(),
     }
 }
@@ -1831,4 +1832,16 @@ fn a_text_relocation_names_its_symbol_and_section() {
     image.binds = vec![Bind { addr: text + 8, import: 0, addend: 0 }];
     let error = image.synthesize().unwrap_err().what;
     assert!(error.contains("`malloc`") && error.contains("`.text`") && error.contains("text relocation"), "{error}");
+}
+
+#[test]
+fn an_executable_with_the_execution_log_starts_on_its_log_stubs_on_both_arches() {
+    for (arch, interpreter) in [
+        (blaze_codegen::Arch::X86_64, "/lib64/ld-linux-x86-64.so.2"),
+        (blaze_codegen::Arch::Aarch64, "/lib/ld-linux-aarch64.so.1"),
+    ] {
+        let kind = OutputKind::Executable { entry: "_start".into() };
+        let logged = crate::table::linked::logged(output(arch, kind, Some(interpreter)));
+        assert!(logged.header.is_multiple_of(8), "{arch:?}");
+    }
 }

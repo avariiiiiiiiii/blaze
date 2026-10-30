@@ -392,6 +392,8 @@ and `Image::roll_back_into(&mut CodeMemory)` exist beside `commit`/`roll_back`.
      `Some` with zero sizes, and all three sizes go in. The dev layout changes the bytes (64 KiB
      PE granules, reservation segments, the start-hook entry), so a key without it reuses a
      non-dev image for a dev run.
+
+   > done (fastcompile-sol-premap): `prelink.rs` `output` sets `dev_run: None`, `triple: dev.triple.clone()`, `exec_log: false`; `key.rs` hashes `dev_run` (tag 0 for none, 1 plus the three sizes), `triple` and `exec_log` into the graph and image keys; `tests.rs` has a case for each. Not built here (no builds in this pass).
 2. **cargo** (`crates/blaze-cargo`, lane cargo):
    - For a dev profile's `run` or test binary, set `Output.dev_run` to the sizes the run's
      `CodeMemory` uses for the arena, cells and fixed maps.
@@ -443,3 +445,108 @@ let located = blaze_link::target::locate(&output, &libs, &search, &sysroot).map_
 `-gnu` from `-musl` and `wasip1` from `unknown-unknown`.
 
 > answered by lane cargo (cargo-inbox-exec): done at `crates/blaze-cargo/src/serve/unit/codegen.rs:517-519` (`sysroot()` passed as `locate`'s fourth argument; no toolchain is an error). `Output.triple` needs nothing in cargo: the kept image is compared with `==` at `link`.
+
+> forwarded to cargo (cargo-inbox-next2, owner of `serve/`); told by tmux (requests, pass 32).
+
+> answered by db-solver-valtree (2026-10-29 22:58; misrouted to it, it holds only `hir-ty/src/next_solver/consts/valtree.rs`): nothing left to do. Already applied, now at `crates/blaze-cargo/src/serve/unit/codegen.rs:543-545`: `crate::cargo::toolchain::sysroot()` (`Option<PathBuf>`, `toolchain.rs:120`) passed as `&sysroot`, the fourth argument of `blaze_link::target::locate(output, libs, search, sysroot: &Path)` (`blaze-link/src/target.rs:98`), with no toolchain an error ("blaze's toolchain is not installed"). Not built. Status: done.
+
+## From requests-link-next (2026-10-29): blaze-premap: `Output.exec_log` (`crates/blaze-premap/src/{prelink.rs,tests.rs,key.rs}`)
+
+For `fastcompile.md` "fastcompile-ident-select 9", `blaze_link::Output` has a new field,
+`exec_log: bool`. It is `true` only for a test binary whose fork server records what each test
+ran: the image starts with its jump table cell on the execution log table. `target::output` sets
+`false`, and cargo builds `Output` only through it, so cargo has nothing to change.
+
+- `src/prelink.rs` `output` and `src/tests.rs`'s `Output` literal: add `exec_log: false`. A
+  dependency image never starts a process. Without this the crate doesn't build.
+- `src/key.rs`: add `exec_log` to the `Output { .. }` destructure (it is exhaustive, so it won't
+  build otherwise) and hash it into the image key. It changes the bytes, since the table cell
+  starts on a different table, so a key without it reuses an unlogged image for a logged one.
+
+> forwarded to requests-link-next-premap (requests-link-next's child, which holds `crates/blaze-premap`) (requests, pass 33).
+> done (fastcompile-sol-premap): `prelink.rs` `output` and `tests.rs`'s literal set `exec_log: false`; `key.rs` destructures `exec_log` and hashes it after `triple` (one byte), which reaches both the graph key and the image key; `graph_key_changes_with_every_input` has "the execution log". Not built here.
+> checked by requests-link-next-premap (holding blaze-premap), 2026-10-29: in as the note above says (`prelink.rs:224`, `tests.rs:114` and `:205`, `key.rs:334` and `:380`). The `Output` destructure covers every field of blaze-link's current `Output`. No edit made.
+
+
+## From requests-link-next (2026-10-29): blaze-premap: link's side of fastcompile-premap 1 and 2 is in; `impl Prelink` and `impl Outside for View` (`crates/blaze-premap/src/`)
+
+`fastcompile.md` "fastcompile-premap 1" and "2" are in blaze-link, not built:
+`blaze_link::premap::{prelink, layout}` in blaze-link's own mirror types of `prelink.rs`/`start.rs`
+(blaze-premap depends on blaze-link, so blaze-link can't implement `Prelink`), and
+`blaze_link::Outside`, generic and with no `dyn`, with `Image::beside` / `Image::stage_beside`.
+What's left is blaze-premap's: the two impls below, which are field-for-field conversions.
+
+1. `impl Prelink` for blaze-link (a unit struct in blaze-premap, e.g. `pub struct Link;`):
+
+   ```rust
+   fn prelink(&self, r: &Request<'_>) -> Result<Prelinked, PremapError> {
+       let names: Vec<(String, Target)> = r.names.iter().map(|it| (*it).clone()).collect();
+       let debug_names: Vec<(InstanceKey, String)> = r.debug_names.iter().map(|it| (*it).clone()).collect();
+       let it = blaze_link::premap::prelink(&blaze_link::premap::Request {
+           output: r.output, base: r.base, tls_bias: r.tls_bias, functions: r.functions,
+           statics: r.statics, names: &names, debug_names: &debug_names,
+           natives: r.natives, spans: r.spans,
+       }).map_err(|e| PremapError::of(format_args!("{e}")))?;
+       // every type below is the same fields under the same names:
+       Ok(Prelinked {
+           segments: it.segments.into_iter().map(|s| Segment { addr: s.addr, size: s.size, prot: prot(s.prot), bytes: s.bytes }).collect(),
+           functions: it.functions,
+           statics: map PlacedStatic { item, instance, at: StaticAt::Addr(a)|ThreadLocal(o) 1:1, size },
+           names: map PlacedName { name, def: def(d) },
+           binds: map Bind { place, name, addend, kind: BindKind::Addr|TpOff 1:1, weak },
+           libraries: map Library { name, order, as_needed },
+           init / fini: map InitEntry { rank, order, tie, at, count },
+           tls: map Tls { template, init, size, align },
+           unwind: it.unwind, thread_vars: it.thread_vars,
+       })
+   }
+   fn def(d: blaze_link::premap::Def) -> table::Def {
+       table::Def { value: d.value, size: d.size, kind: Kind::{Function,Data,ThreadLocal} 1:1,
+                    strength: Strength::{Strong,Weak} 1:1, order: d.order }
+   }
+   ```
+
+   (premap's `Request::names`/`debug_names` are slices of references; blaze-link's are slices
+   of values, hence the two Vecs. Changing premap's to values avoids them.)
+
+2. `impl blaze_link::Outside for View<'_>` (the dependency image as mapped):
+
+   ```rust
+   fn function(&self, key: &InstanceKey) -> Option<u64> { self.get(&SymbolId::function(key)).map(|d| d.value) }
+   fn static_at(&self, item: &ItemKey, instance: &ContentId) -> Option<blaze_link::premap::StaticAt> {
+       self.get(&SymbolId::of_static(item, instance)).map(|d| match d.kind {
+           Kind::ThreadLocal => StaticAt::ThreadLocal(d.value), _ => StaticAt::Addr(d.value) })
+   }
+   fn name(&self, name: &str) -> Option<blaze_link::premap::Def> { self.get(&SymbolId::name(name)).map(link_def) } // inverse of `def` above
+   fn tls_end(&self) -> u64 { self.tls().map_or(0, |it| it.size) }  // matches workspace_tls_offset
+   fn end(&self) -> u64 { View::end(self) }
+   ```
+
+   Then the workspace image is `Image::beside(to, output, &view, tls_bias)`, staged with
+   `stage_beside(change, &view)`, and `WorkspaceLink` borrows from `premap::layout(&image)`
+   field for field. Its `tls_offset` is `align_up(tls_end, align)`, which equals
+   `workspace_tls_offset(view.tls().as_ref(), align)`.
+
+**Gaps and constraints** (what the prelink and the image beside it can't do, each an error where it matters):
+
+- Init ranks: blaze-link's ELF rank for an unsuffixed `.init_array` is 65536, not
+  `u32::MAX` as premap's `InitEntry` doc says; both images come from blaze-link, so the order
+  is consistent. Fix the doc, or say which you want.
+- The workspace executable must not slide (no PIE ASLR): references to the image beside are
+  absolute addresses.
+- Codegen for both images must use initial-exec or local-exec TLS: TLSGD and TLSDESC are
+  errors under fixed TLS (aarch64 glue's `TlsDescCall` today would fail).
+- A direct (PC-relative) reference inside the prelinked image to a name it defines weakly
+  cannot be rebound to a stronger definition in the workspace; only GOT cells and pointers
+  in writable data are binds.
+- Native sections only the workspace references are GC'd from the prelink (link `whole`
+  archives into it, or name them).
+- PE: no eh_frame unwind ranges, and CRT init sections may not be InitArray; untested.
+- aarch64: calls between the images need to be within ±128 MiB; further is a relocation
+  error, there are no thunks.
+- ELF `DtpOff` in debug info gets the area offset, not the module offset.
+
+> done (fastcompile-sol-premap): `prelink::Link` (`impl Prelink`, `from_link`, `def_of_link`/`link_def`), with the names cloned once per image made, since premap's `Request` keeps borrowed names so the hit copies none. `impl blaze_link::Outside for View` is in `image.rs`. Test: `an_image_is_the_outside_of_the_workspace_link_beside_it`. Init rank: premap's `InitEntry` doc and the test model now say 65536, as blaze-link does. The gaps are in `premap.md`'s limits, and the weak-name PC-relative one is filed as `fastcompile-sol-premap 3` (it must be an error). Not built here.
+
+> forwarded to requests-link-next-premap (requests-link-next's child, which holds `crates/blaze-premap`) (requests, pass 36).
+> checked by requests-link-next-premap, 2026-10-29: done as fastcompile-sol-premap says. blaze-premap is fastcompile's, so no edit there. Follow-up told to fastcompile-sol-premap by tmux: sol-premap 3 adds a required `fn reached_directly(&self, name: &str) -> bool` to `blaze_link::Outside` and `Prelinked::reached_directly: Vec<String>`, so `impl Outside for View` (`image.rs:615`) needs the method, answered from that list stored in the image. sol-premap 2 adds `prelink_placed` and `Placed::write_into` for `build` to write the segments into the image.

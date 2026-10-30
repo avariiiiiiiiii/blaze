@@ -394,6 +394,32 @@ pub const UNLINKED: &str = "the build is sanitized (`-Z sanitizer`, or Sanitizer
     passes=sancov-module`), and blaze's linker has no sanitizer runtimes or SanitizerCoverage \
     sections yet, so the program can't be linked";
 
+/// Checks that the toolchain at `sysroot` has the runtime of each of `sanitizers` for `target`,
+/// as rustc's `link_sanitizer_runtime` names it in `lib/rustlib/<target>/lib/`: a dylib on
+/// Apple targets, an archive elsewhere. An error names the sanitizer and the path looked at;
+/// blaze's linker checks the same file when it links it.
+pub fn runtimes(sanitizers: Sanitizers, target: &str, sysroot: &std::path::Path) -> Result<(), String> {
+    let apple = target.contains("-apple-");
+    let dir = sysroot.join("lib/rustlib").join(target).join("lib");
+    for (one, short) in [(Sanitizers::ADDRESS, "asan"), (Sanitizers::THREAD, "tsan"), (Sanitizers::MEMORY, "msan")] {
+        if !sanitizers.contains(one) {
+            continue;
+        }
+        let name = sanitizer_name(one);
+        if target.contains("-windows-") {
+            return Err(format!("`-Zsanitizer={name}` on `{target}`: blaze links no sanitizer runtime for Windows"));
+        }
+        if apple && one == Sanitizers::MEMORY {
+            return Err(format!("`-Zsanitizer={name}` on `{target}`: rustc has no memory sanitizer runtime for Apple targets"));
+        }
+        let file = dir.join(format!("librustc-nightly_rt.{short}.{}", if apple { "dylib" } else { "a" }));
+        if !file.is_file() {
+            return Err(format!("`-Zsanitizer={name}` needs its runtime `{}`, which blaze's toolchain does not have", file.display()));
+        }
+    }
+    Ok(())
+}
+
 /// Sanitizers rustc has that blaze's code generator does not instrument with.
 const UNSANITIZED: &[&str] = &[
     "cfi",
@@ -660,6 +686,25 @@ mod tests {
         assert_eq!(refusal(&["-Zthreads=8", "-Z", "embed-metadata=no"]), None);
         let why = refusal(&["-Zthreads=8", "-Z", "no_such_flag=3"]).unwrap();
         assert_eq!(why, format!("-Z no_such_flag=3: {UNKNOWN}"));
+    }
+
+    #[test]
+    fn a_sanitizer_runtime_the_toolchain_lacks_is_named() {
+        let sysroot = std::env::temp_dir().join(format!("blaze-sanitizer-runtimes-{}", std::process::id()));
+        let lib = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("librustc-nightly_rt.asan.a"), b"").unwrap();
+        let linux = "x86_64-unknown-linux-gnu";
+        assert_eq!(runtimes(Sanitizers::ADDRESS, linux, &sysroot), Ok(()));
+        assert_eq!(runtimes(Sanitizers::NONE, "aarch64-apple-darwin", &sysroot), Ok(()));
+        let thread = runtimes(Sanitizers::THREAD, linux, &sysroot).unwrap_err();
+        assert!(thread.starts_with("`-Zsanitizer=thread` needs its runtime `"), "{thread}");
+        assert!(thread.contains(&lib.join("librustc-nightly_rt.tsan.a").display().to_string()), "{thread}");
+        let apple = runtimes(Sanitizers::ADDRESS, "aarch64-apple-darwin", &sysroot).unwrap_err();
+        assert!(apple.contains("librustc-nightly_rt.asan.dylib"), "{apple}");
+        assert!(runtimes(Sanitizers::MEMORY, "aarch64-apple-darwin", &sysroot).unwrap_err().contains("Apple"));
+        assert!(runtimes(Sanitizers::ADDRESS, "x86_64-pc-windows-msvc", &sysroot).unwrap_err().contains("Windows"));
+        std::fs::remove_dir_all(&sysroot).unwrap();
     }
 
     #[test]

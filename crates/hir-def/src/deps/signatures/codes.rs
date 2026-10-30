@@ -839,6 +839,27 @@ mod tests {
     }
 
     #[test]
+    fn splatted_counts_the_parameters_cfg_leaves() {
+        let db = TestDB::with_files(
+            "fn f(#[cfg(any())] x: u8, a: u8, #[rustc_splat] b: (u8,)) {}\nfn g(a: u8) {}\n\
+             unsafe extern \"C\" { fn v(#[rustc_splat] a: (u8,), ...); }",
+        );
+        let krate = db.fetch_test_crate();
+        let mut found = Vec::new();
+        for (_, module) in crate_def_map(&db, krate).modules(&db) {
+            for decl in module.scope(&db).declarations() {
+                if let ModuleDefId::FunctionId(it) = decl {
+                    let signature = FunctionSignature::of(&db, it);
+                    found.push((signature.name.as_str().to_owned(), signature.splatted));
+                }
+            }
+        }
+        found.sort();
+        let expected = [("f".to_owned(), Some(1)), ("g".to_owned(), None), ("v".to_owned(), None)];
+        assert_eq!(found, expected);
+    }
+
+    #[test]
     fn a_record_id_past_its_store_is_refused() {
         let db = TestDB::with_files("fn f<const C: usize = 1>(_: (), _: u8) {}");
         let krate = db.fetch_test_crate();

@@ -11,9 +11,15 @@
 //! between its neighbours, its tokens balance, the tokens the parser may look at from outside
 //! it are unchanged, and its parse is one node of its kind taking all of its text. When none
 //! is, [`incremental_reparse`] is `None` and the caller parses the whole text.
+//!
+//! Several edits made at once ([`reparse_all`]) are each parsed again so, and spliced in one
+//! copy of the tree ([`FlatTree::splice_all`]); edits whose checks read each other's text are
+//! parsed again as one.
+
+use std::cell::Cell;
 
 use parser::{Edition, LexedStr, Reparser};
-use syntax_tree::{FlatTree, Language, Text};
+use syntax_tree::{FlatTree, Language, Splice, Text};
 
 use crate::{
     AstNode, SyntaxError,
@@ -86,9 +92,114 @@ fn reparse_onto(
     edition: Edition,
     outline: Option<Edition>,
 ) -> Option<(FlatTree, Vec<SyntaxError>, TextRange)> {
-    let edit = Edit { tree, delete, insert, new_source, edition, outline: outline.is_some() };
-    let (tree, new_errors, range) = edit.token().or_else(|| edit.node())?;
-    Some((tree, merge_errors(errors, new_errors, range, delete, insert), range))
+    let edit = Edit::new(tree, delete, insert, new_source, 0, edition, outline.is_some());
+    let mut unit = edit.unit()?;
+    let tree = tree.splice_all(&[unit.splice(new_source)], new_source.clone());
+    let range = unit.range;
+    Some((tree, merge_errors(errors, std::slice::from_mut(&mut unit)), range))
+}
+
+/// The tree of `tree`'s text with each of `edits` made, which is `new_source` (whose tree
+/// shares it), and its errors (`errors`, those of `tree`, merged with those of what was parsed
+/// again). The edits are in order and none overlaps another, `delete` of the old text replaced
+/// by `insert`. Each is parsed again as [`incremental_reparse`] parses one, and the old tree is
+/// copied once with every new piece in it. Edits whose checks read another's text (a token
+/// next to it, the item it is in) are one edit from the first's start to the last's end. `None`
+/// when one of them can not be parsed again alone: the caller parses the whole text.
+pub(crate) fn reparse_all(
+    tree: &FlatTree,
+    edits: &[(TextRange, &str)],
+    new_source: &Text,
+    errors: impl IntoIterator<Item = SyntaxError>,
+    edition: Edition,
+    outline: Option<Edition>,
+) -> Option<(FlatTree, Vec<SyntaxError>)> {
+    if outline.is_some_and(|it| it != edition) {
+        return None;
+    }
+    let grown = |&(delete, insert): &(TextRange, &str)| {
+        insert.len() as i64 - u32::from(delete.len()) as i64
+    };
+    // alloc: one of each an edit, once a call
+    let (mut units, mut groups): (Vec<Unit>, Vec<Group>) = (Vec::new(), Vec::new());
+    let (mut next, mut shift) = (0, 0);
+    while let Some(first) = edits.get(next) {
+        let mut group = Group { delete: first.0, shift, grown: grown(first) };
+        next += 1;
+        let unit = loop {
+            let unit = group.edit(tree, new_source, edition, outline.is_some()).unit()?;
+            if units.last().is_some_and(|it: &Unit| it.reach.end() >= unit.reach.start()) {
+                units.pop();
+                group = groups.pop().expect("a group for every unit").joined(group);
+                continue;
+            }
+            if let Some(edit) = edits.get(next).filter(|it| it.0.start() <= unit.reach.end()) {
+                group = group.joined(Group { delete: edit.0, shift: 0, grown: grown(edit) });
+                next += 1;
+                continue;
+            }
+            break unit;
+        };
+        shift = group.shift + group.grown;
+        units.push(unit);
+        groups.push(group);
+    }
+    // alloc: one an edit, as `units`
+    let splices: Vec<(u32, Splice<'_>)> = units.iter().map(|it| it.splice(new_source)).collect();
+    let tree = tree.splice_all(&splices, new_source.clone());
+    Some((tree, merge_errors(errors, &mut units)))
+}
+
+/// Edits of [`reparse_all`] parsed again as one: the old text `delete` from the first's start
+/// to the last's end, how many bytes longer the text before it is in the new, and how many
+/// longer it is itself.
+#[derive(Clone, Copy)]
+struct Group {
+    delete: TextRange,
+    shift: i64,
+    grown: i64,
+}
+
+impl Group {
+    /// This group and the one just after it, as one.
+    fn joined(self, after: Group) -> Group {
+        let delete = self.delete.cover(after.delete);
+        Group { delete, shift: self.shift, grown: self.grown + after.grown }
+    }
+
+    fn edit<'a>(
+        &self,
+        tree: &'a FlatTree,
+        new_source: &'a Text,
+        edition: Edition,
+        outline: bool,
+    ) -> Edit<'a> {
+        let start = u32::from(self.delete.start()) as i64 + self.shift;
+        let end = u32::from(self.delete.end()) as i64 + self.shift + self.grown;
+        let insert = &new_source[start as usize..end as usize];
+        Edit::new(tree, self.delete, insert, new_source, self.shift, edition, outline)
+    }
+}
+
+/// What an edit parses again: element `at` of the old tree, over `range` of the old text and
+/// `new_range` of the new, with its new tree (`None` for a token, whose new text is all it
+/// needs) and the errors in it from its new start; `reach` is the old text the checks read.
+struct Unit {
+    at: u32,
+    with: Option<FlatTree>,
+    errors: Vec<SyntaxError>,
+    range: TextRange,
+    new_range: TextRange,
+    reach: TextRange,
+}
+
+impl Unit {
+    fn splice<'a>(&'a self, new_source: &'a str) -> (u32, Splice<'a>) {
+        match &self.with {
+            Some(with) => (self.at, Splice::Subtree(with)),
+            None => (self.at, Splice::Token(&new_source[self.new_range])),
+        }
+    }
 }
 
 /// The edit that makes `old` into `new`: the range of `old` between their longest common
@@ -145,15 +256,51 @@ struct Edit<'a> {
     delete: TextRange,
     insert: &'a str,
     new_source: &'a Text,
+    /// How many bytes longer the text before `delete` is in `new_source`: the other edits'
+    /// made with it.
+    shift: i64,
     edition: Edition,
     outline: bool,
+    /// The old text the checks have read so far.
+    reach: Cell<TextRange>,
 }
 
-type Spliced = (FlatTree, Vec<SyntaxError>, TextRange);
+impl<'a> Edit<'a> {
+    fn new(
+        tree: &'a FlatTree,
+        delete: TextRange,
+        insert: &'a str,
+        new_source: &'a Text,
+        shift: i64,
+        edition: Edition,
+        outline: bool,
+    ) -> Edit<'a> {
+        let reach = Cell::new(delete);
+        Edit { tree, delete, insert, new_source, shift, edition, outline, reach }
+    }
+}
 
 impl Edit<'_> {
     fn kind(&self, at: u32) -> SyntaxKind {
         RustLanguage::kind_from_raw(self.tree.kind(at))
+    }
+
+    /// The element parsed again for the edit: the token, else the smallest node.
+    fn unit(&self) -> Option<Unit> {
+        self.token().or_else(|| self.node())
+    }
+
+    /// The checks read `range` of the old text too.
+    fn reads(&self, range: TextRange) {
+        self.reach.set(self.reach.get().cover(range));
+    }
+
+    /// Element `at` parsed again: `with` its new tree, `errors` from its new start.
+    fn parsed(&self, at: u32, with: Option<FlatTree>, errors: Vec<SyntaxError>) -> Option<Unit> {
+        let range = self.tree.range(at);
+        self.reads(range);
+        let (new_range, reach) = (self.new_range(range), self.reach.get());
+        Some(Unit { at, with, errors, range, new_range, reach })
     }
 
     /// Whether `at` is a leaf: a token or a lazy node.
@@ -163,7 +310,8 @@ impl Edit<'_> {
 
     /// Where the old `range`, which holds the edit, is in the new text.
     fn new_range(&self, range: TextRange) -> TextRange {
-        TextRange::at(range.start(), range.len() + TextSize::of(self.insert) - self.delete.len())
+        let start = TextSize::new((u32::from(range.start()) as i64 + self.shift) as u32);
+        TextRange::at(start, range.len() + TextSize::of(self.insert) - self.delete.len())
     }
 
     /// The text of the old `range`, which holds the edit, after it.
@@ -171,7 +319,7 @@ impl Edit<'_> {
         &self.new_source[self.new_range(range)]
     }
 
-    fn token(&self) -> Option<Spliced> {
+    fn token(&self) -> Option<Unit> {
         let tree = self.tree;
         let at = covering(tree, self.delete);
         if !tree.is_token(at) {
@@ -203,6 +351,7 @@ impl Edit<'_> {
         }
         let prev = (0..at).rev().find(|&it| self.is_leaf(it));
         let next = (at + 1..tree.len()).find(|&it| self.is_leaf(it));
+        [prev, next].into_iter().flatten().for_each(|it| self.reads(tree.range(it)));
         if kind == WHITESPACE
             && old_text.contains("\n\n") != new_text.contains("\n\n")
             && [prev, next].into_iter().flatten().any(|it| self.kind(it) == COMMENT)
@@ -213,6 +362,7 @@ impl Edit<'_> {
         // The edited token must not take the start of the next one, nor the previous one its
         // start: for source code `bruh"str"`, removing `ruh` makes `b"str"` one byte string.
         if let Some(next_char) = self.tree.source()[usize::from(range.end())..].chars().next() {
+            self.reads(TextRange::at(range.end(), TextSize::of(next_char)));
             let takes_next = blaze_mem::scratch::with_string(|with_next| {
                 with_next.push_str(new_text);
                 with_next.push(next_char);
@@ -238,11 +388,11 @@ impl Edit<'_> {
 
         let token_range = TextRange::up_to(TextSize::of(new_text));
         let errors = new_err.into_iter().map(|msg| SyntaxError::new(msg, token_range)).collect();
-        Some((tree.replace_token(at, new_text, self.new_source.clone()), errors, range))
+        self.parsed(at, None, errors)
     }
 
-    /// The smallest node holding the edit that parses again alone, spliced.
-    fn node(&self) -> Option<Spliced> {
+    /// The smallest node holding the edit that parses again alone.
+    fn node(&self) -> Option<Unit> {
         let tree = self.tree;
         let covering = covering(tree, self.delete);
         let start = match tree.is_token(covering) {
@@ -278,7 +428,7 @@ impl Edit<'_> {
     /// A `fn` body of an outline, as a lazy node: one exactly when its tokens let the outline
     /// leave it unparsed (`braced`), which it did or the full parse of the body would have
     /// to be checked too.
-    fn body(&self, at: u32) -> Option<Spliced> {
+    fn body(&self, at: u32) -> Option<Unit> {
         let range = self.new_range(self.tree.range(at));
         let text = &self.new_source[range];
         let lexed = LexedStr::new(self.edition, text);
@@ -292,10 +442,10 @@ impl Edit<'_> {
         let mut builder = SyntaxTreeBuilder::sourced_range(self.new_source.clone(), range);
         builder.lazy(BLOCK_EXPR, TextSize::of(text));
         let (with, _no_errors) = builder.finish_raw(self.edition);
-        self.splice(at, with, lexer_errors(&lexed, TextSize::new(0)).collect())
+        self.parsed(at, Some(with), lexer_errors(&lexed, TextSize::new(0)).collect())
     }
 
-    fn block(&self, at: u32, reparser: Reparser, in_full: bool) -> Option<Spliced> {
+    fn block(&self, at: u32, reparser: Reparser, in_full: bool) -> Option<Unit> {
         let kind = self.kind(at);
         let range = self.new_range(self.tree.range(at));
         let lexed = LexedStr::new(self.edition, &self.new_source[range]);
@@ -317,12 +467,12 @@ impl Edit<'_> {
         // clone: a count of the new text, which the node's tree shares
         let source = self.new_source.clone();
         let (with, errors) = build_node(source, range, &lexed, &output, self.edition, kind)?;
-        self.splice(at, with, errors)
+        self.parsed(at, Some(with), errors)
     }
 
     /// An item of the source file, parsed as the file's top level parses it: with the tokens
     /// after it, to stop where it stops in the file.
-    fn item(&self, at: u32, in_full: bool) -> Option<Spliced> {
+    fn item(&self, at: u32, in_full: bool) -> Option<Unit> {
         let tree = self.tree;
         let kind = self.kind(at);
         let range = tree.range(at);
@@ -345,6 +495,7 @@ impl Edit<'_> {
                 seen >= AFTER_ITEM && !kind.is_trivia() && !matches!(kind, INT_NUMBER | T![.])
             })
             .map_or(tree.source().len(), |it| usize::from(tree.range(it).end()));
+        self.reads(TextRange::new(range.end(), TextSize::try_from(ahead).unwrap()));
         // `lexes_alone` showed the lexer ends a token where the item ends.
         let ahead = LexedStr::new(self.edition, &tree.source()[usize::from(range.end())..ahead]);
         let input = lexed.to_input_followed_by(&ahead, self.edition);
@@ -360,12 +511,7 @@ impl Edit<'_> {
         // clone: a count of the new text, which the node's tree shares
         let source = self.new_source.clone();
         let (with, errors) = build_node(source, new, &lexed, &output, self.edition, kind)?;
-        self.splice(at, with, errors)
-    }
-
-    fn splice(&self, at: u32, with: FlatTree, errors: Vec<SyntaxError>) -> Option<Spliced> {
-        let tree = self.tree.replace_subtree(at, &with, self.new_source.clone());
-        Some((tree, errors, self.tree.range(at)))
+        self.parsed(at, Some(with), errors)
     }
 
     /// Whether node `at`'s first [`LOOKAHEAD`] tokens are those of `new`, its new text. When the
@@ -412,6 +558,7 @@ impl Edit<'_> {
                 false => tree.range(it).end(),
             },
         );
+        self.reads(TextRange::new(before, after));
         let before = &source[TextRange::new(before, range.start())];
         let after = &source[TextRange::new(range.end(), after)];
         blaze_mem::scratch::with_string(|joint| {
@@ -485,30 +632,33 @@ fn covering(tree: &FlatTree, range: TextRange) -> u32 {
     }
 }
 
+/// The errors of the tree `units` make: `old_errors`, those of the old tree, that are outside
+/// every unit, moved by what the units before them grew, then each unit's own, from its new
+/// start.
 fn merge_errors(
     old_errors: impl IntoIterator<Item = SyntaxError>,
-    new_errors: Vec<SyntaxError>,
-    range_before_reparse: TextRange,
-    delete: TextRange,
-    insert: &str,
+    units: &mut [Unit],
 ) -> Vec<SyntaxError> {
     let mut res = Vec::new();
-
     for old_err in old_errors {
-        let old_err_range = old_err.range();
-        if old_err_range.end() <= range_before_reparse.start() {
-            res.push(old_err);
-        } else if old_err_range.start() >= range_before_reparse.end() {
-            let inserted_len = TextSize::of(insert);
-            res.push(old_err.with_range((old_err_range + inserted_len) - delete.len()));
-            // Note: extra parens are intentional to prevent uint underflow, HWAB (here was a bug)
+        let range = old_err.range();
+        let before = units.partition_point(|it| it.range.end() <= range.start());
+        if units.get(before).is_some_and(|it| it.range.start() < range.end()) {
+            continue;
+        }
+        match before.checked_sub(1).map(|it| &units[it]) {
+            None => res.push(old_err),
+            // The old end is subtracted first: the error starts past it.
+            Some(it) => res.push(old_err.with_range(range - it.range.end() + it.new_range.end())),
         }
     }
-    res.extend(new_errors.into_iter().map(|new_err| {
-        // fighting borrow checker with a variable ;)
-        let offsetted_range = new_err.range() + range_before_reparse.start();
-        new_err.with_range(offsetted_range)
-    }));
+    for unit in units.iter_mut() {
+        let start = unit.new_range.start();
+        res.extend(unit.errors.drain(..).map(|it| {
+            let range = it.range() + start;
+            it.with_range(range)
+        }));
+    }
     res
 }
 
@@ -996,6 +1146,64 @@ enum Foo {
                 };
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err() {
                     panic!("{}: {edits} edits", file.display());
+                }
+            }
+        }
+    }
+
+    /// Random disjoint edits of real files made at once by `reparse_all`: the parse of the text
+    /// after them, and the one `reparse` makes of them edit by edit, in full and as an outline.
+    #[test]
+    fn reparse_all_random_edits() {
+        let root = test_utils::project_root().into_std_path_buf();
+        let mut files = Vec::new();
+        collect_rs(&root.join("crates/syntax/src"), &mut files);
+        files.sort();
+        let mut rng = SplitMix64::new(0x6a09_e667_f3bc_c908);
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let full = SourceFile::parse(&text, Edition::CURRENT);
+            let outline = SourceFile::parse_outline(Text::from(text.as_str()), Edition::CURRENT);
+            hash_large(&full);
+            hash_large(&outline);
+            for count in 1..8 {
+                let mut owned: Vec<(TextRange, String)> =
+                    (0..count).map(|_| random_edit(&mut rng, &text)).collect();
+                owned.sort_by_key(|it| (it.0.start(), it.0.end()));
+                let mut end = TextSize::new(0);
+                owned.retain(|it| {
+                    let disjoint = it.0.start() >= end;
+                    if disjoint {
+                        end = it.0.end();
+                    }
+                    disjoint
+                });
+                let edits: Vec<(TextRange, &str)> =
+                    owned.iter().map(|(delete, insert)| (*delete, insert.as_str())).collect();
+                let mut after = text.clone();
+                for &(delete, insert) in edits.iter().rev() {
+                    after.replace_range(Range::<usize>::from(delete), insert);
+                }
+                let check = || {
+                    for parse in [&full, &outline] {
+                        let at_once = parse.reparse_all(&edits, Edition::CURRENT);
+                        let mut one_by_one = parse.clone();
+                        for &(delete, insert) in edits.iter().rev() {
+                            one_by_one = one_by_one.reparse(delete, insert, Edition::CURRENT);
+                        }
+                        let after = Text::from(after.as_str());
+                        let parsed = match parse.is_outline() {
+                            true => SourceFile::parse_outline(after, Edition::CURRENT),
+                            false => SourceFile::parse_shared(after, Edition::CURRENT),
+                        };
+                        check_same(&at_once, &parsed);
+                        check_same(&at_once, &one_by_one);
+                        let flat = |it: &Parse<SourceFile>| it.tree.as_ref().unwrap().flat().clone();
+                        assert!(*flat(&at_once) == *flat(&one_by_one), "the same tree");
+                    }
+                };
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err() {
+                    panic!("{}: {edits:?}", file.display());
                 }
             }
         }

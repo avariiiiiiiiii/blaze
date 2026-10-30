@@ -62,9 +62,11 @@ impl Record {
         let mut last: Option<u32> = None;
         for &hit in &hits {
             if hit >= slots {
+                // alloc: error path, the reason the record keeps
                 return Record::incomplete(format!("its execution record names slot {hit} of a binary with {slots}"));
             }
             if last.is_some_and(|it| it >= hit) {
+                // alloc: error path, the reason the record keeps
                 return Record::incomplete(format!("its execution record names slot {hit} out of order"));
             }
             last = Some(hit);
@@ -76,6 +78,7 @@ impl Record {
     /// it did not exit (a signal, a kill, a timeout).
     pub fn of_region(region: &[u8], ended: Result<(), &str>) -> Record {
         if let Err(why) = ended {
+            // alloc: error path, the reason the record keeps
             return Record::incomplete(format!("its execution record is not whole: {why}"));
         }
         let Some((head, map)) = region.split_at_checked(HEADER) else {
@@ -87,11 +90,14 @@ impl Record {
         let slots = u32::from_le_bytes([head[8], head[9], head[10], head[11]]);
         let armed = u32::from_le_bytes([head[12], head[13], head[14], head[15]]);
         if armed != slots {
+            // alloc: error path, the reason the record keeps
             return Record::incomplete(format!("the runtime armed {armed} of its {slots} slots"));
         }
         let Some(map) = map.get(..slots as usize) else {
+            // alloc: error path, the reason the record keeps
             return Record::incomplete(format!("its execution record holds fewer than its {slots} slots"));
         };
+        // alloc: once per run, the hits the record owns
         let mut hits = Vec::new();
         hits_of(map, &mut hits);
         Record::Complete { slots, hits }

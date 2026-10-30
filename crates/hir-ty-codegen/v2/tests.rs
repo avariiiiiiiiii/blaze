@@ -42,7 +42,7 @@ fn held(db: TestDB) -> (&'static TestDB, HirFrontend<'static>) {
 fn held_as(db: TestDB, policy: &Policy) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(db));
     let frontend =
-        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime(Default::default()));
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
     (db, frontend.with_policy(policy))
 }
 
@@ -63,6 +63,7 @@ fn policy(level: OptLevel) -> Policy {
         mode: Mode::Output,
         fold: false,
         sanitize: Sanitize::default(),
+        pgo: blaze_codegen::settings::Pgo::None,
     }
 }
 
@@ -90,9 +91,10 @@ fn spec() -> Spec {
             target: target.triple().to_owned(),
             arch,
             cpu: target.cpu().to_owned(),
-            features: target.features().to_vec(),
+            features: Vec::new(),
             cranelift: "0.136".to_owned(),
             llvm: None,
+            stencils: None,
             frame_pointers: crate::backend::frame_pointers(),
             relocation: if pic { Relocation::Pic } else { Relocation::Static },
         },
@@ -102,7 +104,9 @@ fn spec() -> Spec {
         panic: Panic::Unwind,
         debuginfo: DebugInfo::None,
         fold: false,
+        counted: false,
         mir_inline: false,
+        pgo: blaze_codegen::settings::Pgo::None,
         policy: ContentId::default(),
         sanitize: Sanitize::default(),
     }
@@ -207,6 +211,94 @@ fn a_shape_is_the_same_each_time() {
     let (db, frontend) = frontend(SIBLINGS);
     let root = frontend.root(function(&db, "roots"));
     assert_eq!(shape(&frontend, &root), shape(&frontend, &root));
+}
+
+const SHARED: &str = r#"
+//- minicore: sized
+#[rustc_intrinsic]
+pub fn type_id<T: ?Sized + 'static>() -> u128;
+pub struct A(pub u32);
+pub struct B(pub u32);
+pub fn id<T>(x: T) -> T { x }
+pub fn tid<T: 'static>() -> u128 { type_id::<T>() }
+pub fn roots() -> u128 {
+    let (a, b) = (A(1), B(2));
+    id(&a);
+    id(&b);
+    tid::<&'static A>() ^ tid::<&'static B>()
+}
+"#;
+
+/// Two instances of one body whose code reads nothing that tells their arguments apart
+/// (`id::<&A>`, `id::<&B>`) have one share key in their arguments' place, so they are one
+/// instance: one key, which the build compiles once, and one shape. `tid::<&A>` and
+/// `tid::<&B>` read `type_id`, which tells them apart, and stay two.
+#[test]
+fn instances_with_one_share_key_are_one() {
+    use blaze_codegen::backend::Frontend as _;
+    let (db, frontend) = frontend(SHARED);
+    let policy = policy(OptLevel::O0);
+    let root = frontend.root(function(db, "roots"));
+    let origin = frontend.with(|hir, _| frontend.origin(hir, db.test_crate()));
+    let key = |instance: &HirInstance| {
+        let described = (frontend.describe(instance, &origin))
+            .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
+        let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+        let settings = choice.first.settings();
+        UnitInstance { code: described.code, args: described.args, settings }.key()
+    };
+    let of = |name| {
+        let func = function(db, name);
+        frontend.with(|hir, homes| called(hir, homes, &root, func))
+    };
+    let ids = of("id");
+    let [a, b] = &ids[..] else { panic!("{ids:?}") };
+    assert_ne!(a, b);
+    assert_eq!(key(a), key(b));
+    assert_eq!(shape(&frontend, a), shape(&frontend, b));
+    let tids = of("tid");
+    let [one, two] = &tids[..] else { panic!("{tids:?}") };
+    assert_ne!(key(one), key(two));
+}
+
+/// A generic is shared under every options a unit of its origin builds a body with: the
+/// first spec's, the LLVM spec a live build tiers it up to, the LLVM tier of a tiered run,
+/// and UB checks where its crate has debug assertions. The library's bodies are at level 2,
+/// inlined, as shipped. Leaving one out would key two bodies as one under it.
+#[test]
+fn a_generic_is_shared_under_every_options_its_units_build_with() {
+    use hir_ty_mir::mir::{
+        MirOptLevel::{Debug, Release},
+        MirOptions,
+    };
+    let (db, frontend) = frontend(SHARED);
+    let origin = frontend.with(|hir, _| frontend.origin(hir, db.test_crate()));
+    let options = |policy: &Policy| {
+        let build_time = std::sync::Arc::new(BuildTime(Default::default()));
+        let frontend =
+            HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time).with_policy(policy);
+        frontend.body_options(&origin).expect("the options")
+    };
+    let at = |level, ub_checks, inline| MirOptions { level, ub_checks, lifetime_markers: true, inline };
+    let o0 = options(&policy(OptLevel::O0));
+    assert!(o0.other.contains(at(Debug, false, false)), "{o0:?}");
+    assert!(!o0.other.contains(at(Release, false, false)), "{o0:?}");
+    assert!(o0.lang.contains(at(Release, false, true)), "{o0:?}");
+    let live = options(&Policy { mode: Mode::Live, ..policy(OptLevel::O3) });
+    assert!(live.other.contains(at(Debug, false, false)), "{live:?}");
+    assert!(live.other.contains(at(Release, false, false)), "{live:?}");
+    let tiered = options(&Policy { mode: Mode::Tiered, ..policy(OptLevel::O0) });
+    assert!(tiered.other.contains(at(Debug, false, false)), "{tiered:?}");
+    assert!(tiered.other.contains(at(Release, false, false)), "{tiered:?}");
+    let o3 = options(&policy(OptLevel::O3));
+    assert!(o3.other.contains(at(Release, false, true)), "{o3:?}");
+    let mut checked = policy(OptLevel::O0);
+    checked.profile.debug_assertions = true;
+    let checked = options(&checked);
+    assert!(checked.other.contains(at(Debug, true, false)), "{checked:?}");
+    let unplanned =
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
+    assert!(unplanned.body_options(&origin).is_err_and(|e| e.contains("with_policy")));
 }
 
 /// A warm unit's shape takes nothing of the global allocator: its bytes are the thread's
@@ -597,7 +689,7 @@ fn which_units_inline_is_the_policys() {
     let outer = function(db, "outer");
     let generic = frontend.with(|db, homes| called(db, homes, &root, outer)).remove(0);
     let inlines = |policy: &Policy, instance: &HirInstance| {
-        let build_time = BuildTime(Default::default());
+        let build_time = std::sync::Arc::new(BuildTime(Default::default()));
         let frontend =
             HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time).with_policy(policy);
         frontend.with(|db, _| frontend.inlines(db, instance)).expect("the policy")
@@ -608,7 +700,7 @@ fn which_units_inline_is_the_policys() {
     assert!(!inlines(&policy(OptLevel::O1), &root));
     let mut set_apart = policy(OptLevel::O3);
     let name = frontend.with(|hir, _| match frontend.origin(hir, db.test_crate()) {
-        blaze_codegen::plan::Origin::Member(name) => name,
+        blaze_codegen::plan::Origin::Member(name) => name.as_str().to_owned(),
         other => panic!("the fixture's crate is {other:?}"),
     });
     let o0 = Override { opt_level: Some(OptLevel::O0), ..Override::default() };
@@ -617,7 +709,7 @@ fn which_units_inline_is_the_policys() {
     // Other members and the library's crates still inline, and any of them may ask for it.
     assert!(inlines(&set_apart, &generic));
     let unwalked =
-        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime(Default::default()));
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
     let refused = unwalked.with(|db, _| unwalked.inlines(db, &root));
     assert!(refused.is_err_and(|e| e.contains("with_policy")));
 }

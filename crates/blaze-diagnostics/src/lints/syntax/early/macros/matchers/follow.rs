@@ -90,7 +90,7 @@ struct Errored;
 /// The walk of one matcher.
 struct Follow<'m> {
     m: &'m Matchers,
-    tokens: &'m Tokens,
+    tokens: &'m Tokens<'m>,
     /// The FIRST set of each repetition's contents, by the repetition.
     first: FxHashMap<u32, TokenSet>,
     out: &'m mut Vec<OrPattern>,
@@ -98,7 +98,7 @@ struct Follow<'m> {
 
 /// rustc's `check_lhs_nt_follows`: what the matcher `lhs` (a rule's, or its `attr(..)`
 /// arguments) gives. One that is not in delimiters is an error rustc gives elsewhere.
-pub(super) fn check_lhs(m: &Matchers, tokens: &Tokens, lhs: u32, out: &mut Vec<OrPattern>) {
+pub(super) fn check_lhs(m: &Matchers, tokens: &Tokens<'_>, lhs: u32, out: &mut Vec<OrPattern>) {
     let Mtt::Delimited { tts, .. } = *m.at(lhs) else { return };
     let mut follow = Follow { m, tokens, first: FxHashMap::default(), out };
     follow.build(tts);
@@ -339,15 +339,18 @@ fn can_begin_type(kind: Kind) -> bool {
 #[cfg(test)]
 mod tests {
     use span::Edition;
-    use syntax::{AstNode, SourceFile, ast};
+    use syntax::{
+        SourceFile,
+        view::{self as ast, AstNode as _},
+    };
 
     use super::*;
 
     /// The `pat`s `|` may follow in the definition `text`.
     fn or_patterns(text: &str, edition: Edition) -> Vec<String> {
-        let file = SourceFile::parse(text, edition).tree();
-        let def = file.syntax().descendants().find_map(ast::Macro::cast).unwrap();
-        let tokens = Tokens::of(&def, &|_| (edition, true)).unwrap();
+        let file = SourceFile::parse(text, edition);
+        let def = file.root().descendants().find_map(ast::Macro::cast).unwrap();
+        let tokens = Tokens::of(def, &|_| (edition, true)).unwrap();
         let (m, rules) = Matchers::rules(&tokens, true, edition);
         let mut out = Vec::new();
         for rule in rules {

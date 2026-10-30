@@ -38,6 +38,7 @@ here repeats one of them it says so.
 | persist decode (`decode`, `Source`) | per record | `collect::<Result<..>>` per column (grows, then shrinks) | `exact`/`Source::list`: one allocation of the column's length; temporaries (`buffer`, `Source::tys`' lists, the closure decoder's) in the frame of the task `to_result` opens |
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:44): a summary of C, A, U, E and P below, each settled in its own section (columns `crates/hir-ty/src/infer/columns.rs`, context `infer.rs`, persist `infer/persist.rs:1064`).
 
 ## Prerequisites (other parts)
 
@@ -56,6 +57,7 @@ here repeats one of them it says so.
   so the context's frame set goes in as it is and `crates/hir`'s API does not change.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:44): in the tree at `crates/blaze-mem/src/frame.rs:1254` (`current`), `crates/hir-ty/Cargo.toml:51`, `crates/hir-ty/src/lib.rs:5`, `crates/hir-ty/src/db.rs:46` (`INFER_TAG`), `crates/hir-def/src/resolver.rs:907` (`traits_in_scope_into`), `crates/hir-ty/src/lower.rs:355` (the lowering context's frame); salsa's `mem_tag` in `vendor/salsa/src/function/execute.rs`.
 
 ## C. `infer/columns.rs`
 
@@ -1077,6 +1079,7 @@ its "before" code.
 > has added `impl InferenceContext<'db>` headers in new files (`infer/ambiguity.rs`,
 > `infer/callee.rs`), so A0 ends with `rg -n "InferenceContext<'db>" crates/hir-ty/src`
 > finding nothing.
+> checked by db-audit-mem (22:44): A0 to A13 applied below (db-mem-infer-a-ctx); A0's end condition holds: `rg -n "InferenceContext<'db>" crates/hir-ty/src` finds nothing.
 
 ### A0. Every `InferenceContext<'db>` in the crate, for one mechanical edit
 
@@ -2861,6 +2864,7 @@ build the solver-side `Autoderef` (mem-db-infer-method's `autoderef.rs`) and all
 ## G. The small files: `ambiguity.rs`, `at_error.rs`, `mutability.rs`, `opaques.rs`, `path.rs`
 
 > forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
+> checked by db-audit-mem (22:44): each file's subsection is applied below (db-mem-infer-a-small), the headers `impl<'db, 'f> InferenceContext<'db, 'f>` in the tree.
 
 ### G1. `infer/ambiguity.rs`
 
@@ -3647,6 +3651,7 @@ once per path with an associated item (G4). `infer/autoderef.rs:35, 53`: mem-db-
 - Test-only `from_entries` builders: their own `frame::task` (C4 to C11).
 
 > forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
+> checked by db-audit-mem (22:44): in the tree at `crates/hir-ty/src/infer.rs:1719` and `:1737` (`mem_tag = Infer`), `infer.rs:149` (`infer_query_with_inspect`'s task), `infer/persist.rs:1064` (decode's task), `infer/columns.rs:261`, `:367`, `:547`, `:1136` (`from_entries`' tasks).
 
 ## Speed
 
@@ -3778,3 +3783,5 @@ the import line 105 gains `TraitSet, TraitsInScope`. The parameter stays
 
 > forwarded to mem-db-infer-ctx (`infer/sized_bound.rs`; mem-db-infer-ctx-next2, both windows) and db (`crates/hir`; db-next3); told by tmux (requests, pass 25).
 > applied by db-mem-infer-a-small (21:50): item 1 as written (on top of `db.md`'s frontend-bodies R3, whose `in_crate_trait_value_items` loop sits between the two lines); `TraitId` back in the `hir_def::` list, `TraitSet` beside `TraitsInScope`. This replaces A13 item 3's `TraitsInScope::Inference(&traits)`. Items 2 to 4 are not mine.
+> checked by db (db-next6, 22:48), items 2 to 4: already in the tree. `hir/src/attrs.rs:563` and `hir/src/lib.rs:5954` build `TraitsInScope::Set(TraitSet::collect(..))` with the imports; `infer.rs` has no `traits_in_scope`/`block_traits` field or `get_traits_in_scope` left.
+

@@ -229,16 +229,16 @@ impl ColdBatch {
     fn new(kind: BatchKind) -> ColdBatch {
         ColdBatch {
             kind,
-            key_tags: Vec::new(),
-            keys: Vec::new(),
-            starts: Vec::new(),
-            tys: Vec::new(),
-            defaults: Vec::new(),
-            trait_ids: Vec::new(),
-            trait_args: Vec::new(),
-            predicates: Vec::new(),
+            key_tags: Vec::new(), // alloc: empty
+            keys: Vec::new(), // alloc: empty
+            starts: Vec::new(), // alloc: empty
+            tys: Vec::new(), // alloc: empty
+            defaults: Vec::new(), // alloc: empty
+            trait_ids: Vec::new(), // alloc: empty
+            trait_args: Vec::new(), // alloc: empty
+            predicates: Vec::new(), // alloc: empty
             side: ColdSide::default(),
-            table: Vec::new(),
+            table: Vec::new(), // alloc: empty
             table_root: 0,
         }
     }
@@ -255,12 +255,13 @@ impl ColdBatch {
         self.table = bytes
             .chunks_exact(size_of::<u128>())
             .map(|chunk| u128::from_le_bytes(chunk.try_into().expect("a chunk of 16 bytes")))
-            .collect();
+            .collect(); // alloc: a written batch's own column, once per crate, exact size
         self
     }
 
     fn impl_keys<V>(kind: BatchKind, batch: &Batch<'_, ImplId, V>) -> ColdBatch {
         let mut cold = ColdBatch::new(kind);
+        // alloc: a written batch's own column, once per crate, exact size
         cold.keys = batch.keys.iter().map(|&it| id_bits(it)).collect();
         cold.side = ColdSide::of(&batch.side);
         cold
@@ -273,7 +274,7 @@ impl ColdBatch {
         let mut tys = TyTableWriter::new(interner);
         let mut cold = ColdBatch::new(BatchKind::FieldTypes);
         (cold.key_tags, cold.keys) = batch.variants.iter().map(|&it| variant_key(it)).unzip();
-        cold.starts = batch.starts.to_vec();
+        cold.starts = batch.starts.to_vec(); // alloc: a written batch's own column, exact size
         cold.tys.reserve_exact(batch.fields.len());
         cold.defaults.reserve_exact(batch.fields.len());
         for field in &batch.fields {
@@ -294,6 +295,7 @@ impl ColdBatch {
     ) -> ColdBatch {
         let mut tys = TyTableWriter::new(interner);
         let mut cold = ColdBatch::impl_keys(BatchKind::ImplSelfTys, batch);
+        // alloc: a written batch's own column, once per crate, exact size
         cold.tys = batch.values.iter().map(|it| tys.ty(it.get().skip_binder())).collect();
         cold.with_table(tys)
     }
@@ -336,7 +338,7 @@ impl ColdBatch {
                 own_assoc_ty_bounds_start: it.own_assoc_ty_bounds_start,
                 has_trait_implied_predicate: u32::from(it.has_trait_implied_predicate),
             })
-            .collect();
+            .collect(); // alloc: a written batch's own column, once per crate, exact size
         cold.with_table(tys)
     }
 
@@ -706,15 +708,19 @@ fn exact<T, E>(len: usize, items: impl Iterator<Item = Result<T, E>>) -> Result<
 
 impl ColdSide {
     fn of(side: &SideTable<'_>) -> ColdSide {
+        // alloc: a written batch's own column, once per crate, pushed only for diagnostics
         let mut diagnostics = Vec::new();
         for diagnostic in &side.diagnostics {
             put_diagnostic(&mut diagnostics, diagnostic);
         }
         ColdSide {
-            rows: side.rows.to_vec(),
+            rows: side.rows.to_vec(), // alloc: a written batch's own column, exact size
+            // alloc: a written batch's own column, exact size
             diagnostics_at: side.diagnostics_at.to_vec(),
+            // alloc: a written batch's own column, exact size
             anon_consts_at: side.anon_consts_at.to_vec(),
             diagnostics,
+            // alloc: a written batch's own column, exact size
             anon_consts: side.anon_consts.iter().map(|&it| id_bits(it)).collect(),
         }
     }

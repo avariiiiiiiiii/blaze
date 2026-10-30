@@ -16,12 +16,15 @@ use hir_ty::{
     next_solver::{DbInterner, Region, Ty, TyKind},
 };
 use rustc_type_ir::inherent::IntoKind as _;
-use syntax::{AstNode as _, SyntaxNode, TextRange, ast};
+use syntax::{
+    TextRange,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
-    cx::def_range,
+    cx::def_range_view,
     lints::bodies::{
-        BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set,
+        BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set,
         types::util::{self, diagnostic_item, fn_item, from_expansion},
     },
     lower::{Found, Phase},
@@ -41,7 +44,7 @@ enum Noop {
 
 impl LatePass for NoopMethodCall {
     const LINTS: LintSet = lint_set(["noop_method_call", "suspicious_double_ref_op"]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::MethodCall]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::MethodCall]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         if let Some(found) = noop_method_call(b, expr) {
@@ -73,7 +76,7 @@ fn noop_method_call(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
     // Last of the tests: it reads the source.
     let node = util::syntax(b, expr)?;
     // clone: a node handle, a reference count, once the call is of a noop method
-    let call = ast::MethodCallExpr::cast(node.value.clone())?;
+    let call = ast::MethodCallExpr::cast(node.value)?;
     let name = call.name_ref()?;
     let call_span = b.cx.span(node.with_value(TextRange::new(
         name.syntax().text_range().start(),
@@ -152,15 +155,12 @@ fn erased<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
 /// rustc's `def_span` of an ADT: its header, from its visibility to its generics.
 fn adt_def_span(b: &BodyCx<'_, '_>, adt: AdtId) -> Span {
     let db: &Db = b.db();
-    let node: InFile<SyntaxNode> = match adt {
-        // clone: a node handle or span, for the lint's diagnostic
-        AdtId::StructId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
-        // clone: a node handle or span, for the lint's diagnostic
-        AdtId::EnumId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
-        // clone: a node handle or span, for the lint's diagnostic
-        AdtId::UnionId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
+    let node: InFile<ast::Node<'_>> = match adt {
+        AdtId::StructId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),
+        AdtId::EnumId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),
+        AdtId::UnionId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),
     };
-    b.cx.span(node.as_ref().map(def_range))
+    b.cx.span(node.map(def_range_view))
 }
 
 /// What the lint read: which method the call is on the receiver's type, and whether the type
@@ -175,7 +175,7 @@ fn facts<'db>(
     inner: Ty<'db>,
 ) {
     let Some(written) = util::syntax(b, receiver).and_then(|it| ast::Expr::cast(it.value)) else { return };
-    let Some(receiver_ty) = b.cx.sema.type_of_expr(&written) else { return };
+    let Some(receiver_ty) = b.cx.vsema.type_of_expr(written) else { return };
     let receiver_ty = receiver_ty.original;
     let printed = b.cx.ty(&receiver_ty);
     diag.fact_opt(

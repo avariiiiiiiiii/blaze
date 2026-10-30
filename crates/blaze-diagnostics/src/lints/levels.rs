@@ -34,7 +34,10 @@ use hir::{HirFileId, InFile};
 use hir_def::unstable_features::UnstableFeatures;
 use intern::Symbol;
 use rustc_hash::FxHashMap;
-use syntax::{AstNode as _, SyntaxKind, SyntaxNodePtr, TextRange, ast};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode as _},
+};
 
 pub use crate::lints::registry::Level;
 
@@ -222,8 +225,8 @@ pub(super) struct Kept<'db> {
 
 impl<'db> Kept<'db> {
     fn new(cx: &Cx<'_, 'db>, cmd: &CommandLine, cfg: &'db CfgOptions, root: HirFileId) -> Kept<'db> {
-        let registered_tools = ast::AnyHasAttrs::cast(cx.sema.parse_or_expand(root))
-            .map(|it| attrs::registered_tools(&it, cfg, cx.edition))
+        let registered_tools = ast::AnyHasAttrs::cast(cx.root(root))
+            .map(|it| attrs::registered_tools(it, cfg, cx.edition))
             .unwrap_or_default();
         Kept {
             store: Store { internal: false, registered_tools },
@@ -463,7 +466,7 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
     // unfulfilled; ranked before the test, as what the loop emits can fulfill another
     let mut expectations: Vec<_> = std::mem::take(&mut late.expectations)
         .into_iter()
-        .map(|it| ((owner_rank(&sh, &it.node), attrs::place(cx.sema, &it.node)), it))
+        .map(|it| ((owner_rank(&sh, it.node), attrs::place(&cx.vsema, it.node)), it))
         // alloc: as above
         .collect();
     expectations.sort_by(|a, b| a.0.cmp(&b.0));
@@ -497,7 +500,7 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
 /// Nothing is said of the names in the attributes: [`decide`]'s builders say it.
 pub(crate) struct LevelMap<'db> {
     kept: Kept<'db>,
-    levels: Levels,
+    levels: Levels<'db>,
 }
 
 impl<'db> LevelMap<'db> {
@@ -578,8 +581,7 @@ pub(crate) fn may_fire(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> L
     }
     for tree in &walk.trees {
         for node in tree.of_kind(|it| it == SyntaxKind::ATTR) {
-            // clone: a reference count, once per attribute
-            let Some(attr) = ast::Attr::cast(node.clone()) else { continue };
+            let Some(attr) = ast::Attr::cast(node) else { continue };
             attrs::not_allowed(attr, &store, walk.cfg, cx.edition, &mut set);
         }
     }
@@ -589,7 +591,7 @@ pub(crate) fn may_fire(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> L
 #[cfg(test)]
 mod tests {
     use hir::Semantics;
-    use syntax::AstNode;
+    use syntax::view::{AstNode as _, HasName as _};
 
     use super::*;
 
@@ -613,8 +615,8 @@ mod tests {
     fn fns(cx: &Cx<'_, '_>) -> Vec<(String, InFile<SyntaxNodePtr>)> {
         let mut out = Vec::new();
         for tree in &cx.walk().trees {
-            for node in &tree.nodes {
-                let Some(name) = ast::Fn::cast(node.clone()).and_then(|it| it.name()) else { continue };
+            for &node in &tree.nodes {
+                let Some(name) = ast::Fn::cast(node).and_then(|it| it.name()) else { continue };
                 out.push((name.text().to_owned(), tree.ptr(node)));
             }
         }
@@ -723,6 +725,54 @@ fn main() {}
                 cx.walk();
             });
         });
+    }
+
+    /// A crate of one file with `n` functions, each with two lint attributes, in modules of ten
+    /// with one of their own, under a crate-level one.
+    fn attributed_fns(n: usize) -> String {
+        let mut out = String::from("//- /main.rs crate:main edition:2021\n#![warn(missing_docs)]\n");
+        for m in 0..n.div_ceil(10) {
+            out.push_str(&format!("#[deny(unreachable_pub)]\nmod m{m} {{\n"));
+            for i in m * 10..n.min(m * 10 + 10) {
+                out.push_str(&format!(
+                    "    #[allow(dead_code)]\n    #[warn(elided_lifetimes_in_paths, unused_results)]\n    pub fn f{i}() {{}}\n"
+                ));
+            }
+            out.push_str("}\n");
+        }
+        out.push_str("fn main() {}\n");
+        out
+    }
+
+    /// The allocations of a level map made for the check of [`attributed_fns`]`(n)` with lints
+    /// on, and of the first level asked at each of its functions, when every node from one out
+    /// to the nearest seen is read for attributes.
+    fn level_map_build_allocations(n: usize) -> u64 {
+        let lint = LintId::named("unreachable_pub");
+        let mut used = 0;
+        with_cx(&attributed_fns(n), &["-W", "unused-results", "-D", "warnings"], |cx| {
+            let fns = fns(cx);
+            assert_eq!(fns.len(), n + 1, "the walk comes to every function");
+            used = blaze_alloc_count::measure(|| {
+                let mut map = LevelMap::new(cx, cx.lint_flags());
+                for (_, at) in &fns {
+                    map.level(cx, cx.lint_flags(), lint, *at);
+                }
+            })
+            .1
+            .allocations;
+        });
+        used
+    }
+
+    /// The level map's build reads each lint attribute in place: what grows with the crate is
+    /// its tables, which double, never an allocation per node or attribute.
+    #[test]
+    fn building_the_level_map_allocates_per_table_not_per_attribute() {
+        let (small, large) = (level_map_build_allocations(4), level_map_build_allocations(400));
+        // Under ten tables (the sets' columns, the node table, the kept sources), each doubling
+        // at most eight times from 4 functions to 400: one per node would be 396 more.
+        assert!(large <= small + 80, "the level map's build: {small} allocations at 4 functions, {large} at 400");
     }
 
     #[test]

@@ -1474,7 +1474,7 @@ fn written(node: Node<'_>) -> String {
     text
 }
 
-/// Where each path of a `#[derive(...)]` is: `crate::cx::derive_paths` without the text.
+/// Where each path of a `#[derive(...)]` is: `crate::cx::derive_paths_view` without the text.
 fn derive_ranges(attr: ast::Attr<'_>) -> SmallVec<[TextRange; 4]> {
     let mut ranges = SmallVec::new();
     let Some((_, tt)) = attr.as_simple_call() else { return ranges };
@@ -1493,7 +1493,7 @@ fn derive_ranges(attr: ast::Attr<'_>) -> SmallVec<[TextRange; 4]> {
     ranges
 }
 
-/// The path of the derive at `range` in `attr`, as `crate::cx::derive_paths` prints it.
+/// The path of the derive at `range` in `attr`, as `crate::cx::derive_paths_view` prints it.
 fn derive_text(attr: ast::Attr<'_>, range: TextRange) -> String {
     // alloc: only for a use that is reported
     let mut text = String::new();

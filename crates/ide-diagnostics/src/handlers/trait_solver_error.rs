@@ -14,7 +14,7 @@ pub(crate) fn trait_solver_error<'db>(
 ) -> Diagnostic {
     let ty = |ty: &hir::Type<'db>| ty.display(ctx.db(), ctx.display_target).to_string();
     let (code, message) = match &d.kind {
-        hir::TraitSolverErrorKind::GoalUnmet(goal) => match goal {
+        hir::TraitSolverErrorKind::GoalUnmet { goal, .. } => match goal {
             hir::SolverGoal::HostEffect { trait_ref, maybe_const } => (
                 DiagnosticCode::RustcHardError("E0277"),
                 format!(
@@ -37,7 +37,7 @@ pub(crate) fn trait_solver_error<'db>(
         hir::TraitSolverErrorKind::Overflow { .. } => {
             (DiagnosticCode::RustcHardError("E0275"), "overflow evaluating a requirement".to_owned())
         }
-        hir::TraitSolverErrorKind::ProjectionMismatch(_) => {
+        hir::TraitSolverErrorKind::ProjectionMismatch { .. } => {
             (DiagnosticCode::RustcHardError("E0271"), "type mismatch resolving a projection".to_owned())
         }
         hir::TraitSolverErrorKind::TypesDiffer { expected, found } => (

@@ -68,6 +68,10 @@ where
         revision: crate::Revision,
     ) -> VerifyResult {
         let data = <super::IngredientImpl<C>>::data_raw(zalsa.table(), input);
+        // SAFETY: `Table::get_raw` panics unless `input`'s page holds `Value<C>`s and its slot
+        // is allocated, so `data` points at an initialized value; slots are never freed while
+        // `zalsa` borrows the table. Only `revisions` is read, a `[AtomicRevision; N]` read by
+        // `load`, so a concurrent update of the struct in place does not race this read.
         let field_changed_at = unsafe { (&(*data).revisions)[self.field_index].load() };
         VerifyResult::changed_if(field_changed_at > revision)
     }
@@ -109,6 +113,10 @@ where
 
     fn jar_kind(&self) -> JarKind {
         JarKind::Struct
+    }
+
+    fn read_kind(&self) -> crate::ingredient::ReadKind {
+        crate::ingredient::ReadKind::TrackedStruct
     }
 
     fn memo_table_types(&self) -> &Arc<MemoTableTypes> {

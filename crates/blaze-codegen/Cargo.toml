@@ -16,6 +16,7 @@ doctest = false
 [dependencies]
 blaze-cas.workspace = true
 blaze-format.workspace = true
+blaze-hashcons.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true

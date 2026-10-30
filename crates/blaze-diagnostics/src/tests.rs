@@ -6,7 +6,7 @@ mod check;
 mod db;
 mod emit;
 mod items;
-mod lints;
+pub(crate) mod lints;
 
 use std::collections::HashMap;
 

@@ -135,4 +135,8 @@ impl Glue for X64 {
         let _ = frame;
         (frame::DWARF_R12, 0)
     }
+
+    fn frame_size(frame: &Frame) -> u32 {
+        frame.total()
+    }
 }

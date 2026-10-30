@@ -30,6 +30,7 @@ pub mod blob;
 pub mod content;
 pub mod dedupe;
 pub mod driver;
+pub mod exec;
 pub mod fold;
 pub mod imports;
 #[allow(unsafe_code)]
@@ -40,8 +41,11 @@ pub mod relocs;
 pub mod settings;
 pub mod summary;
 pub mod template;
+pub mod wasm;
 pub mod unwind;
 
+pub use driver::Owner;
+pub use exec::ExecTable;
 pub use relocs::{Reloc, Relocation, Relocs, RelocsView};
 
 /// A function instance: what is compiled.
@@ -82,6 +86,9 @@ pub enum Backend {
     /// build-time code), which is compiled once; else `opt_level=none`.
     Cranelift { speed: bool },
     Llvm { opt: u8 },
+    /// Copy-and-patch (`blaze-stencil`): tier 0 of a tiered dev or test run
+    /// (docs/v2/plan/lanes/fastcompile/stencil.md).
+    Stencil,
 }
 
 impl Backend {
@@ -132,7 +139,72 @@ pub struct CompiledFunction {
     pub lines: Vec<Line>,
     /// What SanitizerCoverage made for it ([`crate::settings::Coverage`]): `None` without.
     pub coverage: Option<Covered>,
+    /// What PGO made of it ([`crate::settings::Pgo`]): `None` built without.
+    pub profile: Option<Profiled>,
 }
+
+/// What PGO made of one function.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Profiled {
+    /// Instrumented (`Pgo::Generate`): its record, from which the link writes the program's
+    /// `__llvm_prf_data`, `__llvm_prf_names` and `__llvm_prf_cnts`. Its code counts into its
+    /// own counters ([`Target::ProfileCounters`]).
+    Counted(ProfileRecord),
+    /// Built with a profile (`Pgo::Use`). `mismatched`: the profile has a record under its
+    /// name with another control flow hash (it was edited since), so none of its counts
+    /// applied; the build's summary counts these ([`crate::driver::Stats::profile_mismatched`]).
+    Used { mismatched: bool },
+}
+
+impl Profiled {
+    pub fn counted(&self) -> Option<&ProfileRecord> {
+        match self {
+            Profiled::Counted(record) => Some(record),
+            Profiled::Used { .. } => None,
+        }
+    }
+
+    pub fn mismatched(&self) -> bool {
+        matches!(self, Profiled::Used { mismatched: true })
+    }
+}
+
+/// LLVM's PGO record of an instrumented function (`__profd_`), as LLVM's raw profile has it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ProfileRecord {
+    /// The name its counts are kept under, as its bytes: [`profile_name`] of them.
+    pub name: [u8; 16],
+    /// The record's `NameRef`, the low 64 bits of the name's MD5.
+    pub name_ref: u64,
+    /// The record's `FuncHash`, its control flow's hash.
+    pub hash: u64,
+    /// Its 8-byte counters, which start zeroed: the record's `NumCounters`.
+    pub counters: u32,
+    /// `__llvm_profile_raw_version`: one value for a build.
+    pub version: u64,
+}
+
+impl ProfileRecord {
+    /// The name its counts are kept under, for `__llvm_prf_names`.
+    pub fn name(&self) -> String {
+        profile_name(&self.name)
+    }
+}
+
+/// The name a function's PGO counts are kept under: `blaze.pgo.` and `name` in lowercase hex.
+pub fn profile_name(name: &[u8; 16]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    // alloc: once per function built with PGO, or an instrumented one the link names
+    let mut out = String::with_capacity(PROFILE_NAME_PREFIX.len() + 32);
+    out.push_str(PROFILE_NAME_PREFIX);
+    for byte in name {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 15)] as char);
+    }
+    out
+}
+
+pub const PROFILE_NAME_PREFIX: &str = "blaze.pgo.";
 
 /// What LLVM's SanitizerCoverage made for one function: its arrays, which start zeroed and
 /// which the link gathers with every other function's into one section each, in one order,
@@ -177,7 +249,8 @@ pub enum Unwind {
         /// Its language-specific data area: one of the function's `data`, by id.
         lsda: Option<ContentId>,
     },
-    /// Windows x64: the `UNWIND_INFO` bytes without the handler, and the handler and its data.
+    /// Windows: x64's `UNWIND_INFO` or ARM64's `.xdata` record (header, then unwind codes),
+    /// without the handler; and the handler and its data.
     Windows { info: Vec<u8>, handler: Option<Target>, lsda: Option<ContentId> },
 }
 
@@ -198,6 +271,10 @@ pub struct Static {
     pub thread_local: bool,
     /// `#[link_section]`, as written.
     pub section: Option<String>,
+    /// On wasm, what each `Target::Extern` its relocations name is imported as when nothing
+    /// defines it (a pointer to a `#[link(wasm_import_module)]` function), by the extern's
+    /// name; empty elsewhere.
+    pub imports: Vec<(String, wasm::Import)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -296,6 +373,16 @@ pub enum Target {
     /// counters, 1 its flags, 2 its guards; the relocation's addend is into it. A function
     /// names no other's, and nothing else names one.
     Coverage(u32),
+    /// The function's own two tier-up counter cells (`blaze_stencil::tier`: 16 bytes,
+    /// 8-aligned, zeroed): its calls at addend 0, its back edges at 8. Written by its own
+    /// code, read by the daemon, placed writable by the linker one pair per instance and
+    /// never merged. The key is the function's own: a function names no other's cells, and
+    /// nothing but a function names any.
+    Counter(InstanceKey),
+    /// The function's own PGO counters ([`ProfileRecord::counters`] of its
+    /// [`Profiled::Counted`], 8 bytes each, zeroed): one array a function, so no index; the
+    /// relocation's addend is into it. A function names no other's, and nothing else names one.
+    ProfileCounters,
 }
 
 /// A native library a crate links against: a `#[link(..)]` of one of its `extern` blocks, a

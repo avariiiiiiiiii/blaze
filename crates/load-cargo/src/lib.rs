@@ -54,6 +54,12 @@ pub fn is_const_macros(path: &AbsPath) -> bool {
     path.extension() == Some("rs")
 }
 
+/// Sets `path`'s contents in `vfs`, a new path numbered by base-db ([`Db::new_file_id`]): the
+/// VFS's own dense numbering would give a reload's first new path a crate attribute's file.
+fn set_file(vfs: &mut vfs::Vfs, db: &mut Db, path: VfsPath, contents: Option<Vec<u8>>) -> bool {
+    vfs.set_file_contents_with(path, contents, || db.new_file_id().expect("base-db has no file ID left"))
+}
+
 #[derive(Debug)]
 pub struct LoadCargoConfig {
     pub load_out_dirs_from_check: bool,
@@ -202,7 +208,7 @@ impl Loaded {
             if let Some(dir) = ws.const_ast_dir() {
                 for (name, text) in ide_db::const_macro::CONST_AST {
                     let path = vfs::VfsPath::from(dir.join(name));
-                    vfs.set_file_contents(path, Some(text.as_bytes().to_vec()));
+                    set_file(vfs, db, path, Some(text.as_bytes().to_vec()));
                 }
             }
             let (other, mut paths) = ws.to_crate_graph(
@@ -212,7 +218,7 @@ impl Loaded {
                         return (excluded == vfs::FileExcluded::No).then_some(file_id);
                     }
                     let contents = loader.load_sync(path.as_path()?);
-                    vfs.set_file_contents(path.clone(), contents);
+                    set_file(vfs, db, path.clone(), contents);
                     vfs.file_id(&path).and_then(|(file_id, excluded)| {
                         (excluded == vfs::FileExcluded::No).then_some(file_id)
                     })
@@ -429,7 +435,7 @@ impl Loaded {
                 vfs::loader::Message::Loaded { files }
                 | vfs::loader::Message::Changed { files } => {
                     for (path, contents) in files {
-                        vfs.set_file_contents(path.into(), contents);
+                        set_file(vfs, db, path.into(), contents);
                     }
                 }
             }
@@ -1313,5 +1319,57 @@ mod tests {
         vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(1), SourceRootId(0)),])
+    }
+
+    /// The files a load set before a graph with `-Z crate-attr`, then the file a reload adds
+    /// after it: the reload's file is set in the database, not refused as an attribute's.
+    #[test]
+    fn a_reload_after_a_graph_with_crate_attrs_sets_its_new_file() {
+        use ide_db::base_db::{CrateOrigin, CrateWorkspaceData, Env, TargetKind};
+
+        let mut db = Db::for_tests();
+        let mut vfs = vfs::Vfs::default();
+        let lib = VfsPath::new_virtual_path("/ws/src/lib.rs".to_owned());
+        assert!(set_file(&mut vfs, &mut db, lib.clone(), Some(b"".to_vec())));
+        let (lib_id, _) = vfs.file_id(&lib).expect("the library's file");
+        db.set_file_text_with_durability(lib_id, "", Durability::LOW);
+        db.set_file_source_root_with_durability(lib_id, SourceRootId(0), Durability::MEDIUM);
+        let mut set = vfs::file_set::FileSet::default();
+        set.insert(lib_id, lib);
+        db.set_source_root_with_durability(
+            SourceRootId(0),
+            triomphe::Arc::new(SourceRoot::new_local(set)),
+            Durability::MEDIUM,
+        );
+
+        let mut graph = CrateGraphBuilder::default();
+        let a = graph.add_crate_root(
+            lib_id,
+            span::Edition::Edition2021,
+            None,
+            None,
+            cfg::CfgOptions::default(),
+            None,
+            Env::default(),
+            CrateOrigin::Local { repo: None, name: None },
+            vec!["no_std".to_owned(), "feature(x)".to_owned()],
+            TargetKind::Lib { is_proc_macro: false },
+            triomphe::Arc::new(AbsPathBuf::assert_utf8(std::env::temp_dir())),
+            triomphe::Arc::new(CrateWorkspaceData {
+                target: Err("no target in tests".into()),
+                toolchain: None,
+                const_eval: Default::default(),
+            }),
+        );
+        let a = graph.set_in_db(&mut db)[&a];
+        let attrs = a.crate_attr_files(&db).to_vec();
+        assert_eq!(attrs.len(), 2);
+
+        let added = VfsPath::new_virtual_path("/ws/src/more.rs".to_owned());
+        assert!(set_file(&mut vfs, &mut db, added.clone(), Some(b"fn f() {}".to_vec())));
+        let (added_id, _) = vfs.file_id(&added).expect("the added file");
+        assert!(added_id != lib_id && !attrs.contains(&added_id), "{added_id:?} is taken");
+        db.set_file_text(added_id, "fn f() {}");
+        assert_eq!(a.crate_attr_files(&db), attrs);
     }
 }

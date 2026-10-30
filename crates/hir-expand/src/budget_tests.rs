@@ -5,7 +5,10 @@
 
 use intern::Symbol;
 use span::{Edition, EditionedFileId, ErasedFileAstId, FileId, Span, SpanAnchor, SyntaxContext};
-use syntax::{AstNode, SourceFile, TextRange, TextSize, ast};
+use syntax::{
+    SourceFile, TextRange, TextSize,
+    view::{self, AstNode as _},
+};
 use syntax_bridge::DocCommentDesugarMode;
 
 use crate::{
@@ -103,12 +106,12 @@ fn span_lookups_allocate_nothing() {
 fn an_argument_costs_a_constant_number_of_allocations() {
     let used = |tokens: usize| {
         let text = format!("m!({});", "a + 1, ".repeat(tokens / 4));
-        let file = SourceFile::parse(&text, Edition::CURRENT).tree();
-        let arg = file.syntax().descendants().find_map(ast::TokenTree::cast).expect("the argument");
+        let parse = SourceFile::parse(&text, Edition::CURRENT);
+        let arg = parse.root().descendants().find_map(view::TokenTree::cast).expect("the argument");
         let map = RealSpanMap::absolute(EditionedFileId::new(FileId::from_raw(7), Edition::CURRENT));
         let at = span(TextRange::empty(TextSize::new(0)));
         let run = || {
-            syntax_bridge::syntax_node_to_token_tree(
+            syntax_bridge::call_input(
                 arg.syntax(),
                 InOrder::new(SpanMap::RealSpanMap(&map)),
                 at,
@@ -189,5 +192,28 @@ fn the_tokens_before_a_semicolon_are_framed() {
             .expect("ends in `;`");
         assert_eq!(before.token_trees().len(), 3);
         assert_eq!(semicolon, span(TextRange::empty(TextSize::new(0))));
+    });
+}
+
+/// `concat!` of literals, warm: the text is the worker's string and the expansion the frame's;
+/// the literal's symbol exists after the first run.
+#[test]
+fn concat_is_framed() {
+    let call = span(TextRange::empty(TextSize::new(0)));
+    let tt = syntax_bridge::parse_to_token_tree_static_span(
+        Edition::CURRENT,
+        call,
+        r#""a", 1, 'b', true"#,
+    )
+    .expect("tokens");
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        let warm = crate::builtin::concat_of_literals_in(frame, &tt, call);
+        assert!(warm.err.is_none());
+        let again = blaze_alloc_count::assert_at_most(0, "a warm `concat!`", || {
+            crate::builtin::concat_of_literals_in(frame, &tt, call)
+        });
+        assert!(again.err.is_none());
+        assert!(again.value.view() == warm.value.view());
+        assert_eq!(again.value.to_string(), r#""a1btrue""#);
     });
 }

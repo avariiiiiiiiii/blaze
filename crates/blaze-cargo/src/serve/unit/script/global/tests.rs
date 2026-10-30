@@ -190,6 +190,9 @@ fn only_a_crates_io_package_with_a_checksum_has_a_public_origin() {
         manifest_path: "/reg/serde-1.0.219/Cargo.toml".into(),
         source: source.map(str::to_owned),
         is_member,
+        default_run: None,
+        checksum: None,
+        tests: blaze_units::query::TestSandbox::default(),
     };
     assert_eq!(origin(&package(false, None), Some([3; 32])), Some(serde()));
     assert_eq!(origin(&package(false, None), None), None);

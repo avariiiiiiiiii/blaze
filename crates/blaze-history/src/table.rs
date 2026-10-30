@@ -4,10 +4,11 @@
 //!
 //! **Layout.** A record is 64 bytes, one cache line, in buckets of [`WAYS`]. A key's bucket is
 //! its own first eight bytes (it is a content hash already) mixed with its kind and masked, so
-//! a lookup hashes nothing and reads one bucket up to its first empty way: at most four lines,
-//! two of the pairs that arm64 and x86 prefetch together, and one for a key never seen in a
-//! bucket with room. A bucket fills from its first way and never empties one (bytes read back
-//! with a gap are refused). A bucket that is full when a new key comes drops its oldest record by
+//! a lookup hashes nothing and reads one bucket: four lines, two of the pairs that arm64 and
+//! x86 prefetch together, loaded at once. The writer compares every way with no branch on what
+//! it holds, so where a key sits costs no misprediction; a reader stops at the first empty way.
+//! A bucket fills from its first way and never empties one (bytes read back with a gap are
+//! refused). A bucket that is full when a new key comes drops its oldest record by
 //! the writer's clock (a count of observations, not time), so the table holds the keys seen
 //! most lately, never more than its fixed size, and the same observations leave the same
 //! records in the same slots.
@@ -181,6 +182,16 @@ impl Slot {
         self.seq.store(seq.wrapping_add(2), Release);
     }
 
+    /// Whether it holds `kind`'s `key`, as the writer reads it: its kind, seen count and key
+    /// compared with no branch between them.
+    fn holds(&self, kind: TaskKind, key: [u64; 2]) -> bool {
+        let head = self.words[0].load(Relaxed);
+        (head as u32 != 0)
+            & (head >> 32 == u64::from(kind.0))
+            & (self.words[2].load(Relaxed) == key[0])
+            & (self.words[3].load(Relaxed) == key[1])
+    }
+
     /// Puts `record` in it with plain stores and no fence: no reader shares it.
     fn set(&mut self, record: &Record) {
         for (word, value) in self.words.iter_mut().zip(pack(record)) {
@@ -246,6 +257,34 @@ impl Table {
         }
         None
     }
+
+    /// Where `kind`'s `key` is or goes, for the writer, whose loads no write races: every way
+    /// of its bucket read and compared with no branch on what it holds, so the way a key sits in
+    /// costs no misprediction. The way holding its record, else the first empty way, else the
+    /// way seen longest ago.
+    fn way(&self, kind: TaskKind, key: [u64; 2]) -> Way {
+        let first = self.bucket(kind, key);
+        let (mut hit, mut empty, mut oldest, mut oldest_at) = (WAYS, WAYS, u64::MAX, 0);
+        for (at, slot) in self.slots[first..first + WAYS].iter().enumerate().rev() {
+            let seen = slot.words[0].load(Relaxed) as u32 != 0;
+            let stamp = slot.words[1].load(Relaxed);
+            hit = if slot.holds(kind, key) { at } else { hit };
+            empty = if seen { empty } else { at };
+            (oldest, oldest_at) = if seen & (stamp < oldest) { (stamp, at) } else { (oldest, oldest_at) };
+        }
+        let held = hit < WAYS;
+        let at = if held { hit } else if empty < WAYS { empty } else { oldest_at };
+        Way { at: first + at, held, evicts: !held & (empty == WAYS) }
+    }
+}
+
+/// Where [`Table::way`] puts a key.
+struct Way {
+    at: usize,
+    /// Whether the slot holds the key's record.
+    held: bool,
+    /// Whether a new record there drops another key's.
+    evicts: bool,
 }
 
 /// The one writer of a table: it observes runs, and gives [`Reader`]s to other threads.
@@ -288,7 +327,14 @@ impl Writer {
 
     /// The record of `kind`'s `key`, if the table holds it.
     pub fn get(&self, kind: TaskKind, key: &Key) -> Option<Record> {
-        self.table.find(kind, halves(key), Slot::peek).map(|it| it.1)
+        let key = halves(key);
+        let first = self.table.bucket(kind, key);
+        let ways = &self.table.slots[first..first + WAYS];
+        let mut hit = WAYS;
+        for (at, slot) in ways.iter().enumerate() {
+            hit = if slot.holds(kind, key) { at } else { hit };
+        }
+        ways.get(hit).and_then(Slot::peek)
     }
 
     /// A run of `kind`'s `key` took `ran_us` and held `peak` bytes at most: its record learns
@@ -297,29 +343,17 @@ impl Writer {
         self.clock += 1;
         let stamp = self.clock;
         let key = halves(key);
-        let first = self.table.bucket(kind, key);
-        let mut free = None;
-        let (mut oldest, mut oldest_at) = (u64::MAX, first);
-        for at in first..first + WAYS {
-            match self.table.slots[at].peek() {
-                Some(mut record) if record.kind == kind && record.key == key => {
-                    record.observe(stamp, ran_us, peak);
-                    self.table.slots[at].write(&record);
-                    return;
-                }
-                Some(record) if record.stamp < oldest => (oldest, oldest_at) = (record.stamp, at),
-                Some(_) => {}
-                None => {
-                    free = Some(at);
-                    break;
-                }
+        let way = self.table.way(kind, key);
+        let slot = &self.table.slots[way.at];
+        let record = match slot.peek().filter(|_| way.held) {
+            Some(mut record) => {
+                record.observe(stamp, ran_us, peak);
+                record
             }
-        }
-        let at = free.unwrap_or_else(|| {
-            self.evicted += 1;
-            oldest_at
-        });
-        self.table.slots[at].write(&Record::first(kind, key, stamp, ran_us, peak));
+            None => Record::first(kind, key, stamp, ran_us, peak),
+        };
+        self.evicted += u64::from(way.evicts);
+        slot.write(&record);
     }
 
     /// Every record and its slot, in slot order.

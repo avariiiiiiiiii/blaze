@@ -1,7 +1,7 @@
-//! Memory: what a process holds and the machine has on macOS, and jemalloc's controls that
-//! its safe API (`tikv_jemalloc_ctl`'s `Access`) does not reach: a purge, which takes no
-//! value, and a profile dump, whose safe form takes only a `&'static` path (one leaked per
-//! dump).
+//! Memory: what a process holds and the machine has on macOS, the allocator's purge, and,
+//! under `heap-profile`, jemalloc's controls that its safe API (`tikv_jemalloc_ctl`'s
+//! `Access`) does not reach: a purge, which takes no value, and a profile dump, whose safe
+//! form takes only a `&'static` path (one leaked per dump).
 
 /// Bytes of memory a process of this user owns: its physical footprint, which is what
 /// Activity Monitor shows, and which still counts pages macOS has compressed.
@@ -40,9 +40,18 @@ pub fn machine_bytes() -> Option<u64> {
     (ok == 0 && bytes != 0).then_some(bytes)
 }
 
+/// Gives the system back the pages of what was freed, which the allocator keeps to reuse
+/// otherwise.
+#[cfg(not(feature = "heap-profile"))]
+pub fn purge_freed_pages() {
+    // SAFETY: `mi_collect` reads and writes no memory of the caller's, and may be called from
+    // any thread at any time.
+    unsafe { libmimalloc_sys::mi_collect(true) };
+}
+
 /// Gives the system back the pages of what was freed, which jemalloc keeps for ten seconds
 /// to reuse otherwise.
-#[cfg(unix)]
+#[cfg(feature = "heap-profile")]
 pub fn purge_freed_pages() {
     use std::ptr::null_mut;
     // SAFETY: the name is a C string, and `arena.<i>.purge` reads and writes no value, which
@@ -86,7 +95,6 @@ mod tests {
         assert!(super::machine_bytes().is_some_and(|it| it > held.unwrap()));
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_purge_leaves_what_is_live() {
         let kept = vec![7u8; 1 << 20];

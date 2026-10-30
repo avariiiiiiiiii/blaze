@@ -97,9 +97,9 @@ impl Fetcher {
     pub fn new(count: u32, workers: u32) -> Fetcher {
         let count = count as usize;
         Fetcher {
-            state: vec![State::Lazy; count],
-            priority: vec![Priority::Idle; count],
-            target: vec![0; count],
+            state: vec![State::Lazy; count], // alloc: setup, a column per run
+            priority: vec![Priority::Idle; count], // alloc: setup, a column per run
+            target: vec![0; count], // alloc: setup, a column per run
             queues: Default::default(),
             waiters: FxHashMap::default(),
             failures: FxHashMap::default(),
@@ -123,9 +123,10 @@ impl Fetcher {
     /// An ask for `lazy` (as the frame said, unchecked) from `to`.
     pub fn ask(&mut self, to: Waiter, lazy: u32, out: &mut Vec<Action>) {
         let Some(state) = self.state.get(lazy as usize).copied() else {
-            let why: Arc<str> =
-                format!("the run asked for lazy function {lazy}, and it has {}", self.state.len()).into();
-            out.push(Action::Answer { to, lazy, outcome: Outcome::Failed(why.clone()) });
+            let len = self.state.len();
+            // alloc: the run's end.
+            let why: Arc<str> = format!("the run asked for lazy function {lazy}, and it has {len}").into();
+            out.push(Action::Answer { to, lazy, outcome: Outcome::Failed(why.clone()) }); // clone: an Arc, the run's end
             out.push(Action::Stop { lazy, why });
             return;
         };
@@ -134,8 +135,8 @@ impl Fetcher {
                 out.push(Action::Answer { to, lazy, outcome: Outcome::Ready(self.target[lazy as usize]) });
             }
             State::Failed => {
-                let why = self.failures[&lazy].clone();
-                out.push(Action::Answer { to, lazy, outcome: Outcome::Failed(why.clone()) });
+                let why = self.failures[&lazy].clone(); // clone: an Arc, the run's end
+                out.push(Action::Answer { to, lazy, outcome: Outcome::Failed(why.clone()) }); // clone: likewise
                 if self.stopped.insert(lazy) {
                     out.push(Action::Stop { lazy, why });
                 }
@@ -152,10 +153,11 @@ impl Fetcher {
         }
     }
 
-    /// Queues `id` at `priority`, or moves it up to it; nothing for one compiling or done.
-    pub fn want(&mut self, id: LazyId, priority: Priority) {
+    /// Queues `id` at `priority`, or moves it up to it; nothing for one compiling or done, or
+    /// queued at `priority` or above. Whether it was queued.
+    pub fn want(&mut self, id: LazyId, priority: Priority) -> bool {
         let at = id.index();
-        let Some(state) = self.state.get(at).copied() else { return };
+        let Some(state) = self.state.get(at).copied() else { return false };
         let queue = match state {
             State::Lazy => true,
             State::Queued => priority < self.priority[at],
@@ -166,6 +168,7 @@ impl Fetcher {
             self.priority[at] = priority;
             self.queues[priority as usize].push_back(id);
         }
+        queue
     }
 
     /// The next compile to start, if one is queued and a worker may take it. A function
@@ -194,6 +197,21 @@ impl Fetcher {
         None
     }
 
+    /// Starts `id`'s compile out of turn, for an asker its caller answers itself once
+    /// [`Fetcher::done`] ends it (with [`Fetcher::ask`], which then answers at once): whether
+    /// it was not started yet. It counts as an asked compile running.
+    pub fn start(&mut self, id: LazyId) -> bool {
+        let at = id.index();
+        if !matches!(self.state.get(at), Some(State::Lazy | State::Queued)) {
+            return false;
+        }
+        self.state[at] = State::Compiling;
+        self.priority[at] = Priority::Asked;
+        self.running += 1;
+        self.compiles += 1;
+        true
+    }
+
     /// The end of `id`'s compile: published at the target, or failed for this reason. Its
     /// waiters are answered; a failure someone waits for stops the run.
     pub fn done(&mut self, id: LazyId, result: Result<u64, &str>, out: &mut Vec<Action>) {
@@ -217,9 +235,10 @@ impl Fetcher {
             Err(why) => {
                 self.state[at] = State::Failed;
                 let why: Arc<str> = why.into();
-                self.failures.insert(id.0, why.clone());
+                self.failures.insert(id.0, why.clone()); // clone: an Arc, a failure
                 if !waiting.is_empty() {
                     for to in waiting {
+                        // clone: an Arc per asker of a failure.
                         out.push(Action::Answer { to, lazy: id.0, outcome: Outcome::Failed(why.clone()) });
                     }
                     self.stopped.insert(id.0);
@@ -258,7 +277,7 @@ impl Fetcher {
 
     /// The functions whose compile failed, by id, with why.
     pub fn failures(&self) -> impl Iterator<Item = (LazyId, &str)> {
-        let mut ids: Vec<u32> = self.failures.keys().copied().collect();
+        let mut ids: Vec<u32> = self.failures.keys().copied().collect(); // alloc: the close's report
         radix::sort(&mut ids);
         ids.into_iter().map(|id| (LazyId(id), &*self.failures[&id]))
     }

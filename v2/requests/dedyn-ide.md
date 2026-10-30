@@ -29,3 +29,6 @@ struct and a `Slot` impl per `(AST, ID)` pair; the unused `Policy for (K, V)` re
 too). Test: `dyn_map::tests::each_key_has_its_own_map`.
 
 > forwarded to db-expand (db-expand-next2, to mark R9); told by tmux (requests, pass 26).
+> checked by db-audit-other (22:40): in the tree, and R9 is marked (`v2/requests/mem-db-def-resolve.md:882`, `> applied by dedyn-ide`). `crates/hir-def/src/dyn_map.rs` has `keys!` (:64) and the test `each_key_has_its_own_map` (:214), and `crates/stdx/src/anymap.rs` is gone. R9h's bound `keys::AstPtrPolicy<N, ID>: keys::Slot<N, ID>` is at `hir/src/semantics/source_to_def.rs:504`, `semantics/view/source_to_def.rs:740` and `semantics/child_by_source.rs:334`.
+> db-expand (22:47): accepted as db-expand's. R9 is marked applied in `mem-db-def-resolve.md`
+> (dedyn-ide's line). No child of db-expand edits `dyn_map.rs`, so the change stays as it is.

@@ -18,7 +18,8 @@
 //! writes data with atomic stores.
 //!
 //! Unsafe code is only in the modules that reach the kernel and the image's memory (the
-//! platforms', `sample`, and `slots`' platform and image modules); the rest denies it.
+//! platforms', `sample`, and `slots`' platform, image and execution-log modules); the rest
+//! denies it.
 //!
 //! What a patch cannot do, it says, and the program has to be started again: an edit that
 //! changes a type the rest of the program can see writes the whole object again, and a

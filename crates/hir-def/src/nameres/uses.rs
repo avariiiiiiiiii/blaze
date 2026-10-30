@@ -25,7 +25,10 @@ use hir_expand::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::Edition;
-use syntax::{AstNode, ast};
+use syntax::{
+    ast,
+    view::{self, AstNode as _},
+};
 
 use crate::{
     AdtId, AssocItemId, AstId, ExpressionStoreOwnerId, ExternCrateId, FxIndexMap, GenericDefId,
@@ -572,8 +575,8 @@ impl<'db> Walk<'db> {
             }
         }
         for &(ast_id, call) in macro_calls {
-            let ast::Item::MacroCall(node) = ast_id.to_node(self.db) else { continue };
-            self.macro_call(&resolver, ast_id.file_id, &node, call);
+            let view::Item::MacroCall(node) = ast_id.to_view(self.db) else { continue };
+            self.macro_call(&resolver, ast_id.file_id, node, call);
         }
     }
 
@@ -621,19 +624,18 @@ impl<'db> Walk<'db> {
             resolver.record_path_uses(db, path, Namespace::Types, hygiene, out);
         }
         for (ptr, call) in source_map.macro_calls() {
-            let root = ptr.file_id.parse_or_expand(db);
-            let node = ptr.value.to_node(&root);
+            let node = ptr.value.to_view(ptr.file_id.root(db));
             let scope = node
                 .syntax()
                 .parent()
-                .and_then(ast::MacroExpr::cast)
-                .and_then(|it| source_map.macro_expansion_expr(InFile::new(ptr.file_id, &it)))
+                .and_then(view::MacroExpr::cast)
+                .and_then(|it| source_map.macro_expansion_expr_view(InFile::new(ptr.file_id, it)))
                 .and_then(|it| match it {
                     ExprOrPatId::ExprId(expr) => scopes.scope_for(expr),
                     ExprOrPatId::PatId(pat) => within.pat(pat),
                 });
             let resolver = resolver_at(&mut resolvers, db, owner, scope);
-            self.macro_call(resolver, ptr.file_id, &node, call);
+            self.macro_call(resolver, ptr.file_id, node, call);
         }
     }
 
@@ -644,7 +646,7 @@ impl<'db> Walk<'db> {
         &mut self,
         resolver: &Resolver<'db>,
         file: HirFileId,
-        node: &ast::MacroCall,
+        node: view::MacroCall<'_>,
         call: MacroCallId,
     ) {
         let db = self.db;
@@ -653,7 +655,7 @@ impl<'db> Walk<'db> {
         let Some(ast_path) = node.path() else { return };
         let span_map = file.span_map(db);
         let Some(path) =
-            ModPath::from_src(db, ast_path, &mut |range| span_map.span_for_range(range).ctx)
+            ModPath::from_src_view(db, ast_path, &mut |range| span_map.span_for_range(range).ctx)
         else {
             return;
         };

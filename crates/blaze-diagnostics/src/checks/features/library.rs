@@ -59,7 +59,7 @@ const STABLE_FEATURES: LintId = LintId::named("stable_features");
 
 /// `check_unused_or_stable_features` of the crate: its diagnostics in rustc's order, each at
 /// `Phase::Items`, the lints at the crate root.
-pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> Vec<Found> {
+pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) -> Vec<Found> {
     // alloc: empty, allocates nothing
     let Some(root) = owners.iter().find(|it| it.target == Target::Crate) else { return Vec::new() };
     let lint_at = root.at();
@@ -521,7 +521,7 @@ fn is_definition(target: Target) -> bool {
 
 /// The library features of a staged crate's attributes (`lib_features`) with the implications
 /// of its definitions; with `errors`, the crate's E0711s, as rustc collects its own.
-fn collect(owners: &[Owner], mut errors: Option<(&Cx<'_, '_>, &mut Vec<Found>)>) -> Library {
+fn collect(owners: &[Owner<'_>], mut errors: Option<(&Cx<'_, '_>, &mut Vec<Found>)>) -> Library {
     let mut library = Library::default();
     for owner in owners {
         if owner.target == Target::MacroCall {
@@ -586,7 +586,7 @@ fn collect(owners: &[Owner], mut errors: Option<(&Cx<'_, '_>, &mut Vec<Found>)>)
 
 /// What the stability parsers make of `owner`'s attributes, in the order rustc's parsed
 /// attributes are in.
-fn declared(owner: &Owner) -> SmallVec<[Declared; 3]> {
+fn declared(owner: &Owner<'_>) -> SmallVec<[Declared; 3]> {
     let mut groups: SmallVec<[(usize, Group, Option<Declared>); 3]> = SmallVec::new();
     for (index, attr) in owner.attrs.iter().enumerate() {
         let Some(meta) = attr.meta() else { continue };
@@ -694,19 +694,11 @@ fn removed(attr: &Attr<'_>) -> Option<Removed> {
     Some(Removed { feature, reason, link, since: version(&since?)? })
 }
 
-/// `parse_version`, printed as `RustcVersion` prints: `major.minor[.patch]`, no `-` suffix.
+/// `parse_version`, printed as `RustcVersion` prints: `major.minor.patch`.
 fn version(text: &str) -> Option<String> {
-    let mut parts = text.split('-');
-    let digits = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let mut digits = digits.splitn(3, '.');
-    let major: u16 = digits.next()?.parse().ok()?;
-    let minor: u16 = digits.next()?.parse().ok()?;
-    let patch: u16 = digits.next().unwrap_or("0").parse().ok()?;
+    let it = hir_def::attrs::stability::RustcVersion::parse(text)?;
     // alloc: the library's table, as above
-    Some(format!("{major}.{minor}.{patch}"))
+    Some(format!("{}.{}.{}", it.major, it.minor, it.patch))
 }
 
 /// An attribute's `key = "value"` items, in order; `None` when one is anything else (rustc's

@@ -89,6 +89,7 @@ struct Raw {
     listen: Tag,
     next: u64,
     conns: Vec<(Conn, Vec<u8>, Tag)>,
+    accepted: usize,
     requests: Vec<(String, Vec<u8>)>,
     answer: Box<dyn FnMut(&str, &[u8]) -> Reply>,
 }
@@ -103,6 +104,7 @@ impl Raw {
         let Completion { tag, done } = completion;
         if tag == self.listen {
             let Done::Accepted { conn } = done else { panic!("the raw listen ended: {done:?}") };
+            self.accepted += 1;
             let recv = self.tag();
             effects.push(Effect::Recv { conn, most: 1 << 24, into: Vec::new(), tag: recv });
             self.conns.push((conn, Vec::new(), recv));
@@ -195,7 +197,8 @@ impl World {
         let mut world = World::bare(seed);
         let listen = Tag(RAW);
         world.effects.push(Effect::Listen { at: at(), tag: listen });
-        world.raw = Some(Raw { listen, next: 0, conns: Vec::new(), requests: Vec::new(), answer: Box::new(answer) });
+        world.raw =
+            Some(Raw { listen, next: 0, conns: Vec::new(), accepted: 0, requests: Vec::new(), answer: Box::new(answer) });
         world
     }
 
@@ -373,6 +376,26 @@ fn fetches_are_batched_and_pipelined() {
 }
 
 #[test]
+fn a_large_fetch_opens_its_connections_together_and_spreads_over_them() {
+    let mut world = World::raw(18, |_, body| {
+        let keys = wire::parse_fetch_ask(body).unwrap();
+        let items: Vec<(Key, Item)> = keys.into_iter().map(|key| (key, Item::Missing)).collect();
+        send(response(200, &fetch_answer(&items)))
+    });
+    let count = (client::BATCH_KEYS * client::PIPELINE * 3) as u64;
+    let asked: Vec<Public> = (0..count).map(|n| public(key(n), Kind::Query)).collect();
+    world.client.fetch_many(&mut world.mine, &asked, &mut world.effects);
+    let connects = world.effects.iter().filter(|it| matches!(it, Effect::Connect { .. })).count();
+    assert_eq!(connects, 3, "as many connections as its batches fill, asked for at once");
+    world.run();
+    assert_eq!(world.raw.as_ref().unwrap().accepted, 3);
+    assert_eq!(world.requests().len(), 12, "one request a batch");
+    for n in 0..count {
+        assert_eq!(world.how(&key(n)), &Fetched::Missing);
+    }
+}
+
+#[test]
 fn keys_a_full_response_defers_are_asked_again() {
     let bytes = b"the only value".to_vec();
     let signed = signed_by(1, key(0), Kind::Code, &bytes);
@@ -436,7 +459,7 @@ fn a_value_that_is_not_the_one_its_signed_record_names_is_refused() {
     });
     world.fetch(&[public(key(0), Kind::Code)]);
     let why = world.refused(&key(0));
-    assert!(why.contains(&format!("{:x}", key(0).0)) && why.contains("hash to"), "{why}");
+    assert!(why.contains("hash to"), "the store hashes it against its record's content: {why}");
     assert_eq!(world.kept(&key(0)), None);
 }
 

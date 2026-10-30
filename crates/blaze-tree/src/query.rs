@@ -4,6 +4,7 @@
 
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
+use blaze_manifest::files::Files;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
 use blaze_units::load::{ResolveAsk, Resolving, ViewResolved, key_id, load_error, platform_cfg, resolve_view};
 use blaze_units::query::{Cbor, Fetch, LoadError, Versioned, producer};
@@ -158,7 +159,7 @@ impl Query for Tree {
     }
 }
 
-fn print_view(view: &ViewResolved<'_>, opts: &Options) -> Result<(String, Vec<String>), LoadError> {
+fn print_view<F: Files>(view: &ViewResolved<'_, F>, opts: &Options) -> Result<(String, Vec<String>), LoadError> {
     let (input, kinds) = view_input(view, opts)?;
     // alloc: the text the query returns, one buffer sized for a line per package.
     let mut out = String::with_capacity(crate::LINE * view.resolve.len());
@@ -171,7 +172,7 @@ fn print_view(view: &ViewResolved<'_>, opts: &Options) -> Result<(String, Vec<St
 }
 
 /// The view's workspace as [`crate::print_resolved`] reads it, and its platforms.
-fn view_input<'a>(view: &ViewResolved<'a>, opts: &Options) -> Result<(Input<'a>, Kinds), LoadError> {
+fn view_input<'a, F: Files>(view: &ViewResolved<'a, F>, opts: &Options) -> Result<(Input<'a>, Kinds), LoadError> {
     let targets: &[String] = match &opts.target {
         Target::Specific(triples) => triples,
         Target::Host | Target::All => &[],

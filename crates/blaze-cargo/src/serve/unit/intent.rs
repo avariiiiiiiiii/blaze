@@ -21,7 +21,10 @@ pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edi
     if let Some((path, why)) = files.corrupt.into_inner() {
         return Err(ApiError::new(why, Some(path)).into());
     }
-    Ok(applied?.edited)
+    let applied = applied?;
+    // alloc: once per edit, one seed per file it reparsed
+    *job.seeds.lock().unwrap_or_else(|it| it.into_inner()) = applied.seeds().collect();
+    Ok(applied.edited)
 }
 
 /// The job's test units (by their place in its graph) that hold a test `filter` selects, as

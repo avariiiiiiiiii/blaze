@@ -90,6 +90,9 @@ pub type LLVMBlazePassesRef = *mut LLVMBlazeOpaquePasses;
 
 extern "C" {
     pub fn LLVMBlazeCreatePasses(TM: LLVMTargetMachineRef) -> LLVMBlazePassesRef;
+    /// Whether the target of `TM` has a feature named `Name` (`Length` bytes, no NUL needed),
+    /// as rustc's `LLVMRustHasFeature` asks. LLVM told a name it lacks warns and ignores it.
+    pub fn LLVMBlazeHasFeature(TM: LLVMTargetMachineRef, Name: *const ::libc::c_char, Length: usize) -> LLVMBool;
     pub fn LLVMBlazeDisposePasses(Passes: LLVMBlazePassesRef);
     /// Runs the pipeline `Pipeline` (`Length` bytes, no NUL needed) over `M`, as
     /// [`LLVMRunPasses`] does with default options but `SLPVectorization`.
@@ -108,6 +111,58 @@ extern "C" {
         M: LLVMModuleRef,
         Wanted: *const LLVMBlazeSanitizers,
     ) -> LLVMErrorRef;
+    /// Passes whose pipelines are built with `Pgo` (read during the call only), as rustc's
+    /// `LLVMRustOptimize` builds them for `-Cprofile-generate` and `-Cprofile-use`: the default
+    /// pipelines [`LLVMBlazeRunPasses`] runs then run PGO's passes where LLVM puts them (not in
+    /// ThinLTO's post-link one). A profile used is read from `Pgo.Profile`, which outlives the
+    /// passes. Null for an `Action` that is neither [`LLVMBlazePgoGenerate`] nor
+    /// [`LLVMBlazePgoUse`].
+    pub fn LLVMBlazeCreatePgoPasses(
+        TM: LLVMTargetMachineRef,
+        Pgo: *const LLVMBlazePgo,
+    ) -> LLVMBlazePassesRef;
+    /// Runs PGO's passes alone over `M`, as LLVM does at `-O0`. For passes
+    /// [`LLVMBlazeCreatePgoPasses`] made.
+    pub fn LLVMBlazeRunPgo(Passes: LLVMBlazePassesRef, M: LLVMModuleRef) -> LLVMErrorRef;
+    /// How many functions the passes found a record of in their profile under the function's
+    /// name with another hash, since this was last asked.
+    pub fn LLVMBlazeTakeMismatched(Passes: LLVMBlazePassesRef) -> u32;
+    /// The indexed profile of IR instrumentation with `Count` records, as `llvm-profdata
+    /// merge` writes it, into `*Out`, which the caller disposes of.
+    pub fn LLVMBlazeWriteProfile(
+        Records: *const LLVMBlazeProfileRecord,
+        Count: usize,
+        Out: *mut LLVMMemoryBufferRef,
+    ) -> LLVMErrorRef;
+}
+
+/// blaze: what [`LLVMBlazeCreatePgoPasses`] builds pipelines for (wrappers/passes.cpp's struct
+/// of the same name, field for field).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LLVMBlazePgo {
+    /// [`LLVMBlazePgoGenerate`] or [`LLVMBlazePgoUse`].
+    pub Action: u8,
+    /// Use: the indexed profile, `Length` bytes followed by a NUL.
+    pub Profile: *const ::libc::c_char,
+    pub Length: usize,
+}
+
+/// `-Cprofile-generate`: LLVM's IR instrumentation.
+pub const LLVMBlazePgoGenerate: u8 = 1;
+/// `-Cprofile-use`: the profile's counts as the code's branch weights.
+pub const LLVMBlazePgoUse: u8 = 2;
+
+/// blaze: one function's counts for [`LLVMBlazeWriteProfile`] (wrappers/passes.cpp's struct of
+/// the same name, field for field).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LLVMBlazeProfileRecord {
+    pub Name: *const ::libc::c_char,
+    pub NameLength: usize,
+    pub Hash: u64,
+    pub Counts: *const u64,
+    pub CountsLength: usize,
 }
 
 /// blaze: what [`LLVMBlazeRunSanitizers`] instruments for (wrappers/passes.cpp's struct of

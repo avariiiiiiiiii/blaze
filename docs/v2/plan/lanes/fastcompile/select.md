@@ -189,20 +189,29 @@ The tests live beside the code:
 - `record/tests.rs`: the eight-bytes-a-step scan against a byte-by-byte reference over random
   maps; region completeness (unarmed, short, foreign, killed); hits validation.
 - `table/tests.rs`: the open-addressing lookup against a map; table refusals; the unlogged
-  hash is independent of table order and sensitive to every unlogged version and `beside`;
-  sets sort, deduplicate, round-trip and report the first change.
+  hash is independent of table order and sensitive to every unlogged version and `beside`,
+  and is the comparison sort's hash at every size, ids that share 8-byte prefixes included;
+  sets built from ranks (bitset or sort) are `Set::of` the same versions; sets sort,
+  deduplicate, round-trip and report the first change.
+- `selector/tests.rs`: postings across blocks and the id tables against plain models; every
+  set's fit, read from counts, is `Image::changed`'s answer over random sets, edits, reverts,
+  gone functions and unlogged changes; advancing to a binary, changed or not, allocates
+  nothing.
 - `select/tests.rs`: an edit to a reached function that wasn't executed keeps the pass; an
   executed one reruns; a revert finds the old pass; failures rerun with the inputs they failed
   with; an incomplete record keeps the pass under the reached set and says why; unlogged
   changes rerun; a gone function, read inputs, unkeepable passes, outside, all, attributes and
   lookback; history end at every length; entry round trip.
-- `sim.rs`, a deterministic simulation of a program whose function versions call others (some
-  only under a bit of a file they read), read or not, and fail or not. Over random edits,
-  reverts, input changes and incomplete records, a test not run must pass now and must have a
-  past pass at the same versions of what it executed now and the same input. Over synthetic
-  single-pass histories, a test runs exactly when a function it executed, the unlogged code,
-  or an input it read changed: never skipped when its executed set meets the changed set, and
-  never run when it doesn't.
+- `sim_tests.rs`, a deterministic simulation of a program whose function versions call others
+  (some only under a bit of a file they read), read or not, and fail or not. Over random
+  edits, reverts, input changes and incomplete records, a test not run must pass now and must
+  have a past pass at the same versions of what it executed now and the same input. Over
+  synthetic single-pass histories, a test runs exactly when a function it executed, the
+  unlogged code, or an input it read changed: never skipped when its executed set meets the
+  changed set, and never run when it doesn't. A `Selector` kept across the edits (and one
+  made afresh half-way, as after a restart) gives every test, at every step, the choice
+  `choose` gives over the same store, with other attributes, outside tests and runs of all
+  mixed in.
 - `api.rs`: a cached result's round trip through `blaze_api::Envelope<Response::TestResult>`
   in deterministic CBOR, with its outcome, duration and basis.
 
@@ -234,3 +243,155 @@ call binds to, which file- or class-level checksums only see as a whole. Runtime
 from the sandbox, so files and environment a test reads are in its key without being
 declared. It is exact rather than predictive: no learned model, no miss rate. When it can't
 be exact (an incomplete record), it says so and uses the reached set, which is still sound.
+
+## Speed of light
+
+Nothing here was run: costs are counted from the code and the machine, as in
+[share.md](share.md#speed-of-light) and
+[speed-of-light-infer-relate.md](../db/speed-of-light-infer-relate.md), whose machine this
+uses. That is an Apple M5 Max performance core at about 4.5 GHz with sustained IPC about 3.5,
+L1 about 3 cycles, L2 about 16, DRAM about 100 ns, and about 25 GB/s of DRAM per core.
+
+There are two hot paths: choosing for a suite after an edit, and keeping how a test ran. A
+suite is chosen for on one core, test after test. Its working set is the binary's table
+(\(F\) rows of 64 bytes), the sets the suite's passes were kept under, and the histories.
+Store reads are in-memory probes: the store verifies a value's hash once, when it is
+recorded.
+
+The example used below: \(F = 100\,000\) functions, of which \(U = 20\,000\) are called not
+through a slot. \(T = 2\,000\) tests, each executing \(E = 1\,500\) functions. An edit changes
+\(D = 3\) functions, whose old versions are in 600 kept sets each, so \(P_D = 1\,800\)
+postings. \(C = 1\,900\) tests stay cached, each having read \(R = 3\) inputs.
+
+**The work that can't be skipped.**
+
+- **Per relink.** Read the new table once (\(F\) rows). Join it to what the last selection
+  knew, by function identity: codegen's table order is not stable, so that is one hash probe
+  per function. Put the unlogged versions in identity order and hash them, because the
+  unlogged hash is part of every set's key.
+- **Per edit.** Every kept set that holds a changed function must be marked unfit: one
+  posting per (changed version, set holding it).
+- **Per test.** Answer it: find its history, hash its attributes, read one fit.
+- **Per cached test.** Check that its pass is kept for the inputs as they are now: what makes
+  a pass exact is its inputs' values now.
+- **Per kept run.**
+  - Scan the record region (a byte per slot).
+  - Put the executed functions in identity order, since a set is stored by content.
+  - Write and hash the set's 64-byte rows.
+  - Do a constant amount of store work: the pass, its shape and the history entry.
+
+Unit costs:
+
+| step | cost |
+|---|---|
+| read one 64-byte table row, streaming | about 2.6 ns |
+| BLAKE3 of 64 bytes inside a long stream, many chunks at once (about 6 GB/s) | about 11 ns |
+| BLAKE3 of a short key (history slot, identity, index slot, result key), `Hasher::new` included | about 30 ns |
+| a store get: one probe of the in-memory store | about 30 ns |
+| a probe or insert into an open-addressed table in L2 | about 5 ns |
+| one radix-sort element (eight passes over an `(u64, u32)` pair) | about 8 ns |
+| one posting: a `u32` from a sequential 64-byte block, an add to a counter in L2 | about 2 ns |
+| an input's value now (a file's content ID from the daemon's file state) | about 30 ns |
+| a kept run's set row: gather it, order it (bitset or radix over `u32` ranks), copy it | about 7 ns |
+
+**The bound.** Choosing for a suite after an edit costs
+
+\[ T_{\text{choose}} \approx F\,(c_{\text{row}} + c_{\text{probe}}) + U\,(c_{\text{blake}} + c_{\text{sort}}) + P_D\,c_{\text{post}} + T\,c_{\text{test}} + C\,(c_{\text{find}} + R\,c_{\text{in}}), \]
+
+where \(c_{\text{test}} \approx 5 + 30 + 5 = 40\) ns (the memo's probe, the attributes' hash,
+the fit). \(c_{\text{find}} \approx 3 \cdot 30 + 2 \cdot 30 + 30 = 180\) ns: three short
+hashes (the identity, the index slot and the result key), two store gets, and the decode of
+the inputs' shape. For the example:
+
+\[ 100\,000 \cdot 7.6 + 20\,000 \cdot 19 + 1\,800 \cdot 2 + 2\,000 \cdot 40 + 1\,900 \cdot (180 + 90)\ \text{ns} \approx 0.76 + 0.38 + 0.004 + 0.08 + 0.51 \approx 1.7\ \text{ms}. \]
+
+The edit itself is the \(P_D\) term, 3.6 µs. The rest is per relink and per test. Keeping a
+run costs
+
+\[ T_{\text{keep}} \approx \tfrac{F_s}{25\ \text{GB/s}} + E\,(c_{\text{row,set}} + c_{\text{blake}}) + 10 \cdot 30\ \text{ns}, \]
+
+with \(F_s\) slot bytes: \(4 + 1\,500 \cdot 18\ \text{ns} + 0.3 \approx 31\ \mu s\) for the
+example, small beside the run it records.
+
+**What the code did.** Every test was chosen from the store alone (`select::choose`), at
+about 8.3 µs a test for the example:
+
+- doubling then halving to its history's end, which is \(2 \log_2 h + 1\) store gets, each
+  behind a short hash (about 0.5 µs at \(h = 16\));
+- its entry;
+- the set's bytes, with every one of the set's functions looked up in the binary
+  (`Image::changed`, \(1\,500 \cdot 5\) ns);
+- then `find`.
+
+For the whole suite that is \(\sum_t |S_t|\) probes, about 16.6 ms, after any edit, however
+small. `Image::new` sorted all \(F\) rows by comparison (about \(17\) compares of 64-byte rows
+each, 6.8 ms) and hashed the unlogged versions 32 bytes per call (one compression at a time,
+about 20 ns a row). Building a kept set sorted its 64-byte rows by comparison, about
+\(E \log_2 E \cdot 5\) ns, or 82 µs. In all, about 24 ms a selection, 14 times the bound, and
+110 µs a keep, 3.5 times.
+
+**What the code does.**
+
+- **[`Selector`](../../../../../crates/blaze-testsel/src/selector.rs)** is an inverted index
+  held across edits for one suite.
+  - Every set it has read gets a dense id with a stale count: how many of its versions the
+    binary lacks.
+  - Every version gets its postings, in 64-byte blocks of 15 set ids.
+  - Every test keeps a memo of its history.
+  - `advance` probes each known function's bound in the new binary. For the few that changed,
+    it walks the postings of the old and new version, moving stale counts by one.
+  - `choose` is the reference walk over the memo, with a set's fit read as two loads. The
+    explanation of a changed set is made only for a test that runs. The store is asked only
+    about inputs (`find`) and what the memo has not read.
+  - The simulation checks it against `select::choose` choice by choice.
+- **`Image::new`** orders identities with a radix sort of their 8-byte prefixes (none for a
+  table already in identity order), and keeps the order and each function's rank. It hashes
+  the unlogged rows 256 at a time, in whole BLAKE3 chunks, over the same bytes as before.
+- **Kept sets** are built from ranks: a bitset over the table when the set is at least a
+  quarter of its words, else a radix sort of `u32` ranks. Then the rows are gathered in that
+  order.
+
+For the example:
+
+- `Image::new` is \(F\,(2.6 + 5 + 8 + 1) + U \cdot 11 \approx 1.9\) ms;
+- `advance` is at most \(F \cdot 5\) ns, about 0.5 ms, plus the 3.6 µs of postings;
+- `choose` over the suite is \(T \cdot 40 + C \cdot 270\) ns, about 0.59 ms.
+
+That is about 3.0 ms, 1.7 times the bound. The edit-proportional and per-test terms are at it.
+The 1.3 ms over the bound is all per relink:
+
+- the radix sort runs over all \(F\) functions, not only the \(U\) unlogged ones, so that kept
+  sets can be built from ranks;
+- the function join costs two hash operations, `Image`'s map and the selector's probe, where
+  the bound has one.
+
+A keep is \(4 + 1\,500 \cdot 18 + 1.6 + 0.3 \approx 33\ \mu s\), 5% over the bound: the
+bitset's scan.
+
+After a restart, the first selection reads each history's end and each set once, as
+`choose` does. After that it reads nothing again while the selector lives.
+`advancing_allocates_nothing` holds `advance` to no allocation, with an edit or without. The
+selector allocates only as it meets new tests, sets, versions and history entries.
+
+**What would close the rest.**
+
+- A table that codegen writes in identity order (`fastcompile-sol-select 2`). It drops the
+  sort to the one compare a row that `by_identity` already takes, and lets the join become a
+  merge at streaming speed.
+- The cached-test term is the largest per-test cost, and it is per cached test, not per
+  changed input. An input change feed from the daemon's file state would make it
+  proportional to the inputs that changed, as the postings make the code term.
+
+**State of the art.**
+
+- **Bazel and Pants** answer a test target with one action-cache lookup, \(O(T)\) per build.
+  They are as fast per target, but a target is all its tests at once.
+- **Ekstazi** checks, per test, the checksum of every class it depends on, with class
+  checksums cached by file time. That is the \(\sum_t |S_t|\) walk the reference does, at
+  class granularity.
+- **Microsoft TIA** keeps an inverted map from source files to tests. That is the same shape
+  as the postings here, at file granularity, and it is the shape search engines use:
+  Lucene's postings in blocks of 128 with skip data, walked only for the terms queried.
+
+The selector matches the inverted-index bound, \(O(P_D)\) for the edit, and does so per
+function: of these systems, it is the only one exact at that granularity.

@@ -40,15 +40,18 @@ use rustc_type_ir::{
     inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind as _},
 };
 use smallvec::SmallVec;
-use syntax::{AstNode as _, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
-    cx::item_range,
+    cx::item_range_view,
     lints::bodies::{
-        BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, PatKinds, PatTag, lint_set,
+        BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, PatKinds, PatKind, lint_set,
         types::util::{Solver, diagnostic_item, from_expansion, path_item, path_value},
     },
-    lower::{Found, Phase, break_outside_of_loop::ancestors},
+    lower::{Found, Phase, break_outside_of_loop::up},
     model::{Applicability, Diag, Span},
 };
 
@@ -71,14 +74,14 @@ fn semi_expr(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<ExprId> 
 
 /// The span of a statement or a `let` as rustc gives it (`Stmt::span`): from its first token
 /// after its attributes to its `;`.
-fn stmt_span(b: &BodyCx<'_, '_>, node: &InFile<SyntaxNode>) -> Span {
-    b.cx.span(node.with_value(item_range(&node.value)))
+fn stmt_span(b: &BodyCx<'_, '_>, node: &InFile<ast::Node<'_>>) -> Span {
+    b.cx.span(node.with_value(item_range_view(node.value)))
 }
 
 /// The expression statement `expr` is the expression of, as written.
-fn expr_stmt(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<InFile<SyntaxNode>> {
-    let node = b.cx.syntax(b.expr_node(expr)?);
-    ancestors(b.cx, &node).into_iter().find(|it| it.value.kind() == SyntaxKind::EXPR_STMT)
+fn expr_stmt<'db>(b: &BodyCx<'_, 'db>, expr: ExprId) -> Option<InFile<ast::Node<'db>>> {
+    let node = b.cx.syntax_view(b.expr_node(expr)?);
+    up(b.cx, node).find(|it| it.value.kind() == SyntaxKind::EXPR_STMT)
 }
 
 /// rustc's `Ty::needs_drop` in the typing environment of the body's item.
@@ -198,9 +201,9 @@ impl Local {
         if let Some(expr) = self.assign {
             return Some(Written { span: b.expr_span(expr)?, at: b.expr_node(expr)? });
         }
-        let node = b.cx.syntax(b.pat_node(self.pat)?);
-        let stmt = ancestors(b.cx, &node).into_iter().find(|it| ast::LetStmt::can_cast(it.value.kind()))?;
-        Some(Written { span: stmt_span(b, &stmt), at: stmt.map(|it| SyntaxNodePtr::new(&it)) })
+        let node = b.cx.syntax_view(b.pat_node(self.pat)?);
+        let stmt = up(b.cx, node).find(|it| ast::LetStmt::can_cast(it.value.kind()))?;
+        Some(Written { span: stmt_span(b, &stmt), at: stmt.map(ast::ptr) })
     }
 }
 
@@ -211,7 +214,7 @@ pub(crate) struct LetUnderscore;
 impl LatePass for LetUnderscore {
     const LINTS: LintSet = lint_set(["let_underscore_drop", "let_underscore_lock"]);
     const HOOKS: Hooks = Hooks::LOCAL;
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Assignment]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Assignment]);
 
     fn check_local(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         if let Some(local) = Local::of_stmt(b, block, index) {
@@ -361,8 +364,8 @@ impl LatePass for UnusedResults {
         else {
             return;
         };
-        let Some(written) = ast::Expr::cast(b.cx.syntax(node).value) else { return };
-        let Some(ty) = b.cx.sema.type_of_expr(&written) else { return };
+        let Some(written) = ast::Expr::cast(b.cx.syntax_view(node).value) else { return };
+        let Some(ty) = b.cx.vsema.type_of_expr(written) else { return };
         let ty = b.cx.ty(&ty.original);
         // alloc: the lint's diagnostic
         let diag = Diag::lint("unused_results", format!("unused result of type `{ty}`"), stmt_span(b, &stmt));
@@ -485,7 +488,7 @@ pub(crate) struct UnitBindings;
 impl LatePass for UnitBindings {
     const LINTS: LintSet = lint_set(["unit_bindings"]);
     const HOOKS: Hooks = Hooks::LOCAL;
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Assignment]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Assignment]);
 
     fn check_local(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         if let Some(local) = Local::of_stmt(b, block, index) {
@@ -528,7 +531,7 @@ pub(crate) struct NonShorthandFieldPatterns;
 
 impl LatePass for NonShorthandFieldPatterns {
     const LINTS: LintSet = lint_set(["non_shorthand_field_patterns"]);
-    const PATS: PatKinds = PatKinds::of(&[PatTag::Record]);
+    const PATS: PatKinds = PatKinds::of(&[PatKind::Record]);
 
     fn check_pat(&mut self, b: &BodyCx<'_, '_>, pat: PatId, out: &mut Vec<Found>) {
         let store = b.store();
@@ -544,12 +547,12 @@ impl LatePass for NonShorthandFieldPatterns {
                 continue;
             }
             let Some(node) = b.pat_node(field.pat) else { continue };
-            let node = b.cx.syntax(node);
+            let node = b.cx.syntax_view(node);
             let Some(written) = node.value.parent().and_then(ast::RecordPatField::cast) else { continue };
             if written.colon_token().is_none() {
                 continue;
             }
-            let span = b.cx.span(node.with_value(item_range(written.syntax())));
+            let span = b.cx.span(node.with_value(item_range_view(written.syntax())));
             if from_expansion(&span) {
                 continue;
             }
@@ -587,7 +590,7 @@ pub(crate) struct UnusedAllocation;
 
 impl LatePass for UnusedAllocation {
     const LINTS: LintSet = lint_set(["unused_allocation"]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Call { callee, args } = b.store().expr(expr) else { return };

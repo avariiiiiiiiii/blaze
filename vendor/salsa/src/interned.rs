@@ -84,6 +84,10 @@ pub unsafe trait Configuration: Sized + 'static {
     fn deserialize<'de, D>(deserializer: D) -> Result<Self::Fields<'static>, D::Error>
     where
         D: plumbing::serde::Deserializer<'de>;
+
+    /// How the daemon image keeps the values, at their IDs ([`crate::image`]); `None` if it
+    /// does not keep them.
+    const IMAGE: Option<crate::image::ImageCodec<Self::Fields<'static>>> = None;
 }
 
 pub trait InternedData: Sized + Eq + Hash + Clone + Sync + Send {}
@@ -1329,6 +1333,10 @@ where
         JarKind::Struct
     }
 
+    fn read_kind(&self) -> crate::ingredient::ReadKind {
+        crate::ingredient::ReadKind::Interned
+    }
+
     /// Outgrown key-map tables are freed once per revision, when no reader can be probing one.
     fn requires_reset_for_new_revision(&self) -> bool {
         true
@@ -1408,6 +1416,170 @@ where
         };
 
         serde::de::DeserializeSeed::deserialize(deserialize, deserializer)
+    }
+
+    fn image_schema(&self) -> Option<blaze_format::SchemaHash> {
+        C::IMAGE.map(|codec| codec.schema)
+    }
+
+    // dyn: the edge: the image's GC and restore reach each kept ingredient once, through the ingredient list's vtable
+    fn image_ids(&self, zalsa: &Zalsa, f: &mut dyn FnMut(Id)) {
+        for (_, value) in zalsa.table().slots_of::<Value<C>>() {
+            f(value.id.load());
+        }
+    }
+
+    fn image_holds(&self, zalsa: &Zalsa, id: Id) -> bool {
+        zalsa.table().get::<Value<C>>(id).id.load() == id
+    }
+
+    unsafe fn image_names(&self, zalsa: &Zalsa, id: Id, ids: &mut Vec<Id>, symbols: &mut Vec<u32>) {
+        let codec = image_codec::<C>();
+        let value = zalsa.table().get::<Value<C>>(id);
+        // SAFETY: The caller holds the storage exclusively, so no reuser writes the fields.
+        (codec.names)(unsafe { &*value.fields.get() }, ids, symbols);
+    }
+
+    unsafe fn write_image_slots(
+        &self,
+        zalsa: &Zalsa,
+        marked: &blaze_ids::bits::BitSet<u32>,
+        out: &mut crate::image::SlotsOut<'_>,
+    ) {
+        let codec = image_codec::<C>();
+        for (_, value) in zalsa.table().slots_of::<Value<C>>() {
+            let id = value.id.load();
+            if marked.contains(id.index()) {
+                // SAFETY: The caller holds the storage exclusively, so no reuser writes the fields.
+                let fields = unsafe { &*value.fields.get() };
+                out.live(id, value.durability.load(), |bytes| (codec.write)(fields, bytes));
+            } else {
+                out.freed(id);
+            }
+        }
+    }
+
+    // alloc: the edge: once per ingredient per restore
+    // dyn: the edge: the image's GC and restore reach each kept ingredient once, through the ingredient list's vtable
+    fn decode_image_slots(
+        &self,
+        slots: &[crate::image::SlotRecord],
+        blob: &[u8],
+    ) -> Result<Box<dyn std::any::Any>, crate::image::ImageError> {
+        let codec = image_codec::<C>();
+        // alloc: the edge: once per ingredient per restore
+        let mut decoded = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let fields = match slot.kind {
+                crate::image::SlotKind::Live => {
+                    let (at, len) = slot.bytes;
+                    (codec.read)(&blob[at..at + len]).map_err(|error| {
+                        crate::image::ImageError::Fields {
+                            ingredient: C::DEBUG_NAME,
+                            error,
+                        }
+                    })?
+                }
+                crate::image::SlotKind::Vacant | crate::image::SlotKind::Spent => (codec.vacant)(),
+            };
+            decoded.push(ImageSlot::<C> {
+                id: slot.id,
+                durability: slot.durability,
+                kind: slot.kind,
+                fields,
+            });
+        }
+        // alloc: the edge: once per ingredient per restore
+        Ok(Box::new(decoded))
+    }
+
+    fn force_image_page(&self, table: &mut crate::table::Table, page: crate::table::PageIndex) {
+        table.force_page::<Value<C>>(page, self.ingredient_index, &self.memo_table_types);
+    }
+
+    // dyn: the edge: the image's GC and restore reach each kept ingredient once, through the ingredient list's vtable
+    fn apply_image_slots(
+        &mut self,
+        table: &mut crate::table::Table,
+        decoded: Box<dyn std::any::Any>,
+    ) {
+        use crate::image::SlotKind;
+
+        let Ok(decoded) = decoded.downcast::<Vec<ImageSlot<C>>>() else {
+            unreachable!("`decode_image_slots` of `{}` made another type", C::DEBUG_NAME)
+        };
+        let page_len = 1 << crate::table::PAGE_LEN_BITS;
+        let mut filling: Option<(crate::table::PageIndex, usize)> = None;
+        for slot in *decoded {
+            let (page, _) = crate::table::split_id(slot.id);
+            if let Some((last, filled)) = filling.filter(|&(last, _)| last != page)
+                && filled < page_len
+            {
+                table.record_unfilled_page(self.ingredient_index, last);
+            }
+            let filled = filling.filter(|&(last, _)| last == page).map_or(0, |(_, n)| n);
+            filling = Some((page, filled + 1));
+
+            // A vacant slot is reused only through the sweep, and only if this struct's values
+            // are ever reused; a spent one never is.
+            let listed = slot.kind == SlotKind::Live
+                || (slot.kind == SlotKind::Vacant && C::REVISIONS != IMMORTAL);
+            let durability = match slot.kind {
+                SlotKind::Live => slot.durability,
+                SlotKind::Vacant => Durability::LOW,
+                SlotKind::Spent => Durability::MAX,
+            };
+            let hash = self.hasher.hash_one(&slot.fields);
+            let shard_index = self.shard(hash);
+            let mut shard = self.shards.lock(shard_index);
+            let value = Value::<C> {
+                shard: shard_index as u16,
+                durability: AtomicDurability::new(durability),
+                id: AtomicId::new(slot.id),
+                last_interned_at: InternedAt::new(Revision::start()),
+                fields: UnsafeCell::new(slot.fields),
+                // SAFETY: We only ever access the memos of a value that we allocated through
+                // our `MemoTableTypes`.
+                memos: UnsafeCell::new(unsafe { MemoTable::new(self.memo_table_types()) }),
+            };
+            // SAFETY: `&mut Table` excludes every other access to the page.
+            let allocated = unsafe { table.page::<Value<C>>(page).allocate(page, |_| value) };
+            let Ok((allocated, value)) = allocated else {
+                unreachable!("the image's pages of `{}` hold at most a page each", C::DEBUG_NAME)
+            };
+            assert_eq!(
+                allocated.index(),
+                slot.id.index(),
+                "the image's slots of `{}` are each page's, in order",
+                C::DEBUG_NAME
+            );
+            if listed {
+                // SAFETY: We hold this ingredient's shard lock, and `value` is the live, stable
+                // value that we just allocated in that shard, its fields hashing to `hash`.
+                unsafe { Self::insert_value(&mut shard, hash, value) };
+            }
+        }
+        if let Some((last, filled)) = filling
+            && filled < page_len
+        {
+            table.record_unfilled_page(self.ingredient_index, last);
+        }
+    }
+}
+
+/// A slot of an interned struct, decoded from the daemon image and not yet in the table.
+struct ImageSlot<C: Configuration> {
+    id: Id,
+    durability: Durability,
+    kind: crate::image::SlotKind,
+    fields: C::Fields<'static>,
+}
+
+/// The struct's [`Configuration::IMAGE`], which the ingredient has if the image calls it.
+fn image_codec<C: Configuration>() -> crate::image::ImageCodec<C::Fields<'static>> {
+    match C::IMAGE {
+        Some(codec) => codec,
+        None => unreachable!("`{}` has no image codec, so the image keeps none of it", C::DEBUG_NAME),
     }
 }
 

@@ -19,7 +19,7 @@ use hir::{
 };
 use rustc_hash::FxHashSet;
 use syntax::{
-    LexedStr, NodeOrToken, SyntaxKind, TextRange,
+    LexedStr, NodeOrToken, SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _, HasAttrs as _},
 };
 
@@ -93,13 +93,12 @@ pub(crate) fn rename(cx: &mut Edits<'_, impl Files>, target: &Target, to: &str) 
 
     let mut hits = Vec::new();
     let finder = memchr::memmem::Finder::new(bare.as_bytes());
+    let files = cx.files;
     for file in files_of(cx.db, def) {
-        let path = cx
-            .files
+        let path = files
             .path(file)
-            .ok_or_else(|| fail(format!("a file of a crate that can see `{}` is outside the view", target.item)))?
-            .to_owned();
-        let (_, bytes) = cx.files.file(&path).ok_or_else(|| fail(format!("{path} is not in the view")))?;
+            .ok_or_else(|| fail(format!("a file of a crate that can see `{}` is outside the view", target.item)))?;
+        let (_, bytes) = files.file(path).ok_or_else(|| fail(format!("{path} is not in the view")))?;
         if finder.find(bytes).is_none() {
             continue;
         }
@@ -116,6 +115,7 @@ pub(crate) fn rename(cx: &mut Edits<'_, impl Files>, target: &Target, to: &str) 
                 ApiError::new(format!("{path}:{line}: {what}"), Some(format!("{path}:{line}")))
             })?;
             let range = token.text_range();
+            // alloc: one replacement a reference rewritten, which its splice owns
             let (range, insert) = match class {
                 Class::No => continue,
                 Class::Name => (range, to.to_owned()),
@@ -149,6 +149,21 @@ pub(crate) fn rename(cx: &mut Edits<'_, impl Files>, target: &Target, to: &str) 
         moves(cx, module, node, &bare, to).map_err(fail)?;
     }
     Ok(())
+}
+
+/// The identifier token whose name, `r#` cut, is the `len` bytes at `at` of `root`'s text;
+/// `None` when they are part of another token or of a longer name. A name never overlaps
+/// itself at a token's start (what comes before a token's start is no identifier character),
+/// so the matches of a non-overlapping search reach every such token.
+pub(crate) fn ident_at(root: ast::Node<'_>, at: usize, len: usize) -> Option<ast::Token<'_>> {
+    let range = TextRange::at(TextSize::try_from(at).ok()?, TextSize::try_from(len).ok()?);
+    let NodeOrToken::Token(token) = root.covering_element(range) else { return None };
+    let own = token.text_range();
+    let start = match token.text().starts_with("r#") {
+        true => own.start() + TextSize::from(2),
+        false => own.start(),
+    };
+    (token.kind() == SyntaxKind::IDENT && start == range.start() && own.end() == range.end()).then_some(token)
 }
 
 /// The front end's item for the node a path named.

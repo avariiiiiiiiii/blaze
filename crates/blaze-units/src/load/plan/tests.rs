@@ -485,7 +485,7 @@ impl Drop for Scratch {
     }
 }
 
-fn manifest(path: &Path, source: blaze_manifest::source::SourceId, config: Config<Disk>) -> Manifest {
+fn manifest(path: &Path, source: SourceId, config: Config<Disk>) -> Manifest {
     match read_manifest(path, source, &Context::new(config)).unwrap() {
         EitherManifest::Real(it) => *it,
         EitherManifest::Virtual(_) => panic!("`{}` has no package", path.display()),
@@ -587,9 +587,9 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
             &["env.FROM_CONFIG='1'", "target.aarch64-unknown-linux-gnu.runner=['qemu-aarch64', '-L', '/sysroot']"],
         )
     };
-    let crates_io = blaze_manifest::source::SourceId::for_registry(&"https://github.com/rust-lang/crates.io-index".parse().unwrap());
-    let app = manifest(&app_path, blaze_manifest::source::SourceId::for_manifest_path(&app_path).unwrap(), config());
-    let pm = manifest(&pm_path, blaze_manifest::source::SourceId::for_manifest_path(&pm_path).unwrap(), config());
+    let crates_io = SourceId::crates_io();
+    let app = manifest(&app_path, blaze_manifest::source::for_manifest_path(&app_path).unwrap(), config());
+    let pm = manifest(&pm_path, blaze_manifest::source::for_manifest_path(&pm_path).unwrap(), config());
     let serde = manifest(&serde_path, crates_io, config());
 
     let path_id = |name: &str, at: &Path| {

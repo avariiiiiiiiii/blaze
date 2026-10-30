@@ -2,7 +2,11 @@
 //! E0579 and the constants `const_to_pat` refuses) and of the range lints of match checking
 //! (`overlapping_range_endpoints`, `non_contiguous_range_endpoints`).
 
-use crate::tests::{items::ui_core, ui};
+use crate::tests::{
+    items::ui_core,
+    lints::bodies::{reachable::PRINTLN, types::ui_std},
+    ui,
+};
 
 #[test]
 fn a_range_with_its_lower_bound_above_its_upper_is_e0030() {
@@ -696,4 +700,121 @@ error: aborting due to 16 previous errors; 1 warning emitted
 
 "##;
     assert_eq!(ui_core("gap_between_ranges.rs", "2015", "option", source), stderr);
+}
+
+#[test]
+fn a_derive_whose_structural_impl_does_not_apply_is_not_structural() {
+    // tests/ui/consts/const_in_pattern/derive-and-manual-partialeq-issue-147714.rs
+    let source = r##"// `derive(PartialEq)`, which also implements `StructuralPartialEq`, must not allow the latter impl
+// to be used with other non-derived implementations of `PartialEq`.
+//
+// Test case by theemathas from <https://github.com/rust-lang/rust/issues/147714>.
+
+#[allow(dead_code)]
+#[derive(PartialEq)]
+enum Thing<T> {
+    A(T),
+    B,
+}
+
+struct Incomparable;
+
+// This impl does not obey StructuralPartialEq's rules.
+impl PartialEq for Thing<Incomparable> {
+    fn eq(&self, _: &Self) -> bool {
+        panic!()
+    }
+}
+
+// This constant does not obey StructuralPartialEq's rules, so it should not
+// implement StructuralPartialEq.
+const X: Thing<Incomparable> = Thing::B;
+
+fn main() {
+    if let X = X {
+        //~^ ERROR constant of non-structural type `Thing<Incomparable>` in a pattern
+        println!("equal");
+    }
+}
+"##;
+    let stderr = r##"error: constant of non-structural type `Thing<Incomparable>` in a pattern
+  --> $DIR/derive-and-manual-partialeq-issue-147714.rs:27:12
+   |
+LL | enum Thing<T> {
+   | ------------- `Thing<Incomparable>` must be annotated with `#[derive(PartialEq)]` to be usable in patterns
+...
+LL | const X: Thing<Incomparable> = Thing::B;
+   | ---------------------------- constant defined here
+...
+LL |     if let X = X {
+   |            ^ constant of non-structural type
+   |
+help: if `Thing<Incomparable>` manually implemented `PartialEq`, you could check for equality instead of pattern matching
+   |
+LL -     if let X = X {
+LL +     if X == X {
+   |
+
+error: aborting due to 1 previous error
+
+"##;
+    let name = "derive-and-manual-partialeq-issue-147714.rs";
+    assert_eq!(ui_std(name, "2015", "sized,fmt,derive,eq,panic", PRINTLN, source), stderr);
+}
+
+#[test]
+fn a_type_without_partial_eq_inside_the_constant_is_labelled() {
+    // tests/ui/consts/const_in_pattern/reject_non_partial_eq.rs
+    let source = r##"// This test is illustrating the difference between how failing to derive
+// `PartialEq` is handled compared to failing to implement it at all.
+
+// See also RFC 1445
+
+#[derive(PartialEq, Eq)]
+struct Structural(u32);
+
+struct NoPartialEq(u32);
+
+struct NoDerive(u32);
+
+// This impl makes NoDerive irreflexive.
+impl PartialEq for NoDerive { fn eq(&self, _: &Self) -> bool { false } }
+
+impl Eq for NoDerive { }
+
+const NO_DERIVE_NONE: Option<NoDerive> = None;
+const NO_PARTIAL_EQ_NONE: Option<NoPartialEq> = None;
+
+fn main() {
+    match None {
+        NO_DERIVE_NONE => println!("NO_DERIVE_NONE"),
+        _ => panic!("whoops"),
+    }
+
+    match None {
+        NO_PARTIAL_EQ_NONE => println!("NO_PARTIAL_EQ_NONE"),
+        //~^ ERROR constant of non-structural type `Option<NoPartialEq>` in a pattern
+        _ => panic!("whoops"),
+    }
+}
+"##;
+    let stderr = r##"error: constant of non-structural type `Option<NoPartialEq>` in a pattern
+  --> $DIR/reject_non_partial_eq.rs:28:9
+   |
+LL | struct NoPartialEq(u32);
+   | ------------------ must be annotated with `#[derive(PartialEq)]` to be usable in patterns
+...
+LL | const NO_PARTIAL_EQ_NONE: Option<NoPartialEq> = None;
+   | --------------------------------------------- constant defined here
+...
+LL |         NO_PARTIAL_EQ_NONE => println!("NO_PARTIAL_EQ_NONE"),
+   |         ^^^^^^^^^^^^^^^^^^ constant of non-structural type
+   |
+   = note: see https://doc.rust-lang.org/stable/std/marker/trait.StructuralPartialEq.html for details
+
+error: aborting due to 1 previous error
+
+"##;
+    let name = "reject_non_partial_eq.rs";
+    assert_eq!(ui_std(name, "2015", "sized,fmt,derive,eq,option,panic", PRINTLN, source), stderr);
 }

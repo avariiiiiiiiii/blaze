@@ -197,27 +197,28 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 ResolveValueResult::ValueNs(it) => {
                     drop_ctx(ctx, no_diagnostics);
 
-                    let args = if let Path::LangItem(..) = path {
-                        let def_and_container = match it {
-                            ValueNs::ConstId(it) => Some((it.into(), it.loc(self.db).container)),
-                            ValueNs::FunctionId(it) => Some((it.into(), it.loc(self.db).container)),
-                            _ => None,
-                        };
-                        let def_and_container =
-                            def_and_container.and_then(|(def, container)| match container {
-                                ItemContainerId::ImplId(it) => Some((def, it.into())),
-                                ItemContainerId::TraitId(it) => Some((def, it.into())),
-                                ItemContainerId::ExternBlockId(_)
-                                | ItemContainerId::ModuleId(_) => None,
-                            });
-                        def_and_container.map(|(def, container)| {
-                            let args = self.infcx().fresh_args_for_item(id.into(), container);
-                            self.write_assoc_resolution(id, def, args);
-                            args
-                        })
-                    } else {
-                        None
+                    // A trait's function or constant reached by a plain path (`use Trait::f;`,
+                    // `import_trait_associated_functions`) is rustc's `<_ as Trait>::f`; an
+                    // impl's item is only reached so through a lang item path.
+                    let is_lang_item = matches!(path, Path::LangItem(..));
+                    let def_and_container = match it {
+                        ValueNs::ConstId(it) => Some((it.into(), it.loc(self.db).container)),
+                        ValueNs::FunctionId(it) => Some((it.into(), it.loc(self.db).container)),
+                        _ => None,
                     };
+                    let def_and_container =
+                        def_and_container.and_then(|(def, container)| match container {
+                            ItemContainerId::ImplId(it) if is_lang_item => Some((def, it.into())),
+                            ItemContainerId::TraitId(it) => Some((def, it.into())),
+                            ItemContainerId::ImplId(_)
+                            | ItemContainerId::ExternBlockId(_)
+                            | ItemContainerId::ModuleId(_) => None,
+                        });
+                    let args = def_and_container.map(|(def, container)| {
+                        let args = self.infcx().fresh_args_for_item(id.into(), container);
+                        self.write_assoc_resolution(id, def, args);
+                        args
+                    });
 
                     (it, args)
                 }

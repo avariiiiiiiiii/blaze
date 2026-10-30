@@ -123,6 +123,8 @@ struct Clif {
     words: Vec<u32>,
     relocs: Vec<code::Reloc>,
     unwind: Option<UnwindInfo>,
+    /// `frame_to_fp_offset` of its frame layout.
+    frame: u32,
 }
 
 fn cranelift(func: &ir::Function, target: &Target) -> Clif {
@@ -146,7 +148,8 @@ fn cranelift(func: &ir::Function, target: &Target) -> Clif {
         })
         .collect();
     let unwind = compiled.create_unwind_info(&*isa).expect("unwind information");
-    Clif { words: words(compiled.code_buffer()), relocs, unwind }
+    let frame = compiled.buffer.frame_layout().expect("a frame layout").frame_to_fp_offset;
+    Clif { words: words(compiled.code_buffer()), relocs, unwind, frame }
 }
 
 /// The patcher's stand-in.
@@ -382,6 +385,31 @@ fn thread_local(conv: CallConv) -> ir::Function {
     })
 }
 
+/// `global_value` of a data symbol (16 bytes in, not colocated) less 8, loaded from at 24,
+/// and of a thread-local.
+fn globals(conv: CallConv) -> ir::Function {
+    build(sig(conv, &[], &[I64]), |b, _| {
+        let base = symbol(b, 3, 16, false, false);
+        let less = b.create_global_value(ir::GlobalValueData::IAddImm {
+            base,
+            offset: Imm64::new(-8),
+            global_type: I64,
+        });
+        let flags = b.func.dfg.mem_flags.insert(ir::MemFlagsData::trusted()).expect("flags");
+        let loaded = b.create_global_value(ir::GlobalValueData::Load {
+            base: less,
+            offset: 24.into(),
+            global_type: I64,
+            flags,
+        });
+        let v = b.ins().global_value(I64, loaded);
+        let tls = symbol(b, 4, 0, false, true);
+        let t = b.ins().global_value(I64, tls);
+        let sum = b.ins().iadd(v, t);
+        b.ins().return_(&[sum]);
+    })
+}
+
 /// The relocations but the tier counters', which Cranelift's code has none of.
 fn kinds(relocs: &[code::Reloc]) -> Vec<(Reloc, Name, i64)> {
     relocs
@@ -513,6 +541,73 @@ fn probes_are_cranelifts() {
             words(buf.bytes())
         });
         assert_eq!(ours[2..2 + len], clif.words[2..2 + len], "{size}");
+    }
+}
+
+/// What the epilogue frees before the last `ldp x29, x30, [sp], #16` and `ret`: its `add sp`
+/// immediates and its restores' post-index steps, the distance from `x29` down to `sp`.
+fn freed(words: &[u32]) -> u32 {
+    let end = words
+        .windows(2)
+        .rposition(|w| w == [0xa8c1_7bfd, inst::RET])
+        .expect("an epilogue");
+    let mut bytes = 0;
+    for &w in words[..end].iter().rev() {
+        if w & 0xffc0_03e0 == 0xa8c0_03e0 || w & 0xffc0_03e0 == 0x6cc0_03e0 {
+            // `ldp` of X or D registers from `[sp], #imm`.
+            bytes += ((w >> 15) & 0x7f) * 8;
+        } else if w & 0xffe0_0fe0 == 0xf840_07e0 || w & 0xffe0_0fe0 == 0xfc40_07e0 {
+            // `ldr` of one X or D register from `[sp], #imm`.
+            bytes += (w >> 12) & 0x1ff;
+        } else if w & 0xff80_03ff == 0x9100_03ff {
+            // `add sp, sp, #imm`, shifted by 12 or not.
+            bytes += ((w >> 10) & 0xfff) << if w & (1 << 22) != 0 { 12 } else { 0 };
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
+/// A leaf whose frame is one stack slot of `bytes`.
+fn leaf_with_slot(conv: CallConv, bytes: u32) -> ir::Function {
+    build(sig(conv, &[], &[]), |b, _| {
+        b.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, bytes, 4));
+        b.ins().return_(&[]);
+    })
+}
+
+#[test]
+fn the_frame_is_cranelifts_frame_to_fp_offset() {
+    // Cranelift's `frame_to_fp_offset` (`fixed_frame_storage_size + clobber_size +
+    // outgoing_args_size`) is what its epilogue frees, with saves and stack arguments.
+    for (func, target) in [
+        (leaf_with_slot(CallConv::SystemV, 64), LINUX),
+        (leaf_with_slot(CallConv::AppleAarch64, 2000), MACOS),
+        (callers(CallConv::SystemV, I64), LINUX),
+        (callers(CallConv::AppleAarch64, I32), MACOS),
+    ] {
+        let clif = cranelift(&func, &target);
+        assert!(clif.frame > 0);
+        assert_eq!(freed(&clif.words), clif.frame, "{:?}", target.os);
+    }
+    // Ours is the same distance in our frame, and the compile's `Code` says it.
+    for (func, target) in [
+        (leaf(CallConv::SystemV), LINUX),
+        (callers(CallConv::SystemV, I64), LINUX),
+        (callers(CallConv::AppleAarch64, I32), MACOS),
+    ] {
+        let ours = whole(&func, &target);
+        let size = Aarch64::frame_size(&ours.frame);
+        assert_eq!(freed(&ours.words), size, "{:?}", target.os);
+        assert_eq!(size, frame::SAVES + AREA.size + ours.frame.outgoing);
+    }
+    let library = mock();
+    for target in [LINUX, MACOS, WINDOWS] {
+        let func = leaf_with_slot(conv(&target), 64);
+        let code = compile_in::<Aarch64, _>(&func, &target, &library, |it, _| it.to_code())
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(freed(&words(&code.bytes)), code.frame, "{:?}", target.os);
     }
 }
 
@@ -661,12 +756,38 @@ fn thread_locals_are_cranelifts() {
 }
 
 #[test]
+fn global_values_are_cranelifts() {
+    for target in [LINUX, MACOS, LINUX_STATIC] {
+        let func = globals(conv(&target));
+        let clif = cranelift(&func, &target);
+        let ours = whole(&func, &target);
+        assert_eq!(kinds(&ours.relocs), kinds(&clif.relocs), "{:?} pic {}", target.os, target.pic);
+        // The thread-local's is a call.
+        assert_eq!(ours.sites.len(), 1);
+    }
+    // Static and not colocated: `ldr x16, #8`, `b #12`, the literal at `Abs8`, then
+    // `sub x16, x16, #8` and `ldur x16, [x16, #24]`.
+    let func = globals(CallConv::SystemV);
+    let ours = whole(&func, &LINUX_STATIC);
+    let span = ours.span(ir::Opcode::GlobalValue, &func);
+    assert_eq!(span[..2], [inst::ldr_lit(inst::X16, 8), inst::b(3)]);
+    assert_eq!(span[4..6], [0xd100_2210, inst::ldur(inst::LDRX, inst::X16, inst::X16, 24)]);
+    let literal = ours.relocs.iter().find(|reloc| reloc.kind == Reloc::Abs8).expect("an Abs8");
+    assert_eq!((literal.name, literal.addend), (Name::User { namespace: 1, index: 3 }, 16));
+}
+
+#[test]
 fn bounds_hold() {
     for target in [LINUX, MACOS, LINUX_STATIC] {
         let conv = conv(&target);
-        for func in
-            [leaf(conv), callers(conv, I64), callers(conv, I32), thread_local(conv), switch()]
-        {
+        for func in [
+            leaf(conv),
+            callers(conv, I64),
+            callers(conv, I32),
+            thread_local(conv),
+            globals(conv),
+            switch(),
+        ] {
             let ours = whole(&func, &target);
             assert!(ours.prologue <= ours.frame.entry);
             assert!(ours.frame.entry <= Aarch64::bound_fixed(&ours.frame));

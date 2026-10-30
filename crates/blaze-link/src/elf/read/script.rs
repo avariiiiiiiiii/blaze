@@ -1,6 +1,7 @@
 //! GNU linker scripts given as shared libraries, as glibc ships `libc.so`:
 //! `GROUP ( /lib/x86_64-linux-gnu/libc.so.6 /usr/lib/x86_64-linux-gnu/libc_nonshared.a
-//! AS_NEEDED ( /lib64/ld-linux-x86-64.so.2 ) )`. Only the commands that name inputs are read.
+//! AS_NEEDED ( /lib64/ld-linux-x86-64.so.2 ) )`, and Debian's `libgcc_s.so`:
+//! `GROUP ( libgcc_s.so.1 -lgcc )`. Only the commands that name inputs are read.
 
 use crate::model::{Names, Shared};
 
@@ -91,13 +92,12 @@ fn list(lexer: &mut Lexer<'_, '_>, as_needed: bool, inputs: &mut Vec<String>) ->
                 lexer.next()?;
                 list(lexer, true, inputs)?;
             }
-            Token::Word(library) if library.starts_with("-l") => {
+            Token::Word("-l" | "-l:") => {
                 // alloc: error path
-                return Err(format!(
-                    "{name}: linker script names {library}: blaze does not search library \
-                     directories from a linker script; name the file's path"
-                ));
+                return Err(format!("{name}: linker script: -l names no library"));
             }
+            // `-lNAME` and `-l:FILE` too, as written: `target::locate` searches for them and the
+            // engine finds them on the line.
             Token::Word(file) => inputs.push(file.to_owned()), // alloc: once per input the script names, `Shared::inputs`
             other => {
                 // alloc: error path

@@ -15,3 +15,4 @@ encoding was the wrong one for this use anyway. No behavior change on Unix.
 
 > forwarded to the coordinator: `crates/blaze-global` is no lane's in crates.md, so the coordinator's; on requests' coordinator list (it doesn't compile against usercode's `os_bytes` until then).
 > forwarded to fastcompile (`crates/blaze-global/` is its, running; told by tmux).
+> applied by fastcompile-sol-global, 2026-10-29. The `trace` import stays: `public.rs` still uses `trace::ALL_ENV_NAME` and `trace::untraceable_name`.

@@ -63,6 +63,7 @@ impl AllowedOptions for TrackedFn {
 
     const SELF_TY: bool = true;
     const MEM_TAG: bool = true;
+    const IMAGE: bool = false;
 
     const PERSIST: AllowedPersistOptions = AllowedPersistOptions::AllowedIdent;
 }

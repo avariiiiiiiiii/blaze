@@ -5,6 +5,23 @@ From lane db's child `db-crateattr` (2026-10-29), for diagnostics.md "diagnostic
 
 ## for diagnostics: read `-Z crate-attr` off its files (`checks.rs`, `lints/syntax/attrs.rs`)
 
+> applied by diagnostics-crateattr (2026-10-29 23:30): item 3. Each refused attribute is
+> reported in `lower/parse/crate_attr.rs`, called from `lower/parse.rs` `parsed` right after the
+> crate root (rustc's `parse` then `inject`), at `Phase::Parse`, not fatal unless rustc's lexer
+> raises one; each finding has `Fact::Crate`. rustc's `.stderr` files differ from this request
+> in three ways (`v2/requests/diagnostics-crateattr.md`): columns and source lines are the
+> wrapped `#![..]` text's (nothing is subtracted); delimiters are matched against the `[`/`]`
+> around the attribute, so the errors are `lower_file`'s of the whole file; and trailing tokens
+> are "unexpected token: .." or "expected `]`, found ..", never "invalid crate attribute".
+> Files are named `<crate attribute>` with their text after a NUL (`emit::name_with_text`), so
+> `Cx::file_of`, `Cx::snippet` and the emitter read each attribute's own text and cargo reads
+> nothing; no `cargo.md` request was needed.
+> Columns, checked against the `.stderr` files (rust-lang/rust ad3d0bc, 2026-07-31) on the
+> parent's request: `garbage` (`-Zcrate-attr=`%~@$#`) puts the attribute's first byte at
+> `<crate attribute>:1:4` and shows `#![`%~@$#]`; `multiple` (`feature(foo),feature(bar)`) puts
+> the `,` at `1:16`, which is 13 in the attribute as given. So the columns count the whole
+> `#![..]` text, and the "subtract `CRATE_ATTR_PREFIX.len()`" in item 3 would be off by 3.
+
 `hir_def::attrs::parse_extra_crate_attrs{,_view}` are deleted. Each crate attribute is now a file
 of its own (base-db `crate::crate_attrs`): text `#![<attr>]`, at the crate's edition, in the crate
 root's source root with no path there, shown as `base_db::CRATE_ATTR_FILE_NAME`
@@ -74,3 +91,4 @@ base-db's is the lasting fix.
 > (lane cargo) and `blaze-engine/src/doctest.rs` `FIRST_FILE` (lane codegen).
 
 > forwarded to db (routed by db-next4 to db-audit-dbsub, its note above) (requests, pass 31).
+> applied by db-audit-dbsub (2026-10-29 23:18), not built: `Files::new_file_id` / `Db::new_file_id(&mut self) -> Option<FileId>` (`crates/base-db/src/files.rs`, `db.rs`) hand out an ID no file, view file or crate attribute has and no earlier call gave (through `Writer::next_file`, the counter views and crate attributes use); `refuse_crate_attr`'s message names it. Test: `crates/base-db/src/tests.rs` `a_new_file_id_meets_no_vfs_file_nor_crate_attr_file`. The moves onto it are filed in `v2/requests/db.md`: "## vfs (requests-next3; vfs is done) and cargo (cargo-next2): load-cargo's file IDs come from base-db" (a cargo reload with `-Z crate-attr` panics today: `Vfs`'s dense numbering lands on the attributes' IDs) and "## codegen (codegen-next1): the doctest builder's file IDs come from base-db"; owners told by tmux.

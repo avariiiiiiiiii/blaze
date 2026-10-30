@@ -88,12 +88,12 @@ impl Stack<'_, Kleene> {
 /// The checks of one definition's rules.
 pub(super) struct Checker<'t> {
     m: &'t Matchers,
-    tokens: &'t Tokens,
+    tokens: &'t Tokens<'t>,
     pub(super) misuses: Vec<Misuse>,
 }
 
 impl<'t> Checker<'t> {
-    pub(super) fn new(m: &'t Matchers, tokens: &'t Tokens) -> Checker<'t> {
+    pub(super) fn new(m: &'t Matchers, tokens: &'t Tokens<'t>) -> Checker<'t> {
         // alloc: empty until a lint fires; holds only what fires
         Checker { m, tokens, misuses: Vec::new() }
     }
@@ -336,15 +336,18 @@ enum Nested {
 #[cfg(test)]
 mod tests {
     use span::Edition;
-    use syntax::{AstNode, SourceFile, ast};
+    use syntax::{
+        SourceFile,
+        view::{self as ast, AstNode as _},
+    };
 
     use super::*;
 
     /// Each misuse in the definition `text`, as the text it is at.
     fn misuses(text: &str) -> Vec<String> {
-        let file = SourceFile::parse(text, Edition::Edition2021).tree();
-        let def = file.syntax().descendants().find_map(ast::Macro::cast).unwrap();
-        let tokens = Tokens::of(&def, &|_| (Edition::Edition2021, true)).unwrap();
+        let file = SourceFile::parse(text, Edition::Edition2021);
+        let def = file.root().descendants().find_map(ast::Macro::cast).unwrap();
+        let tokens = Tokens::of(def, &|_| (Edition::Edition2021, true)).unwrap();
         let (m, rules) = Matchers::rules(&tokens, true, Edition::Edition2021);
         let mut checker = Checker::new(&m, &tokens);
         for rule in rules {

@@ -34,6 +34,8 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 #[cfg(test)]
 mod budget_tests;
+#[cfg(test)]
+mod view_tests;
 
 use salsa::plumbing::{AsId, FromId};
 use thin_vec::ThinVec;
@@ -95,10 +97,9 @@ pub type MacroArg<'db> = (&'db tt::TopSubtree, &'db SyntaxFixupUndoInfo, Span);
 
 /// A macro's expansion tree in one run of [`MacroCallId::parse_macro_expansion`] or
 /// [`MacroCallId::expand_speculative`]: a proc macro's tree or an eager call's input, read in
-/// place; a speculative `macro_rules!` expansion; or a tree built in the run's frame.
+/// place; or a tree built in the run's frame.
 pub(crate) enum Expansion<'db, 'f> {
     Borrowed(&'db tt::TopSubtree),
-    Owned(tt::TopSubtree),
     Framed(tt::TopSubtree<&'f Frame>),
 }
 
@@ -106,7 +107,6 @@ impl Expansion<'_, '_> {
     pub(crate) fn view(&self) -> tt::SubtreeView<'_> {
         match self {
             Expansion::Borrowed(it) => it.view(),
-            Expansion::Owned(it) => it.view(),
             Expansion::Framed(it) => it.view(),
         }
     }
@@ -429,6 +429,23 @@ impl MacroDefKind {
             | MacroDefKind::UnimplementedBuiltIn(id) => id.erase(),
         }
     }
+
+    /// The kind of macro this is: what a call of it expands as.
+    pub fn macro_kind(&self) -> MacroKind {
+        match self {
+            MacroDefKind::Declarative(..) | MacroDefKind::UnimplementedBuiltIn(..) => {
+                MacroKind::Declarative
+            }
+            MacroDefKind::BuiltIn(..) | MacroDefKind::BuiltInEager(..) => {
+                MacroKind::DeclarativeBuiltIn
+            }
+            MacroDefKind::BuiltInDerive(..) => MacroKind::DeriveBuiltIn,
+            MacroDefKind::BuiltInAttr(..) => MacroKind::AttrBuiltIn,
+            MacroDefKind::ProcMacro(_, _, ProcMacroKind::CustomDerive) => MacroKind::Derive,
+            MacroDefKind::ProcMacro(_, _, ProcMacroKind::Attr) => MacroKind::Attr,
+            MacroDefKind::ProcMacro(_, _, ProcMacroKind::Bang) => MacroKind::ProcMacro,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -587,18 +604,7 @@ impl MacroCallId {
     }
 
     pub fn kind(self, db: &Db) -> MacroKind {
-        match self.loc(db).def.kind {
-            MacroDefKind::Declarative(..) => MacroKind::Declarative,
-            MacroDefKind::BuiltIn(..) | MacroDefKind::BuiltInEager(..) => {
-                MacroKind::DeclarativeBuiltIn
-            }
-            MacroDefKind::BuiltInDerive(..) => MacroKind::DeriveBuiltIn,
-            MacroDefKind::ProcMacro(_, _, ProcMacroKind::CustomDerive) => MacroKind::Derive,
-            MacroDefKind::ProcMacro(_, _, ProcMacroKind::Attr) => MacroKind::Attr,
-            MacroDefKind::ProcMacro(_, _, ProcMacroKind::Bang) => MacroKind::ProcMacro,
-            MacroDefKind::BuiltInAttr(..) => MacroKind::AttrBuiltIn,
-            MacroDefKind::UnimplementedBuiltIn(..) => MacroKind::Declarative,
-        }
+        self.loc(db).def.kind.macro_kind()
     }
 
     pub fn is_include_macro(self, db: &Db) -> bool {
@@ -710,7 +716,7 @@ impl MacroCallId {
             unreachable!("an eager call's argument is its location's, read by `macro_arg_considering_derives`");
         }
 
-        let (root, map) = loc.kind.file_id().parse_with_map(db);
+        let map = loc.kind.file_id().span_map(db);
 
         let (is_derive, censor_item_tree_attr_ids, item_node, span) = match &loc.kind {
             MacroCallKind::FnLike { ast_id, .. } => {
@@ -791,9 +797,11 @@ impl MacroCallId {
                 unreachable!("`MacroCallId::macro_arg` called with `MacroCallKind::Derive`")
             }
             MacroCallKind::Attr { ast_id, censored_attr_ids: attr_ids, .. } => {
-                let node = ast_id.to_ptr(db).to_node(&root);
-                let (_, attr) =
-                    attr_ids.invoc_attr().find_attr_range_with_source(db, loc.krate, &node);
+                let (_, attr) = attr_ids.invoc_attr().find_attr_range_with_source_view(
+                    db,
+                    loc.krate,
+                    syntax::view::AnyHasAttrs::new(ast_id.to_view(db)),
+                );
                 let range = attr
                     .path()
                     .map(|path| path.syntax().text_range())
@@ -1124,8 +1132,8 @@ impl MacroCallId {
                 }
                 MacroDefKind::Declarative(it, _) => it
                     .decl_macro_expander(db, loc.krate)
-                    .expand_unhygienic(db, &tt, loc.kind.call_style(), span)
-                    .map(Expansion::Owned),
+                    .expand_unhygienic(db, frame, &tt, loc.kind.call_style(), span)
+                    .map(Expansion::Framed),
                 MacroDefKind::BuiltIn(_, it) => {
                     it.expand(db, frame, self, &tt, span).map_err(Into::into).map(Expansion::Framed)
                 }
@@ -1185,11 +1193,9 @@ fn expand_unimplemented_builtin_macro(
 fn proc_macro_span(db: &Db, ast: AstId<ast::Fn>) -> Span {
     #[salsa::tracked(returns(copy), mem_tag = Expand)]
     fn proc_macro_span(db: &Db, ast: AstId<ast::Fn>, _: ()) -> Span {
-        let (root, span_map) = ast.file_id.parse_with_map(db);
-        let ast_id_map = ast.file_id.ast_id_map(db);
-
-        let node = ast_id_map.get(ast.value).to_node(&root);
-        let range = ast::HasName::name(&node)
+        let span_map = ast.file_id.span_map(db);
+        let node = ast.to_view(db);
+        let range = view::HasName::name(&node)
             .map_or_else(|| node.syntax().text_range(), |name| name.syntax().text_range());
         span_map.span_for_range(range)
     }
@@ -1533,7 +1539,7 @@ impl MacroCallKind {
     pub fn original_call_range(&self, db: &Db, krate: Crate) -> FileRange {
         let get_range = |kind: &_| match kind {
             MacroCallKind::FnLike { ast_id, .. } => {
-                let node = ast_id.to_node(db);
+                let node = ast_id.to_view(db);
                 node.path()
                     .unwrap()
                     .syntax()
@@ -1542,11 +1548,16 @@ impl MacroCallKind {
             }
             MacroCallKind::Derive { ast_id, derive_attr_index, .. } => {
                 // FIXME: should be the range of the macro name, not the whole derive
-                derive_attr_index.find_attr_range(db, krate, *ast_id).1.syntax().text_range()
+                derive_attr_index.find_attr_range_view(db, krate, *ast_id).1.syntax().text_range()
             }
             // FIXME: handle `cfg_attr`
             MacroCallKind::Attr { ast_id, censored_attr_ids: attr_ids, .. } => {
-                attr_ids.invoc_attr().find_attr_range(db, krate, *ast_id).1.syntax().text_range()
+                attr_ids
+                    .invoc_attr()
+                    .find_attr_range_view(db, krate, *ast_id)
+                    .1
+                    .syntax()
+                    .text_range()
             }
         };
 
@@ -1631,7 +1642,8 @@ impl<'db> ExpansionInfo<'db> {
         self.arg.with_value(self.arg_root)
     }
 
-    /// [`Self::map_range_down_exact`] to tokens of the view of the expansion.
+    /// Maps `span` down into the expansion, to tokens of its view: only the ranges whose span is
+    /// `span` exactly.
     pub fn map_range_down_exact_view(
         &self,
         span: Span,
@@ -1677,25 +1689,7 @@ impl<'db> ExpansionInfo<'db> {
     }
 
     /// Maps the passed in file range down into a macro expansion if it is the input to a macro call.
-    ///
-    /// A binary search of the span map's index by anchor, then the run of entries in it.
-    pub fn map_range_down_exact(
-        &self,
-        span: Span,
-    ) -> Option<InMacroFile<impl Iterator<Item = (SyntaxToken, SyntaxContext)> + '_>> {
-        if span.anchor.ast_id == NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER {
-            return None;
-        }
-
-        let tokens = self.exp_map.ranges_with_span_exact(span).flat_map(move |(range, ctx)| {
-            self.expanded.value.covering_element(range).into_token().zip(Some(ctx))
-        });
-
-        Some(InMacroFile::new(self.expanded.file_id, tokens))
-    }
-
-    /// Maps the passed in file range down into a macro expansion if it is the input to a macro call.
-    /// Unlike [`ExpansionInfo::map_range_down_exact`], this will consider spans that contain the given span.
+    /// Unlike [`ExpansionInfo::map_range_down_exact_view`], this will consider spans that contain the given span.
     ///
     /// A binary search of the span map's index by anchor, then the run of entries in it.
     pub fn map_range_down(
@@ -2117,6 +2111,21 @@ impl HirFileId {
         }
     }
 
+    /// [`Self::original_call_node`] as a view: the outermost call, in the real file.
+    pub fn original_call_node_view(self, db: &Db) -> Option<InRealFile<view::Node<'_>>> {
+        let mut call = self.macro_file()?.loc(db).to_node_view(db);
+        loop {
+            match call.file_id {
+                HirFileId::FileId(file_id) => {
+                    break Some(InRealFile { file_id, value: call.value });
+                }
+                HirFileId::MacroFile(macro_call_id) => {
+                    call = macro_call_id.loc(db).to_node_view(db);
+                }
+            }
+        }
+    }
+
     pub fn call_node(self, db: &Db) -> Option<InFile<SyntaxNode>> {
         Some(self.macro_file()?.loc(db).to_node(db))
     }
@@ -2124,19 +2133,6 @@ impl HirFileId {
     /// [`Self::call_node`] as a view.
     pub fn call_node_view(self, db: &Db) -> Option<InFile<view::Node<'_>>> {
         Some(self.macro_file()?.loc(db).to_node_view(db))
-    }
-
-    pub fn as_builtin_derive_attr_node(
-        &self,
-        db: &Db,
-    ) -> Option<InFile<ast::Attr>> {
-        let macro_file = self.macro_file()?;
-        let loc = macro_file.loc(db);
-        let attr = match loc.def.kind {
-            MacroDefKind::BuiltInDerive(..) => loc.to_node(db),
-            _ => return None,
-        };
-        Some(attr.with_value(ast::Attr::cast(attr.value.clone())?)) // clone: a node handle, a non-atomic count
     }
 
     /// Main public API -- parses a hir file, not caring whether it's a real
@@ -2156,21 +2152,6 @@ impl HirFileId {
         match self {
             HirFileId::FileId(file_id) => file_id.parse(db).root(),
             HirFileId::MacroFile(macro_file) => macro_file.parse_macro_expansion(db).value.0.root(),
-        }
-    }
-
-    /// The file's root node and span map. A macro file's root is made from the memo in place,
-    /// with no clone of its parse.
-    pub(crate) fn parse_with_map(self, db: &Db) -> (SyntaxNode, SpanMap<'_>) {
-        match self {
-            HirFileId::FileId(file_id) => (
-                file_id.parse(db).syntax_node(),
-                SpanMap::RealSpanMap(crate::span_map::real_span_map(db, file_id)),
-            ),
-            HirFileId::MacroFile(macro_file) => {
-                let (parse, map) = &macro_file.parse_macro_expansion(db).value;
-                (parse.syntax_node(), SpanMap::ExpansionSpanMap(map))
-            }
         }
     }
 
@@ -2197,7 +2178,7 @@ impl HirFileId {
 impl HirFileId {
     #[salsa::tracked(lru = 1024, returns(ref), mem_tag = Expand)]
     pub fn ast_id_map(self, db: &Db) -> AstIdMap {
-        AstIdMap::from_source(&self.parse_or_expand(db))
+        AstIdMap::from_view(self.root(db))
     }
 
     /// The ranges of the file's syntax errors, sorted by where they start: what

@@ -107,14 +107,24 @@ pub type ImplTraitIdx = la_arena::Idx<ImplTrait>;
 
 #[derive(PartialEq, Eq, Debug, Hash, SalsaValue)]
 pub struct SelfAndAssocBounds {
+    /// The self bounds, then the associated type bounds from `assoc_ty_bounds_start`, then from
+    /// `const_bounds_start` each written `[const] Trait` bound again as `HostEffect(Maybe)`.
     bounds: StoredEarlyBinder<StoredClauses>,
     assoc_ty_bounds_start: u32,
+    const_bounds_start: u32,
 }
 
 impl SelfAndAssocBounds {
     #[inline]
     pub fn all_bounds(&self) -> EarlyBinder<'_, &[Clause<'_>]> {
-        self.bounds.get().map_bound(|it| it.as_slice())
+        self.bounds.get().map_bound(|it| &it.as_slice()[..self.const_bounds_start as usize])
+    }
+
+    /// rustc's `explicit_implied_const_bounds` of an associated type or opaque: its written
+    /// `[const] Trait` item bounds, as `HostEffect(Maybe)` clauses on the alias.
+    #[inline]
+    pub fn const_bounds(&self) -> EarlyBinder<'_, &[Clause<'_>]> {
+        self.bounds.get().map_bound(|it| &it.as_slice()[self.const_bounds_start as usize..])
     }
 
     #[inline]
@@ -1063,6 +1073,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                                 Clauses::empty().store(),
                             ),
                             assoc_ty_bounds_start: 0,
+                            const_bounds_start: 0,
                         });
 
                         let impl_trait_id = origin.either(
@@ -1842,8 +1853,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
         let mut predicates = Vec::new_in(self.frame);
         let mut assoc_ty_bounds = Vec::new_in(self.frame);
+        let mut const_bounds = Vec::new_in(self.frame);
         for b in bounds {
             for (pred, source) in self.lower_type_bound(b, self_ty, false) {
+                const_bounds.extend(maybe_const_bound(interner, b, pred, &source));
                 match source {
                     GenericPredicateSource::SelfOnly => predicates.push(pred),
                     GenericPredicateSource::AssocTyBound => assoc_ty_bounds.push(pred),
@@ -1874,11 +1887,14 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
         let assoc_ty_bounds_start = predicates.len() as u32;
         predicates.extend(assoc_ty_bounds);
+        let const_bounds_start = predicates.len() as u32;
+        predicates.extend(const_bounds);
 
         self.is_lowering_impl_trait_bounds = prev_is_lowering_impl_trait_bounds;
         SelfAndAssocBounds {
             bounds: StoredEarlyBinder::bind(interner, Clauses::new_from_slice(&predicates).store()),
             assoc_ty_bounds_start,
+            const_bounds_start,
         }
     }
 
@@ -3167,6 +3183,45 @@ pub(crate) fn type_alias_self_bounds<'db>(
     type_alias_bounds_with_diagnostics(db, type_alias).value.self_bounds()
 }
 
+/// rustc's `explicit_implied_const_bounds` of an associated type or opaque (its
+/// `explicit_item_bounds_with_filter(.., ConstIfConst)`): each `[const] Trait` written on the
+/// item, as a `HostEffect(Maybe)` clause on the alias. A trait's where clauses on `Self::Assoc`
+/// add none, as rustc's `bounds_from_parent` reads `explicit_predicates_of`, which has no
+/// host effects.
+pub(crate) fn implied_const_bounds<'db>(
+    db: &'db Db,
+    item: crate::next_solver::util::ItemWithBounds<'db>,
+) -> EarlyBinder<'db, &'db [Clause<'db>]> {
+    use crate::next_solver::util::ItemWithBounds;
+    match item {
+        ItemWithBounds::TypeAliasId(alias) => {
+            type_alias_bounds_with_diagnostics(db, alias).value.const_bounds()
+        }
+        ItemWithBounds::InternedOpaqueTyId(opaque) => opaque.loc(db).bounds(db).const_bounds(),
+    }
+}
+
+/// `pred`, lowered from `bound`, as rustc's `ConstIfConst` filter keeps it: the trait clause of a
+/// `[const] Trait` bound on the item itself, as `HostEffect(Maybe)`.
+fn maybe_const_bound<'db>(
+    interner: DbInterner<'db>,
+    bound: &TypeBound,
+    pred: Clause<'db>,
+    source: &GenericPredicateSource,
+) -> Option<Clause<'db>> {
+    if !matches!(bound, TypeBound::Path(_, TraitBoundModifier::MaybeConst))
+        || !matches!(source, GenericPredicateSource::SelfOnly)
+    {
+        return None;
+    }
+    let trait_clause = pred.as_trait_clause()?;
+    Some(
+        trait_clause
+            .map_bound(|it| it.trait_ref)
+            .to_host_effect_clause(interner, rustc_type_ir::BoundConstness::Maybe),
+    )
+}
+
 #[salsa::tracked(returns(ref), mem_tag = Infer)]
 pub(crate) fn type_alias_bounds_with_diagnostics<'db>(
     db: &'db Db,
@@ -3202,13 +3257,17 @@ fn type_alias_bounds_in<'db>(
 
     let mut bounds = Vec::new_in(frame);
     let mut assoc_ty_bounds = Vec::new_in(frame);
+    let mut const_bounds = Vec::new_in(frame);
     for bound in &type_alias_data.bounds {
-        ctx.lower_type_bound(bound, interner_ty, false).for_each(|(pred, source)| match source {
-            GenericPredicateSource::SelfOnly => {
-                bounds.push(pred);
-            }
-            GenericPredicateSource::AssocTyBound => {
-                assoc_ty_bounds.push(pred);
+        ctx.lower_type_bound(bound, interner_ty, false).for_each(|(pred, source)| {
+            const_bounds.extend(maybe_const_bound(interner, bound, pred, &source));
+            match source {
+                GenericPredicateSource::SelfOnly => {
+                    bounds.push(pred);
+                }
+                GenericPredicateSource::AssocTyBound => {
+                    assoc_ty_bounds.push(pred);
+                }
             }
         });
     }
@@ -3249,11 +3308,14 @@ fn type_alias_bounds_in<'db>(
 
     let assoc_ty_bounds_start = bounds.len() as u32;
     bounds.extend(assoc_ty_bounds);
+    let const_bounds_start = bounds.len() as u32;
+    bounds.extend(const_bounds);
 
     TyLoweringResult::from_ctx(
         SelfAndAssocBounds {
             bounds: StoredEarlyBinder::bind(interner, Clauses::new_from_slice(&bounds).store()),
             assoc_ty_bounds_start,
+            const_bounds_start,
         },
         ctx,
     )
@@ -3776,6 +3838,44 @@ pub(crate) fn generic_predicates<'db, 'f>(
     def: GenericDefId,
     frame: &'f Frame,
 ) -> FrameLowered<'f, 'db, GenericPredicates> {
+    lower_generic_predicates(db, def, frame, None)
+}
+
+/// Where a predicate of [`GenericPredicates::query_all`] comes from, for rustc's "required by
+/// this bound in `f`" and "the implicit `Sized` requirement on this type parameter".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PredicateSource {
+    /// A trait's own `Self: Trait`, which no one writes.
+    ImpliedTrait(TraitId),
+    /// From `GenericParams::of(def).where_predicates()[index]`: a bound written on a parameter,
+    /// in a where clause, or an `impl Trait` argument's.
+    Written { def: GenericDefId, index: u32 },
+    /// A type parameter's implicit `Sized`.
+    ImplicitSized(TypeParamId),
+    /// A const parameter's `ConstArgHasType`.
+    ConstParamType(ConstParamId),
+}
+
+/// The source of each predicate of [`GenericPredicates::query_all`]`(db, def)`, in its order:
+/// the predicates lowered again, so only for an error.
+pub fn predicate_sources(db: &Db, def: GenericDefId) -> Vec<PredicateSource> {
+    blaze_mem::frame::current(|frame| {
+        let mut sources = Vec::new(); // alloc: error path, one per predicate
+        let _ = lower_generic_predicates(db, def, frame, Some(&mut sources));
+        sources
+    })
+}
+
+fn lower_generic_predicates<'db, 'f>(
+    db: &'db Db,
+    def: GenericDefId,
+    frame: &'f Frame,
+    sources: Option<&mut Vec<PredicateSource>>,
+) -> FrameLowered<'f, 'db, GenericPredicates> {
+    // alloc: error path, only when `sources` is asked for
+    let mut own_sources = sources.is_some().then(Vec::new);
+    // alloc: error path, as `own_sources`
+    let mut assoc_sources = sources.is_some().then(Vec::new);
     let generics = generics(db, def);
     let store = generics.store();
     let generics = &OnceCell::from(generics);
@@ -3799,6 +3899,7 @@ pub(crate) fn generic_predicates<'db, 'f>(
     let mut own_predicates = Vec::new_in(frame);
     let mut own_assoc_ty_bounds = Vec::new_in(frame);
     let own_implicit_trait_predicate = implicit_trait_predicate(interner, def);
+    let generics_parent = generics.parent().map(|parent| parent.def());
     let parent = if let Some(parent) = generics.parent() {
         GenericPredicates::query_with_diagnostics(db, parent.def()).value
     } else {
@@ -3807,17 +3908,30 @@ pub(crate) fn generic_predicates<'db, 'f>(
 
     let generics = myself;
 
-    for pred in generics.where_predicates() {
+    for (index, pred) in generics.where_predicates().iter().enumerate() {
         tracing::debug!(?pred);
+        let written = PredicateSource::Written { def, index: index as u32 };
         for (pred, source) in ctx.lower_where_predicate(pred, false) {
             match source {
-                GenericPredicateSource::SelfOnly => own_predicates.push(pred),
-                GenericPredicateSource::AssocTyBound => own_assoc_ty_bounds.push(pred),
+                GenericPredicateSource::SelfOnly => {
+                    own_predicates.push(pred);
+                    own_sources.iter_mut().for_each(|it| it.push(written));
+                }
+                GenericPredicateSource::AssocTyBound => {
+                    own_assoc_ty_bounds.push(pred);
+                    assoc_sources.iter_mut().for_each(|it| it.push(written));
+                }
             }
         }
     }
 
     push_const_arg_has_type_predicates(db, &mut own_predicates, generics);
+    if let Some(own_sources) = &mut own_sources {
+        own_sources.extend(generics.iter_with_idx().filter_map(|(_, id, _)| match id {
+            GenericParamId::ConstParamId(id) => Some(PredicateSource::ConstParamType(id)),
+            _ => None,
+        }));
+    }
 
     if let Some(sized_trait) = sized_trait {
         let mut add_sized_clause = |param_idx, param_id, param_data| {
@@ -3852,6 +3966,7 @@ pub(crate) fn generic_predicates<'db, 'f>(
                 )),
             ));
             own_predicates.push(clause);
+            own_sources.iter_mut().for_each(|it| it.push(PredicateSource::ImplicitSized(param_id)));
         };
         generics.iter_with_idx().for_each(|(param_idx, param_id, param_data)| {
             add_sized_clause(param_idx, param_id, param_data);
@@ -3885,6 +4000,18 @@ pub(crate) fn generic_predicates<'db, 'f>(
         own_assoc_ty_bounds_start,
         predicates: StoredEarlyBinder::bind(interner, Clauses::new_from_slice(&all).store()),
     };
+    if let Some(sources) = sources {
+        if let Some(parent) = generics_parent {
+            sources.extend(predicate_sources(db, parent));
+        }
+        if let GenericDefId::TraitId(trait_) = def
+            && own_implicit_trait_predicate.is_some()
+        {
+            sources.push(PredicateSource::ImpliedTrait(trait_));
+        }
+        sources.extend(own_sources.into_iter().flatten());
+        sources.extend(assoc_sources.into_iter().flatten());
+    }
     return FrameLowered::from_ctx(predicates, ctx, frame);
 
     fn implicit_trait_predicate<'db>(

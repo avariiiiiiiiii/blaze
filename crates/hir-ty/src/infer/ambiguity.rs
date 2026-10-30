@@ -6,9 +6,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     /// E0282, E0283 and E0284 for every goal the solver could neither prove nor refute, as
     /// `TypeMustBeKnown` with the goal. rustc reports the pending goals only of a body with no
     /// error yet; those found while normalizing it reported where they were found, so of a body
-    /// with an error they give only what `maybe_report_ambiguity` gives then.
+    /// with an error they give only what `maybe_report_ambiguity` gives then. The goals stalled
+    /// on a coroutine of the body are kept, not reported (rustc's `coroutine_stalled_predicates`).
     pub(super) fn report_ambiguity_errors(&mut self) {
-        let (mut errors, pending) = self.table.take_ambiguity_errors();
+        let (mut errors, pending, stalled) = self.table.take_ambiguity_errors();
+        self.coroutine_stalled.extend(
+            stalled.into_iter().map(|it| (it.cause.span(), it.predicate.store())),
+        );
         let tainted = self.tainted_by_errors();
         if !tainted {
             errors.extend(pending);

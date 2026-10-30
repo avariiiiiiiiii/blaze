@@ -278,7 +278,7 @@ fn check_impl(
 
             let type_mismatches =
                 inference_result.diagnostics().iter().filter_map(|diag| match diag {
-                    InferenceDiagnostic::TypeMismatch { node, expected, found } => {
+                    InferenceDiagnostic::TypeMismatch { node, expected, found, .. } => {
                         Some((*node, expected.as_ref(), found.as_ref()))
                     }
                     _ => None,
@@ -413,7 +413,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                 .diagnostics()
                 .iter()
                 .filter_map(|diag| match diag {
-                    InferenceDiagnostic::TypeMismatch { node, expected, found } => {
+                    InferenceDiagnostic::TypeMismatch { node, expected, found, .. } => {
                         Some((*node, (expected.as_ref(), found.as_ref())))
                     }
                     _ => None,

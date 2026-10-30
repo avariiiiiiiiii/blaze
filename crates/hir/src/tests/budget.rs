@@ -237,6 +237,43 @@ fn the_accessors_iterator_forms_allocate_nothing() {
 }
 
 #[test]
+fn a_warm_completion_search_allocates_nothing() {
+    let db = TestDB::with_files(
+        r#"
+//- /main.rs crate:main deps:dep
+fn main() {}
+//- /dep.rs crate:dep
+pub struct Needle;
+pub fn needle_fn() {}
+pub mod needles { pub struct Inner; }
+"#,
+    );
+    crate::attach_db(&db, || {
+        let main = Crate::all(&db)
+            .into_iter()
+            .find(|it| it.display_name(&db).is_some_and(|it| it.crate_name().as_str() == "main"))
+            .expect("the crate `main`");
+        let search = |query: hir_def::import_map::Query| {
+            main.query_external_importables(&db, query).count()
+        };
+        let first = search(hir_def::import_map::Query::new("needle".to_owned()));
+        assert!(first >= 2, "`Needle` and `needle_fn` are found");
+        assert_eq!(search(hir_def::import_map::Query::new("needle".to_owned())), first);
+        // `Query::new` lowercases into a `String`: the request's edge, made outside the budget.
+        let query = hir_def::import_map::Query::new("needle".to_owned());
+        let again = assert_at_most(0, "a warm completion search", || search(query));
+        assert_eq!(again, first);
+        // The same items in the same order on every search.
+        let order = |db: &TestDB| {
+            main.query_external_importables(db, hir_def::import_map::Query::new("needle".to_owned()))
+                .map(|(item, _)| item)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&db), order(&db));
+    });
+}
+
+#[test]
 fn kmerge2_is_kmerge_by() {
     use itertools::Itertools as _;
     let cases: [(&[u32], &[u32]); 6] =

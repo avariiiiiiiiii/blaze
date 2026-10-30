@@ -25,7 +25,8 @@ use blaze_mem::{Frame, Tag, frame};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Line, Relocs, RelocsView, Static, Target, Unwind,
+    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Line, Profiled, Relocs, RelocsView, Static, Target,
+    Unwind,
     content,
 };
 
@@ -45,6 +46,14 @@ pub enum Ref {
     Extern(u32),
     /// The function's own SanitizerCoverage array ([`Target::Coverage`]).
     Coverage(u32),
+    /// The function's own tier-up counter cells ([`Target::Counter`]): of the key it is
+    /// instantiated as, so two counting instances share one template and never one counter.
+    Counter,
+    /// The function's own PGO counters ([`Target::ProfileCounters`]).
+    ProfileCounters,
+    /// The function's own code: [`Target::Direct`] of the key it is instantiated as, the
+    /// offset into it in the addend (a stencil's jump into itself).
+    Own,
 }
 
 /// A data object of a template: it points only at data before it, so each one's content ID
@@ -75,6 +84,8 @@ pub struct Template {
     pub externs: Vec<String>,
     /// Its SanitizerCoverage arrays and PC table, which are its own whatever fills its places.
     pub coverage: Option<Covered>,
+    /// What PGO made of it: its own record and counters, whatever fills its places.
+    pub profile: Option<Profiled>,
 }
 
 /// A function's [`Unwind`], its personality routine or handler by place and its
@@ -110,6 +121,7 @@ pub struct TemplateView<'a> {
     pub externs: &'a [&'a str],
     /// Owned: the function made of the view takes it as it is.
     pub coverage: Option<Covered>,
+    pub profile: Option<Profiled>,
 }
 
 /// A [`TemplateData`] borrowed.
@@ -197,6 +209,7 @@ impl TemplateView<'_> {
     /// of the template the view is of, each part copied once.
     pub fn instantiate(self, key: InstanceKey, refs: &Refs) -> Result<CompiledFunction, TemplateError> {
         check_refs(refs)?;
+        counts_its_own(self.relocs.targets(), self.profile.as_ref())?;
         if refs_len(refs) != self.refs {
             return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
         }
@@ -208,7 +221,7 @@ impl TemplateView<'_> {
                 align: self.align,
                 // alloc: the instance's code, kept by the build
                 code: self.code.to_vec(),
-                relocs: instantiate_relocs(self.relocs, refs, self.externs, &data, None, frame)?,
+                relocs: instantiate_relocs(self.relocs, refs, self.externs, &data, None, Some(key), frame)?,
                 unwind: self.unwind.map(|it| instantiate_unwind(it, refs, &data)).transpose()?,
                 data,
                 // alloc: kept by the build
@@ -217,6 +230,7 @@ impl TemplateView<'_> {
                 // alloc: kept by the build
                 lines: self.lines.to_vec(),
                 coverage: self.coverage,
+                profile: self.profile,
             })
         })
     }
@@ -237,6 +251,7 @@ impl TemplateView<'_> {
             refs: self.refs,
             externs: self.externs.iter().map(|it| (*it).to_owned()).collect(), // alloc: as `code`
             coverage: self.coverage,
+            profile: self.profile,
         }
     }
 }
@@ -251,6 +266,7 @@ pub struct StaticTemplate {
     pub mutable: bool,
     pub thread_local: bool,
     pub section: Option<String>,
+    pub imports: Vec<(String, crate::wasm::Import)>,
     pub refs: u32,
 }
 
@@ -283,6 +299,14 @@ pub enum TemplateError {
     /// A relocation names a SanitizerCoverage array that is not one of a function's
     /// ([`Covered::ARRAYS`]), or a static names one.
     Coverage(u32),
+    /// A relocation names counter cells ([`Target::Counter`]) that are not its function's
+    /// own: another instance's (the key it names), or any from data or a static (`None`).
+    Counter(Option<InstanceKey>),
+    /// A relocation names PGO counters ([`Target::ProfileCounters`]) from data or a static, or
+    /// from code that is not instrumented ([`Profiled::Counted`]).
+    ProfileCounters,
+    /// Data or a static names a function's own code ([`Ref::Own`]), which only its code can.
+    Own,
 }
 
 impl std::fmt::Display for TemplateError {
@@ -298,7 +322,7 @@ impl std::fmt::Display for TemplateError {
                 write!(f, "data object {data} points at data object {points_at}, not one before it")
             }
             TemplateError::NotAReference(target) => {
-                write!(f, "{target:?} is listed as a reference, but is data or a position")
+                write!(f, "{target:?} is listed as a reference, but is data, a position or a function's own")
             }
             TemplateError::Refs { made, given } => {
                 write!(f, "a template made against {made} references is given {given}")
@@ -311,17 +335,42 @@ impl std::fmt::Display for TemplateError {
             TemplateError::Coverage(array) => {
                 write!(f, "a relocation names coverage array {array}, which is no function's own")
             }
+            TemplateError::Counter(Some(key)) => {
+                write!(f, "a function's code names the counter cells of instance {}, not its own", key.0)
+            }
+            TemplateError::Counter(None) => {
+                write!(f, "data or a static names counter cells, which are only a function's code's own")
+            }
+            TemplateError::ProfileCounters => write!(
+                f,
+                "a relocation names PGO counters, which are only an instrumented function's code's own"
+            ),
+            TemplateError::Own => {
+                write!(f, "data or a static names a function's own code, which only that code can")
+            }
         }
     }
 }
 
-pub const TEMPLATE_DOMAIN: &str = "blaze v2 template 3";
+pub const TEMPLATE_DOMAIN: &str = "blaze v2 template 4";
 
 /// The outside symbols of a static's template: a static names none of its own accord.
 const NO_EXTERNS: &[&str] = &[];
 
 fn check_refs(refs: &Refs) -> Result<(), TemplateError> {
-    match refs.iter().find(|it| matches!(it, Target::Data(_) | Target::Position(_) | Target::Coverage(_))) {
+    match refs
+        .iter()
+        .find(|it| {
+            matches!(
+                it,
+                Target::Data(_)
+                    | Target::Position(_)
+                    | Target::Coverage(_)
+                    | Target::Counter(_)
+                    | Target::ProfileCounters
+            )
+        })
+    {
         // clone: an error names the target
         Some(it) => Err(TemplateError::NotAReference(it.clone())),
         None => Ok(()),
@@ -364,13 +413,16 @@ fn own_externs(refs: &Refs, extra: &[String]) -> Result<Vec<String>, TemplateErr
     Ok(externs)
 }
 
-/// `relocs` with each target by its place, its index and remap in `frame`.
+/// `relocs` with each target by its place, its index and remap in `frame`. `own` is the
+/// instance whose code they are, the one whose counter cells they may name; `None` for data
+/// and statics, which name none.
 fn template_relocs(
     relocs: RelocsView<'_, Target>,
     refs: &Refs,
     externs: &[String],
     data: &[Data],
     before: Option<u32>,
+    own: Option<InstanceKey>,
     frame: &Frame,
 ) -> Result<Relocs<Ref>, TemplateError> {
     relocs.try_map_in(frame, |target| {
@@ -390,6 +442,11 @@ fn template_relocs(
             Target::Position(span) => Ref::Position(*span),
             Target::Coverage(array) if *array < Covered::ARRAYS => Ref::Coverage(*array),
             Target::Coverage(array) => return Err(TemplateError::Coverage(*array)),
+            Target::Counter(key) if own == Some(*key) => Ref::Counter,
+            Target::Counter(key) => return Err(TemplateError::Counter(own.map(|_| *key))),
+            Target::ProfileCounters if own.is_some() => Ref::ProfileCounters,
+            Target::ProfileCounters => return Err(TemplateError::ProfileCounters),
+            Target::Direct(key) if own == Some(*key) => Ref::Own,
             other => reference(refs, externs, other)?,
         })
     })
@@ -407,7 +464,7 @@ fn template_data(
             align: it.align,
             // clone: a static's value, once a static
             bytes: it.bytes.clone(),
-            relocs: template_relocs(it.relocs.view(), refs, externs, data, Some(at as u32), frame)?,
+            relocs: template_relocs(it.relocs.view(), refs, externs, data, Some(at as u32), None, frame)?,
         });
     }
     Ok(made)
@@ -422,20 +479,23 @@ fn instantiate_data<E: AsRef<str>>(
 ) -> Result<Vec<Data>, TemplateError> {
     let mut made: Vec<Data> = Vec::with_capacity(data.len());
     for (at, it) in data.iter().enumerate() {
-        let relocs = instantiate_relocs(it.relocs, refs, externs, &made, Some(at as u32), frame)?;
+        let relocs = instantiate_relocs(it.relocs, refs, externs, &made, Some(at as u32), None, frame)?;
         // alloc: the instance's data, kept by the build
         made.push(Data::new(it.align, it.bytes.to_vec(), relocs));
     }
     Ok(made)
 }
 
-/// `relocs` with `refs` in its places, its index and remap in `frame`.
+/// `relocs` with `refs` in its places, its index and remap in `frame`. `own` is the instance
+/// whose code they are, whose counter cells [`Ref::Counter`] names; `None` for data and
+/// statics.
 fn instantiate_relocs<E: AsRef<str>>(
     relocs: RelocsView<'_, Ref>,
     refs: &Refs,
     externs: &[E],
     data: &[Data],
     before: Option<u32>,
+    own: Option<InstanceKey>,
     frame: &Frame,
 ) -> Result<Relocs, TemplateError> {
     relocs.try_map_in(frame, |target| {
@@ -458,8 +518,21 @@ fn instantiate_relocs<E: AsRef<str>>(
             Ref::Position(span) => Target::Position(span),
             Ref::Coverage(array) if array < Covered::ARRAYS => Target::Coverage(array),
             Ref::Coverage(array) => return Err(TemplateError::Coverage(array)),
+            Ref::Counter => Target::Counter(own.ok_or(TemplateError::Counter(None))?),
+            Ref::ProfileCounters if own.is_some() => Target::ProfileCounters,
+            Ref::ProfileCounters => return Err(TemplateError::ProfileCounters),
+            Ref::Own => Target::Direct(own.ok_or(TemplateError::Own)?),
         })
     })
+}
+
+/// A function's code names PGO counters only when it is instrumented: they are its record's.
+fn counts_its_own(targets: &[Ref], profile: Option<&Profiled>) -> Result<(), TemplateError> {
+    let counted = profile.is_some_and(|it| it.counted().is_some());
+    match !counted && targets.contains(&Ref::ProfileCounters) {
+        true => Err(TemplateError::ProfileCounters),
+        false => Ok(()),
+    }
 }
 
 fn data_index(data: &[Data], id: ContentId) -> Result<u32, TemplateError> {
@@ -536,15 +609,18 @@ impl Template {
         check_refs(refs)?;
         let externs = own_externs(refs, extra)?;
         let (relocs, mut data) = frame::task(Tag::Codegen, |frame| {
-            let relocs = template_relocs(function.relocs.view(), refs, &externs, &function.data, None, frame)?;
+            let own = Some(function.key);
+            let relocs = template_relocs(function.relocs.view(), refs, &externs, &function.data, None, own, frame)?;
             let mut data = Vec::with_capacity(function.data.len());
             for (at, it) in function.data.iter().enumerate() {
-                let relocs = template_relocs(it.relocs.view(), refs, &externs, &function.data, Some(at as u32), frame)?;
+                let at = Some(at as u32);
+                let relocs = template_relocs(it.relocs.view(), refs, &externs, &function.data, at, None, frame)?;
                 // alloc: none: the function's bytes move in once every check has passed
                 data.push(TemplateData { align: it.align, bytes: Vec::new(), relocs });
             }
             Ok::<_, TemplateError>((relocs, data))
         })?;
+        counts_its_own(relocs.targets(), function.profile.as_ref())?;
         let unwind = function.unwind.map(|it| template_unwind(it, refs, &function.data)).transpose()?;
         for (made, it) in data.iter_mut().zip(function.data) {
             made.bytes = it.bytes;
@@ -562,6 +638,7 @@ impl Template {
             refs: refs_len(refs),
             externs,
             coverage: function.coverage,
+            profile: function.profile,
         })
     }
 
@@ -581,6 +658,7 @@ impl Template {
             externs: frame.alloc_slice_fill_with(self.externs.len(), |at| self.externs[at].as_str()),
             // clone: the function made of the view takes it
             coverage: self.coverage.clone(),
+            profile: self.profile,
         }
     }
 
@@ -636,6 +714,7 @@ impl Template {
             hasher.part(name.as_bytes());
         }
         content::covered_into(&mut hasher, self.coverage.as_ref());
+        content::profiled_into(&mut hasher, self.profile.as_ref());
         hasher.finish()
     }
 }
@@ -648,7 +727,7 @@ impl StaticTemplate {
                 Init::Bytes { bytes, relocs } => TemplateInit::Bytes {
                     // clone: a static's value, kept by the build
                     bytes: bytes.clone(),
-                    relocs: template_relocs(relocs.view(), refs, &[], &value.data, None, frame)?,
+                    relocs: template_relocs(relocs.view(), refs, &[], &value.data, None, None, frame)?,
                 },
                 Init::Zeroed { size } => TemplateInit::Zeroed { size: *size },
             };
@@ -664,6 +743,8 @@ impl StaticTemplate {
             thread_local: value.thread_local,
             // clone: a static's value, kept by the build
             section: value.section.clone(),
+            // clone: a static's value, kept by the build
+            imports: value.imports.clone(),
             refs: refs_len(refs),
         })
     }
@@ -681,7 +762,7 @@ impl StaticTemplate {
                 TemplateInit::Bytes { bytes, relocs } => Init::Bytes {
                     // clone: a static's value, kept by the build
                     bytes: bytes.clone(),
-                    relocs: instantiate_relocs(relocs.view(), refs, NO_EXTERNS, &data, None, frame)?,
+                    relocs: instantiate_relocs(relocs.view(), refs, NO_EXTERNS, &data, None, None, frame)?,
                 },
                 TemplateInit::Zeroed { size } => Init::Zeroed { size: *size },
             };
@@ -697,22 +778,27 @@ impl StaticTemplate {
             thread_local: self.thread_local,
             // clone: a static's value, kept by the build
             section: self.section.clone(),
+            // clone: a static's value, kept by the build
+            imports: self.imports.clone(),
         })
     }
 }
 
-/// A static's value and data name no SanitizerCoverage array: those are a function's own.
+/// A static's value and data name no SanitizerCoverage array or PGO counters: those are a
+/// function's own.
 fn names_no_coverage(init: &TemplateInit, data: &[TemplateData]) -> Result<(), TemplateError> {
     let own: &[Ref] = match init {
         TemplateInit::Bytes { relocs, .. } => relocs.targets(),
         TemplateInit::Zeroed { .. } => &[],
     };
     let named = own.iter().chain(data.iter().flat_map(|it| it.relocs.targets())).find_map(|it| match *it {
-        Ref::Coverage(array) => Some(array),
+        Ref::Coverage(array) => Some(TemplateError::Coverage(array)),
+        Ref::ProfileCounters => Some(TemplateError::ProfileCounters),
+        Ref::Own => Some(TemplateError::Own),
         _ => None,
     });
     match named {
-        Some(array) => Err(TemplateError::Coverage(array)),
+        Some(error) => Err(error),
         None => Ok(()),
     }
 }
@@ -724,6 +810,9 @@ fn ref_into(hasher: &mut Hasher, target: &Ref) {
         Ref::Position(SpanRef { anchor, index }) => hasher.update(&[2]).id(&anchor).update(&index.to_le_bytes()),
         Ref::Extern(at) => hasher.update(&[3]).update(&at.to_le_bytes()),
         Ref::Coverage(array) => hasher.update(&[4]).update(&array.to_le_bytes()),
+        Ref::Counter => hasher.update(&[5]),
+        Ref::ProfileCounters => hasher.update(&[6]),
+        Ref::Own => hasher.update(&[7]),
     };
 }
 
@@ -784,6 +873,7 @@ mod tests {
             unwind: None,
             lines: vec![Line { at: 0, span: SpanRef { anchor: ContentId([5; 32]), index: 2 } }],
             coverage: None,
+            profile: None,
         };
         (function, refs)
     }
@@ -945,8 +1035,147 @@ mod tests {
             mutable: false,
             thread_local: false,
             section: None,
+            imports: Vec::new(),
         };
         assert_eq!(StaticTemplate::of(&value, &refs).unwrap_err(), TemplateError::Coverage(1));
+    }
+
+    /// An instrumented function's counters and record are its own: kept by the template, in
+    /// its ID, given back whatever fills its places, and named by nothing else.
+    #[test]
+    fn pgo_counters_are_the_instrumented_functions_own() {
+        let (mut function, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
+        function.relocs.push(Relocation { at: 1, kind: RelocKind::PcRel32, target: Target::ProfileCounters, addend: 4 });
+        let record = crate::ProfileRecord { name: [6; 16], name_ref: 1, hash: 2, counters: 3, version: 10 };
+        let uncounted = function.clone();
+        function.profile = Some(Profiled::Counted(record));
+        let template = Template::of(&function, &refs, &[]).unwrap();
+        assert!(template.relocs.targets().contains(&Ref::ProfileCounters));
+        assert_eq!(template.instantiate(function.key, &refs).unwrap(), function);
+        let (other, other_refs) = reserve(key(4), key(5), ItemKey(ContentId([3; 32])));
+        let other = CompiledFunction { relocs: function.relocs.clone(), profile: function.profile, ..other };
+        assert_eq!(template.instantiate(other.key, &other_refs).unwrap().profile, function.profile);
+        assert_ne!(template.id(), Template { profile: None, ..template.clone() }.id());
+        let used = Template { profile: Some(Profiled::Used { mismatched: true }), ..template.clone() };
+        assert_ne!(used.id(), Template { profile: Some(Profiled::Used { mismatched: false }), ..used.clone() }.id());
+
+        assert_eq!(Template::of(&uncounted, &refs, &[]).unwrap_err(), TemplateError::ProfileCounters);
+        assert_eq!(used.instantiate(function.key, &refs).unwrap_err(), TemplateError::ProfileCounters);
+        let mut from_data = function.clone();
+        from_data.data[0].relocs.push(Relocation { at: 0, kind: RelocKind::Abs64, target: Target::ProfileCounters, addend: 0 });
+        assert_eq!(Template::of(&from_data, &refs, &[]).unwrap_err(), TemplateError::ProfileCounters);
+        let mut listed = refs.clone();
+        listed.push(Target::ProfileCounters);
+        assert_eq!(
+            Template::of(&function, &listed, &[]).unwrap_err(),
+            TemplateError::NotAReference(Target::ProfileCounters)
+        );
+        let value = Static {
+            item: ItemKey(ContentId([3; 32])),
+            instance: ContentId([4; 32]),
+            align: 8,
+            init: Init::Bytes {
+                bytes: vec![0; 8],
+                relocs: vec![Relocation { at: 0, kind: RelocKind::Abs64, target: Target::ProfileCounters, addend: 0 }].into(),
+            },
+            data: Vec::new(),
+            mutable: false,
+            thread_local: false,
+            section: None,
+            imports: Vec::new(),
+        };
+        assert_eq!(StaticTemplate::of(&value, &refs).unwrap_err(), TemplateError::ProfileCounters);
+    }
+
+    /// A function's reference into its own code needs no place: siblings share one template,
+    /// and each instance made of it points into its own code.
+    #[test]
+    fn a_reference_into_its_own_code_is_the_instances_own() {
+        let into_itself = |own: InstanceKey, grow: InstanceKey| {
+            let (mut function, refs) = reserve(own, grow, ItemKey(ContentId([3; 32])));
+            function.relocs.push(Relocation { at: 1, kind: RelocKind::PcRel32, target: Target::Direct(own), addend: 6 });
+            (function, refs)
+        };
+        let (a, a_refs) = into_itself(key(1), key(2));
+        let (b, b_refs) = into_itself(key(4), key(5));
+        let (ta, tb) = (Template::of(&a, &a_refs, &[]).unwrap(), Template::of(&b, &b_refs, &[]).unwrap());
+        assert_eq!(ta, tb);
+        assert!(ta.relocs.targets().contains(&Ref::Own));
+        assert_eq!(ta.instantiate(a.key, &a_refs).unwrap(), a);
+        assert_eq!(ta.instantiate(b.key, &b_refs).unwrap(), b);
+        let made = frame::task(Tag::Codegen, |frame| ta.view(frame).instantiate(b.key, &b_refs)).unwrap();
+        assert_eq!(made, b);
+
+        let (mut from_data, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
+        from_data.data[0].relocs.push(Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Direct(key(1)), addend: 0 });
+        assert_eq!(
+            Template::of(&from_data, &refs, &[]).unwrap_err(),
+            TemplateError::NotReferenced(Target::Direct(key(1)))
+        );
+        let named = StaticTemplate {
+            align: 8,
+            init: TemplateInit::Bytes {
+                bytes: vec![0; 8],
+                relocs: vec![Relocation { at: 0, kind: RelocKind::Abs64, target: Ref::Own, addend: 0 }].into(),
+            },
+            data: Vec::new(),
+            mutable: false,
+            thread_local: false,
+            section: None,
+            imports: Vec::new(),
+            refs: 0,
+        };
+        assert_eq!(named.instantiate(ItemKey(ContentId([3; 32])), ContentId([4; 32]), &[]).unwrap_err(), TemplateError::Own);
+    }
+
+    /// Two counting siblings share one template, and each instance made of it counts in its
+    /// own cells.
+    #[test]
+    fn a_counter_is_the_instances_own() {
+        let counting = |own: InstanceKey, grow: InstanceKey| {
+            let (mut function, refs) = reserve(own, grow, ItemKey(ContentId([3; 32])));
+            for at in [0, 8] {
+                function.relocs.push(Relocation { at: 1, kind: RelocKind::PcRel32, target: Target::Counter(own), addend: at });
+            }
+            (function, refs)
+        };
+        let (a, a_refs) = counting(key(1), key(2));
+        let (b, b_refs) = counting(key(4), key(5));
+        let (ta, tb) = (Template::of(&a, &a_refs, &[]).unwrap(), Template::of(&b, &b_refs, &[]).unwrap());
+        assert_eq!(ta, tb);
+        assert!(ta.relocs.targets().contains(&Ref::Counter));
+        assert_eq!(ta.instantiate(a.key, &a_refs).unwrap(), a);
+        assert_eq!(ta.instantiate(b.key, &b_refs).unwrap(), b);
+        let (plain, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
+        assert_ne!(ta.id(), Template::of(&plain, &refs, &[]).unwrap().id());
+
+        let mut other = plain.clone();
+        other.relocs.push(Relocation { at: 1, kind: RelocKind::PcRel32, target: Target::Counter(key(9)), addend: 0 });
+        assert_eq!(Template::of(&other, &refs, &[]).unwrap_err(), TemplateError::Counter(Some(key(9))));
+        let mut from_data = plain.clone();
+        from_data.data[0].relocs.push(Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Counter(plain.key), addend: 0 });
+        assert_eq!(Template::of(&from_data, &refs, &[]).unwrap_err(), TemplateError::Counter(None));
+        let mut listed = refs.clone();
+        listed.push(Target::Counter(plain.key));
+        assert_eq!(
+            Template::of(&plain, &listed, &[]).unwrap_err(),
+            TemplateError::NotAReference(Target::Counter(plain.key))
+        );
+        let value = Static {
+            item: ItemKey(ContentId([3; 32])),
+            instance: ContentId([4; 32]),
+            align: 8,
+            init: Init::Bytes {
+                bytes: vec![0; 8],
+                relocs: vec![Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Counter(key(1)), addend: 0 }].into(),
+            },
+            data: Vec::new(),
+            mutable: false,
+            thread_local: false,
+            section: None,
+            imports: Vec::new(),
+        };
+        assert_eq!(StaticTemplate::of(&value, &refs).unwrap_err(), TemplateError::Counter(None));
     }
 
     #[test]
@@ -1040,6 +1269,14 @@ mod tests {
             mutable: true,
             thread_local: false,
             section: Some(".init_array".to_owned()),
+            imports: vec![(
+                "host_log".to_owned(),
+                crate::wasm::Import {
+                    module: "env".to_owned(),
+                    field: "log".to_owned(),
+                    ty: crate::wasm::Signature { params: vec![crate::wasm::ValType::I32], results: Vec::new() },
+                },
+            )],
         };
         let template = StaticTemplate::of(&value, &refs).unwrap();
         assert_eq!(template.instantiate(item, value.instance, &refs).unwrap(), value);

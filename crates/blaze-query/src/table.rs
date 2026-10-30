@@ -990,6 +990,31 @@ impl<V: Send + Sync + 'static> Map<V> {
             writer.used = 0;
         }
     }
+
+    /// Gives each shard of this empty map a table that holds as many entries as `like`'s
+    /// shard holds now, so putting the same keys in grows no table: a key's shard is its
+    /// input's bits, the same in both. A table kept at that length is used before a new one.
+    pub(crate) fn size_like(&mut self, like: &Map<V>) {
+        for (shard, other) in self.shards.iter_mut().zip(&like.shards) {
+            let live = other.writer.lock().live;
+            // Grows at the insert that would leave it more than half used (`room`).
+            let len = (live * 2).next_power_of_two().max(FIRST_TABLE);
+            let current = *shard.table.get_mut();
+            let writer = shard.writer.get_mut();
+            assert!(writer.used == 0, "a map sized like another once it had entries");
+            if live == 0 || !current.is_null() && untag(current).1 >= len {
+                continue;
+            }
+            let table = writer.outgrown.take(len).unwrap_or_else(|| new_table(len));
+            if !current.is_null() {
+                // Empty, and `&mut` excludes every reader: kept as the shard's table of its
+                // length.
+                writer.outgrown.hold(Grace::start(), Table(current));
+                writer.outgrown.settle();
+            }
+            *shard.table.get_mut() = table;
+        }
+    }
 }
 
 impl<V: Send + Sync + Clone + 'static> Map<V> {

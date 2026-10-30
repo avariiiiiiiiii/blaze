@@ -20,7 +20,7 @@
 mod harness;
 mod kept;
 mod outside;
-mod proc_macros;
+pub mod proc_macros;
 #[cfg(test)]
 mod tests;
 

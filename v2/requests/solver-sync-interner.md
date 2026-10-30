@@ -53,6 +53,8 @@ nightly-2026-10-27's `rustc_type_ir`).
 
 > forwarded to db: `hir-def/src/signatures.rs` is its.
 
+> not applied by db-solver (2026-10-29 23:45): waits on hir-def's `ConstFlags::TYPE_CONST` (not in `signatures.rs` yet). `is_direct_const` / `const_of_item` (`interner.rs` ~1448) stay rustc's rule for every const not written `type const`, which until the flag is every const hir-def records.
+
 ## 4. Tests that need a database (hir-ide, which has the test fixture)
 
 hir-ty has no test database; `crates/hir-ide/src/tests/` does. Rules ported here that only a

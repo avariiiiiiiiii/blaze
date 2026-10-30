@@ -759,10 +759,10 @@ impl<'db> Cx<'db> {
         let traits = loaded_auto_traits(db, krate);
         f.len(traits.len());
         let env = ParamEnvAndCrate { param_env: db.trait_environment(def), krate };
-        for (&it, holds) in traits.iter().zip(implements_traits_unique(hidden, db, env, traits)) {
+        implements_traits_unique(hidden, db, env, traits, |it, holds| {
             f.item(ItemId::Trait(it));
             f.bool(holds);
-        }
+        });
         f
     }
 

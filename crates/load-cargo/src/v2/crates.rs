@@ -430,3 +430,44 @@ fn const_eval(workspace: &toml::Value, manifest: &str) -> Result<ConstEvalBudget
     }
     Ok(budget)
 }
+
+/// The lint flags of `unit`'s rustc: cargo's `[lints]`, those of its rustflags, its
+/// `--check-cfg`s, and `--cap-lints allow` for a package cargo shows no warnings of (one not
+/// from a path, and the standard library). The check and the front end's crate read this one
+/// list.
+pub fn lint_flags(unit: &Unit, plan: &UnitPlan, local: bool) -> Vec<String> {
+    const SHORT: [&str; 4] = ["-A", "-W", "-D", "-F"];
+    const LONG: [&str; 6] = ["--allow", "--warn", "--deny", "--forbid", "--force-warn", "--cap-lints"];
+    let mut out = plan.lints.clone(); // clone: the unit's own list, once per unit per build
+    let mut flags = plan.rustflags.iter();
+    while let Some(flag) = flags.next() {
+        let flag = flag.as_str();
+        if SHORT.contains(&flag) || LONG.contains(&flag) {
+            out.push(flag.to_owned()); // alloc: `CommandLine::parse` takes `&[String]`; once per flag per unit per build
+            if let Some(value) = flags.next() {
+                out.push(value.clone()); // clone: as above
+            }
+        } else if SHORT.iter().any(|it| flag.starts_with(it))
+            || LONG.iter().any(|it| flag.strip_prefix(it).is_some_and(|rest| rest.starts_with('=')))
+        {
+            out.push(flag.to_owned()); // alloc: as above
+        }
+    }
+    for spec in &plan.check_cfg {
+        out.push("--check-cfg".to_owned()); // alloc: as above
+        out.push(spec.clone()); // clone: as above
+    }
+    if unit.is_std || !local {
+        out.push("--cap-lints".to_owned()); // alloc: as above
+        out.push("allow".to_owned()); // alloc: as above
+    }
+    out
+}
+
+/// Whether cargo shows a package's warnings: one from a path (`(/abs/path)`).
+pub fn local(source: Option<&str>) -> bool {
+    source.is_some_and(|it| {
+        let path = it.trim_start_matches('(');
+        path.starts_with('/') || path.get(1..3) == Some(":\\") || path.starts_with("\\\\")
+    })
+}

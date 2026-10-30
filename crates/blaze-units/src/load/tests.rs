@@ -5,9 +5,9 @@ use blaze_query::{Config, Database, MemTree, Query, QueryKey};
 use blaze_vfs::{View, ViewId};
 
 use super::config::ConfigOf;
-use super::files::LoadFile;
+use super::files::{LoadFile, PathKey, TomlFile};
 use super::invocation::{Asking, Invocation as InvocationQuery};
-use super::manifest::{ManifestKey, ManifestQuery, WorkspaceKey, WorkspaceQuery};
+use super::manifest::{ManifestQuery, WorkspaceKey, WorkspaceQuery};
 use crate::query::{
     BuildConfig, Command, Fetch, FetchKind, Invocation, Mount, Origin, Plan, Planned, TestSandbox, Units, UnitPlan,
 };
@@ -91,8 +91,9 @@ pub(crate) fn library(tree: &MemTree) -> ContentId {
     ])
 }
 
-/// One database, with the standard library in its tree, that views are opened in.
-struct Fixture {
+/// One database, with the standard library in its tree, that views are opened in. The graph's
+/// tests (`graph/tests.rs`) open theirs here too.
+pub(crate) struct Fixture {
     db: Database,
     tree: Arc<MemTree>,
     library: ContentId,
@@ -100,15 +101,15 @@ struct Fixture {
 
 /// A view's build: its files (under `ws/` the workspace's, mounted at [`WS`]), its command
 /// line, the variables past `HOME`, and the mounts past the workspace's and the library's.
-struct Ask<'a> {
-    files: &'a [(&'a str, &'a str)],
-    command: Command,
-    args: &'a [&'a str],
-    env: &'a [(&'a str, &'a str)],
-    mounts: Vec<Mount>,
+pub(crate) struct Ask<'a> {
+    pub(crate) files: &'a [(&'a str, &'a str)],
+    pub(crate) command: Command,
+    pub(crate) args: &'a [&'a str],
+    pub(crate) env: &'a [(&'a str, &'a str)],
+    pub(crate) mounts: Vec<Mount>,
 }
 
-fn ask<'a>(files: &'a [(&'a str, &'a str)]) -> Ask<'a> {
+pub(crate) fn ask<'a>(files: &'a [(&'a str, &'a str)]) -> Ask<'a> {
     Ask { files, command: Command::Build, args: &[], env: &[], mounts: Vec::new() }
 }
 
@@ -117,7 +118,7 @@ fn mount(at: &str, under: &str) -> Mount {
 }
 
 impl Fixture {
-    fn new() -> Fixture {
+    pub(crate) fn new() -> Fixture {
         let tree = Arc::new(MemTree::default());
         let library = library(&tree);
         let mut db = Database::new(Config { tree: Some(tree.clone()), dir: None, tags: 0 });
@@ -125,7 +126,7 @@ impl Fixture {
         Fixture { db, tree, library }
     }
 
-    fn open(&self, ask: &Ask<'_>) -> ViewId {
+    pub(crate) fn open(&self, ask: &Ask<'_>) -> ViewId {
         let files: Vec<(&str, &[u8])> = ask.files.iter().map(|(path, text)| (*path, text.as_bytes())).collect();
         let mut env: Vec<(String, String)> = vec![("HOME".to_owned(), "/home/u".to_owned())];
         env.extend(ask.env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())));
@@ -149,7 +150,7 @@ impl Fixture {
         self.db.open_with(View { root: self.tree.root(&files) }, &config.encode())
     }
 
-    fn plan(&self, view: ViewId) -> Planned {
+    pub(crate) fn plan(&self, view: ViewId) -> Planned {
         self.db.pin().get::<Plan>(view, &()).expect("planned").get()
     }
 
@@ -355,54 +356,54 @@ fn the_lock_file_pins_a_registry_package_which_is_fetched_then_built() {
     assert!(a_lib.dependencies.iter().any(|it| it.index == serde_at && it.extern_crate_name == "serde"));
 }
 
-/// How many times the load's step ran over the view's workspace, and whether its last run
-/// resolved it.
+/// What one step over the view's workspace saw: whether its lock file's bytes were lent from
+/// the database rather than copied, and whether it resolved.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug)]
-struct Counted {
-    rounds: u32,
+struct Stepped {
+    lent: bool,
     resolved: bool,
 }
 
-impl crate::query::Versioned for Counted {
-    const SCHEMA: blaze_format::SchemaHash = blaze_format::schema("blaze v2 cargo test rounds 1");
+impl crate::query::Versioned for Stepped {
+    const SCHEMA: blaze_format::SchemaHash = blaze_format::schema("blaze v2 cargo test step 1");
 }
 
-/// The view's workspace resolved as [`Plan`] resolves it, counting the step's runs.
-struct Rounds;
+/// The view's workspace resolved as [`Plan`] resolves it, in the one step [`Plan`] takes.
+struct Step;
 
-impl Query for Rounds {
+impl Query for Step {
     const KIND: blaze_query::QueryKind = blaze_query::QueryKind(0x63f2);
-    const NAME: &'static str = "cargo test rounds";
-    const PRODUCER: ContentId = crate::query::producer("blaze v2 cargo test rounds 1");
+    const NAME: &'static str = "cargo test step";
+    const PRODUCER: ContentId = crate::query::producer("blaze v2 cargo test step 1");
     type Key = ();
-    type Value = crate::query::Cbor<Counted>;
+    type Value = crate::query::Cbor<Stepped>;
 
     fn input(key: &()) -> ContentId {
-        super::key_id("blaze v2 cargo test rounds key 1", key)
+        super::key_id("blaze v2 cargo test step key 1", key)
     }
 
-    fn execute(cx: &mut blaze_query::Cx<'_>, _: &()) -> Result<crate::query::Cbor<Counted>, blaze_query::Cancelled> {
+    fn execute(cx: &mut blaze_query::Cx<'_>, _: &()) -> Result<crate::query::Cbor<Stepped>, blaze_query::Cancelled> {
+        use blaze_manifest::files::Files;
         let asked = cx.get::<Asking>(&())?.get().unwrap_or_else(|error| panic!("{}", error.what));
         let library = cx.get::<super::files::Mounts>(&())?.get(&asked.library);
         let spec = super::view_spec(&asked, library).unwrap_or_else(|error| panic!("{}", error.what));
-        let mut read = cx.get::<WorkspaceQuery>(&spec.workspace)?.get().unwrap_or_else(|error| panic!("{}", error.what));
-        let mut rounds = 0;
-        let base = std::mem::take(&mut read.snapshot);
-        let (outcome, _) = super::manifest::replay(cx, &read, base, &spec.workspace.config, |cx, ctx, ws, files, reads| {
-            rounds += 1;
-            super::resolve::resolved(cx, ctx, ws, &files, reads, &spec, |_, _| Ok(super::Staged::Done(())))
+        let read = cx.get::<WorkspaceQuery>(&spec.workspace)?.get().unwrap_or_else(|error| panic!("{}", error.what));
+        let lock = std::path::PathBuf::from(format!("{WS}/Cargo.lock"));
+        let outcome = super::manifest::in_workspace(cx, &read, &spec.workspace.config, |ctx, ws| {
+            let lent = matches!(ctx.files().read(&lock), Ok(std::borrow::Cow::Borrowed(_)));
+            let resolved = super::resolve::resolved(ctx, ws, &spec, |_| Ok(super::Staged::Done(())))?;
+            Ok(Stepped { lent, resolved: matches!(resolved, super::Staged::Done(())) })
         })?;
-        let resolved = matches!(outcome, Ok(super::Staged::Done(())));
-        Ok(crate::query::Cbor(Counted { rounds, resolved }))
+        Ok(crate::query::Cbor(outcome.unwrap_or_else(|error| panic!("{}", error.what))))
     }
 }
 
-/// The lock file and every package it pins are read ahead of the step that parses them, so a
-/// load runs its resolve once, not once for the lock file and once more for each package.
+/// A locked workspace resolves in one step, reading the lock file and every package it pins
+/// when it asks for them, each file's bytes lent from where the database keeps them.
 #[test]
-fn a_locked_workspace_resolves_in_one_run() {
+fn a_locked_workspace_resolves_in_one_step_over_lent_bytes() {
     let mut fixture = Fixture::new();
-    fixture.db.register::<Rounds>();
+    fixture.db.register::<Step>();
     let manifest = with_serde();
     let lock = serde_lock();
     let files = [
@@ -413,8 +414,8 @@ fn a_locked_workspace_resolves_in_one_run() {
         ("serde/src/lib.rs", ""),
     ];
     let view = fixture.open(&Ask { mounts: vec![mount(&serde_fetch().at, "serde")], ..ask(&files) });
-    let counted = fixture.db.pin().get::<Rounds>(view, &()).expect("counted").get();
-    assert_eq!(counted, Counted { rounds: 1, resolved: true });
+    let stepped = fixture.db.pin().get::<Step>(view, &()).expect("stepped").get();
+    assert_eq!(stepped, Stepped { lent: true, resolved: true });
     ready(fixture.plan(view));
 }
 
@@ -502,8 +503,9 @@ fn a_comment_in_a_members_manifest_stops_at_that_manifest() {
     let after = [("ws/Cargo.toml", root), ("ws/a/Cargo.toml", commented.as_str()), ("ws/a/src/lib.rs", "")];
     let view = fixture.open(&ask(&after));
     assert_eq!(ready(fixture.plan(view)), first);
-    let member = ManifestKey { path: "/home/u/ws/a/Cargo.toml".to_owned(), config: ConfigOf::View, source: None };
-    assert!(fixture.ran::<ManifestQuery>(view, &member));
+    let member = PathKey { path: "/home/u/ws/a/Cargo.toml".to_owned(), config: ConfigOf::View };
+    assert!(fixture.ran::<TomlFile>(view, &member));
+    assert!(!fixture.ran::<ManifestQuery>(view, &member), "the canonical form is unchanged, so the parse is reused");
     assert!(!fixture.ran::<WorkspaceQuery>(view, &WorkspaceKey::view()));
     assert!(!fixture.ran::<Plan>(view, &()));
 }

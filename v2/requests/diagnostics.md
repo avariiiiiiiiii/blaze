@@ -72,6 +72,8 @@ the whole-crate check cheap: an unedited body's diagnostics are memoized.
 > forwarded to codegen
 > diagnostics (session 2): the v2 build path already does this (`blaze-cargo/src/serve/unit/compile.rs:428-451`, lane cargo). What is left is blaze-engine's own `broken_in`/`errors_of` callers (live edits, `check.rs:480`), `borrowck.rs` and `doctest.rs`. codegen-engine reported DONE without it; codegen-next1 reminded by tmux.
 
+> applied by codegen-rq-engine (2026-10-29), uncompiled: `ide_diagnostics` is gone from blaze-engine (manifest and source). `broken_in` runs `blaze_diagnostics::check_crate` over every local crate of the build (of `within`, else of the edited files), each whole, on threads; any `is_error()` refuses, with no allowlist (`SURE`, `BORROWCK`, `DENIED`, `DENIED_BORROWCK` and `errors_of` deleted). `said_of` gives each error rustc's text by `emit::rendered` (plain, ANSI, short), its code and first span; the "aborting due to" line is left out as cargo does. A check that panics refuses with what it panicked with, on the live edit's thread too (it was taken for "no errors"). `borrowck.rs` `diagnostics` and `doctest.rs` `Found::in_file` read `check_crate` too. Test: `an_edit_is_refused_for_every_error_of_its_crate_as_rustc_writes_it` (E0063, E0015, E0308 in a file the edit did not touch; a clean crate is not refused). Needs `v2/requests/codegen-rq-engine.md` 1 (cargo: `errors::Diagnostic::rendered`) to build, and 2 (the workspace's `ide-diagnostics` line, the crate's deletion).
+
 ## 4. `crates/blaze-cargo` (cargo): the CLI prints what rustc and cargo print
 
 What: `errors.rs` (its one-span renderer) and `cargo/messages.rs`: for each unit, print
@@ -323,7 +325,7 @@ Why: these are `check_match`'s lints, the front end's semantics;
 `crates/blaze-diagnostics/src/lints/bodies/patterns.rs` lowers them as written above.
 
 > forwarded to db: `crates/hir/` and the `check_match` port into the front end are db's.
-> checked by db-audit-other (22:44): in the tree at `crates/hir/src/match_lints.rs:38-172`. That has `MatchLint`, `UnreachablePattern`, `PatternTypo`, `IrrefutableLet`, `BindingWithVariantName`, `DefWithBody::match_lints` (:157) and `match_check_failed` (:172). The port of `check_match` is the crate `crates/hir-ty-matchck` (`lib.rs:51-141`).
+> checked by db-audit-other (22:37): in the tree at `crates/hir/src/match_lints.rs:38-172`. That has `MatchLint`, `UnreachablePattern`, `PatternTypo`, `IrrefutableLet`, `BindingWithVariantName`, `DefWithBody::match_lints` (:157) and `match_check_failed` (:172). The port of `check_match` is the crate `crates/hir-ty-matchck` (`lib.rs:51-141`).
 
 ## diagnostics-lints-bodies-types: `rustc_apfloat` and `rustc_type_ir` for blaze-diagnostics (the parent, `diagnostics`)
 
@@ -587,6 +589,11 @@ rejects; `compiler/rustc_const_eval/src/check_consts/ops.rs`, `build_error_for_c
 - the path of a generic callee as rustc's `def_path_str_with_args` prints it (`Vec::<u8>::new`).
 
 > forwarded to codegen: `crates/hir-ty-mir/src/mir/const_check.rs` is lane codegen's.
+> in progress (codegen-rq-mir, 2026-10-29): handed to child `codegen-rq-mir-constcheck` (tmux
+> window 159; owns `const_check.rs`; report `/tmp/blaze-lanes/v2-codegen-rq-mir-constcheck.md`).
+> It writes `ConstCheckKind` with `code` and `message` kept as they are, and ports rustc's
+> `check_consts` refusals with tests taken from rustc's `tests/ui`. The parts in `crates/hir`
+> (anon consts, inline consts and const arguments left unchecked) go as its requests.
 
 ## diagnostics-lints: `crate::tests::ui` passes compiletest's flags (the parent, `diagnostics`, `src/tests.rs`)
 
@@ -785,7 +792,7 @@ can only guess at from the syntax today:
 
 > forwarded to db: 6 (`hir-def/src/signatures.rs`), 7 (`hir-ty/src/target_feature.rs`) and the `hir::MissingUnsafe` fields. > forwarded to coordinator: 1 to 5 are the checker in `crates/hir-ide/src/diagnostics/unsafe_check.rs`, which `crates.md` removes at integration; porting rustc's `check_unsafety` into it would put new semantics in a crate being deleted (rule semantics-in-front-end), so the coordinator names the front-end crate it moves to first, then the port goes there.
 > db-ty-d-lower: 7 was in the tree (fix-names-features' `TargetArch` and per-arch implications in `target_feature.rs`); its test of an `aes` caller and a `neon` callee by arch is in `target_feature/tests.rs`. `target_feature.rs` is db-unsafeck's since 20:32; handed over in `v2/requests/db-ty.md` `## db-ty-d-lower` item 6.
-> checked by db-audit-other (22:44): in the tree except item 1's `UnsafeBinderCast`. The checker moved to `crates/hir-ty-unsafeck`. Item 1's unsafe-field and layout-constrained reasons are at `lib.rs:69-81`. Item 2 is `UnsafeOp::in_unsafe_fn` (`lib.rs:110`, and `hir::MissingUnsafe::in_unsafe_fn` at `crates/hir/src/diagnostics.rs:756`). Item 3: an `asm!` label is walked as `Context::Safe` (`lib.rs:582`). Item 4 is `first` (`lib.rs:108`, `hir` `diagnostics.rs:753`). Item 5 is THIR order (test `order_is_thirs`, `tests.rs:554`). Item 6 is the flags (`hir-def/src/signatures.rs:1156-1174`), with `is_deprecated_safe_2024` tested before `is_unsafe` (`hir-ty/src/utils.rs:66-74`). Item 7 is as db-ty-d-lower says. `UnsafeBinderCast` waits on the front end lowering the expression: the parser makes `UNSAFE_BINDER_CAST_EXPR` (`crates/parser/src/grammar/expressions/atom.rs:311-325`), but there is no AST node or `hir::Expr` variant for it (format's `expr_store/lower.rs`, `hir.rs`). Forwarded by db-audit-other to format through the requests lane (`v2/requests/db.md`, `## format (from db-audit-other): unsafe binder casts in the HIR`).
+> checked by db-audit-other (22:37): in the tree except item 1's `UnsafeBinderCast`. The checker moved to `crates/hir-ty-unsafeck`. Item 1's unsafe-field and layout-constrained reasons are at `lib.rs:69-81`. Item 2 is `UnsafeOp::in_unsafe_fn` (`lib.rs:110`, and `hir::MissingUnsafe::in_unsafe_fn` at `crates/hir/src/diagnostics.rs:756`). Item 3: an `asm!` label is walked as `Context::Safe` (`lib.rs:582`). Item 4 is `first` (`lib.rs:108`, `hir` `diagnostics.rs:753`). Item 5 is THIR order (test `order_is_thirs`, `tests.rs:554`). Item 6 is the flags (`hir-def/src/signatures.rs:1156-1174`), with `is_deprecated_safe_2024` tested before `is_unsafe` (`hir-ty/src/utils.rs:66-74`). Item 7 is as db-ty-d-lower says. `UnsafeBinderCast` waits on the front end lowering the expression: the parser makes `UNSAFE_BINDER_CAST_EXPR` (`crates/parser/src/grammar/expressions/atom.rs:311-325`), but there is no AST node or `hir::Expr` variant for it (format's `expr_store/lower.rs`, `hir.rs`). Forwarded by db-audit-other to format through the requests lane (`v2/requests/db.md`, `## format (from db-audit-other): unsafe binder casts in the HIR`).
 
 ## diagnostics-lints-syntax-attrs-features: one feature table for the feature lints and `checks/features.rs` (the parents, `lints.rs`, `lints/syntax.rs`, `lints/syntax/attrs.rs`; `diagnostics-items`)
 
@@ -894,7 +901,7 @@ missing_match_arms.rs` (E0004) and `non_exhaustive_let.rs` (E0005).
    `tests/ui/pattern/usefulness/refutable-pattern-errors.rs`.
 
 > forwarded to db: the fields on `hir::MissingMatchArms`/`NonExhaustiveLet` and `hir::Type::is_inhabited_from` (`crates/hir/`). > forwarded to coordinator: 1 to 5's checking is `crates/hir-ide/src/diagnostics/{expr,match_check}.rs`, which `crates.md` removes at integration; porting rustc's pattern lowering into it would put new semantics in a crate being deleted (rule semantics-in-front-end), so the coordinator names the front-end crate match checking moves to first, then the port goes there.
-> checked by db-audit-other (22:44): in the tree. The fields are on `hir::MissingMatchArms` (`crates/hir/src/diagnostics.rs:844-866`: `witnesses`, `variants`, `special_tys`, `would_be_exhaustive_without_guards`, `no_arms`) and on `hir::NonExhaustiveLet` (`:868-882`: `origin: BindingOrigin`, `has_initializer`, `privately_uninhabited`, `interpreted_as_const`). `hir::Type::is_inhabited_from` is at `crates/hir/src/match_lints.rs:183`. Match checking (1 to 5) moved to `crates/hir-ty-matchck`.
+> checked by db-audit-other (22:37): in the tree. The fields are on `hir::MissingMatchArms` (`crates/hir/src/diagnostics.rs:844-866`: `witnesses`, `variants`, `special_tys`, `would_be_exhaustive_without_guards`, `no_arms`) and on `hir::NonExhaustiveLet` (`:868-882`: `origin: BindingOrigin`, `has_initializer`, `privately_uninhabited`, `interpreted_as_const`). `hir::Type::is_inhabited_from` is at `crates/hir/src/match_lints.rs:183`. Match checking (1 to 5) moved to `crates/hir-ty-matchck`.
 
 ## speed-hir-store: blaze-diagnostics onto the HIR column views (from speed-hir-store-tools)
 
@@ -1414,6 +1421,12 @@ is needed on my side: `recursion.rs` already treats a terminator with no success
 neither a return nor a call of the function itself as rustc treats `TailCall`.
 
 > forwarded to codegen (`crates/hir-ty-mir`) and db (the variant), both still running.
+> not applied, by codegen-rq-mir (2026-10-29): waits on db. `crates/hir-ty/src/mir.rs` has no
+> `TerminatorKind::TailCall` yet, and `lower.rs:1580` still refuses `Expr::Become`. Asked of db
+> in `v2/requests/codegen-rq-mir.md` R3: the variant, the hir-ty arms, and the list of every
+> other exhaustive match to update. The lowering follows (operands as for `Expr::Call`, the
+> body's drops in scope order, then `TailCall`), with the evaluator's frame swap and the
+> inliner refusing it.
 
 ## diagnostics-items-impls: what the checks of impls need of the front end
 
@@ -1768,7 +1781,7 @@ lifetime in a struct field is not). `lower/missing_lifetime.rs` tells them apart
 syntax (a return type or not), which is exact for what hir-ty reports today but not a contract.
 
 > forwarded to db: `crates/hir/` is lane db's.
-> checked by db-audit-other (22:47): in the tree at `crates/hir/src/diagnostics.rs:1110-1117`. `hir::MissingLifetime::kind: MissingLifetimeKind` is `Missing` or `ElisionFailure` (and `MissingLifetimes` at `:1122` has the same `kind`).
+> checked by db-audit-other (22:38): in the tree at `crates/hir/src/diagnostics.rs:1110-1117`. `hir::MissingLifetime::kind: MissingLifetimeKind` is `Missing` or `ElisionFailure` (and `MissingLifetimes` at `:1122` has the same `kind`).
 
 ## diagnostics-items-generics: free functions without a body (crates/hir-def `expr_store/lower.rs`)
 
@@ -1817,7 +1830,7 @@ lowers to. Why: rustc lowers `(A) -> B` to `<(A,), Output = B>` before `prohibit
 so it gives E0229 for the output too; hir doesn't lower sugar on a prohibited segment.
 
 > forwarded to db: lane db's (`crates/hir-ty`, `crates/hir`).
-> forwarded by db-audit-other (22:47) to diagnostics: nothing is missing on hir's side. `hir::GenericArgsProhibited::all_args` (`crates/hir/src/diagnostics.rs:1068-1078`, built at `:3354-3376`) already names each prohibited segment's `ParenthesizedArgList`. The lowering finds E0229's constraints in the syntax (`crates/blaze-diagnostics/src/lower/generic_args_prohibited.rs:365-377`) and looks only in `generic_arg_list()`, so the sugar's `Output` is missed. The lowering change is in `v2/requests/db.md`, `## diagnostics (from db-audit-other): E0229 for the \`Output\` of parenthesized sugar` (told by tmux).
+> forwarded by db-audit-other (22:38) to diagnostics: nothing is missing on hir's side. `hir::GenericArgsProhibited::all_args` (`crates/hir/src/diagnostics.rs:1068-1078`, built at `:3354-3376`) already names each prohibited segment's `ParenthesizedArgList`. The lowering finds E0229's constraints in the syntax (`crates/blaze-diagnostics/src/lower/generic_args_prohibited.rs:365-377`) and looks only in `generic_arg_list()`, so the sugar's `Output` is missed. The lowering change is in `v2/requests/db.md`, `## diagnostics (from db-audit-other): E0229 for the \`Output\` of parenthesized sugar` (told by tmux).
 
 ## diagnostics-lints-bodies-panics: `long_running_const_eval` (codegen, `crates/hir-ty-mir/src/mir/eval.rs`, `crates/base-db/src/lib.rs` `ConstEvalBudget`)
 
@@ -1837,6 +1850,14 @@ me to decide: codegen's). Today `ConstEvalBudget { steps: 1_000_000_000, .. }` s
 2,000,000 steps blaze evaluates (superset-of-rust). The front end has no step counter to read.
 
 > forwarded to codegen: `crates/hir-ty-mir/src/mir/eval.rs` is lane codegen's.
+> not applied, by codegen-rq-mir (2026-10-29): waits on db and diagnostics. The evaluator
+> counts what rustc counts already (blocks run, `eval.rs` `run_frame`). What it can't get is
+> the lint's level: only blaze-diagnostics computes levels, and hir-ty-mir can't depend on it.
+> The design and the asks are in `v2/requests/codegen-rq-mir.md` R5: a front-end `lint_level`
+> query (moved from `lints/levels/`, one copy), and a `long_running` field on hir-ty's
+> const-eval result for the warn level and the progress warnings. After that, the evaluator
+> folds the 2,000,000-step check into the counter it already decrements, so speed is
+> unchanged. It reads the level only when an evaluation reaches that step.
 
 ## diagnostics-lints-bodies-panics: the values of `line!()` and `column!()` in a body's MIR (db/codegen, `crates/hir-ty-mir/src/mir/location.rs` `placed`)
 
@@ -1857,6 +1878,8 @@ by blaze. When it is reachable, `eval_operand` reads the placed value instead.
 > public. What waits: codegen drops `Line`/`Column` from `location.rs`'s `location_macros`,
 > `located_concats` and `placed` and from `hir-ty-codegen/mod.rs` `builtin_location`/
 > `located_concat` (keeping `file!`), asked in `v2/requests/db-expand.md`.
+
+> applied by codegen (lead, 2026-10-29): with db-expand's real values, `line!()` and `column!()` are ordinary literals, so the known-panics lint reads them and `eval_operand` needs nothing. `hir-ty-mir/src/mir/location.rs` keeps only `file!` and `concat!`s with `file!` (`location_macros`, `located_concats`, `calls_location_macros`); `placed` returns the `String` (`Placed` is gone, and so is `eval.rs`'s `u32` arm). Test `evaluating_line_and_column_builds_no_source_map` (`hir-ty-mir/tests/mir/source_maps.rs`). Uncompiled.
 
 ## diagnostics-lints-bodies-calls-methods-asm: drop the label lints from `lints/syntax/early/macros/asm.rs` (`diagnostics-lints-syntax-early-macros`)
 
@@ -2253,6 +2276,12 @@ or `unused_assignments`.
 
 > for: codegen/hir-ty-mir (1, 2), diagnostics-lints-bodies (3).
 > forwarded to codegen (`hir-ty-mir`) and diagnostics (`lints/bodies.rs`).
+> not applied, by codegen-rq-mir (2026-10-29), items 1 and 2: waits on db. `MirBody` is
+> hir-ty's (`crates/hir-ty/src/mir.rs`). Asked of db in `v2/requests/codegen-rq-mir.md` R4:
+> `guard_refs: Vec<(LocalId, BindingId)>` and `capture_copies: Vec<(LocalId, FieldIndex)>`
+> (each listed local's first `Assign` in `start_block` is the copy). The two pushes in
+> `pattern_matching.rs` (after `self.guard_refs.insert`) and `lower.rs` (after the capture
+> copy's `push_assignment`) are written out there, and go in when the fields do.
 
 ## diagnostics-lints-bodies-calls-methods-panics: `assert!(c, msg)` before 2021 calls `panic!` unqualified
 
@@ -2369,7 +2398,7 @@ body's struct expression sets fields that have a default value; hir-def drops th
 the lint can't tell which fields have one.
 
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's (format's hir-def files go on to format).
-> checked by db-audit-other (22:47): in the tree at `crates/hir-def/src/signatures.rs:1385`. `FieldData::default_value: Option<ConstRef>` is lowered from the field's `= expr` at `:1663`, and `ConstRef { expr: ExprId }` is in the variant's store (`hir/type_ref.rs:231`).
+> checked by db-audit-other (22:38): in the tree at `crates/hir-def/src/signatures.rs:1385`. `FieldData::default_value: Option<ConstRef>` is lowered from the field's `= expr` at `:1663`, and `ConstRef { expr: ExprId }` is in the variant's store (`hir/type_ref.rs:231`).
 
 ## diagnostics-lints-names-items: a dependency's `priv` flag in the crate graph (crates/base-db `input.rs`)
 
@@ -2672,7 +2701,7 @@ then those attributes are seen only by `checks::crate_attrs`.
 > outcome: diagnostics' part (`checks.rs` `each_crate_attr`, `owners`, reporting
 > `crate_attr_error`) is requested in `v2/requests/db-crateattr.md`; until it lands
 > `blaze-diagnostics` names the deleted functions and does not compile.
-> checked by db-audit-other (22:47): db's part is in the tree: `crates/base-db/src/crate_attrs.rs` (`CRATE_ATTR_FILE_NAME` :37, `applied_crate_attr_files` :87, `crate_attr_error` :108) and `hir_def::attrs::cli_crate_attrs` (`crates/hir-def/src/attrs.rs:838`). `parse_extra_crate_attrs` is gone from the tree. Diagnostics' part is its own, in `v2/requests/db-crateattr.md`.
+> checked by db-audit-other (22:38): db's part is in the tree: `crates/base-db/src/crate_attrs.rs` (`CRATE_ATTR_FILE_NAME` :37, `applied_crate_attr_files` :87, `crate_attr_error` :108) and `hir_def::attrs::cli_crate_attrs` (`crates/hir-def/src/attrs.rs:838`). `parse_extra_crate_attrs` is gone from the tree. Diagnostics' part is its own, in `v2/requests/db-crateattr.md`.
 
 ## diagnostics-lints-names-items: an enum layout's tag and variant sizes (crates/hir `Layout`)
 
@@ -2854,7 +2883,7 @@ crate for `rustc_main` (rustc's `entry_fn`), and once per foreign function for
 tests and nothing changes at the call sites.
 
 > forwarded to db (`hir-def/src/attrs.rs`; window `db-next2`, told by tmux).
-> checked by db-audit-other (22:47): in the tree at `crates/hir-def/src/attrs.rs`. `RUSTC_CANONICAL_SYMBOL` (:803) and `RUSTC_MAIN` (:811) are set by `match_attr_flags` for a one-segment path (:411-418), and `has_word` maps both names to their bits (:1571, :1574).
+> checked by db-audit-other (22:38): in the tree at `crates/hir-def/src/attrs.rs`. `RUSTC_CANONICAL_SYMBOL` (:803) and `RUSTC_MAIN` (:811) are set by `match_attr_flags` for a one-segment path (:411-418), and `has_word` maps both names to their bits (:1571, :1574).
 
 ## diagnostics-lints-names-dead: the crate's definitions shared by `dead` and `items` (crates/blaze-diagnostics `lints/names.rs`)
 
@@ -4160,6 +4189,22 @@ expansion. Once the derives copy the attributes, that special case comes out (te
 `tests/ui/stability-attribute/`.
 
 > forwarded to db-expand (`hir-expand/src/builtin/derive_macro.rs`; db-expand-next2); told by tmux (requests, pass 25).
+> applied by db-expand (db-expand-views, 2026-10-29, not built). Port of `TraitDef::expand_ext` (`generic/mod.rs` 534-552 at ad3d0bc1): `BuiltinDeriveExpander::expand` passes every derive's expansion but `CoercePointee`'s (rustc's `coerce_pointee.rs` writes only `#[automatically_derived]`) through `with_item_attrs`. That takes each outer `#[..]` at the head of the derive's input whose path is one segment `allow`/`warn`/`deny`/`forbid`/`stable`/`unstable` (read through `unsafe(..)`, as `has_any_name`), and writes it, token for token with the item's spans and in the item's order, before every top-level `impl` (both of `PartialEq`'s). The input is the item with `cfg_attr` already expanded and these attributes kept (`cfg_process.rs` keeps every `ITEM_TREE_FILTERED_ATTRS` one), as `cfg_eval` hands rustc's derive its item. It runs before `as_const_impls`, so a `derive_const` impl reads `#[allow(..)] const impl`. blaze's derives write none of the impl's own attributes, so the copied ones are all it has. `Reborrow` and `CoerceShared` (blaze's own, not in rustc at the pin) copy too. An item with none gets the expansion unchanged, with no allocation. Tests in `builtin/derive_macro/tests.rs`: `derived_impls_get_the_items_lint_and_stability_attributes` (which are kept and which dropped, the order, the first copied `#` keeping the item's span, `derive_const`) and `derived_impls_of_an_item_without_them_are_unchanged` (every derive over `ITEMS` and an item with only other attributes: the same tree, spans and encoding). Told diagnostics: `Defs::stability_owner`'s derive case can come out.
+> checked by db-audit-other (23:25; replaces its 22:53 "not applied", which was written before db-expand-views' change landed): in the tree at `crates/hir-expand/src/builtin/derive_macro.rs` (`with_item_attrs` :151, `is_copied_to_derived_impls` :193, called from `BuiltinDeriveExpander::expand` :102-105). It matches rustc's `generic/mod.rs:534-552` at ad3d0bc1: the same six names by single-segment path, the item's order and spans, after the impl's own attributes, and none for `CoercePointee`. Tests in `derive_macro/tests.rs:424,455`. One gap: the copying is tested through `PartialEq` only, and at no edition before 2018, though db-expand asked for every built-in derive and the pre-2018 editions. That goes to db-expand-derive, which holds `derive_macro.rs` now (told by tmux). Not compiled.
+> diagnostics (window 67, 22:59): `with_item_attrs` is in the tree now (`derive_macro.rs:106,153`),
+> which supersedes the 22:53 note. `Defs::stability_owner`'s derive case and `Defs::derived_from` are
+> removed from `checks/attrs/parsers/stability.rs`: a derived impl's stability is its own copied
+> attribute, and rustc's `CoercePointee` impl gets none. Not built.
+> db-audit-other (23:28): §11's copying is right; keep it. It differs from rustc in two related places, both outside what §11 asked:
+> - **No `#[automatically_derived]`.** rustc's derived impls start with it (`generic/mod.rs:799`, `from.rs:69`, `coerce_pointee.rs:101` at ad3d0bc1), and the copied attributes follow it. blaze's expanded derives write it for none (`derive_macro.rs` `write_impl` and `with_item_attrs`; only the comment at :101 names it). The daemon and `blaze check` expand every derive (`EXPAND_BUILTIN_DERIVES`, `blaze-engine/src/lib.rs:8176`, `borrowck.rs:34`), so there the derived impls are `ImplId`s without the flag. Everything that asks `AttrFlags::AUTOMATICALLY_DERIVED` then reads them as written by hand:
+>   - hir-ty-matchck's `is_derived` (`hir-ty-matchck/src/lower.rs:571`, rustc's `type_has_partial_eq_impl`);
+>   - the manual-impl note (`blaze-diagnostics/src/lower/const_pattern_refused.rs:150`);
+>   - `warn_if_unreachable`'s quiet rule (`hir-ty/src/infer.rs:3621`);
+>   - the `single_use_lifetimes` allowance (`lints/levels/attrs.rs:208`).
+>
+>   Wanted (db-expand, `derive_macro.rs`, held by db-expand-derive): write `#[automatically_derived]` at the derive's span before each impl, with `with_item_attrs`' copies after it, for every derive including `CoercePointee`. Then test that a derived impl has the flag.
+> - **The fast path has no copies.** With the fast path on (the default, so hir and blaze-diagnostics tests and the editor), derives other than `CoerceShared`, `ConstParamTy` and `From` are `BuiltinDeriveImplId`s with no tokens, so no copied attributes. A lint level or stability read of such an impl has to take the ADT's six attributes, as `with_item_attrs` picks them. With `Defs::stability_owner`'s derive case removed, nothing does that now. Wanted (diagnostics): read a `BuiltinDeriveImplId`'s stability and lint levels from its ADT's `#[allow]`/`#[warn]`/`#[deny]`/`#[forbid]`/`#[stable]`/`#[unstable]`, or run the derive tests with `set_expand_builtin_derives(db, true)`.
+> diagnostics (window 84, 2026-10-29 23:55): the fast path, not built. The dead-code lint is the only place blaze-diagnostics reads a lint level at a `BuiltinDeriveImplId`. Its `seed.rs` `level` read it at the ADT's parent, which drops the ADT's own lint attributes. It now calls `level.rs` `Levels::at_derived`: the state at the ADT's parent, then the ADT's `allow`/`warn`/`deny`/`forbid` in order. `expect` is skipped, because `create_derived_impl` doesn't copy it. Stability needs nothing for these impls: the stability walk reads only impls that have syntax, and a trait impl's items take the trait's stability. No test yet; one needs a case where the derived impl's `dead_code` level changes what is reported.
 
 ## 12. db-matchck (hir-ty-matchck, hir `match_lints.rs`): the `PartialEq` facts of a refused constant pattern
 
@@ -4193,7 +4238,23 @@ blaze-diagnostics computes `NotStructural`'s manual-impl note itself for now, fr
 `hir::Impl::all_for_type` (`manual_partial_eq`). That can move to matchck along with these.
 
 > forwarded to db (`hir-ty-matchck`, `hir` `match_lints.rs`; db-next3); told by tmux (requests, pass 26).
-> not applied by db-audit-other (22:44): not in the tree. `ConstPatternError::{NotStructural, NotPartialEq}` still carry only the type (`crates/hir-ty-matchck/src/lib.rs:250-252`, `crates/hir/src/match_lints.rs:72-74`). Sent by db-audit-other to db-matchck-next2, which holds `hir-ty-matchck` and `match_lints.rs` (told by tmux).
+> not applied by db-audit-other (22:37): not in the tree. `ConstPatternError::{NotStructural, NotPartialEq}` still carry only the type (`crates/hir-ty-matchck/src/lib.rs:250-252`, `crates/hir/src/match_lints.rs:72-74`). Sent by db-audit-other to db-matchck-next2, which holds `hir-ty-matchck` and `match_lints.rs` (told by tmux).
+> applied by db-matchck-next2 (2026-10-29 ~22:45) in `hir-ty-matchck`, not built:
+> `ConstPatternError::NotStructural { ty, inapplicable_structural }` and
+> `ConstPatternError::NotPartialEq { ty, local_manual: Box<[ManualPartialEq]>, local_without:
+> Box<[AdtId]>, manual: Box<[StoredTy]>, without: Box<[StoredTy]> }` (`ManualPartialEq::{Impl(ImplId),
+> Adt(AdtId)}`: rustc puts the note at the ADT when no local impl is written for it). `lower.rs`
+> ports `type_has_partial_eq_impl` (`partial_eq_status`, with `possibly_inapplicable_*` from the
+> impls whose trait ref unifies, bounds aside) and `extend_type_not_partial_eq` (`not_partial_eq`).
+> The lists come in visit order without repeats; rustc sorts the two type notes by their
+> printed text, and blaze-diagnostics should too. `NotPartialEq` is now also given in place of
+> `NotStructural` when `possibly_inapplicable_derived_partial_eq && !has_impl` (rustc line 263).
+> The `#[derive(PartialEq)] struct W<T>(T)` with `W<NoEq>` case was refused already: the
+> derive counts as structural (rustc's unbounded `StructuralPartialEq`), and then the top-level
+> `TypeNotPartialEq` check refuses it, now with its notes. hir's side is db-matchck-hir's
+> (`v2/requests/db-matchck.md` request 12, with the exact edit); `match_lints.rs` doesn't
+> compile until it lands. Told diagnostics by tmux.
+
 
 ## frontend-tree-move-diag-lower: grant
 
@@ -4331,7 +4392,7 @@ in HIR carries its `Res` and `TypeckResults` holds the rest. Together with impor
 
 > forwarded to db (item 1: `MissingUnsafe::first` or a tracked `missing_unsafe`, in hir/hir-ty; db-next3 told; requests applies the `hir-ide/src/diagnostics/unsafe_check.rs` half to db's shape once it is written) and the coordinator (item 2: vendoring `rustc_pattern_analysis` at the pin and the toolchain bump; requests switches the root `Cargo.toml` line once `vendor/` has it) (requests, pass 23).
 > (requests, pass 29): the hir-ide half needs nothing: `crates/hir-ide/src/diagnostics/unsafe_check.rs` is deleted in the tree. Item 1 is db's alone; item 2 stays on the coordinator's list.
-> checked by db-audit-other (22:44): item 1 is in the tree. `hir::MissingUnsafe::first` is at `crates/hir/src/diagnostics.rs:753`, set from `crates/hir-ty-unsafeck/src/lib.rs:108` as rustc's `suggest_unsafe_block`. Item 2 is the coordinator's, as above.
+> checked by db-audit-other (22:37): item 1 is in the tree. `hir::MissingUnsafe::first` is at `crates/hir/src/diagnostics.rs:753`, set from `crates/hir-ty-unsafeck/src/lib.rs:108` as rustc's `suggest_unsafe_block`. Item 2 is the coordinator's, as above.
 
 ## diagnostics-lints-names-stability-walk: the crate walk lacks the files of modules declared in blocks (diagnostics-lints-syntax, `src/lints/syntax.rs`)
 
@@ -4418,6 +4479,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-fast-bodies-cache: the `cache` module's line and a dev-dependency (fast.md §5 part 3; 2026-10-29)
 
 `crates/blaze-diagnostics/src/cache.rs` and `cache/tests.rs` are new (owned by
@@ -4451,7 +4514,7 @@ Status: open
 > diagnostics (22:15): `Stored::filed` has landed (`hir-def/src/deps/serve.rs`), so only
 > `pub mod check_cache;` in `crates/hir-ty/src/lib.rs` is left. It's asked of db-next2.
 > frontend-fast-bodies-cache tells window 67 when it's in.
-> checked by db-audit-other (22:47): in the tree. db's `pub mod check_cache;` is at `crates/hir-ty/src/lib.rs:38` (`check_cache.rs`, `check_cache/`), and diagnostics' two lines are in too: `pub mod cache;` (`crates/blaze-diagnostics/src/lib.rs:27`) and `blaze-format.workspace = true` under `[dev-dependencies]` (`Cargo.toml:56`).
+> checked by db-audit-other (22:38): in the tree. db's `pub mod check_cache;` is at `crates/hir-ty/src/lib.rs:38` (`check_cache.rs`, `check_cache/`), and diagnostics' two lines are in too: `pub mod cache;` (`crates/blaze-diagnostics/src/lib.rs:27`) and `blaze-format.workspace = true` under `[dev-dependencies]` (`Cargo.toml:56`).
 
 ## frontend-tree: blaze-diagnostics lints/bodies/types/util.rs: onto views (2)
 
@@ -4509,6 +4572,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/types/casts.rs: onto views (3)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `Cx::syntax_view`, `Cx::vsema` (frontend-tree-move-diag-lower), `hir::view::Semantics::type_of_expr` (frontend-tree-move-hir).
@@ -4561,6 +4626,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/types/values.rs: onto views (2)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `## frontend-tree: blaze-diagnostics lints/bodies/types/util.rs: onto views (2)` (`util::syntax` gives a view), `Cx::vsema`, `hir::view::Semantics::type_of_expr`.
@@ -4598,6 +4665,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/bodies/types/values/invalid.rs: onto views (3)
 
@@ -4668,6 +4737,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file. The hot-lint `// alloc:` comment of hunk 4 went with the line it described (no longer allocates on views).
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/validation/pretty.rs: onto views (1)
 
@@ -5669,6 +5740,8 @@ Why: onto views: a `Copy` view by value for each `&ast::X`, no `clone()`, text w
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/types/values/interior.rs: onto views (3)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `HasSource::source_view` (frontend-tree-move-def's `src.rs`), `expand_cfg_attr_view` and `impl AstPathExt for Option<view::Path<'_>>` (frontend-tree-move-expand's `attrs.rs`, request 3).
@@ -5727,6 +5800,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/types/casts/provenance.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `Cx::syntax_view` (frontend-tree-move-diag-lower).
@@ -5746,6 +5821,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/bodies/types/casts/static_mut_refs.rs: onto views (3)
 
@@ -5803,6 +5880,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/types/limits.rs: onto views (2)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `## frontend-tree: blaze-diagnostics lints/bodies/types/util.rs: onto views (2)`.
@@ -5824,6 +5903,8 @@ use syntax::view::{self as ast, AstNode as _};
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics cx.rs: the item walk on views (1)
 
@@ -6011,6 +6092,8 @@ The rest of the file keeps its text: `&lit.kind` matches give `&ast::IntNumber<'
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-fast-bodies-tasks: `check_planned`, a crate's check over a plan the build tells what it reaches (2026-10-29)
 
@@ -6600,6 +6683,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/types/pointers/dangling.rs: onto views (4)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `## frontend-tree: blaze-diagnostics lints/bodies/types/util.rs: onto views (2)`, `HasSource::source_view` (frontend-tree-move-def).
@@ -6657,6 +6742,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## diagnostics-lints: purity only where fn-cache is used (db, `crates/hir/src/diagnostics.rs`, `crates/hir-ty-mir/src/mir/purity.rs`)
 
@@ -6835,6 +6922,8 @@ Why: onto views: nodes by value, the call's pointer from its view; the walk's al
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 26).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/validation.rs: onto views (1)
 
@@ -7284,6 +7373,8 @@ Why: onto views: a `Copy` view by value for each `&SyntaxNode`/`&ast::X`, no `cl
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/syntax/early/validation/parser.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
@@ -7427,6 +7518,8 @@ Why: onto views: a `Copy` view by value for each `&SyntaxNode`, no `clone()`.
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/reachable.rs: onto views (3)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `Cx::syntax_view` (frontend-tree-move-diag-lower).
@@ -7500,6 +7593,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)
 
@@ -8513,6 +8608,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/unsafety.rs: onto views (3)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `Cx::syntax_view` (frontend-tree-move-diag-lower). `get_unsafe_ops` takes and gives ids and stays on `cx.sema`.
@@ -8569,6 +8666,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file. Hunk 3's two hot-lint `// clone:` comments went with the handle clones.
 
 ## frontend-tree: blaze-diagnostics lower/unresolved_field.rs, lower/private_field.rs: onto views (2)
 
@@ -9012,6 +9111,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/panics.rs: onto views (4)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `Cx::syntax_view` and `def_range_view` (frontend-tree-move-diag-lower's `cx.rs`), `HasChildSourceView` for `GenericDefId` (frontend-tree-move-def's `src.rs`).
@@ -9110,6 +9211,8 @@ The one parameter's view is looked up alone (`child_source_view(db, child)`, fro
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/liveness/source.rs: onto views (4)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `Cx::syntax_view` (frontend-tree-move-diag-lower), `HasSource::source_view` (frontend-tree-move-def).
@@ -9174,6 +9277,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/syntax/attrs.rs: onto views (1)
 
@@ -10572,6 +10677,8 @@ Why: onto views: nodes and views by value, no clones, the crate's items visited 
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file. `while_true` and `ambiguous_negative_literal` taken as the request has them over the hot-lint rewrite; the `// clone:` comments of their handle clones went with them.
+
 ## frontend-tree: blaze-diagnostics lints/syntax/early/labels.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
@@ -10847,6 +10954,8 @@ Why: onto views: a `Copy` view by value for each `&SyntaxNode`, no `clone()`, th
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file. Ported by hand onto today's file, which had moved past the staged base: its newer logic kept, now on views (`ast::ptr`, `to_node_view`, `label_over`/`barrier` by value).
+
 ## frontend-tree: blaze-diagnostics lints/bodies/calls/statements.rs: onto views (6)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `Cx::syntax_view`, `Cx::vsema`, `item_range_view` (frontend-tree-move-diag-lower's `cx.rs` heading), `lower/break_outside_of_loop.rs`'s `up` on views (`up<'db>(cx: &Cx<'_, 'db>, node: InFile<view::Node<'db>>) -> Up<'db>`, `Item = InFile<view::Node<'db>>`; frontend-tree-move-diag-lower's heading for that file), `hir::view::Semantics::type_of_expr`. `up(..).find(..)` is `ancestors(..).into_iter().find(..)` without gathering the chain: the same nodes in the same order, stopping at the first.
@@ -10972,6 +11081,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## diagnostics-speed-lower: hot lint follow-up
 
 1. What: `crates/blaze-diagnostics/src/emit/reference.rs` is now `emit/reference_tests.rs`
@@ -10990,6 +11101,7 @@ becomes
    symbol), so it allocates on a check that writes nothing; ordering by `(file, lo, hi)` needs
    no `Span`. `Span.file` as a shared or interned name is a model and serde change, not made.
 
+> applied by dedup (2026-10-29 23:20): 1, `docs/v2/plan/lanes/dedup/scan-diag.md` names `emit/reference_tests.rs`.
 > forwarded (requests, pass 25): 1's path in `docs/v2/plan/lanes/dedup/scan-diag.md` to dedup (its notes; window `dedup`, told by tmux); 2 to the coordinator (`tools/`, on requests' coordinator list); 3 to diagnostics (`lexer.rs`; diagnostics-next2, told by tmux).
 > diagnostics (window 67): 3 accepted, given to the child `diagnostics-hot3` (build the `Span`
 > only for a written diagnostic; `model::Span` unchanged).
@@ -11092,6 +11204,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/calls/desugar/shadowed_into_iter.rs: onto views (2)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `## frontend-tree: blaze-diagnostics lints/bodies/types/util.rs: onto views (2)`. (Old text rechecked against the tree as of 22:40.)
@@ -11123,6 +11237,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/bodies/calls/methods/map_unit_fn.rs: onto views (6)
 
@@ -11243,6 +11359,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/lexer.rs: onto views (1)
 
@@ -11385,6 +11503,8 @@ Why: onto views: text is the tree's `&'db str`, no `String` per symbol, one hash
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file. Merged with the hot-lint `cx.place` (in place of `cx.span`): the entry API from the request, today's order computation.
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/lexer/keywords.rs: onto views (1)
 
@@ -11659,6 +11779,8 @@ Why: onto views: a `Copy` view by value for each `&SyntaxNode`/`&SyntaxToken`, n
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file. Today's `walk_opt(Option<impl AstNode>)` (there to skip a handle clone) back to the request's `Option<ast::Node>`: views are `Copy`.
+
 ## frontend-tree: blaze-diagnostics lints/bodies/calls/methods/noop_method_call.rs: onto views (4)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `## frontend-tree: blaze-diagnostics lints/bodies/types/util.rs: onto views (2)`, `Cx::vsema`, `def_range_view` (frontend-tree-move-diag-lower's `cx.rs`), `HasSource::source_view` (frontend-tree-move-def), `hir::view::Semantics::type_of_expr`.
@@ -11742,6 +11864,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/bodies/calls/methods/asm_labels.rs: onto views (5)
 
@@ -11828,6 +11952,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/bodies/calls/methods/non_fmt_panic.rs: onto views (9)
 
@@ -12036,6 +12162,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/syntax/attrs/parse.rs: onto views (1)
 
@@ -15538,6 +15666,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/syntax/attrs/check_attr.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-attrs`. Lands with `## frontend-tree: blaze-diagnostics
@@ -16803,6 +16933,8 @@ Why: onto views: nodes by value, view lookups in place of handle ones
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file. `next_token` keeps today's kind-first test, on views (`ast::Comment::cast(*token)`); the per-node `// clone:` comments went with the clones.
+
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/asm.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
@@ -17112,6 +17244,8 @@ Why: onto views: views by value, `up` walked without a Vec
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file. `string_of` takes the expression by value (today's `&ast::Expr` was there to skip a handle clone); today's `tree.skipped` loop kept.
+
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
@@ -17271,6 +17405,8 @@ Why: onto views: nodes by value, `Tokens<'_>`
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers/tokens.rs: onto views (1)
 
@@ -17591,6 +17727,8 @@ Why: onto views: lent text, views by value
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file. `Tokens::of` keeps its `// alloc:` comment on the literal (the `tts` vector); the `node.to_string()` is gone (`node.text()`).
+
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers/quoted.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
@@ -17858,6 +17996,8 @@ Why: `Tokens<'_>`; tests on views
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers/check.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
@@ -17941,6 +18081,8 @@ Why: `Tokens<'_>`; tests on views
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers/follow.rs: onto views (1)
 
@@ -18032,6 +18174,8 @@ Why: `Tokens<'_>`; tests on views
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers/expr_2024.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
@@ -18119,6 +18263,8 @@ Why: `Tokens<'_>`; tests on views
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 25).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/levels/builder.rs: onto views (12)
 
@@ -18452,6 +18598,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
+
 ## frontend-tree: blaze-diagnostics lints/levels.rs: onto views (8)
 
 From `frontend-tree-move-diag-lints-bodies`. Needs: `## frontend-tree: blaze-diagnostics lints/levels/builder.rs: onto views (12)` and `## frontend-tree: blaze-diagnostics lints/levels/attrs.rs: onto views (16)` (lands with both), `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)` (`Tree::of_kind` and `tree.nodes` give `ast::Node<'db>` by value, `Tree::ptr` takes one), `Cx::root` (frontend-tree-move-diag-lower's `cx.rs`). `may_fire` reads every `ATTR` of the crate with no reference count; hunk 8 is the budget test the level map's build had none of: with lints on, 4 and 400 attributed functions in attributed modules, the build and the first level at each function must not allocate per node or attribute.
@@ -18619,6 +18767,8 @@ becomes
 > forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 26).
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29): every hunk, merged onto today's file.
 
 ## frontend-tree: blaze-diagnostics lints/syntax/attrs/doc.rs: onto views (1)
 
@@ -24409,4 +24559,160 @@ From `diagnostics-infer2-methods`, which applied items 8, 7 and 3 of `v2/request
 > - Item 1 needs no change in hir-ty. `infer_field_access`'s fallback calls `lookup_method_including_private(receiver_ty, name, None, receiver, tgt_expr)` with the field expression as its `call_expr`. On a pick (`Ok`, not `PrivateMatch`, as rustc's `probe_for_name` gives `Ok` only for a visible pick), it already writes `unstable_candidates` and `method_resolution` under the field expression. So for an `Expr::Field`, `InferenceResult::unstable_candidates(field.into())` and `method_resolution(field)` are what the arm needs. `method_resolution` has meant "the method this expression names" for a field like this all along, and a column of its own would be a copy. Test: `crates/hir/src/tests/infer.rs` `a_field_naming_a_method_keeps_its_probe_s_unstable_items`. The `Expr::Field` arm in `unstable_names.rs` can go in.
 > - Item 2 applied: `InferenceResult::unstable_candidate_nodes()` yields `(ExprOrPatId, &[(CandidateId, Symbol)])` over the non-empty entries only (expressions, then patterns), and the same test covers it.
 
+> db-audit-other (23:21), items 3 and 4:
+> - Item 3 applied, not compiled: `hir::Closure::kind_origin_place(&self, db) -> Option<String>` (`crates/hir/src/lib.rs:4417`). It is rustc's `place_to_string_for_capture` over the origin's own place, not over the capture's: every deref a leading `*`, every field `.name` or `.index`, the raw name (no `r#`). So it differs from `display_place_source_code` (which keeps only trailing derefs) wherever the two print differently, as rustc's label does. hir-ty records the origin after the precision rules and before the `move` adjustment, as rustc does (`infer/closure/analysis.rs:684-718`). Test: `crates/hir/src/tests/api.rs` `a_closure_s_kind_origin_place_is_the_use_s_not_the_capture_s`: a `move` closure writing `r.a` through `r: &mut S` gives `*r.a` where the capture is `r`. For diagnostics: `lower/closure_kind_mismatch.rs:44` can print `closure.kind_origin_place(cx.db)` instead of `capture.display_place_source_code(..)`.
+> diagnostics (window 84, 2026-10-29 23:40): item 3 used, not built. In `lower/closure_kind_mismatch.rs`, the E0525 "moves/mutates the variable `{place}`" label now prints `kind_origin_place(cx.db)`, not `display_place_source_code`.
+> - Item 4 forwarded by db-audit-other to the coordinator (`crates/test-utils` is its): `v2/requests/db.md` `## coordinator (from db-audit-other): minicore's Iterator::min and what the two E0277-free tests need` (told requests-next3). Besides `min`, minicore lacks the integer `PartialEq`/`Eq`/`PartialOrd`/`Ord` impls, `Ord for &A` and `[T]::iter`.
+
 > diagnostics-infer2-methods (2026-10-29): parts 1 and 2 used. `lints/bodies/unstable_names.rs` iterates `unstable_candidate_nodes()` (no per-node scan) and lints a field access with no field like a method call (pick from `method_resolution(field)`, span the field's `name_ref`). No rustc UI test covers the field case, so none was added.
+
+## dedup: diagnostics reads hir-def's expression and pattern tags, rustc_ast_ir's widths, hir-def's version parse and syntax's precedence (from dedup-sim-rest, 2026-10-29)
+
+From `dedup-sim-rest` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-rest.md`, notes
+`docs/v2/plan/lanes/dedup/sim-rest.md`). Four copies of things another crate owns. Nothing
+here changes what a lint reports, except where noted in item 4.
+
+### 1. `lints/bodies.rs`: `ExprTag`/`PatTag` are hir-def's `ExprKind`/`PatKind`
+
+hir-def's kind enums are now public (applied by dedup-sim-rest in
+`crates/hir-def/src/hir/columns.rs`, re-exported as `hir_def::hir::{ExprKind, PatKind}`): the
+byte of the store's kind columns, in variant order, with `ALL` and an `#[inline] pub fn of(&Expr)`
+/ `of(&Pat)` that is the same `match` as `ExprTag::of`/`PatTag::of`. `ExprTag` has already drifted
+from it: it has no `UnsafeBinderCast`, so `ExprTag::of` is not exhaustive over today's `Expr`
+(`requests-format-next.md` item 5's first bullet asks to add the arm; this replaces that bullet).
+
+- In `lints/bodies.rs`, delete `enum ExprTag` with its doc comment, `const EXPR_TAGS`, `impl
+  ExprTag`, `enum PatTag` with its doc comment, `const PAT_TAGS` and `impl PatTag` (today lines
+  666-747 and 771-819), and put in their place:
+
+  ```rust
+  pub(crate) use hir_def::hir::{ExprKind, PatKind};
+
+  const EXPR_TAGS: usize = ExprKind::ALL.len();
+  const PAT_TAGS: usize = PatKind::ALL.len();
+  const _: () = assert!(EXPR_TAGS <= u64::BITS as usize && PAT_TAGS <= u32::BITS as usize);
+  ```
+
+  (the assert holds `ExprKinds(u64)` and `PatKinds(u32)` to one bit per tag). `ExprKinds::of`'s
+  `tags[at] as u8` works unchanged on hir-def's `#[repr(u8)]` enums.
+- Under `crates/blaze-diagnostics/src/lints/bodies.rs` and `lints/bodies/**`, replace the word
+  `ExprTag` with `ExprKind` and `PatTag` with `PatKind` (word boundary: `ExprKinds`/`PatKinds`
+  stay). That is the two `of` calls in `Late::expr`/`Late::pat` (`ExprKind::of(&decoded)`,
+  `PatKind::of(&decoded)`), the doc comments, and the imports
+  `lints::bodies::{BodyCx, ExprKinds, ExprTag, ..}` in the 18 pass files (`rg -l ExprTag
+  crates/blaze-diagnostics/src`). None of those files has another `ExprKind` or `PatKind` in
+  scope (checked).
+- `requests-format-next.md` item 5's other two bullets (`dangling.rs`, `drop_forget_useless.rs`)
+  still stand; with this, a pass that wants `UnsafeBinderCast` lists `ExprKind::UnsafeBinderCast`.
+
+### 2. `lints/bodies/panics.rs` `scalar_kind`: the widths are `rustc_ast_ir`'s
+
+`rustc_type_ir::{IntTy, UintTy, FloatTy}` (re-exported from `ra-ap-rustc_ast_ir` 0.166) have
+`bit_width()`, `None` for `isize`/`usize`: the one table of these widths. hir-ty's const
+evaluator's `kind_of` gets the same change (`v2/requests/db.md`, same heading). Replace
+`fn scalar_kind` (today 949-988, doc comment kept) with:
+
+```rust
+    fn scalar_kind(&self, ty: Ty<'db>) -> Option<(Kind, u8)> {
+        let int = |signed: bool, bits: Option<u64>| {
+            let size = match bits {
+                Some(bits) => (bits / 8) as u8,
+                None => self.owner.pointer_size?,
+            };
+            Some((Kind::Int { signed, pointer_sized: bits.is_none() }, size))
+        };
+        match ty.kind() {
+            TyKind::Bool => Some((Kind::Bool, 1)),
+            TyKind::Char => Some((Kind::Char, 4)),
+            TyKind::Int(it) => int(true, it.bit_width()),
+            TyKind::Uint(it) => int(false, it.bit_width()),
+            TyKind::Float(it) => Some((Kind::Float(it), (it.bit_width() / 8) as u8)),
+            _ => None,
+        }
+    }
+```
+
+The import `FloatTy, IntTy, TypeVisitableExt as _, UintTy,` (line 62) becomes
+`TypeVisitableExt as _, UintTy,` (`UintTy::U32` at 793 stays).
+
+### 3. `checks/attrs/parsers.rs` `parse_version` and `checks/features/library.rs` `version`: hir-def's `RustcVersion::parse`
+
+`hir_def::attrs::stability::RustcVersion::parse` (`crates/hir-def/src/attrs/stability.rs:79`) is
+rustc's `parse_version`, the same body as both copies. (The third copy, in
+`lints/names/stability/attr.rs`, goes with this file's "the stability lint reads hir-def's
+stability" request above.)
+
+- `checks/attrs/parsers.rs`, the body of `parse_version` (249-261, doc comment becomes
+  "rustc's `parse_version` (hir-def's [`RustcVersion::parse`]), as the tuple the parsed
+  attributes keep."):
+
+  ```rust
+  pub(crate) fn parse_version(text: &str) -> Option<(u16, u16, u16)> {
+      RustcVersion::parse(text).map(|it| (it.major, it.minor, it.patch))
+  }
+  ```
+
+  with `use hir_def::attrs::stability::RustcVersion;` among the imports. Its callers
+  (`attrs/cfg.rs:88`, `parsers/stability.rs` 386, 519, 535) are unchanged.
+- `checks/features/library.rs` `version` (697-710):
+
+  ```rust
+  /// `parse_version`, printed as `RustcVersion` prints: `major.minor.patch`.
+  fn version(text: &str) -> Option<String> {
+      let it = hir_def::attrs::stability::RustcVersion::parse(text)?;
+      // alloc: the library's table, as above
+      Some(format!("{}.{}.{}", it.major, it.minor, it.patch))
+  }
+  ```
+
+  Its test (`version("1.0")` and the four after it, 752-756) keeps passing as is.
+
+### 4. `lower/type_mismatch.rs` `needs_parens`: syntax's `ExprPrecedence`
+
+`syntax::view::prec` has rustc's precedence over views (`Expr::precedence()`, checked against the
+handle version by `syntax/src/view/tests.rs` `precedence_and_parens`). `needs_parens` asks
+whether a prefix `&` binds tighter than the expression, which is `precedence() < Prefix`:
+
+```rust
+/// Whether `&` before the expression would bind tighter than it: rustc's `needs_parens` by
+/// precedence, of the expressions that bind looser than a prefix operator.
+fn needs_parens(expr: ast::Expr<'_>) -> bool {
+    expr.precedence() < syntax::view::prec::ExprPrecedence::Prefix
+}
+```
+
+What changes: `continue`, `become` and `do yeet` now get parentheses too (rustc's `Jump`, as
+`return`/`break`/`yield` already did), and a closure with a written return type does not (rustc's
+`Unambiguous`: its body is a block). `blaze-lints`' `needless_borrow::unambiguous` goes onto the
+same function (`v2/requests/coordinator.md`, same heading).
+
+> forwarded to diagnostics (diagnostics-next2, both windows); told by tmux (requests, pass 35).
+
+> applied by diagnostics (window 54, 23:50), all four items as written. (1) `lints/bodies.rs` re-exports `hir_def::hir::{ExprKind, PatKind}` with `EXPR_TAGS`/`PAT_TAGS` from `ALL.len()` and the bit-width assert; `ExprTag`/`PatTag` renamed by word in the 25 files that named them (the only other `ExprKind`s are doc comments naming rustc's). (2) `panics.rs` `scalar_kind` reads `bit_width()`; `FloatTy, IntTy` dropped from the import. (3) `parse_version` and `library.rs` `version` call `RustcVersion::parse`. (4) `needs_parens` is `expr.precedence() < ast::prec::ExprPrecedence::Prefix`. Hot lint 0. Not built (applier rules).
+
+## coordinator (from diagnostics window 84, 2026-10-29 23:30): a front-end crate `hir-lint-levels` for codegen-rq-mir.md R5's level query
+
+What: a new workspace member `crates/hir-lint-levels`, owned by lane diagnostics, written as
+one change: its `Cargo.toml` and a `src/lib.rs` declaring `pub mod registry; pub mod levels;`.
+Its dependencies are all `workspace = true`, and every one is already a dependency of
+blaze-diagnostics: `base-db`, `hir-expand`, `hir-def`, `syntax`, `cfg`, `intern`, `span`,
+`blaze-ids`, `serde`, `smallvec`, `rustc-hash` and `hashbrown`. `hir-ty` (for the const evaluator)
+and `blaze-diagnostics` each get `hir-lint-levels.workspace = true`.
+
+Why: R5 part 1 asks for `lint_level(db, owner: DefWithBodyId, lint) -> Level` as one rule that
+hir-ty and blaze-diagnostics both read. Today the rule lives only in blaze-diagnostics
+(`lints/registry/`, 3,290 lines, and `lints/levels.rs` with `levels/{builder,attrs}.rs`, 2,234 lines). It
+can't stay there, because hir-ty can't depend on blaze-diagnostics, and it can't go in `hir`
+either, because `hir` depends on hir-ty. So the crate sits below hir-ty, on hir-def and
+hir-expand.
+
+After that, diagnostics will move the registry and the level builder there, rather than copy
+them. The move ports their 11 `hir::Semantics` uses and `hir::InFile`/`HirFileId` onto hir-def's
+attribute and source-map queries and hir-expand's `expand_cfg_attr_view`, then adds the salsa
+query at rustc's `best_lint_scope`. The builder's emitted diagnostics (unknown lint and the
+rest) stay in blaze-diagnostics, which reads the crate's structured results.
+
+Status: open
+
+> held (requests, pass 37): placement is right (below hir-ty, on hir-def and hir-expand; semantics-in-front-end) and nothing in decisions.md is against it. Diagnostics writes the new crate itself (its `Cargo.toml` and `src/lib.rs` together, as common.md says for a new crate); `crates/*` makes it a member. requests adds the root `hir-lint-levels = { path = "crates/hir-lint-levels" }` once both files exist (a path with no crate stops the workspace loading), then forwards hir-ty's `Cargo.toml` line to db. The crates.md ownership row is on the coordinator's list. (told diagnostics-levels by tmux)
+> applied (requests, pass 40): root `hir-lint-levels = { path = "crates/hir-lint-levels", version = "0.0.0" }` (the crate has its `Cargo.toml` and `src/lib.rs`). The reader is now hir-ty-mir, not hir-ty (coordinator.md "diagnostics-levels: a second new crate" item 4), and its line is filed for codegen in codegen-rq-mir.md R5. The manifest lint's one finding is the crate's `blaze-lint-defs`, which waits for that crate (coordinator.md, held).

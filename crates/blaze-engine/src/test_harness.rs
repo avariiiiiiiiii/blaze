@@ -7,10 +7,7 @@
 use std::fmt::Write as _;
 
 use ide_db::RootDatabase;
-use syntax::{
-    AstNode as _, AstToken as _,
-    ast::{self, HasAttrs as _, HasName as _},
-};
+use syntax::view::{self as ast, AstNode as _, AstToken as _, HasAttrs as _, HasName as _};
 
 /// The module's name in the crate's root.
 pub(crate) const MODULE: &str = "__blaze_test_harness";
@@ -85,7 +82,7 @@ pub(crate) fn module(
     functions: impl IntoIterator<Item = hir::Function>,
     file_name: &impl Fn(vfs::FileId) -> Option<String>,
 ) -> Option<Harness> {
-    use hir::HasSource as _;
+    use hir::view::HasSourceView as _;
     let edition = krate.edition(db);
     let mut tests = Vec::new();
     for function in functions {
@@ -94,7 +91,7 @@ pub(crate) fn module(
             continue;
         }
         let Some(path) = path_of(db, function, edition) else { continue };
-        let source = function.source(db)?;
+        let source = function.source_view(db)?;
         let mut test = Test {
             path,
             bench,
@@ -106,7 +103,9 @@ pub(crate) fn module(
             end: (0, 0),
         };
         // What `cfg_attr` gives for the crate's cfgs is written as if alone.
-        let mut metas: Vec<ast::Meta> = source.value.attrs().filter_map(|it| it.meta()).collect();
+        let metas = source.value.attrs().filter_map(|it| it.meta());
+        // alloc: a test's few attributes, once per test when the harness is written
+        let mut metas: Vec<ast::Meta<'_>> = metas.collect();
         metas.reverse();
         let mut attrs = Vec::new();
         while let Some(meta) = metas.pop() {
@@ -114,23 +113,23 @@ pub(crate) fn module(
                 attrs.push(meta);
                 continue;
             };
-            let predicate = cfg::CfgExpr::parse_from_ast(cfg_attr.cfg_predicate()?);
+            let predicate = cfg::CfgExpr::parse_from_view(cfg_attr.cfg_predicate()?);
             if krate.cfg(db).check(&predicate) != Some(false) {
-                let inner: Vec<ast::Meta> = cfg_attr.metas().collect();
+                // alloc: a `cfg_attr`'s few attributes, reversed onto the stack
+                let inner: Vec<ast::Meta<'_>> = cfg_attr.metas().collect();
                 metas.extend(inner.into_iter().rev());
             }
         }
         for meta in attrs {
-            let named = |path: Option<ast::Path>| path.map(|it| it.syntax().text().to_string());
             match meta {
-                ast::Meta::PathMeta(meta) => match named(meta.path()).as_deref() {
+                ast::Meta::PathMeta(meta) => match named(meta.path()) {
                     Some("ignore") => test.ignore = true,
                     Some("should_panic") => test.should_panic = ShouldPanic::Yes,
                     _ => {}
                 },
                 ast::Meta::KeyValueMeta(meta) => {
-                    let value = meta.expr().and_then(|it| string_of(&it));
-                    match named(meta.path()).as_deref() {
+                    let value = meta.expr().and_then(string_of);
+                    match named(meta.path()) {
                         Some("ignore") => (test.ignore, test.ignore_message) = (true, value),
                         Some("should_panic") => {
                             test.should_panic = ShouldPanic::WithMessage(value?);
@@ -140,11 +139,11 @@ pub(crate) fn module(
                 }
                 // rustc reads no message from `ignore` with a list after it, and ignores the
                 // test.
-                ast::Meta::TokenTreeMeta(meta) => match named(meta.path()).as_deref() {
+                ast::Meta::TokenTreeMeta(meta) => match named(meta.path()) {
                     Some("ignore") => test.ignore = true,
                     Some("should_panic") => {
                         test.should_panic =
-                            ShouldPanic::WithMessage(expected(&meta.token_tree()?)?);
+                            ShouldPanic::WithMessage(expected(meta.token_tree()?)?);
                     }
                     _ => {}
                 },
@@ -152,7 +151,8 @@ pub(crate) fn module(
             }
         }
         let name = source.value.name()?;
-        let range = source.with_value(name.syntax()).original_file_range_rooted(db);
+        let range = source.with_value(name.syntax().text_range());
+        let range = range.original_node_file_range_rooted(db);
         let file = range.file_id.file_id(db);
         test.file = file_name(file)?;
         let text = db.file_text(file);
@@ -320,8 +320,13 @@ fn nul_ended(text: &str) -> String {
     out
 }
 
+/// The text of a path as it is written.
+fn named(path: Option<ast::Path<'_>>) -> Option<&str> {
+    path.map(|it| it.syntax().text())
+}
+
 /// The value of a string literal.
-fn string_of(expr: &ast::Expr) -> Option<String> {
+fn string_of(expr: ast::Expr<'_>) -> Option<String> {
     let ast::Expr::Literal(literal) = expr else { return None };
     let ast::LiteralKind::String(string) = literal.kind() else { return None };
     Some(string.value().ok()?.into_owned())
@@ -329,24 +334,21 @@ fn string_of(expr: &ast::Expr) -> Option<String> {
 
 /// The message of `should_panic(expected = "...")`. `None` for any other argument: rustc
 /// takes no other.
-fn expected(tree: &ast::TokenTree) -> Option<String> {
-    let tokens: Vec<_> = tree
+fn expected(tree: ast::TokenTree<'_>) -> Option<String> {
+    let mut tokens = tree
         .syntax()
         .children_with_tokens()
         .filter_map(|it| it.into_token())
-        .filter(|it| !it.kind().is_trivia())
-        .collect();
-    match tokens.as_slice() {
-        [open, name, eq, value, close]
-            if open.text() == "("
-                && name.text() == "expected"
-                && eq.text() == "="
-                && close.text() == ")" =>
-        {
-            Some(ast::String::cast(value.clone())?.value().ok()?.into_owned())
-        }
-        _ => None,
+        .filter(|it| !it.kind().is_trivia());
+    let [Some(open), Some(name), Some(eq), Some(value), Some(close), None] =
+        [(); 6].map(|()| tokens.next())
+    else {
+        return None;
+    };
+    if [open, name, eq, close].map(|it| it.text()) != ["(", "expected", "=", ")"] {
+        return None;
     }
+    Some(ast::String::cast(value)?.value().ok()?.into_owned())
 }
 
 #[cfg(test)]
@@ -370,7 +372,7 @@ fn helper() {}
         );
         let asked = std::cell::Cell::new(0);
         let harness = hir::attach_db(&db, || {
-            let sema = hir::Semantics::new(&db);
+            let sema = hir::view::Semantics::new(&db);
             let root = sema.file_to_module_defs(file.file_id(&db)).next().unwrap();
             let krate = root.krate(&db);
             let functions = root.declarations(&db).into_iter().filter_map(|it| match it {

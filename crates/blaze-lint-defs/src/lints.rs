@@ -5,7 +5,7 @@
 //! These are `const`s so that the registry numbers and indexes them as blaze is built; the
 //! lints with their ids are `index::ALL`'s, which is where every `&'static Lint` points.
 
-use span::Edition::{Edition2018, Edition2021, Edition2024};
+use edition::Edition::{Edition2018, Edition2021, Edition2024};
 
 use super::{
     Level::{Allow, Deny, Warn},

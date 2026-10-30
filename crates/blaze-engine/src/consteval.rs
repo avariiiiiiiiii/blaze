@@ -18,11 +18,11 @@ use std::{
 };
 
 use anyhow::Context as _;
-use hir::{AssocItem, HasSource as _, ModuleDef};
+use hir::{AssocItem, ModuleDef, view::HasSourceView as _};
 use ide_db::{ChangeWithProcMacros, RootDatabase, RootDatabaseExt as _};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
 use project_model::{CargoConfig, RustLibSource};
-use syntax::AstNode as _;
+use syntax::view::AstNode as _;
 use vfs::{AbsPathBuf, VfsPath};
 
 pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
@@ -119,8 +119,8 @@ fn evaluated(db: &RootDatabase, file: vfs::FileId) -> Vec<serde_json::Value> {
             return Vec::new();
         };
         let text = db.file_text(file).text(db);
-        let line_of = |node: hir::InFile<&syntax::SyntaxNode>| {
-            let range = node.original_file_range_rooted(db);
+        let line_of = |node: hir::InFile<syntax::TextRange>| {
+            let range = node.original_node_file_range_rooted(db);
             (range.file_id.file_id(db) == file).then(|| {
                 let start = usize::from(range.range.start()).min(text.len());
                 text[..start].matches('\n').count() + 1
@@ -142,11 +142,15 @@ fn evaluated(db: &RootDatabase, file: vfs::FileId) -> Vec<serde_json::Value> {
                 let (name, line, result) = match def {
                     ModuleDef::Const(it) if it.has_body(db) => {
                         let name = it.name(db).map_or("_".to_owned(), |it| it.as_str().to_owned());
-                        let line = it.source(db).and_then(|it| line_of(it.syntax()));
+                        let line = it
+                            .source_view(db)
+                            .and_then(|it| line_of(it.map(|it| it.syntax().text_range())));
                         (named(&name), line, it.eval(db).map(drop).map_err(|e| format!("{e:?}")))
                     }
                     ModuleDef::Static(it) if it.extern_block(db).is_none() => {
-                        let line = it.source(db).and_then(|it| line_of(it.syntax()));
+                        let line = it
+                            .source_view(db)
+                            .and_then(|it| line_of(it.map(|it| it.syntax().text_range())));
                         let result = it.eval(db).map(drop).map_err(|e| format!("{e:?}"));
                         (named(it.name(db).as_str()), line, result)
                     }
@@ -163,7 +167,9 @@ fn evaluated(db: &RootDatabase, file: vfs::FileId) -> Vec<serde_json::Value> {
                     let AssocItem::Const(it) = assoc else { continue };
                     let Some(name) = it.name(db) else { continue };
                     let name = named(&format!("{}::{}", adt.name(db).as_str(), name.as_str()));
-                    let line = it.source(db).and_then(|it| line_of(it.syntax()));
+                    let line = it
+                        .source_view(db)
+                        .and_then(|it| line_of(it.map(|it| it.syntax().text_range())));
                     let result = it.eval(db).map(drop).map_err(|e| format!("{e:?}"));
                     items.push(item(name, line, false, result));
                 }

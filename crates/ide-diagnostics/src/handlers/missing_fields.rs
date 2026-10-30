@@ -57,7 +57,9 @@ fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::MissingFields) -> Option<Vec
     // `struct A(usize);`
     // `let a = A { 0: () }`
     // but it is uncommon usage and it should not be encouraged.
-    if d.missed_fields.iter().any(|(name, _)| name.as_tuple_index().is_some()) {
+    if d.missed_fields.is_empty()
+        || d.missed_fields.iter().any(|(name, _)| name.as_tuple_index().is_some())
+    {
         return None;
     }
 

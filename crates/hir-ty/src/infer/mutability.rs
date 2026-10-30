@@ -3,7 +3,7 @@
 
 use hir_def::hir::{
     Array, AsmOperand, BinaryOp, BindingAnnotation, Expr, ExprId, Pat, PatId, RecordSpread,
-    Statement, UnaryOp,
+    Statement, UnaryOp, UnsafeBinderCastKind,
 };
 use rustc_ast_ir::Mutability;
 
@@ -161,10 +161,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 }
                 self.infer_mut_expr(expr, mutability);
             }
-            Expr::Field { expr, name: _ } => {
+            Expr::Field { expr, name: _ }
+            | Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Unwrap, expr, ty: _ } => {
                 self.infer_mut_expr(expr, mutability);
             }
-            Expr::UnaryOp { expr, op: _ }
+            Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Wrap, expr, ty: _ }
+            | Expr::UnaryOp { expr, op: _ }
             | Expr::Await { expr }
             | Expr::Loop { body: expr, label: _, source: _ }
             | Expr::Cast { expr, type_ref: _ } => {

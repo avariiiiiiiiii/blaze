@@ -531,16 +531,20 @@ fn item_syntax<N: AstIdNode>(
 /// The node at `id` in its file's [`FileOutline`], when the outline has it: the item's
 /// attributes read the same off it as off the file, and a body edit leaves it the same.
 /// `None` for an item in a body the outline leaves out, or one a macro writes.
-pub(crate) fn outline_item<N: AstIdNode>(db: &Db, id: AstId<N>) -> Option<N> {
+pub(crate) fn outline_item<'db, N: AstIdNode + syntax::view::Typed>(
+    db: &'db Db,
+    id: AstId<N>,
+) -> Option<N::Of<'db>> {
     let HirFileId::FileId(file) = id.file_id else { return None };
     let outline = file_outline(db, file);
     let ptr = outline.ast_id_map.try_get_erased(id.value.erase())?;
-    N::cast(ptr.to_node(&outline.root()))
+    let root = syntax::view::Node::root(&outline.tree);
+    <N::Of<'db> as syntax::view::AstNode<'db>>::cast(syntax::view::to_node(ptr, root))
 }
 
 /// The root of `file`'s [`FileOutline`]: the file less the bodies it leaves out.
-pub(crate) fn outline_root(db: &Db, file: EditionedFileId) -> ast::SourceFile {
-    ast::SourceFile::cast(file_outline(db, file).root()).expect("an outline's root is a file")
+pub(crate) fn outline_root(db: &Db, file: EditionedFileId) -> syntax::view::SourceFile<'_> {
+    syntax::view::root(&file_outline(db, file).tree).expect("an outline's root is a file")
 }
 
 /// The [`SignatureSyntax`] of `def`'s signature, `None` for an item a macro writes.
@@ -668,13 +672,17 @@ bitflags! {
         /// Indicates whether this struct is `ppcf128`, laid out as the backend's IBM
         /// double-double scalar.
         const IS_PPC_F128 = 1 << 10;
+        /// Whether a field of this struct or union is written `unsafe` (`unsafe_fields`).
+        const HAS_UNSAFE_FIELDS = 1 << 11;
+        /// Indicates whether this struct is `FieldRepresentingType` (`field_projections`).
+        const IS_FIELD_REPRESENTING_TYPE = 1 << 12;
     }
 }
 
 /// The lang items a struct is laid out or checked as no other struct is, with the flag each
 /// sets, found by `STRUCT_LANG_ITEM_NAMES` (member `i` is entry `i`): one load for a struct with
 /// a `#[lang]`, none for any other.
-const STRUCT_LANG_ITEMS: [(Symbol, StructFlags); 8] = [
+const STRUCT_LANG_ITEMS: [(Symbol, StructFlags); 9] = [
     (sym::phantom_data, StructFlags::IS_PHANTOM_DATA),
     (sym::owned_box, StructFlags::IS_BOX),
     (sym::manually_drop, StructFlags::IS_MANUALLY_DROP),
@@ -683,6 +691,7 @@ const STRUCT_LANG_ITEMS: [(Symbol, StructFlags); 8] = [
     (sym::unsafe_pinned, StructFlags::IS_UNSAFE_PINNED),
     (sym::f16b, StructFlags::IS_F16B),
     (sym::ppcf128, StructFlags::IS_PPC_F128),
+    (sym::field_representing_type, StructFlags::IS_FIELD_REPRESENTING_TYPE),
 ];
 
 static STRUCT_LANG_ITEM_NAMES: intern::KnownNames = intern::KnownNames::new(&[
@@ -694,6 +703,7 @@ static STRUCT_LANG_ITEM_NAMES: intern::KnownNames = intern::KnownNames::new(&[
     sym::Declared::unsafe_pinned,
     sym::Declared::f16b,
     sym::Declared::ppcf128,
+    sym::Declared::field_representing_type,
 ]);
 
 impl StructFlags {
@@ -731,6 +741,8 @@ impl StructSignature {
         if let Some(lang) = attrs.lang_item_with_attrs(db, id.into()) {
             flags |= StructFlags::from_lang_item(&lang);
         }
+        let cfg_options = loc.container.krate(db).cfg_options(db);
+        flags.set(StructFlags::HAS_UNSAFE_FIELDS, has_unsafe_field(source.field_list(), cfg_options));
         let shape = adt_shape(source.kind());
 
         let (store, generic_params, source_map) = lower_generic_params_within(
@@ -786,7 +798,10 @@ impl UnionSignature {
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
-        let flags = StructFlags::from_attrs(AttrFlags::query(db, id.into()));
+        let mut flags = StructFlags::from_attrs(AttrFlags::query(db, id.into()));
+        let cfg_options = loc.container.krate(db).cfg_options(db);
+        let fields = source.record_field_list().map(ast::FieldList::RecordFieldList);
+        flags.set(StructFlags::HAS_UNSAFE_FIELDS, has_unsafe_field(fields, cfg_options));
 
         let (store, generic_params, source_map) = lower_generic_params_within(
             db,
@@ -822,6 +837,8 @@ bitflags! {
         const RUSTC_HAS_INCOHERENT_INHERENT_IMPLS  = 1 << 1;
         /// Whether this enum has `#[fundamental]`.
         const FUNDAMENTAL = 1 << 2;
+        /// Whether a field of a variant of this enum is written `unsafe` (`unsafe_fields`).
+        const HAS_UNSAFE_FIELDS = 1 << 3;
     }
 }
 
@@ -855,7 +872,8 @@ impl EnumSignature {
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
-        let flags = EnumFlags::from_attrs(AttrFlags::query(db, id.into()));
+        let mut flags = EnumFlags::from_attrs(AttrFlags::query(db, id.into()));
+        flags.set(EnumFlags::HAS_UNSAFE_FIELDS, enum_has_unsafe_fields(db, id));
 
         let (store, generic_params, source_map) = lower_generic_params_within(
             db,
@@ -871,6 +889,45 @@ impl EnumSignature {
         let name = as_name_opt(source.name());
         (EnumSignature { generic_params, store, flags, name }, source_map)
     }
+}
+
+/// Whether a field of `fields` that `cfg_options` keeps is written `unsafe`: rustc's
+/// `VariantDef::has_unsafe_fields`, read off the syntax so a signature doesn't read the
+/// variant's [`VariantFields`].
+fn has_unsafe_field(fields: Option<ast::FieldList>, cfg_options: &CfgOptions) -> bool {
+    fn any<Field: ast::HasAttrs>(
+        mut fields: impl Iterator<Item = Field>,
+        cfg_options: &CfgOptions,
+    ) -> bool {
+        fields.any(|field| {
+            let [is_unsafe] = child_tokens(field.syntax(), [T![unsafe]]);
+            is_unsafe && AttrFlags::is_cfg_enabled_for(&field, cfg_options).is_ok()
+        })
+    }
+    match fields {
+        Some(ast::FieldList::RecordFieldList(it)) => any(it.fields(), cfg_options),
+        Some(ast::FieldList::TupleFieldList(it)) => any(it.fields(), cfg_options),
+        None => false,
+    }
+}
+
+/// Whether a field of a variant of `id` that its crate's cfg keeps is written `unsafe`. It
+/// reads the variants, which the enum's [`signature_syntax`] leaves out, so it is a query of
+/// its own: a variant edit runs it again, and the signature only when the answer changes.
+#[salsa::tracked(mem_tag = Nameres)]
+fn enum_has_unsafe_fields(db: &Db, id: EnumId) -> bool {
+    let loc = id.lookup(db);
+    let source = match variants_syntax(db, id) {
+        Some(syntax) => syntax.node::<ast::Enum>().value,
+        None => loc.source(db).value,
+    };
+    let cfg_options = loc.container.krate(db).cfg_options(db);
+    source.variant_list().is_some_and(|list| {
+        list.variants().any(|variant| {
+            AttrFlags::is_cfg_enabled_for(&variant, cfg_options).is_ok()
+                && has_unsafe_field(variant.field_list(), cfg_options)
+        })
+    })
 }
 
 impl EnumSignature {
@@ -894,6 +951,8 @@ bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
     pub struct ConstFlags: u8 {
         const HAS_BODY = 1 << 1;
+        /// Written `default const` (`specialization`).
+        const IS_DEFAULT = 1 << 2;
         const RUSTC_ALLOW_INCOHERENT_IMPL = 1 << 7;
     }
 }
@@ -926,6 +985,8 @@ impl ConstSignature {
             RUSTC_ALLOW_INCOHERENT_IMPL => RUSTC_ALLOW_INCOHERENT_IMPL,
         });
         flags.set(ConstFlags::HAS_BODY, source.value.body().is_some());
+        let [default] = child_tokens(source.value.syntax(), [T![default]]);
+        flags.set(ConstFlags::IS_DEFAULT, default);
 
         let (store, source_map, type_ref) =
             lower_type_ref(db, module, source.as_ref().map(|it| it.ty()), maps, lowering);
@@ -1318,6 +1379,8 @@ bitflags! {
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
     pub struct TypeAliasFlags: u8 {
         const RUSTC_HAS_INCOHERENT_INHERENT_IMPL = 1 << 1;
+        /// Written `default type` (`specialization`).
+        const IS_DEFAULT = 1 << 2;
         const IS_EXTERN = 1 << 6;
         const RUSTC_ALLOW_INCOHERENT_IMPL = 1 << 7;
     }
@@ -1359,6 +1422,8 @@ impl TypeAliasSignature {
             TypeAliasFlags::IS_EXTERN,
             matches!(loc.container, ItemContainerId::ExternBlockId(_)),
         );
+        let [default] = child_tokens(source.value.syntax(), [T![default]]);
+        flags.set(TypeAliasFlags::IS_DEFAULT, default);
         let name = as_name_opt(source.value.name());
         let (store, source_map, generic_params, bounds, ty) =
             lower_type_alias(db, loc.container, source, id, maps, lowering);
@@ -2034,6 +2099,7 @@ mod tests {
             _ if *lang == sym::unsafe_pinned => StructFlags::IS_UNSAFE_PINNED,
             _ if *lang == sym::f16b => StructFlags::IS_F16B,
             _ if *lang == sym::ppcf128 => StructFlags::IS_PPC_F128,
+            _ if *lang == sym::field_representing_type => StructFlags::IS_FIELD_REPRESENTING_TYPE,
             _ => StructFlags::empty(),
         };
         let others = [sym::sized, sym::copy, sym::non_null, sym::va_list, sym::drop];
@@ -2074,6 +2140,7 @@ const trait Co {}
 trait Pl {}
 struct R { unsafe a: u8, b: u8, pub c: u8 }
 struct Q(pub u8, u8);
+impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; const D: u8 = 0; }
 "#;
 
     #[test]
@@ -2084,6 +2151,7 @@ struct Q(pub u8, u8);
         let mut seen_impl = [false; 4];
         let mut seen_trait = [false; 3];
         let mut seen_unsafe_field = false;
+        let mut seen_default = [false; 2];
         fn or(seen: &mut [bool], found: &[bool]) {
             seen.iter_mut().zip(found).for_each(|(seen, found)| *seen |= *found)
         }
@@ -2142,11 +2210,20 @@ struct Q(pub u8, u8);
                     .any(|token| token.kind() == T![unsafe]);
                 assert_eq!(found, scanned, "{it}");
                 seen_unsafe_field |= found;
+            } else if let Some(it) = ast::Const::cast(node.clone()) {
+                let found = child_tokens(it.syntax(), [T![default]]);
+                assert_eq!(found, [it.default_token().is_some()], "{it}");
+                seen_default[0] |= found[0];
+            } else if let Some(it) = ast::TypeAlias::cast(node.clone()) {
+                let found = child_tokens(it.syntax(), [T![default]]);
+                assert_eq!(found, [it.default_token().is_some()], "{it}");
+                seen_default[1] |= found[0];
             } else if let Some(it) = ast::TupleField::cast(node) {
                 let [found] = child_tokens(it.syntax(), [T![unsafe]]);
                 assert!(!found, "{it}");
             }
         }
+        assert_eq!(seen_default, [true; 2]);
         // `gen` is left out: whether `async gen fn` parses is the parser's.
         assert_eq!([seen_fn[0], seen_fn[1], seen_fn[3], seen_fn[4], seen_fn[5]], [true; 5]);
         assert_eq!(seen_static, [true; 3]);
@@ -2373,6 +2450,54 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         assert!(lowerings.iter().any(|it| it.contains("EnumVariants::of")), "{log:#?}");
     }
 
+    /// `HAS_UNSAFE_FIELDS` is set for a struct, union or enum with a field written `unsafe`
+    /// that cfg keeps (rustc's `all_fields().any(|f| f.safety.is_unsafe())`), and an enum's
+    /// follows an edit of its variants.
+    #[test]
+    fn unsafe_fields_set_the_adt_flag() {
+        const UNSAFE: &str = r#"
+pub struct S { unsafe a: u32, b: u32 }
+pub struct T { a: u32, #[cfg(any())] unsafe b: u32 }
+pub union U { unsafe a: u32 }
+pub enum E { A, B { unsafe b: u8 } }
+pub enum F { A(u8), #[cfg(any())] B { unsafe b: u8 } }
+"#;
+        fn flags(db: &TestDB) -> Vec<(String, bool)> {
+            let mut found = Vec::new();
+            for (_, module) in crate_def_map(db, db.fetch_test_crate()).modules(db) {
+                for decl in module.scope(db).declarations() {
+                    let ModuleDefId::AdtId(adt) = decl else { continue };
+                    let (name, has) = match adt {
+                        AdtId::StructId(it) => {
+                            let sig = StructSignature::of(db, it);
+                            (&sig.name, sig.flags.contains(StructFlags::HAS_UNSAFE_FIELDS))
+                        }
+                        AdtId::UnionId(it) => {
+                            let sig = UnionSignature::of(db, it);
+                            (&sig.name, sig.flags.contains(StructFlags::HAS_UNSAFE_FIELDS))
+                        }
+                        AdtId::EnumId(it) => {
+                            let sig = EnumSignature::of(db, it);
+                            (&sig.name, sig.flags.contains(EnumFlags::HAS_UNSAFE_FIELDS))
+                        }
+                    };
+                    found.push((name.as_str().to_owned(), has));
+                }
+            }
+            found.sort();
+            found
+        }
+        let (mut db, file) = TestDB::with_single_file(UNSAFE);
+        let want = |f| {
+            [("E", true), ("F", f), ("S", true), ("T", false), ("U", true)]
+                .map(|(name, has)| (name.to_owned(), has))
+                .to_vec()
+        };
+        assert_eq!(flags(&db), want(false));
+        db.set_file_text(file.file_id(&db), &edited(UNSAFE, &[("A(u8)", "A(u8), C { unsafe c: u8 }")]));
+        assert_eq!(flags(&db), want(true));
+    }
+
     /// The bodies an outline of `CODE` leaves out: those of every fn, const and static that is
     /// its own anchor, which are what `BODY_EDITS` edits, and not `h`'s, whose impl has an
     /// attribute.
@@ -2424,7 +2549,7 @@ pub const K: u8 = ;
 "#;
         let (db, file) = TestDB::with_single_file(INNER);
         assert_eq!(file_outline(&db, file).root().to_string(), LEFT);
-        assert_eq!(outline_root(&db, file).syntax().to_string(), LEFT);
+        assert_eq!(syntax::view::AstNode::syntax(&outline_root(&db, file)).to_string(), LEFT);
     }
 
     #[test]

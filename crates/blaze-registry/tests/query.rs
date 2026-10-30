@@ -3,11 +3,10 @@
 //! versions read with no update.
 
 use std::{
-    future::Future,
     path::PathBuf,
     pin::pin,
     sync::{Arc, Mutex},
-    task::{Context as TaskContext, Poll, Wake, Waker},
+    task::Poll,
 };
 
 use blaze_registry::{
@@ -16,6 +15,7 @@ use blaze_registry::{
 };
 use blaze_resolve::{
     DepKind, Dependency, IndexSummary, MemRegistry, PackageId, QueryKind, Registry, SourceId,
+    block_on,
 };
 use rustc_hash::FxHashMap as HashMap;
 
@@ -48,26 +48,6 @@ impl Http for Server {
             return Ok(Response { status: 304, ..Response::default() });
         }
         Ok(Response { status: 200, headers: vec![("etag".to_owned(), etag)], body })
-    }
-}
-
-struct Unpark(std::thread::Thread);
-
-impl Wake for Unpark {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-}
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut cx = TaskContext::from_waker(&waker);
-    loop {
-        if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
-            return v;
-        }
-        std::thread::park();
     }
 }
 

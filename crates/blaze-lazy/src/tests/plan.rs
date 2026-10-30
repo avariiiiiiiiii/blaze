@@ -1,7 +1,7 @@
 //! What a lazy build compiles ahead (the entry, what initializer and finalizer sections
 //! name), the lazy functions' ids, history's reached set and a function's likely callees.
 
-use blaze_codegen::{Data, Init, InstanceKey, Reloc, RelocKind, Static, Target};
+use blaze_codegen::{Data, Init, InstanceKey, RelocKind, Relocation, Static, Target};
 use blaze_items::{CodeHash, ItemKey};
 
 use super::{compiled, function, id, key};
@@ -12,7 +12,7 @@ use crate::{
 };
 
 fn starts(section: &str, names: &[u32], in_data: &[u32]) -> Static {
-    let reloc = |n: &u32| Reloc { at: 8 * *n, kind: RelocKind::Abs64, target: Target::Function(key(*n)), addend: 0 };
+    let reloc = |n: &u32| Relocation { at: 8 * *n, kind: RelocKind::Abs64, target: Target::Function(key(*n)), addend: 0 };
     Static {
         item: ItemKey(id("blaze-lazy test static", names.first().copied().unwrap_or(0))),
         instance: id("blaze-lazy test static instance", 0),
@@ -27,6 +27,7 @@ fn starts(section: &str, names: &[u32], in_data: &[u32]) -> Static {
         mutable: false,
         thread_local: false,
         section: Some(section.to_owned()),
+        imports: Vec::new(),
     }
 }
 
@@ -104,17 +105,41 @@ fn history_names_lazy_functions_by_code_hash() {
 }
 
 #[test]
+fn history_of_a_large_plan_is_every_instance_of_each_body_in_id_order() {
+    let mut rng = super::Rng::new(7);
+    let walk: Vec<Function> = (0..6000)
+        .map(|n| Function {
+            key: key(n),
+            code: CodeHash(id("blaze-lazy test code", rng.below(700) as u32)),
+            item: ItemKey(id("blaze-lazy test item", n)),
+        })
+        .collect();
+    let plan = Plan::new(&walk, &[], &[]).unwrap();
+    for body in [0u32, 1, 350, 699, 700] {
+        let code = CodeHash(id("blaze-lazy test code", body));
+        let mut out = Vec::new();
+        plan.reached(&[code], &mut out);
+        let expected: Vec<LazyId> =
+            walk.iter().filter(|it| it.code == code).map(|it| plan.id(&it.key).unwrap()).collect();
+        assert_eq!(out, expected, "body {body}");
+    }
+}
+
+#[test]
 fn callees_are_calls_and_tail_calls_not_addresses_taken() {
     let plan = Plan::new(&functions(6), &[key(0)], &[]).unwrap();
     let mut caller = compiled(0, &[1, 2, 1], &[3]);
     let jump = caller.code.len() as u32;
     caller.code.extend_from_slice(&[0xe9, 0, 0, 0, 0]);
-    caller.relocs.push(Reloc { at: jump + 1, kind: RelocKind::PcRel32, target: Target::Direct(key(4)), addend: -4 });
-    caller.relocs.push(Reloc { at: 0, kind: RelocKind::Abs64, target: Target::Function(key(5)), addend: 0 });
-    let mut out = Vec::new();
-    plan.callees(&caller, &mut out);
+    caller.relocs.push(Relocation { at: jump + 1, kind: RelocKind::PcRel32, target: Target::Direct(key(4)), addend: -4 });
+    caller.relocs.push(Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Function(key(5)), addend: 0 });
+    let (mut out, mut seen) = (Vec::new(), plan.scratch());
+    plan.callees(&caller, &mut seen, &mut out);
     let ids = |ns: &[u32]| ns.iter().map(|n| plan.id(&key(*n)).unwrap()).collect::<Vec<_>>();
     assert_eq!(out, ids(&[1, 2, 4]));
+    assert!(seen.iter().all(|word| *word == 0), "the scratch is left clear");
+    plan.callees(&caller, &mut seen, &mut out);
+    assert_eq!(out, ids(&[1, 2, 4, 1, 2, 4]), "each call appends each callee once");
 }
 
 #[test]

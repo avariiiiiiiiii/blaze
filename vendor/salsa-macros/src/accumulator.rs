@@ -49,6 +49,7 @@ impl AllowedOptions for Accumulator {
     const HEAP_SIZE: bool = false;
     const SELF_TY: bool = false;
     const MEM_TAG: bool = false;
+    const IMAGE: bool = false;
     // TODO: Support serializing accumulators.
     const PERSIST: AllowedPersistOptions = AllowedPersistOptions::Invalid;
 }

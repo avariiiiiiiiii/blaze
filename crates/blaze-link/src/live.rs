@@ -80,7 +80,7 @@ impl Stage<'_> {
             // alloc: a restart's reason, which the message carries: once per message
             return restart(format!("it imports `{}`, which the loader binds only at start", new.name));
         }
-        if self.old.tls != self.new.tls {
+        if self.old.tls != self.new.tls || self.old.tls_at != self.new.tls_at {
             // alloc: a restart's reason, which the message carries: once per message
             return restart("its thread-local storage changed".to_owned());
         }

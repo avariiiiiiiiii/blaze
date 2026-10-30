@@ -10,7 +10,7 @@ use base_db::{Crate, CrateType, SourceRoot, SourceRootId, TargetKind, VfsPath};
 use blaze_ids::ContentId;
 use blaze_query::MemTree;
 use blaze_units::{
-    query::{BuildConfig, Command, Invocation, Mount, Origin, PackagePlan, UnitPlan, Units},
+    query::{BuildConfig, Command, Invocation, Mount, Origin, PackagePlan, TestSandbox, UnitPlan, Units},
     schema::{DebugInfo, Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
 };
 use cfg::CfgAtom;
@@ -144,6 +144,9 @@ fn plan(cfgs: &[&str], env: &[(&str, &str)], out_dir: Option<&str>) -> UnitPlan 
         outputs: Vec::new(),
         out_dir: out_dir.map(str::to_owned),
         links: None,
+        unsandboxed: false,
+        runner: Vec::new(),
+        harness: true,
     }
 }
 
@@ -155,6 +158,9 @@ fn package(id: &str, name: &str, manifest_path: &str, source: Option<&str>, is_m
         manifest_path: manifest_path.to_owned(),
         source: source.map(str::to_owned),
         is_member,
+        default_run: None,
+        checksum: None,
+        tests: TestSandbox::default(),
     }
 }
 
@@ -209,6 +215,8 @@ fn units() -> Units {
         target_dir: "/w/target".to_owned(),
         build_dir: "/w/target".to_owned(),
         finished: "`dev` profile [unoptimized + debuginfo]".to_owned(),
+        link_dirs: Vec::new(),
+        sandboxed_tests: false,
     }
 }
 

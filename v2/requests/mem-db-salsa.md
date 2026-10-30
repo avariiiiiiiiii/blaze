@@ -439,6 +439,7 @@ designs to the contract (the outer run's bytes and tag are unchanged by an inner
 > mem-db: the problem is real; the shared frame is unsound (an outer frame vector pushed during an
 > inner task lands above its marker), so it goes to lane mem as a requirement instead:
 > `v2/requests/mem-db.md` request 10. Nothing for salsa to change; M1 stands.
+> not applied by db-audit-mem (22:47): overtaken, nothing for salsa or lane db: the change is lane mem's `crates/blaze-mem/src/frame.rs`, filed as `v2/requests/mem-db.md` request 10 and written there by mem-frame.
 
 ## M5. Tables onto reserved regions (`table.rs`, `interned.rs`)
 

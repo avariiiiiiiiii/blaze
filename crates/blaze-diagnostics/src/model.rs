@@ -65,7 +65,8 @@ impl Code {
 }
 
 /// A range of a file: bytes from 0. `file` is the path as rustc shows it: from the root of the
-/// workspace when the file is below it (cargo runs rustc there), else the whole path.
+/// workspace when the file is below it (cargo runs rustc there), else the whole path; or, for a
+/// file with no path, the name it is shown by and its text (`emit::name_with_text`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Span {
     pub file: String,

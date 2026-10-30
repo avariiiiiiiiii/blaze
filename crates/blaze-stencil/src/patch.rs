@@ -84,7 +84,8 @@ enum Kind {
     /// every use takes as an immediate or the glue materializes.
     #[default]
     Skip,
-    /// An `icmp` its one user (the next instruction) compares in its own stencil.
+    /// What its one user computes in its own stencil: an `icmp` the next instruction
+    /// compares, or a step of a confined access's address.
     Fused,
     /// The architecture's glue.
     Glue,
@@ -582,6 +583,7 @@ pub(crate) fn compile_in<A: Glue, R>(
             lines: &side.lines,
             traps: &side.trap_sites,
             slots: SlotsRef { base, offsets: &side.offsets },
+            frame: A::frame_size(&frame),
         };
         Ok(sink(&code, plan))
     })

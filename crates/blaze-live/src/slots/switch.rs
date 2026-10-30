@@ -18,8 +18,15 @@
 //!   not.
 //! - Nothing goes over an unwind entry once registered, nor over the zero length ending a
 //!   registered run: the unwinder reads them from then on.
-//! - Data goes outside the patch code region, the table cell and the loader's table; the
+//! - Data goes outside the patch code region, the table's header (its cell, the current
+//!   table's word, the execution log's table and map: [`exec`]) and the loader's table; the
 //!   platform checks that it is in the image.
+//!
+//! The switch stores a table first to the header's current word, which the execution log's
+//! stubs read, then to the cell, unless the image was linked with the log: there the cell
+//! stays on the log table, whose words are either a slot's log stub or the target a first
+//! call copied (`super::exec`). Every table the switch makes is one [`Tables`] names, so
+//! [`super::exec::publish`] writes a slot into all of them and the loader's.
 //! - Data is written in place with atomic stores ([`Writes::store`]): one relaxed store per
 //!   naturally aligned piece of at most 8 bytes, each holding its final, rebased value, so no
 //!   write races another thread's load of that piece. A thread reading a static wider than
@@ -32,10 +39,15 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::{Outcome, column::Column, hook};
+use super::{
+    Outcome,
+    column::Column,
+    exec::{Header, Tables},
+    hook,
+};
 use crate::patch::{
     ARCH_AARCH64, ARCH_X86_64, Answer, DESCRIPTOR, DESCRIPTOR_VERSION, Descriptor, MessageView,
-    PatchView,
+    PatchView, exec,
 };
 
 /// How many generations are kept to roll back to, as Relax keeps.
@@ -212,15 +224,15 @@ impl<'a> Writes<'a> {
 
 /// What a platform does to the memory of a running image. Every address is in memory
 /// (slid). The switch has checked that code is in the patch code region, that data is
-/// outside it, the cell and the loader's table, and that neither is over lasting memory
-/// (the module's rules). Whether data is in the image is the platform's to check. The
-/// platform is also where the switch reads the image: the cell and the loader's table.
+/// outside it, the table's header and the loader's table, and that neither is over lasting
+/// memory (the module's rules). Whether data is in the image is the platform's to check. The
+/// platform is also where the switch reads the image: the header and the loader's table.
 pub(crate) trait Memory {
     const DWARF: Dwarf;
     /// Whether the unwinder takes Windows `RUNTIME_FUNCTION`s.
     const SEH: bool;
-    /// What the table cell at `cell` (8-aligned, `Layout::new` checked) holds, by one
-    /// acquire load.
+    /// What the table's word at `cell` (8-aligned, in the header `Layout::new` names) holds,
+    /// by one acquire load.
     fn cell(&self, cell: u64) -> u64;
     /// Checks that `range` is in the image, as the platform checks data.
     fn in_image(&self, range: &Range<u64>) -> Result<(), String>;
@@ -228,9 +240,9 @@ pub(crate) trait Memory {
     /// readable: read-only data the linker wrote, such as the directory's name.
     fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String>;
     /// The loader's table, `slots` addresses at `at`, which [`Switch::new`] checked is
-    /// 8-aligned and in the image. Nothing writes it: the switch stores only to the cell and
-    /// its own tables, and refuses data over it.
-    fn loaders(&self, at: u64, slots: u64) -> &[u64];
+    /// 8-aligned and in the image. Only [`super::exec::publish`] writes it, atomically: the
+    /// switch stores only to the header and its own tables, and refuses data over it.
+    fn loaders(&self, at: u64, slots: u64) -> &[AtomicU64];
     /// Writes into the patch code region and makes it runnable again.
     fn code(&mut self, writes: &Writes<'_>) -> Result<(), String>;
     /// Writes data anywhere in the image with [`Writes::store`], making read-only pages
@@ -240,8 +252,8 @@ pub(crate) trait Memory {
     fn frames(&mut self, starts: &[u64]) -> Result<(), String>;
     /// Adds `RUNTIME_FUNCTION`s (begin, end, unwind information).
     fn functions(&mut self, functions: &[(u64, u64, u64)]) -> Result<(), String>;
-    /// Stores `table` in the table cell `cell` with one release store. An error means the
-    /// cell may or may not hold `table`.
+    /// Stores `table` in the header's word `cell` (the cell or the current table's word)
+    /// with one release store. An error means the word may or may not hold `table`.
     fn publish(&mut self, cell: u64, table: u64) -> Result<(), String>;
 }
 
@@ -520,6 +532,10 @@ pub(crate) struct Switch<M: Memory> {
     kept: Vec<u32>,
     /// The loader's table, which holds generation 0.
     image: u64,
+    /// The table's header, in memory.
+    header: Header,
+    /// Where [`super::exec::publish`] finds the pool's tables.
+    tables: &'static Tables,
     pool: Vec<Pooled>,
     /// The table the cell points at: the image's, or one of the pool.
     on: Option<usize>,
@@ -534,28 +550,45 @@ pub(crate) struct Switch<M: Memory> {
     stored: usize,
 }
 
+impl<M: Memory> Drop for Switch<M> {
+    /// Leaks the pool's tables: the cell or a thread may point at one still, and
+    /// [`super::exec::publish`] writes them for the life of the program.
+    fn drop(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.pool));
+    }
+}
+
 impl<M: Memory> Switch<M> {
+    /// The process's one switch, its tables named in [`super::exec::TABLES`].
     pub(crate) fn new(memory: M, layout: Layout) -> Result<Switch<M>, String> {
-        Switch::with_limits(memory, layout, &Limits::LONG)
+        Switch::with_limits(memory, layout, &Limits::LONG, &super::exec::TABLES)
     }
 
-    /// A switch whose log and lasting ranges hold at most `limits`.
+    /// A switch whose log and lasting ranges hold at most `limits`, its tables named in
+    /// `tables`.
     pub(crate) fn with_limits(
         memory: M,
         layout: Layout,
         limits: &Limits,
+        tables: &'static Tables,
     ) -> Result<Switch<M>, String> {
-        let cell = layout.cell();
-        memory.in_image(&(cell..cell + 8))?;
-        let table = memory.cell(cell);
-        if table == 0 || !table.is_multiple_of(8) {
+        let at = layout.cell();
+        let in_image = |range: &Range<u64>| memory.in_image(range);
+        // SAFETY: `at` is 8-aligned (`Layout::new` checked) and the platform's `in_image`
+        // refuses what is not the image, whose header and loader's table are the linker's
+        // `Class::Table`, writable data for the life of the program.
+        let header = unsafe { Header::checked(at, layout.slots, in_image) }?;
+        let table = header.loader();
+        let current = memory.cell(at + exec::CURRENT);
+        let cell = memory.cell(at + exec::CELL);
+        let expected = if header.logged() { at + exec::log_word(0) } else { table };
+        if current != table || cell != expected {
             // alloc: error path, at start
-            return Err(format!("the jump table cell at {cell:#x} holds {table:#x}"));
+            return Err(format!(
+                "the jump table at {at:#x} starts on {cell:#x} with {current:#x} current, where \
+                 its loader's table is at {table:#x}"
+            ));
         }
-        let end = layout.slots.checked_mul(8).and_then(|len| table.checked_add(len));
-        // alloc: error path, at start
-        let end = end.ok_or_else(|| format!("a jump table at {table:#x} past the end of memory"))?;
-        memory.in_image(&(table..end))?;
         let log = Log::new(layout.generation, limits)?;
         let lasting = Lasting::new(limits.lasting)?;
         let mut kept = Vec::with_capacity(KEPT + 1);
@@ -567,6 +600,8 @@ impl<M: Memory> Switch<M> {
             log,
             kept,
             image: table,
+            header,
+            tables,
             pool: Vec::with_capacity(POOL),
             on: None,
             next: None,
@@ -642,6 +677,7 @@ impl<M: Memory> Switch<M> {
         if *id == self.layout.id {
             Ok(())
         } else {
+            // alloc: error path
             Err(format!("for image {}, where this program runs {}", hex(id), hex(&self.layout.id)))
         }
     }
@@ -669,18 +705,21 @@ impl<M: Memory> Switch<M> {
         self.ours(&patch.id)?;
         let current = self.current();
         if patch.base != current {
+            // alloc: error path
             return Err(format!(
                 "a patch on generation {}, where this program is at {current}",
                 patch.base
             ));
         }
         if patch.generation <= patch.base {
+            // alloc: error path
             return Err(format!(
                 "generation {} on base {}: a generation counts up from its base",
                 patch.generation, patch.base
             ));
         }
         if self.find(patch.generation).is_some() {
+            // alloc: error path
             return Err(format!("generation {} was applied already", patch.generation));
         }
         let layout = &self.layout;
@@ -690,6 +729,7 @@ impl<M: Memory> Switch<M> {
         for (at, bytes) in patch.code {
             let range = span(at, bytes.len())?;
             if !inside(&range, &layout.code) {
+                // alloc: error path
                 return Err(format!(
                     "code at {:#x}..{:#x}, outside the patch code region {:#x}..{:#x}",
                     range.start, range.end, layout.code.start, layout.code.end
@@ -703,23 +743,27 @@ impl<M: Memory> Switch<M> {
                 s.code.push(placed);
             }
         }
-        let cell = layout.table..layout.table.saturating_add(8);
+        let header = exec::len(layout.slots, self.header.logged());
+        let cell = layout.table..layout.table.saturating_add(header);
         let loaders = self.image..self.image.saturating_add(layout.slots.saturating_mul(8));
         s.data.clear();
         for (at, bytes) in patch.data {
             let range = span(at, bytes.len())?;
             if overlap(&range, &layout.code) {
+                // alloc: error path
                 return Err(format!(
                     "data at {:#x}..{:#x}, in the patch code region",
                     range.start, range.end
                 ));
             }
             if overlap(&range, &cell) {
+                // alloc: error path
                 return Err(format!("data over the jump table's cell at {:#x}", cell.start));
             }
             if !bytes.is_empty() {
                 let placed = place(message, at, bytes, slide)?;
                 if overlap(&placed.range(), &loaders) {
+                    // alloc: error path
                     return Err(format!(
                         "data over the loader's jump table at {:#x}",
                         loaders.start.wrapping_sub(slide)
@@ -736,28 +780,33 @@ impl<M: Memory> Switch<M> {
         for spans in [&mut s.code, &mut s.data] {
             spans.sort_unstable_by_key(|it| it.at);
             if let Some(pair) = spans.windows(2).find(|it| it[1].at < it[0].end()) {
+                // alloc: error path
                 return Err(format!("two writes at {:#x}", pair[1].at.wrapping_sub(slide)));
             }
         }
         s.slots.clear();
         for (slot, _) in patch.cells() {
             if u64::from(slot) >= layout.slots {
+                // alloc: error path
                 return Err(format!("slot {slot}, where the table has {}", layout.slots));
             }
             s.slots.push(slot);
         }
         s.slots.sort_unstable();
         if let Some(pair) = s.slots.windows(2).find(|it| it[0] == it[1]) {
+            // alloc: error path
             return Err(format!("slot {} set twice", pair[0]));
         }
         s.rebase.clear();
         s.rebase.extend(patch.rebase().map(|it| it.wrapping_add(slide)));
         s.rebase.sort_unstable();
         if let Some(pair) = s.rebase.windows(2).find(|it| it[0] == it[1]) {
+            // alloc: error path
             return Err(format!("the address at {:#x} rebased twice", pair[0].wrapping_sub(slide)));
         }
         for &at in &s.rebase {
             if find(message, &s.code, at, 8).is_none() && find(message, &s.data, at, 8).is_none() {
+                // alloc: error path
                 return Err(format!(
                     "an address to rebase at {:#x}, in none of the patch's writes",
                     at.wrapping_sub(slide)
@@ -767,6 +816,7 @@ impl<M: Memory> Switch<M> {
         let (fdes, starts, ends) = (&mut s.fdes, &mut s.starts, &mut s.ends);
         frames::<M>(patch, message, &s.code, &s.data, slide, fdes, starts, ends)?;
         if patch.windows().len() != 0 && !M::SEH {
+            // alloc: error path
             return Err("RUNTIME_FUNCTIONs, which this platform's unwinder doesn't take".to_owned());
         }
         s.functions.clear();
@@ -774,6 +824,7 @@ impl<M: Memory> Switch<M> {
         for (begin, end, unwind) in patch.windows() {
             let (slid_begin, slid_unwind) = (begin.wrapping_add(slide), unwind.wrapping_add(slide));
             if begin >= end || find(message, &s.code, slid_begin, end - begin).is_none() {
+                // alloc: error path
                 return Err(format!("a RUNTIME_FUNCTION of {begin:#x}..{end:#x}, not in the code"));
             }
             let written = |len: u64| {
@@ -781,10 +832,12 @@ impl<M: Memory> Switch<M> {
                     .or_else(|| find(message, &s.data, slid_unwind, len))
             };
             let Some(header) = written(4) else {
+                // alloc: error path
                 return Err(format!("unwind information at {unwind:#x}, in none of the writes"));
             };
             let len = unwind_len(header);
             if written(len).is_none() {
+                // alloc: error path
                 return Err(format!(
                     "unwind information at {unwind:#x} runs past the patch's writes ({len} bytes)"
                 ));
@@ -856,15 +909,25 @@ impl<M: Memory> Switch<M> {
     /// Readies a table for the next patch, after the switch: a new one, a copy of the
     /// cell's, while the pool isn't full, else the one the cell left longest ago brought to
     /// the current generation. The next patch then stores only its own cells into it.
+    ///
+    /// A new table is named in [`Tables`] while still zero, then each slot copied by a
+    /// compare-and-swap from zero: a slot [`super::exec::publish`] wrote meanwhile keeps
+    /// what it wrote, and one it wrote before is read here (both sides are sequentially
+    /// consistent).
     fn ready(&mut self) {
         if self.pool.len() < POOL {
-            let table: Box<[AtomicU64]> = match self.on {
-                None => self.image().iter().map(|it| AtomicU64::new(*it)).collect(),
-                Some(on) => {
-                    let table = &self.pool[on].table;
-                    table.iter().map(|it| AtomicU64::new(it.load(Ordering::Relaxed))).collect()
-                }
+            let slots = self.layout.slots as usize;
+            // alloc: one table per pool entry, at most `POOL`, kept for the program's life
+            let table: Box<[AtomicU64]> = (0..slots).map(|_| AtomicU64::new(0)).collect();
+            self.tables.register(self.pool.len(), table.as_ptr() as u64);
+            let from = match self.on {
+                None => self.image(),
+                Some(on) => &self.pool[on].table[..],
             };
+            for (to, from) in table.iter().zip(from) {
+                let value = from.load(Ordering::SeqCst);
+                _ = to.compare_exchange(0, value, Ordering::Relaxed, Ordering::Relaxed);
+            }
             self.pool.push(Pooled { table, holds: self.current, at: self.published });
             self.next = Some(self.pool.len() - 1);
             return;
@@ -882,14 +945,14 @@ impl<M: Memory> Switch<M> {
     }
 
     /// The loader's table, which the cell pointed at when the program started.
-    fn image(&self) -> &[u64] {
+    fn image(&self) -> &[AtomicU64] {
         self.memory.loaders(self.image, self.layout.slots)
     }
 
-    /// The target of `slot` in the table the cell points at.
+    /// The target of `slot` in the current table.
     fn value(&self, slot: u32) -> u64 {
         match self.on {
-            None => self.image()[slot as usize],
+            None => self.image()[slot as usize].load(Ordering::Relaxed),
             Some(at) => self.pool[at].table[slot as usize].load(Ordering::Relaxed),
         }
     }
@@ -965,13 +1028,20 @@ impl<M: Memory> Switch<M> {
         stored
     }
 
-    /// Points the cell at the image's table (`None`) or the pool's table `on`.
+    /// Makes the image's table (`None`) or the pool's table `on` current: the header's current
+    /// word, then the cell, which stays on the execution log's table in an image linked with
+    /// one.
     fn publish(&mut self, on: Option<usize>) -> Result<(), String> {
         let table = match on {
             None => self.image,
             Some(at) => self.pool[at].table.as_ptr() as u64,
         };
-        let stored = self.memory.publish(self.layout.cell(), table);
+        let at = self.layout.cell();
+        let stored = self.memory.publish(at + exec::CURRENT, table);
+        let stored = match stored {
+            Ok(()) if !self.header.logged() => self.memory.publish(at + exec::CELL, table),
+            stored => stored,
+        };
         self.published += 1;
         if let Some(at) = on {
             // After a failed store the cell may point at it: as the one used last, it is the
@@ -987,7 +1057,9 @@ impl<M: Memory> Switch<M> {
     pub(crate) fn roll_back(&mut self, to: u64) -> Result<(), String> {
         let Some(target) = self.find(to) else {
             let kept: Vec<String> =
+                // alloc: error path
                 self.kept.iter().map(|it| self.log.number[*it as usize].to_string()).collect();
+            // alloc: error path
             return Err(format!("generation {to} is not kept; kept are {}", kept.join(", ")));
         };
         if target == self.current {
@@ -1037,11 +1109,13 @@ impl<M: Memory> Switch<M> {
             std::panic::resume_unwind(payload);
         };
         if let Err(why) = self.roll_back(to) {
+            // alloc: error path, once per failed rollback after a panic
             let why = format!("{}; rolling back to generation {to}: {why}", panic.why);
             answer(&Answer::Declined { generation, why });
             std::panic::resume_unwind(payload);
         }
         drop(payload);
+        // clone: once per rollback after a panic, the reason for the linker and the program
         answer(&Answer::RolledBack { generation, to, why: panic.why.clone() });
         Err(Outcome::RolledBack { generation, to, why: panic.why })
     }

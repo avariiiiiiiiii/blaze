@@ -375,10 +375,18 @@ pub(super) fn load_cell(cell: u64) -> u64 {
 }
 
 /// The loader's table at `at`, `slots` addresses.
-pub(super) fn loaders(at: u64, slots: u64) -> &'static [u64] {
+pub(super) fn loaders(at: u64, slots: u64) -> &'static [std::sync::atomic::AtomicU64] {
     // SAFETY: `Switch::new` checked `at..at + slots * 8` is in the image and `at` 8-aligned
-    // before the first call; nothing writes it (the switch refuses data over it).
+    // before the first call; it is the image's writable data (the linker's `Class::Table`),
+    // which only `publish`'s atomic stores write (the switch refuses data over it).
     unsafe { image::words(at, slots as usize) }
+}
+
+/// Checks that `range` is in the image that has `near` (the descriptor's address).
+pub(super) fn in_image_of(range: &Range<u64>, near: u64) -> Result<(), String> {
+    // alloc: error path
+    let base = image_base(near).ok_or_else(|| format!("no image has {near:#x}"))?;
+    in_image(range, base)
 }
 
 /// What a reservation's length and commits are multiples of: the largest page of the

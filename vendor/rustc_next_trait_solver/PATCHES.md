@@ -100,6 +100,14 @@ Why: as `rustc_type_ir`'s `0007-fast-path-depth`: an answer that stands for a se
 evaluation fits in, and costs, the depth it would be evaluated with, asked where the goal is
 evaluated, not added, since a sibling that overflows in between divides that depth.
 
+### 0006-def-id-is-local
+
+What: coherence's `trait_ref_is_local_or_fundamental` and `OrphanChecker::def_id_is_local` pass
+the interner to `DefId::is_local` (`rustc_type_ir` patch `0008-def-id-is-local`): `tcx`, and
+`self.infcx.cx()`.
+
+Why: see that patch.
+
 ## Dropped since the previous base (ra-ap-rustc_next_trait_solver 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#161380 (a constant sends a goal back to the caller's typing

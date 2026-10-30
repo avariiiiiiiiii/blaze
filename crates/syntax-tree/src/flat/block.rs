@@ -86,6 +86,26 @@ impl Block {
         Col { ptr, len: from.len(), _of: PhantomData }
     }
 
+    /// A column of the slices of `parts` one after another, `len` values in all.
+    pub(super) fn put_joined<'a, T: Copy + 'a>(
+        &mut self,
+        len: usize,
+        parts: impl IntoIterator<Item = &'a [T]>,
+    ) -> Col<T> {
+        let ptr = self.place::<T>(len);
+        let mut at = 0;
+        for part in parts {
+            assert!(part.len() <= len - at, "parts of more than the {len} values placed");
+            // SAFETY: `place` gave room for `len` `T`s, aligned, past every column placed
+            // before and in another allocation from any slice outside the block; slots
+            // `at..at + part.len()` are in it (the assert above) and no earlier part wrote them.
+            unsafe { ptr::copy_nonoverlapping(part.as_ptr(), ptr.as_ptr().add(at), part.len()) };
+            at += part.len();
+        }
+        assert_eq!(at, len, "parts of fewer than the values placed");
+        Col { ptr, len, _of: PhantomData }
+    }
+
     /// A column of `len` values, the `n`th `make(n)`, made in order of `n`.
     pub(super) fn fill<T>(&mut self, len: usize, mut make: impl FnMut(usize) -> T) -> Col<T> {
         let ptr = self.place::<T>(len);
@@ -142,9 +162,10 @@ impl<T> Deref for Col<T> {
 
     #[inline]
     fn deref(&self) -> &[T] {
-        // SAFETY: the `len` `T`s at `ptr` were written by `put` or `fill` (none for `empty`),
-        // aligned, and stay allocated while this column lives (the module's invariant). They
-        // are written only through `&mut self`, and no other column overlaps them (`place`).
+        // SAFETY: the `len` `T`s at `ptr` were written by `put`, `put_joined` or `fill` (none
+        // for `empty`), aligned, and stay allocated while this column lives (the module's
+        // invariant). They are written only through `&mut self`, and no other column overlaps
+        // them (`place`).
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -233,6 +254,34 @@ mod tests {
                 assert_eq!((&*b, &*c), (&wide[..], &pairs[..]), "a write stays in its column");
             }
         }
+    }
+
+    /// A column of joined slices is their concatenation (the safe reference), placed between
+    /// two other columns it does not write into.
+    #[test]
+    fn a_joined_column_is_its_parts_one_after_another() {
+        for seed in 0..500 {
+            let mut rng = SplitMix64::new(seed ^ 0x51ce);
+            let parts: Vec<Vec<u32>> = (0..rng.index(6))
+                .map(|n| (0..rng.index(40)).map(|it| (n as u32) << 16 | it as u32).collect())
+                .collect();
+            let joined = parts.concat();
+            let around = [7u64, 8, 9];
+            let size = room::<u64>(room::<u32>(room::<u64>(0, 3), joined.len()), 3);
+            let mut block = Block::new(size);
+            let before = block.put(&around);
+            let col = block.put_joined(joined.len(), parts.iter().map(|it| &it[..]));
+            let after = block.put(&around);
+            assert_eq!(block.filled, block.size(), "seed {seed}");
+            assert_eq!((&*before, &*col, &*after), (&around[..], &joined[..], &around[..]));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "parts of more than")]
+    fn a_joined_column_takes_no_more_than_its_room() {
+        let mut block = Block::new(room::<u32>(0, 3));
+        let _ = block.put_joined(3, [&[1u32, 2][..], &[3, 4][..]]);
     }
 
     #[test]

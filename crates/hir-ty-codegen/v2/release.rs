@@ -23,8 +23,8 @@ use blaze_codegen::{
 };
 #[cfg(feature = "llvm")]
 use blaze_codegen::{
-    Backend, InstanceKey, Target,
-    settings::DebugInfo,
+    Backend, InstanceKey, ProfileRecord, Profiled, Target,
+    settings::{DebugInfo, Pgo},
     summary::{self, Arg, Call},
 };
 #[cfg(feature = "llvm")]
@@ -40,8 +40,24 @@ use crate::{
     ConstBlob,
     backend::{Optimization, Passes, Selection},
     fragment::{DataRequest, FuncTarget, Hint, Requests, Wants},
-    llvm::release::{self as llvm, Given, Prelinked},
+    llvm::{
+        pgo,
+        release::{self as llvm, Given, Prelinked},
+    },
 };
+
+/// Gives the process the profile `bytes`, read from the store under `id`, for the release
+/// units whose `Pgo::Use` names it, while the profile is held ([`pgo::give`]).
+#[cfg(feature = "llvm")]
+pub fn give_profile(id: blaze_ids::ContentId, bytes: &[u8]) -> Result<pgo::Profile, String> {
+    pgo::give(id, bytes)
+}
+
+/// The content ID a profile's bytes are named by in `Pgo::Use` and the store.
+#[cfg(feature = "llvm")]
+pub fn profile_id(bytes: &[u8]) -> blaze_ids::ContentId {
+    pgo::profile_id(bytes)
+}
 
 /// What [`summarize`] leaves in an LLVM unit's prepared function ([`Function::release`]) for
 /// its own [`emit`]: its pre-linked module, so that LLVM's pre-link pipeline runs once per
@@ -50,6 +66,9 @@ use crate::{
 pub(crate) struct Kept {
     #[cfg(feature = "llvm")]
     own: Option<Arc<[u8]>>,
+    /// What its pre-link said: its profile has a record of it with another hash.
+    #[cfg(feature = "llvm")]
+    mismatched: bool,
 }
 
 /// A release function as its importers link it, held for one build.
@@ -101,8 +120,8 @@ pub(crate) fn summarize(
             return Ok((summary, export));
         }
     };
-    let Prelinked { own, export, size, facts } = prelinked(unit, spec, function, refs, optimization)?;
-    function.release.own = Some(own);
+    let Prelinked { own, export, size, facts, mismatched } = prelinked(unit, spec, function, refs, optimization)?;
+    function.release = Kept { own: Some(own), mismatched };
     let requests = &pending.wants.requests;
     let mut calls: Vec<Call> = Vec::with_capacity(facts.calls.len());
     for called in facts.calls {
@@ -131,7 +150,8 @@ pub(crate) fn summarize(
         _ => Vec::new(),
     });
     let addressed = keys(unit, places, refs, facts.addressed.iter().copied().chain(in_data))?;
-    let importable = requests.ordered();
+    // An instrumented body counts into counters of its own, which an importer's copy has not.
+    let importable = requests.ordered() && spec.pgo != Pgo::Generate;
     let hint = match function.hint {
         _ if !importable => summary::Hint::Never,
         Hint::None => summary::Hint::None,
@@ -210,10 +230,14 @@ pub(crate) fn emit(
         return emitted(unit, places, spans, variables, scopes, code, &requests, refs);
     }
     // Nothing summarized a unit compiled without imports, or one whose summary the store had.
-    let own = match function.release.own.take() {
-        Some(own) => own,
-        None => prelinked(unit, spec, &function, refs, optimization)?.own,
+    let (own, mismatched) = match function.release.own.take() {
+        Some(own) => (own, function.release.mismatched),
+        None => {
+            let prelinked = prelinked(unit, spec, &function, refs, optimization)?;
+            (prelinked.own, prelinked.mismatched)
+        }
     };
+    let features = function.features;
     let Function { code: Built::Ir(pending), places, .. } = &mut function else {
         return Err(failed(unit, "an assembly function has no IR for LLVM"));
     };
@@ -242,9 +266,20 @@ pub(crate) fn emit(
         given.dead.extend(by_key(places, refs, *callee).into_iter().map(|it| (it, params.clone())));
     }
     let signature = &pending.func.signature;
-    let (code, covered) =
-        llvm::compile(&mut pending.wants, &own, signature, &linked, &given, optimization, &spec.sanitize)
-            .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))?;
+    let name = (spec.pgo == Pgo::Generate).then(|| pgo::name(unit.item, unit.instance.args));
+    let (code, covered, counted) = llvm::compile(
+        &mut pending.wants,
+        &own,
+        signature,
+        &linked,
+        &given,
+        optimization,
+        &spec.sanitize,
+        name.as_deref(),
+        features,
+    )
+    .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))?;
+    let profile = profiled(unit, spec, counted, mismatched)?;
     placed_since(unit, &pending.wants, places, refs)?;
     let code = crate::backend::pad(code).map_err(|why| failed(unit, why))?;
     let Built::Ir(pending) = &function.code else {
@@ -258,6 +293,7 @@ pub(crate) fn emit(
     inlined.dedup();
     emitted.function.inlined = inlined;
     emitted.function.coverage = coverage(spec, covered);
+    emitted.function.profile = profile;
     Ok(emitted)
 }
 
@@ -353,6 +389,8 @@ fn prelinked(
         matches!(target, Some(Target::Function(_) | Target::Direct(_)))
     };
     let debug = spec.debuginfo != DebugInfo::None;
+    let wanted = pgo::Wanted::of(spec.pgo);
+    let name = wanted.map(|_| pgo::name(unit.item, unit.instance.args));
     llvm::prelink(
         &pending.wants,
         &pending.func,
@@ -363,8 +401,42 @@ fn prelinked(
         &instances,
         &spec.sanitize,
         function.unsanitized,
+        wanted.zip(name.as_deref()),
+        function.features,
     )
     .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))
+}
+
+/// What PGO made of the function, as its compiled function has it: its record, instrumented
+/// (`counted`, read from its module), or, built with a profile, whether the profile has a
+/// record under its name with another hash (`mismatched`, from its pre-link), which the
+/// build's `Stats::profile_mismatched` counts. Anything else than `spec.pgo` asked for is an
+/// error naming it.
+#[cfg(feature = "llvm")]
+fn profiled(
+    unit: &Unit,
+    spec: &Spec,
+    counted: Option<pgo::Counted>,
+    mismatched: bool,
+) -> Result<Option<Profiled>, CodegenError> {
+    match (spec.pgo, counted, mismatched) {
+        (Pgo::None, None, false) => Ok(None),
+        (Pgo::Use(_), None, mismatched) => Ok(Some(Profiled::Used { mismatched })),
+        (Pgo::Generate, Some(counted), false) => {
+            let pgo::Counted { name_ref, hash, counters, version, .. } = counted;
+            let name = pgo::name_bytes(unit.item, unit.instance.args);
+            Ok(Some(Profiled::Counted(ProfileRecord { name, name_ref, hash, counters, version })))
+        }
+        (asked, counted, mismatched) => Err(failed(
+            unit,
+            // alloc: an error
+            format!(
+                "built with PGO {asked:?}, LLVM {} it{}",
+                if counted.is_some() { "instrumented" } else { "did not instrument" },
+                if mismatched { " and its pre-link read a profile of it" } else { "" },
+            ),
+        )),
+    }
 }
 
 /// What the function request `request` is in the build: the instance's key of a function
@@ -687,9 +759,8 @@ mod tests {
         assert_eq!(extra, ["sincos"]);
     }
 
-    #[test]
-    fn levels_are_llvms() {
-        let spec = |opt| Spec {
+    fn spec(opt: u8) -> Spec {
+        Spec {
             toolchain: Toolchain {
                 id: ContentId([1; 32]),
                 target: "x86_64-unknown-linux-gnu".to_owned(),
@@ -698,6 +769,7 @@ mod tests {
                 features: Vec::new(),
                 cranelift: "0".to_owned(),
                 llvm: Some("23".to_owned()),
+                stencils: None,
                 frame_pointers: false,
                 relocation: blaze_codegen::settings::Relocation::Pic,
             },
@@ -707,10 +779,16 @@ mod tests {
             panic: blaze_codegen::settings::Panic::Unwind,
             debuginfo: DebugInfo::None,
             fold: false,
+            counted: false,
             mir_inline: false,
+            pgo: blaze_codegen::settings::Pgo::None,
             policy: ContentId::default(),
             sanitize: blaze_codegen::settings::Sanitize::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn levels_are_llvms() {
         assert_eq!(optimization(&unit(), &spec(3)).unwrap().passes, Passes::Aggressive);
         assert_eq!(optimization(&unit(), &spec(2)).unwrap().passes, Passes::Default);
         assert_eq!(optimization(&unit(), &spec(0)).unwrap().selection, Selection::Fast);
@@ -719,5 +797,35 @@ mod tests {
         assert!(optimization(&unit(), &cranelift).is_err());
         let without = Spec { toolchain: Toolchain { llvm: None, ..spec(2).toolchain }, ..spec(2) };
         assert!(optimization(&unit(), &without).is_err());
+    }
+
+    /// An instrumented function keeps LLVM's record under its own name; one built with a
+    /// profile says whether the profile missed it, so the build counts it rather than refusing
+    /// it; and what `Pgo` did not ask for is an error.
+    #[test]
+    fn what_pgo_made_is_the_functions() {
+        let unit = unit();
+        let with = |pgo| Spec { pgo, ..spec(2) };
+        let name = pgo::name(unit.item, unit.instance.args);
+        let counted =
+            || pgo::Counted { name: name.clone(), name_ref: 5, hash: 7, counters: 3, version: 10 };
+        let Some(Profiled::Counted(record)) = profiled(&unit, &with(Pgo::Generate), Some(counted()), false).unwrap()
+        else {
+            panic!("an instrumented function without its record");
+        };
+        assert_eq!(record.name(), name);
+        assert_eq!((record.name_ref, record.hash, record.counters, record.version), (5, 7, 3, 10));
+
+        let used = with(Pgo::Use(ContentId([9; 32])));
+        for mismatched in [false, true] {
+            assert_eq!(profiled(&unit, &used, None, mismatched).unwrap(), Some(Profiled::Used { mismatched }));
+        }
+        assert_eq!(profiled(&unit, &with(Pgo::None), None, false).unwrap(), None);
+
+        assert!(profiled(&unit, &with(Pgo::None), Some(counted()), false).is_err());
+        assert!(profiled(&unit, &with(Pgo::None), None, true).is_err());
+        assert!(profiled(&unit, &with(Pgo::Generate), None, false).is_err());
+        assert!(profiled(&unit, &with(Pgo::Generate), Some(counted()), true).is_err());
+        assert!(profiled(&unit, &used, Some(counted()), false).is_err());
     }
 }

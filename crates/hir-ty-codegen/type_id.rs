@@ -19,7 +19,7 @@ use hir_def::{
         TypeAliasSignature, UnionSignature,
     },
     src::HasSource,
-    visibility::{Visibility, visibility_from_ast},
+    visibility::{Visibility, visibility_from_ast_view},
 };
 use rustc_abi::{ExternAbi, Integer, IntegerType, ReprFlags};
 use rustc_ast_ir::Mutability;
@@ -29,7 +29,7 @@ use rustc_type_ir::{
     UintTy,
     inherent::{GenericArgs as _, IntoKind, Safety as _, Term as _},
 };
-use syntax::ast::HasVisibility;
+use syntax::view::HasVisibility;
 
 use rustc_hash::FxHashSet;
 
@@ -1030,8 +1030,8 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         let enum_visibility = match variant {
             VariantId::EnumVariantId(it) => {
                 let parent = it.lookup(db).parent;
-                let source = parent.lookup(db).source(db);
-                Some(visibility_from_ast(db, parent, source.map(|it| it.visibility())))
+                let source = parent.lookup(db).source_view(db);
+                Some(visibility_from_ast_view(db, parent, source.map(|it| it.visibility())))
             }
             _ => None,
         };

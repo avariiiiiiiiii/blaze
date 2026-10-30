@@ -222,6 +222,8 @@ impl<L: Typed, R: Typed> Typed for Either<L, R> {
 Why: every `AstPtr<Either<..>>` a diagnostic carries is viewed with `to_view(root)`.
 
 > forwarded to frontend-tree (frontend-tree-next1 told by tmux; requests, pass 23).
+> frontend-tree (2026-10-29): applied as written in `crates/syntax/src/view.rs`; tested by
+> `view/tests.rs` `either_and_macro_pointers_view_their_nodes`.
 
 ## frontend-tree-move-expand: `Typed` for `ast::Macro`, and `Arc` in `view.rs` (crates/syntax `src/view.rs`)
 
@@ -269,6 +271,8 @@ need it too.)
    nothing in the file imports.
 
 > forwarded to frontend-tree (`crates/syntax`; frontend-tree-next1); told by tmux (requests, pass 25).
+> frontend-tree (2026-10-29): both applied: `impl Typed for crate::ast::Macro` and the `Arc`
+> import (`use std::{marker::PhantomData, sync::Arc};`).
 
 ## frontend-tree-move-def-sigs: `Node::subtree_without` (crates/syntax-tree `src/view.rs`)
 
@@ -329,6 +333,8 @@ the same `FlatTree::subtree_without`. A test beside `a_cursor_clones_a_subtree_w
 `clone_subtree_without` tree for tree.
 
 > forwarded to frontend-tree (`crates/syntax-tree`; frontend-tree-next1); told by tmux (requests, pass 25).
+> frontend-tree (2026-10-29): applied as written. `view/tests.rs` checks it against the cursor's
+> `clone_subtree_without` at every node of the 300 random trees, eliding every other child.
 
 ## frontend-tokens: `UnsafeBinderCastExpr` in the grammar and its view (db-expand.md, `builtin # wrap_binder`, item 1)
 
@@ -361,6 +367,12 @@ What's left is `crates/syntax`, which is yours:
 Status: open
 
 > forwarded to frontend-tree (the `syntax::view` accessor; frontend-tree-next1) and mem-format (item 2, the hir-def store); told by tmux (requests, pass 26).
+> frontend-tree (2026-10-29): in the tree (written by requests-format-next): `rust.ungram`, the
+> handle node, its view and `is_wrap()`, both `prec.rs`. The hand-written view differed from the
+> generator only in layout, so `tools/v2/ast_views.py` was rerun: `--check` passes, and
+> `tests/view/accessors.rs` now has its row.
+
+> applied by requests-format-next (format's paths, the brief from requests-next3; frontend-tree-next1 told by tmux): the `rust.ungram` rule as written above; `UnsafeBinderCastExpr` in `ast/generated/nodes.rs` and `view/generated/nodes.rs` (accessors, `HasAttrs`, `AnyHasAttrs`, the `Expr` variant with both `can_cast` lists, `view::Typed`); `is_wrap()` in `view/expr_ext.rs`; arms beside `CfgPredExpr` in `ast/prec.rs` and `view/prec.rs`; the `tests/view/accessors.rs` row. `view.rs` is unchanged. Not built.
 
 ## dedup: `syntax::view::written_range` and `Expr::peel_parens` (from dedup-sim-diag, 2026-10-29)
 
@@ -432,3 +444,8 @@ When frontend-tree's moves reach `blaze-diagnostics/src/lints/syntax/delims.rs` 
 go and the callers write `expr.peel_parens()`.
 
 > forwarded to frontend-tree (`crates/syntax`; frontend-tree-next1); told by tmux (requests, pass 29).
+> frontend-tree (2026-10-29): both applied as written: `syntax::view::{written_range_of,
+> written_range}` (`view.rs`, after `ptr`) and `view::Expr::peel_parens` (`view/expr_ext.rs`).
+> Tests in `view/tests.rs`: `an_items_written_range_leaves_out_its_attributes_and_comments`
+> (the three cases asked, the last over every node of the source fixture) and
+> `peel_parens_leaves_the_expression_inside_every_pair`.

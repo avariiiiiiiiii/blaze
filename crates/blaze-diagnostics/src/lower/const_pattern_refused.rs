@@ -25,6 +25,8 @@ use crate::{
 const STRUCTURAL_PARTIAL_EQ: &str =
     "see https://doc.rust-lang.org/stable/std/marker/trait.StructuralPartialEq.html for details";
 
+const MUST_BE_DERIVED: &str = "the `PartialEq` trait must be derived, manual `impl`s are not sufficient; see https://doc.rust-lang.org/stable/std/marker/trait.StructuralPartialEq.html for details";
+
 const POINTER: &str = "function pointers and raw pointers not derived from integers in patterns behave unpredictably and should not be relied upon";
 
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ConstPatternRefused<'db>) -> Vec<Found> {
@@ -41,11 +43,14 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ConstPatternRefused<'db>) ->
             let message = format!("{prefix} `{}` cannot be used in patterns", cx.ty(ty)); // alloc: the error's message, the edge
             refused(span, message, format!("{prefix} can't be used in patterns")) // alloc: its label
         }
-        ConstPatternError::NotStructural(ty) => not_structural(cx, d.pat, span, ty),
-        ConstPatternError::NotPartialEq(ty) => {
+        ConstPatternError::NotStructural { ty, inapplicable_structural } => {
+            not_structural(cx, d.pat, span, ty, *inapplicable_structural)
+        }
+        ConstPatternError::NotPartialEq { ty, local_manual, local_without, manual, without } => {
             let message = format!("constant of non-structural type `{}` in a pattern", cx.ty(ty)); // alloc: the error's message, the edge
             let mut diag = refused(span, message, "constant of non-structural type");
             diag.note(STRUCTURAL_PARTIAL_EQ);
+            not_partial_eq(cx, &mut diag, local_manual, local_without, manual, without);
             diag
         }
         ConstPatternError::NaN => {
@@ -104,35 +109,87 @@ fn refused(span: Span, message: impl Into<String>, label: impl Into<String>) -> 
     diag
 }
 
-/// rustc's `TypeNotStructural`. Match checking gives it only when the ADT has no
-/// `StructuralPartialEq` impl at all, so rustc's `manual_partialeq_impl` holds: the note is
-/// the impl's span note when the crate writes one, else the plain note.
-fn not_structural<'db>(cx: &Cx<'_, 'db>, pat: InFile<AstPtr<tag::Pat>>, span: Span, ty: &Type<'db>) -> Diag {
+/// rustc's `TypeNotStructural`. With a `StructuralPartialEq` impl whose bounds don't hold
+/// (`inapplicable_structural`) there is no note on a manual `PartialEq` impl, and the
+/// suggestion is given only for a local ADT; otherwise the note is the impl's span note when
+/// the crate writes one, else the plain note.
+fn not_structural<'db>(
+    cx: &Cx<'_, 'db>,
+    pat: InFile<AstPtr<tag::Pat>>,
+    span: Span,
+    ty: &Type<'db>,
+    inapplicable_structural: bool,
+) -> Diag {
     let printed = cx.ty(ty);
     let message = format!("constant of non-structural type `{printed}` in a pattern"); // alloc: the error's message, the edge
     let mut diag = refused(span.clone(), message, "constant of non-structural type"); // clone: the error's span, the edge
+    let is_local = ty.as_adt().is_some_and(|adt| adt.module(cx.db).krate(cx.db) == cx.krate);
     if let Some(adt) = ty.as_adt()
         && let Some(source) = cx.vsema.source(adt)
     {
         let def = cx.span(source.map(|it| def_span(it.syntax())));
-        let label = match adt.module(cx.db).krate(cx.db) == cx.krate {
+        let label = match is_local {
             // alloc: the error's label, the edge
             true => format!("`{printed}` must be annotated with `#[derive(PartialEq)]` to be usable in patterns"),
             false => format!("`{printed}` is not usable in patterns"), // alloc: as above
         };
         diag.span_label(def, label);
     }
-    match manual_partial_eq(cx, ty) {
-        Some(at) => diag.span_note(
-            at,
-            "the `PartialEq` trait must be derived, manual `impl`s are not sufficient; see https://doc.rust-lang.org/stable/std/marker/trait.StructuralPartialEq.html for details",
-        ),
-        None => diag.note(STRUCTURAL_PARTIAL_EQ),
-    };
-    if let Some(name) = cx.snippet(&span) {
-        suggest_eq(cx, &mut diag, pat, &span, name);
+    if !inapplicable_structural {
+        match manual_partial_eq(cx, ty) {
+            Some(at) => diag.span_note(at, MUST_BE_DERIVED),
+            None => diag.note(STRUCTURAL_PARTIAL_EQ),
+        };
+    }
+    if (is_local || !inapplicable_structural)
+        && let Some(name) = cx.snippet(&span)
+    {
+        let manual = !inapplicable_structural;
+        suggest_eq(cx, &mut diag, pat, &span, name, (!manual).then_some(printed.as_str()));
     }
     diag
+}
+
+/// rustc's `extend_type_not_partial_eq`: a span note at each local ADT with a manual
+/// `PartialEq` impl (at the impl, else the ADT), a label at each local ADT with none, then the
+/// foreign types with a manual impl and those with none, each sorted by their text.
+fn not_partial_eq<'db>(
+    cx: &Cx<'_, 'db>,
+    diag: &mut Diag,
+    local_manual: &[hir::ManualPartialEq],
+    local_without: &[hir::Adt],
+    manual: &[Type<'db>],
+    without: &[Type<'db>],
+) {
+    for &it in local_manual {
+        let source = match it {
+            hir::ManualPartialEq::Impl(it) => cx.vsema.source(it).map(|it| it.map(|it| def_span(it.syntax()))),
+            hir::ManualPartialEq::Adt(it) => cx.vsema.source(it).map(|it| it.map(|it| def_span(it.syntax()))),
+        };
+        if let Some(at) = source {
+            diag.span_note(cx.span(at), MUST_BE_DERIVED);
+        }
+    }
+    for &adt in local_without {
+        if let Some(source) = cx.vsema.source(adt) {
+            let at = cx.span(source.map(|it| def_span(it.syntax())));
+            diag.span_label(at, "must be annotated with `#[derive(PartialEq)]` to be usable in patterns");
+        }
+    }
+    let sorted = |tys: &[Type<'db>]| {
+        let mut printed: Vec<String> = tys.iter().map(|it| cx.ty(it)).collect(); // alloc: the error's notes, the edge
+        printed.sort_unstable();
+        printed
+    };
+    for ty in sorted(manual) {
+        // alloc: the error's note, the edge
+        diag.note(format!(
+            "`{ty}` must be annotated with `#[derive(PartialEq)]` to be usable in patterns, manual `impl`s are not sufficient; see https://doc.rust-lang.org/stable/std/marker/trait.StructuralPartialEq.html for details"
+        ));
+    }
+    for ty in sorted(without) {
+        diag.note(format!("`{ty}` must be annotated with `#[derive(PartialEq)]` to be usable in patterns")); // alloc: as above
+    }
 }
 
 /// rustc's `non_blanket_impl` when it is local and not derived: a `PartialEq` impl for the
@@ -157,8 +214,16 @@ fn manual_partial_eq(cx: &Cx<'_, '_>, ty: &Type<'_>) -> Option<Span> {
 
 /// rustc's `SuggestEq`: by what the constant's outermost pattern is part of, bind it and
 /// compare instead. rustc goes up through patterns only, so a constant under a struct
-/// pattern's field (a `PatField`, not a pattern) gets none.
-fn suggest_eq(cx: &Cx<'_, '_>, diag: &mut Diag, pat: InFile<AstPtr<tag::Pat>>, span: &Span, name: &str) {
+/// pattern's field (a `PatField`, not a pattern) gets none. `not_manual` is the type printed
+/// when rustc's `manual_partialeq_impl` is false: the message is then conditional on it.
+fn suggest_eq(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    pat: InFile<AstPtr<tag::Pat>>,
+    span: &Span,
+    name: &str,
+    not_manual: Option<&str>,
+) {
     let node = cx.node_view(pat).map(|it| it.syntax());
     let mut outer = node;
     let mut parent = None;
@@ -231,6 +296,11 @@ fn suggest_eq(cx: &Cx<'_, '_>, diag: &mut Diag, pat: InFile<AstPtr<tag::Pat>>, s
             ("check for equality instead of pattern matching", parts.into())
         }
         _ => return,
+    };
+    let message = match not_manual {
+        // alloc: the suggestion's message, the edge
+        Some(ty) => format!("if `{ty}` manually implemented `PartialEq`, you could {message}"),
+        None => message.to_owned(), // alloc: as above
     };
     diag.multipart_suggestion(message, parts, Applicability::MaybeIncorrect);
 }

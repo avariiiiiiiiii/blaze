@@ -290,6 +290,43 @@ fn f() {
 }
 
 #[test]
+fn a_closure_s_kind_origin_place_is_the_use_s_not_the_capture_s() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized, fn
+struct S { a: u8 }
+fn f(r: &mut S, mut t: (u8, u8)) {
+    let mut moved = move || { r.a = 1; };
+    let mut borrowed = || { t.1 = 2; };
+}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let f = func(&db, "f");
+        let crate::AnyFunctionId::FunctionId(id) = f.id else { panic!() };
+        let def = hir_def::DefWithBodyId::FunctionId(id);
+        let body = hir_def::expr_store::Body::of(&db, def);
+        let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
+        let places: Vec<_> = body
+            .exprs()
+            .filter(|(_, it)| matches!(it, Expr::Closure { .. }))
+            .map(|(closure, _)| {
+                let ty = infer.type_of_expr_or_pat(closure.into()).expect("the closure has a type");
+                let closure = Type::new(&db, id.into(), ty).as_closure().expect("a closure type");
+                let (_, capture) = closure.kind_origin(&db).expect("an `FnMut` closure's origin");
+                let place = closure.kind_origin_place(&db).expect("the origin's place");
+                (place, capture.display_place_source_code(&db, span::Edition::CURRENT))
+            })
+            .collect();
+        // The `move` closure captures `r` itself; rustc labels the use's `(*r).a` as `*r.a`.
+        assert_eq!(
+            places,
+            [("*r.a".to_owned(), "r".to_owned()), ("t.1".to_owned(), "t.1".to_owned())]
+        );
+    });
+}
+
+#[test]
 fn deprecation_is_its_own_or_its_module_s() {
     let db = TestDB::with_files(
         r#"

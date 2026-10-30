@@ -106,7 +106,7 @@ impl<T> PollExt<T> for Poll<T> {
 }
 
 /// Runs `future` to its end on this thread.
-pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+pub fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
     let mut cx = Context::from_waker(&waker);

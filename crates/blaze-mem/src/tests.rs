@@ -1425,6 +1425,100 @@ fn shared_owners_on_many_threads_drop_it_once() {
 }
 
 #[test]
+fn shared_from_matches_share_for_every_head_length() {
+    let pool = Pool::<pool::Counted<[u32; 8]>>::new(64, Tag::Link).expect("reserve");
+    let mut cache = pool.cache();
+    for len in [0, 3, 8] {
+        let head: Vec<u32> = (1..=len as u32).collect();
+        let mut whole = [9u32; 8];
+        whole[..len].copy_from_slice(&head);
+        assert_eq!(*cache.share_from(&head, &9), *cache.share(whole), "head of {len}");
+    }
+    let pool = Pool::<pool::Counted<[String; 5]>>::new(64, Tag::Link).expect("reserve");
+    let mut cache = pool.cache();
+    for len in [0, 3, 5] {
+        let head: Vec<String> = (0..len).map(|i| format!("item {i}")).collect();
+        let whole: [String; 5] =
+            std::array::from_fn(|i| head.get(i).cloned().unwrap_or_else(|| "fill".to_owned()));
+        let made = cache.share_from(&head, &"fill".to_owned());
+        assert_eq!(*made, whole, "head of {len}");
+    }
+}
+
+#[test]
+fn shared_from_makes_a_megabyte_slot_on_a_small_stack() {
+    let pool = Pool::<pool::Counted<[u8; 1 << 20]>>::new(4, Tag::Link).expect("reserve");
+    thread::scope(|scope| {
+        thread::Builder::new()
+            .stack_size(64 << 10)
+            .spawn_scoped(scope, || {
+                let mut cache = pool.cache();
+                let a = cache.share_from(&[], &7);
+                let b = cache.share_from(&a[..], &0);
+                assert!(a.iter().chain(b.iter()).all(|&byte| byte == 7));
+                assert!(!pool::Shared::ptr_eq(&a, &b), "a copy is its own slot");
+            })
+            .expect("spawn")
+            .join()
+            .expect("no overflow");
+    });
+    assert!(pool.carved() <= 2, "a pool of 1 MiB slots carves two at a time, not 64");
+}
+
+#[test]
+fn shared_from_allocates_nothing_once_warm() {
+    let pool = Pool::<pool::Counted<[u64; 64]>>::new(1 << 10, Tag::Link).expect("reserve");
+    let mut cache = pool.cache();
+    let mut round = || {
+        let first = cache.share_from(&[1, 2, 3], &0);
+        let copy = cache.share_from(&first[..], &0);
+        drop((first, copy));
+    };
+    round();
+    blaze_alloc_count::assert_at_most(0, "a warm share_from and its copy", &mut round);
+}
+
+#[test]
+fn shared_from_a_panicking_clone_drops_what_it_wrote_and_returns_the_slot() {
+    struct Bomb {
+        drops: Rc<Cell<usize>>,
+        clones: Rc<Cell<usize>>,
+        armed: Rc<Cell<bool>>,
+    }
+    impl Clone for Bomb {
+        fn clone(&self) -> Bomb {
+            assert!(!self.armed.get() || self.clones.get() < 4, "the fifth clone panics");
+            self.clones.set(self.clones.get() + 1);
+            Bomb {
+                drops: Rc::clone(&self.drops),
+                clones: Rc::clone(&self.clones),
+                armed: Rc::clone(&self.armed),
+            }
+        }
+    }
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+    let pool = Pool::<pool::Counted<[Bomb; 8]>>::new(1, Tag::Link).expect("reserve");
+    let mut cache = pool.cache();
+    let (drops, clones, armed) =
+        (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)), Rc::new(Cell::new(true)));
+    let fill =
+        Bomb { drops: Rc::clone(&drops), clones: Rc::clone(&clones), armed: Rc::clone(&armed) };
+    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(cache.share_from(&[], &fill));
+    }));
+    assert!(made.is_err());
+    assert_eq!(drops.get(), 4, "the four written are dropped once each");
+    armed.set(false);
+    let again = cache.try_share_from(&[], &fill);
+    assert!(again.is_ok(), "the pool's one slot came back");
+    assert_eq!(pool.carved(), 1);
+}
+
+#[test]
 fn shared_allocates_nothing_once_warm() {
     let pool = Pool::<pool::Counted<[u64; 8]>>::new(1 << 14, Tag::Link).expect("reserve");
     let mut cache = pool.cache();

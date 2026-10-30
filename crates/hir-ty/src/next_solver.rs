@@ -9,6 +9,7 @@ mod allocation;
 mod binder;
 mod consts;
 mod def_id;
+mod features;
 pub mod fold;
 pub mod format_proof_tree;
 pub mod fulfill;
@@ -22,6 +23,7 @@ pub mod interner;
 mod ir_print;
 pub mod normalize;
 pub mod obligation_ctxt;
+mod opaque_variances;
 mod opaques;
 pub mod persist;
 pub mod predicate;
@@ -36,6 +38,8 @@ pub mod util;
 mod budget_tests;
 #[cfg(test)]
 mod coroutine_witness_tests;
+#[cfg(test)]
+mod ported_rules_tests;
 
 use std::sync::OnceLock;
 
@@ -43,6 +47,7 @@ pub use allocation::*;
 pub use binder::*;
 pub use consts::*;
 pub use def_id::*;
+pub use features::Features;
 pub use generic_arg::*;
 pub use interner::*;
 pub use opaques::*;

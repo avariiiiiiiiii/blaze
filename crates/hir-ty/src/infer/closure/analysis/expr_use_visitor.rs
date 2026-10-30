@@ -13,7 +13,7 @@ use hir_def::{
     attrs::AttrFlags,
     hir::{
         Array, AsmOperand, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, MatchArm, Pat,
-        PatId, RecordLitField, RecordSpread, Statement,
+        PatId, RecordLitField, RecordSpread, Statement, UnsafeBinderCastKind,
     },
     resolver::ValueNs,
     upvars::UpvarsRef,
@@ -673,6 +673,9 @@ pub(crate) struct ExprUseVisitor<'a, 'db, 'f, D: Delegate<'db, 'f>> {
     delegate: D,
     closure_expr: ExprId,
     upvars: UpvarsRef<'db>,
+    /// rustc's `body_owner_is_closure`: false for [`ExprUseVisitor::for_body`], where what a
+    /// nested closure captures is a local of the body, not an upvar.
+    owner_is_closure: bool,
 }
 
 impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
@@ -687,7 +690,19 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
         upvars: UpvarsRef<'db>,
         delegate: D,
     ) -> Self {
-        ExprUseVisitor { delegate, closure_expr, upvars, cx }
+        ExprUseVisitor { delegate, closure_expr, upvars, cx, owner_is_closure: true }
+    }
+
+    /// The visitor of a body that is no closure (rustc's `ExprUseVisitor::for_clippy` of a fn,
+    /// const or static): it has no upvars, and `root` is its root expression.
+    pub(crate) fn for_body(cx: &'a mut InferenceContext<'db, 'f>, root: ExprId, delegate: D) -> Self {
+        ExprUseVisitor {
+            delegate,
+            closure_expr: root,
+            upvars: UpvarsRef::empty(),
+            cx,
+            owner_is_closure: false,
+        }
     }
 
     pub(crate) fn consume_closure_body(&mut self, params: &[PatId], body: ExprId) -> Result {
@@ -782,6 +797,10 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
 
             Expr::Field { expr: base, .. } => {
                 // base.f
+                self.walk_expr(base)?;
+            }
+
+            Expr::UnsafeBinderCast { expr: base, .. } => {
                 self.walk_expr(base)?;
             }
 
@@ -1333,7 +1352,7 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
             for (fake_read, cause, origins) in closure_data.fake_reads.iter() {
                 match fake_read.base {
                     PlaceBase::Upvar { var_id, closure: _ } => {
-                        if upvar_is_local_variable(self.upvars, var_id) {
+                        if self.owner_is_closure && upvar_is_local_variable(self.upvars, var_id) {
                             // The nested closure might be fake reading the current (enclosing) closure's local variables.
                             // The only places we want to fake read before creating the parent closure are the ones that
                             // are not local to it/ defined by it.
@@ -1372,7 +1391,7 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
             }
 
             for (var_id, min_list) in closure_data.min_captures.iter() {
-                if !self.upvars.contains(var_id) {
+                if self.owner_is_closure && !self.upvars.contains(var_id) {
                     // The nested closure might be capturing the current (enclosing) closure's local variables.
                     // We check if the root variable is ever mentioned within the enclosing closure, if not
                     // then for the current body (if it's a closure) these aren't captures, we will ignore them.
@@ -1382,8 +1401,12 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
                     let place = &captured_place.place;
                     let capture_info = &captured_place.info;
 
-                    // Mark the place to be captured by the enclosing closure
-                    let place_base = PlaceBase::Upvar { var_id, closure: self.closure_expr };
+                    // Mark the place to be captured by the enclosing closure, or, in a body that is
+                    // no closure, as the body's own local.
+                    let place_base = match self.owner_is_closure {
+                        true => PlaceBase::Upvar { var_id, closure: self.closure_expr },
+                        false => PlaceBase::Local(var_id),
+                    };
                     let place_with_id = PlaceWithOrigin::of_capture(
                         place,
                         place_base,
@@ -1607,6 +1630,16 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                     base,
                     expr_ty,
                     ProjectionKind::Field { field_idx, variant_idx: 0 },
+                ))
+            }
+
+            Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Unwrap, expr: base, ty: _ } => {
+                let base = self.cat_expr(base)?;
+                Ok(self.cat_projection(
+                    expr.into(),
+                    base,
+                    expr_ty,
+                    ProjectionKind::UnwrapUnsafeBinder,
                 ))
             }
 
@@ -2066,6 +2099,72 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
         } else {
             false
         }
+    }
+}
+
+/// The locals of `def`'s body that it moves a place based on out of, sorted: rustc's
+/// `ExprUseVisitor::for_clippy(..).consume_body(body)` with clippy's `MovedVariablesCtxt`
+/// (`needless_pass_by_value`), which records the base of each `consume` that is a local. It
+/// runs over the body's finished `result`, merged into a context of its own as an inline
+/// const's result is. `None` when the walk stops at a type error, a body rustc lints nothing of.
+pub fn moved_locals<'db>(
+    db: &'db base_db::Db,
+    def: hir_def::DefWithBodyId,
+    result: &crate::InferenceResult<'db>,
+) -> Option<Box<[BindingId]>> {
+    let body = hir_def::expr_store::Body::of(db, def);
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+        let mut cx = InferenceContext::new(
+            db,
+            crate::InferBodyId::DefWithBodyId(def),
+            hir_def::ExpressionStoreOwnerId::Body(def),
+            def.generic_def(db),
+            &body.store,
+            hir_def::resolver::HasResolver::resolver(def, db),
+            true,
+            crate::lower::LoweringMode::Analysis,
+            frame,
+        );
+        cx.merge(result);
+        let mut params = Vec::with_capacity_in(body.params.len(), frame);
+        params.extend(body.params.iter().map(|it| it.formal));
+        let root = body.root_expr();
+        let mut delegate = MovedLocals { moved: Vec::new_in(frame) };
+        ExprUseVisitor::for_body(&mut cx, root, &mut delegate)
+            .consume_closure_body(&params, root)
+            .ok()?;
+        let moved = &mut delegate.moved;
+        moved.sort_unstable_by_key(|it| it.into_raw().into_u32());
+        moved.dedup();
+        // alloc: the answer, once per body asked, past the frame
+        Some(Box::from(&moved[..]))
+    })
+}
+
+/// clippy's `MovedVariablesCtxt`: what [`moved_locals`] records.
+struct MovedLocals<'f> {
+    moved: Vec<BindingId, &'f Frame>,
+}
+
+impl<'db, 'f> Delegate<'db, 'f> for MovedLocals<'f> {
+    fn consume(&mut self, place_with_id: PlaceWithOrigin<'f>, _: &mut InferenceContext<'db, 'f>) {
+        if let PlaceBase::Local(binding) = place_with_id.place.base {
+            self.moved.push(binding);
+        }
+    }
+
+    fn use_cloned(&mut self, _: PlaceWithOrigin<'f>, _: &mut InferenceContext<'db, 'f>) {}
+
+    fn borrow(&mut self, _: PlaceWithOrigin<'f>, _: BorrowKind, _: &mut InferenceContext<'db, 'f>) {}
+
+    fn mutate(&mut self, _: PlaceWithOrigin<'f>, _: &mut InferenceContext<'db, 'f>) {}
+
+    fn fake_read(
+        &mut self,
+        _: PlaceWithOrigin<'f>,
+        _: FakeReadCause,
+        _: &mut InferenceContext<'db, 'f>,
+    ) {
     }
 }
 

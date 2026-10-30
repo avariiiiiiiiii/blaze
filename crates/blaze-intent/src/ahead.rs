@@ -6,8 +6,9 @@
 //! Selection is libtest's: a test is selected when its name contains any of the filters, and
 //! every test when there are none.
 
+use blaze_ids::{prehashed::ByHash, radix};
 use blaze_items::CodeHash;
-use rustc_hash::FxHashMap;
+use memchr::memmem::Finder;
 
 /// A test as its binary's last build and run left it.
 pub struct Test<'a> {
@@ -39,13 +40,15 @@ pub struct Plan {
 pub fn plan(binaries: &[Binary<'_>], filters: &[String]) -> Plan {
     let mut plan = Plan::default();
     let mut matched = vec![false; filters.len()];
-    let mut count: FxHashMap<CodeHash, u32> = FxHashMap::default();
+    // Each filter's searcher is made once, not once per test name as `str::contains` makes it.
+    let finders: Vec<Finder<'_>> = filters.iter().map(|it| Finder::new(it.as_bytes())).collect();
+    let mut count: ByHash<CodeHash, u32> = ByHash::default();
     for binary in binaries {
         let mut selected = false;
         for test in binary.tests {
             let mut hit = filters.is_empty();
-            for (at, filter) in filters.iter().enumerate() {
-                if test.name.contains(filter.as_str()) {
+            for (at, finder) in finders.iter().enumerate() {
+                if finder.find(test.name.as_bytes()).is_some() {
                     matched[at] = true;
                     hit = true;
                 }
@@ -63,11 +66,29 @@ pub fn plan(binaries: &[Binary<'_>], filters: &[String]) -> Plan {
             plan.units.push(binary.unit);
         }
     }
-    let mut hot: Vec<(u32, CodeHash)> = count.into_iter().map(|(hash, n)| (n, hash)).collect();
-    hot.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    plan.hot = hot.into_iter().map(|(_, hash)| hash).collect();
+    plan.hot = hottest_first(count);
     plan.unmatched = filters.iter().zip(&matched).filter(|(_, hit)| !**hit).map(|(it, _)| it.clone()).collect();
     plan
+}
+
+/// The hashes by how many tests reached each, most first, then by hash: a radix sort on the
+/// count and the hash's first four bytes, then a compare of the whole hash within each run that
+/// key leaves tied (a run of more than one is rare: two of `n` hashes share four bytes with
+/// probability about \(n^2 / 2^{33}\)).
+fn hottest_first(count: ByHash<CodeHash, u32>) -> Vec<CodeHash> {
+    let key = |n: u32, hash: &CodeHash| {
+        let [a, b, c, d, ..] = hash.0.0;
+        radix::pack_32(u32::MAX - n, u32::from_be_bytes([a, b, c, d]))
+    };
+    let mut hot: Vec<(u64, CodeHash)> = Vec::with_capacity(count.len());
+    hot.extend(count.into_iter().map(|(hash, n)| (key(n, &hash), hash)));
+    radix::sort_copy_by_key(&mut hot, |it| it.0);
+    for run in hot.chunk_by_mut(|a, b| a.0 == b.0) {
+        if run.len() > 1 {
+            run.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        }
+    }
+    hot.into_iter().map(|(_, hash)| hash).collect()
 }
 
 #[cfg(test)]
@@ -94,6 +115,35 @@ mod tests {
         assert_eq!(plan.units, [7]);
         assert_eq!(plan.hot, [b, a]);
         assert_eq!(plan.unmatched, ["nothing"]);
+    }
+
+    #[test]
+    fn the_radix_order_is_the_compare_order_ties_and_all() {
+        let mut count: ByHash<CodeHash, u32> = ByHash::default();
+        for n in 0..2000u32 {
+            let mut bytes = ContentId::of("blaze-intent test", &n.to_le_bytes()).0;
+            // A tenth share their first four bytes, so the key leaves runs tied.
+            if n % 10 == 0 {
+                bytes[..4].copy_from_slice(&[7, 7, 7, 7]);
+            }
+            count.insert(CodeHash(ContentId(bytes)), n % 5);
+        }
+        let mut reference: Vec<(u32, CodeHash)> = count.iter().map(|(hash, n)| (*n, *hash)).collect();
+        reference.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let reference: Vec<CodeHash> = reference.into_iter().map(|(_, hash)| hash).collect();
+        assert_eq!(hottest_first(count), reference);
+    }
+
+    #[test]
+    fn filters_match_as_str_contains_does() {
+        let names = ["parse::empty", "", "ünï::cödé", "a::b::c"];
+        let filters = ["", "::", "cödé", "b::c", "zz", "parse::empty::more"];
+        for filter in filters {
+            let finder = Finder::new(filter.as_bytes());
+            for name in names {
+                assert_eq!(finder.find(name.as_bytes()).is_some(), name.contains(filter), "{name:?} {filter:?}");
+            }
+        }
     }
 
     #[test]

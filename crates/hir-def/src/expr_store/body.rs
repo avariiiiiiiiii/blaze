@@ -179,15 +179,14 @@ impl Body {
     /// a body a macro writes, recording no map. Most bodies a build lowers never show where a
     /// part of them is written, so their maps are built only when read: [`Body::relative`] and
     /// [`Body::with_source_map`] lower the body again, with the map and this body's blocks.
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, def: DefWithBodyId) -> Arc<Body> {
+    /// The body is the memo's own value, lent by reference: no `Arc` and no count to write.
+    #[salsa::tracked(returns(ref))]
+    pub fn of(db: &Db, def: DefWithBodyId) -> Body {
         let _p = tracing::info_span!("body_query").entered();
-        let body = match lower_relative(db, def, BodyLowering::Body) {
+        match lower_relative(db, def, BodyLowering::Body) {
             Some((body, _)) => body,
             None => lower_in_file(db, def, BodyLowering::Body).0,
-        };
-        // alloc: the query's value, one per lowered body
-        Arc::new(body)
+        }
     }
 }
 

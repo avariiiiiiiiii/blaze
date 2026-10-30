@@ -150,6 +150,16 @@ pub enum CandidateSource {
     Trait(TraitId),
 }
 
+/// What a method is looked up for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProbeFor {
+    /// A method call: its pick marks the trait's import used and may give the edition lint.
+    Call,
+    /// A field access that names no field, asking whether a method of the name exists
+    /// (rustc's `method_exists_for_diagnostic`): neither, as no call is made.
+    Diagnostic,
+}
+
 impl<'db, 'f> InferenceContext<'db, 'f> {
     /// Performs method lookup. If lookup is successful, it will return the callee
     /// and store an appropriate adjustment for the self-expr. In some cases it may
@@ -163,11 +173,40 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         receiver: ExprId,
         call_expr: ExprId,
     ) -> Result<(MethodCallee<'db>, bool), MethodError<'db>> {
+        self.lookup_method_as(ProbeFor::Call, self_ty, name, generic_args, receiver, call_expr)
+    }
+
+    /// [`Self::lookup_method_including_private`] for a field access `field_expr` that names no
+    /// field: the same pick, adjustments, unstable candidates and resolution, but the pick's
+    /// trait import is not marked used and no edition lint is given for it, as rustc's
+    /// `method_exists_for_diagnostic` does neither.
+    #[instrument(level = "debug", skip(self))]
+    pub(crate) fn lookup_method_for_diagnostic(
+        &mut self,
+        self_ty: Ty<'db>,
+        name: Name,
+        receiver: ExprId,
+        field_expr: ExprId,
+    ) -> Result<(MethodCallee<'db>, bool), MethodError<'db>> {
+        self.lookup_method_as(ProbeFor::Diagnostic, self_ty, name, None, receiver, field_expr)
+    }
+
+    fn lookup_method_as(
+        &mut self,
+        probe_for: ProbeFor,
+        self_ty: Ty<'db>,
+        name: Name,
+        generic_args: Option<&HirGenericArgs>,
+        receiver: ExprId,
+        call_expr: ExprId,
+    ) -> Result<(MethodCallee<'db>, bool), MethodError<'db>> {
         let (pick, is_visible) = match self.lookup_probe(call_expr, receiver, name, self_ty) {
             Ok(it) => {
                 self.write_unstable_candidates(call_expr.into(), &it);
-                self.record_trait_pick(call_expr.into(), &it);
-                self.lint_edition_dependent_dot_call(self_ty, call_expr, receiver, &it);
+                if probe_for == ProbeFor::Call {
+                    self.record_trait_pick(call_expr.into(), &it);
+                    self.lint_edition_dependent_dot_call(self_ty, call_expr, receiver, &it);
+                }
                 (it, true)
             }
             Err(MethodError::PrivateMatch(it)) => {
@@ -526,6 +565,7 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
     };
     let db = infcx.interner.db;
     let item_of = |impl_id: ImplId| {
+        // clone: the tracked query's key; a `Name` is an interned symbol, so a count bump
         impl_value_item(db, impl_id, name.clone()).map(|it| match it {
             CandidateId::FunctionId(f) => AssocItemId::FunctionId(f),
             CandidateId::ConstId(c) => AssocItemId::ConstId(c),

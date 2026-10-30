@@ -228,21 +228,15 @@ fn kilobytes(text: &str, name: &str) -> Option<u64> {
     line.trim().trim_end_matches("kB").trim().parse::<u64>().ok()?.checked_mul(1024)
 }
 
-/// Bytes allocated and not freed, when the allocator counts them.
+/// Bytes allocated and not freed, as the daemon's allocator counts them
+/// ([`blaze_graph::arena::Counting`]): within its batch per thread of the exact count.
 pub fn live() -> Option<u64> {
-    #[cfg(unix)]
-    {
-        tikv_jemalloc_ctl::epoch::advance().ok()?;
-        tikv_jemalloc_ctl::stats::allocated::read().ok().map(|it| it as u64)
-    }
-    #[cfg(windows)]
-    None
+    Some(blaze_graph::arena::held())
 }
 
-/// Gives the system back the pages of what was freed, which jemalloc keeps for ten seconds
-/// to reuse otherwise.
+/// Gives the system back the pages of what was freed, which the allocator keeps to reuse
+/// otherwise.
 pub fn give_back() {
-    #[cfg(unix)]
     crate::raw::memory::purge_freed_pages();
 }
 

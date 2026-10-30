@@ -20,7 +20,10 @@ use hir_ty::next_solver::{CallableIdWrapper, TyKind};
 use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::IntoKind as _;
 use span::Edition;
-use syntax::{AstNode, TextRange, TextSize, ast};
+use syntax::{
+    TextRange, TextSize,
+    view::{self as ast, AstNode},
+};
 
 use super::BodyCx;
 use crate::{
@@ -208,7 +211,7 @@ impl Visitor<'_, '_, '_> {
 /// The unsafe operations of the body, by where they are written.
 fn operations(b: &BodyCx<'_, '_>) -> FxHashSet<ExprOrPatSource> {
     let def = DefWithBody::from(b.owner);
-    b.cx.sema.get_unsafe_ops(def.into())
+    b.cx.vsema.get_unsafe_ops(def.into())
 }
 
 /// Whether `expr` calls a function that is unsafe to call in edition 2024: hir's operations
@@ -250,19 +253,17 @@ impl Block {
     /// Whether `expr`, an `unsafe` block, is written so, not made by lowering.
     fn is_explicit(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
         let Some(node) = b.expr_node(expr) else { return false };
-        let node = b.cx.syntax(node);
+        let node = b.cx.syntax_view(node);
         ast::BlockExpr::cast(node.value).is_some_and(|it| it.unsafe_token().is_some())
     }
 
     fn of(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Block> {
         let node = b.expr_node(expr)?;
-        let syntax = b.cx.syntax(node);
-        // clone: a lint's span, for a lint found
-        let block = ast::BlockExpr::cast(syntax.value.clone())?;
+        let syntax = b.cx.syntax_view(node);
+        let block = ast::BlockExpr::cast(syntax.value)?;
         let start = block.unsafe_token()?.text_range().start();
         let range = TextRange::new(start, block.syntax().text_range().end());
-        // alloc: for a lint found
-        let text = block.syntax().text().to_string();
+        let text = block.syntax().text();
         let local = usize::from(start - block.syntax().text_range().start());
         let written = &text[local..];
         let head = written.split('{').next().unwrap_or("").trim_end();

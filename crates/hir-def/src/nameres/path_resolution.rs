@@ -31,7 +31,7 @@ use crate::{
     item_scope::{BUILTIN_SCOPE, ImportOrExternCrate},
     nameres::{
         BlockInfo, BuiltinShadowMode, DefMap, LocalDefMap, MacroSubNs, crate_def_map,
-        sub_namespace_match,
+        sub_namespace_match, trait_items::trait_item_per_ns,
     },
     per_ns::{PerNs, TypesItem},
     visibility::{RawVisibility, Visibility},
@@ -661,13 +661,33 @@ impl DefMap {
                         ),
                     };
                 }
+                ModuleDefId::TraitId(trait_)
+                    if q.mode == ResolveMode::Import && i + 1 == segments.len() =>
+                {
+                    // `use Trait::item`: an import reads a trait as rustc's module of its
+                    // associated items. Whether the crate may (E0658) is the importer's to
+                    // report. Items the trait's def map cannot list yet bind nothing, and the
+                    // importer reports `ItemsFromMacros`.
+                    let mut res = PerNs::none();
+                    let listed = self.for_each_trait_item_for_import(db, trait_, |name, item| {
+                        if name == *segment {
+                            res = res.or(trait_item_per_ns(item, curr.vis));
+                        }
+                    });
+                    if listed.is_err() {
+                        res = PerNs::none();
+                    }
+                    return ResolvePathResult::new(
+                        res,
+                        ReachedFixedPoint::Yes,
+                        None,
+                        ResolvePathResultPrefixInfo::default(),
+                    );
+                }
                 def => {
                     // could be an inherent method call in UFCS form
                     // (`Struct::method`), or some other kind of associated item, resolved by
                     // type inference.
-                    // FIXME: `use Trait::item` (`import_trait_associated_functions`) needs the
-                    // trait's items while the def map is collected, and collecting them expands
-                    // macros that call back into the def map being computed.
                     return ResolvePathResult::new(
                         PerNs::types(def, curr.vis, curr.import),
                         ReachedFixedPoint::Yes,

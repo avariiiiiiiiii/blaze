@@ -15,7 +15,7 @@ use crate::manifest::{
     Context, EitherManifest, Manifest, WorkspaceConfig, WorkspaceRootConfig, read_manifest,
 };
 use crate::paths::{ancestors, normalize_path};
-use crate::source::SourceId;
+use crate::source;
 
 /// The manifest of the workspace root above `manifest_path`, if one claims it.
 pub(crate) fn find_workspace_root<F: Files>(
@@ -23,7 +23,7 @@ pub(crate) fn find_workspace_root<F: Files>(
     ctx: &Context<F>,
 ) -> anyhow::Result<Option<PathBuf>> {
     find_workspace_root_with_loader(manifest_path, ctx, |self_path| {
-        let source_id = SourceId::for_manifest_path(self_path)?;
+        let source_id = source::for_manifest_path(self_path)?;
         let manifest = read_manifest(self_path, source_id, ctx)?;
         Ok(manifest.workspace_config().get_ws_root(self_path, manifest_path))
     })
@@ -135,7 +135,7 @@ impl<'c, F: Files> Workspace<'c, F> {
 
     fn load(&mut self, manifest_path: &Path) -> anyhow::Result<&EitherManifest> {
         if !self.packages.contains_key(manifest_path) {
-            let source_id = SourceId::for_manifest_path(manifest_path)?;
+            let source_id = source::for_manifest_path(manifest_path)?;
             let manifest = read_manifest(manifest_path, source_id, self.ctx)?;
             self.packages.insert(manifest_path.to_owned(), manifest);
         }

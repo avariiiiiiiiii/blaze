@@ -37,6 +37,17 @@ fn display_unsafety_reason(reason: UnsafetyReason) -> &'static str {
         UnsafetyReason::RawPtrDeref => "dereference of raw pointer",
         UnsafetyReason::MutableStatic => "use of mutable static",
         UnsafetyReason::ExternStatic => "use of extern static",
+        UnsafetyReason::UseOfUnsafeField => "use of unsafe field",
+        UnsafetyReason::InitializingTypeWithUnsafeField => "initializing type with an unsafe field",
+        UnsafetyReason::CallDropExplicitly => "explicit call of a `Drop` method",
+        UnsafetyReason::InitializingTypeWith => {
+            "initializing a type with `#[rustc_layout_scalar_valid_range_*]`"
+        }
+        UnsafetyReason::MutationOfLayoutConstrainedField => "mutation of layout constrained field",
+        UnsafetyReason::BorrowOfLayoutConstrainedField => {
+            "borrow of layout constrained field with interior mutability"
+        }
+        UnsafetyReason::UnsafeBinderCast => "unsafe binder cast",
     }
 }
 

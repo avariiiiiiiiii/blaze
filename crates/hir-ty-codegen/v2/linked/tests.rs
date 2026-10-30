@@ -18,7 +18,7 @@ use db::TestDB;
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(TestDB::with_single_file(text).0));
     let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
-    (db, HirFrontend::new(Databases::new(db), hashes, BuildTime(Default::default())))
+    (db, HirFrontend::new(Databases::new(db), hashes, std::sync::Arc::new(BuildTime(Default::default()))))
 }
 
 #[track_caller]
@@ -88,6 +88,7 @@ fn compiled(key: u8, lines: Vec<Line>) -> CompiledFunction {
         unwind: None,
         lines,
         coverage: None,
+        profile: None,
     }
 }
 

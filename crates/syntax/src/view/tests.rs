@@ -240,6 +240,45 @@ fn either_and_macro_pointers_view_their_nodes() {
 }
 
 #[test]
+fn an_items_written_range_leaves_out_its_attributes_and_comments() {
+    let text = "/// d\n#[a]\n// c\npub fn f() {}";
+    let f = Fixture::new(text);
+    let (_, item) = some(f.nodes::<ast::Fn, view::Fn<'_>>()).remove(0);
+    let start = TextSize::try_from(text.find("pub").unwrap()).unwrap();
+    let end = item.syntax().text_range().end();
+    assert_eq!(view::written_range(item.syntax()), TextRange::new(start, end));
+
+    let range = TextRange::new(TextSize::from(2), TextSize::from(9));
+    let attrs = [(SyntaxKind::ATTR, TextRange::new(TextSize::from(2), TextSize::from(6)))];
+    assert_eq!(view::written_range_of(range, attrs), range);
+
+    let f = Fixture::source();
+    for (h, v) in f.handle().descendants().zip(f.view().descendants()) {
+        let of_handle = view::written_range_of(
+            h.text_range(),
+            h.children_with_tokens().map(|it| (it.kind(), it.text_range())),
+        );
+        assert_eq!(view::written_range(v), of_handle, "{:?}", v.kind());
+    }
+}
+
+#[test]
+fn peel_parens_leaves_the_expression_inside_every_pair() {
+    let f = Fixture::new("fn f() { ((a)); (a).b; (); }");
+    let peeled: Vec<_> = f
+        .view()
+        .descendants()
+        .filter_map(view::ExprStmt::cast)
+        .filter_map(|it| it.expr())
+        .map(|it| it.peel_parens())
+        .collect();
+    let [a, field, unit] = peeled[..] else { panic!("three statements, got {}", peeled.len()) };
+    assert!(matches!(a, view::Expr::PathExpr(_)) && a.syntax().text() == "a");
+    assert!(matches!(field, view::Expr::FieldExpr(_)));
+    assert!(matches!(unit, view::Expr::TupleExpr(_)));
+}
+
+#[test]
 fn names_and_lifetimes() {
     let f = Fixture::source();
     for (h, v) in some(f.nodes::<ast::Name, view::Name<'_>>()) {

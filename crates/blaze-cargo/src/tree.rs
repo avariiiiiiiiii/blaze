@@ -9,6 +9,7 @@ use std::{
     time::SystemTime,
 };
 
+use blaze_mem::scratch;
 use ide_db::{
     RootDatabase, RootDatabaseExt as _,
     base_db::{SourceRoot, SourceRootId, salsa::Durability},
@@ -80,8 +81,10 @@ impl Tree {
 
     /// Whether [`Tree::added`] has directories to list again.
     pub fn relisted(&self, db: &RootDatabase) -> bool {
+        let mut lent = scratch::lend_path();
         self.directories.iter().any(|(path, dir)| {
-            let now = std::fs::metadata(db.on_disk(path)).and_then(|it| it.modified()).ok();
+            db.files().on_disk_into(path, &mut lent);
+            let now = std::fs::metadata(&*lent).and_then(|it| it.modified()).ok();
             now.is_some() && now != dir.listed
         })
     }
@@ -89,11 +92,13 @@ impl Tree {
     /// The source files that are new since the last look. Each is in its source root once
     /// this returns, with no text in it yet.
     pub fn added(&mut self, db: &mut RootDatabase) -> Moved {
+        let mut lent = scratch::lend_path();
         let mut stale: Vec<PathBuf> = self
             .directories
             .iter()
             .filter(|(path, dir)| {
-                let now = std::fs::metadata(db.on_disk(path)).and_then(|it| it.modified()).ok();
+                db.files().on_disk_into(path, &mut lent);
+                let now = std::fs::metadata(&*lent).and_then(|it| it.modified()).ok();
                 now.is_some() && now != dir.listed
             })
             .map(|(path, _)| path.clone())
@@ -103,9 +108,10 @@ impl Tree {
         while let Some(path) = stale.pop() {
             let Some(dir) = self.directories.get_mut(&path) else { continue };
             let root = dir.root;
-            let on_disk = db.on_disk(&path);
-            dir.listed = std::fs::metadata(&on_disk).and_then(|it| it.modified()).ok();
-            let Ok(entries) = std::fs::read_dir(&on_disk) else { continue };
+            db.files().on_disk_into(&path, &mut lent);
+            let on_disk: &Path = &lent;
+            dir.listed = std::fs::metadata(on_disk).and_then(|it| it.modified()).ok();
+            let Ok(entries) = std::fs::read_dir(on_disk) else { continue };
             // A package's directory holds much that is not source: only the directories
             // with source right in them are looked into there.
             let package = on_disk.join("Cargo.toml").exists();
@@ -139,7 +145,9 @@ impl Tree {
                 let file = match known {
                     Some(file) => file,
                     None => {
-                        self.vfs.set_file_contents(vfs_path.clone(), Some(Vec::new()));
+                        self.vfs.set_file_contents_with(vfs_path.clone(), Some(Vec::new()), || {
+                            db.new_file_id().expect("base-db has no file ID left")
+                        });
                         let Some((file, _)) = self.vfs.file_id(&vfs_path) else { continue };
                         db.set_file_text_with_durability(file, "", Durability::LOW);
                         file
@@ -164,13 +172,14 @@ impl Tree {
     /// Whether [`Tree::included`] has files to add: a file that is not on disk, as that of a
     /// module still to be written, is none.
     pub fn includes_more(&self, db: &RootDatabase) -> bool {
+        let mut lent = scratch::lend_path();
         db.included_sources().into_iter().any(|(path, root)| {
             let source_root = db.source_root(root).source_root(db);
             let known = self.vfs.file_id(&VfsPath::from(path.clone()));
-            let on_disk = db.on_disk(path.as_ref());
+            db.files().on_disk_into(path.as_ref(), &mut lent);
             !known.is_some_and(|(file, _)| source_root.path_for_file(&file).is_some())
-                && on_disk.is_file()
-                && self.unread.get(&path).is_none_or(|&was| was != modified(&on_disk))
+                && lent.is_file()
+                && self.unread.get(&path).is_none_or(|&was| was != modified(&lent))
         })
     }
 
@@ -198,6 +207,7 @@ impl Tree {
     }
 
     pub fn included(&mut self, db: &mut RootDatabase) -> Vec<(FileId, PathBuf)> {
+        let mut lent = scratch::lend_path();
         let mut added = Vec::new();
         let mut joined: FxHashMap<SourceRootId, Vec<(FileId, VfsPath)>> = FxHashMap::default();
         for (path, root) in db.included_sources() {
@@ -208,16 +218,18 @@ impl Tree {
             {
                 continue;
             }
-            let on_disk = db.on_disk(path.as_ref());
-            let Ok(text) = std::fs::read_to_string(&on_disk) else {
-                self.unread.insert(path, modified(&on_disk));
+            db.files().on_disk_into(path.as_ref(), &mut lent);
+            let Ok(text) = std::fs::read_to_string(&*lent) else {
+                self.unread.insert(path, modified(&lent));
                 continue;
             };
             self.unread.remove(&path);
-            self.vfs.set_file_contents(vfs_path.clone(), Some(text.clone().into_bytes()));
-            let Some((file, _)) = self.vfs.file_id(&vfs_path) else { continue };
             let durability =
                 if source_root.is_library { Durability::HIGH } else { Durability::LOW };
+            self.vfs.set_file_contents_with(vfs_path.clone(), Some(text.clone().into_bytes()), || {
+                db.new_file_id().expect("base-db has no file ID left")
+            });
+            let Some((file, _)) = self.vfs.file_id(&vfs_path) else { continue };
             db.set_file_text_with_durability(file, &text, durability);
             db.set_file_source_root_with_durability(file, root, durability);
             joined.entry(root).or_default().push((file, vfs_path));

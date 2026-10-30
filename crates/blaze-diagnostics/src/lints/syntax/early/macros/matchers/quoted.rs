@@ -149,7 +149,7 @@ impl Matchers {
     /// The rules of `tokens`, a `macro_rules!` body (rules separated by `;`) or a `macro`'s (by
     /// `,`), as `compile_declarative_macro` takes them: it stops at the first rule it cannot
     /// read on, and a rule it stopped in has what it read of it.
-    pub(super) fn rules(tokens: &Tokens, macro_rules: bool, edition: Edition) -> (Matchers, Vec<Rule>) {
+    pub(super) fn rules(tokens: &Tokens<'_>, macro_rules: bool, edition: Edition) -> (Matchers, Vec<Rule>) {
         // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
         let mut m = Matchers { tts: Vec::new(), vars: Vec::new(), scratch: Vec::new(), edition };
         // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
@@ -210,7 +210,7 @@ impl Matchers {
     }
 
     /// rustc's `parse_one_tt`: `tt` parsed alone.
-    fn one(&mut self, tokens: &Tokens, tt: &Tt, part: Part) -> u32 {
+    fn one(&mut self, tokens: &Tokens<'_>, tt: &Tt, part: Part) -> u32 {
         let tree = self.tree(tokens, tt, &mut Iter::new(&[]), part);
         self.tts.push(tree);
         (self.tts.len() - 1) as u32
@@ -218,7 +218,7 @@ impl Matchers {
 
     /// rustc's `quoted::parse`: the children of a group appended to the arena after those of
     /// the groups in them.
-    fn parse(&mut self, tokens: &Tokens, input: Ids, part: Part) -> Ids {
+    fn parse(&mut self, tokens: &Tokens<'_>, input: Ids, part: Part) -> Ids {
         let mark = self.scratch.len();
         let mut iter = Iter::new(tokens.get(input));
         while let Some(tt) = iter.next() {
@@ -258,7 +258,7 @@ impl Matchers {
     }
 
     /// rustc's `parse_tree`: `tt`, with what follows it in `iter` when it starts a `$..`.
-    fn tree(&mut self, tokens: &Tokens, tt: &Tt, iter: &mut Iter<'_>, part: Part) -> Mtt {
+    fn tree(&mut self, tokens: &Tokens<'_>, tt: &Tt, iter: &mut Iter<'_>, part: Part) -> Mtt {
         let dollar = match *tt {
             Tt::Token(it) if it.is(Punct::Dollar) => it,
             Tt::Token(it) => return Mtt::Token(it),
@@ -296,7 +296,7 @@ impl Matchers {
 
     /// rustc's `MetaVarExpr::parse` of what is in `${..}`: the variables it names, or `None`
     /// where it is an error (and rustc reads the `$` alone, without the braces).
-    fn metavar_expr(&mut self, tokens: &Tokens, input: Ids) -> Option<Ids> {
+    fn metavar_expr(&mut self, tokens: &Tokens<'_>, input: Ids) -> Option<Ids> {
         let mark = self.vars.len();
         let parsed = self.metavar_expr_inner(tokens, input);
         if parsed.is_none() {
@@ -305,7 +305,7 @@ impl Matchers {
         parsed.map(|()| Ids { start: mark as u32, end: self.vars.len() as u32 })
     }
 
-    fn metavar_expr_inner(&mut self, tokens: &Tokens, input: Ids) -> Option<()> {
+    fn metavar_expr_inner(&mut self, tokens: &Tokens<'_>, input: Ids) -> Option<()> {
         let mut iter = Iter::new(tokens.get(input));
         let ident = plain_ident(iter.next())?;
         let Some(Tt::Delimited(Group { delim: Delim::Paren, tts: args, .. })) = iter.next() else { return None };
@@ -428,14 +428,16 @@ fn kleene_op(iter: &mut Iter<'_>, span: TextRange) -> Result<Result<Kleene, Toke
 
 #[cfg(test)]
 mod tests {
-    use syntax::{AstNode, SourceFile, ast};
+    use syntax::{
+        Parse, SourceFile,
+        view::{self as ast, AstNode as _},
+    };
 
     use super::*;
 
-    fn rules(text: &str, edition: Edition) -> (Tokens, Matchers, Vec<Rule>) {
-        let file = SourceFile::parse(text, edition).tree();
-        let def = file.syntax().descendants().find_map(ast::Macro::cast).unwrap();
-        let tokens = Tokens::of(&def, &|_| (edition, true)).unwrap();
+    fn rules(file: &Parse<SourceFile>, edition: Edition) -> (Tokens<'_>, Matchers, Vec<Rule>) {
+        let def = file.root().descendants().find_map(ast::Macro::cast).unwrap();
+        let tokens = Tokens::of(def, &|_| (edition, true)).unwrap();
         let (m, rules) = Matchers::rules(&tokens, matches!(def, ast::Macro::MacroRules(_)), edition);
         (tokens, m, rules)
     }
@@ -451,7 +453,8 @@ mod tests {
 
     #[test]
     fn a_specifier_is_read_in_its_edition() {
-        let (tokens, m, rules) = rules("macro_rules! m { ($p:pat $e:expr) => {}; }", Edition::Edition2018);
+        let file = SourceFile::parse("macro_rules! m { ($p:pat $e:expr) => {}; }", Edition::Edition2018);
+        let (tokens, m, rules) = rules(&file, Edition::Edition2018);
         let tts = lhs_tts(&m, &rules[0]);
         let kinds: Vec<_> = tts
             .iter()
@@ -467,13 +470,15 @@ mod tests {
                 ("e".to_owned(), Frag::Expr2021 { inferred: true }, "$e:expr".to_owned()),
             ]
         );
-        let (_, m, rules) = rules("macro_rules! m { ($p:pat) => {} }", Edition::Edition2021);
+        let file = SourceFile::parse("macro_rules! m { ($p:pat) => {} }", Edition::Edition2021);
+        let (_, m, rules) = rules(&file, Edition::Edition2021);
         assert!(matches!(lhs_tts(&m, &rules[0])[0], Mtt::MetaVarDecl { kind: Frag::PatWithOr, .. }));
     }
 
     #[test]
     fn a_repetition_has_its_separator_and_operator() {
-        let (tokens, m, rules) = rules("macro_rules! m { ($($x:tt),+ $(;)?) => { $($x)* } }", Edition::Edition2021);
+        let file = SourceFile::parse("macro_rules! m { ($($x:tt),+ $(;)?) => { $($x)* } }", Edition::Edition2021);
+        let (tokens, m, rules) = rules(&file, Edition::Edition2021);
         let tts = lhs_tts(&m, &rules[0]);
         let Mtt::Sequence { separator: Some(sep), kleene, .. } = tts[0] else { panic!("{:?}", tts[0]) };
         assert_eq!(tokens.text(sep.range), ",");
@@ -488,19 +493,22 @@ mod tests {
 
     #[test]
     fn rules_stop_where_rustc_stops() {
-        let (_, _, all) = rules("macro_rules! m { () => {}; (a) => {} (b) => {} }", Edition::Edition2021);
+        let file = SourceFile::parse("macro_rules! m { () => {}; (a) => {} (b) => {} }", Edition::Edition2021);
+        let (_, _, all) = rules(&file, Edition::Edition2021);
         assert_eq!(all.len(), 2);
-        let (_, _, all) = rules("macro_rules! m { () => {}; (a) }", Edition::Edition2021);
+        let file = SourceFile::parse("macro_rules! m { () => {}; (a) }", Edition::Edition2021);
+        let (_, _, all) = rules(&file, Edition::Edition2021);
         assert_eq!(all.len(), 2);
         assert!(all[1].lhs.is_some() && all[1].rhs.is_none());
-        let (_, _, all) = rules("macro m { () => {}, (a) => {} }", Edition::Edition2021);
+        let file = SourceFile::parse("macro m { () => {}, (a) => {} }", Edition::Edition2021);
+        let (_, _, all) = rules(&file, Edition::Edition2021);
         assert_eq!(all.len(), 2);
     }
 
     #[test]
     fn a_metavar_expression_names_its_variables() {
-        let (tokens, m, rules) =
-            rules("macro_rules! m { ($($x:tt)*) => { ${count($x)} ${ignore($y)} ${index()} ${bogus($z)} } }", Edition::Edition2021);
+        let file = SourceFile::parse("macro_rules! m { ($($x:tt)*) => { ${count($x)} ${ignore($y)} ${index()} ${bogus($z)} } }", Edition::Edition2021);
+        let (tokens, m, rules) = rules(&file, Edition::Edition2021);
         let Mtt::Delimited { tts, .. } = *m.at(rules[0].rhs.unwrap()) else { panic!() };
         let rhs = get(&m, tts);
         let names: Vec<Vec<&str>> = rhs

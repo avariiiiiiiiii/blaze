@@ -112,7 +112,7 @@ impl Places {
         let mut file = at.file_id;
         while let Some(call) = file.macro_file() {
             let loc = call.loc(cx.db);
-            let node = loc.to_node(cx.db);
+            let node = loc.to_node_view(cx.db);
             inner.push(match loc.kind {
                 MacroCallKind::Derive { .. } => {
                     let adt = node.value.parent().map_or(node.value.text_range(), |it| it.text_range());

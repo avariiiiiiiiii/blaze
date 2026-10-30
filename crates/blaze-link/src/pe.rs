@@ -37,6 +37,8 @@ use crate::model::{
 };
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
+pub(crate) use coff::asked_libraries;
+
 /// Where link.exe loads an executable and a DLL when the loader does not move them.
 const EXE_BASE: u64 = 0x1_4000_0000;
 const DLL_BASE: u64 = 0x1_8000_0000;

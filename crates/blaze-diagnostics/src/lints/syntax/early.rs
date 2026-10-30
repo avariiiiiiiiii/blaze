@@ -29,7 +29,7 @@ pub(crate) mod validation;
 use hir::{HirFileId, InFile};
 use rustc_hash::FxHashMap;
 use span::SyntaxContext;
-use syntax::{SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange};
+use syntax::{SyntaxKind, SyntaxNodePtr, TextRange, view as ast};
 
 use crate::{
     cx::Cx,
@@ -42,7 +42,7 @@ use crate::{
 /// those apart). Each node is read once; each part dispatches on its kind with a `match`.
 /// What is not of the nodes goes apart: the lexer over each file's text, expansions once per
 /// tree, `unused_labels` over each body's expression column.
-pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
+pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Emitted> {
     let mut out = lexer::lints(cx, walk);
     let expansions = Expansions::of(cx, walk);
     let mut builtin = builtin::Builtin::new(cx, &expansions);
@@ -52,7 +52,7 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
     for (index, tree) in walk.trees.iter().enumerate() {
         let index = index as u32;
         builtin.tree(cx, tree, &mut out);
-        for (node, &kind) in tree.nodes.iter().zip(&tree.kinds) {
+        for (&node, &kind) in tree.nodes.iter().zip(&tree.kinds) {
             builtin.node(cx, walk, tree, node, kind, &mut out);
             validation.node(cx, tree, index, node, &mut out);
             if matches!(kind, SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF) {
@@ -94,23 +94,47 @@ pub(crate) fn allows_unsafe(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) 
 /// The trees of the walk by the macro call (or the item or attribute of an attribute macro or
 /// derive) they are the expansion of: one FxHash probe per lookup, built once per crate with
 /// its size known.
-pub(crate) struct Expansions<'w> {
-    by_call: FxHashMap<InFile<SyntaxNodePtr>, &'w Tree>,
+pub(crate) struct Expansions<'w, 'db> {
+    by_call: FxHashMap<InFile<SyntaxNodePtr>, &'w Tree<'db>>,
 }
 
-impl<'w> Expansions<'w> {
-    pub(crate) fn of(cx: &Cx<'_, '_>, walk: &'w Walk<'_>) -> Expansions<'w> {
+impl<'w, 'db> Expansions<'w, 'db> {
+    pub(crate) fn of(cx: &Cx<'_, '_>, walk: &'w Walk<'db>) -> Expansions<'w, 'db> {
         let mut by_call = FxHashMap::with_capacity_and_hasher(walk.trees.len(), Default::default());
         for tree in &walk.trees {
             let Some(call) = tree.call else { continue };
-            let node = call.loc(cx.db).to_node(cx.db);
-            by_call.insert(node.map(|it| SyntaxNodePtr::new(&it)), tree);
+            let node = call.loc(cx.db).to_node_view(cx.db);
+            by_call.insert(node.map(ast::ptr), tree);
         }
         Expansions { by_call }
     }
 
     /// The tree `call` of `file` expands to, if the walk has it.
-    pub(crate) fn of_call(&self, file: HirFileId, call: &SyntaxNode) -> Option<&'w Tree> {
-        self.by_call.get(&InFile::new(file, SyntaxNodePtr::new(call))).copied()
+    pub(crate) fn of_call(&self, file: HirFileId, call: ast::Node<'_>) -> Option<&'w Tree<'db>> {
+        self.by_call.get(&InFile::new(file, ast::ptr(call))).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// On a crate with nothing to lint, the walk over every node of every tree allocates
+    /// nothing per node: what the pass allocates, less what `unused_labels` does (the crate's
+    /// list of bodies, from hir-def's `every_body`), is the same whatever the crate's size.
+    #[test]
+    fn the_walk_allocates_nothing_per_node() {
+        let used = |fns: usize| {
+            let mut used = None;
+            crate::lints::with_cx(&crate::lints::quiet_crate(fns), &[], |cx| {
+                let walk = cx.walk();
+                assert!(super::lints(cx, walk).is_empty());
+                let (found, all) = blaze_alloc_count::measure(|| super::lints(cx, walk));
+                assert!(found.is_empty());
+                let (_, labels) = blaze_alloc_count::measure(|| super::labels::unused(cx));
+                used = Some(all.allocations - labels.allocations);
+            });
+            used.unwrap()
+        };
+        let (small, large) = (used(4), used(400));
+        assert_eq!(small, large, "the early pass's allocations do not grow with the crate");
     }
 }

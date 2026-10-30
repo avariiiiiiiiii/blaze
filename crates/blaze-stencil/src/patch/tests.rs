@@ -22,7 +22,7 @@ use crate::{
     arch::{Area, Cx, Glue},
     code::{self, Code},
     enc::{self, Form},
-    shape::{self, Dst, IntCc, Isa, Op, Shape, Src, Ty},
+    shape::{self, Disp, Dst, IntCc, Isa, Op, Shape, Src, Ty},
     table::format::{Hole, HoleKind, Reader, Variant, Writer},
 };
 
@@ -83,9 +83,13 @@ const RELAY: u8 = 0x4e;
 const STUB: [u8; 2] = [0x0f, 0x0b];
 
 /// The ops the mock library has every shape of.
-const OPS: [Op; 22] = [
+const OPS: [Op; 26] = [
     Op::Load,
     Op::Store,
+    Op::LoadConfined,
+    Op::StoreConfined,
+    Op::Ireduce,
+    Op::Uextend,
     Op::Snarrow,
     Op::SwidenLow,
     Op::Copy,
@@ -128,7 +132,8 @@ fn fields(shape: Shape) -> Vec<(HoleKind, Form)> {
             }
         }
     }
-    if matches!(shape.op, Op::Load | Op::Store | Op::StackAddr) {
+    let displaced = shape.confined().is_some_and(|(_, disp)| disp != Disp::Zero);
+    if matches!(shape.op, Op::Load | Op::Store | Op::StackAddr) || displaced {
         out.push((HoleKind::Offset, Form::Abs32S));
     }
     if matches!(shape.dst, Dst::Slot | Dst::Both) {
@@ -173,7 +178,8 @@ fn build(keep: impl Fn(Shape) -> bool) -> Vec<u8> {
     shape::each_on(Isa::X86_64, |shape| {
         if keep(shape) {
             let (code, holes) = stencil(shape);
-            let faults: &[u16] = if matches!(shape.op, Op::Load | Op::Store) { &[FAULT] } else { &[] };
+            let access = matches!(shape.op, Op::Load | Op::Store | Op::LoadConfined | Op::StoreConfined);
+            let faults: &[u16] = if access { &[FAULT] } else { &[] };
             writer.push_with_faults(shape, &code, 5, &holes, faults).unwrap();
         }
     });
@@ -261,6 +267,10 @@ impl Glue for Mock {
 
     fn slot_base(_: &Frame) -> (u16, i32) {
         (6, -16)
+    }
+
+    fn frame_size(_: &Frame) -> u32 {
+        0
     }
 }
 
@@ -1101,4 +1111,139 @@ fn compiling_the_same_function_twice_gives_the_same_code() {
     let fresh = compile(&mut Scratch::new(), &func);
     assert_eq!(first, again);
     assert_eq!(first, fresh);
+}
+
+/// The values of a confined access's address, in the order [`confined`] makes them.
+const SUM: usize = 0;
+const REDUCE: usize = 1;
+const EXTEND: usize = 2;
+const ADDRESS: usize = 3;
+
+/// A load (or a store of `x`) at `offset` from `iadd vmctx, uextend.i64 (ireduce.i32 sum)`, `sum`
+/// being `iadd p, iconst off` or, without `off`, `p`, of the parameters `[p, vmctx, x]`. The
+/// value `again` names is returned too, a second use. The address's values go to `parts`.
+fn confined(
+    off: Option<i64>,
+    offset: i32,
+    store: bool,
+    again: Option<usize>,
+    parts: &mut Vec<ir::Value>,
+) -> ir::Function {
+    let mut returns = Vec::new();
+    if !store {
+        returns.push(types::I64);
+    }
+    returns.extend(again.map(|n| if n == REDUCE { types::I32 } else { types::I64 }));
+    function(&[types::I64; 3], &returns, |b, p| {
+        let flags = ir::MemFlagsData::new().with_trap_code(Some(TrapCode::HEAP_OUT_OF_BOUNDS));
+        let sum = match off {
+            Some(off) => {
+                let k = b.ins().iconst(types::I64, off);
+                b.ins().iadd(p[0], k)
+            }
+            None => p[0],
+        };
+        let reduce = b.ins().ireduce(types::I32, sum);
+        let extend = b.ins().uextend(types::I64, reduce);
+        let address = b.ins().iadd(p[1], extend);
+        let mut results = Vec::new();
+        if store {
+            b.ins().store(flags, p[2], address, offset);
+        } else {
+            results.push(b.ins().load(types::I64, flags, address, offset));
+        }
+        *parts = vec![sum, reduce, extend, address];
+        results.extend(again.map(|n| parts[n]));
+        b.ins().return_(&results);
+    })
+}
+
+#[test]
+fn a_confined_access_is_one_stencil_of_its_address_and_access() {
+    let wraps = (1i64 << 32) + 5;
+    for (off, disp, offset) in [
+        (None, Disp::Zero, None),
+        (Some(0), Disp::Zero, None),
+        (Some(16), Disp::Imm32, Some(16)),
+        (Some(-8), Disp::Imm32, Some(-8)),
+        (Some(wraps), Disp::Imm32, Some(5)),
+    ] {
+        for store in [false, true] {
+            let mut parts = Vec::new();
+            let func = confined(off, 0, store, None, &mut parts);
+            let mut scratch = Scratch::new();
+            let code = compile(&mut scratch, &func);
+            let s = stencils(&decode(&code));
+            assert_eq!(s.len(), 1, "{func}");
+            let access = if store { Op::Store } else { Op::Load };
+            assert_eq!(s[0].shape.confined(), Some((access, disp)), "{func}");
+            let p = func.dfg.block_params(func.layout.entry_block().unwrap()).to_vec();
+            let operands = if store { vec![p[2], p[0], p[1]] } else { vec![p[0], p[1]] };
+            for (kind, value) in [HoleKind::Slot0, HoleKind::Slot1, HoleKind::Slot2].into_iter().zip(operands) {
+                assert_eq!(s[0].field(kind), place(&scratch, value), "{func}");
+            }
+            let hole = s[0].fields.iter().find(|it| it.0 == HoleKind::Offset).map(|it| it.1);
+            assert_eq!(hole, offset, "the offset wrapped to 32 bits: {func}");
+            for value in &parts[usize::from(off.is_none())..] {
+                assert_eq!(scratch.plan.sels[inst_of(&func, *value).as_u32() as usize].kind, Kind::Fused);
+            }
+            assert_eq!(
+                code.traps,
+                [(s[0].at + u32::from(FAULT), TrapCode::HEAP_OUT_OF_BOUNDS)],
+                "the access's fault keeps its code: {func}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_confined_access_is_apart_when_it_has_an_offset_or_a_value_of_its_address_another_use() {
+    let ops = |code: &Code| stencils(&decode(code)).iter().map(|it| it.shape.op).collect::<Vec<_>>();
+    let mut parts = Vec::new();
+    let mut apart = [Op::Iadd, Op::Ireduce, Op::Uextend, Op::Iadd, Op::Load];
+    let func = confined(Some(16), 8, false, None, &mut parts);
+    assert_eq!(ops(&compile(&mut Scratch::new(), &func)), apart, "{func}");
+    for again in [REDUCE, EXTEND, ADDRESS] {
+        let func = confined(Some(16), 0, false, Some(again), &mut parts);
+        assert_eq!(ops(&compile(&mut Scratch::new(), &func)), apart, "{func}");
+    }
+
+    let func = confined(Some(16), 0, false, Some(SUM), &mut parts);
+    let s = stencils(&decode(&compile(&mut Scratch::new(), &func)));
+    assert_eq!(s.iter().map(|it| it.shape.op).collect::<Vec<_>>(), [Op::Iadd, Op::LoadConfined]);
+    assert_eq!(s[1].shape.confined(), Some((Op::Load, Disp::Zero)), "the sum, used again, is `p`");
+
+    static UNFUSED: OnceLock<Vec<u8>> = OnceLock::new();
+    let bytes = UNFUSED.get_or_init(|| build(|shape| OPS.contains(&shape.op) && shape.confined().is_none()));
+    let library = Reader::new(bytes).unwrap();
+    for store in [false, true] {
+        apart[4] = if store { Op::Store } else { Op::Load };
+        let func = confined(Some(16), 0, store, None, &mut parts);
+        let code = try_compile(&mut Scratch::new(), &func, &library).unwrap();
+        assert_eq!(ops(&code), apart, "without the fused shape: {func}");
+    }
+}
+
+#[test]
+fn a_confined_access_keeps_its_operands_live_to_itself() {
+    let mut values = Vec::new();
+    let func = function(&[types::I64; 3], &[types::I64, types::I64], |b, p| {
+        let sum = b.ins().iadd(p[0], p[2]);
+        let reduce = b.ins().ireduce(types::I32, sum);
+        let extend = b.ins().uextend(types::I64, reduce);
+        let address = b.ins().iadd(p[1], extend);
+        let y = b.ins().imul(p[2], p[2]);
+        let z = b.ins().iadd(y, y);
+        let v = b.ins().load(types::I64, ir::MemFlagsData::new(), address, 0);
+        b.ins().return_(&[v, z]);
+        values = vec![sum, y, z];
+    });
+    let mut scratch = Scratch::new();
+    let s = stencils(&decode(&compile(&mut scratch, &func)));
+    assert_eq!(s.last().unwrap().shape.confined(), Some((Op::Load, Disp::Zero)));
+    let [sum, y, z] = values[..] else { unreachable!() };
+    assert_eq!(s.last().unwrap().field(HoleKind::Slot0), place(&scratch, sum));
+    for later in [y, z] {
+        assert_ne!(slot_of(&scratch, later), slot_of(&scratch, sum), "{later} took the slot of `p`");
+    }
 }

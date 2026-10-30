@@ -31,8 +31,23 @@ Design notes for [the db lane](../db.md), as written on 2026-10-29. The code is
   time; closing one retires its tables.
 - Inputs are the only per-view queries: `FILE` (the file's content ID), `DIR` (the hash of its
   sorted names, not of what is under it), `CONFIG` (the bytes the view was opened with). The
-  database reads them through a `Tree` (`file`, `list`), a pure function of a root that the VFS
-  implements over its immutable nodes (`blaze_vfs::Reader`).
+  database reads them through a `Tree` (`file`, `read_dir`), a pure function of a root that the
+  VFS implements over its immutable nodes (`blaze_vfs::Reader`). `read_dir` lends a
+  directory's names sorted, and the database hashes them as lent, stopping (naming the root
+  and directory) at a name out of order. A view keeps a directory's names only once one of
+  its queries reads them (`Cx::dir`), so verifying an edge to a directory copies nothing.
+- A view opened is sized like the view opened last, if still open: each shard of its result
+  and input tables gets a table that holds as many entries as that view's shard does, so a
+  view of the same tree resolves and verifies with no table grown and nothing allocated
+  (`verifying_in_a_new_view_of_the_same_tree_allocates_nothing`,
+  blaze-units' `a_warm_load_allocates_nothing`).
+- A query reaches what is no input (a code generator's front end and backends, the daemon's
+  memo of templates) through `Cx::context::<T>()`, which the database's owner gave with
+  `Database::provide`, one value a type. No edge records it, so a context must change no
+  value; what does (a build's policy) goes in the key or the view's configuration.
+- A database view is not a VFS view: the daemon opens one per build configuration of a VFS
+  view and keeps a root's last one open past its VFS view (the last plan, and `Request::Why`
+  through the session's `kept`), so the database names its views itself.
 - What-if views (#276) are views of roots the VFS made without moving a head; best-of-N is N of
   them at once, sharing every memo whose inputs are equal.
 
@@ -87,6 +102,13 @@ again.
 - `evict(key)` drops values kept elsewhere (compiled code once it is in the store): the
   fingerprint and edges stay, so cutoff still works, and a value asked for again is made again
   and must have its fingerprint, or the query is named as not deterministic.
+- A kind with `Query::SHARE` keeps equal values once, whichever view or key made them: a memo
+  of a value with the same schema and fingerprint as one already kept (its bytes compared; a
+  mismatch panics naming the query) names the same value row. A shared row counts the memos
+  naming it. Evicting, moving to a cold pack or freeing one memo lets go of its count and keeps
+  the others' value. A collection retires a shared row once no memo names it. Other kinds pay
+  nothing. A cold pack and the image write each distinct value once, for every kind, and every
+  memo of it maps that one copy.
 - Nothing a reader may hold is freed under it. Every reference the database hands out borrows a
   task's `blaze_reclaim::Guard`: `Cx` carries its task's guard, and outside a query
   `Database::pin()` gives a `Pinned` that holds one. A row, table, value, memo or view let go of
@@ -143,6 +165,18 @@ no hash.
   segment's hold count carries a bias that its lane settles with its own count at seal.
 - Collection marks memos in bitsets sized by the store's IDs, not hash sets, and a cold pack
   is checked against the value still in memory by a `memcmp`, not a second hash.
+- The hot line's copy is a seqlock rewritten after each swap of the word. The swap's
+  compare-and-swap, the rewriter's load of `seen`, its store of `seen` and its reload of the
+  word are SeqCst: under acquire and release, a second swap that sees the copy being rewritten
+  and the rewriter's reload could both read the old value (store buffering), and the copy would
+  stay stale until the next swap.
+- The crate's synchronization types come from `sync.rs`: `std`'s, or under `--cfg blaze_check`
+  the model checker's ([safety/model.md](../safety/model.md)), and segments report each copy,
+  read and free of their bytes to it. Model tests (`model_*`, in `table/tests.rs`,
+  `memo/tests.rs` and `tests.rs`) check `Map` growth and update, `Column` pushes, the value
+  word's evict / refill / cold-write swaps and the inline copy, segment holds and sealing,
+  `add_memo` racing `collect` (a key given a memo after the bump keeps it), and `INSIDE` per
+  thread.
 - Per-component bounds and how far off each is: [speed-of-light.md](speed-of-light.md),
   "blaze-query".
 
@@ -192,7 +226,8 @@ Nothing has been built or measured yet. These are design comparisons, to be chec
   thread), and the store then copies it into its segment, so a value is written once and
   copied once. `QueryKey::task_key` hashes the key for the
   plane's single flight, once per miss. An input's `Tree::file` gives the VFS's own `Bytes`
-  (its `Arc`, or its range of the mapped image), one count per file per view.
+  (its `Arc`, or its range of the mapped image), one count per file per view: a view's bytes
+  are kept owned because a database view can outlive the VFS view it was opened for.
 
 ## The daemon image and the settle swap
 

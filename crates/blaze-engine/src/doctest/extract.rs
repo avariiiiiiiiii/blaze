@@ -3,10 +3,13 @@
 
 use std::path::PathBuf;
 
-use hir::{Adt, AssocItem, HasAttrs, HasSource, Module, ModuleDef};
+use hir::{Adt, AssocItem, HasAttrs, Module, ModuleDef, view::HasSourceView as _};
 use ide_db::{RootDatabase, rust_doc::is_rust_fence};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
-use syntax::{AstNode, SyntaxKind, TextRange, TextSize, ast::HasName};
+use syntax::{
+    SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode as _, AstToken as _, HasName as _},
+};
 
 /// One code block of the documentation that is a test.
 pub(crate) struct Example {
@@ -141,7 +144,7 @@ impl Found<'_> {
         // rustdoc tests the examples of a `use` once, under the name it brings in, or under
         // none for a list or a glob (rustdoc of nightly-2026-10-25).
         for it in module.use_decls(db) {
-            let name = it.source(db).value.use_tree().and_then(|tree| use_name(&tree));
+            let name = it.source_view(db).value.use_tree().and_then(use_name);
             self.documented(it, &name.map_or_else(|| path.to_owned(), |name| join(path, name)));
         }
         for it in module.extern_crate_decls(db) {
@@ -149,9 +152,9 @@ impl Found<'_> {
             self.documented(it, &join(path, name.as_ref().map_or("_", |it| it.as_str())));
         }
         for it in module.impl_defs(db) {
-            let Some(source) = it.source(db) else { continue };
+            let Some(source) = it.source_view(db) else { continue };
             let Some(ty) = source.value.self_ty() else { continue };
-            let path = join(path, shown_type(&ty));
+            let path = join(path, shown_type(ty));
             self.documented(it, &path);
             self.items(it.items(db), &path);
         }
@@ -232,7 +235,7 @@ impl Found<'_> {
             return self.included_line(docs, block.start, pat);
         };
         let db = self.db;
-        let tree = range.file_id.parse_or_expand(db);
+        let tree = range.file_id.root(db);
         let token = tree.token_at_offset(range.value.start()).right_biased()?;
         // What rustdoc looks in: the comment or string as it is written, where a macro is used
         // for what a macro wrote.
@@ -255,12 +258,12 @@ impl Found<'_> {
     fn included_line(&self, docs: &hir::Docs, start: usize, pat: &str) -> Option<usize> {
         let mut calls = docs.macro_calls();
         let (call, id) = calls.next()?;
-        if calls.next().is_some() || included(&call.to_in_file_node(self.db).value).is_none() {
+        if calls.next().is_some() || included(call.to_view(self.db)).is_none() {
             return None;
         }
-        let expansion = hir::HirFileId::from(id).parse_or_expand(self.db);
+        let expansion = hir::HirFileId::from(id).root(self.db);
         let mut tokens = expansion.descendants_with_tokens().filter_map(|it| it.into_token());
-        let file = tokens.find_map(<syntax::ast::String as syntax::AstToken>::cast)?;
+        let file = tokens.find_map(ast::String::cast)?;
         let file = file.value().ok()?;
         let text = docs.docs();
         let at = if text.trim_end() == file.trim_end() { start } else { found_once(&file, pat)? };
@@ -275,7 +278,7 @@ impl Found<'_> {
         starts.into_iter().all(|at| {
             let at = TextRange::empty(TextSize::new(at as u32));
             let Some((range, _)) = docs.find_ast_range(at) else { return false };
-            let tree = range.file_id.parse_or_expand(self.db);
+            let tree = range.file_id.root(self.db);
             let comment = [SyntaxKind::OUTER_DOC_COMMENT, SyntaxKind::INNER_DOC_COMMENT];
             tree.token_at_offset(range.value.start()).any(|it| comment.contains(&it.kind()))
         })
@@ -298,9 +301,10 @@ impl Found<'_> {
         }
         // The text starts with what a macro wrote, like `include_str!`.
         let (call, _) = docs.macro_calls().next()?;
-        let call = call.to_in_file_node(self.db);
-        let included = self.whole_files.then(|| included(&call.value)).flatten();
-        let call = call.syntax().original_file_range_rooted(self.db);
+        let call = hir::InFile::new(call.file_id, call.to_view(self.db));
+        let included = self.whole_files.then(|| included(call.value)).flatten();
+        let call = call.map(|it| it.syntax().text_range());
+        let call = call.original_node_file_range_rooted(self.db);
         if let Some(included) = included {
             // From edition 2024 the text of a file that is included is in that file, and the
             // lines are its lines. When the documentation ends in a comment or an attribute
@@ -313,8 +317,8 @@ impl Found<'_> {
             let path = self.path(call.file_id.file_id(self.db))?;
             return Some((path.parent()?.join(included), 1));
         }
-        let tree = call.file_id.parse(self.db).syntax_node();
-        let attr = tree.covering_element(call.range).ancestors();
+        let parse = call.file_id.parse(self.db);
+        let attr = parse.root().covering_element(call.range).ancestors();
         let attr = attr.into_iter().find(|it| it.kind() == SyntaxKind::ATTR);
         let start = attr.map_or(call.range, |it| it.text_range()).start();
         self.line_of(call.file_id, start)
@@ -325,10 +329,10 @@ impl Found<'_> {
     fn written(&self, docs: &hir::Docs, range: TextRange) -> Option<(PathBuf, usize)> {
         let db = self.db;
         let (range, _) = docs.find_ast_range(range)?;
-        let tree = range.file_id.parse_or_expand(db);
+        let tree = range.file_id.root(db);
         let token = tree.token_at_offset(range.value.start()).right_biased()?;
         // What a macro wrote of its own is where the macro is used, as rustdoc has it.
-        let written = hir::InFile::new(range.file_id, token.clone()).original_file_range(db);
+        let written = hir::InFile::new(range.file_id, token).original_file_range(db);
         let attr = token.parent_ancestors().find(|it| it.kind() == SyntaxKind::ATTR);
         // Before edition 2024 an attribute a macro wrote around what it was given is where
         // the macro is used, whatever line what is in it was written on.
@@ -358,59 +362,60 @@ fn found_once(text: &str, pat: &str) -> Option<usize> {
 }
 
 /// The file an `include_str!("file")` names, as it is written.
-fn included(call: &syntax::ast::MacroCall) -> Option<String> {
+fn included(call: ast::MacroCall<'_>) -> Option<String> {
     let includes = call.path()?.segment()?.name_ref().is_some_and(|it| it.text() == "include_str");
     let mut tokens = call.token_tree()?.syntax().descendants_with_tokens();
-    let file =
-        tokens.find_map(|it| <syntax::ast::String as syntax::AstToken>::cast(it.into_token()?))?;
+    let file = tokens.find_map(|it| ast::String::cast(it.into_token()?))?;
     includes.then(|| file.value().ok().map(|it| it.into_owned())).flatten()
 }
 
 /// The name a `use` is tested under: the one it brings its path in as, and none for a list
 /// or a glob.
-fn use_name(tree: &syntax::ast::UseTree) -> Option<String> {
+fn use_name(tree: ast::UseTree<'_>) -> Option<String> {
     if tree.use_tree_list().is_some() || tree.star_token().is_some() {
         return None;
     }
     if let Some(rename) = tree.rename() {
         return Some(rename.name().map_or("_".to_owned(), |it| it.text().to_owned()));
     }
-    tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string())
+    // alloc: the name an example is listed under, once per documented `use`
+    tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_owned())
 }
 
 fn is_macro_rules(db: &RootDatabase, it: hir::Macro) -> bool {
-    let source = it.source(db).and_then(|it| it.value.left());
-    matches!(source, Some(syntax::ast::Macro::MacroRules(_)))
+    let source = it.source_view(db).and_then(|it| it.value.left());
+    matches!(source, Some(ast::Macro::MacroRules(_)))
 }
 
 /// Whether the macro is one of the items of the module as they are written: its own, or of a
 /// macro that is used there.
 fn is_written_in(db: &RootDatabase, it: hir::Macro, module: Module) -> bool {
-    let Some(source) = it.source(db) else { return false };
-    let written = source.syntax().original_file_range_rooted(db);
-    let tree = written.file_id.parse(db).syntax_node();
-    let around = tree.covering_element(written.range).ancestors();
-    let inline = around.into_iter().find_map(syntax::ast::Module::cast);
+    use hir::view::ModuleSourceView;
+    let Some(source) = it.source_view(db) else { return false };
+    let written = source.map(|it| it.syntax().text_range()).original_node_file_range_rooted(db);
+    let parse = written.file_id.parse(db);
+    let around = parse.root().covering_element(written.range).ancestors();
+    let inline = around.into_iter().find_map(ast::Module::cast);
     let inline = inline.map(|it| it.syntax().text_range());
-    let module = module.definition_source(db);
+    let module = module.definition_source_view(db);
     module.file_id == hir::HirFileId::from(written.file_id)
-        && match &module.value {
-            hir::ModuleSource::SourceFile(_) => inline.is_none(),
-            hir::ModuleSource::Module(it) => inline == Some(it.syntax().text_range()),
-            hir::ModuleSource::BlockExpr(_) => false,
+        && match module.value {
+            ModuleSourceView::SourceFile(_) => inline.is_none(),
+            ModuleSourceView::Module(it) => inline == Some(it.syntax().text_range()),
+            ModuleSourceView::BlockExpr(_) => false,
         }
 }
 
 /// The type an `impl` is of as rustdoc names it: as the compiler writes it out, where a
 /// reference has its lifetime even when none is written, and with no spaces.
-fn shown_type(ty: &syntax::ast::Type) -> String {
+fn shown_type(ty: ast::Type<'_>) -> String {
     let mut shown = String::new();
     for token in ty.syntax().descendants_with_tokens().filter_map(|it| it.into_token()) {
         if token.kind().is_trivia() {
             continue;
         }
         shown.push_str(token.text());
-        let reference = token.parent().and_then(syntax::ast::RefType::cast);
+        let reference = token.parent().and_then(ast::RefType::cast);
         if token.kind() == SyntaxKind::AMP && reference.is_some_and(|it| it.lifetime().is_none()) {
             shown.push_str("'_");
         }
@@ -505,9 +510,9 @@ mod tests {
     fn type_of_an_impl_as_rustdoc_names_it() {
         let shown = |ty: &str| {
             let file = format!("impl<'a, R> T for {ty} {{}}");
-            let file = syntax::ast::SourceFile::parse(&file, syntax::Edition::CURRENT).tree();
-            let found = file.syntax().descendants().find_map(syntax::ast::Impl::cast);
-            shown_type(&found.and_then(|it| it.self_ty()).unwrap())
+            let parse = syntax::SourceFile::parse(&file, syntax::Edition::CURRENT);
+            let found = parse.root().descendants().find_map(ast::Impl::cast);
+            shown_type(found.and_then(|it| it.self_ty()).unwrap())
         };
         assert_eq!(shown("&mut Deserializer<R>"), "&'_mutDeserializer<R>");
         assert_eq!(shown("&'a Map<K, V>"), "&'aMap<K,V>");

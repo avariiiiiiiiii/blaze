@@ -27,10 +27,7 @@ use hir_ty::{
 use intern::Symbol;
 use rustc_type_ir::inherent::IntoKind;
 use std::sync::OnceLock;
-use syntax::{
-    AstNode, SyntaxNode,
-    ast,
-};
+use syntax::view::{self as ast, AstNode as _};
 
 use crate::{lints::bodies::BodyCx, model::Span};
 
@@ -139,8 +136,8 @@ pub(crate) fn ty_adjusted<'db>(b: &BodyCx<'_, 'db>, expr: ExprId) -> Ty<'db> {
 }
 
 /// The syntax `expr` is written as, parsed or expanded.
-pub(crate) fn syntax(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<InFile<SyntaxNode>> {
-    Some(b.cx.syntax(b.expr_node(expr)?))
+pub(crate) fn syntax<'db>(b: &BodyCx<'_, 'db>, expr: ExprId) -> Option<InFile<ast::Node<'db>>> {
+    Some(b.cx.syntax_view(b.expr_node(expr)?))
 }
 
 /// [`BodyCx::expr_span`], parentheses included.
@@ -153,7 +150,7 @@ pub(crate) fn span(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
 pub(crate) fn print_ty<'db>(b: &BodyCx<'_, 'db>, near: ExprId, ty: Ty<'db>) -> Option<String> {
     let node = syntax(b, near)?;
     let expr = ast::Expr::cast(node.value)?;
-    let of = b.cx.sema.type_of_expr(&expr)?.original;
+    let of = b.cx.vsema.type_of_expr(expr)?.original;
     Some(b.cx.ty(&of.derived_from_next_solver(ty)))
 }
 

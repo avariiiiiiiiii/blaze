@@ -2,11 +2,13 @@
 
 mod ast_validation;
 mod attrs;
+mod crate_attr;
 mod defs;
 mod features;
 mod generics;
 mod impls;
 mod krate;
+mod lifetimes;
 mod macros;
 mod names;
 mod parse;

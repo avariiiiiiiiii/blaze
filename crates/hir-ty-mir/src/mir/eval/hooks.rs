@@ -2,7 +2,7 @@
 //! evaluation reads the pointers it goes through), each hook's `Stop` made the evaluator's
 //! error.
 
-use std::{cell::UnsafeCell, ops::Range};
+use std::{cell::RefCell, ops::Range};
 
 use super::machine::{
     Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Ptr, RetagMode, Site, Stop, TypedCx,
@@ -15,13 +15,18 @@ fn stopped<'db, T>(it: MResult<T>) -> Result<'db, T> {
     it.map_err(|Stop| MirEvalError::MachineStop)
 }
 
-/// The machine, behind the evaluator's shared borrows. Each method calls one hook and hands
-/// out no reference to the machine, so no two `&mut M` are ever live at once.
-pub(super) struct Hooks<M>(UnsafeCell<M>);
+/// The machine, behind the evaluator's shared borrows. Each method borrows it for one hook and
+/// hands out no reference to it; a hook that reached `Hooks` again would panic on the borrow.
+/// Without `M::CHECKS` (only [`super::machine::Plain`], whose hooks are empty) the hooks that
+/// return nothing the evaluator uses don't touch the cell, so a run without the checker pays
+/// no borrow flag; `alloc`, `read` and `atomic_load` are called only under `M::CHECKS`, and
+/// `schedule` only with a second thread. Const eval's machine
+/// (`super::provenance::Provenance`) checks, so it pays one flag per hook.
+pub(super) struct Hooks<M>(RefCell<M>);
 
 impl<M> Hooks<M> {
     pub(super) fn new(machine: M) -> Self {
-        Hooks(UnsafeCell::new(machine))
+        Hooks(RefCell::new(machine))
     }
 
     pub(super) fn into_inner(self) -> M {
@@ -30,18 +35,25 @@ impl<M> Hooks<M> {
 
     #[inline(always)]
     fn with<R>(&self, f: impl FnOnce(&mut M) -> R) -> R {
-        // SAFETY: `Hooks` is `!Sync` (it holds an `UnsafeCell`), so only this thread reaches
-        // the machine. The `&mut M` lives only for `f`, which every caller below makes one
-        // call of a `Machine` hook: a hook gets only `&mut M` and so cannot reach this
-        // `Hooks` (the evaluator owns it), and nothing here calls `with` while one is running.
-        f(unsafe { &mut *self.0.get() })
+        f(&mut *self.0.borrow_mut())
     }
 }
 
 impl<'db, M: Machine<'db>> Hooks<M> {
+    /// A hook that returns nothing: skipped without `M::CHECKS`.
+    #[inline(always)]
+    fn unit(&self, f: impl FnOnce(&mut M) -> MResult<()>) -> Result<'db, ()> {
+        match M::CHECKS {
+            true => stopped(self.with(f)),
+            false => Ok(()),
+        }
+    }
+
     #[inline(always)]
     pub(super) fn step(&self, at: Site<'db>) {
-        self.with(|m| m.step(at))
+        if M::CHECKS {
+            self.with(|m| m.step(at))
+        }
     }
     #[inline(always)]
     pub(super) fn alloc(
@@ -62,11 +74,14 @@ impl<'db, M: Machine<'db>> Hooks<M> {
         align: Option<u64>,
         kind: MemKind,
     ) -> Result<'db, ()> {
-        stopped(self.with(|m| m.free(ptr, size, align, kind)))
+        self.unit(|m| m.free(ptr, size, align, kind))
     }
     #[inline(always)]
     pub(super) fn root(&self, addr: u64) -> Option<M::Prov> {
-        self.with(|m| m.root(addr))
+        match M::CHECKS {
+            true => self.with(|m| m.root(addr)),
+            false => None,
+        }
     }
     #[inline(always)]
     pub(super) fn read(
@@ -87,7 +102,7 @@ impl<'db, M: Machine<'db>> Hooks<M> {
         access: Access,
         shadow: &M::Shadow,
     ) -> Result<'db, ()> {
-        stopped(self.with(|m| m.write(ptr, size, align, access, shadow)))
+        self.unit(|m| m.write(ptr, size, align, access, shadow))
     }
     #[inline(always)]
     pub(super) fn copy(
@@ -98,11 +113,11 @@ impl<'db, M: Machine<'db>> Hooks<M> {
         align: u64,
         overlapping: bool,
     ) -> Result<'db, ()> {
-        stopped(self.with(|m| m.copy(dst, src, size, align, overlapping)))
+        self.unit(|m| m.copy(dst, src, size, align, overlapping))
     }
     #[inline(always)]
     pub(super) fn require_init(&self, shadow: &M::Shadow, range: Range<usize>) -> Result<'db, ()> {
-        stopped(self.with(|m| m.require_init(shadow, range)))
+        self.unit(|m| m.require_init(shadow, range))
     }
     #[inline(always)]
     pub(super) fn atomic_load(
@@ -122,11 +137,11 @@ impl<'db, M: Machine<'db>> Hooks<M> {
         bytes: &[u8],
         old: &[u8],
     ) -> Result<'db, ()> {
-        stopped(self.with(|m| m.atomic_store(ptr, ord, bytes, old)))
+        self.unit(|m| m.atomic_store(ptr, ord, bytes, old))
     }
     #[inline(always)]
     pub(super) fn fence(&self, ord: AtomicOrd, compiler_only: bool) -> Result<'db, ()> {
-        stopped(self.with(|m| m.fence(ord, compiler_only)))
+        self.unit(|m| m.fence(ord, compiler_only))
     }
     #[inline(always)]
     pub(super) fn offset_from(
@@ -135,7 +150,7 @@ impl<'db, M: Machine<'db>> Hooks<M> {
         b: Ptr<M::Prov>,
         unsigned: bool,
     ) -> Result<'db, ()> {
-        stopped(self.with(|m| m.offset_from(a, b, unsigned)))
+        self.unit(|m| m.offset_from(a, b, unsigned))
     }
     #[inline(always)]
     pub(super) fn typed(
@@ -146,35 +161,51 @@ impl<'db, M: Machine<'db>> Hooks<M> {
         bytes: &[u8],
         mode: RetagMode,
     ) -> Result<'db, ()> {
-        stopped(self.with(|m| m.typed(cx, place, ty, bytes, mode)))
+        self.unit(|m| m.typed(cx, place, ty, bytes, mode))
     }
     #[inline(always)]
     pub(super) fn offset(&self, ptr: Ptr<M::Prov>, by: i64) -> Result<'db, ()> {
-        stopped(self.with(|m| m.offset(ptr, by)))
+        self.unit(|m| m.offset(ptr, by))
     }
     #[inline(always)]
     pub(super) fn expose(&self, ptr: Ptr<M::Prov>) -> Result<'db, ()> {
-        stopped(self.with(|m| m.expose(ptr)))
+        self.unit(|m| m.expose(ptr))
     }
     #[inline(always)]
     pub(super) fn from_exposed(&self, addr: u64) -> Option<M::Prov> {
-        self.with(|m| m.from_exposed(addr))
+        match M::CHECKS {
+            true => self.with(|m| m.from_exposed(addr)),
+            false => None,
+        }
+    }
+    #[inline(always)]
+    pub(super) fn function(&self, id: u64) -> Option<M::Prov> {
+        match M::CHECKS {
+            true => self.with(|m| m.function(id)),
+            false => None,
+        }
+    }
+    #[inline(always)]
+    pub(super) fn freeze(&self, addr: u64) {
+        if M::CHECKS {
+            self.with(|m| m.freeze(addr))
+        }
     }
     #[inline(always)]
     pub(super) fn call(&self) -> Result<'db, ()> {
-        stopped(self.with(|m| m.call()))
+        self.unit(|m| m.call())
     }
     #[inline(always)]
     pub(super) fn protect(&self, place: Ptr<M::Prov>, size: u64) -> Result<'db, ()> {
-        stopped(self.with(|m| m.protect(place, size)))
+        self.unit(|m| m.protect(place, size))
     }
     #[inline(always)]
     pub(super) fn ret(&self) -> Result<'db, ()> {
-        stopped(self.with(|m| m.ret()))
+        self.unit(|m| m.ret())
     }
     #[inline(always)]
     pub(super) fn spawn(&self, thread: EvalThread) -> Result<'db, ()> {
-        stopped(self.with(|m| m.spawn(thread)))
+        self.unit(|m| m.spawn(thread))
     }
     #[inline(always)]
     pub(super) fn schedule(
@@ -186,34 +217,38 @@ impl<'db, M: Machine<'db>> Hooks<M> {
     }
     #[inline(always)]
     pub(super) fn join(&self, joined: EvalThread) -> Result<'db, ()> {
-        stopped(self.with(|m| m.join(joined)))
+        self.unit(|m| m.join(joined))
     }
     #[inline(always)]
     pub(super) fn detach(&self, thread: EvalThread) -> Result<'db, ()> {
-        stopped(self.with(|m| m.detach(thread)))
+        self.unit(|m| m.detach(thread))
     }
     #[inline(always)]
     pub(super) fn exit(&self) -> Result<'db, ()> {
-        stopped(self.with(|m| m.exit()))
+        self.unit(|m| m.exit())
     }
     #[inline(always)]
     pub(super) fn yield_now(&self) {
-        self.with(|m| m.yield_now())
+        if M::CHECKS {
+            self.with(|m| m.yield_now())
+        }
     }
     #[inline(always)]
     pub(super) fn thread_name(&self, thread: EvalThread, name: &[u8]) {
-        self.with(|m| m.thread_name(thread, name))
+        if M::CHECKS {
+            self.with(|m| m.thread_name(thread, name))
+        }
     }
     #[inline(always)]
     pub(super) fn release(&self, object: u64) -> Result<'db, ()> {
-        stopped(self.with(|m| m.release(object)))
+        self.unit(|m| m.release(object))
     }
     #[inline(always)]
     pub(super) fn acquire(&self, object: u64) -> Result<'db, ()> {
-        stopped(self.with(|m| m.acquire(object)))
+        self.unit(|m| m.acquire(object))
     }
     #[inline(always)]
     pub(super) fn finish(&self) -> Result<'db, ()> {
-        stopped(self.with(|m| m.finish()))
+        self.unit(|m| m.finish())
     }
 }

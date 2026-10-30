@@ -22,7 +22,9 @@
 //! Workers take compiles from the fetcher, compile with no lock held, place one at a time,
 //! and send the answers after the fetcher's lock is let go, before queuing the callees or
 //! binding the tier-up. A worker with nothing to do spins a while before it sleeps (one at a
-//! time), and a queued compile wakes one sleeper, not all. A compile that panics or fails
+//! time), and a queued compile wakes one sleeper, not all. A lone ask whose code is compiled
+//! already ([`Compiler::hit`]) skips the workers: the thread that read it places and answers
+//! it, saving the hand-off. A compile that panics or fails
 //! answers `Failed` naming the function; a run that called it is stopped with that error,
 //! never left to run something else. The fetcher's lock ([`Shared::state`]) is held only to
 //! take or record a compile, never across one; the placer's only across one placement.
@@ -51,6 +53,11 @@ use crate::{
 /// Compiles one instance of the build.
 pub trait Compiler: Send + Sync + 'static {
     fn compile(&self, key: InstanceKey) -> Result<CompiledFunction, String>;
+    /// `key`'s code when it is compiled already (codegen's memo, the store's mapped index),
+    /// found by a probe: no compile, no I/O, no lock held past the lookup. `None` when it is
+    /// not, and [`Compiler::compile`] compiles it. Called on the thread that read the ask,
+    /// which answers a hit itself.
+    fn hit(&self, key: InstanceKey) -> Option<CompiledFunction>;
     /// The instance whose first code `key` is, compiled again at `to` (its backend,
     /// [`Tier::backend`], counting calls and back edges in cells when [`Tier::counts`]).
     fn tier_up(&self, key: InstanceKey, to: Tier) -> Result<CompiledFunction, String>;
@@ -135,7 +142,25 @@ struct State {
     idle_queued: bool,
     /// Workers asleep on [`Shared::wake`].
     parked: u32,
+    /// When the last ask for code not ready yet came.
+    last_ask: Option<Instant>,
 }
+
+/// A worker's, or an asking thread's, reusable buffers for one compile's end.
+struct Buffers {
+    actions: Vec<Action>,
+    callees: Vec<LazyId>,
+    frame: Vec<u8>,
+    /// [`crate::plan::Plan::callees`]'s scratch.
+    seen: Vec<u64>,
+}
+
+/// How long after the last ask an ask is taken to be alone, not one of a burst of first calls
+/// from several threads: past the time a reader takes for one ask, below the time from one
+/// answer to the same thread's next first call. A lone ask whose code is compiled already is
+/// answered by the thread that read it; one in a burst is a worker's, so a burst places in
+/// parallel.
+const ALONE: Duration = Duration::from_micros(1);
 
 /// How long a worker that ran out of compiles watches [`Shared::jobs`] before it sleeps: past
 /// the gap between two first calls of one thread (the asker's wake-up, the resolver, the run up
@@ -164,6 +189,8 @@ struct Shared<C: Compiler, P: Placer, A: Answers> {
     tier: Mutex<Option<Tiered<C, P, A>>>,
     /// The functions whose first code could not be bound to the tier runner, and why.
     unbound: Mutex<Vec<(LazyId, String)>>,
+    /// The asking threads' buffers, between the hits they answer.
+    spare: Mutex<Vec<Buffers>>,
 }
 
 /// One lazy run's daemon side.
@@ -208,7 +235,7 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         // alloc: setup, once per run.
         let shared = Arc::new(Shared {
             session,
-            state: Mutex::new(State { fetcher, closing: false, idle_queued: false, parked: 0 }),
+            state: Mutex::new(State { fetcher, closing: false, idle_queued: false, parked: 0, last_ask: None }),
             wake: Condvar::new(),
             jobs: AtomicU64::new(0),
             spinning: AtomicBool::new(false),
@@ -218,6 +245,7 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
             idle: config.idle,
             tier: Mutex::new(None),
             unbound: Mutex::new(Vec::new()), // alloc: setup; grows only for a failed bind
+            spare: Mutex::new(Vec::new()),   // alloc: setup; a buffer per thread that asks at once
         });
         if let Some(up) = tier {
             let recompiler = Recompiler(Arc::downgrade(&shared));
@@ -262,7 +290,8 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
 
     /// A blaze-inproc frame of `kind` and sequence number `seq` from `client`'s run process,
     /// with body `bytes`. A frame that is not an ask is an error of the channel, for the
-    /// daemon to stop the run with.
+    /// daemon to stop the run with. A lone ask ([`ALONE`]) for code the compiler has already
+    /// is placed and answered on the calling thread, before this returns.
     pub fn frame(&self, client: u32, kind: Kind, seq: u32, bytes: &[u8]) -> Result<(), WireError> {
         let frame = Frame::decode(bytes)?;
         if wire::channel_kind(&frame) != kind {
@@ -282,8 +311,7 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         let mut state = lock(&self.shared.state);
         let mut queued = 0;
         for &id in ids {
-            queued += u32::from(!state.fetcher.started(id));
-            state.fetcher.want(id, priority);
+            queued += u32::from(state.fetcher.want(id, priority));
         }
         let wakes = self.shared.queued(&state, queued);
         drop(state);
@@ -378,7 +406,27 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
             self.answers.send(to.client, to.seq, wire::READY_KIND, &wire::ready(to.request, lazy, target));
             return;
         }
-        let queued = u32::from(!state.fetcher.started(LazyId(lazy)) && lazy < state.fetcher.len());
+        let id = LazyId(lazy);
+        let now = Instant::now();
+        let alone = state.last_ask.is_none_or(|last| now.duration_since(last) >= ALONE);
+        state.last_ask = Some(now);
+        if alone && !state.fetcher.started(id) && lazy < state.fetcher.len() {
+            drop(state);
+            let hit = self.hit(id);
+            state = lock(&self.state);
+            // Not started by another thread meanwhile: answered here, never a waiter.
+            if let Some(compiled) = hit
+                && state.fetcher.start(id)
+            {
+                drop(state);
+                let placed = self.place_compiled(id, compiled);
+                let mut buffers = lock(&self.spare).pop().unwrap_or_else(|| self.buffers());
+                self.finish(id, placed, Some(to), &mut buffers);
+                lock(&self.spare).push(buffers);
+                return;
+            }
+        }
+        let queued = u32::from(!state.fetcher.started(id) && lazy < state.fetcher.len());
         let mut actions = Vec::new(); // alloc: only for a failure; a wait or a queue pushes nothing
         state.fetcher.ask(to, lazy, &mut actions);
         let wakes = self.queued(&state, queued);
@@ -467,33 +515,52 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
     }
 
     fn work(&self) {
-        // alloc: each worker's buffers, made once and reused for every compile.
-        let (mut actions, mut callees, mut frame) = (Vec::new(), Vec::new(), Vec::new());
+        let mut buffers = self.buffers();
         while let Some(id) = self.take() {
             let placed = self.compile_and_place(id);
-            actions.clear();
-            let mut state = lock(&self.state);
-            let result = placed.as_ref().map(|it| it.0).map_err(String::as_str);
-            state.fetcher.done(id, result, &mut actions);
-            drop(state);
-            // The askers wait on nothing else: answered before the prefetch and the tier-up.
-            self.act(&actions, &mut frame);
-            let Ok((_, function, cells)) = placed else { continue };
-            callees.clear();
-            self.session.plan().callees(&function, &mut callees);
-            if !callees.is_empty() {
-                let mut state = lock(&self.state);
-                let mut queued = 0;
-                for &callee in &callees {
-                    queued += u32::from(!state.fetcher.started(callee));
-                    state.fetcher.want(callee, Priority::Callee);
-                }
-                let wakes = self.queued(&state, queued);
-                drop(state);
-                self.rouse(wakes);
-            }
-            self.bind(id, cells);
+            self.finish(id, placed, None, &mut buffers);
         }
+    }
+
+    fn buffers(&self) -> Buffers {
+        // alloc: a thread's buffers, made once and reused for every compile it ends.
+        Buffers { actions: Vec::new(), callees: Vec::new(), frame: Vec::new(), seen: self.session.plan().scratch() }
+    }
+
+    /// The end of `id`'s compile: recorded, answered (its waiters, and `asker`, who started it
+    /// with [`Fetcher::start`]), its callees queued and its code bound.
+    fn finish(
+        &self,
+        id: LazyId,
+        placed: Result<(u64, CompiledFunction, Option<u64>), String>,
+        asker: Option<Waiter>,
+        buffers: &mut Buffers,
+    ) {
+        let Buffers { actions, callees, frame, seen } = buffers;
+        actions.clear();
+        let mut state = lock(&self.state);
+        let result = placed.as_ref().map(|it| it.0).map_err(String::as_str);
+        state.fetcher.done(id, result, actions);
+        if let Some(to) = asker {
+            state.fetcher.ask(to, id.0, actions);
+        }
+        drop(state);
+        // The askers wait on nothing else: answered before the prefetch and the tier-up.
+        self.act(actions, frame);
+        let Ok((_, function, cells)) = placed else { return };
+        callees.clear();
+        self.session.plan().callees(&function, seen, callees);
+        if !callees.is_empty() {
+            let mut state = lock(&self.state);
+            let mut queued = 0;
+            for &callee in callees.iter() {
+                queued += u32::from(state.fetcher.want(callee, Priority::Callee));
+            }
+            let wakes = self.queued(&state, queued);
+            drop(state);
+            self.rouse(wakes);
+        }
+        self.bind(id, cells);
     }
 
     /// `id`'s first code was published (the fetcher has it ready), counting in `cells`.
@@ -515,13 +582,16 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
     fn recompile(&self, id: LazyId, to: Tier) -> Result<Option<u64>, String> {
         let plan = self.session.plan();
         if id.0 >= plan.len() {
+            // alloc: the tier runner's mistake, reported.
             return Err(format!("tier-up of lazy function {}, of {}", id.0, plan.len()));
         }
         let (key, item) = (plan.key(id), plan.item(id));
+        // alloc: called only for a failure.
         let named = |why: &str| format!("recompiling {key:?} (item {item:?}) at {to:?}: {why}");
         let function = self.compiler.tier_up(key, to).map_err(|why| named(&why))?;
         let (target, cells) = {
             let mut placer = lock(&self.placer);
+            // alloc: only for a placement that failed.
             let target = placer.replace(key, &function).map_err(|why| named(&format!("placing it: {why}")))?;
             (target, placer.cells(&function.key))
         };
@@ -537,13 +607,38 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
     /// `id`'s code, compiled, placed and published: where it runs, the function and where it
     /// counts, or why not, naming it.
     fn compile_and_place(&self, id: LazyId) -> Result<(u64, CompiledFunction, Option<u64>), String> {
+        let key = self.session.plan().key(id);
+        self.place_compiled(id, catch_unwind(AssertUnwindSafe(|| self.compiler.compile(key))))
+    }
+
+    /// `id`'s code when the compiler has it already ([`Compiler::hit`]), for
+    /// [`Shared::place_compiled`]: a probe that panicked is the compile's failure.
+    fn hit(&self, id: LazyId) -> Option<std::thread::Result<Result<CompiledFunction, String>>> {
+        let key = self.session.plan().key(id);
+        match catch_unwind(AssertUnwindSafe(|| self.compiler.hit(key))) {
+            Ok(None) => None,
+            Ok(Some(function)) => Some(Ok(Ok(function))),
+            Err(payload) => Some(Err(payload)),
+        }
+    }
+
+    /// `id`'s code, as its compile (or probe) ended, placed and published: as
+    /// [`Shared::compile_and_place`].
+    fn place_compiled(
+        &self,
+        id: LazyId,
+        compiled: std::thread::Result<Result<CompiledFunction, String>>,
+    ) -> Result<(u64, CompiledFunction, Option<u64>), String> {
         let plan = self.session.plan();
         let (key, item) = (plan.key(id), plan.item(id));
+        // alloc: called only for a failure.
         let named = |why: &str| format!("compiling {key:?} (item {item:?}) on its first call: {why}");
-        let function = match catch_unwind(AssertUnwindSafe(|| self.compiler.compile(key))) {
+        let function = match compiled {
             Ok(Ok(function)) if function.key == key => function,
+            // alloc: a failure.
             Ok(Ok(function)) => return Err(named(&format!("the compiler gave {:?}", function.key))),
             Ok(Err(why)) => return Err(named(&why)),
+            // alloc: a failure.
             Err(payload) => return Err(named(&format!("the compiler panicked: {}", panic_text(&*payload)))),
         };
         let placed = catch_unwind(AssertUnwindSafe(|| {
@@ -553,7 +648,8 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
         match placed {
             Ok(Ok((0, _))) => Err(named("placed at address 0")),
             Ok(Ok((target, cells))) => Ok((target, function, cells)),
-            Ok(Err(why)) => Err(named(&format!("placing it: {why}"))),
+            Ok(Err(why)) => Err(named(&format!("placing it: {why}"))), // alloc: a failure
+            // alloc: a failure.
             Err(payload) => Err(named(&format!("placing it panicked: {}", panic_text(&*payload)))),
         }
     }
@@ -624,12 +720,14 @@ impl Answers for Runs {
     fn send(&self, client: u32, seq: u32, kind: Kind, body: &[u8]) {
         let Some(sender) = lock(&self.senders).get(&client).cloned() else { return };
         if let Err(error) = sender.send(kind, seq, body) {
+            // alloc: the run's end.
             kill(&sender, &format!("answering its ask for a lazy function's code: {error}"));
         }
     }
 
     /// Kills every run process it answers: they run one program, which called the function.
     fn stop(&self, _: Option<(InstanceKey, ItemKey)>, why: &str) {
+        // alloc: the run's end; the kills are made with the lock let go.
         let senders: Vec<Sender> = lock(&self.senders).values().cloned().collect();
         for sender in &senders {
             kill(sender, why);
@@ -640,10 +738,10 @@ impl Answers for Runs {
 // dyn: a panic's payload, which is what `catch_unwind` gives.
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     match payload.downcast_ref::<&str>() {
-        Some(text) => (*text).to_owned(),
+        Some(text) => (*text).to_owned(), // alloc: a panic's text
         None => match payload.downcast_ref::<String>() {
-            Some(text) => text.clone(),
-            None => "a payload that is not text".to_owned(),
+            Some(text) => text.clone(), // clone: a panic's text, for its failure
+            None => "a payload that is not text".to_owned(), // alloc: a panic's text
         },
     }
 }

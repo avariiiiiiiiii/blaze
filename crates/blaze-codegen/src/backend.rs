@@ -12,7 +12,7 @@ use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 
 use crate::{
-    CodegenError, CompiledFunction, InstanceKey, Static, Unit,
+    CodegenError, CompiledFunction, InstanceKey, Owner, Static, Unit,
     plan::Origin,
     settings::Spec,
     summary::{Imports, Summary},
@@ -65,6 +65,19 @@ pub struct Described<I, S> {
     /// What a debugger and a backtrace call it: rustc's demangled name of the instance,
     /// with its generic arguments (`core::ptr::drop_in_place<alloc::string::String>`).
     pub name: String,
+    /// Whose it is for a dependency image: [`Owner::Dependency`] when its item is a
+    /// dependency's or the standard library's and none of its type arguments names a
+    /// workspace crate's type, closure or item; an `asm!` function is its asker's.
+    pub owner: Owner,
+    /// What it is across versions, before its settings ([`crate::exec::fn_id`]): its item's
+    /// key, which instance of the item it is (a closure by its place in its owner's body, a
+    /// shim by its kind) and its type arguments. An edit of its body keeps it.
+    pub identity: ContentId,
+    /// Its code as it runs, test selection's `Bound`: its code hash, its item's
+    /// `blaze_items::bound_hash` (which function each ref of its body binds to) and its type
+    /// arguments. `Err` names why its item's could not be hashed; only a test binary's table
+    /// needs it.
+    pub bound: Result<ContentId, String>,
 }
 
 /// What the front end says of a static.

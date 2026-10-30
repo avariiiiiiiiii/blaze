@@ -19,12 +19,12 @@ use hir_ty::next_solver::{DbInterner, Ty, TyKind};
 use intern::Symbol;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
-use syntax::{AstNode as _, ast};
+use syntax::view::{self as ast, AstNode as _};
 
 use super::util::{self, Solver};
 use crate::{
     lints::bodies::{
-        BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, PatKinds, PatTag, lint_set,
+        BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, PatKinds, PatKind, lint_set,
     },
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
@@ -208,13 +208,13 @@ impl LatePass for TypeLimits {
     ]);
     const HOOKS: Hooks = Hooks::BODY;
     const EXPRS: ExprKinds = ExprKinds::of(&[
-        ExprTag::Literal,
-        ExprTag::UnaryOp,
-        ExprTag::BinaryOp,
-        ExprTag::Call,
-        ExprTag::MethodCall,
+        ExprKind::Literal,
+        ExprKind::UnaryOp,
+        ExprKind::BinaryOp,
+        ExprKind::Call,
+        ExprKind::MethodCall,
     ]);
-    const PATS: PatKinds = PatKinds::of(&[PatTag::Lit, PatTag::Range]);
+    const PATS: PatKinds = PatKinds::of(&[PatKind::Lit, PatKind::Range]);
 
     fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
         self.crate_of(b);

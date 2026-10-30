@@ -1,8 +1,12 @@
 //! rustc's UI tests of names that do not resolve: imports (E0432), modules with no file (E0583),
-//! paths of bodies (E0425 in a module, E0433 of a prefix), and the style lints of the names
-//! items are given.
+//! paths of bodies (E0425 in a module, E0433 of a prefix), imports of a trait's items without
+//! `import_trait_associated_functions` (E0658), and the style lints of the names items are given.
 
-use crate::tests::ui;
+use crate::{
+    Options,
+    emit::Style,
+    tests::{Mode, checked_with, compiletest, normalized, ui},
+};
 
 #[test]
 fn an_import_from_an_unknown_crate_suggests_the_extern_crate() {
@@ -200,4 +204,156 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0433`.
 "##;
     assert_eq!(ui("export-fully-qualified-2018.rs", "2018", source), stderr);
+}
+
+/// A `std` with the one item the test reads beside minicore's: `HashMap`, with `Default`.
+const STD_HASH_MAP: &str = "//- /std.rs crate:std
+pub mod collections {
+    pub struct HashMap<K, V>(K, V);
+    impl<K, V> core::default::Default for HashMap<K, V> {
+        fn default() -> Self {
+            loop {}
+        }
+    }
+}
+";
+
+#[test]
+fn an_import_of_a_traits_items_is_unstable_once_per_name_and_glob() {
+    // tests/ui/feature-gates/feature-gate-import-trait-associated-functions.rs
+    let source = r#"//@ edition:2018
+use std::collections::HashMap;
+
+use A::{DEFAULT, new};
+//~^ ERROR `use` associated items of traits is unstable [E0658]
+//~| ERROR `use` associated items of traits is unstable [E0658]
+use Default::default;
+//~^ ERROR `use` associated items of traits is unstable [E0658]
+
+struct S {
+    a: HashMap<i32, i32>,
+}
+
+impl S {
+    fn new() -> S {
+        S { a: default() }
+    }
+}
+
+trait A: Sized {
+    const DEFAULT: Option<Self> = None;
+    fn new() -> Self;
+    fn do_something(&self);
+}
+
+mod b {
+    use super::A::{self, DEFAULT, new};
+    //~^ ERROR `use` associated items of traits is unstable [E0658]
+    //~| ERROR `use` associated items of traits is unstable [E0658]
+
+    struct B();
+
+    impl A for B {
+        const DEFAULT: Option<Self> = Some(B());
+        fn new() -> Self {
+            B()
+        }
+
+        fn do_something(&self) {}
+    }
+
+    fn f() {
+        let b: B = new();
+        b.do_something();
+        let c: B = DEFAULT.unwrap();
+    }
+}
+
+impl A for S {
+    fn new() -> Self {
+        S::new()
+    }
+
+    fn do_something(&self) {}
+}
+
+fn f() {
+    let s: S = new();
+    s.do_something();
+    let t: Option<S> = DEFAULT;
+}
+
+trait Glob {}
+use Glob::*; //~ ERROR `use` associated items of traits is unstable
+
+fn main() {}
+"#;
+    let stderr = r#"error[E0658]: `use` associated items of traits is unstable
+  --> $DIR/feature-gate-import-trait-associated-functions.rs:4:9
+   |
+LL | use A::{DEFAULT, new};
+   |         ^^^^^^^
+   |
+   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
+   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0658]: `use` associated items of traits is unstable
+  --> $DIR/feature-gate-import-trait-associated-functions.rs:4:18
+   |
+LL | use A::{DEFAULT, new};
+   |                  ^^^
+   |
+   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
+   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0658]: `use` associated items of traits is unstable
+  --> $DIR/feature-gate-import-trait-associated-functions.rs:7:5
+   |
+LL | use Default::default;
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
+   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0658]: `use` associated items of traits is unstable
+  --> $DIR/feature-gate-import-trait-associated-functions.rs:27:26
+   |
+LL |     use super::A::{self, DEFAULT, new};
+   |                          ^^^^^^^
+   |
+   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
+   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0658]: `use` associated items of traits is unstable
+  --> $DIR/feature-gate-import-trait-associated-functions.rs:27:35
+   |
+LL |     use super::A::{self, DEFAULT, new};
+   |                                   ^^^
+   |
+   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
+   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0658]: `use` associated items of traits is unstable
+  --> $DIR/feature-gate-import-trait-associated-functions.rs:64:5
+   |
+LL | use Glob::*;
+   |     ^^^^^^^
+   |
+   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
+   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error: aborting due to 6 previous errors
+
+For more information about this error, try `rustc --explain E0658`.
+"#;
+    let name = "feature-gate-import-trait-associated-functions.rs";
+    let fixture = format!("//- minicore: default, option\n{STD_HASH_MAP}//- /{name} crate:main edition:2018 deps:std\n{source}");
+    let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
+    assert_eq!(normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })), stderr);
 }

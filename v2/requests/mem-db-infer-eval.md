@@ -807,6 +807,7 @@ the flat side, inside `frame::task(Tag::Infer, ..)`, calls it on `variants_of(fr
 
 > forwarded to db (from requests, pass 17; told by tmux).
 > held by requests-items-mem: waits on R-abi (`crates/rustc_abi` `layout_of_struct_or_enum`/`layout_of_union` still take nested `IndexVec`s); `variants_of`'s per-variant `collect` carries an `// alloc:` note naming it.
+> forwarded by db-audit-mem (22:44) to lane items (requests-items-mem): `crates/hir-ty/src/layout/adt.rs` is lane items', filed in `v2/requests/db.md` under "mem-db-infer-eval, for lane items"; it waits on R-abi (filed there for the coordinator), not landed: `crates/rustc_abi/src/layout.rs:346` and `:400` still take `&IndexSlice<VariantIdx, IndexVec<FieldIdx, F>>`.
 
 ## `layout/target.rs`
 

@@ -15,14 +15,14 @@
 use hir::{InFile, MacroCallId};
 use ra_ap_rustc_parse_format as parse_format;
 use syntax::{
-    AstNode, AstToken as _, SyntaxKind, SyntaxNode, SyntaxNodePtr, T,
-    ast::{self, HasLoopBody as _, IsString as _},
+    SyntaxKind, SyntaxNodePtr, T,
+    view::{self as ast, AstNode as _, AstToken as _, HasLoopBody as _, IsString as _},
 };
 
 use crate::{
     cx::Cx,
     lints::syntax::{Emitted, Pass, Tree, Walk, source_fact},
-    lower::{Phase, break_outside_of_loop::ancestors},
+    lower::{Phase, break_outside_of_loop::up},
     model::{Diag, Span},
 };
 
@@ -50,7 +50,7 @@ struct Args {
 }
 
 impl Args {
-    fn of(tree: &Tree, asm: &ast::AsmExpr, kind: AsmMacro) -> Args {
+    fn of(tree: &Tree<'_>, asm: ast::AsmExpr<'_>, kind: AsmMacro) -> Args {
         let mut args = Args::default();
         for piece in asm.asm_pieces() {
             let on = !tree.skipped(piece.syntax().text_range());
@@ -110,18 +110,17 @@ pub(super) fn x86(walk: &Walk<'_>) -> bool {
 
 /// The lints of `tree`, the expansion of `call`, a call of `asm!`, `global_asm!` or
 /// `naked_asm!` on x86 ([`x86`]).
-pub(super) fn lints(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, out: &mut Vec<Emitted>) {
-    let asm = tree.nodes.iter().find(|it| it.kind() == SyntaxKind::ASM_EXPR);
-    // clone: a cursor's refcount (no allocation), once per `asm!` call on x86
-    let Some(asm) = asm.and_then(|it| ast::AsmExpr::cast(it.clone())) else { return };
-    asm_lints(cx, tree, call, &asm, out);
+pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, tree: &Tree<'db>, call: MacroCallId, out: &mut Vec<Emitted>) {
+    let asm = tree.of_kind(|kind| kind == SyntaxKind::ASM_EXPR).next();
+    let Some(asm) = asm.and_then(ast::AsmExpr::cast) else { return };
+    asm_lints(cx, tree, call, asm, out);
 }
 
-fn asm_lints(
-    cx: &Cx<'_, '_>,
-    tree: &Tree,
+fn asm_lints<'db>(
+    cx: &Cx<'_, 'db>,
+    tree: &Tree<'db>,
     call: MacroCallId,
-    asm: &ast::AsmExpr,
+    asm: ast::AsmExpr<'db>,
     emitted: &mut Vec<Emitted>,
 ) {
     let kind = if asm.global_asm_token().is_some() {
@@ -140,7 +139,7 @@ fn asm_lints(
         if tree.skipped(expr.syntax().text_range()) {
             continue;
         }
-        let Some((value, style)) = string_of(cx, &expr) else { return };
+        let Some((value, style)) = string_of(cx, expr) else { return };
         for (needle, message) in [
             (".intel_syntax", "avoid using `.intel_syntax`, Intel syntax is the default"),
             (".att_syntax", "avoid using `.att_syntax`, prefer using `options(att_syntax)` instead"),
@@ -150,7 +149,7 @@ fn asm_lints(
             }
             let span = cx.span(InFile::new(tree.file, expr.syntax().text_range()));
             let at = *lint_node
-                .get_or_insert_with(|| lint_node_of(cx, &call.loc(cx.db).to_node(cx.db)));
+                .get_or_insert_with(|| lint_node_of(cx, call.loc(cx.db).to_node_view(cx.db)));
             let end: fn(char) -> bool = |c| matches!(c, '\n' | ';' | '\\' | '"');
             let found = cx.snippet(&span).and_then(|it| inner(it, needle, end));
             let mut diag = Diag::lint("bad_asm_style", message, within(&span, found));
@@ -165,7 +164,7 @@ fn asm_lints(
 
 /// rustc's `expr_to_spanned_string` of a template once the macros it is a call of are expanded:
 /// its string and, when it is raw, its number of `#`s; `None` for what is not a string.
-fn string_of(cx: &Cx<'_, '_>, expr: &ast::Expr) -> Option<(String, Option<usize>)> {
+fn string_of<'db>(cx: &Cx<'_, 'db>, expr: ast::Expr<'db>) -> Option<(String, Option<usize>)> {
     match expr {
         ast::Expr::Literal(literal) => match literal.kind() {
             ast::LiteralKind::String(it) => {
@@ -177,8 +176,8 @@ fn string_of(cx: &Cx<'_, '_>, expr: &ast::Expr) -> Option<(String, Option<usize>
             _ => None,
         },
         ast::Expr::MacroExpr(it) => {
-            let expanded = cx.sema.expand_macro_call(&it.macro_call()?)?;
-            string_of(cx, &ast::Expr::cast(expanded.value)?)
+            let expanded = cx.vsema.expand_macro_call(it.macro_call()?)?;
+            string_of(cx, ast::Expr::cast(expanded.value)?)
         }
         _ => None,
     }
@@ -216,18 +215,22 @@ fn within(span: &Span, inner: Option<(usize, usize)>) -> Span {
 /// rustc's `current_expansion.lint_node_id` at the macro call `call`: the innermost node around
 /// it `InvocationCollector` gives an id with `assign_id!`, through the calls of the macros it
 /// is in to the crate's root.
-fn lint_node_of(cx: &Cx<'_, '_>, call: &InFile<SyntaxNode>) -> InFile<SyntaxNodePtr> {
-    let chain = ancestors(cx, call);
-    let at =
-        chain.iter().skip(1).find(|it| has_lint_id(&it.value)).unwrap_or(&chain[chain.len() - 1]);
-    at.as_ref().map(SyntaxNodePtr::new)
+fn lint_node_of<'db>(cx: &Cx<'_, 'db>, call: InFile<ast::Node<'db>>) -> InFile<SyntaxNodePtr> {
+    let mut last = call;
+    for it in up(cx, call).skip(1) {
+        if has_lint_id(it.value) {
+            return it.map(ast::ptr);
+        }
+        last = it;
+    }
+    last.map(ast::ptr)
 }
 
 /// Whether rustc's node for `node` is one `assign_id!` gives an id: the crate, an item, a
 /// variant, a where predicate, a field, a field of a pattern or of a struct expression, a
 /// parameter, a generic parameter, a match arm, a `let` or a statement ending in `;`, a type, a
 /// pattern or an expression; never a macro call, which its expansion replaces.
-fn has_lint_id(node: &SyntaxNode) -> bool {
+fn has_lint_id(node: ast::Node<'_>) -> bool {
     let kind = node.kind();
     if ast::MacroCall::can_cast(kind)
         || ast::MacroExpr::can_cast(kind)
@@ -236,14 +239,12 @@ fn has_lint_id(node: &SyntaxNode) -> bool {
     {
         return false;
     }
-    // clone: a cursor's refcount (no allocation), only once a `bad_asm_style` lint fires
-    if let Some(stmt) = ast::ExprStmt::cast(node.clone()) {
+    if let Some(stmt) = ast::ExprStmt::cast(node) {
         return stmt.semicolon_token().is_some()
             && !matches!(stmt.expr(), Some(ast::Expr::MacroExpr(_)));
     }
-    // clone: a cursor's refcount (no allocation), only once a `bad_asm_style` lint fires
-    if let Some(block) = ast::BlockExpr::cast(node.clone()) {
-        return is_expr(&block);
+    if let Some(block) = ast::BlockExpr::cast(node) {
+        return is_expr(block);
     }
     ast::SourceFile::can_cast(kind)
         || ast::Item::can_cast(kind)
@@ -265,23 +266,20 @@ fn has_lint_id(node: &SyntaxNode) -> bool {
 
 /// Whether `block` is an expression to rustc, not the `Block` of a function, a loop, the
 /// branch an `if` takes, a `let .. else` or an asm `label`.
-fn is_expr(block: &ast::BlockExpr) -> bool {
+fn is_expr(block: ast::BlockExpr<'_>) -> bool {
     let Some(parent) = block.syntax().parent() else { return true };
-    let is = |it: Option<ast::BlockExpr>| it.as_ref() == Some(block);
+    let is = |it: Option<ast::BlockExpr<'_>>| it == Some(block);
     let kind = parent.kind();
     if ast::Fn::can_cast(kind) || ast::LetElse::can_cast(kind) || ast::AsmLabel::can_cast(kind) {
         return false;
     }
-    // clone: a cursor's refcount (no allocation), only once a `bad_asm_style` lint fires
-    if let Some(it) = ast::IfExpr::cast(parent.clone()) {
+    if let Some(it) = ast::IfExpr::cast(parent) {
         return !is(it.then_branch());
     }
-    // clone: a cursor's refcount (no allocation), only once a `bad_asm_style` lint fires
-    if let Some(it) = ast::LoopExpr::cast(parent.clone()) {
+    if let Some(it) = ast::LoopExpr::cast(parent) {
         return !is(it.loop_body());
     }
-    // clone: a cursor's refcount (no allocation), only once a `bad_asm_style` lint fires
-    if let Some(it) = ast::WhileExpr::cast(parent.clone()) {
+    if let Some(it) = ast::WhileExpr::cast(parent) {
         return !is(it.loop_body());
     }
     if let Some(it) = ast::ForExpr::cast(parent) {

@@ -16,6 +16,7 @@
 //! Design and the case for each behavior: `docs/v2/plan/lanes/fastcompile/premap.md`.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 use std::fmt;
 
@@ -40,7 +41,7 @@ pub use dev::{Dev, Job, Plan, plan};
 pub use image::View;
 pub use key::{GraphInputs, GraphKey, ImageInputs, ImageKey};
 pub use prelink::{Prelink, Prelinked, Request};
-pub use split::{Built, Owned, SidedNative, WorkspacePart};
+pub use split::{Built, Fit, Owned, SidedNative, Stale, WorkspacePart};
 pub use store::Shelf;
 pub use table::{Def, SymbolId, TableView};
 
@@ -54,6 +55,11 @@ impl PremapError {
     pub fn new(what: String) -> PremapError {
         PremapError { what }
     }
+
+    /// The error `what` says, its message made here, once, when premap fails.
+    pub fn of(what: fmt::Arguments<'_>) -> PremapError {
+        PremapError { what: fmt::format(what) } // alloc: error: its message
+    }
 }
 
 impl fmt::Display for PremapError {
@@ -66,6 +72,6 @@ impl std::error::Error for PremapError {}
 
 impl From<blaze_inproc::Error> for PremapError {
     fn from(error: blaze_inproc::Error) -> PremapError {
-        PremapError { what: error.to_string() }
+        PremapError::of(format_args!("{error}"))
     }
 }

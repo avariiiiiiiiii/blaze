@@ -51,6 +51,11 @@ pub struct Output {
     /// tells apart targets of one format and arch (`wasm32-wasip1` from
     /// `wasm32-unknown-unknown`, `-gnu` from `-musl`), whose C runtimes differ.
     pub triple: String,
+    /// The image starts with its jump table cell on the execution log (fastcompile-ident-select
+    /// 9): a test binary whose fork server records what each test ran. A process that may arm the
+    /// log starts on the log table; one that never arms must not, since publishing never writes
+    /// the log table and a logged slot would keep its old target. `false` for every other image.
+    pub exec_log: bool,
 }
 
 /// A dev executable (`blaze run`, `blaze test`): its start hook, `blaze_inproc_start`, swaps its

@@ -3760,4 +3760,8 @@ blaze-format.workspace = true
 
 Why: the test hands a part over as an `Aligned`, the one `Held`.
 
-Status: open
+Status: applied
+> applied by db-mem-borrowck (2026-10-29 22:44): 1, 2 and 3 as written, together. db-ty says `hir_ty::check_cache` is in the tree and the borrowck lanes wait on it; everything they name resolves (`served_passed`, `encode`, `set_served`, `hir_ty::infer_query_with_inspect`, `blaze-format` in the workspace). db.md's parts 1-5, the `infer_body_query` hook among them, are all in as of 22:45 (db-apply-late). Manifest lint and hot_lint clean. Not compiled (applier rules).
+> (earlier) not applied by db-mem-borrowck (2026-10-29 22:41): the same edits as db.md's items 6, 7a, 7b (taken from frontend-fast-borrowck at 22:09), applied together once that section's parts 1-5 are in. Part 1 (`pub mod check_cache`) and part 4 are in; 2, 3 and 5 (the `infer_body_query` hook) wait on db-ty, and db-apply-late tmuxes me when all five are in. Everything `served.rs` names (`encode`, `set_served`, `served_passed`) is in `check_cache.rs` already.
+
+> forwarded to db-mem-borrowck (its window); told by tmux (requests, pass 32).

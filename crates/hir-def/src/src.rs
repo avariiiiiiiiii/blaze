@@ -97,6 +97,21 @@ pub fn use_trees_view<'db>(
     .expect("failed to lower use tree")
 }
 
+/// [`HasChildSource::child_source`] of a `UseId` as views of the database's tree: every
+/// `UseTree` of the import, by the index the item tree gives it.
+pub fn use_tree_sources_view<'db>(
+    db: &'db Db,
+    id: UseId,
+) -> InFile<ArenaMap<Idx<ast::UseTree>, view::UseTree<'db>>> {
+    let loc = id.lookup(db);
+    let map = use_trees_view(db, loc.id)
+        .iter()
+        .map(|(idx, &tree)| (Idx::from_raw(idx.into_raw()), tree))
+        // alloc: a use's trees by item-tree index, for diagnostics
+        .collect();
+    InFile::new(loc.id.file_id, map)
+}
+
 impl HasChildSource<la_arena::Idx<ast::UseTree>> for UseId {
     type Value = ast::UseTree;
     fn child_source(

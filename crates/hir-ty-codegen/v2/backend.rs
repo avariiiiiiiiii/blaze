@@ -8,7 +8,7 @@ use blaze_codegen::{
     Arch, Backend, CodegenError, CompiledFunction, Compile, Static, Unit,
     backend::{Emitted, FrontRef, Import, Prepare, Shape},
     fold::{Group, Masked, Merged},
-    settings::{DebugInfo, Relocation, Sanitizers, Spec},
+    settings::{DebugInfo, Pgo, Relocation, Sanitizers, Spec},
     summary::{Imports, Summary},
     template::Refs,
 };
@@ -39,11 +39,12 @@ use super::{
 };
 use crate::{
     Detach, Instance, InstanceDef, Produced, compile_as,
-    debuginfo::SlotPlaces,
+    debuginfo::{LineRow, SlotPlaces, VariablePlace},
     fragment::{self, Hint, Requests},
     frame_map::{self, FrameHashMap},
     home::Homes,
     instance_code,
+    unwind::FunctionUnwind,
 };
 
 /// Cranelift and LLVM over the IR builder.
@@ -64,9 +65,42 @@ const CHANGES_CODE: &[&str] = &[
     "BLAZE_BUILT_IN",
 ];
 
-/// Whether the process's code generator is the one `spec` asks for: the IR builder and
-/// Cranelift take the target, its features and frame pointers from the process.
+/// Whether the process's code generator is the one `spec` asks for: its IR as
+/// [`check_built`] says, compiled to code that is position-independent or static as the
+/// toolchain says and, for a stencil unit, counts its calls.
 fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
+    check_built(unit, spec)?;
+    let fail = |what: String| failed(unit, what);
+    let (cranelift, stencil) = (spec.backend.is_cranelift(), spec.backend == Backend::Stencil);
+    if stencil && !spec.counted {
+        // alloc: an error
+        return Err(fail("a stencil unit that does not count its calls: stencil code always does".to_owned()));
+    }
+    if spec.counted && !cranelift && !stencil {
+        // alloc: an error
+        return Err(fail(format!(
+            "a unit for {:?} that counts its calls: only stencil and Cranelift code counts",
+            spec.backend
+        )));
+    }
+    let isa = isa(unit)?;
+    let pic = isa.flags().is_pic();
+    if pic != (spec.toolchain.relocation == Relocation::Pic) {
+        // alloc: an error
+        return Err(fail(format!(
+            "the unit's code is {:?}, the process's Cranelift {}",
+            spec.toolchain.relocation,
+            if pic { "position-independent" } else { "static" }
+        )));
+    }
+    Ok(())
+}
+
+/// Whether the process's IR builder builds the IR `spec` asks for: the IR builder and
+/// Cranelift take the target and frame pointers from the process, and the unit's target
+/// features are a set the process compiles with (one ISA and one LLVM target machine a set).
+/// What the IR is compiled to (its relocation model, whether it counts) is no part of it.
+pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
     let fail = |what: String| failed(unit, what);
     if unit.backend != spec.backend {
         return Err(fail(format!("a unit for {:?} with a spec for {:?}", unit.backend, spec.backend)));
@@ -94,35 +128,44 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
         )));
     }
     let cranelift = spec.backend.is_cranelift();
+    let stencil = spec.backend == Backend::Stencil;
     // Cranelift knows no CPU by name: a named one is the features it has past the baseline,
-    // which `toolchain.features` lists. LLVM is told the baseline's name only.
+    // which `toolchain.features` lists. LLVM is told the baseline's name only, and stencils
+    // are made for the baseline's.
     if !cranelift && target.cpu() != toolchain.cpu {
         return Err(fail(format!(
-            "the process compiles for the CPU {}, the unit for {}: the LLVM back end is told \
+            "the process compiles for the CPU {}, the unit for {}: the {:?} back end is told \
              no other CPU yet",
             target.cpu(),
-            toolchain.cpu
+            toolchain.cpu,
+            spec.backend
         )));
     }
-    if cranelift && target.features() != toolchain.features.as_slice() {
-        return Err(fail(format!(
-            "the process compiles with the target features {:?}, the unit with {:?}",
-            target.features(),
-            toolchain.features
-        )));
+    if stencil {
+        check_stencils(unit, target, spec)?;
     }
-    if !cranelift && !toolchain.features.is_empty() {
-        return Err(fail(format!(
-            "the unit is for the target features {:?}: the LLVM back end is told none yet",
-            toolchain.features
-        )));
+    // Cranelift's ISA and LLVM's target machine are made for the set the first time it is
+    // compiled with; a set that can't be made is the unit's error, never the baseline's code.
+    let features = target.features_of(&toolchain.features).map_err(fail)?;
+    if cranelift {
+        crate::target_with(features).map_err(|e| {
+            failed(unit, format!("Cranelift has no ISA for the target features {:?}: {e}", toolchain.features))
+        })?;
     }
-    if cranelift && !spec.sanitize.is_empty() {
+    if (cranelift || stencil) && !spec.sanitize.is_empty() {
         return Err(fail(
             "-Zsanitizer and SanitizerCoverage are instrumented by the LLVM back end \
              (Backend::Llvm), which this unit is not compiled by"
                 .to_owned(),
         ));
+    }
+    if !matches!(spec.backend, Backend::Llvm { .. }) && spec.pgo != Pgo::None {
+        // alloc: an error
+        return Err(fail(format!(
+            "PGO ({:?}: -Cprofile-generate, -Cprofile-use) is instrumented and used by the LLVM \
+             back end (Backend::Llvm), and this unit is compiled by {:?}",
+            spec.pgo, spec.backend
+        )));
     }
     if toolchain.frame_pointers != crate::backend::frame_pointers() {
         return Err(fail(format!(
@@ -131,30 +174,49 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
             crate::backend::frame_pointers()
         )));
     }
-    let isa = isa(unit)?;
-    if cranelift && !toolchain.features.is_empty() {
-        // alloc: per unit of a build that names target features, the ISA's settings
-        let flags = isa.isa_flags();
-        for feature in &toolchain.features {
-            let Some((setting, on)) = target.cranelift_setting(feature).map_err(fail)? else { continue };
-            let set = flags.iter().find(|it| it.name == setting).and_then(|it| it.as_bool());
-            if set != Some(on) {
-                return Err(fail(format!(
-                    "the unit is for {feature}, and Cranelift's ISA has `{setting}` {set:?}"
-                )));
-            }
-        }
-    }
-    let pic = isa.flags().is_pic();
-    if pic != (toolchain.relocation == Relocation::Pic) {
-        return Err(fail(format!(
-            "the unit's code is {:?}, the process's Cranelift {}",
-            toolchain.relocation,
-            if pic { "position-independent" } else { "static" }
-        )));
-    }
     if let Some(knob) = set_knob() {
         return Err(fail(format!("`{knob}` is set, which changes code a unit's key has no part of")));
+    }
+    Ok(())
+}
+
+/// What a stencil unit's spec must say of the stencils: the library the process copies from
+/// is the one its key names (`Toolchain::stencils`), its target features turn none of the
+/// baseline's off (the stencils are the baseline's code, which runs wherever the baseline's
+/// features are, and uses none past them).
+fn check_stencils(unit: &Unit, target: &crate::Target, spec: &Spec) -> Result<(), CodegenError> {
+    let fail = |what: String| failed(unit, what);
+    let toolchain = &spec.toolchain;
+    let Some(stencils) = target.stencil() else {
+        // alloc: an error
+        return Err(fail(format!("a stencil unit for {}, which has no stencils", toolchain.target)));
+    };
+    let id = blaze_stencil::library_id(&stencils).map_err(|e| failed(unit, e))?;
+    match &toolchain.stencils {
+        None => {
+            // alloc: an error
+            return Err(fail(format!(
+                "a stencil unit for {}, whose toolchain names no stencil library",
+                toolchain.target
+            )));
+        }
+        Some(named) if !blaze_format::hex::is_encoding(named, &id) => {
+            // alloc: an error
+            return Err(fail(format!(
+                "a stencil unit for the stencil library {named}, and the process copies from {}",
+                blaze_format::hex::encode(&id)
+            )));
+        }
+        Some(_) => {}
+    }
+    if let Some(off) = toolchain.features.iter().find(|it| it.starts_with('-')) {
+        // alloc: an error
+        return Err(fail(format!(
+            "a stencil unit for the target features {:?}: stencils are the code of {}'s \
+             baseline, and `{off}` turns one of its features off",
+            toolchain.features,
+            target.cpu()
+        )));
     }
     Ok(())
 }
@@ -188,89 +250,118 @@ impl Backends<'_> {
         // tables, the shape's tables) is in a frame of the worker's, reset when it returns;
         // what it keeps (the IR, its places, spans, variables and scopes) is the heap's.
         blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
-            let fail = |what: String| failed(unit, format!("{instance:?}: {what}"));
-            let build = Build::of(spec);
-            if build.inlines && !inlined {
-                return Err(fail(format!(
-                    "a unit whose MIR is inlined ({:?}) of references listed for units that \
-                     inline none: what the inlined code calls is not among them",
-                    unit.backend
-                )));
-            }
-            let walked = refs::listed(db, instance, inlined).map_err(fail)?;
-            if walked.len() != refs.len() {
-                return Err(fail(format!(
-                    "{} references given for an instance of {}",
-                    refs.len(),
-                    walked.len()
-                )));
-            }
-            let mut placer = Placer::listed_in(walked, frame);
-            let mut code = build::with(build, || built(db, instance, spec.overflow_checks))
-                .map_err(fail)?
-                .map_err(fail)?;
-            let krate = compiled_in(db, instance);
-            let (places, source, variables) = match &mut code {
-                Built::Ir(pending) => {
-                    let requests = &mut pending.wants.requests;
-                    let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
-                        .map_err(fail)?;
-                    (places, pending.source.take(), pending.variables.take())
-                }
-                Built::Assembled(_, requests) => {
-                    let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
-                        .map_err(fail)?;
-                    (places, None, None)
-                }
-            };
-            let lines = spec.debuginfo != DebugInfo::None;
-            let spans = match (&source, lines) {
-                (Some(source), true) => written_spans(db, hashes, source).map_err(fail)?,
-                _ => Vec::new(),
-            };
-            let told = matches!(spec.debuginfo, DebugInfo::Limited | DebugInfo::Full);
-            let (variables, mut scopes) = match (&source, variables) {
-                (Some(source), Some((env, variables))) if told => {
-                    let krate = env.as_ref(db).krate;
-                    named(db, hashes, krate, source.owner, &variables, &source.spans, frame)
-                        .map_err(fail)?
-                }
-                _ => Default::default(),
-            };
-            if let (Some(source), true) = (&source, lines) {
-                inlined_scopes(db, hashes, source, &mut scopes).map_err(fail)?;
-            }
-            if let Built::Ir(pending) = &mut code {
-                if !lines {
-                    pending.func.stencil.srclocs.clear();
-                }
-                if unit.backend.is_cranelift() {
-                    colocate(&mut pending.func, &places, placer.refs(), frame);
-                }
-            }
-            let inlined =
-                super::frontend::inlined(db, hashes, (instance, inlined)).map_err(fail)?;
-            let function = Function {
-                code,
-                places,
-                spans,
-                variables,
-                scopes,
-                inlined,
-                hint: hint(db, instance),
-                unsanitized: unsanitized(db, spec, instance).map_err(fail)?,
-                release: Default::default(),
-                foldable: foldable(db, instance),
-            };
-            let shape = shape::of(unit, &function, frame).map_err(fail)?;
-            // alloc: the prepared function, kept by the driver until its emit
+            let function = built_function(db, homes, hashes, unit, spec, (instance, inlined), refs, frame)?;
+            let shape = shape::of(unit, &function, frame)
+                // alloc: an error
+                .map_err(|what| failed(unit, format!("{instance:?}: {what}")))?;
             let prepared = match unit.backend {
+                // alloc: the prepared function, kept by the driver until its emit
                 Backend::Cranelift { .. } => Prepared::Cranelift(Box::new(function)),
+                // alloc: the prepared function, kept by the driver until its emit
                 Backend::Llvm { .. } => Prepared::Llvm(Box::new(function)),
+                // alloc: the prepared function, kept by the driver until its emit
+                Backend::Stencil => Prepared::Stencil(Box::new(function)),
             };
             Ok((shape, prepared))
         })
     }
+}
+
+/// `instance`'s IR as `spec` builds it, against `refs`, with what each of its requests is in
+/// the build: what a unit's [`Prepared`] holds, and what [`super::lowered()`] hands out. Its
+/// tables are in `frame`; what it keeps is the heap's.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn built_function(
+    db: &Db,
+    homes: &mut Homes,
+    hashes: &HashSource,
+    unit: &Unit,
+    spec: &Spec,
+    (instance, inlined): (&HirInstance, bool),
+    refs: &Refs,
+    frame: &Frame,
+) -> Result<Function, CodegenError> {
+    // alloc: an error
+    let fail = |what: String| failed(unit, format!("{instance:?}: {what}"));
+    let build = Build::of(spec);
+    if build.inlines && !inlined {
+        // alloc: an error
+        return Err(fail(format!(
+            "a unit whose MIR is inlined ({:?}) of references listed for units that \
+             inline none: what the inlined code calls is not among them",
+            unit.backend
+        )));
+    }
+    let walked = refs::listed(db, instance, inlined).map_err(fail)?;
+    if walked.len() != refs.len() {
+        // alloc: an error
+        return Err(fail(format!(
+            "{} references given for an instance of {}",
+            refs.len(),
+            walked.len()
+        )));
+    }
+    let mut placer = Placer::listed_in(walked, frame);
+    let mut code = build::with(build, || built(db, instance, spec.overflow_checks))
+        .map_err(fail)?
+        .map_err(fail)?;
+    let krate = compiled_in(db, instance);
+    let (places, source, variables) = match &mut code {
+        Built::Ir(pending) => {
+            let requests = &mut pending.wants.requests;
+            let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
+                .map_err(fail)?;
+            (places, pending.source.take(), pending.variables.take())
+        }
+        Built::Assembled(_, requests) => {
+            let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
+                .map_err(fail)?;
+            (places, None, None)
+        }
+    };
+    let lines = spec.debuginfo != DebugInfo::None;
+    let spans = match (&source, lines) {
+        (Some(source), true) => written_spans(db, hashes, source).map_err(fail)?,
+        // alloc: none, empty
+        _ => Vec::new(),
+    };
+    let told = matches!(spec.debuginfo, DebugInfo::Limited | DebugInfo::Full);
+    let (variables, mut scopes) = match (&source, variables) {
+        (Some(source), Some((env, variables))) if told => {
+            let krate = env.as_ref(db).krate;
+            named(db, hashes, krate, source.owner, &variables, &source.spans, frame)
+                .map_err(fail)?
+        }
+        _ => Default::default(),
+    };
+    if let (Some(source), true) = (&source, lines) {
+        inlined_scopes(db, hashes, source, &mut scopes).map_err(fail)?;
+    }
+    if let Built::Ir(pending) = &mut code {
+        if !lines {
+            pending.func.stencil.srclocs.clear();
+        }
+        if matches!(unit.backend, Backend::Cranelift { .. } | Backend::Stencil) {
+            colocate(&mut pending.func, &places, placer.refs(), frame);
+        }
+    }
+    let inlined = super::frontend::inlined(db, hashes, (instance, inlined)).map_err(fail)?;
+    let (features, own_features) = features(db, spec, instance).map_err(fail)?;
+    Ok(Function {
+        code,
+        places,
+        spans,
+        variables,
+        scopes,
+        inlined,
+        hint: hint(db, instance),
+        unsanitized: unsanitized(db, spec, instance).map_err(fail)?,
+        features,
+        release: Default::default(),
+        // A fold would share one function's counter cells between its members, and
+        // give one function's code of its own target features to the others.
+        foldable: !spec.counted && !own_features && foldable(db, instance),
+    })
 }
 
 /// The crate an instance's code is compiled in; `None` for assembly, which is no crate's.
@@ -298,6 +389,71 @@ fn hint(db: &Db, instance: &HirInstance) -> Hint {
     } else {
         Hint::None
     }
+}
+
+/// The target features the instance's code is compiled with, and whether they are more than
+/// its unit's: the unit's (`Toolchain::features`) and what the `#[target_feature(enable)]` of
+/// its function turns on with what that implies (`TargetFeatures::from_fn`), as rustc gives
+/// each function a `target-features` of its own. As rustc's `codegen_instance_attrs`, a vtable
+/// or reify shim has those of the function it is of, and drop glue and the `FnOnce` shims
+/// none; as its `codegen_fn_attrs`, a closure or coroutine has its function's. They change the
+/// code only, never `cfg(target_feature)`.
+fn features(db: &Db, spec: &Spec, instance: &HirInstance) -> Result<(crate::Features, bool), String> {
+    let target = crate::Target::selected()?;
+    let unit = target.features_of(&spec.toolchain.features)?;
+    let func = match &instance.0 {
+        Kind::Code(Instance { def: InstanceDef::Fn(func) | InstanceDef::VtableShim(func), .. }, _) => {
+            Some(*func)
+        }
+        Kind::Code(
+            Instance {
+                def:
+                    InstanceDef::Closure(_)
+                    | InstanceDef::Coroutine(_)
+                    | InstanceDef::CoroutineByMove(_)
+                    | InstanceDef::ReifyShim { .. },
+                ..
+            },
+            _,
+        ) => match super::frontend::item_of(db, &instance.0)? {
+            ItemId::Function(func) => Some(func),
+            _ => None,
+        },
+        Kind::Code(..) | Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(_) => None,
+    };
+    let Some(func) = func else { return Ok((unit, false)) };
+    let enabled = hir_ty::TargetFeatures::from_fn(db, func).known();
+    if enabled.is_empty() {
+        return Ok((unit, false));
+    }
+    let set = with_enabled(target, &spec.toolchain.features, enabled.names())?;
+    Ok((set, set != unit))
+}
+
+/// The set of `toolchain` (a unit's sorted features) with `enabled` (rustc's names, each with
+/// what it implies) turned on: a feature the toolchain turns off is on again, and one the
+/// baseline has or the toolchain turns on already is not named twice.
+fn with_enabled<'a>(
+    target: &crate::Target,
+    toolchain: &[String],
+    enabled: impl Iterator<Item = &'a str>,
+) -> Result<crate::Features, String> {
+    let baseline = super::toolchain::baseline(target);
+    // alloc: per function of a `#[target_feature]`, its set's names
+    let mut names: Vec<String> = toolchain.to_vec();
+    for name in enabled {
+        let off = names.iter().position(|it| it.strip_prefix('-') == Some(name));
+        if let Some(off) = off {
+            names.remove(off);
+        } else if !baseline.iter().any(|it| *it == name)
+            && !names.iter().any(|it| it.strip_prefix('+') == Some(name))
+        {
+            // alloc: per function of a `#[target_feature]`, a feature's name
+            names.push(format!("+{name}"));
+        }
+    }
+    names.sort_unstable();
+    target.features_of(&names)
 }
 
 /// Which of `spec`'s sanitizers are off for the instance. As rustc's `codegen_instance_attrs`,
@@ -615,11 +771,31 @@ fn colocate(func: &mut ir::Function, places: &Places, refs: &[Ref], frame: &Fram
     }
 }
 
-/// Compiles a prepared function with Cranelift, against `refs`.
+/// Compiles a prepared function with Cranelift, against `refs`; `counted`, its code counts its
+/// calls and back edges into its own cells (`blaze_stencil::tier::instrument`).
 pub(crate) fn emit_cranelift(
     unit: &Unit,
     function: Box<Function>,
     refs: &Refs,
+    counted: bool,
+) -> Result<Emitted, CodegenError> {
+    let features = function.features;
+    emit_built(unit, function, refs, |func, named| compiled(unit, func, named, counted, features))
+}
+
+/// Compiles a prepared function by copy-and-patch (`blaze_stencil`), against `refs`.
+fn emit_stencil(unit: &Unit, function: Box<Function>, refs: &Refs) -> Result<Emitted, CodegenError> {
+    emit_built(unit, function, refs, |func, named| stenciled(unit, func, named))
+}
+
+/// A prepared function's code, its IR made code by `backend` (given the stack slots of its
+/// named locals), against `refs`. An assembly function's code is the assembler's, whatever
+/// the backend.
+fn emit_built(
+    unit: &Unit,
+    function: Box<Function>,
+    refs: &Refs,
+    backend: impl FnOnce(ir::Function, &[ir::StackSlot]) -> Result<fragment::Code, CodegenError>,
 ) -> Result<Emitted, CodegenError> {
     if function.places.refs as usize != refs.len() {
         return Err(failed(
@@ -635,7 +811,7 @@ pub(crate) fn emit_cranelift(
     let named = Named { spans: &spans, variables: &variables, scopes: &scopes, inlined };
     match code {
         Built::Ir(pending) => {
-            let code = compiled(unit, pending.func, &pending.named)?;
+            let code = backend(pending.func, &pending.named)?;
             told(unit, &places, &pending.wants.requests, code, refs, named)
         }
         Built::Assembled(code, requests) => told(unit, &places, &requests, code, refs, named),
@@ -730,31 +906,39 @@ fn emit_ir(
     let Built::Ir(pending) = &function.code else {
         return Err(failed(unit, "a fold of an assembly function"));
     };
+    // A fold's members never count: `merge` refuses them.
     if thunk {
-        let code = compiled(unit, ir, &[])?;
+        let code = compiled(unit, ir, &[], false, function.features)?;
         let none = side::Scopes::default();
         let named = Named { spans: &[], variables: &[], scopes: &none, inlined: Vec::new() };
         told(unit, &function.places, function.requests(), code, refs, named)
     } else {
-        let code = compiled(unit, ir, &pending.named)?;
+        let code = compiled(unit, ir, &pending.named, false, function.features)?;
         emitted(unit, function, code, refs)
     }
 }
 
 /// Cranelift's code of the IR at the unit's level, `named` being the stack slots of its
-/// named locals.
+/// named locals; `counted`, counting into the function's own cells; with the ISA of the
+/// function's target features ([`features`]).
 fn compiled(
     unit: &Unit,
     func: ir::Function,
     named: &[ir::StackSlot],
+    counted: bool,
+    features: crate::Features,
 ) -> Result<fragment::Code, CodegenError> {
     let Backend::Cranelift { speed } = unit.backend else {
         return Err(failed(unit, format!("Cranelift's code of a unit for {:?}", unit.backend)));
     };
     let isa = isa(unit)?;
     crate::with_context(func, |context| {
+        // Before the pairs are lowered: the counting is of the IR's own calls and loops.
+        if counted {
+            blaze_stencil::tier::instrument(&mut context.func).map_err(|e| failed(unit, e))?;
+        }
         let pairs = crate::float_pair::lower(&mut context.func);
-        let mut code = crate::emit_lent(context, speed).map_err(|e| failed(unit, e))?;
+        let mut code = crate::emit_lent(context, speed, features).map_err(|e| failed(unit, e))?;
         if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
             code.slots = SlotPlaces::of_frame(isa, frame, &context.func, named.iter().copied());
         }
@@ -763,6 +947,107 @@ fn compiled(
         }
         Ok(code)
     })
+}
+
+/// Copy-and-patch code of the IR (`blaze_stencil::compile_to`), in the terms Cranelift's
+/// compile gives ([`fragment::Code`]), `named` being the stack slots of its named locals.
+/// What the stencils can't compile is the unit's error, never another backend's code.
+/// A prepared function's IR as copy-and-patch compiles it, which [`super::lowered()`] hands out:
+/// a pair of floats `windows_fastcall` can't return is returned as two integers, in its
+/// signature and its calls alike (`float_pair::lower`), whose `hold` gives the code back the
+/// signature its callers know.
+pub(super) fn stencil_ir(func: &mut ir::Function) -> Option<crate::float_pair::Lowered> {
+    crate::float_pair::lower(func)
+}
+
+fn stenciled(
+    unit: &Unit,
+    func: ir::Function,
+    named: &[ir::StackSlot],
+) -> Result<fragment::Code, CodegenError> {
+    if unit.backend != Backend::Stencil {
+        // alloc: an error
+        return Err(failed(unit, format!("copy-and-patch code of a unit for {:?}", unit.backend)));
+    }
+    let target = crate::Target::selected().map_err(|e| failed(unit, e))?;
+    let Some(stencils) = target.stencil() else {
+        // alloc: an error
+        return Err(failed(unit, format!("copy-and-patch code for {}, which has no stencils", target.triple())));
+    };
+    crate::with_context(func, |context| {
+        let pairs = stencil_ir(&mut context.func);
+        let func = &context.func;
+        let mut code = blaze_stencil::compile_to(func, &stencils, |code| stencil_code(code, func, named))
+            .map_err(|e| failed(unit, e))?
+            .map_err(|e| failed(unit, e))?;
+        if let Some(pairs) = pairs {
+            pairs.hold(context, &mut code).map_err(|e| failed(unit, e))?;
+        }
+        Ok(code)
+    })
+}
+
+/// Stencil code as a [`fragment::Code`], copied out of the compile's frame once: its
+/// relocations by the names Cranelift's would have (the counter cells by
+/// `COUNTER_NAMESPACE`, as `tier::instrument` names them in IR), its unwind information
+/// with its landing pads, its lines and where its named slots are.
+fn stencil_code(
+    code: &blaze_stencil::CodeRef<'_>,
+    func: &ir::Function,
+    named: &[ir::StackSlot],
+) -> Result<fragment::Code, String> {
+    use blaze_stencil::code::Name;
+    let mut relocs = crate::spare::relocs();
+    for reloc in code.relocs {
+        let name = match reloc.name {
+            Name::User { namespace, index } => fragment::RelocName::user(namespace, index),
+            Name::LibCall(call) => fragment::RelocName::LibCall(call),
+            Name::Known(symbol) => fragment::RelocName::Known(symbol),
+            Name::Own(offset) => fragment::RelocName::Own(offset),
+            Name::Counter => {
+                fragment::RelocName::User { namespace: blaze_stencil::tier::COUNTER_NAMESPACE, index: 0 }
+            }
+        };
+        let row = fragment::Reloc { offset: reloc.at, kind: reloc.kind, name, addend: reloc.addend, elf_type: None };
+        // alloc: an error
+        relocs.push(row).map_err(|e| e.to_string())?;
+    }
+    let mut lines = crate::spare::lines();
+    LineRow::extend_ranges(&mut lines, code.lines.iter().copied());
+    Ok(fragment::Code {
+        // clone: the function's signature, kept with its code as Cranelift's emit keeps it
+        signature: func.signature.clone(),
+        // alloc: the function's code, kept by the build
+        bytes: code.bytes.to_vec(),
+        align: u64::from(code.align),
+        relocs,
+        unwind: FunctionUnwind::of_stencil(code)?,
+        lines,
+        slots: stencil_slots(code.slots, named)?,
+    })
+}
+
+/// Where the named slots of stencil code are, as [`SlotPlaces::of_frame`] gives Cranelift's:
+/// from the frame pointer, which the stencils' frame always has.
+fn stencil_slots(slots: blaze_stencil::code::SlotsRef<'_>, named: &[ir::StackSlot]) -> Result<SlotPlaces, String> {
+    // A frame base no variable is told from would be read by nothing.
+    if named.is_empty() {
+        return Ok(SlotPlaces::default());
+    }
+    let Some(base) = u8::try_from(slots.base).ok().filter(|it| *it < 32) else {
+        // alloc: an error
+        return Err(format!("stack slots from DWARF register {}, which `DW_OP_reg` has none of", slots.base));
+    };
+    let mut places = Vec::with_capacity(named.len());
+    for &slot in named {
+        let Some(&offset) = slots.offsets.get(slot.as_u32() as usize) else {
+            // alloc: an error
+            return Err(format!("{slot} of a named local, which copy-and-patch code has no place of"));
+        };
+        places.push((slot.as_u32(), VariablePlace::Frame(i64::from(offset))));
+    }
+    // alloc: one byte, kept with the code
+    Ok(SlotPlaces::new(vec![cranelift_codegen::gimli::DW_OP_reg0.0 + base], places))
 }
 
 impl<'db> Prepare for Backends<'db> {
@@ -797,6 +1082,9 @@ impl<'db> Prepare for Backends<'db> {
             Prepared::Cranelift(_) => {
                 Err(failed(unit, "a summary of a Cranelift unit: summaries are LLVM's"))
             }
+            Prepared::Stencil(_) => {
+                Err(failed(unit, "a summary of a stencil unit: summaries are LLVM's"))
+            }
         }
     }
 
@@ -813,16 +1101,24 @@ impl<'db> Prepare for Backends<'db> {
                 if imports.is_some() {
                     return Err(failed(unit, "imports for a Cranelift unit: imports are LLVM's"));
                 }
-                emit_cranelift(unit, function, refs)
+                emit_cranelift(unit, function, refs, spec.counted)
             }
             Prepared::Llvm(function) => super::release::emit(unit, spec, *function, refs, imports),
+            Prepared::Stencil(function) => {
+                if imports.is_some() {
+                    return Err(failed(unit, "imports for a stencil unit: imports are LLVM's"));
+                }
+                emit_stencil(unit, function, refs)
+            }
         }
     }
 
+    // Counting code is never `foldable` ([`Backends::prepared`]): a fold would share one
+    // function's cells between many.
     fn masked(&self, _: &Unit, prepared: &Prepared, refs: &Refs) -> Option<Masked> {
         match prepared {
             Prepared::Cranelift(function) if function.foldable => super::fold::masked(function, refs),
-            Prepared::Cranelift(_) | Prepared::Llvm(_) => None,
+            Prepared::Cranelift(_) | Prepared::Llvm(_) | Prepared::Stencil(_) => None,
         }
     }
 
@@ -834,9 +1130,15 @@ impl<'db> Prepare for Backends<'db> {
         let mut functions = Vec::with_capacity(members.len());
         for (unit, spec, prepared, refs) in members {
             match prepared {
+                Prepared::Cranelift(_) if spec.counted => {
+                    return Err(failed(unit, "a fold of a counting unit: its cells are its own"));
+                }
                 Prepared::Cranelift(function) => functions.push((unit, spec, function, refs)),
                 Prepared::Llvm(_) => {
                     return Err(failed(unit, "a fold of an LLVM unit: folds are Cranelift's"));
+                }
+                Prepared::Stencil(_) => {
+                    return Err(failed(unit, "a fold of a stencil unit: folds are Cranelift's"));
                 }
             }
         }
@@ -882,5 +1184,32 @@ impl Compile for Backends<'_> {
     ) -> Result<CompiledFunction, CodegenError> {
         let (_, prepared) = self.prepare(frontend, unit, spec, instance, refs)?;
         Ok(self.emit(unit, spec, prepared, refs, None)?.function)
+    }
+}
+
+#[cfg(test)]
+mod features_tests {
+    use super::with_enabled;
+
+    fn names(features: &[&str]) -> Vec<String> {
+        features.iter().map(|it| (*it).to_owned()).collect()
+    }
+
+    /// A `#[target_feature(enable)]` set is the unit's with what it enables: named once, a
+    /// baseline feature not at all, and one the unit turns off on again.
+    #[test]
+    fn a_functions_set_is_its_units_with_what_it_enables() {
+        let x86 = crate::Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let set = with_enabled(&x86, &[], ["avx", "avx2", "sse2"].into_iter()).expect("a set");
+        assert_eq!(set.names(), names(&["+avx", "+avx2"]));
+        let unit = names(&["+avx", "+popcnt"]);
+        let set = with_enabled(&x86, &unit, ["avx", "avx2"].into_iter()).expect("a set");
+        assert_eq!(set.names(), names(&["+avx", "+avx2", "+popcnt"]));
+        let unit = names(&["-popcnt"]);
+        let set = with_enabled(&x86, &unit, ["popcnt"].into_iter()).expect("a set");
+        assert!(set.is_baseline());
+        let unit = x86.features_of(&names(&["+avx"])).expect("a set");
+        let same = with_enabled(&x86, &names(&["+avx"]), ["avx"].into_iter()).expect("a set");
+        assert_eq!(same, unit);
     }
 }

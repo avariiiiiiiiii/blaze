@@ -974,7 +974,7 @@ impl MacroId {
 #[salsa::tracked]
 impl MacroId {
     /// Turns a MacroId into a MacroDefId, describing the macro's definition post name resolution.
-    #[salsa::tracked(returns(copy))]
+    #[salsa::tracked(returns(copy), mem_tag = Nameres)]
     pub fn definition(self, db: &Db) -> MacroDefId {
         let kind = |expander, file_id, m| {
             let in_file = InFile::new(file_id, m);
@@ -1793,7 +1793,7 @@ impl Complete {
 }
 
 // return: macro call id and include file id
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
 pub fn include_macro_invoc(
     db: &Db,
     krate: Crate,

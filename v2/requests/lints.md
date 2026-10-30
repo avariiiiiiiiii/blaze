@@ -67,6 +67,14 @@ Design: docs/v2/plan/lanes/lints.md, docs/v2/plan/lanes/lints/cx.md.
   Until it exists, blaze-lints is written against this exact API.
 
 > forwarded to db (`crates/hir`; told by tmux).
+> applied by db-audit-other-bodyanalysis (2026-10-29 23:10): `crates/hir/src/body_analysis.rs`,
+> re-exported `hir::BodyAnalysis`, this exact API; answers through `SourceAnalyzer` built over
+> the relative maps of the store a node is in (the body's, the item's signature or fields, or an
+> item nested in the body, found from `Body::blocks`' item scopes), scopes climbed out of
+> expansions by the store's own calls; tested in `crates/hir/src/body_analysis/tests.rs`. Not
+> built (no-build lane). Left: `resolve_path`'s fresh lowering of a path still makes
+> `ExprCollector::new`, which reads the file's ast id and span maps (request in `db.md`).
+> applied by db-audit-other (23:16): the gap is closed and the rest is checked. `SourceAnalyzer` has `maps` (`crates/hir/src/source_analyzer.rs:87`, `None` at every other constructor), and its four path re-lowerings go through `path_collector` (:301, `ExprCollector::with_maps`, which the lower.rs owner made `pub`). `BodyAnalysis` sets `maps` to the anchor's `BodySyntax` maps for a node of the body's own file (`body_analysis.rs:472`), so no answer reads the file's whole maps. Every method blaze-lints calls exists with its caller's signature (`pub use` at `crates/hir/src/lib.rs:167`). Not compiled.
 
 ## diagnostics: register blaze's new lints and the group `blaze::hot`
 

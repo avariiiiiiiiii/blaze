@@ -51,6 +51,7 @@ the first pick, and each attempt's applicable candidates are one `ApplicableCand
 own.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): a summary of the sections below, each settled in its own subsection; in the tree.
 
 ## Prerequisites (other parts)
 
@@ -74,11 +75,13 @@ own.
   solver; see "Left as is".
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): in the tree: `crates/hir-ty/src/lib.rs:5` (`allocator_api`), `crates/hir-ty/src/db.rs:46` (`INFER_TAG`), `FrameMap`/`FrameSet` in `crates/hir-ty/src/lib.rs`, `crates/hir-ty/src/infer.rs:2049` (the context's frame), salsa's `mem_tag` (`vendor/salsa/src/function/execute.rs`).
 
 ## Shared helpers (method_resolution.rs, lane db and lane items)
 
 > forwarded to db (from requests, pass 17; told by tmux).
 > forwarded by db-mem-infer-b (21:25): every entry in `method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs` and `drop.rs` (S1, P1 to P5, C1, C2, I1 to I6, M1 to M8, O1 to O4, SP1, D1, T1, T2 and their rows of the tables and tests below) is lane items', filed in `v2/requests/db.md` "mem-db-infer-method, for lane items". Lane db's entries here are P6, N1, R1, H1, H2.
+> checked by db-audit-mem (22:46): in the tree at `crates/hir-ty/src/method_resolution.rs:83` (`pub(crate) use crate::{FrameMap, FrameSet};`).
 
 ### S1. Frame map and set aliases
 
@@ -103,6 +106,7 @@ pub(crate) type FrameSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame
 ## Hot path: method calls and paths
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): each subsection applied or superseded below (db-mem-infer-b, frontend-fast-method); in the tree at `crates/hir-ty/src/autoderef.rs:85` (`AutoderefSteps` an `ArrayVec`), `crates/hir-ty/src/method_resolution.rs:626` (`TraitValueItems::new_in`).
 
 ### P1. `MethodResolutionContext` carries the frame (method_resolution.rs:74, lane db + items)
 
@@ -680,6 +684,7 @@ Ty<'db>> + use<'db>` holds: `arrayvec::IntoIter` owns its items.
 ## Confirm
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): applied below (frontend-fast-method); in the tree at `crates/hir-ty/src/method_resolution/confirm.rs:184` to `:195` (the context's frame, `adjust_steps_as_infer_ok(frame)`).
 
 ### C1. `ConfirmContext` and its lowerer carry `'f` (confirm.rs:40-45, 53, 74-80, 316, 352-358, lane db + items)
 
@@ -1545,6 +1550,7 @@ fn crates_containing_incoherent_inherent_impls(db: &Db, krate: Crate) -> Box<[Cr
 ## Other method_resolution.rs queries (lane db + items)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): M1 to M8 applied below (db-mem-infer-b-queries); 33 `mem_tag = Infer` in `crates/hir-ty/src/method_resolution.rs`.
 
 ### M1. `trait_value_items` (559-579)
 
@@ -2061,6 +2067,7 @@ scan a memo slice.
 ## opaques.rs (lane db + items)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): applied below (requests-items-mem; O4 nothing); `crates/hir-ty/src/opaques.rs` carries its 7 `mem_tag = Infer`.
 
 ### O1. `type_aliases_of` and its two queries (118-139)
 
@@ -2232,6 +2239,7 @@ here. Whether that `Vec` moves to a frame is the solver's entry.
 ## specialization.rs (lane db + items)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): applied below (requests-items-mem); in the tree at `crates/hir-ty/src/specialization.rs:325` (`constrained_params<'f>`).
 
 ### SP1. `constrained_params` and `parameters_for` in the frame (231-289, 294-361)
 
@@ -2372,6 +2380,7 @@ crate::method_resolution::{FrameSet, SelfTyKey, TraitImpls};`. `specializes_quer
 ## drop.rs (lane db + items)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): applied below (requests-items-mem); in the tree at `crates/hir-ty/src/drop.rs:106` (`has_drop_glue_in`).
 
 ### D1. `has_drop_glue`'s visited set (100-108)
 
@@ -2432,6 +2441,7 @@ it is called. Imports: `use blaze_mem::Frame;`, `use rustc_hash::FxBuildHasher;`
 ## inhabitedness.rs (lane db)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): applied below (db-mem-infer-b); in the tree at `crates/hir-ty/src/inhabitedness.rs:33`, `:62`, `:161` (`_in` forms, `frame_set(frame)`).
 
 ### N1. `UninhabitedFrom::recursive_ty` in the frame (22-49, 51-58, 101-104)
 
@@ -2541,6 +2551,7 @@ here only as a note.
 ## representability.rs (lane db)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): applied below (db-mem-infer-b, then db-apply-ty's bits on top); in the tree at `crates/hir-ty/src/representability.rs:101` and `:128`.
 
 ### R1. `params_in_repr` builds its words in the frame (93-155, 175-201)
 
@@ -2663,6 +2674,7 @@ and `rest` assertions (both tests keep their assertions: bits 0, 5, 63, 64, 130 
 ## traits.rs (lane db + items)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): applied below (requests-items-mem, db-mem-infer-b); `crates/hir-ty/src/traits.rs` has both `mem_tag = Infer`.
 
 ### T1. `where_predicate_must_hold` (395-470): entry point outside queries
 
@@ -2730,6 +2742,7 @@ an exact `Vec<bool>` the caller (`blaze-items/src/form.rs:753`) owns: no change.
 ## Callers outside hir-ty (lane db: `crates/hir`)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): applied below (db-mem-infer-b, H1/H2); in the tree at `crates/hir/src/attrs.rs:558` (`frame::task(Tag::Infer, ..)`).
 
 ### H1. `crates/hir/src/attrs.rs:556`
 
@@ -2967,6 +2980,7 @@ that is not changed above (`rg` over the eleven files):
   memos.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): notes, nothing to apply; db-mem-infer-b's hot_lint (22:10) found only these listed lines left.
 
 ## Tests (R8; budget tests are mem-db-infer's)
 
@@ -3096,6 +3110,7 @@ None of R1-R8 fails here. Two notes for mem-db-infer:
   forms let their callers pass the frame they have, which their parts should do.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): notes, nothing to apply.
 
 ## Speed
 
@@ -3131,3 +3146,4 @@ shrunk. The bound is the write of the result columns plus one pass over the reco
 0.5 MB touched, well under a millisecond, once per crate per change.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:46): notes, nothing to apply.

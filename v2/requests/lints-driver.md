@@ -11,6 +11,11 @@
   `BodyAnalysis`; `Semantics` stays only for `item_lints`, which reads the whole file anyway.
 
 > forwarded to db (db-next2, `crates/hir/src/body_analysis.rs`) (requests, pass 19; told by tmux).
+> applied by db-audit-other-bodyanalysis (2026-10-29 23:10): all three, with no inference, in
+> the scope of the block (or nested item's signature or fields) the node is in; a macro call by
+> its path in that scope (`MacroSubNs::Bang`), a name as `speculative_resolve_mod_path` does.
+> Tested in `crates/hir/src/body_analysis/tests.rs`; not built.
+> checked by db-audit-other (23:16): in the tree at `crates/hir/src/body_analysis.rs`: `resolve_type` :300, `resolve_macro_call` :307, `resolve_name` :328, with the signatures `blaze-lints/src/check.rs` calls. Not compiled.
 
 ## lints-blaze: `blaze::Lint` public
 

@@ -5,6 +5,8 @@ mod incremental;
 mod macros;
 mod mod_resolution;
 mod paths;
+mod primitive_shadow;
+mod trait_imports;
 mod uses;
 mod worklist;
 mod batch_order;

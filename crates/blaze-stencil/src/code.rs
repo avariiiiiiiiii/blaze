@@ -34,6 +34,9 @@ pub struct Code {
     pub traps: Vec<(u32, ir::TrapCode)>,
     /// Where each stack slot is, from the frame pointer.
     pub slots: Slots,
+    /// The bytes from the frame pointer down to the stack pointer in the body, as Cranelift's
+    /// `frame_to_fp_offset`: where a landing pad's stack pointer is put back to.
+    pub frame: u32,
 }
 
 impl Code {
@@ -139,6 +142,7 @@ pub struct CodeRef<'a> {
     pub lines: &'a [(u32, ir::SourceLoc)],
     pub traps: &'a [(u32, ir::TrapCode)],
     pub slots: SlotsRef<'a>,
+    pub frame: u32,
 }
 
 /// [`Unwind`], borrowed.
@@ -194,7 +198,8 @@ impl Code {
     /// Makes this `code`, writing into this one's vectors: nothing is allocated unless a vector
     /// is too small, or the unwind information changes kind.
     pub fn copy_from(&mut self, code: &CodeRef<'_>) {
-        let CodeRef { bytes, align, relocs, unwind, calls, handlers, lines, traps, slots } = *code;
+        let CodeRef { bytes, align, relocs, unwind, calls, handlers, lines, traps, slots, frame } =
+            *code;
         refill(&mut self.bytes, bytes);
         self.align = align;
         refill(&mut self.relocs, relocs);
@@ -222,6 +227,7 @@ impl Code {
         refill(&mut self.traps, traps);
         self.slots.base = slots.base;
         refill(&mut self.slots.offsets, slots.offsets);
+        self.frame = frame;
     }
 }
 

@@ -59,6 +59,7 @@ pub mod frozen;
 pub use hir_expand::proc_macro::may_have_session_macros;
 mod mod_resolution;
 mod path_resolution;
+mod trait_items;
 pub mod proc_macro;
 pub mod uses;
 
@@ -95,6 +96,7 @@ use tt::TextRange;
 use crate::{
     AstId, BlockId, BlockIdLt, BuiltinDeriveImplId, ExternCrateId, FunctionId, FxIndexMap, Lookup,
     MacroCallStyles, MacroExpander, MacroId, ModuleId, ModuleIdLt, ProcMacroId, UseId,
+    builtin_type::BuiltinType,
     item_scope::{BuiltinShadowMode, ItemScope},
     item_tree::TreeId,
     nameres::{diagnostics::DefDiagnostic, path_resolution::ResolveMode},
@@ -638,6 +640,27 @@ pub fn crate_def_map(db: &Db, crate_id: Crate) -> &DefMap {
 #[salsa::tracked]
 pub fn crate_recursion_limit(db: &Db, krate: Crate) -> u32 {
     crate_def_map(db, krate).recursion_limit()
+}
+
+/// Whether a primitive type's name (`u8`, `str`, `bool`, ..) can mean something else in
+/// `krate`: a module of the crate has that name in its type namespace (an item, a named or glob
+/// import, an `extern crate`), or the crate's extern prelude or prelude does. When it is
+/// `false`, a one-segment path of a primitive type's name written in a module of the crate is
+/// that primitive type, unless a generic parameter or a block scope around the path has the
+/// name: blocks are not counted (each has its own def map), nor are generic parameters, so a
+/// caller checks those itself.
+#[salsa::tracked]
+pub fn crate_shadows_primitive_type(db: &Db, krate: Crate) -> bool {
+    let pair = crate_local_def_map(db, krate);
+    let def_map = pair.def_map(db);
+    let shadows = |scope: &ItemScope| {
+        scope.types().any(|(name, _)| BuiltinType::by_name(name).is_some())
+    };
+    def_map.modules(db).any(|(_, module)| shadows(module.scope(db)))
+        || pair.local(db).extern_prelude().any(|(name, _)| BuiltinType::by_name(name).is_some())
+        || def_map.prelude().is_some_and(|(prelude, _)| {
+            shadows(prelude.def_map(db).module(db, prelude).scope(db))
+        })
 }
 
 #[salsa::tracked]
@@ -1202,7 +1225,7 @@ impl SourcePosition {
     fn new(db: &Db, mut file: HirFileId, range: TextRange) -> Self {
         let mut calls = SmallVec::from_iter([(file, range.start())]);
         while let Some(call) = file.macro_file() {
-            let node = call.call_node(db);
+            let node = call.call_node_view(db);
             file = node.file_id;
             calls.push((file, node.value.text_range().start()));
         }

@@ -6,8 +6,8 @@
 //!   loader's thread-local bias, the C objects and libraries of the link line and the span
 //!   tables positions are filled from.
 //!   Images of one graph differ only in which instances they hold.
-//! - [`ImageKey`]: the graph key and the instances: every function by its instance key and
-//!   code hash, every static by its item, instance and definition, every name the image
+//! - [`ImageKey`]: the graph key and the instances: every function by its instance key,
+//!   code hash and what it inlined, every static by its item, instance and definition, every name the image
 //!   defines. It is the store's key of the image and the name of its one memory object on
 //!   the machine.
 //!
@@ -15,15 +15,17 @@
 //! error here until it is hashed. Lists are hashed sorted and length-prefixed, so the order
 //! the caller found them in never changes a key.
 
+use blaze_codegen::content::arch_tag;
 use blaze_codegen::settings::Toolchain;
-use blaze_codegen::{Arch, CompiledFunction, Init, InstanceKey, Reloc, Settings, Static, Target};
-use blaze_ids::{ContentId, Hasher, radix};
+use blaze_codegen::{CompiledFunction, InstanceKey, Settings, Target};
+use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
-use blaze_link::{Debug, Format, NativeKind, Output, OutputKind, Platform};
+use blaze_link::{Debug, DevRun, Format, NativeKind, Output, OutputKind, Platform};
+use blaze_mem::{Tag, frame, frame::Frame};
 
-pub const GRAPH_DOMAIN: &str = "blaze v2 premap graph 1";
-pub const IMAGE_DOMAIN: &str = "blaze v2 premap image 1";
-pub const STATIC_DOMAIN: &str = "blaze v2 premap static 1";
+pub const GRAPH_DOMAIN: &str = "blaze v2 premap graph 2";
+pub const IMAGE_DOMAIN: &str = "blaze v2 premap image 2";
+pub const INLINED_DOMAIN: &str = "blaze v2 premap inlined 1";
 
 /// The dependency graph an image is of: what every image of it shares.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -76,11 +78,13 @@ pub struct GraphInputs<'a> {
     pub spans: &'a [(ContentId, ContentId)],
 }
 
-/// A function of the image: its key and its generic's code hash.
+/// A function of the image: its key, its generic's code hash and what it built in of other
+/// functions ([`inlined_digest`]), which the code hash does not say.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct KeyedFunction {
     pub key: InstanceKey,
     pub code: CodeHash,
+    pub inlined: Option<ContentId>,
 }
 
 /// A static of the image: which one, and the content ID of its definition
@@ -98,36 +102,39 @@ pub struct ImageInputs<'a> {
     pub functions: &'a [KeyedFunction],
     pub statics: &'a [KeyedStatic],
     /// The names its Rust code defines (`#[no_mangle]`, `#[export_name]`) and what each is.
-    pub names: &'a [(String, Target)],
+    pub names: &'a [&'a (String, Target)],
     /// The names for debuggers and backtraces, when the output carries debug info.
-    pub debug_names: &'a [(InstanceKey, String)],
+    pub debug_names: &'a [&'a (InstanceKey, String)],
 }
 
 impl GraphKey {
+    /// On every dev build: its sorting is on a frame, so it allocates nothing of the heap.
     pub fn of(inputs: &GraphInputs<'_>) -> GraphKey {
+        frame::task(Tag::Link, |frame| GraphKey::of_in(inputs, frame))
+    }
+
+    fn of_in(inputs: &GraphInputs<'_>, frame: &Frame) -> GraphKey {
         let GraphInputs { units, toolchain, settings, linker, output, base, tls_bias, natives, spans } = inputs;
         let mut hasher = Hasher::new(GRAPH_DOMAIN);
 
-        let mut order: Vec<usize> = (0..units.len()).collect();
-        order.sort_unstable_by(|a, b| {
-            let (a, b) = (&units[*a], &units[*b]);
-            (a.package, a.target).cmp(&(b.package, b.target))
-        });
+        let mut order = Vec::with_capacity_in(units.len(), frame);
+        order.extend(units.iter());
+        order.sort_unstable_by(|a, b| (a.package, a.target).cmp(&(b.package, b.target)));
         count(&mut hasher, units.len());
-        for at in order {
-            let DepUnit { package, target, features, cfg, rustflags } = &units[at];
+        for DepUnit { package, target, features, cfg, rustflags } in order {
             hasher.part(package.as_bytes()).part(target.as_bytes());
-            set(&mut hasher, features);
-            set(&mut hasher, cfg);
+            set(&mut hasher, features, frame);
+            set(&mut hasher, cfg, frame);
             count(&mut hasher, rustflags.len());
             for flag in rustflags.iter() {
                 hasher.part(flag.as_bytes());
             }
         }
 
-        toolchain_into(&mut hasher, toolchain);
+        toolchain_into(&mut hasher, toolchain, frame);
 
-        let mut ids: Vec<[u8; 32]> = settings.iter().map(|it| it.0.0).collect();
+        let mut ids = Vec::with_capacity_in(settings.len(), frame);
+        ids.extend(settings.iter().map(|it| it.0.0));
         ids.sort_unstable();
         ids.dedup();
         count(&mut hasher, ids.len());
@@ -137,10 +144,11 @@ impl GraphKey {
         output_into(&mut hasher, output);
         hasher.update(&base.to_le_bytes()).update(&tls_bias.to_le_bytes());
 
-        let mut natives: Vec<&NativeInput> = natives.iter().collect();
-        radix::sort_copy_by_key(&mut natives, |it| it.order);
-        count(&mut hasher, natives.len());
-        for NativeInput { id, kind, order } in natives {
+        let mut sorted = Vec::with_capacity_in(natives.len(), frame);
+        sorted.extend(natives.iter());
+        sorted.sort_unstable_by_key(|it| it.order);
+        count(&mut hasher, sorted.len());
+        for NativeInput { id, kind, order } in sorted {
             hasher.id(id).update(&order.to_le_bytes());
             match kind {
                 NativeKind::Object => hasher.update(&[0]),
@@ -149,10 +157,11 @@ impl GraphKey {
             };
         }
 
-        let mut spans: Vec<&(ContentId, ContentId)> = spans.iter().collect();
-        spans.sort_unstable();
-        count(&mut hasher, spans.len());
-        for (anchor, table) in spans {
+        let mut sorted = Vec::with_capacity_in(spans.len(), frame);
+        sorted.extend(spans.iter());
+        sorted.sort_unstable();
+        count(&mut hasher, sorted.len());
+        for (anchor, table) in sorted {
             hasher.id(anchor).id(table);
         }
         GraphKey(hasher.finish())
@@ -160,43 +169,48 @@ impl GraphKey {
 }
 
 impl ImageKey {
+    /// Only for a build its graph's newest image does not serve; its sorting is on a frame.
     pub fn of(graph: GraphKey, inputs: &ImageInputs<'_>) -> ImageKey {
+        frame::task(Tag::Link, |frame| ImageKey::of_in(graph, inputs, frame))
+    }
+
+    fn of_in(graph: GraphKey, inputs: &ImageInputs<'_>, frame: &Frame) -> ImageKey {
         let ImageInputs { functions, statics, names, debug_names } = inputs;
         let mut hasher = Hasher::new(IMAGE_DOMAIN);
         hasher.id(&graph.0);
 
-        // One flat buffer of 64-byte records, sorted, hashed in one call: BLAKE3 hashes a
-        // long input on all its SIMD lanes at once.
-        let mut flat: Vec<[u8; 64]> = functions
-            .iter()
-            .map(|KeyedFunction { key, code }| {
-                let mut it = [0; 64];
-                it[..32].copy_from_slice(&key.0.0);
-                it[32..].copy_from_slice(&code.0.0);
-                it
-            })
-            .collect();
+        // One flat buffer of records, sorted, hashed in one call: BLAKE3 hashes a long input
+        // on all its SIMD lanes at once.
+        let mut flat = Vec::with_capacity_in(functions.len(), frame);
+        flat.extend(functions.iter().map(|KeyedFunction { key, code, inlined }| {
+            let mut it = [0u8; 96];
+            it[..32].copy_from_slice(&key.0.0);
+            it[32..64].copy_from_slice(&code.0.0);
+            if let Some(inlined) = inlined {
+                it[64..].copy_from_slice(&inlined.0);
+            }
+            it
+        }));
         flat.sort_unstable();
         flat.dedup();
         count(&mut hasher, flat.len());
         hasher.update(flat.as_flattened());
 
-        let mut flat: Vec<[u8; 96]> = statics
-            .iter()
-            .map(|KeyedStatic { item, instance, definition }| {
-                let mut it = [0; 96];
-                it[..32].copy_from_slice(&item.0.0);
-                it[32..64].copy_from_slice(&instance.0);
-                it[64..].copy_from_slice(&definition.0);
-                it
-            })
-            .collect();
+        let mut flat = Vec::with_capacity_in(statics.len(), frame);
+        flat.extend(statics.iter().map(|KeyedStatic { item, instance, definition }| {
+            let mut it = [0u8; 96];
+            it[..32].copy_from_slice(&item.0.0);
+            it[32..64].copy_from_slice(&instance.0);
+            it[64..].copy_from_slice(&definition.0);
+            it
+        }));
         flat.sort_unstable();
         flat.dedup();
         count(&mut hasher, flat.len());
         hasher.update(flat.as_flattened());
 
-        let mut sorted: Vec<&(String, Target)> = names.iter().collect();
+        let mut sorted = Vec::with_capacity_in(names.len(), frame);
+        sorted.extend(names.iter());
         sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         count(&mut hasher, sorted.len());
         for (name, target) in sorted {
@@ -204,7 +218,8 @@ impl ImageKey {
             target_into(&mut hasher, target);
         }
 
-        let mut sorted: Vec<&(InstanceKey, String)> = debug_names.iter().collect();
+        let mut sorted = Vec::with_capacity_in(debug_names.len(), frame);
+        sorted.extend(debug_names.iter());
         sorted.sort_unstable();
         count(&mut hasher, sorted.len());
         for (key, name) in sorted {
@@ -214,47 +229,38 @@ impl ImageKey {
     }
 }
 
-/// The content ID of a static's definition: its value, alignment, mutability, thread-local
-/// storage, section and the data its value refers to.
-pub fn static_definition(value: &Static) -> ContentId {
-    let Static { item, instance, align, init, data, mutable, thread_local, section } = value;
-    let mut hasher = Hasher::new(STATIC_DOMAIN);
-    hasher.id(&item.0).id(instance).update(&align.to_le_bytes());
-    match init {
-        Init::Bytes { bytes, relocs } => {
-            hasher.update(&[0]).part(bytes);
-            relocs_into(&mut hasher, relocs);
-        }
-        Init::Zeroed { size } => {
-            hasher.update(&[1]).update(&size.to_le_bytes());
-        }
-    }
-    count(&mut hasher, data.len());
-    for blaze_codegen::Data { id, align, bytes, relocs } in data {
-        hasher.id(id).update(&align.to_le_bytes()).part(bytes);
-        relocs_into(&mut hasher, relocs);
-    }
-    hasher.update(&[*mutable as u8, *thread_local as u8]);
-    match section {
-        Some(section) => hasher.update(&[1]).part(section.as_bytes()),
-        None => hasher.update(&[0]),
-    };
-    hasher.finish()
+/// The content ID of a static's definition: codegen's, the one hash of it, so an image's
+/// key and its check can't drift.
+pub use blaze_codegen::driver::static_definition;
+
+/// What the key holds of a function: its key, its code hash (given by the caller from the
+/// instance it compiled) and what it inlined.
+pub fn keyed(function: &CompiledFunction, code: CodeHash) -> KeyedFunction {
+    KeyedFunction { key: function.key, code, inlined: inlined_digest(&function.inlined) }
 }
 
-/// What the key holds of a function: its key and its code hash, the code hash given by the
-/// caller from the instance it compiled.
-pub fn keyed(function: &CompiledFunction, code: CodeHash) -> KeyedFunction {
-    KeyedFunction { key: function.key, code }
+/// The code hashes of the callees whose bodies a function inlined, in its order: `None` when
+/// it inlined none, as a dev build's functions mostly do.
+pub fn inlined_digest(inlined: &[CodeHash]) -> Option<ContentId> {
+    if inlined.is_empty() {
+        return None;
+    }
+    let mut hasher = Hasher::new(INLINED_DOMAIN);
+    count(&mut hasher, inlined.len());
+    for code in inlined {
+        hasher.id(&code.0);
+    }
+    Some(hasher.finish())
 }
 
 fn count(hasher: &mut Hasher, n: usize) {
     hasher.update(&(n as u64).to_le_bytes());
 }
 
-/// A set of strings, sorted and deduplicated. Per unit, once per key: units are hundreds.
-fn set(hasher: &mut Hasher, items: &[String]) {
-    let mut sorted: Vec<&str> = items.iter().map(String::as_str).collect();
+/// A set of strings, sorted and deduplicated.
+fn set(hasher: &mut Hasher, items: &[String], frame: &Frame) {
+    let mut sorted = Vec::with_capacity_in(items.len(), frame);
+    sorted.extend(items.iter().map(String::as_str));
     sorted.sort_unstable();
     sorted.dedup();
     count(hasher, sorted.len());
@@ -263,10 +269,11 @@ fn set(hasher: &mut Hasher, items: &[String]) {
     }
 }
 
-fn toolchain_into(hasher: &mut Hasher, toolchain: &Toolchain) {
-    let Toolchain { id, target, arch, cpu, features, cranelift, llvm, frame_pointers, relocation } = toolchain;
+fn toolchain_into(hasher: &mut Hasher, toolchain: &Toolchain, frame: &Frame) {
+    let Toolchain { id, target, arch, cpu, features, cranelift, llvm, stencils, frame_pointers, relocation } = toolchain;
     hasher.id(id).part(target.as_bytes()).update(&[arch_tag(*arch)]).part(cpu.as_bytes());
-    let mut sorted: Vec<&str> = features.iter().map(String::as_str).collect();
+    let mut sorted = Vec::with_capacity_in(features.len(), frame);
+    sorted.extend(features.iter().map(String::as_str));
     sorted.sort_unstable();
     count(hasher, sorted.len());
     for feature in sorted {
@@ -277,12 +284,30 @@ fn toolchain_into(hasher: &mut Hasher, toolchain: &Toolchain) {
         Some(llvm) => hasher.update(&[1]).part(llvm.as_bytes()),
         None => hasher.update(&[0]),
     };
+    match stencils {
+        Some(stencils) => hasher.update(&[1]).part(stencils.as_bytes()),
+        None => hasher.update(&[0]),
+    };
     hasher.update(&[*frame_pointers as u8, *relocation as u8]);
 }
 
 fn output_into(hasher: &mut Hasher, output: &Output) {
-    let Output { format, arch, kind, interpreter, platform, incremental, debug, live, tags, stack, windows_subsystem } =
-        output;
+    let Output {
+        format,
+        arch,
+        kind,
+        interpreter,
+        platform,
+        incremental,
+        debug,
+        live,
+        tags,
+        stack,
+        windows_subsystem,
+        dev_run,
+        triple,
+        exec_log,
+    } = output;
     hasher.update(&[format_tag(*format), arch_tag(*arch)]);
     match kind {
         OutputKind::Executable { entry } => {
@@ -321,14 +346,13 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
         None => hasher.update(&[0]),
     };
     hasher.update(&[*windows_subsystem as u8]);
-}
-
-fn relocs_into(hasher: &mut Hasher, relocs: &[Reloc]) {
-    count(hasher, relocs.len());
-    for Reloc { at, kind, target, addend } in relocs {
-        hasher.update(&at.to_le_bytes()).update(&[blaze_codegen::content::kind_tag(*kind)]).update(&addend.to_le_bytes());
-        target_into(hasher, target);
-    }
+    match dev_run {
+        Some(DevRun { arena, cells, fixed }) => {
+            hasher.update(&[1]).update(&arena.to_le_bytes()).update(&cells.to_le_bytes()).update(&fixed.to_le_bytes())
+        }
+        None => hasher.update(&[0]),
+    };
+    hasher.part(triple.as_bytes()).update(&[*exec_log as u8]);
 }
 
 fn target_into(hasher: &mut Hasher, target: &Target) {
@@ -340,15 +364,10 @@ fn target_into(hasher: &mut Hasher, target: &Target) {
         Target::Extern(name) => hasher.update(&[4]).part(name.as_bytes()),
         Target::Weak(name) => hasher.update(&[5]).part(name.as_bytes()),
         Target::Position(span) => hasher.update(&[6]).id(&span.anchor).update(&span.index.to_le_bytes()),
+        Target::Coverage(array) => hasher.update(&[7]).update(&array.to_le_bytes()),
+        Target::Counter(key) => hasher.update(&[8]).id(&key.0),
+        Target::ProfileCounters => hasher.update(&[9]),
     };
-}
-
-pub(crate) fn arch_tag(arch: Arch) -> u8 {
-    match arch {
-        Arch::X86_64 => 0,
-        Arch::Aarch64 => 1,
-        Arch::Wasm32 => 2,
-    }
 }
 
 pub(crate) fn format_tag(format: Format) -> u8 {

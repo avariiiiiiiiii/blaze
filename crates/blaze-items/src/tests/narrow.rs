@@ -46,19 +46,11 @@ fn krate(db: &TestDB) -> Crate {
 }
 
 fn declarations(db: &TestDB) -> Vec<ModuleDefId> {
-    let def_map = crate_def_map(db, krate(db));
-    def_map
-        .modules(db)
-        .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
-        .collect()
+    hir_def::test_items::declarations(db, krate(db))
 }
 
 fn impls(db: &TestDB) -> Vec<ImplId> {
-    let def_map = crate_def_map(db, krate(db));
-    def_map
-        .modules(db)
-        .flat_map(|(_, module)| module.scope(db).impls().collect::<Vec<_>>())
-        .collect()
+    hir_def::test_items::impls(db, krate(db))
 }
 
 fn struct_named(db: &TestDB, name: &str) -> StructId {
@@ -551,7 +543,9 @@ fn implements_traits_unique_answers_as_one_at_a_time() {
             };
             let one_at_a_time: Vec<bool> =
                 traits.iter().map(|&it| implements_trait_unique(ty, &db, env, it)).collect();
-            assert_eq!(implements_traits_unique(ty, &db, env, &traits), one_at_a_time, "{name}");
+            let mut together = Vec::new();
+            implements_traits_unique(ty, &db, env, &traits, |_, holds| together.push(holds));
+            assert_eq!(together, one_at_a_time, "{name}");
             match name {
                 "A" => assert_eq!(one_at_a_time, [true, true, true]),
                 "B" => assert_eq!(one_at_a_time, [false, false, false]),

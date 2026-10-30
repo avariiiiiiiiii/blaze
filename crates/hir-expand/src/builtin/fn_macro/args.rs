@@ -153,6 +153,25 @@ pub(super) fn exprs<'t>(
     Ok(exprs)
 }
 
+/// `tt`'s arguments, each its trees up to the next top-level `,`: what [`exprs`] gives for
+/// arguments that are one literal or `true`/`false`, with no parse and so no database.
+#[cfg(test)]
+pub(super) fn comma_separated(tt: &tt::TopSubtree) -> SmallVec<[Arg<'_>; 4]> {
+    let close = tt.top_subtree().delimiter.close;
+    let mut iter = tt.iter();
+    let mut args = SmallVec::new();
+    while !iter.is_empty() {
+        let at = iter.next_span().unwrap_or(close);
+        let start = iter.savepoint();
+        while iter.peek().is_some_and(|it| !is_comma(&it)) {
+            iter.next();
+        }
+        args.push(Arg::new(iter.from_savepoint(start), at));
+        iter.next();
+    }
+    args
+}
+
 /// rustc's `get_single_expr_from_tts`: the one expression `tt` has, and a `,` after it if there
 /// is one. No expression is `{name} takes 1 argument` at the call, with none read; more is the
 /// same error, with the first read all the same.

@@ -179,6 +179,39 @@ fn equal_values_intern_once() {
     assert!((a.idx().raw() as usize) < cons.end() && (b.idx().raw() as usize) < cons.end());
 }
 
+/// The hot paths allocate nothing: an intern that finds its value, an index or a content ID to
+/// a value, and comparing or hashing two handles. The values are made outside the count.
+#[cfg(not(blaze_check))]
+#[test]
+fn hits_reads_and_compares_allocate_nothing() {
+    use std::hash::{Hash, Hasher as _};
+
+    let cons = HashCons::<Leaf>::new();
+    let handles: Vec<_> = (0..1_000).map(|n| cons.intern(leaf(n, "hit"))).collect();
+    let (a, b) = (handles[17], handles[400]);
+    let again: Vec<Leaf> = (0..1_000).map(|n| leaf(n, "hit")).collect();
+    let (content, absent) = (a.content(), content_of(&leaf(5_000, "hit")));
+    blaze_alloc_count::assert_at_most(0, "interning values already in", || {
+        for (value, handle) in again.into_iter().zip(&handles) {
+            assert_eq!(cons.intern(value), *handle);
+        }
+    });
+    blaze_alloc_count::assert_at_most(0, "an index to a value and a handle", || {
+        assert_eq!(cons.get(a.idx()).n, 17);
+        assert_eq!(cons.handle(b.idx()), b);
+    });
+    blaze_alloc_count::assert_at_most(0, "a content ID to its handle", || {
+        assert_eq!(cons.lookup(&content), Some(a));
+        assert_eq!(cons.lookup(&absent), None);
+    });
+    blaze_alloc_count::assert_at_most(0, "comparing and hashing handles", || {
+        assert!(a == a && a != b);
+        let mut hasher = DefaultHasher::new();
+        a.hash(&mut hasher);
+        hasher.finish()
+    });
+}
+
 #[test]
 fn chunks_cover_every_place() {
     let mut expected = (0, 0);

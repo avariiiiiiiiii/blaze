@@ -36,7 +36,9 @@ still calls those; the handle versions are deleted once both lanes' callers are 
 
 - `Cx::vsema: hir::view::Semantics<'db>`, beside `sema`. Every view handed to it must come from
   a tree it gave out (it finds a view's file by the tree's address), so every root below comes
-  from it.
+  from it. It is the one view `Semantics` of a `Cx`: `lints/syntax.rs`'s `Walk` takes its roots
+  from it too (`cx.vsema.parse`, `cx.root`), and `node_view`/`syntax_view` are
+  `vsema.to_view`/`to_view_syntax`.
 - `Cx::root(&self, file: HirFileId) -> view::Node<'db>`: `self.vsema.parse_or_expand(file)`.
 - `Cx::node_view<N: syntax::AstNode + Typed>(&self, ptr: InFile<AstPtr<N>>) -> InFile<N::Of<'db>>`:
   `ptr.value.to_view(self.root(ptr.file_id))`.
@@ -51,12 +53,35 @@ still calls those; the handle versions are deleted once both lanes' callers are 
   `def_range_view` slices `node.text()` instead of `node.to_string()`.
 - `Cx::lint_level` keeps taking `InFile<SyntaxNodePtr>` (an id).
 
+### The twins `lints/` moves onto (all in the tree, `'db` from `Cx<'_, 'db>`)
+
+| Handle (deleted once `lints/` is off it) | View twin |
+| --- | --- |
+| `Cx::syntax(InFile<SyntaxNodePtr>)` | `Cx::syntax_view(InFile<SyntaxNodePtr>) -> InFile<view::Node<'db>>` |
+| `Cx::node(InFile<AstPtr<N>>)` | `Cx::node_view(InFile<AstPtr<N>>) -> InFile<<N as Typed>::Of<'db>>` |
+| `cx::derive_paths(&ast::Attr)` | `cx::derive_paths_view(view::Attr<'_>) -> Vec<(TextRange, String)>` |
+| (token walk) | `cx::derive_path_tokens_view(view::Attr<'t>, FnMut(TextRange, &[view::Token<'t>]))` |
+| `cx::item_range(&SyntaxNode)` | `cx::item_range_view(view::Node<'_>) -> TextRange` |
+| `cx::def_range(&SyntaxNode)` | `cx::def_range_view(view::Node<'_>) -> TextRange` |
+| `cx::signature_range(&ast::Fn)` | `cx::signature_range_view(view::Fn<'_>) -> TextRange` |
+| `cx::closure_decl_range(&SyntaxNode)` | `cx::closure_decl_range_view(view::Node<'_>) -> TextRange` |
+| `break_outside_of_loop::ancestors` | `break_outside_of_loop::up(cx, InFile<view::Node<'db>>)`, `Item = InFile<view::Node<'db>>` |
+| (a file's tree) | `Cx::root(HirFileId) -> view::Node<'db>` (from `cx.vsema`) |
+
+Files import the free ones under the old names (`cx::{item_range_view as item_range, ..}`).
+`Found::new(Diag, Phase)` and `Found::lint(Diag, Phase, InFile<SyntaxNodePtr>)` keep taking ids:
+a view's id is `view::ptr(node)`.
+
 ## Lower-layer twins read
 
 - `HirFileId::root(db) -> view::Node<'db>` and `AstId::<N>::to_view(db)` (hir-expand, in tree).
 - `AstPtr::<N>::to_view(root)` / `try_to_view` and `Typed`/`AstNode` for `Either<L, R>`
   (syntax, in tree).
 - `MacroCallLoc::to_node_view(db) -> InFile<view::Node<'db>>` (hir-expand, in tree).
+- hir-def's twins per [tree-move-def.md](tree-move-def.md) and its `tree-move-def-<part>.md`
+  (`HasSource::source_view`, `HasChildSourceView::child_source_view`, `use_tree_to_view`,
+  `ExpressionStoreSourceMap::node_*_view`, `file_id_and_params_of_view`). Nothing in these paths
+  calls the handle forms; `BuiltinDeriveImplLoc::source` gives an `InFile<TextRange>`, not a node.
 - `hir::view::Semantics` (`crates/hir/src/semantics/view.rs`, in tree). `to_def2(InFile<&T>)`
   has no twin; callers take `to_def(T)`, the same lookup with the file found from the tree.
 

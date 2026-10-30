@@ -23,9 +23,11 @@
 //! (`ty_kind_suggestion`) and `compiler/rustc_trait_selection/src/diagnostics.rs` (`NoElse`)
 //! (MIT or Apache-2.0).
 //!
-//! The front end does not say why the types had to agree (rustc's `ObligationCause`, requested
-//! in `v2/requests/diagnostics.md`): it is found again here from the syntax around the
-//! expression, which the front end reports at the innermost tail of a block as rustc does.
+//! The front end's `cause` says why the types had to agree where it is an `if`'s `else`, a
+//! `match` arm after others, or a block's tail (whose local initialized by blocks gets rustc's
+//! `suggest_turning_stmt_into_expr`); the rest (a `let`'s type, an argument, a return) is found
+//! from the syntax around the expression, which the front end reports at the innermost tail of a
+//! block as rustc does.
 //!
 //! Cost: nothing until type checking reports the mismatch. Then O(the syntax from the
 //! expression up to the item, and a `match`'s earlier arms, each typed once): suggestions
@@ -46,7 +48,7 @@ use crate::{
     print,
 };
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TypeMismatch<'_>) -> Vec<Found> {
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>) -> Vec<Found> {
     let at = d.expr_or_pat.map(|it| it.syntax_node_ptr());
     let node = cx.syntax_view(at);
     let expr = ast::Expr::cast(node.value);
@@ -100,13 +102,13 @@ enum Call<'db> {
     Method(ast::MethodCallExpr<'db>),
 }
 
-fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'_>, node: InFile<ast::Node<'db>>) -> Diag {
+fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast::Node<'db>>) -> Diag {
     let span = cx.span(node.map(|it| it.text_range()));
     let outer = outer_of(node.value);
-    let context = context(cx, outer);
-    let message = match &context {
-        Context::MatchArm { .. } => "`match` arms have incompatible types",
-        Context::Else { .. } => "`if` and `else` have incompatible types",
+    let context = context(cx, outer, d.cause);
+    let message = match d.cause {
+        hir::ObligationCauseCode::MatchExpressionArm { .. } => "`match` arms have incompatible types",
+        hir::ObligationCauseCode::IfExpression => "`if` and `else` have incompatible types",
         _ => "mismatched types",
     };
     // clone: on the error path, for an error hir found
@@ -185,6 +187,9 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'_>, node: InFile<ast::
         Context::Plain => {}
     }
     note_expected_found(cx, &d.expected, &d.actual, at_error(d), &mut diag);
+    if d.cause == hir::ObligationCauseCode::BlockTailExpression {
+        stmt_into_expr(cx, d, node, &mut diag);
+    }
     if let Some(expr) = ast::Expr::cast(node.value) {
         suggest(cx, node.with_value(expr), &d.expected, &d.actual, &mut diag);
     }
@@ -207,7 +212,7 @@ fn ty_at_error<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>, at_error: Option<&str
 }
 
 /// rustc's `note_expected_found`: the two types in full, aligned, unless both are simple.
-fn note_expected_found<'db>(
+pub(super) fn note_expected_found<'db>(
     cx: &Cx<'_, 'db>,
     expected: &hir::Type<'db>,
     found: &hir::Type<'db>,
@@ -278,9 +283,10 @@ fn outer_of(mut node: ast::Node<'_>) -> ast::Node<'_> {
     }
 }
 
-fn context<'db>(cx: &Cx<'_, 'db>, outer: ast::Node<'db>) -> Context<'db> {
+fn context<'db>(cx: &Cx<'_, 'db>, outer: ast::Node<'db>, cause: hir::ObligationCauseCode) -> Context<'db> {
     let Some(parent) = outer.parent() else { return Context::Plain };
-    if let Some(arm) = ast::MatchArm::cast(parent)
+    if matches!(cause, hir::ObligationCauseCode::MatchExpressionArm { .. })
+        && let Some(arm) = ast::MatchArm::cast(parent)
         && arm.expr().is_some_and(|it| it.syntax() == outer)
         && let Some(match_expr) = arm.syntax().parent().and_then(|it| it.parent()).and_then(ast::MatchExpr::cast)
     {
@@ -296,7 +302,9 @@ fn context<'db>(cx: &Cx<'_, 'db>, outer: ast::Node<'db>) -> Context<'db> {
             .collect();
         return if prior.is_empty() { Context::Plain } else { Context::MatchArm { match_expr, prior } };
     }
-    if let Some(if_expr) = ast::IfExpr::cast(parent) {
+    if cause == hir::ObligationCauseCode::IfExpression
+        && let Some(if_expr) = ast::IfExpr::cast(parent)
+    {
         let is_else = match if_expr.else_branch() {
             Some(ast::ElseBranch::Block(it)) => it.syntax() == outer,
             Some(ast::ElseBranch::IfExpr(it)) => it.syntax() == outer,
@@ -543,7 +551,7 @@ fn missing_return_type(
 /// its value is of the type.
 fn no_tail<'db>(
     cx: &Cx<'_, 'db>,
-    d: &hir::TypeMismatch<'_>,
+    d: &hir::TypeMismatch<'db>,
     node: InFile<ast::Node<'db>>,
     block: ast::BlockExpr<'db>,
     item: ast::Fn<'db>,
@@ -560,22 +568,83 @@ fn no_tail<'db>(
             "implicitly returns `()` as its body has no tail or `return` expression",
         );
     }
-    if let Some(ast::Stmt::ExprStmt(stmt)) = block.stmt_list().and_then(|it| it.statements().last())
+    remove_semicolon(cx, node.with_value(block), &d.expected, &mut diag);
+    note_expected_found(cx, &d.expected, &d.actual, at_error(d), &mut diag);
+    diag
+}
+
+/// rustc's `consider_removing_semicolon`: "remove this semicolon to return this value" when the
+/// last statement of `block` is an expression whose value is of `expected`.
+fn remove_semicolon<'db>(
+    cx: &Cx<'_, 'db>,
+    block: InFile<ast::BlockExpr<'db>>,
+    expected: &hir::Type<'db>,
+    diag: &mut Diag,
+) {
+    if let Some(ast::Stmt::ExprStmt(stmt)) = block.value.stmt_list().and_then(|it| it.statements().last())
         && let Some(semi) = stmt.semicolon_token()
         && let Some(expr) = stmt.expr()
         && let Some(ty) = cx.vsema.type_of_expr(expr)
-        && ty.original.could_coerce_to(cx.db, &d.expected)
+        && ty.original.could_coerce_to(cx.db, expected)
     {
         diag.suggestion_with_style(
             // alloc: the error's text, for an error hir found
-            vec![(in_file(semi.text_range()), String::new())],
+            vec![(cx.span(block.with_value(semi.text_range())), String::new())],
             "remove this semicolon to return this value",
             Applicability::MachineApplicable,
             SuggestionStyle::HideCodeInline,
         );
     }
-    note_expected_found(cx, &d.expected, &d.actual, at_error(d), &mut diag);
-    diag
+}
+
+/// rustc's `suggest_turning_stmt_into_expr`: a block whose tail of type `()` names a local whose
+/// `let` is initialized by an `if`, `match` or block, each of whose blocks may have its last
+/// statement's semicolon removed.
+fn stmt_into_expr<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast::Node<'db>>, diag: &mut Diag) {
+    // A `match` arm's cause is of the arm, not of a block.
+    let in_block = node.value.parent().is_some_and(|it| ast::StmtList::can_cast(it.kind()));
+    let in_arm = outer_of(node.value).parent().is_some_and(|it| ast::MatchArm::can_cast(it.kind()));
+    if !d.actual.strip_references().is_unit() || !in_block || in_arm {
+        return;
+    }
+    let Some(ast::Expr::PathExpr(path)) = ast::Expr::cast(node.value) else { return };
+    let Some(hir::PathResolution::Local(local)) = path.path().and_then(|it| cx.vsema.resolve_path(it)) else {
+        return;
+    };
+    let source = local.primary_source_view(cx.db);
+    cx.root(source.file());
+    let Some(init) = source.syntax().parent().and_then(ast::LetStmt::cast).and_then(|it| it.initializer()) else {
+        return;
+    };
+    // alloc: the error's parts, for an error hir found
+    let mut blocks = Vec::new();
+    collect_blocks(init, &mut blocks);
+    let expected = d.expected.strip_references();
+    for block in blocks {
+        remove_semicolon(cx, InFile::new(source.file(), block), &expected, diag);
+    }
+}
+
+fn collect_blocks<'db>(expr: ast::Expr<'db>, blocks: &mut Vec<ast::BlockExpr<'db>>) {
+    match expr {
+        ast::Expr::IfExpr(it) => {
+            let Some(else_) = it.else_branch() else { return };
+            if let Some(then) = it.then_branch() {
+                blocks.push(then);
+            }
+            match else_ {
+                ast::ElseBranch::Block(it) => blocks.push(it),
+                ast::ElseBranch::IfExpr(it) => collect_blocks(ast::Expr::IfExpr(it), blocks),
+            }
+        }
+        ast::Expr::MatchExpr(it) => {
+            for body in it.match_arm_list().into_iter().flat_map(|it| it.arms()).filter_map(|it| it.expr()) {
+                collect_blocks(body, blocks);
+            }
+        }
+        ast::Expr::BlockExpr(it) => blocks.push(it),
+        _ => {}
+    }
 }
 
 /// E0317: an `if` with no `else` where a value of another type than `()` is expected. The
@@ -890,14 +959,5 @@ fn is_string(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> bool {
 /// Whether `&` before the expression would bind tighter than it: rustc's `needs_parens` by
 /// precedence, of the expressions that bind looser than a prefix operator.
 fn needs_parens(expr: ast::Expr<'_>) -> bool {
-    matches!(
-        expr,
-        ast::Expr::BinExpr(_)
-            | ast::Expr::CastExpr(_)
-            | ast::Expr::RangeExpr(_)
-            | ast::Expr::ClosureExpr(_)
-            | ast::Expr::ReturnExpr(_)
-            | ast::Expr::BreakExpr(_)
-            | ast::Expr::YieldExpr(_)
-    )
+    expr.precedence() < ast::prec::ExprPrecedence::Prefix
 }

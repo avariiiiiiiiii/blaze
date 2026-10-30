@@ -228,6 +228,23 @@ fn write_value(out: &mut Vec<u8>, key: &Key, kind: Kind, content: &ContentId, by
     crate::copy::append(out, bytes);
 }
 
+/// The bytes before a value in its answer frame: the frame's length, then the value's header.
+pub const VALUE_FRAME_HEADER: usize = 8 + VALUE_HEADER;
+
+/// Writes into the first [`VALUE_FRAME_HEADER`] bytes of `head` what
+/// [`Answer::encode_framed`] writes before a value of `len` bytes. A buffer holding the value
+/// after that many reserved bytes is then the frame as it is, for `Done::Read`, with no copy.
+pub fn write_value_frame_header(head: &mut [u8], key: &Key, kind: Kind, content: &ContentId, len: usize) {
+    let head = &mut head[..VALUE_FRAME_HEADER];
+    head[..8].copy_from_slice(&((VALUE_HEADER + len) as u64).to_le_bytes());
+    head[8..16].copy_from_slice(&header(ANSWER_MAGIC));
+    head[16] = VALUE;
+    head[17..49].copy_from_slice(&key.0.0);
+    head[49] = kind.code();
+    head[50..82].copy_from_slice(&content.0);
+    head[82..].copy_from_slice(&(len as u64).to_le_bytes());
+}
+
 fn write_ask(out: &mut Vec<u8>, key: &Key) {
     out.extend_from_slice(&header(ASK_MAGIC));
     out.extend_from_slice(&key.0.0);
@@ -1091,6 +1108,17 @@ mod tests {
     fn answers_round_trip() {
         for answer in samples() {
             assert_eq!(Answer::decode(&answer.encode()), Ok(answer));
+        }
+    }
+
+    #[test]
+    fn a_value_frame_header_is_what_encode_framed_writes_before_the_value() {
+        for answer in samples() {
+            let Answer::Value { key, kind, content, bytes } = &answer else { continue };
+            let mut built = vec![0; VALUE_FRAME_HEADER];
+            built.extend_from_slice(bytes);
+            write_value_frame_header(&mut built, key, *kind, content, bytes.len());
+            assert_eq!(built, answer.encode_framed(), "{answer:?}");
         }
     }
 

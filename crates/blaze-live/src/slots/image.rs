@@ -209,14 +209,29 @@ pub(super) unsafe fn view(at: u64, len: usize) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(at as *const u8, len) }
 }
 
-/// `len` 8-byte words of the image at `at`.
+/// `len` 8-byte words of the image at `at`, which [`crate::slots::publish`] may store to while
+/// they are read.
 ///
 /// # Safety
 ///
-/// As [`view`], for `len * 8` bytes, and `at` is 8-aligned.
-pub(super) unsafe fn words(at: u64, len: usize) -> &'static [u64] {
-    // SAFETY: the caller's; any bits are valid `u64`s.
-    unsafe { std::slice::from_raw_parts(at as *const u64, len) }
+/// `at..at + len * 8` is mapped readable and writable for the life of the program (the
+/// platform checked it is in the image's data), `at` is 8-aligned, and the words are accessed
+/// only atomically.
+pub(super) unsafe fn words(at: u64, len: usize) -> &'static [AtomicU64] {
+    // SAFETY: the caller's; an `AtomicU64` has a `u64`'s size and alignment, and any bits are
+    // a valid one.
+    unsafe { std::slice::from_raw_parts(at as *const AtomicU64, len) }
+}
+
+/// The byte at `at`, which log stubs and other processes sharing its pages may store to.
+///
+/// # Safety
+///
+/// `at` is mapped readable and writable for the life of the program, and accessed only
+/// atomically or by the log stubs' single-byte stores.
+pub(super) unsafe fn byte(at: u64) -> &'static AtomicU8 {
+    // SAFETY: the caller's; an `AtomicU8` has a `u8`'s size and alignment.
+    unsafe { AtomicU8::from_ptr(at as *mut u8) }
 }
 
 /// The 8-byte table cell at `at`.

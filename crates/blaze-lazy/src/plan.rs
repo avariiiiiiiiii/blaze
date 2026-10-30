@@ -33,18 +33,16 @@
 //! the run starts, so a program rustc rejects is rejected here too.
 
 use blaze_codegen::{CompiledFunction, Init, InstanceKey, RelocKind, Static, Target};
+use blaze_ids::names;
 use blaze_items::{CodeHash, ItemKey};
 use rustc_hash::FxHashMap;
 
 use crate::{LazyId, MOST_LAZY};
 
-/// A function of the build, as codegen's walk describes it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Function {
-    pub key: InstanceKey,
-    pub code: CodeHash,
-    pub item: ItemKey,
-}
+/// A function of the build, as codegen's lazy walk lists it (`Built::walked`).
+pub use blaze_codegen::driver::Walked as Function;
+/// The rule codegen compiles ahead by, so [`Plan::ahead`] and what the build holds agree.
+pub use blaze_codegen::driver::runs_at_start;
 
 /// Why a function is compiled ahead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,7 +128,8 @@ impl Plan {
                 plan.by_code.push((function.code, next));
             }
         }
-        plan.by_code.sort_unstable_by_key(|it| (it.0, it.1));
+        // Stable, and pushed in id order: sorted by code hash, then id.
+        names::sort_by_name(&mut plan.by_code, |it| &it.0.0.0[..]);
         Ok(plan)
     }
 
@@ -169,19 +168,31 @@ impl Plan {
         }
     }
 
+    /// A clear bitmap of one bit per lazy function, for [`Plan::callees`].
+    pub fn scratch(&self) -> Vec<u64> {
+        vec![0; self.keys.len().div_ceil(64)] // alloc: once per caller, reused
+    }
+
     /// Appends to `out` the lazy functions `function`'s code calls (a call or a tail call to
-    /// the callee, not a reference to its address): what it is likely to call next.
-    pub fn callees(&self, function: &CompiledFunction, out: &mut Vec<LazyId>) {
+    /// the callee, not a reference to its address), each once, in the order of their first
+    /// call: what it is likely to call next. `seen` is a clear [`Plan::scratch`], left clear.
+    pub fn callees(&self, function: &CompiledFunction, seen: &mut [u64], out: &mut Vec<LazyId>) {
+        let from = out.len();
         for reloc in &function.relocs {
             let (Target::Function(key) | Target::Direct(key)) = &reloc.target else { continue };
             if !is_call(function, reloc.at, reloc.kind) {
                 continue;
             }
             if let Some(id) = self.id(key) {
-                if !out.contains(&id) {
+                let (word, bit) = (id.index() / 64, 1u64 << (id.0 % 64));
+                if seen[word] & bit == 0 {
+                    seen[word] |= bit;
                     out.push(id);
                 }
             }
+        }
+        for id in &out[from..] {
+            seen[id.index() / 64] = 0;
         }
     }
 }
@@ -200,28 +211,14 @@ fn is_call(function: &CompiledFunction, at: u32, kind: RelocKind) -> bool {
     }
 }
 
-/// Whether a static in `section` runs code at the start or the end of the process or of a
-/// thread: an initializer or finalizer array, as each object format names it.
-pub fn runs_at_start(section: &str) -> bool {
-    let elf = |name: &str| section == name || section.strip_prefix(name).is_some_and(|it| it.starts_with('.'));
-    elf(".init_array")
-        || elf(".preinit_array")
-        || elf(".fini_array")
-        || elf(".ctors")
-        || elf(".dtors")
-        || section.contains("__mod_init_func")
-        || section.contains("__mod_term_func")
-        || section.starts_with(".CRT$X")
-}
-
 /// The functions a static's value and its data name.
 fn named_functions(value: &Static) -> impl Iterator<Item = InstanceKey> + '_ {
     let own = match &value.init {
-        Init::Bytes { relocs, .. } => relocs.as_slice(),
-        Init::Zeroed { .. } => &[],
+        Init::Bytes { relocs, .. } => Some(relocs),
+        Init::Zeroed { .. } => None,
     };
-    own.iter().chain(value.data.iter().flat_map(|it| it.relocs.iter())).filter_map(|it| match it.target {
-        Target::Function(key) | Target::Direct(key) => Some(key),
+    own.into_iter().flatten().chain(value.data.iter().flat_map(|it| it.relocs.iter())).filter_map(|it| match it.target {
+        Target::Function(key) | Target::Direct(key) => Some(*key),
         _ => None,
     })
 }

@@ -25,7 +25,7 @@ use hir_def::{
 };
 use hir_expand::{
     MacroCallKind, MacroDefId, MacroDefKind,
-    attrs::{AstKeyValueMetaExt as _, AstPathExt as _, expand_cfg_attr},
+    attrs::{AstKeyValueMetaExt as _, AstPathExt as _, expand_cfg_attr_view},
     builtin::EagerExpander,
 };
 use hir_ty::next_solver::{CallableIdWrapper, DbInterner, Ty, TyKind, infer::select::EvaluationResult};
@@ -33,13 +33,13 @@ use ra_ap_rustc_parse_format::{ParseMode, Parser, Piece};
 use rustc_type_ir::inherent::IntoKind as _;
 use span::FileId;
 use syntax::{
-    AstNode as _, SmolStr, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange,
-    ast::{self, HasAttrs as _},
+    SmolStr, SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode as _, HasAttrs as _},
 };
 
 use crate::{
     lints::bodies::{
-        BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set,
+        BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set,
         types::util::{self, Solver},
     },
     lower::{Found, Phase},
@@ -66,7 +66,7 @@ struct FmtTraits {
 
 impl LatePass for NonPanicFmt {
     const LINTS: LintSet = lint_set([LINT]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Call { callee, args: &[arg] } = b.store().expr(expr) else { return };
@@ -316,7 +316,7 @@ fn trait_facts<'db>(b: &BodyCx<'_, 'db>, diag: &mut Diag, arg: ExprId, ty: Ty<'d
         return;
     }
     let Some(written) = util::syntax(b, arg).and_then(|it| ast::Expr::cast(it.value)) else { return };
-    let Some(of) = b.cx.sema.type_of_expr(&written) else { return };
+    let Some(of) = b.cx.vsema.type_of_expr(written) else { return };
     let ty = of.original.derived_from_next_solver(ty);
     let printed = b.cx.ty(&ty);
     for &(name, it) in checked {
@@ -380,7 +380,7 @@ impl At {
 }
 
 fn at_ptr(b: &BodyCx<'_, '_>, ptr: InFile<SyntaxNodePtr>) -> Option<At> {
-    at(b, b.cx.syntax(ptr))
+    at(b, b.cx.syntax_view(ptr))
 }
 
 /// rustc's span of `node`: its first token's to its last, as rustc's parser spans a node,
@@ -388,19 +388,19 @@ fn at_ptr(b: &BodyCx<'_, '_>, ptr: InFile<SyntaxNodePtr>) -> Option<At> {
 /// is written in a file; else the first). The output of a built-in macro (but `include!`'s) is
 /// spanned at the macro's call, in its expansion, as rustc's built-in macros span what they
 /// make.
-fn at(b: &BodyCx<'_, '_>, node: InFile<SyntaxNode>) -> Option<At> {
+fn at(b: &BodyCx<'_, '_>, node: InFile<ast::Node<'_>>) -> Option<At> {
     let db = b.db();
     let range = node.value.text_range();
     let Some(call) = node.file_id.macro_file() else {
         let file = node.file_id.file_id()?.file_id(db);
         return Some(At { file, range, expn: None, shown: node.with_value(range) });
     };
-    if is_builtin_output(db, call, &node.value) {
+    if is_builtin_output(db, call, node.value) {
         let site = call_site(b, call)?;
         return Some(At { expn: Some(call), ..site });
     }
-    let first = token(db, node.with_value(first_token(&node.value)?))?;
-    let last = token(db, node.with_value(last_token(&node.value)?))?;
+    let first = token(db, node.with_value(first_token(node.value)?))?;
+    let last = token(db, node.with_value(last_token(node.value)?))?;
     Some(if first.expn == last.expn && first.file == last.file {
         At { range: first.range.cover(last.range), shown: node.with_value(range), ..first }
     } else if first.expn.is_none() {
@@ -411,7 +411,7 @@ fn at(b: &BodyCx<'_, '_>, node: InFile<SyntaxNode>) -> Option<At> {
 }
 
 /// rustc's span of a token of an expansion.
-fn token(db: &Db, token: InFile<SyntaxToken>) -> Option<At> {
+fn token(db: &Db, token: InFile<ast::Token<'_>>) -> Option<At> {
     let range = token.value.text_range();
     let shown = token.with_value(range);
     let (written, ctxt) = shown.original_node_file_range_opt(db)?;
@@ -419,7 +419,7 @@ fn token(db: &Db, token: InFile<SyntaxToken>) -> Option<At> {
     Some(At { file: written.file_id.file_id(db), range: written.range, expn, shown })
 }
 
-fn first_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+fn first_token(node: ast::Node<'_>) -> Option<ast::Token<'_>> {
     let end = node.text_range().end();
     let mut token = node.first_token()?;
     while token.kind().is_trivia() {
@@ -428,7 +428,7 @@ fn first_token(node: &SyntaxNode) -> Option<SyntaxToken> {
     Some(token)
 }
 
-fn last_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+fn last_token(node: ast::Node<'_>) -> Option<ast::Token<'_>> {
     let start = node.text_range().start();
     let mut token = node.last_token()?;
     while token.kind().is_trivia() {
@@ -439,7 +439,7 @@ fn last_token(node: &SyntaxNode) -> Option<SyntaxToken> {
 
 /// Whether `node` is the whole expansion of `call`, a call of a built-in macro other than
 /// `include!` (whose expansion is the included file's code, spanned where it is written).
-fn is_builtin_output(db: &Db, call: MacroCallId, node: &SyntaxNode) -> bool {
+fn is_builtin_output(db: &Db, call: MacroCallId, node: ast::Node<'_>) -> bool {
     let builtin = match call.loc(db).def.kind {
         MacroDefKind::BuiltIn(..) => true,
         MacroDefKind::BuiltInEager(_, expander) => !matches!(expander, EagerExpander::Include),
@@ -450,7 +450,7 @@ fn is_builtin_output(db: &Db, call: MacroCallId, node: &SyntaxNode) -> bool {
 
 /// rustc's `outer_expn_data().call_site` of an expansion: the span of the macro call.
 fn call_site(b: &BodyCx<'_, '_>, call: MacroCallId) -> Option<At> {
-    at(b, call.loc(b.db()).to_node(b.db()))
+    at(b, call.loc(b.db()).to_node_view(b.db()))
 }
 
 /// rustc's `Span::source_callsite`: the call of the outermost macro `at` came out of, written
@@ -503,10 +503,10 @@ fn macro_symbol(b: &BodyCx<'_, '_>, call: MacroCallId) -> String {
     let db = b.db();
     let loc = call.loc(db);
     let name: Option<String> = match loc.kind {
-        MacroCallKind::FnLike { .. } => ast::MacroCall::cast(loc.to_node(db).value)
+        MacroCallKind::FnLike { .. } => ast::MacroCall::cast(loc.to_node_view(db).value)
             .and_then(|it| it.path())
             // alloc: the macro's name as called, on the lint's path (a 2015 panic not given a plain literal)
-            .map(|it| it.syntax().text().to_string().split_whitespace().collect()),
+            .map(|it| it.syntax().text().split_whitespace().collect()),
         _ => b.cx.expansion_of(call).map(|it| it.name),
     };
     // alloc: the lint's diagnostic
@@ -522,11 +522,11 @@ fn macro_item(db: &Db, def: MacroDefId) -> Option<SmolStr> {
         | MacroDefKind::BuiltInAttr(id, _)
         | MacroDefKind::BuiltInDerive(id, _)
         | MacroDefKind::BuiltInEager(id, _)
-        | MacroDefKind::UnimplementedBuiltIn(id) => id.to_node(db).attrs(),
-        MacroDefKind::ProcMacro(id, ..) => id.to_node(db).attrs(),
+        | MacroDefKind::UnimplementedBuiltIn(id) => id.to_view(db).attrs(),
+        MacroDefKind::ProcMacro(id, ..) => id.to_view(db).attrs(),
     };
     let cfg = def.krate.cfg_options(db);
-    expand_cfg_attr(attrs, || cfg, |meta, _| match meta {
+    expand_cfg_attr_view(attrs, || cfg, |meta, _| match meta {
         ast::Meta::KeyValueMeta(attr) if attr.path().is1("rustc_diagnostic_item") => match attr.value_string() {
             Some(name) => ControlFlow::Break(name),
             None => ControlFlow::Continue(()),

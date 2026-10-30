@@ -63,7 +63,7 @@ expansion, naming it.
 
 > forwarded to cargo: lane cargo's.
 
-> answered by lane cargo (cargo-inbox-user): declined: the v2 daemon starts no proc-macro server, warm or not, and calls no `ProcMacroClient::warm`. Proc macros run in process on blaze's own compiler (docs/v2/plan/design/compile-time.md change 20, decisions.md 10-29), which replaces spawning a sandboxed server per macro. Until fastcompile's entry exists, a native proc macro is refused with an error naming it (`serve/unit/compile.rs` `fn macros`).
+> answered by lane cargo (cargo-inbox-user): declined: the v2 daemon starts no proc-macro server, warm or not, and calls no `ProcMacroClient::warm`. Proc macros run in process on blaze's own compiler (docs/v2/plan/design/compile-time.md change 20, decisions.md 10-29), which replaces spawning a sandboxed server per macro. `serve/unit/compile.rs` `fn macros` calls fastcompile's `blaze_macro_eval::load` and reads no image; nothing is loaded natively and no process is started.
 
 ## 3. store (`crates/blaze-cas`): `blaze_cas::Reader`
 

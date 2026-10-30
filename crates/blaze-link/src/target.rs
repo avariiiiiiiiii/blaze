@@ -31,8 +31,14 @@
 //! own directories first, then the toolchain's, and in each directory the files the kind
 //! allows, in the linker's order (`lib{name}.so` before `lib{name}.a` for a `dylib` on ELF;
 //! `.tbd`, `.dylib`, `.so`, `.a` on Mach-O; `{name}.lib` on PE; `lib{name}.a` on wasm). A
-//! GNU linker script found as a shared library (glibc's `libc.so`) is followed on the line by
-//! the files it names ([`crate::script_inputs`]), which the engine wants there. The engine
+//! GNU linker script found as a shared library (glibc's `libc.so`, Debian's `libgcc_s.so`) is
+//! followed on the line by the files it names ([`crate::script_inputs`]), its `-lNAME`s
+//! searched for as `dylib`s, which the engine wants there. A PE archive is followed by the
+//! libraries its members ask for with `/DEFAULTLIB`, transitively (`msvcrt.lib` brings
+//! `vcruntime.lib` and `ucrt.lib`), which the engine checks are there for every member it
+//! takes. A Mach-O object or archive is followed by the libraries and frameworks its objects'
+//! `LC_LINKER_OPTION`s ask for (`-lz`, `-framework Security`), transitively, found as ld64
+//! finds them, which the engine checks are there for every object it loads. The engine
 //! resolves archives wherever they are on the line, so each file is on it once.
 
 #[cfg(test)]
@@ -73,6 +79,14 @@ const MACOS_MINIMUM: u32 = 0x000b_0000;
 /// The domain a linker script's bytes are named in for the engine's reader.
 const SCRIPT: &str = "blaze v2 link target script";
 
+/// The domain a PE archive's bytes are named in for what its members ask for.
+const ASKED: &str = "blaze v2 link target default libraries";
+
+/// The domains a Mach-O object's or archive's bytes are named in for what its
+/// `LC_LINKER_OPTION`s ask for: one per architecture, whose slice of a universal file is read.
+const AUTOLINKED_AARCH64: &str = "blaze v2 link target autolinked libraries aarch64";
+const AUTOLINKED_X86_64: &str = "blaze v2 link target autolinked libraries x86_64";
+
 const LINKED: &str = "x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch64-apple-darwin, \
                       x86_64-pc-windows-msvc, wasm32-wasip1 and wasm32-unknown-unknown";
 
@@ -93,7 +107,9 @@ pub fn output(
 /// The files of `output`'s link line, in its order: the C runtime's start objects, `libs`
 /// (searched in `search`, the link's `-L`s, then the toolchain's directories), the libraries
 /// the toolchain's driver adds, the C runtime's end objects. A linker script's files follow
-/// it. A library not found is an error naming it and every directory searched. `sysroot` is
+/// it, and so do the libraries a PE archive's members ask for and those a Mach-O object's or
+/// archive member's `LC_LINKER_OPTION`s ask for. A library not found is an error naming it
+/// (and the script, object or member that asked) and every directory searched. `sysroot` is
 /// blaze's toolchain (`blaze toolchain --path`), whose self-contained C runtime WASI links.
 pub fn locate(
     output: &Output,
@@ -149,6 +165,7 @@ fn output_with<A: Ask>(
         stack: target.stack(),
         windows_subsystem: false,
         dev_run: None,
+        exec_log: false,
         // alloc: once per link, the triple the output is for
         triple: triple.to_owned(),
     })
@@ -178,7 +195,7 @@ fn locate_with<A: Ask>(
     }
     let found = cache.found(ask, target, Some(sysroot))?;
     let executable = matches!(output.kind, OutputKind::Executable { .. });
-    let mut line = Line { output, search, found: &found, out: Vec::with_capacity(libs.len() + 8) };
+    let mut line = Line { cache, output, search, found: &found, out: Vec::with_capacity(libs.len() + 8) };
     for name in target.start(executable) {
         line.object(name)?;
     }
@@ -310,7 +327,8 @@ impl Target {
 
     /// The libraries after the crates': what the system `cc` adds (`-lgcc -lgcc_s -lc` for
     /// glibc, `-lSystem` on macOS) and wasi-libc. MSVC's CRT comes in by the `/DEFAULTLIB`s of
-    /// what links it, and rustc's spec adds nothing.
+    /// the libraries that link it ([`Line::defaults`]), and rustc's spec adds nothing. What a
+    /// Mach-O object autolinks follows it ([`Line::autolinks`]).
     fn late(self) -> &'static [(&'static str, NativeLibKind)] {
         const STATIC: NativeLibKind = NativeLibKind::Static { whole: false, bundle: true };
         match self {
@@ -484,13 +502,46 @@ impl Key {
     }
 }
 
-/// The toolchains found, by what each was found from: a few per process, searched in order.
-pub(crate) struct Cache(Mutex<Vec<(Key, Arc<Found>)>>);
+/// The default libraries each member of a PE archive asks for, as `(member, library)`
+/// ([`crate::pe::asked_libraries`]), or the `LC_LINKER_OPTION`s of a Mach-O object or
+/// archive's members, as `(member, option)` ([`crate::macho::asked_libraries`]).
+type Asked = Arc<Vec<(String, String)>>;
+
+/// The toolchains found, by what each was found from, and what the PE archives read for their
+/// default libraries ask for, by their bytes: a few of each per process, searched in order.
+pub(crate) struct Cache {
+    found: Mutex<Vec<(Key, Arc<Found>)>>,
+    asked: Mutex<Vec<(ContentId, Asked)>>,
+}
 
 impl Cache {
     pub(crate) const fn new() -> Cache {
         // alloc: none, an empty `Vec` holds no buffer
-        Cache(Mutex::new(Vec::new()))
+        Cache { found: Mutex::new(Vec::new()), asked: Mutex::new(Vec::new()) }
+    }
+
+    /// What the PE archive, or the Mach-O object or archive for `arch`, at `path` (`name` on
+    /// the line) asks for: read once for each content the file has had.
+    fn asked(&self, path: &Path, name: &str, format: Format, arch: Arch) -> Result<Asked, LinkError> {
+        // alloc: error path
+        let bytes = std::fs::read(path).map_err(|error| fail(format!("{name}: {error}")))?;
+        let domain = match (format, arch) {
+            (Format::MachO, Arch::X86_64) => AUTOLINKED_X86_64,
+            (Format::MachO, _) => AUTOLINKED_AARCH64,
+            _ => ASKED,
+        };
+        let id = ContentId::of(domain, &bytes);
+        if let Some((_, asked)) = self.asked.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|it| it.0 == id) {
+            return Ok(Arc::clone(asked));
+        }
+        let asked = match format {
+            Format::MachO => crate::macho::asked_libraries(name, &bytes, arch),
+            _ => crate::pe::asked_libraries(name, &bytes),
+        };
+        // alloc: once per process and file content, what it asks for
+        let asked = Arc::new(asked.map_err(fail)?);
+        self.asked.lock().unwrap_or_else(PoisonError::into_inner).push((id, Arc::clone(&asked)));
+        Ok(asked)
     }
 
     /// The toolchain of `target` as the environment is now, with blaze's toolchain at
@@ -499,7 +550,7 @@ impl Cache {
     fn found<A: Ask>(&self, ask: &A, target: Target, sysroot: Option<&Path>) -> Result<Arc<Found>, LinkError> {
         let key = Key::of(ask, target, sysroot)?;
         // Only a whole answer is pushed: one a panic interrupted left nothing.
-        let mut kept = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut kept = self.found.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((_, found)) = kept.iter().find(|(it, _)| *it == key) {
             return Ok(Arc::clone(found));
         }
@@ -829,6 +880,7 @@ fn wasi(key: &Key) -> Result<Found, LinkError> {
 
 /// A link line as it is found.
 struct Line<'a> {
+    cache: &'a Cache,
     output: &'a Output,
     search: &'a [PathBuf],
     found: &'a Found,
@@ -874,26 +926,107 @@ impl Line<'_> {
         Err(not_found(name, &files, self.dirs(framework)))
     }
 
-    /// `path` on the line, unless it is already, and the files it names when it is a linker
-    /// script.
+    /// `path` on the line, unless it is already, then the files it names when it is a linker
+    /// script, the libraries its members ask for when it is a PE archive, and those its
+    /// `LC_LINKER_OPTION`s ask for when it is a Mach-O object or archive.
     fn push(&mut self, path: PathBuf, kind: NativeKind) -> Result<(), LinkError> {
-        if self.out.iter().any(|it| it.path == path) {
+        let pe = self.output.format == Format::Pe;
+        if self.out.iter().any(|it| it.path == path || (pe && it.path.as_os_str().eq_ignore_ascii_case(path.as_os_str()))) {
             return Ok(());
         }
         let script =
             self.output.format == Format::Elf && matches!(kind, NativeKind::Shared { .. }) && sniff(&path)? == Sniffed::Text;
+        let archive = pe && matches!(kind, NativeKind::Archive { .. });
+        let autolinks =
+            self.output.format == Format::MachO && matches!(kind, NativeKind::Archive { .. } | NativeKind::Object);
         // alloc: once per file of the line, the name the engine knows it by
         let name = path.to_string_lossy().into_owned();
         self.out.push(Located { path, name, kind });
+        let at = self.out.len() - 1;
         if script {
-            self.follow(self.out.len() - 1)?;
+            self.follow(at)?;
+        }
+        if archive {
+            self.defaults(at)?;
+        }
+        if autolinks {
+            self.autolinks(at)?;
         }
         Ok(())
     }
 
+    /// The libraries the members of the PE archive at `at` ask for, each after it on the line
+    /// and followed in turn, as link.exe follows `/DEFAULTLIB` from the members it takes. A
+    /// member's own `/NODEFAULTLIB` takes its own out ([`crate::pe::asked_libraries`]); one in
+    /// another member does not, since that member may not be taken. Every member's are
+    /// followed, taken or not: a library on the line that nothing is taken from costs nothing,
+    /// and the engine checks those of the members it takes.
+    fn defaults(&mut self, at: usize) -> Result<(), LinkError> {
+        let asked = self.cache.asked(&self.out[at].path, &self.out[at].name, Format::Pe, self.output.arch)?;
+        for (member, library) in asked.iter() {
+            let path = self.default_library(library).map_err(|it| {
+                // alloc: error path
+                fail(format!("{}({member}) asks for {library} (/DEFAULTLIB), and {}", self.out[at].name, it.what))
+            })?;
+            self.push(path, NativeKind::Archive { whole: false })?;
+        }
+        Ok(())
+    }
+
+    /// The libraries the `LC_LINKER_OPTION`s of the Mach-O object or archive at `at` ask for,
+    /// each after it on the line and followed in turn, as ld64 follows them from every object
+    /// and loaded member: `-lNAME` searched as a `dylib` is (`libNAME.tbd`, `.dylib`, `.so`,
+    /// then `.a`, in the link's directories then the SDK's `usr/lib`), `-framework NAME` as
+    /// a framework (in the link's directories then the SDK's frameworks). A weak form or any
+    /// other option is an error ([`crate::macho::autolink`]). Every member's are followed,
+    /// taken or not, and the engine checks those of the objects and members it loads.
+    fn autolinks(&mut self, at: usize) -> Result<(), LinkError> {
+        let asked = self.cache.asked(&self.out[at].path, &self.out[at].name, Format::MachO, self.output.arch)?;
+        for (member, option) in asked.iter() {
+            let by = |what: &str| match member.is_empty() {
+                // alloc: error path
+                true => fail(format!("{} asks for {option} (LC_LINKER_OPTION), and {what}", self.out[at].name)),
+                // alloc: error path
+                false => fail(format!("{}({member}) asks for {option} (LC_LINKER_OPTION), and {what}", self.out[at].name)),
+            };
+            let (name, kind) = match crate::macho::autolink(option).map_err(|what| by(&what))? {
+                crate::macho::Autolink::Library(name) => (name, NativeLibKind::Dylib),
+                crate::macho::Autolink::Framework(name) => (name, NativeLibKind::Framework),
+            };
+            let (path, kind) = self.find(name, kind, false).map_err(|it| by(&it.what))?;
+            self.push(path, kind)?;
+        }
+        Ok(())
+    }
+
+    /// The file a `/DEFAULTLIB` names: itself when it is a path, else the first in the line's
+    /// directories with its name, ASCII case ignored as link.exe ignores it.
+    fn default_library(&self, library: &str) -> Result<PathBuf, LinkError> {
+        let given = Path::new(library);
+        if given.is_absolute() {
+            return match given.is_file() {
+                true => Ok(given.to_path_buf()),
+                // alloc: error path
+                false => Err(fail(format!("{library} is not a file"))),
+            };
+        }
+        for dir in self.dirs(false) {
+            let path = dir.join(library);
+            if path.is_file() {
+                return Ok(path);
+            }
+            if let Some(path) = caseless(dir, library) {
+                return Ok(path);
+            }
+        }
+        // alloc: error path
+        let files = [(library.to_owned(), NativeKind::Archive { whole: false })];
+        Err(not_found(library, &files, self.dirs(false)))
+    }
+
     /// The files the linker script at `at` names, after it on the line: an absolute path as it
     /// is, another name searched for as a file in the line's directories, `-lNAME` as a
-    /// `dylib` is.
+    /// `dylib` is and `-l:FILE` as a `+verbatim` one.
     fn follow(&mut self, at: usize) -> Result<(), LinkError> {
         let script = &self.out[at];
         let bytes: Arc<[u8]> = std::fs::read(&script.path)
@@ -906,7 +1039,14 @@ impl Line<'_> {
         for input in crate::script_inputs(self.output, &native)? {
             let path = match input.strip_prefix("-l") {
                 Some(lib) => {
-                    let (path, kind) = self.find(lib, NativeLibKind::Dylib, false)?;
+                    let (lib, verbatim) = match lib.strip_prefix(':') {
+                        Some(file) => (file, true),
+                        None => (lib, false),
+                    };
+                    let (path, kind) = self
+                        .find(lib, NativeLibKind::Dylib, verbatim)
+                        // alloc: error path
+                        .map_err(|it| fail(format!("{name} names {input}, and {}", it.what)))?;
                     self.push(path, kind)?;
                     continue;
                 }
@@ -1021,6 +1161,20 @@ fn not_found<'a>(name: &str, files: &[(String, NativeKind)], dirs: impl Iterator
         what.push_str("any directory: the link names none, and the toolchain has none");
     }
     fail(what)
+}
+
+/// The file in `dir` named `file` with ASCII case ignored, where the directory is case
+/// sensitive (a Windows SDK copied to Linux or macOS).
+fn caseless(dir: &Path, file: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        if entry.file_name().to_str().is_some_and(|it| it.eq_ignore_ascii_case(file)) {
+            let path = entry.path();
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// What a file's first bytes say it is.

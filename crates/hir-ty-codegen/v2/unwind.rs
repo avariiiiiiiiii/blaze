@@ -58,15 +58,17 @@ pub(crate) fn convert(
 /// The CIE every function of the process's ISA shares, made and read back once: Cranelift's
 /// `create_systemv_cie` depends on the ISA alone.
 struct Common {
-    made: CommonInformationEntry,
     /// Its fields as read back, with an FDE of no instructions.
     entry: Entry,
 }
 
 impl Common {
-    /// The instructions of one function's FDE, written after the shared CIE and read back.
-    fn fde(&self, fde: gimli::write::FrameDescriptionEntry) -> Result<Vec<u8>, String> {
-        Entry::of(self.made.clone(), fde).map(|it| it.fde)
+    /// The instructions of one function's FDE, as they are written after the shared CIE.
+    fn fde(&self, fde: crate::unwind::Fde<'_>) -> Result<Vec<u8>, String> {
+        // alloc: the function's FDE, kept with its code
+        let mut out = Vec::new();
+        fde.write(self.entry.code_align, self.entry.data_align, &mut out)?;
+        Ok(out)
     }
 }
 
@@ -83,8 +85,8 @@ fn common(isa: &dyn TargetIsa) -> Result<&'static Common, String> {
         let Some(made) = process.create_systemv_cie() else {
             return Err(format!("{} has no DWARF call frame information", process.triple()));
         };
-        let entry = Entry::of(made.clone(), FrameDescriptionEntry::new(ANYWHERE, 0))?;
-        Ok(Common { made, entry })
+        let entry = Entry::of(made, FrameDescriptionEntry::new(ANYWHERE, 0))?;
+        Ok(Common { entry })
     });
     common.as_ref().map_err(Clone::clone)
 }

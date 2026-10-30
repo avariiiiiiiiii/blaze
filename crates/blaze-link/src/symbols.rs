@@ -115,6 +115,9 @@ pub(crate) enum SymKey {
     /// A dev run's pointer to `blaze_inproc_start` ([`crate::DevRun`]): before every other
     /// key in [`Symbols::cmp_keys`], so first among the pieces of its class and rank.
     StartHook,
+    /// A dev run's tier-up counter pairs ([`blaze_codegen::Target::Counter`]): the start of the
+    /// cells reservation, each pair at an offset of it ([`crate::counter`]).
+    Counters,
 }
 
 const _: () = assert!(size_of::<SymKey>() == 20);
@@ -152,6 +155,7 @@ impl SymKey {
             Coverage(a, b) => [23, a.0, b, 0, 0],
             CoveragePcs(a) => [24, a.0, 0, 0, 0],
             StartHook => [25, 0, 0, 0, 0],
+            Counters => [26, 0, 0, 0, 0],
         }
     }
 }
@@ -561,6 +565,7 @@ impl Symbols {
             SymKey::Coverage(it, array) => write!(out, "Coverage({:?}, {array})", self.instance(it)),
             SymKey::CoveragePcs(it) => write!(out, "CoveragePcs({:?})", self.instance(it)),
             SymKey::StartHook => write!(out, "StartHook"),
+            SymKey::Counters => write!(out, "Counters"),
         }
     }
 
@@ -611,7 +616,8 @@ impl Symbols {
             | SymKey::Stubs
             | SymKey::Descriptor
             | SymKey::LiveDir
-            | SymKey::StartHook => {}
+            | SymKey::StartHook
+            | SymKey::Counters => {}
         }
     }
 

@@ -15,8 +15,8 @@ use blaze_items::{CodeHash, ItemKey};
 use super::*;
 use crate::{
     Arch, Backend, Init, RelocKind,
-    plan::{Mode, OptLevel, Override, Profile},
-    settings::{DebugInfo, Panic, Relocation, Sanitize, Toolchain},
+    plan::{Mode, OptLevel, Override, Package, Profile},
+    settings::{DebugInfo, Panic, Pgo, Relocation, Sanitize, Toolchain},
     summary::{Attrs, Call, Hint},
 };
 
@@ -36,6 +36,8 @@ struct Program {
     functions: HashMap<u32, Function>,
     /// Each static's value byte and section.
     statics: HashMap<u32, (u8, Option<String>)>,
+    /// The functions a static's value points to.
+    static_calls: HashMap<u32, Vec<u32>>,
     /// The functions of each level the walk reached, in the order it told them.
     reached: Mutex<Vec<Vec<u32>>>,
     stop: AtomicBool,
@@ -47,7 +49,7 @@ impl Program {
             body,
             calls: calls.to_vec(),
             statics: Vec::new(),
-            origin: Origin::Member("app".to_owned()),
+            origin: Origin::Member(Package::new("app")),
             symbol: None,
             built_in: Vec::new(),
         };
@@ -83,11 +85,15 @@ impl Frontend for Program {
         for callee in &function.calls {
             code.update(&callee.to_le_bytes());
         }
+        let code = CodeHash(code.finish());
         Ok(Described {
+            owner: Owner::of(&function.origin),
+            identity: ContentId::of("blaze v2 test identity 1", &id.to_le_bytes()),
+            bound: Ok(code.0),
             item: item(*id),
-            code: CodeHash(code.finish()),
+            code,
             args: ContentId::default(),
-            origin: function.origin.clone(),
+            origin: function.origin,
             overflow_checks: None,
             address: match function.symbol {
                 Some(_) => Address::Significant,
@@ -109,9 +115,9 @@ impl Frontend for Program {
             mutable: false,
             thread_local: false,
             section: section.clone(),
-            origin: Origin::Member("app".to_owned()),
+            origin: Origin::Member(Package::new("app")),
             symbol: None,
-            refs: Vec::new(),
+            refs: self.static_calls.get(id).into_iter().flatten().map(|it| FrontRef::Function(*it)).collect(),
         })
     }
 
@@ -131,6 +137,9 @@ struct Machine {
     summarized: AtomicUsize,
     statics: AtomicUsize,
 }
+
+/// The body byte of a function whose IR can't be built, as a layout error stops it.
+const FAILS_ITS_CHECK: u8 = 0xee;
 
 /// A function's body byte, and how many places it has.
 struct Prepared {
@@ -163,6 +172,9 @@ impl Prepare for Machine {
     ) -> Result<(Shape, Prepared), CodegenError> {
         self.prepared.fetch_add(1, Ordering::Relaxed);
         let prepared = Prepared { body: program.functions[id].body, refs: refs.len() };
+        if prepared.body == FAILS_ITS_CHECK {
+            return Err(error(unit.instance.key(), unit.item, "a layout too big for the target"));
+        }
         Ok((Shape::of(unit, &code(&prepared)), prepared))
     }
 
@@ -238,6 +250,7 @@ impl Prepare for Machine {
             unwind: None,
             lines: Vec::new(),
             coverage: None,
+            profile: None,
         };
         Ok(Emitted { function, side: None, extra })
     }
@@ -272,6 +285,7 @@ impl Prepare for Machine {
             mutable: false,
             thread_local: false,
             section: section.clone(),
+            imports: Vec::new(),
         })
     }
 }
@@ -303,6 +317,7 @@ fn policy(level: OptLevel, mode: Mode) -> Policy {
             features: Vec::new(),
             cranelift: "0.136".to_owned(),
             llvm: Some("23.1".to_owned()),
+            stencils: None,
             frame_pointers: false,
             relocation: Relocation::Pic,
         },
@@ -318,11 +333,12 @@ fn policy(level: OptLevel, mode: Mode) -> Policy {
         mode,
         fold: false,
         sanitize: Sanitize::default(),
+        pgo: Pgo::None,
     }
 }
 
 fn member() -> Origin {
-    Origin::Member("app".to_owned())
+    Origin::Member(Package::new("app"))
 }
 
 /// `main` (1) calls 2 and 3; 2 calls 4, 3 calls 5; 4 and 5 differ; 2 and 3 are one shape.
@@ -528,7 +544,7 @@ fn a_live_build_starts_at_cranelift_and_tiers_up() {
         Override { opt_level: Some(OptLevel::O3), ..Override::default() },
     );
     let mut program = program();
-    program.functions.get_mut(&4).unwrap().origin = Origin::Dependency("memchr".to_owned());
+    program.functions.get_mut(&4).unwrap().origin = Origin::Dependency(Package::new("memchr"));
     let machine = Machine::default();
     let memo = Memo::new();
     let mut build = Build::new(&machine, &program, &policy, &memo);
@@ -552,7 +568,7 @@ fn a_tiered_callee_may_be_built_in_but_a_patchable_one_may_not() {
         Override { opt_level: Some(OptLevel::O3), ..Override::default() },
     );
     let mut program = program();
-    program.functions.get_mut(&4).unwrap().origin = Origin::Dependency("memchr".to_owned());
+    program.functions.get_mut(&4).unwrap().origin = Origin::Dependency(Package::new("memchr"));
     program.functions.get_mut(&2).unwrap().built_in = vec![0];
     let built = Build::new(&Machine::default(), &program, &policy, &Memo::new())
         .run(&[(1, member())], &Store::default())
@@ -634,6 +650,37 @@ fn a_stored_function_is_the_decoded_templates() {
     assert!(stored_function(&[0; 3], key, &[]).is_err());
 }
 
+/// A function built with a profile it no longer matches is counted however the build has it:
+/// compiled, or read back from the store.
+#[test]
+fn a_mismatched_profile_is_counted_compiled_or_stored() {
+    let key = InstanceKey(ContentId([1; 32]));
+    let function = |profile| CompiledFunction {
+        key,
+        arch: Arch::X86_64,
+        align: 16,
+        code: vec![0xc3],
+        relocs: crate::Relocs::new(),
+        data: Vec::new(),
+        inlined: Vec::new(),
+        side: None,
+        unwind: None,
+        lines: Vec::new(),
+        coverage: None,
+        profile,
+    };
+    let mismatched = function(Some(crate::Profiled::Used { mismatched: true }));
+    let template = crate::template::Template::of(&mismatched, &[], &[]).unwrap();
+    let stored = stored_function(&crate::blob::encode(&template), key, &[]).unwrap().unwrap();
+    assert_eq!(stored, mismatched);
+    let mut out = Out::default();
+    for it in [mismatched, stored, function(Some(crate::Profiled::Used { mismatched: false })), function(None)] {
+        out.push(CodeHash(ContentId::default()), it);
+    }
+    assert_eq!(out.stats.profile_mismatched, 2);
+    assert_eq!(out.functions.len(), 4);
+}
+
 #[test]
 fn a_level_without_its_backend_names_the_function() {
     let mut policy = policy(OptLevel::O3, Mode::Output);
@@ -642,3 +689,8 @@ fn a_level_without_its_backend_names_the_function() {
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].item, item(1));
 }
+
+mod later;
+mod masks;
+mod pieces;
+mod stop;

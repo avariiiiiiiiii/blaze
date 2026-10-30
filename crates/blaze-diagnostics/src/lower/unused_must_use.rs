@@ -152,7 +152,7 @@ fn must_use_adt<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>, post: &str) -> Optio
 
 /// The function a call or a method call calls, when it names one: rustc's
 /// `check_fn_must_use` (a local holding a function names none).
-fn callee(cx: &Cx<'_, '_>, expr: ast::Expr<'_>) -> Option<hir::Function> {
+fn callee<'db>(cx: &Cx<'_, 'db>, expr: ast::Expr<'db>) -> Option<hir::Function> {
     match expr {
         ast::Expr::CallExpr(call) => {
             let ast::Expr::PathExpr(path) = call.expr()? else { return None };

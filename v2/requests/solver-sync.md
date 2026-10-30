@@ -108,6 +108,8 @@ read from about 15 cycles to the bound of about 6 (with the change in section 2 
 > load. salsa's memo columns do the same with `OnceLock<Region>`. `blaze-mem` in
 > `crates/hir-ty/Cargo.toml` is db's part.
 
+> not applied by db-solver (2026-10-29 23:45): the same change as `mem-db-solver.md` 9 (`Column` on a reserved `Region`), which waits as said there; `blaze-mem` is in `crates/hir-ty/Cargo.toml:51`.
+
 ## 5. Coordinator: `compiler/rustc_transmute` at 16d1ffac into `/tmp/rust-solver`
 
 What: add `compiler/rustc_transmute` to `/tmp/rust-solver`'s sparse checkout, at the same

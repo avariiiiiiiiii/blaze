@@ -49,6 +49,7 @@ are `hashbrown::HashMap<K, V, FxBuildHasher, &Frame>`, whose `A: Allocator` need
 Run `tools/v2/manifest_lint.py` after.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:42): in the tree: `hashbrown` and `blaze-mem` in base-db's, hir-expand's, hir-def's and hir's `Cargo.toml` (outcome lines under H3).
 
 ## H2. `#![feature(allocator_api)]` (same owners)
 
@@ -69,6 +70,7 @@ base-db and hir-expand keep `#![forbid(unsafe_code)]`: nothing here needs unsafe
 API is safe).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:42): in the tree: base-db lib.rs:5, hir-expand :7, hir-def :11, hir :21.
 
 ## H3. One counting allocator per test binary (same owners)
 
@@ -123,6 +125,7 @@ tables `Tag::Query` (contract 5).
 >   B1's line says.
 > - B7's `parse_errors` half waits on `Parse::errors_exact` in `crates/syntax`. Tell db-expand
 >   when it lands.
+> checked by db-audit-mem (22:42): B1-B8 and the budget tests are settled below. Still open: B7's `parse_errors` half waits on `Parse::errors_exact`/`errors_with_bodies_exact` (`v2/requests/mem-format-tree.md`, "a parse's errors at their exact length", forwarded to frontend-tree), not in `crates/syntax/src/lib.rs` (`errors()` still returns a `Vec`).
 
 ### B1. Every setter is a task of its own (`files.rs`, `named.rs`, `content.rs`, `lib.rs`)
 
@@ -948,6 +951,7 @@ and B1, B2 frame them. No base-db query calls `frame::current`.
 > forwarded to db (from requests, pass 17; told by tmux).
 
 > checked by db-mem-def (21:40): no change asked, and it holds. B6 and B7 open `frame::task(Tag::Query, ..)`, and no base-db query calls `frame::current` (`db/tests.rs:62` calls it inside a `run_all` task, which B5 frames).
+> checked by db-mem-def (22:45): M1 is in. `vendor/salsa/src/function/execute.rs:343` runs each query body in `blaze_mem::frame::task(C::MEM_TAG, ..)`, as do the cycle paths at 208, 267 and 278, so the "`vendor/salsa` opens no frame" above is out of date. B6's and B7's own `frame::task(Tag::Query, ..)` now nests inside salsa's: still right, one frame more per run. A `frame::current` in a query body no longer stops. Only a plain function that calls it from outside any task (a test) still does.
 
 ### Budget tests
 

@@ -56,7 +56,7 @@ pub use fact::is_plain_data;
 pub use intrinsics::{Class, classify};
 
 /// The domain of a share key.
-pub const SHARE_DOMAIN: &str = "blaze v2 share key 1";
+pub const SHARE_DOMAIN: &str = "blaze v2 share key 2";
 /// The domain of a type's fact.
 pub const FACT_DOMAIN: &str = "blaze v2 share fact 1";
 /// The domain of the records of one walk of a body.
@@ -92,10 +92,10 @@ pub struct ShareInstance {
     pub args: StoredGenericArgs,
 }
 
-/// A set of [`MirOptions`], one bit for each of the twelve (three levels, UB checks or not,
-/// lifetime markers or not).
+/// A set of [`MirOptions`], one bit for each of the twenty-four (three levels, UB checks or
+/// not, lifetime markers or not, inlined or not).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OptionsSet(u16);
+pub struct OptionsSet(u32);
 
 const LEVELS: [MirOptLevel; 3] = [MirOptLevel::Off, MirOptLevel::Debug, MirOptLevel::Release];
 
@@ -118,7 +118,10 @@ impl OptionsSet {
             MirOptLevel::Debug => 1,
             MirOptLevel::Release => 2,
         };
-        level * 4 + (options.ub_checks as u32) * 2 + options.lifetime_markers as u32
+        level * 8
+            + (options.ub_checks as u32) * 4
+            + (options.lifetime_markers as u32) * 2
+            + options.inline as u32
     }
 
     pub const fn contains(self, options: MirOptions) -> bool {
@@ -135,8 +138,14 @@ impl OptionsSet {
             .into_iter()
             .flat_map(|level| {
                 [false, true].into_iter().flat_map(move |ub_checks| {
-                    [false, true]
-                        .map(|lifetime_markers| MirOptions { level, ub_checks, lifetime_markers })
+                    [false, true].into_iter().flat_map(move |lifetime_markers| {
+                        [false, true].map(|inline| MirOptions {
+                            level,
+                            ub_checks,
+                            lifetime_markers,
+                            inline,
+                        })
+                    })
                 })
             })
             .filter(move |&options| self.contains(options))
@@ -147,8 +156,9 @@ impl OptionsSet {
 /// `Build::options` over the units of the build): `lang` for a body of the library's crates,
 /// `other` for the rest. An instance's `Described` is one for every unit of the build, so the
 /// key is over the body with each options here: two instances with one key are one under
-/// each of them. A build whose units all compile alike gives one options each, and the key
-/// costs one walk.
+/// each of them. An options says whether the body is inlined, so the key reads the inlined
+/// body where a unit compiles one, and never keys an inlined and an uninlined body as one. A
+/// build whose units all compile alike gives one options each, and the key costs one walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BodyOptions {
     pub lang: OptionsSet,

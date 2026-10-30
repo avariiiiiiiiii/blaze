@@ -44,6 +44,8 @@ mod anchored_path;
 pub mod file_set;
 pub mod loader;
 mod path_interner;
+#[cfg(test)]
+mod tests;
 mod vfs_path;
 
 use std::{fmt, hash::BuildHasherDefault, mem};
@@ -214,10 +216,33 @@ impl Vfs {
     /// Returns `true` if the file was modified, and saves the [change](ChangedFile).
     ///
     /// If the path does not currently exist in the `Vfs`, allocates a new
-    /// [`FileId`] for it.
+    /// [`FileId`] for it, numbering densely. A `Vfs` whose files a database also numbers
+    /// takes its new IDs from it instead ([`Vfs::set_file_contents_with`]).
     pub fn set_file_contents(&mut self, path: VfsPath, contents: Option<Vec<u8>>) -> bool {
         let _p = span!(Level::INFO, "Vfs::set_file_contents").entered();
         let file_id = self.alloc_file_id(path);
+        self.set_contents(file_id, contents)
+    }
+
+    /// [`Vfs::set_file_contents`], with a new path's [`FileId`] from `new_id` (called only for a
+    /// path the `Vfs` has never had), such as base-db's `Db::new_file_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_id()` is already another path's ID.
+    pub fn set_file_contents_with(
+        &mut self,
+        path: VfsPath,
+        contents: Option<Vec<u8>>,
+        new_id: impl FnOnce() -> FileId,
+    ) -> bool {
+        let _p = span!(Level::INFO, "Vfs::set_file_contents_with").entered();
+        let file_id = self.interner.intern_with(path, new_id);
+        self.hold(file_id);
+        self.set_contents(file_id, contents)
+    }
+
+    fn set_contents(&mut self, file_id: FileId, contents: Option<Vec<u8>>) -> bool {
         let state: FileState = self.get(file_id);
         let change = match (state, contents) {
             (FileState::Deleted, None) => return false,
@@ -301,10 +326,15 @@ impl Vfs {
     /// Does not record a change.
     fn alloc_file_id(&mut self, path: VfsPath) -> FileId {
         let file_id = self.interner.intern(path);
+        self.hold(file_id);
+        file_id
+    }
+
+    /// Grows `data` to hold `file_id`, IDs no path has reading as deleted.
+    fn hold(&mut self, file_id: FileId) {
         let idx = file_id.0 as usize;
         let len = self.data.len().max(idx + 1);
         self.data.resize(len, FileState::Deleted);
-        file_id
     }
 
     /// Returns the status of the file associated with the given `file_id`.

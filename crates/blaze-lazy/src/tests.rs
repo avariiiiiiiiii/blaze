@@ -5,6 +5,7 @@ mod budget;
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod exec;
 mod flight;
+mod hit;
 mod plan;
 mod refuse;
 mod sim;
@@ -15,9 +16,9 @@ mod wire;
 use std::collections::BTreeMap;
 
 use blaze_codegen::{
-    Arch, CompiledFunction, InstanceKey, Reloc, RelocKind, Target,
+    Arch, CompiledFunction, InstanceKey, RelocKind, Target,
     plan::{Mode, OptLevel, Override, Policy, Profile},
-    settings::{DebugInfo, Panic, Relocation, Toolchain},
+    settings::{DebugInfo, Panic, Pgo, Relocation, Sanitize, Toolchain},
 };
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
@@ -34,6 +35,7 @@ pub(crate) fn policy(level: OptLevel, mode: Mode) -> Policy {
             features: Vec::new(),
             cranelift: "0.136".to_owned(),
             llvm: Some("23.1".to_owned()),
+            stencils: None,
             frame_pointers: true,
             relocation: Relocation::Pic,
         },
@@ -48,6 +50,8 @@ pub(crate) fn policy(level: OptLevel, mode: Mode) -> Policy {
         },
         mode,
         fold: false,
+        sanitize: Sanitize::default(),
+        pgo: Pgo::None,
     }
 }
 
@@ -73,12 +77,12 @@ pub(crate) fn compiled(n: u32, callees: &[u32], addressed: &[u32]) -> CompiledFu
     let mut relocs = Vec::new();
     for &callee in callees {
         code.push(0xe8);
-        relocs.push(Reloc { at: code.len() as u32, kind: RelocKind::PcRel32, target: Target::Function(key(callee)), addend: -4 });
+        relocs.push(blaze_codegen::Relocation { at: code.len() as u32, kind: RelocKind::PcRel32, target: Target::Function(key(callee)), addend: -4 });
         code.extend_from_slice(&[0; 4]);
     }
     for &other in addressed {
         code.extend_from_slice(&[0x48, 0x8d, 0x05]);
-        relocs.push(Reloc { at: code.len() as u32, kind: RelocKind::PcRel32, target: Target::Function(key(other)), addend: -4 });
+        relocs.push(blaze_codegen::Relocation { at: code.len() as u32, kind: RelocKind::PcRel32, target: Target::Function(key(other)), addend: -4 });
         code.extend_from_slice(&[0; 4]);
     }
     code.push(0xc3);
@@ -87,11 +91,13 @@ pub(crate) fn compiled(n: u32, callees: &[u32], addressed: &[u32]) -> CompiledFu
         arch: Arch::X86_64,
         align: 16,
         code,
-        relocs,
+        relocs: relocs.into(),
         data: Vec::new(),
         inlined: Vec::new(),
         side: None,
         unwind: None,
         lines: Vec::new(),
+        coverage: None,
+        profile: None,
     }
 }

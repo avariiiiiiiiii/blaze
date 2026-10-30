@@ -314,6 +314,7 @@ mod function;
 mod graph;
 mod hash;
 mod id;
+pub mod image;
 mod ingredient;
 mod ingredient_cache;
 mod input;
@@ -358,6 +359,7 @@ pub use self::event::{Event, EventKind};
 pub use self::fingerprint::{Fingerprint, StableHasher};
 pub use self::id::Id;
 pub use self::input::setter::Setter;
+pub use self::ingredient::ReadKind;
 pub use self::key::DatabaseKeyIndex;
 pub use self::return_mode::SalsaAsDeref;
 pub use self::return_mode::SalsaAsRef;
@@ -430,6 +432,8 @@ pub mod plumbing {
     };
     pub use crate::zalsa_local::ZalsaLocal;
     pub use blaze_mem::Tag as MemTag;
+
+    pub use crate::image::ImageCodec;
 
     #[cfg(feature = "persistence")]
     pub use serde;

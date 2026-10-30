@@ -98,6 +98,14 @@ class Input(unittest.TestCase):
         with self.assertRaises(typed_input.InputError):
             pgo.parse_input(build(bolt_bins=[]))
 
+    def test_speedup_floor_and_rounds_checked(self) -> None:
+        got = pgo.parse_input(build())
+        assert isinstance(got, pgo.Build)
+        self.assertEqual((got.min_speedup, got.measure_runs, got.baseline), (50, 2, ""))
+        for bad in (build(min_speedup=0), build(min_speedup=1000), build(measure_runs=0)):
+            with self.assertRaises(typed_input.InputError, msg=bad):
+                pgo.parse_input(bad)
+
 
 class TrainingFile(unittest.TestCase):
     def test_checked_in_training_parses(self) -> None:
@@ -105,8 +113,16 @@ class TrainingFile(unittest.TestCase):
         names = [p.name for p in training.projects]
         self.assertEqual(names, ["blaze", "ripgrep", "nushell"])
         self.assertIsNotNone(training.corpus)
+        self.assertEqual(training.measure, ("ripgrep",))
         for project in training.projects:
             self.assertTrue(any(t.edit for t in project.turns), project.name)
+
+    def test_measure_names_projects(self) -> None:
+        for measure in ([], ["q"], ["p", "p"]):
+            with self.assertRaises(typed_input.InputError, msg=measure):
+                pgo.parse_training(json.dumps({"projects": [self.project()], "measure": measure}))
+        got = pgo.parse_training(json.dumps({"projects": [self.project()], "measure": ["p"]}))
+        self.assertEqual(got.measure, ("p",))
 
     def project(self, **fields: object) -> dict[str, object]:
         given: dict[str, object] = {"name": "p", "source": "git", "repo": "https://x/y", "rev": COMMIT,
@@ -152,12 +168,24 @@ class Pins(unittest.TestCase):
 
     def test_roundtrip(self) -> None:
         bolt = {"mode": "instrument", "name": "b.fdata", "sha256": SHA}
-        blaze = pin(builder="blaze", llvm="ef" * 20, bolt=bolt, binaries={"name": "b.tar.xz", "sha256": SHA})
+        speedup = {"plain_ms": 90_000, "pgo": 120, "total": 150, "runs": 3}
+        binaries = {"name": "b.tar.xz", "sha256": SHA}
+        blaze = pin(builder="blaze", llvm="ef" * 20, bolt=bolt, binaries=binaries, speedup=speedup)
         text = pins({LINUX: blaze, MAC: pin()})
         got = pgo.load_pins(text)
         self.assertEqual(pgo.load_pins(pgo.dump_pins(got)), got)
         self.assertEqual([t for t, _ in got.targets], [MAC, LINUX])
         self.assertEqual(dict(got.targets)[LINUX].bolt, pgo.Bolt("instrument", "b.fdata", SHA))
+        self.assertEqual(dict(got.targets)[LINUX].speedup, pgo.Speedup(90_000, 120, 150, 3))
+
+    def test_a_blaze_pin_names_its_speedup(self) -> None:
+        binaries = {"name": "b.tar.xz", "sha256": SHA}
+        unmeasured = pin(builder="blaze", llvm="ef" * 20, binaries=binaries)
+        never_ran = pin(builder="blaze", llvm="ef" * 20, binaries=binaries,
+                        speedup={"plain_ms": 0, "pgo": 1, "total": 1, "runs": 3})
+        for bad in (unmeasured, never_ran):
+            with self.assertRaises(typed_input.InputError, msg=bad):
+                pgo.load_pins(pins({LINUX: bad}))
 
     def test_unknown_fields_refused(self) -> None:
         with self.assertRaises(SystemExit):
@@ -218,7 +246,8 @@ class Outputs(unittest.TestCase):
             (root / "b.tar.xz").write_bytes(b"b")
             archive = pgo.Asset("b.tar.xz", hashlib.sha256(b"b").hexdigest())
             digest = hashlib.sha256(b"p").hexdigest()
-            good = pgo.Pin("p.profdata", digest, COMMIT, 9, None, "blaze", "ef" * 20, None, archive)
+            speedup = pgo.Speedup(1000, 100, 100, 1)
+            good = pgo.Pin("p.profdata", digest, COMMIT, 9, None, "blaze", "ef" * 20, None, archive, speedup)
             out = root / f"{MAC}.json"
             out.write_text(json.dumps({"target": MAC, "toolchain": "t", "pin": pgo.pin_json(good)}))
             self.assertEqual(pgo.read_output(out), (MAC, "t", good))
@@ -285,6 +314,38 @@ class Steps(unittest.TestCase):
         self.assertEqual(pgo.binaries(off, ["blaze"]), ["blaze-engine"])
         engine = (HERE.parents[1] / "crates" / "blaze-engine" / "Cargo.toml").read_text()
         self.assertIn("blaze-engine", pgo.binaries(engine, []))
+
+    def test_speedup_of_the_least_times(self) -> None:
+        self.assertEqual(pgo.saved(100.0, 85.0), 150)
+        self.assertEqual(pgo.saved(3.0, 2.0), 333)
+        self.assertEqual(pgo.saved(100.0, 101.0), -10)
+        got = pgo.speedup_of({"plain": 100.0, "pgo": 88.0, "total": 84.0}, 3, 50)
+        self.assertEqual(got, pgo.Speedup(100_000, 120, 160, 3))
+        # No BOLT: the profile's is the whole speedup.
+        self.assertEqual(pgo.speedup_of({"plain": 10.0, "pgo": 9.0}, 1, 50), pgo.Speedup(10_000, 100, 100, 1))
+        # A profile that applied to nothing, or a slower binary, stops the release.
+        for least in ({"plain": 100.0, "pgo": 99.0, "total": 96.0}, {"plain": 100.0, "pgo": 104.0}):
+            with self.assertRaises(pgo.Failed, msg=least):
+                pgo.speedup_of(least, 3, 50)
+        with self.assertRaises(pgo.Failed):
+            pgo.speedup_of({"plain": 0.0, "pgo": 0.0}, 3, 50)
+
+    def test_rounds_rotate_the_sets(self) -> None:
+        names = ["pgo", "plain", "total"]
+        firsts = [pgo.rotated(names, i)[0] for i in range(3)]
+        self.assertEqual(firsts, names)
+        self.assertEqual(pgo.rotated(names, 4), ["plain", "total", "pgo"])
+
+    def test_baseline_has_both_binaries(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            given = pgo.parse_input(build(baseline=d))
+            assert isinstance(given, pgo.Build)
+            llvm = pgo.Llvm(Path(d), "ef" * 20)
+            (Path(d) / "blaze").write_bytes(b"x")
+            with self.assertRaises(pgo.Failed):
+                pgo.plain_bins(given, llvm, Path(d))
+            (Path(d) / "blaze-engine").write_bytes(b"x")
+            self.assertEqual(pgo.plain_bins(given, llvm, Path(d)), Path(d).resolve())
 
     def test_edit_text_changes_each_turn(self) -> None:
         self.assertEqual(pgo.edit_text(1), "\nconst _: u64 = 1;\n")

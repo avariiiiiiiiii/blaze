@@ -107,7 +107,7 @@ fn plain_data<'db>(
             if let hir_def::AdtId::UnionId(_) = adt {
                 return false;
             }
-            identity::variants(db, adt).all(|variant| {
+            adt.variants(db).all(|variant| {
                 db.field_types(variant).iter().all(|(_, field)| {
                     let ty = field.ty().instantiate(interner, args).skip_norm_wip();
                     plain_data(db, interner, infcx, param_env, ty, depth + 1)
@@ -235,7 +235,7 @@ impl<'db> Cx<'db> {
                 out.update(&[tag::ADT]);
                 out.id(identity::adt(db, adt).as_ref().map_err(Clone::clone)?);
                 layout::write(&self.layout(ty)?, out);
-                for variant in identity::variants(db, adt) {
+                for variant in adt.variants(db) {
                     if let VariantId::EnumVariantId(variant) = variant {
                         let discriminant = db.const_eval_discriminant(variant).map_err(|error| {
                             Unshared::ConstEval(format!("a discriminant of `{ty:?}`: {error:?}")) // alloc: error path

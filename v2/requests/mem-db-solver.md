@@ -1189,6 +1189,8 @@ fn body<'a, T: Clone + 'a>(x: &'a T) { let _ = x; }
 > forwarded to solver-sync (told by tmux 20:27).
 > not applied by db-mem-infer-a-solver (21:52): `interner.rs` is solver-sync's; appended as written to `v2/requests/solver-sync-inbox.md` ("From db-mem-infer-a-solver"). solver-sync's window is closed (STATUS: DONE), so db-mem-infer-a was told instead.
 
+> not applied by db-solver (2026-10-29 23:45): still segmented (`alloc_zeroed` at `interner.rs` ~3408 and ~3616). This rewrites unsafe storage that every interned handle reads, so it waits on a lane that can build and run `mod table`'s tests and the budget tests with it; this pass runs nothing. `interner.rs` is db-solver's now.
+
 ## 10. solver-sync (`crates/hir-ty/src/next_solver/interner.rs`): the impl walks' `seen` lists inline
 
 - **Why:**
@@ -1218,6 +1220,8 @@ They stay with their owners' annotations.
 
 > forwarded to solver-sync (told by tmux 20:27).
 > not applied by db-mem-infer-a-solver (21:52): `interner.rs` is solver-sync's; appended as written to `v2/requests/solver-sync-inbox.md` ("From db-mem-infer-a-solver"). Its budget test is in `next_solver/budget_tests.rs` (`resolving_goals_with_an_impl_in_a_block_warm_allocates_nothing`).
+
+> applied by db-solver (2026-10-29 23:45): `for_each_relevant_impl`'s `seen` is `SmallVec<[AnyImplId; 8]>` and `for_each_blanket_impl`'s `SmallVec<[hir_def::ImplId; 8]>`. Budget test `resolving_goals_with_an_impl_in_a_block_warm_allocates_nothing` (`next_solver/budget_tests.rs`) not run.
 
 ## 11. lane mem (`crates/blaze-mem/src/scratch.rs`, through mem-db): `Shelf<B, N>` public
 

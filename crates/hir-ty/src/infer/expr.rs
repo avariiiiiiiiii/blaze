@@ -11,9 +11,10 @@ use hir_def::{
     hir::{
         ArithOp, Array, AsmOperand, AsmOptions, BinaryOp, BindingAnnotation, Expr, ExprId,
         ExprOrPatIdPacked, InlineAsmKind, LabelId, LoopSource, Pat, PatId, RecordLitField,
-        RecordSpread, Statement, Statements, UnaryOp,
+        RecordSpread, Statement, Statements, UnaryOp, UnsafeBinderCastKind,
     },
     resolver::{TypeNs, ValueNs},
+    type_ref::TypeRefId,
     signatures::VariantFields,
 };
 use hir_def::{
@@ -282,6 +283,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             Expr::Underscore => true,
             Expr::UnaryOp { op: UnaryOp::Deref, .. } => true,
             Expr::Field { .. } | Expr::Index { .. } => true,
+            // rustc's `is_place_expr`: an unsafe binder cast keeps its operand's place-ness.
+            Expr::UnsafeBinderCast { expr, .. } => self.is_syntactic_place_expr(expr),
             Expr::Call { .. }
             | Expr::MethodCall { .. }
             | Expr::Tuple { .. }
@@ -433,7 +436,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         coerce.coerce_forced_unit(
                             self,
                             tgt_expr,
-                            &ObligationCause::new(tgt_expr),
+                            &ObligationCause::with_code(
+                                tgt_expr,
+                                ObligationCauseCode::IfExpressionWithNoElse,
+                            ),
                             true,
                             ExprIsRead::Yes,
                         );
@@ -995,6 +1001,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 } else {
                     self.types.types.unit
                 }
+            }
+            Expr::UnsafeBinderCast { kind, expr, ty } => {
+                self.infer_unsafe_binder_cast(tgt_expr, kind, expr, ty, expected, is_read)
             }
             Expr::IncludeBytes => {
                 let len = self.table.next_const_var(Span::Dummy);
@@ -1623,7 +1632,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     coerce.coerce_forced_unit(
                         self,
                         ret,
-                        &ObligationCause::new(ret),
+                        &ObligationCause::with_code(ret, ObligationCauseCode::ReturnNoExpression),
                         true,
                         ExprIsRead::Yes,
                     );
@@ -1882,6 +1891,78 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         })
     }
 
+    /// rustc's `check_expr_unsafe_binder_cast`. `wrap_binder!` checks its operand against the
+    /// binder's contents and has the binder's type; `unwrap_binder!` has the contents of its
+    /// operand's binder. Each binder is instantiated with fresh region variables.
+    fn infer_unsafe_binder_cast(
+        &mut self,
+        tgt_expr: ExprId,
+        kind: UnsafeBinderCastKind,
+        operand: ExprId,
+        type_ref: Option<TypeRefId>,
+        expected: &Expectation<'db>,
+        is_read: ExprIsRead,
+    ) -> Ty<'db> {
+        let ascribed = type_ref.map(|type_ref| self.make_ty(type_ref));
+        match kind {
+            UnsafeBinderCastKind::Wrap => {
+                let binder_ty = match (ascribed, expected.only_has_type(&mut self.table)) {
+                    (Some(ascribed), Some(expected)) => {
+                        _ = self.demand_eqtype(operand.into(), expected, ascribed);
+                        expected
+                    }
+                    (Some(ty), None) | (None, Some(ty)) => ty,
+                    (None, None) => self.table.next_ty_var(operand.into()),
+                };
+                let binder_ty = self.structurally_resolve_type(operand.into(), binder_ty);
+                let contents = self.unsafe_binder_contents(tgt_expr, kind, operand, binder_ty);
+                self.infer_expr_suptype_coerce_never(
+                    operand,
+                    &Expectation::HasType(contents),
+                    is_read,
+                );
+                binder_ty
+            }
+            UnsafeBinderCastKind::Unwrap => {
+                let hint = ascribed.unwrap_or_else(|| self.table.next_ty_var(operand.into()));
+                let binder_ty = self.infer_expr_suptype_coerce_never(
+                    operand,
+                    &Expectation::HasType(hint),
+                    is_read,
+                );
+                let binder_ty = self.structurally_resolve_type(operand.into(), binder_ty);
+                self.unsafe_binder_contents(tgt_expr, kind, operand, binder_ty)
+            }
+        }
+    }
+
+    /// What `binder_ty`, the binder of the cast `tgt_expr`, holds; an error, reported unless
+    /// `binder_ty` is one, when it is no unsafe binder.
+    fn unsafe_binder_contents(
+        &mut self,
+        tgt_expr: ExprId,
+        kind: UnsafeBinderCastKind,
+        operand: ExprId,
+        binder_ty: Ty<'db>,
+    ) -> Ty<'db> {
+        match binder_ty.kind() {
+            TyKind::UnsafeBinder(inner) => self.infcx().instantiate_binder_with_fresh_vars(
+                operand.into(),
+                BoundRegionConversionTime::HigherRankedType,
+                inner.into(),
+            ),
+            TyKind::Error(_) => binder_ty,
+            _ => {
+                self.push_diagnostic(InferenceDiagnostic::UnsafeBinderCastOfNonBinder {
+                    expr: tgt_expr,
+                    kind,
+                    found: binder_ty.store(),
+                });
+                self.err_ty()
+            }
+        }
+    }
+
     fn infer_field_access(
         &mut self,
         tgt_expr: ExprId,
@@ -1913,19 +1994,15 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 ty
             }
             None => {
-                // no field found, lets attempt to resolve it like a function so that IDE things
-                // work out while people are typing
-                let resolved = self.lookup_method_including_private(
-                    receiver_ty,
-                    name.clone(),
-                    None,
-                    receiver,
-                    tgt_expr,
-                );
+                // No field: probe for a method of the name, as rustc's
+                // `method_exists_for_diagnostic`, which also lets IDE features work while
+                // people are typing.
+                let resolved =
+                    self.lookup_method_for_diagnostic(receiver_ty, *name, receiver, tgt_expr);
                 self.push_diagnostic(InferenceDiagnostic::UnresolvedField {
                     expr: tgt_expr,
                     receiver: receiver_ty.store(),
-                    name: name.clone(),
+                    name: *name,
                     method_with_same_name_exists: resolved.is_ok(),
                 });
                 match resolved {
@@ -2003,7 +2080,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
         let resolved = self.lookup_method_including_private(
             receiver_ty,
-            method_name.clone(),
+            *method_name,
             generic_args,
             receiver,
             tgt_expr,
@@ -2039,7 +2116,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         ) {
                             ctx.probe_for_name(
                                 method_resolution::Mode::Path,
-                                method_name.clone(),
+                                *method_name,
                                 receiver_ty,
                             )
                         } else {
@@ -2060,7 +2137,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 self.push_diagnostic(InferenceDiagnostic::UnresolvedMethodCall {
                     expr: tgt_expr,
                     receiver: receiver_ty.store(),
-                    name: method_name.clone(),
+                    name: *method_name,
                     field_with_same_name: field_with_same_name_exists.map(|it| it.store()),
                     assoc_func_with_same_name: assoc_func_with_same_name.map(|it| it.def_id),
                 });
@@ -2338,12 +2415,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 self.table.select_obligations_where_possible();
             }
 
-            let mut skip_indices = skip_indices.iter().copied();
+            let mut skip_indices = skip_indices.iter().copied().peekable();
             let mut position = 0;
             // Check each argument, to satisfy the input it was provided for
             // Visually, we're traveling down the diagonal of the compatibility matrix
             for (idx, arg) in provided_args.iter().enumerate() {
-                if skip_indices.clone().next() == Some(idx as u32) {
+                if skip_indices.peek() == Some(&(idx as u32)) {
                     skip_indices.next();
                     continue;
                 }
@@ -2434,17 +2511,17 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 let ty = self.expr_ty_after_adjustments(arg);
                 self.table.resolve_vars_if_possible(ty)
             })
-            .collect();
+            .collect(); // alloc: error path
         let inputs_tys: Vec<(Ty<'db>, Ty<'db>)> = formal_input_tys
             .iter()
             .zip(expected_input_tys)
             .map(|(&formal, &expected)| {
                 (self.table.resolve_vars_if_possible(formal), self.table.resolve_vars_if_possible(expected))
             })
-            .collect();
+            .collect(); // alloc: error path
 
         let mut compatible_ends = Vec::with_capacity(provided.len());
-        let mut compatible = Vec::new();
+        let mut compatible = Vec::new(); // alloc: error path
         for (provided_idx, &arg_ty) in provided.iter().enumerate() {
             for (expected_idx, &(formal, expected)) in inputs_tys.iter().enumerate() {
                 let fits = if provided_idx == expected_idx {
@@ -2467,13 +2544,17 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             ),
             _ => (self.types.types.error, None),
         };
+        // alloc: error path, the diagnostic's own record
         Box::new(CallArguments {
             callee: self.ty_as_found(callee),
             method,
             is_method: matches!(self.store.expr(call_expr), Expr::MethodCall { .. }),
             c_variadic,
+            // alloc: error path
             formal_inputs: inputs_tys.iter().map(|&(formal, _)| self.ty_as_found(formal)).collect(),
+            // alloc: error path
             expected_inputs: inputs_tys.iter().map(|&(_, expected)| self.ty_as_found(expected)).collect(),
+            // alloc: error path
             provided: provided.iter().map(|&ty| self.ty_as_found(ty)).collect(),
             compatible_ends: compatible_ends.into_boxed_slice(),
             compatible: compatible.into_boxed_slice(),

@@ -65,7 +65,7 @@ use crate::{
     lang_item::{LangItemEnum, LangItemTarget, LangItems},
     nameres::{
         DefDiagnostic, DefMap, DefMapCrateData, LocalDefMap, ModuleData, ModuleOrigin, ModulesSlot,
-        diagnostics::DefDiagnosticKind,
+        diagnostics::{DefDiagnosticKind, TraitItemImport},
         uses::{DeriveHelperUse, MacroCallRecord, MacroVia, NameRecords, Use, Used},
     },
     per_ns::{Item, Namespace},
@@ -78,7 +78,7 @@ type R<T = ()> = Result<T, String>;
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 11";
+pub const ENCODING: &str = "blaze frozen def map 12";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1761,6 +1761,15 @@ impl Enc<'_> {
                 self.ast_id(*id)?;
                 self.u32(index.into_raw().into_u32());
             }
+            DefDiagnosticKind::TraitItemImport { id, index, why } => {
+                self.u8(10);
+                self.ast_id(*id)?;
+                self.u32(index.into_raw().into_u32());
+                self.u8(match why {
+                    TraitItemImport::Unstable => 0,
+                    TraitItemImport::ItemsFromMacros => 1,
+                });
+            }
             DefDiagnosticKind::UnconfiguredCode { ast_id, cfg } => {
                 self.u8(3);
                 self.hir_file(ast_id.file_id)?;
@@ -3202,6 +3211,17 @@ impl Dec<'_> {
                     it => return Err(format!("macro error {it}")),
                 };
                 DefDiagnosticKind::MacroError { ast, path, err }
+            }
+            10 => {
+                let id = self.ast_id()?;
+                let index = Idx::from_raw(RawIdx::from_u32(self.u32()?));
+                let why = match self.u8()? {
+                    0 => TraitItemImport::Unstable,
+                    1 => TraitItemImport::ItemsFromMacros,
+                    // alloc: error path
+                    it => return Err(format!("trait item import {it}")),
+                };
+                DefDiagnosticKind::TraitItemImport { id, index, why }
             }
             // alloc: error path
             it => return Err(format!("diagnostic {it}")),

@@ -66,8 +66,9 @@ use super::{
     fold::{BoundVarReplacer, BoundVarReplacerDelegate, FnMutDelegate},
     generics::{Generics, generics},
     persist,
+    features::Features,
     region::{BoundRegion, BoundRegionKind, EarlyParamRegion, Region},
-    util::sizedness_constraint_for_ty,
+    util::adt_sizedness_constraint,
 };
 
 /// A list of interned values, as an index into a [`table::Lists`] of its own: `$storage` holds the
@@ -403,6 +404,8 @@ pub struct DbInterner<'db> {
     /// The solver answers with the region constraints proving a goal takes, as borrowck needs;
     /// otherwise regions are not looked at.
     regions: bool,
+    /// The crate's `#![feature(..)]`s, read once; `None` without a crate.
+    features: Option<Features<'db>>,
 }
 
 // The database is `Send + Sync` (`salsa::Database`), so an interner is, by the auto traits.
@@ -424,6 +427,7 @@ impl<'db> DbInterner<'db> {
             recursion_limit: 128,
             solved: tls_cache::Solved::new(),
             regions: false,
+            features: None,
         }
     }
 
@@ -437,6 +441,7 @@ impl<'db> DbInterner<'db> {
             recursion_limit: hir_def::nameres::crate_recursion_limit(db, krate),
             solved: tls_cache::Solved::new(),
             regions: false,
+            features: Some(Features::of(db, krate)),
         }
     }
 
@@ -630,6 +635,10 @@ bitflags::bitflags! {
         const IS_PHANTOM_DATA = 1 << 3;
         const IS_MANUALLY_DROP = 1 << 4;
         const IS_BOX = 1 << 5;
+        /// A field of some variant is `unsafe` (`#![feature(unsafe_fields)]`).
+        const HAS_UNSAFE_FIELDS = 1 << 6;
+        /// `core::field::FieldRepresentingType`, what `field_of!` names.
+        const IS_FIELD_REPRESENTING_TYPE = 1 << 7;
     }
 }
 
@@ -661,8 +670,14 @@ impl AdtDef {
                 if data.flags.contains(StructFlags::IS_MANUALLY_DROP) {
                     flags.insert(AdtFlags::IS_MANUALLY_DROP);
                 }
+                if data.flags.contains(StructFlags::IS_FIELD_REPRESENTING_TYPE) {
+                    flags.insert(AdtFlags::IS_FIELD_REPRESENTING_TYPE);
+                }
                 if data.flags.contains(StructFlags::IS_BOX) {
                     flags.insert(AdtFlags::IS_BOX);
+                }
+                if data.flags.contains(StructFlags::HAS_UNSAFE_FIELDS) {
+                    flags.insert(AdtFlags::HAS_UNSAFE_FIELDS);
                 }
                 if data.flags.contains(StructFlags::HAS_REPR) {
                     flags.insert(AdtFlags::HAS_REPR);
@@ -678,6 +693,9 @@ impl AdtDef {
                 if data.flags.contains(StructFlags::FUNDAMENTAL) {
                     flags.insert(AdtFlags::IS_FUNDAMENTAL);
                 }
+                if data.flags.contains(StructFlags::HAS_UNSAFE_FIELDS) {
+                    flags.insert(AdtFlags::HAS_UNSAFE_FIELDS);
+                }
                 if data.flags.contains(StructFlags::HAS_REPR) {
                     flags.insert(AdtFlags::HAS_REPR);
                     if data.repr(db, id).is_some_and(|repr| repr.packed()) {
@@ -691,6 +709,9 @@ impl AdtDef {
                 let mut flags = AdtFlags::empty();
                 if data.flags.contains(EnumFlags::FUNDAMENTAL) {
                     flags.insert(AdtFlags::IS_FUNDAMENTAL);
+                }
+                if data.flags.contains(EnumFlags::HAS_UNSAFE_FIELDS) {
+                    flags.insert(AdtFlags::HAS_UNSAFE_FIELDS);
                 }
                 if data.flags.contains(EnumFlags::HAS_REPR) {
                     flags.insert(AdtFlags::HAS_REPR);
@@ -757,6 +778,12 @@ impl AdtDef {
     #[inline]
     pub fn is_box(self) -> bool {
         matches!(self.0, AdtDefInner::Struct { flags, .. } if flags.contains(AdtFlags::IS_BOX))
+    }
+
+    /// rustc's `AdtDef::has_unsafe_fields`.
+    #[inline]
+    pub fn has_unsafe_fields(self) -> bool {
+        self.flags().contains(AdtFlags::HAS_UNSAFE_FIELDS)
     }
 
     #[inline]
@@ -834,10 +861,7 @@ impl<'db> inherent::AdtDef<DbInterner<'db>> for AdtDef {
         interner: DbInterner<'db>,
         sizedness: SizedTraitKind,
     ) -> Option<EarlyBinder<DbInterner<'db>, Ty<'db>>> {
-        let tail_ty = self.struct_tail_ty(interner)?;
-        tail_ty
-            .map_bound(|tail_ty| sizedness_constraint_for_ty(interner, sizedness, tail_ty))
-            .transpose()
+        adt_sizedness_constraint(interner, self, sizedness)
     }
 
     fn destructor(self, interner: DbInterner<'db>) -> Option<AdtDestructorKind> {
@@ -846,13 +870,77 @@ impl<'db> inherent::AdtDef<DbInterner<'db>> for AdtDef {
         })
     }
 
+    /// rustc's rule (`field_projections`): `FieldRepresentingType<Base, VARIANT, FIELD>` names
+    /// field `FIELD` of variant `VARIANT` of `Base`. A base other than an ADT or a tuple, or an
+    /// index not yet a value, answers `None`: the solver's builtin field candidates take only
+    /// those two bases.
     fn field_representing_type_info(
         self,
-        _interner: DbInterner<'db>,
-        _args: GenericArgs<'db>,
+        interner: DbInterner<'db>,
+        args: GenericArgs<'db>,
     ) -> Option<rustc_type_ir::FieldInfo<DbInterner<'db>>> {
-        // FIXME
-        None
+        if !self.flags().contains(AdtFlags::IS_FIELD_REPRESENTING_TYPE) {
+            return None;
+        }
+        let index = |i: usize| match args.const_at(i).kind() {
+            ConstKind::Value(value) => Some(
+                value
+                    .try_to_leaf()
+                    .expect("a `FieldRepresentingType` index is a `u32` leaf")
+                    .to_u32() as usize,
+            ),
+            _ => None,
+        };
+        let base = args.type_at(0);
+        let (variant_idx, field_idx) = (index(1)?, index(2)?);
+        let db = interner.db;
+        let (ty, variant, name) = match base.kind() {
+            TyKind::Adt(base_def, base_args) => {
+                let (variant_id, variant_name): (VariantId, _) = match base_def.def_id() {
+                    AdtId::StructId(id) if variant_idx == 0 => (id.into(), None),
+                    AdtId::UnionId(id) if variant_idx == 0 => (id.into(), None),
+                    AdtId::EnumId(id) => {
+                        let (name, &(variant, _)) = id
+                            .enum_variants(db)
+                            .variants
+                            .get_index(variant_idx)
+                            .unwrap_or_else(|| panic!("{base:?} has no variant {variant_idx}"));
+                        (variant.into(), Some(Symbol(name.symbol().clone()))) // clone: `FieldInfo` owns its names
+                    }
+                    _ => panic!("{base:?} has no variant {variant_idx}"),
+                };
+                let (_, field) = hir_def::signatures::VariantFields::of(db, variant_id)
+                    .fields()
+                    .iter()
+                    .nth(field_idx)
+                    .unwrap_or_else(|| panic!("variant {variant_idx} of {base:?} has no field {field_idx}"));
+                let (_, field_ty) = db
+                    .field_types(variant_id)
+                    .iter()
+                    .nth(field_idx)
+                    .expect("every field of a variant has a type");
+                let ty = field_ty.ty().instantiate(interner, base_args).skip_norm_wip();
+                (ty, variant_name, Symbol(field.name.symbol().clone())) // clone: `FieldInfo` owns its names
+            }
+            TyKind::Tuple(tys) => {
+                assert_eq!(variant_idx, 0, "a tuple has one variant, not {variant_idx}");
+                let ty = *tys
+                    .as_slice()
+                    .get(field_idx)
+                    .unwrap_or_else(|| panic!("{base:?} has no field {field_idx}"));
+                let name = hir_expand::name::Name::new_tuple_field(field_idx);
+                (ty, None, Symbol(name.symbol().clone())) // clone: `FieldInfo` owns its names
+            }
+            _ => return None,
+        };
+        Some(rustc_type_ir::FieldInfo {
+            base,
+            ty,
+            variant,
+            variant_idx: rustc_abi::VariantIdx::from_usize(variant_idx),
+            name,
+            field_idx: rustc_abi::FieldIdx::from_usize(field_idx),
+        })
     }
 }
 
@@ -872,27 +960,6 @@ impl fmt::Debug for AdtDef {
                 f.write_str(data.name.as_str())
             }
         })
-    }
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub struct Features;
-
-impl<'db> inherent::Features<DbInterner<'db>> for Features {
-    fn generic_const_exprs(self) -> bool {
-        false
-    }
-
-    fn coroutine_clone(self) -> bool {
-        false
-    }
-
-    fn gca_const_items(self) -> bool {
-        false
-    }
-
-    fn feature_bound_holds_in_crate(self, _symbol: Symbol) -> bool {
-        false
     }
 }
 
@@ -1218,7 +1285,7 @@ impl<'db> Interner for DbInterner<'db> {
 
     type AdtDef = AdtDef;
 
-    type Features = Features;
+    type Features = Features<'db>;
 
     fn mk_args(self, args: &[Self::GenericArg]) -> Self::GenericArgs {
         GenericArgs::new_from_slice(args)
@@ -1251,7 +1318,7 @@ impl<'db> Interner for DbInterner<'db> {
             // captured now did not, and so must not be shared either.
             None => salsa::unshareable_reads(self.db),
         }
-        tracked.value.clone()
+        tracked.value.clone() // clone: `get_tracked` hands out an owned value; the solver's are handles
     }
 
     fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, Self::DepNodeIndex) {
@@ -1299,7 +1366,10 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn expand_abstract_consts<T: rustc_type_ir::TypeFoldable<Self>>(self, _: T) -> T {
-        unreachable!("only used by the old trait solver in rustc");
+        panic!(
+            "`#![feature(generic_const_exprs)]` relates abstract consts, which blaze does not \
+             build (rustc's `thir_abstract_const`)"
+        );
     }
 
     fn generics_of(self, def_id: Self::DefId) -> Self::GenericsOf {
@@ -1316,14 +1386,8 @@ impl<'db> Interner for DbInterner<'db> {
                 return crate::variance::ctor_variances(self.db, def_id.into());
             }
             SolverDefId::EnumVariantId(def_id) => def_id.loc(self.db).parent.into(),
-            SolverDefId::InternedOpaqueTyId(_def_id) => {
-                // FIXME(next-solver): track variances
-                //
-                // We compute them based on the only `Ty` level info in rustc,
-                // move `variances_of_opaque` into `rustc_next_trait_solver` for reuse.
-                return VariancesOf::new_from_iter(
-                    (0..self.generics_of(def_id).count()).map(|_| Variance::Invariant),
-                );
+            SolverDefId::InternedOpaqueTyId(def_id) => {
+                return super::opaque_variances::variances_of_opaque(self, def_id);
             }
             SolverDefId::AdtId(def_id) => def_id.into(),
             SolverDefId::FunctionId(def_id) => def_id.into(),
@@ -1355,10 +1419,8 @@ impl<'db> Interner for DbInterner<'db> {
             SolverDefId::ConstId(id) => self.db.value_ty(id.into()).unwrap(),
             SolverDefId::StaticId(id) => self.db.value_ty(id.into()).unwrap(),
             SolverDefId::AnonConstId(id) => id.loc(self.db).ty.get(),
-            // FIXME(next-solver): This uses the types of `query mir_borrowck` in rustc.
-            //
-            // We currently always use the type from HIR typeck which ignores regions. This
-            // should be fine.
+            // rustc reads `mir_borrowck`'s hidden type; HIR typeck's differs from it only in its
+            // regions, which this solver proves no constraint over.
             SolverDefId::InternedOpaqueTyId(def_id) => {
                 self.type_of_opaque_hir_typeck(def_id.into())
             }
@@ -1516,8 +1578,11 @@ impl<'db> Interner for DbInterner<'db> {
         self.recursion_limit as usize
     }
 
-    fn features(self) -> Features {
-        Features
+    fn features(self) -> Features<'db> {
+        self.features.expect(
+            "the solver asked for the crate's features of an interner without a crate \
+             (`DbInterner::new_no_crate`); solving needs `DbInterner::new_with`",
+        )
     }
 
     fn fn_sig(
@@ -1689,8 +1754,13 @@ impl<'db> Interner for DbInterner<'db> {
         })
     }
 
-    fn has_target_features(self, _def_id: Self::FunctionId) -> bool {
-        false
+    /// rustc's `!codegen_fn_attrs(def_id).target_features.is_empty()`: a safe
+    /// `#[target_feature]` function implements no `Fn*` trait.
+    fn has_target_features(self, def_id: Self::FunctionId) -> bool {
+        match def_id.0 {
+            CallableDefId::FunctionId(id) => !AttrFlags::target_features(self.db, id).is_empty(),
+            CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => false,
+        }
     }
 
     fn require_projection_lang_item(
@@ -1918,7 +1988,7 @@ impl<'db> Interner for DbInterner<'db> {
                 module.block(self.db)
             });
             let in_block = type_block.is_some() || trait_block.is_some();
-            let mut seen = Vec::new();
+            let mut seen: smallvec::SmallVec<[AnyImplId; 8]> = smallvec::SmallVec::new();
             let in_crates = TraitImpls::in_crate_and_deps_for_trait_and_self_ty(
                 self.db,
                 krate,
@@ -2066,7 +2136,7 @@ impl<'db> Interner for DbInterner<'db> {
 
         // The impls of a block are among those of its crate as well as its own, and the solver
         // takes a second copy for an ambiguity.
-        let mut seen = Vec::new();
+        let mut seen: smallvec::SmallVec<[hir_def::ImplId; 8]> = smallvec::SmallVec::new();
         try_visit!(TraitImpls::for_each_block(self.db, block, &mut |impls| {
             for &impl_ in impls.blanket_impls(trait_def_id.0) {
                 seen.push(impl_);
@@ -2082,9 +2152,21 @@ impl<'db> Interner for DbInterner<'db> {
         R::output()
     }
 
-    fn has_item_definition(self, _def_id: Self::ImplOrTraitAssocTermId) -> bool {
-        // FIXME(next-solver): should check if the associated item has a value.
-        true
+    /// rustc's `defaultness(def_id).has_value()`: an impl's item always has one, a trait's when
+    /// it gives a default.
+    fn has_item_definition(self, def_id: Self::ImplOrTraitAssocTermId) -> bool {
+        use hir_def::signatures::{ConstSignature, TypeAliasSignature};
+        let db = self.db;
+        match def_id.0 {
+            TermId::TypeAliasId(id) => match id.loc(db).container {
+                ItemContainerId::TraitId(_) => TypeAliasSignature::of(db, id).ty.is_some(),
+                _ => true,
+            },
+            TermId::ConstId(id) => match id.loc(db).container {
+                ItemContainerId::TraitId(_) => ConstSignature::of(db, id).has_body(),
+                _ => true,
+            },
+        }
     }
 
     fn impl_is_default(self, impl_def_id: Self::ImplId) -> bool {
@@ -2288,6 +2370,7 @@ impl<'db> Interner for DbInterner<'db> {
         let Ok(def_id) = InferBodyId::try_from(def_id) else {
             return SolverDefIds::default();
         };
+        // alloc: once per body's typing mode; `opaques::opaque_types_defined_by` fills a `Vec`
         let mut result = Vec::new();
         crate::opaques::opaque_types_defined_by(self.db, def_id, &mut result);
         SolverDefIds::new_from_slice(&result)
@@ -2299,6 +2382,7 @@ impl<'db> Interner for DbInterner<'db> {
         let Ok(def_id) = InferBodyId::try_from(def_id) else {
             return SolverDefIds::default();
         };
+        // alloc: once per body's typing mode; `opaques::opaque_types_defined_by` fills a `Vec`
         let mut result = Vec::new();
 
         crate::opaques::opaque_types_defined_by(db, def_id, &mut result);
@@ -2344,9 +2428,22 @@ impl<'db> Interner for DbInterner<'db> {
         }
     }
 
-    fn alias_has_const_conditions(self, _def_id: Self::DefId) -> bool {
-        // FIXME(next-solver)
-        false
+    fn alias_has_const_conditions(self, def_id: Self::DefId) -> bool {
+        // rustc's `is_conditionally_const` on an alias: an associated type of a const trait or
+        // impl, and an RPIT of a const fn; a free alias, a TAIT and an inherent associated type
+        // never are.
+        match def_id {
+            SolverDefId::TypeAliasId(alias) => {
+                crate::effects::is_conditionally_const(self.db, alias.into())
+            }
+            SolverDefId::InternedOpaqueTyId(opaque) => match opaque.loc(self.db) {
+                crate::ImplTraitId::ReturnTypeImplTrait(func, _) => {
+                    crate::effects::fn_is_const(self.db, func)
+                }
+                crate::ImplTraitId::TypeAliasImplTrait(..) => false,
+            },
+            _ => false,
+        }
     }
 
     fn explicit_implied_const_bounds(
@@ -2356,18 +2453,26 @@ impl<'db> Interner for DbInterner<'db> {
         Self,
         impl IntoIterator<Item = rustc_type_ir::Binder<Self, rustc_type_ir::TraitRef<Self>>>,
     > {
-        // A trait's `[const]` supertraits. FIXME: an associated type's `[const]` item bounds.
-        let trait_ = match def_id {
-            SolverDefId::TraitId(trait_) => Some(trait_),
-            _ => None,
+        let (conditions, trait_) = match def_id {
+            SolverDefId::TraitId(trait_) => {
+                (crate::lower::const_conditions(self.db(), trait_.into()).skip_binder(), Some(trait_))
+            }
+            SolverDefId::TypeAliasId(alias) => {
+                (crate::lower::implied_const_bounds(self.db(), alias.into()).skip_binder(), None)
+            }
+            SolverDefId::InternedOpaqueTyId(opaque) => {
+                (crate::lower::implied_const_bounds(self.db(), opaque.into()).skip_binder(), None)
+            }
+            _ => (&[][..], None),
         };
-        let conditions = trait_.map_or(&[][..], |trait_| {
-            crate::lower::const_conditions(self.db(), trait_.into()).skip_binder()
-        });
+        // A trait's `[const]` supertraits are its conditions on `Self`; an alias's bounds keep
+        // their own self type, the projection or opaque.
         EarlyBinder::bind(
             self,
             crate::effects::effect_trait_refs(conditions.iter().copied()).filter(move |it| {
-                Some(it.skip_binder().def_id.0) != trait_ && is_ty_self(it.skip_binder().self_ty())
+                trait_.is_none_or(|trait_| {
+                    it.skip_binder().def_id.0 != trait_ && is_ty_self(it.skip_binder().self_ty())
+                })
             }),
         )
     }
@@ -2385,9 +2490,9 @@ impl<'db> Interner for DbInterner<'db> {
 
     fn opt_alias_variances(
         self,
-        _kind: impl Into<AliasTermKind<'db>>,
+        kind: impl Into<AliasTermKind<'db>>,
     ) -> Option<Self::VariancesOf> {
-        None
+        super::opaque_variances::opt_alias_variances(self, kind.into())
     }
 
     fn opaque_of_impl(
@@ -2441,8 +2546,13 @@ impl<'db> Interner for DbInterner<'db> {
         TraitSignature::of(self.db(), trait_.0).flags.contains(TraitFlags::UNSAFE)
     }
 
-    fn impl_self_is_guaranteed_unsized(self, _def_id: Self::ImplId) -> bool {
-        false
+    fn impl_self_is_guaranteed_unsized(self, def_id: Self::ImplId) -> bool {
+        match def_id {
+            AnyImplId::ImplId(id) => impl_self_is_guaranteed_unsized(self.db, id),
+            AnyImplId::BuiltinDeriveImplId(_) => {
+                unreachable!("a builtin derive's trait has no associated item for it to miss")
+            }
+        }
     }
 
     fn impl_specializes(
@@ -2609,6 +2719,53 @@ pub(super) fn bind_witness_regions<'db>(
     )
 }
 
+/// rustc's `impl_self_is_guaranteed_unsized` (rustc_ty_utils): the struct tail of the impl's
+/// self type, each alias structurally normalized on the way (`struct_tail_raw`), is `dyn`, a
+/// slice or `str`. Its own interner, as rustc's is a query of its own: the solve here shares no
+/// cache with the goal that asked.
+fn impl_self_is_guaranteed_unsized(db: &Db, impl_id: hir_def::ImplId) -> bool {
+    use crate::next_solver::{
+        infer::{DbInternerInferExt, traits::ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    };
+    let interner = DbInterner::new_with(db, impl_id.krate(db));
+    let infcx = interner.infer_ctxt().build(rustc_type_ir::TypingMode::non_body_analysis());
+    let mut ocx = ObligationCtxt::new(&infcx);
+    let cause = ObligationCause::dummy();
+    let param_env = crate::lower::trait_environment(db, GenericDefId::ImplId(impl_id));
+    let mut ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
+    let limit = interner.recursion_limit();
+    for iteration in 0.. {
+        // Past the limit rustc reports it and the tail is an error type.
+        if iteration > limit {
+            return false;
+        }
+        match ty.kind() {
+            TyKind::Adt(adt, args) => {
+                let AdtId::StructId(id) = adt.def_id() else { break };
+                let Some(field) = db.field_types(id.into()).values().next_back() else { break };
+                ty = field.ty().instantiate(interner, args).skip_norm_wip();
+            }
+            TyKind::Tuple(tys) => match tys.as_slice().last() {
+                Some(&last) => ty = last,
+                None => break,
+            },
+            TyKind::Pat(inner, _) => ty = inner,
+            TyKind::Alias(..) => {
+                let normalized = ocx
+                    .structurally_normalize_ty(&cause, param_env, ty)
+                    .unwrap_or_else(|_| Ty::new_error(interner, ErrorGuaranteed));
+                if normalized == ty {
+                    break;
+                }
+                ty = normalized;
+            }
+            _ => break,
+        }
+    }
+    matches!(ty.kind(), TyKind::Dynamic(..) | TyKind::Slice(_) | TyKind::Str)
+}
+
 fn is_ty_self(ty: Ty<'_>) -> bool {
     match ty.kind() {
         TyKind::Param(param) => param.index == 0,
@@ -2634,7 +2791,7 @@ fn fully_generic_for_reflection<'db>(
     args: GenericArgs<'db>,
     clauses: impl IntoIterator<Item = Clause<'db>>,
 ) -> bool {
-    let mut params = Vec::new();
+    let mut params: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
     let header_generic = args.iter().all(|arg| {
         arg.walk().all(|arg| match arg.kind() {
             GenericArgKind::Lifetime(region) => match region.kind() {

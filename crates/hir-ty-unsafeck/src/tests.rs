@@ -210,6 +210,31 @@ impl WithUnsafeField {
     );
 }
 
+// tests/ui/unsafe-binders: each way of the cast needs `unsafe`, and its operand is walked.
+#[test]
+fn unsafe_binder_cast() {
+    check(
+        r#"
+static mut N: i32 = 0;
+
+fn main() {
+    let x = &1i32;
+    builtin # wrap_binder(x);
+  //^^^^^^^^^^^^^^^^^^^^^^^^ error: UnsafeBinderCast
+    builtin # unwrap_binder(x, &i32);
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: UnsafeBinderCast
+    unsafe { builtin # wrap_binder(x) };
+}
+
+unsafe fn in_unsafe_fn(x: &i32) {
+    builtin # wrap_binder(N);
+  //^^^^^^^^^^^^^^^^^^^^^^^^ unsafe_op_in_unsafe_fn: UnsafeBinderCast first
+                        //^ unsafe_op_in_unsafe_fn: MutableStatic
+}
+"#,
+    );
+}
+
 // tests/ui/unsafe/unsafe_op_in_unsafe_fn/rfc-2585-unsafe_op_in_unsafe_fn.rs
 #[test]
 fn unsafe_op_in_unsafe_fn() {

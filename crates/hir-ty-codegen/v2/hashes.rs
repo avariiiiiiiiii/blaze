@@ -65,9 +65,9 @@ impl ItemHashes {
         let anchors = anchors(db, owner).0;
         let store = BodyStore::of(db, owner);
         let spans: [Vec<MirSpan>; TABLES] = [
-            store.exprs().map(|(it, _)| MirSpan::ExprId(it)).collect(),
-            store.exprs().map(|(it, _)| MirSpan::ExprEnd(it)).collect(),
-            store.pats().map(|(it, _)| MirSpan::PatId(it)).collect(),
+            store.expr_ids().map(MirSpan::ExprId).collect(), // alloc: the tables returned, exact size
+            store.expr_ids().map(MirSpan::ExprEnd).collect(), // alloc: the tables returned, exact size
+            store.pat_ids().map(MirSpan::PatId).collect(),
             store.bindings().map(|(it, _)| MirSpan::BindingId(it)).collect(),
             vec![MirSpan::SelfParam],
             vec![MirSpan::Unknown],

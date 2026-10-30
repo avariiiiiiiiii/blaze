@@ -79,6 +79,8 @@ pub enum UnsafetyReason {
     MutationOfLayoutConstrainedField,
     /// Borrowing such a place, or binding it `ref`, where its type is not `Freeze`.
     BorrowOfLayoutConstrainedField,
+    /// `wrap_binder!` or `unwrap_binder!`: a cast to or from an `unsafe<..>` binder type.
+    UnsafeBinderCast,
 }
 
 /// How rustc reports an [`UnsafeOp`].
@@ -584,6 +586,10 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
                         }
                     }
                 }
+            }
+            Expr::UnsafeBinderCast { .. } => {
+                self.requires_unsafe(current, UnsafetyReason::UnsafeBinderCast);
+                store.walk_child_exprs_without_pats(current, |child| self.walk_expr(child));
             }
             Expr::Missing
             | Expr::If { .. }

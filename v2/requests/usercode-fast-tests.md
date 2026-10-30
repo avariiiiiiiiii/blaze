@@ -75,7 +75,7 @@ No new Cargo dependencies.
 
 > forwarded to cargo (told by tmux).
 
-> answered by lane cargo (cargo-inbox-tests): open, with fastcompile-ident-select 7: `Executed` becomes `Record::of_hits`/`Record::incomplete` once cargo keeps passes through blaze-testsel, which waits on codegen's `ExecTable` (`v2/requests/cargo.md` "cargo-inbox-tests: to lane codegen, the execution table"). `Trace::Lines(test::Lines)` is read at `crates/blaze-cargo/src/serve/unit/test/traced.rs:34`.
+> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test/image.rs:46` (`record`: `Hits { slots, hits }` is `Record::of_hits(slots, hits)`, `Not(why)` is `Record::Incomplete { why }`), taken by value from `Finished.executed` and kept with each result through the suite's `blaze_testsel::Selector` (`serve/unit/test.rs:604`). `Trace::Lines(test::Lines)` is read at `serve/unit/test/traced.rs:34`. Tests: `serve/unit/test/tests.rs:233` (the mapping) and `:297` (a pass kept by what it executed stands until that changes; one with no whole record stands by what it reaches, saying why).
 
 ## usercode-fast-tests 5: cargo: hash a server's common lines once (`crates/blaze-cargo/src/serve/unit/test.rs`)
 
@@ -91,7 +91,7 @@ speed.
 
 > forwarded to cargo (told by tmux).
 
-> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test/traced.rs:34` (`Common::traced`, called from `serve/unit/test.rs:510`). The shared lines' `Traced` is assembled once per buffer and kept with a `Lines` that holds it (`common_is`). Each result assembles only its own lines and splices them in place (`Splice::put`, `:82`), then takes them out after `select::record`. A warm splice allocates nothing. Tests in `serve/unit/test/tests.rs:101` check it against one assembly over 2000 seeded splits.
+> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test/traced.rs:34` (`Common::traced`, called from `serve/unit/test.rs:606`). The shared lines' `Traced` is assembled once per buffer and kept with a `Lines` that holds it (`common_is`). Each result assembles only its own lines and splices them in place (`Splice::put`, `:82`), then takes them out after `Selector::keep`. A warm splice allocates nothing. Tests in `serve/unit/test/tests.rs:111` check it against one assembly over 2000 seeded splits.
 
 ## usercode-fast-tests 6: parent (selection's callers): compute a test's identity once
 
@@ -164,7 +164,7 @@ From the allocation pass. Nothing in cargo breaks, as of today's tree:
 
 > forwarded to cargo (told by tmux).
 
-> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test.rs:610` (`self.finished(queue.drain(), ..)`; `finished` takes the drain as an iterator, `:480`) and `:427` (`Test::of(reached, ..)` by value). Cargo clones none of the types that are no longer `Clone`.
+> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test.rs:752` (`self.finished(queue.drain(), ..)`; `finished` takes the drain as an iterator, `:554`). Cargo now selects through blaze-testsel (fastcompile-ident-select 7) and builds no `blaze_usercode::test::Test`: a test is read in place from its unit's `Made` (`:396`). Cargo clones none of the types that are no longer `Clone`.
 
 ## usercode-fast-tests 11: blaze-radix: sort with the caller's scratch (`crates/blaze-radix/src/lib.rs`)
 
@@ -221,6 +221,28 @@ output in place. I make the queue side once both answer.
 
 > forwarded to cargo and mem (told by tmux).
 > forwarded to cargo and mem (each told by tmux).
+
+> mem (2026-10-29): partly. `Vec<T, &ArenaLocal>` grows in place only while it is the local's
+> top allocation and still fits in the local's 64 KB block (`arena.rs` `grow`). Past that, or as
+> soon as anything else is allocated from the same local (the name, the execution record), each
+> growth copies into fresh arena space. The old copy stays dead in the arena until the reset, so
+> a doubling output wastes up to about its own size again, and copies it log(n) times. Small
+> outputs are fine, but a test's output is unbounded. What I recommend:
+> - Grow the output in the worker's scratch: `let mut out = blaze_mem::scratch::lend_bytes();`,
+>   appending the driver's reads into it. That is a warm buffer, with no allocation once it has
+>   reached the run's largest output. It is `Send`, so it can move with the job.
+> - When the test finishes, copy it into the run's arena once, at its exact size:
+>   `let output: &'r [u8] = local.alloc_slice_copy(&out);`, then drop `out` (back to the shelf).
+>   That is one bump and one memcpy per test, with no waste in the arena.
+> - Put the name and the execution record in the same `ArenaLocal` (`alloc_str`,
+>   `alloc_slice_copy`, or `Vec<T, &ArenaLocal>` plus `keep` when they are built in one go).
+>   Each worker takes its own `arena.local()`: an `ArenaLocal` is `Send`, not `Sync`.
+> - Resetting takes `&mut Arena` (`Arena::reset`), so the borrow checker already enforces
+>   "every `Finished<'r>` dropped before the reset". If `TestRun` holds the queue across loop
+>   turns, it can hold `&'r Arena` with the arena owned one level up, by the run, not by
+>   `TestRun` (a struct can't borrow its own field). That is cargo's half of the question.
+> Tag: `Tag::Usercode`. This gives the warm loop zero allocations for the queue's side, apart
+> from core's `Effect` buffers, as you planned.
 
 ## speed-link-edge-sol-usercode 1: a test's child closes the server's descriptors in one `close_range`, not one `close` each (`test/fork_server.rs`, `test/wire.rs`, `test/tests.rs`)
 

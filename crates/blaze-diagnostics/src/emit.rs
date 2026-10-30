@@ -42,6 +42,32 @@ pub const WIDTH: usize = annotate_snippets::renderer::DEFAULT_TERM_WIDTH;
 /// The index of a file that can't be read: past the end of every arena of files.
 const UNREAD: u32 = u32::MAX;
 
+/// What ends the shown name of a file with no path (a crate attribute's) in the name its spans
+/// give it, the file's text after it. rustc's `FileName::CliCrateAttr` is likewise the name and
+/// a hash of the text, shown as the name alone: files shown by one name stay apart, and no
+/// caller reads the text. No path and no name rustc shows holds a NUL.
+const TEXT_AFTER: char = '\0';
+
+/// The name the spans of a file with no path give it: `shown`, then the file's `text`.
+pub fn name_with_text(shown: &str, text: &str) -> String {
+    // alloc: a span's file name, made only as a diagnostic is built
+    let mut name = String::with_capacity(shown.len() + TEXT_AFTER.len_utf8() + text.len());
+    name.push_str(shown);
+    name.push(TEXT_AFTER);
+    name.push_str(text);
+    name
+}
+
+/// The name rustc shows the file `name` by: without the text a file with no path carries.
+pub fn shown(name: &str) -> &str {
+    name.split_once(TEXT_AFTER).map_or(name, |(shown, _)| shown)
+}
+
+/// The text of the file `name`, when it is one with no path, which carries it.
+fn text_in(name: &str) -> Option<&str> {
+    name.split_once(TEXT_AFTER).map(|(_, text)| text)
+}
+
 /// The text of the files diagnostics point into, by the name they give them. The caller reads
 /// them: [`Sources::unread`] names the files a batch of diagnostics needs, each given once to
 /// [`Sources::add`] before the batch is written.
@@ -173,12 +199,13 @@ impl Sources {
 
     /// The files `diags` point into, through each macro call and definition their spans are
     /// in, that were not given to [`Sources::add`]: each once, in the order first pointed into.
+    /// A file with no path is not one: its name carries its text ([`name_with_text`]).
     pub fn unread<'d>(&self, diags: impl IntoIterator<Item = &'d Diag>) -> Vec<&'d str> {
         let mut seen: hashbrown::HashSet<&'d str, FxBuildHasher> = hashbrown::HashSet::default();
         let mut unread = Vec::new(); // alloc: the files diagnostics written point into, the edge
         for diag in diags {
             each_file(diag, &mut |name| {
-                if !self.names.contains_key(name) && seen.insert(name) {
+                if text_in(name).is_none() && !self.names.contains_key(name) && seen.insert(name) {
                     unread.push(name);
                 }
             });
@@ -201,7 +228,15 @@ impl Sources {
 
     /// The 1-based line and 1-based column (in chars) of byte `at` of `file`.
     pub fn position(&self, file: &str, at: u32) -> Option<(u32, u32)> {
-        let file = self.files.get(self.index(file) as usize)?;
+        let carried;
+        let file = match text_in(file) {
+            Some(text) => {
+                // alloc: a file with no path, indexed for a span of it written
+                carried = File::new(text.to_owned());
+                &carried
+            }
+            None => self.files.get(self.index(file) as usize)?,
+        };
         if at > file.len {
             return None;
         }
@@ -215,27 +250,70 @@ impl Sources {
     }
 }
 
-/// The files one diagnostic points into, each looked up in [`Sources`] once. A diagnostic has
-/// one or two, so a scan comparing names costs less than hashing them again.
+/// The files with no path one diagnostic points into, each indexed from the text its name
+/// carries, in the order [`each_file`] first meets them: the diagnostic's own, as [`Sources`]
+/// holds the files read. None for most diagnostics, which allocates nothing.
+struct Carried(SmallVec<[File; 1]>);
+
+impl Carried {
+    fn of(diag: &Diag) -> Carried {
+        let mut names: SmallVec<[&str; 1]> = SmallVec::new();
+        let mut files: SmallVec<[File; 1]> = SmallVec::new();
+        each_file(diag, &mut |name| {
+            if let Some(text) = text_in(name)
+                && !names.contains(&name)
+            {
+                names.push(name);
+                // alloc: a file with no path, indexed for a diagnostic written
+                files.push(File::new(text.to_owned()));
+            }
+        });
+        Carried(files)
+    }
+}
+
+/// The files one diagnostic points into, each looked up in [`Sources`] once, or in the
+/// diagnostic's [`Carried`] for one with no path. A diagnostic has one or two, so a scan
+/// comparing names costs less than hashing them again.
 struct Placed<'a> {
-    names: SmallVec<[(&'a str, u32); 4]>,
+    names: SmallVec<[(&'a str, Held); 4]>,
     files: &'a [File],
+    carried: &'a [File],
+}
+
+/// Where [`Placed`] has a file: by its index in [`Sources`] or in [`Carried`].
+#[derive(Clone, Copy)]
+enum Held {
+    Read(u32),
+    Carried(u32),
 }
 
 impl<'a> Placed<'a> {
-    fn new(diag: &'a Diag, sources: &'a Sources) -> Placed<'a> {
-        let mut names: SmallVec<[(&'a str, u32); 4]> = SmallVec::new();
+    fn new(diag: &'a Diag, sources: &'a Sources, carried: &'a Carried) -> Placed<'a> {
+        let mut names: SmallVec<[(&'a str, Held); 4]> = SmallVec::new();
+        let mut next = 0;
         each_file(diag, &mut |name| {
-            if !names.iter().any(|(it, _)| *it == name) {
-                names.push((name, sources.index(name)));
+            if names.iter().any(|(it, _)| *it == name) {
+                return;
             }
+            let held = match text_in(name) {
+                Some(_) => {
+                    next += 1;
+                    Held::Carried(next - 1)
+                }
+                None => Held::Read(sources.index(name)),
+            };
+            names.push((name, held));
         });
-        Placed { names, files: &sources.files }
+        Placed { names, files: &sources.files, carried: &carried.0 }
     }
 
     fn get(&self, name: &str) -> Option<&'a File> {
-        let &(_, index) = self.names.iter().find(|(it, _)| *it == name)?;
-        self.files.get(index as usize)
+        let &(_, held) = self.names.iter().find(|(it, _)| *it == name)?;
+        match held {
+            Held::Read(index) => self.files.get(index as usize),
+            Held::Carried(index) => self.carried.get(index as usize),
+        }
     }
 
     /// The file `span` is in. One blaze can't read is a bug of whoever made the span: rustc
@@ -302,7 +380,7 @@ impl Default for Style {
 
 /// `diag` as rustc writes it, without the empty line it writes after one.
 pub fn rendered(diag: &Diag, sources: &Sources, style: Style) -> String {
-    render(diag, &Placed::new(diag, sources), style)
+    render(diag, &Placed::new(diag, sources, &Carried::of(diag)), style)
 }
 
 /// `rendered` as rustc writes it to stderr: with the empty line after it (none after short, nor
@@ -312,7 +390,7 @@ pub fn written(diag: &Diag, sources: &Sources, style: Style) -> String {
     if style.short && explains(diag) {
         return String::new(); // alloc: empty, allocates nothing
     }
-    write(diag, &Placed::new(diag, sources), style)
+    write(diag, &Placed::new(diag, sources, &Carried::of(diag)), style)
 }
 
 /// rustc's `--error-format=json` line of `diag` (keys in rustc's order), without the newline
@@ -323,7 +401,8 @@ pub fn json(diag: &Diag, sources: &Sources, style: Style) -> String {
     if style.short && explains(diag) {
         return String::new(); // alloc: empty, allocates nothing
     }
-    let placed = Placed::new(diag, sources);
+    let carried = Carried::of(diag);
+    let placed = Placed::new(diag, sources, &carried);
     let rendered = write(diag, &placed, style);
     json::line(diag, &placed, rendered)
 }
@@ -331,7 +410,8 @@ pub fn json(diag: &Diag, sources: &Sources, style: Style) -> String {
 /// [`json`] with `rendered` as its text: [`written`] of `diag` in the same style, made
 /// already.
 pub fn json_rendered(diag: &Diag, sources: &Sources, rendered: String) -> String {
-    let placed = Placed::new(diag, sources);
+    let carried = Carried::of(diag);
+    let placed = Placed::new(diag, sources, &carried);
     json::line(diag, &placed, rendered)
 }
 
@@ -511,7 +591,7 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
                     subs.push(
                         Snippet::source(&file.text[start..end])
                             .line_start(line)
-                            .path(name)
+                            .path(shown(name))
                             .fold(fold)
                             .patches(parts.into_iter().map(move |it| {
                                 Patch::new(
@@ -649,7 +729,7 @@ fn annotated_snippet<'a>(
     annotations: SmallVec<[Annotation<'a>; 4]>,
 ) -> Option<Snippet<'a, annotate_snippets::Annotation<'a>>> {
     let (start, end, line) = shrink_file(file, annotations.iter().map(|it| (it.lo, it.hi)))?;
-    Some(Snippet::source(&file.text[start..end]).line_start(line).path(name).annotations(
+    Some(Snippet::source(&file.text[start..end]).line_start(line).path(shown(name)).annotations(
         annotations.into_iter().map(move |it| {
             let annotation = it.kind.span(it.lo.saturating_sub(start)..it.hi.saturating_sub(start));
             match it.label {
@@ -1045,6 +1125,33 @@ mod tests {
         assert_eq!(normalize_whitespace(Cow::Borrowed("a\tb\u{200d}c")), "a    bc");
         // `’` starts with 0xE2 too and is kept as it is.
         assert_eq!(normalize_whitespace(Cow::Borrowed("it’s")), "it’s");
+    }
+
+    /// Two files with no path shown by one name: each span reads its own file's text from its
+    /// name, none is asked of the caller, and the name shown is the name alone.
+    #[test]
+    fn files_shown_by_one_name_keep_their_own_text() {
+        let a = name_with_text("<crate attribute>", "#![(]");
+        let b = name_with_text("<crate attribute>", "#![feature(foo),feature(bar)]");
+        assert_ne!(a, b);
+        assert_eq!((shown(&a), shown(&b), shown("src/lib.rs")), ("<crate attribute>", "<crate attribute>", "src/lib.rs"));
+        let first = Diag::error(None, "x", Span { file: a.clone(), lo: 3, hi: 4, expansion: None });
+        let second = Diag::error(None, "y", Span { file: b.clone(), lo: 15, hi: 16, expansion: None });
+        let sources = Sources::default();
+        assert!(sources.unread([&first, &second]).is_empty());
+        assert_eq!(sources.position(&a, 3), Some((1, 4)));
+        assert_eq!(sources.position(&b, 15), Some((1, 16)));
+        assert_eq!(sources.position(&a, 6), None);
+        let line = json(&second, &sources, Style::default());
+        assert!(line.contains(r#""file_name":"<crate attribute>""#), "{line}");
+        assert!(line.contains(r##""text":"#![feature(foo),feature(bar)]""##), "{line}");
+        let style = Style { ui_testing: true, ..Style::default() };
+        let (first, second) = (rendered(&first, &sources, style), rendered(&second, &sources, style));
+        assert!(first.contains("--> <crate attribute>:1:4\n") && first.contains("LL | #![(]\n"), "{first}");
+        assert!(!first.contains("feature"), "{first}");
+        assert!(second.contains("--> <crate attribute>:1:16\n"), "{second}");
+        assert!(second.contains("LL | #![feature(foo),feature(bar)]\n"), "{second}");
+        assert!(!first.contains('\0') && !second.contains('\0'));
     }
 
     #[test]

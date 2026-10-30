@@ -112,8 +112,8 @@ impl ImportMap {
         // within a row. Both columns come out at their length and become the memo's.
         // clone: an `ImportInfo` is plain data (`Name` is `Copy`), copied into the memo's column
         let pairs = found.infos.iter().map(|(row, info)| (*row, info.clone()));
-        // alloc: the memo's offsets and infos, exact, and the sort's cursors (a u32 a row)
-        let (info_start, infos) = blaze_ids::radix::Csr::build(rows, pairs).into_parts();
+        // alloc: the memo's offsets and infos, exact; the sort's cursors are the frame's
+        let (info_start, infos) = blaze_ids::radix::Csr::build_in(rows, pairs, frame).into_parts();
         let (info_start, infos) = (info_start.into_boxed_slice(), infos.into_boxed_slice());
 
         // alloc: the memo's bits, exact
@@ -1956,9 +1956,8 @@ pub fn fmt() {}
         assert_eq!(visited, search_dependencies(&db, main, &query));
     }
 
-    /// A build of a crate's import map, its inputs warm, allocates its nine columns and the
-    /// counting sort's cursors, and nothing else: the collection, the sort and the keys are
-    /// the frame's.
+    /// A build of a crate's import map, its inputs warm, allocates its nine columns and nothing
+    /// else: the collection, the counting sort's cursors, the sort and the keys are the frame's.
     #[test]
     fn build_is_its_columns() {
         let db = TestDB::with_files(
@@ -1973,7 +1972,7 @@ pub mod m { pub fn f() {} pub use super::S as R; }
         let krate = db.fetch_test_crate();
         let memo = ImportMap::of(&db, krate);
         let built = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
-            blaze_alloc_count::assert_at_most(10, "an import-map build", || {
+            blaze_alloc_count::assert_at_most(9, "an import-map build", || {
                 ImportMap::build(&db, krate, frame)
             })
         });

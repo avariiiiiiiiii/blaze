@@ -26,7 +26,7 @@ use crate::{
             at::At,
             errors::{FulfillmentError, FulfillmentErrorCode},
             snapshot::CombinedSnapshot,
-            traits::{Obligation, ObligationCause, PredicateObligation},
+            traits::{Obligation, ObligationCause, PredicateObligation, PredicateObligations},
         },
         inspect::{InspectConfig, InspectGoal, ProofTreeVisitor},
         obligation_ctxt::ObligationCtxt,
@@ -477,13 +477,14 @@ impl<'db> InferenceTable<'db> {
     /// The ambiguities to report once inference is done: those found so far (normalizing a
     /// type structurally, which rustc reports where it happens), then the goals still pending
     /// (rustc's `report_ambiguity_errors`), after the goals stalled on a coroutine of the body
-    /// are set aside (`drain_stalled_coroutine_obligations`; rustc checks them after borrowck).
+    /// are set aside (`drain_stalled_coroutine_obligations`), the third list: rustc proves
+    /// those after borrowck, in `check_coroutine_obligations`.
     pub(super) fn take_ambiguity_errors(
         &mut self,
-    ) -> (Vec<FulfillmentError<'db>>, Vec<FulfillmentError<'db>>) {
+    ) -> (Vec<FulfillmentError<'db>>, Vec<FulfillmentError<'db>>, PredicateObligations<'db>) {
         self.select_obligations_where_possible();
         let infcx = &self.infer_ctxt;
-        _ = self.fulfillment_cx.drain_stalled_obligations_for_coroutines(infcx);
+        let stalled = self.fulfillment_cx.drain_stalled_obligations_for_coroutines(infcx);
         let found: Vec<_> = self
             .trait_errors
             .extract_if(.., |error| {
@@ -496,7 +497,7 @@ impl<'db> InferenceTable<'db> {
             .into_iter()
             .map(|error| error.into_fulfillment_error(infcx))
             .collect(); // alloc: error path, none of a body without an ambiguity
-        (found, pending)
+        (found, pending, stalled)
     }
 
     pub(super) fn record_trait_errors(
@@ -772,6 +773,12 @@ pub(super) mod resolve_completely {
                 kind: crate::solver_errors::TypeAnnotationNeeded::E0282,
                 ambiguity: None,
                 origin: crate::solver_errors::variable_origin(&self.ctx.table.infer_ctxt, var),
+                // alloc: error path, a reported diagnostic's term
+                named: Some(Box::new(crate::solver_errors::NamedTerm::new(
+                    &self.ctx.table.infer_ctxt,
+                    self.top_term,
+                ))),
+                cause: crate::next_solver::infer::traits::ObligationCauseCode::Misc,
             });
         }
     }

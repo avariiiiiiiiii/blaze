@@ -453,6 +453,7 @@ Expr =
 | UnderscoreExpr
 | IncludeBytesExpr
 | CfgPredExpr
+| UnsafeBinderCastExpr
 
 // We need a special expression for this because we don't have access to the file,
 // and emitting a specific array will have problems with the length.
@@ -461,6 +462,10 @@ IncludeBytesExpr =
 
 CfgPredExpr =
   'builtin' '#' 'cfg' '(' CfgPredicate ','? ')'
+
+// What core's `wrap_binder!` and `unwrap_binder!` expand to.
+UnsafeBinderCastExpr =
+  AnyAttr* 'builtin' '#' ('wrap_binder' | 'unwrap_binder') '(' Expr (',' Type)? ')'
 
 OffsetOfExpr =
   AnyAttr* 'builtin' '#' 'offset_of' '(' Type ',' fields:(NameRef ('.' NameRef)* ) ')'

@@ -1,14 +1,15 @@
 //! Allocation budgets of the hot paths: an ask of a published function, the frames, and the
 //! plan's lookups allocate nothing; a first ask, once the runner is warm, allocates only the
-//! list of its waiters.
+//! list of its waiters, and a lone hit, answered by the thread that read it, nothing.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use blaze_alloc_count::{assert_at_most, measure};
-use blaze_codegen::InstanceKey;
+use blaze_codegen::{Arch, CompiledFunction, InstanceKey};
 use blaze_inproc::frame::Kind;
 use blaze_items::{CodeHash, ItemKey};
+use blaze_stencil::tier::Tier;
 
 use super::flight::{Addresses, Counting, session};
 use super::{compiled, function, id, key};
@@ -16,7 +17,7 @@ use crate::{
     LazyId,
     fetch::{Action, Fetcher, Outcome, Waiter},
     plan::{Function, Plan},
-    runner::{Answers, Config, Runner},
+    runner::{Answers, Compiler, Config, Runner},
     wire::{self, ASK_KIND, Frame, READY_KIND, READY_LEN},
 };
 
@@ -108,6 +109,60 @@ fn a_first_ask_of_a_warm_runner_allocates_only_its_waiters() {
     runner.close();
 }
 
+/// Has every function compiled already, as code that allocates nothing to hand over.
+struct Empty;
+
+impl Compiler for Empty {
+    fn compile(&self, key: InstanceKey) -> Result<CompiledFunction, String> {
+        Err(format!("{key:?}: every function is a hit"))
+    }
+
+    fn hit(&self, key: InstanceKey) -> Option<CompiledFunction> {
+        Some(CompiledFunction {
+            key,
+            arch: Arch::X86_64,
+            align: 16,
+            code: Vec::new(),
+            relocs: Default::default(),
+            data: Vec::new(),
+            inlined: Vec::new(),
+            side: None,
+            unwind: None,
+            lines: Vec::new(),
+            coverage: None,
+            profile: None,
+        })
+    }
+
+    fn tier_up(&self, key: InstanceKey, _: Tier) -> Result<CompiledFunction, String> {
+        Err(format!("{key:?}: not tiered"))
+    }
+}
+
+#[test]
+fn a_lone_hit_of_a_warm_runner_allocates_nothing() {
+    let kept = Kept::new();
+    let runner = Runner::start(
+        session(&(0..3).map(function).collect::<Vec<_>>()),
+        &[],
+        Empty,
+        Addresses((0..3).map(|n| (key(n), target_of(n))).collect()),
+        kept.clone(),
+        Config { workers: 1, idle: false },
+        None,
+    )
+    .unwrap();
+    runner.frame(0, ASK_KIND, 1, &wire::ask(1, 0)).unwrap();
+    assert_eq!(kept.wait(1).0, READY_KIND);
+    let asked = wire::ask(2, 1);
+    std::thread::sleep(Duration::from_millis(1));
+    assert_at_most(0, "a lone hit, answered by the reading thread", || runner.frame(0, ASK_KIND, 2, &asked).unwrap());
+    let (kind, bytes, _) = kept.wait(2);
+    assert_eq!(kind, READY_KIND);
+    assert_eq!(Frame::decode(&bytes).unwrap(), Frame::Ready { request: 2, lazy: 1, target: target_of(1) });
+    assert_eq!(runner.close().compiles, 2);
+}
+
 #[test]
 fn the_fetchers_answer_of_a_published_function_allocates_nothing() {
     let mut fetcher = Fetcher::new(4, 2);
@@ -150,13 +205,13 @@ fn the_plans_lookups_allocate_nothing() {
     let reached: Vec<CodeHash> = (0..64).step_by(3).map(|n| CodeHash(id("blaze-lazy test code", n))).collect();
     let keys: Vec<InstanceKey> = (0..64).map(key).collect();
     let calls = compiled(0, &[1, 2, 3], &[4]);
-    let (mut ids, mut callees) = (Vec::with_capacity(64), Vec::with_capacity(8));
+    let (mut ids, mut callees, mut seen) = (Vec::with_capacity(64), Vec::with_capacity(8), plan.scratch());
     let ((), used) = measure(|| {
         for (n, key) in keys.iter().enumerate() {
             assert_eq!(plan.id(key), Some(LazyId(n as u32)));
         }
         plan.reached(&reached, &mut ids);
-        plan.callees(&calls, &mut callees);
+        plan.callees(&calls, &mut seen, &mut callees);
     });
     assert_eq!(used.allocations, 0, "the plan's lookups: {used:?}");
     assert_eq!(ids.len(), reached.len());

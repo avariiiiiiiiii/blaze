@@ -10,6 +10,7 @@ use crate::{cx::Cx, model::Diag};
 
 pub(crate) mod parse;
 
+pub(crate) mod ambiguous_associated_item;
 pub(crate) mod bad_rtn;
 pub(crate) mod elided_lifetimes_in_path;
 pub(crate) mod generic_args_prohibited;
@@ -20,12 +21,14 @@ pub(crate) mod incorrect_generics_len;
 pub(crate) mod incorrect_generics_order;
 pub(crate) mod infer_vars_not_allowed;
 pub(crate) mod invalid_derive_target;
+pub(crate) mod late_bound_lifetime_args;
 pub(crate) mod macro_def_error;
 pub(crate) mod macro_error;
 pub(crate) mod macro_expansion_parse_error;
 pub(crate) mod malformed_derive;
 pub(crate) mod missing_body;
 pub(crate) mod missing_lifetime;
+pub(crate) mod missing_lifetimes;
 pub(crate) mod parenthesized_generic_args_without_fn_trait;
 pub(crate) mod pattern_arg_in_extern_fn;
 pub(crate) mod trait_impl_incorrect_safety;
@@ -69,6 +72,7 @@ pub(crate) mod non_exhaustive_record_pat;
 pub(crate) mod private_assoc_item;
 pub(crate) mod private_field;
 pub(crate) mod obligation_cause;
+pub(crate) mod trait_item_import;
 pub(crate) mod trait_solver_error;
 pub(crate) mod type_mismatch;
 pub(crate) mod type_must_be_known;
@@ -83,6 +87,7 @@ pub(crate) mod unresolved_field;
 pub(crate) mod unresolved_ident;
 pub(crate) mod unresolved_method_call;
 pub(crate) mod unresolved_path;
+pub(crate) mod unsafe_binder_cast_of_non_binder;
 
 pub(crate) mod await_outside_of_async;
 pub(crate) mod borrowck_error;
@@ -161,6 +166,7 @@ impl Found {
 /// `d` as rustc gives it: none, one, or several diagnostics.
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> {
     match d {
+        AnyDiagnostic::AmbiguousAssociatedItem(d) => ambiguous_associated_item::lower(cx, &d),
         AnyDiagnostic::BadRtn(d) => bad_rtn::lower(cx, &d),
         AnyDiagnostic::ElidedLifetimesInPath(d) => elided_lifetimes_in_path::lower(cx, &d),
         AnyDiagnostic::GenericArgsProhibited(d) => generic_args_prohibited::lower(cx, &d),
@@ -171,12 +177,14 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::IncorrectGenericsOrder(d) => incorrect_generics_order::lower(cx, &d),
         AnyDiagnostic::InferVarsNotAllowed(d) => infer_vars_not_allowed::lower(cx, &d),
         AnyDiagnostic::InvalidDeriveTarget(d) => invalid_derive_target::lower(cx, &d),
+        AnyDiagnostic::LateBoundLifetimeArgs(d) => late_bound_lifetime_args::lower(cx, &d),
         AnyDiagnostic::MacroDefError(d) => macro_def_error::lower(cx, &d),
         AnyDiagnostic::MacroError(d) => macro_error::lower(cx, &d),
         AnyDiagnostic::MacroExpansionParseError(d) => macro_expansion_parse_error::lower(cx, &d),
         AnyDiagnostic::MalformedDerive(d) => malformed_derive::lower(cx, &d),
         AnyDiagnostic::MissingBody(d) => missing_body::lower(cx, &d),
         AnyDiagnostic::MissingLifetime(d) => missing_lifetime::lower(cx, &d),
+        AnyDiagnostic::MissingLifetimes(d) => missing_lifetimes::lower(cx, &d),
         AnyDiagnostic::ParenthesizedGenericArgsWithoutFnTrait(d) => {
             parenthesized_generic_args_without_fn_trait::lower(cx, &d)
         }
@@ -190,6 +198,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::UnimplementedBuiltinMacro(d) => unimplemented_builtin_macro::lower(cx, &d),
         AnyDiagnostic::UnresolvedExternCrate(d) => unresolved_extern_crate::lower(cx, &d),
         AnyDiagnostic::UnresolvedImport(d) => unresolved_import::lower(cx, &d),
+        AnyDiagnostic::TraitItemImport(d) => trait_item_import::lower(cx, &d),
         AnyDiagnostic::UnresolvedMacroCall(d) => unresolved_macro_call::lower(cx, &d),
         AnyDiagnostic::UnresolvedModule(d) => unresolved_module::lower(cx, &d),
 
@@ -272,6 +281,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::NonExhaustiveLet(d) => non_exhaustive_let::lower(cx, &d),
         AnyDiagnostic::PatternComplexityLimit(d) => pattern_complexity_limit::lower(cx, &d),
         AnyDiagnostic::ReturnOutsideFunction(d) => return_outside_function::lower(cx, &d),
+        AnyDiagnostic::UnsafeBinderCastOfNonBinder(d) => unsafe_binder_cast_of_non_binder::lower(cx, &d),
         AnyDiagnostic::UndeclaredLabel(d) => undeclared_label::lower(cx, &d),
         AnyDiagnostic::UnreachableLabel(d) => unreachable_label::lower(cx, &d),
         AnyDiagnostic::UnusedMustUse(d) => unused_must_use::lower(cx, &d),

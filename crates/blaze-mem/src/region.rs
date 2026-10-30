@@ -63,11 +63,9 @@ impl Region {
     fn placed(bytes: usize, huge: bool, node: Option<u32>, tag: Tag) -> Result<Region, MemError> {
         let page = os::page_size();
         let granule = if huge { crate::HUGE_PAGE.max(page) } else { page.max(64 << 10) };
-        let reserved = crate::align::checked_align_up(bytes.max(1), granule).ok_or(MemError::TooLarge {
-            tag,
-            what: "a reservation",
-            wanted: bytes,
-        })?;
+        let reserved = crate::align::checked_align_up(bytes.max(1), granule).ok_or(
+            MemError::TooLarge { tag, what: "a reservation", wanted: bytes },
+        )?;
         let base = match node {
             Some(node) => os::reserve_on(reserved, huge, node),
             None => os::reserve(reserved, huge),

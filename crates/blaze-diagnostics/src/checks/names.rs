@@ -40,6 +40,10 @@ pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
 pub(super) struct Signature<'db> {
     pub(super) node: InFile<ast::Node<'db>>,
     pub(super) item: Option<ItemId>,
+    /// Whether a primitive type's name is that type wherever no generic parameter of the
+    /// signature has it: nothing of the crate shadows one, and the item is not in a block
+    /// (`hir::Crate::shadows_primitive_type` counts no block scope).
+    pub(super) primitives: bool,
 }
 
 impl Signature<'_> {
@@ -56,32 +60,34 @@ impl Signature<'_> {
 /// impls after them.
 fn signatures<'db>(cx: &Cx<'_, 'db>, scopes: &[hir::Module], mut visit: impl FnMut(Signature<'db>)) {
     let db = cx.db;
-    let mut push = |node: Option<InFile<ast::Node<'db>>>, item: Option<ItemId>| {
+    let unshadowed = !cx.krate.shadows_primitive_type(db);
+    let mut push = |node: Option<InFile<ast::Node<'db>>>, item: Option<ItemId>, primitives: bool| {
         let Some(node) = node else { return };
-        visit(Signature { node, item });
+        visit(Signature { node, item, primitives });
     };
     for &module in scopes {
+        let primitives = unshadowed && !hir_def::ModuleId::from(module).is_block_module(db);
         for def in module.declarations_iter(db) {
             let item = item_id(db, def);
             match def {
-                hir::ModuleDef::Function(it) => push(syntax_of(cx.vsema.source(it)), item),
-                hir::ModuleDef::Adt(it) => push(syntax_of(cx.vsema.source(it)), item),
-                hir::ModuleDef::TypeAlias(it) => push(syntax_of(cx.vsema.source(it)), item),
-                hir::ModuleDef::Const(it) => push(syntax_of(cx.vsema.source(it)), item),
-                hir::ModuleDef::Static(it) => push(syntax_of(cx.vsema.source(it)), item),
+                hir::ModuleDef::Function(it) => push(syntax_of(cx.vsema.source(it)), item, primitives),
+                hir::ModuleDef::Adt(it) => push(syntax_of(cx.vsema.source(it)), item, primitives),
+                hir::ModuleDef::TypeAlias(it) => push(syntax_of(cx.vsema.source(it)), item, primitives),
+                hir::ModuleDef::Const(it) => push(syntax_of(cx.vsema.source(it)), item, primitives),
+                hir::ModuleDef::Static(it) => push(syntax_of(cx.vsema.source(it)), item, primitives),
                 hir::ModuleDef::Trait(it) => {
-                    push(syntax_of(cx.vsema.source(it)), item);
+                    push(syntax_of(cx.vsema.source(it)), item, primitives);
                     for assoc in it.items_iter(db) {
-                        push(assoc_syntax(cx, assoc), item_id(db, assoc.into()));
+                        push(assoc_syntax(cx, assoc), item_id(db, assoc.into()), primitives);
                     }
                 }
                 _ => {}
             }
         }
         for imp in module.impl_defs_iter(db) {
-            push(syntax_of(cx.vsema.source(imp)), ImplId::try_from(imp).ok().map(ItemId::Impl));
+            push(syntax_of(cx.vsema.source(imp)), ImplId::try_from(imp).ok().map(ItemId::Impl), primitives);
             for assoc in imp.items_iter(db) {
-                push(assoc_syntax(cx, assoc), item_id(db, assoc.into()));
+                push(assoc_syntax(cx, assoc), item_id(db, assoc.into()), primitives);
             }
         }
     }

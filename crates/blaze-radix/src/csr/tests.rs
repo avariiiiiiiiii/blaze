@@ -169,3 +169,58 @@ fn a_warm_rebuild_allocates_nothing() {
     assert_eq!(csr.len(), pairs.len());
     assert_eq!(graph.len(), pairs.len());
 }
+
+/// `System`, past the counted global allocator, with a count of what it is asked for.
+#[derive(Clone, Copy)]
+struct Scratch<'a>(&'a Cell<usize>);
+
+// SAFETY: every call is `System`'s, which upholds `Allocator`'s contract; the count is a side
+// table that no block depends on.
+unsafe impl Allocator for Scratch<'_> {
+    fn allocate(&self, layout: std::alloc::Layout) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+        self.0.set(self.0.get() + 1);
+        std::alloc::System.allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: std::alloc::Layout) {
+        // SAFETY: `ptr` came from `allocate` above, so from `System`, with this `layout`.
+        unsafe { std::alloc::System.deallocate(ptr, layout) }
+    }
+}
+
+/// `build_in` is `build`, with the cursors (one block) in the scratch and only the two columns
+/// on the heap.
+#[test]
+fn build_in_puts_the_cursors_in_the_scratch() {
+    let pairs: Vec<(u32, u32)> = (0..2_000u32).map(|at| (at.wrapping_mul(2_654_435_761) % 300, at)).collect();
+    let asked = Cell::new(0);
+    let csr = blaze_alloc_count::assert_at_most(2, "a CSR built with scratch cursors", || {
+        Csr::build_in(300, pairs.iter().copied(), Scratch(&asked))
+    });
+    assert_eq!(asked.get(), 1);
+    assert_eq!(csr, Csr::build(300, pairs.iter().copied()));
+}
+
+/// A CSR and a graph with their columns, scratch and cursors all in an allocator of their own
+/// are the global ones, and ask the heap for nothing.
+#[test]
+fn a_csr_in_an_allocator_is_the_global_one() {
+    let pairs: Vec<(u32, u32)> = (0..2_000u32).map(|at| (at.wrapping_mul(2_654_435_761) % 300, at)).collect();
+    let asked = Cell::new(0);
+    let (csr, graph) = blaze_alloc_count::assert_at_most(0, "a CSR in its own allocator", || {
+        let mut cursors = Vec::new_in(Scratch(&asked));
+        let mut csr = Csr::new_in(Scratch(&asked));
+        csr.rebuild(300, pairs.iter().copied(), &mut cursors);
+        let (mut graph, mut by_target) = (Csr::new_in(Scratch(&asked)), Csr::new_in(Scratch(&asked)));
+        graph.rebuild_graph(300, pairs.iter().map(|&(s, t)| (s, t % 300)), &mut by_target, &mut cursors);
+        graph.dedup_rows();
+        (csr, graph)
+    });
+    assert!(asked.get() >= 5, "the columns, by-target columns and cursors were not in the scratch");
+    assert_eq!(csr, Csr::build(300, pairs.iter().copied()));
+    let mut global = Csr::graph(300, pairs.iter().map(|&(s, t)| (s, t % 300)));
+    global.dedup_rows();
+    assert_eq!(graph, global);
+    let (starts, items) = csr.into_parts();
+    assert_eq!(Csr::from_parts(starts, items), Csr::build(300, pairs.iter().copied()));
+}

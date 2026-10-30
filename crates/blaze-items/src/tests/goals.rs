@@ -4,7 +4,9 @@
 use blaze_alloc_count::assert_at_most;
 use blaze_ids::ContentId;
 use blaze_query::QueryKind;
+use cfg::CfgOptions;
 use hir_def::{AdtId, AssocItemId, ImplId, TraitId, lang_item::lang_items};
+use intern::Symbol;
 use hir_ty::{
     method_resolution::{ImplPair, RelevantImplsKey, SelfTyKey, relevant_impls},
     next_solver::{
@@ -23,7 +25,7 @@ use crate::{
     index::impl_self_ty,
     item_key, key, kinds, specializes,
     table::{fact_of_ref, fact_ref},
-    value,
+    value, whole_crate,
 };
 
 fn id(n: u8) -> ContentId {
@@ -36,7 +38,7 @@ fn a_fact_reads_back_from_its_parts() {
     let mut kinds: Vec<u16> = facts.iter().map(|it| it.kind().0).collect();
     kinds.sort_unstable();
     kinds.dedup();
-    assert_eq!(kinds.len(), 17, "one fact of each kind");
+    assert_eq!(kinds.len(), 18, "one fact of each kind");
     for fact in facts {
         let parts = fact_ref(&fact);
         assert_eq!(parts.kind, fact.kind());
@@ -185,11 +187,18 @@ fn a_read_of_an_items_query_stands_for_its_signature() {
     assert_eq!(target, Some(Fact::Target(key::crate_key(&db, krate))));
     assert_eq!(target, Some(crate::target(&db, krate)));
 
-    // A key whose page holds another struct, a query keyed by a crate's batch or several
-    // arguments, and a name no query has stand for nothing.
+    // A dependency's batch stands for its whole crate.
+    for name in
+        ["crate_impl_traits", "crate_impl_self_tys", "crate_field_types", "crate_impl_predicates"]
+    {
+        assert_eq!(read(name, krate.as_id()), Some(whole_crate(&db, krate)), "{name}");
+        assert_eq!(read(name, imp.as_id()), None, "{name} of no crate");
+    }
+
+    // A key whose page holds another struct, another crate-wide table, a query keyed by
+    // several arguments, and a name no query has stand for nothing.
     assert_eq!(read("ImplSignature::kept", tr.as_id()), None);
     assert_eq!(read("fn_sig_for_fn", struct_.as_id()), None);
-    assert_eq!(read("crate_impl_traits", krate.as_id()), None);
     assert_eq!(read("TraitImpls::for_crate", krate.as_id()), None);
     assert_eq!(read("no such query", imp.as_id()), None);
 }
@@ -306,6 +315,63 @@ fn the_crate_key_changes_when_the_crate_loads_another() {
     assert_eq!(Goals.crate_key(&db, Some(main)), before, "it loads the same crates");
     edit(&mut db, main_file, "pub struct M;\npub use dep::D;\n");
     assert_ne!(Goals.crate_key(&db, Some(main)), before, "it loads `dep` now");
+}
+
+const CRATES: &str = r#"
+//- /dep.rs crate:dep new_source_root:library
+pub struct D;
+//- /notes.rs
+pub struct N;
+//- /main.rs crate:main deps:dep new_source_root:local
+pub struct M;
+//- /other.rs crate:other new_source_root:local
+pub struct O;
+"#;
+
+#[track_caller]
+fn crate_named(db: &TestDB, name: &str) -> base_db::Crate {
+    *base_db::all_crates(db)
+        .iter()
+        .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.to_string() == name))
+        .unwrap_or_else(|| panic!("no crate `{name}`"))
+}
+
+#[test]
+fn a_crate_fact_changes_with_its_dependencies_files_and_cfg_alone() {
+    let (mut db, files) = TestDB::with_many_files(CRATES);
+    let [dep_root, notes, _, other_root] = [0, 1, 2, 3].map(|at| files[at].file_id(&db));
+    let (main, dep, other) =
+        (crate_named(&db, "main"), crate_named(&db, "dep"), crate_named(&db, "other"));
+    let fact = whole_crate(&db, main);
+    let val = |db: &TestDB| value(db, &fact).ok();
+    let mut before = val(&db);
+    assert!(before.is_some());
+    assert_ne!(before, value(&db, &whole_crate(&db, dep)).ok(), "a crate is not its dependency");
+
+    edit(&mut db, other_root, "pub struct O;\npub fn g() {}\n");
+    let mut cfg = CfgOptions::default();
+    cfg.insert_atom(Symbol::intern("blaze_items_other"));
+    other.set_cfg_options(&mut db, cfg);
+    assert_eq!(val(&db), before, "an unrelated crate's file and cfg keep it");
+
+    for (file, text, what) in [
+        (dep_root, "pub struct D;\npub fn f() {}\n", "the dependency's root"),
+        (notes, "pub struct N(u8);\n", "a file of its source root no module names"),
+    ] {
+        edit(&mut db, file, text);
+        let now = val(&db);
+        assert_ne!(now, before, "an edit of {what} changes it");
+        before = now;
+    }
+
+    let mut cfg = CfgOptions::default();
+    cfg.insert_atom(Symbol::intern("blaze_items_dep"));
+    dep.set_cfg_options(&mut db, cfg);
+    assert_ne!(val(&db), before, "the dependency's cfg changes it");
+
+    let (nowhere, elsewhere) = (Fact::Crate(id(8)), Fact::Crate(id(9)));
+    assert_eq!(value(&db, &nowhere).ok(), value(&db, &elsewhere).ok(), "no crate is absent");
+    assert_ne!(value(&db, &nowhere).ok(), val(&db));
 }
 
 #[test]

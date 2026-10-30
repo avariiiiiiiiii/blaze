@@ -17,16 +17,11 @@
 //! A thread holds bytes of one cap at a time: [`set_cap`] takes effect on a thread once its
 //! frames hold none of the cap before.
 
-use std::{
-    cell::Cell,
-    fmt,
-    marker::PhantomData,
-    ptr,
-    sync::{
-        Condvar, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-        mpsc,
-    },
+use std::{cell::Cell, fmt, marker::PhantomData, ptr, sync::mpsc};
+
+use crate::sync::{
+    Condvar, Mutex, MutexGuard, PoisonError,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 /// What a task unwinds with when the cap cancelled its frame's growth: every holder of the cap
@@ -97,8 +92,10 @@ thread_local! {
     static HOLDING: Cell<(Option<&'static Shared>, u64)> = const { Cell::new((None, 0)) };
 }
 
-/// The cap task frames reserve from; null when none is set.
-static INSTALLED: AtomicPtr<Shared> = AtomicPtr::new(ptr::null_mut());
+/// The cap task frames reserve from; null when none is set. `std`'s atomic even under the model
+/// checker: it is process-wide, outside any model, and no model installs a cap.
+static INSTALLED: std::sync::atomic::AtomicPtr<Shared> =
+    std::sync::atomic::AtomicPtr::new(ptr::null_mut());
 
 impl Cap {
     /// A cap of `limit` bytes, and what hears each time it passes `spill_at`.

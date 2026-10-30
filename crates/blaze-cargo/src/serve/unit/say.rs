@@ -25,6 +25,7 @@ pub(crate) fn cargo(level: Level, message: String, unit: Option<UnitOf>, color: 
         facts: Vec::new(),
         rendered,
         unit,
+        explanation: None,
     }
 }
 

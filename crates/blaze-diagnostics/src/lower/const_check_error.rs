@@ -104,7 +104,7 @@ fn non_const_call(cx: &Cx<'_, '_>, diag: &mut Diag, node: InFile<SyntaxNodePtr>,
 }
 
 /// The function a call or a method call calls.
-fn callee(cx: &Cx<'_, '_>, expr: ast::Expr<'_>) -> Option<hir::Function> {
+fn callee<'db>(cx: &Cx<'_, 'db>, expr: ast::Expr<'db>) -> Option<hir::Function> {
     match expr {
         ast::Expr::CallExpr(call) => {
             let ast::Expr::PathExpr(path) = call.expr()? else { return None };

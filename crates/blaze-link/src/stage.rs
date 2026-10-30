@@ -18,6 +18,7 @@ use std::sync::Arc;
 use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Relocs, Static, Target, Unwind};
 use blaze_format::cursor::{self, Reader};
 use blaze_ids::{Hasher, radix};
+use blaze_live::patch::exec;
 use blaze_mem::Frame;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -28,7 +29,7 @@ use crate::model::{Apply, Class, Fixup, Formats, Plan, Special, Sym, Writer};
 use crate::position::{self, Spans};
 use crate::reloc::{self, GotKind};
 use crate::state::{ClassId, Def, NewPiece, PieceId, PieceRef, State, What};
-use crate::symbols::{IdNo, Obj, SymKey, Symbols, Wide};
+use crate::symbols::{IdNo, NameId, Obj, SymKey, Symbols, Wide};
 use crate::table;
 use crate::unwind::{self, Field};
 use crate::{Change, Format, LinkError, Output};
@@ -191,8 +192,9 @@ pub(crate) fn error(function: Option<InstanceKey>, what: impl Into<String>) -> L
 }
 
 /// The key a codegen target is, and whether it is referred to weakly. `of` is the function
-/// whose code or data refers to it: a coverage array is that function's own, and outside a
-/// function (`None`) there is none to name.
+/// whose code or data refers to it: a coverage array or a counter pair is that function's
+/// own, and outside a function (`None`) there is none to name. Every counter pair is an
+/// offset of [`SymKey::Counters`], which [`Stage::fixups`] adds to the addend.
 fn wide<'t>(target: &'t Target, table: bool, of: Option<&'t InstanceKey>) -> Option<(Wide<'t>, bool)> {
     Some(match target {
         Target::Function(key) if table => (Wide::Slot(key), false),
@@ -203,6 +205,11 @@ fn wide<'t>(target: &'t Target, table: bool, of: Option<&'t InstanceKey>) -> Opt
         Target::Weak(name) => (Wide::Name(name), true),
         Target::Position(span) => (Wide::Position(span), false),
         Target::Coverage(array) => (Wide::Coverage(of?, *array), false),
+        Target::Counter(_) => {
+            of?;
+            (Wide::Key(SymKey::Counters), false)
+        }
+        Target::ProfileCounters => return None,
     })
 }
 
@@ -246,7 +253,14 @@ impl<'a> Stage<'a> {
     /// personality routine's.
     fn target_sym(&mut self, target: &Target) -> Result<Sym, LinkError> {
         let Some((key, _)) = wide(target, self.table, None) else {
-            return Err(error(None, "a SanitizerCoverage array named outside the function it is of"));
+            return Err(match target {
+                Target::Counter(key) => error(
+                    Some(*key),
+                    "its tier-up counter cells named outside its own code: nothing but a function's code names any",
+                ),
+                Target::ProfileCounters => error(None, "PGO counters named outside the instrumented function's own code"),
+                _ => error(None, "a SanitizerCoverage array named outside the function it is of"),
+            });
         };
         let key = match key {
             Wide::Key(key) => key,
@@ -465,35 +479,80 @@ impl<'a> Stage<'a> {
         Ok(())
     }
 
-    /// The jump table's generation cell, cells and stubs, with room for `functions` and
-    /// what incremental links add.
+    /// The jump table's header (its cell, [`blaze_live::patch::exec`]), cells and stubs, with
+    /// room for `functions` and what incremental links add; with [`Output::exec_log`], the
+    /// header's log table and private map and the log stubs after the slot stubs too.
     fn fixed(&mut self, functions: u64) -> Result<(), LinkError> {
         let capacity = table::capacity(functions, true);
         let capacity = u32::try_from(capacity).map_err(|_| error(None, "a jump table past 2^32 slots"))?;
         self.new.capacity = capacity;
+        let slots = u64::from(capacity);
+        let arch = self.arch();
+        let logged = self.output.exec_log;
+        if logged && arch == Arch::Aarch64 && slots > table::A64_LOG_SLOTS {
+            return Err(error(
+                None,
+                // alloc: error path
+                format!(
+                    "a jump table of {slots} slots with an execution log, where AArch64's log stubs reach {}",
+                    table::A64_LOG_SLOTS
+                ),
+            ));
+        }
         let cells = self.sym(SymKey::Cells);
         let generation = self.sym(SymKey::Generation);
-        let fixups = self.fixup_slice([Fixup { at: 0, apply: Apply::Abs64, target: cells, addend: 0, minus: None }]);
-        let piece = self.piece(generation, &Class::Table, 8, 8, fixups, What::Fixed);
-        self.make(&piece, Content::Zero);
-        let mut piece = self.piece(cells, &Class::Table, 8, u64::from(capacity) * 8, &[], What::Cells);
+        let stubs = self.sym(SymKey::Stubs);
+        let size = table::stub_size(arch);
+        let log_stubs = (slots * size) as i64;
+        let stride = table::log_stub_size(arch);
+        let abs = |at: u64, target: Sym, addend: i64| Fixup { at, apply: Apply::Abs64, target, addend, minus: None };
+        let (cell, cell_addend) = if logged { (generation, exec::HEADER as i64) } else { (cells, 0) };
+        let always = [abs(exec::CELL, cell, cell_addend), abs(exec::CURRENT, cells, 0), abs(exec::LOADER, cells, 0)];
+        let log = [
+            abs(exec::MAP, generation, exec::private_map(slots) as i64),
+            abs(exec::STUBS, stubs, log_stubs),
+        ];
+        let words = (0..if logged { slots } else { 0 })
+            .map(|slot| abs(exec::log_word(slot), stubs, log_stubs + (slot * stride) as i64));
+        let fixups = self.fixup_slice(always.into_iter().chain(log.into_iter().filter(|_| logged)).chain(words));
+        let header: &'a mut [u8] = self.arena.alloc_slice_fill_with(exec::HEADER as usize, |_| 0);
+        header[exec::SLOTS as usize..][..4].copy_from_slice(&capacity.to_le_bytes());
+        let stride_field = if logged { stride as u32 } else { 0 };
+        header[exec::STRIDE as usize..][..4].copy_from_slice(&stride_field.to_le_bytes());
+        let piece = self.piece(generation, &Class::Table, 8, exec::len(slots, logged), fixups, What::Fixed);
+        self.make(&piece, Content::Bytes(header));
+        let mut piece = self.piece(cells, &Class::Table, 8, slots * 8, &[], What::Cells);
         piece.rank = 1;
         self.make(&piece, Content::Zero);
-        let arch = self.arch();
-        let size = table::stub_size(arch) as usize;
-        let code: &'a mut [u8] = self.arena.alloc_slice_fill_with(size * capacity as usize, |_| 0);
-        table::stubs(arch, code);
+        let log_len = if logged { table::log_size(arch, slots) } else { 0 };
+        let code: &'a mut [u8] = self.arena.alloc_slice_fill_with((slots * size + log_len) as usize, |_| 0);
+        let (slot_code, log_code) = code.split_at_mut((slots * size) as usize);
+        table::stubs(arch, slot_code);
+        if logged {
+            table::log_stubs(arch, slots, log_code);
+        }
         let stub = table::stub_fixups(arch);
-        let fixups = self.fixup_slice((0..u64::from(capacity)).flat_map(|slot| {
-            stub.iter().map(move |it| Fixup {
-                at: slot * size as u64 + it.at,
-                apply: it.apply,
-                target: generation,
-                addend: it.addend,
-                minus: None,
-            })
-        }));
-        let stubs = self.sym(SymKey::Stubs);
+        let routine = log_stubs as u64 + table::log_routine(arch, slots);
+        let routine_fixups = table::log_fixups(arch).iter().filter(|_| logged).map(move |it| Fixup {
+            at: routine + it.at,
+            apply: it.apply,
+            target: generation,
+            addend: it.addend,
+            minus: None,
+        });
+        let fixups = self.fixup_slice(
+            (0..slots)
+                .flat_map(|slot| {
+                    stub.iter().map(move |it| Fixup {
+                        at: slot * size + it.at,
+                        apply: it.apply,
+                        target: generation,
+                        addend: it.addend,
+                        minus: None,
+                    })
+                })
+                .chain(routine_fixups),
+        );
         let piece = self.piece(stubs, &Class::Stubs, 16, code.len() as u64, fixups, What::Fixed);
         self.make(&piece, Content::Bytes(code));
         Ok(())
@@ -603,6 +662,16 @@ impl<'a> Stage<'a> {
             if !seen.insert(&function.key) {
                 return Err(error(Some(function.key), "added twice in one change"));
             }
+            let profiled = function.profile.as_ref().is_some_and(|it| it.counted().is_some())
+                || std::iter::once(&function.relocs)
+                    .chain(function.data.iter().map(|it| &it.relocs))
+                    .any(|relocs| relocs.targets().iter().any(|it| matches!(it, Target::ProfileCounters)));
+            if profiled {
+                return Err(error(
+                    Some(function.key),
+                    "instrumented for PGO counters (`-Cprofile-generate`): the link places no `__llvm_prf_*` sections yet",
+                ));
+            }
             let body = self.symbols.find_body(&function.key);
             if body.and_then(|it| self.new.home(it)).is_some() {
                 continue;
@@ -632,13 +701,16 @@ impl<'a> Stage<'a> {
     }
 
     /// `relocs` as fixups, `syms` being the symbols of its targets by index
-    /// ([`Stage::reloc_syms`]), and the weak ones among them.
+    /// ([`Stage::reloc_syms`]), and the weak ones among them. `counter` is the offset of the
+    /// function's counter pair from [`SymKey::Counters`] ([`Stage::counter`]) when `relocs` are
+    /// its code's and name it.
     fn fixups(
         &self,
         relocs: &Relocs,
         syms: &[Sym],
         function: Option<InstanceKey>,
         in_code: bool,
+        counter: Option<u64>,
     ) -> Result<(&'a [Fixup], &'a [Sym]), LinkError> {
         let mut fixups = Vec::with_capacity_in(relocs.len(), self.arena);
         let mut weak = Vec::new_in(self.arena);
@@ -650,23 +722,73 @@ impl<'a> Stage<'a> {
         for (row, reloc) in relocs.rows().iter().zip(relocs.iter()) {
             let apply = reloc::of_kind(reloc.kind, self.output.format, self.arch(), in_code).map_err(|it| error(function, it))?;
             let target = syms[row.target as usize];
-            fixups.push(Fixup { at: u64::from(reloc.at), apply, target, addend: reloc.addend, minus: None });
+            let addend = match reloc.target {
+                Target::Counter(key) => {
+                    let Some(at) = counter.filter(|_| in_code && function == Some(*key)) else {
+                        return Err(error(
+                            function.or(Some(*key)),
+                            // alloc: error path
+                            format!(
+                                "the tier-up counter cells of {key:?} named in {}: only a function's own code names its cells",
+                                if in_code { "another function's code" } else { "data" }
+                            ),
+                        ));
+                    };
+                    if !crate::counter::reaches(apply) {
+                        return Err(error(
+                            function,
+                            // alloc: error path
+                            format!(
+                                "its tier-up counter cells reached by a {:?} relocation: cells are reached rip-relative \
+                                 (x86-64) or by ADRP and a page offset (AArch64)",
+                                reloc.kind
+                            ),
+                        ));
+                    }
+                    reloc.addend + at as i64
+                }
+                _ => reloc.addend,
+            };
+            fixups.push(Fixup { at: u64::from(reloc.at), apply, target, addend, minus: None });
         }
         weak.sort_unstable();
         weak.dedup();
         Ok((fixups.leak(), weak.leak()))
     }
 
+    /// The offset of `function`'s counter pair from [`SymKey::Counters`], given now if it has
+    /// none ([`crate::counter::pair`]), when its code names its counter cells.
+    fn counter(&mut self, function: &CompiledFunction, id: IdNo) -> Result<Option<u64>, LinkError> {
+        if !function.relocs.targets().iter().any(|it| matches!(it, Target::Counter(_))) {
+            return Ok(None);
+        }
+        let pair = crate::counter::pair(self.output, &mut self.new, id, &function.key)?;
+        Ok(Some(crate::counter::offset(pair)))
+    }
+
+    /// The piece [`SymKey::Counters`] is defined in: no bytes, at the start of a dev run's
+    /// cells reservation, which keeps its region's size 0 ([`crate::model::reserved`]); each
+    /// pair is at its offset ([`crate::counter`]). Made once, kept by every later stage.
+    pub fn counter_cells(&mut self) {
+        if crate::counter::capacity(self.output) == 0 {
+            return;
+        }
+        let sym = self.sym(SymKey::Counters);
+        if self.new.home(sym).is_some() {
+            return;
+        }
+        let class = Class::Reserve(crate::model::Reserve::Cells);
+        let mut piece = self.piece(sym, &class, crate::counter::PAIR, 0, &[], What::Fixed);
+        piece.zero = true;
+        self.make(&piece, Content::Zero);
+    }
+
     fn add_function(&mut self, function: &'a CompiledFunction, syms: &[Sym]) -> Result<(), LinkError> {
         let key = Some(function.key);
         let body = syms[0];
-        let (fixups, weak) = self.fixups(&function.relocs, &syms[1..=function.relocs.targets().len()], key, true)?;
-        if self.arch() == Arch::Wasm32 && wasm_imports_in(&function.code).map_err(|it| error(key, it))? {
-            let (code, _) = blaze_codegen::wasm::Code::decode(&function.code)
-                // alloc: error path
-                .map_err(|it| error(key, format!("its wasm header: {it}")))?;
-            self.wasm_imports(&code.imports);
-        }
+        let id = self.symbols.id(&function.key.0);
+        let counter = self.counter(function, id)?;
+        let (fixups, weak) = self.fixups(&function.relocs, &syms[1..=function.relocs.targets().len()], key, true, counter)?;
         let mut at = 1 + function.relocs.targets().len();
         for data in &function.data {
             let sym = syms[at];
@@ -779,7 +901,6 @@ impl<'a> Stage<'a> {
             }
             None => {}
         }
-        let id = self.symbols.id(&function.key.0);
         self.add_coverage(function, id, body)?;
         let info = self.new.add_function(function.key, id, fde_sym, windows, &function.lines);
         let (class, rank) = self.own(Class::Text);
@@ -793,7 +914,13 @@ impl<'a> Stage<'a> {
         );
         piece.rank = rank;
         piece.weak = weak;
-        self.make(&piece, Content::Bytes(&function.code));
+        let made = self.make(&piece, Content::Bytes(&function.code));
+        if self.arch() == Arch::Wasm32 && wasm_imports_in(&function.code).map_err(|it| error(key, it))? {
+            let (code, _) = blaze_codegen::wasm::Code::decode(&function.code)
+                // alloc: error path
+                .map_err(|it| error(key, format!("its wasm header: {it}")))?;
+            self.declare_wasm(made, key, &code.imports)?;
+        }
         if self.table {
             let slot = self.sym(SymKey::Slot(id));
             if self.new.home(slot).is_none() {
@@ -901,7 +1028,7 @@ impl<'a> Stage<'a> {
         if self.new.home(sym).is_some() {
             return Ok(());
         }
-        let (fixups, weak) = self.fixups(&data.relocs, relocs, function, false)?;
+        let (fixups, weak) = self.fixups(&data.relocs, relocs, function, false, None)?;
         let (class, rank) = self.own(if fixups.is_empty() { Class::Rodata } else { Class::RelRo });
         let mut piece =
             Self::piece_in(sym, class, u64::from(data.align), data.bytes.len() as u64, fixups, What::Shared);
@@ -928,10 +1055,7 @@ impl<'a> Stage<'a> {
             Init::Zeroed { size } => (&[][..], &NO_RELOCS, *size, true),
         };
         let syms = self.reloc_syms(relocs)?;
-        let (fixups, weak) = self.fixups(relocs, syms, None, false)?;
-        if self.arch() == Arch::Wasm32 {
-            self.wasm_imports(&it.imports);
-        }
+        let (fixups, weak) = self.fixups(relocs, syms, None, false, None)?;
         // alloc: error path
         let static_error = |what: String| error(None, format!("the static {:?}: {what}", it.item));
         let (class, rank) = match &it.section {
@@ -966,7 +1090,10 @@ impl<'a> Stage<'a> {
         piece.rank = rank;
         piece.zero = zeroed;
         piece.weak = weak;
-        self.make(&piece, content);
+        let made = self.make(&piece, content);
+        if self.arch() == Arch::Wasm32 {
+            self.declare_wasm(made, None, &it.imports)?;
+        }
         if it.thread_local && self.plan.tls_descriptors {
             let tlv = self.sym(SymKey::Tlv(item, instance));
             if let Def::Piece { piece, .. } = self.new.def(tlv) {
@@ -1331,16 +1458,81 @@ impl<'a> Stage<'a> {
             && self.new.resolved.imports.get(at as usize).is_some_and(|it| it.kind == crate::model::SymbolKind::Function)
     }
 
-    /// Records what codegen says names are imported as on wasm; the map is copied only when
-    /// one is new or different.
-    fn wasm_imports(&mut self, imports: &[(String, blaze_codegen::wasm::Import)]) {
+    /// Records that the piece `id` just made (a function's body or a static) declares what
+    /// codegen says each of `imports` is imported as on wasm. A name's import is the one its
+    /// live declarers agree on: a different one is an error naming both, and an edit that
+    /// changes a name's import removes the old declarer in the same change ([`Stage::apply`]
+    /// removes first). The map is copied only when a name is new.
+    fn declare_wasm(
+        &mut self,
+        id: PieceId,
+        function: Option<InstanceKey>,
+        imports: &[(String, blaze_codegen::wasm::Import)],
+    ) -> Result<(), LinkError> {
+        if imports.is_empty() {
+            return Ok(());
+        }
+        let mut names = Vec::with_capacity_in(imports.len(), self.arena);
         for (name, import) in imports {
             let name = self.symbols.name(name);
-            if self.new.wasm_imports.get(&name) != Some(import) {
-                // clone: the state's map owns its imports; only a new or changed one is copied
+            // A piece declares a few names: a linear check finds one it declared already.
+            let ours = names.contains(&name.0);
+            if ours || self.new.wasm_declarers(name) > 0 {
+                let agreed = self.new.wasm_imports.get(&name).expect("a declared name's import");
+                if agreed != import {
+                    return Err(self.wasm_conflict(id, function, name, agreed, import, ours));
+                }
+            } else if self.new.wasm_imports.get(&name) != Some(import) {
+                // clone: the state's map owns its imports; only a new one is copied
                 Arc::make_mut(&mut self.new.wasm_imports).insert(name, import.clone());
             }
+            if !ours {
+                names.push(name.0);
+            }
         }
+        self.new.declare_wasm(id, &names);
+        Ok(())
+    }
+
+    /// The error of the piece `id` declaring `name` imported as `import`, when a live piece
+    /// (`ours`: `id` itself) declares it as `agreed`.
+    fn wasm_conflict(
+        &self,
+        id: PieceId,
+        function: Option<InstanceKey>,
+        name: NameId,
+        agreed: &blaze_codegen::wasm::Import,
+        import: &blaze_codegen::wasm::Import,
+        ours: bool,
+    ) -> LinkError {
+        let by = self.symbols.describe(self.new.piece(id).expect("just made").sym);
+        let other = if ours {
+            // clone: error path
+            by.clone()
+        } else {
+            // An error's: one walk of the pieces finds the other declarer, which a count above
+            // 0 says is live, and is not `id`, which declares nothing yet.
+            let other = self.new.live_pieces().find(|it| it.wasm_names().contains(&name.0)).expect("a live declarer");
+            self.symbols.describe(other.sym)
+        };
+        let shown = |it: &blaze_codegen::wasm::Import| {
+            if agreed.ty == import.ty {
+                // alloc: error path
+                format!("`{}`.`{}`", it.module, it.field)
+            } else {
+                // alloc: error path
+                format!("`{}`.`{}` of type {:?}", it.module, it.field, it.ty)
+            }
+        };
+        // alloc: error path
+        let what = format!(
+            "`{}` is imported as {} by {other} and as {} by {by}: one name is one wasm import, so \
+             each module's import needs a name of its own",
+            self.symbols.str(name),
+            shown(agreed),
+            shown(import),
+        );
+        error(function, what)
     }
 
     /// A GOT cell's fixups: the core writes what it can; an import's cells are the loader's.

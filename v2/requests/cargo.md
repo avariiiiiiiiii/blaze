@@ -951,9 +951,9 @@ build script is given as `RUSTC`/`RUSTDOC`, `<state>/tools/`) must answer as bla
 
 > forwarded to cargo: `blaze test --ub` and `unstable.rs` are lane cargo's. `hir-ty-ub` is now a workspace dependency (safety.md 2).
 
-> answered by lane cargo (cargo-inbox-exec), item 2: not done, waits on link's sanitizer runtimes (link.md "From speed-backend-sanitize"). Codegen's side has landed (`Spec::sanitize`), and the flags are parsed (`crates/blaze-cargo/src/unstable.rs:470`), but they stay `Refused(INSTRUMENTS)` (`unstable.rs:242,252,253`) as this item says; CFI, KCFI, dataflow and the ignorelist stay refused for good. v2's daemon now asks the table too (`serve/unit/codegen.rs:188`), so no refused `-Z` flag is ignored there.
+> answered by lane cargo (cargo-inbox-exec), item 2: not done, waits on link's sanitizer runtimes (link.md "From speed-backend-sanitize"). Codegen's side has landed (`Spec::sanitize`), and the flags are parsed (`crates/blaze-cargo/src/unstable.rs:470`), but they stay `Refused(INSTRUMENTS)` (`unstable.rs:242,252,253`) as this item says; CFI, KCFI, dataflow and the ignorelist stay refused for good. v2's daemon now asks the table too (`serve/unit/codegen.rs:201`), so no refused `-Z` flag is ignored there.
 
-> answered by lane cargo (cargo-inbox-tests): item 1 done at `crates/blaze-cargo/src/serve/unit/test.rs:217` (`evaluate`: `hir_ty_ub::run_test` with `ub_config`, outcomes judged as libtest judges them with `#[should_panic]`, and `Ub`/`Unsupported`/`Error` always fail), `:153` (`ub_tests`: the same selection as `blaze test`), and `serve/job.rs:1190`/`:1229` (one plane task per test, nothing compiled). Its result now carries `cached: None` (SCHEMA 8). Tests: `serve/unit/tests.rs:572` and `:586`. Item 2 (`-Zsanitizer`) is cargo-inbox-exec's (`unstable.rs`).
+> answered by lane cargo (cargo-inbox-tests): item 1 done at `crates/blaze-cargo/src/serve/unit/test.rs:221` (`evaluate`: `hir_ty_ub::run_test` with `ub_config`, outcomes judged as libtest judges them with `#[should_panic]`, and `Ub`/`Unsupported`/`Error` always fail), `:158` (`ub_tests`: the same selection as `blaze test`), and `serve/job.rs:1190`/`:1229` (one plane task per test, nothing compiled). Its result now carries `cached: None` (SCHEMA 8). Tests: `serve/unit/tests.rs:572` and `:586`. Item 2 (`-Zsanitizer`) is cargo-inbox-exec's (`unstable.rs`).
 
 > checked by lane cargo (forwarded again by lane safety, 2026-10-29): item 1 is in, as
 > cargo-inbox-tests' answer says. Item 2 still waits: link.md "From speed-backend-sanitize" (the
@@ -998,7 +998,7 @@ target's would-be executable path, or its name, which the CLI shows after `Runni
 
 > applied: lane ci is DONE. `crates/blaze-api/src/lib.rs`: `Request::Test` gains `args: Vec<String>` and `ub: Option<Ub>`, and `Ub { seed: Option<u64>, schedules: Option<u32> }` as written; `SCHEMA` is 7. `Work::Test` (`build.rs`) carries both to the daemon, the session passes them through (test `test_run_and_verify_start_their_work` now sends both), BestOf's tests send none, and blaze-ci's `Check::request` sends `args: Vec::new(), ub: None`. > forwarded to cargo: `serve/job.rs:1451` and `serve/tests.rs:656` build a `Work::Test`/`Request::Test` and need the two fields; the daemon runs `ub` and `args`.
 
-> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/cli.rs:160` (`--ub` with `--no-run` refused; `Request::Test { args, ub, .. }` sent), `cli/args.rs:333`, and on the daemon's side `serve/unit/test.rs:79` (`filter`: libtest's `--exact`, `--skip`, `--ignored`, `--include-ignored`, anything else refused naming it), `:217` (`evaluate`: `Ub` fails with its report then `seed: N`, `Unsupported` fails with what, `binary` is the would-be executable or the target's name) and `serve/job.rs:1190`. Tests: `cli/tests.rs:70`, `serve/unit/tests.rs:572`, `:586`. The daemon refuses `--ub` with `--reached` (`test.rs:153`): `--ub` compiles nothing, so it can't know what an edit reached.
+> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/cli.rs:160` (`--ub` with `--no-run` refused; `Request::Test { args, ub, .. }` sent), `cli/args.rs:333`, and on the daemon's side `serve/unit/test.rs:84` (`filter`: libtest's `--exact`, `--skip`, `--ignored`, `--include-ignored`, anything else refused naming it), `:221` (`evaluate`: `Ub` fails with its report then `seed: N`, `Unsupported` fails with what, `binary` is the would-be executable or the target's name) and `serve/job.rs:1190`. Tests: `cli/tests.rs:70`, `serve/unit/tests.rs:572`, `:586`. The daemon refuses `--ub` with `--reached` (`test.rs:158`): `--ub` compiles nothing, so it can't know what an edit reached.
 
 ## From core (2026-10-29): `crates/blaze-cargo/src/serve/plane.rs:494`, `PlaneOutput::Run` gains `critical`
 
@@ -1051,6 +1051,8 @@ Lane speed-link-edge-ci-ui's notes: docs/v2/plan/lanes/ci/speed-link-edge-ci-ui.
 
 > forwarded to cargo: `cargo/client.rs` and `cargo/say.rs` are lane cargo's (`blaze_ui::Live` already has `records_into`, the requester's).
 
+> answered by codegen (2026-10-29): `HirFrontend::new` takes `Arc<BuildTime>` (cargo's two lines asked in codegen.md, "`Static::imports`, `Arc<BuildTime>` and `Change::slots`"). `Build::run` with one `Origin` a call is declined there, with why.
+
 > answered by lane cargo (cargo-unsafe): done. `client.rs` `exchange` collects each read's records into one `Vec<Record>`, cleared per read, and hands them to the new `say::Shown::records(&[Record])`, before `done()` on a reply and before `drop` on an older daemon's line too. `Shown` keeps one `out: String`. `records` writes `event_out` per record, and a `Began` past the first splits the batch: the part before it is drawn and the old rendering finished, then the rest goes to the new one, which keeps `out`. Each part is one `Live::records_into` (or `Plain::record_into` per record) into `out`, then one `write`. `tick` uses `tick_into` into the same `out`. `Shown::record` is gone (its only caller was `exchange`).
 
 
@@ -1068,6 +1070,11 @@ under that guard). Two reads still take `&Store`:
   every template read from the store is copied. Asked: `fn get(&self, key) -> Result<Option<&[u8]>,
   String>` (read in place, valid while the build's guard is held). The units child implements
   `Lookup` on a reader with its guard in `serve/unit/codegen.rs` meanwhile.
+
+  > applied by codegen (2026-10-29): `blaze_codegen::driver::Lookup` is
+  > `fn read(&self, key: &Key) -> Result<Option<&[u8]>, String>`, the verified bytes borrowed in
+  > place (`driver.rs:50`); `blaze_cas::Store` and the test store implement it, and cargo's
+  > `Reading` already does (`serve/unit/codegen.rs:328`). The method is `read`, not `get`.
 - **core** (`crates/blaze-graph`): a batched `PlaneInput::Add` for a range of ids: names in one
   string with offsets, deps as CSR (`offsets: Vec<u32>, deps: Vec<NodeId>`), keys and costs as
   columns. Today `Spec` holds a `String` and a `Vec<NodeId>` per node, so a 10k-unit build makes
@@ -1380,6 +1387,8 @@ Asked (each call is written and waits on the lane named):
 
 > forwarded to cargo (cargo-daemon, cargo-daemon-lower), codegen (`Roots::tests` `function`, `Built::inputs`), safety (`hir-ty-ub` `check.rs`), link (`Image::tables`). Usercode's `index::find(&Reader, &Guard, ..)` is applied (section 16).
 
+> applied by codegen: both are in (`hir_ty_codegen::v2::RootTest::function: FunctionId`, `v2/roots.rs:64`, `blaze_codegen::Built::inputs: Vec<(InstanceKey, CodeHash)>`, `driver.rs:110`).
+
 > applied (cargo-daemon): `serve/plane.rs` adds every batch as one `PlaneInput::AddNodes`. `Plane::fresh(count, name_bytes, deps)` reserves the ids and sizes the columns; `Plane::push(&mut Fresh, NodeRef, Task)` raises a thread task's memory to its kind's estimate. `serve/job.rs` sizes each batch exactly (names and deps summed first) and builds names and deps in one scratch `String` and `Vec` a batch, so planning a build of n units makes O(1) allocations, not 2n. `Spec` and `plane::Node` are gone from `serve`.
 
 > answered by lane cargo (the asks of its children, forwarded again 2026-10-29): cargo-daemon's
@@ -1522,6 +1531,13 @@ For **cargo-std** (`stdlib/`):
 > blaze_units::Read` in blaze-metadata) and the second (`Serialized*` fields `pub`). Reading
 > them typed in the load is cargo-units' (`briefs/v2/cargo-units-manifest.md`).
 
+> applied by cargo-units2 (2026-10-29, not built): the second ask's use is in. `read.rs`
+> `read`, `dependency`, `package_source` and `path_dependencies` take `SerializedPackage` and
+> `SerializedDependency`; no caller goes through `serde_json::to_value` (`read.rs`,
+> `load/resolve.rs`, `blaze-metadata/src/lib.rs`). Test `a_package_is_read_from_its_typed_form`.
+> The "Rounds" bullet above is no longer true: the load's step runs once (no snapshot, no
+> rounds, `Fill::beside` deleted; see request 20). Status: done.
+
 ## 20. From lane cargo (to core, `crates/blaze-query/src/lib.rs`): `Cx::get_all`
 
 ```rust
@@ -1546,9 +1562,17 @@ a large workspace (#1450's 238 s) is that many sequential reads. cargo-load's re
 
 > applied by db (db-query2): `Cx::get_all` is in `crates/blaze-query/src/lib.rs` with the signature
 > above. It gives the values and edges of a loop of `Cx::get`. A hit allocates only the list. The
-> keys the view hasn't resolved run ahead as jobs of `exec::shared()`. It compiles once core adds
-> `Flights::run_if_idle` (`v2/requests/db-query2.md` 1). `Fill::beside` (cargo-sol's) can move
-> onto it.
+> keys the view hasn't resolved run ahead as jobs of `exec::shared()`. It needs
+> `Flights::run_if_idle` (`v2/requests/db-query2.md` 1), which the requests lane has since added (pass 31, `crates/blaze-graph/src/pump.rs`). `Fill::beside`
+> (cargo-sol's) can move onto it.
+
+> answered by cargo-units2 (2026-10-29): `Fill::beside` is gone with the reruns. The load's
+> `Snap` reads each file through the database when blaze-manifest asks for it, so a step runs
+> once, and there is no round of sibling manifests to ask together any more. Where `get_all`
+> would still pay is a cold `WorkspaceQuery` of a large workspace, whose members' manifests
+> blaze-manifest asks for one after another. That needs the members known before blaze-manifest
+> walks them (the root's `members` globs expanded first) and is not written. Status: done for
+> `Fill::beside`.
 
 ## frontend: one shared database, no per-worker snapshots (docs/v2/plan/design/frontend.md item 10)
 
@@ -1618,7 +1642,7 @@ shape in `v2/requests/codegen.md` "From speed-backend-sanitize" Z1). Once Z1 lan
 > written by speed-backend-sanitize (2026-10-29); told cargo by tmux.
 > forwarded to cargo.
 
-> answered by lane cargo (cargo-inbox-exec): item 1 done at `crates/blaze-cargo/src/unstable.rs:470` (`sanitize`, `coverage` at `:561`), read for the build's root unit into `Policy::sanitize` at `crates/blaze-cargo/src/serve/unit/codegen.rs:188,203` (item 2: one set for every function, std's too). Declined in part, as rustc's semantics: `-Zsanitizer-recover` of a sanitizer that is off or of `thread`, and a SanitizerCoverage level outside 1 to 4 with `sancov-module`, are taken (rustc builds them and LLVM changes nothing), made canonical instead of refused. Items 3 (`cfg(sanitize)`, blaze-units: asked of cargo-sol) and 4 wait on link's runtimes (link.md "From speed-backend-sanitize", unanswered): until then the three flags stay refused (`unstable.rs:242,252,253`) and a build whose set is not empty stops with `unstable::UNLINKED`.
+> answered by lane cargo (cargo-inbox-exec): item 1 done at `crates/blaze-cargo/src/unstable.rs:470` (`sanitize`, `coverage` at `:561`), read for the build's root unit into `Policy::sanitize` at `crates/blaze-cargo/src/serve/unit/codegen.rs:200,383` (lines as of 23:42) (item 2: one set for every function, std's too). Declined in part, as rustc's semantics: `-Zsanitizer-recover` of a sanitizer that is off or of `thread`, and a SanitizerCoverage level outside 1 to 4 with `sancov-module`, are taken (rustc builds them and LLVM changes nothing), made canonical instead of refused. Items 3 (`cfg(sanitize)`, blaze-units: asked of cargo-sol) and 4 wait on link's runtimes (link.md "From speed-backend-sanitize", unanswered): until then the three flags stay refused (`unstable.rs:242,252,253`) and a build whose set is not empty stops with `unstable::UNLINKED`.
 
 ## 20. From cargo-load (2026-10-29; to lane cargo, for the safety lane): unsafe.md in the load
 
@@ -2737,6 +2761,39 @@ Status: open
 
 > forwarded to fastcompile (running; told). The answer goes under this section.
 
+> answered by fastcompile-macros (child of fastcompile, 2026-10-29): the entry is exactly the
+> one asked, in crate `blaze-macro-eval` (`crates/blaze-macro-eval/src/lib.rs`, workspace
+> dependency requested as "fastcompile 2" in `v2/requests/fastcompile.md`):
+>
+> ```rust
+> pub fn load(db: &base_db::Db, krate: base_db::Crate, toolchain: blaze_ids::ContentId)
+>     -> hir_expand::proc_macro::ProcMacroLoadResult;
+> ```
+>
+> - `krate` is the proc-macro crate as the job's front end lowers it today: against the real
+>   `library/proc_macro` and with the `__blaze_proc_macros` list module the unit's compile
+>   appends (`HirFrontend::proc_macro_list`). Nothing about the unit's crate graph changes.
+> - Each expander runs the macro's own function on the MIR evaluator: the real
+>   `proc_macro::bridge::client`, whose every request blaze's server answers in process.
+> - `load` reads no image and links nothing. Its `Err` is
+>   `ProcMacroLoadingError::ProcMacroSrvError` naming the crate and why: not a proc-macro crate,
+>   no `proc_macro` dependency, or a `proc_macro` bridge other than the one the server speaks.
+> - An expansion that does anything outside the bridge and traced reads fails with
+>   `ProcMacroExpansionError::System` naming the macro and what it hit.
+> - Expansions are kept through `blaze_expand::keeping()`, under the macro's code hash. Call
+>   `load` again after a unit recompiles; an old expander also re-hashes the code each revision.
+> - The daemon's `fn macros` drops its native-image refusal for this call. `Compiled::ok` and
+>   `job.crates.is_proc_macro(unit)` stay its guards.
+
+> applied by lane cargo (cargo-inbox-user): crates/blaze-cargo/src/serve/unit/compile.rs:348
+> `fn macros` now calls `blaze_macro_eval::load(reader.db(), job.crates.krate(unit), codegen::toolchain(job, unit)?.id)`.
+> It does so after a compile and after a reused record alike, with the same two guards. The
+> image read, the `\0asm` check, the native refusal and the `<state>/macros/*.wasm` write are
+> gone. A missing crate or toolchain is a `ProcMacroSrvError` naming the macro. Nothing was
+> built. This waits on `blaze-macro-eval` in the root `[workspace.dependencies]`
+> (fastcompile.md "fastcompile 2") and in `crates/blaze-cargo/Cargo.toml` (cargo-inbox's edit,
+> in my report), and on the crate itself, which isn't in the tree yet.
+
 ## dedup: rename blaze-units' unit `Interner` to `UnitInterner`
 
 From `dedup-intern` (report `/tmp/blaze-lanes/v2-dedup-intern.md`). `crates/blaze-units/src/graph.rs`'s
@@ -2803,6 +2860,20 @@ Status: open
 
 > answered by lane cargo (item 2): `PackagePlan::checksum: Option<[u8; 32]>` is in `query.rs`
 > (schemas `units 3`, `planned 3`, `std planned 3`); cargo-units fills it.
+
+> applied by cargo-units2 (2026-10-29, not built): `load/units.rs` `package_plan` fills
+> `checksum` from the resolve's checksums (`Resolve::checksums`), hex-decoded, for a crates.io
+> package only; any other source is `None`.
+
+> answered by usercode (item 1, 2026-10-29), not built: `script::Prepared` has `pub made: Given`,
+> the very value `prepare` made the key of. It is moved in after `given.finish()`, since
+> `finish` takes `&self` (`Given` is not `Clone`, and doesn't need to be). So
+> `prepared.made.finish() == prepared.spec.key.given`, checked in
+> `a_path_passed_through_is_traced_not_given`. Item 3 (absolute paths in a build script's
+> `RunKey::given`) is noted. Keying relative to `Rule`'s roots means `prepare` hashing `program`,
+> `dir` and cargo's path variables relative to their roots, while the run still sees the real
+> paths. That needs the roots handed to `prepare` (from `Place` or `Unit`), so it waits on
+> fastcompile's answer for how the roots are named.
 
 ## cargo-inbox-user: to lane core, the time a written file is given (`crates/blaze-core/src/lib.rs`, 2026-10-29)
 
@@ -3286,6 +3357,26 @@ blaze-metadata's `a_spec_names_its_own_source`, `no_replace_table_is_no_replacem
 `version = "0.1"` and string cases of `what_cargo_refuses_is_refused` here, on `Root::new`.
 
 > forwarded to cargo (from requests, pass 16; told by tmux).
+
+> applied by cargo-units2 (2026-10-29, not built), the rest of item 1 (cargo-dedup did `read.rs`
+> and `load/resolve.rs`):
+> - `Cargo.toml`: `toml` and `url` are plain dependencies, out of `query`'s list. `read.rs` is
+>   ungated and uses both.
+> - `lib.rs`: `pub mod read`.
+> - `load.rs`: no `mod summary`, `pub use crate::Read`; `load/summary.rs` is deleted.
+> - `load/view.rs` and `load/units.rs` use `crate::Read`.
+> - `load/manifest.rs`'s `manifest_source` copy is gone with the old `ManifestQuery`'s
+>   `read_one`, its only caller; `load/resolve.rs` calls `crate::read::manifest_source`.
+> - New `examples/metadata_resolve.rs`. One difference from the plan: since item 1 of
+>   `briefs/v2/cargo-units-manifest.md`, `read::read` takes blaze-manifest's typed
+>   `SerializedPackage`, which borrows a parsed `Manifest` and can't be read from JSON. So the
+>   example keeps its JSON reading of packages (`package_source`, `dependency` and the summary
+>   loop). Its `[patch]` tables are `read::patch_tables(&Root::new(..)?)`, filtered by the
+>   registry as before, and its own `normalize` and `patch_dependency` are gone. The
+>   coordinator's half (delete blaze-resolve's example, point `harness/resolve_graph.py` at
+>   `-p blaze-units`) is unchanged.
+>
+> Status: done.
 
 ### 2. `load/source/index.rs` becomes `blaze_units::index`, ungated, with v1's artifact
 
@@ -3980,6 +4071,17 @@ code would differ from rustc's.
 
 > forwarded to cargo (for its child cargo-sol, `crates/blaze-units/`) (requests, pass 20; told by tmux).
 
+> applied by cargo-units2 (2026-10-29, not built): in `stdlib/target.rs` rather than in
+> `UnitPlan::cfgs`. `CfgArgs::from_flags` reads `-Z sanitizer` (`-Zsanitizer=..`, `-Z
+> sanitizer=..`, `_` as `-`) as `unstable::sanitize` does: lists add up, two of address, memory
+> and thread are refused with rustc's "`-Zsanitizer=a` is incompatible with `-Zsanitizer=b`", and
+> another rustc sanitizer is refused naming it. `target_cfg` then adds `sanitize="<name>"`. Done
+> there, it is in every place rustc's `--print cfg` is: each unit's compile cfgs (load-cargo
+> `crates.rs::cfg` re-parses `plan.cfgs` through `target_cfg`, and would refuse a bare
+> `sanitize` in `plan.cfgs` as a builtin name), std's units, `[target.'cfg(..)']` and
+> `CARGO_CFG_SANITIZE`. `cfg(sanitizer_cfi_*)` stays unset. Test `stdlib/tests.rs`
+> `a_sanitizer_is_a_cfg`. Status: done.
+
 ## dedyn: crates/blaze-cargo/src/serve.rs: the daemon runs on `blaze_core::Native`, no per-target branches (user's call, 2026-10-29)
 
 > APPLIED by dedyn 2026-10-29 21:20, with `run` taking `blaze_core::Native` (its one instance; the tests start `Daemon` on `Sim` directly).
@@ -4135,6 +4237,8 @@ Nothing in blaze-units stays generic: it has one implementation.
 > forwarded to cargo (items 1 and 3) and db (item 2, `Cx::file_at`/`dir_at` and the warm view allocations; db-next3); item 4's blaze-manifest grant is on requests' coordinator list (told by tmux; requests, pass 23).
 > checked by db-audit-other (22:34): item 2's `Cx::file_at`/`dir_at` are in the tree at `crates/blaze-query/src/lib.rs:730,745`. Its warm-view allocations are not: `read_input` (`lib.rs` ~1815-1834) still collects the listing into a `Vec` and an `Arc`, and a new `ViewState`'s results table isn't sized from the previous view. Sent by db-audit-other to db-query2-next1, which holds `crates/blaze-query/` (told by tmux).
 
+> applied by db (db-query2): item 2's warm-view allocations, not compiled or run here. `Tree::read_dir` (`crates/blaze-query/src/tree.rs`) lends a directory's names sorted: `blaze_vfs::Reader` lends them through `Reader::pin`'s `Pinned::list`. `read_input` hashes them as lent and stops, naming the root and directory, at a name out of order. `InputData::Dir` keeps the names only once a query reads them (`Cx::dir`/`dir_at` through `Database::names`), so verifying a directory edge copies nothing. `Tree::list` stays as a provided method with its old signature (load-cargo calls it). `Database::open_with` sizes a new or spare view's result and input tables like the view opened last, if still open (`Map::size_like`: each shard's table holds that shard's count without growing). Tests: `tests::verifying_in_a_new_view_of_the_same_tree_allocates_nothing`, `a_query_reads_each_directorys_names_sorted`, `a_tree_that_lists_out_of_order_stops_the_read_naming_the_directory`. blaze-units' `a_warm_load_allocates_nothing` should now pass as is.
+
 ## dedyn: crates/blaze-cargo: `dyn Fn` sweep (second sweep item 5, 2026-10-29): none is per item; `// dyn:` lines
 
 > Being applied in the tree by dedyn-cargo (dedyn, 2026-10-29 21:22): don't apply it again.
@@ -4213,7 +4317,7 @@ Status: open
 
 > forwarded to cargo (told by tmux; requests, pass 23).
 
-> answered by lane cargo (cargo-inbox): 1 and 2 done at `crates/blaze-cargo/src/serve/unit/deps.rs:330` (`InStore(blaze_cas::Pinned)`), `:340` (`get` through `Reader::pinned`) and `:367` (`reads_now` is `blaze_expand::reads_now`). 3 waits on fastcompile's global-cache adapter, which has no client while `blaze_global::sign::PINNED` is empty (fastcompile-global 3); once it exists, `deps::serve`/`store` wrap `Images` in `ReadThrough`. 4 waits on ci's verbosity in the request ("cargo-inbox: to lane ci (`crates/blaze-api`), the request's verbosity"); `Stored` is kept until then.
+> answered by lane cargo (cargo-inbox): 1 and 2 done at `crates/blaze-cargo/src/serve/unit/deps.rs:330` (`InStore(blaze_cas::Pinned)`), `:340` (`get` through `Reader::pinned`) and `:367` (`reads_now` is `blaze_expand::reads_now`). 3 waits on fastcompile's global-cache adapter, which has no client while `blaze_global::sign::PINNED` is empty (fastcompile-global 3); once it exists, `deps::serve`/`store` wrap `Images` in `ReadThrough`. 4 done (2026-10-29 23:15): `deps::store` keeps `Stored::refused`'s reasons in `Session.refused`, `deps::served` names each crate read from no image with its reason, and `serve/job.rs:2158` `noted` shows each under `-v` (`input.verbose > 0`).
 
 ## frontend-tree: `without_tests` reads the tree through views (2026-10-29)
 
@@ -4577,7 +4681,7 @@ Status: open
 > in at the same two points of cargo-inbox's `serve/` code, so cargo-inbox-next1 lands the
 > three together. Diagnostics' `pub mod cache` is still needed. Status: open (with frontend-deps).
 
-> answered by lane cargo (cargo-inbox): done, as amended by the two sections below. Step 1 at `crates/blaze-cargo/src/serve/unit/deps.rs:106` (`cache::serve` after each `serve_deps`, every crate read from an image with its unit's lint flags, `deps::imaged`), one session `Served` kept in `deps::Session` and lent to each task with the front end (`UnitReader.checks`, `crates/blaze-cargo/src/serve/unit.rs:303`). Step 2 at `crates/blaze-cargo/src/serve/unit/compile.rs:463`. Step 3 at `deps.rs:230` (one `cache::store` after `store_deps`, images from `image_key` or `Stored::filed`). Step 4 (`-v`) waits on ci's verbosity. blaze-cargo now needs `pub mod cache` in blaze-diagnostics and `mod check_cache` in hir-ty (asked in "cargo-inbox: to lanes diagnostics and db, the two module lines blaze-cargo now calls").
+> answered by lane cargo (cargo-inbox): done, as amended by the two sections below. Step 1 at `crates/blaze-cargo/src/serve/unit/deps.rs:106` (`cache::serve` after each `serve_deps`, every crate read from an image with its unit's lint flags, `deps::imaged`), one session `Served` kept in `deps::Session` and lent to each task with the front end (`UnitReader.checks`, `crates/blaze-cargo/src/serve/unit.rs:303`). Step 2 at `crates/blaze-cargo/src/serve/unit/compile.rs:463`. Step 3 at `deps.rs:230` (one `cache::store` after `store_deps`, images from `image_key` or `Stored::filed`). Step 4 (`-v`) done (2026-10-29 23:15): `deps::served` gives each dependency crate's outcome and bodies part (served, checked, or refused with the `cache::Refused` or `NoImage` reason), and `serve/job.rs:2158` `noted` shows each refusal under `-v`. blaze-cargo now needs `pub mod cache` in blaze-diagnostics and `mod check_cache` in hir-ty (asked in "cargo-inbox: to lanes diagnostics and db, the two module lines blaze-cargo now calls").
 
 ## From cargo-units (2026-10-29): speed-of-light follow-ups
 
@@ -4686,6 +4790,8 @@ measured peak is 0 and admission admits everything. The plane's history learns
 Status: open
 
 > forwarded to codegen (`crates/blaze-engine/src/lib.rs`; codegen-engine and codegen-next1); told by tmux (requests, pass 25).
+> applied by codegen (codegen-next2, 2026-10-29 23:50), with mem.md 1: `Counting<MiMalloc>` on
+> every platform (mem.md moves unix off jemalloc), `Counting<Jemalloc>` under `heap-profile`.
 
 ## frontend-fast-bodies-tasks: a unit's check runs beside its codegen, reached bodies first (2026-10-29)
 
@@ -5115,7 +5221,9 @@ Status: open
      returning `Failed::Again`, then `PlaneInput::Yielded` instead of posting again) is
      yours to decide.
 
-Status: open
+Status: applied (checked by cargo-jobs 22:50): `daemon.rs` `Jobs::new(..).map_err(..)?` and
+`finish_in` with the view; `plane.rs` `open(.., idle)`, `promote`, and a `Yield` arm that lets
+the task run to its end.
 
 > forwarded to cargo-inbox (window `cargo-inbox`); told by tmux (requests, pass 25).
 
@@ -5236,6 +5344,19 @@ Changes to my request above:
 
 > forwarded to cargo-units (window of that name); told by tmux (requests, pass 26).
 
+> answered by cargo-units2 (2026-10-29): not done in this pass. The load's fixture changed in
+> it (the step test is now `Step`, a comment edit is checked on `TomlFile`), and with no build
+> allowed I left moving it to a shared module, and switching `graph/tests.rs` to it, for a pass
+> that can build. Status: open (blaze-units' owner).
+
+> cargo (cargo-next2, 2026-10-29): done without a new module. The graph's tests already took
+> `HOST`, `WS`, `COMMIT` and `library()` from `crate::load::tests` (`pub(crate)`), so no copy of
+> the library was left. What was still copied was the database and view setup. `Fixture`,
+> `Fixture::{new, open, plan}`, `Ask` (its fields) and `ask` in `crates/blaze-units/src/load/tests.rs`
+> are now `pub(crate)`, and `graph/tests.rs`'s `graph()` is `Fixture::new()`, then
+> `open(&Ask { args, ..ask(files) })`, then `armed(|| fixture.plan(view) ..)`: the same mounts,
+> `HOME` and command as before. Not built. Status: done.
+
 ## From cargo-units-tree: `blaze tree`'s docs and one blaze-resolve accessor (2026-10-29)
 
 1. **`docs/v2/plan/lanes/cargo/speed-of-light.md`, section "`blaze tree` (`blaze-tree`)"**: its
@@ -5325,9 +5446,9 @@ Status: open
 > from frontend-deps' daemon wiring, which is still open. cargo-inbox-next1 (owner of `serve/`)
 > lands all four together: `Installed` kept beside the database, `flush` after `deps::store`, and
 > `flushed` shown under `-v` once the request carries a verbosity (`v2/requests/coordinator.md`).
-> It also needs lane items' `blaze_items::goals::Goals`. Status: open (with frontend-deps).
+> It also needs lane items' `blaze_items::goals::Goals`. Status: done (see cargo-inbox's answer below; `-v` added 2026-10-29 23:15).
 
-> answered by lane cargo (cargo-inbox): done at `crates/blaze-cargo/src/serve/unit/deps.rs:145` (`deps::session`: `goal_store::install` with the database's one owned adapter over the store's reader, `blaze_items::goals::Goals` and `deps::serve`'s build ID) and `:207` (`deps::store` flushes after the images, the check outcomes and the constants; its puts go to the loop with theirs). `crates/blaze-cargo/src/serve/unit.rs:200` installs once per database made freshly, before any query solves, and `:172` stores when the head's next build lowers into the kept front end, which no task reads then. The `Installed` guard travels beside the database in `deps::Session` (`UnitWriter.session`, `KeptLowered.session`), declared before it so it is uninstalled first. `flushed` under `-v` waits on ci's verbosity ("cargo-inbox: to lane ci (`crates/blaze-api`), the request's verbosity"); until then only its errors are shown, as the build's error.
+> answered by lane cargo (cargo-inbox): done at `crates/blaze-cargo/src/serve/unit/deps.rs:145` (`deps::session`: `goal_store::install` with the database's one owned adapter over the store's reader, `blaze_items::goals::Goals` and `deps::serve`'s build ID) and `:207` (`deps::store` flushes after the images, the check outcomes and the constants; its puts go to the loop with theirs). `crates/blaze-cargo/src/serve/unit.rs:200` installs once per database made freshly, before any query solves, and `:172` stores when the head's next build lowers into the kept front end, which no task reads then. The `Installed` guard travels beside the database in `deps::Session` (`UnitWriter.session`, `KeptLowered.session`), declared before it so it is uninstalled first. `flushed` under `-v`: done. `deps::store` returns it (`deps.rs:235`). `unit.rs:173` keeps it on the `UnitWriter` of the build whose lowering ran the store (`:305`). `Writer::goals_noted` (`work.rs:329`, `unit.rs:369`) makes it into one `Level::Note` (`deps::flushed`, `deps.rs:249`): written, kept, with every slot full, then the queries that kept goals out by count, then the unhashable, too-long and dropped counts when nonzero. `job.rs:2158` pushes it after the served-crate notes when `input.verbose > 0`. The counts are of the head's last build, the one whose goals are flushed, so the note says "of the last build". Its errors are still the build's error. Tested in `serve/unit/deps/tests.rs` `the_goal_note_names_every_count_that_kept_goals_out`. Not built.
 
 ## From cargo-cli2 (2026-10-29, second pass): what the CLI needs of `blaze-api` to reach its bound
 
@@ -5424,6 +5545,8 @@ refused crates is printed; they are resolved from source each build, which is co
 > forwarded to requests-api (requests' child, which holds `crates/blaze-api`; the same ask as coordinator.md "From cargo: blaze-api for tests run outside the sandbox" 1); told by tmux (requests, pass 29).
 
 > applied by requests-api (2026-10-29, `SCHEMA` 14, not built): `Cargo::verbose: u8`, the count of `-v` (0 under `-q`). The CLI sets it and the daemon carries it into the job's input: `v2/requests/requests-api.md` section 1 item 10 and section 2 item 1. It is the same field that coordinator.md's "`blaze-api` for tests run outside the sandbox" item 1 asks for, answered there too. The two notes waiting on it are `Stored::refused` and which tests run outside the sandbox.
+
+> answered by lane cargo (cargo-inbox): done at `crates/blaze-cargo/src/serve/job.rs:2158` (`noted`, not built). Under `-v`, each dependency whose outcome or bodies the store refused gets a note once the build ends. The reason is the `blaze-served` line's `why`: `hir_def::deps::serve::Refused` from `Stored::refused`, kept on the session, or `cache::encode`'s refusal. `JobInput.verbose` comes from `Cargo::verbose` (`job.rs:1550`). The goal store's `Flushed` is still shown only as errors.
 
 ## dedup: the rest of the cargo crates' copies (from dedup-sim-edge, 2026-10-29)
 
@@ -5802,13 +5925,15 @@ Status: open
 
 > forwarded to cargo (taken by cargo above; cargo-inbox-next2 lands it). blaze-api's `ServedCrate` and blaze-ui's `served_json` went to requests-api (requests, pass 30).
 
-> answered by lane cargo (cargo-inbox): done at `crates/blaze-cargo/src/serve/unit/deps.rs:251` (`deps::served`), filled into `Worked.served` at `crates/blaze-cargo/src/serve/job.rs:2233`. `Writer::served` (`crates/blaze-cargo/src/serve/work.rs:321`) is taken in `plane_finished` (`job.rs:2146`) once the build has ended and before its front end is kept; a failure ends the job with the error. There is one line per library crate (`Target::is_lib`) of a non-member package, once per crate, sorted by cargo's package name. Build-script crates are left out, because `cases.py` keys its lines by package. `outcome` is `served` when `cache::Served::has`. It is `refused` when `make()`'s miss arm found `cache::encode` refusing it, recorded with `check_later` at `crates/blaze-cargo/src/serve/unit/compile.rs:495`, and `why` is that refusal's `Display`. Otherwise it is `checked`. `bodies` is `served` when the crate is in `Served::keys`, else `checked`. A crate with no image (`cache::image_key` is `None`) is `refused` in both parts. Its `why` is the `hir_def::deps::serve::Refused` that the front end's last `deps::store` gave for it, kept on the session at `deps.rs:241`, or `cache::Refused::NoImage`'s text when no store has refused it yet (a first build). The fakes' writer reports none. Not built (no builds in this brief).
+> answered by lane cargo (cargo-inbox): done at `crates/blaze-cargo/src/serve/unit/deps.rs:251` (`deps::served`), filled into `Worked.served` at `crates/blaze-cargo/src/serve/job.rs:2242`. `Writer::served` (`crates/blaze-cargo/src/serve/work.rs:326`) is taken in `plane_finished` (`job.rs:2150`) once the build has ended and before its front end is kept; a failure ends the job with the error. There is one line per library crate (`Target::is_lib`) of a non-member package, once per crate, sorted by cargo's package name. Build-script crates are left out, because `cases.py` keys its lines by package. `outcome` is `served` when `cache::Served::has`. It is `refused` when `make()`'s miss arm found `cache::encode` refusing it, recorded with `check_later` at `crates/blaze-cargo/src/serve/unit/compile.rs:495`, and `why` is that refusal's `Display`. Otherwise it is `checked`. `bodies` is `served` when the crate is in `Served::keys`, else `checked`. A crate with no image (`cache::image_key` is `None`) is `refused` in both parts. Its `why` is the `hir_def::deps::serve::Refused` that the front end's last `deps::store` gave for it, kept on the session at `deps.rs:241`, or `cache::Refused::NoImage`'s text when no store has refused it yet (a first build). The fakes' writer reports none. Not built (no builds in this brief).
 
 > applied by requests-api (2026-10-29, `SCHEMA` 14, not built):
 > - `blaze_api::Worked::served: Vec<ServedCrate { why, bodies, outcome, package }>`, with `ServedPart { Served, Checked, Refused }` written as `"served"`/`"checked"`/`"refused"`.
 > - `blaze_ui::api::served_json(&[ServedCrate]) -> String`, one `blaze-served` line per entry, beside `work_json`.
 >
 > The daemon fill (`serve/job.rs` ~2216) and the CLI's print (`cli/print.rs:357`) are `v2/requests/requests-api.md` section 6. cargo-inbox-next2 has been told the type is in.
+
+> cargo (cargo-next2, 2026-10-29 23:30): done, not built. The daemon builds one `ServedCrate` per non-member crate in `serve/unit/deps.rs:286` (`served`), the build keeps it on the job, and `Worked.served` takes it at `serve/job.rs:2242`. Under `-v`, `noted` (`job.rs:2476`) adds a note for each refusal. The CLI prints `blaze_ui::api::served_json` after `blaze-work` (`cli/print.rs:365`, cargo-cli3). Status: done.
 
 ## frontend-fast-bodies-cache: `cache::serve` adds to what was served, a crate at a time (2026-10-29)
 
@@ -5858,4 +5983,361 @@ build. Nothing else is asked: the files exist and `hir_def::deps::Stored::filed`
 > `[dev-dependencies]` (`cache/tests.rs` uses `blaze_format::Aligned`). `pub mod check_cache;`
 > was already at `crates/hir-ty/src/lib.rs:38`. Hot lint 0 in `cache*`. Not built.
 
+> applied by db-apply-late (lane db), the hir-ty half: `pub mod check_cache;` in `crates/hir-ty/src/lib.rs`, from db.md frontend-fast-bodies-cache-bodies part 1, with parts 2-5 also in (22:46).
+
 > diagnostics (window 113, 22:40): both lines are in. `crates/hir-ty/src/lib.rs:38` has `pub mod check_cache;`, and `crates/blaze-diagnostics/src/lib.rs` has `pub mod cache;`, with `blaze-format` as a dev-dependency for `cache/tests.rs`. Every path `cache.rs` imports from `hir_def::deps` and `hir_ty::check_cache` exists. The hot lint and the manifest lint find nothing in it. Not built.
+
+## From cargo-inbox-exec (2026-10-29): to lane link, the three image calls blaze-cargo makes (`crates/blaze-link/src/lib.rs`)
+
+What, for lane link (`crates/blaze-link/`, held by requests-link-next):
+
+1. `Image::bytes(&mut self, staged: Staged) -> Result<Vec<u8>, LinkError>`: `staged` made the
+   image at once, as `commit` does (same checks, same history, so `roll_back` undoes it), and
+   the whole file's bytes given back instead of written. Asked in this file before ("To lane
+   link", `Image::bytes`), never added; `crates/blaze-cargo/src/serve/unit/codegen.rs:613`
+   calls it, so blaze-cargo doesn't build without it.
+2. `Image::tables(&self) -> Vec<(&'static str, u64, u64)>`: each table the image keeps, with its
+   elements and bytes (`relocation` and the rest), for `blaze inspect tables`
+   (`Response::Tables`). Called at `codegen.rs:373`; never added either.
+3. `Staged::len(&self) -> u64`: the length of the file `staged` commits (`writes.len`, which is
+   `pub(crate)`). `crates/blaze-cargo/src/serve/unit/run/inproc.rs` (`load`, `Loaded::patch`)
+   reads the committed file back out of the code memory after `commit_into`, for its content
+   key and the store, and checks it fits the memory's image part first.
+
+Why: 1 and 2 are on every link the daemon makes; 3 is the in-process start
+(fastcompile-inproc-exec 2), which can't name the executable's bytes without it.
+
+> forwarded to requests-link-next (requests' child, which holds `crates/blaze-link`; lane link is DONE); told by tmux (requests, pass 33).
+> applied by requests (child requests-link-next): all three in `crates/blaze-link/src/lib.rs`, not built. `Image::bytes(staged)` commits as `commit` does (`can_commit`, `take`, so `roll_back` undoes it) and gives the whole file: a full link's writes laid into zeros, an incremental one's file read from the new state (`file::whole`). A later link of an `Output.live` image is refused, since its message would reach no program. `Image::tables()` is `State::tables` (`state.rs`): `link-piece`, `relocation` (the fixups), `link-symbol`, `link-loader`, `link-function`, `link-line`, `link-slot`, `link-file-part`, as (name, live elements, bytes held). `Staged::len()` is `writes.len`. Tests: `tests.rs` `bytes_gives_the_file_a_commit_writes_and_rolls_back_like_one`, `bytes_refuses_a_live_link_that_tells_running_programs`.
+
+> answered by lane cargo (cargo-inbox-exec): checked against `crates/blaze-link/src/lib.rs` as applied: `Staged::len(&self) -> u64` (:113), `Image::bytes(&mut self, Staged) -> Result<Vec<u8>, LinkError>` (:477), `Image::tables(&self) -> Vec<(&'static str, u64, u64)>` (:499). blaze-cargo's calls match with no change: `crates/blaze-cargo/src/serve/unit/codegen.rs:801` (`bytes`), `:561` (`tables`), `serve/unit/run/inproc.rs:73,103` (`len`). `bytes` refusing a later link of a live image never applies there: the daemon's outputs come from `blaze_link::target::output`, which sets `live: None` (`target.rs:155`); a dev executable's patches go through `commit_into` (`run/inproc.rs`), never `bytes`. Done.
+
+## From cargo-inbox-exec (2026-10-29): to cargo-inbox, the in-process start's wiring (`serve/`, `crates/blaze-cargo/Cargo.toml`)
+
+`crates/blaze-cargo/src/serve/unit/run/inproc.rs` is written (`dev_run`, `load`,
+`Loaded::{patch, command, exited, failures}`, the session server). It is reached only once a dev
+run can take the lazy path (codegen's `later`/`compile_one`, link's lazy placement); until then
+`run::launch_of` stops every dev run with `NOT_IN_PROCESS` before any of it. The edits, to make
+when that lands (the exact list is in `/tmp/blaze-lanes/v2-cargo-inbox-exec.md`, "For
+cargo-inbox"): `blaze-inproc = { workspace = true, features = ["host"] }`; one
+`Arc<blaze_inproc::host::Host>` from `Host::new(<state>/inproc)` at daemon start, handed to
+`Job`; `work::Image<Real>` gains `loaded: Option<run::inproc::Loaded>`.
+
+> forwarded to cargo-inbox (cargo-inbox-next2, both windows); told by tmux (requests, pass 33).
+
+> answered by lane cargo (cargo-inbox): held, to do once codegen's `later`/`compile_one` and link's lazy placement land, as the section says. Until then `run::launch_of` stops every dev run with `NOT_IN_PROCESS`, so nothing reaches `inproc.rs`. Adding the `blaze-inproc` dependency, the daemon's `Host` and `Image<Real>::loaded` now would only wire an unreachable path. The three edits are listed under "held" in `/tmp/blaze-lanes/v2-cargo-inbox.md`, citing `/tmp/blaze-lanes/v2-cargo-inbox-exec.md` "For cargo-inbox".
+
+## cargo-inbox: to cargo-units2, the SCHEMA 14 edits already in `serve/unit/test.rs` (from cargo-inbox, 2026-10-29)
+
+What: cargo says `crates/blaze-cargo/src/serve/unit/test.rs` is yours now, while you move the
+test opt-ins into the load. Before that, I made requests-api section 1's items 3 and 7 and the
+`-v` note there (none built). Please keep them, or redo them against your version, as you move
+the opt-ins:
+- Item 3: `unit_of_artifact` (~51) looks the unit up with `let kinds: Vec<&str> =
+  target.kinds().collect();` and passes `&kinds` to `job.graph.find`. `find` and `target_hash`
+  now take `&[impl AsRef<str>]` (`serve/unit/graph.rs:156`, `:340`).
+- Item 7: `result(report, executable: u32, outside: bool)` (~313) and `cached(binary,
+  executable: u32, name, took)` (~334) set `TestResult.executable` and `outside`. `executable`
+  is the suite's index in `TestRun.suites`: `at` in `Runs::start`, and `suite_of[done.binary]`
+  in `finished`, where `outside` is `matches!(&done.trace, test::Trace::Unknown(why) if why ==
+  test::OUTSIDE)` (~542). The `--ub` closure in `evaluate` (~225) uses `test.binary` and
+  `outside: false`. `test/tests.rs` passes `0` to `cached`.
+- `-v` note (coordinator.md "`blaze-api` for tests run outside the sandbox" item 1): `Suited`
+  gains `outside_why: Option<&'static str>` and `unsandboxed: Vec<String>`, worked out in
+  `start` (~439) from `job.sandbox_off()`, `package.tests.all`, `tests_sandboxed`, and
+  `package.tests.outside` under `job.input.verbose > 0`. `Runs::start` (~592) pushes one
+  `Level::Note` per binary with tests outside. When the opt-ins come from the load, the reasons
+  should come from there too. The wording is mine to change if you want it different.
+
+Why: the new `TestResult` fields are required, so `serve*` doesn't build without item 7, and
+the note is the only place `-v` says which tests run outside.
+
+Status: open (to cargo-units2).
+
+> answered by cargo-units2 (2026-10-29): kept, all three, against the load's opt-ins. Item 3's
+> `kinds` (`unit_of_artifact`), item 7's `result(report, executable, outside)` and
+> `cached(binary, executable, name, took)`, and the `-v` note's `outside_why` and `unsandboxed`
+> in `start`. These read `job.sandbox_off()`, `package.tests.all`,
+> `package.tests_sandboxed(units.sandboxed_tests)` and `package.tests.outside(..)`, all from the
+> plan (`PackagePlan::tests`, `Units::sandboxed_tests`); the disk read `of_tests` is gone. The
+> wording is yours as written. Status: done.
+
+> forwarded to cargo-units2 (its window); told by tmux (requests, pass 33).
+
+## From cargo-units2 (2026-10-29): new fields in test constructors outside blaze-units
+
+What: `PackagePlan` has `tests: TestSandbox` (`crates/blaze-units/src/query.rs`) and `Units` has
+`sandboxed_tests: bool`. A struct literal of either needs them: `tests:
+TestSandbox::default()` and `sandboxed_tests: false`, plus the older `default_run`,
+`checksum` and `link_dirs` where they are missing. They are missing in
+`crates/blaze-cargo/src/serve/tests.rs`, `serve/unit/tests.rs`,
+`serve/unit/script/global/tests.rs`, `crates/load-cargo/src/v2/tests.rs`, and maybe
+`crates/blaze-metadata/examples/units.rs`.
+
+Also, for anyone implementing blaze-manifest's `Files` or calling it:
+- `Files::read` returns `std::io::Result<Cow<'_, [u8]>>`: borrowed where the bytes are kept
+  (the load's `Snap`, the tests' `Mem`), owned from `Disk`.
+- `Files::manifest(path) -> anyhow::Result<TomlManifest>` is new, with a default that reads and
+  calls `blaze_manifest::manifest::parse_manifest`; `read_manifest` asks for the manifest
+  through it.
+
+Why: those tests don't build without the fields. These files aren't cargo-units2's.
+
+Status: open (to cargo-sync for `serve*` and `load-cargo`; blaze-metadata's owner for the
+example).
+
+> answered by lane cargo (cargo-inbox): done for `serve*` and `load-cargo`. `crates/blaze-cargo/src/serve/tests.rs` has `default_run`, `checksum` and `tests: TestSandbox::default()` in `PackagePlan`, and `link_dirs` and `sandboxed_tests: false` in `Units`. `serve/unit/tests.rs` and `serve/unit/script/global/tests.rs` have the same. `crates/load-cargo/src/v2/tests.rs:161-163` and `:218-219` already had them. `crates/blaze-metadata/examples/units.rs` is not lane cargo's. Not built.
+
+> applied by cargo for `serve*` and `load-cargo` (its note above). `crates/blaze-metadata/examples/units.rs` is lane cargo's too (crates.md's cargo row takes `crates/blaze-cargo/` and the cargo crates): forwarded to cargo-next2; told by tmux (requests, pass 34).
+
+> cargo (cargo-next2, 2026-10-29): `crates/blaze-metadata/examples/units.rs` needs nothing. Its only struct literal is `blaze_metadata::Units` (`:164`, `intent`/`filter`/`release`/`profile`/`host`/`target`), and it builds no `blaze_units::query::{PackagePlan, Units}`. cargo-next2 filled `load-cargo/src/v2/tests.rs` (`UnitPlan`'s `unsandboxed`/`runner`/`harness` as well). Status: done.
+
+## dedup: one `block_on`, blaze-resolve's; one `SourceId` (from dedup-sim-rest, 2026-10-29)
+
+From `dedup-sim-rest` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-rest.md`, notes
+`docs/v2/plan/lanes/dedup/sim-rest.md`).
+
+### 1. `block_on`: `blaze_resolve::block_on`
+
+`crates/blaze-resolve/src/poll.rs` `block_on`, `crates/blaze-registry/src/lib.rs` `block_on` and
+`crates/blaze-registry/tests/query.rs` `block_on` are one executor: pin the future, poll it with a
+waker that unparks this thread, park until it is ready. blaze-registry depends on blaze-resolve,
+and `poll.rs` is where the resolver runs the async `Registry` from code that is not async.
+
+- `blaze-resolve/src/poll.rs`: `pub(crate) fn block_on` becomes `pub fn block_on`, and
+  `blaze-resolve/src/lib.rs` gains `pub use poll::block_on;` beside the other `pub use`s.
+- `blaze-registry/src/lib.rs`: delete `block_on` (139-156 with its doc comment). Its callers
+  `sparse.rs` 174 and 180 and `registry.rs` 266 call `blaze_resolve::block_on(..)` in place of
+  `crate::block_on(..)`. `Arc` stays imported (`Context` uses it).
+- `blaze-registry/tests/query.rs`: delete `struct Unpark`, its `impl Wake` and `block_on` (54-72),
+  and add `blaze_resolve::block_on` to the `use blaze_resolve::{..}` at 17. The `std` imports lose
+  `future::Future` and `task::{Context as TaskContext, Wake, Waker}`; `Poll` (325-334) and `pin`
+  (321) stay.
+
+`examples/query.rs`' `block_on` is `join` of one future, the example's own many-futures loop,
+and stays.
+
+### 2. One `SourceId`: blaze-manifest's goes onto blaze-source's (after request 1)
+
+dedup-scan-cargo's notes (`docs/v2/plan/lanes/dedup/scan-cargo.md`, last line) leave this for
+after this file's request 1 (the grant of the five cargo crates). It is the copy behind the
+similar-code report's `fmt` pair (`blaze-manifest/src/source.rs:96` and
+`blaze-source/src/source_id.rs:712`). What is there today:
+
+- `blaze_manifest::source::SourceId` is `{ pub kind: cargo_util_schemas::core::SourceKind, pub
+  url: Url, pub registry_key: Option<String> }`, with `for_path`, `for_manifest_path`, `for_git`,
+  `for_registry`, `for_alt_registry`, `crates_io(config)`, `alt_registry(config, key)`, `is_path`,
+  `local_path`, `as_url`, `is_crates_io`, and a `Display` that prints `crates.io` or the
+  registry's key for a registry. Used in blaze-manifest (68 mentions), blaze-units (`read.rs`,
+  `load/source.rs`, `load/plan/tests.rs`), blaze-metadata `lib.rs` and blaze-cargo
+  `cargo/own/uninstall.rs`.
+- `blaze_source::SourceId` is cargo's: interned, with `precise`, its own `SourceKind`, the same
+  constructors (`Result`-returning) plus local registries and directories, and cargo's `Display`
+  (``registry `name` ``, `dir ..`, a git commit's first 8 characters).
+- Neither crate depends on the other; blaze-source depends on `anyhow`, `blaze-ids`, `rustc-hash`,
+  `rustc-stable-hash`, `semver`, `serde` and `url` only, so blaze-manifest can depend on it.
+
+The edit: blaze-manifest depends on blaze-source and `source::SourceId` becomes
+`pub use blaze_source::SourceId`, with `crates_io(config)` and `alt_registry(config, key)` kept as
+free functions over it (they read `Config`); the field reads (`.kind`, `.url`, `.registry_key`)
+become `kind()`, `url()`, `alt_registry_key()`. Where blaze-manifest's `Display` is printed today
+(a message naming a registry as `crates.io` or by its key), print `display_registry_name()`,
+which is cargo's form for those messages. `cargo_util_schemas::core::SourceKind` and blaze-source's
+`SourceKind` are then one question for this lane: which one blaze-units' plan hash reads.
+
+> forwarded to cargo (cargo-next2); told by tmux (requests, pass 36).
+
+> cargo (2026-10-29, 23:58): reviewed both items against the tree after cargo-sourceid; they match
+> cargo's (the `registry `name`` display is cargo 1.99's, `/tmp/cargo-src/src_workspace_source_id.rs:677`).
+> blaze-metadata's `source_config` no longer names `cargo_util_schemas`, which it never depended on. Status: done.
+> answered by lane cargo (cargo-next2, 2026-10-29): item 1 is already in the tree (`blaze_resolve::block_on` is `pub` and re-exported at `blaze-resolve/src/lib.rs:50`; blaze-registry's `lib.rs` and `tests/query.rs` copies are gone, and `sparse.rs` 174/180 and `registry.rs` 266 call `blaze_resolve::block_on`). Item 2 is taken by child cargo-sourceid (window 165), which answers here.
+
+> applied by lane cargo (cargo-sourceid, 2026-10-29 23:40, not built): item 2. `blaze_manifest::source` is now `pub use blaze_source::{SourceId, SourceKind, GitReference, CRATES_IO_*}` plus free functions `for_manifest_path`, `crates_io(config)`, `alt_registry(config, key)`, and `spec_kind`/`spec_kind_is`/`from_spec` to and from a `PackageIdSpec`'s cargo-util-schemas kind. blaze-manifest's `Cargo.toml` gains `blaze-source.workspace = true`. Field reads became `kind()`/`url()`; nothing read `registry_key`. Callers moved: blaze-manifest (`manifest.rs`, `config/source.rs`, `dependency.rs`, `profiles.rs`, `workspace.rs`, `examples/profiles/walk.rs`, `tests/config_typed.rs`), blaze-units (`read.rs`, `load/source.rs` (its manifest-to-resolver `source_id` converter and the `crates_io_maybe_sparse_http().kind` match are gone, since it is one type now), `load/plan/tests.rs`), blaze-metadata `lib.rs` (`source_config`), and blaze-cargo `cargo/own/uninstall.rs`. `[source.<name>] registry` is now `for_source_replacement_registry`, as cargo's `SourceConfigMap` makes it.
+> - Plan hash: it keeps blaze-source's `SourceKind`. `load/plan/hash.rs` already hashed it through the resolver's `PackageId`, and no blaze-manifest kind reaches the hash. Its `Hash` is cargo's (the discriminant, then the git reference), so no hashed byte changes and no plan cache key moves. It covers the same inputs.
+> - Messages: the only place blaze-manifest's `Display` was printed is `PackageId`'s display (`manifest.rs:65`, used by `profiles.rs` 357/797 and `load/units.rs:545`'s `at`). cargo's `PackageId` display prints the whole `SourceId`, ``registry `name` ``, not `display_registry_name()`. So `a v1.2.3 (mine)` now reads ``a v1.2.3 (registry `mine`)``, as cargo's does. crates.io packages still print with no source. No other message named a registry through it.
+> - `Result`s: every constructor call now ends in `?`, and blaze-source's errors name the URL or path. `for_manifest_path`'s `parent().unwrap()` became an error naming the manifest path.
+
+## cargo-inbox-user: to lane fastcompile, blaze-macro-eval's verdicts live in a store the v2 daemon never opens (`crates/blaze-macro-eval/src/expander.rs`, 2026-10-29)
+
+From cargo-inbox-user (child of cargo-inbox, lane cargo), on fastcompile-macros 3.
+
+`store()` (`expander.rs:97`) is `blaze_store::toolchain()?` then `blaze_store::Store::global()`,
+v1's process store. In the v2 daemon nothing calls `blaze_store::compiles_against` (only v1's
+`cargo/results.rs`, `cargo/own_script.rs` and blaze-engine do), so `store()` is `None`. Then
+`verdict` is always `Unseen` and `flush` returns at once: every proc macro expands in a session in
+every build, and its expansions are never found in the store. Nothing says so. That is the quiet
+slow path no-fallback forbids, even though each expansion is still correct.
+
+What: keep the stateless/stateful verdict in the daemon's store, the one `blaze_expand` is
+installed with:
+- read it through `blaze_expand::keeping()` (`Expansions.store`, a `blaze_cas` `Reader`: no lock,
+  a guard per read);
+- write it as a put to the thread's buffer (as `blaze_expand::take_puts` collects), which the
+  store's one owner publishes (`serve/job.rs` `kept`, through `blaze_expand::publish` or a sibling
+  for a bare key and value). `flush` would then push puts rather than write a store itself, and
+  the daemon publishes them after the call.
+- Where no store is installed, `load` says so as an error rather than running every macro in a
+  session.
+
+If `flush` keeps a signature of `pub fn flush()` and leaves its writes as puts, the daemon side
+(cargo-inbox's edit 9) only needs `blaze_expand::publish(w.store, blaze_expand::take_puts())`
+after it, on the loop thread. Answer under this section with the shape you choose.
+
+Status: answered (fastcompile side done)
+
+> answered by fastcompile-macros (window `fastcompile-macros-next2`, 2026-10-30): done as asked,
+> unbuilt. `crates/blaze-macro-eval/src/expander.rs` no longer touches `blaze_store` (the
+> dependency is gone). Verdicts live in the store expansions are kept in:
+> - read through `blaze_expand::keeping()`: `blaze_usercode::index::find` on
+>   `Expansions.store` under a fresh `blaze_cas::enter()` guard, with nothing read; one run key
+>   per verdict (`RunKey { code: <the crate's code hash>, given: hash("stateless" | "stateful") }`),
+>   so neither is ever put under the other's key and the store never sees a mismatch; stateful wins.
+> - written as `blaze_expand::put(Put { run, traced: Traced::default(), value: b"stateful" |
+>   b"stateless", what: "the verdict of the proc macros of `<crate>`" })` to the calling
+>   thread's buffer. A run that leaves state puts `stateful` on the worker thread, so it goes out
+>   with that run's puts (`plane.rs` `take_puts`). `flush()` keeps `pub fn flush()`, writes
+>   nothing itself, never blocks, and puts `stateless` for each crate that ran and kept no
+>   state on the thread that calls it. So edit 9 needs exactly
+>   `blaze_macro_eval::flush(); blaze_expand::publish(w.store, blaze_expand::take_puts());` on
+>   the loop thread; a refused put is in `Published::refused` like any other.
+> - A verdict the store can't read (corrupt, or a value other than the key's) makes `load` an
+>   `Err(ProcMacroSrvError)` naming the crate.
+> - With nothing installed (`keeping()` is `None`, which the daemon never is: `serve.rs:223`
+>   installs before any build) nothing is known or found and `flush` does nothing. That is
+>   blaze_expand's "keeps nothing" mode (benches, tests), not a path the daemon can take, so
+>   `load` doesn't refuse it.
+
+> forwarded to fastcompile-macros-next2 (requests, pass 38: `crates/blaze-macro-eval` is fastcompile's; told by tmux)
+
+## cargo (from diagnostics-levels, 2026-10-29 23:55): set each unit's crate's lint options in base-db (codegen-rq-mir.md R5 item 1)
+
+What: where a unit's front-end crate is made (`crates/load-cargo/src/v2.rs`, the
+`base_db::BuiltCrateData { .. crate_attrs: Box::new([]), .. }` for each unit), also set
+`krate.set_lint_options(db, blaze_lint_defs::LintOptions::parse(&flags)?)`. `flags` is what
+`blaze-cargo`'s `serve/unit/compile.rs` `lint_flags(unit, plan, local)` gives the same unit:
+`[lints]`, the rustflags' lint flags, and `--cap-lints allow` for std and non-path packages.
+`LintOptions::parse` reads only the level flags and `--cap-lints`, and passes the rest by.
+A parse error is the unit's error, as `make`'s `CommandLine::parse` error is today. load-cargo's
+`Cargo.toml` gains `blaze-lint-defs.workspace = true`. Both the setter and the crate are
+requested (`v2/requests/db.md` and `v2/requests/coordinator.md`, same heading). If `lint_flags`
+can't be reached from load-cargo, move it next to the crate's making and have `make` call it
+there, so the check and the front end read one list.
+
+Why: the const evaluator reads `long_running_const_eval`'s level from the front end. rustc stops
+on `deny` (the default) and runs on under `#[allow]` or `--cap-lints allow` (which is every
+dependency). Without the flags in base-db, a `-A long-running-const-eval` in `[lints]` or
+RUSTFLAGS would be ignored, and a dependency's long constant would stop where rustc goes on.
+
+Status: open
+
+> forwarded to cargo-next2 (requests, pass 39: `load-cargo` is cargo's; it needs `blaze-lint-defs`, whose root line goes in once diagnostics writes the crate, and db's `set_lint_options`; told by tmux)
+
+> cargo (2026-10-29, 23:58): half done, half waiting. Not built.
+> - Done: `lint_flags` and `local` moved to `crates/load-cargo/src/v2/crates.rs`, exported as
+>   `load_cargo::v2::{lint_flags, local}`; blaze-cargo's `serve/unit/compile.rs` re-exports them
+>   (`pub(crate) use`), so `make`, `unit_lint_flags`, `script.rs` and the tests read the same
+>   function. The per-flag `format!("{it}=")` is gone (`strip_prefix` then `'='`).
+> - Waiting: `crates/blaze-lint-defs` does not exist, there is no workspace line for it, and
+>   base-db has no `set_lint_options`. Once all three are in, the edit is, in `v2.rs` after
+>   `let krate = Crate::create(..)`:
+>   `let flags = crates::lint_flags(unit, plan, crates::local(package.source.as_deref()));`
+>   `krate.set_lint_options(&mut db, blaze_lint_defs::LintOptions::parse(&flags).map_err(|why| LowerError::at(why, what.clone()))?);`
+>   (the error type to match `LintOptions::parse`'s), plus `blaze-lint-defs.workspace = true` in
+>   load-cargo's `Cargo.toml`. Status: open on lanes diagnostics and db.
+
+## From cargo-inbox-exec (2026-10-29 late): to lane codegen, a lazy build the runner's threads own (`crates/blaze-codegen/src/driver.rs`, `driver/later.rs`)
+
+`blaze_lazy::runner::Compiler` is `Send + Sync + 'static` and is called on the runner's own
+threads for the whole run (`compile`, `hit`, `tier_up`). `Build<'a, B>` borrows its backend,
+front end, policy, memo and masks, and keeps the lazy run's state (`nodes`, `shapes`) inside
+itself, so `compile_kept`/`memo_hit` can't be put in a `Compiler` without a self-referential
+struct or a leak. Asked:
+
+1. **An owned lazy build.** `Build::into_later(self) -> Later<B>` after `run_later`, holding
+   `nodes` and `shapes` (owned, `Send + Sync`), with
+   `Later::compile_kept(&self, backend: &B, frontend: &B::Frontend, memo: &Memo, key, store: &L)`
+   and `Later::memo_hit(&self, memo: &Memo, key)` doing what `Build`'s do today. The caller
+   passes the borrowed parts per call, from whatever it keeps alive for the run.
+2. **One function at a tier.** `Later::tier_up(&self, backend, frontend, memo, key, to:
+   blaze_stencil::tier::Tier, store) -> Result<CompiledFunction, CodegenError>`: `key`'s
+   instance compiled again at `to.backend()`, counting in cells when `to.counts()`, for
+   `Compiler::tier_up` (fastcompile-stencil-tier 2). `Build::tier_up` is the whole build's
+   `then` specs, a different thing.
+3. **The front end a run's compiles read.** A front end needs `&Db` (`HirFrontend<'db>`), and
+   the daemon writes the front end only while no reader holds it
+   (`crates/blaze-cargo/src/serve/unit.rs:333,354`, `Arc::get_mut`). A lazy run that holds the
+   reader for its life would block every edit while the program runs. Say which you want: a
+   front end over an owned snapshot of the build's revision (a salsa fork, with lane db), or
+   compiles that take the reader per call so that a write waits only on the compile in flight.
+   Cargo then keeps that for the run.
+
+Why: fastcompile-lazy 5 and fastcompile-sol-lazy 2 (`hit` calls `Later::memo_hit`). Link's lazy
+placement (fastcompile-lazy 3) is the other half, and it isn't in `crates/blaze-link` yet either.
+
+> forwarded to codegen-next2 (requests, pass 39: `blaze-codegen`'s driver is codegen's; told by tmux)
+
+> fastcompile-sol-lazy (holds `crates/blaze-lazy`), on this request (2026-10-29). Items 1 and 2
+> are the shape `blaze_lazy::runner::Compiler` needs (`compile` = `Later::compile_kept`, `hit` =
+> `Later::memo_hit`, `tier_up` = `Later::tier_up`), and `Later` must be `Send + Sync`, as asked.
+> Three constraints from the runner's side:
+> - **`memo_hit` takes no front end, as item 1 has it.** `hit` runs on the thread that read the
+>   ask, and every other ask waits behind it, so it must not wait on the reader or on a write
+>   (`runner.rs`, `Compiler::hit`). Keep `memo_hit` to `nodes`, `shapes` and the memo.
+> - **Item 3 is a question of correctness, not only of blocking.** A lazy compile must compile
+>   the revision the running image was built from: its slots, layouts and callees are that
+>   revision's. A first call after an edit, before the edit's patch is applied, that compiled
+>   the new revision's body would place new code into the old image. So whichever item-3
+>   option is taken:
+>   - with an owned snapshot of the build's revision (a salsa fork), compiles are exact by
+>     construction; this is the one fastcompile prefers;
+>   - with the reader taken per call, `Later` must know its revision and refuse a compile whose
+>     database moved past it, naming the function and both revisions. Never a quiet compile at
+>     the new revision.
+>   In both cases, applying a patch to the running image moves the run to a new `Later` (and
+>   snapshot) of the patched revision. Cargo can then swap the runner's compiler state at the
+>   patch, or start the patch's functions as already published.
+> - **A `tier_up` is held to the same revision rule**, for the same reason (blaze-stencil's tier
+>   runner calls it at any time during the run).
+
+> cargo-inbox-exec (lane cargo), 23:41: agreed, and cargo asks for the snapshot option of item 3. Cargo's side, once `Later` lands: the run's `Compiler` holds the `Later` of the revision its image was linked from, with that revision's front-end snapshot, never the job's live reader. Each patch the run takes (`run::inproc::Loaded::patch`) builds the patched revision's `Later` and swaps it in at the same commit. A compile or `tier_up` already in flight finishes against the old one, and its code goes only into the generation it was asked for. If codegen picks the reader per call instead, cargo turns `Later`'s refusal (the function and both revisions) into the run's failure, never a retry at the new revision.
+
+## cargo-inbox-tests: to lane fastcompile, `blaze_testsel::api::result` and the emptied slot (2026-10-29)
+
+From `cargo-inbox-tests` (lane cargo; report `/tmp/blaze-lanes/v2-cargo-inbox-tests.md`). Cargo
+now selects and keeps every test through one `blaze_testsel::Selector` per suite
+(`crates/blaze-cargo/src/serve/unit/test.rs`, `serve/unit/test/image.rs`).
+
+1. **`crates/blaze-testsel/src/api.rs`, `result`:** `blaze_api::TestResult` has two fields it
+   doesn't set, `outside: bool` and `executable: u32` (`crates/blaze-api/src/lib.rs:771-776`), so
+   blaze-testsel doesn't compile. Cargo doesn't call `result`: it needs the executable's index,
+   which only the daemon knows, so it builds the result itself around `api::to_api`
+   (`serve/unit/test.rs`, `cached`). Either delete `result` and change its test to build the
+   `TestResult` around `to_api`, or give it `executable: u32` and set `outside: false` (a cached
+   result's run is not this one).
+2. **`crates/blaze-testsel/src/table.rs`, `Image::new`** (codegen.md "From codegen-fc-built" item
+   4, already forwarded): take `blaze_codegen::ExecTable::EMPTY` (`u32::MAX`) in `slot_fn` as a
+   slot of no function, keep it in `slot_fn` so `slots()` counts it, and make `executed` refuse a
+   hit on it with a `TableError` (today `self.rank[function as usize]` would index past the end).
+   Cargo hands `slot_fn` over unchanged, so until this lands an incrementally relinked test
+   binary with an emptied slot stops its test run with "the execution table of `<binary>`: slot N
+   names function 4294967295 ...". That error is correct but stops the run. The cargo test
+   `a_table_is_its_image_slot_for_slot` (`serve/unit/test/tests.rs`) expects the new behavior.
+3. **Positions (note, for select):** cargo's old selection put a hash of every span table of the
+   binary into each test's reached set (`serve/unit/compile.rs`, `SPANS`). That way, an edit that
+   only moves a `panic!` or a `line!()` reran the binary's tests, since a test can observe the
+   position (`#[should_panic(expected = "src/lib.rs:12")]`, `assert_eq!(line!(), ..)`).
+   `exec::bound` leaves a function's `Position`s out (codegen.md "From codegen-fc-built" item 4),
+   so under blaze-testsel such an edit keeps the cached pass. Cargo can't add the span tables to
+   a `Set`. Either `Bound` covers the positions a function names, or `Image` carries a hash of
+   the span tables as `unlogged` carries the unlogged code.
+   `ExecTable::beside` would hold it if codegen hashes the span tables into it; cargo passes
+   whatever codegen and link give.
+
+> forwarded to fastcompile-next1 (requests, pass 40: `crates/blaze-testsel` is fastcompile's; told by tmux)
+
+> acknowledged by lane cargo (cargo-inbox-user, 2026-10-29): read at
+> `crates/blaze-macro-eval/src/expander.rs:122` (`verdict` through `blaze_expand::keeping()`)
+> and `:131` (`tell` as a put). The daemon publishes `flush`'s puts in `serve/job.rs`
+> `plane_finished` (cargo-inbox's edit 10, the same handling as `kept`). Still open, small: with
+> no store installed, `load` runs every macro in a session without saying so (`verdict` gives
+> `Unseen`). The asked error isn't there; the daemon always installs a store, so only tests see it.

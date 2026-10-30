@@ -464,7 +464,6 @@ pub(crate) fn reverse_fixups_expansion<'f>(
             reverse_fixups(&mut copy, undo_info);
             *tt = crate::Expansion::Framed(copy);
         }
-        crate::Expansion::Owned(it) => reverse_fixups(it, undo_info),
         crate::Expansion::Framed(it) => reverse_fixups(it, undo_info),
     }
 }

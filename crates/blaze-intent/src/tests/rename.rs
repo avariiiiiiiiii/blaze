@@ -4,10 +4,11 @@
 
 use std::collections::BTreeMap;
 
-use base_db::{FileId, FileText};
+use base_db::{EditionedFileId, FileId, FileText};
 use blaze_api::{Edit, EditedItem, How, Target};
 use blaze_items::{ItemKey, key::Resolved};
-use syntax::Edition;
+use blaze_vfs::Op;
+use syntax::{Edition, NodeOrToken, SourceFile, SyntaxKind};
 use test_fixture::WithFixture;
 
 use super::{applied, assert_fresh, db::TestDB, roots};
@@ -96,13 +97,41 @@ fn check(edits: &[Edit], after: &BTreeMap<String, String>) -> (TestDB, Applied) 
     assert_eq!(&applied(&before, &made.edited.ops), after);
     let (edited, written) = roots(&before, &made.edited.ops, after);
     assert_eq!(edited, written, "the edit's root is the text edits'");
-    for seed in &made.seeds {
+    let mut edited_files: Vec<&str> = made
+        .edited
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Edit { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
+    edited_files.sort_unstable();
+    edited_files.dedup();
+    assert_eq!(made.seeds().count(), edited_files.len(), "a seed for each file edited, none with errors");
+    for seed in made.seeds() {
         let (path, text) = after
             .iter()
             .find(|(_, text)| FileText::content_of(text, None) == seed.content)
             .expect("a seed is of an edited file's new text");
+        assert_eq!(view.path(seed.file), Some(path.as_str()), "a seed names its own file");
         assert_eq!(seed.edition, Edition::CURRENT, "{path}");
         assert_fresh(&seed.parse, text);
+    }
+    // The commit, in a front end of the same files (`db` stays the view as it was, which the
+    // items' keys are of): the new texts set, then each seed handed over, and the file's next
+    // parse is the seed's own tree.
+    let (mut next, files) = self::view(GRAPH, &PATHS);
+    let seeds: Vec<_> = made.seeds().collect();
+    for seed in &seeds {
+        let path = view.path(seed.file).expect("a seed names a file of the view");
+        assert_eq!(files.path(seed.file), Some(path), "the same file in the next front end");
+        next.set_file_text(seed.file, &after[path]);
+    }
+    for seed in &seeds {
+        let id = EditionedFileId::new(&next, seed.file, seed.edition);
+        assert!(id.seed_parse(&next, seed.content, &seed.parse), "the front end takes the seed");
+        assert!(std::ptr::eq(id.parse(&next).root().file(), seed.parse.root().file()), "no parse of its own");
     }
     (db, made)
 }
@@ -258,4 +287,37 @@ fn total(s: &S) -> u32 { s.area() }
     let text = after.get_mut("lib.rs").unwrap();
     *text = text.replace("area", "size");
     assert_eq!(applied(&texts(&files), &made.edited.ops), after);
+}
+
+/// The identifier tokens of the name, in order, as a walk of every token of a full parse
+/// finds them.
+fn walked(text: &str, name: &str) -> Vec<u32> {
+    let parse = SourceFile::parse(text, Edition::CURRENT);
+    parse
+        .root()
+        .descendants_with_tokens()
+        .filter_map(|it| match it {
+            NodeOrToken::Token(token) => Some(token),
+            NodeOrToken::Node(_) => None,
+        })
+        .filter(|it| it.kind() == SyntaxKind::IDENT && it.text().strip_prefix("r#").unwrap_or(it.text()) == name)
+        .map(|it| u32::from(it.text_range().start()))
+        .collect()
+}
+
+#[test]
+fn the_names_matches_reach_every_identifier_of_it_and_nothing_else() {
+    let text = "fn area() {} // area\nfn r#area() { areas(); \"area\"; x.area; let _ = area_of; }\n\
+                mod m { fn f() { m::area() } }\n";
+    let finder = memchr::memmem::Finder::new(b"area");
+    for parse in [SourceFile::parse(text, Edition::CURRENT), SourceFile::parse_outline(text, Edition::CURRENT)] {
+        let root = parse.root();
+        let found: Vec<u32> = finder
+            .find_iter(text.as_bytes())
+            .filter_map(|at| crate::rename::ident_at(root, at, 4))
+            .map(|it| u32::from(it.text_range().start()))
+            .collect();
+        assert_eq!(found, walked(text, "area"));
+        assert_eq!(found.len(), 4, "the fn, the raw fn, the field and the path; no comment, string or longer name");
+    }
 }

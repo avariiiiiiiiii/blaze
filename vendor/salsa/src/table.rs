@@ -18,10 +18,10 @@ use crate::{Id, IngredientIndex, Revision};
 
 pub(crate) mod memo;
 
-const PAGE_LEN_BITS: usize = 7;
+pub(crate) const PAGE_LEN_BITS: usize = 7;
 const PAGE_LEN_MASK: usize = PAGE_LEN - 1;
 const PAGE_LEN: usize = 1 << PAGE_LEN_BITS;
-const MAX_PAGES: usize = Id::MAX_USIZE / PAGE_LEN;
+pub(crate) const MAX_PAGES: usize = Id::MAX_USIZE / PAGE_LEN;
 
 /// A typed [`Page`] view.
 pub(crate) struct PageView<'p, T: Slot>(&'p Page, PhantomData<&'p T>);
@@ -228,7 +228,7 @@ pub struct PageIndex(usize);
 
 impl PageIndex {
     #[inline]
-    fn new(idx: usize) -> Self {
+    pub(crate) fn new(idx: usize) -> Self {
         debug_assert!(idx < MAX_PAGES);
         Self(idx)
     }
@@ -247,6 +247,9 @@ impl SlotIndex {
     fn new(idx: usize) -> Self {
         debug_assert!(idx < PAGE_LEN);
         Self(idx)
+    }
+    pub(crate) fn as_usize(&self) -> usize {
+        self.0
     }
 }
 
@@ -318,6 +321,12 @@ impl Table {
     /// Returns the number of pages that have been allocated.
     pub fn page_count(&self) -> usize {
         self.pages.len()
+    }
+
+    /// The ingredient whose slots page `page` holds, or `None` for a placeholder page.
+    pub(crate) fn page_owner(&self, page: usize) -> Option<IngredientIndex> {
+        let page = self.page_at(page);
+        (page.slot_type_id != TypeId::of::<DummySlot>()).then_some(page.ingredient)
     }
 
     #[cfg(feature = "salsa_unstable")]

@@ -217,3 +217,10 @@ the session guards it itself (`session.rs` `handle` refuses an even generation; 
 `a_report_or_finish_after_the_finish_is_dropped` sends one).
 
 > forwarded to mem (`crates/blaze-mem/`; mem-next1 told by tmux; requests, pass 23).
+
+> done by mem (2026-10-29): fixed in `crates/blaze-mem/src/handle.rs`. `get`, `get_mut`, `remove`
+> and `contains` go through `Entry::holds`, which needs the generations equal and the entry's
+> odd (occupied), so a forged even generation or generation 0 finds nothing. Test:
+> `slab_refuses_a_made_up_even_generation`. Same report as mem-core-macos and mem-core-linux.
+
+

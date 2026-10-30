@@ -12,6 +12,7 @@ pub fn to_api(cached: &Cached) -> blaze_api::Cached {
     blaze_api::Cached {
         basis: match &cached.basis {
             Basis::Executed => blaze_api::Basis::Executed,
+            // clone: the message owns its reason, once per cached result sent
             Basis::Reached { why } => blaze_api::Basis::Reached { why: why.clone() },
         },
         millis: cached.took.as_millis().min(u128::from(u64::MAX)) as u64,
@@ -24,12 +25,14 @@ pub fn to_api(cached: &Cached) -> blaze_api::Cached {
 /// other is kept.
 pub fn of_api(cached: &blaze_api::Cached) -> Result<Cached, String> {
     if cached.outcome != TestOutcome::Passed {
+        // alloc: error path
         return Err(format!("a cached test result is a pass, not {:?}", cached.outcome));
     }
     Ok(Cached {
         took: Duration::from_millis(cached.millis),
         basis: match &cached.basis {
             blaze_api::Basis::Executed => Basis::Executed,
+            // clone: the result owns its reason, once per cached result read
             blaze_api::Basis::Reached { why } => Basis::Reached { why: why.clone() },
         },
     })
@@ -38,10 +41,13 @@ pub fn of_api(cached: &blaze_api::Cached) -> Result<Cached, String> {
 /// The result of a test not run: it took nothing now, and its run that stands is `cached`.
 pub fn result(binary: &str, name: &str, cached: &Cached) -> TestResult {
     TestResult {
+        // alloc: the message owns its names, once per result sent
         name: name.to_owned(),
+        // alloc: the message owns its names, once per result sent
         binary: binary.to_owned(),
         cached: Some(to_api(cached)),
         millis: 0,
+        // alloc: empty, allocates nothing
         output: Vec::new(),
         outcome: TestOutcome::Unreached,
     }

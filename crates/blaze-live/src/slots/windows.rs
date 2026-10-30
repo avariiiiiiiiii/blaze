@@ -131,6 +131,13 @@ pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
     Ok((at, readable(&(at..end), module as u64)?))
 }
 
+/// Checks that `range` is committed, readable memory of the module that has `near` (the
+/// descriptor's address).
+pub(super) fn in_image_of(range: &Range<u64>, near: u64) -> Result<(), String> {
+    let module = module_of(near as *const c_void)?;
+    readable(range, module as u64).map(|_| ())
+}
+
 /// The image's bytes at `range`, checked to be committed, readable and of the image at
 /// `base`.
 fn readable(range: &Range<u64>, base: u64) -> Result<&'static [u8], String> {
@@ -327,9 +334,10 @@ impl Memory for Os {
         readable(range, self.base)
     }
 
-    fn loaders(&self, at: u64, slots: u64) -> &[u64] {
+    fn loaders(&self, at: u64, slots: u64) -> &[AtomicU64] {
         // SAFETY: `Switch::new` checked `at..at + slots * 8` is in the image and `at` 8-aligned
-        // before the first call; nothing writes it (the switch refuses data over it).
+        // before the first call; it is the image's writable data (the linker's `Class::Table`),
+        // which only `publish`'s atomic stores write (the switch refuses data over it).
         unsafe { image::words(at, slots as usize) }
     }
 

@@ -43,6 +43,7 @@ use crate::{
         ModuleOrigin, ModuleScope, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot,
         diagnostics::DefDiagnostic,
         path_resolution::{PathRead, ReachedFixedPoint, ResolvePathResult},
+        trait_items::trait_item_per_ns,
         uses,
     },
     per_ns::{Item, PerNs},
@@ -883,14 +884,21 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                         ));
                         self.update_held(module_id, start, vis, Some(ImportOrExternCrate::Glob(glob)));
                     }
-                    Some(ModuleDefId::TraitId(_)) => {
-                        // FIXME: Implement this correctly
-                        // We can't actually call `trait_items`, the reason being that if macro calls
-                        // occur, they will call back into the def map which we might be computing right
-                        // now resulting in a cycle.
-                        // To properly implement this, trait item collection needs to be done in def map
-                        // collection...
-                        self.update(module_id, &[], vis, Some(ImportOrExternCrate::Glob(glob)));
+                    Some(ModuleDefId::TraitId(it)) => {
+                        // glob import from trait => its associated items, as rustc's traits are
+                        // modules to `use`. None where it cannot list them, which the end of
+                        // collection reports.
+                        let start = self.held.len();
+                        let held = &mut self.held;
+                        let listed = self.def_map.for_each_trait_item_for_import(
+                            self.db,
+                            it,
+                            |name, item| held.push((Some(name), trait_item_per_ns(item, vis))),
+                        );
+                        if listed.is_err() {
+                            self.held.truncate(start);
+                        }
+                        self.update_held(module_id, start, vis, Some(ImportOrExternCrate::Glob(glob)));
                     }
                     Some(d) => {
                         tracing::debug!("glob import from non-module/enum {:?}", d);

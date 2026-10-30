@@ -234,6 +234,7 @@ mod tests {
             refs: 0,
             externs: Vec::new(),
             coverage: None,
+            profile: None,
         }
     }
 
@@ -372,6 +373,7 @@ mod model {
             refs: 0,
             externs: Vec::new(),
             coverage: None,
+            profile: None,
         }
     }
 

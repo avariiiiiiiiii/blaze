@@ -191,7 +191,7 @@ fn span<'a>(
         })
     });
     DiagnosticSpan {
-        file_name: name,
+        file_name: super::shown(name),
         byte_start: lo,
         byte_end,
         line_start,

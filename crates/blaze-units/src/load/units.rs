@@ -11,7 +11,7 @@ use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::{Profiles, requested_profile};
 use blaze_manifest::targets::TargetKind;
 use blaze_manifest::{Context, Workspace};
-use blaze_query::{Cancelled, Cx};
+use blaze_query::Cancelled;
 use blaze_resolve::resolver::{CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, PackageTargets};
 use blaze_resolve::{Cfg, InternedString, PackageId, Platform};
 use cargo_util_schemas::manifest::{TomlProfile, TomlProfiles};
@@ -21,7 +21,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::files::Snap;
 use super::manifest::WorkspaceRead;
 use super::resolve::Resolved;
-use crate::read::Read;
+use crate::Read;
 use super::{ForeignAsk, Spec, Staged, load_error};
 use super::sandbox::PackageOptOut;
 use crate::query::{LoadError, LockWrite, PackagePlan, StdGraph, StdKey, StdPlanned, StdUnits, TestSandbox, UnitPlan};
@@ -51,9 +51,8 @@ pub(crate) struct Built {
 
 /// The units of `resolved`, as `spec` asks for them.
 pub(crate) fn units(
-    cx: &mut Cx<'_>,
-    ctx: &Context<Snap>,
-    ws: &Workspace<'_, Snap>,
+    ctx: &Context<Snap<'_, '_>>,
+    ws: &Workspace<'_, Snap<'_, '_>>,
     spec: &Spec,
     read: &WorkspaceRead,
     resolved: Resolved<'_>,
@@ -233,7 +232,7 @@ pub(crate) fn units(
                     Ok(it) => it,
                     Err(error) => return Ok(Staged::Failed(error)),
                 };
-                let std = match cx.get::<StdUnits>(&key)?.get() {
+                let std = match ctx.files().with_cx(|cx| cx.get::<StdUnits>(&key).map(|it| it.get()))? {
                     StdPlanned::Ready(std) => std,
                     StdPlanned::Failed(error) => return Ok(Staged::Failed(error)),
                 };

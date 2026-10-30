@@ -76,7 +76,12 @@ writes one buffer:
    [stencil-patch.md](stencil-patch.md) has the patcher's passes in their exact order.
 7. **Finish.** It writes trap stubs (one per trap code used), then the function's constants
    (`vconst`, shuffle masks, 16-byte aligned, reached PC-relatively). Label fixups are
-   resolved and the unwind rows closed, and the result is returned as `Code`.
+   resolved and the unwind rows closed, and the result is returned as `Code`: the bytes and
+   their alignment, the relocations, the unwind information, the call sites and their
+   handlers, the line and trap tables, where each stack slot is (`slots`), and `frame`, the
+   bytes from the frame pointer down to the stack pointer in the body (Cranelift's
+   `frame_to_fp_offset`, `Glue::frame_size`). A stencil frame is fixed, so `frame` is one
+   number per function: the stack pointer a landing pad is resumed with is `fp - frame`.
 
 The compile allocates nothing from the global allocator. It runs as one blaze-mem task
 (`blaze_mem::frame::task(Tag::Codegen, ..)`, [memory.md](../../design/memory.md)): every column,
@@ -98,8 +103,8 @@ A shape (`shape::Shape`, 4 bytes packed in `Shape::key`) names one stencil:
   builder makes. `f16` and `f128` have only moves, loads, stores, `select` and `bitcast`.
   Their arithmetic is calls already.
 - `aux`: what else changes the code. That is the condition code of `icmp`/`fcmp`/`brif`
-  fusions, the `AtomicRmwOp`, the lane of `extractlane`/`insertlane`, or the source type of an
-  extension, reduction or conversion.
+  fusions, the `AtomicRmwOp`, the lane of `extractlane`/`insertlane`, the source type of an
+  extension, reduction or conversion, or the access and offset form of a confined access.
 - `srcs`: where each operand comes from: a slot, the accumulator, or an immediate (32 bits,
   sign-extended to the type).
 - `dst`: where the result goes: a slot, the accumulator, or both.
@@ -107,7 +112,17 @@ A shape (`shape::Shape`, 4 bytes packed in `Shape::key`) names one stencil:
 Fusions are shapes of their own. `icmp`/`icmp_imm` followed by the `brif` that is its only use
 is one `BrIcmp` stencil, which compares and branches with no `setcc` and no slot. `select` of
 an `icmp` is one `SelectIcmp`. These two cover the loop conditions and the `min`/`max` idioms
-of MIR.
+of MIR. A load or store (any type and extension, and `atomic_load`/`atomic_store`) at offset 0
+of the compiled macro tier's confined address,
+`iadd vmctx, uextend.i64 (ireduce.i32 (iadd p, iconst off))`, each inner value used once, is
+one `LoadConfined` or `StoreConfined` stencil
+([macros-tier.md](macros-tier.md), "Cost per access"): x86-64
+`mov eax, [r12+p]; lea eax, [rax+off]; mov r, [rbase+rax]`, AArch64
+`ldr w, [x20, #p]; add w, w, #off; ldr x, [xb, w, uxtw]`. Its `aux` names the plain access
+(`Shape::confined`) and how `off`, wrapped to 32 bits, is added: not at all when it is 0,
+AArch64's `add #:lo12:` for 1 to 4095, or a 32-bit `Offset` hole. Its fault is the access's,
+with the access's trap code. Without the pattern, or without the fused shape in the library,
+each instruction is its own stencil, so code without it is unchanged.
 
 **The accumulator** keeps a result in a register when its only use is the next instruction,
 or in a register and its slot when it has other uses too. This is top-of-stack caching (Xu and
@@ -125,7 +140,8 @@ naming the opcode and type, never a compile by Cranelift. `tests/coverage.rs` ho
 to every (opcode, type) Cranelift's x64 and AArch64 lowerings accept, so the error is
 unreachable for any IR Cranelift compiles.
 
-Count: about 7,000 stencils per architecture variant, 200 to 300 KB of code and tables per
+Count: 7,000 to 8,000 stencils per architecture variant (7,408 on x86-64 and 7,782 on AArch64,
+of which the confined accesses are 508 and 762), 200 to 300 KB of code and tables per
 variant.
 
 ## Holes

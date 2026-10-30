@@ -26,14 +26,11 @@ use hir_def::{
     resolver::ValueNs,
     src::HasSource,
 };
-use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr};
+use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr_view};
 use hir_ty::{ParamEnvAndCrate, next_solver::Ty};
 use intern::Symbol;
 use rustc_hash::FxHashMap;
-use syntax::{
-    AstNode,
-    ast::{self, HasAttrs},
-};
+use syntax::view::{self as ast, AstNode, HasAttrs};
 
 use super::util;
 use crate::{lints::bodies::BodyCx, model::Span};
@@ -55,7 +52,7 @@ pub(super) fn source_callsite(span: Span) -> Span {
 pub(super) fn type_info<'db>(b: &BodyCx<'_, 'db>, expr: ExprId) -> Option<hir::TypeInfo<'db>> {
     let node = util::syntax(b, expr)?;
     let expr = ast::Expr::cast(node.value)?;
-    b.cx.sema.type_of_expr(&expr)
+    b.cx.vsema.type_of_expr(expr)
 }
 
 /// rustc's printing of the type `expr` was inferred as (`expr_ty`).
@@ -68,9 +65,9 @@ pub(super) fn ty_text(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<String> {
 /// rustc's `find_attr!` of it.
 pub(super) fn has_attr(db: &Db, def: FunctionId, name: &str) -> bool {
     let krate = def.krate(db);
-    let attrs = def.lookup(db).source(db).value.attrs();
+    let attrs = def.lookup(db).source_view(db).value.attrs();
     let cfg = krate.cfg_options(db);
-    expand_cfg_attr(attrs, || cfg, |meta, _| match meta {
+    expand_cfg_attr_view(attrs, || cfg, |meta, _| match meta {
         ast::Meta::PathMeta(attr) if attr.path().is1(name) => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     })
@@ -227,7 +224,7 @@ pub(super) fn callee_fn(b: &BodyCx<'_, '_>, callee: ExprId) -> Option<FunctionId
 
 /// rustc's `def_span` of a function: its signature, as rustc shows it.
 pub(super) fn fn_def_span(b: &BodyCx<'_, '_>, def: FunctionId) -> Span {
-    let source = def.lookup(b.db()).source(b.db());
-    let range = crate::cx::signature_range(&source.value);
+    let source = def.lookup(b.db()).source_view(b.db());
+    let range = crate::cx::signature_range_view(source.value);
     b.cx.span(InFile::new(source.file_id, range))
 }

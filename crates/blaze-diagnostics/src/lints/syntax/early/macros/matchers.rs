@@ -22,7 +22,10 @@ mod tokens;
 
 use hir::{HirFileId, InFile};
 use span::{Edition, SyntaxContext};
-use syntax::{AstNode, SyntaxNode, SyntaxNodePtr, TextRange, TextSize, ast};
+use syntax::{
+    SyntaxNodePtr, TextRange, TextSize,
+    view::{self as ast, AstNode as _},
+};
 
 use self::{
     check::{Checker, Misuse},
@@ -45,7 +48,7 @@ pub(super) fn crate_at(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Option<InFile<Syntax
         .root_module(cx.db)
         .as_source_file_id(cx.db)
         .and_then(|it| walk.tree(HirFileId::from(it)))
-        .map(|it| it.ptr(&it.root))
+        .map(|it| it.ptr(it.root))
 }
 
 const META_VARIABLE_MISUSE: LintId = LintId::named("meta_variable_misuse");
@@ -62,8 +65,8 @@ const LINTS: LintSet = LintSet::of(&[META_VARIABLE_MISUSE, INCOMPATIBLE_OR_PATTE
 pub(super) fn definition(
     cx: &Cx<'_, '_>,
     krate: Option<InFile<SyntaxNodePtr>>,
-    tree: &Tree,
-    node: &SyntaxNode,
+    tree: &Tree<'_>,
+    node: ast::Node<'_>,
     out: &mut Vec<Emitted>,
 ) {
     if !cx.any_may_fire(&LINTS) {
@@ -74,8 +77,7 @@ pub(super) fn definition(
         cx.lint_may_fire(INCOMPATIBLE_OR_PATTERNS),
         cx.lint_may_fire(EXPR_FRAGMENT_SPECIFIER),
     );
-    // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
-    let Some(def) = ast::Macro::cast(node.clone()) else { return };
+    let Some(def) = ast::Macro::cast(node) else { return };
     let at = tree.ptr(node);
     let map = tree.file.macro_file().map(|call| call.expansion_span_map(cx.db));
     let root = SyntaxContext::root(tree.file.edition(cx.db));
@@ -83,8 +85,8 @@ pub(super) fn definition(
         let ctx = map.map_or(root, |it| it.span_at(offset).ctx);
         (ctx.edition(cx.db), ctx.is_root())
     };
-    let Some(tokens) = Tokens::of(&def, &span) else { return };
-    let (macro_rules, keyword) = match &def {
+    let Some(tokens) = Tokens::of(def, &span) else { return };
+    let (macro_rules, keyword) = match def {
         ast::Macro::MacroRules(it) => (true, it.macro_rules_token()),
         ast::Macro::MacroDef(it) => (false, it.macro_token()),
     };
@@ -148,7 +150,7 @@ pub(super) fn definition(
     }
 }
 
-fn misuse_diag(cx: &Cx<'_, '_>, tree: &Tree, tokens: &Tokens, misuse: &Misuse) -> Diag {
+fn misuse_diag(cx: &Cx<'_, '_>, tree: &Tree<'_>, tokens: &Tokens<'_>, misuse: &Misuse) -> Diag {
     let span = |range: TextRange| cx.span(InFile::new(tree.file, range));
     match *misuse {
         Misuse::Duplicate { span: at, prev } => {
@@ -185,7 +187,7 @@ fn misuse_diag(cx: &Cx<'_, '_>, tree: &Tree, tokens: &Tokens, misuse: &Misuse) -
 
 /// An identifier as rustc's `Ident` displays it: with `r#` when its name is reserved in its
 /// span's edition and can be raw (`is_raw_guess`).
-fn printed(tokens: &Tokens, ident: Token) -> String {
+fn printed(tokens: &Tokens<'_>, ident: Token) -> String {
     let name = tokens.name(ident.range);
     let reserved = match name {
         "as" | "break" | "const" | "continue" | "else" | "enum" | "extern" | "false" | "fn" | "for" | "if"

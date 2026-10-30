@@ -7,7 +7,7 @@
 
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
-use blaze_api::{ApiError, Artifact, Response};
+use blaze_api::{ApiError, Artifact, ArtifactKind, Response, TargetKind};
 use blaze_cas::Store;
 use blaze_codegen::plan::{Mode as BuildMode, Policy};
 use blaze_core::{Command, Completion, Done, Effect, Sandbox, Tag};
@@ -18,6 +18,7 @@ use rustc_hash::FxHashMap;
 use super::{Job, Real, UnitWriter, codegen, package_of};
 use crate::serve::work::Runs;
 
+pub(crate) mod inproc;
 #[cfg(test)]
 mod tests;
 
@@ -33,8 +34,8 @@ pub(crate) enum Launch {
 pub(crate) const NOT_IN_PROCESS: &str = "blaze runs a dev profile's process on its code memory, \
     compiled lazily and tiered (docs/v2/plan/lanes/fastcompile/inproc.md, lazy.md), and this \
     blaze can't yet: its code generator has no lazy build (`Build::run` with `later`, \
-    `Build::compile_one`) or tiered mode, its linker has no lazy placement, and its daemon does not yet link a dev executable \
-    for the overlay (`Output::dev_run`) and commit it into code memory (`Image::commit_into`)";
+    `Build::compile_one`) or tiered mode (`Mode::Tiered`, `Backend::Stencil`), and its linker has \
+    no lazy placement";
 
 /// How the process of unit `unit` starts; `runner` says it runs under a
 /// `target.<triple>.runner`. What a `run` and a test binary both start through.
@@ -97,7 +98,7 @@ pub(crate) fn process_env(job: &[(String, String)], artifact: &Artifact, os: &st
 fn runnable(artifact: &Artifact) -> bool {
     !artifact.profile.test
         && artifact.executable.is_some()
-        && (artifact.kind == "bin" || artifact.target.kind.iter().any(|it| it == "example"))
+        && (artifact.kind == ArtifactKind::Bin || artifact.target.kind == TargetKind::Example)
 }
 
 /// The program cargo runs of `built`: `bin` when given, else the `default-run` of the package
@@ -169,9 +170,10 @@ pub(crate) fn start(
     let chosen = choose(built, bin, default_run).map_err(|what| ApiError::new(what, None))?;
     let program = chosen.executable.clone().unwrap_or_else(|| chosen.path.clone());
     let target = &chosen.target;
+    let kinds: Vec<&str> = target.kinds().collect(); // alloc: once per run, a word or two
     let at = job
         .graph
-        .find(&units.graph.units, &chosen.package, &target.name, &target.kind, Mode::Build)
+        .find(&units.graph.units, &chosen.package, &target.name, &kinds, Mode::Build)
         .ok_or_else(|| ApiError::new(format!("no unit of `{}` is in the build", target.name), None))? as usize;
     let unit = &units.graph.units[at];
     let package = package_of(units, unit)?;

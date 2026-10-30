@@ -92,6 +92,8 @@ impl SectionId {
     pub const SYMBOLS: SectionId = SectionId(0x0200);
     /// The plane's history: what tasks of each kind held (`blaze-graph`).
     pub const PLANE_HISTORY: SectionId = SectionId(0x0400);
+    /// salsa's interned values, at their IDs (`salsa::image`).
+    pub const SALSA_INTERNED: SectionId = SectionId(0x0500);
     /// The VFS's tree of nodes and names (`blaze-vfs`).
     pub const VFS_TREE: SectionId = SectionId::vfs(0);
     /// The VFS's file bytes.
@@ -122,6 +124,7 @@ impl SectionId {
             SectionId::DB_BLOB => "the database's values",
             SectionId::SYMBOLS => "the symbol table",
             SectionId::PLANE_HISTORY => "the plane's history",
+            SectionId::SALSA_INTERNED => "salsa's interned values",
             SectionId(id) if id & !0xff == SectionId::VFS => "the VFS tree",
             SectionId(id) if id & !0xffff == SectionId::INTERNED => "an interned table",
             _ => "a section this blaze does not know",

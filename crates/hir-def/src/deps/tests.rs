@@ -527,6 +527,9 @@ fn reads_read_back_and_damaged_ones_do_not_panic() {
         &["A", "B"],
         &[(b"one", ContentId([1; 32])), (b"two", ContentId([2; 32]))],
     );
+    let (env, shapes) = reads.names();
+    assert_eq!(env, [Box::<str>::from("A"), "B".into()]);
+    assert_eq!(shapes.collect::<Vec<_>>(), [b"one" as &[u8], b"two"]);
     let bytes = reads.encode();
     let back = Reads::decode(&bytes).unwrap();
     assert_eq!(back.encode(), bytes);
@@ -810,4 +813,29 @@ fn serving_a_crate_at_a_time_adds_to_what_was_served() {
     assert!(DepImages::try_get(raw).unwrap().images(raw).is_empty());
     assert!(frozen::FrozenDefMaps::try_get(raw).unwrap().maps(raw).is_empty());
     assert!(image_of(raw, core).is_none());
+}
+
+/// A key's inputs are those of the walk that made it: the crate, every crate its key covers
+/// once each, and their `OUT_DIR`s as their variables give them.
+#[test]
+fn key_inputs_are_what_the_key_was_made_from() {
+    let db = TestDB::with_files(
+        "//- /lib.rs crate:lib deps:mid,core new_source_root:library env:OUT_DIR=/out/lib\n\
+         pub use mid::M;\n\
+         //- /mid.rs crate:mid deps:core new_source_root:library\n\
+         pub use core::C as M;\n\
+         //- /core.rs crate:core new_source_root:library env:OUT_DIR=/out/core\n\
+         pub struct C;\n",
+    );
+    let (lib, mid) = (crate_named(&db, "lib"), crate_named(&db, "mid"));
+    let inputs = key_inputs(&db, &[lib], BUILD);
+    let keys = keys(&db, &[lib], BUILD);
+    assert_eq!(inputs.len(), keys.len());
+    for (krate, it) in &inputs {
+        assert_eq!((it.key, it.build, it.closure[0]), (keys[krate], BUILD, *krate));
+    }
+    assert_eq!(names(&db, &inputs[&lib].closure), ["core", "lib", "mid"]);
+    assert_eq!(inputs[&lib].closure.len(), 3, "core, a dependency of two, is in it once");
+    assert_eq!(inputs[&lib].out_dirs, ["/out/lib", "/out/core"]);
+    assert_eq!(inputs[&mid].out_dirs, ["/out/core"]);
 }

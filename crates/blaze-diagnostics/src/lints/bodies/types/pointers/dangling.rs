@@ -22,12 +22,12 @@ use hir_def::{
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
-use syntax::{AstNode, ast};
+use syntax::view::{self as ast, AstNode};
 
 use super::{Inits, has_attr, layout, peel_casts, span, ty_text};
 use crate::{
     lints::{
-        bodies::{BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set, types::util},
+        bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
         registry::LintId,
     },
     lower::{Found, Phase},
@@ -61,7 +61,7 @@ impl DanglingPointers {
 impl LatePass for DanglingPointers {
     const LINTS: LintSet = lint_set([TEMPORARIES, LOCALS]);
     const HOOKS: Hooks = Hooks::BODY;
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Closure]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Closure]);
 
     fn check_body(&mut self, b: &BodyCx<'_, '_>, out: &mut Vec<Found>) {
         let DefWithBodyId::FunctionId(function) = b.owner else { return };
@@ -166,7 +166,7 @@ fn temporary(b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
     }
     let Some(call) = util::syntax(b, expr) else { return };
     // clone: a node handle, a reference count, once the call is of a `#[rustc_as_ptr]` method on a temporary
-    let Some(name) = ast::MethodCallExpr::cast(call.value.clone()).and_then(|it| it.name_ref()) else { return };
+    let Some(name) = ast::MethodCallExpr::cast(call.value).and_then(|it| it.name_ref()) else { return };
     let ptr_span = b.cx.span(call.with_value(name.syntax().text_range()));
     let (Some(at), Some(temporary_span), Some(ty)) = (b.expr_node(expr), span(b, receiver), ty_text(b, receiver))
     else {
@@ -223,7 +223,8 @@ fn is_temporary_rvalue(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
         | Expr::Underscore
         | Expr::OffsetOf(_)
         | Expr::InlineAsm(_)
-        | Expr::IncludeBytes => false,
+        | Expr::IncludeBytes
+        | Expr::UnsafeBinderCast { .. } => false,
     }
 }
 
@@ -268,7 +269,7 @@ fn function_return(b: &BodyCx<'_, '_>, function: FunctionId) -> Option<FnRet> {
     let poly = db.callable_item_signature(CallableDefId::FunctionId(function)).instantiate_identity().skip_norm_wip();
     let output = interner.instantiate_bound_regions_with_erased(poly).output();
     pointee_not_1zst(b, output)?;
-    let source = function.lookup(db).source(db);
+    let source = function.lookup(db).source_view(db);
     let ret_ty_node = source.value.ret_type()?.ty()?;
     let ret_ty_span = b.cx.span(InFile::new(source.file_id, ret_ty_node.syntax().text_range()));
     let ret_ty = b.cx.ty(&hir::Function::from(function).ret_type(db));
@@ -294,7 +295,7 @@ fn closure_return(b: &BodyCx<'_, '_>, closure: ExprId) -> Option<FnRet> {
     pointee_not_1zst(b, output)?;
     let node = util::syntax(b, closure)?;
     // clone: a node handle, a reference count, once the closure returns a raw pointer
-    let ret_ty_node = ast::ClosureExpr::cast(node.value.clone())?.ret_type()?.ty()?;
+    let ret_ty_node = ast::ClosureExpr::cast(node.value)?.ret_type()?.ty()?;
     let ret_ty_span = b.cx.span(node.with_value(ret_ty_node.syntax().text_range()));
     Some(FnRet { ret_ty: b.cx.ty(&ret), ret_ty_span, fn_kind: "closure" })
 }

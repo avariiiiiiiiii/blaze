@@ -19,6 +19,7 @@ blaze-codegen.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 blaze-usercode.workspace = true
 memchr.workspace = true
 ring.workspace = true
@@ -27,6 +28,7 @@ rustls-native-certs.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 blaze-items.workspace = true
 
 [lints]

@@ -1615,7 +1615,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok(cell)
     }
 
-    fn set_errno(&mut self, code: i32) -> Result<'db, ()> {
+    /// Sets the running thread's `errno`, as a shim's failing call does.
+    pub fn set_errno(&mut self, code: i32) -> Result<'db, ()> {
         let cell = self.errno_cell()?;
         self.write_memory(cell, &code.to_le_bytes())
     }

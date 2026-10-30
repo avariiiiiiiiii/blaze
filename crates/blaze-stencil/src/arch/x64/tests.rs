@@ -33,6 +33,7 @@ use super::{
 };
 use crate::{
     Cpu, Error, Os, Target, TlsModel,
+    arch::{Area, Glue},
     buf::Buf,
     code::{self, Code, Handler, Name, Rule, Unwind},
     enc::Form,
@@ -104,6 +105,8 @@ struct Clif {
     relocs: Vec<code::Reloc>,
     insts: Vec<(u32, UnwindInst)>,
     unwind: Option<UnwindInfo>,
+    /// `frame_to_fp_offset` of its frame layout.
+    frame: u32,
 }
 
 fn cranelift(func: &ir::Function, target: &Target) -> Clif {
@@ -128,7 +131,8 @@ fn cranelift(func: &ir::Function, target: &Target) -> Clif {
         .collect();
     let insts = compiled.buffer.unwind_info.iter().cloned().collect();
     let unwind = compiled.create_unwind_info(&*isa).expect("unwind information");
-    Clif { bytes: compiled.code_buffer().to_vec(), relocs, insts, unwind }
+    let frame = compiled.buffer.frame_layout().expect("a frame layout").frame_to_fp_offset;
+    Clif { bytes: compiled.code_buffer().to_vec(), relocs, insts, unwind, frame }
 }
 
 // The mock library: each stencil a header, one field per hole and a tail jump, as the
@@ -655,6 +659,66 @@ fn landing_pads_store_the_payload() {
     let [Handler::Default { landing }] = code.handlers[..] else { panic!("{:?}", code.handlers) };
     // `mov [r12 + disp], rax`.
     assert_eq!(&code.bytes[landing as usize..landing as usize + 2], &[0x49, 0x89]);
+}
+
+/// The immediate of the `add rsp` before the last `mov rsp, rbp`, `pop rbp`, `ret` (0 when
+/// there is none): what the epilogue frees, the distance from `rbp` down to `rsp`.
+fn freed(bytes: &[u8]) -> u32 {
+    let end = bytes
+        .windows(5)
+        .rposition(|w| w == [0x48, 0x89, 0xec, 0x5d, 0xc3])
+        .expect("an epilogue");
+    if end >= 4 && bytes[end - 4..end - 1] == [0x48, 0x83, 0xc4] {
+        bytes[end - 1] as i8 as u32
+    } else if end >= 7 && bytes[end - 7..end - 4] == [0x48, 0x81, 0xc4] {
+        u32::from_le_bytes([bytes[end - 4], bytes[end - 3], bytes[end - 2], bytes[end - 1]])
+    } else {
+        0
+    }
+}
+
+/// A call with two of its eight arguments on the stack.
+fn stack_arguments() -> ir::Function {
+    build(sig(CallConv::SystemV, &[I64], &[]), |b, p| {
+        let callee = import(b, 0, sig(CallConv::SystemV, &[I64; 8], &[]), true);
+        b.ins().call(callee, &[p[0]; 8]);
+        b.ins().return_(&[]);
+    })
+}
+
+#[test]
+fn the_frame_is_cranelifts_frame_to_fp_offset() {
+    // Cranelift's `frame_to_fp_offset` (`fixed_frame_storage_size + clobber_size +
+    // outgoing_args_size`) is what its epilogue frees, with saves, spills and stack arguments.
+    for (func, target) in [
+        (leaf_with_slot(64), LINUX),
+        (leaf_with_slot(2000), LINUX),
+        (pressure(CallConv::SystemV), LINUX),
+        (pressure(CallConv::WindowsFastcall), WINDOWS),
+        (stack_arguments(), LINUX),
+    ] {
+        let clif = cranelift(&func, &target);
+        assert!(clif.frame > 0);
+        assert_eq!(freed(&clif.bytes), clif.frame, "{:?}", target.os);
+    }
+    // Ours is the same distance in our frame.
+    for (func, target) in [
+        (leaf_with_slot(64), LINUX),
+        (leaf_with_slot(2000), MACOS),
+        (stack_arguments(), LINUX),
+        (callers(CallConv::WindowsFastcall), WINDOWS),
+    ] {
+        let code = ours(&func, &target);
+        assert_eq!(freed(&code.bytes), code.frame, "{:?}", target.os);
+    }
+    let frame = |func: &ir::Function| {
+        X64::frame(func, &LINUX, Area { size: 1024, align: 16 })
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let leaf = frame(&leaf_with_slot(64));
+    let calls = frame(&stack_arguments());
+    assert_eq!(X64::frame_size(&leaf), leaf.clobber + leaf.fixed);
+    assert_eq!(X64::frame_size(&calls), X64::frame_size(&leaf) + 16);
 }
 
 #[test]

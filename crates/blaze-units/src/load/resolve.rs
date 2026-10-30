@@ -1,5 +1,5 @@
 //! The workspace resolved as cargo's `resolve_ws_with_opts` resolves it (blaze-metadata's
-//! `resolving_with`, every file read through the load's snapshot): the lock file read, each
+//! `resolving_with`, every file read through the load's [`Snap`]): the lock file read, each
 //! package it pins located where cargo keeps it ([`Sources::locate`], a fetch when it is not
 //! mounted), the whole workspace resolved guided by the lock file and the build's packages by
 //! that, the lock file as cargo would write it, and the packages the resolve picked that the
@@ -13,7 +13,7 @@ use blaze_manifest::files::Files;
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
 use blaze_manifest::metadata::export_package;
 use blaze_manifest::{Context, Workspace};
-use blaze_query::{Cancelled, Cx};
+use blaze_query::Cancelled;
 use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::resolver::{CliFeatures, HasDevUnits, Members, ResolveBehavior, VersionOrdering, members_with_features};
 use blaze_resolve::workspace_resolve::{PackageRegistry, resolve_ws};
@@ -23,7 +23,7 @@ use blaze_resolve::{
 };
 use rustc_hash::FxHashMap;
 
-use super::files::{Reads, Snap};
+use super::files::Snap;
 use super::source::{Index, Located, Sources};
 use super::{Select, Spec, Staged, load_error};
 use crate::query::{Fetch, LockWrite, LoadError};
@@ -56,16 +56,15 @@ pub(crate) struct Resolved<'a> {
     pub warnings: Vec<String>,
 }
 
-/// Resolves the workspace `ws` as `spec` asks and hands the result to `then`.
-pub(crate) fn resolved<'db, R>(
-    cx: &mut Cx<'db>,
-    ctx: &Context<Snap>,
-    ws: &Workspace<'_, Snap>,
-    files: &Snap,
-    reads: &Reads<'_>,
+/// Resolves the workspace `ws` as `spec` asks and hands the result to `then`. Every file is
+/// read through `ctx`'s [`Snap`], and every query asked through its `Cx`.
+pub(crate) fn resolved<'r, 'db, R>(
+    ctx: &Context<Snap<'r, 'db>>,
+    ws: &Workspace<'_, Snap<'r, 'db>>,
     spec: &Spec,
-    then: impl FnOnce(&mut Cx<'db>, Resolved<'_>) -> Result<Staged<R>, Cancelled>,
+    then: impl FnOnce(Resolved<'_>) -> Result<Staged<R>, Cancelled>,
 ) -> Result<Staged<R>, Cancelled> {
+    let files = *ctx.files();
     let at = Some(ws.root_manifest().display().to_string());
     let fail = |error: anyhow::Error| Staged::Failed(load_error(&error, at.clone()));
     let root = ws.root().to_owned();
@@ -78,7 +77,6 @@ pub(crate) fn resolved<'db, R>(
         Err(error) => return Ok(fail(error)),
     };
     let lock_path = root.join("Cargo.lock");
-    reads.file(cx, &lock_path)?;
     let lock_text = match files.read(&lock_path) {
         Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -103,7 +101,7 @@ pub(crate) fn resolved<'db, R>(
     // The packages the lock file pins, located and read.
     let mut owned: Vec<Package> = path_packages;
     if let Some(lock) = &lock {
-        match locate_all(cx, ctx, reads, &sources, &locked_ids(lock), lock.checksums())? {
+        match locate_all(ctx, &sources, &locked_ids(lock), lock.checksums())? {
             Staged::Done(mut read) => owned.append(&mut read),
             Staged::Needs(fetches) => return Ok(Staged::Needs(fetches)),
             Staged::Failed(error) => return Ok(Staged::Failed(error)),
@@ -195,16 +193,18 @@ pub(crate) fn resolved<'db, R>(
         FeatureUnification::Selected | FeatureUnification::Package => &specs,
     };
 
-    let index = Index::new(&sources, cx, pinned);
-    let result = resolve_ws(
-        &mut PackageRegistry::new(Through(&index)),
-        &resolving,
-        lock.as_ref(),
-        &cli_features,
-        resolved_for,
-        has_dev_units,
-    );
-    let index_fetches = index.finish()?;
+    let (result, index_fetches) = files.with_cx(|cx| {
+        let index = Index::new(&sources, cx, pinned);
+        let result = resolve_ws(
+            &mut PackageRegistry::new(Through(&index)),
+            &resolving,
+            lock.as_ref(),
+            &cli_features,
+            resolved_for,
+            has_dev_units,
+        );
+        index.finish().map(|fetches| (result, fetches))
+    })?;
     if !index_fetches.is_empty() {
         return Ok(Staged::Needs(index_fetches));
     }
@@ -220,7 +220,7 @@ pub(crate) fn resolved<'db, R>(
 
     // The registry packages the resolve picked that the lock file does not pin.
     let unread: Vec<PackageId> = locked_ids(&whole).into_iter().filter(|id| !reads.contains_key(id)).collect();
-    match locate_all(cx, ctx, reads, &sources, &unread, whole.checksums())? {
+    match locate_all(ctx, &sources, &unread, whole.checksums())? {
         Staged::Done(picked) => {
             for package in &picked {
                 match read_of(&package.manifest_path, &package.manifest, package.locked_source.as_deref(), Some(&whole)) {
@@ -252,7 +252,7 @@ pub(crate) fn resolved<'db, R>(
     if let Some(missing) = targeted.iter().find(|id| !manifests.contains_key(id)) {
         return Ok(fail(anyhow::anyhow!("no manifest of `{missing}` was read")));
     }
-    then(cx, Resolved {
+    then(Resolved {
         resolve: targeted,
         member_ids,
         specs,
@@ -295,10 +295,10 @@ struct Prepared {
     lock: Option<Resolve>,
 }
 
-fn prepare(
-    ws: &Workspace<'_, Snap>,
+fn prepare<F: Files>(
+    ws: &Workspace<'_, F>,
     root: &summary::Root<'_>,
-    ctx: &Context<Snap>,
+    ctx: &Context<F>,
     lock_text: Option<&str>,
 ) -> anyhow::Result<Prepared> {
     let replace = summary::replace_table(root)?;
@@ -339,21 +339,20 @@ fn locked_ids(lock: &Resolve) -> Vec<PackageId> {
 }
 
 /// The packages `ids` located where cargo keeps them and read from their manifests; every one
-/// not mounted is a fetch. Every manifest is read ahead before the first is parsed, so the
-/// step runs once however many packages there are, never once more for each.
+/// not mounted is a fetch. Each manifest is its `ManifestQuery`, parsed once whichever step
+/// reads it.
 fn locate_all(
-    cx: &mut Cx<'_>,
-    ctx: &Context<Snap>,
-    reads: &Reads<'_>,
+    ctx: &Context<Snap<'_, '_>>,
     sources: &Sources,
     ids: &[PackageId],
     checksums: &FxHashMap<PackageId, Option<String>>,
 ) -> Result<Staged<Vec<Package>>, Cancelled> {
+    let files = *ctx.files();
     let mut here = Vec::new();
     let mut needs: Vec<Fetch> = Vec::new();
     for &id in ids {
-        let checksum = checksums.get(&id).cloned().flatten();
-        match sources.locate(cx, id, checksum.as_deref())? {
+        let checksum = checksums.get(&id).and_then(Option::as_deref);
+        match files.with_cx(|cx| sources.locate(cx, id, checksum))? {
             Located::Here { manifest } => here.push((id, manifest)),
             Located::Needs(fetch) => needs.push(fetch),
             Located::Failed(error) => return Ok(Staged::Failed(error)),
@@ -361,9 +360,6 @@ fn locate_all(
     }
     if !needs.is_empty() {
         return Ok(Staged::Needs(needs));
-    }
-    for (_, manifest_path) in &here {
-        reads.file(cx, Path::new(manifest_path))?;
     }
     let mut read = Vec::with_capacity(here.len());
     for (id, manifest_path) in here {

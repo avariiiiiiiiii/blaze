@@ -13,7 +13,10 @@ use itertools::Itertools;
 use mbe::{DelimiterKind, expect_fragment};
 use span::{Edition, FileId, Span};
 use stdx::edit_distance::edit_distance;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{
+    SyntaxKind, TextRange, TextSize,
+    view::{self, AstNode as _},
+};
 use self::args::{Arg, Array, IntSuffix, Lit, lit_value};
 use crate::{
     BuiltinError, EditionedFileId, ExpandError, ExpandResult, FileRange, HirFileId, InFile,
@@ -273,21 +276,21 @@ fn place_expand<'f>(
 /// `expansion_cause`): the column in code points, as `column!` counts them.
 pub fn written_place(db: &Db, id: MacroCallId) -> Option<(u32, u32)> {
     let call = written_call(db, id);
-    let range = InFile::new(call.file_id, written_range(&call.value));
+    let range = InFile::new(call.file_id, written_range(call.value));
     line_and_column(db, range.original_node_file_range_rooted(db))
 }
 
 /// The call `id` is, when it is written in a file or in what a macro was passed; else the call
 /// of the macro whose expansion wrote it, and so on up. The tokens of an `include!`d file are
 /// its own, so the walk stops in it, as rustc's stops at `include!`.
-fn written_call(db: &Db, id: MacroCallId) -> InFile<SyntaxNode> {
-    let mut call = id.loc(db).to_node(db);
+fn written_call(db: &Db, id: MacroCallId) -> InFile<view::Node<'_>> {
+    let mut call = id.loc(db).to_node_view(db);
     while let Some(outer) = call.file_id.macro_file() {
-        let start = TextRange::empty(written_range(&call.value).start());
+        let start = TextRange::empty(written_range(call.value).start());
         if call.file_id.span_map(db).span_for_range(start).ctx.is_root() {
             break;
         }
-        call = outer.loc(db).to_node(db);
+        call = outer.loc(db).to_node_view(db);
     }
     call
 }
@@ -295,11 +298,11 @@ fn written_call(db: &Db, id: MacroCallId) -> InFile<SyntaxNode> {
 /// rustc's span of the call `id`, the `sp` its expander is given: from the macro's path to the
 /// closing delimiter, in the context of `span`.
 fn call_span(db: &Db, id: MacroCallId, span: Span) -> Span {
-    let call = id.loc(db).to_node(db);
-    let mut range = written_range(&call.value);
+    let call = id.loc(db).to_node_view(db);
+    let mut range = written_range(call.value);
     let map = call.file_id.span_map(db);
     // The `;` of a call in item position is the call's in the syntax tree, not in rustc's span.
-    if let Some(args) = ast::MacroCall::cast(call.value).and_then(|it| it.token_tree()) {
+    if let Some(args) = view::MacroCall::cast(call.value).and_then(|it| it.token_tree()) {
         range = TextRange::new(range.start(), args.syntax().text_range().end());
     }
     let first = map.span_for_range(range);
@@ -312,7 +315,7 @@ fn call_span(db: &Db, id: MacroCallId, span: Span) -> Span {
 
 /// The range of a macro call without the attributes and comments on top of it, which rustc's
 /// span of it leaves out.
-fn written_range(node: &SyntaxNode) -> TextRange {
+fn written_range(node: view::Node<'_>) -> TextRange {
     let start = node
         .children_with_tokens()
         .find(|it| {
@@ -406,7 +409,8 @@ fn stringify_expand<'f>(
 fn write_assert_condition(out: &mut String, tokens: &str, edition: Edition) {
     use syntax::{SyntaxKind, T};
 
-    let expr = syntax::ast::Expr::parse(tokens, edition).syntax_node();
+    let parse = syntax::ast::Expr::parse(tokens, edition);
+    let expr = parse.root();
     let start = out.len();
     let mut whitespace = false;
     let mut after_operator = false;
@@ -867,22 +871,42 @@ fn concat_expand<'f>(
     tt: &tt::TopSubtree,
     _call_site: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let open = tt.top_subtree().delimiter.open;
+    let exprs = match args::exprs(db, tt) {
+        Ok(it) => it,
+        Err(err) => return ExpandResult::new(quote_in!(frame, open => ""), err),
+    };
+    concat_text_in(frame, &exprs, open)
+}
+
+/// [`concat_expand`] of `tt`'s arguments split at its top-level commas: the budget test's form,
+/// which has no database to parse them as expressions.
+#[cfg(test)]
+pub(crate) fn concat_of_literals_in<'f>(
+    frame: &'f Frame,
+    tt: &tt::TopSubtree,
+    open: Span,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    concat_text_in(frame, &args::comma_separated(tt), open)
+}
+
+/// `concat!`'s string of its arguments, `open` its span when no argument gives one.
+fn concat_text_in<'f>(
+    frame: &'f Frame,
+    exprs: &[args::Arg<'_>],
+    open: Span,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let mut span: Option<Span> = None;
     let mut record_span = |s: Span| match &mut span {
         Some(span) if span.anchor == s.anchor => span.range = span.range.cover(s.range),
         Some(_) => (),
         None => span = Some(s),
     };
-    let open = tt.top_subtree().delimiter.open;
-    let exprs = match args::exprs(db, tt) {
-        Ok(it) => it,
-        Err(err) => return ExpandResult::new(quote_in!(frame, open => ""), err),
-    };
     let mut text = blaze_mem::scratch::lend_string();
     let mut err = None;
     // alloc: the arguments that are no literal, on the error path
     let mut missing = Vec::new();
-    for arg in &exprs {
+    for arg in exprs {
         if let Some(lit) = arg.literal() {
             match lit_value(&lit) {
                 Ok(Lit::Str(it)) => {

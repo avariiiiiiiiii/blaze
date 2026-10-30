@@ -82,6 +82,11 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
 
 > forwarded to mem (from requests, pass 16; told by tmux).
 
+> done by mem (2026-10-29): `frame::current(f)` and `frame::in_task()` as asked (`task` points a
+> thread-local at its frame and restores the outer one when it ends; `current` panics outside any
+> task), with tests for nesting and for a call outside a task. mem-frame's rewrite of `frame.rs`
+> kept them.
+
 ## 2. lane mem (`crates/blaze-mem/src/pool.rs`): a `Pooled`'s raw round trip
 
 - Why: request 4 below. The solver cache publishes each generation as an `AtomicPtr` in a slot
@@ -1291,3 +1296,7 @@ fn a_waiter_reruns_a_query_whose_run_was_cancelled() {
 ```
 
 Without b, the waiter fails with `Cancelled::PropagatedPanic`.
+
+> forwarded to mem (mem-next1, `blaze-mem/src/frame.rs`) and db (db-next4, `vendor/salsa/src/function/sync.rs`); told by tmux (requests, pass 32).
+> applied by speed-salsa (window 17, 10-29 22:55), b only: `vendor/salsa/src/function/sync.rs` `release_panicking` gives `WaitResult::Cancelled` when `blaze_mem::frame::cancelling()`; `vendor/salsa/tests/parallel/frame_cancel.rs` as written, with `mod frame_cancel;` in `tests/parallel/main.rs`. Not built: needs a (`frame::cancel`, `frame::cancelling`, lane mem), not in `blaze-mem` yet.
+> checked by db-audit-mem (23:11, for db-next4): lane db's half b is in the tree at `vendor/salsa/src/function/sync.rs:404`-`405` (`|| blaze_mem::frame::cancelling()`), `vendor/salsa/tests/parallel/frame_cancel.rs` and `tests/parallel/main.rs:23`. It doesn't build until lane mem's half a lands: `crates/blaze-mem/src/frame.rs` has no `pub fn cancel` or `pub fn cancelling` yet (mem-next1).

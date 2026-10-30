@@ -156,7 +156,7 @@ fn old_adt(db: &Db, old: Old, adt: AdtId) -> Result<ContentId, String> {
             let interface = interface_hash(db, ItemId::Impl(imp)).map_err(describe)?;
             dropping.push((item_key(db, ItemId::Adt(at)), interface.0));
         }
-        for variant in crate::identity::variants(db, at) {
+        for variant in at.variants(db) {
             for field in db.field_types(variant).values() {
                 for arg in field.ty().skip_binder().walk() {
                     if let Some(ty) = arg.ty()

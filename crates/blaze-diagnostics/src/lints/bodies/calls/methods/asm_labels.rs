@@ -20,11 +20,14 @@ use hir_def::{
     hir::{AsmOptions, Expr, ExprId, InlineAsmKind, generics::GenericParamDataRef},
 };
 use smallvec::SmallVec;
-use syntax::{AstNode, SyntaxNodePtr, TextRange, ast};
+use syntax::{
+    SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode},
+};
 
 use crate::{
     cx::Cx,
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set},
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -62,7 +65,7 @@ fn asm_arch(cx: &Cx<'_, '_>) -> Option<Arch> {
 
 impl LatePass for AsmLabels {
     const LINTS: LintSet = lint_set(["named_asm_labels", "binary_asm_labels"]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::InlineAsm]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::InlineAsm]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::InlineAsm(asm) = b.store().expr(expr) else { return };
@@ -113,9 +116,8 @@ struct Template<'db> {
 /// when one is not a string, which rustc refuses before there is an `asm!` to lint.
 fn templates<'db>(b: &BodyCx<'_, 'db>, at: InFile<SyntaxNodePtr>) -> Option<SmallVec<[Template<'db>; 2]>> {
     let cx = b.cx;
-    let node = cx.syntax(at);
-    // clone: a node handle, a reference count, once per `asm!`
-    let asm = ast::AsmExpr::cast(node.value.clone())?;
+    let node = cx.syntax_view(at);
+    let asm = ast::AsmExpr::cast(node.value)?;
     let inactive = |ptr: SyntaxNodePtr| {
         b.source_map.diagnostics().iter().any(|it| {
             matches!(it, ExpressionStoreDiagnostics::InactiveCode { node: inactive, .. }
@@ -124,7 +126,7 @@ fn templates<'db>(b: &BodyCx<'_, 'db>, at: InFile<SyntaxNodePtr>) -> Option<Smal
     };
     let mut templates = SmallVec::new();
     for expr in asm.template() {
-        if inactive(SyntaxNodePtr::new(expr.syntax())) {
+        if inactive(ast::ptr(expr.syntax())) {
             continue;
         }
         let (value, range) = template_str(cx, expr)?;
@@ -138,7 +140,7 @@ fn templates<'db>(b: &BodyCx<'_, 'db>, at: InFile<SyntaxNodePtr>) -> Option<Smal
 /// rustc's `expr_to_spanned_string` of a template: its string and the range of the expression
 /// it is, a macro call's when it is one; what a macro was given as `$e:expr` is the expression
 /// inside the parentheses the expansion puts it in.
-fn template_str(cx: &Cx<'_, '_>, expr: ast::Expr) -> Option<(String, TextRange)> {
+fn template_str<'db>(cx: &Cx<'_, 'db>, expr: ast::Expr<'db>) -> Option<(String, TextRange)> {
     match expr {
         ast::Expr::ParenExpr(it) => template_str(cx, it.expr()?),
         ast::Expr::Literal(_) | ast::Expr::MacroExpr(_) => {
@@ -150,7 +152,7 @@ fn template_str(cx: &Cx<'_, '_>, expr: ast::Expr) -> Option<(String, TextRange)>
 }
 
 /// The string `expr` is once the macros it is a call of are expanded.
-fn string_of(cx: &Cx<'_, '_>, expr: ast::Expr) -> Option<String> {
+fn string_of<'db>(cx: &Cx<'_, 'db>, expr: ast::Expr<'db>) -> Option<String> {
     match expr {
         ast::Expr::Literal(literal) => match literal.kind() {
             ast::LiteralKind::String(it) => Some(it.value().ok()?.into_owned()),
@@ -158,7 +160,7 @@ fn string_of(cx: &Cx<'_, '_>, expr: ast::Expr) -> Option<String> {
         },
         ast::Expr::ParenExpr(it) => string_of(cx, it.expr()?),
         ast::Expr::MacroExpr(it) => {
-            let expanded = cx.sema.expand_macro_call(&it.macro_call()?)?;
+            let expanded = cx.vsema.expand_macro_call(it.macro_call()?)?;
             string_of(cx, ast::Expr::cast(expanded.value)?)
         }
         _ => None,

@@ -1347,7 +1347,7 @@ mod tests {
             .map(|at| Scope { parent: at.checked_sub(1), ranges: vec![(0, 8)] })
             .collect();
         chain.variables[0].scope = Some(39_999);
-        let isa = Target::selected().and_then(|it| it.isa("backtracking", false, cranelift_codegen::settings::OptLevel::None)).unwrap();
+        let isa = Target::selected().and_then(|it| it.isa(crate::Features::BASELINE, "backtracking", false, cranelift_codegen::settings::OptLevel::None)).unwrap();
         // Only ELF and Mach-O have the tables.
         let Some(mut context) = DebugContext::new(&*isa, "/", true, None, false) else { return };
         for (at, debug) in [deep.debug.unwrap(), ring, chain].iter().enumerate() {

@@ -19,7 +19,9 @@
 //! words mean the same in another process. Outside, the bytes are exactly the ones above.
 
 use std::cell::RefCell;
+use std::hash::BuildHasher;
 use std::mem::{offset_of, size_of};
+use std::ops::{Deref, DerefMut};
 
 use blaze_format::{FormatError, Slice, Str, Writer};
 use cfg::{CfgAtom, CfgExpr};
@@ -29,7 +31,7 @@ use hir_expand::{
     name::Name,
 };
 use intern::{Interned, Internable, Symbol};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use smallvec::SmallVec;
 use span::{Edition, ErasedFileAstId, FileAstId, Span, SpanAnchor, SyntaxContext};
 use syntax::{TextRange, TextSize};
@@ -272,20 +274,91 @@ pub(crate) trait Code: Sized {
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError>;
 }
 
-/// The words and names of a buffer being written.
+/// The words and names of a buffer being written. Its vectors and maps are this thread's
+/// spares ([`Words::new`]), given back emptied when it is dropped, so a warm write grows
+/// none of them.
+pub(crate) struct Words(WordsBuffers);
+
 #[derive(Default)]
-pub(crate) struct Words {
+pub(crate) struct WordsBuffers {
     words: Vec<u32>,
     text: String,
     /// Each name's start in `text` and its length.
     names: Vec<(u32, u32)>,
-    by_text: FxHashMap<Box<str>, u32>,
+    /// The last name of each text's hash; earlier names of the same hash are chained in
+    /// `same_hash`.
+    by_hash: FxHashMap<u64, u32>,
+    /// For each name, the name before it with the same hash, [`NO_NAME`] for none.
+    same_hash: Vec<u32>,
     by_symbol: FxHashMap<Symbol, u32>,
+    /// What [`Words::place`] builds the name column in.
+    placed: Vec<Str>,
+}
+
+const NO_NAME: u32 = u32::MAX;
+/// The spares a thread keeps (writes nest: a buffer's values are written while another's
+/// are), and the words above which a spare is freed rather than kept.
+const SPARE_WORDS: usize = 4;
+const SPARE_WORDS_CAP: usize = 1 << 22;
+
+thread_local! {
+    // alloc: const-empty, once per thread.
+    static SPARES: RefCell<Vec<WordsBuffers>> = const { RefCell::new(Vec::new()) };
+}
+
+impl WordsBuffers {
+    fn clear(&mut self) {
+        let WordsBuffers { words, text, names, by_hash, same_hash, by_symbol, placed } = self;
+        words.clear();
+        text.clear();
+        names.clear();
+        by_hash.clear();
+        same_hash.clear();
+        by_symbol.clear();
+        placed.clear();
+    }
+
+    fn held(&self) -> usize {
+        self.words.capacity() + self.text.capacity() / 4 + self.names.capacity()
+    }
+}
+
+impl Deref for Words {
+    type Target = WordsBuffers;
+
+    fn deref(&self) -> &WordsBuffers {
+        &self.0
+    }
+}
+
+impl DerefMut for Words {
+    fn deref_mut(&mut self) -> &mut WordsBuffers {
+        &mut self.0
+    }
+}
+
+impl Drop for Words {
+    fn drop(&mut self) {
+        let mut buffers = std::mem::take(&mut self.0);
+        if buffers.held() > SPARE_WORDS_CAP {
+            return;
+        }
+        buffers.clear();
+        // A thread that is ending frees it.
+        let _ = SPARES.try_with(move |spares| {
+            let mut spares = spares.borrow_mut();
+            if spares.len() < SPARE_WORDS {
+                spares.push(buffers);
+            }
+        });
+    }
 }
 
 impl Words {
+    /// Words on one of this thread's spares, empty.
     pub(crate) fn new() -> Words {
-        Words::default()
+        let spare = SPARES.try_with(|spares| spares.borrow_mut().pop()).ok().flatten();
+        Words(spare.unwrap_or_default())
     }
 
     /// The word the next one written will be.
@@ -354,37 +427,41 @@ impl Words {
     }
 
     fn name(&mut self, text: &str) -> u32 {
-        if let Some(&index) = self.by_text.get(text) {
-            return index;
+        let hash = FxBuildHasher.hash_one(text);
+        let mut at = self.by_hash.get(&hash).copied().unwrap_or(NO_NAME);
+        while at != NO_NAME {
+            let (start, len) = self.names[at as usize];
+            if &self.text[start as usize..(start + len) as usize] == text {
+                return at;
+            }
+            at = self.same_hash[at as usize];
         }
         let index = u32::try_from(self.names.len()).expect("more than 2^32 names in one buffer");
         let start = u32::try_from(self.text.len()).expect("more than 4 GiB of names in one buffer");
         let len = u32::try_from(text.len()).expect("a name of 4 GiB or more");
         self.text.push_str(text);
         self.names.push((start, len));
-        self.by_text.insert(text.into(), index);
+        let earlier = self.by_hash.insert(hash, index).unwrap_or(NO_NAME);
+        self.same_hash.push(earlier);
         index
     }
 
     /// Writes the text, the names and the words, for a [`WordsRec`] to point at
     /// ([`Placed::rec`]).
-    pub(crate) fn place(&self, out: &mut Writer) -> Placed {
+    pub(crate) fn place(&mut self, out: &mut Writer) -> Placed {
         let text_at = out.push_slice(self.text.as_bytes());
         let names_at = out.next::<Str>();
-        let names: Vec<Str> = (self.names.iter().enumerate())
-            .map(|(index, &(start, len))| {
-                let field_at = names_at + (index * size_of::<Str>()) as u64;
-                Str::between(field_at, text_at + u64::from(start), len as usize)
-            })
-            // alloc: write path, the name column of one buffer.
-            .collect();
-        let pushed = out.push_slice(&names);
+        let WordsBuffers { names, placed, .. } = &mut self.0;
+        placed.clear();
+        placed.extend(names.iter().enumerate().map(|(index, &(start, len))| {
+            let field_at = names_at + (index * size_of::<Str>()) as u64;
+            Str::between(field_at, text_at + u64::from(start), len as usize)
+        }));
+        let pushed = out.push_slice(placed);
         debug_assert_eq!(pushed, names_at, "`Writer::next` is not where `push_slice` writes");
+        let names = Column { at: names_at, len: placed.len() as u32 };
         let words_at = out.push_slice(&self.words);
-        Placed {
-            words: Column { at: words_at, len: self.at() },
-            names: Column { at: names_at, len: names.len() as u32 },
-        }
+        Placed { words: Column { at: words_at, len: self.at() }, names }
     }
 }
 
@@ -1166,6 +1243,37 @@ mod tests {
         assert!(Read::new(&root.words, &buffer).get::<Vec<u32>>().is_err());
     }
 
+    /// Names: one index per text whether it comes as a `str` or a symbol, in first-use order,
+    /// with texts of one hash told apart by their bytes; a warm `Words` allocates nothing.
+    #[test]
+    fn names_are_one_index_per_text_on_warm_words() {
+        let texts = ["a", "b", "a", "", "ab", "b", ""];
+        let indices = |w: &mut Words| -> Vec<u32> { texts.iter().map(|text| w.name(text)).collect() };
+        let mut cold = Words::new();
+        assert_eq!(indices(&mut cold), [0, 1, 0, 2, 3, 1, 2]);
+        cold.symbol(&Symbol::intern("ab"));
+        assert_eq!(cold.words.last(), Some(&3), "a symbol's text is the same name");
+        drop(cold);
+        // A collision: two names chained under one hash are still found by their text.
+        let mut w = Words::new();
+        let (first, second) = (w.name("x"), w.name("y"));
+        let hash = FxBuildHasher.hash_one("x");
+        w.by_hash.insert(hash, second);
+        w.same_hash[second as usize] = first;
+        assert_eq!(w.name("x"), first);
+        drop(w);
+
+        let name_all = || {
+            let mut warm = Words::new();
+            texts.iter().for_each(|text| {
+                warm.name(text);
+            });
+            warm.symbol(&Symbol::intern("ab"));
+        };
+        name_all();
+        blaze_alloc_count::assert_at_most(0, "names on warm words", name_all);
+    }
+
     fn crate_of(bits: u64) -> base_db::Crate {
         <base_db::Crate as salsa::plumbing::FromId>::from_id(salsa::Id::from_bits(bits))
     }
@@ -1181,7 +1289,7 @@ mod tests {
             Some(table) => relocating(table, || value.put(&mut w)),
             None => value.put(&mut w),
         }
-        w.words
+        std::mem::take(&mut w.words)
     }
 
     /// `words` read as a `T` in a scope of `table`.

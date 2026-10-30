@@ -54,6 +54,8 @@ use vfs::file_set::FileSetConfig;
 pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
+pub use self::crates::{lint_flags, local};
+
 /// What [`lower`] lowers.
 pub struct Lower<'a, T> {
     pub units: &'a Units,

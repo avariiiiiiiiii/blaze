@@ -10,7 +10,7 @@
 //! `add_missing_lifetime_specifiers_label`, `suggest_introducing_lifetime`) (MIT or
 //! Apache-2.0).
 
-use hir::{GenericDef, InFile, ModuleDef, PathResolution};
+use hir::{GenericDef, HirFileId, InFile, MissingLifetimeKind, ModuleDef, PathResolution};
 use syntax::{
     SmolStr, TextRange, TextSize, WalkEvent,
     view::{self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _},
@@ -27,7 +27,7 @@ use crate::{
 
 /// rustc's `MissingLifetimeKind`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     /// `'_`, at the lifetime.
     Underscore,
     /// `&T`, at the `&`.
@@ -40,16 +40,47 @@ enum Kind {
 
 /// rustc's `MissingLifetime`: where lifetimes are missing, how many and how they are left out.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Missing {
-    range: TextRange,
-    kind: Kind,
-    count: usize,
+pub(crate) struct Missing {
+    pub(crate) range: TextRange,
+    pub(crate) kind: Kind,
+    pub(crate) count: usize,
     /// For `Comma`: whether the brackets are empty, `Ty<>`.
-    empty_brackets: bool,
+    pub(crate) empty_brackets: bool,
+}
+
+impl Missing {
+    /// `&T`'s lifetime, at the `&`.
+    pub(crate) fn ampersand(amp: TextRange) -> Missing {
+        Missing { range: amp, kind: Kind::Ampersand, count: 1, empty_brackets: false }
+    }
+
+    /// `'_`.
+    pub(crate) fn underscore(lifetime: TextRange) -> Missing {
+        Missing { range: lifetime, kind: Kind::Underscore, count: 1, empty_brackets: false }
+    }
+
+    /// The `count` lifetimes `seg` leaves out: at its `<`, or at its name when it has no
+    /// arguments.
+    pub(crate) fn of_segment(seg: &Segment<'_>, count: usize) -> Missing {
+        match seg.list.and_then(|it| Some((it, it.l_angle_token()?))) {
+            Some((list, angle)) => Missing {
+                range: angle.text_range(),
+                kind: Kind::Comma,
+                count,
+                empty_brackets: list.generic_args().next().is_none(),
+            },
+            None => Missing {
+                range: seg.name.syntax().text_range(),
+                kind: Kind::Brackets,
+                count,
+                empty_brackets: false,
+            },
+        }
+    }
 }
 
 /// rustc's `ElisionFnParameter`: a parameter whose type has lifetimes.
-struct FnParam {
+pub(crate) struct FnParam {
     index: usize,
     ident: Option<SmolStr>,
     lifetime_count: usize,
@@ -58,7 +89,7 @@ struct FnParam {
 
 /// rustc's `LifetimeBinderKind`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Binder {
+pub(crate) enum Binder {
     FnPtrType,
     PolyTrait,
     WhereBound,
@@ -81,24 +112,24 @@ impl Binder {
         }
     }
 
-    fn higher_ranked(self) -> bool {
+    pub(crate) fn higher_ranked(self) -> bool {
         matches!(self, Binder::FnPtrType | Binder::PolyTrait | Binder::WhereBound)
     }
 }
 
 /// Where rustc's generics span of a binder is: empty where it has none, else its `<..>`.
 #[derive(Clone, Copy)]
-enum At {
+pub(crate) enum At {
     Empty(TextSize),
     /// Just after the `<`, where rustc's `span_through_char(span, '<')` ends.
     AfterAngle(TextSize),
 }
 
 /// A lifetime rib of rustc's resolver with generics: what it binds and where.
-struct Rib {
-    kind: Binder,
-    at: At,
-    lifetimes: Vec<(SmolStr, TextRange)>,
+pub(crate) struct Rib {
+    pub(crate) kind: Binder,
+    pub(crate) at: At,
+    pub(crate) lifetimes: Vec<(SmolStr, TextRange)>,
 }
 
 fn rib(kind: Binder, list: Option<ast::GenericParamList<'_>>, empty_at: TextSize) -> Rib {
@@ -130,7 +161,7 @@ fn after_name<'t>(item: impl ast::HasName<'t>) -> TextSize {
 
 /// The lifetime ribs with generics around `node`, innermost first, to the item rustc stops
 /// at (its `LifetimeRibKind::Item`): an associated item's goes on to its trait or impl.
-fn ribs(node: ast::Node<'_>) -> Vec<Rib> {
+pub(crate) fn ribs(node: ast::Node<'_>) -> Vec<Rib> {
     // alloc: the error's parts, for an error hir found
     let mut ribs = Vec::new();
     for ancestor in node.ancestors() {
@@ -204,13 +235,23 @@ fn ribs(node: ast::Node<'_>) -> Vec<Rib> {
 /// The signature whose return type `node` is in: an item's, a function pointer's, or a
 /// `Fn(A) -> B` bound's.
 #[derive(Clone, Copy)]
-enum Sig<'t> {
+pub(crate) enum Sig<'t> {
     Fn(ast::Fn<'t>),
     Ptr(ast::FnPtrType<'t>),
     Sugar(ast::ParenthesizedArgList<'t>),
 }
 
-fn return_of(node: ast::Node<'_>) -> Option<Sig<'_>> {
+impl<'t> Sig<'t> {
+    pub(crate) fn syntax(self) -> ast::Node<'t> {
+        match self {
+            Sig::Fn(it) => it.syntax(),
+            Sig::Ptr(it) => it.syntax(),
+            Sig::Sugar(it) => it.syntax(),
+        }
+    }
+}
+
+pub(crate) fn return_of(node: ast::Node<'_>) -> Option<Sig<'_>> {
     for ancestor in node.ancestors().skip(1) {
         if let Some(ret) = ast::RetType::cast(ancestor) {
             let parent = ret.syntax().parent()?;
@@ -283,7 +324,7 @@ fn path_lifetimes<'db>(cx: &Cx<'_, 'db>, path: ast::Path<'db>) -> usize {
 
 /// The lifetimes a path leaves out: those of the segment that names a type or trait, when it
 /// gives none.
-fn path_missing<'db>(cx: &Cx<'_, 'db>, path: ast::Path<'db>) -> Option<Missing> {
+pub(crate) fn path_missing<'db>(cx: &Cx<'_, 'db>, path: ast::Path<'db>) -> Option<Missing> {
     let mut at = Some(path);
     while let Some(path) = at {
         at = path.qualifier();
@@ -376,7 +417,7 @@ fn walk<'db>(cx: &Cx<'_, 'db>, node: ast::Node<'db>, into: &mut Lifetimes) {
 
 /// The parameters of `sig` with lifetimes in their types, and the lifetimes they leave out:
 /// rustc's `resolve_fn_params` when elision fails.
-fn fn_params<'db>(cx: &Cx<'_, 'db>, sig: Sig<'db>) -> (Vec<Missing>, Vec<FnParam>) {
+pub(crate) fn fn_params<'db>(cx: &Cx<'_, 'db>, sig: Sig<'db>) -> (Vec<Missing>, Vec<FnParam>) {
     // alloc: the error's parts, for an error hir found
     let mut inputs: Vec<(Option<SmolStr>, ast::Node<'db>, TextRange)> = Vec::new();
     let mut self_param = None;
@@ -496,23 +537,15 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
         // alloc: the error's parts, for an error hir found
         return vec![Found::new(diag, Phase::Resolve)];
     };
-    let this = match seg.list.and_then(|it| Some((it, it.l_angle_token()?))) {
-        Some((list, angle)) => Missing {
-            range: angle.text_range(),
-            kind: Kind::Comma,
-            count: expected,
-            empty_brackets: list.generic_args().next().is_none(),
-        },
-        None => Missing {
-            range: seg.name.syntax().text_range(),
-            kind: Kind::Brackets,
-            count: expected,
-            empty_brackets: false,
-        },
-    };
+    let this = Missing::of_segment(&seg, expected);
 
-    // A return type's elision failures are one error, given with its first path.
-    let sig = return_of(seg.node);
+    // A return type's elision failures are one error, given with its first path; hir gives
+    // those of a type's paths with the rest of the return type's as `MissingLifetimes`, so
+    // these are the paths it lowers on their own.
+    let sig = match d.kind {
+        MissingLifetimeKind::ElisionFailure => return_of(seg.node),
+        MissingLifetimeKind::Missing | MissingLifetimeKind::NotAllowed => None,
+    };
     let (refs, params) = match sig {
         Some(sig) => {
             // Each site of the group has its own hir diagnostic: the walk up to this one's
@@ -551,7 +584,25 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
         None => (vec![this], None),
     };
 
-    let span = |range: TextRange| seg.span(cx, range);
+    let rib_at = sig.map_or(seg.node, Sig::syntax);
+    let mut diag = report(cx, seg.file, rib_at, &refs, params);
+    generics_fact(cx, &mut diag, d.def);
+    site_fact(cx, &mut diag, InFile::new(seg.file, seg.node));
+    // alloc: the error's parts, for an error hir found
+    vec![Found::new(diag, Phase::Resolve)]
+}
+
+/// rustc's `report_missing_lifetime_specifiers` of `refs` in `file`, under the lifetime ribs
+/// around `rib_at`, with the parameters of the signature when they are a return type's
+/// elision failures: E0106 with its labels, help and suggestions.
+pub(crate) fn report<'db>(
+    cx: &Cx<'_, 'db>,
+    file: HirFileId,
+    rib_at: ast::Node<'db>,
+    refs: &[Missing],
+    params: Option<(Vec<Missing>, Vec<FnParam>)>,
+) -> Diag {
+    let span = |range: TextRange| cx.span(InFile::new(file, range));
     let total: usize = refs.iter().map(|it| it.count).sum();
     let mut diag =
         // alloc: the error's text, for an error hir found
@@ -559,7 +610,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
     for lt in &refs[1..] {
         diag.primary(span(lt.range));
     }
-    for lt in &refs {
+    for lt in refs {
         let expected = match lt.count {
             // alloc: the error's text, for an error hir found
             1 => "named".to_owned(),
@@ -570,7 +621,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
         diag.span_label(span(lt.range), format!("expected {expected} lifetime parameter{}", s(lt.count)));
     }
 
-    let ribs = ribs(seg.node);
+    let ribs = ribs(rib_at);
     // alloc: the error's parts, for an error hir found
     let mut in_scope: Vec<(SmolStr, Option<TextRange>)> = Vec::new();
     for rib in &ribs {
@@ -737,9 +788,5 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
             }
         }
     }
-
-    generics_fact(cx, &mut diag, d.def);
-    site_fact(cx, &mut diag, InFile::new(seg.file, seg.node));
-    // alloc: the error's parts, for an error hir found
-    vec![Found::new(diag, Phase::Resolve)]
+    diag
 }

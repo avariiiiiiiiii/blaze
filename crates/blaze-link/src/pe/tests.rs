@@ -9,7 +9,7 @@ use object::read::pe::{ExportTarget, Import as PeImport, ImageNtHeaders as _, Im
 use blaze_alloc_count::{assert_at_most, measure};
 use blaze_format::cursor::Put;
 
-use super::coff::{ImportName, words};
+use super::coff::{ImportName, asked_libraries, words};
 use super::image::{self, Buf, Image, Tables, alignment, pdb_stem};
 use super::{
     DEBUG, GRANULE, IDATA, OBJ_PDATA, PDATA, Pe, RELOC, START_HOOK, TLS_DIR, TLS_INDEX, place, rank, writer,
@@ -36,6 +36,7 @@ fn output(kind: OutputKind) -> Output {
         stack: None,
         windows_subsystem: false,
         dev_run: None,
+        exec_log: false,
         triple: "x86_64-pc-windows-msvc".into(),
     }
 }
@@ -1408,6 +1409,36 @@ fn import_library_is_a_shared_per_dll() {
 // Allocation budgets.
 
 /// What reading `bytes` as `kind` allocates on this thread.
+/// An object whose only section is a `.drectve` of `directives`.
+fn directives_only(directives: &str) -> Vec<u8> {
+    let mut coff = Coff::default();
+    coff.section(".drectve", INFO, directives.as_bytes().to_vec());
+    coff.bytes()
+}
+
+#[test]
+fn archive_members_ask_for_their_default_libraries() {
+    let import = short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_NAME);
+    let bytes = archive(&[
+        ("a.obj", directives_only("/DEFAULTLIB:vcruntime -defaultlib:\"ucrt.lib\" /DEFAULTLIB:libcmt /nodefaultlib:LIBCMT.LIB /INCLUDE:x"), &[]),
+        ("k32.dll", import, &[]),
+        ("b.obj", directives_only("/DEFAULTLIB:VCRUNTIME.lib /DEFAULTLIB:oldnames"), &[]),
+        ("c.obj", directives_only("/DEFAULTLIB:gone /NODEFAULTLIB"), &[]),
+        ("test.obj", object(), &["main_fn"]),
+    ]);
+    let asked = asked_libraries("msvcrt.lib", &bytes).unwrap();
+    let asked: Vec<(&str, &str)> = asked.iter().map(|(member, library)| (member.as_str(), library.as_str())).collect();
+    assert_eq!(
+        asked,
+        [("a.obj", "vcruntime.lib"), ("a.obj", "ucrt.lib"), ("b.obj", "oldnames.lib"), ("test.obj", "msvcrt.lib")],
+        "each once, in member order, less its member's own /NODEFAULTLIBs"
+    );
+
+    let error = asked_libraries("x.lib", &archive(&[("bad.obj", directives_only("/DEFAULTLIB"), &[])])).unwrap_err();
+    assert!(error.contains("x.lib(bad.obj)") && error.contains("/DEFAULTLIB needs an argument"), "{error}");
+    assert!(asked_libraries("empty.lib", b"!<arch>\n").unwrap().is_empty());
+}
+
 fn allocations(pe: &Pe, name: &str, bytes: &[u8], kind: NativeKind) -> u64 {
     let (file, used) = measure(|| pe.read(name, bytes, &kind));
     assert!(file.is_ok(), "{:?}", file.err());
@@ -1884,4 +1915,10 @@ fn dev_run_image_is_what_the_start_hook_maps() {
     let mut f = executable();
     let image = f.image().unwrap();
     assert!(blaze_inproc::image::layout(blaze_inproc::Format::Pe, &image, GRANULE).is_err(), "a build's code shares a granule");
+}
+
+#[test]
+fn an_executable_with_the_execution_log_starts_on_its_log_stubs() {
+    let logged = crate::table::linked::logged(exe());
+    assert!(logged.header.is_multiple_of(8));
 }

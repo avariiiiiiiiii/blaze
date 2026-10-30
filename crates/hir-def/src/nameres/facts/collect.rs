@@ -143,7 +143,6 @@ pub(crate) fn crate_data(
     };
     let mut crate_data = DefMapCrateData::new(krate_data.edition);
     let mut is_proc_macro = krate_data.target_kind.is_proc_macro();
-
     // Process other crate-level attributes.
     for attr in &*attrs {
         let Some(attr_name) = attr.path.as_ident() else { continue };

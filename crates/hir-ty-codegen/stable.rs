@@ -374,7 +374,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 // What is built names only what it depends on, and to name a crate of the
                 // checkout is to go through every body of it: not of one that is not built.
                 let named: FxHashSet<Crate> =
-                    self.owned.iter().flat_map(|it| it.transitive_deps(self.db)).collect();
+                    self.owned.iter().flat_map(|it| it.transitive_deps(self.db).iter().copied()).collect();
                 let all = base_db::all_crates(self.db);
                 for &krate in all.iter().filter(|it| named.contains(it)) {
                     let mut name = String::new();
@@ -698,14 +698,11 @@ impl<'a, 'db> StableNames<'a, 'db> {
 
     fn spell_ty(&self, out: &mut String, ty: Ty<'db>) -> Option<()> {
         let db = self.db;
+        if let Some(name) = hir_ty_mir::mir::type_name::scalar_name(ty) {
+            out.push_str(name);
+            return Some(());
+        }
         match ty.kind() {
-            TyKind::Bool => out.push_str("bool"),
-            TyKind::Char => out.push_str("char"),
-            TyKind::Str => out.push_str("str"),
-            TyKind::Never => out.push('!'),
-            TyKind::Int(it) => out.push_str(it.name_str()),
-            TyKind::Uint(it) => out.push_str(it.name_str()),
-            TyKind::Float(it) => out.push_str(it.name_str()),
             TyKind::Ref(region, pointee, mutability) => {
                 out.push('&');
                 self.region(out, region)?;

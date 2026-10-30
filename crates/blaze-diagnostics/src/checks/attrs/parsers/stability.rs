@@ -1244,21 +1244,6 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
         }
     }
 
-    /// The item a derive made `def` of, when `def` is the impl it expands to: rustc's derives
-    /// copy the item's `#[stable]` and `#[unstable]` onto it (`create_derived_impl`).
-    fn derived_from(&self, def: &Def<'db>) -> Option<Def<'db>> {
-        if !matches!(def.target, Target::Impl { .. }) || def.node.value.parent()?.parent().is_some() {
-            return None;
-        }
-        let loc = def.node.file_id.macro_file()?.loc(self.cx.db);
-        let MacroCallKind::Derive { .. } = loc.kind else { return None };
-        let item = loc.to_node_item_view(self.cx.db).map(|it| it.syntax());
-        // The item's tree is given out by `vsema`, so `reachable` may ask it of the item.
-        self.cx.vsema.parse_or_expand(item.file_id);
-        let target = Target::of(self.cx, item, self.crate_root)?;
-        Some(Def { node: item, target })
-    }
-
     fn own_stability(&self, owner: usize) -> Option<&'a Stability> {
         self.parsed.of(owner).iter().find_map(|it| match &it.parsed {
             Parsed::Stability(stability) => Some(stability),
@@ -1319,12 +1304,6 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
 
     fn stability_owner(&mut self, def: &Def<'db>) -> Option<usize> {
         if let Some(owner) = self.owner(def)
-            && self.own_stability(owner).is_some()
-        {
-            return Some(owner);
-        }
-        if let Some(item) = self.derived_from(def)
-            && let Some(owner) = self.owner(&item)
             && self.own_stability(owner).is_some()
         {
             return Some(owner);

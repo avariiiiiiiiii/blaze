@@ -358,3 +358,50 @@ fn h(_: N<{ 1 + 1 }>) {}
         }
     });
 }
+
+#[test]
+fn an_item_bound_only_an_upstream_crate_could_meet_is_impossible_only_there() {
+    let (db, file_ids) = TestDB::with_many_files(
+        r#"
+//- /dep.rs crate:dep
+pub struct Foreign;
+pub trait ForeignTrait {}
+pub trait Tr<T> {
+    fn m(&self) where T: ForeignTrait {}
+}
+pub struct S;
+impl Tr<Foreign> for S {}
+//- /main.rs crate:main deps:dep
+"#,
+    );
+
+    crate::attach_db(&db, || {
+        let dep_module = db.module_for_file(file_ids[0].file_id(&db));
+        let main = db.module_for_file(file_ids[1].file_id(&db)).krate(&db);
+        let def_map = dep_module.def_map(&db);
+        let scope = &def_map.module(&db, dep_module).scope(&db);
+        let ModuleDefId::TraitId(tr) = declared(&db, scope, "Tr") else {
+            panic!("`Tr` should be a trait");
+        };
+        let m = tr
+            .trait_items(&db)
+            .items
+            .iter()
+            .find_map(|(name, item)| match *item {
+                AssocItemId::FunctionId(it) if name.as_str() == "m" => Some(it),
+                _ => None,
+            })
+            .expect("`Tr::m`");
+        let impl_ = scope.impls().next().expect("`impl Tr<Foreign> for S`");
+
+        // `dep` knows every impl of `ForeignTrait`, so `Foreign: ForeignTrait` fails there.
+        assert!(crate::traits::is_impossible_associated_item(
+            &db,
+            dep_module.krate(&db),
+            impl_,
+            m.into(),
+        ));
+        // `main` can't: `dep` may add the impl, so the bound is ambiguous, not impossible.
+        assert!(!crate::traits::is_impossible_associated_item(&db, main, impl_, m.into()));
+    });
+}

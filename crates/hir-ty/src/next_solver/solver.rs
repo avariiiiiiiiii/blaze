@@ -419,7 +419,9 @@ impl<'db> SolverDelegate for SolverContext<'db> {
             };
             Const::new_from_allocation(interner, &allocation, env)
         };
-        Ok(Some(konst))
+        // rustc's `try_evaluate_const`: a constant with no value tree is an error here; it is
+        // reported for what the constant is used as.
+        Ok(Some(konst.unwrap_or_else(|_| Const::new_error(interner, ErrorGuaranteed))))
     }
 
     /// What `arg` needs to be well formed: the bounds of every struct, enum and union in it
@@ -616,9 +618,9 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                             })?;
                         type_of(ancestor)
                     })
-                    .or_else(|| {
-                        if trait_assoc_data.ty.is_some() { Some(trait_assoc_id) } else { None }
-                    })
+                    // rustc's `assoc_def`: the trait's item, with or without a default; the
+                    // solver asks `has_item_definition` about one without.
+                    .or(Some(trait_assoc_id))
                     .map(|def| ImplOrTraitAssocTermId(TermId::TypeAliasId(def)))
             }
             TermId::ConstId(trait_assoc_id) => {
@@ -643,11 +645,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                     return FetchEligibleAssocItemResponse::Err(ErrorGuaranteed);
                 }
                 in_impl
-                    .or_else(
-                        || {
-                            if trait_assoc_data.has_body() { Some(trait_assoc_id) } else { None }
-                        },
-                    )
+                    .or(Some(trait_assoc_id))
                     .map(|def| ImplOrTraitAssocTermId(TermId::ConstId(def)))
             }
         };

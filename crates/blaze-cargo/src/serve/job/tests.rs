@@ -84,6 +84,8 @@ fn cargos_own_invocation_is_kept_whole() {
         env: vec![("RUSTFLAGS".into(), "-Dwarnings".into())],
         files: Vec::new(),
         color: false,
+        width: None,
+        verbose: 0,
     });
     let work = Work::Test { targets: targets.clone(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
     let made = invocation(&work, Some(&targets), "/elsewhere", &[]);

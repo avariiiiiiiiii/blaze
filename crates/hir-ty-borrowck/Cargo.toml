@@ -37,6 +37,7 @@ syntax.workspace = true
 [dev-dependencies]
 test-fixture.workspace = true
 blaze-alloc-count.workspace = true
+blaze-format.workspace = true
 
 [features]
 in-rust-tree = ["hir-ty/in-rust-tree"]

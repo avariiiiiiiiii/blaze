@@ -56,6 +56,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         destination: Interval,
         span: MirSpan,
     ) -> Result<'db, bool> {
+        if self.foreign_claims(def) && self.exec_foreign(def, args, generic_args, destination)? {
+            return Ok(true);
+        }
         if self.not_special_fn_cache.borrow().contains(&def) {
             return Ok(false);
         }

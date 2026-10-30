@@ -134,8 +134,11 @@ undefined, wherever the archive is on the line, to a fixed point (lld's rule). T
   pull archive members; a fallback chain back to itself is an error.
 - `.drectve` directives: `/INCLUDE` roots and requires its symbol; `/EXPORT:name=symbol` exports
   it (from an executable too, as link.exe does); `/FAILIFMISMATCH` with two values is an error
-  naming both inputs; `/DEFAULTLIB` and `/NODEFAULTLIB` are `default_libraries`, which the
-  caller resolves on its library path.
+  naming both inputs; `/DEFAULTLIB` and `/NODEFAULTLIB` are followed as link.exe does, from
+  every object and taken archive member: `target::locate` puts each library they ask for on
+  the line after the archive that asked (transitively, found in `-L` then `LIB`), and the
+  engine stops with an error naming the library and `archive(member)` when one a loaded
+  member asks for is not on it.
 - An archive member that reads as a `Shared` (an import library's member) adds its DLL, merged
   by name with the others of that DLL.
 - Collection (`--gc-sections`): from the roots (Rust's references, the entry, exports, `_init`,
@@ -477,8 +480,8 @@ writer has its own tests from hand-made `Placed` values. None was run.
 - The whole cells array (8 bytes per slot of capacity, about 512 KiB at the least capacity) is
   written on each incremental link of an image with a table; writing only changed entries is a
   smaller write the effects can already say.
-- `default_libraries` reads objects on the link line only: libraries a pulled archive member
-  asks for are not found (link.exe follows them).
+- A Mach-O object's `LC_LINKER_OPTION` libraries (`-lz`, `-framework X`) are neither put on
+  the line nor checked (ld64 follows them); link.md 25.
 - An archive member is pulled even when a shared library given earlier defines the name.
 - AArch64: no range-extension veneers; a call past ±128 MiB is an error naming it
   (`Class::Veneers` exists in the model but the core makes none).

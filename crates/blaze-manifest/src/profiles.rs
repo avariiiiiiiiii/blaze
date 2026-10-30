@@ -32,12 +32,12 @@ fn spec_matches(spec: &PackageIdSpec, pkg: &PackageId) -> bool {
         return false;
     }
     if let Some(u) = spec.url()
-        && *u != pkg.source_id.url
+        && u != pkg.source_id.url()
     {
         return false;
     }
     if let Some(k) = spec.kind()
-        && *k != pkg.source_id.kind
+        && !crate::source::spec_kind_is(k, pkg.source_id.kind())
     {
         return false;
     }

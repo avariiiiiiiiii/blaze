@@ -19,6 +19,7 @@ use blaze_cas::{Key, Kind, Store, Ticket};
 use blaze_core::{Address, Completion, Conn, Done, Effect, Tag};
 use blaze_format::cursor::Reader;
 use blaze_ids::ContentId;
+use blaze_mem::{Tag as MemTag, frame};
 
 use crate::{
     Tags,
@@ -83,18 +84,21 @@ struct Response {
 impl Response {
     fn new(status: u16, body: Vec<u8>, tickets: Vec<Ticket>) -> Response {
         let close = status != 200;
+        // alloc: the edge: a response's buffers, one a request, sent after it.
         let mut head = Vec::new();
         http::write_response_head(status, body.len(), close, &mut head);
         Response { head, body, tickets, close }
     }
 
     fn refused(status: u16, why: &str) -> Response {
+        // alloc: an error's message, made only when it fails.
         let mut body = why.as_bytes().to_vec();
         let mut end = body.len().min(wire::REASON_MOST);
         while !why.is_char_boundary(end) {
             end -= 1;
         }
         body.truncate(end);
+        // alloc: the edge: a response's buffers, one a request, sent after it.
         Response::new(status, body, Vec::new())
     }
 
@@ -111,6 +115,7 @@ enum Role {
 impl<C: Channels> Server<C> {
     /// Tags it asks with are `tags..tags + 2^32`.
     pub fn new(at: Address, channels: C, trust: Trust, tags: u64) -> Server<C> {
+        // alloc: setup: once a server or a connection.
         Server { at, channels, trust, tags: Tags::new(tags), listen: None, peers: Vec::new(), problems: Vec::new() }
     }
 
@@ -122,6 +127,7 @@ impl<C: Channels> Server<C> {
         assert!(self.listen.is_none(), "a server started twice");
         let tag = self.tags.next();
         self.listen = Some(tag);
+        // alloc: setup: once a server or a connection.
         effects.push(Effect::Listen { at: self.at.clone(), tag });
     }
 
@@ -153,6 +159,7 @@ impl<C: Channels> Server<C> {
                 Done::Unlistened => self.listen = None,
                 done => {
                     self.listen = None;
+                    // alloc: an error's message, made only when it fails.
                     self.problems.push(format!("listening at {} ended: {done:?}", self.at));
                 }
             }
@@ -178,6 +185,7 @@ impl<C: Channels> Server<C> {
                     }
                     self.pump(at, store, effects);
                 }
+                // alloc: an error's message, made only when it fails.
                 done => self.drop_peer(at, &format!("sending failed: {done:?}"), effects),
             },
             Some(Role::Recv(at)) => {
@@ -196,6 +204,7 @@ impl<C: Channels> Server<C> {
                         Ok(()) => self.pump(at, store, effects),
                         Err(why) => self.drop_peer(at, &why, effects),
                     },
+                    // alloc: an error's message, made only when it fails.
                     done => self.drop_peer(at, &format!("receiving failed: {done:?}"), effects),
                 }
             }
@@ -217,6 +226,7 @@ impl<C: Channels> Server<C> {
 
     fn accept(&mut self, conn: Conn, effects: &mut Vec<Effect>) {
         if self.peers.len() >= PEERS_MOST {
+            // alloc: an error's message, made only when it fails.
             self.problems.push(format!("a connection hung up on: {PEERS_MOST} are served already"));
             effects.push(Effect::Hangup { conn, tag: self.tags.next() });
             return;
@@ -224,6 +234,7 @@ impl<C: Channels> Server<C> {
         let channel = match self.channels.channel() {
             Ok(channel) => channel,
             Err(why) => {
+                // alloc: an error's message, made only when it fails.
                 self.problems.push(format!("a connection hung up on: {why}"));
                 effects.push(Effect::Hangup { conn, tag: self.tags.next() });
                 return;
@@ -237,7 +248,9 @@ impl<C: Channels> Server<C> {
             channel,
             sending: None,
             recv: Some(tag),
+            // alloc: setup: once a server or a connection.
             staged: Vec::new(),
+            // alloc: setup: once a server or a connection.
             plain: Vec::new(),
             waiting: VecDeque::new(),
             queued: 0,
@@ -249,6 +262,7 @@ impl<C: Channels> Server<C> {
 
     fn drop_peer(&mut self, at: usize, why: &str, effects: &mut Vec<Effect>) {
         let peer = &self.peers[at];
+        // alloc: an error's message, made only when it fails.
         self.problems.push(format!("a connection dropped with {} responses unsent: {why}", peer.waiting.len()));
         self.remove(at, effects);
     }
@@ -368,7 +382,9 @@ fn answer(
 ) -> Response {
     if !store.ready() {
         let why = match store.broken() {
+            // alloc: an error's message, made only when it fails.
             Some(broken) => broken.to_string(),
+            // alloc: an error's message, made only when it fails.
             None => "the cache's store is not open yet".to_owned(),
         };
         return Response::refused(503, &why);
@@ -378,6 +394,7 @@ fn answer(
         PUBLISH_PATH => publish(body, store, trust, recv_window, effects),
         BUNDLE_PATH => bundle(body, store),
         BUNDLE_PUBLISH_PATH => bundle_publish(body, store, trust, effects),
+        // alloc: an error's message, made only when it fails.
         _ => Err(Response::refused(404, &format!("{path}: the global cache has no such path"))),
     };
     answered.unwrap_or_else(|refused| refused)
@@ -385,58 +402,67 @@ fn answer(
 
 /// The value of `key` and its signed record: `Ok(None)` when it has no record of it.
 fn found<'s>(store: &'s Store, key: &Key) -> Result<Option<(Signed, &'s [u8])>, Response> {
+    // alloc: an error's message, made only when it fails.
     let failed = |why: String| Response::refused(500, &format!("the cache's value of {:x}: {why}", key.0));
+    // alloc: an error's message, made only when it fails.
     let Some(record) = store.get(&record_key(key)).map_err(|corrupt| failed(corrupt.to_string()))? else {
         return Ok(None);
     };
     let bytes: &[u8; SIGNED_LEN] =
+        // alloc: an error's message, made only when it fails.
         record.bytes.try_into().map_err(|_| failed(format!("a record of {} bytes", record.bytes.len())))?;
     let signed = Signed::decode(bytes).map_err(failed)?;
+    // alloc: an error's message, made only when it fails.
     let value = store.get(key).map_err(|corrupt| failed(corrupt.to_string()))?;
     let value = value.ok_or_else(|| failed("its record is kept and it is not".into()))?;
     if value.content != signed.record.content || value.kind != signed.record.kind || signed.record.key != *key {
+        // alloc: an error's message, made only when it fails.
         return Err(failed(format!("its record names {:?}, and the value kept is {:x} of kind {:?}", signed.record, value.content, value.kind)));
     }
     Ok(Some((signed, value.bytes)))
 }
 
 fn fetch(body: &[u8], store: &mut Store, window: &mut SendWindow) -> Result<Response, Response> {
-    let keys = wire::parse_fetch_ask(body).map_err(|why| Response::refused(400, &why))?;
-    let mut answers = Vec::with_capacity(keys.len());
-    let mut bytes = 0;
-    let mut deferring = false;
-    for key in &keys {
-        let kept = if deferring { None } else { found(store, key)? };
-        if let Some((signed, _)) = &kept {
-            deferring = !wire::takes(bytes, signed.record.len);
-            if !deferring {
-                bytes += signed.record.len;
+    frame::task(MemTag::Store, |temp| {
+        let keys = wire::parse_fetch_ask_in(body, temp).map_err(|why| Response::refused(400, &why))?;
+        let mut answers = Vec::with_capacity_in(keys.len(), temp);
+        let mut bytes = 0;
+        let mut deferring = false;
+        for key in &keys {
+            let kept = if deferring { None } else { found(store, key)? };
+            if let Some((signed, _)) = &kept {
+                deferring = !wire::takes(bytes, signed.record.len);
+                if !deferring {
+                    bytes += signed.record.len;
+                }
+            }
+            answers.push((key, deferring, kept));
+        }
+        // alloc: the response's body, which the connection sends after the request.
+        let mut out = Vec::with_capacity(12 + answers.len() * (33 + SIGNED_LEN) + bytes as usize);
+        wire::header(wire::FETCH_ANSWER, &mut out);
+        out.extend_from_slice(&(answers.len() as u32).to_le_bytes());
+        for (key, deferred, kept) in answers {
+            match (deferred, kept) {
+                (true, _) => {
+                    out.push(wire::DEFERRED);
+                    out.extend_from_slice(&key.0.0);
+                }
+                (false, None) => {
+                    out.push(wire::MISSING);
+                    out.extend_from_slice(&key.0.0);
+                }
+                (false, Some((signed, value))) => {
+                    out.push(wire::FOUND);
+                    out.extend_from_slice(&key.0.0);
+                    out.extend_from_slice(&signed.encode());
+                    window.write(value, &mut out);
+                }
             }
         }
-        answers.push((key, deferring, kept));
-    }
-    let mut out = Vec::with_capacity(12 + answers.len() * (33 + SIGNED_LEN) + bytes as usize);
-    wire::header(wire::FETCH_ANSWER, &mut out);
-    out.extend_from_slice(&(answers.len() as u32).to_le_bytes());
-    for (key, deferred, kept) in answers {
-        match (deferred, kept) {
-            (true, _) => {
-                out.push(wire::DEFERRED);
-                out.extend_from_slice(&key.0.0);
-            }
-            (false, None) => {
-                out.push(wire::MISSING);
-                out.extend_from_slice(&key.0.0);
-            }
-            (false, Some((signed, value))) => {
-                out.push(wire::FOUND);
-                out.extend_from_slice(&key.0.0);
-                out.extend_from_slice(&signed.encode());
-                window.write(value, &mut out);
-            }
-        }
-    }
-    Ok(Response::new(200, out, Vec::new()))
+        // alloc: the edge: a response's buffers, one a request, sent after it.
+        Ok(Response::new(200, out, Vec::new()))
+    })
 }
 
 fn publish(
@@ -446,14 +472,17 @@ fn publish(
     window: &mut RecvWindow,
     effects: &mut Vec<Effect>,
 ) -> Result<Response, Response> {
+    // alloc: an error's message, made only when it fails.
     let bad = |why: String| Response::refused(400, &format!("a malformed publish: {why}"));
     let mut reader = Reader::new(body);
     reader.header(wire::PUBLISH_ASK, "a publish").map_err(bad)?;
     let count = reader.count(SIGNED_LEN + 4, BATCH_MOST, "values").map_err(bad)?;
     let mut statuses = Vec::with_capacity(count);
+    // alloc: the edge: a response's buffers, one a request, sent after it.
     let mut tickets = Vec::new();
     for _ in 0..count {
         let signed = reader.signed().map_err(bad)?;
+        // alloc: an error's message, made only when it fails.
         let checked = trust.verify(&signed).map_err(|refused| refused.to_string());
         let value = window.read(&mut reader, signed.record.len, checked.is_ok()).map_err(bad)?;
         let status = checked.and_then(|()| keep(store, &signed, value.expect("a value whose record is checked is kept"), &mut tickets));
@@ -463,6 +492,7 @@ fn publish(
     if !tickets.is_empty() {
         store.flush(effects);
     }
+    // alloc: the edge: a response's buffers, one a request, sent after it.
     let mut out = Vec::new();
     wire::publish_answer(&statuses, &mut out);
     Ok(Response::new(200, out, tickets))
@@ -473,15 +503,19 @@ fn keep(store: &mut Store, signed: &Signed, bytes: Vec<u8>, tickets: &mut Vec<Ti
     let record = signed.record;
     let found = blaze_cas::content_of(&bytes);
     if found != record.content {
+        // alloc: an error's message, made only when it fails.
         return Err(format!(
             "the global cache refuses {:x}: its bytes hash to {found:x}, not the {:x} its record names",
             record.key.0, record.content
         ));
     }
     let value = store.put(record.key, record.kind, bytes).map_err(|mismatch| {
+        // alloc: an error's message, made only when it fails.
         format!("the global cache keeps another value of {:x}: {:x}, not {:x}", record.key.0, mismatch.kept, mismatch.given)
     })?;
+    // alloc: an error's message, made only when it fails.
     let kept = store.put(record_key(&record.key), Kind::Query, signed.encode().to_vec()).map_err(|_| {
+        // alloc: an error's message, made only when it fails.
         format!("the global cache keeps another signed record of {:x} (another publisher's)", record.key.0)
     })?;
     tickets.extend([value, kept]);
@@ -489,12 +523,15 @@ fn keep(store: &mut Store, signed: &Signed, bytes: Vec<u8>, tickets: &mut Vec<Ti
 }
 
 fn bundle(body: &[u8], store: &Store) -> Result<Response, Response> {
+    // alloc: an error's message, made only when it fails.
     let bad = |why: String| Response::refused(400, &format!("a malformed bundle request: {why}"));
     let mut reader = Reader::new(body);
     reader.header(wire::BUNDLE_ASK, "a bundle request").map_err(bad)?;
     let id = BundleId(ContentId(*reader.array().map_err(wire::truncated).map_err(bad)?));
     reader.end("a bundle request").map_err(bad)?;
+    // alloc: an error's message, made only when it fails.
     let manifest = store.get(&id.manifest_key()).map_err(|corrupt| Response::refused(500, &corrupt.to_string()))?;
+    // alloc: the edge: a response's buffers, one a request, sent after it.
     let mut out = Vec::new();
     wire::header(wire::BUNDLE_ANSWER, &mut out);
     match manifest {
@@ -505,11 +542,13 @@ fn bundle(body: &[u8], store: &Store) -> Result<Response, Response> {
             out.extend_from_slice(entry.bytes);
         }
     }
+    // alloc: the edge: a response's buffers, one a request, sent after it.
     Ok(Response::new(200, out, Vec::new()))
 }
 
 /// Keeps a manifest signed by a pinned publisher whose every record is the one it keeps.
 fn bundle_publish(body: &[u8], store: &mut Store, trust: &Trust, effects: &mut Vec<Effect>) -> Result<Response, Response> {
+    // alloc: an error's message, made only when it fails.
     let bad = |why: String| Response::refused(400, &format!("a malformed bundle publish: {why}"));
     let mut reader = Reader::new(body);
     reader.header(wire::BUNDLE_PUBLISH, "a bundle publish").map_err(bad)?;
@@ -518,26 +557,33 @@ fn bundle_publish(body: &[u8], store: &mut Store, trust: &Trust, effects: &mut V
     let key = Key(manifest.id.0);
     let status = manifest
         .verify(trust)
+        // alloc: an error's message, made only when it fails.
         .map_err(|why| format!("the manifest of {:x} is refused: {why}", key.0))
         .and_then(|()| {
             for entry in &manifest.entries {
                 match found(store, &entry.key) {
                     Ok(Some((signed, _))) if signed.record == *entry => {}
                     Ok(Some((signed, _))) => {
+                        // alloc: an error's message, made only when it fails.
                         return Err(format!("it lists {:?} for {:x}, and the cache keeps {:?}", entry, entry.key.0, signed.record));
                     }
+                    // alloc: an error's message, made only when it fails.
                     Ok(None) => return Err(format!("it lists {:x}, which the cache has no value of", entry.key.0)),
+                    // alloc: an error's message, made only when it fails.
                     Err(response) => return Err(String::from_utf8_lossy(&response.body).into_owned()),
                 }
             }
             Ok(())
         });
+    // alloc: the edge: a response's buffers, one a request, sent after it.
     let mut tickets = Vec::new();
     let status = status.and_then(|()| {
+        // alloc: the edge: a response's buffers, one a request, sent after it.
         let mut bytes = Vec::new();
         manifest.encode(&mut bytes);
         let ticket = store
             .put(manifest.id.manifest_key(), Kind::Output, bytes)
+            // alloc: an error's message, made only when it fails.
             .map_err(|_| format!("the cache keeps another manifest of {:x}", key.0))?;
         tickets.push(ticket);
         Ok(())
@@ -545,6 +591,7 @@ fn bundle_publish(body: &[u8], store: &mut Store, trust: &Trust, effects: &mut V
     if !tickets.is_empty() {
         store.flush(effects);
     }
+    // alloc: the edge: a response's buffers, one a request, sent after it.
     let mut out = Vec::new();
     wire::publish_answer(&[(key, status)], &mut out);
     Ok(Response::new(200, out, tickets))

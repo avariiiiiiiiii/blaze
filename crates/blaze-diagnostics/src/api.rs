@@ -11,8 +11,8 @@ use crate::{
 };
 
 /// `diag` for the agent API, its `rendered` as rustc writes it in `style`, of `unit` when it is
-/// a cargo unit's. Its `explanation` is rustc's for its code, as rustc's JSON gives it; a
-/// caller writing a human format, which prints none, clears it.
+/// a cargo unit's. Its `explanation` is rustc's for its code, as rustc's JSON gives it, in
+/// every format: only a JSON writer prints it.
 pub fn diagnostic(diag: &Diag, sources: &Sources, style: Style, unit: Option<UnitOf>) -> Diagnostic {
     let mut children: Vec<Diagnostic> =
         // alloc: the API's owned copy of a diagnostic written, the edge
@@ -126,14 +126,17 @@ fn place(
 ) -> blaze_api::Span {
     let at = |byte: u32| {
         sources.position(&span.file, byte).unwrap_or_else(|| {
-            panic!("blaze-diagnostics: a span at byte {byte} of `{}`, which has no such byte", span.file)
+            panic!(
+                "blaze-diagnostics: a span at byte {byte} of `{}`, which has no such byte",
+                crate::emit::shown(&span.file)
+            )
         })
     };
     let (line, column) = at(span.lo);
     let (end_line, end_column) = at(span.hi);
     blaze_api::Span {
         // clone: the API's owned file name, of a span written
-        file: span.file.clone(),
+        file: crate::emit::shown(&span.file).to_owned(),
         line,
         column,
         end_line,

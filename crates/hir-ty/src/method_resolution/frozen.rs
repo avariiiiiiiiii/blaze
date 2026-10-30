@@ -12,7 +12,7 @@ use blaze_format::cursor::{Put, Reader};
 use blaze_mem::Frame;
 use hir_def::{
     ModuleDefId,
-    nameres::frozen::{Dec, Enc, Frozen, Mode, record_difference},
+    nameres::frozen::{Dec, Enc, Frozen, Mode, check_frozen},
 };
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{FloatTy, IntTy, Mutability, UintTy, fast_reject::SimplifiedType as S};
@@ -177,19 +177,7 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
 /// [`Mode::Check`], or what was read of them in [`Mode::Verify`].
 pub fn check(db: &Db, krate: Crate) {
     let Some(frozen) = frozen(db, krate) else { return };
-    let what = match frozen.mode {
-        Mode::Serve => return,
-        Mode::Check => "the live ones",
-        Mode::Verify => "what was read of them",
-    };
-    match encode(db, krate) {
-        Ok(written) if *written == *frozen.bytes => {}
-        Ok(written) => record_difference(db, krate, "impls", what, &written, &frozen.bytes),
-        Err(why) => {
-            let what = format!("{what}, which cannot be written ({why})");
-            record_difference(db, krate, "impls", &what, &[], &[])
-        }
-    }
+    check_frozen(db, krate, "impls", frozen, || encode(db, krate));
 }
 
 const INTS: [IntTy; 6] = [IntTy::Isize, IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::I128];
@@ -211,6 +199,7 @@ fn write_def(enc: &mut Enc<'_>, it: &SolverDefId<'_>) -> R {
             enc.u8(2);
             enc.def(it.into())
         }
+        // alloc: the error of impls that cannot be written, which keeps them unfrozen
         _ => Err("a type named by neither an ADT, a trait nor a type alias".to_owned()),
     }
 }
@@ -221,6 +210,7 @@ fn read_def<'db>(dec: &mut Dec<'_>) -> R<SolverDefId<'db>> {
         _ => match dec.def()? {
             ModuleDefId::TraitId(it) => SolverDefId::TraitId(it),
             ModuleDefId::TypeAliasId(it) => SolverDefId::TypeAliasId(it),
+            // alloc: the error on corrupt bytes.
             _ => return Err("a type named by an item that names none".to_owned()),
         },
     })
@@ -293,6 +283,7 @@ fn write_simplified(enc: &mut Enc<'_>, it: &SimplifiedType<'_>) -> R {
         S::Placeholder => enc.u8(18),
         S::Error => enc.u8(19),
         S::Closure(_) | S::Coroutine(_) | S::CoroutineWitness(_) => {
+            // alloc: the error of impls that cannot be written, which keeps them unfrozen
             return Err("an impl for a closure or a coroutine".to_owned());
         }
     }
@@ -321,6 +312,6 @@ fn read_simplified<'db>(dec: &mut Dec<'_>) -> R<SimplifiedType<'db>> {
         17 => S::UnsafeBinder,
         18 => S::Placeholder,
         19 => S::Error,
-        it => return Err(format!("simplified type {it}")),
+        it => return Err(format!("simplified type {it}")), // alloc: the error on corrupt bytes.
     })
 }

@@ -57,6 +57,8 @@ pub struct Prepared {
     pub env: Vec<(OsString, OsString)>,
     /// The names given, which are left out of what is traced: the key has them already.
     pub given: Vec<OsString>,
+    /// What the key was made of: `made.finish()` is `spec.key.given`.
+    pub made: Given,
 }
 
 /// `unit`'s run, in a build started with `inherited` (cargo's environment once started:
@@ -90,7 +92,7 @@ pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -
     };
     // clone: setup, the run owns its OUT_DIR
     let spec = run::Spec { key, command, out_dir: Some(unit.out_dir.clone()), mode: place.mode };
-    Ok(Prepared { spec, env: vars, given: names })
+    Ok(Prepared { spec, env: vars, given: names, made: given })
 }
 
 fn run_only(name: &OsStr) -> bool {
@@ -177,6 +179,9 @@ mod tests {
         other.target = "aarch64-unknown-linux-gnu".into();
         let three = prepare(&other, &inherited("/a"), &place()).unwrap();
         assert_ne!(one.spec.key, three.spec.key);
+        for prepared in [&one, &two, &three] {
+            assert_eq!(prepared.made.finish(), prepared.spec.key.given, "the key is made of what is kept");
+        }
         let Sandbox::On { write, trace, .. } = &one.spec.command.sandbox else { panic!() };
         assert!(*trace && write == &[unit().out_dir]);
     }

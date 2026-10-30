@@ -93,3 +93,22 @@ fn a_task_that_would_wait_on_itself_runs_again_and_another_panic_goes_on() {
     let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
     assert!(message.contains("crate two"), "{message}");
 }
+
+#[test]
+fn the_goal_note_names_every_count_that_kept_goals_out() {
+    let plain = goal_store::Flushed { written: 3, kept: 5, ..goal_store::Flushed::default() };
+    assert_eq!(flushed(&plain).message, "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full");
+    let out = goal_store::Flushed {
+        slots_full: 1,
+        inexpressible: vec![("impl_datum", 4), ("crate_env", 2)],
+        too_long: 7,
+        ..goal_store::Flushed::default()
+    };
+    let note = flushed(&out);
+    assert_eq!(note.level, Level::Note);
+    assert_eq!(
+        note.message,
+        "the persistent goal cache, of the last build: 0 written, 0 kept, 1 with every slot full; \
+         goals kept out by `impl_datum` (4), `crate_env` (2); 7 too long to keep"
+    );
+}

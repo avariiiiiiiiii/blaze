@@ -17,10 +17,11 @@
 //! | macro hygiene | `Resolves` in the def-site scope for def-site names; mixed-site names resolve at the call site |
 //! | auto-trait leakage | `AutoTraits(opaque)` |
 //! | the target's data layout | `Target(crate)` |
+//! | a dependency's batches, whether one impl specializes another | `Crate(crate)` |
 
 use std::{alloc::Allocator, fmt::Write as _};
 
-use base_db::Db;
+use base_db::{Db, ProcessEnv};
 use blaze_ids::{ContentId, Fingerprint, Hasher, radix};
 use blaze_mem::{Frame, Tag, frame, scratch};
 use either::Either;
@@ -34,7 +35,11 @@ use hir_def::{
     lang_item::lang_items,
     unstable_features::UnstableFeatures,
 };
-use hir_expand::{AstId, HirFileId, MacroCallId, name::Name};
+use hir_expand::{
+    AstId, HirFileId, MacroCallId,
+    name::Name,
+    proc_macro::{ProcMacroKind, ProcMacros},
+};
 use hir_ty::{
     InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, all_super_traits,
     check_orphan_rules,
@@ -74,6 +79,7 @@ const DROP_CHECK: &str = "blaze v2 fact drop check 1";
 const VTABLE: &str = "blaze v2 fact vtable 1";
 const DERIVE: &str = "blaze v2 fact derive 1";
 const TARGET: &str = "blaze v2 fact target 1";
+const CRATE: &str = "blaze v2 fact crate 1";
 const CONST_TYPE: &str = "blaze v2 fact const value type 1";
 
 fn domain(fact: &Fact) -> &'static str {
@@ -95,6 +101,7 @@ fn domain(fact: &Fact) -> &'static str {
         Fact::Vtable { .. } => VTABLE,
         Fact::Derive(_) => DERIVE,
         Fact::Target(_) => TARGET,
+        Fact::Crate(_) => CRATE,
     }
 }
 
@@ -244,8 +251,99 @@ fn value_in(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
                 }),
             }
         }
+        Fact::Crate(krate) => {
+            let Some(krate) = key::resolve_crate(db, &krate) else { return absent() };
+            h.id(&crate_inputs(db, krate));
+            write_noted_reads(db, &mut h, krate);
+        }
     }
     Ok(h.finish())
+}
+
+/// What `krate` and every crate it depends on are made from, as their database inputs: each
+/// one's [`base_db::Crate::content`] (its root's path, edition, origin, crate attributes,
+/// target kind, version, cfg and features, env, the workspace's target, toolchain and
+/// const-eval budget, and its dependencies' content), the content of the source root of its
+/// root file (every file's path and text), and its proc macros with their libraries, as a
+/// dependency image's key (`hir_def::deps::key`) has them.
+#[salsa::tracked]
+fn crate_inputs(db: &Db, krate: base_db::Crate) -> ContentId {
+    let mut h = Hasher::new(CRATE);
+    let all = krate.transitive_deps(db);
+    h.part(b"inputs").update(&(all.len() as u64).to_le_bytes());
+    for &it in all {
+        let root = db.file_source_root(it.data(db).root_file_id).source_root_id(db);
+        h.id(&it.content(db)).id(&db.source_root(root).content(db));
+        write_proc_macros(db, &mut h, it);
+    }
+    h.finish()
+}
+
+/// A crate's proc macros: none, why they did not load, or each one's name, kind, whether it
+/// is disabled and the library it is code of where that is known. Where it is not, the
+/// macro is built from its crate's sources, which [`crate_inputs`] hashes with the crate.
+fn write_proc_macros(db: &Db, h: &mut Hasher, krate: base_db::Crate) {
+    let Some(loaded) = ProcMacros::get_for_crate(db, krate) else {
+        h.update(&[0]);
+        return;
+    };
+    let Some(macros) = loaded.macros() else {
+        scratch::with_string(|text| {
+            if let Some(err) = loaded.get_error() {
+                write!(text, "{err}").expect("writing to a string cannot fail");
+            }
+            h.update(&[1]).part(text.as_bytes());
+        });
+        return;
+    };
+    h.update(&[2]).update(&(macros.len() as u64).to_le_bytes());
+    for it in macros {
+        let kind = match it.kind {
+            ProcMacroKind::CustomDerive => 0,
+            ProcMacroKind::Bang => 1,
+            ProcMacroKind::Attr => 2,
+        };
+        h.part(it.name.as_str().as_bytes()).update(&[kind, it.disabled as u8]);
+        match it.expander.code() {
+            Some(code) => h.update(&[1]).id(&code),
+            None => h.update(&[0]),
+        };
+    }
+}
+
+/// What the macros of `krate` and its dependencies read that no database input of theirs
+/// holds: the files outside the VFS that `include_bytes!` and `include_str!` read, and the
+/// process variables `env!` and `option_env!` read, with their values now. The database notes
+/// each as it is read and these are not tracked, so they are never memoized: a read noted
+/// after a value was taken gives another value, a miss, never a stale hit.
+fn write_noted_reads(db: &Db, h: &mut Hasher, krate: base_db::Crate) {
+    let files = db.files();
+    let process = ProcessEnv::try_get(db).map(|it| it.vars(db));
+    // alloc: base-db hands the notes out as one list; made once per value of a crate fact
+    let env_read = files.env_read();
+    h.part(b"noted");
+    for &it in krate.transitive_deps(db) {
+        // alloc: as above, empty (no allocation) for a crate that included no such file
+        let included = files.included_by(db, it);
+        h.update(&(included.len() as u64).to_le_bytes());
+        for (path, bytes) in &included {
+            h.part(path.as_str().as_bytes());
+            match bytes {
+                Some(bytes) => h.update(&[1]).part(bytes),
+                None => h.update(&[0]),
+            };
+        }
+        let names = || env_read.iter().filter(move |(by, _)| *by == it).map(|(_, name)| name);
+        h.update(&(names().count() as u64).to_le_bytes());
+        for name in names() {
+            h.part(name.as_bytes());
+            let value = process.and_then(|vars| vars.iter().find(|&(at, _)| at == name));
+            match value {
+                Some((_, value)) => h.update(&[1]).part(value.as_bytes()),
+                None => h.update(&[0]),
+            };
+        }
+    }
 }
 
 /// The first 128 bits of [`value`]: what a dependency edge records.
@@ -330,6 +428,10 @@ pub fn derive(db: &Db, ty: AdtId) -> Fact {
 
 pub fn target(db: &Db, krate: base_db::Crate) -> Fact {
     Fact::Target(key::crate_key(db, krate))
+}
+
+pub fn whole_crate(db: &Db, krate: base_db::Crate) -> Fact {
+    Fact::Crate(key::crate_key(db, krate))
 }
 
 /// The item `subject` names, `None` if none does.

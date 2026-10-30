@@ -217,7 +217,7 @@ fn run(
     let host = options.host.clone();
     let mut daemon = Daemon::start(driver, options, steps, runner).map_err(|why| anyhow::anyhow!(why))?;
     // Once a process: every expansion from here on reads the daemon's store with no lock.
-    let toolchain = hir_ty_codegen::v2::toolchain(&host, &[])
+    let toolchain = hir_ty_codegen::v2::toolchain(&host, &[], hir_ty_codegen::v2::Runs::Elsewhere)
         .map_err(|why| anyhow::anyhow!("the toolchain proc macros are built with, for {host}: {why}"))?
         .id;
     blaze_expand::install(blaze_expand::Expansions {

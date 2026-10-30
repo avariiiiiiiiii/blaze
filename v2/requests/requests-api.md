@@ -74,6 +74,23 @@ every code.
 
 > forwarded to cargo (cargo-inbox-next2, owner of `serve/`); told by tmux (requests, pass 30).
 
+> answered by lane cargo (cargo-inbox): done, not built (this brief allows no builds).
+> 1. `crates/blaze-cargo/src/serve/unit.rs:568`: `Job::unit_of` takes the unit's index and sets `id` from it, refused by name past 2^32. It also sets `test` (`Mode::Test`, or `Check` with `checked_as_test`). Both callers (`compile.rs:449`, `script.rs:575`) pass the index.
+> 2. `crates/blaze-cargo/src/serve/unit.rs:612`: `unit_target` returns `Result`. `kind` is `TargetKind::named` of cargo's first word, or `Lib` for any other word. Every crate type goes through `CrateType::named`, and an unknown one is an error naming it and the target. An empty kind list is an error too, not `Lib`. `script.rs:234` builds `blaze_build_script::Target`, whose kinds are still strings, so it is unchanged. `serve/tests.rs:86` uses the enums. `:185` is a `blaze_units` target and is unchanged.
+> 3. `crates/blaze-cargo/src/serve/unit/graph.rs:156` and `:340`: `target_hash` and `find` take `&[impl AsRef<str>]` and hash each word. `test.rs` and `run.rs` look a unit up by `target.kinds()`, which gives back exactly cargo's words.
+> 4. `crates/blaze-cargo/src/serve/unit/run.rs:100`.
+> 5. `crates/blaze-cargo/src/serve/unit/artifact.rs:111`: `kind` returns `Result<ArtifactKind, ApiError>`, refusing an unknown word by name. `artifact()` returns `Result`. `unit/tests.rs` compares with the enum.
+> 6. `crates/blaze-cargo/src/serve/job.rs:1790`: `package` is `build.package_of[at]`.
+> 7. `crates/blaze-cargo/src/serve/unit/test.rs:313`, `:334` and the `--ub` closure at `:225`. `executable` is the suite's index in `TestRun.suites` (one per test binary; for `--ub`, `test.binary`). `outside` is `Trace::Unknown(test::OUTSIDE)` (`:542`), false for cached and ignored results.
+> 8. `explanation: None` in `say.rs:28`, `job.rs` `warned` and `serve/tests.rs:106`.
+> 9. `JobInput.width` (`crates/blaze-cargo/src/serve/work.rs:129`), from `Cargo::width` (`job.rs:1549`). `compile.rs:506` renders with it, and the unit's record key hashes it beside `color` and `short` (`compile.rs:203`).
+> 10. `JobInput.verbose` (`work.rs:131`, `job.rs:1550`). Under `-v`, each test binary with tests outside the sandbox gets a note saying which and why (`unit/test.rs:592`: `BLAZE_SANDBOX=off`, `tests = false`, no opt-in, or `unsandboxed-tests`). Each dependency the store refused gets a note with its reason (`job.rs:2158`, `noted`).
+> 11. Nothing to do.
+> 12. `crates/blaze-cargo/src/serve/job/tests.rs:79`.
+> Section 6: item 1 is done (cargo.md "the `blaze-served` line"). Item 2 was already in `cli/print.rs:365` and its test.
+
+> cargo-inbox (2026-10-29 22:46), on diagnostics' ask to set `explanation` to `None` under the human `--message-format` at `serve/unit/compile.rs` `make()`: declined, and item 11 stands. The CLI prints `explanation` only under JSON (`crates/blaze-cargo/src/cli/json.rs:341`), so human output is the same either way. Clearing it in the daemon would only take rustc's text away from agents, who get the whole answer under any format. It would also put the JSON/human choice into every compile record's key (`compile.rs:203` has `color` and `short` only), so one cached record could no longer serve both. The daemon passes `api::diagnostic`'s `explanation` through unchanged in every format.
+
 ## 2. To lane cargo, the CLI (`crates/blaze-cargo/src/cli*`; cargo-cli2's side)
 
 1. `cli/place.rs` `Cargo` (~217):

@@ -1,94 +1,67 @@
-//! One manifest read and normalized ([`ManifestQuery`]: its `[workspace.package]` and
-//! `[workspace.dependencies]` inherited, its targets discovered), and the workspace: its root,
-//! members and default members ([`WorkspaceQuery`]). Each keeps the files it read
-//! ([`Snapshot`]), so a later query reads the same manifests again from exactly those.
+//! One manifest parsed ([`ManifestQuery`]: blaze-manifest's `TomlManifest`, kept, so no step
+//! parses it again), and the workspace: its root, members and default members
+//! ([`WorkspaceQuery`]). A later step reads the same workspace again in one pass
+//! ([`in_workspace`]), every file through the database.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 use blaze_manifest::files::Files;
-use blaze_manifest::manifest::{EitherManifest, read_manifest};
 use blaze_manifest::{Context, Workspace};
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
+use cargo_util_schemas::manifest::TomlManifest;
 use serde::{Deserialize, Serialize};
 
 use super::config::{ConfigChain, ConfigOf, ConfigRead};
-use super::files::{Fill, Reads, Snapshot, Used, run_over};
+use super::files::{Found, PathKey, Snap, TomlFile, lent, read_through};
 use super::invocation::Asking;
-use super::{load_error, unmounted_error};
+use super::load_error;
 use super::key_id;
 use crate::query::{Cbor, LoadError, Versioned, producer};
 
-/// A manifest by absolute path, read with a configuration, as the package of `source` (the
-/// source as a lock file writes it; `None` for the path package in its directory).
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct ManifestKey {
-    pub path: String,
-    pub config: ConfigOf,
-    pub source: Option<String>,
+/// A manifest as its [`ManifestQuery`] parsed it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) enum Parsed {
+    Here(TomlManifest),
+    Absent,
+    /// Under no mount of the view.
+    Unmounted,
+    /// Not UTF-8 or not a manifest: reading it again gives the error.
+    Unparsed,
 }
 
-/// What reading one manifest read and said.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct ManifestRead {
-    /// Every file it read (the config's too), TOML in its canonical form.
-    pub snapshot: Snapshot,
-    /// Its warnings, or cargo's error reading it.
-    pub read: Result<Vec<String>, LoadError>,
+impl Versioned for Parsed {
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo manifest parsed 1");
 }
 
-impl Versioned for ManifestRead {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo manifest read 2");
-}
-
+/// A manifest by absolute path, read with a configuration's mounts, parsed as blaze-manifest's
+/// `Files::manifest` parses it. It reads its [`TomlFile`], so the canonical form's bytes are
+/// what an edit is seen by: a comment reruns the file and stops there.
 pub(crate) struct ManifestQuery;
 
 impl Query for ManifestQuery {
     const KIND: QueryKind = QueryKind(0x6016);
     const NAME: &'static str = "cargo manifest";
-    const PRODUCER: ContentId = producer("blaze v2 cargo manifest 1");
-    type Key = ManifestKey;
-    type Value = Cbor<ManifestRead>;
+    const PRODUCER: ContentId = producer("blaze v2 cargo manifest 2");
+    type Key = PathKey;
+    type Value = Cbor<Parsed>;
 
-    fn input(key: &ManifestKey) -> ContentId {
-        key_id("blaze v2 cargo manifest key 2", key)
+    fn input(key: &PathKey) -> ContentId {
+        key_id("blaze v2 cargo manifest key 3", key)
     }
 
-    fn execute(cx: &mut Cx<'_>, key: &ManifestKey) -> Result<Cbor<ManifestRead>, Cancelled> {
-        let mut config = match cx.get::<ConfigChain>(&key.config)?.get() {
-            Ok(config) => config,
-            Err(error) => return Ok(Cbor(ManifestRead { snapshot: Snapshot::default(), read: Err(error) })),
-        };
-        let fill = Fill { config: &key.config, own: Some(&key.path), members: false };
-        let path = PathBuf::from(&key.path);
-        let base = std::mem::take(&mut config.snapshot);
-        let (read, used) = run_over(cx, base, &fill, |_, files, _| {
-            Ok(read_one(&config, files, &path, key.source.as_deref()))
-        })?;
-        let read = match used.unmounted() {
-            Some(at) => Err(unmounted_error(at)),
-            None => read.map_err(|error| load_error(&error, Some(key.path.clone()))),
-        };
-        Ok(Cbor(ManifestRead { snapshot: used.canonical(), read }))
+    fn execute(cx: &mut Cx<'_>, key: &PathKey) -> Result<Cbor<Parsed>, Cancelled> {
+        let kept = cx.get::<TomlFile>(key)?.bytes();
+        Ok(Cbor(match lent(kept) {
+            Found::Here(bytes) => match blaze_manifest::manifest::parse_manifest(Path::new(&key.path), bytes) {
+                Ok(manifest) => Parsed::Here(manifest),
+                Err(_) => Parsed::Unparsed,
+            },
+            Found::Absent => Parsed::Absent,
+            Found::Unmounted => Parsed::Unmounted,
+        }))
     }
-}
-
-fn read_one(
-    config: &ConfigRead,
-    files: Snap,
-    path: &Path,
-    source: Option<&str>,
-) -> anyhow::Result<Vec<String>> {
-    let ctx = Context::new(super::config::build(config, files)?);
-    let source = match source {
-        Some(source) => manifest_source(source, &ctx.config)?,
-        None => blaze_manifest::source::SourceId::for_manifest_path(path)?,
-    };
-    Ok(match read_manifest(path, source, &ctx)? {
-        EitherManifest::Real(m) => m.warnings.clone(),
-        EitherManifest::Virtual(m) => m.warnings.clone(),
-    })
 }
 
 /// A workspace: from its manifest (none: the one cargo finds from the cwd, or
@@ -105,7 +78,7 @@ impl WorkspaceKey {
     }
 }
 
-/// A workspace as read: where it is, its members, and every file reading it read.
+/// A workspace as read: where it is and its members.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct WorkspaceRead {
     pub config: ConfigRead,
@@ -115,14 +88,12 @@ pub(crate) struct WorkspaceRead {
     pub members: Vec<String>,
     pub default_members: Vec<String>,
     pub is_virtual: bool,
-    /// The config's and every manifest's files, TOML in its canonical form.
-    pub snapshot: Snapshot,
     /// cargo's warnings of the workspace and its manifests, as it prints them after `warning: `.
     pub warnings: Vec<String>,
 }
 
 impl Versioned for Result<WorkspaceRead, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo workspace read 2");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo workspace read 3");
 }
 
 pub(crate) struct WorkspaceQuery;
@@ -130,7 +101,7 @@ pub(crate) struct WorkspaceQuery;
 impl Query for WorkspaceQuery {
     const KIND: QueryKind = QueryKind(0x6017);
     const NAME: &'static str = "cargo workspace";
-    const PRODUCER: ContentId = producer("blaze v2 cargo workspace 2");
+    const PRODUCER: ContentId = producer("blaze v2 cargo workspace 3");
     type Key = WorkspaceKey;
     type Value = Cbor<Result<WorkspaceRead, LoadError>>;
 
@@ -139,7 +110,7 @@ impl Query for WorkspaceQuery {
     }
 
     fn execute(cx: &mut Cx<'_>, key: &WorkspaceKey) -> Result<Cbor<Result<WorkspaceRead, LoadError>>, Cancelled> {
-        let mut config = match cx.get::<ConfigChain>(&key.config)?.get() {
+        let config = match cx.get::<ConfigChain>(&key.config)?.get() {
             Ok(config) => config,
             Err(error) => return Ok(Cbor(Err(error))),
         };
@@ -154,29 +125,13 @@ impl Query for WorkspaceQuery {
             },
             (None, ConfigOf::Fixed { .. }) => None,
         };
-        let fill = Fill { config: &key.config, own: None, members: true };
-        let base = std::mem::take(&mut config.snapshot);
-        let (found, used) = run_over(cx, base, &fill, |_, files, _| {
-            Ok(read_workspace(&config, files, manifest_path.as_deref()))
-        })?;
-        if let Some(at) = used.unmounted() {
-            return Ok(Cbor(Err(unmounted_error(at))));
-        }
-        Ok(Cbor(found.map(|mut read| {
-            read.snapshot = used.canonical();
-            read
-        })))
+        let found = read_through(cx, &key.config, |files| Ok(read_workspace(&config, files, manifest_path.as_deref())))?;
+        Ok(Cbor(found.and_then(|it| it)))
     }
 }
 
-fn read_workspace(
-    config: &ConfigRead,
-    files: Snap,
-    manifest_path: Option<&str>,
-) -> Result<WorkspaceRead, LoadError> {
-    let ctx = Context::new(
-        super::config::build(config, files.clone()).map_err(|error| load_error(&error, None))?,
-    );
+fn read_workspace(config: &ConfigRead, files: Snap<'_, '_>, manifest_path: Option<&str>) -> Result<WorkspaceRead, LoadError> {
+    let ctx = Context::new(super::config::build(config, files).map_err(|error| load_error(&error, None))?);
     let current = root_manifest(manifest_path, &config.cwd, &files)?;
     let ws = Workspace::new(Path::new(&current), &ctx).map_err(|error| load_error(&error, Some(current.clone())))?;
     let show = |path: &Path| path.display().to_string();
@@ -190,20 +145,20 @@ fn read_workspace(
         });
     }
     Ok(WorkspaceRead {
+        // clone: the configuration's inputs, which the workspace's value keeps.
         config: config.clone(),
         current: show(ws.current_manifest()),
         root_manifest: show(ws.root_manifest()),
         default_members: ws.default_members().map(|(path, _)| show(path)).collect(),
         members,
         is_virtual: ws.is_virtual(),
-        snapshot: Snapshot::default(),
         warnings,
     })
 }
 
 /// The manifest cargo reads: `--manifest-path`'s, or the nearest `Cargo.toml` from the cwd up,
 /// as cargo's `find_root_manifest_for_wd` and `root_manifest` say it.
-fn root_manifest(manifest_path: Option<&str>, cwd: &str, files: &Snap) -> Result<String, LoadError> {
+fn root_manifest<F: Files>(manifest_path: Option<&str>, cwd: &str, files: &F) -> Result<String, LoadError> {
     use blaze_manifest::files::FileKind;
     if let Some(path) = manifest_path {
         let path = super::files::normal(Path::new(path)).unwrap_or_else(|| path.to_owned());
@@ -244,57 +199,89 @@ fn root_manifest(manifest_path: Option<&str>, cwd: &str, files: &Snap) -> Result
     Err(LoadError { what: format!("could not find `Cargo.toml` in `{cwd}` or any parent directory"), at: None })
 }
 
-/// The workspace `read` describes read again over `base`, its snapshot (moved out of it, so
-/// no file is copied), handed to `then` with its context.
-pub(crate) fn replay<'db, R>(
+/// The workspace `read` describes, read again in one step over `cx` through `config_of`'s
+/// mounts and handed to `then` with its context. Its manifests are their [`ManifestQuery`]s,
+/// parsed already; what `then` reads past them is read when it asks.
+pub(crate) fn in_workspace<'db, R>(
     cx: &mut Cx<'db>,
     read: &WorkspaceRead,
-    base: Snapshot,
     config_of: &ConfigOf,
-    mut then: impl FnMut(&mut Cx<'db>, &Context<Snap>, &Workspace<'_, Snap>, Snap, &Reads<'_>) -> Result<R, Cancelled>,
-) -> Result<(Result<R, LoadError>, Used), Cancelled> {
-    let fill = Fill { config: config_of, own: None, members: true };
-    run_over(cx, base, &fill, |cx, files, reads| {
-        let config = match super::config::build(&read.config, files.clone()) {
+    then: impl for<'r, 'a> FnOnce(&'a Context<Snap<'r, 'db>>, &'a Workspace<'a, Snap<'r, 'db>>) -> Result<R, Cancelled>,
+) -> Result<Result<R, LoadError>, Cancelled> {
+    let answer = read_through(cx, config_of, |files| {
+        let config = match super::config::build(&read.config, files) {
             Ok(config) => config,
             Err(error) => return Ok(Err(load_error(&error, None))),
         };
         let ctx = Context::new(config);
         let ws = match Workspace::new(Path::new(&read.current), &ctx) {
             Ok(ws) => ws,
+            // clone: the path an error names.
             Err(error) => return Ok(Err(load_error(&error, Some(read.current.clone())))),
         };
-        then(cx, &ctx, &ws, files, reads).map(Ok)
-    })
+        then(&ctx, &ws).map(Ok)
+    })?;
+    Ok(answer.and_then(|it| it))
 }
 
-/// The source of a package a lock file pins to `source`, as blaze-manifest names it
-/// (blaze-metadata's `manifest_source`).
-pub(crate) fn manifest_source(
-    source: &str,
-    config: &blaze_manifest::Config<Snap>,
-) -> anyhow::Result<blaze_manifest::source::SourceId> {
-    use anyhow::Context as _;
-    use blaze_manifest::source::{CRATES_IO_INDEX, SourceId};
-    use cargo_util_schemas::core::GitReference;
-    let (kind, rest) = source.split_once('+').context("a source with no kind")?;
-    match kind {
-        "registry" if rest == CRATES_IO_INDEX => SourceId::crates_io(config),
-        "registry" => Ok(SourceId::for_registry(&rest.parse()?)),
-        "sparse" => Ok(SourceId::for_registry(&source.parse()?)),
-        "git" => {
-            let mut url: url::Url = rest.parse()?;
-            let query: rustc_hash::FxHashMap<String, String> = url.query_pairs().into_owned().collect();
-            let reference = match (query.get("branch"), query.get("tag"), query.get("rev")) {
-                (Some(branch), _, _) => GitReference::Branch(branch.clone()),
-                (_, Some(tag), _) => GitReference::Tag(tag.clone()),
-                (_, _, Some(rev)) => GitReference::Rev(rev.clone()),
-                _ => GitReference::DefaultBranch,
-            };
-            url.set_fragment(None);
-            url.set_query(None);
-            Ok(SourceId::for_git(&url, reference))
-        }
-        _ => anyhow::bail!("the source {source} is not one blaze reads yet"),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manifest kept in CBOR reads back as the same manifest, so a step that takes it from
+    /// its query sees what parsing the file would have given.
+    #[test]
+    fn a_parsed_manifest_is_kept_whole() {
+        let text = r#"
+[package]
+name = "a"
+version = "0.1.0"
+edition = "2021"
+authors = ["A <a@example.com>"]
+build = false
+links = "z"
+
+[package.metadata.blaze]
+tests = false
+when = 1979-05-27T07:32:00Z
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "b"
+required-features = ["x"]
+
+[features]
+default = ["x"]
+x = ["dep:serde", "serde?/derive"]
+
+[dependencies]
+serde = { version = "1", optional = true, default-features = false }
+local = { path = "../local" }
+git = { git = "https://example.com/g", branch = "main" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies.inherited]
+workspace = true
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+debug = 1
+
+[lints.rust]
+unused = { level = "warn", priority = -1 }
+
+[workspace]
+members = ["m/*"]
+"#;
+        let parsed = blaze_manifest::manifest::parse_manifest(Path::new("/w/Cargo.toml"), text.as_bytes()).unwrap();
+        let kept = blaze_protocol::cbor::to_vec(&Parsed::Here(parsed.clone())).unwrap();
+        let Parsed::Here(read) = blaze_protocol::cbor::from_slice::<Parsed>(&kept).unwrap() else { panic!("not here") };
+        assert_eq!(toml::to_string(&read).unwrap(), toml::to_string(&parsed).unwrap());
     }
 }

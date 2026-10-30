@@ -19,6 +19,8 @@ writing these files now.
 
 > forwarded to codegen: codegen-inline is its child.
 
+> taken by codegen (lead, 2026-10-29): codegen-inline is DONE, so `hir-ty-mir`'s owner, child codegen-rq-mir, does it. The enum is `hir_ty::intrinsic::Intrinsic` and the terminator has `Call::intrinsic: Option<Intrinsic>` (`hir-ty/src/mir.rs:639`).
+
 ## To fastcompile-ident-share (`crates/hir-ty-share/`)
 
 `src/lib.rs` declares `mod intrinsics` (`classify`, `Class`) and

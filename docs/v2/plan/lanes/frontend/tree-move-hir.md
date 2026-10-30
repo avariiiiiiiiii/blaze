@@ -58,7 +58,7 @@ handle path.
   `speculative_resolve_view(ast::Path<'_>)` is the view twin; `speculative_resolve_mod_path(&ModPath)`,
   which blaze-lints calls, is frontend-tree-move-tools' request in `v2/requests/db.md`),
   `resolve_path(_with_subst)`,
-  `resolve_path_per_ns`, `resolve_mod_path`, `resolve_method_call(_as_callable)`,
+  `resolve_path_per_ns`, `resolve_mod_path`, `resolve_method_call`, `resolve_method_call_as_callable`,
   `resolve_expr_as_callable`, `resolve_field`, `resolve_record_field(_with_substitution)`,
   `resolve_record_pat_field(_with_subst)`, `resolve_variant`, `resolve_bind_pat_to_const`,
   `resolve_macro_call`, `resolve_macro_call2`, `is_proc_macro_call`, `resolve_macro_call_arm`,

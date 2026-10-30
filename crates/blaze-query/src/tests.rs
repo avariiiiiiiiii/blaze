@@ -15,7 +15,7 @@ use blaze_vfs::{Bytes, Mode, View, ViewId};
 use intern::Live;
 
 use crate::{
-    Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, MemTree, Query,
+    Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, MemTree, Names as Lent, Query,
     QueryKey, QueryKind, Stored, Tree, kinds,
     subtree::{Digest, Subtree, SubtreeKey},
     table::{Aligned, EdgeRecord},
@@ -1073,6 +1073,25 @@ fn a_revalidation_that_changes_nothing_allocates_nothing() {
     assert_eq!((runs("double"), runs("len")), (1, 1), "verified, not run again");
 }
 
+/// A new view of a tree that an open view resolved verifies with nothing allocated: its tables
+/// are sized like that view's, and a directory's names are hashed as the tree lends them.
+#[test]
+fn verifying_in_a_new_view_of_the_same_tree_allocates_nothing() {
+    let (db, tree) = setup();
+    let files = [("a", "abc"), ("d/x", "1"), ("d/y", "2")];
+    let first = view(&db, &tree, &files);
+    let (name, dir) = ("a".to_owned(), "d".to_owned());
+    assert_eq!(double(&db, first, "a"), 6);
+    assert_eq!(db.pin().get::<Names>(first, &dir), Ok(2));
+    let again = view(&db, &tree, &files);
+    let pinned = db.pin();
+    let got = blaze_alloc_count::assert_at_most(0, "verifying in a new view", || {
+        (pinned.get::<Double>(again, &name), pinned.get::<Names>(again, &dir))
+    });
+    assert_eq!(got, (Ok(6), Ok(2)));
+    assert_eq!((runs("double"), runs("names")), (1, 1), "verified, not run again");
+}
+
 /// Once warm, a collection that finds nothing new to drop allocates nothing.
 #[test]
 fn a_warm_collection_allocates_nothing() {
@@ -1168,8 +1187,8 @@ impl Tree for Breaking {
         }
         self.files.file(root, path)
     }
-    fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
-        self.files.list(root, path)
+    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Lent<'_, '_>)) -> bool {
+        self.files.read_dir(root, path, read)
     }
 }
 
@@ -1283,10 +1302,11 @@ impl Tree for Backwards {
     fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
         self.0.file(root, path)
     }
-    fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
-        let mut names = self.0.list(root, path)?;
+    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Lent<'_, '_>)) -> bool {
+        let Some(mut names) = self.0.list(root, path) else { return false };
         names.reverse();
-        Some(names)
+        read(&mut names.iter().map(|(name, dir)| (name.as_str(), *dir)));
+        true
     }
 }
 
@@ -1315,7 +1335,18 @@ thread_local! {
 }
 
 #[test]
-fn a_listing_is_sorted_once_whatever_order_the_tree_gives() {
+fn a_query_reads_each_directorys_names_sorted() {
+    let (mut db, tree) = setup();
+    db.register::<Listing>();
+    let one = view(&db, &tree, &[("b", "1"), ("c/x", "2"), ("a", "3")]);
+    assert_eq!(db.pin().get::<Listing>(one, &String::new()), Ok(3));
+    assert_eq!(LISTED.with(|listed| listed.borrow().clone()), "a,b,c");
+    assert_eq!(db.pin().get::<Listing>(one, &"c".to_owned()), Ok(1));
+    assert_eq!(LISTED.with(|listed| listed.borrow().clone()), "x");
+}
+
+#[test]
+fn a_tree_that_lists_out_of_order_stops_the_read_naming_the_directory() {
     reset();
     let files: &[(&str, &[u8])] = &[("b", b"1"), ("c/x", b"2"), ("a", b"3")];
     let backwards = Arc::new(Backwards(MemTree::default()));
@@ -1324,13 +1355,10 @@ fn a_listing_is_sorted_once_whatever_order_the_tree_gives() {
     register(&mut db);
     db.register::<Listing>();
     let one = db.open(View { root });
-    assert_eq!(db.pin().get::<Listing>(one, &String::new()), Ok(3));
-    assert_eq!(LISTED.with(|listed| listed.borrow().clone()), "a,b,c");
-    let reversed = tree_of(&db, one, "", false);
-
-    let (sorted_db, sorted) = setup();
-    let other = sorted_db.open(View { root: sorted.root(files) });
-    assert_eq!(tree_of(&sorted_db, other, "", false), reversed, "the hash does not see the tree's order");
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.pin().get::<Listing>(one, &String::new())));
+    let panic = failed.expect_err("a listing out of order is the tree's error");
+    let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or("");
+    assert!(message.contains("listed directory \"\"") && message.contains("out of order"), "{message}");
 }
 
 static SPREAD: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
@@ -1535,4 +1563,266 @@ fn a_warm_get_all_allocates_only_its_list() {
     assert_eq!(db.pin().get::<CountedAll>(one, &(asked.clone(), 0)), Ok(fold(0..16)));
     assert_eq!(db.pin().get::<CountedAll>(one, &(asked, 1)), Ok(fold(0..16)));
     assert_eq!(WARM_ALL.load(Ordering::SeqCst), 1, "a warm get_all allocated more than its list");
+}
+
+/// A file's length, of a kind whose equal values are kept once.
+struct SameLen;
+
+impl Query for SameLen {
+    const KIND: QueryKind = QueryKind(0x2f14);
+    const NAME: &'static str = "same len";
+    const PRODUCER: ContentId = ContentId([0x14; 32]);
+    const SHARE: bool = true;
+    type Key = String;
+    type Value = Num;
+    fn input(key: &String) -> ContentId {
+        key_id(key)
+    }
+    fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
+        ran("same len");
+        Ok(Num(cx.file(key)?.map_or(u64::MAX, |file| file.bytes.len() as u64)))
+    }
+}
+
+fn same_len(db: &Database, view: ViewId, name: &str) -> u64 {
+    db.pin().get::<SameLen>(view, &name.to_owned()).expect("same len")
+}
+
+/// Each memo's value word of `name`'s key.
+fn words(db: &Database, name: &str) -> Vec<u64> {
+    let task = blaze_reclaim::enter();
+    db.slot(&task, &key::<SameLen>(name))
+        .map_or_else(Vec::new, |slot| slot.memos().iter().map(|&memo| db.store.value_word(&task, memo)).collect())
+}
+
+/// Collects until every memo let go of is freed: other tests' threads may still be in tasks
+/// that began before it was unlinked.
+fn collect_until_freed(db: &Database) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut effects = Vec::new();
+    loop {
+        db.collect(&[], &mut effects);
+        assert!(effects.is_empty(), "nothing cold to write: {effects:?}");
+        if db.store.dying() == 0 {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "what the collections let go of was never freed");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// A shared kind's equal values, from two keys and from one key's memos in two views (its
+/// file differs, its length doesn't), are one value row: every memo's word names it.
+fn shared_three() -> (Database, Arc<MemTree>, ViewId, ViewId) {
+    let (mut db, tree) = setup();
+    db.register::<SameLen>();
+    let one = view(&db, &tree, &[("a", "xyz"), ("b", "abc")]);
+    let two = view(&db, &tree, &[("a", "pqr")]);
+    assert_eq!((same_len(&db, one, "a"), same_len(&db, one, "b"), same_len(&db, two, "a")), (3, 3, 3));
+    assert_eq!(runs("same len"), 3, "a's file differs in the two views: it runs in each");
+    (db, tree, one, two)
+}
+
+#[test]
+fn equal_values_of_a_shared_kind_from_two_views_and_two_keys_hold_one_row() {
+    let (db, _tree, _, _) = shared_three();
+    let (a, b) = (words(&db, "a"), words(&db, "b"));
+    assert_eq!(a.len(), 2, "a has a memo for each view's file");
+    assert!(a.iter().chain(&b).all(|&word| word != 0 && word == b[0]), "one row: {a:?} {b:?}");
+    assert_eq!(db.store.shared_rows(), 1);
+}
+
+#[test]
+fn evicting_or_collecting_one_memo_keeps_the_others_shared_value() {
+    let (db, _tree, one, two) = shared_three();
+    let row = words(&db, "b")[0];
+    assert_eq!(db.evict(&key::<SameLen>("b")), 1);
+    assert_eq!(words(&db, "b"), [0], "b's memo let go of the row");
+    assert_eq!(words(&db, "a"), [row, row], "a's memos still name it");
+    assert_eq!((same_len(&db, one, "a"), runs("same len")), (3, 3), "a's value is read, not made again");
+    assert_eq!(same_len(&db, one, "b"), 3);
+    assert_eq!(runs("same len"), 4, "b's evicted value is made again");
+    assert_eq!(words(&db, "b"), [row], "and refilled into the shared row, not a row of its own");
+
+    db.close(two);
+    collect_until_freed(&db);
+    assert_eq!(words(&db, "a").len(), 1, "a's memo of the closed view is collected");
+    assert_eq!(db.store.shared_rows(), 1, "the row stays while a memo names it");
+    assert_eq!((same_len(&db, one, "a"), same_len(&db, one, "b"), runs("same len")), (3, 3, 4));
+
+    db.close(one);
+    collect_until_freed(&db);
+    assert_eq!(db.store.shared_rows(), 0, "no memo names the row: it is freed");
+    let task = blaze_reclaim::enter();
+    assert!(db.slot(&task, &key::<SameLen>("a")).is_none() && db.slot(&task, &key::<SameLen>("b")).is_none());
+}
+
+/// The image writes equal values once, whatever their kind: a shared kind's memos and a plain
+/// kind's map the same bytes of the blob once started from it.
+#[test]
+fn equal_values_go_into_the_image_once() {
+    let (db, tree, one, _) = shared_three();
+    assert_eq!((db.pin().get::<Len>(one, &"a".to_owned()), db.pin().get::<Len>(one, &"b".to_owned())), (Ok(3), Ok(3)));
+    let (bytes, _) = image_of(&db, Builder::new());
+
+    let mut started = Database::open_image(config(&tree), opened(&bytes)).expect("an image");
+    register(&mut started);
+    started.register::<SameLen>();
+    reset();
+    let same = view(&started, &tree, &[("a", "xyz"), ("b", "abc")]);
+    assert_eq!((same_len(&started, same, "a"), same_len(&started, same, "b")), (3, 3));
+    let len = |name: &str| started.pin().get::<Len>(same, &name.to_owned());
+    assert_eq!((len("a"), len("b")), (Ok(3), Ok(3)));
+    assert_eq!((runs("same len"), runs("len")), (0, 0), "every memo verified from the image");
+
+    let task = blaze_reclaim::enter();
+    let at = |key: QueryKey| {
+        let slot = started.slot(&task, &key).expect("a key of the image");
+        let bytes = started.store.bytes(&task, *slot.memos().last().expect("a memo")).expect("mapped");
+        (bytes.as_ptr(), bytes.len())
+    };
+    let shared = at(key::<SameLen>("b"));
+    assert_eq!(at(key::<SameLen>("a")), shared, "a shared kind's equal values are one copy in the blob");
+    assert_eq!(at(key::<Len>("a")), shared, "so are any kind's: Len's value has the same bytes");
+    assert_eq!(at(key::<Len>("b")), shared);
+}
+
+/// A cold pack writes equal values once, whatever their kind, and every memo maps them.
+#[test]
+fn equal_values_go_into_a_cold_pack_once() {
+    let (db, tree) = setup();
+    let one = view(&db, &tree, &[("a", "xyz"), ("b", "abc")]);
+    assert_eq!((db.pin().get::<Len>(one, &"a".to_owned()), db.pin().get::<Len>(one, &"b".to_owned())), (Ok(3), Ok(3)));
+    db.close(one);
+    let mut effects = Vec::new();
+    db.collect(&[key::<Len>("a"), key::<Len>("b")], &mut effects);
+    let (_, bytes, tag) = written(&mut effects);
+    assert_eq!(bytes, crate::write_value(&Num(3)), "the pack holds the one value once");
+    db.complete(Completion { tag, done: Done::Written }, &mut effects);
+    let (_, tag) = mapped(&mut effects);
+    db.complete(Completion { tag, done: Done::Mapped(mapping(&bytes)) }, &mut effects);
+    for name in ["a", "b"] {
+        assert!(matches!(db.memo(&key::<Len>(name)).map(|memo| memo.value), Some(Stored::Disk(_))), "{name}");
+    }
+}
+
+/// A context [`Database::provide`] gives every query.
+struct Scale(u64);
+
+/// A file's length times the database's [`Scale`]; `u64::MAX` with none given.
+struct Scaled;
+
+impl Query for Scaled {
+    const KIND: QueryKind = QueryKind(0x2f15);
+    const NAME: &'static str = "scaled";
+    const PRODUCER: ContentId = ContentId([0x15; 32]);
+    type Key = String;
+    type Value = Num;
+    fn input(key: &String) -> ContentId {
+        key_id(key)
+    }
+    fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
+        let Some(&Scale(scale)) = cx.context::<Scale>() else { return Ok(Num(u64::MAX)) };
+        Ok(Num(cx.file(key)?.map_or(0, |file| file.bytes.len() as u64) * scale))
+    }
+}
+
+#[test]
+fn a_query_reads_the_context_of_its_type_the_database_was_given() {
+    let (mut db, tree) = setup();
+    db.register::<Scaled>();
+    let files = [("a", "abcd")];
+    let one = view(&db, &tree, &files);
+    assert_eq!(db.pin().get::<Scaled>(one, &"a".to_owned()), Ok(u64::MAX), "none given yet");
+
+    let (mut db, tree) = setup();
+    db.register::<Scaled>();
+    db.provide(Scale(3));
+    db.provide("a context of another type");
+    let one = view(&db, &tree, &files);
+    assert_eq!(db.pin().get::<Scaled>(one, &"a".to_owned()), Ok(12));
+}
+
+/// Model tests of the database's own lock-free state (docs/v2/plan/lanes/safety/model.md): the
+/// collection generation with each key's `born`, and the thread-local that marks a query
+/// running.
+#[cfg(blaze_check)]
+mod model {
+    use std::sync::{Arc, atomic::Ordering};
+
+    use blaze_check::{Builder, thread};
+    use blaze_ids::{ContentId, Fingerprint};
+
+    use super::WORD;
+    use crate::{Database, Inside, QueryKey, QueryKind, inside_a_query};
+
+    const KEY: QueryKey = QueryKey { kind: QueryKind(0x2f00), input: ContentId([3; 32]) };
+
+    /// `Database::add_memo` from two threads racing `Database::collect`: a memo given by a thread
+    /// that saw the collection's bump of the generation is young to it and kept; one given
+    /// before may go (no view reaches it). A key keeps only memos given, each once. Finding 0 of
+    /// the safety lane's request: before `born` was only raised, the giver that loaded the
+    /// generation first could lower the other's stamp, and this schedule dropped a young memo.
+    #[test]
+    fn model_collect_keeps_a_memo_given_after_it_bumped_the_generation() {
+        let mut builder = Builder::new();
+        // `collect` loads or locks each shard of each table a few times: each is a branch.
+        builder.max_branches = builder.max_branches.max(32 * blaze_ids::shard_count() + 10_000);
+        builder.check(|| {
+            let db = Arc::new(Database::empty());
+            let give = |fingerprint: u128| {
+                let db = db.clone();
+                thread::spawn(move || {
+                    let task = blaze_reclaim::enter();
+                    let code = db.store.code(WORD, ContentId([1; 32]));
+                    let made = db.store.make(KEY, Fingerprint(fingerprint), code, &[], &[]);
+                    let saw_bump = db.generation.load(Ordering::SeqCst) > 0;
+                    db.add_memo(&task, KEY, made);
+                    saw_bump
+                })
+            };
+            let givers = [give(1), give(2)];
+            // The one thread here in a `blaze_mem::frame::task` (`collect`'s scratch is the OS
+            // thread's, which every model thread shares).
+            db.collect(&[], &mut Vec::new());
+            let saw = givers.map(|giver| giver.join().expect("a giver"));
+            let task = blaze_reclaim::enter();
+            let kept: Vec<u128> = db.slot(&task, &KEY).map_or_else(Vec::new, |slot| {
+                slot.memos().iter().map(|&memo| db.store.fingerprint(&task, memo).0).collect()
+            });
+            assert!(kept.iter().all(|it| *it == 1 || *it == 2), "only memos given are kept: {kept:?}");
+            for (fingerprint, saw_bump) in [1, 2].into_iter().zip(saw) {
+                let count = kept.iter().filter(|it| **it == fingerprint).count();
+                assert!(count <= 1, "memo {fingerprint} is kept {count} times: {kept:?}");
+                assert!(
+                    !saw_bump || count == 1,
+                    "memo {fingerprint}, given after the collection bumped the generation, was dropped: {kept:?}"
+                );
+            }
+        });
+    }
+
+    /// `INSIDE` is each thread's own: one thread's running query is never another's, at any
+    /// interleaving of their marks.
+    #[test]
+    fn model_inside_a_query_is_per_thread() {
+        blaze_check::model(|| {
+            let other = thread::spawn(|| {
+                assert!(!inside_a_query(), "another thread's query is not this one's");
+                thread::yield_now();
+                let inside = Inside::enter();
+                thread::yield_now();
+                assert!(inside_a_query());
+                drop(inside);
+                assert!(!inside_a_query());
+            });
+            let inside = Inside::enter();
+            thread::yield_now();
+            assert!(inside_a_query(), "this thread's mark is its own");
+            drop(inside);
+            thread::yield_now();
+            assert!(!inside_a_query());
+            other.join().expect("the other thread");
+        });
+    }
 }

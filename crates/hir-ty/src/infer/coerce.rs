@@ -979,8 +979,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             for &expr in exprs {
                 self.write_expr_adj(
                     expr,
-                    // clone: `Adjust` is plain `Copy` data, `Copy` requested in `infer.rs`
-                    &[Adjustment { kind: prev_adjustment.clone(), target: fn_ptr.store() }],
+                    &[Adjustment { kind: prev_adjustment, target: fn_ptr.store() }],
                 );
             }
             self.write_expr_adj(

@@ -16,12 +16,19 @@ use std::sync::OnceLock;
 
 use base_db::Db;
 use hir_def::ModuleId;
+use rustc_type_ir::{
+    Interner as _, RegionKind, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    TypeVisitableExt as _, inherent::IntoKind as _,
+};
 
 use crate::{
     InferBodyId,
     db::{InternedClosureId, InternedCoroutineId, InternedOpaqueTyId},
     mir::{InlinedBody, MirBody, MirEvalError, MirLowerError, MirOptions, MirOwner, MirStage},
-    next_solver::{Allocation, GenericArgs, StoredGenericArgs, StoredTy, Ty},
+    next_solver::{
+        Allocation, DbInterner, GenericArgs, Region, StoredGenericArgs, StoredTy, Ty,
+        default_types,
+    },
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 
@@ -246,18 +253,18 @@ fn mir_loop4<'db, A, B, C, D>(_: &'db Db, _: salsa::Id, _: A, _: B, _: C, _: D) 
 
 // Built MIR.
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn mir_body_query<'db>(db: &'db Db, def: InferBodyId<'db>) -> Built<'db> {
     compute(db, MirOwner::Body(def), MirStage::Built)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn mir_body_for_closure_query<'db>(db: &'db Db, closure: InternedClosureId<'db>) -> Built<'db> {
     compute(db, MirOwner::Closure(closure), MirStage::Built)
 }
 
 /// The body of an `async` block, as the `Future::poll` of the block's type.
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -268,7 +275,7 @@ pub fn mir_body_for_coroutine_query<'db>(
 /// The body of the `async` block of an `async` closure that is called by value though it could
 /// be called again: the future that makes owns what the closure captured, where the block
 /// itself borrows from the closure.
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -278,7 +285,7 @@ pub fn mir_body_for_coroutine_by_move_query<'db>(
 
 // Built MIR, monomorphized.
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
 pub fn monomorphized_mir_body_query<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,
@@ -288,7 +295,7 @@ pub fn monomorphized_mir_body_query<'db>(
     compute_monomorphized(db, MirOwner::Body(owner), MirStage::Built, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
 pub fn monomorphized_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -298,7 +305,7 @@ pub fn monomorphized_mir_body_for_closure_query<'db>(
     compute_monomorphized(db, MirOwner::Closure(closure), MirStage::Built, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
 pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -308,7 +315,7 @@ pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     compute_monomorphized(db, MirOwner::Coroutine(coroutine), MirStage::Built, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
 pub fn monomorphized_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -321,12 +328,12 @@ pub fn monomorphized_mir_body_for_coroutine_by_move_query<'db>(
 
 // Runtime MIR.
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn runtime_mir_body_query<'db>(db: &'db Db, def: InferBodyId<'db>) -> Built<'db> {
     compute(db, MirOwner::Body(def), MirStage::Runtime)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn runtime_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -334,7 +341,7 @@ pub fn runtime_mir_body_for_closure_query<'db>(
     compute(db, MirOwner::Closure(closure), MirStage::Runtime)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn runtime_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -342,7 +349,7 @@ pub fn runtime_mir_body_for_coroutine_query<'db>(
     compute(db, MirOwner::Coroutine(coroutine), MirStage::Runtime)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -350,7 +357,7 @@ pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
     compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Runtime)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_runtime_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
@@ -360,7 +367,7 @@ pub fn monomorphized_runtime_mir_body_query<'db>(
     compute_monomorphized(db, MirOwner::Body(def), MirStage::Runtime, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_runtime_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -370,7 +377,7 @@ pub fn monomorphized_runtime_mir_body_for_closure_query<'db>(
     compute_monomorphized(db, MirOwner::Closure(closure), MirStage::Runtime, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_runtime_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -381,7 +388,7 @@ pub fn monomorphized_runtime_mir_body_for_coroutine_query<'db>(
     compute_monomorphized(db, owner, MirStage::Runtime, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_runtime_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -394,7 +401,7 @@ pub fn monomorphized_runtime_mir_body_for_coroutine_by_move_query<'db>(
 
 // Optimized MIR.
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
 pub fn optimized_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
@@ -403,7 +410,7 @@ pub fn optimized_mir_body_query<'db>(
     compute(db, MirOwner::Body(def), MirStage::Optimized(options))
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
 pub fn optimized_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -414,7 +421,7 @@ pub fn optimized_mir_body_for_closure_query<'db>(
 
 /// The body of an `async` block's `poll` with `options`: of the passes, only the UB checks run
 /// on a coroutine body.
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
 pub fn optimized_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -423,7 +430,7 @@ pub fn optimized_mir_body_for_coroutine_query<'db>(
     compute(db, MirOwner::Coroutine(coroutine), MirStage::Optimized(options))
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
 pub fn optimized_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -432,7 +439,7 @@ pub fn optimized_mir_body_for_coroutine_by_move_query<'db>(
     compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Optimized(options))
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
@@ -444,7 +451,7 @@ pub fn monomorphized_optimized_mir_body_query<'db>(
     compute_monomorphized(db, MirOwner::Body(def), stage, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -456,7 +463,7 @@ pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
     compute_monomorphized(db, MirOwner::Closure(closure), stage, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -468,7 +475,7 @@ pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
     compute_monomorphized(db, MirOwner::Coroutine(coroutine), stage, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -487,12 +494,55 @@ pub fn monomorphized_optimized_mir_body_for_coroutine_by_move_query<'db>(
 /// `ignore_for_traits` marks), generic in the parameters of the coroutine's parent, with regions
 /// erased. No cycle result: a goal on a coroutine of the body being inferred waits until that
 /// body is checked, as rustc's stalled coroutine goals, so a cycle here is a bug to stop on.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Mir)]
 pub fn coroutine_witnesses_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Box<[StoredTy]> {
-    (mir().coroutine_witnesses)(db, coroutine)
+    let mut witnesses = (mir().coroutine_witnesses)(db, coroutine);
+    let interner = DbInterner::new_no_crate(db);
+    for witness in witnesses.iter_mut() {
+        *witness = erase_regions(interner, witness.as_ref()).store();
+    }
+    witnesses
+}
+
+/// rustc's `erase_regions`: every free region `'erased`, and every binder's variables
+/// anonymized. MIR locals keep typeck's regions (`'static`, early-bound parameters, errors).
+pub(crate) fn erase_regions<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
+    return ty.fold_with(&mut EraseRegions { interner });
+
+    struct EraseRegions<'db> {
+        interner: DbInterner<'db>,
+    }
+
+    impl<'db> TypeFolder<DbInterner<'db>> for EraseRegions<'db> {
+        fn cx(&self) -> DbInterner<'db> {
+            self.interner
+        }
+
+        fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+            if ty.has_type_flags(TypeFlags::HAS_BINDER_VARS | TypeFlags::HAS_FREE_REGIONS) {
+                ty.super_fold_with(self)
+            } else {
+                ty
+            }
+        }
+
+        fn fold_binder<T: TypeFoldable<DbInterner<'db>>>(
+            &mut self,
+            t: rustc_type_ir::Binder<DbInterner<'db>, T>,
+        ) -> rustc_type_ir::Binder<DbInterner<'db>, T> {
+            self.interner.anonymize_bound_vars(t).super_fold_with(self)
+        }
+
+        fn fold_region(&mut self, region: Region<'db>) -> Region<'db> {
+            match region.kind() {
+                RegionKind::ReBound(..) => region,
+                _ => default_types().regions.erased,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -522,6 +572,41 @@ mod tests {
     #[test]
     fn a_table_registered_once_is_found() {
         assert_eq!(one::<Once>("the-crate").0, 7);
+    }
+
+    #[test]
+    fn a_witness_keeps_no_free_region_and_its_bound_regions() {
+        use rustc_type_ir::{BoundVar, INNERMOST, Mutability, inherent::Ty as _};
+
+        use crate::next_solver::{BoundRegionKind, BoundVarKinds, BoundVariableKind};
+
+        let db = Db::for_tests();
+        let interner = DbInterner::new_no_crate(&db);
+        let types = &default_types().types;
+        let regions = &default_types().regions;
+        let anon = BoundVariableKind::Region(BoundRegionKind::Anon);
+        let shared = |region, ty| Ty::new_ref(interner, region, ty, Mutability::Not);
+        // `for<'a> fn(&'a u8, &'r u16)`.
+        let fn_ptr = |r| {
+            let bound = Region::new_anon_bound(interner, INNERMOST, BoundVar::from_u32(0));
+            let sig = interner
+                .mk_fn_sig_safe_rust_abi([shared(bound, types.u8), shared(r, types.u16)], types.unit);
+            Ty::new_fn_ptr(
+                interner,
+                rustc_type_ir::Binder::bind_with_vars(sig, BoundVarKinds::new_from_slice(&[anon])),
+            )
+        };
+
+        for (ty, erased) in [
+            (
+                shared(regions.statik, shared(regions.error, types.u32)),
+                shared(regions.erased, shared(regions.erased, types.u32)),
+            ),
+            (fn_ptr(regions.statik), fn_ptr(regions.erased)),
+            (types.u32, types.u32),
+        ] {
+            assert_eq!(erase_regions(interner, ty), erased, "{ty:?}");
+        }
     }
 
     #[test]

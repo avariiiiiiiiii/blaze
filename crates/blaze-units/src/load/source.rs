@@ -23,8 +23,7 @@ use anyhow::{anyhow, bail};
 use blaze_manifest::Config;
 use blaze_manifest::files::Files;
 use blaze_query::{Cancelled, Cx};
-use blaze_resolve::{CRATES_IO_REGISTRY, GitReference, PackageId, SourceId, SourceKind};
-use cargo_util_schemas::core as manifest_core;
+use blaze_resolve::{CRATES_IO_REGISTRY, PackageId, SourceId, SourceKind};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
@@ -449,10 +448,7 @@ struct SourceMap {
 
 impl SourceMap {
     fn new<F: Files>(config: &Config<F>) -> anyhow::Result<SourceMap> {
-        let crates_io = match config.crates_io_maybe_sparse_http()?.kind {
-            manifest_core::SourceKind::SparseRegistry => SourceId::crates_io_sparse(),
-            _ => SourceId::crates_io(),
-        };
+        let crates_io = config.crates_io_maybe_sparse_http()?;
         let mut map = SourceMap {
             by_name: FxHashMap::default(),
             names: FxHashMap::default(),
@@ -467,9 +463,9 @@ impl SourceMap {
             }
             let id = match name.as_str() {
                 CRATES_IO_REGISTRY => crates_io,
-                _ => source_id(&name, &def.id)?,
+                _ => def.id,
             };
-            map.add(&name, Replacement { id, with: def.replace_with.clone() })?;
+            map.add(&name, Replacement { id, with: def.replace_with })?;
         }
         let named: Vec<String> = map
             .by_name
@@ -478,9 +474,7 @@ impl SourceMap {
             .filter(|name| !map.by_name.contains_key(name))
             .collect();
         for name in named {
-            if let Ok(id) = blaze_manifest::source::SourceId::alt_registry(config, &name)
-                && let Ok(id) = SourceId::for_alt_registry(&id.url, &name)
-            {
+            if let Ok(id) = blaze_manifest::source::alt_registry(config, &name) {
                 map.registries.insert(name, id);
             }
         }
@@ -549,30 +543,6 @@ impl SourceMap {
             );
         }
         Ok(replaced)
-    }
-}
-
-/// A `[source.<name>]` location as blaze-manifest reads it, as the resolver names sources.
-fn source_id(name: &str, id: &blaze_manifest::source::SourceId) -> anyhow::Result<SourceId> {
-    let path = || {
-        id.url.to_file_path().map_err(|()| anyhow!("`source.{name}` names `{}`, which is not a path", id.url))
-    };
-    match &id.kind {
-        manifest_core::SourceKind::Registry | manifest_core::SourceKind::SparseRegistry => {
-            SourceId::for_source_replacement_registry(&id.url, name)
-        }
-        manifest_core::SourceKind::LocalRegistry => SourceId::for_local_registry(&path()?),
-        manifest_core::SourceKind::Directory => SourceId::for_directory(&path()?),
-        manifest_core::SourceKind::Git(reference) => {
-            let reference = match reference {
-                manifest_core::GitReference::Branch(it) => GitReference::Branch(it.clone()),
-                manifest_core::GitReference::Tag(it) => GitReference::Tag(it.clone()),
-                manifest_core::GitReference::Rev(it) => GitReference::Rev(it.clone()),
-                manifest_core::GitReference::DefaultBranch => GitReference::DefaultBranch,
-            };
-            SourceId::for_git(&id.url, reference)
-        }
-        _ => bail!("`source.{name}` is not a source blaze reads yet"),
     }
 }
 

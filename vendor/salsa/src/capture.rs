@@ -82,6 +82,43 @@ impl Reads {
         self.accumulated
     }
 
+    /// How many reads this holds.
+    pub fn len(&self) -> usize {
+        self.edges as usize
+    }
+
+    /// Whether this holds no reads.
+    pub fn is_empty(&self) -> bool {
+        self.edges == 0
+    }
+
+    /// Calls `f` with each read, in read order: its key, what its ingredient holds and the
+    /// ingredient's debug name, until `f` breaks.
+    ///
+    /// # Panics
+    ///
+    /// If `self` was captured in another revision than `db`'s current one.
+    pub fn for_each_read(
+        &self,
+        // dyn: the edge: salsa's public database handle, and one ingredient lookup per read
+        db: &dyn Database,
+        mut f: impl FnMut(crate::DatabaseKeyIndex, crate::ReadKind, &'static str) -> std::ops::ControlFlow<()>,
+    ) -> std::ops::ControlFlow<()> {
+        let zalsa = db.zalsa();
+        assert!(
+            self.revision == zalsa.current_revision(),
+            "salsa: `Reads::for_each_read` of reads captured in revision {:?}, in revision {:?}",
+            self.revision,
+            zalsa.current_revision(),
+        );
+        for (edge, _) in self.edges(zalsa.graph()) {
+            let key = edge.key();
+            let ingredient = zalsa.lookup_ingredient(key.ingredient_index());
+            f(key, ingredient.read_kind(), ingredient.debug_name())?;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
     /// The edges in read order, each with the fingerprint it was read with
     /// ([`Fingerprint::NONE`] for none).
     pub(crate) fn edges<'g>(

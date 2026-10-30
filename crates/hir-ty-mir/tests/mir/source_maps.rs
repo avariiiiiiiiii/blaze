@@ -1,6 +1,7 @@
 //! MIR reads a body's source map only where it emits a position: lowering a body, checking
-//! its macro calls and evaluating a constant without `line!`, `column!`, `file!` or `concat!`
-//! build no map, and the places those macros give are where they are written.
+//! its macro calls and evaluating a constant without `file!` or `concat!` build no map
+//! (`line!` and `column!` expand to their values), and the places those macros give are where
+//! they are written.
 
 use hir_ty::{db::HirDatabase, next_solver::GenericArgs};
 use hir_ty_mir::mir::{MirOptLevel, MirOptions};
@@ -102,6 +103,18 @@ fn evaluating_a_constant_without_location_macros_builds_no_source_map() {
     hir_ty::attach_db(&db, || {
         let executed = db.log_executed(|| {
             assert_eq!(bytes(&db, "GOAL"), 6u32.to_le_bytes());
+        });
+        assert_no_map(&executed);
+    });
+}
+
+#[test]
+fn evaluating_line_and_column_builds_no_source_map() {
+    let (db, _) = TestDB::with_single_file(PLACED);
+    hir_ty::attach_db(&db, || {
+        let executed = db.log_executed(|| {
+            bytes(&db, "LINE");
+            bytes(&db, "COLUMN");
         });
         assert_no_map(&executed);
     });

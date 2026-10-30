@@ -54,6 +54,13 @@ impl Reads {
         self.env.is_empty() && self.macros.is_empty()
     }
 
+    /// The names read: the process variables `env!` and `option_env!` read, and each
+    /// expansion's names as its server encodes them (an `ExpansionReads::Traced` shape), each
+    /// sorted.
+    pub fn names(&self) -> (&[Box<str>], impl Iterator<Item = &[u8]>) {
+        (&self.env, self.macros.iter().map(|(shape, _)| &**shape))
+    }
+
     /// The reads of `krate` as it is resolved in `db`: the proc-macro expansions of every macro
     /// call of its modules, of `calls` (those its signatures name,
     /// [`super::signatures::encode`]) and of each call any of them is in the expansion of; and
@@ -231,7 +238,7 @@ impl Reads {
 }
 
 /// Slot `n` of the crate whose key is `key`: where the `n`th set of names it read is kept.
-pub(crate) fn slot(key: ContentId, n: u32) -> ContentId {
+pub fn slot(key: ContentId, n: u32) -> ContentId {
     let mut hasher = Hasher::new(READS_DOMAIN);
     hasher.part(b"slot").id(&key).update(&n.to_le_bytes());
     hasher.finish()
@@ -239,7 +246,7 @@ pub(crate) fn slot(key: ContentId, n: u32) -> ContentId {
 
 /// Where the image of the crate whose key is `key` is, for the reads `record` (a slot's bytes)
 /// and the values `values` they have.
-pub(crate) fn image_key(key: ContentId, record: &[u8], values: ContentId) -> ContentId {
+pub fn image_key(key: ContentId, record: &[u8], values: ContentId) -> ContentId {
     let mut hasher = Hasher::new(READS_DOMAIN);
     hasher.part(b"image").id(&key).part(record).id(&values);
     hasher.finish()

@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 use base_db::{Db, Crate, FileId};
 use hir_def::{CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTy, AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitor,
     inherent::{BoundExistentialPredicates as _, IntoKind, ParamEnv as _, SliceLike as _},
@@ -263,12 +263,20 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
 /// for it. Read once, as [`Homes::home`] is asked for each instance a function calls.
 static NO_HOME: LazyLock<bool> = LazyLock::new(|| std::env::var_os("BLAZE_NO_HOME").is_some());
 
-/// Picks the crate each instance is compiled as.
-#[derive(Default)]
-pub(super) struct Homes {
-    /// What each crate can see: itself and the crates whose impls it knows.
-    sees: FxHashMap<Crate, FxHashSet<Crate>>,
+/// What `krate` can see: itself and the crates whose impls it knows ([`loaded_crates`]),
+/// sorted to be probed by binary search. One memo for every task that asks.
+#[salsa::tracked(returns(deref))]
+fn sees(db: &Db, krate: Crate) -> Box<[Crate]> {
+    // alloc: the memo's result, one exact block
+    let mut sees: Box<[Crate]> = loaded_crates(db, krate).into();
+    sees.sort_unstable();
+    sees
 }
+
+/// Picks the crate each instance is compiled as. It holds nothing: what a crate sees is the
+/// database's memo ([`sees`]).
+#[derive(Default)]
+pub(super) struct Homes;
 
 impl Homes {
     /// The environment to compile `instance` in when a function compiled in `asked` asks for
@@ -289,11 +297,8 @@ impl Homes {
             return asked.clone();
         }
         let home = mentions.crates.iter().copied().find(|&krate| {
-            let sees = self
-                .sees
-                .entry(krate)
-                .or_insert_with(|| loaded_crates(db, krate).iter().copied().collect());
-            mentions.crates.iter().all(|it| sees.contains(it))
+            let sees = sees(db, krate);
+            mentions.crates.iter().all(|it| sees.binary_search(it).is_ok())
         });
         match home {
             Some(krate) => ParamEnvAndCrate { krate, ..asked.as_ref(db) }.store(),

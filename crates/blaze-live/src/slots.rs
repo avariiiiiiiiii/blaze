@@ -16,6 +16,10 @@
 //! the directory (inotify, kqueue, change notifications) and counts them, so [`Live::poll`]
 //! is one atomic load while nothing came.
 //!
+//! An image linked with an execution log ([`exec`]) keeps its cell on the log's table, and a
+//! switch stores only the header's current table; [`publish`] writes one slot into every
+//! generation's table, for lazy compilation's code placed after the link.
+//!
 //! Linux on x86-64 and AArch64, macOS on AArch64 and Windows on x86-64; elsewhere
 //! [`Live::start`] says so.
 
@@ -36,10 +40,12 @@ use std::{
 use crate::patch::{
     ANSWER, Answer, DESCRIPTOR, DESCRIPTOR_MAGIC, Descriptor, Message, message_file_into,
 };
+pub use exec::publish;
 use os::backtrace;
 use switch::{KEPT, Layout, Switch};
 
 mod column;
+pub mod exec;
 mod hook;
 mod image;
 mod switch;
@@ -107,7 +113,7 @@ mod os {
             match *self {}
         }
 
-        fn loaders(&self, _: u64, _: u64) -> &[u64] {
+        fn loaders(&self, _: u64, _: u64) -> &[std::sync::atomic::AtomicU64] {
             match *self {}
         }
 
@@ -133,6 +139,10 @@ mod os {
     }
 
     pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
+        Err(PLATFORMS.to_owned())
+    }
+
+    pub(super) fn in_image_of(_: &Range<u64>, _: u64) -> Result<(), String> {
         Err(PLATFORMS.to_owned())
     }
 

@@ -27,7 +27,7 @@ use smallvec::SmallVec;
 
 use super::{between, can_be_used_for_suggestions, edition, end_point, significant_drop::SignificantDrops};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Level, Span, SuggestionStyle},
 };
@@ -57,7 +57,7 @@ impl LatePass for IfLetRescope {
     // first when `if_let_rescope` is in `lints_that_dont_need_to_run`, so skipping skips both.
     const LINTS: LintSet = lint_set(["if_let_rescope"]);
     const HOOKS: Hooks = Hooks::BODY;
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Block, ExprTag::Match, ExprTag::If, ExprTag::Loop]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Block, ExprKind::Match, ExprKind::If, ExprKind::Loop]);
 
     fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
         self.skip.clear();

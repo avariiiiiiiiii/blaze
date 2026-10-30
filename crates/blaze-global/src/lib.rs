@@ -6,7 +6,8 @@
 //!   public is judged where it is made. A [`public::Rule`] takes how a key was made (a query's
 //!   inputs, a build script's or proc macro's run with what it read, an LLVM-optimized
 //!   function with the instances it builds in), makes the key again with the owning crate's
-//!   own function, and checks every input: a crates.io crate version by its checksum, the
+//!   own function (a dependency's front-end image, whose key only the front end can make, by
+//!   what the walk that made it covered), and checks every input: a crates.io crate version by its checksum, the
 //!   pinned toolchain, the builders' system image. What passes is a [`public::Public`], the
 //!   only thing this crate publishes or fetches. A workspace member, a path, git or private
 //!   registry dependency, a variable of the machine's environment, or anything not traced is
@@ -29,6 +30,7 @@
 //!   lock's [`bundle::BundleId`], fetched in parallel and placed in the store.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 pub mod bundle;
 pub mod client;
@@ -38,6 +40,9 @@ pub mod server;
 pub mod sign;
 pub mod tls;
 pub mod wire;
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 #[cfg(test)]
 mod tests;
 
@@ -50,7 +55,10 @@ pub(crate) use blaze_ids::prehashed::ByHash;
 pub use crate::{
     bundle::{BundleId, BundleSpec, Download, Downloaded, Locked, Manifest},
     client::{Client, Endpoint, GotBundle, Published},
-    public::{FnSource, FunctionMade, Origin, Private, Public, QueryMade, Root, Rule, RunMade, RunPart, Secrets},
+    public::{
+        FnSource, FunctionMade, ImageMade, ImagePart, ImageRead, Origin, Private, Public, QueryMade, Root, Rule, RunMade,
+        RunPart, Secrets,
+    },
     server::{Server, record_key},
     sign::{PINNED, Publisher, PublisherKey, Record, Signed, Trust},
     tls::{Channel, Channels, Tls, TlsClient, TlsServer},

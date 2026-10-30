@@ -426,6 +426,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             panic_unwinds: Vec::with_capacity(0),
             promoted_constants: Vec::with_capacity(0),
             unreachable_after_calls: Vec::with_capacity(0),
+            guard_refs: Vec::with_capacity(0),
+            capture_copies: Vec::with_capacity(0),
             inlined: Default::default(),
         };
         let store_owner = owner.expression_store_owner(db);
@@ -3004,7 +3006,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             return in_bounds && self.is_promotable_unadjusted(base);
         }
         let is_fn = matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnDef(..));
-        let adjustments = self.infer.expr_adjustments.get(&expr).map_or(&[][..], |it| &**it);
+        let adjustments = self.infer.expr_adjustments.get(&expr).unwrap_or_default();
         // Unsizing a reference to a constant, `&[1, 2]` to a slice say, leaves it one: rustc's
         // `promote_consts::Validator::validate_rvalue` lets every cast through that is not of
         // a pointer to an integer.
@@ -3411,7 +3413,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         expr_id: ExprId,
         current: BasicBlockId,
     ) -> Result<'db, Option<(Operand, BasicBlockId)>> {
-        let adjustments = self.infer.expr_adjustments.get(&expr_id).cloned().unwrap_or_default();
+        let adjustments = self.infer.expr_adjustments.get(&expr_id).unwrap_or_default();
         let Some((Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(_)), .. }, rest)) =
             adjustments.split_last()
         else {

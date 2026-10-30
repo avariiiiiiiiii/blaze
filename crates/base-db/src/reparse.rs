@@ -114,6 +114,9 @@ impl Reparse {
     /// the kept parse when there is one; kept for the next text.
     pub(crate) fn parse(&self, text: &Text, edition: Edition, outline: bool) -> Parse<SourceFile> {
         debug_assert!(text.ptr_eq(&self.slot.text), "a reparse of another text");
+        if let Some(own) = self.own(edition, outline) {
+            return own;
+        }
         let parse = match self.previous(edition, outline) {
             Some((previous, delete)) => {
                 #[cfg(test)]
@@ -129,6 +132,33 @@ impl Reparse {
         };
         self.keep(&parse, edition, outline);
         parse
+    }
+
+    /// Takes `parse`, a full parse its caller made of this text in `edition` (an edit's tree
+    /// reparsed in place, `blaze_intent::Seed`), as the text's parse: [`Reparse::parse`] returns
+    /// it while it lives. It is kept weakly, as the parses `parse` makes are, so the caller holds
+    /// it until the file is parsed. `false`, and nothing kept, when its text is not this one or
+    /// the slot has a live parse of the edition already.
+    pub(crate) fn seed(&self, text: &Text, edition: Edition, parse: &Parse<SourceFile>) -> bool {
+        debug_assert!(text.ptr_eq(&self.slot.text), "a seed of another text");
+        if parse.root().text() != text.as_str() {
+            return false;
+        }
+        if cfg!(debug_assertions) {
+            assert_whole(parse, text, edition, false);
+        }
+        self.keep(parse, edition, false)
+    }
+
+    /// A live parse of this text in `edition` and of the kind: a seed, or one `parse` made
+    /// that something still holds.
+    fn own(&self, edition: Edition, outline: bool) -> Option<Parse<SourceFile>> {
+        self.slot
+            .kept
+            .iter()
+            .filter_map(OnceLock::get)
+            .filter(|kept| kept.edition == edition && kept.outline == outline)
+            .find_map(|kept| kept.parse.upgrade())
     }
 
     /// The kept parse of the edit's "before" text in `edition` and of the kind, and the range
@@ -153,24 +183,26 @@ impl Reparse {
         Some((parse, edit.delete))
     }
 
-    /// Keeps `parse` in this text's slot, unless a live one of its edition and kind is kept.
-    fn keep(&self, parse: &Parse<SourceFile>, edition: Edition, outline: bool) {
+    /// Keeps `parse` in this text's slot, unless a live one of its edition and kind is kept:
+    /// whether it kept this one.
+    fn keep(&self, parse: &Parse<SourceFile>, edition: Edition, outline: bool) -> bool {
         for kept in &self.slot.kept {
             match kept.get() {
                 Some(it) if it.edition == edition && it.outline == outline => {
                     if it.parse.upgrade().is_some() {
-                        return;
+                        return false;
                     }
                 }
                 Some(_) => {}
                 None => {
                     let made = Kept { edition, outline, parse: parse.downgrade() };
                     if kept.set(made).is_ok() {
-                        return;
+                        return true;
                     }
                 }
             }
         }
+        false
     }
 }
 
@@ -301,4 +333,79 @@ pub(crate) fn common_prefix_scalar(a: &[u8], b: &[u8]) -> usize {
 /// [`common_suffix`] a byte at a time.
 pub(crate) fn common_suffix_scalar(a: &[u8], b: &[u8]) -> usize {
     a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count()
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use std::cell::Cell;
+
+    use salsa::Durability;
+    use span::Edition;
+    use syntax::SourceFile;
+    use triomphe::Arc;
+    use vfs::{FileId, VfsPath, file_set::FileSet};
+
+    use super::{REPARSED, assert_whole};
+    use crate::{Db, EditionedFileId, SourceRoot, SourceRootId};
+
+    fn one_file(db: &mut Db, text: &str) -> (FileId, EditionedFileId) {
+        let file = FileId::from_raw(0);
+        db.set_file_text_with_durability(file, text, Durability::LOW);
+        db.set_file_source_root_with_durability(file, SourceRootId(0), Durability::MEDIUM);
+        let mut set = FileSet::default();
+        set.insert(file, VfsPath::new_virtual_path("/a/lib.rs".to_owned()));
+        let root = Arc::new(SourceRoot::new_local(set));
+        db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
+        (file, EditionedFileId::new(db, file, Edition::Edition2021))
+    }
+
+    /// fastcompile-intent 3: a seed is the file's parse, with no parse of its own, and is the
+    /// tree a whole parse makes.
+    #[test]
+    fn a_seeded_parse_is_the_seed() {
+        let mut db = Db::for_tests();
+        let (file, id) = one_file(&mut db, "fn f() {}\n");
+        let _ = id.parse(&db);
+        let text = "fn f() { 1 + 2 }\nstruct S;\n";
+        db.set_file_text(file, text);
+        let seed = SourceFile::parse_shared(text, Edition::Edition2021);
+        let content = db.file_text(file).content(&db);
+        assert!(id.seed_parse(&db, content, &seed));
+        assert!(!id.seed_parse(&db, content, &seed), "a live parse of the edition is kept already");
+        let start = REPARSED.with(Cell::get);
+        let parse = id.parse(&db);
+        assert_eq!(REPARSED.with(Cell::get), start, "no reparse");
+        assert!(std::ptr::eq(parse.root().file(), seed.root().file()), "the seed's own tree");
+        assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, false);
+    }
+
+    #[test]
+    fn a_seed_of_another_text_is_refused() {
+        let mut db = Db::for_tests();
+        let (file, id) = one_file(&mut db, "fn f() {}\n");
+        let old = db.file_text(file).content(&db);
+        db.set_file_text(file, "fn g() {}\n");
+        let stale = SourceFile::parse_shared("fn f() {}\n", Edition::Edition2021);
+        assert!(!id.seed_parse(&db, old, &stale), "the file moved on from the seed's text");
+        let content = db.file_text(file).content(&db);
+        assert!(!id.seed_parse(&db, content, &stale), "the tree's text is not the file's");
+        let parse = id.parse(&db);
+        assert_eq!(parse.root().text(), "fn g() {}\n");
+        assert!(!std::ptr::eq(parse.root().file(), stale.root().file()));
+    }
+
+    #[test]
+    fn a_dropped_seed_is_parsed_again() {
+        let mut db = Db::for_tests();
+        let (file, id) = one_file(&mut db, "fn f() {}\n");
+        let text = "fn h() -> u8 { 0 }\n";
+        db.set_file_text(file, text);
+        let content = db.file_text(file).content(&db);
+        let seed = SourceFile::parse_shared(text, Edition::Edition2021);
+        assert!(id.seed_parse(&db, content, &seed));
+        drop(seed);
+        let parse = id.parse(&db);
+        assert_eq!(parse.root().text(), text);
+        assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, false);
+    }
 }

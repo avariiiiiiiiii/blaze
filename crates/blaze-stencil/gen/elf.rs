@@ -21,7 +21,7 @@ use crate::{
     enc::Form,
     format::{self, ENTRY, Hole, HoleKind, Writer},
     generate::llvm::Disasm,
-    shape::{Dst, Isa, Op, Shape, Src, pinned},
+    shape::{Disp, Dst, Isa, Op, Shape, Src, pinned},
 };
 
 /// One stencil as the library holds it.
@@ -396,6 +396,8 @@ fn accesses_memory(op: Op) -> bool {
             | Op::AtomicStore
             | Op::AtomicRmw
             | Op::AtomicCas
+            | Op::LoadConfined
+            | Op::StoreConfined
     )
 }
 
@@ -462,7 +464,7 @@ fn allowed(shape: Shape, kind: HoleKind) -> bool {
         HoleKind::Imm2 => src(2) == Src::Imm,
         HoleKind::Result0 => matches!(shape.dst, Dst::Slot | Dst::Both),
         HoleKind::Result1 => info.results == 2,
-        HoleKind::Offset => memory,
+        HoleKind::Offset => memory || offset(shape),
         HoleKind::Next | HoleKind::Rodata => true,
         HoleKind::Target => info.branches,
         HoleKind::Trap => info.traps,
@@ -471,10 +473,16 @@ fn allowed(shape: Shape, kind: HoleKind) -> bool {
     }
 }
 
-/// The holes every stencil of `shape` has: its results' slots, which it always writes, and
-/// the jump to its continuation.
+/// Whether `shape` is a confined access that adds its offset.
+fn offset(shape: Shape) -> bool {
+    shape.confined().is_some_and(|(_, disp)| disp != Disp::Zero)
+}
+
+/// The holes every stencil of `shape` has: its results' slots, which it always writes, a
+/// confined access's offset when it adds one, and the jump to its continuation.
 fn required(shape: Shape) -> impl Iterator<Item = HoleKind> {
     let result0 = matches!(shape.dst, Dst::Slot | Dst::Both).then_some(HoleKind::Result0);
     let result1 = (shape.op.info().results == 2).then_some(HoleKind::Result1);
-    [result0, result1, Some(HoleKind::Next)].into_iter().flatten()
+    let offset = offset(shape).then_some(HoleKind::Offset);
+    [result0, result1, offset, Some(HoleKind::Next)].into_iter().flatten()
 }

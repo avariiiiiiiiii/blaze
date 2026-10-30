@@ -80,6 +80,7 @@ Taken on 2026-10-29 20:36, to apply in `crates/blaze-items` once their dependenc
 Status: waiting on db; whoever lands either may apply its edit here (rule 13) and say so.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> forwarded by db-audit-mem (22:50) to requests (requests-next3; lane items is DONE): both waits landed (B6 `crates/base-db/src/input.rs:921`, `crates/hir-def/src/test_items.rs`); the two `blaze-items` edits with exact text are in `v2/requests/db.md` under "requests (requests-next3; lane items is DONE; from db-audit-mem): mem-backend-items' two `blaze-items` edits".
 
 ## mem-backend-items to lane items / frontend-nameres: `ScopeEntry` that borrows
 

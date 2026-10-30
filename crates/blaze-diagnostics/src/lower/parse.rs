@@ -28,6 +28,8 @@ use crate::{
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
+mod crate_attr;
+
 /// A crate's syntax errors, and whether rustc stops compiling after them: then nothing but
 /// these and its closing lines is said of the crate.
 pub(crate) struct Parsed {
@@ -48,32 +50,56 @@ pub(crate) fn parsed(cx: &Cx<'_, '_>) -> Parsed {
         .modules(db)
         .all(|(_, data)| data.origin.file_id().is_none_or(|file| file_errors(db, file).is_empty()));
     if clean {
-        // alloc: empty, allocates nothing
-        return Parsed { found: Vec::new(), fatal: false };
+        // alloc: empty unless a crate attribute is refused, the edge
+        let mut found = Vec::new();
+        let fatal = crate_attr::lower(cx, &mut found);
+        return Parsed { found, fatal };
     }
     // alloc: a crate with a syntax error, the edge
     let mut found = Vec::new();
     // alloc: the error's parts, for an error hir found
     let mut emptied: Vec<hir::Module> = Vec::new();
-    for module in crate::checks::modules(cx) {
-        if module.is_inline(db) || module.path_to_root(db).iter().any(|it| emptied.contains(it)) {
-            continue;
-        }
-        let Some(file) = module.as_source_file_id(db) else { continue };
-        let errors = file_errors(db, file);
-        if errors.is_empty() {
-            continue;
-        }
-        let (file_id, edition) = file.unpack(db);
-        let text = cx.file_text(file_id);
-        let tree = cx.root(file.into());
-        match lower_file(cx, file.into(), text, edition, tree, errors, &mut found) {
-            Outcome::Parsed => {}
-            Outcome::GaveUp if !module.is_crate_root(db) => emptied.push(module),
-            Outcome::GaveUp | Outcome::Fatal => return Parsed { found, fatal: true },
+    let modules = crate::checks::modules(cx);
+    let (&root, rest) = modules.split_first().expect("a crate has its root module");
+    if module_fatal(cx, root, &mut emptied, &mut found) || crate_attr::lower(cx, &mut found) {
+        return Parsed { found, fatal: true };
+    }
+    for &module in rest {
+        if module_fatal(cx, module, &mut emptied, &mut found) {
+            return Parsed { found, fatal: true };
         }
     }
     Parsed { found, fatal: false }
+}
+
+/// The syntax errors of `module`'s own file, if it has one rustc reads, and whether rustc stops
+/// there; a module whose file rustc gives up on is `emptied`.
+fn module_fatal(
+    cx: &Cx<'_, '_>,
+    module: hir::Module,
+    emptied: &mut Vec<hir::Module>,
+    found: &mut Vec<Found>,
+) -> bool {
+    let db = cx.db;
+    if module.is_inline(db) || module.path_to_root(db).iter().any(|it| emptied.contains(it)) {
+        return false;
+    }
+    let Some(file) = module.as_source_file_id(db) else { return false };
+    let errors = file_errors(db, file);
+    if errors.is_empty() {
+        return false;
+    }
+    let (file_id, edition) = file.unpack(db);
+    let text = cx.file_text(file_id);
+    let tree = cx.root(file.into());
+    match lower_file(cx, file.into(), text, edition, tree, errors, found) {
+        Outcome::Parsed => false,
+        Outcome::GaveUp if !module.is_crate_root(db) => {
+            emptied.push(module);
+            false
+        }
+        Outcome::GaveUp | Outcome::Fatal | Outcome::Unbalanced => true,
+    }
 }
 
 /// The syntax errors of `file`, its bodies' included, memoized: a file parsed in full has them
@@ -93,6 +119,9 @@ enum Outcome {
     GaveUp,
     /// The compilation stops.
     Fatal,
+    /// A delimiter is not matched: rustc parses nothing of the file, and stops after a file's
+    /// (`unwrap_or_emit_fatal`) but not after a crate attribute's (`cmdline_attrs.rs`).
+    Unbalanced,
 }
 
 /// A token of a file as rustc's lexer gives it to the parser: not whitespace or a comment, and
@@ -192,7 +221,7 @@ fn lower_file(
     let delimiters = f.delimiters();
     if !delimiters.is_empty() {
         found.extend(delimiters.into_iter().map(|it| Found::new(it, Phase::Parse)));
-        return Outcome::Fatal;
+        return Outcome::Unbalanced;
     }
 
     let is_lexer_error = |error: &SyntaxError| {

@@ -2,7 +2,8 @@
 //! target and the `RUSTFLAGS` cargo gives it, as rustc reads them: `-C target-cpu`,
 //! `-C target-feature`, `-C force-frame-pointers` and `-C relocation-model`. A flag that
 //! changes code and is not read here is an error naming it; one that changes only the link
-//! or what is reported is the link's or cargo's, and is not this module's.
+//! or what is reported is the link's or cargo's, and is not this module's. Where the program
+//! runs ([`Runs`]) decides the features when the flags name no CPU.
 //!
 //! [`select`] then sets up the process's code generator for it, before the first unit.
 
@@ -101,9 +102,28 @@ const X86_64_V4: &[&str] = &["avx512bw", "avx512cd", "avx512dq", "avx512f", "avx
 const AARCH64: &[&str] = &["fp-armv8", "neon"];
 const APPLE_M1: &[&str] = &["fp-armv8", "lse", "neon"];
 
+/// Where the program a unit is part of runs.
+///
+/// [`Toolchain::features`] are the code generator's only. `cfg(target_feature)` is not
+/// computed from them, and must stay so: the front end's cfgs come from the flags alone
+/// (`blaze_units::stdlib::target::CfgArgs`, and `blaze_cargo`'s `answers/own.rs` for
+/// `--print cfg`), so a `cfg!` picks what rustc without `-C target-cpu=native` picks, whatever
+/// the machine the code is compiled for has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Runs {
+    /// On the machine that builds it: a dev build or a test that runs where it is built.
+    /// With no `-C target-cpu`, its code may use every feature of this machine that
+    /// Cranelift can, as `-C target-cpu=native` gives them, on the baseline CPU's name.
+    Here,
+    /// On another machine: a `--target`, remote or output build. With no `-C target-cpu`,
+    /// the target's baseline.
+    Elsewhere,
+}
+
 /// The toolchain of a unit for `target`, built with `rustflags` (its `RUSTFLAGS`, as cargo
-/// gives them to rustc).
-pub fn toolchain(target: &str, rustflags: &[String]) -> Result<Toolchain, String> {
+/// gives them to rustc), for a program that `runs` there. A `-C target-cpu` or
+/// `-C target-feature` in the flags wins over where it runs.
+pub fn toolchain(target: &str, rustflags: &[String], runs: Runs) -> Result<Toolchain, String> {
     let emitted = Target::parse(target)?;
     let flags = Flags::read(rustflags)?;
     let arch = match emitted.arch {
@@ -114,7 +134,19 @@ pub fn toolchain(target: &str, rustflags: &[String]) -> Result<Toolchain, String
     let baseline = baseline(&emitted);
     let (cpu, mut on) = match flags.cpu.as_deref() {
         // alloc: per toolchain made, a few names
-        None => (emitted.cpu().to_owned(), set(baseline)),
+        None if runs == Runs::Elsewhere => (emitted.cpu().to_owned(), set(baseline)),
+        None => {
+            if emitted.triple() != Target::host() {
+                // alloc: an error
+                return Err(format!(
+                    "a build that runs where it is built is for the host's target {}, not {}",
+                    Target::host(),
+                    emitted.triple()
+                ));
+            }
+            // alloc: per toolchain made, a few names
+            (emitted.cpu().to_owned(), on_host(&emitted, baseline))
+        }
         Some("native") => native(&emitted, baseline)?,
         Some(named) => match levels(&emitted, named) {
             // alloc: per toolchain made, a few names
@@ -177,16 +209,25 @@ pub fn toolchain(target: &str, rustflags: &[String]) -> Result<Toolchain, String
         // alloc: per toolchain made, a few names
         cranelift: CRANELIFT.to_owned(),
         llvm: llvm(),
+        stencils: match emitted.stencil() {
+            Some(stencil) => {
+                // alloc: an error, once per toolchain made
+                let id = blaze_stencil::library_id(&stencil).map_err(|e| e.to_string())?;
+                Some(blaze_format::hex::encode(&id))
+            }
+            None => None,
+        },
         frame_pointers,
         relocation,
     })
 }
 
-/// Sets up the process's code generator for `toolchain`: its target, target features and
-/// frame pointers. Said once, before the first unit; each unit's spec is checked against it.
+/// Sets up the process's code generator for `toolchain`: its target and frame pointers, and
+/// its target features as one more set the process compiles with. Said before the first unit
+/// of each toolchain; each unit's spec is checked against it.
 pub fn select(toolchain: &Toolchain) -> Result<(), String> {
     let target = Target::select(&toolchain.target)?;
-    target.select_features(&toolchain.features)?;
+    target.features_of(&toolchain.features)?;
     crate::backend::keep_frame_pointers(toolchain.frame_pointers);
     Ok(())
 }
@@ -222,7 +263,7 @@ fn llvm() -> Option<String> {
 }
 
 /// What a CPU of the target always has, as rustc's baseline CPU of it ([`Target::cpu`]).
-fn baseline(target: &Target) -> &'static [&'static str] {
+pub(super) fn baseline(target: &Target) -> &'static [&'static str] {
     match (target.arch, target.cpu()) {
         (crate::Arch::X86_64, _) => X86_64,
         (crate::Arch::Aarch64, "apple-m1") => APPLE_M1,
@@ -266,17 +307,33 @@ fn native(target: &Target, baseline: &[&str]) -> Result<(String, BTreeSet<String
         // alloc: per toolchain made, a few names
         None => target.cpu().to_owned(),
     };
+    Ok((name, on_host(target, baseline)))
+}
+
+/// The baseline with every feature the host has that Cranelift's code may use, and what
+/// each implies: `-C target-cpu=native`'s, and a build's that runs where it is built.
+fn on_host(target: &Target, baseline: &[&str]) -> BTreeSet<String> {
     let mut on = set(baseline);
-    for feature in host_features() {
+    for feature in host_features(target) {
         turn_on(&mut on, implications(target), feature);
     }
-    Ok((name, on))
+    on
 }
 
 /// The features this host has, of those past the baseline that Cranelift has a setting for
-/// or that turn one on.
-fn host_features() -> Vec<&'static str> {
-    // alloc: once per toolchain of `native`, a few names
+/// or that turn one on; none for a target of another architecture (wasm's code runs on no
+/// CPU of its own).
+fn host_features(target: &Target) -> Vec<&'static str> {
+    let host = match target.arch {
+        crate::Arch::X86_64 => cfg!(target_arch = "x86_64"),
+        crate::Arch::Aarch64 => cfg!(target_arch = "aarch64"),
+        crate::Arch::Wasm32 => false,
+    };
+    if !host {
+        // alloc: none, an empty `Vec`
+        return Vec::new();
+    }
+    // alloc: once per toolchain of the host's features, a few names
     let mut found = Vec::new();
     #[cfg(target_arch = "x86_64")]
     {
@@ -298,7 +355,11 @@ fn host_features() -> Vec<&'static str> {
                 $(if std::arch::is_aarch64_feature_detected!($name) { found.push($name); })*
             };
         }
-        detect!("lse", "paca", "pacg", "fp16", "dotprod", "i8mm");
+        detect!("lse", "fp16", "dotprod", "i8mm");
+        // rustc has them on or off together.
+        if std::arch::is_aarch64_feature_detected!("paca") && std::arch::is_aarch64_feature_detected!("pacg") {
+            found.extend(["paca", "pacg"]);
+        }
     }
     found
 }

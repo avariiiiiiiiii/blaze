@@ -520,17 +520,13 @@ fn trait_impls_in(
 pub(crate) fn trait_impls(db: &Db, trait_: TraitId) -> Runs<SimplifiedType, AnyImpl> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
-        for &krate in dependents(db, trait_.krate(db)) {
+        // `krate` and the crates that depend on it: the only ones that can hold an impl of
+        // one of its traits, which the impl names.
+        for &krate in trait_.krate(db).transitive_rev_deps(db) {
             rows.extend(trait_impls_in(db, krate, trait_).rows());
         }
         Runs::new(&mut rows)
     })
-}
-
-/// `krate` and the crates that depend on it, directly or not: the only ones that can hold an
-/// impl of one of its traits, which the impl names.
-fn dependents(db: &Db, krate: Crate) -> &[Crate] {
-    krate.transitive_rev_deps(db)
 }
 
 /// The impls of `trait_` whose simplified self type is `self_ty`, sorted by key.

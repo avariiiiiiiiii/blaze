@@ -11,14 +11,16 @@ use rustc_literal_escaper::{
 use syntax_tree::Direction;
 
 use crate::{
-    AstNode, SyntaxError,
+    SyntaxError,
     SyntaxKind::{BLOCK_EXPR, CONST, FN, INT_NUMBER, TYPE_ALIAS},
-    SyntaxNode, SyntaxToken, T, TextRange, TextSize, WalkEvent, algo,
-    ast::{self, HasAttrs, HasVisibility, IsString, RangeItem},
-    match_ast,
+    T, TextRange, TextSize, WalkEvent, match_ast,
+    view::{
+        self as ast, AstNode, HasAttrs as _, HasVisibility as _, IsString as _, Node,
+        RangeItem as _, Token,
+    },
 };
 
-pub(crate) fn validate(root: &SyntaxNode, errors: &mut Vec<SyntaxError>) {
+pub(crate) fn validate(root: Node<'_>, errors: &mut Vec<SyntaxError>) {
     let _p = tracing::info_span!("parser::validate").entered();
     // FIXME:
     // * Add unescape validation of raw string literals and raw byte string literals
@@ -33,7 +35,7 @@ pub(crate) fn validate(root: &SyntaxNode, errors: &mut Vec<SyntaxError>) {
 /// A lazy node and what is in it are validated when `body` says so, which first adds the
 /// body's parser errors; `body` is asked before anything walks into the node.
 pub(crate) fn validate_outline(
-    root: &SyntaxNode,
+    root: Node<'_>,
     lazies: &[(TextRange, u32)],
     mut body: impl FnMut(u32, &mut Vec<SyntaxError>) -> bool,
     errors: &mut Vec<SyntaxError>,
@@ -50,7 +52,7 @@ pub(crate) fn validate_outline(
             lazies.next();
             preorder.skip_subtree();
             if body(at, errors) {
-                validate(&node, errors);
+                validate(node, errors);
             }
             continue;
         }
@@ -59,15 +61,15 @@ pub(crate) fn validate_outline(
 }
 
 /// Runs on every node of a validated tree: one `match` on the kind, so a node no check is for
-/// (most nodes) costs one jump, and the node is cast (a cursor clone) only for its check. Each
-/// type is a single kind.
-fn validate_node(node: SyntaxNode, errors: &mut Vec<SyntaxError>) {
+/// (most nodes) costs one jump, and the node is cast only for its check. Each type is a single
+/// kind.
+fn validate_node(node: Node<'_>, errors: &mut Vec<SyntaxError>) {
     use crate::SyntaxKind as K;
     macro_rules! dispatch {
         ($($kind:ident => $ty:ident($it:ident) => $res:expr,)*) => {
             match node.kind() {
                 $(K::$kind => {
-                    debug_assert_eq!(<ast::$ty as AstNode>::kind(), K::$kind);
+                    debug_assert_eq!(<ast::$ty<'_> as AstNode<'_>>::kind(), K::$kind);
                     let $it = ast::$ty::cast(node).expect("the kind casts");
                     $res;
                 })*
@@ -167,7 +169,7 @@ fn rustc_unescape_error_to_string(err: EscapeError) -> (&'static str, bool) {
     (err_message, err.is_fatal())
 }
 
-fn validate_literal(literal: ast::Literal, acc: &mut Vec<SyntaxError>) {
+fn validate_literal(literal: ast::Literal<'_>, acc: &mut Vec<SyntaxError>) {
     // FIXME: move this function to outer scope (https://github.com/rust-lang/rust-analyzer/pull/2834#discussion_r366196658)
     fn unquote(text: &str, prefix_len: usize, end_delimiter: char) -> Option<&str> {
         text.rfind(end_delimiter).and_then(|end| text.get(prefix_len..end))
@@ -240,7 +242,7 @@ fn validate_literal(literal: ast::Literal, acc: &mut Vec<SyntaxError>) {
     }
 }
 
-pub(crate) fn validate_block_structure(root: &SyntaxNode) {
+pub(crate) fn validate_block_structure(root: Node<'_>) {
     // alloc: a debug-only structure check, switched off in `syntax_node.rs`
     let mut stack = Vec::new();
     for node in root.descendants_with_tokens() {
@@ -270,7 +272,7 @@ pub(crate) fn validate_block_structure(root: &SyntaxNode) {
     }
 }
 
-fn validate_numeric_name(name_ref: Option<ast::NameRef>, errors: &mut Vec<SyntaxError>) {
+fn validate_numeric_name(name_ref: Option<ast::NameRef<'_>>, errors: &mut Vec<SyntaxError>) {
     if let Some(int_token) = int_token(name_ref)
         && int_token.text().chars().any(|c| !c.is_ascii_digit())
     {
@@ -281,12 +283,12 @@ fn validate_numeric_name(name_ref: Option<ast::NameRef>, errors: &mut Vec<Syntax
         ));
     }
 
-    fn int_token(name_ref: Option<ast::NameRef>) -> Option<SyntaxToken> {
+    fn int_token(name_ref: Option<ast::NameRef<'_>>) -> Option<Token<'_>> {
         name_ref?.syntax().first_child_or_token()?.into_token().filter(|it| it.kind() == INT_NUMBER)
     }
 }
 
-fn validate_visibility(vis: ast::Visibility, errors: &mut Vec<SyntaxError>) {
+fn validate_visibility(vis: ast::Visibility<'_>, errors: &mut Vec<SyntaxError>) {
     let path_without_in_token = if let Some(inner) = vis.visibility_inner() {
         inner.in_token().is_none()
             && inner
@@ -298,7 +300,7 @@ fn validate_visibility(vis: ast::Visibility, errors: &mut Vec<SyntaxError>) {
         false
     };
     if path_without_in_token {
-        errors.push(SyntaxError::new("incorrect visibility restriction", vis.syntax.text_range()));
+        errors.push(SyntaxError::new("incorrect visibility restriction", vis.syntax().text_range()));
     }
     let parent = match vis.syntax().parent() {
         Some(it) => it,
@@ -316,11 +318,11 @@ fn validate_visibility(vis: ast::Visibility, errors: &mut Vec<SyntaxError>) {
     // FIXME: disable validation if there's an attribute, since some proc macros use this syntax.
     // ideally the validation would run only on the fully expanded code, then this wouldn't be necessary.
     if impl_def.trait_().is_some() && impl_def.attrs().next().is_none() {
-        errors.push(SyntaxError::new("Unnecessary visibility qualifier", vis.syntax.text_range()));
+        errors.push(SyntaxError::new("Unnecessary visibility qualifier", vis.syntax().text_range()));
     }
 }
 
-fn validate_range_expr(expr: ast::RangeExpr, errors: &mut Vec<SyntaxError>) {
+fn validate_range_expr(expr: ast::RangeExpr<'_>, errors: &mut Vec<SyntaxError>) {
     if expr.op_kind() == Some(ast::RangeOp::Inclusive) && expr.end().is_none() {
         errors.push(SyntaxError::new(
             "An inclusive range must have an end expression",
@@ -329,7 +331,7 @@ fn validate_range_expr(expr: ast::RangeExpr, errors: &mut Vec<SyntaxError>) {
     }
 }
 
-fn validate_path_keywords(segment: ast::PathSegment, errors: &mut Vec<SyntaxError>) {
+fn validate_path_keywords(segment: ast::PathSegment<'_>, errors: &mut Vec<SyntaxError>) {
     let path = segment.parent_path();
     let is_path_start = segment.coloncolon_token().is_none() && path.qualifier().is_none();
     if let Some(token) = segment.self_token() {
@@ -349,7 +351,7 @@ fn validate_path_keywords(segment: ast::PathSegment, errors: &mut Vec<SyntaxErro
         ));
     }
 
-    fn use_prefix(mut path: ast::Path) -> Option<ast::Path> {
+    fn use_prefix(mut path: ast::Path<'_>) -> Option<ast::Path<'_>> {
         for node in path.syntax().ancestors().skip(1) {
             match_ast! {
                 match node {
@@ -370,7 +372,7 @@ fn validate_path_keywords(segment: ast::PathSegment, errors: &mut Vec<SyntaxErro
     }
 }
 
-fn validate_trait_object_ref_ty(ty: ast::RefType, errors: &mut Vec<SyntaxError>) {
+fn validate_trait_object_ref_ty(ty: ast::RefType<'_>, errors: &mut Vec<SyntaxError>) {
     match ty.ty() {
         Some(ast::Type::DynTraitType(ty)) => {
             if let Some(err) = validate_trait_object_ty_plus(ty) {
@@ -386,7 +388,7 @@ fn validate_trait_object_ref_ty(ty: ast::RefType, errors: &mut Vec<SyntaxError>)
     }
 }
 
-fn validate_trait_object_ptr_ty(ty: ast::PtrType, errors: &mut Vec<SyntaxError>) {
+fn validate_trait_object_ptr_ty(ty: ast::PtrType<'_>, errors: &mut Vec<SyntaxError>) {
     match ty.ty() {
         Some(ast::Type::DynTraitType(ty)) => {
             if let Some(err) = validate_trait_object_ty_plus(ty) {
@@ -402,7 +404,7 @@ fn validate_trait_object_ptr_ty(ty: ast::PtrType, errors: &mut Vec<SyntaxError>)
     }
 }
 
-fn validate_trait_object_fn_ptr_ret_ty(ty: ast::FnPtrType, errors: &mut Vec<SyntaxError>) {
+fn validate_trait_object_fn_ptr_ret_ty(ty: ast::FnPtrType<'_>, errors: &mut Vec<SyntaxError>) {
     match ty.ret_type().and_then(|ty| ty.ty()) {
         Some(ast::Type::DynTraitType(ty)) => {
             if let Some(err) = validate_trait_object_ty_plus(ty) {
@@ -418,7 +420,7 @@ fn validate_trait_object_fn_ptr_ret_ty(ty: ast::FnPtrType, errors: &mut Vec<Synt
     }
 }
 
-fn validate_trait_object_ty(ty: ast::DynTraitType) -> Option<SyntaxError> {
+fn validate_trait_object_ty(ty: ast::DynTraitType<'_>) -> Option<SyntaxError> {
     let tbl = ty.type_bound_list()?;
     let no_bounds = tbl.bounds().filter_map(|it| it.ty()).next().is_none();
 
@@ -431,7 +433,7 @@ fn validate_trait_object_ty(ty: ast::DynTraitType) -> Option<SyntaxError> {
     }
 }
 
-fn validate_impl_object_ty(ty: ast::ImplTraitType) -> Option<SyntaxError> {
+fn validate_impl_object_ty(ty: ast::ImplTraitType<'_>) -> Option<SyntaxError> {
     let tbl = ty.type_bound_list()?;
     let no_bounds = tbl.bounds().filter_map(|it| it.ty()).next().is_none();
 
@@ -442,12 +444,23 @@ fn validate_impl_object_ty(ty: ast::ImplTraitType) -> Option<SyntaxError> {
         )),
         false => None,
     }
+}
+
+/// The first token from `token` on in `direction` that is not trivia: `algo::skip_trivia_token`.
+fn skip_trivia_token(mut token: Token<'_>, direction: Direction) -> Option<Token<'_>> {
+    while token.kind().is_trivia() {
+        token = match direction {
+            Direction::Next => token.next_token()?,
+            Direction::Prev => token.prev_token()?,
+        }
+    }
+    Some(token)
 }
 
 // FIXME: This is not a validation error, this is a context dependent parse error
-fn validate_trait_object_ty_plus(ty: ast::DynTraitType) -> Option<SyntaxError> {
+fn validate_trait_object_ty_plus(ty: ast::DynTraitType<'_>) -> Option<SyntaxError> {
     let dyn_token = ty.dyn_token()?;
-    let preceding_token = algo::skip_trivia_token(dyn_token.prev_token()?, Direction::Prev)?;
+    let preceding_token = skip_trivia_token(dyn_token.prev_token()?, Direction::Prev)?;
     let tbl = ty.type_bound_list()?;
     let more_than_one_bound = tbl.bounds().next_tuple::<(_, _)>().is_some();
 
@@ -459,9 +472,9 @@ fn validate_trait_object_ty_plus(ty: ast::DynTraitType) -> Option<SyntaxError> {
 }
 
 // FIXME: This is not a validation error, this is a context dependent parse error
-fn validate_impl_object_ty_plus(ty: ast::ImplTraitType) -> Option<SyntaxError> {
+fn validate_impl_object_ty_plus(ty: ast::ImplTraitType<'_>) -> Option<SyntaxError> {
     let dyn_token = ty.impl_token()?;
-    let preceding_token = algo::skip_trivia_token(dyn_token.prev_token()?, Direction::Prev)?;
+    let preceding_token = skip_trivia_token(dyn_token.prev_token()?, Direction::Prev)?;
     let tbl = ty.type_bound_list()?;
     let more_than_one_bound = tbl.bounds().next_tuple::<(_, _)>().is_some();
 
@@ -472,7 +485,7 @@ fn validate_impl_object_ty_plus(ty: ast::ImplTraitType) -> Option<SyntaxError> {
     }
 }
 
-fn validate_macro_rules(mac: ast::MacroRules, errors: &mut Vec<SyntaxError>) {
+fn validate_macro_rules(mac: ast::MacroRules<'_>, errors: &mut Vec<SyntaxError>) {
     if let Some(vis) = mac.visibility() {
         errors.push(SyntaxError::new(
             "visibilities are not allowed on `macro_rules!` items",
@@ -481,18 +494,18 @@ fn validate_macro_rules(mac: ast::MacroRules, errors: &mut Vec<SyntaxError>) {
     }
 }
 
-fn validate_const(const_: ast::Const, errors: &mut Vec<SyntaxError>) {
+fn validate_const(const_: ast::Const<'_>, errors: &mut Vec<SyntaxError>) {
     if let Some(mut_token) = const_
         .const_token()
         .and_then(|t| t.next_token())
-        .and_then(|t| algo::skip_trivia_token(t, Direction::Next))
+        .and_then(|t| skip_trivia_token(t, Direction::Next))
         .filter(|t| t.kind() == T![mut])
     {
         errors.push(SyntaxError::new("const globals cannot be mutable", mut_token.text_range()));
     }
 }
 
-fn validate_let_expr(let_: ast::LetExpr, errors: &mut Vec<SyntaxError>) {
+fn validate_let_expr(let_: ast::LetExpr<'_>, errors: &mut Vec<SyntaxError>) {
     let mut ancestor = let_.syntax().parent();
     while let Some(node) = ancestor {
         let kind = node.kind();

@@ -4,10 +4,10 @@
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
 
-use crate::{Arch, CompiledFunction, Covered, Data, Line, RelocKind, Relocs, Target, Unwind};
+use crate::{Arch, CompiledFunction, Covered, Data, Line, Profiled, RelocKind, Relocs, Target, Unwind};
 
-pub const DATA_DOMAIN: &str = "blaze v2 data 2";
-pub const CODE_DOMAIN: &str = "blaze v2 code 3";
+pub const DATA_DOMAIN: &str = "blaze v2 data 3";
+pub const CODE_DOMAIN: &str = "blaze v2 code 4";
 
 /// The content ID of a read-only data object: its alignment, bytes and relocations. Two
 /// objects with one ID are one object.
@@ -26,7 +26,7 @@ impl Data {
 }
 
 /// The content ID of what a compiled function does: its architecture, alignment, bytes,
-/// relocations, data, unwind information and lines. Not its key, what it inlined or its side
+/// relocations, data, unwind information, lines, coverage and profile. Not its key, what it inlined or its side
 /// table: two functions with one code ID run the same instructions against the same
 /// addresses, unwind alike and show the same lines in a backtrace.
 pub fn code_id(function: &CompiledFunction) -> ContentId {
@@ -54,6 +54,7 @@ pub fn code_id(function: &CompiledFunction) -> ContentId {
     };
     lines_into(&mut hasher, &function.lines);
     covered_into(&mut hasher, function.coverage.as_ref());
+    profiled_into(&mut hasher, function.profile.as_ref());
     hasher.finish()
 }
 
@@ -69,6 +70,20 @@ pub(crate) fn covered_into(hasher: &mut Hasher, covered: Option<&Covered>) {
     for (at, pc_flags) in pcs {
         hasher.update(&at.to_le_bytes()).update(&pc_flags.to_le_bytes());
     }
+}
+
+/// What PGO made of a function: an instrumented one counts under its own name and record, and
+/// one built with a profile is other code than one built without.
+pub(crate) fn profiled_into(hasher: &mut Hasher, profiled: Option<&Profiled>) {
+    match profiled {
+        None => hasher.update(&[0]),
+        Some(Profiled::Counted(record)) => {
+            hasher.update(&[1]).update(&record.name).update(&record.name_ref.to_le_bytes());
+            hasher.update(&record.hash.to_le_bytes()).update(&record.counters.to_le_bytes());
+            hasher.update(&record.version.to_le_bytes())
+        }
+        Some(Profiled::Used { mismatched }) => hasher.update(&[2, u8::from(*mismatched)]),
+    };
 }
 
 fn optional_target_into<'h>(hasher: &'h mut Hasher, target: Option<&Target>) -> &'h mut Hasher {
@@ -130,19 +145,29 @@ pub(crate) fn target_into(hasher: &mut Hasher, target: &Target) {
         }
         Target::Weak(name) => hasher.update(&[6]).part(name.as_bytes()),
         Target::Coverage(array) => hasher.update(&[7]).update(&array.to_le_bytes()),
+        Target::Counter(key) => hasher.update(&[8]).id(&key.0),
+        Target::ProfileCounters => hasher.update(&[9]),
     };
 }
 
-pub const TARGET_DOMAIN: &str = "blaze v2 target 2";
+pub const TARGET_DOMAIN: &str = "blaze v2 target 3";
+/// A [`Target::Counter`]'s own domain: its cells are its instance's, by the key alone.
+pub const COUNTER_DOMAIN: &str = "blaze v2 counter 1";
 
 /// A relocation target's content ID, to set targets apart without comparing them.
 pub fn target_id(target: &Target) -> ContentId {
+    if let Target::Counter(key) = target {
+        let mut hasher = Hasher::new(COUNTER_DOMAIN);
+        hasher.id(&key.0);
+        return hasher.finish();
+    }
     let mut hasher = Hasher::new(TARGET_DOMAIN);
     target_into(&mut hasher, target);
     hasher.finish()
 }
 
-pub(crate) fn arch_tag(arch: Arch) -> u8 {
+/// The byte an [`Arch`] is hashed and stored as.
+pub fn arch_tag(arch: Arch) -> u8 {
     match arch {
         Arch::X86_64 => 0,
         Arch::Aarch64 => 1,
@@ -150,7 +175,8 @@ pub(crate) fn arch_tag(arch: Arch) -> u8 {
     }
 }
 
-pub(crate) fn arch_of(tag: u8) -> Option<Arch> {
+/// The [`Arch`] of a byte [`arch_tag`] gave; `None` for another byte.
+pub fn arch_of(tag: u8) -> Option<Arch> {
     Some(match tag {
         0 => Arch::X86_64,
         1 => Arch::Aarch64,
@@ -243,6 +269,7 @@ mod tests {
             unwind: None,
             lines: Vec::new(),
             coverage: None,
+            profile: None,
         }
     }
 
@@ -276,6 +303,86 @@ mod tests {
         assert_ne!(code_id(&a), code_id(&b));
         assert_ne!(code_id(&b), code_id(&c));
         assert_ne!(target_id(&Target::Coverage(0)), target_id(&Target::Coverage(1)));
+    }
+
+    /// An instrumented function's record, and whether a profile applied, are its code.
+    #[test]
+    fn what_pgo_made_of_a_function_is_its_code() {
+        let a = function(&[0xc3], Vec::new());
+        let record = crate::ProfileRecord { name: [3; 16], name_ref: 5, hash: 7, counters: 2, version: 10 };
+        let profiled = |profile| CompiledFunction { profile: Some(profile), ..a.clone() };
+        let counted = profiled(Profiled::Counted(record));
+        let ids = [
+            code_id(&a),
+            code_id(&counted),
+            code_id(&profiled(Profiled::Counted(crate::ProfileRecord { hash: 8, ..record }))),
+            code_id(&profiled(Profiled::Counted(crate::ProfileRecord { name: [4; 16], ..record }))),
+            code_id(&profiled(Profiled::Counted(crate::ProfileRecord { counters: 3, ..record }))),
+            code_id(&profiled(Profiled::Used { mismatched: false })),
+            code_id(&profiled(Profiled::Used { mismatched: true })),
+        ];
+        let distinct: std::collections::BTreeSet<ContentId> = ids.iter().copied().collect();
+        assert_eq!(distinct.len(), ids.len());
+        assert_eq!(code_id(&counted), code_id(&counted.clone()));
+    }
+
+    /// Every target, one of each variant: a new variant gets a line here.
+    fn every_target() -> Vec<Target> {
+        let id = ContentId([9; 32]);
+        vec![
+            Target::Function(InstanceKey(id)),
+            Target::Direct(InstanceKey(id)),
+            Target::Static { item: blaze_items::ItemKey(id), instance: id },
+            Target::Data(id),
+            Target::Extern("x".to_owned()),
+            Target::Weak("x".to_owned()),
+            Target::Position(SpanRef { anchor: id, index: 0 }),
+            Target::Coverage(0),
+            Target::Counter(InstanceKey(id)),
+            Target::ProfileCounters,
+        ]
+    }
+
+    #[test]
+    fn every_target_has_its_own_id() {
+        let targets = every_target();
+        for target in &targets {
+            // Exhaustive: a new variant is a compile error here until `every_target` has it.
+            match target {
+                Target::Function(_)
+                | Target::Direct(_)
+                | Target::Static { .. }
+                | Target::Data(_)
+                | Target::Extern(_)
+                | Target::Weak(_)
+                | Target::Position(_)
+                | Target::Coverage(_)
+                | Target::Counter(_)
+                | Target::ProfileCounters => {}
+            }
+        }
+        let ids: std::collections::BTreeSet<ContentId> = targets.iter().map(target_id).collect();
+        assert_eq!(ids.len(), targets.len());
+    }
+
+    /// A counter is its instance's: by the key, in a domain of its own, and two instances'
+    /// cells are other targets, so their code is other code.
+    #[test]
+    fn a_counter_is_its_instances_own() {
+        let (a, b) = (InstanceKey(ContentId([1; 32])), InstanceKey(ContentId([2; 32])));
+        let mut hasher = Hasher::new(COUNTER_DOMAIN);
+        hasher.id(&a.0);
+        assert_eq!(target_id(&Target::Counter(a)), hasher.finish());
+        assert_ne!(target_id(&Target::Counter(a)), target_id(&Target::Counter(b)));
+        assert_ne!(target_id(&Target::Counter(a)), target_id(&Target::Function(a)));
+        let add = [0x48, 0x83, 0x05, 0, 0, 0, 0, 1];
+        let counting = |key: InstanceKey| {
+            let reloc =
+                Relocation { at: 3, kind: RelocKind::PcRel32, target: Target::Counter(key), addend: 4 };
+            CompiledFunction { key, ..function(&add, vec![reloc]) }
+        };
+        assert_ne!(code_id(&counting(a)), code_id(&counting(b)));
+        assert_ne!(code_id(&counting(a)), code_id(&function(&add, Vec::new())));
     }
 
     #[test]

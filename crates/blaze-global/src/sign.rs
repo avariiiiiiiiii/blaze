@@ -58,6 +58,7 @@ impl Record {
     }
 
     pub fn decode(bytes: &[u8; RECORD_LEN]) -> Result<Record, String> {
+        // alloc: an error's message, made only when it fails.
         let kind = Kind::from_code(bytes[32]).ok_or_else(|| format!("a record of an unknown kind code {}", bytes[32]))?;
         Ok(Record {
             key: Key(ContentId(bytes[..32].try_into().expect("32 bytes"))),
@@ -135,6 +136,7 @@ impl Publisher {
     /// The publisher whose Ed25519 private key is `seed` (RFC 8032's 32-byte secret).
     pub fn from_seed(seed: &[u8; 32]) -> Result<Publisher, String> {
         let pair = Ed25519KeyPair::from_seed_unchecked(seed)
+            // alloc: an error's message, made only when it fails.
             .map_err(|error| format!("an Ed25519 seed refused: {error}"))?;
         let key = PublisherKey(pair.public_key().as_ref().try_into().expect("an Ed25519 public key is 32 bytes"));
         Ok(Publisher { pair, seed: *seed, key })
@@ -182,6 +184,7 @@ pub struct Trust {
 impl Trust {
     /// The keys this blaze pins ([`PINNED`]).
     pub fn pinned() -> Result<Trust, String> {
+        // alloc: setup: once a trust.
         Trust::new(PINNED.to_vec())
     }
 
@@ -203,10 +206,12 @@ impl Trust {
     pub fn verify(&self, signed: &Signed) -> Result<(), Refused> {
         let refused = |what: String| Refused { key: signed.record.key, what };
         if !self.trusts(&signed.publisher) {
+            // alloc: an error's message, made only when it fails.
             return Err(refused(format!("its record is signed by {}, which this blaze does not pin", signed.publisher)));
         }
         UnparsedPublicKey::new(&ED25519, &signed.publisher.0)
             .verify(&signed.record.message(), &signed.signature)
+            // alloc: an error's message, made only when it fails.
             .map_err(|_| refused(format!("its record's signature is not {}'s", signed.publisher)))
     }
 
@@ -219,10 +224,12 @@ impl Trust {
         signature: &[u8; 64],
     ) -> Result<(), String> {
         if !self.trusts(publisher) {
+            // alloc: an error's message, made only when it fails.
             return Err(format!("signed by {publisher}, which this blaze does not pin"));
         }
         UnparsedPublicKey::new(&ED25519, &publisher.0)
             .verify(&digest_message(what, digest), signature)
+            // alloc: an error's message, made only when it fails.
             .map_err(|_| format!("its signature is not {publisher}'s"))
     }
 }

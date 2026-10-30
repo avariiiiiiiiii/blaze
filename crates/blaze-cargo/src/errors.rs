@@ -16,6 +16,21 @@ pub struct Diagnostic {
     pub code: Option<String>,
     pub message: String,
     pub span: Option<Span>,
+    /// rustc's whole text of it, with every span, label and note, where the one who found it
+    /// wrote it (blaze-diagnostics): what [`Diagnostic::rendered`], [`Diagnostic::rendered_ansi`]
+    /// and [`Diagnostic::short`] give then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendered: Option<Box<Rendered>>,
+}
+
+/// A diagnostic as rustc writes it, in each form cargo asks for.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Rendered {
+    pub plain: String,
+    /// `--color=always`, `json-diagnostic-rendered-ansi`.
+    pub ansi: String,
+    /// `--message-format=short`, `json-diagnostic-short`.
+    pub short: String,
 }
 
 /// A range of a file as rustc's JSON has it: bytes from 0, lines and columns from 1, a
@@ -77,12 +92,12 @@ pub fn at(
         column_end,
         text: lines.collect(),
     };
-    Diagnostic { code: code.map(str::to_owned), message: message.to_owned(), span: Some(span) }
+    Diagnostic { code: code.map(str::to_owned), message: message.to_owned(), span: Some(span), rendered: None }
 }
 
 /// An error that is of no one place.
 pub fn of_none(message: &str) -> Diagnostic {
-    Diagnostic { code: None, message: message.to_owned(), span: None }
+    Diagnostic { code: None, message: message.to_owned(), span: None, rendered: None }
 }
 
 /// The line and the column of byte `at` of `text`.
@@ -94,6 +109,9 @@ fn position(text: &str, at: usize) -> (usize, usize) {
 impl Diagnostic {
     /// As rustc writes it, with the first line of where it is and that marked.
     pub fn rendered(&self) -> String {
+        if let Some(rendered) = &self.rendered {
+            return rendered.plain.clone();
+        }
         let header = self.header();
         let Some(span) = &self.span else { return header };
         let Some(line) = span.text.first() else { return header };
@@ -118,6 +136,9 @@ impl Diagnostic {
 
     /// As rustc writes it to a terminal, in colour: `--message-format=json-diagnostic-rendered-ansi`.
     pub fn rendered_ansi(&self) -> String {
+        if let Some(rendered) = &self.rendered {
+            return rendered.ansi.clone();
+        }
         const BOLD: &str = "\x1b[1m";
         const RED: &str = "\x1b[1m\x1b[91m";
         const BLUE: &str = "\x1b[1m\x1b[94m";
@@ -150,6 +171,9 @@ impl Diagnostic {
 
     /// As rustc's `--error-format=short` writes it.
     pub fn short(&self) -> String {
+        if let Some(rendered) = &self.rendered {
+            return rendered.short.clone();
+        }
         match &self.span {
             Some(span) => format!(
                 "{}:{}:{}: {}",
@@ -415,6 +439,7 @@ mod tests {
                 code: it.map(str::to_owned),
                 message: String::new(),
                 span: None,
+                rendered: None,
             });
             Said(said.collect()).notes()
         };

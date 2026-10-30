@@ -420,8 +420,9 @@ the same results as carrying it, because a run's fixed point ends with every que
 next run attempts every import first: a fresh unit pushes each one, and a carried one calls
 `wake_all` after its replay.
 
-**The graph.** `ImportGraph<'f>` and `Solver<'a, 'f>` live in the frame. `from_edges` does its two
-counting sorts in the frame by itself, because `blaze_radix::Csr` takes no allocator. The DFS stack
+**The graph.** `ImportGraph<'f>` and `Solver<'a, 'f>` live in the frame. `from_edges` is
+`Csr::new_in(frame)` with `rebuild_graph` (its scratch in the frame too), then `dedup_rows`, and
+`components` groups the members with `Csr::rebuild` over the frame `stack` as cursors. The DFS stack
 entry is `DfsFrame`. `partition`'s only global allocations are the three columns of `Partition`
 (`PARTITION_ALLOCATIONS = 3` in `facts/tests/graph.rs`).
 

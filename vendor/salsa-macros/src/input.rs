@@ -69,6 +69,7 @@ impl AllowedOptions for InputStruct {
 
     const SELF_TY: bool = false;
     const MEM_TAG: bool = false;
+    const IMAGE: bool = false;
 
     const PERSIST: AllowedPersistOptions = AllowedPersistOptions::AllowedValue;
 }

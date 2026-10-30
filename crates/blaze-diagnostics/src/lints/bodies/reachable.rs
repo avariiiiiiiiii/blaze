@@ -12,7 +12,10 @@
 use hir::InFile;
 use hir_def::hir::{Expr, ExprId, ExprOrPatId, Statement};
 use hir_ty::{Unreachable, UnreachableAt};
-use syntax::{AstNode, SyntaxNodePtr, ast};
+use syntax::{
+    SyntaxNodePtr,
+    view::{self as ast, AstNode},
+};
 
 use super::BodyCx;
 use crate::{
@@ -88,7 +91,7 @@ fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span
             let span = match store.expr(expr) {
                 Expr::Call { callee, .. } => b.expr_span(callee)?,
                 Expr::MethodCall { .. } => {
-                    let call = b.cx.syntax(node);
+                    let call = b.cx.syntax_view(node);
                     let name = ast::MethodCallExpr::cast(call.value)?.name_ref()?;
                     b.cx.span(InFile::new(call.file_id, name.syntax().text_range()))
                 }
@@ -124,19 +127,16 @@ fn statement_node(b: &BodyCx<'_, '_>, statement: Statement<'_>) -> Option<InFile
         Statement::Let { pat, .. } => (b.pat_node(pat)?, true),
         Statement::Item(_) => return None,
     };
-    let syntax = b.cx.syntax(node);
+    let syntax = b.cx.syntax_view(node);
     let found = match is_let {
         true => syntax.value.ancestors().find(|it| ast::LetStmt::can_cast(it.kind()))?,
         false => match syntax.value.parent().and_then(ast::ExprStmt::cast) {
             Some(stmt) => match stmt.expr() {
-                // clone: a node handle, a reference count, for a lint found
-                Some(ast::Expr::MacroExpr(call)) => call.syntax().clone(),
-                // clone: a node handle, a reference count, for a lint found
-                _ => stmt.syntax().clone(),
+                Some(ast::Expr::MacroExpr(call)) => call.syntax(),
+                _ => stmt.syntax(),
             },
-            // clone: a node handle, a reference count, for a lint found
-            None => syntax.value.clone(),
+            None => syntax.value,
         },
     };
-    Some(InFile::new(syntax.file_id, SyntaxNodePtr::new(&found)))
+    Some(InFile::new(syntax.file_id, ast::ptr(found)))
 }

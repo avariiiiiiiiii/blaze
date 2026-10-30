@@ -2023,6 +2023,30 @@ impl<'t> Union<'t> {
     pub fn union_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![union]) }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnsafeBinderCastExpr<'t> {
+    pub(crate) syntax: Node<'t>,
+}
+impl<'t> UnsafeBinderCastExpr<'t> {
+    #[inline]
+    pub fn expr(self) -> Option<Expr<'t>> { support::child(self.syntax) }
+    #[inline]
+    pub fn ty(self) -> Option<Type<'t>> { support::child(self.syntax) }
+    #[inline]
+    pub fn pound_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![#]) }
+    #[inline]
+    pub fn l_paren_token(self) -> Option<Token<'t>> { support::token(self.syntax, T!['(']) }
+    #[inline]
+    pub fn r_paren_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![')']) }
+    #[inline]
+    pub fn comma_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![,]) }
+    #[inline]
+    pub fn builtin_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![builtin]) }
+    #[inline]
+    pub fn unwrap_binder_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![unwrap_binder]) }
+    #[inline]
+    pub fn wrap_binder_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![wrap_binder]) }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UnsafeMeta<'t> {
     pub(crate) syntax: Node<'t>,
 }
@@ -2278,6 +2302,7 @@ pub enum Expr<'t> {
     TryExpr(TryExpr<'t>),
     TupleExpr(TupleExpr<'t>),
     UnderscoreExpr(UnderscoreExpr<'t>),
+    UnsafeBinderCastExpr(UnsafeBinderCastExpr<'t>),
     WhileExpr(WhileExpr<'t>),
     YeetExpr(YeetExpr<'t>),
     YieldExpr(YieldExpr<'t>),
@@ -5953,6 +5978,28 @@ impl fmt::Debug for Union<'_> {
         f.debug_struct("Union").field("syntax", &self.syntax).finish()
     }
 }
+impl<'t> AstNode<'t> for UnsafeBinderCastExpr<'t> {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        UNSAFE_BINDER_CAST_EXPR
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == UNSAFE_BINDER_CAST_EXPR }
+    #[inline]
+    fn cast(syntax: Node<'t>) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> Node<'t> { self.syntax }
+}
+impl fmt::Debug for UnsafeBinderCastExpr<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnsafeBinderCastExpr").field("syntax", &self.syntax).finish()
+    }
+}
 impl<'t> AstNode<'t> for UnsafeMeta<'t> {
     #[inline]
     fn kind() -> SyntaxKind
@@ -6627,6 +6674,10 @@ impl<'t> From<UnderscoreExpr<'t>> for Expr<'t> {
     #[inline]
     fn from(node: UnderscoreExpr<'t>) -> Expr<'t> { Expr::UnderscoreExpr(node) }
 }
+impl<'t> From<UnsafeBinderCastExpr<'t>> for Expr<'t> {
+    #[inline]
+    fn from(node: UnsafeBinderCastExpr<'t>) -> Expr<'t> { Expr::UnsafeBinderCastExpr(node) }
+}
 impl<'t> From<WhileExpr<'t>> for Expr<'t> {
     #[inline]
     fn from(node: WhileExpr<'t>) -> Expr<'t> { Expr::WhileExpr(node) }
@@ -6641,7 +6692,7 @@ impl<'t> From<YieldExpr<'t>> for Expr<'t> {
 }
 impl<'t> AstNode<'t> for Expr<'t> {
     #[inline]
-    fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, ARRAY_EXPR | ASM_EXPR | AWAIT_EXPR | BECOME_EXPR | BIN_EXPR | BLOCK_EXPR | BREAK_EXPR | CALL_EXPR | CAST_EXPR | CFG_PRED_EXPR | CLOSURE_EXPR | CONTINUE_EXPR | FIELD_EXPR | FOR_EXPR | FORMAT_ARGS_EXPR | IF_EXPR | INCLUDE_BYTES_EXPR | INDEX_EXPR | LET_EXPR | LITERAL | LOOP_EXPR | MACRO_EXPR | MATCH_EXPR | METHOD_CALL_EXPR | OFFSET_OF_EXPR | PAREN_EXPR | PATH_EXPR | PREFIX_EXPR | RANGE_EXPR | RECORD_EXPR | REF_EXPR | RETURN_EXPR | TRY_EXPR | TUPLE_EXPR | UNDERSCORE_EXPR | WHILE_EXPR | YEET_EXPR | YIELD_EXPR) }
+    fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, ARRAY_EXPR | ASM_EXPR | AWAIT_EXPR | BECOME_EXPR | BIN_EXPR | BLOCK_EXPR | BREAK_EXPR | CALL_EXPR | CAST_EXPR | CFG_PRED_EXPR | CLOSURE_EXPR | CONTINUE_EXPR | FIELD_EXPR | FOR_EXPR | FORMAT_ARGS_EXPR | IF_EXPR | INCLUDE_BYTES_EXPR | INDEX_EXPR | LET_EXPR | LITERAL | LOOP_EXPR | MACRO_EXPR | MATCH_EXPR | METHOD_CALL_EXPR | OFFSET_OF_EXPR | PAREN_EXPR | PATH_EXPR | PREFIX_EXPR | RANGE_EXPR | RECORD_EXPR | REF_EXPR | RETURN_EXPR | TRY_EXPR | TUPLE_EXPR | UNDERSCORE_EXPR | UNSAFE_BINDER_CAST_EXPR | WHILE_EXPR | YEET_EXPR | YIELD_EXPR) }
     #[inline]
     fn cast(syntax: Node<'t>) -> Option<Self> {
         let res = match syntax.kind() {
@@ -6680,6 +6731,7 @@ impl<'t> AstNode<'t> for Expr<'t> {
             TRY_EXPR => Expr::TryExpr(TryExpr { syntax }),
             TUPLE_EXPR => Expr::TupleExpr(TupleExpr { syntax }),
             UNDERSCORE_EXPR => Expr::UnderscoreExpr(UnderscoreExpr { syntax }),
+            UNSAFE_BINDER_CAST_EXPR => Expr::UnsafeBinderCastExpr(UnsafeBinderCastExpr { syntax }),
             WHILE_EXPR => Expr::WhileExpr(WhileExpr { syntax }),
             YEET_EXPR => Expr::YeetExpr(YeetExpr { syntax }),
             YIELD_EXPR => Expr::YieldExpr(YieldExpr { syntax }),
@@ -6725,6 +6777,7 @@ impl<'t> AstNode<'t> for Expr<'t> {
             Expr::TryExpr(it) => it.syntax,
             Expr::TupleExpr(it) => it.syntax,
             Expr::UnderscoreExpr(it) => it.syntax,
+            Expr::UnsafeBinderCastExpr(it) => it.syntax,
             Expr::WhileExpr(it) => it.syntax,
             Expr::YeetExpr(it) => it.syntax,
             Expr::YieldExpr(it) => it.syntax,
@@ -7374,7 +7427,7 @@ impl fmt::Debug for AnyHasArgList<'_> {
 }
 impl<'t> AstNode<'t> for AnyHasAttrs<'t> {
     #[inline]
-    fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, ARRAY_EXPR | ASM_CLOBBER_ABI | ASM_EXPR | ASM_OPERAND_NAMED | ASM_OPTIONS | ASSOC_ITEM_LIST | AWAIT_EXPR | BECOME_EXPR | BIN_EXPR | BLOCK_EXPR | BREAK_EXPR | CALL_EXPR | CAST_EXPR | CLOSURE_EXPR | CONST | CONST_PARAM | CONTINUE_EXPR | ENUM | EXTERN_BLOCK | EXTERN_CRATE | EXTERN_ITEM_LIST | FIELD_EXPR | FN | FOR_EXPR | FORMAT_ARGS_EXPR | IDENT_PAT | IF_EXPR | IMPL | INDEX_EXPR | ITEM_LIST | LET_EXPR | LET_STMT | LIFETIME_PARAM | LITERAL | LOOP_EXPR | MACRO_CALL | MACRO_DEF | MACRO_RULES | MATCH_ARM | MATCH_ARM_LIST | MATCH_EXPR | METHOD_CALL_EXPR | MODULE | OFFSET_OF_EXPR | PARAM | PAREN_EXPR | PATH_EXPR | PREFIX_EXPR | RANGE_EXPR | RECORD_EXPR | RECORD_EXPR_FIELD | RECORD_EXPR_FIELD_LIST | RECORD_FIELD | RECORD_PAT_FIELD | REF_EXPR | REST_PAT | RETURN_EXPR | SELF_PARAM | SOURCE_FILE | STATIC | STMT_LIST | STRUCT | TRAIT | TRY_EXPR | TUPLE_EXPR | TUPLE_FIELD | TYPE_ALIAS | TYPE_PARAM | UNDERSCORE_EXPR | UNION | USE | VARIANT | WHILE_EXPR | YEET_EXPR | YIELD_EXPR) }
+    fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, ARRAY_EXPR | ASM_CLOBBER_ABI | ASM_EXPR | ASM_OPERAND_NAMED | ASM_OPTIONS | ASSOC_ITEM_LIST | AWAIT_EXPR | BECOME_EXPR | BIN_EXPR | BLOCK_EXPR | BREAK_EXPR | CALL_EXPR | CAST_EXPR | CLOSURE_EXPR | CONST | CONST_PARAM | CONTINUE_EXPR | ENUM | EXTERN_BLOCK | EXTERN_CRATE | EXTERN_ITEM_LIST | FIELD_EXPR | FN | FOR_EXPR | FORMAT_ARGS_EXPR | IDENT_PAT | IF_EXPR | IMPL | INDEX_EXPR | ITEM_LIST | LET_EXPR | LET_STMT | LIFETIME_PARAM | LITERAL | LOOP_EXPR | MACRO_CALL | MACRO_DEF | MACRO_RULES | MATCH_ARM | MATCH_ARM_LIST | MATCH_EXPR | METHOD_CALL_EXPR | MODULE | OFFSET_OF_EXPR | PARAM | PAREN_EXPR | PATH_EXPR | PREFIX_EXPR | RANGE_EXPR | RECORD_EXPR | RECORD_EXPR_FIELD | RECORD_EXPR_FIELD_LIST | RECORD_FIELD | RECORD_PAT_FIELD | REF_EXPR | REST_PAT | RETURN_EXPR | SELF_PARAM | SOURCE_FILE | STATIC | STMT_LIST | STRUCT | TRAIT | TRY_EXPR | TUPLE_EXPR | TUPLE_FIELD | TYPE_ALIAS | TYPE_PARAM | UNDERSCORE_EXPR | UNION | UNSAFE_BINDER_CAST_EXPR | USE | VARIANT | WHILE_EXPR | YEET_EXPR | YIELD_EXPR) }
     #[inline]
     fn cast(syntax: Node<'t>) -> Option<Self> { Self::can_cast(syntax.kind()).then_some(AnyHasAttrs { syntax }) }
     #[inline]
@@ -7764,6 +7817,10 @@ impl<'t> From<Union<'t>> for AnyHasAttrs<'t> {
     #[inline]
     fn from(node: Union<'t>) -> AnyHasAttrs<'t> { AnyHasAttrs { syntax: node.syntax } }
 }
+impl<'t> From<UnsafeBinderCastExpr<'t>> for AnyHasAttrs<'t> {
+    #[inline]
+    fn from(node: UnsafeBinderCastExpr<'t>) -> AnyHasAttrs<'t> { AnyHasAttrs { syntax: node.syntax } }
+}
 impl<'t> From<Use<'t>> for AnyHasAttrs<'t> {
     #[inline]
     fn from(node: Use<'t>) -> AnyHasAttrs<'t> { AnyHasAttrs { syntax: node.syntax } }
@@ -8150,6 +8207,7 @@ impl<'t> view::HasAttrs<'t> for Union<'t> {}
 impl<'t> view::HasGenericParams<'t> for Union<'t> {}
 impl<'t> view::HasName<'t> for Union<'t> {}
 impl<'t> view::HasVisibility<'t> for Union<'t> {}
+impl<'t> view::HasAttrs<'t> for UnsafeBinderCastExpr<'t> {}
 impl<'t> view::HasAttrs<'t> for Use<'t> {}
 impl<'t> view::HasVisibility<'t> for Use<'t> {}
 impl<'t> view::HasAttrs<'t> for Variant<'t> {}
@@ -8970,6 +9028,11 @@ impl fmt::Display for Union<'_> {
         fmt::Display::fmt(&self.syntax(), f)
     }
 }
+impl fmt::Display for UnsafeBinderCastExpr<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.syntax(), f)
+    }
+}
 impl fmt::Display for UnsafeMeta<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.syntax(), f)
@@ -9653,6 +9716,9 @@ impl view::Typed for crate::ast::UnderscoreExpr {
 }
 impl view::Typed for crate::ast::Union {
     type Of<'t> = Union<'t>;
+}
+impl view::Typed for crate::ast::UnsafeBinderCastExpr {
+    type Of<'t> = UnsafeBinderCastExpr<'t>;
 }
 impl view::Typed for crate::ast::UnsafeMeta {
     type Of<'t> = UnsafeMeta<'t>;

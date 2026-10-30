@@ -24,6 +24,7 @@ use crate::{
     hir::{
         Array, Binding, BindingAnnotation, BindingId, CaptureBy, ClosureKind, CoroutineKind, Expr,
         ExprId, Literal, Movability, Pat, PatId, RecordSpread, Statement, Statements, Unsafe,
+        UnsafeBinderCastKind,
         generics::{GenericParams, WherePredicate},
     },
     lang_item::LangItemTarget,
@@ -295,6 +296,7 @@ pub fn print_function(
         ret_type,
         abi,
         flags,
+        splatted: _,
     }: &FunctionSignature,
     edition: Edition,
 ) -> String {
@@ -576,6 +578,18 @@ impl Printer<'_> {
             Expr::Underscore => w!(self, "_"),
             Expr::InlineAsm(_) => w!(self, "builtin#asm(_)"),
             Expr::IncludeBytes => w!(self, "include_bytes!(_)"),
+            Expr::UnsafeBinderCast { kind, expr, ty } => {
+                match kind {
+                    UnsafeBinderCastKind::Wrap => w!(self, "builtin#wrap_binder("),
+                    UnsafeBinderCastKind::Unwrap => w!(self, "builtin#unwrap_binder("),
+                }
+                self.print_expr(expr);
+                if let Some(ty) = ty {
+                    w!(self, ", ");
+                    self.print_type_ref(ty);
+                }
+                w!(self, ")");
+            }
             Expr::OffsetOf(offset_of) => {
                 w!(self, "builtin#offset_of(");
                 self.print_type_ref(offset_of.container);

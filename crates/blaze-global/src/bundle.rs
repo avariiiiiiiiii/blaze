@@ -54,14 +54,18 @@ impl Locked {
     /// build it (a dependency of another target). A crates.io package with no checksum is an
     /// error, since nothing then says which bytes it is.
     pub fn parse(lock: &str, built: impl Fn(&str, &str) -> Option<Vec<String>>) -> Result<Vec<Locked>, String> {
+        // alloc: an error's message, made only when it fails.
         let table = lock.parse::<toml::Table>().map_err(|error| format!("Cargo.lock is not TOML: {error}"))?;
+        // alloc: setup: once a bundle or its lock file, not a value.
         let Some(packages) = table.get("package") else { return Ok(Vec::new()) };
         let packages = packages.as_array().ok_or("Cargo.lock's `package` is not an array of tables")?;
+        // alloc: setup: once a bundle or its lock file, not a value.
         let mut locked = Vec::new();
         for package in packages {
             let package = package.as_table().ok_or("a `package` of Cargo.lock that is not a table")?;
             let field = |name: &str| package.get(name).and_then(|it| it.as_str());
             let (Some(name), Some(version)) = (field("name"), field("version")) else {
+                // alloc: an error's message, made only when it fails.
                 return Err(format!("a package of Cargo.lock with no name or version: {package}"));
             };
             if !field("source").is_some_and(|source| CRATES_IO.contains(&source)) {
@@ -69,13 +73,16 @@ impl Locked {
             }
             let Some(features) = built(name, version) else { continue };
             let checksum = field("checksum").ok_or_else(|| {
+                // alloc: an error's message, made only when it fails.
                 format!("{name} {version} of crates.io has no checksum in Cargo.lock: nothing says which bytes it is")
             })?;
             let checksum = blaze_format::hex::decode::<32>(checksum)
+                // alloc: an error's message, made only when it fails.
                 .ok_or_else(|| format!("{name} {version}'s checksum {checksum:?} is not 64 hex digits"))?;
             let mut features = features;
             features.sort_unstable();
             features.dedup();
+            // alloc: setup: once a bundle or its lock file, not a value.
             locked.push(Locked { name: name.to_owned(), version: version.to_owned(), checksum, features });
         }
         locked.sort_unstable();
@@ -101,9 +108,11 @@ pub struct BundleId(pub ContentId);
 
 impl BundleId {
     pub fn of(spec: &BundleSpec) -> BundleId {
+        // alloc: setup: once a bundle or its lock file, not a value.
         let mut packages: Vec<&Locked> = spec.packages.iter().collect();
         packages.sort_unstable();
         packages.dedup();
+        // alloc: setup: once a bundle or its lock file, not a value.
         let mut bytes = Vec::new();
         let text = |text: &str, bytes: &mut Vec<u8>| {
             bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
@@ -117,6 +126,7 @@ impl BundleId {
             text(&package.name, &mut bytes);
             text(&package.version, &mut bytes);
             bytes.extend_from_slice(&package.checksum);
+            // alloc: setup: once a bundle or its lock file, not a value.
             let mut features: Vec<&String> = package.features.iter().collect();
             features.sort_unstable();
             features.dedup();
@@ -154,6 +164,7 @@ impl Manifest {
                 assert_eq!((public.key(), public.kind()), (record.key, record.kind), "a record of another key than the one shown public");
                 record
             })
+            // alloc: setup: once a bundle or its lock file, not a value.
             .collect();
         entries.sort_unstable_by_key(|it| it.key);
         entries.dedup();
@@ -200,6 +211,7 @@ impl Manifest {
     pub fn verify(&self, trust: &Trust) -> Result<(), String> {
         trust.verify_digest(SIGNED_AS, &digest(&self.id, &self.entries), &self.publisher, &self.signature)?;
         match self.entries.windows(2).find(|pair| pair[0].key >= pair[1].key) {
+            // alloc: an error's message, made only when it fails.
             Some(pair) => Err(format!("its records are not sorted by key, each once, at {:x}", pair[1].key.0)),
             None => Ok(()),
         }
@@ -262,6 +274,7 @@ impl Download {
         client: &mut Client<C>,
         effects: &mut Vec<Effect>,
     ) -> Vec<GotBundle> {
+        // alloc: setup: once a bundle or its lock file, not a value.
         let mut others = Vec::new();
         for got in got {
             if got.tag != self.asked || !matches!(self.state, State::Asking) {
@@ -269,23 +282,29 @@ impl Download {
                 continue;
             }
             self.state = match got.result {
+                // alloc: an error's message, made only when it fails.
                 Err(why) => State::Done(Err(format!("the manifest of bundle {}: {why}", hex(&self.id.0.0)))),
                 Ok(None) => State::Done(Ok(Downloaded::NoBundle)),
                 Ok(Some(manifest)) => {
                     let publics: Vec<Public> =
+                        // alloc: setup: once a bundle or its lock file, not a value.
                         manifest.entries.iter().map(|entry| Public::listed(entry.key, entry.kind)).collect();
+                    // alloc: setup: once a bundle or its lock file, not a value.
                     let lens: ByHash<Key, u64> = manifest.entries.iter().map(|it| (it.key, it.len)).collect();
                     let waiting = client
                         .fetch_many(store, &publics, effects)
                         .into_iter()
                         .map(|(key, _)| (key, lens[&key]))
+                        // alloc: setup: once a bundle or its lock file, not a value.
                         .collect();
                     State::Fetching {
                         listed: manifest.entries.len(),
                         waiting,
                         fetched: 0,
                         bytes: 0,
+                        // alloc: setup: once a bundle or its lock file, not a value.
                         tickets: Vec::new(),
+                        // alloc: an error's message, made only when it fails.
                         failed: Vec::new(),
                     }
                 }
@@ -300,6 +319,7 @@ impl Download {
         let State::Fetching { waiting, fetched: count, bytes, tickets, failed, .. } = &mut self.state else {
             return fetched;
         };
+        // alloc: setup: once a bundle or its lock file, not a value.
         let mut others = Vec::new();
         for (key, how) in fetched {
             let Some(len) = waiting.remove(&key) else {
@@ -312,7 +332,9 @@ impl Download {
                     *bytes += len;
                     tickets.push(ticket);
                 }
+                // alloc: an error's message, made only when it fails.
                 Fetched::Missing => failed.push(format!("{:x}: the cache lists it and has no value of it", key.0)),
+                // alloc: an error's message, made only when it fails.
                 Fetched::Refused(why) => failed.push(format!("{:x}: {why}", key.0)),
             }
         }
@@ -336,9 +358,12 @@ impl Download {
         let result = if failed.is_empty() {
             Ok(Downloaded::Kept { listed: *listed, fetched: *fetched, bytes: *bytes, tickets: std::mem::take(tickets) })
         } else {
+            // alloc: an error's message, made only when it fails.
             let named = failed.iter().take(NAMED_MOST).cloned().collect::<Vec<_>>().join("; ");
             let more = failed.len().saturating_sub(NAMED_MOST);
+            // alloc: an error's message, made only when it fails.
             let more = if more == 0 { String::new() } else { format!("; and {more} more") };
+            // alloc: an error's message, made only when it fails.
             Err(format!(
                 "bundle {}: {} of its {listed} values were not kept: {named}{more}",
                 hex(&self.id.0.0),

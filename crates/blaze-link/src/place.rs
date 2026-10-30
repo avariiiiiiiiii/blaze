@@ -204,6 +204,7 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         LiveDir => 22,
         Coverage(..) => 23,
         CoveragePcs(_) => 24,
+        Counters => 25,
     };
     let seven = |bytes: &[u8]| {
         let mut out = [0u8; 8];
@@ -217,7 +218,7 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         Local(obj, _) | Section(obj, _) | Frame(obj, ..) => seven(&symbols.content(obj.native).0),
         Name(name) | FileName(name) | IatEnd(name) | Common(name) => seven(symbols.str(name).as_bytes()),
         Got(kind, _) => (kind as u64) << 48,
-        Plt(_) | Generation | Cells | Stubs | Descriptor | LiveDir | StartHook => 0,
+        Plt(_) | Generation | Cells | Stubs | Descriptor | LiveDir | Counters | StartHook => 0,
     };
     tag << 56 | rest
 }
@@ -829,6 +830,7 @@ mod tests {
         }
         syms.push(symbols.intern(SymKey::Cells));
         syms.push(symbols.intern(SymKey::Stubs));
+        syms.push(symbols.intern(SymKey::Counters));
         for &a in &syms {
             for &b in &syms {
                 let (pa, pb) = (prefix(&symbols, a), prefix(&symbols, b));

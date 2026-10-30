@@ -165,6 +165,26 @@ fn main() {
     assert!(report.contains("was deallocated here:"));
 }
 
+// modifying_constants.rs: what a constant points to is interned read-only, so a write through a
+// pointer cast from it is refused before any borrow is checked.
+#[test]
+fn a_write_to_what_a_constant_points_to_is_read_only() {
+    let (found, _) = ub(
+        program!(
+            "sized",
+            r#"
+const C: &i32 = &1;
+fn main() {
+    let p = C as *const i32 as *mut i32;
+    unsafe { *p = 42 };
+}
+"#
+        ),
+        "which is read-only",
+    );
+    assert!(matches!(found.ub, Ub::Memory(MemError::WriteToReadOnly(_))));
+}
+
 // null_pointer_deref.rs
 #[test]
 fn dangling_pointers_null_deref() {

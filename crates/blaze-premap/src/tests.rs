@@ -1,11 +1,13 @@
 use blaze_cas::{Config, Store};
 use blaze_codegen::settings::{Relocation, Toolchain};
-use blaze_codegen::{Arch, CompiledFunction, Init, InstanceKey, Reloc, RelocKind, Settings, Static, Target};
+use blaze_codegen::driver::Digests;
+use blaze_codegen::driver::digests::{debug_name_digest, function_digest};
+use blaze_codegen::{Arch, CompiledFunction, Init, InstanceKey, Relocation as Reloc, RelocKind, Settings, Static, Target};
 use blaze_core::sim::{Faults, Sim};
 use blaze_core::{Effect, FileName, run_until_idle};
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
-use blaze_link::{Debug, Format, Native, NativeKind, Output, OutputKind, Platform};
+use blaze_link::{Debug, DevRun, Format, Native, NativeKind, Output, OutputKind, Platform};
 use rustc_hash::FxHashMap;
 
 use crate::cache::{Images, Pick, Ready};
@@ -16,10 +18,10 @@ use crate::model::{self, Libraries, Model, PAGE, RESERVE};
 use crate::prelink::{
     self, Bind, BindKind, InitEntry, Library, PlacedName, Prelink, Prelinked, Prot, Request, Segment, Tls,
 };
-use crate::split::{Built, Owned, SidedNative, image_part, workspace_part};
+use crate::split::{Built, Fit, Owned, SidedNative, Stale, WorkspacePart, image_part, workspace_part};
 use crate::start::{self, WorkspaceLink};
 use crate::store::Shelf;
-use crate::table::{self, Def, Kind, Strength, SymbolId, TableView};
+use crate::table::{self, Def, Kind, Refs, Strength, SymbolId, TableView};
 use crate::PremapError;
 
 const BASE: u64 = prelink::IMAGES.start;
@@ -46,12 +48,14 @@ fn function(n: u64, relocs: Vec<Reloc>) -> CompiledFunction {
         arch: Arch::X86_64,
         align: 16,
         code: vec![0xcc; 32],
-        relocs,
+        relocs: relocs.into(),
         data: Vec::new(),
         inlined: Vec::new(),
         side: None,
         unwind: None,
         lines: Vec::new(),
+        coverage: None,
+        profile: None,
     }
 }
 
@@ -73,11 +77,12 @@ fn value(n: u64, init: Init) -> Static {
         mutable: false,
         thread_local: false,
         section: None,
+        imports: Vec::new(),
     }
 }
 
 fn pointer_to(target: Target) -> Init {
-    Init::Bytes { bytes: vec![0; 8], relocs: vec![reloc(0, RelocKind::Abs64, target)] }
+    Init::Bytes { bytes: vec![0; 8], relocs: vec![reloc(0, RelocKind::Abs64, target)].into() }
 }
 
 fn toolchain() -> Toolchain {
@@ -89,6 +94,7 @@ fn toolchain() -> Toolchain {
         features: vec!["+sse2".to_owned()],
         cranelift: "0.120".to_owned(),
         llvm: None,
+        stencils: None,
         frame_pointers: true,
         relocation: Relocation::Pic,
     }
@@ -107,6 +113,9 @@ fn dev_output() -> Output {
         tags: 1 << 48,
         stack: None,
         windows_subsystem: false,
+        dev_run: None,
+        triple: "x86_64-unknown-linux-gnu".to_owned(),
+        exec_log: false,
     }
 }
 
@@ -179,6 +188,7 @@ fn graph_key_changes_with_every_input() {
         ("target features", Box::new(|it: &mut Graph| it.toolchain.features.push("+avx2".to_owned()))),
         ("cranelift", Box::new(|it: &mut Graph| it.toolchain.cranelift = "0.121".to_owned())),
         ("llvm", Box::new(|it: &mut Graph| it.toolchain.llvm = Some("20".to_owned()))),
+        ("the stencils", Box::new(|it: &mut Graph| it.toolchain.stencils = Some("00".to_owned()))),
         ("frame pointers", Box::new(|it: &mut Graph| it.toolchain.frame_pointers = false)),
         ("relocation", Box::new(|it: &mut Graph| it.toolchain.relocation = Relocation::Static)),
         ("codegen settings", Box::new(|it: &mut Graph| it.settings.push(Settings(id(2))))),
@@ -193,6 +203,10 @@ fn graph_key_changes_with_every_input() {
         ("tags", Box::new(|it: &mut Graph| it.output.tags = 2 << 48)),
         ("the stack", Box::new(|it: &mut Graph| it.output.stack = Some(8 << 20))),
         ("the windows subsystem", Box::new(|it: &mut Graph| it.output.windows_subsystem = true)),
+        ("a dev run of no reservations", Box::new(|it: &mut Graph| it.output.dev_run = Some(DevRun { arena: 0, cells: 0, fixed: 0 }))),
+        ("a dev run's reservation", Box::new(|it: &mut Graph| it.output.dev_run = Some(DevRun { arena: 1 << 30, cells: 0, fixed: 0 }))),
+        ("the output's triple", Box::new(|it: &mut Graph| it.output.triple = "x86_64-unknown-linux-musl".to_owned())),
+        ("the execution log", Box::new(|it: &mut Graph| it.output.exec_log = true)),
         ("the base", Box::new(|it: &mut Graph| it.base += 1 << 20)),
         ("the thread-local bias", Box::new(|it: &mut Graph| it.tls_bias -= 64)),
         ("a native's contents", Box::new(|it: &mut Graph| it.natives[0].id = id(4))),
@@ -229,13 +243,15 @@ fn graph_key_ignores_order_of_sets() {
 #[test]
 fn image_key_changes_with_every_instance() {
     let graph = Graph::new().key();
-    let functions = vec![KeyedFunction { key: ikey(1), code: CodeHash(id(11)) }];
+    let functions = vec![KeyedFunction { key: ikey(1), code: CodeHash(id(11)), inlined: None }];
     let static_value = value(1, Init::Zeroed { size: 8 });
     let statics = vec![KeyedStatic { item: item(1), instance: instance(1), definition: static_definition(&static_value) }];
     let names = vec![("ffi_entry".to_owned(), Target::Function(ikey(1)))];
     let debug_names = vec![(ikey(1), "dep::f".to_owned())];
     let key = |functions: &[KeyedFunction], statics: &[KeyedStatic], names: &[(String, Target)], debug: &[(InstanceKey, String)]| {
-        ImageKey::of(graph, &ImageInputs { functions, statics, names, debug_names: debug })
+        let names: Vec<&(String, Target)> = names.iter().collect();
+        let debug: Vec<&(InstanceKey, String)> = debug.iter().collect();
+        ImageKey::of(graph, &ImageInputs { functions, statics, names: &names, debug_names: &debug })
     };
     let base = key(&functions, &statics, &names, &debug_names);
     let mut seen = vec![base];
@@ -245,7 +261,9 @@ fn image_key_changes_with_every_instance() {
     };
     push("a function's key", key(&[KeyedFunction { key: ikey(2), ..functions[0] }], &statics, &names, &debug_names));
     push("a function's code hash", key(&[KeyedFunction { code: CodeHash(id(12)), ..functions[0] }], &statics, &names, &debug_names));
-    push("a function more", key(&[functions[0], KeyedFunction { key: ikey(3), code: CodeHash(id(13)) }], &statics, &names, &debug_names));
+    push("a function more", key(&[functions[0], KeyedFunction { key: ikey(3), code: CodeHash(id(13)), inlined: None }], &statics, &names, &debug_names));
+    let inlined = crate::key::inlined_digest(&[CodeHash(id(14))]);
+    push("what a function inlined", key(&[KeyedFunction { inlined, ..functions[0] }], &statics, &names, &debug_names));
     let changed = value(1, Init::Zeroed { size: 16 });
     push("a static's value", key(&functions, &[KeyedStatic { definition: static_definition(&changed), ..statics[0] }], &names, &debug_names));
     let mutable = Static { mutable: true, ..value(1, Init::Zeroed { size: 8 }) };
@@ -256,6 +274,7 @@ fn image_key_changes_with_every_instance() {
     push("a name", key(&functions, &statics, &[("other".to_owned(), Target::Function(ikey(1)))], &debug_names));
     push("what a name is", key(&functions, &statics, &[("ffi_entry".to_owned(), Target::Direct(ikey(1)))], &debug_names));
     push("a debug name", key(&functions, &statics, &names, &[(ikey(1), "dep::g".to_owned())]));
+    let (names, debug_names): (Vec<_>, Vec<_>) = (names.iter().collect(), debug_names.iter().collect());
     let other_graph = ImageKey::of(GraphKey(id(1)), &ImageInputs { functions: &functions, statics: &statics, names: &names, debug_names: &debug_names });
     push("the graph", other_graph);
 }
@@ -291,15 +310,28 @@ fn table_finds_every_entry_and_refuses_corruption() {
     corrupt[empty * 64 + 40] = 1;
     assert!(TableView::parse(&corrupt).is_err(), "an empty slot with bytes is refused");
     assert!(TableView::parse(&bytes[..bytes.len() - 1]).is_err(), "a cut table is refused");
+
+    let mut referring = bytes.clone();
+    table::set_content(&mut referring, &entries[3].0, 2).unwrap();
+    table::set_debug(&mut referring, &entries[5].0, 1).unwrap();
+    assert!(TableView::parse(&referring).is_err(), "a ref past what the image has is refused");
+    assert!(TableView::parse_with(&referring, 1, 1).is_err(), "a content ref one past the last");
+    let view = TableView::parse_with(&referring, 2, 1).unwrap();
+    assert_eq!(view.entry(&entries[3].0).unwrap().refs, Refs { content: 2, debug: 0 });
+    assert_eq!(view.entry(&entries[5].0).unwrap().refs, Refs { content: 0, debug: 1 });
+    assert_eq!(view.get(&entries[5].0), Some(entries[5].1), "a ref leaves the definition as it was");
+    assert!(table::set_content(&mut referring, &SymbolId::function(&ikey(100)), 1).is_err(), "a symbol it has not");
 }
 
 /// A small dependency graph: two dependency functions, a static pointing at one, a
 /// thread-local and an init function; two workspace functions (one the dependencies' hook
 /// by name), a thread-local of its own and an init function.
+#[derive(Clone)]
 struct Small {
     functions: Vec<CompiledFunction>,
     statics: Vec<Static>,
     names: Vec<(String, Target)>,
+    debug_names: Vec<(InstanceKey, String)>,
     owned_functions: Vec<(InstanceKey, CodeHash)>,
     owned_statics: Vec<(ItemKey, ContentId)>,
 }
@@ -333,22 +365,33 @@ impl Small {
         let t1 = Static { thread_local: true, align: 16, ..value(2, Init::Zeroed { size: 16 }) };
         let i1 = Static { section: Some(".init_array".to_owned()), ..value(3, pointer_to(Target::Function(ikey(1)))) };
         let i2 = Static { section: Some(".init_array".to_owned()), ..value(13, pointer_to(Target::Function(ikey(11)))) };
-        let t2 = Static { thread_local: true, align: 4, ..value(12, Init::Bytes { bytes: vec![1, 2, 3, 4], relocs: Vec::new() }) };
+        let t2 = Static { thread_local: true, align: 4, ..value(12, Init::Bytes { bytes: vec![1, 2, 3, 4], relocs: Vec::new().into() }) };
         let mut owned_functions = vec![(ikey(1), CodeHash(id(101))), (ikey(2), CodeHash(id(102)))];
         owned_functions.sort();
         let mut owned_statics = vec![(item(1), instance(1)), (item(2), instance(2)), (item(3), instance(3))];
         owned_statics.sort();
+        let mut statics = vec![s1, i2, t1, i1, t2];
+        statics.sort_by_key(|it| (it.item, it.instance));
         Small {
             functions: vec![d1, w1, d2, w2],
-            statics: vec![s1, i2, t1, i1, t2],
+            statics,
             names: vec![("__rg_alloc".to_owned(), Target::Function(ikey(12)))],
+            debug_names: Vec::new(),
             owned_functions,
             owned_statics,
         }
     }
 
+    /// The build as codegen gives it, its digests made from what the test left in it. They
+    /// are leaked so a test's `Built` borrows from `self` alone.
     fn built(&self) -> Built<'_> {
-        Built { functions: &self.functions, statics: &self.statics, names: &self.names, debug_names: &[] }
+        let digests = Digests {
+            functions: self.functions.iter().map(|it| (it.key, function_digest(CodeHash(it.key.0), &it.inlined))).collect(),
+            statics: self.statics.iter().map(|it| ((it.item, it.instance), static_definition(it))).collect(),
+            debug_names: self.debug_names.iter().map(|(key, name)| (*key, debug_name_digest(name))).collect(),
+        };
+        let digests: &'static Digests = Box::leak(Box::new(digests));
+        Built { functions: &self.functions, statics: &self.statics, names: &self.names, debug_names: &self.debug_names, digests }
     }
 
     fn owned(&self) -> Owned<'_> {
@@ -363,6 +406,13 @@ fn natives() -> Vec<SidedNative<'static>> {
     }]
 }
 
+fn part_of(fit: Fit<'_>) -> WorkspacePart<'_> {
+    match fit {
+        Fit::Part(part) => part,
+        Fit::Stale(stale) => panic!("the image is stale for the build that made it: {stale:?}"),
+    }
+}
+
 fn prelink_request<'a>(output: &'a Output, part: &'a crate::split::ImagePart<'a>) -> Request<'a> {
     Request {
         output,
@@ -374,6 +424,9 @@ fn prelink_request<'a>(output: &'a Output, part: &'a crate::split::ImagePart<'a>
         debug_names: &part.debug_names,
         natives: &part.natives,
         spans: &[],
+        function_digests: &part.function_digests,
+        static_digests: &part.static_digests,
+        debug_digests: &part.debug_digests,
     }
 }
 
@@ -388,7 +441,7 @@ fn prelinked_and_workspace_link_run_as_the_whole_link() {
     let image = View::parse(&bytes, key).unwrap();
     assert_eq!(image.libraries().map(|it| it.name).collect::<Vec<_>>(), ["libc.so.6"]);
 
-    let workspace = workspace_part(&small.built(), &small.owned(), &image.table(), &natives).unwrap();
+    let workspace = part_of(workspace_part(&small.built(), &small.owned(), &image, &natives).unwrap());
     assert!(workspace.complete());
     assert_eq!(workspace.functions.iter().map(|it| it.key).collect::<Vec<_>>(), [ikey(11), ikey(12)]);
     assert!(workspace.natives.iter().all(|it| matches!(it.kind, NativeKind::Shared { .. })), "a shared library is in both");
@@ -422,6 +475,171 @@ fn prelinked_and_workspace_link_run_as_the_whole_link() {
     assert_eq!(split.memory, whole.memory, "every byte the program starts with");
 }
 
+fn image_from(small: &Small, key: ImageKey) -> Vec<u8> {
+    let natives = natives();
+    let part = image_part(&small.built(), &small.owned(), &natives).unwrap();
+    let output = prelink::output(&dev_output(), "blaze-premap-test");
+    prelink::build(&Model, &prelink_request(&output, &part), key).unwrap()
+}
+
+#[test]
+fn an_image_serves_only_a_build_whose_pieces_it_holds_are_its_own() {
+    let mut small = Small::new();
+    small.names.push(("dep_entry".to_owned(), Target::Function(ikey(2))));
+    small.debug_names = vec![(ikey(1), "dep::one".to_owned()), (ikey(11), "app::main".to_owned())];
+    let key = ImageKey(id(82));
+    let bytes = image_from(&small, key);
+    let image = View::parse(&bytes, key).unwrap();
+    assert_eq!((image.names(), image.debug_names()), (1, 1));
+    let natives = natives();
+    let stale = |build: &Small| match workspace_part(&build.built(), &build.owned(), &image, &natives).unwrap() {
+        Fit::Part(_) => None,
+        Fit::Stale(it) => Some(it),
+    };
+    let workspace = part_of(workspace_part(&small.built(), &small.owned(), &image, &natives).unwrap());
+    assert_eq!(workspace.names, [&small.names[0]], "the image's name is not linked again");
+    assert_eq!(workspace.debug_names, [&small.debug_names[1]]);
+
+    let changes: Vec<(&str, Box<dyn Fn(&mut Small)>, Option<Stale>)> = vec![
+        ("a workspace function's inlined callees", Box::new(|it: &mut Small| it.functions[1].inlined = vec![CodeHash(id(500))]), None),
+        (
+            "a dependency function's inlined callees",
+            Box::new(|it: &mut Small| it.functions[0].inlined = vec![CodeHash(id(500))]),
+            Some(Stale::Function(ikey(1))),
+        ),
+        (
+            "a dependency static's value",
+            Box::new(|it: &mut Small| it.statics[0] = value(1, pointer_to(Target::Function(ikey(1))))),
+            Some(Stale::Static(item(1), instance(1))),
+        ),
+        ("what a name is", Box::new(|it: &mut Small| it.names[1].1 = Target::Function(ikey(1))), Some(Stale::Name(1))),
+        ("a name", Box::new(|it: &mut Small| it.names[1].0 = "dep_other".to_owned()), Some(Stale::Name(1))),
+        ("a name the image has, gone", Box::new(|it: &mut Small| drop(it.names.pop())), Some(Stale::Extra)),
+        ("a debug name", Box::new(|it: &mut Small| it.debug_names[0].1 = "dep::uno".to_owned()), Some(Stale::Function(ikey(1)))),
+        ("a debug name the image has, gone", Box::new(|it: &mut Small| drop(it.debug_names.remove(0))), Some(Stale::Extra)),
+        (
+            "an init static the image has, gone",
+            Box::new(|it: &mut Small| {
+                it.statics.retain(|it| it.item != item(3));
+                it.owned_statics.retain(|it| it.0 != item(3));
+            }),
+            Some(Stale::Extra),
+        ),
+    ];
+    for (what, change, expected) in changes {
+        let mut build = small.clone();
+        change(&mut build);
+        assert_eq!(stale(&build), expected, "{what}");
+    }
+}
+
+#[test]
+fn a_build_the_newest_image_does_not_serve_makes_its_own() {
+    let mut images = Images::default();
+    let mut shelf = Shelved::default();
+    let natives = natives();
+    let first = with_dev(&Small::new(), &natives, |dev| {
+        let Plan::Make(job) = dev::plan(&mut images, dev).unwrap() else { panic!() };
+        let made = job.make(&Model, &mut shelf);
+        images.finish(job.key, made).unwrap().key
+    });
+    let mut edited = Small::new();
+    edited.functions[0].inlined = vec![CodeHash(id(500))];
+    with_dev(&edited, &natives, |dev| {
+        let Plan::Make(job) = dev::plan(&mut images, dev).unwrap() else { panic!("a stale image is never linked against") };
+        assert_ne!(job.key, first);
+        assert!(matches!(dev::plan(&mut images, dev).unwrap(), Plan::Wait), "a second build waits for it");
+        let made = job.make(&Model, &mut shelf);
+        images.finish(job.key, made).unwrap();
+        let Plan::Link { image, workspace, next } = dev::plan(&mut images, dev).unwrap() else { panic!() };
+        assert_eq!(image.key, job.key);
+        assert!(workspace.complete() && next.is_none());
+    });
+}
+
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+#[test]
+fn a_graph_key_allocates_nothing_of_the_heap() {
+    let graph = Graph::new();
+    let units: Vec<DepUnit<'_>> = graph
+        .units
+        .iter()
+        .map(|(package, target, features, cfg, rustflags)| DepUnit { package, target, features, cfg, rustflags })
+        .collect();
+    let inputs = GraphInputs {
+        units: &units,
+        toolchain: &graph.toolchain,
+        settings: &graph.settings,
+        linker: graph.linker,
+        output: &graph.output,
+        base: graph.base,
+        tls_bias: graph.tls_bias,
+        natives: &graph.natives,
+        spans: &graph.spans,
+    };
+    let warm = GraphKey::of(&inputs);
+    let (key, used) = blaze_alloc_count::measure(|| GraphKey::of(&inputs));
+    assert_eq!(key, warm);
+    assert_eq!(used, blaze_alloc_count::Used::default());
+}
+
+#[test]
+fn an_image_key_allocates_nothing_of_the_heap() {
+    let small = Small::new();
+    let natives = natives();
+    let part = image_part(&small.built(), &small.owned(), &natives).unwrap();
+    let inputs = ImageInputs {
+        functions: &part.keyed_functions,
+        statics: &part.keyed_statics,
+        names: &part.names,
+        debug_names: &part.debug_names,
+    };
+    let warm = ImageKey::of(GraphKey(id(1)), &inputs);
+    let (key, used) = blaze_alloc_count::measure(|| ImageKey::of(GraphKey(id(1)), &inputs));
+    assert_eq!(key, warm);
+    assert_eq!(used, blaze_alloc_count::Used::default());
+}
+
+#[test]
+fn splitting_a_build_copies_no_name() {
+    let mut small = Small::new();
+    small.names.push(("dep_entry".to_owned(), Target::Function(ikey(2))));
+    let natives = natives();
+    let built = small.built();
+    drop(image_part(&built, &small.owned(), &natives).unwrap());
+    let (part, used) = blaze_alloc_count::measure(|| image_part(&built, &small.owned(), &natives).unwrap());
+    assert_eq!(part.names.len(), 1);
+    assert!(part.names.iter().all(|it| built.names.iter().any(|b| std::ptr::eq(b, *it))), "the part's names are the build's");
+    assert!(used.allocations <= 10, "the part's ten lists, no `String`: {used:?}");
+}
+
+#[test]
+fn a_hit_allocates_its_lists_and_nothing_per_piece() {
+    let mut small = Small::new();
+    small.debug_names = vec![(ikey(1), "dep::one".to_owned()), (ikey(11), "app::main".to_owned())];
+    let key = ImageKey(id(83));
+    let bytes = image_from(&small, key);
+    let image = View::parse(&bytes, key).unwrap();
+    let natives = natives();
+    let built = small.built();
+    let check = || part_of(workspace_part(&built, &small.owned(), &image, &natives).unwrap());
+    drop(check());
+    let (workspace, used) = blaze_alloc_count::measure(check);
+    let lists = [
+        workspace.functions.is_empty(),
+        workspace.statics.is_empty(),
+        workspace.names.is_empty(),
+        workspace.debug_names.is_empty(),
+        workspace.natives.is_empty(),
+        workspace.spilled.is_empty(),
+        workspace.spilled_statics.is_empty(),
+    ];
+    let filled = lists.iter().filter(|it| !**it).count() as u64;
+    assert_eq!(used.allocations, filled, "one exact allocation per list the workspace link gets, none per piece");
+}
+
 #[test]
 fn image_refuses_a_dependency_that_reaches_into_the_workspace() {
     let mut small = Small::new();
@@ -436,7 +654,7 @@ fn image_refuses_a_dependency_that_reaches_into_the_workspace() {
     let mut small = Small::new();
     small.statics[0].section = Some("linkme_SLOTS".to_owned());
     assert!(image_part(&small.built(), &small.owned(), &natives()).is_ok(), "a section only the image has");
-    small.statics[1].section = Some("linkme_SLOTS".to_owned());
+    small.statics.iter_mut().find(|it| it.item == item(13)).unwrap().section = Some("linkme_SLOTS".to_owned());
     let error = image_part(&small.built(), &small.owned(), &natives()).err().unwrap();
     assert!(error.what.contains("linkme_SLOTS"), "{error}");
 
@@ -471,9 +689,29 @@ fn image_round_trips_and_refuses_damage() {
 
     let reopened = View::reopen(&bytes, key);
     assert_eq!(reopened.table().len(), image.table().len());
+    assert!(image.whole());
+    let meta = View::reopen(&bytes[..image.meta_len()], key);
+    assert!(!meta.whole(), "the metadata alone");
+    assert_eq!(meta.table().len(), image.table().len());
+    assert_eq!(meta.binds().count(), 3);
+    assert!(meta.segments().all(|it| it.bytes.is_empty()));
+    assert!(crate::map::Memory::of(&meta).is_err(), "no memory object of the metadata alone");
+    for (function, _) in &small.owned_functions {
+        let entry = image.entry(&SymbolId::function(function)).unwrap();
+        let inlined = &small.functions.iter().find(|it| it.key == *function).unwrap().inlined;
+        assert_eq!(image.content(entry.refs.content), Some(function_digest(CodeHash(function.0), inlined)), "codegen's digest");
+    }
+    let dep_statics: Vec<&Static> =
+        small.statics.iter().filter(|it| small.owned_statics.contains(&(it.item, it.instance))).collect();
+    assert_eq!(image.statics(), dep_statics.len());
+    for (at, value) in dep_statics.iter().enumerate() {
+        let entry = image.entry(&SymbolId::of_static(&value.item, &value.instance)).unwrap();
+        assert_eq!(image.content(entry.refs.content), Some(static_definition(value)));
+        assert_eq!(image.static_record(at), ((value.item, value.instance), static_definition(value)), "sorted");
+    }
     assert!(View::parse(&bytes, ImageKey(id(79))).is_err(), "an image under another key");
     assert!(View::parse(&bytes[..bytes.len() - 1], key).is_err(), "a cut image");
-    for at in [0, 8, 16, 40, 48] {
+    for at in [0, 8, 16, 40, 48, 64, 72] {
         let mut damaged = bytes.clone();
         damaged[at] ^= 0x55;
         assert!(View::parse(&damaged, key).is_err(), "damage at {at} is refused");
@@ -481,9 +719,38 @@ fn image_round_trips_and_refuses_damage() {
 }
 
 #[test]
+fn an_image_is_the_outside_of_the_workspace_link_beside_it() {
+    use blaze_link::Outside;
+    use blaze_link::premap::StaticAt;
+    let small = Small::new();
+    let natives = natives();
+    let part = image_part(&small.built(), &small.owned(), &natives).unwrap();
+    let output = prelink::output(&dev_output(), "blaze-premap-test");
+    let key = ImageKey(id(79));
+    let bytes = prelink::build(&Model, &prelink_request(&output, &part), key).unwrap();
+    let image = View::parse(&bytes, key).unwrap();
+    for (key, _) in &small.owned_functions {
+        assert_eq!(Outside::function(&image, key), image.get(&SymbolId::function(key)).map(|it| it.value));
+    }
+    assert_eq!(Outside::function(&image, &ikey(11)), None, "a workspace function is not the image's");
+    for it in small.statics.iter().filter(|it| small.owned_statics.contains(&(it.item, it.instance))) {
+        let value = image.get(&SymbolId::of_static(&it.item, &it.instance)).unwrap().value;
+        let want = if it.thread_local { StaticAt::ThreadLocal(value) } else { StaticAt::Addr(value) };
+        assert_eq!(Outside::static_at(&image, &it.item, &it.instance), Some(want));
+    }
+    assert_eq!(Outside::tls_end(&image), 16);
+    assert_eq!(Outside::end(&image), image.end());
+    assert_eq!(Outside::name(&image, "not defined"), None);
+    let def = Def { value: 0x1000, size: 8, kind: Kind::Data, strength: Strength::Weak, order: 3 };
+    assert_eq!(prelink::def_of_link(prelink::link_def(def)), def);
+}
+
+#[test]
 fn prelink_refuses_what_it_was_not_asked() {
     struct Fixed(Prelinked);
     impl Prelink for Fixed {
+        type Placed = Prelinked;
+
         fn prelink(&self, _: &Request<'_>) -> Result<Prelinked, PremapError> {
             Ok(self.0.clone())
         }
@@ -516,6 +783,8 @@ fn prelink_refuses_what_it_was_not_asked() {
 fn image_of(binds: Vec<Bind>, names: Vec<PlacedName>, init: Vec<InitEntry>, tls: Option<Tls>) -> (Vec<u8>, ImageKey) {
     struct Fixed(Prelinked);
     impl Prelink for Fixed {
+        type Placed = Prelinked;
+
         fn prelink(&self, _: &Request<'_>) -> Result<Prelinked, PremapError> {
             Ok(self.0.clone())
         }
@@ -544,6 +813,9 @@ fn image_of(binds: Vec<Bind>, names: Vec<PlacedName>, init: Vec<InitEntry>, tls:
         debug_names: &[],
         natives: &[],
         spans: &[],
+        function_digests: &[],
+        static_digests: &[],
+        debug_digests: &[],
     };
     let key = ImageKey(id(80));
     (prelink::build(&Fixed(linked), &request, key).unwrap(), key)
@@ -698,8 +970,8 @@ fn store_round_trip() {
 struct Shelved(FxHashMap<ImageKey, Vec<u8>>, u32);
 
 impl Shelf for Shelved {
-    fn get_image(&self, key: &ImageKey) -> Result<Option<Box<[u8]>>, PremapError> {
-        Ok(self.0.get(key).map(|it| it.clone().into_boxed_slice()))
+    fn get_image(&self, key: &ImageKey) -> Result<Option<&[u8]>, PremapError> {
+        Ok(self.0.get(key).map(Vec::as_slice))
     }
 
     fn put_image(&mut self, key: &ImageKey, bytes: Vec<u8>) -> Result<(), PremapError> {
@@ -790,9 +1062,11 @@ fn a_failed_image_fails_again_and_never_falls_back() {
     let mut images = Images::default();
     let graph = GraphKey(id(1));
     let key = ImageKey(id(2));
-    assert!(matches!(images.pick(graph, key), Pick::Make));
+    assert!(images.newest(graph).is_none());
+    assert!(matches!(images.want(key), Pick::Make));
     let error = PremapError::new("the prelink of the dependency image placed no function".to_owned());
     assert!(images.finish(key, Err::<Ready, _>(error.clone())).is_err());
-    assert!(matches!(images.pick(graph, key), Pick::Failed(it) if it == error));
+    assert!(matches!(images.want(key), Pick::Failed(it) if it == error));
+    assert!(images.newest(graph).is_none(), "a failed image is no graph's newest");
     assert!(!images.claim(key));
 }

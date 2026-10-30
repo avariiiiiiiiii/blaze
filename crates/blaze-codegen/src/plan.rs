@@ -15,15 +15,18 @@
 //! - Tiering (#807): a build that takes edits starts a function whose level is LLVM's at
 //!   Cranelift and puts LLVM's code in its slot once compiled. A build whose output is a file
 //!   compiles each function once, at its level: the output never depends on timing.
+//! - A tiered run ([`Mode::Tiered`]) starts each function at opt-level 0 as stencils that
+//!   count, patchable: `blaze_stencil::tier` tiers it up by its counts, not the plan.
 
-use std::collections::BTreeMap;
+use std::{cmp::Ordering, collections::BTreeMap, fmt, sync::LazyLock};
 
-use blaze_ids::{ContentId, Hasher};
-use serde::{Deserialize, Serialize};
+use blaze_hashcons::{Consed, HashCons, Interned};
+use blaze_ids::{ContentId, Domain, Hasher};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     Backend,
-    settings::{DebugInfo, Panic, Sanitize, Spec, Toolchain},
+    settings::{DebugInfo, Panic, Pgo, Sanitize, Spec, Toolchain},
 };
 
 pub const POLICY_DOMAIN: &str = "blaze v2 codegen policy 1";
@@ -75,17 +78,98 @@ pub struct Profile {
     pub build_override: Override,
 }
 
-/// Whose code an instance is, for its settings.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+/// Whose code an instance is, for its settings. One pointer and a tag: the walk copies it for
+/// every callee it keys by who asks for it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum Origin {
     /// A workspace member's.
-    Member(String),
+    Member(Package),
     /// A dependency's, by package name.
-    Dependency(String),
+    Dependency(Package),
     /// What a build script or proc macro runs: its own code and its dependencies'.
-    BuildTime(String),
+    BuildTime(Package),
     /// A crate of the standard library's.
     Std,
+}
+
+/// A package's name, interned once a process: [`Copy`], equal exactly when the names are,
+/// hashed by the name's content (the same in every run, never by address), ordered and
+/// serialized as the name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Package(Interned<'static, PackageName>);
+
+#[derive(PartialEq, Eq)]
+struct PackageName(Box<str>);
+
+static PACKAGE_NAME: Domain = Domain::new("blaze v2 codegen package name 1");
+
+impl Consed for PackageName {
+    fn domain() -> &'static Domain {
+        &PACKAGE_NAME
+    }
+
+    fn hash_content(&self, hasher: &mut Hasher) {
+        hasher.part(self.0.as_bytes());
+    }
+}
+
+/// Every package name the process has made an [`Origin`] of: the packages of the workspaces
+/// it builds, a few thousand at most.
+static PACKAGES: LazyLock<HashCons<PackageName>> = LazyLock::new(HashCons::new);
+
+impl Package {
+    /// The package named `name`. A name made before is found with no lock and no allocation.
+    pub fn new(name: &str) -> Package {
+        // `content_of(&PackageName(name))`, without the box.
+        let mut hasher = Hasher::of(&PACKAGE_NAME);
+        hasher.part(name.as_bytes());
+        if let Some(found) = PACKAGES.lookup(&hasher.finish()) {
+            return Package(found);
+        }
+        // alloc: once a process, per package name
+        Package(PACKAGES.intern(PackageName(name.into())))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        &self.0.get().0
+    }
+}
+
+impl PartialOrd for Package {
+    fn partial_cmp(&self, other: &Package) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Package {
+    fn cmp(&self, other: &Package) -> Ordering {
+        if self == other { Ordering::Equal } else { self.as_str().cmp(other.as_str()) }
+    }
+}
+
+impl fmt::Debug for Package {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl fmt::Display for Package {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Package {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Package {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Package, D::Error> {
+        let name = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        Ok(Package::new(&name))
+    }
 }
 
 /// What a build makes.
@@ -97,6 +181,10 @@ pub enum Mode {
     /// functions are reached through slots, and what is at LLVM's level starts at
     /// Cranelift's.
     Live,
+    /// A dev or test run the daemon runs in process (`blaze-inproc`, lazily through
+    /// `blaze-lazy`): code at opt-level 0 starts as stencils that count, and
+    /// `blaze_stencil::tier` decides each one's tier-up by its counts.
+    Tiered,
 }
 
 /// How every function of one build is compiled.
@@ -111,6 +199,8 @@ pub struct Policy {
     /// The build's sanitizers and SanitizerCoverage (`RUSTFLAGS`' `-Zsanitizer` and the
     /// rest), the same for every function.
     pub sanitize: Sanitize,
+    /// `-Cprofile-generate` or `-Cprofile-use`, the same for every function.
+    pub pgo: Pgo,
 }
 
 /// How one function is compiled.
@@ -130,6 +220,9 @@ pub struct Choice {
 pub enum PlanError {
     /// The level asks for LLVM, and this blaze was built without it.
     NoLlvm { origin: Origin, level: OptLevel },
+    /// A tiered build's code at opt-level 0 is stencils, and the target has no stencil
+    /// library ([`Toolchain::stencils`]).
+    NoStencils { target: String },
 }
 
 impl std::fmt::Display for PlanError {
@@ -139,6 +232,11 @@ impl std::fmt::Display for PlanError {
                 f,
                 "{origin:?} is compiled at opt-level {level:?}, which needs LLVM, and this blaze \
                  was built without it (`--features llvm`)"
+            ),
+            PlanError::NoStencils { target } => write!(
+                f,
+                "a tiered run compiles opt-level 0 code as stencils, and {target} has no stencil \
+                 library"
             ),
         }
     }
@@ -163,21 +261,17 @@ impl Policy {
     /// The overrides that apply to `origin`, outermost first, as cargo layers them: the
     /// profile, then `"*"` for a non-member, then the package's own; `build-override` over
     /// all of them for build-time code.
-    fn layers(&self, origin: &Origin) -> Vec<&Override> {
+    fn layers(&self, origin: &Origin) -> impl Iterator<Item = &Override> {
         let packages = &self.profile.packages;
-        match origin {
-            Origin::Member(name) => packages.get(name).into_iter().collect(),
-            Origin::Dependency(name) => {
-                packages.get("*").into_iter().chain(packages.get(name)).collect()
+        let layers = match origin {
+            Origin::Member(name) => [packages.get(name.as_str()), None, None],
+            Origin::Dependency(name) => [packages.get("*"), packages.get(name.as_str()), None],
+            Origin::BuildTime(name) => {
+                [packages.get("*"), packages.get(name.as_str()), Some(&self.profile.build_override)]
             }
-            Origin::BuildTime(name) => packages
-                .get("*")
-                .into_iter()
-                .chain(packages.get(name))
-                .chain([&self.profile.build_override])
-                .collect(),
-            Origin::Std => vec![&SHIPPED_STD],
-        }
+            Origin::Std => [Some(&SHIPPED_STD), None, None],
+        };
+        layers.into_iter().flatten()
     }
 
     /// How a function whose code is `origin`'s is compiled. `overflow_checks` is the front
@@ -201,7 +295,7 @@ impl Policy {
         }
         let llvm = self.toolchain.llvm.is_some();
         let backend =
-            level.backend(llvm).ok_or_else(|| PlanError::NoLlvm { origin: origin.clone(), level })?;
+            level.backend(llvm).ok_or(PlanError::NoLlvm { origin: *origin, level })?;
         // Only a member's code is edited, so only it is recompiled: the rest is compiled once
         // and can afford Cranelift's optimizer.
         let member = matches!(origin, Origin::Member(_));
@@ -218,11 +312,28 @@ impl Policy {
             panic: profile.panic,
             debuginfo,
             fold: self.fold && backend.is_cranelift(),
+            counted: false,
             // A member's code built into another function's would outlive a patch of it.
             mir_inline: matches!(level, OptLevel::O2 | OptLevel::O3) && !live,
             sanitize: self.sanitize,
+            pgo: self.pgo,
             policy: self.id(),
         };
+        // Build-time code runs out of the run's process, where no counter cells are: it is
+        // compiled as an output's.
+        let counted = self.mode == Mode::Tiered && level == OptLevel::O0 && !matches!(origin, Origin::BuildTime(_));
+        if counted {
+            if self.toolchain.stencils.is_none() {
+                // clone: an error names the target
+                return Err(PlanError::NoStencils { target: self.toolchain.target.clone() });
+            }
+            // Its tier-up is `blaze_stencil::tier`'s, by its counts: never a plan's `then`.
+            return Ok(Choice {
+                first: Spec { fold: false, counted: true, ..spec.at(Backend::Stencil) },
+                then: None,
+                patchable: true,
+            });
+        }
         let patchable = live && member;
         let tiered = live && !backend.is_cranelift();
         Ok(if tiered {
@@ -253,6 +364,7 @@ mod tests {
                 features: Vec::new(),
                 cranelift: "0.136".to_owned(),
                 llvm: Some("23.1".to_owned()),
+                stencils: None,
                 frame_pointers: true,
                 relocation: Relocation::Pic,
             },
@@ -268,11 +380,12 @@ mod tests {
             mode,
             fold: false,
             sanitize: Sanitize::default(),
+            pgo: Pgo::None,
         }
     }
 
     fn member() -> Origin {
-        Origin::Member("app".to_owned())
+        Origin::Member(Package::new("app"))
     }
 
     #[test]
@@ -281,7 +394,7 @@ mod tests {
         let own = policy.choose(&member(), None).unwrap();
         assert_eq!(own.first.backend, Backend::Cranelift { speed: false });
         assert!(own.patchable && own.then.is_none());
-        let dependency = policy.choose(&Origin::Dependency("regex".to_owned()), None).unwrap();
+        let dependency = policy.choose(&Origin::Dependency(Package::new("regex")), None).unwrap();
         assert!(!dependency.patchable);
     }
 
@@ -291,10 +404,10 @@ mod tests {
             let policy = policy(OptLevel::O0, mode);
             let speed = |origin: Origin| policy.choose(&origin, None).unwrap().first.backend;
             assert_eq!(speed(member()), Backend::Cranelift { speed: false });
-            assert_eq!(speed(Origin::Dependency("regex".to_owned())), Backend::Cranelift { speed: true });
-            assert_eq!(speed(Origin::BuildTime("serde_derive".to_owned())), Backend::Cranelift { speed: true });
+            assert_eq!(speed(Origin::Dependency(Package::new("regex"))), Backend::Cranelift { speed: true });
+            assert_eq!(speed(Origin::BuildTime(Package::new("serde_derive"))), Backend::Cranelift { speed: true });
         }
-        let dependency = policy(OptLevel::O0, Mode::Output).choose(&Origin::Dependency("regex".to_owned()), None);
+        let dependency = policy(OptLevel::O0, Mode::Output).choose(&Origin::Dependency(Package::new("regex")), None);
         let own = policy(OptLevel::O0, Mode::Output).choose(&member(), None);
         assert_ne!(dependency.unwrap().first.settings(), own.unwrap().first.settings());
     }
@@ -321,12 +434,12 @@ mod tests {
         );
         let own = policy.choose(&member(), None).unwrap();
         assert_eq!(own.first.backend, Backend::Cranelift { speed: false });
-        let dependency = policy.choose(&Origin::Dependency("nalgebra".to_owned()), None).unwrap();
+        let dependency = policy.choose(&Origin::Dependency(Package::new("nalgebra")), None).unwrap();
         assert_eq!(dependency.first.backend, Backend::Llvm { opt: 3 });
-        let named = policy.choose(&Origin::Dependency("slow".to_owned()), None).unwrap();
+        let named = policy.choose(&Origin::Dependency(Package::new("slow")), None).unwrap();
         assert_eq!(named.first.backend, Backend::Cranelift { speed: true });
         // `"*"` is not for members, even one named like a dependency.
-        let member_star = policy.choose(&Origin::Member("nalgebra".to_owned()), None).unwrap();
+        let member_star = policy.choose(&Origin::Member(Package::new("nalgebra")), None).unwrap();
         assert_eq!(member_star.first.backend, Backend::Cranelift { speed: false });
     }
 
@@ -334,7 +447,7 @@ mod tests {
     fn build_override_is_outermost_for_build_time_code() {
         let mut policy = policy(OptLevel::O3, Mode::Output);
         policy.profile.build_override.opt_level = Some(OptLevel::O0);
-        let build = policy.choose(&Origin::BuildTime("serde_derive".to_owned()), None).unwrap();
+        let build = policy.choose(&Origin::BuildTime(Package::new("serde_derive")), None).unwrap();
         assert_eq!(build.first.backend, Backend::Cranelift { speed: true });
     }
 
@@ -345,7 +458,7 @@ mod tests {
             "*".to_owned(),
             Override { opt_level: Some(OptLevel::O3), ..Override::default() },
         );
-        let dependency = Origin::Dependency("memchr".to_owned());
+        let dependency = Origin::Dependency(Package::new("memchr"));
         let tiered = live.choose(&dependency, None).unwrap();
         assert_eq!(tiered.first.backend, Backend::Cranelift { speed: false });
         assert_eq!(tiered.then.as_ref().unwrap().backend, Backend::Llvm { opt: 3 });
@@ -374,6 +487,40 @@ mod tests {
     }
 
     #[test]
+    fn a_tiered_run_starts_level_zero_as_counting_stencils() {
+        let mut tiered = policy(OptLevel::O0, Mode::Tiered);
+        tiered.toolchain.stencils = Some("ab".repeat(32));
+        tiered.fold = true;
+        tiered.profile.packages.insert(
+            "nalgebra".to_owned(),
+            Override { opt_level: Some(OptLevel::O3), ..Override::default() },
+        );
+        for origin in [member(), Origin::Dependency(Package::new("regex"))] {
+            let choice = tiered.choose(&origin, None).unwrap();
+            assert_eq!(choice.first.backend, Backend::Stencil);
+            assert!(choice.first.counted && !choice.first.fold && !choice.first.mir_inline);
+            assert!(choice.then.is_none() && choice.patchable);
+        }
+        let mut output = tiered.clone();
+        output.mode = Mode::Output;
+        let higher = Origin::Dependency(Package::new("nalgebra"));
+        let (at_three, as_output) = (tiered.choose(&higher, None).unwrap(), output.choose(&higher, None).unwrap());
+        assert_eq!(at_three.first, Spec { policy: tiered.id(), ..as_output.first });
+        assert_eq!((at_three.then, at_three.patchable), (as_output.then, as_output.patchable));
+        assert_eq!(tiered.choose(&Origin::Std, None).unwrap().first.backend, Backend::Llvm { opt: 3 });
+        let build = tiered.choose(&Origin::BuildTime(Package::new("serde_derive")), None).unwrap();
+        assert_eq!(build.first.backend, Backend::Cranelift { speed: true });
+        assert!(!build.first.counted);
+
+        tiered.toolchain.stencils = None;
+        assert_eq!(
+            tiered.choose(&member(), None),
+            Err(PlanError::NoStencils { target: "aarch64-unknown-linux-gnu".to_owned() })
+        );
+        assert!(tiered.choose(&higher, None).is_ok());
+    }
+
+    #[test]
     fn without_llvm_a_level_that_needs_it_is_refused() {
         let mut policy = policy(OptLevel::O3, Mode::Output);
         policy.toolchain.llvm = None;
@@ -396,5 +543,47 @@ mod tests {
         b.profile.packages.insert("x".to_owned(), Override::default());
         let (a, b) = (a.choose(&member(), None).unwrap(), b.choose(&member(), None).unwrap());
         assert_ne!(a.first.settings(), b.first.settings());
+    }
+
+    fn std_hash(value: &impl std::hash::Hash) -> u64 {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        BuildHasherDefault::<rustc_hash::FxHasher>::default().hash_one(value)
+    }
+
+    #[test]
+    fn a_package_is_its_name() {
+        // A name made from another string is the same package: equal, hashed alike.
+        let owned = String::from("serde");
+        let (a, b) = (Package::new("serde"), Package::new(&owned));
+        assert_eq!(a, b);
+        assert_eq!(std_hash(&a), std_hash(&b));
+        assert_eq!(a.as_str(), "serde");
+        assert_ne!(Package::new("serde"), Package::new("serde_json"));
+        assert_ne!(Origin::Member(a), Origin::Dependency(a));
+        // Ordered by name, whatever order the names were made in.
+        let (z, m) = (Package::new("zz-made-first"), Package::new("aa-made-second"));
+        assert!(m < z && Origin::Member(m) < Origin::Member(z));
+        assert_eq!(format!("{:?}", Origin::Member(a)), "Member(\"serde\")");
+    }
+
+    #[test]
+    fn an_origin_is_serialized_as_its_name() {
+        let origin = Origin::BuildTime(Package::new("serde_derive"));
+        let json = serde_json::to_string(&origin).unwrap();
+        assert_eq!(json, r#"{"BuildTime":"serde_derive"}"#);
+        assert_eq!(serde_json::from_str::<Origin>(&json).unwrap(), origin);
+    }
+
+    #[test]
+    fn copying_and_finding_a_package_allocates_nothing() {
+        let origin = Origin::Dependency(Package::new("regex"));
+        let mut copies = 0;
+        blaze_alloc_count::assert_at_most(0, "a package made again, and its origin copied", || {
+            for _ in 0..64 {
+                let again = Origin::Dependency(Package::new("regex"));
+                copies += usize::from(again == origin);
+            }
+        });
+        assert_eq!(copies, 64);
     }
 }

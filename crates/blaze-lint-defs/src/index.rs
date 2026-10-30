@@ -8,7 +8,7 @@
 //! one compare); a lint by id, its first group and a store entry by index are one load each.
 //! The two perfect hashes take about 4 KiB together.
 
-use span::Edition;
+use edition::Edition;
 
 use super::{Level, Lint, LintId, lints, names};
 

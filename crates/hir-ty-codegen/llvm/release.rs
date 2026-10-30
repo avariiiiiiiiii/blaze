@@ -31,12 +31,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::{
     INNER, Machine, Machinery, OWN, REBASED, Symbol, Unhandled, agree_calls, attribute_kind, emitted, link,
     lower::{Debug, Defined, Lowering},
-    mark_hint, rebase, retold_bytes,
+    mark_features, mark_hint,
+    pgo::{self, Counted},
+    rebase, retold_bytes,
     sanitize::{self, Covered},
     told_constants, wrap,
 };
 use crate::{
-    DataIdentity,
+    DataIdentity, Features,
     backend::{Optimization, Passes, Phase, Tally},
     fragment::{Code, DataRequest, Hint, Wants},
     imports::Import,
@@ -53,6 +55,9 @@ pub(crate) struct Prelinked {
     /// Its instructions, as LLVM counts them.
     pub(crate) size: usize,
     pub(crate) facts: Facts,
+    /// Built with a profile: whether the profile has a record of its name with another hash
+    /// ([`pgo`]), so that it is built with no counts.
+    pub(crate) mismatched: bool,
 }
 
 /// What the pre-linked function says of itself for its summary, its callees by the
@@ -130,7 +135,10 @@ fn run(module: &Module<'_>, passes: &str, machine: &Machinery, vectorize: bool) 
 /// and reads what its summary says. `instances` says which of the function requests of
 /// `wants` are functions of the build (the others are outside symbols). `debug` asks for its
 /// line table and variables. The function has the attributes of the sanitizers of `sanitize`
-/// that `unsanitized` leaves on ([`sanitize::mark`]).
+/// that `unsanitized` leaves on ([`sanitize::mark`]). With `pgo`, what it is built with for PGO
+/// and the name its counts are kept under ([`pgo::name`]), it is instrumented or given its
+/// profile's counts here, as LLVM's pre-link pipeline does. It is compiled with the target
+/// features `features`, its unit's and its `#[target_feature]`'s ([`mark_features`]).
 pub(crate) fn prelink(
     wants: &Wants,
     func: &ir::Function,
@@ -141,9 +149,11 @@ pub(crate) fn prelink(
     instances: &impl Fn(u32) -> bool,
     sanitize: &Sanitize,
     unsanitized: Sanitizers,
+    pgo: Option<(pgo::Wanted, &str)>,
+    features: Features,
 ) -> Result<Prelinked, Unhandled> {
     let tally = Tally::global();
-    Machine::with(optimization, |context, machine| {
+    Machine::with_pgo(optimization, pgo.map(|it| it.0), features, |context, machine| {
         let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
@@ -166,6 +176,7 @@ pub(crate) fn prelink(
         let function = tally.time(Phase::Lower, || {
             let function = Lowering::add(context, &module, &own)?;
             mark_hint(context, function, hint);
+            mark_features(context, function, features)?;
             sanitize::mark(context, function, sanitize, unsanitized);
             Lowering::define(
                 context,
@@ -186,8 +197,16 @@ pub(crate) fn prelink(
         // The builder of the line table goes before the module is changed or let go of.
         let lined = lines.inspect(Debug::finish).is_some();
         tally.time(Phase::Verify, || module.verify()).map_err(llvm)?;
+        let renamed = pgo.map(|(wanted, name)| pgo::instrumented(context, &module, function, wanted, name));
         if let Some(passes) = prelink_passes(optimization) {
             run(&module, passes, machine, true)?;
+        }
+        if pgo.is_some() && !pgo::in_pipeline(optimization) {
+            tally.time(Phase::Optimize, || machine.run_pgo(&module))?;
+        }
+        let mismatched = machine.take_mismatched() > 0;
+        if let Some(renamed) = renamed {
+            renamed.restore();
         }
         let size = function.get_basic_blocks().iter().map(|it| it.get_instructions().count()).sum();
         let mut facts = facts(&module, function, instances);
@@ -202,7 +221,7 @@ pub(crate) fn prelink(
         };
         let body = optimistic(context, module, function, instances, machine)?;
         facts.body = Attrs { noreturn: facts.attrs.noreturn, ..body };
-        Ok(Prelinked { own, export, size, facts })
+        Ok(Prelinked { own, export, size, facts, mismatched })
     })
 }
 
@@ -565,7 +584,9 @@ fn optimistic<'ctx>(
 /// pipeline of `optimization`. `wants` has the function's requests and, after them, those
 /// of the imports (`Import::funcs`, `Import::datas`); `signature` is the function's. The
 /// code is instrumented for `sanitize` once optimized, and what SanitizerCoverage made for
-/// it comes with it.
+/// it comes with it. Instrumented for PGO when [`prelink`] was, under `profiled` (its
+/// [`pgo::name`]), it comes with what LLVM's record of it says. `features` are those
+/// [`prelink`] was given, which `own` says of its function already.
 pub(crate) fn compile(
     wants: &mut Wants,
     own: &[u8],
@@ -574,13 +595,15 @@ pub(crate) fn compile(
     given: &Given,
     optimization: Optimization,
     sanitize: &Sanitize,
-) -> Result<(Code, Covered), Unhandled> {
+    profiled: Option<&str>,
+    features: Features,
+) -> Result<(Code, Covered, Option<Counted>), Unhandled> {
     let tally = Tally::global();
     // Where a parameter is the only way to its memory, as `compiled` wraps it.
     let wrapped = optimization.pipeline().is_some()
         && wants.pointees.iter().any(|(_, it)| it.unique)
         && crate::Target::selected().is_ok_and(|it| it.object_format == crate::ObjectFormat::MachO);
-    Machine::with(optimization, |context, machine| {
+    Machine::with_pgo(optimization, None, features, |context, machine| {
         let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
@@ -619,16 +642,28 @@ pub(crate) fn compile(
         if module.get_function(INNER).is_some() {
             return Err(Unhandled::Shape("a body not built into the function that calls it"));
         }
+        let counted = profiled.map(|name| pgo::counted(&module, name)).transpose()?;
         let object = tally
             .time(Phase::Emit, || machine.write_to_memory_buffer(&module, FileType::Object))
             .map_err(llvm)?;
         let own = (OWN, signature.clone());
+        if let Some(counted) = counted {
+            let covered = sanitize.coverage.is_on();
+            let (code, coverage, bytes) =
+                tally.time(Phase::Read, || emitted::read_profiled(object.as_slice(), own, wants, covered))?;
+            if u64::from(bytes) != u64::from(counted.counters) * 8 {
+                return Err(Unhandled::Shape("PGO counters of another size than the record says"));
+            }
+            return Ok((code, coverage, Some(counted)));
+        }
         if sanitize.coverage.is_on() {
-            return tally.time(Phase::Read, || emitted::read_covered(object.as_slice(), own, wants));
+            let (code, coverage) =
+                tally.time(Phase::Read, || emitted::read_covered(object.as_slice(), own, wants))?;
+            return Ok((code, coverage, None));
         }
         let mut codes = tally.time(Phase::Read, || emitted::read(object.as_slice(), &[own], wants))?;
         let code = codes.pop().ok_or(Unhandled::Shape("an object without the function"))??;
-        Ok((code, Covered::default()))
+        Ok((code, Covered::default(), None))
     })
 }
 

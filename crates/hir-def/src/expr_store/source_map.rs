@@ -979,6 +979,10 @@ impl ExpressionStoreSourceMap {
         self.types_map_back.get(id).ok_or(SyntheticSyntax)
     }
 
+    pub fn lifetime_syntax(&self, id: LifetimeRefId) -> Result<LifetimeSource, SyntheticSyntax> {
+        self.lifetime_map_back.get(id).ok_or(SyntheticSyntax)
+    }
+
     pub fn node_type(&self, node: InFile<&ast::Type>) -> Option<TypeRefId> {
         self.types_map.get(&node.map(AstPtr::new)).cloned()
     }

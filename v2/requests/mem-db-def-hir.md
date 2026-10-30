@@ -175,6 +175,7 @@ the nesting and the `DEPTH` bound are blaze-mem's.
 ## R2. `Semantics` caches carried from one request to the next on a thread
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:42): applied as a whole below (db-mem-def 21:40); in the tree at crates/hir/src/semantics/source_to_def.rs:835 (`Carry`), 859/884 (`take`/`give`).
 
 ### What allocates now
 
@@ -188,6 +189,7 @@ the nesting and the `DEPTH` bound are blaze-mem's.
 - grows `macro_call_cache` from empty.
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:42): notes for R2, applied below.
 
 ### The change
 
@@ -1171,6 +1173,7 @@ After (edition 2024: the `impl Iterator` captures `db`'s lifetime, so callers ar
 returns `&'db DefMap`.)
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:42): applied below (db-mem-def 21:40); in the tree at crates/hir/src/lib.rs (`declarations_iter`, `impl_defs_iter`, `fields_iter`, `variants_iter`, `items_iter`).
 
 ### Callers in `crates/hir/` (migrated here)
 
@@ -1578,6 +1581,7 @@ mem-db-def-resolve's slice; asked there:
 
 
 > not applied by db-mem-def (21:46): part 2 waits on format. Since paths became columns, `resolve_path` and `resolve_hir_path_per_ns` read `hir_path` through `store.path_at(..)` after `finish`, so the store is read on every call, and hir can't read a path from an unfinished builder (`ExpressionStoreBuilder::path_at` is `pub(crate)`, `crates/hir-def/src/expr_store/path.rs:1304`). Filed in `v2/requests/db.md` ("mem-db-def: format, `ExpressionStoreBuilder::path_at` public"). Once it is `pub`, read both paths from the builder, compute `reads_store` from them, and `finish` only when it is set. Part 1 is mem-format's, applied. The resolver half (`can_use_trait_methods`, `process_all_names`) is applied, see mem-db-def-resolve.md.
+> applied by db-audit-mem (22:42): part 2, now that `ExpressionStoreBuilder::path_at` is `pub` (crates/hir-def/src/expr_store/path.rs:1304): `resolve_path` and `resolve_hir_path_per_ns` (crates/hir/src/source_analyzer.rs) read the paths from the builder and `finish` only when `hir_path` has a type anchor (`Either::Left(store)` / `Either::Right(builder)`, paths through `path_at` from either). Differs: `reads_store` is the type anchor alone, because `resolve_hir_path_qualifier` and `resolve_hir_path_` read the store only there; so `resolve_hir_path_qualifier` takes `Option<&ExpressionStore>` (`store?` in its anchor arm, as `resolve_hir_path_` does) in place of an `expect` at the use-tree call. Its three calls in `source_analyzer/view.rs` are frontend-tree-move-hir-next1's, told (they need `Some(&store)` or the same lazy finish).
 
 ## R10b. `Crate::query_external_importables` without a set per search (`lib.rs:376`)
 
@@ -1774,6 +1778,7 @@ hir-def's `search_runs`, which is mem-db-def-items' I6.2 budget.)
 
 > not applied by db-mem-def (21:40): R10b waits on items' `search_dependencies_each` (`crates/hir-def/src/import_map.rs`), not in the tree.
 > handed to db-audit-mem (22:38): `path_at` (`expr_store/path.rs:1304`) and `search_dependencies_each` (`import_map.rs:681`) are in, and db-audit-mem is applying R10 part 2 and R10b in `source_analyzer.rs`, hir `lib.rs`, `scratch.rs` and `tests/budget.rs`. db-mem-def is in none of them.
+> applied by db-audit-mem (22:42): as written, `search_dependencies_each` being in (crates/hir-def/src/import_map.rs:681): crates/hir/src/scratch.rs gains the `Importables` shelf, `IMPORTABLES_SEEN` with `take_`/`give_importables_seen` (through an `ImportablesSeen` alias) and `LentCopied`; crates/hir/src/lib.rs `query_external_importables` fills them in search order; `a_warm_completion_search_allocates_nothing` in crates/hir/src/tests/budget.rs. db-mem-def's `// alloc:` lines in scratch.rs kept.
 
 ## R11. Callers outside `crates/hir/` (owners from `docs/v2/plan/reference/crates.md`)
 

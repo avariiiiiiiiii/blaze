@@ -813,7 +813,7 @@ impl<'db> Ty<'db> {
                     .predicates(db)
                     .iter_instantiated_copied(interner, args.as_slice())
                     .map(Unnormalized::skip_norm_wip)
-                    .collect(),
+                    .collect(), // alloc: owned list for `hir`'s and the lints' type walks (a `pub` signature)
             ),
             TyKind::Param(param) => {
                 // FIXME: We shouldn't use `param.id` here.
@@ -831,7 +831,7 @@ impl<'db> Ty<'db> {
                                     ClauseKind::TypeOutlives(pred) => pred.0 == self,
                                     _ => false,
                                 })
-                                .collect::<Vec<_>>();
+                                .collect::<Vec<_>>(); // alloc: owned list for `hir`'s and the lints' type walks (a `pub` signature)
 
                             Some(predicates)
                         }
@@ -853,7 +853,7 @@ impl<'db> Ty<'db> {
                         GenericArgs::empty(),
                     )
                     .upcast(interner);
-                    Some(vec![impl_bound])
+                    Some(vec![impl_bound]) // alloc: owned list for `hir`'s and the lints' type walks (a `pub` signature)
                 } else {
                     None
                 }
@@ -1407,7 +1407,10 @@ impl<'db> rustc_type_ir::inherent::Ty<DbInterner<'db>> for Ty<'db> {
     }
 
     fn has_unsafe_fields(self) -> bool {
-        false
+        match self.kind() {
+            TyKind::Adt(adt, _) => adt.has_unsafe_fields(),
+            _ => false,
+        }
     }
 
     fn discriminant_ty(self, interner: DbInterner<'db>) -> Ty<'db> {

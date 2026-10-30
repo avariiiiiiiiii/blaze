@@ -5,7 +5,10 @@ use std::iter;
 use base_db::{Db, Crate};
 use hir_expand::{InFile, Lookup};
 use la_arena::ArenaMap;
-use syntax::ast::{self, HasVisibility};
+use syntax::{
+    AstPtr,
+    view::{self as ast, HasVisibility},
+};
 
 use crate::{
     AssocItemId, BlockIdLt, HasModule, ItemContainerId, LocalFieldId, ModuleId, ModuleIdLt, TraitId,
@@ -304,10 +307,23 @@ impl VariantFields {
     }
 }
 
+/// [`visibility_from_ast_view`] of a handle: the view of the same node, in the database's tree
+/// the handle was read from.
 pub fn visibility_from_ast(
     db: &Db,
     has_resolver: impl HasResolver + HasModule,
-    ast_vis: InFile<Option<ast::Visibility>>,
+    ast_vis: InFile<Option<syntax::ast::Visibility>>,
+) -> Visibility {
+    let file_id = ast_vis.file_id;
+    let root = file_id.root(db);
+    let vis = ast_vis.value.map(|it| AstPtr::new(&it).to_view(root));
+    visibility_from_ast_view(db, has_resolver, InFile::new(file_id, vis))
+}
+
+pub fn visibility_from_ast_view(
+    db: &Db,
+    has_resolver: impl HasResolver + HasModule,
+    ast_vis: InFile<Option<ast::Visibility<'_>>>,
 ) -> Visibility {
     let mut span_map = None;
     let raw_vis = crate::item_tree::visibility_from_ast(db, ast_vis.value, &mut |range| {
@@ -332,22 +348,22 @@ impl AssocItemId {
             AssocItemId::FunctionId(function_id) => {
                 let loc = function_id.lookup(db);
                 trait_item_visibility(db, loc.container).unwrap_or_else(|| {
-                    let source = loc.source(db);
-                    visibility_from_ast(db, function_id, source.map(|src| src.visibility()))
+                    let source = loc.source_view(db);
+                    visibility_from_ast_view(db, function_id, source.map(|src| src.visibility()))
                 })
             }
             AssocItemId::ConstId(const_id) => {
                 let loc = const_id.lookup(db);
                 trait_item_visibility(db, loc.container).unwrap_or_else(|| {
-                    let source = loc.source(db);
-                    visibility_from_ast(db, const_id, source.map(|src| src.visibility()))
+                    let source = loc.source_view(db);
+                    visibility_from_ast_view(db, const_id, source.map(|src| src.visibility()))
                 })
             }
             AssocItemId::TypeAliasId(type_alias_id) => {
                 let loc = type_alias_id.lookup(db);
                 trait_item_visibility(db, loc.container).unwrap_or_else(|| {
-                    let source = loc.source(db);
-                    visibility_from_ast(db, type_alias_id, source.map(|src| src.visibility()))
+                    let source = loc.source_view(db);
+                    visibility_from_ast_view(db, type_alias_id, source.map(|src| src.visibility()))
                 })
             }
         }
@@ -366,6 +382,88 @@ fn trait_item_visibility(
 
 fn trait_visibility(db: &Db, def: TraitId) -> Visibility {
     let loc = def.lookup(db);
-    let source = loc.source(db);
-    visibility_from_ast(db, def, source.map(|src| src.visibility()))
+    let source = loc.source_view(db);
+    visibility_from_ast_view(db, def, source.map(|src| src.visibility()))
+}
+
+#[cfg(test)]
+mod view_tests {
+    use syntax::ast::HasVisibility as _;
+    use test_fixture::WithFixture;
+
+    use super::*;
+    use crate::{
+        AssocItemId, ModuleDefId,
+        nameres::{
+            assoc::{ImplItems, TraitItems},
+            crate_def_map,
+        },
+        test_db::{TestDB, TestDBExt},
+    };
+
+    /// Every way to write a visibility, on every kind of item that reads one from its syntax.
+    const CODE: &str = r#"
+pub mod m {
+    pub(crate) fn a() {}
+    pub(super) const B: u8 = 0;
+    pub(in crate::m) type C = u8;
+    pub(self) fn d() {}
+    fn e() {}
+    pub trait T { fn f(&self); const G: u8; type H; }
+    pub(crate) trait U {}
+    pub struct S;
+    impl S { pub fn i() {} pub(crate) const J: u8 = 1; fn l() {} }
+    impl T for S { fn f(&self) {} const G: u8 = 2; type H = u8; }
+}
+pub use m::*;
+"#;
+
+    /// The visibility each item's own syntax gives, read through the handle and through its view.
+    macro_rules! both {
+        ($db:ident, $id:expr) => {{
+            let id = $id;
+            let loc = id.lookup(&$db);
+            let handle = visibility_from_ast(&$db, id, loc.source(&$db).map(|it| it.visibility()));
+            let view =
+                visibility_from_ast_view(&$db, id, loc.source_view(&$db).map(|it| it.visibility()));
+            assert_eq!(handle, view, "{id:?}");
+        }};
+    }
+
+    /// `visibility_from_ast_view` is `visibility_from_ast`, item by item, for every function,
+    /// const, type alias and trait of `CODE`, the items of its traits and impls too.
+    #[test]
+    fn the_view_twin_is_the_handle_version() {
+        let (db, _) = TestDB::with_single_file(CODE);
+        let mut items = Vec::new();
+        let mut traits = 0;
+        for (_, module) in crate_def_map(&db, db.fetch_test_crate()).modules(&db) {
+            let scope = module.scope(&db);
+            for decl in scope.declarations() {
+                match decl {
+                    ModuleDefId::FunctionId(it) => both!(db, it),
+                    ModuleDefId::ConstId(it) => both!(db, it),
+                    ModuleDefId::TypeAliasId(it) => both!(db, it),
+                    ModuleDefId::TraitId(it) => {
+                        both!(db, it);
+                        traits += 1;
+                        items.extend(TraitItems::query(&db, it).items.iter().map(|&(_, it)| it));
+                    }
+                    _ => {}
+                }
+            }
+            for imp in scope.impls() {
+                items.extend(ImplItems::of(&db, imp).0.items.iter().map(|&(_, it)| it));
+            }
+        }
+        assert_eq!(traits, 2, "the traits of CODE");
+        assert_eq!(items.len(), 9, "the trait and impl items of CODE");
+        for item in items {
+            match item {
+                AssocItemId::FunctionId(it) => both!(db, it),
+                AssocItemId::ConstId(it) => both!(db, it),
+                AssocItemId::TypeAliasId(it) => both!(db, it),
+            }
+        }
+    }
 }

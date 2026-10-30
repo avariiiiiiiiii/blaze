@@ -38,7 +38,7 @@ pub struct ObligationCause {
 
 /// rustc's `ObligationCauseCode`, the codes diagnostics read. Ids only, so a cause stays `Copy`
 /// (rustc boxes it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ObligationCauseCode {
     /// Not well classified or should be obvious from the span.
     Misc,
@@ -59,6 +59,10 @@ pub enum ObligationCauseCode {
     MatchExpressionArm { prior_arms: u32 },
     /// The type of a `let` must be `Sized`.
     LetType,
+    /// An `if` without an `else` is `()`, which must agree with what the `if` is expected to be.
+    IfExpressionWithNoElse,
+    /// A `return` without a value returns `()`, which must agree with the return type.
+    ReturnNoExpression,
 }
 
 impl ObligationCause {

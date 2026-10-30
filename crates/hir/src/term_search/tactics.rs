@@ -55,9 +55,11 @@ pub(super) fn trivial<'a, 'lt, 'db>(
             return None;
         }
 
-        lookup.insert(db, ty.clone(), std::iter::once(expr.clone()));
+        let unifies = ty.instantiate_with_errors(db).could_unify_with_deeply(db, &ctx.goal);
+        // clone: the lookup keeps its own copy of the candidate, an ID here
+        lookup.insert(db, ty, std::iter::once(expr.clone()));
 
-        ty.instantiate_with_errors(db).could_unify_with_deeply(db, &ctx.goal).then_some(expr)
+        unifies.then_some(expr)
     })
 }
 
@@ -105,9 +107,11 @@ pub(super) fn assoc_const<'a, 'lt, 'db>(
                 return None;
             }
 
-            lookup.insert(db, ty.clone(), std::iter::once(expr.clone()));
+            let unifies = ty.instantiate_with_errors(db).could_unify_with_deeply(db, &ctx.goal);
+            // clone: the lookup keeps its own copy of the candidate, an ID here
+            lookup.insert(db, ty, std::iter::once(expr.clone()));
 
-            ty.instantiate_with_errors(db).could_unify_with_deeply(db, &ctx.goal).then_some(expr)
+            unifies.then_some(expr)
         })
 }
 
@@ -127,15 +131,15 @@ pub(super) fn data_constructor<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     _defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
+    types: &'lt mut Vec<Type<'db>>,
     fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
-    lookup
-        .types_wishlist()
-        .clone()
-        .into_iter()
-        .chain(iter::once(ctx.goal.clone()))
+    lookup.wishlist_into(types);
+    types.push(ctx.goal);
+    types
+        .drain(..)
         .filter_map(|ty| ty.as_adt().map(|adt| (adt, ty)))
         .filter(|_| fuel.should_continue())
         .filter_map(move |(adt, ty)| match adt {
@@ -163,29 +167,32 @@ pub(super) fn data_constructor<'a, 'lt, 'db>(
                     return None;
                 }
 
-                let generics: Vec<_> = ty.type_arguments().collect();
-
                 // Early exit if some param cannot be filled from lookup
                 let param_exprs: Vec<Vec<Expr<'_>>> = fields
                     .into_iter()
                     .map(|field| {
-                        lookup.find(db, &field.ty(db).instantiate(db, generics.iter().cloned()))
+                        lookup.find(db, &field.ty(db).instantiate(db, ty.type_arguments()))
                     })
                     .collect::<Option<_>>()?;
+
+                // alloc: the generic args the candidates own
+                let generics: Vec<_> = ty.type_arguments().collect();
 
                 // Note that we need special case for 0 param constructors because of multi cartesian
                 // product
                 let exprs: Vec<Expr<'_>> = if param_exprs.is_empty() {
+                    // alloc: the one candidate, with no params
                     vec![Expr::Struct { strukt, generics, params: Vec::new() }]
                 } else {
                     param_exprs
                         .into_iter()
                         .multi_cartesian_product()
+                        // clone: each candidate owns its generic args
                         .map(|params| Expr::Struct { strukt, generics: generics.clone(), params })
-                        .collect()
+                        .collect() // alloc: the candidates, kept by the lookup and returned
                 };
 
-                lookup.insert(db, ty.clone(), exprs.iter().cloned());
+                lookup.insert(db, ty, exprs.iter().cloned());
                 Some((ty, exprs))
             }
             Adt::Enum(enum_) => {
@@ -205,43 +212,41 @@ pub(super) fn data_constructor<'a, 'lt, 'db>(
                     return None;
                 }
 
+                // alloc: the generic args the candidates own, once per enum
                 let generics: Vec<_> = ty.type_arguments().collect();
-                let exprs = enum_
-                    .variants_iter(db)
-                    .filter_map(|variant| {
-                        // Early exit if some param cannot be filled from lookup
-                        let param_exprs: Vec<Vec<Expr<'_>>> = variant
-                            .fields_iter(db)
-                            .map(|field| {
-                                let ty = field.ty(db).instantiate(db, generics.iter().cloned());
-                                lookup.find(db, &ty)
-                            })
-                            .collect::<Option<_>>()?;
+                // alloc: the candidates, kept by the lookup and returned
+                let mut exprs: Vec<Expr<'_>> = Vec::new();
+                for variant in enum_.variants_iter(db) {
+                    // Early exit if some param cannot be filled from lookup
+                    let Some(param_exprs) = variant
+                        .fields_iter(db)
+                        .map(|field| {
+                            let ty = field.ty(db).instantiate(db, &generics);
+                            lookup.find(db, &ty)
+                        })
+                        .collect::<Option<Vec<Vec<Expr<'_>>>>>()
+                    else {
+                        continue;
+                    };
 
-                        // Note that we need special case for 0 param constructors because of multi cartesian
-                        // product
-                        let variant_exprs: Vec<Expr<'_>> = if param_exprs.is_empty() {
-                            vec![Expr::Variant {
-                                variant,
-                                generics: generics.clone(),
-                                params: Vec::new(),
-                            }]
-                        } else {
-                            param_exprs
-                                .into_iter()
-                                .multi_cartesian_product()
-                                .map(|params| Expr::Variant {
-                                    variant,
-                                    generics: generics.clone(),
-                                    params,
-                                })
-                                .collect()
-                        };
-                        lookup.insert(db, ty.clone(), variant_exprs.iter().cloned());
-                        Some(variant_exprs)
-                    })
-                    .flatten()
-                    .collect();
+                    let start = exprs.len();
+                    // Note that we need special case for 0 param constructors because of multi cartesian
+                    // product
+                    if param_exprs.is_empty() {
+                        exprs.push(Expr::Variant {
+                            variant,
+                            // clone: each candidate owns its generic args
+                            generics: generics.clone(),
+                            params: Vec::new(), // alloc: empty
+                        });
+                    } else {
+                        exprs.extend(param_exprs.into_iter().multi_cartesian_product().map(
+                            // clone: each candidate owns its generic args
+                            |params| Expr::Variant { variant, generics: generics.clone(), params },
+                        ));
+                    }
+                    lookup.insert(db, ty, exprs[start..].iter().cloned());
+                }
 
                 Some((ty, exprs))
             }
@@ -305,82 +310,64 @@ pub(super) fn free_function<'a, 'lt, 'db>(
                     return None;
                 }
 
-                let generic_params = lookup
-                    .iter_types()
-                    .collect::<Vec<_>>() // Force take ownership
+                // With no type param left to fill, the one choice of generics is the defaults.
+                if !fuel.should_continue() {
+                    return None;
+                }
+                // alloc: the generic args the candidates own
+                let generics: Vec<_> =
+                    type_params.iter().map(|it| it.default(db)).collect::<Option<_>>()?;
+
+                let ret_ty = it.ret_type(db).instantiate(db, &generics);
+                // Filter out private and unsafe functions
+                if !it.is_visible_from(db, module)
+                    || it.is_unsafe_to_call(
+                        db,
+                        None,
+                        crate::Crate::from(ctx.scope.resolver().krate()).edition(db),
+                    )
+                    || it.is_unstable(db)
+                    || ret_ty.is_raw_ptr()
+                {
+                    return None;
+                }
+
+                // Early exit if some param cannot be filled from lookup
+                let param_exprs: Vec<Vec<Expr<'_>>> = it
+                    .params_without_self(db)
                     .into_iter()
-                    .permutations(non_default_type_params_len);
-
-                let exprs: Vec<_> = generic_params
-                    .filter(|_| fuel.should_continue())
-                    .filter_map(|generics| {
-                        // Insert default type params
-                        let mut g = generics.into_iter();
-                        let generics: Vec<_> = type_params
-                            .iter()
-                            .map(|it| match it.default(db) {
-                                Some(ty) => Some(ty),
-                                None => {
-                                    let generic = g.next().expect("Missing type param");
-                                    // Filter out generics that do not unify due to trait bounds
-                                    it.ty(db).could_unify_with(db, &generic).then_some(generic)
-                                }
-                            })
-                            .collect::<Option<_>>()?;
-
-                        let ret_ty = it.ret_type(db).instantiate(db, generics.iter().cloned());
-                        // Filter out private and unsafe functions
-                        if !it.is_visible_from(db, module)
-                            || it.is_unsafe_to_call(
-                                db,
-                                None,
-                                crate::Crate::from(ctx.scope.resolver().krate()).edition(db),
-                            )
-                            || it.is_unstable(db)
-                            || ret_ty.is_raw_ptr()
-                        {
-                            return None;
+                    .map(|field| {
+                        let ty = &field.ty().instantiate(db, &generics);
+                        match ty.is_mutable_reference() {
+                            true => None,
+                            false => lookup.find_autoref(db, ty),
                         }
-
-                        // Early exit if some param cannot be filled from lookup
-                        let param_exprs: Vec<Vec<Expr<'_>>> = it
-                            .params_without_self(db)
-                            .into_iter()
-                            .map(|field| {
-                                let ty = &field.ty().instantiate(db, &generics);
-                                match ty.is_mutable_reference() {
-                                    true => None,
-                                    false => lookup.find_autoref(db, ty),
-                                }
-                            })
-                            .collect::<Option<_>>()?;
-
-                        // Note that we need special case for 0 param constructors because of multi cartesian
-                        // product
-                        let fn_exprs: Vec<Expr<'_>> = if param_exprs.is_empty() {
-                            vec![Expr::Function { func: *it, generics, params: Vec::new() }]
-                        } else {
-                            param_exprs
-                                .into_iter()
-                                .multi_cartesian_product()
-                                .map(|params| Expr::Function {
-                                    func: *it,
-                                    generics: generics.clone(),
-
-                                    params,
-                                })
-                                .collect()
-                        };
-
-                        lookup.insert(db, ret_ty.clone(), fn_exprs.iter().cloned());
-                        Some((ret_ty, fn_exprs))
                     })
-                    .collect();
-                Some(exprs)
+                    .collect::<Option<_>>()?;
+
+                // Note that we need special case for 0 param constructors because of multi cartesian
+                // product
+                let fn_exprs: Vec<Expr<'_>> = if param_exprs.is_empty() {
+                    // alloc: the one candidate, with no params
+                    vec![Expr::Function { func: *it, generics, params: Vec::new() }]
+                } else {
+                    param_exprs
+                        .into_iter()
+                        .multi_cartesian_product()
+                        .map(|params| Expr::Function {
+                            func: *it,
+                            // clone: each candidate owns its generic args
+                            generics: generics.clone(),
+                            params,
+                        })
+                        .collect() // alloc: the candidates, kept by the lookup and returned
+                };
+
+                lookup.insert(db, ret_ty, fn_exprs.iter().cloned());
+                Some((ret_ty, fn_exprs))
             }
             _ => None,
         })
-        .flatten()
         .filter_map(|(ty, exprs)| {
             ty.instantiate_with_errors(db).could_unify_with_deeply(db, &ctx.goal).then_some(exprs)
         })
@@ -406,19 +393,20 @@ pub(super) fn impl_method<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     _defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
+    types: &'lt mut Vec<Type<'db>>,
     fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
-    lookup
-        .new_types(NewTypesKey::ImplMethod)
-        .into_iter()
+    lookup.new_types(NewTypesKey::ImplMethod, types);
+    types
+        .drain(..)
         .filter(|ty| !ty.type_arguments().any(|it| it.contains_unknown()))
         .filter(|_| fuel.should_continue())
         .flat_map(|ty| {
-            Impl::all_for_type(db, ty.clone()).into_iter().map(move |imp| (ty.clone(), imp))
+            Impl::all_for_type(db, ty).into_iter().map(move |imp| (ty, imp))
         })
-        .flat_map(|(ty, imp)| imp.items_iter(db).map(move |item| (imp, ty.clone(), item)))
+        .flat_map(|(ty, imp)| imp.items_iter(db).map(move |item| (imp, ty, item)))
         .filter_map(|(imp, ty, it)| match it {
             AssocItem::Function(f) => Some((imp, ty, f)),
             _ => None,
@@ -476,8 +464,6 @@ pub(super) fn impl_method<'a, 'lt, 'db>(
                 return None;
             }
 
-            let target_type_exprs = lookup.find(db, &ty).expect("Type not in lookup");
-
             // Early exit if some param cannot be filled from lookup
             let param_exprs: Vec<Vec<Expr<'_>>> = it
                 .params_without_self(db)
@@ -487,21 +473,25 @@ pub(super) fn impl_method<'a, 'lt, 'db>(
                 })
                 .collect::<Option<_>>()?;
 
+            let target_type_exprs = lookup.find(db, &ty).expect("Type not in lookup");
+
+            // alloc: the generic args the candidates own
             let generics: Vec<_> = ty.type_arguments().collect();
             let fn_exprs: Vec<Expr<'_>> = std::iter::once(target_type_exprs)
                 .chain(param_exprs)
                 .multi_cartesian_product()
-                .map(|params| {
-                    let mut params = params.into_iter();
-                    let target = Box::new(params.next().unwrap());
+                .map(|mut params| {
+                    // alloc: the candidate's receiver, an `Expr` node
+                    let target = Box::new(params.remove(0));
                     Expr::Method {
                         func: it,
+                        // clone: each candidate owns its generic args
                         generics: generics.clone(),
                         target,
-                        params: params.collect(),
+                        params,
                     }
                 })
-                .collect();
+                .collect(); // alloc: the candidates, returned
 
             Some((ret_ty, fn_exprs))
         })
@@ -527,14 +517,18 @@ pub(super) fn struct_projection<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     _defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
+    types: &'lt mut Vec<Type<'db>>,
     fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
-    lookup
-        .new_types(NewTypesKey::StructProjection)
-        .into_iter()
-        .map(|ty| (ty.clone(), lookup.find(db, &ty).expect("Expr not in lookup")))
+    lookup.new_types(NewTypesKey::StructProjection, types);
+    types
+        .drain(..)
+        .map(|ty| {
+            let targets = lookup.find(db, &ty).expect("Expr not in lookup");
+            (ty, targets)
+        })
         .filter(|_| fuel.should_continue())
         .flat_map(move |(ty, targets)| {
             ty.fields(db).into_iter().filter_map(move |(field, filed_ty)| {
@@ -542,8 +536,10 @@ pub(super) fn struct_projection<'a, 'lt, 'db>(
                     return None;
                 }
                 let exprs = targets
+                    // clone: each field access owns its target, a result value
                     .clone()
                     .into_iter()
+                    // alloc: the access's target, an `Expr` node
                     .map(move |target| Expr::Field { field, expr: Box::new(target) });
                 Some((filed_ty, exprs))
             })
@@ -576,12 +572,13 @@ pub(super) fn famous_types<'a, 'lt, 'db>(
     let bool_ty = BuiltinType::bool().ty(db);
     let unit_ty = Type::new_unit(db);
     [
-        Expr::FamousType { ty: bool_ty.clone(), value: "true" },
+        Expr::FamousType { ty: bool_ty, value: "true" },
         Expr::FamousType { ty: bool_ty, value: "false" },
         Expr::FamousType { ty: unit_ty, value: "()" },
     ]
     .into_iter()
     .inspect(|exprs| {
+        // clone: once a search, the lookup's copy of a value with no heap parts
         lookup.insert(db, exprs.ty(db), std::iter::once(exprs.clone()));
     })
     .filter(|expr| expr.ty(db).instantiate_with_errors(db).could_unify_with_deeply(db, &ctx.goal))
@@ -603,22 +600,22 @@ pub(super) fn impl_static_method<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     _defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
+    types: &'lt mut Vec<Type<'db>>,
     fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
-    lookup
-        .types_wishlist()
-        .clone()
-        .into_iter()
-        .chain(iter::once(ctx.goal.clone()))
+    lookup.wishlist_into(types);
+    types.push(ctx.goal);
+    types
+        .drain(..)
         .filter(|ty| !ty.type_arguments().any(|it| it.contains_unknown()))
         .filter(|_| fuel.should_continue())
         .flat_map(|ty| {
-            Impl::all_for_type(db, ty.clone()).into_iter().map(move |imp| (ty.clone(), imp))
+            Impl::all_for_type(db, ty).into_iter().map(move |imp| (ty, imp))
         })
         .filter(|(_, imp)| !imp.is_unsafe(db))
-        .flat_map(|(ty, imp)| imp.items_iter(db).map(move |item| (imp, ty.clone(), item)))
+        .flat_map(|(ty, imp)| imp.items_iter(db).map(move |item| (imp, ty, item)))
         .filter_map(|(imp, ty, it)| match it {
             AssocItem::Function(f) => Some((imp, ty, f)),
             _ => None,
@@ -671,18 +668,21 @@ pub(super) fn impl_static_method<'a, 'lt, 'db>(
 
             // Note that we need special case for 0 param constructors because of multi cartesian
             // product
+            // alloc: the generic args the candidates own
             let generics = ty.type_arguments().collect();
             let fn_exprs: Vec<Expr<'_>> = if param_exprs.is_empty() {
+                // alloc: the one candidate, with no params
                 vec![Expr::Function { func: it, generics, params: Vec::new() }]
             } else {
                 param_exprs
                     .into_iter()
                     .multi_cartesian_product()
+                    // clone: each candidate owns its generic args
                     .map(|params| Expr::Function { func: it, generics: generics.clone(), params })
-                    .collect()
+                    .collect() // alloc: the candidates, kept by the lookup and returned
             };
 
-            lookup.insert(db, ret_ty.clone(), fn_exprs.iter().cloned());
+            lookup.insert(db, ret_ty, fn_exprs.iter().cloned());
 
             Some((ret_ty, fn_exprs))
         })
@@ -708,14 +708,14 @@ pub(super) fn make_tuple<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     _defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
+    types: &'lt mut Vec<Type<'db>>,
     fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
 
-    lookup
-        .types_wishlist()
-        .clone()
-        .into_iter()
+    lookup.wishlist_into(types);
+    types
+        .drain(..)
         .filter(|_| fuel.should_continue())
         .filter(|ty| ty.is_tuple())
         .filter_map(move |ty| {
@@ -733,14 +733,14 @@ pub(super) fn make_tuple<'a, 'lt, 'db>(
                 .multi_cartesian_product()
                 .filter(|_| fuel.should_continue())
                 .map(|params| {
-                    let tys: Vec<Type<'_>> = params.iter().map(|it| it.ty(db)).collect();
-                    let tuple_ty = Type::new_tuple(db, &tys);
+                    let tuple_ty = Type::new_tuple(db, params.iter().map(|it| it.ty(db)));
 
-                    let expr = Expr::Tuple { ty: tuple_ty.clone(), params };
+                    let expr = Expr::Tuple { ty: tuple_ty, params };
+                    // clone: the lookup keeps its own copy of the candidate
                     lookup.insert(db, tuple_ty, iter::once(expr.clone()));
                     expr
                 })
-                .collect();
+                .collect(); // alloc: the candidates, returned
 
             Some(exprs)
         })

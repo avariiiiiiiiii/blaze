@@ -1,5 +1,7 @@
 //! The derives as they were written before they wrote into one builder: nested `quote!`s, a
 //! `format!` per name. Kept for the tests only, which check the new code gives the same trees.
+//! [`handle`] keeps `From` and `CoerceShared`'s target as they read the derive's own item
+//! through handles.
 
 use itertools::izip;
 use rustc_hash::FxHashSet;
@@ -1207,4 +1209,130 @@ pub(super) fn partial_ord_expand(
             }
         },
     )
+}
+
+/// `From` and `CoerceShared`'s target reading the derive's own item through handles, as before
+/// they read it in place. Their parse is `editor.rs`' handle parse.
+pub(super) mod handle {
+    use blaze_mem::Frame;
+    use smallvec::SmallVec;
+    use span::Span;
+    use syntax::ast::{self, AstNode, FieldList, HasAttrs, HasName};
+    use syntax_bridge::DocCommentDesugarMode;
+
+    use crate::{
+        BuiltinError, ExpandError, ExpandResult,
+        builtin::{
+            derive_macro::{
+                FieldsKind, Variant, editor::parse_adt_from_handle, empty, in_group, write_derive,
+                write_impl,
+            },
+            quote::{dollar_crate, group},
+        },
+        tt,
+    };
+
+    /// `#[derive(From)]` of the item read through handles.
+    pub(in crate::builtin::derive_macro) fn from_derive<'f>(
+        frame: &'f Frame,
+        span: Span,
+        adt: &ast::Adt,
+        span_map: &span::SpanMap,
+    ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+        let refuse = |message: &str| {
+            let name = adt.name().map(|it| span_map.span_at(it.syntax().text_range().start()));
+            let error = BuiltinError::derive(message)
+                .note("`#[derive(From)]` can only be used on structs with exactly one field")
+                .also_at(name.into_iter().collect::<Box<[_]>>());
+            ExpandResult::new(empty(frame, span), error.at(span))
+        };
+        let strukt = match adt {
+            ast::Adt::Struct(it) => it,
+            ast::Adt::Enum(_) => return refuse("`#[derive(From)]` used on an enum"),
+            ast::Adt::Union(_) => return refuse("`#[derive(From)]` used on a union"),
+        };
+        let mut field_types: SmallVec<[Option<ast::Type>; 2]> = SmallVec::new();
+        match strukt.field_list() {
+            Some(FieldList::RecordFieldList(it)) => {
+                field_types.extend(it.fields().map(|it| it.ty()).take(2))
+            }
+            Some(FieldList::TupleFieldList(it)) => {
+                field_types.extend(it.fields().map(|it| it.ty()).take(2))
+            }
+            None => {}
+        }
+        let field_ty = match &field_types[..] {
+            [Some(ty)] => syntax_bridge::syntax_node_to_token_tree(
+                ty.syntax(),
+                span_map,
+                span,
+                DocCommentDesugarMode::ProcMacro,
+            ),
+            [None] => {
+                let err = ExpandError::other(span, "missing field type");
+                return ExpandResult::new(empty(frame, span), err);
+            }
+            [] => return refuse("`#[derive(From)]` used on a struct with no fields"),
+            _ => return refuse("`#[derive(From)]` used on a struct with multiple fields"),
+        };
+        let info = match parse_adt_from_handle(adt, span_map, span) {
+            Ok(it) => it,
+            Err(err) => return ExpandResult::new(empty(frame, span), err),
+        };
+        let krate = &dollar_crate(span);
+        let field_ty = &field_ty;
+        let record_field = match info.shape.variants.first() {
+            Some(Variant { kind: FieldsKind::Record, .. }) => info.shape.fields.first(),
+            _ => None,
+        };
+        let body = group(span, |b| match record_field {
+            Some(field) => quote_into!(b, span => Self { #field : value }),
+            None => quote_into!(b, span => Self ( value )),
+        });
+        let trait_path =
+            group(span, |b| quote_into!(b, span => #krate::convert::From<#field_ty>));
+        let no_extra_params = group(span, |_| {});
+        ExpandResult::ok(write_derive(frame, span, |b| {
+            write_impl(b, span, &info, &trait_path, false, &no_extra_params, |b| {
+                in_group(b, span, |b| {
+                    quote_into!(b, span =>
+                        #[inline]
+                        fn from(value : #field_ty) -> Self { #body }
+                    )
+                })
+            })
+        }))
+    }
+
+    /// The tokens of the struct's one `#[coerce_shared(Target)]`, read through handles.
+    pub(in crate::builtin::derive_macro) fn coerce_shared_target_tokens(
+        span: Span,
+        strukt: &ast::Struct,
+    ) -> Option<tt::TopSubtree> {
+        let mut attrs = strukt
+            .attrs()
+            .filter(|attr| attr.as_simple_call().is_some_and(|(name, _)| name == "coerce_shared"));
+        let attr = attrs.next()?;
+        if attrs.next().is_some() {
+            return None;
+        }
+        let (_, target_tokens) = attr.as_simple_call()?;
+        let l_paren = target_tokens.l_paren_token()?;
+        let r_paren = target_tokens.r_paren_token()?;
+
+        let mut span_map = span::SpanMap::empty();
+        span_map.push(target_tokens.syntax().text_range().start(), span);
+        span_map.push(target_tokens.syntax().text_range().end(), span);
+
+        let remove = syntax_bridge::Removed::<_>::from_iter([l_paren.into(), r_paren.into()]);
+        Some(syntax_bridge::syntax_node_to_token_tree_modified(
+            target_tokens.syntax(),
+            &span_map,
+            syntax_bridge::Appended::<_, std::alloc::Global>::default(),
+            remove,
+            span,
+            DocCommentDesugarMode::ProcMacro,
+            |_, _| (true, syntax_bridge::Inserted::new()),
+        ))
+    }
 }

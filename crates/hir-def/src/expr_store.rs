@@ -192,7 +192,7 @@ struct ExpressionOnlyStore {
 /// The owner in [`ExpressionOnlyStore::binding_owners`] of a binding the top level owns.
 const NO_OWNER: u32 = u32::MAX;
 
-const _: () = assert!((columns::ExprKind::IncludeBytes as u32) < u64::BITS);
+const _: () = assert!((columns::ExprKind::UnsafeBinderCast as u32) < u64::BITS);
 
 /// A bit per kind byte of `expr_kind` (each an [`columns::ExprKind`], which the columns are
 /// checked to hold before a store is made of them), in variant order.
@@ -1595,6 +1595,10 @@ impl ExpressionStore {
             Expr::Cast { expr, type_ref } => {
                 visitor.on_expr(expr);
                 visitor.on_type(type_ref);
+            }
+            Expr::UnsafeBinderCast { expr, ty, kind: _ } => {
+                visitor.on_expr(expr);
+                visitor.on_type_opt(ty);
             }
             Expr::Field { expr, name: _ }
             | Expr::Await { expr }

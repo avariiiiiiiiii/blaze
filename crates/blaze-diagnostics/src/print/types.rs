@@ -17,12 +17,12 @@ use hir_ty::{
     next_solver::{
         Binder, BoundExistentialPredicates, CallableIdWrapper, Clause, ClauseKind,
         ExistentialProjection, FnSig, GenericArg, GenericArgs, ParamTy, Region, TermId, TermKind,
-        Term, TraitIdWrapper, TraitPredicate, TraitRef, Ty, TyKind, Tys,
+        Term, TraitClause, TraitIdWrapper, TraitRef, Ty, TyKind, Tys,
     },
 };
 use rustc_abi::ExternAbi;
 use rustc_type_ir::{
-    AliasTyKind, BoundTyKind, ClosureKind, InferTy, Mutability, PredicatePolarity, Upcast as _,
+    AliasTyKind, BoundTyKind, ClausePolarity, ClosureKind, InferTy, Mutability, Upcast as _,
     elaborate::elaborate,
     fold_regions,
     inherent::{
@@ -55,7 +55,7 @@ struct FnTrait<'t> {
     return_ty: Option<Binder<'t, Term<'t>>>,
 }
 
-type Traits<'t> = Vec<(Binder<'t, TraitPredicate<'t>>, SmallVec<[(TermId, Term<'t>); 2]>)>;
+type Traits<'t> = Vec<(Binder<'t, TraitClause<'t>>, SmallVec<[(TermId, Term<'t>); 2]>)>;
 
 impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     /// rustc's `FmtPrinter::print_type`: past the type length limit a type prints as `_`,
@@ -423,11 +423,11 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                     let trait_ = pred.def_id().0;
                     if Some(trait_) == lang.Sized {
                         match pred.polarity {
-                            PredicatePolarity::Positive => {
+                            ClausePolarity::Positive => {
                                 has_sized = true;
                                 continue;
                             }
-                            PredicatePolarity::Negative => has_negative_sized = true,
+                            ClausePolarity::Negative => has_negative_sized = true,
                         }
                     } else if Some(trait_) == lang.MetaSized {
                         has_meta_sized = true;
@@ -436,9 +436,9 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                     self.insert_trait(bound.rebind(pred), None, &mut traits, &mut fn_traits);
                 }
                 ClauseKind::Projection(pred) => {
-                    let trait_pred = TraitPredicate {
+                    let trait_pred = TraitClause {
                         trait_ref: pred.projection_term.trait_ref(self.interner),
-                        polarity: PredicatePolarity::Positive,
+                        polarity: ClausePolarity::Positive,
                     };
                     let item = (pred.def_id().0, bound.rebind(pred.term));
                     self.insert_trait(bound.rebind(trait_pred), Some(item), &mut traits, &mut fn_traits);
@@ -481,13 +481,13 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 }
                 None => {
                     let interner = self.interner;
-                    let pred = entry.bound.map_bound(|(args, self_ty)| TraitPredicate {
+                    let pred = entry.bound.map_bound(|(args, self_ty)| TraitClause {
                         trait_ref: TraitRef::new(
                             interner,
                             TraitIdWrapper(trait_),
                             [GenericArg::from(self_ty), Ty::new_tup(interner, args.as_slice()).into()],
                         ),
-                        polarity: PredicatePolarity::Positive,
+                        polarity: ClausePolarity::Positive,
                     });
                     match traits.iter_mut().find(|(it, _)| *it == pred) {
                         Some((_, assoc)) => assoc.clear(),
@@ -502,7 +502,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 self.write_str(" + ");
             }
             self.wrap_binder(&pred, BinderKind::ForAll, |p, pred| {
-                if pred.polarity == PredicatePolarity::Negative {
+                if pred.polarity == ClausePolarity::Negative {
                     p.write_str("!");
                 }
                 let trait_ = pred.trait_ref.def_id.0;
@@ -558,14 +558,14 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     /// associated items.
     fn insert_trait(
         &self,
-        pred: Binder<'t, TraitPredicate<'t>>,
+        pred: Binder<'t, TraitClause<'t>>,
         item: Option<(TermId, Binder<'t, Term<'t>>)>,
         traits: &mut Traits<'t>,
         fn_traits: &mut Vec<FnTrait<'t>>,
     ) {
         let trait_ref = pred.skip_binder().trait_ref;
         let fn_kind = self.fn_trait_kind(trait_ref.def_id.0);
-        if pred.skip_binder().polarity == PredicatePolarity::Positive
+        if pred.skip_binder().polarity == ClausePolarity::Positive
             && let Some((kind, is_async)) = fn_kind
             && let Some(args) = trait_ref.args.as_slice().get(1).and_then(|it| it.ty())
             && let TyKind::Tuple(types) = args.kind()

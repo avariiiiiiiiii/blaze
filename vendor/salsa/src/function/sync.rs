@@ -401,7 +401,9 @@ impl<'me> ClaimGuard<'me> {
             .expect("key claimed twice?")
             .remove()
             .0;
-        let result = if self.zalsa_local.should_trigger_local_cancellation() {
+        let result = if self.zalsa_local.should_trigger_local_cancellation()
+            || blaze_mem::frame::cancelling()
+        {
             WaitResult::Cancelled
         } else {
             WaitResult::Panicked

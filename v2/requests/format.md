@@ -198,6 +198,7 @@ so no Cargo.toml edit is needed).
    impls later, but that is not needed to build.
 
 > forwarded to db: `crates/hir-ty/src/next_solver/interner.rs` is db's (db-ty); the GC impl is still at line 2600.
+> checked by db-audit-other (22:40): in the tree. `crates/hir-ty/` has no `GarbageCollector`, `impl_gc_visit`, `collect_ty_garbage` or `decrement_refcount`, and `interner.rs` has no `impl WorldExposer for`.
 2. **Drop the re-export** — `crates/hir/src/lib.rs:215`. Old text:
    ```rust
            next_solver::{clear_tls_solver_cache, collect_ty_garbage},
@@ -209,6 +210,7 @@ so no Cargo.toml edit is needed).
    Why: `collect_ty_garbage` is removed by request 1 (nothing calls it: `rg collect_ty_garbage`).
 
 > forwarded to db: `crates/hir/src/lib.rs:220` still re-exports it.
+> checked by db-audit-other (22:40): in the tree at `crates/hir/src/lib.rs:241` (`next_solver::clear_tls_solver_cache,` alone).
 3. **`StoredGenericArg` holds no reference count** — `crates/hir-ty/src/next_solver/generic_arg.rs:147-184`.
    Old text:
    ```rust
@@ -270,6 +272,7 @@ so no Cargo.toml edit is needed).
    in the arena, at least 8 for `TyInterned`/`ConstInterned`/`RegionInterned`.
 
 > forwarded to db: `generic_arg.rs` still calls `decrement_refcount` (line 169).
+> checked by db-audit-other (22:40): in the tree at `crates/hir-ty/src/next_solver/generic_arg.rs:111-120`. `StoredGenericArg` derives `Clone, Copy` with no `Drop`, and `new` only packs the pointer: the field is now `packed`, not `ptr`.
 
 Optional, not needed to build: `impl_internable!(gc; X)` and `impl_slice_internable!(gc; X, H, S)`
 are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*.rs`); the

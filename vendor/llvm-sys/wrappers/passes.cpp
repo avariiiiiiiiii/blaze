@@ -13,18 +13,31 @@
  *
  * LLVMBlazeRunSanitizers runs the sanitizers' instrumentation with the same analysis
  * managers, as rustc runs it at the end of its pipeline.
+ *
+ * LLVMBlazeCreatePgoPasses keeps passes whose pipelines instrument for PGO or use a profile, as
+ * rustc's LLVMRustOptimize builds its PassBuilder with PGOOptions for -Cprofile-generate and
+ * -Cprofile-use. A profile is read from memory, never from a file.
  */
 #include <llvm-c/Error.h>
 #include <llvm-c/TargetMachine.h>
 #include <llvm-c/Types.h>
+#include <llvm/ADT/IntrusiveRefCntPtr.h>
 #include <llvm/ADT/StringMap.h>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/IR/DiagnosticHandler.h>
+#include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/StandardInstrumentations.h>
+#include <llvm/ProfileData/InstrProf.h>
+#include <llvm/ProfileData/InstrProfWriter.h>
 #include <llvm/Support/Error.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/PGOOptions.h>
+#include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Transforms/Instrumentation/AddressSanitizer.h>
 #include <llvm/Transforms/Instrumentation/MemorySanitizer.h>
@@ -49,9 +62,10 @@ PipelineTuningOptions tuning(bool SLPVectorization) {
 /* What LLVMRunPasses makes for one call, made once for one context. Members are built in this
  * order and destroyed in the reverse, as LLVMRunPasses's locals are. */
 struct Pipelines {
-  Pipelines(TargetMachine *Machine, bool SLPVectorization, LLVMContext &Context)
+  Pipelines(TargetMachine *Machine, bool SLPVectorization, LLVMContext &Context,
+            const std::optional<PGOOptions> &Pgo, IntrusiveRefCntPtr<vfs::FileSystem> FS)
       : Context(Context), Tuning(tuning(SLPVectorization)),
-        Builder(Machine, Tuning, std::nullopt, &Callbacks),
+        Builder(Machine, Tuning, Pgo, &Callbacks, FS ? FS : vfs::getRealFileSystem()),
         Instrumentation(Context, /*DebugLogging=*/false, /*VerifyEach=*/false) {
     Builder.registerLoopAnalyses(Loops);
     Builder.registerFunctionAnalyses(Functions);
@@ -95,6 +109,38 @@ struct LLVMBlazeOpaquePasses {
   TargetMachine *Machine;
   std::unique_ptr<Pipelines> Vectorizing;
   std::unique_ptr<Pipelines> Plain;
+  /* What every pipeline is built with for PGO: none for LLVMBlazeCreatePasses's. */
+  std::optional<PGOOptions> Pgo = std::nullopt;
+  /* Where a profile used is read from: the profile alone, in memory. */
+  IntrusiveRefCntPtr<vfs::FileSystem> FS = nullptr;
+  /* The start of the warning PGOInstrumentationUse gives a function whose hash is not the
+   * profile's record of its name, and how many it gave since LLVMBlazeTakeMismatched. */
+  std::string MismatchText = "";
+  uint32_t Mismatched = 0;
+};
+
+/* What LLVMBlazeCreatePgoPasses builds pipelines for: rustc's -Cprofile-generate (Generate)
+ * or -Cprofile-use (Use). Declared field for field in src/transforms/pass_builder.rs. */
+struct LLVMBlazePgo {
+  uint8_t Action;
+  /* Use: the indexed profile, Length bytes followed by a NUL, live as long as the passes. */
+  const char *Profile;
+  size_t Length;
+};
+
+enum : uint8_t {
+  LLVMBlazePgoGenerate = 1,
+  LLVMBlazePgoUse = 2,
+};
+
+/* A function's counts for LLVMBlazeWriteProfile, as llvm-profdata merges them. Declared field
+ * for field in src/transforms/pass_builder.rs. */
+struct LLVMBlazeProfileRecord {
+  const char *Name;
+  size_t NameLength;
+  uint64_t Hash;
+  const uint64_t *Counts;
+  size_t CountsLength;
 };
 
 /* What LLVMBlazeRunSanitizers instruments for: rustc's -Zsanitizer, -Zsanitizer-recover and
@@ -181,6 +227,83 @@ bool covers(const LLVMBlazeSanitizers &Wanted) {
   return Wanted.CoverageLevel >= 1 && Wanted.CoverageLevel <= 4;
 }
 
+/* The name the profile used has in the passes' file system, which holds it alone. */
+constexpr const char *ProfileName = "blaze.profdata";
+
+/* Where an instrumented program writes its profile unless LLVM_PROFILE_FILE says otherwise:
+ * rustc's for -Cprofile-generate with no directory. The same in every function, so that the
+ * code is one whatever the directory; the link names the binary's. */
+constexpr const char *RawProfileName = "default_%m.profraw";
+
+/* Counts the functions PGOInstrumentationUse found a record of under their name with another
+ * hash, which it warns of one function at a time, and hands every other diagnostic to the
+ * handler it stands in for. */
+struct Mismatches final : DiagnosticHandler {
+  Mismatches(std::unique_ptr<DiagnosticHandler> Outer, StringRef Text)
+      : Outer(std::move(Outer)), Text(Text) {}
+
+  bool handleDiagnostics(const DiagnosticInfo &DI) override {
+    if (const auto *Profile = dyn_cast<DiagnosticInfoPGOProfile>(&DI)) {
+      if (Profile->getSeverity() == DS_Warning &&
+          StringRef(Profile->getMsg().str()).starts_with(Text)) {
+        ++Count;
+        return true;
+      }
+    }
+    return Outer->handleDiagnostics(DI);
+  }
+  bool isAnalysisRemarkEnabled(StringRef Pass) const override {
+    return Outer->isAnalysisRemarkEnabled(Pass);
+  }
+  bool isMissedOptRemarkEnabled(StringRef Pass) const override {
+    return Outer->isMissedOptRemarkEnabled(Pass);
+  }
+  bool isPassedOptRemarkEnabled(StringRef Pass) const override {
+    return Outer->isPassedOptRemarkEnabled(Pass);
+  }
+  bool isAnyRemarkEnabled() const override { return Outer->isAnyRemarkEnabled(); }
+
+  std::unique_ptr<DiagnosticHandler> Outer;
+  StringRef Text;
+  uint32_t Count = 0;
+};
+
+/* Runs `Manager` over `Mod` with `Kept`'s analyses, counting the mismatches of a profile used
+ * into `Passes`, and forgets the analyses after. */
+void runCounted(LLVMBlazeOpaquePasses &Passes, Pipelines &Kept, ModulePassManager &Manager,
+                Module &Mod) {
+  bool Using = Passes.Pgo && Passes.Pgo->Action == PGOOptions::IRUse;
+  if (!Using) {
+    Manager.run(Mod, Kept.Modules);
+    Kept.forget();
+    return;
+  }
+  LLVMContext &Context = Mod.getContext();
+  auto Counter = std::make_unique<Mismatches>(Context.getDiagnosticHandler(), Passes.MismatchText);
+  Mismatches *Counting = Counter.get();
+  Context.setDiagnosticHandler(std::move(Counter));
+  Manager.run(Mod, Kept.Modules);
+  Kept.forget();
+  std::unique_ptr<DiagnosticHandler> Taken = Context.getDiagnosticHandler();
+  Passes.Mismatched += Counting->Count;
+  Context.setDiagnosticHandler(std::move(Counting->Outer));
+}
+
+/* The pipelines of `Passes` for `SLPVectorization`, made for the context of `Mod` the first
+ * time; an error for a module of another context than they were made for. */
+Expected<Pipelines *> slot(LLVMBlazeOpaquePasses &Passes, bool SLPVectorization, Module &Mod) {
+  std::unique_ptr<Pipelines> &Slot = SLPVectorization ? Passes.Vectorizing : Passes.Plain;
+  if (!Slot) {
+    Slot = std::make_unique<Pipelines>(Passes.Machine, SLPVectorization, Mod.getContext(),
+                                       Passes.Pgo, Passes.FS);
+  } else if (&Slot->Context != &Mod.getContext()) {
+    return make_error<StringError>(
+        "blaze: passes kept for one LLVM context were given a module of another",
+        inconvertibleErrorCode());
+  }
+  return Slot.get();
+}
+
 } // namespace
 
 extern "C" {
@@ -192,22 +315,27 @@ LLVMBlazeOpaquePasses *LLVMBlazeCreatePasses(LLVMTargetMachineRef Machine) {
 
 void LLVMBlazeDisposePasses(LLVMBlazeOpaquePasses *Passes) { delete Passes; }
 
+/* Whether `Machine`'s target has a feature named `Name` (`Length` bytes), as rustc's
+ * LLVMRustHasFeature asks: LLVM told a name it lacks only prints a warning and ignores it. */
+LLVMBool LLVMBlazeHasFeature(LLVMTargetMachineRef Machine, const char *Name, size_t Length) {
+  const MCSubtargetInfo *Info = reinterpret_cast<TargetMachine *>(Machine)->getMCSubtargetInfo();
+  StringRef Wanted(Name, Length);
+  for (const SubtargetFeatureKV &Feature : Info->getAllProcessorFeatures())
+    if (Wanted == Feature.Key)
+      return 1;
+  return 0;
+}
+
 /* Runs the pipeline `Text` (`Length` bytes) over `M`, as LLVMRunPasses does with options whose
  * only change is SLP vectorization. Every module given to one object is of one context. */
 LLVMErrorRef LLVMBlazeRunPasses(LLVMBlazeOpaquePasses *Passes, LLVMModuleRef M,
                                 const char *Text, size_t Length,
                                 LLVMBool SLPVectorization) {
   Module &Mod = *unwrap(M);
-  std::unique_ptr<Pipelines> &Slot = SLPVectorization ? Passes->Vectorizing : Passes->Plain;
-  if (!Slot) {
-    Slot = std::make_unique<Pipelines>(Passes->Machine, SLPVectorization != 0,
-                                       Mod.getContext());
-  } else if (&Slot->Context != &Mod.getContext()) {
-    return wrap(make_error<StringError>(
-        "blaze: passes kept for one LLVM context were given a module of another",
-        inconvertibleErrorCode()));
-  }
-  Pipelines &Kept = *Slot;
+  Expected<Pipelines *> Slot = slot(*Passes, SLPVectorization != 0, Mod);
+  if (!Slot)
+    return wrap(Slot.takeError());
+  Pipelines &Kept = **Slot;
   StringRef Pipeline(Text, Length);
   std::unique_ptr<ModulePassManager> Once;
   ModulePassManager *Manager = nullptr;
@@ -226,8 +354,7 @@ LLVMErrorRef LLVMBlazeRunPasses(LLVMBlazeOpaquePasses *Passes, LLVMModuleRef M,
     else
       Once = std::move(Parsed);
   }
-  Manager->run(Mod, Kept.Modules);
-  Kept.forget();
+  runCounted(*Passes, Kept, *Manager, Mod);
   return nullptr;
 }
 
@@ -240,14 +367,10 @@ LLVMErrorRef LLVMBlazeRunPasses(LLVMBlazeOpaquePasses *Passes, LLVMModuleRef M,
 LLVMErrorRef LLVMBlazeRunSanitizers(LLVMBlazeOpaquePasses *Passes, LLVMModuleRef M,
                                     const LLVMBlazeSanitizers *Wanted) {
   Module &Mod = *unwrap(M);
-  std::unique_ptr<Pipelines> &Slot = Passes->Plain;
-  if (!Slot) {
-    Slot = std::make_unique<Pipelines>(Passes->Machine, false, Mod.getContext());
-  } else if (&Slot->Context != &Mod.getContext()) {
-    return wrap(make_error<StringError>(
-        "blaze: passes kept for one LLVM context were given a module of another",
-        inconvertibleErrorCode()));
-  }
+  Expected<Pipelines *> Found = slot(*Passes, false, Mod);
+  if (!Found)
+    return wrap(Found.takeError());
+  Pipelines *Slot = *Found;
   ModulePassManager Manager;
   if (covers(*Wanted)) {
     Manager.addPass(SanitizerCoveragePass(coverage(*Wanted)));
@@ -273,6 +396,91 @@ LLVMErrorRef LLVMBlazeRunSanitizers(LLVMBlazeOpaquePasses *Passes, LLVMModuleRef
   }
   Manager.run(Mod, Slot->Modules);
   Slot->forget();
+  return nullptr;
+}
+
+/* Passes whose pipelines are built with `Pgo` (not null, read during the call only), as
+ * LLVMRustOptimize builds its PassBuilder: IRInstr writing `default_%m.profraw`, or IRUse of
+ * the profile `Pgo->Profile`, which the passes read from memory and which outlives them. The
+ * default pipelines named in LLVMBlazeRunPasses run PGO's passes where LLVM puts them (the
+ * per-module and ThinLTO pre-link pipelines; not ThinLTO's post-link one); LLVMBlazeRunPgo
+ * runs them alone. Null for an action that is neither. */
+LLVMBlazeOpaquePasses *LLVMBlazeCreatePgoPasses(LLVMTargetMachineRef Machine,
+                                                const LLVMBlazePgo *Pgo) {
+  auto *Passes = new LLVMBlazeOpaquePasses{reinterpret_cast<TargetMachine *>(Machine), nullptr,
+                                           nullptr};
+  switch (Pgo->Action) {
+  case LLVMBlazePgoGenerate:
+    Passes->Pgo = PGOOptions(RawProfileName, "", "", "", PGOOptions::IRInstr,
+                             PGOOptions::NoCSAction);
+    break;
+  case LLVMBlazePgoUse: {
+    auto Files = makeIntrusiveRefCnt<vfs::InMemoryFileSystem>();
+    Files->addFile(ProfileName, 0,
+                   MemoryBuffer::getMemBuffer(StringRef(Pgo->Profile, Pgo->Length), ProfileName,
+                                              /*RequiresNullTerminator=*/true));
+    Passes->FS = Files;
+    Passes->Pgo =
+        PGOOptions(ProfileName, "", "", "", PGOOptions::IRUse, PGOOptions::NoCSAction);
+    Passes->MismatchText = InstrProfError(instrprof_error::hash_mismatch).message();
+    break;
+  }
+  default:
+    delete Passes;
+    return nullptr;
+  }
+  return Passes;
+}
+
+/* Runs PGO's passes alone over `M`, as LLVM runs them at -O0 (addPGOInstrPassesForO0): the
+ * instrumentation and its lowering, or the profile's use. For passes LLVMBlazeCreatePgoPasses
+ * made; `M` is of the context they were first run with. */
+LLVMErrorRef LLVMBlazeRunPgo(LLVMBlazeOpaquePasses *Passes, LLVMModuleRef M) {
+  if (!Passes->Pgo)
+    return wrap(make_error<StringError>("blaze: PGO's passes of passes made without PGO",
+                                        inconvertibleErrorCode()));
+  Module &Mod = *unwrap(M);
+  Expected<Pipelines *> Found = slot(*Passes, false, Mod);
+  if (!Found)
+    return wrap(Found.takeError());
+  Pipelines &Kept = **Found;
+  const PGOOptions &Pgo = *Passes->Pgo;
+  ModulePassManager Manager;
+  Kept.Builder.addPGOInstrPassesForO0(Manager, Pgo.Action == PGOOptions::IRInstr,
+                                      /*IsCS=*/false, Pgo.AtomicCounterUpdate, Pgo.ProfileFile,
+                                      /*ProfileRemappingFile=*/"");
+  runCounted(*Passes, Kept, Manager, Mod);
+  return nullptr;
+}
+
+/* How many functions the passes found a record of in the profile they use under the
+ * function's name with another hash since this was last asked. */
+uint32_t LLVMBlazeTakeMismatched(LLVMBlazeOpaquePasses *Passes) {
+  uint32_t Mismatched = Passes->Mismatched;
+  Passes->Mismatched = 0;
+  return Mismatched;
+}
+
+/* The indexed profile of IR instrumentation with the `Count` records `Records`, as
+ * llvm-profdata merge writes it, into `*Out`, which the caller disposes of. */
+LLVMErrorRef LLVMBlazeWriteProfile(const LLVMBlazeProfileRecord *Records, size_t Count,
+                                   LLVMMemoryBufferRef *Out) {
+  InstrProfWriter Writer;
+  if (Error Err = Writer.mergeProfileKind(InstrProfKind::IRInstrumentation))
+    return wrap(std::move(Err));
+  Error Failed = Error::success();
+  for (size_t At = 0; At < Count; ++At) {
+    const LLVMBlazeProfileRecord &Record = Records[At];
+    std::vector<uint64_t> Counts(Record.Counts, Record.Counts + Record.CountsLength);
+    NamedInstrProfRecord Named(StringRef(Record.Name, Record.NameLength), Record.Hash,
+                               std::move(Counts));
+    Writer.addRecord(std::move(Named), 1, [&Failed](Error Err) {
+      Failed = joinErrors(std::move(Failed), std::move(Err));
+    });
+  }
+  if (Failed)
+    return wrap(std::move(Failed));
+  *Out = wrap(Writer.writeBuffer().release());
   return nullptr;
 }
 

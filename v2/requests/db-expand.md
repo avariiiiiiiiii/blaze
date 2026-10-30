@@ -267,6 +267,8 @@ skip list, since its expansion is no longer a dummy.
 
 > forwarded to codegen: a note for it from db-expand.
 
+> applied by codegen (lead, 2026-10-29): `location.rs` (`location_macros`, `located_concats`, `placed`) and `hir-ty-codegen/mod.rs` (`builtin_location`, `location_macro`, `promoted_constant`) handle only `file!` and a `concat!` with it. Inside such a `concat!`, `line!()` and `column!()` are still read from the call's arguments (the `concat!` is re-rendered for the path), through `macro_location_of`, which counts code points as `column!` does. `mentions_location` needs no change: it reads the two maps. `column_width` stays for `track_caller`. `hir/src/semantics.rs:601` is db's.
+
 ## File text is `std::sync::Arc<str>` (db-expand, for format, codegen and the coordinator)
 
 What: `base_db::FileText::text` now returns `&std::sync::Arc<str>` (was `triomphe::Arc<str>`), so
@@ -825,6 +827,7 @@ Why: rustc says "couldn't read `{path}`: {error}"; blaze can only say "failed to
 
 > forwarded to db (from requests, pass 16; told by tmux).
 > applied by db-audit-dbsub-macros (2026-10-29 22:45), for `include_bytes!`/`include_str!`: `base_db::IncludedFile` keeps `read: Result<Arc<[u8]>, ReadError>` (`ReadError`: the `io::ErrorKind` and OS code, written as `io::Error` writes itself; `bytes()` stays `Option`), its content id hashes the error's text (domain "included file 2"), and `Db::included_path` gives rustc's unnormalized resolved path. `fn_macro.rs` `included_bytes` returns rustc's "couldn't read `{path}`: {error}" at the call span (`call_span`, rustc's `sp`). Test: base-db `an_unreadable_included_file_keeps_its_error`. Not built. Still "failed to load file": `include!` (its file comes through the VFS, so its read error is the VFS loader's) and an anchor with no path on disk (rustc's "cannot resolve relative path in non-file source").
+> db-expand-macros (2026-10-29, 22:45, not built): db-audit-dbsub-macros pointed out that `include_str!` still accepted a file that isn't UTF-8 (`String::from_utf8_lossy`). It now refuses one as rustc's `expand_include_str` does: ``"`{path}` wasn't a utf-8 file"`` at the call span, with the path as written. rustc's `utf8_error` also adds a note on where the invalid bytes are; an `ExpandError` carries only the message. Test: `include_str_of_a_file_that_is_not_utf_8_is_an_error` (`macro_expansion_tests/builtin_errors.rs`). It writes a temporary file and includes it by absolute path.
 
 ## db-expand-macros: what macro expansion waits on (format, `crates/mbe/`, `crates/span/`, `crates/hir-def/src/{item_tree,expr_store}/`)
 
@@ -2493,6 +2496,7 @@ Status: open (db-expand-sigs, told db-expand-attrs by tmux)
 
 > applied by db-expand (db-expand-sigs, 2026-10-29), signatures.rs's side: `TraitFlags::DENY_EXPLICIT_IMPL = 1 << 11` from `RUSTC_DENY_EXPLICIT_IMPL`, the reference test's `if`, and `deny_explicit_impl_is_a_trait_flag`. Part B (lane hir) is still open.
 > applied by db-expand (db-expand-attrs, 2026-10-29), part A: as written (`rustc_deny_explicit_impl` in `Word`, `RUSTC_DENY_EXPLICIT_IMPL = 1 << 84`, `if single` beside the other one-segment words rather than beside `rustc_coinductive`, which also reads three segments by their last), also an arm of `has_word`; rows in `gating_flags_of_known_shapes` and the corpus' gating table, and a case in `has_word_flags_match_the_source`. Part B is lane hir's.
+> applied by db (db-next6, 22:47), part B: `hir::Trait::is_deny_explicit_impl` after `is_unsafe`, as written. Diagnostics' `denies_explicit_impls` switching to it is theirs.
 
 ## db-expand-names: facts' collect_crate/collect_block take the query's frame (frontend-nameres, `crates/hir-def/src/nameres/facts.rs`)
 
@@ -2557,6 +2561,9 @@ Status: open.
 
 > forwarded to frontend-nameres (A5 and H4 are its; told by tmux; requests, pass 24).
 > frontend-nameres (2026-10-29 21:36): not this lane's. A5 (`DefMapCrateData::shrink_to_fit` to `settle`, `nameres.rs:352`) and H4 (the collector's `unstable_features.reserve`, `collector.rs`) are in db-expand-names' files: Part H's owners line in `mem-db-def-collect.md` gives `nameres.rs` and `collector.rs` to db-expand-names. `facts/` has one call of its own: `Arc::make_mut(&mut crate_ops.data).shrink_to_fit()` in `facts/driver.rs` `collect_crate` is `DefMapCrateData::shrink_to_fit`. When A5 renames it to `settle`, this lane changes that call in the same pass (tell `frontend-nameres-next1`). So I11.1 waits on A5 landing in `nameres.rs` plus that one facts line.
+> not applied by db-audit-dbsub-expand (2026-10-29 22:45): deferred, not lost. A5's owner, db-expand-names-next2, holds it deferred with Part H (Andrew's decision at 21:05; `v2/requests/mem-db-def-collect.md:252`) and asked me to wait. In the tree, `DefMapCrateData::shrink_to_fit` (`nameres.rs:372`) still calls `unstable_features.shrink_to_fit()`, and so does `facts/driver.rs:655`. The live path's features are enabled in `facts/collect.rs:178`, not the test-only `collector.rs`, so H4's reserve belongs there (frontend-nameres's) when Part H is lifted. I11.1 goes in with A5 then.
+> db-expand-names (2026-10-29 22:42): A5 is mine and deferred with Part H (Andrew, 21:05). I11.1 also needs H4 (`unstable_features.reserve` where the features are read, now in `facts/`), which is Part H too. Still waiting; db-audit-dbsub-expand was told by tmux.
+> db-audit-dbsub-expand (2026-10-29 22:54): frontend-nameres-core-next2 asked me to apply A5 (`DefMapCrateData::settle`, `registered_tools: Box<[Symbol]>`, `LocalDefMap::shrink_to_fit` removed, `collector.rs:862`). Declined: still deferred with Part H, and db-expand-names-next2 holds it. Core's `facts/` side is not in the tree yet (`facts/collect.rs:182,190`, `facts/driver.rs:655,759-760` still use `push`/`shrink_to_fit`); core was told to hold it until A5 is lifted, and db-expand-names-next2 was told.
 
 ## db-expand-macros: minicore's `marker::StructuralPartialEq` (coordinator, `crates/test-utils/src/minicore.rs`)
 
@@ -2628,10 +2635,18 @@ refuses those programs. It never accepts one rustc rejects.
 > and `is_wrap()`, and the `Expr` variant) belongs to frontend-tree. It is filed in
 > `v2/requests/frontend-tree.md`, `## frontend-tokens: UnsafeBinderCastExpr`. mem-format has been
 > told.
+>
+> frontend-tokens (2026-10-29 23:30): item 1 is complete. frontend-tree added
+> `UnsafeBinderCastExpr` to `crates/syntax`: the `rust.ungram` rule, the handle and the
+> `Expr::UnsafeBinderCastExpr` variant, and the view with `is_wrap()` (`view/expr_ext.rs`).
+> It reran `ast_views.py`, and `--check` passes. Item 2 (the lowering) can start. mem-format
+> has been told.
 > mem-format (21:59): frontend-tokens reports the parser makes `UNSAFE_BINDER_CAST_EXPR`; its
 > `syntax::view` node (`expr()`, `ty()`, `is_wrap()`) is requested of frontend-tree
 > (`v2/requests/frontend-tree.md`). Item 2 still waits on that node, and on db-ty's item 3 for
 > hir-ty's exhaustive `Expr` matches.
+
+> applied by requests-format-next: item 2, and the `crates/syntax` half of item 1. The ast and view `UnsafeBinderCastExpr` nodes have `expr()`, `ty()` and `is_wrap()`. `Expr::UnsafeBinderCast { kind, expr, ty }` is in `hir-def/src/hir.rs`, with its columns, walker, pretty-printer and persisted words (the schema goes from 6 to 7). The `lower.rs` arm is by frontend-tree-move-def-lower-next2. The hir-ty, hir-ty-unsafeck and other `Expr` arms are filed in `v2/requests/requests-format-next.md`. Not built.
 
 ## db-expand-paths: what I6, R8 and R10.4 leave to other owners (db, coordinator, mem; `crates/hir-def/Cargo.toml`, `crates/hir/src/lib.rs`, `vendor/salsa`, `crates/blaze-radix/src/csr.rs`)
 
@@ -2650,6 +2665,15 @@ refuses those programs. It never accepts one rustc rejects.
    caller's allocator (say `group_into` generic over `A: Allocator` for `cursors`). Then
    `ImportMap::build` puts its one temporary on the frame and is its nine allocations.
    `build_is_its_columns` allows 10 until then.
+   > applied by dedup (2026-10-29 23:20): `Csr::build_in(rows, pairs, scratch: A)` (cursors in
+   > `scratch`, one block of `rows`; only the two columns on the heap; test
+   > `build_in_puts_the_cursors_in_the_scratch`), and `Csr::rebuild` takes `&mut Vec<u32, A>`.
+   > Left to hir-def's owner: `import_map.rs:116` `Csr::build(rows, pairs)` ->
+   > `Csr::build_in(rows, pairs, <the frame>)`, and `build_is_its_columns` back to 9.
+   > applied by db-expand (db-expand-next2, 2026-10-29 23:22): `ImportMap::build` calls
+   > `blaze_ids::radix::Csr::build_in(rows, pairs, frame)` (`import_map.rs:116`), and
+   > `build_is_its_columns` allows 9, its doc comment counting the cursors as the frame's. Not
+   > run (applier rules); hot lint is clean on `import_map.rs`.
 5. **R10.4 and R10.9 (`visibility.rs`):** not applied. They take `&impl DefMapRead`, and R10.1's
    trait is not in the tree (deferred by db-expand-names). Whoever lands R10.1 changes
    `is_visible_from_def_map`, `max` and `min` to `&impl DefMapRead` in the same change. The bodies
@@ -2657,6 +2681,15 @@ refuses those programs. It never accepts one rustc rejects.
    `debug_assertions` instead of `def_map.module(..)`.
 
 > forwarded to db (1 `hir-def/Cargo.toml`, 2 `hir/src/lib.rs`, 3 `vendor/salsa`'s per-query `frame::task`, 5 R10.1's `DefMapRead`; db-next3) and dedup (4, optional, `blaze-radix/src/csr.rs`; window `dedup`); told by tmux (requests, pass 25).
+> db-expand (22:45), checked in the tree:
+> - 1 is done: `fst` is only in hir-def's `[dev-dependencies]`, and only `import_map.rs`'s test
+>   reference uses it.
+> - 3 is done: salsa's `execute_query` runs every body in `frame::task(C::MEM_TAG, ..)`
+>   (`vendor/salsa/src/function/execute.rs:343`).
+> - 5 waits on R10.1 (marked under R10.4 in `mem-db-def-resolve.md`).
+> - 2 (`crates/hir`) was re-sent to db-ty-next2 and db-next6.
+> checked by db (db-next6, 22:48), item 2: already in. `Crate::query_external_importables` (`hir/src/lib.rs:401`) calls `import_map::search_dependencies_each` with the scratch `found` list and per-worker seen-set, in found order.
+> checked by db-audit-dbsub-expand (2026-10-29 22:49): every item settled. 1 applied by me (22:40, `crates/hir-def/Cargo.toml`: `fst` moved to `[dev-dependencies]`, manifest lint clean). 2 in the tree, applied by db-audit-mem (`mem-db-def-hir.md:1781`): `hir/src/lib.rs:401-415`, `scratch.rs:95-115` (`Importables`, `IMPORTABLES_SEEN`, `take/give_importables_seen`). 3 in the tree (`vendor/salsa/src/function/execute.rs:343`). 4 filed to dedup in `v2/requests/db.md` (heading "dedup (`crates/blaze-radix/src/csr.rs`)"), dedup told by tmux. 5 deferred with R10 (Andrew, 21:05; `mem-db-def-resolve.md` R10.4).
 
 ## db-expand-macros: the proc-macro expansion query is `proc_macro_expansion` now (db-expand-names, `crates/hir-def/src/nameres/tests/incremental.rs`)
 
@@ -3204,6 +3237,8 @@ needs: `## frontend-tree: hir-def src.rs: onto views (1)` (frontend-tree-move-de
 
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
 > db-expand-names (2026-10-29 21:45): `source_view` has landed; still waiting on `AsName` for `view::Name`/`view::NameRef` in hir-expand.
+> applied by db-expand-names (2026-10-29 22:44, not built): 1 and 2 as written. Both needs are in (`src.rs:27`, `name.rs` 301/313). `view::Rename` implements `view::HasName`, and `param.name()` at L1379 is inherent, so the import swap breaks nothing else.
+> checked by db-audit-dbsub-expand (2026-10-29 22:46): in the tree at `crates/hir-def/src/resolver.rs:15` (`view::HasName`) and `:879` (`loc.source_view(db)`).
 
 ## frontend-tree: hir-def find_path.rs: onto views (1)
 
@@ -3258,6 +3293,7 @@ needs: `## frontend-tree: hir-expand name.rs + mod_path.rs: onto views (4)` (fro
 > still waiting (db-expand-paths, 21:44): its need is now filed (`## frontend-tree: hir-expand name.rs + mod_path.rs: onto views (4)`), but `ModPath::from_src_view` is not in `crates/hir-expand/src/` yet. Both edits go in when it lands.
 
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
+> applied by db-expand (db-expand-defviews, 2026-10-29 22:47, not built): edits 1 and 2 together, as written, now that `ModPath::from_src_view` is in (`hir-expand/src/mod_path.rs:103`). `check_found_path_` reads the path from `Parse::root` and lowers it with the view twin; `find_path.rs` has no handle use left.
 
 ## frontend-tree: hir-def diagnostic_item/tests.rs: onto views (1)
 
@@ -3964,6 +4000,7 @@ needs: `## frontend-tree: hir-def src.rs: onto views (1)` (frontend-tree-move-de
 > still waiting (db-expand-paths, 21:44): need 1 has landed (`HasSource::source_view`, `src.rs:27`). Need 2 is filed (`v2/requests/frontend-deps-items.md`) but not in the code: `item_tree/lower.rs:1059` still takes `Option<ast::Visibility>`. It in turn waits on `from_src_view` and `item_tree/attrs.rs`. All six edits go in when it lands. Edits 3-6 can't go first: they hand a view to `visibility_from_ast_view`, whose body (edit 2) needs need 2.
 
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
+> applied by db-expand (db-expand-defviews, 2026-10-29 22:48, not built): all six edits as written; both needs are in (`HasSource::source_view`, `item_tree::visibility_from_ast` on `Option<view::Visibility<'_>>` at `item_tree/lower.rs:1039`). Until now `visibility_from_ast` handed a handle to that view function, so this also makes `visibility.rs` type-check again. The handle version now resolves the view of the same node and calls the twin, so every `Visibility` is unchanged; `view_tests::the_view_twin_is_the_handle_version` compares both on every visibility form. `mem-db-def-resolve.md`'s `## R10.4` is not applied (waits on R10.1).
 
 ## frontend-tree: hir-def nameres.rs: onto views (1)
 
@@ -4426,6 +4463,7 @@ paragraph above.
 
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
 > db-expand-names (2026-10-29 21:45): accepted, waiting on its needs; checked in the tree: `HasSource::source_view` is in, `HirFileId::call_node_view` (hir-expand) is not.
+> applied by db-expand-names (2026-10-29 22:52, not built): all 9 hunks as written, each matched once. Its needs have landed: `HirFileId::call_node_view` (`hir-expand/src/lib.rs:2130`). hot_lint is clean.
 
 ## frontend-tree: hir-expand attrs.rs + cfg_process.rs: onto views (3)
 
@@ -5081,6 +5119,7 @@ mod_path.rs: onto views`: `AsName` for `view::Name<'_>`, `ModPath::from_src_view
 
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
 > db-expand-names (2026-10-29 21:45): accepted, waiting on its needs; checked in the tree: `AttrsOrCfg::lower` still takes `&impl ast::HasAttrs`, and hir-expand has no `AsName` for `view::Name` and no `ModPath::from_src_view`.
+> applied by db-expand-names (2026-10-29 22:52, not built): all 10 hunks as written, each matched once. Its needs have landed: `AttrsOrCfg::lower` on `impl ast::HasAttrs<'t>`, `AsName` for view names, `ModPath::from_src_view`. hot_lint is clean.
 
 ## frontend-tree: hir-def nameres/uses.rs: onto views (1)
 
@@ -5193,6 +5232,7 @@ the `name.rs, mod_path.rs` heading of frontend-tree-move-expand (`ModPath::from_
 
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
 > db-expand-names (2026-10-29 21:45): accepted, waiting on its needs; checked in the tree: no `ExpressionStoreSourceMap::macro_expansion_expr_view` and no `ModPath::from_src_view` yet.
+> applied by db-expand-names (2026-10-29 22:52, not built): all 6 hunks as written, each matched once. Its needs have landed: `macro_expansion_expr_view` (`source_map.rs:1108`), `ModPath::from_src_view` (`mod_path.rs:103`). hot_lint is clean.
 
 ## frontend-tree: hir-def test_db.rs: onto views (1)
 
@@ -6175,6 +6215,7 @@ not borrowed.
 
 > forwarded to db-expand (`crates/hir-expand`; db-expand-next2); told by tmux (requests, pass 25).
 > applied by db-expand: by db-expand-macros (2026-10-29, not built), both hunks, plus one change. db-mem-def's E13 had since made the handle version take the worker's `ArgMap::take()`, so the view version does too (`&*arg_map` in `InOrder`), not a fresh `ExpansionSpanMap::empty()`. `view_tests.rs` (request 6) already calls both `ModPath::from_src_view` and `expand_eager_macro_input_view`.
+> applied by db-expand (db-expand-views, 2026-10-29 23:05, not built): the rewritten 4.5. `ModPath::from_tokens` is deleted, with no twin. `rg '\bfrom_tokens\b' crates` finds only blaze-fmt's own `MetaItem`/`MetaItemKind`/`MetaItemInner::from_tokens`. 4.3 was in already, so the tree's `from_tokens` named `Peekable`, `T` and `SyntaxToken` with none imported. Its one other name, `intern::Symbol`, goes from the import too. 4.1-4.4 and 4.6 are in (`from_src_view`, `convert_path_view`). The line above, by db-expand-macros, reads as (5)'s (`expand_eager_macro_input_view`, `ArgMap::take()`) and sits here by mistake.
 
 ## frontend-tree: hir-def nameres tests: onto views (1)
 
@@ -7268,6 +7309,8 @@ needs:
     rule; hir-def has `blaze-alloc-count`).
 
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
+> not applied by db-audit-dbsub-expand (2026-10-29 22:44): waits on need 1, `Node::subtree_without` in `crates/syntax-tree/src/view.rs` (`v2/requests/frontend-tree.md:273`, forwarded to frontend-tree-next1 in pass 25, unanswered; only `FlatTree::subtree_without`, `pub(crate)`, at `flat.rs:1190`). frontend-tree-next1 chased by tmux. Every other need is in: `source_view` (`src.rs:27`), the lowering functions on views (`expr_store/lower.rs:267-1544`), `visibility_from_ast` on a view (`item_tree/lower.rs:1039`), `is_cfg_enabled_for(impl HasAttrs<'t>)` (`attrs.rs:1415`), `AsName` for view names (`name.rs:301,313`), and the outline section and its view forms (this file, both applied). No holder: db-expand-sigs and frontend-tree-move-def-sigs report DONE with it open. Once the need lands, the 27 hunks go in as written. Re-read each against `signatures.rs` first: db-audit-dbsub edited `FunctionSignature::lower` (~1182-1243) at 22:35.
+> not applied by db-expand (db-expand-defviews): waits on Node::subtree_without (2026-10-29 22:48). `crates/syntax-tree/src/view.rs` has no `subtree_without`; only `FlatTree::subtree_without` (`flat.rs:1190`, `pub(crate)`) and the handle `clone_subtree_without` exist.
 
 ## frontend-tree: hir-def macro_expansion_tests: onto views (1)
 
@@ -9329,8 +9372,10 @@ needs: `## frontend-tree: hir-expand lib.rs: onto views (2)` (frontend-tree-move
    handle per call on the legacy-macro lookup path.
 
 > db-expand-names (2026-10-29 21:45): accepted, waiting on its need. `MacroCallId::call_node_view` is not in `crates/hir-expand/src` yet. I'll apply the one hunk when it lands; anyone holding `nameres.rs` may apply it (rule 13).
+> applied by db-expand-names (2026-10-29 22:48, not built): as written. `call_node_view` is in (`hir-expand/src/lib.rs:564`, `InFile<view::Node<'_>>`), and `SourcePosition::new` reads only `node.file_id` and `node.value.text_range().start()`.
 
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
+> checked by db-audit-dbsub-expand (2026-10-29 22:48): in the tree at `crates/hir-def/src/nameres.rs:1227` (`call.call_node_view(db)`; need at `hir-expand/src/lib.rs:564`), applied by its holder db-expand-names-next2.
 
 ## frontend-tree: hir-expand eager.rs: onto views (5)
 
@@ -9748,6 +9793,9 @@ Why: this is the twin hir-def's eager call site moves to. The input is never tur
 and the edit is one copy instead of a green-tree rewrite per call.
 
 > forwarded to db-expand (`crates/hir-expand`; db-expand-next2); told by tmux (requests, pass 25).
+> applied by db-expand (db-expand-views, 2026-10-29): already in `eager.rs`, every hunk. 5.1's import is as written; `expand_eager_macro_input_view`, `EagerInput`, `lazy_expand_view`, `eager_macro_recur_view` and `replace_calls` follow 5.2 step for step, with two later db-expand changes kept: every `eager_calls` is `&mut Vec<EagerCall, impl Allocator>`, and the argument's span map is the worker's pooled `ArgMap::take()` (read as `&*arg_map`) in place of `ExpansionSpanMap::empty()`, as the handle form has it. What it needs is in: `ExpandTo::of_call_site_view` (`lib.rs`), `ModPath::from_src_view`, `AstIdMap::ast_id_of_view`, `syntax_bridge::call_input`, `AstPtr::of`. hir-def's eager call site (`hir-def/src/lib.rs`) calls the view form; `view_tests.rs` still calls the handle form, so `expand_eager_macro_input` stays.
+> checked by db-audit-dbsub-expand (2026-10-29 22:44): in the tree at `crates/hir-expand/src/eager.rs`: `expand_eager_macro_input_view` (`:401`), `lazy_expand_view` (`:508`), `eager_macro_recur_view` (`:535`) and `replace_calls` (`:725`), on its needs `ExpandTo::of_call_site_view` (`lib.rs:1936`) and `ModPath::from_src_view` (`mod_path.rs:103`). hir-def's caller is on it (`hir-def/src/lib.rs:75` imports `expand_eager_macro_input_view`). The `view_tests.rs` comparison is request (6)'s and isn't declared as a module yet (see that heading).
+> note by db-expand-views (2026-10-29 23:02): applied by db-expand-macros at 22:10 (its word on handing over `hir-expand`), with E13's `ArgMap::take()` in the view form; db-expand-views found it in and changed nothing. `view_tests.rs` is declared now ((6), 6.12).
 
 ## db-expand-attrs: `outline_item`/`outline_root`, and the outline keeps a fn body an inner attribute may start (db-expand-sigs, `crates/hir-def/src/signatures.rs`)
 
@@ -9912,6 +9960,8 @@ Status: open (frontend-tree-move-def-sigs, told db-expand-sigs and frontend-tree
 by tmux)
 
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
+> checked by db-expand-sigs (2026-10-29 22:55): in the tree as written (`signatures.rs:534`, `:546`), with item 2's `may_start_with_inner_attr` kept. `the_outline_keeps_a_body_an_inner_attribute_may_start` now reads `outline_root`'s view through `syntax::view::AstNode::syntax`.
+> applied by db-audit-dbsub-expand (2026-10-29 22:44, not built): both hunks as written (`crates/hir-def/src/signatures.rs` `outline_item`, `outline_root`). Its partner `attrs.rs: onto views (1)` was already in: `attrs.rs`'s `item_node` and `file_root` (`:93`, `:103`) already wanted `N::Of<'db>` and `view::SourceFile<'_>`, so hir-def didn't build until now. `FileOutline::root` stays for `signature_syntax` (`:523`) and the tests.
 
 ## db-expand-macros: `SpanMap::made_idents`, the spans `${concat(..)}` made (frontend-tree, `crates/span/src/map.rs`)
 
@@ -11391,6 +11441,8 @@ Why: this declares the differential tests of the twins of requests 1 to 5 and of
 bodies against their handle forms.
 
 > forwarded to db-expand (`crates/hir-expand`; db-expand-next2); told by tmux (requests, pass 26).
+> checked by db-audit-dbsub-expand (2026-10-29 22:46): in the tree. `parse_with_map` has no definition or caller left in `crates/`; `macro_arg` reads `span_map` (`hir-expand/src/lib.rs:713`, `:717`, `:794`); `proc_macro_span` (`:1191`), `original_call_range` (`:1536-1551`) and `ast_id_map` (`:2190`) read views; `declarative.rs` uses `expand_cfg_attr_view`/`call_input_in`; `span_map.rs:139-170` reads `parse.view()`; `fn_macro.rs` `written_call`/`written_range` take views (`:286`, `:318`); `find_derive_range` uses `find_attr_range_view` (`attrs.rs:654`); `budget_tests.rs:114` uses `call_input`; `mod view_tests;` (`lib.rs:38`).
+> applied by db-expand (db-expand-views, 2026-10-29). Applied as written: 6.1 and 6.2 (`macro_arg` reads `span_map`, the attribute through `find_attr_range_with_source_view` of the item's view), 6.3 (`proc_macro_span` off `ast.to_view`, `view::HasName`), 6.4 (`original_call_range`), 6.5 (`parse_with_map` deleted: `rg` of `crates/` finds no caller left), 6.6 (`ast_id_map` is `AstIdMap::from_view(self.root(db))`), 6.8 (`real_span_map_in` reads `parse.view()`), 6.9 (`written_call`/`call_span`/`written_range` on `to_node_view`, `write_assert_condition` on `parse.root()`), 6.11 and 6.12 (`mod view_tests;`). Already in: 6.7 (`declarative.rs`, with `call_input_in` in the frame), 6.9's `include!` hunk (`call_input_in` of `parse(db).root()`), 6.10 (`find_derive_range` on `find_attr_range_view`, its tokens through `call_input_in` with `AbsoluteSpans`). frontend-tree's `Typed for ast::Macro` is in (`syntax/src/view.rs`). Same results: `span_map` is the map `parse_with_map` paired with the root for both file kinds (`real_span_map`, the expansion memo's `.1`), `to_view` reads the same pointer of the same map, `ast_id_of_view` and `ast_id` give the same ID of the same node, and `from_source` was `from_view` of the same tree.
 
 ## frontend-tree: hir-expand builtin/derive_macro.rs: onto views (7)
 
@@ -11511,6 +11563,8 @@ Why: the same cases, on the view form `derives_copy` now is and on the handle fo
 own item keeps.
 
 > forwarded to db-expand (`crates/hir-expand`; db-expand-next2); told by tmux (requests, pass 26).
+> applied by db-expand (db-expand-views, 2026-10-29): 7.1 to 7.4 as written. `derives_copy` takes `view::Adt` and reads `ast_id.to_view(db)`; `attr_words_have_view` splits the same tokens' text the same way; `view::HasAttrs::attrs` is the same `Attr` children `ast::HasAttrs::attrs` gives. The test checks the view form and the handle form `attr_words_have` on the same cases.
+> checked by db-audit-dbsub-expand (2026-10-29 22:46): in the tree at `crates/hir-expand/src/builtin/derive_macro.rs:188` (`fn derives_copy(adt: view::Adt<'_>)`), called with `ast_id.to_view(db)` at `:97`.
 
 ## frontend-tree: hir-def attrs/tests.rs: onto views (4)
 
@@ -12230,6 +12284,8 @@ and a `Vec` per owner is an allocation per node with attributes. The `cfg_attr` 
 in one place: the same steps as `expand_cfg_attr_view` with the cfg in hand.
 
 > forwarded to db-expand (`crates/hir-expand`; db-expand-next2); told by tmux (requests, pass 26).
+> applied by db-expand (db-expand-views, 2026-10-29): as written. `cfg_attrs_view` and `CfgAttrsView` sit before `ITEM_TREE_FILTERED_ATTRS`, the same steps as `expand_cfg_attr_with_doc_comments_view` (unsafe unwrapped, a `cfg_attr` checked once and its metas pushed reversed). The test `cfg_attrs_view_matches_the_handle_expansion` is in `attrs.rs`'s `tests` module (request (3)'s differential for `expand_cfg_attr_view` is in `view_tests.rs`, but this one needs only a parse, no database).
+> checked by db-audit-dbsub-expand (2026-10-29 22:52): in the tree at `crates/hir-expand/src/attrs.rs:280` (`cfg_attrs_view`), its test at `attrs.rs:842`.
 
 
 ## frontend-tree: hir-def src.rs: use_tree_sources_view, the UseId child source as views (2)
@@ -12288,6 +12344,7 @@ Why: the view twin of the handle `child_source` below, which builds the same map
 > frontend-tree-move-def (2026-10-29 22:16): checked, as written. Its test is already in
 > `crates/hir-def/src/src/tests.rs` (`use_tree_to_view_is_use_tree_to_ast` calls
 > `use_tree_sources_view`), so hir-def's tests build only once this hunk lands.
+> applied by db-expand (db-expand-defviews, 2026-10-29 22:47, not built): hunk 1 as written, `use_tree_sources_view` before the handle `child_source` in `src.rs`. The test in `src/tests.rs` already compares it with the handle map, tree by tree.
 
 ## db-expand-names: macro_call_as_call_id's eager_calls in any allocator (db-expand's `lib.rs` holder, `crates/hir-def/src/lib.rs`)
 
@@ -12312,6 +12369,7 @@ Status: applied
 >   `#![feature(allocator_api)]`.
 > - Callers with a global `Vec` don't change (`facts/macros.rs:737` and `attrs/docs.rs:659` pass
 >   `&mut Vec::new()`).
+> checked by db-audit-dbsub-expand (2026-10-29 22:45): in the tree at `crates/hir-def/src/lib.rs:1691` (`use std::{alloc::Allocator, ..}` at `:64-65`) and `crates/hir-expand/src/eager.rs:100, 193, 221, 411, 517, 546` (`use std::alloc::Allocator;` at `:21`).
 
 ## frontend-tree: hir-expand lib.rs + files.rs: original_call_node_view, and the handle functions nobody calls go (9)
 
@@ -12491,6 +12549,8 @@ impl InFile<SyntaxToken> {
 Why: nothing calls `upmap_once` (`rg '\bupmap_once\b' crates`); `ExpansionInfo::map_range_up_once` stays for its other callers.
 
 > forwarded to db-expand (db-expand-next2); told by tmux (requests, pass 28).
+> applied by db-expand (db-expand-views, 2026-10-29): 9.1 to 9.7 as written. `original_call_node_view` is added before `call_node` (`view_tests.rs` already calls it). Before deleting, `rg` over all of `crates/` found each of `as_builtin_derive_attr_node`, `map_range_down_exact`, `node_file_range` and `upmap_once` only at its definition (and `map_range_down_exact` in two docs and a `view_tests.rs` comment that names it as deleted), so all four go. `original_call_node` stays: `blaze-lints/src/check.rs` and `ide-db/src/search.rs` call it.
+> checked by db-audit-dbsub-expand (2026-10-29 22:52): in the tree at `crates/hir-expand/src/lib.rs:2111` (`original_call_node_view`); `as_builtin_derive_attr_node`, `map_range_down_exact`, `node_file_range` and `upmap_once` have no definitions left in `hir-expand/src` (their `_view` forms stay at `lib.rs:1643`, `files.rs:295`).
 
 ## db-expand-attrs: `NativeLib` keeps what `#[link]` says, and `HAS_LINK_ORDINAL`; the readers refuse it (codegen-api-link, `crates/hir-ty-codegen/v2/linked.rs`; blaze-engine, `crates/blaze-engine/src/link.rs`; blaze-items, `crates/blaze-items/src/form.rs`)
 
@@ -14918,3 +14978,3288 @@ function with its handle form and `CoercePointee` with the editor's, on every fi
 first run of each warms the interner before the allocations are measured.
 
 Status: open (frontend-tree-move-expand-derive; told db-expand-next2 by tmux).
+
+> forwarded to db-expand (db-expand-next2; db-expand-views runs too); told by tmux (requests, pass 32).
+> not applied by db-expand (db-expand-views, 2026-10-29): it changes an output, so it is not a view move. The section's own exception: `CoercePointee`'s editor form builds every predicate through `make`, which reparses in `Edition::CURRENT` (`syntax/src/ast/make.rs`), and 10.18's token build keeps the item's own edition's tokens, so a 2015 item naming `async`, `dyn` or `gen` in a predicate gets other impls. The 33 hunks land together (10.1's imports, 10.18 and 10.20 move the editor form, the tests compare with it), so none is in. (7) is applied, and every other old text is unchanged by this lane. What it needs: `## db-expand-views: (10) split so the view move changes no output (frontend-tree, crates/hir-expand/src/builtin/derive_macro.rs)` below.
+> withdrawn (frontend-tree-move-expand-derive, 2026-10-29): superseded by (11), the view move with no output change, and (12), `CoercePointee` as a token build matching rustc. Both are at the end of this file. Apply neither hunk of (10).
+
+## db-expand-views: (10) split so the view move changes no output (frontend-tree, crates/hir-expand/src/builtin/derive_macro.rs)
+
+For frontend-tree-move-expand-derive. `## frontend-tree: hir-expand builtin/derive_macro.rs: onto
+views (10)` is not applied: its `CoercePointee` token build gives other tokens than the editor form
+for an item of an edition before the current one (a predicate naming `async`, `dyn` or `gen` in
+2015), and a view move must give the same trees, spans and errors (superset-of-rust). One of:
+
+1. Make the token build give what the editor gives now in every edition (the predicates as
+   `Edition::CURRENT` lexes their text), and add a fixture in 2015 naming `async`/`dyn`/`gen`
+   to `coerce_pointee_matches_the_editor`. Then (10) is a view move and db-expand applies it
+   whole.
+2. Or split (10): the view move of everything but `CoercePointee` (10.1 keeping the editor
+   imports, 10.2 to 10.17, the tests but `coerce_pointee_matches_the_editor`) as one section,
+   and the `CoercePointee` token build as its own correctness change. That one says which of the
+   two rustc does for a 2015 item (rustc's `expand_deriving_coerce_pointee` works on the AST, so
+   likely the item's own tokens) and proves it with a differential test against the pinned
+   nightly on a 2015 crate, as `AGENTS.md`'s compiler-correctness rule asks.
+
+Whichever lands, rewrite its old texts against `derive_macro.rs` as it is now ((7) is applied:
+`derives_copy` takes `view::Adt`, `attr_words_have_view` is beside `attr_words_have`).
+
+Status: open (db-expand-views).
+
+> forwarded to frontend-tree (frontend-tree-next1); told by tmux (requests, pass 34).
+> answered (frontend-tree-move-expand-derive, 2026-10-29): option 2. (10) is withdrawn. (11) is the view move, with no output change. (12) is the token build, a correctness change: it keeps each token taken from the item at its own span, as rustc's AST derive does. Both are at the end of this file.
+
+## db-expand: `Body::of` keeps its body in the memo, no `Arc` (format / speed-hir-store-srcmap, `crates/hir-def/src/expr_store/body.rs`)
+
+What: frontend.md item 5, the body side (db.md, "frontend: what frontend.md items 7-12 still
+need", db-next2's 22:10 status line). `Body::of` (`expr_store/body.rs`, ~L182) is
+`#[salsa::tracked(returns(deref))] fn of(db, def) -> Arc<Body>`. Make it hold the `Body` in the
+memo itself and hand out `&Body`, as db-expand-sigs did for signatures (`signatures.rs`: a private
+tracked `kept(db, id) -> Kept<Self>` with `returns(ref)`, and a plain `of` returning `&Self`).
+`relative` and `with_source_map` still return `(Arc<Body>, map)`, so they make their own `Arc` (or
+take one off the kept body) for their callers, as the signatures do.
+Why: one `Arc` and one count write per lowered body, and the `Arc`'s header in every memo. A hit
+already reads by reference (`returns(deref)`), so only the miss and the memory change.
+Test: `of` equals `with_source_map(..).0` for every body fixture, as `signatures/alone_tests.rs`
+`of_is_the_lowering_with_the_source_map` does.
+Who: `expr_store/` is format's (db-expand's brief excludes it). db.md names the body side as
+speed-hir-store-srcmap's.
+
+Status: applied by speed-hir (2026-10-29 22:55; every holder of `expr_store/` is DONE), not
+compiled. `Body::of` is `#[salsa::tracked(returns(ref))] fn of(db, def) -> Body`: no `Kept` enum,
+since no image serves bodies, so the memo holds the `Body` itself. Callers already got `&Body`
+under `returns(deref)`, so none of the 131 call sites changes. `relative` and `with_source_map`
+still make their own `Arc` for `(Arc<Body>, map)`. Test: `tests/body.rs` `round_trip`, which
+every body fixture's `lower` runs, asserts `*Body::of == *with_source_map(..).0` and that two
+reads of `of` lend the same `&Body`. `crates/hir/src/tests/infer.rs` still types the result
+`Arc<Body>`, which is already wrong under `returns(deref)`: filed in `v2/requests/db.md`, "##
+speed-hir: `hir/src/tests/infer.rs` takes `Body::of` by reference".
+
+> applied by speed-hir (its status above) (requests, pass 34).
+
+## db-expand-names: imports from a trait in the facts engine (frontend-nameres, `crates/hir-def/src/nameres/facts/`)
+
+What: db.md "## hir-def nameres: glob imports from a trait". The test collector, path resolution
+and the frozen encoding have it (db-expand-names, 2026-10-29, not compiled); the live engine needs
+the same two pieces, plus the differential's file list.
+1. `facts/unit.rs` ~886, the `Some(ModuleDefId::TraitId(_))` glob arm. Old:
+
+```rust
+                    Some(ModuleDefId::TraitId(_)) => {
+                        // FIXME: Implement this correctly
+                        // We can't actually call `trait_items`, the reason being that if macro calls
+                        // occur, they will call back into the def map which we might be computing right
+                        // now resulting in a cycle.
+                        // To properly implement this, trait item collection needs to be done in def map
+                        // collection...
+                        self.update(module_id, &[], vis, Some(ImportOrExternCrate::Glob(glob)));
+                    }
+```
+
+New (`use crate::nameres::trait_items::trait_item_per_ns;`):
+
+```rust
+                    Some(ModuleDefId::TraitId(it)) => {
+                        // glob import from trait => its associated items, as rustc's traits are
+                        // modules to `use`. None where it cannot list them, which the end of
+                        // collection reports.
+                        let start = self.held.len();
+                        let held = &mut self.held;
+                        let listed = self.def_map.for_each_trait_item_for_import(
+                            self.db,
+                            it,
+                            |name, item| held.push((Some(name), trait_item_per_ns(item, vis))),
+                        );
+                        if listed.is_err() {
+                            self.held.truncate(start);
+                        }
+                        self.update_held(module_id, start, vis, Some(ImportOrExternCrate::Glob(glob)));
+                    }
+```
+
+(If the unit reaches its def map other than as `self.def_map`, use that; the method only needs
+`&DefMap` of the map being collected, for its krate, block, cfg and registered attributes.)
+2. `facts/driver.rs`, after each unresolved-import loop (crate ~740, block ~1104): for every
+import of the final round, in the same order as the unresolved ones, push
+`DefDiagnostic::trait_item_import(import.module, import.source.id.lookup(db).id,
+import.source.use_tree, why)` for each `why` that
+`def_map.trait_item_import_reports(db, import.source.kind, status.unwrap_or_else(PerNs::none), |why| ..)`
+gives. The rule is in `nameres/trait_items.rs`, so both collectors share it; the test collector's
+copy is at the end of `collector.rs`'s `finish`.
+3. `facts/tests/differential.rs` `NAMERES`: add `"tests/trait_imports.rs"`.
+Why: superset-of-rust. `use Trait::*` bound nothing; rustc binds the trait's functions,
+constants and types, and reports E0658 without `import_trait_associated_functions`.
+Test: `nameres/tests/trait_imports.rs` (8 tests) goes through `crate_def_map`, so its glob and
+diagnostic cases pass only with 1 and 2; the differential then holds the two collectors equal.
+Who: `facts/` is frontend-nameres's.
+
+Status: open.
+
+> applied by frontend-nameres (2026-10-29 23:10, not built): 1 and 2 at 23:08, from db.md's forwarded item (answered there), matching your Old/New. In 2, a shared `trait_item_import_diagnostics` helper in `driver.rs` serves both loops. For 3, `NAMERES` gains `"tests/trait_imports.rs"`, and also `"tests/primitive_shadow.rs"`, `"tests/uses.rs"` and `"tests/views.rs"`, in sorted order. Those three were not listed either, and the differential's completeness test (every `.rs` in `nameres/tests/` must be listed) would fail on them. Their fixtures are now compared too. A literal that is not a fixture is skipped, as for every file. If one of them differs on purpose, it goes into `ORDER_DEPENDENT` or an `Exempt` with a reason. Status: done.
+
+> applied by frontend-nameres (2026-10-29 23:07): items 1 and 2 (`facts/unit.rs` glob arm, `facts/driver.rs` `trait_item_import_diagnostics` for crate and block); checked by db-expand-names. Item 3 applied 23:08 (with `primitive_shadow.rs`, `uses.rs`, `views.rs`); `NAMERES` now lists every file in `nameres/tests/`, checked by db-expand-names.
+
+## db-expand-names: the `TraitItemImport` def diagnostic in hir (crates/hir owner, `crates/hir/src/diagnostics.rs`)
+
+What: `DefDiagnosticKind` has a new variant, `TraitItemImport { id: AstId<ast::Use>, index:
+Idx<ast::UseTree>, why: hir_def::nameres::diagnostics::TraitItemImport }`, so
+`emit_def_diagnostic` (~1558) no longer compiles. Add, after the `UnresolvedImport` arm:
+
+```rust
+            DefDiagnosticKind::TraitItemImport { id, index, why } => {
+                let use_tree = hir_def::src::use_tree_to_ast(self.db, *id, *index);
+                self.acc.push(
+                    TraitItemImport { decl: InFile::new(id.file_id, AstPtr::new(&use_tree)), why: *why }
+                        .into(),
+                );
+            }
+```
+
+and a `pub struct TraitItemImport { pub decl: InFile<AstPtr<ast::UseTree>>, pub why:
+hir_def::nameres::diagnostics::TraitItemImport }` next to `UnresolvedImport` (~283), in the
+`AnyDiagnostic` list.
+Why: hir-def and hir don't build together until this lands.
+Test: blaze-diagnostics' (next request).
+
+Status: open.
+> applied by db-apply-ty2 (2026-10-29 23:13): as written (the push binds `decl` first, to fit the line), `TraitItemImport` in the `AnyDiagnostic` list after `TraitImplRedundantAssocItems`, the struct after `UnresolvedImport`. Test `crates/hir/src/tests/trait_imports.rs`: a glob and a single import of `Default`'s items are two `Unstable` reports without the feature, none with it. diagnostics-next2 told by tmux; its arms are in (`blaze-diagnostics/src/lower/mod.rs:200`, `ide-diagnostics/src/lib.rs:577`).
+
+> routed by db-next4 to db-apply-ty2, first (2026-10-29 23:07). When applied, tell diagnostics-next2 (window 54), which waits on it.
+
+## db-expand-names: render imports of trait items (diagnostics, `crates/blaze-diagnostics/src/lower/`)
+
+What: a lowering for hir's new `TraitItemImport`, next to `lower/unresolved_import.rs`:
+- `why: Unstable`: rustc's `feature_err` at the use tree's span: error[E0658] "`use` associated
+items of traits is unstable", with rustc's feature notes for `import_trait_associated_functions`
+(issue 134691). rustc reports once per glob, and once per namespace for a single import; hir-def
+already gives one diagnostic per report.
+- `why: ItemsFromMacros`: blaze's own error (no rustc code), "blaze cannot import the items of
+trait `{name}`: an item of it comes from a macro or an attribute macro", at the use tree. The
+import binds nothing (a single import is also reported unresolved), so the build stops there,
+never quietly without the items.
+Why: superset-of-rust and no-fallback.
+Test: a differential case against the pinned rustc for both a glob and a single import without
+the feature.
+
+Status: open.
+
+> diagnostics (window 67, 23:12): the lowering is written, `lower/trait_item_import.rs`:
+> E0658 through the new `checks::features::lowered_feature_err`, whose notes depend on
+> `RUSTC_BOOTSTRAP` as `configured`'s do, and blaze's error naming the trait as written. Both are
+> at the use tree, in `Phase::Resolve`. Its `mod` line and `AnyDiagnostic::TraitItemImport` arm
+> (and ide-diagnostics') wait on hir's struct and arm ("the `TraitItemImport` def diagnostic in
+> hir", above): `hir::TraitItemImport` doesn't exist yet, and hir's `DefDiagnosticKind` match has
+> no arm for it, so hir doesn't build. The UI test,
+> `tests/ui/feature-gates/feature-gate-import-trait-associated-functions.rs` copied with its
+> `.stderr`, goes in with the arm. Whoever lands hir's side, tell diagnostics by tmux: window 54 (`diagnostics-next2`; it was 67 before the windows were renumbered).
+
+> told diagnostics-next2 by tmux (2026-10-29 23:00).
+> diagnostics, 23:09: `lower/trait_item_import.rs` written (E0658 with rustc's feature notes; blaze's `ItemsFromMacros` error at the use tree). Its arms in blaze-diagnostics and ide-diagnostics, and rustc's feature-gate UI test, wait on the hir request below; tell diagnostics-next2 (window 54; 67 is now cargo-jobs) when it lands.
+
+> forwarded to diagnostics (diagnostics-next2, both windows); told by tmux (requests, pass 35).
+
+> applied by diagnostics (window 54, 23:40): `pub(crate) mod trait_item_import;` and `AnyDiagnostic::TraitItemImport(d) => trait_item_import::lower(cx, &d)` in `lower/mod.rs`; ide-diagnostics gets `handlers/trait_item_import.rs` and its arm. rustc's `feature-gate-import-trait-associated-functions` .rs/.stderr is the test `an_import_of_a_traits_items_is_unstable_once_per_name_and_glob` in `tests/items/resolve.rs`. The ide handler reads `hir::TraitItemImportWhy`, the re-export `pub use hir_def::nameres::diagnostics::TraitItemImport as TraitItemImportWhy;` asked of db-apply-ty2. Not built.
+
+## db-expand-names: trait functions reached through an imported name (hir-ty, `crates/hir-ty/src/infer/path.rs`)
+
+What: after `use Trait::f;`, a plain path `f` resolves (value namespace) to a `FunctionId` or
+`ConstId` whose container is the trait. `infer/path.rs` ~200 gives fresh args with `Self` only
+for `Path::LangItem`, so such a call has no `Self`. rustc reads it as `<_ as Trait>::f`: give
+`fresh_args_for_item` and `write_assoc_resolution` whenever the container is
+`ItemContainerId::TraitId`, whatever the path kind (an imported item can't be an impl's).
+Why: the imports now bind these (db.md "## hir-def nameres: glob imports from a trait").
+Test: `use Default::default; let x: u8 = default();` infers `u8` as under rustc.
+
+Status: open.
+> applied by db-apply-ty2 (2026-10-29 23:09): `infer/path.rs` gives fresh args and an assoc resolution to a `ValueNs::{FunctionId, ConstId}` whose container is a trait for every path kind; an impl container still only for `Path::LangItem`. Test `hir-ty/src/tests/trait_item_imports.rs`: `let x = default(); let _: u8 = x;` (core's trait) and a local trait's `make()` infer `x` as `u8`/`u16` with no diagnostic. Not compiled (applier rules).
+
+> routed by db-next4 to db-apply-ty2, after the hir arm (2026-10-29 23:07).
+
+## frontend-tree: hir-expand builtin/derive_macro.rs: onto views (11)
+
+From frontend-tree-move-expand-derive (window `frontend-tree-move-expand-derive-next1`; notes
+`docs/v2/plan/lanes/frontend/tree-move-expand-derive.md`). Half of (10), which is withdrawn (the
+split `## db-expand-views: (10) split so the view move changes no output` asked for, option 2).
+The other half is (12), below.
+
+**No output changes.** Every derive but `CoercePointee` reads its own item (the parse of the
+derive's token tree) through views. The result is the same tree, with the same spans and errors:
+- `call_input` runs the `FlatConverter` that `syntax_node_to_token_tree` ran on the same flat
+  node.
+- `SpanMap::span_for(range)` is `span_at(range.start())`.
+- The three item errors come in the same order.
+
+`CoercePointee` is untouched. Its code moves as it is into a new file,
+`derive_macro/editor.rs`, with the handle reads it rests on:
+- `to_adt_syntax`;
+- the handle parse, as `parse_adt_from_handle`, with `push_fields` and `name_to_token`;
+- `attr_words_have` and `type_param_span`.
+
+The view parse can't read the tree the editor builds, so the editor keeps its handle parse until
+(12) replaces the editor. The one change inside the moved code: `coerce_pointee_expand` is split
+into the parse and `coerce_pointee_derive(frame, span, &adt, &span_map)`, and the body is the
+same.
+
+No new `SyntaxNode` is made by the moved derives. The old code made one per derive call
+(`parsed.syntax_node()`), and `CoerceShared` made a second for its target. `From`'s handle form
+and `CoerceShared`'s target tokens go to `reference.rs`'s `handle` module, test-only, as the
+reference the new tests compare against.
+
+Old texts are copied from the files as they are now ((7) is applied). The three files and the
+new one land together. Not built (the lane runs no build).
+
+11.1 File `crates/hir-expand/src/builtin/derive_macro.rs`. Old:
+
+```rust
+use base_db::Db;
+use blaze_mem::Frame;
+use either::Either;
+use intern::{Symbol, sym};
+use itertools::Itertools;
+use parser::SyntaxKind;
+use smallvec::SmallVec;
+use span::{Edition, Span};
+use syntax_bridge::DocCommentDesugarMode;
+use tracing::debug;
+
+use crate::{
+    BuiltinError, ExpandError, ExpandErrorKind, ExpandResult, MacroCallId, MacroCallKind,
+    builtin::quote::{ToTokenTree, dollar_crate, group},
+    hygiene::span_with_def_site_ctxt,
+    name::{self, AsName, Name},
+    span_map::ExpansionSpanMap,
+    tt,
+};
+use syntax::{
+    TextRange, TextSize,
+    ast::{
+        self, AstNode, FieldList, HasAttrs, HasGenericArgs, HasGenericParams, HasModuleItem,
+        HasName, HasTypeBounds,
+    },
+    syntax_editor::{GetOrCreateWhereClause, SyntaxEditor},
+    view::{self, AstNode as _, HasAttrs as _},
+};
+
+#[cfg(test)]
+mod reference;
+#[cfg(test)]
+mod tests;
+```
+
+New:
+
+```rust
+use base_db::Db;
+use blaze_mem::Frame;
+use intern::{Symbol, sym};
+use smallvec::SmallVec;
+use span::{Edition, Span};
+use syntax_bridge::{DocCommentDesugarMode, SpanMapper};
+use tracing::debug;
+
+use crate::{
+    BuiltinError, ExpandError, ExpandErrorKind, ExpandResult, MacroCallId, MacroCallKind,
+    builtin::quote::{ToTokenTree, dollar_crate, group},
+    hygiene::span_with_def_site_ctxt,
+    name::{self, AsName, Name},
+    tt,
+};
+use syntax::{
+    Parse, SyntaxNode, TextRange,
+    view::{
+        self as ast, AstNode, FieldList, HasAttrs, HasGenericParams, HasModuleItem, HasName,
+        HasTypeBounds,
+    },
+};
+use syntax::view;
+
+use editor::coerce_pointee_expand;
+
+mod editor;
+#[cfg(test)]
+mod reference;
+#[cfg(test)]
+mod tests;
+```
+
+Why: the file reads only views now (`ast` is `syntax::view`, the convention). `either`,
+`itertools`, `parser::SyntaxKind`, `TextSize`, `HasGenericArgs`, `ExpansionSpanMap` and the
+editor's imports were used only by `CoercePointee` and the handle reads, and they go with them to
+`editor.rs` (11.19). `register_builtin!` takes an identifier, so `coerce_pointee_expand` is
+imported.
+
+11.2 Old (the handle `attr_words_have`, and the first doc line of `attr_words_have_view`):
+
+```rust
+/// Whether the words of `attr`'s text (its runs of letters, digits and `_`, leaving out those in
+/// `skip`) start with `head` and then have `word`. A word never spans two tokens, so the tokens
+/// are split one by one and nothing is copied.
+fn attr_words_have(attr: &ast::Attr, head: &str, skip: &[&str], word: &str) -> bool {
+    let mut first = true;
+    for token in attr.syntax().descendants_with_tokens().filter_map(|it| it.into_token()) {
+        for it in token.text().split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if it.is_empty() || skip.contains(&it) {
+                continue;
+            }
+            if first {
+                if it != head {
+                    return false;
+                }
+                first = false;
+            } else if it == word {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// [`attr_words_have`] of a view of the attribute.
+fn attr_words_have_view(attr: view::Attr<'_>, head: &str, skip: &[&str], word: &str) -> bool {
+```
+
+New:
+
+```rust
+/// Whether the words of `attr`'s text (its runs of letters, digits and `_`, leaving out those in
+/// `skip`) start with `head` and then have `word`. A word never spans two tokens, so the tokens
+/// are split one by one and nothing is copied.
+fn attr_words_have_view(attr: view::Attr<'_>, head: &str, skip: &[&str], word: &str) -> bool {
+```
+
+Why: the view parse's `repr(packed)` (11.10) reads the view. The handle form moves to
+`editor.rs` (11.19), whose handle parse still calls it.
+
+11.3 Old:
+
+```rust
+fn parse_adt(
+    db: &Db,
+    tt: &tt::TopSubtree,
+    call_site: Span,
+) -> Result<BasicAdtInfo, ExpandError> {
+    let (adt, tm) = to_adt_syntax(db, tt, call_site)?;
+    parse_adt_from_syntax(&adt, &tm, call_site)
+}
+
+/// Pushes the fields of `list` to `fields`, and says how they are written.
+fn push_fields(
+    fields: &mut Vec<tt::Ident>,
+    call_site: Span,
+    tm: &ExpansionSpanMap,
+    list: Option<FieldList>,
+) -> Result<FieldsKind, ExpandError> {
+```
+
+New:
+
+```rust
+fn parse_adt(
+    db: &Db,
+    tt: &tt::TopSubtree,
+    call_site: Span,
+) -> Result<BasicAdtInfo, ExpandError> {
+    let (parsed, tm) = parse_item(db, tt);
+    parse_adt_from_syntax(adt_of(&parsed, call_site)?, &tm, call_site)
+}
+
+/// Pushes the fields of `list` to `fields`, and says how they are written.
+fn push_fields(
+    fields: &mut Vec<tt::Ident>,
+    call_site: Span,
+    tm: &impl SpanMapper,
+    list: Option<FieldList<'_>>,
+) -> Result<FieldsKind, ExpandError> {
+```
+
+Why: the item is a view of the parse, and the span of a token is any mapper's (11.17's
+`AtSpan` gives one span for all).
+
+11.4 Old:
+
+```rust
+                    span: at_field(tm.span_at(at.start())),
+```
+
+New:
+
+```rust
+                    span: at_field(tm.span_for(at)),
+```
+
+Why: `SpanMap::span_for(range)` is `span_at(range.start())`.
+
+11.5 Old:
+
+```rust
+fn parse_adt_from_syntax(
+    adt: &ast::Adt,
+    tm: &span::SpanMap,
+    call_site: Span,
+) -> Result<BasicAdtInfo, ExpandError> {
+```
+
+New:
+
+```rust
+fn parse_adt_from_syntax(
+    adt: ast::Adt<'_>,
+    tm: &impl SpanMapper,
+    call_site: Span,
+) -> Result<BasicAdtInfo, ExpandError> {
+```
+
+Why: a view, read in place.
+
+11.6 Old:
+
+```rust
+    let (name, generic_param_list, where_clause, kind) = match &adt {
+```
+
+New:
+
+```rust
+    let (name, generic_param_list, where_clause, kind) = match adt {
+```
+
+Why: a view is `Copy`.
+
+11.7 Old:
+
+```rust
+                    && variant.attrs().any(|it| it.simple_name() == Some("default".into()))
+```
+
+New:
+
+```rust
+                    && variant.attrs().any(|it| it.simple_name() == Some("default"))
+```
+
+Why: the view's `simple_name` is a `&str` of the tree.
+
+11.8 Old:
+
+```rust
+    let to_tt = |node: &syntax::SyntaxNode| {
+        syntax_bridge::syntax_node_to_token_tree(
+            node,
+            tm,
+            call_site,
+            DocCommentDesugarMode::ProcMacro,
+        )
+    };
+```
+
+New:
+
+```rust
+    let to_tt = |node: view::Node<'_>| {
+        syntax_bridge::call_input(node, tm, call_site, DocCommentDesugarMode::ProcMacro)
+    };
+```
+
+Why: `call_input` runs the `FlatConverter` that `syntax_node_to_token_tree` ran on the flat
+node, so the tree is the same.
+
+11.9 Old:
+
+```rust
+        let field_list = match adt {
+            ast::Adt::Enum(it) => it.variant_list().map(|list| list.syntax().clone()), // clone: a node handle, a non-atomic count
+            ast::Adt::Struct(it) => it.field_list().map(|list| list.syntax().clone()), // clone: a node handle, a non-atomic count
+            ast::Adt::Union(it) => it.record_field_list().map(|list| list.syntax().clone()), // clone: a node handle, a non-atomic count
+        };
+```
+
+New:
+
+```rust
+        let field_list = match adt {
+            ast::Adt::Enum(it) => it.variant_list().map(|list| list.syntax()),
+            ast::Adt::Struct(it) => it.field_list().map(|list| list.syntax()),
+            ast::Adt::Union(it) => it.record_field_list().map(|list| list.syntax()),
+        };
+```
+
+Why: no handle to clone.
+
+11.10 Old:
+
+```rust
+    let packed = adt.attrs().any(|attr| attr_words_have(&attr, "repr", &["r"], "packed"));
+```
+
+New:
+
+```rust
+    let packed = adt.attrs().any(|attr| attr_words_have_view(attr, "repr", &["r"], "packed"));
+```
+
+Why: the attribute is a view.
+
+11.11 Old (`to_adt_syntax` and `name_to_token`):
+
+```rust
+fn to_adt_syntax(
+    db: &Db,
+    tt: &tt::TopSubtree,
+    call_site: Span,
+) -> Result<(ast::Adt, span::SpanMap), ExpandError> {
+    let (parsed, tm, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        crate::token_tree_to_syntax_node(db, frame, tt.view(), crate::ExpandTo::Items)
+    });
+    let macro_items = ast::MacroItems::cast(parsed.syntax_node())
+        .ok_or_else(|| ExpandError::other(call_site, "invalid item definition"))?;
+    let item =
+        macro_items.items().next().ok_or_else(|| ExpandError::other(call_site, "no item found"))?;
+    let adt = ast::Adt::cast(item.syntax().clone()) // clone: a node handle, a non-atomic count
+        .ok_or_else(|| ExpandError::other(call_site, "expected struct, enum or union"))?;
+    Ok((adt, tm))
+}
+
+fn name_to_token(
+    call_site: Span,
+    token_map: &ExpansionSpanMap,
+    name: Option<ast::Name>,
+) -> Result<tt::Ident, ExpandError> {
+    let name = name.ok_or_else(|| {
+        debug!("parsed item has no name");
+        ExpandError::other(call_site, "missing name")
+    })?;
+    let span = token_map.span_at(name.syntax().text_range().start());
+```
+
+New:
+
+```rust
+/// The derive's item parsed from its token tree, and the span of each of its tokens.
+fn parse_item(db: &Db, tt: &tt::TopSubtree) -> (Parse<SyntaxNode>, span::SpanMap) {
+    let (parsed, tm, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        crate::token_tree_to_syntax_node(db, frame, tt.view(), crate::ExpandTo::Items)
+    });
+    (parsed, tm)
+}
+
+/// The struct, enum or union [`parse_item`] parsed, read in place.
+fn adt_of(parsed: &Parse<SyntaxNode>, call_site: Span) -> Result<ast::Adt<'_>, ExpandError> {
+    let macro_items = ast::MacroItems::cast(parsed.root())
+        .ok_or_else(|| ExpandError::other(call_site, "invalid item definition"))?;
+    let item =
+        macro_items.items().next().ok_or_else(|| ExpandError::other(call_site, "no item found"))?;
+    ast::Adt::cast(item.syntax())
+        .ok_or_else(|| ExpandError::other(call_site, "expected struct, enum or union"))
+}
+
+fn name_to_token(
+    call_site: Span,
+    token_map: &impl SpanMapper,
+    name: Option<ast::Name<'_>>,
+) -> Result<tt::Ident, ExpandError> {
+    let name = name.ok_or_else(|| {
+        debug!("parsed item has no name");
+        ExpandError::other(call_site, "missing name")
+    })?;
+    let span = token_map.span_for(name.syntax().text_range());
+```
+
+Why: the parse is kept and read through its root, with the same three errors in the same
+order. The item is borrowed from the parse, so `to_adt_syntax`'s pair becomes these two.
+`editor.rs` keeps the handle `to_adt_syntax` and `name_to_token` for `CoercePointee` (11.19).
+
+11.12 Old (`from_expand`'s body and `from_derive`'s signature):
+
+```rust
+    let (adt, span_map) = match to_adt_syntax(db, tt, span) {
+        Ok(it) => it,
+        Err(err) => return ExpandResult::new(empty(frame, span), err),
+    };
+    from_derive(frame, span, &adt, &span_map)
+}
+
+fn from_derive<'f>(
+    frame: &'f Frame,
+    span: Span,
+    adt: &ast::Adt,
+    span_map: &span::SpanMap,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+```
+
+New:
+
+```rust
+    let (parsed, span_map) = parse_item(db, tt);
+    let adt = match adt_of(&parsed, span) {
+        Ok(it) => it,
+        Err(err) => return ExpandResult::new(empty(frame, span), err),
+    };
+    from_derive(frame, span, adt, &span_map)
+}
+
+fn from_derive<'f>(
+    frame: &'f Frame,
+    span: Span,
+    adt: ast::Adt<'_>,
+    span_map: &span::SpanMap,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+```
+
+Why: the view. The rest of `from_derive` reads it as it read the handle.
+
+11.13 Old:
+
+```rust
+    let mut field_types: SmallVec<[Option<ast::Type>; 2]> = SmallVec::new();
+```
+
+New:
+
+```rust
+    let mut field_types: SmallVec<[Option<ast::Type<'_>>; 2]> = SmallVec::new();
+```
+
+Why: a view type.
+
+11.14 Old:
+
+```rust
+        [Some(ty)] => syntax_bridge::syntax_node_to_token_tree(
+            ty.syntax(),
+            span_map,
+            span,
+            DocCommentDesugarMode::ProcMacro,
+        ),
+```
+
+New:
+
+```rust
+        [Some(ty)] => {
+            syntax_bridge::call_input(ty.syntax(), span_map, span, DocCommentDesugarMode::ProcMacro)
+        }
+```
+
+Why: as 11.8.
+
+11.15 Old (`coerce_shared_expand`'s first lines):
+
+```rust
+    let (adt, span_map) = match to_adt_syntax(db, tt, span) {
+        Ok(it) => it,
+        Err(err) => {
+            return ExpandResult::new(empty(frame, span), err);
+        }
+    };
+    let ast::Adt::Struct(strukt) = &adt else {
+```
+
+New:
+
+```rust
+    let (parsed, span_map) = parse_item(db, tt);
+    let adt = match adt_of(&parsed, span) {
+        Ok(it) => it,
+        Err(err) => {
+            return ExpandResult::new(empty(frame, span), err);
+        }
+    };
+    let ast::Adt::Struct(strukt) = adt else {
+```
+
+Why: as 11.12. `coerce_shared_target(db, span, strukt)` below stays as written.
+
+11.16 Old:
+
+```rust
+                "`derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute",
+            ),
+        );
+    };
+    let info = match parse_adt_from_syntax(&adt, &span_map, span) {
+```
+
+New:
+
+```rust
+                "`derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute",
+            ),
+        );
+    };
+    let info = match parse_adt_from_syntax(adt, &span_map, span) {
+```
+
+Why: the view.
+
+11.17 Old (all of `coerce_shared_target`):
+
+```rust
+fn coerce_shared_target(
+    db: &Db,
+    span: Span,
+    strukt: &ast::Struct,
+) -> Option<tt::TopSubtree> {
+    let mut attrs = strukt
+        .attrs()
+        .filter(|attr| attr.as_simple_call().is_some_and(|(name, _)| name == "coerce_shared"));
+    let attr = attrs.next()?;
+    if attrs.next().is_some() {
+        return None;
+    }
+    let (_, target_tokens) = attr.as_simple_call()?;
+    let l_paren = target_tokens.l_paren_token()?;
+    let r_paren = target_tokens.r_paren_token()?;
+
+    let mut span_map = span::SpanMap::empty();
+    span_map.push(target_tokens.syntax().text_range().start(), span);
+    span_map.push(target_tokens.syntax().text_range().end(), span);
+
+    let remove = syntax_bridge::Removed::<_>::from_iter([l_paren.into(), r_paren.into()]);
+    let target = syntax_bridge::syntax_node_to_token_tree_modified(
+        target_tokens.syntax(),
+        &span_map,
+        syntax_bridge::Appended::<_, std::alloc::Global>::default(),
+        remove,
+        span,
+        DocCommentDesugarMode::ProcMacro,
+        |_, _| (true, syntax_bridge::Inserted::new()),
+    );
+
+    let (parse, _, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        crate::token_tree_to_syntax_node(db, frame, target.view(), crate::ExpandTo::Type)
+    });
+    if !parse.errors().is_empty() {
+        return None;
+    }
+    ast::Type::cast(parse.syntax_node())?;
+    Some(target)
+}
+```
+
+New:
+
+```rust
+/// Every token at `span`: what the derive says, it says at the derive.
+struct AtSpan(Span);
+
+impl SpanMapper for AtSpan {
+    fn span_for(&self, _: TextRange) -> Span {
+        self.0
+    }
+}
+
+fn coerce_shared_target(db: &Db, span: Span, strukt: ast::Struct<'_>) -> Option<tt::TopSubtree> {
+    let target = coerce_shared_target_tokens(span, strukt)?;
+    let (parse, _, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        crate::token_tree_to_syntax_node(db, frame, target.view(), crate::ExpandTo::Type)
+    });
+    if !parse.errors().is_empty() {
+        return None;
+    }
+    ast::Type::cast(parse.root())?;
+    Some(target)
+}
+
+/// The tokens of the struct's one `#[coerce_shared(Target)]`, without the parentheses, every
+/// one at `span`.
+fn coerce_shared_target_tokens(span: Span, strukt: ast::Struct<'_>) -> Option<tt::TopSubtree> {
+    let mut attrs = strukt
+        .attrs()
+        .filter(|attr| attr.as_simple_call().is_some_and(|(name, _)| name == "coerce_shared"));
+    let attr = attrs.next()?;
+    if attrs.next().is_some() {
+        return None;
+    }
+    let (_, target_tokens) = attr.as_simple_call()?;
+    let l_paren = target_tokens.l_paren_token()?;
+    let r_paren = target_tokens.r_paren_token()?;
+    let remove = syntax_bridge::Removed::<_>::from_iter([l_paren.id(), r_paren.id()]);
+    Some(syntax_bridge::call_input_modified(
+        target_tokens.syntax(),
+        AtSpan(span),
+        syntax_bridge::Appended::<_, std::alloc::Global>::default(),
+        remove,
+        span,
+        DocCommentDesugarMode::ProcMacro,
+        |_, _| (true, syntax_bridge::Inserted::new()),
+    ))
+}
+```
+
+Why: the same tokens from the view (`AtSpan` is the two-entry map, which gave `span` to every
+token). The type check reads the root and makes no second `SyntaxNode`. The tokens are split
+out so the test compares them with the handle form's (`reference::handle`, 11.21).
+
+11.18 Old: everything from the line
+
+```rust
+/// rustc's `GenericParam::span` of a type parameter: its name, to the end of its default if it
+```
+
+through the end of the file. That is `type_param_span` and `coerce_pointee_expand`, whose first
+statement is `let (adt, span_map) = match to_adt_syntax(db, tt, span) {`. It runs up to that
+function's last nested function `any_long` and the file's last line, the `}` closing
+`coerce_pointee_expand`.
+
+New: nothing. The file ends with the `}` closing `write_coerce_pointee_impls`.
+
+Why: `CoercePointee` moves to `editor.rs` (11.19) with no change to its code.
+
+11.19 New file `crates/hir-expand/src/builtin/derive_macro/editor.rs`:
+
+```rust
+//! `CoercePointee`'s expansion through a `SyntaxEditor`: the derive's item read through handles
+//! and copied into an editor, whose `where` clause `make` writes from text. The handle parse of
+//! the edited copy is here too: the view parse cannot read a tree the editor built.
+
+use base_db::Db;
+use blaze_mem::Frame;
+use either::Either;
+use itertools::Itertools;
+use parser::SyntaxKind;
+use smallvec::SmallVec;
+use span::Span;
+use syntax::{
+    TextRange, TextSize,
+    ast::{
+        self, AstNode, FieldList, HasAttrs, HasGenericArgs, HasGenericParams, HasModuleItem,
+        HasName, HasTypeBounds,
+    },
+    syntax_editor::{GetOrCreateWhereClause, SyntaxEditor},
+};
+use syntax_bridge::DocCommentDesugarMode;
+use tracing::debug;
+
+use super::{
+    AdtKind, AdtParam, AdtShape, BasicAdtInfo, FieldsKind, Variant, empty, len_u32,
+    tuple_field_symbol, write_coerce_pointee_impls,
+};
+use crate::{
+    BuiltinError, ExpandError, ExpandResult,
+    name::{AsName, Name},
+    span_map::ExpansionSpanMap,
+    tt,
+};
+
+/// Whether the words of `attr`'s text (its runs of letters, digits and `_`, leaving out those in
+/// `skip`) start with `head` and then have `word`. A word never spans two tokens, so the tokens
+/// are split one by one and nothing is copied.
+pub(super) fn attr_words_have(attr: &ast::Attr, head: &str, skip: &[&str], word: &str) -> bool {
+    let mut first = true;
+    for token in attr.syntax().descendants_with_tokens().filter_map(|it| it.into_token()) {
+        for it in token.text().split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if it.is_empty() || skip.contains(&it) {
+                continue;
+            }
+            if first {
+                if it != head {
+                    return false;
+                }
+                first = false;
+            } else if it == word {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(super) fn coerce_pointee_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    span: Span,
+    tt: &tt::TopSubtree,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let (adt, span_map) = match to_adt_syntax(db, tt, span) {
+        Ok(it) => it,
+        Err(err) => {
+            return ExpandResult::new(empty(frame, span), err);
+        }
+    };
+    coerce_pointee_derive(frame, span, &adt, &span_map)
+}
+
+/// `#[derive(CoercePointee)]` of the item: a `SyntaxEditor` copy of it, with the new `where`
+/// predicates made by `make`.
+pub(super) fn coerce_pointee_derive<'f>(
+    frame: &'f Frame,
+    span: Span,
+    adt: &ast::Adt,
+    span_map: &span::SpanMap,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    // The editor's copy of the item starts at 0, the item in `span_map` where it was parsed.
+    let base = adt.syntax().text_range().start();
+    let span_of = |range: TextRange| {
+        let first = span_map.span_at(range.start() + base);
+        match range.end().checked_sub(TextSize::new(1)).filter(|_| !range.is_empty()) {
+            Some(last) => first.cover(span_map.span_at(last + base)),
+            None => first,
+        }
+    };
+    let (editor, adt) = SyntaxEditor::with_ast_node(adt);
+    let make = editor.make();
+    let refuse = |error: BuiltinError, at: Span| {
+        ExpandResult::new(empty(frame, span), error.at(at))
+    };
+    // rustc's `CoercePointee` errors are E0802.
+    fn pointee_error(message: impl Into<Box<str>>) -> BuiltinError {
+        BuiltinError::derive(message).code(802)
+    }
+    let ast::Adt::Struct(strukt) = &adt else {
+        return refuse(
+            pointee_error(
+                "`CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`",
+            ),
+            span,
+        );
+    };
+    let has_at_least_one_field = strukt
+        .field_list()
+        .map(|it| match it {
+            ast::FieldList::RecordFieldList(it) => it.fields().next().is_some(),
+            ast::FieldList::TupleFieldList(it) => it.fields().next().is_some(),
+        })
+        .unwrap_or(false);
+    if !has_at_least_one_field {
+        return refuse(
+            pointee_error(
+                "`CoercePointee` can only be derived on `struct`s with at least one field",
+            ),
+            span,
+        );
+    }
+    let type_params = strukt
+        .generic_param_list()
+        .into_iter()
+        .flat_map(|generics| {
+            generics.generic_params().filter_map(|param| match param {
+                ast::GenericParam::TypeParam(param) => Some(param),
+                _ => None,
+            })
+        })
+        .collect_vec();
+    if type_params.is_empty() {
+        return refuse(
+            pointee_error(
+                "`CoercePointee` can only be derived on `struct`s that are generic over at least one type",
+            ),
+            span,
+        );
+    }
+    let (pointee_param, pointee_param_idx) = if type_params.len() == 1 {
+        // Regardless of the only type param being designed as `#[pointee]` or not, we can just use it as such.
+        (type_params[0].clone(), 0) // clone: `CoercePointee` only, rare: node handles and its edit's lists
+    } else {
+        let mut pointees = type_params.iter().cloned().enumerate().filter(|(_, param)| {
+            param.attrs().any(|attr| {
+                let is_pointee = attr.as_simple_atom().is_some_and(|name| name == "pointee");
+                if is_pointee {
+                    // Remove the `#[pointee]` attribute so it won't be present in the generated
+                    // impls (where we cannot resolve it).
+                    editor.delete(attr.syntax());
+                }
+                is_pointee
+            })
+        });
+        match (pointees.next(), pointees.next()) {
+            (Some((pointee_idx, pointee)), None) => (pointee, pointee_idx),
+            (None, _) => {
+                return refuse(
+                    pointee_error(
+                        "exactly one generic type parameter must be marked \
+                                as `#[pointee]` to derive `CoercePointee` traits",
+                    ),
+                    span,
+                );
+            }
+            (Some((_, one)), Some(_)) => {
+                return refuse(
+                    pointee_error(
+                        "only one type parameter can be marked as `#[pointee]` \
+                                when deriving `CoercePointee` traits",
+                    ),
+                    type_param_span(&one).map_or(span, span_of),
+                );
+            }
+        }
+    };
+    let (Some(struct_name), Some(pointee_param_name)) = (strukt.name(), pointee_param.name())
+    else {
+        return ExpandResult::new(
+            tt::TopSubtree::empty_in(tt::DelimSpan::from_single(span), frame),
+            ExpandError::other(span, "invalid item"),
+        );
+    };
+
+    {
+        let mut pointee_has_maybe_sized_bound = false;
+        if let Some(bounds) = pointee_param.type_bound_list() {
+            pointee_has_maybe_sized_bound |= bounds.bounds().any(is_maybe_sized_bound);
+        }
+        if let Some(where_clause) = strukt.where_clause() {
+            pointee_has_maybe_sized_bound |= where_clause.predicates().any(|pred| {
+                let Some(ast::Type::PathType(ty)) = pred.ty() else { return false };
+                let is_not_pointee = ty.path().is_none_or(|path| {
+                    let is_pointee = path
+                        .as_single_name_ref()
+                        .is_some_and(|name| name.text() == pointee_param_name.text());
+                    !is_pointee
+                });
+                if is_not_pointee {
+                    return false;
+                }
+                pred.type_bound_list()
+                    .is_some_and(|bounds| bounds.bounds().any(is_maybe_sized_bound))
+            })
+        }
+        if !pointee_has_maybe_sized_bound {
+            return refuse(
+                // alloc: an error's message, on the error path
+                pointee_error(format!(
+                    "`derive(CoercePointee)` requires `{pointee_param_name}` to be marked `?Sized`"
+                )),
+                span_of(pointee_param_name.syntax().text_range()),
+            );
+        }
+    }
+    // rustc checks this of the impl the derive writes, in coherence
+    // (`visit_implementation_of_coerce_pointee_validity`): only once every check above passed.
+    let is_repr_transparent = strukt.attrs().any(|attr| {
+        attr.as_simple_call().is_some_and(|(name, tt)| {
+            name == "repr"
+                && tt.syntax().children_with_tokens().any(|it| {
+                    it.into_token().is_some_and(|it| {
+                        it.kind() == SyntaxKind::IDENT && it.text() == "transparent"
+                    })
+                })
+        })
+    });
+    if !is_repr_transparent {
+        return refuse(
+            pointee_error(
+                "`derive(CoercePointee)` is only applicable to `struct` with `repr(transparent)` layout",
+            ),
+            span,
+        );
+    }
+
+    const ADDED_PARAM: &str = "__S";
+
+    let mut new_predicates: Vec<ast::WherePred> = Vec::new(); // clone: `CoercePointee` only, rare: node handles and its edit's lists
+
+    {
+        // # Rewrite generic parameter bounds
+        // For each bound `U: ..` in `struct<U: ..>`, make a new bound with `__S` in place of `#[pointee]`
+        // Example:
+        // ```
+        // struct<
+        //     U: Trait<T>,
+        //     #[pointee] T: Trait<T> + ?Sized,
+        //     V: Trait<T>> ...
+        // ```
+        // ... generates this `impl` generic parameters
+        // ```
+        // impl<
+        //     U: Trait<T>,
+        //     T: Trait<T> + ?Sized,
+        //     V: Trait<T>
+        // >
+        // where
+        //     U: Trait<__S>,
+        //     __S: Trait<__S> + ?Sized,
+        //     V: Trait<__S> ...
+        // ```
+        for param in &type_params {
+            let Some(param_name) = param.name() else { continue };
+            if let Some(bounds) = param.type_bound_list() {
+                // If the target type is the pointee, duplicate the bound as whole.
+                // Otherwise, duplicate only bounds that mention the pointee.
+                let is_pointee = param_name.text() == pointee_param_name.text();
+                let new_bounds = bounds.bounds().filter_map(|bound| {
+                    let new_bound = substitute_type_bound(
+                        bound.clone(), // clone: `CoercePointee` only, rare: node handles and its edit's lists
+                        pointee_param_name.text(),
+                        ADDED_PARAM,
+                    );
+
+                    if is_pointee {
+                        return new_bound.or(Some(bound));
+                    }
+                    new_bound
+                });
+
+                let new_bounds_target = if is_pointee {
+                    make.name_ref(ADDED_PARAM)
+                } else {
+                    make.name_ref(param_name.text())
+                };
+                new_predicates.push(make.where_pred(
+                    Either::Right(
+                        make.ty_path_from_segments([make.path_segment(new_bounds_target)], false),
+                    ),
+                    new_bounds,
+                ));
+            }
+        }
+
+        // # Rewrite `where` clauses
+        //
+        // Move on to `where` clauses.
+        // Example:
+        // ```
+        // struct MyPointer<#[pointee] T, ..>
+        // where
+        //   U: Trait<V> + Trait<T>,
+        //   Companion<T>: Trait<T>,
+        //   T: Trait<T> + ?Sized,
+        // { .. }
+        // ```
+        // ... will have a impl prelude like so
+        // ```
+        // impl<..> ..
+        // where
+        //   U: Trait<V> + Trait<T>,
+        //   U: Trait<__S>,
+        //   Companion<T>: Trait<T>,
+        //   Companion<__S>: Trait<__S>,
+        //   T: Trait<T> + ?Sized,
+        //   __S: Trait<__S> + ?Sized,
+        // ```
+        //
+        // We should also write a few new `where` bounds from `#[pointee] T` to `__S`
+        // as well as any bound that indirectly involves the `#[pointee] T` type.
+        for predicate in strukt.where_clause().into_iter().flat_map(|wc| wc.predicates()) {
+            let Some(pred_target) = predicate.ty() else { continue };
+
+            // If the target type references the pointee, duplicate the bound as whole.
+            // Otherwise, duplicate only bounds that mention the pointee.
+            if let Some(predicate_with_substituted_target) =
+                substitute_where_pred(&predicate, pointee_param_name.text(), ADDED_PARAM)
+            {
+                new_predicates.push(predicate_with_substituted_target);
+            } else if let Some(bounds) = predicate.type_bound_list() {
+                let new_bounds = bounds.bounds().filter_map(|bound| {
+                    substitute_type_bound(bound, pointee_param_name.text(), ADDED_PARAM)
+                });
+                new_predicates.push(make.where_pred(Either::Right(pred_target), new_bounds));
+            }
+        }
+    }
+
+    {
+        // # Add `Unsize<__S>` bound to `#[pointee]` at the generic parameter location
+        //
+        // Find the `#[pointee]` parameter and add an `Unsize<__S>` bound to it.
+        new_predicates.push(
+            make.where_pred(
+                Either::Right(make.ty_path_from_segments(
+                    [make.path_segment(make.name_ref(pointee_param_name.text()))],
+                    false,
+                )),
+                [make.type_bound(
+                    make.ty_path_from_segments(
+                        [
+                            make.path_segment(make.name_ref("core")),
+                            make.path_segment(make.name_ref("marker")),
+                            make.generic_ty_path_segment(
+                                make.name_ref("Unsize"),
+                                [make
+                                    .type_arg(make.ty_path_from_segments(
+                                        [make.path_segment(make.name_ref(ADDED_PARAM))],
+                                        false,
+                                    ))
+                                    .into()],
+                            ),
+                        ],
+                        true,
+                    ),
+                )],
+            ),
+        );
+    }
+
+    let self_for_traits = {
+        // Replace the `#[pointee]` with `__S`.
+        let mut type_param_idx = 0;
+        let self_params_for_traits = strukt
+            .generic_param_list()
+            .into_iter()
+            .flat_map(|params| params.generic_params())
+            .filter_map(|param| {
+                Some(match param {
+                    ast::GenericParam::ConstParam(param) => {
+                        ast::GenericArg::ConstArg(make.expr_const_value(param.name()?.text()))
+                    }
+                    ast::GenericParam::LifetimeParam(param) => {
+                        make.lifetime_arg(param.lifetime()?).into()
+                    }
+                    ast::GenericParam::TypeParam(param) => {
+                        let name = if pointee_param_idx == type_param_idx {
+                            make.name_ref(ADDED_PARAM)
+                        } else {
+                            make.name_ref(param.name()?.text())
+                        };
+                        type_param_idx += 1;
+                        make.type_arg(make.ty_path_from_segments([make.path_segment(name)], false))
+                            .into()
+                    }
+                })
+            });
+
+        make.path_from_segments(
+            [make.generic_ty_path_segment(
+                make.name_ref(struct_name.text()),
+                self_params_for_traits,
+            )],
+            false,
+        )
+    };
+
+    strukt.get_or_create_where_clause(&editor, new_predicates.into_iter());
+    let edit = editor.finish();
+    let strukt = ast::Struct::cast(edit.new_root().clone()).unwrap(); // clone: `CoercePointee` only, rare: node handles and its edit's lists
+    let adt = ast::Adt::Struct(strukt.clone()); // clone: `CoercePointee` only, rare: node handles and its edit's lists
+
+    let mut span_map = span::SpanMap::empty();
+    // One span for them all.
+    span_map.push(adt.syntax().text_range().end(), span);
+
+    let self_for_traits = syntax_bridge::syntax_node_to_token_tree(
+        self_for_traits.syntax(),
+        &span_map,
+        span,
+        DocCommentDesugarMode::ProcMacro,
+    );
+    let info = match parse_adt_from_handle(&adt, &span_map, span) {
+        Ok(it) => it,
+        Err(err) => {
+            return ExpandResult::new(empty(frame, span), err);
+        }
+    };
+
+    return ExpandResult::ok(write_coerce_pointee_impls(frame, span, &info, &self_for_traits));
+
+    fn is_maybe_sized_bound(bound: ast::TypeBound) -> bool {
+        if bound.question_mark_token().is_none() {
+            return false;
+        }
+        let Some(ast::Type::PathType(ty)) = bound.ty() else {
+            return false;
+        };
+        let Some(path) = ty.path() else {
+            return false;
+        };
+        return segments_eq(&path, &["Sized"])
+            || segments_eq(&path, &["core", "marker", "Sized"])
+            || segments_eq(&path, &["std", "marker", "Sized"]);
+
+        fn segments_eq(path: &ast::Path, expected: &[&str]) -> bool {
+            path.segments().zip_longest(expected.iter().copied()).all(|value| {
+                value.both().is_some_and(|(segment, expected)| {
+                    segment.name_ref().is_some_and(|name| name.text() == expected)
+                })
+            })
+        }
+    }
+
+    /// Returns true if any substitution was performed.
+    fn substitute_type_bound(
+        bound: ast::TypeBound,
+        param_name: &str,
+        replacement: &str,
+    ) -> Option<ast::TypeBound> {
+        let (editor, bound) = SyntaxEditor::with_ast_node(&bound);
+        let substituted = bound
+            .ty()
+            .is_some_and(|ty| substitute_type_in_bound(&editor, ty, param_name, replacement));
+        if !substituted {
+            return None;
+        }
+
+        let edit = editor.finish();
+        Some(ast::TypeBound::cast(edit.new_root().clone()).unwrap()) // clone: `CoercePointee` only, rare: node handles and its edit's lists
+    }
+
+    fn substitute_where_pred(
+        predicate: &ast::WherePred,
+        param_name: &str,
+        replacement: &str,
+    ) -> Option<ast::WherePred> {
+        let (editor, predicate) = SyntaxEditor::with_ast_node(predicate);
+        let substituted = predicate
+            .ty()
+            .is_some_and(|ty| substitute_type_in_bound(&editor, ty, param_name, replacement));
+        if substituted && let Some(bounds) = predicate.type_bound_list() {
+            for bound in bounds.bounds() {
+                if let Some(ty) = bound.ty() {
+                    substitute_type_in_bound(&editor, ty, param_name, replacement);
+                }
+            }
+        }
+        if !substituted {
+            return None;
+        }
+
+        let edit = editor.finish();
+        Some(ast::WherePred::cast(edit.new_root().clone()).unwrap()) // clone: `CoercePointee` only, rare: node handles and its edit's lists
+    }
+
+    fn substitute_type_in_bound(
+        editor: &SyntaxEditor,
+        ty: ast::Type,
+        param_name: &str,
+        replacement: &str,
+    ) -> bool {
+        let make = editor.make();
+        return match ty {
+            ast::Type::ArrayType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::DynTraitType(ty) => {
+                go_bounds(editor, ty.type_bound_list(), param_name, replacement)
+            }
+            ast::Type::FnPtrType(ty) => any_long(
+                ty.param_list()
+                    .into_iter()
+                    .flat_map(|params| params.params().filter_map(|param| param.ty()))
+                    .chain(ty.ret_type().and_then(|it| it.ty())),
+                |ty| substitute_type_in_bound(editor, ty, param_name, replacement),
+            ),
+            ast::Type::ForType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::ImplTraitType(ty) => {
+                go_bounds(editor, ty.type_bound_list(), param_name, replacement)
+            }
+            ast::Type::ParenType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::PathType(ty) => ty.path().is_some_and(|path| {
+                if path.as_single_name_ref().is_some_and(|name| name.text() == param_name) {
+                    editor.replace(
+                        path.syntax(),
+                        make.path_from_segments(
+                            [make.path_segment(make.name_ref(replacement))],
+                            false,
+                        )
+                        .syntax(),
+                    );
+                    return true;
+                }
+
+                any_long(
+                    path.segments()
+                        .filter_map(|segment| segment.generic_arg_list())
+                        .flat_map(|it| it.generic_args())
+                        .filter_map(|generic_arg| match generic_arg {
+                            ast::GenericArg::TypeArg(ty) => ty.ty(),
+                            _ => None,
+                        }),
+                    |ty| substitute_type_in_bound(editor, ty, param_name, replacement),
+                )
+            }),
+            ast::Type::PtrType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::RefType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::SliceType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::TupleType(ty) => any_long(ty.fields(), |ty| {
+                substitute_type_in_bound(editor, ty, param_name, replacement)
+            }),
+            ast::Type::PatternType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::InferType(_) | ast::Type::MacroType(_) | ast::Type::NeverType(_) => false,
+        };
+
+        fn go_bounds(
+            editor: &SyntaxEditor,
+            bounds: Option<ast::TypeBoundList>,
+            param_name: &str,
+            replacement: &str,
+        ) -> bool {
+            bounds.is_some_and(|bounds| {
+                any_long(bounds.bounds(), |bound| {
+                    bound.ty().is_some_and(|ty| {
+                        substitute_type_in_bound(editor, ty, param_name, replacement)
+                    })
+                })
+            })
+        }
+
+        /// Like [`Iterator::any()`], but not short-circuiting.
+        fn any_long<I: Iterator, F: FnMut(I::Item) -> bool>(iter: I, mut f: F) -> bool {
+            let mut result = false;
+            iter.for_each(|item| result |= f(item));
+            result
+        }
+    }
+}
+
+/// rustc's `GenericParam::span` of a type parameter: its name, to the end of its default if it
+/// has one.
+fn type_param_span(param: &ast::TypeParam) -> Option<TextRange> {
+    let name = param.name()?.syntax().text_range();
+    Some(match param.default_type() {
+        Some(ty) => name.cover(ty.syntax().text_range()),
+        None => name,
+    })
+}
+
+fn to_adt_syntax(
+    db: &Db,
+    tt: &tt::TopSubtree,
+    call_site: Span,
+) -> Result<(ast::Adt, span::SpanMap), ExpandError> {
+    let (parsed, tm, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        crate::token_tree_to_syntax_node(db, frame, tt.view(), crate::ExpandTo::Items)
+    });
+    let macro_items = ast::MacroItems::cast(parsed.syntax_node())
+        .ok_or_else(|| ExpandError::other(call_site, "invalid item definition"))?;
+    let item =
+        macro_items.items().next().ok_or_else(|| ExpandError::other(call_site, "no item found"))?;
+    let adt = ast::Adt::cast(item.syntax().clone()) // clone: a node handle, a non-atomic count
+        .ok_or_else(|| ExpandError::other(call_site, "expected struct, enum or union"))?;
+    Ok((adt, tm))
+}
+
+/// Pushes the fields of `list` to `fields`, and says how they are written.
+fn push_fields(
+    fields: &mut Vec<tt::Ident>,
+    call_site: Span,
+    tm: &ExpansionSpanMap,
+    list: Option<FieldList>,
+) -> Result<FieldsKind, ExpandError> {
+    let at_field = |span: Span| Span { ctx: call_site.ctx, ..span };
+    Ok(match list {
+        None => FieldsKind::Unit,
+        Some(FieldList::RecordFieldList(it)) => {
+            fields.reserve(it.fields().count());
+            for field in it.fields() {
+                let name = name_to_token(call_site, tm, field.name())?;
+                fields.push(tt::Ident { span: at_field(name.span), ..name });
+            }
+            FieldsKind::Record
+        }
+        Some(FieldList::TupleFieldList(it)) => {
+            fields.reserve(it.fields().count());
+            for (i, field) in it.fields().enumerate() {
+                let at = field
+                    .ty()
+                    .map_or_else(|| field.syntax().text_range(), |ty| ty.syntax().text_range());
+                fields.push(tt::Ident {
+                    sym: tuple_field_symbol(i),
+                    span: at_field(tm.span_at(at.start())),
+                    is_raw: tt::IdentIsRaw::No,
+                });
+            }
+            FieldsKind::Tuple
+        }
+    })
+}
+
+/// The struct, enum or union read through handles: `CoercePointee`'s edited copy.
+pub(super) fn parse_adt_from_handle(
+    adt: &ast::Adt,
+    tm: &span::SpanMap,
+    call_site: Span,
+) -> Result<BasicAdtInfo, ExpandError> {
+    let mut fields = Vec::new(); // alloc: the shape's field list, one per derive (each list reserved in `push_fields`)
+    let mut variants = Vec::new(); // alloc: the shape's variant list, one per derive
+    // A struct's one variant takes its name, which is read last, as the errors are.
+    let mut struct_fields = None;
+    let (name, generic_param_list, where_clause, kind) = match &adt {
+        ast::Adt::Struct(it) => {
+            struct_fields = Some(push_fields(&mut fields, call_site, tm, it.field_list())?);
+            (it.name(), it.generic_param_list(), it.where_clause(), AdtKind::Struct)
+        }
+        ast::Adt::Enum(it) => {
+            let mut default_variant = None;
+            for (i, variant) in it.variant_list().into_iter().flat_map(|it| it.variants()).enumerate()
+            {
+                if default_variant.is_none()
+                    && variant.attrs().any(|it| it.simple_name() == Some("default".into()))
+                {
+                    default_variant = Some(i);
+                }
+                let name = name_to_token(call_site, tm, variant.name())?;
+                let start = len_u32(fields.len());
+                let kind = push_fields(&mut fields, call_site, tm, variant.field_list())?;
+                variants.push(Variant { name, kind, start, end: len_u32(fields.len()) });
+            }
+            (
+                it.name(),
+                it.generic_param_list(),
+                it.where_clause(),
+                AdtKind::Enum { default_variant },
+            )
+        }
+        ast::Adt::Union(it) => {
+            (it.name(), it.generic_param_list(), it.where_clause(), AdtKind::Union)
+        }
+    };
+
+    let to_tt = |node: &syntax::SyntaxNode| {
+        syntax_bridge::syntax_node_to_token_tree(
+            node,
+            tm,
+            call_site,
+            DocCommentDesugarMode::ProcMacro,
+        )
+    };
+    let lifetimes = generic_param_list
+        .iter()
+        .flat_map(|param_list| param_list.lifetime_params())
+        .filter_map(|param| Some((to_tt(param.syntax()), to_tt(param.lifetime()?.syntax()))))
+        .collect(); // alloc: one tree per lifetime parameter; none without generics
+    let mut param_names: SmallVec<[Name; 4]> = SmallVec::new();
+    let param_types = generic_param_list
+        .into_iter()
+        .flat_map(|param_list| param_list.type_or_const_params())
+        .map(|param| {
+            let name = match param.name() {
+                Some(it) => {
+                    let name = it.as_name();
+                    if !param_names.contains(&name) {
+                        param_names.push(name);
+                    }
+                    to_tt(it.syntax())
+                }
+                None => tt::TopSubtree::empty(::tt::DelimSpan { open: call_site, close: call_site }),
+            };
+            let bounds = match &param {
+                ast::TypeOrConstParam::Type(it) => it.type_bound_list().map(|it| to_tt(it.syntax())),
+                ast::TypeOrConstParam::Const(_) => None,
+            };
+            let const_ty = if let ast::TypeOrConstParam::Const(param) = param {
+                let ty = param.ty().map(|ty| to_tt(ty.syntax())).unwrap_or_else(|| {
+                    tt::TopSubtree::empty(::tt::DelimSpan { open: call_site, close: call_site })
+                });
+                Some(ty)
+            } else {
+                None
+            };
+            AdtParam { name, const_ty, bounds }
+        })
+        .collect(); // alloc: one entry per type or const parameter; none without generics
+
+    let where_clause = match where_clause {
+        Some(w) => w.predicates().map(|it| to_tt(it.syntax())).collect(), // alloc: one tree per where predicate
+        None => Vec::new(), // alloc: none, an empty `Vec`
+    };
+
+    // For a generic parameter `T`, when shorthand associated type `T::Assoc` appears in field
+    // types (of any variant for enums), we generate trait bound for it. It sounds reasonable to
+    // also generate trait bound for qualified associated type `<T as Trait>::Assoc`, but rustc
+    // does not do that for some unknown reason.
+    //
+    // See the analogous function in rustc [find_type_parameters()] and rust-lang/rust#50730.
+    // [find_type_parameters()]: https://github.com/rust-lang/rust/blob/1.70.0/compiler/rustc_builtin_macros/src/deriving/generic/mod.rs#L378
+
+    // It's cumbersome to deal with the distinct structures of ADTs, so let's just get untyped
+    // `SyntaxNode` that contains fields and look for descendant `ast::PathType`s. Of note is that
+    // we should not inspect `ast::PathType`s in parameter bounds and where clauses. A type
+    // without type parameters has none, and its fields aren't walked.
+    let associated_types = if param_names.is_empty() {
+        Vec::new() // alloc: none, an empty `Vec`
+    } else {
+        let field_list = match adt {
+            ast::Adt::Enum(it) => it.variant_list().map(|list| list.syntax().clone()), // clone: a node handle, a non-atomic count
+            ast::Adt::Struct(it) => it.field_list().map(|list| list.syntax().clone()), // clone: a node handle, a non-atomic count
+            ast::Adt::Union(it) => it.record_field_list().map(|list| list.syntax().clone()), // clone: a node handle, a non-atomic count
+        };
+        field_list
+            .into_iter()
+            .flat_map(|it| it.descendants())
+            .filter_map(ast::PathType::cast)
+            .filter_map(|p| {
+                let name = p.path()?.qualifier()?.as_single_name_ref()?.as_name();
+                param_names.contains(&name).then_some(p)
+            })
+            .map(|it| to_tt(it.syntax()))
+            .collect() // alloc: one tree per `T::Assoc` path, only with type parameters
+    };
+    let name_token = name_to_token(call_site, tm, name)?;
+    if let Some(kind) = struct_fields {
+        variants.push(Variant { name: name_token.clone(), kind, start: 0, end: len_u32(fields.len()) }); // clone: a copy (symbol and span)
+    }
+    let packed = adt.attrs().any(|attr| attr_words_have(&attr, "repr", &["r"], "packed"));
+    Ok(BasicAdtInfo {
+        name: name_token,
+        shape: AdtShape { kind, variants, fields },
+        param_types,
+        lifetimes,
+        where_clause,
+        associated_types,
+        packed,
+        copy_bounds: false,
+    })
+}
+
+fn name_to_token(
+    call_site: Span,
+    token_map: &ExpansionSpanMap,
+    name: Option<ast::Name>,
+) -> Result<tt::Ident, ExpandError> {
+    let name = name.ok_or_else(|| {
+        debug!("parsed item has no name");
+        ExpandError::other(call_site, "missing name")
+    })?;
+    let span = token_map.span_at(name.syntax().text_range().start());
+
+    let name_token = tt::Ident::new(name.text(), span);
+    Ok(name_token)
+}
+```
+
+Why: `CoercePointee`'s editor form, unchanged, and the handle reads only it still uses. It
+needs the handle parse because the view parse can't read the tree the editor built. The texts
+are the current file's, with these differences:
+- `parse_adt_from_syntax` is renamed `parse_adt_from_handle` (the name is the view's now);
+- `attr_words_have` and the parse are `pub(super)`, for the tests;
+- `coerce_pointee_expand` is split into the parse and `coerce_pointee_derive`, whose body is
+  the old one from `let base = ..` on. It takes `adt: &ast::Adt`, so
+  `SyntaxEditor::with_ast_node(adt)` takes it without the `&`.
+
+The `// clone:` and `// alloc:` notes are kept as they were. (12) makes this file test-only and
+the reference.
+
+11.20 File `crates/hir-expand/src/builtin/derive_macro/reference.rs`. Old:
+
+```rust
+//! The derives as they were written before they wrote into one builder: nested `quote!`s, a
+//! `format!` per name. Kept for the tests only, which check the new code gives the same trees.
+```
+
+New:
+
+```rust
+//! The derives as they were written before they wrote into one builder: nested `quote!`s, a
+//! `format!` per name. Kept for the tests only, which check the new code gives the same trees.
+//! [`handle`] keeps `From` and `CoerceShared`'s target as they read the derive's own item
+//! through handles.
+```
+
+11.21 Same file, at its end. Old (the file's last lines, closing `partial_ord_expand`):
+
+```rust
+            quote! {span =>
+                fn partial_cmp(&self, other: &Self) -> #krate::option::Option<#krate::cmp::Ordering> {
+                    #body
+                }
+            }
+        },
+    )
+}
+```
+
+New:
+
+```rust
+            quote! {span =>
+                fn partial_cmp(&self, other: &Self) -> #krate::option::Option<#krate::cmp::Ordering> {
+                    #body
+                }
+            }
+        },
+    )
+}
+
+/// `From` and `CoerceShared`'s target reading the derive's own item through handles, as before
+/// they read it in place. Their parse is `editor.rs`' handle parse.
+pub(super) mod handle {
+    use blaze_mem::Frame;
+    use smallvec::SmallVec;
+    use span::Span;
+    use syntax::ast::{self, AstNode, FieldList, HasAttrs, HasName};
+    use syntax_bridge::DocCommentDesugarMode;
+
+    use crate::{
+        BuiltinError, ExpandError, ExpandResult,
+        builtin::{
+            derive_macro::{
+                FieldsKind, Variant, editor::parse_adt_from_handle, empty, in_group, write_derive,
+                write_impl,
+            },
+            quote::{dollar_crate, group},
+        },
+        tt,
+    };
+
+    /// `#[derive(From)]` of the item read through handles.
+    pub(in crate::builtin::derive_macro) fn from_derive<'f>(
+        frame: &'f Frame,
+        span: Span,
+        adt: &ast::Adt,
+        span_map: &span::SpanMap,
+    ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+        let refuse = |message: &str| {
+            let name = adt.name().map(|it| span_map.span_at(it.syntax().text_range().start()));
+            let error = BuiltinError::derive(message)
+                .note("`#[derive(From)]` can only be used on structs with exactly one field")
+                .also_at(name.into_iter().collect::<Box<[_]>>());
+            ExpandResult::new(empty(frame, span), error.at(span))
+        };
+        let strukt = match adt {
+            ast::Adt::Struct(it) => it,
+            ast::Adt::Enum(_) => return refuse("`#[derive(From)]` used on an enum"),
+            ast::Adt::Union(_) => return refuse("`#[derive(From)]` used on a union"),
+        };
+        let mut field_types: SmallVec<[Option<ast::Type>; 2]> = SmallVec::new();
+        match strukt.field_list() {
+            Some(FieldList::RecordFieldList(it)) => {
+                field_types.extend(it.fields().map(|it| it.ty()).take(2))
+            }
+            Some(FieldList::TupleFieldList(it)) => {
+                field_types.extend(it.fields().map(|it| it.ty()).take(2))
+            }
+            None => {}
+        }
+        let field_ty = match &field_types[..] {
+            [Some(ty)] => syntax_bridge::syntax_node_to_token_tree(
+                ty.syntax(),
+                span_map,
+                span,
+                DocCommentDesugarMode::ProcMacro,
+            ),
+            [None] => {
+                let err = ExpandError::other(span, "missing field type");
+                return ExpandResult::new(empty(frame, span), err);
+            }
+            [] => return refuse("`#[derive(From)]` used on a struct with no fields"),
+            _ => return refuse("`#[derive(From)]` used on a struct with multiple fields"),
+        };
+        let info = match parse_adt_from_handle(adt, span_map, span) {
+            Ok(it) => it,
+            Err(err) => return ExpandResult::new(empty(frame, span), err),
+        };
+        let krate = &dollar_crate(span);
+        let field_ty = &field_ty;
+        let record_field = match info.shape.variants.first() {
+            Some(Variant { kind: FieldsKind::Record, .. }) => info.shape.fields.first(),
+            _ => None,
+        };
+        let body = group(span, |b| match record_field {
+            Some(field) => quote_into!(b, span => Self { #field : value }),
+            None => quote_into!(b, span => Self ( value )),
+        });
+        let trait_path =
+            group(span, |b| quote_into!(b, span => #krate::convert::From<#field_ty>));
+        let no_extra_params = group(span, |_| {});
+        ExpandResult::ok(write_derive(frame, span, |b| {
+            write_impl(b, span, &info, &trait_path, false, &no_extra_params, |b| {
+                in_group(b, span, |b| {
+                    quote_into!(b, span =>
+                        #[inline]
+                        fn from(value : #field_ty) -> Self { #body }
+                    )
+                })
+            })
+        }))
+    }
+
+    /// The tokens of the struct's one `#[coerce_shared(Target)]`, read through handles.
+    pub(in crate::builtin::derive_macro) fn coerce_shared_target_tokens(
+        span: Span,
+        strukt: &ast::Struct,
+    ) -> Option<tt::TopSubtree> {
+        let mut attrs = strukt
+            .attrs()
+            .filter(|attr| attr.as_simple_call().is_some_and(|(name, _)| name == "coerce_shared"));
+        let attr = attrs.next()?;
+        if attrs.next().is_some() {
+            return None;
+        }
+        let (_, target_tokens) = attr.as_simple_call()?;
+        let l_paren = target_tokens.l_paren_token()?;
+        let r_paren = target_tokens.r_paren_token()?;
+
+        let mut span_map = span::SpanMap::empty();
+        span_map.push(target_tokens.syntax().text_range().start(), span);
+        span_map.push(target_tokens.syntax().text_range().end(), span);
+
+        let remove = syntax_bridge::Removed::<_>::from_iter([l_paren.into(), r_paren.into()]);
+        Some(syntax_bridge::syntax_node_to_token_tree_modified(
+            target_tokens.syntax(),
+            &span_map,
+            syntax_bridge::Appended::<_, std::alloc::Global>::default(),
+            remove,
+            span,
+            DocCommentDesugarMode::ProcMacro,
+            |_, _| (true, syntax_bridge::Inserted::new()),
+        ))
+    }
+}
+```
+
+Why: the reference the new tests compare against. These are the old bodies, test-only, and they
+change only in their names. The handle parse they call is `editor.rs`' (11.19).
+`coerce_shared_target_tokens` is the old `coerce_shared_target` without the reparse check, which
+stays in `derive_macro.rs` over the view (11.17).
+
+11.22 File `crates/hir-expand/src/builtin/derive_macro/tests.rs`. Old:
+
+```rust
+use syntax::{
+    AstNode, SourceFile, TextRange, TextSize, ast,
+    view::{self, AstNode as _},
+};
+```
+
+New:
+
+```rust
+use syntax::{
+    AstNode, Parse, SourceFile, TextRange, TextSize, ast,
+    view::{self, AstNode as _},
+};
+```
+
+11.23 Old:
+
+```rust
+    map.finish();
+    (adt, map)
+}
+```
+
+New:
+
+```rust
+    map.finish();
+    (adt, map)
+}
+
+/// `text` parsed as [`item`] parses it: the same tree, so the same ranges and span map.
+fn parsed(text: &str) -> Parse<SourceFile> {
+    SourceFile::parse(text, Edition::CURRENT)
+}
+
+/// The first item of `parse`, read in place.
+fn adt_view(parse: &Parse<SourceFile>) -> view::Adt<'_> {
+    parse.root().descendants().find_map(view::Adt::cast).expect("an item")
+}
+
+/// Items for `CoercePointee`: each of its refusals in rustc's order, and each shape of bound
+/// and `where` predicate its rewrite reads (each arm of `substitute_type_in_bound`).
+const POINTEE_ITEMS: &[&str] = &[
+    "#[repr(transparent)] enum E<T: ?Sized> { A(Box<T>) }",
+    "#[repr(transparent)] union U<T: ?Sized> { a: Box<T> }",
+    "#[repr(transparent)] struct P<T: ?Sized>;",
+    "#[repr(transparent)] struct P<T: ?Sized> {}",
+    "#[repr(transparent)] struct P<T: ?Sized>();",
+    "#[repr(transparent)] struct P<'a>(&'a u8);",
+    "#[repr(transparent)] struct P<const N: usize>([u8; N]);",
+    "#[repr(transparent)] struct P<T: ?Sized, U>(Box<T>, U);",
+    "#[repr(transparent)] struct P<#[pointee] T: ?Sized = u8, #[pointee] U: ?Sized>(Box<T>, Box<U>);",
+    "#[repr(transparent)] struct P<#[pointee] T, U: ?Sized>(Box<T>, U);",
+    "#[repr(transparent)] struct P<T: Sized>(Box<T>);",
+    "#[repr(transparent)] struct P<T: ?Send>(Box<T>);",
+    "#[repr(transparent)] struct P<T>(Box<T>) where U: ?Sized;",
+    "#[repr(transparent)] struct P<T: ?marker::Sized>(Box<T>);",
+    "#[repr(C)] struct P<T: ?Sized>(Box<T>);",
+    "struct P<T: ?Sized>(Box<T>);",
+    "#[repr(transparent)] struct Ptr<T: ?Sized>(Box<T>);",
+    "#[repr(transparent)] pub struct Ptr<T: ?Sized> { ptr: Box<T> }",
+    "#[repr(transparent)] struct Ptr<'a, T: ?Sized, const N: usize>(&'a T) where T: Tr;",
+    "#[repr(transparent)] struct Ptr<T>(Box<T>) where T: ?Sized,;",
+    "#[repr(transparent)] struct Ptr<T: ?core::marker::Sized>(Box<T>);",
+    "#[repr(transparent)] struct Ptr<T>(Box<T>) where T: ?::std::marker::Sized;",
+    "#[repr(transparent)] struct r#Ptr<r#T: ?Sized>(Box<r#T>);",
+    "#[repr(transparent)] struct Ptr<#[cfg(all())] 'a, #[pointee] T: ?Sized + Tr<T> + 'static = u8, U: 'a + Tr<T> + Send, V, const N: usize>(&'a T, U, V);",
+    "#[repr(transparent)] struct Ptr<#[pointee] T: ?Sized, U: Tr<[T; 1]> + Tr<dyn Tr<T> + 'static> + Tr<fn(T, u8) -> T> + Tr<for<'x> fn(&'x T)> + Tr<impl Tr<T>> + Tr<(T)> + Tr<*const T> + Tr<&'static mut T> + Tr<[T]> + Tr<(T, u8)> + Tr<_> + Tr<m!(T)> + Tr<!> + Tr<T<u8>> + Tr<::T> + Tr<T::Assoc> + Tr<<T as Tr>::X> + Tr<Vec<Vec<T>>> + Fn(T) -> T>(Box<T>, U);",
+    "#[repr(transparent)] struct Ptr<'a, #[pointee] T: ?Sized, U, V>(&'a T, U, V) where U: Tr<V> + Tr<T>, Companion<T>: Tr<T>, T: Tr<T> + ?Sized, for<'x> &'x T: Debug, 'a: 'a, [T; 4]: Copy, (T, U): Tr, *const T: Tr, fn(T) -> T: Tr, Box<dyn Tr<T> + 'a>: Tr, Vec<U>: Tr<T>, Vec<U>: Send, [U]: Tr<T>, U: Tr<T> +, !: Tr<T>, for<'x> Vec<&'x U>: Tr<T>, T::Assoc: Tr<T>, <U as Tr<T>>::X: Tr;",
+];
+```
+
+11.24 Old:
+
+```rust
+/// A derive's old expansion and its new one, built in the frame.
+type Derive = for<'f> fn(
+    &'f Frame,
+    &ItemSource<'_>,
+    Span,
+) -> (ExpandResult<tt::TopSubtree>, ExpandResult<tt::TopSubtree<&'f Frame>>);
+
+fn derives() -> [(&'static str, Derive); 12] {
+    macro_rules! pair {
+        ($old:ident, $new:ident $(, $arg:expr)?) => {
+            |frame: &Frame, input: &ItemSource<'_>, span: Span| {
+                let dummy = tt::TopSubtree::empty(tt::DelimSpan::from_single(span));
+                let info = super::parse_adt_from_syntax(input.0, input.1, span);
+```
+
+New:
+
+```rust
+/// A derive's old expansion and its new one, built in the frame from the item read in place.
+type Derive = for<'f> fn(
+    &'f Frame,
+    &ItemSource<'_>,
+    view::Adt<'_>,
+    Span,
+) -> (ExpandResult<tt::TopSubtree>, ExpandResult<tt::TopSubtree<&'f Frame>>);
+
+fn derives() -> [(&'static str, Derive); 12] {
+    macro_rules! pair {
+        ($old:ident, $new:ident $(, $arg:expr)?) => {
+            |frame: &Frame, input: &ItemSource<'_>, adt: view::Adt<'_>, span: Span| {
+                let dummy = tt::TopSubtree::empty(tt::DelimSpan::from_single(span));
+                let info = super::parse_adt_from_syntax(adt, input.1, span);
+```
+
+11.25 Old:
+
+```rust
+    for text in ITEMS {
+        let (adt, map) = item(text);
+        let input = ItemSource(&adt, &map);
+        for (name, derive) in derives() {
+            let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+            let (old, new) = derive(frame, &input, span);
+```
+
+New:
+
+```rust
+    for text in ITEMS {
+        let (adt, map) = item(text);
+        let parse = parsed(text);
+        let input = ItemSource(&adt, &map);
+        for (name, derive) in derives() {
+            let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+            let (old, new) = derive(frame, &input, adt_view(&parse), span);
+```
+
+11.26 Old (`from_matches_nested_quotes`' last cases and loop):
+
+```rust
+        "struct None;",
+        "enum E { A(u8) }",
+    ] {
+        let (adt, map) = item(text);
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let new = super::from_derive(frame, span, &adt, &map);
+        let old = reference_from(frame, span, &adt, &map);
+        assert_same(&format!("From of `{text}`"), &old, &new);
+    }
+```
+
+New:
+
+```rust
+        "struct None;",
+        "enum E { A(u8) }",
+        "union U { a: u8 }",
+        "struct Missing { a }",
+        "struct TwoRecord { a: u8, b: u8 }",
+        "enum Empty {}",
+        "struct Generic<T: Copy, const N: usize>([T; N]) where T: Send;",
+    ] {
+        let (adt, map) = item(text);
+        let parse = parsed(text);
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let new = super::from_derive(frame, span, adt_view(&parse), &map);
+        let handle = reference::handle::from_derive(frame, span, &adt, &map);
+        assert_same(&format!("From of `{text}`, against the handle form"), &handle, &new);
+        let old = reference_from(frame, span, &adt, &map);
+        assert_same(&format!("From of `{text}`"), &old, &new);
+    }
+```
+
+11.27 Old:
+
+```rust
+        let (adt, map) = item(text);
+        let info = super::parse_adt_from_syntax(&adt, &map, span);
+```
+
+New:
+
+```rust
+        let (_, map) = item(text);
+        let parse = parsed(text);
+        let info = super::parse_adt_from_syntax(adt_view(&parse), &map, span);
+```
+
+11.28 Old (in `reference_from`):
+
+```rust
+    let refused = || {
+        super::from_derive(frame, span, adt, map).map(|it| tt::TopSubtree::from_subtree(it.view()))
+    };
+```
+
+New:
+
+```rust
+    let refused = || {
+        reference::handle::from_derive(frame, span, adt, map)
+            .map(|it| tt::TopSubtree::from_subtree(it.view()))
+    };
+```
+
+11.29 Old:
+
+```rust
+        _ => return refused(),
+    };
+    let field_ty = syntax_bridge::syntax_node_to_token_tree(
+        ty.expect("a type").syntax(),
+```
+
+New:
+
+```rust
+        _ => return refused(),
+    };
+    let Some(ty) = ty else { return refused() };
+    let field_ty = syntax_bridge::syntax_node_to_token_tree(
+        ty.syntax(),
+```
+
+11.30 Old (in `coerce_pointee_impls_match_nested_quotes`):
+
+```rust
+    let (adt, map) = item(text);
+    let self_for_traits = quote! {span => Ptr<'a, __S, N> };
+```
+
+New:
+
+```rust
+    let (adt, map) = item(text);
+    let parse = parsed(text);
+    let self_for_traits = quote! {span => Ptr<'a, __S, N> };
+```
+
+and old:
+
+```rust
+        &super::parse_adt_from_syntax(&adt, &map, span).expect("an item"),
+```
+
+New:
+
+```rust
+        &super::parse_adt_from_syntax(adt_view(&parse), &map, span).expect("an item"),
+```
+
+11.31 Old (in `shape_is_one_field_list`):
+
+```rust
+        let (adt, map) = item(text);
+        let new = super::parse_adt_from_syntax(&adt, &map, span).expect("an item");
+```
+
+New:
+
+```rust
+        let (_, map) = item(text);
+        let parse = parsed(text);
+        let new = super::parse_adt_from_syntax(adt_view(&parse), &map, span).expect("an item");
+```
+
+11.32 Old (in `derives_copy_reads_words_as_the_text_did`):
+
+```rust
+                .any(|attr| super::attr_words_have(&attr, "derive", &[], "Copy")),
+```
+
+New:
+
+```rust
+                .any(|attr| super::editor::attr_words_have(&attr, "derive", &[], "Copy")),
+```
+
+11.33 Old (in `a_derive_allocates_nothing_per_field`):
+
+```rust
+        let (adt, map) = item(&text);
+        let span = call_site();
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let run = || {
+            super::clone_derive(frame, span, super::parse_adt_from_syntax(&adt, &map, span), false)
+        };
+```
+
+New:
+
+```rust
+        let (_, map) = item(&text);
+        let parse = parsed(&text);
+        let adt = adt_view(&parse);
+        let span = call_site();
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let run = || {
+            super::clone_derive(frame, span, super::parse_adt_from_syntax(adt, &map, span), false)
+        };
+```
+
+11.34 Old (in `derived_impls_get_the_items_lint_and_stability_attributes`):
+
+```rust
+    let (adt, map) = item(text);
+    let input = item_input(&adt, &map);
+    let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+    let derive = || super::partial_eq_derive(frame, span, super::parse_adt_from_syntax(&adt, &map, span));
+```
+
+New:
+
+```rust
+    let (adt, map) = item(text);
+    let parse = parsed(text);
+    let input = item_input(&adt, &map);
+    let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+    let derive = || {
+        super::partial_eq_derive(frame, span, super::parse_adt_from_syntax(adt_view(&parse), &map, span))
+    };
+```
+
+11.35 Old (in `derived_impls_of_an_item_without_them_are_unchanged`):
+
+```rust
+        let (adt, map) = item(text);
+        let input = item_input(&adt, &map);
+        let source = ItemSource(&adt, &map);
+        for (name, derive) in derives() {
+            let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+            let (_, plain) = derive(frame, &source, span);
+            let (_, again) = derive(frame, &source, span);
+```
+
+New:
+
+```rust
+        let (adt, map) = item(text);
+        let parse = parsed(text);
+        let input = item_input(&adt, &map);
+        let source = ItemSource(&adt, &map);
+        for (name, derive) in derives() {
+            let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+            let (_, plain) = derive(frame, &source, adt_view(&parse), span);
+            let (_, again) = derive(frame, &source, adt_view(&parse), span);
+```
+
+Why (11.34, 11.35): the two tests written after (10) call the view parse and the `Derive` that
+takes the view (11.24).
+
+11.36 At the end of the file, after `derived_impls_of_an_item_without_them_are_unchanged`'s closing `}`, add:
+
+```rust
+
+/// The parse of the item read in place against the handle form's: field by field.
+fn assert_same_info(what: &str, old: &super::BasicAdtInfo, new: &super::BasicAdtInfo) {
+    assert_eq!(old.name, new.name, "{what}: the name");
+    assert_eq!(format!("{:?}", old.shape), format!("{:?}", new.shape), "{what}: the shape");
+    assert_eq!(old.param_types.len(), new.param_types.len(), "{what}: the parameters");
+    for (old, new) in old.param_types.iter().zip(&new.param_types) {
+        assert!(old.name == new.name, "{what}: a parameter's name");
+        assert!(old.const_ty == new.const_ty, "{what}: a parameter's type");
+        assert!(old.bounds == new.bounds, "{what}: a parameter's bounds");
+    }
+    assert!(old.lifetimes == new.lifetimes, "{what}: the lifetimes");
+    assert!(old.where_clause == new.where_clause, "{what}: the `where` clause");
+    assert!(old.associated_types == new.associated_types, "{what}: the associated types");
+    assert_eq!((old.packed, old.copy_bounds), (new.packed, new.copy_bounds), "{what}");
+}
+
+#[test]
+fn parse_adt_matches_the_handle_form() {
+    let span = call_site();
+    for text in ITEMS.iter().chain(POINTEE_ITEMS) {
+        let (adt, map) = item(text);
+        let parse = parsed(text);
+        let old = super::editor::parse_adt_from_handle(&adt, &map, span);
+        let new = super::parse_adt_from_syntax(adt_view(&parse), &map, span);
+        match (old, new) {
+            (Ok(old), Ok(new)) => assert_same_info(text, &old, &new),
+            (Err(old), Err(new)) => assert_eq!(old, new, "{text}"),
+            (old, new) => panic!("{text}: {:?} against {:?}", old.err(), new.err()),
+        }
+    }
+}
+
+#[test]
+fn coerce_shared_target_matches_the_handle_form() {
+    let span = call_site();
+    for text in [
+        "#[coerce_shared(Ref<'a, T>)] struct Mut<'a, T>(&'a mut T);",
+        "#[coerce_shared(::core::marker::PhantomData<&'a ()>)] struct Mut<'a>;",
+        "#[coerce_shared(Ref)] #[coerce_shared(Other)] struct Mut;",
+        "#[coerce_shared] struct Mut;",
+        "#[coerce_shared = \"Ref\"] struct Mut;",
+        "#[coerce_shared()] struct Mut;",
+        "#[coerce_shared(a b, c)] struct Mut;",
+        "struct Mut;",
+    ] {
+        let (adt, _) = item(text);
+        let parse = parsed(text);
+        let (ast::Adt::Struct(old), view::Adt::Struct(new)) = (&adt, adt_view(&parse)) else {
+            panic!("{text}: a struct")
+        };
+        let old = reference::handle::coerce_shared_target_tokens(span, old);
+        let new = super::coerce_shared_target_tokens(span, new);
+        assert_eq!(old.is_some(), new.is_some(), "{text}");
+        if let (Some(old), Some(new)) = (old, new) {
+            assert_same(text, &ExpandResult::ok(old), &ExpandResult::ok(new));
+        }
+    }
+}
+
+/// Reading the item in place allocates no more than reading it through handles did.
+#[test]
+fn the_item_read_in_place_allocates_no_more() {
+    let span = call_site();
+    let wide = wide_struct(256);
+    for text in ITEMS.iter().copied().chain([wide.as_str()]) {
+        let (adt, map) = item(text);
+        let parse = parsed(text);
+        let view = adt_view(&parse);
+        let handle = || super::editor::parse_adt_from_handle(&adt, &map, span).is_ok();
+        let in_place = || super::parse_adt_from_syntax(view, &map, span).is_ok();
+        assert_eq!(handle(), in_place(), "{text}");
+        let (_, old) = blaze_alloc_count::measure(handle);
+        let (_, new) = blaze_alloc_count::measure(in_place);
+        assert!(
+            new.allocations <= old.allocations,
+            "`{text}`: {} allocations in place, {} through handles",
+            new.allocations,
+            old.allocations
+        );
+    }
+}
+```
+
+Why (11.22-11.36): every test runs the derives over the view. The new tests compare each moved
+function with its handle form on every fixture. The first run of each warms the interner before
+the allocations are measured. `CoercePointee` keeps its tests as they are
+(`coerce_pointee_impls_match_nested_quotes` now reads the item through the view parse). The
+comparison of its token build with the editor is in (12), not here.
+
+What the tests prove:
+- `derives_match_nested_quotes` and `derived_impls_of_an_item_without_them_are_unchanged` run
+  every derive over the view, against the nested-quote reference.
+- `parse_adt_matches_the_handle_form` compares the view parse with the handle parse field by
+  field, and their errors. It runs on `ITEMS` and `POINTEE_ITEMS`, which has each kind of
+  bound, predicate, raw name and malformed item the parse reads.
+- `from_matches_nested_quotes` compares `From` with its handle form and with the nested quotes,
+  on every refusal.
+- `coerce_shared_target_matches_the_handle_form` covers one and two attributes, a bare one, a
+  `=` one, an empty one, junk tokens and a path with generics.
+- `the_item_read_in_place_allocates_no_more` checks that the view parse allocates no more than
+  the handle parse.
+- `derives_copy_reads_words_as_the_text_did` checks the handle `attr_words_have` (now in
+  `editor.rs`) against the view form.
+
+Status: open (frontend-tree-move-expand-derive; told db-expand-next2 and db-expand-views by tmux).
+> routed by db-expand (db-expand-next2, 2026-10-29 23:20) to a new child, `db-expand-derive` (brief `~/restart-2026-10-28/briefs/v2/db-expand-derive.md`). It holds `derive_macro.rs` and `derive_macro/`, keeps §11's `with_item_attrs`, and then checks T1 (d). (12) goes to it once filed.
+> applied by db-expand (db-expand-derive, 23:27): 11.1 to 11.36, all four files together. `editor.rs` is 11.19's text exactly; before writing it I diffed that text against the code it moves, and the only differences are the three the section names. `rg` over `crates/` found no caller outside `derive_macro` of `parse_adt_from_syntax`, `to_adt_syntax`, `attr_words_have`, `type_param_span`, `coerce_pointee_expand` or `push_fields` (blaze-diagnostics' `type_param_span` is its own). Two places where the old texts and the tree differed, with the section's intent applied around them: 11.1's import block leaves the file's `use std::ops::Range;` (above the old text, used by `Variant::fields`) as it is; 11.34 and 11.35 edit the §11 tests (`derived_impls_get_the_items_lint_and_stability_attributes`, `derived_impls_of_an_item_without_them_are_unchanged`), which keep every assertion and now read the item through the view parse. `with_item_attrs` is unchanged. No output changes: `call_input` in place of `syntax_node_to_token_tree`, `span_for` in place of `span_at(start)`, `AtSpan` in place of the two-entry map, and the three item errors in the same order. Not built (the lane runs no build); hot lint finds nothing in `derive_macro.rs` or `editor.rs`. mem-db-def-expand T1 (d) is still not applied: it needs E11's framed shapes (`parse_adt_from_syntax(frame, ..)`, `BasicAdtInfo<'f>`), which were waiting on this move and are now unblocked (see the `>` line under T1 there). (12) is left alone until it is routed.
+> forwarded to db-expand-derive (requests, pass 37; it holds `derive_macro.rs` and `derive_macro/` and applies 11.1-11.36; told by tmux)
+
+## frontend-tree: hir-expand builtin/derive_macro.rs: onto views (12)
+
+> open (frontend-tree-move-expand-derive, 2026-10-29): needs (11) applied first. Every old text below is against the files as (11) leaves them. db-expand-derive's tree matched that state when this was filed (`derive_macro.rs`, `reference.rs` and `editor.rs` byte for byte; `tests.rs` was mid-edit, and 12.6 only appends to it). Told db-expand-derive, db-expand-views, db-expand-next2 and frontend-tree-move-expand-next1 by tmux.
+> routed by db-expand (db-expand-next2, 2026-10-29 23:27) to `db-expand-derive`, after (11). db-audit-other, which db-expand-views had passed (11) and (12) to, is out of hir-expand and takes neither. The "Not fixed here" binder loss goes to db-expand-derive after (12): copy the whole predicate, binder included, as rustc's `coerce_pointee.rs` does, with a test on `for<'x> Vec<&'x U>: Tr<T>` (superset-of-rust: a known divergence isn't left open).
+> applied by db-expand (db-expand-derive, 23:41): 12.1 to 12.8 as written (the harness case was already in the tree, equal to 12.8), then checked against rustc's `compiler/rustc_builtin_macros/src/deriving/coerce_pointee.rs` at the pin (nightly-2026-10-27, `16d1ffac17ad8b739e32483ac2e65fe7e1804977`) and brought to it. What changes in the output, all toward rustc: (a) copied tokens keep the item's spans and so its edition (12's fix: a 2015 item's `async`, `dyn` and `gen` stay names); `__S`, `Unsize`'s path and the `:` and `+` written between are at the derive's span. (b) A `where` predicate that names the pointee anywhere (binder, type or any bound) is copied whole, binder and every bound included; one that doesn't is left out, so no more `Vec<U>:` with no bounds, and `for<'x> Vec<&'x U>: Tr<T>` keeps its `for<'x>` (the binder loss). (c) A type parameter gets a predicate only when one of its bounds names the pointee: no empty `U:`. (d) Only rustc's `is_simple_path` is the pointee (one segment, no arguments, no leading `::`), so `T<u8>` and `::T` are left alone. Every type inside is walked: `Fn(T) -> T`'s arguments and return type, associated-item arguments and bounds (`Tr<A = T>`, `Tr<A: Tr<T>>`), `<T as Tr<T>>::X`'s self type and trait, and `for<..>` binder parameters. A bound's trait path is not itself a type, as in rustc. (e) `?::Sized` no longer counts as `?Sized`: after a leading `::` only `core::marker::Sized` and `std::marker::Sized` do, as rustc's `is_sized_marker` has it. (f) `#[pointee(..)]` marks the pointee as `#[pointee]` does (`has_name`). (g) `r#T` and `T` are the same parameter. Refusals, their order, messages and spans are unchanged and match rustc's. Tests: `POINTEE_WALK_ITEMS` (the two big fixtures, moved out of `POINTEE_ITEMS`) are left out of `coerce_pointee_matches_the_editor`, since the editor reads them otherwise; new `coerce_pointee_substitutes_as_rustc` covers (b) to (g), including `for<'x> Vec<&'x U>: Tr<T>`. `coerce_pointee_keeps_a_2015_items_names` now counts 24 (`U: dyn::Tr<__S> + async::Tr<u8>` is copied whole). Still different from rustc, not fixed here: a type inside a const argument's expression isn't substituted (only reachable under `generic_const_exprs`); there is no `CoercePointeeValidated` impl (rustc emits one, and coherence checks it); no `NonGenericPointee` errors for `#[pointee]` outside a type parameter (an `ExpandError` holds one error); and the TooManyPointees "another" label is missing. These are filed under `## db-expand-derive: CoercePointee parts rustc has and blaze doesn't` at the end of this file. Hot lint: nothing new (only `reference.rs`'s older test-only findings). Not built: this phase has no builds.
+
+`CoercePointee` written as a direct token build, with no `SyntaxEditor`, no `make` and no
+reparse. This is a correctness change, and its output differs from today's on purpose:
+
+- Today every token of the impls is at the derive's span. The editor reparses the predicates as
+  text in `Edition::CURRENT` (`make::where_pred` uses `ast_from_text`), and blaze parses macro
+  output with each token's own edition (`token_tree_to_syntax_node(.., |ctx| ctx.edition(db))`).
+  A 2015 item whose predicates name `async`, `dyn` or `gen` therefore gets impls that read them
+  as 2024 keywords.
+- rustc (`rustc_builtin_macros/src/deriving/coerce_pointee.rs`; the pinned nightly is
+  `1.101.0-nightly (16d1ffac1 2026-10-26)`) builds the impls from `generics.clone()` and
+  clones of the `where` predicates (`bound.clone()`, pushed with `predicate.span`). The self
+  type's arguments are `cx.ty_ident(p.span(), p.ident)`. Only what rustc adds is made at the
+  derive's span: `__S` (`cx.ty_ident(span, Ident::new(sym::__S, span))`, which also replaces
+  each pointee path) and `core::marker::Unsize` (`path!(span, ..)`). Every token taken from the
+  item keeps its own span, and so its edition and hygiene.
+- The token build does the same. Each token copied from the item (the struct's generics and
+  predicates through `parse_adt_from_syntax` with the item's span map, the predicates it
+  rewrites, and the self type's names) is at its span in `span_map`. `__S`, the `Unsize` path
+  and the `:`, `+`, `<`, `,` and `>` written between are at `span`.
+
+What does not change: the tokens, their spacing and their order, and the errors. That is
+checked against the editor version, kept test-only as `derive_macro/editor.rs`, on every
+current-edition fixture (`coerce_pointee_matches_the_editor`, with spans set aside). The spans
+are checked on their own (`coerce_pointee_keeps_the_items_spans`), the 2015 names by
+`coerce_pointee_keeps_a_2015_items_names`, and rustc's behavior by the new frontend harness case
+`harness/v2/frontend/cases/infer/118-coerce-pointee-2015-predicates.rs` (12.8). The case has not
+been run.
+
+Not fixed here, and kept the same as the editor: for a `where` predicate whose type does not
+name the pointee but whose bounds do, blaze writes `ty: bounds that name it`, which drops a
+`for<'x>` binder (fixture `for<'x> Vec<&'x U>: Tr<T>`). rustc copies the whole predicate.
+
+12.1 File `crates/hir-expand/src/builtin/derive_macro.rs`. Old:
+
+```rust
+use blaze_mem::Frame;
+use intern::{Symbol, sym};
+```
+
+New:
+
+```rust
+use blaze_mem::Frame;
+use either::Either;
+use intern::{Symbol, sym};
+use itertools::Itertools;
+use parser::SyntaxKind;
+```
+
+Old:
+
+```rust
+use syntax::{
+    Parse, SyntaxNode, TextRange,
+    view::{
+        self as ast, AstNode, FieldList, HasAttrs, HasGenericParams, HasModuleItem, HasName,
+        HasTypeBounds,
+    },
+};
+use syntax::view;
+
+use editor::coerce_pointee_expand;
+
+mod editor;
+#[cfg(test)]
+mod reference;
+```
+
+New:
+
+```rust
+use syntax::{
+    Parse, SyntaxNode, TextRange, TextSize,
+    view::{
+        self as ast, AstNode, FieldList, HasAttrs, HasGenericArgs, HasGenericParams,
+        HasModuleItem, HasName, HasTypeBounds,
+    },
+};
+use syntax::view;
+
+#[cfg(test)]
+mod editor;
+#[cfg(test)]
+mod reference;
+```
+
+12.2 Same file, at its end. Old (the last lines of `write_coerce_pointee_impls`, the file's last
+function after (11)):
+
+```rust
+        in_group(b, span, |b| {
+            write_impl(b, span, info, &coerce_unsized, false, &added_param, |b| {
+                empty_group(b, span)
+            })
+        });
+    })
+}
+```
+
+New:
+
+```rust
+        in_group(b, span, |b| {
+            write_impl(b, span, info, &coerce_unsized, false, &added_param, |b| {
+                empty_group(b, span)
+            })
+        });
+    })
+}
+
+/// Each token at `span` but with its own range: where in the item a converted token was, which
+/// is how [`write_copied`] finds the pointee's paths and the token's span in the item.
+struct AtRange(Span);
+
+impl SpanMapper for AtRange {
+    fn span_for(&self, range: TextRange) -> Span {
+        Span { range, ..self.0 }
+    }
+}
+
+/// rustc's `CoercePointee` errors are E0802.
+fn pointee_error(message: impl Into<Box<str>>) -> BuiltinError {
+    BuiltinError::derive(message).code(802)
+}
+
+/// rustc's `GenericParam::span` of a type parameter: its name, to the end of its default if it
+/// has one.
+fn type_param_span(param: ast::TypeParam<'_>) -> Option<TextRange> {
+    let name = param.name()?.syntax().text_range();
+    Some(match param.default_type() {
+        Some(ty) => name.cover(ty.syntax().text_range()),
+        None => name,
+    })
+}
+
+/// Whether `bound` is `?Sized`, `?core::marker::Sized` or `?std::marker::Sized`.
+fn is_maybe_sized_bound(bound: ast::TypeBound<'_>) -> bool {
+    if bound.question_mark_token().is_none() {
+        return false;
+    }
+    let Some(ast::Type::PathType(ty)) = bound.ty() else { return false };
+    let Some(path) = ty.path() else { return false };
+    let segments_eq = |expected: &[&str]| {
+        path.segments().zip_longest(expected.iter().copied()).all(|value| {
+            value.both().is_some_and(|(segment, expected)| {
+                segment.name_ref().is_some_and(|name| name.text() == expected)
+            })
+        })
+    };
+    segments_eq(&["Sized"])
+        || segments_eq(&["core", "marker", "Sized"])
+        || segments_eq(&["std", "marker", "Sized"])
+}
+
+fn coerce_pointee_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    span: Span,
+    tt: &tt::TopSubtree,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let (parsed, span_map) = parse_item(db, tt);
+    let adt = match adt_of(&parsed, span) {
+        Ok(it) => it,
+        Err(err) => {
+            return ExpandResult::new(empty(frame, span), err);
+        }
+    };
+    coerce_pointee_derive(frame, span, adt, &span_map)
+}
+
+/// rustc's `CoercePointee` (`deriving/coerce_pointee.rs`): its checks in its order, then the
+/// `DispatchFromDyn` and `CoerceUnsized` impls of the struct with `__S` in the pointee's place.
+/// rustc's impls are clones of the item's generics and predicates, so here too every token taken
+/// from the item keeps its span in `span_map`, and with it its edition and hygiene; only what the
+/// impls add is at `span`.
+fn coerce_pointee_derive<'f>(
+    frame: &'f Frame,
+    span: Span,
+    adt: ast::Adt<'_>,
+    span_map: &span::SpanMap,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let span_of = |range: TextRange| {
+        let first = span_map.span_at(range.start());
+        match range.end().checked_sub(TextSize::new(1)).filter(|_| !range.is_empty()) {
+            Some(last) => first.cover(span_map.span_at(last)),
+            None => first,
+        }
+    };
+    let refuse = |error: BuiltinError, at: Span| {
+        ExpandResult::new(empty(frame, span), error.at(at))
+    };
+    let ast::Adt::Struct(strukt) = adt else {
+        return refuse(
+            pointee_error(
+                "`CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`",
+            ),
+            span,
+        );
+    };
+    let has_at_least_one_field = strukt
+        .field_list()
+        .map(|it| match it {
+            ast::FieldList::RecordFieldList(it) => it.fields().next().is_some(),
+            ast::FieldList::TupleFieldList(it) => it.fields().next().is_some(),
+        })
+        .unwrap_or(false);
+    if !has_at_least_one_field {
+        return refuse(
+            pointee_error(
+                "`CoercePointee` can only be derived on `struct`s with at least one field",
+            ),
+            span,
+        );
+    }
+    let type_params = || {
+        strukt.generic_param_list().into_iter().flat_map(|generics| {
+            generics.generic_params().filter_map(|param| match param {
+                ast::GenericParam::TypeParam(param) => Some(param),
+                _ => None,
+            })
+        })
+    };
+    let Some(first) = type_params().next() else {
+        return refuse(
+            pointee_error(
+                "`CoercePointee` can only be derived on `struct`s that are generic over at least one type",
+            ),
+            span,
+        );
+    };
+    let (pointee, pointee_idx) = if type_params().nth(1).is_none() {
+        // The only type parameter is the pointee, marked `#[pointee]` or not.
+        (first, 0)
+    } else {
+        let mut pointees = type_params().enumerate().filter(|(_, param)| {
+            param.attrs().any(|attr| attr.as_simple_atom() == Some("pointee"))
+        });
+        match (pointees.next(), pointees.next()) {
+            (Some((pointee_idx, pointee)), None) => (pointee, pointee_idx),
+            (None, _) => {
+                return refuse(
+                    pointee_error(
+                        "exactly one generic type parameter must be marked \
+                                as `#[pointee]` to derive `CoercePointee` traits",
+                    ),
+                    span,
+                );
+            }
+            (Some((_, one)), Some(_)) => {
+                return refuse(
+                    pointee_error(
+                        "only one type parameter can be marked as `#[pointee]` \
+                                when deriving `CoercePointee` traits",
+                    ),
+                    type_param_span(one).map_or(span, span_of),
+                );
+            }
+        }
+    };
+    let (Some(struct_name), Some(pointee_name)) = (strukt.name(), pointee.name()) else {
+        return ExpandResult::new(empty(frame, span), ExpandError::other(span, "invalid item"));
+    };
+    let pointee_text = pointee_name.text();
+    let maybe_sized = pointee
+        .type_bound_list()
+        .is_some_and(|bounds| bounds.bounds().any(is_maybe_sized_bound))
+        || strukt.where_clause().is_some_and(|where_clause| {
+            where_clause.predicates().any(|pred| {
+                let Some(ast::Type::PathType(ty)) = pred.ty() else { return false };
+                let is_pointee = ty.path().is_some_and(|path| {
+                    path.as_single_name_ref().is_some_and(|name| name.text() == pointee_text)
+                });
+                is_pointee
+                    && pred
+                        .type_bound_list()
+                        .is_some_and(|bounds| bounds.bounds().any(is_maybe_sized_bound))
+            })
+        });
+    if !maybe_sized {
+        return refuse(
+            // alloc: an error's message, on the error path
+            pointee_error(format!(
+                "`derive(CoercePointee)` requires `{pointee_text}` to be marked `?Sized`"
+            )),
+            span_of(pointee_name.syntax().text_range()),
+        );
+    }
+    // rustc checks this of the impl the derive writes, in coherence
+    // (`visit_implementation_of_coerce_pointee_validity`): only once every check above passed.
+    let is_repr_transparent = strukt.attrs().any(|attr| {
+        attr.as_simple_call().is_some_and(|(name, tt)| {
+            name == "repr"
+                && tt.syntax().children_with_tokens().any(|it| {
+                    it.into_token().is_some_and(|it| {
+                        it.kind() == SyntaxKind::IDENT && it.text() == "transparent"
+                    })
+                })
+        })
+    });
+    if !is_repr_transparent {
+        return refuse(
+            pointee_error(
+                "`derive(CoercePointee)` is only applicable to `struct` with `repr(transparent)` layout",
+            ),
+            span,
+        );
+    }
+    let mut info = match parse_adt_from_syntax(adt, span_map, span) {
+        Ok(it) => it,
+        Err(err) => {
+            return ExpandResult::new(empty(frame, span), err);
+        }
+    };
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |scratch| {
+        write_pointee_predicates(
+            scratch,
+            span,
+            span_map,
+            strukt,
+            pointee_name,
+            &mut info.where_clause,
+        )
+    });
+    let self_for_traits = pointee_self_type(span, span_map, strukt, struct_name, pointee_idx);
+    ExpandResult::ok(write_coerce_pointee_impls(frame, span, &info, &self_for_traits))
+}
+
+const ADDED_PARAM: &str = "__S";
+
+/// `__S`, the type parameter the impls add in the pointee's place.
+fn added_param(span: Span) -> tt::Ident {
+    tt::Ident { sym: Symbol::intern(ADDED_PARAM), span, is_raw: tt::IdentIsRaw::No }
+}
+
+/// `name` as the item wrote it, at its span there: a name keeps the edition it was written in,
+/// so a 2015 `async` stays a name.
+fn copied_name(name: ast::Name<'_>, span_map: &span::SpanMap) -> tt::Ident {
+    tt::Ident::new(name.text(), span_map.span_at(name.syntax().text_range().start()))
+}
+
+/// Appends to `out` the `where` predicates the impls add, in order:
+/// - for each type parameter with bounds, the bounds that name the pointee (all of the
+///   pointee's own), with `__S` in its place;
+/// - for each `where` predicate with a type, the whole predicate when its type names the
+///   pointee, or else its type and those of its bounds that name it;
+/// - `T: ::core::marker::Unsize<__S>` of the pointee `T`.
+///
+/// What is copied from the item is at its span in `span_map`; `__S`, `Unsize`'s path and the
+/// `:` and `+` written between are at `span`. A written predicate is spaced as the text
+/// `T: A + B` is: `:` and `+` are `Alone`, and a type's last punct before its `:` is `Joint`.
+fn write_pointee_predicates(
+    scratch: &Frame,
+    span: Span,
+    span_map: &span::SpanMap,
+    strukt: ast::Struct<'_>,
+    pointee: ast::Name<'_>,
+    out: &mut Vec<tt::TopSubtree>,
+) {
+    let pointee_text = pointee.text();
+    let alone = |char| tt::Leaf::Punct(punct(char, tt::Spacing::Alone, span));
+    let mut paths: SmallVec<[TextRange; 4]> = SmallVec::new();
+    for param in strukt.generic_param_list().into_iter().flat_map(|it| it.generic_params()) {
+        let ast::GenericParam::TypeParam(param) = param else { continue };
+        let (Some(name), Some(bounds)) = (param.name(), param.type_bound_list()) else { continue };
+        let is_pointee = name.text() == pointee_text;
+        let mut b = Builder::new(tt::Delimiter::invisible_spanned(span));
+        b.push(tt::Leaf::Ident(if is_pointee {
+            added_param(span)
+        } else {
+            copied_name(name, span_map)
+        }));
+        b.push(alone(':'));
+        let mut first = true;
+        for bound in bounds.bounds() {
+            paths.clear();
+            let named = bound.ty().is_some_and(|ty| pointee_paths(ty, pointee_text, &mut paths));
+            if !named && !is_pointee {
+                continue;
+            }
+            if !first {
+                b.push(alone('+'));
+            }
+            first = false;
+            write_copied(&mut b, scratch, bound.syntax(), span, span_map, &paths, false);
+        }
+        out.push(b.build_skip_top_subtree());
+    }
+    for pred in strukt.where_clause().into_iter().flat_map(|it| it.predicates()) {
+        let Some(ty) = pred.ty() else { continue };
+        paths.clear();
+        let mut b = Builder::new(tt::Delimiter::invisible_spanned(span));
+        if pointee_paths(ty, pointee_text, &mut paths) {
+            for bound in pred.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
+                if let Some(ty) = bound.ty() {
+                    pointee_paths(ty, pointee_text, &mut paths);
+                }
+            }
+            write_copied(&mut b, scratch, pred.syntax(), span, span_map, &paths, false);
+        } else if let Some(bounds) = pred.type_bound_list() {
+            write_copied(&mut b, scratch, ty.syntax(), span, span_map, &[], true);
+            b.push(alone(':'));
+            let mut first = true;
+            for bound in bounds.bounds() {
+                paths.clear();
+                if !bound.ty().is_some_and(|ty| pointee_paths(ty, pointee_text, &mut paths)) {
+                    continue;
+                }
+                if !first {
+                    b.push(alone('+'));
+                }
+                first = false;
+                write_copied(&mut b, scratch, bound.syntax(), span, span_map, &paths, false);
+            }
+        } else {
+            continue;
+        }
+        out.push(b.build_skip_top_subtree());
+    }
+    let mut b = Builder::new(tt::Delimiter::invisible_spanned(span));
+    b.push(tt::Leaf::Ident(copied_name(pointee, span_map)));
+    b.push(alone(':'));
+    for name in ["core", "marker", "Unsize"] {
+        b.push(tt::Leaf::Punct(punct(':', tt::Spacing::Joint, span)));
+        b.push(alone(':'));
+        b.push(tt::Leaf::Ident(tt::Ident::new(name, span)));
+    }
+    b.push(alone('<'));
+    b.push(tt::Leaf::Ident(added_param(span)));
+    b.push(alone('>'));
+    out.push(b.build_skip_top_subtree());
+}
+
+/// Pushes to `paths` the range of each path in `ty` that is the pointee by name, and says
+/// whether there was one. Every part of the type is walked, none skipped: it may name the
+/// pointee twice.
+fn pointee_paths(ty: ast::Type<'_>, pointee: &str, paths: &mut SmallVec<[TextRange; 4]>) -> bool {
+    match ty {
+        ast::Type::ArrayType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
+        ast::Type::DynTraitType(ty) => bound_pointee_paths(ty.type_bound_list(), pointee, paths),
+        ast::Type::FnPtrType(ty) => {
+            let params =
+                ty.param_list().into_iter().flat_map(|it| it.params()).filter_map(|it| it.ty());
+            all_pointee_paths(params.chain(ty.ret_type().and_then(|it| it.ty())), pointee, paths)
+        }
+        ast::Type::ForType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
+        ast::Type::ImplTraitType(ty) => bound_pointee_paths(ty.type_bound_list(), pointee, paths),
+        ast::Type::ParenType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
+        ast::Type::PathType(ty) => ty.path().is_some_and(|path| {
+            if path.as_single_name_ref().is_some_and(|name| name.text() == pointee) {
+                paths.push(path.syntax().text_range());
+                return true;
+            }
+            let args = path
+                .segments()
+                .filter_map(|segment| segment.generic_arg_list())
+                .flat_map(|it| it.generic_args())
+                .filter_map(|arg| match arg {
+                    ast::GenericArg::TypeArg(ty) => ty.ty(),
+                    _ => None,
+                });
+            all_pointee_paths(args, pointee, paths)
+        }),
+        ast::Type::PtrType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
+        ast::Type::RefType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
+        ast::Type::SliceType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
+        ast::Type::TupleType(ty) => all_pointee_paths(ty.fields(), pointee, paths),
+        ast::Type::PatternType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
+        ast::Type::InferType(_) | ast::Type::MacroType(_) | ast::Type::NeverType(_) => false,
+    }
+}
+
+/// [`pointee_paths`] of each of `types`.
+fn all_pointee_paths<'t>(
+    types: impl Iterator<Item = ast::Type<'t>>,
+    pointee: &str,
+    paths: &mut SmallVec<[TextRange; 4]>,
+) -> bool {
+    let mut found = false;
+    for ty in types {
+        found |= pointee_paths(ty, pointee, paths);
+    }
+    found
+}
+
+/// [`pointee_paths`] of the type of each of `bounds`.
+fn bound_pointee_paths(
+    bounds: Option<ast::TypeBoundList<'_>>,
+    pointee: &str,
+    paths: &mut SmallVec<[TextRange; 4]>,
+) -> bool {
+    let types = bounds.into_iter().flat_map(|it| it.bounds()).filter_map(|it| it.ty());
+    all_pointee_paths(types, pointee, paths)
+}
+
+/// Writes the tokens of `node` into `b`, each at its span in `span_map`, with `__S` at `span` in
+/// the place of each of `paths` (the pointee's, from [`pointee_paths`]). `joint_last` says a `:`
+/// follows `node` with no space, which joins a last punct to it.
+fn write_copied(
+    b: &mut Builder,
+    scratch: &Frame,
+    node: view::Node<'_>,
+    span: Span,
+    span_map: &span::SpanMap,
+    paths: &[TextRange],
+    joint_last: bool,
+) {
+    let piece = syntax_bridge::call_input_in(
+        node,
+        AtRange(span),
+        span,
+        DocCommentDesugarMode::ProcMacro,
+        scratch,
+    );
+    let mut out = Copied { b, span, span_map, paths, held: None };
+    if matches!(piece.top_subtree().delimiter.kind, tt::DelimiterKind::Invisible) {
+        out.walk(piece.iter());
+    } else {
+        out.walk(piece.as_token_trees().iter());
+    }
+    out.finish(joint_last);
+}
+
+/// Copies token trees into the impls, holding each punct back until what follows it is known: a
+/// punct before `__S` is `Alone`, as before any identifier.
+struct Copied<'a> {
+    b: &'a mut Builder,
+    span: Span,
+    span_map: &'a span::SpanMap,
+    paths: &'a [TextRange],
+    held: Option<tt::Punct>,
+}
+
+impl Copied<'_> {
+    /// The span in the item of the token converted at `at`, whose range is the token's.
+    fn in_item(&self, at: Span) -> Span {
+        self.span_map.span_at(at.range.start())
+    }
+
+    fn walk(&mut self, iter: tt::TtIter<'_>) {
+        for element in iter {
+            let at = element.first_span().range.start();
+            if let Some(path) = self.paths.iter().find(|it| it.contains(at)) {
+                if path.start() == at {
+                    if let Some(it) = &mut self.held {
+                        it.spacing = tt::Spacing::Alone;
+                    }
+                    self.flush();
+                    self.b.push(tt::Leaf::Ident(added_param(self.span)));
+                }
+                continue;
+            }
+            self.flush();
+            match element {
+                tt::TtElement::Leaf(tt::Leaf::Punct(it)) => {
+                    self.held = Some(tt::Punct { span: self.in_item(it.span), ..it });
+                }
+                tt::TtElement::Leaf(tt::Leaf::Ident(it)) => {
+                    let span = self.in_item(it.span);
+                    self.b.push(tt::Leaf::Ident(tt::Ident { span, ..it }));
+                }
+                tt::TtElement::Leaf(tt::Leaf::Literal(it)) => {
+                    let span = self.in_item(it.span);
+                    self.b.push(tt::Leaf::Literal(tt::Literal { span, ..it }));
+                }
+                tt::TtElement::Subtree(subtree, inner) => {
+                    let (open, close) =
+                        (self.in_item(subtree.delimiter.open), self.in_item(subtree.delimiter.close));
+                    self.b.open(subtree.delimiter.kind, open);
+                    self.walk(inner);
+                    self.flush();
+                    self.b.close(close);
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some(it) = self.held.take() {
+            self.b.push(tt::Leaf::Punct(it));
+        }
+    }
+
+    fn finish(mut self, joint_last: bool) {
+        if joint_last && let Some(it) = &mut self.held {
+            it.spacing = tt::Spacing::Joint;
+        }
+        self.flush();
+    }
+}
+
+/// `Name<..>`, the struct with `__S` for the pointee: the self type of the impls' traits. Each
+/// parameter is written by its name in the item, at its span there, spaced as the text
+/// `Name<'a, __S, N>` is; `__S`, `<`, `,` and `>` are at `span`.
+fn pointee_self_type(
+    span: Span,
+    span_map: &span::SpanMap,
+    strukt: ast::Struct<'_>,
+    struct_name: ast::Name<'_>,
+    pointee_idx: usize,
+) -> tt::TopSubtree {
+    let mut type_param_idx = 0;
+    let args = strukt
+        .generic_param_list()
+        .into_iter()
+        .flat_map(|params| params.generic_params())
+        .filter_map(|param| {
+            Some(match param {
+                ast::GenericParam::ConstParam(param) => {
+                    Either::Left(copied_name(param.name()?, span_map))
+                }
+                ast::GenericParam::LifetimeParam(param) => Either::Right(param.lifetime()?),
+                ast::GenericParam::TypeParam(param) => {
+                    let name = if pointee_idx == type_param_idx {
+                        added_param(span)
+                    } else {
+                        copied_name(param.name()?, span_map)
+                    };
+                    type_param_idx += 1;
+                    Either::Left(name)
+                }
+            })
+        });
+    let mut args = args.peekable();
+    let mut b = Builder::new(tt::Delimiter::invisible_spanned(span));
+    b.push(tt::Leaf::Ident(copied_name(struct_name, span_map)));
+    let opens_joint = matches!(args.peek(), Some(Either::Right(_)) | None);
+    let open = if opens_joint { tt::Spacing::Joint } else { tt::Spacing::Alone };
+    b.push(tt::Leaf::Punct(punct('<', open, span)));
+    let mut first = true;
+    for arg in args {
+        if !first {
+            b.push(tt::Leaf::Punct(punct(',', tt::Spacing::Alone, span)));
+        }
+        first = false;
+        match arg {
+            Either::Left(name) => b.push(tt::Leaf::Ident(name)),
+            Either::Right(lifetime) => {
+                // Split as `syntax_bridge` splits a lifetime token: `'` and the name after it.
+                let start = lifetime.syntax().text_range().start();
+                let name_start = start + TextSize::of('\'');
+                b.push(tt::Leaf::Punct(punct('\'', tt::Spacing::Joint, span_map.span_at(start))));
+                b.push(tt::Leaf::Ident(tt::Ident {
+                    sym: Symbol::intern(&lifetime.text()[1..]),
+                    span: span_map.span_at(name_start),
+                    is_raw: tt::IdentIsRaw::No,
+                }));
+            }
+        }
+    }
+    b.push(tt::Leaf::Punct(punct('>', tt::Spacing::Alone, span)));
+    b.build_skip_top_subtree()
+}
+```
+
+Why each piece is right:
+- The checks, their order and their errors are (10)'s 10.18 checks, which are the editor's.
+  `coerce_pointee_matches_the_editor` compares the errors directly.
+- `info` is read with the item's span map, as every other derive reads it (`derives()` in the
+  tests). The struct's generics in the impls are rustc's `generics.clone()`.
+- The predicates are the editor's, in its order and spacing. Only the spans differ: a copied
+  token is at its own span (rustc's cloned bound or predicate), and `__S`, `Unsize<__S>` and
+  the `:` and `+` written between are at `span`.
+- A name is copied as written (`copied_name`) where the editor raw-escaped a current-edition
+  keyword (`made_name` in (10)). The token's edition decides how blaze parses the impls, so a
+  2015 `async` is a name in the impls as in the item, and an `r#T` is raw from its own token.
+- `Unsize` is bounded on the pointee's own name at its span, as rustc pushes the bound onto the
+  pointee parameter itself.
+- The self type's names are rustc's `ty_ident(p.span(), p.ident)`. A lifetime is split as
+  `syntax_bridge` splits its token, with each half's span from `span_map`.
+- The scratch trees (`call_input_in`) live in a task's frame, as the editor's reparses did, so
+  nothing new is allocated on the warm path.
+
+12.3 File `crates/hir-expand/src/builtin/derive_macro/editor.rs`, test-only from 12.1. Old:
+
+```rust
+//! `CoercePointee`'s expansion through a `SyntaxEditor`: the derive's item read through handles
+//! and copied into an editor, whose `where` clause `make` writes from text. The handle parse of
+//! the edited copy is here too: the view parse cannot read a tree the editor built.
+
+use base_db::Db;
+use blaze_mem::Frame;
+```
+
+New:
+
+```rust
+//! `CoercePointee`'s expansion as it was through a `SyntaxEditor`, the reference its token build
+//! is checked against (`coerce_pointee_matches_the_editor`): the derive's item read through
+//! handles and copied into an editor, whose `where` clause `make` writes from text, every token
+//! at the derive's span. The handle parse of the edited copy is here too: the view parse cannot
+//! read a tree the editor built.
+
+use blaze_mem::Frame;
+```
+
+Old:
+
+```rust
+        self, AstNode, FieldList, HasAttrs, HasGenericArgs, HasGenericParams, HasModuleItem,
+        HasName, HasTypeBounds,
+```
+
+New:
+
+```rust
+        self, AstNode, FieldList, HasAttrs, HasGenericArgs, HasGenericParams, HasName,
+        HasTypeBounds,
+```
+
+12.4 Same file. Old (all of `coerce_pointee_expand`, and the doc of `coerce_pointee_derive`
+after it):
+
+```rust
+pub(super) fn coerce_pointee_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    span: Span,
+    tt: &tt::TopSubtree,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let (adt, span_map) = match to_adt_syntax(db, tt, span) {
+        Ok(it) => it,
+        Err(err) => {
+            return ExpandResult::new(empty(frame, span), err);
+        }
+    };
+    coerce_pointee_derive(frame, span, &adt, &span_map)
+}
+
+/// `#[derive(CoercePointee)]` of the item: a `SyntaxEditor` copy of it, with the new `where`
+/// predicates made by `make`.
+```
+
+New:
+
+```rust
+/// `#[derive(CoercePointee)]` of the item: a `SyntaxEditor` copy of it, with the new `where`
+/// predicates made by `make`.
+```
+
+12.5 Same file. Old (all of `to_adt_syntax`, and the doc of `push_fields` after it):
+
+```rust
+fn to_adt_syntax(
+    db: &Db,
+    tt: &tt::TopSubtree,
+    call_site: Span,
+) -> Result<(ast::Adt, span::SpanMap), ExpandError> {
+    let (parsed, tm, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        crate::token_tree_to_syntax_node(db, frame, tt.view(), crate::ExpandTo::Items)
+    });
+    let macro_items = ast::MacroItems::cast(parsed.syntax_node())
+        .ok_or_else(|| ExpandError::other(call_site, "invalid item definition"))?;
+    let item =
+        macro_items.items().next().ok_or_else(|| ExpandError::other(call_site, "no item found"))?;
+    let adt = ast::Adt::cast(item.syntax().clone()) // clone: a node handle, a non-atomic count
+        .ok_or_else(|| ExpandError::other(call_site, "expected struct, enum or union"))?;
+    Ok((adt, tm))
+}
+
+/// Pushes the fields of `list` to `fields`, and says how they are written.
+```
+
+New:
+
+```rust
+/// Pushes the fields of `list` to `fields`, and says how they are written.
+```
+
+12.6 File `crates/hir-expand/src/builtin/derive_macro/tests.rs`. At the end of the file, after `the_item_read_in_place_allocates_no_more`'s closing `}`, add:
+
+```rust
+
+/// `tree` with every span `span`: what is left to compare once spans are set aside.
+fn at_one_span<A: std::alloc::Allocator>(tree: &tt::TopSubtree<A>, span: Span) -> tt::TopSubtree {
+    fn walk(b: &mut tt::TopSubtreeBuilder, iter: tt::TtIter<'_>, span: Span) {
+        for element in iter {
+            match element {
+                tt::TtElement::Leaf(tt::Leaf::Punct(it)) => {
+                    b.push(tt::Leaf::Punct(tt::Punct { span, ..it }))
+                }
+                tt::TtElement::Leaf(tt::Leaf::Ident(it)) => {
+                    b.push(tt::Leaf::Ident(tt::Ident { span, ..it }))
+                }
+                tt::TtElement::Leaf(tt::Leaf::Literal(it)) => {
+                    b.push(tt::Leaf::Literal(tt::Literal { span, ..it }))
+                }
+                tt::TtElement::Subtree(subtree, inner) => {
+                    b.open(subtree.delimiter.kind, span);
+                    walk(b, inner, span);
+                    b.close(span);
+                }
+            }
+        }
+    }
+    let kind = tree.top_subtree().delimiter.kind;
+    let mut b = tt::TopSubtreeBuilder::new(tt::Delimiter { open: span, close: span, kind });
+    walk(&mut b, tree.iter(), span);
+    b.build()
+}
+
+/// Calls `f` on each leaf of `iter`, in order, inside groups too.
+fn each_leaf(iter: tt::TtIter<'_>, f: &mut impl FnMut(&tt::Leaf)) {
+    for element in iter {
+        match element {
+            tt::TtElement::Leaf(leaf) => f(&leaf),
+            tt::TtElement::Subtree(_, inner) => each_leaf(inner, f),
+        }
+    }
+}
+
+/// `CoercePointee` written as tokens against the editor's rewrite, over every refusal and every
+/// shape of bound: the same impls, token for token and spaced alike, and the same errors. Spans
+/// differ by design (the editor's are all the derive's, the token build's are the item's where
+/// it copies a token), so they are set aside here and checked by
+/// `coerce_pointee_keeps_the_items_spans`.
+#[test]
+fn coerce_pointee_matches_the_editor() {
+    let span = call_site();
+    for text in POINTEE_ITEMS.iter().chain(ITEMS) {
+        let (adt, map) = item(text);
+        let parse = parsed(text);
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let old = super::editor::coerce_pointee_derive(frame, span, &adt, &map);
+        let new = super::coerce_pointee_derive(frame, span, adt_view(&parse), &map);
+        assert_eq!(old.err, new.err, "CoercePointee of `{text}`");
+        let old = old.map(|it| at_one_span(&it, span));
+        let new = new.map(|it| at_one_span(&it, span));
+        assert_same(&format!("CoercePointee of `{text}`"), &old, &new);
+    }
+}
+
+/// Each token of the impls is either the derive's (at `span`) or one copied from the item, at
+/// that token's own span (`item`'s map gives each token its range in `text`). `__S` is always
+/// the derive's.
+#[test]
+fn coerce_pointee_keeps_the_items_spans() {
+    let span = call_site();
+    for text in POINTEE_ITEMS.iter().chain(ITEMS) {
+        let (_, map) = item(text);
+        let parse = parsed(text);
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let new = super::coerce_pointee_derive(frame, span, adt_view(&parse), &map);
+        let mut copied = 0;
+        each_leaf(new.value.iter(), &mut |leaf| {
+            let at = *leaf.span();
+            let written = match leaf {
+                tt::Leaf::Ident(it) => it.sym.as_str().to_owned(),
+                tt::Leaf::Punct(it) => it.char.to_string(),
+                tt::Leaf::Literal(it) => it.text_and_suffix.as_str().to_owned(),
+            };
+            if at == span {
+                return;
+            }
+            assert_ne!(written, "__S", "`{text}`: `__S` at {at:?}, not the derive's span");
+            assert_eq!(at.ctx, SyntaxContext::root(Edition::CURRENT), "`{text}`: `{written}`");
+            assert!(
+                text[at.range].contains(&*written),
+                "`{text}`: `{written}` at {:?}, which is `{}`",
+                at.range,
+                &text[at.range]
+            );
+            copied += 1;
+        });
+        assert!(new.err.is_some() || copied > 0, "`{text}`: nothing copied from the item");
+    }
+}
+
+/// A 2015 item whose predicates name `async`, `dyn` and `gen` (2015 names; 2018 made the first
+/// two keywords and 2024 the third). The impls write each as the name it was, not raw, at its
+/// span in the item and so in the item's edition, where the editor reparsed them as current-
+/// edition text. rustc's build of the same item is the frontend harness case
+/// `infer/118-coerce-pointee-2015-predicates.rs`.
+#[test]
+fn coerce_pointee_keeps_a_2015_items_names() {
+    let span = call_site();
+    let text = "#[repr(transparent)] struct Ptr<'a, #[pointee] T: ?Sized + async::Tr<T>, U: gen::Tr<T>>(&'a T, PhantomData<U>) \
+        where U: dyn::Tr<T> + async::Tr<u8>, T: gen::Tr<U>, &'a T: dyn::Tr<u8>;";
+    let parse = SourceFile::parse(text, Edition::Edition2015);
+    assert!(parse.errors().is_empty(), "{text}: {:?}", parse.errors());
+    let mut map = span::SpanMap::empty();
+    for token in parse.tree().syntax().descendants_with_tokens().filter_map(|it| it.into_token()) {
+        let range = token.text_range();
+        map.push(range.end(), span_at(range, SyntaxContext::root(Edition::Edition2015)));
+    }
+    map.finish();
+    let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+    let new = super::coerce_pointee_derive(frame, span, adt_view(&parse), &map);
+    assert_eq!(new.err, None, "{text}");
+    let mut names = 0;
+    each_leaf(new.value.iter(), &mut |leaf| {
+        let tt::Leaf::Ident(it) = leaf else { return };
+        if !["async", "dyn", "gen"].contains(&it.sym.as_str()) {
+            return;
+        }
+        assert!(matches!(it.is_raw, tt::IdentIsRaw::No), "{text}: `{}` is raw", it.sym.as_str());
+        assert_eq!(&text[it.span.range], it.sym.as_str(), "{text}: `{}` in the item", it.sym.as_str());
+        assert_eq!(it.span.ctx, SyntaxContext::root(Edition::Edition2015), "{text}");
+        names += 1;
+    });
+    // Per impl: the two parameters' bounds (2), the four names of the item's own predicates
+    // and the five predicates added (`__S: ?Sized + async::Tr<__S>`, `U: gen::Tr<__S>`,
+    // `U: dyn::Tr<__S>`, `__S: gen::Tr<U>`, `&'a __S: dyn::Tr<u8>`), so 11; two impls.
+    assert_eq!(names, 22, "{text}");
+}
+```
+
+12.7 Remove nothing else. After 12.1-12.6 the file `derive_macro.rs` has no `use editor::..`
+and no `made_name`. `editor.rs` keeps `coerce_pointee_derive`, `parse_adt_from_handle` and
+`attr_words_have`, all used only by `tests.rs` and `reference.rs`. Deleting `editor.rs` once
+this has been trusted for a while is a later change.
+
+12.8 New file `harness/v2/frontend/cases/infer/118-coerce-pointee-2015-predicates.rs` (a
+frontend harness case, run by `harness/v2/frontend/cases.py` under the pinned rustc and under
+blaze and compared; it has not been run):
+
+```rust
+//@ expect: accept
+//@ edition: 2015
+// `derive(CoercePointee)` on a 2015 item whose predicates name `async`, `dyn` and `gen`, which
+// are names in 2015. rustc's impls clone the item's predicates, which keep their edition, so the
+// names stay names in the impls.
+#![feature(derive_coerce_pointee)]
+
+use std::marker::{CoercePointee, PhantomData};
+
+mod async {
+    pub trait Tr<X: ?Sized> {}
+    impl<X: ?Sized, Y: ?Sized> Tr<X> for Y {}
+}
+
+mod dyn {
+    pub trait Tr<X: ?Sized> {}
+    impl<X: ?Sized, Y: ?Sized> Tr<X> for Y {}
+}
+
+mod gen {
+    pub trait Tr<X: ?Sized> {}
+    impl<X: ?Sized, Y: ?Sized> Tr<X> for Y {}
+}
+
+#[derive(CoercePointee)]
+#[repr(transparent)]
+struct Ptr<'a, #[pointee] T: ?Sized + async::Tr<T>, U: gen::Tr<T>>(&'a T, PhantomData<U>)
+where
+    U: dyn::Tr<T> + async::Tr<u8>,
+    T: gen::Tr<U>,
+    &'a T: dyn::Tr<u8>;
+
+fn main() {
+    let a = [1u8, 2, 3, 4];
+    let p: Ptr<[u8; 4], u8> = Ptr(&a, PhantomData);
+    let q: Ptr<[u8], u8> = p;
+    assert!(q.0.len() == 4);
+}
+```
+
+12.8 is already in the tree: it is a new file in `harness/`, not db-expand's, so I wrote it
+myself. It is what rustc does today. Blaze matches it only with 12.1-12.6, and today's editor
+build should fail it (`async`/`dyn` reparsed as 2024 keywords).
+
+> forwarded to db-expand-derive (requests, pass 38; it holds `derive_macro.rs` and `derive_macro/`; told by tmux)
+
+## db-expand-derive: CoercePointee parts rustc has and blaze doesn't
+
+Filed by db-expand-derive (2026-10-29 23:41) after applying (12) and checking it against
+rustc's `coerce_pointee.rs` at the pin (`16d1ffac17ad8b739e32483ac2e65fe7e1804977`). With (12)
+the impls blaze writes match rustc's. These four parts remain, each a superset-of-rust gap
+that this lane can't close on its own:
+
+1. **`CoercePointeeValidated` impl.** rustc also emits
+   `unsafe impl<..> ::core::marker::CoercePointeeValidated for Ptr<..> {}`, and its builtin
+   coherence check (in `rustc_hir_analysis`) refuses with E0802 what the derive's syntactic
+   checks can't see. The impl text is
+   `derive_macro.rs`'s; the check belongs in hir-ty's coherence (semantics-in-front-end).
+2. **`NonGenericPointee` errors.** rustc's `DetectNonGenericPointeeAttr` visitor reports each
+   `#[pointee]` that isn't on a type parameter (on a lifetime, a const parameter, or anywhere
+   in the item), alongside any other error. `ExpandError` holds one error, so blaze can't
+   report them together. This needs a multi-error `ExpandResult` (hir-expand's `lib.rs`, not
+   this lane's files) before `coerce_pointee_derive` can push them.
+3. **TooManyPointees label.** rustc labels the second `#[pointee]` "here another type
+   parameter is marked as `#[pointee]`". Blaze's `BuiltinError` carries the primary span only;
+   the label needs secondary spans on `BuiltinError`.
+4. **Const argument expressions.** rustc's `TypeSubstitution` walks into a const argument's
+   expression and substitutes a type there. Blaze's walk stops at const arguments. Only
+   `generic_const_exprs` lets a struct's bounds hold such an expression, so this matters only
+   for that feature. It needs an expression walk in `pointee_paths`.
+
+Each needs a differential test against rustc in `harness/v2/frontend/cases/`.
+
+> routed by db-expand (db-expand-next2, 2026-10-29 23:44) to `db-expand-pointee`, after E11 and T1 (d). Parts 2, 3 and 4 and part 1's impl are hir-expand's (db-expand's), so this lane can close them:
+> - Part 4: the walk.
+> - Part 3: `BuiltinError::also_at` exists (`lib.rs:216`) but has no labels. The labels are added in hir-expand; the rendering is filed for diagnostics.
+> - Part 1: the impl is emitted. The E0802 coherence check is filed for db (hir-ty). If minicore lacks the trait, that is filed for the coordinator.
+> - Part 2: the multi-error expansion result. Its callers outside hir-expand are filed for their owners.

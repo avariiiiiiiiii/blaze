@@ -162,8 +162,10 @@ pub(super) fn call_signature(func: &ir::Function, inst: ir::Inst) -> Option<ir::
 /// Whether `inst` finds a thread-local's address with a call (ELF's TLS descriptor, Mach-O's
 /// `tlv` thunk), as Cranelift's `ElfTlsGetAddr` and `MachOTlsGetAddr` are calls.
 fn makes_tls_call(func: &ir::Function, target: &Target, inst: ir::Inst) -> bool {
-    let InstructionData::UnaryGlobalValue { opcode: Opcode::TlsValue, global_value } =
-        func.dfg.insts[inst]
+    let InstructionData::UnaryGlobalValue {
+        opcode: Opcode::TlsValue | Opcode::GlobalValue,
+        global_value,
+    } = func.dfg.insts[inst]
     else {
         return false;
     };

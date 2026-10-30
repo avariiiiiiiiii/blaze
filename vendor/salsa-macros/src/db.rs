@@ -92,6 +92,8 @@ impl DbMacro {
             const _: () = {
                 use salsa::plumbing as #zalsa;
 
+                // SAFETY: `storage` and `storage_mut` both return the one `#storage` field, which
+                // `self` owns (`HasStorage`'s `# Safety` in storage.rs).
                 unsafe impl #zalsa::HasStorage for #db {
                     #[inline(always)]
                     fn storage(&self) -> &#zalsa::Storage<Self> {
@@ -145,6 +147,12 @@ impl DbMacro {
             #[inline(never)]
             #[doc(hidden)]
             fn zalsa_register_downcaster(&self) -> &salsa::plumbing::DatabaseDownCaster<dyn #TraitPath> {
+                // SAFETY: `downcast` is `fn(&Self) -> &dyn Trait`, `add` wants
+                // `fn(NonNull<Self>) -> NonNull<dyn Trait>`. `NonNull<T>` is a transparent
+                // non-null `*const T`, the same layout and ABI as `&T`, a fat pointer for
+                // `dyn Trait`, so the two signatures pass and return the same words. `downcast`
+                // returns its argument unsized and reads nothing through it, and every caller
+                // (`views.rs`, `downcast_unchecked`) passes a pointer to a live `Self`.
                 salsa::plumbing::views(self).add::<Self, dyn #TraitPath>(unsafe {
                     ::std::mem::transmute(<Self as #TraitPath>::downcast as fn(_) -> _)
                 })

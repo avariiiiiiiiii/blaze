@@ -27,13 +27,19 @@
 //! [`SLOTS`] deep on interrupted threads could wait for ever. `ask/model.rs` checks the
 //! protocol under every interleaving.
 //!
+//! Before it sleeps, an asker spins on its state word for about one cross-process wake-up
+//! ([`ASKER_SPIN`]), what the sleep and wake would cost it, and the reader rescans the slots for
+//! [`READER_SPIN`] after the last ask it took, so a burst of first calls finds neither asleep.
+//! A spin only reads the words the sleep compares, and the clock (`clock_gettime`,
+//! `QueryPerformanceCounter`), so the asker's side stays async-signal-safe.
+//!
 //! The run process is not trusted: the daemon reads each length once and bounds it, and a slot
 //! in a state it did not expect is skipped or refused. A run process whose daemon is gone wakes
 //! every second and finds its channel hung up.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::channel::Channel;
 use crate::fence::Words;
@@ -81,6 +87,13 @@ const GENERATIONS: u64 = 1 << 24;
 
 /// How long an asker sleeps before it looks whether the daemon is still there.
 const LOOK: Duration = Duration::from_secs(1);
+
+/// How long an asker spins for its answer before each sleep: about one cross-process wake-up.
+const ASKER_SPIN: Duration = Duration::from_micros(3);
+
+/// How long the reader rescans the slots after the last ask it took before it sleeps on the
+/// doorbell: one daemon core, after a burst.
+const READER_SPIN: Duration = Duration::from_micros(50);
 
 fn state(generation: u64, phase: u64) -> u64 {
     generation << 8 | phase
@@ -172,6 +185,18 @@ fn answered(words: &impl Words, index: usize, generation: u64) -> Result<(), u64
     if now == state(generation, ANSWERED) { Ok(()) } else { Err(now) }
 }
 
+/// [`answered`], spinning for up to `spin` while it is not.
+fn answered_within(words: &impl Words, index: usize, generation: u64, spin: Duration) -> Result<(), u64> {
+    let start = Instant::now();
+    loop {
+        let seen = answered(words, index, generation);
+        if seen.is_ok() || start.elapsed() >= spin {
+            return seen;
+        }
+        std::hint::spin_loop();
+    }
+}
+
 fn state_word(words: &impl Words, index: usize) -> &AtomicU64 {
     words.word(base(index) + S_STATE)
 }
@@ -237,7 +262,7 @@ pub(crate) fn request(
         return Err(error);
     }
     let bell = bell(words, index);
-    while let Err(seen) = answered(words, index, generation) {
+    while let Err(seen) = answered_within(words, index, generation, ASKER_SPIN) {
         if !sys::wait_answer(state_word(words, index), seen as u32, bell, LOOK) && sys::hung_up(stream) {
             return Err(Error::new("the daemon hung up before it answered"));
         }
@@ -329,11 +354,13 @@ pub struct Reader {
     run: Arc<Run>,
     next: usize,
     body: Vec<u8>,
+    /// When it last returned an ask, for [`READER_SPIN`].
+    last: Option<Instant>,
 }
 
 impl Reader {
     pub(crate) fn new(channel: Channel, run: Arc<Run>) -> Reader {
-        Reader { channel, run, next: 0, body: Vec::new() }
+        Reader { channel, run, next: 0, body: Vec::new(), last: None }
     }
 
     /// The next ask, as a frame whose sequence number is what [`Sender::send`] answers it by;
@@ -343,7 +370,13 @@ impl Reader {
         loop {
             if let Some((index, generation, kind)) = take(&self.run.words, self.next, &mut self.body)? {
                 self.next = (index + 1) % SLOTS;
+                self.last = Some(Instant::now());
                 return Ok(Frame { kind, seq: seq(index, generation), body: &self.body });
+            }
+            // The rings of asks taken while spinning are drained by the next `wait_ring`.
+            if self.last.is_some_and(|last| last.elapsed() < READER_SPIN) {
+                std::hint::spin_loop();
+                continue;
             }
             if !self.run.bells.wait_ring(self.channel.stream())? {
                 return Err(Error::new(format!("process {} hung up", self.run.pid)));

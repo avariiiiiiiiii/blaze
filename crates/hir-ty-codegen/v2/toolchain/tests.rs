@@ -1,9 +1,22 @@
 use super::*;
 
 fn of(target: &str, flags: &[&str]) -> Result<Toolchain, String> {
+    runs(target, flags, Runs::Elsewhere)
+}
+
+fn here(flags: &[&str]) -> Result<Toolchain, String> {
+    runs(Target::host(), flags, Runs::Here)
+}
+
+fn runs(target: &str, flags: &[&str], runs: Runs) -> Result<Toolchain, String> {
     blaze_store::compiles_against("hir-ty-codegen v2 toolchain tests");
     let flags: Vec<String> = flags.iter().map(|it| (*it).to_owned()).collect();
-    toolchain(target, &flags)
+    toolchain(target, &flags, runs)
+}
+
+/// Whether blaze emits code for the machine the tests run on.
+fn host_is_a_target() -> bool {
+    Target::parse(Target::host()).is_ok()
 }
 
 const LINUX: &str = "x86_64-unknown-linux-gnu";
@@ -115,6 +128,77 @@ fn native_is_the_hosts_and_only_for_the_host() {
         assert!(native.features.iter().all(|it| it.starts_with('+')), "{:?}", native.features);
         assert_eq!((native.target, native.arch), (base.target, base.arch));
     }
+}
+
+#[test]
+fn here_is_the_hosts_features_on_the_baseline_cpu() {
+    if !host_is_a_target() {
+        return;
+    }
+    let here = here(&[]).unwrap();
+    let native = of(Target::host(), &["-C", "target-cpu=native"]).unwrap();
+    let elsewhere = of(Target::host(), &[]).unwrap();
+    assert_eq!(here.features, native.features, "the features `native` gives");
+    assert!(here.features.iter().all(|it| it.starts_with('+')), "{:?}", here.features);
+    assert!(here.features.is_sorted());
+    assert_eq!(here.cpu, elsewhere.cpu, "the baseline CPU's name, as rustc without `-C target-cpu`");
+    assert_eq!((&here.target, &here.arch, &here.id), (&elsewhere.target, &elsewhere.arch, &elsewhere.id));
+    assert_eq!(here.cpu, Target::parse(Target::host()).unwrap().cpu());
+}
+
+#[test]
+fn elsewhere_is_the_baseline() {
+    if !host_is_a_target() {
+        return;
+    }
+    let elsewhere = of(Target::host(), &[]).unwrap();
+    let apple = Target::host().contains("-apple-");
+    assert!(elsewhere.features.is_empty(), "{:?}", elsewhere.features);
+    assert_eq!(elsewhere.frame_pointers, apple);
+    for other in [LINUX, "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
+        assert!(of(other, &[]).unwrap().features.is_empty(), "{other}");
+    }
+}
+
+#[test]
+fn here_is_only_the_hosts_target() {
+    let other = if Target::host() == LINUX { "aarch64-unknown-linux-gnu" } else { LINUX };
+    let error = runs(other, &[], Runs::Here).unwrap_err();
+    assert!(error.contains(other) && error.contains("where it is built"), "{error}");
+}
+
+#[test]
+fn the_flags_win_over_where_it_runs() {
+    if !host_is_a_target() {
+        return;
+    }
+    let host = Target::host();
+    let baseline = Target::parse(host).unwrap().cpu();
+    let named = format!("target-cpu={baseline}");
+    assert_eq!(here(&["-C", &named]).unwrap(), of(host, &["-C", &named]).unwrap());
+    assert!(here(&["-C", &named]).unwrap().features.is_empty());
+    let native = ["-C", "target-cpu=native"];
+    assert_eq!(here(&native).unwrap(), of(host, &native).unwrap());
+    let x86 = host.starts_with("x86_64-");
+    let (on, off) = if x86 { ("+bmi2", "avx") } else { ("+dotprod", "lse") };
+    let turned_on = here(&["-C", &format!("target-feature={on}")]).unwrap();
+    assert!(turned_on.features.contains(&on.to_owned()), "{:?}", turned_on.features);
+    let turned_off = here(&["-C", &format!("target-feature=-{off}")]).unwrap();
+    assert!(!turned_off.features.contains(&format!("+{off}")), "{:?}", turned_off.features);
+    if baseline_of(host).contains(&off) {
+        assert!(turned_off.features.contains(&format!("-{off}")), "{:?}", turned_off.features);
+    }
+    if x86 {
+        // Off with what implies it: `avx2`, `fma`, `f16c` and the AVX-512s.
+        assert!(!turned_off.features.iter().any(|it| it.starts_with("+avx")), "{:?}", turned_off.features);
+        let level = here(&["-C", "target-cpu=x86-64-v2"]).unwrap();
+        assert_eq!(level, of(host, &["-C", "target-cpu=x86-64-v2"]).unwrap());
+        assert!(!level.features.contains(&"+avx".to_owned()), "the level's, not the host's");
+    }
+}
+
+fn baseline_of(host: &str) -> &'static [&'static str] {
+    baseline(&Target::parse(host).unwrap())
 }
 
 #[test]

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use blaze_codegen::{
     Arch,
     plan::{Mode, OptLevel, Override, Policy, Profile},
-    settings::{DebugInfo, Panic, Relocation, Sanitize, Toolchain},
+    settings::{DebugInfo, Panic, Pgo, Relocation, Sanitize, Toolchain},
 };
 use blaze_ids::ContentId;
 
@@ -21,6 +21,7 @@ fn policy(level: OptLevel) -> Policy {
             features: Vec::new(),
             cranelift: "0.136".to_owned(),
             llvm: Some("23.1".to_owned()),
+            stencils: None,
             frame_pointers: true,
             relocation: Relocation::Pic,
         },
@@ -36,6 +37,7 @@ fn policy(level: OptLevel) -> Policy {
         mode: Mode::Output,
         fold: true,
         sanitize: Sanitize::default(),
+        pgo: Pgo::None,
     }
 }
 

@@ -52,12 +52,15 @@ impl Channel for Tls {
     fn received(&mut self, bytes: &[u8], plain: &mut Vec<u8>) -> Result<(), String> {
         let mut input = bytes;
         while !input.is_empty() {
+            // alloc: an error's message, made only when it fails.
             self.conn.read_tls(&mut input).map_err(|error| format!("TLS: {error}"))?;
+            // alloc: an error's message, made only when it fails.
             let state = self.conn.process_new_packets().map_err(|error| format!("TLS: {error}"))?;
             let ready = state.plaintext_bytes_to_read();
             if ready > 0 {
                 let at = plain.len();
                 plain.resize(at + ready, 0);
+                // alloc: an error's message, made only when it fails.
                 self.conn.reader().read_exact(&mut plain[at..]).map_err(|error| format!("TLS: {error}"))?;
             }
             if state.peer_has_closed() {
@@ -68,11 +71,13 @@ impl Channel for Tls {
     }
 
     fn send(&mut self, plain: &[u8]) -> Result<(), String> {
+        // alloc: an error's message, made only when it fails.
         self.conn.writer().write_all(plain).map_err(|error| format!("TLS: {error}"))
     }
 
     fn outgoing(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
         while self.conn.wants_write() {
+            // alloc: an error's message, made only when it fails.
             self.conn.write_tls(out).map_err(|error| format!("TLS: {error}"))?;
         }
         Ok(())
@@ -98,21 +103,28 @@ impl TlsClient {
         let mut roots = RootCertStore::empty();
         let (added, _) = roots.add_parsable_certificates(found.certs);
         if added == 0 {
+            // alloc: setup: once a TLS config or a connection.
             let errors: Vec<String> = found.errors.iter().map(ToString::to_string).collect();
+            // alloc: an error's message, made only when it fails.
             return Err(format!(
                 "no root certificate to check the global cache at {host} with was found on this machine ({})",
+                // alloc: an error's message, made only when it fails.
                 if errors.is_empty() { "no errors loading them".to_owned() } else { errors.join("; ") }
             ));
         }
+        // alloc: setup: once a TLS config or a connection.
         let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
+            // alloc: an error's message, made only when it fails.
             .map_err(|error| format!("TLS versions: {error}"))?
             .with_root_certificates(roots)
             .with_no_client_auth();
+        // alloc: setup: once a TLS config or a connection.
         TlsClient::with_config(Arc::new(config), host)
     }
 
     pub fn with_config(config: Arc<ClientConfig>, host: &str) -> Result<TlsClient, String> {
+        // alloc: an error's message, made only when it fails.
         let name = ServerName::try_from(host.to_owned()).map_err(|error| format!("{host:?} as a TLS server name: {error}"))?;
         Ok(TlsClient { config, name })
     }
@@ -122,7 +134,9 @@ impl Channels for TlsClient {
     type Channel = Tls;
 
     fn channel(&self) -> Result<Tls, String> {
+        // alloc: setup: once a TLS config or a connection.
         let conn = ClientConnection::new(Arc::clone(&self.config), self.name.clone())
+            // alloc: an error's message, made only when it fails.
             .map_err(|error| format!("TLS: {error}"))?;
         Ok(Tls::new(Connection::Client(conn)))
     }
@@ -144,6 +158,7 @@ impl Channels for TlsServer {
     type Channel = Tls;
 
     fn channel(&self) -> Result<Tls, String> {
+        // alloc: an error's message, made only when it fails.
         let conn = ServerConnection::new(Arc::clone(&self.config)).map_err(|error| format!("TLS: {error}"))?;
         Ok(Tls::new(Connection::Server(conn)))
     }

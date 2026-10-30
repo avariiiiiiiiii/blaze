@@ -489,6 +489,30 @@ impl<'t, L: Language> Node<'t, L> {
     pub fn subtree(self) -> FlatTree {
         self.tree.subtree(self.at)
     }
+
+    /// [`Self::subtree`] with the nodes `elided` under this one, ascending and disjoint, each
+    /// replaced by an empty node of its kind ([`FlatTree::subtree_without`]): the cursors'
+    /// `clone_subtree_without`. They must be in the tree this node's children are in (its
+    /// part's, for a lazy node).
+    pub fn subtree_without(self, elided: &[Node<'t, L>]) -> FlatTree {
+        if elided.is_empty() {
+            return self.subtree();
+        }
+        let (place, at) = self.inner();
+        let numbers = elided.iter().map(|node| {
+            assert!(
+                std::ptr::eq(node.tree, place.tree),
+                "the elided {:?} at {:?} is not in the flat tree of the {:?} it is cut from",
+                node.kind(),
+                node.text_range(),
+                self.kind(),
+            );
+            node.at
+        });
+        // alloc: the elided nodes' numbers, once per copy
+        let numbers: Vec<u32> = numbers.collect();
+        place.tree.subtree_without(at, &numbers)
+    }
 }
 
 impl<'t, L: Language> Token<'t, L> {

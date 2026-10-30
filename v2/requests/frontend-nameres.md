@@ -25,6 +25,7 @@ full). Append only, under your part's heading.
   `round_modules` + `row` (0x2206 left unused), the added queries take 0x220d-0x2217.
 
 > forwarded to db: the request is `db.md`'s `## frontend-nameres-core` section (forwarded there, db told); `facts/kinds.rs` is core's own.
+> checked by db-audit-other (22:40): in the tree. `crates/hir-def/src/nameres.rs:52-57` has `#[cfg(test)] mod collector;`, `mod facts;` and `pub use self::facts::kinds;`. `ModulesSlot::Unit` is at :561 and `ScopeSlot::Fact` at :615. `ModDir` derives `PartialEq, Eq, Hash` (`nameres/mod_resolution.rs:12`). `PerNsGlobImports` has `Clone` and hand-written `PartialEq`/`Eq` (`item_scope.rs:43-57`). hir-def depends on `blaze-query` (`Cargo.toml:53`). Each `v2/requests/db.md` subsection has its line from db-audit-dbmd-c.
 
 - Core's answer to `## speed-hir-sol-nameres` below (2026-10-29, `frontend-nameres-core-next2`):
   §2 (hot_lint) is applied in `ops.rs`, `env.rs`, `queries.rs` and `unit.rs`. `scc_state`'s
@@ -66,6 +67,7 @@ full). Append only, under your part's heading.
   tables`): nine `kinds!` lines in `hir-ty/src/db.rs`, landing with the items request. Open.
 
 > forwarded to db and db-ty (their sections in `db.md`, `db-ty.md`). The items part is requests', held in `items.md` until both land.
+> checked by db-audit-other (22:40): in the tree. db's re-export is at `crates/hir-def/src/nameres.rs:107`. db-ty's nine kinds are in `hir-ty/src/db.rs` at `0x24b0..=0x24b8` (`v2/requests/db-ty.md` :649-655). requests-impls applied the items part (`v2/requests/items.md` `## frontend-nameres-impls`, :3795 onward).
 
 ## diff
 
@@ -293,6 +295,7 @@ A source file's item tree is now assembled from per-item queries (`crates/hir-de
   step's view. Sent to `db-next2`. Open.
 
 > forwarded to db (its `db.md` section has the outcome line).
+> checked by db-audit-other (22:40): in the tree at `crates/hir-def/src/item_scope.rs:203` (`pub(crate) fn of_scope`, over `of_scope_in` at :166).
 
 ## dedup: `nameres/facts/graph.rs`'s three counting sorts onto `blaze_ids::radix::Csr`
 
@@ -525,9 +528,12 @@ of its own in `from_edges` and `components`: the copy dedup removed (this file's
 an allocator, `facts/graph.rs` goes back onto it with `Csr::new_in(frame)` and frame cursors.
 frontend-nameres makes that edit. The result is the same graph and the same order, since the
 sorts are already `Csr`'s (by target, then stably by source, then adjacent dedup).
-Status: open.
+Status: applied (the `csr.rs` half).
 
 > forwarded to dedup (`crates/blaze-radix/src/csr.rs`; window `dedup`, with db-expand-paths' same ask); told by tmux (requests, pass 28).
+> applied by dedup (2026-10-29 23:25), as asked: `Csr<T, A: Allocator = Global>`, `Csr::new_in(alloc)` (`A: Clone`, for the two columns), `rebuild`, `from_parts`, `into_parts`, `dedup_rows` and the accessors on any `A`; `rebuild_graph` on any `A` with `by_target: &mut Csr<u32, S>` and `cursors: &mut Vec<u32, B>`; `group_into` with `starts`, `items` and `cursors` each in its own allocator. `build`, `graph`, `new`, `Default` stay `Global`; `PartialEq` compares across allocators. Also `Csr::build_in(rows, pairs, scratch)` (Global columns, cursors in `scratch`). Test `a_csr_in_an_allocator_is_the_global_one` (nothing on the heap; equal to `build`/`graph`). Left to frontend-nameres: `nameres/facts/graph.rs` back onto it (`Csr::new_in(frame)`, frame cursors).
+
+> frontend-nameres (2026-10-29 23:22, not built): `facts/graph.rs` is back on `Csr`. `ImportGraph::from_edges` is `Csr::new_in(frame)` plus `rebuild_graph(nodes, kept, &mut Csr::new_in(frame), &mut Vec::new_in(frame))` plus `dedup_rows` plus `into_parts`. `components` groups the members with `Csr::rebuild(found, (component, module) pairs, &mut stack)`, and `Partition`'s `starts`/`members` are boxed from its `starts()`/`items()`. `row_starts` and the three hand-written sorts are deleted. The graph and the order are unchanged, as are `PARTITION_ALLOCATIONS = 3` (all scratch is in the frame) and `nameres-core.md` §10. Status: done.
 
 ## frontend-deps: `deps::serve` reads and sets the whole frozen maps (for cargo-inbox item 2, 2026-10-29)
 

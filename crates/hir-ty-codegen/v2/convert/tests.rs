@@ -201,13 +201,6 @@ fn line_rows_take_their_spans() {
 fn what_v2_has_no_target_for_is_an_error() {
     let inlined = reloc(1, binemit::Reloc::X86CallPCRel4, crate::fragment::INLINED, 0);
     assert!(convert(code(vec![inlined], Vec::new()), &requests()).is_err());
-    let offset = ModuleReloc {
-        offset: 1,
-        kind: binemit::Reloc::X86PCRel4,
-        name: ModuleRelocTarget::FunctionOffset(FuncId::from_u32(0), 8),
-        addend: 0,
-    };
-    assert!(convert(code(vec![offset], Vec::new()), &requests()).is_err());
     let mut writable = requests();
     writable.datas[0] = DataRequest::Blob {
         blob: blob(b"x", Vec::new(), Vec::new()),
@@ -230,6 +223,58 @@ fn a_coverage_relocation_is_at_the_functions_own_array() {
     assert_eq!(compiled.coverage, None);
     let past = reloc(1, binemit::Reloc::X86PCRel4, namespace, 3);
     assert!(convert(code(vec![past], Vec::new()), &requests()).is_err());
+}
+
+/// A relocation at the tier counter cells is at the instance's own (`Target::Counter` of its
+/// key), the cell by its addend, whether stencil glue or counting Cranelift code wrote it.
+#[test]
+fn a_counter_relocation_is_at_the_instances_own_cells() {
+    let namespace = blaze_stencil::tier::COUNTER_NAMESPACE;
+    let mut calls = reloc(3, binemit::Reloc::X86PCRel4, namespace, 0);
+    calls.addend = -5;
+    let mut back_edges = reloc(11, binemit::Reloc::X86PCRel4, namespace, 0);
+    back_edges.addend = 3;
+    let compiled = convert(code(vec![calls, back_edges], Vec::new()), &requests()).expect("converted");
+    let targets: Vec<_> = compiled.relocs.iter().map(|it| (it.target.clone(), it.addend)).collect();
+    assert_eq!(targets, vec![(Target::Counter(key()), -5), (Target::Counter(key()), 3)]);
+    let other = reloc(3, binemit::Reloc::X86PCRel4, namespace, 1);
+    assert!(convert(code(vec![other], Vec::new()), &requests()).is_err());
+}
+
+/// A relocation into the function's own code (stencil code's `Name::Own`, Cranelift's
+/// `FunctionOffset`) is at its own instance, `Target::Direct` of its key, the offset added to
+/// its addend; an offset past the code's end is refused.
+#[test]
+fn a_relocation_into_its_own_code_is_at_the_instance() {
+    let into = |at, offset, addend| ModuleReloc {
+        offset: at,
+        kind: binemit::Reloc::X86PCRel4,
+        name: ModuleRelocTarget::FunctionOffset(FuncId::from_u32(0), offset),
+        addend,
+    };
+    let relocs = vec![into(1, 8, -4), into(9, 0, -4), into(17, 32, 0)];
+    let compiled = convert(code(relocs, Vec::new()), &requests()).expect("converted");
+    let targets: Vec<_> = compiled.relocs.iter().map(|it| (it.target.clone(), it.addend)).collect();
+    let own = |addend| (Target::Direct(key()), addend);
+    assert_eq!(targets, vec![own(4), own(-4), own(32)]);
+    assert_eq!(compiled.relocs.targets(), [Target::Direct(key())]);
+    assert!(convert(code(vec![into(1, 33, 0)], Vec::new()), &requests()).is_err());
+    assert!(convert(code(vec![into(1, 8, i64::MAX)], Vec::new()), &requests()).is_err());
+}
+
+/// An instrumented function's PGO counters are its own, the counter by the addend.
+#[cfg(feature = "llvm")]
+#[test]
+fn a_pgo_counter_relocation_is_at_the_functions_own_counters() {
+    let namespace = crate::llvm::pgo::COUNTER_RELOCS;
+    let mut second = reloc(3, binemit::Reloc::X86PCRel4, namespace, 0);
+    second.addend = 4;
+    let compiled = convert(code(vec![second], Vec::new()), &requests()).expect("converted");
+    let targets: Vec<_> = compiled.relocs.iter().map(|it| (it.target.clone(), it.addend)).collect();
+    assert_eq!(targets, vec![(Target::ProfileCounters, 4)]);
+    assert_eq!(compiled.profile, None);
+    let other = reloc(3, binemit::Reloc::X86PCRel4, namespace, 1);
+    assert!(convert(code(vec![other], Vec::new()), &requests()).is_err());
 }
 
 #[test]

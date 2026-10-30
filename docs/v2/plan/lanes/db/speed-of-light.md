@@ -693,6 +693,23 @@ The most frequent operation: every read of a query inside a query, on every warm
 | cold pack check | `memcmp`, 30 GB/s | a second hash | `memcmp` | ≈ 1× in CPU; faults dominate | populated maps, once measured |
 | image write | ≈ 1.7 s (10 GB) | ≈ 2.6 s | ≈ 2.1 s | 1.24× (once per cold build) | radix sort of the keys |
 
+### Salsa's interned values in the image (`vendor/salsa/src/image.rs`, speed-salsa, 10-29)
+
+Not yet built or measured. These are counts from the code:
+
+- **Write:** one pass over every slot of every kept struct, plus one mark-and-name walk of
+  the values the roots reach. A kept slot costs a 24-byte record and the codec's bytes; a
+  slot of a page that isn't kept costs nothing but its page's 4-byte owner word. The GC bit
+  set is 1 bit per slot of the pages in use: \(\frac{n}{8}\) bytes for \(n\) slots, so 128 KB
+  for 1 M slots.
+- **Restore:** one decode per kept value into a `Vec` (validate, then apply), then a slot
+  write, one hash and one key-map insert per value. Its bound is that hash and insert, about
+  20 ns a value, so 1 M interned values take about 20 ms on one core. The apply is
+  single-threaded under `&mut`; shards are independent, so splitting it across the pool is
+  what removes the rest. Unlike `intern::Mapped`, values are copied into salsa's slots and
+  not read in place: salsa's slots own their fields, and reading them in place needs fields
+  laid out as `blaze-format` records (a change to the slot type, not taken).
+
 ## hir-def: name resolution (speed-hir-sol-nameres)
 
 What this covers:

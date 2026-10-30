@@ -27,14 +27,23 @@ pub struct Reach {
 }
 
 /// A node as [`Reach::new`] takes it: its marks and its references.
-pub(super) struct Node<'a> {
-    pub(super) marks: [ContentId; 2],
-    pub(super) refs: &'a [Target],
+pub(crate) struct Node<'a> {
+    pub(crate) marks: [ContentId; 2],
+    pub(crate) refs: &'a [Target],
+}
+
+/// What [`Reach::functions_of`] reuses from one root to the next: a bit per node, of which
+/// each walk clears only those it set, and the walk's stack and the nodes it visited.
+#[derive(Default)]
+pub(crate) struct Walk {
+    seen: Vec<u64>,
+    stack: Vec<u32>,
+    visited: Vec<u32>,
 }
 
 impl Reach {
     /// The graph of `functions` and `statics`, each sorted by key, without duplicates.
-    pub(super) fn new<'a>(
+    pub(crate) fn new<'a>(
         functions: impl Iterator<Item = (InstanceKey, Node<'a>)>,
         statics: impl Iterator<Item = ((ItemKey, ContentId), Node<'a>)>,
     ) -> Reach {
@@ -104,7 +113,9 @@ impl Reach {
             | Target::Extern(_)
             | Target::Weak(_)
             | Target::Position(_)
-            | Target::Coverage(_) => None,
+            | Target::Coverage(_)
+            | Target::Counter(_)
+            | Target::ProfileCounters => None,
         }
     }
 
@@ -134,6 +145,54 @@ impl Reach {
         marks.sort_unstable();
         marks.dedup();
         Some(marks)
+    }
+
+    /// The functions `root` reaches, itself included, as their places in key order (those of
+    /// [`super::Built::inputs`]), sorted: through statics too, whose values point at functions.
+    /// `None` when `root` is no function of the build.
+    pub(crate) fn functions_of(&self, root: &InstanceKey, walk: &mut Walk) -> Option<Vec<u32>> {
+        let root = self.functions.binary_search(root).ok()? as u32;
+        walk.seen.resize(self.marks.len().div_ceil(64), 0);
+        walk.stack.clear();
+        walk.visited.clear();
+        walk.seen[root as usize / 64] |= 1 << (root % 64);
+        walk.stack.push(root);
+        walk.visited.push(root);
+        while let Some(at) = walk.stack.pop() {
+            let edges = &self.edges[self.starts[at as usize] as usize..self.starts[at as usize + 1] as usize];
+            for &next in edges {
+                let (word, bit) = (next as usize / 64, 1u64 << (next % 64));
+                if walk.seen[word] & bit == 0 {
+                    walk.seen[word] |= bit;
+                    walk.stack.push(next);
+                    walk.visited.push(next);
+                }
+            }
+        }
+        let functions = self.functions.len();
+        let words = functions.div_ceil(64);
+        // alloc: per root, the list its caller keeps
+        let mut out = Vec::with_capacity(walk.visited.len());
+        // A scan of the functions' bits when it reads fewer words than a sort would compare.
+        if walk.visited.len() * 4 >= words {
+            for (word, &bits) in walk.seen[..words].iter().enumerate() {
+                let mut bits = match word + 1 == words && functions % 64 != 0 {
+                    true => bits & ((1u64 << (functions % 64)) - 1),
+                    false => bits,
+                };
+                while bits != 0 {
+                    out.push((word * 64) as u32 + bits.trailing_zeros());
+                    bits &= bits - 1;
+                }
+            }
+        } else {
+            out.extend(walk.visited.iter().copied().filter(|&it| (it as usize) < functions));
+            out.sort_unstable();
+        }
+        for &at in &walk.visited {
+            walk.seen[at as usize / 64] &= !(1u64 << (at % 64));
+        }
+        Some(out)
     }
 }
 
@@ -189,5 +248,38 @@ mod tests {
         let want: Vec<CodeHash> =
             [0, 8, 10, 20, 50].into_iter().map(|it| CodeHash(mark(it))).collect();
         assert_eq!(got, want);
+    }
+
+    /// The functions a root reaches by place, through a static, the same with the walk reused
+    /// and on both ways of listing them, against `of`'s marks.
+    #[test]
+    fn a_root_s_functions_are_its_places_in_key_order() {
+        // Function `n` is the `n`th in key order.
+        let numbered = |n: u32| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&n.to_be_bytes());
+            InstanceKey(ContentId(bytes))
+        };
+        let item = ItemKey(mark(7));
+        let none: [Target; 0] = [];
+        let calls = [Target::Direct(numbered(2)), Target::Static { item, instance: mark(8) }];
+        let to_four = [Target::Function(numbered(4))];
+        // 300 functions: a root that reaches one lists it by a sort, one that reaches more by
+        // its bits. 0 reaches 2, the static and through it 4; 299 reaches every function.
+        let mut functions: Vec<(InstanceKey, Node<'_>)> =
+            (0..300).map(|n| (numbered(n), Node { marks: [mark(1), mark(0)], refs: &none[..] })).collect();
+        functions[0].1.refs = &calls[..];
+        let all: Vec<Target> = (0..300).map(|n| Target::Direct(numbered(n))).collect();
+        functions[299].1.refs = &all[..];
+        let statics = [((item, mark(8)), Node { marks: [mark(90), mark(8)], refs: &to_four[..] })];
+        let reach = Reach::new(functions.into_iter(), statics.into_iter());
+        let mut walk = Walk::default();
+        for _ in 0..2 {
+            assert_eq!(reach.functions_of(&numbered(0), &mut walk).unwrap(), [0, 2, 4]);
+            assert_eq!(reach.functions_of(&numbered(299), &mut walk).unwrap(), (0..300).collect::<Vec<u32>>());
+            assert_eq!(reach.functions_of(&numbered(1), &mut walk).unwrap(), [1]);
+        }
+        assert_eq!(reach.functions_of(&numbered(300), &mut walk), None);
+        assert!(walk.seen.iter().all(|it| *it == 0), "each walk clears what it set");
     }
 }

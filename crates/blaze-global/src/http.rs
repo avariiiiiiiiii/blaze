@@ -89,12 +89,14 @@ pub(crate) fn response_head(buffer: &[u8], body_most: u64) -> Result<Option<Resp
     let status_line = lines.next().unwrap_or_default();
     let mut words = status_line.splitn(3, ' ');
     if words.next() != Some("HTTP/1.1") {
+        // alloc: an error's message, made only when it fails.
         return Err(format!("not an HTTP/1.1 response: {status_line:?}"));
     }
     let status = words
         .next()
         .filter(|it| it.len() == 3)
         .and_then(|it| it.parse::<u16>().ok())
+        // alloc: an error's message, made only when it fails.
         .ok_or_else(|| format!("a status line with no status: {status_line:?}"))?;
     let fields = fields(lines, body_most).map_err(|bad| bad.what)?;
     Ok(Some(ResponseHead { status, head, body: fields.body, close: fields.close }))
@@ -104,17 +106,22 @@ pub(crate) fn request_head(buffer: &[u8], body_most: impl Fn(&str) -> u64) -> Re
     let Some((head, lines)) = head_lines(buffer)? else { return Ok(None) };
     let mut lines = lines.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
-    let words: Vec<&str> = request_line.split(' ').collect();
-    let [method, path, version] = words[..] else {
+    let mut words = request_line.split(' ');
+    let (Some(method), Some(path), Some(version), None) = (words.next(), words.next(), words.next(), words.next())
+    else {
+        // alloc: an error's message, made only when it fails.
         return Err(bad(400, format!("not a request line: {request_line:?}")));
     };
     if version != "HTTP/1.1" {
+        // alloc: an error's message, made only when it fails.
         return Err(bad(400, format!("not an HTTP/1.1 request: {request_line:?}")));
     }
     if method != "POST" {
+        // alloc: an error's message, made only when it fails.
         return Err(bad(405, format!("{method} {path}: the global cache takes POST only")));
     }
     let fields = fields(lines, body_most(path))?;
+    // alloc: the edge: the request's path, one a request.
     Ok(Some(RequestHead { path: path.to_owned(), head, body: fields.body }))
 }
 
@@ -127,6 +134,7 @@ fn head_lines(buffer: &[u8]) -> Result<Option<(usize, &str)>, Bad> {
     let window = &buffer[..buffer.len().min(HEAD_MOST)];
     let Some(end) = memchr::memmem::find(window, b"\r\n\r\n") else {
         if buffer.len() >= HEAD_MOST {
+            // alloc: an error's message, made only when it fails.
             return Err(bad(400, format!("a head longer than the {HEAD_MOST} bytes allowed")));
         }
         return Ok(None);
@@ -144,6 +152,7 @@ fn fields<'a>(lines: impl Iterator<Item = &'a str>, body_most: u64) -> Result<Fi
     let mut body = None;
     let mut close = false;
     for line in lines {
+        // alloc: an error's message, made only when it fails.
         let (name, value) = line.split_once(':').ok_or_else(|| bad(400, format!("a header with no colon: {line:?}")))?;
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
@@ -151,14 +160,18 @@ fn fields<'a>(lines: impl Iterator<Item = &'a str>, body_most: u64) -> Result<Fi
                 return Err(bad(400, "two Content-Length headers".into()));
             }
             if value.is_empty() || !value.bytes().all(|it| it.is_ascii_digit()) {
+                // alloc: an error's message, made only when it fails.
                 return Err(bad(400, format!("a Content-Length of {value:?}")));
             }
+            // alloc: an error's message, made only when it fails.
             let len = value.parse::<u64>().map_err(|_| bad(413, format!("a Content-Length of {value}")))?;
             if len > body_most {
+                // alloc: an error's message, made only when it fails.
                 return Err(bad(413, format!("a body of {len} bytes, more than the {body_most} allowed")));
             }
             body = Some(len as usize);
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            // alloc: an error's message, made only when it fails.
             return Err(bad(400, format!("a body sent as {value}: only a Content-Length is taken")));
         } else if name.eq_ignore_ascii_case("connection") {
             close = value.split(',').any(|it| it.trim().eq_ignore_ascii_case("close"));

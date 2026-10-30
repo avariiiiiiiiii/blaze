@@ -29,6 +29,7 @@ already list them; for bodies only the inference result has the list.
 until this lands. Read-only, no behavior change.
 
 > forwarded to db: `crates/hir-ty/src/infer.rs` is db's (db-ty).
+> checked by db-audit-other (22:39): in the tree at `crates/hir-ty/src/infer.rs:1914` (`InferenceResult::defined_anon_consts`).
 
 ## items-form: `VTableMap::tys` (`crates/hir-ty/src/mir.rs`)
 
@@ -54,6 +55,7 @@ form that spells one. With `tys` it is one line and no wasted work. Read-only, n
 change.
 
 > forwarded to db: `crates/hir-ty/src/mir.rs` is db's (db-ty).
+> checked by db-audit-other (22:39): in the tree at `crates/hir-ty/src/mir.rs:2172` (`VTableMap::tys`), as speed-types' line above says.
 
 ## items-form: `tait_hidden_types` public (`crates/hir-ty/src/opaques.rs`), optional
 
@@ -264,6 +266,7 @@ derives, crate by crate, which is the order the walk gives today. Asked: use it 
 trait no longer reruns the goal.
 
 > forwarded to db: `next_solver/solver.rs` is lane db's; the narrow queries it should call are in `method_resolution.rs`.
+> checked by db-audit-other (22:39): in the tree. Candidate assembly is in `crates/hir-ty/src/next_solver/interner.rs`: `TraitImpls::in_crate_and_deps_for_trait_and_self_ty` at :1921 and `TraitImpls::blanket_in_crate_and_deps` at :2076. `for_crate_and_deps` is no longer called anywhere under `next_solver/`.
 
 ## speed-hir-store: blaze-items onto the HIR column views (from speed-hir-store-tools)
 
@@ -357,6 +360,7 @@ for `rustc_nounwind`. `form.rs` already gates on the bits itself (`Cx::attrs`). 
 every other caller cheaper too, with the same answers.
 
 > forwarded to db: `crates/hir-def/src/attrs.rs` is lane db's.
+> checked by db-audit-other (22:39): in the tree at `crates/hir-def/src/attrs.rs`. 1: `link_name`, `link_section`, `linkage` and `export_name` return before their tracked query when the bit is missing (:1457, :1525, :1539, :1553). 2: `is_rustc_nounwind` is `AttrFlags::query(..).contains(RUSTC_NOUNWIND)` (:1822-1823).
 
 ## speed-types-probe-coherence, for lane items: tests of the coherence and opaques speed pass (`crates/blaze-items/src/tests/`)
 
@@ -2291,6 +2295,8 @@ pub fn check(db: &Db, krate: Crate) {
 ```
 
 (its doc comment stays). What is recorded is the same text as before.
+
+> applied by requests-items-next: `method_resolution/frozen.rs` `check` is now `check_frozen(db, krate, "impls", frozen, || encode(db, krate))`, as written. The import takes `check_frozen` in place of `record_difference`, which the file no longer uses.
 
 ## From db (db-next2, 2026-10-29): `opaques.rs` still calls `StoredEarlyBinder::bind` with one argument
 

@@ -61,7 +61,7 @@ pub(crate) fn stability(path: &[&str]) -> Option<Option<Gate>> {
 
 /// rustc's `check_attribute_stability` of `attr`: E0658 when its parser is unstable, the
 /// feature is not enabled and the expansion it comes from is not allowed it, at its path.
-pub(crate) fn gate(cx: &Cx<'_, '_>, features: &Features, attr: &Attr) -> Option<Diag> {
+pub(crate) fn gate(cx: &Cx<'_, '_>, features: &Features, attr: &Attr<'_>) -> Option<Diag> {
     let path = attr.meta()?.path()?;
     let mut names: [Option<ast::NameRef<'_>>; 2] = [None, None];
     let mut len = 0;
@@ -136,8 +136,8 @@ fn explain(feature: &str, name: &str) -> String {
 /// `#[cfg]`s and `#[cfg_attr]`s in order (a `cfg_attr`'s attributes when its predicate holds;
 /// nothing after a `cfg` that does not, nor in the node), the predicate of each `cfg!`, and the
 /// [`gate`]s of a macro call's attributes.
-pub(super) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner], features: &Features) -> Vec<Found> {
-    let calls: FxHashMap<InFile<SyntaxNodePtr>, &Owner> =
+pub(super) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner<'_>], features: &Features) -> Vec<Found> {
+    let calls: FxHashMap<InFile<SyntaxNodePtr>, &Owner<'_>> =
         // alloc: setup, the macro calls' owners, once per check
         owners.iter().filter(|it| it.target == Target::MacroCall).map(|it| (it.at(), it)).collect();
     // alloc: empty, allocates only when a gate is hit

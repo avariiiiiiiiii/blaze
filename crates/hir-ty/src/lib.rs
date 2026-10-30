@@ -37,6 +37,7 @@ mod variance;
 pub mod autoderef;
 pub mod check_cache;
 pub mod consteval;
+pub mod coroutine_obligations;
 pub mod db;
 pub mod drop;
 pub mod dyn_compatibility;
@@ -113,7 +114,7 @@ pub use infer::{
 pub use lower::{
     ElidedLifetimes, ElidedOutput, FieldType, FieldTypes, GenericDefaults, GenericDefaultsRef,
     GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, LoweringMode, Lowered,
-    SelfAndAssocBounds, TyDefId, TyLoweringContext, TyLoweringResult,
+    PredicateSource, SelfAndAssocBounds, TyDefId, TyLoweringContext, TyLoweringResult,
     ValueTyDefId,
     batch::{
         Batch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits, SideTable,
@@ -121,7 +122,7 @@ pub use lower::{
     diagnostics::*,
     elided_lifetimes,
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
-    with_elided_regions,
+    predicate_sources, with_elided_regions,
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
 pub use opaques::{rpit_hidden_types, tait_hidden_types};
@@ -185,11 +186,25 @@ pub struct ComplexMemoryMap<'db> {
     /// those are not rustc's hashes, which whoever emits the constant puts in their place.
     /// `None` for the id of a field reflection made.
     pub type_ids: Vec<Option<Ty<'db>>>,
+    /// The offsets into the evaluated value's bytes of each word that is a pointer with
+    /// provenance, sorted. A word not listed is an integer, even when it is typed as a pointer.
+    value_pointers: Vec<usize>,
+    /// The addresses, in this map's address space, of each word inside `memory`'s pieces that
+    /// is a pointer with provenance, sorted.
+    memory_pointers: Vec<usize>,
 }
 
 impl Hash for ComplexMemoryMap<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let ComplexMemoryMap { memory, vtable, statics, aligns, type_ids } = self;
+        let ComplexMemoryMap {
+            memory,
+            vtable,
+            statics,
+            aligns,
+            type_ids,
+            value_pointers,
+            memory_pointers,
+        } = self;
         memory.hash(state);
         // `VTableMap`'s ids of types follow from the order of its types.
         state.write_usize(vtable.tys().len());
@@ -197,7 +212,17 @@ impl Hash for ComplexMemoryMap<'_> {
         statics.hash(state);
         aligns.hash(state);
         type_ids.hash(state);
+        value_pointers.hash(state);
+        memory_pointers.hash(state);
     }
+}
+
+/// Where a word of an evaluated constant is: at an offset into its value's bytes, or at an
+/// address inside its memory map's pieces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerAt {
+    Value(usize),
+    Memory(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -396,6 +421,17 @@ impl ComplexMemoryMap<'_> {
             Err(at) => self.aligns.insert(at, (addr, align)),
         }
     }
+
+    /// Records that the word at `at` is a pointer with provenance.
+    pub fn note_pointer(&mut self, at: PointerAt) {
+        let (column, at) = match at {
+            PointerAt::Value(offset) => (&mut self.value_pointers, offset),
+            PointerAt::Memory(addr) => (&mut self.memory_pointers, addr),
+        };
+        if let Err(index) = column.binary_search(&at) {
+            column.insert(index, at);
+        }
+    }
 }
 
 impl<'db> MemoryMap<'db> {
@@ -426,6 +462,16 @@ impl<'db> MemoryMap<'db> {
                 let at = map.aligns.binary_search_by_key(&start, |it| it.0).ok()?;
                 Some(map.aligns[at].1)
             }
+        }
+    }
+
+    /// Whether the word at `at` is a pointer with provenance. An `Empty` or `Simple` map holds
+    /// no such word: a `Simple` map is only made for a literal's reference.
+    pub fn has_provenance(&self, at: PointerAt) -> bool {
+        let MemoryMap::Complex(map) = self else { return false };
+        match at {
+            PointerAt::Value(offset) => map.value_pointers.binary_search(&offset).is_ok(),
+            PointerAt::Memory(addr) => map.memory_pointers.binary_search(&addr).is_ok(),
         }
     }
 
@@ -615,6 +661,38 @@ mod memory_map_tests {
         assert_ne!(hash(&empty), hash(&with_static));
         assert_ne!(hash(&MemoryMap::Empty), hash(&MemoryMap::simple(Box::new([0u8; 0]))));
         assert_ne!(hash(&MemoryMap::simple(Box::new([1u8]))), hash(&MemoryMap::simple(Box::new([2u8]))));
+    }
+
+    #[test]
+    fn pointers_with_provenance_are_kept_by_column_and_hashed() {
+        let mut map = ComplexMemoryMap::default();
+        map.note_pointer(PointerAt::Memory(24));
+        map.note_pointer(PointerAt::Value(8));
+        map.note_pointer(PointerAt::Memory(16));
+        map.note_pointer(PointerAt::Memory(24));
+        let mut other = ComplexMemoryMap::default();
+        other.note_pointer(PointerAt::Memory(16));
+        other.note_pointer(PointerAt::Memory(24));
+        other.note_pointer(PointerAt::Value(8));
+        assert_eq!(map.memory_pointers, [16, 24]);
+        let (map, other) = (MemoryMap::Complex(Box::new(map)), MemoryMap::Complex(Box::new(other)));
+        assert_eq!(map, other);
+        assert_eq!(hash(&map), hash(&other));
+        assert!(map.has_provenance(PointerAt::Value(8)));
+        assert!(map.has_provenance(PointerAt::Memory(16)));
+        assert!(!map.has_provenance(PointerAt::Memory(8)));
+        assert!(!map.has_provenance(PointerAt::Value(16)));
+        assert!(!MemoryMap::Empty.has_provenance(PointerAt::Value(0)));
+        assert!(!MemoryMap::simple(Box::new([0u8; 8])).has_provenance(PointerAt::Value(0)));
+        for at in [PointerAt::Value(16), PointerAt::Memory(8)] {
+            let mut moved = ComplexMemoryMap::default();
+            moved.note_pointer(PointerAt::Memory(16));
+            moved.note_pointer(PointerAt::Memory(24));
+            moved.note_pointer(at);
+            let moved = MemoryMap::Complex(Box::new(moved));
+            assert_ne!(map, moved);
+            assert_ne!(hash(&map), hash(&moved));
+        }
     }
 }
 

@@ -30,6 +30,7 @@ pub(crate) mod misc;
 pub(crate) mod stability;
 
 use hir::InFile;
+use hir_def::attrs::stability::RustcVersion;
 use syntax::TextRange;
 
 use super::{
@@ -246,18 +247,10 @@ pub(crate) fn limit(cx: &mut Accept<'_, '_, '_>, nv: &NameValue) -> Option<u64> 
     None
 }
 
-/// `util.rs`' `parse_version`: `1.2` or `1.2.3`, without a `-` suffix.
+/// rustc's `parse_version` (hir-def's [`RustcVersion::parse`]), as the tuple the parsed
+/// attributes keep.
 pub(crate) fn parse_version(text: &str) -> Option<(u16, u16, u16)> {
-    let mut components = text.split('-');
-    let digits = components.next()?;
-    if components.next().is_some() {
-        return None;
-    }
-    let mut digits = digits.splitn(3, '.');
-    let major = digits.next()?.parse().ok()?;
-    let minor = digits.next()?.parse().ok()?;
-    let patch = digits.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
+    RustcVersion::parse(text).map(|it| (it.major, it.minor, it.patch))
 }
 
 #[cfg(test)]

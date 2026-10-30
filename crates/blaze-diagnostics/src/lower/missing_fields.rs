@@ -32,14 +32,13 @@ use crate::{
             Record, RecordField, has_unmentioned_error, is_number, listify, pat_fields, suggestable, tuple_variant_as_struct,
             variant_path,
         },
+        unresolved_method_call::inject_use_span,
     },
     model::{Applicability, Diag, MultiSpan, SuggestionStyle},
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingFields) -> Vec<Found> {
-    // alloc: empty, allocates nothing
-    let Some((_, first)) = d.missed_fields.first() else { return vec![] };
-    let variant = first.parent_def(cx.db);
+    let variant = d.variant;
     let node = cx.node_view(InFile::new(d.file, d.field_list_parent));
     // alloc: empty, allocates nothing
     let Some(record) = Record::of(d.file, node.value) else { return vec![] };
@@ -137,7 +136,7 @@ fn expression<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Variant
     let remaining = remaining(cx, record, variant);
     match record.rest {
         Some((_, Some(_))) => None,
-        Some((dots, None)) => default_fields(cx, record, dots, &remaining),
+        Some((dots, None)) => default_fields(cx, record, variant, dots, &remaining),
         None => {
             if matches!(variant, hir::Variant::Union(_))
                 || remaining.is_empty()
@@ -194,8 +193,14 @@ pub(crate) fn last_field_mismatch<'db>(cx: &Cx<'_, 'db>, value: InFile<ast::Node
 }
 
 /// `..` with no base: E0797, or with `#![feature(default_field_values)]` the fields without
-/// a default value.
-fn default_fields(cx: &Cx<'_, '_>, record: &Record<'_>, dots: TextRange, remaining: &[(String, hir::Field)]) -> Option<Diag> {
+/// a default value, or the variant having no fields.
+fn default_fields(
+    cx: &Cx<'_, '_>,
+    record: &Record<'_>,
+    variant: hir::Variant,
+    dots: TextRange,
+    remaining: &[(String, hir::Field)],
+) -> Option<Diag> {
     let mandatory: Vec<&str> =
         // alloc: the error's parts, for an error hir found
         remaining.iter().filter(|(_, it)| !has_default(cx, *it)).map(|(name, _)| name.as_str()).collect();
@@ -205,9 +210,38 @@ fn default_fields(cx: &Cx<'_, '_>, record: &Record<'_>, dots: TextRange, remaini
         let at = dots.shrink_to_hi();
         // clone: the error's parts, for an error hir found
         let mut diag = Diag::error(Some("E0797"), "base expression required after `..`", at.clone());
-        if !remaining.is_empty() {
-            diag.suggestion_verbose(at, "add a base expression here", "/* expr */", Applicability::HasPlaceholders);
+        // `sess.is_nightly_build()`, as `checks::features` reads it: `RUSTC_BOOTSTRAP=-1` makes
+        // it a stable compiler.
+        let nightly = cx.krate.base().env(cx.db).get("RUSTC_BOOTSTRAP").as_deref() != Some("-1");
+        if nightly && mandatory.is_empty() && !remaining.is_empty() {
+            let root = cx.krate.root_module(cx.db);
+            let inject = inject_use_span(cx, root).expect("the crate root is a file, whose items have a start");
+            diag.suggestion_verbose(
+                inject,
+                "add `#![feature(default_field_values)]` to the crate attributes to enable default values on `struct` fields",
+                "#![feature(default_field_values)]\n",
+                Applicability::MachineApplicable,
+            );
         }
+        match remaining.is_empty() {
+            false => {
+                diag.suggestion_verbose(at, "add a base expression here", "/* expr */", Applicability::HasPlaceholders)
+            }
+            true => diag.suggestion_verbose(
+                dots,
+                "remove the `..` as all the fields are already present",
+                "",
+                Applicability::MachineApplicable,
+            ),
+        };
+        return Some(diag);
+    }
+    if variant.fields_iter(cx.db).next().is_none() {
+        let message =
+            // alloc: the error's text, for an error hir found
+            format!("`{}` has no fields, `..` needs at least one default field in the struct definition", adt_ty(cx, record, variant));
+        let mut diag = Diag::error(None, message, dots);
+        diag.span_label(record.span(cx, record.path_range()), "this type has no fields");
         return Some(diag);
     }
     if mandatory.is_empty() {

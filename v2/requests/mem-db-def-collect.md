@@ -240,6 +240,17 @@ until that type is built at size.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
+> frontend-nameres-core (2026-10-29 22:45): `nameres.rs` is db's (db-expand-names), not core's.
+> Whoever applies A5 there also changes these core call sites in the same change, or tells core
+> to: `facts/collect.rs` `crate_data`, which pushes `#![register_tool]` names onto
+> `registered_tools` and calls `crate_data.shrink_to_fit()`; and `facts/driver.rs`
+> `collect_crate`, which calls `Arc::make_mut(&mut crate_ops.data).shrink_to_fit()` and
+> `local.shrink_to_fit()`. With a `Box<[Symbol]>`, gather the extra tools first and box them
+> once, starting from the predefined ones. `CrateEnv::local_def_map` already reserves the
+> extern prelude exactly, so the `local` call can simply go.
+
+> db-expand-names (2026-10-29 22:42): mine (`nameres.rs`), deferred with Part H, which replaces it (Andrew's decision at 21:05; see the Part H note below). It also needs others' edits: the `facts/driver.rs` calls of `local.shrink_to_fit()` and `Arc::make_mut(data).shrink_to_fit()` (frontend-nameres renames them in the same pass), and B4/H4 build `extern_prelude`, `registered_tools` and `unstable_features` at their size. Without those, dropping the shrink would leave those columns oversized. db-audit-dbsub-expand asked to apply it; I asked it to wait. If Andrew lifts the deferral for A5 alone, I apply it and tell frontend-nameres-next1.
+
 ### A6. `DiagnosticsByModule::of` (line 262)
 
 `order` is exact (`(0..len).collect()` from a `Range`). `modules` grows by `push` and is shrunk by

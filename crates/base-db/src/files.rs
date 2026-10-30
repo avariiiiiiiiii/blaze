@@ -458,6 +458,29 @@ impl Files {
         over.unwrap_or_else(|| path.to_owned())
     }
 
+    /// [`Files::on_disk`] into `out`, emptied first: for a caller that asks it of every file on
+    /// every look and keeps one buffer for it.
+    pub fn on_disk_into(&self, path: &Path, out: &mut PathBuf) {
+        out.as_mut_os_string().clear();
+        let over = self
+            .views_in_use()
+            .iter()
+            .filter(|it| !it.built.iter().any(|built| path.starts_with(built)))
+            .find_map(|it| Some((&it.over, path.strip_prefix(&it.base).ok()?)));
+        match over {
+            Some((over, rest)) => {
+                out.push(over);
+                out.push(rest);
+            }
+            None => out.push(path),
+        }
+    }
+
+    /// The files outside the VFS that `include_bytes!` or `include_str!` named, in no order.
+    pub fn included_paths(&self) -> impl Iterator<Item = &AbsPath> + '_ {
+        self.included.iter().map(|it| it.path.as_path())
+    }
+
     /// A file outside the VFS that `include_bytes!` or `include_str!` names, read from disk the
     /// first time it is asked for. Whoever watches the disk keeps it current with
     /// [`Files::reload_included_file`]. Two readers that ask for it first at once each read it,
@@ -711,8 +734,8 @@ impl Files {
     }
 
     /// The first file ID from `next` on that nothing has: the one place base-db hands out file
-    /// IDs, for a view's new files ([`Files::set_view_root`]) and crate attributes' files
-    /// ([`crate::crate_attrs`]).
+    /// IDs, for a view's new files ([`Files::set_view_root`]), crate attributes' files
+    /// ([`crate::crate_attrs`]) and callers that number their own ([`Files::new_file_id`]).
     pub(crate) fn unused_file_id(&self, writer: &Writer, next: &mut u32) -> Option<FileId> {
         while *next <= span::EditionedFileId::MAX_FILE_ID {
             let id = FileId::from_raw(*next);
@@ -722,6 +745,17 @@ impl Files {
             }
         }
         None
+    }
+
+    /// A file ID nothing has and no earlier call gave, for a caller that numbers files of its
+    /// own (a VFS reload, the doctest builder): set after a crate graph with crate attributes,
+    /// it never meets an attribute's file or a view's. `None` once every file ID is taken.
+    pub fn new_file_id(&self) -> Option<FileId> {
+        let mut writer = self.lock();
+        let mut next = writer.next_file;
+        let id = self.unused_file_id(&writer, &mut next);
+        writer.next_file = next;
+        id
     }
 }
 

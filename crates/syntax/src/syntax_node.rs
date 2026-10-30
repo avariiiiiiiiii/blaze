@@ -95,7 +95,7 @@ impl SyntaxTreeBuilder {
         // Disable block validation, see https://github.com/rust-lang/rust-analyzer/pull/10357
         #[allow(clippy::overly_complex_bool_expr)]
         if cfg!(debug_assertions) && false {
-            crate::validation::validate_block_structure(&tree.root());
+            crate::validation::validate_block_structure(crate::view::Node::root(tree.flat()));
         }
         Parse::new(tree, errors)
     }

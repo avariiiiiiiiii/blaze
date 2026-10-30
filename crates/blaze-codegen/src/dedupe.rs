@@ -116,8 +116,13 @@ pub fn dedupe(
     loop {
         // Unordered: each group is sorted on its own, and only fills `more`, a map by key.
         let mut groups: FxHashMap<ContentId, Vec<InstanceKey>> = FxHashMap::default();
-        // A covered function counts its own blocks: merged, two would share counters.
-        for function in functions.iter().filter(|it| mergeable(&it.key) && it.coverage.is_none()) {
+        // A covered function counts its own blocks, a counting one its own calls and an
+        // instrumented one its own PGO record: merged, two would share counters.
+        let counts = |it: &CompiledFunction| {
+            it.profile.is_some_and(|it| it.counted().is_some())
+                || it.relocs.targets().iter().any(|it| matches!(it, Target::Counter(_) | Target::ProfileCounters))
+        };
+        for function in functions.iter().filter(|it| mergeable(&it.key) && it.coverage.is_none() && !counts(it)) {
             groups.entry(code_id(function)).or_default().push(function.key);
         }
         let mut more: HashMap<InstanceKey, InstanceKey> = HashMap::new();
@@ -176,6 +181,7 @@ mod tests {
             unwind: None,
             lines: Vec::new(),
             coverage: None,
+            profile: None,
         }
     }
 
@@ -233,6 +239,38 @@ mod tests {
         };
         let mut functions = vec![covered(2), covered(3)];
         assert!(dedupe(&mut functions, &|_| true).merged.is_empty());
+        assert_eq!(functions.len(), 2);
+    }
+
+    #[test]
+    fn counting_functions_count_apart() {
+        let counting = |n| {
+            let mut it = function(n, 0x90, &[]);
+            it.relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::Counter(key(n)), addend: 4 });
+            it
+        };
+        let mut functions = vec![counting(2), counting(3), function(7, 0xc3, &[3])];
+        assert!(dedupe(&mut functions, &|_| true).merged.is_empty());
+        assert_eq!(functions.len(), 3);
+        assert_eq!(functions[0].relocs.targets(), [Target::Counter(key(2))]);
+    }
+
+    /// Instrumented functions keep their own records and counters; ones built with a profile
+    /// merge as any code, a mismatched one only with another mismatched.
+    #[test]
+    fn instrumented_functions_count_apart() {
+        let record = crate::ProfileRecord { name: [1; 16], name_ref: 2, hash: 3, counters: 1, version: 10 };
+        let profiled = |n, profile| CompiledFunction { profile: Some(profile), ..function(n, 0x90, &[]) };
+        let mut functions = vec![profiled(2, crate::Profiled::Counted(record)), profiled(3, crate::Profiled::Counted(record))];
+        functions[0].relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::ProfileCounters, addend: 4 });
+        functions[1].relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::ProfileCounters, addend: 4 });
+        assert!(dedupe(&mut functions, &|_| true).merged.is_empty());
+        assert_eq!(functions.len(), 2);
+
+        let used = |mismatched| crate::Profiled::Used { mismatched };
+        let mut functions = vec![profiled(2, used(true)), profiled(3, used(true)), profiled(4, used(false))];
+        let deduped = dedupe(&mut functions, &|_| true);
+        assert_eq!(deduped.merged, BTreeMap::from([(key(3), key(2))]));
         assert_eq!(functions.len(), 2);
     }
 

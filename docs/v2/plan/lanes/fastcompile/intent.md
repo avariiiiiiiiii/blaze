@@ -175,3 +175,212 @@ task could hold a thread for up to one task's length.
 - Without request 2, a speculative job runs as an ordinary weighted request. Until then the
   daemon must not implement `speculate` as `start`: it stops with an error naming the
   missing idle class.
+
+## Speed of light
+
+Nothing here was run: costs are counted from the code and the machine. The machine is that of
+[link's speed of light](../link/speed-of-light.md#the-machine): 3.5 GHz, L2 streaming at
+32 bytes a cycle (about 110 GB/s read, about 50 GB/s for a copy, which reads and writes), one
+core from DRAM at about 25 GB/s, BLAKE3 at about 6 GB/s. A salsa memo hit is about 30 ns, as in
+[share.md](share.md#speed-of-light). The lexer runs at about 1 GB/s
+([mem/codegen.md](../mem/codegen.md)).
+
+There are three hot paths:
+
+- one edit applied to a file's flat tree, which should be bound by the bytes it changes;
+- a rename, which should be bound by the references it finds;
+- a declared intent, which should be bound by the work it starts and by how fast that work
+  stops once dropped.
+
+### Unit costs
+
+| step | cost |
+|---|---|
+| copy or compare bytes held in L2, per byte moved | about 0.02 ns |
+| lex and parse a block, and build its subtree | about 5 ns a byte (about 25 ns a token of about 5 bytes) |
+| scan for a name (`memchr::memmem`), file bytes from DRAM | about 0.04 ns a byte |
+| down from the root to the element at an offset: `covering_element`, a binary search of each level's children, about 10 levels | about 100 ns |
+| one member of a container in a path step (find its `NAME` child, compare the text) | about 15 ns |
+| resolve one occurrence of a name (`descend_into_macros_exact`, then `resolve_path`, `resolve_method_call` or `resolve_field`, warm) | about 1 µs |
+| the validation walk of `Parse::errors`, per element | about 3 ns |
+| a reached hash counted: read 32 bytes from DRAM, update its entry in an L2-resident table | about 6 ns |
+
+### An edit
+
+**The work.** Take a file of \(N\) bytes whose tree holds \(E \approx N/3\) elements, at about
+6 bytes of columns each, so about \(2N\) bytes of tree. An edit names an item through a path
+of containers with \(I\) members in all, and changes \(B\) bytes of a token, block or body.
+
+- The item must be found: \(15I\) ns, without an index of the file's names.
+- The new text and tree are a new immutable version: the base is the front end's, which salsa
+  keeps. With one contiguous text and one flat tree per file
+  ([decisions.md](../../process/decisions.md), #42), that is the text once (\(2N\) bytes
+  moved) and the columns once (\(4N\) bytes moved). A persistent tree (rowan's green nodes,
+  Roslyn's, tree-sitter's) copies only the path to the root. The flat tree pays \(6N\)
+  instead, so that every read after it is a column load.
+- The unit the edit falls in must be relexed and reparsed: \(5B\) ns.
+- Each touched item is named and keyed: its path (\(15I\) ns for the siblings its steps
+  count) and a few memo hits (about 0.5 µs).
+
+So the bound for one edit in one file is
+
+\[ T_{\text{edit}} \approx 30\,I + 0.02 \cdot 6N + 5B + 500 \ \text{ns}. \]
+
+Take a 40 KiB workspace file (about 1,000 lines, 13,000 elements) with 100 top items, and a
+`ReplaceBody` of a 1 KiB body. Then \(T_{\text{edit}} \approx 3 + 4.9 + 5 + 0.5 \approx
+13.4\ \mu s\).
+
+**What the code did before this section** (counted from the code):
+
+- `Working` kept its own `String` of the whole text: a copy at open (\(2N\)) and a
+  `replace_range` per splice (about \(N\) moved).
+- `finish` made every seed whether anyone took it or not. That is a BLAKE3 of the file
+  (\(N/6\) GB/s, 6.8 µs) and `errors()`, the validation walk of the whole tree (\(3E\) ns,
+  about 40 µs).
+- `item_at` found an item through `token_at_offset`, which scans every child at each level:
+  about 1.2 µs per touched item for 400 top-level children.
+- With `syntax`'s own excess (below, 4.9 µs), the total is about
+  \(13.4 + 4.9 + 2.4 + 6.8 + 40 + 1.2 \approx 69\ \mu s\), five times the bound.
+
+**What the code does now:**
+
+- `Working` holds no text. `text()` is the tree's own source, which the reparse makes once
+  (test `the_text_is_the_trees_never_a_copy`).
+- Opening a file compares nothing when the view's bytes and the front end's text are the same
+  memory (`begins_with`, then `Text::ptr_eq`).
+- `Applied::seeds()` is lazy: the hash and the walk are paid only by a caller that seeds. The
+  daemon takes only `edited`, so today it pays neither.
+- `item_at` goes down by binary search (`covering_element`), about 100 ns.
+- `open_id` is a hash lookup, not a scan of the files opened.
+- The reads `text`, `bytes`, `to_now`, `to_base`, `root` and `base` allocate nothing (test
+  `reads_and_position_maps_allocate_nothing`).
+
+blaze-intent's own part is now the path, the naming and the ops: at the bound. What is left
+over the bound is inside `syntax`'s `Parse::reparse`. It moves about \(12N\) bytes where the
+bound is \(6N\): the new text, a compare of the new text's prefix and suffix against the old
+(`assert!`), and the columns built in `Buffers` and copied again by `pack`. That is about
+\(18.3\ \mu s\) against \(13.4\), 1.37 times. Request `fastcompile-sol-intent 1` asks format
+to write the columns once and make the compare a debug assertion, which brings an edit to
+within 10%.
+
+### Several edits, and rename
+
+A request with \(k\) splices in one file reparses \(k\) times, so it pays the \(6N\)-byte
+version (today \(12N\)) \(k\) times where the bound pays it once. For \(k\) of 1 to 3, as
+an agent's edits mostly are, the excess is \(k - 1\) versions: 5 to 10 µs at 40 KiB. A
+rename writes every reference as a splice, so \(k\) is the number of references in the file.
+
+**The rename's work.**
+
+- Scan the bytes of every file of the crates that can see the item (\(\sum N_f\), from DRAM).
+- Find the token at each match: \(H\) matches, 100 ns each.
+- Resolve each identifier occurrence: \(h\) of them, 1 µs each.
+- Write each file with references once: \(6N_f\) bytes moved, plus relexing a token per
+  reference.
+
+\[ T_{\text{rename}} \approx 0.04 \textstyle\sum N_f + 100\,H + 1000\,h + 0.12 \sum_{f \in F_h} N_f \ \text{ns}. \]
+
+Take a public function renamed in a crate of 200 files of 20 KiB (4 MiB), with 15 references
+in 5 files. Then \(T_{\text{rename}} \approx 168 + 1.5 + 15 + 12 \approx 197\ \mu s\). A file
+already in L2 scans at about 110 GB/s, so a warm scan is about 38 µs.
+
+**What the code did before:**
+
+- Each file whose bytes held the name was walked token by token
+  (`descendants_with_tokens`), about \(3E_f\) ns, or 21 µs for a 20 KiB file. That is 25
+  times its scan.
+- Each candidate file's path was copied into a `String`.
+- Each reference paid a full reparse, \(12N_f\).
+- Total: about \(168 + 105 + 15 + 74 \approx 362\ \mu s\).
+
+**What the code does now:**
+
+- Each match of the name goes straight to its token (`rename::ident_at`: `covering_element`
+  over the match, an identifier whose name, `r#` cut, is exactly the match). So a file costs
+  its scan and its matches, not its nodes.
+- A non-overlapping search reaches every token, because a name never overlaps itself at a
+  token's start (what precedes a token's start is no identifier character). The test
+  `the_names_matches_reach_every_identifier_of_it_and_nothing_else` checks this against the
+  walk, on a full parse and on an outline whose bodies are lazy.
+- Paths are borrowed from `Files`, not copied.
+- Total: about \(168 + 1.5 + 15 + 74 \approx 259\ \mu s\), 1.3 times the bound. All of the
+  excess is the per-reference reparse, which `Parse::reparse_all` (request
+  `fastcompile-sol-intent 1`) makes one call per file; the loop over `hits` in `rename.rs`
+  becomes that call.
+
+### Declared intent
+
+**Announcing.** `WillTest` and `WillSave` are answered with `Announced` after
+`Intents::add`. That cancels the connection's open intents (a scan of a few) and pushes one
+entry, well under a microsecond. Everything else is the job it starts, through
+`Builder::speculate`, in the plane's idle class (`blaze-graph` `plane.rs`). Nothing in the
+request path waits on that job.
+
+**Planning a `WillTest`** (`ahead::plan`). Take \(T\) tests, \(F\) filters, and \(R\)
+reached hashes over the selected tests, \(D\) of them distinct.
+
+- Matching costs one SIMD substring search per test and filter.
+- Counting costs \(6R\) ns: each hash is read once and counted in a table.
+- Ordering is a radix sort of \(D\) items.
+
+Today `reached` is empty for every test, because blaze-testsel's record waits on codegen's
+`ExecTable` (fastcompile-ident-select 7). So this matters only once that lands. The code is
+at the bound:
+
+- each filter's `memmem::Finder` is built once. `str::contains` builds a Two-Way searcher on
+  every call, about 20 to 50 ns per test and filter;
+- the count table is `blaze_ids::prehashed::ByHash`: a code hash is a hash already, so its
+  first word indexes the table and nothing is hashed. FxHash over 32 bytes is about 2.5 ns
+  more per reached hash, 40% over;
+- the order (count descending, then hash) is a radix sort on the count and the hash's first
+  four bytes, with the rare tied run compared in full (`hottest_first`, checked against the
+  compare sort with forced ties). A compare sort costs about \(4 \log_2 D\) ns a hash, 64 ns
+  at \(D = 50{,}000\); the radix sort costs about 10 ns.
+
+For 2,000 tests reaching 1,000 functions each (\(R = 2 \cdot 10^6\), \(D = 5 \cdot 10^4\)),
+that is about 13 ms, against about 21 ms before. The build it starts takes seconds.
+
+**Stopping dropped work.** An intent not taken over is cancelled at the moment its cause
+arrives:
+
+- a newer intent, a commit to another root and the connection's end are each a scan of the
+  open intents (`Intents::cancel_where`);
+- the wait is checked on every daemon turn (`Session::tick`), and the loop wakes at
+  `Session::deadline`.
+
+The cancel itself is one store to the job's flag and a `Plane::cancel`, which skips every
+node of the request that is not running.
+
+The bound for the rest is one function's compile, 50 to 200 µs, since no design stops code
+mid-function without checking for it inside the code. Today a running task sees the flag only
+at its job's stage checks (`compile.rs`, `job.cancelled()`). Codegen's `stopped()` is polled
+once per walk level, and only when a body check runs beside the build. The daemon also ignores
+the plane's `Yield`. So a dropped speculative build holds its threads for up to one unit's
+codegen (tens to hundreds of milliseconds), and a foreground task waiting for them waits that
+long. That is 100 to 1,000 times the bound. Requests `fastcompile-sol-intent 3` (cargo: the
+job's flag and `Yield` reach codegen's `stopped()`) and `4` (codegen: poll it per function)
+bring it to the bound.
+
+A cancelled idle task that nothing foreground waits for may run on. It uses only threads
+nothing else wants, and what it compiles is stored by content, so a later root that shares it
+reuses it.
+
+### State of the art
+
+- **Incremental reparse.** rust-analyzer (`syntax::parsing::reparsing`, rowan), Roslyn and
+  tree-sitter (`ts_tree_edit`) relex a token or reparse a block, and rebuild only the path to
+  the root of a persistent tree. blaze picks the same units (`Parse::reparse` is
+  rust-analyzer's rule, plus lazy bodies) but pays one \(6N\) copy per file for a flat tree,
+  whose every later read is a column load instead of a pointer chase. At 40 KiB the copy is
+  about 5 µs, under a body's reparse. The edit's result also stays the front end's tree (a
+  seed) where rust-analyzer's is discarded.
+- **Rename.** rust-analyzer's `FindUsages` scans each file of the search scope for the name
+  and maps each match to its token, then classifies it through `Semantics`. blaze-intent now
+  does the same, with SIMD `memmem`. It beats rust-analyzer by refusing what it can't resolve
+  instead of editing text in macros, and by scanning only the crates that can see the item. A
+  trigram index of the workspace (zoekt, Sourcegraph) would make the scan proportional to the
+  files that hold the name. That index is not built here; the scan runs at memory bandwidth.
+- **Speculation.** Watch modes and flycheck (rust-analyzer, dune, cargo-watch) build after a
+  save, and merge queues build ahead of a merge. Here the build starts before the save, in an
+  idle class, and is promoted, not restarted, when the save lands. With requests 3 and 4,
+  dropping it gives every thread back within one function.

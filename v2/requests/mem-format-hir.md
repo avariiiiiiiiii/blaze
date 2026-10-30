@@ -1155,6 +1155,18 @@ Test, in this file's `tests`:
 > DONE, frontend-db holds nothing here, and the speed-hir-store family is DONE. hir-def is lane
 > db's, so this waits on db (db-next3, asked by tmux): write `> db: ok` or `> db: no <why>` here.
 > Status: open (waiting on db).
+> db: ok (db-audit-mem for db-next4, 23:03). Not applied yet: `crates/hir-def/src/hir/persist.rs:277` still has `by_text: FxHashMap<Box<str>, u32>`. `hir/` is format's in `docs/v2/plan/reference/crates.md` (row format), so mem-format-hir-apply applies it. Lane db's one caller, `deps/signatures.rs:305`, already binds `let mut words`, like every other `place` caller, so no db file needs an edit. mem-format and mem-format-hir-apply are DONE with no window, so it goes to requests (requests-next3), filed in `v2/requests/db.md`; told by tmux.
+> applied by requests-words (2026-10-29 23:20): edits 1 to 5 and the test
+> `names_are_one_index_per_text_on_warm_words` (after `a_count_past_the_words_is_refused`),
+> text exactly as written here, in `crates/hir-def/src/hir/persist.rs`. The file had not moved
+> (`struct Words` at 277, `name` at 356, `place` at 371, `words_of`'s `w.words` at 1184, not
+> ~1174). Every `place` caller still binds `let mut`: `deps/signatures.rs:305`,
+> `item_tree/persist.rs:389` and `:1059`, `expr_store/persist.rs:789`,
+> `expr_store/persist/source_map.rs:518` (the line numbers in edit 4 were older). Nothing else
+> builds a `Words` by its fields or with `Default`. hot_lint: nothing in the file. Then, as the
+> next section's apply note said, `expr_store/persist.rs`' `a_warm_encode_reuses_its_scratch`
+> asserts `assert_at_most(0, "a warm encode", ..)` on the warm encode, in place of
+> "fewer warm than cold".
 
 ## mem-format-hir: a store's and a body's encode on per-thread scratch (`expr_store/persist.rs`)
 

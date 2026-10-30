@@ -1176,6 +1176,106 @@ fn default_library(name: &str) -> (&str, &'static str) {
     (name, if file.contains('.') { "" } else { ".lib" })
 }
 
+/// The default libraries the members of the COFF archive `bytes` ask for, for finding what a
+/// link takes them with: each member's `/DEFAULTLIB`s less its own `/NODEFAULTLIB`s (none after
+/// a bare one), as `(member, library)` in member order, each library once (the first member
+/// asking) and named as link.exe names it (`.lib` added when it has no extension). Only the
+/// section table and `.drectve` are read. An import member asks for nothing, and an anonymous
+/// object built for LTCG or `/clr` carries its directives in what blaze does not read; the
+/// engine refuses such a member if it is ever taken.
+pub(crate) fn asked_libraries(name: &str, bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let input = Input { file: name, member: None };
+    let file = ArchiveFile::parse(bytes).map_err(|e| fail(input, format_args!("not an archive: {e}")))?;
+    if file.is_thin() {
+        return Err(fail(input, "a thin archive, which link.exe does not read"));
+    }
+    // alloc: once per library searched for its default libraries (setup, kept per process)
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut quoted = scratch::lend_string();
+    for member in file.members() {
+        let member = member.map_err(|e| fail(input, e))?;
+        let member_name = text(member.name());
+        let at = Input { file: name, member: Some(&member_name) };
+        let data = member.data(bytes).map_err(|e| fail(at, e))?;
+        let drectve = match (u16_at(data, 0), u16_at(data, 2), u16_at(data, 4)) {
+            (Some(pe::IMAGE_FILE_MACHINE_UNKNOWN), Some(0xffff), Some(version)) => {
+                if version >= 2 && data.get(12..28) == Some(&BIGOBJ[..]) {
+                    drectve::<pe::AnonObjectHeaderBigobj>(at, data)?
+                } else {
+                    None
+                }
+            }
+            _ => drectve::<pe::ImageFileHeader>(at, data)?,
+        };
+        let Some(drectve) = drectve else { continue };
+        let all = text(drectve.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(drectve));
+        let start = out.len();
+        let mut none = false;
+        // alloc: none unless a member takes out more than four of its own libraries
+        let mut left_out: smallvec::SmallVec<[String; 4]> = smallvec::SmallVec::new();
+        words(&all, &mut quoted, |word| -> Result<(), String> {
+            let Some(option) = word.strip_prefix(['/', '-']) else { return Ok(()) };
+            let (option, arg) = match option.split_once(':') {
+                Some((option, arg)) => (option, Some(arg)),
+                None => (option, None),
+            };
+            if option.eq_ignore_ascii_case("defaultlib") {
+                let arg = arg.ok_or_else(|| fail(at, "the .drectve option /DEFAULTLIB needs an argument"))?;
+                let (stem, extension) = default_library(arg);
+                if !out.iter().any(|it| joins_ignoring_case(&it.1, stem, extension)) {
+                    // alloc: once per default library an archive's members name (setup)
+                    out.push((member_name.clone().into_owned(), join(stem, extension)));
+                }
+            } else if option.eq_ignore_ascii_case("nodefaultlib") {
+                match arg {
+                    None => none = true,
+                    Some(arg) => {
+                        let (stem, extension) = default_library(arg);
+                        // alloc: once per `/NODEFAULTLIB:lib` of a member (setup)
+                        left_out.push(join(stem, extension));
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        if none {
+            out.truncate(start);
+        } else if !left_out.is_empty() {
+            let mut kept = start;
+            for at in start..out.len() {
+                if !left_out.iter().any(|gone| gone.eq_ignore_ascii_case(&out[at].1)) {
+                    out.swap(kept, at);
+                    kept += 1;
+                }
+            }
+            out.truncate(kept);
+        }
+    }
+    Ok(out)
+}
+
+/// The `.drectve` of the COFF object `data`, if it has one.
+fn drectve<'d, C: CoffHeader>(name: Input<'_>, data: &'d [u8]) -> Result<Option<&'d [u8]>, String> {
+    let mut offset = 0;
+    let header = C::parse(data, &mut offset).map_err(|e| fail(name, format_args!("not a COFF object: {e}")))?;
+    let sections = header.sections(data, offset).map_err(|e| fail(name, e))?;
+    let symbols = header.symbols(data).map_err(|e| fail(name, e))?;
+    for section in sections.iter() {
+        if section.name(symbols.strings()).map_err(|e| fail(name, e))? == b".drectve" {
+            return section.coff_data(data).map(Some).map_err(|()| fail(name, "a truncated .drectve"));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `it` is `stem` then `extension`, ASCII case ignored.
+fn joins_ignoring_case(it: &str, stem: &str, extension: &str) -> bool {
+    it.len() == stem.len() + extension.len()
+        && it.is_char_boundary(stem.len())
+        && it[..stem.len()].eq_ignore_ascii_case(stem)
+        && it[stem.len()..].eq_ignore_ascii_case(extension)
+}
+
 /// Whether `it` is `stem` then `extension`.
 fn joins(it: &str, stem: &str, extension: &str) -> bool {
     it.len() == stem.len() + extension.len() && it.starts_with(stem) && it.ends_with(extension)

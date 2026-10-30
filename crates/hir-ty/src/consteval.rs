@@ -617,9 +617,10 @@ blaze_format::record! {
     /// bytes in `bytes`, every other column empty), 2 for [`MemoryMap::Complex`] (its pieces'
     /// bytes in `bytes` in the order of their addresses). Types are indices in the buffer's
     /// type table (`next_solver::persist`): `vtable` in the order of their ids, `type_ids` one
-    /// more than the index, 0 for a `TypeId` of no type.
+    /// more than the index, 0 for a `TypeId` of no type. `value_pointers` and
+    /// `memory_pointers` are where its words with provenance are, sorted.
     #[derive(Clone, Copy)]
-    pub struct MemoryMapRec: 1 {
+    pub struct MemoryMapRec: 2 {
         pub kind: u32,
         pub bytes: Slice<u8>,
         pub pieces: Slice<PieceRec>,
@@ -627,6 +628,8 @@ blaze_format::record! {
         pub statics: Slice<StaticRec>,
         pub vtable: Slice<u32>,
         pub type_ids: Slice<u32>,
+        pub value_pointers: Slice<u64>,
+        pub memory_pointers: Slice<u64>,
     }
 }
 
@@ -641,7 +644,7 @@ blaze_format::record! {
     }
 }
 
-const _: () = assert!(size_of::<MemoryMapRec>() == 4 + 6 * 8);
+const _: () = assert!(size_of::<MemoryMapRec>() == 4 + 8 * 8);
 const _: () = assert!(size_of::<AllocationRec>() == 4 + 8 + size_of::<MemoryMapRec>());
 
 /// Writes `allocation` into `out`, its types into `tys`; returns where its record is, for the
@@ -686,6 +689,8 @@ struct MapColumns {
     statics: Placed,
     vtable: Placed,
     type_ids: Placed,
+    value_pointers: Placed,
+    memory_pointers: Placed,
 }
 
 impl MapColumns {
@@ -700,6 +705,12 @@ impl MapColumns {
             statics: self.statics.slice(field(offset_of!(MemoryMapRec, statics))),
             vtable: self.vtable.slice(field(offset_of!(MemoryMapRec, vtable))),
             type_ids: self.type_ids.slice(field(offset_of!(MemoryMapRec, type_ids))),
+            value_pointers: self
+                .value_pointers
+                .slice(field(offset_of!(MemoryMapRec, value_pointers))),
+            memory_pointers: self
+                .memory_pointers
+                .slice(field(offset_of!(MemoryMapRec, memory_pointers))),
         }
     }
 }
@@ -719,6 +730,8 @@ fn write_memory_map<'db>(
         statics: none,
         vtable: none,
         type_ids: none,
+        value_pointers: none,
+        memory_pointers: none,
     };
     match map {
         MemoryMap::Empty => {}
@@ -776,6 +789,16 @@ fn write_memory_map<'db>(
                 map.type_ids.len(),
                 map.type_ids.iter().map(|it| it.map_or(0, |it| ty(it) + 1)),
             );
+            columns.value_pointers = Placed::push_each(
+                out,
+                map.value_pointers.len(),
+                map.value_pointers.iter().map(|&it| it as u64),
+            );
+            columns.memory_pointers = Placed::push_each(
+                out,
+                map.memory_pointers.len(),
+                map.memory_pointers.iter().map(|&it| it as u64),
+            );
         }
     }
     columns
@@ -796,11 +819,15 @@ fn read_memory_map<'db>(
     let statics = record.statics.follow(buffer)?;
     let vtable = record.vtable.follow(buffer)?;
     let type_ids = record.type_ids.follow(buffer)?;
+    let value_pointers = record.value_pointers.follow(buffer)?;
+    let memory_pointers = record.memory_pointers.follow(buffer)?;
     let only_bytes = pieces.is_empty()
         && aligns.is_empty()
         && statics.is_empty()
         && vtable.is_empty()
-        && type_ids.is_empty();
+        && type_ids.is_empty()
+        && value_pointers.is_empty()
+        && memory_pointers.is_empty();
     match record.kind {
         0 if only_bytes && bytes.is_empty() => return Ok(MemoryMap::Empty),
         1 if only_bytes => return Ok(MemoryMap::Simple(Box::from(bytes))),
@@ -857,6 +884,18 @@ fn read_memory_map<'db>(
             at => Some(ty(at - 1)?),
         });
     }
+    for (column, places) in
+        [(&mut map.value_pointers, value_pointers), (&mut map.memory_pointers, memory_pointers)]
+    {
+        if places.windows(2).any(|it| it[0] >= it[1]) {
+            return Err(invalid("pointers with provenance out of the order of their places"));
+        }
+        // alloc: the owned allocation read back, once, at its size
+        column.reserve_exact(places.len());
+        for &place in places {
+            column.push(word(place)?);
+        }
+    }
     Ok(MemoryMap::Complex(Box::new(map))) // alloc: the owned allocation read back, once
 }
 
@@ -893,6 +932,9 @@ mod tests {
             size: 16,
             id: salsa::plumbing::FromId::from_id(salsa::Id::from_bits(7 | (2 << 32))),
         });
+        map.note_pointer(crate::PointerAt::Memory(0x2000));
+        map.note_pointer(crate::PointerAt::Value(8));
+        map.note_pointer(crate::PointerAt::Value(0));
         map
     }
 
@@ -919,6 +961,9 @@ mod tests {
         other.note_align(0x2000, 8);
         other.insert(0x2000, Box::new([1u8, 2, 3, 4, 5, 6, 7, 8]));
         other.statics = complex().statics;
+        other.note_pointer(crate::PointerAt::Value(0));
+        other.note_pointer(crate::PointerAt::Memory(0x2000));
+        other.note_pointer(crate::PointerAt::Value(8));
         let (a, b) = (MemoryMap::Complex(Box::new(complex())), MemoryMap::Complex(Box::new(other)));
         assert_eq!(a, b);
         assert_eq!(&*write(&a), &*write(&b));
@@ -930,9 +975,20 @@ mod tests {
 
     /// A buffer of a map of `kind` with `pieces` over `bytes`, as no writer of a map writes it.
     fn forged(kind: u32, pieces: &[PieceRec], bytes: &[u8]) -> Aligned {
+        forged_with_pointers(kind, pieces, bytes, &[])
+    }
+
+    /// [`forged`], with `value_pointers` as that column.
+    fn forged_with_pointers(
+        kind: u32,
+        pieces: &[PieceRec],
+        bytes: &[u8],
+        value_pointers: &[u64],
+    ) -> Aligned {
         let mut out = Writer::new(<MemoryMapRec as Record>::SCHEMA);
         let pieces_at = Placed::push(&mut out, pieces);
         let bytes_at = Placed::push(&mut out, bytes);
+        let value_pointers = Placed::push(&mut out, value_pointers);
         let none = Placed { at: 0, len: 0 };
         let columns = MapColumns {
             kind,
@@ -942,6 +998,8 @@ mod tests {
             statics: none,
             vtable: none,
             type_ids: none,
+            value_pointers,
+            memory_pointers: none,
         };
         let at = out.next::<MemoryMapRec>();
         let root = out.push(&columns.record(at));
@@ -961,5 +1019,11 @@ mod tests {
         let read_back = read(&forged(2, &[piece(8, 0, 1), piece(9, 0, 2)], &[1, 2])).unwrap();
         let MemoryMap::Complex(map) = read_back else { panic!("a complex map read as another") };
         assert_eq!(map.memory.get(&9), Some(&[1, 2][..]));
+        assert!(read(&forged_with_pointers(1, &[], &[1], &[0])).is_err());
+        assert!(read(&forged_with_pointers(2, &[], &[], &[8, 8])).is_err());
+        assert!(read(&forged_with_pointers(2, &[], &[], &[16, 8])).is_err());
+        let read_back = read(&forged_with_pointers(2, &[], &[], &[8, 16])).unwrap();
+        assert!(read_back.has_provenance(crate::PointerAt::Value(16)));
+        assert!(!read_back.has_provenance(crate::PointerAt::Memory(16)));
     }
 }

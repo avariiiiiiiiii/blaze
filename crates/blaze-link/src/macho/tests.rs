@@ -36,6 +36,7 @@ fn output_at(arch: Arch, kind: OutputKind, minimum: u32) -> Output {
         stack: None,
         windows_subsystem: false,
         dev_run: None,
+        exec_log: false,
         triple: match arch { Arch::X86_64 => "x86_64-apple-darwin", _ => "aarch64-apple-darwin" }.into(),
     }
 }
@@ -2067,5 +2068,13 @@ fn what_a_dev_run_cannot_overlay_is_an_error() {
         cell.got.insert(0, GotEntry { addr: TEXT + 0x108, holds: Holds::Import(0) });
         let error = encode_error(&cell);
         assert!(error.contains("dyld fixes up a GOT cell at 0x100004108 to `_free`, in `__TEXT,__unwind_info`"), "{error}");
+    }
+}
+
+#[test]
+fn an_executable_with_the_execution_log_starts_on_its_log_stubs_on_both_arches() {
+    for arch in [Arch::Aarch64, Arch::X86_64] {
+        let logged = crate::table::linked::logged(output_at(arch, OutputKind::Executable { entry: "main".into() }, CHAINED));
+        assert!(logged.header.is_multiple_of(8), "{arch:?}");
     }
 }

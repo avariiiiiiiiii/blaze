@@ -24,7 +24,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use super::FnItems;
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -61,7 +61,7 @@ impl LatePass for DropForgetUseless {
         "undropped_manually_drops",
     ]);
     const HOOKS: Hooks = Hooks::BODY.and(Hooks::STMT).and(Hooks::ARM);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
 
     fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
         self.arm_values.clear();
@@ -199,7 +199,11 @@ fn can_have_side_effects(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
     let any = |exprs: &[ExprId]| exprs.iter().any(|it| can_have_side_effects(b, *it));
     stdx::ensure_sufficient_stack(|| match b.store().expr(expr) {
         Expr::Path(_) | Expr::Literal(_) | Expr::OffsetOf(_) | Expr::IncludeBytes => false,
-        Expr::UnaryOp { expr, .. } | Expr::Field { expr, .. } | Expr::Ref { expr, .. } | Expr::Cast { expr, .. } => {
+        Expr::UnaryOp { expr, .. }
+        | Expr::Field { expr, .. }
+        | Expr::Ref { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::UnsafeBinderCast { expr, .. } => {
             can_have_side_effects(b, expr)
         }
         Expr::Index { base, .. } => can_have_side_effects(b, base),

@@ -530,17 +530,6 @@ fn layout_of_ty_in(
             // The tail can be behind an associated type, such as `A::Dyn`.
             let normalize = |ty| normalizer.normalize(ty);
             let unsized_part = struct_tail_erasing_lifetimes(db, pointee, &normalize);
-            // FIXME(next-solver)
-            /*
-            if let TyKind::AssociatedType(id, subst) = unsized_part.kind(Interner) {
-                unsized_part = TyKind::Alias(chalk_ir::AliasTy::Projection(ProjectionTy {
-                    associated_ty_id: *id,
-                    substitution: subst.clone(),
-                }))
-                .intern(Interner);
-            }
-            unsized_part = normalize(db, trait_env, unsized_part);
-            */
             let metadata = match unsized_part.kind() {
                 TyKind::Slice(_) | TyKind::Str => {
                     scalar_unit(dl, Primitive::Int(dl.ptr_sized_integer(), false))
@@ -635,6 +624,7 @@ fn layout_of_ty_in(
         }
 
         TyKind::Pat(ty, pat) => {
+            // clone: a pattern type's layout is its base's with a narrower valid range, made once per pattern type into its memo
             let mut layout = db.layout_of_ty(ty.store(), trait_env.clone())?.0.clone();
             match pat.kind() {
                 PatternKind::Range { start, end } => {
@@ -765,7 +755,9 @@ fn layout_of_ty_in(
             // single field transparent Adts, and only the parts of the compiler that
             // specifically care about pattern types will have to handle it.
             layout.fields = FieldsShape::Arbitrary {
+                // alloc: the one field of a pattern type's layout, kept in its memo
                 offsets: [Size::ZERO].into_iter().collect(),
+                // alloc: as above
                 in_memory_order: [RustcFieldIdx::new(0)].into_iter().collect(),
             };
             layout
@@ -814,36 +806,34 @@ fn extract_const_value<'db>(ct: Const<'db>) -> Result<ValueConst<'db>, LayoutErr
     }
 }
 
-pub fn struct_tail_erasing_lifetimes<'a, F: Fn(Ty<'a>) -> Ty<'a>>(
+/// rustc's `struct_tail_raw`: the type a pointer to `pointee` takes its metadata from, the last
+/// field of the last field ... through structs, tuples and pattern types. Each struct's last
+/// field goes through `normalize` (the identity for none); a struct whose representation is
+/// infinite is its own tail.
+pub fn struct_tail_erasing_lifetimes<'a>(
     db: &'a Db,
-    pointee: Ty<'a>,
-    normalize: &F,
+    mut pointee: Ty<'a>,
+    mut normalize: impl FnMut(Ty<'a>) -> Ty<'a>,
 ) -> Ty<'a> {
-    match pointee.kind() {
-        TyKind::Adt(def, args) => {
-            let struct_id = match def.def_id() {
-                AdtId::StructId(id) => id,
-                _ => return pointee,
-            };
-            if representability(db, def.def_id()) == Representability::Infinite {
-                return pointee;
-            }
-            match variant_field_ids(db, struct_id.into()).last() {
-                Some(&f) => {
-                    let last_field_ty = normalize(field_ty(db, struct_id.into(), f, args));
-                    struct_tail_erasing_lifetimes(db, last_field_ty, normalize)
+    loop {
+        pointee = match pointee.kind() {
+            TyKind::Adt(def, args) => {
+                let AdtId::StructId(struct_id) = def.def_id() else { return pointee };
+                if representability(db, def.def_id()) == Representability::Infinite {
+                    return pointee;
                 }
-                None => pointee,
+                match variant_field_ids(db, struct_id.into()).last() {
+                    Some(&f) => normalize(field_ty(db, struct_id.into(), f, args)),
+                    None => return pointee,
+                }
             }
-        }
-        TyKind::Tuple(tys) => {
-            if let Some(last_field_ty) = tys.iter().next_back() {
-                struct_tail_erasing_lifetimes(db, last_field_ty, normalize)
-            } else {
-                pointee
-            }
-        }
-        _ => pointee,
+            TyKind::Tuple(tys) => match tys.iter().next_back() {
+                Some(last) => last,
+                None => return pointee,
+            },
+            TyKind::Pat(base, _) => base,
+            _ => return pointee,
+        };
     }
 }
 
@@ -922,8 +912,8 @@ mod tests {
     use super::*;
     use crate::next_solver::{
         AliasConst, AliasConstKind, AliasTyKind, ClosureIdWrapper, ConstExt, FreeConstAliasId,
-        IsRigid, Mutability, Region, RegionExt, RegionKind, ScalarInt, TraitAssocTyId, Tys,
-        ValTree, ValTreeKind,
+        IsRigid, Mutability, Pattern, Region, RegionExt, RegionKind, ScalarInt, TraitAssocTyId,
+        Tys, ValTree, ValTreeKind,
     };
 
     /// A deterministic stream of choices: xorshift64.
@@ -1148,5 +1138,35 @@ mod tests {
             assert_eq!(needs_normalizing(it), model, "type {index}");
             assert_eq!(model, index >= alias_free.len(), "type {index}");
         }
+    }
+
+    /// The tail goes through tuples and pattern types, as rustc's `struct_tail_raw`, and stops at
+    /// anything else; only a struct's last field is normalized.
+    #[test]
+    fn a_tail_goes_through_tuples_and_pattern_types() {
+        let db = Db::for_tests();
+        let interner = DbInterner::new_no_crate(&db);
+        let u8 = ty(TyKind::Uint(UintTy::U8));
+        let slice = ty(TyKind::Slice(u8));
+        let not_null = |base| ty(TyKind::Pat(base, Pattern::new(interner, PatternKind::NotNull)));
+        let cases = [
+            (u8, u8),
+            (slice, slice),
+            (tuple(&[]), tuple(&[])),
+            (tuple(&[u8, slice]), slice),
+            (tuple(&[u8, tuple(&[ty(TyKind::Bool), ty(TyKind::Str)])]), ty(TyKind::Str)),
+            (not_null(reference(u8)), reference(u8)),
+            (tuple(&[u8, not_null(reference(slice))]), reference(slice)),
+            (reference(slice), reference(slice)),
+        ];
+        let mut normalized = 0;
+        for (index, (of, tail)) in cases.into_iter().enumerate() {
+            let found = struct_tail_erasing_lifetimes(&db, of, |it| {
+                normalized += 1;
+                it
+            });
+            assert_eq!(found, tail, "case {index}");
+        }
+        assert_eq!(normalized, 0, "no struct, nothing normalized");
     }
 }

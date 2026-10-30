@@ -50,6 +50,8 @@
 > solver-sync (20:10): solver-sync-glue has stopped. When the query lands, tell window
 > `solver-sync`, which owns `interner.rs` and makes the `coroutine_hidden_types` edit and its test.
 
+> applied by db-solver (2026-10-29 23:45): `coroutine_hidden_types` (`next_solver/interner.rs`) reads `db.coroutine_witnesses(def_id.0)` and binds every free region of the witnesses as its own anonymous bound region of one outer binder, no assumptions (`bind_witness_regions`); tests in `next_solver/coroutine_witness_tests.rs` (`Rc` held across an `.await` is not `Send`, `u32` held is). Not run (this pass builds nothing).
+
 ## 4. solver-sync (`interner.rs`): compute the shared cache's key once per interner
 
 - Why: the speed-of-light bar (`docs/v2/plan/lanes/db/speed-of-light-solver-cache.md`).
@@ -85,6 +87,8 @@
 > forwarded to db (window `db-next2`, told by tmux); `impl_hir_database!`'s line is requests' (`hir-ide/src/impl_db_macro.rs`), held with db 12 until the query exists.
 > forwarded to db (its lane doc; window `db-next2`, told by tmux).
 
+> not applied by db-solver (2026-10-29 23:45): waits on lane db (the doc is its, not `next_solver/`); `trait-solver.md` lines 38 and 40 still describe the virtual call and the lock.
+
 ## 6. lane db: install `blaze-alloc-count` in hir-ty's tests
 
 - `crates/hir-ty/Cargo.toml` `[dev-dependencies]`: `blaze-alloc-count.workspace = true`.
@@ -94,6 +98,8 @@
   its generation alone) and `infer/relate/generalize.rs:776` call it already.
 
 > forwarded to db (window `db-next2`, told by tmux).
+
+> checked by db-solver (2026-10-29 23:45): in the tree, `crates/hir-ty/Cargo.toml:65` (`blaze-alloc-count` dev-dependency) and `crates/hir-ty/src/lib.rs:60` (`#[global_allocator]`).
 
 ## 7. coordinator (`tools/v2/hot_lint.py`): `crates` can't be given
 
@@ -145,3 +151,5 @@
   and 9 and for `tls_cache`'s slot arrays in a `Region` tagged `Infer`.
 
 > forwarded to db (window `db-next2`, told by tmux); `blaze-mem` is a root workspace dependency now.
+
+> checked by db-solver (2026-10-29 23:45): in the tree, `crates/hir-ty/Cargo.toml:51`; `interner/tls_cache.rs` uses `blaze_mem::{Pool, Pooled, pool::Limbo}`.

@@ -22,14 +22,14 @@ use hir_def::{
 use hir_ty::next_solver::TyKind;
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::{
-    AstNode as _, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
-    ast::HasName as _,
+    SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
+    view::{self, AstNode as _, HasName as _},
 };
 
 use super::{expr_span, from_expansion};
 use crate::{
     lints::bodies::{
-        BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set,
+        BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set,
         types::util::{Solver, method_fn, path_value},
     },
     lower::{Found, Phase},
@@ -47,7 +47,7 @@ pub(crate) struct StaticMutRefs;
 impl LatePass for StaticMutRefs {
     const LINTS: LintSet = lint_set(["static_mut_refs"]);
     const HOOKS: Hooks = Hooks::STMT;
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Ref, ExprTag::MethodCall]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Ref, ExprKind::MethodCall]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         match b.store().expr(expr) {
@@ -129,9 +129,9 @@ fn addr_of_span(b: &BodyCx<'_, '_>, outer: &Span, inner: &Span) -> Span {
 /// The `let` statement the pattern `pat` is of: where rustc's `check_stmt` lints.
 fn let_node(b: &BodyCx<'_, '_>, pat: hir_def::hir::PatId) -> Option<InFile<SyntaxNodePtr>> {
     let node = b.pat_node(pat)?;
-    let syntax = b.cx.syntax(node);
+    let syntax = b.cx.syntax_view(node);
     let stmt = syntax.value.ancestors().find(|it| it.kind() == SyntaxKind::LET_STMT)?;
-    Some(InFile::new(syntax.file_id, SyntaxNodePtr::new(&stmt)))
+    Some(InFile::new(syntax.file_id, view::ptr(stmt)))
 }
 
 /// rustc's `emit_static_mut_refs`: the lint at `span`, with the `&raw` suggestion at `sugg`
@@ -210,7 +210,7 @@ fn mutability_span(b: &BodyCx<'_, '_>, def: StaticId) -> Option<Span> {
     if flags.contains(StaticFlags::EXTERN) || !flags.contains(StaticFlags::MUTABLE) {
         return None;
     }
-    let source = def.lookup(db).source(db);
+    let source = def.lookup(db).source_view(db);
     let file = source.file_id.file_id()?.file_id(db);
     let node = source.value.syntax();
     let first = node.children_with_tokens().find(|it| !it.kind().is_trivia() && it.kind() != SyntaxKind::ATTR)?;

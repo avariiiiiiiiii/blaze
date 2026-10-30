@@ -9,7 +9,7 @@
 //! or given back, a pool's batch of 64, a frame's task ending. Each tag's counters sit on their
 //! own 128-byte line, so subsystems never write each other's.
 
-use std::fmt;
+use std::{cell::Cell, fmt};
 
 use crate::sync::atomic::{AtomicU64, Ordering};
 
@@ -196,12 +196,59 @@ pub fn allocated(tag: Tag, bytes: usize) {
     }
 }
 
-/// A task of `tag` took `peak` bytes of its frame at most, all given back now.
+/// A task's bytes a thread adds to a tag's `allocated` before folding them into the tag's line.
+const FOLD_AT: u64 = 1 << 20;
+
+/// What the thread's tasks added to each tag's `allocated` and is not on the tag's line yet:
+/// folded in at [`FOLD_AT`], at a [`snapshot`] the thread takes, and when the thread ends.
+struct Pending([Cell<u64>; Tag::COUNT]);
+
+impl Pending {
+    fn fold(&self) {
+        for (pending, line) in self.0.iter().zip(&LINES) {
+            let bytes = pending.replace(0);
+            if bytes != 0 {
+                line.allocated.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.fold();
+    }
+}
+
+thread_local! {
+    static PENDING: Pending = const { Pending([const { Cell::new(0) }; Tag::COUNT]) };
+}
+
+/// A task of `tag` took `peak` bytes of its frame at most, all given back now. Warm, it writes
+/// no shared line: the peak is written only when it rises, and the bytes gather per thread.
 pub fn task_ended(tag: Tag, peak: usize) {
-    if peak != 0 {
-        let line = line(tag);
-        line.allocated.fetch_add(as_u64(peak), Ordering::Relaxed);
-        line.task_peak.fetch_max(as_u64(peak), Ordering::Relaxed);
+    if peak == 0 {
+        return;
+    }
+    let line = line(tag);
+    let peak = as_u64(peak);
+    if peak > line.task_peak.load(Ordering::Relaxed) {
+        line.task_peak.fetch_max(peak, Ordering::Relaxed);
+    }
+    let full = PENDING.try_with(|pending| {
+        let gathered = &pending.0[tag.index()];
+        let bytes = gathered.get() + peak;
+        if bytes < FOLD_AT {
+            gathered.set(bytes);
+            return 0;
+        }
+        gathered.set(0);
+        bytes
+    });
+    // A thread being torn down has no pending counts left: the bytes go straight to the line.
+    let bytes = full.unwrap_or(peak);
+    if bytes != 0 {
+        line.allocated.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -267,7 +314,10 @@ impl Snapshot {
     }
 }
 
+/// The counters now. Another thread's tasks' bytes reach `allocated` up to [`FOLD_AT`] per tag
+/// late; the calling thread's are folded in first.
 pub fn snapshot() -> Snapshot {
+    let _ = PENDING.try_with(Pending::fold);
     let mut tags = [Counters::default(); Tag::COUNT];
     for (counters, line) in tags.iter_mut().zip(&LINES) {
         *counters = Counters {

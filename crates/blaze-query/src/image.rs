@@ -35,7 +35,7 @@ use blaze_reclaim::Guard;
 use crate::{
     DbError, Input, QueryKey, QueryKind, kinds,
     memo::{MemoId, Store},
-    table::{EDGE_RECORD, EdgeRecord, FxSet, ShortLock},
+    table::{EDGE_RECORD, EdgeRecord, FxMap, FxSet, ShortLock},
 };
 
 pub(crate) const MEMO_RECORD: usize = 192;
@@ -131,6 +131,8 @@ pub(crate) fn write(
     let mut values: Vec<Placed> = Vec::with_capacity(all.memos.len());
     let mut keys: Vec<(u64, u64)> = Vec::with_capacity(all.keys.len());
     let mut paths: Vec<(u8, u64, u64)> = Vec::with_capacity(inputs.len());
+    // Equal values, of any kind, go into the blob once: their memos map the same bytes.
+    let mut written: FxMap<ContentId, u64> = FxMap::default(); // alloc: see above
     {
         let mut blob = builder.section(SectionId::DB_BLOB, BLOB);
         for entry in &all.keys {
@@ -139,8 +141,12 @@ pub(crate) fn write(
                 values.push(match store.bytes(task, memo) {
                     Some(bytes) => {
                         symbols(entry.key, bytes);
-                        blob.align(16);
-                        Placed { at: blob.bytes(bytes), len: bytes.len() as u64, id: crate::value_id(bytes) }
+                        let id = crate::value_id(bytes);
+                        let at = *written.entry(id).or_insert_with(|| {
+                            blob.align(16);
+                            blob.bytes(bytes)
+                        });
+                        Placed { at, len: bytes.len() as u64, id }
                     }
                     None => Placed { at: 0, len: EVICTED, id: ContentId::default() },
                 });

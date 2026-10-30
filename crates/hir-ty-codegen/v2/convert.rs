@@ -89,6 +89,7 @@ pub(crate) fn function(
 ) -> Result<CompiledFunction, String> {
     let word = word(arch)?;
     let mut own = OwnData { data: Vec::new(), word };
+    let size = code.bytes.len();
     let names: Relocs<RelocName> = Relocs::try_from_iter_in(
         frame,
         code.relocs.iter().map(|reloc| {
@@ -96,7 +97,11 @@ pub(crate) fn function(
                 Some(elf) => elf_kind(elf)?,
                 None => reloc_kind(reloc.kind)?,
             };
-            Ok::<_, String>(Relocation { at: reloc.offset, kind, target: reloc.name, addend: reloc.addend })
+            let (target, addend) = match reloc.name {
+                RelocName::Own(offset) => (RelocName::Own(0), own_addend(offset, reloc.addend, size)?),
+                name => (name, reloc.addend),
+            };
+            Ok::<_, String>(Relocation { at: reloc.offset, kind, target, addend })
         }),
     )?;
     let named = names.targets().iter().filter_map(|name| match *name {
@@ -104,7 +109,7 @@ pub(crate) fn function(
         _ => None,
     });
     let datas = own.requests(frame, requests, resolve, named)?;
-    let relocs = names.view().try_map_in(frame, |&name| reloc_target(name, requests, &datas, resolve))?;
+    let relocs = names.view().try_map_in(frame, |&name| reloc_target(key, name, requests, &datas, resolve))?;
     let unwind = match &code.unwind {
         Some(unwind) => {
             let personality = || resolve.symbol(PERSONALITY);
@@ -140,10 +145,37 @@ pub(crate) fn function(
         data: own.data,
         inlined: Vec::new(),
         coverage: None,
+        profile: None,
         side,
         unwind,
         lines,
     })
+}
+
+/// The target of each user name `func` declares, by its index, as [`function`] makes a
+/// relocation at it a target (namespace 0 a function request, 1 a data request), and the
+/// function's own data those name, each object pointing only at the ones before it. A name
+/// [`function`] has no target for is the error it would be.
+pub(crate) fn names(
+    frame: &Frame,
+    key: InstanceKey,
+    arch: Arch,
+    func: &cranelift_codegen::ir::Function,
+    requests: &Requests,
+    resolve: &impl Resolver,
+) -> Result<(Vec<Target>, Vec<Data>), String> {
+    // alloc: none until it has data of its own, which the caller keeps
+    let mut own = OwnData { data: Vec::new(), word: word(arch)? };
+    let declared = func.params.user_named_funcs();
+    let named = declared.values().filter(|it| it.namespace == 1).map(|it| it.index as usize);
+    let datas = own.requests(frame, requests, resolve, named)?;
+    // alloc: per function handed out, its names, kept by the caller
+    let mut names = Vec::with_capacity(declared.len());
+    for name in declared.values() {
+        let name = RelocName::user(name.namespace, name.index);
+        names.push(reloc_target(key, name, requests, &datas, resolve)?);
+    }
+    Ok((names, own.data))
 }
 
 /// A static's value: its own data, the target of each of its requests, and its blob's
@@ -318,7 +350,9 @@ fn own_blob(request: &DataRequest) -> Result<&ConstBlob, String> {
     }
 }
 
+/// The target of a relocation of instance `key`'s code at `name`.
 fn reloc_target(
+    key: InstanceKey,
     name: RelocName,
     requests: &Requests,
     datas: &[Option<Target>],
@@ -346,6 +380,20 @@ fn reloc_target(
             0..3 => Ok(Target::Coverage(index)),
             _ => Err(format!("a relocation at SanitizerCoverage array {index}, of 3")),
         },
+        // An instrumented function's own PGO counters, the counter by the addend.
+        #[cfg(feature = "llvm")]
+        RelocName::User { namespace: crate::llvm::pgo::COUNTER_RELOCS, index } => match index {
+            0 => Ok(Target::ProfileCounters),
+            // alloc: an error
+            _ => Err(format!("a relocation at PGO counters {index}, where a function has only its own (0)")),
+        },
+        // Stencil code's and counting Cranelift code's (`blaze_stencil::tier::instrument`):
+        // the instance's own cells, the cell by the addend.
+        RelocName::User { namespace: blaze_stencil::tier::COUNTER_NAMESPACE, index: 0 } => Ok(Target::Counter(key)),
+        RelocName::User { namespace: blaze_stencil::tier::COUNTER_NAMESPACE, index } => {
+            // alloc: an error
+            Err(format!("a relocation at tier counter cells {index}, where a function has only its own (0)"))
+        }
         RelocName::User { namespace, .. } => {
             Err(format!("a relocation in the unknown namespace {namespace}"))
         }
@@ -353,10 +401,23 @@ fn reloc_target(
         RelocName::Known(symbol) => {
             Err(format!("a relocation at the linker's {symbol:?}, which v2 has no target for"))
         }
+        // The function's own code, at its start: `function` moved the offset into the addend.
+        RelocName::Own(0) => Ok(Target::Direct(key)),
         RelocName::Own(offset) => {
-            Err(format!("a relocation at offset {offset} of the function itself"))
+            Err(format!("a relocation at offset {offset} of the function itself, not moved into its addend"))
         }
     }
+}
+
+/// The addend of a relocation `offset` bytes into the function's own code of `size` bytes,
+/// at the function's start: the offset added in, which must be inside the code.
+fn own_addend(offset: u32, addend: i64, size: usize) -> Result<i64, String> {
+    if offset as usize > size {
+        return Err(format!("a relocation at offset {offset} of the function itself, which has {size} bytes"));
+    }
+    addend.checked_add(i64::from(offset)).ok_or_else(|| {
+        format!("a relocation at offset {offset} of the function itself, whose addend {addend} overflows with it")
+    })
 }
 
 /// The kind of a relocation as v2 names it.

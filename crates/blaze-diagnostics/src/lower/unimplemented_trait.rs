@@ -18,9 +18,8 @@
 //! (`blame_specific_arg_if_possible`) (MIT or Apache-2.0).
 //!
 //! What the front end does not give yet (requested in `v2/requests/diagnostics.md` and
-//! `v2/requests/diagnostics-infer2-solver.md`): which bound of an impl a "required for" step
-//! went through (found again by its trait in the impl's syntax), the span of a derive's impl,
-//! and whether a span is of a format string's desugaring.
+//! `v2/requests/diagnostics-infer2-solver.md`): the span of a derive's impl, and whether a span
+//! is of a format string's desugaring.
 //!
 //! Cost: nothing until the solver reports the error. Then O(the call's arguments, the
 //! callee's bounds and the trait's attributes): types compare as interned ids, never printed;
@@ -28,16 +27,11 @@
 //! `on_unimplemented` arguments are made only for a trait with the attribute.
 
 use base_db::{CrateOrigin, LangCrateOrigin};
-use blaze_items::{Fact, ItemId};
-use hir::{AsAssocItem as _, InFile, LangItem, PathResolution};
-use hir_def::FunctionId;
+use hir::{InFile, LangItem};
 use hir_ty::method_resolution::TraitImpls;
 use syntax::{
     NodeOrToken, SyntaxKind, TextRange,
-    view::{
-        self as ast, AstNode as _, AstToken as _, HasArgList as _, HasAttrs as _, HasGenericParams as _,
-        HasName as _, HasTypeBounds as _,
-    },
+    view::{self as ast, AstNode as _, AstToken as _, HasArgList as _, HasAttrs as _, HasGenericArgs as _},
 };
 
 use crate::{
@@ -138,7 +132,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
         diag.span_help(cx.span(range), "this trait has no implementations, consider adding one");
     }
     note_derived(cx, d, &mut diag);
-    obligation_cause::note(cx, &mut diag, d.cause, Some(root_ref.trait_()), root_self.as_ref());
+    obligation_cause::note(cx, &mut diag, d.cause, Some(root_ref.trait_()));
 
     for pred in std::iter::once(leaf).chain(&d.parent_trait_predicates) {
         let tr = pred.trait_ref();
@@ -262,8 +256,8 @@ fn note_derived(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>, diag: &mut Dia
     let mut i = 0;
     while i < parents.len() {
         let trait_ = parents[i].trait_ref().trait_();
-        let child = if i == 0 { &d.trait_predicate } else { &parents[i - 1] };
-        match d.parent_impls.get(i).copied().flatten().and_then(|it| impl_note(cx, it, child)) {
+        let bound = d.parent_impl_bounds.get(i).copied().flatten();
+        match d.parent_impls.get(i).copied().flatten().and_then(|it| impl_note(cx, it, bound)) {
             Some(at) => diag.span_note(at, required(&parents[i])),
             None => diag.note(required(&parents[i])),
         };
@@ -289,10 +283,10 @@ fn note_derived(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>, diag: &mut Dia
 }
 
 /// Where rustc puts "required for `X` to implement `Y`" for a local impl: on its trait and self
-/// type, "unsatisfied trait bound introduced here" on the bound of the impl `child` is of
+/// type, "unsatisfied trait bound introduced here" on the impl's `bound` the step went through
 /// ("implicitly introduced here" on the type parameter for an implicit `Sized`). `None` for an
 /// impl of another crate or of a macro's expansion, which rustc notes without a span.
-fn impl_note(cx: &Cx<'_, '_>, impl_: hir::Impl, child: &hir::TraitClause<'_>) -> Option<MultiSpan> {
+fn impl_note(cx: &Cx<'_, '_>, impl_: hir::Impl, bound: Option<hir::BoundSource>) -> Option<MultiSpan> {
     if impl_.module(cx.db).krate(cx.db) != cx.krate {
         return None;
     }
@@ -312,37 +306,11 @@ fn impl_note(cx: &Cx<'_, '_>, impl_: hir::Impl, child: &hir::TraitClause<'_>) ->
     primary.push(self_span.clone());
     // alloc: empty, the error's labels, for an error hir found
     let mut at = MultiSpan { primary, labels: Vec::new() };
-    let trait_ = child.trait_ref().trait_();
-    let mut bounds = generic_bounds(item.generic_param_list(), item.where_clause())
-        .filter(|bound| bound_trait(cx, *bound) == Some(trait_));
-    let label = match (bounds.next(), bounds.next()) {
-        (Some(bound), None) => {
-            Some((cx.span(src.with_value(bound.syntax().text_range())), "unsatisfied trait bound introduced here"))
-        }
-        (None, _) if is_lang(cx, trait_, LangItem::Sized) => {
-            let want = child.trait_ref().self_ty().as_type_param(cx.db).map(|it| it.name(cx.db));
-            item.generic_param_list()
-                .into_iter()
-                .flat_map(|it| it.type_or_const_params())
-                .find_map(|p| match p {
-                    ast::TypeOrConstParam::Type(it)
-                        if !is_maybe_sized(it)
-                            && want.as_ref().is_some_and(|w| it.name().is_some_and(|n| n.text() == w.as_str())) =>
-                    {
-                        it.name()
-                    }
-                    _ => None,
-                })
-                .map(|name| {
-                    (
-                        cx.span(src.with_value(name.syntax().text_range())),
-                        "unsatisfied trait bound implicitly introduced here",
-                    )
-                })
-        }
-        _ => None,
+    let label = match bound {
+        Some(hir::BoundSource::ImplicitSized(_)) => "unsatisfied trait bound implicitly introduced here",
+        _ => "unsatisfied trait bound introduced here",
     };
-    if let Some((span, label)) = label
+    if let Some(span) = bound.and_then(|it| obligation_cause::bound_span(cx, it))
         && !overlaps(&span, &self_span)
     {
         // alloc: the error's text, for an error hir found
@@ -351,150 +319,25 @@ fn impl_note(cx: &Cx<'_, '_>, impl_: hir::Impl, child: &hir::TraitClause<'_>) ->
     Some(at)
 }
 
-/// The bounds written on an item's type parameters and in its where clause, in order.
-fn generic_bounds<'t>(
-    params: Option<ast::GenericParamList<'t>>,
-    wheres: Option<ast::WhereClause<'t>>,
-) -> impl Iterator<Item = ast::TypeBound<'t>> {
-    let params = params.into_iter().flat_map(|it| it.type_or_const_params()).filter_map(|param| match param {
-        ast::TypeOrConstParam::Type(param) => param.type_bound_list(),
-        ast::TypeOrConstParam::Const(_) => None,
-    });
-    let wheres = wheres.into_iter().flat_map(|it| it.predicates()).filter_map(|pred| pred.type_bound_list());
-    params.chain(wheres).flat_map(|list| list.bounds())
-}
-
-/// rustc's note on the bound of `callee` that did not hold: "required by a bound in `f`", on
-/// the bound written in `f`'s generics or where clause; "required by an implicit `Sized`
-/// bound in `f`" on the type parameter when it is `Sized`'s and `f` writes no such bound.
-/// When `f` writes several bounds of the trait and the front end does not say which one it
-/// was, it is not named.
-pub(super) fn where_clause_note<'db>(
-    cx: &Cx<'_, 'db>,
-    diag: &mut Diag,
-    callee: hir::Function,
-    trait_: hir::Trait,
-    self_ty: Option<&hir::Type<'db>>,
-) {
-    let Some(src) = cx.vsema.source(callee) else { return };
-    let item = src.value;
-    let mut bounds = bounds_of(item).filter(|bound| bound_trait(cx, *bound) == Some(trait_));
-    let only = bounds.next();
-    if only.is_some() && bounds.next().is_some() {
-        return;
-    }
-    let name = print::def_path(cx, hir::ModuleDef::Function(callee));
-    let ident = item.name().map(|it| cx.span(src.with_value(it.syntax().text_range())));
-    let (at, descr, label) = match only {
-        Some(bound) => (
-            cx.span(src.with_value(bound.syntax().text_range())),
-            // alloc: the error's text, for an error hir found
-            format!("required by a bound in `{name}`"),
-            // alloc: the error's text, for an error hir found
-            format!("required by this bound in `{name}`"),
-        ),
-        None if is_lang(cx, trait_, LangItem::Sized) => {
-            let mut params = item.generic_param_list().into_iter().flat_map(|it| {
-                it.type_or_const_params().filter_map(|p| match p {
-                    ast::TypeOrConstParam::Type(it) if !is_maybe_sized(it) => Some(it),
-                    _ => None,
-                })
-            });
-            let param = match self_ty.and_then(|it| it.as_type_param(cx.db)) {
-                Some(param) => {
-                    let want = param.name(cx.db);
-                    params.find(|it| it.name().is_some_and(|n| n.text() == want.as_str()))
-                }
-                None => match (params.next(), params.next()) {
-                    (Some(only), None) => Some(only),
-                    _ => None,
-                },
-            };
-            let Some(param) = param else { return };
-            let range = param.name().map_or(param.syntax().text_range(), |it| it.syntax().text_range());
-            (
-                cx.span(src.with_value(range)),
-                // alloc: the error's text, for an error hir found
-                format!("required by an implicit `Sized` bound in `{name}`"),
-                // alloc: the error's text, for an error hir found
-                format!("required by the implicit `Sized` requirement on this type parameter in `{name}`"),
-            )
-        }
-        _ => return,
-    };
-    // clone: on the error path, for an error hir found
-    let mut span = MultiSpan::of(at.clone());
-    if let Some(ident) = ident
-        && !overlaps(&ident, &at)
-        && !same_line(cx, &ident, &at)
-    {
-        let descr = if callee.has_self_param(cx.db) {
-            "method"
-        } else if callee.as_assoc_item(cx.db).is_some() {
-            "associated function"
-        } else {
-            "function"
-        };
-        // alloc: the error's text, for an error hir found
-        span.labels.push((ident, format!("required by a bound in this {descr}")));
-    }
-    span.labels.push((at, label));
-    diag.span_note(span, descr);
-    if let Ok(id) = FunctionId::try_from(callee) {
-        // alloc: the error's text, for an error hir found
-        diag.fact(Fact::Signature(cx.key(ItemId::Function(id))), format!("the signature of `{name}`"));
-    }
-}
-
-/// The bounds written on a function's type parameters, in its parameters' `impl Trait` types
-/// and in its where clause, in order.
-fn bounds_of<'t>(item: ast::Fn<'t>) -> impl Iterator<Item = ast::TypeBound<'t>> {
-    let params = item
-        .generic_param_list()
-        .into_iter()
-        .flat_map(|it| it.type_or_const_params())
-        .filter_map(|param| match param {
-            ast::TypeOrConstParam::Type(param) => param.type_bound_list(),
-            ast::TypeOrConstParam::Const(_) => None,
-        });
-    let impl_traits = item
-        .param_list()
-        .into_iter()
-        .flat_map(|it| it.params())
-        .filter_map(|param| param.ty())
-        .flat_map(|ty| ty.syntax().descendants().filter_map(ast::ImplTraitType::cast))
-        .filter_map(|it| it.type_bound_list());
-    let wheres = item
-        .where_clause()
-        .into_iter()
-        .flat_map(|it| it.predicates())
-        .filter_map(|pred| pred.type_bound_list());
-    params.chain(impl_traits).chain(wheres).flat_map(|list| list.bounds())
-}
-
-/// The trait a bound names.
-fn bound_trait<'db>(cx: &Cx<'_, 'db>, bound: ast::TypeBound<'db>) -> Option<hir::Trait> {
+/// The `Assoc = ..` constraint on `assoc` written in `bound`'s trait path.
+pub(super) fn constraint_range(cx: &Cx<'_, '_>, bound: ast::TypeBound<'_>, assoc: hir::TypeAlias) -> Option<TextRange> {
     let ast::Type::PathType(ty) = bound.ty()? else { return None };
-    match cx.vsema.resolve_path(ty.path()?)? {
-        PathResolution::Def(hir::ModuleDef::Trait(it)) => Some(it),
+    let name = assoc.name(cx.db);
+    ty.path()?.segment()?.generic_arg_list()?.generic_args().find_map(|arg| match arg {
+        ast::GenericArg::AssocTypeArg(it) if it.name_ref().is_some_and(|n| n.text() == name.as_str()) => {
+            Some(it.syntax().text_range())
+        }
         _ => None,
-    }
-}
-
-/// Whether a type parameter is written `?Sized`.
-fn is_maybe_sized(param: ast::TypeParam<'_>) -> bool {
-    param.type_bound_list().is_some_and(|list| {
-        list.bounds().any(|it| it.question_mark_token().is_some())
     })
 }
 
-fn overlaps(a: &Span, b: &Span) -> bool {
+pub(super) fn overlaps(a: &Span, b: &Span) -> bool {
     a.file == b.file && a.lo < b.hi && b.lo < a.hi
 }
 
 /// Whether the end of `a` is on the line `b` starts on (rustc compares `ident.span.hi()` with
 /// `span.lo()`).
-fn same_line(cx: &Cx<'_, '_>, a: &Span, b: &Span) -> bool {
+pub(super) fn same_line(cx: &Cx<'_, '_>, a: &Span, b: &Span) -> bool {
     if a.file != b.file {
         return false;
     }

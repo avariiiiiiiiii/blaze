@@ -33,6 +33,9 @@ mod tbd;
 mod tests;
 mod unwind;
 
+pub(crate) use input::{Autolink, asked_libraries, autolink};
+#[cfg(test)]
+pub(crate) use input::tests::linking as linking_object;
 #[cfg(feature = "fuzz")]
 pub(crate) use dylib::trie_differential;
 #[cfg(feature = "fuzz")]

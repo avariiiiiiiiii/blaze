@@ -17,8 +17,9 @@
 /// The name of the descriptor's symbol, which the linker exports.
 pub const DESCRIPTOR: &str = "__blaze_live";
 pub const DESCRIPTOR_MAGIC: [u8; 8] = *b"BLZLIVE2";
-/// The version of [`Descriptor`] this crate reads and writes.
-pub const DESCRIPTOR_VERSION: u32 = 2;
+/// The version of [`Descriptor`] this crate reads and writes: 3 since [`Descriptor::table`]
+/// names the [`exec`] header rather than a cell alone.
+pub const DESCRIPTOR_VERSION: u32 = 3;
 
 /// [`Descriptor::arch`] of x86-64 and of AArch64.
 pub const ARCH_X86_64: u32 = 0;
@@ -27,6 +28,61 @@ pub const ARCH_AARCH64: u32 = 1;
 /// The generation of an image's first full link; each commit of the image counts up from it.
 /// A program starts at the generation its descriptor says ([`Descriptor::generation`]).
 pub const FIRST_GENERATION: u64 = 0;
+
+/// The jump table's header, which [`Descriptor::table`] names, and its execution log
+/// (fastcompile-ident-select 9): the layout blaze-link writes and the runtime reads, every
+/// word little-endian, the header 8-aligned in writable data.
+///
+/// Every call through a slot loads [`CELL`](exec::CELL), then the slot's word of the table it
+/// points at.
+/// Without a log the cell points at the current generation's table. With one (blaze-link's
+/// `Output::exec_log`), it points at the log table from the start: word `s` of it holds slot
+/// `s`'s log stub until that is first called, which marks `map + 16 + s`, copies word `s` of
+/// the table at [`CURRENT`](exec::CURRENT) into the log table's word `s` and jumps there, so
+/// each later call goes straight to the code.
+pub mod exec {
+    /// The address of the table calls go through: the current generation's, or the log table.
+    pub const CELL: u64 = 0;
+    /// The address of the current generation's table, which the log stubs copy from.
+    pub const CURRENT: u64 = 8;
+    /// The address of the map the log stubs mark (slot `s` at `map + 16 + s`): the image's
+    /// own private map until the process is armed, then the armed region.
+    pub const MAP: u64 = 16;
+    /// The address of slot 0's log stub; 0 in an image without a log.
+    pub const STUBS: u64 = 24;
+    /// The address of the loader's table, which holds the generation the image was linked at.
+    pub const LOADER: u64 = 32;
+    /// The table's slot count, a `u32`.
+    pub const SLOTS: u64 = 40;
+    /// The bytes from one log stub to the next, a `u32`; 0 without a log.
+    pub const STRIDE: u64 = 44;
+    /// The header's length without a log, and where the log table starts with one.
+    pub const HEADER: u64 = 48;
+
+    /// A region's first bytes: what `__blaze_exec_arm` checks it starts with.
+    pub const MAGIC: [u8; 8] = *b"blzexec1";
+    /// A map's header ([`MAGIC`], the slot count and the slots armed, each a `u32`); slot
+    /// `s`'s byte follows at `REGION_HEADER + s`.
+    pub const REGION_HEADER: u64 = 16;
+
+    /// The offset of the log table's word for `slot`.
+    pub const fn log_word(slot: u64) -> u64 {
+        HEADER + slot * 8
+    }
+
+    /// The offset of the image's private map, after the log table of `slots` words.
+    pub const fn private_map(slots: u64) -> u64 {
+        HEADER + slots * 8
+    }
+
+    /// The header's length for a table of `slots` slots, with the log or without: the log
+    /// table and the private map, padded to a word, follow the fixed words.
+    pub const fn len(slots: u64, logged: bool) -> u64 {
+        if logged { private_map(slots) + (REGION_HEADER + slots).next_multiple_of(8) } else { HEADER }
+    }
+
+    const _: () = assert!(len(3, true) == 48 + 24 + 24 && len(3, false) == HEADER);
+}
 
 /// What the symbol `__blaze_live` of an image blaze-link made is: written by the linker in
 /// read-only data, every address as linked (unslid); the slide is where the descriptor is
@@ -44,8 +100,9 @@ pub struct Descriptor {
     /// whose `base` is the generation it is at.
     pub generation: u64,
     pub this: u64,
-    /// The cell holding the address of the current jump table (an array of `slots` code
-    /// addresses, slid by the loader); every call through a slot loads this cell first.
+    /// The jump table's header ([`exec`]), whose first word is the cell holding the address
+    /// of the table calls go through (an array of `slots` code addresses, slid by the
+    /// loader); every call through a slot loads this cell first.
     pub table: u64,
     /// The table's capacity: every slot has its stub from the full link on, so a patch only
     /// sets cells.

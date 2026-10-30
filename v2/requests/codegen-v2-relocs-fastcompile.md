@@ -78,6 +78,7 @@ No file in these crates hard-codes a content ID or store key of codegen's (`blaz
   file won't compile without it.
 
 > forwarded to fastcompile (holds `crates/blaze-premap/`, `crates/blaze-lazy/`) (requests, pass 18; told by tmux).
+> done (fastcompile-sol-premap): `relocs_into(&Relocs)` hashes the rows as stored, each target once, then the wide addends; `STATIC_DOMAIN` is `"blaze v2 premap static 2"`; `Target::Coverage` is hashed (tag 7). Not built here (no builds in this pass).
 
 ### crates/blaze-premap/src/split.rs
 
@@ -114,6 +115,7 @@ No file in these crates hard-codes a content ID or store key of codegen's (`blaz
   closure's annotated `&Target` parameter deref-coerces, but the extra `&` is noise.
 
 > forwarded to fastcompile (requests, pass 18; told by tmux).
+> done (fastcompile-sol-premap): `image_part` checks each function's and static's `Relocs::targets()` (each target once) against hashed sets of codegen's ownership, not `as_slice`.
 
 ### crates/blaze-premap/src/tests.rs
 
@@ -211,6 +213,7 @@ Order check: every `vec![reloc(..)]` in `Small::new` (lines 311–329) is alread
 cells' order in `model::place` stay the same.
 
 > forwarded to fastcompile (requests, pass 18; told by tmux).
+> done (fastcompile-sol-premap): `tests.rs` imports `Relocation as Reloc`, builds `Relocs` with `.into()`, sets `coverage: None`.
 
 ### crates/blaze-lazy/src/plan.rs
 
@@ -352,6 +355,10 @@ cells' order in `model::place` stay the same.
   `jump + 1`), so `out == ids(&[1, 2, 4])` still holds.
 
 > forwarded to fastcompile (requests, pass 18; told by tmux).
+
+> applied by fastcompile-sol-lazy, 2026-10-29: the three blaze-lazy sections (`plan.rs`
+> `named_functions`, `tests.rs`, `tests/plan.rs`), exactly as written, `coverage: None`
+> included. Not built. blaze-premap's sections are not mine.
 
 ## Checked, no change needed
 

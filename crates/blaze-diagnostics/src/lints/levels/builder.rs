@@ -17,7 +17,10 @@ use hir::{HirFileId, InFile};
 use intern::Symbol;
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
-use syntax::{SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, ast};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode as _},
+};
 
 use super::{
     ExpectId, Shared, Source, SourceId, Spec,
@@ -59,7 +62,7 @@ pub(super) struct Emitted {
 }
 
 /// An `#[expect]` of one lint, a group or a tool's lint, as the HIR has it.
-pub(super) struct Expectation {
+pub(super) struct Expectation<'db> {
     pub(super) id: ExpectId,
     /// Where the name is in the attribute.
     pub(super) key: Span,
@@ -67,7 +70,7 @@ pub(super) struct Expectation {
     /// `#[expect(unfulfilled_lint_expectations)]`, which nothing fulfills.
     pub(super) is_unfulfilled: bool,
     /// The node the attribute is on: where the level of `unfulfilled_lint_expectations` is.
-    pub(super) node: InFile<SyntaxNode>,
+    pub(super) node: InFile<ast::Node<'db>>,
 }
 
 /// A set of levels: the command line's, or one node's attributes'.
@@ -84,7 +87,7 @@ const NO_SET: SetId = SetId::MAX;
 /// one, against rustc's `FxIndexMap` per set. Finding a lint's level is one bit test of
 /// `anywhere` for a lint no set names (most of them), else one bit test of each set from the
 /// node out and a scan of the 2-byte ids of the one that has it.
-pub(super) struct Levels {
+pub(super) struct Levels<'db> {
     /// rustc's `lint_added_lints`: the early lint pass's builder, which says what is wrong with
     /// the attributes and holds to a `forbid`; the HIR's does neither and has no lint attributes
     /// on generic parameters.
@@ -106,9 +109,9 @@ pub(super) struct Levels {
     /// The set in force at each node seen, by one FxHash of the node: 28 bytes a node.
     at: HashTable<(InFile<SyntaxNodePtr>, SetId)>,
     /// The nodes between one asked of and the nearest seen, kept for its capacity.
-    chain: Vec<(u64, InFile<SyntaxNodePtr>, InFile<SyntaxNode>)>,
+    chain: Vec<(u64, InFile<SyntaxNodePtr>, InFile<ast::Node<'db>>)>,
     pub(super) emitted: Vec<Emitted>,
-    pub(super) expectations: Vec<Expectation>,
+    pub(super) expectations: Vec<Expectation<'db>>,
 }
 
 const _: () = assert!(size_of::<(InFile<SyntaxNodePtr>, SetId)>() <= 28);
@@ -116,10 +119,10 @@ const _: () = assert!(size_of::<(InFile<SyntaxNodePtr>, SetId)>() <= 28);
 /// The number of [`Level`]s.
 const LEVELS: usize = Level::Forbid as usize + 1;
 
-impl Levels {
+impl<'db> Levels<'db> {
     /// The builder with the command line's levels (rustc's `add_command_line`), and, when it
     /// `speaks`, what it says of the names on it; one that does not is for levels alone.
-    pub(super) fn new(sh: &mut Shared<'_, '_, '_>, early: bool, speaks: bool) -> Levels {
+    pub(super) fn new(sh: &mut Shared<'_, '_, 'db>, early: bool, speaks: bool) -> Levels<'db> {
         let mut levels = Levels::empty(early, speaks, sh.cmd.opts.len());
         let cmd = sh.cmd;
         for (name, level) in &cmd.opts {
@@ -129,7 +132,7 @@ impl Levels {
     }
 
     /// The builder with an empty command line's set, room for `cmd` levels in it.
-    fn empty(early: bool, walking: bool, cmd: usize) -> Levels {
+    fn empty(early: bool, walking: bool, cmd: usize) -> Levels<'db> {
         Levels {
             early,
             walking,
@@ -257,14 +260,13 @@ impl Levels {
     /// Every node of the crate with attributes, as rustc's walk comes to it. A node without
     /// costs a read of the tree's two columns, kind and `Tree::attrs`; only the rest are looked
     /// at.
-    pub(super) fn walk(&mut self, sh: &mut Shared<'_, '_, '_>, walk: &Walk<'_>) {
+    pub(super) fn walk(&mut self, sh: &mut Shared<'_, '_, 'db>, walk: &Walk<'db>) {
         self.walking = true;
         let early = self.early;
         for tree in &walk.trees {
             for node in tree.with_attrs(|kind| attrs::may_be_owner(kind, early)) {
                 if attrs::owns(node, early) {
-                    // clone: a reference count on the tree, of a node with an attribute
-                    self.set_at(sh, InFile::new(tree.file, node.clone()));
+                    self.set_at(sh, InFile::new(tree.file, node));
                 }
             }
         }
@@ -273,42 +275,42 @@ impl Levels {
 
     /// [`Levels::set_at`] of the node `at` points to, with no tree walked when a node at it was
     /// seen.
-    pub(super) fn set_of(&mut self, sh: &mut Shared<'_, '_, '_>, at: InFile<SyntaxNodePtr>) -> SetId {
+    pub(super) fn set_of(&mut self, sh: &mut Shared<'_, '_, 'db>, at: InFile<SyntaxNodePtr>) -> SetId {
         let hash = FxBuildHasher.hash_one(&at);
         if let Some(&(_, set)) = self.at.find(hash, |(it, _)| *it == at) {
             return set;
         }
-        let node = sh.cx.syntax(at);
+        let node = sh.cx.syntax_view(at);
         self.set_at(sh, node)
     }
 
     /// The set in force at `node`: of its attributes, else of the nearest node around it with
     /// any. Each node between it and the nearest one seen is hashed once.
-    pub(super) fn set_at(&mut self, sh: &mut Shared<'_, '_, '_>, node: InFile<SyntaxNode>) -> SetId {
+    pub(super) fn set_at(&mut self, sh: &mut Shared<'_, '_, 'db>, node: InFile<ast::Node<'db>>) -> SetId {
         let mut chain = std::mem::take(&mut self.chain);
         let mut next = Some(node);
         let mut set = COMMAND_LINE;
         while let Some(node) = next {
-            let key = attrs::key(&node);
+            let key = attrs::key(node);
             let hash = FxBuildHasher.hash_one(&key);
             if let Some(&(_, known)) = self.at.find(hash, |(it, _)| *it == key) {
                 set = known;
                 break;
             }
-            next = attrs::parent(sh.cx.sema, &node);
+            next = attrs::parent(&sh.cx.vsema, node);
             chain.push((hash, key, node));
         }
         for (hash, key, node) in chain.drain(..).rev() {
-            set = self.push_node(sh, set, &node);
+            set = self.push_node(sh, set, node);
             self.at.insert_unique(hash, (key, set), |(it, _)| FxBuildHasher.hash_one(it));
         }
         self.chain = chain;
         set
     }
 
-    fn push_node(&mut self, sh: &mut Shared<'_, '_, '_>, parent: SetId, node: &InFile<SyntaxNode>) -> SetId {
-        let Some(owner) = attrs::owner(&node.value, self.early) else { return parent };
-        let reads = attrs::read(&owner, sh.cfg, sh.cx.edition);
+    fn push_node(&mut self, sh: &mut Shared<'_, '_, 'db>, parent: SetId, node: InFile<ast::Node<'db>>) -> SetId {
+        let Some(owner) = attrs::owner(node.value, self.early) else { return parent };
+        let reads = attrs::read(owner, sh.cfg, sh.cx.edition);
         if reads.is_empty() {
             return parent;
         }
@@ -339,7 +341,7 @@ impl Levels {
     }
 
     /// rustc's `add`: the attributes of one node.
-    fn add(&mut self, sh: &mut Shared<'_, '_, '_>, set: SetId, node: &InFile<SyntaxNode>, reads: Reads, is_crate: bool) {
+    fn add(&mut self, sh: &mut Shared<'_, '_, 'db>, set: SetId, node: InFile<ast::Node<'db>>, reads: Reads<'db>, is_crate: bool) {
         let says = self.early && self.walking;
         let in_root = node.file_id == sh.root;
         let cx = sh.cx;
@@ -347,7 +349,7 @@ impl Levels {
         let span = |range: TextRange| cx.span(InFile::new(file, range));
         let mut known: Option<Place> = None;
         // clone: a diagnostic's place, made once and copied for each diagnostic of the node
-        let mut place = || known.get_or_insert_with(|| attrs::place(cx.sema, node)).clone();
+        let mut place = || known.get_or_insert_with(|| attrs::place(&cx.vsema, node)).clone();
         for read in reads {
             let (level, mut items, pre) = match read {
                 Read::Allows(id) => {
@@ -500,10 +502,9 @@ impl Levels {
                     && self.walking
                 {
                     let is_unfulfilled = matches!(lints, [only] if only.id() == LintId::UNFULFILLED_LINT_EXPECTATIONS);
-                    // clone: an interned symbol; and the node, a reference count, once per `#[expect]` name
+                    // clone: an interned symbol, once per `#[expect]` name
                     let reason = reason.clone();
-                    // clone: as above
-                    self.expectations.push(Expectation { id, key: at(), reason, is_unfulfilled, node: node.clone() });
+                    self.expectations.push(Expectation { id, key: at(), reason, is_unfulfilled, node });
                 }
             }
         }
@@ -779,21 +780,20 @@ fn malformed(at: Span, label: &str) -> Diag {
 /// Where the HIR has the `#[expect]`s of `node`, for the order rustc checks them in
 /// (`ModuleItems::owners`): the crate, then free items, trait items, impl items and foreign
 /// items, each in order; the owner is the item `node` is in.
-pub(super) fn owner_rank(sh: &Shared<'_, '_, '_>, node: &InFile<SyntaxNode>) -> (u8, Place) {
-    let sema = sh.cx.sema;
-    // clone: a reference count on the tree, once per `#[expect]` name
-    let mut at = node.clone();
+pub(super) fn owner_rank(sh: &Shared<'_, '_, '_>, node: InFile<ast::Node<'_>>) -> (u8, Place) {
+    let sema = &sh.cx.vsema;
+    let mut at = node;
     loop {
         let kind = at.value.kind();
         if kind == SyntaxKind::SOURCE_FILE && at.file_id == sh.root {
-            return (0, attrs::place(sema, &at));
+            return (0, attrs::place(sema, at));
         }
-        let up = attrs::parent(sema, &at);
+        let up = attrs::parent(sema, at);
         if ast::Item::can_cast(kind) && kind != SyntaxKind::MACRO_CALL {
             let around = up.as_ref().map(|it| it.value.kind());
             let rank = match around {
                 Some(SyntaxKind::ASSOC_ITEM_LIST) => {
-                    match up.as_ref().and_then(|it| attrs::parent(sema, it)).map(|it| it.value.kind()) {
+                    match up.and_then(|it| attrs::parent(sema, it)).map(|it| it.value.kind()) {
                         Some(SyntaxKind::TRAIT) => 2,
                         _ => 3,
                     }
@@ -801,11 +801,11 @@ pub(super) fn owner_rank(sh: &Shared<'_, '_, '_>, node: &InFile<SyntaxNode>) -> 
                 Some(SyntaxKind::EXTERN_ITEM_LIST) => 4,
                 _ => 1,
             };
-            return (rank, attrs::place(sema, &at));
+            return (rank, attrs::place(sema, at));
         }
         match up {
             Some(up) => at = up,
-            None => return (0, attrs::place(sema, &at)),
+            None => return (0, attrs::place(sema, at)),
         }
     }
 }
@@ -825,7 +825,7 @@ mod tests {
         [Level::Allow, Level::Expect, Level::Warn, Level::ForceWarn, Level::Deny, Level::Forbid];
 
     /// [`Levels::raw`] as it was: a scan of the ids of each set from `set` out.
-    fn raw_by_scan(levels: &Levels, id: LintId, set: SetId) -> Option<Spec> {
+    fn raw_by_scan(levels: &Levels<'_>, id: LintId, set: SetId) -> Option<Spec> {
         let mut at = set;
         while at != NO_SET {
             let range = levels.range(at);

@@ -86,6 +86,7 @@ unevaluated constants; the collector already takes associated consts, as for `Ra
 
 > applied (items DONE): `blaze-items/src/form.rs` hashes the four new `AssertKind`s with tags 5-8 and their operands; casts hash `CastKind` by `Debug`, so `Transmute` is in already. forwarded to diagnostics (`panics.rs:518`), codegen (`hir-ty-codegen`), db (hir-ty, hir-ty-borrowck).
 > applied by db-ty-d-mir: nothing to change in hir-ty, hir, hir-ty-borrowck or hir-ty-wfcheck: outside `mir.rs` (done) no match on `AssertKind` and `CastKind`'s one (`hir-ty-borrowck/src/regions.rs:4789`) ends in `_ => ()`.
+> applied by codegen (2026-10-29), checked by the lead: hir-ty-codegen's part is 5 below (`mod.rs` lowers the four `AssertKind`s and `CastKind::Transmute`, `v2/refs.rs:1053` takes it); `fncache/dispatch.rs:393` matches casts with `_ => false`, so needs no arm.
 
 ## 5. Codegen must lower (speed-backend-lower, `crates/hir-ty-codegen/mod.rs`)
 
@@ -197,6 +198,7 @@ doesn't call core's `panic_const_add_overflow` and the rest, so std's panic hook
 calls them as rustc's codegen does.
 
 > forwarded to db (hir-def is db's; db-next2 told).
+> forwarded by db-audit-other (22:50) to format (through requests-next3). The `lang_item.rs` lines need 22 `sym::panic_const_*` names in `crates/intern` (format's), so the two halves must land as one change. `v2/requests/db.md` `## format (through requests-next3; from db-audit-other): the panic_const_* symbols and lang items` has the exact text for both and db's go for the `lang_item.rs` half. `panic_bounds_check`, `panic_misaligned_pointer_dereference` and `panic_null_pointer_dereference` are in already (`crates/hir-def/src/lang_item.rs:603-609`). Codegen finds these functions by path (`hir-ty-codegen/v2/refs.rs:1185`), so only the evaluator is left to call them.
 
 ## 12. hir-ty `src/infer.rs` (db-ty): value resolutions and adjustments as columns
 

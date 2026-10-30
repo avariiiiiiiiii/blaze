@@ -11,7 +11,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{cast_ty_span, expr_span};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set},
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set},
     lower::{Found, Phase},
     model::{Applicability, Diag, SuggestionStyle},
 };
@@ -21,7 +21,7 @@ pub(crate) struct FunctionCastsAsInteger;
 
 impl LatePass for FunctionCastsAsInteger {
     const LINTS: LintSet = lint_set(["function_casts_as_integer"]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Cast]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Cast]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Cast { expr: from, .. } = b.store().expr(expr) else { return };

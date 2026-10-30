@@ -87,9 +87,12 @@ are heap `Vec`s. None of that depends on the values, so it is all removable.
   mispredicts dominate when measured, threaded dispatch with explicit tail calls (`become`,
   available on blaze's own nightly) and superinstructions for the common pairs
   (`CheckedBinaryOp` + `Assert`, `Discriminant` + `SwitchInt`).
-- **Hooks.** `M::CHECKS` already compiles every hook out for `Plain`. Under a checker, an
-  instruction carries the type ids the hooks need (`typed` still takes the `Ty`), so the
-  checker's cost is its own work and the evaluator adds under 10% to it.
+- **Hooks.** `M::CHECKS` already compiles every hook out for `Plain`, the `RefCell` that
+  holds the machine (`eval/hooks.rs`) included: no borrow flag is read in const eval. Under a
+  checker, an instruction carries the type ids the hooks need (`typed` still takes the `Ty`),
+  so the checker's cost is its own work and the evaluator adds under 10% to it; the borrow
+  flag is one load, compare and store per hook (about 1 cycle), against the checker's tens to
+  hundreds of cycles per access.
 - **One path.** The decoded form replaces the typed walk; there is no second, slower
   interpreter kept beside it (rule no-fallback). The generic-placeholder case
   (`assert_placeholder_ty_is_unused`, which takes `(0, 1)` as the size) decodes with that
@@ -233,3 +236,178 @@ for each whether it reaches a process, the network or assembly.
 
 STATUS of this section: the bounds are written; kept symbols are at the bound, the listing
 within 2×, `outside` 2 to 3× until it folds into the build's walk.
+
+## codegen-fc-lazy: a lazy build (`crates/blaze-codegen/src/driver/later.rs`)
+
+A lazy build (`Build::run_later`) walks what a whole build walks, compiles its statics, its
+entry and what start sections name, and checks every other function; `Build::compile_one`
+compiles one on its first call. The walk is the whole build's and is counted in its section;
+what follows is the work a lazy build adds or saves.
+
+- **The check, warm** (the store has the function's template): one store probe and one
+  decode of the template's lists in place, no copy and no instantiation. **Bound:** a probe of
+  the mapped store is about 100 ns (a hash, an index read, a page that is usually resident);
+  the decode streams the template at about 32 bytes a cycle, about 100 ns for a 1 KB
+  template. For 50 000 functions: 5 ms of probes, and 5 ms of decoding spread over all cores
+  (about 0.2 ms on 32). A whole warm build instead instantiates every function (a copy of its
+  code, relocations and lines, 1 to 2 µs each, 50 to 100 ms), so the lazy check is 10 to 20×
+  less. **Where the code is:** the decode is on all cores; the probes are on the calling
+  thread, as `Lookup` says the store is read, so they are the floor of the check. **What
+  closes it:** a `Lookup` that is `Sync` (`blaze_cas::Reader` reads take no lock) would put
+  the probes on all cores too; that is a change to `driver.rs`'s trait, the parent's.
+- **The check, cold** (no template): the function's IR is built (its MIR monomorphized and
+  lowered, its layouts), on all cores, and let go on the thread that built it; 64 bytes of it
+  are kept (its key and shape). **Bound:** the front end's IR build of each reached function,
+  which is what makes a lazy build fail where a whole build fails. Emission (instruction
+  selection, register allocation and encoding, about two thirds of a dev compile) is not
+  paid until a first call. **Where the code is:** at the bound: one prepare per function, no
+  emit, no IR held.
+- **`compile_one`.** A store hit is one probe and one instantiation, bound by copying the
+  function (about 50 ns for 1 KB). A function whose check built its IR finds the memo's
+  template by the shape it kept, one probe and one instantiation, with no IR built again. A
+  miss is one prepare and one emit, the backend's bound. Nothing is locked: the build is read
+  only, and the memo is lock-free. **Gap:** the kept shapes are a hash map, one probe a first
+  call; a column indexed by the function's place in the walk would be a read, which needs the
+  lazy runner to pass that place (its `LazyId` follows the walk's order). Small.
+
+STATUS of this section: the check and `compile_one` are at their bounds, except that the
+check's store probes run on one thread, as `Lookup` requires.
+
+## codegen-fc-built: owners and the execution table (`crates/blaze-codegen/src/driver/owners.rs`, `exec.rs`)
+
+Every build now says whose each instance is (`Built::owners`, `static_owners`) and what it is
+across versions (`Built::versions`); a test binary's link adds its table (`ExecTable::new`).
+Counts are for 100 000 functions with 10 references each, not measured (not built).
+
+- **Owners and the check.** Two copies of the walk's key-ordered lists and, per reference to
+  a function or static, a binary search of them for its owner: 1 M searches of 17 compares of
+  32-byte keys, about 10 ms on one thread. **Bound:** the walk already resolves each reference
+  to its node by a hash; keeping that node's place there would make the owner a read, about
+  1 ms. **Where the code is:** the searches, after the walk and before any compile, on the
+  walking thread. **What closes it:** an owner column in `Sorted`, filled by the walk, read by
+  place; it changes the walk's node, so it waits on the lanes that share `driver.rs`.
+- **Versions.** Per instance one `fn_id` hash (64 bytes) and one `exec::bound` hash of its
+  references' item keys (a hash lookup each, about 40 bytes hashed each): about 1 M lookups and
+  40 MB hashed, 10 to 20 ms on one thread, paid by every build though only a test binary's
+  table reads it. **Bound:** none for a build that is no test binary. **What closes it:**
+  `Build` told whether the unit is a test binary (a `Policy` field), or the versions made by
+  `ExecTable::new` from the nodes, which `Built` does not keep. The per-instance parts are
+  independent, so a parallel map would take them to under 1 ms on 32 cores.
+- **`ExecTable::new`.** One sort of the functions by `FnId` (100 000 × 17 compares, about
+  3 ms), one slot lookup per function (the link's, a hash each), and per test one walk of its
+  reach (`Reach::functions_of`, at its bound: a bit per node, cleared by the walk that set it)
+  mapped to table places and sorted, by a sort when it is under a quarter of the table's
+  words and by a reused bit per function otherwise. **Bound:** the sort is what
+  `blaze_testsel::Image::new` would do and now checks in one pass (fastcompile-sol-select 2);
+  the walks are the floor, as each test's reach is its own.
+
+STATUS of this section: `ExecTable::new` at its bound; owners and versions each about 10× off
+theirs, with the fixes above, and both on one thread.
+
+## codegen-rq-lower: a function's unwind entry and its variables' places (`crates/hir-ty-codegen/unwind.rs`, `debuginfo.rs`)
+
+Owner: codegen-rq-lower.
+
+**The FDE of a Cranelift function.** v2 keeps, per function, the call frame instructions
+of its `.eh_frame` FDE after a CIE shared by the ISA (`v2/unwind.rs` `Common`). The bound is
+the bytes themselves. A dev function saves 0 to 12 registers, so it has 2 to 14 rows: on
+x86-64, `push rbp` (a CFA offset and a register rule), `mov rbp, rsp` (a CFA register) and
+one offset per callee-saved register; AArch64 adds the link register and, when signing, a
+`RaSignState`. Each row is 1 to 3 bytes, padded to 8, so about 8 to 32 bytes. At about one
+byte every 2 cycles (branchy, a LEB128 per operand), that is 20 to 70 cycles, or 10 to 20 ns,
+plus the one allocation of the output (40 to 80 cycles). Before, each function cloned the
+CIE (its own `Vec` of instructions), registered it and the FDE in a gimli `FrameTable`
+(an `IndexSet`, a `Vec` of FDEs and an atomic `BaseId`), wrote the whole `.eh_frame` into an
+`EndianVec`, parsed it back and copied out both halves. That is about six allocations and
+a few hundred bytes written and read, so roughly 1,500 to 3,000 cycles.
+
+How the design reaches the bound:
+- `FunctionUnwind::of` makes the rows once, at compile time, from the `(offset, UnwindInst)`
+  pairs Cranelift's buffer already holds (`SystemV::rows`, a port of Cranelift's
+  `create_unwind_info_from_insts`). That is one pass and one `Vec` of rows, which the
+  function's `UnwindInfo` made anyway.
+- `unwind::Fde::write` encodes them straight into the output with gimli's encoding (checked
+  byte for byte), with no table, no CIE and no parse.
+- What is left over the bound is the output `Vec` and a `Vec` of rows per function. Writing
+  into a buffer the caller keeps would remove the first, if `Unwind::Dwarf::fde` borrowed.
+
+What stands in the way:
+- `Unwind::Dwarf::cie` is a `Vec<u8>` per function, a clone of about 20 bytes and one
+  allocation. It is the parent's to make a `ContentId` or carry once per build.
+- Other architectures (riscv64, s390x) still go through gimli (`Frame::Cranelift`).
+- A benchmark should confirm, per function of the dev path, the FDE in under 100 ns and one
+  allocation, against the convert time before.
+
+**Where a named variable lives** (`SlotPlaces::of`). The side table asks once per named
+local which place its stack slot has. With \(m\) slots and \(n\) locals, the bound is reading
+each local once, plus a probe of \(\log_2 m\) compares, which is under 10 for any function's
+slot count, at about 2 cycles each. The linear `find` it replaces cost \(O(nm)\): for a
+function with 1,000 slots and as many locals, about 500,000 compares, or about 0.3 ms. Now
+it is about 10,000. `SlotPlaces::new` sorts once, a stable \(O(m \log m)\) sort, and skips
+the sort when the slots are already in order. A benchmark should confirm that
+`describe_variables` stays linear on a function with thousands of named locals.
+
+## codegen-rq-features: target-feature sets (`crates/hir-ty-codegen/target.rs`, `llvm.rs`, `v2/backend.rs`)
+
+Owner: codegen-rq-features.
+
+**Numbering a set** (`Target::features_of`, `Features`). A set is a `u8`. The bound for
+finding a set already named is one compare per set named so far, a few in any process (a
+dev job's host set, a release job's baseline, one per distinct `#[target_feature]` set), each
+an early-out slice compare of about 5 to 15 short strings, with no lock and no allocation.
+The design is at that bound: `FEATURE_SETS` is a fixed array of `OnceLock`s, scanned
+lock-free. The lock is taken only to add a set, once per set per process. Checking the
+names (`cranelift_setting`, an 18-entry scan each) adds about 10 × 18 compares, or about
+100 ns, per prepared function. That is under 1% of a prepare (10 to 100 µs). Numbering the
+unit's set once per unit would remove it, but the spec is not carried from `check_spec` to
+`prepared`.
+
+**A function's set** (`v2/backend.rs` `features`). For a function with no
+`#[target_feature]` the work is the salsa hit of `TargetFeatures::from_fn` (about 30
+cycles) and the numbering above. For one with it, there is one `Vec` of the unit's names plus
+what it enables, sorted. That is a handful of allocations, only for such functions.
+
+**The code generator of a set.** Cranelift: `target_of` indexes a static
+`[[[OnceLock; 3]; 2]; 128]` by set, level and kind, which is one load and a check. The ISA is
+made once per set and kind. LLVM: a thread's machines are keyed `(level, pgo, set)` in one
+`FxHashMap` (one more byte hashed). LLVM's feature string for a set is made once
+(`llvm::told`, a static array of `OnceLock<Box<str>>`), and each function gets it as one
+string attribute, interned by LLVM, which costs nothing next to LLVM's compile. Names LLVM
+lacks are checked once per machine made, not per function.
+
+**The shape.** 1 + 4 bytes for a set with no names, plus 8 + the length per name. Hashing
+that is far under a nanosecond per byte.
+
+## codegen-fc-sol: stopping, the memo probe and the pieces' digests (`crates/blaze-codegen/src/driver.rs`, `driver/later.rs`, `driver/digests.rs`)
+
+Not measured (not built). Counts are for 100 000 functions.
+
+- **Stopping per function** (`Build::until_stopped`). Every per-function loop (prepare,
+  summarize, emit, merge, static compile, the lazy check and the lazy entry) asks
+  `Frontend::stopped` before each item: a relaxed load of the job's flag and, with a body
+  check beside the build, one indirect call, together 1 to 2 ns against a function's 50 to
+  200 µs (0.002%). **Bound:** a design that never stops code mid-function gives a thread back
+  when the function it is in ends, so the latency is one function a core: 50 to 200 µs for a
+  dev compile. **Where the code is:** at the bound; nothing is begun once the flag is set, and
+  the one `stopped` error is made once per loop, not per item left.
+- **`Build::memo_hit`.** Three probes (the walk's node, the recorded shape, the lock-free
+  memo), about 20 ns each, then the instantiation (a copy of the function, about 50 ns for
+  1 KB) and the template's encoding for its `Put` (a second copy and one allocation, about the
+  same). **Bound:** the probes and one copy, about 110 ns. **Where the code is:** about 1.5× it,
+  for the `Put`'s bytes. **What closes it:** giving the store writer the memo's template by
+  reference and encoding it there, off the reading thread; that changes the signature
+  fastcompile-sol-lazy 3 asked for, so it waits on the lazy runner's `hit`.
+- **Digests** (`Built::digests`). A function's is its code hash when it built nothing in (a
+  32-byte copy, as nearly every dev function), else one BLAKE3 of 40 + 32 bytes per callee,
+  about 100 ns. A static's is one BLAKE3 of its bytes, relocations and data, made on the cores
+  that instantiate or compile it, at BLAKE3's SIMD rate (several GB/s a core), with
+  instantiation now on all cores too. A debug name's is one BLAKE3 of about 60 bytes, 80 ns,
+  made beside `describe` (microseconds) on the walk's cores: 8 ms of CPU, about 0.3 ms on 32
+  cores. Sorting is one `sort_unstable` of the function digests (already in key order but for
+  the lazy and release pushes) and one of the statics'; debug names come in key order.
+  **Bound:** zero for functions; for statics, one pass over bytes the build already copies;
+  for names, the hash. **What closes the rest:** the debug name's digest kept with the
+  instance's description in the front end's memo, so a warm walk hashes nothing.
+
+STATUS of this section: stopping is at its bound; `memo_hit` 1.5× it; digests at their bound
+for functions and statics, the debug names' hash paid on every walk.

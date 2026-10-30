@@ -844,7 +844,7 @@ pub(crate) mod tests {
     use itertools::Itertools;
     use span::Edition;
     use stdx::format_to;
-    use syntax::ast::AstNode;
+    use syntax::view::AstNode;
     use test_fixture::WithFixture;
 
     use crate::test_db::{TestDB, TestDBExt};
@@ -869,10 +869,10 @@ pub(crate) mod tests {
         let parsed_path_file =
             syntax::SourceFile::parse(&format!("use {path};"), span::Edition::CURRENT);
         let ast_path =
-            parsed_path_file.syntax_node().descendants().find_map(syntax::ast::Path::cast).unwrap();
+            parsed_path_file.root().descendants().find_map(syntax::view::Path::cast).unwrap();
         let span_map = LazyCell::new(|| hir_expand::HirFileId::from(pos.file_id).span_map(&db));
         let mod_path =
-            ModPath::from_src(&db, ast_path, &mut |range| span_map.span_for_range(range).ctx)
+            ModPath::from_src_view(&db, ast_path, &mut |range| span_map.span_for_range(range).ctx)
                 .unwrap();
 
         let (def_map, local_def_map) = module.local_def_map(&db);

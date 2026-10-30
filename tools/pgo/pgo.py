@@ -22,8 +22,13 @@ One typed input (AGENTS.md rule scripts-take-typed-input), one of two kinds:
      trained either by BOLT's instrumentation (the default: a VM has no LBR) or by `perf record`
      with branch stacks, then optimised;
   7. runs the gate with the optimised binaries as BLAZE_BIN;
-  8. writes into `out` the merged profile, the BOLT profile and the binaries, each named by its
-     content's sha256, and `<target>.json`, its entry for tools/pgo/profiles.json.
+  8. times the turns of the training's `measure` projects, `measure_runs` rounds, with a plain
+     build of this commit (`baseline`, or built here without a profile), the PGO build and the
+     PGO and BOLT build in turn, and refuses an optimised blaze that saves under `min_speedup`
+     thousandths of the plain one's least time: a profile that did not apply stops the release;
+  9. writes into `out` the merged profile, the BOLT profile and the binaries, each named by its
+     content's sha256, and `<target>.json`, its entry for tools/pgo/profiles.json, with the
+     speedup measured.
 
 `publish` checks every file each `<target>.json` of `dirs` names against its sha256, uploads them
 to the release tools/pgo/profiles.json names (`upload`), and writes their entries into it.
@@ -37,6 +42,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -103,6 +109,15 @@ class Build:
     min_count: int = 1_000_000_000
     turn_secs: int = 3600
     build_secs: int = 7200
+    # The least the optimised blaze must save of a plain build's time on the measured turns, in
+    # thousandths. PGO saves rustc 100 to 160 and BOLT 20 to 50 more; 50 still passes on a noisy
+    # VM and stops a profile that applied to nothing.
+    min_speedup: int = 50
+    # The rounds each set of binaries runs the measured turns; the least time of each is kept.
+    measure_runs: int = 2
+    # A directory of this commit's blaze built plainly (the `dist` profile and the `llvm`
+    # feature, no profile), the speedup's baseline; empty builds one here.
+    baseline: str = ""
 
 
 @dataclass(frozen=True)
@@ -147,6 +162,8 @@ class Corpus:
 class Training:
     projects: tuple[Project, ...]
     corpus: Corpus | None = None
+    # The projects whose turns are timed for the speedup, by name: at least one.
+    measure: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -178,9 +195,21 @@ class Bolt:
 
 
 @dataclass(frozen=True)
+class Speedup:
+    """What the optimised blaze saved on the measured turns against a plain build of its commit,
+    in thousandths of the plain build's least time: by the profile alone, and by the profile and
+    BOLT (the same on a target BOLT does not rewrite)."""
+
+    plain_ms: int
+    pgo: int
+    total: int
+    runs: int
+
+
+@dataclass(frozen=True)
 class Pin:
     """One target's profile. An entry of the cargo-trained pipeline (.github/scripts/build_release.py)
-    has no `builder`, `llvm`, `bolt` or `binaries`: it is `cargo`'s."""
+    has no `builder`, `llvm`, `bolt`, `binaries` or `speedup`: it is `cargo`'s."""
 
     name: str
     sha256: str
@@ -192,6 +221,7 @@ class Pin:
     llvm: str | None = None
     bolt: Bolt | None = None
     binaries: Asset | None = None
+    speedup: Speedup | None = None
 
 
 @dataclass(frozen=True)
@@ -247,6 +277,10 @@ def check_build(build: Build) -> None:
         wrong("field min_count is at least 1")
     if not build.gate:
         wrong("field gate is empty: the optimised binary passes a gate before it is published")
+    if not 1 <= build.min_speedup < 1000:
+        wrong("field min_speedup is 1 to 999 thousandths: an optimised blaze shows its speedup")
+    if build.measure_runs < 1:
+        wrong("field measure_runs is at least 1")
 
 
 def parse_training(text: str) -> Training:
@@ -266,6 +300,12 @@ def parse_training(text: str) -> Training:
         check_turns(where, project.edit, project.turns)
     if training.corpus is not None:
         check_turns("corpus", training.corpus.edit, training.corpus.turns)
+    if not training.measure:
+        wrong("measure is empty: the speedup is timed on at least one project")
+    if unknown := sorted(set(training.measure) - set(names)):
+        wrong(f"measure names {unknown}, which are not projects")
+    if len(set(training.measure)) != len(training.measure):
+        wrong(f"measure names a project twice: {list(training.measure)}")
     return training
 
 
@@ -376,8 +416,10 @@ def read_pin(target: str, value: object) -> Pin:
             wrong(f"targets.{target}: {asset.name!r} is not a file name")
     if not COMMIT.fullmatch(pin.commit):
         wrong(f"targets.{target}.commit is a full commit, not {pin.commit!r}")
-    if pin.builder == "blaze" and (pin.llvm is None or pin.binaries is None):
-        wrong(f"targets.{target} is blaze's: it names its llvm and binaries")
+    if pin.builder == "blaze" and (pin.llvm is None or pin.binaries is None or pin.speedup is None):
+        wrong(f"targets.{target} is blaze's: it names its llvm, binaries and speedup")
+    if pin.speedup is not None and (pin.speedup.plain_ms < 1 or pin.speedup.runs < 1):
+        wrong(f"targets.{target}.speedup was measured: plain_ms and runs are at least 1")
     return pin
 
 
@@ -656,9 +698,10 @@ def on_path(bins: Path, env: dict[str, str]) -> str:
     return f"{bins}{os.pathsep}{env.get('PATH', '')}"
 
 
-def train(build: Build, trees: list[Tree], bins: Path, stage: str, work: Path, extra: dict[str, str]) -> None:
+def train(build: Build, trees: list[Tree], bins: Path, stage: str, work: Path, extra: dict[str, str]) -> float:
     """Every turn of every tree run by the blaze in `bins`, on a fresh copy of the sources and a
-    fresh BLAZE_HOME; then its daemon stopped and gone."""
+    fresh BLAZE_HOME; then its daemon stopped and gone. The seconds the turns took, copies and
+    stops apart."""
     root = work / f"train-{stage}"
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
@@ -666,6 +709,7 @@ def train(build: Build, trees: list[Tree], bins: Path, stage: str, work: Path, e
     env.update(extra)
     env.update(BLAZE_HOME=str(root / "home"), PATH=on_path(bins, env))
     blaze = bins / exe(build.target, "blaze")
+    spent = 0.0
     try:
         for tree in trees:
             copy = root / tree.name
@@ -677,7 +721,9 @@ def train(build: Build, trees: list[Tree], bins: Path, stage: str, work: Path, e
                     with (copy / tree.edit).open("a") as f:
                         f.write(edit_text(edits))
                 step = f"train {stage}: {tree.name} turn {i}"
+                began = time.monotonic()
                 run(step, [str(blaze), *turn.args], cwd=copy, env=env, secs=build.turn_secs)
+                spent += time.monotonic() - began
     except Failed:
         try:
             stop(blaze, env)
@@ -686,6 +732,57 @@ def train(build: Build, trees: list[Tree], bins: Path, stage: str, work: Path, e
         raise
     stop(blaze, env)
     wait_exit(bins)
+    return spent
+
+
+def rotated[T](items: list[T], by: int) -> list[T]:
+    """`items` from its `by`th on, then the rest: round `by` of a measurement runs the sets in
+    this order, so none always runs first on a cold machine."""
+    at = by % len(items)
+    return items[at:] + items[:at]
+
+
+def measure(build: Build, trees: list[Tree], sets: dict[str, Path], work: Path) -> dict[str, float]:
+    """Each set of binaries' least seconds over `measure_runs` rounds of `trees`' turns, each round
+    running every set, in a rotated order."""
+    least = {name: math.inf for name in sets}
+    for i in range(build.measure_runs):
+        for name in rotated(sorted(sets), i):
+            least[name] = min(least[name], train(build, trees, sets[name], f"measure-{name}", work, {}))
+    return least
+
+
+def saved(plain: float, optimised: float) -> int:
+    """The thousandths of `plain` that `optimised` saved, rounded down; under 0 when slower."""
+    return math.floor(1000 * (plain - optimised) / plain)
+
+
+def speedup_of(least: dict[str, float], runs: int, floor: int) -> Speedup:
+    """The speedup of the least times of the sets `plain`, `pgo` and, where BOLT ran, `total`;
+    Failed when the optimised blaze saves under `floor` thousandths."""
+    plain = least["plain"]
+    if not plain > 0:
+        raise Failed("the measured turns took no time with the plain blaze")
+    pgo = saved(plain, least["pgo"])
+    total = saved(plain, least.get("total", least["pgo"]))
+    got = Speedup(max(1, round(plain * 1000)), pgo, total, runs)
+    if total < floor:
+        raise Failed(
+            f"the optimised blaze saves {total}/1000 of a plain build's {got.plain_ms} ms on the measured "
+            f"turns ({pgo}/1000 by the profile alone), under the {floor}/1000 a profile that applies saves"
+        )
+    return got
+
+
+def plain_bins(build: Build, llvm: Llvm, work: Path) -> Path:
+    """The speedup's baseline: `baseline`, checked, or this commit built here with no profile."""
+    if not build.baseline:
+        return build_blaze(build, llvm, "plain", [], work)
+    bins = Path(build.baseline).resolve()
+    for name in ("blaze", "blaze-engine"):
+        if not (bins / exe(build.target, name)).is_file():
+            raise Failed(f"baseline {bins} has no {exe(build.target, name)}")
+    return bins
 
 
 def merge_profdata(llvm: Llvm, raw: Path, out: Path, min_count: int) -> int:
@@ -782,6 +879,8 @@ def do_build(build: Build) -> None:
     for tool in ("llvm-profdata", *(BOLT_TOOLS if build.bolt != "none" else ())):
         llvm.tool(tool)
     trees = prepare(training, work)
+    timed = [tree for tree in trees if tree.name in training.measure]
+    plain = plain_bins(build, llvm, work)
 
     raw = work / "raw"
     shutil.rmtree(raw, ignore_errors=True)
@@ -792,11 +891,14 @@ def do_build(build: Build) -> None:
     count = merge_profdata(llvm, raw, merged, build.min_count)
 
     optimised = build_blaze(build, llvm, "use", stage_flags(build.target, "use", merged), work)
+    sets = {"plain": plain, "pgo": optimised}
     bolt_pin: Bolt | None = None
     bolt_data: Path | None = None
     if build.bolt != "none":
         optimised, bolt_data = bolt(build, llvm, trees, optimised, work)
+        sets["total"] = optimised
     gate(build, optimised)
+    speedup = speedup_of(measure(build, timed, sets, work), build.measure_runs, build.min_speedup)
 
     out.mkdir(parents=True, exist_ok=True)
     stem = f"blaze-{toolchain}-{build.target}"
@@ -808,10 +910,14 @@ def do_build(build: Build) -> None:
         bolt_pin = Bolt(build.bolt, asset.name, asset.sha256)
     pack(sorted(optimised.iterdir()), f"blaze-pgo-{build.target}", out / "binaries")
     archive = named(out / "binaries", f"blaze-pgo-{toolchain}-{build.target}", ".tar.xz")
-    pin = Pin(profile.name, profile.sha256, commit, count, None, "blaze", llvm.commit, bolt_pin, archive)
+    pin = Pin(profile.name, profile.sha256, commit, count, None, "blaze", llvm.commit, bolt_pin, archive, speedup)
     entry = {"target": build.target, "toolchain": toolchain, "pin": pin_json(pin)}
     (out / f"{build.target}.json").write_text(json.dumps(entry, indent=2) + "\n")
-    print(f"{build.target}: {profile.name}, {count} counts, binaries {archive.name}", flush=True)
+    print(
+        f"{build.target}: {profile.name}, {count} counts, binaries {archive.name}, "
+        f"{speedup.total}/1000 faster than plain ({speedup.pgo}/1000 by the profile)",
+        flush=True,
+    )
 
 
 def read_output(path: Path) -> tuple[str, str, Pin]:

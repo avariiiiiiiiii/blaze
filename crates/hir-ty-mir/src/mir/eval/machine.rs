@@ -1,7 +1,8 @@
 //! What the evaluator tells a checker of undefined behavior (`hir-ty-ub`'s `check::Checker`):
-//! every memory event, typed copy, frame and thread switch. [`Plain`] is the machine of const
-//! eval and of every run without the checker: its hooks are empty and its provenance and
-//! shadow are `()`, so the evaluator generic over it is the evaluator without one.
+//! every memory event, typed copy, frame and thread switch. [`Plain`] is the machine of every
+//! run without the checker: its hooks are empty and its provenance and shadow are `()`, so
+//! the evaluator generic over it is the evaluator without one. Const eval runs
+//! `super::provenance::Provenance`, which tracks only which words are pointers.
 
 use std::ops::Range;
 
@@ -93,6 +94,18 @@ pub trait Shadow<P>: Clone + Default + std::fmt::Debug {
     fn put(&mut self, at: usize, other: &Self);
     /// The provenance of the pointer that starts at `at`, if a whole one does.
     fn prov_at(&self, at: usize, size: usize) -> Option<P>;
+    /// Calls `f` with the start of each whole pointer of `size` bytes with provenance in the
+    /// first `len` bytes of these, in order.
+    fn pointers(&self, len: usize, size: usize, mut f: impl FnMut(usize)) {
+        if size == 0 || size > len {
+            return;
+        }
+        for at in 0..=len - size {
+            if self.prov_at(at, size).is_some() {
+                f(at);
+            }
+        }
+    }
 }
 
 /// Where the evaluator is, for reports.
@@ -119,7 +132,8 @@ pub trait Machine<'db> {
     type Shadow: Shadow<Self::Prov>;
 
     /// Whether the machine looks at anything: `false` only for [`Plain`], whose evaluator
-    /// then skips what only the hooks need (provenance, per-local allocations, typed copies).
+    /// then skips what only the hooks need (provenance, per-local allocations, typed copies)
+    /// and calls no hook but `schedule`.
     const CHECKS: bool = true;
 
     /// Where the evaluator is: called before each statement and each terminator.
@@ -206,6 +220,18 @@ pub trait Machine<'db> {
     fn expose(&mut self, ptr: Ptr<Self::Prov>) -> MResult<()>;
     /// An integer cast to a pointer (`as *const T`, `with_exposed_provenance`).
     fn from_exposed(&mut self, addr: u64) -> Option<Self::Prov>;
+    /// The provenance of a pointer to the function `id` (a [`VTableMap`] id), which is in no
+    /// allocation. A machine that gives functions none sees such a pointer as an integer.
+    fn function(&mut self, _id: u64) -> Option<Self::Prov> {
+        None
+    }
+    /// The [`MemKind::Global`] allocation that starts at `addr` is read-only from now on, its
+    /// initial bytes written; a write to it is undefined behavior. By rustc's interning
+    /// (`intern_const_alloc_recursive`): a constant's value and all it points to; a static's
+    /// own memory when it is not `static mut` and its type is `Freeze`; what a static points
+    /// to unless it is `static mut`. Promoted temporaries stay writable: blaze's body writes
+    /// them itself.
+    fn freeze(&mut self, addr: u64);
 
     /// A frame starts: called before the arguments are copied into the callee's locals.
     fn call(&mut self) -> MResult<()>;
@@ -238,7 +264,7 @@ pub trait Machine<'db> {
     fn finish(&mut self) -> MResult<()>;
 }
 
-/// No checker: const eval and every run without `--ub`.
+/// No checker: every run without `--ub` but const eval's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Plain;
 
@@ -338,6 +364,8 @@ impl<'db> Machine<'db> for Plain {
     fn from_exposed(&mut self, _: u64) -> Option<()> {
         None
     }
+    #[inline(always)]
+    fn freeze(&mut self, _: u64) {}
     #[inline(always)]
     fn call(&mut self) -> MResult<()> {
         Ok(())

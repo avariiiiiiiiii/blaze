@@ -76,6 +76,7 @@ impl<T: Consed + Persist> HashCons<T> {
         let values = self.sorted();
         let mut out = Writer::new(PACK_SCHEMA);
         let mut scratch = Writer::new(T::SCHEMA);
+        // clone: the header each value's scratch buffer starts again from, once per pack
         let header = scratch.bytes.clone();
         let mut placed = Vec::with_capacity(values.len());
         for value in &values {
@@ -98,6 +99,7 @@ impl<T: Consed + Persist> HashCons<T> {
                 let field = first + i as u64 * size + offset_of!(PackEntry, bytes) as u64;
                 PackEntry { content, bytes: Slice::between(field, at, len) }
             })
+            // alloc: the pack's entry table, once per pack written
             .collect();
         let written = out.push_slice(&entries);
         debug_assert_eq!(written, first);

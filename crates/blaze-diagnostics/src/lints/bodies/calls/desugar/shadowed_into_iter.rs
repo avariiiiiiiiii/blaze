@@ -17,11 +17,11 @@ use hir_def::{
 use hir_ty::next_solver::{Ty, TyKind};
 use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::IntoKind as _;
-use syntax::{AstNode, ast};
+use syntax::view::{self as ast, AstNode};
 
 use super::for_loop;
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -39,7 +39,7 @@ pub(crate) struct ShadowedIntoIter {
 impl LatePass for ShadowedIntoIter {
     const LINTS: LintSet = lint_set(["array_into_iter", "boxed_slice_into_iter"]);
     const HOOKS: Hooks = Hooks::BODY;
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Match, ExprTag::MethodCall]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Match, ExprKind::MethodCall]);
 
     fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
         self.for_heads.clear();
@@ -145,7 +145,7 @@ fn is_ref_to_boxed_slice(ty: Ty<'_>) -> bool {
 fn method_name(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
     let node = util::syntax(b, expr)?;
     // clone: a node or span, for the lint's diagnostic
-    let call = ast::MethodCallExpr::cast(node.value.clone())?;
+    let call = ast::MethodCallExpr::cast(node.value)?;
     let name = call.name_ref()?;
     Some(b.cx.span(node.with_value(name.syntax().text_range())))
 }

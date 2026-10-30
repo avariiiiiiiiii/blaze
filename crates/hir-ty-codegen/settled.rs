@@ -67,7 +67,7 @@ impl Mixed {
         });
         let sees = crates
             .iter()
-            .map(|&(krate, _)| (krate, krate.transitive_deps(db).into_iter().collect()))
+            .map(|&(krate, _)| (krate, krate.transitive_deps(db).iter().copied().collect()))
             .collect();
         let by_id = program
             .iter()

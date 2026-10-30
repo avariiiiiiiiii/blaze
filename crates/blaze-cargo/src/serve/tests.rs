@@ -23,7 +23,7 @@ use blaze_core::{
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, DbError, Query, QueryKey, QueryKind};
 use blaze_units::{
-    query::{BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LockWrite, Origin, PackagePlan, Planned, UnitPlan, Units},
+    query::{BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LockWrite, Origin, PackagePlan, Planned, TestSandbox, UnitPlan, Units},
     schema::{DebugInfo, Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
 };
 use blaze_vfs::{Change, Op, ViewId};
@@ -129,7 +129,7 @@ fn needed() -> Vec<Fetch> {
 struct FakePlan;
 
 impl Query for FakePlan {
-    const KIND: QueryKind = QueryKind(0x7e01);
+    const KIND: QueryKind = QueryKind(0x67f0);
     const NAME: &'static str = "fake plan";
     const PRODUCER: ContentId = ContentId([7; 32]);
     type Key = ();
@@ -254,6 +254,9 @@ fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units {
         outputs: Vec::new(),
         out_dir: None,
         links: None,
+        unsandboxed: false,
+        runner: Vec::new(),
+        harness: true,
     };
     let package = |id: &str, name: &str, version: &str, source: Option<String>, is_member| PackagePlan {
         id: id.into(),
@@ -262,6 +265,9 @@ fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units {
         manifest_path: format!("{root}/Cargo.toml"),
         source,
         is_member,
+        default_run: None,
+        checksum: None,
+        tests: TestSandbox::default(),
     };
     Units {
         plans: vec![plan; graph.units.len()],
@@ -275,6 +281,8 @@ fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units {
         target_dir: format!("{root}/target"),
         build_dir: format!("{root}/target"),
         finished: FINISHED.into(),
+        link_dirs: Vec::new(),
+        sandboxed_tests: false,
     }
 }
 
@@ -404,6 +412,10 @@ impl Writer<Fake> for FakeWriter {
 
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {
         Ok(Vec::new()) // the fakes read no dependency from the store
+    }
+
+    fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {
+        None // the fakes offer no goal
     }
 
     fn apply(&mut self) -> Result<bool, ApiError> {

@@ -23,7 +23,7 @@ use crate::{
     fragment::{self, DataRequest, Hint, RelocName, Requests},
 };
 
-const VERSION: u8 = 6;
+const VERSION: u8 = 7;
 
 /// Where data is in a shape, as the names of its IR have it.
 mod namespace {
@@ -47,6 +47,7 @@ mod part {
     pub(super) const SCOPES: u8 = 10;
     pub(super) const INLINED: u8 = 11;
     pub(super) const UNSANITIZED: u8 = 12;
+    pub(super) const FEATURES: u8 = 13;
 }
 
 pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shape, String> {
@@ -138,6 +139,13 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
         });
         out.u8(part::UNSANITIZED);
         out.u8(function.unsanitized.0);
+        // A `#[target_feature]` function's code is its own set's: one IR, two sets, two codes.
+        out.u8(part::FEATURES);
+        let features = function.features.names();
+        out.u32(features.len() as u32);
+        for feature in features {
+            out.bytes(feature.as_bytes());
+        }
         Ok(Shape::of(unit, out.0))
     })
 }

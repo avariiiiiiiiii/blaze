@@ -317,7 +317,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
         // What inference peeled off the scrutinee before the pattern: references, and with
         // `deref_patterns` smart pointers, outermost first.
         let infer = self.infer;
-        let adjustments = infer.pat_adjustments.get(&pattern).map_or(&[][..], |it| &**it);
+        let adjustments = infer.pat_adjustments.get(&pattern).unwrap_or_default();
         for (index, adjustment) in adjustments.iter().enumerate() {
             cond_place = match adjustment.kind {
                 PatAdjust::BuiltinDeref => cond_place.project(ProjectionElem::Deref),

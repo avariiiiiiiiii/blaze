@@ -30,6 +30,7 @@
 extern crate rustc_driver as _;
 
 mod handlers {
+    pub(crate) mod ambiguous_associated_item;
     pub(crate) mod array_pattern_without_fixed_length;
     pub(crate) mod await_outside_of_async;
     pub(crate) mod bad_rtn;
@@ -62,6 +63,7 @@ mod handlers {
     pub(crate) mod invalid_derive_target;
     pub(crate) mod invalid_lhs_of_assignment;
     pub(crate) mod invalid_range_pat_type;
+    pub(crate) mod late_bound_lifetime_args;
     pub(crate) mod macro_error;
     pub(crate) mod malformed_derive;
     pub(crate) mod method_call_illegal_sized_bound;
@@ -70,6 +72,7 @@ mod handlers {
     pub(crate) mod missing_body;
     pub(crate) mod missing_fields;
     pub(crate) mod missing_lifetime;
+    pub(crate) mod missing_lifetimes;
     pub(crate) mod missing_match_arms;
     pub(crate) mod missing_unsafe;
     pub(crate) mod mut_ref_in_imm_ref_pat;
@@ -90,6 +93,7 @@ mod handlers {
     pub(crate) mod trait_impl_missing_assoc_item;
     pub(crate) mod trait_impl_orphan;
     pub(crate) mod trait_impl_redundant_assoc_item;
+    pub(crate) mod trait_item_import;
     pub(crate) mod trait_solver_error;
     pub(crate) mod type_mismatch;
     pub(crate) mod type_must_be_known;
@@ -111,6 +115,7 @@ mod handlers {
     pub(crate) mod unresolved_method;
     pub(crate) mod unresolved_module;
     pub(crate) mod unresolved_path;
+    pub(crate) mod unsafe_binder_cast_of_non_binder;
     pub(crate) mod unused_must_use;
     pub(crate) mod yield_outside_coroutine;
 
@@ -570,6 +575,7 @@ fn semantic_diagnostics_asked<F: Fn(hir::DefWithBody) -> bool>(
             AnyDiagnostic::UnresolvedField(d) => handlers::unresolved_field::unresolved_field(&ctx, &d),
             AnyDiagnostic::UnresolvedIdent(d) => handlers::unresolved_ident::unresolved_ident(&ctx, &d),
             AnyDiagnostic::UnresolvedImport(d) => handlers::unresolved_import::unresolved_import(&ctx, &d),
+            AnyDiagnostic::TraitItemImport(d) => handlers::trait_item_import::trait_item_import(&ctx, &d),
             AnyDiagnostic::UnresolvedMacroCall(d) => handlers::unresolved_macro_call::unresolved_macro_call(&ctx, &d),
             AnyDiagnostic::UnresolvedMethodCall(d) => handlers::unresolved_method::unresolved_method(&ctx, &d),
             AnyDiagnostic::UnresolvedModule(d) => handlers::unresolved_module::unresolved_module(&ctx, &d),
@@ -591,6 +597,12 @@ fn semantic_diagnostics_asked<F: Fn(hir::DefWithBody) -> bool>(
             AnyDiagnostic::IncorrectGenericsLen(d) => handlers::incorrect_generics_len::incorrect_generics_len(&ctx, &d),
             AnyDiagnostic::IncorrectGenericsOrder(d) => handlers::incorrect_generics_order::incorrect_generics_order(&ctx, &d),
             AnyDiagnostic::MissingLifetime(d) => handlers::missing_lifetime::missing_lifetime(&ctx, &d),
+            AnyDiagnostic::MissingLifetimes(d) => {
+                res.extend(handlers::missing_lifetimes::missing_lifetimes(&ctx, &d));
+                continue;
+            }
+            AnyDiagnostic::LateBoundLifetimeArgs(d) => handlers::late_bound_lifetime_args::late_bound_lifetime_args(&ctx, &d),
+            AnyDiagnostic::AmbiguousAssociatedItem(d) => handlers::ambiguous_associated_item::ambiguous_associated_item(&ctx, &d),
             AnyDiagnostic::ElidedLifetimesInPath(d) => handlers::elided_lifetimes_in_path::elided_lifetimes_in_path(&ctx, &d),
             AnyDiagnostic::GenericDefaultRefersToSelf(d) => handlers::generic_default_refers_to_self::generic_default_refers_to_self(&ctx, &d),
             AnyDiagnostic::InvalidLhsOfAssignment(d) => handlers::invalid_lhs_of_assignment::invalid_lhs_of_assignment(&ctx, &d),
@@ -616,6 +628,7 @@ fn semantic_diagnostics_asked<F: Fn(hir::DefWithBody) -> bool>(
             AnyDiagnostic::ExplicitDropMethodUse(d) => handlers::explicit_drop_method_use::explicit_drop_method_use(&ctx, &d),
             AnyDiagnostic::YieldOutsideCoroutine(d) => handlers::yield_outside_coroutine::yield_outside_coroutine(&ctx, &d),
             AnyDiagnostic::ReturnOutsideFunction(d) => handlers::return_outside_function::return_outside_function(&ctx, &d),
+            AnyDiagnostic::UnsafeBinderCastOfNonBinder(d) => handlers::unsafe_binder_cast_of_non_binder::unsafe_binder_cast_of_non_binder(&ctx, &d),
         };
         res.push(d)
     }

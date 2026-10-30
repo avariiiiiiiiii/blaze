@@ -164,9 +164,9 @@ fn is_primitive(ty: &hir::Type<'_>) -> bool {
 }
 
 /// E0615 (`ban_take_value_of_method`).
-fn take_value_of_method(
-    cx: &Cx<'_, '_>,
-    field_expr: ast::FieldExpr<'_>,
+fn take_value_of_method<'db>(
+    cx: &Cx<'_, 'db>,
+    field_expr: ast::FieldExpr<'db>,
     field: &str,
     ty: &str,
     field_span: Span,
@@ -231,7 +231,7 @@ fn take_value_of_method(
 
 /// How many arguments besides `self` the method `name` the receiver of `x.name` would call
 /// takes.
-fn method_params(cx: &Cx<'_, '_>, field_expr: ast::FieldExpr<'_>, name: &str) -> Option<usize> {
+fn method_params<'db>(cx: &Cx<'_, 'db>, field_expr: ast::FieldExpr<'db>, name: &str) -> Option<usize> {
     let base = field_expr.expr()?;
     let receiver = cx.vsema.type_of_expr(base)?.original;
     let scope = cx.vsema.scope(field_expr.syntax())?;

@@ -229,6 +229,16 @@ the process, the first reason kept as the run's error (`killed`).
 | macOS | `__ulock_wait` with `UL_COMPARE_AND_WAIT_SHARED` | one byte on the socket | `kill` of the process ID, so only before the launcher reaps it |
 | Windows | the slot's auto-reset event, which the daemon made and duplicated into the run | the doorbell event | `TerminateProcess` |
 
+Neither end sleeps at once. Before each sleep an asker spins on its state word for 3 µs,
+about one cross-process wake-up, so spinning never costs more than the sleep and wake would.
+The spin reads only the words and the clock, so it stays async-signal-safe. The reader rescans
+the slots for 50 µs after the last ask it took before it sleeps on the doorbell. Rings sent
+while it spins wait in the socket (or the event) until its next sleep drains them. A burst of
+first calls from one thread therefore pays no wake-up (the
+[first call](lazy.md#speed-of-light)'s two, about 6 µs); the reader's spin costs one daemon
+core for 50 µs after a burst. An asker whose ring finds the socket's buffer full waits for
+that next sleep, at most 50 µs after the last ask was taken; its own ask is taken meanwhile.
+
 A thread that finds all 64 slots claimed sleeps on the count of frees (in the process: a
 futex, `WaitOnAddress` on Windows). Other threads' slots come back as they are answered, so the
 one way to wait for ever is 64 asks nested on threads their own signal handlers interrupted.

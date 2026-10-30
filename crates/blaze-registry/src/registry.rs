@@ -263,7 +263,7 @@ impl Registry {
 
     /// [`Registry::summaries`] on this thread.
     pub fn summaries_blocking(&self, name: &str) -> anyhow::Result<Arc<Summaries>> {
-        crate::block_on(self.summaries(name))
+        blaze_resolve::block_on(self.summaries(name))
     }
 
     fn forget(&self, name: &str, read: &Arc<Read>) {

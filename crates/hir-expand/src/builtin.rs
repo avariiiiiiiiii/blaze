@@ -14,3 +14,5 @@ pub use self::{
         include_input_to_file_id, line_and_column, written_place,
     },
 };
+#[cfg(test)]
+pub(crate) use self::fn_macro::concat_of_literals_in;

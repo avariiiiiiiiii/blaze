@@ -360,8 +360,27 @@ fn the_vfs_setters_refuse_a_crate_attr_file() {
     db.set_file_text(attr, "fn f() {}");
 }
 
-/// rustc's rule for one crate attribute (`rustc_builtin_macros/src/cmdline_attrs.rs`): exactly
-/// one attribute item, its tokens balanced, nothing after it.
+#[test]
+fn a_new_file_id_meets_no_vfs_file_nor_crate_attr_file() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let given = db.new_file_id().expect("an unused file ID");
+    assert!(!files.contains(&given), "{given:?} is a file of the VFS");
+    let a = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
+    let attrs = a.crate_attr_files(&db).to_vec();
+    assert!(!attrs.contains(&given), "a crate attribute took {given:?}");
+    let after = db.new_file_id().expect("another unused file ID");
+    assert!(after != given && !attrs.contains(&after) && !files.contains(&after));
+
+    // A reload's new files, set after the graph, are not refused as an attribute's.
+    db.set_file_text(given, "fn f() {}");
+    db.set_file_text(after, "fn g() {}");
+    assert_eq!(attr_texts(&db, a), ["#![no_std]", "#![feature(x)]"]);
+}
+
+/// rustc's rule for one crate attribute (`rustc_builtin_macros/src/cmdline_attrs.rs`): the
+/// wrapped `#![<attr>]` balanced, one attribute, nothing after it. Ranges are in the wrapped
+/// text, as rustc's columns are (`tests/ui/attributes/z-crate-attr/*.stderr`).
 #[test]
 fn a_crate_attr_is_one_attribute_or_rustcs_error() {
     use crate::CrateAttrError;
@@ -371,11 +390,23 @@ fn a_crate_attr_is_one_attribute_or_rustcs_error() {
         ("feature(a, b)", None),
         ("doc = \"x\"", None),
         ("cfg_attr(unix, no_std)", None),
-        ("a b", Some(CrateAttrError::Trailing { range: range(3, 6) })),
-        ("a, b", Some(CrateAttrError::Trailing { range: range(3, 5) })),
-        ("a] #![b", Some(CrateAttrError::UnexpectedClose { close: range(4, 5) })),
-        ("a(", Some(CrateAttrError::Unclosed { open: range(4, 5) })),
+        // `garbage.stderr`: not an attribute.
+        ("`%~@$#", Some(CrateAttrError::Syntax)),
+        ("a b", Some(CrateAttrError::Syntax)),
+        // `multiple.stderr`: "expected `]`, found `,`".
+        ("feature(a),feature(b)", Some(CrateAttrError::Syntax)),
+        ("a, b", Some(CrateAttrError::Syntax)),
+        // `unbalanced-paren.stderr`: "mismatched closing delimiter: `]`".
+        ("(", Some(CrateAttrError::MismatchedClose { open: range(3, 4), close: range(4, 5) })),
+        (")", Some(CrateAttrError::MismatchedClose { open: range(2, 3), close: range(3, 4) })),
+        ("a(", Some(CrateAttrError::MismatchedClose { open: range(4, 5), close: range(5, 6) })),
         ("a(]", Some(CrateAttrError::MismatchedClose { open: range(4, 5), close: range(5, 6) })),
+        ("a]]", Some(CrateAttrError::UnexpectedClose { close: range(5, 6) })),
+        ("a] ([", Some(CrateAttrError::Unclosed { open: range(6, 7) })),
+        // `injection.stderr`, `injection2.stderr`: "unexpected token: `#`" after a written `]`.
+        ("a] #![b", Some(CrateAttrError::UnexpectedToken { token: range(6, 7) })),
+        ("feature(x)]#![no_std", Some(CrateAttrError::UnexpectedToken { token: range(14, 15) })),
+        ("a b] #![c", Some(CrateAttrError::Syntax)),
         ("a = ", Some(CrateAttrError::Syntax)),
         ("\"a", Some(CrateAttrError::Syntax)),
     ];

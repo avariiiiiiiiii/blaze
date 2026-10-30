@@ -112,7 +112,9 @@ fn verdict(owner: DefWithBodyId, result: &BorrowckResult) -> Result<(), Refused>
 /// The build path: `def`'s borrow check, which must pass before any of its code is compiled
 /// for a build or taken from the store into one.
 pub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {
-    verdict(def, borrowck(db, def))?;
+    if !hir_ty::check_cache::served_passed(db, def) {
+        verdict(def, borrowck(db, def))?;
+    }
     Ok(Checked { owner: def, _revision: PhantomData })
 }
 

@@ -1211,6 +1211,13 @@ There are no consumers outside the crate (`rg blaze_global crates` finds only it
 
 > forwarded to fastcompile (from requests, pass 16; told by tmux).
 
+> applied by fastcompile-sol-global, 2026-10-29 (part B, B1 to B7, and its three budget tests in
+> `wire.rs`). Where it differs: B3's `pump` is now `pump_all`, `ask` and `flush` (one request a
+> connection in turn, and the connections opened together). Its request buffers are lent from
+> `scratch::lend_bytes`, and the keys a request carries stay a `Vec` marked `// alloc:`,
+> because the request keeps them until it is answered. B4 also drops the client's own content
+> hash: the store's is the one check.
+
 ### B1. `crates/blaze-global/Cargo.toml`
 
 ```toml
@@ -1940,6 +1947,8 @@ pin that `find` finds what it found before.
 > forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ## D. blaze-premap: the image key's temporaries, and no copy of every name
+
+> done (fastcompile-sol-premap), D1–D4 and the budget tests: `blaze-mem` and `blaze-alloc-count` (dev) in `Cargo.toml`, `allocator_api`, both keys' records on a `Tag::Link` frame, the parts borrow names and debug names; `an_image_key_allocates_nothing_of_the_heap` and `splitting_a_build_copies_no_name` in `tests.rs`. Not built here (no builds in this pass).
 
 premap's reads (`View::parse`/`reopen`, `TableView::get`/`find`, `segments()` and the iterators)
 allocate nothing already. `Images::pick` is FxHashMap lookups and an `Arc` clone. What does allocate

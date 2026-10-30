@@ -43,6 +43,9 @@ fn round_trip(db: &TestDB, def: DefWithBodyId) {
         source_map.store.macro_calls().map(|(_, call)| call).collect();
     assert_eq!(in_store, in_map, "{def:?}: the store's macro calls are the source map's");
     assert_eq!(Body::of(db, def).store.macro_calls(), body.store.macro_calls());
+    let of = Body::of(db, def);
+    assert_eq!(*of, **body, "{def:?}: `of` and `with_source_map`");
+    assert!(std::ptr::eq(of, Body::of(db, def)), "{def:?}: `of` lends the memo's own body");
     crate::expr_store::persist::assert_round_trip(body, source_map);
     if let Some((body, source_map)) = Body::relative(db, def) {
         crate::expr_store::persist::assert_round_trip(body, source_map);
@@ -102,6 +105,7 @@ fn main(x: i32, s: S, v: &[i32], r: &mut i32) {
     let _ = ("s", b"ab", c"c", 'c', b'a', true, 3, 1i64, 2u8, 0x10, 1.5, 2.5f32, 2f64);
     let _ = (two!(), -x, !true, *r, &mut x, &raw const x, x as u8, nothing!());
     let _ = (x + 1 * 2, x == 1 && true, v[0], s.a, _, builtin # include_bytes);
+    let _ = (builtin # wrap_binder(x), builtin # unwrap_binder(x, u8));
     let _ = [1, 2];
     let _ = [0; 4];
     let _ = 0..x;
@@ -172,6 +176,7 @@ fn every_variant_pretty_prints() {
                 let _ = ("s", "ab", "c\0", 'c', 97u8, true, 3, 1i64, 2u8, 16, 1.5, 2.5f32, 2f64, );
                 let _ = (2, -x, !true, *r, &mut x, &raw x, x as u8, �, );
                 let _ = (x + 1 * 2, x == 1 && true, v[0], s.a, _, include_bytes!(_), );
+                let _ = (builtin#wrap_binder(x), builtin#unwrap_binder(x, u8), );
                 let _ = [
                     1, 2,
                 ];
@@ -323,9 +328,10 @@ fn expr_variant(expr: Expr<'_>) -> usize {
         Expr::OffsetOf(_) => 30,
         Expr::InlineAsm(_) => 31,
         Expr::IncludeBytes => 32,
+        Expr::UnsafeBinderCast { .. } => 33,
     }
 }
-const EXPR_VARIANTS: usize = 33;
+const EXPR_VARIANTS: usize = 34;
 
 /// [`expr_variant`] for patterns.
 fn pat_variant(pat: Pat<'_>) -> usize {
@@ -1113,4 +1119,67 @@ fn ids_are_the_ids_of_the_decoded_nodes() {
     assert!(body.pat_ids().eq(body.pats().map(|(id, _)| id)));
     assert_eq!(ExpressionStore::empty().expr_ids().len(), 0);
     assert_eq!(ExpressionStore::empty().pat_ids().len(), 0);
+}
+
+mod generic_arg_twins {
+    use span::Edition;
+    use syntax::{
+        AstNode as _, SourceFile, SyntaxNodePtr, ast as tag,
+        view::{self as ast, AstNode},
+    };
+
+    use crate::expr_store::lower::{
+        hir_assoc_type_binding_to_ast, hir_assoc_type_binding_to_ast_view, hir_generic_arg_to_ast,
+        hir_generic_arg_to_ast_view,
+    };
+
+    /// Generic argument lists with every kind of argument: lifetimes (named and elided), types,
+    /// consts (literal and block), bindings, bounds and return type notation.
+    const CODE: &str = r#"
+fn f() {
+    let a: Vec<u32> = Vec::<u32>::new();
+    let b: Map<'a, K, V, 3, { N + 1 }> = x;
+    let c: impl Iterator<Item = u32, Assoc<T> = u8, method(..): Send, Bounded: Copy> = y;
+    let d: Box<dyn Fn(u8) -> u8 + Send> = z;
+    let e: Foo<'_, T, Assoc = (), 'static, [u8; 2]> = w;
+    g::<'static, T, 1, Item = ()>();
+}
+"#;
+
+    /// Both twins pick the same argument, or both none, at every index of every list, with and
+    /// without a `Self` argument (which takes index 0, so there is no argument 0 to map then).
+    #[test]
+    fn handle_and_view_twins_agree() {
+        let parse = SourceFile::parse(CODE, Edition::CURRENT);
+        let views: Vec<_> = parse.root().descendants().filter_map(ast::GenericArgList::cast).collect();
+        let handles: Vec<_> =
+            parse.tree().syntax().descendants().filter_map(tag::GenericArgList::cast).collect();
+        assert_eq!(views.len(), handles.len());
+        assert!(views.len() >= 7, "the fixture's lists, found {}", views.len());
+        let (mut args, mut bindings) = (0, 0);
+        for (view, handle) in views.into_iter().zip(&handles) {
+            assert_eq!(ast::ptr(view.syntax()), SyntaxNodePtr::new(handle.syntax()));
+            let len = view.generic_args().count() as u32;
+            for idx in 0..=len {
+                for has_self_arg in [false, true] {
+                    if has_self_arg && idx == 0 {
+                        continue;
+                    }
+                    let by_view = hir_generic_arg_to_ast_view(view, idx, has_self_arg)
+                        .map(|it| ast::ptr(it.syntax()));
+                    let by_handle = hir_generic_arg_to_ast(handle, idx, has_self_arg)
+                        .map(|it| SyntaxNodePtr::new(it.syntax()));
+                    assert_eq!(by_view, by_handle, "argument {idx} ({has_self_arg}) of `{view}`");
+                    args += usize::from(by_view.is_some());
+                }
+                let by_view =
+                    hir_assoc_type_binding_to_ast_view(view, idx).map(|it| ast::ptr(it.syntax()));
+                let by_handle = hir_assoc_type_binding_to_ast(handle, idx)
+                    .map(|it| SyntaxNodePtr::new(it.syntax()));
+                assert_eq!(by_view, by_handle, "binding {idx} of `{view}`");
+                bindings += usize::from(by_view.is_some());
+            }
+        }
+        assert!(args >= 15 && bindings >= 4, "{args} arguments and {bindings} bindings found");
+    }
 }

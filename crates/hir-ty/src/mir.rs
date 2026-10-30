@@ -642,6 +642,11 @@ pub enum TerminatorKind {
         //fn_span: Span,
     },
 
+    /// `become func(args)`: the frame is gone before `func` runs, and what `func` returns, the
+    /// caller of this body gets. No successors, no unwind edge (rustc: a tail call unwinds as the
+    /// callee does, from the caller's caller).
+    TailCall { func: Operand, args: Box<[Operand]>, fn_span: MirSpan },
+
     /// Evaluates the operand, which must have type `bool`. If it is not equal to `expected`,
     /// initiates a panic. Initiating a panic corresponds to a `Call` terminator with some
     /// unspecified constant as the function to call, all the operands stored in the `AssertMessage`
@@ -1312,7 +1317,7 @@ impl TerminatorKind {
                 f(cond);
                 msg.for_each_operand_mut(f);
             }
-            TerminatorKind::Call { func, args, .. } => {
+            TerminatorKind::Call { func, args, .. } | TerminatorKind::TailCall { func, args, .. } => {
                 f(func);
                 args.iter_mut().for_each(f);
             }
@@ -1337,7 +1342,7 @@ impl TerminatorKind {
                 f(cond);
                 msg.for_each_operand(f);
             }
-            TerminatorKind::Call { func, args, .. } => {
+            TerminatorKind::Call { func, args, .. } | TerminatorKind::TailCall { func, args, .. } => {
                 f(func);
                 args.iter().for_each(f);
             }
@@ -1370,6 +1375,7 @@ impl TerminatorKind {
             | TerminatorKind::Abort
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
+            | TerminatorKind::TailCall { .. }
             | TerminatorKind::CoroutineDrop => ([None, None], &[]),
         };
         Successors { pair, at: 0, switch: switch.iter() }
@@ -1389,19 +1395,31 @@ impl TerminatorKind {
     }
 
     /// Every block this terminator may go to: its successors, the imaginary edge of a
-    /// `FalseEdge`, and the block it unwinds to, last.
-    pub fn all_successors(&self) -> SmallVec<[BasicBlockId; 2]> {
-        match self {
+    /// `FalseEdge`, and the block it unwinds to, last. Read in place.
+    pub fn all_successors(&self) -> impl DoubleEndedIterator<Item = BasicBlockId> + '_ {
+        use std::slice::from_ref;
+        let (first, then, last): (&[BasicBlockId], _, _) = match self {
+            TerminatorKind::Goto { target } => (from_ref(target), None, None),
+            TerminatorKind::SwitchInt { targets, .. } => (targets.all_targets(), None, None),
+            TerminatorKind::Drop { target, unwind, .. }
+            | TerminatorKind::DropAndReplace { target, unwind, .. }
+            | TerminatorKind::FalseUnwind { real_target: target, unwind } => {
+                (from_ref(target), *unwind, None)
+            }
+            TerminatorKind::Call { target, cleanup, .. } => (&[], *target, *cleanup),
+            TerminatorKind::Assert { target, cleanup, .. } => (from_ref(target), *cleanup, None),
+            TerminatorKind::Yield { resume, drop, .. } => (from_ref(resume), *drop, None),
             TerminatorKind::FalseEdge { real_target, imaginary_target } => {
-                smallvec![*real_target, *imaginary_target] // alloc: two blocks, inline in the SmallVec
+                (from_ref(real_target), Some(*imaginary_target), None)
             }
-            _ => {
-                // alloc: inline in the SmallVec but for a switch of two or more values
-                let mut all: SmallVec<[BasicBlockId; 2]> = self.successors().collect();
-                all.extend(self.unwind());
-                all
-            }
-        }
+            TerminatorKind::UnwindResume
+            | TerminatorKind::Abort
+            | TerminatorKind::Return
+            | TerminatorKind::Unreachable
+            | TerminatorKind::TailCall { .. }
+            | TerminatorKind::CoroutineDrop => (&[], None, None),
+        };
+        first.iter().copied().chain(then).chain(last)
     }
 
     pub fn unwind_mut(&mut self) -> Option<&mut Option<BasicBlockId>> {
@@ -1557,6 +1575,15 @@ pub struct MirBody<'db> {
     /// In a built body, in the order of the calls' blocks: the calls of an uninhabited type
     /// lowering gave no target, for the `unreachable_code` lint.
     pub unreachable_after_calls: Vec<UnreachableAfterCall>,
+    /// The locals that hold a guard's shared reference to a by-value binding of a guarded match
+    /// arm, with that binding (rustc's `BindingForm::RefForGuard`). A read of the local in the
+    /// guard is a read of the binding.
+    pub guard_refs: Vec<(LocalId, BindingId)>,
+    /// The locals a closure or coroutine copies a capture into at its start
+    /// (`cap = move (*_1).f`, at `MirSpan::Unknown`), with the capture's field. rustc has no such
+    /// copy: it is neither a use nor an assignment. Each local's first `Assign` in `start_block`
+    /// is the copy. A capture used in place (a borrowed closure's owned capture) isn't listed.
+    pub capture_copies: Vec<(LocalId, FieldIndex)>,
     /// What the optimizer inlined into this body; `MirSpan::Inlined` indexes its spans.
     pub inlined: Inlined<'db>,
 }
@@ -1582,6 +1609,8 @@ impl Hash for MirBody<'_> {
             panic_unwinds,
             promoted_constants,
             unreachable_after_calls,
+            guard_refs,
+            capture_copies,
             inlined,
         } = self;
         basic_blocks.hash(state);
@@ -1607,6 +1636,8 @@ impl Hash for MirBody<'_> {
         panic_unwinds.hash(state);
         promoted_constants.hash(state);
         unreachable_after_calls.hash(state);
+        guard_refs.hash(state);
+        capture_copies.hash(state);
         inlined.hash(state);
     }
 }
@@ -1778,6 +1809,10 @@ macro_rules! places_walker {
                             args.$iter().for_each(|x| for_operand(x, &mut f));
                             f(destination);
                         }
+                        TerminatorKind::TailCall { func, args, .. } => {
+                            for_operand(func, &mut f);
+                            args.$iter().for_each(|x| for_operand(x, &mut f));
+                        }
                         TerminatorKind::Assert { cond, msg, .. } => {
                             for_operand(cond, &mut f);
                             msg.$each(&mut |it| for_operand(it, &mut f));
@@ -1928,9 +1963,13 @@ impl MirBody<'_> {
             panic_unwinds,
             promoted_constants,
             unreachable_after_calls,
+            guard_refs,
+            capture_copies,
             inlined,
         } = self;
         inlined.shrink_to_fit();
+        guard_refs.shrink_to_fit();
+        capture_copies.shrink_to_fit();
         promoted_constants.shrink_to_fit();
         unreachable_after_calls.shrink_to_fit();
         upvars_in_place.shrink_to_fit();
@@ -2575,6 +2614,44 @@ mod tests {
         {
             assert_eq!(locals_visited(&mut null), (vec![], vec![]));
         }
+    }
+
+    #[test]
+    fn all_successors_are_the_successors_then_the_imaginary_edge_then_the_unwind() {
+        use super::{BasicBlockId, SwitchTargets, TerminatorKind};
+
+        let block = |n: u32| -> BasicBlockId { Idx::from_raw(RawIdx::from(n)) };
+        let all = |kind: &TerminatorKind| {
+            kind.all_successors().map(|it| it.into_raw().into_u32()).collect::<Vec<_>>()
+        };
+        let switch = TerminatorKind::SwitchInt {
+            discr: copy_of(0),
+            targets: SwitchTargets::new([(0, block(1)), (1, block(2))].into_iter(), block(3)),
+        };
+        assert_eq!(all(&switch), [1, 2, 3]);
+        let edge = TerminatorKind::FalseEdge { real_target: block(4), imaginary_target: block(5) };
+        assert_eq!(all(&edge), [4, 5]);
+        let unwind = TerminatorKind::FalseUnwind { real_target: block(6), unwind: Some(block(7)) };
+        assert_eq!(all(&unwind), [6, 7]);
+        assert_eq!(unwind.all_successors().rev().next(), Some(block(7)), "the unwind is last");
+        assert!(all(&TerminatorKind::Return).is_empty());
+    }
+
+    #[test]
+    fn a_tail_call_goes_nowhere_in_this_body_and_reads_its_operands() {
+        use super::{MirSpan, TerminatorKind};
+
+        let call = TerminatorKind::TailCall {
+            func: copy_of(0),
+            args: Box::new([copy_of(1), copy_of(2)]),
+            fn_span: MirSpan::Unknown,
+        };
+        assert_eq!(call.successors().count(), 0);
+        assert_eq!(call.all_successors().count(), 0);
+        assert_eq!(call.unwind(), None);
+        let mut read = Vec::new();
+        call.for_each_operand(&mut |op| read.push(op.clone()));
+        assert_eq!(read, [copy_of(0), copy_of(1), copy_of(2)]);
     }
 
     #[test]

@@ -1182,6 +1182,19 @@ pub fn check(handle: &SyntaxNode, node: view::Node<'_>) {
         assert_eq!(h.record_field_list().map(|it| range(it.syntax())), v.record_field_list().map(|it| view_range(it.syntax())), "Union::record_field_list");
         assert_eq!(h.union_token().map(|it| (it.kind(), it.text_range())), v.union_token().map(|it| (it.kind(), it.text_range())), "Union::union_token");
     }
+    assert_eq!(<ast::UnsafeBinderCastExpr>::can_cast(handle.kind()), <view::UnsafeBinderCastExpr<'_>>::can_cast(node.kind()));
+    if let (Some(h), Some(v)) = (ast::UnsafeBinderCastExpr::cast(handle.clone()), view::UnsafeBinderCastExpr::cast(node)) {
+        assert_eq!(range(h.syntax()), view_range(v.syntax()));
+        assert_eq!(h.expr().map(|it| range(it.syntax())), v.expr().map(|it| view_range(it.syntax())), "UnsafeBinderCastExpr::expr");
+        assert_eq!(h.ty().map(|it| range(it.syntax())), v.ty().map(|it| view_range(it.syntax())), "UnsafeBinderCastExpr::ty");
+        assert_eq!(h.pound_token().map(|it| (it.kind(), it.text_range())), v.pound_token().map(|it| (it.kind(), it.text_range())), "UnsafeBinderCastExpr::pound_token");
+        assert_eq!(h.l_paren_token().map(|it| (it.kind(), it.text_range())), v.l_paren_token().map(|it| (it.kind(), it.text_range())), "UnsafeBinderCastExpr::l_paren_token");
+        assert_eq!(h.r_paren_token().map(|it| (it.kind(), it.text_range())), v.r_paren_token().map(|it| (it.kind(), it.text_range())), "UnsafeBinderCastExpr::r_paren_token");
+        assert_eq!(h.comma_token().map(|it| (it.kind(), it.text_range())), v.comma_token().map(|it| (it.kind(), it.text_range())), "UnsafeBinderCastExpr::comma_token");
+        assert_eq!(h.builtin_token().map(|it| (it.kind(), it.text_range())), v.builtin_token().map(|it| (it.kind(), it.text_range())), "UnsafeBinderCastExpr::builtin_token");
+        assert_eq!(h.unwrap_binder_token().map(|it| (it.kind(), it.text_range())), v.unwrap_binder_token().map(|it| (it.kind(), it.text_range())), "UnsafeBinderCastExpr::unwrap_binder_token");
+        assert_eq!(h.wrap_binder_token().map(|it| (it.kind(), it.text_range())), v.wrap_binder_token().map(|it| (it.kind(), it.text_range())), "UnsafeBinderCastExpr::wrap_binder_token");
+    }
     assert_eq!(<ast::UnsafeMeta>::can_cast(handle.kind()), <view::UnsafeMeta<'_>>::can_cast(node.kind()));
     if let (Some(h), Some(v)) = (ast::UnsafeMeta::cast(handle.clone()), view::UnsafeMeta::cast(node)) {
         assert_eq!(range(h.syntax()), view_range(v.syntax()));

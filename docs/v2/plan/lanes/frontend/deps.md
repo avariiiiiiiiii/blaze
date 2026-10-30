@@ -116,6 +116,10 @@ it once it runs.
   mapping at a 16-byte boundary, so an image is never copied. Its parts (`PartBytes::In`)
   borrow it: the frozen def maps and lang items (`Frozen.bytes`), and signature stores
   (`ExpressionStoreRef::decode_in`, whose columns are `Col::borrowed`).
+- **Public keys** (for `blaze_global::Rule::image`). `deps::key_inputs` gives each key with
+  its build, the closure of crates it covers and their `OUT_DIR`s, from the walk that made
+  it. `Reads::names`, `deps::slot` and `deps::image_key` say which derived key a driver asks
+  about.
 - **Global cache.** `ReadThrough { local, global }` is an `ImageStore` that asks the local
   store, then the global one, and keeps what the global one gave locally. Puts and `reads_now`
   go to the local store. Portable keys are what make a global image usable.

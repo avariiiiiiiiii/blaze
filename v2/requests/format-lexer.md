@@ -80,6 +80,8 @@ Mem's choice; format-lexer moves the columns as soon as either one exists.
 > when the shelf has larger ones or the thread is ending. Tested: return across threads, and
 > zero allocations once warm with a token and a checkpoint column.
 
+Status: answered and applied by mem (2026-10-29); format-lexer can move `LexedStr`'s two columns onto `scratch::lend_u32s()` now.
+
 ## format-lexer: `blaze-mem` as a dependency of `parser` (coordinator, `crates/parser/Cargo.toml`)
 
 What: add `blaze-mem.workspace = true` under `[dependencies]` in `crates/parser/Cargo.toml`.

@@ -18,6 +18,11 @@ accessors is unchanged in name, signature and meaning).
 Why: the result's columns (db-ty-shared.md, db-ty-infer's part).
 
 > forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's, not db-ty's (`crates.md`).
+> applied by codegen-rq-mir (2026-10-29): `lower_scalar_operand` (`lower.rs`) reads
+> `self.infer.expr_adjustments.get(&expr_id).unwrap_or_default()`, the borrowed `&[Adjustment]`
+> (`Csr::get` gives `Option<&[T]>`), not a `to_vec()` copy: nothing is allocated, and `rest` goes
+> to `lower_expr_to_place_with_adjust` as the slice it takes. The other nine reads in hir-ty-mir
+> already took the slice.
 
 ## 2. db-ty-hir: a fixture test of the inference record's round trip through the type table
 
@@ -138,6 +143,8 @@ Where: the lines above. `crates/hir-ty-mir/` is codegen's and `crates/hir-ide/` 
 Why: unsafe.md "Where unsafe is allowed".
 
 > applied (hir-ide is the coordinator's): `tests.rs` and `diagnostics/match_check.rs` use `.unwrap_or_default()` on the slice. forwarded to codegen for the three `hir-ty-mir` sites.
+
+> applied by codegen (lead, 2026-10-29): the three `hir-ty-mir` sites take the slice as it is, `.get(..).unwrap_or_default()`: `mir/lower.rs:3007` (`expr_adjustments`), `lower/match_tree.rs:440` and `lower/pattern_matching.rs:320` (`pat_adjustments`). No `&**it` is left in hir-ty-mir's lowering.
 
 ## 8. format (lead): a safe byte view of a `Record` slice
 

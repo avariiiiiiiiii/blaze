@@ -39,10 +39,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ClosureKindMismatch) -> Vec<Found>
     }
     if let Some(closure) = closure
         && let Some(ty) = cx.vsema.type_of_expr(ast::Expr::ClosureExpr(closure.value))
-        && let Some((node, capture)) = ty.original.as_closure().and_then(|it| it.kind_origin(cx.db))
+        && let Some(origin) = ty.original.as_closure()
+        && let Some((node, _)) = origin.kind_origin(cx.db)
+        && let Some(place) = origin.kind_origin_place(cx.db)
     {
         let span = cx.span_of(node.map(|it| it.syntax_node_ptr()));
-        let place = capture.display_place_source_code(cx.db, cx.edition);
         let label = match found {
             FnTrait::FnOnce | FnTrait::AsyncFnOnce => {
                 // alloc: the error's label
@@ -63,7 +64,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ClosureKindMismatch) -> Vec<Found>
     diag.span_label(cause.span.clone(), label); // clone: the label's span
     cause.label_call(&mut diag);
     let trait_ = hir::Trait::lang(cx.db, cx.krate, lang_item(expected));
-    obligation_cause::note(cx, &mut diag, d.cause, trait_, None);
+    obligation_cause::note(cx, &mut diag, d.cause, trait_);
     code_fact(cx, &mut diag, d.span.map(|it| it.syntax_node_ptr()));
     vec![Found::new(diag, Phase::Bodies)] // alloc: the error found
 }

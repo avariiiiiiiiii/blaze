@@ -88,8 +88,18 @@ between instances of one body:
   - layouts and ABI from facts;
   - constants by their bytes;
   - each reference to another instance by that instance's own key, which is what codegen's
-    `Described::args` becomes with the hook below;
+    `Described::args` becomes with the hook below. The walk keys a callee in the caller's
+    environment, and codegen describes it in the callee's home crate. The key reads the
+    environment's crate only through trait solving, normalization and layout. For an
+    instance's concrete arguments, coherence and the build's one target make those answers
+    the same whichever crate asks, so the two keys are equal. They are two salsa entries,
+    though, which costs one extra walk per callee whose home crate is not the caller's;
   - vtables, shims and drop glue by the full identities codegen names them by.
+
+The key is over the body as codegen compiles it under each options: `MirOptions` with its
+`level`, `ub_checks`, `lifetime_markers` and `inline`, each of the 24 a bit of `OptionsSet`.
+So the walk reads the inlined body where a unit compiles one, and never keys an inlined body and
+an uninlined one as one. A library body is always at release and inlined (`Build::options`).
 
 So equal keys give equal refs, equal `built_in` and equal store keys. Codegen's own spelling
 of an instance's arguments (`v2/hashes.rs`) is copied in `identity.rs`, so it is never coarser
@@ -291,7 +301,7 @@ query is memoized by salsa, so the cost on a hit is one lookup.
   would share `&dyn Trait` coercions of types whose methods share.
 - **`Future::poll` of a coroutine** is keyed by identity, as codegen calls the coroutine's body.
 - **Mutual recursion** is unshared. A fixpoint over the cycle would share it.
-- **The MIR options.** The key is over `hir-ty`'s `MirOptions` (`{level, ub_checks,
-  lifetime_markers}`), the interface `HirDatabase::optimized_mir_body` has. `hir-ty-codegen`
-  builds one with an `inline` field that `hir-ty` lacks. If inlining becomes an options field,
-  `OptionsSet` gets its bit.
+- **A callee keyed in its home crate.** Keying it there would make the caller's record and
+  codegen's description of the callee one salsa entry, saving the extra walk. The home crate
+  is `hir-ty-codegen`'s (`Homes::home`), which `hir-ty-share` can't depend on. It would have
+  to come in through the share query's arguments.

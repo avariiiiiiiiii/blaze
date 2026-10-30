@@ -89,6 +89,7 @@ impl Lookup {
 
     fn new(fns: &[Version]) -> Result<Lookup, TableError> {
         let size = (fns.len() * 2).next_power_of_two().max(8);
+        // alloc: once per binary
         let mut lookup = Lookup { mask: size - 1, places: vec![NONE; size] };
         for (at, version) in fns.iter().enumerate() {
             let mut place = Lookup::home(&version.id) & lookup.mask;
@@ -128,14 +129,56 @@ pub struct Image {
     logged: Vec<bool>,
     unlogged: ContentId,
     lookup: Lookup,
+    /// Table indices in identity order, which is [`Version`]'s, as identities are distinct.
+    order: Vec<u32>,
+    /// Each table index's place in `order`.
+    rank: Vec<u32>,
 }
 
 pub const UNLOGGED_DOMAIN: &str = "blaze v2 testsel unlogged 1";
+
+/// Unlogged versions hashed per call: whole BLAKE3 chunks, which the hasher compresses many at
+/// once with SIMD, where a call per 32 bytes compresses one block at a time.
+const BATCH: usize = 256;
+
+/// An identity's first eight bytes as an integer of their order: big-endian.
+fn prefix(id: &FnId) -> u64 {
+    let b = &id.0.0;
+    u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// The table indices of `fns`, whose identities are distinct, in identity order: the table's
+/// own when it is in that order already (one compare a function), else a radix sort by the
+/// first eight bytes, then each run of one prefix (one in 2^64 for two BLAKE3 outputs) by the
+/// whole identity.
+fn by_identity(fns: &[Version]) -> Vec<u32> {
+    if fns.windows(2).all(|it| it[0].id < it[1].id) {
+        // alloc: once per binary, the order kept
+        return (0..fns.len() as u32).collect();
+    }
+    // alloc: once per binary, the sort's keys
+    let mut keyed: Vec<(u64, u32)> = fns.iter().enumerate().map(|(at, it)| (prefix(&it.id), at as u32)).collect();
+    blaze_ids::radix::sort_pairs(&mut keyed);
+    let mut start = 0;
+    while start < keyed.len() {
+        let mut end = start + 1;
+        while end < keyed.len() && keyed[end].0 == keyed[start].0 {
+            end += 1;
+        }
+        if end - start > 1 {
+            keyed[start..end].sort_unstable_by(|a, b| fns[a.1 as usize].id.cmp(&fns[b.1 as usize].id));
+        }
+        start = end;
+    }
+    // alloc: once per binary, the order kept
+    keyed.into_iter().map(|it| it.1).collect()
+}
 
 impl Image {
     /// The table of a binary: its functions, each slot's function, and `beside`, the content
     /// of the code it runs that is in no table (the premapped dependency image; zero for none).
     pub fn new(fns: Vec<Version>, slot_fn: Vec<u32>, beside: ContentId) -> Result<Image, TableError> {
+        // alloc: once per binary
         let mut logged = vec![false; fns.len()];
         for (slot, &function) in slot_fn.iter().enumerate() {
             let Some(it) = logged.get_mut(function as usize) else {
@@ -147,15 +190,71 @@ impl Image {
             *it = true;
         }
         let lookup = Lookup::new(&fns)?;
-        let mut outside: Vec<&Version> = fns.iter().zip(&logged).filter(|it| !*it.1).map(|it| it.0).collect();
-        outside.sort_unstable();
-        let mut hasher = Hasher::new(UNLOGGED_DOMAIN);
-        hasher.id(&beside).update(&(outside.len() as u64).to_le_bytes());
-        for version in outside {
-            hasher.id(&version.id.0).id(&version.bound.0);
+        let order = by_identity(&fns);
+        // alloc: once per binary
+        let mut rank = vec![0u32; fns.len()];
+        for (place, &at) in order.iter().enumerate() {
+            rank[at as usize] = place as u32;
         }
+        let outside = logged.iter().filter(|it| !**it).count();
+        let mut hasher = Hasher::new(UNLOGGED_DOMAIN);
+        hasher.id(&beside).update(&(outside as u64).to_le_bytes());
+        let mut batch = [0u8; 64 * BATCH];
+        let mut filled = 0;
+        for &at in &order {
+            if logged[at as usize] {
+                continue;
+            }
+            let version = &fns[at as usize];
+            batch[filled..filled + 32].copy_from_slice(&version.id.0.0);
+            batch[filled + 32..filled + 64].copy_from_slice(&version.bound.0.0);
+            filled += 64;
+            if filled == batch.len() {
+                hasher.update(&batch);
+                filled = 0;
+            }
+        }
+        hasher.update(&batch[..filled]);
         let unlogged = hasher.finish();
-        Ok(Image { fns, slot_fn, logged, unlogged, lookup })
+        Ok(Image { fns, slot_fn, logged, unlogged, lookup, order, rank })
+    }
+
+    /// How many functions the binary's table has.
+    pub fn len(&self) -> usize {
+        self.fns.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fns.is_empty()
+    }
+
+    /// The set of the functions of `ranks` (places in identity order, any order, repeats
+    /// allowed), each once, in identity order: a bitset over every rank when they are many
+    /// against the table, else a radix sort, whichever touches less.
+    fn set_of_ranks(&self, mut ranks: Vec<u32>) -> Set {
+        let words = self.fns.len().div_ceil(64);
+        // alloc: the set the caller keeps, once per kept run
+        let mut fns = Vec::with_capacity(ranks.len());
+        if ranks.len() * 4 >= words {
+            // alloc: once per kept run, a bit per function
+            let mut bits = vec![0u64; words];
+            for &rank in &ranks {
+                bits[rank as usize / 64] |= 1u64 << (rank % 64);
+            }
+            for (word, &set) in bits.iter().enumerate() {
+                let mut set = set;
+                while set != 0 {
+                    let rank = word * 64 + set.trailing_zeros() as usize;
+                    fns.push(self.fns[self.order[rank] as usize]);
+                    set &= set - 1;
+                }
+            }
+        } else {
+            blaze_ids::radix::sort(&mut ranks);
+            ranks.dedup();
+            fns.extend(ranks.iter().map(|&rank| self.fns[self.order[rank as usize] as usize]));
+        }
+        Set { unlogged: self.unlogged, fns }
     }
 
     /// The hash of every function called not through a slot, and of the code in no table.
@@ -182,28 +281,30 @@ impl Image {
         if slots != self.slots() {
             return Err(TableError::OtherBinary { record: slots, table: self.slots() });
         }
-        let mut fns = Vec::with_capacity(hits.len());
+        // alloc: once per kept run
+        let mut ranks = Vec::with_capacity(hits.len());
         for &hit in hits {
             let Some(&function) = self.slot_fn.get(hit as usize) else {
                 return Err(TableError::OtherBinary { record: slots, table: self.slots() });
             };
-            fns.push(self.fns[function as usize]);
+            ranks.push(self.rank[function as usize]);
         }
-        Ok(Set::of(self.unlogged, fns))
+        Ok(self.set_of_ranks(ranks))
     }
 
     /// The set of what codegen's walk says a test reaches (`reached`, by table index): its
     /// logged functions; the rest are in [`Image::unlogged`].
     pub fn reached(&self, reached: &[u32]) -> Result<Set, TableError> {
-        let mut fns = Vec::with_capacity(reached.len());
+        // alloc: once per kept run
+        let mut ranks = Vec::with_capacity(reached.len());
         for &at in reached {
             match self.logged.get(at as usize) {
                 None => return Err(TableError::NotInTable(at)),
-                Some(true) => fns.push(self.fns[at as usize]),
+                Some(true) => ranks.push(self.rank[at as usize]),
                 Some(false) => {}
             }
         }
-        Ok(Set::of(self.unlogged, fns))
+        Ok(self.set_of_ranks(ranks))
     }
 
     /// The set a record keys a pass by: what it executed when whole.
@@ -287,10 +388,11 @@ pub struct SetView<'a> {
 impl<'a> SetView<'a> {
     pub fn decode(bytes: &'a [u8]) -> Result<SetView<'a>, String> {
         if bytes.len() < SET_HEAD || bytes[..16] != *SET_MAGIC {
-            return Err("not a set of functions".to_owned());
+            return Err("not a set of functions".to_owned()); // alloc: error path
         }
         let count = u64::from_le_bytes(bytes[48..56].try_into().expect("8 bytes"));
         if (bytes.len() - SET_HEAD) as u64 != count.saturating_mul(64) {
+            // alloc: error path
             return Err("a set of functions holds another number of them than it says".to_owned());
         }
         Ok(SetView { bytes })
@@ -317,6 +419,7 @@ impl<'a> SetView<'a> {
     }
 
     pub fn to_set(&self) -> Set {
+        // alloc: a set to own, made only when one is asked for
         Set { unlogged: self.unlogged(), fns: self.versions().collect() }
     }
 }

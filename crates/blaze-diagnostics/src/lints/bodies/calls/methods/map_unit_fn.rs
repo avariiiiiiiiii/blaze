@@ -19,15 +19,18 @@ use hir_ty::{
     next_solver::{CallableIdWrapper, Ty, TyKind},
 };
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
-use syntax::{AstNode as _, SyntaxKind, SyntaxNodePtr, TextRange, ast};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
-    cx::signature_range,
+    cx::signature_range_view,
     lints::bodies::{
         BodyCx, Hooks, LatePass, LintSet, lint_set,
         types::util::{self, fn_item, from_expansion, method_fn},
     },
-    lower::{Found, Phase, break_outside_of_loop::ancestors},
+    lower::{Found, Phase, break_outside_of_loop::up},
     model::{Applicability, Diag, Span},
 };
 
@@ -55,7 +58,7 @@ fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found>
         return None;
     }
     let node = util::syntax(b, expr)?;
-    let stmt = ancestors(b.cx, &node).into_iter().find(|it| it.value.kind() == SyntaxKind::EXPR_STMT)?;
+    let stmt = up(b.cx, node).find(|it| it.value.kind() == SyntaxKind::EXPR_STMT)?;
     if from_expansion(&b.cx.span(stmt.as_ref().map(|it| it.text_range())))
         || from_expansion(&b.expr_span(receiver)?)
         || from_expansion(&b.expr_span(arg)?)
@@ -82,7 +85,7 @@ fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found>
     };
 
     // clone: a node handle or span, once the lint fires
-    let call = ast::MethodCallExpr::cast(node.value.clone())?;
+    let call = ast::MethodCallExpr::cast(node.value)?;
     let name = call.name_ref()?;
     let name_span = b.cx.span(node.with_value(name.syntax().text_range()));
     let span = b.cx.span(node.with_value(TextRange::new(name.syntax().text_range().start(), node.value.text_range().end())));
@@ -99,13 +102,13 @@ fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found>
     diag.span_label(span, "after this call to map, the resulting iterator is `impl Iterator<Item = ()>`, which means the only information carried by the iterator is the number of items");
     diag.suggestion_verbose(name_span, "you might have meant to use `Iterator::for_each`", "for_each", Applicability::MaybeIncorrect);
     if let Some(written) = util::syntax(b, receiver).and_then(|it| ast::Expr::cast(it.value))
-        && let Some(receiver_ty) = b.cx.sema.type_of_expr(&written)
+        && let Some(receiver_ty) = b.cx.vsema.type_of_expr(written)
     {
         let printed = b.cx.ty(&receiver_ty.original);
         // alloc: the lint's diagnostic
         diag.fact_opt(b.cx.method_fact(&receiver_ty.original, "map"), format!("what `map` is on `{printed}`"));
     }
-    Some(b.lint(diag, Phase::Late, stmt.map(|it| SyntaxNodePtr::new(&it))))
+    Some(b.lint(diag, Phase::Late, stmt.map(ast::ptr)))
 }
 
 /// rustc's `ret_ty.is_unit() || ret_ty.is_never()`.
@@ -129,8 +132,8 @@ fn fn_span(b: &BodyCx<'_, '_>, function: FunctionId) -> Option<Span> {
     if hir::Crate::from(function.krate(db)) != b.cx.krate {
         return None;
     }
-    let source = function.lookup(db).source(db);
-    Some(b.cx.span(source.as_ref().map(signature_range)))
+    let source = function.lookup(db).source_view(db);
+    Some(b.cx.span(source.map(signature_range_view)))
 }
 
 /// rustc's `span_of_impl` of a closure (always of this crate): its `def_span`, the closure's
@@ -142,9 +145,8 @@ fn closure_span(b: &BodyCx<'_, '_>, closure: InternedClosure<'_>) -> Option<Span
         InferBodyId::DefWithBodyId(owner) if owner == b.owner => b.expr_node(closure.expr)?,
         owner => expr_node(db, owner, closure.expr)?,
     };
-    let node = b.cx.syntax(ptr);
-    // clone: a node handle or span, once the lint fires
-    let written = ast::ClosureExpr::cast(node.value.clone())?;
+    let node = b.cx.syntax_view(ptr);
+    let written = ast::ClosureExpr::cast(node.value)?;
     let start = node
         .value
         .children_with_tokens()

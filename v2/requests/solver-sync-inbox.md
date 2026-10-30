@@ -238,6 +238,8 @@ tree; keep them through the port.
 > forwarded to solver-sync (its inbox; told by tmux).
 > declared by db-ty-d-mir (21:19): `HirDatabase::coroutine_witnesses(&self, def: InternedCoroutineId<'db>) -> &'db [StoredTy]` (`hir-ty/src/db.rs`), a provider memo (`hir-ty/src/providers.rs`, `coroutine_witnesses_query`), not `impl_hir_database!` (gone). The read in `coroutine_hidden_types` is open: `db.coroutine_witnesses(def_id.0)`, each type's erased regions replaced by fresh anonymous bound regions of one outer `Binder`, no region assumptions, under the `EarlyBinder` the caller instantiates. Also rustc's stalled coroutine goals: a goal on a coroutine of the body being type-checked waits (`TypingMode::Analysis { defining_opaque_types_and_generators }`, `check_coroutine_obligations` after borrowck), or the witness query lowers MIR of the body being inferred, a cycle. Test written: `crates/hir/src/tests.rs`, `a_future_is_send_only_when_what_it_holds_across_an_await_is`. solver-sync's window is gone (its report says DONE); db told by tmux to name who does this.
 
+> checked by db-solver (2026-10-29 23:45): 1 holds (no `conjure`, no `unsafe impl Send/Sync`; the `send_sync` assert at `interner.rs` ~411). 2 holds (`type DepNodeIndex = Option<salsa::Reads>`, ~1243). 3 holds (`solver.rs` SAFETY comment and named transmute). 4 holds: `tls_cache.rs`'s one lock is `slots` (~115), taken only to make, replace or clear a generation (~324, ~366), never on a lookup. 5 applied (see solver-sync-glue.md 3).
+
 ## From db-ty-sol-infer (2026-10-29): make an empty fulfillment round free (`fulfill.rs`)
 
 Type inference runs `select_obligations_where_possible` whenever a type is still a variable,
@@ -279,6 +281,8 @@ obligations that nothing has unblocked. Arithmetic in
 > forwarded by solver-sync to lane db (20:10): `fulfill.rs` and `infer/` are lane db's
 > (`v2/requests/db.md` section 10: db-ty-port-solver and db-ty-port-infer); told db-next2 and
 > db-ty-port-infer-next2 by tmux.
+
+> settled by db-solver (2026-10-29 23:45) (`fulfill.rs` is db-solver's now): 1 is in the tree (`FulfillmentCtxt::fixpoint`, `fulfill.rs:156`, against `InferCtxt::state_changes`). 2 (watch lists) not applied: waits on a lane that can build and measure, since it is a speed change whose exactness test (`InferenceResult` with watch lists on and off, against a naive model) must run, and this pass runs nothing.
 
 ## From db-ty-d-infer2 (2026-10-29): obligation cause codes and type variable origins (`next_solver/infer/`)
 
@@ -336,6 +340,8 @@ Both are diagnostic only; the solver's answers do not change.
      Both are fieldless. db-ty then sets them in `infer/expr.rs` (the `coerce_forced_unit`
      calls of the `if` with no `else` and of `return`) and in `infer/persist.rs` (two more
      cause tags, 8 and 9).
+
+> settled by db-solver (2026-10-29 23:45): 1 and 2 are in the tree (`ObligationCause { span, code }`, `type_var_origin`/`const_var_origin`). 3 not applied: the `Hash` derive conflicts with `solver_errors.rs:46`'s hand-written `impl Hash for ObligationCauseCode` until that is deleted in the same change, and the two new codes break the exhaustive matches in `infer/persist.rs` (~2084, ~2944) and `blaze-diagnostics/src/lower/obligation_cause.rs` (~41). None of those files is db-solver's. db-ty may make the `infer/traits.rs` half too (derive `Hash`, add `IfExpressionWithNoElse` and `ReturnNoExpression`, fieldless, after `LetType`) in the same change as its own halves (tags 9 and 10 in `persist.rs`, the impl deleted); filed in `v2/requests/db.md`.
 
 ## From lane db (db.md section 12, 20:05): CacheScope; `SimplifiedType: PartialOrd + Ord`
 
@@ -503,4 +509,6 @@ paths a goal hit or a warm re-solve doesn't take. They cover:
 They stay with their owners' annotations.
 
 > forwarded to db-ty (`next_solver/interner.rs`; solver-sync is DONE; db-ty-next2, both windows); told by tmux (requests, pass 25).
+
+> settled by db-solver (2026-10-29 23:45): see `v2/requests/mem-db-solver.md` 9 and 10.
 

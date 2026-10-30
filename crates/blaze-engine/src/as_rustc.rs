@@ -302,16 +302,17 @@ impl Drop for Scratch {
 /// The features the crate root `text` names in a `#![feature(...)]`, under a `cfg_attr` or
 /// not: one that is off still has to be one blaze knows.
 fn features(text: &str, edition: &str) -> Vec<String> {
-    use syntax::{AstNode as _, ast::HasAttrs as _};
+    use syntax::view::{AstNode as _, HasAttrs as _};
     let edition = edition.parse().unwrap_or(syntax::Edition::CURRENT);
-    let file = syntax::SourceFile::parse(text, edition).tree();
+    let parse = syntax::SourceFile::parse(text, edition);
+    let file = parse.view();
     let mut named = Vec::new();
     for attr in file.attrs() {
-        let attr = attr.syntax().text().to_string();
+        let attr = attr.syntax().text();
         if !attr.starts_with("#!") {
             continue;
         }
-        let mut rest = attr.as_str();
+        let mut rest = attr;
         while let Some(at) = rest.find("feature") {
             rest = rest[at + "feature".len()..].trim_start();
             let Some(inside) = rest.strip_prefix('(') else { continue };

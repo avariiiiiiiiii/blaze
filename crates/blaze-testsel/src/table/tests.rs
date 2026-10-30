@@ -87,6 +87,73 @@ fn sets_are_sorted_round_trip_and_name_what_changed() {
     assert_eq!(deps.changed(&view), Some(Change::Unlogged));
 }
 
+/// The unlogged hash as it was first written: 64-byte compares, a call per identity and bound.
+fn unlogged_reference(fns: &[Version], slot_fn: &[u32], beside: ContentId) -> ContentId {
+    let mut outside: Vec<&Version> =
+        fns.iter().enumerate().filter(|(at, _)| !slot_fn.contains(&(*at as u32))).map(|it| it.1).collect();
+    outside.sort_unstable();
+    let mut hasher = Hasher::new(UNLOGGED_DOMAIN);
+    hasher.id(&beside).update(&(outside.len() as u64).to_le_bytes());
+    for version in outside {
+        hasher.id(&version.id.0).id(&version.bound.0);
+    }
+    hasher.finish()
+}
+
+/// Identities whose first eight bytes are equal, so the order falls to the rest.
+fn twin(n: u32, prefix: [u8; 8]) -> Version {
+    let mut id = id(n).0;
+    id.0[..8].copy_from_slice(&prefix);
+    Version { id: FnId(id), bound: bound(n, 0) }
+}
+
+#[test]
+fn the_unlogged_hash_and_order_are_the_reference_ones_at_every_size() {
+    let mut rng = blaze_ids::rng::SplitMix64::new(3);
+    for count in [0u32, 1, 2, 63, 64, 65, 255, 256, 257, 1000, 5000] {
+        let mut fns: Vec<Version> = (0..count).map(|n| version(n, n % 5)).collect();
+        if count > 10 {
+            fns[3] = twin(3, [7; 8]);
+            fns[9] = twin(9, [7; 8]);
+            fns[10] = twin(10, [7; 8]);
+        }
+        let slot_fn: Vec<u32> = (0..count).filter(|_| rng.below(3) == 0).collect();
+        let beside = ContentId::of("blaze v2 testsel test image 1", &count.to_le_bytes());
+        let mut sorted = fns.clone();
+        sorted.sort_unstable();
+        // A table in codegen's order, and one in identity order already.
+        for fns in [fns, sorted.clone()] {
+            let image = Image::new(fns.clone(), slot_fn.clone(), beside).unwrap();
+            assert_eq!(image.unlogged(), unlogged_reference(&fns, &slot_fn, beside), "{count}");
+            let ordered: Vec<Version> = image.order.iter().map(|&at| fns[at as usize]).collect();
+            assert_eq!(ordered, sorted, "{count}");
+            for (at, &rank) in image.rank.iter().enumerate() {
+                assert_eq!(image.order[rank as usize] as usize, at);
+            }
+        }
+    }
+}
+
+/// Both ways a set is made (a bitset for many, a sort for few) against `Set::of`.
+#[test]
+fn sets_of_ranks_are_sets_of_versions() {
+    let mut rng = blaze_ids::rng::SplitMix64::new(5);
+    for count in [1u32, 2, 64, 200, 3000] {
+        let fns: Vec<Version> = (0..count).map(|n| version(n, n % 2)).collect();
+        let slots: Vec<u32> = (0..count).rev().collect();
+        let image = Image::new(fns.clone(), slots.clone(), ContentId::default()).unwrap();
+        for many in [0usize, 1, 3, 20, count as usize, 3 * count as usize] {
+            let hits: Vec<u32> = (0..many).map(|_| rng.below(u64::from(count)) as u32).collect();
+            let want = Set::of(image.unlogged(), hits.iter().map(|&at| fns[at as usize]).collect());
+            assert_eq!(image.reached(&hits).unwrap(), want, "{count} {many}");
+            let mut slot_hits: Vec<u32> = hits.iter().map(|&at| count - 1 - at).collect();
+            slot_hits.sort_unstable();
+            slot_hits.dedup();
+            assert_eq!(image.executed(count, &slot_hits).unwrap(), want, "{count} {many}");
+        }
+    }
+}
+
 #[test]
 fn a_record_keys_by_what_it_executed_only_when_whole() {
     let image = Image::new(vec![version(0, 0), version(1, 0)], vec![0, 1], ContentId::default()).unwrap();

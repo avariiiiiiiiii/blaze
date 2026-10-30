@@ -298,13 +298,13 @@ fn positions(db: &Db, owner: DefWithBodyId) -> Result<Positions, String> {
     for table in 0..TABLES {
         starts[table] = rows.len() as u32;
         match table {
-            code::EXPRS => for (it, _) in store.exprs() {
+            code::EXPRS => for it in store.expr_ids() {
                 rows.push(row(MirSpan::ExprId(it))?);
             },
-            code::EXPR_ENDS => for (it, _) in store.exprs() {
+            code::EXPR_ENDS => for it in store.expr_ids() {
                 rows.push(row(MirSpan::ExprEnd(it))?);
             },
-            code::PATS => for (it, _) in store.pats() {
+            code::PATS => for it in store.pat_ids() {
                 rows.push(row(MirSpan::PatId(it))?);
             },
             code::BINDINGS => for (it, _) in store.bindings() {

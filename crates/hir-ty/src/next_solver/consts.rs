@@ -123,11 +123,13 @@ pub trait ConstExt<'db>: Sized {
 
     fn new_valtree(interner: DbInterner<'db>, ty: Ty<'db>, kind: ValTreeKind<'db>) -> Self;
 
+    /// The value tree of an evaluated constant, or why it has none, which the caller
+    /// reports (rustc's `ValTreeCreationError`).
     fn new_from_allocation(
         interner: DbInterner<'db>,
         allocation: &AllocationData<'db>,
         param_env: ParamEnvAndCrate<'db>,
-    ) -> Self;
+    ) -> Result<Self, ValTreeCreationError<'db>>;
 
     /// This constant's row: the same number for the same constant, on every thread, for the
     /// life of the process.
@@ -164,7 +166,7 @@ impl<'db> ConstExt<'db> for Const<'db> {
         interner: DbInterner<'db>,
         allocation: &AllocationData<'db>,
         param_env: ParamEnvAndCrate<'db>,
-    ) -> Self {
+    ) -> Result<Self, ValTreeCreationError<'db>> {
         allocation_to_const(
             interner,
             allocation.ty,

@@ -17,7 +17,10 @@ use rustc_apfloat::{
     ieee::{Double, Half, Quad, Single},
 };
 use rustc_type_ir::{FloatTy, IntTy, UintTy, inherent::IntoKind};
-use syntax::{AstNode, SyntaxNodePtr, ast};
+use syntax::{
+    SyntaxNodePtr,
+    view::{self as ast, AstNode},
+};
 
 use super::super::util;
 use crate::{
@@ -29,10 +32,10 @@ use crate::{
 pub(super) const LINT: &str = "overflowing_literals";
 
 /// A literal as rustc's `check_lit` is given it.
-struct Lit {
+struct Lit<'db> {
     expr: ExprId,
     at: InFile<SyntaxNodePtr>,
-    kind: ast::LiteralKind,
+    kind: ast::LiteralKind<'db>,
     /// `lit.span`: the literal's, or of a negated literal of a pattern, with its `-`.
     span: Span,
 }
@@ -174,18 +177,17 @@ pub(super) fn lint_literal(b: &BodyCx<'_, '_>, expr: ExprId, negation: Option<Ex
 }
 
 /// The literal `expr` is written as, and whether it is a pattern's with a `-` before it.
-fn literal(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<(Lit, bool)> {
+fn literal<'db>(b: &BodyCx<'_, 'db>, expr: ExprId) -> Option<(Lit<'db>, bool)> {
     let at = b.expr_node(expr)?;
-    let node = b.cx.syntax(at);
-    // clone: a span or node handle, for a literal `may_overflow` found
-    let (lit, pat) = match ast::Literal::cast(node.value.clone()) {
+    let node = b.cx.syntax_view(at);
+    let (lit, pat) = match ast::Literal::cast(node.value) {
         Some(lit) => {
             let pat = lit.syntax().parent().and_then(ast::LiteralPat::cast);
             (lit, pat)
         }
         None => {
             // clone: a span or node handle, for a literal `may_overflow` found
-            let pat = ast::LiteralPat::cast(node.value.clone())?;
+            let pat = ast::LiteralPat::cast(node.value)?;
             (pat.literal()?, Some(pat))
         }
     };
@@ -321,7 +323,7 @@ fn type_suggestion(ty: Ty<'_>, value: u128, negative: bool) -> Option<&'static s
 }
 
 /// rustc's `get_bin_hex_repr`: the literal as written when it is hexadecimal or binary.
-fn bin_hex_repr(b: &BodyCx<'_, '_>, lit: &Lit) -> Option<String> {
+fn bin_hex_repr(b: &BodyCx<'_, '_>, lit: &Lit<'_>) -> Option<String> {
     let src = snippet(b, &lit.span)?;
     let mut chars = src.chars();
     if chars.next()? == '0' && matches!(chars.next(), Some('x' | 'b')) {
@@ -338,7 +340,7 @@ enum IntType {
 /// rustc's `report_bin_hex_error`.
 fn report_bin_hex_error(
     b: &BodyCx<'_, '_>,
-    lit: &Lit,
+    lit: &Lit<'_>,
     ty: IntType,
     bits: u32,
     repr: String,
@@ -430,7 +432,7 @@ fn parent_cast(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ExprId> {
 /// Whether it linted.
 fn lint_overflowing_range_endpoint(
     b: &BodyCx<'_, '_>,
-    lit: &Lit,
+    lit: &Lit<'_>,
     suffix: Option<&str>,
     value: u128,
     max: u128,
@@ -491,7 +493,7 @@ fn lint_overflowing_range_endpoint(
 /// rustc's `lint_int_literal`.
 fn lint_int_literal(
     b: &BodyCx<'_, '_>,
-    lit: &Lit,
+    lit: &Lit<'_>,
     t: IntTy,
     value: u128,
     negation: Option<Span>,
@@ -537,7 +539,7 @@ fn lint_int_literal(
 }
 
 /// rustc's `lint_uint_literal`.
-fn lint_uint_literal(b: &BodyCx<'_, '_>, lit: &Lit, t: UintTy, out: &mut Vec<Found>) {
+fn lint_uint_literal(b: &BodyCx<'_, '_>, lit: &Lit<'_>, t: UintTy, out: &mut Vec<Found>) {
     let uint_type = match t {
         UintTy::Usize => match pointer_width(b) {
             Some(width) => t.normalize(width),

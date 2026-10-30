@@ -11,13 +11,15 @@
 //! vectors; the per-crate tables of `paths` are built once and read without locks.
 
 mod consts;
+mod erase;
 pub(crate) mod paths;
 mod printer;
 mod types;
 
 use hir::AsAssocItem as _;
 use hir_def::ModuleDefId;
-use hir_ty::next_solver::Ty;
+use hir_ty::next_solver::{DbInterner, Ty, TyKind};
+use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 
 pub(crate) use paths::Paths;
 
@@ -33,6 +35,30 @@ pub fn ty(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
 /// A type with no path trimmed: rustc's `with_no_trimmed_paths!`.
 pub fn ty_untrimmed(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
     ty_in(cx, ty.to_next_solver(), Mode::UNTRIMMED)
+}
+
+/// rustc's `ty_to_string` of a `let`'s type in "consider giving `x` an explicit type": the type
+/// through its `ClosureEraser`, decided by `undecided` (the type with its variables as errors)
+/// and printed from `named` (the same type with each variable made for a parameter named by it,
+/// rustc's `ty_infer_name_resolver`; `undecided` when hir does not say), a function item as its
+/// signature.
+pub fn let_type<'db>(cx: &Cx<'_, 'db>, undecided: &hir::Type<'db>, named: Option<&hir::Type<'db>>) -> String {
+    let interner = DbInterner::new_with(cx.db, cx.krate.into());
+    let undecided = undecided.to_next_solver();
+    let named = named.map_or(undecided, hir::Type::to_next_solver);
+    let ty = erase::erase(cx.db, interner, undecided, named);
+    let ty = match ty.kind() {
+        TyKind::FnDef(..) => Ty::new_fn_ptr(interner, ty.callable_sig(interner).expect("a function item has a signature")),
+        _ => ty,
+    };
+    ty_in(cx, ty, Mode::NORMAL)
+}
+
+/// The undecided types and constants rustc's `where_x_is_kind` counts in a `let`'s type erased
+/// as [`let_type`] erases it ("where the placeholder(s) `_` (are|is) specified"), 0 when all of
+/// it is.
+pub fn let_placeholders<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>) -> usize {
+    erase::undecided_count(cx.db, DbInterner::new_with(cx.db, cx.krate.into()), ty.to_next_solver())
 }
 
 fn ty_in(cx: &Cx<'_, '_>, ty: Ty<'_>, mode: Mode) -> String {

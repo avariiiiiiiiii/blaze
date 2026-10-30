@@ -13,8 +13,8 @@ use hir_expand::{
 };
 use span::AstIdMap;
 use syntax::{
-    AstNode,
-    ast::{self, HasModuleItem, HasName},
+    ast,
+    view::{self, AstNode, HasModuleItem, HasName},
 };
 use thin_vec::ThinVec;
 
@@ -50,8 +50,7 @@ impl TraitItems {
         tr: TraitId,
     ) -> (TraitItems, DefDiagnostics) {
         let ItemLoc { container: module_id, id: ast_id } = *tr.lookup(db);
-        let ast_id_map = ast_id.file_id.ast_id_map(db);
-        let source = ast_id.with_value(ast_id_map.get(ast_id.value)).to_node(db);
+        let source = ast_id.to_view(db);
         if source.eq_token().is_some() {
             // FIXME(trait-alias) probably needs special handling here
             return (
@@ -119,7 +118,7 @@ impl ImplItems {
 
         let collector =
             AssocItemCollector::new(db, module_id, ItemContainerId::ImplId(id), ast_id.file_id);
-        let source = ast_id.with_value(collector.ast_id_map.get(ast_id.value)).to_node(db);
+        let source = collector.ast_id_map.get(ast_id.value).to_view(ast_id.file_id.root(db));
         let (items, macro_calls, diagnostics) = collector.collect(source.assoc_item_list());
 
         (ImplItems { items, macro_calls }, DefDiagnostics::new(diagnostics))
@@ -179,7 +178,7 @@ impl<'db> AssocItemCollector<'db> {
 
     fn collect(
         mut self,
-        item_list: Option<ast::AssocItemList>,
+        item_list: Option<view::AssocItemList<'db>>,
     ) -> (Box<[(Name, AssocItemId)]>, ThinVec<(AstId<ast::Item>, MacroCallId)>, Vec<DefDiagnostic>)
     {
         if let Some(item_list) = item_list {
@@ -191,9 +190,9 @@ impl<'db> AssocItemCollector<'db> {
         (self.items.into_boxed_slice(), self.macro_calls, self.diagnostics)
     }
 
-    fn collect_item(&mut self, item: ast::AssocItem) {
-        let ast_id = self.ast_id_map.ast_id(&item);
-        let attrs = match AttrsOrCfg::lower(self.db, &item, &|| self.cfg_options, self.span_map) {
+    fn collect_item(&mut self, item: view::AssocItem<'db>) {
+        let ast_id = self.ast_id_map.ast_id_of_view::<ast::AssocItem>(item);
+        let attrs = match AttrsOrCfg::lower(self.db, item, &|| self.cfg_options, self.span_map) {
             AttrsOrCfg::Enabled { attrs } => attrs,
             AttrsOrCfg::CfgDisabled(cfg) => {
                 self.diagnostics.push(DefDiagnostic::unconfigured_code(
@@ -259,11 +258,11 @@ impl<'db> AssocItemCollector<'db> {
         self.record_item(item);
     }
 
-    fn record_item(&mut self, item: ast::AssocItem) {
+    fn record_item(&mut self, item: view::AssocItem<'db>) {
         match item {
-            ast::AssocItem::Fn(function) => {
+            view::AssocItem::Fn(function) => {
                 let Some(name) = function.name() else { return };
-                let ast_id = self.ast_id_map.ast_id(&function);
+                let ast_id = self.ast_id_map.ast_id_of_view::<ast::Fn>(function);
                 let def = FunctionLoc {
                     container: self.container,
                     id: InFile::new(self.file_id, ast_id),
@@ -271,9 +270,9 @@ impl<'db> AssocItemCollector<'db> {
                 .intern(self.db);
                 self.items.push((name.as_name(), def.into()));
             }
-            ast::AssocItem::TypeAlias(type_alias) => {
+            view::AssocItem::TypeAlias(type_alias) => {
                 let Some(name) = type_alias.name() else { return };
-                let ast_id = self.ast_id_map.ast_id(&type_alias);
+                let ast_id = self.ast_id_map.ast_id_of_view::<ast::TypeAlias>(type_alias);
                 let def = TypeAliasLoc {
                     container: self.container,
                     id: InFile::new(self.file_id, ast_id),
@@ -281,20 +280,20 @@ impl<'db> AssocItemCollector<'db> {
                 .intern(self.db);
                 self.items.push((name.as_name(), def.into()));
             }
-            ast::AssocItem::Const(konst) => {
+            view::AssocItem::Const(konst) => {
                 let Some(name) = konst.name() else { return };
-                let ast_id = self.ast_id_map.ast_id(&konst);
+                let ast_id = self.ast_id_map.ast_id_of_view::<ast::Const>(konst);
                 let def =
                     ConstLoc { container: self.container, id: InFile::new(self.file_id, ast_id) }
                         .intern(self.db);
                 self.items.push((name.as_name(), def.into()));
             }
-            ast::AssocItem::MacroCall(call) => {
-                let ast_id = self.ast_id_map.ast_id(&call);
+            view::AssocItem::MacroCall(call) => {
+                let ast_id = self.ast_id_map.ast_id_of_view::<ast::MacroCall>(call);
                 let ast_id = InFile::new(self.file_id, ast_id);
                 let Some(path) = call.path() else { return };
                 let range = path.syntax().text_range();
-                let Some(path) = ModPath::from_src(self.db, path, &mut |range| {
+                let Some(path) = ModPath::from_src_view(self.db, path, &mut |range| {
                     self.span_map.span_for_range(range).ctx
                 }) else {
                     return;
@@ -378,13 +377,13 @@ impl<'db> AssocItemCollector<'db> {
         let old_span_map = mem::replace(&mut self.span_map, SpanMap::ExpansionSpanMap(span_map));
         self.macro_depth += 1;
 
-        let items = ast::MacroItems::cast(syntax.syntax_node()).expect("not `MacroItems`");
+        let items = view::MacroItems::cast(syntax.root()).expect("not `MacroItems`");
         for item in items.items() {
             let item = match item {
-                ast::Item::Fn(it) => ast::AssocItem::from(it),
-                ast::Item::Const(it) => it.into(),
-                ast::Item::TypeAlias(it) => it.into(),
-                ast::Item::MacroCall(it) => it.into(),
+                view::Item::Fn(it) => view::AssocItem::from(it),
+                view::Item::Const(it) => it.into(),
+                view::Item::TypeAlias(it) => it.into(),
+                view::Item::MacroCall(it) => it.into(),
                 // FIXME: Should error on disallowed item kinds.
                 _ => continue,
             };

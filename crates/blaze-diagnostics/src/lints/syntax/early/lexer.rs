@@ -24,7 +24,7 @@ mod idents;
 mod keywords;
 mod lex;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::hash_map};
 
 use blaze_mem::Frame;
 use hir::{HirFileId, InFile};
@@ -45,12 +45,13 @@ use crate::{
 
 use self::lex::{Lexed, LexedFile};
 
-pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'_>) -> Vec<Emitted> {
+
+pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Emitted> {
     // alloc: empty, allocates nothing
     let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return Vec::new() };
     // alloc: empty, allocates nothing
     let Some(root) = walk.tree(HirFileId::from(root)) else { return Vec::new() };
-    let krate = root.ptr(&root.root);
+    let krate = root.ptr(root.root);
     // alloc: empty until a lint fires; holds only what fires
     let mut emitted = Vec::new();
     for tree in walk.files() {
@@ -118,7 +119,7 @@ fn gathers_idents(cx: &Cx<'_, '_>, walk: &Walk<'_>, ascii: &[bool]) -> bool {
     }
     walk.trees.iter().any(|tree| {
         tree.call.is_some_and(|call| matches!(call.loc(cx.db).def.kind, MacroDefKind::ProcMacro(..)))
-            && tree.root.text().try_for_each_chunk(|chunk| if chunk.is_ascii() { Ok(()) } else { Err(()) }).is_err()
+            && !tree.root.text().is_ascii()
     })
 }
 
@@ -195,8 +196,9 @@ impl<'db> Gallery<'db> {
     /// The identifiers of what proc macros expand to (`proc_macro_server.rs`: each `Ident` a
     /// proc macro gives back, its lifetimes' too, which `proc_macro` gives as a `'` and an
     /// `Ident`), where the gallery has no such symbol yet. They are expanded after the files
-    /// they are called from are lexed.
-    fn add_proc_macro_idents(&mut self, cx: &Cx<'_, 'db>, walk: &Walk<'_>, sources: &[Source]) {
+    /// they are called from are lexed. A symbol borrows the expansion's text, which the
+    /// database keeps, unless NFC changes it.
+    fn add_proc_macro_idents(&mut self, cx: &Cx<'_, 'db>, walk: &Walk<'db>, sources: &[Source]) {
         let mut index: Option<FxHashMap<FileId, u32>> = None;
         for tree in &walk.trees {
             let Some(call) = tree.call else { continue };
@@ -212,9 +214,7 @@ impl<'db> Gallery<'db> {
                 };
                 let Some(name) = name else { continue };
                 let symbol = lex::nfc(name.strip_prefix("r#").unwrap_or(name));
-                if self.symbols.contains_key(symbol.as_ref()) {
-                    continue;
-                }
+                let hash_map::Entry::Vacant(slot) = self.symbols.entry(symbol) else { continue };
                 let range = InFile::new(tree.file, token.text_range());
                 let (file, at) = cx.place(range);
                 let index = index.get_or_insert_with(|| {
@@ -223,7 +223,7 @@ impl<'db> Gallery<'db> {
                 });
                 let file = index.get(&file).copied().unwrap_or(u32::MAX);
                 let order = (file, at.start().into(), at.end().into());
-                self.symbols.insert(Cow::Owned(symbol.into_owned()), Entry { order, place: Place::Expansion(range) });
+                slot.insert(Entry { order, place: Place::Expansion(range) });
             }
         }
     }

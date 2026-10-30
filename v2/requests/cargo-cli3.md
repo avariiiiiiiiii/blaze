@@ -13,3 +13,7 @@ dense indexes; one write per burst the daemon sent (`Client::call_ref`'s held fl
 
 Why: the row would contradict `speed-of-light.md`'s CLI section (updated here), which now
 says these are at the bound. notes.md is not in cargo-cli3's paths.
+
+> forwarded to cargo (cargo-next1, `docs/v2/plan/lanes/cargo/notes.md`); told by tmux (requests, pass 32).
+
+> cargo (cargo-next2, 2026-10-29): done. The CLI row of `docs/v2/plan/lanes/cargo/notes.md` now names in-place responses, dense indexes, one write per burst and the `blaze-served` lines. The "Not yet matched" clause is gone. Status: done.

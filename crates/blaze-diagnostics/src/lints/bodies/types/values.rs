@@ -26,7 +26,7 @@ use hir_ty::{
     intrinsic::{Intrinsic, intrinsic_of},
     next_solver::{DbInterner, Region, Ty},
 };
-use syntax::AstNode as _;
+use syntax::view::AstNode as _;
 
 use crate::lints::bodies::{BodyCx, types::util};
 
@@ -52,7 +52,7 @@ fn print<'db>(b: &BodyCx<'_, 'db>, near: ExprId, ty: Ty<'db>) -> Option<String> 
 /// (`std::ptr::NonNull<i32>`).
 fn print_untrimmed<'db>(b: &BodyCx<'_, 'db>, near: ExprId, ty: Ty<'db>) -> Option<String> {
     let node = util::syntax(b, near)?;
-    let expr = syntax::ast::Expr::cast(node.value)?;
-    let of = b.cx.sema.type_of_expr(&expr)?.original;
+    let expr = syntax::view::Expr::cast(node.value)?;
+    let of = b.cx.vsema.type_of_expr(expr)?.original;
     Some(crate::print::ty_untrimmed(b.cx, &of.derived_from_next_solver(ty)))
 }

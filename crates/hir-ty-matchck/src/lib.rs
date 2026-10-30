@@ -25,7 +25,7 @@ mod tests;
 
 use base_db::Db;
 use hir_def::{
-    ConstId, DefWithBodyId, EnumId, EnumVariantId,
+    AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, ImplId,
     hir::{ExprId, ExprOrPatId, PatId},
     item_scope::ImportId,
 };
@@ -247,11 +247,40 @@ pub enum ConstPatternError {
     /// value of this type.
     Invalid(StoredTy),
     /// `TypeNotStructural`: the value holds this ADT, which doesn't derive `PartialEq`.
-    NotStructural(StoredTy),
-    /// `TypeNotPartialEq`: the constant's type doesn't implement `PartialEq`.
-    NotPartialEq(StoredTy),
+    NotStructural {
+        ty: StoredTy,
+        /// `possibly_inapplicable_structural_partial_eq`: the ADT has a `StructuralPartialEq`
+        /// impl whose bounds don't hold, so rustc says nothing of a manual `PartialEq` impl.
+        inapplicable_structural: bool,
+    },
+    /// `TypeNotPartialEq`: `ty` doesn't implement `PartialEq`. It is the constant's type, or
+    /// an ADT in its value whose derived `PartialEq` doesn't apply. The lists are what
+    /// `extend_type_not_partial_eq` finds in `ty`, each in the order it meets them, without
+    /// repeats; rustc prints the spans by position and the types sorted by their text. All
+    /// are empty when `ty` holds a `dyn` or an unsafe binder.
+    NotPartialEq {
+        ty: StoredTy,
+        /// A local ADT with a manual `PartialEq` impl: a span note at the impl, or at the ADT
+        /// when no local impl is written for its type.
+        local_manual: Box<[ManualPartialEq]>,
+        /// A local ADT with no `PartialEq` impl: a label at it.
+        local_without: Box<[AdtId]>,
+        /// A foreign type with a manual `PartialEq` impl: a note.
+        manual: Box<[StoredTy]>,
+        /// A foreign type with no `PartialEq` impl: a note.
+        without: Box<[StoredTy]>,
+    },
     /// `NaNPattern`: "cannot use NaN in patterns".
     NaN,
+}
+
+/// Where `extend_type_not_partial_eq`'s note about a local manual `PartialEq` impl points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ManualPartialEq {
+    /// The impl written for the type.
+    Impl(ImplId),
+    /// The ADT, whose `PartialEq` comes from a blanket or foreign impl.
+    Adt(AdtId),
 }
 
 /// Match checking of `def`, once per body: the closures and inline constants written in it are

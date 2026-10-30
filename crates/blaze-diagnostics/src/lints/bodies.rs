@@ -63,7 +63,10 @@ use hir_ty::{
 };
 use rustc_hash::FxHashMap;
 use span::FileId;
-use syntax::{AstNode as _, SyntaxNodePtr, TextRange, TextSize, ast};
+use syntax::{
+    SyntaxNodePtr, TextRange, TextSize,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
     cx::Cx,
@@ -341,7 +344,7 @@ impl<'a, 'db> BodyCx<'a, 'db> {
     pub(crate) fn expr_span(&self, expr: ExprId) -> Option<Span> {
         let node = self.expr_node(expr)?;
         let mut span = self.cx.span_of(node);
-        let InFile { file_id, value } = self.cx.syntax(node);
+        let InFile { file_id, value } = self.cx.syntax_view(node);
         let mut at = value;
         while let Some(parent) = at.parent().filter(|it| ast::ParenExpr::can_cast(it.kind())) {
             let outer = self.cx.span(InFile::new(file_id, parent.text_range()));
@@ -395,7 +398,7 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         }
         let node = self.mir_node(span)?;
         let MirSpan::ExprEnd(_) = span else { return Some(self.cx.span_of(node)) };
-        let last = self.cx.syntax(node).value.last_token()?;
+        let last = self.cx.syntax_view(node).value.last_token()?;
         let end = last.text_range().end();
         let len = TextSize::of(last.text().chars().next_back()?);
         Some(self.cx.span(InFile::new(node.file_id, TextRange::new(end - len, end))))
@@ -660,97 +663,20 @@ impl Hooks {
     }
 }
 
-/// The tag of an [`Expr`]: one per variant, in variant order, as hir-def's columns number them.
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ExprTag {
-    Missing,
-    Path,
-    If,
-    Let,
-    Block,
-    Const,
-    Loop,
-    Call,
-    MethodCall,
-    Match,
-    Continue,
-    Break,
-    Return,
-    Become,
-    Yield,
-    Yeet,
-    RecordLit,
-    Field,
-    Await,
-    Cast,
-    Ref,
-    UnaryOp,
-    BinaryOp,
-    Assignment,
-    Index,
-    Closure,
-    Tuple,
-    Array,
-    Literal,
-    Underscore,
-    OffsetOf,
-    InlineAsm,
-    IncludeBytes,
-}
+pub(crate) use hir_def::hir::{ExprKind, PatKind};
 
-const EXPR_TAGS: usize = ExprTag::IncludeBytes as usize + 1;
+const EXPR_TAGS: usize = ExprKind::ALL.len();
+const PAT_TAGS: usize = PatKind::ALL.len();
+const _: () = assert!(EXPR_TAGS <= u64::BITS as usize && PAT_TAGS <= u32::BITS as usize);
 
-impl ExprTag {
-    /// A `match` on the decoded variant, which compiles to its discriminant.
-    #[inline]
-    pub(crate) fn of(expr: &Expr<'_>) -> ExprTag {
-        match expr {
-            Expr::Missing => ExprTag::Missing,
-            Expr::Path(_) => ExprTag::Path,
-            Expr::If { .. } => ExprTag::If,
-            Expr::Let { .. } => ExprTag::Let,
-            Expr::Block { .. } => ExprTag::Block,
-            Expr::Const(_) => ExprTag::Const,
-            Expr::Loop { .. } => ExprTag::Loop,
-            Expr::Call { .. } => ExprTag::Call,
-            Expr::MethodCall { .. } => ExprTag::MethodCall,
-            Expr::Match { .. } => ExprTag::Match,
-            Expr::Continue { .. } => ExprTag::Continue,
-            Expr::Break { .. } => ExprTag::Break,
-            Expr::Return { .. } => ExprTag::Return,
-            Expr::Become { .. } => ExprTag::Become,
-            Expr::Yield { .. } => ExprTag::Yield,
-            Expr::Yeet { .. } => ExprTag::Yeet,
-            Expr::RecordLit { .. } => ExprTag::RecordLit,
-            Expr::Field { .. } => ExprTag::Field,
-            Expr::Await { .. } => ExprTag::Await,
-            Expr::Cast { .. } => ExprTag::Cast,
-            Expr::Ref { .. } => ExprTag::Ref,
-            Expr::UnaryOp { .. } => ExprTag::UnaryOp,
-            Expr::BinaryOp { .. } => ExprTag::BinaryOp,
-            Expr::Assignment { .. } => ExprTag::Assignment,
-            Expr::Index { .. } => ExprTag::Index,
-            Expr::Closure { .. } => ExprTag::Closure,
-            Expr::Tuple { .. } => ExprTag::Tuple,
-            Expr::Array(_) => ExprTag::Array,
-            Expr::Literal(_) => ExprTag::Literal,
-            Expr::Underscore => ExprTag::Underscore,
-            Expr::OffsetOf(_) => ExprTag::OffsetOf,
-            Expr::InlineAsm(_) => ExprTag::InlineAsm,
-            Expr::IncludeBytes => ExprTag::IncludeBytes,
-        }
-    }
-}
-
-/// A set of [`ExprTag`]s, a bit each.
+/// A set of [`ExprKind`]s, a bit each.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ExprKinds(u64);
 
 impl ExprKinds {
     pub(crate) const NONE: ExprKinds = ExprKinds(0);
 
-    pub(crate) const fn of(tags: &[ExprTag]) -> ExprKinds {
+    pub(crate) const fn of(tags: &[ExprKind]) -> ExprKinds {
         let mut bits = 0u64;
         let mut at = 0;
         while at < tags.len() {
@@ -765,64 +691,14 @@ impl ExprKinds {
     }
 }
 
-/// The tag of a [`Pat`], one per variant, in variant order.
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum PatTag {
-    Missing,
-    Rest,
-    Wild,
-    Tuple,
-    Or,
-    Record,
-    Range,
-    Slice,
-    Path,
-    Lit,
-    Bind,
-    TupleStruct,
-    Ref,
-    Box,
-    Deref,
-    NotNull,
-    Expr,
-}
-
-const PAT_TAGS: usize = PatTag::Expr as usize + 1;
-
-impl PatTag {
-    #[inline]
-    pub(crate) fn of(pat: &Pat<'_>) -> PatTag {
-        match pat {
-            Pat::Missing => PatTag::Missing,
-            Pat::Rest => PatTag::Rest,
-            Pat::Wild => PatTag::Wild,
-            Pat::Tuple { .. } => PatTag::Tuple,
-            Pat::Or(_) => PatTag::Or,
-            Pat::Record { .. } => PatTag::Record,
-            Pat::Range { .. } => PatTag::Range,
-            Pat::Slice { .. } => PatTag::Slice,
-            Pat::Path(_) => PatTag::Path,
-            Pat::Lit(_) => PatTag::Lit,
-            Pat::Bind { .. } => PatTag::Bind,
-            Pat::TupleStruct { .. } => PatTag::TupleStruct,
-            Pat::Ref { .. } => PatTag::Ref,
-            Pat::Box { .. } => PatTag::Box,
-            Pat::Deref { .. } => PatTag::Deref,
-            Pat::NotNull => PatTag::NotNull,
-            Pat::Expr(_) => PatTag::Expr,
-        }
-    }
-}
-
-/// A set of [`PatTag`]s, a bit each.
+/// A set of [`PatKind`]s, a bit each.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct PatKinds(u32);
 
 impl PatKinds {
     pub(crate) const NONE: PatKinds = PatKinds(0);
 
-    pub(crate) const fn of(tags: &[PatTag]) -> PatKinds {
+    pub(crate) const fn of(tags: &[PatKind]) -> PatKinds {
         let mut bits = 0u32;
         let mut at = 0;
         while at < tags.len() {
@@ -1041,7 +917,7 @@ impl Late<'_, '_, '_> {
         let b = self.b;
         let decoded = b.store().expr(expr);
         let Passes { all, expr: on, .. } = &mut *self.passes;
-        for &i in on[ExprTag::of(&decoded) as usize].ids() {
+        for &i in on[ExprKind::of(&decoded) as usize].ids() {
             all[usize::from(i)].check_expr(b, expr, self.out);
         }
         stdx::ensure_sufficient_stack(|| self.expr_children(expr, decoded));
@@ -1122,7 +998,7 @@ impl Late<'_, '_, '_> {
         let store = b.store();
         let decoded = store.pat(pat);
         let Passes { all, pat: on, .. } = &mut *self.passes;
-        for &i in on[PatTag::of(&decoded) as usize].ids() {
+        for &i in on[PatKind::of(&decoded) as usize].ids() {
             all[usize::from(i)].check_pat(b, pat, self.out);
         }
         match decoded {

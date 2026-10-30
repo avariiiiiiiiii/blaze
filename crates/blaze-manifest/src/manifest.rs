@@ -27,7 +27,7 @@ use crate::files::Files;
 use crate::features::{Edition, Feature, Features, ResolveBehavior};
 use crate::paths::normalize_path;
 use crate::profiles::validate_profiles;
-use crate::source::{CRATES_IO_INDEX, CRATES_IO_REGISTRY, SourceId, into_url};
+use crate::source::{self, CRATES_IO_INDEX, CRATES_IO_REGISTRY, GitReference, SourceId, into_url};
 use crate::targets::{self, Target};
 use crate::workspace::find_workspace_root;
 
@@ -73,8 +73,8 @@ impl PackageId {
     pub fn to_spec(&self) -> PackageIdSpec {
         PackageIdSpec::new(self.name.clone())
             .with_version(PartialVersion::from(self.version.clone()))
-            .with_url(self.source_id.url.clone())
-            .with_kind(self.source_id.kind.clone())
+            .with_url(self.source_id.url().clone())
+            .with_kind(source::spec_kind(self.source_id.kind()))
     }
 }
 
@@ -1006,7 +1006,7 @@ fn inheritable_from_path<F: Files>(
     if let Some(ws_root) = ctx.ws_roots.borrow().get(workspace_path_root) {
         return Ok(ws_root.inheritable.clone());
     }
-    let source_id = SourceId::for_manifest_path(&workspace_path)?;
+    let source_id = source::for_manifest_path(&workspace_path)?;
     let man = read_manifest(&workspace_path, source_id, ctx)?;
     match man.workspace_config() {
         WorkspaceConfig::Root(root) => {
@@ -1263,7 +1263,7 @@ fn to_real_manifest<F: Files>(
     let mut deps = Vec::new();
     let mut manifest_ctx = ManifestContext {
         deps: &mut deps,
-        source_id: source_id.clone(),
+        source_id,
         config: &ctx.config,
         warnings,
         platform: None,
@@ -1665,10 +1665,10 @@ fn dep_to_dependency<F: Files>(
     dep.optional = orig.optional.unwrap_or(false);
     dep.platform = manifest_ctx.platform.clone();
     if let Some(registry) = &orig.registry {
-        dep.registry_id = Some(SourceId::alt_registry(manifest_ctx.config, registry)?);
+        dep.registry_id = Some(source::alt_registry(manifest_ctx.config, registry)?);
     }
     if let Some(registry_index) = &orig.registry_index {
-        dep.registry_id = Some(SourceId::for_registry(&into_url(registry_index)?));
+        dep.registry_id = Some(SourceId::for_registry(&into_url(registry_index)?)?);
     }
     if let Some(kind) = kind {
         dep.kind = kind;
@@ -1731,7 +1731,6 @@ fn to_dependency_source_id<F: Files>(
                      Only one of `branch`, `tag` or `rev` is allowed.",
                 );
             }
-            use cargo_util_schemas::core::GitReference;
             let reference = orig
                 .branch
                 .clone()
@@ -1747,21 +1746,21 @@ fn to_dependency_source_id<F: Files>(
                      use `rev = \"{fragment}\"` in the dependency declaration.",
                 ));
             }
-            Ok(SourceId::for_git(&loc, reference))
+            SourceId::for_git(&loc, reference)
         }
         (None, Some(path), _, _) => {
             if manifest_ctx.source_id.is_path() {
                 let path = manifest_ctx.file.parent().unwrap().join(path);
                 SourceId::for_path(&normalize_path(&path))
             } else {
-                Ok(manifest_ctx.source_id.clone())
+                Ok(manifest_ctx.source_id)
             }
         }
-        (None, None, Some(registry), None) => SourceId::alt_registry(manifest_ctx.config, registry),
+        (None, None, Some(registry), None) => source::alt_registry(manifest_ctx.config, registry),
         (None, None, None, Some(registry_index)) => {
-            Ok(SourceId::for_registry(&into_url(registry_index)?))
+            SourceId::for_registry(&into_url(registry_index)?)
         }
-        (None, None, None, None) => SourceId::crates_io(manifest_ctx.config),
+        (None, None, None, None) => source::crates_io(manifest_ctx.config),
     }
 }
 

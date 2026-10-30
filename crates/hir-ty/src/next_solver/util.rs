@@ -3,7 +3,7 @@
 use std::ops::ControlFlow;
 
 use base_db::Db;
-use hir_def::{HasModule, ImplId, TraitId, TypeAliasId};
+use hir_def::{GenericDefId, HasModule, ImplId, TraitId, TypeAliasId};
 use rustc_abi::{Float, HasDataLayout, Integer, IntegerType, Primitive, ReprOptions};
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
@@ -11,15 +11,19 @@ use rustc_type_ir::{
     RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable,
     TypeVisitableExt, TypeVisitor, UintTy, UniverseIndex, Upcast,
     elaborate::{self, elaborate},
-    inherent::{AdtDef, GenericArg as _, IntoKind, ParamEnv as _, SliceLike, Ty as _},
+    inherent::{
+        AdtDef, Clause as _, GenericArg as _, IntoKind, ParamEnv as _, SliceLike, Ty as _,
+    },
     lang_items::SolverTraitLangItem,
     solve::SizedTraitKind,
 };
+use smallvec::SmallVec;
 use stdx::impl_from;
 
 use crate::{
     ImplTraitId,
     db::{HirDatabase, InternedOpaqueTyId},
+    lower::GenericPredicates,
     next_solver::{
         BoundConst, Clauses, FxIndexMap, ParamEnv, PlaceholderConst, PlaceholderRegion,
         PlaceholderType, PolyTraitRef, StoredClauses, StoredEarlyBinder,
@@ -303,59 +307,6 @@ impl<'db> CoroutineArgsExt<'db> for CoroutineArgs<DbInterner<'db>> {
     }
 }
 
-/// Finds the max universe present
-pub struct MaxUniverse {
-    max_universe: UniverseIndex,
-}
-
-impl Default for MaxUniverse {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MaxUniverse {
-    pub fn new() -> Self {
-        MaxUniverse { max_universe: UniverseIndex::ROOT }
-    }
-
-    pub fn max_universe(self) -> UniverseIndex {
-        self.max_universe
-    }
-}
-
-impl<'db> TypeVisitor<DbInterner<'db>> for MaxUniverse {
-    type Result = ();
-
-    fn visit_ty(&mut self, t: Ty<'db>) {
-        if let TyKind::Placeholder(placeholder) = t.kind() {
-            self.max_universe = UniverseIndex::from_u32(
-                self.max_universe.as_u32().max(placeholder.universe.as_u32()),
-            );
-        }
-
-        t.super_visit_with(self)
-    }
-
-    fn visit_const(&mut self, c: Const<'db>) {
-        if let ConstKind::Placeholder(placeholder) = c.kind() {
-            self.max_universe = UniverseIndex::from_u32(
-                self.max_universe.as_u32().max(placeholder.universe.as_u32()),
-            );
-        }
-
-        c.super_visit_with(self)
-    }
-
-    fn visit_region(&mut self, r: Region<'db>) {
-        if let RegionKind::RePlaceholder(placeholder) = r.kind() {
-            self.max_universe = UniverseIndex::from_u32(
-                self.max_universe.as_u32().max(placeholder.universe.as_u32()),
-            );
-        }
-    }
-}
-
 pub struct BottomUpFolder<'db, F, G, H>
 where
     F: FnMut(Ty<'db>) -> Ty<'db>,
@@ -439,15 +390,9 @@ pub fn sizedness_constraint_for_ty<'db>(
             .and_then(|ty| sizedness_constraint_for_ty(interner, sizedness, ty)),
 
         Adt(adt, args) => {
-            if crate::representability::representability(interner.db, adt.def_id())
-                == Representability::Infinite
-            {
-                return None;
-            }
-
-            adt.struct_tail_ty(interner).and_then(|tail_ty| {
-                let tail_ty = tail_ty.instantiate(interner, args).skip_norm_wip();
-                sizedness_constraint_for_ty(interner, sizedness, tail_ty)
+            adt_sizedness_constraint(interner, adt, sizedness).and_then(|intermediate| {
+                let ty = intermediate.instantiate(interner, args).skip_norm_wip();
+                sizedness_constraint_for_ty(interner, sizedness, ty)
             })
         }
 
@@ -455,6 +400,48 @@ pub fn sizedness_constraint_for_ty<'db>(
             panic!("unexpected type `{ty:?}` in sizedness_constraint_for_ty")
         }
     }
+}
+
+/// A type such that the struct `adt` is `sizedness` if and only if that type is, or `None` when
+/// it always is: rustc's `adt_sizedness_constraint`. Enums and unions always are.
+pub(crate) fn adt_sizedness_constraint<'db>(
+    interner: DbInterner<'db>,
+    adt: super::AdtDef,
+    sizedness: SizedTraitKind,
+) -> Option<EarlyBinder<'db, Ty<'db>>> {
+    let adt_id = adt.def_id();
+    if !matches!(adt_id, hir_def::AdtId::StructId(_)) {
+        return None;
+    }
+    if crate::representability::representability(interner.db, adt_id)
+        == Representability::Infinite
+    {
+        return None;
+    }
+
+    let constraint = adt
+        .struct_tail_ty(interner)?
+        .map_bound(|tail_ty| sizedness_constraint_for_ty(interner, sizedness, tail_ty))
+        .transpose()?;
+
+    // A where-clause bounding the constraint by the trait itself already makes every
+    // well-formed instance `sizedness`.
+    let lang_items = interner.lang_items();
+    let sizedness_trait = match sizedness {
+        SizedTraitKind::Sized => lang_items.Sized,
+        SizedTraitKind::MetaSized => lang_items.MetaSized,
+    };
+    let constraint_ty = *constraint.as_ref().skip_binder();
+    let bounded = GenericPredicates::query_explicit(interner.db, GenericDefId::AdtId(adt_id))
+        .skip_binder()
+        .any(|clause| {
+            clause.as_trait_clause().is_some_and(|trait_clause| {
+                let trait_clause = trait_clause.skip_binder();
+                Some(trait_clause.def_id().0) == sizedness_trait
+                    && trait_clause.self_ty() == constraint_ty
+            })
+        });
+    if bounded { None } else { Some(constraint) }
 }
 
 pub fn apply_args_to_binder<'db, T: TypeFoldable<DbInterner<'db>>>(
@@ -760,7 +747,7 @@ pub fn sizedness_fast_path<'db>(
         // FIXME(sized_hierarchy): this temporarily reverts the `sized_hierarchy` feature
         // while a proper fix for `tests/ui/sized-hierarchy/incomplete-inference-issue-143992.rs`
         // is pending a proper fix
-        if matches!(sizedness, SizedTraitKind::MetaSized) {
+        if matches!(sizedness, SizedTraitKind::MetaSized) && !tcx.features().sized_hierarchy() {
             return true;
         }
 
@@ -797,14 +784,17 @@ pub(crate) fn upcast_choices<'db>(
     interner: DbInterner<'db>,
     source_trait_ref: PolyTraitRef<'db>,
     target_trait_def_id: TraitId,
-) -> Vec<PolyTraitRef<'db>> {
+) -> SmallVec<[PolyTraitRef<'db>; 1]> {
     if source_trait_ref.def_id().0 == target_trait_def_id {
-        return vec![source_trait_ref]; // Shortcut the most common case.
+        return SmallVec::from_buf([source_trait_ref]); // Shortcut the most common case.
     }
 
-    elaborate::supertraits(interner, source_trait_ref)
-        .filter(|r| r.def_id().0 == target_trait_def_id)
-        .collect()
+    let mut choices = SmallVec::new();
+    choices.extend(
+        elaborate::supertraits(interner, source_trait_ref)
+            .filter(|r| r.def_id().0 == target_trait_def_id),
+    );
+    choices
 }
 
 #[inline]

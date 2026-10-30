@@ -26,9 +26,8 @@ mod matchers;
 use hir::{InFile, MacroCallId};
 use hir_expand::{ExpandTo, MacroCallKind, MacroCallLoc, MacroDefKind, builtin::BuiltinAttrExpander};
 use syntax::{
-    AstNode, AstToken as _, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, T,
-    TextSize,
-    ast::{self, HasName as _},
+    NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextSize,
+    view::{self as ast, AstNode as _, AstToken as _, HasName as _},
 };
 
 use crate::{
@@ -42,7 +41,7 @@ use crate::{
 /// and those of its early and late lint passes the parts give: one pass over the trees of
 /// expansions, each call's location read once and its lints picked by the kind of its macro.
 /// Macro definitions are linted in the early pass's one walk ([`definition`]).
-pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
+pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Emitted> {
     // alloc: empty until a lint fires; holds only what fires
     let mut emitted = Vec::new();
     let x86 = asm::x86(walk);
@@ -69,8 +68,8 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
 pub(super) fn definition(
     cx: &Cx<'_, '_>,
     krate: Option<InFile<SyntaxNodePtr>>,
-    tree: &Tree,
-    node: &SyntaxNode,
+    tree: &Tree<'_>,
+    node: ast::Node<'_>,
     out: &mut Vec<Emitted>,
 ) {
     matchers::definition(cx, krate, tree, node, out);
@@ -84,21 +83,22 @@ pub(super) fn crate_at(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Option<InFile<Syntax
 /// `semicolon_in_expressions_from_macros` (`..._from_non_local_macros` for a macro of another
 /// crate): rustc parses what a `macro_rules!` macro called as an expression expands to as one
 /// expression, and when a `;` comes after it, buffers the lint at the `;` and drops it.
-fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &MacroCallLoc) -> Option<Emitted> {
+fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree<'_>, call: MacroCallId, loc: &MacroCallLoc) -> Option<Emitted> {
     let db = cx.db;
     let MacroDefKind::Declarative(def, _) = loc.def.kind else { return None };
     let MacroCallKind::FnLike { expand_to, .. } = &loc.kind else { return None };
-    let node = loc.to_node(db);
-    // clone: a cursor's refcount (no allocation), once per macro call
-    let mac = ast::MacroCall::cast(node.value.clone())?;
-    let is_trailing = is_trailing(&mac);
+    let node = loc.to_node_view(db);
+    let mac = ast::MacroCall::cast(node.value)?;
+    let is_trailing = is_trailing(mac);
     let semicolon = match expand_to {
         ExpandTo::Expr => {
             let expanded = call.parse_macro_expansion(db);
             if expanded.err.is_some() || !expanded.value.0.errors().is_empty() {
                 return None;
             }
-            let semicolon = dropped_semicolon(cx, call)?;
+            // The `;` the front end drops from the end of an expression's expansion
+            // (`without_last_semicolon` in `crates/hir-expand/src/lib.rs`), with its span.
+            let semicolon = expanded.value.1.dropped_semicolon?;
             span_of_token(cx, call, semicolon)
         }
         // The front end expands a block's trailing macro call as statements, where rustc
@@ -119,8 +119,7 @@ fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &Mac
     };
     let mut diag = Diag::lint(lint, "trailing semicolon in macro used in expression position", semicolon);
     if is_trailing {
-        // alloc: the lint's text, for a lint found
-        let name = def.to_node(db).name().map(|it| it.text().to_string())?;
+        let name = def.to_view(db).name()?.text();
         diag.note("macro invocations at the end of a block are treated as expressions");
         // alloc: the lint's text, for a lint found
         diag.note(format!(
@@ -134,31 +133,11 @@ fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &Mac
 
 /// Whether rustc's `flat_map_stmt` expands `call` with `is_trailing_mac`: it is the trailing
 /// expression of a block, not in braces (`parse_stmt_mac` makes `m! {}` a statement).
-fn is_trailing(call: &ast::MacroCall) -> bool {
+fn is_trailing(call: ast::MacroCall<'_>) -> bool {
     let Some(expr) = call.syntax().parent().and_then(ast::MacroExpr::cast) else { return false };
     let Some(list) = expr.syntax().parent().and_then(ast::StmtList::cast) else { return false };
     let braced = call.token_tree().and_then(|it| it.left_delimiter_token()).is_some_and(|it| it.kind() == T!['{']);
     !braced && list.tail_expr().is_some_and(|it| it.syntax() == expr.syntax())
-}
-
-/// The `;` the front end drops from the end of what the `macro_rules!` call `call` expands to
-/// as an expression (`without_last_semicolon` in `crates/hir-expand/src/lib.rs`), with its
-/// span, from the macro's transcription.
-fn dropped_semicolon(cx: &Cx<'_, '_>, call: MacroCallId) -> Option<span::Span> {
-    let db = cx.db;
-    let loc = call.loc(db);
-    let MacroDefKind::Declarative(def, _) = loc.def.kind else { return None };
-    let (arg, _, span) = call.macro_arg_considering_derives(db, &loc.kind);
-    let expanded = def.decl_macro_expander(db, loc.def.krate).expand(db, arg, call, span);
-    if expanded.err.is_some() {
-        return None;
-    }
-    match expanded.value.0.token_trees().iter().last()? {
-        hir_expand::tt::TtElement::Leaf(hir_expand::tt::Leaf::Punct(punct)) if punct.char == ';' => {
-            Some(punct.span)
-        }
-        _ => None,
-    }
 }
 
 /// [`Cx::span`] of a token of the expansion of `call` by its span: where it is written when it
@@ -190,7 +169,7 @@ fn span_of_token(cx: &Cx<'_, '_>, call: MacroCallId, token: span::Span) -> Span 
 /// `incomplete_include`: rustc parses what `include!` called as an expression or a statement
 /// reads as one expression (`ExpandInclude::make_expr`), and buffers the lint at the first
 /// token of the file after it.
-fn incomplete_include(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &MacroCallLoc) -> Option<Emitted> {
+fn incomplete_include(cx: &Cx<'_, '_>, tree: &Tree<'_>, call: MacroCallId, loc: &MacroCallLoc) -> Option<Emitted> {
     let db = cx.db;
     if !loc.def.is_include() {
         return None;
@@ -198,13 +177,11 @@ fn incomplete_include(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &Mac
     let MacroCallKind::FnLike { expand_to, .. } = &loc.kind else { return None };
     let first = tree.root.children().next();
     let expr = match expand_to {
-        // clone: a cursor's refcount (no allocation), once per macro call
-        ExpandTo::Expr if ast::Expr::can_cast(tree.root.kind()) => tree.root.clone(),
+        ExpandTo::Expr if ast::Expr::can_cast(tree.root.kind()) => tree.root,
         ExpandTo::Expr => first.filter(|it| ast::Expr::can_cast(it.kind()))?,
         ExpandTo::Statements => match first? {
             it if ast::Expr::can_cast(it.kind()) => it,
-            // clone: a cursor's refcount (no allocation), once per macro call
-            it => ast::ExprStmt::cast(it)?.expr()?.syntax().clone(),
+            it => ast::ExprStmt::cast(it)?.expr()?.syntax(),
         },
         _ => return None,
     };
@@ -213,25 +190,24 @@ fn incomplete_include(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &Mac
     if read.file_id != file {
         return None;
     }
-    let source = cx.sema.parse(file);
+    let source = cx.vsema.parse(file);
     let rest = next_token(source.syntax(), read.range.end())?;
     let span = cx.span_in_file(file.file_id(db), rest.text_range());
     let mut diag = Diag::lint("incomplete_include", "include macro expected single expression in source", span);
-    let at = enclosing(cx, loc.to_node(db));
+    let at = enclosing(cx, loc.to_node_view(db));
     source_fact(cx, &mut diag, at);
     Some(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at))
 }
 
 /// The first token of `root` from `offset` that rustc's lexer gives: not white space nor a
 /// comment, but a doc comment.
-fn next_token(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
+fn next_token(root: ast::Node<'_>, offset: TextSize) -> Option<ast::Token<'_>> {
     root.descendants_with_tokens().filter_map(NodeOrToken::into_token).find(|token| {
         if token.text_range().start() < offset {
             return false;
         }
         match token.kind() {
-            // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
-            SyntaxKind::COMMENT => ast::Comment::cast(token.clone()).is_some_and(|it| it.kind().doc.is_some()),
+            SyntaxKind::COMMENT => ast::Comment::cast(*token).is_some_and(|it| it.kind().doc.is_some()),
             kind => !kind.is_trivia(),
         }
     })
@@ -251,20 +227,19 @@ fn duplicate_attribute(cx: &Cx<'_, '_>, walk: &Walk<'_>, loc: &MacroCallLoc) -> 
         _ => return None,
     };
     let MacroCallKind::Attr { ast_id, censored_attr_ids, .. } = &loc.kind else { return None };
-    let node = loc.to_node(db);
+    let node = loc.to_node_view(db);
     // rustc does not look for it on an item that is a statement.
     if node.value.parent().is_some_and(|it| matches!(it.kind(), SyntaxKind::STMT_LIST | SyntaxKind::MACRO_STMTS)) {
         return None;
     }
-    // clone: a cursor's refcount (no allocation), once per macro call
-    let owner = ast::AnyHasAttrs::cast(node.value.clone())?;
-    let (_, invoked) = censored_attr_ids.invoc_attr().find_attr_range(db, loc.krate, *ast_id);
+    let owner = ast::AnyHasAttrs::cast(node.value)?;
+    let (_, invoked) = censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id);
     let invoked = invoked.syntax().text_range();
-    let (meta, attr) = walk.attrs(&owner).into_iter().find(|(meta, _)| {
-        meta.syntax().text_range() != invoked && meta.simple_name().is_some_and(|it| it.as_str() == name)
-    })?;
+    let (meta, attr) = walk
+        .attrs(owner)
+        .find(|(meta, _)| meta.syntax().text_range() != invoked && meta.simple_name() == Some(name))?;
     // An attribute `cfg_attr` gives is spanned by what `cfg_attr` holds of it.
-    let range = match meta.syntax().parent().is_some_and(|it| it == *attr.syntax()) {
+    let range = match meta.syntax().parent().is_some_and(|it| it == attr.syntax()) {
         true => attr.syntax().text_range(),
         false => meta.syntax().text_range(),
     };
@@ -277,7 +252,7 @@ fn duplicate_attribute(cx: &Cx<'_, '_>, walk: &Walk<'_>, loc: &MacroCallLoc) -> 
 /// The node rustc's expansion buffers a lint of the macro call or attribute macro `node` at
 /// (`lint_node_id`): the node around the call, not the call itself (it is replaced), and for
 /// a call at the top of an expansion, the node around the call that expansion is of.
-fn enclosing(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> InFile<SyntaxNodePtr> {
+fn enclosing(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>) -> InFile<SyntaxNodePtr> {
     let mut node = node;
     loop {
         let parent = node.value.parent();
@@ -286,11 +261,11 @@ fn enclosing(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> InFile<SyntaxNodePtr>
                 node = node.with_value(parent);
             }
             Some(parent) if parent.parent().is_some() || node.file_id.macro_file().is_none() => {
-                return InFile::new(node.file_id, SyntaxNodePtr::new(&parent));
+                return InFile::new(node.file_id, ast::ptr(parent));
             }
             _ => match node.file_id.macro_file() {
-                Some(call) => node = call.loc(cx.db).to_node(cx.db),
-                None => return InFile::new(node.file_id, SyntaxNodePtr::new(&node.value)),
+                Some(call) => node = call.loc(cx.db).to_node_view(cx.db),
+                None => return InFile::new(node.file_id, ast::ptr(node.value)),
             },
         }
     }

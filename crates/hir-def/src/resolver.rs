@@ -12,7 +12,7 @@ use intern::{Symbol, sym};
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use span::SyntaxContext;
-use syntax::{SyntaxKind, ast::HasName};
+use syntax::{SyntaxKind, view::HasName};
 
 use crate::{
     AdtId, AstIdLoc, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId,
@@ -876,7 +876,7 @@ impl<'db> Resolver<'db> {
             .extern_crate_decls()
             .filter_map(|id| {
                 let loc = id.lookup(db);
-                let extern_crate = loc.source(db);
+                let extern_crate = loc.source_view(db);
                 // If there is a rename (`as x`), extract the renamed name, or remove the `extern crate`
                 // if it is an underscore.
                 extern_crate

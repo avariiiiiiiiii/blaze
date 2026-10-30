@@ -3,6 +3,7 @@
 
 use std::hash::Hash;
 
+use blaze_ids::ContentId;
 use span::Edition;
 use syntax::{SyntaxError, ast};
 use vfs::FileId;
@@ -90,5 +91,23 @@ impl EditionedFileId {
     #[inline]
     pub fn edition(self, db: &Db) -> Edition {
         self.field(db).edition()
+    }
+
+    /// Hands the file's next [`EditionedFileId::parse`] a tree already made of its text, in
+    /// full and in this edition (an edit's tree reparsed in place, `blaze_intent::Seed`):
+    /// `parse` returns that tree while the caller holds it, instead of parsing again. `content`
+    /// is the [`FileText::content`](crate::FileText::content) the tree was made for. Nothing is
+    /// taken, and it is `false`, when the file's text has moved on from it, the tree's text is
+    /// not the file's, or the file already has a live parse in this edition. What `parse`
+    /// returns is the same either way: debug builds check a seed against a whole parse.
+    pub fn seed_parse(
+        self,
+        db: &Db,
+        content: ContentId,
+        parse: &syntax::Parse<ast::SourceFile>,
+    ) -> bool {
+        let (file_id, edition) = self.unpack(db);
+        let input = db.file_text(file_id);
+        input.content(db) == content && input.reparse_field(db).seed(input.text(db), edition, parse)
     }
 }

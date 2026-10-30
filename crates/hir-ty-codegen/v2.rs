@@ -35,6 +35,7 @@ pub(crate) mod fold;
 pub(crate) mod frontend;
 pub(crate) mod hashes;
 pub(crate) mod linked;
+mod lowered;
 pub(crate) mod places;
 pub(crate) mod refs;
 pub(crate) mod release;
@@ -51,8 +52,13 @@ pub use backend::Backends;
 pub use frontend::{BodyChecks, Databases, HirFrontend};
 pub use hashes::ItemHashes;
 pub use linked::LinkInputs;
-pub use roots::{RootKind, RootTest, Roots};
-pub use toolchain::{select, toolchain};
+pub use lowered::{Lowering, lowered};
+pub use roots::{RootKind, RootTest, Roots, proc_macros as proc_macro_list};
+pub use toolchain::{Runs, select, toolchain};
+#[cfg(feature = "llvm")]
+pub use crate::llvm::pgo::Profile;
+#[cfg(feature = "llvm")]
+pub use release::{give_profile, profile_id};
 
 /// What the items lane says of the front end's items by content (docs/v2/plan/lanes/items.md): the
 /// keys the code generator puts in place of the database's dense ids, which differ from one
@@ -197,18 +203,20 @@ pub struct HirStatic(pub StaticId);
 pub(crate) enum Prepared {
     Cranelift(Box<Function>),
     Llvm(Box<Function>),
+    /// For copy-and-patch (`blaze_stencil`): prepared as for Cranelift, over the same IR.
+    Stencil(Box<Function>),
 }
 
 impl Prepared {
     pub(crate) fn function(&self) -> &Function {
         match self {
-            Prepared::Cranelift(it) | Prepared::Llvm(it) => it,
+            Prepared::Cranelift(it) | Prepared::Llvm(it) | Prepared::Stencil(it) => it,
         }
     }
 
     pub(crate) fn into_function(self) -> Box<Function> {
         match self {
-            Prepared::Cranelift(it) | Prepared::Llvm(it) => it,
+            Prepared::Cranelift(it) | Prepared::Llvm(it) | Prepared::Stencil(it) => it,
         }
     }
 }
@@ -231,6 +239,9 @@ pub(crate) struct Function {
     /// The sanitizers of the unit's set that are off for it: what its `#[sanitize(.. = "off")]`
     /// turns off, and SanitizerCoverage for a `__sanitizer_*` symbol. None without a set.
     pub(crate) unsanitized: blaze_codegen::settings::Sanitizers,
+    /// The target features its code is compiled with: its unit's (`Toolchain::features`) and
+    /// what its `#[target_feature(enable)]` turns on.
+    pub(crate) features: crate::Features,
     /// Where [`release::summarize`] leaves what [`release::emit`] takes up.
     pub(crate) release: release::Kept,
     /// Whether a fold may give it another function's code: not where its address is

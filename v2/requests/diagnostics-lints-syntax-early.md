@@ -16,6 +16,7 @@ suggestion there, but at the wrong span; the test is left out of
 
 > forwarded to db: `crates/hir-expand/` (the mbe transcription's spans) is lane db's.
 > forwarded to format (db-next2): the fix is in `crates/mbe` (`transcriber.rs`, a `stmt` fragment transcribed in an invisible group spanned by the metavariable) and `syntax-bridge`, both format's. hir-expand takes the span map as given. It is the same change as db-dispatch's "db-expand 16" forward to format.
+> checked by db-audit-other (22:40): in the tree, on format's side, and hir-expand needs nothing. `crates/mbe` sends a `stmt` or `block` fragment out in an invisible group spanned by its metavariable (`TokensOrigin::Grouped`, `expander.rs:291-293`, `expander/matcher.rs:1199`, `expander/transcriber.rs:74`). Its test is `a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables` (`mbe/src/tests.rs:634`). The UI test can go back into `tests/lints/syntax/early/builtin.rs` (diagnostics').
 
 ## diagnostics-lints-syntax-early: the `;` hir-expand drops from an expression expansion (speed)
 

@@ -1,0 +1,57 @@
+[package]
+name = "blaze-macro-eval"
+description = "Proc macros run on blaze's own compiler, in process: the macro's real code and the real `proc_macro` client on the MIR evaluator, answered by blaze's server, isolated by construction"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+ra-ap-rustc_lexer.workspace = true
+rustc-hash.workspace = true
+rustc-literal-escaper.workspace = true
+unicode-normalization.workspace = true
+
+base-db.workspace = true
+blaze-cas.workspace = true
+blaze-core.workspace = true
+blaze-expand.workspace = true
+blaze-ids.workspace = true
+blaze-usercode.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
+intern.workspace = true
+load-cargo.workspace = true
+salsa.workspace = true
+span.workspace = true
+tt.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-macro-wasm.workspace = true
+blaze-query.workspace = true
+blaze-units.workspace = true
+blaze-vfs.workspace = true
+native-proc-macro.workspace = true
+paths.workspace = true
+proc-macro-api.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

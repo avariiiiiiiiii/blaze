@@ -33,7 +33,7 @@ mod transform;
 pub mod type_name;
 
 pub use eval::{
-    Evaluator, MirOutput, interpret_mir,
+    Evaluator, MirOutput, foreign, interpret_mir,
     machine::{
         Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Plain, Ptr, RetagMode, Shadow,
         Site, Stop, TypedCx,

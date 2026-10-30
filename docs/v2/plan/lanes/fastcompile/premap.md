@@ -27,21 +27,23 @@ and this file. Hooks in other lanes are requests in `v2/requests/fastcompile.md`
 (a field added is a compile error in `key.rs` until it is hashed), every list sorted and
 length-prefixed (rustflags excepted: their order is their meaning).
 
-- `GraphKey` (`"blaze v2 premap graph 1"`): for every dependency unit, its package id, target,
+- `GraphKey` (`"blaze v2 premap graph 2"`): for every dependency unit, its package id, target,
   features, cfgs and rustflags. Then:
   - the toolchain (`settings::Toolchain`: the nightly's and blaze's code identity, triple, arch,
-    cpu, target features, backend versions, frame pointers, relocation model);
+    cpu, target features, backend versions, frame pointers, relocation model, stencils);
   - every codegen settings id the image's functions were compiled under;
   - blaze-link's code identity;
   - the output it links for (format, arch, kind and entry or name and exports, interpreter,
-    platform and versions, incremental, debug info, live, tags, stack, Windows subsystem);
+    platform and versions, incremental, debug info, live, tags, stack, Windows subsystem, the
+    dev run's arena, cell and fixed sizes or none, triple, exec log);
   - the base address;
   - the run loader's thread-local bias;
   - every native input of the link line: content id, kind (object, archive and whether whole,
     shared library and whether as-needed) and place on the line;
   - the span side tables positions are filled from.
-- `ImageKey` (`"blaze v2 premap image 1"`, the store's key and the memory object's name): the
-  graph key, then every function by instance key and code hash, and every static by item,
+- `ImageKey` (`"blaze v2 premap image 2"`, the store's key and the memory object's name): the
+  graph key, then every function by instance key, code hash and the digest of the code hashes
+  it inlined (`inlined_digest`), and every static by item,
   instance and definition (value, relocations, alignment, mutability, thread-local, section,
   the data it points at). Then every global name the image defines and what it is, and every
   debug name.
@@ -50,10 +52,11 @@ Images of one graph differ only in which instances they hold: a build that needs
 the graph's image lacks links it with the workspace this time (`spilled`), and the image of its
 own key is made in the background.
 
-Tested: `graph_key_changes_with_every_input` changes each of the 35 inputs alone and checks
+Tested: `graph_key_changes_with_every_input` changes each of the 40 inputs alone and checks
 every key differs from all the others; `image_key_changes_with_every_instance` does the same
-for the image key's 11; `graph_key_ignores_order_of_sets` checks order-free lists are and
-rustflags aren't.
+for the image key's 13; `graph_key_ignores_order_of_sets` checks order-free lists are and
+rustflags aren't. Both keys build their sorted records on a `Tag::Link` frame:
+`a_graph_key_allocates_nothing_of_the_heap` and `an_image_key_allocates_nothing_of_the_heap`.
 
 ## Which pieces are the image's
 
@@ -69,8 +72,16 @@ aren't generic and belong to their crate.
   ownership as above rules it out. Names outside blaze's code (`Extern`, `Weak`) stay open,
   bound by the run (`__rg_alloc` from the workspace's `#[global_allocator]`, `malloc` from
   libc).
-- `workspace_part`, given an image's table, takes everything the table lacks. Every piece is in
-  exactly one of the two, so every function and static has one address.
+- `workspace_part`, given an image, takes everything its table lacks. Every piece is in
+  exactly one of the two, so every function and static has one address. A piece the table
+  holds must be the image's own, checked against the slot's content and debug references
+  without computing the image key: a function's inlined digest, a static's definition, a debug
+  name, and every Rust name the image defines (its value and kind, and none the build lacks).
+  An init or fini entry of the image with Rust's tie must be one of the build's statics. Any
+  other is `Fit::Stale`, and the build makes its own image. Pieces are sorted into the lists in
+  parallel above 4096, each list allocated once at its length
+  (`a_hit_allocates_its_lists_and_nothing_per_piece`); the parts borrow the build's names
+  (`splitting_a_build_copies_no_name`).
 
 ## The prelink and the image
 
@@ -81,7 +92,10 @@ collides with other code memory a run maps. It ends at `0x80_0000_0000`, the top
 address space (the smallest AArch64 Linux configures), and stays away from where loaders put
 executables, libraries, stacks and heaps. The workspace image is made at a base just past the
 dependency image, so calls between them stay within reach. It goes through a hook (`Prelink`,
-`fastcompile-premap 1`) whose stage runs in parallel, as any full link does. What comes back is
+`fastcompile-premap 1`) whose stage runs in parallel, as any full link does. `prelink::Link`
+implements it with `blaze_link::premap::prelink`, whose types mirror premap's field for field.
+The workspace image is linked by `blaze_link::Image::beside` against the dependency image's
+`View`, which is its `blaze_link::Outside` (`fastcompile-premap 2`). What comes back is
 checked against what was asked:
 
 - every function and static is placed;
@@ -91,12 +105,15 @@ checked against what was asked:
 - every init piece, thread-local template, unwind range and Mach-O thread-local descriptor lies
   inside the image.
 
-It is then encoded as one value: a 240-byte header (magic, version, format, arch, key, base,
-granule, directory) and fixed-layout records. `View::parse` checks every offset, length, name
+It is then encoded as one value: a 288-byte header (magic, version 2, format, arch, key, base,
+granule, the count of Rust names it defines, a directory of 13 sections) and fixed-layout
+records, the segments' bytes last and page-aligned. Everything before them is the metadata, and
+the bytes are written in parallel 1 MiB pieces. `View::parse` checks every offset, length, name
 and address against the bytes and the key before anything reads them.
 
 The symbol table is open-addressed, at most half full, in 64-byte slots: id, value, size,
-line order, kind, strength. A slot is found by the first 8 bytes of its id: the instance key,
+line order, kind, strength, and references (from 1, 0 for none) into the content ids and debug
+names the image was made of. The prelink's placement check is one probe per piece. A slot is found by the first 8 bytes of its id: the instance key,
 or a domain-separated hash of a static's item and instance or of a global name. A workspace
 link's outside reference costs one probe, usually one cache line. Parsing checks every slot is
 reachable from its probe start and of a kind there is.
@@ -207,19 +224,24 @@ check the format.
 ## Rebuilding only when the key changes
 
 `cache.rs`, `dev.rs`. The machine's `Images` holds one opened image per key (parsed, checked,
-its memory object filled), shared by every view and run, never one per view. `dev::plan`:
+its memory object filled, only its metadata kept in memory), shared by every view and run,
+never one per view. `dev::plan`:
 
-1. splits the build and keys its image;
-2. if that image is open, uses it;
-3. else uses the newest image of its graph and links the spilled instances with the workspace;
-   if anything spilled, the image of its key is claimed and made in the background;
-4. with no image of the graph, makes one (from the store if it is there, else by the prelink).
-   Another build meanwhile waits rather than making it twice.
+1. keys the graph and takes the newest image of it;
+2. if that image's pieces are the build's own (above) and it holds all of them, links the
+   workspace against it, with no image key computed;
+3. if it holds them but some spilled, links the spilled instances with the workspace, keys the
+   build's own image and claims it to be made in the background;
+4. if it is stale, or there is no image of the graph, keys the build's own image and uses it if
+   open, else makes it (from the store if it is there, else by the prelink). Another build
+   meanwhile waits rather than making it twice.
 
 A finished image replaces its graph's previous one, which closes when no run maps it. At most 8
 graphs are kept (a machine's branches and toolchains), the least recently used closed first. A
 failed image fails again for its key: no whole link takes its place. Tested:
-`an_image_is_made_once_per_key_and_again_only_when_a_build_needs_more` and
+`an_image_is_made_once_per_key_and_again_only_when_a_build_needs_more`,
+`an_image_serves_only_a_build_whose_pieces_it_holds_are_its_own`,
+`a_build_the_newest_image_does_not_serve_makes_its_own` and
 `a_failed_image_fails_again_and_never_falls_back`.
 
 ## Limits, each an error naming it
@@ -229,6 +251,19 @@ failed image fails again for its key: no whole link takes its place. Tested:
   blaze-link. Without either, blaze-link's range check fails the link; nothing is silently
   redirected.
 - A TpOff reference from the image to a library's thread-local is refused (above).
+- Thread-locals of both images are reached at fixed offsets from the thread pointer (initial-
+  and local-exec). A dynamic access (a `__tls_get_addr` pair, a TLS descriptor such as
+  AArch64's `TlsDescCall`) is blaze-link's error, never a slower path.
+- The workspace executable is not slid (no PIE ASLR): its references into the image are
+  absolute addresses.
+- A PC-relative reference inside the image to a name it defines weakly can't be rebound to a
+  stronger workspace definition. Only GOT cells and pointers in writable data are binds. This
+  is not an error yet: a strong workspace definition of such a name must refuse the link
+  (`fastcompile-sol-premap 3`), or the run differs from a whole link.
+- A native section only the workspace refers to is not in the image: link its archive whole
+  into the image, or name it.
+- PE images register no `.eh_frame` ranges, and their CRT init sections aren't checked to be
+  init arrays; this is untested.
 - A `__start_`/`__stop_` section spanning both sides is refused (above).
 - wasm has no image: code is reached by index, not mapped (`prelink::base`).
 
@@ -242,3 +277,144 @@ In `v2/requests/fastcompile.md`:
 4. inproc: the start and the placement;
 5. cargo: the dev-run path;
 6. coordinator: the workspace dependency.
+
+## Speed of light
+
+Nothing here was run: costs are counted from the code and the machine. The machine and unit
+costs are those of
+[speed-of-light-infer-relate.md](../db/speed-of-light-infer-relate.md): an Apple M5 Max, 6
+performance cores at about 4.5 GHz, 16 MB L2 per cluster, DRAM about 100 ns, sustained IPC
+about 3.5. Memory bandwidth is about 10 GB/s from one core and well over 100 GB/s from all of
+them.
+
+The workload is a mid-size dev program:
+
+- \(F \approx 100\,000\) dependency function instances and 2 000 workspace ones;
+- \(S \approx 5\,000\) dependency statics, about 100 bytes each (0.5 MB);
+- \(N \approx 2\,000\) Rust names;
+- one debug name per function, about 60 bytes each;
+- an image of \(W \approx 85\) MB with \(R \approx 1.4\) million relocations, about 800 000 of
+  them to distinct targets;
+- a table of about 210 000 entries in 512 Ki slots (32 MB). It is not in cache on a dev run:
+  each probe is a random line of DRAM, overlapped by the core's memory-level parallelism.
+
+### Unit costs
+
+| step | cost |
+|---|---|
+| a table probe in a cold 32 MB table, about 25 in flight per core | about 4 ns |
+| compare a 32-byte id or content ref (L1) | about 1 ns |
+| read and compare a debug name of about 60 bytes (its line of the strings section) | about 9 ns |
+| BLAKE3 of one short record: hasher, one block, finalize | about 80 to 100 ns |
+| BLAKE3 streamed over long input, one core | about 1.5 GB/s |
+| one `mmap` of a resident object at a fixed address | about 2 µs |
+| a minor fault on a fresh zero page (16 KiB) | about 0.5 µs |
+| apply one relocation: read the target from a hot array, patch 4 or 8 bytes | about 5 ns |
+
+### The hit: deciding a dev run's image
+
+A hit is a dev run whose dependencies are unchanged, the common case. The work that can't be
+skipped, with codegen's interface as it is (it hands over pieces, not their digests):
+
+- the graph key: a few hundred records of units and settings, sorted and hashed, about 30 µs;
+- per built function, one probe to tell the image's from the workspace's, plus a compare of the
+  slot's content ref against the digest of what it inlined;
+- per debug name the image holds, one probe and one string compare;
+- per static, its symbol id (one BLAKE3) and its definition (one BLAKE3 over its value and
+  relocations), then a probe and a compare.
+
+So the bound on one core is
+
+\[ T_{\text{hit}} \approx 30\ \mu s + (4 + 1)\,F + (4 + 9)\,F + 200\,S\ \text{ns} \approx
+0.03 + 0.5 + 1.3 + 1.0 \approx 2.8\ \text{ms}, \]
+
+and on \(c\) cores, every term but the graph key split evenly,
+
+\[ T_{\text{hit}}(c) \approx 30\ \mu s + 2.8\ \text{ms} / c \approx 0.5\ \text{ms at } c = 6. \]
+
+Nothing in it allocates per piece: the lists the link takes are allocated once each, at their
+lengths.
+
+**What the code did.** `dev::plan` split the build and computed the image key on every run. It
+sorted and hashed about 18 MB of records (every function's key and code hash, every static's
+definition, every debug name) and cloned every name into the parts. That is about 95 ms on one
+core, a sequential hash, about 35 times the one-core bound and 190 times the six-core one.
+
+**What it does now:**
+
+- It keys the graph first, on a `Tag::Link` frame with no heap allocation, and takes the
+  newest image of the graph.
+- `workspace_part` checks every piece against that image's slots as above, without computing
+  the image key. It sorts pieces in parallel (rayon, in pieces of 4096) into one class byte
+  each, then builds each list once at its exact length.
+- Only a spilled or stale build computes the image key, and that is the cold path's cost.
+
+The counted cost is the bound's terms plus one sequential pass over the class bytes to build the
+lists, about 0.1 ms for 100 000 functions. On one core that is within 5% of the bound. On six
+cores it is about 0.6 ms against 0.5 ms, 20% over. That pass stays sequential because a
+parallel filter-collect allocates per split, and the budget test holds the hit to one
+allocation per list (`a_hit_allocates_its_lists_and_nothing_per_piece`).
+
+**Closer than the bound.** Statics cost a third of the bound because their definitions are
+hashed on every run. Debug names cost half of it because they are compared as strings. If
+codegen gave a sorted digest per piece (function, static and debug name, keyed by instance), the
+hit would be a merge of two sorted arrays at memory bandwidth, about 35 µs on six cores. That is
+a request to codegen (`fastcompile-sol-premap 1`).
+
+### Mapping the image at start
+
+The work that can't be skipped is one fixed map per segment of the image, about four: code,
+read-only data, data and thread-local templates. Each segment's pages are already resident in
+the image's memory object.
+
+\[ T_{\text{map}} \approx 4 \cdot 2\ \mu s \approx 8\ \mu s. \]
+
+`Memory::maps` gives exactly one `FixedMap` per segment, into a list allocated once at its
+length, which is the bound. Pages the run touches then fault in as minor faults, one per 16 KiB
+page touched. That cost belongs to blaze-inproc's `CodeMemory`, and with huge pages it would be
+one fault per 2 MiB.
+
+The image is opened once per key per machine, not per run. That costs one copy of the metadata
+(the 32 MB table plus about 6 MB of names, about 4 ms) and a fill of the memory object (85 MB, about 8.5 ms from one core).
+An opened `Ready` keeps only the metadata, so a machine with 8 graphs open holds 8 tables, not
+8 images.
+
+### The cold prelink
+
+The cold prelink runs once per image key, when dependencies change. It is bound by the bytes
+written and the relocations applied:
+
+\[ T_{\text{prelink}} \approx \frac{W}{B} + \frac{W}{16\ \text{KiB}} \cdot 0.5\ \mu s \cdot
+\frac{1}{c} + \frac{5\ \text{ns} \cdot R}{c} \approx 0.7 + 0.4 + 1.2 \approx 2.3\ \text{ms at }
+c = 6, \]
+
+where \(B \approx 120\) GB/s is the all-core write bandwidth. On top of that, premap's own work
+that can't be skipped is:
+
+- the closure check, one probe of a hashed set per distinct target:
+  \(800\,000 \cdot 10\ \text{ns} / c \approx 1.3\) ms;
+- the table, one slot write per entry: about 1 to 2 ms on one core;
+- BLAKE3 over the image for the store, all cores: about 1 ms.
+
+So the bound for the whole cold path is about 6 ms.
+
+**Against mold and wild.** mold links Chromium (about 2 GB of output) in about 2 s on 16
+cores, about 1 GB/s end to end. At that rate an 85 MB image takes about 85 ms, and wild is
+roughly 1.5 to 2 times faster on debug links. Both start from object files on disk: parsing,
+symbol resolution by string and section merging. Here the pieces are already in memory, keyed
+by instance key, so the bound is set by bytes and relocations alone, an order of magnitude
+under a whole-program linker.
+
+**What the code does.** `image_part` checks each function's and static's relocation targets
+(`Relocs::targets()`, each target once) against open-addressed sets on the frame, in parallel.
+Before, it checked every row with a binary search, about 80 ms. The prelink's placement check
+is one table probe per piece; before, it sorted and binary-searched. `encode` writes the image
+once, copying the segments in parallel 1 MiB pieces into a zeroed buffer. `Job::make` opens the
+image from the bytes and moves them into the store, with no clone (before, it copied all 85 MB).
+
+Still off the bound: the segments' bytes are written three times. blaze-link writes them into
+its own buffers, `encode` copies them into the image, and the memory object is filled from that.
+That is about 2.5 times the write term, a few milliseconds. Writing once needs blaze-link to
+write its segments into a buffer premap gives it (`fastcompile-sol-premap 2`). A store hit
+opens the image from the store's own bytes (`Shelf::get_image` lends them), so it copies only
+the metadata and the memory object's fill.

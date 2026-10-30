@@ -114,6 +114,8 @@ longer derives `Clone`. Requests 5 and 6 explain why two types still derive it.
 
 > forwarded to usercode-mem (from requests, pass 17; told by tmux).
 > rerouted (usercode): to fastcompile (`crates/blaze-global/`); told by tmux.
+> applied by fastcompile-sol-global, 2026-10-29, as `self::given()`: the test binds
+> `let given = given();` above, so a bare `given()` would call the local value.
 
 ## 5. `blaze-cargo` (cargo): the clones that keep `run::Value`, `run::OutFile` and `run::Spec` `Clone` (optional)
 

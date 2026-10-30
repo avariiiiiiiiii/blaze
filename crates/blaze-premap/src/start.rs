@@ -59,7 +59,7 @@ pub fn tls_parts(
     for (tls, offset) in parts {
         let end = offset.checked_add(tls.size);
         if tls.align > reserve.align || !offset.is_multiple_of(tls.align) || end.is_none_or(|end| end > reserve.size) {
-            return Err(PremapError::new(format!(
+            return Err(PremapError::of(format_args!(
                 "the run's loader keeps {} bytes aligned to {} for thread-locals, and they need {} bytes \
                  aligned to {} at {offset}",
                 reserve.size, reserve.align, tls.size, tls.align
@@ -125,12 +125,13 @@ pub fn plan<'a>(
     reserve: &TlsReserve,
 ) -> Result<Start<'a>, PremapError> {
     if !workspace.names.is_sorted_by(|a, b| a.0 < b.0) {
-        return Err(PremapError::new("the workspace link's names are not sorted, each once".to_owned()));
+        return Err(PremapError::of(format_args!("the workspace link's names are not sorted, each once")));
     }
     let image_tls = image.tls();
 
-    let mut writes = Vec::new();
-    let mut lookups = Vec::new();
+    let binds = image.binds().count();
+    let mut writes = Vec::with_capacity(binds);
+    let mut lookups = Vec::with_capacity(binds);
     for bind in image.binds() {
         let theirs = workspace
             .names
@@ -140,7 +141,7 @@ pub fn plan<'a>(
         let own = image.get(&SymbolId::name(bind.name));
         let def = match (theirs, own) {
             (Some(a), Some(b)) if a.strength == Strength::Strong && b.strength == Strength::Strong => {
-                return Err(PremapError::new(format!(
+                return Err(PremapError::of(format_args!(
                     "`{}` is defined in the workspace and in a dependency, both strongly",
                     bind.name
                 )));
@@ -161,7 +162,7 @@ pub fn plan<'a>(
                 writes.push((bind.place, def.value.wrapping_add_signed(bind.addend)));
             }
             (Some(_), _) => {
-                return Err(PremapError::new(format!(
+                return Err(PremapError::of(format_args!(
                     "`{}` is bound as {} and defined as {}",
                     bind.name,
                     if bind.kind == BindKind::TpOff { "a thread-local" } else { "an address" },
@@ -169,7 +170,7 @@ pub fn plan<'a>(
                 )));
             }
             (None, BindKind::TpOff) => {
-                return Err(PremapError::new(format!(
+                return Err(PremapError::of(format_args!(
                     "the dependency image reaches the thread-local `{}` of a shared library at a fixed \
                      offset, and a library the run loads has no fixed thread-local offset",
                     bind.name
@@ -181,17 +182,20 @@ pub fn plan<'a>(
         }
     }
 
-    let mut libraries: Vec<(u32, &'a str)> = image.libraries().map(|it| (it.order, it.name)).collect();
+    let mut libraries: Vec<(u32, &'a str)> = Vec::with_capacity(image.libraries().count() + workspace.libraries.len());
+    libraries.extend(image.libraries().map(|it| (it.order, it.name)));
     libraries.extend(workspace.libraries.iter().map(|it| (it.order, it.name.as_str())));
     radix::sort_copy_by_key(&mut libraries, |it| it.0);
     let mut seen = rustc_hash::FxHashSet::default();
-    let libraries = libraries.into_iter().filter(|it| seen.insert(it.1)).map(|it| it.1).collect();
+    let mut once = Vec::with_capacity(libraries.len());
+    once.extend(libraries.into_iter().filter(|it| seen.insert(it.1)).map(|it| it.1));
+    let libraries = once;
 
     let tls = match (workspace.tls, workspace.tls_offset) {
         (Some(tls), Some(offset)) => {
             let expected = workspace_tls_offset(image_tls.as_ref(), tls.align);
             if offset != expected {
-                return Err(PremapError::new(format!(
+                return Err(PremapError::of(format_args!(
                     "the workspace link put its thread-locals at {offset} in the run's area, and after \
                      the dependency image's they start at {expected}"
                 )));
@@ -200,29 +204,31 @@ pub fn plan<'a>(
         }
         (None, None) => tls_parts(reserve, image_tls.as_ref(), None)?,
         _ => {
-            return Err(PremapError::new(
-                "the workspace link has a thread-local template and no place for it, or a place and none".to_owned(),
-            ));
+            return Err(PremapError::of(format_args!(
+                "the workspace link has a thread-local template and no place for it, or a place and none"
+            )));
         }
     };
 
-    let image_init: Vec<InitEntry> = image.init().collect();
-    let image_fini: Vec<InitEntry> = image.fini().collect();
-    let init = merged(&image_init, workspace.init)?;
-    let fini = merged(&image_fini, workspace.fini)?;
-    let mut unwind: Vec<(u64, u64)> = image.unwind().collect();
+    let init = merged(image.init(), image.init().count(), workspace.init)?;
+    let fini = merged(image.fini(), image.fini().count(), workspace.fini)?;
+    let mut unwind = Vec::with_capacity(image.unwind().count() + workspace.unwind.len());
+    unwind.extend(image.unwind());
     unwind.extend_from_slice(workspace.unwind);
-    let mut thread_vars: Vec<(u64, u64)> = image.thread_vars().collect();
+    let mut thread_vars = Vec::with_capacity(image.thread_vars().count() + workspace.thread_vars.len());
+    thread_vars.extend(image.thread_vars());
     thread_vars.extend_from_slice(workspace.thread_vars);
     Ok(Start { libraries, writes, lookups, tls, thread_vars, unwind, init, fini })
 }
 
 /// The cells of both sides' pieces in a whole link's order.
-fn merged(image: &[InitEntry], workspace: &[InitEntry]) -> Result<Vec<u64>, PremapError> {
-    let mut all: Vec<&InitEntry> = image.iter().chain(workspace).collect();
+fn merged(image: impl Iterator<Item = InitEntry>, count: usize, workspace: &[InitEntry]) -> Result<Vec<u64>, PremapError> {
+    let mut all = Vec::with_capacity(count + workspace.len());
+    all.extend(image);
+    all.extend_from_slice(workspace);
     all.sort_by_key(|it| it.sort_key());
     if let Some(pair) = all.windows(2).find(|it| it[0].sort_key() == it[1].sort_key()) {
-        return Err(PremapError::new(format!(
+        return Err(PremapError::of(format_args!(
             "two init pieces, at {:#x} and {:#x}, have one place in a whole link's order",
             pair[0].at, pair[1].at
         )));

@@ -103,6 +103,7 @@ enum Event {
     Offset { addr: u64, prov: Option<u32>, by: i64 },
     Expose { addr: u64, prov: Option<u32> },
     FromExposed { addr: u64, prov: Option<u32> },
+    Freeze { addr: u64 },
     Call,
     Protect { addr: u64, prov: Option<u32>, size: u64 },
     Ret,
@@ -334,6 +335,10 @@ impl<'db> Machine<'db> for Recorder {
         let prov = self.root(addr).filter(|it| self.exposed.contains(it));
         self.events.push(Event::FromExposed { addr, prov });
         prov
+    }
+
+    fn freeze(&mut self, addr: u64) {
+        self.events.push(Event::Freeze { addr });
     }
 
     fn call(&mut self) -> MResult<()> {
@@ -661,6 +666,47 @@ fn main() {
         .position(|it| matches!(*it, Event::Typed { value, .. } if value as u32 == 41))
         .unwrap_or_else(|| panic!("no assignment of `a + 40`: {events:#?}"));
     assert!(free < sum, "`b` is freed at the frame's end, not at its StorageDead: {events:#?}");
+}
+
+/// rustc's interning (`intern_const_alloc_recursive`): a constant's value and what it points
+/// to are read-only, so Miri reports a write through `R as *const u32 as *mut u32`.
+#[test]
+fn a_constant_and_what_it_points_to_are_frozen() {
+    let events = record(
+        r#"
+const R: &u32 = &7;
+fn main() {
+    let r = R;
+    let _x = *r;
+}
+"#,
+    );
+    let copied = made(&events, TyClass::Ref, RetagMode::Default);
+    let pointee = events[..copied.at].iter().position(|it| *it == Event::Freeze { addr: copied.to });
+    assert!(pointee.is_some(), "`&7` is not frozen before `R` is used: {events:#?}");
+    let frozen = events.iter().filter(|it| matches!(it, Event::Freeze { .. })).count();
+    assert!(frozen >= 2, "`R`'s own copy is not frozen: {events:#?}");
+}
+
+/// A static is read-only unless it is `static mut` (or not `Freeze`), as rustc interns it.
+#[test]
+fn a_static_is_frozen_and_a_static_mut_is_not() {
+    let events = record(
+        r#"
+static A: u32 = 1;
+static mut B: u32 = 2;
+fn main() {
+    let a = &A;
+    let b = unsafe { &raw const B };
+    let _x = *a;
+    let _y = unsafe { *b };
+}
+"#,
+    );
+    let a = made(&events, TyClass::Ref, RetagMode::Default);
+    let b = made(&events, TyClass::RawPtr, RetagMode::Raw);
+    assert!(events.contains(&Event::Freeze { addr: a.to }), "`A` is writable: {events:#?}");
+    assert!(!events.contains(&Event::Freeze { addr: b.to }), "`B` is read-only: {events:#?}");
 }
 
 #[test]

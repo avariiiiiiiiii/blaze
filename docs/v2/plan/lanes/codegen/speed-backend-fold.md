@@ -90,10 +90,15 @@ work and allocations per bucket. Each place constant was hashed with BLAKE3 (`ta
 per member just to compare targets.
 
 **Now**:
-- One BLAKE3 per candidate for its bucket ID (shape, size and the constants' kinds, the kinds
-  given in one update from a reused buffer instead of one update each). That is a hash computed
-  once and carried, then one stable sort of `u32` indices by (settings, bucket ID, key), so each
-  bucket is a run: members as index ranges, with no `Vec` per bucket.
+- No BLAKE3 per candidate (fastcompile-ident-hashcons 4, 2026-10-29): a candidate's bucket ID
+  is its `Form`'s content ID (shape, size and the constants' kinds, without their values,
+  under the unchanged `blaze v2 masked 2`), computed once when the form is interned. The
+  driver keeps one `driver::Masks` across builds, by stored key: an unchanged function is
+  neither read from the store nor hashed again, a new one is hashed once. Then one stable sort
+  of `u32` indices by (settings, bucket ID, key), so each bucket is a run: members as index
+  ranges, with no `Vec` per bucket. The bound for an unchanged build is one lock-free probe
+  per candidate (a 32-byte compare on a tag match, ~10 ns) against a BLAKE3 of its whole
+  masked IR before (~1 cycle a byte, so ~1 µs for a 1 KiB shape): 100× less per candidate.
 - The split is incremental: a part keeps, per constant, whether it varies and its class
   (constants of one class are equal in every member). Whether a member fits is one pass over its
   `n` constants against at most `max_params + 1` representatives, and adding it re-splits

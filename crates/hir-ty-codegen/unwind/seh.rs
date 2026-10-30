@@ -119,7 +119,7 @@ impl Pads {
     const ENTRY: usize = 12;
 
     /// A call that returns to `returns_to` and looks at [`ARRIVAL`] when it has.
-    fn returning(&mut self, returns_to: u32) {
+    pub(super) fn returning(&mut self, returns_to: u32) {
         self.entered(returns_to - 1..returns_to, 0);
     }
 

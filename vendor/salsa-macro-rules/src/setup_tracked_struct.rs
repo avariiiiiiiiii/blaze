@@ -326,8 +326,12 @@ macro_rules! setup_tracked_struct {
             }
 
 
+            // SAFETY: the struct holds only an `Id` and a `PhantomData` of the database lifetime;
+            // nothing is reached through it without the database, which is `Sync`.
             unsafe impl Send for $Struct<'_> {}
 
+            // SAFETY: the struct holds only an `Id` and a `PhantomData` of the database lifetime;
+            // nothing is reached through it without the database, which is `Sync`.
             unsafe impl Sync for $Struct<'_> {}
 
             $zalsa::macro_if! { $generate_debug_impl =>
@@ -338,6 +342,9 @@ macro_rules! setup_tracked_struct {
                 }
             }
 
+            // SAFETY: the struct holds only an `Id` (and a `PhantomData`), which never points into
+            // storage; an old revision's value stays an index that the database checks on use
+            // (`SalsaValue`'s `# Safety` in salsa_value.rs).
             unsafe impl $zalsa::SalsaValue for $Struct<'_> {}
 
             impl<$db_lt> $Struct<$db_lt> {

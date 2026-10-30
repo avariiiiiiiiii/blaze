@@ -27,7 +27,7 @@ use std::{
     },
 };
 
-pub(super) use super::unix::{GRAIN, Reserved, backtrace, descriptor};
+pub(super) use super::unix::{GRAIN, Reserved, backtrace, descriptor, in_image_of};
 use super::{
     Events,
     switch::{Dwarf, Layout, Memory, Writes},
@@ -188,7 +188,7 @@ impl Memory for Os {
         super::unix::bytes(range, self.segments.base())
     }
 
-    fn loaders(&self, at: u64, slots: u64) -> &[u64] {
+    fn loaders(&self, at: u64, slots: u64) -> &[AtomicU64] {
         loaders(at, slots)
     }
 

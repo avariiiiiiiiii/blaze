@@ -9,7 +9,7 @@ use std::{
 use blaze_api::{Artifact, ArtifactKind, Level, UnitProfile};
 use blaze_ids::ContentId;
 use blaze_units::{
-    query::{PackagePlan, UnitPlan, Units},
+    query::{PackagePlan, TestSandbox, UnitPlan, Units},
     schema::{DebugInfo, Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
 };
 use blaze_usercode::run::Value;
@@ -102,6 +102,8 @@ fn package(id: &str, name: &str, dir: &str) -> PackagePlan {
         source: Some(format!("({dir})")),
         is_member: true,
         default_run: None,
+        checksum: None,
+        tests: TestSandbox::default(),
     }
 }
 
@@ -141,6 +143,7 @@ fn build(out: &std::path::Path) -> Units {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
+        sandboxed_tests: false,
     }
 }
 

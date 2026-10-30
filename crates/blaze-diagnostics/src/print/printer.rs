@@ -12,12 +12,12 @@ use hir_def::{AdtId, GenericDefId, ItemContainerId, Lookup, hir::generics::Gener
 use hir_expand::name::Name;
 use hir_ty::next_solver::{
     Binder, BoundRegion, DbInterner, EarlyParamRegion, GenericArg, GenericArgKind, GenericArgs,
-    Region, RegionKind, TraitPredicate, TraitRef, Ty, TyKind,
+    Region, RegionKind, TraitClause, TraitRef, Ty, TyKind,
 };
 use intern::Symbol;
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
-    BoundRegionKind, BoundVarIndexKind, DebruijnIndex, INNERMOST, PredicatePolarity,
+    BoundRegionKind, BoundVarIndexKind, ClausePolarity, DebruijnIndex, INNERMOST,
     TypeSuperVisitable, TypeVisitable, TypeVisitor,
     inherent::{BoundExistentialPredicates as _, IntoKind as _},
 };
@@ -243,6 +243,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 BoundRegionKind::Named(_) if kind == BinderKind::Signature && !self.mode.erase => {
                     late_name(self.db, br)
                 }
+                BoundRegionKind::NamedForPrinting(name) if !self.mode.erase && name.0.as_str() != "'_" => Some(name.0),
                 _ => None,
             };
             let name = own.unwrap_or_else(|| loop {
@@ -677,10 +678,10 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     }
 
     /// rustc's `TraitPredicate` printing: `T: Trait`, `T: !Trait`.
-    pub(crate) fn print_trait_predicate(&mut self, pred: TraitPredicate<'t>) {
+    pub(crate) fn print_trait_predicate(&mut self, pred: TraitClause<'t>) {
         self.print_type(pred.trait_ref.self_ty());
         self.write_str(": ");
-        if pred.polarity == PredicatePolarity::Negative {
+        if pred.polarity == ClausePolarity::Negative {
             self.write_str("!");
         }
         self.print_trait_sugared(pred.trait_ref);

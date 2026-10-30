@@ -167,9 +167,12 @@ impl Steps for Real {
         let writer = cancellable(move || -> Result<(UnitWriter, Vec<Put>), Failed> {
             let mut kept = kept;
             let mut puts = Vec::new();
+            let mut flushed = None;
             if let Some(it) = &mut kept {
                 let later = std::mem::take(&mut it.later);
-                puts = deps::store(&it.lowered, it.deps.take(), &mut it.session, &later, &it.root)?;
+                let (stored, goals) = deps::store(&it.lowered, it.deps.take(), &mut it.session, &later, &it.root)?;
+                puts = stored;
+                flushed = Some(goals);
             }
             let kept = kept.filter(|it| {
                 (Arc::ptr_eq(&it.units, &input.units) || it.units == input.units) && it.config == input.config
@@ -184,22 +187,27 @@ impl Steps for Real {
             let failed = |error| Failed::Error(lower_error(error));
             // A front end kept and moved to the view keeps what it was served: only crates of
             // the build's dependencies were, and moving reads again only the view's files.
-            let (mut lowered, session) = match kept {
-                Some(KeptLowered { session, mut lowered, .. }) => match lowered.refresh(lower()).map_err(failed)? {
-                    true => (lowered, Some(session)),
+            let (mut lowered, session, seeded) = match kept {
+                Some(KeptLowered { session, mut lowered, seeds, .. }) => match lowered.refresh(lower()).map_err(failed)? {
+                    true => {
+                        let seeded = seed(&lowered, seeds);
+                        (lowered, Some(session), seeded)
+                    }
                     false => {
-                        drop((session, lowered));
-                        (load_cargo::v2::lower(lower()).map_err(failed)?, None)
+                        drop((session, lowered, seeds));
+                        (load_cargo::v2::lower(lower()).map_err(failed)?, None, Vec::new())
                     }
                 },
-                None => (load_cargo::v2::lower(lower()).map_err(failed)?, None),
+                None => (load_cargo::v2::lower(lower()).map_err(failed)?, None, Vec::new()),
             };
             let fresh = session.is_none();
             let mut session = match session {
                 Some(session) => session,
                 None => deps::session(&lowered, &input.store)?,
             };
-            let job = Arc::new(Job::new(input.clone(), lowered.crates().clone(), self.shared.clone()));
+            let mut job = Job::new(input.clone(), lowered.crates().clone(), self.shared.clone());
+            job._seeded = seeded;
+            let job = Arc::new(job);
             let waits = graph::Waits::new(&job.graph);
             for unit in 0..job.graph.len() as u32 {
                 if unit % 64 == 0 && input.cancelled.load(Ordering::Relaxed) {
@@ -222,6 +230,7 @@ impl Steps for Real {
                 runs: Vec::new(),
                 macros: Vec::new(),
                 deps,
+                flushed,
             };
             Ok((writer, puts))
         })??;
@@ -229,6 +238,14 @@ impl Steps for Real {
         let front = Arc::new(JobFront(writer.job.clone()));
         Ok(FrontEnd { front, writer, puts })
     }
+}
+
+/// The kept `seeds` a front end moved to their edit's commit took, each as its file's next
+/// parse ([`base_db::EditionedFileId::seed_parse`]); the others are dropped.
+fn seed(lowered: &Lowered, mut seeds: Vec<blaze_intent::Seed>) -> Vec<blaze_intent::Seed> {
+    let db = lowered.db();
+    seeds.retain(|it| base_db::EditionedFileId::new(db, it.file, it.edition).seed_parse(db, it.content, &it.parse));
+    seeds
 }
 
 fn lower_error(error: load_cargo::v2::LowerError) -> ApiError {
@@ -251,6 +268,9 @@ pub(crate) struct KeptLowered {
     /// paths are named from, until the next build lowering into it stores them.
     later: Vec<deps::Later>,
     root: String,
+    /// The trees its job's last edit reparsed in place, for the next build to seed its parses
+    /// with when it moves to the edit's commit.
+    seeds: Vec<blaze_intent::Seed>,
 }
 
 /// What a task reads the front end through ([`Steps::Reader`]): a shared reference to the job's
@@ -296,6 +316,9 @@ pub(crate) struct UnitWriter {
     macros: Vec<(usize, ProcMacroLoadResult)>,
     /// What a front end freshly lowered was served with ([`deps::serve`]).
     deps: Option<deps::Kept>,
+    /// What storing the kept front end this one lowered into did with its goals
+    /// ([`deps::store`]); None when nothing was kept.
+    flushed: Option<hir_ty::next_solver::goal_store::Flushed>,
 }
 
 impl Writer<Real> for UnitWriter {
@@ -359,6 +382,10 @@ impl Writer<Real> for UnitWriter {
         deps::served(self.front.db(), &self.job, &self.session)
     }
 
+    fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {
+        self.flushed.as_ref().map(deps::flushed)
+    }
+
     fn keep(mut self) -> Option<KeptLowered> {
         if !matches!(self.apply(), Ok(true)) {
             return None;
@@ -366,6 +393,7 @@ impl Writer<Real> for UnitWriter {
         let UnitWriter { session, front, job, deps, .. } = self;
         let lowered = Arc::into_inner(front)?;
         let later = std::mem::take(&mut *job.later.lock().unwrap_or_else(|it| it.into_inner()));
+        let seeds = std::mem::take(&mut *job.seeds.lock().unwrap_or_else(|it| it.into_inner()));
         Some(KeptLowered {
             session,
             lowered,
@@ -374,6 +402,7 @@ impl Writer<Real> for UnitWriter {
             deps,
             later,
             root: job.mounted.root().to_owned(), // alloc: once per front end kept
+            seeds,
         })
     }
 }
@@ -490,7 +519,10 @@ pub(crate) struct Job {
     /// Only the loop touches it: the lock is never contended.
     pub(crate) starts: Box<[Mutex<Option<Box<script::Start>>>]>,
     /// The crates built for build scripts and proc macros, as the code generator takes them.
-    pub(crate) build_time: OnceLock<hir_ty_codegen::v2::BuildTime>,
+    pub(crate) build_time: OnceLock<std::sync::Arc<hir_ty_codegen::v2::BuildTime>>,
+    /// The profiles its units' `-C profile-use`s name, read and given to the code generator
+    /// once, and held while the job lives.
+    pub(crate) profiles: OnceLock<codegen::Profiles>,
     /// `blaze test --ub`'s tests, selected once on a worker, read by every evaluation.
     pub(crate) ub: OnceLock<test::UbTests>,
     /// When the job's front was made: the clock the test queue is given.
@@ -498,6 +530,12 @@ pub(crate) struct Job {
     /// The dependency crates checked this build, kept with the front end until the head's next
     /// build stores their outcomes ([`deps::store`]); one write per such crate.
     later: Mutex<Vec<deps::Later>>,
+    /// The trees the job's last edit reparsed in place ([`intent::edit`]), kept with the front
+    /// end for the next build.
+    seeds: Mutex<Vec<blaze_intent::Seed>>,
+    /// The seeds its front end took: the database holds a seed weakly, so it lives as long as
+    /// the job.
+    _seeded: Vec<blaze_intent::Seed>,
 }
 
 impl Job {
@@ -520,9 +558,12 @@ impl Job {
             inert: (0..slots).map(|_| OnceLock::new()).collect(),
             starts: (0..slots).map(|_| Mutex::new(None)).collect(),
             build_time: OnceLock::new(),
+            profiles: OnceLock::new(),
             ub: OnceLock::new(),
             began: Instant::now(),
             later: Mutex::new(Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
+            seeds: Mutex::new(Vec::new()),
+            _seeded: Vec::new(),
         }
     }
 

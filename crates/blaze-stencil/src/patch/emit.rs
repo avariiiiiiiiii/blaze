@@ -560,7 +560,10 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                 HoleKind::Imm0 => imm(hole.form, fill.imms[0], addend),
                 HoleKind::Imm1 => imm(hole.form, fill.imms[1], addend),
                 HoleKind::Imm2 => imm(hole.form, fill.imms[2], addend),
-                HoleKind::Offset => fill.offset + addend,
+                // A confined access adds its offset in 32 bits, which wrap.
+                HoleKind::Offset => {
+                    imm(hole.form, (fill.offset, if shape.confined().is_some() { 32 } else { 64 }), addend)
+                }
                 HoleKind::Next => match fill.next {
                     Next::Falls => end + addend - i64::from(place),
                     Next::To(to) => {

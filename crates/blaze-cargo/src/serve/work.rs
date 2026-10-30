@@ -124,6 +124,11 @@ pub struct JobInput {
     /// Diagnostics are rendered a line each: cargo's `--message-format=short` or
     /// `json-diagnostic-short`.
     pub short: bool,
+    /// The columns diagnostics are rendered in, as rustc's `--diagnostic-width`; none for
+    /// rustc's default ([`blaze_api::Cargo::width`]).
+    pub width: Option<u32>,
+    /// How many `-v` the request gave ([`blaze_api::Cargo::verbose`]).
+    pub verbose: u8,
     pub goal: Goal,
     /// Set once the job is cancelled: long work looks at it between pieces and stops with
     /// [`Failed::Again`], which the loop drops for a cancelled job.
@@ -319,6 +324,9 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// name, with whether its check outcome and its bodies were served from the store,
     /// checked, or refused ([`blaze_api::Worked::served`]).
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError>;
+    /// Under `-v`: the note of what storing the kept front end this build lowered into did with
+    /// the goals its build offered to the persistent goal cache. None when nothing was kept.
+    fn goals_noted(&self) -> Option<blaze_api::Diagnostic>;
     /// On the loop, once every task of the job's build has ended: the front end with every
     /// write applied, for the head's next build to lower into. None while a reader of it is
     /// alive or a write fails to apply: the next build lowers anew.

@@ -457,6 +457,13 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
                 }
                 self.place(destination, Ctx::Call, live);
             }
+            // rustc's `super_terminator`: by-ref captures are not marked live at a `become`.
+            TerminatorKind::TailCall { func, args, .. } => {
+                self.operand(func, live);
+                for arg in args.iter() {
+                    self.operand(arg, live);
+                }
+            }
             TerminatorKind::Yield { value, resume_arg, .. } => {
                 self.operand(value, live);
                 self.place(resume_arg, Ctx::Call, live);
@@ -693,6 +700,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
                     TerminatorKind::Call { func, args, destination, .. } => {
                         in_operand(func) || args.iter().any(in_operand) || in_place(destination)
                     }
+                    TerminatorKind::TailCall { func, args, .. } => in_operand(func) || args.iter().any(in_operand),
                     TerminatorKind::Assert { cond, .. } => in_operand(cond),
                     TerminatorKind::Yield { value, resume_arg, .. } => in_operand(value) || in_place(resume_arg),
                     _ => false,

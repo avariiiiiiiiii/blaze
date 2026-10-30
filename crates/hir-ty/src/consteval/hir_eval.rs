@@ -21,7 +21,7 @@ use hir_def::{
     resolver::ValueNs,
 };
 use hir_expand::Lookup;
-use rustc_type_ir::{IntTy, TypeVisitableExt as _, UintTy, inherent::IntoKind};
+use rustc_type_ir::{TypeVisitableExt as _, UintTy, inherent::IntoKind};
 
 pub(crate) use self::ops::{Kind, Panic};
 use crate::{
@@ -445,33 +445,14 @@ impl<'db> Compiler<'_, 'db> {
     }
 
     fn kind_of(&self, ty: Ty<'db>) -> Option<Kind> {
-        Some(match ty.kind() {
-            TyKind::Bool => Kind::Bool,
-            TyKind::Char => Kind::Char,
-            TyKind::Int(int) => Kind::int(
-                match int {
-                    IntTy::Isize => self.pointer_bytes,
-                    IntTy::I8 => 1,
-                    IntTy::I16 => 2,
-                    IntTy::I32 => 4,
-                    IntTy::I64 => 8,
-                    IntTy::I128 => 16,
-                },
-                true,
-            )?,
-            TyKind::Uint(uint) => Kind::int(
-                match uint {
-                    UintTy::Usize => self.pointer_bytes,
-                    UintTy::U8 => 1,
-                    UintTy::U16 => 2,
-                    UintTy::U32 => 4,
-                    UintTy::U64 => 8,
-                    UintTy::U128 => 16,
-                },
-                false,
-            )?,
-            _ => return None,
-        })
+        let bytes = |bits: Option<u64>| bits.map_or(self.pointer_bytes, |it| it / 8);
+        match ty.kind() {
+            TyKind::Bool => Some(Kind::Bool),
+            TyKind::Char => Some(Kind::Char),
+            TyKind::Int(int) => Kind::int(bytes(int.bit_width()), true),
+            TyKind::Uint(uint) => Kind::int(bytes(uint.bit_width()), false),
+            _ => None,
+        }
     }
 
     fn push(&mut self, op: Op) -> Option<()> {

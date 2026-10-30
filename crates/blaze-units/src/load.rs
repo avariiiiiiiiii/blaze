@@ -6,9 +6,10 @@
 //! [`Foreign`], the same load of a workspace keyed by nothing of the view (the standard
 //! library's, [`crate::stdlib`]).
 //!
-//! Each query keeps what it read in its value, in a canonical form where it can (TOML
-//! re-serialized), so an edit no one reads (a comment, a file's contents a listing does not
-//! show) cuts off where it is first read. Only [`invocation::Invocation`] reads `Cx::config`.
+//! Each step reads each file once, through the database, when it asks for it; a TOML file is
+//! read in its canonical form (re-serialized), so an edit no one reads (a comment, a file's
+//! contents a listing does not show) cuts off where it is first read. Only
+//! [`invocation::Invocation`] reads `Cx::config`.
 
 mod config;
 mod files;
@@ -32,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use self::config::ConfigOf;
 use self::invocation::{Asked, Asking};
-use self::manifest::{WorkspaceKey, WorkspaceQuery, replay};
+use self::manifest::{WorkspaceKey, WorkspaceQuery, in_workspace};
 use self::units::Built;
 use crate::query::{
     Cbor, Command, Fetch, LoadError, Mount, Plan, Planned, StdGraph, StdPlanned, Units, kinds, producer,
@@ -40,6 +41,7 @@ use crate::query::{
 use crate::{Filter, Intent};
 
 pub use self::files::Snap;
+pub use crate::Read;
 pub use self::view::{ResolveAsk, Resolving, ViewResolved, platform_cfg, resolve_view};
 
 thread_local! {
@@ -258,17 +260,13 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
 
 /// Loads the workspace `spec` names and makes its units.
 fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
-    let mut read = match cx.get::<WorkspaceQuery>(&spec.workspace)?.get() {
+    let read = match cx.get::<WorkspaceQuery>(&spec.workspace)?.get() {
         Ok(read) => read,
         Err(error) => return Ok(Staged::Failed(error)),
     };
-    let base = std::mem::take(&mut read.snapshot);
-    let (outcome, used) = replay(cx, &read, base, &spec.workspace.config, |cx, ctx, ws, files, reads| {
-        resolve::resolved(cx, ctx, ws, &files, reads, spec, |cx, resolved| units::units(cx, ctx, ws, spec, &read, resolved))
+    let outcome = in_workspace(cx, &read, &spec.workspace.config, |ctx, ws| {
+        resolve::resolved(ctx, ws, spec, |resolved| units::units(ctx, ws, spec, &read, resolved))
     })?;
-    if let Some(at) = used.unmounted() {
-        return Ok(Staged::Failed(unmounted_error(at)));
-    }
     Ok(match outcome {
         Ok(staged) => staged,
         Err(error) => Staged::Failed(error),
@@ -418,6 +416,7 @@ pub fn register(db: &mut Database) {
     db.register::<files::LoadDir>();
     db.register::<files::FixedFile>();
     db.register::<files::FixedDir>();
+    db.register::<files::TomlFile>();
     db.register::<config::ConfigChain>();
     db.register::<manifest::ManifestQuery>();
     db.register::<manifest::WorkspaceQuery>();

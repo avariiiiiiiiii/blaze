@@ -523,8 +523,9 @@ pub(crate) enum Directive {
     /// `/FAILIFMISMATCH:key=value`: every object of the link naming `key` names `value`; an
     /// error naming both objects otherwise (LNK2038: mixing CRTs or `_ITERATOR_DEBUG_LEVEL`).
     Mismatch { key: String, value: String },
-    /// `/NODEFAULTLIB[:lib]`: the default library `lib` (every one when `None`) is not added
-    /// for any object's `libraries` ([`crate::default_libraries`]).
+    /// `/NODEFAULTLIB[:lib]`: the default library `lib` (every one when `None`) is neither put
+    /// on the line by [`crate::target::locate`] nor required by the engine for any object or
+    /// member it loads.
     NoDefaultLib(Option<String>),
 }
 
@@ -1090,7 +1091,7 @@ impl<'a> View<'a> {
         // alloc: none once `scratch` holds the longest read across pages (a record or a function)
         scratch.resize(len, 0);
         self.copy_to(at, scratch);
-        Some(scratch)
+        Some(&scratch[..])
     }
 
     /// The `N` bytes at `at`, across a page boundary or not; none past the end.
@@ -1133,7 +1134,7 @@ impl<'a> View<'a> {
 
     /// The first `len` bytes; none past the end.
     pub fn prefix(self, len: usize) -> Option<View<'a>> {
-        (len <= self.len()).then_some(match self {
+        (len <= self.len()).then(|| match self {
             View::Slice(bytes) => View::Slice(&bytes[..len]),
             View::Pages(pages) => View::Pages(Pages { bytes: pages.bytes, len }),
         })
@@ -1146,7 +1147,7 @@ impl<'a> View<'a> {
         assert!(at <= end && end <= self.len() && (end - at).is_multiple_of(N), "{N}-byte chunks of {at}..{end}");
         let window = match self {
             View::Slice(bytes) => &bytes[at..end],
-            View::Pages(_) => &[],
+            View::Pages(_) => &[][..],
         };
         Arrays { view: self, at, end, window, window_at: at }
     }
@@ -1417,6 +1418,9 @@ impl Writer for Formats {
 
 /// The writer of an output's format.
 pub(crate) fn writer(output: &Output) -> Result<Formats, LinkError> {
+    if output.exec_log {
+        exec_log(output).map_err(|what| LinkError { function: None, what: what.into() })?;
+    }
     Ok(match output.format {
         Format::Elf => Formats::Elf(crate::elf::writer(output)?),
         Format::MachO => Formats::MachO(crate::macho::writer(output)?),
@@ -1425,9 +1429,61 @@ pub(crate) fn writer(output: &Output) -> Result<Formats, LinkError> {
     })
 }
 
+/// Why `output` can't have the jump table's execution log (fastcompile-ident-select 9), if it
+/// can't: the log stubs sit beside the slot stubs, and the runtime finds the log through the
+/// live descriptor's table.
+fn exec_log(output: &Output) -> Result<(), &'static str> {
+    if output.format == Format::Wasm {
+        return Err("an execution log on wasm, which reaches code by index and has no slot stubs to log calls in");
+    }
+    if !output.incremental {
+        return Err("an execution log in an image linked without a jump table (not incremental)");
+    }
+    if output.live.is_none() {
+        return Err("an execution log in an image with no live descriptor, by which the runtime finds the log");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_execution_log_is_refused_where_there_are_no_slot_stubs() {
+        let ok = Output {
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            kind: crate::OutputKind::Executable { entry: "_start".into() },
+            interpreter: Some("/lib64/ld-linux-x86-64.so.2".into()),
+            platform: None,
+            incremental: true,
+            debug: crate::Debug::None,
+            live: Some(crate::Live { dir: blaze_core::FileName::new("live").unwrap(), path: "/tmp/live".into() }),
+            tags: 1 << 32,
+            stack: None,
+            windows_subsystem: false,
+            dev_run: None,
+            triple: "x86_64-unknown-linux-gnu".into(),
+            exec_log: true,
+        };
+        assert!(exec_log(&ok).is_ok());
+        assert!(writer(&ok).is_ok());
+        for (format, incremental, live, needs) in [
+            (Format::Wasm, true, true, "wasm"),
+            (Format::Elf, false, true, "without a jump table"),
+            (Format::Elf, true, false, "no live descriptor"),
+        ] {
+            let mut output = ok.clone();
+            output.format = format;
+            output.incremental = incremental;
+            if !live {
+                output.live = None;
+            }
+            let why = exec_log(&output).expect_err("refused");
+            assert!(why.contains(needs), "{why}");
+        }
+    }
 
     /// A region in pages, some written since its buffer and its end past the buffer, reads
     /// as the same bytes in one slice do: words and records across page boundaries, chunks,

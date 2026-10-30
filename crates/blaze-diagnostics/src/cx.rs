@@ -20,8 +20,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::{Edition, FileId};
 use syntax::{
-    AstNode, AstPtr, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, TextSize,
-    ast::{self, HasAttrs as _},
+    AstNode, AstPtr, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self, AstNode as _, HasAttrs as _},
 };
 
@@ -50,7 +49,7 @@ impl<'a> Files<'a> {
     }
 
     /// The name rustc gives `file` in a diagnostic, by [`Files::relative`]; a file the front end
-    /// has no path for is `<file N>`.
+    /// has no path for is `<file N>` (a crate attribute's is named by [`Cx::file_name`]).
     pub fn name(&self, file: FileId) -> String {
         match self.paths.get(&file) {
             // alloc: a span's file name, made only as a diagnostic is built
@@ -216,9 +215,14 @@ impl<'a, 'db> Cx<'a, 'db> {
         self.lints.is_some_and(|it| it.check_cfg.cargo)
     }
 
-    /// The name rustc shows `file` by.
+    /// The name rustc shows `file` by. A crate attribute's file has no path: it is
+    /// [`base_db::CRATE_ATTR_FILE_NAME`] with the file's text, which tells the attributes apart
+    /// and is their source to the emitter ([`crate::emit::name_with_text`]).
     pub fn file_name(&self, file: FileId) -> String {
-        let name = self.files.name(file);
+        let name = match self.files.paths.contains_key(&file) || base_db::crate_attr_owner(self.db, file).is_none() {
+            true => self.files.name(file),
+            false => crate::emit::name_with_text(base_db::CRATE_ATTR_FILE_NAME, self.file_text(file)),
+        };
         let mut named = self.named.borrow_mut();
         if !named.contains_key(name.as_str()) {
             named.insert(name.clone(), file); // alloc: once per file named
@@ -312,14 +316,10 @@ impl<'a, 'db> Cx<'a, 'db> {
         self.span(ptr.map(|it| it.text_range()))
     }
 
-    /// The node `ptr` points to, parsed or expanded.
-    pub fn node<N: AstNode>(&self, ptr: InFile<AstPtr<N>>) -> InFile<N> {
-        let root = self.sema.parse_or_expand(ptr.file_id);
-        ptr.map(|it| it.to_node(&root))
-    }
-
-    /// The syntax node `ptr` points to, parsed or expanded.
-    pub fn syntax(&self, ptr: InFile<SyntaxNodePtr>) -> InFile<SyntaxNode> {
+    /// The syntax node `ptr` points to, as a handle: for a test comparing a handle walk with
+    /// the view walk that replaced it.
+    #[cfg(test)]
+    pub fn syntax(&self, ptr: InFile<SyntaxNodePtr>) -> InFile<syntax::SyntaxNode> {
         let root = self.sema.parse_or_expand(ptr.file_id);
         ptr.map(|it| it.to_node(&root))
     }
@@ -331,14 +331,12 @@ impl<'a, 'db> Cx<'a, 'db> {
 
     /// The node `ptr` points to, as a view: [`Cx::node`] with no handle.
     pub fn node_view<N: AstNode + view::Typed>(&self, ptr: InFile<AstPtr<N>>) -> InFile<N::Of<'db>> {
-        let root = self.root(ptr.file_id);
-        ptr.map(|it| it.to_view(root))
+        InFile::new(ptr.file_id, self.vsema.to_view(ptr))
     }
 
     /// The syntax node `ptr` points to, as a view: [`Cx::syntax`] with no handle.
     pub fn syntax_view(&self, ptr: InFile<SyntaxNodePtr>) -> InFile<view::Node<'db>> {
-        let root = self.root(ptr.file_id);
-        ptr.map(|it| view::to_node(it, root))
+        InFile::new(ptr.file_id, self.vsema.to_view_syntax(ptr))
     }
 
     /// What rustc says of the expansion of the macro call `call`: where it was called (itself
@@ -460,137 +458,7 @@ impl<'a, 'db> Cx<'a, 'db> {
 }
 
 /// The paths of a `#[derive(...)]`, in order, with where each is, as text: for a diagnostic
-/// naming a derive. A scan takes [`derive_path_tokens`].
-pub fn derive_paths(attr: &ast::Attr) -> Vec<(TextRange, String)> {
-    // alloc: the paths as text, for a diagnostic's name of a derive
-    let mut paths = Vec::new();
-    derive_path_tokens(attr, |range, tokens| {
-        // alloc: as above
-        paths.push((range, tokens.iter().map(|it| it.text()).collect()));
-    });
-    paths
-}
-
-/// Each path of a `#[derive(...)]`, in order: where it is and its tokens (names, `::`). No
-/// allocation for a path of up to eight tokens.
-pub fn derive_path_tokens(attr: &ast::Attr, mut each: impl FnMut(TextRange, &[SyntaxToken])) {
-    let Some((_, tt)) = attr.as_simple_call() else { return };
-    let mut current: SmallVec<[SyntaxToken; 8]> = SmallVec::new();
-    let mut flush = |current: &mut SmallVec<[SyntaxToken; 8]>| {
-        if let (Some(first), Some(last)) = (current.first(), current.last()) {
-            each(TextRange::new(first.text_range().start(), last.text_range().end()), current);
-        }
-        current.clear();
-    };
-    for token in tt.syntax().children_with_tokens().filter_map(NodeOrToken::into_token) {
-        match token.kind() {
-            SyntaxKind::IDENT | SyntaxKind::COLON2 | SyntaxKind::COLON => current.push(token),
-            SyntaxKind::COMMA | SyntaxKind::R_PAREN => flush(&mut current),
-            _ => {}
-        }
-    }
-    flush(&mut current);
-}
-
-/// Where rustc's span of an item starts: after its attributes, doc comments and the comments
-/// before it.
-pub fn item_range(node: &SyntaxNode) -> TextRange {
-    let start = node
-        .children_with_tokens()
-        .find(|it| match it {
-            NodeOrToken::Node(node) => {
-                !matches!(node.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
-            }
-            NodeOrToken::Token(token) => !token.kind().is_trivia(),
-        })
-        .map_or(node.text_range().start(), |it| it.text_range().start());
-    TextRange::new(start, node.text_range().end())
-}
-
-/// rustc's `def_span` of a closure (`fn_decl_span`): from after its attributes to the end of
-/// its return type, else of its parameters; [`item_range`] of a node that is not a closure.
-pub fn closure_decl_range(node: &SyntaxNode) -> TextRange {
-    let range = item_range(node);
-    let end = (node.kind() == SyntaxKind::CLOSURE_EXPR)
-        .then(|| {
-            let child = |kind| node.children().find(|it| it.kind() == kind);
-            child(SyntaxKind::RET_TYPE).or_else(|| child(SyntaxKind::PARAM_LIST))
-        })
-        .flatten()
-        .map_or(range.end(), |it| it.text_range().end());
-    TextRange::new(range.start(), end.max(range.start()))
-}
-
-/// The span rustc gives a function's definition (`def_span`): its signature, without its body.
-pub fn signature_range(item: &ast::Fn) -> TextRange {
-    let range = item_range(item.syntax());
-    let end: TextSize = match item.body() {
-        Some(body) => {
-            let mut end = body.syntax().text_range().start();
-            let mut at = body.syntax().prev_sibling_or_token();
-            while let Some(it) = at {
-                if !it.kind().is_trivia() {
-                    end = it.text_range().end();
-                    break;
-                }
-                at = it.prev_sibling_or_token();
-            }
-            end
-        }
-        None => range.end(),
-    };
-    TextRange::new(range.start(), end.max(range.start()))
-}
-
-/// The span rustc gives an item's definition (`def_span`): a function's signature; of a type,
-/// a trait or an impl, from its first keyword to the end of its header, before `{` or `;`;
-/// else the whole item.
-pub fn def_range(node: &SyntaxNode) -> TextRange {
-    if node.kind() == SyntaxKind::FN
-        // clone: a reference count on the tree, of a function only
-        && let Some(item) = ast::Fn::cast(node.clone())
-    {
-        return signature_range(&item);
-    }
-    let range = item_range(node);
-    let header_end = node
-        .children_with_tokens()
-        .filter(|it| it.text_range().start() >= range.start())
-        .find(|it| match it {
-            NodeOrToken::Node(node) => matches!(
-                node.kind(),
-                SyntaxKind::RECORD_FIELD_LIST
-                    | SyntaxKind::VARIANT_LIST
-                    | SyntaxKind::ASSOC_ITEM_LIST
-                    | SyntaxKind::ITEM_LIST
-            ),
-            NodeOrToken::Token(token) => token.kind() == SyntaxKind::SEMICOLON,
-        })
-        .map(|it| it.text_range().start());
-    let Some(end) = header_end else { return range };
-    // The header's text from `range`'s start to `end`, its trailing whitespace trimmed, read
-    // token by token in place.
-    let mut trimmed = range.start();
-    for token in node.descendants_with_tokens().filter_map(NodeOrToken::into_token) {
-        let at = token.text_range();
-        if at.end() <= range.start() {
-            continue;
-        }
-        if at.start() >= end {
-            break;
-        }
-        let text = token.text();
-        let from = usize::from(range.start().max(at.start()) - at.start());
-        let to = usize::from(end.min(at.end()) - at.start());
-        let kept = text[from..to].trim_end();
-        if !kept.is_empty() {
-            trimmed = at.start() + TextSize::of(&text[..from + kept.len()]);
-        }
-    }
-    TextRange::new(range.start(), trimmed)
-}
-
-/// [`derive_paths`] of a view.
+/// naming a derive. A scan takes [`derive_path_tokens_view`].
 pub fn derive_paths_view(attr: view::Attr<'_>) -> Vec<(TextRange, String)> {
     // alloc: the paths as text, for a diagnostic's name of a derive
     let mut paths = Vec::new();
@@ -601,7 +469,8 @@ pub fn derive_paths_view(attr: view::Attr<'_>) -> Vec<(TextRange, String)> {
     paths
 }
 
-/// [`derive_path_tokens`] of a view: the same paths, ranges and tokens, in order.
+/// Each path of a `#[derive(...)]`, in order: where it is and its tokens (names, `::`). No
+/// allocation for a path of up to eight tokens.
 pub fn derive_path_tokens_view<'t>(attr: view::Attr<'t>, mut each: impl FnMut(TextRange, &[view::Token<'t>])) {
     let Some((_, tt)) = attr.as_simple_call() else { return };
     let mut current: SmallVec<[view::Token<'t>; 8]> = SmallVec::new();
@@ -621,7 +490,8 @@ pub fn derive_path_tokens_view<'t>(attr: view::Attr<'t>, mut each: impl FnMut(Te
     flush(&mut current);
 }
 
-/// [`item_range`] of a view.
+/// Where rustc's span of an item starts: after its attributes, doc comments and the comments
+/// before it.
 pub fn item_range_view(node: view::Node<'_>) -> TextRange {
     let start = node
         .children_with_tokens()
@@ -635,7 +505,8 @@ pub fn item_range_view(node: view::Node<'_>) -> TextRange {
     TextRange::new(start, node.text_range().end())
 }
 
-/// [`closure_decl_range`] of a view.
+/// rustc's `def_span` of a closure (`fn_decl_span`): from after its attributes to the end of
+/// its return type, else of its parameters; [`item_range_view`] of a node that is not a closure.
 pub fn closure_decl_range_view(node: view::Node<'_>) -> TextRange {
     let range = item_range_view(node);
     let end = view::ClosureExpr::cast(node)
@@ -646,7 +517,7 @@ pub fn closure_decl_range_view(node: view::Node<'_>) -> TextRange {
     TextRange::new(range.start(), end.max(range.start()))
 }
 
-/// [`signature_range`] of a view.
+/// The span rustc gives a function's definition (`def_span`): its signature, without its body.
 pub fn signature_range_view(item: view::Fn<'_>) -> TextRange {
     let range = item_range_view(item.syntax());
     let end: TextSize = match item.body() {
@@ -667,8 +538,10 @@ pub fn signature_range_view(item: view::Fn<'_>) -> TextRange {
     TextRange::new(range.start(), end.max(range.start()))
 }
 
-/// [`def_range`] of a view: the header's text is sliced from the text the tree lends, so
-/// nothing is copied.
+/// The span rustc gives an item's definition (`def_span`): a function's signature; of a type,
+/// a trait or an impl, from its first keyword to the end of its header, before `{` or `;`;
+/// else the whole item. The header's text is sliced from the text the tree lends, so nothing
+/// is copied.
 pub fn def_range_view(node: view::Node<'_>) -> TextRange {
     if let Some(item) = view::Fn::cast(node) {
         return signature_range_view(item);
@@ -695,9 +568,140 @@ pub fn def_range_view(node: view::Node<'_>) -> TextRange {
 
 #[cfg(test)]
 mod tests {
-    use syntax::{AstNode, SourceFile, ast, view::AstNode as _};
+    use syntax::{AstNode, SourceFile, SyntaxNode, SyntaxToken, ast, view::AstNode as _};
 
     use super::*;
+
+    /// The paths of a `#[derive(...)]`, in order, with where each is, as text: for a diagnostic
+    /// naming a derive. A scan takes [`derive_path_tokens`].
+    fn derive_paths(attr: &ast::Attr) -> Vec<(TextRange, String)> {
+        // alloc: the paths as text, for a diagnostic's name of a derive
+        let mut paths = Vec::new();
+        derive_path_tokens(attr, |range, tokens| {
+            // alloc: as above
+            paths.push((range, tokens.iter().map(|it| it.text()).collect()));
+        });
+        paths
+    }
+
+    /// Each path of a `#[derive(...)]`, in order: where it is and its tokens (names, `::`). No
+    /// allocation for a path of up to eight tokens.
+    fn derive_path_tokens(attr: &ast::Attr, mut each: impl FnMut(TextRange, &[SyntaxToken])) {
+        let Some((_, tt)) = attr.as_simple_call() else { return };
+        let mut current: SmallVec<[SyntaxToken; 8]> = SmallVec::new();
+        let mut flush = |current: &mut SmallVec<[SyntaxToken; 8]>| {
+            if let (Some(first), Some(last)) = (current.first(), current.last()) {
+                each(TextRange::new(first.text_range().start(), last.text_range().end()), current);
+            }
+            current.clear();
+        };
+        for token in tt.syntax().children_with_tokens().filter_map(NodeOrToken::into_token) {
+            match token.kind() {
+                SyntaxKind::IDENT | SyntaxKind::COLON2 | SyntaxKind::COLON => current.push(token),
+                SyntaxKind::COMMA | SyntaxKind::R_PAREN => flush(&mut current),
+                _ => {}
+            }
+        }
+        flush(&mut current);
+    }
+
+    /// Where rustc's span of an item starts: after its attributes, doc comments and the comments
+    /// before it.
+    fn item_range(node: &SyntaxNode) -> TextRange {
+        let start = node
+            .children_with_tokens()
+            .find(|it| match it {
+                NodeOrToken::Node(node) => {
+                    !matches!(node.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
+                }
+                NodeOrToken::Token(token) => !token.kind().is_trivia(),
+            })
+            .map_or(node.text_range().start(), |it| it.text_range().start());
+        TextRange::new(start, node.text_range().end())
+    }
+
+    /// rustc's `def_span` of a closure (`fn_decl_span`): from after its attributes to the end of
+    /// its return type, else of its parameters; [`item_range`] of a node that is not a closure.
+    fn closure_decl_range(node: &SyntaxNode) -> TextRange {
+        let range = item_range(node);
+        let end = (node.kind() == SyntaxKind::CLOSURE_EXPR)
+            .then(|| {
+                let child = |kind| node.children().find(|it| it.kind() == kind);
+                child(SyntaxKind::RET_TYPE).or_else(|| child(SyntaxKind::PARAM_LIST))
+            })
+            .flatten()
+            .map_or(range.end(), |it| it.text_range().end());
+        TextRange::new(range.start(), end.max(range.start()))
+    }
+
+    /// The span rustc gives a function's definition (`def_span`): its signature, without its body.
+    fn signature_range(item: &ast::Fn) -> TextRange {
+        let range = item_range(item.syntax());
+        let end: TextSize = match item.body() {
+            Some(body) => {
+                let mut end = body.syntax().text_range().start();
+                let mut at = body.syntax().prev_sibling_or_token();
+                while let Some(it) = at {
+                    if !it.kind().is_trivia() {
+                        end = it.text_range().end();
+                        break;
+                    }
+                    at = it.prev_sibling_or_token();
+                }
+                end
+            }
+            None => range.end(),
+        };
+        TextRange::new(range.start(), end.max(range.start()))
+    }
+
+    /// The span rustc gives an item's definition (`def_span`): a function's signature; of a type,
+    /// a trait or an impl, from its first keyword to the end of its header, before `{` or `;`;
+    /// else the whole item.
+    fn def_range(node: &SyntaxNode) -> TextRange {
+        if node.kind() == SyntaxKind::FN
+            // clone: a reference count on the tree, of a function only
+            && let Some(item) = ast::Fn::cast(node.clone())
+        {
+            return signature_range(&item);
+        }
+        let range = item_range(node);
+        let header_end = node
+            .children_with_tokens()
+            .filter(|it| it.text_range().start() >= range.start())
+            .find(|it| match it {
+                NodeOrToken::Node(node) => matches!(
+                    node.kind(),
+                    SyntaxKind::RECORD_FIELD_LIST
+                        | SyntaxKind::VARIANT_LIST
+                        | SyntaxKind::ASSOC_ITEM_LIST
+                        | SyntaxKind::ITEM_LIST
+                ),
+                NodeOrToken::Token(token) => token.kind() == SyntaxKind::SEMICOLON,
+            })
+            .map(|it| it.text_range().start());
+        let Some(end) = header_end else { return range };
+        // The header's text from `range`'s start to `end`, its trailing whitespace trimmed, read
+        // token by token in place.
+        let mut trimmed = range.start();
+        for token in node.descendants_with_tokens().filter_map(NodeOrToken::into_token) {
+            let at = token.text_range();
+            if at.end() <= range.start() {
+                continue;
+            }
+            if at.start() >= end {
+                break;
+            }
+            let text = token.text();
+            let from = usize::from(range.start().max(at.start()) - at.start());
+            let to = usize::from(end.min(at.end()) - at.start());
+            let kept = text[from..to].trim_end();
+            if !kept.is_empty() {
+                trimmed = at.start() + TextSize::of(&text[..from + kept.len()]);
+            }
+        }
+        TextRange::new(range.start(), trimmed)
+    }
 
     fn first<N: AstNode>(text: &str) -> N {
         SourceFile::parse(text, Edition::CURRENT).tree().syntax().descendants().find_map(N::cast).unwrap()

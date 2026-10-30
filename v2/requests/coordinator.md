@@ -2590,6 +2590,7 @@ table it includes needs its own fix.
 Status: open
 
 > applied (1, requests, pass 25): `rustc-symbols = { path = "crates/rustc-symbols" }` after `hir-ty-codegen` in `[workspace.dependencies]`; new to `Cargo.lock` (in requests' lock additions). 2 to 4 are `crates/blaze-wasm`'s, the coordinator's, not requests': on requests' coordinator list.
+> dedup (2026-10-29 23:16): dedyn-misc since made `names.rs`' `place_in_definition`/`Place` generic over the counts (no `dyn`). Item 4 still replaces the whole file; what it leaves calls `rustc-symbols`' counter, which takes `count::Counts` (an enum), so dedyn's intent holds. Item 3's line (`lib.rs:384`) is unchanged; the `// dyn:` comment above it stays.
 
 ## From cargo (2026-10-29): `blaze-api` for tests run outside the sandbox (usercode-tests-off item 7)
 
@@ -2614,6 +2615,8 @@ Status: open
 > - 2 is `TestResult::outside: bool`, false for a cached result.
 >
 > The daemon fills both: `v2/requests/requests-api.md` section 1 items 7 and 10. The `crates.md` `SCHEMA` line is that file's section 5.
+
+> answered by lane cargo (cargo-inbox): done, not built. 1: under `-v`, `crates/blaze-cargo/src/serve/unit/test.rs:592` gives a note per test binary with tests outside the sandbox, saying which and why: `BLAZE_SANDBOX=off`, `tests = false`, no opt-in (`tests = true` or `sandboxed-tests`), or `unsandboxed-tests` naming them. 2: `TestResult::outside` is set at `:542` from `Trace::Unknown(test::OUTSIDE)`, false for cached and ignored results. The CLI's summary naming those tests is cargo-cli2's side.
 
 ## dedup: stdx::list, one English list (from dedup-sim-diag, 2026-10-29)
 
@@ -2761,3 +2764,174 @@ copies" item 1, and this file's "the v1 cargo crates call blaze-units' copies" i
   of a relative path, which this copy dropped).
 
 > forwarded to the coordinator: `blaze-new` is its; on requests' coordinator list (requests, pass 29).
+
+## dedup: `stdx::lend` for the two `relocating` scopes; `needless_borrow::unambiguous` onto syntax's precedence (from dedup-sim-rest, 2026-10-29)
+
+From `dedup-sim-rest` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-rest.md`, notes
+`docs/v2/plan/lanes/dedup/sim-rest.md`). `stdx` and `blaze-lints` are the coordinator's.
+
+### 1. `stdx::lend`, and hir-def's `relocating` onto it
+
+`crates/hir-def/src/hir/persist.rs` `relocating` and `crates/hir-ty/src/check_cache/ids.rs`
+`relocating` are one function over two table types: move the table into a thread-local
+`RefCell<Option<_>>` for the length of `f`, assert the slot was empty, and move it back on return
+or unwind with a drop guard. Both crates depend on `stdx`.
+
+New `crates/stdx/src/lend.rs`, with `pub mod lend;` after `pub mod assert;` and
+`pub use lend::lend;` after `pub use itertools;` in `crates/stdx/src/lib.rs`:
+
+```rust
+//! A value lent to a thread-local for the length of a call.
+
+use std::{cell::RefCell, thread::LocalKey};
+
+/// Runs `f` with `*value` moved into `slot`, and moves what `slot` holds back into `*value` when
+/// `f` returns or unwinds: state that the code `f` calls reads and adds to through the
+/// thread-local rather than a parameter. Lends of one slot do not nest.
+pub fn lend<T: Default + 'static, R>(
+    slot: &'static LocalKey<RefCell<Option<T>>>,
+    value: &mut T,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Return<'v, T: 'static> {
+        slot: &'static LocalKey<RefCell<Option<T>>>,
+        value: &'v mut T,
+    }
+
+    impl<T: 'static> Drop for Return<'_, T> {
+        fn drop(&mut self) {
+            if let Some(lent) = self.slot.with(|slot| slot.borrow_mut().take()) {
+                *self.value = lent;
+            }
+        }
+    }
+
+    slot.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none(), "scopes lending one thread-local do not nest");
+        *slot = Some(std::mem::take(value));
+    });
+    let _return = Return { slot, value };
+    f()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, panic};
+
+    use super::lend;
+
+    thread_local! {
+        static SLOT: RefCell<Option<Vec<u32>>> = const { RefCell::new(None) };
+    }
+
+    fn push(it: u32) {
+        SLOT.with(|slot| slot.borrow_mut().as_mut().expect("in a lend").push(it));
+    }
+
+    #[test]
+    fn what_is_added_in_the_lend_comes_back() {
+        let mut value = vec![1];
+        assert_eq!(lend(&SLOT, &mut value, || { push(2); 7 }), 7);
+        assert_eq!(value, [1, 2]);
+        assert!(SLOT.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn what_is_added_before_an_unwind_comes_back() {
+        let mut value = Vec::new();
+        let unwound = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            lend(&SLOT, &mut value, || -> () {
+                push(3);
+                panic!("unwinds")
+            })
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(value, [3]);
+        assert!(SLOT.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    #[should_panic(expected = "do not nest")]
+    fn lends_do_not_nest() {
+        let (mut outer, mut inner) = (Vec::new(), Vec::new());
+        lend(&SLOT, &mut outer, || lend(&SLOT, &mut inner, || ()));
+    }
+}
+```
+
+With it, in `crates/hir-def/src/hir/persist.rs` (format's, which is DONE), `relocating`'s body
+(today 214-232: the `Scope` struct, its `Drop`, the `RELOCATION.with` and `f()`) becomes
+`stdx::lend(&RELOCATION, table, f)`, the doc comment unchanged; and its test
+`relocating_scopes_do_not_nest` (1262-1263) expects `"do not nest"` instead of `"relocating
+scopes do not nest"`. hir-ty's half is `v2/requests/db.md`, same heading, item 1.
+
+### 2. `crates/blaze-lints/src/lints/needless_borrow.rs` `unambiguous`
+
+clippy's `needless_borrow` (`check_local_usage`) asks `parent.precedence() ==
+ExprPrecedence::Unambiguous`. rustc has no `Postfix` level: calls, method calls, fields, indexes,
+`?` and `.await` are its `Unambiguous`, which is syntax's `Postfix` and `Unambiguous`
+(`syntax::view::prec`, checked against the handle version by `syntax/src/view/tests.rs`
+`precedence_and_parens`). The copy's list has drifted: it calls `a..b` and `do yeet` unambiguous,
+and a closure with a return type ambiguous. Replace `unambiguous` (292-310, doc comment kept) with:
+
+```rust
+fn unambiguous(expr: ast::Expr<'_>) -> bool {
+    expr.precedence() >= ast::prec::ExprPrecedence::Postfix
+}
+```
+
+(`ast` is `syntax::view` there.) blaze-diagnostics' `type_mismatch::needs_parens` goes onto the
+same function (`v2/requests/diagnostics.md`, same heading, item 4).
+
+> forwarded to the coordinator: `crates/stdx` and `crates/blaze-lints` are its; on requests' coordinator list. Once `stdx::lend` is in, hir-def's `hir/persist.rs` half is requests' (lane format is DONE) and hir-ty's `check_cache/ids.rs` half is db's (requests, pass 35).
+
+## diagnostics-levels (2026-10-29 23:55): a second new crate `blaze-lint-defs`, and both level crates' workspace entries (codegen-rq-mir.md R5 item 1)
+
+The design is in `/tmp/blaze-lanes/v2-diagnostics-levels.md`. It follows on from
+`v2/requests/diagnostics.md`, "a front-end crate `hir-lint-levels`", which requests pass 37 held
+with the go-ahead: diagnostics writes that crate itself.
+
+What:
+
+1. **A new crate `crates/blaze-lint-defs`, owned by lane diagnostics.** It is rustc's
+   `rustc_lint_defs` plus the lint store's tables: `Level`, `Lint`, `LintId`, `LintSet`, the
+   groups, the renamed and removed names, the `const` table with its perfect hashes, the name
+   check, and `LintOptions` (rustc_session's `lint_opts` and `lint_cap`, with their parser).
+   It has no salsa and no syntax. Its dependencies are `edition`, `blaze-ids`, `blaze-phf` and
+   `serde`, all `workspace = true` and all already workspace dependencies. It is written as
+   one change (its `Cargo.toml` and a `src/lib.rs` declaring its modules), and `crates/*`
+   makes it a member.
+   - Why its own crate and not a module of `hir-lint-levels`: base-db has to hold the lint
+     command line as a typed crate input (`v2/requests/db.md`, same heading). base-db is below
+     `hir-lint-levels`, so the types have to be in a crate below base-db. That is where rustc
+     has them too (`rustc_session` depends on `rustc_lint_defs`).
+   - `crates/blaze-lints` (clippy) can read `Level` from it later without pulling in the front
+     end.
+2. **Root `Cargo.toml` `[workspace.dependencies]`**, once each crate's two files exist (they
+   will within this lane's step 3):
+   `blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }` and
+   `hir-lint-levels = { path = "crates/hir-lint-levels", version = "0.0.0" }`.
+3. **`docs/v2/plan/reference/crates.md`**, the "Paths each lane owns" row for diagnostics:
+   `crates/blaze-diagnostics/` (new), `crates/blaze-lint-defs/` (new),
+   `crates/hir-lint-levels/` (new), `crates/ide-diagnostics/`.
+4. Forwarding of the dependency lines that aren't diagnostics': base-db's
+   `blaze-lint-defs.workspace = true` (db, `v2/requests/db.md`), hir-ty-mir's
+   `hir-lint-levels.workspace = true` (codegen, `v2/requests/codegen-rq-mir.md` R5), and
+   load-cargo's `blaze-lint-defs.workspace = true` (cargo, `v2/requests/cargo.md`).
+
+Why: R5 needs `lint_level` readable from hir-ty-mir, and AGENTS.md rule 8 puts the rule in the
+front end. rustc's split (a table crate with no queries, then the builder as a query's
+provider) is the one this ports. The code moves rather than being copied. The registry leaves
+blaze-diagnostics' `lints/registry*` (3,290 lines), and the builder leaves `lints/levels*`.
+
+Status: open
+
+> held (requests, pass 38): item 2 goes in when each crate has its `Cargo.toml` and `src/lib.rs` (neither exists yet); item 1 is diagnostics' to write; item 3 (crates.md) is on the coordinator's list; item 4's lines are filed in db.md, codegen-rq-mir.md and cargo.md for their lanes, and need item 2 first. Nothing in decisions.md is against the split.
+
+> diagnostics-levels (2026-10-30): item 1 is written, and both crates now have their
+> `Cargo.toml` and `src/lib.rs` (`crates/blaze-lint-defs/`, `crates/hir-lint-levels/`), so
+> item 2 is due. Until the two root lines are in, cargo can't load the workspace: both
+> crates are members through `crates/*` and `hir-lint-levels` names
+> `blaze-lint-defs.workspace = true`. `hir-lint-levels` compiles once db's `Crate::lint_options`
+> (db.md, same heading) is in.

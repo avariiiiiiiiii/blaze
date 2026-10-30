@@ -52,8 +52,7 @@ impl<'db> AlternativeExprs<'db> {
         match self {
             // alloc: the candidates a tactic combines; the table is written to while they live.
             AlternativeExprs::Few(exprs) => exprs.iter().cloned().collect(),
-            // alloc: the one candidate; clone: `Type` is an ID and an interned `Ty` (`Copy` requested)
-            AlternativeExprs::Many => vec![Expr::Many(ty.clone())],
+            AlternativeExprs::Many => vec![Expr::Many(*ty)], // alloc: the one candidate
         }
     }
 
@@ -126,15 +125,13 @@ impl<'db> LookupTable<'db> {
     fn find(&mut self, db: &'db Db, ty: &Type<'db>) -> Option<Vec<Expr<'db>>> {
         let Some((t, tts)) = self.data.iter().find(|(t, _)| t.could_unify_with_deeply(db, ty))
         else {
-            // clone: `Type` is an ID and an interned `Ty`, no allocation (`Copy` requested)
-            self.types_wishlist.insert(ty.clone());
+            self.types_wishlist.insert(*ty);
             return None;
         };
 
         // Collapse suggestions if there are many
         if tts.len() > self.many_threshold {
-            // alloc: the one candidate; clone: `Type` is an ID and an interned `Ty`
-            return Some(vec![Expr::Many(ty.clone())]);
+            return Some(vec![Expr::Many(*ty)]); // alloc: the one candidate
         }
 
         Some(tts.exprs(t))
@@ -148,8 +145,7 @@ impl<'db> LookupTable<'db> {
         if let Some((t, tts)) = self.data.iter().find(|(t, _)| t.could_unify_with_deeply(db, ty)) {
             // Collapse suggestions if there are many
             if tts.len() > self.many_threshold {
-                // alloc: the one candidate; clone: `Type` is an ID and an interned `Ty`
-                return Some(vec![Expr::Many(ty.clone())]);
+                return Some(vec![Expr::Many(*ty)]); // alloc: the one candidate
             }
             return Some(tts.exprs(t));
         }
@@ -158,16 +154,14 @@ impl<'db> LookupTable<'db> {
             t.add_reference(db, Mutability::Shared).could_unify_with_deeply(db, ty)
         }) {
             if tts.len() > self.many_threshold {
-                // alloc: the one candidate; clone: `Type` is an ID and an interned `Ty`
-                return Some(vec![Expr::Many(ty.clone())]);
+                return Some(vec![Expr::Many(*ty)]); // alloc: the one candidate
             }
             let exprs = tts.exprs(t).into_iter();
             // alloc: collected in place over `exprs`'s buffer, a box per candidate's `&`
             return Some(exprs.map(|expr| Expr::Reference(Box::new(expr))).collect());
         }
 
-        // clone: `Type` is an ID and an interned `Ty`, no allocation (`Copy` requested)
-        self.types_wishlist.insert(ty.clone());
+        self.types_wishlist.insert(*ty);
         None
     }
 
@@ -193,8 +187,7 @@ impl<'db> LookupTable<'db> {
             }
             Entry::Vacant(entry) => {
                 for it in self.new_types.values_mut() {
-                    // clone: `Type` is an ID and an interned `Ty`, no allocation (`Copy` requested)
-                    it.push(entry.key().clone());
+                    it.push(*entry.key());
                 }
                 entry.insert(AlternativeExprs::new(self.many_threshold, exprs));
             }
@@ -215,7 +208,7 @@ impl<'db> LookupTable<'db> {
     /// Fill `out` (cleared first) with the types queried but not found, in the set's order.
     fn wishlist_into(&self, out: &mut Vec<Type<'db>>) {
         out.clear();
-        out.extend(self.types_wishlist.iter().cloned());
+        out.extend(self.types_wishlist.iter().copied());
     }
 }
 
@@ -296,8 +289,7 @@ pub fn term_search<'db>(ctx: &TermSearchCtx<'_, 'db>) -> Vec<Expr<'db>> {
         defs.insert(def);
     });
 
-    // clone: once a search; `Type` is an ID and an interned `Ty` (`Copy` requested)
-    let mut lookup = LookupTable::new(ctx.config.many_alternatives_threshold, ctx.goal.clone());
+    let mut lookup = LookupTable::new(ctx.config.many_alternatives_threshold, ctx.goal);
     let fuel = &Fuel::new(ctx.config.fuel);
     // The types each tactic walks this iteration, reused across tactics and iterations.
     let mut types = Vec::new(); // alloc: empty

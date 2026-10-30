@@ -11,7 +11,7 @@ use hir::InFile;
 use hir_def::{
     AdtId, HasModule as _, Lookup, VariantId,
     hir::{Expr, ExprId, Literal},
-    src::{HasChildSource as _, HasSource as _},
+    src::{HasChildSourceView as _, HasSource as _},
 };
 use hir_ty::{
     ParamEnvAndCrate,
@@ -20,12 +20,12 @@ use hir_ty::{
 };
 use rustc_abi::BackendRepr;
 use rustc_type_ir::inherent::IntoKind as _;
-use syntax::AstNode as _;
+use syntax::view::AstNode as _;
 
 use super::inhabited::{Pred, Preds};
 use crate::{
-    cx::def_range,
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set, types::util},
+    cx::def_range_view,
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -64,7 +64,7 @@ impl InitError {
 
 impl LatePass for InvalidValue {
     const LINTS: LintSet = lint_set(["invalid_value"]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call, ExprTag::MethodCall]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call, ExprKind::MethodCall]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some(init) = dangerous_init(b, expr) else { return };
@@ -217,8 +217,8 @@ impl<'db> InitCx<'_, '_, 'db> {
         init: Init,
     ) -> Option<InitError> {
         let db = self.b.db();
-        let source = def.lookup(db).source(db);
-        let span = self.b.cx.span(InFile::new(source.file_id, def_range(source.value.syntax())));
+        let source = def.lookup(db).source_view(db);
+        let span = self.b.cx.span(InFile::new(source.file_id, def_range_view(source.value.syntax())));
         // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
         let mut potential = Vec::new();
         for &(variant, _) in def.enum_variants(db).variants.values() {
@@ -269,10 +269,9 @@ impl<'db> InitCx<'_, '_, 'db> {
             let field_ty = EarlyBinder::bind(types[field].ty().skip_binder()).instantiate(interner, args).skip_norm_wip();
             let Some(mut err) = self.ty_find_init_error(field_ty, init) else { continue };
             if local {
-                let sources = variant.child_source(db);
-                // clone: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
-                let node = sources.value[field].as_ref().either(|it| it.syntax().clone(), |it| it.syntax().clone());
-                let span = b.cx.span(InFile::new(sources.file_id, def_range(&node)));
+                let source = variant.child_source_view(db, field);
+                let node = source.value.expect("a local variant's field has a node").either(|it| it.syntax(), |it| it.syntax());
+                let span = b.cx.span(InFile::new(source.file_id, def_range_view(node)));
                 if err.0[0].1.is_none() {
                     err.0[0].1 = Some(span);
                     // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it

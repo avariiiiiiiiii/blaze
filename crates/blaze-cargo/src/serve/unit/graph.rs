@@ -153,11 +153,14 @@ pub(crate) struct Graph {
 }
 
 /// What a unit builds, hashed: its package, target name and kinds, and mode.
-pub(crate) fn target_hash(pkg_id: &str, name: &str, kinds: &[String], mode: Mode) -> u64 {
+pub(crate) fn target_hash(pkg_id: &str, name: &str, kinds: &[impl AsRef<str>], mode: Mode) -> u64 {
     let mut hasher = FxHasher::default();
     pkg_id.hash(&mut hasher);
     name.hash(&mut hasher);
-    kinds.hash(&mut hasher);
+    kinds.len().hash(&mut hasher);
+    for kind in kinds {
+        kind.as_ref().hash(&mut hasher);
+    }
     mode.hash(&mut hasher);
     hasher.finish()
 }
@@ -334,11 +337,14 @@ impl Graph {
     }
 
     /// The unit that builds `kinds` target `name` of `pkg_id` in `mode`.
-    pub(crate) fn find(&self, all: &[Unit], pkg_id: &str, name: &str, kinds: &[String], mode: Mode) -> Option<u32> {
+    pub(crate) fn find(&self, all: &[Unit], pkg_id: &str, name: &str, kinds: &[impl AsRef<str>], mode: Mode) -> Option<u32> {
         let found = self.by_target.get(&target_hash(pkg_id, name, kinds, mode))?;
         found.iter().copied().find(|at| {
             let unit = &all[*at as usize];
-            unit.pkg_id == pkg_id && unit.target.name == name && unit.target.kind == kinds && unit.mode == mode
+            unit.pkg_id == pkg_id
+                && unit.target.name == name
+                && unit.target.kind.iter().map(String::as_str).eq(kinds.iter().map(AsRef::as_ref))
+                && unit.mode == mode
         })
     }
 

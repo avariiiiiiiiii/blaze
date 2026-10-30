@@ -361,6 +361,7 @@ mod tests {
             stack,
             windows_subsystem: false,
             dev_run: None,
+            exec_log: false,
             triple: "wasm32-unknown-unknown".into(),
         }
     }

@@ -7,8 +7,9 @@
 //! the root of a library crate of the given edition, so what is checked again is only what
 //! the file changes. `harness/borrowck_ui.py` scores rustc's own `tests/ui` with it.
 //!
-//! `blaze-engine borrowck --project DIR` checks a cargo workspace instead: the errors the borrow
-//! checker finds in its crates, which for code rustc accepts must be none. With
+//! Both are blaze-diagnostics' diagnostics, every one rustc's checks give, the borrow checker's
+//! among them. `blaze-engine borrowck --project DIR` checks a cargo workspace instead: the
+//! errors blaze finds in its crates, which for code rustc accepts must be none. With
 //! `--timings OUT`, it times the checker on each body of the workspace instead, writing one
 //! JSON object per body to `OUT` and a summary to standard output. Without `--project`,
 //! `--timings OUT` writes for each file how many bodies were checked and the time by phase.
@@ -83,7 +84,6 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         .find_map(|it| vfs.file_id(&VfsPath::from(AbsPathBuf::assert_utf8(it))))
         .map(|(file, _)| file)
         .context("the crate root is not loaded")?;
-    let config = ide_diagnostics::DiagnosticsConfig::test_sample();
     let krate = *ide_db::base_db::relevant_crates(&db, file)
         .first()
         .context("the crate root is in no crate")?;
@@ -119,8 +119,11 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         if let Ok(name) = std::env::var("BLAZE_BORROWCK_MIR") {
             dump_mir(&db, file, &name);
         }
+        // alloc: the file's name, once a file
+        let paths = std::collections::HashMap::from([(file, test.clone())]);
         let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            hir_ty_borrowck::timings::measure(|| diagnostics(&db, &config, file))
+            let found = || diagnostics(&db, krate, &paths);
+            hir_ty_borrowck::timings::measure(found)
         }));
         let found = found.map(|(found, timings)| {
             if let Some(out) = &mut timings_out {
@@ -137,7 +140,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
                 });
                 let _ = writeln!(out, "{line}").and_then(|()| out.flush());
             }
-            found
+            found.into_iter().filter(|(path, _)| *path == test).map(|(_, it)| it).collect::<Vec<_>>()
         });
         let mut out =
             serde_json::json!({ "path": test, "ms": started.elapsed().as_millis() as u64 });
@@ -152,13 +155,6 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
-
-/// The codes of what the borrow checker reports: what a project rustc accepts must have none.
-const BORROWCK_CODES: &[&str] = &[
-    "E0373", "E0381", "E0382", "E0384", "E0499", "E0500", "E0501", "E0502", "E0503", "E0505",
-    "E0506", "E0507", "E0508", "E0509", "E0510", "E0515", "E0521", "E0524", "E0596", "E0597",
-    "E0621", "E0713", "E0716", "E0793", "E0309", "E0310", "E0311", "borrowck",
-];
 
 /// The cargo workspace at `root`, loaded as `load_cargo::load_workspace_at` loads it, but
 /// refused when `cargo metadata` fails: rust-analyzer then reads the workspace with
@@ -183,9 +179,10 @@ fn load_project(
     Ok((db, vfs))
 }
 
-/// `blaze-engine borrowck --project DIR`: the borrow checker's errors in the crates of the cargo
-/// workspace at `DIR`, one JSON object per line, and a last line counting files, errors,
-/// `unused_mut` warnings and files the checker panicked on, which fail it.
+/// `blaze-engine borrowck --project DIR`: the errors blaze-diagnostics gives in the local crates
+/// of the cargo workspace at `DIR` (every one: rustc accepts the workspace), one JSON object
+/// per line, and a last line counting files, errors, `unused_mut` warnings and crates the
+/// checker panicked on, which fail it.
 fn check_project(project: &str) -> anyhow::Result<()> {
     let root = AbsPathBuf::assert_utf8(dunce::canonicalize(project)?);
     let cargo_config = CargoConfig {
@@ -202,14 +199,17 @@ fn check_project(project: &str) -> anyhow::Result<()> {
     };
     let started = Instant::now();
     let (db, vfs) = load_project(&root, &cargo_config, &load_config)?;
-    let config = ide_diagnostics::DiagnosticsConfig::test_sample();
+    let crates: Vec<ide_db::base_db::Crate> = hir::attach_db(&db, || {
+        let local = hir::Crate::all(&db).into_iter().filter(|it| it.origin(&db).is_local());
+        local.map(ide_db::base_db::Crate::from).collect()
+    });
+    // alloc: the names of the workspace's files, once
+    let paths: std::collections::HashMap<vfs::FileId, String> =
+        vfs.iter().map(|(file, path)| (file, path.to_string())).collect();
     let files: Vec<vfs::FileId> = hir::attach_db(&db, || {
         let mut files = Vec::new();
-        for krate in hir::Crate::all(&db) {
-            if !krate.origin(&db).is_local() {
-                continue;
-            }
-            for module in krate.modules(&db) {
+        for &krate in &crates {
+            for module in hir::Crate::from(krate).modules(&db) {
                 let file = module.definition_source_file_id(&db).original_file(&db);
                 files.push(file.file_id(&db));
             }
@@ -222,25 +222,23 @@ fn check_project(project: &str) -> anyhow::Result<()> {
     let mut errors = 0;
     let mut unused_mut = 0;
     let mut panics = 0;
-    for &file in &files {
+    for &krate in &crates {
         if let Ok(name) = std::env::var("BLAZE_BORROWCK_MIR") {
-            dump_mir(&db, file, &name);
+            let root = hir::Crate::from(krate).root_file(&db);
+            dump_mir(&db, root, &name);
         }
         let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            diagnostics(&db, &config, file)
+            diagnostics(&db, krate, &paths)
         }));
-        let path = vfs.file_path(file).to_string();
         let mut stdout = stdout.lock();
         match found {
+            // Every error is one: rustc accepts the workspace, so it is one blaze gives wrongly.
             Ok(found) => {
-                for it in found {
-                    let code = it["code"].as_str().unwrap_or_default();
-                    if it["severity"] == "Error"
-                        && (BORROWCK_CODES.contains(&code) || code == "unused_mut")
-                    {
+                for (path, it) in found {
+                    if it["severity"] == "Error" {
                         errors += 1;
                         writeln!(stdout, "{}", serde_json::json!({ "path": path, "error": it }))?;
-                    } else if code == "unused_mut" {
+                    } else if it["code"] == "unused_mut" {
                         unused_mut += 1;
                         writeln!(stdout, "{}", serde_json::json!({ "path": path, "warning": it }))?;
                     }
@@ -249,6 +247,7 @@ fn check_project(project: &str) -> anyhow::Result<()> {
             Err(panic) => {
                 panics += 1;
                 let panic = crate::panic_message(&*panic);
+                let path = paths.get(&hir::Crate::from(krate).root_file(&db)).cloned();
                 writeln!(stdout, "{}", serde_json::json!({ "path": path, "panic": panic }))?;
             }
         }
@@ -265,11 +264,11 @@ fn check_project(project: &str) -> anyhow::Result<()> {
             "secs": secs
         })
     )?;
-    // A file the checker panics on has none of its errors reported.
+    // A crate the checker panics on has none of its errors reported.
     anyhow::ensure!(
         panics == 0,
-        "the borrow checker panicked on {panics} of {} files",
-        files.len()
+        "the checker panicked on {panics} of {} crates",
+        crates.len()
     );
     Ok(())
 }
@@ -527,7 +526,7 @@ fn mode_name(mode: hir_ty_borrowck::Mode) -> &'static str {
 fn dump_mir(db: &RootDatabase, file: vfs::FileId, name: &str) {
     use hir_ty::db::HirDatabase as _;
     hir::attach_db(db, || {
-        let sema = hir::Semantics::new(db);
+        let sema = hir::view::Semantics::new(db);
         let Some(module) = sema.file_to_module_def(file) else { return };
         for def in module.declarations(db) {
             if let hir::ModuleDef::Function(function) = def
@@ -556,38 +555,56 @@ fn dump_mir(db: &RootDatabase, file: vfs::FileId, name: &str) {
     })
 }
 
-/// Every diagnostic rust-analyzer has for `file`, with the line and column (from 1) of where
-/// it starts.
+/// Every diagnostic blaze-diagnostics gives compiling `krate`, by the name in `paths` of the
+/// file its first primary span is in (`<file N>` for one not named there, empty for one of no
+/// place), with the line and column (from 1) of where it starts. rustc's closing lines
+/// ("aborting due to ...", "N warnings emitted", the failure notes) are not among them.
 fn diagnostics(
     db: &RootDatabase,
-    config: &ide_diagnostics::DiagnosticsConfig,
-    file: vfs::FileId,
-) -> Vec<serde_json::Value> {
+    krate: ide_db::base_db::Crate,
+    paths: &std::collections::HashMap<vfs::FileId, String>,
+) -> Vec<(String, serde_json::Value)> {
+    use blaze_diagnostics::Level;
+    let files = blaze_diagnostics::Files::new(paths, "");
+    let options = blaze_diagnostics::Options::default();
     hir::attach_db(db, || {
-        let found = ide_diagnostics::full_diagnostics(
-            db,
-            config,
-            &ide_db::assists::AssistResolveStrategy::None,
-            file,
-        );
-        let text = db.file_text(file).text(db);
+        let found = blaze_diagnostics::check_crate(db, hir::Crate::from(krate), files, &options);
+        let named: std::collections::HashMap<String, vfs::FileId> =
+            paths.keys().map(|&file| (files.name(file), file)).collect();
+        let closing = |it: &blaze_diagnostics::Diag| {
+            it.message.starts_with("aborting due to")
+                || it.message.ends_with("warning emitted")
+                || it.message.ends_with("warnings emitted")
+        };
         found
             .into_iter()
-            .filter(|it| it.range.file_id == file)
+            .filter(|it| matches!(it.level, Level::Error | Level::Warning) && !closing(it))
             .map(|it| {
-                let start = usize::from(it.range.range.start()).min(text.len());
-                let before = &text[..start];
-                let line = before.matches('\n').count() + 1;
-                let col = before.rsplit('\n').next().map_or(0, |it| it.chars().count()) + 1;
-                let expanded = it.main_node.is_some_and(|it| it.file_id.is_macro());
-                serde_json::json!({
-                    "code": it.code.as_str(),
-                    "severity": format!("{:?}", it.severity),
+                let span = it.span.primary_span();
+                let path = span.map_or_else(String::new, |it| it.file.clone());
+                let text = named.get(&path).map(|&file| db.file_text(file).text(db));
+                let (line, col) = match (span, text) {
+                    (Some(span), Some(text)) => {
+                        let start = (span.lo as usize).min(text.len());
+                        let start = (0..=start).rev().find(|&at| text.is_char_boundary(at));
+                        let before = &text[..start.unwrap_or(0)];
+                        let line = before.matches('\n').count() + 1;
+                        let col = before.rsplit('\n').next().map_or(0, |it| it.chars().count()) + 1;
+                        (line, col)
+                    }
+                    _ => (0, 0),
+                };
+                let expanded = span.is_some_and(|it| it.expansion.is_some());
+                let code = it.code.as_ref().map_or("", |it| it.as_str());
+                let out = serde_json::json!({
+                    "code": code,
+                    "severity": format!("{:?}", it.level),
                     "line": line,
                     "col": col,
                     "message": it.message,
                     "expanded": expanded,
-                })
+                });
+                (path, out)
             })
             .collect()
     })

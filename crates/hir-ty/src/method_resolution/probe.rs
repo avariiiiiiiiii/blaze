@@ -573,7 +573,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                         }
                         step
                     })
-                    .collect();
+                    .collect(); // alloc: none up to its inline size: the steps are a `SmallVec`, as above
                 (steps, autoderef_via_deref.reached_recursion_limit())
             };
             let final_ty = autoderef_via_deref.final_ty();
@@ -762,7 +762,7 @@ impl<'db, 'f> ProbeChoice<'db> for ProbeForNameChoice<'db, 'f> {
             }
 
             let sources =
-                applicable_candidates.iter().map(|p| this.candidate_source(p, self_ty)).collect();
+                applicable_candidates.iter().map(|p| this.candidate_source(p, self_ty)).collect(); // alloc: the ambiguity error's sources, an error path
             return ControlFlow::Break(Err(MethodError::Ambiguity(sources)));
         }
 
@@ -771,7 +771,7 @@ impl<'db, 'f> ProbeChoice<'db> for ProbeForNameChoice<'db, 'f> {
                 let unstable_candidates = match this.choice.stable_only {
                     // clone: rustc's pick takes the list found so far.
                     true => this.choice.unstable_candidates.borrow().clone(),
-                    false => Vec::new(),
+                    false => Vec::new(), // alloc: none: an empty `Vec`
                 };
                 ControlFlow::Break(Ok(probe.to_unadjusted_pick(self_ty, unstable_candidates)))
             }
@@ -1490,7 +1490,7 @@ impl<'a, 'db, 'f> ProbeContext<'a, 'db, ProbeForNameChoice<'db, 'f>> {
             let sources = [possible_shadower, possible_shadowed]
                 .into_iter()
                 .map(|p| self.candidate_source_from_pick(p))
-                .collect();
+                .collect(); // alloc: the ambiguity error's sources, an error path
             return Err(MethodError::Ambiguity(sources));
         }
         Ok(())
@@ -1740,7 +1740,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
                 self.consider_probe(self_ty, instantiate_self_ty_obligations, probe)
                     != ProbeResult::NoMatch
             })
-            .collect();
+            .collect(); // alloc: none up to 4: `ApplicableCandidates` is a `SmallVec`
 
         debug!("applicable_candidates: {:?}", applicable_candidates);
 
@@ -2139,8 +2139,8 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
             autoref_or_ptr_adjustment: None,
             self_ty,
             receiver_steps: None,
-            shadowed_candidates: vec![],
-            unstable_candidates: vec![],
+            shadowed_candidates: vec![], // alloc: none: an empty `Vec`
+            unstable_candidates: vec![], // alloc: none: an empty `Vec`
         })
     }
 
@@ -2160,12 +2160,12 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
             return None;
         };
         let mut supertraits: FxHashSet<_> =
-            supertrait_def_ids(self.interner(), child_trait.into()).collect();
+            supertrait_def_ids(self.interner(), child_trait.into()).collect(); // alloc: only when several candidates apply and the crate enables `supertrait_item_shadowing`
 
-        let mut remaining_candidates: Vec<_> = probes[1..].to_vec();
+        let mut remaining_candidates: Vec<_> = probes[1..].to_vec(); // alloc: as above
         while !remaining_candidates.is_empty() {
             let mut made_progress = false;
-            let mut next_round = vec![];
+            let mut next_round = vec![]; // alloc: none until a candidate is pushed, and as above
 
             for remaining_candidate in remaining_candidates {
                 let ItemContainerId::TraitId(remaining_trait) =
@@ -2184,7 +2184,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
                 // other pick we've eliminated at this point. It will
                 // take over at this point.
                 let remaining_trait_supertraits: FxHashSet<_> =
-                    supertrait_def_ids(self.interner(), remaining_trait.into()).collect();
+                    supertrait_def_ids(self.interner(), remaining_trait.into()).collect(); // alloc: as above
                 if remaining_trait_supertraits.contains(&child_trait.into()) {
                     child_candidate = remaining_candidate;
                     child_trait = remaining_trait;
@@ -2221,9 +2221,9 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
                 .iter()
                 .map(|c| c.item)
                 .filter(|item| *item != child_candidate.item)
-                .collect(),
+                .collect(), // alloc: as above
             receiver_steps: None,
-            unstable_candidates: vec![],
+            unstable_candidates: vec![], // alloc: none: an empty `Vec`
         })
     }
 
@@ -2368,7 +2368,7 @@ impl<'db> Candidate<'db> {
                 InherentImplCandidate { receiver_steps, .. } => Some(receiver_steps),
                 _ => None,
             },
-            shadowed_candidates: vec![],
+            shadowed_candidates: vec![], // alloc: none: an empty `Vec`
             unstable_candidates,
         }
     }

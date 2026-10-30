@@ -35,10 +35,27 @@ pub struct Location {
     pub line: u32,
 }
 
+/// What an ingredient holds, as a read of it is told apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadKind {
+    /// An input struct's field.
+    Input,
+    /// An interned value: a pure function of its fields, which it holds.
+    Interned,
+    /// A tracked struct or its field.
+    TrackedStruct,
+    /// A tracked function's memo.
+    Query,
+    Accumulator,
+}
+
 pub trait Ingredient: Any + fmt::Debug + Send + Sync {
     fn debug_name(&self) -> &'static str;
     fn location(&self) -> &'static Location;
     fn jar_kind(&self) -> JarKind;
+
+    /// What this ingredient holds, for telling its reads apart.
+    fn read_kind(&self) -> ReadKind;
 
     /// Has the value for `input` in this ingredient changed after `revision`?
     ///
@@ -245,6 +262,75 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
         unreachable!(
             "called `deserialize` on ingredient where `should_serialize` returns `false`"
         )
+    }
+
+    /// The schema of this ingredient's values in the daemon image ([`crate::image`]), or `None`
+    /// if the image does not keep them. Only interned structs with an `image` codec have one.
+    fn image_schema(&self) -> Option<blaze_format::SchemaHash> {
+        None
+    }
+
+    /// Calls `f` with the `Id` of each of this ingredient's values.
+    // dyn: the edge: the image's GC and restore reach each kept ingredient once, through the ingredient list's vtable
+    fn image_ids(&self, _zalsa: &Zalsa, _f: &mut dyn FnMut(Id)) {
+        unreachable!("called `image_ids` on an ingredient the image does not keep")
+    }
+
+    /// Whether `id`, of this ingredient, is the value its slot holds now.
+    fn image_holds(&self, _zalsa: &Zalsa, _id: Id) -> bool {
+        unreachable!("called `image_holds` on an ingredient the image does not keep")
+    }
+
+    /// Pushes the salsa IDs and the symbol IDs that the value `id` names.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds the storage exclusively until this returns.
+    unsafe fn image_names(
+        &self,
+        _zalsa: &Zalsa,
+        _id: Id,
+        _ids: &mut Vec<Id>,
+        _symbols: &mut Vec<u32>,
+    ) {
+        unreachable!("called `image_names` on an ingredient the image does not keep")
+    }
+
+    /// Appends every slot of this ingredient's pages, in page and slot order: the values whose
+    /// index `marked` holds as kept, the others as freed.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds the storage exclusively until this returns.
+    unsafe fn write_image_slots(
+        &self,
+        _zalsa: &Zalsa,
+        _marked: &blaze_ids::bits::BitSet<u32>,
+        _out: &mut crate::image::SlotsOut<'_>,
+    ) {
+        unreachable!("called `write_image_slots` on an ingredient the image does not keep")
+    }
+
+    /// Decodes the slots the image keeps for this ingredient, changing nothing.
+    // alloc: the edge: once per ingredient per restore
+    fn decode_image_slots(
+        &self,
+        _slots: &[crate::image::SlotRecord],
+        _blob: &[u8],
+    // dyn: the edge: the image's GC and restore reach each kept ingredient once, through the ingredient list's vtable
+    ) -> Result<Box<dyn Any>, crate::image::ImageError> {
+        unreachable!("called `decode_image_slots` on an ingredient the image does not keep")
+    }
+
+    /// Makes page `page`, empty, a page of this ingredient's values.
+    fn force_image_page(&self, _table: &mut Table, _page: crate::table::PageIndex) {
+        unreachable!("called `force_image_page` on an ingredient the image does not keep")
+    }
+
+    /// Puts the slots `decode_image_slots` decoded back at their IDs.
+    // dyn: the edge: the image's GC and restore reach each kept ingredient once, through the ingredient list's vtable
+    fn apply_image_slots(&mut self, _table: &mut Table, _decoded: Box<dyn Any>) {
+        unreachable!("called `apply_image_slots` on an ingredient the image does not keep")
     }
 }
 

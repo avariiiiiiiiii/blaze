@@ -1577,6 +1577,7 @@ mod tests {
             stack: None,
             windows_subsystem: false,
             dev_run: None,
+            exec_log: false,
             triple: match arch { Arch::X86_64 => "x86_64-apple-darwin", _ => "aarch64-apple-darwin" }.into(),
         }
     }

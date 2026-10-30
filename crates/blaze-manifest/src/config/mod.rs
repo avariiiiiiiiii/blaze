@@ -513,6 +513,7 @@ impl<F: Files> Config<F> {
         if !seen.insert(path.to_path_buf()) {
             bail!("config `include` cycle detected with path `{}`", path.display());
         }
+        // alloc: an error's context, made only when the read fails.
         let read = || format!("failed to read configuration file `{}`", path.display());
         let bytes = self.files.read(path).with_context(read)?;
         let contents = std::str::from_utf8(&bytes)

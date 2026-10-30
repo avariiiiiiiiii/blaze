@@ -344,6 +344,13 @@ fn check(tree: &Arc<FlatTree>) {
                     }
                 }
                 assert_eq!(&v.subtree(), &**c.clone_subtree().flat_tree().unwrap());
+                let elided: Vec<View<'_>> = v.children().step_by(2).collect();
+                let elided_cursors: Vec<Cursor> = c.children().step_by(2).collect();
+                assert_eq!(
+                    &v.subtree_without(&elided),
+                    &**c.clone_subtree_without(&elided_cursors).flat_tree().unwrap(),
+                    "{i} subtree without every other child"
+                );
             }
             (NodeOrToken::Token(c), NodeOrToken::Token(v)) => {
                 let token = |it: Option<api::SyntaxToken<Raw>>| find(it.map(NodeOrToken::Token));

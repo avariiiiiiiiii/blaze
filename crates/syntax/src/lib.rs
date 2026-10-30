@@ -154,17 +154,24 @@ impl<T> Parse<T> {
         self.errors_of(false)
     }
 
+    /// Whether the parse stored errors, those its lexer and parser found: without the walk of
+    /// every node [`Parse::errors`] makes to validate the tree, nor the errors of an outline's
+    /// lazy bodies.
+    pub fn has_parser_errors(&self) -> bool {
+        self.errors.is_some()
+    }
+
     fn errors_of(&self, all_bodies: bool) -> Vec<SyntaxError> {
         let mut errors = if let Some(e) = self.errors.as_deref() { e.to_vec() } else { vec![] };
-        let root = self.syntax_node();
+        let root = self.root();
         let Some(edition) = self.outline else {
-            validation::validate(&root, &mut errors);
+            validation::validate(root, &mut errors);
             return errors;
         };
         let tree = self.tree.as_ref().unwrap().flat();
         let lazies: Vec<_> = tree.lazies().map(|at| (tree.range(at), at)).collect();
         validation::validate_outline(
-            &root,
+            root,
             &lazies,
             |at, errors| {
                 if !all_bodies && !tree.is_parsed(at) {
@@ -324,6 +331,35 @@ impl Parse<SourceFile> {
         match parsing::incremental_reparse_onto(tree, delete, &text, errors, edition, self.outline)
         {
             Some((tree, errors, _reparsed)) => {
+                Parse::with_outline(Tree::new(std::sync::Arc::new(tree)), errors, self.outline)
+            }
+            None => match self.outline {
+                Some(_) => SourceFile::parse_outline(text, edition),
+                None => SourceFile::parse_shared(text, edition),
+            },
+        }
+    }
+
+    /// The parse of the text with each of `edits` made (`delete` replaced by `insert`; in order
+    /// of start, none overlapping another, all in this parse's text): the new text made once,
+    /// each edit's token, lazy body, block or item chosen and checked as [`Parse::reparse`]
+    /// chooses and checks it, and the tree copied once with all of them in it. Edits whose
+    /// checks read each other's text are parsed again as one. When one has no such element,
+    /// the whole new text is parsed once, as [`Parse::reparse`] does for one edit. The same
+    /// parse as [`Parse::reparse`] makes of them one by one.
+    pub fn reparse_all(&self, edits: &[(TextRange, &str)], edition: Edition) -> Parse<SourceFile> {
+        if edits.is_empty() && self.outline.is_none_or(|it| it == edition) {
+            return self.clone();
+        }
+        let tree = self.tree.as_ref().unwrap().flat();
+        let text = raw::spliced(tree.source(), edits);
+        let errors = self.errors.as_deref().unwrap_or_default().iter().cloned();
+        let reparsed = match edits.is_empty() {
+            true => None,
+            false => parsing::reparse_all(tree, edits, &text, errors, edition, self.outline),
+        };
+        match reparsed {
+            Some((tree, errors)) => {
                 Parse::with_outline(Tree::new(std::sync::Arc::new(tree)), errors, self.outline)
             }
             None => match self.outline {

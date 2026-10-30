@@ -5,7 +5,6 @@
 use base_db::{Crate, all_crates};
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, ImplId, ModuleDefId, TypeAliasId,
-    nameres::crate_def_map,
     signatures::{
         EnumSignature, FunctionSignature, StructSignature, TypeAliasSignature, UnionSignature,
     },
@@ -40,20 +39,12 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
 }
 
 fn declarations(db: &TestDB, krate: Crate) -> Vec<ModuleDefId> {
-    let def_map = crate_def_map(db, krate);
-    def_map
-        .modules(db)
-        .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
-        .collect()
+    hir_def::test_items::declarations(db, krate)
 }
 
 /// The impls of `krate`'s modules, in the order they are written.
 fn impls(db: &TestDB, krate: Crate) -> Vec<ImplId> {
-    let def_map = crate_def_map(db, krate);
-    def_map
-        .modules(db)
-        .flat_map(|(_, module)| module.scope(db).impls().collect::<Vec<_>>())
-        .collect()
+    hir_def::test_items::impls(db, krate)
 }
 
 fn function_named(db: &TestDB, krate: Crate, name: &str) -> FunctionId {

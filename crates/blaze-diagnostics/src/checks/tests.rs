@@ -1,6 +1,7 @@
 //! Allocation budgets of the checks' no-diagnostic path: a clean crate's signatures are
 //! resolved with as many allocations at 8 items as at 64 (a type parameter of the item and a
-//! lifetime its binder declares are ruled out from the syntax, before Semantics), and the
+//! lifetime its binder declares are ruled out from the syntax, before Semantics, as is a
+//! primitive type where nothing of the crate shadows one), and the
 //! attribute reads every check makes (a path, one owner's lowering) allocate nothing.
 
 use blaze_alloc_count::{assert_at_most, measure};
@@ -10,6 +11,7 @@ use super::{attrs, defs, features, names};
 use crate::{
     cx::Cx,
     lints::syntax::attrs::{Owner, owners},
+    model::Code,
 };
 
 /// `check` given the context of the one crate of `fixture`.
@@ -60,8 +62,49 @@ fn names_of_a_clean_crate_cost_the_same_at_any_size() {
     assert!(small <= 8, "the clean path allocates {small} times");
 }
 
+/// A crate of one file with `n` items whose signatures name only primitive types.
+fn primitive_items(n: usize) -> String {
+    let mut out = String::from("//- /main.rs crate:main\n");
+    for i in 0..n {
+        out.push_str(&format!("pub fn p{i}(x: u8, y: &str, z: bool) -> f64 {{ let _ = (x, y, z); 0.0 }}\n"));
+        out.push_str(&format!("pub struct P{i}(u128, char, isize);\n"));
+    }
+    out.push_str("fn main() {}\n");
+    out
+}
+
+/// In a crate where nothing shadows a primitive type, its paths are ruled out from the syntax,
+/// before Semantics.
+#[test]
+fn primitive_types_of_a_clean_crate_cost_the_same_at_any_size() {
+    let allocations = |n: usize| {
+        with_cx(&primitive_items(n), |cx| {
+            assert!(!cx.krate.shadows_primitive_type(cx.db), "nothing of the fixture shadows a primitive");
+            let scopes = defs::scopes(cx);
+            assert!(names::check(cx, &scopes).is_empty(), "the fixture's signatures resolve");
+            measure(|| names::check(cx, &scopes)).1.allocations
+        })
+    };
+    let (small, large) = (allocations(8), allocations(64));
+    assert_eq!(small, large, "the primitive paths' allocations grow with the items");
+}
+
+/// A crate that brings in a name of a primitive type has it resolved: a variant `u8` is not a
+/// type (rustc's E0573).
+#[test]
+fn a_shadowed_primitive_type_is_resolved() {
+    let fixture = "//- /main.rs crate:main\npub enum E { u8 }\nuse E::u8;\npub fn f(_: u8) {}\nfn main() {}\n";
+    with_cx(fixture, |cx| {
+        assert!(cx.krate.shadows_primitive_type(cx.db), "the import shadows `u8`");
+        let scopes = defs::scopes(cx);
+        let found = names::check(cx, &scopes);
+        let codes: Vec<_> = found.iter().map(|it| it.diag.code.clone()).collect();
+        assert_eq!(codes, [Some(Code::Error("E0573".to_owned()))]);
+    });
+}
+
 /// The owners of the attributes of [`generic_items`]`(8)`.
-fn with_owners<R>(check: impl FnOnce(&Cx<'_, '_>, &[Owner]) -> R) -> R {
+fn with_owners<R>(check: impl FnOnce(&Cx<'_, '_>, &[Owner<'_>]) -> R) -> R {
     with_cx(&generic_items(8), |cx| {
         let owners = owners(cx, cx.walk());
         assert!(owners.iter().map(|it| it.attrs.len()).sum::<usize>() >= 32, "the fixture has attributes");

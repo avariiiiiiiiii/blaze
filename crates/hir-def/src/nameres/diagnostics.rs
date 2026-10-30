@@ -23,6 +23,21 @@ pub enum DefDiagnosticKind {
     MalformedDerive { ast: AstId<ast::Adt>, id: AttrId },
     MacroDefError { ast: AstId<ast::Macro>, message: String },
     MacroError { ast: AstId<ast::Item>, path: ModPath, err: ExpandErrorKind },
+    /// A `use` of a trait's associated items (`use Trait::item`, `use Trait::*`) that rustc's
+    /// `finalize_imports` reports, or that blaze cannot list.
+    TraitItemImport { id: AstId<ast::Use>, index: Idx<ast::UseTree>, why: TraitItemImport },
+}
+
+/// Why a [`DefDiagnosticKind::TraitItemImport`] is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TraitItemImport {
+    /// rustc's E0658, "`use` associated items of traits is unstable": the crate does not enable
+    /// `import_trait_associated_functions`. The import still binds the items, as in rustc.
+    Unstable,
+    /// The trait is in the def map being collected and an item of it comes from a macro or
+    /// may be an attribute macro's: listing them would expand macros that read this def map.
+    /// blaze stops here instead of importing fewer items than rustc does; nothing is bound.
+    ItemsFromMacros,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +92,15 @@ impl DefDiagnostic {
         index: Idx<ast::UseTree>,
     ) -> Self {
         Self { in_module: container, kind: DefDiagnosticKind::UnresolvedImport { id, index } }
+    }
+
+    pub(crate) fn trait_item_import(
+        container: ModuleId,
+        id: AstId<ast::Use>,
+        index: Idx<ast::UseTree>,
+        why: TraitItemImport,
+    ) -> Self {
+        Self { in_module: container, kind: DefDiagnosticKind::TraitItemImport { id, index, why } }
     }
 
     pub fn macro_error(

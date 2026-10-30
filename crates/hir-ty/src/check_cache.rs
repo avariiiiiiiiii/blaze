@@ -180,13 +180,13 @@ impl std::fmt::Debug for PartBuf {
     }
 }
 
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
 fn served_part(db: &Db, krate: Crate) -> Option<PartBuf> {
     ServedBodies::try_get(db)?.parts(db).0.get(&krate).cloned().map(PartBuf)
 }
 
 /// The crate's items, made in this database once per crate: what each body's ids name.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn served_items(db: &Db, krate: Crate) -> Box<[(IdKind, u64)]> {
     let part = view(db, krate).expect("the items of a crate with a part");
     part.items(db, krate).unwrap_or_else(|why| corrupt(db, krate, None, &why))

@@ -104,6 +104,15 @@ with `share_from(&old[..], &old[0])` when `Shared::owners` is above 1, then take
 
 > forwarded to mem (`crates/blaze-mem/src/pool.rs`; mem-next1); told by tmux (requests, pass 29).
 
+> done by mem (2026-10-29): `Cache::<Counted<[E; N]>>::try_share_from` / `share_from` and the
+> `Written` guard, as written (with `&raw mut` for the field pointers). Tests in `src/tests.rs`:
+> - `shared_from_matches_share_for_every_head_length` (`[u32; 8]` and `[String; 5]`);
+> - `shared_from_makes_a_megabyte_slot_on_a_small_stack` (1 MiB slots on a 64 KiB stack);
+> - `shared_from_allocates_nothing_once_warm`;
+> - `shared_from_a_panicking_clone_drops_what_it_wrote_and_returns_the_slot`. It uses a pool of
+>   one slot, so the retry succeeds only if the slot came back.
+> `cow.rs`'s call now has what it needs.
+
 ## M2 (lane mem, `crates/blaze-mem/src/pool.rs`): `Shared::make_mut`'s signature
 
 `pub fn make_mut(this: &mut Self, cache: &mut Cache<'p, Counted<T>>) -> &mut T` has two elided
@@ -118,6 +127,9 @@ pub fn make_mut<'s>(this: &'s mut Self, cache: &mut Cache<'p, Counted<T>>) -> &'
 
 > forwarded to mem (`crates/blaze-mem/src/pool.rs`; mem-next1); told by tmux (requests, pass 29).
 
+> done by mem (2026-10-29): `make_mut<'s>(this: &'s mut Self, cache: &mut Cache<'p, Counted<T>>)
+> -> &'s mut T`.
+
 ## M3 (lane mem, `crates/blaze-mem/src/pool.rs`): carving large slots commits 64 of them
 
 `Pool::carve` commits `BATCH` (64) slots at once (`self.slots.ensure(end * SIZE)`). For the image
@@ -130,3 +142,8 @@ pages when it is handed out rather than when it is carved. Not needed for correc
 works either way.
 
 > forwarded to mem (`crates/blaze-mem/src/pool.rs`; mem-next1); told by tmux (requests, pass 29).
+
+> done by mem (2026-10-29): `Pool::<T>::CARVE` is a const, the number of slots that fit in
+> 2 MiB, clamped to 1..=64. `carve` takes that many (64 for small slots, as before; one at a time
+> for 1 MiB and larger). A pool of large slots commits only what its first objects need.
+

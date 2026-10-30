@@ -1,0 +1,55 @@
+//! What the harness running the corpus gives it: one JSON value in `BLAZE_MACRO_CORPUS`, the
+//! value itself or a file's path, refusing a field it does not know.
+
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+
+pub(crate) const VAR: &str = "BLAZE_MACRO_CORPUS";
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Corpus {
+    /// `tests/corpus/ws` or a copy of it, absolute, built there by `blaze build -p
+    /// corpus-calls` (each build script's run left its output where the plan names it), its
+    /// registry packages fetched into `cargo_home`.
+    pub(crate) workspace: String,
+    /// Another copy, built the same way, which the keeping tests change.
+    pub(crate) scratch: Option<String>,
+    /// The `CARGO_HOME` the packages were fetched into and the build ran with.
+    pub(crate) cargo_home: String,
+    /// The toolchain's proc-macro server, of `vendor/proc-macro-srv` for the pinned nightly.
+    pub(crate) server: Option<String>,
+    /// rustc's library of each proc-macro crate of the workspace by crate name
+    /// (`serde_derive`), built by the pinned nightly's cargo.
+    #[serde(default)]
+    pub(crate) dylibs: BTreeMap<String, String>,
+    /// blaze's WebAssembly module of a proc-macro crate, by crate name, where one was built.
+    #[serde(default)]
+    pub(crate) wasm: BTreeMap<String, String>,
+}
+
+impl Corpus {
+    pub(crate) fn read() -> Result<Corpus, String> {
+        let value = std::env::var(VAR).map_err(|_| {
+            format!("{VAR} names no corpus config: the harness sets it (crates/blaze-macro-eval/tests/corpus.rs)")
+        })?;
+        let text = match value.trim_start().starts_with('{') {
+            true => value,
+            false => std::fs::read_to_string(&value).map_err(|error| format!("{VAR}={value}: {error}"))?,
+        };
+        serde_json::from_str(&text).map_err(|error| format!("{VAR}: {error}"))
+    }
+
+    pub(crate) fn server(&self) -> Result<&str, String> {
+        self.server.as_deref().ok_or_else(|| format!("{VAR} names no `server`: the toolchain's proc-macro server"))
+    }
+
+    pub(crate) fn scratch(&self) -> Result<&str, String> {
+        self.scratch.as_deref().ok_or_else(|| format!("{VAR} names no `scratch`: a built copy of the workspace to change"))
+    }
+
+    pub(crate) fn dylib(&self, krate: &str) -> Result<&str, String> {
+        self.dylibs.get(krate).map(String::as_str).ok_or_else(|| format!("{VAR} names no rustc library of `{krate}` in `dylibs`"))
+    }
+}

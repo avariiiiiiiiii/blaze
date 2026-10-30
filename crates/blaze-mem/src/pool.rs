@@ -22,7 +22,7 @@ use std::{
     marker::PhantomData,
     mem,
     ops::{Deref, DerefMut},
-    ptr::NonNull,
+    ptr::{self, NonNull},
 };
 
 use blaze_reclaim::Grace;
@@ -82,6 +82,19 @@ impl<T> Pool<T> {
         mem::size_of::<T>()
     };
 
+    /// Slots carved (and committed) at once: a batch, or as many as fit in 2 MiB when slots
+    /// are large, so a pool of big slots commits no more than its first few objects need.
+    const CARVE: u32 = {
+        let fit = (2 << 20) / Self::SIZE;
+        if fit < 1 {
+            1
+        } else if fit > BATCH {
+            BATCH as u32
+        } else {
+            fit as u32
+        }
+    };
+
     /// A pool of at most `max` objects for `tag`, reserving their room and committing none.
     pub fn new(max: u32, tag: Tag) -> Result<Pool<T>, MemError> {
         let max = max.min(crate::stack::NONE - 1);
@@ -131,7 +144,7 @@ impl<T> Pool<T> {
 
     /// Up to `BATCH` new slots, committed, their links made; their first index and count.
     fn carve(&self) -> Result<(u32, u32), MemError> {
-        let start = self.carved.fetch_add(BATCH as u32, Ordering::Relaxed);
+        let start = self.carved.fetch_add(Self::CARVE, Ordering::Relaxed);
         if start >= self.max {
             self.carved.fetch_min(self.max, Ordering::Relaxed);
             return Err(MemError::Exhausted {
@@ -140,7 +153,7 @@ impl<T> Pool<T> {
                 wanted: (start as usize + 1) * Self::SIZE,
             });
         }
-        let end = start.saturating_add(BATCH as u32).min(self.max);
+        let end = start.saturating_add(Self::CARVE).min(self.max);
         self.slots.ensure(end as usize * Self::SIZE)?;
         for index in start..end {
             // SAFETY: `[start, end)` came from the `fetch_add` just now: no other thread has
@@ -445,6 +458,73 @@ impl<'p, T> Cache<'p, Counted<T>> {
     }
 }
 
+impl<'p, E: Clone, const N: usize> Cache<'p, Counted<[E; N]>> {
+    /// Places `head`, then clones of `fill` up to `N` elements, in a slot with one owner. Each
+    /// element is written in place: the array never passes through the stack, so a slot of
+    /// megabytes works, and a copy (`head` a whole array) is one pass over the slot.
+    pub fn try_share_from(
+        &mut self,
+        head: &[E],
+        fill: &E,
+    ) -> Result<Shared<'p, [E; N]>, MemError> {
+        assert!(head.len() <= N, "{} elements for a slot of {N}", head.len());
+        if self.len == 0 {
+            self.refill()?;
+        }
+        self.len -= 1;
+        let index = self.items[self.len];
+        let ptr = self.pool.slot(index);
+        let slot = ptr.as_ptr();
+        // SAFETY: a free slot is committed, aligned for `Counted<[E; N]>`, holds no value and is
+        // held by this cache alone; its fields are written through raw pointers, never read.
+        let items = unsafe {
+            (&raw mut (*slot).owners).write(AtomicU32::new(1));
+            (&raw mut (*slot).value).cast::<E>()
+        };
+        let mut written = Written { pool: self.pool, index, items, len: 0 };
+        for item in head {
+            // SAFETY: `written.len < head.len() <= N`: in the array, and nothing is there yet.
+            unsafe { items.add(written.len).write(item.clone()) };
+            written.len += 1;
+        }
+        while written.len < N {
+            // SAFETY: as above, `written.len < N`.
+            unsafe { items.add(written.len).write(fill.clone()) };
+            written.len += 1;
+        }
+        mem::forget(written);
+        Ok(Shared { pool: self.pool, index, ptr })
+    }
+
+    /// As [`Cache::try_share_from`]; stops when the pool is full.
+    #[inline]
+    #[track_caller]
+    pub fn share_from(&mut self, head: &[E], fill: &E) -> Shared<'p, [E; N]> {
+        match self.try_share_from(head, fill) {
+            Ok(shared) => shared,
+            Err(error) => fail(error),
+        }
+    }
+}
+
+/// The elements a `try_share_from` has written: dropped, and the slot returned, if a clone
+/// panics.
+struct Written<'p, E, T> {
+    pool: &'p Pool<T>,
+    index: u32,
+    items: *mut E,
+    len: usize,
+}
+
+impl<E, T> Drop for Written<'_, E, T> {
+    fn drop(&mut self) {
+        // SAFETY: the first `len` elements were written and nothing else owns them; the slot's
+        // count is a plain atomic with nothing to drop.
+        unsafe { ptr::slice_from_raw_parts_mut(self.items, self.len).drop_in_place() };
+        self.pool.give_one(self.index);
+    }
+}
+
 /// A `T` in a slot of a [`Pool`], owned like an `Arc<T>`: [`Clone`] adds an owner (one atomic
 /// add), the last owner's drop drops the value and returns the slot, and [`Shared::make_mut`]
 /// copies into a fresh slot only while the value is shared. For copy-on-write chunks that come
@@ -496,7 +576,7 @@ impl<'p, T> Shared<'p, T> {
     /// owners share it, which then keep the old one.
     #[inline]
     #[track_caller]
-    pub fn make_mut(this: &mut Self, cache: &mut Cache<'p, Counted<T>>) -> &mut T
+    pub fn make_mut<'s>(this: &'s mut Self, cache: &mut Cache<'p, Counted<T>>) -> &'s mut T
     where
         T: Clone,
     {

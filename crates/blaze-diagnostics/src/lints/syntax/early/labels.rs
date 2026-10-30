@@ -17,7 +17,8 @@ use hir::{HirFileId, InFile};
 use hir_def::{expr_store::Body, hir::Expr, nameres::demand::every_body};
 use span::SyntaxContext;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, T, TextRange, ast,
+    SyntaxKind, T, TextRange,
+    view::{self as ast, AstNode as _},
 };
 
 use super::ctxt;
@@ -57,13 +58,13 @@ pub(super) fn unused(cx: &Cx<'_, '_>) -> Vec<Emitted> {
             if ptr.kind() != SyntaxKind::LABEL {
                 continue;
             }
-            let node = cx.syntax(InFile::new(source.file_id, ptr));
+            let node = cx.syntax_view(InFile::new(source.file_id, ptr));
             let Some(lifetime) = node.value.children().find_map(ast::Lifetime::cast) else { continue };
             if lifetime.text().as_bytes().get(1) == Some(&b'_') {
                 continue;
             }
             let Some(labeled) = node.value.parent() else { continue };
-            let at = InFile::new(node.file_id, SyntaxNodePtr::new(&labeled));
+            let at = InFile::new(node.file_id, ast::ptr(labeled));
             let span = cx.span(InFile::new(node.file_id, lifetime.syntax().text_range()));
             let mut diag = Diag::lint("unused_labels", "unused label", span);
             source_fact(cx, &mut diag, at);
@@ -76,11 +77,11 @@ pub(super) fn unused(cx: &Cx<'_, '_>) -> Vec<Emitted> {
 /// The warning resolution gives when the label `node` (of `tree`) resolves, as a `break` to it
 /// would, to a label of an enclosing loop or block. Called in walk order, so in the order rustc's
 /// visitor declares them.
-pub(super) fn shadowing(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
+pub(super) fn shadowing(cx: &Cx<'_, '_>, tree: &Tree<'_>, node: ast::Node<'_>, out: &mut Vec<Emitted>) {
     let Some(lifetime) = node.children().find_map(ast::Lifetime::cast) else { return };
     let Some(labeled) = node.parent() else { return };
     let range = lifetime.syntax().text_range();
-    let at = InFile::new(tree.file, SyntaxNodePtr::new(&labeled));
+    let at = InFile::new(tree.file, ast::ptr(labeled));
     let hygiene = ctxt(cx, tree.file, range);
     let Some(orig) = resolve(cx, InFile::new(tree.file, labeled), lifetime.text(), hygiene) else { return };
     let name = lifetime.text();
@@ -103,7 +104,7 @@ pub(super) fn shadowing(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &m
 /// are no rib.
 fn resolve(
     cx: &Cx<'_, '_>,
-    labeled: InFile<SyntaxNode>,
+    labeled: InFile<ast::Node<'_>>,
     name: &str,
     mut hygiene: SyntaxContext,
 ) -> Option<InFile<TextRange>> {
@@ -111,17 +112,17 @@ fn resolve(
     let mut key: Option<SyntaxContext> = None;
     loop {
         let Some(parent) = child.parent() else {
-            let call = file.macro_file()?.loc(cx.db).to_node(cx.db);
+            let call = file.macro_file()?.loc(cx.db).to_node_view(cx.db);
             (file, child) = (call.file_id, call.value);
             continue;
         };
-        if barrier(&parent, &child) {
+        if barrier(parent, child) {
             return None;
         }
-        if parent.kind() == SyntaxKind::STMT_LIST && macro_definitions(cx, file, &parent, &child, &mut hygiene) {
+        if parent.kind() == SyntaxKind::STMT_LIST && macro_definitions(cx, file, parent, child, &mut hygiene) {
             key = None;
         }
-        if let Some(label) = label_over(&parent, &child)
+        if let Some(label) = label_over(parent, child)
             && let Some(lifetime) = label.lifetime()
             && lifetime.text() == name
         {
@@ -138,18 +139,18 @@ fn resolve(
 /// The label `parent` declares over `child`: rustc's label rib of a loop or block covers a
 /// `loop`'s body, a `while`'s condition and body, a `for`'s pattern and body (not what it
 /// iterates) and a block's statements.
-fn label_over(parent: &SyntaxNode, child: &SyntaxNode) -> Option<ast::Label> {
+fn label_over<'t>(parent: ast::Node<'t>, child: ast::Node<'t>) -> Option<ast::Label<'t>> {
     let label = || parent.children().find_map(ast::Label::cast);
     let mut blocks = parent.children().filter(|it| it.kind() == SyntaxKind::BLOCK_EXPR);
     match parent.kind() {
         // `LoopExpr::loop_body`: its first block.
-        SyntaxKind::LOOP_EXPR => blocks.next().filter(|body| body == child).and_then(|_| label()),
+        SyntaxKind::LOOP_EXPR => blocks.next().filter(|&body| body == child).and_then(|_| label()),
         SyntaxKind::WHILE_EXPR if child.kind() != SyntaxKind::LABEL => label(),
         SyntaxKind::FOR_EXPR => {
             // `ForExpr::loop_body`: its second block, else its first.
             let (first, second) = (blocks.next(), blocks.next());
-            let in_scope = second.or(first).is_some_and(|body| &body == child)
-                || parent.children().find(|it| ast::Pat::can_cast(it.kind())).is_some_and(|pat| &pat == child);
+            let in_scope = second.or(first).is_some_and(|body| body == child)
+                || parent.children().find(|it| ast::Pat::can_cast(it.kind())).is_some_and(|pat| pat == child);
             in_scope.then(label).flatten()
         }
         SyntaxKind::BLOCK_EXPR if child.kind() == SyntaxKind::STMT_LIST => label(),
@@ -160,7 +161,7 @@ fn label_over(parent: &SyntaxNode, child: &SyntaxNode) -> Option<ast::Label> {
 /// Whether rustc's label ribs have a barrier at `parent` over `child`: a closure, a coroutine
 /// (`async` or `gen` block), a constant (an item, an inline `const` block, an array's length, a
 /// const argument or parameter default, a discriminant) or an item's own scope.
-fn barrier(parent: &SyntaxNode, child: &SyntaxNode) -> bool {
+fn barrier(parent: ast::Node<'_>, child: ast::Node<'_>) -> bool {
     match parent.kind() {
         SyntaxKind::CLOSURE_EXPR | SyntaxKind::CONST_ARG | SyntaxKind::CONST_PARAM | SyntaxKind::VARIANT => {
             true
@@ -186,8 +187,8 @@ fn barrier(parent: &SyntaxNode, child: &SyntaxNode) -> bool {
 fn macro_definitions(
     cx: &Cx<'_, '_>,
     file: HirFileId,
-    list: &SyntaxNode,
-    child: &SyntaxNode,
+    list: ast::Node<'_>,
+    child: ast::Node<'_>,
     hygiene: &mut SyntaxContext,
 ) -> bool {
     let mut bound = child.text_range().start();
@@ -201,7 +202,7 @@ fn macro_definitions(
         let start = ptr.text_range().start();
         let defined_here = start < bound
             && list.children().any(|stmt| {
-                matches!(stmt.kind(), SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF) && SyntaxNodePtr::new(&stmt) == ptr
+                matches!(stmt.kind(), SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF) && ast::ptr(stmt) == ptr
             });
         if !defined_here {
             break;

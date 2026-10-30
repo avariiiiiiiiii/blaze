@@ -213,6 +213,7 @@ pub fn elsewhere() -> u32 { 1 }
     let other = files[1].file_id(&db);
     let defs = hir_ty::attach_db(&db, || {
         let defs: Vec<_> =
+            // alloc: the test's setup, before anything is measured.
             functions(&db).into_iter().filter(|(name, _)| name != "elsewhere").collect();
         for (_, def) in &defs {
             borrowck(&db, *def);

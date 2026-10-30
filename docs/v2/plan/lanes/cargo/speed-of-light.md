@@ -29,8 +29,8 @@ file.
 
 The load turns a checkout's files and the request's config into `Units`: every unit's crate,
 dependencies, cfgs, env, flags and outputs (`load.rs`, `load/`). It is a set of queries on
-blaze-query's database (`Invocation`, `Asking`, `Mounts`, `LoadFile`, `LoadDir`, `ConfigChain`,
-`ManifestQuery`, `WorkspaceQuery`, `Plan`), so its warm cost is the database's: a memo hit in the
+blaze-query's database (`Invocation`, `Asking`, `Mounts`, `LoadFile`, `LoadDir`, `TomlFile`,
+`ConfigChain`, `ManifestQuery`, `WorkspaceQuery`, `Plan`), so its warm cost is the database's: a memo hit in the
 same view is one probe, and in a new view each memo is verified down to its inputs' fingerprints.
 A memo hit allocates nothing: every query's `input` hashes its key in `key_id`'s per-thread
 buffer, held to zero by `a_warm_load_allocates_nothing` (a file hit, a `Plan` hit, a `Plan`
@@ -56,7 +56,7 @@ the view's tree.
 ### Manifests and config (`load/manifest.rs`, `load/config.rs`)
 
 Work: each `Cargo.toml` and `.cargo/config.toml` parsed once into blaze-manifest's form;
-`ManifestQuery` keeps a manifest as canonical TOML, so a change of whitespace or comments is
+`TomlFile` keeps a TOML file as canonical TOML, so a change of whitespace or comments is
 seen as no change (an early cutoff for everything downstream).
 
 - Bound: one parse of each file's bytes. A TOML parser of the simd-json kind does well over
@@ -69,14 +69,18 @@ seen as no change (an early cutoff for everything downstream).
   parse + write + parse in `ManifestQuery`, then blaze-manifest parses the canonical text again:
   about 3 passes where one would do, so a cold load of 200 manifests takes about 35 ms where it
   should take 12.
-- What closes it: `ManifestQuery` keeps blaze-manifest's parsed `TomlManifest` (its own
-  `Persist`) as the value with the canonical bytes as the fingerprint, and the workspace reads
-  that value instead of parsing again. That needs blaze-manifest's types to be persistable;
-  the manifest crates are lane cargo's since request 1 (2026-10-29 21:08), and cargo-units
-  owns this change. The config chain is a few
-  files up the directory tree, about 5 `stat`s and one parse each, at the bound already. Its
-  snapshot is moved into the run, not cloned, and a run's snapshot is canonicalized only for
-  the files read raw in it (`files::Used::canonical`), not every file of the snapshot again.
+- Closed (cargo-units2, 2026-10-29): `TomlFile` (keyed by path and configuration) holds the
+  canonical bytes, and `ManifestQuery` reads it and keeps blaze-manifest's parsed `TomlManifest`
+  as its value (`manifest::Parsed`, CBOR, which round-trips it whole: test
+  `a_parsed_manifest_is_kept_whole`). blaze-manifest asks for a manifest through
+  `Files::manifest`, whose default reads and parses and which the load's `Snap` answers from the
+  query, so no step parses a manifest again: a cold load is parse + write (+ parse when not
+  canonical already) in `TomlFile`, one parse in `ManifestQuery`, then a CBOR decode per step
+  that reads it. A comment edit reruns `TomlFile` alone (test
+  `a_comment_in_a_members_manifest_stops_at_that_manifest`). The config chain is a few files up
+  the directory tree, about 5 `stat`s and one parse each, at the bound already; `ConfigChain`
+  keeps only its inputs and warnings, and each step builds the config again from its
+  `TomlFile`s.
 
 ### Resolve (`load/resolve.rs`)
 
@@ -96,14 +100,21 @@ its manifest; without one, cargo's resolver over the index.
 - Now (cargo-sol): `run_over` hands its step a `Reads` handle that reads a file through the
   database into the snapshot during the step. `resolved` reads `Cargo.lock` before parsing it,
   and `locate_all` reads every located package's manifest before parsing any. A locked workspace
-  resolves in one run (test `a_locked_workspace_resolves_in_one_run`). A path dependency outside
+  resolves in one run (test `a_locked_workspace_resolves_in_one_step_over_lent_bytes`). A path dependency outside
   the workspace still costs one run per level of path dependencies, which is rare and bounded by
   their depth.
-- What removes the reruns entirely: blaze-manifest's `Files` is now a type parameter, never
-  `dyn` (dedyn-files), so blaze-units' `Snap` can borrow the step's `Cx` and read through the
-  database on demand, and `Files::read` can return borrowed bytes instead of a new `Vec` (each
-  read copies the file today). Both are cargo-units' now that the manifest crates are lane
-  cargo's.
+- Closed (cargo-units2, 2026-10-29): the reruns are gone. `Snap<'r, 'db>` borrows the step's
+  `Cx` (`files::Reader`) and reads each file through the database when blaze-manifest asks for
+  it; `read_through` runs a step exactly once, and `run_over`, `Snapshot`, `Reads` and the
+  queries' kept snapshots are deleted. A query the step asks itself (`Sources::locate`, the
+  index, `StdUnits`) goes through `Snap::with_cx`. `Files::read` returns `Cow<'_, [u8]>`:
+  `Snap` lends the bytes where the database keeps them (no copy; test
+  `kept_bytes_and_names_are_lent`), `Disk` returns them owned. A listing is decoded in place
+  once a step. A path dependency outside the workspace no longer costs a run per level.
+- Closed (cargo-units2, 2026-10-29): each package's `Summary` and `Read` are built from
+  blaze-manifest's typed `SerializedPackage` (`read.rs` `read`), not from a
+  `serde_json::to_value` of it read back key by key: one JSON tree of every package's
+  dependencies, targets and features no longer allocated and walked per package.
 - The fastest known technique is cargo's with a lock: the lock is taken as the answer and only
   checked against the manifests. The design matches it.
 - Without a lock, index files are parsed lazily (`load/source/index.rs` `Lines`), as cargo's

@@ -17,7 +17,7 @@ use std::ops::ControlFlow;
 use base_db::Db;
 use hir::{InFile, db::HirDatabase};
 use hir_def::{AdtId, HasModule as _, Lookup, VariantId, nameres::crate_def_map, src::HasSource as _};
-use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr};
+use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr_view};
 use hir_ty::{
     consteval::try_const_usize,
     layout::enum_variant_ids,
@@ -29,13 +29,10 @@ use rustc_type_ir::{
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _},
 };
 use smallvec::{SmallVec, smallvec};
-use syntax::{
-    AstNode, SyntaxNode,
-    ast::{self, HasAttrs},
-};
+use syntax::view::{self as ast, AstNode, HasAttrs};
 
 use crate::{
-    cx::def_range,
+    cx::def_range_view,
     lints::bodies::{BodyCx, types::util::Solver},
     model::Span,
 };
@@ -333,12 +330,12 @@ fn def_path(db: &Db, adt: AdtId) -> Option<SmallVec<[&'static str; 6]>> {
 /// Whether the ADT is `#[rustc_insignificant_dtor]`, its `cfg_attr`s expanded.
 fn insignificant_dtor(db: &Db, adt: AdtId) -> bool {
     let attrs = match adt {
-        AdtId::StructId(it) => it.lookup(db).source(db).value.attrs(),
-        AdtId::EnumId(it) => it.lookup(db).source(db).value.attrs(),
-        AdtId::UnionId(it) => it.lookup(db).source(db).value.attrs(),
+        AdtId::StructId(it) => it.lookup(db).source_view(db).value.attrs(),
+        AdtId::EnumId(it) => it.lookup(db).source_view(db).value.attrs(),
+        AdtId::UnionId(it) => it.lookup(db).source_view(db).value.attrs(),
     };
     let cfg = adt.krate(db).cfg_options(db);
-    expand_cfg_attr(attrs, || cfg, |meta, _| match meta {
+    expand_cfg_attr_view(attrs, || cfg, |meta, _| match meta {
         ast::Meta::PathMeta(meta) if meta.path().is1("rustc_insignificant_dtor") => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     })
@@ -353,17 +350,13 @@ pub(super) fn dtor_span(b: &BodyCx<'_, '_>, ty: Ty<'_>) -> Option<Span> {
     let TyKind::Adt(def, _) = ty.kind() else { return None };
     let db = b.db();
     let adt = def.def_id();
-    let node: InFile<SyntaxNode> = match hir_ty::drop::destructor(db, adt) {
-        // clone: a node handle, for the span of the lint's note
-        Some(impl_) => impl_.lookup(db).source(db).map(|it| it.syntax().clone()),
+    let node: InFile<ast::Node<'_>> = match hir_ty::drop::destructor(db, adt) {
+        Some(impl_) => impl_.lookup(db).source_view(db).map(|it| it.syntax()),
         None => match adt {
-            // clone: a node handle, for the span of the lint's note
-            AdtId::StructId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
-            // clone: a node handle, for the span of the lint's note
-            AdtId::EnumId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
-            // clone: a node handle, for the span of the lint's note
-            AdtId::UnionId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
+            AdtId::StructId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),
+            AdtId::EnumId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),
+            AdtId::UnionId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),
         },
     };
-    Some(b.cx.span(node.map(|it| def_range(&it))))
+    Some(b.cx.span(node.map(def_range_view)))
 }

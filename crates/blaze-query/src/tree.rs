@@ -16,11 +16,26 @@ pub trait Tree: Send + Sync {
     /// bytes are a range of the mapped image that fails its check is `Err`, naming the
     /// image's section and group: never `None`, which would be a file that is not there.
     fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt>;
-    /// The names in the directory at `path` (`""` for the root), each with whether it is a
-    /// directory; `None` for none or a file. In any order: the database sorts a listing by
-    /// name once, when a view first reads it (already-sorted listings are only checked).
-    fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>>;
+    /// Lends `read` the names in the directory at `path` (`""` for the root), sorted by name,
+    /// each with whether it is a directory; `false`, with `read` not called, for none or a
+    /// file. The database hashes a listing as it is lent, copying nothing, and stops naming
+    /// the root and directory at a name out of order.
+    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool; // dyn: one call a directory per view, and `Tree` is a trait object
+
+    /// [`Tree::read_dir`]'s names, owned: for a caller that keeps them.
+    fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
+        let mut owned = None;
+        self.read_dir(root, path, &mut |names| {
+            // alloc: the caller asked for the names owned.
+            owned = Some(names.map(|(name, dir)| (name.to_owned(), dir)).collect());
+        });
+        owned
+    }
 }
+
+/// A directory's names as a [`Tree`] lends them (for `'n`), each with whether it is a
+/// directory.
+pub type Names<'a, 'n> = &'a mut (dyn Iterator<Item = (&'n str, bool)> + 'a); // dyn: see `Tree::read_dir`
 
 /// The VFS's files: [`blaze_vfs::Vfs::reader`], a lock-free handle on its immutable nodes by
 /// content ID. Here rather than in blaze-vfs because blaze-query depends on blaze-vfs.
@@ -32,9 +47,11 @@ impl Tree for blaze_vfs::Reader {
         blaze_vfs::Reader::file(self, root, path)
     }
 
-    fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
-        // alloc: the reader's owned listing, collected in place, once per directory per view.
-        blaze_vfs::Reader::list(self, root, path).map(Iterator::collect)
+    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool { // dyn: see `Tree::read_dir`
+        let pinned = self.pin();
+        let Some(mut names) = pinned.list(root, path) else { return false };
+        read(&mut names);
+        true
     }
 }
 
@@ -79,14 +96,10 @@ impl MemTree {
     fn files(&self, root: ContentId) -> Option<Arc<Files>> {
         self.roots.lock().get(&root).cloned()
     }
-}
 
-impl Tree for MemTree {
-    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
-        Ok(self.files(root).and_then(|files| files.get(path).cloned()))
-    }
-
-    fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
+    /// The names in the directory at `path` under `root`, sorted, each with whether it is a
+    /// directory; `None` for none or a file.
+    fn names(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
         let files = self.files(root)?;
         if files.contains_key(path) {
             return None;
@@ -114,9 +127,21 @@ impl Tree for MemTree {
     }
 }
 
+impl Tree for MemTree {
+    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+        Ok(self.files(root).and_then(|files| files.get(path).cloned()))
+    }
+
+    fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool { // dyn: see `Tree::read_dir`
+        let Some(names) = self.names(root, path) else { return false };
+        read(&mut names.iter().map(|(name, dir)| (name.as_str(), *dir)));
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MemTree, Tree};
+    use super::MemTree;
 
     #[test]
     fn a_listing_is_sorted_by_name_and_sees_only_its_directory() {
@@ -130,7 +155,7 @@ mod tests {
             ("a/c.rs", b"6"),
             ("b", b"7"),
         ]);
-        let names = |path| tree.list(root, path);
+        let names = |path| tree.names(root, path);
         let owned = |it: &[(&str, bool)]| Some(it.iter().map(|&(n, d)| (n.to_owned(), d)).collect::<Vec<_>>());
         assert_eq!(
             names(""),

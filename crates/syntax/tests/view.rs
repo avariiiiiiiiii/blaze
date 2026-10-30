@@ -226,3 +226,20 @@ fn walking_a_whole_file_allocates_nothing() {
         }
     }
 }
+
+#[test]
+fn validating_a_file_without_errors_allocates_nothing() {
+    let mut checked = 0;
+    for (path, text) in corpus().into_iter().step_by(7) {
+        let parse = SourceFile::parse(&text, Edition::CURRENT);
+        if !parse.errors().is_empty() {
+            continue;
+        }
+        let errors = blaze_alloc_count::assert_at_most(0, &format!("validating {path:?}"), || {
+            parse.errors()
+        });
+        assert!(errors.is_empty());
+        checked += 1;
+    }
+    assert!(checked > 0, "the corpus has no file without errors");
+}

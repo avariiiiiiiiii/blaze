@@ -8,6 +8,7 @@
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![feature(allocator_api)]
+#![forbid(unsafe_code)]
 #![allow(rustdoc::private_intra_doc_links)]
 
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;

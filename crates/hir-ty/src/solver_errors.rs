@@ -10,7 +10,7 @@
 //!
 //! [`NextSolverError`]: crate::next_solver::fulfill::NextSolverError
 
-use hir_def::{GenericParamId, TraitId, hir::generics::GenericParams};
+use hir_def::{GenericParamId, TraitId};
 use intern::Symbol;
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_type_ir::{
@@ -33,34 +33,13 @@ use crate::{
             BoundRegionConversionTime, InferCtxt,
             errors::{FulfillmentError, FulfillmentErrorCode},
             resolve::ReplaceInferWithError,
-            select::SelectionError,
-            traits::{ObligationCause, ObligationCauseCode, PredicateObligation},
+            select::{ImplSource, SelectionError},
+            traits::{Obligation, ObligationCause, ObligationCauseCode, PredicateObligation},
         },
         obligation_ctxt::ObligationCtxt,
         util::clauses_as_obligations,
     },
 };
-
-// The derive belongs on the enum in `next_solver/infer/traits.rs` (requested of solver-sync,
-// `v2/requests/solver-sync-inbox.md`); diagnostics hash the code they carry.
-impl std::hash::Hash for ObligationCauseCode {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match *self {
-            ObligationCauseCode::WhereClauseInExpr { item, bound_index, arg_index } => {
-                (item, bound_index, arg_index).hash(state)
-            }
-            ObligationCauseCode::MatchExpressionArm { prior_arms } => prior_arms.hash(state),
-            ObligationCauseCode::Misc
-            | ObligationCauseCode::SizedArgumentType
-            | ObligationCauseCode::SizedReturnType
-            | ObligationCauseCode::BlockTailExpression
-            | ObligationCauseCode::ReturnValue
-            | ObligationCauseCode::IfExpression
-            | ObligationCauseCode::LetType => {}
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
 pub struct SolverDiagnostic {
@@ -78,10 +57,11 @@ pub enum SolverDiagnosticKind {
         trait_predicate: StoredTraitPredicate,
         parent_trait_predicates: Vec<StoredTraitPredicate>,
         /// For each of `parent_trait_predicates`, the impl that would prove it, whose where
-        /// clause required the goal nearer the error (rustc's `ImplDerived`); `None` where that
-        /// goal came from no impl.
+        /// clause required the goal nearer the error, with that clause's index in the impl's
+        /// [`crate::GenericPredicates::query_all`] (rustc's `ImplDerived` and its
+        /// `impl_def_predicate_index`); `None` where that goal came from no impl.
         #[type_visitable(ignore)]
-        parent_impls: Vec<Option<AnyImplId>>,
+        parent_impls: Vec<Option<(AnyImplId, u32)>>,
     },
     /// A closure does not implement the `Fn*` or `AsyncFn*` trait asked of it because of its
     /// closure kind (E0525).
@@ -99,7 +79,13 @@ pub enum SolverDiagnosticKind {
     /// A goal other than a trait's that does not hold: a `[const] Trait` bound
     /// (`report_host_effect_error`), a trait that is not dyn-compatible (E0038), a type that is
     /// not well-formed, or one rustc's `report_selection_error` calls a bug.
-    GoalUnmet { goal: StoredGoal },
+    GoalUnmet {
+        goal: StoredGoal,
+        /// For a `[const] Trait` or `const Trait` goal of a `const` trait, the impl that meets the
+        /// trait goal when that impl is not `const` (`report_host_effect_error`).
+        #[type_visitable(ignore)]
+        non_const_impl: Option<AnyImplId>,
+    },
     /// E0275: evaluating the goal overflowed (`report_overflow_no_abort`).
     Overflow {
         goal: StoredGoal,
@@ -107,7 +93,12 @@ pub enum SolverDiagnosticKind {
         suggest_increasing_limit: bool,
     },
     /// E0271: "type mismatch resolving `goal`", a projection goal (`report_projection_error`).
-    ProjectionMismatch { goal: StoredGoal },
+    ProjectionMismatch {
+        goal: StoredGoal,
+        /// What the goal's alias normalizes to where that is not the goal's term: rustc's
+        /// "expected `term`, found `normalized`".
+        normalized: Option<StoredGenericArg>,
+    },
     /// E0308: a subtyping or coercion goal of two types that differ (`report_mismatched_types`).
     TypesDiffer { expected: StoredTy, found: StoredTy },
     /// "the constant `ct` is not of type `expected_ty`", which is `ct_ty`.
@@ -186,8 +177,8 @@ pub enum StoredGoal {
         #[type_visitable(ignore)]
         feature: Symbol,
     },
-    /// A region or type outlives a region.
-    Outlives,
+    /// `a: b`: a region or type outlives the region `b`.
+    Outlives { a: StoredGenericArg, b: StoredGenericArg },
     /// rustc's `PredicateKind::Ambiguous`.
     Ambiguous,
 }
@@ -233,8 +224,11 @@ impl StoredGoal {
             PredicateKind::Clause(ClauseKind::UnstableFeature(feature)) => {
                 StoredGoal::UnstableFeature { feature }
             }
-            PredicateKind::Clause(ClauseKind::RegionOutlives(_) | ClauseKind::TypeOutlives(_)) => {
-                StoredGoal::Outlives
+            PredicateKind::Clause(ClauseKind::RegionOutlives(outlives)) => {
+                StoredGoal::Outlives { a: arg(outlives.0.into()), b: arg(outlives.1.into()) }
+            }
+            PredicateKind::Clause(ClauseKind::TypeOutlives(outlives)) => {
+                StoredGoal::Outlives { a: arg(outlives.0.into()), b: arg(outlives.1.into()) }
             }
             PredicateKind::Ambiguous => StoredGoal::Ambiguous,
         }
@@ -319,7 +313,10 @@ impl SolverDiagnostic {
                     {
                         return None;
                     }
-                    _ => SolverDiagnosticKind::GoalUnmet { goal: goal() },
+                    _ => SolverDiagnosticKind::GoalUnmet {
+                        goal: goal(),
+                        non_const_impl: non_const_impl(infcx, &error.obligation),
+                    },
                 }
             }
             FulfillmentErrorCode::Select(SelectionError::ConstArgHasWrongType {
@@ -343,9 +340,10 @@ impl SolverDiagnostic {
             FulfillmentErrorCode::Select(SelectionError::Overflow(_)) => {
                 unreported(UnreportedSolverError::SelectionOverflow)
             }
-            FulfillmentErrorCode::Project(_) => {
-                SolverDiagnosticKind::ProjectionMismatch { goal: goal() }
-            }
+            FulfillmentErrorCode::Project(_) => SolverDiagnosticKind::ProjectionMismatch {
+                goal: goal(),
+                normalized: projection_normalized(infcx, &error.obligation),
+            },
             FulfillmentErrorCode::Outlives => SolverDiagnosticKind::HigherRankedOutlives,
             FulfillmentErrorCode::Subtype(expected_found, _) => SolverDiagnosticKind::TypesDiffer {
                 expected: infcx.deeply_resolve_ignoring_regions(expected_found.expected).store(),
@@ -360,6 +358,70 @@ impl SolverDiagnostic {
         };
         Some(SolverDiagnostic { span, cause: error.obligation.cause.code(), kind })
     }
+}
+
+/// What the alias of a projection goal normalizes to, when that differs from the goal's term:
+/// rustc's `report_projection_error`, which normalizes the alias, takes the nested goals it can,
+/// and keeps the normalized term only when equating it with the goal's term fails.
+fn projection_normalized<'db>(
+    infcx: &InferCtxt<'db>,
+    obligation: &PredicateObligation<'db>,
+) -> Option<StoredGenericArg> {
+    let interner = infcx.interner;
+    let kind = obligation.predicate.kind();
+    let PredicateKind::Clause(ClauseKind::Projection(data)) = kind.skip_binder() else {
+        return None;
+    };
+    infcx.probe(|_| {
+        let data = infcx.instantiate_binder_with_fresh_vars(
+            obligation.cause.span(),
+            BoundRegionConversionTime::HigherRankedType,
+            kind.rebind(data),
+        );
+        let mut ocx = ObligationCtxt::new(infcx);
+        let (cause, param_env) = (&obligation.cause, obligation.param_env);
+        let alias = data.projection_term.to_term(interner, IsRigid::No);
+        let normalized = ocx.structurally_normalize_term(cause, param_env, alias).ok()?;
+        let _ = ocx.try_evaluate_obligations();
+        ocx.eq(cause, param_env, data.term, normalized).is_err().then(|| {
+            let normalized = infcx.deeply_resolve_ignoring_regions(normalized);
+            GenericArg::from(normalized).fold_with(&mut ReplaceInferWithError::new(interner)).store()
+        })
+    })
+}
+
+/// The impl selection picks for a `[const] Trait` or `const Trait` goal's trait predicate, when
+/// the trait is `const` and the impl is not: rustc's `report_host_effect_error`, which then says
+/// "trait `Trait` is implemented but not `const`" or suggests making the impl `const`.
+fn non_const_impl<'db>(
+    infcx: &InferCtxt<'db>,
+    obligation: &PredicateObligation<'db>,
+) -> Option<AnyImplId> {
+    let interner = infcx.interner;
+    let kind = infcx.deeply_resolve_ignoring_regions(obligation.predicate).kind();
+    let PredicateKind::Clause(ClauseKind::HostEffect(data)) = kind.skip_binder() else {
+        return None;
+    };
+    if !crate::effects::trait_is_const(interner.db(), data.trait_ref.def_id.0) {
+        return None;
+    }
+    infcx.probe(|_| {
+        let trait_ref = infcx.instantiate_binder_with_fresh_vars(
+            obligation.cause.span(),
+            BoundRegionConversionTime::HigherRankedType,
+            kind.rebind(data.trait_ref),
+        );
+        let obligation =
+            Obligation::new(interner, ObligationCause::dummy(), obligation.param_env, trait_ref);
+        match infcx.select(&obligation) {
+            Ok(Some(ImplSource::UserDefined(impl_)))
+                if !crate::effects::impl_is_const(interner.db(), impl_.impl_def_id) =>
+            {
+                Some(impl_.impl_def_id)
+            }
+            _ => None,
+        }
+    })
 }
 
 /// rustc's `emit_specialized_closure_kind_error`: the closure kind of a closure that does not
@@ -506,18 +568,7 @@ pub(crate) fn variable_origin<'db>(
     term: Term<'db>,
 ) -> Option<(Span, GenericParamId)> {
     GenericArg::from(term).walk().find_map(|arg| {
-        let (span, param) = match TyOrConstInferVar::maybe_from_generic_arg::<DbInterner<'db>>(arg)? {
-            TyOrConstInferVar::Ty(vid) => infcx.type_var_origin(vid),
-            TyOrConstInferVar::Const(vid) => infcx.const_var_origin(vid)?,
-            TyOrConstInferVar::TyInt(_) | TyOrConstInferVar::TyFloat(_) => return None,
-        };
-        let param = param?;
-        if let GenericParamId::TypeParamId(it) = param
-            && GenericParams::of(infcx.interner.db, it.parent())[it.local_id()].is_trait_self()
-        {
-            return None;
-        }
-        Some((span, param))
+        named::variable_param(infcx, TyOrConstInferVar::maybe_from_generic_arg::<DbInterner<'db>>(arg)?)
     })
 }
 
@@ -823,6 +874,8 @@ fn report_ambiguity<'db>(
     let term = ambiguity_term(predicate);
     let diagnostic = |kind, top_term: Option<Term<'db>>, candidates, related| {
         let origin = top_term.and_then(|term| variable_origin(infcx, term));
+        // alloc: error path, a reported diagnostic's term
+        let named = top_term.map(|term| Box::new(NamedTerm::new(infcx, term)));
         let top_term = top_term.map(|term| {
             GenericArg::from(term).fold_with(&mut ReplaceInferWithError::new(interner)).store()
         });
@@ -836,6 +889,8 @@ fn report_ambiguity<'db>(
                 related,
             })),
             origin,
+            named,
+            cause: obligation.cause.code(),
         }
     };
     let (kind, top_term, candidates) = match predicate.kind().skip_binder() {
@@ -915,3 +970,9 @@ fn report_ambiguity<'db>(
     }
     Some(diagnostic(kind, top_term, candidates, notes))
 }
+
+mod named;
+#[cfg(test)]
+mod tests;
+
+pub use named::NamedTerm;

@@ -11,17 +11,17 @@
 use std::mem::offset_of;
 
 use blaze_format::{
-    ALIGN, Aligned, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as,
-    schema_of,
+    ALIGN, Aligned, FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer,
+    open_as, schema_of,
 };
 use blaze_mem::{Frame, scratch};
 use hir_def::{
-    AdtId, AssocItemId, ConstId, ConstParamId, EnumId, EnumVariantId, FieldId, FunctionId,
-    GenericDefId, GenericParamId, ImplId, LifetimeParamId, StaticId, StructId, TraitId,
-    TupleFieldId, TupleId, TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId, VariantId,
+    AdtId, AssocItemId, ConstId, ConstParamId, EnumVariantId, FieldId, FunctionId, GenericDefId,
+    GenericParamId, LifetimeParamId, StructId, TraitId, TupleFieldId, TupleId, TypeOrConstParamId,
+    TypeParamId, UnionId, VariantId,
     hir::{
-        ArithOp, BinaryOp, BindingId, CmpOp, ExprId, ExprOrPatId, ExprOrPatIdPacked, LogicOp,
-        Ordering, UnaryOp,
+        ArithOp, BinaryOp, BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, UnaryOp,
+        UnsafeBinderCastKind,
     },
     resolver::ValueNs,
 };
@@ -32,7 +32,6 @@ use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_hash::FxBuildHasher;
 use rustc_type_ir::{ClausePolarity, ClosureKind};
-use salsa::plumbing::{AsId, FromId};
 
 use crate::{
     Span,
@@ -59,8 +58,8 @@ use crate::{
     },
     method_resolution::CandidateId,
     next_solver::{
-        DbInterner, FnSig, FnSigKind, GenericArgs, StoredFnSig, StoredGenericArgs, StoredTraitRef,
-        StoredTy, StoredTys, TraitRef, Ty, Tys,
+        DbInterner, FnSig, FnSigKind, GenericArgs, Predicate, StoredFnSig, StoredGenericArgs,
+        StoredPredicate, StoredTraitRef, StoredTy, StoredTys, TraitRef, Ty, Tys,
         AnyImplId, StoredGenericArg,
         abi::Safety,
         infer::traits::ObligationCauseCode,
@@ -68,7 +67,7 @@ use crate::{
     },
     solver_errors::{SolverDiagnostic, SolverDiagnosticKind, StoredTraitPredicate},
     solver_errors::{
-        Ambiguity, AmbiguityCandidate, AmbiguityNote, StoredGoal, TypeAnnotationNeeded,
+        Ambiguity, AmbiguityCandidate, AmbiguityNote, NamedTerm, StoredGoal, TypeAnnotationNeeded,
         UnreportedSolverError,
     },
 };
@@ -161,6 +160,8 @@ columns! {
         Unreachables,
         /// `[kind, local]` per `traits_in_scope_used` pair, as a side table writes a node.
         TraitsUsedNodes,
+        /// `[span kind, span local, predicate]` per goal stalled on a coroutine of the body.
+        CoroutineStalled,
         ClosureExprs,
         /// The diagnostics, then the closures' data.
         Words,
@@ -284,12 +285,14 @@ fn table_in(buffer: &[u8], table: &[u128]) -> &[u8] {
     &buffer[start..][..size_of_val(table)]
 }
 
-fn salsa_id(bits: u64) -> Option<salsa::Id> {
-    (bits as u32 != 0).then(|| salsa::Id::from_bits(bits))
+/// An id's word: its salsa bits, or inside `check_cache::relocating` its place in the table.
+fn id_bits<T: crate::check_cache::Relocate>(id: T) -> u64 {
+    crate::check_cache::id_bits(id)
 }
 
-fn id_bits(id: impl AsId) -> u64 {
-    id.as_id().as_bits()
+/// [`id_bits`]' id back; `None` for index 0 or a place not in the table.
+fn id_of<T: crate::check_cache::Relocate>(bits: u64) -> Option<T> {
+    crate::check_cache::id_of(bits)
 }
 
 fn local<T>(id: Idx<T>) -> u32 {
@@ -325,11 +328,10 @@ fn variant_key(variant: VariantId) -> (u8, u64) {
 }
 
 fn variant_of(tag: u8, bits: u64) -> Option<VariantId> {
-    let id = salsa_id(bits)?;
     Some(match tag {
-        0 => EnumVariantId::from_id(id).into(),
-        1 => StructId::from_id(id).into(),
-        2 => UnionId::from_id(id).into(),
+        0 => id_of::<EnumVariantId>(bits)?.into(),
+        1 => id_of::<StructId>(bits)?.into(),
+        2 => id_of::<UnionId>(bits)?.into(),
         _ => return None,
     })
 }
@@ -342,10 +344,9 @@ fn candidate_key(candidate: CandidateId) -> (u8, u64) {
 }
 
 fn candidate_of(tag: u8, bits: u64) -> Option<CandidateId> {
-    let id = salsa_id(bits)?;
     Some(match tag {
-        0 => FunctionId::from_id(id).into(),
-        1 => ConstId::from_id(id).into(),
+        0 => id_of::<FunctionId>(bits)?.into(),
+        1 => id_of::<ConstId>(bits)?.into(),
         _ => return None,
     })
 }
@@ -397,53 +398,6 @@ fn adjust_code(adjust: &Adjust) -> u8 {
         Adjust::Pointer(PointerCast::ArrayToPointer) => 14,
         Adjust::Pointer(PointerCast::Unsize) => 15,
     }
-}
-
-fn arith_code(op: ArithOp) -> u32 {
-    match op {
-        ArithOp::Add => 0,
-        ArithOp::Mul => 1,
-        ArithOp::Sub => 2,
-        ArithOp::Div => 3,
-        ArithOp::Rem => 4,
-        ArithOp::Shl => 5,
-        ArithOp::Shr => 6,
-        ArithOp::BitXor => 7,
-        ArithOp::BitOr => 8,
-        ArithOp::BitAnd => 9,
-    }
-}
-
-/// `&&`, `||`, then the ten arithmetic operators from 2, the comparisons from 12, `=` at 18 and
-/// the compound assignments from 19.
-fn binary_code(op: BinaryOp) -> u32 {
-    match op {
-        BinaryOp::LogicOp(LogicOp::And) => 0,
-        BinaryOp::LogicOp(LogicOp::Or) => 1,
-        BinaryOp::ArithOp(op) => 2 + arith_code(op),
-        BinaryOp::CmpOp(CmpOp::Eq { negated }) => 12 + u32::from(negated),
-        BinaryOp::CmpOp(CmpOp::Ord { ordering, strict }) => {
-            14 + 2 * u32::from(ordering == Ordering::Greater) + u32::from(strict)
-        }
-        BinaryOp::Assignment { op: None } => 18,
-        BinaryOp::Assignment { op: Some(op) } => 19 + arith_code(op),
-    }
-}
-
-fn binary_of(code: u32) -> Option<BinaryOp> {
-    Some(match code {
-        0 => BinaryOp::LogicOp(LogicOp::And),
-        1 => BinaryOp::LogicOp(LogicOp::Or),
-        2..12 => BinaryOp::ArithOp(ArithOp::ALL[code as usize - 2]),
-        12 | 13 => BinaryOp::CmpOp(CmpOp::Eq { negated: code == 13 }),
-        14..18 => BinaryOp::CmpOp(CmpOp::Ord {
-            ordering: if code >= 16 { Ordering::Greater } else { Ordering::Less },
-            strict: code % 2 == 1,
-        }),
-        18 => BinaryOp::Assignment { op: None },
-        19..29 => BinaryOp::Assignment { op: Some(ArithOp::ALL[code as usize - 19]) },
-        _ => return None,
-    })
 }
 
 const CAST_ERRORS: [CastError; 17] = [
@@ -556,12 +510,35 @@ fn node_of(words: &[u32]) -> Option<ExprOrPatId> {
     }
 }
 
+/// `[kind, local]` with the kinds [`Sink::span`] writes, `[4, 0]` for `Dummy`.
+fn span_words(span: Span) -> [u32; 2] {
+    match span {
+        Span::ExprId(it) => [0, local(it)],
+        Span::PatId(it) => [1, local(it)],
+        Span::BindingId(it) => [2, local(it)],
+        Span::TypeRefId(it) => [3, local(it)],
+        Span::Dummy => [4, 0],
+    }
+}
+
+fn span_of(words: &[u32]) -> Option<Span> {
+    match *words {
+        [0, it] => Some(Span::ExprId(local_of(it))),
+        [1, it] => Some(Span::PatId(local_of(it))),
+        [2, it] => Some(Span::BindingId(local_of(it))),
+        [3, it] => Some(Span::TypeRefId(local_of(it))),
+        [4, 0] => Some(Span::Dummy),
+        _ => None,
+    }
+}
+
 /// Where a record's types go as it is made: the type table, or in tests a list.
 trait TyEncode<'db> {
     fn ty(&mut self, ty: Ty<'db>) -> u32;
     fn args(&mut self, args: GenericArgs<'db>) -> u32;
     /// The trait as two words of its salsa id and its arguments.
     fn trait_ref(&mut self, trait_ref: &StoredTraitRef) -> [u32; 3];
+    fn predicate(&mut self, predicate: Predicate<'db>) -> u32;
 }
 
 /// Where a record's types come back from.
@@ -569,6 +546,7 @@ trait TyDecode {
     fn ty(&self, at: u32) -> Result<StoredTy, FormatError>;
     fn args(&self, at: u32) -> Result<StoredGenericArgs, FormatError>;
     fn trait_ref(&self, words: [u32; 3]) -> Result<StoredTraitRef, FormatError>;
+    fn predicate(&self, at: u32) -> Result<StoredPredicate, FormatError>;
 }
 
 struct TableEncode<'db> {
@@ -591,6 +569,10 @@ impl<'db> TyEncode<'db> for TableEncode<'db> {
         let args = trait_ref.args.store();
         [bits as u32, (bits >> 32) as u32, self.table.args(args.as_ref())]
     }
+
+    fn predicate(&mut self, predicate: Predicate<'db>) -> u32 {
+        self.table.predicate(predicate)
+    }
 }
 
 struct TableDecode<'a, 'db> {
@@ -610,14 +592,16 @@ impl TyDecode for TableDecode<'_, '_> {
     }
 
     fn trait_ref(&self, [low, high, args]: [u32; 3]) -> Result<StoredTraitRef, FormatError> {
-        let id = salsa_id(u64::from(low) | (u64::from(high) << 32))
-            .ok_or(FormatError::Invalid { at: self.at, what: "a trait of id 0" })?;
+        let id = id_of::<TraitId>(u64::from(low) | (u64::from(high) << 32))
+            .ok_or(FormatError::Invalid { at: self.at, what: "a trait of id 0 or not in the table" })?;
         let args = self.table.args(args)?;
-        Ok(StoredTraitRef::new(TraitRef::new_from_args(
-            self.interner,
-            TraitId::from_id(id).into(),
-            args,
-        )))
+        Ok(StoredTraitRef::new(crate::check_cache::outside(|| {
+            TraitRef::new_from_args(self.interner, id.into(), args)
+        })))
+    }
+
+    fn predicate(&self, at: u32) -> Result<StoredPredicate, FormatError> {
+        self.table.predicate(at).map(Predicate::store)
     }
 }
 
@@ -776,6 +760,7 @@ impl InferenceRecord {
             diagnostics,
             unreachable,
             traits_in_scope_used,
+            coroutine_stalled_predicates,
             nodes_with_type_mismatches,
             error_ty,
             expr_adjustments,
@@ -869,6 +854,13 @@ impl InferenceRecord {
         record.put32(C32::Unreachables, unreachable.iter().flat_map(unreachable_words));
         record.put32(C32::TraitsUsedNodes, traits_in_scope_used.iter().flat_map(|&(node, _)| node_words(node)));
         record.put64(C64::TraitsUsedIds, traits_in_scope_used.iter().map(|&(_, trait_)| id_bits(trait_)));
+        record.put32(
+            C32::CoroutineStalled,
+            coroutine_stalled_predicates.iter().flat_map(|&(span, predicate)| {
+                let [kind, at] = span_words(span);
+                [kind, at, tys.predicate(predicate.as_ref())]
+            }),
+        );
 
         let mut words = Sink::new();
         diagnostics.iter().for_each(|it| words.diagnostic(tys, it));
@@ -915,33 +907,10 @@ impl InferenceRecord {
     }
 }
 
-/// Where a column was written: nowhere when it is empty.
-#[derive(Clone, Copy)]
-struct Placed {
-    at: u64,
-    len: usize,
-}
-
-impl Placed {
-    fn push<T: Record>(out: &mut Writer, values: &[T]) -> Placed {
-        match values.is_empty() {
-            true => Placed { at: 0, len: 0 },
-            false => Placed { at: out.push_slice(values), len: values.len() },
-        }
-    }
-
-    fn slice<T>(self, field_at: u64) -> Slice<T> {
-        match self.len {
-            0 => Slice::EMPTY,
-            len => Slice::between(field_at, self.at, len),
-        }
-    }
-}
-
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(9),
+        Part::U64(15),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -1035,8 +1004,8 @@ impl<'a> InferenceRecordRef<'a> {
         &self.bytes[start as usize..][..len as usize]
     }
 
-    fn id<T: FromId>(&self, bits: u64) -> Result<T, FormatError> {
-        salsa_id(bits).map(T::from_id).ok_or(self.invalid("a salsa id of index 0"))
+    fn id<T: crate::check_cache::Relocate>(&self, bits: u64) -> Result<T, FormatError> {
+        id_of(bits).ok_or(self.invalid("a salsa id of index 0 or not in the table"))
     }
 
     fn same_len(&self, lens: &[usize], what: &'static str) -> Result<(), FormatError> {
@@ -1211,12 +1180,15 @@ impl<'a> InferenceRecordRef<'a> {
         let type_of_opaque = {
             let (ids, opaque_tys) = (self.u64s(C64::OpaqueIds), self.u32s(C32::OpaqueTys));
             self.same_len(&[ids.len(), opaque_tys.len()], "opaque columns of different lengths")?;
-            let entries = exact(
+            let mut entries = exact(
                 ids.len(),
                 ids.iter()
                     .zip(opaque_tys)
                     .map(|(&bits, &ty)| Ok((self.id::<InternedOpaqueTyId<'db>>(bits)?, tys.ty(ty)?))),
             )?;
+            if crate::check_cache::in_scope() {
+                entries.sort_unstable_by_key(|&(id, _)| id);
+            }
             SortedMap::from_sorted(entries).map_err(|what| self.invalid(what))?
         };
 
@@ -1256,6 +1228,19 @@ impl<'a> InferenceRecordRef<'a> {
                 words
                     .chunks_exact(UNREACHABLE_WORDS)
                     .map(|it| unreachable_of(it).ok_or(self.invalid("an unreachable entry of no kind"))),
+            )?
+            .into_boxed_slice()
+        };
+
+        let coroutine_stalled_predicates = {
+            let words = self.u32s(C32::CoroutineStalled);
+            self.ensure(words.len() % 3 == 0, "a stalled goal column of a partial goal")?;
+            exact(
+                words.len() / 3,
+                words.chunks_exact(3).map(|it| {
+                    let span = span_of(&it[..2]).ok_or(self.invalid("a stalled goal at a span of no kind"))?;
+                    Ok((span, tys.predicate(it[2])?))
+                }),
             )?
             .into_boxed_slice()
         };
@@ -1330,6 +1315,7 @@ impl<'a> InferenceRecordRef<'a> {
             diagnostics,
             unreachable,
             traits_in_scope_used,
+            coroutine_stalled_predicates,
             nodes_with_type_mismatches: ExprOrPatSet {
                 exprs: self.idx_set(C64::MismatchedExprs)?,
                 pats: self.idx_set(C64::MismatchedPats)?,
@@ -1396,7 +1382,7 @@ impl Sink {
         self.word(local(id));
     }
 
-    fn id(&mut self, id: impl AsId) {
+    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
         self.u64(id_bits(id));
     }
 
@@ -1684,7 +1670,11 @@ impl Sink {
                 self.word(11);
                 self.name(&Name::new_symbol_root(feature.clone()));
             }
-            StoredGoal::Outlives => self.word(12),
+            StoredGoal::Outlives { a, b } => {
+                self.word(12);
+                self.generic_arg(tys, a);
+                self.generic_arg(tys, b);
+            }
             StoredGoal::Ambiguous => self.word(13),
         }
     }
@@ -1876,7 +1866,7 @@ impl Sink {
                 unmet.iter().for_each(|it| self.goal(tys, it));
             }
             D::BinaryOperatorCannotBeApplied { expr, op, lhs, rhs, at_error, unmet, output } => {
-                self.words.extend([23, local(*expr), binary_code(*op)]);
+                self.words.extend([23, local(*expr), op.code()]);
                 self.ty(tys, lhs);
                 self.ty(tys, rhs);
                 match at_error.as_deref() {
@@ -1995,10 +1985,10 @@ impl Sink {
                 self.generic_def(*def);
             }
             D::InvalidLhsOfAssignment { lhs, assign, op } => {
-                let op = op.map_or(0, |op| 1 + arith_code(op));
+                let op = op.map_or(0, |op| 1 + op.code());
                 self.words.extend([35, local(*lhs), local(*assign), op]);
             }
-            D::TypeMustBeKnown { at_point, top_term, kind, ambiguity, origin } => {
+            D::TypeMustBeKnown { at_point, top_term, kind, ambiguity, origin, named, cause } => {
                 self.word(36);
                 self.span(*at_point);
                 match top_term {
@@ -2027,6 +2017,19 @@ impl Sink {
                     self.span(*span);
                     self.generic_param(*param);
                 }
+                match named {
+                    None => self.word(0),
+                    Some(named) => {
+                        let at = tys.args(GenericArgs::new_from_slice(&[named.term.as_ref()]));
+                        self.words.extend([1, at]);
+                        self.len(named.params.len());
+                        for &(span, param) in &named.params {
+                            self.span(span);
+                            self.generic_param(param);
+                        }
+                    }
+                }
+                self.cause_code(*cause);
             }
             D::UnionExprMustHaveExactlyOneField { expr } => self.words.extend([37, local(*expr)]),
             D::TypeMismatch { node, expected, found, at_error, cause } => {
@@ -2059,7 +2062,12 @@ impl Sink {
                         self.len(parent_trait_predicates.len());
                         parent_trait_predicates.iter().for_each(|it| self.trait_predicate(tys, it));
                         debug_assert_eq!(parent_impls.len(), parent_trait_predicates.len());
-                        parent_impls.iter().for_each(|&it| self.optional_impl(it));
+                        for &it in parent_impls {
+                            self.optional_impl(it.map(|(impl_, _)| impl_));
+                            if let Some((_, bound_index)) = it {
+                                self.word(bound_index);
+                            }
+                        }
                     }
                     SolverDiagnosticKind::ClosureKindMismatch { expected, found, is_async, closure } => {
                         self.word(1);
@@ -2068,18 +2076,23 @@ impl Sink {
                         self.bool(*is_async);
                         self.ty(tys, closure);
                     }
-                    SolverDiagnosticKind::GoalUnmet { goal } => {
+                    SolverDiagnosticKind::GoalUnmet { goal, non_const_impl } => {
                         self.word(2);
                         self.goal(tys, goal);
+                        self.optional_impl(*non_const_impl);
                     }
                     SolverDiagnosticKind::Overflow { goal, suggest_increasing_limit } => {
                         self.word(3);
                         self.goal(tys, goal);
                         self.bool(*suggest_increasing_limit);
                     }
-                    SolverDiagnosticKind::ProjectionMismatch { goal } => {
+                    SolverDiagnosticKind::ProjectionMismatch { goal, normalized } => {
                         self.word(4);
                         self.goal(tys, goal);
+                        self.bool(normalized.is_some());
+                        if let Some(normalized) = normalized {
+                            self.generic_arg(tys, normalized);
+                        }
                     }
                     SolverDiagnosticKind::TypesDiffer { expected, found } => {
                         self.word(5);
@@ -2125,6 +2138,14 @@ impl Sink {
                 };
                 self.words.extend([43, local(*expr), kind]);
             }
+            D::UnsafeBinderCastOfNonBinder { expr, kind, found } => {
+                let kind = match kind {
+                    UnsafeBinderCastKind::Wrap => 0,
+                    UnsafeBinderCastKind::Unwrap => 1,
+                };
+                self.words.extend([45, local(*expr), kind]);
+                self.ty(tys, found);
+            }
             D::RecordMissingFields { record, variant, missed_fields } => {
                 self.word(44);
                 self.expr_or_pat(*record);
@@ -2167,6 +2188,8 @@ impl Sink {
             }
             ObligationCauseCode::LetType => self.word(7),
             ObligationCauseCode::SizedReturnType => self.word(8),
+            ObligationCauseCode::IfExpressionWithNoElse => self.word(9),
+            ObligationCauseCode::ReturnNoExpression => self.word(10),
         }
     }
 
@@ -2331,13 +2354,9 @@ impl Source<'_> {
         Ok(local_of(self.word()?))
     }
 
-    fn salsa(&mut self) -> Result<salsa::Id, FormatError> {
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
         let bits = self.u64()?;
-        salsa_id(bits).ok_or(self.invalid("a salsa id of index 0"))
-    }
-
-    fn id<T: FromId>(&mut self) -> Result<T, FormatError> {
-        self.salsa().map(T::from_id)
+        id_of(bits).ok_or(self.invalid("a salsa id of index 0 or not in the table"))
     }
 
     /// A list's length, which is at most the words left: each entry is at least a word.
@@ -2423,18 +2442,16 @@ impl Source<'_> {
     }
 
     fn generic_def(&mut self) -> Result<GenericDefId, FormatError> {
-        let tag = self.word()?;
-        let id = self.salsa()?;
-        Ok(match tag {
-            0 => AdtId::StructId(StructId::from_id(id)).into(),
-            1 => AdtId::EnumId(EnumId::from_id(id)).into(),
-            2 => AdtId::UnionId(UnionId::from_id(id)).into(),
-            3 => ConstId::from_id(id).into(),
-            4 => FunctionId::from_id(id).into(),
-            5 => ImplId::from_id(id).into(),
-            6 => StaticId::from_id(id).into(),
-            7 => TraitId::from_id(id).into(),
-            8 => TypeAliasId::from_id(id).into(),
+        Ok(match self.word()? {
+            0 => AdtId::StructId(self.id()?).into(),
+            1 => AdtId::EnumId(self.id()?).into(),
+            2 => AdtId::UnionId(self.id()?).into(),
+            3 => GenericDefId::ConstId(self.id()?),
+            4 => GenericDefId::FunctionId(self.id()?),
+            5 => GenericDefId::ImplId(self.id()?),
+            6 => GenericDefId::StaticId(self.id()?),
+            7 => GenericDefId::TraitId(self.id()?),
+            8 => GenericDefId::TypeAliasId(self.id()?),
             _ => return Err(self.invalid("a generic definition of no kind")),
         })
     }
@@ -2598,7 +2615,7 @@ impl Source<'_> {
             9 => StoredGoal::ConstEquate { a: self.generic_arg(tys)?, b: self.generic_arg(tys)? },
             10 => StoredGoal::DynCompatible { trait_: self.id()? },
             11 => StoredGoal::UnstableFeature { feature: self.name()?.symbol().clone() },
-            12 => StoredGoal::Outlives,
+            12 => StoredGoal::Outlives { a: self.generic_arg(tys)?, b: self.generic_arg(tys)? },
             13 => StoredGoal::Ambiguous,
             _ => return Err(self.invalid("a goal of no kind")),
         })
@@ -2675,12 +2692,10 @@ impl Source<'_> {
             },
             7 => {
                 let id = self.node()?;
-                let kind = self.word()?;
-                let item_id = self.salsa()?;
-                let item = match kind {
-                    0 => AssocItemId::FunctionId(FunctionId::from_id(item_id)),
-                    1 => AssocItemId::ConstId(ConstId::from_id(item_id)),
-                    2 => AssocItemId::TypeAliasId(TypeAliasId::from_id(item_id)),
+                let item = match self.word()? {
+                    0 => AssocItemId::FunctionId(self.id()?),
+                    1 => AssocItemId::ConstId(self.id()?),
+                    2 => AssocItemId::TypeAliasId(self.id()?),
                     _ => return Err(self.invalid("an associated item of no kind")),
                 };
                 D::PrivateAssocItem { id, item }
@@ -2764,7 +2779,7 @@ impl Source<'_> {
                 expr: self.local()?,
                 op: {
                     let code = self.word()?;
-                    binary_of(code).ok_or(self.invalid("a binary operator of no kind"))?
+                    BinaryOp::from_code(code).ok_or(self.invalid("a binary operator of no kind"))?
                 },
                 lhs: self.ty(tys)?,
                 rhs: self.ty(tys)?,
@@ -2905,6 +2920,22 @@ impl Source<'_> {
                     _ => return Err(self.invalid("an optional ambiguity of no kind")),
                 },
                 origin: if self.bool()? { Some((self.span()?, self.generic_param()?)) } else { None },
+                named: match self.word()? {
+                    0 => None,
+                    1 => {
+                        let args = tys.args(self.word()?)?;
+                        let term = match args.as_ref().as_slice() {
+                            [term] => term.store(),
+                            _ => return Err(self.invalid("a named term that is not one argument")),
+                        };
+                        let len = self.len()?;
+                        let params =
+                            exact(len, (0..len).map(|_| Ok((self.span()?, self.generic_param()?))))?;
+                        Some(Box::new(NamedTerm { term, params }))
+                    }
+                    _ => return Err(self.invalid("an optional named term of no kind")),
+                },
+                cause: self.cause_code()?,
             },
             37 => D::UnionExprMustHaveExactlyOneField { expr: self.local()? },
             38 => D::TypeMismatch {
@@ -2926,7 +2957,13 @@ impl Source<'_> {
                         let trait_predicate = self.trait_predicate(tys)?;
                         let len = self.len()?;
                         let parent_trait_predicates = exact(len, (0..len).map(|_| self.trait_predicate(tys)))?;
-                        let parent_impls = exact(len, (0..len).map(|_| self.optional_impl()))?;
+                        let parent_impls = exact(
+                            len,
+                            (0..len).map(|_| match self.optional_impl()? {
+                                Some(impl_) => Ok(Some((impl_, self.word()?))),
+                                None => Ok(None),
+                            }),
+                        )?;
                         SolverDiagnosticKind::TraitUnimplemented {
                             trait_predicate,
                             parent_trait_predicates,
@@ -2939,12 +2976,18 @@ impl Source<'_> {
                         is_async: self.bool()?,
                         closure: self.ty(tys)?,
                     },
-                    2 => SolverDiagnosticKind::GoalUnmet { goal: self.goal(tys)? },
+                    2 => SolverDiagnosticKind::GoalUnmet {
+                        goal: self.goal(tys)?,
+                        non_const_impl: self.optional_impl()?,
+                    },
                     3 => SolverDiagnosticKind::Overflow {
                         goal: self.goal(tys)?,
                         suggest_increasing_limit: self.bool()?,
                     },
-                    4 => SolverDiagnosticKind::ProjectionMismatch { goal: self.goal(tys)? },
+                    4 => SolverDiagnosticKind::ProjectionMismatch {
+                        goal: self.goal(tys)?,
+                        normalized: if self.bool()? { Some(self.generic_arg(tys)?) } else { None },
+                    },
                     5 => SolverDiagnosticKind::TypesDiffer { expected: self.ty(tys)?, found: self.ty(tys)? },
                     6 => SolverDiagnosticKind::ConstArgHasWrongType {
                         ct: self.generic_arg(tys)?,
@@ -2984,6 +3027,15 @@ impl Source<'_> {
                     _ => return Err(self.invalid("a return of no kind")),
                 },
             },
+            45 => D::UnsafeBinderCastOfNonBinder {
+                expr: self.local()?,
+                kind: match self.word()? {
+                    0 => UnsafeBinderCastKind::Wrap,
+                    1 => UnsafeBinderCastKind::Unwrap,
+                    _ => return Err(self.invalid("an unsafe binder cast of no kind")),
+                },
+                found: self.ty(tys)?,
+            },
             44 => {
                 let record = self.expr_or_pat()?;
                 let variant = self.variant()?;
@@ -3022,6 +3074,8 @@ impl Source<'_> {
             6 => ObligationCauseCode::MatchExpressionArm { prior_arms: self.word()? },
             7 => ObligationCauseCode::LetType,
             8 => ObligationCauseCode::SizedReturnType,
+            9 => ObligationCauseCode::IfExpressionWithNoElse,
+            10 => ObligationCauseCode::ReturnNoExpression,
             _ => return Err(self.invalid("an obligation cause of no kind")),
         })
     }
@@ -3161,10 +3215,11 @@ mod tests {
     use blaze_format::to_bytes;
     use either::Either;
     use hir_def::{
-        BuiltinDeriveImplId,
+        BuiltinDeriveImplId, ImplId, StaticId, TypeAliasId,
         hir::{BindingId, PatId},
     };
     use la_arena::ArenaMap;
+    use salsa::plumbing::FromId;
 
     use super::*;
     use crate::{
@@ -3173,9 +3228,11 @@ mod tests {
             GenericArgsProhibitedReason, PathGenericsSource, PathLoweringDiagnostic,
             TyLoweringDiagnostic,
         },
-        next_solver::{GenericArg, StoredGenericArg, TyKind, default_types},
+        next_solver::{
+            Const, ConstExt, ConstKind, GenericArg, StoredGenericArg, TyKind, default_types,
+        },
     };
-    use rustc_type_ir::InferTy;
+    use rustc_type_ir::{InferConst, InferTy};
 
     /// Types and arguments as a list, without a database: what the round trip of everything but
     /// the type table is tested with. A trait reference needs an interner, so the tests hold none.
@@ -3183,6 +3240,7 @@ mod tests {
     struct Model {
         tys: Vec<StoredTy>,
         args: Vec<StoredGenericArgs>,
+        predicates: Vec<StoredPredicate>,
     }
 
     impl<'db> TyEncode<'db> for Model {
@@ -3199,6 +3257,11 @@ mod tests {
         fn trait_ref(&mut self, _: &StoredTraitRef) -> [u32; 3] {
             panic!("the tests hold no trait reference")
         }
+
+        fn predicate(&mut self, predicate: Predicate<'db>) -> u32 {
+            self.predicates.push(predicate.store());
+            self.predicates.len() as u32 - 1
+        }
     }
 
     impl TyDecode for Model {
@@ -3212,6 +3275,10 @@ mod tests {
 
         fn trait_ref(&self, _: [u32; 3]) -> Result<StoredTraitRef, FormatError> {
             Err(FormatError::Invalid { at: 0, what: "no trait references" })
+        }
+
+        fn predicate(&self, at: u32) -> Result<StoredPredicate, FormatError> {
+            self.predicates.get(at as usize).copied().ok_or(FormatError::Invalid { at: 0, what: "no such predicate" })
         }
     }
 
@@ -3257,6 +3324,8 @@ mod tests {
     fn every_diagnostic() -> Vec<InferenceDiagnostic> {
         use InferenceDiagnostic as D;
         let types = &default_types().types;
+        let regions = &default_types().regions;
+        let region = |it: crate::next_solver::Region<'static>| GenericArg::from(it).store();
         let ty = |it: Ty<'static>| it.store();
         let variant: VariantId = StructId::from_id(id(4)).into();
         let enum_variant: VariantId = EnumVariantId::from_id(id(5)).into();
@@ -3280,7 +3349,8 @@ mod tests {
             StoredGoal::ConstEquate { a: arg_of(types.bool), b: arg_of(types.u8) },
             StoredGoal::DynCompatible { trait_ },
             StoredGoal::UnstableFeature { feature: Symbol::intern("blaze_feature") },
-            StoredGoal::Outlives,
+            StoredGoal::Outlives { a: region(regions.statik), b: region(regions.erased) },
+            StoredGoal::Outlives { a: arg_of(types.u8), b: region(regions.statik) },
             StoredGoal::Ambiguous,
         ];
         let mut all = vec![
@@ -3486,6 +3556,15 @@ mod tests {
                 kind: TypeAnnotationNeeded::E0282,
                 ambiguity: None,
                 origin: Some((Span::ExprId(expr(31)), TypeParamId::from_unchecked(param).into())),
+                named: Some(Box::new(NamedTerm {
+                    term: GenericArg::from(Ty::new_without_interner(TyKind::Infer(InferTy::FreshTy(1))))
+                        .store(),
+                    params: vec![
+                        (Span::Dummy, ConstParamId::from_unchecked(param).into()),
+                        (Span::ExprId(expr(31)), TypeParamId::from_unchecked(param).into()),
+                    ],
+                })),
+                cause: causes[0],
             },
             D::TypeMustBeKnown {
                 at_point: Span::PatId(pat(1)),
@@ -3496,6 +3575,8 @@ mod tests {
                     related: Vec::new(),
                 })),
                 origin: Some((Span::Dummy, ConstParamId::from_unchecked(param).into())),
+                named: None,
+                cause: causes[2],
             },
             D::TypeMustBeKnown {
                 at_point: Span::ExprId(expr(30)),
@@ -3518,6 +3599,14 @@ mod tests {
                         .collect(),
                 })),
                 origin: None,
+                named: Some(Box::new(NamedTerm {
+                    term: GenericArg::from(Const::new_without_interner(ConstKind::Infer(
+                        InferConst::Fresh(0),
+                    )))
+                    .store(),
+                    params: vec![(Span::PatId(pat(2)), ConstParamId::from_unchecked(param).into())],
+                })),
+                cause: causes[1],
             },
             D::UnionExprMustHaveExactlyOneField { expr: expr(21) },
             D::TypeMismatch {
@@ -3555,7 +3644,18 @@ mod tests {
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::ExprId(expr(31)),
                 cause: causes[3],
-                kind: SolverDiagnosticKind::ProjectionMismatch { goal: goals[2].clone() },
+                kind: SolverDiagnosticKind::ProjectionMismatch {
+                    goal: goals[2].clone(),
+                    normalized: Some(arg_of(types.bool)),
+                },
+            }),
+            D::SolverDiagnostic(SolverDiagnostic {
+                span: Span::ExprId(expr(31)),
+                cause: causes[0],
+                kind: SolverDiagnosticKind::ProjectionMismatch {
+                    goal: goals[2].clone(),
+                    normalized: None,
+                },
             }),
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::PatId(pat(17)),
@@ -3581,6 +3681,16 @@ mod tests {
             D::MutableRefBinding { pat: pat(15) },
             D::YieldOutsideCoroutine { expr: expr(24) },
             D::ReturnOutsideFunction { expr: expr(25), kind: ReturnKind::BecomeExpr },
+            D::UnsafeBinderCastOfNonBinder {
+                expr: expr(25),
+                kind: UnsafeBinderCastKind::Wrap,
+                found: ty(types.u8),
+            },
+            D::UnsafeBinderCastOfNonBinder {
+                expr: expr(26),
+                kind: UnsafeBinderCastKind::Unwrap,
+                found: ty(types.never),
+            },
             D::RecordMissingFields {
                 record: ExprOrPatId::PatId(pat(16)),
                 variant,
@@ -3595,11 +3705,16 @@ mod tests {
             at_error: (n == 1).then(|| Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store()),
             unmet: goals.iter().take(n).cloned().collect(),
         }));
-        all.extend(goals.iter().map(|goal| {
+        all.extend(goals.iter().enumerate().map(|(n, goal)| {
+            let non_const_impl = match n % 3 {
+                0 => None,
+                1 => Some(AnyImplId::ImplId(ImplId::from_id(id(42)))),
+                _ => Some(AnyImplId::BuiltinDeriveImplId(BuiltinDeriveImplId::from_id(id(43)))),
+            };
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::ExprId(expr(33)),
                 cause: causes[8],
-                kind: SolverDiagnosticKind::GoalUnmet { goal: goal.clone() },
+                kind: SolverDiagnosticKind::GoalUnmet { goal: goal.clone(), non_const_impl },
             })
         }));
         let unreported = [
@@ -3619,7 +3734,7 @@ mod tests {
         }));
         all.extend((0..29).map(|code| D::BinaryOperatorCannotBeApplied {
             expr: expr(27),
-            op: binary_of(code).unwrap(),
+            op: BinaryOp::from_code(code).unwrap(),
             lhs: ty(types.i32),
             rhs: ty(types.u8),
             at_error: (code % 4 == 1).then(|| {
@@ -3815,6 +3930,8 @@ mod tests {
                 (ExprOrPatId::PatId(pat(6)), TraitId::from_id(id(48))),
                 (ExprOrPatId::ExprId(expr(12)), TraitId::from_id(id(48))),
             ]),
+            // A predicate needs an interner, so the column is only tested empty here.
+            coroutine_stalled_predicates: Box::new([]),
             nodes_with_type_mismatches: mismatches,
             error_ty: types.unit.store(),
             expr_adjustments: expr_adjustments.freeze(),
@@ -3862,6 +3979,23 @@ mod tests {
         assert_eq!(back.diagnostics.len(), every_diagnostic().len());
         assert_eq!(back.unreachable.len(), every_unreachable().len());
         assert_eq!(back.traits_in_scope_used(), result.traits_in_scope_used(), "in their order");
+    }
+
+    #[test]
+    fn a_stalled_goal_span_round_trips_and_one_of_no_kind_is_refused() {
+        let binding = BindingId::from_raw(RawIdx::from_u32(3));
+        let type_ref = hir_def::type_ref::TypeRefId::from_raw(RawIdx::from_u32(9));
+        for span in [
+            Span::ExprId(expr(5)),
+            Span::PatId(pat(7)),
+            Span::BindingId(binding),
+            Span::TypeRefId(type_ref),
+            Span::Dummy,
+        ] {
+            assert_eq!(span_of(&span_words(span)), Some(span));
+        }
+        assert_eq!(span_of(&[4, 1]), None, "a dummy span holds no index");
+        assert_eq!(span_of(&[5, 0]), None, "no sixth kind");
     }
 
     #[test]
@@ -3957,9 +4091,9 @@ mod tests {
             assert_eq!(adjust_code(adjust) as usize, code);
         }
         for code in 0..29 {
-            assert_eq!(binary_code(binary_of(code).unwrap()), code);
+            assert_eq!(BinaryOp::from_code(code).unwrap().code(), code);
         }
-        assert!(binary_of(29).is_none());
+        assert!(BinaryOp::from_code(29).is_none());
         for (code, error) in CAST_ERRORS.iter().enumerate() {
             assert_eq!(cast_error_code(error) as usize, code);
         }
@@ -3988,7 +4122,7 @@ mod tests {
         });
     }
 
-    fn cause_codes() -> [ObligationCauseCode; 10] {
+    fn cause_codes() -> [ObligationCauseCode; 12] {
         let item: GenericDefId = ImplId::from_id(id(9)).into();
         [
             ObligationCauseCode::Misc,
@@ -4001,6 +4135,8 @@ mod tests {
             ObligationCauseCode::MatchExpressionArm { prior_arms: 4 },
             ObligationCauseCode::LetType,
             ObligationCauseCode::SizedReturnType,
+            ObligationCauseCode::IfExpressionWithNoElse,
+            ObligationCauseCode::ReturnNoExpression,
         ]
     }
 

@@ -781,9 +781,19 @@ fn reads_a_linker_script() {
 }
 
 #[test]
-fn a_linker_script_searching_libraries_is_an_error() {
-    let message = error(read(Arch::X86_64, "libx.so", b"GROUP ( -lfoo )", &SHARED));
-    assert!(message.contains("libx.so") && message.contains("-lfoo"), "{message}");
+fn a_linker_scripts_libraries_are_kept_as_written() {
+    let debian = b"/* GNU ld script\n   Use the shared library, but some functions are only in\n   the static library.  */\nGROUP ( libgcc_s.so.1 -lgcc )\n";
+    let gcc_s = shared(read(Arch::X86_64, "/usr/lib/gcc/x86_64-linux-gnu/12/libgcc_s.so", debian, &SHARED));
+    assert_eq!(gcc_s.name, "libgcc_s.so");
+    assert_eq!(gcc_s.inputs, ["libgcc_s.so.1", "-lgcc"]);
+    let other = shared(read(Arch::X86_64, "libx.so", b"INPUT ( -l:libfoo.so.2 AS_NEEDED ( -lbar ) )", &SHARED));
+    assert_eq!(other.inputs, ["-l:libfoo.so.2", "-lbar"]);
+}
+
+#[test]
+fn a_linker_script_searching_directories_is_an_error() {
+    let message = error(read(Arch::X86_64, "libx.so", b"GROUP ( -l )", &SHARED));
+    assert!(message.contains("libx.so") && message.contains("-l names no library"), "{message}");
     let message = error(read(Arch::X86_64, "libx.so", b"SEARCH_DIR(\"/usr/lib\")", &SHARED));
     assert!(message.contains("libx.so") && message.contains("SEARCH_DIR"), "{message}");
     let message = error(read(Arch::X86_64, "libx.so", b"GROUP ( a.so", &SHARED));

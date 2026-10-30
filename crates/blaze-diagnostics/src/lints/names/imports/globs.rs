@@ -13,26 +13,23 @@
 //! `max_vis`), `compiler/rustc_middle/src/ty/mod.rs` (`Visibility::to_string`) and
 //! `compiler/rustc_resolve/src/effective_visibilities.rs` (MIT or Apache-2.0).
 
-use hir::{HasSource, InFile, ModuleDef};
+use hir::{InFile, ModuleDef, view::HasSourceView as _};
 use hir_def::{MacroId, ModuleDefId, ModuleId, visibility::Visibility};
 use hir_expand::{mod_path::ModPath, name::Name};
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
-use syntax::{
-    AstNode, SyntaxNode, SyntaxNodePtr,
-    ast::{self, HasVisibility},
-};
+use syntax::view::{self as ast, AstNode as _, HasVisibility, Node};
 
 use super::used::{Binding, Entry, Ns, Tree, TreeKind, UseItem, Uses, entry};
 use crate::{
-    cx::{Cx, item_range},
+    cx::{Cx, item_range_view},
     lower::{Found, Phase},
     model::{Applicability, Diag},
 };
 
 /// The lints of this module, in the order rustc buffers them: each import's as it is
 /// finalized, then each module's names'.
-pub(super) fn lints(cx: &Cx<'_, '_>, uses: &Uses<'_>) -> Vec<Found> {
+pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>) -> Vec<Found> {
     // alloc: holds only diagnostics that fire; empty, it allocates nothing
     let mut found = Vec::new();
     for item in &uses.items {
@@ -56,7 +53,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>, uses: &Uses<'_>) -> Vec<Found> {
 
 /// rustc's check that a glob import re-exports something as visibly as it is declared: its
 /// visibility greater than `max_vis`, the greatest of those of what it imports.
-fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem, tree: &Tree) -> Option<Found> {
+fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>, tree: &Tree<'_>) -> Option<Found> {
     let db = cx.db;
     let Some(ModuleDefId::ModuleId(from)) = tree.source else { return None };
     // A private import is as visible as anything it can import, so `max_vis` never falls below it.
@@ -108,13 +105,13 @@ fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem, tree: &Tree
     diag.span_note(span, format!("the most public imported item is `{}`", max.to_string(cx, home)));
     diag.help("reduce the glob import's visibility or increase visibility of imported items");
     diag.fact(cx.resolves_fact(from.into(), "*"), "what the glob import brings in");
-    let at = InFile::new(item.node.file_id, SyntaxNodePtr::new(tree.node.syntax()));
+    let at = InFile::new(item.node.file_id, ast::ptr(tree.node.syntax()));
     Some(Found::lint(diag, Phase::Resolve, at))
 }
 
 /// `pub_use_of_private_extern_crate`: a `pub` single import of nothing but an `extern crate`
 /// item less visible than it.
-fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem, tree: &Tree) -> Option<Found> {
+fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>, tree: &Tree<'_>) -> Option<Found> {
     if !item.public || tree.self_import || tree.binding.is_none() {
         return None;
     }
@@ -138,7 +135,7 @@ fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem, tree: 
         format!("extern crate `{ident}` is private and cannot be re-exported"),
         span,
     );
-    let start = item_range(krate.node.value.syntax());
+    let start = item_range_view(krate.node.value.syntax());
     let sugg = cx.span(InFile::new(krate.node.file_id, start)).shrink_to_lo();
     diag.suggestion_verbose(
         sugg,
@@ -148,16 +145,16 @@ fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem, tree: 
     );
     // alloc: the fact of a lint that fires
     diag.fact(cx.resolves_fact(item.module.into(), &ident), format!("what `{ident}` is imported from"));
-    let at = InFile::new(item.node.file_id, SyntaxNodePtr::new(tree.node.syntax()));
+    let at = InFile::new(item.node.file_id, ast::ptr(tree.node.syntax()));
     Some(Found::lint(diag, Phase::Resolve, at))
 }
 
 /// `ambiguous_glob_reexports` and `hidden_glob_reexports` of the names of `module`.
-fn reexports(cx: &Cx<'_, '_>, uses: &Uses<'_>, module: ModuleId) -> Vec<Found> {
+fn reexports<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>, module: ModuleId) -> Vec<Found> {
     let db = cx.db;
     // alloc: holds only diagnostics that fire; empty, it allocates nothing
     let mut found = Vec::new();
-    let globs: SmallVec<[(&UseItem, &Tree, ModuleId); 2]> = uses
+    let globs: SmallVec<[(&UseItem<'db>, &Tree<'db>, ModuleId); 2]> = uses
         .globs_of(module)
         .filter_map(|(item, tree)| match tree.source {
             Some(ModuleDefId::ModuleId(from)) if from != module => Some((item, tree, from)),
@@ -183,7 +180,7 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses<'_>, module: ModuleId) -> Vec<Found> {
         let current = here.get(name);
         for ns in Ns::ALL {
             let Some(it) = entry(&current, ns) else { continue };
-            let imported: SmallVec<[(&UseItem, &Tree, Entry); 2]> = globs
+            let imported: SmallVec<[(&UseItem<'db>, &Tree<'db>, Entry); 2]> = globs
                 .iter()
                 .filter_map(|(item, tree, from)| {
                     let per = from.def_map(db).module(db, *from).name_in_scope(db, name);
@@ -222,7 +219,7 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses<'_>, module: ModuleId) -> Vec<Found> {
                     );
                     // alloc: the fact of a lint that fires
                     diag.fact(cx.resolves_fact(module.into(), &text), format!("what `{text}` is in the module"));
-                    let at = InFile::new(first_item.node.file_id, SyntaxNodePtr::new(first_item.node.value.syntax()));
+                    let at = InFile::new(first_item.node.file_id, ast::ptr(first_item.node.value.syntax()));
                     found.push(Found::lint(diag, Phase::Resolve, at));
                 }
                 it => {
@@ -239,7 +236,7 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses<'_>, module: ModuleId) -> Vec<Found> {
                     let Some(private) = binding_node(cx, uses, it) else { continue };
                     // alloc: the lint fires; the name goes into its note and fact
                     let text = name.as_str().to_owned();
-                    let span = cx.span(private.map(|it| item_span(&it)));
+                    let span = cx.span(private.map(item_span));
                     let mut diag =
                         // clone: the lint fires; its span is both the primary span and a note's
                         Diag::lint("hidden_glob_reexports", "private item shadows public glob re-export", span.clone());
@@ -255,7 +252,7 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses<'_>, module: ModuleId) -> Vec<Found> {
                     diag.span_note(span, "but the private item here shadows it");
                     // alloc: the fact of a lint that fires
                     diag.fact(cx.resolves_fact(module.into(), &text), format!("what `{text}` is in the module"));
-                    found.push(Found::lint(diag, Phase::Resolve, private.map(|it| SyntaxNodePtr::new(&it))));
+                    found.push(Found::lint(diag, Phase::Resolve, private.map(ast::ptr)));
                 }
             }
         }
@@ -265,17 +262,15 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses<'_>, module: ModuleId) -> Vec<Found> {
 
 /// The node of what a name is bound to in a module, when it is not a glob's: the item that
 /// defines it, the `use` tree or the `extern crate` item that imports it.
-fn binding_node(cx: &Cx<'_, '_>, uses: &Uses<'_>, it: Entry) -> Option<InFile<SyntaxNode>> {
+fn binding_node<'db>(cx: &Cx<'_, 'db>, uses: &Uses<'_, 'db>, it: Entry) -> Option<InFile<Node<'db>>> {
     match it.import {
         Some(binding @ Binding::Import(_)) => {
             let (item, tree) = uses.tree(binding)?;
-            // clone: a rowan cursor's refcount, for `hidden_glob_reexports` once it fires
-            Some(InFile::new(item.node.file_id, tree.node.syntax().clone()))
+            Some(InFile::new(item.node.file_id, tree.node.syntax()))
         }
         Some(Binding::ExternCrate(id)) => {
             let krate = uses.extern_crate_of(id)?;
-            // clone: a rowan cursor's refcount, for `hidden_glob_reexports` once it fires
-            Some(krate.node.as_ref().map(|it| it.syntax().clone()))
+            Some(krate.node.map(|it| it.syntax()))
         }
         Some(Binding::Glob(_)) => None,
         None => def_node(cx, it.def),
@@ -283,30 +278,29 @@ fn binding_node(cx: &Cx<'_, '_>, uses: &Uses<'_>, it: Entry) -> Option<InFile<Sy
 }
 
 /// The item that defines `def`.
-fn def_node(cx: &Cx<'_, '_>, def: ModuleDefId) -> Option<InFile<SyntaxNode>> {
-    fn node<N: AstNode>(it: Option<InFile<N>>) -> Option<InFile<SyntaxNode>> {
-        // clone: a rowan cursor's refcount, for `hidden_glob_reexports` once it fires
-        it.map(|it| it.map(|it| it.syntax().clone()))
+fn def_node<'db>(cx: &Cx<'_, 'db>, def: ModuleDefId) -> Option<InFile<Node<'db>>> {
+    fn node<'db, N: ast::AstNode<'db>>(it: Option<InFile<N>>) -> Option<InFile<Node<'db>>> {
+        it.map(|it| it.map(|it| it.syntax()))
     }
     let db = cx.db;
     match ModuleDef::from(def) {
-        ModuleDef::Module(it) => node(it.declaration_source(db)),
-        ModuleDef::Function(it) => node(it.source(db)),
-        ModuleDef::Adt(hir::Adt::Struct(it)) => node(it.source(db)),
-        ModuleDef::Adt(hir::Adt::Union(it)) => node(it.source(db)),
-        ModuleDef::Adt(hir::Adt::Enum(it)) => node(it.source(db)),
-        ModuleDef::Const(it) => node(it.source(db)),
-        ModuleDef::Static(it) => node(it.source(db)),
-        ModuleDef::Trait(it) => node(it.source(db)),
-        ModuleDef::TypeAlias(it) => node(it.source(db)),
-        ModuleDef::Macro(it) => node(it.source(db)),
+        ModuleDef::Module(it) => node(it.declaration_source_view(db)),
+        ModuleDef::Function(it) => node(it.source_view(db)),
+        ModuleDef::Adt(hir::Adt::Struct(it)) => node(it.source_view(db)),
+        ModuleDef::Adt(hir::Adt::Union(it)) => node(it.source_view(db)),
+        ModuleDef::Adt(hir::Adt::Enum(it)) => node(it.source_view(db)),
+        ModuleDef::Const(it) => node(it.source_view(db)),
+        ModuleDef::Static(it) => node(it.source_view(db)),
+        ModuleDef::Trait(it) => node(it.source_view(db)),
+        ModuleDef::TypeAlias(it) => node(it.source_view(db)),
+        ModuleDef::Macro(it) => node(it.source_view(db)),
         ModuleDef::EnumVariant(_) | ModuleDef::BuiltinType(_) => None,
     }
 }
 
 /// rustc's span of a binding: an item's without its attributes, a `use` tree's whole.
-fn item_span(node: &SyntaxNode) -> syntax::TextRange {
-    if ast::UseTree::can_cast(node.kind()) { node.text_range() } else { item_range(node) }
+fn item_span(node: Node<'_>) -> syntax::TextRange {
+    if ast::UseTree::can_cast(node.kind()) { node.text_range() } else { item_range_view(node) }
 }
 
 /// The module rustc's privacy counts an item of `module` in: the nearest that is not a block.
@@ -323,7 +317,7 @@ fn nearest_module(cx: &Cx<'_, '_>, module: ModuleId) -> ModuleId {
 }
 
 /// The visibility a `use` item is declared with, resolved.
-fn item_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem) -> Option<Vis> {
+fn item_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, item: &UseItem<'_>) -> Option<Vis> {
     let db = cx.db;
     let home = nearest_module(cx, item.module);
     let Some(vis) = item.node.value.visibility() else { return Some(Vis::Module(home)) };
@@ -334,7 +328,7 @@ fn item_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem) -> Option<V
         ast::VisibilityKind::PubSuper => Vis::Module(home.def_map(db).containing_module(db, home)?),
         ast::VisibilityKind::In(path) => {
             let span_map = item.node.file_id.span_map(db);
-            let path = ModPath::from_src(db, path, &mut |range| span_map.span_for_range(range).ctx)?;
+            let path = ModPath::from_src_view(db, path, &mut |range| span_map.span_for_range(range).ctx)?;
             match entry(&uses.lookup(cx, home, path.kind, path.segments()), Ns::Types)?.def {
                 ModuleDefId::ModuleId(it) => Vis::module(cx, it),
                 _ => return None,

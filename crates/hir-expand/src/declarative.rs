@@ -102,21 +102,22 @@ impl DeclarativeMacroExpander {
         }
     }
 
-    pub fn expand_unhygienic(
+    pub fn expand_unhygienic<'f>(
         &self,
         db: &Db,
+        frame: &'f Frame,
         tt: &tt::TopSubtree,
         call_style: MacroCallStyle,
         call_site: Span,
-    ) -> ExpandResult<tt::TopSubtree> {
+    ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
         match self.mac.err() {
             Some(_) => ExpandResult::new(
-                tt::TopSubtree::empty(tt::DelimSpan { open: call_site, close: call_site }),
+                tt::TopSubtree::empty_in(tt::DelimSpan { open: call_site, close: call_site }, frame),
                 ExpandError::new(call_site, ExpandErrorKind::MacroDefinition),
             ),
             None => self
                 .mac
-                .expand(db, tt, |_| (), call_style, call_site)
+                .expand_in(frame, db, tt, |_| (), call_style, call_site)
                 .map(TupleExt::head)
                 .map_err(Into::into),
         }

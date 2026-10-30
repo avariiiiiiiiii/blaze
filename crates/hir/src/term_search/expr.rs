@@ -34,6 +34,7 @@ fn mod_item_path_str(
     edition: Edition,
 ) -> Result<String, DisplaySourceCodeError> {
     let path = mod_item_path(sema_scope, def, cfg);
+    // alloc: source text for the editor, built per suggestion after the search
     path.map(|it| it.display(sema_scope.db, edition).to_string())
         .ok_or(DisplaySourceCodeError::PathNotFound)
 }
@@ -117,15 +118,18 @@ impl<'db> Expr<'db> {
                         container_name(container, sema_scope, cfg, edition, display_target)?;
                     let const_name = it
                         .name(db)
-                        .map(|c| c.display(db, edition).to_string())
-                        .unwrap_or(String::new());
-                    Ok(format!("{container_name}::{const_name}"))
+                        .map(|c| c.display(db, edition).to_string()) // alloc: editor text
+                        .unwrap_or(String::new()); // alloc: empty
+                    Ok(format!("{container_name}::{const_name}")) // alloc: editor text
                 }
                 None => mod_item_path_str(sema_scope, &ModuleDef::Const(*it)),
             },
             Expr::Static(it) => mod_item_path_str(sema_scope, &ModuleDef::Static(*it)),
+            // alloc: source text for the editor, built per suggestion after the search
             Expr::Local(it) => Ok(it.name(db).display(db, edition).to_string()),
+            // alloc: as above
             Expr::ConstParam(it) => Ok(it.name(db).display(db, edition).to_string()),
+            // alloc: as above
             Expr::FamousType { value, .. } => Ok(value.to_string()),
             Expr::Function { func, params, .. } => {
                 let args = params
@@ -139,12 +143,13 @@ impl<'db> Expr<'db> {
                     Some(container) => {
                         let container_name =
                             container_name(container, sema_scope, cfg, edition, display_target)?;
+                        // alloc: editor text
                         let fn_name = func.name(db).display(db, edition).to_string();
-                        Ok(format!("{container_name}::{fn_name}({args})"))
+                        Ok(format!("{container_name}::{fn_name}({args})")) // alloc: editor text
                     }
                     None => {
                         let fn_name = mod_item_path_str(sema_scope, &ModuleDef::Function(*func))?;
-                        Ok(format!("{fn_name}({args})"))
+                        Ok(format!("{fn_name}({args})")) // alloc: editor text
                     }
                 }
             }
@@ -153,6 +158,7 @@ impl<'db> Expr<'db> {
                     return Ok(many_formatter(&target.ty(db)));
                 }
 
+                // alloc: editor text
                 let func_name = func.name(db).display(db, edition).to_string();
                 let self_param = func.self_param(db).unwrap();
                 let target_str =
@@ -168,20 +174,23 @@ impl<'db> Expr<'db> {
                     Some(trait_) => {
                         let trait_name = mod_item_path_str(sema_scope, &ModuleDef::Trait(trait_))?;
                         let target = match self_param.access(db) {
+                            // alloc: editor text
                             crate::Access::Shared if !target.is_many() => format!("&{target_str}"),
                             crate::Access::Exclusive if !target.is_many() => {
-                                format!("&mut {target_str}")
+                                format!("&mut {target_str}") // alloc: editor text
                             }
                             crate::Access::Owned => target_str,
                             _ => many_formatter(&target.ty(db)),
                         };
                         let res = match args.is_empty() {
+                            // alloc: editor text
                             true => format!("{trait_name}::{func_name}({target})",),
+                            // alloc: editor text
                             false => format!("{trait_name}::{func_name}({target}, {args})",),
                         };
                         Ok(res)
                     }
-                    None => Ok(format!("{target_str}.{func_name}({args})")),
+                    None => Ok(format!("{target_str}.{func_name}({args})")), // alloc: editor text
                 }
             }
             Expr::Variant { variant, params, .. } => {
@@ -195,7 +204,7 @@ impl<'db> Expr<'db> {
                             .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                             .into_iter()
                             .join(", ");
-                        format!("({args})")
+                        format!("({args})") // alloc: editor text
                     }
                     StructKind::Record => {
                         let fields = variant.fields(db);
@@ -203,6 +212,7 @@ impl<'db> Expr<'db> {
                             .iter()
                             .zip(fields.iter())
                             .map(|(a, f)| {
+                                // alloc: editor text
                                 let tmp = format!(
                                     "{}: {}",
                                     f.name(db).display(db, edition),
@@ -218,13 +228,13 @@ impl<'db> Expr<'db> {
                             .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                             .into_iter()
                             .join(", ");
-                        format!("{{ {args} }}")
+                        format!("{{ {args} }}") // alloc: editor text
                     }
-                    StructKind::Unit => String::new(),
+                    StructKind::Unit => String::new(), // alloc: empty
                 };
 
                 let prefix = mod_item_path_str(sema_scope, &ModuleDef::EnumVariant(*variant))?;
-                Ok(format!("{prefix}{inner}"))
+                Ok(format!("{prefix}{inner}")) // alloc: editor text
             }
             Expr::Struct { strukt, params, .. } => {
                 let inner = match strukt.kind(db) {
@@ -237,7 +247,7 @@ impl<'db> Expr<'db> {
                             .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                             .into_iter()
                             .join(", ");
-                        format!("({args})")
+                        format!("({args})") // alloc: editor text
                     }
                     StructKind::Record => {
                         let fields = strukt.fields(db);
@@ -245,6 +255,7 @@ impl<'db> Expr<'db> {
                             .iter()
                             .zip(fields.iter())
                             .map(|(a, f)| {
+                                // alloc: editor text
                                 let tmp = format!(
                                     "{}: {}",
                                     f.name(db).display(db, edition),
@@ -260,13 +271,13 @@ impl<'db> Expr<'db> {
                             .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                             .into_iter()
                             .join(", ");
-                        format!(" {{ {args} }}")
+                        format!(" {{ {args} }}") // alloc: editor text
                     }
-                    StructKind::Unit => String::new(),
+                    StructKind::Unit => String::new(), // alloc: empty
                 };
 
                 let prefix = mod_item_path_str(sema_scope, &ModuleDef::Adt(Adt::Struct(*strukt)))?;
-                Ok(format!("{prefix}{inner}"))
+                Ok(format!("{prefix}{inner}")) // alloc: editor text
             }
             Expr::Tuple { params, .. } => {
                 let args = params
@@ -275,7 +286,7 @@ impl<'db> Expr<'db> {
                     .collect::<Result<Vec<String>, DisplaySourceCodeError>>()?
                     .into_iter()
                     .join(", ");
-                let res = format!("({args})");
+                let res = format!("({args})"); // alloc: editor text
                 Ok(res)
             }
             Expr::Field { expr, field } => {
@@ -285,8 +296,8 @@ impl<'db> Expr<'db> {
 
                 let strukt =
                     expr.gen_source_code(sema_scope, many_formatter, cfg, display_target)?;
-                let field = field.name(db).display(db, edition).to_string();
-                Ok(format!("{strukt}.{field}"))
+                let field = field.name(db).display(db, edition).to_string(); // alloc: editor text
+                Ok(format!("{strukt}.{field}")) // alloc: editor text
             }
             Expr::Reference(expr) => {
                 if expr.contains_many_in_illegal_pos(db) {
@@ -295,7 +306,7 @@ impl<'db> Expr<'db> {
 
                 let inner =
                     expr.gen_source_code(sema_scope, many_formatter, cfg, display_target)?;
-                Ok(format!("&{inner}"))
+                Ok(format!("&{inner}")) // alloc: editor text
             }
             Expr::Many(ty) => Ok(many_formatter(ty)),
         }
@@ -310,40 +321,45 @@ impl<'db> Expr<'db> {
             Expr::Static(it) => it.ty(db),
             Expr::Local(it) => it.ty(db),
             Expr::ConstParam(it) => it.ty(db),
-            Expr::FamousType { ty, .. } => ty.clone(),
+            Expr::FamousType { ty, .. } => *ty,
             Expr::Function { func, generics, .. } => func.ret_type(db).instantiate(db, generics),
             Expr::Method { func, generics, target, .. } => func
                 .ret_type(db)
-                .instantiate(db, target.ty(db).type_arguments().chain(generics.iter().cloned())),
+                .instantiate(db, target.ty(db).type_arguments().chain(generics.iter().copied())),
             Expr::Variant { variant, generics, .. } => {
                 Adt::from(variant.parent_enum(db)).ty(db).instantiate(db, generics)
             }
             Expr::Struct { strukt, generics, .. } => {
                 Adt::from(*strukt).ty(db).instantiate(db, generics)
             }
-            Expr::Tuple { ty, .. } => ty.clone(),
+            Expr::Tuple { ty, .. } => *ty,
             Expr::Field { expr, field } => {
                 field.ty(db).instantiate(db, expr.ty(db).type_arguments())
             }
             Expr::Reference(it) => it.ty(db),
-            Expr::Many(ty) => ty.clone(),
+            Expr::Many(ty) => *ty,
         }
     }
 
     /// List the traits used in type tree
     pub fn traits_used(&self, db: &Db) -> Vec<Trait> {
-        let mut res = Vec::new();
+        let mut res = Vec::new(); // alloc: the returned list, once per suggestion
+        self.push_traits_used(db, &mut res);
+        res
+    }
 
+    /// `traits_used`, appended to `out`.
+    fn push_traits_used(&self, db: &Db, out: &mut Vec<Trait>) {
         if let Expr::Method { func, params, .. } = self {
-            res.extend(params.iter().flat_map(|it| it.traits_used(db)));
+            for param in params {
+                param.push_traits_used(db, out);
+            }
             if let Some(it) = func.as_assoc_item(db)
                 && let Some(it) = it.container_or_implemented_trait(db)
             {
-                res.push(it);
+                out.push(it);
             }
         }
-
-        res
     }
 
     /// Check in the tree contains `Expr::Many` variant in illegal place to insert `todo`,
@@ -392,7 +408,9 @@ fn container_name(
             let self_ty = imp.self_ty(sema_scope.db);
             // Should it be guaranteed that `mod_item_path` always exists?
             match self_ty.as_adt().and_then(|adt| mod_item_path(sema_scope, &adt.into(), cfg)) {
+                // alloc: editor text
                 Some(path) => path.display(sema_scope.db, edition).to_string(),
+                // alloc: editor text
                 None => self_ty.display(sema_scope.db, display_target).to_string(),
             }
         }

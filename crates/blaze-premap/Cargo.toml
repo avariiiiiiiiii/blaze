@@ -21,9 +21,12 @@ blaze-ids.workspace = true
 blaze-inproc.workspace = true
 blaze-items.workspace = true
 blaze-link.workspace = true
+blaze-mem.workspace = true
+rayon.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 blaze-core.workspace = true
 
 [lints]

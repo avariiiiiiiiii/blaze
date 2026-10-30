@@ -30,11 +30,11 @@ use rustc_type_ir::{
     TypeVisitableExt as _,
     inherent::{GenericArgs as _, IntoKind as _, SliceLike as _},
 };
-use syntax::{AstNode as _, ast};
+use syntax::view::{self as ast, AstNode as _};
 
 use super::BodyCx;
 use crate::{
-    cx::signature_range,
+    cx::signature_range_view,
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -106,10 +106,10 @@ fn lint(b: &BodyCx<'_, '_>, calls: Option<Vec<MirSpan>>) -> Vec<Found> {
     let mut sites: Vec<Span> = calls.into_iter().filter_map(|it| b.mir_span(it)).collect();
     sites.sort_by(|a, b| (&a.file, a.lo, a.hi).cmp(&(&b.file, b.lo, b.hi)));
     let at = b.owner_node();
-    let node = b.cx.syntax(at);
-    // alloc: empty, allocates nothing; clone: a node handle, a reference count, for a lint found
-    let Some(function) = ast::Fn::cast(node.value.clone()) else { return Vec::new() };
-    let span = b.cx.span(InFile::new(node.file_id, signature_range(&function)));
+    let node = b.cx.syntax_view(at);
+    // alloc: empty, allocates nothing
+    let Some(function) = ast::Fn::cast(node.value) else { return Vec::new() };
+    let span = b.cx.span(InFile::new(node.file_id, signature_range_view(function)));
     // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("unconditional_recursion", "function cannot return without recursing", span.clone());
     diag.span_label(span, "cannot return without recursing");
@@ -183,6 +183,8 @@ fn returns(terminator: &Terminator, recursive: bool) -> bool {
         | TerminatorKind::Unreachable
         | TerminatorKind::Yield { .. } => true,
         TerminatorKind::Call { target: None, cleanup: None, .. } => !recursive,
+        // rustc counts `become` as possibly recursive, but never as a recursive call site.
+        TerminatorKind::TailCall { .. } => false,
         _ => false,
     }
 }

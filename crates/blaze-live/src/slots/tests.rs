@@ -1,6 +1,8 @@
-//! The table switching on an image made in the test's own memory: a descriptor, a table
-//! cell, a two-slot table of two functions, and buffers for the patch regions, with the
-//! platform's writes done by [`Fake`].
+//! The table switching on an image made in the test's own memory: a descriptor, a table's
+//! header (with an execution log's table and map, or without), a two-slot table of two
+//! functions, and buffers for the patch regions, with the platform's writes done by
+//! [`Fake`]. Calls through a log stub are made as the linker's stub makes them
+//! ([`Program::target`]).
 
 #![allow(unsafe_code)]
 
@@ -13,11 +15,14 @@ use std::{
 use blaze_ids::rng::SplitMix64;
 
 use super::{
-    Outcome, hook, image,
+    Outcome,
+    exec::{self, Header, Tables},
+    hook, image,
     switch::{Dwarf, HOST_ARCH, KEPT, Layout, Limits, Memory, POOL, Span, Switch, Writes},
 };
 use crate::patch::{
     Answer, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, FIRST_GENERATION, Message, Patch,
+    exec::{self as words, CELL, CURRENT, LOADER, MAP, MAGIC, REGION_HEADER, SLOTS, STUBS},
 };
 
 /// The slide of the fake image: every address it says is this much below where it is.
@@ -62,8 +67,8 @@ impl Memory for Fake {
     const SEH: bool = true;
 
     fn cell(&self, cell: u64) -> u64 {
-        // SAFETY: the cell is the `Program`'s, an 8-aligned `AtomicU64` that outlives the
-        // switch.
+        // SAFETY: a word of the `Program`'s header, an 8-aligned `AtomicU64` that outlives
+        // the switch.
         unsafe { image::cell(cell) }.load(Ordering::Acquire)
     }
 
@@ -80,9 +85,9 @@ impl Memory for Fake {
         Err(format!("{:#x}: the fake image has no read-only data", range.start))
     }
 
-    fn loaders(&self, at: u64, slots: u64) -> &[u64] {
-        // SAFETY: the table is the `Program`'s, 8-aligned and `slots` long (`Switch::new`
-        // checked the cell points at it), and outlives the switch; nothing writes it.
+    fn loaders(&self, at: u64, slots: u64) -> &[AtomicU64] {
+        // SAFETY: the table is the `Program`'s `AtomicU64`s, `slots` long (`Switch::new`
+        // checked the header names it), and outlives the switch.
         unsafe { image::words(at, slots as usize) }
     }
 
@@ -115,21 +120,34 @@ impl Memory for Fake {
     }
 
     fn publish(&mut self, cell: u64, table: u64) -> Result<(), String> {
-        // SAFETY: the cell is the `Program`'s, an `AtomicU64` that outlives the switch.
+        // SAFETY: a word of the `Program`'s header, an `AtomicU64` that outlives the switch.
         unsafe { AtomicU64::from_ptr(cell as *mut u64) }.store(table, Ordering::Release);
         self.published += 1;
         Ok(())
     }
 }
 
+/// Where the fake log stubs are said to be, and how far apart: never run, only compared.
+const LOG_STUBS: u64 = 0x5_0000_0000;
+const LOG_STRIDE: u64 = 16;
+
+fn log_stub(slot: u64) -> u64 {
+    LOG_STUBS + slot * LOG_STRIDE
+}
+
 /// The parts of an image a switch works on, in the test's memory.
 struct Program {
-    cell: Box<AtomicU64>,
-    table: Box<[u64]>,
+    /// The table's header as the linker lays it out ([`words`]): with a log, its log table
+    /// and private map follow.
+    header: Box<[AtomicU64]>,
+    /// The loader's table.
+    table: Box<[AtomicU64]>,
     code: Box<[u64]>,
     data: Box<[u64]>,
     /// The patch code region: `code`'s buffer, or a function's own code.
     region: Range<u64>,
+    /// The tables of the program's switch.
+    tables: &'static Tables,
 }
 
 impl Program {
@@ -139,13 +157,88 @@ impl Program {
 
     /// A program whose table has `slots` slots, of `one` and `two` in turn.
     fn with_slots(slots: usize) -> Program {
-        let table: Box<[u64]> =
-            (0..slots).map(|it| if it % 2 == 0 { address(one) } else { address(two) }).collect();
-        let cell = Box::new(AtomicU64::new(table.as_ptr() as u64));
+        Program::linked(slots, false)
+    }
+
+    /// A program of `slots` slots linked with an execution log, or without one.
+    fn linked(slots: usize, logged: bool) -> Program {
+        let table: Box<[AtomicU64]> = (0..slots)
+            .map(|it| AtomicU64::new(if it % 2 == 0 { address(one) } else { address(two) }))
+            .collect();
+        let len = words::len(slots as u64, logged) / 8;
+        let header: Box<[AtomicU64]> = (0..len).map(|_| AtomicU64::new(0)).collect();
+        let at = header.as_ptr() as u64;
+        let word = |offset: u64| &header[(offset / 8) as usize];
+        let loader = table.as_ptr() as u64;
+        word(CURRENT).store(loader, Ordering::Relaxed);
+        word(LOADER).store(loader, Ordering::Relaxed);
+        if logged {
+            word(CELL).store(at + words::log_word(0), Ordering::Relaxed);
+            word(MAP).store(at + words::private_map(slots as u64), Ordering::Relaxed);
+            word(STUBS).store(LOG_STUBS, Ordering::Relaxed);
+            word(SLOTS).store(slots as u64 | LOG_STRIDE << 32, Ordering::Relaxed);
+            for slot in 0..slots as u64 {
+                word(words::log_word(slot)).store(log_stub(slot), Ordering::Relaxed);
+            }
+        } else {
+            word(CELL).store(loader, Ordering::Relaxed);
+            word(SLOTS).store(slots as u64, Ordering::Relaxed);
+        }
         let code = vec![0u64; 512].into_boxed_slice();
         let region = code.as_ptr() as u64..code.as_ptr() as u64 + 512 * 8;
         let data = vec![0u64; 64].into_boxed_slice();
-        Program { cell, table, code, data, region }
+        let tables = Box::leak(Box::new(Tables::new()));
+        Program { header, table, code, data, region, tables }
+    }
+
+    /// The table cell, the header's first word.
+    fn cell(&self) -> &AtomicU64 {
+        &self.header[0]
+    }
+
+    fn word(&self, offset: u64) -> &AtomicU64 {
+        &self.header[(offset / 8) as usize]
+    }
+
+    /// The loader's table as it is now.
+    fn loaders(&self) -> Vec<u64> {
+        self.table.iter().map(|it| it.load(Ordering::Relaxed)).collect()
+    }
+
+    /// The header as the runtime reads it.
+    fn exec_header(&self) -> Header {
+        let at = self.header.as_ptr() as u64;
+        // SAFETY: the header and the loader's table are the program's `AtomicU64`s, which
+        // outlive the test; the fake image has all of memory.
+        unsafe { Header::checked(at, self.table.len() as u64, |_| Ok(())) }.expect("a header")
+    }
+
+    /// Where the private map is, which the log stubs mark until a region is armed.
+    fn private_map(&self) -> u64 {
+        self.header.as_ptr() as u64 + words::private_map(self.table.len() as u64)
+    }
+
+    /// Where the call through `slot` lands, as the linker's stubs take it: the cell, then
+    /// the slot's word, and when that is the slot's log stub, what the stub does (marks the
+    /// slot in the map, copies the current table's word into the log table and lands there).
+    fn target(&self, slot: usize) -> u64 {
+        let table = self.cell().load(Ordering::Acquire);
+        // SAFETY: the cell holds the loader's table, a table of the pool or the log table,
+        // each `slots` 8-aligned `AtomicU64`s that outlive the test.
+        let word = unsafe { image::cell(table + slot as u64 * 8) };
+        let target = word.load(Ordering::Acquire);
+        if target != log_stub(slot as u64) {
+            return target;
+        }
+        let map = self.word(MAP).load(Ordering::Acquire);
+        // SAFETY: the map is the private map or an armed region, `16 + slots` bytes that
+        // outlive the test.
+        unsafe { image::byte(map + REGION_HEADER + slot as u64) }.store(1, Ordering::Relaxed);
+        let current = self.word(CURRENT).load(Ordering::Acquire);
+        // SAFETY: the current table, as above.
+        let target = unsafe { image::cell(current + slot as u64 * 8) }.load(Ordering::Acquire);
+        word.store(target, Ordering::Relaxed);
+        target
     }
 
     fn code_at(&self, offset: u64) -> u64 {
@@ -191,7 +284,7 @@ impl Program {
             id: ID,
             generation,
             this: unslid(at),
-            table: unslid(self.cell.as_ptr() as u64),
+            table: unslid(self.cell().as_ptr() as u64),
             slots: self.table.len() as u64,
             patch_code: [unslid(self.region.start), unslid(self.region.end)],
             patch_data: [unslid(self.data_at(0)), unslid(self.data_at(64 * 8))],
@@ -201,12 +294,13 @@ impl Program {
         let decoded = Descriptor::decode(&bytes).expect("a descriptor");
         let layout = Layout::new(&decoded, at).expect("a layout");
         assert_eq!(layout.slide, SLIDE);
-        Switch::with_limits(fake, layout, limits)
+        Switch::with_limits(fake, layout, limits, self.tables)
     }
 
-    /// Calls slot `slot` as code the linker made does: the cell, then the slot.
+    /// Calls slot `slot` as code the linker made does: the cell, then the slot, through its
+    /// log stub while that is there.
     fn call(&self, slot: usize) -> u32 {
-        let f = self.slots()[slot];
+        let f = self.target(slot);
         // SAFETY: the table holds addresses of `extern "C-unwind" fn() -> u32`.
         let f: extern "C-unwind" fn() -> u32 = unsafe { std::mem::transmute(f as usize) };
         f()
@@ -218,10 +312,11 @@ impl Program {
 
     /// Every slot of the table the cell points at.
     fn slots(&self) -> Vec<u64> {
-        let table = self.cell.load(Ordering::Acquire) as *const u64;
-        // SAFETY: the cell holds a table of `self.table.len()` addresses, 8-aligned, which
-        // nothing writes while the test reads it.
-        unsafe { std::slice::from_raw_parts(table, self.table.len()) }.to_vec()
+        let table = self.cell().load(Ordering::Acquire);
+        // SAFETY: the cell holds a table of `self.table.len()` 8-aligned `AtomicU64`s that
+        // outlive the test.
+        let word = |slot: usize| unsafe { image::cell(table + slot as u64 * 8) };
+        (0..self.table.len()).map(|it| word(it).load(Ordering::Acquire)).collect()
     }
 }
 
@@ -241,11 +336,12 @@ fn applied(switch: &mut Switch<Fake>, patch: Patch) {
     assert_eq!(answer, Some(Answer::Applied { generation }));
 }
 
-/// A cell or a loader's table the image doesn't have is refused before the switch reads it.
+/// A header or a loader's table the image doesn't have is refused before the switch reads
+/// it, as are a header naming no loader's table and one that starts elsewhere.
 #[test]
 fn a_table_outside_the_image_is_refused() {
     let program = Program::new();
-    let cell = program.cell.as_ptr() as u64;
+    let cell = program.cell().as_ptr() as u64;
     let table = program.table.as_ptr() as u64;
     for (outside, named) in [(cell..cell + 8, cell), (table + 8..table + 9, table)] {
         let fake = Fake { outside: Some(outside), ..Fake::default() };
@@ -253,16 +349,27 @@ fn a_table_outside_the_image_is_refused() {
         assert!(refused.contains(&format!("{named:#x}")), "{refused}");
     }
     let zero = Program::new();
-    zero.cell.store(0, Ordering::Relaxed);
+    zero.word(LOADER).store(0, Ordering::Relaxed);
     let refused = zero.switch_with(Fake::default(), FIRST_GENERATION).err().expect("refused");
     assert!(refused.contains("holds 0x0"), "{refused}");
+    for logged in [false, true] {
+        let elsewhere = Program::linked(2, logged);
+        elsewhere.cell().store(elsewhere.data_at(0), Ordering::Relaxed);
+        let refused = elsewhere.switch_with(Fake::default(), FIRST_GENERATION).err();
+        let refused = refused.expect("refused");
+        assert!(refused.contains(&format!("starts on {:#x}", elsewhere.data_at(0))), "{refused}");
+    }
+    let other = Program::new();
+    other.word(SLOTS).store(3, Ordering::Relaxed);
+    let refused = other.switch_with(Fake::default(), FIRST_GENERATION).err().expect("refused");
+    assert!(refused.contains("has 3 slots"), "{refused}");
 }
 
 #[test]
 fn patches_switch_the_table_and_roll_back() {
     let program = Program::new();
     let mut switch = program.switch(true);
-    let image_table = program.cell.load(Ordering::Relaxed);
+    let image_table = program.cell().load(Ordering::Relaxed);
     assert_eq!(program.calls(), (1, 2));
 
     // An address to rebase, then an FDE and the zero length after it, in the code; a static
@@ -321,7 +428,7 @@ fn patches_switch_the_table_and_roll_back() {
     assert_eq!(program.calls(), (2, 1));
     switch.handle(Message::RollBack { id: ID, to: 0 });
     assert_eq!(program.calls(), (1, 2));
-    assert_eq!(program.cell.load(Ordering::Relaxed), image_table);
+    assert_eq!(program.cell().load(Ordering::Relaxed), image_table);
 
     // Code rolled back stays: a thread can be in it still.
     let mut over = patch(3, 0, vec![(1, unslid(address(one)))]);
@@ -375,7 +482,7 @@ fn a_program_starts_at_the_generation_it_was_linked_at() {
 fn a_bad_patch_is_declined_before_anything_is_written() {
     let program = Program::new();
     let mut switch = program.switch(true);
-    let table = program.cell.load(Ordering::Relaxed);
+    let table = program.cell().load(Ordering::Relaxed);
     let region = unslid(program.code_at(0));
     let with = |change: &dyn Fn(&mut Patch)| {
         let mut patch = patch(1, 0, vec![]);
@@ -395,7 +502,7 @@ fn a_bad_patch_is_declined_before_anything_is_written() {
         ),
         (with(&|it| it.data = vec![(region, vec![1])]), "in the patch code region"),
         (
-            with(&|it| it.data = vec![(unslid(program.cell.as_ptr() as u64), vec![0; 8])]),
+            with(&|it| it.data = vec![(unslid(program.cell().as_ptr() as u64), vec![0; 8])]),
             "the jump table's cell",
         ),
         (patch(1, 0, vec![(2, 0)]), "slot 2, where the table has 2"),
@@ -445,7 +552,7 @@ fn a_bad_patch_is_declined_before_anything_is_written() {
             other => panic!("{other}, where it should say {says:?}"),
         }
         assert!(matches!(answer, Some(Answer::Declined { .. })), "{answer:?}");
-        assert_eq!(program.cell.load(Ordering::Relaxed), table);
+        assert_eq!(program.cell().load(Ordering::Relaxed), table);
         assert_eq!(switch.memory.published, 0);
         assert_eq!(switch.current(), 0);
     }
@@ -584,7 +691,7 @@ fn the_pool_holds_what_a_whole_table_per_generation_would() {
     const SLOTS: usize = 16;
     let program = Program::with_slots(SLOTS);
     let mut switch = program.switch(false);
-    let mut model = HashMap::from([(FIRST_GENERATION, program.table.to_vec())]);
+    let mut model = HashMap::from([(FIRST_GENERATION, program.loaders())]);
     let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     let mut next = FIRST_GENERATION + 1;
     for _ in 0..2000 {
@@ -616,7 +723,7 @@ fn the_pool_holds_what_a_whole_table_per_generation_would() {
 #[test]
 fn a_rollback_to_a_generation_a_table_holds_writes_no_table() {
     let program = Program::new();
-    let image = program.cell.load(Ordering::Relaxed);
+    let image = program.cell().load(Ordering::Relaxed);
     let mut switch = program.switch(false);
     applied(&mut switch, patch(1, 0, vec![(0, unslid(address(two)))]));
     let first = switch.table_of(1).expect("a table holds generation 1");
@@ -628,13 +735,13 @@ fn a_rollback_to_a_generation_a_table_holds_writes_no_table() {
     let pooled = switch.pooled();
 
     switch.roll_back(1).expect("generation 1 is kept");
-    assert_eq!(program.cell.load(Ordering::Relaxed), first);
+    assert_eq!(program.cell().load(Ordering::Relaxed), first);
     assert_eq!(program.calls(), (2, 2));
     switch.roll_back(0).expect("generation 0 is kept");
-    assert_eq!(program.cell.load(Ordering::Relaxed), image);
+    assert_eq!(program.cell().load(Ordering::Relaxed), image);
     assert_eq!(switch.table_of(0), Some(image));
     switch.roll_back(2).expect("generation 2 is kept");
-    assert_eq!(program.cell.load(Ordering::Relaxed), second);
+    assert_eq!(program.cell().load(Ordering::Relaxed), second);
     assert_eq!(program.calls(), (2, 1));
     assert_eq!(switch.pooled(), pooled);
 }
@@ -646,7 +753,7 @@ fn a_patch_stores_only_its_own_cells_before_the_switch() {
     const SLOTS: usize = 64;
     let program = Program::with_slots(SLOTS);
     let mut switch = program.switch(false);
-    let mut table = program.table.to_vec();
+    let mut table = program.loaders();
     for generation in 1..=4 * POOL as u64 {
         let cells: Vec<(u32, u64)> = (0..generation as u32 % 7 + 1)
             .map(|it| {
@@ -779,12 +886,12 @@ fn a_full_column_refuses_the_patch() {
     let mut switch = program.switch_limited(false, &Limits { generations: 3, ..roomy });
     applied(&mut switch, patch(1, 0, vec![(0, unslid(address(two)))]));
     applied(&mut switch, patch(2, 1, vec![(1, unslid(address(one)))]));
-    let table = program.cell.load(Ordering::Relaxed);
+    let table = program.cell().load(Ordering::Relaxed);
     let (outcome, answer) =
         switch.handle(Message::Patch(patch(3, 2, vec![(0, unslid(address(one)))])));
     refused(&outcome, "the log's generation numbers is full: it holds 3 rows at most");
     assert!(matches!(answer, Some(Answer::Declined { generation: 3, .. })), "{answer:?}");
-    assert_eq!(program.cell.load(Ordering::Relaxed), table);
+    assert_eq!(program.cell().load(Ordering::Relaxed), table);
     assert_eq!((switch.current(), program.calls()), (2, (2, 1)));
     switch.roll_back(1).expect("generation 1 is kept");
     assert_eq!(program.calls(), (2, 2));
@@ -847,4 +954,185 @@ fn a_warm_roll_back_allocates_nothing() {
         assert!(matches!(outcome, Outcome::RolledBack { .. }), "{outcome:?}");
     });
     assert_eq!(switch.current(), before);
+}
+
+/// A region as the test server makes one: the record's magic, `slots`, `armed` zero, and a
+/// byte per slot, in `len` bytes rounded up to whole words.
+fn region(slots: u32, len: usize) -> Box<[AtomicU64]> {
+    let mut bytes = vec![0u8; len.next_multiple_of(8)];
+    bytes[..8].copy_from_slice(&MAGIC);
+    bytes[8..12].copy_from_slice(&slots.to_le_bytes());
+    let word = |it: &[u8]| AtomicU64::new(u64::from_le_bytes(it.try_into().expect("8 bytes")));
+    bytes.chunks(8).map(word).collect()
+}
+
+fn region_byte(region: &[AtomicU64], at: usize) -> u8 {
+    region[at / 8].load(Ordering::Relaxed).to_le_bytes()[at % 8]
+}
+
+/// The slots `region` marks.
+fn marked(region: &[AtomicU64], slots: usize) -> Vec<usize> {
+    let at = REGION_HEADER as usize;
+    (0..slots).filter(|it| region_byte(region, at + it) != 0).collect()
+}
+
+/// `armed`, bytes 12..16 of the region.
+fn armed(region: &[AtomicU64]) -> u32 {
+    u32::from_le_bytes([12, 13, 14, 15].map(|it| region_byte(region, it)))
+}
+
+/// Arms the program's log into `region`, `len` bytes of it.
+fn arm(program: &Program, region: &[AtomicU64], len: usize) -> i32 {
+    assert!(len <= region.len() * 8);
+    // SAFETY: `region` is `len` bytes or more of `AtomicU64`s that outlive the program's
+    // calls, and nothing else writes it.
+    unsafe { program.exec_header().arm(region.as_ptr() as *mut u8, len) }
+}
+
+/// The prelude's first calls are marked in the image's own map and carried into the region
+/// when it is armed; every log stub is put back, so the test's first calls are marked in the
+/// region, each slot once, and `armed` says the slot count last.
+#[test]
+fn arming_carries_the_prelude_and_logs_the_first_calls() {
+    const SLOTS: usize = 12;
+    let program = Program::linked(SLOTS, true);
+    let _switch = program.switch(false);
+    let header = program.header.as_ptr() as u64;
+    assert_eq!(program.cell().load(Ordering::Relaxed), header + words::log_word(0));
+    assert_eq!(program.call(1), 2);
+    assert_eq!(program.call(9), 2);
+    assert_eq!(program.call(1), 2);
+    assert_eq!(program.word(words::log_word(1)).load(Ordering::Relaxed), address(two));
+    let map = program.private_map();
+    // SAFETY: the private map is the header's last `16 + SLOTS` bytes, rounded to words.
+    let byte = |at: u64| unsafe { image::byte(map + at) }.load(Ordering::Relaxed);
+    let prelude = || -> Vec<u64> {
+        (0..SLOTS as u64).filter(|it| byte(REGION_HEADER + it) != 0).collect()
+    };
+    assert_eq!(prelude(), [1, 9]);
+
+    let len = REGION_HEADER as usize + SLOTS;
+    let record = region(SLOTS as u32, len);
+    assert_eq!(arm(&program, &record, len), exec::ARMED);
+    assert_eq!(armed(&record), SLOTS as u32);
+    assert_eq!(marked(&record, SLOTS), [1, 9]);
+    assert_eq!(program.word(MAP).load(Ordering::Relaxed), record.as_ptr() as u64);
+    for slot in 0..SLOTS as u64 {
+        assert_eq!(program.word(words::log_word(slot)).load(Ordering::Relaxed), log_stub(slot));
+    }
+    assert_eq!(program.cell().load(Ordering::Relaxed), header + words::log_word(0));
+
+    assert_eq!(program.call(4), 1);
+    assert_eq!(program.call(4), 1);
+    assert_eq!(program.call(1), 2);
+    assert_eq!(marked(&record, SLOTS), [1, 4, 9]);
+    assert_eq!(prelude(), [1, 9], "the image's own map is left as it was");
+
+    // Armed again, into another region: what the first region had is carried over.
+    let again = region(SLOTS as u32, len);
+    assert_eq!(arm(&program, &again, len), exec::ARMED);
+    assert_eq!(marked(&again, SLOTS), [1, 4, 9]);
+}
+
+/// A region too short, null, without the record's magic or of another slot count is refused,
+/// as is arming an image linked without a log, and nothing is changed.
+#[test]
+fn arming_refuses_a_region_it_cannot_use() {
+    const SLOTS: usize = 3;
+    let program = Program::linked(SLOTS, true);
+    let _switch = program.switch(false);
+    let map = program.word(MAP).load(Ordering::Relaxed);
+    let len = REGION_HEADER as usize + SLOTS;
+    let record = region(SLOTS as u32, len);
+    assert_eq!(arm(&program, &record, len - 1), exec::SHORT);
+    // SAFETY: a null region, refused before it is read.
+    let null = unsafe { program.exec_header().arm(std::ptr::null_mut(), len) };
+    assert_eq!(null, exec::SHORT);
+    let other = region(SLOTS as u32 + 1, len);
+    assert_eq!(arm(&program, &other, len), exec::OTHER_SLOTS);
+    let unmarked = region(SLOTS as u32, len);
+    unmarked[0].store(u64::from_le_bytes(*b"blzexec0"), Ordering::Relaxed);
+    assert_eq!(arm(&program, &unmarked, len), exec::NOT_A_RECORD);
+    for refused in [&record, &other, &unmarked] {
+        assert_eq!(armed(refused), 0);
+    }
+    assert_eq!(program.word(MAP).load(Ordering::Relaxed), map);
+
+    let plain = Program::linked(SLOTS, false);
+    let _plain_switch = plain.switch(false);
+    assert!(!plain.exec_header().logged());
+    assert_eq!(arm(&plain, &record, len), exec::NO_LOG);
+    assert_eq!(armed(&record), 0);
+}
+
+/// `publish` while armed writes the loader's table and every table of the pool, never the
+/// log table: a slot called already keeps the target it copied, and one not called yet
+/// still goes through its log stub, is marked and lands on what was published.
+#[test]
+fn publish_while_armed_leaves_the_log_table_alone() {
+    const SLOTS: usize = 4;
+    let program = Program::linked(SLOTS, true);
+    let mut switch = program.switch(false);
+    let len = REGION_HEADER as usize + SLOTS;
+    let record = region(SLOTS as u32, len);
+    assert_eq!(arm(&program, &record, len), exec::ARMED);
+    assert_eq!(program.call(0), 1);
+
+    let header = program.exec_header();
+    header.publish(program.tables, 0, address(two)).expect("published");
+    header.publish(program.tables, 2, address(two)).expect("published");
+    let refused = header.publish(program.tables, SLOTS as u32, address(two)).err();
+    assert!(refused.expect("refused").contains("slot 4 published"));
+    assert_eq!(program.loaders(), [address(two), address(two), address(two), address(two)]);
+    let log = |slot: u64| program.word(words::log_word(slot)).load(Ordering::Relaxed);
+    assert_eq!((log(0), log(1), log(2)), (address(one), log_stub(1), log_stub(2)));
+    assert_eq!(program.call(0), 1, "a slot called already keeps what it copied");
+    assert_eq!(program.call(2), 2);
+    assert_eq!(marked(&record, SLOTS), [0, 2]);
+
+    // The pool's tables have it too: a switch to one of them keeps slot 2 published.
+    let cells = vec![(1, unslid(address(one)))];
+    applied(&mut switch, patch(FIRST_GENERATION + 1, FIRST_GENERATION, cells));
+    let current = program.word(CURRENT).load(Ordering::Relaxed);
+    assert_ne!(current, program.table.as_ptr() as u64);
+    // SAFETY: the current table is one of the pool's, `SLOTS` `AtomicU64`s the switch keeps.
+    let word = |slot: u64| unsafe { image::cell(current + slot * 8) }.load(Ordering::Relaxed);
+    assert_eq!((word(0), word(1), word(2)), (address(two), address(one), address(two)));
+    header.publish(program.tables, 3, address(one)).expect("published");
+    assert_eq!(word(3), address(one));
+}
+
+/// A switch while armed stores the header's current table and leaves the cell on the log
+/// table: a slot not called yet lands on the new generation's code and is marked, a rollback
+/// is the current table's store again. Without a log, the cell moves with the current table.
+#[test]
+fn a_switch_while_armed_keeps_the_cell_on_the_log_table() {
+    const SLOTS: usize = 2;
+    let program = Program::linked(SLOTS, true);
+    let mut switch = program.switch(false);
+    let log_table = program.header.as_ptr() as u64 + words::log_word(0);
+    let len = REGION_HEADER as usize + SLOTS;
+    let record = region(SLOTS as u32, len);
+    assert_eq!(arm(&program, &record, len), exec::ARMED);
+    assert_eq!(program.call(0), 1);
+
+    let swapped = vec![(0, unslid(address(two))), (1, unslid(address(one)))];
+    applied(&mut switch, patch(FIRST_GENERATION + 1, FIRST_GENERATION, swapped.clone()));
+    assert_eq!(program.cell().load(Ordering::Relaxed), log_table);
+    assert_ne!(program.word(CURRENT).load(Ordering::Relaxed), program.table.as_ptr() as u64);
+    assert_eq!(program.call(1), 1, "the new generation's code");
+    assert_eq!(program.call(0), 1, "copied before the switch");
+    assert_eq!(marked(&record, SLOTS), [0, 1]);
+
+    switch.roll_back(FIRST_GENERATION).expect("rolled back");
+    assert_eq!(program.cell().load(Ordering::Relaxed), log_table);
+    assert_eq!(program.word(CURRENT).load(Ordering::Relaxed), program.table.as_ptr() as u64);
+    assert_eq!(armed(&record), SLOTS as u32);
+
+    let plain = Program::linked(SLOTS, false);
+    let mut switch = plain.switch(false);
+    applied(&mut switch, patch(FIRST_GENERATION + 1, FIRST_GENERATION, swapped));
+    let current = plain.word(CURRENT).load(Ordering::Relaxed);
+    assert_eq!(plain.cell().load(Ordering::Relaxed), current);
+    assert_eq!(plain.calls(), (2, 1));
 }

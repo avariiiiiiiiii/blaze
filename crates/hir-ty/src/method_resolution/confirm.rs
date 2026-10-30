@@ -387,6 +387,13 @@ impl<'a, 'db, 'f> ConfirmContext<'a, 'db, 'f> {
                 });
             }
 
+            fn report_late_bound_lifetime_args(&mut self, def: GenericDefId, _hard_error: bool) {
+                self.ctx.push_diagnostic(InferenceDiagnostic::MethodCallLateBoundLifetimeArgs {
+                    expr: self.expr,
+                    def,
+                });
+            }
+
             fn provided_kind(
                 &mut self,
                 param_id: GenericParamId,

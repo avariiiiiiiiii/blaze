@@ -15,6 +15,8 @@ but a later change to it would break it without anything failing loudly.
 
 > forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's.
 
+> taken by codegen (lead, 2026-10-29): child codegen-rq-mir.
+
 ## 2. hir-ty-mir: mark the capture copies at a closure's start
 
 What: on `MirBody`, the statements (or the locals) that copy a capture out of the closure's own
@@ -25,6 +27,8 @@ closure's own local. `upvar_locals` already maps the capture to its local.
 
 > forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's.
 
+> taken by codegen (lead, 2026-10-29): child codegen-rq-mir.
+
 ## 3. the parent (`lints/bodies.rs`) or hir-ty-mir: the MIR of an inline const
 
 What: liveness run on each `const { .. }` block (rustc's `check_liveness` runs on every body
@@ -33,6 +37,8 @@ it. Why: `BodyCx::exprs` leaves inline consts out and no MIR of one is reachable
 parent's MIR, so `let x = 1;` in a `const { }` gets no `unused_variables`.
 
 > forwarded to diagnostics (the parent's `lints/bodies.rs`) and codegen (`hir-ty-mir`).
+
+> taken by codegen (lead, 2026-10-29): the hir-ty-mir half, child codegen-rq-mir.
 
 ## 4. hir-ty-mir: a closure or coroutine whose MIR does not lower
 
@@ -43,3 +49,5 @@ itself fails, the body gets no lints. Each such case is a lowering gap of hir-ty
 `not_supported!`), and is reported there.
 
 > forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's.
+
+> taken by codegen (lead, 2026-10-29): child codegen-rq-mir.

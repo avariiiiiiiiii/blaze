@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Arch, Backend, Settings};
 
-pub const SETTINGS_DOMAIN: &str = "blaze v2 codegen settings 3";
+pub const SETTINGS_DOMAIN: &str = "blaze v2 codegen settings 4";
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Panic {
@@ -49,6 +49,10 @@ pub struct Toolchain {
     pub cranelift: String,
     /// `None` for a blaze built without LLVM: a unit that asks for it is refused.
     pub llvm: Option<String>,
+    /// The hex of `blaze_stencil::library_id` for the target: the stencils
+    /// [`Backend::Stencil`] copies. `None` for a target with no library (wasm): a unit that
+    /// asks for it is refused.
+    pub stencils: Option<String>,
     pub frame_pointers: bool,
     pub relocation: Relocation,
 }
@@ -132,6 +136,18 @@ impl Coverage {
     }
 }
 
+/// Profile-guided optimization in the LLVM back end (rustc's `-Cprofile-generate` and
+/// `-Cprofile-use`): the profile keys the code it shaped, so a new profile is a rebuild.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub enum Pgo {
+    #[default]
+    None,
+    /// LLVM's IR instrumentation, writing raw profiles (`default_%m.profraw`).
+    Generate,
+    /// The `.profdata` in the store under this content ID.
+    Use(ContentId),
+}
+
 /// What changes one function's machine code besides its MIR and its type arguments' facts.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Spec {
@@ -148,6 +164,10 @@ pub struct Spec {
     /// Folding functions that differ only in constants (#1292): changes which body a
     /// function's code is.
     pub fold: bool,
+    /// The code counts its calls and back edges into its own `Target::Counter` cells, for
+    /// tier-up (`blaze_stencil::tier`): stencil code always does, the Cranelift tier of a
+    /// tiered run does, LLVM code never does.
+    pub counted: bool,
     /// Whether rustc's MIR inliner runs on the bodies of the crates compiled at these
     /// settings (`Inline::is_enabled`): `-Copt-level` 2 or 3, not `s`/`z`, which share
     /// `Llvm { opt: 2 }`, and not in a build that patches, as rustc runs it only outside
@@ -157,6 +177,7 @@ pub struct Spec {
     /// The sanitizers and coverage the LLVM back end instruments with: a sanitized build's
     /// code is never a plain one's.
     pub sanitize: Sanitize,
+    pub pgo: Pgo,
     /// The content ID of the policy that gives every function of the build its settings
     /// ([`crate::plan::Policy::id`]): a function's relocations name its callees by keys made
     /// with their settings, so a change to how a callee is compiled is a change to the
@@ -174,8 +195,10 @@ impl Spec {
             panic,
             debuginfo,
             fold,
+            counted,
             mir_inline,
             sanitize,
+            pgo,
             policy,
         } = self;
         let Toolchain {
@@ -186,6 +209,7 @@ impl Spec {
             features,
             cranelift,
             llvm,
+            stencils,
             frame_pointers,
             relocation,
         } = toolchain;
@@ -201,10 +225,15 @@ impl Spec {
             Some(llvm) => hasher.update(&[1]).part(llvm.as_bytes()),
             None => hasher.update(&[0]),
         };
+        match stencils {
+            Some(stencils) => hasher.update(&[1]).part(stencils.as_bytes()),
+            None => hasher.update(&[0]),
+        };
         hasher.update(&[*frame_pointers as u8, *relocation as u8]);
         match backend {
             Backend::Cranelift { speed } => hasher.update(&[0, u8::from(*speed)]),
             Backend::Llvm { opt } => hasher.update(&[1, *opt]),
+            Backend::Stencil => hasher.update(&[2]),
         };
         hasher.update(&[
             *overflow_checks as u8,
@@ -212,11 +241,17 @@ impl Spec {
             *panic as u8,
             *debuginfo as u8,
             *fold as u8,
+            *counted as u8,
             *mir_inline as u8,
         ]);
         let Sanitize { sanitizers, recover, track_origins, coverage } = sanitize;
         hasher.update(&[sanitizers.0, recover.0, *track_origins, coverage.level]);
         hasher.update(&coverage.flags.to_le_bytes());
+        match pgo {
+            Pgo::None => hasher.update(&[0]),
+            Pgo::Generate => hasher.update(&[1]),
+            Pgo::Use(profile) => hasher.update(&[2]).id(profile),
+        };
         hasher.id(policy);
         Settings(hasher.finish())
     }
@@ -242,6 +277,7 @@ mod tests {
                 features: vec!["+sse2".to_owned()],
                 cranelift: "0.136".to_owned(),
                 llvm: Some("23.1".to_owned()),
+                stencils: Some("ab".repeat(32)),
                 frame_pointers: false,
                 relocation: Relocation::Pic,
             },
@@ -251,8 +287,10 @@ mod tests {
             panic: Panic::Unwind,
             debuginfo: DebugInfo::Full,
             fold: false,
+            counted: false,
             mir_inline: false,
             sanitize: Sanitize::default(),
+            pgo: Pgo::None,
             policy: ContentId([2; 32]),
         }
     }
@@ -269,21 +307,27 @@ mod tests {
             |it| it.toolchain.cranelift = "0.137".to_owned(),
             |it| it.toolchain.llvm = None,
             |it| it.toolchain.llvm = Some("24.0".to_owned()),
+            |it| it.toolchain.stencils = None,
+            |it| it.toolchain.stencils = Some("cd".repeat(32)),
             |it| it.toolchain.frame_pointers = true,
             |it| it.toolchain.relocation = Relocation::Static,
             |it| it.backend = Backend::Llvm { opt: 3 },
             |it| it.backend = Backend::Cranelift { speed: true },
+            |it| it.backend = Backend::Stencil,
             |it| it.overflow_checks = false,
             |it| it.debug_assertions = false,
             |it| it.panic = Panic::Abort,
             |it| it.debuginfo = DebugInfo::LineTablesOnly,
             |it| it.fold = true,
+            |it| it.counted = true,
             |it| it.mir_inline = true,
             |it| it.sanitize.sanitizers = Sanitizers::ADDRESS,
             |it| it.sanitize.recover = Sanitizers::ADDRESS,
             |it| it.sanitize.track_origins = 2,
             |it| it.sanitize.coverage.level = 3,
             |it| it.sanitize.coverage.flags = Coverage::PC_TABLE,
+            |it| it.pgo = Pgo::Generate,
+            |it| it.pgo = Pgo::Use(ContentId([5; 32])),
             |it| it.policy = ContentId([4; 32]),
         ];
         let mut seen = std::collections::BTreeSet::from([base.settings()]);

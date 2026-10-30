@@ -84,6 +84,7 @@ cfg = { path = "crates/cfg", version = "0.0.0", features = ["tt", "syntax"] }
 hir = { path = "crates/hir", version = "0.0.0" }
 hir-def = { path = "crates/hir-def", version = "0.0.0" }
 hir-expand = { path = "crates/hir-expand", version = "0.0.0" }
+hir-lint-levels = { path = "crates/hir-lint-levels", version = "0.0.0" }
 hir-ty = { path = "crates/hir-ty", version = "0.0.0" }
 hir-ty-borrowck = { path = "crates/hir-ty-borrowck", version = "0.0.0" }
 hir-ty-matchck = { path = "crates/hir-ty-matchck", version = "0.0.0" }
@@ -98,6 +99,7 @@ blaze-expand = { path = "crates/blaze-expand" }
 # The `proc_macro` blaze's native expanders are built against (crates/blaze-expand/src/native/).
 native-proc-macro = { package = "blaze-native-proc-macro", path = "crates/blaze-expand/src/native/proc_macro" }
 blaze-macro-wasm = { path = "crates/blaze-macro-wasm" }
+blaze-macro-eval = { path = "crates/blaze-macro-eval" }
 blaze-store = { path = "crates/blaze-store" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }
@@ -152,7 +154,6 @@ blaze-vfs = { path = "crates/blaze-vfs" }
 flecs-c = { path = "vendor/flecs-c" }
 hir-ide = { path = "crates/hir-ide", version = "0.0.0" }
 ide-db = { path = "crates/ide-db", version = "0.0.0" }
-ide-diagnostics = { path = "crates/ide-diagnostics", version = "0.0.0" }
 intern = { path = "crates/intern", version = "0.0.0" }
 load-cargo = { path = "crates/load-cargo", version = "0.0.0" }
 mbe = { path = "crates/mbe", version = "0.0.0" }
@@ -245,6 +246,8 @@ libc = "0.2.172"
 memchr = "2.8.1"
 # The `blaze` binary's general-purpose allocator (docs/v2/plan/design/memory.md).
 mimalloc = { version = "0.1.52", default-features = false }
+# mimalloc's C side, for `mi_collect` when the daemon gives freed pages back.
+libmimalloc-sys = { version = "0.1.49", default-features = false }
 nohash-hasher = "0.2.0"
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 pulldown-cmark = { version = "0.9.6", default-features = false }

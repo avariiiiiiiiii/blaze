@@ -29,26 +29,28 @@ use crate::{
 };
 use db::TestDB;
 
-const fn options(level: MirOptLevel, ub_checks: bool) -> MirOptions {
-    MirOptions { level, ub_checks, lifetime_markers: true }
+const fn options(level: MirOptLevel, ub_checks: bool, inline: bool) -> MirOptions {
+    MirOptions { level, ub_checks, lifetime_markers: true, inline }
 }
 
-const OFF: MirOptions = options(MirOptLevel::Off, false);
-const DEBUG: MirOptions = options(MirOptLevel::Debug, false);
-const DEBUG_CHECKED: MirOptions = options(MirOptLevel::Debug, true);
-const RELEASE: MirOptions = options(MirOptLevel::Release, false);
+const OFF: MirOptions = options(MirOptLevel::Off, false, false);
+const DEBUG: MirOptions = options(MirOptLevel::Debug, false, false);
+const DEBUG_CHECKED: MirOptions = options(MirOptLevel::Debug, true, false);
+const RELEASE: MirOptions = options(MirOptLevel::Release, false, false);
+/// A body of the library's crates: always at release, inlined, as shipped (`Build::options`).
+const LANG: MirOptions = options(MirOptLevel::Release, false, true);
 
 const RUNTIME: BodyOptions =
     BodyOptions { lang: OptionsSet::of(&[OFF]), other: OptionsSet::of(&[OFF]) };
 
 /// What a build of debug units with and without debug assertions and release units asks.
 const EVERY_LEVEL: BodyOptions = BodyOptions {
-    lang: OptionsSet::of(&[RELEASE]),
-    other: OptionsSet::of(&[OFF, DEBUG, DEBUG_CHECKED, RELEASE]),
+    lang: OptionsSet::of(&[LANG]),
+    other: OptionsSet::of(&[OFF, DEBUG, DEBUG_CHECKED, RELEASE, LANG]),
 };
 
 const UB_CHECKED: BodyOptions =
-    BodyOptions { lang: OptionsSet::of(&[RELEASE]), other: OptionsSet::of(&[DEBUG_CHECKED]) };
+    BodyOptions { lang: OptionsSet::of(&[LANG]), other: OptionsSet::of(&[DEBUG_CHECKED]) };
 
 const MINICORE: &str = "sized, copy, clone, drop, size_of, unsize, coerce_unsized, fn";
 
@@ -262,24 +264,17 @@ fn options_are_a_set() {
     assert!(set.contains(OFF) && set.contains(RELEASE) && set.contains(DEBUG_CHECKED));
     assert!(!set.contains(DEBUG));
     assert!(!set.contains(MirOptions { lifetime_markers: false, ..OFF }));
+    assert!(!set.contains(LANG), "an inlined body is not the uninlined one");
     assert_eq!(set.iter().collect::<Vec<_>>(), [OFF, DEBUG_CHECKED, RELEASE]);
     assert!(OptionsSet::of(&[]).is_empty() && OptionsSet::EMPTY.is_empty());
     let every: Vec<MirOptions> = [OFF, DEBUG, DEBUG_CHECKED, RELEASE]
         .into_iter()
+        .chain([MirOptLevel::Release, MirOptLevel::Off].map(|level| options(level, true, false)))
         .flat_map(|it| [it, MirOptions { lifetime_markers: false, ..it }])
-        .chain([true, false].map(|lifetime_markers| MirOptions {
-            level: MirOptLevel::Release,
-            ub_checks: true,
-            lifetime_markers,
-        }))
-        .chain([true, false].map(|lifetime_markers| MirOptions {
-            level: MirOptLevel::Off,
-            ub_checks: true,
-            lifetime_markers,
-        }))
+        .flat_map(|it| [it, MirOptions { inline: true, ..it }])
         .collect();
     let all = OptionsSet::of(&every);
-    assert_eq!(all.iter().count(), 12, "each of the twelve options has its own bit");
+    assert_eq!(all.iter().count(), 24, "each of the twenty-four options has its own bit");
     let mut sorted = every.clone();
     sorted.sort();
     assert_eq!(all.iter().collect::<Vec<_>>(), sorted, "in `MirOptions`' order");

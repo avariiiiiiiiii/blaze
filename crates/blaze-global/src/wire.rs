@@ -29,7 +29,7 @@ use std::collections::VecDeque;
 
 use blaze_cas::Key;
 use blaze_format::cursor::{self, Put as _, Reader};
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Domain};
 
 use crate::{
     ByHash,
@@ -48,8 +48,10 @@ pub const LONGEST_VALUE: u64 = blaze_cas::remote::LONGEST_VALUE;
 /// The most keys one fetch names.
 pub const BATCH_MOST: usize = 4096;
 /// A fetch's answer, or a publish, carries values of about this many bytes: it takes its
-/// first value whatever its length, then the next while they are no more than this.
-pub const BATCH_BYTES: u64 = 64 << 20;
+/// first value whatever its length, then the next while they are no more than this. Four
+/// in flight on a connection are more than its receive window holds, so the pipe stays full,
+/// and a client of [`crate::client::CONNECTIONS`] buffers a bounded amount.
+pub const BATCH_BYTES: u64 = 8 << 20;
 /// The most bytes of a body: a batch whose first value is the longest, and its framing.
 pub const BODY_MOST: u64 = LONGEST_VALUE + BATCH_BYTES + (8 << 20);
 /// The most bytes of one piece: more than any chunk the store cuts.
@@ -113,10 +115,12 @@ impl Fields for Reader<'_> {
     fn header(&mut self, magic: &[u8; 6], what: &str) -> Result<(), String> {
         let found = self.array::<6>().map_err(truncated)?;
         if found != magic {
+            // alloc: an error's message, made only when it fails.
             return Err(format!("not {what}: its magic is {:?}", found.escape_ascii().to_string()));
         }
         let version = self.u16().map_err(truncated)?;
         if version != VERSION {
+            // alloc: an error's message, made only when it fails.
             return Err(format!("{what} of version {version}; this blaze speaks version {VERSION}"));
         }
         Ok(())
@@ -126,6 +130,7 @@ impl Fields for Reader<'_> {
         let mut peek = *self;
         let count = peek.u32().map_err(truncated)? as usize;
         if count > most {
+            // alloc: an error's message, made only when it fails.
             return Err(format!("{count} {what}, more than the {most} allowed"));
         }
         self.count_u32(each).map_err(truncated)
@@ -134,21 +139,26 @@ impl Fields for Reader<'_> {
     fn end(&self, what: &str) -> Result<(), String> {
         match self.left() {
             0 => Ok(()),
+            // alloc: an error's message, made only when it fails.
             left => Err(format!("{left} trailing bytes after {what}")),
         }
     }
 }
 
-/// The pieces `value` travels as.
-pub(crate) fn pieces(value: &[u8]) -> Vec<std::ops::Range<usize>> {
+/// `f` of the pieces `value` travels as: none when empty, the whole of it under
+/// [`CHUNKED_FROM`] bytes, else blaze-cas's chunks.
+pub(crate) fn with_pieces<R>(value: &[u8], f: impl FnOnce(&[std::ops::Range<usize>]) -> R) -> R {
     if value.is_empty() {
-        Vec::new()
+        f(&[])
     } else if value.len() < CHUNKED_FROM {
-        vec![0..value.len()]
+        f(&[0..value.len()])
     } else {
-        blaze_cas::chunk::chunks(value)
+        // alloc: blaze-cas's chunk list, once per value of `CHUNKED_FROM` bytes or more.
+        f(&blaze_cas::chunk::chunks(value))
     }
 }
+
+static PIECE: Domain = Domain::new(PIECE_DOMAIN);
 
 /// The pieces one direction of a connection sent, as the receiver holds them.
 #[derive(Default)]
@@ -162,11 +172,14 @@ pub(crate) struct SendWindow {
 impl SendWindow {
     /// `value` as its pieces: each one held a reference, the rest their bytes, then held.
     pub(crate) fn write(&mut self, value: &[u8], out: &mut Vec<u8>) {
-        let pieces = pieces(value);
+        with_pieces(value, |pieces| self.write_pieces(value, pieces, out))
+    }
+
+    fn write_pieces(&mut self, value: &[u8], pieces: &[std::ops::Range<usize>], out: &mut Vec<u8>) {
         out.put_u32(pieces.len() as u32);
-        for range in pieces {
+        for range in pieces.iter().cloned() {
             let piece = &value[range];
-            let hash = ContentId::of(PIECE_DOMAIN, piece);
+            let hash = ContentId::of_domain(&PIECE, piece);
             if let Some(&seq) = self.by_hash.get(&hash) {
                 out.put_u8(SEEN);
                 out.put_u64(seq);
@@ -191,7 +204,12 @@ impl SendWindow {
 /// The pieces one direction of a connection received.
 #[derive(Default)]
 pub(crate) struct RecvWindow {
-    held: VecDeque<Box<[u8]>>,
+    /// The pieces held, oldest first, end to end; `kept[0]` is byte `base` of all the pieces
+    /// this side received.
+    kept: Vec<u8>,
+    base: u64,
+    /// Each piece held: where it starts among all received, and its length.
+    held: VecDeque<(u64, u32)>,
     first: u64,
     bytes: u64,
 }
@@ -202,10 +220,12 @@ impl RecvWindow {
     /// record's when `keep`, so the value's buffer is allocated once at its length.
     pub(crate) fn read(&mut self, reader: &mut Reader<'_>, len: u64, keep: bool) -> Result<Option<Vec<u8>>, String> {
         if len > LONGEST_VALUE {
+            // alloc: an error's message, made only when it fails.
             return Err(format!("a value of {len} bytes, longer than the {LONGEST_VALUE} allowed"));
         }
         let count = reader.count(2, usize::MAX, "pieces")?;
         if count as u64 > len {
+            // alloc: an error's message, made only when it fails.
             return Err(format!("{count} pieces of a value of {len} bytes"));
         }
         let mut value = keep.then(|| Vec::with_capacity(len as usize));
@@ -215,6 +235,7 @@ impl RecvWindow {
                 NEW => {
                     let n = reader.u32().map_err(truncated)? as usize;
                     if n == 0 || n > PIECE_MOST {
+                        // alloc: an error's message, made only when it fails.
                         return Err(format!("a piece of {n} bytes (1 to {PIECE_MOST} are allowed)"));
                     }
                     let bytes = reader.take(n).map_err(truncated)?;
@@ -224,18 +245,22 @@ impl RecvWindow {
                 SEEN => {
                     let seq = reader.u64().map_err(truncated)?;
                     let at = seq.checked_sub(self.first).filter(|at| *at < self.held.len() as u64).ok_or_else(|| {
+                        // alloc: an error's message, made only when it fails.
                         format!(
                             "a reference to piece {seq}, outside the {} to {} this side holds",
                             self.first,
                             self.first + self.held.len() as u64
                         )
                     })?;
-                    &*self.held[at as usize]
+                    let (start, len) = self.held[at as usize];
+                    &self.kept[(start - self.base) as usize..][..len as usize]
                 }
+                // alloc: an error's message, made only when it fails.
                 other => return Err(format!("an unknown piece {other} (0 is new, 1 seen)")),
             };
             total += piece.len() as u64;
             if total > len {
+                // alloc: an error's message, made only when it fails.
                 return Err(format!("its pieces are more than the {len} bytes of its record"));
             }
             if let Some(value) = &mut value {
@@ -243,37 +268,58 @@ impl RecvWindow {
             }
         }
         if total != len {
+            // alloc: an error's message, made only when it fails.
             return Err(format!("its pieces are {total} bytes, not the {len} of its record"));
         }
         Ok(value)
     }
 
     fn hold(&mut self, bytes: &[u8]) {
-        self.held.push_back(bytes.into());
+        let end = self.base + self.kept.len() as u64;
+        self.kept.extend_from_slice(bytes);
+        self.held.push_back((end, bytes.len() as u32));
         self.bytes += bytes.len() as u64;
         while self.bytes > WINDOW {
-            let old = self.held.pop_front().expect("a window over its bytes holds a piece");
-            self.bytes -= old.len() as u64;
+            let (_, len) = self.held.pop_front().expect("a window over its bytes holds a piece");
+            self.bytes -= u64::from(len);
             self.first += 1;
+        }
+        // The pieces dropped are the buffer's front: cut them once they are half of it, so a
+        // byte moves at most once per byte received and the buffer stays under twice the window.
+        let live = self.held.front().map_or(self.base + self.kept.len() as u64, |it| it.0);
+        let dead = (live - self.base) as usize;
+        if dead * 2 > self.kept.len() {
+            self.kept.drain(..dead);
+            self.base = live;
         }
     }
 }
 
 /// A fetch's body.
 pub(crate) fn fetch_ask(keys: &[Key], out: &mut Vec<u8>) {
-    out.reserve(12 + 32 * keys.len());
+    fetch_ask_with(keys.len(), keys.iter().copied(), out);
+}
+
+/// A fetch's body naming the `count` keys of `keys`.
+pub(crate) fn fetch_ask_with(count: usize, keys: impl Iterator<Item = Key>, out: &mut Vec<u8>) {
+    out.reserve(12 + 32 * count);
     header(FETCH_ASK, out);
-    out.put_u32(keys.len() as u32);
+    out.put_u32(count as u32);
     for key in keys {
         out.put_bytes(&key.0.0);
     }
 }
 
 pub(crate) fn parse_fetch_ask(body: &[u8]) -> Result<Vec<Key>, String> {
+    parse_fetch_ask_in(body, std::alloc::Global)
+}
+
+/// [`parse_fetch_ask`] into `alloc`: the server's on the request's frame.
+pub(crate) fn parse_fetch_ask_in<A: std::alloc::Allocator>(body: &[u8], alloc: A) -> Result<Vec<Key, A>, String> {
     let mut reader = Reader::new(body);
     reader.header(FETCH_ASK, "a fetch")?;
     let count = reader.count(32, BATCH_MOST, "keys")?;
-    let mut keys = Vec::with_capacity(count);
+    let mut keys = Vec::with_capacity_in(count, alloc);
     for _ in 0..count {
         keys.push(reader.key()?);
     }
@@ -293,9 +339,11 @@ pub(crate) fn reason(why: &str, out: &mut Vec<u8>) {
 pub(crate) fn read_reason(reader: &mut Reader<'_>) -> Result<String, String> {
     let len = reader.u16().map_err(truncated)? as usize;
     if len > REASON_MOST {
+        // alloc: an error's message, made only when it fails.
         return Err(format!("a reason of {len} bytes, more than the {REASON_MOST} allowed"));
     }
     let bytes = reader.take(len).map_err(truncated)?;
+    // alloc: an error's message, made only when it fails.
     String::from_utf8(bytes.to_vec()).map_err(|_| "a reason that is not UTF-8".to_owned())
 }
 
@@ -310,6 +358,7 @@ pub(crate) fn parse_publish_answer(body: &[u8], most: usize) -> Result<Vec<(Key,
         let status = match reader.u8().map_err(truncated)? {
             KEPT => Ok(()),
             REFUSED => Err(read_reason(&mut reader)?),
+            // alloc: an error's message, made only when it fails.
             other => return Err(format!("an unknown status {other} (0 is kept, 1 refused)")),
         };
         out.push((key, status));
@@ -410,7 +459,7 @@ mod tests {
         let mut send = SendWindow::default();
         send.write(&value, &mut wire);
         send.write(&value, &mut wire);
-        let first = wire.len() - (4 + 9 * pieces(&value).len());
+        let first = wire.len() - (4 + 9 * with_pieces(&value, <[_]>::len));
         let read = |bytes: &[u8], len: u64| {
             let mut recv = RecvWindow::default();
             let mut reader = Reader::new(bytes);
@@ -456,10 +505,70 @@ mod tests {
     fn every_chunk_the_store_cuts_is_a_piece_the_wire_takes() {
         for seed in 0..4 {
             let value = noise(4 << 20, 50 + seed);
-            for range in pieces(&value) {
+            for range in with_pieces(&value, <[_]>::to_vec) {
                 assert!(range.len() <= PIECE_MOST && !range.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn a_value_the_window_holds_travels_with_no_allocation() {
+        let value = vec![7u8; 1000];
+        let (mut send, mut recv) = (SendWindow::default(), RecvWindow::default());
+        let mut wire = Vec::new();
+        send.write(&value, &mut wire);
+        recv.read(&mut Reader::new(&wire), value.len() as u64, false).unwrap();
+        wire.clear();
+        let ((), used) = blaze_alloc_count::measure(|| send.write(&value, &mut wire));
+        assert_eq!(used, blaze_alloc_count::Used::default(), "a piece the receiver holds goes as its number");
+        let (read, used) =
+            blaze_alloc_count::measure(|| recv.read(&mut Reader::new(&wire), value.len() as u64, false).unwrap());
+        assert_eq!(read, None);
+        assert_eq!(used, blaze_alloc_count::Used::default(), "a value refused is read past with no copy");
+        let (read, used) =
+            blaze_alloc_count::measure(|| recv.read(&mut Reader::new(&wire), value.len() as u64, true).unwrap());
+        assert_eq!(read.as_deref(), Some(&value[..]));
+        assert_eq!(used.allocations, 1, "a value kept is one buffer of its length");
+    }
+
+    #[test]
+    fn a_warm_window_holds_new_pieces_with_no_allocation() {
+        // Under `CHUNKED_FROM`, so each value is one piece; each distinct, so each is new.
+        const LEN: usize = 60 << 10;
+        let piece = |n: u64| {
+            let mut it = vec![0u8; LEN];
+            it[..8].copy_from_slice(&n.to_le_bytes());
+            it
+        };
+        let (mut send, mut recv) = (SendWindow::default(), RecvWindow::default());
+        let mut wire = Vec::new();
+        // Four windows' worth: the buffer has cut its front more than once and reached its
+        // steady size (under twice the window and a piece).
+        let rounds = 4 * (WINDOW as usize / LEN) + 2;
+        for n in 0..rounds as u64 {
+            wire.clear();
+            send.write(&piece(n), &mut wire);
+            recv.read(&mut Reader::new(&wire), LEN as u64, false).unwrap();
+        }
+        wire.clear();
+        send.write(&piece(u64::MAX), &mut wire);
+        let (read, used) =
+            blaze_alloc_count::measure(|| recv.read(&mut Reader::new(&wire), LEN as u64, false).unwrap());
+        assert_eq!(read, None);
+        assert_eq!(used, blaze_alloc_count::Used::default(), "a new piece in a warm window");
+    }
+
+    #[test]
+    fn a_fetch_parsed_onto_a_frame_allocates_nothing() {
+        let keys: Vec<Key> = (0..64u8).map(|i| Key(ContentId([i; 32]))).collect();
+        let mut body = Vec::new();
+        fetch_ask(&keys, &mut body);
+        blaze_mem::frame::task(blaze_mem::Tag::Store, |temp| parse_fetch_ask_in(&body, temp).map(drop)).unwrap();
+        let (parsed, used) = blaze_alloc_count::measure(|| {
+            blaze_mem::frame::task(blaze_mem::Tag::Store, |temp| parse_fetch_ask_in(&body, temp).map(|it| it.to_vec()))
+        });
+        assert_eq!(parsed.unwrap(), keys);
+        assert_eq!(used.allocations, 1, "only the test's copy out of the frame");
     }
 
     #[test]

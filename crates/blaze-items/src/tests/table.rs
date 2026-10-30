@@ -35,6 +35,7 @@ pub(super) fn every_kind() -> Vec<Fact> {
         Fact::Vtable { trait_: a, self_ty: SimplifiedType(id(5)) },
         Fact::Derive(a),
         Fact::Target(id(6)),
+        Fact::Crate(id(7)),
     ]
 }
 
@@ -75,7 +76,7 @@ fn order(fact: &Fact) -> (u16, QueryOrder) {
         | Fact::Specializes(it)
         | Fact::DropCheck(it)
         | Fact::Derive(it) => (it.0, None, None),
-        Fact::Target(it) => (it, None, None),
+        Fact::Target(it) | Fact::Crate(it) => (it, None, None),
     };
     (fact.kind().0, parts)
 }

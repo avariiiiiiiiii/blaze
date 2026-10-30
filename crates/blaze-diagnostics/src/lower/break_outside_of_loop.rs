@@ -14,7 +14,7 @@
 
 use hir::{HirFileId, InFile};
 use syntax::{
-    SyntaxKind, SyntaxNode, TextRange, TextSize, WalkEvent,
+    SyntaxKind, TextRange, TextSize, WalkEvent,
     view::{self as ast, AstNode as _, HasLoopBody as _},
 };
 
@@ -437,29 +437,6 @@ fn required(stack: &[Context], is_break: bool) -> Option<Context> {
     }
 }
 
-/// The nodes from `node` up, through each macro expansion to its call, `node` first, as
-/// handles: [`up`] for the callers not on views yet.
-pub(crate) fn ancestors(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<InFile<SyntaxNode>> {
-    // alloc: the whole chain, for a caller that reads it more than once
-    let mut chain = Vec::new();
-    // clone: a reference count on the tree
-    let (mut file, mut next) = (node.file_id, Some(node.value.clone()));
-    loop {
-        let node = match next.take() {
-            Some(it) => it,
-            None => {
-                let Some(call) = file.macro_file() else { break };
-                let call = call.loc(cx.db).to_node(cx.db);
-                file = call.file_id;
-                call.value
-            }
-        };
-        next = node.parent();
-        chain.push(InFile::new(file, node));
-    }
-    chain
-}
-
 /// The nodes from `node` up, through each macro expansion to its call, `node` first, one at a
 /// time: a macro call's node is found (its file parsed or expanded) only when the walk goes
 /// past the top of its expansion, so a walk that stops at the first node it wants pays only
@@ -708,6 +685,7 @@ fn block(top: &Context, node: InFile<ast::Node<'_>>, it: ast::BlockExpr<'_>) -> 
 pub(crate) mod tests {
     use blaze_alloc_count::assert_at_most;
     use hir::Semantics;
+    use syntax::SyntaxNode;
 
     use super::*;
 
@@ -818,7 +796,28 @@ fn main() {}
         });
     }
 
-    /// The handle walk kept for the callers not on views gives the nodes the view walk does.
+    /// The nodes from `node` up, through each macro expansion to its call, `node` first, as
+    /// handles: the walk [`up`] replaced, gathered whole.
+    fn ancestors(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<InFile<SyntaxNode>> {
+        let mut chain = Vec::new();
+        let (mut file, mut next) = (node.file_id, Some(node.value.clone()));
+        loop {
+            let node = match next.take() {
+                Some(it) => it,
+                None => {
+                    let Some(call) = file.macro_file() else { break };
+                    let call = call.loc(cx.db).to_node(cx.db);
+                    file = call.file_id;
+                    call.value
+                }
+            };
+            next = node.parent();
+            chain.push(InFile::new(file, node));
+        }
+        chain
+    }
+
+    /// The handle walk up gives the nodes the view walk does.
     #[test]
     fn the_handle_walk_up_is_the_view_walk() {
         with_file(BLOCKS, |cx, root| {

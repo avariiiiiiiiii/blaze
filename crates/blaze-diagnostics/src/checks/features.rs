@@ -61,13 +61,13 @@ use crate::{
 /// `misc_checking_1`.
 ///
 /// The gates of the attributes of macro calls, as expansion gives them.
-pub(crate) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner], features: &Features) -> Vec<Found> {
+pub(crate) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner<'_>], features: &Features) -> Vec<Found> {
     attributes::expansion(cx, walk, owners, features)
 }
 
 /// `feature_gate::check_crate`: the checks of the features themselves ([`staged`]), then the
 /// gates of syntax.
-pub(crate) fn early(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner], features: &Features, flags: &Flags) -> Vec<Found> {
+pub(crate) fn early(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner<'_>], features: &Features, flags: &Flags) -> Vec<Found> {
     let mut found = staged(cx, owners, features, flags);
     found.extend(gates::check(cx, walk, features, flags));
     found
@@ -75,7 +75,7 @@ pub(crate) fn early(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner], features
 
 /// `check_unused_or_stable_features`: E0635, E0557 of a removed library feature,
 /// `stable_features`, `duplicate_features`.
-pub(crate) fn unused_or_stable(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> Vec<Found> {
+pub(crate) fn unused_or_stable(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) -> Vec<Found> {
     library::check(cx, owners, features)
 }
 
@@ -143,7 +143,7 @@ impl Features {
 }
 
 /// The crate's `#![feature(..)]`s: each feature it names, with the attribute it is in.
-fn crate_features<'a>(owners: &'a [Owner]) -> Vec<Named<'a>> {
+fn crate_features<'a>(owners: &'a [Owner<'_>]) -> Vec<Named<'a>> {
     // alloc: setup, the crate's `#![feature]`s, once per caller per check
     owners.iter().find(|it| it.target == Target::Crate).map(|it| named(it).collect()).unwrap_or_default()
 }
@@ -151,7 +151,7 @@ fn crate_features<'a>(owners: &'a [Owner]) -> Vec<Named<'a>> {
 /// rustc's `features`: what `#![feature]` enables, and its errors as expansion reads the
 /// crate's attributes: a removed language feature (E0557), one `-Z allow-features` leaves out
 /// (E0725).
-pub(crate) fn configured(cx: &Cx<'_, '_>, owners: &[Owner], flags: &Flags) -> (Features, Vec<Found>) {
+pub(crate) fn configured(cx: &Cx<'_, '_>, owners: &[Owner<'_>], flags: &Flags) -> (Features, Vec<Found>) {
     let bootstrap = cx.krate.base().env(cx.db).get("RUSTC_BOOTSTRAP");
     // alloc: setup, the crate's name, once per check
     let crate_name = cx.krate.display_name(cx.db).map(|it| it.crate_name().to_string());
@@ -163,7 +163,7 @@ pub(crate) fn configured(cx: &Cx<'_, '_>, owners: &[Owner], flags: &Flags) -> (F
     // alloc: empty, allocates only when a feature is in error
     let mut found = Vec::new();
     for feature in crate_features(owners) {
-        let name = feature.name.as_str();
+        let name = feature.name;
         let at = feature.attr.in_file(feature.range);
         let lang = table::lang(name);
         if let Some((reason, pull)) = table::removed(name) {
@@ -231,7 +231,7 @@ const DEPENDENT_FEATURES: &[(&str, &[&str])] = &[
 /// The checks `check_crate` makes of the features themselves before its gates:
 /// `maybe_stage_features` (E0554), `check_incompatible_features`, `check_dependent_features`,
 /// `check_new_solver_banned_features`, `check_features_requiring_new_solver`.
-pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features, flags: &Flags) -> Vec<Found> {
+pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features, flags: &Flags) -> Vec<Found> {
     // alloc: empty, allocates only when a feature is in error
     let mut diags = Vec::new();
     if !features.crate_nightly
@@ -294,7 +294,7 @@ pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features, fla
 /// `maybe_stage_features`: `#![feature]` where rustc is not a nightly, at the first
 /// `#![feature]`, with each stable feature it names and, when all are, the suggestion to remove
 /// the attribute.
-fn on_non_nightly(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> Option<Diag> {
+fn on_non_nightly(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) -> Option<Diag> {
     let named = crate_features(owners);
     let first = owners
         .iter()
@@ -338,6 +338,20 @@ pub(crate) fn feature_err(
     diag.span = span.into();
     feature_notes(&mut diag, features, feature);
     diag
+}
+
+/// [`feature_err`] for a lowering of what hir found, which has no [`Features`]: its notes
+/// depend only on whether the compiler is a nightly, read off `RUSTC_BOOTSTRAP` as
+/// [`configured`] reads it.
+pub(crate) fn lowered_feature_err(
+    cx: &Cx<'_, '_>,
+    feature: &str,
+    span: impl Into<MultiSpan>,
+    explain: impl Into<String>,
+) -> Diag {
+    let bootstrap = cx.krate.base().env(cx.db).get("RUSTC_BOOTSTRAP");
+    let features = Features { nightly: nightly_build(bootstrap.as_deref(), None), ..Features::default() };
+    feature_err(&features, feature, span, explain)
 }
 
 /// rustc's `feature_warn`: the warning of a soft gate, `unstable_syntax_pre_expansion` (a

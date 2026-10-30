@@ -4,7 +4,7 @@ use super::types::ui_std;
 use crate::tests::ui;
 
 /// std's `println!` and what it calls, for the tests that write one.
-const PRINTLN: &str = r#"pub mod io {
+pub(crate) const PRINTLN: &str = r#"pub mod io {
     pub fn _print(_args: core::fmt::Arguments<'_>) {}
 }
 

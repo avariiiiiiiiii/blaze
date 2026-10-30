@@ -95,7 +95,7 @@ fn one(root: &Path, spec: &str, bins: &[String], quiet: bool) -> anyhow::Result<
 fn cwd_package(ctx: &Context<Disk>) -> anyhow::Result<PackageId> {
     let cwd = ctx.config.cwd().to_owned();
     let manifest = cwd.join("Cargo.toml");
-    let source = blaze_manifest::source::SourceId::for_path(&cwd)?;
+    let source = SourceId::for_path(&cwd)?;
     let package = match read_manifest(&manifest, source, ctx)? {
         EitherManifest::Real(package) => package,
         EitherManifest::Virtual(_) => anyhow::bail!(
@@ -112,7 +112,7 @@ fn cwd_package(ctx: &Context<Disk>) -> anyhow::Result<PackageId> {
     };
     anyhow::ensure!(kinds(false) || kinds(true), "no packages found with binaries or examples");
     let id = &package.package_id;
-    Ok(PackageId::new(id.name.as_str().into(), id.version.clone(), SourceId::for_path(&cwd)?))
+    Ok(PackageId::new(id.name.as_str().into(), id.version.clone(), source))
 }
 
 fn remove(

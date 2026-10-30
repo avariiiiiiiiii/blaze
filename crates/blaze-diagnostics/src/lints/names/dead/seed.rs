@@ -99,21 +99,17 @@ impl<'c, 'a, 'db> Crate<'c, 'a, 'db> {
 }
 
 impl<'db> Crate<'_, '_, 'db> {
-    /// The node whose attributes set the level at `def`: its own, or for what a builtin derive
-    /// makes (a sibling of its ADT in rustc's HIR), what the ADT is in.
-    fn level_node(&self, def: DefIdx) -> Option<InFile<ast::Node<'db>>> {
+    /// The ADT whose attributes set the level at `def` when it is what a builtin derive makes
+    /// with no tokens (a sibling of its ADT in rustc's HIR, carrying the ADT's copied lint
+    /// attributes).
+    fn derived_from(&self, def: DefIdx) -> Option<InFile<ast::Node<'db>>> {
         let defs = self.defs;
-        if let Some(node) = defs[def].node {
-            return Some(self.cx.syntax_view(node));
-        }
         let derive = match defs[def].id {
             Id::Derive(it) | Id::DeriveMethod(it) => it,
             _ => return None,
         };
         let adt = defs.get(Id::Adt(derive.loc(self.cx.db).adt))?;
-        let node = self.cx.syntax_view(defs[adt].node?);
-        let parent = node.value.parent()?;
-        Some(node.with_value(parent))
+        Some(self.cx.syntax_view(defs[adt].node?))
     }
 
     /// The level of `dead_code` at `def` (rustc's `lint_level_spec_at_node`).
@@ -122,9 +118,10 @@ impl<'db> Crate<'_, '_, 'db> {
         if let Some(it) = slot.get() {
             return it;
         }
-        let level = match self.level_node(def) {
-            Some(node) => self.levels.at(self.cx, node),
-            None => self.levels.at(self.cx, self.crate_root()),
+        let level = match (self.defs[def].node, self.derived_from(def)) {
+            (Some(node), _) => self.levels.at(self.cx, self.cx.syntax_view(node)),
+            (None, Some(adt)) => self.levels.at_derived(self.cx, adt),
+            (None, None) => self.levels.at(self.cx, self.crate_root()),
         };
         slot.set(Some(level));
         level

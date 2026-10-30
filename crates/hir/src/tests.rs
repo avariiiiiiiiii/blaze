@@ -4,6 +4,8 @@ mod bodies;
 mod db;
 mod infer;
 mod lower;
+mod trait_imports;
+mod types;
 
 use base_db::{RunOrder, all_crates, set_run_order};
 use blaze_format::{Aligned, Persist, Record, Rel, Writer};
@@ -444,6 +446,45 @@ fn a_future_is_send_only_when_what_it_holds_across_an_await_is() {
             let interner = DbInterner::new_with(&db, hir_def::HasModule::krate(&def, &db));
             let fut = binding_ty(&db, def, "fut");
             assert_eq!(implements(interner, send, &[(fut, false)]), [expected], "{name}");
+        }
+    });
+}
+
+const SEND_REQUIRED_IN_ITS_BODY: &str = r#"
+//- minicore: sized, send, future
+struct NotSend(*const u8);
+fn not_send() -> NotSend { loop {} }
+fn consume(_: NotSend) {}
+fn require_send<T: Send>(_: T) {}
+fn held() {
+    require_send(async {
+        let it = not_send();
+        async {}.await;
+        consume(it);
+    });
+}
+fn moved_before() {
+    require_send(async {
+        consume(not_send());
+        async {}.await;
+    });
+}
+"#;
+
+/// rustc's `check_coroutine_obligations`: `Send` of a future the body defines stalls in
+/// inference, on the future's witness, and is proved after it. Inference reports nothing; the
+/// check refutes it when a `NotSend` is held across the `.await` and proves it when it is not.
+#[test]
+fn a_goal_stalled_on_the_body_s_own_future_is_checked_after_inference() {
+    let db = TestDB::with_files(SEND_REQUIRED_IN_ITS_BODY);
+    crate::attach_db(&db, || {
+        for (name, errors) in [("held", 1), ("moved_before", 0)] {
+            let body = InferBodyId::DefWithBodyId(function(&db, name));
+            let infer = InferenceResult::of(&db, body);
+            assert!(!infer.coroutine_stalled_predicates().is_empty(), "{name}: `{{async}}: Send`");
+            assert!(infer.diagnostics().is_empty(), "{name}: {:?}", infer.diagnostics());
+            let found = hir_ide::coroutine_obligations::coroutine_obligation_errors(&db, body);
+            assert_eq!(found.len(), errors, "{name}: {found:?}");
         }
     });
 }

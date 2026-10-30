@@ -80,7 +80,7 @@ Each owner's notes are the authority; a heading here is corrected when an owner'
 - `frontend-tree-move-def` ([tree-move-def.md](tree-move-def.md)): `HasSource::source_view`,
   `HasChildSourceView`, `ExpressionStoreSourceMap::node_*_view`.
 
-### `cfg_attrs_view` (requested: `v2/requests/db-expand.md`, heading (8))
+### `cfg_attrs_view` (requested: `v2/requests/db-expand.md`, heading (8); applied)
 
 `Walk::attrs` is an iterator, and the `cfg_attr` rule stays in hir-expand, so hir-expand gets
 the iterator form of `expand_cfg_attr_view` for a caller that has the `CfgOptions` in hand, in
@@ -157,7 +157,11 @@ it compares `cfg_attrs_view` with `expand_cfg_attr` over the handles on nested `
 - `v2/requests/diagnostics.md`: `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views
   (1)` (the walk) and `## frontend-tree: blaze-diagnostics lints.rs: onto views (2)`
   (`body_item`): both applied by this lane under diagnostics' grant.
-- `v2/requests/db-expand.md` (8): `cfg_attrs_view`, which `Walk::attrs` calls; open.
+- `v2/requests/db-expand.md` (8): `cfg_attrs_view`, which `Walk::attrs` calls; applied by
+  db-expand-views (`hir-expand/src/attrs.rs`).
 - `v2/requests/diagnostics-infer2-methods.md` (1): `lints/bodies/unstable_names.rs`, a file that
-  lane wrote after the split; open.
-- The children's headings: their notes, `tree-move-diag-lints-<part>.md`.
+  lane wrote after the split; applied by its author.
+- The children's headings: their notes, `tree-move-diag-lints-<part>.md`. The 44 the `-bodies`
+  and `-early` windows left were applied by this lane, merged onto today's files and marked per
+  heading. The 6 imports headings (`-uses`'s, whose window had ended) were applied by this lane
+  once hir-def `use_tree_sources_view` (`v2/requests/db-expand.md` src.rs (2)) was in.

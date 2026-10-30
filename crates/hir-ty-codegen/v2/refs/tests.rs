@@ -35,7 +35,7 @@ use db::TestDB;
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(TestDB::with_single_file(text).0));
-    (db, HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime(Default::default())))
+    (db, HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default()))))
 }
 
 #[track_caller]
@@ -62,9 +62,10 @@ fn spec() -> Spec {
             target: target.triple().to_owned(),
             arch,
             cpu: target.cpu().to_owned(),
-            features: target.features().to_vec(),
+            features: Vec::new(),
             cranelift: "0.136".to_owned(),
             llvm: None,
+            stencils: None,
             frame_pointers: crate::backend::frame_pointers(),
             relocation: if pic { Relocation::Pic } else { Relocation::Static },
         },
@@ -74,7 +75,9 @@ fn spec() -> Spec {
         panic: Panic::Unwind,
         debuginfo: DebugInfo::None,
         fold: false,
+        counted: false,
         mir_inline: false,
+        pgo: blaze_codegen::settings::Pgo::None,
         policy: ContentId::default(),
         sanitize: Sanitize::default(),
     }

@@ -5,7 +5,10 @@ use std::cell::Cell;
 use base_db::Db;
 use blaze_ids::radix;
 use span::Span;
-use syntax::{AstNode, TextRange, ast};
+use syntax::{
+    TextRange, ast,
+    view::{self, AstNode as _, HasModuleItem as _},
+};
 
 pub use span::RealSpanMap;
 
@@ -128,12 +131,12 @@ fn real_span_map_in(
     editioned_file_id: base_db::EditionedFileId,
     frame: &blaze_mem::Frame,
 ) -> RealSpanMap {
-    use syntax::ast::HasModuleItem;
     let mut pairs = Vec::new_in(frame);
     pairs.push((syntax::TextSize::new(0), span::ROOT_ERASED_FILE_AST_ID));
     let ast_id_map = HirFileId::from(editioned_file_id).ast_id_map(db);
 
-    let tree = editioned_file_id.parse(db).tree();
+    let parse = editioned_file_id.parse(db);
+    let tree = parse.view();
     // This is an incrementality layer. Basically we can't use absolute ranges for our spans as that
     // would mean we'd invalidate everything whenever we type. So instead we make the text ranges
     // relative to some AstIds reducing the risk of invalidation as typing somewhere no longer
@@ -148,34 +151,35 @@ fn real_span_map_in(
     // this kind of joining makes them as stable as the AstIdMap (which is basically changing on
     // every input of the file)…
 
-    let item_to_entry =
-        |item: ast::Item| (item.syntax().text_range().start(), ast_id_map.ast_id(&item).erase());
+    let item_to_entry = |item: view::Item<'_>| {
+        (item.syntax().text_range().start(), ast_id_map.ast_id_of_view::<ast::Item>(item).erase())
+    };
     // Top level items make for great anchors as they are the most stable and a decent boundary
     pairs.extend(tree.items().map(item_to_entry));
     // Unfortunately, assoc items are very common in Rust, so descend into those as well and make
     // them anchors too, but only if they have no attributes attached, as those might be proc-macros
     // and using different anchors inside of them will prevent spans from being joinable.
-    tree.items().for_each(|item| match &item {
-        ast::Item::ExternBlock(it) if ast::attrs_including_inner(it).next().is_none() => {
+    tree.items().for_each(|item| match item {
+        view::Item::ExternBlock(it) if view::attrs_including_inner(&it).next().is_none() => {
             if let Some(extern_item_list) = it.extern_item_list() {
                 pairs.extend(
-                    extern_item_list.extern_items().map(ast::Item::from).map(item_to_entry),
+                    extern_item_list.extern_items().map(view::Item::from).map(item_to_entry),
                 );
             }
         }
-        ast::Item::Impl(it) if ast::attrs_including_inner(it).next().is_none() => {
+        view::Item::Impl(it) if view::attrs_including_inner(&it).next().is_none() => {
             if let Some(assoc_item_list) = it.assoc_item_list() {
-                pairs.extend(assoc_item_list.assoc_items().map(ast::Item::from).map(item_to_entry));
+                pairs.extend(assoc_item_list.assoc_items().map(view::Item::from).map(item_to_entry));
             }
         }
-        ast::Item::Module(it) if ast::attrs_including_inner(it).next().is_none() => {
+        view::Item::Module(it) if view::attrs_including_inner(&it).next().is_none() => {
             if let Some(item_list) = it.item_list() {
                 pairs.extend(item_list.items().map(item_to_entry));
             }
         }
-        ast::Item::Trait(it) if ast::attrs_including_inner(it).next().is_none() => {
+        view::Item::Trait(it) if view::attrs_including_inner(&it).next().is_none() => {
             if let Some(assoc_item_list) = it.assoc_item_list() {
-                pairs.extend(assoc_item_list.assoc_items().map(ast::Item::from).map(item_to_entry));
+                pairs.extend(assoc_item_list.assoc_items().map(view::Item::from).map(item_to_entry));
             }
         }
         _ => (),

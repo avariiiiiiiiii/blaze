@@ -41,30 +41,24 @@ pub fn written_range(node: Node<'_>) -> TextRange {
     TextRange::new(start, node.text_range().end())
 }
 
-/// Whether lowering `body` met a call of `line!`, `column!`, `file!` or `concat!`: only then
-/// can a literal of it be what one of them expanded to, and only then is its source map read.
+/// Whether lowering `body` met a call of `file!` or `concat!`: only then can a literal of it be
+/// what `file!` expanded to, and only then is its source map read. `line!()` and `column!()`
+/// expand to their values (hir-expand's `place_expand`), so they need nothing here.
 fn calls_location_macros(db: &Db, body: &Body) -> bool {
     body.macro_calls().iter().any(|call| {
         matches!(
             call.loc(db).def.kind,
-            MacroDefKind::BuiltIn(
-                _,
-                BuiltinFnLikeExpander::Line
-                    | BuiltinFnLikeExpander::Column
-                    | BuiltinFnLikeExpander::File
-            ) | MacroDefKind::BuiltInEager(_, EagerExpander::Concat)
+            MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::File)
+                | MacroDefKind::BuiltInEager(_, EagerExpander::Concat)
         )
     })
 }
 
-/// The literals of a body that `line!()`, `column!()` or `file!()` expanded to. The source map
-/// changes with every edit above the body, and this keeps code without such literals from
-/// changing with it.
+/// The literals of a body that `file!()` expanded to, each with its expansion: the path is the
+/// build's rule's ([`name_sources`]), not the expander's. The source map changes with every
+/// edit above the body, and this keeps code without such literals from changing with it.
 #[salsa::tracked(returns(ref))]
-pub fn location_macros<'db>(
-    db: &'db Db,
-    owner: DefWithBodyId,
-) -> FxHashMap<ExprId, (BuiltinFnLikeExpander, HirFileId)> {
+pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> FxHashMap<ExprId, HirFileId> {
     let body = Body::of(db, owner);
     if !calls_location_macros(db, body) {
         return FxHashMap::default();
@@ -74,23 +68,16 @@ pub fn location_macros<'db>(
         .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
         .filter_map(|(id, _)| {
             let file_id = source_map.expr_syntax(id).ok()?.file_id;
-            let MacroDefKind::BuiltIn(_, expander) = file_id.macro_file()?.loc(db).def.kind else {
-                return None;
-            };
-            matches!(
-                expander,
-                BuiltinFnLikeExpander::Line
-                    | BuiltinFnLikeExpander::Column
-                    | BuiltinFnLikeExpander::File
-            )
-            .then_some((id, (expander, file_id)))
+            let kind = file_id.macro_file()?.loc(db).def.kind;
+            matches!(kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::File))
+                .then_some((id, file_id))
         })
         // alloc: the query's value, of a body that called a location macro
         .collect()
 }
 
-/// The literals of a body that `concat!` made of arguments with `line!()`, `column!()` or
-/// `file!()` among them, each with the expansion it is in.
+/// The literals of a body that `concat!` made of arguments with `file!()` among them, each with
+/// the expansion it is in.
 #[salsa::tracked(returns(ref))]
 pub fn located_concats<'db>(
     db: &'db Db,
@@ -112,12 +99,6 @@ pub fn located_concats<'db>(
         })
         // alloc: the query's value, of a body that called a location macro
         .collect()
-}
-
-/// What `line!()`, `column!()`, `file!()` or a `concat!` of them is where it is written.
-pub enum Placed {
-    Number(u32),
-    Text(String),
 }
 
 // dyn: the build's rule, told once a build and called once per file (`file_source_path`)
@@ -184,10 +165,10 @@ fn file_source_path<'db>(db: &'db Db, file: base_db::FileText) -> Option<String>
     (names.rule(db).paths)(db, file.file_id(db))
 }
 
-/// The value of the literal `expr` of `owner` when it is what `line!()`, `column!()`,
-/// `file!()` or a `concat!` of them expanded to: rust-analyzer expands them to placeholders,
-/// and a constant is evaluated from what it expanded them to.
-pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
+/// The text of the literal `expr` of `owner` when it is what `file!()`, or a `concat!` with
+/// `file!()` among its arguments, expanded to: the expander gives a placeholder for the path,
+/// and a constant is evaluated from what the build names the file.
+pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<String> {
     let path = |file| source_path(db, file);
     if let Some(file_id) = located_concats(db, owner).get(&expr) {
         use std::fmt::Write;
@@ -207,19 +188,15 @@ pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
                 }
             }
         }
-        return Some(Placed::Text(text));
+        return Some(text);
     }
-    let &(expander, file_id) = location_macros(db, owner).get(&expr)?;
+    let &file_id = location_macros(db, owner).get(&expr)?;
     let site = written_call(db, file_id)?;
     let range = InFile::new(site.file_id, written_range(site.value));
     let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
-    let (file, line, col) = macro_location_of(db, file_id.into(), range)?;
-    Some(match expander {
-        BuiltinFnLikeExpander::Line => Placed::Number(line),
-        BuiltinFnLikeExpander::Column => Placed::Number(col),
-        // alloc: the value of `file!()`, made only where one is evaluated
-        _ => Placed::Text(path(file)?.to_owned()),
-    })
+    let (file, _, _) = macro_location_of(db, file_id.into(), range)?;
+    // alloc: the value of `file!()`, made only where one is evaluated
+    Some(path(file)?.to_owned())
 }
 
 /// The macro of `name` that expands to a place in the source.
@@ -232,11 +209,12 @@ fn location_expander(name: &str) -> Option<BuiltinFnLikeExpander> {
     }
 }
 
-/// Whether a macro call is passed a call of `line!`, `column!` or `file!`.
+/// Whether a macro call is passed a call of `file!`. A `concat!` of only `line!()` and
+/// `column!()` already holds their values.
 fn names_location(call: Node<'_>) -> bool {
     call.descendants_with_tokens().filter_map(|it| it.into_token()).any(|token| {
         token.kind() == SyntaxKind::IDENT
-            && location_expander(token.text()).is_some()
+            && token.text() == "file"
             && std::iter::successors(token.next_token(), |it| it.next_token())
                 .find(|next| !next.kind().is_trivia())
                 .is_some_and(|next| next.kind() == SyntaxKind::BANG)

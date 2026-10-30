@@ -21,21 +21,24 @@ impl Memory {
     /// The memory object of `view`, written and published once.
     pub fn of(view: &View<'_>) -> Result<Memory, PremapError> {
         let meta = view.meta();
+        if !view.whole() {
+            return Err(PremapError::of(format_args!("the dependency image {:?} is read without its segment bytes", meta.key.0)));
+        }
         let len = view.end() - meta.base;
         let mut name = String::from("blaze-premap-"); // alloc: setup, once per image: its memory object's name
         blaze_format::hex::encode_into(&meta.key.0.0[..8], &mut name);
         let mut memory = CodeMemory::new(&name, len, 0)?;
         let page = memory.page();
         if meta.base % page != 0 {
-            return Err(PremapError::new(format!(
+            return Err(PremapError::of(format_args!(
                 "the dependency image's base {:#x} is not a multiple of this machine's mapping granule {page:#x}",
                 meta.base
             )));
         }
-        let mut maps = Vec::new();
+        let mut maps = Vec::with_capacity(view.segments().count());
         for segment in view.segments() {
             if segment.addr % page != 0 {
-                return Err(PremapError::new(format!(
+                return Err(PremapError::of(format_args!(
                     "the dependency image's segment at {:#x} is not a multiple of this machine's mapping \
                      granule {page:#x}",
                     segment.addr

@@ -1010,6 +1010,20 @@ mod tests {
         copied_in(SourceFile::parse(text, Edition::CURRENT).root())
     }
 
+    /// An outline's hash and a file's skeleton walk the tree's arrays and allocate nothing.
+    #[test]
+    fn an_outline_is_hashed_with_no_allocation() {
+        let text = "mod m { fn f<T>(x: T) { let _ = || 1; } }\n#[derive(Debug)]\nstruct S;\n\
+                    impl S { fn g(&self) -> u8 { 2 } }\nmacro_rules! m { () => {} }\n";
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        let none = FxHashSet::<TextRange>::default();
+        let (hash, skeleton) = blaze_alloc_count::assert_at_most(0, "an outline's hash", || {
+            (hash_outside_bodies(parse.root(), &none, &none), skeleton_of(parse.root()))
+        });
+        assert_eq!(hash.1, 0);
+        assert_eq!(skeleton, Some(hash.0));
+    }
+
     #[test]
     fn what_rustc_copies_is_told() {
         let same = |before: &str, after: &str| {

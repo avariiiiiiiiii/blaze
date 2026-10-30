@@ -37,6 +37,7 @@ from the store (`before: &[PatId]`, `after: &[PatId]`), subpattern type lists ar
 `Tys`, and `PatOrigin` is a `Copy` enum. Those need no change.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): a summary of E0 to E17, each settled in its own section; in the tree (`crates/hir-ty/src/infer/{coerce,expr,pat,callee,cast,op,place_op}.rs`).
 
 ## Prerequisites (other parts)
 
@@ -50,6 +51,7 @@ from the store (`before: &[PatId]`, `after: &[PatId]`), subpattern type lists ar
   file, so this file and ctx's can be applied in either order.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): in the tree at `crates/hir-ty/src/lib.rs:5`, `crates/hir-ty/Cargo.toml:51`, `Cargo.toml` hashbrown `nightly`, and `InferenceContext<'db, 'f>`'s `pub(crate) frame` in `crates/hir-ty/src/infer.rs`.
 
 ## Cross-part interfaces these files program against
 
@@ -57,6 +59,7 @@ Each is a change in a file of another part. The exact code is given, so mem-db-i
 it to that part's owner together with the part's own entries.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): X1 to X4 are settled in their sections below.
 
 ### X1. `write_expr_adj` takes `&[Adjustment]` (mem-db-infer-ctx, `infer.rs` about line 2281)
 
@@ -191,6 +194,7 @@ with `use blaze_mem::Frame;`. The caller outside my files,
 solver's.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): in the tree at `crates/hir-ty/src/infer/autoderef.rs:33` (takes `frame: &'f Frame`; db-mem-infer-a-small, "already in place").
 
 ### X3. `InferenceContextAutoderef` carries `'f` (mem-db-infer-method, `autoderef.rs:135,167`)
 
@@ -201,6 +205,7 @@ with `ctx(&mut self) -> &mut InferenceContext<'db, 'f>` and
 `InferenceContextAutoderef<'_, 'db, 'f>` (lifetimes in that order).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): in the tree at `crates/hir-ty/src/autoderef.rs:251` and `:262` (`<'a, 'db, 'f>`, `ctx() -> &mut InferenceContext<'db, 'f>`).
 
 ### X4. The context's fields these files fill (mem-db-infer-ctx, `infer.rs` about lines 1770 to 1800, 261, 2224, 2346)
 
@@ -266,6 +271,7 @@ Each file that names `Frame` adds `use blaze_mem::Frame;`; each that names a has
 ## coerce.rs
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): E1 to E5 in the tree (db-mem-infer-a), each checked below.
 
 ### E1. `Coerce` holds the frame; `CoerceResult` is a frame list (lines 88 to 220, 233 to 237, 340, 530 to 543)
 
@@ -402,6 +408,7 @@ after (X2; the `adjustments.push(..)` of the autoref that follows is unchanged):
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): in the tree at `crates/hir-ty/src/infer/coerce.rs:94` (`Coerce<'f, D>`) and `:113` (`CoerceResult<'db, 'f>` a `Vec<Adjustment, &'f Frame>`).
 
 ### E2. `InferenceCoercionDelegate` and `InferenceContext::coerce` (lines 867 to 926)
 
@@ -462,6 +469,7 @@ after:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): in the tree at `crates/hir-ty/src/infer/coerce.rs:736` and `:774` (`coerce` builds `Coerce` with `frame`, `write_expr_adj(expr, &adjustments)`).
 
 ### E3. `try_find_coercion_lub` (lines 945 to 1157)
 
@@ -526,6 +534,7 @@ Before (1118) `self.write_expr_adj(new, adjustments.into_boxed_slice());`, after
 `self.write_expr_adj(expr, &adjustments);`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): in the tree at `crates/hir-ty/src/infer/coerce.rs:847`, its `Coerce` with `frame` at `:1001`.
 
 ### E4. `CoerceMany` keeps its expressions in the frame (lines 1201 to 1242)
 
@@ -587,6 +596,7 @@ where a shorter `'exprs` is. `coerce_inner` passes `exprs` (`&Vec<ExprId, &Frame
 unchanged. Remove `use smallvec::SmallVec;` (line 53, its only use).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): in the tree at `crates/hir-ty/src/infer/coerce.rs:1104` to `:1150` (`Expressions::Dynamic(Vec<ExprId, &'exprs Frame>)`, `new(.., frame)`, `with_capacity`).
 
 ### E5. `could_coerce` runs only what decides its answer, in a task (lines 1445 to 1625; R1 entry point)
 
@@ -639,10 +649,12 @@ in `Resolver`; `has_infer` was the only `TypeVisitableExt` method.) What remains
 the solver's `InferCtxt` (mem-db-solver's).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): in the tree at `crates/hir-ty/src/infer/coerce.rs:1353` and `:1358` (`frame::task(Tag::Infer, ..)`).
 
 ## expr.rs
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): E6 to E10 applied below (db-mem-infer-a-expr), in the tree.
 
 ### E6. Match arms reserve their count; breakables take the frame (lines 514, 2291 to 2302)
 
@@ -979,6 +991,7 @@ both lists as before).
 ## pat.rs
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): E11 applied below (db-mem-infer-a-expr), in the tree.
 
 ### E11. Record pattern field maps (lines 1158 to 1257)
 
@@ -1078,6 +1091,7 @@ Imports: `collections::hash_map::Entry::{Occupied, Vacant},` leaves the `std::{.
 ## callee.rs
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): E12 to E14 applied below (db-mem-infer-a-expr), in the tree.
 
 ### E12. Adjustments of the callee (lines 107 to 260)
 
@@ -1268,6 +1282,7 @@ The caller (465 to 471) `&indices_to_skip` stays (it derefs to `&[u32]`).
 ## cast.rs
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): E15 applied below (db-mem-infer-a-expr), in the tree.
 
 ### E15. The auto-trait set of a dyn-to-dyn pointer cast (lines 388 to 405)
 
@@ -1313,6 +1328,7 @@ frame list (X4). Its methods take `&mut InferenceContext<'db, '_>` (E0).
 ## op.rs
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): E16 applied below (db-mem-infer-a-expr), in the tree.
 
 ### E16. The left operand's autoref (line 228)
 
@@ -1327,6 +1343,7 @@ After: `self.write_expr_adj(lhs_expr, &[autoref]);`
 ## place_op.rs
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:45): E17 applied below (db-mem-infer-a-expr), in the tree.
 
 ### E17. Overloaded deref and index adjustments (lines 64 to 70, 106 to 175)
 

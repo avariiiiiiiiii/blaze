@@ -1280,6 +1280,7 @@ pub mod kinds {
         INFER = 0x2400, "infer_body_query";
         INFER_ANON_CONST = 0x2401, "infer_anon_const_body_query";
         CLOSURE_EXPRS = 0x2402, "closure_exprs";
+        COROUTINE_OBLIGATIONS = 0x2403, "coroutine_obligation_errors";
 
         // Const eval.
         CONST_EVAL = 0x2410, "const_eval_query";
@@ -1322,6 +1323,7 @@ pub mod kinds {
         GENERICS_REQUIRE_SIZED_SELF = 0x2443, "generics_require_sized_self";
         REPRESENTABILITY = 0x2444, "representability";
         PARAMS_IN_REPR = 0x2445, "params_in_repr";
+        OPAQUE_VARIANCES = 0x2446, "opaque_variances_query";
 
         // Layout and drop.
         LAYOUT_OF_ADT = 0x2450, "layout_of_adt_query";

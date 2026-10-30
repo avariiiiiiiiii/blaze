@@ -30,7 +30,7 @@ use crate::{
     model::{Diag, Span},
 };
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedAssocItem) -> Vec<Found> {
+pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedAssocItem<'_>) -> Vec<Found> {
     let node = cx.node_view(d.expr_or_pat);
     let at = |range: TextRange| cx.span(InFile::new(node.file_id, range));
     let path = path_of(node.value);
@@ -126,7 +126,7 @@ fn qualifier_ty<'db>(cx: &Cx<'_, 'db>, qualifier: ast::Path<'db>) -> Option<hir:
 
 /// E0599 where the type the item was looked for on is not known here: rustc's message with the
 /// qualifier as written, so the program is still refused at the name.
-fn unknown(cx: &Cx<'_, '_>, d: &hir::UnresolvedAssocItem, span: Span, qualifier: &str, name: &str) -> Found {
+fn unknown(cx: &Cx<'_, '_>, d: &hir::UnresolvedAssocItem<'_>, span: Span, qualifier: &str, name: &str) -> Found {
     // alloc: the error's text, for an error hir found
     let message = format!("no associated function or constant named `{name}` found for `{qualifier}` in the current scope");
     // clone: on the error path, for an error hir found

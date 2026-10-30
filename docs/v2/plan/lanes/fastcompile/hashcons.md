@@ -211,3 +211,97 @@ what any query answers.
 - `hash_std`: writes integers little-endian at fixed width (`usize` as 64 bits) and `str` as
   std does, checked byte for byte against a hand feed; a derived-`Hash` enum interns as its
   value.
+- Allocation budget (`blaze-alloc-count`): an intern of a value already in, `get`, `handle`,
+  `lookup` (found and not), and comparing and hashing handles allocate nothing.
+
+## Speed of light
+
+Nothing here was run: costs are counted from the code and the machine, as in
+[share.md](share.md#speed-of-light) and
+[speed-of-light-infer-relate.md](../db/speed-of-light-infer-relate.md), whose machine this
+uses. That is an Apple M5 Max performance core at about 4.5 GHz with sustained IPC about 3.5,
+L1 about 3 cycles, L2 about 16, DRAM about 100 ns.
+
+The hot paths are four. An intern of a value already there is the common case: a query
+re-executing to equal output. Comparing two handles is early cutoff. An index or content ID
+to a value is a read. An intern of a new value is the rarest of the four.
+
+**The work that can't be skipped.**
+
+- **An intern** must compute the value's content ID. The ID is the value's name everywhere
+  after: the cutoff fingerprint, the persisted key, and the parts of a composite. It is BLAKE3
+  over the bytes `hash_content` feeds.
+- **Finding the value** costs at least one cache line of an index. Confirming it costs the
+  node's line, for its 32-byte content ID and one `Eq`: a hit must be checked, or a
+  collision or a bad `hash_content` would alias two values silently.
+- **A compare** is one word compare.
+- **A read** is the arithmetic from index to place and the loads that reach the node.
+- **A new value** also takes one write of the node and one publication of the entry. Under
+  threads it takes some serialization of two equal values racing, so that exactly one wins.
+
+Unit costs:
+
+| step | cost |
+|---|---|
+| `Hasher::of(domain)`: the domain's context key, cached in the `Domain` | about 10 ns |
+| one BLAKE3 compression (64 bytes, a single chunk is sequential) | about 20 ns |
+| a line in L1 / L2 / DRAM | about 1 / 4 / 100 ns |
+| compare 32 bytes; `Eq` of a value of interned parts (pointer compares) | about 1 ns each |
+| an uncontended lock and unlock of the shard's mutex | about 10 ns |
+
+**The bound.** For a value feeding \(b\) bytes (a composite of \(k\) parts feeds
+\(32k\) plus its own), with the index and node lines in L2:
+
+\[ T_{\text{hit}} \approx 10 + 20 \lceil b / 64 \rceil + 2 \cdot 4 + 1 + T_{\text{Eq}} \ \text{ns}, \]
+
+about 40 ns for a leaf or a pair of parts. Cold, the two lines are about 200 ns. The other
+paths:
+
+- comparing two handles, \(T_{\text{cmp}} \approx 0.3\) ns, one cycle;
+- \(T_{\text{get}} \approx 2 \cdot 4\) ns, two dependent loads;
+- \(T_{\text{lookup}} \approx T_{\text{hit}} - T_{\text{hash}}\), about 10 ns;
+- \(T_{\text{new}} \approx T_{\text{hit}} + 10 + 4 + T_{\text{move}}\) ns: the lock, a second
+  look, the node write, and amortized growth below one more probe, since a table doubles at
+  half load.
+
+**What the code does.**
+
+- **`intern`** is `content_of` (one `Hasher::of`, the value's feed, `finish`), then `Key::of`:
+  shifts of the fingerprint for the shard, tag and home. Then `Shard::find` loads the shard's
+  level, its table's line at home, and the node on a tag match. `matched` compares the content
+  ID and runs `Eq`, and the value passed in is dropped.
+- **`==`** is `ptr::eq`.
+- **`get`** is `chunk_of` (a leading-zeros count) and two acquire loads.
+- **`lookup`** is `intern` without the hash.
+- **A miss** locks the shard, looks again, appends to the arena (`OnceLock::set`) and
+  publishes the entry with one release store.
+
+Against the bound:
+
+- **The hit** is at it. The one load more is the shard's level, a read-mostly line that stays
+  in L1. An entry whose 32-bit tag (fingerprint bits 32..64) differs never loads a node.
+- **The compare, the read and the lookup** are at it.
+- **The miss** is at it for one thread. A compare-and-swap insert would save the lock on an
+  uncontended miss, about 10 ns. It would also need the node published before its equality
+  check, so a racing twin could be seen half-made. The lock is kept, and the contention
+  measurement is the one named above.
+
+None of these paths allocates: the allocation budget test holds the hit, the reads and the
+compares to zero. The pending move of the shard's index onto `blaze_mem::swiss::Index` keeps
+one probe: a group of tags compared at once, then the node.
+
+**State of the art.**
+
+- **rustc's interners** hash a value with FxHash, about 1 to 5 ns for a small one, and lock
+  the shard in the parallel front end. That gives an address, not a name. The name, the
+  stable hash that incremental compilation needs, is a second hash with `StableHasher`
+  (SipHasher128). So a rustc intern with its fingerprint costs a lock plus two hashes. Here
+  it is one BLAKE3 hash and no lock on a hit.
+- **salsa's interned lookups** by value take a shard lock and record a read.
+- **papaya and scc** pin an epoch on every read, which is a store. The reads here store
+  nothing.
+- **egg's hashcons** is a single-threaded `HashMap` probe, the same one or two lines, with no
+  persistent name.
+
+So a hit costs about what rustc's intern plus its stable hash costs, with no lock, and
+yields a name that is the same in every run and on disk.

@@ -6,6 +6,7 @@
 mod alloc_budget;
 mod db;
 mod erase_regions;
+mod foreign;
 #[path = "../../src/mir/optimize/inline/fixtures.rs"]
 mod inline;
 mod machine;

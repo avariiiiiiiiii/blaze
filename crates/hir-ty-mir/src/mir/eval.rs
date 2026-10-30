@@ -39,9 +39,10 @@ use triomphe::Arc;
 
 use crate::{
     CallableDefId, ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
+    PointerAt,
     consteval::{self, ConstEvalError, try_const_usize},
     db::{AnonConstId, GeneralConstId, HirDatabase, InternedClosureId},
-    drop::{DropGlue, has_drop_glue},
+    drop::{DropGlue, has_drop_glue, is_freeze},
     infer::PointerCast,
     intrinsic::Intrinsic,
     layout::{Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
@@ -63,13 +64,16 @@ use super::{
 };
 use super::{Budget, IsSigned, MirEvalError, VTableMap, pad16};
 
+pub mod foreign;
 mod hooks;
 pub mod machine;
+mod provenance;
 mod shim;
 mod threads;
 mod unwind;
 
 use hooks::Hooks;
+use provenance::Provenance;
 use machine::{
     Access, EvalThread, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site, TypedCx,
 };
@@ -246,7 +250,8 @@ enum Origin {
     /// `const_make_global` has made it global.
     ConstHeap { global: bool },
     /// The thread shims' `errno` cells and dispatch semaphores, freed only by their shim
-    /// (`dispatch_release`).
+    /// (`dispatch_release`), and the arguments and return place of an embedder's call, freed
+    /// when it returns.
     Machine,
     /// An anonymous `mmap`, freed only by `munmap`.
     Mmap,
@@ -431,6 +436,8 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// function, only the nested runs of `interpret_mir` do.
     limits_frames: bool,
     infcx: InferCtxt<'db>,
+    /// What an embedder set ([`foreign`]).
+    embedder: foreign::Embedder<'db, M>,
 }
 
 /// What a `TypeId` of the evaluation stands for: a type, or the type that stands for a field
@@ -706,8 +713,14 @@ pub fn interpret_mir<'db>(
     let ty = body.locals[return_slot()].ty.as_ref();
     let mut read_statics = FxHashSet::default();
     loop {
-        let mut evaluator =
-            Evaluator::new(db, body.owner, assert_placeholder_ty_is_unused, trait_env)?;
+        let mut evaluator = Evaluator::with_machine(
+            db,
+            body.owner,
+            assert_placeholder_ty_is_unused,
+            trait_env,
+            Provenance::default(),
+        )
+        .map_err(|(e, _)| e)?;
         // The evaluator only asks of it, so it comes back as it went in.
         evaluator.read_statics = Some(mem::take(&mut read_statics));
         let it = evaluator.evaluate(body, ty);
@@ -785,11 +798,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             // alloc: the constant's map, kept with it
             memory_map.type_ids = self.type_ids.iter().map(of).collect();
         }
+        let pointers = self.note_pointers(interval, &mut memory_map)?;
         let bytes = Box::from(bytes);
         let memory_map = if memory_map.memory.is_empty()
             && memory_map.statics.is_empty()
             && memory_map.type_ids.is_empty()
             && self.vtable_map.is_empty()
+            && !pointers
         {
             MemoryMap::Empty
         } else {
@@ -800,6 +815,37 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             MemoryMap::Complex(Box::new(memory_map))
         };
         Ok(Allocation::new(AllocationData { ty, memory: bytes, memory_map }))
+    }
+
+    /// Notes in `map` each word of the value in `value` and of the memory `map` kept that is
+    /// a pointer with provenance, as the machine knows them; whether there was one. Without a
+    /// machine that tracks provenance there is none.
+    fn note_pointers(
+        &self,
+        value: Interval,
+        map: &mut ComplexMemoryMap<'db>,
+    ) -> Result<'db, bool> {
+        if !M::CHECKS {
+            return Ok(false);
+        }
+        let size = self.ptr_size();
+        let mut noted = false;
+        let (_, shadow) = self.read_shadowed(value.addr, value.size)?;
+        shadow.pointers(value.size, size, |at| {
+            map.note_pointer(PointerAt::Value(at));
+            noted = true;
+        });
+        let pieces: SmallVec<[(usize, usize); 8]> =
+            // alloc: the kept pieces' places, once per constant, as `note_pointer` takes the map
+            map.memory.iter().map(|(&addr, bytes)| (addr, bytes.len())).collect();
+        for (addr, len) in pieces {
+            let (_, shadow) = self.read_shadowed(Address::from_usize(addr), len)?;
+            shadow.pointers(len, size, |at| {
+                map.note_pointer(PointerAt::Memory(addr + at));
+                noted = true;
+            });
+        }
+        Ok(noted)
     }
 }
 
@@ -914,6 +960,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             cached_fn_mut_trait_func: lang_items.FnMut_call_mut,
             cached_fn_once_trait_func: lang_items.FnOnce_call_once,
             infcx,
+            embedder: Default::default(),
         })
     }
 
@@ -2259,7 +2306,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         if let TyKind::FnDef(_, _) | TyKind::Closure(_, _) = current_ty.kind() {
                             let id = self.vtable_map.id(current_ty);
                             let ptr_size = self.ptr_size();
-                            Owned(OwnedBytes::from_slice(&id.to_le_bytes()[0..ptr_size]))
+                            let bytes = OwnedBytes::from_slice(&id.to_le_bytes()[0..ptr_size]);
+                            match M::CHECKS {
+                                true => {
+                                    let prov = self.machine.function(id as u64);
+                                    Shadowed(bytes, M::Shadow::pointer(ptr_size, prov))
+                                }
+                                false => Owned(bytes),
+                            }
                         } else {
                             not_supported!(
                                 "creating a fn pointer from a non FnDef or Closure type"
@@ -2894,7 +2948,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     None => match self.constants.get(&Either::Right(allocation)) {
                         Some(&interval) => interval,
                         None => {
-                            let interval = self.allocate_allocation_in_heap(locals, allocation)?;
+                            let interval =
+                                self.allocate_allocation_in_heap(locals, allocation, Mutability::Not)?;
                             self.constants.insert(Either::Right(allocation), interval);
                             interval
                         }
@@ -2904,34 +2959,29 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         })
     }
 
-    /// The value of a literal that `line!()`, `column!()`, `file!()` or a `concat!` of them
-    /// expanded to. The expansion has a placeholder there, for the code not to change with
-    /// every edit above it, and a constant is what it is where it is written.
+    /// The value of a literal that `file!()`, or a `concat!` with it, expanded to: the
+    /// expansion has a placeholder for the path, which is the build's rule's.
     fn placed(
         &mut self,
         it: &Operand,
         ty: Ty<'db>,
         locals: &Locals<'db>,
     ) -> Result<'db, Option<Interval>> {
-        use crate::mir::location::Placed;
         let (Some(MirSpan::ExprId(expr)), InferBodyId::DefWithBodyId(owner)) =
             (it.span, locals.body.owner)
         else {
             return Ok(None);
         };
         Ok(match (crate::mir::location::placed(self.db, owner, expr), ty.kind()) {
-            (Some(Placed::Number(number)), TyKind::Uint(rustc_type_ir::UintTy::U32)) => {
-                let addr = self.heap_allocate(4, 4)?;
-                self.write_memory(addr, &number.to_le_bytes())?;
-                Some(Interval::new(addr, 4))
-            }
-            (Some(Placed::Text(text)), TyKind::Ref(_, to, _)) if to.is_str() => {
+            (Some(text), TyKind::Ref(_, to, _)) if to.is_str() => {
                 let at = self.heap_allocate(text.len(), 1)?;
                 self.write_memory(at, text.as_bytes())?;
+                self.freeze(Interval::new(at, text.len()));
                 let size = self.ptr_size();
                 let addr = self.heap_allocate(2 * size, size)?;
                 self.write_pointer(addr, at)?;
                 self.write_memory(addr.offset(size), &word_bytes(text.len()))?;
+                self.freeze(Interval::new(addr, 2 * size));
                 Some(Interval::new(addr, 2 * size))
             }
             _ => None,
@@ -2955,7 +3005,19 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok(values)
     }
 
+    /// A constant's value, read-only as all it points to.
     fn allocate_valtree_in_heap(
+        &mut self,
+        ty: Ty<'db>,
+        valtree: ValTree<'db>,
+        locals: &Locals<'db>,
+    ) -> Result<'db, Interval> {
+        let value = self.valtree_in_heap(ty, valtree, locals)?;
+        self.freeze(value);
+        Ok(value)
+    }
+
+    fn valtree_in_heap(
         &mut self,
         ty: Ty<'db>,
         valtree: ValTree<'db>,
@@ -3027,6 +3089,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         .collect::<Result<'_, Vec<_>>>()?;
                     let bytes_addr = self.heap_allocate(bytes.len(), 1)?;
                     self.write_memory(bytes_addr, &bytes)?;
+                    self.freeze(Interval::new(bytes_addr, bytes.len()));
                     let ref_addr = self.heap_allocate(self.ptr_size() * 2, self.ptr_size())?;
                     self.write_pointer(ref_addr, bytes_addr)?;
                     let mut len = [0; 16];
@@ -3055,6 +3118,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     for (i, item) in items.iter().enumerate() {
                         self.copy_from_interval(items_addr.offset(i * item_size), *item)?;
                     }
+                    self.freeze(Interval::new(items_addr, items.len() * item_size));
                     let ref_addr = self.heap_allocate(self.ptr_size() * 2, self.ptr_size())?;
                     self.write_pointer(ref_addr, items_addr)?;
                     let mut len = [0; 16];
@@ -3171,7 +3235,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             MirEvalError::ConstEvalError(name, Box::new(e))
                         })?,
                 };
-                self.allocate_allocation_in_heap(locals, allocation)
+                let mutability = match id {
+                    GeneralConstId::StaticId(static_id) => self.static_nested_mutability(static_id),
+                    GeneralConstId::ConstId(_) | GeneralConstId::AnonConstId(_) => Mutability::Not,
+                };
+                self.allocate_allocation_in_heap(locals, allocation, mutability)
             }
             _ => not_supported!("evaluating unknown const"),
         }
@@ -3217,38 +3285,54 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let addr = self.heap_allocate(result.size, align)?;
         let interval = Interval::new(addr, result.size);
         interval.write_from_interval(self, result)?;
+        self.freeze(interval);
         self.free_stack(mark)?;
         Ok(interval)
     }
 
+    /// A copy of a constant's value, read-only with what it points to unless `mutability` is
+    /// `Mut` (the value of a `static mut`, whose pointees may be written).
     fn allocate_allocation_in_heap(
         &mut self,
         locals: &Locals<'db>,
         allocation: Allocation<'db>,
+        mutability: Mutability,
     ) -> Result<'db, Interval> {
         let (size, align) =
             self.size_align_of(allocation.ty, locals)?.unwrap_or((allocation.memory.len(), 1));
         let addr = self.heap_allocate(size, align)?;
-        self.write_allocation(locals, allocation, addr, size)?;
-        Ok(Interval::new(addr, size))
+        self.write_allocation(locals, allocation, addr, size, mutability)?;
+        let value = Interval::new(addr, size);
+        if mutability == Mutability::Not {
+            self.freeze(value);
+        }
+        Ok(value)
     }
 
-    /// Copies a constant's value to `addr`, along with the memory it points to.
+    /// Copies a constant's value to `addr`, along with the memory it points to, which is
+    /// read-only once written unless `nested` is `Mut` (rustc's interning: only a
+    /// `static mut`'s pointees may be written).
     fn write_allocation(
         &mut self,
         locals: &Locals<'db>,
         allocation: Allocation<'db>,
         addr: Address,
         size: usize,
+        nested: Mutability,
     ) -> Result<'db, ()> {
         let AllocationData { ty, memory: ref v, ref memory_map } = *allocation;
         // Its ids are of the evaluation that made it, and mean another type here.
         if memory_map.has_type_ids() {
             not_supported!("a constant computed from a `TypeId`, read by another evaluation");
         }
+        let mut frozen: SmallVec<[Interval; 4]> = SmallVec::new();
+        let freezes = M::CHECKS && nested == Mutability::Not;
         let patch_map = memory_map.transform_addresses(|b, align| {
             let addr = self.heap_allocate(b.len(), align)?;
             self.write_memory(addr, b)?;
+            if freezes {
+                frozen.push(Interval::new(addr, b.len()));
+            }
             Ok(addr.to_usize())
         })?;
         let padded;
@@ -3278,7 +3362,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             addr,
             ty,
             locals,
-        )
+        )?;
+        for block in frozen {
+            self.freeze(block);
+        }
+        Ok(())
     }
 
     fn eval_place(&mut self, p: &StoredPlace, locals: &Locals<'db>) -> Result<'db, Interval> {
@@ -3508,6 +3596,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let to = self.with_prov(to, self.machine.root(to.to_usize() as u64));
         self.write_pointer(at, to)
+    }
+
+    /// Writes at `at` a pointer to the function `id` (a [`VTableMap`] id), which carries the
+    /// provenance the machine gives functions.
+    fn write_function_pointer(&mut self, at: Address, id: usize) -> Result<'db, ()> {
+        let bytes = word_bytes(id);
+        if !M::CHECKS {
+            self.poke_memory(at, bytes.len())?.copy_from_slice(&bytes);
+            return Ok(());
+        }
+        let shadow = M::Shadow::pointer(bytes.len(), self.machine.function(id as u64));
+        self.write_shadowed(at, &bytes, &shadow)
     }
 
     /// A computed pointer value to `to` with `metadata` after it, as a `Ref` makes one.
@@ -3780,6 +3880,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// Memory of the evaluator's own ([`Origin::Evaluator`]), zeroed.
     fn heap_allocate(&mut self, size: usize, align: usize) -> Result<'db, Address> {
         self.allocate(size, align, Origin::Evaluator, true)
+    }
+
+    /// The block of [`Self::heap_allocate`] that `block` is, its bytes written, is read-only
+    /// from now on ([`Machine::freeze`]). A zero-sized block holds nothing to write.
+    #[inline(always)]
+    fn freeze(&self, block: Interval) {
+        if M::CHECKS && block.size != 0 {
+            self.machine.freeze(block.addr.to_usize() as u64);
+        }
     }
 
     /// A zeroed block of the heap: a freed one of its size class and alignment when there is
@@ -4427,13 +4536,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     // A function cast to a raw pointer is still the id the value's own
                     // evaluation gave the function, and this one has another for it.
                     let new_id = self.vtable_map.id(fn_ty);
-                    self.poke_memory(addr, self.ptr_size())?.copy_from_slice(&word_bytes(new_id));
+                    self.write_function_pointer(addr, new_id)?;
                 }
             }
             TyKind::FnPtr(_, _) => {
                 let ty = ty_of_bytes(self.peek_memory(addr, my_size)?)?;
                 let new_id = self.vtable_map.id(ty);
-                self.poke_memory(addr, my_size)?.copy_from_slice(&word_bytes(new_id));
+                self.write_function_pointer(addr, new_id)?;
             }
             TyKind::Adt(id, args) => match id.def_id() {
                 AdtId::StructId(s) => {
@@ -4995,6 +5104,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if let Some(o) = self.thread_statics.get(&st) {
             return Ok(*o);
         }
+        if let Some(location) = self.preset_static_location(st)? {
+            return Ok(location);
+        }
         let static_data = StaticSignature::of(self.db, st);
         if hir_def::attrs::AttrFlags::query(self.db, st.into())
             .contains(hir_def::attrs::AttrFlags::THREAD_LOCAL)
@@ -5010,8 +5122,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let location = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
             self.write_pointer(location, memory)?;
             self.thread_statics.insert(st, location);
-            self.write_allocation(locals, allocation, memory, size)?;
-            self.static_memory.push((memory.to_usize(), size, st));
+            let nested = self.static_nested_mutability(st);
+            self.write_allocation(locals, allocation, memory, size, nested)?;
+            self.freeze_static(st, allocation.ty, Interval::new(memory, size));
+            self.record_static(memory, size, st)?;
             return Ok(location);
         }
         let is_read = self.read_statics.as_ref().is_none_or(|read| read.contains(&st));
@@ -5037,8 +5151,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let result = Interval::new(self.heap_allocate(size, align)?, size);
             // Known before its value is written: what it points to may point back at it.
             let location = self.locate_static(st, result.addr)?;
-            self.write_allocation(locals, allocation, result.addr, size)?;
-            self.static_memory.push((result.addr.to_usize(), size, st));
+            let nested = self.static_nested_mutability(st);
+            self.write_allocation(locals, allocation, result.addr, size, nested)?;
+            self.freeze_static(st, allocation.ty, result);
+            self.record_static(result.addr, size, st)?;
             return Ok(location);
         } else {
             let ty = InferenceResult::of(self.db, DefWithBodyId::from(st))
@@ -5052,8 +5168,29 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let addr = self.heap_allocate(size, align)?;
             Interval::new(addr, size)
         };
-        self.static_memory.push((result.addr.to_usize(), result.size, st));
+        self.record_static(result.addr, result.size, st)?;
         self.locate_static(st, result.addr)
+    }
+
+    /// Whether what the value of `st` points to may be written: only for a `static mut`
+    /// (rustc's `intern_const_alloc_recursive`, which accepts `static mut X: &mut [i32] =
+    /// &mut [42]`).
+    fn static_nested_mutability(&self, st: StaticId) -> Mutability {
+        match StaticSignature::of(self.db, st).flags.contains(StaticFlags::MUTABLE) {
+            true => Mutability::Mut,
+            false => Mutability::Not,
+        }
+    }
+
+    /// The memory of `st`, of type `ty`, its initial value written: read-only unless it is a
+    /// `static mut` or its type has interior mutability (rustc's interning).
+    fn freeze_static(&self, st: StaticId, ty: Ty<'db>, memory: Interval) {
+        if !M::CHECKS || self.static_nested_mutability(st) == Mutability::Mut {
+            return;
+        }
+        if is_freeze(&self.infcx, ty, self.param_env.param_env) {
+            self.freeze(memory);
+        }
     }
 
     /// Records where the memory of a static is, and gives the address of a pointer to it.
@@ -5395,7 +5532,7 @@ pub fn render_const_using_debug_impl<'db>(
             // alloc: error path
             .map_err(|_| MirEvalError::NotSupported("unreachable".to_owned()))?,
     };
-    let data = evaluator.allocate_allocation_in_heap(locals, c)?;
+    let data = evaluator.allocate_allocation_in_heap(locals, c, Mutability::Not)?;
     let lang_items = evaluator.interner().lang_items();
     let resolver = owner.resolver(db);
     let Some(debug_fmt_fn) = lang_items.Debug_fmt else {

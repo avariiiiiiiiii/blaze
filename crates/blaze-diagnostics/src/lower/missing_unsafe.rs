@@ -44,6 +44,22 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingUnsafe) -> Vec<Found> {
     let node = cx.syntax_view(ptr);
     let span = cx.span_of(ptr);
     let op = Op::of(cx, d.reason, node, ptr);
+    let refused = match (&op, d.lint) {
+        // clone: a handle, on the error path, for an operation hir found unsafe
+        (Op::InitializingTypeWith, _) => Some(initializing_type_with(span.clone())),
+        (Op::CallDropExplicitly(_), UnsafeLint::UnsafeOpInUnsafeFn) => Some(Diag::error(
+            None,
+            "blaze found an explicit call of a `Drop` method in an `unsafe fn` body, which rustc's `check_unsafety` never reaches (`span_bug!`)",
+            // clone: a handle, on the error path, for an operation hir found unsafe
+            span.clone(),
+        )),
+        _ => None,
+    };
+    if let Some(mut diag) = refused {
+        code_fact(cx, &mut diag, ptr);
+        // alloc: the diagnostic's parts, for an operation hir found unsafe
+        return vec![Found::new(diag, Phase::Mir)];
+    }
     let found = match d.lint {
         UnsafeLint::HardError => Found::new(requires_unsafe(cx, &op, node, span, ptr), Phase::Mir),
         UnsafeLint::UnsafeOpInUnsafeFn => {
@@ -85,10 +101,20 @@ enum Op {
     ExternStatic(Option<hir::Static>),
     RawPtrDeref,
     UnionField(Option<hir::Union>),
+    UseOfUnsafeField,
+    InitializingTypeWithUnsafeField,
+    MutationOfLayoutConstrainedField,
+    BorrowOfLayoutConstrainedField,
+    UnsafeBinderCast,
+    /// A call of `Drop::drop` or `Drop::pin_drop` by path.
+    CallDropExplicitly(Option<hir::Function>),
+    /// A struct expression of a type with `#[rustc_layout_scalar_valid_range_*]`, which hir
+    /// reports and rustc's `check_unsafety` does not.
+    InitializingTypeWith,
 }
 
 impl Op {
-    fn of(cx: &Cx<'_, '_>, reason: UnsafetyReason, node: InFile<ast::Node<'_>>, at: InFile<SyntaxNodePtr>) -> Op {
+    fn of<'db>(cx: &Cx<'_, 'db>, reason: UnsafetyReason, node: InFile<ast::Node<'db>>, at: InFile<SyntaxNodePtr>) -> Op {
         match reason {
             UnsafetyReason::UnsafeFnCall => call(cx, node, at),
             UnsafetyReason::InlineAsm => Op::InlineAsm,
@@ -96,6 +122,13 @@ impl Op {
             UnsafetyReason::MutableStatic => Op::MutableStatic(static_of(cx, node)),
             UnsafetyReason::ExternStatic => Op::ExternStatic(static_of(cx, node)),
             UnsafetyReason::UnionField => Op::UnionField(union_of(cx, node)),
+            UnsafetyReason::UseOfUnsafeField => Op::UseOfUnsafeField,
+            UnsafetyReason::InitializingTypeWithUnsafeField => Op::InitializingTypeWithUnsafeField,
+            UnsafetyReason::CallDropExplicitly => Op::CallDropExplicitly(callee(cx, node.value)),
+            UnsafetyReason::InitializingTypeWith => Op::InitializingTypeWith,
+            UnsafetyReason::MutationOfLayoutConstrainedField => Op::MutationOfLayoutConstrainedField,
+            UnsafetyReason::BorrowOfLayoutConstrainedField => Op::BorrowOfLayoutConstrainedField,
+            UnsafetyReason::UnsafeBinderCast => Op::UnsafeBinderCast,
         }
     }
 
@@ -127,9 +160,43 @@ impl Op {
             Op::RawPtrDeref => ("dereference of raw pointer".to_owned(), "dereference of raw pointer"),
             // alloc: the diagnostic's text, for an operation hir found unsafe
             Op::UnionField(_) => ("access to union field".to_owned(), "access to union field"),
+            // alloc: the diagnostic's text, for an operation hir found unsafe
+            Op::UseOfUnsafeField => ("use of unsafe field".to_owned(), "use of unsafe field"),
+            Op::InitializingTypeWithUnsafeField => (
+                // alloc: the diagnostic's text, for an operation hir found unsafe
+                "initializing type with an unsafe field".to_owned(),
+                "initialization of struct with unsafe field",
+            ),
+            Op::MutationOfLayoutConstrainedField => (
+                // alloc: the diagnostic's text, for an operation hir found unsafe
+                "mutation of layout constrained field".to_owned(),
+                "mutation of layout constrained field",
+            ),
+            Op::BorrowOfLayoutConstrainedField => (
+                // alloc: the diagnostic's text, for an operation hir found unsafe
+                "borrow of layout constrained field with interior mutability".to_owned(),
+                "borrow of layout constrained field with interior mutability",
+            ),
+            // alloc: the diagnostic's text, for an operation hir found unsafe
+            Op::UnsafeBinderCast => ("unsafe binder cast".to_owned(), "unsafe binder cast"),
+            Op::CallDropExplicitly(function) => return call_drop_explicitly(cx, *function, span),
+            Op::InitializingTypeWith => return initializing_type_with(span),
         };
-        // alloc: the diagnostic's text, for an operation hir found unsafe
-        let message = format!("{what} is unsafe and requires unsafe {needs}");
+        // rustc's two unsafe-field errors say "block" where `unsafe_op_in_unsafe_fn` is allowed
+        // too, and its unsafe binder cast's message carries the end of an older note's sentence.
+        let needs = match self {
+            Op::UseOfUnsafeField | Op::InitializingTypeWithUnsafeField => "block",
+            _ => needs,
+        };
+        let message = match self {
+            // alloc: the diagnostic's text, for an operation hir found unsafe
+            Op::UnsafeBinderCast => format!(
+                "unsafe binder cast is unsafe and requires unsafe {} information that may be required to uphold safety guarantees of a type",
+                if needs == "block" { "block" } else { "block or unsafe fn" }
+            ),
+            // alloc: the diagnostic's text, for an operation hir found unsafe
+            _ => format!("{what} is unsafe and requires unsafe {needs}"),
+        };
         let mut diag = match lint {
             // clone: a handle, on the error path, for an operation hir found unsafe
             Some(lint) => Diag::lint_with_code(lint, "E0133", message, span.clone()),
@@ -161,15 +228,19 @@ impl Op {
                 }
             }
             _ => {
-                diag.note(self.note());
+                if let Some(note) = self.note(lint.is_some()) {
+                    diag.note(note);
+                }
             }
         }
         diag
     }
 
-    /// What rustc's note says the operation risks.
-    fn note(&self) -> &'static str {
-        match self {
+    /// What rustc's note says the operation risks, in the lint `unsafe_op_in_unsafe_fn` when
+    /// `in_lint`: none for an unsafe binder cast, nor for the lint of a borrow of a layout
+    /// constrained field.
+    fn note(&self, in_lint: bool) -> Option<&'static str> {
+        Some(match self {
             Op::Call(_) | Op::CallWithFeatures { .. } => {
                 "consult the function's documentation for information on how to avoid undefined behavior"
             }
@@ -186,7 +257,18 @@ impl Op {
             Op::UnionField(_) => {
                 "the field may not be properly initialized: using uninitialized data will cause undefined behavior"
             }
-        }
+            Op::UseOfUnsafeField | Op::InitializingTypeWithUnsafeField => "unsafe fields may carry library invariants",
+            Op::MutationOfLayoutConstrainedField => {
+                "mutating layout constrained fields cannot statically be checked for valid values"
+            }
+            Op::BorrowOfLayoutConstrainedField if !in_lint => {
+                "references to fields of layout constrained fields lose the constraints. Coupled with interior mutability, the field can be changed to invalid values"
+            }
+            Op::BorrowOfLayoutConstrainedField
+            | Op::UnsafeBinderCast
+            | Op::CallDropExplicitly(_)
+            | Op::InitializingTypeWith => return None,
+        })
     }
 
     /// Records what made the operation unsafe: the callee's signature, the static's, the
@@ -214,6 +296,31 @@ impl Op {
             _ => {}
         }
     }
+}
+
+/// rustc's `CallDropExplicitlyRequiresUnsafe`: no label and no note, the same where
+/// `unsafe_op_in_unsafe_fn` is allowed.
+fn call_drop_explicitly(cx: &Cx<'_, '_>, function: Option<hir::Function>, span: Span) -> Diag {
+    let Some(function) = function else {
+        return Diag::error(None, "blaze cannot name the `Drop` method this call calls", span);
+    };
+    // alloc: the diagnostic's text, for an operation hir found unsafe
+    let message = format!(
+        "call `{}` explicitly is unsafe and requires unsafe block",
+        cx.def_path(ModuleDef::Function(function))
+    );
+    Diag::error(Some("E0133"), message, span)
+}
+
+/// hir's `InitializingTypeWith`, which rustc's `check_unsafety` has no kind of: the pinned
+/// rustc (16d1ffac) reports no struct expression of a type with
+/// `#[rustc_layout_scalar_valid_range_*]`, so a program it builds would stop here.
+fn initializing_type_with(span: Span) -> Diag {
+    Diag::error(
+        None,
+        "blaze reports initializing a type with `#[rustc_layout_scalar_valid_range_*]` outside `unsafe`, which rustc does not (hir-ty-unsafeck's `InitializingTypeWith`)",
+        span,
+    )
 }
 
 /// rustc's `emit_requires_unsafe_err`: the error, and the label on the `unsafe` block or
@@ -455,7 +562,7 @@ fn audit_that<'db>(cx: &Cx<'_, 'db>, function: hir::Function) -> Option<ast::Str
 /// The operation of a call hir found unsafe: of the function it calls (an `unsafe fn`, one of
 /// an `extern` block, one safe only before 2024), of one with `#[target_feature]`, or through
 /// a pointer.
-fn call(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>, at: InFile<SyntaxNodePtr>) -> Op {
+fn call<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, at: InFile<SyntaxNodePtr>) -> Op {
     let Some(function) = callee(cx, node.value) else { return Op::Call(None) };
     let Ok(id) = hir_def::FunctionId::try_from(function) else { return Op::Call(Some(function)) };
     let signature = FunctionSignature::of(cx.db, id);
@@ -486,7 +593,7 @@ fn call(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>, at: InFile<SyntaxNodePtr>)
 
 /// The function a call or a method call calls, by the type of its callee: `None` through a
 /// pointer.
-fn callee(cx: &Cx<'_, '_>, node: ast::Node<'_>) -> Option<hir::Function> {
+fn callee<'db>(cx: &Cx<'_, 'db>, node: ast::Node<'db>) -> Option<hir::Function> {
     if let Some(call) = ast::MethodCallExpr::cast(node) {
         return cx.vsema.resolve_method_call(call);
     }
@@ -498,7 +605,7 @@ fn callee(cx: &Cx<'_, '_>, node: ast::Node<'_>) -> Option<hir::Function> {
 }
 
 /// The static a path (an expression or the target of an assignment) names.
-fn static_of(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>) -> Option<hir::Static> {
+fn static_of<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Option<hir::Static> {
     let path = match ast::PathExpr::cast(node.value) {
         Some(it) => it.path()?,
         None => ast::PathPat::cast(node.value)?.path()?,
@@ -510,7 +617,7 @@ fn static_of(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>) -> Option<hir::Static
 }
 
 /// The union whose field a field expression reads, or a pattern of whose fields `node` is.
-fn union_of(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>) -> Option<hir::Union> {
+fn union_of<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Option<hir::Union> {
     if let Some(field) = ast::FieldExpr::cast(node.value) {
         return match cx.vsema.resolve_field(field)?.left()?.parent_def(cx.db) {
             hir::Variant::Union(it) => Some(it),

@@ -69,6 +69,9 @@ macro_rules! setup_interned_struct {
         // The function used to implement `C::heap_size`.
         heap_size_fn: $($heap_size_fn:path)?,
 
+        // The `salsa::image::ImageCodec` constant that keeps the values in the daemon image.
+        image: $($image:path)?,
+
         // If `true`, `serialize_fn` and `deserialize_fn` have been provided.
         persist: $persist:tt,
 
@@ -173,6 +176,10 @@ macro_rules! setup_interned_struct {
                 type Struct<'db> = $Struct< $($db_lt_arg)? >;
 
                 $(
+                    const IMAGE: Option<$zalsa::ImageCodec<Self::Fields<'static>>> = Some($image);
+                )?
+
+                $(
                     fn heap_size(value: &Self::Fields<'_>) -> Option<usize> {
                         Some($heap_size_fn(value))
                     }
@@ -229,8 +236,12 @@ macro_rules! setup_interned_struct {
                 }
             }
 
+            // SAFETY: the struct holds only an `Id` and a `PhantomData` of the database lifetime;
+            // nothing is reached through it without the database, which is `Sync`.
             unsafe impl< $($db_lt_arg)? > Send for $Struct< $($db_lt_arg)? > {}
 
+            // SAFETY: the struct holds only an `Id` and a `PhantomData` of the database lifetime;
+            // nothing is reached through it without the database, which is `Sync`.
             unsafe impl< $($db_lt_arg)? > Sync for $Struct< $($db_lt_arg)? > {}
 
             $zalsa::macro_if! { $generate_debug_impl =>
@@ -298,6 +309,9 @@ macro_rules! setup_interned_struct {
             }
 
 
+            // SAFETY: the struct holds only an `Id` (and a `PhantomData`), which never points into
+            // storage; an old revision's value stays an index that the database checks on use
+            // (`SalsaValue`'s `# Safety` in salsa_value.rs).
             unsafe impl< $($db_lt_arg)? > $zalsa::SalsaValue for $Struct< $($db_lt_arg)? > {}
 
             impl<$db_lt> $Struct< $($db_lt_arg)? >  {

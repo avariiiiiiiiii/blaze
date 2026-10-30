@@ -127,6 +127,15 @@ inside the hook's ask. That waits on inproc's signal-safe asks (fastcompile-lazy
   identically.
 - `plan` and `refuse`: what is compiled ahead, ids, history, callees, and the release and
   output refusals.
+- `budget`: an ask of a published function, a lone hit, the frames and the plan's lookups
+  allocate nothing; a first ask of a warm runner allocates only its list of waiters.
+- `hit`: a lone hit is answered before `Runner::frame` returns and is never compiled. Its
+  callees are still prefetched, a miss goes to a worker, and a probe that panics fails the
+  function, naming it, and stops the run once. Many threads asking for hits at once start
+  each function once.
+- `wake`: asks while a worker spins, after every worker went to sleep, and in a burst are
+  each compiled once and answered; prefetches wake sleeping workers; a close ends spinning and
+  sleeping workers at once.
 
 ## Hooks (v2/requests/fastcompile.md)
 
@@ -137,3 +146,226 @@ inside the hook's ask. That waits on inproc's signal-safe asks (fastcompile-lazy
 - fastcompile-lazy 4 (codegen): a "compile later" walk and `compile_one`.
 - fastcompile-lazy 5 (cargo): dev `run` and `test` take the lazy path. An explicit lazy
   release is an error.
+- fastcompile-sol-lazy 1 (inproc, done): an asker and the reader spin briefly before they
+  sleep.
+- fastcompile-sol-lazy 2 (cargo): `Compiler::hit`, a probe of codegen's memo and the store.
+- fastcompile-sol-lazy 3 (codegen): `Build::memo_hit`, the probe `hit` wraps.
+
+## Speed of light
+
+Nothing here was run: costs are counted from the code and the machine. The machine is
+[link's](../link/speed-of-light.md#the-machine): 3.5 GHz, a system call on an open descriptor
+0.15 µs. A first call waits mostly on threads waking, which that table lacks, so three figures
+are added below. They are estimates from the hardware and the kernel, not measurements. The
+channel is blaze-inproc's ([inproc.md](inproc.md), "The asks"). An asker spins up to 3 µs on
+its answer, then sleeps on its slot's futex. The daemon's reader rescans the slots for 50 µs
+after its last ask, then sleeps on the doorbell, one byte on the socket.
+
+There are three hot paths: a warm call, a first call, and many threads first-calling at once.
+
+### A warm call
+
+Once bound, a call goes from the caller's `call` to the function's slot stub, which holds the
+function's code. On x86-64 the stub is `mov r11, [rip + cell]; jmp [r11 + disp32]`; on
+AArch64 it is six instructions ending in `br x16` (blaze-link's `table.rs`). A whole live
+build calls through the same stub, so laziness adds no instruction, load or branch. Once the
+slot is stored, neither the entry nor the resolver is on the path.
+
+What the slot costs over a direct `call rel32` (two L1 loads and one predicted indirect
+branch) is the price of the jump table, which lets a running program be patched. It is paid
+in every live build, lazy or not.
+
+**Bound \(0\) over the whole live build. Code \(0\).**
+
+### A first call
+
+The work that can't be skipped when a function has no code yet:
+
+1. Keep the caller's argument state across the ask: save and restore every register a call
+   can carry a value in.
+2. Tell the daemon. The asker can't run code the daemon hasn't made, and the daemon learns of
+   the ask only through a signal across processes: a wake of a sleeping thread, or a cache
+   line read by a spinning one.
+3. Compile (\(T_C\)) and place (\(T_P\)).
+4. Tell the asker, the same way.
+
+| step | cost |
+|---|---|
+| `XSAVEC` and `XRSTOR` of the AVX-512 state (about 2.7 KiB, components in their initial state skipped) and the resolver's 40 other instructions; on AArch64, 640 bytes stored and loaded by `stp` and `ldp` | about 0.1 µs (\(S\)) |
+| a wake: a thread asleep on a futex or a socket read, on another idle core, running again. This is the waker's system call (about 1 µs, \(W_s\)), the IPI, a shallow C-state exit and the schedule; half of a `perf bench sched pipe` round trip | about 3 µs (\(W\)) |
+| a cache line moved to a core that spins on it | about 0.1 µs (\(L\)) |
+| compile, a memo or store hit | about 1 µs |
+| compile, blaze-stencil, a 100-instruction function (30 to 60 ns an instruction, [stencil.md](stencil.md)) | 3 to 6 µs |
+| compile, Cranelift `opt_level=none`, the same function ([stencil.md](stencil.md)) | 10 to 30 µs |
+| place: a TLSF take, the bytes and relocations, `publish` (nothing on x86-64; `dc cvau`, `ic ivau` per line, one `dsb` and `isb` on AArch64) and the slot's release store | about 0.2 µs (\(T_P\)) |
+| an uncontended lock and unlock, a hash probe, a short `Vec` push | about 20 ns each |
+
+Both ends of the channel are asleep before an isolated ask, so the bound is
+
+\[ T^{*} = S + 2W + T_C + T_P \approx 6.3\ \mu s + T_C. \]
+
+That is 7.3 µs with a memo hit, 11.3 µs with blaze-stencil (5 µs) and 36.3 µs with Cranelift
+(30 µs), plus 0.1 µs of bookkeeping (\(B\), below).
+
+**What the code does,** counted from it:
+
+- **In the run process** (the entry, the resolver and `hook::fetch`): `push` and `jmp`; then
+  \(S\); one load for `attach`; the request counter's `fetch_add`; a 4 KiB answer buffer
+  zeroed (about 20 ns); one compare-and-swap that claims a slot; 16 bytes written; the
+  doorbell's `send`, the first \(W\); and the futex wait. After the answer: three words read,
+  the slot freed with three atomics, and the frame decoded. That is about 0.2 µs on top of
+  \(S\) and the wakes.
+- **The reader** (inproc's) wakes on the doorbell, scans 64 state words, takes the slot with a
+  compare-and-swap and calls `Runner::frame`. That decodes 16 bytes, takes the fetcher's lock,
+  runs `Fetcher::ask` (a hash insert and a waiter push, the one allocation of a first ask,
+  `budget.rs`), counts the compiles it queued and lets the lock go.
+- **The hand-off to a worker**, changed by this pass:
+  - *Before*, it was `notify_all` on the condvar. Every sleeping worker woke, which put a third
+    \(W\) on the critical path, and the woken workers all contended for the fetcher's lock.
+    The reader also made that system call on every ask, duplicates included.
+  - *Now*, a worker that runs out of compiles spins on `Shared::jobs` for 50 µs (`SPIN`), one
+    worker at a time. The reader bumps `jobs` under the lock, so the spinner sees the bump
+    within about \(L\) and takes the compile. A sleeping worker is woken (`notify_one`) only
+    for a compile no spinner covers.
+- **The worker** takes the lock, calls `Fetcher::next`, lets the lock go, compiles, and places
+  under the placer's lock (held for that one placement). It then takes the lock again for
+  `Fetcher::done` and sends the answers.
+  - *Before*, the answers waited on the callee scan (with a dedupe quadratic in the number of
+    callees), the queuing of the callees and its wakes, and the tier runner's bind.
+  - *Now*, the answers go first, and all of that comes after them, off the asker's path.
+- **The answer** goes through `Runs::send`: a lock, a map probe, and the `Sender`'s `Arc`
+  cloned and dropped. Then three words go into the slot, the state is stored with release,
+  and the futex wake is the second \(W\).
+
+- **A lone hit skips the worker** (`Compiler::hit`, request `fastcompile-sol-lazy 2`). An ask
+  more than 1 µs after the last one (`ALONE`) probes the compiler for code it already has. On
+  a hit, the reading thread claims the function (`Fetcher::start`), places it, and answers its
+  asker directly, never as a waiter. Nothing wakes, no cache line moves to a worker, and
+  nothing is allocated (`budget.rs`). A miss costs the probe and one more hold of the lock,
+  then goes to a worker as before. Asks closer together than 1 µs are a burst from several
+  threads, and stay with the workers so that they place in parallel.
+
+**How far it is.** The bound also carries the bookkeeping no design avoids, \(B \approx
+0.1\ \mu s\): claiming a slot, recording the compile once for single flight, and routing the
+answer to its process. On top of that, the code spends about 0.1 µs: the 4 KiB answer buffer
+zeroed, the frame decoded, the clock read, two more holds of the fetcher's lock and the
+answer's route in `Runs::send`. Handing an ask to a spinning worker adds about 0.2 µs: the
+`jobs` line and the fetcher's lock line each move to the worker's core. Handing it to a
+sleeping worker adds \(W\).
+
+- **In a burst**, the reader rescans for 50 µs after its last ask and an asker spins for 3 µs
+  (`fastcompile-sol-lazy 1`), and a worker spins. The bound is \(S + 2L + B + T_C + T_P\)
+  while the answer comes within the asker's 3 µs. A longer compile adds the asker's wake:
+  \(S + L + B + T_C + T_P + W\).
+- **Isolated**, nothing has asked or compiled for 50 µs, so the channel and the workers are
+  asleep: \(T^{*} + B = S + 2W + B + T_C + T_P\). "Before this pass" is the herd and the
+  answer behind the callee scan and bind: \(W + 0.5\ \mu s\) more.
+
+| compile | in a burst: bound | handed to a worker | now | isolated: bound | before this pass | now |
+|---|---|---|---|---|---|---|
+| memo hit (1 µs) | 1.6 µs | 1.9 µs (+19%) | 1.7 µs (+8%) | 7.4 µs | 10.9 µs (+47%) | 7.5 µs (+2%) |
+| blaze-stencil (5 µs) | 8.5 µs | 8.8 µs (+4%) | 8.8 µs (+4%) | 11.4 µs | 14.9 µs (+31%) | 14.6 µs (+28%) |
+| Cranelift (30 µs) | 33.5 µs | 33.8 µs (+1%) | 33.8 µs (+1%) | 36.4 µs | 39.9 µs (+10%) | 39.6 µs (+9%) |
+
+A memo hit is answered by the reading thread in both regimes; a compile is a worker's.
+
+An isolated compile still waits on a worker's wake. Every worker is asleep only when no
+compile ended in the 50 µs before the ask, which makes that ask the first of a burst. A run's first calls do come in bursts: its start, each new code
+path, and chains in which one thread first-calls one function after another. Each call of a
+chain starts \(W\) plus the program's work between the two calls after the last answer, which
+is under 50 µs unless the program computes in between.
+
+So the third wake is paid once per burst, adding \(W/n\) to each of a burst's \(n\) first
+calls. That is within 10% of a memo hit's bound from \(n = 7\) on, and of blaze-stencil's from
+\(n = 4\) on. The isolated compile itself stays \(W\) over its bound, and there are two ways
+to close that gap, neither taken:
+
+- the reader compiles a miss itself, which leaves every ask that arrives meanwhile unread for
+  the whole compile (30 µs with Cranelift, to save 3 µs). A hit takes only its placement, so
+  hits are the ones the reader serves;
+- a worker spins for the whole run, which burns a core for the run.
+
+Prefetch takes many first calls off this path entirely. A callee queued from its caller's
+relocations, or from history, is usually published before it is called. Its late ask is then
+answered by the reader at once, with no worker and no allocation (`Shared::ask`'s fast path,
+`budget.rs`): \(S + 2W\) plus about 0.3 µs, with \(T_C\) gone.
+
+The spinning costs at most one core for 50 µs after a burst's last compile, on the daemon's
+side, and nothing while compiles run. It is the competitive spin-then-park of rayon's sleep
+module (an event counter, checked before parking), with one spinner at a time as Go's scheduler
+and Tokio limit theirs. A wake missed by a race costs parallelism, never a compile: a worker
+that finishes a compile takes the next one itself.
+
+What is left of a burst's memo hit, the 0.1 µs over \(B\), is spread over about ten steps of
+20 ns each in blaze-inproc, the daemon's `Runs` and here. Nothing in it is a wake, a system
+call or an allocation. The asker's doorbell `send` is still a system call while the reader
+spins, but it runs after the slot is marked asked, alongside the daemon's work, so it is off
+the critical path.
+
+### Many threads first-calling at once
+
+\(N\) threads ask for \(F \le N\) distinct functions at once, with \(n_w\) workers and one
+reader per run process. What can't be skipped:
+
+- each function is compiled once, at most \(n_w\) at a time;
+- the one reader reads each ask, at a cost \(r\) (the slot, the decode, the fetcher's lock,
+  `Fetcher::ask`) of about 0.3 µs;
+- each asker is woken once, by its own slot's futex, at \(W_s\) to whoever wakes it;
+- a function's waiters are answered by the worker that compiled it.
+
+So
+
+\[ T^{*}_{N} \approx 2W + \max\Big(N r,\ \Big\lceil \tfrac{F}{n_w} \Big\rceil (T_C + T_P) + \Big\lceil \tfrac{N}{\min(F, n_w)} \Big\rceil W_s\Big). \]
+
+Take 32 threads, 8 functions, 4 workers and blaze-stencil compiles. The bound is
+\(6 + \max(9.6,\ 2 \cdot 5.2 + 8 \cdot 1) = 24.4\) µs.
+
+- **Before this pass:** the reader's `notify_all` was a system call on every ask, because std's
+  futex condvar wakes unconditionally. It also woke every idle worker, so \(r \approx 1\) µs.
+  That gives \(6 + \max(32,\ 18.4) + 3 \approx 41\) µs, 68% over.
+- **Now:** the reader makes a system call only for an ask that wakes a sleeping worker, at most
+  \(n_w - 1\) of them per burst. That gives \(r \approx 0.3\) µs plus \(3 W_s\) once. The three
+  sleeping workers start their first compiles \(W\) late, so the total is
+  \(6 + \max(12.6,\ 21.4) = 27.4\) µs, 12% over.
+  - A burst that arrives while compiles run is at the bound: its workers are running and take
+    the next compile themselves.
+  - The 12% is a constant \(W\), so it falls under 10% for any burst with more than about
+    30 µs of compile work.
+
+Asks in a burst come closer together than 1 µs (\(r\)), so they stay with the workers. Only
+a burst's first ask can be served by the reader as a lone hit, which delays the rest by one
+placement, about 0.2 µs.
+
+Single flight costs an extra asker only its waiter push and its own answer. `flight.rs`
+checks that 32 threads asking for 8 functions get 8 compiles.
+
+**What is left, and whose it is:** the answer term
+\(\lceil N / \min(F, n_w) \rceil W_s\). Thirty-two askers of one function cost its worker 32
+wake system calls, about 32 µs. One futex per function in flight, woken once with
+`FUTEX_WAKE` of all, would bring that to the kernel's per-thread wake, about 0.3 µs each.
+That is blaze-inproc's slot design (one futex per ask, model-checked in `ask/model.rs`), so it
+is named here and not changed.
+
+### Setup, once per run
+
+- `Plan::new` makes one hash insert and one row per function. It now sorts the code-hash
+  column with `blaze_ids::names::sort_by_name`, a stable radix sort on an 8-byte prefix, in
+  place of \(n \log n\) compares of 32-byte keys (about 3.5 million at 200,000 functions).
+- `Plan::callees` dedupes through a bitmap kept by its caller (`Plan::scratch`), in time
+  linear in the relocations. It was `Vec::contains`, quadratic in a function's callees: about
+  a million compares for a function that dispatches to a thousand others.
+- `stub::generate` is one pass of 16 bytes per function: 3.2 MB for 200,000 functions, about
+  0.3 ms at the page-cache copy rate.
+
+### Against the state of the art
+
+- **glibc's lazy binding** (`_dl_runtime_resolve_xsavec`) is the same trampoline at the same
+  cost \(S\), and resolves in-process by a symbol lookup. A first call here compiles in the
+  daemon instead, so it adds \(2W\) (\(2L\) once the channel spins).
+- **V8's lazy compilation and LLVM ORC's lazy call-throughs** compile on the calling thread,
+  so their bound is \(S + T_C\). Here the compiler, memo, store and code memory are the
+  daemon's: a compiler in the program would mean linking the compiler into every dev
+  executable. The cross-process signal is paid for, and prefetch keeps most first calls from
+  waiting on a compile.
+- **ORC has no single flight across processes.** The fetcher compiles once however many
+  threads and processes ask, at one waiter push per extra asker.

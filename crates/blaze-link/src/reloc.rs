@@ -98,6 +98,10 @@ pub(crate) struct Ctx {
     pub m: u64,
     pub base: u64,
     pub tls: Option<Tls>,
+    /// The target's thread-local offset when the image's thread-locals are at a place fixed
+    /// beside another image's ([`crate::state::State::tls_at`]): every thread-local kind then
+    /// writes `tp + A`, whatever the format's TLS model would compute from `tls`.
+    pub tp: Option<i64>,
 }
 
 /// The [`Apply`] a codegen relocation is written as, by the kind of target it has and
@@ -238,6 +242,15 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Bad
     let ga = g.wrapping_add(a as u64);
     let pc = |to: u64| to.wrapping_sub(p) as i64;
     let tls = || ctx.tls.ok_or(Bad::NoTls);
+    // The offset from the thread pointer, and from the start of the image's block.
+    let tp = || match ctx.tp {
+        Some(tp) => Ok(tp),
+        None => tp_offset(ctx.arch, tls()?, s),
+    };
+    let dtp = || match ctx.tp {
+        Some(tp) => Ok(tp),
+        None => Ok(s.checked_sub(tls()?.addr).ok_or(Bad::OutsideTls)? as i64),
+    };
     match apply {
         Apply::Abs64 => put(field, sa.to_le_bytes()),
         Apply::Abs32 => put(field, fits_u32(sa)?.to_le_bytes()),
@@ -248,8 +261,13 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Bad
         Apply::Delta32 => put(field, fits_i32(sa.wrapping_sub(m) as i64)?.to_le_bytes()),
         Apply::ImageRel32 => put(field, fits_u32(sa.wrapping_sub(base))?.to_le_bytes()),
         Apply::SecRel32 => {
-            let tls = tls()?;
-            let at = sa.checked_sub(tls.addr).filter(|it| *it <= tls.size).ok_or(Bad::SecRelNotTls)?;
+            let at = match ctx.tp {
+                Some(tp) => u64::try_from(tp + a).map_err(|_| Bad::SecRelNotTls)?,
+                None => {
+                    let tls = tls()?;
+                    sa.checked_sub(tls.addr).filter(|it| *it <= tls.size).ok_or(Bad::SecRelNotTls)?
+                }
+            };
             put(field, fits_u32(at)?.to_le_bytes())
         }
         Apply::Section16 => return Err(Bad::Section16),
@@ -259,33 +277,33 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Bad
         | Apply::GotRel32
         | Apply::TlvRel32 => put(field, fits_i32(pc(ga))?.to_le_bytes()),
         Apply::X86TpOff32 => {
-            let off = tp_offset(ctx.arch, tls()?, s)? + a;
+            let off = tp()? + a;
             put(field, fits_i32(off)?.to_le_bytes())
         }
         Apply::DtpOff32 => {
-            let off = s.checked_sub(tls()?.addr).ok_or(Bad::OutsideTls)? as i64 + a;
+            let off = dtp()? + a;
             put(field, fits_i32(off)?.to_le_bytes())
         }
         Apply::DtpOff64 => {
-            let off = s.checked_sub(tls()?.addr).ok_or(Bad::OutsideTls)? as i64 + a;
+            let off = dtp()? + a;
             put(field, off.to_le_bytes())
         }
-        Apply::TpOff64 => put(field, (tp_offset(ctx.arch, tls()?, s)? + a).to_le_bytes()),
+        Apply::TpOff64 => put(field, (tp()? + a).to_le_bytes()),
         Apply::TlsOffset => match (ctx.format, ctx.arch) {
             (Format::Elf, Arch::X86_64) => {
-                let off = tp_offset(ctx.arch, tls()?, s)? + a;
+                let off = tp()? + a;
                 put(field, fits_i32(off)?.to_le_bytes())
             }
             (Format::Elf, Arch::Aarch64) => {
                 if field.len() < 8 {
                     return Err(Bad::A64Literal);
                 }
-                let off = tp_offset(ctx.arch, tls()?, s)? + a;
+                let off = tp()? + a;
                 put(field, off.to_le_bytes())
             }
             (Format::Pe, _) => {
-                let at = s.checked_sub(tls()?.addr).ok_or(Bad::OutsideTls)?;
-                put(field, fits_u32(at.wrapping_add(a as u64))?.to_le_bytes())
+                let at = dtp()?;
+                put(field, fits_u32(at.wrapping_add(a) as u64)?.to_le_bytes())
             }
             (format, arch) => return Err(Bad::TlsOffsetIn(format, arch)),
         },
@@ -309,7 +327,7 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Bad
         Apply::A64TlsDescAdd12 => a64_lo12(field, ga, 0)?,
         Apply::A64TlsDescCall => {}
         Apply::A64TpHi12 | Apply::A64TpLo12 => {
-            let off = tp_offset(ctx.arch, tls()?, s)? + a;
+            let off = tp()? + a;
             if !(0..1 << 24).contains(&off) {
                 return Err(Bad::TpRange(off));
             }
@@ -417,7 +435,7 @@ mod tests {
     use super::*;
 
     fn ctx(arch: Arch, s: u64, a: i64, p: u64) -> Ctx {
-        Ctx { arch, format: Format::Elf, s, a, p, g: 0, m: 0, base: 0, tls: None }
+        Ctx { arch, format: Format::Elf, s, a, p, g: 0, m: 0, base: 0, tls: None, tp: None }
     }
 
     #[test]

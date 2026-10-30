@@ -23,13 +23,24 @@
 //! `io_uring_register` and `mmap`), the layouts as `linux/io_uring.h` has them. Linux 6.0 or
 //! later: each feature's absence is an error naming it and the kernel that has it. Before 6.1
 //! `statx` says no alignment for writes that bypass the cache, so none does.
+//!
+//! A request in flight is a slot of columns ([`ops`]): 32 bytes a completion reads, the buffer
+//! it lends the kernel, and what only its submission and end read; its handle is the
+//! `user_data` of its completions. The machinery that asks the kernel and steps completions is
+//! in [`flight`]. A large send on a TCP connection goes from the asker's pages
+//! (`IORING_OP_SEND_ZC`). docs/v2/plan/lanes/core/speed-uring.md has the costs per request and
+//! how they compare with other runtimes.
+
+mod files;
+mod flight;
+mod ops;
 
 use std::{
     cell::{RefCell, UnsafeCell},
     collections::VecDeque,
     ffi::CStr,
     fmt::Write as _,
-    io::{self, Write as _},
+    io,
     mem::ManuallyDrop,
     os::{
         fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
@@ -50,6 +61,7 @@ use blaze_mem::{Handle, Slab, Tag as MemTag, scratch};
 use blaze_radix as radix;
 use rustc_hash::FxHashMap;
 
+use self::ops::{Cold, Hot, Id, Kind};
 use crate::{
     Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names, RECV_MOST, Stamp, Tag,
     wheel::{self, Wheel},
@@ -61,12 +73,20 @@ const OP_POLL_ADD: u8 = 6;
 const OP_ACCEPT: u8 = 13;
 const OP_ASYNC_CANCEL: u8 = 14;
 const OP_CONNECT: u8 = 16;
+const OP_OPENAT: u8 = 18;
+const OP_CLOSE: u8 = 19;
+const OP_FILES_UPDATE: u8 = 20;
+const OP_STATX: u8 = 21;
 const OP_READ: u8 = 22;
 const OP_WRITE: u8 = 23;
 const OP_SEND: u8 = 26;
 const OP_RECV: u8 = 27;
 const OP_SHUTDOWN: u8 = 34;
 const OP_RENAMEAT: u8 = 35;
+const OP_UNLINKAT: u8 = 36;
+const OP_MKDIRAT: u8 = 37;
+const OP_LINKAT: u8 = 39;
+const OP_SEND_ZC: u8 = 47;
 
 const SETUP_SQPOLL: u32 = 1 << 1;
 const SETUP_CQSIZE: u32 = 1 << 3;
@@ -103,6 +123,9 @@ const FILE_INDEX_ALLOC: u32 = u32::MAX;
 const CQE_F_BUFFER: u32 = 1 << 0;
 /// In a completion's flags: the request goes on and will complete again.
 const CQE_F_MORE: u32 = 1 << 1;
+/// In a completion's flags: a zero-copy send's notification that the kernel reads its pages
+/// no more.
+const CQE_F_NOTIF: u32 = 1 << 3;
 const CQE_BUFFER_SHIFT: u32 = 16;
 /// In a cancel's flags: every request it matches, not the first, and every request at all.
 const ASYNC_CANCEL_ALL: u32 = 1 << 0;
@@ -131,6 +154,12 @@ const RECV_GROUP: u16 = 0;
 /// Bytes received and not yet asked for, past which a connection stops receiving until they
 /// are taken.
 const INBOX: usize = 4 << 20;
+/// A send on a TCP connection of at least this many bytes goes from the asker's pages
+/// (`IORING_OP_SEND_ZC`, Linux 6.0): it saves the copy into the socket's buffers (~3 µs at
+/// 10 GB/s for 32 KiB) and costs the pinning of its pages and a second completion, the
+/// notification, of ~1 µs together; below ~10 KiB the copy is the cheaper (the kernel's
+/// `msg_zerocopy.rst`). A Unix socket has no zero-copy sends, so its sends always copy.
+const ZERO_COPY_LEAST: usize = 32 << 10;
 /// `statx`'s mask bit of the alignment a write that bypasses the cache needs (Linux 6.1).
 const STATX_DIOALIGN: u32 = 0x2000;
 /// What a [`Stamp`] is made of, as `statx`'s mask asks for it (`linux/stat.h`; `libc` has these
@@ -167,6 +196,7 @@ const KEPT: u32 = 1 << 20;
 const CONNS: u32 = 1 << 20;
 const SPAWNS: u32 = 1 << 16;
 const WATCHES: u32 = 1 << 16;
+const LISTENS: u32 = 1 << 16;
 /// A request's slot is the `user_data`'s bits 2 to 31, beside its link.
 const _: () = assert!(PENDING < 1 << 30);
 /// Buffers, watches' tables and paths kept from what ended for what starts next.
@@ -518,10 +548,10 @@ impl Drop for Fixed {
 
 /// Registered buffers (`IORING_REGISTER_BUFFERS2`), page-aligned, for the pieces of writes
 /// that bypass the page cache (`WRITE_FIXED`), which need memory aligned to the device's
-/// blocks. Pinned once, so no request pins pages of its own.
+/// blocks. Pinned once, so no request pins pages of its own; lent one per write by
+/// [`ops::Lent`].
 struct Registered {
     map: Map,
-    free: Vec<u16>,
 }
 
 impl Registered {
@@ -549,7 +579,7 @@ impl Registered {
                 _ => error,
             }
         })?;
-        Ok(Registered { map, free: (0..DIRECT_BUFFERS).rev().collect() }) // alloc: setup, once per driver.
+        Ok(Registered { map })
     }
 
     fn at(&self, index: u16) -> *mut u8 {
@@ -559,11 +589,16 @@ impl Registered {
 }
 
 /// The buffers a connection's multishot receive takes from (`IORING_REGISTER_PBUF_RING`): the
-/// kernel picks one per completion, and each is given back once its bytes are copied out.
+/// kernel picks one per completion, and each is given back once its bytes are copied out. The
+/// buffers given back during a reap are published to the kernel together, one store of the
+/// ring's tail for the batch ([`Provided::publish`]), so the cache line the kernel reads moves
+/// once per reap, not once per buffer.
 struct Provided {
     ring: Map,
     buffers: Map,
     tail: u16,
+    /// The tail the kernel was last shown.
+    published: u16,
 }
 
 impl Provided {
@@ -578,10 +613,11 @@ impl Provided {
             resv: [0; 3],
         };
         register(fd, REGISTER_PBUF_RING, &raw const reg, 1, "a ring of provided buffers", "5.19")?;
-        let mut provided = Provided { ring, buffers, tail: 0 };
+        let mut provided = Provided { ring, buffers, tail: 0, published: 0 };
         for bid in 0..RECV_BUFFERS {
             provided.give(bid);
         }
+        provided.publish();
         Ok(provided)
     }
 
@@ -597,7 +633,8 @@ impl Provided {
         unsafe { std::slice::from_raw_parts(at, len.min(RECV_BUFFER)) }
     }
 
-    /// Buffer `bid` the kernel's again.
+    /// Buffer `bid` the kernel's again once [`Provided::publish`] next runs: its entry written
+    /// past the tail the kernel was shown, which it does not read until then.
     fn give(&mut self, bid: u16) {
         let mask = RECV_BUFFERS - 1;
         let entry: *mut ProvidedBuf = self.ring.at((self.tail & mask) as u32 * size_of::<ProvidedBuf>() as u32);
@@ -605,16 +642,41 @@ impl Provided {
         // group), so the offset is within `buffers`.
         let addr = unsafe { self.buffers.at.add(bid as usize * RECV_BUFFER) } as u64;
         // SAFETY: `entry` is slot `tail & mask` of the ring `new` mapped for `RECV_BUFFERS`
-        // entries; the kernel does not read it until the tail store below moves past it; if it
-        // did, it would read a half-written entry.
+        // entries; the kernel does not read it until `publish` stores a tail past it (at most
+        // `RECV_BUFFERS` given back between publishes, as every buffer is given back once per
+        // completion that names it); if it did, it would read a half-written entry.
         unsafe { (*entry).addr = addr };
         // SAFETY: as above.
         unsafe { (*entry).len = RECV_BUFFER as u32 };
         // SAFETY: as above.
         unsafe { (*entry).bid = bid };
         self.tail = self.tail.wrapping_add(1);
-        // SAFETY: the tail is the `resv` of the first entry, the kernel's to read.
+        debug_assert!(self.tail.wrapping_sub(self.published) <= RECV_BUFFERS);
+    }
+
+    /// Every buffer given back since the last publish shown to the kernel, with one store.
+    fn publish(&mut self) {
+        if self.tail == self.published {
+            return;
+        }
+        self.published = self.tail;
+        // SAFETY: the tail is the `resv` of the first entry, the kernel's to read; the release
+        // publishes the entries `give` wrote before it.
         unsafe { (*self.ring.at::<AtomicU16>(14)).store(self.tail, Ordering::Release) };
+    }
+
+    /// Buffers given back and not yet shown to the kernel.
+    #[cfg(test)]
+    fn unpublished(&self) -> u16 {
+        self.tail.wrapping_sub(self.published)
+    }
+
+    /// The tail the kernel reads.
+    #[cfg(test)]
+    fn shown(&self) -> u16 {
+        // SAFETY: the tail word at the fixed `resv` offset 14 of the ring `new` mapped, which
+        // only `publish` stores.
+        unsafe { (*self.ring.at::<AtomicU16>(14)).load(Ordering::Acquire) }
     }
 }
 
@@ -699,6 +761,15 @@ struct Ring {
     cq_tail: *const AtomicU32,
     cq_mask: u32,
     cqes: *const Cqe,
+    /// The tail of the requests written, ahead of the kernel's until [`Ring::publish`] stores
+    /// it there: one store, and one move of the cache line the kernel's thread polls, for every
+    /// request of a step.
+    sq_local: u32,
+    /// The tail the kernel was last shown.
+    sq_shown: u32,
+    /// The kernel's head as last read: room is counted from it, read again only where the ring
+    /// looks full.
+    sq_seen: u32,
     /// Requests written to the ring since the kernel's thread was last told of them.
     unsubmitted: u32,
     // Dropped after the pointers into them are no longer used.
@@ -785,6 +856,9 @@ impl Ring {
             cq_tail: rings.at(cq.tail),
             cq_mask,
             cqes: rings.at(cq.cqes),
+            sq_local: 0,
+            sq_shown: 0,
+            sq_seen: 0,
             unsubmitted: 0,
             _maps: vec![rings, sqes], // alloc: setup, once per driver.
             fd,
@@ -792,29 +866,42 @@ impl Ring {
     }
 
     /// Writes `sqes` to the ring one after another, all or, where there is no room for all,
-    /// none (a linked chain is links of requests next to each other).
+    /// none (a linked chain is links of requests next to each other). The kernel sees them at
+    /// the next [`Ring::publish`].
     fn push(&mut self, sqes: &[Sqe]) -> bool {
-        // SAFETY: `sq_head` points at the kernel's `AtomicU32` in `rings`, mapped while `self`
-        // lives; the kernel moves it, so only atomic loads.
-        let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
-        // SAFETY: `sq_tail` as above; only this thread writes it.
-        let tail = unsafe { (*self.sq_tail).load(Ordering::Relaxed) };
-        if tail.wrapping_sub(head) as usize + sqes.len() > self.sq_entries as usize {
-            return false;
+        let wanted = sqes.len() as u32;
+        if self.sq_local.wrapping_sub(self.sq_seen) + wanted > self.sq_entries {
+            // SAFETY: `sq_head` points at the kernel's `AtomicU32` in `rings`, mapped while
+            // `self` lives; the kernel moves it, so only atomic loads.
+            self.sq_seen = unsafe { (*self.sq_head).load(Ordering::Acquire) };
+            if self.sq_local.wrapping_sub(self.sq_seen) + wanted > self.sq_entries {
+                return false;
+            }
         }
         for (n, sqe) in sqes.iter().enumerate() {
-            let at = tail.wrapping_add(n as u32) & self.sq_mask;
+            let at = self.sq_local.wrapping_add(n as u32) & self.sq_mask;
             // SAFETY: `at` is masked by `sq_mask`, so below `sq_entries`, the length of the SQE
             // array.
             let slot = unsafe { self.sqes.add(at as usize) };
-            // SAFETY: slots from `tail` are not the kernel's until the tail store below moves
-            // past them; if it read one early it would see a torn request.
+            // SAFETY: slots from the kernel's tail on are not the kernel's until `publish`
+            // stores a tail past them, and the room check above keeps them behind its head; if
+            // it read one early it would see a torn request.
             unsafe { slot.write(*sqe) };
         }
-        // SAFETY: as above; the release publishes the entries with the tail.
-        unsafe { (*self.sq_tail).store(tail.wrapping_add(sqes.len() as u32), Ordering::Release) };
-        self.unsubmitted += sqes.len() as u32;
+        self.sq_local = self.sq_local.wrapping_add(wanted);
+        self.unsubmitted += wanted;
         true
+    }
+
+    /// Shows the kernel every request written since it was last shown, with one store.
+    fn publish(&mut self) {
+        if self.sq_local == self.sq_shown {
+            return;
+        }
+        self.sq_shown = self.sq_local;
+        // SAFETY: `sq_tail` points at the kernel's `AtomicU32` in `rings`; only this thread
+        // writes it, and the release publishes the entries `push` wrote before it.
+        unsafe { (*self.sq_tail).store(self.sq_local, Ordering::Release) };
     }
 
     /// The submission ring's flags, read after every write of it is visible to the kernel's
@@ -829,13 +916,13 @@ impl Ring {
     /// `wait`, waits up to it for one completion. Completions the kernel held for want of room
     /// are flushed to the ring by any enter that gets events.
     fn enter(&mut self, wait: Option<Duration>) -> io::Result<()> {
+        self.publish();
         let flags = self.flags();
         // SAFETY: `sq_head` points at the kernel's `AtomicU32` in `rings`, mapped while `self`
         // lives; the kernel moves it, so only atomic loads.
         let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
-        // SAFETY: `sq_tail` as above; only this thread writes it.
-        let tail = unsafe { (*self.sq_tail).load(Ordering::Relaxed) };
-        let queued = head != tail;
+        self.sq_seen = head;
+        let queued = head != self.sq_local;
         let wake = queued && flags & SQ_NEED_WAKEUP != 0;
         self.unsubmitted = 0;
         let wait = wait.or((flags & SQ_CQ_OVERFLOW != 0).then_some(Duration::ZERO));
@@ -886,28 +973,50 @@ impl Ring {
         }
     }
 
-    /// Every completion the kernel has posted: its `user_data`, its result and its flags
-    /// ([`CQE_F_MORE`], [`CQE_F_BUFFER`] and the buffer's id).
-    fn reap(&mut self, mut each: impl FnMut(u64, i32, u32)) {
+    /// The completions posted and not yet reaped, from the first to one past the last: read
+    /// each with [`Ring::cqe`], then give them all back with one [`Ring::consume`].
+    fn completions(&self) -> (u32, u32) {
         // SAFETY: `cq_head` points at the kernel's `AtomicU32` in `rings`; only this thread
         // writes it.
-        let mut head = unsafe { (*self.cq_head).load(Ordering::Relaxed) };
+        let head = unsafe { (*self.cq_head).load(Ordering::Relaxed) };
         // SAFETY: `cq_tail` as above; the kernel moves it, and the acquire pairs with its release
         // of the entries.
         let tail = unsafe { (*self.cq_tail).load(Ordering::Acquire) };
+        (head, tail)
+    }
+
+    /// Completion `at` of [`Ring::completions`]: its `user_data`, its result and its flags
+    /// ([`CQE_F_MORE`], [`CQE_F_BUFFER`] and the buffer's id, [`CQE_F_NOTIF`]).
+    fn cqe(&self, at: u32) -> (u64, i32, u32) {
+        // SAFETY: masked by `cq_mask`, so below the completion ring's `cq_entries`.
+        let cqe = unsafe { self.cqes.add((at & self.cq_mask) as usize) };
+        // SAFETY: entries from the head to the tail `completions` read are posted (its acquire)
+        // and the kernel does not reuse one until `consume` stores a head past it; the copy is
+        // made before that.
+        let Cqe { user_data, res, flags } = unsafe { cqe.read() };
+        (user_data, res, flags)
+    }
+
+    /// The completions before `head` the kernel's again, with one store for all of them: the
+    /// kernel keeps what it posts meanwhile in its overflow list (`IORING_FEAT_NODROP`).
+    fn consume(&mut self, head: u32) {
+        // SAFETY: `cq_head` as in `completions`; the release orders the reads of the entries
+        // before the kernel's reuse of them.
+        unsafe { (*self.cq_head).store(head, Ordering::Release) };
+    }
+
+    /// Every completion the kernel has posted, in one pass.
+    fn reap(&mut self, mut each: impl FnMut(u64, i32, u32)) {
+        let (mut head, tail) = self.completions();
+        if head == tail {
+            return;
+        }
         while head != tail {
-            // SAFETY: masked by `cq_mask`, so below the completion ring's `cq_entries`.
-            let at = unsafe { self.cqes.add((head & self.cq_mask) as usize) };
-            // SAFETY: entries between head and tail are posted (the acquire above) and the kernel
-            // does not reuse one until the head store below passes it; the reference is dropped
-            // before that store.
-            let cqe = unsafe { &*at };
-            let (user_data, res, flags) = (cqe.user_data, cqe.res, cqe.flags);
+            let (user_data, res, flags) = self.cqe(head);
             head = head.wrapping_add(1);
-            // SAFETY: as above; the entry is the kernel's again once the head is past it.
-            unsafe { (*self.cq_head).store(head, Ordering::Release) };
             each(user_data, res, flags);
         }
+        self.consume(head);
     }
 }
 
@@ -986,145 +1095,6 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
     out
 }
 
-/// A request in flight, in its slot of [`Uring::pending`], which never moves (a [`Slab`]'s
-/// entries are in reserved memory). Every buffer the kernel is given is on the heap, or in the
-/// slot itself only for a request of one completion (a connect's address), so taking an `Op`
-/// out of its slot while one of its completions is stepped ([`Uring::completed`]) moves nothing
-/// the kernel may still read: it is put back before the request is asked again. A file it names
-/// is held by its owner's count of requests on it ([`Kept::users`], [`Connection::users`]), so
-/// neither the file's slot nor its descriptor is let go while the kernel may still be given the
-/// request.
-enum Op {
-    /// Into `bytes` from `at`, `got` of `bytes.len()` read so far.
-    Read {
-        file: Handle<Kept>,
-        at: u64,
-        bytes: Vec<u8>,
-        got: usize,
-    },
-    /// `bytes` at the end of the file, `put` of them written so far.
-    Append {
-        file: Handle<Kept>,
-        bytes: Vec<u8>,
-        put: usize,
-    },
-    /// `bytes` at `at` of a file, through a descriptor of its own: the one kept for the file
-    /// appends wherever it is told to write. With `direct` the descriptor bypasses the page
-    /// cache, and each piece is copied into the registered buffer `buffer` and written from
-    /// there; until one is free, it waits.
-    WriteAt {
-        fd: OwnedFd,
-        at: u64,
-        bytes: Vec<u8>,
-        put: usize,
-        direct: bool,
-        buffer: Option<u16>,
-    },
-    Sync {
-        file: Handle<Kept>,
-    },
-    /// A whole file as one chain of linked requests: written to the temporary, synced, renamed
-    /// over the path, and its directory `dir` synced. `names` holds the temporary's path and
-    /// the path, each NUL-terminated, the second from `to`: a buffer of the driver's
-    /// ([`Uring::paths`]), on the heap, which the kernel reads while the rename is in flight. A
-    /// link that fails cancels those after it; a short write asks the chain again from where it
-    /// stopped.
-    Write {
-        fd: OwnedFd,
-        dir: OwnedFd,
-        bytes: Vec<u8>,
-        put: usize,
-        names: Vec<u8>,
-        to: usize,
-        file: FileName,
-        chain: Chain,
-    },
-    /// The first of `names` renamed over the second (from `to`), as for [`Op::Write`], then
-    /// each of `dirs` there is synced, linked.
-    Rename {
-        names: Vec<u8>,
-        to: usize,
-        dirs: [Option<OwnedFd>; 2],
-        chain: Chain,
-    },
-    /// A read of a watch's events, asked again after each until the watch is stopped.
-    Watch {
-        watch: Handle<Watching>,
-    },
-    /// Stops the request whose `user_data` is `target`; its own completion is nobody's.
-    Cancel {
-        target: u64,
-    },
-    /// The exit of the process of `spawn`: a poll of the pidfd its [`Spawning`] keeps open for
-    /// as long as any request of it is in flight.
-    Exit {
-        spawn: Handle<Spawning>,
-        pidfd: RawFd,
-    },
-    /// One of a spawn's output pipes, read until it ends, into a buffer of
-    /// [`Uring::buffers`].
-    Output {
-        spawn: Handle<Spawning>,
-        fd: OwnedFd,
-        buffer: Vec<u8>,
-        stderr: bool,
-    },
-    /// A spawn's input, `put` of it written; its pipe is closed when this ends.
-    Input {
-        spawn: Handle<Spawning>,
-        fd: OwnedFd,
-        bytes: Vec<u8>,
-        put: usize,
-    },
-    /// An accept of a listen's, asked again after each until the listen is stopped. The
-    /// kernel puts each connection straight into a slot of its half of the [`Table`].
-    Accept {
-        listener: crate::net::Listener,
-        stopping: bool,
-    },
-    /// The kernel reads the address from `at`, in this request's slot, until it completes:
-    /// once, so the slot is not left before (see [`Op`]).
-    Connect {
-        socket: Option<Fixed>,
-        at: crate::net::SockAddr,
-    },
-    /// The one receive of `conn`, multishot: each completion's bytes are in a buffer of the
-    /// [`Provided`] ring, copied into the connection's inbox and the buffer given back.
-    Recv {
-        conn: Conn,
-    },
-    /// A send on `conn`, `put` of `bytes` sent so far.
-    Send {
-        conn: Conn,
-        bytes: Vec<u8>,
-        put: usize,
-    },
-    /// `conn` shut both ways, for a hangup.
-    Shutdown {
-        conn: Conn,
-    },
-    /// A read of the eventfd that threads doing work off the ring bump once they have sent
-    /// its completion; in flight while any such work is.
-    Wake {
-        fd: RawFd,
-        /// [`Offload::count`], held while the kernel may write into it.
-        count: Rc<UnsafeCell<[u8; 8]>>,
-    },
-    /// In its slot while its completion is stepped; never asked of the kernel.
-    Stepping,
-}
-
-impl Op {
-    /// The completions the kernel still owes it: one per link of a chain not yet in.
-    fn owed(&self) -> usize {
-        match self {
-            Op::Write { chain, .. } => chain.owed(WRITE_LINKS),
-            Op::Rename { chain, dirs, .. } => chain.owed(1 + dirs.iter().flatten().count()),
-            _ => 1,
-        }
-    }
-}
-
 /// A watch's read and what it reads for, in [`Uring::watchings`], which is not freed while the
 /// kernel may still write into `buffer` (see `Drop`).
 struct Watching {
@@ -1150,33 +1120,6 @@ struct Kept {
 
 /// The links of a whole file's write: the write, its sync, the rename and its directory's sync.
 const WRITE_LINKS: usize = 4;
-
-/// The results of a linked chain's requests, by link, as their completions come in any order.
-#[derive(Default)]
-struct Chain {
-    results: [Option<i32>; 4],
-}
-
-impl Chain {
-    /// The result of link `link`; once all `links` are in, every result, and the chain is
-    /// empty for its next asking.
-    fn take(&mut self, link: usize, res: i32, links: usize) -> Option<[i32; 4]> {
-        self.results[link] = Some(res);
-        if self.results[..links].iter().any(Option::is_none) {
-            return None;
-        }
-        Some(std::mem::take(&mut self.results).map(|it| it.unwrap_or(0)))
-    }
-
-    fn owed(&self, links: usize) -> usize {
-        self.results[..links].iter().filter(|it| it.is_none()).count()
-    }
-}
-
-/// A request's handle: the `user_data` its completions carry names its slot and the
-/// generation the slot had, so a completion of a request that ended, whose slot holds another
-/// since, is told from that one's and dropped.
-type Id = Handle<Pending>;
 
 /// The `user_data` of link `link` of the request `id`, a request of no chain its link 0: the
 /// generation in the high half, the slot and the link in the low.
@@ -1217,8 +1160,9 @@ struct Offload {
     /// The request reading `wake`, while there is one.
     reading: Option<Id>,
     /// What each read of `wake` reads into, never read itself: one for the driver's life, so
-    /// a wait allocates nothing. Kept alive past the driver by a request the kernel keeps.
-    count: Rc<UnsafeCell<[u8; 8]>>,
+    /// a wait allocates nothing, written by the kernel through the cell's pointer alone. Not
+    /// freed while the kernel may still write into it (see `Drop`).
+    count: ManuallyDrop<Box<UnsafeCell<[u8; 8]>>>,
 }
 
 impl Offload {
@@ -1232,17 +1176,9 @@ impl Offload {
         // SAFETY: the call returned a descriptor of its own.
         let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }); // alloc: setup, once per driver.
         // alloc: setup, once per driver.
-        let count = Rc::new(UnsafeCell::new([0; 8]));
+        let count = ManuallyDrop::new(Box::new(UnsafeCell::new([0; 8])));
         Ok(Offload { sender, receiver, wake, out: 0, reading: None, count })
     }
-}
-
-struct Pending {
-    tag: Tag,
-    op: Op,
-    /// Given to the kernel before the ring failed: kept where it is, never freed or asked
-    /// again, so the kernel writes into nothing else; its completions are dropped.
-    abandoned: bool,
 }
 
 /// What became of a request whose completion was reaped.
@@ -1302,6 +1238,8 @@ struct Connection {
     /// and it is hung up.
     users: usize,
     hung: bool,
+    /// A TCP connection, whose large sends go from the asker's pages ([`ZERO_COPY_LEAST`]).
+    tcp: bool,
     /// What its receive took and no `Recv` has yet, in order.
     inbox: VecDeque<u8>,
     /// The `Recv`s waiting for bytes, in the order they were submitted, with their most and
@@ -1313,6 +1251,14 @@ struct Connection {
     pausing: bool,
     /// How its receiving ended: the peer hung up (or reset it), or why it failed.
     ended: Option<Result<(), String>>,
+}
+
+/// A connect in flight, in [`Uring::connectings`], which is not freed while the kernel may
+/// still read `at` (see `Drop`): its socket, given to the connection it makes.
+struct Connecting {
+    socket: Option<Fixed>,
+    at: crate::net::SockAddr,
+    tcp: bool,
 }
 
 /// An [`Effect::Stamp`] on the [`Stampers`]: its names claimed [`STAMP_CHUNK`] at a time, each
@@ -1590,24 +1536,27 @@ pub struct Uring {
     registered: Registered,
     /// Not freed while the kernel may still write into it (see `Drop`).
     provided: ManuallyDrop<Provided>,
+    /// The registered buffers' lending to writes that bypass the page cache.
+    lent: ops::Lent,
     /// Each file opened, for reading and appending, and the name each is kept under.
     kept: Slab<Kept>,
     names: FxHashMap<FileName, Handle<Kept>>,
     /// Every request in flight or waiting, by the handle its `user_data` carries ([`data`]).
     /// Not freed while the kernel may still read or write what a request holds (see `Drop`).
-    pending: ManuallyDrop<Slab<Pending>>,
+    ops: ManuallyDrop<ops::Ops>,
+    /// The names of whole-file writes and renames in flight, which the kernel reads; not freed
+    /// while it may (see `Drop`).
+    paths: ManuallyDrop<ops::Paths>,
     /// Requests for which the ring had no room.
     waiting: VecDeque<Id>,
-    /// Writes bypassing the page cache waiting for a registered buffer.
-    for_buffers: VecDeque<Id>,
     /// Devices whose file system refused `O_DIRECT`: their writes go through the page cache.
     refused: rustc_hash::FxHashSet<u64>,
     /// Writes that bypassed the page cache, ended.
     direct_writes: u64,
+    /// Sends that went from the asker's pages (`IORING_OP_SEND_ZC`), ended.
+    zero_copy_sends: u64,
     /// Completions to hand out at the next poll, in order.
     ready: Vec<Completion>,
-    /// The completions reaped from the ring, kept for the next reap's.
-    posted: Vec<(u64, i32, u32)>,
     /// The request reading each watch's events, by the watch's tag.
     watches: FxHashMap<Tag, Id>,
     /// What each watch's read reads for. Not freed while the kernel may still write into a
@@ -1615,6 +1564,11 @@ pub struct Uring {
     watchings: ManuallyDrop<Slab<Watching>>,
     /// The request accepting each listen's connections, by the listen's tag.
     listens: FxHashMap<Tag, Id>,
+    /// What each listen accepts on, by the handle in its accept's [`ops::Hot::of`].
+    listeners: Slab<crate::net::Listener>,
+    /// Each connect in flight, by the handle in its request's [`ops::Hot::of`]. Not freed while
+    /// the kernel may still read an address of one (see `Drop`).
+    connectings: ManuallyDrop<Slab<Connecting>>,
     spawns: Slab<Spawning>,
     /// Each spawn in flight by its tag, for a kill.
     spawning: FxHashMap<Tag, Handle<Spawning>>,
@@ -1628,8 +1582,6 @@ pub struct Uring {
     buffers: Vec<Vec<u8>>,
     /// The tables of watches that ended, with their lists of flushes, for the next watch.
     trees: Vec<(crate::watch::Spare, Vec<Tag>)>,
-    /// The buffers of names of writes and renames that ended, for the next.
-    paths: Vec<Vec<u8>>,
     /// Made for the first [`Effect::Stamp`].
     stampers: Option<Stampers>,
     offload: Offload,
@@ -1657,19 +1609,22 @@ impl Uring {
             table,
             registered,
             provided,
+            lent: ops::Lent::new(DIRECT_BUFFERS),
             kept: slab(KEPT)?,
             names: FxHashMap::default(),
-            pending: ManuallyDrop::new(slab(PENDING)?),
+            ops: ManuallyDrop::new(ops::Ops::new(PENDING).map_err(io::Error::other)?),
+            paths: ManuallyDrop::new(ops::Paths::new().map_err(io::Error::other)?),
             // alloc: setup, once per driver: room for as many as the ring holds.
             waiting: VecDeque::with_capacity(ENTRIES as usize),
-            for_buffers: VecDeque::new(), // alloc: empty, nothing allocated; reused after.
             refused: rustc_hash::FxHashSet::default(),
             direct_writes: 0,
+            zero_copy_sends: 0,
             ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
-            posted: Vec::new(), // alloc: empty, nothing allocated; reused after.
             watches: FxHashMap::default(),
             watchings: ManuallyDrop::new(slab(WATCHES)?),
             listens: FxHashMap::default(),
+            listeners: slab(LISTENS)?,
+            connectings: ManuallyDrop::new(slab(CONNS)?),
             spawns: slab(SPAWNS)?,
             spawning: FxHashMap::default(),
             conns: slab(CONNS)?,
@@ -1677,7 +1632,6 @@ impl Uring {
             confine: None,
             buffers: Vec::with_capacity(SPARES), // alloc: setup, once per driver.
             trees: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
-            paths: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
             stampers: None,
             offload: Offload::new()?,
             in_flight: 0,
@@ -1690,18 +1644,6 @@ impl Uring {
     pub fn confined(mut self, confine: Arc<dyn Confine>) -> Uring {
         self.confine = Some(confine);
         self
-    }
-
-    /// Where the listen `listen` listens, while it does: the port a TCP listen of port 0 was
-    /// given. `None` for a Unix socket's.
-    pub fn local_addr(&self, listen: Tag) -> Option<std::net::SocketAddr> {
-        let id = self.listens.get(&listen)?;
-        match &self.pending.get(*id)?.op {
-            Op::Accept { listener: crate::net::Listener::Tcp(listener), .. } => {
-                listener.local_addr().ok()
-            }
-            _ => None,
-        }
     }
 
     /// Every timer due, fired in the order they were due.
@@ -1752,50 +1694,6 @@ impl Uring {
         file
     }
 
-    fn start(&mut self, tag: Tag, op: Op) -> Id {
-        let id = self.pending.insert(Pending { tag, op, abandoned: false });
-        self.queue(id);
-        id
-    }
-
-    /// Writes the request `id` as it now stands to the ring, or keeps it for when there is
-    /// room (or, bypassing the page cache, for when a registered buffer is free).
-    fn queue(&mut self, id: Id) {
-        if !self.buffered(id) {
-            self.for_buffers.push_back(id);
-            return;
-        }
-        let mut sqes = [Sqe::default(); WRITE_LINKS];
-        let n = self.sqes(id, &mut sqes);
-        if !self.waiting.is_empty() || !self.ring.push(&sqes[..n]) {
-            self.waiting.push_back(id);
-        }
-    }
-
-    /// Whether the request `id` has the registered buffer it needs, given one if it needs one
-    /// and one is free.
-    fn buffered(&mut self, id: Id) -> bool {
-        let Some(Pending { op: Op::WriteAt { direct: true, buffer, .. }, .. }) = self.pending.get_mut(id)
-        else {
-            return true;
-        };
-        if buffer.is_none() {
-            *buffer = self.registered.free.pop();
-        }
-        buffer.is_some()
-    }
-
-    /// The registered buffer of a write that ended free again, for the next that waits.
-    fn unbuffer(&mut self, buffer: u16) {
-        self.registered.free.push(buffer);
-        while let Some(id) = self.for_buffers.pop_front() {
-            if self.pending.contains(id) {
-                self.queue(id);
-                return;
-            }
-        }
-    }
-
     /// A buffer of [`PIPE`] bytes, kept from one that ended where there is one.
     fn buffer(&mut self) -> Vec<u8> {
         // alloc: a pipe's or a watch's buffer, where none that ended is kept for it.
@@ -1807,274 +1705,6 @@ impl Uring {
         if self.buffers.len() < SPARES && buffer.len() == PIPE {
             self.buffers.push(buffer);
         }
-    }
-
-    /// An empty buffer for names, kept from a write or rename that ended where there is one.
-    fn path(&mut self) -> Vec<u8> {
-        // alloc: a buffer of names, where none that ended is kept for it.
-        self.paths.pop().unwrap_or_else(|| Vec::with_capacity(2 * libc::PATH_MAX as usize))
-    }
-
-    /// What a request that ended held, let go: the file it used, its buffers kept for the next,
-    /// a spawn's part ended, a connection's use.
-    fn ended(&mut self, tag: Tag, op: Op) {
-        match op {
-            Op::Read { file, .. } | Op::Append { file, .. } | Op::Sync { file } => unkeep(&mut self.kept, file),
-            Op::Write { names, .. } | Op::Rename { names, .. } => self.give_back_path(names),
-            Op::Watch { watch } => {
-                let Watching { tree, buffer, mut flushes, .. } =
-                    self.watchings.remove(watch).expect("a watch's read's watching");
-                self.give_back(buffer);
-                let spare = tree.end();
-                if self.trees.len() < SPARES {
-                    flushes.clear();
-                    self.trees.push((spare, flushes));
-                }
-            }
-            Op::Exit { spawn, .. } => self.part_ended(spawn),
-            Op::Output { spawn, fd, buffer, .. } => {
-                // Closes the pipe before the process is reaped.
-                drop(fd);
-                self.give_back(buffer);
-                self.part_ended(spawn);
-            }
-            Op::Input { spawn, fd, .. } => {
-                drop(fd);
-                self.part_ended(spawn);
-            }
-            Op::Recv { conn } => {
-                self.release(conn);
-                self.deliver(conn);
-            }
-            Op::Send { conn, .. } | Op::Shutdown { conn } => self.release(conn),
-            Op::WriteAt { direct, buffer, .. } => {
-                self.direct_writes += u64::from(direct);
-                if let Some(buffer) = buffer {
-                    self.unbuffer(buffer);
-                }
-            }
-            Op::Cancel { .. } | Op::Accept { .. } | Op::Connect { .. } | Op::Wake { .. } => {}
-            Op::Stepping => unreachable!("{tag:?}: a request ended while it was stepped"),
-        }
-    }
-
-    /// The requests the request `id` is, as it now stands, into `sqes`: one, or each link of
-    /// a chain. How many.
-    fn sqes(&self, id: Id, sqes: &mut [Sqe; WRITE_LINKS]) -> usize {
-        let pending = self.pending.get(id).expect("a request in flight");
-        let user_data = data(id, 0);
-        let kept = |file: &Handle<Kept>| self.kept.get(*file).expect("held by its request").fixed.target();
-        let socket = |conn: &Conn| self.conns.get(conn_of(*conn)).expect("used by its request").socket.target();
-        // SAFETY of the kernel's reads and writes: every buffer and address below stays where
-        // it is until the request's completion (see `Op`).
-        sqes[0] = match &pending.op {
-            Op::Read { file, at, bytes, got } => {
-                let (fd, flags) = kept(file);
-                Sqe {
-                    opcode: OP_READ,
-                    flags,
-                    fd,
-                    off: at + *got as u64,
-                    addr: bytes[*got..].as_ptr() as u64,
-                    len: (bytes.len() - got).min(u32::MAX as usize) as u32,
-                    user_data,
-                    ..Sqe::default()
-                }
-            }
-            Op::Append { file, bytes, put } => {
-                let (fd, flags) = kept(file);
-                Sqe {
-                    opcode: OP_WRITE,
-                    flags,
-                    fd,
-                    // The file's position, which is its end: it is open for appending.
-                    off: u64::MAX,
-                    addr: bytes[*put..].as_ptr() as u64,
-                    len: (bytes.len() - put).min(u32::MAX as usize) as u32,
-                    user_data,
-                    ..Sqe::default()
-                }
-            }
-            Op::WriteAt { fd, at, bytes, put, direct: true, buffer } => {
-                let buffer = buffer.expect("a registered buffer, given before it is queued");
-                let piece = (bytes.len() - put).min(DIRECT_PIECE);
-                let to = self.registered.at(buffer);
-                // SAFETY: the buffer is this request's alone, `DIRECT_PIECE` long, and the
-                // kernel reads it only for this request, which it is not given before this.
-                unsafe { ptr::copy_nonoverlapping(bytes[*put..].as_ptr(), to, piece) };
-                Sqe {
-                    opcode: OP_WRITE_FIXED,
-                    fd: fd.as_raw_fd(),
-                    off: at + *put as u64,
-                    addr: to as u64,
-                    len: piece as u32,
-                    buf_index: buffer,
-                    user_data,
-                    ..Sqe::default()
-                }
-            }
-            Op::WriteAt { fd, at, bytes, put, .. } => Sqe {
-                opcode: OP_WRITE,
-                fd: fd.as_raw_fd(),
-                off: at + *put as u64,
-                addr: bytes[*put..].as_ptr() as u64,
-                len: (bytes.len() - put).min(u32::MAX as usize) as u32,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Sync { file } => {
-                let (fd, flags) = kept(file);
-                Sqe { opcode: OP_FSYNC, flags, fd, user_data, ..Sqe::default() }
-            }
-            Op::Write { fd, dir, bytes, put, names, to, .. } => {
-                let fd = fd.as_raw_fd();
-                sqes[1] =
-                    Sqe { opcode: OP_FSYNC, flags: SQE_IO_LINK, fd, user_data: data(id, 1), ..Sqe::default() };
-                sqes[2] = rename(names, *to, SQE_IO_LINK, data(id, 2));
-                sqes[3] = Sqe { opcode: OP_FSYNC, fd: dir.as_raw_fd(), user_data: data(id, 3), ..Sqe::default() };
-                sqes[0] = Sqe {
-                    opcode: OP_WRITE,
-                    flags: SQE_IO_LINK,
-                    fd,
-                    off: *put as u64,
-                    addr: bytes[*put..].as_ptr() as u64,
-                    len: (bytes.len() - put).min(u32::MAX as usize) as u32,
-                    user_data,
-                    ..Sqe::default()
-                };
-                return WRITE_LINKS;
-            }
-            Op::Rename { names, to, dirs, .. } => {
-                let count = dirs.iter().flatten().count();
-                for (n, dir) in dirs.iter().flatten().enumerate() {
-                    let flags = if n + 1 < count { SQE_IO_LINK } else { 0 };
-                    sqes[1 + n] = Sqe {
-                        opcode: OP_FSYNC,
-                        flags,
-                        fd: dir.as_raw_fd(),
-                        user_data: data(id, 1 + n),
-                        ..Sqe::default()
-                    };
-                }
-                sqes[0] = rename(names, *to, if count == 0 { 0 } else { SQE_IO_LINK }, user_data);
-                return 1 + count;
-            }
-            Op::Watch { watch } => {
-                let watching = self.watchings.get(*watch).expect("a watch's read's watching");
-                Sqe {
-                    opcode: OP_READ,
-                    fd: watching.tree.raw(),
-                    off: u64::MAX,
-                    addr: watching.buffer.as_ptr() as u64,
-                    len: watching.buffer.len() as u32,
-                    user_data,
-                    ..Sqe::default()
-                }
-            }
-            Op::Cancel { target } => Sqe {
-                opcode: OP_ASYNC_CANCEL,
-                fd: -1,
-                addr: *target,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Exit { pidfd, .. } => Sqe {
-                opcode: OP_POLL_ADD,
-                fd: *pidfd,
-                op_flags: libc::POLLIN as u32,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Output { fd, buffer, .. } => Sqe {
-                opcode: OP_READ,
-                fd: fd.as_raw_fd(),
-                // A pipe has no position.
-                off: u64::MAX,
-                addr: buffer.as_ptr() as u64,
-                len: buffer.len() as u32,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Input { fd, bytes, put, .. } => Sqe {
-                opcode: OP_WRITE,
-                fd: fd.as_raw_fd(),
-                off: u64::MAX,
-                addr: bytes[*put..].as_ptr() as u64,
-                len: (bytes.len() - put).min(u32::MAX as usize) as u32,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Accept { listener, .. } => Sqe {
-                opcode: OP_ACCEPT,
-                ioprio: ACCEPT_MULTISHOT,
-                fd: listener.fd(),
-                op_flags: libc::SOCK_CLOEXEC as u32,
-                // Into a slot of the kernel's half of the table, which the completion names.
-                splice_fd_in: FILE_INDEX_ALLOC as i32,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Connect { socket, at, .. } => {
-                let (fd, flags) = socket.as_ref().expect("a connect's socket").target();
-                Sqe {
-                    opcode: OP_CONNECT,
-                    flags,
-                    fd,
-                    addr: &raw const at.storage as u64,
-                    // The address's length.
-                    off: u64::from(at.len),
-                    user_data,
-                    ..Sqe::default()
-                }
-            }
-            Op::Recv { conn } => {
-                let (fd, flags) = socket(conn);
-                Sqe {
-                    opcode: OP_RECV,
-                    flags: flags | SQE_BUFFER_SELECT,
-                    ioprio: RECV_MULTISHOT,
-                    fd,
-                    buf_index: RECV_GROUP,
-                    user_data,
-                    ..Sqe::default()
-                }
-            }
-            Op::Send { conn, bytes, put } => {
-                let (fd, flags) = socket(conn);
-                Sqe {
-                    opcode: OP_SEND,
-                    flags,
-                    fd,
-                    addr: bytes[*put..].as_ptr() as u64,
-                    len: (bytes.len() - put).min(u32::MAX as usize) as u32,
-                    op_flags: libc::MSG_NOSIGNAL as u32,
-                    user_data,
-                    ..Sqe::default()
-                }
-            }
-            Op::Shutdown { conn } => {
-                let (fd, flags) = socket(conn);
-                Sqe {
-                    opcode: OP_SHUTDOWN,
-                    flags,
-                    fd,
-                    len: libc::SHUT_RDWR as u32,
-                    user_data,
-                    ..Sqe::default()
-                }
-            }
-            Op::Wake { fd, count } => Sqe {
-                opcode: OP_READ,
-                fd: *fd,
-                off: u64::MAX,
-                addr: count.get() as u64,
-                len: 8,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Stepping => unreachable!("a request asked while it is stepped"),
-        };
-        1
     }
 
     /// Whether `WriteAt` of `len` bytes at `at` through `fd` bypasses the page cache, `fd`
@@ -2141,18 +1771,6 @@ impl Uring {
         Ok(())
     }
 
-    /// Work for the effect `tag` was handed off the ring: the ring reads its wake until every
-    /// such work's completion is in.
-    fn offloaded(&mut self, tag: Tag) {
-        self.offload.out += 1;
-        if self.offload.reading.is_none() {
-            let fd = self.offload.wake.as_raw_fd();
-            let count = Rc::clone(&self.offload.count);
-            let id = self.start(tag, Op::Wake { fd, count });
-            self.offload.reading = Some(id);
-        }
-    }
-
     /// The [`Stampers`], started for the first sweep or listing.
     fn make_stampers(&mut self) -> io::Result<()> {
         if self.stampers.is_none() {
@@ -2204,522 +1822,10 @@ impl Uring {
         }
     }
 
-    fn flush_waiting(&mut self) {
-        let mut sqes = [Sqe::default(); WRITE_LINKS];
-        while let Some(&id) = self.waiting.front() {
-            if !self.pending.contains(id) {
-                self.waiting.pop_front();
-                continue;
-            }
-            let n = self.sqes(id, &mut sqes);
-            if !self.ring.push(&sqes[..n]) {
-                break;
-            }
-            self.waiting.pop_front();
-        }
-    }
-
-    fn submit_ring(&mut self) {
-        if self.ring.unsubmitted > 0
-            && let Err(error) = self.ring.enter(None)
-        {
-            self.fail_unsubmitted(error);
-        }
-    }
-
-    /// The ring takes no more requests: every effect in flight fails. What the kernel may
-    /// still hold of them stays in its slot, abandoned, never freed, and so do the watches,
-    /// spawns' pipes and connections their buffers and files are.
-    fn fail_unsubmitted(&mut self, error: io::Error) {
-        // alloc: clone: the error path, once, when the ring dies.
-        let why = format!("the ring failed: {error}");
-        // clone: the error path, once per effect in flight.
-        let failed = |tag| Completion { tag, done: Done::Failed(IoError(why.clone())) };
-        for (_, pending) in self.pending.iter_mut().filter(|(_, it)| !it.abandoned) {
-            pending.abandoned = true;
-            match &mut pending.op {
-                Op::Watch { watch } => {
-                    let watching = self.watchings.get_mut(*watch).expect("a watch's read's watching");
-                    self.ready.extend(watching.flushes.drain(..).map(failed));
-                    self.ready.push(failed(pending.tag));
-                }
-                // A spawn fails once, below; work off the ring still completes through its
-                // thread; a receive's effects fail with their connection's, below.
-                Op::Cancel { .. }
-                | Op::Exit { .. }
-                | Op::Output { .. }
-                | Op::Input { .. }
-                | Op::Recv { .. }
-                | Op::Wake { .. } => {}
-                // The kernel may still read its bytes: they stay in the slot, abandoned, and an
-                // empty buffer comes back in their place.
-                Op::Send { .. } => {
-                    let done = Done::unsent(Vec::new(), &why); // alloc: none, an empty `Vec`.
-                    self.ready.push(Completion { tag: pending.tag, done });
-                }
-                _ => self.ready.push(failed(pending.tag)),
-            }
-        }
-        // Timers need no ring, but end with it as everything in flight does.
-        self.timers.drain(|_, tag| self.ready.push(failed(tag)));
-        // alloc: the error path, once.
-        let mut spawns: Vec<(u64, Handle<Spawning>)> = self.spawning.drain().map(|(tag, it)| (tag.0, it)).collect();
-        radix::sort_copy_by_key(&mut spawns, |it| it.0);
-        for (_, spawn) in spawns {
-            let mut spawn = self.spawns.remove(spawn).expect("in flight");
-            if !spawn.exited {
-                _ = kill(spawn.pidfd.as_raw_fd());
-            }
-            spawn.failed = Some(why.clone()); // clone: the error path.
-            let tag = spawn.tag;
-            self.ready.push(Completion { tag, done: spawn.end() });
-        }
-        for (_, conn) in self.conns.iter_mut() {
-            for (tag, _, into) in conn.recvs.drain(..) {
-                self.ready.push(Completion { tag, done: Done::unread(into, &why) });
-            }
-            conn.receiving = None;
-        }
-        self.watches.clear();
-        self.listens.clear();
-        self.offload.reading = None;
-        self.waiting.clear();
-        self.for_buffers.clear();
-        self.ring.unsubmitted = 0;
-    }
-
-    /// Takes the completion whose `user_data` is `user_data`: its effect's completion, or the
-    /// rest of it asked for. With [`CQE_F_MORE`] in `flags` the kernel still holds the
-    /// request (a multishot one), so it is kept and not asked again.
-    ///
-    /// A completion whose handle is stale (its request ended, its slot empty or another's since:
-    /// a read cancelled after it completed, a request let go when the ring failed) is dropped,
-    /// as is one of a request abandoned in place.
-    fn completed(&mut self, user_data: u64, res: i32, flags: u32) {
-        let (id, link) = of_data(user_data);
-        let Some(pending) = self.pending.get_mut(id) else { return };
-        if pending.abandoned {
-            return;
-        }
-        let tag = pending.tag;
-        let more = flags & CQE_F_MORE != 0;
-        // Moves nothing the kernel may still read (see `Op`).
-        let mut op = std::mem::replace(&mut pending.op, Op::Stepping);
-        let step = self.step(tag, &mut op, link, res, flags);
-        let again = |this: &mut Uring, op: Op| {
-            this.pending.get_mut(id).expect("kept while stepped").op = op;
-            if !more {
-                this.queue(id);
-            }
-        };
-        match step {
-            Step::Again => again(self, op),
-            Step::Goes(done) => {
-                self.ready.push(Completion { tag, done });
-                again(self, op);
-            }
-            Step::Held => self.pending.get_mut(id).expect("kept while stepped").op = op,
-            Step::Ends(done) => {
-                if let Some(done) = done {
-                    self.ready.push(Completion { tag, done });
-                }
-                self.pending.remove(id);
-                self.ended(tag, op);
-            }
-        }
-    }
-
-    /// What the result `res` of link `link` of a request of the effect `tag` means for it.
-    fn step(&mut self, tag: Tag, op: &mut Op, link: usize, res: i32, flags: u32) -> Step {
-        // alloc: called only for a request that failed.
-        let error = |res: i32| io::Error::from_raw_os_error(-res).to_string();
-        let failed = |res: i32| Some(Done::Failed(IoError(error(res))));
-        let more = flags & CQE_F_MORE != 0;
-        match op {
-            Op::Cancel { .. } => Step::Ends(None),
-            Op::Read { bytes, got, .. } => {
-                if res < 0 {
-                    return Step::Ends(failed(res));
-                }
-                *got += res as usize;
-                if res > 0 && *got < bytes.len() {
-                    return Step::Again;
-                }
-                let mut bytes = std::mem::take(bytes);
-                bytes.truncate(*got);
-                Step::Ends(Some(Done::Read(bytes)))
-            }
-            Op::Append { bytes, put, .. } => {
-                if res < 0 {
-                    return Step::Ends(failed(res));
-                }
-                *put += res as usize;
-                match (*put < bytes.len(), res) {
-                    (false, _) => Step::Ends(Some(Done::Appended)),
-                    (true, 0) => Step::Ends(failed(-libc::EIO)),
-                    (true, _) => Step::Again,
-                }
-            }
-            Op::WriteAt { bytes, put, .. } => {
-                if res < 0 {
-                    return Step::Ends(failed(res));
-                }
-                *put += res as usize;
-                match (*put < bytes.len(), res) {
-                    (false, _) => Step::Ends(Some(Done::Written)),
-                    (true, 0) => Step::Ends(failed(-libc::EIO)),
-                    (true, _) => Step::Again,
-                }
-            }
-            Op::Sync { .. } if res < 0 => Step::Ends(failed(res)),
-            Op::Sync { .. } => Step::Ends(Some(Done::Synced)),
-            Op::Write { bytes, put, names, file, chain, .. } => {
-                let Some([wrote, synced, renamed, dir]) = chain.take(link, res, WRITE_LINKS) else {
-                    return Step::Held;
-                };
-                // A short write breaks the chain; the rest is asked again, with the links
-                // after it.
-                if wrote > 0 && *put + (wrote as usize) < bytes.len() {
-                    *put += wrote as usize;
-                    return Step::Again;
-                }
-                self.forget(file);
-                let wrote = if wrote == 0 && *put < bytes.len() { -libc::EIO } else { wrote };
-                match [wrote, synced, renamed].into_iter().find(|it| *it < 0) {
-                    // The temporary was never renamed: the old file is as it was.
-                    Some(res) => {
-                        // SAFETY: the temporary's path, NUL-terminated, at the start of `names`.
-                        unsafe { libc::unlink(names.as_ptr().cast()) };
-                        Step::Ends(failed(res))
-                    }
-                    None if dir < 0 => Step::Ends(failed(dir)),
-                    None => Step::Ends(Some(Done::Written)),
-                }
-            }
-            Op::Rename { dirs, chain, .. } => {
-                let links = 1 + dirs.len();
-                let Some(results) = chain.take(link, res, links) else { return Step::Held };
-                match results[..links].iter().find(|it| **it < 0) {
-                    Some(&res) => Step::Ends(failed(res)),
-                    None => Step::Ends(Some(Done::Renamed)),
-                }
-            }
-            Op::Watch { watch } => {
-                let Uring { watchings, ready, watches, .. } = self;
-                let Watching { tree, buffer, stopping, flushes, journal } =
-                    watchings.get_mut(*watch).expect("a watch's read's watching");
-                match res {
-                    // Cancelled for a flush, or by a flush's cancel that came after the read it
-                    // was for.
-                    _ if res == -libc::ECANCELED && !*stopping => {
-                        flushed(ready, tag, tree, buffer, flushes, journal.as_ref());
-                        Step::Again
-                    }
-                    _ if res == -libc::ECANCELED || (res < 0 && *stopping) => {
-                        watches.remove(&tag);
-                        unflushed(ready, flushes);
-                        Step::Ends(Some(Done::Unwatched))
-                    }
-                    1.. => {
-                        let done = told(journal.as_ref(), tree.take(&buffer[..res as usize]));
-                        ready.push(Completion { tag, done });
-                        if !*stopping {
-                            flushed(ready, tag, tree, buffer, flushes, journal.as_ref());
-                            return Step::Again;
-                        }
-                        // The read was done before the cancel reached it: this change, then the
-                        // end.
-                        watches.remove(&tag);
-                        unflushed(ready, flushes);
-                        Step::Ends(Some(Done::Unwatched))
-                    }
-                    _ => {
-                        watches.remove(&tag);
-                        unflushed(ready, flushes);
-                        Step::Ends(failed(if res < 0 { res } else { -libc::EIO }))
-                    }
-                }
-            }
-            Op::Exit { spawn, .. } => {
-                if res < 0 {
-                    self.spoil(*spawn, format!("waiting for its exit: {}", error(res))); // alloc: an error.
-                } else if let Some(spawn) = self.spawns.get_mut(*spawn) {
-                    spawn.exited = true;
-                }
-                Step::Ends(None)
-            }
-            Op::Output { spawn, buffer, stderr, .. } => {
-                if res > 0 {
-                    if let Some(spawn) = self.spawns.get_mut(*spawn) {
-                        let to = if *stderr { &mut spawn.stderr } else { &mut spawn.stdout };
-                        // alloc: the spawn's own output, grown as it comes.
-                        to.extend_from_slice(&buffer[..res as usize]);
-                    }
-                    return Step::Again;
-                }
-                if res < 0 {
-                    let pipe = if *stderr { "stderr" } else { "stdout" };
-                    self.spoil(*spawn, format!("reading its {pipe}: {}", error(res))); // alloc: an error.
-                }
-                Step::Ends(None)
-            }
-            Op::Input { spawn, bytes, put, .. } => {
-                // It ended, or closed its input, before reading all of it.
-                if res == -libc::EPIPE {
-                    return Step::Ends(None);
-                }
-                if res < 0 || (res == 0 && *put < bytes.len()) {
-                    let why = if res < 0 { error(res) } else { error(-libc::EIO) };
-                    self.spoil(*spawn, format!("writing its input: {why}")); // alloc: an error.
-                    return Step::Ends(None);
-                }
-                *put += res as usize;
-                match *put < bytes.len() {
-                    true => Step::Again,
-                    false => Step::Ends(None),
-                }
-            }
-            Op::Accept { stopping, .. } => {
-                if res >= 0 {
-                    let socket = self.table.accepted(res as u32);
-                    let conn = self.add(socket);
-                    let done = Done::Accepted { conn };
-                    // Stopping, it ends only at the completion that says the kernel let go of
-                    // it: until then it may accept more.
-                    if !*stopping || more {
-                        return Step::Goes(done);
-                    }
-                    self.listens.remove(&tag);
-                    self.ready.push(Completion { tag, done });
-                    return Step::Ends(Some(Done::Unlistened));
-                }
-                if more {
-                    // The kernel goes on accepting with it: it has not ended.
-                    return Step::Held;
-                }
-                if res == -libc::ECANCELED || *stopping {
-                    self.listens.remove(&tag);
-                    return Step::Ends(Some(Done::Unlistened));
-                }
-                if res == -libc::ENFILE {
-                    self.listens.remove(&tag);
-                    // alloc: an error.
-                    let why = format!(
-                        "{}: every one of the {} slots the ring's table of files keeps for \
-                         accepted connections is in use",
-                        error(res),
-                        self.table.ours
-                    );
-                    return Step::Ends(Some(Done::Failed(IoError(why))));
-                }
-                // A connection that went before it was taken, or the network's errors that
-                // accept(2) says to take as "try again".
-                let again = [
-                    libc::ECONNABORTED,
-                    libc::EINTR,
-                    libc::EPROTO,
-                    libc::ENETDOWN,
-                    libc::ENOPROTOOPT,
-                    libc::EHOSTDOWN,
-                    libc::ENONET,
-                    libc::EHOSTUNREACH,
-                    libc::EOPNOTSUPP,
-                    libc::ENETUNREACH,
-                ];
-                if again.contains(&-res) {
-                    return Step::Again;
-                }
-                self.listens.remove(&tag);
-                Step::Ends(failed(res))
-            }
-            Op::Connect { socket, .. } => {
-                if res < 0 {
-                    return Step::Ends(failed(res));
-                }
-                let socket = socket.take().expect("a connect's socket");
-                let conn = self.add(socket);
-                Step::Ends(Some(Done::Connected { conn }))
-            }
-            Op::Recv { conn } => {
-                let conn = *conn;
-                if flags & CQE_F_BUFFER != 0 {
-                    let bid = (flags >> CQE_BUFFER_SHIFT) as u16;
-                    if res > 0
-                        && let Some(connection) = self.conns.get_mut(conn_of(conn))
-                        && !connection.hung
-                    {
-                        connection.inbox.extend(self.provided.bytes(bid, res as usize));
-                    }
-                    self.provided.give(bid);
-                }
-                let Some(connection) = self.conns.get_mut(conn_of(conn)) else {
-                    return if more { Step::Held } else { Step::Ends(None) };
-                };
-                if !more {
-                    connection.receiving = None;
-                    connection.pausing = false;
-                    match res {
-                        // The peer hung up, or reset it: as good as hung up, for a reader.
-                        0 => connection.ended = Some(Ok(())),
-                        _ if res == -libc::ECONNRESET => connection.ended = Some(Ok(())),
-                        // Out of buffers, or paused: armed again once it is wanted.
-                        _ if res == -libc::ENOBUFS || res == -libc::ECANCELED || res > 0 => {}
-                        _ => connection.ended = Some(Err(error(res))),
-                    }
-                    return Step::Ends(None);
-                }
-                let pause = connection.inbox.len() >= INBOX && !connection.pausing;
-                if pause {
-                    connection.pausing = true;
-                    let id = connection.receiving.expect("an armed receive");
-                    self.start(NOBODYS, Op::Cancel { target: data(id, 0) });
-                }
-                self.deliver(conn);
-                Step::Held
-            }
-            Op::Wake { .. } => {
-                self.take_offloaded();
-                if res >= 0 && self.offload.out > 0 {
-                    return Step::Again;
-                }
-                // Nothing more is off the ring, or the read failed: what is still out is taken
-                // in at the polls that follow, and the next work off the ring reads again.
-                self.offload.reading = None;
-                Step::Ends(None)
-            }
-            Op::Send { bytes, put, .. } => {
-                // Its bytes are the asker's again once the send ends: the kernel reads them no more.
-                let unsent = |bytes: &mut Vec<u8>, res: i32| {
-                    Step::Ends(Some(Done::unsent(std::mem::take(bytes), io::Error::from_raw_os_error(-res))))
-                };
-                if res < 0 {
-                    return unsent(bytes, res);
-                }
-                *put += res as usize;
-                match (*put < bytes.len(), res) {
-                    (false, _) => {
-                        bytes.clear();
-                        Step::Ends(Some(Done::Sent(std::mem::take(bytes))))
-                    }
-                    (true, 0) => unsent(bytes, -libc::EIO),
-                    (true, _) => Step::Again,
-                }
-            }
-            Op::Shutdown { .. } if res < 0 && res != -libc::ENOTCONN => Step::Ends(failed(res)),
-            Op::Shutdown { .. } => Step::Ends(Some(Done::HungUp)),
-        }
-    }
-
-    fn reap(&mut self) {
-        self.take_offloaded();
-        let mut posted = std::mem::take(&mut self.posted);
-        self.ring.reap(|user_data, res, flags| posted.push((user_data, res, flags)));
-        for (user_data, res, flags) in posted.drain(..) {
-            self.completed(user_data, res, flags);
-        }
-        self.posted = posted;
-        self.flush_waiting();
-        self.submit_ring();
-    }
-
-    /// Stops the watch or listen whose request is `id`: through the ring, or here if the
-    /// request has not reached the kernel yet.
-    fn stop(&mut self, id: Id) {
-        let Some(pending) = self.pending.get_mut(id) else { return };
-        let stopping = match &mut pending.op {
-            Op::Watch { watch } => &mut self.watchings.get_mut(*watch).expect("a watch's read's watching").stopping,
-            Op::Accept { stopping, .. } => stopping,
-            _ => unreachable!("a watch's or a listen's request"),
-        };
-        if std::mem::replace(stopping, true) {
-            return;
-        }
-        let tag = pending.tag;
-        let Some(at) = self.waiting.iter().position(|&it| it == id) else {
-            self.start(tag, Op::Cancel { target: data(id, 0) });
-            return;
-        };
-        self.waiting.remove(at);
-        let pending = self.pending.remove(id).expect("in flight");
-        let done = match &pending.op {
-            Op::Watch { watch } => {
-                self.watches.remove(&tag);
-                let watching = self.watchings.get_mut(*watch).expect("a watch's read's watching");
-                unflushed(&mut self.ready, &mut watching.flushes);
-                Done::Unwatched
-            }
-            _ => {
-                self.listens.remove(&tag);
-                Done::Unlistened
-            }
-        };
-        self.ready.push(Completion { tag, done });
-        self.ended(tag, pending.op);
-    }
-
-    /// Asks the watch `watch` for the flush `tag`. Its read, run by the ring's kernel thread,
-    /// would race a read of the descriptor here, so a read in the kernel is cancelled and the
-    /// flush answered once its completion is in ([`flushed`]); a read still waiting for room
-    /// in the ring reads nothing, so the descriptor is drained now.
-    fn flush(&mut self, watch: Tag, tag: Tag) -> io::Result<()> {
-        let Some(&id) = self.watches.get(&watch) else {
-            // alloc: an error path.
-            return Err(io::Error::other(format!("nothing is watched as {watch:?}")));
-        };
-        let waiting = self.waiting.contains(&id);
-        let Some(Pending { op: Op::Watch { watch: watching }, .. }) = self.pending.get(id) else {
-            unreachable!("a watch's request")
-        };
-        let Watching { tree, buffer, stopping, flushes, journal } =
-            self.watchings.get_mut(*watching).expect("a watch's read's watching");
-        if *stopping {
-            return Err(io::Error::other("the watch ended before the flush"));
-        }
-        if waiting {
-            flushes.push(tag);
-            flushed(&mut self.ready, watch, tree, buffer, flushes, journal.as_ref());
-            return Ok(());
-        }
-        flushes.push(tag);
-        if flushes.len() == 1 {
-            self.start(watch, Op::Cancel { target: data(id, 0) });
-        }
-        Ok(())
-    }
-
     /// An effect that fails as it is submitted, with no request of its own to end.
     fn refuse(&mut self, tag: Tag, why: String) {
         self.in_flight += 1;
         self.ready.push(Completion { tag, done: Done::Failed(IoError(why)) });
-    }
-
-    fn spawn(&mut self, tag: Tag, command: Box<Command>) -> io::Result<()> {
-        let crate::process::Started { pid, pidfd, stdin, stdout, stderr, mut finish } =
-            crate::process::start(&self.root, command, self.confine.as_ref())?;
-        let input = std::mem::take(&mut finish.command.stdin);
-        let exit = pidfd.as_raw_fd();
-        let parts = 3 + usize::from(stdin.is_some());
-        let spawn = self.spawns.insert(Spawning {
-            tag,
-            pid,
-            pidfd,
-            finish,
-            stdout: Vec::new(), // alloc: empty until the process writes; the spawn's own output.
-            stderr: Vec::new(), // alloc: empty until the process writes; the spawn's own output.
-            parts,
-            exited: false,
-            failed: None,
-        });
-        self.spawning.insert(tag, spawn);
-        self.start(tag, Op::Exit { spawn, pidfd: exit });
-        let buffer = self.buffer();
-        self.start(tag, Op::Output { spawn, fd: stdout, buffer, stderr: false });
-        let buffer = self.buffer();
-        self.start(tag, Op::Output { spawn, fd: stderr, buffer, stderr: true });
-        if let Some(fd) = stdin {
-            self.start(tag, Op::Input { spawn, fd, bytes: input, put: 0 });
-        }
-        Ok(())
     }
 
     /// A request of `spawn` ended; once all have, it completes.
@@ -2754,26 +1860,12 @@ impl Uring {
         }
     }
 
-    fn add(&mut self, socket: Fixed) -> Conn {
-        let conn = self.conns.insert(Connection {
-            socket,
-            users: 0,
-            hung: false,
-            inbox: VecDeque::new(), // alloc: empty until it receives; grown once and reused.
-            recvs: VecDeque::new(), // alloc: empty until it is asked; grown once and reused.
-            receiving: None,
-            pausing: false,
-            ended: None,
-        });
-        Conn(conn.to_bits())
-    }
-
-    /// `conn`, used by one more request until [`Uring::release`] says it ended; `false` for one
-    /// that names nothing or is hung up, which nothing more uses.
-    fn use_conn(&mut self, conn: Conn) -> bool {
-        let Some(connection) = self.conns.get_mut(conn_of(conn)).filter(|it| !it.hung) else { return false };
+    /// `conn`, used by one more request until [`Uring::release`] says it ended, and whether it
+    /// is TCP's; `None` for one that names nothing or is hung up, which nothing more uses.
+    fn use_conn(&mut self, conn: Conn) -> Option<bool> {
+        let connection = self.conns.get_mut(conn_of(conn)).filter(|it| !it.hung)?;
         connection.users += 1;
-        true
+        Some(connection.tcp)
     }
 
     fn release(&mut self, conn: Conn) {
@@ -2795,241 +1887,9 @@ impl Uring {
         self.deliver(conn);
     }
 
-    /// Hands `conn`'s waiting `Recv`s what its inbox holds, or its end, and arms its receive
-    /// where one waits for bytes not yet taken.
-    fn deliver(&mut self, conn: Conn) {
-        let Some(connection) = self.conns.get_mut(conn_of(conn)) else { return };
-        while let Some((tag, most, into)) = connection.recvs.front_mut() {
-            let (tag, most) = (*tag, *most);
-            let done = match &connection.ended {
-                _ if most == 0 => Done::Read(std::mem::take(into)),
-                _ if !connection.inbox.is_empty() => {
-                    let n = most.min(RECV_MOST).min(connection.inbox.len());
-                    let (front, back) = connection.inbox.as_slices();
-                    let split = front.len().min(n);
-                    // alloc: none once the asker's buffer has room for `n` more.
-                    into.extend_from_slice(&front[..split]);
-                    into.extend_from_slice(&back[..n - split]);
-                    connection.inbox.drain(..n);
-                    Done::Read(std::mem::take(into))
-                }
-                Some(Ok(())) => Done::Read(std::mem::take(into)),
-                Some(Err(why)) => Done::unread(std::mem::take(into), why),
-                None => break,
-            };
-            connection.recvs.pop_front();
-            self.ready.push(Completion { tag, done });
-        }
-        let arm = connection.receiving.is_none()
-            && connection.ended.is_none()
-            && !connection.hung
-            && !connection.recvs.is_empty()
-            && connection.inbox.len() < INBOX;
-        if !arm {
-            return;
-        }
-        connection.users += 1;
-        let id = self.start(NOBODYS, Op::Recv { conn });
-        if let Some(connection) = self.conns.get_mut(conn_of(conn)) {
-            connection.receiving = Some(id);
-        }
-    }
-
-    /// Shuts `conn` both ways through the ring, its waiting receives answered empty, and lets
-    /// it go once nothing in flight uses it.
-    fn hang_up(&mut self, conn: Conn, tag: Tag) -> io::Result<()> {
-        let connection = self.conns.get_mut(conn_of(conn)).filter(|it| !it.hung).ok_or_else(|| gone(conn))?;
-        connection.hung = true;
-        connection.inbox.clear();
-        connection.users += 1;
-        let receiving = connection.receiving;
-        for (tag, _, into) in connection.recvs.drain(..) {
-            self.ready.push(Completion { tag, done: Done::Read(into) });
-        }
-        if let Some(id) = receiving {
-            self.start(NOBODYS, Op::Cancel { target: data(id, 0) });
-        }
-        self.start(tag, Op::Shutdown { conn });
-        Ok(())
-    }
-
-    /// Starts [`Effect::Write`] `tag` of `bytes` over `file`: its temporary made next to it,
-    /// and the chain that writes, syncs and renames it over the file asked.
-    fn write(&mut self, tag: Tag, file: FileName, bytes: Vec<u8>) -> io::Result<()> {
-        let mut names = self.path();
-        let made = under(&self.root, &file, |path| {
-            crate::fs::make_parent(path)?;
-            push_temporary(&mut names, path)?;
-            let to = push_c(&mut names, path)?;
-            let dir = open_dir_of(path)?;
-            let temporary = CStr::from_bytes_with_nul(&names[..to]).expect("NUL-terminated as pushed");
-            Ok::<_, io::Error>((to, dir, create(temporary)?))
-        });
-        let (to, dir, fd) = match made {
-            Ok(it) => it,
-            Err(error) => {
-                self.give_back_path(names);
-                return Err(error);
-            }
-        };
-        self.start(tag, Op::Write { fd, dir, bytes, put: 0, names, to, file, chain: Chain::default() });
-        Ok(())
-    }
-
-    /// Starts [`Effect::Rename`] `tag` of `from` over `to`, linked to the syncs of the
-    /// directory of each.
-    fn rename(&mut self, tag: Tag, from: &FileName, to: &FileName) -> io::Result<()> {
-        self.forget(from);
-        self.forget(to);
-        let mut names = self.path();
-        let made = under(&self.root, from, |from| {
-            under(&self.root, to, |to| {
-                crate::fs::make_parent(to)?;
-                push_c(&mut names, from)?;
-                let at = push_c(&mut names, to)?;
-                let mut dirs = [Some(open_dir_of(to)?), None];
-                if from.parent() != to.parent() {
-                    dirs[1] = Some(open_dir_of(from)?);
-                }
-                Ok::<_, io::Error>((at, dirs))
-            })
-        });
-        let (at, dirs) = match made {
-            Ok(it) => it,
-            Err(error) => {
-                self.give_back_path(names);
-                return Err(error);
-            }
-        };
-        self.start(tag, Op::Rename { names, to: at, dirs, chain: Chain::default() });
-        Ok(())
-    }
-
-    /// A buffer of names kept for the next write or rename, where there is room.
-    fn give_back_path(&mut self, mut names: Vec<u8>) {
-        if self.paths.len() < SPARES {
-            names.clear();
-            self.paths.push(names);
-        }
-    }
-
-    /// Starts the watch `tag` of `dir`, into the tables of one that ended where there is one;
-    /// an [`Effect::Journal`]'s with `journal`.
-    fn watch(&mut self, tag: Tag, dir: FileName, journal: bool) -> io::Result<()> {
-        let (spare, flushes) = match self.trees.pop() {
-            Some((spare, flushes)) => (Some(spare), flushes),
-            None => (None, Vec::new()), // alloc: empty until a flush; kept for the next watch.
-        };
-        let tree = crate::watch::Tree::reusing(spare, &self.root, &dir, true)?;
-        let buffer = self.buffer();
-        let journal = journal.then_some(dir);
-        let watch = self.watchings.insert(Watching { tree, buffer, stopping: false, flushes, journal });
-        let id = self.start(tag, Op::Watch { watch });
-        self.watches.insert(tag, id);
-        Ok(())
-    }
-
     /// Writes that bypassed the page cache (`O_DIRECT`) and ended, since the driver was made.
     pub fn direct_writes(&self) -> u64 {
         self.direct_writes
-    }
-}
-
-/// The rename of the first of `names` over the second, which starts at `to`, each
-/// NUL-terminated and relative to the working directory.
-fn rename(names: &[u8], to: usize, flags: u8, user_data: u64) -> Sqe {
-    debug_assert!(to > 0 && names[to - 1] == 0 && names.last() == Some(&0));
-    Sqe {
-        opcode: OP_RENAMEAT,
-        flags,
-        fd: libc::AT_FDCWD,
-        addr: names.as_ptr() as u64,
-        // The new name's directory, and the new name.
-        len: libc::AT_FDCWD as u32,
-        off: names[to..].as_ptr() as u64,
-        user_data,
-        ..Sqe::default()
-    }
-}
-
-impl Drop for Uring {
-    /// Kills the processes of spawns in flight and takes back from the kernel every buffer
-    /// it was lent (every request cancelled, its completions waited for), so none is freed
-    /// while the kernel may still write into it. What it does not give back in time is leaked,
-    /// with the provided buffers its receives write into.
-    fn drop(&mut self) {
-        for (_, spawn) in self.spawns.iter() {
-            if !spawn.exited {
-                _ = kill(spawn.pidfd.as_raw_fd());
-            }
-        }
-        // Never handed to the kernel.
-        for id in std::mem::take(&mut self.waiting).into_iter().chain(std::mem::take(&mut self.for_buffers)) {
-            self.pending.remove(id);
-        }
-        let mut owed: FxHashMap<Id, usize> =
-            self.pending.iter().map(|(id, it)| (id, it.op.owed())).collect(); // alloc: drop, once.
-        let deadline = Instant::now() + LETTING_GO;
-        let mut posted = Vec::new(); // alloc: the driver's drop, once.
-        let cancel = Sqe {
-            opcode: OP_ASYNC_CANCEL,
-            fd: -1,
-            op_flags: ASYNC_CANCEL_ALL | ASYNC_CANCEL_ANY,
-            user_data: NOBODY,
-            ..Sqe::default()
-        };
-        let mut alive = true;
-        while alive && !self.pending.is_empty() && !self.ring.push(&[cancel]) {
-            alive = Instant::now() < deadline && self.ring.enter(None).is_ok();
-            self.ring.reap(|user_data, res, flags| posted.push((user_data, res, flags)));
-        }
-        while alive {
-            for (user_data, res, flags) in posted.drain(..) {
-                let (id, _) = of_data(user_data);
-                match self.pending.get(id).map(|it| &it.op) {
-                    // A connection the accept made after it was cancelled, let go here.
-                    Some(Op::Accept { .. }) if res >= 0 => _ = self.table.set(res as u32, -1),
-                    Some(Op::Recv { .. }) if flags & CQE_F_BUFFER != 0 => {
-                        self.provided.give((flags >> CQE_BUFFER_SHIFT) as u16);
-                    }
-                    _ => {}
-                }
-                // A multishot request the kernel still holds is not given back yet.
-                if flags & CQE_F_MORE == 0
-                    && let Some(left) = owed.get_mut(&id)
-                {
-                    *left -= 1;
-                    if *left == 0 {
-                        // A connection's or a spawn's request let go: what it used goes with
-                        // the driver below.
-                        self.pending.remove(id);
-                    }
-                }
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            let lent = self.pending.iter().any(|(_, it)| !matches!(it.op, Op::Cancel { .. }));
-            if !lent || left.is_zero() {
-                break;
-            }
-            alive = self.ring.enter(Some(left)).is_ok();
-            self.ring.reap(|user_data, res, flags| posted.push((user_data, res, flags)));
-        }
-        self.spawning.clear();
-        // alloc: the driver's drop, once.
-        let spawns: Vec<Handle<Spawning>> = self.spawns.iter().map(|(it, _)| it).collect();
-        for spawn in spawns {
-            _ = self.spawns.remove(spawn).expect("listed").end();
-        }
-        let lent = self.pending.iter().any(|(_, it)| !matches!(it.op, Op::Cancel { .. }));
-        if !lent {
-            // SAFETY: each dropped once, here; no request the kernel holds reads or writes into
-            // what they hold. Where one does, they are leaked with what it uses.
-            unsafe {
-                ManuallyDrop::drop(&mut self.provided);
-                ManuallyDrop::drop(&mut self.pending);
-                ManuallyDrop::drop(&mut self.watchings);
-            }
-        }
     }
 }
 
@@ -3143,40 +2003,6 @@ fn with_c<R>(path: &Path, f: impl FnOnce(&CStr) -> io::Result<R>) -> io::Result<
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))?;
         f(c)
     })
-}
-
-/// `path` NUL-terminated at the end of `into`; where it starts.
-fn push_c(into: &mut Vec<u8>, path: &Path) -> io::Result<usize> {
-    let at = into.len();
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.contains(&0) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"));
-    }
-    into.extend_from_slice(bytes);
-    into.push(0);
-    Ok(at)
-}
-
-/// A name next to `path`'s, at the end of `into` NUL-terminated, that no other write of this
-/// process or another uses, as [`crate::fs::temporary_next_to`] makes one.
-fn push_temporary(into: &mut Vec<u8>, path: &Path) -> io::Result<usize> {
-    let at = into.len();
-    if let Some(parent) = path.parent() {
-        into.extend_from_slice(parent.as_os_str().as_bytes());
-        if !parent.as_os_str().is_empty() {
-            into.push(b'/');
-        }
-    }
-    let leaf = path.file_name().map_or(&[][..], |it| it.as_bytes());
-    let n = TEMPORARY.fetch_add(1, Ordering::Relaxed);
-    into.push(b'.');
-    into.extend_from_slice(leaf);
-    write!(into, ".{}-{n}.tmp", std::process::id())?;
-    if into[at..].contains(&0) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"));
-    }
-    into.push(0);
-    Ok(at)
 }
 
 fn open(path: &Path, make: bool) -> io::Result<OwnedFd> {
@@ -3323,8 +2149,11 @@ impl Driver for Uring {
                         true => Ok(Some(Done::Written)),
                         false => {
                             let direct = self.direct(fd.as_raw_fd(), offset, bytes.len())?;
-                            let op = Op::WriteAt { fd, at: offset, bytes, put: 0, direct, buffer: None };
-                            self.start(tag, op);
+                            let mut hot = Hot::new(tag, Kind::WriteAt, 0);
+                            if direct {
+                                hot.flags |= ops::DIRECT;
+                            }
+                            self.start(hot, bytes, Cold { at: offset, fds: [Some(fd), None], ..Cold::EMPTY });
                             Ok(None)
                         }
                     })
@@ -3367,7 +2196,7 @@ impl Driver for Uring {
                             0 => Some(Done::Read(bytes)),
                             _ => {
                                 let file = self.hold(file);
-                                self.start(tag, Op::Read { file, at: 0, bytes, got: 0 });
+                                self.start(Hot::new(tag, Kind::Read, file.to_bits()), bytes, Cold::EMPTY);
                                 None
                             }
                         }
@@ -3379,8 +2208,9 @@ impl Driver for Uring {
                 },
                 Effect::Read { file, at, len, .. } => self.file(&file, false).map(|file| {
                     let file = self.hold(file);
+                    let hot = Hot::new(tag, Kind::Read, file.to_bits());
                     // alloc: the read's result, handed to its asker.
-                    self.start(tag, Op::Read { file, at, bytes: vec![0; len], got: 0 });
+                    self.start(hot, vec![0; len], Cold { at, ..Cold::EMPTY });
                     None
                 }),
                 Effect::Append { file, bytes, .. } => {
@@ -3388,14 +2218,14 @@ impl Driver for Uring {
                         true => Some(Done::Appended),
                         false => {
                             let file = self.hold(file);
-                            self.start(tag, Op::Append { file, bytes, put: 0 });
+                            self.start(Hot::new(tag, Kind::Append, file.to_bits()), bytes, Cold::EMPTY);
                             None
                         }
                     })
                 }
                 Effect::Sync { file, .. } => self.file(&file, true).map(|file| {
                     let file = self.hold(file);
-                    self.start(tag, Op::Sync { file });
+                    self.start(Hot::new(tag, Kind::Sync, file.to_bits()), ops::NO_BYTES, Cold::EMPTY);
                     None
                 }),
                 Effect::Truncate { file, len, .. } => self.file(&file, true).and_then(|file| {
@@ -3416,7 +2246,8 @@ impl Driver for Uring {
                 Effect::Listen { at: address, .. } => {
                     crate::net::listen(&self.root, &address).and_then(|listener| {
                         no_delay(&listener)?;
-                        let id = self.start(tag, Op::Accept { listener, stopping: false });
+                        let listener = self.listeners.insert(listener);
+                        let id = self.start(Hot::new(tag, Kind::Accept, listener.to_bits()), ops::NO_BYTES, Cold::EMPTY);
                         self.listens.insert(tag, id);
                         Ok(None)
                     })
@@ -3424,8 +2255,9 @@ impl Driver for Uring {
                 Effect::Connect { at: address, .. } => crate::net::sockaddr(&self.root, &address)
                     .and_then(|address| {
                         let socket = connect_socket(&self.table, address.domain)?;
-                        let op = Op::Connect { socket: Some(socket), at: address };
-                        self.start(tag, op);
+                        let tcp = address.domain != libc::AF_UNIX;
+                        let connecting = self.connectings.insert(Connecting { socket: Some(socket), at: address, tcp });
+                        self.start(Hot::new(tag, Kind::Connect, connecting.to_bits()), ops::NO_BYTES, Cold::EMPTY);
                         Ok(None)
                     }),
                 Effect::Recv { conn, most, into, .. } => {
@@ -3439,11 +2271,15 @@ impl Driver for Uring {
                     }))
                 }
                 Effect::Send { conn, bytes, .. } => match self.use_conn(conn) {
-                    true => {
-                        self.start(tag, Op::Send { conn, bytes, put: 0 });
+                    Some(tcp) => {
+                        let mut hot = Hot::new(tag, Kind::Send, conn.0);
+                        if tcp && bytes.len() >= ZERO_COPY_LEAST {
+                            hot.flags |= ops::ZERO_COPY;
+                        }
+                        self.start(hot, bytes, Cold::EMPTY);
                         Ok(None)
                     }
-                    false => Ok(Some(Done::unsent(bytes, gone(conn)))),
+                    None => Ok(Some(Done::unsent(bytes, gone(conn)))),
                 },
                 Effect::Hangup { conn, .. } => self.hang_up(conn, tag).map(|()| None),
             };
@@ -4085,7 +2921,7 @@ mod tests {
         let aligned = align != 0 && piece % align as usize == 0 && DIRECT_PIECE % align as usize == 0;
         let direct = if aligned && !driver.refused.contains(&device) { count as u64 } else { 0 };
         assert_eq!(driver.direct_writes(), direct, "alignment {align}");
-        assert_eq!(driver.registered.free.len(), DIRECT_BUFFERS as usize);
+        assert_eq!((driver.lent.free(), driver.lent.waiters().count()), (DIRECT_BUFFERS as usize, 0));
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -4478,46 +3314,63 @@ mod tests {
         }
     }
 
-    /// The slab of requests answers as the map of ids it replaced does, over random starts and
-    /// ends of many seeds: each `user_data` names its request and link, and one of a request
-    /// that ended names nothing, even once its slot holds another; [`NOBODY`] names nothing.
+    /// The columns of requests answer as a map of ids does, over random starts, completions and
+    /// ends of many seeds: each `user_data` names its request and link, a completion steps its
+    /// own request's progress and buffer alone, and one of a request that ended (a stale
+    /// completion) names nothing, even once its slot holds another; [`NOBODY`] names nothing.
     #[test]
-    fn pending_agrees_with_the_map_it_replaced() {
-        let made = |n: u64| Pending { tag: Tag(n), op: Op::Cancel { target: n.wrapping_mul(7) }, abandoned: false };
-        let shown = |it: &Pending| match it.op {
-            Op::Cancel { target } => (it.tag, target),
-            _ => unreachable!("only cancels are made"),
+    fn the_columns_of_requests_agree_with_a_map() {
+        // A request as the model has it: its tag, whose it is, its progress, its buffer, its offset.
+        type Model = (Tag, u64, u64, Vec<u8>, u64);
+        let shown = |ops: &ops::Ops, id: Id| -> Option<Model> {
+            let hot = ops.get(id)?;
+            Some((hot.tag, hot.of, hot.done, ops.buf(id).clone(), ops.cold(id).at))
         };
         for seed in 0..64 {
             let mut rng = crate::sim::Rng::new(seed);
-            let mut ours: Slab<Pending> = Slab::new(PENDING, MemTag::Io).unwrap();
-            let mut theirs: FxHashMap<u64, Pending> = FxHashMap::default();
+            let mut ours = ops::Ops::new(PENDING).unwrap();
+            let mut theirs: FxHashMap<u64, Model> = FxHashMap::default();
             let (mut live, mut ended): (Vec<(u64, Id)>, Vec<Id>) = (Vec::new(), Vec::new());
             for next in 0..2_000u64 {
-                if live.is_empty() || (live.len() < 256 && rng.below(3) != 0) {
-                    let id = ours.insert(made(next));
-                    theirs.insert(next, made(next));
-                    live.push((next, id));
-                } else {
-                    let (key, id) = live.swap_remove(rng.below(live.len() as u64) as usize);
-                    assert_eq!(ours.remove(id).as_ref().map(shown), theirs.remove(&key).as_ref().map(shown));
-                    ended.push(id);
+                match rng.below(4) {
+                    _ if live.is_empty() || (live.len() < 256 && rng.below(3) != 0) => {
+                        let model = (Tag(next), next.wrapping_mul(7), 0, next.to_le_bytes().to_vec(), next * 3);
+                        let cold = Cold { at: model.4, ..Cold::EMPTY };
+                        let id = ours.insert(Hot::new(model.0, Kind::Read, model.1), model.3.clone(), cold);
+                        theirs.insert(next, model);
+                        live.push((next, id));
+                    }
+                    // A completion of a request in flight, by its `user_data`: its progress moves.
+                    0 | 1 => {
+                        let (key, id) = live[rng.below(live.len() as u64) as usize];
+                        let link = rng.below(4) as usize;
+                        let (found, at) = of_data(data(id, link));
+                        assert_eq!((found, at), (id, link));
+                        let got = rng.below(100);
+                        ours.get_mut(found).expect("in flight").done += got;
+                        ours.buf_mut(found).push(got as u8);
+                        let model = theirs.get_mut(&key).expect("in flight");
+                        model.2 += got;
+                        model.3.push(got as u8);
+                    }
+                    _ => {
+                        let (key, id) = live.swap_remove(rng.below(live.len() as u64) as usize);
+                        let (hot, buf, cold) = ours.remove(id).expect("in flight");
+                        let model = theirs.remove(&key).expect("in flight");
+                        assert_eq!((hot.tag, hot.of, hot.done, buf, cold.at), model);
+                        ended.push(id);
+                    }
                 }
                 assert_eq!(ours.len(), theirs.len());
-                if !live.is_empty() {
-                    let (key, id) = live[rng.below(live.len() as u64) as usize];
-                    let link = rng.below(4) as usize;
-                    assert_eq!(of_data(data(id, link)), (id, link));
-                    assert_eq!(ours.get(of_data(data(id, link)).0).map(shown), theirs.get(&key).map(shown));
-                }
                 if !ended.is_empty() {
                     let id = ended[rng.below(ended.len() as u64) as usize];
-                    assert!(ours.get(of_data(data(id, 0)).0).is_none(), "{id:?} ended");
+                    let link = rng.below(4) as usize;
+                    assert!(ours.get(of_data(data(id, link)).0).is_none(), "{id:?} ended");
                 }
                 assert!(ours.get(of_data(NOBODY).0).is_none());
             }
             for (key, id) in &live {
-                assert_eq!(ours.get(*id).map(shown), theirs.get(key).map(shown));
+                assert_eq!(shown(&ours, *id).as_ref(), theirs.get(key));
             }
             let reused = ended.iter().any(|old| live.iter().any(|(_, it)| it.index() == old.index()));
             assert!(reused, "seed {seed}: no slot of an ended request holds another");
@@ -4526,7 +3379,7 @@ mod tests {
 
     /// Each request in flight, by its handle.
     fn requests(driver: &Uring) -> Vec<Id> {
-        driver.pending.iter().map(|(id, _)| id).collect()
+        driver.ops.iter().map(|(id, _)| id).collect()
     }
 
     /// A completion that comes after its request ended, once the request's slot holds another
@@ -4553,7 +3406,7 @@ mod tests {
         driver.completed(data(synced, 0), 0, 0);
         driver.completed(data(synced, 0), -libc::EIO, 0);
         assert!(driver.ready.is_empty(), "{:?}", driver.ready);
-        assert!(driver.pending.contains(read));
+        assert!(driver.ops.contains(read));
         let mut seen = Vec::new();
         run_until_idle(&mut driver, &mut Vec::new(), |done, _| seen.push(done.done));
         assert_eq!(seen, [Done::Read(b"bytes".to_vec())]);
@@ -4574,7 +3427,7 @@ mod tests {
         driver.completed(data(watched, 0), 16, 0);
         driver.completed(data(watched, 0), -libc::ECANCELED, 0);
         assert!(driver.ready.is_empty(), "{:?}", driver.ready);
-        assert!(driver.pending.contains(reused) && driver.watches.contains_key(&Tag(4)));
+        assert!(driver.ops.contains(reused) && driver.watches.contains_key(&Tag(4)));
         let mut seen = BTreeMap::new();
         run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(4) }], |done, _| {
             _ = seen.insert(done.tag.0, done.done)
@@ -4792,6 +3645,164 @@ mod tests {
         assert!(ring.conns.is_empty());
         drop(ring);
         _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A warm append, positioned write, whole file's write and rename allocate nothing: their
+    /// bytes are the asker's, their names go in an arena and their descriptors in a column.
+    #[test]
+    fn warm_writes_and_renames_allocate_nothing() {
+        let root = dir("uring-warm-writes");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/block"), [0u8; 64]).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let name = |it: &str| FileName::new(it).unwrap();
+        let (log, block, whole, moved) = (name("d/log"), name("d/block"), name("d/whole"), name("d/moved"));
+        let mut out = Vec::with_capacity(16);
+        for round in 0..2 * WARM {
+            let at = 8 * round;
+            let mut writes = Vec::with_capacity(4);
+            writes.push(Effect::Append { file: log.clone(), bytes: b"line\n".to_vec(), tag: Tag(10 * round) });
+            writes.push(Effect::WriteAt { file: block.clone(), at, bytes: round.to_le_bytes().to_vec(), tag: Tag(10 * round + 1) });
+            writes.push(Effect::Write { file: whole.clone(), bytes: round.to_le_bytes().to_vec(), tag: Tag(10 * round + 2) });
+            let mut renames = Vec::with_capacity(1);
+            renames.push(Effect::Rename { from: whole.clone(), to: moved.clone(), tag: Tag(10 * round + 3) });
+            out.clear();
+            let ((), used) = blaze_alloc_count::measure(|| {
+                driver.submit(&mut writes);
+                poll_until(&mut driver, &mut out, |out| out.len() == 3);
+                driver.submit(&mut renames);
+                poll_until(&mut driver, &mut out, |out| out.len() == 4);
+            });
+            out.sort_by_key(|it| it.tag.0);
+            let done: Vec<&Done> = out.iter().map(|it| &it.done).collect();
+            assert_eq!(done, [&Done::Appended, &Done::Written, &Done::Written, &Done::Renamed], "round {round}");
+            if round >= WARM {
+                assert_eq!(used.allocations, 0, "round {round}: {} bytes", used.bytes);
+            }
+        }
+        let last = 2 * WARM - 1;
+        assert_eq!(std::fs::read(root.join("d/moved")).unwrap(), last.to_le_bytes());
+        assert_eq!(std::fs::read(root.join("d/block")).unwrap()[8 * last as usize..][..8], last.to_le_bytes());
+        assert_eq!(std::fs::read(root.join("d/log")).unwrap().len(), 5 * 2 * WARM as usize);
+        assert!(!root.join("d/whole").exists());
+        assert_eq!(driver.paths.held(), [0, 0]);
+        assert_eq!(driver.in_flight(), 0);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The provided buffers a pass of completions gives back are shown to the kernel together,
+    /// with one store of the ring's tail after the pass, not one per buffer; between, the
+    /// kernel's tail is as it was.
+    #[test]
+    fn provided_buffers_go_back_once_per_pass() {
+        let root = dir("uring-provided");
+        let mut ring = Uring::new(&root).unwrap();
+        assert_eq!((ring.provided.unpublished(), ring.provided.shown()), (0, RECV_BUFFERS));
+        let at = Address::Unix(FileName::new("s.sock").unwrap());
+        ring.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }, Effect::Connect { at, tag: Tag(2) }]);
+        let mut out = Vec::new();
+        poll_until(&mut ring, &mut out, |out| out.len() == 2);
+        let conn = |it: &Done| match it {
+            Done::Accepted { conn } | Done::Connected { conn } => *conn,
+            other => panic!("{other:?}"),
+        };
+        out.sort_by_key(|it| it.tag.0);
+        let (server, client) = (conn(&out[0].done), conn(&out[1].done));
+        let sent = 5 * RECV_BUFFER / 2;
+        ring.submit(&mut vec![
+            Effect::Recv { conn: server, most: 64 << 10, into: Vec::new(), tag: Tag(3) },
+            Effect::Send { conn: client, bytes: vec![7; sent], tag: Tag(4) },
+        ]);
+        let mut received = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while received < sent && Instant::now() < deadline {
+            ring.submit_ring();
+            ring.ring.enter(Some(Duration::from_millis(50))).unwrap();
+            let shown = ring.provided.shown();
+            let (first, tail) = ring.ring.completions();
+            let (mut head, mut given) = (first, 0);
+            while head != tail {
+                let (user_data, res, flags) = ring.ring.cqe(head);
+                head = head.wrapping_add(1);
+                if flags & CQE_F_BUFFER != 0 && res > 0 {
+                    received += res as usize;
+                    given += 1;
+                }
+                ring.completed(user_data, res, flags);
+            }
+            if head != first {
+                ring.ring.consume(head);
+            }
+            assert_eq!((ring.provided.unpublished(), ring.provided.shown()), (given, shown));
+            ring.provided.publish();
+            assert_eq!((ring.provided.unpublished(), ring.provided.shown()), (0, shown.wrapping_add(given)));
+        }
+        assert_eq!(received, sent);
+        let mut effects = vec![
+            Effect::Hangup { conn: client, tag: Tag(5) },
+            Effect::Hangup { conn: server, tag: Tag(6) },
+            Effect::Unlisten { tag: Tag(1) },
+        ];
+        run_until_idle(&mut ring, &mut effects, |_, _| {});
+        assert_eq!(ring.in_flight(), 0);
+        drop(ring);
+        _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A large send on a TCP connection goes from the asker's pages: it ends once the kernel's
+    /// notification says it is done with them, received whole, its buffer handed back empty.
+    /// A small one copies.
+    #[test]
+    fn a_large_tcp_send_goes_from_the_askers_pages() {
+        let mut ring = Uring::new(dir("uring-zero-copy")).unwrap();
+        ring.submit(&mut vec![Effect::Listen { at: Address::Tcp("127.0.0.1:0".parse().unwrap()), tag: Tag(1) }]);
+        let at = ring.local_addr(Tag(1)).expect("listening");
+        ring.submit(&mut vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(2) }]);
+        let mut out = Vec::new();
+        poll_until(&mut ring, &mut out, |out| out.len() == 2);
+        let conn = |it: &Done| match it {
+            Done::Accepted { conn } | Done::Connected { conn } => *conn,
+            other => panic!("{other:?}"),
+        };
+        out.sort_by_key(|it| it.tag.0);
+        let (server, client) = (conn(&out[0].done), conn(&out[1].done));
+        let large: Vec<u8> = (0..4 << 20).map(|at: usize| (at * 13) as u8).collect();
+        let whole = large.len() + 4;
+        // The small send only once the large one ended: sends in flight together may interleave.
+        let mut effects = vec![
+            Effect::Send { conn: client, bytes: large.clone(), tag: Tag(3) },
+            Effect::Recv { conn: server, most: 64 << 10, into: Vec::new(), tag: Tag(10) },
+        ];
+        let (mut got, mut sent, mut next) = (Vec::new(), Vec::new(), 11);
+        run_until_idle(&mut ring, &mut effects, |done, effects| match done.done {
+            Done::Sent(bytes) => {
+                sent.push((done.tag, bytes.len(), bytes.capacity()));
+                if done.tag == Tag(3) {
+                    effects.push(Effect::Send { conn: client, bytes: b"tail".to_vec(), tag: Tag(4) });
+                }
+            }
+            Done::Read(mut bytes) => {
+                got.extend_from_slice(&bytes);
+                bytes.clear();
+                if got.len() < whole {
+                    effects.push(Effect::Recv { conn: server, most: 64 << 10, into: bytes, tag: Tag(next) });
+                    next += 1;
+                } else {
+                    effects.push(Effect::Hangup { conn: client, tag: Tag(5) });
+                    effects.push(Effect::Hangup { conn: server, tag: Tag(6) });
+                    effects.push(Effect::Unlisten { tag: Tag(1) });
+                }
+            }
+            Done::HungUp | Done::Unlistened => {}
+            other => panic!("{other:?}"),
+        });
+        assert_eq!(got.len(), whole);
+        assert!(got[..large.len()] == large[..] && got[large.len()..] == b"tail"[..]);
+        assert_eq!(sent.iter().map(|it| (it.0, it.1)).collect::<Vec<_>>(), [(Tag(3), 0), (Tag(4), 0)]);
+        assert!(sent[0].2 >= large.len(), "the asker's own buffer handed back");
+        assert_eq!(ring.zero_copy_sends(), 1);
+        assert_eq!(ring.in_flight(), 0);
     }
 
     #[test]

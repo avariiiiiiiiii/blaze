@@ -27,13 +27,13 @@ use blaze_ids::{ContentId, Fingerprint};
 use blaze_reclaim::{Grace, Guard};
 
 use crate::{
-    QueryKey, Stored,
+    QueryKey, QueryKind, Stored,
     segment::{self, Lanes, Segment, Segments, Span, lane},
     sync::{
-        atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
+        atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence},
         read_bytes,
     },
-    table::{COLLECT_AT, EDGE_RECORD, EdgeRecord, Free, FxMap, Generations, Ids, Rows, ShortLock},
+    table::{COLLECT_AT, EDGE_RECORD, Edit, EdgeRecord, Free, FxMap, Generations, Ids, Map, Rows, ShortLock},
 };
 
 /// A memo: its row in the store's hot and cold columns.
@@ -142,9 +142,38 @@ struct ValueRow {
     id: ContentId,
     /// In a segment of this process, which [`Store::evict`] may drop.
     memory: bool,
+    /// One value of a [`Shared`] kind, named by every memo of an equal value
+    /// ([`Store::shared`]); otherwise the row is its one memo's.
+    shared: bool,
+    /// For a shared row: how many memo words name it (or are about to), and [`DEAD`] once
+    /// [`Store::sweep`] found none and retired it.
+    names: AtomicU32,
 }
 
+#[cfg(not(blaze_check))]
 const _: () = assert!(size_of::<ValueRow>() == 64);
+
+/// [`ValueRow::names`] of a shared row being retired: no memo may name it again.
+const DEAD: u32 = u32::MAX;
+
+/// A kind whose equal values are kept once ([`crate::Query::SHARE`]): its schema, which with a
+/// value's fingerprint finds the row, and its name, for the panic when two values of one
+/// fingerprint differ.
+#[derive(Clone, Copy)]
+pub(crate) struct Shared {
+    pub(crate) name: &'static str,
+    pub(crate) schema: SchemaHash,
+}
+
+const SHARED_DOMAIN: &str = "blaze v2 db shared value 1";
+
+/// The key of the shared row of values of `schema` with `fingerprint`.
+fn shared_key(schema: SchemaHash, fingerprint: Fingerprint) -> QueryKey {
+    let mut parts = [0u8; 48];
+    parts[..32].copy_from_slice(&schema.0.0);
+    parts[32..].copy_from_slice(&fingerprint.0.to_le_bytes());
+    QueryKey { kind: QueryKind(0), input: ContentId::of(SHARED_DOMAIN, &parts) }
+}
 
 // SAFETY: `bytes` never change once copied in or mapped, and stay while the row's hold on its
 // segment does, or while the database keeps the mapping.
@@ -153,9 +182,9 @@ unsafe impl Send for ValueRow {}
 unsafe impl Sync for ValueRow {}
 
 impl ValueRow {
-    fn new(span: Span, memory: bool, id: ContentId) -> ValueRow {
+    fn new(span: Span, memory: bool, id: ContentId, shared: bool) -> ValueRow {
         let (bytes, len, segment) = span.into_raw();
-        ValueRow { bytes, len, segment, id, memory }
+        ValueRow { bytes, len, segment, id, memory, shared, names: AtomicU32::new(u32::from(shared)) }
     }
 
     fn bytes(&self) -> &[u8] {
@@ -228,6 +257,9 @@ pub(crate) struct Store {
     value_ids: Ids,
     values: Rows<ValueRow>,
     generations: Generations,
+    /// The word of each shared value row, by [`shared_key`]: how a memo of a [`Shared`] kind
+    /// finds the row of an equal value, whichever view or key made it.
+    shared: Map<u64>,
     writers: Lanes<Writers>,
     codes: ShortLock<Codes>,
     dying: ShortLock<Dying>,
@@ -249,6 +281,7 @@ impl Store {
             value_ids: Ids::new(),
             values: Rows::new(),
             generations: Generations::new(),
+            shared: Map::new(),
             writers: Lanes::new(),
             codes: ShortLock::default(),
             dying: ShortLock::default(),
@@ -304,23 +337,91 @@ impl Store {
         self.ids.end()
     }
 
-    fn put_value(&self, frees: &mut Frees, span: Span, memory: bool, id: ContentId) -> u64 {
+    fn put_value(&self, frees: &mut Frees, span: Span, memory: bool, id: ContentId, shared: bool) -> u64 {
         let row = self.value_ids.claim(&mut frees.values);
         let generation = self.generations.bump(row);
         // SAFETY: claimed just now and not yet published.
-        unsafe { self.values.put(row, ValueRow::new(span, memory, id)) };
+        unsafe { self.values.put(row, ValueRow::new(span, memory, id, shared)) };
         word(generation, row)
     }
 
-    fn add(&self, key: QueryKey, fingerprint: Fingerprint, code: u32, edges: Span, value: Option<(Span, bool, ContentId)>) -> MemoId {
-        self.frees(|frees| {
-            let (value, bytes, value_len) = match value {
-                Some((span, memory, id)) => {
-                    let (bytes, value_len) = (span.bytes().as_ptr().cast_mut(), span.bytes().len());
-                    (self.put_value(frees, span, memory, id), bytes, value_len)
+    /// `bytes` copied into this thread's value segment, in a row of their own.
+    fn copy_value(&self, bytes: &[u8]) -> u64 {
+        let span = self.bytes.copy(bytes, blaze_format::ALIGN);
+        self.frees(|frees| self.put_value(frees, span, true, ContentId::default(), false))
+    }
+
+    /// The word of the shared row of `bytes`, with a name taken on it for the memo about to
+    /// name it: the row of an equal value made before (its bytes compared), or a new one.
+    fn take_shared(&self, task: &Guard, shared: Shared, fingerprint: Fingerprint, bytes: &[u8]) -> u64 {
+        let key = shared_key(shared.schema, fingerprint);
+        loop {
+            if let Some(&word) = self.shared.get(task, &key) {
+                let row = value_row(word).expect("a shared value has a row");
+                // SAFETY: a row named in `shared` is retired only after `Store::sweep` found no
+                // name on it, and dropped after a grace begun then, which this task (which
+                // loaded the word) holds back.
+                let value = unsafe { self.values.get(row) };
+                if value.bytes() != bytes {
+                    panic!(
+                        "query {} made two values of schema {:?} and fingerprint {fingerprint:?} that differ \
+                         in their bytes: its `Persist` encoding is not deterministic, or the fingerprints \
+                         collided",
+                        shared.name, shared.schema
+                    );
                 }
-                None => (0, ptr::null_mut(), 0),
-            };
+                let mut names = value.names.load(Ordering::Relaxed);
+                while names != DEAD {
+                    debug_assert!(names < DEAD - 1, "2^32 memos naming one value");
+                    match value.names.compare_exchange_weak(names, names + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => return word,
+                        Err(now) => names = now,
+                    }
+                }
+            }
+            let span = self.bytes.copy(bytes, blaze_format::ALIGN);
+            let made = self.frees(|frees| self.put_value(frees, span, true, ContentId::default(), true));
+            // What the published word replaced: none, or a dead row's (dead stays dead).
+            let mut replaced = None;
+            let mut ours = false;
+            self.shared.update(task, key, |now| {
+                replaced = now.copied();
+                ours = now.is_none_or(|&now| {
+                    let row = value_row(now).expect("a shared value has a row");
+                    // SAFETY: as above: this task loaded the word from `shared`.
+                    unsafe { self.values.get(row) }.names.load(Ordering::Acquire) == DEAD
+                });
+                ours.then_some(made)
+            });
+            if ours {
+                if let Some(dead) = replaced {
+                    // Unlinked by this publish, so this maker retires it, not the sweep.
+                    self.retire_shared(dead);
+                }
+                return made;
+            }
+            // A racing maker published a live row first; this one was never published.
+            let row = value_row(made).expect("a value made has a row");
+            self.frees(|frees| {
+                // SAFETY: never published, so no reader has it.
+                unsafe { self.values.drop_row(row) };
+                frees.values.ready(row);
+            });
+        }
+    }
+
+    /// The memo's word, from the row it names: `value` is 0, a row this thread just put, or a
+    /// shared row it took a name on.
+    fn add(&self, key: QueryKey, fingerprint: Fingerprint, code: u32, edges: Span, value: u64) -> MemoId {
+        let (bytes, value_len) = match value_row(value) {
+            Some(row) => {
+                // SAFETY: as the comment says, the memo about to name the row keeps it.
+                let row = unsafe { self.values.get(row) };
+                (row.bytes.as_ptr(), row.len)
+            }
+            None => (ptr::null_mut(), 0),
+        };
+        self.frees(|frees| {
             let memo = self.ids.claim(&mut frees.memos);
             let (at, len, segment) = edges.into_raw();
             // SAFETY: claimed just now and not yet published.
@@ -354,8 +455,26 @@ impl Store {
         value: &[u8],
     ) -> MemoId {
         let edges = self.edges.copy(EdgeRecord::as_bytes(edges), align_of::<EdgeRecord>());
-        let value = self.bytes.copy(value, blaze_format::ALIGN);
-        self.add(key, fingerprint, code, edges, Some((value, true, ContentId::default())))
+        let value = self.copy_value(value);
+        self.add(key, fingerprint, code, edges, value)
+    }
+
+    /// A memo a run of a [`Shared`] kind made: its edges copied as [`Store::make`]'s, its value
+    /// the row of an equal value of the kind's schema if there is one (whichever view or key
+    /// made it), else copied once into a new shared row.
+    pub(crate) fn make_shared(
+        &self,
+        key: QueryKey,
+        fingerprint: Fingerprint,
+        code: u32,
+        edges: &[EdgeRecord],
+        value: &[u8],
+        shared: Shared,
+    ) -> MemoId {
+        let edges = self.edges.copy(EdgeRecord::as_bytes(edges), align_of::<EdgeRecord>());
+        let task = blaze_reclaim::enter();
+        let value = self.take_shared(&task, shared, fingerprint, value);
+        self.add(key, fingerprint, code, edges, value)
     }
 
     /// A memo of the image: its edges and value stay in the mapping.
@@ -374,8 +493,11 @@ impl Store {
     ) -> MemoId {
         // SAFETY: the caller's contract.
         let edges = unsafe { Span::mapped(EdgeRecord::as_bytes(edges)) };
-        // SAFETY: as above.
-        let value = value.map(|(bytes, id)| (unsafe { Span::mapped(bytes) }, false, id));
+        let value = value.map_or(0, |(bytes, id)| {
+            // SAFETY: as above.
+            let span = unsafe { Span::mapped(bytes) };
+            self.frees(|frees| self.put_value(frees, span, false, id, false))
+        });
         self.add(key, fingerprint, code, edges, value)
     }
 
@@ -403,7 +525,7 @@ impl Store {
     /// The memo's edges in the order they were read: one range, read in place.
     pub(crate) fn edges<'g>(&'g self, task: &'g Guard, memo: MemoId) -> &'g [EdgeRecord] {
         let hot = self.hot(task, memo);
-        read_bytes(hot.edges.as_ptr().cast(), hot.edge_len as usize * EDGE_RECORD);
+        read_bytes(hot.edges.as_ptr().cast::<u8>(), hot.edge_len as usize * EDGE_RECORD);
         // SAFETY: `edge_len` records written at `edges` before the memo was published, held by
         // its cold row's segment hold (or in the image) until the memo is freed.
         unsafe { std::slice::from_raw_parts(hot.edges.as_ptr(), hot.edge_len as usize) }
@@ -480,8 +602,25 @@ impl Store {
         }
     }
 
+    /// Lets go of a memo word's name on `row` if it is a shared row (which [`Store::sweep`]
+    /// retires once none is left): `false` for a row that is its one memo's.
+    fn let_go_shared(&self, row: u32) -> bool {
+        // SAFETY: the caller's word names the row (or is about to and never will), and a row is
+        // retired only after its memo's word stops naming it, or, shared, after every name on
+        // it was let go of: this is one of them.
+        let value = unsafe { self.values.get(row) };
+        if !value.shared {
+            return false;
+        }
+        // Release: this memo's reads of the row happen before the sweep that sees no name.
+        let was = value.names.fetch_sub(1, Ordering::Release);
+        debug_assert!(was != 0 && was != DEAD, "a shared row let go of by a memo that did not name it");
+        true
+    }
+
     /// Swaps the memo's word from `was` to `now`: the value let go of goes to the limbo, or,
-    /// when the word no longer is `was`, `now`'s row (never published) is freed at once.
+    /// when the word no longer is `was`, `now`'s row (never published) is freed at once. A shared
+    /// row is let go of by its name instead.
     fn swap_value(&self, task: &Guard, memo: MemoId, was: u64, now: u64) -> bool {
         // SeqCst: see `refresh`.
         let swapped = self.hot(task, memo).value.compare_exchange(was, now, Ordering::SeqCst, Ordering::Acquire);
@@ -489,7 +628,7 @@ impl Store {
             Ok(_) => (value_row(was), true),
             Err(_) => (value_row(now), false),
         };
-        if let Some(row) = gone {
+        if let Some(row) = gone.filter(|&row| !self.let_go_shared(row)) {
             self.frees(|frees| {
                 if unlinked {
                     frees.values.retire(Grace::start(), row);
@@ -524,8 +663,14 @@ impl Store {
     /// An evicted value back in memory, copied once into this thread's segment; a racing
     /// refill's wins.
     pub(crate) fn refill(&self, task: &Guard, memo: MemoId, bytes: &[u8]) {
-        let span = self.bytes.copy(bytes, blaze_format::ALIGN);
-        let now = self.frees(|frees| self.put_value(frees, span, true, ContentId::default()));
+        let now = self.copy_value(bytes);
+        self.swap_value(task, memo, 0, now);
+    }
+
+    /// An evicted value of a [`Shared`] kind back in memory: the shared row of an equal value
+    /// if there is one, as [`Store::make_shared`]; a racing refill's wins.
+    pub(crate) fn refill_shared(&self, task: &Guard, memo: MemoId, bytes: &[u8], shared: Shared) {
+        let now = self.take_shared(task, shared, self.fingerprint(task, memo), bytes);
         self.swap_value(task, memo, 0, now);
     }
 
@@ -538,7 +683,7 @@ impl Store {
     pub(crate) unsafe fn to_disk(&self, task: &Guard, memo: MemoId, was: u64, bytes: &[u8], id: ContentId) -> bool {
         // SAFETY: the caller's contract.
         let span = unsafe { Span::mapped(bytes) };
-        let now = self.frees(|frees| self.put_value(frees, span, false, id));
+        let now = self.frees(|frees| self.put_value(frees, span, false, id, false));
         self.swap_value(task, memo, was, now)
     }
 
@@ -555,8 +700,9 @@ impl Store {
         // SAFETY: the caller's contract: nothing reaches the memo, so its rows and value row
         // are this caller's.
         let word = unsafe { self.hot.get(memo) }.value.load(Ordering::Acquire);
+        let own = value_row(word).filter(|&row| !self.let_go_shared(row));
         self.frees(|frees| {
-            if let Some(row) = value_row(word) {
+            if let Some(row) = own {
                 // SAFETY: the memo's value, reached only through the memo.
                 unsafe { self.values.drop_row(row) };
                 frees.values.ready(row);
@@ -666,14 +812,60 @@ impl Store {
                 self.dying.lock().checked.extend(pinned.iter().map(|&memo| (grace, memo)));
             }
         });
+        self.sweep_shared();
         let values = &self.values;
         self.frees(|frees| {
             // SAFETY: a retired value row's grace has passed: no task that could reach it is left.
             frees.values.reclaim(|row| unsafe { values.drop_row(row) });
         });
+        self.shared.sweep();
         self.edges.sweep();
         self.bytes.sweep();
         self.keys.sweep();
+    }
+
+    /// Takes each shared row no memo names any more out of [`Store::shared`] and retires it:
+    /// once its count is [`DEAD`], a maker of an equal value makes a row of its own.
+    fn sweep_shared(&self) {
+        let task = blaze_reclaim::enter();
+        let values = &self.values;
+        self.shared.edit_all_with(
+            &task,
+            |_, &word| {
+                let row = value_row(word).expect("a shared value has a row");
+                // SAFETY: as in `Store::take_shared`: this task loaded the word from `shared`.
+                let value = unsafe { values.get(row) };
+                // Acquire: every memo's reads of the row happen before its retirement. A name
+                // taken meanwhile fails this exchange; none can be taken after it.
+                let dead = value.names.compare_exchange(0, DEAD, Ordering::Acquire, Ordering::Relaxed).is_ok();
+                if dead { Edit::Remove } else { Edit::Keep }
+            },
+            // Removed: unlinked from `shared` now. A dead word a maker replaced first is
+            // retired by that maker (`Store::take_shared`).
+            |&word, _| self.retire_shared(word),
+        );
+    }
+
+    /// Retires a dead shared row just unlinked from [`Store::shared`]: a task that loaded a
+    /// memo's word naming it, or the word from `shared`, began before this grace.
+    fn retire_shared(&self, word: u64) {
+        let row = value_row(word).expect("a shared value has a row");
+        self.frees(|frees| frees.values.retire(Grace::start(), row));
+    }
+
+    /// How many shared value rows the store keeps, retired ones included until swept.
+    #[cfg(test)]
+    pub(crate) fn shared_rows(&self) -> usize {
+        let task = blaze_reclaim::enter();
+        let mut rows = 0;
+        self.shared.for_each(&task, |_, _| rows += 1);
+        rows
+    }
+
+    /// The memo's value word, for a test to compare two memos' rows.
+    #[cfg(test)]
+    pub(crate) fn value_word(&self, task: &Guard, memo: MemoId) -> u64 {
+        self.hot(task, memo).value.load(Ordering::Acquire)
     }
 
     /// How many values this lane let go of wait for their grace, after freeing those past it.
@@ -722,6 +914,8 @@ impl Store {
             }
         }
         *self.dying.get_mut() = keep;
+        self.sweep_shared();
+        self.shared.reclaim();
         let values = &self.values;
         for writers in self.writers.iter_mut() {
             // SAFETY: `&mut` excludes every reader.

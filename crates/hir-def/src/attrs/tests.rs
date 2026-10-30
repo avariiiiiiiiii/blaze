@@ -1433,12 +1433,7 @@ fn a_refused_crate_attr_is_not_applied() {
     let files = base_db::crate_attr_files(&db, krate);
     assert_eq!(files.len(), 3);
     assert_eq!(base_db::crate_attr_error(&db, files[0]), None);
-    assert_eq!(
-        base_db::crate_attr_error(&db, files[1]),
-        Some(base_db::CrateAttrError::Trailing {
-            range: syntax::TextRange::new(3.into(), 5.into())
-        })
-    );
+    assert_eq!(base_db::crate_attr_error(&db, files[1]), Some(base_db::CrateAttrError::Syntax));
     assert_eq!(base_db::crate_attr_error(&db, files[2]), None);
     assert_eq!(base_db::applied_crate_attr_files(&db, krate), [files[0], files[2]]);
     let module = db.module_for_file(file_id.file_id(&db));

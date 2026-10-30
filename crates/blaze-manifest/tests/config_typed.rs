@@ -256,7 +256,7 @@ fn source_replacement_follows_replace_with() {
     );
     let config = tree.config(&[]);
     let sources = config.source_configs().unwrap();
-    assert_eq!(sources["vendored"].id.url.to_file_path().unwrap(), tree.root.join("vendor"));
+    assert_eq!(sources["vendored"].id.url().to_file_path().unwrap(), tree.root.join("vendor"));
     assert_eq!(config.replacement("crates-io").unwrap(), Replacement::Source("vendored".into()));
     assert_eq!(config.replacement("vendored").unwrap(), Replacement::None);
     assert_eq!(config.replacement("alt").unwrap(), Replacement::Registry("my-registry".into()));

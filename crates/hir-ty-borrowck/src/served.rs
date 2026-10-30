@@ -30,7 +30,7 @@ pub fn closures(mut pair: Pair) -> u32 {
     let read = move || pair.a;
     read()
 }
-pub fn same(pair: Pair) -> bool { pair == pair.clone() }
+pub fn same(pair: Pair) -> bool { pair == pair.clone() } // clone: the fixture's code
 pub fn two_mut() { let mut n = 0; let a = &mut n; let b = &mut n; *a += 1; *b += 1; }
 pub const C: u32 = 3 + 4;
 //- /main.rs crate:main deps:core,dep new_source_root:local
@@ -40,6 +40,7 @@ fn main() { let _ = dep::sum(&dep::Pair { a: 1, b: None }); }
 fn crate_named(db: &Db, name: &str) -> Crate {
     *all_crates(db)
         .iter()
+        // alloc: test setup
         .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.to_string() == name))
         .unwrap()
 }
@@ -53,6 +54,7 @@ fn served(passed: fn(DefWithBodyId) -> bool) -> (Db, Crate) {
     let dep = crate_named(&db, "dep");
     // alloc: test setup
     let mut parts = FxHashMap::default();
+    // alloc: test setup
     parts.insert(dep, Arc::new(Aligned::copy_from(&bytes)) as hir_def::deps::ImageBuf);
     check_cache::set_served(&mut db, parts);
     (db, dep)

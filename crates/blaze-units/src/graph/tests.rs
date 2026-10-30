@@ -175,45 +175,17 @@ fn dense_ranks_give_equal_items_one_rank() {
 /// The graph of real workspaces, built as the daemon builds it: through the load's queries.
 #[cfg(feature = "query")]
 mod load {
-    use std::sync::Arc;
-
-    use blaze_query::{Config, Database, MemTree};
-    use blaze_vfs::View;
-
     use super::{Budget, armed};
-    use crate::load::tests::{COMMIT, HOST, WS, library};
-    use crate::query::{BuildConfig, Command, Invocation, Mount, Origin, Plan, Planned};
+    use crate::load::tests::{Ask, Fixture, HOST, WS, ask};
+    use crate::query::Planned;
     use crate::schema::{DebugInfo, Mode, Strip, Stripped, Unit, UnitGraph};
-    use crate::stdlib::{library_at, library_mount};
 
     /// The workspace's graph (not the standard library's, which the load builds too) of the
     /// files under `ws/`, built with `args`, and its budget.
     fn graph(files: &[(&str, &str)], args: &[&str]) -> (Budget, UnitGraph) {
-        let tree = Arc::new(MemTree::default());
-        let library = library(&tree);
-        let mut db = Database::new(Config { tree: Some(tree.clone()), dir: None, tags: 0 });
-        crate::query::register(&mut db);
-        let files: Vec<(&str, &[u8])> = files.iter().map(|(path, text)| (*path, text.as_bytes())).collect();
-        let mut mounts = vec![
-            Mount { at: WS.to_owned(), origin: Origin::View, under: "ws".to_owned() },
-            library_mount(library, COMMIT),
-        ];
-        mounts.sort();
-        let config = BuildConfig {
-            invocation: Invocation {
-                command: Command::Build,
-                args: args.iter().map(|it| (*it).to_owned()).collect(),
-                root: WS.to_owned(),
-                cwd: WS.to_owned(),
-                env: vec![("HOME".to_owned(), "/home/u".to_owned())],
-                files: Vec::new(),
-            },
-            mounts,
-            host: HOST.to_owned(),
-            library: library_at(COMMIT),
-        };
-        let view = db.open_with(View { root: tree.root(&files) }, &config.encode());
-        let built = armed(|| match db.pin().get::<Plan>(view, &()).expect("planned").get() {
+        let fixture = Fixture::new();
+        let view = fixture.open(&Ask { args, ..ask(files) });
+        let built = armed(|| match fixture.plan(view) {
             Planned::Ready(_) => {}
             Planned::Needs(fetches) => panic!("the load needs {fetches:?}"),
             Planned::Failed(error) => panic!("the load failed: {}", error.what),

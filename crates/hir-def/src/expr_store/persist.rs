@@ -58,9 +58,9 @@ use crate::{
     },
     hir::{
         AsmOperand, AsmOptions, AsmPiece, Binding, BindingAnnotation, BindingId, BindingProblems,
-        ExprId, ExprOrPatId, ExprOrPatIdPacked, FloatTypeWrapper, InlineAsm, InlineAsmKind,
-        InlineAsmRegOrRegClass, Label, Literal, MatchArm, OffsetOf, PatId, RecordFieldPat,
-        RecordLitField,
+        ExprId, ExprKind, ExprOrPatId, ExprOrPatIdPacked, FloatTypeWrapper, InlineAsm,
+        InlineAsmKind, InlineAsmRegOrRegClass, Label, Literal, MatchArm, OffsetOf, PatId, PatKind,
+        RecordFieldPat, RecordLitField,
         col::{Col, SlabLayout, SlabWriter},
         columns::{self, Frozen, HirColumns},
         persist::{Code, Column, Node, Placed, Read, Words, WordsRec, syntax_context},
@@ -229,20 +229,6 @@ macro_rules! same_numbers {
 }
 
 kinds! {
-    /// Which [`crate::hir::Expr`] variant an expression of a buffer is, read in place.
-    ExprKind {
-        Missing, Path, If, Let, Block, Const, Loop, Call, MethodCall, Match, Continue, Break,
-        Return, Become, Yield, Yeet, RecordLit, Field, Await, Cast, Ref, UnaryOp, BinaryOp,
-        Assignment, Index, Closure, Tuple, Array, Literal, Underscore, OffsetOf, InlineAsm,
-        IncludeBytes,
-    }
-
-    /// Which [`crate::hir::Pat`] variant a pattern of a buffer is, read in place.
-    PatKind {
-        Missing, Rest, Wild, Tuple, Or, Record, Range, Slice, Path, Lit, Bind, TupleStruct, Ref,
-        Box, Deref, NotNull, Expr,
-    }
-
     /// Which [`type_ref::TypeRef`] variant a type of a buffer is, read in place.
     TypeRefKind {
         Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
@@ -262,16 +248,6 @@ kinds! {
 }
 
 same_numbers! {
-    ExprKind = columns::ExprKind {
-        Missing, Path, If, Let, Block, Const, Loop, Call, MethodCall, Match, Continue, Break,
-        Return, Become, Yield, Yeet, RecordLit, Field, Await, Cast, Ref, UnaryOp, BinaryOp,
-        Assignment, Index, Closure, Tuple, Array, Literal, Underscore, OffsetOf, InlineAsm,
-        IncludeBytes,
-    }
-    PatKind = columns::PatKind {
-        Missing, Rest, Wild, Tuple, Or, Record, Range, Slice, Path, Lit, Bind, TupleStruct, Ref,
-        Box, Deref, NotNull, Expr,
-    }
     TypeRefKind = type_ref::TypeRefKind {
         Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
         TypeParam, PatternType, Error,
@@ -1217,11 +1193,11 @@ impl<'a> ExpressionStoreRef<'a> {
 
     /// Which variant `expr` is, `None` past the arena.
     pub fn expr_kind(self, expr: ExprId) -> Option<ExprKind> {
-        ExprKind::from_u32(u32::from(*self.expr_kind.get(raw(expr) as usize)?))
+        ExprKind::ALL.get(usize::from(*self.expr_kind.get(raw(expr) as usize)?)).copied()
     }
 
     pub fn pat_kind(self, pat: PatId) -> Option<PatKind> {
-        PatKind::from_u32(u32::from(*self.pat_kind.get(raw(pat) as usize)?))
+        PatKind::ALL.get(usize::from(*self.pat_kind.get(raw(pat) as usize)?)).copied()
     }
 
     pub fn statements_len(self) -> usize {
@@ -1505,7 +1481,7 @@ impl ExpressionStore {
 impl Persist for ExpressionStore {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ExpressionStore"),
-        Part::U64(6),
+        Part::U64(7),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1578,7 +1554,7 @@ impl Body {
 impl Persist for Body {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("Body"),
-        Part::U64(6),
+        Part::U64(7),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -2465,6 +2441,7 @@ mod tests {
             Expr::OffsetOf(_) => ExprKind::OffsetOf,
             Expr::InlineAsm(_) => ExprKind::InlineAsm,
             Expr::IncludeBytes => ExprKind::IncludeBytes,
+            Expr::UnsafeBinderCast { .. } => ExprKind::UnsafeBinderCast,
         }
     }
 
@@ -3010,8 +2987,8 @@ fn f() -> u32 {
     }
 
     /// An encode on warm per-thread scratch writes the same bytes as on cold and grows none of
-    /// the scratch's buffers, so into an output that has the room it allocates only what
-    /// [`Words`] does, which a fresh `Words` does on every encode.
+    /// the scratch's buffers, and its [`Words`] are this thread's spares, so into an output
+    /// that has the room it allocates nothing.
     #[test]
     fn a_warm_encode_reuses_its_scratch() {
         let (db, defs) = bodies(EVERY_KIND);
@@ -3022,20 +2999,14 @@ fn f() -> u32 {
         };
         ENCODE.with(|it| *it.borrow_mut() = EncodeScratch::default());
         let mut out = room();
-        let (root, cold) = blaze_alloc_count::measure(|| body.write(&mut out));
+        let root = body.write(&mut out);
         assert_eq!(out.finish(root), reference, "the same bytes on fresh scratch");
         let held = ENCODE.with(|it| it.borrow().capacity());
         assert_ne!(held, 0, "the encode kept its buffers");
 
         let mut out = room();
-        let (root, warm) = blaze_alloc_count::measure(|| body.write(&mut out));
+        let root = blaze_alloc_count::assert_at_most(0, "a warm encode", || body.write(&mut out));
         assert_eq!(out.finish(root), reference, "the same bytes on reused scratch");
         assert_eq!(ENCODE.with(|it| it.borrow().capacity()), held, "a buffer grew on a warm encode");
-        assert!(
-            warm.allocations < cold.allocations,
-            "a warm encode allocated {} times, a cold one {}",
-            warm.allocations,
-            cold.allocations
-        );
     }
 }

@@ -156,27 +156,26 @@ pub fn implements_trait_unique_with_infcx<'db>(
     trait_ref_holds(&infcx, env, trait_, args)
 }
 
-/// For each of `traits`, what [`implements_trait_unique`] answers for `ty`, from one interner
-/// and one inference context in the same typing mode. Each check runs in its own probe, which
-/// rolls back the universe, every variable table, region constraints and obligations and
-/// opaque types, so no check sees what another left.
+/// For each of `traits` in order, `each` of it and what [`implements_trait_unique`] answers
+/// for `ty`, from one interner and one inference context in the same typing mode. Each check
+/// runs in its own probe, which rolls back the universe, every variable table, region
+/// constraints and obligations and opaque types, so no check sees what another left.
 pub fn implements_traits_unique<'db>(
     ty: Ty<'db>,
     db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     traits: &[TraitId],
-) -> Vec<bool> {
+    mut each: impl FnMut(TraitId, bool),
+) {
     let interner = DbInterner::new_with(db, env.krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
-    traits
-        .iter()
-        .map(|&trait_| {
-            infcx.probe(|_| {
-                let args = infcx.fill_rest_fresh_args(Span::Dummy, trait_.into(), [ty.into()]);
-                trait_ref_holds(&infcx, env, trait_, args)
-            })
-        })
-        .collect()
+    for &trait_ in traits {
+        let holds = infcx.probe(|_| {
+            let args = infcx.fill_rest_fresh_args(Span::Dummy, trait_.into(), [ty.into()]);
+            trait_ref_holds(&infcx, env, trait_, args)
+        });
+        each(trait_, holds);
+    }
 }
 
 fn trait_ref_holds<'db>(
@@ -287,7 +286,10 @@ pub fn is_impossible_associated_item(
     }
 
     let Some(trait_ref) = db.impl_trait(impl_) else { return false };
-    let interner = DbInterner::new_with(db, impl_.krate(db));
+    // Solved for `krate`, rustc's local crate: coherence answers a trait goal only a crate
+    // upstream of it could implement (`io::Error: Ord`) as ambiguous, since that crate may add
+    // the impl.
+    let interner = DbInterner::new_with(db, krate);
     // As coherence asks: the impl's parameters are inference variables, so a clause that holds
     // for some of their values (`T: Ord` of an `IntoIter<T>`) is ambiguous, not an error.
     let infcx = interner.infer_ctxt().build(TypingMode::Coherence);
@@ -300,32 +302,6 @@ pub fn is_impossible_associated_item(
         .filter(|clause| clause.visit_with(&mut OwnParam(parent)).is_continue())
     {
         let clause = EarlyBinder::bind(interner, clause).instantiate(interner, args).skip_norm_wip();
-        // Coherence answers a trait goal only a crate upstream of `krate` could implement
-        // (`io::Error: Ord`) as ambiguous, since that crate may add the impl; rust-analyzer's
-        // solver takes every crate as local, so the goal is left out here instead.
-        // A projection is normalized as the solver constrains it, though the impl's own bounds
-        // on its inference variables leave the goal ambiguous (`Self::Item` of a
-        // `FindIter<'a, 'h, A: Automaton>` is `Match`); one under a binder (`for<'a>`) is
-        // judged as written, the normalizer taking no bound vars. Each projection has a
-        // fulfillment context of its own, so the clauses already registered are answered once,
-        // at the end, and not with it.
-        if let rustc_type_ir::ClauseKind::Trait(pred) = clause.kind().skip_binder() {
-            let known = knowable(db, krate, pred.trait_ref, |ty| {
-                if !matches!(ty.kind(), TyKind::Alias(..)) || ty.has_escaping_bound_vars() {
-                    return ty;
-                }
-                let mut own = crate::next_solver::fulfill::FulfillmentCtxt::new(&infcx);
-                infcx
-                    .at(&ObligationCause::dummy(), ParamEnv::empty())
-                    .structurally_normalize_ty(ty, &mut own)
-                    .ok()
-                    .filter(|it| !matches!(it.kind(), TyKind::Infer(_)))
-                    .unwrap_or(ty)
-            });
-            if !known {
-                continue;
-            }
-        }
         ocx.register_obligation(Obligation::new(
             interner,
             ObligationCause::dummy(),
@@ -334,50 +310,6 @@ pub fn is_impossible_associated_item(
         ));
     }
     !ocx.try_evaluate_obligations().is_empty()
-}
-
-/// Whether `krate` can know every impl of `trait_ref`: the trait is its own or `#[fundamental]`,
-/// or one of the types is its own, under references and `#[fundamental]` types. rustc's
-/// `trait_ref_is_knowable` and `orphan_check_trait_ref`, leaving out where parameters may appear.
-/// Each type looked at goes through `normalize` first.
-fn knowable<'db>(
-    db: &'db Db,
-    krate: Crate,
-    trait_ref: crate::next_solver::TraitRef<'db>,
-    mut normalize: impl FnMut(Ty<'db>) -> Ty<'db>,
-) -> bool {
-    let trait_id = trait_ref.def_id.0;
-    if trait_id.module(db).krate(db) == krate
-        || TraitSignature::of(db, trait_id).flags.contains(TraitFlags::FUNDAMENTAL)
-    {
-        return true;
-    }
-    trait_ref.args.types().any(|mut ty| {
-        loop {
-            ty = normalize(ty);
-            match ty.kind() {
-                TyKind::Ref(_, inner, _) => ty = inner,
-                TyKind::Adt(adt_def, args) => {
-                    let fundamental = match adt_def.def_id() {
-                        AdtId::StructId(id) => {
-                            StructSignature::of(db, id).flags.contains(StructFlags::FUNDAMENTAL)
-                        }
-                        _ => false,
-                    };
-                    match args.types().next() {
-                        Some(inner) if fundamental => ty = inner,
-                        _ => break adt_def.def_id().module(db).krate(db) == krate,
-                    }
-                }
-                TyKind::Dynamic(bounds, _) => {
-                    break bounds
-                        .principal_def_id()
-                        .is_some_and(|it| it.0.module(db).krate(db) == krate);
-                }
-                _ => break false,
-            }
-        }
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

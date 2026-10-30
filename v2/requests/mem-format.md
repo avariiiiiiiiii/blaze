@@ -936,6 +936,7 @@ shrunk by `into_boxed_slice`; `found` grows; `place_bodies` collects `placed`; `
 first lookup) and `relative` (each item lowered) do the same.
 
 > forwarded to db (db-expand-macros-next1) (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:47): applied by frontend-tree-span (below), in the tree at `crates/span/src/ast_id.rs:1141`, `:1262`, `:1374` (`frame::task(Tag::Parse, ..)`), `:762` and `:770` (kept sort scratch), tests at `:2107` and `:2490`.
 
 ### `crates/span/Cargo.toml`
 
@@ -943,12 +944,14 @@ Under `[dependencies]`, `# local deps`: `blaze-mem.workspace = true` (then `pyth
 tools/v2/manifest_lint.py '{"root": "."}'`).
 
 > forwarded to db (db-expand-macros-next1) (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:47): in the tree at `crates/span/Cargo.toml:22` (`blaze-mem.workspace = true`).
 
 ### `crates/span/src/lib.rs`
 
 After `#![deny(unsafe_code)]`: `#![feature(allocator_api)]`.
 
 > forwarded to db (db-expand-macros-next1) (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:47): in the tree at `crates/span/src/lib.rs:5` (`#![feature(allocator_api)]`).
 
 ### `crates/span/src/ast_id.rs`
 
@@ -1134,6 +1137,7 @@ Bodies::new(relative_tree, &mut placed))`.
 
 > forwarded to db (db-expand-macros-next1) (from requests, pass 16; told by tmux).
 > db-expand-macros: not mine (`crates/span/` is format's in my brief); see the end of this section.
+> checked by db-audit-mem (22:47): in the tree at `crates/span/src/ast_id.rs:1141`, `:1262`, `:1374` and `:770` (frontend-tree-span, recorded at the end of this section).
 
 ### Budget tests, in `mod tests` beside `lookups_allocate_nothing_once_bodies_are_walked`
 

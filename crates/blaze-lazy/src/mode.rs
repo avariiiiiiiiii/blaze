@@ -67,9 +67,9 @@ fn level_name(level: OptLevel) -> &'static str {
 /// Whether `purpose` may compile lazily: `Ok` only for a process the daemon runs, with no
 /// output, under a profile that is not a release one.
 pub fn allow(purpose: &Purpose<'_>) -> Result<(), Refused> {
-    let profile = || purpose.profile.to_owned();
+    let profile = || purpose.profile.to_owned(); // alloc: called only for a refusal
     if let Some(path) = purpose.output {
-        return Err(Refused::Output { profile: profile(), path: path.to_owned() });
+        return Err(Refused::Output { profile: profile(), path: path.to_owned() }); // alloc: a refusal
     }
     if purpose.policy.mode == Mode::Output {
         return Err(Refused::Whole { profile: profile() });

@@ -12,10 +12,10 @@ use blaze_manifest::diagnostic::report;
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::manifest::PackageId as Pkg;
 use blaze_manifest::profiles::{Profile, Profiles, UnitFor, requested_profile};
-use blaze_manifest::source::SourceId;
+use blaze_manifest::source::{self, SourceId};
 use blaze_manifest::files::Disk;
 use blaze_manifest::{Config, Context, Workspace};
-use cargo_util_schemas::core::{PackageIdSpec, SourceKind};
+use cargo_util_schemas::core::PackageIdSpec;
 use cargo_util_schemas::lockfile::TomlLockfile;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
@@ -158,7 +158,7 @@ fn package(pkg_id: &str) -> anyhow::Result<Pkg> {
     let version = spec.version().ok_or_else(|| anyhow!("package id `{pkg_id}` has no version"))?;
     let url = spec.url().ok_or_else(|| anyhow!("package id `{pkg_id}` has no source"))?;
     let kind = spec.kind().ok_or_else(|| anyhow!("package id `{pkg_id}` has no source kind"))?;
-    let source_id = SourceId { kind: kind.clone(), url: url.clone(), registry_key: None };
+    let source_id = source::from_spec(kind, url)?;
     Ok(Pkg { name: spec.name().to_owned(), version, source_id })
 }
 
@@ -174,23 +174,19 @@ fn lock_packages(ws: &Workspace<'_, Disk>, units: &[Unit]) -> anyhow::Result<Opt
     for package in lock.package.into_iter().flatten() {
         let version: semver::Version = package.version.parse()?;
         let source_id = match &package.source {
-            Some(source) => SourceId {
-                kind: source.kind().clone(),
-                url: source.url().clone(),
-                registry_key: None,
-            },
+            Some(locked) => source::from_spec(locked.kind(), locked.url())?,
             None => {
                 let unit = units.iter().find(|u| {
                     u.pkg.name == package.name
                         && u.pkg.version == version
-                        && matches!(u.pkg.source_id.kind, SourceKind::Path)
+                        && u.pkg.source_id.is_path()
                 });
                 let member = ws.members().find(|(_, m)| {
                     m.package_id.name == package.name && m.package_id.version == version
                 });
                 match (unit, member) {
-                    (Some(u), _) => u.pkg.source_id.clone(),
-                    (None, Some((_, m))) => m.package_id.source_id.clone(),
+                    (Some(u), _) => u.pkg.source_id,
+                    (None, Some((_, m))) => m.package_id.source_id,
                     (None, None) => SourceId::for_path(ws.root())?,
                 }
             }
@@ -255,8 +251,8 @@ fn profiles_of(
     let mut parsed = Vec::new();
     for unit in units {
         let pkg = package(unit["pkg_id"].as_str().unwrap_or_default())?;
-        let is_member = matches!(pkg.source_id.kind, SourceKind::Path)
-            && pkg.source_id.url.to_file_path().is_ok_and(|p| ws.is_member(&p.join("Cargo.toml")));
+        let is_member = pkg.source_id.is_path()
+            && pkg.source_id.url().to_file_path().is_ok_and(|p| ws.is_member(&p.join("Cargo.toml")));
         let kinds: Vec<&str> = unit["target"]["kind"]
             .as_array()
             .map(|k| k.iter().filter_map(Value::as_str).collect())
@@ -376,7 +372,7 @@ struct Walk<'a> {
 impl Walk<'_> {
     fn profile(&self, i: usize, unit_for: UnitFor, kind: &CompileKind) -> Profile {
         let unit = &self.units[i];
-        let is_local = matches!(unit.pkg.source_id.kind, SourceKind::Path);
+        let is_local = unit.pkg.source_id.is_path();
         self.profiles.get_profile(&unit.pkg, unit.is_member, is_local, unit_for, kind)
     }
 

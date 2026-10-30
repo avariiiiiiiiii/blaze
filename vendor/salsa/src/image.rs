@@ -34,7 +34,7 @@ use crate::zalsa::{IngredientIndex, Zalsa, ZalsaDatabase};
 use crate::{Database, Id};
 
 /// How the image keeps the fields `F` of an interned struct.
-pub struct ImageCodec<F: 'static> {
+pub struct ImageCodec<F> {
     /// The schema of the bytes [`ImageCodec::write`] makes: a change is a refused image.
     pub schema: SchemaHash,
     /// Appends the fields' bytes. Symbols are written as their IDs, salsa IDs as their bits.
@@ -51,7 +51,7 @@ pub struct ImageCodec<F: 'static> {
 pub const SECTION: SectionId = SectionId::SALSA_INTERNED;
 
 /// The section's layout, all little-endian:
-const LAYOUT: SchemaHash = blaze_format::schema(
+pub const LAYOUT: SchemaHash = blaze_format::schema(
     "blaze v2 salsa interned 1: \
      header { magic u64, pages u32, ingredients u32, values u32, pad u32, blob u64 }; \
      pages [u32; pages] (the owning ingredient, or u32::MAX for a placeholder); \
@@ -69,7 +69,7 @@ const NO_OWNER: u32 = u32::MAX;
 
 /// What a slot of a kept page holds.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum SlotKind {
+pub enum SlotKind {
     /// A kept value, at its `Id`.
     Live = 0,
     /// A freed value's slot, at the next generation, for a value made later.
@@ -80,7 +80,7 @@ pub(crate) enum SlotKind {
 
 /// One slot of a kept page, as the section holds it.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct SlotRecord {
+pub struct SlotRecord {
     pub(crate) id: Id,
     pub(crate) durability: Durability,
     pub(crate) kind: SlotKind,
@@ -89,7 +89,7 @@ pub(crate) struct SlotRecord {
 }
 
 /// A kept ingredient's slots, as [`crate::ingredient::Ingredient::write_image_slots`] appends them.
-pub(crate) struct SlotsOut<'a> {
+pub struct SlotsOut<'a> {
     pub(crate) slots: &'a mut Vec<SlotRecord>,
     pub(crate) blob: &'a mut Vec<u8>,
 }
@@ -433,6 +433,7 @@ fn restore_section(zalsa: &mut Zalsa, bytes: &[u8]) -> Result<(), ImageError> {
         let mut expected: Option<(usize, usize)> = None;
         for value in first..next {
             let at = values_at + value * VALUE;
+            let record = read.bytes(at, VALUE)?;
             let bits = read.u64(at)?;
             if bits as u32 == 0 {
                 return Err(ImageError::Invalid("an `Id` of index 0"));
@@ -454,11 +455,11 @@ fn restore_section(zalsa: &mut Zalsa, bytes: &[u8]) -> Result<(), ImageError> {
                 return Err(ImageError::Invalid("a kept page with a slot missing"));
             }
             expected = Some((page, slot));
-            let durability = match bytes[at + 20] {
+            let durability = match record[20] {
                 level @ 0..=3 => Durability::from_index(level),
                 _ => return Err(ImageError::Invalid("a durability past `NEVER_CHANGE`")),
             };
-            let kind = match bytes[at + 21] {
+            let kind = match record[21] {
                 0 => SlotKind::Live,
                 1 => SlotKind::Vacant,
                 2 => SlotKind::Spent,
@@ -492,13 +493,13 @@ fn restore_section(zalsa: &mut Zalsa, bytes: &[u8]) -> Result<(), ImageError> {
         if owner == NO_OWNER {
             zalsa.table_mut().push_uninit_page();
         } else {
-            let (ingredient, table) = zalsa.ingredient_and_table_mut(IngredientIndex::new(owner));
-            ingredient.force_image_page(table, PageIndex::new(page));
+            let (ingredient, runtime) = zalsa.lookup_ingredient_mut(IngredientIndex::new(owner));
+            ingredient.force_image_page(runtime.table_mut(), PageIndex::new(page));
         }
     }
     for (index, values) in decoded {
-        let (ingredient, table) = zalsa.ingredient_and_table_mut(index);
-        ingredient.apply_image_slots(table, values);
+        let (ingredient, runtime) = zalsa.lookup_ingredient_mut(index);
+        ingredient.apply_image_slots(runtime.table_mut(), values);
     }
     Ok(())
 }

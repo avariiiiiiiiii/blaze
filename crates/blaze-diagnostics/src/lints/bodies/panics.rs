@@ -37,7 +37,7 @@ use either::Either;
 use hir::InFile;
 use hir_def::{
     AdtId, CallableDefId, ConstParamId, DefWithBodyId, EnumVariantId, GenericDefId, GenericParamId, ItemContainerId,
-    Lookup, VariantId, hir::ExprId, layout::BackendRepr, src::HasChildSource as _,
+    Lookup, VariantId, hir::ExprId, layout::BackendRepr, src::HasChildSourceView as _,
 };
 use hir_expand::{MacroDefKind, builtin::BuiltinFnLikeExpander};
 use hir_ty::{
@@ -59,19 +59,19 @@ use hir_ty::{
 };
 use hir_ty_borrowck::NotChecked;
 use rustc_type_ir::{
-    FloatTy, IntTy, TypeVisitableExt as _, UintTy,
+    TypeVisitableExt as _, UintTy,
     inherent::{IntoKind as _, SliceLike as _},
 };
 use smallvec::SmallVec;
 use syntax::{
-    AstNode as _, SyntaxNodePtr,
-    ast::{self, HasAttrs as _, HasName as _},
+    SyntaxNodePtr,
+    view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
 };
 
 use self::scalar::{Kind, Output, Scalar};
 use super::BodyCx;
 use crate::{
-    cx::def_range,
+    cx::def_range_view,
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -948,43 +948,21 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
 
     /// What a value of `ty` is, with its size, when it is a primitive the lint computes with.
     fn scalar_kind(&self, ty: Ty<'db>) -> Option<(Kind, u8)> {
-        let int = |signed: bool, pointer_sized: bool| Kind::Int { signed, pointer_sized };
-        Some(match ty.kind() {
-            TyKind::Bool => (Kind::Bool, 1),
-            TyKind::Char => (Kind::Char, 4),
-            TyKind::Int(it) => {
-                let size = match it {
-                    IntTy::I8 => 1,
-                    IntTy::I16 => 2,
-                    IntTy::I32 => 4,
-                    IntTy::I64 => 8,
-                    IntTy::I128 => 16,
-                    IntTy::Isize => self.owner.pointer_size?,
-                };
-                (int(true, it == IntTy::Isize), size)
-            }
-            TyKind::Uint(it) => {
-                let size = match it {
-                    UintTy::U8 => 1,
-                    UintTy::U16 => 2,
-                    UintTy::U32 => 4,
-                    UintTy::U64 => 8,
-                    UintTy::U128 => 16,
-                    UintTy::Usize => self.owner.pointer_size?,
-                };
-                (int(false, it == UintTy::Usize), size)
-            }
-            TyKind::Float(it) => {
-                let size = match it {
-                    FloatTy::F16 => 2,
-                    FloatTy::F32 => 4,
-                    FloatTy::F64 => 8,
-                    FloatTy::F128 => 16,
-                };
-                (Kind::Float(it), size)
-            }
-            _ => return None,
-        })
+        let int = |signed: bool, bits: Option<u64>| {
+            let size = match bits {
+                Some(bits) => (bits / 8) as u8,
+                None => self.owner.pointer_size?,
+            };
+            Some((Kind::Int { signed, pointer_sized: bits.is_none() }, size))
+        };
+        match ty.kind() {
+            TyKind::Bool => Some((Kind::Bool, 1)),
+            TyKind::Char => Some((Kind::Char, 4)),
+            TyKind::Int(it) => int(true, it.bit_width()),
+            TyKind::Uint(it) => int(false, it.bit_width()),
+            TyKind::Float(it) => Some((Kind::Float(it), (it.bit_width() / 8) as u8)),
+            _ => None,
+        }
     }
 
     fn env_and_crate(&self) -> ParamEnvAndCrate<'db> {
@@ -1035,12 +1013,11 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         if let MirSpan::ExprId(_) = span
             && let Some(node) = self.b.mir_node(span)
         {
-            let mut syntax = self.b.cx.syntax(node).value;
+            let mut syntax = self.b.cx.syntax_view(node).value;
             while let Some(paren) = syntax.parent().and_then(ast::ParenExpr::cast) {
-                // clone: a node handle, a reference count, for a lint found
-                syntax = paren.syntax().clone();
+                syntax = paren.syntax();
             }
-            let node = InFile::new(node.file_id, SyntaxNodePtr::new(&syntax));
+            let node = InFile::new(node.file_id, ast::ptr(syntax));
             return (node, self.b.cx.span_of(node));
         }
         if let Some(node) = self.b.mir_node(span)
@@ -1049,15 +1026,15 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
             return (node, span);
         }
         let owner = self.b.owner_node();
-        let node = self.b.cx.syntax(owner);
-        (owner, self.b.cx.span(InFile::new(owner.file_id, def_range(&node.value))))
+        let node = self.b.cx.syntax_view(owner);
+        (owner, self.b.cx.span(InFile::new(owner.file_id, def_range_view(node.value))))
     }
 }
 
 /// The name of `param` when it is marked `#[rustc_panics_when_zero]`.
 fn panics_when_zero(db: &Db, param: ConstParamId) -> Option<String> {
-    let sources = param.parent().child_source(db);
-    let Either::Left(ast::TypeOrConstParam::Const(node)) = sources.value.get(param.local_id())? else { return None };
+    let source = param.parent().child_source_view(db, param.local_id());
+    let Either::Left(ast::TypeOrConstParam::Const(node)) = source.value? else { return None };
     let marked = node.attrs().any(|attr| attr.path().is_some_and(|path| path.syntax().text() == "rustc_panics_when_zero"));
     // alloc: the lint's text, for a lint found
     marked.then(|| node.name().map(|it| it.text().to_string()))?

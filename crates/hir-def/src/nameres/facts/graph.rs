@@ -14,6 +14,7 @@
 use std::{iter, sync::LazyLock};
 
 use base_db::Crate;
+use blaze_ids::radix::Csr;
 use blaze_mem::Frame;
 use hashbrown::{HashMap, HashSet, hash_map::Entry};
 use hir_expand::{
@@ -116,69 +117,20 @@ pub(super) struct ImportGraph<'f> {
     targets: FrameVec<'f, u32>,
 }
 
-/// The starts of `rows` rows counted from `keys`: row `r` is `starts[r]..starts[r + 1]`.
-fn row_starts<'f>(frame: &'f Frame, rows: usize, keys: impl Iterator<Item = u32>) -> FrameVec<'f, u32> {
-    let mut starts = Vec::with_capacity_in(rows + 1, frame);
-    starts.resize(rows + 1, 0);
-    for key in keys {
-        starts[key as usize + 1] += 1;
-    }
-    for at in 1..starts.len() {
-        starts[at] += starts[at - 1];
-    }
-    starts
-}
-
 impl<'f> ImportGraph<'f> {
-    /// The graph of `edges` (`(reader, read)`) over `nodes` modules, by two counting sorts (by
-    /// target, then stably by source), so it depends on the set of edges only, not their order
-    /// or repeats.
+    /// The graph of `edges` (`(reader, read)`) over `nodes` modules, by `Csr`'s two counting
+    /// sorts (by target, then stably by source), so it depends on the set of edges only, not
+    /// their order or repeats. Columns and scratch are in `frame`.
     pub(super) fn from_edges(frame: &'f Frame, nodes: u32, edges: &[(u32, u32)]) -> ImportGraph<'f> {
-        let n = nodes as usize;
-        let kept = || {
-            edges.iter().copied().filter(move |&(src, dst)| {
-                assert!(src < nodes && dst < nodes, "import graph edge {src} -> {dst} outside {nodes} modules");
-                src != dst
-            })
-        };
-        // The sources of the edges into `t` are `by_target[into[t]..into[t + 1]]`.
-        let into = row_starts(frame, n, kept().map(|(_, dst)| dst));
-        let mut cursor = Vec::with_capacity_in(n, frame);
-        cursor.extend_from_slice(&into[..n]);
-        let mut by_target = Vec::with_capacity_in(into[n] as usize, frame);
-        by_target.resize(into[n] as usize, 0);
-        for (src, dst) in kept() {
-            let at = &mut cursor[dst as usize];
-            by_target[*at as usize] = src;
-            *at += 1;
-        }
-        // Stably by source over the targets in order: each source's targets come out ascending.
-        let mut offsets = row_starts(frame, n, by_target.iter().copied());
-        cursor.clear();
-        cursor.extend_from_slice(&offsets[..n]);
-        let mut targets = Vec::with_capacity_in(by_target.len(), frame);
-        targets.resize(by_target.len(), 0);
-        for target in 0..n {
-            for &src in &by_target[into[target] as usize..into[target + 1] as usize] {
-                let at = &mut cursor[src as usize];
-                targets[*at as usize] = target as u32;
-                *at += 1;
-            }
-        }
-        // A repeat is next to its first, as each source's targets are ascending.
-        let mut write = 0u32;
-        for m in 0..n {
-            let (start, end) = (offsets[m], offsets[m + 1]);
-            offsets[m] = write;
-            for read in start..end {
-                if read == start || targets[read as usize] != targets[write as usize - 1] {
-                    targets[write as usize] = targets[read as usize];
-                    write += 1;
-                }
-            }
-        }
-        offsets[n] = write;
-        targets.truncate(write as usize);
+        let kept = edges.iter().copied().filter(move |&(src, dst)| {
+            assert!(src < nodes && dst < nodes, "import graph edge {src} -> {dst} outside {nodes} modules");
+            src != dst
+        });
+        let mut graph = Csr::new_in(frame);
+        graph.rebuild_graph(nodes as usize, kept, &mut Csr::new_in(frame), &mut Vec::new_in(frame));
+        // Each source's targets are ascending, so a repeat is next to its first.
+        graph.dedup_rows();
+        let (offsets, targets) = graph.into_parts();
         ImportGraph { offsets, targets }
     }
 
@@ -291,23 +243,19 @@ pub(super) fn components(frame: &Frame, graph: &ImportGraph<'_>) -> Partition {
         *at = n - 1 - *at;
     }
     // Members by component, a counting sort over the modules in order: each list ascending.
-    let starts = row_starts(frame, found as usize, rindex.iter().copied());
-    stack.clear();
-    stack.extend_from_slice(&starts[..found as usize]);
-    let mut members = Vec::with_capacity_in(n as usize, frame);
-    members.resize(n as usize, 0);
-    for (module, &component) in rindex.iter().enumerate() {
-        let at = &mut stack[component as usize];
-        members[*at as usize] = module as u32;
-        *at += 1;
-    }
+    let mut members = Csr::new_in(frame);
+    members.rebuild(
+        found as usize,
+        rindex.iter().enumerate().map(|(module, &component)| (component, module as u32)),
+        &mut stack,
+    );
     Partition {
         // alloc: the query's value, three exact columns, once per round
         of: Box::from(&rindex[..]),
         // alloc: as `of`
-        starts: Box::from(&starts[..]),
+        starts: Box::from(members.starts()),
         // alloc: as `of`
-        members: Box::from(&members[..]),
+        members: Box::from(members.items()),
     }
 }
 

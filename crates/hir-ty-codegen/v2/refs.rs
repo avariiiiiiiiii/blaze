@@ -660,9 +660,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         operands.iter().map(|it| self.operand(it)).collect()
     }
 
-    /// Whether `operand` is what `line!()`, `column!()`, `file!()` or a `concat!` of them
-    /// expanded to, which `builtin_location` makes of where it is: data that points nowhere
-    /// else, a literal's when it does not.
+    /// Whether `operand` is what `file!()`, or a `concat!` with it, expanded to, which
+    /// `builtin_location` makes of where it is: data that points nowhere else, a literal's
+    /// when it does not.
     fn located(&self, operand: &Operand) -> bool {
         let Some((owner, expr)) = self.fx.written_expr(operand.span()) else { return false };
         let InferBodyId::DefWithBodyId(def) = owner else { return false };

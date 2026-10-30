@@ -21,6 +21,15 @@
   lints ask hir rather than rebuilding the solver's answers.
 
 > forwarded to db (`crates/hir`) (from requests, pass 16; told by tmux).
+> applied by db-audit-other-types (2026-10-29 22:41): none of the five existed; written in
+> `crates/hir/src/lib.rs` with the callers' signatures: `Type::env_bounds` (beside `env_traits`;
+> type arguments only after `Self`, as `impls_trait` takes types), `Type::ref_to` (erased region,
+> beside `add_reference`), `Type::is_sized` (`Sized` via `implements_trait_unique`, an error type
+> sized), `Type::may_implement_copy` (`type_allowed_to_implement_copy` with `Safety::Safe`: core's
+> primitives, else an ADT with no unsafe field, no `drop::destructor`, every field `is_copy` with the
+> type's arguments; modulo regions, hir-ty has no region resolver outside bodies), and
+> `Callable::safety` (the erased signature's). Tests: `crates/hir/src/tests/types.rs`.
+> checked by db-audit-other (22:52): in the tree at `crates/hir/src/lib.rs`: `ref_to` :5174, `is_sized` :5468, `may_implement_copy` :5489 (rustc's arms and its skip of error fields), `env_bounds` :6204, `Callable::safety` :6485. Not compiled.
 
 ## db (`crates/hir`): two more for `needless_pass_by_value`
 
@@ -42,6 +51,18 @@
   move is semantics; it belongs in the front end (semantics-in-front-end), not re-derived in a lint.
 
 > forwarded to db (db-next2, `crates/hir/`) (requests, pass 18; told by tmux).
+> applied by db-audit-other-types (2026-10-29 22:41): the `impls_trait_fresh` half only, in
+> `crates/hir/src/lib.rs` after `impls_trait`: `traits::implements_trait_unique`, which already
+> fills the arguments after `Self` fresh; tested in `crates/hir/src/tests/types.rs`. The
+> `BodyAnalysis::consumes` half is `db-audit-other-bodyanalysis`'.
+> applied by db-audit-other-bodyanalysis (2026-10-29 23:10): the `consumes` half only.
+> `hir_ty::infer::closure::analysis::expr_use_visitor::moved_locals(db, def, &InferenceResult)`
+> merges the finished result into a fresh context and walks the body with
+> `ExprUseVisitor::for_body` (rustc's `body_owner_is_closure == false`: a nested closure's
+> captures are the body's locals) and clippy's `MovedVariablesCtxt` as delegate; `consumes`
+> binary-searches its sorted answer, `true` for a body the walk stops at a type error in.
+> Tested in `crates/hir/src/body_analysis/tests.rs` (moved, read, `move` closure); not built.
+> checked by db-audit-other (23:16): both halves are in the tree. `impls_trait_fresh` is at `crates/hir/src/lib.rs:5363`. `consumes` is at `crates/hir/src/body_analysis.rs:351`, over `hir_ty::infer::closure::analysis::expr_use_visitor::moved_locals` (sorted and deduped; only `consume` is recorded, as clippy's `MovedVariablesCtxt`). Not compiled.
 
 ## lints-driver (`crates/blaze-lints/src/check.rs`, `lints/mod.rs`)
 

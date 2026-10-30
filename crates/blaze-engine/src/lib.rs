@@ -44,16 +44,20 @@ mod tier;
 mod versions;
 mod whole;
 
-/// The daemon holds millions of small allocations and frees a file's worth of them on each
-/// edit, which the system allocator is slow at. jemalloc gives the system back more of what
-/// a build freed than mimalloc does. It is not built for Windows.
-#[cfg(all(unix, not(test)))]
+/// What the general allocator still serves (startup, configuration, rare large one-offs; the
+/// bulk of a build comes from `blaze-mem`, which gives its pages back itself) wants the fastest
+/// small-object allocator, mimalloc. Counted, so that the plane's `arena::measure` and
+/// admission's `arena::held` see its bytes.
+#[cfg(all(not(test), not(all(unix, feature = "heap-profile"))))]
 #[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static ALLOC: blaze_graph::arena::Counting<mimalloc::MiMalloc> =
+    blaze_graph::arena::Counting(mimalloc::MiMalloc);
 
-#[cfg(all(windows, not(test)))]
+/// `heap-profile` profiles jemalloc's heap, so jemalloc serves under it. Not on Windows.
+#[cfg(all(unix, feature = "heap-profile", not(test)))]
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: blaze_graph::arena::Counting<tikv_jemallocator::Jemalloc> =
+    blaze_graph::arena::Counting(tikv_jemallocator::Jemalloc);
 
 /// The tests hold the hot paths to allocation budgets.
 #[cfg(test)]
@@ -62,6 +66,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use ide_db::base_db::{CrateOrigin, LangCrateOrigin, TargetKind};
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
@@ -90,11 +95,8 @@ use project_model::{
     ProjectWorkspaceKind, RustLibSource, TargetDirectoryConfig, WorkspaceBuildScripts,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use syntax::{
-    AstNode, SyntaxNode,
-    ast::{self, HasName},
-    match_ast,
-};
+use rustc_symbols::{Paths, Places, StaticPath};
+use syntax::view::{AstNode, HasName};
 use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 #[cfg(unix)]
@@ -914,14 +916,6 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// What reads the syntax, with each file a module of the crates of the programs.
-    fn sema(&self) -> hir::Semantics<'a> {
-        match &self.programs {
-            Some(crates) => hir::Semantics::new_within(self.db, crates.clone()),
-            None => hir::Semantics::new(self.db),
-        }
-    }
-
     /// Whether the crate is of the standard library blaze built before.
     fn prebuilt(&self, krate: ide_db::base_db::Crate) -> bool {
         self.prebuilt.as_ref().is_some_and(|it| it.crates.contains(&krate))
@@ -933,68 +927,42 @@ impl<'a> Resolver<'a> {
     }
 }
 
+impl<'a> Paths<'a> for Resolver<'a> {
+    fn db(&self) -> &'a Db {
+        self.db
+    }
+
+    /// How the paths of symbols spell a crate ([`Resolver::crate_path_of`]).
+    fn crate_path(&self, krate: Crate) -> Option<Cow<'_, str>> {
+        self.crate_facts(krate.into()).path.as_deref().map(Cow::Borrowed)
+    }
+
+    /// What reads the syntax, with each file a module of the crates of the programs.
+    fn sema(&self) -> hir::view::Semantics<'a> {
+        match &self.programs {
+            Some(crates) => hir::view::Semantics::new_within(self.db, crates.clone()),
+            None => hir::view::Semantics::new(self.db),
+        }
+    }
+
+    fn places(&self) -> &Places {
+        &self.places
+    }
+}
+
 impl Resolver<'_> {
     /// [`SymbolResolver::static_`], worked out.
     fn static_named(&self, id: StaticId) -> Option<String> {
         if self.prebuilt(hir_def::HasModule::krate(&id, self.db)) {
             return self.in_prebuilt(self.own_static_name(id)?);
         }
-        let ModuleDef::Static(it) = ModuleDef::from(ModuleDefId::StaticId(id)) else {
-            return None;
+        let symbol = match self.static_path(id)? {
+            StaticPath::Item(path) => self.table.get(&path),
+            StaticPath::InBody { path, closures, place, around } => self
+                .table
+                .get_nested(&path, &closures, place, &around)
+                .or_else(|| self.table.get_at(&path, place, &around)),
         };
-        let module = it.module(self.db);
-        let name = it.name(self.db);
-        if module.nearest_non_block_module(self.db) == module {
-            let path = self.item_path(module, name.as_str())?;
-            return self.table.get(&path).map(str::to_owned);
-        }
-        // A static in a body is named after the items around it, which only the syntax knows.
-        let sema = self.sema();
-        let source = sema.source(it)?;
-        let mut names = vec![name.as_str().to_owned()];
-        let mut closures = Vec::new();
-        let mut around = Vec::new();
-        let mut owner = None;
-        for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
-            if is_closure(&node) {
-                closures.push(closure_number(&sema, &self.places, &node)?);
-                continue;
-            }
-            if let Some(func) = ast::Fn::cast(node.clone()) {
-                if func.async_token().is_some() {
-                    closures.push(0);
-                }
-                let func = self.function_at(&sema, module, &func)?;
-                owner = Some(self.path(func.try_into().ok()?)?);
-                break;
-            }
-            if let Some(name) = name_in_path(&node) {
-                around.push(place_in_definition(&sema, &node, Counts::InPath(&name))?.into());
-                names.push(name);
-            }
-        }
-        let owner = match owner {
-            Some(owner) => owner,
-            None => {
-                around.pop();
-                let outer = names.pop()?;
-                self.item_path(module.nearest_non_block_module(self.db), &outer)?
-            }
-        };
-        names.push(owner);
-        names.reverse();
-        closures.reverse();
-        around.reverse();
-        let path = names.join("::");
-        // Only a path through a closure or an anonymous constant has segments left out of it.
-        let named = Counts::Statics(name.as_str());
-        let counted = Counted::Statics(name.as_str().to_owned());
-        let place =
-            place_counted(&sema, &self.places, counted, source.value.syntax(), named)?.into();
-        let symbol = self
-            .table
-            .get_nested(&path, &closures, place, &around)
-            .or_else(|| self.table.get_at(&path, place, &around));
         symbol.map(str::to_owned)
     }
 
@@ -1004,59 +972,6 @@ impl Resolver<'_> {
         path.strip_prefix(&self.root).ok().or(base)
     }
 
-    /// The function's path as `rustc-demangle` prints its v0 symbol.
-    fn path(&self, func: FunctionId) -> Option<String> {
-        let ModuleDef::Function(func) = ModuleDef::from(ModuleDefId::FunctionId(func)) else {
-            return None;
-        };
-        let name = func.name(self.db);
-        let Some(assoc) = func.as_assoc_item(self.db) else {
-            return self.item_path(func.module(self.db), name.as_str());
-        };
-        // A method a trait provides is named after the trait, as what its body declares is.
-        let imp = match assoc.container(self.db) {
-            AssocItemContainer::Impl(imp) => imp,
-            AssocItemContainer::Trait(trait_) => {
-                let trait_ = self.item_path(trait_.module(self.db), trait_.name(self.db).as_str());
-                return Some(format!("{}::{}", trait_?, name.as_str()));
-            }
-        };
-        let self_ty = self.type_path(&imp.self_ty(self.db))?;
-        match imp.trait_(self.db) {
-            Some(trait_) => {
-                let mut path =
-                    self.item_path(trait_.module(self.db), trait_.name(self.db).as_str())?;
-                // `impl PartialEq<str> for String` and `impl PartialEq<&str> for String` are
-                // told apart by the trait's arguments alone.
-                let trait_ref = imp.trait_ref(self.db)?;
-                let params = hir::GenericDef::from(trait_).type_or_const_params(self.db);
-                let mut args = Vec::new();
-                for (idx, param) in params.iter().enumerate().skip(1) {
-                    let arg = trait_ref.get_type_argument(idx)?;
-                    let default = param.as_type_param(self.db).and_then(|it| it.default(self.db));
-                    // FIXME: a default that names a parameter is understood only as `= Self`.
-                    let is_default = default.as_ref().is_some_and(|default| {
-                        if default.as_type_param(self.db).is_some() {
-                            return hir::attach_db(self.db, || arg == trait_ref.self_ty());
-                        }
-                        let default = self.type_path(default);
-                        default.is_some() && default == self.type_path(&arg)
-                    });
-                    if idx + 1 == params.len() && is_default {
-                        break;
-                    }
-                    args.push(self.type_path(&arg)?);
-                }
-                if !args.is_empty() {
-                    path = format!("{path}<{}>", args.join(", "));
-                }
-                let trait_ = path;
-                Some(format!("<{self_ty} as {trait_}>::{}", name.as_str()))
-            }
-            None => Some(format!("<{self_ty}>::{}", name.as_str())),
-        }
-    }
-
     /// The symbol of `func`, when it has one.
     fn function_named(&self, func: FunctionId) -> Option<String> {
         if let Some(symbol) = exported_symbol(self.db, func) {
@@ -1064,7 +979,7 @@ impl Resolver<'_> {
         }
         // rustc built nothing of blaze's test harness.
         if in_harness(self.db, func) {
-            return Some(format!("blaze.harness.{}", self.path(func)?));
+            return Some(format!("blaze.harness.{}", self.function_path(func)?));
         }
         let krate = hir_def::HasModule::krate(&func, self.db);
         if let Some(symbol) = linked_symbol(self.db, func)
@@ -1094,7 +1009,7 @@ impl Resolver<'_> {
         }
         let extern_block =
             matches!(func.lookup(self.db).container, ItemContainerId::ExternBlockId(_));
-        let Some(path) = self.path(func) else {
+        let Some(path) = self.function_path(func) else {
             // No path to look up in what rustc built, but one of a crate rustc built nothing of
             // is ours to name all the same, by where it is written.
             if extern_block || self.rustc_built(krate) {
@@ -1136,7 +1051,7 @@ impl Resolver<'_> {
     /// The name blaze gives a non-generic function of the crate `id` names: where it is, and
     /// for one in a body where in the source that is.
     fn function_named_in(&self, func: FunctionId, id: u64) -> Option<String> {
-        let Some(path) = self.path(func) else {
+        let Some(path) = self.function_path(func) else {
             // No path to write (the `impl` is for `!`, `dyn Trait`, a type taking a constant, or
             // the function sits where `item_path` cannot reach): its name and where it is
             // written say which function it is just as well.
@@ -1185,7 +1100,7 @@ impl Resolver<'_> {
         if !is_in_body(self.db, module) {
             return false;
         }
-        let Some(path) = self.path(func) else { return false };
+        let Some(path) = self.function_path(func) else { return false };
         let krate = module.krate(self.db);
         let listed = lock(&self.listed.functions).get(&krate).cloned();
         // Kept with the listing, which an edit to more than bodies forgets, for the builds
@@ -1221,7 +1136,7 @@ impl Resolver<'_> {
             if !is_in_body(self.db, hir::Function::from(func).module(self.db)) {
                 continue;
             }
-            let Some(path) = self.path(func) else { continue };
+            let Some(path) = self.function_path(func) else { continue };
             if !seen.insert(path.clone()) {
                 shared.insert(path);
             }
@@ -1232,11 +1147,6 @@ impl Resolver<'_> {
     /// rustc's `StableCrateId` of a crate it built something of.
     fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
         self.crate_facts(krate).rustc_id
-    }
-
-    /// How the paths of symbols spell a crate.
-    fn crate_path(&self, krate: Crate) -> Option<&str> {
-        self.crate_facts(krate.into()).path.as_deref()
     }
 
     /// What stands for a crate of the checkout that rustc built nothing of.
@@ -1333,158 +1243,6 @@ impl Resolver<'_> {
     /// The file the crate's source starts at.
     fn crate_root(&self, krate: Crate) -> Option<PathBuf> {
         crate_root_file(self.db, krate)
-    }
-
-    fn item_path(&self, module: Module, name: &str) -> Option<String> {
-        let mut path = self.scope_path(module)?;
-        path.push_str("::");
-        path.push_str(name);
-        Some(path)
-    }
-
-    /// The function written at `func`, which holds the block that `scope` is the module of.
-    ///
-    /// `Semantics::to_def` answers the same, but starts from every crate the file is part of,
-    /// which for a package with tests and examples analyses all its dev-dependencies.
-    fn function_at(
-        &self,
-        sema: &hir::Semantics<'_>,
-        scope: Module,
-        func: &ast::Fn,
-    ) -> Option<hir::Function> {
-        let db = self.db;
-        let file = sema.hir_file_for(func.syntax());
-        let written = hir::InFile::new(file, file.ast_id_map(db).ast_id(func));
-        let is_it = |it: &hir::Function| {
-            FunctionId::try_from(*it).is_ok_and(|it| it.lookup(db).id == written)
-        };
-        let among = |items: Vec<hir::AssocItem>| {
-            items.into_iter().filter_map(hir::AssocItem::as_function).find(is_it)
-        };
-        let mut module = Some(scope);
-        while let Some(it) = module {
-            let found = it
-                .declarations(db)
-                .into_iter()
-                .find_map(|def| match def {
-                    ModuleDef::Function(func) => Some(func).filter(is_it),
-                    ModuleDef::Trait(trait_) => among(trait_.items(db)),
-                    _ => None,
-                })
-                .or_else(|| it.impl_defs(db).into_iter().find_map(|imp| among(imp.items(db))));
-            if found.is_some() || it.nearest_non_block_module(db) == it {
-                return found;
-            }
-            module = it.parent(db);
-        }
-        None
-    }
-
-    /// The path of what holds a module's items: the module, or for the items of a block the
-    /// function, closure, constant or static the block is in, which only the syntax knows.
-    fn scope_path(&self, module: Module) -> Option<String> {
-        if module.nearest_non_block_module(self.db) == module {
-            // alloc: a miss: the path is built once, into the memo of what asked for it.
-            let mut path = self.crate_path(module.krate(self.db))?.to_owned();
-            for segment in module.path_segments(self.db) {
-                path.push_str("::");
-                path.push_str(segment.as_str());
-            }
-            return Some(path);
-        }
-        let sema = self.sema();
-        let source = module.definition_source(self.db);
-        let hir::ModuleSource::BlockExpr(block) = source.value else { return None };
-        let range = block.syntax().text_range();
-        let block = sema
-            .parse_or_expand(source.file_id)
-            .covering_element(range)
-            .ancestors()
-            .find(|it| it.text_range() == range && ast::BlockExpr::can_cast(it.kind()))?;
-        let mut inner = Vec::new();
-        let mut owner = None;
-        for node in sema.ancestors_with_macros(block) {
-            if is_closure(&node) {
-                inner.push(format!("{{closure#{}}}", closure_number(&sema, &self.places, &node)?));
-                continue;
-            }
-            if let Some(func) = ast::Fn::cast(node.clone()) {
-                // The body of an `async fn` is a closure to rustc.
-                if func.async_token().is_some() {
-                    inner.push("{closure#0}".to_owned());
-                }
-                let func = self.function_at(&sema, module, &func)?;
-                owner = Some(self.path(func.try_into().ok()?)?);
-                break;
-            }
-            match_ast! {
-                match node {
-                    ast::Const(it) => inner.push(it.name().map_or("_".to_owned(), |it| it.text().to_owned())),
-                    ast::Static(it) => inner.push(it.name()?.text().to_owned()),
-                    // Anonymous constants have numbers we don't know.
-                    ast::BlockExpr(it) => if it.const_token().is_some() { return None },
-                    ast::ConstArg(_) => return None,
-                    _ => {},
-                }
-            }
-        }
-        let mut path = match owner {
-            Some(owner) => owner,
-            None => {
-                let outer = inner.pop()?;
-                self.item_path(module.nearest_non_block_module(self.db), &outer)?
-            }
-        };
-        for segment in inner.iter().rev() {
-            path.push_str("::");
-            path.push_str(segment);
-        }
-        Some(path)
-    }
-
-    /// A type the way rustc writes it in a symbol.
-    fn type_path(&self, ty: &hir::Type<'_>) -> Option<String> {
-        if let Some((inner, mutability)) = ty.as_reference() {
-            let inner = self.type_path(&inner)?;
-            return Some(match mutability {
-                hir::Mutability::Shared => format!("&{inner}"),
-                hir::Mutability::Mut => format!("&mut {inner}"),
-            });
-        }
-        if let Some(elem) = ty.as_slice() {
-            return Some(format!("[{}]", self.type_path(&elem)?));
-        }
-        if let Some(builtin) = ty.as_builtin() {
-            return Some(builtin.name().as_str().to_owned());
-        }
-        if ty.is_tuple() {
-            let fields: Option<Vec<_>> =
-                ty.tuple_fields(self.db).iter().map(|it| self.type_path(it)).collect();
-            return Some(match &*fields? {
-                [only] => format!("({only},)"),
-                fields => format!("({})", fields.join(", ")),
-            });
-        }
-        // A parameter of the `impl` an item is in, where the item is not generic itself: a
-        // static, or what a closure or constant in a generic function holds.
-        if ty.as_type_param(self.db).is_some() {
-            return Some("_".to_owned());
-        }
-        let adt = ty.as_adt()?;
-        let path = self.item_path(adt.module(self.db), adt.name(self.db).as_str())?;
-        let generics = hir::GenericDef::from(adt);
-        let params = generics.type_or_const_params(self.db);
-        if params.is_empty() {
-            return Some(path);
-        }
-        // rustc leaves a defaulted const argument out of the name, so `Bump` may be `Bump<1>`.
-        // FIXME: name those too.
-        if !params.iter().all(|it| it.as_type_param(self.db).is_some()) {
-            return None;
-        }
-        // Lifetimes are erased, and rustc leaves erased ones out of the name.
-        let args: Option<Vec<_>> = ty.type_arguments().map(|arg| self.type_path(&arg)).collect();
-        Some(format!("{path}<{}>", args?.join(", ")))
     }
 }
 
@@ -1696,8 +1454,10 @@ impl SymbolResolver for Resolver<'_> {
 
     fn private(&self, func: FunctionId) -> bool {
         // alloc: a miss: the path is spelled once a build.
-        let private =
-            || !self.is_generic(func) && self.path(func).is_some_and(|path| self.table.private(&path));
+        let private = || {
+            !self.is_generic(func)
+                && self.function_path(func).is_some_and(|path| self.table.private(&path))
+        };
         *self.memos.privates.get_or_insert_with(func, private)
     }
 
@@ -1722,32 +1482,8 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn closure(&self, owner: FunctionId, expr: hir_def::hir::ExprId) -> Option<intern::Symbol> {
-        let source_map = &Body::with_source_map(self.db, owner.into()).1;
-        let written = source_map.expr_syntax(expr).ok()?;
-        let sema = self.sema();
-        let node = written.value.to_node(&sema.parse_or_expand(written.file_id));
         // alloc: a closure's path, once per unit that names it.
-        let mut inner = Vec::new();
-        for node in sema.ancestors_with_macros(node.syntax().clone()) {
-            if is_closure(&node) {
-                // alloc: a closure's path, once per unit that names it.
-                inner.push(format!("{{closure#{}}}", closure_number(&sema, &self.places, &node)?));
-                continue;
-            }
-            if let Some(func) = ast::Fn::cast(node) {
-                // The body of an `async fn` is a closure of its own to rustc.
-                if func.async_token().is_some() {
-                    return None;
-                }
-                break;
-            }
-        }
-        let mut path = self.path(owner)?;
-        for segment in inner.iter().rev() {
-            path.push_str("::");
-            path.push_str(segment);
-        }
-        self.table.get(&path).map(intern::Symbol::intern)
+        self.table.get(&self.closure_path(owner, expr)?).map(intern::Symbol::intern)
     }
 
     fn makers(&self, function: &str, out: &mut Vec<u64>) {
@@ -1807,55 +1543,11 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
-        let adt = hir::Adt::from(adt);
-        let sema = self.sema();
-        let source = sema.source(adt)?;
-        let mut around = sema.ancestors_with_macros(source.value.syntax().clone()).skip(1);
-        let func = ast::Fn::cast(around.find(is_definition)?)?;
-        // The body of an `async fn` is a closure to rustc.
-        if func.async_token().is_some() {
-            return None;
-        }
-        let name = adt.name(self.db);
-        let named_so = func.syntax().descendants().filter_map(ast::Name::cast).filter(|it| {
-            it.text() == name.as_str()
-                && it.syntax().parent().is_some_and(|it| {
-                    ast::Adt::can_cast(it.kind())
-                        || ast::Trait::can_cast(it.kind())
-                        || ast::TypeAlias::can_cast(it.kind())
-                        || ast::Module::can_cast(it.kind())
-                })
-        });
-        if named_so.count() != 1 {
-            return None;
-        }
-        self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()
+        self.declaring_function(adt)
     }
 
     fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
-        use hir::HasSource;
-        let db = self.db;
-        let it = hir::Impl::from(id);
-        let source = it.source(db)?;
-        // FIXME: where rustc puts the `impl`s a macro makes among the ones written out.
-        if source.file_id.is_macro() {
-            return None;
-        }
-        let start = |it: &hir::InFile<ast::Impl>| it.value.syntax().text_range().start();
-        let mut earlier = 0;
-        for other in it.module(db).impl_defs(db) {
-            let other = other.source(db)?;
-            // rustc numbers what a module has written out before what its macros and derives
-            // make, which it only has once they are expanded.
-            if other.file_id.is_macro() {
-                continue;
-            }
-            if other.file_id != source.file_id {
-                return None;
-            }
-            earlier += u32::from(start(&other) < start(&source));
-        }
-        Some(earlier)
+        rustc_symbols::impl_place(self.db, id)
     }
 
     fn nothing_of_rustc(&self) -> bool {
@@ -1881,9 +1573,8 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn item(&self, item: ModuleDefId) -> Option<String> {
-        let item = ModuleDef::from(item);
         // alloc: an item's path, which the caller extends into the symbol it spells.
-        self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
+        self.item_path_of(item)
     }
 
     fn adt_at(&self, path: &str) -> Option<hir_def::AdtId> {
@@ -1894,7 +1585,7 @@ impl SymbolResolver for Resolver<'_> {
         let name = segments.pop()?;
         Crate::all(db)
             .into_iter()
-            .filter(|&it| self.crate_path(it) == Some(krate))
+            .filter(|&it| self.crate_path(it).as_deref() == Some(krate))
             .find_map(|it| {
                 let mut module = it.root_module(db);
                 for segment in &segments {
@@ -1908,23 +1599,6 @@ impl SymbolResolver for Resolver<'_> {
                 let id = hir_def::AdtId::from(adt);
                 (self.item(id.into()).as_deref() == Some(path)).then_some(id)
             })
-    }
-}
-
-/// The segment a constant or static that items are written in adds to their path, as rustc
-/// prints it: its name, or `_` for an unnamed constant. objc2's `declare_class!` keeps a
-/// class's ivar offsets in statics in a `const _: () = { .. }`, which rustc exports as
-/// `<module>::_::__OBJC2_IVAR_OFFSET`.
-fn name_in_path(node: &SyntaxNode) -> Option<String> {
-    match_ast! {
-        match node {
-            ast::Const(it) => it
-                .name()
-                .map(|it| it.text().to_string())
-                .or_else(|| it.underscore_token().map(|_| "_".to_owned())),
-            ast::Static(it) => it.name().map(|it| it.text().to_string()),
-            _ => None,
-        }
     }
 }
 
@@ -1953,544 +1627,6 @@ fn crate_place(root: &Path, inside: Option<&Path>, cargo_home: Option<&str>) -> 
 fn short_hash(text: &str) -> u64 {
     let hash = <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes());
     u64::from_le_bytes(hash[..8].try_into().expect("a hash is 32 bytes"))
-}
-
-/// Whether rustc numbers the node as a closure: a closure, or an `async` block.
-fn is_closure(node: &SyntaxNode) -> bool {
-    ast::ClosureExpr::can_cast(node.kind())
-        || ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.async_token().is_some())
-}
-
-fn is_definition(node: &SyntaxNode) -> bool {
-    !ast::MacroCall::can_cast(node.kind())
-        && (ast::Item::can_cast(node.kind())
-            || ast::AssocItem::can_cast(node.kind())
-            || ast::ConstArg::can_cast(node.kind())
-            || is_closure(node)
-            || ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.const_token().is_some()))
-}
-
-/// The place of a node among those of the definition it is written in that `counts` holds
-/// of, in the order rustc comes across them, or none when that order cannot be told. This is
-/// how rustc tells apart the closures of a function, and the statics of one name that a
-/// macro used twice in it declares.
-fn place_in_definition(
-    sema: &hir::Semantics<'_>,
-    target: &SyntaxNode,
-    counts: Counts<'_>,
-) -> Option<u32> {
-    let along: Vec<_> = sema.ancestors_with_macros(target.clone()).collect();
-    let owner = owner_of(&along)?;
-    let mut count = Count::new(sema, Some(target), along, counts, &owner);
-    count.all_in(&owner)?;
-    count.waiting_ones()?;
-    count.earlier
-}
-
-/// The definition a node is written in, as [`place_in_definition`] counts in: the first of
-/// `along` but the node that is one, or the last.
-fn owner_of(along: &[SyntaxNode]) -> Option<SyntaxNode> {
-    let mut root = None;
-    let owner = along.iter().skip(1).cloned().find(|node| {
-        root = Some(node.clone());
-        is_definition(node)
-    });
-    owner.or(root)
-}
-
-/// [`place_in_definition`] of what `counted` names, every node of the definition counted
-/// once and kept in `places`: a definition with many closures, or a macro used many times
-/// that declares a static each time (tracing's `META` and `__CALLSITE`), is gone through
-/// once instead of once a node, which made a build in full of a large program wait on one
-/// thread (#259). A node whose place the count does not find is counted alone as before.
-fn place_counted(
-    sema: &hir::Semantics<'_>,
-    places: &Places,
-    counted: Counted,
-    target: &SyntaxNode,
-    counts: Counts<'_>,
-) -> Option<u32> {
-    let along: Vec<_> = sema.ancestors_with_macros(target.clone()).collect();
-    let owner = owner_of(&along)?;
-    if let Some(spot) = spot_in(&along, &owner) {
-        let of = PlacesOf {
-            file: sema.hir_file_for(&owner),
-            range: owner.text_range(),
-            kind: owner.kind(),
-            counted,
-        };
-        let known = places.0.lock().unwrap_or_else(|e| e.into_inner()).get(&of).cloned();
-        let all = known.unwrap_or_else(|| {
-            let all = all_places(sema, &owner, counts).map(Arc::new);
-            places.0.lock().unwrap_or_else(|e| e.into_inner()).insert(of, all.clone());
-            all
-        });
-        if let Some(&place) = all.as_ref().and_then(|all| all.get(&spot)) {
-            return Some(place);
-        }
-    }
-    place_in_definition(sema, target, counts)
-}
-
-/// The places of all the nodes of the definition `owner` that `counts` holds of, by where
-/// each is ([`Spot`]), or none when the order rustc numbers them in is not known.
-fn all_places(
-    sema: &hir::Semantics<'_>,
-    owner: &SyntaxNode,
-    counts: Counts<'_>,
-) -> Option<FxHashMap<Spot, u32>> {
-    let mut count = Count::new(sema, None, Vec::new(), counts, owner);
-    count.places = Some(FxHashMap::default());
-    count.all_in(owner)?;
-    count.waiting_ones()?;
-    let mut places = count.places?;
-    // Two nodes in one spot are told apart by nothing a spot has.
-    for spot in count.twice {
-        places.remove(&spot);
-    }
-    Some(places)
-}
-
-/// Where `along`'s first node is in the definition `owner`, which `along` goes up to: the
-/// macros it is expanded from and the expansion of each, or none when an attribute or a
-/// derive made a node on the way, which the count does not go into.
-fn spot_in(along: &[SyntaxNode], owner: &SyntaxNode) -> Option<Spot> {
-    let at_owner = along.iter().position(|it| it == owner)?;
-    let mut calls = Vec::new();
-    for at in (1..at_owner).rev() {
-        let node = &along[at];
-        if ast::MacroCall::can_cast(node.kind()) {
-            let root = &along[at - 1];
-            if root.parent().is_some() {
-                return None;
-            }
-            calls.push((node.text_range(), root.kind()));
-        } else if node.parent().is_none() && !ast::MacroCall::can_cast(along[at + 1].kind()) {
-            // An expansion that no macro call along is of.
-            return None;
-        }
-    }
-    if along.first()?.parent().is_none() {
-        return None;
-    }
-    Some((calls, along.first()?.text_range()))
-}
-
-/// The places of the counted nodes of the definitions gone through ([`place_counted`]).
-#[derive(Clone, Default)]
-struct Places(Arc<std::sync::Mutex<FxHashMap<PlacesOf, Option<Arc<FxHashMap<Spot, u32>>>>>>);
-
-/// A definition, and what is counted in it.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct PlacesOf {
-    file: hir::HirFileId,
-    range: syntax::TextRange,
-    kind: syntax::SyntaxKind,
-    counted: Counted,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum Counted {
-    Closures,
-    /// The statics of a name.
-    Statics(String),
-}
-
-/// The nodes a count counts.
-#[derive(Clone, Copy)]
-enum Counts<'a> {
-    Closures,
-    /// The statics of a name.
-    Statics(&'a str),
-    /// The constants and statics [`name_in_path`] gives a name.
-    InPath(&'a str),
-}
-
-impl Counts<'_> {
-    fn holds(self, node: &SyntaxNode) -> bool {
-        match self {
-            Counts::Closures => is_closure(node),
-            Counts::Statics(name) => ast::Static::cast(node.clone())
-                .is_some_and(|it| it.name().is_some_and(|it| it.text() == name)),
-            Counts::InPath(name) => name_in_path(node).as_deref() == Some(name),
-        }
-    }
-}
-
-/// Where a node is in a definition: the macros it is expanded from, the outermost first,
-/// each by where it is used and what it is expanded to (a macro used in a body is expanded
-/// both to items and to statements, of the same text), and the node's range in the last.
-type Spot = (Vec<(syntax::TextRange, syntax::SyntaxKind)>, syntax::TextRange);
-
-/// The imports of the scope of a definition that rustc has not resolved when it first comes
-/// to the macros used in the definition: those a macro expanded to. It resolves the imports
-/// it has, then expands every macro it can, and only then resolves the imports that those
-/// expanded to.
-#[derive(Default)]
-struct LateImports {
-    names: FxHashSet<String>,
-    glob: bool,
-}
-
-impl LateImports {
-    fn around(sema: &hir::Semantics<'_>, owner: &SyntaxNode) -> LateImports {
-        let mut late = LateImports::default();
-        let module_expanded = module_is_expanded(sema, owner);
-        let expanded = |node: &SyntaxNode| {
-            module_expanded
-                || sema.hir_file_for(node).is_macro()
-                || sema
-                    .ancestors_with_macros(node.clone())
-                    .filter_map(ast::Item::cast)
-                    .any(|item| has_attribute_macro(sema, &item))
-        };
-        if expanded(owner) {
-            late.add_written_in(owner);
-        }
-        for scope in sema.ancestors_with_macros(owner.clone()) {
-            if expanded(&scope) {
-                let imports = scope.children().filter_map(ast::Use::cast);
-                imports.filter_map(|it| it.use_tree()).for_each(|tree| late.add(&tree, None));
-            }
-            if ast::Module::can_cast(scope.kind()) {
-                break;
-            }
-        }
-        late
-    }
-
-    /// Adds the imports written in the blocks of a definition, those of the definitions in
-    /// it apart.
-    fn add_written_in(&mut self, node: &SyntaxNode) {
-        for child in node.children() {
-            if let Some(tree) = ast::Use::cast(child.clone()).and_then(|it| it.use_tree()) {
-                self.add(&tree, None);
-            } else if !is_definition(&child) {
-                self.add_written_in(&child);
-            }
-        }
-    }
-
-    /// Adds the names the tree brings in, `prefix` being the last name of the path before it.
-    fn add(&mut self, tree: &ast::UseTree, prefix: Option<String>) {
-        let last = tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string());
-        let own = if last.as_deref() == Some("self") { prefix } else { last };
-        if let Some(list) = tree.use_tree_list() {
-            list.use_trees().for_each(|it| self.add(&it, own.clone()));
-        } else if tree.star_token().is_some() {
-            self.glob = true;
-        } else if let Some(name) = tree.rename().and_then(|it| it.name()) {
-            self.names.insert(name.text().to_owned());
-        } else {
-            self.names.extend(own);
-        }
-    }
-}
-
-/// Whether an attribute of the item is a macro, which rustc expands the item with: `#[test]`
-/// is one, though it leaves the item as it is written.
-fn has_attribute_macro(sema: &hir::Semantics<'_>, item: &ast::Item) -> bool {
-    sema.resolve_attr_macro_call(item).is_some()
-        || ast::HasAttrs::attrs(item).filter_map(|it| it.path()).any(|path| {
-            matches!(
-                sema.resolve_path(&path),
-                Some(hir::PathResolution::Def(ModuleDef::Macro(found))) if found.is_attr(sema.db)
-            )
-        })
-}
-
-/// Whether a macro expanded to the module the node is in, or to one around it.
-fn module_is_expanded(sema: &hir::Semantics<'_>, node: &SyntaxNode) -> bool {
-    let mut module = sema.scope(node).map(|it| it.module());
-    while let Some(it) = module {
-        if it.declaration_source(sema.db).is_some_and(|it| it.file_id.is_macro()) {
-            return true;
-        }
-        module = it.parent(sema.db);
-    }
-    false
-}
-
-/// When rustc expands a macro used in a definition.
-enum Turn {
-    /// As it comes to it.
-    Now,
-    /// After every macro it can expand at first, the last such first.
-    Later,
-}
-
-struct Count<'a, 'db> {
-    sema: &'a hir::Semantics<'db>,
-    target: Option<&'a SyntaxNode>,
-    /// The target and what it is in, the macros it is expanded from with their expansions.
-    along: Vec<SyntaxNode>,
-    counts: Counts<'a>,
-    late: LateImports,
-    seen: u32,
-    earlier: Option<u32>,
-    /// The macros to expand after the others, each with the macros it is in.
-    waiting: Vec<(ast::MacroCall, Vec<(syntax::TextRange, syntax::SyntaxKind)>)>,
-    /// The macros the nodes being counted are in, as a [`Spot`] has them.
-    calls: Vec<(syntax::TextRange, syntax::SyntaxKind)>,
-    /// The place of every counted node, when they are all wanted.
-    places: Option<FxHashMap<Spot, u32>>,
-    twice: Vec<Spot>,
-}
-
-impl<'a, 'db> Count<'a, 'db> {
-    fn new(
-        sema: &'a hir::Semantics<'db>,
-        target: Option<&'a SyntaxNode>,
-        along: Vec<SyntaxNode>,
-        counts: Counts<'a>,
-        owner: &SyntaxNode,
-    ) -> Self {
-        let late = LateImports::around(sema, owner);
-        Count {
-            sema,
-            target,
-            along,
-            counts,
-            late,
-            seen: 0,
-            earlier: None,
-            waiting: Vec::new(),
-            calls: Vec::new(),
-            places: None,
-            twice: Vec::new(),
-        }
-    }
-
-    /// Expands the macros that wait for the others, the last come to first.
-    fn waiting_ones(&mut self) -> Option<()> {
-        while let Some((call, calls)) = self.waiting.pop() {
-            self.calls = calls;
-            self.expansion_of(&call)?;
-        }
-        Some(())
-    }
-
-    /// Counts the nodes of the definition `node` is of, or none when the order rustc numbers
-    /// them in is not known.
-    ///
-    /// rustc numbers what is written in the definition before what the macros used in it
-    /// expand to, and then goes through the macros in turn, each the same way.
-    fn all_in(&mut self, node: &SyntaxNode) -> Option<()> {
-        let mut calls = Vec::new();
-        self.written_in(node, &mut calls);
-        for call in calls {
-            match self.turn(&call) {
-                Some(Turn::Now) => self.expansion_of(&call)?,
-                Some(Turn::Later) => self.waiting.push((call, self.calls.clone())),
-                None => self.nothing_in(&call)?,
-            }
-        }
-        Some(())
-    }
-
-    fn expansion_of(&mut self, call: &ast::MacroCall) -> Option<()> {
-        // A macro used in a body is expanded twice, to items and to statements, and of the
-        // same text: the target is in one of them, which need not be the one sema gives.
-        let at = self.along.iter().position(|it| it == call.syntax());
-        let along = at.and_then(|at| at.checked_sub(1)).map(|at| self.along[at].clone());
-        let root = match along.filter(|root| root.parent().is_none()) {
-            Some(root) => root,
-            None => match self.sema.expand_macro_call(call) {
-                Some(expansion) => expansion.value,
-                None => return Some(()),
-            },
-        };
-        self.calls.push((call.syntax().text_range(), root.kind()));
-        self.all_in(&root)?;
-        self.calls.pop();
-        Some(())
-    }
-
-    /// That the macro expands to nothing that is counted, so that when it is expanded is
-    /// the same to the count.
-    fn nothing_in(&mut self, call: &ast::MacroCall) -> Option<()> {
-        let (seen, waiting) = (self.seen, self.waiting.len());
-        self.expansion_of(call)?;
-        (self.seen == seen && self.waiting.len() == waiting).then_some(())
-    }
-
-    /// As `all_in`, of what is not in a macro: `calls` gets the macros come across.
-    fn written_in(&mut self, node: &SyntaxNode, calls: &mut Vec<ast::MacroCall>) {
-        for child in node.children() {
-            if let Some(call) = ast::MacroCall::cast(child.clone()) {
-                calls.push(call);
-                continue;
-            }
-            let target = self.target == Some(&child);
-            if target {
-                self.earlier = Some(self.seen);
-            }
-            let counted = self.counts.holds(&child);
-            if counted && let Some(places) = &mut self.places {
-                let spot = (self.calls.clone(), child.text_range());
-                if places.insert(spot.clone(), self.seen).is_some() {
-                    self.twice.push(spot);
-                }
-            }
-            if target || counted {
-                self.seen += 1;
-            }
-            if !target && !is_definition(&child) {
-                self.written_in(&child, calls);
-            }
-        }
-    }
-
-    /// When rustc expands the macro, or none when that is not known: a macro it finds by a
-    /// late import waits for the import.
-    fn turn(&self, call: &ast::MacroCall) -> Option<Turn> {
-        let Some(path) = call.path() else { return Some(Turn::Now) };
-        let Some(first) = path.first_segment().and_then(|it| it.name_ref()) else {
-            return Some(Turn::Now);
-        };
-        let alone = path.qualifier().is_none();
-        let imported = self.late.names.contains(first.text());
-        if !alone && !imported {
-            return self.reached_by_path(call).then_some(Turn::Now);
-        }
-        if !imported && !self.late.glob {
-            return Some(Turn::Now);
-        }
-        if alone && self.in_textual_scope(call)? {
-            return Some(Turn::Now);
-        }
-        if imported {
-            return Some(Turn::Later);
-        }
-        // A name alone may be found by the glob import: not one of this crate or of the
-        // standard library, which the macros in scope everywhere are.
-        let home = self.sema.resolve_macro_call(call)?.module(self.sema.db).krate(self.sema.db);
-        let here = self.sema.scope(call.syntax())?.krate();
-        (home == here || home.origin(self.sema.db).is_lang()).then_some(Turn::Now)
-    }
-
-    /// Whether a path finds the macro with no late import: any but a `macro_rules!` one of
-    /// this crate that is not exported, which is in no module but by an import of it, and is
-    /// found at once only through an import written in the module the path names.
-    fn reached_by_path(&self, call: &ast::MacroCall) -> bool {
-        let sema = self.sema;
-        let Some(found) = sema.resolve_macro_call(call) else { return true };
-        let here = sema.scope(call.syntax()).map(|it| it.krate());
-        if Some(found.module(sema.db).krate(sema.db)) != here {
-            return true;
-        }
-        match sema.source(found).and_then(|it| it.value.left()) {
-            Some(ast::Macro::MacroRules(rules)) => {
-                ast::HasAttrs::attrs(&rules)
-                    .any(|it| it.simple_name().is_some_and(|name| name == "macro_export"))
-                    || self.imported_where_written(call)
-            }
-            _ => true,
-        }
-    }
-
-    /// Whether the module that the path of `call` names imports the macro by a `use` written
-    /// in it, which no macro made: rustc resolves those before it expands any macro, as
-    /// `crate::tracing::debug!` finds salsa's `pub(crate) use debug;`.
-    fn imported_where_written(&self, call: &ast::MacroCall) -> bool {
-        let sema = self.sema;
-        let Some(path) = call.path() else { return false };
-        let (Some(qualifier), Some(name)) =
-            (path.qualifier(), path.segment().and_then(|it| it.name_ref()))
-        else {
-            return false;
-        };
-        let Some(hir::PathResolution::Def(ModuleDef::Module(module))) =
-            sema.resolve_path(&qualifier)
-        else {
-            return false;
-        };
-        let mut around = Some(module);
-        while let Some(it) = around {
-            if it.declaration_source(sema.db).is_some_and(|it| it.file_id.is_macro()) {
-                return false;
-            }
-            around = it.parent(sema.db);
-        }
-        let written = sema.module_definition_node(module);
-        if written.file_id.is_macro() {
-            return false;
-        }
-        let items = match ast::Module::cast(written.value.clone()) {
-            Some(inline) => inline.item_list().map(|it| it.syntax().clone()),
-            None => ast::SourceFile::can_cast(written.value.kind()).then_some(written.value),
-        };
-        let uses = items.iter().flat_map(|it| it.children()).filter_map(ast::Use::cast);
-        uses.filter(|it| !has_attribute_macro(sema, &ast::Item::Use(it.clone()))).any(|it| {
-            let mut imported = LateImports::default();
-            it.use_tree().into_iter().for_each(|tree| imported.add(&tree, None));
-            imported.names.contains(&*name.text())
-        })
-    }
-
-    /// Whether the macro is a `macro_rules!` one found by where it is written, which is
-    /// before an import of the name is looked for: one written earlier, beside something
-    /// the use is in, or in a `#[macro_use]` module that is. None when that is not known:
-    /// a macro expanded to it or to a module around it.
-    fn in_textual_scope(&self, call: &ast::MacroCall) -> Option<bool> {
-        let sema = self.sema;
-        let Some(found) = sema.resolve_macro_call(call) else { return Some(false) };
-        let Some(source) = sema.source(found) else { return Some(false) };
-        let Some(ast::Macro::MacroRules(rules)) = source.value.left() else {
-            return Some(false);
-        };
-        let named = rules.name().map(|it| it.text().to_string());
-        let used = call.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string());
-        // Another crate's are in scope by `#[macro_use]`, which is looked in after imports.
-        let home = found.module(sema.db).krate(sema.db);
-        if named != used || Some(home) != sema.scope(call.syntax()).map(|it| it.krate()) {
-            return Some(false);
-        }
-        let mut module = found.module(sema.db);
-        let mut written = hir::InFile::new(source.file_id, rules.syntax().clone());
-        loop {
-            if written.file_id.is_macro() {
-                return None;
-            }
-            let beside = sema.ancestors_with_macros(call.syntax().clone()).any(|around| {
-                around.parent() == written.value.parent()
-                    && sema.hir_file_for(&around) == written.file_id
-                    && written.value.text_range().end() <= around.text_range().start()
-            });
-            if beside {
-                return Some(true);
-            }
-            // The scope goes on after a module that is `#[macro_use]`.
-            let inline = written.value.ancestors().skip(1).find_map(ast::Module::cast);
-            let around = match inline {
-                Some(inline) => written.with_value(inline),
-                None => match module.declaration_source(sema.db) {
-                    Some(declared) => declared,
-                    None => return Some(false),
-                },
-            };
-            let goes_on = ast::HasAttrs::attrs(&around.value)
-                .any(|it| it.simple_name().is_some_and(|name| name == "macro_use"));
-            if !goes_on {
-                return Some(false);
-            }
-            module = match module.parent(sema.db) {
-                Some(parent) => parent,
-                None => return Some(false),
-            };
-            written = around.map(|it| it.syntax().clone());
-        }
-    }
-}
-
-/// The `n` of the `{closure#n}` rustc names a closure: its place among the closures of the
-/// definition it is written in, a closure's own closures being counted apart.
-fn closure_number(
-    sema: &hir::Semantics<'_>,
-    places: &Places,
-    closure: &SyntaxNode,
-) -> Option<u32> {
-    place_counted(sema, places, Counted::Closures, closure, Counts::Closures)
 }
 
 /// The crates called `krate` that a build of the checkout at `checkout` compiles: a package's
@@ -4073,9 +3209,9 @@ fn reach_of_tests(
     listed: &Listed,
     args: &Args,
 ) -> String {
-    use hir::HasSource as _;
+    use hir::view::HasSourceView as _;
     use sha2::Digest as _;
-    use syntax::ast::HasAttrs as _;
+    use syntax::view::HasAttrs as _;
     let crates = crates_named(db, &args.krate, args).unwrap_or_default();
     let Some(&krate) = crates.first() else { return String::new() };
     let functions = &listed.of(db, krate).functions;
@@ -4094,8 +3230,8 @@ fn reach_of_tests(
     for (&id, reach) in tests.iter().zip(reaches) {
         let function = hir::Function::from(id);
         let Some(name) = test_harness::name(db, krate, function) else { continue };
-        let attrs = function.source(db).map(|it| {
-            let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
+        let attrs = function.source_view(db).map(|it| {
+            let attrs = it.value.attrs().map(|it| it.syntax().text());
             attrs.collect::<Vec<_>>().join("\n")
         });
         let identity = format!("{:032x}\n{}", reach.hash, attrs.unwrap_or_default());
@@ -4257,7 +3393,8 @@ fn run_tool_std(db: &mut RootDatabase) -> anyhow::Result<()> {
 /// Whether the root of `krate` says `#![no_main]`.
 fn has_no_main(db: &RootDatabase, krate: Crate) -> bool {
     let root = ide_db::base_db::EditionedFileId::new(db, krate.root_file(db), krate.edition(db));
-    let attrs = syntax::ast::HasAttrs::attrs(&root.parse(db).tree());
+    let parse = root.parse(db);
+    let attrs = syntax::view::HasAttrs::attrs(&parse.view());
     attrs.filter_map(|it| it.as_simple_atom()).any(|it| it == "no_main")
 }
 
@@ -4634,7 +3771,8 @@ fn callers_of_generic(db: &RootDatabase, functions: &[FunctionId]) -> Vec<Functi
                 continue;
             }
             let ide_db::search::FileReferenceNode::NameRef(name) = reference.name else { continue };
-            let caller = sema.ancestors_with_macros(name.syntax().clone()).find_map(ast::Fn::cast);
+            let name = syntax::AstNode::syntax(&name);
+            let caller = sema.ancestors_with_macros(name.clone()).find_map(syntax::ast::Fn::cast);
             let caller = caller.and_then(|it| sema.to_def(&it));
             let Some(caller) = caller.and_then(|it| FunctionId::try_from(it).ok()) else {
                 continue;
@@ -5481,7 +4619,7 @@ fn build(
         let deny: FxHashSet<&str> = deny.lines().collect();
         denied.extend(
             entries.iter().chain(&on_demand).copied().filter(|&func| {
-                resolver.path(func).is_some_and(|path| deny.contains(path.as_str()))
+                resolver.function_path(func).is_some_and(|path| deny.contains(path.as_str()))
             }),
         );
     }
@@ -5532,7 +4670,7 @@ fn build(
     })
     .map_err(anyhow::Error::msg)?;
     let Some(mut unit) = unit else { return Ok(None) };
-    let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
+    let name = |func| resolver.function_path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
     // Looking for the macro costs a walk of every macro call of the crate, so it is done once
     // a crate, and not for the standard library's own build, whose refusals are only counted.
     let mut failed_macros = FxHashMap::default();
@@ -6429,8 +5567,8 @@ impl std::fmt::Display for Refused {
 }
 
 /// Why the source as it is can't be built by the daemon, when it can't: the proc-macro server
-/// failed an expansion, then a file that does not parse, then the errors found in the edited
-/// files, then a function left uncompiled.
+/// failed an expansion, then a file that does not parse, then the errors rustc gives in the
+/// crates of the build ([`broken_in`]), then a function left uncompiled.
 /// Paths are shown from `root`, the workspace's, as rustc's errors show them.
 fn refusal(
     db: &RootDatabase,
@@ -6512,12 +5650,13 @@ fn written_at(
     root: &Path,
     message: &str,
 ) -> errors::Diagnostic {
-    let at = func.and_then(|func| hir::HasSource::source(hir::Function::from(func), db)).and_then(
-        |source| {
+    let at = func
+        .and_then(|func| hir::view::HasSourceView::source_view(hir::Function::from(func), db))
+        .and_then(|source| {
             let name = source.value.name()?;
-            Some(source.with_value(name.syntax()).original_file_range_rooted(db))
-        },
-    );
+            let range = source.with_value(name.syntax().text_range());
+            Some(range.original_node_file_range_rooted(db))
+        });
     match at {
         Some(at) if watched.paths.contains_key(&at.file_id.file_id(db)) => {
             let file = at.file_id.file_id(db);
@@ -6571,56 +5710,14 @@ fn unparsed(
     None
 }
 
-/// The errors rust-analyzer is as sure of as rustc is: a wrong one fails a build that is
-/// right.
-const SURE: &[&str] = &[
-    "E0004",
-    "E0005",
-    "E0023",
-    "E0046",
-    "E0057",
-    "E0061",
-    "E0063",
-    "E0308",
-    "E0407",
-    "E0425",
-    "E0432",
-    "E0559",
-    "E0560",
-    "E0583",
-    "E0599",
-    "E0665",
-    "builtin-derive-error",
-    "unresolved-macro-call",
-];
-
-/// The borrow checker's errors, which fail a build unless `BLAZE_BORROWCK_REFUSE=0`:
-/// `borrowck` is rustc's errors without a code, as "lifetime may not live long enough".
-const BORROWCK: &[&str] = &[
-    "E0309", "E0310", "E0311", "E0373", "E0381", "E0382", "E0384", "E0499", "E0500", "E0501",
-    "E0502", "E0503", "E0505", "E0506", "E0507", "E0508", "E0509", "E0515", "E0521", "E0524",
-    "E0594", "E0596", "E0597", "E0621", "E0716", "borrowck",
-];
-
-/// The lints rust-analyzer finds where rustc does, and nowhere else, as `lints_ui.py` scores
-/// them against rustc's UI tests and its probes of each place a lint applies. None is denied
-/// by default, so one at the level of an error is one a source denies, which no flag but
-/// `--cap-lints` or `--force-warn` undoes.
-const DENIED: &[&str] = &[
-    "non_snake_case",
-    "non_camel_case_types",
-    "non_upper_case_globals",
-    "unused_must_use",
-    "deprecated_safe_2024",
-    "elided_lifetimes_in_paths",
-    "unsafe_op_in_unsafe_fn",
-];
-
-/// The lints of [`DENIED`]'s kind that the borrow checker gives, off with its errors.
-const DENIED_BORROWCK: &[&str] = &["unused_mut"];
-
-/// The errors written in the edited files, as rust-analyzer finds them, with paths from
-/// `root` as rustc's are. Nothing may reach them, so the build never looks at them.
+/// The errors rustc gives compiling the crates of a build, as blaze-diagnostics finds them in
+/// every file of each, in rustc's order a crate, with paths from `root` as rustc's are. The
+/// crates are the local ones (the workspace's and those at a path) of `within`, or of those
+/// the `edited` files are modules of when no set is given: what else a program is made of (the
+/// standard library, a registry's crates) has no source an edit can change since it was built.
+/// No list says which errors count: every one refuses the build, and so does one in a file the
+/// edit did not touch (#1522, #1440, #780). `lints` is false where the flags rustc is given cap
+/// them.
 fn broken_in(
     db: &RootDatabase,
     edited: &[vfs::FileId],
@@ -6629,162 +5726,193 @@ fn broken_in(
     within: Option<Arc<FxHashSet<ide_db::base_db::Crate>>>,
     lints: bool,
 ) -> Option<errors::Said> {
-    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-    let config = ide_diagnostics::DiagnosticsConfig::test_sample();
-    let refuse_borrowck = std::env::var_os("BLAZE_BORROWCK_REFUSE").is_none_or(|it| it != "0");
-    // The check of one file is an edit's, over before anyone would look.
-    let counting = match edited.len() {
-        0 | 1 => events::Counting::none(),
-        files => events::Counting::new(events::Step::Check, files, threads.min(files)),
+    let crates: FxHashSet<ide_db::base_db::Crate> = match &within {
+        // alloc: the crates of the build, once a check
+        Some(within) => within.iter().copied().collect(),
+        None => edited
+            .iter()
+            .flat_map(|&file| ide_db::base_db::relevant_crates(db, file).iter().copied())
+            // alloc: as above
+            .collect(),
     };
-    let mut found: Vec<_> = std::thread::scope(|scope| {
-        let checks: Vec<_> = (0..threads.min(edited.len()))
-            .map(|part| {
-                let (config, within, counting) = (&config, &within, &counting);
-                scope.spawn(move || {
-                    let files = edited.iter().skip(part).step_by(threads);
-                    hir::attach_db(db, || {
-                        files
-                            .flat_map(|&file| {
-                                counting.on(part, || shown(watched, file, root));
-                                // A library's files are its unit tests' too, with what is
-                                // under `cfg(test)`: each crate built of them says what it
-                                // finds, where rust-analyzer would ask the first.
-                                let crates: Vec<_> = ide_db::base_db::relevant_crates(db, file)
-                                    .iter()
-                                    .copied()
-                                    .filter(|it| within.as_ref().is_none_or(|w| w.contains(it)))
-                                    .collect();
-                                let each: Vec<_> = match crates.len() {
-                                    0 | 1 => vec![within.clone()],
-                                    _ => crates
-                                        .into_iter()
-                                        .map(|it| Some(Arc::new(FxHashSet::from_iter([it]))))
-                                        .collect(),
-                                };
-                                let rules = (lints, refuse_borrowck);
-                                let each = each.into_iter().flat_map(move |within| {
-                                    errors_of(db, config, file, within, rules)
-                                });
-                                let found = each.collect::<Vec<_>>();
-                                counting.done(part);
-                                found
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-            })
-            .collect();
-        checks.into_iter().flat_map(|it| it.join().unwrap_or_default()).collect()
-    });
-    if found.is_empty() {
+    // alloc: as above, in order
+    let mut crates: Vec<_> = crates.into_iter().filter(|it| it.data(db).origin.is_local()).collect();
+    crates.sort_unstable_by_key(|&it| hir::Crate::from(it).root_file(db).index());
+    if crates.is_empty() {
         return None;
     }
-    found.sort_by(|(a, a_code, a_said), (b, b_code, b_said)| {
-        (a.file_id, a.range.start(), a.range.end(), a_code, a_said).cmp(&(
-            b.file_id,
-            b.range.start(),
-            b.range.end(),
-            b_code,
-            b_said,
-        ))
-    });
-    found.dedup();
-    let said = found
-        .iter()
-        .map(|(at, code, message)| {
-            let text = db.file_text(at.file_id).text(db);
-            // rustc's codes are `E` and four digits; rust-analyzer's own names are not codes.
-            let rustcs = code
-                .strip_prefix('E')
-                .is_some_and(|it| !it.is_empty() && it.bytes().all(|b| b.is_ascii_digit()));
-            let code = rustcs.then_some(*code);
-            let path = shown(watched, at.file_id, root);
-            errors::at(code, message, &path, text, at.range)
-        })
-        .collect();
-    Some(errors::Said(said))
-}
-
-/// What the last check of a file found nothing wrong in: the file's [`outline::skeleton`] then,
-/// and a hash of how each of its functions was written. An edit that leaves the skeleton as it
-/// was changed no more than bodies nothing else sees into, and a body's errors are its own:
-/// the next check asks only for the bodies whose functions are written otherwise.
-struct Clean {
-    skeleton: u64,
-    functions: FxHashMap<hir::Function, u64>,
-}
-
-/// The [`Clean`] checks, by the file, the crates it was read as a module of (`within`, by a
-/// hash of the set), and the rules of what is an error.
-type CleanKey = (vfs::FileId, Option<(usize, u64)>, (bool, bool));
-
-static CLEAN: std::sync::LazyLock<std::sync::Mutex<FxHashMap<CleanKey, Clean>>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// The errors the check of `file` as a module of the crates `within` finds, by the rules
-/// (lints denied, borrowck refused) of [`broken_in`]. After a check that found none, the next
-/// asks rust-analyzer only for the bodies an edit can have changed ([`Clean`]); every body is
-/// asked for when the file is more than bodies apart from that check, or it was not clean.
-fn errors_of(
-    db: &RootDatabase,
-    config: &ide_diagnostics::DiagnosticsConfig,
-    file: vfs::FileId,
-    within: Option<Arc<FxHashSet<ide_db::base_db::Crate>>>,
-    (lints, refuse_borrowck): (bool, bool),
-) -> Vec<(ide_db::FileRange, &'static str, String)> {
-    use std::hash::BuildHasher as _;
-    let crates = within.as_ref().map(|set| {
-        let hashes = set.iter().map(|it| rustc_hash::FxBuildHasher.hash_one(it));
-        (set.len(), hashes.fold(0, |all, it| all ^ it))
-    });
-    let key = (file, crates, (lints, refuse_borrowck));
-    let skeleton = outline::skeleton(db, file);
-    let was = skeleton.and_then(|now| lock(&CLEAN).remove(&key).filter(|it| it.skeleton == now));
-    let functions = std::cell::RefCell::new(FxHashMap::default());
-    let asked_of = std::cell::Cell::new((0usize, 0usize));
-    let asked = |body: hir::DefWithBody| {
-        let hir::DefWithBody::Function(func) = body else { return was.is_none() };
-        let written = hir::HasSource::source(func, db)
-            .map(|it| rustc_hash::FxBuildHasher.hash_one(it.value.syntax().text().to_string()));
-        let Some(written) = written else { return true };
-        functions.borrow_mut().insert(func, written);
-        let asked = was.as_ref().is_none_or(|was| was.functions.get(&func) != Some(&written));
-        let (n, of) = asked_of.get();
-        asked_of.set((n + usize::from(asked), of + 1));
-        asked
+    // alloc: the command line, once a check
+    let flags: Vec<String> = match lints {
+        // alloc: none, an empty `Vec`
+        true => Vec::new(),
+        // alloc: as above
+        false => vec!["--cap-lints".to_owned(), "allow".to_owned()],
     };
-    let found: Vec<_> = ide_diagnostics::semantic_diagnostics_of_bodies(
-        db,
-        config,
-        &ide_db::assists::AssistResolveStrategy::None,
-        file,
-        within,
-        &asked,
-    )
-    .into_iter()
-    .filter(|it| {
-        let code = it.code.as_str();
-        // rustc says nothing of most lints in what another crate's macro expands to.
-        let expanded = it.main_node.is_some_and(|it| it.file_id.is_macro());
-        it.severity == ide_db::Severity::Error
-            && (SURE.contains(&code)
-                || refuse_borrowck && BORROWCK.contains(&code)
-                || lints
-                    && !expanded
-                    && (DENIED.contains(&code)
-                        || refuse_borrowck && DENIED_BORROWCK.contains(&code)))
-    })
-    .map(|it| (it.range, it.code.as_str(), it.message))
-    .collect();
-    if std::env::var_os("BLAZE_STATS").is_some() {
-        let (n, of) = asked_of.get();
-        eprintln!("check: {file:?}: the bodies of {n} of {of} functions asked");
+    let lints = match blaze_diagnostics::lints::CommandLine::parse(&flags) {
+        Ok(it) => it,
+        Err(why) => {
+            // alloc: the error path
+            let why = format!("the lint flags `{}` do not read: {why}", flags.join(" "));
+            return Some(errors::Said::one(errors::of_none(&why)));
+        }
+    };
+    let options = blaze_diagnostics::Options { lints, ..Default::default() };
+    // Every file of the crates is named, as an error may be in any of them; a watched file by
+    // the path it was read at. The map is std's as `blaze_diagnostics::Files` takes it.
+    // alloc: the names, once a check
+    let mut paths: std::collections::HashMap<vfs::FileId, String> = watched
+        .paths
+        .iter()
+        .map(|(&file, path)| (file, path.to_string_lossy().into_owned()))
+        // alloc: as above
+        .collect();
+    for &krate in &crates {
+        let source_root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
+        let source_root = db.source_root(source_root).source_root(db);
+        for file in source_root.iter() {
+            if let Some(path) = source_root.path_for_file(&file).and_then(|it| it.as_path()) {
+                // alloc: as above
+                paths.entry(file).or_insert_with(|| path.as_str().to_owned());
+            }
+        }
     }
-    if let Some(skeleton) = skeleton.filter(|_| found.is_empty()) {
-        lock(&CLEAN).insert(key, Clean { skeleton, functions: functions.into_inner() });
+    let root_name = root.to_string_lossy();
+    let files = blaze_diagnostics::Files::new(&paths, &root_name);
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(crates.len());
+    let counting = match crates.len() {
+        1 => events::Counting::none(),
+        count => events::Counting::new(events::Step::Check, count, threads),
+    };
+    let next = AtomicUsize::new(0);
+    // dyn: a worker's panic payload, only when a check panics.
+    let checked: Vec<Result<Vec<(usize, Vec<blaze_diagnostics::Diag>)>, Box<dyn std::any::Any + Send>>> =
+        std::thread::scope(|scope| {
+            // alloc: a handle a thread, once a check
+            let workers: Vec<_> = (0..threads)
+                .map(|part| {
+                    let (crates, next, counting, options) = (&crates, &next, &counting, &options);
+                    scope.spawn(move || {
+                        // alloc: a slot a crate the thread checks, once a check
+                        let mut done = Vec::new();
+                        hir::attach_db(db, || {
+                            loop {
+                                let at = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(&krate) = crates.get(at) else { break };
+                                let krate = hir::Crate::from(krate);
+                                counting.on(part, || crate_shown(db, krate));
+                                let diags = blaze_diagnostics::check_crate(db, krate, files, options);
+                                counting.done(part);
+                                done.push((at, diags));
+                            }
+                        });
+                        done
+                    })
+                })
+                // alloc: as above
+                .collect();
+            // alloc: a result a thread, once a check
+            workers.into_iter().map(|it| it.join()).collect()
+        });
+    // alloc: a list a crate, once a check; an empty `Vec` allocates nothing
+    let mut by_crate: Vec<Vec<blaze_diagnostics::Diag>> = crates.iter().map(|_| Vec::new()).collect();
+    for worker in checked {
+        match worker {
+            Ok(done) => {
+                for (at, diags) in done {
+                    by_crate[at] = diags;
+                }
+            }
+            // An edit came in: the check is asked again of the source as it is now.
+            Err(panic) if panic.is::<ide_db::base_db::salsa::Cancelled>() => {
+                std::panic::resume_unwind(panic)
+            }
+            Err(panic) => {
+                let panic = panic_message(&*panic);
+                // alloc: the error path
+                let why = format!("blaze-diagnostics panicked checking the build: {panic}");
+                return Some(errors::Said::one(errors::of_none(&why)));
+            }
+        }
     }
-    found
+    let said = said_of(db, &by_crate, &paths, files);
+    (!said.0.is_empty()).then_some(said)
+}
+
+/// How a crate is named while it is checked: its name, else its root file.
+fn crate_shown(db: &RootDatabase, krate: Crate) -> String {
+    match krate.display_name(db) {
+        // alloc: a line of progress a crate, only where more than one is checked
+        Some(name) => name.crate_name().to_string(),
+        // alloc: as above
+        None => format!("{:?}", krate.root_file(db)),
+    }
+}
+
+/// The errors of each crate's diagnostics, in order, as a verdict says them: rustc's text of
+/// each as `blaze_diagnostics::emit` writes it, and its code, message and first primary span
+/// as rustc's JSON has them. A library's files are its unit tests' too, so an error both say
+/// is said once. The closing "aborting due to ..." is left out, as cargo leaves it out; the
+/// notes naming the codes are [`errors::Said::notes`].
+fn said_of(
+    db: &RootDatabase,
+    by_crate: &[Vec<blaze_diagnostics::Diag>],
+    // alloc: std's map, as `blaze_diagnostics::Files` takes it
+    paths: &std::collections::HashMap<vfs::FileId, String>,
+    files: blaze_diagnostics::Files<'_>,
+) -> errors::Said {
+    use blaze_diagnostics::emit;
+    let errors: Vec<&blaze_diagnostics::Diag> = by_crate
+        .iter()
+        .flatten()
+        .filter(|it| it.is_error() && !it.message.starts_with("aborting due to"))
+        // alloc: once a check, empty unless it is refused
+        .collect();
+    if errors.is_empty() {
+        return errors::Said::default();
+    }
+    // alloc: the error path, once a refused check, as is every allocation below
+    let named: FxHashMap<String, vfs::FileId> =
+        // alloc: as above
+        paths.keys().map(|&file| (files.name(file), file)).collect();
+    let text_of = |name: &str| named.get(name).map(|&file| db.file_text(file).text(db));
+    let mut sources = emit::Sources::default();
+    for name in sources.unread(errors.iter().copied()) {
+        // alloc: the error path
+        sources.add(name, text_of(name).map(|it| it.to_string()));
+    }
+    let style = emit::Style::default();
+    let mut seen = FxHashSet::default();
+    // alloc: the error path
+    let mut said = Vec::new();
+    for diag in errors {
+        let code = match &diag.code {
+            Some(blaze_diagnostics::Code::Error(code)) => Some(code.as_str()),
+            Some(blaze_diagnostics::Code::LintWithCode { code, .. }) => Some(code.as_str()),
+            Some(blaze_diagnostics::Code::Lint(_)) | None => None,
+        };
+        let plain = emit::rendered(diag, &sources, style);
+        // clone: the error path; a hash alone could take two errors for one
+        if !seen.insert(plain.clone()) {
+            continue;
+        }
+        let at = diag.span.primary_span().filter(|it| it.lo <= it.hi).and_then(|span| {
+            let text = text_of(&span.file)?;
+            let range = syntax::TextRange::new(span.lo.into(), span.hi.into());
+            Some(errors::at(code, &diag.message, emit::shown(&span.file), text, range))
+        });
+        let mut error = at.unwrap_or_else(|| errors::Diagnostic {
+            code: code.map(str::to_owned),
+            ..errors::of_none(&diag.message)
+        });
+        // alloc: the error path; boxed, as most errors carry no text of their own
+        error.rendered = Some(Box::new(errors::Rendered {
+            ansi: emit::rendered(diag, &sources, emit::Style { ansi: true, ..style }),
+            short: emit::rendered(diag, &sources, emit::Style { short: true, ..style }),
+            plain,
+        }));
+        said.push(error);
+    }
+    errors::Said(said)
 }
 
 /// The text of the source file at `path` as the database has it.
@@ -7404,8 +6532,8 @@ impl Tests {
         args: &Args,
         found: &mut Option<(Vec<Arc<ListedCrate>>, Tests)>,
     ) -> Tests {
-        use hir::HasSource as _;
-        use syntax::ast::HasAttrs as _;
+        use hir::view::HasSourceView as _;
+        use syntax::view::HasAttrs as _;
         let crates = crates_named(db, &args.krate, args).unwrap_or_default();
         let listings: Vec<_> = crates.into_iter().map(|it| listed.of(db, it)).collect();
         if let Some((was, tests)) = found.as_ref() {
@@ -7429,8 +6557,8 @@ impl Tests {
                     .filter_map(|it| Some(it.name(db)?.as_str().to_owned()))
                     .collect();
                 path.push(function.name(db).as_str().to_owned());
-                let attrs = function.source(db).map(|it| {
-                    let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
+                let attrs = function.source_view(db).map(|it| {
+                    let attrs = it.value.attrs().map(|it| it.syntax().text());
                     attrs.collect::<Vec<_>>().join(" ")
                 });
                 tests.push((path.join("::"), attrs.unwrap_or_default()));
@@ -11438,7 +10566,23 @@ impl Program {
             };
             let (check, checked) = (std::sync::Mutex::new(Some(check)), std::sync::OnceLock::new());
             let broken = || {
-                let joined = || lock(&check).take().and_then(|it| it.join().ok()).flatten();
+                // A check that panicked found nothing to say the source compiles: it refuses.
+                let joined = || {
+                    let check = lock(&check).take()?;
+                    match check.join() {
+                        Ok(broken) => broken,
+                        Err(panic) if panic.is::<ide_db::base_db::salsa::Cancelled>() => {
+                            std::panic::resume_unwind(panic)
+                        }
+                        Err(panic) => {
+                            let panic = panic_message(&*panic);
+                            // alloc: the error path
+                            let why = format!("the check of the edit panicked: {panic}");
+                            Some(errors::Said::one(errors::of_none(&why)))
+                        }
+                    }
+                };
+                // clone: `None` but for a refused edit, whose errors are said once
                 checked.get_or_init(joined).clone()
             };
             let hold =
@@ -11756,30 +10900,6 @@ mod tests {
         assert_eq!(splice::MOVED_STATIC, hir_ty_codegen::MOVED_STATIC);
     }
 
-    /// Each kind of node a count counts holds of its nodes alone: closures and `async` blocks,
-    /// the statics of a name, and the constants and statics of a name in a path (`_` for an
-    /// unnamed constant).
-    #[test]
-    fn a_count_counts_the_nodes_of_its_kind() {
-        let text = r#"
-static A: u8 = 0;
-static B: u8 = 0;
-const A: u8 = 0;
-const _: u8 = 0;
-fn f() { let _ = || 0; let _ = async {}; let _ = {}; }
-"#;
-        let tree = syntax::SourceFile::parse(text, syntax::Edition::CURRENT).syntax_node();
-        let held = |counts: Counts<'_>| {
-            let nodes = tree.descendants().filter(|it| counts.holds(it));
-            nodes.map(|it| it.text().to_string()).collect::<Vec<_>>()
-        };
-        assert_eq!(held(Counts::Closures), ["|| 0", "async {}"]);
-        assert_eq!(held(Counts::Statics("A")), ["static A: u8 = 0;"]);
-        assert_eq!(held(Counts::InPath("A")), ["static A: u8 = 0;", "const A: u8 = 0;"]);
-        assert_eq!(held(Counts::InPath("_")), ["const _: u8 = 0;"]);
-        assert!(held(Counts::Statics("C")).is_empty());
-    }
-
     /// What cargo says is taken in line by line, and its end wakes who waits for more.
     #[test]
     fn what_cargo_says_is_kept_until_it_ends() {
@@ -11969,20 +11089,65 @@ fn main() {}
         );
         let [main, shared, other] = [0, 1, 2].map(|it| files[it].file_id(&db));
         hir::attach_db(&db, || {
-            let crates_of = |sema: &hir::Semantics<'_>, file| {
+            let crates_of = |sema: &hir::view::Semantics<'_>, file| {
                 let modules = sema.file_to_module_defs(file);
                 modules.map(|it| ide_db::base_db::Crate::from(it.krate(&db))).collect::<Vec<_>>()
             };
-            let all = hir::Semantics::new(&db);
+            let all = hir::view::Semantics::new(&db);
             let (app, example) = (crates_of(&all, main)[0], crates_of(&all, other)[0]);
             assert_eq!(crates_of(&all, shared), [app, example]);
             let within = |crates: &[_]| {
-                hir::Semantics::new_within(&db, Arc::new(crates.iter().copied().collect()))
+                hir::view::Semantics::new_within(&db, Arc::new(crates.iter().copied().collect()))
             };
             assert_eq!(crates_of(&within(&[example]), shared), [example]);
             assert_eq!(crates_of(&within(&[app]), shared), [app]);
             assert_eq!(crates_of(&within(&[example]), main), [app]);
         });
+    }
+
+    /// An edit is refused for every error rustc gives in its crate, in a file it did not touch
+    /// too, as rustc writes it: no list says which count (#1522's E0063, #1440's E0015, #780's
+    /// E0308). A crate with none is not refused.
+    #[test]
+    fn an_edit_is_refused_for_every_error_of_its_crate_as_rustc_writes_it() {
+        use test_fixture::WithFixture;
+        let (db, files) = RootDatabase::with_many_files(
+            r#"
+//- /src/lib.rs crate:app
+mod other;
+pub fn edited() {}
+//- /src/other.rs
+pub struct S { a: u32, b: u32 }
+pub fn missing() -> S { S { a: 1 } }
+pub fn mismatched() -> u32 { "text" }
+fn plain() -> u32 { 1 }
+pub const C: u32 = plain();
+//- /clean/lib.rs crate:clean
+pub fn fine() -> u32 { 1 }
+"#,
+        );
+        let [lib, other, clean] = [0, 1, 2].map(|it| files[it].file_id(&db));
+        // A fixture's paths are virtual, which the check names by the paths it is given.
+        let sources = |named: &[(vfs::FileId, &str)]| Sources {
+            paths: named.iter().map(|&(file, path)| (file, PathBuf::from(path))).collect(),
+        };
+        let root = Path::new("/");
+        let watched = sources(&[(lib, "/src/lib.rs"), (other, "/src/other.rs")]);
+        let said = broken_in(&db, &[lib], &watched, root, None, true);
+        let said = said.expect("the errors of the file the edit did not touch refuse it");
+        let codes: FxHashSet<_> = said.0.iter().filter_map(|it| it.code.as_deref()).collect();
+        assert_eq!(codes, ["E0015", "E0063", "E0308"].into_iter().collect(), "{said}");
+        let mismatched = said.0.iter().find(|it| it.code.as_deref() == Some("E0308")).unwrap();
+        let span = mismatched.span.as_ref().expect("where it is");
+        assert_eq!(span.file_name, "src/other.rs");
+        let rendered = mismatched.rendered.as_ref().expect("rustc's text of it");
+        assert!(rendered.plain.starts_with("error[E0308]: mismatched types\n"), "{}", rendered.plain);
+        assert!(rendered.plain.contains("src/other.rs:3:"), "{}", rendered.plain);
+        assert!(rendered.short.starts_with("src/other.rs:3:"), "{}", rendered.short);
+        assert!(rendered.ansi.contains('\x1b'), "{}", rendered.ansi);
+        let watched = sources(&[(clean, "/clean/lib.rs")]);
+        let clean = broken_in(&db, &[clean], &watched, root, None, true);
+        assert_eq!(clean, None);
     }
 
     /// The questions a unit asks of the resolver for each function it calls, each panic it
@@ -12004,7 +11169,7 @@ pub fn caller() -> u32 { callee(&Point { x: 1 }) }
             (SymbolTable::default(), content::Contents::default(), Listed::default());
         hir::attach_db(&db, || {
             let resolver = Resolver::of_rustcs(&db, &table, &args, &contents, &listed);
-            let sema = hir::Semantics::new(&db);
+            let sema = hir::view::Semantics::new(&db);
             let file = file.file_id(&db);
             let module = sema.file_to_module_defs(file).next().unwrap();
             let krate = ide_db::base_db::Crate::from(module.krate(&db));
@@ -12072,7 +11237,7 @@ extern "C" fn exported() {}
 "#,
         );
         hir::attach_db(&db, || {
-            let sema = hir::Semantics::new(&db);
+            let sema = hir::view::Semantics::new(&db);
             let module = sema.file_to_module_defs(file.file_id(&db)).next().unwrap();
             let listed = ListedCrate::new(&db, module.krate(&db));
             let name = |func: FunctionId| hir::Function::from(func).name(&db).as_str().to_owned();
@@ -12214,7 +11379,7 @@ mod user {
 "#,
         );
         hir::attach_db(&db, || {
-            let sema = hir::Semantics::new(&db);
+            let sema = hir::view::Semantics::new(&db);
             let root = sema.file_to_module_defs(file.file_id(&db)).next().unwrap();
             let user =
                 root.children(&db).find(|it| it.name(&db).is_some_and(|it| it.as_str() == "user"));

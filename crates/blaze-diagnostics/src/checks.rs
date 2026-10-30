@@ -7,7 +7,7 @@
 mod ast_validation;
 mod attrs;
 mod defs;
-mod features;
+pub(crate) mod features;
 pub(crate) mod impls;
 mod krate;
 mod macros;
@@ -44,7 +44,7 @@ pub(crate) const PASSES: Phase = Phase::Items;
 /// lints and the lint levels read too.
 pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
     let walk = cx.walk();
-    let owners: Vec<Owner> = owners(cx, walk);
+    let owners: Vec<Owner<'_>> = owners(cx, walk);
     let flags = features::Flags::default();
     let (features, mut found) = features::configured(cx, &owners, &flags);
     let session = attrs::Session::of(cx, &owners, features);

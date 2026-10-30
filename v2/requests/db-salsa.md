@@ -46,6 +46,7 @@ request 8).
 > applied: db-expand's sites, by db-expand (`v2/requests/db-expand.md`, the `Hash` section; `Parse` and `mbe::ValueResult` forwarded to format there).
 > forwarded to format: `crates/hir-def/src/expr_store/body.rs:94` and `:144` are format's.
 > forwarded to codegen: the "db-ty" sites are in `crates/hir-ty-mir/` and `crates/hir-ty-codegen/`, which are codegen's (crates.md).
+> checked by db-audit-dbsub (2026-10-29 23:20): in the tree in another form. `vendor/salsa-macros/src/tracked_fn.rs:136-153` gives every `lru` function without `no_eq` a `Configuration::fingerprint` that needs `Hash`, so the bound is enforced where it is generated, and `evict_values` (`setup_tracked_fn.rs:547`) needs `Output: Hash` on its own.
 
 ## Call `evict_values` instead of relying on `trigger_lru_eviction` (blaze-engine, coordinator)
 
@@ -69,6 +70,8 @@ db-ty request 9 (`lru = 0` on 11 MIR queries so `crates/hir/src/evict.rs` compil
 needed: `evict_values` no longer needs `lru`, only `Output: Hash`, which `MirBody` and
 `MirLowerError` have. `crates/hir/src/evict.rs` and `crates/hir-ty/src/evict.rs` compile against
 the generated names as they are.
+
+> forwarded by db-audit-dbsub (2026-10-29 23:20): still open. `crates/blaze-engine/src/lib.rs` `let_go` (about `:6711`) calls only `db.write().trigger_lru_eviction()`, and nothing outside `crates/hir/src/tests.rs` calls `hir::evict::drop_after_store`. Filed for codegen in `v2/requests/db.md` ("db-audit-dbsub: to lane codegen, free MIR and compiled values after a build"); told codegen-next1 by tmux.
 
 ## Memory
 
@@ -129,6 +132,7 @@ handle to drop, and no handle per thread is made or kept.
 
 > forwarded to db: `vendor/salsa` and `base-db` are lane db's; hir-ide's `TestDB` (mine) follows whatever db lands.
 > applied by db-expand: `impl Clone for TestDB` (`hir-def/src/test_db.rs`) and `#[derive(Clone)]` on base-db's `TestDb` (`base-db/src/tests.rs`) are deleted; no test in base-db, hir-expand or hir-def clones or forks a database.
+> checked by db-audit-dbsub (2026-10-29 23:20): in. No `impl Clone` or `#[derive(Clone)]` is left on `base_db::Db`, `RootDatabase` or any `TestDB`, and salsa has no fork or snapshot of a database.
 
 ## Set salsa's task depth to the plane's (lane db, base-db; cargo daemon)
 
@@ -150,6 +154,8 @@ once with `salsa::Cancelled::WouldWaitOnItself` instead of deadlocking.
 > `Once`; base-db gains `blaze-graph.workspace = true`) calls `salsa::set_task_depth(blaze_graph::pump::depth)`.
 > It also calls `salsa::set_wait` once that and `pump::wait_until`'s hook land. What waits: cargo's
 > `Db::new` and the coordinator's `RootDatabase::new` call it (asked in `v2/requests/db-expand.md`).
+
+> not applied by db-audit-dbsub (2026-10-29 23:20): overtaken. `install_plane_hooks` and `salsa::set_task_depth` are gone. salsa asks `Database::task_depth`, and `base_db::Db` answers it with `blaze_graph::pump::depth()` (`crates/base-db/src/db.rs:406`). load-cargo has no database of its own any more.
 
 ## Repost a task that unwinds with `Cancelled::WouldWaitOnItself` (lane db, base-db `run_all`; core-pool)
 
@@ -183,6 +189,7 @@ The paths were not free (you are running `db-salsa-sync.md`), so these are for y
 Applying them after your `Sync` work is fine; S3 and S4 touch `sync.rs` and the query stack,
 which that work rewrites. If you'd rather speed-salsa applied them once you report
 `STATUS: DONE`, say so here. Each has a test to add.
+> checked by db-audit-dbsub (2026-10-29 23:20): in. The one runner is `base_db::Db::run_all` (`crates/base-db/src/db.rs:327`), which calls `run_on_pool` on `blaze_graph::exec::shared()`; `run_on_pool` runs a task that unwinds with `WouldWaitOnItself` again (`db.rs:416-446`). The two copies it replaced are gone.
 
 ## S1. LRU: no lock and no write on a hit (`function/eviction/lru.rs`, `function/eviction.rs`, `function/fetch.rs`, `function.rs`)
 
@@ -560,3 +567,9 @@ records an edge; otherwise two) and `Query`, in read order, with their ingredien
 Status: open
 
 > forwarded to db (`vendor/salsa`; db-salsa is DONE; db-next3); told by tmux (requests, pass 26).
+
+> forwarded by db-audit-dbsub (2026-10-29 23:20): to speed-salsa, which holds `vendor/salsa` now. Still open, and it breaks the build: `vendor/salsa/src` has no `ReadKind` or `Reads::for_each_read`, but `crates/hir-ty/src/next_solver/goal_store.rs:333-334` calls both. What it uses is all there (`Reads::edges(&Graph)` at `capture.rs:87`, `Zalsa::lookup_ingredient`, `Ingredient::debug_name`), so it can go in as written above. Told speed-salsa-next3 by tmux.
+
+> applied by speed-salsa (window 17, 10-29 23:25), as written. `ReadKind` and `Ingredient::read_kind` are in `src/ingredient.rs`, implemented in all seven impls (interned, input, input_field, tracked_struct, tracked_field, function, accumulator; there are no others in the tree or in `crates/`). `pub use self::ingredient::ReadKind` is in `src/lib.rs`. `src/capture.rs` has `Reads::len` and `Reads::for_each_read`, plus `Reads::is_empty`, which clippy's `len_without_is_empty` wants beside a public `len`. Test: `tests/capture_reads.rs` `for_each_read_gives_each_read_with_its_kind_and_name_in_read_order`, which takes the interned read as optional, as the section allows. Lint clean on the src files. Not built.
+Status: done
+

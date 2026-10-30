@@ -1,10 +1,10 @@
 //! Definition of `SolverDefId`
 
-use base_db::Db;
+use base_db::{Crate, Db};
 use hir_def::{
     AdtId, AttrDefId, BuiltinDeriveImplId, CallableDefId, ConstId, DefWithBodyId, EnumId,
     EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, StaticId, StructId,
-    TraitId, TypeAliasId, UnionId, VariantId,
+    HasModule, TraitId, TypeAliasId, UnionId, VariantId,
     signatures::{
         ConstSignature, EnumSignature, FunctionSignature, StaticSignature, StructSignature,
         TraitSignature, TypeAliasSignature, UnionSignature,
@@ -324,12 +324,46 @@ impl TryFrom<SolverDefId<'_>> for GenericDefId {
     }
 }
 
+impl<'db> SolverDefId<'db> {
+    /// The crate the item is defined in.
+    pub(crate) fn krate(self, db: &'db Db) -> Crate {
+        match self {
+            SolverDefId::AdtId(id) => id.krate(db),
+            SolverDefId::ConstId(id) => id.krate(db),
+            SolverDefId::FunctionId(id) => id.krate(db),
+            SolverDefId::ImplId(id) => id.krate(db),
+            SolverDefId::BuiltinDeriveImplId(id) => id.krate(db),
+            SolverDefId::StaticId(id) => id.krate(db),
+            SolverDefId::AnonConstId(id) => id.loc(db).owner.krate(db),
+            SolverDefId::TraitId(id) => id.krate(db),
+            SolverDefId::TypeAliasId(id) => id.krate(db),
+            SolverDefId::InternedClosureId(id) => id.loc(db).owner.krate(db),
+            SolverDefId::InternedCoroutineId(id) => id.loc(db).owner.krate(db),
+            SolverDefId::InternedCoroutineClosureId(id) => id.loc(db).owner.krate(db),
+            SolverDefId::InternedOpaqueTyId(id) => match id.loc(db) {
+                crate::ImplTraitId::ReturnTypeImplTrait(func, _) => func.krate(db),
+                crate::ImplTraitId::TypeAliasImplTrait(alias, _) => alias.krate(db),
+            },
+            SolverDefId::EnumVariantId(id) => id.krate(db),
+            SolverDefId::Ctor(Ctor::Struct(id)) => id.krate(db),
+            SolverDefId::Ctor(Ctor::Enum(id)) => id.krate(db),
+        }
+    }
+}
+
+/// rustc's `krate == LOCAL_CRATE`, the local crate being the one `cx` solves for. An interner
+/// without a crate has no local crate to answer for, and stops.
+#[inline]
+fn is_local_to<'db>(id: SolverDefId<'db>, cx: DbInterner<'db>) -> bool {
+    id.krate(cx.db) == cx.expect_crate()
+}
+
 impl<'db> inherent::DefId<DbInterner<'db>> for SolverDefId<'db> {
     fn as_local(self) -> Option<SolverDefId<'db>> {
         Some(self)
     }
-    fn is_local(self) -> bool {
-        true
+    fn is_local(self, cx: DbInterner<'db>) -> bool {
+        is_local_to(self, cx)
     }
 }
 
@@ -389,8 +423,8 @@ macro_rules! declare_id_wrapper {
             fn as_local(self) -> Option<$local> {
                 Some(self.into())
             }
-            fn is_local(self) -> bool {
-                true
+            fn is_local(self, cx: DbInterner<'db>) -> bool {
+                is_local_to(self.into(), cx)
             }
         }
     };
@@ -453,8 +487,8 @@ macro_rules! declare_id_wrapper_with_lt {
             fn as_local(self) -> Option<$local> {
                 Some(self.into())
             }
-            fn is_local(self) -> bool {
-                true
+            fn is_local(self, cx: DbInterner<'db>) -> bool {
+                is_local_to(self.into(), cx)
             }
         }
     };
@@ -591,8 +625,8 @@ impl<'db> inherent::DefId<DbInterner<'db>> for CallableIdWrapper {
     fn as_local(self) -> Option<SolverDefId<'db>> {
         Some(self.into())
     }
-    fn is_local(self) -> bool {
-        true
+    fn is_local(self, cx: DbInterner<'db>) -> bool {
+        is_local_to(self.into(), cx)
     }
 }
 
@@ -628,7 +662,7 @@ impl<'db> inherent::DefId<DbInterner<'db>> for AnyImplId {
     fn as_local(self) -> Option<SolverDefId<'db>> {
         Some(self.into())
     }
-    fn is_local(self) -> bool {
-        true
+    fn is_local(self, cx: DbInterner<'db>) -> bool {
+        is_local_to(self.into(), cx)
     }
 }

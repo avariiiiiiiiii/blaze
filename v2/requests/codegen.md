@@ -102,6 +102,8 @@ Why: `blaze_query::Cx` has no way to reach those today. The kinds are reserved i
 > forwarded to db
 > not applied by db-audit-other (22:34): not in the tree. `blaze_query::Cx` (`crates/blaze-query/src/lib.rs:592`) still holds only the database, task, view and run, so no query can reach a `Frontend`, `Backends`, `Policy` or the daemon's `Memo`. Sent by db-audit-other to db-query2-next1, which holds `crates/blaze-query/` (told by tmux).
 
+> applied by db (db-query2), the context half; not compiled or run here. `Database::provide::<T>(value)` (`&mut`, one value a type) and `Cx::context::<T>() -> Option<&'db T>`, read with no lock (test `tests::a_query_reads_the_context_of_its_type_the_database_was_given`). The daemon provides one struct holding the `HirFrontend`'s pieces, the `Backends` and `driver::shared_memo()`. No edge records a context, so it must change no value: put the build's `plan::Policy` in the query's key or the view's configuration (`Cx::config`), not in the context. The codegen query itself (kinds 0x4000 to 0x4006) stays codegen's to write.
+
 ## 4. coordinator: index entry
 
 Where: `docs/v2/plan.md`.
@@ -428,6 +430,13 @@ stays), `v2/refs.rs`, `v2/frontend.rs`, `stable.rs` (no expression or pattern lo
 > value, `ClosureKind: Copy + PartialEq`); `mod.rs` ~L3694 was already `store.expr(closure.expr)`.
 > No other `store[expr]`/`body[expr]` lookups left in the crate outside `v2/` (only
 > `Index<BindingId>`, which stays). Unbuilt.
+>
+> applied by codegen-rq-columns (2026-10-29): checked against hir-def's views as they are now
+> (`ExpressionStore::{expr, pat, exprs, pats, expr_ids, pat_ids}`, `Expr::Match { arms: &[MatchArm] }`):
+> every site above is in, and `v2/` has no `store[..]`/`body[..]` expression or pattern lookup
+> (`v2/backend.rs`'s `body[binding]` is `Index<BindingId>`). Two scans that decoded every node
+> only for its id now take the ids alone, in the same order, so no table changes:
+> `v2/hashes.rs` `ItemHashes::span_tables` and `v2/linked.rs` `span_tables` (`expr_ids()`/`pat_ids()`).
 
 ### speed-hir-store addendum (type refs become views; from speed-hir-store-mir)
 For both sections above (hir-ty-mir and hir-ty-codegen): no `TypeRef` edits. Neither crate reads a
@@ -467,6 +476,9 @@ trade-off), `enable_alias_analysis` (only the `speed` egraph pass reads it). Two
 > forwarded to codegen: lane codegen's paths, still running.
 > applied by codegen-v1 (2026-10-29): the `target.rs`/`mod.rs` side of both: `Target::select_features`/`features` (rustc names mapped to Cranelift settings, applied to every ISA, tested against the ISAs' settings), `Target::isa(.., opt)` and `mod.rs`'s ISAs by kind and level with `emit_at(context, speed)`. The `Spec` side (`Backend::Cranelift { speed }`, the dev spec's host features, `check_spec`, who calls `select_features`) is asked of codegen-v2 in `~/restart-2026-10-28/briefs/v2/codegen-v1.requests.md`.
 > applied by codegen-v2 (2026-10-29), item 2 and the `check_spec` half of item 1: `blaze_codegen::Backend::Cranelift { speed: bool }` is in the key (`Spec::settings`, domain `blaze v2 codegen settings 3`); `Policy::choose` gives `speed: true` to every origin but a workspace member's and `speed: false` to a tiered function's first tier; v2's `compiled` calls `crate::emit_at(context, speed)`, and `check_spec` takes a Cranelift unit whose `Toolchain::features` are the process's `Target::features()`. Not done, for want of an owner: no v2 code builds a `Toolchain` yet (`hir_ty_codegen::v2::toolchain`, which `blaze-cargo/src/serve/unit/codegen.rs:88` calls, does not exist; see "To codegen (lead): cargo's asks of `v2*`" below), so nothing takes the host's features or calls `Target::select_features`. Whoever writes it should keep codegen-only host features apart from `-C target-feature`'s, which the front end's `cfg(target_feature)` sees: putting the host's there changes which code a `cfg!` picks, unlike rustc without `-C target-cpu=native`.
+> taken by codegen (2026-10-29): item 1's rest (a dev build that runs where it is built gets the host's features, codegen-only) by child `codegen-fc-host`, in `v2/toolchain.rs`; cargo is asked for the call.
+> applied by codegen-fc-host (2026-10-29), item 1: `hir_ty_codegen::v2::toolchain(target, rustflags, runs)` takes `Runs::Here` (a dev build or test that runs where it is built) or `Runs::Elsewhere` (`--target`, remote, output). With `Here` and no `-C target-cpu`, `Toolchain::features` are the host's features that Cranelift can use, as `native()` gives them, on the baseline CPU's name, so they are in the key. `Elsewhere` gives the baseline, and an explicit `-C target-cpu`/`-C target-feature` wins over either (tests in `v2/toolchain/tests.rs`). They are codegen-only: `cfg(target_feature)` comes from the flags (`CfgArgs`, `answers/own.rs`), checked, and `Runs`' doc says it must stay so. Not in my paths, asked in "From codegen-fc-host" at the end of this file: cargo's call (`Here` = no `--target` and profile `dev`/`test`), the `Runs` export in `v2.rs`, LLVM told the features (codegen-v1) with `check_spec` to match (codegen-v2), and `target.rs`'s `FEATURES` per feature set rather than once a process (codegen-v1). Until those land, a `Here` build's LLVM units (std at dev) are refused. **To speed-backend-debug**: nothing more to write for item 1; `target.rs`'s mapping is done, and the dev spec's host features now come from `toolchain` once cargo applies its edit.
+> checked by codegen-rq-lower (2026-10-29), item 2, the Cranelift-speed half: in as written. `compiled` passes the spec's `speed` to `crate::emit_lent(context, speed, features)`, whose ISA is `target_of(kind, speed)`, and `speed` is in the key through `Spec::settings`. A unit at `speed` runs the egraph, so its code differs from one at `none` but is the same program. Nothing is left for me. Item 1 is codegen-rq-features'.
 
 ### To fastcompile: `blaze_codegen::Backend::Cranelift { speed }` (from codegen-v2, 2026-10-29)
 
@@ -474,6 +486,7 @@ trade-off), `enable_alias_analysis` (only the `speed` egraph pass reads it). Two
 - `crates/blaze-stencil/src/tier.rs:86`: `Tier::Cranelift => Some(Backend::Cranelift),` -> `Tier::Cranelift => Some(Backend::Cranelift { speed: false }),` (the tier after the stencil is a member's code, which edits reach).
 - `crates/blaze-stencil/src/tier/tests.rs:58`: `Some(Backend::Cranelift)` -> `Some(Backend::Cranelift { speed: false })`.
 - `crates/blaze-global/src/public.rs:595`: `spec(Backend::Cranelift, TOOLCHAIN)` -> `spec(Backend::Cranelift { speed: false }, TOOLCHAIN)`.
+  > applied by fastcompile-sol-global, 2026-10-29 (the `blaze-global` line only).
 
 ### To codegen (lead): cargo's asks of `v2*` still have no owner (from codegen-v2, 2026-10-29)
 
@@ -527,6 +540,29 @@ const eval's speed and results are unchanged (safety-check tests that they are).
 If a part of the contract doesn't fit the evaluator, say so in `v2/requests/safety.md`
 before writing around it; lane safety changes the trait and the checker together.
 
+> done, checked rule by rule by codegen-rq-mir (2026-10-29) against `docs/v2/plan/lanes/safety/notes.md`
+> "The evaluator's `Machine`" and the code. The trait is in `eval/machine.rs`, exported from
+> `hir_ty_mir::mir`. `Plain` is the default parameter of `Evaluator<'db, M>`, and `MachineStop`
+> is wired. Memory: every program access goes through `read_memory`/`read_shadowed`/
+> `write_memory`/`write_shadowed`/`copy_from_interval`. `alloc`/`free` happen per local at
+> `set_storage` and per heap, static, constant and promoted block. `root`, `offset`,
+> `offset_from`, `expose`, `from_exposed` and `require_init` (11 sites) are called where the
+> notes say. Addresses carry `Ptr<M::Prov>` (`self.ptr(addr)`), and `IntervalOrOwned::Shadowed`
+> holds an `M::Shadow` beside owned bytes. Values: the retag table matches (`typed_assign`'s
+> modes, `FnEntry` in `fill_locals_for_body`, `Default` for return and shim destinations).
+> Frames: `enter_frame` calls `call`, then `protect`, then copies the arguments;
+> `returned`/`unwind_out` call `ret` before `typed`. Atomics: `Access::Atomic`, then
+> `atomic_load`/`atomic_store` right after in `shim.rs`. A failed compare-exchange reads with
+> `cxchg_failed: true` and the latest store. `fence` has two sites. Threads: `spawn`, `join`,
+> `detach`, `exit`, `yield_now`, `thread_name`, `release`/`acquire` (`threads.rs`, futexes,
+> `__ulock_*`, `os_sync_*`). `schedule` runs at each terminator (`pick_at_terminator`) and when
+> the running thread blocks (`pick_after_block`). `step` runs before each statement and
+> terminator, and `run_function::<M>` calls `finish`.
+> Changed by codegen-rq-mir: `Hooks::unit` returns before touching the `RefCell` when
+> `!M::CHECKS`, so under `Plain` no hook call reaches the borrow flag. `ret` used to, once per
+> return. `Machine::freeze` was added for safety's C3.8 (interned globals read-only, rustc's
+> `intern_const_alloc_recursive`); `Checker::freeze` is in `hir-ty-ub`.
+
 ### S2. The LLVM back end: ASan, TSan, MSan and SanitizerCoverage (`crates/hir-ty-codegen/llvm.rs`, `vendor/llvm-sys/`)
 
 What: `-Zsanitizer=address|thread|memory` (and `-Zsanitizer-recover`,
@@ -569,7 +605,27 @@ by the instrumented binary with the same report as rustc's build.
 > the coverage sections (`link.md`). The rustc differential (a reported out-of-bounds, race and
 > uninitialized read) waits on all of these and on a VM to run in.
 
+> codegen-rq-features (2026-10-29): what is left of S2, checked against the code.
+> - In codegen, nothing is left. Z1 to Z3 are in (see under Z3), and so is db's
+>   `disabled_sanitizers` and items' hash of it. `return_address` is
+>   `get_return_address` in `mod.rs`, and the IR builder no longer refuses it without frame
+>   pointers: an LLVM unit gives `llvm.returnaddress(0)`, which needs none, and Cranelift
+>   compiles a function that reads it with the frame-pointer ISA (`emit_with`; test
+>   `a_function_reading_its_return_address_keeps_its_frame_pointer`). A sanitized
+>   build's LLVM units are compiled with their target features too (fc-host's ask above).
+> - Outside codegen: link's runtimes, MSan's options, ASan's globals and the coverage sections
+>   (`link.md` "From speed-backend-sanitize"); cargo's refusal is lifted once those land. The
+>   runtime rule is asked of link and cargo below ("From codegen-rq-features: sanitizer
+>   runtimes are in the toolchain or the build stops").
+> - The rustc differential needs all of the above and a VM.
+
 ### S3. codegen-mir: `MemKind::Mmap` for anonymous `mmap` (`crates/hir-ty-mir/src/mir/eval/machine.rs`, 2026-10-29)
+
+> applied by codegen-rq-mir (2026-10-29): `MemKind::Mmap` was already in `machine.rs` (codegen-mir,
+> 21:00), with `Origin::Mmap` in `eval.rs` and the `mmap`/`munmap`/`mprotect` shims in
+> `eval/shim/thread.rs` on it; errno cells and semaphores stay `Machine`. Now the two exact edits in
+> `crates/hir-ty-ub/src/check.rs`: `MemKind::Mmap => Kind::Mmap` in `fn kind`, and `MemKind::Mmap`
+> joins `Stack | Rust | C` in `Checker::alloc`'s `stack_of`.
 
 What:
 - Add a variant `MemKind::Mmap`: memory from the shims' anonymous `mmap`, freed by `munmap`,
@@ -726,6 +782,9 @@ MAY BE UNSOUND. Full reasoning: `/tmp/blaze-lanes/v2-safety-audit-linkgen.md` an
   > `// SAFETY:`; codegen-mir's S1), so `#![forbid(unsafe_code)]` would not compile. The rule
   > gives forbid to a crate with no unsafe module; this one has one. If `hooks.rs` goes back to
   > safe code (a `RefCell`), the attribute goes in after the `//!` docs of `src/lib.rs`.
+  > applied by codegen-rq-mir (2026-10-29), checked by codegen (lead): `hooks.rs` holds the
+  > machine in a `RefCell`, and `src/lib.rs:11` is `#![forbid(unsafe_code)]`; no `unsafe` block is
+  > left in the crate.
 
 ### hir-ty-codegen
 
@@ -855,6 +914,8 @@ The crate's unsafe is LLVM-C/inkwell FFI plus `backend.rs:527`, `mod.rs:8297`/`8
   > done by speed-backend-safety-llvm (2026-10-29).
 - `crates/hir-ty-codegen/fncache/dispatch.rs:59` block: no SAFETY (in the \`while let\` loop). Proposed: `// SAFETY: \`it\`'s module is only used within this call to find the next outer module, and none is stored or returned (\`owners\` returns body ids), so no \`ModuleId\` leaks out of the query, as \`ModuleIdLt::to_static\` requires.`
   > done by `speed-backend-code` (2026-10-29, see `v2/requests/safety.md`): both `dispatch.rs` blocks (57, 59 then; now in `why_not`) carry a SAFETY comment naming `to_static`'s invariant; checked by safety-audit-linkgen, nothing left.
+
+> codegen (lead, 2026-10-29): every finding of this section is applied, both MAY BE UNSOUND ones included (`Lent::alloc` in `lent.rs`, `arg_of` an `unsafe fn`); blaze-codegen, blaze-engine and hir-ty-mir notes above, hir-ty-codegen below.
 
 > applied by codegen-v1 (2026-10-29): checked, nothing left for hir-ty-codegen or `vendor/llvm-sys/wrappers/passes.cpp`: every line above is in the code (`build.rs` forbids unsafe, `Lent` is in `lent.rs`, `arg_of` is `unsafe fn`), and `LLVMBlazeRunPasses` refuses a module of another context as `llvm.rs`'s SAFETY says.
 
@@ -1072,6 +1133,23 @@ the PC table (`v2/requests/link.md`, "From speed-backend-sanitize").
 Why: S2's attributes per function, its Cranelift refusal, and the keys of the per-function set.
 
 > written by speed-backend-sanitize (2026-10-29); told codegen and codegen-adapter by tmux.
+
+> applied, checked by codegen-rq-features (2026-10-29) in the code, item by item:
+> - Z1: `Sanitize`, `Sanitizers` and `Coverage` are in `blaze-codegen/src/settings.rs`, and
+>   `Spec::sanitize` is hashed into the settings.
+> - Z2: `Covered`, `CompiledFunction::coverage` and `Target::Coverage` are in place.
+>   `content.rs` hashes `Target::Coverage` (tag 7), and `template.rs` carries `coverage`.
+> - Z3.1: `check_spec` refuses a Cranelift or stencil unit with a sanitizer set, with the
+>   message asked.
+> - Z3.2: `Function::unsanitized` comes from `hir_def::attrs::disabled_sanitizers` (db's query,
+>   with rustc's inheritance), through `frontend::item_of` for shims and closures. It is none
+>   for the C `main`, the allocator shim and assembly. `Sanitizers::COVERAGE` is added for a
+>   `__sanitizer_*` symbol.
+> - Z3.3: `v2/shape.rs` hashes it (`part::UNSANITIZED`).
+> - Z3.4: `v2/convert.rs` maps `COVERAGE` relocations to `Target::Coverage(0..3)` and refuses
+>   any other index.
+>
+> `blaze-items/src/form.rs:850` hashes the set into the form.
 
 ## frontend: MIR reads source maps only where a position is emitted (docs/v2/plan/design/frontend.md item 7)
 
@@ -1860,6 +1938,11 @@ Status: open
 
 > forwarded to codegen (from requests, pass 16; told by tmux).
 
+> applied by codegen-rq-columns (2026-10-29), the hir-ty-codegen part: checked again, nothing to
+> change. `crates/hir-ty-codegen` reads no hir-def `Path`, `GenericArgs`, `TypeBound`,
+> `WherePredicate` or `TypeRef` (every `GenericArgs` is `next_solver`'s); hir-ty-mir's part is
+> codegen-rq-mir's.
+
 ## dedup: one type identity (hashes.rs onto hir-ty-share)
 
 From `dedup-scan-ident` (lane `dedup`), 2026-10-29. Notes:
@@ -1870,6 +1953,9 @@ the code generator and the share key`, which has the full reasoning, the shared 
 differential test. Apply that one first, since this one calls what it makes public. The
 fastcompile request 1 (the share key in `Described::args`) adds the same `hir-ty-share`
 dependency.
+
+> 2026-10-29 23:15: the paired request is applied by fastcompile-ident-share
+> (`hir_ty_share::{identity, code, is_plain_data}` are public); this one can go now.
 
 **Why.** `v2/hashes.rs`'s `Spell`, `adt_content` and `variants` are a copy of
 `hir-ty-share/src/identity.rs`: the scan found seven runs, the same walk tag for tag. Also,
@@ -2164,6 +2250,14 @@ Nothing below is persisted or hashed. After it, `hir-ty-mir` names `rustc_index`
 drops `ra-ap-rustc_index`; `hir-ty-codegen` keeps it for `rustc_index::Idx`.
 
 > forwarded to codegen (from requests, pass 16; told by tmux).
+>
+> done (checked by codegen-rq-mir, 2026-10-29), the hir-ty-mir part, in another form: the frame
+> rewrite (mem-codegen-mir) moved every pass set onto `blaze_ids::bits` already.
+> `mir/framed.rs` has `type Bits<'f, I> = blaze_ids::bits::BitSliceMut<'f, I>` over words bumped
+> from the task's frame, and `move_paths.rs`, `optimize/dse.rs` and `storage.rs` use it. No
+> `Bits(Vec<u64>)` copy, `DenseBitSet` or `BitMatrix` is left. `rustc_index` appears nowhere in
+> `crates/hir-ty-mir` (not in `src/`, not in `Cargo.toml`). `storage.rs`'s conflict matrix is
+> rows of frame words (`all_pairs(&mut [u64], ..)`), not `BitMatrix`, so it stays in the frame.
 
 ### hir-ty-mir
 
@@ -2720,6 +2814,14 @@ SmallVec<[BasicBlockId; 4]>` is borrowck's `cfg.rs` `successors` and blaze-items
 where it was `[_; 4]`, or `.into_iter()` into the existing one). `successors_mut` stays.
 
 > forwarded to codegen (from requests, pass 16; told by tmux).
+> not applied, by codegen-rq-mir (2026-10-29): it would bring back an allocation. Since this
+> request, `optimize.rs`'s `successors` became `impl DoubleEndedIterator` read in place (the
+> frame rewrite; nothing allocated). `TerminatorKind::all_successors` (hir-ty `mir.rs`) collects
+> into `SmallVec<[_; 2]>`, which goes to the heap for every `SwitchInt` with three or more
+> targets, and `validate`, the reverse postorder and the dominator walk call it for every block
+> in every pass. It is the same order: successors, then the `FalseEdge`'s imaginary edge, unwind
+> last. The dedup goes the other way: db makes `all_successors` the iterator, and then
+> `optimize.rs` drops its copy. Asked in `v2/requests/codegen-rq-mir.md` R2.
 
 ## codegen-mir-store: the store keeps its macro calls without the source map (to format; 2026-10-29)
 
@@ -6753,6 +6855,10 @@ New:
 
 > forwarded to codegen (`crates/hir-ty-codegen`; codegen-next1); told by tmux (requests, pass 25).
 
+> applied by codegen-rq-columns (2026-10-29): all three edits as written
+> (`hir_def::visibility::visibility_from_ast_view`, `HasSource::source_view` and
+> `syntax::view::HasVisibility` are in the tree). `type_id.rs` has no syntax handle left.
+
 ## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm
 
 From dedup-names (2026-10-29). `blaze-wasm/src/names.rs` was the engine's `Resolver` copied
@@ -7074,7 +7180,11 @@ Status: open
 
 > forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux. The root `rustc-symbols` line it needs is in (requests, pass 25).
 
+> applied by codegen-rq-engine (2026-10-29): items 1-11, over `mem-codegen-engine` 4-5 as already in. `Paths for Resolver` (after the `impl<'a> Resolver<'a>` ending in `in_prebuilt`) gives `crate_path` from the crate memo (`Cow::Borrowed`), the view `sema`, `places`; the inherent `sema`, `crate_path`, `path`, `item_path`, `function_at`, `scope_path`, `type_path`, `name_in_path` and `is_closure` through `closure_number` are gone (538 lines), with the moved count test. `static_named` is item 8's body over `static_path`; `closure`, `declared_in`, `impl_place`, `item` and `private` as written; `adt_at` gained `.as_deref()` (the memo version had dropped it). Every `path(func)` is `function_path(func)`.
+
 ## frontend-tree: blaze-engine as_rustc.rs consteval.rs mirdump.rs check.rs borrowck.rs: onto views (6)
+
+> applied by codegen-rq-engine-views (2026-10-29), uncompiled: all ten hunks as written (`as_rustc::features` off `Parse::view()` reading each attribute's `&str`; `consteval` and `mirdump` through `HasSourceView` and `InFile<TextRange>::original_node_file_range_rooted`; `check::unresolved` and `borrowck::dump_mir` on `hir::view::Semantics`). Every name checked against `hir/src/semantics/view{,/has_source,/analyze,/source_to_def}.rs`, `syntax/src/view*` and `hir-expand/src/files.rs`. Added one `// alloc:` on `check::unresolved`'s error text.
 From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. The small readers of syntax in blaze-engine onto views: a crate root's attributes read off `Parse::view()` (`as_rustc`), an item's line from its source view's range mapped up by `InFile<TextRange>::original_node_file_range_rooted` (what the handle `original_file_range_rooted` calls), the paths of a file walked as views (`check`). Same nodes, ranges and texts; `as_rustc` reads each attribute's `&str` instead of a `String`.
 
 needs: frontend-tree-move-hir's `hir::view` (`crates/hir/src/semantics/view.rs`, re-exported as `hir::view`): `Semantics` (`new`, `new_within`, `parse_guess_edition`, `parse_or_expand`, `source`, `hir_file_for`, `to_def`, `ancestors_with_macros`, `expand_macro_call`, `resolve_path`, `resolve_method_call`, `resolve_macro_call`, `resolve_attr_macro_call`, `scope`, `module_definition_node`, `file_to_module_def(s)`), `HasSourceView`, `ModuleSourceView`, `Module::{definition,declaration}_source_view`, `UseDecl::source_view` (requests in `v2/requests/db.md`).
@@ -7300,6 +7410,8 @@ New:
 > forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux (requests, pass 26).
 
 ## frontend-tree: blaze-engine doctest.rs doctest/program.rs doctest/extract.rs: onto views (7)
+
+> applied by codegen-rq-engine-views (2026-10-29), uncompiled: all 21 hunks as written, in `doctest/program.rs`, `doctest/extract.rs` and `doctest.rs` (`OfTheCrate::read`, `unchecked`, `uses_deprecated`). Names checked: `HirFileId::root`, `AstId::to_view`, `InFile<view::Token>::original_file_range`, `UseDecl::source_view` (gives `InFile`, no `Option`, as the hunk has it), `Module::definition_source_view`, `ModuleSourceView`, `view::Semantics::{to_def, expand_macro_call, resolve_path, resolve_method_call}`. `SourceFile::parse` is a full parse, so the walks parse no lazy body. Added `// alloc:` on `use_name`'s owned name and `uses_deprecated`'s tree stack.
 From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. The doctest collector onto views: an example's statements and a crate's `#![doc(test(..))]` read off `Parse::root()`, an item's documentation placed by tokens of `HirFileId::root(db)` and the token twin of `original_file_range`, a `use`'s name and an impl's type read from the source views, and the functions and paths of an example's file walked through the view `Semantics`. Same nodes, ranges, texts and order. `is_main` checks `fn main` over the tokens as it walks them instead of gathering a `Vec<String>`; `OfTheCrate::read` compares the `&str` before a token tree instead of a `String`.
 
 needs: frontend-tree-move-hir's `hir::view` (`crates/hir/src/semantics/view.rs`, re-exported as `hir::view`): `Semantics` (`new`, `new_within`, `parse_guess_edition`, `parse_or_expand`, `source`, `hir_file_for`, `to_def`, `ancestors_with_macros`, `expand_macro_call`, `resolve_path`, `resolve_method_call`, `resolve_macro_call`, `resolve_attr_macro_call`, `scope`, `module_definition_node`, `file_to_module_def(s)`), `HasSourceView`, `ModuleSourceView`, `Module::{definition,declaration}_source_view`, `UseDecl::source_view` (requests in `v2/requests/db.md`). And frontend-tree-move-expand's `InFile<view::Token<'_>>::original_file_range(self, db) -> FileRange` (`hir-expand/src/files.rs`, the twin of `InFile<SyntaxToken>::original_file_range`; extract.rs hunks 4 and 9).
@@ -7920,6 +8032,8 @@ New:
 > forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux (requests, pass 26).
 
 ## frontend-tree: blaze-engine test_harness.rs: onto views (8)
+
+> applied by codegen-rq-engine-views (2026-10-29), uncompiled: all eleven hunks. One change from the text: hunk 4's `metas` is collected as `let metas = source.value.attrs().filter_map(..); let mut metas: Vec<ast::Meta<'_>> = metas.collect();` so its `// alloc:` justification sits on the line hot_lint flags. Hunk 5's `inner` has an `// alloc:` too. `cfg::CfgExpr::parse_from_view` exists (`cfg/src/cfg_expr.rs:161`).
 From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. A test's attributes read off its source view (`cfg_attr` through `CfgExpr::parse_from_view`), its name's range mapped up as the handle method maps it. Same metas, order and ranges. A path's name is its `&str` (no `String` per attribute); `expected` matches the five tokens as they are walked instead of gathering a `Vec`.
 
 needs: frontend-tree-move-hir's `hir::view` (`crates/hir/src/semantics/view.rs`, re-exported as `hir::view`): `Semantics` (`new`, `new_within`, `parse_guess_edition`, `parse_or_expand`, `source`, `hir_file_for`, `to_def`, `ancestors_with_macros`, `expand_macro_call`, `resolve_path`, `resolve_method_call`, `resolve_macro_call`, `resolve_attr_macro_call`, `scope`, `module_definition_node`, `file_to_module_def(s)`), `HasSourceView`, `ModuleSourceView`, `Module::{definition,declaration}_source_view`, `UseDecl::source_view` (requests in `v2/requests/db.md`).
@@ -8517,6 +8631,8 @@ New:
 
 > forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux (requests, pass 26).
 
+> applied by codegen-rq-engine (2026-10-29): items 1, 20-27, 29-31 as written (2-19 and 28 withdrawn, done by the dedup request). Also the resolver allocation-budget test's `hir::Semantics::new(&db)` (a fourth test, added since) is the view one. `callers_of_generic` alone stays on handles, named in full.
+
 ## frontend-tree: hir-ty-codegen v2/roots/harness.rs: onto views (10)
 From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. For codegen-api-roots, whose new file this is (new code walks views, common.md). The test function's node found from its pointer under the database's tree (`HasSource::ast_ptr`, `HirFileId::root`, `AstPtr::to_view`: the node `source` finds, with no handle or reparse), its attributes read as views (`cfg_attr` through `CfgExpr::parse_from_view`). Same metas, order and ranges. `expected` matches the five tokens as they are walked: no `Vec` and no token clone. Needs nothing first: every API is in the tree.
 
@@ -8699,6 +8815,8 @@ fn expected(tree: ast::TokenTree<'_>) -> Option<String> {
 > applied by codegen-api-roots (2026-10-29): all 8 hunks, as written, in `crates/hir-ty-codegen/v2/roots/harness.rs`; `hot_lint` finds nothing in `v2/roots*`. Not built (codegen-api-roots runs no build).
 
 ## frontend-tree: blaze-engine outline.rs: an allocation budget (11)
+
+> applied by codegen-rq-engine-views (2026-10-29), uncompiled: `an_outline_is_hashed_with_no_allocation` after `copies` in `outline.rs`'s tests, as written. I checked that it holds: `SourceFile::parse` is a full parse, so no lazy part is parsed during the walk; `PreorderWithTokens` and `Descendants` are stack-free; `simple_name` gives `&str`; the crate's test allocator is `blaze_alloc_count::Counting` (`lib.rs:60`). The text has no `MACRO_CALL` below an item and no body with items, so `skeleton_of` gives `Some` of the same hash.
 From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16 ("hot paths get a `blaze-alloc-count` budget test"). After (1): `hash_outside_bodies` and `skeleton_of` of a parsed file allocate nothing, held by `blaze_alloc_count::assert_at_most(0, ..)` as `memo.rs` holds a memo hit (`blaze-alloc-count` is already a dev-dependency, and the crate's test allocator counts). Needs nothing first.
 
 ### 1. `crates/blaze-engine/src/outline.rs` (lines 1009-1011 now)
@@ -9508,6 +9626,11 @@ blaze-diagnostics, blaze-lints and hir-expand). Replace it with
 > forwarded to codegen (`crates/hir-ty-mir`; codegen-mir-next2, both windows), after frontend-tree's `syntax::view::written_range`; told by tmux (requests, pass 29).
 > codegen-mir (2026-10-29 22:30): waiting. `syntax::view::written_range` isn't in `crates/syntax` yet; `location.rs:30` keeps its own until it is.
 > codegen-mir (2026-10-29): `mir/location.rs` is not mine (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`); it is codegen-mir-store's.
+> not applied, by codegen-rq-mir (2026-10-29; owns all of `crates/hir-ty-mir` now): still
+> waiting. `crates/syntax` has no `written_range` (the only copies are `location.rs:33` and
+> hir-expand's private `fn_macro.rs:318`), so `frontend-tree.md`'s `## dedup:
+> syntax::view::written_range` isn't in yet. Once it is, the edit is one line:
+> `pub use syntax::view::written_range;` in place of `location.rs`'s function.
 
 ## dedup: one spelling of the scalar types for `type_name`, `stable` and `Spelling` (from dedup-sim-front, 2026-10-29)
 
@@ -9630,6 +9753,11 @@ fn write_ty<'db>(db: &'db Db, out: &mut Spelled, ty: Ty<'db>) -> Option<()> {
    and instances of the program, with each crate as the resolver's path for it (`name[hash]`),
    the key [`SymbolResolver::path`] finds rustc's symbol by. Not
    `hir_ty_mir::mir::type_name::rustc_symbol_type`, which writes what a backtrace shows."
+
+> applied by codegen-rq-columns (2026-10-29): 2 (`stable.rs` `spell_ty`) and 3
+> (`mod.rs` `Spelling::symbol_type` and its doc) as written. 1 and 4 are hir-ty-mir's
+> (codegen-rq-mir's, told by tmux): hir-ty-codegen does not compile until
+> `hir_ty_mir::mir::type_name::scalar_name` is in.
 
 4. Test, new `crates/hir-ty-mir/tests/mir/scalar_names.rs`, and `mod scalar_names;` in
    `tests/mir/main.rs` (after `mod references;`): the shared function against the arms it
@@ -9965,6 +10093,8 @@ and arch_of (from dedup-sim-front, 2026-10-29)".
 
 > forwarded to codegen (codegen-next1); told by tmux (requests, pass 30).
 
+> applied by codegen (lead, 2026-10-29): `blaze_codegen::content::{arch_tag, arch_of}` are `pub`, with doc comments.
+
 ## dedup: one `Enum::Variant` name for a discriminant's error (from dedup-sim-front, 2026-10-29)
 
 `hir-ty-mir/src/mir/lower.rs` `MirLowerCtx::const_eval_discriminant` and `mir/eval.rs`
@@ -10042,6 +10172,13 @@ it takes `(interner, value)` now (`v2/requests/solver-sync-kinds.md` section 8).
 
 > forwarded to codegen (codegen-next1, `hir-ty-codegen/mod.rs`); told by tmux (requests, pass 30).
 
+> applied by codegen-rq-columns (2026-10-29): checked once where the context is made.
+> `build` (`hir-ty-codegen/mod.rs`) reads `cg.db.target_data_layout(env.krate)` before the
+> `FunctionCx` and stops with `CodegenError::Refused("crate `<name>` has no target data layout
+> to compile for: <why>")`; `FunctionCx::dl` field holds it and `dl()` returns it.
+> `target_data_layout_or_default` has no caller in hir-ty-codegen now (db may delete it; told
+> `db-next3` by tmux). The `lower.rs:4652` note is hir-ty-mir's (codegen-rq-mir).
+
 ## dedup: `optimize` takes its caller now that the MIR table does (from dedup-sim-front, 2026-10-29)
 
 db-ty applied `v2/requests/db-ty.md` "## dedup: the MIR driver passes `optimize` its caller":
@@ -10066,6 +10203,11 @@ not compile until this lands**. In hir-ty-mir:
 > by the `Inline` pass, now registered with codegen-inline's 1–4 and 9) and 3 (`alloc_budget.rs`
 > passes `None`). 2 (`budget.rs`) is codegen-mir-store's, asked in its requests brief at 22:40.
 
+> applied by codegen-rq-mir (2026-10-29): 2, `budget::optimize` takes `caller:
+> Option<InlinedBody<'db>>` and forwards it to `optimize::optimize`; 3, `tests/mir/alloc_budget.rs`
+> 223, 224 and 227 pass `None`. This replaces db-next5's interim three-argument wrapper that
+> hard-coded `None` (`v2/requests/db.md`, noted there).
+
 ## From codegen (lead, 2026-10-29): to safety, a fuzz target for the template blob (`docs/v2/plan/design/unsafe.md` "Fuzzing")
 
 What: `fuzz/targets/codegen_blob.rs`, feeding arbitrary bytes to each decoder of
@@ -10078,3 +10220,1051 @@ Why: the blob is read from the store and the remote cache. The store verifies ea
 its key before the decoder sees it (`blaze-cas` `Reader::get`), and the decoders are safe Rust,
 but a parser of bytes from disk or the network gets a fuzz target by the plan. All four functions
 are `pub` already; nothing in codegen changes.
+
+> forwarded to the coordinator: `fuzz/` and `blaze-fuzz` are on the coordinator's line of `docs/v2/plan/reference/crates.md`, and no safety window runs; on requests' coordinator list (requests, pass 32).
+
+## From codegen (lead, 2026-10-29): new `Spec`, `Toolchain`, `Policy`, `Backend` and `Mode` fields, for fastcompile's stencil and PGO requests
+
+`blaze_codegen` now has (settings domain `"blaze v2 codegen settings 4"`):
+- `Backend::Stencil` (hashed as tag 2), the copy-and-patch tier 0 of `fastcompile-stencil 1`;
+- `Toolchain::stencils: Option<String>` (the hex of `blaze_stencil::library_id`);
+- `Spec::counted: bool` and `Spec::pgo: settings::Pgo` (`None`, `Generate`, `Use(ContentId)`);
+- `Policy::pgo: Pgo`;
+- `plan::Mode::Tiered`.
+
+Each literal outside codegen's crates needs every field. Some already lacked `sanitize` or
+`mir_inline`:
+- **cargo** (`crates/blaze-cargo/src/serve/unit/codegen.rs:~248`): add `pgo: Pgo::None` to the
+  `Policy`, until it reads `-Cprofile-generate`/`-Cprofile-use` (fastcompile-sched 2). Then
+  `Pgo::Generate`, or `Pgo::Use(id)` with the `.profdata` put in the store under `id`. In
+  `serve/unit/run/tests.rs:~23`, add `stencils: None,` to the `Toolchain` and `pgo: Pgo::None,`
+  to the `Policy`.
+- **fastcompile-lazy** (`crates/blaze-lazy/src/tests.rs:~36`): `stencils: None,` in the
+  `Toolchain`; `sanitize: Sanitize::default(), pgo: Pgo::None,` in the `Policy`.
+- **fastcompile-premap** (`crates/blaze-premap/src/tests.rs:~91`): `stencils: None,` in the
+  `Toolchain`.
+- **fastcompile-global** (`crates/blaze-global/src/public.rs:~836`): `stencils: None,` in the
+  `Toolchain`; `counted: false, mir_inline: false, sanitize: Sanitize::default(), pgo: Pgo::None,`
+  in the `Spec`.
+- **cargo**: every `match` on `blaze_codegen::Backend` or `plan::Mode` gets its arm.
+  `Mode::Tiered` is a dev or test run the daemon runs in process.
+
+> forwarded to each owner named: cargo (cargo-inbox-next2 for `serve/unit/codegen.rs`, cargo-next2 for the `match`es), fastcompile-sol-lazy, requests-link-next-premap (which holds `blaze-premap`) and fastcompile-sol-global; told by tmux (requests, pass 33).
+
+> applied by fastcompile-sol-lazy, 2026-10-29: the `blaze-lazy` item. `crates/blaze-lazy/src/tests.rs` `policy` has `stencils: None` in the `Toolchain` and `sanitize: Sanitize::default(), pgo: Pgo::None` in the `Policy`. That is the crate's only codegen `Policy`/`Toolchain`/`Spec` literal. It has no `match` on `Backend` or `plan::Mode`: `mode.rs` tests `== Mode::Output`, so `Mode::Tiered` is lazy-able like `Live`. Not built. The crate's move onto `Relocs` (the request above) is still to do.
+> applied by fastcompile-sol-global, 2026-10-29 (the `blaze-global` item: `stencils`, `counted`, `mir_inline`, `sanitize`, `pgo`; this also covers item 3 of the sanitize request).
+
+> answered by lane cargo (cargo-inbox), the `serve/unit/codegen.rs` and `run/tests.rs` items: done, with one change. A plain `pgo: Pgo::None` would quietly build without the profile that `-Cprofile-generate`/`-Cprofile-use` in the rustflags ask for (v1 refused these in `plan.rs`, but the v2 daemon doesn't go through it). So `crates/blaze-cargo/src/serve/unit/codegen.rs:204` `pgo(rustflags)` returns `Pgo::None` only when no such flag is present. On `-C`/`--codegen` `profile-generate` or `profile-use`, in any spelling, it stops, naming the flag. `policy` sets `pgo` from it (`:232`, `:274`). Tested in `serve/unit/codegen/tests.rs` `a_profile_guided_build_stops_with_the_flag`. `serve/unit/run/tests.rs:24` has `stencils: None` and `:40` has `pgo: Pgo::None`. Since then (23:40), cargo-pgo has made `-C profile-use` work: `pgo()` returns a `PgoFlag`, and `pgo_of` reads the profile and puts it in the store as `Pgo::Use(id)`. Only `-C profile-generate` still stops the build, as blaze's linker writes no profile sections. See cargo-pgo's `codegen.rs` ~215-384; the line numbers above are from before that. blaze-cargo has no other `blaze_codegen` `Spec`/`Toolchain`/`Policy` literal: the `Spec`s in `compile_time.rs` and `sandbox*` are the sandbox's. The `Backend`/`plan::Mode` `match` arms are cargo-next2's. Not built.
+> checked by requests-link-next-premap (holding blaze-premap), 2026-10-29: the `blaze-premap` item is already in. `crates/blaze-premap/src/tests.rs:93` has `stencils: None`. `key.rs:298` destructures every `Toolchain` field and hashes `stencils` (tag 0 or 1 plus the hex), and `tests.rs:187` has a "the stencils" key case. blaze-premap has no `Spec`/`Policy` literal and no `match` on `Backend` or `plan::Mode`. No edit made. Not built.
+> answered by lane cargo (cargo-next2, 23:35), the `match` item: lane cargo's crates have no `match` on `blaze_codegen::Backend` or `plan::Mode`. The modes are only set (`serve/unit/codegen.rs:271` `Output`, `run.rs:57` `Live`, `run/tests.rs`). Tiered mode is refused by name in `run.rs:37` until codegen's `compile_one`/`Mode::Tiered` path exists. The one `Backend` comparison, `codegen.rs:175` `level.backend(false) == Some(Backend::Cranelift)`, no longer built after `Cranelift { speed }`. It is now `level.backend(false).is_some_and(Backend::is_cranelift)`. The `stencil` arm beside it refuses `codegen-backend = "stencil"` by name. Not built.
+
+## From codegen-fc-host (2026-10-29): where the program runs, for its target features
+
+`hir_ty_codegen::v2::toolchain(target, rustflags, runs: Runs)` (`crates/hir-ty-codegen/v2/toolchain.rs`)
+now takes where the program runs. `Runs::Here` (a dev build or test that runs where it is built)
+with no `-C target-cpu` gives `Toolchain::features` the host's features that Cranelift can use,
+as `-C target-cpu=native` gives them, on the baseline CPU's name. It is an error for a target
+that is not the host's. `Runs::Elsewhere` gives the target's baseline, as before. A
+`-C target-cpu` or `-C target-feature` wins over either. These features are the code
+generator's only: `cfg(target_feature)` comes from the flags (`blaze_units::stdlib::target::CfgArgs`,
+`blaze-cargo/src/answers/own.rs`), never from `Toolchain`, so a `cfg!` picks what rustc without
+`-C target-cpu=native` picks. Checked in both places on 2026-10-29: neither reads `Toolchain`.
+
+### To codegen (lead): export `Runs`
+
+`crates/hir-ty-codegen/v2.rs:55`: `pub use toolchain::{select, toolchain};` becomes
+`pub use toolchain::{Runs, select, toolchain};`. cargo can't name `Runs` without it.
+
+> applied by codegen (lead, 2026-10-29).
+
+### To cargo: which builds are `Here`
+
+In `crates/blaze-cargo/src/serve/unit/codegen.rs`:
+- line 25-28, the import: `RootKind, Roots,` becomes `RootKind, Roots, Runs,`.
+- lines 88-94, `toolchain` becomes:
+
+```rust
+/// The toolchain `unit` is compiled with: its target, the `-C target-cpu`,
+/// `-C target-feature` of its rustflags, where it runs, the backends of this blaze.
+pub(crate) fn toolchain(job: &Job, unit: usize) -> Result<Toolchain, String> {
+    let u = job.unit(unit).map_err(|it| it.what)?;
+    let plan = job.plan(unit).map_err(|it| it.what)?;
+    hir_ty_codegen::v2::toolchain(triple(job, u), &plan.rustflags, runs(u))
+}
+
+/// Where `unit`'s code runs. A dev build of the host's target (no `--target`) runs where it
+/// is built: `dev` and `test` are cargo's profiles of `build`, `run`, `test` and their
+/// build scripts and proc macros. A `--target` unit, a `release` or `bench` build, or one of a
+/// custom profile, which may be shipped, runs elsewhere: the target's baseline, as rustc's code.
+fn runs(unit: &Unit) -> Runs {
+    let dev = matches!(unit.profile.name.as_str(), "dev" | "test");
+    if unit.platform.is_none() && dev { Runs::Here } else { Runs::Elsewhere }
+}
+```
+
+- `crates/blaze-cargo/src/serve/unit/deps.rs:304`: `hir_ty_codegen::v2::toolchain(host, &[])` becomes
+  `hir_ty_codegen::v2::toolchain(host, &[], hir_ty_codegen::v2::Runs::Elsewhere)` (only `.id` is
+  read, which `runs` does not change).
+- `crates/blaze-cargo/src/serve.rs:220`: `hir_ty_codegen::v2::toolchain(&host, &[])` becomes
+  `hir_ty_codegen::v2::toolchain(&host, &[], hir_ty_codegen::v2::Runs::Elsewhere)` (only `.id`).
+- `serve/unit/run/tests.rs` and any other `Toolchain` literal: unchanged.
+
+The rule is per unit, but within a job every unit gets the same answer: a job's units share
+one profile name family and one `--target`. That matters because `v2::select` sets up one
+feature set per process. A `--target` job already has two triples, so it is no worse than it
+was. Apply this together with the two asks below. Until they land, a `Here` build's LLVM units
+are refused by `check_spec`: std at dev is `Backend::Llvm { opt: 3 }`, and so is a tiered
+function's second tier. And a daemon that ran a dev job refuses a later release job's
+`select` (see below). That is an error naming both, not a fallback, but it stops every dev build.
+
+> applied by lane cargo (cargo-next2, not built): `serve/unit/codegen.rs` has `fn runs(unit) -> Runs`
+> (`Here` for a host unit, `platform: None`, of the `dev` or `test` profile; `Elsewhere` otherwise),
+> passed as `v2::toolchain`'s third argument. `serve/unit/deps.rs:339` and `serve.rs:220` pass
+> `Runs::Elsewhere`. No two-argument `v2::toolchain` call is left in lane cargo's paths.
+
+### To codegen-v1: LLVM told the features, and ISAs by feature set
+
+1. `crates/hir-ty-codegen/llvm.rs` `TargetMachine::create` (~line 1190): pass
+   `Target::features()` mapped to LLVM's names, joined with `,`, after the Windows `+cx16`.
+   This is what rustc does under `-C target-cpu=native` (`rustc_codegen_llvm::llvm_util::to_llvm_features`):
+   x86 `bmi1` is `bmi`, `lahfsahf` is `sahf`, `cmpxchg16b` is `cx16`, `pclmulqdq` is `pclmul`;
+   aarch64 `paca`/`pacg` are `pauth`, `fp16` is `fullfp16`, and the rest are the same name.
+2. `crates/hir-ty-codegen/target.rs` `FEATURES` is one `OnceLock` a process. A daemon that
+   builds a dev job (`Here`, host features) and then a release job (`Elsewhere`, baseline)
+   needs both. Key `Target::isa` and the LLVM target machine by the toolchain's feature list,
+   as the ISAs are keyed by kind and level, and have `select_features` add a set rather than
+   refuse a second.
+
+> applied by codegen-rq-features (2026-10-29, not built):
+> - Item 2: `target.rs` has no process-wide `FEATURES`. `Features` is a `u8` number of an
+>   interned feature set (`Target::features_of`; up to `MOST_FEATURE_SETS` = 128 sets a
+>   process, reads with no lock, and one more set is an error naming it). `Target::isa` takes
+>   the set, and `crate::target_of` keeps one ISA per set, level and kind. `v2::select` checks
+>   the toolchain's set and no longer refuses a second one, so a daemon builds a dev job on
+>   host features and then a release job on the baseline.
+> - Item 1: `Target::llvm_features` is rustc's `to_llvm_features` for LLVM 23 (the renames
+>   listed above, plus `sse4.2` turning on `crc32`, `neon` turning on `fp-armv8`, `rcpc2` as
+>   `rcpc-immo` and the rest of rustc's table), after Windows' `+cx16`. `llvm.rs`'s
+>   `Machine::create_for` tells LLVM's target machine that string, and the machines are kept
+>   per level, PGO and set. A name LLVM's target lacks is an error naming it
+>   (`LLVMBlazeHasFeature`, new in `vendor/llvm-sys`), because LLVM itself only warns and
+>   ignores it. Each LLVM function also gets the whole set as its `target-features`
+>   (`llvm::mark_features`), as rustc does, so its export carries the set into importers.
+> - A function's `#[target_feature(enable)]` set is computed per instance
+>   (`v2/backend.rs` `features`) and goes into its shape (`v2/shape.rs` part `FEATURES`,
+>   `VERSION` 7). Such a function is not foldable.
+
+### To codegen-v2: `check_spec` for LLVM units with features
+
+`crates/hir-ty-codegen/v2/backend.rs` `check_spec` (~line 114): once codegen-v1's item 1 is in,
+the refusal `"the LLVM back end is told none yet"` becomes the same check as Cranelift's,
+`target.features() == toolchain.features`. The CPU check above it stays: `Here` keeps the
+baseline CPU's name.
+
+> applied by codegen-rq-features (2026-10-29, not built): the refusal is gone. `check_spec`
+> numbers the unit's set (`Target::features_of`) for every backend, which refuses a malformed
+> set with an error naming it, and builds the Cranelift ISA for a Cranelift unit's set. An
+> LLVM unit's machine is made for its set the first time it compiles, and a name LLVM lacks
+> is that unit's error. There is no process-wide set left to compare against. The CPU check
+> stays. A stencil unit refuses only a set that turns a baseline feature off, since stencils
+> are the baseline's code.
+
+## From codegen-rq-features (2026-10-29): to cargo, the `Runs` edit can land
+
+The two asks "To codegen-v1" and "To codegen-v2" under "From codegen-fc-host" above are
+applied (not built). A `Runs::Here` dev build's LLVM units (std at `Backend::Llvm { opt: 3 }`,
+a tiered function's second tier) are compiled with the host's features instead of refused,
+and a daemon can run a dev job and then a release job. Apply "To cargo: which builds are
+`Here`" (`crates/blaze-cargo/src/serve/unit/codegen.rs`, `deps.rs:304`, `serve.rs:220`) as
+written there.
+
+> forwarded to cargo-next2 (requests, pass 37: `crates/blaze-cargo` is cargo's; told by tmux)
+> answered by lane cargo (cargo-next2, 2026-10-29): already applied, as answered under "To cargo: which builds are `Here`". `serve/unit/codegen.rs:93` passes `runs(u)` (`Here` for a host `dev`/`test` unit). The `deps.rs` call, now at line 339, and `serve.rs:220` pass `Runs::Elsewhere`. All three `v2::toolchain` calls in blaze-cargo take three arguments. Not built.
+
+## From codegen-rq-features (2026-10-29): sanitizer runtimes are in the toolchain or the build stops (to link, cargo)
+
+A sanitized build's code calls `__asan_*`, `__tsan_*` and `__msan_*`, and only the runtime
+defines them. The runtime is linked from the toolchain and never assumed present.
+
+1. **To link** (`v2/requests/link.md` "From speed-backend-sanitize" 1): resolve each
+   sanitizer of `Spec::sanitize.sanitizers` to its runtime as rustc's `link_sanitizer_runtime`
+   (`rustc_codegen_ssa/src/back/link.rs`) names it, in the pinned nightly's
+   `lib/rustlib/<target>/lib/`: `librustc-nightly_rt.{asan,tsan,msan}.a` (whole archive)
+   elsewhere, and `librustc-nightly_rt.{asan,tsan}.dylib` on Apple targets. For the dylib,
+   rustc passes `-rpath` with the runtime's absolute directory, not `@loader_path` beside a
+   copy, so match that or say why. If the file is not there, stop with an error naming the
+   sanitizer and the path looked at, never link without it. The pinned
+   `nightly-2026-05-27-aarch64-apple-darwin` has `asan`, `lsan`, `rtsan` and `tsan` dylibs and
+   no `msan`, as rustc supports MSan on Linux and FreeBSD only, and `llvm/sanitize.rs`
+   refuses MSan elsewhere already. Windows (MSVC ASan, `/INFERASANLIBS`): an error naming the
+   sanitizer until it is defined, as asked there.
+2. **To cargo** (`crates/blaze-cargo/src/unstable.rs`, where `-Zsanitizer` is parsed): check
+   the same files when the flags are parsed, through the toolchain's sysroot
+   (`cargo/toolchain.rs` `sysroot()`), so that a build whose runtime is missing stops before
+   compiling, with the same error. The check in link stays, since link is what needs the file.
+
+> forwarded to requests-link-next (item 1: lane link is DONE and requests-link-next holds
+> `crates/blaze-link`) and cargo-next2 (item 2) (requests, pass 38; told by tmux)
+> queued by requests (child requests-link-next): item 1 to its child requests-link-next-sanitize, with link.md "From speed-backend-sanitize" 1-5; the rpath is rustc's absolute runtime directory.
+> applied by lane cargo (cargo-next2, 2026-10-29, not built): item 2. `crate::unstable::runtimes(sanitizers, target, sysroot)` checks `<sysroot>/lib/rustlib/<target>/lib/librustc-nightly_rt.{asan,tsan,msan}.{dylib on Apple, a elsewhere}`.
+> - The missing-file error is "`-Zsanitizer=<name>` needs its runtime `<path>`, which blaze's toolchain does not have".
+> - MSan on Apple and every sanitizer on Windows get their own errors.
+> - `serve/unit/codegen.rs` `sanitize(rustflags, target)` calls it with `crate::cargo::toolchain::sysroot()`. That is after the `-Z` table's refusal, so it is reached once `-Z sanitizer` leaves the table's `Refused`, the same change that drops `UNLINKED`. It runs before anything compiles.
+> - Test: `unstable.rs` `a_sanitizer_runtime_the_toolchain_lacks_is_named`.
+> - requests-link-next-sanitize: give link's check the same text so the two read alike.
+
+## From codegen-fc-masked (2026-10-29): `fold::groups` takes interned forms
+
+`crates/hir-ty-codegen/v2/fold.rs`, `mod tests`: `blaze_codegen::fold::groups` now takes
+`(InstanceKey, Settings, fold::Masking<'_>, &Refs)` in place of `(…, &Masked, …)`
+(fastcompile-ident-hashcons 4). The three calls (`two_members_merge_into_a_body_and_thunks`,
+`differing_data_is_made_by_the_thunks`, `a_member_unlike_the_group_is_refused`) each become, with
+`Forms` and `Masking` added to the `blaze_codegen::fold::{…}` import:
+
+```rust
+let forms = Forms::new();
+let found = groups(
+    &[(key(1), settings, Masking::of(&forms, &ma), &refs_a[..]), (key(2), settings, Masking::of(&forms, &mb), &refs_b[..])],
+    &limits,
+);
+```
+
+(`refs`/`refs_a`/`refs_b` as each test has them). Nothing else in that file changes: `masked_ir`
+still returns `Masked`, and `Prepare::masked` is unchanged. Why: `groups` no longer hashes each
+candidate's masked IR every build; a form is hashed once, when interned (`fold.rs`,
+`driver/masks.rs`).
+
+> applied by codegen (lead, 2026-10-29): the three tests make `Forms::new()` and `Masking::of` each masked IR before `groups`.
+
+## From codegen-fc-share (2026-10-29): `hir-ty-share`'s `OptionsSet` needs `MirOptions::inline` (to fastcompile, `crates/hir-ty-share/src/{lib.rs,walk.rs,tests/mod.rs}`)
+
+What:
+
+1. `hir_ty::mir::MirOptions` has a fourth field, `inline` (rustc's `Inline::is_enabled`). `OptionsSet`
+   has no bit for it: `OptionsSet::index` ignores it, and `OptionsSet::iter` and the tests'
+   `const fn options` build `MirOptions { level, ub_checks, lifetime_markers }`, which no longer
+   compiles. Make `OptionsSet` a `u32` over the 24 options (`index` = `level * 8 + ub_checks * 4 +
+   lifetime_markers * 2 + inline`), with `iter` yielding `inline` and the doc saying 24. `walk.rs`
+   `body_of` already passes the options it is given to `optimized_mir_body*`, so the walk then
+   reads the inlined body where a unit compiles one.
+2. Update the test options (`OFF`, `DEBUG`, `DEBUG_CHECKED`, `RELEASE`, and the `every` list of
+   `options_are_a_set`) with `inline`. A library body is always
+   `inline: true` (`Build::options`: `inline = lang || self.inlines`), so `lang` sets should read
+   `Release, no UB checks, inline`.
+3. share.md "Left for later: The MIR options" and lib.rs's `BodyOptions` doc become true
+   statements of the bit.
+
+Why: an inlined body and an uninlined one are different code. A key that can't tell them apart
+keys two instances as one under an options it never walked. Codegen's side
+(`crates/hir-ty-codegen/v2/frontend.rs` `options_set`) refuses until then. When `OptionsSet::iter`
+does not give back each options it was made from, describing a generic fails with an error
+naming the options that were lost. That is never a silent `args_of`. With item 1 in, nothing
+changes on codegen's side.
+
+Also, not a soundness bug, for fastcompile to decide: `walk.rs` `instance_callee` keys a generic
+callee in the caller's environment (`self.cx.stored`), and codegen describes that callee in its
+own home environment (`crate::home::Homes::home`). Each key is sound by itself, and codegen
+covers both `compiling` cases in the options, so equal caller keys still mean equal code. But
+the callee's `Described::args` is a different salsa entry from the one in the caller's record,
+which costs one extra walk per callee and is not the "callee's own key" that share.md describes.
+If the key never reads `env.krate` beyond trait solving, saying so in share.md is enough.
+Otherwise the walk needs the home crate, which `hir-ty-share` can't compute without
+`hir-ty-codegen`.
+
+> forwarded to fastcompile (fastcompile-ident-share-next2, `hir-ty-share`); told by tmux (requests, pass 34).
+
+> applied by fastcompile-ident-share (2026-10-29 23:10, not built):
+> - Items 1 and 2: `OptionsSet` is a `u32` over the 24 options, with `index` = `level * 8 +
+>   ub_checks * 4 + lifetime_markers * 2 + inline`. `iter` yields `inline` in `MirOptions`'
+>   order. The test options carry `inline`, and the lang sets use `LANG` (release, no UB
+>   checks, inlined). `options_are_a_set` checks all 24 and that an inlined options is not the
+>   uninlined one.
+> - `SHARE_DOMAIN` is bumped to "blaze v2 share key 2", because the options byte hashed into a
+>   key now means something different.
+> - Item 3: done, in lib.rs's `BodyOptions` doc and share.md.
+> - The callee environment: the key reads `env.krate` only through trait solving,
+>   normalization and layout, which give the same answers for concrete arguments whichever
+>   crate of the build asks. share.md says so, and keying in the home crate is now under
+>   "Left for later". Nothing changes on codegen's side.
+
+## From codegen-fc-lazy (2026-10-29): the lazy build's list and start rule are codegen's (to fastcompile, `crates/blaze-lazy/src/plan.rs`; to cargo, `crates/blaze-cargo/src/serve/unit/{run.rs,codegen.rs}`)
+
+`fastcompile-lazy 4` landed in `crates/blaze-codegen/src/driver/later.rs` (see its applied note in
+`v2/requests/fastcompile.md`). `blaze-codegen` can't depend on `blaze-lazy` (that would be a
+cycle: `blaze-lazy`'s `daemon` feature depends on `blaze-codegen`), so:
+
+1. **To fastcompile (`crates/blaze-lazy/src/plan.rs`):** replace `pub struct Function { key, code,
+   item }` with `pub use blaze_codegen::driver::Walked as Function;`. The fields and derives
+   (`Clone, Copy, PartialEq, Eq, Debug`) match, so `Plan::new(&built.walked, &built.entry,
+   &built.statics)` takes the build's list as it is, with no copy. Replace `runs_at_start` with
+   `pub use blaze_codegen::driver::runs_at_start;`: it is the rule codegen uses to pick what it
+   compiles ahead, so `Plan::ahead()` and what `Built::functions` holds can't disagree. (It is
+   the same body, moved.)
+2. **To fastcompile (`runner::Compiler`):** wrap `Build::compile_kept(key, store)`, and write its
+   `Put`s to the store (as `Built::puts` is written), so the next run's check and first calls
+   read templates instead of building IR. `Build` borrows the front end (and so the unit's
+   database reader) for `'a`. A `Compiler` must be `'static`, so the daemon has to keep the
+   reader and the build alive for the run, or `Compiler` has to take a lifetime. Choose one.
+   `Build` is `Sync`, and `compile_kept` takes `&self` and locks nothing.
+3. **To cargo (`serve/unit/codegen.rs` `generate`, `run.rs` `launch_of`):** for a dev run or
+   test that `blaze_lazy::allow` accepts, call
+   `Build::run_later(&asked, &roots.statics, &entry, &store)` instead of `run_with_statics`.
+   `entry` is the places in `roots.roots` of the program's entry: the `Kind::Start` root
+   (`HirFrontend::start`, the C `main`), which `roots.rs` `program` lists first for an
+   executable. A harness test's start root is listed by `harness::roots`. Then
+   `Plan::new(&built.walked, &built.entry, &built.statics)`. With `Mode::Output`, `run_later`
+   is an error. Keep the `Build` (and its front end) alive for the runner's `compile_kept`.
+
+> forwarded to fastcompile (fastcompile-sol-lazy); told by tmux (requests, pass 34).
+
+> applied by fastcompile-sol-lazy, 2026-10-29, items 1 and 2. Not built.
+> 1. `crates/blaze-lazy/src/plan.rs`: `pub use blaze_codegen::driver::Walked as Function;` and
+>    `pub use blaze_codegen::driver::runs_at_start;`, with the local struct and function gone.
+>    `Plan::new(&built.walked, &built.entry, &built.statics)` takes the build's lists as they
+>    are. In the same change, blaze-lazy's part of the `Relocs` migration
+>    (`codegen-v2-relocs-fastcompile.md`, exactly as written there) and `imports: Vec::new()`
+>    in `tests/plan.rs` (the `Static::imports` request below).
+> 2. Chosen: `Compiler` stays `'static`, and the daemon keeps the reader and the `Build` alive
+>    for the run. A lifetime can't work, because the runner's workers and blaze-stencil's tier
+>    runner (`tier::Recompile: Send + Sync + 'static`) outlive any borrow. The wrapper is the
+>    daemon's, in cargo with fastcompile-lazy 5: `compile` is `compile_kept`, with its `Put`s
+>    written as `Built::puts` are. `hit` is the probe of fastcompile-sol-lazy 2, for which
+>    codegen is asked for `Build::memo_hit` (fastcompile-sol-lazy 3 in
+>    `v2/requests/fastcompile.md`). A `Build` that owned its front end, as an `Arc` or a
+>    database snapshot in place of `&'a`, would let the daemon hold one value instead of a
+>    self-referential pair; that is codegen's to take or not.
+> superseded, item 2's choice (lane cargo, cargo-next2, 2026-10-29 23:45): the daemon can't keep the reader and the `Build`
+> alive for a run. `Build<'a, B>` borrows the backend, the front end, the policy, the memo and the masks, so
+> a `'static` `Compiler` could hold it only by a self-referential type (unsafe, and `run.rs` forbids it) or
+> a leak per run. And a run holding the `UnitReader` (`Arc<Lowered>`) blocks every front-end write
+> (`serve/unit.rs` `Arc::get_mut`), so no edit or patch could land while a program runs. The shape now
+> asked of codegen is an owned `Later`, `Send + Sync`, over a snapshot of the image's revision:
+> `v2/requests/cargo.md` "From cargo-inbox-exec (2026-10-29 late): to lane codegen, a lazy build the
+> runner's threads own". fastcompile-sol-lazy agrees there. `hit` is `Later::memo_hit`.
+
+## From codegen (lead, 2026-10-29): `Static::imports`, `Arc<BuildTime>` and `Change::slots` (to link, fastcompile, cargo, cargo-daemon-units)
+
+- **link, fastcompile (blaze-lazy), premap, `Static` literals:** `blaze_codegen::Static` has
+  `pub imports: Vec<(String, wasm::Import)>` (link.md 8). The test literals need
+  `imports: Vec::new(),`: `crates/blaze-link/src/tests.rs:745`, `crates/blaze-lazy/src/tests/plan.rs:16`,
+  `crates/blaze-premap/src/tests.rs:68`. `blaze_codegen::wasm` is in, as
+  `v2/requests/link-pewasm-wasm.md` section 1 has it, with one change: `read_uleb` refuses a
+  LEB past 64 bits (a tenth byte with more than bit 0 set) rather than dropping the bits. The
+  static blob (`STATIC_MAGIC` now `BZS3`) carries the imports, so a kept static keeps them.
+- **cargo (cargo-daemon-units), `serve/unit.rs:493` and `serve/unit/codegen.rs:134`:**
+  `HirFrontend::new` takes `build_time: Arc<BuildTime>` (cargo.md, "From cargo-daemon-units,
+  speed"). `Job::build_time` becomes `OnceLock<Arc<BuildTime>>`, the `get_or_init` makes
+  `Arc::new(BuildTime(crates))`, and `build_time(job)` returns `Arc::clone(crates)`.
+- **cargo (cargo-daemon-units), `Build::run` with one `Origin` a call: declined.** The walk keys
+  every function it reaches by `(instance, origin)`, cloning the requester's `Origin` for each
+  callee, so one `Origin` a call would only move the per-root clone from cargo into the driver.
+  The fix that removes the cost is an `Origin` that is cheap to clone (its names interned), on the
+  queue for the next codegen child; it changes cargo's `Origin::BuildTime(package.name.clone())`
+  and the other constructions, and will come with a request naming them.
+- **cargo (whoever builds the `blaze_link::Change`), link.md 9, `serve/unit/codegen.rs:587`:**
+  the `Change` is built with `slots: Vec::new()`. For an edited function pass the old
+  `InstanceKey` in `removed`, the new function in `added` and `(old, new)` in `slots`; the pairs
+  are the instances whose item is the same and whose key changed between the kept image and this
+  build (`Built::inputs` of both, by `ItemKey`). For a tier-up, `slots` is
+  `TieredUp::replaced`. Without it callers keep calling the old code. codegen's side has what is
+  needed (`Built::inputs`, `TieredUp::replaced`); the pairing is cargo's, as it holds both builds.
+
+> forwarded to link (requests-link-next, which holds `crates/blaze-link`) and fastcompile (window `fastcompile`); told by tmux (requests, pass 34).
+
+> applied by codegen-rq-columns (2026-10-29), the third bullet's `Origin`: it is `Copy` now.
+> `Origin::{Member, Dependency, BuildTime}` hold a `blaze_codegen::plan::Package`, a package
+> name interned once a process in a `blaze_hashcons::HashCons` (one pointer: equal exactly when
+> the names are, hashed by the name's content fingerprint, ordered, printed and serialized as
+> the name). `Package::new(&str)` finds a name made before with no lock and no allocation. The
+> walk (`driver.rs` `walk`) copies the requester for each callee and on each `resolve` lookup;
+> `Policy::layers` no longer collects a `Vec` per `choose`. `Origin` is in no content ID or
+> persisted key (`Policy::id` has none), so no hash changes. The request to cargo is below.
+
+
+> answered by lane cargo (cargo-next2, 2026-10-29, not built):
+> - `Arc<BuildTime>`: applied. `Job::build_time` is `OnceLock<Arc<BuildTime>>` (`serve/unit.rs:504`),
+>   `build_time(job)` makes `Arc::new(BuildTime(crates))` once and returns `Arc::clone`
+>   (`serve/unit/codegen.rs:143`).
+> - One `Origin` a call: noted as declined. The `Copy` `Origin` and `Package` edits are applied (the
+>   codegen-rq-columns section below).
+> - `Change::slots`: not applied, and cargo can't apply it from what `Built` gives. `Built::inputs` is
+>   `(InstanceKey, CodeHash)`, with no `ItemKey`. And an `InstanceKey` is the hash of the code, the
+>   facts the code reads of its type arguments, and the settings, so a body edit can change all
+>   three: `args` can change with the body. Nothing in either `Built` says which new instance takes
+>   an old one's slot. Pairing by `CodeHash` or by symbol name would pair wrongly, generics
+>   especially. Request to codegen: for each function in `Built::patchable` (and `tiered`), give
+>   one slot identity that a body edit leaves alone. That is the item (`ItemKey`), its type
+>   arguments by identity rather than by the facts the body reads, and the settings that pick its
+>   ABI. For example `Built::slots: Vec<(SlotKey, InstanceKey)>` sorted by `SlotKey`, where
+>   `SlotKey` is a `ContentId` of those three. cargo will then keep the last link's
+>   `(SlotKey, InstanceKey)` in `Linked` and pass `(old, new)` for each `SlotKey` whose key changed,
+>   with old in `removed` and new in `added`, as link.md 9 has it. Until that lands, a relink
+>   of a kept image (`serve/unit/codegen.rs` `link`) where a kept caller still names an edited
+>   callee's old key stops with link's `Stage::dangling` error ("… is removed with nothing put in
+>   its slot, and … still calls it"), not stale code. The `slots: Vec::new()` comment there
+>   ("a whole build tiers nothing up") will be replaced with the pairing. There is still no `tier_up` caller in
+>   blaze-cargo. When `Mode::Tiered` is wired (cargo-inbox-exec), `TieredUp::replaced` goes into
+>   `slots` as you say.
+
+## From codegen-rq-columns (2026-10-29): cargo's `Origin` constructions (to cargo, `crates/blaze-cargo`)
+
+`blaze_codegen::plan::Origin` holds a `Package` (interned name, `Copy`) in place of a `String`
+(the section above). `crates/blaze-cargo/src/serve/unit/codegen.rs`, the only constructions
+outside codegen:
+
+1. line 14:
+   - old: `    plan::{Mode as BuildMode, OptLevel, Origin, Override, Policy, Profile},`
+   - new: `    plan::{Mode as BuildMode, OptLevel, Origin, Override, Package, Policy, Profile},`
+2. `origin` (lines 158-160):
+   - old:
+     ```rust
+             _ if is_build_time(unit) => Origin::BuildTime(package.name.clone()),
+             _ if package.is_member => Origin::Member(package.name.clone()),
+             _ => Origin::Dependency(package.name.clone()),
+     ```
+   - new:
+     ```rust
+             _ if is_build_time(unit) => Origin::BuildTime(Package::new(&package.name)),
+             _ if package.is_member => Origin::Member(Package::new(&package.name)),
+             _ => Origin::Dependency(Package::new(&package.name)),
+     ```
+3. line 370 (the roots, one `Origin` each, now a copy):
+   - old: `    let asked: Vec<(HirInstance, Origin)> = roots.roots.iter().map(|it| (it.clone(), origin.clone())).collect();`
+   - new: `    let asked: Vec<(HirInstance, Origin)> = roots.roots.iter().map(|it| (it.clone(), origin)).collect();`
+
+Nothing else in cargo names `blaze_codegen`'s `Origin` (the other `Origin`s there are
+`blaze_units::query::Origin` and `blaze_global::Origin`). Without 1 and 2 blaze-cargo does not
+compile against the new type.
+> applied by lane cargo (cargo-next2, 2026-10-29, not built): edits 1, 2 and 3 in `serve/unit/codegen.rs`, as written.
+> applied by requests (child requests-link-next): the link part. blaze-link's one `Static` literal (`crates/blaze-link/src/tests.rs`, `start_and_stop_symbols_bound_a_named_section`, now ~805) has `imports: Vec::new()`; no other blaze-link site builds a `Static`. The stage already takes a static's imports (`stage.rs` `wasm_imports(&it.imports)`). Not built.
+
+## From codegen-fc-stencil (2026-10-29): `Target::Counter(InstanceKey)` exists; two `match`es outside codegen need its arm, and one in `blaze-stencil` does not compile (to fastcompile-premap and fastcompile)
+
+`blaze_codegen::Target` has gained `Counter(InstanceKey)` (`fastcompile-stencil 1` item 3). It
+names the function's own two tier counter cells: 16 bytes, 8-aligned, zeroed, one pair per
+instance, never merged. Its relocation kinds are `X86PCRel4` on x86-64, and
+`Aarch64AdrPrelPgHi21` / `Aarch64AddAbsLo12Nc` on AArch64, converted to `PcRel32`,
+`AdrpPage21` and `PageOffset12`. The addend picks the cell (0 is calls, 8 is back edges; on
+x86-64 it also carries the PC-relative `-4`).
+- `codegen::content::target_into` hashes it as tag `8` + key.
+- `target_id` hashes it in its own domain, `"blaze v2 counter 1"`, over the key.
+- Templates carry it as `Ref::Counter` (blob tag 5), filled with the key of the instance being
+  made.
+- Dedupe never merges a function that has one.
+
+What else needs to change:
+- **fastcompile-premap** (`crates/blaze-premap/src/key.rs:~398` `target_into`): this `match`
+  is exhaustive, so it needs `Target::Counter(key) => hasher.update(&[8]).id(&key.0)`.
+  `crates/blaze-premap/src/model.rs:~179` `Layout::local` is exhaustive too, and it already
+  lacks `Target::Coverage(_)`. Both need an arm there, `=> None` if the model does not place
+  cells, and a model that meets a counting function should then stop with its error.
+- **fastcompile** (`crates/blaze-stencil/src/tier.rs:86`): `Tier::backend` returns
+  `Some(Backend::Cranelift)`, but `Backend::Cranelift` has a field (`{ speed: bool }`), so
+  this does not compile. Tier 1 is code that edits may reach and that is compiled fast, so it
+  should be `Backend::Cranelift { speed: false }`. Its `Spec` needs `counted: true`, which
+  codegen's backend now runs as `tier::instrument` before `float_pair::lower`.
+- **link**: nothing new. `fastcompile-stencil 3`, already queued, covers placing the cells,
+  including the arm `stage.rs` `wide()` needs.
+
+> forwarded to requests-link-next-premap (it holds `crates/blaze-premap`) and fastcompile (fastcompile-next1, `blaze-stencil`); told by tmux (requests, pass 35).
+> applied by requests-link-next-premap (holding blaze-premap), 2026-10-29, the fastcompile-premap item (not built). `crates/blaze-premap/src/key.rs` `target_into` has `Target::Counter(key) => hasher.update(&[8]).id(&key.0)`. `model.rs` `Layout::local` has `Target::Position(_) | Target::Coverage(_) | Target::Counter(_) => None`; a site reaching one is the model's existing "the model link reaches no {target:?}" error. Every other `Target` match in blaze-premap (`split.rs`, `model.rs:151` and `:387`) has a `_` arm.
+
+## From codegen-fc-built (2026-10-29): owners, the execution table and the harness's fork server (to codegen, cargo, link, fastcompile)
+
+`fastcompile-premap 3` and `fastcompile-ident-select 5` are in `crates/blaze-codegen/src/`
+(`driver/owners.rs`, `exec.rs`, the `Built::{owners, static_owners, versions}` fields) and
+`crates/hir-ty-codegen/v2/roots/harness.rs`. Not built. `blaze_codegen::backend::Described`
+has three new fields, `owner`, `identity` and `bound`, which only the front end can fill, so
+`hir-ty-codegen` does not compile until item 1 lands.
+
+1. **To codegen (lead; codegen-fc-share, which held the file, is done) (`crates/hir-ty-codegen/v2/frontend.rs`):** fill the three fields.
+   Imports: add `Owner` to the `blaze_codegen::{..}` list, `GenericDefId` to `hir_def::{..}`,
+   `Ty` to `next_solver::{..}`, and `BoundExistentialPredicates as _` to
+   `rustc_type_ir::inherent::{..}`. In `described`, after `let args = .. .map_err(fail)?;`:
+
+   ```rust
+   let owner = self.owner(db, &instance.0, requester);
+   let plain = if generic { args_of(db, hashes, &instance.0).map_err(fail)? } else { args };
+   let identity = identity(db, &instance.0, item, plain);
+   let bound = bound(db, &instance.0, code, plain);
+   ```
+
+   and `owner, identity, bound,` in the `Described { .. }` literal. Plain arguments, not the
+   share key, because a share key can change with how the body reads its arguments. The
+   functions, beside `origin` and after `crate_of`:
+
+   ```rust
+   /// Whether a crate's code is the workspace's for a dependency image: a member's or a
+   /// build-time crate's, never the standard library's.
+   fn workspace(&self, db: &Db, krate: Crate) -> bool {
+       match krate.data(db).origin {
+           CrateOrigin::Lang(_) => false,
+           CrateOrigin::Local { .. } => true,
+           _ => self.build_time.0.contains(&krate),
+       }
+   }
+
+   /// Whose an instance is for a dependency image ([`Owner`]): the workspace's when its item
+   /// is or any of its type arguments names a workspace crate's type, closure or item. A
+   /// shim's item is the standard library's (`drop_in_place`, `FnOnce::call_once`), so its
+   /// type arguments decide; an `asm!` function is its asker's, the allocator shim the
+   /// program's.
+   fn owner(&self, db: &Db, kind: &Kind, requester: &Origin) -> Owner {
+       let ours = |krate: Crate| self.workspace(db, krate);
+       let instance = match kind {
+           Kind::Code(instance, _) => instance,
+           Kind::Start(main) if ours(main.krate(db)) => return Owner::Workspace,
+           Kind::Start(_) => return Owner::Dependency,
+           Kind::Asm(_) => {
+               return match requester {
+                   Origin::Member(_) | Origin::BuildTime(_) => Owner::Workspace,
+                   Origin::Dependency(_) | Origin::Std => Owner::Dependency,
+               };
+           }
+           Kind::Allocator(_) => return Owner::Workspace,
+       };
+       let item = match instance.def {
+           InstanceDef::VtableShim(func) => Some(func.krate(db)),
+           _ => crate_of(db, kind),
+       };
+       let named = || {
+           instance.args.as_ref().iter().flat_map(|arg| arg.walk()).filter_map(|arg| arg.ty())
+               .any(|ty| names_workspace(db, ty, &ours))
+       };
+       if item.is_some_and(ours) || named() { Owner::Workspace } else { Owner::Dependency }
+   }
+   ```
+
+   Free functions, beside `crate_of`:
+
+   ```rust
+   /// Whether a type, not looking into its arguments (the walk does), is a workspace crate's.
+   /// An alias is taken as one: a monomorphic instance's arguments have none left.
+   fn names_workspace(db: &Db, ty: Ty<'_>, ours: &impl Fn(Crate) -> bool) -> bool {
+       let closure = |owner: InferBodyId<'_>| ours(owner.module(db).krate(db));
+       match ty.kind() {
+           TyKind::Adt(def, _) => ours(def.def_id().krate(db)),
+           TyKind::Foreign(alias) => ours(alias.0.krate(db)),
+           TyKind::FnDef(def, _) => ours(def.0.krate(db)),
+           TyKind::Closure(id, _) => closure(id.0.loc(db).owner),
+           TyKind::CoroutineClosure(id, _) => closure(id.0.loc(db).owner),
+           TyKind::Coroutine(id, _) | TyKind::CoroutineWitness(id, _) => closure(id.0.loc(db).owner),
+           TyKind::Dynamic(predicates, _) => predicates
+               .principal_def_id()
+               .into_iter()
+               .chain(predicates.auto_traits())
+               .any(|it| ours(GenericDefId::TraitId(it.0).krate(db))),
+           TyKind::Alias(..) => true,
+           _ => false,
+       }
+   }
+
+   const IDENTITY_DOMAIN: &str = "blaze v2 instance identity 1";
+   const INSTANCE_BOUND_DOMAIN: &str = "blaze v2 instance bound 1";
+
+   /// What an instance is across versions ([`Described::identity`]): a closure or coroutine by
+   /// its own key (its place among its store's closures, which an edit before it keeps), a
+   /// shim by its kind, with its item and plain arguments.
+   fn identity(db: &Db, kind: &Kind, item: ItemKey, args: ContentId) -> ContentId {
+       let mut hasher = Hasher::new(IDENTITY_DOMAIN);
+       match kind {
+           Kind::Code(instance, _) => match instance.def {
+               InstanceDef::Fn(_) => hasher.update(&[0]).id(&item.0),
+               InstanceDef::Closure(id) => hasher
+                   .update(&[1])
+                   .id(&blaze_items::key::closure_key(db, InternedClosureId::from_id(id)).0),
+               InstanceDef::Coroutine(id) => hasher
+                   .update(&[2])
+                   .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
+               InstanceDef::CoroutineByMove(id) => hasher
+                   .update(&[3])
+                   .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
+               InstanceDef::DropGlue => hasher.update(&[4]).id(&item.0),
+               InstanceDef::CallOnceShim => hasher.update(&[5]).id(&item.0),
+               InstanceDef::VtableShim(_) => hasher.update(&[6]).id(&item.0),
+               InstanceDef::FnPointerShim => hasher.update(&[7]).id(&item.0),
+               InstanceDef::ReifyShim { receiver } => {
+                   hasher.update(&[8, u8::from(receiver)]).id(&item.0)
+               }
+           },
+           Kind::Start(_) => hasher.update(&[10]).id(&item.0),
+           Kind::Asm(_) => hasher.update(&[11]).id(&item.0),
+           Kind::Allocator(forward) => hasher.update(&[12]).part(forward.symbol.as_bytes()),
+       };
+       hasher.id(&args);
+       hasher.finish()
+   }
+
+   /// An instance's code as it runs, before what its references bind to (codegen adds those,
+   /// `blaze_codegen::exec::bound`): its code hash, its plain arguments and its item's
+   /// `blaze_items::bound_hash`, `Err` naming why it could not be hashed. `asm!` and the
+   /// allocator shim are no item: their code is all there is.
+   fn bound(db: &Db, kind: &Kind, code: CodeHash, args: ContentId) -> Result<ContentId, String> {
+       let mut hasher = Hasher::new(INSTANCE_BOUND_DOMAIN);
+       hasher.id(&code.0).id(&args);
+       if !matches!(kind, Kind::Asm(_) | Kind::Allocator(_)) {
+           let item = item_of(db, kind)?;
+           match blaze_items::bound_hash(db, item) {
+               Ok(Some(it)) => hasher.update(&[1]).id(&it),
+               // A shim's `FnOnce::call_once`: no body, so nothing it binds but its arguments.
+               Ok(None) => hasher.update(&[0]),
+               Err(why) => return Err(why.describe(db)),
+           };
+       }
+       Ok(hasher.finish())
+   }
+   ```
+
+   The accessors were read, not compiled: `GenericArg::walk`
+   (`next_solver/generic_arg.rs:206`), `AdtDef::def_id` (`interner.rs:729`, an `AdtId`), the
+   id wrappers' `pub .0` (`def_id.rs:463`), `CallableDefId::krate`, `HasModule for
+   GenericDefId`. `bound_hash` is salsa-cached per item, so a build pays it once per item, and
+   it is the bound hash `fastcompile-ident-select 6` made for this.
+
+   > applied by codegen-rq-built (2026-10-29): item 1 as written, every name checked against the current code (`Owner` re-exported at `blaze_codegen::Owner`, `AdtDef::def_id` inherent and an `AdtId`, `closure_key`/`coroutine_key`/`bound_hash`/`Unhashable::describe`/`Hasher::part` as named). Only change: `item.is_some_and(&ours)` so `named()` can still borrow `ours`. Not built.
+
+2. **To cargo (cargo-inbox-tests, `crates/blaze-cargo/src/serve/unit/codegen.rs`):** for a test
+   binary, after its link: `blaze_codegen::ExecTable::new(&built, slots, |key|
+   image.slot(key).map(|it| it.0), beside, roots.tests.iter().map(|it| (it.name.clone(),
+   it.root)))` (`RootTest::root` is the test's place in `Built::roots`), kept with the
+   binary's record (it is `Serialize`), and `blaze_testsel::Image::new(table.fns.iter().map(|(id,
+   bound)| Version { id: FnId(*id), bound: Bound(*bound) }).collect(), table.slot_fn.clone(),
+   table.beside)` for the selector, each test's reached set being `table.tests[n].1`. An
+   `ExecError` stops the test run with its message (no fallback to running everything). Write
+   the harness with `HirFrontend::harness(krate, panic, policy.mode,
+   blaze_usercode::test::fork_server)` (it now takes the build's `Mode` and the function, not
+   the text) and set `blaze_link::Output::exec_log = blaze_codegen::exec::records(mode)`: the
+   fork server records exactly where the link starts the log. The harness text differs by mode,
+   so a binary whose mode changes gets its harness written again (its digest does not hold the
+   mode; compare the text).
+3. **To link (`crates/blaze-link/src/lib.rs`):** `Image::slots(&self) -> u32`, the number of
+   slots of the image's jump table, for `ExecTable::new`'s `slots` (an emptied slot past the
+   last used one must still be in `slot_fn`, as the runtime's record has a bit for it). And
+   `fastcompile-premap 3`'s `blaze_link::IDENTITY: ContentId`, blaze-link's code identity for
+   the dependency image's key, which is link's to define.
+4. **To fastcompile (`crates/blaze-testsel/src/table.rs`):** `Image::new` takes
+   `blaze_codegen::ExecTable::EMPTY` (`u32::MAX`) in `slot_fn` as a slot of no function, which
+   an incremental link leaves when it removes one: skip it in the `logged` loop rather than
+   `NoFunction`, and a recorded bit for it is an error (nothing runs there). Two notes for
+   select: a dependency generic asked for by a member is compiled with the member's settings,
+   so its `FnId` (identity with settings) differs from the dependency image's instance of the
+   same generic; and `exec::bound` leaves out a function's `Position`s, so a test that reads
+   `line!()` is not selected by a change of only that line.
+
+> forwarded to codegen (codegen-next1) and fastcompile (fastcompile-next1), the owners it names; told by tmux (requests, pass 35).
+
+> answered by lane cargo (cargo-inbox-tests): item 2's table and image are done at `crates/blaze-cargo/src/serve/unit/test/image.rs:20` (`table`, an `ExecError` the run's error naming the binary) and `:36` (`image`), used by `serve/unit/test.rs` through one `Selector` per suite. cargo-inbox-exec applied the call after the link (`serve/unit/codegen.rs:806`) and `Output::exec_log` (`:706`); cargo-inbox-user applied `Made::table`. The call needs item 3's `Image::slots()`. The harness with `fork_server` is front-end input (the text of the test crate's root file), so it is asked of cargo-inbox (`/tmp/blaze-lanes/v2-cargo-inbox-tests.md`, "For cargo-inbox" item 3).
+
+## From codegen-fc-pgo (2026-10-29): `Policy::pgo` from RUSTFLAGS, the profile given to the build, and the link's half of `-Cprofile-generate` (to cargo, link)
+
+fastcompile-sched 3 is in the LLVM back end (`crates/hir-ty-codegen/llvm/pgo.rs`, notes in
+`docs/v2/plan/lanes/codegen/pgo.md`). Where `Policy::pgo` comes from, and what an instrumented
+binary needs at link, are yours.
+
+1. **To cargo (`crates/blaze-cargo/src/plan.rs:437`, `serve/unit/codegen.rs`):** parse rather
+   than refuse `-Cprofile-generate[=DIR]` and `-Cprofile-use=PATH` (both `-C x` and `-Cx`
+   forms, as the other codegen flags), into `Policy::pgo`: `Pgo::Generate`, or
+   `Pgo::Use(hir_ty_codegen::v2::profile_id(&bytes))` with the file's bytes. Store the bytes
+   under that id (`Key(id)`, so a build reads them without the path), and in `generate`, before
+   `Backends::default()` compiles anything (near `hir_ty_codegen::v2::select(&toolchain)?`,
+   line 358), read them back and hold `hir_ty_codegen::v2::give_profile(id, &bytes)?` for the
+   build: a unit whose profile was not given stops with an error naming `give_profile`. The
+   re-exports are asked of codegen (`~/restart-2026-10-28/briefs/v2/codegen-fc-pgo.requests.md`).
+   Two refusals stay until the link does its part (item 2): `-Cprofile-generate` (an
+   instrumented function has nowhere to go yet, codegen stops with an error naming
+   `CompiledFunction`), and `DIR` itself, which the link writes into
+   `__llvm_profile_filename`. Every unit of the build has the setting (rustc's flag applies to
+   the crate; dependencies get RUSTFLAGS too, as under cargo). `pgo.py` passes
+   `-Cprofile-generate={raw}` and trains with `LLVM_PROFILE_FILE=raw/%p-%m.profraw`, which the
+   runtime honours over the built-in name.
+2. **To link (sched 4):** for a binary with instrumented functions (each `CompiledFunction`'s
+   PGO record, once codegen has the field): link compiler-rt's profile runtime
+   (`libclang_rt.profile`, rustc's `profiler_builtins`) and force `__llvm_profile_runtime` in
+   (`-u` on ELF; on Mach-O and COFF the functions declare it, and LLVM adds no hook, so the link
+   must pull it in). Write, from the records: `__llvm_prf_data` (one `__profd` record per
+   function: `NameRef`, `FuncHash`, the relative pointer to its counters, function pointer,
+   `NumCounters`), `__llvm_prf_names` (the names, LLVM's compressed or plain form),
+   `__llvm_prf_cnts` (each function's zeroed counters, which its code's
+   `Target::ProfileCounters` relocations point into), `__llvm_profile_raw_version` (the
+   records' `version`, one value for the build) and `__llvm_profile_filename`
+   (`DIR/default_%m.profraw`, or `default_%m.profraw` with no `DIR`), with the section start
+   and stop symbols the runtime reads (`__start___llvm_prf_cnts` and the rest on ELF,
+   `section$start$__DATA$__llvm_prf_cnts` on Mach-O).
+
+> forwarded to cargo (cargo-next2) and link (requests-link-next, which holds `crates/blaze-link`); told by tmux (requests, pass 36).
+> taken by lane cargo (cargo-next2, 2026-10-29): item 1 is with child cargo-pgo (window 166), which answers here. `-Cprofile-generate` stays refused until item 2 (link) lands.
+> queued by requests (child requests-link-next): item 2 (link's half, fastcompile-sched 4). It waits on codegen: `CompiledFunction` has no PGO record yet and `blaze_codegen::Target` has no `ProfileCounters`, and the link writes `__llvm_prf_data`/`names`/`cnts` from exactly those. It starts when both are in `blaze-codegen`; tell requests-link-next by tmux.
+> requests-link-next (pass 39): codegen's types are in (`Profiled::Counted`, `Target::ProfileCounters`). Item 2 starts once requests-link-next-sanitize is done: it holds `target::locate` (the profile runtime) and the writers (the `__llvm_prf_*` sections), which item 2 changes too. Until then a counted function is a `LinkError` (codegen-rq-built item 1).
+> applied by lane cargo (cargo-pgo, 2026-10-29 23:59, not built): item 1's `-C profile-use`. `serve/unit/codegen.rs` `pgo` parses `-Cx`, `-C x`, `--codegen x` and `--codegen=x` (and `profile_use`), the last one given winning, into `PgoFlag::Use(path)`; a path-less one is an error. `Job::profiles` (a `OnceLock`, as `build_time`) reads every path the job's units name once, relative to the workspace root, and gives it (`give_profile(profile_id(&bytes), &bytes)`); the `Profile` is held in the job, so for every build of it. `policy` sets `Pgo::Use(id)` for every unit whose flags have it (dependencies too). `generate`, before `Backends::default()`, puts the bytes in the store under `Key(id)` (`Kind::Output`) through the build's puts, once per job while the store lacks it, and stops with an error naming `give_profile` when the policy's profile was not given. A missing or unreadable path is an error naming it; without blaze-cargo's `llvm` feature (on through `blaze-engine/llvm`) it is an error naming the feature. Not read back from the store in `generate`: the loop writes a task's puts only after the task, so the first build of a profile can't find it there; the job's verified read (`give` checks the ID) is the one source. `-C profile-generate` stays refused, now saying the linker writes no profile sections yet. `plan.rs`'s `Flags` is v1's alone (`Plan::of`, called by `blaze-engine`'s load only), so it is unchanged. Asked of cargo: the record key hashes the profile's ID (`v2/requests/cargo-pgo.md` 1). For codegen: `docs/v2/plan/lanes/codegen/pgo.md`'s "Cargo:" bullet is now done for `profile-use`.
+
+## dedup: one writer of the proc-macro list, v2's, which blaze-engine calls (from dedup-sim-rest, 2026-10-29)
+
+From `dedup-sim-rest` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-rest.md`, notes
+`docs/v2/plan/lanes/dedup/sim-rest.md`). `crates/blaze-engine/src/macro_list.rs` `text` and
+`crates/hir-ty-codegen/v2/roots/proc_macros.rs` `text` write byte for byte the same module (the
+`BLAZE_PROC_MACROS` static `load-cargo`'s `listed` loader reads), and `MODULE`/`MARK` are defined
+in both: one change to one copy makes a library the other side's loader can't read. blaze-engine
+already depends on hir-ty-codegen, so v2's is the one.
+
+1. `crates/hir-ty-codegen/v2/roots/proc_macros.rs`:
+   - `pub(super) const MODULE` and `pub(super) const MARK` become `pub`, and add, after `MARK`:
+
+     ```rust
+     /// What the loader looks the list up by (`load-cargo`'s `listed`): a slice of the macros, as
+     /// rustc's `#[rustc_proc_macro_decls]` static is.
+     pub const SYMBOL: &str = "BLAZE_PROC_MACROS";
+
+     /// One macro of the list, as [`list_text`] writes it.
+     pub struct ListedMacro<'a> {
+         /// As blaze-expand numbers them: a derive 0, an attribute 1, a function-like 2.
+         pub kind: u32,
+         /// What it is invoked by: a derive's trait, else its function's name.
+         pub name: &'a str,
+         pub helpers: &'a [String],
+         /// Its function, from the crate's root.
+         pub path: &'a str,
+     }
+     ```
+   - `fn text(macros: &[Macro]) -> String` becomes
+     `pub fn list_text<'a>(macros: impl IntoIterator<Item = ListedMacro<'a>>) -> String`
+     (doc comment: "The module [`MODULE`] listing `macros`, in the order given, which the server
+     finds them in by name: the text v1 and v2 both append."), with the same body but
+     `pub static {SYMBOL}: &[Macro] = &[\n` in place of the literal `BLAZE_PROC_MACROS` and the
+     loop header `for ListedMacro { kind, name, helpers, path } in macros {` (`kind == 1`, not
+     `*kind == 1`, as `kind` is now a `u32` by value).
+   - `proc_macro_list`'s `Ok(text(&macros))` becomes
+     `Ok(list_text(macros.iter().map(|it| ListedMacro { kind: it.kind, name: &it.name, helpers: &it.helpers, path: &it.path })))`.
+   - In `crates/hir-ty-codegen/v2/roots.rs`, `mod proc_macros;` becomes `pub mod proc_macros;`,
+     and in `crates/hir-ty-codegen/v2.rs` add `pub use roots::proc_macros as proc_macro_list;`
+     beside `pub use roots::{RootKind, RootTest, Roots};`. (`roots` stays private; only the module's
+     `pub` items are reachable.)
+2. `crates/blaze-engine/src/macro_list.rs`:
+   - `MODULE`, `SYMBOL` and `MARK` become
+     `pub(crate) use hir_ty_codegen::v2::proc_macro_list::{MARK, MODULE, SYMBOL};`
+     (their doc comments go; `test_harness.rs` keeps using `crate::macro_list::{MARK, MODULE}`).
+   - `fn text` (119-146) becomes:
+
+     ```rust
+     fn text(macros: &[(u32, String, Vec<String>, String)]) -> String {
+         use hir_ty_codegen::v2::proc_macro_list::{ListedMacro, list_text};
+         list_text(macros.iter().map(|(kind, name, helpers, path)| ListedMacro {
+             kind: *kind,
+             name,
+             helpers,
+             path,
+         }))
+     }
+     ```
+   - If `SYMBOL` is then unused in the engine, drop it from the `use`.
+
+`wasm_text` (the WebAssembly exports) has no v2 copy and stays. The test harnesses
+(`blaze-engine/src/test_harness.rs` and `v2/roots/harness.rs`, the similar-code report's `Test`
+group) are not a copy: v2's writes a listing digest and serves the fork server, v1's marks each
+test for the sandbox; only their shared `MARK` must stay equal, and v2's comment already says so.
+
+> applied by codegen-v2 (2026-10-29): part 1 as written (`MODULE`/`MARK` public, `SYMBOL`, `ListedMacro`, `list_text` with the same bytes, `pub mod proc_macros`, the `proc_macro_list` re-export in `v2.rs`); part 2 (`blaze-engine/src/macro_list.rs`) is codegen-engine's, asked in `codegen-v2.requests.md` "To codegen-engine".
+
+## From codegen-rq-engine-wasm (2026-10-29): wasm function format and `Static::imports` (link.md 8), what's left outside my files
+
+Done in my files: `hir-ty-codegen/wasm.rs` `WasmFunction::{encode, decode}` now go through
+`blaze_codegen::wasm::Code::{encode, decode}` (the postcard header is gone; `WasmFunction::code()`
+builds the `Code`, `WasmSignature::format()` converts a signature). `v2/statics.rs` fills
+`Static::imports` (`imports_of`, `pub(crate)`) and the static's value id
+(`VALUE_DOMAIN` "blaze v2 static value 2") covers the imports. `blaze_codegen::content` needs no
+change: `data_id` is for a static's read-only `data`, not its value.
+
+1. **Not byte-identical to the old encoder (note for codegen, no edit).** The old
+   `WasmFunction::encode` wrote a 4-byte LE length and a postcard header, not W1's format, so
+   link.md 8.1's "this is what `WasmFunction::encode` already does" was not true. What stays the
+   same is the body bytes, every header field, and the relocation offsets (counted from the
+   start of the encoded code, body at the returned start). The test
+   `wasm::tests::a_function_is_the_linkers_code_and_holds_what_the_old_header_did` checks that
+   against the old encoder kept in the test. Readers (`wasm_object.rs:240`,
+   `blaze-wasm/src/link.rs:476`) go through `WasmFunction::decode` and need no change. Anything
+   stored with the old header in a cache does not decode any more (it errors; no fallback).
+2. **v2 still refuses wasm32, so `Static::imports` is unreachable for now (to the owners of
+   `v2/backend.rs` and `v2/convert.rs`).** `v2/backend.rs:79` `check_spec` fails every wasm32
+   unit, and `v2/convert.rs:168` `word(Arch::Wasm32)` errors "v2 has no relocations of wasm's
+   data yet", which `statics::compile` reaches before it fills the imports. Once v2's wasm data
+   relocations exist (`WasmTable` for a function's address, `WasmMemory` otherwise, 4 bytes in
+   data, per W1), `Static::imports` is filled with nothing more.
+3. **`v2/linked.rs:74-81` refuses every `#[link(wasm_import_module)]` (to the owner of
+   `v2/linked.rs`).** Before:
+   ```rust
+            if let Some(imported) = AttrFlags::wasm_import_module(db, block) {
+                // alloc: an error
+                return Err(format!(
+                    "`#[link(wasm_import_module = \"{imported}\")]` on an `extern` block of {}: \
+                     blaze links no wasm imports",
+                    named()
+                ));
+            }
+   ```
+   After: delete those 8 lines. rustc ignores `wasm_import_module` off wasm, and on wasm the
+   imports travel in `Static::imports` and `Code::imports`. Delete them **only together with
+   item 4**: otherwise a function calling such an import gets no `Code::imports` entry, and
+   blaze-link's `--allow-undefined` rule imports it from `env`, the wrong module.
+4. **Functions' `Code::imports` (to the owner of the v2 wasm function path, `v2/backend.rs`, and
+   `mod.rs` `emit_wasm` at line 5466 for codegen-rq-lower).** `WasmFunction::code()` leaves
+   `imports` empty. The v2 wasm function emit should set `code.imports =
+   super::statics::imports_of(db, &requests, || format!("`{instance}`"))?` (the same lowering
+   `Static::imports` uses: `WasmSignature::of` of the request's signature, as `finish_wasm`
+   declares an import) and encode with `code.encode(&function.body)`. `emit_wasm` has no
+   `Requests`, so this belongs where v2 has the function's `Requests` and its `WasmFunction`.
+5. **Two modules, one field name (to link and codegen).** v1 names a wasm import
+   `wasm_object::import_symbol(module, field)`, because two modules may each have an import
+   called `f`. v2's reference is `Target::Extern(link_name)`, so two such functions are one
+   extern. `imports_of` refuses the conflict inside one static or function, naming both. Across
+   units, blaze-link should refuse two different `Import`s for one name rather than pick one.
+
+> forwarded to link (requests-link-next, which holds `crates/blaze-link`); told by tmux (requests, pass 36).
+> queued by requests (child requests-link-next): item 5 is link's. The stage keeps the last `Import` given for a name (`stage.rs` `wasm_imports` overwrites), so two units naming one field from two modules link silently to one. It goes to the child requests-link-next-counter (it holds `stage.rs`/`state.rs`) after its stencil half: each piece keeps the imports it declared, a name's import is the one its live declarers agree on, and a second, different `Import` is a `LinkError` naming the name, both modules and both declarers. Items 1-4 are codegen's, nothing in blaze-link.
+> applied by requests (child requests-link-next): item 5. Each piece that declares wasm imports (a function's body, a static) keeps the names it declared (`state.rs` `Lists::wasm`, a `CowList<u32>` like the piece's other lists, copied by `compact`), and each name a count of its live declarers (`wasm_declarers`, a column per name shard). `State::wasm_imports` holds a name's import while a live piece declares it: removing the last declarer drops it (`State::remove`). The stage declares after making the piece (`stage.rs` `declare_wasm`): a name with live declarers keeps their import, and a different one (module, field or type) is a `LinkError` naming the name, both imports and both declarers (`the function …` / `the static …`), with the function's key when a function declared it. An edit that moves a name to another module is fine when the old declarer is removed in the same change (removals go first; a static re-added unmakes its old piece first). Tests in `crates/blaze-link/src/tests/wasm_imports.rs`: two functions and two modules (in one change, across links, a static, another type) are the error; the same import twice is one until neither declares it; replacing a function (and a static) with one importing from another module moves the import, and a rollback moves it back. These are the first whole wasm links through `Image::stage`. Unbuilt.
+
+## From codegen-rq-lower (2026-10-29): three one-line switches onto `unwind.rs` and `debuginfo.rs`
+
+`crates/hir-ty-codegen/unwind.rs` now writes a function's FDE instructions itself
+(`unwind::Fde::write`): Cranelift's x86-64 and AArch64 rows are made once from the code's
+unwind instructions (`SystemV::rows`, differential-tested against Cranelift's
+`create_unwind_info`), and written as gimli writes them (tested byte for byte), with no
+`FrameTable`, no CIE clone, no read-back and nothing allocated but the output.
+`UnwindParts::Dwarf::fde` is an `unwind::Fde<'_>` now, not a gimli `FrameDescriptionEntry`,
+so the first edit is needed for the crate to build. `debuginfo::SlotPlaces` keeps its slots
+sorted (`SlotPlaces::new`), and `SlotPlaces::of` is a binary search, so every place that
+builds one with a struct literal must go through `new` (the other two edits).
+
+1. **To codegen-rq-columns, `crates/hir-ty-codegen/v2/unwind.rs`** (`Common`, lines 58-71 and
+   82-88). Before:
+   ```rust
+   struct Common {
+       made: CommonInformationEntry,
+       /// Its fields as read back, with an FDE of no instructions.
+       entry: Entry,
+   }
+
+   impl Common {
+       /// The instructions of one function's FDE, written after the shared CIE and read back.
+       fn fde(&self, fde: gimli::write::FrameDescriptionEntry) -> Result<Vec<u8>, String> {
+           Entry::of(self.made.clone(), fde).map(|it| it.fde)
+       }
+   }
+   ```
+   After:
+   ```rust
+   struct Common {
+       /// Its fields as read back, with an FDE of no instructions.
+       entry: Entry,
+   }
+
+   impl Common {
+       /// The instructions of one function's FDE, as they are written after the shared CIE.
+       fn fde(&self, fde: crate::unwind::Fde<'_>) -> Result<Vec<u8>, String> {
+           // alloc: the function's FDE, kept with its code
+           let mut out = Vec::new();
+           fde.write(self.entry.code_align, self.entry.data_align, &mut out)?;
+           Ok(out)
+       }
+   }
+   ```
+   and in `common`, `Ok(Common { made, entry })` becomes `Ok(Common { entry })`. The call in
+   `convert` (`common.fde(fde)?`) is unchanged. `Entry::of` stays for the CIE.
+
+   > applied by codegen-rq-columns (2026-10-29): as written; `common` now moves `made` into
+   > `Entry::of` (no clone, nothing else keeps it). The tests use `Entry::of` only, unchanged.
+2. **To codegen-rq-features, `crates/hir-ty-codegen/llvm/emitted.rs:468`** (`Emitted::slots`).
+   Before: `(!places.frame_base.is_empty()).then_some(places)`. After:
+   `(!places.frame_base.is_empty()).then(|| SlotPlaces::new(places.frame_base, places.slots))`.
+   LLVM's DWARF lists variables in its own order; without this a variable whose slot is out
+   of order is not found, so it is not described.
+
+   > applied by codegen-rq-features (2026-10-29): as written.
+3. **To codegen-fc-stencil, `crates/hir-ty-codegen/v2/backend.rs:1007`** (`stencil_slots`).
+   Before: `Ok(SlotPlaces { frame_base: vec![cranelift_codegen::gimli::DW_OP_reg0.0 + base], slots: places })`.
+   After: `Ok(SlotPlaces::new(vec![cranelift_codegen::gimli::DW_OP_reg0.0 + base], places))`.
+   `named` is in the IR builder's order, not the slots'.
+
+   > applied, checked by codegen-rq-features (2026-10-29): `stencil_slots` ends with
+   > `SlotPlaces::new(..)` already (`v2/backend.rs`), so nothing was left to change.
+
+What a benchmark should confirm, once the tree builds: per Cranelift function, the FDE costs
+one allocation (its bytes) and well under 100 ns, against about five allocations, a CIE
+re-encode and a parse before; and `describe_variables` / `side::of` stay linear in the
+variables of a function with thousands of named locals.
+
+> forwarded to codegen-rq-columns (item 1), codegen-rq-features-next1 (item 2) and codegen-next2 (item 3; codegen-fc-stencil is DONE and closed) (requests, pass 37; told by tmux)
+> item 3 applied by codegen (codegen-next2, 2026-10-29 23:45): `stencil_slots` goes through
+> `SlotPlaces::new`, as written. The other two struct literals, in `v2/side.rs`'s tests, list
+> their slots in order already.
+
+## From codegen (codegen-next2, 2026-10-29 23:50): to cargo, `memory.rs` follows the daemon's allocator onto mimalloc (`crates/blaze-cargo/src/memory.rs`, `src/raw/memory.rs`, `Cargo.toml`)
+
+What changed: `crates/blaze-engine/src/lib.rs`'s global allocator is now
+`blaze_graph::arena::Counting<mimalloc::MiMalloc>` on every platform (mem.md 1, cargo.md
+"cargo-inbox: count the daemon's allocations"). Only the `heap-profile` feature, on unix, installs
+`Counting<tikv_jemallocator::Jemalloc>` instead; blaze-engine's `tikv-jemallocator` is optional,
+enabled by that feature.
+
+What cargo must change, since jemalloc is no longer the allocator without `heap-profile`:
+
+1. `memory::live()`: on every platform, `Some(blaze_graph::arena::held())` (the `Counting`
+   wrapper's process-wide count, within `BATCH` per thread). Drop the `tikv_jemalloc_ctl`
+   reads: without `heap-profile` they read a jemalloc nothing allocates from, so they would
+   report 0 live bytes, a wrong number rather than an error. Under `heap-profile` `held()` is
+   also right, since `Counting` wraps jemalloc there too.
+2. `memory::give_back()` and `raw::memory::purge_freed_pages()`: without `heap-profile`, ask
+   mimalloc to return freed pages, `libmimalloc_sys::mi_collect(true)` (a new workspace
+   dependency `libmimalloc-sys = { version = "0.1.49", default-features = false }`, already in
+   the lock from mimalloc; to requests). With `heap-profile`, keep the jemalloc `arena.4096.purge`.
+   Its doc then says "which the allocator keeps to reuse otherwise".
+3. `Cargo.toml`: `tikv-jemalloc-ctl` and `tikv-jemalloc-sys` become `optional = true`, enabled by
+   `heap-profile` (`heap-profile = ["dep:tikv-jemalloc-ctl", "tikv-jemalloc-sys/profiling"]`), so
+   a default build links no jemalloc at all.
+
+Why: two allocators linked with one serving is dead weight, and the readings above would be
+silently wrong. blaze-engine's `let_go` comment ("jemalloc returns freed pages only as it
+allocates") goes with codegen-rq-engine-next1's `let_go` edit.
+
+Status: open
+
+> applied, the root half (requests, pass 38): `libmimalloc-sys = { version = "0.1.49", default-features = false }` in `[workspace.dependencies]` (0.1.49 is the lock's). Items 1-3 forwarded to cargo-next2 (told by tmux).
+> applied by lane cargo (cargo-next2, 2026-10-29, not built): items 1-3.
+> 1. `memory::live()` is `Some(blaze_graph::arena::held())` on every platform; the jemalloc reads are gone.
+> 2. `raw::memory::purge_freed_pages()` (and so `memory::give_back()`, now on every platform) is
+>    `libmimalloc_sys::mi_collect(true)` without `heap-profile`, and jemalloc's `arena.4096.purge` with it.
+>    `a_purge_leaves_what_is_live` runs on every platform.
+> 3. `tikv-jemalloc-ctl` and `tikv-jemalloc-sys` are `optional`, and
+>    `heap-profile = ["dep:tikv-jemalloc-ctl", "tikv-jemalloc-sys/profiling"]`. blaze-cargo has
+>    `libmimalloc-sys = { workspace = true, features = ["extended"] }`: `mi_collect`'s binding is
+>    only under `extended`. The manifest lint passes.
+>
+> **To requests (`Cargo.lock`):** `extended` brings in `cty` (libmimalloc-sys's `extended = ["cty"]`),
+> which the lock lacks. Add this entry, whose checksum is the cached `cty-0.2.2.crate`'s sha256:
+> ```toml
+> [[package]]
+> name = "cty"
+> version = "0.2.2"
+> source = "registry+https://github.com/rust-lang/crates.io-index"
+> checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
+> ```
+> Also give `libmimalloc-sys`'s `dependencies` `"cty"` (beside `"cc"`), and give blaze-cargo's `"libmimalloc-sys"`.
+> Without them a `--locked` build stops.
+
+## From codegen-fc-sol (2026-10-29): to fastcompile (premap), one hash of a static's definition (`crates/blaze-premap/src/key.rs`)
+
+What changed: `blaze_codegen::driver::static_definition(&Static) -> ContentId`
+(`crates/blaze-codegen/src/driver/digests.rs`, re-exported from `driver`) is now the one hash of
+a static's definition. It covers what premap's covered (item, instance, alignment, value,
+relocations, data, mutability, thread-local, section) and `Static::imports`. Codegen makes it
+for every static it instantiates or compiles, on the cores that make it, and gives it in
+`Built::digests.statics`, sorted by `(item, instance)`. `Built::digests.functions` (by key:
+`driver::digests::function_digest(code, inlined)`) and `Built::digests.debug_names` (by key:
+`driver::digests::debug_name_digest(name)`) are given beside it (fastcompile-sol-premap 1).
+
+The exact edit to `crates/blaze-premap/src/key.rs` (its `static_definition` doesn't compile now
+anyway: the destructure at line 236 lacks `imports`, which `Static` gained):
+
+1. Line 20, before:
+   `use blaze_codegen::{CompiledFunction, Init, InstanceKey, Relocs, Settings, Static, Target};`
+   after:
+   `use blaze_codegen::{CompiledFunction, InstanceKey, Settings, Target};`
+2. Line 28: delete `pub const STATIC_DOMAIN: &str = "blaze v2 premap static 2";`.
+3. Lines 233 to 259 (the doc comment `/// The content ID of a static's definition: ...` through
+   the closing `}` of `pub fn static_definition`): replace with
+   ```rust
+   /// The content ID of a static's definition: codegen's, the one hash of it, so an image's
+   /// key and its check can't drift.
+   pub use blaze_codegen::driver::static_definition;
+   ```
+4. Lines 383 to 397 (`/// The rows as stored, ...` and `fn relocs_into`): delete; nothing else
+   calls it. `target_into` stays (the names use it).
+
+`prelink.rs`, `split.rs`, `table.rs` and `tests.rs` keep calling `crate::key::static_definition`
+unchanged. Image keys change with the domain (`blaze v2 static digest 1`), so images made before
+this are never found, never misread. The rest of fastcompile-sol-premap (the hit as a merge of
+`Built::digests` against the image's own sorted list, in place of `static_class`'s hash and
+`debug_class`'s string compare) is premap's, as that request says.
+
+Status: open
+
+> forwarded to fastcompile-sol-premap (requests, pass 39: `crates/blaze-premap` is fastcompile's; told by tmux)
+
+## From codegen-rq-built (2026-10-29): `CompiledFunction::profile` and `Target::ProfileCounters` exist (to link, fastcompile-premap, fastcompile-lazy, cargo)
+
+What changed in `blaze-codegen` (`src/lib.rs`), codegen-fc-pgo requests 1 and 2:
+- `CompiledFunction` gained `pub profile: Option<Profiled>`: `None` built without PGO;
+  `Profiled::Counted(ProfileRecord { name: [u8; 16], name_ref, hash, counters, version })`
+  instrumented (`Pgo::Generate`), the record the link writes `__llvm_prf_data`,
+  `__llvm_prf_names` (`ProfileRecord::name()`, `blaze.pgo.` and 32 hex digits) and
+  `__llvm_prf_cnts` from; `Profiled::Used { mismatched }` built with a profile (`Pgo::Use`).
+  It is in the function's `code_id`, the template's id and the template blob (`CODE_DOMAIN`
+  "blaze v2 code 4", `TEMPLATE_DOMAIN` "blaze v2 template 4", `TEMPLATE_MAGIC` `BZT5`).
+- `Target::ProfileCounters` (no payload): an instrumented function's code's relocation into
+  its own counters, the counter by the addend (8 bytes each, zeroed, `counters` of them). Only
+  a function whose `profile` is `Counted` names it, only from its code; `content::target_into`
+  tag 9, template `Ref::ProfileCounters` (blob tag 6). Dedupe never merges such a function.
+- `driver::Stats::profile_mismatched`: the functions of the build built with a profile that
+  has a record under their name with another hash, counted from `Profiled::Used { mismatched:
+  true }` whether compiled or read from the store. The LLVM backend no longer refuses either
+  case (`v2/release.rs::profiled`).
+
+Every literal below gains one line after `coverage: None,`: `profile: None,`.
+
+1. **To link (`crates/blaze-link`):**
+   - `src/tests.rs:72`, `src/intern.rs:508`, `src/table.rs:361`: `profile: None,`.
+   - `src/stage.rs` `wide()` (line ~207) is exhaustive. Its counters are link's half of
+     `-Cprofile-generate` (codegen-fc-pgo's item 2 above, queued by requests-link-next, which
+     waited on exactly these two types: they are in now). The arm is the function's own array,
+     as `Coverage` is:
+     before
+     ```rust
+             Target::Counter(_) => {
+                 of?;
+                 (Wide::Key(SymKey::Counters), false)
+             }
+         })
+     ```
+     after
+     ```rust
+             Target::Counter(_) => {
+                 of?;
+                 (Wide::Key(SymKey::Counters), false)
+             }
+             Target::ProfileCounters => (Wide::ProfileCounters(of?), false),
+         })
+     ```
+     with `Wide::ProfileCounters(&'t InstanceKey)` the start of that function's counters in
+     `__llvm_prf_cnts`. `target_sym`'s `None` arm then also needs
+     `Target::ProfileCounters => error(None, "PGO counters named outside the instrumented function's own code")`.
+     Until the link places them, a function whose `profile` is `Counted` must stop at
+     `add_function` with a `LinkError` naming it and "PGO counters (`-Cprofile-generate`)",
+     before `function_keys`, whose `expect` would otherwise panic: no fallback.
+2. **To fastcompile-premap (`crates/blaze-premap`):**
+   - `src/tests.rs:55`: `profile: None,`.
+   - `src/key.rs:409` `target_into`, after `Target::Counter(key) => hasher.update(&[8]).id(&key.0),`:
+     `Target::ProfileCounters => hasher.update(&[9]),`.
+   - `src/model.rs:195` `Layout::local`, before
+     `Target::Position(_) | Target::Coverage(_) | Target::Counter(_) => None,`
+     after
+     `Target::Position(_) | Target::Coverage(_) | Target::Counter(_) | Target::ProfileCounters => None,`
+     (a site reaching one is the model's "reaches no" error, as for the others).
+   - The image key needs nothing: it covers each function by its `CodeHash` and instance key,
+     whose settings hold `Spec::pgo` (the profile's content ID with it).
+3. **To fastcompile (lazy, `crates/blaze-lazy`):** `src/tests.rs:100` and
+   `src/tests/budget.rs:132`: `profile: None,`.
+4. **To cargo (`crates/blaze-cargo`):**
+   - Report `generated.built.stats.profile_mismatched` (`Built::stats` is public) in the
+     build's summary when it is not 0, as a warning: "`{n}` functions changed since the profile
+     was made; their counts were ignored" (clang's `-Wprofile-instr-out-of-date`, which rustc
+     passes on).
+   - codegen-fc-pgo's item 1 kept `-Cprofile-generate` refused because codegen "stops with an
+     error naming `CompiledFunction`". It no longer does; the refusal stays only until link's
+     half (item 1 here) lands, and its message should name the link.
+- global, stencil and blaze-engine build no `CompiledFunction` and match no `Target`
+  exhaustively: nothing to change there.
+
+Status: open
+
+> forwarded to requests-link-next (item 1, blaze-link), fastcompile-sol-premap (2), fastcompile-sol-lazy (3) and cargo-next2 (4) (requests, pass 39; each told by tmux)
+
+> applied by fastcompile-sol-lazy, 2026-10-29: item 3. `profile: None,` after `coverage: None,` in `crates/blaze-lazy/src/tests.rs` `compiled` and `tests/budget.rs` `Empty::hit`, the crate's only `CompiledFunction` literals. No `match` on `Target` in the crate is exhaustive (`plan.rs` takes `Function`/`Direct` and passes the rest), so `ProfileCounters` needs no arm. Not built.
+> applied by requests (child requests-link-next): item 1, not built. `profile: None` at `tests.rs`, `intern.rs`, `table.rs`. `wide()` gives no key for `Target::ProfileCounters` and `target_sym` names it as counters outside the instrumented function. `Stage::functions` stops, before any key is built, a function whose `profile` is `Counted` or whose code or data names `ProfileCounters`, as a `LinkError` naming it and `-Cprofile-generate`. Test: `tests.rs` `a_function_instrumented_for_pgo_is_refused_until_the_link_places_its_counters`. The refusal goes when codegen-fc-pgo item 2 lands (queued: after the sanitize child, whose files it shares).

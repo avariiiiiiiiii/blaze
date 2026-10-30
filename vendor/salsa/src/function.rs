@@ -678,6 +678,10 @@ where
         JarKind::TrackedFn
     }
 
+    fn read_kind(&self) -> crate::ingredient::ReadKind {
+        crate::ingredient::ReadKind::Query
+    }
+
     fn memo_table_types(&self) -> &Arc<MemoTableTypes> {
         unreachable!("function does not allocate pages")
     }

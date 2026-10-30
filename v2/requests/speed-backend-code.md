@@ -35,3 +35,5 @@ unchanged: same entries, and `None` in the same cases.
 ```
 
 > done by speed-backend-code (2026-10-29): `asm_blocks` is the code above (fragment.rs:933); `inline_of` is now used only by `asm.rs` tests and can go.
+
+> checked by codegen (lead, 2026-10-29): both halves are in and agree. `fragment.rs:1122` `Wants::asm_blocks` returns `FxHashMap<u32, &'static asm::Inline>` through `asm::inline_block`, `llvm/lower.rs:124`/`:596` take that map and `asm_block` (`:1980`) gives `Option<&'static asm::Inline>`, so the `llvm` build's type mismatch is gone. `inline_of` is already deleted: no caller is left, and `asm.rs`'s test uses `inline_block`. Nothing left for speed-backend-intrinsics.

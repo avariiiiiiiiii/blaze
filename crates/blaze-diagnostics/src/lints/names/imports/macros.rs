@@ -17,8 +17,8 @@ use hir_def::MacroId;
 use hir_expand::name::AsName;
 use smallvec::SmallVec;
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T, TextRange,
-    ast::{self, HasName, HasVisibility},
+    NodeOrToken, SyntaxKind, T, TextRange,
+    view::{self as ast, AstNode as _, HasName, HasVisibility, Node},
 };
 
 use super::used::Uses;
@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// rustc's `unused_macros` and `unused_macro_rules`, each at the macro's item.
-pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses<'_>) -> Vec<Found> {
+pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses<'_, '_>) -> Vec<Found> {
     // alloc: holds only diagnostics that fire; empty, it allocates nothing
     let mut found = Vec::new();
     let (macros, arms) =
@@ -40,14 +40,13 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses<'_>) -> Vec<Fo
     }
     for tree in &walk.trees {
         for node in tree.of_kind(|it| matches!(it, SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF)) {
-            // clone: a rowan cursor's refcount, one per macro definition; `cast` takes the node
-            let Some(def) = ast::Macro::cast(node.clone()) else { continue };
+            let Some(def) = ast::Macro::cast(node) else { continue };
             let Some(name) = def.name() else { continue };
             let text = name.text();
-            if text.starts_with('_') || uses.macros_unknown.contains(&name.as_name()) || exported(walk, &def) {
+            if text.starts_with('_') || uses.macros_unknown.contains(&name.as_name()) || exported(walk, def) {
                 continue;
             }
-            let Some(it) = cx.sema.to_def(&def) else { continue };
+            let Some(it) = cx.vsema.to_def(def) else { continue };
             let id = MacroId::from(it);
             let at = tree.ptr(node);
             if !uses.macros.contains(&id) {
@@ -67,7 +66,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses<'_>) -> Vec<Fo
             }
             let matched = uses.arms.get(&id);
             let mut fact = None;
-            for (n, rule) in rules(&def).enumerate() {
+            for (n, rule) in rules(def).enumerate() {
                 if rule.compile_error || matched.is_some_and(|it| it.contains(n)) {
                     continue;
                 }
@@ -91,10 +90,9 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses<'_>) -> Vec<Fo
 
 /// Whether `def` is exported, so never counted: a `macro_rules!` with `#[macro_export]`, a
 /// `pub macro`.
-fn exported(walk: &Walk<'_>, def: &ast::Macro) -> bool {
+fn exported(walk: &Walk<'_>, def: ast::Macro<'_>) -> bool {
     match def {
-        // clone: a rowan cursor's refcount; `AnyHasAttrs` takes the node and has no borrowed form
-        ast::Macro::MacroRules(it) => walk.attrs(&ast::AnyHasAttrs::new(it.clone())).iter().any(|(meta, _)| {
+        ast::Macro::MacroRules(it) => walk.attrs(ast::AnyHasAttrs::new(it)).any(|(meta, _)| {
             let path = match meta {
                 ast::Meta::PathMeta(it) => it.path(),
                 ast::Meta::TokenTreeMeta(it) => it.path(),
@@ -119,7 +117,7 @@ struct Rule {
 ///
 /// The body's delimiters are walked with the rest: neither is a `=`, `=>` or token tree, so
 /// neither changes a rule.
-fn rules(def: &ast::Macro) -> impl Iterator<Item = Rule> {
+fn rules(def: ast::Macro<'_>) -> impl Iterator<Item = Rule> {
     let (single, body) = match def {
         ast::Macro::MacroRules(it) => (None, it.token_tree()),
         ast::Macro::MacroDef(it) => match it.args() {
@@ -141,7 +139,7 @@ fn rules(def: &ast::Macro) -> impl Iterator<Item = Rule> {
     let mut after_arrow = false;
     single.into_iter().chain(std::iter::from_fn(move || {
         while let Some(element) = elements.next() {
-            match &element {
+            match element {
                 NodeOrToken::Token(token) if token.kind() == T![=] => {
                     elements.next_if(|it| it.kind() == T![>]);
                     after_arrow = true;
@@ -163,7 +161,7 @@ fn rules(def: &ast::Macro) -> impl Iterator<Item = Rule> {
 
 /// Whether a token tree has `compile_error!` followed by a delimited group in it, at any
 /// depth: rustc's `has_compile_error_macro`.
-fn has_compile_error(tt: &SyntaxNode) -> bool {
+fn has_compile_error(tt: Node<'_>) -> bool {
     // How much of `compile_error ! (..)` the elements so far end with: nothing, the name, the `!`.
     let mut seen = 0u8;
     for element in tt.children_with_tokens() {
@@ -175,7 +173,7 @@ fn has_compile_error(tt: &SyntaxNode) -> bool {
                 _ => seen = 0,
             },
             NodeOrToken::Node(node) => {
-                if node.kind() == SyntaxKind::TOKEN_TREE && (seen == 2 || has_compile_error(&node)) {
+                if node.kind() == SyntaxKind::TOKEN_TREE && (seen == 2 || has_compile_error(node)) {
                     return true;
                 }
                 seen = 0;
@@ -187,14 +185,17 @@ fn has_compile_error(tt: &SyntaxNode) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use syntax::{AstNode, SourceFile, ast};
+    use syntax::{
+        SourceFile,
+        view::{self as ast, AstNode as _},
+    };
 
     use super::rules;
 
     fn spans(text: &str) -> Vec<(Vec<String>, bool)> {
-        let file = SourceFile::parse(text, span::Edition::CURRENT).tree();
-        let def = file.syntax().descendants().find_map(ast::Macro::cast).unwrap();
-        rules(&def)
+        let parse = SourceFile::parse(text, span::Edition::CURRENT);
+        let def = parse.root().descendants().find_map(ast::Macro::cast).unwrap();
+        rules(def)
             .into_iter()
             .map(|rule| (rule.spans.iter().map(|it| text[*it].to_owned()).collect(), rule.compile_error))
             .collect()

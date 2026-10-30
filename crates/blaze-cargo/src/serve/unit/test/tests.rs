@@ -1,17 +1,25 @@
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+use blaze_cas::{Corrupt, Key, Mismatch, Ticket};
+use blaze_codegen::ExecTable;
 use blaze_core::Traced;
 use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
+use blaze_testsel::{Basis, Bound, Cached, Choice, FnId, Ran, Record, Selector, Subject, Why};
 use blaze_usercode::{
-    test::{Lines, Trace},
+    test::{Attrs, Executed, Lines, Passes, Trace},
     trace::{self, Inputs, Seen},
 };
 
-use super::traced::{Common, Splice};
+use super::{
+    image::{Selectors, image, record},
+    traced::{Common, Splice},
+};
 
 // The budget tests here count through the test binary's one counting allocator,
 // `crate::sandbox`'s.
@@ -158,13 +166,169 @@ fn a_warm_splice_allocates_nothing() {
 fn a_kept_pass_is_reported_cached() {
     use blaze_api::{Basis, TestOutcome};
 
-    let result = super::cached("tests/parse", "parse::nested", Some(std::time::Duration::from_micros(9_999)));
+    let kept = Cached { took: Duration::from_micros(9_999), basis: blaze_testsel::Basis::Executed };
+    let result = super::cached("tests/parse", 3, "parse::nested", &kept);
     assert_eq!((result.outcome, result.millis, result.output.len()), (TestOutcome::Unreached, 0, 0));
+    assert_eq!((result.executable, result.outside), (3, false));
     assert_eq!((result.binary.as_str(), result.name.as_str()), ("tests/parse", "parse::nested"));
     let cached = result.cached.expect("a kept pass is cached");
-    assert_eq!((cached.outcome, cached.millis), (TestOutcome::Passed, 9));
-    assert!(matches!(cached.basis, Basis::Reached { why } if why == super::REACHED));
-    assert_eq!(super::cached("a", "b", None).cached.map(|it| it.millis), Some(0));
+    assert_eq!((cached.outcome, cached.millis, cached.basis), (TestOutcome::Passed, 9, Basis::Executed));
+    let reached = Cached { took: Duration::ZERO, basis: blaze_testsel::Basis::Reached { why: "killed".to_owned() } };
+    let cached = super::cached("a", 0, "b", &reached).cached.expect("a kept pass is cached");
+    assert_eq!((cached.millis, cached.basis), (0, Basis::Reached { why: "killed".to_owned() }));
+}
+
+/// The store, as a map that refuses to replace a value.
+#[derive(Default)]
+struct Mem {
+    values: BTreeMap<Key, Vec<u8>>,
+    puts: u64,
+}
+
+impl Passes for Mem {
+    fn get(&self, key: &Key) -> Result<Option<&[u8]>, Corrupt> {
+        Ok(self.values.get(key).map(Vec::as_slice))
+    }
+
+    fn put(&mut self, key: Key, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
+        match self.values.get(&key) {
+            Some(kept) if *kept != bytes => {
+                return Err(Mismatch {
+                    key,
+                    kept: ContentId::of("blaze v2 cargo test mem 1", kept),
+                    given: ContentId::of("blaze v2 cargo test mem 1", &bytes),
+                });
+            }
+            Some(_) => {}
+            None => _ = self.values.insert(key, bytes),
+        }
+        self.puts += 1;
+        Ok(Ticket(self.puts))
+    }
+}
+
+fn fn_id(n: u32) -> ContentId {
+    ContentId::of("blaze v2 cargo test fn 1", &n.to_le_bytes())
+}
+
+fn bound(n: u32, version: u32) -> ContentId {
+    ContentId::of("blaze v2 cargo test bound 1", &[n.to_le_bytes(), version.to_le_bytes()].concat())
+}
+
+/// The table of a binary of three functions at `versions`: `0` and `2` in slots 0 and 1, `1`
+/// called directly, and one test `t` that reaches all three.
+fn exec_table(versions: [u32; 3]) -> ExecTable {
+    let mut fns: Vec<(ContentId, ContentId)> = (0..3).map(|n| (fn_id(n), bound(n, versions[n as usize]))).collect();
+    fns.sort_unstable();
+    let at = |n: u32| fns.iter().position(|it| it.0 == fn_id(n)).expect("in the table") as u32;
+    let slot_fn = vec![at(0), at(2)];
+    let mut reached = vec![at(0), at(1), at(2)];
+    reached.sort_unstable();
+    ExecTable { fns, slot_fn, beside: ContentId::default(), tests: vec![("t".to_owned(), reached)] }
+}
+
+/// A fork server's record is selection's: whole when its hits are strictly increasing and in
+/// the table, else not whole, saying why.
+#[test]
+fn what_a_test_executed_is_its_record() {
+    assert_eq!(record(Executed::Hits { slots: 4, hits: vec![1, 3] }), Record::Complete { slots: 4, hits: vec![1, 3] });
+    assert_eq!(record(Executed::Hits { slots: 4, hits: Vec::new() }), Record::Complete { slots: 4, hits: Vec::new() });
+    assert!(matches!(record(Executed::Hits { slots: 4, hits: vec![3, 1] }), Record::Incomplete { .. }));
+    assert!(matches!(record(Executed::Hits { slots: 2, hits: vec![2] }), Record::Incomplete { .. }));
+    let why = "the child was killed after 60s".to_owned();
+    assert_eq!(record(Executed::Not(why.clone())), Record::Incomplete { why });
+}
+
+/// The image keeps every slot, an emptied one too, as a record names slots by place; a table
+/// that is not one is refused naming its binary.
+#[test]
+fn a_table_is_its_image_slot_for_slot() {
+    let table = exec_table([0, 0, 0]);
+    let made = image("tests/parse", &table).expect("a table");
+    assert_eq!((made.len(), made.slots()), (3, 2));
+    assert_eq!(made.bound_of(&FnId(fn_id(1))), Some(Bound(bound(1, 0))));
+
+    let mut emptied = exec_table([0, 0, 0]);
+    emptied.slot_fn.insert(1, ExecTable::EMPTY);
+    let made = image("tests/parse", &emptied).expect("an emptied slot is a slot of no function");
+    assert_eq!(made.slots(), 3);
+
+    let mut broken = exec_table([0, 0, 0]);
+    broken.slot_fn.push(7);
+    let why = image("tests/parse", &broken).err().expect("a slot of no function in the table");
+    assert!(why.contains("`tests/parse`"), "{why}");
+}
+
+/// A suite's selector is kept between runs, moved to its binary only when it was relinked, and
+/// held by one run at a time.
+#[test]
+fn a_suite_keeps_its_selector_and_moves_it_to_a_relinked_binary() {
+    let selectors = Selectors::default();
+    let given = ContentId::of("blaze v2 cargo test given 1", b"suite");
+    let (first, second) = (ContentId::of("blaze v2 cargo test bin 1", b"1"), ContentId::of("blaze v2 cargo test bin 1", b"2"));
+    let selector = selectors.take(given, first, || image("t", &exec_table([0, 0, 0]))).expect("made");
+    assert_eq!((selector.given(), selectors.len()), (given, 0));
+    selectors.give(first, selector);
+    assert_eq!(selectors.len(), 1);
+    let selector = selectors.take(given, first, || panic!("the selector's image is of this binary")).expect("kept");
+    assert_eq!(selectors.len(), 0);
+    selectors.give(first, selector);
+    let mut made = false;
+    let selector = selectors
+        .take(given, second, || {
+            made = true;
+            image("t", &exec_table([0, 0, 1]))
+        })
+        .expect("moved");
+    assert!(made);
+    assert_eq!(selector.image().bound_of(&FnId(fn_id(2))), Some(Bound(bound(2, 1))));
+    let refused = selectors.take(given, first, || Err("no table".to_owned()));
+    assert_eq!(refused.err().as_deref(), Some("no table"), "none is kept while one is taken: a new one's image is asked for");
+}
+
+fn choose(selector: &mut Selector, store: &Mem, subject: &Subject<'_>) -> Choice {
+    selector.choose(store, subject, false, &mut World::new()).expect("chosen")
+}
+
+/// Through the daemon's path (the image of a table, a server's record, a selector), a pass
+/// kept by what it executed stands until a function it executed changes; one whose record is
+/// not whole stands by what it reaches, saying why.
+#[test]
+fn a_pass_stands_until_what_it_executed_changes() {
+    let attrs = Attrs::default();
+    let table = exec_table([0, 0, 0]);
+    let subject = Subject { name: "t", attrs: &attrs, outside: false, reached: &table.tests[0].1 };
+    let traced = Traced::default();
+    let given = ContentId::of("blaze v2 cargo test given 1", b"suite");
+
+    let mut store = Mem::default();
+    let mut selector = Selector::new(given, image("t", &table).expect("a table"));
+    assert!(matches!(choose(&mut selector, &store, &subject), Choice::Run { why: Why::New, .. }));
+    // It called slot 0's function, `0`, and not slot 1's, `2`.
+    let executed = record(Executed::Hits { slots: 2, hits: vec![0] });
+    let ran = Ran { passed: true, took: Duration::from_millis(3), traced: Some(&traced), record: &executed };
+    selector.keep(&mut store, &subject, &ran).expect("kept");
+    let cached = |choice: Choice| match choice {
+        Choice::Cached(it) => it,
+        other => panic!("ran: {other:?}"),
+    };
+    assert_eq!(cached(choose(&mut selector, &store, &subject)).basis, Basis::Executed);
+    selector.advance(image("t", &exec_table([0, 0, 1])).expect("a table"));
+    assert_eq!(cached(choose(&mut selector, &store, &subject)).took, Duration::from_millis(3));
+    selector.advance(image("t", &exec_table([1, 0, 1])).expect("a table"));
+    let choice = choose(&mut selector, &store, &subject);
+    assert!(matches!(choice, Choice::Run { why: Why::Changed(FnId(id)), .. } if id == fn_id(0)), "{choice:?}");
+
+    let mut store = Mem::default();
+    let mut selector = Selector::new(given, image("t", &table).expect("a table"));
+    let killed = record(Executed::Not("the child was killed".to_owned()));
+    let ran = Ran { passed: true, took: Duration::from_millis(5), traced: Some(&traced), record: &killed };
+    selector.keep(&mut store, &subject, &ran).expect("kept");
+    let kept = cached(choose(&mut selector, &store, &subject));
+    assert_eq!(kept.basis, Basis::Reached { why: "the child was killed".to_owned() });
+    selector.advance(image("t", &exec_table([0, 1, 0])).expect("a table"));
+    let choice = choose(&mut selector, &store, &subject);
+    assert!(matches!(choice, Choice::Run { why: Why::Unlogged, .. }), "{choice:?}");
 }
 
 fn of(lines: &[(Seen, String)]) -> Lines {

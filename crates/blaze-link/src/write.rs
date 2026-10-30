@@ -46,6 +46,9 @@ pub(crate) enum Value {
     Import(u32),
     /// An offset in the image's TLS block.
     Tls(u64),
+    /// A thread-local of an image this one is linked beside: its offset from the thread
+    /// pointer ([`Def::TpOff`]).
+    TpOff(i64),
 }
 
 /// Why a symbol has no value; made into words only when an error is reported.
@@ -110,6 +113,7 @@ impl Resolver<'_> {
                 Def::Import(at) => Value::Import(at),
                 Def::Absolute(value) => Value::Absolute(value),
                 Def::TlsOffset(value) => Value::Tls(value),
+                Def::TpOff(value) => Value::TpOff(value),
                 Def::Alias(to) => {
                     sym = to;
                     continue;
@@ -191,6 +195,7 @@ const ABSOLUTE: u64 = 2;
 const IMPORT: u64 = 3;
 const TLS: u64 = 4;
 const WHY: u64 = 5;
+const TP_OFF: u64 = 6;
 /// No such cell or stub.
 const NONE: u64 = u64::MAX;
 
@@ -275,6 +280,7 @@ impl Column {
                 Ok(Value::Absolute(it)) => [it, ABSOLUTE],
                 Ok(Value::Import(it)) => [u64::from(it), IMPORT],
                 Ok(Value::Tls(it)) => [it, TLS],
+                Ok(Value::TpOff(it)) => [it as u64, TP_OFF],
                 Err(why) => {
                     column.whys.push(why);
                     [column.whys.len() as u64 - 1, WHY]
@@ -329,6 +335,7 @@ impl Column {
             ABSOLUTE => Ok(Value::Absolute(value)),
             IMPORT => Ok(Value::Import(value as u32)),
             TLS => Ok(Value::Tls(value)),
+            TP_OFF => Ok(Value::TpOff(value as i64)),
             WHY => Err(value as u32),
             _ => Err(u32::MAX),
         }
@@ -407,6 +414,8 @@ struct Reloc<'s> {
     format: Format,
     base: u64,
     tls: Option<Tls>,
+    /// [`State::tls_at`].
+    tls_at: Option<i64>,
     got_by_library: bool,
     imports: &'s [Import],
     /// wasm: code addresses in function index order, after the imports.
@@ -501,12 +510,35 @@ impl Reloc<'_> {
             let s = match value {
                 Value::Image(s) | Value::Absolute(s) => s,
                 Value::Tls(offset) => tls_base + offset,
-                Value::Import(_) => 0,
+                Value::Import(_) | Value::TpOff(_) => 0,
+            };
+            let tls_kind = reloc::is_tls(fixup.apply);
+            let tp = match (value, self.tls_at) {
+                (Value::TpOff(tp), _) if tls_kind => Some(tp),
+                (Value::TpOff(_), _) => {
+                    return Err(fail(
+                        fixup,
+                        // alloc: error path
+                        format!(
+                            "{} is a thread-local of the image this one is linked beside, which only a \
+                             thread-local relocation reaches",
+                            symbols.describe(fixup.target)
+                        ),
+                    ));
+                }
+                (Value::Image(_) | Value::Tls(_), Some(at)) if tls_kind => {
+                    let Some(offset) = s.checked_sub(tls_base).filter(|_| self.tls.is_some()) else {
+                        return Err(fail(fixup, "a thread-local relocation to what is not thread-local".into()));
+                    };
+                    Some(at + offset as i64)
+                }
+                _ => None,
             };
             let m = match fixup.minus {
                 Some(minus) => match self.column.value(minus) {
                     Ok(Value::Image(m) | Value::Absolute(m)) => m,
                     Ok(Value::Tls(offset)) => tls_base + offset,
+                    Ok(Value::TpOff(_)) => return Err(fail(fixup, "the difference of another image's thread-local".into())),
                     Ok(Value::Import(_)) => return Err(fail(fixup, "the difference of an import".into())),
                     Err(at) => return Err(fail(fixup, self.column.why(symbols, minus, at))),
                 },
@@ -607,7 +639,7 @@ impl Reloc<'_> {
             if fixup.apply == Apply::Abs64 && slid {
                 out.rebase.push(fixup.at);
             }
-            let ctx = Ctx { arch: self.arch, format: self.format, s, a: fixup.addend, p, g, m, base: self.base, tls: self.tls };
+            let ctx = Ctx { arch: self.arch, format: self.format, s, a: fixup.addend, p, g, m, base: self.base, tls: self.tls, tp };
             // alloc: error path
             reloc::apply(fixup.apply, &ctx, place).map_err(|it| fail(fixup, it.to_string()))?;
         }
@@ -822,6 +854,7 @@ impl<'a> Stage<'a> {
                 format: self.output.format,
                 base: self.plan.base,
                 tls: state.tls,
+                tls_at: state.tls_at,
                 got_by_library,
                 imports: &state.resolved.imports,
                 wasm,
@@ -1096,6 +1129,8 @@ struct Entries<'s> {
     resolver: Resolver<'s>,
     arch: Arch,
     tls: Option<Tls>,
+    /// [`State::tls_at`].
+    tls_at: Option<i64>,
     indexed_code: bool,
 }
 
@@ -1152,11 +1187,23 @@ impl Entries<'_> {
         let value = self.resolver.value(target).map_err(|it| error(None, it.say(self.resolver.symbols)))?;
         let tls = self.tls;
         Ok(match (kind, value) {
+            (GotKind::TlsGd | GotKind::TlsDesc, _) if self.tls_at.is_some() => {
+                return Err(error(
+                    None,
+                    "a dynamic thread-local access (a `__tls_get_addr` pair or a TLS descriptor) in an image \
+                     whose thread-locals are at a fixed place beside another's: build it with the \
+                     initial-exec or local-exec TLS model",
+                ));
+            }
             (GotKind::Address, Value::Import(at)) => Holds::Import(at),
             (GotKind::Address, Value::Image(s) | Value::Absolute(s)) => Holds::Local(s),
             (GotKind::TpOff, Value::Import(at)) => Holds::ImportTpOff(at),
             (GotKind::TlsGd, Value::Import(at)) => Holds::TlsGd { import: Some(at), offset: 0 },
             (GotKind::TlsDesc, Value::Import(at)) => Holds::TlsDesc { import: Some(at), offset: 0 },
+            (GotKind::TpOff, Value::TpOff(tp)) => Holds::TpOff(tp),
+            (_, Value::TpOff(_)) => {
+                return Err(error(None, "an address GOT cell of another image's thread-local"));
+            }
             (kind, value) => {
                 let tls = tls.ok_or_else(|| error(None, "a thread-local GOT cell in an image with no TLS"))?;
                 let at = match value {
@@ -1167,10 +1214,11 @@ impl Entries<'_> {
                     _ => return Err(error(None, "a TLS cell of an absolute symbol")),
                 };
                 match kind {
-                    GotKind::TpOff => Holds::TpOff(
+                    GotKind::TpOff => Holds::TpOff(match self.tls_at {
+                        Some(tls_at) => tls_at + at as i64,
                         // alloc: error path
-                        reloc::tp_offset(self.arch, tls, tls.addr + at).map_err(|it| error(None, it.to_string()))?,
-                    ),
+                        None => reloc::tp_offset(self.arch, tls, tls.addr + at).map_err(|it| error(None, it.to_string()))?,
+                    }),
                     GotKind::TlsGd => Holds::TlsGd { import: None, offset: at },
                     GotKind::TlsDesc => Holds::TlsDesc { import: None, offset: at },
                     GotKind::Address => unreachable!("matched above"),
@@ -1214,6 +1262,7 @@ impl<'a> Stage<'a> {
             resolver: Resolver { symbols: self.symbols, state: &self.new, regions: &regions, base: self.plan.base },
             arch: self.output.arch,
             tls: self.new.tls,
+            tls_at: self.new.tls_at,
             indexed_code: self.plan.indexed_code,
         };
         let all = Want { loader: true, got: true, functions: true };
@@ -1245,7 +1294,8 @@ impl<'a> Stage<'a> {
             let (old_resolved, new_resolved) = (&self.old.resolved, &self.new.resolved);
             let imports = !Arc::ptr_eq(&old_resolved.imports, &new_resolved.imports)
                 || !Arc::ptr_eq(&old_resolved.libraries, &new_resolved.libraries)
-                || self.old.tls != self.new.tls;
+                || self.old.tls != self.new.tls
+                || self.old.tls_at != self.new.tls_at;
             let batch = entries.collect(ids.par_iter().copied(), Want { loader: true, got: !imports, functions: true })?;
             let (binds, got) = if imports {
                 let count = self.new.piece_count();

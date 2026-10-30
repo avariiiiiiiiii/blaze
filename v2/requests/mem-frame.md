@@ -22,6 +22,13 @@ Condvar, atomic, mpsc}` directly, because blaze-mem's `sync` shim has only atomi
 
 > forwarded to mem (mem-next1); told by tmux (requests, pass 31).
 
+> done by mem (2026-10-29): `crate::sync` now gives `Condvar`, `Mutex`, `MutexGuard` and
+> `PoisonError` (std's, or blaze-check's under `cfg(blaze_check)`). `cap.rs` takes them and its
+> atomics from there. `INSTALLED` stays std's `AtomicPtr`, since it is process-wide and outside
+> any model. The spill channel stays `std::sync::mpsc`. `model.rs` gains
+> `model_a_full_cap_cancels_one_of_two_stuck_holders` (no deadlock; at most one cancelled;
+> every byte back) and `model_a_thread_holding_nothing_waits_and_is_never_cancelled`.
+
 ## 2. lane mem (`crates/blaze-mem/src/lib.rs` line 7): the frame row of the table
 
 The row still says "a bump pointer per worker over a reserved [`Region`]". Asked, in its place:
@@ -30,6 +37,8 @@ task starts in the rest of its outer task's chunk), with [`Marker`]s and reset; 
 hands each task one".
 
 > forwarded to mem (mem-next1); told by tmux (requests, pass 31).
+
+> done by mem (2026-10-29): the row reads as asked.
 
 ## 3. lane mem (`crates/blaze-mem/src/tag.rs`): `task_ended` per task on a shared line
 
@@ -41,6 +50,11 @@ speed note, not a bug. A per-thread sum added in batches, like `blaze_graph::are
 (with the max kept per thread and folded in at a snapshot), would take it off the task path.
 
 > forwarded to mem (mem-next1); told by tmux (requests, pass 31).
+
+> done by mem (2026-10-29). `task_ended` writes no shared line when warm. The peak does a
+> relaxed load and then `fetch_max` only when it rises. The bytes gather in a thread-local per
+> tag and fold into `allocated` at 1 MiB, at a `snapshot` the thread takes, and when the thread
+> ends. Another thread's bytes can reach the rate up to 1 MiB per tag late.
 
 ## 4. drive's cancelled work
 

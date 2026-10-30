@@ -3,8 +3,8 @@
 //! `main`, unless the example has one.
 
 use syntax::{
-    AstNode, Edition, SyntaxKind, TextSize,
-    ast::{self, HasName},
+    Edition, SyntaxKind, TextSize,
+    view::{self as ast, AstNode as _, HasName as _},
 };
 
 /// What goes around an example that is the same for every example of a crate.
@@ -38,10 +38,10 @@ impl Parts {
     fn of(code: &str, crate_name: &str, edition: Edition) -> Parts {
         // Statements are only read inside a function.
         let wrapped = format!("{WRAP}{code}\n}}");
-        let file = ast::SourceFile::parse(&wrapped, edition).tree();
+        let parse = syntax::SourceFile::parse(&wrapped, edition);
         let whole = TextSize::of(&*wrapped);
-        let body = file
-            .syntax()
+        let body = parse
+            .root()
             .children()
             .find_map(ast::Fn::cast)
             .filter(|it| it.syntax().text_range().end() == whole)
@@ -55,8 +55,7 @@ impl Parts {
         for node in body.syntax().children() {
             let start = (usize::from(node.text_range().start()) - WRAP.len()).min(code.len());
             let end = (usize::from(node.text_range().end()) - WRAP.len()).min(code.len());
-            let is_inner_attr =
-                ast::Attr::cast(node.clone()).is_some_and(|it| it.excl_token().is_some());
+            let is_inner_attr = ast::Attr::cast(node).is_some_and(|it| it.excl_token().is_some());
             in_attrs &= is_inner_attr;
             // Until the first statement of `main`, what is between the crate's attributes and
             // a statement goes with the `extern crate`s, so a blank line there stays one.
@@ -68,13 +67,13 @@ impl Parts {
             taken = end;
             if in_attrs {
                 parts.crate_attrs.push_str(text);
-            } else if let Some(it) = ast::ExternCrate::cast(node.clone()) {
+            } else if let Some(it) = ast::ExternCrate::cast(node) {
                 parts.names_the_crate |= it
                     .name_ref()
                     .is_some_and(|name| name.text().trim_start_matches("r#") == crate_name);
                 parts.extern_crates.push_str(text);
             } else {
-                parts.has_main |= is_main(&node);
+                parts.has_main |= is_main(node);
                 parts.rest.push_str(text);
             }
         }
@@ -84,8 +83,8 @@ impl Parts {
 }
 
 /// Whether the statement is `fn main`, or a macro call that may write one.
-fn is_main(node: &syntax::SyntaxNode) -> bool {
-    if let Some(function) = ast::Fn::cast(node.clone()) {
+fn is_main(node: ast::Node<'_>) -> bool {
+    if let Some(function) = ast::Fn::cast(node) {
         return function.name().is_some_and(|it| it.text() == "main");
     }
     let call = node.descendants().find(|it| it.kind() == SyntaxKind::MACRO_CALL);
@@ -95,13 +94,14 @@ fn is_main(node: &syntax::SyntaxNode) -> bool {
     );
     is_call
         && call.is_some_and(|it| {
-            let words: Vec<String> = it
-                .descendants_with_tokens()
+            let mut before = None;
+            it.descendants_with_tokens()
                 .filter_map(|it| it.into_token())
                 .filter(|it| !it.kind().is_trivia())
-                .map(|it| it.text().to_owned())
-                .collect();
-            words.windows(2).any(|it| it[0] == "fn" && it[1] == "main")
+                .any(|it| {
+                    let word = it.text();
+                    std::mem::replace(&mut before, Some(word)) == Some("fn") && word == "main"
+                })
         })
 }
 

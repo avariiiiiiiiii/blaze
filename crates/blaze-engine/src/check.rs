@@ -116,9 +116,10 @@ pub(crate) fn once(project: &Path, krate: &str) -> anyhow::Result<Option<crate::
     }
     Ok(scope.checked.iter().find_map(|&file| unresolved(&db, file)).map(|path| {
         crate::Refused::Error(crate::errors::Said::one(crate::errors::Diagnostic {
+            // alloc: the error path, as below
             code: Some("E0433".to_owned()),
-            message: format!("failed to resolve `{path}`"),
-            span: None,
+            // alloc: as above
+            ..crate::errors::of_none(&format!("failed to resolve `{path}`"))
         }))
     }))
 }
@@ -127,12 +128,13 @@ pub(crate) fn once(project: &Path, krate: &str) -> anyhow::Result<Option<crate::
 /// rust-analyzer does not say of a type's path, and on which a probe of a library item
 /// turns (autocfg's `probe_trait("alloc::alloc::Allocator")` with no `extern crate alloc`).
 fn unresolved(db: &RootDatabase, file: vfs::FileId) -> Option<String> {
-    use syntax::{AstNode as _, ast};
-    let sema = hir::Semantics::new(db);
+    use syntax::view::{self as ast, AstNode as _};
+    let sema = hir::view::Semantics::new(db);
     let tree = sema.parse_guess_edition(file);
     tree.syntax().descendants().filter_map(ast::Path::cast).find_map(|path| {
         let in_attr = path.syntax().ancestors().any(|it| ast::Attr::can_cast(it.kind()));
-        (!in_attr && sema.resolve_path(&path).is_none()).then(|| path.to_string())
+        // alloc: the text of the error, once per check that fails
+        (!in_attr && sema.resolve_path(path).is_none()).then(|| path.to_string())
     })
 }
 

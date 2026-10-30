@@ -334,8 +334,26 @@ pub(super) fn ldst(buf: &mut Buf<'_>, op: Mem, rt: u8, rn: u8, off: u32, tmp: u8
         buf.put4(word);
     } else {
         mov_imm(buf, tmp, u64::from(off));
-        buf.put4((op.bits & !0x0100_0000) | 0x0020_e800 | r(tmp) << 16 | r(rn) << 5 | r(rt));
+        buf.put4(ldst_reg(op, rt, rn, tmp));
     }
+}
+
+/// [`ldst`] at a signed offset: a negative one unscaled from -256, and otherwise put in `tmp`
+/// for the register form.
+pub(super) fn ldst_any(buf: &mut Buf<'_>, op: Mem, rt: u8, rn: u8, off: i32, tmp: u8) {
+    if off >= 0 {
+        ldst(buf, op, rt, rn, off as u32, tmp);
+    } else if off >= -256 {
+        buf.put4(ldur(op, rt, rn, off));
+    } else {
+        mov_imm(buf, tmp, i64::from(off) as u64);
+        buf.put4(ldst_reg(op, rt, rn, tmp));
+    }
+}
+
+/// `op rt, [rn, xm, sxtx]`.
+const fn ldst_reg(op: Mem, rt: u8, rn: u8, rm: u8) -> u32 {
+    (op.bits & !0x0100_0000) | 0x0020_e800 | r(rm) << 16 | r(rn) << 5 | r(rt)
 }
 
 /// The unscaled form of `op rt, [rn, #off]` (`ldur`/`stur`), `off` in -256..256.

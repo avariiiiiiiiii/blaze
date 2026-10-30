@@ -237,16 +237,63 @@ impl Clone for FlatTree {
     }
 }
 
-/// A tree's columns before they are packed ([`FlatTree::pack`]).
+/// A tree's columns before they are packed ([`FlatTree::pack`]): slices, or for an edit's
+/// words, node parents, kinds and marks the values made as they are written ([`Fill`]).
 #[derive(Clone, Copy)]
-struct Columns<'a> {
-    words: &'a [u32],
+struct Columns<'a, W = &'a [u32], P = &'a [u32], K = &'a [(u32, u16)], M = &'a [u32]> {
+    words: W,
     nodes: &'a [u64],
-    node_parents: &'a [u32],
+    node_parents: P,
     far: &'a [(u32, u32)],
-    kinds: &'a [(u32, u16)],
+    kinds: K,
     big: &'a [(u32, u32)],
-    marks: &'a [u32],
+    marks: M,
+}
+
+/// A column [`FlatTree::pack`] writes into its block: how many values it has, and writing
+/// them there.
+trait Fill<T> {
+    fn count(&self) -> usize;
+    fn place(self, block: &mut Block) -> Col<T>;
+}
+
+impl<T: Copy> Fill<T> for &[T] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn place(self, block: &mut Block) -> Col<T> {
+        block.put(self)
+    }
+}
+
+/// A column of the `.0` values of `.1`, made in order.
+struct Made<I>(usize, I);
+
+impl<T, I: Iterator<Item = T>> Fill<T> for Made<I> {
+    fn count(&self) -> usize {
+        self.0
+    }
+
+    fn place(self, block: &mut Block) -> Col<T> {
+        let Made(len, mut values) = self;
+        let col = block.fill(len, |_| values.next().expect("as many values as counted"));
+        assert!(values.next().is_none(), "more values than the {len} counted");
+        col
+    }
+}
+
+/// A column of the slices of `.1` one after another, `.0` values in all.
+struct Joined<I>(usize, I);
+
+impl<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]>> Fill<T> for Joined<I> {
+    fn count(&self) -> usize {
+        self.0
+    }
+
+    fn place(self, block: &mut Block) -> Col<T> {
+        block.put_joined(self.0, self.1)
+    }
 }
 
 /// A node of [`FlatTree::subtree_without`]'s copy whose elements are being pushed: its number,
@@ -283,6 +330,18 @@ struct Buffers {
     text: String,
     opened: Vec<Open>,
     spare: Spare,
+    splicing: Splicing,
+}
+
+/// Where [`FlatTree::splice_all`] works out an edit.
+#[derive(Debug)]
+struct Splicing {
+    /// The splices, placed.
+    placed: Vec<Placed>,
+    /// Their ancestors, each with its child on the way to the first splice under it.
+    ancestors: Vec<(u32, u32)>,
+    /// The words of the edited tree written after it is packed, by element.
+    patches: Vec<(u32, u32)>,
 }
 
 thread_local! {
@@ -308,6 +367,11 @@ impl Buffers {
             opened: Vec::new(),  // alloc: none, an empty vector
             // alloc: none, empty vectors
             spare: Spare { nodes: Vec::new(), pairs: Vec::new(), hashes: Vec::new() },
+            splicing: Splicing {
+                placed: Vec::new(),    // alloc: none, an empty vector
+                ancestors: Vec::new(), // alloc: none, an empty vector
+                patches: Vec::new(),   // alloc: none, an empty vector
+            },
         }
     }
 
@@ -330,6 +394,9 @@ impl Buffers {
         self.spare.nodes.clear();
         self.spare.pairs.clear();
         self.spare.hashes.clear();
+        self.splicing.placed.clear();
+        self.splicing.ancestors.clear();
+        self.splicing.patches.clear();
         // A thread that is ending: they are freed.
         let _ = BUFFERS.try_with(|shelf| {
             let held = shelf.take();
@@ -532,7 +599,7 @@ impl Packer {
     ) -> FlatTree {
         radix::sort_copy_by_key_in(&mut self.big, |it| it.0, &mut spare.pairs);
         node_bits(&self.words, &mut spare.nodes);
-        let columns = Columns {
+        let columns: Columns<'_> = Columns {
             words: &self.words,
             nodes: &spare.nodes,
             node_parents: &self.node_parents,
@@ -598,35 +665,97 @@ fn moved_part(part: &OnceLock<Part>, source: &Text, from: u32, to: u32) -> OnceL
     moved
 }
 
+/// What [`FlatTree::splice_all`] puts in place of an element.
+#[derive(Debug, Clone, Copy)]
+pub enum Splice<'a> {
+    /// A node's subtree, by this tree's, whose root is a node of its kind
+    /// ([`FlatTree::replace_subtree`]).
+    Subtree(&'a FlatTree),
+    /// A token's text, its kind staying ([`FlatTree::replace_token`]).
+    Token(&'a str),
+}
+
+/// A splice of [`FlatTree::splice_all`], placed: the old elements `lo..hi` it replaces, over
+/// `start..end` of the old text, and the `added` elements it puts in their place, from `new_lo`
+/// on, over `new_start..new_end` of the new.
+#[derive(Debug, Clone, Copy)]
+struct Placed {
+    lo: u32,
+    hi: u32,
+    added: u32,
+    new_lo: u32,
+    start: u32,
+    end: u32,
+    new_start: u32,
+    new_end: u32,
+}
+
+impl Placed {
+    /// Where old element `it`, past this splice and before the next, is in the new tree.
+    fn after(&self, it: u32) -> u32 {
+        it - self.hi + self.new_lo + self.added
+    }
+}
+
+/// How many of `placed`'s splices old element `it` is past: the gap it is in, or the splice it
+/// is the first element of.
+fn gap(placed: &[Placed], it: u32) -> usize {
+    placed.partition_point(|p| p.hi <= it)
+}
+
+/// Old element `it`, past `g` of `placed`'s splices and before the next, in the new tree.
+fn moved(placed: &[Placed], g: usize, it: u32) -> u32 {
+    match g {
+        0 => it,
+        g => placed[g - 1].after(it),
+    }
+}
+
+/// Where the text past `g` of `placed`'s splices (and before the next) was, and is: the end
+/// of the last of them in the old text and in the new, as [`moved_part`] takes them.
+fn text_shift(placed: &[Placed], g: usize) -> (u32, u32) {
+    match g {
+        0 => (0, 0),
+        g => (placed[g - 1].end, placed[g - 1].new_end),
+    }
+}
+
 impl FlatTree {
     /// The tree over `source` of `columns`, with [`FlatTree::ranks`] counted from its node bits,
     /// its `kept` nodes that [`keeps`] their hashes (ascending, the `n`th `kept_at(n)` with its
     /// hash or 0) and its lazy nodes: every column in one allocation, the block. The columns
     /// aligned to 8 are placed first, so the block has no padding.
-    fn pack(
+    fn pack<W, P, K, M>(
         source: Text,
-        columns: Columns<'_>,
+        columns: Columns<'_, W, P, K, M>,
         lazy: Option<Box<Lazy>>,
         kept: usize,
         kept_at: impl Fn(usize) -> (u32, u128),
-    ) -> FlatTree {
+    ) -> FlatTree
+    where
+        W: Fill<u32>,
+        P: Fill<u32>,
+        K: Fill<(u32, u16)>,
+        M: Fill<u32>,
+    {
         let Columns { words, nodes, node_parents, far, kinds, big, marks } = columns;
-        debug_assert_eq!(nodes.len(), words.len().div_ceil(64), "node bits for every 64 elements");
+        let (elements, parents) = (words.count(), node_parents.count());
+        debug_assert_eq!(nodes.len(), elements.div_ceil(64), "node bits for every 64 elements");
         debug_assert!((1..kept).all(|n| kept_at(n - 1).0 < kept_at(n).0), "kept nodes ascending");
         let kept_words = match kept {
             0 => 0,
-            _ => node_parents.len().div_ceil(64),
+            _ => parents.div_ceil(64),
         };
         let mut room = block::room::<u64>(0, nodes.len());
         room = block::room::<u64>(room, kept_words);
         room = block::room::<Slot>(room, kept);
-        room = block::room::<u32>(room, words.len());
+        room = block::room::<u32>(room, elements);
         room = block::room::<u32>(room, nodes.len());
-        room = block::room::<u32>(room, node_parents.len());
+        room = block::room::<u32>(room, parents);
         room = block::room::<(u32, u32)>(room, far.len());
-        room = block::room::<(u32, u16)>(room, kinds.len());
+        room = block::room::<(u32, u16)>(room, kinds.count());
         room = block::room::<(u32, u32)>(room, big.len());
-        room = block::room::<u32>(room, marks.len());
+        room = block::room::<u32>(room, marks.count());
         room = block::room::<u32>(room, kept_words);
         room = block::room::<u32>(room, kept);
         // alloc: the tree's one block
@@ -634,19 +763,19 @@ impl FlatTree {
         let nodes = block.put(nodes);
         let mut bits = block.fill(kept_words, |_| 0u64);
         let hashes = block.fill(kept, |n| Slot::new(kept_at(n).1));
-        let words = block.put(words);
+        let words = words.place(&mut block);
         let mut before = 0;
         let ranks = block.fill(nodes.len(), |word| {
             let rank = before;
             before += nodes[word].count_ones();
             rank
         });
-        debug_assert_eq!(before as usize, node_parents.len(), "a node bit for each node");
-        let node_parents = block.put(node_parents);
+        debug_assert_eq!(before as usize, parents, "a node bit for each node");
+        let node_parents = node_parents.place(&mut block);
         let far = block.put(far);
-        let kinds = block.put(kinds);
+        let kinds = kinds.place(&mut block);
         let big = block.put(big);
-        let marks = block.put(marks);
+        let marks = marks.place(&mut block);
         for n in 0..kept {
             let at = kept_at(n).0;
             let node = BitSlice::<usize>::from_words(&nodes[..]).contains(at as usize);
@@ -894,47 +1023,6 @@ impl FlatTree {
             slot.set(hash);
         }
         hash
-    }
-
-    /// Pushes to `kept`, empty, the kept nodes, each with its hash or 0, of the tree an edit of element
-    /// `at` makes: the elements `lo..hi` replaced by `with`'s (as they are for `None`), and the
-    /// text of `at`'s ancestors `grown` bytes longer; `sorting` is room to sort them in. The
-    /// ancestors are hashed again when asked; every other kept node keeps its hash.
-    fn kept_around(
-        &self,
-        at: u32,
-        grown: i64,
-        (lo, hi): (u32, u32),
-        with: Option<&FlatTree>,
-        kept: &mut Vec<(u32, u128)>,
-        sorting: &mut Vec<(u32, u128)>,
-    ) {
-        let added = with.map_or(hi - lo, FlatTree::len);
-        let theirs = with.map_or(0, |it| it.kept.elements.len());
-        kept.reserve(self.kept.elements.len() + theirs + 64);
-        // Before `lo`, a node whose subtree ends past it is an ancestor.
-        kept.extend(self.kept.between(0, lo).filter(|&(it, _)| self.end(it) <= lo));
-        let mut up = self.parent(at);
-        while let Some(ancestor) = up {
-            self.keep_grown(ancestor, grown, hi - lo, added, kept);
-            up = self.parent(ancestor);
-        }
-        radix::sort_copy_by_key_in(kept, |it| it.0, sorting);
-        match with {
-            Some(with) => kept.extend(with.kept.between(0, with.len()).map(|(it, hash)| (it + lo, hash))),
-            None => kept.extend(self.kept.between(lo, hi)),
-        }
-        kept.extend(self.kept.between(hi, self.len()).map(|(it, hash)| (it - (hi - lo) + added, hash)));
-    }
-
-    /// Pushes ancestor `at` of an edit, with no hash yet, when it keeps one with its text
-    /// `grown` bytes longer and `removed` elements of it replaced by `added`.
-    fn keep_grown(&self, at: u32, grown: i64, removed: u32, added: u32, kept: &mut Vec<(u32, u128)>) {
-        let text = (u32::from(self.range(at).len()) as i64 + grown) as u32;
-        let size = self.end(at) - at - removed + added;
-        if keeps(text, size) {
-            kept.push((at, 0));
-        }
     }
 
     /// Where element `at` starts; `len()` for where the last ends.
@@ -1307,253 +1395,225 @@ impl FlatTree {
     /// moved to `source` (their text did not change, only where it is). A tree has one
     /// expander, so when both keep lazy nodes they must have the same `data`.
     pub fn replace_subtree(&self, at: u32, with: &FlatTree, source: Text) -> FlatTree {
-        let kind = self.kind(at);
-        assert!(
-            !self.is_token(at) && !with.is_token(0) && with.kind(0) == kind,
-            "element {at} is replaced by a {:?} that is not a node of its kind, {kind:?}",
-            with.kind(0),
-        );
-        let (old, root, new) = (self.range(at), self.range(0), with.range(0));
-        let (base, start) = (u32::from(root.start()), u32::from(old.start()));
-        let (old_end, old_root_end) = (u32::from(old.end()), u32::from(root.end()));
-        let new_end = start as u64 + u32::from(new.len()) as u64;
-        let root_end = new_end + (old_root_end - old_end) as u64;
-        fn bytes(text: &str, from: u64, to: u64) -> Option<&[u8]> {
-            text.as_bytes().get(from as usize..to as usize)
-        }
-        let same = |from: u64, to: u64, old_from: u32, old_to: u32| {
-            let it = bytes(&source, from, to);
-            it.is_some() && it == bytes(&self.source, old_from as u64, old_to as u64)
-        };
+        self.splice_all(&[(at, Splice::Subtree(with))], source)
+    }
+
+    /// The tree with each of `splices` made at once, over `source`, the new whole text: each
+    /// one's element replaced as [`Self::replace_subtree`] or [`Self::replace_token`] replaces
+    /// it, and the root's text between them as it was. They are in order of element and none
+    /// is in another's subtree. The tree is the one those replacements made one after another
+    /// give, made in one pass: its columns are written into its block as they are made, the
+    /// copies around the splices with them, and the words that change after.
+    pub fn splice_all(&self, splices: &[(u32, Splice<'_>)], source: Text) -> FlatTree {
+        assert!(!splices.is_empty(), "no splices to make");
+        let mut buffers = Buffers::take();
+        self.place(splices, &mut buffers.splicing.placed);
+        let last = *buffers.splicing.placed.last().expect("a splice placed");
+        let old_root_end = u32::from(self.range(0).end());
+        let root_end = old_root_end as u64 - last.end as u64 + last.new_end as u64;
         assert!(
             root_end <= u32::MAX as u64
-                && (old_root_end as usize != self.source.len() || root_end == source.len() as u64)
-                && bytes(&source, start as u64, new_end) == Some(with.source[new].as_bytes())
-                && same(base as u64, start as u64, base, start)
-                && same(new_end, root_end, old_end, old_root_end),
-            "the new text is not the old one with {kind:?} at {old:?} replaced by the {new:?} given",
+                && root_end <= source.len() as u64
+                && (old_root_end as usize != self.source.len() || root_end == source.len() as u64),
+            "the new text, of {} bytes, is not the root's after the splices, to byte {root_end}",
+            source.len(),
         );
-        let new_end = new_end as u32;
-        let (lo, hi) = (at, self.end(at));
-        let (removed, added) = (hi - lo, with.len());
-        let len = self.len() as u64 - removed as u64 + added as u64;
+        debug_assert!(
+            self.spliced_text(&buffers.splicing.placed, splices, &source),
+            "the new text is not the old one with the splices given made",
+        );
+        let len = self.len() as u64 - last.hi as u64 + (last.new_lo + last.added) as u64;
         assert!(len < NO_PARENT as u64, "a tree of 2^32 - 1 elements or more");
-        let len = len as u32;
-        let after = |it: u32| it - removed + added;
-        let before = |it: u32| it - added + removed;
-        let up = self.parent(at);
-
-        // Copied around `at`, not repacked: what changes is the ancestors' sizes, how far back
-        // the parent is of their tokens after `at`, and the numbers past it in the tables.
-        let mut buffers = Buffers::take();
-        let Buffers { packer, marks, kept: hashes, spare, .. } = &mut buffers;
-        let Packer { words, node_parents, far, kinds, big } = packer;
-        words.reserve(len as usize);
-        words.extend_from_slice(&self.words[..lo as usize]);
-        words.extend_from_slice(&with.words);
-        words.extend_from_slice(&self.words[hi as usize..]);
-        far.reserve(self.far.len() + with.far.len() + 1);
-        far.extend_from_slice(in_range(&self.far, 0, lo));
-        let root = &mut words[lo as usize];
-        if *root & TAG != NODE {
-            let distance = match up {
-                None => 0,
-                Some(parent) if lo - parent < FAR => lo - parent,
-                Some(parent) => {
-                    far.push((lo, parent));
-                    FAR
-                }
-            };
-            *root = (*root & !(FAR << UP)) | distance << UP;
-        }
-        far.extend(with.far.iter().map(|&(it, parent)| (it + lo, parent + lo)));
-        // Those after `hi` under an ancestor are pushed as the ancestors are walked.
-        let rest = in_range(&self.far, hi, self.len()).iter().filter(|it| it.1 >= lo);
-        far.extend(rest.map(|&(it, parent)| (after(it), after(parent))));
-        big.reserve(self.big.len() + with.big.len());
-        // Before `lo`, a node whose subtree ends past it is an ancestor, its size set below.
-        big.extend(in_range(&self.big, 0, lo).iter().filter(|&&(it, _)| self.end(it) <= lo));
-        big.extend(with.big.iter().map(|&(it, value)| (it + lo, value)));
-        big.extend(in_range(&self.big, hi, self.len()).iter().map(|&(it, value)| (after(it), value)));
-        let (mut child, mut ancestor) = (at, up);
-        while let Some(it) = ancestor {
-            let end = self.end(it);
-            let size = after(end) - it;
-            let stored = match size < HUGE {
-                true => size,
-                false => {
-                    big.push((it, size));
-                    HUGE
-                }
-            };
-            let word = &mut words[it as usize];
-            *word = (*word & (FAR_KIND | TAG)) | stored << VALUE;
-            let mut next = self.end(child);
-            while next < end {
-                if self.words[next as usize] & TAG != NODE {
-                    let distance = after(next) - it;
-                    let back = match distance < FAR {
-                        true => distance,
-                        false => {
-                            far.push((after(next), it));
-                            FAR
-                        }
-                    };
-                    let word = &mut words[after(next) as usize];
-                    *word = (*word & !(FAR << UP)) | back << UP;
-                }
-                next = self.end(next);
-            }
-            (child, ancestor) = (it, self.parent(it));
-        }
-        radix::sort_copy_by_key_in(far, |it| it.0, &mut spare.pairs);
-        radix::sort_copy_by_key_in(big, |it| it.0, &mut spare.pairs);
-        kinds.reserve(self.kinds.len() + with.kinds.len());
-        kinds.extend_from_slice(in_range(&self.kinds, 0, lo));
-        kinds.extend(with.kinds.iter().map(|&(it, kind)| (it + lo, kind)));
-        kinds.extend(in_range(&self.kinds, hi, self.len()).iter().map(|&(it, kind)| (after(it), kind)));
-
-        let (ranked, past) = (self.rank(lo), self.nodes_before(hi));
-        let parent = up.unwrap_or(NO_PARENT);
-        let count = ranked + with.node_parents.len() + self.node_parents.len() - past;
-        node_parents.reserve(count);
-        node_parents.extend_from_slice(&self.node_parents[..ranked]);
-        node_parents.extend(with.node_parents.iter().map(|&it| match it {
-            NO_PARENT => parent,
-            it => it + lo,
-        }));
-        node_parents.extend(self.node_parents[past..].iter().map(|&it| match it {
-            it if it < lo || it == NO_PARENT => it,
-            it => after(it),
-        }));
-        // `len` is `lo + added + (self.len() - hi)`: the three ranges fill the new bits exactly.
-        spare.nodes.resize((len as usize).div_ceil(64), 0);
-        let mut nodes = BitSliceMut::<usize>::from_words(&mut spare.nodes[..]);
-        let ours = BitSlice::from_words(&self.nodes[..]);
-        nodes.or_range_at(0, &ours, 0..lo as usize);
-        nodes.or_range_at(lo as usize, &BitSlice::from_words(&with.nodes[..]), 0..added as usize);
-        nodes.or_range_at((lo + added) as usize, &ours, hi as usize..self.len() as usize);
-
-        // A start past `lo` is `with`'s, moved to `at`'s start, or that of the element it was
-        // before the edit, moved by what the text grew: a mark and up to seven lengths.
-        let first = lo.div_ceil(MARK);
-        let with_start = u32::from(new.start());
-        marks.reserve((len / MARK + 1) as usize);
-        marks.extend_from_slice(&self.marks[..first as usize]);
-        marks.extend((first..=len / MARK).map(|mark| match mark * MARK {
-            it if it < lo + added => with.offset(it - lo) - with_start + start,
-            it => self.offset(before(it)) - old_end + new_end,
-        }));
-
-        let ours = self.lazy.as_ref().map(|lazy| {
-            let before = lazy.nodes.partition_point(|&it| it < lo);
-            let past = lazy.nodes.partition_point(|&it| it < hi);
-            (lazy, before, past)
-        });
-        let kept = ours.map_or(0, |(lazy, before, past)| before + lazy.nodes.len() - past);
-        let theirs = with.lazy.as_ref().filter(|it| !it.nodes.is_empty());
-        let expander = match (ours.filter(|_| kept > 0), theirs) {
-            (Some((ours, ..)), Some(theirs)) => {
-                assert_eq!(
-                    ours.data, theirs.data,
-                    "a tree's lazy nodes and those replacing {kind:?} at {old:?} have different expanders",
-                );
-                Some((ours.expand, ours.data))
-            }
-            (Some((ours, ..)), None) => Some((ours.expand, ours.data)),
-            (None, Some(theirs)) => Some((theirs.expand, theirs.data)),
-            (None, None) => None,
+        let tree = match splices.iter().all(|(_, it)| matches!(it, Splice::Token(_))) {
+            true => self.splice_tokens(splices, &mut buffers, source),
+            false => self.splice_subtrees(splices, len as u32, &mut buffers, source),
         };
-        let lazy = expander.map(|(expand, data)| {
-            // alloc: an outline's lazy nodes, once per edit
-            let (mut nodes, mut parts) = (Vec::new(), Vec::new());
-            if let Some((ours, before, _)) = ours {
-                for (&it, part) in ours.nodes[..before].iter().zip(&ours.parts[..before]) {
-                    nodes.push(it);
-                    parts.push(moved_part(part, &source, 0, 0));
-                }
-            }
-            if let Some(theirs) = theirs {
-                for (&it, part) in theirs.nodes.iter().zip(theirs.parts.iter()) {
-                    nodes.push(it + lo);
-                    parts.push(moved_part(part, &source, new.start().into(), start));
-                }
-            }
-            if let Some((ours, _, past)) = ours {
-                for (&it, part) in ours.nodes[past..].iter().zip(&ours.parts[past..]) {
-                    nodes.push(after(it));
-                    parts.push(moved_part(part, &source, old_end, new_end));
-                }
-            }
-            // alloc: as `nodes` above
-            Box::new(Lazy { nodes: nodes.into(), parts: parts.into(), expand, data })
-        });
-
-        let grown = u32::from(new.len()) as i64 - u32::from(old.len()) as i64;
-        self.kept_around(at, grown, (lo, hi), Some(with), hashes, &mut spare.hashes);
-        let columns = Columns {
-            words: words.as_slice(),
-            nodes: &spare.nodes,
-            node_parents: node_parents.as_slice(),
-            far: far.as_slice(),
-            kinds: kinds.as_slice(),
-            big: big.as_slice(),
-            marks: marks.as_slice(),
-        };
-        let tree = FlatTree::pack(source, columns, lazy, hashes.len(), |n| hashes[n]);
         buffers.give();
         tree
     }
 
-    /// The tree with token `at`'s text replaced by `text` (its kind stays), over `source`, the
-    /// new whole text: `text` is `source` at the token's start, and the rest of the root's text
-    /// is as it was around it. No element but the token changes, so only its length and the
-    /// starts kept after it are written: every lazy node stays lazy and every part already
-    /// parsed is kept, those after the token moved to `source`.
-    pub fn replace_token(&self, at: u32, text: &str, source: Text) -> FlatTree {
-        let kind = self.kind(at);
-        assert!(self.is_token(at), "element {at} ({kind:?}) is not a token");
-        let (old, root) = (self.range(at), self.range(0));
-        let (base, start) = (u32::from(root.start()), u32::from(old.start()));
-        let (old_end, old_root_end) = (u32::from(old.end()), u32::from(root.end()));
-        let new_end = start as u64 + text.len() as u64;
-        let root_end = new_end + (old_root_end - old_end) as u64;
-        fn bytes(text: &str, from: u64, to: u64) -> Option<&[u8]> {
+    /// Pushes to `placed`, empty, where each of `splices` is in this tree and in the one they
+    /// make.
+    fn place(&self, splices: &[(u32, Splice<'_>)], placed: &mut Vec<Placed>) {
+        placed.reserve(splices.len());
+        for &(at, splice) in splices {
+            let kind = self.kind(at);
+            let (hi, added, len) = match splice {
+                Splice::Subtree(with) => {
+                    assert!(
+                        !self.is_token(at) && !with.is_token(0) && with.kind(0) == kind,
+                        "element {at} is replaced by a {:?} that is not a node of its kind, {kind:?}",
+                        with.kind(0),
+                    );
+                    (self.end(at), with.len(), u32::from(with.range(0).len()))
+                }
+                Splice::Token(text) => {
+                    assert!(self.is_token(at), "element {at} ({kind:?}) is not a token");
+                    (at + 1, 1, u32::try_from(text.len()).expect("a token of under 4 GiB"))
+                }
+            };
+            let old = self.range(at);
+            let (start, end) = (u32::from(old.start()), u32::from(old.end()));
+            let (new_lo, new_start) = match placed.last() {
+                None => (at as u64, start as u64),
+                Some(before) => {
+                    assert!(
+                        before.hi <= at,
+                        "the splice of element {at} is in or before that of element {}",
+                        before.lo,
+                    );
+                    let new_lo = at as u64 - before.hi as u64 + (before.new_lo + before.added) as u64;
+                    (new_lo, start as u64 - before.end as u64 + before.new_end as u64)
+                }
+            };
+            let new_end = new_start + len as u64;
+            assert!(new_lo + (added as u64) < NO_PARENT as u64, "a tree of 2^32 - 1 elements or more");
+            assert!(new_end <= u32::MAX as u64, "a text of 4 GiB or more");
+            let (new_lo, new_start, new_end) = (new_lo as u32, new_start as u32, new_end as u32);
+            placed.push(Placed { lo: at, hi, added, new_lo, start, end, new_start, new_end });
+        }
+    }
+
+    /// Whether `source` is this tree's text with `placed`'s `splices` made: the text around
+    /// them as it was, and each one's its own.
+    fn spliced_text(&self, placed: &[Placed], splices: &[(u32, Splice<'_>)], source: &str) -> bool {
+        fn bytes(text: &str, from: u32, to: u32) -> Option<&[u8]> {
             text.as_bytes().get(from as usize..to as usize)
         }
-        let same = |from: u64, to: u64, old_from: u32, old_to: u32| {
-            let it = bytes(&source, from, to);
-            it.is_some() && it == bytes(&self.source, old_from as u64, old_to as u64)
+        let same = |new: u32, old: u32, to: u32| {
+            let it = bytes(source, new, new + (to - old));
+            it.is_some() && it == bytes(&self.source, old, to)
         };
-        assert!(
-            root_end <= u32::MAX as u64
-                && (old_root_end as usize != self.source.len() || root_end == source.len() as u64)
-                && bytes(&source, start as u64, new_end) == Some(text.as_bytes())
-                && same(base as u64, start as u64, base, start)
-                && same(new_end, root_end, old_end, old_root_end),
-            "the new text is not the old one with the {kind:?} at {old:?} replaced by {text:?}",
-        );
-        let new_end = new_end as u32;
-        let len = text.len() as u32;
-
-        let mut buffers = Buffers::take();
-        let Buffers { packer, kept, spare, .. } = &mut buffers;
-        let big = &mut packer.big;
-        big.extend_from_slice(&self.big);
-        if let Ok(it) = big.binary_search_by_key(&at, |it| it.0) {
-            big.remove(it);
-        }
-        let stored = match len < LONG {
-            true => len,
-            false => {
-                big.insert(big.partition_point(|it| it.0 < at), (at, len));
-                LONG
+        let root = self.range(0);
+        let (mut old, mut new) = (u32::from(root.start()), u32::from(root.start()));
+        for (p, &(_, splice)) in placed.iter().zip(splices) {
+            let theirs = match splice {
+                Splice::Subtree(with) => &with.source[with.range(0)],
+                Splice::Token(text) => text,
+            };
+            if !same(new, old, p.start) || bytes(source, p.new_start, p.new_end) != Some(theirs.as_bytes()) {
+                return false;
             }
+            (old, new) = (p.end, p.new_end);
+        }
+        same(new, old, u32::from(root.end()))
+    }
+
+    /// The old elements between `placed`'s splices `g - 1` and `g`: after the one before
+    /// (from the root for the first) to the next (to the end for the last).
+    fn gap_of(&self, placed: &[Placed], g: usize) -> (u32, u32) {
+        let from = match g {
+            0 => 0,
+            g => placed[g - 1].hi,
         };
+        (from, placed.get(g).map_or(self.len(), |it| it.lo))
+    }
+
+    /// Pushes to `ancestors`, empty, every ancestor of `placed`'s elements once, each with
+    /// its child on the way to the first of them under it: walked up from each splice to
+    /// where the walk from the one before joins it.
+    fn ancestors_of(&self, placed: &[Placed], ancestors: &mut Vec<(u32, u32)>) {
+        let mut before = None;
+        for it in placed {
+            let (mut child, mut up) = (it.lo, self.parent(it.lo));
+            while let Some(ancestor) = up {
+                if before.is_some_and(|lo| ancestor <= lo && lo < self.end(ancestor)) {
+                    break;
+                }
+                ancestors.push((ancestor, child));
+                (child, up) = (ancestor, self.parent(ancestor));
+            }
+            before = Some(it.lo);
+        }
+    }
+
+    /// Ancestor `at` of `placed`'s splices in the tree they make: its number, size and the
+    /// length of its text.
+    fn grown(&self, placed: &[Placed], at: u32) -> (u32, u32, u32) {
+        let (end, range) = (self.end(at), self.range(at));
+        let (g, past) = (gap(placed, at), gap(placed, end));
+        let new = moved(placed, g, at);
+        let offset = |g: usize, at: TextSize| {
+            let (from, to) = text_shift(placed, g);
+            u32::from(at) - from + to
+        };
+        (new, moved(placed, past, end) - new, offset(past, range.end()) - offset(g, range.start()))
+    }
+
+    /// Pushes to `kept`, empty, the kept nodes, each with its hash or 0, of the tree
+    /// `placed`'s `splices` make, `ancestors` their ancestors; `sorting` is room to sort them
+    /// in. The ancestors are hashed again when asked; every other kept node keeps its hash.
+    fn kept_spliced(
+        &self,
+        placed: &[Placed],
+        splices: &[(u32, Splice<'_>)],
+        ancestors: &[(u32, u32)],
+        kept: &mut Vec<(u32, u128)>,
+        sorting: &mut Vec<(u32, u128)>,
+    ) {
+        let theirs: usize = splices
+            .iter()
+            .map(|(_, it)| match it {
+                Splice::Subtree(with) => with.kept.elements.len(),
+                Splice::Token(_) => 0,
+            })
+            .sum();
+        kept.reserve(self.kept.elements.len() + theirs + ancestors.len());
+        for g in 0..=placed.len() {
+            let (from, to) = self.gap_of(placed, g);
+            // A node of a gap whose subtree ends past the next splice's start is an ancestor.
+            let ours = self.kept.between(from, to).filter(|&(it, _)| self.end(it) <= to);
+            kept.extend(ours.map(|(it, hash)| (moved(placed, g, it), hash)));
+            if let (Some(it), Some((_, Splice::Subtree(with)))) = (placed.get(g), splices.get(g)) {
+                kept.extend(with.kept.between(0, with.len()).map(|(at, hash)| (at + it.new_lo, hash)));
+            }
+        }
+        for &(at, _) in ancestors {
+            let (new, size, text) = self.grown(placed, at);
+            if keeps(text, size) {
+                kept.push((new, 0));
+            }
+        }
+        radix::sort_copy_by_key_in(kept, |it| it.0, sorting);
+    }
+
+    /// The word of token splice `it` in the tree it makes, its length past the word pushed
+    /// to `big`.
+    fn token_word(&self, it: &Placed, big: &mut Vec<(u32, u32)>) -> u32 {
+        let len = it.new_end - it.new_start;
+        if len >= LONG {
+            big.push((it.new_lo, len));
+        }
+        (self.words[it.lo as usize] & !(LONG << VALUE)) | len.min(LONG) << VALUE
+    }
+
+    /// The kinds of splice `it`, `with` for a subtree, and the number of the first element
+    /// they are numbered from.
+    fn spliced_kinds<'a>(&'a self, it: &Placed, with: Option<&'a FlatTree>) -> (&'a [(u32, u16)], u32) {
+        match with {
+            Some(with) => (&with.kinds[..], 0),
+            None => (in_range(&self.kinds, it.lo, it.hi), it.lo),
+        }
+    }
+
+    /// [`Self::splice_all`] of tokens alone (`buffers.splicing.placed`): no element but the tokens
+    /// changes, so the tree's columns are copied as they are, and only the tokens' words and
+    /// the starts kept after the first are written.
+    fn splice_tokens(&self, splices: &[(u32, Splice<'_>)], buffers: &mut Buffers, source: Text) -> FlatTree {
+        let Buffers { packer, splicing: Splicing { placed, ancestors, .. }, kept, spare, .. } = buffers;
+        let (placed, big) = (&placed[..], &mut packer.big);
+        big.reserve(self.big.len() + placed.len());
+        for g in 0..=placed.len() {
+            let (from, to) = self.gap_of(placed, g);
+            big.extend_from_slice(in_range(&self.big, from, to));
+            if let Some(it) = placed.get(g).filter(|it| it.new_end - it.new_start >= LONG) {
+                big.push((it.lo, it.new_end - it.new_start));
+            }
+        }
         let lazy = self.lazy.as_ref().map(|lazy| {
-            let parts = lazy.nodes.iter().zip(lazy.parts.iter()).map(|(&it, part)| match it < at {
-                true => moved_part(part, &source, 0, 0),
-                false => moved_part(part, &source, old_end, new_end),
+            let parts = lazy.nodes.iter().zip(lazy.parts.iter()).map(|(&it, part)| {
+                let (from, to) = text_shift(placed, gap(placed, it));
+                moved_part(part, &source, from, to)
             });
             // alloc: an outline's lazy nodes, once per edit
             Box::new(Lazy {
@@ -1563,20 +1623,247 @@ impl FlatTree {
                 data: lazy.data,
             })
         });
-        let grown = len as i64 - u32::from(old.len()) as i64;
-        self.kept_around(at, grown, (at, at + 1), None, kept, &mut spare.hashes);
+        self.ancestors_of(placed, ancestors);
+        self.kept_spliced(placed, splices, ancestors, kept, &mut spare.hashes);
         let columns = Columns { big: big.as_slice(), ..self.columns() };
         let mut tree = FlatTree::pack(source, columns, lazy, kept.len(), |n| kept[n]);
-        buffers.give();
-        // No element but the token changes: its word, and the starts kept after it.
-        let word = &mut tree.words[at as usize];
-        *word = (*word & !(LONG << VALUE)) | stored << VALUE;
+        for it in placed {
+            let len = it.new_end - it.new_start;
+            let word = &mut tree.words[it.lo as usize];
+            *word = (*word & !(LONG << VALUE)) | len.min(LONG) << VALUE;
+        }
         for (mark, start) in tree.marks.iter_mut().enumerate() {
-            if mark as u32 * MARK > at {
-                *start = *start - old_end + new_end;
-            }
+            let (from, to) = text_shift(placed, gap(placed, mark as u32 * MARK));
+            *start = *start - from + to;
         }
         tree
+    }
+
+    /// [`Self::splice_all`] with a subtree among `splices` (`buffers.splicing`), of `len`
+    /// elements: the copies between the splices and the splices' own columns are written into
+    /// the block one after another, numbered as they are made; the tables are merged in
+    /// order; the ancestors' words, and those of the leaves under them after a splice, are
+    /// written last.
+    fn splice_subtrees(
+        &self,
+        splices: &[(u32, Splice<'_>)],
+        len: u32,
+        buffers: &mut Buffers,
+        source: Text,
+    ) -> FlatTree {
+        let Buffers { packer, splicing, kept, spare, .. } = buffers;
+        let Splicing { placed, ancestors, patches } = splicing;
+        let (placed, far, big) = (&placed[..], &mut packer.far, &mut packer.big);
+        let subtree = move |g: usize| match splices.get(g) {
+            Some(&(_, Splice::Subtree(with))) => Some(with),
+            _ => None,
+        };
+        let gaps = move |g: usize| self.gap_of(placed, g);
+        let splices_and_gaps = 0..=placed.len();
+        self.ancestors_of(placed, ancestors);
+
+        // The copies' entries, moved: a far parent of a leaf with a splice between them, and
+        // an ancestor's size, are pushed as the ancestors are walked.
+        for g in splices_and_gaps.clone() {
+            let (from, to) = gaps(g);
+            let near = in_range(&self.far, from, to).iter().filter(|it| it.1 >= from);
+            far.extend(near.map(|&(it, parent)| (moved(placed, g, it), moved(placed, g, parent))));
+            let sized = in_range(&self.big, from, to).iter().filter(|&&(it, _)| self.end(it) <= to);
+            big.extend(sized.map(|&(it, value)| (moved(placed, g, it), value)));
+            if let (Some(it), Some(with)) = (placed.get(g), subtree(g)) {
+                far.extend(with.far.iter().map(|&(at, parent)| (at + it.new_lo, parent + it.new_lo)));
+                big.extend(with.big.iter().map(|&(at, value)| (at + it.new_lo, value)));
+            }
+        }
+        for &(at, child) in ancestors.iter() {
+            let (new, size, _) = self.grown(placed, at);
+            let stored = match size < HUGE {
+                true => size,
+                false => {
+                    big.push((new, size));
+                    HUGE
+                }
+            };
+            patches.push((new, (self.words[at as usize] & (FAR_KIND | TAG)) | stored << VALUE));
+            let end = self.end(at);
+            let mut next = child;
+            while next < end {
+                let g = gap(placed, next);
+                let spliced = placed.get(g).filter(|it| it.lo == next);
+                let word = match (spliced, subtree(g)) {
+                    (Some(_), Some(with)) => with.words[0],
+                    (Some(it), None) => self.token_word(it, big),
+                    (None, _) => self.words[next as usize],
+                };
+                if word & TAG != NODE {
+                    let it = spliced.map_or_else(|| moved(placed, g, next), |it| it.new_lo);
+                    let back = match it - new < FAR {
+                        true => it - new,
+                        false => {
+                            far.push((it, new));
+                            FAR
+                        }
+                    };
+                    let under = (word & !(FAR << UP)) | back << UP;
+                    if spliced.is_some() || under != word {
+                        patches.push((it, under));
+                    }
+                }
+                next = spliced.map_or_else(|| self.end(next), |it| it.hi);
+            }
+        }
+        radix::sort_copy_by_key_in(far, |it| it.0, &mut spare.pairs);
+        radix::sort_copy_by_key_in(big, |it| it.0, &mut spare.pairs);
+
+        spare.nodes.resize((len as usize).div_ceil(64), 0);
+        let mut nodes = BitSliceMut::<usize>::from_words(&mut spare.nodes[..]);
+        let ours = BitSlice::from_words(&self.nodes[..]);
+        for g in splices_and_gaps.clone() {
+            let (from, to) = gaps(g);
+            nodes.or_range_at(moved(placed, g, from) as usize, &ours, from as usize..to as usize);
+            if let (Some(it), Some(with)) = (placed.get(g), subtree(g)) {
+                let theirs = BitSlice::from_words(&with.nodes[..]);
+                nodes.or_range_at(it.new_lo as usize, &theirs, 0..it.added as usize);
+            }
+        }
+
+        let ours = self.lazy.as_deref();
+        let lazies = |lazy: &Lazy, (from, to): (u32, u32)| {
+            lazy.nodes.partition_point(|&it| it < from)..lazy.nodes.partition_point(|&it| it < to)
+        };
+        let kept_ours: usize = ours.map_or(0, |lazy| {
+            splices_and_gaps.clone().map(|g| lazies(lazy, gaps(g)).len()).sum()
+        });
+        let mut expander = ours.filter(|_| kept_ours > 0).map(|it| (it.expand, it.data));
+        for (g, it) in placed.iter().enumerate() {
+            let theirs = subtree(g).and_then(|with| with.lazy.as_ref()).filter(|it| !it.nodes.is_empty());
+            match (expander, theirs) {
+                (Some((_, data)), Some(theirs)) => assert_eq!(
+                    data, theirs.data,
+                    "a tree's lazy nodes and those replacing element {} have different expanders",
+                    it.lo,
+                ),
+                (None, Some(theirs)) => expander = Some((theirs.expand, theirs.data)),
+                (_, None) => (),
+            }
+        }
+        let lazy = expander.map(|(expand, data)| {
+            // alloc: an outline's lazy nodes, once per edit
+            let (mut nodes, mut parts) = (Vec::new(), Vec::new());
+            for g in splices_and_gaps.clone() {
+                if let Some(ours) = ours {
+                    let range = lazies(ours, gaps(g));
+                    let (from, to) = text_shift(placed, g);
+                    for (&it, part) in ours.nodes[range.clone()].iter().zip(&ours.parts[range]) {
+                        nodes.push(moved(placed, g, it));
+                        parts.push(moved_part(part, &source, from, to));
+                    }
+                }
+                let theirs = placed.get(g).zip(subtree(g)).and_then(|(it, with)| Some((it, with, with.lazy.as_ref()?)));
+                if let Some((it, with, theirs)) = theirs {
+                    let start = u32::from(with.range(0).start());
+                    for (&at, part) in theirs.nodes.iter().zip(theirs.parts.iter()) {
+                        nodes.push(at + it.new_lo);
+                        parts.push(moved_part(part, &source, start, it.new_start));
+                    }
+                }
+            }
+            // alloc: as `nodes` above
+            Box::new(Lazy { nodes: nodes.into(), parts: parts.into(), expand, data })
+        });
+        self.kept_spliced(placed, splices, ancestors, kept, &mut spare.hashes);
+
+        // The columns made as they are written: each copy between the splices, then the
+        // splice's own, numbered in the new tree.
+        let words = splices_and_gaps.clone().flat_map(move |g| {
+            let (from, to) = gaps(g);
+            let spliced = placed.get(g).map(|it| match subtree(g) {
+                Some(with) => &with.words[..],
+                None => &self.words[it.lo as usize..it.hi as usize],
+            });
+            std::iter::once(&self.words[from as usize..to as usize]).chain(spliced)
+        });
+        let parents = splices_and_gaps.clone().map(|g| {
+            let (from, to) = gaps(g);
+            self.nodes_before(to) - self.nodes_before(from) + subtree(g).map_or(0, |it| it.node_parents.len())
+        });
+        let node_parents = splices_and_gaps.clone().flat_map(move |g| {
+            let (from, to) = gaps(g);
+            let ours = self.node_parents[self.nodes_before(from)..self.nodes_before(to)].iter();
+            let ours = ours.map(move |&it| match it {
+                NO_PARENT => NO_PARENT,
+                it if it >= from => moved(placed, g, it),
+                it => moved(placed, gap(placed, it), it),
+            });
+            let theirs = placed.get(g).zip(subtree(g)).into_iter().flat_map(move |(it, with)| {
+                let up = self.parent(it.lo).map_or(NO_PARENT, |up| moved(placed, gap(placed, up), up));
+                with.node_parents.iter().map(move |&at| match at {
+                    NO_PARENT => up,
+                    at => at + it.new_lo,
+                })
+            });
+            ours.chain(theirs)
+        });
+        let kinds_of = move |g: usize| {
+            let (from, to) = gaps(g);
+            let spliced = placed.get(g).map(|it| (it, self.spliced_kinds(it, subtree(g))));
+            (in_range(&self.kinds, from, to), spliced)
+        };
+        let kinds_count = splices_and_gaps.clone().map(|g| {
+            let (ours, spliced) = kinds_of(g);
+            ours.len() + spliced.map_or(0, |(_, (theirs, _))| theirs.len())
+        });
+        let kinds = splices_and_gaps.clone().flat_map(move |g| {
+            let (ours, spliced) = kinds_of(g);
+            let ours = ours.iter().map(move |&(it, kind)| (moved(placed, g, it), kind));
+            let theirs = spliced.into_iter().flat_map(|(it, (theirs, base))| {
+                theirs.iter().map(move |&(at, kind)| (at - base + it.new_lo, kind))
+            });
+            ours.chain(theirs)
+        });
+        // A start is a splice's, from its own tree's, or that of the element it was in the
+        // copies: a mark and up to seven lengths.
+        let marks = (0..=len / MARK).map(move |mark| {
+            let at = mark * MARK;
+            let g = placed.partition_point(|it| it.new_lo + it.added <= at);
+            match (placed.get(g).filter(|it| it.new_lo <= at), subtree(g)) {
+                (Some(it), Some(with)) => {
+                    with.offset(at - it.new_lo) - u32::from(with.range(0).start()) + it.new_start
+                }
+                (Some(it), None) => it.new_start,
+                (None, _) => {
+                    let old = match g {
+                        0 => at,
+                        g => at - (placed[g - 1].new_lo + placed[g - 1].added) + placed[g - 1].hi,
+                    };
+                    let (from, to) = text_shift(placed, g);
+                    self.offset(old) - from + to
+                }
+            }
+        });
+        let columns = Columns {
+            words: Joined(len as usize, words),
+            nodes: &spare.nodes,
+            node_parents: Made(parents.sum(), node_parents),
+            far: far.as_slice(),
+            kinds: Made(kinds_count.sum(), kinds),
+            big: big.as_slice(),
+            marks: Made((len / MARK + 1) as usize, marks),
+        };
+        let mut tree = FlatTree::pack(source, columns, lazy, kept.len(), |n| kept[n]);
+        for &(at, word) in patches.iter() {
+            tree.words[at as usize] = word;
+        }
+        tree
+    }
+
+    /// The tree with token `at`'s text replaced by `text` (its kind stays), over `source`, the
+    /// new whole text: `text` is `source` at the token's start, and the rest of the root's text
+    /// is as it was around it. No element but the token changes, so only its length and the
+    /// starts kept after it are written: every lazy node stays lazy and every part already
+    /// parsed is kept, those after the token moved to `source`.
+    pub fn replace_token(&self, at: u32, text: &str, source: Text) -> FlatTree {
+        self.splice_all(&[(at, Splice::Token(text))], source)
     }
 
     /// The lazy nodes, in preorder.
@@ -1671,6 +1958,7 @@ pub struct FlatTreeBuilder {
     /// The rest of the thread's buffers, given back with the others.
     opened: Vec<Open>,
     spare: Spare,
+    splicing: Splicing,
 }
 
 impl Default for FlatTreeBuilder {
@@ -1681,7 +1969,7 @@ impl Default for FlatTreeBuilder {
 
 impl FlatTreeBuilder {
     pub fn new() -> FlatTreeBuilder {
-        let Buffers { packer, marks, open, starts, lazies, kept, text, opened, spare } =
+        let Buffers { packer, marks, open, starts, lazies, kept, text, opened, spare, splicing } =
             Buffers::take();
         FlatTreeBuilder {
             text,
@@ -1697,6 +1985,7 @@ impl FlatTreeBuilder {
             kept,
             opened,
             spare,
+            splicing,
         }
     }
 
@@ -1859,9 +2148,9 @@ impl FlatTreeBuilder {
         radix::sort_copy_by_key_in(&mut self.kept, |it| it.0, &mut self.spare.hashes);
         let tree = self.packer.tree(source, &self.marks, &mut self.spare, lazy, &self.kept);
         let FlatTreeBuilder {
-            text, packer, marks, open, starts, lazies, kept, opened, spare, ..
+            text, packer, marks, open, starts, lazies, kept, opened, spare, splicing, ..
         } = self;
-        Buffers { packer, marks, open, starts, lazies, kept, text, opened, spare }.give();
+        Buffers { packer, marks, open, starts, lazies, kept, text, opened, spare, splicing }.give();
         tree
     }
 }
@@ -1880,7 +2169,7 @@ mod tests {
 
     use blaze_ids::rng::SplitMix64;
 
-    use super::{keeps, Expand, FlatTree, HUGE, LONG};
+    use super::{keeps, Expand, FlatTree, Splice, HUGE, LONG};
     use crate::{
         cursor::{SyntaxElement, SyntaxNode},
         FlatTreeBuilder, NodeOrToken, SyntaxKind, Text, TextRange, TextSize, TokenAtOffset,
@@ -2881,6 +3170,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(debug_assertions), ignore = "the text is compared under debug assertions")]
     #[should_panic(expected = "is not the old one")]
     fn a_token_is_replaced_only_by_its_text() {
         let shape = Shape::Node(
@@ -2908,6 +3198,103 @@ mod tests {
             same_arrays(&spliced, &built, seed);
             assert!((0..built.len()).all(|it| spliced.parent(it) == built.parent(it)));
             compare(&Model::new(&edited), &SyntaxNode::new_flat_root(Arc::new(spliced)), false, seed);
+        }
+    }
+
+    /// Disjoint subtrees and tokens spliced at once make the tree built anew from the edited
+    /// shape, and the tree the same replacements make one by one.
+    #[test]
+    fn splicing_many_at_once_is_replacing_them_one_by_one() {
+        for seed in 0..1000 {
+            let mut rng = SplitMix64::new(seed ^ 0x3c6e);
+            let mut shape = random_shape(seed);
+            let outline = seed % 2 == 1;
+            if outline {
+                make_lazy(&mut shape, &mut rng);
+            }
+            let tree = match outline {
+                true => build_outline(&shape, expand),
+                false => Arc::new(build_flat(&shape, seed % 4 == 2)),
+            };
+            for (i, at) in tree.lazies().enumerate() {
+                if i % 2 == 0 {
+                    let _ = tree.part(at);
+                }
+            }
+            // Each pick past the subtree of the one before, the first maybe the root.
+            let (mut picks, mut next) = (Vec::new(), rng.below(3) as u32);
+            while next < tree.len() && picks.len() < 6 {
+                picks.push(next);
+                next = tree.end(next) + rng.below(4) as u32;
+            }
+            let edits: Vec<(u32, Shape, Option<Arc<FlatTree>>)> = (picks.iter())
+                .map(|&at| match tree.is_token(at) {
+                    true => {
+                        let text = match rng.below(4) {
+                            0 => String::new(),
+                            1 => "x".into(),
+                            2 => "y".repeat(LONG as usize + rng.below(3) as usize),
+                            _ => "é".into(),
+                        };
+                        (at, Shape::Token(tree.kind(at), text), None)
+                    }
+                    false => {
+                        let mut with = random_shape(seed * 8 + at as u64 + 40_000);
+                        if let Shape::Node(kind, ..) = &mut with {
+                            *kind = tree.kind(at);
+                        }
+                        if outline && rng.below(2) == 0 {
+                            make_lazy(&mut with, &mut rng);
+                        }
+                        let built = build_outline(&with, expand);
+                        (at, with, Some(built))
+                    }
+                })
+                .collect();
+            let splices: Vec<(u32, Splice<'_>)> = (edits.iter())
+                .map(|(at, with, built)| match (with, built) {
+                    (_, Some(built)) => (*at, Splice::Subtree(built)),
+                    (Shape::Token(_, text), None) => (*at, Splice::Token(text)),
+                    (Shape::Node(..), None) => panic!("a node's edit is built"),
+                })
+                .collect();
+            let mut edited = shape.clone();
+            for (at, with, _) in edits.iter().rev() {
+                edited = replaced(&edited, *at, with, &mut 0);
+            }
+            let mut text = String::new();
+            text_of(&edited, &mut text);
+            let at_once = tree.splice_all(&splices, text.into());
+            let built = match outline {
+                true => build_outline(&edited, expand),
+                false => Arc::new(build_flat(&edited, false)),
+            };
+            same_arrays(&at_once, &built, seed);
+            for it in 0..built.len() {
+                assert_eq!(
+                    (at_once.parent(it), at_once.range(it), at_once.end(it), at_once.is_lazy(it)),
+                    (built.parent(it), built.range(it), built.end(it), built.is_lazy(it)),
+                    "seed {seed}, element {it}"
+                );
+            }
+            assert!(at_once.lazies().eq(built.lazies()));
+            for it in at_once.lazies() {
+                assert_eq!(at_once.part(it), built.part(it), "seed {seed}, lazy {it}");
+                assert_eq!(at_once.part_errors(it), &expanded_errors(&at_once, it)[..]);
+            }
+            let (mut step, mut stepped) = (shape, tree);
+            for &(at, splice) in splices.iter().rev() {
+                let (_, with, _) = edits.iter().find(|it| it.0 == at).unwrap();
+                step = replaced(&step, at, with, &mut 0);
+                let mut text = String::new();
+                text_of(&step, &mut text);
+                stepped = Arc::new(match splice {
+                    Splice::Subtree(with) => stepped.replace_subtree(at, with, text.into()),
+                    Splice::Token(with) => stepped.replace_token(at, with, text.into()),
+                });
+            }
+            same_arrays(&at_once, &stepped, seed);
+            compare(&Model::new(&edited), &SyntaxNode::new_flat_root(Arc::new(at_once)), false, seed);
         }
     }
 

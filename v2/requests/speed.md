@@ -169,6 +169,21 @@ stays 16 scalar loads, selects and stores (`mod.rs` `llvm_intrinsic`, `x86.ssse3
 LLVM emits one `pshufb`. With the per-function ISA, `admits(Vectors::Sse2, ..)` becomes
 `admits(Vectors::X86(features), ..)` (mine to write) and that arm `x86_pshufb`.
 
+> applied by codegen-rq-features (2026-10-29, not built), sharing the keying of fc-host's ask in
+> `v2/requests/codegen.md`: `crate::Features` numbers a sorted set (`Target::features_of`), and
+> `crate::target_of(features, kind, speed)` keeps one ISA per set, made on first use with each
+> of the set's Cranelift settings (`Target::isa`, the `X86_FEATURES` table: `has_ssse3`,
+> `has_sse41`, `has_sse42`, `has_avx`, `has_avx2`, `has_fma`, `has_bmi1`, `has_bmi2`,
+> `has_popcnt`, `has_lzcnt`, the AVX-512 ones). A v2 function's set is its unit's
+> `Toolchain::features` with what its `#[target_feature(enable)]` turns on and implies
+> (`v2/backend.rs` `features`, through `hir_ty::TargetFeatures::from_fn`; a closure has its
+> function's, a vtable or reify shim its item's). It is `Function::features`, it is in the
+> function's shape (`v2/shape.rs` part `FEATURES`), and `emit_lent(ctx, speed, features)`
+> compiles with that set's ISA. Left to you: the IR builder's `Vectors::X86(features)`. While
+> it builds, the function's set is `TargetFeatures::from_fn` of the function plus the unit's,
+> which is what `v2/backend.rs` `features` computes, so the vectors it picks match the ISA the
+> function is compiled with. v1's `compile_as` callers keep the baseline (`Features::BASELINE`).
+
 ### 2. Vendor cranelift-codegen and add vector reductions
 
 What: vendor `cranelift-codegen` 0.136.2 (and its `-meta`, `-shared`) under `vendor/` with a
@@ -186,6 +201,8 @@ where LLVM emits `umaxv` + `fmov` (2). Without the op, Cranelift cannot express 
 ## speed-backend-code
 
 > forwarded to codegen: only `hashbrown.workspace = true` in `crates/hir-ty-codegen/Cargo.toml` is asked; the root has `hashbrown` 0.17 already.
+
+> applied by codegen: `hashbrown.workspace = true` is in `crates/hir-ty-codegen/Cargo.toml` (line 21).
 
 ### `hashbrown` in `crates/hir-ty-codegen/Cargo.toml` (2026-10-29)
 

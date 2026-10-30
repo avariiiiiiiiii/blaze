@@ -398,6 +398,7 @@ fn kind(kind: MemKind) -> Kind {
         MemKind::Global => Kind::Global,
         MemKind::ConstHeap => Kind::ConstHeap,
         MemKind::Machine => Kind::Machine,
+        MemKind::Mmap => Kind::Mmap,
     }
 }
 
@@ -435,7 +436,7 @@ impl<'db> Machine<'db> for Checker<'db> {
             Err(e) => return Err(self.fail(e.into())),
         };
         let stack_of = match mem_kind {
-            MemKind::Stack | MemKind::Rust | MemKind::C => Some(self.thread),
+            MemKind::Stack | MemKind::Rust | MemKind::C | MemKind::Mmap => Some(self.thread),
             MemKind::Global | MemKind::ConstHeap | MemKind::Machine => None,
         };
         self.races.new_alloc(alloc, size, stack_of);
@@ -577,6 +578,13 @@ impl<'db> Machine<'db> for Checker<'db> {
     // wildcard, resolved at each access to the exposed allocation the address is in.
     fn from_exposed(&mut self, _addr: u64) -> Option<Prov> {
         Some(Prov::Wildcard)
+    }
+
+    // Miri: intern.rs, `intern_const_alloc_recursive`: interned globals are `Mutability::Not`.
+    fn freeze(&mut self, addr: u64) {
+        if let Some(alloc) = self.mem.live_at(addr) {
+            self.mem.set_immutable(alloc);
+        }
     }
 
     // Miri: machine.rs, `after_stack_push` and `before_stack_pop` (`on_stack_pop`).

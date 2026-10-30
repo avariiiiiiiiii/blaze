@@ -116,6 +116,17 @@ fits in, and costs, the depth the search graph would give it
 (`docs/v2/plan/lanes/frontend/fast-trait.md`, "Depth"; `v2/requests/db-ty.md`, "the shape table
 charges search-graph depth as rustc does").
 
+### 0008-def-id-is-local
+
+What: `inherent::DefId::is_local(self, cx: I) -> bool`: it takes the interner.
+`rustc_next_trait_solver`'s patch `0006-def-id-is-local` passes it at coherence's two calls.
+
+Why: rustc compares an id's crate with `LOCAL_CRATE`, a constant of the session. blaze's ids
+carry their crate, but one database checks many crates, so the crate being checked is the
+interner's (`DbInterner::krate`) and an id alone can't say whether it is local. Without it every
+trait ref counted as local, and coherence (`TypingMode::Coherence`) never saw an upstream or
+downstream crate's possible impl.
+
 ## Dropped since the previous base (ra-ap-rustc_type_ir 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#159228 (the retry with twice the recursion limit:

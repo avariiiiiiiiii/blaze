@@ -5,14 +5,18 @@
 //! valtree.
 
 use hir_ty::db::HirDatabase;
-use std::cell::Cell;
+use std::{cell::Cell, ops::ControlFlow};
+
+use base_db::Db;
 
 use hir_def::{
-    AdtId, ConstId, DefWithBodyId, HasModule, VariantId,
+    AdtId, ConstId, DefWithBodyId, HasModule, TraitId, VariantId,
+    attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplTrait,
     expr_store::{Body, HygieneId, path::Path, scope::ExprScopes},
     hir::{Expr, ExprId, ExprOrPatId, Literal, Pat as HirPat, PatId, RangeOp, UnaryOp},
     resolver::{Resolver, ValueNs, resolver_for_scope},
+    signatures::ImplSignature,
 };
 use intern::Symbol;
 use rustc_apfloat::{
@@ -23,21 +27,27 @@ use rustc_pattern_analysis::{
     constructor::{Constructor, IntRange, MaybeInfiniteInt, OpaqueId, RangeEnd, Slice, SliceKind},
     pat::{DeconstructedPat, IndexedPat},
 };
-use rustc_type_ir::{FloatTy, inherent::IntoKind};
+use rustc_type_ir::{
+    FloatTy, Interner as _, TraitRef, TypeSuperVisitable, TypeVisitable, TypeVisitor,
+    inherent::IntoKind,
+};
 use smallvec::{SmallVec, smallvec};
 
 use hir_ty::{
-    BindingMode, ByRef, InferenceResult, MemoryMap, ParamEnvAndCrate,
+    BindingMode, ByRef, InferenceResult, MemoryMap, ParamEnvAndCrate, Span,
     consteval::try_const_usize,
     infer::PatAdjust,
     method_resolution::CandidateId,
-    next_solver::{Allocation, GenericArgs, Ty, TyKind},
+    next_solver::{
+        Allocation, AnyImplId, DbInterner, GenericArgs, StoredTy, Ty, TyKind,
+        infer::traits::ObligationCause,
+    },
     traits::{implements_trait_unique, implements_trait_unique_with_args},
     utils::detect_variant_from_bytes,
 };
 
 use crate::{
-    ConstPatternError,
+    ConstPatternError, ManualPartialEq,
     cx::{Cx, VariantIdx},
 };
 
@@ -74,6 +84,68 @@ impl Refusals {
         if !refused {
             self.pat.push(error);
         }
+    }
+}
+
+/// rustc's `PartialEqImplStatus` of an ADT, from `type_has_partial_eq_impl`.
+struct PartialEqStatus {
+    /// A `PartialEq` impl applies to the type.
+    has_impl: bool,
+    /// The last impl for the type, `non_blanket_impl`, is derived.
+    is_derived: bool,
+    non_blanket_impl: Option<AnyImplId>,
+    /// A `StructuralPartialEq` impl matches the type, its bounds aside.
+    possibly_inapplicable_structural: bool,
+    /// A derived `PartialEq` impl matches the type, its bounds aside.
+    possibly_inapplicable_derived: bool,
+}
+
+/// `extend_type_not_partial_eq`'s visitor: the ADTs in a type, by why they keep it from being
+/// `PartialEq`.
+struct PartialEqFacts<'l, 'c, 'a, 'db> {
+    lowerer: &'l Lowerer<'c, 'a, 'db>,
+    local_manual: Vec<ManualPartialEq>,
+    local_without: Vec<AdtId>,
+    manual: Vec<Ty<'db>>,
+    without: Vec<Ty<'db>>,
+}
+
+fn push_new<T: PartialEq>(list: &mut Vec<T>, item: T) {
+    if !list.contains(&item) {
+        list.push(item); // alloc: a refused constant's notes, made once the error fires.
+    }
+}
+
+impl<'db> TypeVisitor<DbInterner<'db>> for PartialEqFacts<'_, '_, '_, 'db> {
+    type Result = ControlFlow<()>;
+
+    fn visit_ty(&mut self, ty: Ty<'db>) -> ControlFlow<()> {
+        match ty.kind() {
+            TyKind::Dynamic(..) | TyKind::UnsafeBinder(..) => return ControlFlow::Break(()),
+            TyKind::FnPtr(..) => return ControlFlow::Continue(()),
+            TyKind::Adt(def, _) => {
+                let cx = self.lowerer.cx;
+                let adt = def.def_id();
+                let local_adt = adt.krate(cx.db) == cx.krate;
+                let status = self.lowerer.partial_eq_status(ty, adt);
+                let manual = status.has_impl && !status.is_derived;
+                match status.non_blanket_impl {
+                    _ if status.possibly_inapplicable_structural => {}
+                    Some(AnyImplId::ImplId(impl_)) if manual && impl_.krate(cx.db) == cx.krate => {
+                        push_new(&mut self.local_manual, ManualPartialEq::Impl(impl_))
+                    }
+                    _ if manual && local_adt => {
+                        push_new(&mut self.local_manual, ManualPartialEq::Adt(adt))
+                    }
+                    _ if !status.has_impl && local_adt => push_new(&mut self.local_without, adt),
+                    _ if manual => push_new(&mut self.manual, ty),
+                    _ if !status.has_impl => push_new(&mut self.without, ty),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        ty.super_visit_with(self)
     }
 }
 
@@ -411,7 +483,7 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
             Refusals { valtree: Some(error), .. } => smallvec![error],
             Refusals { pat: errors, .. } if !errors.is_empty() => errors,
             // alloc: as above.
-            _ if !self.has_partial_eq(ty, 0) => smallvec![ConstPatternError::NotPartialEq(ty.store())],
+            _ if !self.has_partial_eq(ty, 0) => smallvec![self.not_partial_eq(ty)],
             _ => return Ok(lowered),
         };
         Err(LowerError::ConstPattern { pat, errors })
@@ -454,22 +526,124 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
     }
 
     /// `type_marked_structural`: the ADT implements `StructuralPartialEq`, which
-    /// `#[derive(PartialEq)]` implements for every argument. The front end records a builtin
-    /// derive as the derive, not as the impls it expands to, so the derive is looked for too.
+    /// `#[derive(PartialEq)]` implements for every argument.
     fn is_structural(&self, ty: Ty<'db>, adt: AdtId) -> bool {
-        let db = self.cx.db;
-        let module = adt.module(db);
-        let derived = module.def_map(db).module(db, module).scope(db).builtin_derive_impls().any(
-            |derive| {
-                let loc = derive.loc(db);
-                loc.adt == adt && loc.trait_ == BuiltinDeriveImplTrait::PartialEq
-            },
-        );
-        derived
+        self.builtin_derives_partial_eq(adt)
             || self.cx.infcx.interner.lang_items().StructuralPeq.is_some_and(|structural| {
                 let env = ParamEnvAndCrate { param_env: self.cx.env, krate: self.cx.krate };
-                implements_trait_unique(ty, db, env, structural)
+                implements_trait_unique(ty, self.cx.db, env, structural)
             })
+    }
+
+    /// The front end records a builtin derive as the derive, not as the impls it expands to,
+    /// so its `StructuralPartialEq` impl is the recorded derive.
+    fn builtin_derives_partial_eq(&self, adt: AdtId) -> bool {
+        let db = self.cx.db;
+        let module = adt.module(db);
+        module.def_map(db).module(db, module).scope(db).builtin_derive_impls().any(|derive| {
+            let loc = derive.loc(db);
+            loc.adt == adt && loc.trait_ == BuiltinDeriveImplTrait::PartialEq
+        })
+    }
+
+    /// `type_has_partial_eq_impl` of `ty`, an instance of `adt`.
+    fn partial_eq_status(&self, ty: Ty<'db>, adt: AdtId) -> PartialEqStatus {
+        let db = self.cx.db;
+        let lang = self.cx.infcx.interner.lang_items();
+        let mut status = PartialEqStatus {
+            has_impl: self.has_partial_eq(ty, 0),
+            is_derived: false,
+            non_blanket_impl: None,
+            possibly_inapplicable_structural: self.builtin_derives_partial_eq(adt)
+                || lang.StructuralPeq.is_some_and(|structural| {
+                    self.any_impl_matches(structural, GenericArgs::new_from_slice(&[ty.into()]))
+                }),
+            possibly_inapplicable_derived: false,
+        };
+        let Some(partial_eq) = lang.PartialEq else { return status };
+        let args = GenericArgs::new_from_slice(&[ty.into(), ty.into()]);
+        let interner = self.cx.infcx.interner;
+        let goal = TraitRef::new_from_args(interner, partial_eq.into(), args);
+        interner.for_each_relevant_impl(goal, |impl_| {
+            let derived = match impl_ {
+                AnyImplId::BuiltinDeriveImplId(_) => true,
+                AnyImplId::ImplId(id) => {
+                    AttrFlags::query(db, id.into()).contains(AttrFlags::AUTOMATICALLY_DERIVED)
+                }
+            };
+            if derived && !status.possibly_inapplicable_derived {
+                status.possibly_inapplicable_derived = self.impl_matches(impl_, goal);
+            }
+            if !is_blanket(db, impl_) {
+                status.is_derived = derived;
+                status.non_blanket_impl = Some(impl_);
+            }
+        });
+        status
+    }
+
+    /// Whether an impl of `trait_` matches `trait_(args)`, its bounds aside.
+    fn any_impl_matches(&self, trait_: TraitId, args: GenericArgs<'db>) -> bool {
+        let interner = self.cx.infcx.interner;
+        let goal = TraitRef::new_from_args(interner, trait_.into(), args);
+        let mut found = false;
+        interner.for_each_relevant_impl(goal, |impl_| {
+            found = found || self.impl_matches(impl_, goal);
+        });
+        found
+    }
+
+    /// Whether `impl_` matches `goal` as `compute_applicable_impls_for_diagnostics` asks with
+    /// `ignore_predicates_of_impls`: its trait ref unifies with `goal` and it is positive.
+    fn impl_matches(&self, impl_: AnyImplId, goal: TraitRef<DbInterner<'db>>) -> bool {
+        let db = self.cx.db;
+        let infcx = self.cx.infcx;
+        match impl_ {
+            // A derive is generic over every parameter of its ADT, with `Self` as `Rhs`.
+            AnyImplId::BuiltinDeriveImplId(_) => true,
+            AnyImplId::ImplId(id) => {
+                !ImplSignature::of(db, id).is_negative()
+                    && db.impl_trait(id).is_some_and(|trait_ref| {
+                        infcx.probe(|_| {
+                            let args = infcx.fresh_args_for_item(Span::Dummy, id.into());
+                            let trait_ref =
+                                trait_ref.instantiate(infcx.interner, args).skip_norm_wip();
+                            let at = infcx.at(&ObligationCause::dummy(), self.cx.env);
+                            at.eq(goal, trait_ref).is_ok()
+                        })
+                    })
+            }
+        }
+    }
+
+    /// `TypeNotPartialEq` of `ty`, with what `extend_type_not_partial_eq` finds in it.
+    fn not_partial_eq(&self, ty: Ty<'db>) -> ConstPatternError {
+        let mut facts = PartialEqFacts {
+            lowerer: self,
+            local_manual: Vec::new(), // alloc: none until `push_new`.
+            local_without: Vec::new(), // alloc: as above.
+            manual: Vec::new(),        // alloc: as above.
+            without: Vec::new(),       // alloc: as above.
+        };
+        let store = |tys: Vec<Ty<'db>>| -> Box<[StoredTy]> {
+            tys.into_iter().map(|ty| ty.store()).collect() // alloc: as `push_new`.
+        };
+        if ty.visit_with(&mut facts).is_break() {
+            return ConstPatternError::NotPartialEq {
+                ty: ty.store(),
+                local_manual: Box::default(),
+                local_without: Box::default(),
+                manual: Box::default(),
+                without: Box::default(),
+            };
+        }
+        ConstPatternError::NotPartialEq {
+            ty: ty.store(),
+            local_manual: facts.local_manual.into_boxed_slice(),
+            local_without: facts.local_without.into_boxed_slice(),
+            manual: store(facts.manual),
+            without: store(facts.without),
+        }
     }
 
     fn layout_size(&self, ty: Ty<'db>) -> Result<usize, LowerError> {
@@ -518,7 +692,17 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                     && !refused
                     && !self.is_structural(ty, def.def_id()) =>
             {
-                refusals.pat(refused, ConstPatternError::NotStructural(ty.store()));
+                let status = self.partial_eq_status(ty, def.def_id());
+                // A derived `PartialEq` that doesn't apply is the error, not the missing derive.
+                let error = if status.possibly_inapplicable_derived && !status.has_impl {
+                    self.not_partial_eq(ty)
+                } else {
+                    ConstPatternError::NotStructural {
+                        ty: ty.store(),
+                        inapplicable_structural: status.possibly_inapplicable_structural,
+                    }
+                };
+                refusals.pat(refused, error);
                 return self.value_pat(pat, ty, bytes, map, depth, refusals, true);
             }
             TyKind::Tuple(tys) => {
@@ -875,6 +1059,16 @@ fn float_range_is_valid(ctor: &Constructor<Cx<'_, '_>>) -> bool {
         Constructor::F64Range(lo, hi, end) => valid(lo, hi, *end),
         Constructor::F128Range(lo, hi, end) => valid(lo, hi, *end),
         _ => true,
+    }
+}
+
+/// A blanket impl: its self type is one of its parameters.
+fn is_blanket(db: &Db, impl_: AnyImplId) -> bool {
+    match impl_ {
+        AnyImplId::BuiltinDeriveImplId(_) => false,
+        AnyImplId::ImplId(id) => db.impl_trait(id).is_some_and(|trait_ref| {
+            matches!(trait_ref.skip_binder().self_ty().kind(), TyKind::Param(_))
+        }),
     }
 }
 

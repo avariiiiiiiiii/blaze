@@ -1,6 +1,6 @@
 //! The roots of each kind of unit over fixtures.
 
-use blaze_codegen::settings::Panic;
+use blaze_codegen::{plan::Mode, settings::Panic};
 use hir_def::{AssocItemId, test_items};
 use test_fixture::WithFixture;
 
@@ -21,11 +21,15 @@ const FORK_SERVER: &str = "\n    pub mod fork_server {\n        \
      }\n    \
      }\n";
 
+fn fork_server(_: bool) -> &'static str {
+    FORK_SERVER
+}
+
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(fixture: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(TestDB::with_files(fixture)));
     let frontend =
-        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime(Default::default()));
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
     (db, frontend)
 }
 
@@ -49,7 +53,7 @@ fn function(db: &TestDB, frontend: &HirFrontend<'_>, name: &str) -> HirInstance 
 /// root file.
 fn with_harness(fixture: &str) -> String {
     let (db, frontend) = frontend(fixture);
-    let harness = frontend.harness(db.test_crate(), Panic::Unwind, FORK_SERVER);
+    let harness = frontend.harness(db.test_crate(), Panic::Unwind, Mode::Output, fork_server);
     let harness = harness.expect("a harness").expect("the crate has `cfg(test)`");
     format!("{fixture}{harness}")
 }
@@ -206,7 +210,7 @@ fn a_crate_with_tests_and_no_harness_is_refused() {
 #[test]
 fn a_harness_with_panic_abort_is_refused() {
     let (db, frontend) = frontend("//- /lib.rs crate:main cfg:test\n#[test]\nfn a() {}\n");
-    let what = frontend.harness(db.test_crate(), Panic::Abort, FORK_SERVER).expect_err("refused");
+    let what = frontend.harness(db.test_crate(), Panic::Abort, Mode::Output, fork_server).expect_err("refused");
     assert!(what.what.contains("-Zpanic-abort-tests"), "{}", what.what);
 }
 
@@ -242,7 +246,7 @@ fn a_proc_macro_crate_needs_to_be_one() {
 fn the_text_on_disk_is_before_what_blaze_appends() {
     let fixture = "//- /lib.rs crate:main cfg:test\n#[test]\nfn a() {}\n";
     let (db, frontend) = frontend(fixture);
-    let harness = frontend.harness(db.test_crate(), Panic::Unwind, FORK_SERVER);
+    let harness = frontend.harness(db.test_crate(), Panic::Unwind, Mode::Output, fork_server);
     let harness = harness.expect("a harness").expect("cfg(test)");
     let text = format!("fn a() {{}}\n{harness}");
     assert_eq!(HirFrontend::on_disk(&text), "fn a() {}\n");
@@ -252,6 +256,24 @@ fn the_text_on_disk_is_before_what_blaze_appends() {
 #[test]
 fn a_crate_without_cfg_test_has_no_harness() {
     let (db, frontend) = frontend("//- /main.rs crate:main\nfn main() {}\n");
-    let harness = frontend.harness(db.test_crate(), Panic::Unwind, FORK_SERVER);
+    let harness = frontend.harness(db.test_crate(), Panic::Unwind, Mode::Output, fork_server);
     assert_eq!(harness.expect("no refusal"), None);
+}
+
+/// A binary with jump-table slots asks for the fork server that records what each test ran.
+#[test]
+fn a_harness_records_where_its_binary_has_slots() {
+    let (db, frontend) = frontend("//- /lib.rs crate:main cfg:test\n#[test]\nfn a() {}\n");
+    let asked = |record: bool| -> &'static str {
+        match record {
+            true => "\n    // recorded\n",
+            false => "\n    // unrecorded\n",
+        }
+    };
+    for (mode, record) in [(Mode::Output, false), (Mode::Live, true), (Mode::Tiered, true)] {
+        let harness = frontend.harness(db.test_crate(), Panic::Unwind, mode, asked);
+        let harness = harness.expect("a harness").expect("cfg(test)");
+        let wanted = if record { "// recorded" } else { "// unrecorded" };
+        assert!(harness.contains(wanted), "{mode:?}: {harness}");
+    }
 }

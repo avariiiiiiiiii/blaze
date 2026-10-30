@@ -11,7 +11,7 @@ use std::fmt;
 
 /// Bumped with any change to what a shape means or which shapes exist: the library's header
 /// carries it, and a library of another version is refused.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// The registers the stencils' convention (`preserve_none`) passes `frame` and `acc` in, by
 /// hardware number. The generator checks LLVM's choice against these (its probe stencil), and
@@ -415,6 +415,59 @@ impl RmwOp {
     }
 }
 
+/// How a confined access ([`Op::LoadConfined`], [`Op::StoreConfined`]) adds its offset to
+/// the 32-bit address: `aux` bits 5..7.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum Disp {
+    /// The offset is 0: no add.
+    Zero,
+    /// An `add` of the `Offset` hole's low 12 bits, for an offset of 1 to 4095: AArch64's
+    /// `add #:lo12:`.
+    Lo12,
+    /// An `add` of all 32 bits of the `Offset` hole.
+    Imm32,
+}
+
+impl Disp {
+    pub const fn from_u8(it: u8) -> Option<Disp> {
+        match it {
+            0 => Some(Disp::Zero),
+            1 => Some(Disp::Lo12),
+            2 => Some(Disp::Imm32),
+            _ => None,
+        }
+    }
+
+    /// Whether `isa`'s library has it: x86-64's `lea` takes any 32-bit offset as one
+    /// instruction, so it has no `Lo12`.
+    pub const fn on(self, isa: Isa) -> bool {
+        !matches!((self, isa), (Disp::Lo12, Isa::X86_64))
+    }
+}
+
+/// The loads [`Op::LoadConfined`] fuses, by their number in its `aux`'s low 5 bits.
+pub const CONFINED_LOADS: [Op; 14] = [
+    Op::Load,
+    Op::Uload8,
+    Op::Sload8,
+    Op::Uload16,
+    Op::Sload16,
+    Op::Uload32,
+    Op::Sload32,
+    Op::Uload8x8,
+    Op::Sload8x8,
+    Op::Uload16x4,
+    Op::Sload16x4,
+    Op::Uload32x2,
+    Op::Sload32x2,
+    Op::AtomicLoad,
+];
+
+/// The stores [`Op::StoreConfined`] fuses, likewise.
+pub const CONFINED_STORES: [Op; 5] =
+    [Op::Store, Op::Istore8, Op::Istore16, Op::Istore32, Op::AtomicStore];
+
 /// The instruction set a library is of: which part of the set has stencils
 /// ([`Op::on`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -430,8 +483,9 @@ impl Isa {
 /// The operation of a stencil: Cranelift's opcodes that a stencil implements, with the
 /// `_imm` forms folded into their base op (an [`Src::Imm`] operand), `select_spectre_guard`
 /// into [`Op::Select`], `stack_addr` kept as a frame-relative op, and the fusions
-/// [`Op::BrIcmp`] and [`Op::SelectIcmp`]. Opcodes not here are the glue's (`arch::Glue`) or
-/// refused with an error naming them (`patch/select.rs`).
+/// [`Op::BrIcmp`], [`Op::SelectIcmp`], [`Op::LoadConfined`] and [`Op::StoreConfined`]. Opcodes
+/// not here are the glue's (`arch::Glue`) or refused with an error naming them
+/// (`patch/select.rs`).
 ///
 /// Operand types are [`Shape::arg`]'s and result types [`Shape::result`]'s. The amount of a
 /// shift or rotate (operand 1) is read as its low 8 bits, so any integer type of amount takes
@@ -613,6 +667,14 @@ pub enum Op {
     AtomicRmw,
     AtomicCas,
     Fence,
+    /// A load at `iadd vmctx, uextend.i64 (ireduce.i32 (iadd_imm p, off))` with offset 0, the
+    /// address of the macro tier's confinement: operands `[p, vmctx]`. `aux` is the load's
+    /// number in [`CONFINED_LOADS`] in its low 5 bits and the [`Disp`] of `off` (the `Offset`
+    /// hole) above; `ty` is the plain load's.
+    LoadConfined,
+    /// A store at the same address: operands `[x, p, vmctx]`, `aux` from
+    /// [`CONFINED_STORES`].
+    StoreConfined,
     // Control.
     /// To `Next`.
     Jump,
@@ -684,6 +746,8 @@ pub enum Aux {
     Rmw,
     /// 0 for a 32-bit immediate sign-extended, 1 for one of 64 bits (64-bit types only).
     Wide,
+    /// A confined access and its [`Disp`] ([`Op::LoadConfined`], [`Op::StoreConfined`]).
+    Confined,
 }
 
 /// What an op takes and gives, and which shapes of it exist.
@@ -947,6 +1011,12 @@ const TABLE: [Info; Op::Trapnz as usize + 1] = [
     Info::new(Op::AtomicRmw, "atomic_rmw", 2, 1, TySet::INTS).aux(Aux::Rmw).imm(0b10).no_acc(),
     Info::new(Op::AtomicCas, "atomic_cas", 3, 1, TySet::INTS_WIDE).no_acc(),
     Info::new(Op::Fence, "fence", 0, 0, I8),
+    // `vmctx` lives across the whole function: never in an accumulator.
+    Info::new(Op::LoadConfined, "load_confined", 2, 1, TySet::ALL).aux(Aux::Confined).acc(0b01),
+    Info::new(Op::StoreConfined, "store_confined", 3, 0, TySet::ALL)
+        .aux(Aux::Confined)
+        .imm(0b001)
+        .acc(0b011),
     Info::new(Op::Jump, "jump", 0, 0, I8),
     Info::new(Op::Brif, "brif", 1, 0, TySet::INTS_WIDE).branches(),
     Info::new(Op::BrIcmp, "br_icmp", 2, 0, TySet::INTS_WIDE).imm(0b10).aux(Aux::IntCc).branches(),
@@ -1055,10 +1125,12 @@ impl Shape {
             | Op::Sload16x4
             | Op::Uload32x2
             | Op::Sload32x2
-            | Op::AtomicLoad => Ty::I64,
+            | Op::AtomicLoad
+            | Op::LoadConfined => Ty::I64,
             Op::Store | Op::Istore8 | Op::Istore16 | Op::Istore32 | Op::AtomicStore if n == 1 => {
                 Ty::I64
             }
+            Op::StoreConfined if n > 0 => Ty::I64,
             Op::AtomicRmw | Op::AtomicCas if n == 0 => Ty::I64,
             Op::UaddOverflowCin | Op::SaddOverflowCin | Op::UsubOverflowBin | Op::SsubOverflowBin
                 if n == 2 =>
@@ -1096,6 +1168,30 @@ impl Shape {
         }
     }
 
+    /// The plain access a confined op fuses and how it adds its offset; `None` for any other
+    /// op, or an `aux` that names none.
+    pub fn confined(self) -> Option<(Op, Disp)> {
+        let accesses: &[Op] = match self.op {
+            Op::LoadConfined => &CONFINED_LOADS,
+            Op::StoreConfined => &CONFINED_STORES,
+            _ => return None,
+        };
+        let access = *accesses.get(usize::from(self.aux & 0x1f))?;
+        Some((access, Disp::from_u8(self.aux >> 5)?))
+    }
+
+    /// The confined op of the plain access `access` with its offset added as `disp`: its op and
+    /// `aux`; `None` when no confined op fuses `access`.
+    pub fn confining(access: Op, disp: Disp) -> Option<(Op, u8)> {
+        let (op, accesses): (Op, &[Op]) = if CONFINED_LOADS.contains(&access) {
+            (Op::LoadConfined, &CONFINED_LOADS)
+        } else {
+            (Op::StoreConfined, &CONFINED_STORES)
+        };
+        let at = accesses.iter().position(|it| *it == access)?;
+        Some((op, at as u8 | (disp as u8) << 5))
+    }
+
     /// Whether `aux` is one of the op's for the type.
     fn aux_ok(self) -> bool {
         let info = self.op.info();
@@ -1108,6 +1204,9 @@ impl Shape {
             Aux::Lane => aux < ty.lanes(),
             Aux::Rmw => aux < RmwOp::COUNT,
             Aux::Wide => aux == 0 || (aux == 1 && ty.bytes() == 8),
+            Aux::Confined => {
+                self.confined().is_some_and(|(access, _)| access.info().tys.contains(ty))
+            }
             Aux::Ty(set) => {
                 let Some(src) = Ty::from_u8(aux) else { return false };
                 set.contains(src)
@@ -1142,6 +1241,11 @@ impl Shape {
     pub fn exists_on(self, isa: Isa) -> bool {
         let info = self.op.info();
         if !self.op.on(isa) || !info.tys.contains(self.ty) || !self.aux_ok() {
+            return false;
+        }
+        if let Some((_, disp)) = self.confined()
+            && !disp.on(isa)
+        {
             return false;
         }
         let mut accs = 0;
@@ -1181,6 +1285,12 @@ impl Shape {
         }
         // `select` of a condition wider than the `i8` an `icmp` gives is rare: base only.
         if self.op == Op::Select && self.aux != Ty::I8 as u8 {
+            return false;
+        }
+        // A confined atomic takes its operands from slots, as the plain one does.
+        if let Some((access, _)) = self.confined()
+            && access.info().acc == 0
+        {
             return false;
         }
         if self.dst == Dst::Both {
@@ -1234,6 +1344,7 @@ fn auxes(info: &Info, ty: Ty) -> impl Iterator<Item = u8> {
         Aux::Ty(_) => (0, Ty::ALL.len() as u8),
         Aux::Rmw => (0, RmwOp::COUNT),
         Aux::Wide => (0, 2),
+        Aux::Confined => (0, 3 << 5),
     };
     start..end
 }
@@ -1348,6 +1459,8 @@ mod tests {
             Op::Bitcast,
             Op::Load,
             Op::Store,
+            Op::LoadConfined,
+            Op::StoreConfined,
         ];
         each(|shape| {
             if matches!(shape.ty, Ty::F16 | Ty::F128) {
@@ -1405,6 +1518,28 @@ mod tests {
                 dst: Dst::None,
             };
             assert!(shape.exists(), "{shape}");
+        }
+    }
+
+    #[test]
+    fn confined_ops_name_each_access_and_how_it_adds_its_offset() {
+        for access in CONFINED_LOADS.into_iter().chain(CONFINED_STORES) {
+            for disp in [Disp::Zero, Disp::Lo12, Disp::Imm32] {
+                let (op, aux) = Shape::confining(access, disp).unwrap();
+                let shape = Shape { op, ty: Ty::I64, aux, srcs: [Src::None; 3], dst: Dst::None };
+                assert_eq!(shape.confined(), Some((access, disp)), "{shape}");
+            }
+        }
+        assert_eq!(Shape::confining(Op::Iadd, Disp::Zero), None);
+        for isa in Isa::ALL {
+            let mut lo12 = false;
+            each_on(isa, |shape| {
+                let Some((access, disp)) = shape.confined() else { return };
+                assert!(disp.on(isa), "{shape} on {isa:?}");
+                assert!(access.info().tys.contains(shape.ty), "{shape}");
+                lo12 |= disp == Disp::Lo12;
+            });
+            assert_eq!(lo12, isa == Isa::Aarch64, "{isa:?}");
         }
     }
 

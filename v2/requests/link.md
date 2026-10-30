@@ -335,6 +335,10 @@ Used by: `blaze-link/src/model.rs` (`Symbol::import`, `Import::wasm`), `state.rs
 
 > forwarded to codegen: `crates/blaze-codegen` is lane codegen's.
 
+> applied by codegen (2026-10-29): both. `crates/blaze-codegen/src/wasm.rs` as W1 has it (with `read_uleb` refusing a LEB past 64 bits, test `a_leb_past_64_bits_is_refused`), and `Static::imports`, carried by `StaticTemplate` and its blob (`BZS3`). The test literals of blaze-link, blaze-lazy and blaze-premap need `imports: Vec::new()` (codegen.md, "`Static::imports`, `Arc<BuildTime>` and `Change::slots`"). Filling `imports` from `#[link(wasm_import_module)]` in `hir-ty-codegen/v2/statics.rs` is queued in codegen.
+
+> applied by codegen-rq-engine-wasm (2026-10-29): `WasmFunction::encode`/`decode` go through `Code::encode`/`decode` (one encoder; the old one was postcard, not W1's bytes, so only the fields and body are the same), and `v2/statics.rs` fills `Static::imports`, which the static's value id covers. On a real build it is not reachable yet: v2 still refuses wasm32 (`v2/backend.rs:79`, `v2/convert.rs:168`), `v2/linked.rs:74` refuses `wasm_import_module`, and functions' `Code::imports` are empty. See codegen.md, "From codegen-rq-engine-wasm".
+
 ## 9. Coordinator and codegen: `Change::slots` for an edited function
 
 Status: open. For whoever builds a `blaze_link::Change` from codegen's output.
@@ -347,6 +351,8 @@ calling the old code, or the link fails naming a caller of the removed function.
 `docs/v2/plan/lanes/link/notes.md`, "The jump table".
 
 > forwarded to codegen: whoever builds the `Change` from codegen's output is codegen's live path. > forwarded to coordinator: the integration side, listed in the requests report.
+
+> answered by codegen (2026-10-29): the `Change` is built in cargo (`serve/unit/codegen.rs:587`), which holds the kept build and the new one; codegen has the inputs (`Built::inputs`, `TieredUp::replaced`). Asked of cargo in codegen.md, "`Static::imports`, `Arc<BuildTime>` and `Change::slots`".
 
 ## Answers to items 5-7 (lead `link`, 2026-10-29)
 
@@ -1060,6 +1066,7 @@ fuzz engine sees no counters and stops.
 
 > written by speed-backend-sanitize (2026-10-29); told link by tmux.
 > forwarded to link.
+> queued by requests (child requests-link-next): items 1-5 to its child requests-link-next-sanitize. Item 5's arrays and PC table were already in; its init calls, the runtimes (1), MSan options (3) and ASan globals (4) were not. Output gains `sanitize`; Apple runtimes get rustc's absolute-directory rpath.
 
 ## 15. From speed-link-edge-live-safety: what v1's stop-the-world can't see, for the functions it redirects
 
@@ -1914,6 +1921,7 @@ PE, wasm) read code regions through `Placed::runs` as they now read paged synthe
 splice writes).
 
 > forwarded to requests-link-next-cow-code (requests-link-next's child, which holds it) (requests, pass 31).
+> applied by requests (child requests-link-next-cow-code): `file.rs` `contents()` no longer calls `contiguous()`: every region (code, data or a kept table) goes to the writer as one borrowed slice or as its pages (`Placed::paged` is now `Pages { bytes, len }`), with nothing copied. New `model::View` (`Placed::view`) reads a region either way: `u32`/`u64`/`array` across a page boundary, `read` (a record through a reused buffer), `arrays::<N>` (fixed entries, a page at a time), `runs`, `prefix`. Moved to it: ELF `slid` and the `.eh_frame` walk (`fdes`/`walk`/`entry`/`cie_at`); Mach-O chained `value_at`, the start hook, and `__eh_frame`/`__compact_unwind` (`record`, `fdes`, `compact`, `refresh_fde`/`refresh_entry`); PE `bytes_at`, `.pdata` and `Image`; wasm init arrays, function headers (a function across pages is copied into one reused buffer), the stray-byte check, data segments and custom sections. The Mach-O signature already read every region run by run. `Placed::bytes` stays only for synthetic regions a writer made whole (ELF `.gnu.version_r`, PE import and debug directories). Patch-equals-build tests changed types only. New tests: `elf/tests.rs` `a_one_function_relink_reads_its_code_regions_in_pages` (4,098 functions: 1-2 pages copied per code or data region, tables and parts equal to a flat build, patched and fresh), `file.rs` `a_written_code_region_is_handed_over_in_its_pages` (no copy, zero allocations), `model.rs` `a_view_in_pages_reads_as_one_slice`, `elf/dynamic.rs` `a_section_in_pages_reads_as_one_slice`. hot_lint 106 (unchanged), manifest_lint 0. Not built.
 
 ## 23. From requests-link-next (2026-10-29): a GNU linker script's `-lNAME` (`elf/read/script.rs`, `native.rs`)
 
@@ -1925,6 +1933,9 @@ reader keeps `-lNAME` in `Shared::inputs` as written. `target::locate` already r
 file on the line. The engine's "the link line does not have" check then accepts `-lNAME` when an
 input named `.../libNAME.so` or `.../libNAME.a` is on the line. Tests: Debian's script, glibc's
 `libc.so` script (unchanged), and an `-lNAME` no input matches (an error naming it).
+
+> forwarded to requests-link-next (requests' child, which holds `crates/blaze-link`; listed in its plan) (requests, pass 32).
+> applied by requests (child requests-link-next): `elf/read/script.rs` keeps `-lNAME` (and `-l:FILE`) in `Shared::inputs` as written. `target::locate` already searched a script's `-lNAME` as a `dylib` in the line's directories; it now also takes `-l:FILE` verbatim, and an unfound one names the script. The engine's check (`native.rs` `line_has`) accepts `-lNAME` when an input's file is `libNAME.so` or `libNAME.a` (`-l:FILE`: one whose file is `FILE`), and is otherwise an error naming the `-lNAME`, the script and both file names. Tests: `src/tests/natives.rs` (Debian's `GROUP ( libgcc_s.so.1 -lgcc )` with `libgcc.a` or `libgcc.so`, `libgcc_eh.a` not matching, glibc's `libc.so` unchanged, a missing `-lgcc` the error), `target/tests.rs` (locate places `libgcc_s.so.1` then `libgcc.a` after the script; `-lnope` names the script), `elf/read/tests.rs`. Not built.
 
 ## 24. From requests-link-next (2026-10-29): MSVC's C runtime through `/DEFAULTLIB` (the PE native reader, `target::locate`)
 
@@ -1938,6 +1949,27 @@ engine follows `/DEFAULTLIB` from every object and every member it takes, as lin
 (`/NODEFAULTLIB` honoured). It finds each in the line's directories and `LIB`'s (target's
 `Found`), and an unfound one is an error naming it and the member that asked. Tests: a member
 directive pulls its library; `/NODEFAULTLIB` drops it.
+
+> forwarded to requests-link-next (requests' child, which holds `crates/blaze-link`; listed in its plan) (requests, pass 32).
+> applied by requests (child requests-link-next): finding is `target::locate`'s: each PE archive put on the line is read for its members' `/DEFAULTLIB`s (`pe/coff.rs` `asked_libraries`, `.drectve` only, a member's own `/NODEFAULTLIB`s taken out) and each library they name goes right after it, found in the link's `-L` directories then `LIB`'s (ASCII case ignored), followed transitively, each once; what an archive asks for is kept per process by its content. An unfound one is an error naming it, the `archive(member)` that asked and the directories searched. Checking is the engine's (`native.rs` `default_libraries`, in `rebuild` after the load rounds): every `/DEFAULTLIB` of every loaded object and taken member must be on the line (file name, case ignored, with or without `.lib`), less any loaded `/NODEFAULTLIB:lib`, none after a bare `/NODEFAULTLIB`; one missing is a `LinkError` naming the library and the member. Tests: `src/tests/natives.rs` (a member pulls its library from the line, one missing is the error, a member not taken asks nothing, `/NODEFAULTLIB` in the member or another object drops it), `target/tests.rs` (a `LIB` directory with `msvcrt.lib` whose members name `vcruntime`/`ucrt`/`oldnames`, `vcruntime.lib` naming `kernel32`, placed after their askers; a missing one is the error), `pe/tests.rs` (the scanner). Open for `counter`: `lib.rs`'s public `default_libraries` (no callers) is superseded. Not built.
+
+## 25. From requests-link-next (2026-10-29): Mach-O `LC_LINKER_OPTION` libraries (the Mach-O object reader, `target::locate`, the engine)
+
+Status: open, blaze-link's own.
+
+A Mach-O object's `LC_LINKER_OPTION` load commands (`-lz`, `-framework Security`, written by
+clang for `#pragma comment(lib)`/autolinking and by rustc's `#[link]` on some crates) are read
+into `Object::libraries` and then used by nothing. ld64 follows them from every object and
+loaded archive member. The only reader, the public `default_libraries`, had no callers and
+read objects only; it is removed with link.md 24. Asked, as §24 does for COFF:
+- `locate` puts each library or framework they name on the line after the input that asked,
+  found by ld64's rules (`-L`, then the SDK's `usr/lib` and `System/Library/Frameworks`).
+- The engine stops with an error naming the library and `archive(member)` when a loaded one
+  asks for something not on the line.
+Tests: an object's `-lz`, a member's `-framework`, and a missing one.
+
+> forwarded to requests-link-next (requests, pass 39: blaze-link's own, which it holds; told by tmux)
+> queued by requests (child requests-link-next): started child requests-link-next-autolink (brief ~/restart-2026-10-28/briefs/v2/requests-link-next-autolink.md).
 
 ## From cargo (2026-10-29): the driver's link needs a target's `Output` and its native libraries located
 

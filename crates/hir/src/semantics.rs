@@ -478,6 +478,7 @@ impl<'db> SemanticsImpl<'db> {
     pub fn parse(&self, file_id: EditionedFileId) -> ast::SourceFile {
         let hir_file_id = file_id.into();
         let tree = file_id.parse(self.db).tree();
+        // clone: refcount bump, the cache keeps the root handle
         self.cache(tree.syntax().clone(), hir_file_id);
         tree
     }
@@ -504,6 +505,7 @@ impl<'db> SemanticsImpl<'db> {
         let file_id = self.attach_first_edition(file_id);
 
         let tree = file_id.parse(self.db).tree();
+        // clone: refcount bump, the cache keeps the root handle
         self.cache(tree.syntax().clone(), file_id.into());
         tree
     }
@@ -530,6 +532,7 @@ impl<'db> SemanticsImpl<'db> {
                         let node = in_file.to_node(self.db);
                         let root = node.syntax().tree_top();
                         self.cache(root, file_id);
+                        // clone: refcount bump for the returned handle
                         Some(in_file.with_value(node.syntax().clone()))
                     }
                     _ => unreachable!("FileId can only belong to a file module"),
@@ -557,6 +560,7 @@ impl<'db> SemanticsImpl<'db> {
 
     pub fn parse_or_expand(&self, file_id: HirFileId) -> SyntaxNode {
         let node = file_id.parse_or_expand(self.db);
+        // clone: refcount bump, the cache keeps the root handle
         self.cache(node.clone(), file_id);
         node
     }
@@ -571,6 +575,7 @@ impl<'db> SemanticsImpl<'db> {
 
     pub fn expand(&self, file_id: MacroCallId) -> ExpandResult<SyntaxNode> {
         let res = file_id.parse_macro_expansion(self.db).as_ref().map(|it| it.0.syntax_node());
+        // clone: refcount bump, the cache keeps the root handle
         self.cache(res.value.clone(), file_id.into());
         res
     }
@@ -619,14 +624,14 @@ impl<'db> SemanticsImpl<'db> {
 
     /// If `item` has an attribute macro attached to it, expands it.
     pub fn expand_attr_macro(&self, item: &ast::Item) -> Option<ExpandResult<InFile<SyntaxNode>>> {
-        let src = self.wrap_node_infile(item.clone());
-        let macro_call_id = self.with_ctx(|ctx| ctx.item_to_macro_call(src.as_ref()))?;
+        let src = self.find_file(item.syntax()).with_value(item);
+        let macro_call_id = self.with_ctx(|ctx| ctx.item_to_macro_call(src))?;
         Some(self.expand(macro_call_id).map(|it| InFile::new(macro_call_id.into(), it)))
     }
 
     pub fn expand_derive_as_pseudo_attr_macro(&self, attr: &ast::Meta) -> Option<SyntaxNode> {
         let adt = attr.parent_attr()?.syntax().parent().and_then(ast::Adt::cast)?;
-        let src = self.wrap_node_infile(attr.clone());
+        let src = self.find_file(attr.syntax()).with_value(attr);
         let call_id = self.with_ctx(|ctx| {
             ctx.attr_to_derive_macro_call(src.with_value(&adt), src).map(|(_, it, _)| it)
         })?;
@@ -653,6 +658,7 @@ impl<'db> SemanticsImpl<'db> {
                             }
                         }
                     })
+                    // alloc: returned to the IDE caller, one entry per derive
                     .collect(),
             )
         })
@@ -669,9 +675,12 @@ impl<'db> SemanticsImpl<'db> {
                 let file_id = call?.left()?;
                 let ExpandResult { value, err } = file_id.parse_macro_expansion(self.db);
                 let root_node = value.0.syntax_node();
+                // clone: refcount bump, the cache keeps the root handle
                 self.cache(root_node.clone(), file_id.into());
+                // clone: `Arc` bump of the memo's error for the owned result
                 Some(ExpandResult { value: root_node, err: err.clone() })
             })
+            // alloc: returned to the IDE caller, one entry per derive
             .collect();
         Some(res)
     }
@@ -683,9 +692,10 @@ impl<'db> SemanticsImpl<'db> {
         let adt = attr.parent_attr()?.syntax().parent().and_then(ast::Adt::cast)?;
         let file_id = self.find_file(adt.syntax()).file_id;
         let adt = InFile::new(file_id, &adt);
-        let src = InFile::new(file_id, attr.clone());
+        let src = InFile::new(file_id, attr);
         self.with_ctx(|ctx| {
             let (.., res) = ctx.attr_to_derive_macro_call(adt, src)?;
+            // alloc: owned out of the cache borrow for the IDE caller
             Some(res.to_vec())
         })
     }
@@ -703,9 +713,10 @@ impl<'db> SemanticsImpl<'db> {
             .derive_helpers_in_scope(self.db, InFile::new(sa.file_id, id))?
             .iter()
             .map(|(name, macro_, _)| {
-                let macro_name = Macro::from(*macro_).name(self.db).symbol().clone();
-                (name.symbol().clone(), macro_name)
+                let macro_name = *Macro::from(*macro_).name(self.db).symbol();
+                (*name.symbol(), macro_name)
             })
+            // alloc: returned to the IDE caller, exact size
             .collect();
         Some(result)
     }
@@ -727,6 +738,7 @@ impl<'db> SemanticsImpl<'db> {
             .iter()
             .filter(|&(name, _, _)| *name == attr_name)
             .filter_map(|&(_, macro_, call)| Some((macro_.into(), call.left()?)))
+            // alloc: returned to the IDE caller
             .collect();
         // FIXME: We filter our builtin derive "fake" expansions, is this correct? Should we still expose them somehow?
         res.is_empty().not().then_some(res)
@@ -765,8 +777,8 @@ impl<'db> SemanticsImpl<'db> {
         speculative_args: &ast::Item,
         token_to_map: SyntaxToken,
     ) -> Option<(SyntaxNode, Vec<(SyntaxToken, u8)>)> {
-        let macro_call = self.wrap_node_infile(actual_macro_call.clone());
-        let macro_call_id = self.with_ctx(|ctx| ctx.item_to_macro_call(macro_call.as_ref()))?;
+        let macro_call = self.find_file(actual_macro_call.syntax()).with_value(actual_macro_call);
+        let macro_call_id = self.with_ctx(|ctx| ctx.item_to_macro_call(macro_call))?;
         self.speculative_expand_raw(macro_call_id, speculative_args.syntax(), token_to_map)
     }
 
@@ -776,12 +788,12 @@ impl<'db> SemanticsImpl<'db> {
         speculative_args: &ast::Attr,
         token_to_map: SyntaxToken,
     ) -> Option<(SyntaxNode, Vec<(SyntaxToken, u8)>)> {
-        let attr = self.wrap_node_infile(actual_macro_call.clone());
+        let attr = self.find_file(actual_macro_call.syntax()).with_value(actual_macro_call);
         let adt = actual_macro_call.syntax().parent().and_then(ast::Adt::cast)?;
         let macro_call_id = self.with_ctx(|ctx| {
             ctx.attr_to_derive_macro_call(
                 attr.with_value(&adt),
-                attr.with_value(attr.value.meta()?),
+                attr.with_value(&attr.value.meta()?),
             )
             .map(|(_, it, _)| it)
         })?;
@@ -802,8 +814,8 @@ impl<'db> SemanticsImpl<'db> {
             body: store,
             conflicts: FxHashSet::default(),
             db: self.db,
-            new_name: new_name.symbol().clone(),
-            old_name: to_be_renamed.name(self.db).symbol().clone(),
+            new_name: *new_name.symbol(),
+            old_name: *to_be_renamed.name(self.db).symbol(),
             owner: to_be_renamed.parent,
             to_be_renamed: to_be_renamed.binding_id,
             resolver,
@@ -817,6 +829,7 @@ impl<'db> SemanticsImpl<'db> {
                 parent_infer: to_be_renamed.parent_infer,
                 binding_id,
             })
+            // alloc: returned to the IDE caller, exact size
             .collect()
     }
 
@@ -826,6 +839,7 @@ impl<'db> SemanticsImpl<'db> {
         string: &ast::String,
     ) -> Option<Vec<(TextRange, Option<Either<PathResolution<'db>, InlineAsmOperand>>)>> {
         let string_start = string.syntax().text_range().start();
+        // clone: refcount bump, the descent takes the token by value
         let token = self.wrap_token_infile(string.syntax().clone());
         self.descend_into_macros_breakable(token, |token, _| {
             (|| {
@@ -834,12 +848,14 @@ impl<'db> SemanticsImpl<'db> {
                 let literal =
                     string.syntax().parent().filter(|it| it.kind() == SyntaxKind::LITERAL)?;
                 let parent = literal.parent()?;
-                if let Some(format_args) = ast::FormatArgsExpr::cast(parent.clone()) {
+                if ast::FormatArgsExpr::can_cast(parent.kind()) {
+                    let format_args = ast::FormatArgsExpr::cast(parent)?;
                     let source_analyzer = self.analyze_no_infer(format_args.syntax())?;
                     let format_args = self.wrap_node_infile(format_args);
                     let res = source_analyzer
                         .as_format_args_parts(self.db, format_args.as_ref())?
                         .map(|(range, res)| (range + string_start, res.map(Either::Left)))
+                        // alloc: returned to the IDE caller
                         .collect();
                     Some(res)
                 } else {
@@ -857,6 +873,7 @@ impl<'db> SemanticsImpl<'db> {
                                 Some(Either::Right(InlineAsmOperand { owner, expr, index })),
                             )
                         })
+                        // alloc: returned to the IDE caller
                         .collect();
                     Some(res)
                 }
@@ -908,6 +925,7 @@ impl<'db> SemanticsImpl<'db> {
         let relative_offset =
             offset.checked_sub(original_token.value.syntax().text_range().start())?;
         self.descend_into_macros_breakable(
+            // clone: refcount bump, the descent takes the token by value
             original_token.as_ref().map(|it| it.syntax().clone()),
             |token, _| {
                 (|| {
@@ -939,7 +957,8 @@ impl<'db> SemanticsImpl<'db> {
         debug_assert!(offset <= string.syntax().text_range().len());
         let literal = string.syntax().parent().filter(|it| it.kind() == SyntaxKind::LITERAL)?;
         let parent = literal.parent()?;
-        if let Some(format_args) = ast::FormatArgsExpr::cast(parent.clone()) {
+        if ast::FormatArgsExpr::can_cast(parent.kind()) {
+            let format_args = ast::FormatArgsExpr::cast(parent)?;
             let source_analyzer =
                 self.analyze_impl(InFile::new(file_id, format_args.syntax()), None, false)?;
             source_analyzer
@@ -1016,6 +1035,7 @@ impl<'db> SemanticsImpl<'db> {
     /// Maps a node down by mapping its first and last token down.
     pub fn descend_node_into_attributes<N: AstNode>(&self, node: N) -> SmallVec<[N; 1]> {
         // This might not be the correct way to do this, but it works for now
+        // alloc: returned, inline for the common single node
         let mut res = smallvec![];
         let tokens = (|| {
             // FIXME: the trivia skipping should not be necessary
@@ -1086,6 +1106,7 @@ impl<'db> SemanticsImpl<'db> {
     /// That is, we strictly check if it lies inside the input of a macro call.
     pub fn is_inside_macro_call(&self, token @ InFile { value, .. }: InFile<&SyntaxToken>) -> bool {
         value.parent_ancestors().any(|ancestor| {
+            // clone: refcount bump, `ancestor` is cast again below
             if let Some(macro_call) = ast::MacroCall::cast(ancestor.clone())
                 // If this is the *path* of a macro, it's not inside the call.
                 && macro_call.path().is_none_or(|path| {
@@ -1124,8 +1145,10 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     pub fn descend_into_macros(&self, token: SyntaxToken) -> SmallVec<[SyntaxToken; 1]> {
+        // alloc: returned, inline for the common single token
         let mut res = smallvec![];
         self.descend_into_macros_all(
+            // clone: refcount bump, `token` is the result when nothing maps
             self.wrap_token_infile(token.clone()),
             false,
             &mut |t, _ctx| res.push(t.value),
@@ -1141,8 +1164,10 @@ impl<'db> SemanticsImpl<'db> {
         token: SyntaxToken,
         always_descend_into_derives: bool,
     ) -> SmallVec<[InFile<SyntaxToken>; 1]> {
+        // alloc: returned, inline for the common single token
         let mut res = smallvec![];
         let token = self.wrap_token_infile(token);
+        // clone: refcount bump, `token` is the result when nothing maps
         self.descend_into_macros_all(token.clone(), always_descend_into_derives, &mut |t, ctx| {
             if !ctx.is_opaque(self.db) {
                 // Don't descend into opaque contexts
@@ -1166,10 +1191,12 @@ impl<'db> SemanticsImpl<'db> {
     /// Descends the token into expansions, returning the tokens that matches the input
     /// token's [`SyntaxKind`] and text.
     pub fn descend_into_macros_exact(&self, token: SyntaxToken) -> SmallVec<[SyntaxToken; 1]> {
+        // alloc: returned, inline for the common single token
         let mut r = smallvec![];
         let text = token.text();
         let kind = token.kind();
 
+        // clone: refcount bump, `token` is the result when nothing maps
         self.descend_into_macros_cb(token.clone(), |InFile { value, file_id: _ }, ctx| {
             let mapped_kind = value.kind();
             let any_ident_match = || kind.is_any_identifier() && value.kind().is_any_identifier();
@@ -1192,10 +1219,12 @@ impl<'db> SemanticsImpl<'db> {
         &self,
         token: SyntaxToken,
     ) -> SmallVec<[InFile<SyntaxToken>; 1]> {
+        // alloc: returned, inline for the common single token
         let mut r = smallvec![];
         let text = token.text();
         let kind = token.kind();
 
+        // clone: refcount bump, `token` is the result when nothing maps
         self.descend_into_macros_cb(token.clone(), |InFile { value, file_id }, ctx| {
             let mapped_kind = value.kind();
             let any_ident_match = || kind.is_any_identifier() && value.kind().is_any_identifier();
@@ -1218,6 +1247,7 @@ impl<'db> SemanticsImpl<'db> {
         let text = token.text();
         let kind = token.kind();
         self.descend_into_macros_breakable(
+            // clone: refcount bump, `token` is the result when nothing maps
             self.wrap_token_infile(token.clone()),
             |InFile { value, file_id: _ }, _ctx| {
                 let mapped_kind = value.kind();
@@ -1492,7 +1522,7 @@ impl<'db> SemanticsImpl<'db> {
                                         let derive_call = ctx
                                             .attr_to_derive_macro_call(
                                                 InFile::new(expansion, &adt),
-                                                InFile::new(expansion, meta.clone()),
+                                                InFile::new(expansion, &meta),
                                             )?
                                             .1;
 
@@ -1594,8 +1624,10 @@ impl<'db> SemanticsImpl<'db> {
             // re-order the tokens from token_at_offset by returning the ancestors with the smaller first nodes first
             // See algo::ancestors_at_offset, which uses the same approach
             |left, right| {
+                // clone: copies of the two ancestor iterators to compare them, no allocation
                 left.clone()
                     .map(|node| node.text_range().len())
+                    // clone: as above
                     .lt(right.clone().map(|node| node.text_range().len()))
             },
         )
@@ -1710,6 +1742,7 @@ impl<'db> SemanticsImpl<'db> {
     pub fn fn_return_points(&self, func: Function) -> Vec<InFile<ast::ReturnExpr>> {
         let func_id = match func.id {
             AnyFunctionId::FunctionId(id) => id,
+            // alloc: empty
             _ => return vec![],
         };
         let (body, source_map) = Body::with_source_map(self.db, func_id.into());
@@ -1738,6 +1771,7 @@ impl<'db> SemanticsImpl<'db> {
             });
         }
 
+        // alloc: returned to the IDE caller
         let mut returns = vec![];
         collect_returns(self, body, source_map, body.root_expr(), &mut returns);
         returns
@@ -1755,8 +1789,8 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     pub fn resolve_label(&self, label: &ast::Lifetime) -> Option<Label> {
-        let src = self.wrap_node_infile(label.clone());
-        let (parent, label_id) = self.with_ctx(|ctx| ctx.label_ref_to_def(src.as_ref()))?;
+        let src = self.find_file(label.syntax()).with_value(label);
+        let (parent, label_id) = self.with_ctx(|ctx| ctx.label_ref_to_def(src))?;
         Some(Label { parent, label_id })
     }
 
@@ -1811,10 +1845,11 @@ impl<'db> SemanticsImpl<'db> {
                     };
 
                     // Update `source_ty` for the next adjustment
-                    let source = mem::replace(&mut source_ty, target.clone());
+                    let source = mem::replace(&mut source_ty, target);
 
                     Adjustment { source, target, kind }
                 })
+                // alloc: returned to the IDE caller, exact size
                 .collect()
         })
     }
@@ -1876,6 +1911,7 @@ impl<'db> SemanticsImpl<'db> {
         };
         let Some(candidates) = self.analyze(syntax).and_then(|it| it.unstable_candidates(node))
         else {
+            // alloc: empty
             return Vec::new();
         };
         // clone: the few passed-over items of one call, for a lint.
@@ -1949,12 +1985,15 @@ impl<'db> SemanticsImpl<'db> {
 
     /// The type that the associated `try` block, closure or function expects.
     pub fn try_expr_returned_type(&self, try_expr: &ast::TryExpr) -> Option<Type<'db>> {
+        // clone: refcount bump, the walk takes the node by value
         self.ancestors_with_macros(try_expr.syntax().clone()).find_map(|parent| {
-            if let Some(try_block) = ast::BlockExpr::cast(parent.clone())
-                && try_block.try_block_modifier().is_some()
-            {
+            let kind = parent.kind();
+            if ast::BlockExpr::can_cast(kind) {
+                let try_block = ast::BlockExpr::cast(parent)?;
+                try_block.try_block_modifier()?;
                 Some(self.type_of_expr(&try_block.into())?.original)
-            } else if let Some(closure) = ast::ClosureExpr::cast(parent.clone()) {
+            } else if ast::ClosureExpr::can_cast(kind) {
+                let closure = ast::ClosureExpr::cast(parent)?;
                 Some(
                     self.type_of_expr(&closure.into())?
                         .original
@@ -2067,10 +2106,13 @@ impl<'db> SemanticsImpl<'db> {
 
     pub fn get_unsafe_ops_for_unsafe_block(&self, block: ast::BlockExpr) -> Vec<ExprOrPatSource> {
         always!(block.unsafe_token().is_some());
+        // alloc: empty
         let Some(sa) = self.analyze(block.syntax()) else { return vec![] };
+        // alloc: empty
         let Some((def, store, sm, Some(infer))) = sa.def() else { return vec![] };
         let block = self.wrap_node_infile(ast::Expr::from(block));
         let Some(ExprOrPatId::ExprId(block)) = sm.node_expr(block.as_ref()) else {
+            // alloc: empty
             return Vec::new();
         };
         let mut res = Vec::default();
@@ -2097,9 +2139,9 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     pub fn resolve_attr_macro_call(&self, item: &ast::Item) -> Option<Macro> {
-        let item_in_file = self.wrap_node_infile(item.clone());
+        let item_in_file = self.find_file(item.syntax()).with_value(item);
         let id = self.with_ctx(|ctx| {
-            let macro_call_id = ctx.item_to_macro_call(item_in_file.as_ref())?;
+            let macro_call_id = ctx.item_to_macro_call(item_in_file)?;
             macro_call_to_macro_id(ctx, macro_call_id)
         })?;
         Some(Macro { id })
@@ -2200,6 +2242,7 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     fn file_to_module_defs(&self, file: FileId) -> impl Iterator<Item = Module> {
+        // alloc: copy out of the cache borrow, inline for the common single module
         self.with_ctx(|ctx| ctx.file_to_def(file).to_owned()).into_iter().map(Module::from)
     }
 
@@ -2264,12 +2307,14 @@ impl<'db> SemanticsImpl<'db> {
         cache.entry(def).or_insert_with(|| match def {
             Either::Left(def) => AnonConstId::all_from_signature(self.db, def)
                 .map(|anon_const| (anon_const.loc(self.db).expr, anon_const))
+                // alloc: cached once per signature
                 .collect(),
             Either::Right(def) => {
                 let all_anon_consts =
                     self.db.field_types_with_diagnostics(def).defined_anon_consts().iter().copied();
                 all_anon_consts
                     .map(|anon_const| (anon_const.loc(self.db).expr, anon_const))
+                    // alloc: cached once per signature
                     .collect()
             }
         })
@@ -2451,7 +2496,9 @@ impl<'db> SemanticsImpl<'db> {
                     .borrow()
                     .root_to_file_cache
                     .keys()
+                    // alloc: panic message
                     .map(|it| format!("{it:?}"))
+                    // alloc: panic message
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -2495,6 +2542,7 @@ impl<'db> SemanticsImpl<'db> {
                 break false;
             }
 
+            // clone: refcount bump, the walk keeps `parent` to step up from it
             if let Some(parent) = ast::Expr::cast(parent.clone())
                 && let Some(ExprOrPatId::ExprId(expr_id)) =
                     source_map.node_expr(InFile { file_id, value: &parent })
@@ -2536,6 +2584,7 @@ impl<'db> SemanticsImpl<'db> {
         let sa = self.analyze(element.either(|e| e.syntax(), |s| s.syntax()))?;
         let infer_body = sa.infer_body?;
         let store = sa.store()?;
+        // clone: own copy to move between scopes, once per call
         let mut resolver = sa.resolver.clone();
         let def = resolver.expression_store_owner()?;
 
@@ -2543,43 +2592,49 @@ impl<'db> SemanticsImpl<'db> {
             !path.mod_path().and_then(|path| path.as_ident()).is_some_and(Name::is_generated)
         };
 
-        let exprs = element.either(
-            |e| vec![e.clone()],
-            |stmts| {
-                let mut exprs: Vec<_> = stmts
+        // alloc: the walk's stack, one per call
+        let mut exprs: Vec<ExprId> = Vec::new();
+        let mut push_expr = |e: &ast::Expr| {
+            if let Some(id) = sa.expr_id(e).and_then(|e| e.as_expr()) {
+                exprs.push(id);
+            }
+        };
+        match element {
+            Either::Left(e) => push_expr(e),
+            Either::Right(stmts) => {
+                for stmt in stmts
                     .statements()
                     .filter(|stmt| text_range.contains_range(stmt.syntax().text_range()))
-                    .filter_map(|stmt| match stmt {
-                        ast::Stmt::ExprStmt(expr_stmt) => expr_stmt.expr().map(|e| vec![e]),
-                        ast::Stmt::Item(_) => None,
-                        ast::Stmt::LetStmt(let_stmt) => {
-                            let init = let_stmt.initializer();
-                            let let_else = let_stmt
-                                .let_else()
-                                .and_then(|le| le.block_expr())
-                                .map(ast::Expr::BlockExpr);
-
-                            match (init, let_else) {
-                                (Some(i), Some(le)) => Some(vec![i, le]),
-                                (Some(i), _) => Some(vec![i]),
-                                (_, Some(le)) => Some(vec![le]),
-                                _ => None,
+                {
+                    match stmt {
+                        ast::Stmt::ExprStmt(expr_stmt) => {
+                            if let Some(e) = expr_stmt.expr() {
+                                push_expr(&e);
                             }
                         }
-                    })
-                    .flatten()
-                    .collect();
+                        ast::Stmt::Item(_) => {}
+                        ast::Stmt::LetStmt(let_stmt) => {
+                            if let Some(i) = let_stmt.initializer() {
+                                push_expr(&i);
+                            }
+                            if let Some(le) = let_stmt
+                                .let_else()
+                                .and_then(|le| le.block_expr())
+                                .map(ast::Expr::BlockExpr)
+                            {
+                                push_expr(&le);
+                            }
+                        }
+                    }
+                }
 
                 if let Some(tail_expr) = stmts.tail_expr()
                     && text_range.contains_range(tail_expr.syntax().text_range())
                 {
-                    exprs.push(tail_expr);
+                    push_expr(&tail_expr);
                 }
-                exprs
-            },
-        );
-        let mut exprs: Vec<_> =
-            exprs.into_iter().filter_map(|e| sa.expr_id(e).and_then(|e| e.as_expr())).collect();
+            }
+        }
 
         let mut locals: FxIndexSet<Local<'db>> = FxIndexSet::default();
         let mut add_to_locals_used = |id, parent_expr| {
@@ -2650,6 +2705,7 @@ impl<'db> SemanticsImpl<'db> {
         match container {
             ChildContainer::DefWithBodyId(def) => {
                 thread_local! {
+                    // alloc: empty
                     static RESULT: RefCell<Vec<ProofTreeData>> = const { RefCell::new(Vec::new()) };
                 }
                 // Inference runs inline on this thread, and a call cancelled part way leaves
@@ -2669,8 +2725,8 @@ impl<'db> SemanticsImpl<'db> {
                     }),
                     LoweringMode::Ide,
                 );
-                let data: Vec<ProofTreeData> =
-                    RESULT.with(|data| data.borrow_mut().drain(..).collect());
+                let data: Vec<ProofTreeData> = RESULT.with(|data| mem::take(&mut *data.borrow_mut()));
+                // alloc: debug dump returned to the editor
                 let data = serde_json::to_string_pretty(&data).unwrap_or_else(|_| "[]".to_owned());
                 Some(data)
             }
@@ -2757,6 +2813,7 @@ to_def_impls![
     (crate::ExternCrateDecl, ast::ExternCrate, extern_crate_to_def),
     (crate::InlineAsmOperand, ast::AsmOperandNamed, asm_operand_to_def),
     (crate::ExternBlock, ast::ExternBlock, extern_block_to_def),
+    (crate::UseDecl, ast::Use, use_to_def),
     (MacroCallId, ast::MacroCall, macro_call_to_macro_call),
 ];
 

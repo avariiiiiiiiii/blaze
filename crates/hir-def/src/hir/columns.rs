@@ -42,6 +42,7 @@
 //! | `Literal` | `literals` t | |
 //! | `OffsetOf` | `offset_ofs` t | |
 //! | `InlineAsm` | `asms` t | |
+//! | `UnsafeBinderCast` | e | `[expr, ty+1 <<1 \| kind]` |
 //!
 //! | pattern | data | `extra` |
 //! |---|---|---|
@@ -87,6 +88,7 @@ use crate::{
         Array, AsmOperand, BindingId, CaptureBy, ClosureKind, CoroutineKind, CoroutineSource, Expr,
         ExprId, InlineAsm, Item, LabelId, Literal, LoopSource, MatchArm, Movability, OffsetOf,
         Pat, PatId, RecordFieldPat, RecordLitField, RecordSpread, Statement, Statements, Unsafe,
+        UnsafeBinderCastKind,
         col::{Col, SlabLayout, SlabWriter},
     },
     type_ref::{Mutability, Rawness, TypeRefId},
@@ -197,10 +199,11 @@ const _: () = {
     assert!(size_of::<PatId>() == size_of::<u32>());
 };
 
-/// Which variant of [`Expr`] a node is, in variant order.
+/// Which variant of [`Expr`] a node is, in variant order: the byte of the `expr_kind` column,
+/// and the one expression tag every crate reads (`hir_def::hir::ExprKind`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ExprKind {
+pub enum ExprKind {
     Missing,
     Path,
     If,
@@ -234,12 +237,14 @@ pub(crate) enum ExprKind {
     OffsetOf,
     InlineAsm,
     IncludeBytes,
+    UnsafeBinderCast,
 }
 
-/// Which variant of [`Pat`] a node is, in variant order.
+/// Which variant of [`Pat`] a node is, in variant order: the byte of the `pat_kind` column, and
+/// the one pattern tag every crate reads (`hir_def::hir::PatKind`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PatKind {
+pub enum PatKind {
     Missing,
     Rest,
     Wild,
@@ -286,17 +291,19 @@ impl StatementKind {
 
 impl ExprKind {
     /// Every kind, at the index of its value.
-    pub(crate) const ALL: [ExprKind; 33] = {
+    pub const ALL: [ExprKind; 34] = {
         use ExprKind::*;
         [
             Missing, Path, If, Let, Block, Const, Loop, Call, MethodCall, Match, Continue, Break,
             Return, Become, Yield, Yeet, RecordLit, Field, Await, Cast, Ref, UnaryOp, BinaryOp,
             Assignment, Index, Closure, Tuple, Array, Literal, Underscore, OffsetOf, InlineAsm,
-            IncludeBytes,
+            IncludeBytes, UnsafeBinderCast,
         ]
     };
 
-    pub(crate) fn of(expr: &Expr<'_>) -> ExprKind {
+    /// A `match` on the decoded variant, which compiles to its discriminant.
+    #[inline]
+    pub fn of(expr: &Expr<'_>) -> ExprKind {
         match expr {
             Expr::Missing => ExprKind::Missing,
             Expr::Path(_) => ExprKind::Path,
@@ -331,13 +338,14 @@ impl ExprKind {
             Expr::OffsetOf(_) => ExprKind::OffsetOf,
             Expr::InlineAsm(_) => ExprKind::InlineAsm,
             Expr::IncludeBytes => ExprKind::IncludeBytes,
+            Expr::UnsafeBinderCast { .. } => ExprKind::UnsafeBinderCast,
         }
     }
 }
 
 impl PatKind {
     /// Every kind, at the index of its value.
-    pub(crate) const ALL: [PatKind; 17] = {
+    pub const ALL: [PatKind; 17] = {
         use PatKind::*;
         [
             Missing, Rest, Wild, Tuple, Or, Record, Range, Slice, Path, Lit, Bind, TupleStruct, Ref,
@@ -345,7 +353,8 @@ impl PatKind {
         ]
     };
 
-    pub(crate) fn of(pat: &Pat<'_>) -> PatKind {
+    #[inline]
+    pub fn of(pat: &Pat<'_>) -> PatKind {
         match pat {
             Pat::Missing => PatKind::Missing,
             Pat::Rest => PatKind::Rest,
@@ -371,7 +380,7 @@ impl PatKind {
 /// The `extra` words of each expression kind, by kind.
 pub(crate) const EXPR_WORDS: [u8; ExprKind::ALL.len()] = [
     0, 0, 3, 2, 6, 0, 2, 3, 5, 3, 0, 2, 0, 0, 0, 0, 4, 2, 0, 2, 2, 2, 3, 2, 2, 7, 2, 3, 0, 0, 0, 0,
-    0,
+    0, 2,
 ];
 
 /// The `extra` words of each pattern kind, by kind.
@@ -528,6 +537,8 @@ const COROUTINE_SOURCES: [CoroutineSource; 3] =
     [CoroutineSource::Block, CoroutineSource::Closure, CoroutineSource::Fn];
 const MOVABILITIES: [Movability; 2] = [Movability::Static, Movability::Movable];
 const CAPTURES: [CaptureBy; 2] = [CaptureBy::Value, CaptureBy::Ref];
+const UNSAFE_BINDER_CASTS: [UnsafeBinderCastKind; 2] =
+    [UnsafeBinderCastKind::Wrap, UnsafeBinderCastKind::Unwrap];
 
 fn from_table<T: Copy>(table: &[T], word: u32, what: &'static str) -> Checked<T> {
     table.get(word as usize).copied().ok_or(what)
@@ -886,6 +897,14 @@ impl<V: ColumnVec> HirColumns<V> {
             ExprKind::OffsetOf => Expr::OffsetOf(entry(&self.offset_ofs, d, OFFSET_OF)?),
             ExprKind::InlineAsm => Expr::InlineAsm(entry(&self.asms, d, ASM)?),
             ExprKind::IncludeBytes => Expr::IncludeBytes,
+            ExprKind::UnsafeBinderCast => {
+                let [expr, word] = self.node::<2>(d)?;
+                Expr::UnsafeBinderCast {
+                    kind: from_table(&UNSAFE_BINDER_CASTS, word & 1, "an unsafe binder cast out of range")?,
+                    expr: idx(expr),
+                    ty: unopt(word >> 1),
+                }
+            }
         })
     }
 
@@ -1487,6 +1506,9 @@ impl HirColumns<Growing> {
             Expr::Literal(literal) => put_one(&mut self.literals, literal, old),
             Expr::OffsetOf(offset_of) => put_one(&mut self.offset_ofs, offset_of, old),
             Expr::InlineAsm(asm) => put_one(&mut self.asms, asm, old),
+            Expr::UnsafeBinderCast { kind, expr, ty } => {
+                self.words(old, [raw(expr), shl(opt(ty), 1) | kind as u32])
+            }
         }
     }
 
@@ -1656,6 +1678,10 @@ impl Bounds {
             Expr::Cast { expr, type_ref } => {
                 self.expr(expr)?;
                 self.type_ref(type_ref)
+            }
+            Expr::UnsafeBinderCast { kind: _, expr, ty } => {
+                self.expr(expr)?;
+                self.type_opt(ty)
             }
             Expr::BinaryOp { lhs, rhs, op: _ } => {
                 self.expr(lhs)?;
@@ -2096,6 +2122,8 @@ mod tests {
             Expr::OffsetOf(&v.offset_of),
             Expr::InlineAsm(&v.asm),
             Expr::IncludeBytes,
+            Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Wrap, expr: E0, ty: None },
+            Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Unwrap, expr: E0, ty: Some(T0) },
         ];
         exprs.extend(ops.map(|op| Expr::BinaryOp { lhs: E0, rhs: E0, op }));
         exprs.extend(closure_kinds.into_iter().map(|closure_kind| Expr::Closure {

@@ -47,11 +47,12 @@ use crate::model::{
     Apply, Archive, Binding, Class, Data, Directive, Fixup, Formats, Import, Library, Name, Names, NativeFile,
     Object, SectionKind, Shared, Special, Sym, Symbol, SymbolDef, SymbolKind, Tie, Writer,
 };
+use crate::premap::{Outside, Strength, outside_def};
 use crate::stage::{Content, Stage, error};
 use crate::state::{Def, Input, PieceId, State, What};
 use crate::symbols::{NameId, Obj, SymKey, Symbols, Wide};
 use crate::unwind;
-use crate::{Change, LinkError, NativeKind, OutputKind};
+use crate::{Change, Format, LinkError, NativeKind, OutputKind};
 
 const NONE: u32 = u32::MAX;
 const NONE64: u64 = u64::MAX;
@@ -394,6 +395,147 @@ fn check_shared(shared: &Shared) -> Result<(), String> {
     shared.more.iter().try_for_each(check_shared)
 }
 
+/// Whether the line, by its inputs' `names`, has what a linker script names as `wanted`: a
+/// path as written or ending in `/wanted`, `-lNAME` as an input whose file is `libNAME.so` or
+/// `libNAME.a`, `-l:FILE` as one whose file is `FILE`.
+fn line_has(names: &FxHashSet<&str>, wanted: &str) -> bool {
+    fn file(it: &str) -> &str {
+        it.rsplit('/').next().unwrap_or(it)
+    }
+    match wanted.strip_prefix("-l") {
+        Some(lib) => match lib.strip_prefix(':') {
+            Some(exact) => names.iter().any(|it| file(it) == exact),
+            None => names.iter().any(|it| {
+                file(it).strip_prefix("lib").and_then(|it| it.strip_prefix(lib)).is_some_and(|it| it == ".so" || it == ".a")
+            }),
+        },
+        None => {
+            names.contains(wanted)
+                || names.iter().any(|it| {
+                    it.len() > wanted.len() && it.ends_with(wanted) && it.as_bytes()[it.len() - wanted.len() - 1] == b'/'
+                })
+        }
+    }
+}
+
+/// Whether `a` and `b` name one library as link.exe matches a `/DEFAULTLIB`: by file name,
+/// case-insensitively, with or without `.lib`.
+fn same_library(a: &str, b: &str) -> bool {
+    fn stem(it: &str) -> &str {
+        let file = it.rsplit(['/', '\\']).next().unwrap_or(it);
+        match file.len().checked_sub(4) {
+            Some(at) if file.is_char_boundary(at) && file[at..].eq_ignore_ascii_case(".lib") => &file[..at],
+            _ => file,
+        }
+    }
+    stem(a).eq_ignore_ascii_case(stem(b))
+}
+
+/// link.exe's default libraries: every `/DEFAULTLIB` of the objects and archive members
+/// `graph` loaded is on the line (`inputs`), but those a loaded one's `/NODEFAULTLIB` takes
+/// out, and none after a bare `/NODEFAULTLIB`. The linker reads no file itself:
+/// [`crate::target::locate`] puts them on the line, so one missing is an error naming it and
+/// the member that asked.
+fn default_libraries(graph: &Graph, inputs: &[Input]) -> Result<(), LinkError> {
+    let mut left_out: SmallVec<[&str; 4]> = SmallVec::new();
+    for load in &graph.loads {
+        for directive in &load.parsed.object().directives {
+            match directive {
+                Directive::NoDefaultLib(None) => return Ok(()),
+                Directive::NoDefaultLib(Some(library)) => left_out.push(library),
+                _ => {}
+            }
+        }
+    }
+    let mut checked: SmallVec<[&str; 8]> = SmallVec::new();
+    for load in &graph.loads {
+        for library in &load.parsed.object().libraries {
+            if checked.iter().any(|it| same_library(it, library)) {
+                continue;
+            }
+            checked.push(library);
+            if left_out.iter().any(|it| same_library(it, library)) || inputs.iter().any(|it| same_library(&it.name, library)) {
+                continue;
+            }
+            return Err(error(
+                None,
+                // alloc: error path
+                format!(
+                    "{} asks for {library} (/DEFAULTLIB), which the link line does not have: the link \
+                     was located without the libraries its archives' members ask for",
+                    asker(inputs, load)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// ld64's autolinking: every library an `LC_LINKER_OPTION` of the objects and archive members
+/// `graph` loaded asks for is on the line (`inputs`), by the file ld64 finds it as
+/// ([`autolinked`]). The linker reads no file itself: [`crate::target::locate`] puts them on
+/// the line, so one missing, or an option blaze does not follow ([`crate::macho::autolink`]),
+/// is an error naming it and the member that asked.
+fn linker_options(graph: &Graph, inputs: &[Input]) -> Result<(), LinkError> {
+    let mut checked: SmallVec<[&str; 8]> = SmallVec::new();
+    for load in &graph.loads {
+        for option in &load.parsed.object().libraries {
+            if checked.contains(&option.as_str()) {
+                continue;
+            }
+            // alloc: error path
+            let asked = crate::macho::autolink(option).map_err(|what| error(None, format!("{}: {what}", asker(inputs, load))))?;
+            if !autolinked(inputs, asked) {
+                return Err(error(
+                    None,
+                    // alloc: error path
+                    format!(
+                        "{} asks for {option} (LC_LINKER_OPTION), which the link line does not have: the \
+                         link was located without the libraries its objects ask for",
+                        asker(inputs, load)
+                    ),
+                ));
+            }
+            checked.push(option);
+        }
+    }
+    Ok(())
+}
+
+/// Whether an input is the file ld64 takes `asked` as: `libNAME.tbd`, `.dylib`, `.so` or `.a`
+/// for `-lNAME`, `NAME.framework/NAME.tbd` or `NAME.framework/NAME` for `-framework NAME`.
+fn autolinked(inputs: &[Input], asked: crate::macho::Autolink<'_>) -> bool {
+    inputs.iter().any(|input| {
+        let mut parts = input.name.rsplit('/');
+        let file = parts.next().unwrap_or_default();
+        match asked {
+            crate::macho::Autolink::Library(name) => file
+                .strip_prefix("lib")
+                .and_then(|it| it.strip_prefix(name))
+                .is_some_and(|it| matches!(it, ".tbd" | ".dylib" | ".so" | ".a")),
+            crate::macho::Autolink::Framework(name) => {
+                (file == name || file.strip_suffix(".tbd") == Some(name))
+                    && parts.next().and_then(|it| it.strip_suffix(".framework")) == Some(name)
+            }
+        }
+    })
+}
+
+/// What errors call the object `load`: its input's name, and the member's in an archive's.
+fn asker(inputs: &[Input], load: &Load) -> String {
+    let input = &inputs[load.input as usize];
+    let member = match (&*input.file, load.parsed.obj.member.checked_sub(1)) {
+        (NativeFile::Archive(archive), Some(at)) => archive.members.get(at as usize).map(|it| archive.name(it.name)),
+        _ => None,
+    };
+    match member {
+        // alloc: error path
+        Some(member) => format!("{}({member})", input.name),
+        // alloc: error path
+        None => input.name.to_string(),
+    }
+}
+
 /// The bytes of each native input this stage, by its index in [`State::inputs`]: what native
 /// sections and frame records borrow, so that they are never copied.
 #[derive(Default)]
@@ -673,8 +815,11 @@ fn object_keys<'f>(obj: Obj, object: &'f Object, records: &[(u32, Vec<unwind::Na
 /// of each name the first library's symbol. Built when the libraries change, not per stage.
 #[derive(Default)]
 pub(crate) struct Exports {
-    roots: Vec<(Arc<NativeFile>, bool)>,
+    /// File, `as_needed`, place on the link line ([`crate::Native::order`]).
+    roots: Vec<(Arc<NativeFile>, bool, u32)>,
     libraries: Vec<Library>,
+    /// Of each library, its root's place on the link line.
+    orders: Vec<u32>,
     /// Of each library, the first of its name (an import library's members of one DLL).
     canonical: Vec<u32>,
     names: Names,
@@ -697,9 +842,10 @@ struct Export {
 impl Exports {
     /// Once per change of the link's shared libraries: every buffer is sized once, but for the
     /// flattened list (as deep as the libraries' re-exports) and each distinct version's name.
-    fn build(roots: Vec<(Arc<NativeFile>, bool)>) -> Result<Exports, String> {
+    fn build(roots: Vec<(Arc<NativeFile>, bool, u32)>) -> Result<Exports, String> {
         let mut flat: Vec<(&Shared, bool)> = Vec::with_capacity(roots.len());
-        for (file, as_needed) in &roots {
+        let mut orders: Vec<u32> = Vec::with_capacity(roots.len());
+        for (file, as_needed, order) in &roots {
             let NativeFile::Shared(shared) = &**file else { continue };
             let mut at = flat.len();
             flat.push((shared, *as_needed));
@@ -708,6 +854,7 @@ impl Exports {
                 flat.extend(this.more.iter().map(|it| (it, as_needed)));
                 at += 1;
             }
+            orders.resize(flat.len(), *order);
         }
         let mut first: FxHashMap<&str, u32> = FxHashMap::with_capacity_and_hasher(flat.len(), Default::default());
         let mut canonical: Vec<u32> = Vec::with_capacity(flat.len());
@@ -743,7 +890,7 @@ impl Exports {
                 let _ = table.insert(hashed, index, |_| false);
             }
         }
-        Ok(Exports { roots, libraries, canonical, names, versions, symbols, table })
+        Ok(Exports { roots, libraries, orders, canonical, names, versions, symbols, table })
     }
 
     fn find(&self, name: &str) -> Option<&Export> {
@@ -758,8 +905,9 @@ impl Exports {
     }
 
     /// Whether these are the libraries it was built from.
-    fn same(&self, roots: &[(Arc<NativeFile>, bool)]) -> bool {
-        self.roots.len() == roots.len() && self.roots.iter().zip(roots).all(|(a, b)| Arc::ptr_eq(&a.0, &b.0) && a.1 == b.1)
+    fn same(&self, roots: &[(Arc<NativeFile>, bool, u32)]) -> bool {
+        self.roots.len() == roots.len()
+            && self.roots.iter().zip(roots).all(|(a, b)| Arc::ptr_eq(&a.0, &b.0) && a.1 == b.1 && a.2 == b.2)
     }
 }
 
@@ -783,6 +931,9 @@ const QUEUED: u16 = 64;
 const LOOSE: u16 = 128;
 /// Rust refers to it (a root, resolved).
 const WANTED: u16 = 256;
+/// The image this one is linked beside defines it, and wins ([`crate::Outside`]): its
+/// definition is [`Graph::outside`]'s, and `best` is NONE64.
+const OUTSIDE: u16 = 512;
 
 /// A global of the graph: a name loaded objects mention, or Rust refers to or defines.
 #[derive(Clone, Copy)]
@@ -846,6 +997,8 @@ pub(crate) struct Graph {
     /// wasm: what objects say a name is imported as, and the input saying it.
     wasm: FxHashMap<Sym, (u32, blaze_codegen::wasm::Import)>,
     entry: Option<Sym>,
+    /// Of each [`OUTSIDE`] slot, what the image beside defines it as.
+    outside: FxHashMap<u32, Def>,
 }
 
 impl Graph {
@@ -876,6 +1029,7 @@ impl Graph {
             asked: Arc::default(),
             wasm: FxHashMap::default(),
             entry: None,
+            outside: FxHashMap::default(),
         }
     }
 
@@ -930,14 +1084,15 @@ impl Graph {
         slot != NONE && self.slots[slot as usize].best == pack(load, symbol) && self.best(slot).is_some()
     }
 
-    /// Whether the natives or Rust define the name.
+    /// Whether the natives, Rust or the image beside define the name.
     fn defined(&self, slot: u32) -> bool {
-        self.slots[slot as usize].flags & (RUST | ALIAS) != 0 || self.best(slot).is_some()
+        self.slots[slot as usize].flags & (RUST | ALIAS | OUTSIDE) != 0 || self.best(slot).is_some()
     }
 
-    /// What a defined name is, as [`Outcome`] kinds.
+    /// What a defined name is, as [`Outcome`] kinds: a definition of the image beside, fixed
+    /// for this image's life, counts as Rust's.
     fn kind(&self, slot: u32) -> u8 {
-        if self.slots[slot as usize].flags & RUST != 0 {
+        if self.slots[slot as usize].flags & (RUST | OUTSIDE) != 0 {
             return O_RUST;
         }
         match self.best(slot) {
@@ -1414,6 +1569,8 @@ pub(crate) struct Resolved {
     /// Each import's symbol.
     pub import_syms: Arc<Vec<Sym>>,
     pub libraries: Arc<Vec<Library>>,
+    /// Of each of `libraries`, its place on the link line ([`crate::Native::order`]).
+    pub library_orders: Arc<Vec<u32>>,
     /// What the objects' `/EXPORT` directives export: the name, the symbol, and whether it
     /// is data.
     pub exports: Arc<Vec<(String, String, bool)>>,
@@ -1445,6 +1602,41 @@ impl Resolved {
     fn outcome(&self, sym: Sym) -> u8 {
         self.outcomes.get(Symbols::dense(sym)).copied().unwrap_or(0)
     }
+
+    /// The global names the natives define, each once, as resolution chose them: neither
+    /// Rust's nor the image beside's. One defined as an alias of its fallback is weak, at
+    /// the fallback's place on the line. `inputs` are those it was resolved from.
+    pub(crate) fn native_defs<'r>(&'r self, inputs: &'r [Input]) -> impl Iterator<Item = NativeDef> + 'r {
+        self.graph.as_deref().into_iter().flat_map(move |graph| {
+            let order = move |load: u32| inputs[graph.loads[load as usize].input as usize].order;
+            (0..graph.slots.len() as u32).filter_map(move |slot| {
+                let it = &graph.slots[slot as usize];
+                if it.flags & (RUST | OUTSIDE) != 0 {
+                    return None;
+                }
+                if let Some((load, symbol)) = graph.best(slot) {
+                    let size = match graph.object(load).symbols[symbol as usize].def {
+                        SymbolDef::Section { size, .. } | SymbolDef::Common { size, .. } => size,
+                        _ => 0,
+                    };
+                    return Some(NativeDef { sym: it.sym, weak: it.strength < 3, order: order(load), size });
+                }
+                (it.flags & ALIAS != 0)
+                    .then(|| NativeDef { sym: it.sym, weak: true, order: order(unpack(it.fallback).0), size: 0 })
+            })
+        })
+    }
+}
+
+/// A name the natives define ([`Resolved::native_defs`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeDef {
+    pub sym: Sym,
+    /// Weak, or a common.
+    pub weak: bool,
+    /// Its object's place on the link line.
+    pub order: u32,
+    pub size: u64,
 }
 
 /// A number that changes exactly when a stage built its resolution's graph again.
@@ -1464,9 +1656,10 @@ struct Build {
     group_list: Vec<(u32, u32)>,
     mismatches: FxHashMap<String, (String, u32)>,
     asked: FxHashSet<String>,
-    shared: Vec<(Arc<NativeFile>, bool)>,
-    /// Import libraries' members, in load order.
-    members: Vec<Arc<NativeFile>>,
+    /// The line's shared libraries: file, `as_needed`, place on the line.
+    shared: Vec<(Arc<NativeFile>, bool, u32)>,
+    /// Import libraries' members, in load order, and their archive's place on the line.
+    members: Vec<(Arc<NativeFile>, u32)>,
     commons: FxHashMap<u32, (u64, u64)>,
 }
 
@@ -1533,7 +1726,7 @@ impl Build {
         let graph = &mut self.graph;
         for slot in 0..graph.slots.len() as u32 {
             let it = graph.slots[slot as usize];
-            if it.fallback != NONE64 && it.flags & RUST == 0 && graph.best(slot).is_none() {
+            if it.fallback != NONE64 && it.flags & (RUST | OUTSIDE) == 0 && graph.best(slot).is_none() {
                 graph.slots[slot as usize].flags |= ALIAS;
             }
         }
@@ -1656,16 +1849,20 @@ impl<'a> Stage<'a> {
         for input in inputs.iter() {
             let NativeFile::Shared(shared) = &*input.file else { continue };
             for wanted in &shared.inputs {
-                let found = names.contains(wanted.as_str())
-                    || inputs.iter().any(|it| {
-                        it.name.len() > wanted.len()
-                            && it.name.ends_with(wanted.as_str())
-                            && it.name.as_bytes()[it.name.len() - wanted.len() - 1] == b'/'
-                    });
-                if !found {
-                    // alloc: error path
-                    return Err(error(None, format!("{} names {wanted}, which the link line does not have", input.name)));
+                if line_has(&names, wanted) {
+                    continue;
                 }
+                let what = match wanted.strip_prefix("-l") {
+                    Some(file) if file.starts_with(':') => {
+                        // alloc: error path
+                        format!("{} names {wanted}, and the link line has no {}", input.name, &file[1..])
+                    }
+                    // alloc: error path
+                    Some(lib) => format!("{} names {wanted}, and the link line has no lib{lib}.so or lib{lib}.a", input.name),
+                    // alloc: error path
+                    None => format!("{} names {wanted}, which the link line does not have", input.name),
+                };
+                return Err(error(None, what));
             }
         }
         let old: &'a State = self.old;
@@ -2376,7 +2573,7 @@ impl<'a> Stage<'a> {
     /// Resolves the natives and the names, reusing what the image's resolution can. A stage
     /// that made and removed no piece, on the image's inputs and names, keeps the image's
     /// resolution as it is and allocates nothing.
-    pub fn resolve(&mut self) -> Result<(), LinkError> {
+    pub fn resolve<O: Outside>(&mut self, outside: &O) -> Result<(), LinkError> {
         // clone: an `Arc`: the image's resolution, read while this stage's is made
         let old = self.new.resolved.clone();
         let (refs, changes) = self.references(&old);
@@ -2412,11 +2609,11 @@ impl<'a> Stage<'a> {
             (true, _) => None,
             // clone: every field an `Arc` or copy-on-write: reference counts, no allocation
             (false, true) => Some((*old).clone()),
-            (false, false) => self.grow(&old, &refs, &gained)?,
+            (false, false) => self.grow(&old, &refs, &gained, outside)?,
         };
         let mut next = match grown {
             Some(it) => it,
-            None => self.rebuild(&old, &refs)?,
+            None => self.rebuild(&old, &refs, outside)?,
         };
         next.refs = refs;
         next.pieces = self.new.piece_count();
@@ -2428,13 +2625,21 @@ impl<'a> Stage<'a> {
 
     /// Resolves names Rust newly refers to against the kept graph, and makes what they newly
     /// reach; `None` when that needs what only building the graph again gives.
-    fn grow(&mut self, old: &Resolved, refs: &Refs, gained: &[Sym]) -> Result<Option<Resolved>, LinkError> {
+    fn grow<O: Outside>(
+        &mut self,
+        old: &Resolved,
+        refs: &Refs,
+        gained: &[Sym],
+        outside: &O,
+    ) -> Result<Option<Resolved>, LinkError> {
         // clone: an `Arc`: the kept graph, read while the stage makes what it reaches
         let Some(graph) = old.graph.clone() else { return Ok(None) };
         // clone: copy-on-write: reference counts, copied only where marked
         let mut marks = old.marks.clone();
         let mut outcomes: Vec<(Sym, u8)> = Vec::with_capacity(gained.len());
         let mut undefined: Vec<Sym> = Vec::with_capacity(gained.len());
+        // alloc: none unless the image beside defines a gained name, once per grown resolution
+        let mut beside: Vec<(Sym, Def)> = Vec::new();
         let (sections, frames) = {
             let symbols: &Symbols = &*self.symbols;
             let mut marker = Marker::new(&graph, &mut marks, symbols, self.writer);
@@ -2450,6 +2655,20 @@ impl<'a> Stage<'a> {
                     continue;
                 }
                 let slot = graph.slot_of.get(&sym).copied();
+                if O::ANY {
+                    // No loaded object mentions a name new to the graph, so only archives
+                    // could define it, and the image beside comes before them.
+                    let def = match slot {
+                        Some(slot) if graph.slots[slot as usize].flags & OUTSIDE != 0 => graph.outside.get(&slot).copied(),
+                        Some(_) => None,
+                        None => symbols.name_of(sym).and_then(|name| outside.name(name)).map(outside_def),
+                    };
+                    if let Some(def) = def {
+                        beside.push((sym, def));
+                        outcomes.push((sym, O_RUST | weak));
+                        continue;
+                    }
+                }
                 if slot.is_some_and(|it| graph.slots[it as usize].flags & ALIAS != 0) {
                     return Ok(None);
                 }
@@ -2542,6 +2761,10 @@ impl<'a> Stage<'a> {
         }
         // clone: every field an `Arc` or copy-on-write: reference counts, no allocation
         let mut next = old.clone();
+        for (sym, def) in beside {
+            self.define(sym, def);
+            next.defined.push(sym);
+        }
         let mut imports: Vec<(Sym, Import)> = Vec::with_capacity(decisions.len());
         for (sym, decision, outcome) in decisions {
             match decision {
@@ -2594,9 +2817,66 @@ impl<'a> Stage<'a> {
         Ok(Some(next))
     }
 
+    /// Where the image beside defines a name the loads mention, a whole link's rule picks
+    /// between its definition and theirs: strong beats weak (a common is weaker than
+    /// either), of two weak ones the first on the line wins, two strong ones are the
+    /// duplicate symbol error. Rust's names lose to none.
+    fn beside_names<O: Outside>(&self, b: &mut Build, inputs: &[Input], outside: &O) -> Result<(), LinkError> {
+        for slot in 0..b.graph.slots.len() as u32 {
+            let it = b.graph.slots[slot as usize];
+            let Some(name) = self.symbols.name_of(it.sym) else { continue };
+            let Some(theirs) = outside.name(name) else { continue };
+            let strength = if theirs.strength == Strength::Strong { 3 } else { 2 };
+            let duplicate = |ours: &str| {
+                // alloc: error path
+                error(None, format!("duplicate symbol `{name}`: {ours}, and so does the image this one is linked beside"))
+            };
+            let wins = if it.flags & RUST != 0 {
+                if strength == 3 {
+                    return Err(duplicate("Rust code defines it"));
+                }
+                false
+            } else {
+                match b.graph.best(slot) {
+                    None => true,
+                    Some((load, _)) if strength == 3 && it.strength == 3 => {
+                        // alloc: error path
+                        return Err(duplicate(&format!("{} defines it", self.input_name(b.graph.loads[load as usize].input))));
+                    }
+                    Some(_) if strength != it.strength => strength > it.strength,
+                    Some((load, _)) => theirs.order < inputs[b.graph.loads[load as usize].input as usize].order,
+                }
+            };
+            if !wins && theirs.strength == Strength::Weak && outside.reached_directly(name) {
+                let ours = match b.graph.best(slot) {
+                    Some((load, _)) if it.flags & RUST == 0 => self.input_name(b.graph.loads[load as usize].input),
+                    _ => "Rust code",
+                };
+                return Err(error(
+                    None,
+                    // alloc: error path
+                    format!(
+                        "`{name}` is defined by {ours} in {}, and weakly by the dependency image it is linked beside, \
+                         whose own code reaches its definition directly: a whole link would reach this one from there \
+                         too",
+                        self.name
+                    ),
+                ));
+            }
+            if wins {
+                let it = &mut b.graph.slots[slot as usize];
+                it.best = NONE64;
+                it.strength = 0;
+                it.flags |= OUTSIDE;
+                b.graph.outside.insert(slot, outside_def(theirs));
+            }
+        }
+        Ok(())
+    }
+
     /// Builds the graph again from the kept objects and makes the image's natives and names
     /// what it gives, touching only what differs.
-    fn rebuild(&mut self, old: &Resolved, refs: &Refs) -> Result<Resolved, LinkError> {
+    fn rebuild<O: Outside>(&mut self, old: &Resolved, refs: &Refs, outside: &O) -> Result<Resolved, LinkError> {
         let output = self.output;
         // clone: an `Arc`: the inputs, read while the stage defines and makes pieces
         let inputs = self.new.inputs.clone();
@@ -2659,8 +2939,9 @@ impl<'a> Stage<'a> {
                 }
                 NativeFile::Archive(_) => lazy.push(at),
                 NativeFile::Shared(_) => {
+                    let as_needed = matches!(input.kind, NativeKind::Shared { as_needed: true });
                     // clone: an `Arc`: the library's file, for the exports
-                    b.shared.push((input.file.clone(), matches!(input.kind, NativeKind::Shared { as_needed: true })));
+                    b.shared.push((input.file.clone(), as_needed, input.order));
                 }
             }
         }
@@ -2671,7 +2952,7 @@ impl<'a> Stage<'a> {
             for (&(input, _), read) in round.iter().zip(reads) {
                 match read {
                     Read::Object(parsed) => self.register(&mut b, parsed, input, pulled)?,
-                    Read::Shared(file) => b.members.push(file),
+                    Read::Shared(file) => b.members.push((file, inputs[input as usize].order)),
                     Read::Index(_) => {}
                 }
             }
@@ -2682,6 +2963,10 @@ impl<'a> Stage<'a> {
                     continue;
                 }
                 let Some(name) = self.symbols.name_of(b.graph.slots[slot as usize].sym) else { continue };
+                // A member is pulled only for what is still undefined after the image beside.
+                if O::ANY && outside.name(name).is_some() {
+                    continue;
+                }
                 for (input, table) in &archives {
                     let NativeFile::Archive(archive) = &*inputs[*input as usize].file else { continue };
                     if let Some(member) = archive_find(table, archive, name) {
@@ -2699,6 +2984,14 @@ impl<'a> Stage<'a> {
             round = next;
             pulled = true;
         }
+        match output.format {
+            Format::Pe => default_libraries(&b.graph, &inputs)?,
+            Format::MachO => linker_options(&b.graph, &inputs)?,
+            Format::Elf | Format::Wasm => {}
+        }
+        if O::ANY {
+            self.beside_names(&mut b, &inputs, outside)?;
+        }
         b.aliases(&*self.symbols)?;
         let mut commons: Vec<(Sym, u64, u64)> = Vec::with_capacity(b.commons.len());
         for (slot, (size, align)) in &b.commons {
@@ -2709,7 +3002,7 @@ impl<'a> Stage<'a> {
         }
         commons.sort_unstable_by_key(|it| it.0);
         let mut shared = std::mem::take(&mut b.shared);
-        shared.extend(b.members.drain(..).map(|it| (it, false)));
+        shared.extend(b.members.drain(..).map(|(it, order)| (it, false, order)));
         b.graph.exports = match old.graph.as_ref().map(|it| &it.exports) {
             // clone: an `Arc`: the libraries are the image's, so are their exports
             Some(it) if it.same(&shared) => it.clone(),
@@ -2896,6 +3189,8 @@ impl<'a> Stage<'a> {
             } else if it.flags & ALIAS != 0 {
                 let (load, symbol) = unpack(it.fallback);
                 Def::Alias(graph.loads[load as usize].parsed.sym(symbol))
+            } else if it.flags & OUTSIDE != 0 {
+                graph.outside[&slot]
             } else {
                 continue;
             };
@@ -3007,11 +3302,13 @@ impl<'a> Stage<'a> {
         // alloc: one index per shared library, once per graph built; kept as the image's
         let mut index = vec![NONE; exports.libraries.len()];
         let mut needed: Vec<Library> = Vec::with_capacity(exports.libraries.len());
+        let mut library_orders: Vec<u32> = Vec::with_capacity(exports.libraries.len());
         for (at, library) in exports.libraries.iter().enumerate() {
             if exports.canonical[at] == at as u32 && (!library.as_needed || used[at]) {
                 index[at] = needed.len() as u32;
                 // clone: the edge: the image's needed list owns its libraries' names, once per graph built
                 needed.push(Library { name: library.name.clone(), as_needed: library.as_needed });
+                library_orders.push(exports.orders[at]);
             }
         }
         let mut current: FxHashMap<Sym, Import> = FxHashMap::with_capacity_and_hasher(imports.len(), Default::default());
@@ -3088,6 +3385,7 @@ impl<'a> Stage<'a> {
             imports: keep(&old.imports, imports),
             import_syms: keep(&old.import_syms, import_syms),
             libraries: keep(&old.libraries, needed),
+            library_orders: keep(&old.library_orders, library_orders),
             // clone: an `Arc`
             exports: graph.asked.clone(),
             stale,

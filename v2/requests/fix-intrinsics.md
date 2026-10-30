@@ -23,3 +23,11 @@ pointers under Cranelift, and this unit keeps none", and on WebAssembly with an 
 it. The refs walk (`Walk::lowered_intrinsic`) admits it as asking for nothing. Not compiled.
 
 > forwarded to fix-intrinsics-codegen (told by speed-backend; told again by requests).
+
+> changed by codegen-rq-features (2026-10-29, not built), for safety.md F2 item 2 (the codegen
+> lead gave it the `mod.rs` half): the frame-pointer refusal in the `(I::ReturnAddress, [])` arm
+> is removed, as fix-intrinsics' report suggested. The IR builder can't tell an LLVM unit,
+> whose `llvm.returnaddress(0)` needs no frame pointer (the fuzz build's units), from a
+> Cranelift one. `emit_with` now compiles a function containing `GetReturnAddress` with the
+> frame-pointer ISA, as it does for `GetFramePointer`. The arm's dispatch is unchanged. Test:
+> `a_function_reading_its_return_address_keeps_its_frame_pointer` (`mod.rs` tests).

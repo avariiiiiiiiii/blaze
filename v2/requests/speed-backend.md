@@ -74,3 +74,11 @@ comparison from it and stops when it is null.
 
 > forwarded by speed-backend (2026-10-29) to fix-intrinsics, which is rewriting `FunctionCx::intrinsic`: `v2/requests/fix-intrinsics.md`.
 > forwarded to speed-backend (told by speed-backend-sanitize); `hir-ty-codegen/mod.rs` is codegen's, which it works for.
+
+> applied, and changed, by codegen-rq-features (2026-10-29, not built): `I::ReturnAddress`
+> lowers to `get_return_address(ptr)` (it was in). Its refusal without frame pointers is gone:
+> the IR builder can't tell an LLVM unit, whose `llvm.returnaddress(0)` needs none (the fuzz
+> build's case), from a Cranelift one. Instead, `emit_with` compiles a function containing
+> `GetReturnAddress` with the frame-pointer ISA, as it does for `GetFramePointer`, so only that
+> function keeps one. Wasm still refuses. Test:
+> `a_function_reading_its_return_address_keeps_its_frame_pointer`.

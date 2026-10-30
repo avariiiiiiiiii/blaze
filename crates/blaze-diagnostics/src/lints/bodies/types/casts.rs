@@ -20,7 +20,7 @@ pub(crate) mod static_mut_refs;
 
 use hir::InFile;
 use hir_def::hir::ExprId;
-use syntax::{AstNode, ast};
+use syntax::view::{self as ast, AstNode};
 
 use super::util::{from_expansion, span as expr_span};
 use crate::{
@@ -32,9 +32,9 @@ use crate::{
 /// left out as rustc's lowering leaves them.
 fn cast_ty_span(b: &BodyCx<'_, '_>, cast: ExprId) -> Option<Span> {
     let node = b.expr_node(cast)?;
-    let InFile { file_id, value } = b.cx.syntax(node);
+    let InFile { file_id, value } = b.cx.syntax_view(node);
     let mut ty = ast::CastExpr::cast(value)?.ty()?;
-    while let ast::Type::ParenType(it) = &ty {
+    while let ast::Type::ParenType(it) = ty {
         ty = it.ty()?;
     }
     Some(b.cx.span(InFile::new(file_id, ty.syntax().text_range())))
@@ -64,8 +64,8 @@ fn ancestor_in_same_ctxt(span: &Span, other: &Span) -> Option<Span> {
 /// (`typeck_results().expr_ty`).
 fn ty_text(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<String> {
     let node = b.expr_node(expr)?;
-    let syntax = b.cx.syntax(node);
+    let syntax = b.cx.syntax_view(node);
     let expr = ast::Expr::cast(syntax.value)?;
-    let info = b.cx.sema.type_of_expr(&expr)?;
+    let info = b.cx.vsema.type_of_expr(expr)?;
     Some(b.cx.ty(&info.original))
 }

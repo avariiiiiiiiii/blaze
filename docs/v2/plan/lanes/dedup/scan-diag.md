@@ -79,7 +79,7 @@ need. In
 - Moved: the backtrace tests go from `emit.rs` to `model.rs`. The two copies had no other
   tests of their own: `blaze-lints/src/tests.rs`'s whole-pipeline expectations, unchanged, now
   run on the shared emitter.
-- Differential: `emit/reference.rs` holds the deleted emitter (taking a `Diag`) as the
+- Differential: `emit/reference_tests.rs` holds the deleted emitter (taking a `Diag`) as the
   reference, and a proptest compares them over ASCII `\n` files, one or two of them, 1-2 primary
   spans, labels with tabs, children with and without spans, every suggestion style and
   applicability, disjoint and attribute suggestions, short, colour and a narrow width.

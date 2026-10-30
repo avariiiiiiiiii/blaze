@@ -276,9 +276,6 @@ impl<FileId: Copy, N: AstNode> InFileWrapper<FileId, N> {
     pub fn syntax(&self) -> InFileWrapper<FileId, &SyntaxNode> {
         self.with_value(self.value.syntax())
     }
-    pub fn node_file_range(&self) -> FileRangeWrapper<FileId> {
-        FileRangeWrapper { file_id: self.file_id, range: self.value.syntax().text_range() }
-    }
 }
 
 impl<FileId: Copy, N: AstNode> InFileWrapper<FileId, &N> {
@@ -288,7 +285,7 @@ impl<FileId: Copy, N: AstNode> InFileWrapper<FileId, &N> {
     }
 }
 
-/// The views' [`InFileWrapper::syntax`] and [`InFileWrapper::node_file_range`]: named `_view`, as
+/// The views' [`InFileWrapper::syntax`] and the node's file range: named `_view`, as
 /// a type may be both a handle and a view in coherence's eyes.
 impl<'t, FileId: Copy, N: view::AstNode<'t>> InFileWrapper<FileId, N> {
     pub fn syntax_view(&self) -> InFileWrapper<FileId, view::Node<'t>> {
@@ -496,12 +493,6 @@ fn parent_with_macros<'db>(
             let item = node.file_id.macro_file()?.loc(db).to_node_item_view(db);
             Some(item.with_value(view::AstNode::syntax(&item.value).parent()?))
         }
-    }
-}
-
-impl InMacroFile<SyntaxToken> {
-    pub fn upmap_once(self, db: &Db) -> InFile<smallvec::SmallVec<[TextRange; 1]>> {
-        self.file_id.expansion_info(db).map_range_up_once(db, self.value.text_range())
     }
 }
 

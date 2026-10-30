@@ -1,27 +1,33 @@
 //! The front end of a v2 build over the database: what each instance and static is by
 //! content, whose code it is, and what it refers to.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base_db::{Db, Crate, CrateOrigin};
 use blaze_codegen::{
     CodegenError,
+    Owner,
     backend::{Address, Described, DescribedStatic, FrontRef, Frontend},
-    plan::{Origin, PlanError, Policy},
+    plan::{Mode, Origin, Package, PlanError, Policy},
 };
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, attrs::AttrFlags,
+    AdtId, CallableDefId, DefWithBodyId, FunctionId, GenericDefId, HasModule, Lookup,
+    attrs::AttrFlags,
     expr_store::ExpressionStore,
 };
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
     db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
-    next_solver::{DbInterner, GenericArgs, ParamEnv, Region, TyKind},
+    next_solver::{DbInterner, GenericArgs, ParamEnv, Region, Ty, TyKind},
 };
-use hir_ty_mir::mir::overflow::crate_checks_overflow;
+use hir_ty_mir::mir::{MirOptions, overflow::crate_checks_overflow};
+use hir_ty_share::{BodyOptions, OptionsSet, ShareDef, ShareInstance};
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
+use rustc_type_ir::inherent::{
+    BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike as _,
+};
 use salsa::plumbing::FromId;
 use smallvec::{SmallVec, smallvec};
 
@@ -61,60 +67,64 @@ pub trait BodyChecks: Sync {
 pub struct HirFrontend<'db> {
     pub(crate) databases: Databases<'db>,
     pub(crate) hashes: HashSource,
-    pub(crate) build_time: BuildTime,
-    /// Which origins' units MIR-inline: what a function's references are walked for.
-    inlining: Option<Inlining>,
-    // dyn: called once a level of the walk, never per instance
+    pub(crate) build_time: std::sync::Arc<BuildTime>,
+    /// How each origin's units build bodies: what a function's references are walked for and
+    /// what a generic is shared under.
+    units: Option<Units>,
+    // dyn: `reached` once a level of the walk, `stopped` once a function compiled (2 ns
+    // against its 50 to 200 µs), never per instruction
     checks: Option<&'db dyn BodyChecks>,
+    /// Set when the build's job is cancelled or gives way to another task.
+    stop: Option<&'db AtomicBool>,
 }
 
-/// Whether some unit of each origin of the build's [`Policy`] MIR-inlines
-/// (`Spec::mir_inline`), the first spec or the one a live build tiers it up to.
-struct Inlining {
+/// One value for each origin of the build's [`Policy`], told apart as the plan tells them.
+struct ByOrigin<T> {
     /// A member's, a dependency's, build-time code's, of a package the profile names no
     /// override for.
-    member: Result<bool, PlanError>,
-    dependency: Result<bool, PlanError>,
-    build_time: Result<bool, PlanError>,
+    member: T,
+    dependency: T,
+    build_time: T,
     /// Of a package the profile names (`[profile.*.package.<name>]`), the same three.
-    packages: FxHashMap<String, [Result<bool, PlanError>; 3]>,
-    std: Result<bool, PlanError>,
-    /// Some origin's units inline: what a generic, which every origin may ask for, is walked
-    /// with.
-    any: bool,
+    packages: FxHashMap<Package, [T; 3]>,
+    std: T,
 }
 
-impl Inlining {
-    /// Made once a build, choosing for each origin as the plan does.
-    fn of(policy: &Policy) -> Inlining {
-        let inlines = |origin: Origin| {
-            policy.choose(&origin, None).map(|choice| {
-                let then = choice.then.is_some_and(|it| Build::of(&it).inlines);
-                Build::of(&choice.first).inlines || then
-            })
-        };
-        let kinds = |name: &str| {
-            [
-                inlines(Origin::Member(name.to_owned())),
-                inlines(Origin::Dependency(name.to_owned())),
-                inlines(Origin::BuildTime(name.to_owned())),
-            ]
+impl<T> ByOrigin<T> {
+    /// Made once a build.
+    fn of(policy: &Policy, mut each: impl FnMut(&Origin) -> T) -> ByOrigin<T> {
+        let mut kinds = |name: Package| {
+            [each(&Origin::Member(name)), each(&Origin::Dependency(name)), each(&Origin::BuildTime(name))]
         };
         // No package is named the empty name: these are of one the profile has nothing for.
-        let [member, dependency, build_time] = kinds("");
+        let [member, dependency, build_time] = kinds(Package::new(""));
         let packages: FxHashMap<_, _> = (policy.profile.packages.keys())
             .filter(|it| *it != "*")
-            .map(|name| (name.clone(), kinds(name)))
-            .collect();
-        let std = inlines(Origin::Std);
-        let any = [&member, &dependency, &build_time, &std]
-            .into_iter()
-            .chain(packages.values().flatten())
-            .any(|it| it == &Ok(true));
-        Inlining { member, dependency, build_time, packages, std, any }
+            .map(|name| {
+                let name = Package::new(name);
+                (name, kinds(name))
+            })
+            .collect(); // alloc: once a build, sized by the packages the profile names
+        let std = each(&Origin::Std);
+        ByOrigin { member, dependency, build_time, packages, std }
     }
 
-    fn of_origin(&self, origin: &Origin) -> &Result<bool, PlanError> {
+    fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> ByOrigin<U> {
+        let (member, dependency, build_time) =
+            (f(&self.member), f(&self.dependency), f(&self.build_time));
+        let packages = (self.packages.iter())
+            .map(|(name, kinds)| (*name, kinds.each_ref().map(&mut f)))
+            .collect(); // alloc: once a build, sized by the packages the profile names
+        ByOrigin { member, dependency, build_time, packages, std: f(&self.std) }
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        [&self.member, &self.dependency, &self.build_time, &self.std]
+            .into_iter()
+            .chain(self.packages.values().flatten())
+    }
+
+    fn get(&self, origin: &Origin) -> &T {
         let (name, kind) = match origin {
             Origin::Std => return &self.std,
             Origin::Member(name) => (name, 0),
@@ -128,9 +138,120 @@ impl Inlining {
     }
 }
 
+/// How the units of each origin of the build's [`Policy`] build bodies. Made once a build,
+/// choosing for each origin as the plan does.
+struct Units {
+    /// Whether some unit of the origin MIR-inlines (`Spec::mir_inline`), at the first spec or
+    /// one a build tiers it up to.
+    inlines: ByOrigin<Result<bool, PlanError>>,
+    /// Some origin's units inline: what a generic, which every origin may ask for, is walked
+    /// with.
+    any: bool,
+    /// Every options a unit of the origin may build a body with ([`Build::options`]), by
+    /// whether the body is of the library's crates: what a generic it asks for is shared
+    /// under ([`hir_ty_share::share_key`]).
+    options: ByOrigin<Result<BodyOptions, String>>,
+}
+
+impl Units {
+    fn of(db: &Db, policy: &Policy) -> Units {
+        let builds = ByOrigin::of(policy, |origin| builds_of(policy, origin));
+        let inlines = builds.map(|it| match it {
+            Ok(builds) => Ok(builds.iter().any(|it| it.inlines)),
+            Err(e) => Err(e.clone()), // clone: once a build, an error
+        });
+        let any = inlines.values().any(|it| it == &Ok(true));
+        let crates = base_db::all_crates(db);
+        let mut by_build: FxHashMap<Build, Asked> = FxHashMap::default();
+        let options = builds.map(|it| -> Result<BodyOptions, String> {
+            let builds = it.as_ref().map_err(ToString::to_string)?;
+            let mut asked = Asked::default();
+            for &build in builds {
+                let of = by_build.entry(build).or_insert_with(|| asked_of(db, &crates, build));
+                asked.add(of);
+            }
+            Ok(BodyOptions { lang: options_set(&asked.lang)?, other: options_set(&asked.other)? })
+        });
+        Units { inlines, any, options }
+    }
+}
+
+/// How the units of `origin` build bodies: at its first spec, at the spec a live build tiers
+/// it up to, and in a tiered run at LLVM's, which optimizes (`blaze_stencil::tier::Tier::Llvm`).
+fn builds_of(policy: &Policy, origin: &Origin) -> Result<SmallVec<[Build; 3]>, PlanError> {
+    let choice = policy.choose(origin, None)?;
+    let first = Build::of(&choice.first);
+    let mut builds: SmallVec<[Build; 3]> = smallvec![first]; // alloc: none, inline
+    builds.extend(choice.then.as_ref().map(Build::of));
+    if policy.mode == Mode::Tiered && policy.toolchain.llvm.is_some() {
+        builds.push(Build { optimized: true, ..first });
+    }
+    Ok(builds)
+}
+
+/// The options bodies are built with, each once: of the library's crates and of the rest.
+#[derive(Default)]
+struct Asked {
+    lang: SmallVec<[MirOptions; 2]>,
+    other: SmallVec<[MirOptions; 2]>,
+}
+
+impl Asked {
+    fn push(&mut self, lang: bool, options: MirOptions) {
+        let class = if lang { &mut self.lang } else { &mut self.other };
+        if !class.contains(&options) {
+            class.push(options);
+        }
+    }
+
+    fn add(&mut self, other: &Asked) {
+        other.lang.iter().for_each(|&it| self.push(true, it));
+        other.other.iter().for_each(|&it| self.push(false, it));
+    }
+}
+
+/// Every [`Build::options`] `build` gives a body of each crate of the graph, compiled in its
+/// own crate or in another, as an instance is in the crate [`Homes`] picks for it.
+fn asked_of(db: &Db, crates: &[Crate], build: Build) -> Asked {
+    let mut asked = Asked::default();
+    for (at, &written) in crates.iter().enumerate() {
+        let lang = written.data(db).origin.is_lang();
+        let elsewhere = crates.get(usize::from(at == 0)).copied().filter(|it| *it != written);
+        for compiling in [Some(written), elsewhere].into_iter().flatten() {
+            asked.push(lang, build.options(db, written, compiling));
+        }
+    }
+    asked
+}
+
+/// `options` as the share key takes them. The set must hold each whole: options it can't tell
+/// apart would key two bodies as one.
+fn options_set(options: &[MirOptions]) -> Result<OptionsSet, String> {
+    let set = OptionsSet::of(options);
+    match options.iter().find(|it| !set.iter().any(|kept| kept == **it)) {
+        None => Ok(set),
+        // alloc: once a build, an error
+        Some(lost) => Err(format!(
+            "`hir_ty_share::OptionsSet` can't hold the MIR options {lost:?} a unit builds bodies \
+             with, so no generic can be shared by what its code reads"
+        )),
+    }
+}
+
+const NO_POLICY: &str = "the front end was made with no policy (`HirFrontend::with_policy`), so \
+                         it can't tell how the instance's units build its MIR";
+
 impl<'db> HirFrontend<'db> {
-    pub fn new(databases: Databases<'db>, hashes: HashSource, build_time: BuildTime) -> Self {
-        HirFrontend { databases, hashes, build_time, inlining: None, checks: None }
+    /// `build_time` is shared: a daemon makes one a job and hands it to each unit's front end.
+    pub fn new(databases: Databases<'db>, hashes: HashSource, build_time: std::sync::Arc<BuildTime>) -> Self {
+        HirFrontend { databases, hashes, build_time, units: None, checks: None, stop: None }
+    }
+
+    /// The front end of a build that stops before its next function once `stop` is set: its
+    /// job was cancelled, or the plane asked its task to give way. Checked or not.
+    pub fn with_stop(mut self, stop: &'db AtomicBool) -> Self {
+        self.stop = Some(stop);
+        self
     }
 
     /// The front end of a build whose unit's bodies `checks` checks beside it.
@@ -143,7 +264,7 @@ impl<'db> HirFrontend<'db> {
     /// The front end of a build compiled as `policy` says: what describing and preparing a
     /// function need, which list what its code calls as the units of its origin inline it.
     pub fn with_policy(mut self, policy: &Policy) -> Self {
-        self.inlining = Some(Inlining::of(policy));
+        self.units = Some(Units::of(self.databases.db, policy));
         self
     }
 
@@ -166,17 +287,13 @@ impl<'db> HirFrontend<'db> {
         instance: &HirInstance,
         origin: Option<&Origin>,
     ) -> Result<bool, String> {
-        let Some(inlining) = &self.inlining else {
-            return Err("the front end was made with no policy (`HirFrontend::with_policy`), so \
-                        it can't tell which units inline the instance's MIR"
-                .to_owned());
-        };
+        let Some(units) = &self.units else { return Err(NO_POLICY.to_owned()) }; // alloc: an error
         let of_origin = match crate_of(db, &instance.0) {
             Some(krate) if !generic(&instance.0) => match origin {
-                Some(origin) => inlining.of_origin(origin),
-                None => inlining.of_origin(&self.origin(db, krate)),
+                Some(origin) => units.inlines.get(origin),
+                None => units.inlines.get(&self.origin(db, krate)),
             },
-            _ => return Ok(inlining.any),
+            _ => return Ok(units.any),
         };
         of_origin.as_ref().copied().map_err(|it| it.to_string())
     }
@@ -219,12 +336,20 @@ impl<'db> HirFrontend<'db> {
         .map_err(|what| undescribed(instance, None, what))?;
         let fail = |what: String| undescribed(instance, Some(item), what);
         let code = code_of(db, hashes, &instance.0).map_err(fail)?;
-        let args = args_of(db, hashes, &instance.0).map_err(fail)?;
         let generic = generic(&instance.0);
         let origin = match crate_of(db, &instance.0) {
             Some(krate) if !generic => self.origin(db, krate),
             _ => requester.clone(),
         };
+        let args = match generic {
+            true => self.shared_args(db, &instance.0, &origin),
+            false => args_of(db, hashes, &instance.0),
+        }
+        .map_err(fail)?;
+        let owner = self.owner(db, &instance.0, requester);
+        let plain = if generic { args_of(db, hashes, &instance.0).map_err(fail)? } else { args };
+        let identity = identity(db, &instance.0, item, plain);
+        let bound = bound(db, &instance.0, code, plain);
         let overflow_checks = if generic { written_checks(db, &instance.0) } else { None };
         let symbol = symbol_of(db, &instance.0);
         let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
@@ -241,7 +366,38 @@ impl<'db> HirFrontend<'db> {
             name: super::linked::debug_name(db, &instance.0),
             refs,
             built_in,
+            owner,
+            identity,
+            bound,
         })
+    }
+
+    /// A generic's arguments as its code reads them, compiled as `origin` asks: its share key
+    /// under every options a unit of `origin` builds a body with, or, for an instance with
+    /// none, its arguments' content ID ([`args_of`]). Both give exact code; the reason it has
+    /// no key says why it is per instance. A generic callee is of its caller's origin, so its
+    /// key here is the one its caller's key holds.
+    fn shared_args(&self, db: &Db, kind: &Kind, origin: &Origin) -> Result<ContentId, String> {
+        let Kind::Code(instance, env) = kind else { return args_of(db, &self.hashes, kind) };
+        let options = self.body_options(origin)?;
+        // clone: the query's key, a reference count
+        let shared = ShareInstance { def: share_def(instance.def), args: instance.args.clone() };
+        match hir_ty_share::share_key(db, &shared, env, options) {
+            Ok(key) => Ok(Hasher::new(SHARED_ARGS_DOMAIN).id(&key.0).finish()),
+            Err(why) => {
+                tracing::debug!(?instance, %why, "compiled per instance");
+                args_of(db, &self.hashes, kind)
+            }
+        }
+    }
+
+    /// Every options a unit of `origin` builds a body with: what a generic it asks for is
+    /// shared under.
+    pub(super) fn body_options(&self, origin: &Origin) -> Result<BodyOptions, String> {
+        match &self.units {
+            Some(units) => units.options.get(origin).clone(), // clone: a copy, or an error
+            None => Err(NO_POLICY.to_owned()), // alloc: an error
+        }
     }
 
     /// Whose code a crate's is, for its settings.
@@ -250,10 +406,10 @@ impl<'db> HirFrontend<'db> {
         let name = match &data.origin {
             CrateOrigin::Lang(_) => return Origin::Std,
             CrateOrigin::Local { name: Some(name), .. } | CrateOrigin::Library { name, .. } => {
-                name.as_str().to_owned()
+                Package::new(name.as_str())
             }
             CrateOrigin::Local { name: None, .. } | CrateOrigin::Rustc { .. } => {
-                fncache::crate_name(db, krate)
+                Package::new(&fncache::crate_name(db, krate))
             }
         };
         if self.build_time.0.contains(&krate) {
@@ -263,6 +419,48 @@ impl<'db> HirFrontend<'db> {
             CrateOrigin::Local { .. } => Origin::Member(name),
             _ => Origin::Dependency(name),
         }
+    }
+
+    /// Whether a crate's code is the workspace's for a dependency image: a member's or a
+    /// build-time crate's, never the standard library's.
+    fn workspace(&self, db: &Db, krate: Crate) -> bool {
+        match krate.data(db).origin {
+            CrateOrigin::Lang(_) => false,
+            CrateOrigin::Local { .. } => true,
+            _ => self.build_time.0.contains(&krate),
+        }
+    }
+
+    /// Whose an instance is for a dependency image ([`Owner`]): the workspace's when its item
+    /// is or any of its type arguments names a workspace crate's type, closure or item. A
+    /// shim's item is the standard library's (`drop_in_place`, `FnOnce::call_once`), so its
+    /// type arguments decide; an `asm!` function is its asker's, the allocator shim the
+    /// program's.
+    fn owner(&self, db: &Db, kind: &Kind, requester: &Origin) -> Owner {
+        let ours = |krate: Crate| self.workspace(db, krate);
+        let instance = match kind {
+            Kind::Code(instance, _) => instance,
+            Kind::Start(main) if ours(main.krate(db)) => return Owner::Workspace,
+            Kind::Start(_) => return Owner::Dependency,
+            Kind::Asm(_) => {
+                return match requester {
+                    Origin::Member(_) | Origin::BuildTime(_) => Owner::Workspace,
+                    Origin::Dependency(_) | Origin::Std => Owner::Dependency,
+                };
+            }
+            Kind::Allocator(_) => return Owner::Workspace,
+        };
+        let item = match instance.def {
+            InstanceDef::VtableShim(func) => Some(func.krate(db)),
+            _ => crate_of(db, kind),
+        };
+        let named = || {
+            (instance.args.as_ref().iter())
+                .flat_map(|arg| arg.walk())
+                .filter_map(|arg| arg.ty())
+                .any(|ty| names_workspace(db, ty, &ours))
+        };
+        if item.is_some_and(&ours) || named() { Owner::Workspace } else { Owner::Dependency }
     }
 
     fn described_static(
@@ -322,7 +520,7 @@ impl Frontend for HirFrontend<'_> {
     }
 
     fn stopped(&self) -> bool {
-        self.checks.is_some_and(|it| it.stopped())
+        self.stop.is_some_and(|it| it.load(Ordering::Relaxed)) || self.checks.is_some_and(|it| it.stopped())
     }
 }
 
@@ -470,6 +668,23 @@ const ASM_ITEM_DOMAIN: &str = "blaze v2 asm item 1";
 const ASM_DOMAIN: &str = "blaze v2 asm 1";
 const START_DOMAIN: &str = "blaze v2 start 1";
 const ARGS_DOMAIN: &str = "blaze v2 args 1";
+/// A share key in place of the arguments: never equal to an [`ARGS_DOMAIN`] hash.
+const SHARED_ARGS_DOMAIN: &str = "blaze v2 shared args 1";
+
+/// What an instance runs, as the share key names it.
+fn share_def(def: InstanceDef) -> ShareDef {
+    match def {
+        InstanceDef::Fn(func) => ShareDef::Fn(func),
+        InstanceDef::Closure(id) => ShareDef::Closure(id),
+        InstanceDef::Coroutine(id) => ShareDef::Coroutine(id),
+        InstanceDef::CoroutineByMove(id) => ShareDef::CoroutineByMove(id),
+        InstanceDef::DropGlue => ShareDef::DropGlue,
+        InstanceDef::CallOnceShim => ShareDef::CallOnceShim,
+        InstanceDef::VtableShim(func) => ShareDef::VtableShim(func),
+        InstanceDef::FnPointerShim => ShareDef::FnPointerShim,
+        InstanceDef::ReifyShim { receiver } => ShareDef::ReifyShim { receiver },
+    }
+}
 
 /// What an instance's code is. A shim's is what kind of shim it is, with the code of the
 /// function whose signature it adapts: what else it reads is its type argument's.
@@ -557,6 +772,82 @@ pub(super) fn crate_of(db: &Db, kind: &Kind) -> Option<Crate> {
         Kind::Start(main) => Some(main.krate(db)),
         Kind::Asm(_) | Kind::Allocator(_) => None,
     }
+}
+
+/// Whether a type, not looking into its arguments (the walk does), is a workspace crate's.
+/// An alias is taken as one: a monomorphic instance's arguments have none left.
+fn names_workspace(db: &Db, ty: Ty<'_>, ours: &impl Fn(Crate) -> bool) -> bool {
+    let closure = |owner: InferBodyId<'_>| ours(owner.module(db).krate(db));
+    match ty.kind() {
+        TyKind::Adt(def, _) => ours(def.def_id().krate(db)),
+        TyKind::Foreign(alias) => ours(alias.0.krate(db)),
+        TyKind::FnDef(def, _) => ours(def.0.krate(db)),
+        TyKind::Closure(id, _) => closure(id.0.loc(db).owner),
+        TyKind::CoroutineClosure(id, _) => closure(id.0.loc(db).owner),
+        TyKind::Coroutine(id, _) | TyKind::CoroutineWitness(id, _) => {
+            closure(id.0.loc(db).owner)
+        }
+        TyKind::Dynamic(predicates, _) => (predicates.principal_def_id().into_iter())
+            .chain(predicates.auto_traits())
+            .any(|it| ours(GenericDefId::TraitId(it.0).krate(db))),
+        TyKind::Alias(..) => true,
+        _ => false,
+    }
+}
+
+const IDENTITY_DOMAIN: &str = "blaze v2 instance identity 1";
+const INSTANCE_BOUND_DOMAIN: &str = "blaze v2 instance bound 1";
+
+/// What an instance is across versions ([`Described::identity`]): a closure or coroutine by
+/// its own key (its place among its store's closures, which an edit before it keeps), a
+/// shim by its kind, with its item and plain arguments.
+fn identity(db: &Db, kind: &Kind, item: ItemKey, args: ContentId) -> ContentId {
+    let mut hasher = Hasher::new(IDENTITY_DOMAIN);
+    match kind {
+        Kind::Code(instance, _) => match instance.def {
+            InstanceDef::Fn(_) => hasher.update(&[0]).id(&item.0),
+            InstanceDef::Closure(id) => hasher
+                .update(&[1])
+                .id(&blaze_items::key::closure_key(db, InternedClosureId::from_id(id)).0),
+            InstanceDef::Coroutine(id) => hasher
+                .update(&[2])
+                .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
+            InstanceDef::CoroutineByMove(id) => hasher
+                .update(&[3])
+                .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
+            InstanceDef::DropGlue => hasher.update(&[4]).id(&item.0),
+            InstanceDef::CallOnceShim => hasher.update(&[5]).id(&item.0),
+            InstanceDef::VtableShim(_) => hasher.update(&[6]).id(&item.0),
+            InstanceDef::FnPointerShim => hasher.update(&[7]).id(&item.0),
+            InstanceDef::ReifyShim { receiver } => {
+                hasher.update(&[8, u8::from(receiver)]).id(&item.0)
+            }
+        },
+        Kind::Start(_) => hasher.update(&[10]).id(&item.0),
+        Kind::Asm(_) => hasher.update(&[11]).id(&item.0),
+        Kind::Allocator(forward) => hasher.update(&[12]).part(forward.symbol.as_bytes()),
+    };
+    hasher.id(&args);
+    hasher.finish()
+}
+
+/// An instance's code as it runs, before what its references bind to (codegen adds those,
+/// `blaze_codegen::exec::bound`): its code hash, its plain arguments and its item's
+/// `blaze_items::bound_hash`, `Err` naming why it could not be hashed. `asm!` and the
+/// allocator shim are no item: their code is all there is.
+fn bound(db: &Db, kind: &Kind, code: CodeHash, args: ContentId) -> Result<ContentId, String> {
+    let mut hasher = Hasher::new(INSTANCE_BOUND_DOMAIN);
+    hasher.id(&code.0).id(&args);
+    if !matches!(kind, Kind::Asm(_) | Kind::Allocator(_)) {
+        let item = item_of(db, kind)?;
+        match blaze_items::bound_hash(db, item) {
+            Ok(Some(it)) => hasher.update(&[1]).id(&it),
+            // A shim's `FnOnce::call_once`: no body, so nothing it binds but its arguments.
+            Ok(None) => hasher.update(&[0]),
+            Err(why) => return Err(why.describe(db)),
+        };
+    }
+    Ok(hasher.finish())
 }
 
 /// The overflow checks the MIR of a generic says, as rustc builds a crate's MIR with its own:

@@ -1,7 +1,8 @@
-//! A dev build's way to its dependency image: [`plan`] splits the build, keys the image of
-//! its dependency pieces and picks the image it links against from the machine's
-//! [`Images`]; a [`Job`] makes an image (from the store when it is there, else by the
-//! prelink) for [`Images::finish`].
+//! A dev build's way to its dependency image: [`plan`] keys the build's graph and checks the
+//! graph's newest image of the machine's [`Images`] against the build; only when that image
+//! does not serve it does it split off the build's dependency pieces and key their image. A
+//! [`Job`] makes an image (from the store when it is there, else by the prelink) for
+//! [`Images::finish`].
 //!
 //! The daemon's dev run (`v2/requests/fastcompile.md`, fastcompile-premap 5):
 //!
@@ -19,7 +20,7 @@ use crate::PremapError;
 use crate::cache::{Images, Pick, Ready};
 use crate::key::{GraphInputs, GraphKey, ImageInputs, ImageKey};
 use crate::prelink::{self, Prelink, Request};
-use crate::split::{Built, ImagePart, Owned, SidedNative, WorkspacePart, image_part, workspace_part};
+use crate::split::{Built, Fit, ImagePart, Owned, SidedNative, WorkspacePart, image_part, workspace_part};
 use crate::store::Shelf;
 
 /// A dev build, as premap takes it.
@@ -36,9 +37,9 @@ pub enum Plan<'a> {
     /// Link `workspace` against `image`. `next` is set when the image lacks dependency
     /// pieces of this build: the image of its key, claimed, to make in the background.
     Link { image: Arc<Ready>, workspace: WorkspacePart<'a>, next: Option<Job<'a>> },
-    /// The graph has no image: make this one, claimed, and plan again.
+    /// No image serves the build: make the image of its key, claimed, and plan again.
     Make(Job<'a>),
-    /// Another build is making the graph's first image: wait for it and plan again.
+    /// Another build is making the image of this one's key: wait for it and plan again.
     Wait,
 }
 
@@ -50,9 +51,54 @@ pub struct Job<'a> {
     dev: &'a Dev<'a>,
 }
 
+/// A build its graph's newest image serves keys nothing but its graph: the image's pieces are
+/// checked against the build's ([`workspace_part`]). Only a build it does not serve splits
+/// off and keys its own image.
 pub fn plan<'a>(images: &mut Images, dev: &'a Dev<'a>) -> Result<Plan<'a>, PremapError> {
-    let part = image_part(&dev.built, &dev.owned, dev.natives)?;
     let graph = GraphKey::of(&dev.graph);
+    let newest = images.newest(graph);
+    if let Some(image) = &newest
+        && let Fit::Part(workspace) = workspace_part(&dev.built, &dev.owned, &image.view(), dev.natives)?
+    {
+        let image = Arc::clone(image);
+        if workspace.complete() {
+            return Ok(Plan::Link { image, workspace, next: None });
+        }
+        let (key, part) = own_key(graph, dev)?;
+        if image.key == key {
+            return Err(PremapError::of(format_args!(
+                "the dependency image {:?} lacks {} functions and {} statics its own pieces have",
+                key.0,
+                workspace.spilled.len(),
+                workspace.spilled_statics.len()
+            )));
+        }
+        let next = images.claim(key).then_some(Job { graph, key, part, dev });
+        return Ok(Plan::Link { image, workspace, next });
+    }
+    let (key, part) = own_key(graph, dev)?;
+    match images.want(key) {
+        Pick::Use(image) => match workspace_part(&dev.built, &dev.owned, &image.view(), dev.natives)? {
+            Fit::Part(workspace) if workspace.complete() => Ok(Plan::Link { image, workspace, next: None }),
+            Fit::Part(workspace) => Err(PremapError::of(format_args!(
+                "the dependency image {:?} lacks {} functions and {} statics its own pieces have",
+                key.0,
+                workspace.spilled.len(),
+                workspace.spilled_statics.len()
+            ))),
+            Fit::Stale(stale) => {
+                Err(PremapError::of(format_args!("the dependency image {:?} is not of its own pieces: {stale:?}", key.0)))
+            }
+        },
+        Pick::Make => Ok(Plan::Make(Job { graph, key, part, dev })),
+        Pick::Wait => Ok(Plan::Wait),
+        Pick::Failed(error) => Err(error),
+    }
+}
+
+/// The dependency pieces of `dev` and the key of their image.
+fn own_key<'a>(graph: GraphKey, dev: &'a Dev<'a>) -> Result<(ImageKey, ImagePart<'a>), PremapError> {
+    let part = image_part(&dev.built, &dev.owned, dev.natives)?;
     let key = ImageKey::of(
         graph,
         &ImageInputs {
@@ -62,27 +108,7 @@ pub fn plan<'a>(images: &mut Images, dev: &'a Dev<'a>) -> Result<Plan<'a>, Prema
             debug_names: &part.debug_names,
         },
     );
-    match images.pick(graph, key) {
-        Pick::Use(image) => {
-            let workspace = workspace_part(&dev.built, &dev.owned, &image.view().table(), dev.natives)?;
-            if workspace.complete() {
-                return Ok(Plan::Link { image, workspace, next: None });
-            }
-            if image.key == key {
-                return Err(PremapError::new(format!(
-                    "the dependency image {:?} lacks {} functions and {} statics its own pieces have",
-                    key.0,
-                    workspace.spilled.len(),
-                    workspace.spilled_statics.len()
-                )));
-            }
-            let next = images.claim(key).then_some(Job { graph, key, part, dev });
-            Ok(Plan::Link { image, workspace, next })
-        }
-        Pick::Make => Ok(Plan::Make(Job { graph, key, part, dev })),
-        Pick::Wait => Ok(Plan::Wait),
-        Pick::Failed(error) => Err(error),
-    }
+    Ok((key, part))
 }
 
 impl Job<'_> {
@@ -91,7 +117,7 @@ impl Job<'_> {
         if let Some(bytes) = shelf.get_image(&self.key)? {
             return Ready::open(self.graph, self.key, bytes);
         }
-        let name = format!("blaze-premap-{}", self.key.0);
+        let name = format!("blaze-premap-{}", self.key.0); // alloc: setup, once per image made: its output's name
         let output = prelink::output(self.dev.graph.output, &name);
         let request = Request {
             output: &output,
@@ -103,9 +129,13 @@ impl Job<'_> {
             debug_names: &self.part.debug_names,
             natives: &self.part.natives,
             spans: self.dev.spans,
+            function_digests: &self.part.function_digests,
+            static_digests: &self.part.static_digests,
+            debug_digests: &self.part.debug_digests,
         };
         let bytes = prelink::build(linker, &request, self.key)?;
-        shelf.put_image(&self.key, bytes.clone())?;
-        Ready::open(self.graph, self.key, bytes.into_boxed_slice())
+        let ready = Ready::open(self.graph, self.key, &bytes)?;
+        shelf.put_image(&self.key, bytes)?;
+        Ok(ready)
     }
 }

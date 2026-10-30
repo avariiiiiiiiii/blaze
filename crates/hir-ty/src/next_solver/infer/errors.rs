@@ -33,8 +33,9 @@ pub struct FulfillmentError<'db> {
     pub code: FulfillmentErrorCode<'db>,
     pub parent_trait_obligations: Vec<Predicate<'db>>,
     /// For each of `parent_trait_obligations`, the impl whose where clause the next obligation
-    /// came from (rustc's `ImplDerived`), or `None` where it didn't come from an impl.
-    pub parent_impls: Vec<Option<AnyImplId>>,
+    /// came from and that clause's index in the impl's predicates (rustc's `ImplDerived` with
+    /// its `impl_def_predicate_index`), or `None` where it didn't come from an impl.
+    pub parent_impls: Vec<Option<(AnyImplId, u32)>>,
 }
 
 impl FulfillmentError<'_> {
@@ -253,7 +254,7 @@ fn find_best_leaf_obligation<'db>(
     infcx: &InferCtxt<'db>,
     obligation: &PredicateObligation<'db>,
     consider_ambiguities: bool,
-) -> (PredicateObligation<'db>, Vec<Predicate<'db>>, Vec<Option<AnyImplId>>) {
+) -> (PredicateObligation<'db>, Vec<Predicate<'db>>, Vec<Option<(AnyImplId, u32)>>) {
     let obligation = infcx.deeply_resolve_ignoring_regions(*obligation);
     // FIXME: we use a probe here as the `BestObligation` visitor does not
     // check whether it uses candidates which get shadowed by where-bounds.
@@ -295,7 +296,7 @@ struct BestObligation<'db> {
     obligation: PredicateObligation<'db>,
     consider_ambiguities: bool,
     parent_trait_obligations: Vec<Predicate<'db>>,
-    parent_impls: Vec<Option<AnyImplId>>,
+    parent_impls: Vec<Option<(AnyImplId, u32)>>,
 }
 
 impl<'db> BestObligation<'db> {
@@ -303,7 +304,7 @@ impl<'db> BestObligation<'db> {
     fn with_derived_obligation(
         &mut self,
         derived_obligation: PredicateObligation<'db>,
-        parent_impl: Option<AnyImplId>,
+        parent_impl: Option<(AnyImplId, u32)>,
         and_then: impl FnOnce(&mut Self) -> <Self as ProofTreeVisitor<'db>>::Result,
     ) -> <Self as ProofTreeVisitor<'db>>::Result {
         let parent_predicate = self.obligation.predicate;
@@ -542,7 +543,7 @@ impl<'db> BestObligation<'db> {
 
 impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
     type Result =
-        ControlFlow<(PredicateObligation<'db>, Vec<Predicate<'db>>, Vec<Option<AnyImplId>>)>;
+        ControlFlow<(PredicateObligation<'db>, Vec<Predicate<'db>>, Vec<Option<(AnyImplId, u32)>>)>;
 
     fn span(&self) -> Span {
         self.obligation.cause.span()
@@ -657,7 +658,7 @@ impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
                         impl_where_bound_count,
                         parent_trait_pred,
                     ));
-                    parent_impl = candidate_impl;
+                    parent_impl = candidate_impl.map(|it| (it, impl_where_bound_count as u32));
                     impl_where_bound_count += 1;
                 }
                 (
@@ -671,7 +672,7 @@ impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
                         impl_where_bound_count,
                         parent_host_clause,
                     ));
-                    parent_impl = candidate_impl;
+                    parent_impl = candidate_impl.map(|it| (it, impl_where_bound_count as u32));
                     impl_where_bound_count += 1;
                 }
                 (ChildMode::PassThrough, _)

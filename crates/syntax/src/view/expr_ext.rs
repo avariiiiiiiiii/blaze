@@ -24,6 +24,18 @@ impl<'t> ast::Expr<'t> {
                 | ast::Expr::MatchExpr(_)
         )
     }
+
+    /// The expression inside every pair of parentheses around `self` (rustc's `peel_parens`:
+    /// HIR has no parentheses); `self` when it is not parenthesized, or a `()` holds nothing.
+    pub fn peel_parens(self) -> ast::Expr<'t> {
+        let mut expr = self;
+        while let ast::Expr::ParenExpr(paren) = expr
+            && let Some(inner) = paren.expr()
+        {
+            expr = inner;
+        }
+        expr
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -233,6 +245,13 @@ impl<'t> ast::IndexExpr<'t> {
 
     pub fn index(self) -> Option<ast::Expr<'t>> {
         support::children(self.syntax).nth(1)
+    }
+}
+
+impl<'t> ast::UnsafeBinderCastExpr<'t> {
+    /// Whether it is `builtin # wrap_binder(..)`, not `builtin # unwrap_binder(..)`.
+    pub fn is_wrap(self) -> bool {
+        self.wrap_binder_token().is_some()
     }
 }
 

@@ -19,15 +19,15 @@ use hir_def::{
     signatures::{ConstSignature, FunctionSignature},
     src::HasSource as _,
 };
-use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr};
+use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr_view};
 use hir_ty::Adjust;
 use syntax::{
-    AstNode as _, TextRange,
-    ast::{self, HasAttrs as _, HasName as _, HasVisibility as _},
+    TextRange,
+    view::{self as ast, AstNode as _, HasAttrs as _, HasName as _, HasVisibility as _},
 };
 
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag},
 };
@@ -37,7 +37,7 @@ pub(crate) struct InteriorMutableConsts;
 
 impl LatePass for InteriorMutableConsts {
     const LINTS: LintSet = lint_set(["const_item_interior_mutations"]);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::MethodCall, ExprTag::Call]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::MethodCall, ExprKind::Call]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();
@@ -112,8 +112,8 @@ impl LatePass for InteriorMutableConsts {
 /// expanded.
 fn should_not_be_called_on_const_items(db: &Db, method: FunctionId) -> bool {
     let cfg = method.krate(db).cfg_options(db);
-    let attrs = method.lookup(db).source(db).value.attrs();
-    expand_cfg_attr(attrs, || cfg, |meta, _| match meta {
+    let attrs = method.lookup(db).source_view(db).value.attrs();
+    expand_cfg_attr_view(attrs, || cfg, |meta, _| match meta {
         ast::Meta::PathMeta(it) if it.path().is1("rustc_should_not_be_called_on_const_items") => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     })
@@ -131,7 +131,7 @@ fn static_suggestion(b: &BodyCx<'_, '_>, diag: &mut Diag, konst: ConstId, const_
     }
     // alloc: the lint's text, for a lint found
     let message = format!("for a shared instance of `{const_name}`, consider making it a `static` item instead");
-    let source = loc.source(db);
+    let source = loc.source_view(db);
     let range = (|| {
         if source.file_id.is_macro() {
             return None;

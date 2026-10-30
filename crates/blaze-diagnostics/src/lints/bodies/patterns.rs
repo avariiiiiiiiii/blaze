@@ -13,15 +13,15 @@
 //! Apache-2.0). Which patterns are redundant and why is match checking's
 //! (`hir::DefWithBody::match_lints`); rustc checks no body that failed type checking.
 
-use hir::{DefWithBody, HasSource as _, InFile, IrrefutableLet, LetSource, MatchLint, PatternTypo};
+use hir::{DefWithBody, InFile, IrrefutableLet, LetSource, MatchLint, PatternTypo, view::HasSourceView as _};
 use syntax::{
-    AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange,
-    ast::{self, HasName as _},
+    AstPtr, SyntaxKind, SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode, HasName as _},
 };
 
 use super::BodyCx;
 use crate::{
-    cx::def_range,
+    cx::def_range_view,
     lower::{Found, Phase},
     model::{Applicability, Diag, MultiSpan, Span},
 };
@@ -141,10 +141,9 @@ fn pattern_typo(b: &BodyCx<'_, '_>, diag: &mut Diag, pat: &Span, typo: &PatternT
             );
         }
         PatternTypo::InaccessibleConstant(konst) => {
-            let Some(source) = konst.source(cx.db) else { return };
-            // clone: a lint's span, for a lint found
-            let node = source.map(|it| it.syntax().clone());
-            let range = def_range(&node.value);
+            let Some(source) = konst.source_view(cx.db) else { return };
+            let node = source.map(|it| it.syntax());
+            let range = def_range_view(node.value);
             diag.span_note(
                 cx.span(InFile::new(node.file_id, range)),
                 "there is a constant of the same name, which could have been used to pattern match against its value instead of introducing a new catch-all binding, but it is not accessible from this scope",
@@ -160,8 +159,8 @@ fn pattern_typo(b: &BodyCx<'_, '_>, diag: &mut Diag, pat: &Span, typo: &PatternT
 }
 
 /// rustc's `whole_arm_span`: the arm, from its pattern to its value, with the `,` after it.
-fn whole_arm(b: &BodyCx<'_, '_>, arm: InFile<AstPtr<ast::MatchArm>>) -> Option<Span> {
-    let node = b.cx.node(arm);
+fn whole_arm(b: &BodyCx<'_, '_>, arm: InFile<AstPtr<syntax::ast::MatchArm>>) -> Option<Span> {
+    let node = b.cx.node_view(arm);
     let start = node.value.pat()?.syntax().text_range().start();
     let end = match node.value.comma_token() {
         Some(comma) => comma.text_range().end(),
@@ -198,7 +197,7 @@ fn irrefutable_let(b: &BodyCx<'_, '_>, d: &IrrefutableLet) -> Option<Found> {
 /// `LetSource::LetElse`: at `else`, with the `let` labelled, unless the `let` is a macro's.
 fn let_else(b: &BodyCx<'_, '_>, d: &IrrefutableLet) -> Option<Found> {
     let cx = b.cx;
-    let node = cx.syntax(d.at);
+    let node = cx.syntax_view(d.at);
     let stmt = ast::LetStmt::cast(node.value)?;
     let start = stmt.let_token()?.text_range().start();
     let end = stmt.initializer()?.syntax().text_range().end();
@@ -238,7 +237,7 @@ fn binding_with_variant_name(b: &BodyCx<'_, '_>, d: &hir::BindingWithVariantName
     let cx = b.cx;
     let at = d.pat.map(|it| it.syntax_node_ptr());
     // alloc: the lint's text, for a lint found
-    let name = cx.node(d.pat).value.name()?.text().to_string();
+    let name = cx.node_view(d.pat).value.name()?.text();
     let span = cx.span_of(at);
     let ty_path = crate::print::def_path_untrimmed(cx, hir::ModuleDef::Adt(d.enum_.into()));
     let mut diag = Diag::lint(
@@ -306,9 +305,9 @@ fn non_contiguous_range_endpoints(b: &BodyCx<'_, '_>, d: &hir::NonContiguousRang
 
 /// rustc's `match_lint_level`: the `match`, `let` or parameter the pattern is part of, whose
 /// level the range lints take (an arm's own attributes don't count).
-fn match_level(b: &BodyCx<'_, '_>, pat: InFile<AstPtr<ast::Pat>>) -> InFile<SyntaxNodePtr> {
-    let node = b.cx.syntax(pat_node(pat));
-    for ancestor in b.cx.sema.ancestors_with_macros_file(node).skip(1) {
+fn match_level(b: &BodyCx<'_, '_>, pat: InFile<AstPtr<syntax::ast::Pat>>) -> InFile<SyntaxNodePtr> {
+    let node = b.cx.syntax_view(pat_node(pat));
+    for ancestor in b.cx.vsema.ancestors_with_macros_file(node).skip(1) {
         match ancestor.value.kind() {
             SyntaxKind::MATCH_ARM
             | SyntaxKind::MATCH_ARM_LIST
@@ -317,12 +316,12 @@ fn match_level(b: &BodyCx<'_, '_>, pat: InFile<AstPtr<ast::Pat>>) -> InFile<Synt
             | SyntaxKind::MACRO_CALL
             | SyntaxKind::TOKEN_TREE => {}
             kind if ast::Pat::can_cast(kind) => {}
-            _ => return ancestor.map(|it| SyntaxNodePtr::new(&it)),
+            _ => return ancestor.map(ast::ptr),
         }
     }
     pat_node(pat)
 }
 
-fn pat_node(pat: InFile<AstPtr<ast::Pat>>) -> InFile<SyntaxNodePtr> {
+fn pat_node(pat: InFile<AstPtr<syntax::ast::Pat>>) -> InFile<SyntaxNodePtr> {
     pat.map(|it| it.syntax_node_ptr())
 }

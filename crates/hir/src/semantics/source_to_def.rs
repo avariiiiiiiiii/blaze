@@ -465,11 +465,11 @@ impl<'db> SourceToDefCtx<'db, '_> {
     pub(super) fn attr_to_derive_macro_call(
         &mut self,
         item: InFile<&ast::Adt>,
-        src: InFile<ast::Meta>,
+        src: InFile<&ast::Meta>,
     ) -> Option<(AttrId, MacroCallId, &[Option<Either<MacroCallId, BuiltinDeriveImplId>>])> {
         let map = self.dyn_map(item)?;
         map[keys::DERIVE_MACRO_CALL]
-            .get(&AstPtr::new(&src.value))
+            .get(&AstPtr::new(src.value))
             .map(|&(attr_id, call_id, ref ids)| (attr_id, call_id, &**ids))
     }
 

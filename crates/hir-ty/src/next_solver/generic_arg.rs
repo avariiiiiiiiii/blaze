@@ -11,9 +11,8 @@ use std::{marker::PhantomData, num::NonZeroU32};
 use arrayvec::ArrayVec;
 use hir_def::{GenericDefId, GenericParamId, hir::generics::LifetimeParamData};
 use rustc_type_ir::{
-    ClosureArgs, ConstVid, CoroutineArgs, CoroutineClosureArgs, FallibleTypeFolder,
-    GenericTypeVisitable, Interner, TyVid, TypeFoldable, TypeFolder, TypeVisitable, TypeVisitor,
-    Variance,
+    ClosureArgs, CoroutineArgs, CoroutineClosureArgs, FallibleTypeFolder, GenericTypeVisitable,
+    Interner, TypeFoldable, TypeFolder, TypeVisitable, TypeVisitor, Variance,
     inherent::{GenericArg as _, GenericsOf, IntoKind, SliceLike, Term as _, Ty as _},
     relate::{Relate, VarianceDiagInfo},
     walk::TypeWalker,
@@ -745,24 +744,6 @@ impl<'db> Relate<DbInterner<'db>> for Term<'db> {
 }
 
 impl<'db> rustc_type_ir::inherent::Term<DbInterner<'db>> for Term<'db> {}
-
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub enum TermVid {
-    Ty(TyVid),
-    Const(ConstVid),
-}
-
-impl From<TyVid> for TermVid {
-    fn from(value: TyVid) -> Self {
-        TermVid::Ty(value)
-    }
-}
-
-impl From<ConstVid> for TermVid {
-    fn from(value: ConstVid) -> Self {
-        TermVid::Const(value)
-    }
-}
 
 impl<'db> DbInterner<'db> {
     pub(super) fn mk_args(self, args: &[GenericArg<'db>]) -> GenericArgs<'db> {

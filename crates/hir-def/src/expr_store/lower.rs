@@ -58,7 +58,7 @@ use crate::{
         Array, Binding, BindingAnnotation, BindingId, BindingProblems, CaptureBy, ClosureKind,
         CoroutineKind, CoroutineSource, Expr, ExprId, Item, Label, LabelId, Literal, LoopSource,
         MatchArm, Movability, OffsetOf, Pat, PatId, RecordFieldPat, RecordLitField, RecordSpread,
-        Statement, Statements, Unsafe, generics::GenericParams,
+        Statement, Statements, Unsafe, UnsafeBinderCastKind, generics::GenericParams,
     },
     item_scope::BuiltinShadowMode,
     lang_item::{LangItemTarget, LangItems},
@@ -468,6 +468,7 @@ pub(crate) fn lower_function(
     Option<TypeRefId>,
     bool,
     bool,
+    Option<u8>,
 ) {
     let mut expr_collector =
         ExprCollector::with_maps(db, module, fn_.file_id, LoweringMode::Analysis, maps);
@@ -477,6 +478,8 @@ pub(crate) fn lower_function(
     let params_mark = expr_collector.store.list_mark();
     let mut has_self_param = false;
     let mut has_variadic = false;
+    let is_splat = |attr: ast::Attr<'_>| attr.simple_name().is_some_and(|it| it == "rustc_splat");
+    let mut splat_at: Option<usize> = None;
     collector.collect_impl_trait(&mut expr_collector, |collector, impl_trait_lower_fn| {
         collector.with_lifetime_bound_scope(LifetimeBoundScope::Argument, |collector| {
             if let Some(param_list) = fn_.value.param_list() {
@@ -484,6 +487,9 @@ pub(crate) fn lower_function(
                     let enabled = collector.check_cfg(param);
                     if enabled {
                         has_self_param = true;
+                        if ast::HasAttrs::attrs(&param).any(is_splat) {
+                            splat_at = Some(0);
+                        }
                         let self_param_ty = match param.ty() {
                             Some(ty) => collector.lower_type_ref(ty, impl_trait_lower_fn),
                             None => {
@@ -524,7 +530,13 @@ pub(crate) fn lower_function(
                         has_variadic |= is_variadic;
                         !is_variadic
                     })
-                    .map(|param| param.ty())
+                    .enumerate()
+                    .map(|(index, param)| {
+                        if splat_at.is_none() && ast::HasAttrs::attrs(&param).any(is_splat) {
+                            splat_at = Some(index + usize::from(has_self_param));
+                        }
+                        param.ty()
+                    })
                     .collect::<SmallVec<[_; 8]>>();
                 for p in p {
                     let ty = collector.lower_type_ref_opt(p, impl_trait_lower_fn);
@@ -576,6 +588,11 @@ pub(crate) fn lower_function(
         return_type,
         has_self_param,
         has_variadic,
+        if has_variadic {
+            None
+        } else {
+            splat_at.and_then(|index| u8::try_from(index).ok()).filter(|&index| index < u8::MAX)
+        },
     )
 }
 
@@ -883,7 +900,7 @@ impl<'db> ExprCollector<'db> {
 
     /// With `maps`, what is collected is a part of `current_file_id` lowered as a tree of its
     /// own, and these are the maps of that part ([`Expander::within`]).
-    pub(crate) fn with_maps(
+    pub fn with_maps(
         db: &'db Db,
         module: ModuleId,
         current_file_id: HirFileId,
@@ -2129,6 +2146,15 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Expr::FormatArgsExpr(f) => self.collect_format_args(f, syntax_ptr),
             ast::Expr::IncludeBytesExpr(_) => self.alloc_expr(Expr::IncludeBytes, syntax_ptr),
+            ast::Expr::UnsafeBinderCastExpr(e) => {
+                let kind = match e.is_wrap() {
+                    true => UnsafeBinderCastKind::Wrap,
+                    false => UnsafeBinderCastKind::Unwrap,
+                };
+                let expr = self.collect_expr_opt(e.expr());
+                let ty = e.ty().map(|ty| self.lower_type_ref_disallow_impl_trait(ty));
+                self.alloc_expr(Expr::UnsafeBinderCast { kind, expr, ty }, syntax_ptr)
+            }
             ast::Expr::CfgPredExpr(e) => {
                 let enabled = Literal::Bool(self.check_cfg_pred(e.cfg_predicate()));
                 let id = self.store.alloc_literal_expr(enabled);

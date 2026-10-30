@@ -4,6 +4,7 @@
 
 mod calls;
 mod const_patterns;
+mod default_fields;
 mod members;
 mod patterns;
 mod print;

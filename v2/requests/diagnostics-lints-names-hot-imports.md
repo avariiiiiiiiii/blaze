@@ -211,6 +211,8 @@ becomes
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29), for `-uses` (no window left): every hunk as written; each still matched today's file.
+
 ## frontend-tree: blaze-diagnostics lints/names/imports/qualifications.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-uses`. Needs: the parent's `lints/syntax.rs` heading,
@@ -508,6 +510,8 @@ fn is_qualifying_trait(ty: Node<'_>) -> bool {
 > forwarded to diagnostics-lints-names-hot-imports (window of that name); told by tmux (requests, pass 25). (requests, pass 27: now diagnostics-next2, the lead, since that window is gone and its lane DONE; told by tmux.)
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29), for `-uses` (no window left): every hunk as written; each still matched today's file.
 
 ## frontend-tree: blaze-diagnostics lints/names/imports/globs.rs: onto views (1)
 
@@ -820,6 +824,8 @@ becomes
 > forwarded to diagnostics-lints-names-hot-imports (window of that name); told by tmux (requests, pass 25). (requests, pass 27: now diagnostics-next2, the lead, since that window is gone and its lane DONE; told by tmux.)
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29), for `-uses` (no window left): every hunk as written; each still matched today's file.
 
 ## frontend-tree: blaze-diagnostics lints/names/imports/unused.rs: onto views (1)
 
@@ -1244,6 +1250,8 @@ fn is_no_implicit_prelude(attr: ast::Attr<'_>) -> bool {
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
 
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29), for `-uses` (no window left): every hunk as written; each still matched today's file. Moved onto hir-def `use_tree_sources_view` (db-expand-defviews, `db-expand.md` src.rs (2)).
+
 ## frontend-tree: blaze-diagnostics lints/names/imports.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-uses`. Needs nothing outside: `MacroCallLoc::to_node_view`
@@ -1269,6 +1277,8 @@ becomes
 > forwarded to diagnostics-lints-names-hot-imports (window of that name); told by tmux (requests, pass 25). (requests, pass 27: now diagnostics-next2, the lead, since that window is gone and its lane DONE; told by tmux.)
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29), for `-uses` (no window left): every hunk as written; each still matched today's file.
 
 ## frontend-tree: blaze-diagnostics lints/names/imports/used.rs: onto views (1)
 
@@ -1912,4 +1922,6 @@ becomes
 ```
 
 > granted by diagnostics (window 113, 2026-10-29 22:20): frontend-tree's agents apply this directly under the grant in `v2/requests/diagnostics.md` `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (heading order, one function at a time, rereading before each edit), and mark it `> applied by <window>`. The `diagnostics-hot2-*` hot-lint pass (22:00) edited many of these files, so a staged base may have moved: merge onto today's file, and keep each `// alloc:`/`// clone:` comment where its line still allocates or clones.
+
+> applied by frontend-tree-move-diag-lints-next1 (2026-10-29), for `-uses` (no window left): every hunk as written; each still matched today's file. Moved onto hir-def `use_tree_sources_view` (db-expand-defviews, `db-expand.md` src.rs (2)).
 

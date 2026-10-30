@@ -75,17 +75,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     image::ImageMap,
-    memo::{MemoId, Slot, Store},
+    memo::{MemoId, Shared, Slot, Store},
     segment::Span,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         thread_local,
     },
     table::{Column, EdgeRecord, Edit, FxMap, FxSet, Map, Rows, ShortLock},
 };
 pub use crate::{
     subtree::TreeHash,
-    tree::{MemTree, Tree},
+    tree::{MemTree, Names, Tree},
 };
 
 /// A kind of query, by number. Numbers are given in `blaze-query`'s [`kinds`] for the
@@ -307,6 +307,12 @@ pub trait Query: 'static {
     /// The subsystem its runs allocate for: each run is a `blaze_mem::frame::task` of it, so
     /// what the run's code takes through `blaze_mem::frame::current` counts there.
     const TAG: blaze_mem::Tag = blaze_mem::Tag::Query;
+    /// Equal values of this kind are kept once, whichever view or key made them: a memo of an
+    /// equal value (its schema and fingerprint, then its bytes) names the one value row. Two
+    /// values of one fingerprint whose bytes differ panic, naming the query. For kinds whose
+    /// values often repeat across keys (docs/v2/plan/lanes/fastcompile/hashcons.md, "Which
+    /// values"); a kind that leaves it costs nothing.
+    const SHARE: bool = false;
     /// Kept as bytes (deterministic CBOR) beside the key's memos and in the image, so a
     /// dependency no one names again can still be run to verify an edge on it.
     type Key: Clone + Send + Sync + Serialize + serde::de::DeserializeOwned + 'static;
@@ -411,6 +417,8 @@ struct KindInfo {
     run: Runner,
     /// The tag of the frame task each run is ([`Query::TAG`]).
     tag: blaze_mem::Tag,
+    /// Set for a [`Query::SHARE`] kind.
+    share: Option<Shared>,
     /// The symbols a value of the kind names (`Persist::symbols`), marked live when an image
     /// is written.
     symbols: fn(&[u8], &mut Vec<u32>) -> Result<(), FormatError>,
@@ -723,7 +731,7 @@ impl<'db> Cx<'db> {
         let value = self.db.input(self.task, self.state, key, || Input::Dir(path.to_owned()))?;
         self.record(key, value.fingerprint);
         Ok(match &value.data {
-            InputData::Dir(Some(names)) => Some(&**names),
+            InputData::Dir(Some(names)) => Some(self.db.names(self.state.view.root, path, names)),
             _ => None,
         })
     }
@@ -753,7 +761,7 @@ impl<'db> Cx<'db> {
         let value = self.db.input(self.task, self.state, key, || Input::DirAt { root, path: path.to_owned() })?;
         self.record(key, value.fingerprint);
         Ok(match &value.data {
-            InputData::Dir(Some(names)) => Some(&**names),
+            InputData::Dir(Some(names)) => Some(self.db.names(root, path, names)),
             _ => None,
         })
     }
@@ -776,6 +784,12 @@ impl<'db> Cx<'db> {
         let value = self.db.input(self.task, state, key, || Input::Config)?;
         self.record(key, value.fingerprint);
         Ok(&*state.config)
+    }
+
+    /// The database's context of type `T`, as [`Database::provide`] gave it; `None` for none.
+    /// Records no edge: a context changes no value.
+    pub fn context<T: Send + Sync + 'static>(&self) -> Option<&'db T> {
+        self.db.contexts.get(&TypeId::of::<T>()).and_then(|context| (**context).downcast_ref())
     }
 
     /// Records that the query read `fact`, whose fingerprint was `saw`: for facts computed
@@ -950,6 +964,13 @@ impl ViewState {
         self.reruns.reset();
     }
 
+    /// Sizes its tables for as many results and inputs as `like` holds now: for an empty state
+    /// about to serve a view of a tree like `like`'s, whose keys go in with no table grown.
+    fn size_like(&mut self, like: &ViewState) {
+        self.results.size_like(&like.results);
+        self.inputs.size_like(&like.inputs);
+    }
+
     /// Makes it the state of `view`, as `ViewState::new` would.
     fn reuse(&mut self, id: ViewId, view: View, config: &[u8]) {
         self.id = id;
@@ -1021,7 +1042,10 @@ struct InputValue {
 #[derive(Clone)]
 enum InputData {
     File(Option<(ContentId, blaze_vfs::Mode, blaze_vfs::Bytes)>),
-    Dir(Option<Arc<[(String, bool)]>>),
+    /// A directory's names (`None` for no directory): hashed as the tree lent them, and kept
+    /// only once a query of the view reads them ([`Database::names`]), so verifying an edge
+    /// to a directory copies nothing.
+    Dir(Option<OnceLock<Box<[(String, bool)]>>>),
     Config,
 }
 
@@ -1089,6 +1113,11 @@ pub struct Database {
     inputs: Map<Input>,
     /// By [`ViewId`]; a closed one is taken out.
     views: Column<ViewState>,
+    /// One past the index of the view opened last; 0 before the first. A view opened is
+    /// sized like it.
+    newest: AtomicU32,
+    /// What [`Database::provide`] gave, by type: set only with `&mut`, so read with no lock.
+    contexts: FxMap<TypeId, Box<dyn Any + Send + Sync>>, // dyn: a context's type is its owner's
     /// One run of a key at a time, whatever view asked, on the plane's wait graph (#1301).
     flights: Flights<()>,
     /// Closed views, until every task that could hold them has ended, then kept for the next
@@ -1146,6 +1175,8 @@ impl Database {
             slots: Map::hot(),
             inputs: Map::new(),
             views: Column::new(),
+            newest: AtomicU32::new(0),
+            contexts: FxMap::default(),
             flights: Flights::new(),
             spare_views: ShortLock::default(),
             generation: AtomicU64::new(0),
@@ -1227,9 +1258,20 @@ impl Database {
                 query: TypeId::of::<Q>(),
                 run: run_query::<Q>,
                 tag: Q::TAG,
+                share: Q::SHARE.then_some(Shared { name: Q::NAME, schema: Q::Value::SCHEMA }),
                 symbols: <Q::Value as Persist>::symbols,
             },
         );
+    }
+
+    /// Gives every query `context`, which [`Cx::context`] hands it: what a query needs of the
+    /// database's owner that is no input, such as a code generator's front end and backends or
+    /// the daemon's memo of compiled templates. A context must not change any query's value,
+    /// since no edge records it: what a value depends on is its key and the files, configuration
+    /// and queries it reads. One of each type; a second replaces the first.
+    pub fn provide<T: Send + Sync + 'static>(&mut self, context: T) {
+        // alloc: once a context, when the database is set up.
+        self.contexts.insert(TypeId::of::<T>(), Box::new(context));
     }
 
     pub fn open(&self, view: View) -> ViewId {
@@ -1238,16 +1280,30 @@ impl Database {
 
     /// Opens `view` with its configuration (target, profile, features asked for), what
     /// [`Cx::config`] reads.
+    ///
+    /// Its tables are sized like those of the view opened last, if still open: a view of the
+    /// same tree then resolves and verifies with no table grown, allocating nothing.
     pub fn open_with(&self, view: View, config: &[u8]) -> ViewId {
         let spare = self.spare_views.lock().take();
-        Idx::from_raw(self.views.push_boxed(|index| match spare {
-            Some(mut state) => {
-                state.reuse(Idx::from_raw(index), view, config);
-                state
+        let index = self.views.push_boxed(|index| {
+            let mut state = match spare {
+                Some(mut state) => {
+                    state.reuse(Idx::from_raw(index), view, config);
+                    state
+                }
+                // alloc: a view's state, until as many views were closed as are open at once.
+                None => Box::new(ViewState::new(Idx::from_raw(index), view, Arc::from(config))),
+            };
+            let task = blaze_reclaim::enter();
+            if let Some(newest) = self.newest.load(Ordering::Relaxed).checked_sub(1)
+                && let Some(like) = self.views.get(&task, newest)
+            {
+                state.size_like(like);
             }
-            // alloc: a view's state, until as many views were closed as are open at once.
-            None => Box::new(ViewState::new(Idx::from_raw(index), view, Arc::from(config))),
-        }))
+            state
+        });
+        self.newest.fetch_max(index + 1, Ordering::Relaxed);
+        Idx::from_raw(index)
     }
 
     pub fn close(&self, view: ViewId) {
@@ -1541,6 +1597,8 @@ impl Database {
         // clone: once a settle, as is every clone and box below.
         let mut new = Database::open_image(self.config.clone(), image)?;
         std::mem::swap(&mut new.kinds, &mut self.kinds);
+        std::mem::swap(&mut new.contexts, &mut self.contexts);
+        new.newest = AtomicU32::new(self.newest.load(Ordering::Relaxed));
         let store = &new.store;
         new.kinds.for_each_mut(|info| info.code = store.code(info.schema, info.producer));
         let (next, views) = self.views.take_all();
@@ -1625,6 +1683,16 @@ impl Database {
     fn tree(&self) -> &dyn Tree {
         self.config.tree.as_deref().unwrap_or_else(|| {
             panic!("the database has no file tree to read a view's files from: make it with Database::new")
+        })
+    }
+
+    /// The names of the directory at `path` under `root`, as `names` keeps them for a view:
+    /// listed from the tree again the first time a query of the view reads them.
+    fn names<'g>(&self, root: ContentId, path: &str, names: &'g OnceLock<Box<[(String, bool)]>>) -> &'g [(String, bool)] {
+        names.get_or_init(|| {
+            // alloc: a directory's names, once per directory per view whose queries read them.
+            let names = self.tree().list(root, path);
+            names.unwrap_or_else(|| panic!("the tree lost directory {path:?} of root {root:x} while a view read it")).into_boxed_slice()
         })
     }
 
@@ -1818,25 +1886,20 @@ impl Database {
                 Ok(InputValue { fingerprint, data: InputData::File(file) })
             }
             Input::Dir(path) | Input::DirAt { path, .. } => {
-                let mut names = self.tree().list(root, path);
-                // Once per directory per view, so neither `Cx::dir`'s callers nor the
-                // fingerprint below depend on the tree's listing order.
-                if let Some(names) = &mut names
-                    && !names.is_sorted_by(|a, b| a.0 <= b.0)
-                {
-                    names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                }
-                let fingerprint = match &names {
-                    Some(names) => {
-                        let mut hasher = Hasher::new(NAMES_DOMAIN);
-                        for (name, dir) in names {
-                            hasher.part(name.as_bytes()).update(&[u8::from(*dir)]);
-                        }
-                        hasher.finish().fingerprint()
+                let mut hasher = Hasher::new(NAMES_DOMAIN);
+                let listed = self.tree().read_dir(root, path, &mut |names| {
+                    let mut last: Option<&str> = None;
+                    for (name, dir) in names {
+                        assert!(
+                            last.is_none_or(|last| last < name),
+                            "the tree listed directory {path:?} of root {root:x} out of order: {name:?} after {last:?}"
+                        );
+                        hasher.part(name.as_bytes()).update(&[u8::from(dir)]);
+                        last = Some(name);
                     }
-                    None => absent("directory"),
-                };
-                Ok(InputValue { fingerprint, data: InputData::Dir(names.map(Arc::from)) })
+                });
+                let fingerprint = if listed { hasher.finish().fingerprint() } else { absent("directory") };
+                Ok(InputValue { fingerprint, data: InputData::Dir(listed.then(OnceLock::new)) })
             }
             Input::Config => Ok(InputValue {
                 fingerprint: ContentId::of(CONFIG_DOMAIN, &state.config).fingerprint(),
@@ -1949,8 +2012,10 @@ impl Database {
         let Some((computed, recording)) = self.execute(task, state, info, run, source)? else {
             return Ok(None);
         };
-        let made =
-            recording.with(|edges| self.store.make(key, computed.fingerprint, info.code, edges, &computed.bytes));
+        let made = recording.with(|edges| match info.share {
+            Some(shared) => self.store.make_shared(key, computed.fingerprint, info.code, edges, &computed.bytes, shared),
+            None => self.store.make(key, computed.fingerprint, info.code, edges, &computed.bytes),
+        });
         drop(recording);
         let memo = self.add_memo(task, key, made);
         state.reruns.insert(task, key, Rerun { previous });
@@ -2048,7 +2113,10 @@ impl Database {
                         info.name, computed.fingerprint
                     );
                 }
-                self.store.refill(task, memo, &computed.bytes);
+                match info.share {
+                    Some(shared) => self.store.refill_shared(task, memo, &computed.bytes, shared),
+                    None => self.store.refill(task, memo, &computed.bytes),
+                }
                 Ok(())
             })?;
         }
@@ -2084,11 +2152,17 @@ impl Database {
         // alloc: one pack, its entries and its name a collection that moves values.
         let mut bytes = Vec::new();
         let mut entries = Vec::new(); // alloc: see above
+        // Equal values (a shared row's memos, or equal bytes of any kind) are written once.
+        let mut written: FxMap<ContentId, usize> = FxMap::default(); // alloc: see above
         for memo in memos {
             let Some((word, value)) = self.store.in_memory(task, memo) else { continue };
-            bytes.resize(bytes.len().next_multiple_of(blaze_format::ALIGN), 0);
-            let (at, len, id) = (bytes.len(), value.len(), value_id(value));
-            bytes.extend_from_slice(value);
+            let (len, id) = (value.len(), value_id(value));
+            let at = *written.entry(id).or_insert_with(|| {
+                bytes.resize(bytes.len().next_multiple_of(blaze_format::ALIGN), 0);
+                let at = bytes.len();
+                bytes.extend_from_slice(value);
+                at
+            });
             entries.push(ColdEntry { memo, word, at, len, id });
         }
         if entries.is_empty() {

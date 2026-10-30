@@ -217,16 +217,40 @@ pub(super) enum VariablePlace {
 }
 
 /// Where the stack slots of a function are while it runs, for the ones that hold a local
-/// written with a name.
+/// written with a name. Made by [`SlotPlaces::new`], and sorted again when read back, so that
+/// [`SlotPlaces::of`] finds a slot by binary search: one is asked for each variable told of.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "UnsortedSlotPlaces")]
 pub(super) struct SlotPlaces {
     /// The DWARF expression of what [`VariablePlace::Frame`] and `DW_OP_fbreg` count from.
     pub(super) frame_base: Vec<u8>,
-    /// The number of a slot and where its bytes are.
+    /// The number of a slot and where its bytes are, by the number.
     pub(super) slots: Vec<(u32, VariablePlace)>,
 }
 
+/// [`SlotPlaces`] as an entry written before its slots were kept sorted has them.
+#[derive(Deserialize)]
+struct UnsortedSlotPlaces {
+    frame_base: Vec<u8>,
+    slots: Vec<(u32, VariablePlace)>,
+}
+
+impl From<UnsortedSlotPlaces> for SlotPlaces {
+    fn from(it: UnsortedSlotPlaces) -> Self {
+        SlotPlaces::new(it.frame_base, it.slots)
+    }
+}
+
 impl SlotPlaces {
+    /// The places of `slots`, in any order: sorted by number, and of a number told twice the
+    /// first is the one [`SlotPlaces::of`] gives.
+    pub(super) fn new(frame_base: Vec<u8>, mut slots: Vec<(u32, VariablePlace)>) -> SlotPlaces {
+        if !slots.is_sorted_by_key(|it| it.0) {
+            slots.sort_by_key(|it| it.0);
+        }
+        SlotPlaces { frame_base, slots }
+    }
+
     /// The places in a frame Cranelift laid out for `func`, which it finds by the frame
     /// pointer.
     pub(super) fn of_frame(
@@ -258,7 +282,7 @@ impl SlotPlaces {
         if places.is_empty() {
             return SlotPlaces::default();
         }
-        SlotPlaces { frame_base: vec![gimli::DW_OP_reg0.0 + register.0 as u8], slots: places }
+        SlotPlaces::new(vec![gimli::DW_OP_reg0.0 + register.0 as u8], places)
     }
 }
 
@@ -330,7 +354,8 @@ fn pointee_expression(held: &[u8], offset: u32) -> Option<Vec<u8>> {
 
 impl SlotPlaces {
     pub(super) fn of(&self, slot: u32) -> Option<&VariablePlace> {
-        self.slots.iter().find(|it| it.0 == slot).map(|it| &it.1)
+        let at = self.slots.partition_point(|it| it.0 < slot);
+        self.slots.get(at).filter(|it| it.0 == slot).map(|it| &it.1)
     }
 }
 
@@ -1613,6 +1638,28 @@ mod tests {
             state ^= state >> 7;
             state ^= state << 17;
             state
+        }
+    }
+
+    /// A slot is found by binary search where a linear search of the slots as they were told
+    /// found it: the first told of its number, or none. What is read back of slots written
+    /// in any order is sorted too.
+    #[test]
+    fn a_slot_is_found_as_a_search_in_the_order_told_finds_it() {
+        for seed in 0..200 {
+            let mut next = seeded(seed);
+            let told: Vec<(u32, VariablePlace)> = (0..next() % 40)
+                .map(|at| ((next() % 24) as u32, VariablePlace::Frame(at as i64)))
+                .collect();
+            let places = SlotPlaces::new(vec![0x56], told.clone());
+            for slot in 0..26 {
+                let first = told.iter().find(|it| it.0 == slot).map(|it| &it.1);
+                assert_eq!(places.of(slot), first, "seed {seed}, slot {slot}");
+            }
+            let unsorted = SlotPlaces { frame_base: vec![0x56], slots: told };
+            let bytes = postcard::to_allocvec(&unsorted).unwrap();
+            let read: SlotPlaces = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(read, places, "seed {seed}");
         }
     }
 

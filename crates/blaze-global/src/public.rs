@@ -5,8 +5,11 @@
 //! a [`FunctionMade`] or a side table of a public function. Each check makes the key again
 //! with the function its owner makes it with (`Key::of`, `blaze_usercode::index`,
 //! `blaze_codegen::query::keys`), so what is checked is what the key is a hash of, and then
-//! checks every input's [`Origin`]. What passes is a [`Public`]: the client fetches and the
-//! builders publish only those.
+//! checks every input's [`Origin`]. A dependency's front-end image ([`ImageMade`]) is the one
+//! key not made again here: it is a hash of the crate graph and files only the front end's
+//! database holds, so what it covers comes from the walk that makes it, and is checked the
+//! same way. What passes is a [`Public`]: the client fetches and the builders publish only
+//! those.
 //!
 //! Public is:
 //! - a crates.io crate version, named by the SHA-256 of its `.crate` the lock file gives and
@@ -24,14 +27,14 @@
 //! function. And whatever the inputs, a value holding a [`Secrets`] entry is never published.
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt,
     path::{Component, Path, PathBuf},
 };
 
 use blaze_cas::{Key, Kind};
 use blaze_codegen::{Backend, Instance, InstanceKey, query::keys, settings::Spec, summary::Imports};
-use blaze_core::Traced;
+use blaze_core::{Traced, Untraceable};
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 use blaze_usercode::{Given, RunKey, index, trace};
@@ -87,6 +90,9 @@ pub struct Root {
 #[derive(Clone, Debug)]
 pub struct Rule {
     toolchain: ContentId,
+    /// The blaze that reads and writes dependency images: its own code with the nightly it
+    /// compiles against, as their keys name it.
+    build: ContentId,
     systems: Vec<ContentId>,
     roots: Vec<Root>,
     /// Each root by the hash of its components ([`component_hash`]) and its depth, sorted:
@@ -189,6 +195,48 @@ pub struct FunctionMade<'a> {
     pub imported: &'a [FnSource],
 }
 
+/// A dependency crate's image key and what it covers, as `hir_def::deps` made it. The key is a
+/// hash of the crate graph and its files, which only the front end's database holds, so the
+/// walk that makes the key gives these with it (`hir_def::deps::KeyInputs`) and the driver
+/// passes them on. Images are kept as [`Kind::Query`] values.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageMade<'a> {
+    /// The crate's key (`hir_def::deps::keys`).
+    pub key: ContentId,
+    /// The blaze build the key was made by.
+    pub build: ContentId,
+    /// Where the crate and each crate of its dependency closure come from, the crate first.
+    pub crates: &'a [Origin],
+    /// The `OUT_DIR` of each of `crates` that has one.
+    pub out_dirs: &'a [&'a Path],
+    /// The names the crate read besides its key's inputs (its `Reads`), which its slots keep.
+    pub reads: &'a [ImageRead<'a>],
+}
+
+/// A name a crate's resolution read: by an `env!`, or by one of its proc-macro expansions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageRead<'a> {
+    File(&'a Path),
+    /// A directory's listing.
+    Dir(&'a Path),
+    /// A variable of the process or of the shell an expansion ran in.
+    Env(&'a OsStr),
+    /// What an expansion read that can't be traced.
+    Untraceable(Untraceable),
+}
+
+/// Which key of a crate's image.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImagePart {
+    /// The image under the crate's key alone: a crate that read nothing besides its key's
+    /// inputs.
+    Image,
+    /// A slot of the key, keeping the names the crate read (`hir_def::deps::reads::slot`).
+    Slot(ContentId),
+    /// The image filed by those names and their values (`hir_def::deps::reads::image_key`).
+    Filed(ContentId),
+}
+
 /// The hash of a path's components up to and with `component`, from `hash`, theirs before
 /// it: equal for paths `Path::starts_with` takes as equal, as a drive's letter is any case
 /// there, so every prefix (its kind and letters) hashes alike and the compare decides.
@@ -214,10 +262,16 @@ fn depth_bit(depth: u32) -> u64 {
 }
 
 impl Rule {
-    /// The rule pinning `toolchain` and the builders' `systems`, with what is under each of
-    /// `roots`, and the variables of `public_env` public. Of two roots of one path the later
-    /// is taken.
-    pub fn new(toolchain: ContentId, systems: Vec<ContentId>, roots: Vec<Root>, public_env: Vec<OsString>) -> Rule {
+    /// The rule pinning `toolchain`, the `build` of blaze that dependency images are keyed by,
+    /// and the builders' `systems`, with what is under each of `roots`, and the variables of
+    /// `public_env` public. Of two roots of one path the later is taken.
+    pub fn new(
+        toolchain: ContentId,
+        build: ContentId,
+        systems: Vec<ContentId>,
+        roots: Vec<Root>,
+        public_env: Vec<OsString>,
+    ) -> Rule {
         let mut by_hash = Vec::with_capacity(roots.len());
         let mut depths = 0;
         for (at, root) in roots.iter().enumerate() {
@@ -226,11 +280,15 @@ impl Rule {
             by_hash.push((hash, depth, at as u32));
         }
         by_hash.sort_unstable();
-        Rule { toolchain, systems, roots, by_hash, depths, public_env }
+        Rule { toolchain, build, systems, roots, by_hash, depths, public_env }
     }
 
     pub fn toolchain(&self) -> ContentId {
         self.toolchain
+    }
+
+    pub fn build(&self) -> ContentId {
+        self.build
     }
 
     pub fn systems(&self) -> &[ContentId] {
@@ -251,13 +309,16 @@ impl Rule {
             Origin::CratesIo { name, version, .. } if !name.is_empty() && !version.is_empty() => Ok(()),
             Origin::CratesIo { .. } => Err("a crates.io crate with no name or version".into()),
             Origin::Toolchain(id) if *id == self.toolchain => Ok(()),
+            // alloc: an error's message, made only when it fails.
             Origin::Toolchain(id) => Err(format!(
                 "it reads the toolchain {:x}, not the pinned {:x}",
                 id, self.toolchain
             )),
             Origin::System(id) if self.systems.contains(id) => Ok(()),
+            // alloc: an error's message, made only when it fails.
             Origin::System(id) => Err(format!("it reads the system image {:x}, which is not a builder's", id)),
             Origin::Outputs => Ok(()),
+            // alloc: an error's message, made only when it fails.
             private => Err(format!("it reads {private}")),
         }
     }
@@ -303,6 +364,7 @@ impl Rule {
 
     fn public_path(&self, path: &Path) -> Result<(), String> {
         let origin = self.path(path)?;
+        // alloc: an error's message, made only when it fails.
         self.origin(origin).map_err(|why| format!("{why} ({})", path.display()))
     }
 
@@ -328,17 +390,21 @@ impl Rule {
         if made.given.finish() != made.run.given {
             return Err(private("what it was given is not what its key was made with".into()));
         }
+        // alloc: an error's message, made only when it fails.
         self.origin(made.code).map_err(|why| private(format!("its code: {why}")))?;
+        // alloc: an error's message, made only when it fails.
         self.origin(made.caller).map_err(|why| private(format!("what it runs for: {why}")))?;
         for (name, value) in made.given.vars() {
             let path = Path::new(value);
             if path.is_absolute() {
                 self.public_path(path)
+                    // alloc: an error's message, made only when it fails.
                     .map_err(|why| private(format!("{} names a path: {why}", name.to_string_lossy())))?;
             }
         }
         let traced = made.traced;
         if let Some(it) = traced.untraceable.first() {
+            // alloc: an error's message, made only when it fails.
             return Err(private(format!("it read what can't be traced ({})", trace::untraceable_name(*it))));
         }
         for (path, _) in &traced.files {
@@ -352,6 +418,7 @@ impl Rule {
                 return Err(private("it read the whole environment".into()));
             }
             if value.is_some() && !self.public_env.contains(name) {
+                // alloc: an error's message, made only when it fails.
                 return Err(private(format!(
                     "it read {} with a value, which is the machine's",
                     name.to_string_lossy()
@@ -374,6 +441,7 @@ impl Rule {
             return Err(private("it is not compiled by LLVM: only release code is shared".into()));
         }
         if spec.toolchain.id != self.toolchain {
+            // alloc: an error's message, made only when it fails.
             return Err(private(format!(
                 "it is compiled by the toolchain {:x}, not the pinned {:x}",
                 spec.toolchain.id, self.toolchain
@@ -387,8 +455,10 @@ impl Rule {
         let all = std::iter::once(made.function).chain(made.built_in).chain(made.imported);
         for source in all {
             let what = || source.instance.key().0;
+            // alloc: an error's message, made only when it fails.
             self.origin(&source.code).map_err(|why| private(format!("the code of {:x}: {why}", what())))?;
             for origin in &source.args {
+                // alloc: an error's message, made only when it fails.
                 self.origin(origin).map_err(|why| private(format!("a type argument of {:x}: {why}", what())))?;
             }
         }
@@ -399,9 +469,86 @@ impl Rule {
     pub fn side(&self, id: &ContentId, of: &Public) -> Result<Public, Private> {
         let key = keys::side(id);
         if of.kind != Kind::Code {
+            // alloc: an error's message, made only when it fails.
             return Err(Private { key, why: format!("a side table of {:x}, which is not code", of.key.0) });
         }
         Ok(Public { key, kind: Kind::Debug })
+    }
+
+    /// Whether `part` of a dependency crate's image is public: the key is the pinned build's,
+    /// the crate and each crate of its closure is a crates.io version or the toolchain, each
+    /// `OUT_DIR` is under the outputs of public runs, and each name the crate read is a file
+    /// or listing of a public source or a public variable.
+    pub fn image(&self, made: &ImageMade<'_>, part: ImagePart) -> Result<Public, Private> {
+        let key = Key(match part {
+            ImagePart::Image => made.key,
+            ImagePart::Slot(key) | ImagePart::Filed(key) => key,
+        });
+        let private = |why: String| Private { key, why };
+        if made.build != self.build {
+            // alloc: an error path, as is each message below.
+            return Err(private(format!(
+                "it is keyed by the blaze build {:x}, not the pinned {:x}",
+                made.build, self.build
+            )));
+        }
+        if made.crates.is_empty() {
+            return Err(private("it covers no crate".into()));
+        }
+        for (at, origin) in made.crates.iter().enumerate() {
+            let which = |why: String| match at {
+                // alloc: an error path.
+                0 => private(format!("the crate: {why}")),
+                // alloc: an error path.
+                _ => private(format!("a crate it depends on: {why}")),
+            };
+            match origin {
+                Origin::CratesIo { .. } | Origin::Toolchain(_) => self.origin(origin).map_err(which)?,
+                // alloc: an error path.
+                other => return Err(which(format!("it is {other}, not a crates.io crate or the toolchain"))),
+            }
+        }
+        for &out in made.out_dirs {
+            match self.path(out) {
+                Ok(Origin::Outputs) => {}
+                Ok(other) => {
+                    // alloc: an error path.
+                    return Err(private(format!(
+                        "its OUT_DIR {} is {other}, not the outputs of public build scripts",
+                        out.display()
+                    )));
+                }
+                // alloc: an error path.
+                Err(why) => return Err(private(format!("its OUT_DIR: {why}"))),
+            }
+        }
+        if part == ImagePart::Image && !made.reads.is_empty() {
+            // alloc: an error path.
+            return Err(private("a crate that read names besides its key's inputs has no image under its key alone".into()));
+        }
+        for read in made.reads {
+            match *read {
+                ImageRead::File(path) | ImageRead::Dir(path) => {
+                    // alloc: an error path.
+                    self.public_path(path).map_err(|why| private(format!("a name it read: {why}")))?
+                }
+                ImageRead::Untraceable(it) => {
+                    // alloc: an error path.
+                    return Err(private(format!("it read what can't be traced ({})", trace::untraceable_name(it))));
+                }
+                // alloc: an error path.
+                ImageRead::Env(name) if name == trace::ALL_ENV_NAME => return Err(private("it read the whole environment".into())),
+                ImageRead::Env(name) if self.public_env.iter().any(|it| it.as_os_str() == name) => {}
+                ImageRead::Env(name) => {
+                    // alloc: an error path.
+                    return Err(private(format!(
+                        "it read the variable {}, which is the machine's",
+                        name.to_string_lossy()
+                    )));
+                }
+            }
+        }
+        Ok(Public { key, kind: Kind::Query })
     }
 }
 
@@ -439,6 +586,7 @@ impl Secrets {
     pub const SHORTEST: usize = 8;
 
     pub fn new() -> Secrets {
+        // alloc: setup: once a set of secrets.
         Secrets { finders: Vec::new() }
     }
 
@@ -446,6 +594,7 @@ impl Secrets {
     pub fn add(&mut self, name: impl Into<String>, secret: &[u8]) -> Result<(), String> {
         let name = name.into();
         if secret.len() < Secrets::SHORTEST {
+            // alloc: an error's message, made only when it fails.
             return Err(format!("the secret {name} is shorter than {} bytes", Secrets::SHORTEST));
         }
         self.finders.push((name, memmem::Finder::new(secret).into_owned()));
@@ -466,8 +615,9 @@ impl Secrets {
             if public.contains(&name) {
                 continue;
             }
-            let bytes = trace::os_bytes(&value);
+            let bytes = value.as_encoded_bytes();
             if bytes.len() >= Secrets::SHORTEST {
+                // alloc: setup: once a set of secrets.
                 let name = format!("the value of {}", name.to_string_lossy());
                 self.add(name, bytes).expect("long enough");
             }
@@ -477,6 +627,7 @@ impl Secrets {
     /// Refuses `bytes`, the value of `key`, when it holds a secret.
     pub fn check(&self, key: Key, bytes: &[u8]) -> Result<(), Private> {
         match self.finders.iter().find(|(_, finder)| finder.find(bytes).is_some()) {
+            // alloc: an error's message, made only when it fails.
             Some((name, _)) => Err(Private { key, why: format!("it holds {name}") }),
             None => Ok(()),
         }
@@ -493,7 +644,7 @@ impl Default for Secrets {
 mod tests {
     use blaze_codegen::{
         Settings,
-        settings::{DebugInfo, Panic, Relocation, Toolchain},
+        settings::{DebugInfo, Panic, Pgo, Relocation, Sanitize, Toolchain},
         Arch,
     };
     use blaze_core::Untraceable;
@@ -504,6 +655,7 @@ mod tests {
 
     const TOOLCHAIN: ContentId = ContentId([1; 32]);
     const SYSTEM: ContentId = ContentId([2; 32]);
+    const BUILD: ContentId = ContentId([11; 32]);
 
     fn serde() -> Origin {
         Origin::CratesIo { name: "serde".into(), version: "1.0.219".into(), checksum: [3; 32] }
@@ -512,6 +664,7 @@ mod tests {
     fn rule() -> Rule {
         Rule::new(
             TOOLCHAIN,
+            BUILD,
             vec![SYSTEM],
             vec![
                 Root { path: "/reg/serde-1.0.219".into(), origin: serde() },
@@ -577,15 +730,16 @@ mod tests {
             let roots = (0..rng.next_u64() % 12)
                 .map(|n| Root { path: drawn(&mut rng, 5), origin: origins[n as usize % origins.len()].clone() })
                 .collect();
-            let rule = Rule::new(TOOLCHAIN, Vec::new(), roots, Vec::new());
+            let rule = Rule::new(TOOLCHAIN, BUILD, Vec::new(), roots, Vec::new());
             for _ in 0..50 {
                 let path = drawn(&mut rng, 8);
                 assert_eq!(rule.path(&path).ok(), rule.path_scanned(&path), "round {round}: {}", path.display());
             }
         }
-        let doubled = Rule::new(TOOLCHAIN, Vec::new(), vec![Root { path: "/a//b/".into(), origin: serde() }], Vec::new());
+        let doubled = Rule::new(TOOLCHAIN, BUILD, Vec::new(), vec![Root { path: "/a//b/".into(), origin: serde() }], Vec::new());
         assert_eq!(doubled.path(Path::new("/a/b/./c")), Ok(&serde()), "components, not bytes");
-        let everything = Rule::new(TOOLCHAIN, Vec::new(), vec![Root { path: "".into(), origin: Origin::Outputs }], Vec::new());
+        let everything =
+            Rule::new(TOOLCHAIN, BUILD, Vec::new(), vec![Root { path: "".into(), origin: Origin::Outputs }], Vec::new());
         assert_eq!(everything.path(Path::new("/x")).ok(), Some(&Origin::Outputs), "an empty root is under everything");
         assert_eq!(everything.path_scanned(Path::new("/x")), Some(&Origin::Outputs));
     }
@@ -687,7 +841,7 @@ mod tests {
             assert!(check(&traced, &private, &serde(), &given).unwrap().contains("its code"));
             assert!(check(&traced, &serde(), &private, &given).unwrap().contains("runs for"));
         }
-        let mut other = given.clone();
+        let mut other = self::given();
         other.env("OUT_DIR", "/home/alice/proj/target/out");
         assert!(check(&traced, &serde(), &serde(), &other).unwrap().contains("given"));
         let other_run = RunKey { code: run.code, given: other.finish() };
@@ -705,6 +859,7 @@ mod tests {
                 features: Vec::new(),
                 cranelift: "0.136".into(),
                 llvm: Some("23.1".into()),
+                stencils: None,
                 frame_pointers: false,
                 relocation: Relocation::Pic,
             },
@@ -714,6 +869,10 @@ mod tests {
             panic: Panic::Unwind,
             debuginfo: DebugInfo::None,
             fold: false,
+            counted: false,
+            mir_inline: false,
+            sanitize: Sanitize::default(),
+            pgo: Pgo::None,
             policy: ContentId([0; 32]),
         }
     }
@@ -741,7 +900,7 @@ mod tests {
         assert_eq!((public.key(), public.kind()), (keys::release(&imports.blob_key(stored)), Kind::Code));
         assert_eq!(rule.side(&ContentId([1; 32]), &public).unwrap().kind(), Kind::Debug);
 
-        let dev = spec(Backend::Cranelift, TOOLCHAIN);
+        let dev = spec(Backend::Cranelift { speed: false }, TOOLCHAIN);
         let dev_fn = source(10, dev.settings(), serde());
         let made_dev = FunctionMade { spec: &dev, function: &dev_fn, ..made };
         assert!(rule.function(&made_dev).unwrap_err().why.contains("LLVM"));
@@ -788,5 +947,109 @@ mod tests {
         assert!(secrets.check(key, hex.as_bytes()).unwrap_err().why.contains("hex"));
         assert!(Secrets::new().add("x", b"short").is_err());
         assert!(!format!("{secrets:?}").contains("ghp_"));
+    }
+
+    const IMAGE: ContentId = ContentId([12; 32]);
+    const SLOT: ContentId = ContentId([13; 32]);
+    const FILED: ContentId = ContentId([14; 32]);
+    const OUT: &str = "/work/target/build/serde-1/out";
+
+    fn image<'a>(crates: &'a [Origin], out_dirs: &'a [&'a Path], reads: &'a [ImageRead<'a>]) -> ImageMade<'a> {
+        ImageMade { key: IMAGE, build: BUILD, crates, out_dirs, reads }
+    }
+
+    #[test]
+    fn an_image_of_public_crates_is_public_under_each_of_its_keys() {
+        let rule = rule();
+        let crates = [serde(), Origin::Toolchain(TOOLCHAIN)];
+        let out_dirs = [Path::new(OUT)];
+        let made = image(&crates, &out_dirs, &[]);
+        let public = rule.image(&made, ImagePart::Image).unwrap();
+        assert_eq!((public.key(), public.kind()), (Key(IMAGE), Kind::Query));
+        let (again, used) = blaze_alloc_count::measure(|| rule.image(&made, ImagePart::Image).map(|it| it.key()));
+        assert_eq!(again, Ok(Key(IMAGE)));
+        assert_eq!(used, blaze_alloc_count::Used::default(), "a public image is shown so with no allocation");
+
+        let reads = [
+            ImageRead::File(Path::new("/reg/serde-1.0.219/src/table.in")),
+            ImageRead::Dir(Path::new("/toolchain/lib")),
+            ImageRead::File(Path::new("/usr/include/zlib.h")),
+            ImageRead::File(Path::new("/work/target/build/serde-1/out/generated.rs")),
+            ImageRead::Env(OsStr::new("TARGET")),
+        ];
+        let read = image(&crates, &out_dirs, &reads);
+        assert_eq!(rule.image(&read, ImagePart::Slot(SLOT)).map(|it| (it.key(), it.kind())), Ok((Key(SLOT), Kind::Query)));
+        assert_eq!(rule.image(&read, ImagePart::Filed(FILED)).map(|it| it.key()), Ok(Key(FILED)));
+        let alone = rule.image(&read, ImagePart::Image).unwrap_err();
+        assert!(alone.why.contains("its key alone"), "{alone}");
+        assert_eq!(alone.key, Key(IMAGE));
+    }
+
+    #[test]
+    fn a_crate_of_each_origin_is_covered_as_its_origin_says() {
+        let rule = rule();
+        let out_dirs = [Path::new(OUT)];
+        for public in [serde(), Origin::Toolchain(TOOLCHAIN)] {
+            let crates = [public.clone(), serde()];
+            assert!(rule.image(&image(&crates, &out_dirs, &[]), ImagePart::Image).is_ok(), "{public}");
+            let closure = [serde(), public.clone()];
+            assert!(rule.image(&image(&closure, &out_dirs, &[]), ImagePart::Image).is_ok(), "{public}");
+        }
+        let not_crates = [Origin::System(SYSTEM), Origin::Outputs];
+        for private in private_origins().into_iter().chain(not_crates) {
+            let own = [private.clone(), serde()];
+            let error = rule.image(&image(&own, &out_dirs, &[]), ImagePart::Image).unwrap_err();
+            assert!(error.why.starts_with("the crate: "), "{private}: {error}");
+            let closure = [serde(), Origin::Toolchain(TOOLCHAIN), private.clone()];
+            for part in [ImagePart::Image, ImagePart::Slot(SLOT), ImagePart::Filed(FILED)] {
+                let error = rule.image(&image(&closure, &out_dirs, &[]), part).unwrap_err();
+                assert!(error.why.starts_with("a crate it depends on: "), "{private}: {error}");
+            }
+        }
+        assert!(rule.image(&image(&[], &out_dirs, &[]), ImagePart::Image).unwrap_err().why.contains("no crate"));
+    }
+
+    #[test]
+    fn an_image_of_another_build_or_out_dir_is_not_public() {
+        let rule = rule();
+        let crates = [serde()];
+        let out_dirs = [Path::new(OUT)];
+        let other = ImageMade { build: ContentId([9; 32]), ..image(&crates, &out_dirs, &[]) };
+        assert!(rule.image(&other, ImagePart::Image).unwrap_err().why.contains("pinned"));
+        let outs = [
+            ("/work/src/out", "a workspace member"),
+            ("/home/alice/out", "no public source"),
+            ("/reg/serde-1.0.219/out", "serde 1.0.219"),
+            ("target/build/serde-1/out", "no public source"),
+        ];
+        for (out, says) in outs {
+            let out_dirs = [Path::new(out)];
+            let error = rule.image(&image(&crates, &out_dirs, &[]), ImagePart::Image).unwrap_err();
+            assert!(error.why.contains("OUT_DIR") && error.why.contains(says), "{out}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_name_read_that_is_not_public_makes_the_derived_keys_private() {
+        let rule = rule();
+        let crates = [serde()];
+        let out_dirs = [Path::new(OUT)];
+        let reads = [
+            (ImageRead::File(Path::new("/work/src/lib.rs")), "a workspace member"),
+            (ImageRead::Dir(Path::new("/reg/serde-1.0.219/vendored")), "a path dependency"),
+            (ImageRead::File(Path::new("/home/alice/.ssh/id_ed25519")), "no public source"),
+            (ImageRead::File(Path::new("src/table.in")), "no public source"),
+            (ImageRead::Env(OsStr::new("HOME")), "HOME"),
+            (ImageRead::Env(OsStr::new(trace::ALL_ENV_NAME)), "whole environment"),
+            (ImageRead::Untraceable(Untraceable::Network), "traced"),
+        ];
+        for (read, says) in reads {
+            let made = image(&crates, &out_dirs, std::slice::from_ref(&read));
+            for (part, key) in [(ImagePart::Slot(SLOT), SLOT), (ImagePart::Filed(FILED), FILED)] {
+                let error = rule.image(&made, part).unwrap_err();
+                assert!(error.why.contains(says), "{read:?}: {error}");
+                assert_eq!(error.key, Key(key));
+            }
+        }
     }
 }

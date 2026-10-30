@@ -144,6 +144,7 @@ Why: `lower/incorrect_case.rs` dispatches on `d.ident_type`'s `Display` text, wr
 `match` on the enum and the buffer goes. Output is unchanged.
 
 > forwarded to db (db-next2, `crates/hir/`) (requests, pass 19; told by tmux).
+> applied by db-audit-other (22:43): hir's half is in. `crates/hir/src/diagnostics.rs:74` reads `diagnostics::{CaseType, IdentType, IncorrectCase}`, so the enum is `hir::diagnostics::IdentType`. It builds only once hir-ide exports it: `IdentType` is `pub` in the private `decl_check` module (`crates/hir-ide/src/diagnostics/decl_check.rs:78`), and `hir_ide::diagnostics` re-exports only `CaseType, IncorrectCase, incorrect_case`. That one-line change is the coordinator's (`crates/hir-ide/`). It is forwarded by db-audit-other in `v2/requests/db.md`, `## coordinator (from db-audit-other): hir-ide exports IdentType` (requests-next3 told).
 
 ## 3. Memoized errors of a library outline (lane db, `crates/base-db/src/editioned_file_id.rs`)
 

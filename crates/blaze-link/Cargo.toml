@@ -24,6 +24,7 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-inproc.workspace = true
 blaze-items.workspace = true
+blaze-lazy.workspace = true
 blaze-live.workspace = true
 blaze-mem.workspace = true
 blaze-sha256.workspace = true

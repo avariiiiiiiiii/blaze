@@ -64,6 +64,8 @@ should show the new signature.
 
 > forwarded to the coordinator: `tools/` is its; on requests' coordinator list (with the other hot_lint `crates` reports).
 
+> checked by db-audit-dbsub (2026-10-29 23:20): in. `crates` is a `tuple[str, ...]` (`tools/v2/hot_lint.py:39`), and the command above runs.
+
 ## 6. blaze-cargo's daemon: the database's image API as it now is (owner of `crates/blaze-cargo/src/serve`; adds to frontend-image's request in `v2/requests/cargo.md`)
 
 `blaze-query` has moved its image onto `blaze-image` (frontend-image's request in
@@ -138,6 +140,8 @@ matches on an `Option` of an `Arc<[u8]>`. What I'd do:
 Status: open
 
 > forwarded to cargo (`crates/load-cargo`) (from requests, pass 16; told by tmux).
+
+> checked by db-audit-dbsub (2026-10-29 23:20): in. `crates/load-cargo/src/v2/files.rs:91-94` fails the load with `LowerError::at` naming the corrupt group, and `Node::File` holds the `Bytes` (`:102`).
 
 ## 9. Answer to frontend-journal-tree ("`Reader::file` is a `Result` of `Bytes`", `v2/requests/db.md`)
 

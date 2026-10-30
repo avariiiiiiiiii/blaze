@@ -730,7 +730,7 @@ impl Frozen {
         if self.edited_bodies.is_empty() {
             return false;
         }
-        let crates: FxHashSet<Crate> = krate.transitive_deps(db).into_iter().collect();
+        let crates: FxHashSet<Crate> = krate.transitive_deps(db).iter().copied().collect();
         self.edited_bodies
             .iter()
             .any(|&file| base_db::relevant_crates(db, file).iter().any(|it| crates.contains(it)))

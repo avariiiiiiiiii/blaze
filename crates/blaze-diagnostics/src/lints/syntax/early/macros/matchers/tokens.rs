@@ -9,7 +9,10 @@
 //! (`Token::glue`) (MIT or Apache-2.0).
 
 use span::Edition;
-use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxToken, TextRange, TextSize, ast};
+use syntax::{
+    NodeOrToken, SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode as _},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Delim {
@@ -237,36 +240,36 @@ impl Tt {
 
 /// The tokens of a macro definition's body (`ast::MacroDef::body`'s tokens), as rustc's
 /// parser hands them to `compile_declarative_macro` and to the early lint pass.
-pub(super) struct Tokens {
+pub(super) struct Tokens<'t> {
     /// The definition's text, from `base` on.
-    text: String,
+    text: &'t str,
     base: TextSize,
     tts: Vec<Tt>,
     /// The body: in braces the rules; for `macro m(..) { .. }`, `(..) => { .. }`.
     pub(super) top: Ids,
 }
 
-impl Tokens {
+impl<'t> Tokens<'t> {
     /// The tokens of `def`; `span` gives the edition of the span at an offset and whether it
     /// has the root context.
-    pub(super) fn of(def: &ast::Macro, span: &impl Fn(TextSize) -> (Edition, bool)) -> Option<Tokens> {
+    pub(super) fn of(def: ast::Macro<'t>, span: &impl Fn(TextSize) -> (Edition, bool)) -> Option<Tokens<'t>> {
         let node = def.syntax();
         let mut tokens =
             // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
-            Tokens { text: node.to_string(), base: node.text_range().start(), tts: Vec::new(), top: Ids::default() };
+            Tokens { text: node.text(), base: node.text_range().start(), tts: Vec::new(), top: Ids::default() };
         // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
         let mut scratch = Vec::new();
         match def {
-            ast::Macro::MacroRules(it) => tokens.top = tokens.group(&it.token_tree()?, span, &mut scratch).tts,
+            ast::Macro::MacroRules(it) => tokens.top = tokens.group(it.token_tree()?, span, &mut scratch).tts,
             ast::Macro::MacroDef(it) => {
                 let body = it.body()?;
                 match it.args() {
-                    None => tokens.top = tokens.group(&body, span, &mut scratch).tts,
+                    None => tokens.top = tokens.group(body, span, &mut scratch).tts,
                     // rustc's `parse_item_decl_macro`: `macro m(..) { .. }` is the one rule
                     // `(..) => { .. }`.
                     Some(args) => {
-                        let args = tokens.group(&args, span, &mut scratch);
-                        let body = tokens.group(&body, span, &mut scratch);
+                        let args = tokens.group(args, span, &mut scratch);
+                        let body = tokens.group(body, span, &mut scratch);
                         let between = TextRange::new(args.close.range.end(), body.open.range.start());
                         let (edition, root) = span(between.start());
                         let arrow = Token { kind: Kind::Punct(Punct::FatArrow), range: between, edition, root };
@@ -284,14 +287,14 @@ impl Tokens {
         &self.tts[ids.start as usize..ids.end as usize]
     }
 
-    pub(super) fn text(&self, range: TextRange) -> &str {
+    pub(super) fn text(&self, range: TextRange) -> &'t str {
         let start = usize::from(range.start() - self.base);
         let end = usize::from(range.end() - self.base);
         self.text.get(start..end).unwrap_or("")
     }
 
     /// The name of an identifier: rustc's symbol, without `r#`.
-    pub(super) fn name(&self, range: TextRange) -> &str {
+    pub(super) fn name(&self, range: TextRange) -> &'t str {
         let text = self.text(range);
         text.strip_prefix("r#").unwrap_or(text)
     }
@@ -305,7 +308,7 @@ impl Tokens {
     /// it, so that each group's are one run.
     fn group(
         &mut self,
-        tt: &ast::TokenTree,
+        tt: ast::TokenTree<'_>,
         span: &impl Fn(TextSize) -> (Edition, bool),
         scratch: &mut Vec<Tt>,
     ) -> Group {
@@ -321,11 +324,11 @@ impl Tokens {
         // Whether the last token pushed is punctuation with nothing after it yet.
         let mut glue = false;
         for child in tt.syntax().children_with_tokens() {
-            let t: SyntaxToken = match child {
+            let t: ast::Token<'_> = match child {
                 NodeOrToken::Node(node) => {
                     glue = false;
                     if let Some(inner) = ast::TokenTree::cast(node) {
-                        let inner = self.group(&inner, span, scratch);
+                        let inner = self.group(inner, span, scratch);
                         scratch.push(Tt::Delimited(inner));
                     }
                     continue;
@@ -428,17 +431,20 @@ fn unsuffixed_usize(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use syntax::SourceFile;
+    use syntax::{Parse, SourceFile};
 
     use super::*;
 
-    fn tokens(text: &str) -> Tokens {
-        let file = SourceFile::parse(text, Edition::Edition2021).tree();
-        let def = file.syntax().descendants().find_map(ast::Macro::cast).unwrap();
-        Tokens::of(&def, &|_| (Edition::Edition2021, true)).unwrap()
+    fn parse(text: &str) -> Parse<SourceFile> {
+        SourceFile::parse(text, Edition::Edition2021)
     }
 
-    fn kinds(tokens: &Tokens, ids: Ids) -> Vec<String> {
+    fn tokens(parse: &Parse<SourceFile>) -> Tokens<'_> {
+        let def = parse.root().descendants().find_map(ast::Macro::cast).unwrap();
+        Tokens::of(def, &|_| (Edition::Edition2021, true)).unwrap()
+    }
+
+    fn kinds(tokens: &Tokens<'_>, ids: Ids) -> Vec<String> {
         tokens
             .get(ids)
             .iter()
@@ -451,7 +457,8 @@ mod tests {
 
     #[test]
     fn punctuation_written_together_is_glued() {
-        let tokens = tokens("macro_rules! m { ($a:tt :: $b:tt || =>= $(x)*= ) => {} }");
+        let parse = parse("macro_rules! m { ($a:tt :: $b:tt || =>= $(x)*= ) => {} }");
+        let tokens = tokens(&parse);
         let top = kinds(&tokens, tokens.top);
         assert_eq!(top[1], "Punct(FatArrow)");
         let Tt::Delimited(lhs) = tokens.get(tokens.top)[0] else { panic!() };
@@ -480,7 +487,8 @@ mod tests {
 
     #[test]
     fn space_and_comments_keep_punctuation_apart() {
-        let tokens = tokens("macro_rules! m { (: : |/**/| /// doc\n) => {} }");
+        let parse = parse("macro_rules! m { (: : |/**/| /// doc\n) => {} }");
+        let tokens = tokens(&parse);
         let Tt::Delimited(lhs) = tokens.get(tokens.top)[0] else { panic!() };
         assert_eq!(
             kinds(&tokens, lhs.tts),
@@ -490,7 +498,8 @@ mod tests {
 
     #[test]
     fn a_macro_with_parameters_is_one_rule() {
-        let tokens = tokens("macro m($e:expr) { $e }");
+        let parse = parse("macro m($e:expr) { $e }");
+        let tokens = tokens(&parse);
         let top = kinds(&tokens, tokens.top);
         assert_eq!(top.len(), 3);
         assert_eq!(top[1], "Punct(FatArrow)");
@@ -499,7 +508,8 @@ mod tests {
 
     #[test]
     fn names_and_literals_are_told_apart() {
-        let tokens = tokens(r#"macro_rules! m { (r#expr _ 'a "s" "s"x 0x1f 1u8) => {} }"#);
+        let parse = parse(r#"macro_rules! m { (r#expr _ 'a "s" "s"x 0x1f 1u8) => {} }"#);
+        let tokens = tokens(&parse);
         let Tt::Delimited(lhs) = tokens.get(tokens.top)[0] else { panic!() };
         let tts = tokens.get(lhs.tts);
         let Tt::Token(raw) = tts[0] else { panic!() };

@@ -18,11 +18,11 @@ mod traits;
 #[cfg(test)]
 mod tests;
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 use either::Either;
 
-use crate::{AstPtr, FlatTree, Parse, RustLanguage, SyntaxKind, SyntaxNodePtr};
+use crate::{AstPtr, FlatTree, Parse, RustLanguage, SyntaxKind, SyntaxNodePtr, TextRange};
 
 pub use self::{
     expr_ext::*,
@@ -202,6 +202,31 @@ pub fn root<'t, N: AstNode<'t>>(tree: &'t Arc<FlatTree>) -> Option<N> {
 #[inline]
 pub fn ptr(node: Node<'_>) -> SyntaxNodePtr {
     SyntaxNodePtr::from_parts(node.kind(), node.text_range())
+}
+
+/// rustc's span of an item or a macro call, which leaves out the attributes, doc comments and
+/// comments on top of it: from the first of `children` (a node's children, in order, as their
+/// kinds and ranges) that is none of those, to the end of `range`, the node's own.
+pub fn written_range_of(
+    range: TextRange,
+    children: impl IntoIterator<Item = (SyntaxKind, TextRange)>,
+) -> TextRange {
+    let start = children
+        .into_iter()
+        .find(|&(kind, _)| {
+            !matches!(kind, SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT) && !kind.is_trivia()
+        })
+        .map_or(range.start(), |(_, it)| it.start());
+    TextRange::new(start, range.end())
+}
+
+/// [`written_range_of`] of `node`.
+#[inline]
+pub fn written_range(node: Node<'_>) -> TextRange {
+    written_range_of(
+        node.text_range(),
+        node.children_with_tokens().map(|it| (it.kind(), it.text_range())),
+    )
 }
 
 /// The node `ptr` points at under `root`, found from the bottom up.

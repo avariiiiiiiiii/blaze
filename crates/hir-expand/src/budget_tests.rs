@@ -213,7 +213,7 @@ fn concat_is_framed() {
             crate::builtin::concat_of_literals_in(frame, &tt, call)
         });
         assert!(again.err.is_none());
-        assert!(again.value.view() == warm.value.view());
+        assert!(*again.value == *warm.value);
         assert_eq!(again.value.to_string(), r#""a1btrue""#);
     });
 }

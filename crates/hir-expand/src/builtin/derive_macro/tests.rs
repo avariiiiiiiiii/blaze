@@ -5,7 +5,8 @@
 use span::{Edition, EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext};
 use blaze_mem::{Frame, Tag};
 use syntax::{
-    AstNode, Parse, SourceFile, TextRange, TextSize, ast,
+    AstNode, Parse, SourceFile, TextRange, TextSize,
+    ast::{self, HasName as _},
     view::{self, AstNode as _},
 };
 
@@ -315,7 +316,7 @@ fn reference_from(
         }
     };
     let trait_path = {
-        let field_ty = field_ty.clone();
+        let field_ty = field_ty.copy();
         quote! {span => #krate::convert::From<#field_ty> }
     };
     ExpandResult::ok(reference::expand_simple_derive_with_parsed(
@@ -356,12 +357,11 @@ fn coerce_pointee_impls_match_nested_quotes() {
         &super::parse_adt_from_syntax(adt_view(&parse), &map, span).expect("an item"),
         &self_for_traits,
     );
-    let info = reference::parse_adt_from_syntax(&adt, &map, span).expect("an item");
     let krate = dollar_crate(span);
     let impl_of = |trait_path: tt::TopSubtree| {
         reference::expand_simple_derive_with_parsed(
             span,
-            info.clone(),
+            reference::parse_adt_from_syntax(&adt, &map, span).expect("an item"),
             trait_path,
             |_| quote! {span => },
             false,

@@ -572,7 +572,7 @@ mod tests {
             else {
                 panic!("not an ident");
             };
-            assert_eq!(*ident, reinterned(text));
+            assert_eq!(ident, reinterned(text));
         }
         let name = Name::new_symbol_root(Symbol::intern("field"));
         let quoted = quote!(DUMMY => #name);
@@ -580,6 +580,6 @@ mod tests {
         else {
             panic!("not an ident");
         };
-        assert_eq!(*ident, reinterned("field"));
+        assert_eq!(ident, reinterned("field"));
     }
 }

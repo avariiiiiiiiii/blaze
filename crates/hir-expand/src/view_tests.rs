@@ -15,7 +15,7 @@ use expect_test::expect_file;
 use span::{Edition, SyntaxContext};
 use syntax::{
     AstPtr, SourceFile, TextRange, ast,
-    view::{self, AstNode as _},
+    view::{self, AstNode as _, HasName as _},
 };
 use triomphe::Arc;
 
@@ -304,7 +304,9 @@ fn calls_and_expansions() {
     let db = &f.db;
     let files = files(&f);
     let mut out = String::new();
-    let real = |it: InRealFile<view::Node<'_>>| InFile::new(it.file_id.into(), it.value);
+    fn real(it: InRealFile<view::Node<'_>>) -> InFile<view::Node<'_>> {
+        InFile::new(it.file_id.into(), it.value)
+    }
     for id in macro_files(&f) {
         let (loc, file) = (id.loc(db), HirFileId::from(id));
         put!(

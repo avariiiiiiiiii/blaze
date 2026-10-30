@@ -31,3 +31,9 @@ Part of the [v2 plan](README.md). Section numbers refer to the plan as first wri
 ## Issues this lane takes in
 
 - **#277 the agent API** is the only interface (section 1). (`v2-ci`, coordinator)
+
+## Done when
+
+- the agent API's every request answered, schema versioned, the CLI a client of it
+- the webhook service, check runs, the latest-wins train, the production oracle, snapshots
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

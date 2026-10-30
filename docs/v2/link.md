@@ -25,3 +25,10 @@ Part of the [v2 plan](README.md). Section numbers refer to the plan as first wri
   result, patching before checks finish with rollback. Views (section 2) make it nearly free.
   **#1302** lazy borrow checking is allowed only on this live-patch path, never for a build's
   output (cargo's rule: a borrowck error means no binary). (`v2-db`, `v2-link`)
+
+## Done when
+
+- full and incremental links of ELF, Mach-O and COFF, in parallel, with one atomic commit
+- debug info and panic locations from side tables; live patching with rollback
+- C objects, archives and shared libraries of the link line
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

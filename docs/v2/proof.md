@@ -41,3 +41,8 @@ and `v2-proof` run everything together once the lanes' work is in:
 - **#1325, #1326, #805**: deleted `include_str!` inputs not invalidated, literal whitespace
   changing fingerprints, a worker keyed by `PATH`. Each becomes an oracle edit kind, and the
   environment becomes a traced input, not part of a worker's identity. (`v2-proof`, `v2-usercode`)
+
+## Done when
+
+- the oracle, corpus with rejections, determinism, tight memory and budgets run against v1 today through the same entry points v2 will use
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

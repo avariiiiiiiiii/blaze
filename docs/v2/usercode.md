@@ -42,3 +42,11 @@ Part of the [v2 plan](README.md). Section numbers refer to the plan as first wri
 - **#1443 a process per test from a fork server**: each test binary starts once in its sandbox,
   forks a copy-on-write child per test (0.1-0.5 ms on Linux), one global queue over all cores.
   **#227, #1330**: run only the tests an edit reached. (`v2-usercode`)
+
+## Done when
+
+- build scripts and proc macros run sandboxed with every read traced, keyed by those reads
+- inert build scripts evaluated; native expanders behind byte-exact source match
+- tests one process each from a fork server, selected by reached code hashes
+- the Windows sandbox
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

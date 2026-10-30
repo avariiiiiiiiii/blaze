@@ -95,3 +95,10 @@ eviction never breaks cutoff.
 - **#906**: a stale sibling closure after a capture change gives silent wrong results. Closure
   captures are a fact of their own (section 6.1), and this repro goes into the oracle's corpus.
   (`v2-items`, `v2-proof`)
+
+## Done when
+
+- every item gets interface, layout, code and deep hashes, names and positions only where observable
+- every fact kind of section 6.2 and its negative index exists and is read by its queries
+- rename and move keep code; #906's closure-capture case is a fact
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

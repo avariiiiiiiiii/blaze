@@ -19,3 +19,11 @@ Part of the [v2 plan](README.md). Section numbers refer to the plan as first wri
 - **Forks of the VM only for**: another tenant (isolation), a build bigger than one box (helpers
   for a slice of codegen), and snapshots to resume after a crash or a stop.
 - **macOS and Windows** each get their own warm machine running the same daemon.
+
+## Done when
+
+- commits, rebase, diffs, journal recovery and collection work, with modes and symlinks
+- Vfs::empty and blaze_query::Tree are implemented
+- file watching on Linux, macOS and Windows produces transactions
+- simulation tests of torn writes and power cuts
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

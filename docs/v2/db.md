@@ -57,3 +57,11 @@ per thread. salsa's `Storage` is `!Sync`, so v1 gives each thread its own handle
 shares the memo tables and counts clones, so a write waits for every clone to drop). v2 has no
 handles. All parallel work, macro expansion rounds included, runs as plane tasks on the one
 worker pool (`docs/v2/core.md`), never on threads spawned by a query.
+
+## Done when
+
+- blaze-query is Sync, keyed by input hash, with fingerprints on every edge and sound verification
+- hir-def, hir-expand and hir-ty run on it; no salsa per-thread handles; expansion rounds are plane tasks
+- the image, settle swap, GC and the why-did-this-rerun explainer work
+- types and the trait solver are u32-indexed tables
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

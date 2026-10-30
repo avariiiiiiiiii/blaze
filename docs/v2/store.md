@@ -32,3 +32,10 @@ Part of the [v2 plan](README.md). Section numbers refer to the plan as first wri
 - **#1298 store as one mapped file per crate version**: append payloads, write the index into
   the inactive of two slots, flip the header; one barrier, not a sync per entry (anim cold
   wrote 77,481 entries serially). (`v2-store`)
+
+## Done when
+
+- one mapped file per crate version with the index flip; the mmapped BLAKE3 index
+- hot, warm and cold tiers with background moves; every read verified
+- keys by schema and producing code; the remote as an off-path tier
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

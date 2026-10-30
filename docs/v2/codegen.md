@@ -32,3 +32,11 @@ Part of the [v2 plan](README.md). Section numbers refer to the plan as first wri
   slots) and fix it in codegen; tests built at the profile's opt-level. **#807**: tiering,
   Cranelift first and LLVM in the background, instead of O2 on every dependency function.
   (`v2-codegen`)
+
+## Done when
+
+- one unit per function or batch; instances keyed by code hash and type-argument facts
+- the back-end memo and constant folding; dedupe never merges statics
+- dev code at least as fast as cargo debug on ripgrep; release with summaries
+- statics, unwind and line tables emitted (link's request)
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

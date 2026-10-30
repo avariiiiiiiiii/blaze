@@ -41,3 +41,11 @@ pointer-free, aligned and position-independent, so it can be mmapped and used in
   as item outlines (4-byte packed tokens), and their bodies are parsed, lowered and inferred
   only when codegen reaches them. `blaze check` still checks the workspace's crates fully.
   (`v2-format`, `v2-db`)
+
+## Done when
+
+- blaze-format's records, schemas and the three compression tiers round-trip exactly
+- flat syntax replaces rowan in syntax, parser, tt, mbe and their users
+- HIR bodies and item trees are columns within their size budgets (const asserts)
+- outline parse and on-demand bodies for dependency files
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

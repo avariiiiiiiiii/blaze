@@ -63,3 +63,11 @@ nodes of the same key while one runs. `plane.rs`'s own memo of settled keys goes
 A driver for Windows: IOCP for files, sockets and timers, `ReadDirectoryChangesW` for file
 changes, job objects for children, alongside io_uring and kqueue. Its sandbox is usercode's
 (AppContainer and job objects, #1390).
+
+## Done when
+
+- every driver (io_uring, kqueue, IOCP, simulation) implements every Effect
+- the worker pool steals within a CCD or cluster first and pins threads
+- the plane admits by memory with the hard backstop and holds no memo
+- simulation tests over many seeds for every driver path
+- nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

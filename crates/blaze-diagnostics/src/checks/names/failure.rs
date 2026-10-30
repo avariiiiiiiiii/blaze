@@ -9,6 +9,7 @@
 
 use hir::{InFile, ItemInNs, ModPath, ModuleDef, Name, PathKind};
 use span::Edition;
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     SyntaxKind, TextRange,
     view::{self as ast, AstNode as _},
@@ -17,7 +18,6 @@ use syntax::{
 pub(super) use crate::lower::unresolved_import::{ROOT, Segment};
 use crate::{
     cx::Cx,
-    lints::edit_distance::find_best_match_for_name,
     lower::unresolved_import::{missing_crate, missing_crate_2015, value_descr},
     model::{Applicability, Diag, Span},
 };
@@ -284,7 +284,7 @@ fn similar_module_or_crate<'db>(cx: &Cx<'_, 'db>, place: &At<'db>, name: &str) -
     candidates.dedup();
     // alloc: the error's suggestion, on the error path
     let candidates: Vec<&str> = candidates.iter().map(Name::as_str).collect();
-    find_best_match_for_name(&candidates, name, None).filter(|it| *it != name).map(str::to_owned)
+    find_best_match_for_name(&candidates, name, None).copied().filter(|it| *it != name).map(str::to_owned)
 }
 
 #[cfg(test)]

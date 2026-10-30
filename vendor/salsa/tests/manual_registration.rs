@@ -1,4 +1,5 @@
 #![cfg(not(feature = "inventory"))]
+#![forbid(unsafe_code)]
 
 mod ingredients {
     #[salsa::input]

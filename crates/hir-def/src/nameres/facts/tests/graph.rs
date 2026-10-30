@@ -17,12 +17,9 @@ use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
+use hegel::generators as gs;
+use hegel::{Hegel, Settings, TestCase};
 use intern::Symbol;
-use proptest::{
-    collection,
-    prelude::*,
-    test_runner::{Config, TestRunner},
-};
 use span::Edition;
 use test_fixture::WithFixture;
 
@@ -54,8 +51,11 @@ fn crates() -> (TestDB, Crate, Crate) {
     (db, this, other)
 }
 
-fn runner(cases: u32) -> TestRunner {
-    TestRunner::new(Config { cases, failure_persistence: None, ..Config::default() })
+/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set (a long
+/// run).
+fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
+    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
+    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 
 #[derive(Default)]
@@ -261,34 +261,35 @@ fn tarjan(nodes: u32, edges: &[(u32, u32)]) -> BTreeSet<Vec<u32>> {
 
 #[test]
 fn pearce_equals_tarjan() {
-    let graphs = (1u32..48).prop_flat_map(|n| (Just(n), collection::vec((0..n, 0..n), 0..160)));
-    runner(1024)
-        .run(&graphs, |(nodes, edges)| {
-            task(|frame| {
-                let partition = components(frame, &ImportGraph::from_edges(frame, nodes, &edges));
-                check_well_formed(&partition, nodes);
-                prop_assert_eq!(component_sets(&partition), tarjan(nodes, &edges));
-                for &(src, dst) in &edges {
-                    prop_assert!(
-                        partition.of(dst) <= partition.of(src),
-                        "edge {} -> {} goes to a later component",
-                        src,
-                        dst
-                    );
-                    prop_assert!(partition.may_read(partition.of(src), partition.of(dst)));
-                }
-                // The order of the edges and their repeats change nothing.
-                let mut shuffled: Vec<(u32, u32)> = edges.iter().rev().copied().collect();
-                shuffled.extend_from_slice(&edges);
-                prop_assert_eq!(
-                    ImportGraph::from_edges(frame, nodes, &shuffled),
-                    ImportGraph::from_edges(frame, nodes, &edges)
+    run_cases(1024, |tc| {
+        let nodes: u32 = tc.draw(gs::integers().min_value(1).max_value(47));
+        let edges: Vec<(u32, u32)> = tc.draw(
+            gs::vecs(gs::tuples!(gs::integers().max_value(nodes - 1), gs::integers().max_value(nodes - 1)))
+                .max_size(159),
+        );
+        task(|frame| {
+            let partition = components(frame, &ImportGraph::from_edges(frame, nodes, &edges));
+            check_well_formed(&partition, nodes);
+            assert_eq!(component_sets(&partition), tarjan(nodes, &edges));
+            for &(src, dst) in &edges {
+                assert!(
+                    partition.of(dst) <= partition.of(src),
+                    "edge {} -> {} goes to a later component",
+                    src,
+                    dst
                 );
-                prop_assert_eq!(components(frame, &ImportGraph::from_edges(frame, nodes, &shuffled)), partition);
-                Ok(())
-            })
+                assert!(partition.may_read(partition.of(src), partition.of(dst)));
+            }
+            // The order of the edges and their repeats change nothing.
+            let mut shuffled: Vec<(u32, u32)> = edges.iter().rev().copied().collect();
+            shuffled.extend_from_slice(&edges);
+            assert_eq!(
+                ImportGraph::from_edges(frame, nodes, &shuffled),
+                ImportGraph::from_edges(frame, nodes, &edges)
+            );
+            assert_eq!(components(frame, &ImportGraph::from_edges(frame, nodes, &shuffled)), partition);
         })
-        .unwrap();
+    });
 }
 
 #[test]
@@ -872,25 +873,23 @@ impl<'w> Model<'w> {
 #[test]
 fn partition_allows_every_read_of_a_brute_force_resolver() {
     let (_db, this, other) = crates();
-    runner(2048)
-        .run(&collection::vec(any::<u8>(), 0..192), |bytes| {
-            let world = world(&bytes, this, other);
-            let mut model = Model::new(&world);
-            model.run();
-            let p = partition_of(&world.shape);
-            check_well_formed(&p, world.shape.modules.len() as u32);
-            for &(reader, read) in &model.reads {
-                prop_assert!(
-                    p.may_read(p.of(reader), p.of(read)),
-                    "module {} reads module {}, which comes after it: {:?}",
-                    reader,
-                    read,
-                    world
-                );
-            }
-            Ok(())
-        })
-        .unwrap();
+    run_cases(2048, |tc| {
+        let bytes: Vec<u8> = tc.draw(gs::binary().max_size(191));
+        let world = world(&bytes, this, other);
+        let mut model = Model::new(&world);
+        model.run();
+        let p = partition_of(&world.shape);
+        check_well_formed(&p, world.shape.modules.len() as u32);
+        for &(reader, read) in &model.reads {
+            assert!(
+                p.may_read(p.of(reader), p.of(read)),
+                "module {} reads module {}, which comes after it: {:?}",
+                reader,
+                read,
+                world
+            );
+        }
+    });
 }
 
 /// Module `m{i}` globs `m{i + 1}` and imports `super::m{i + 1}::x`: edges grow with the chain.

@@ -454,20 +454,25 @@ fn write_ty<'db>(db: &'db Db, out: &mut Spelled, ty: Ty<'db>) -> Option<()> {
             write_dyn_debug(db, out, bounds)?;
         }
         TyKind::Dynamic(bounds, _) => write_dyn(db, out, bounds)?,
-        TyKind::FnDef(def, args) => match def.0 {
-            CallableDefId::FunctionId(func) => write_function(db, out, func, args.as_slice())?,
-            _ if out.spelling == Spelling::Symbol => return None,
-            CallableDefId::StructId(it) => {
-                write_ty(db, out, Ty::new_adt(DbInterner::new_no_crate(db), it.into(), args))?;
-                out.push_str("::{{constructor}}");
+        TyKind::FnDef(def, args) => {
+            let args = args.skip_binder();
+            match def.0 {
+                CallableDefId::FunctionId(func) => write_function(db, out, func, args.as_slice())?,
+                _ if out.spelling == Spelling::Symbol => return None,
+                CallableDefId::StructId(it) => {
+                    let ty = Ty::new_adt(DbInterner::new_no_crate(db), it.into(), args);
+                    write_ty(db, out, ty)?;
+                    out.push_str("::{{constructor}}");
+                }
+                CallableDefId::EnumVariantId(it) => {
+                    let parent = it.lookup(db).parent;
+                    let ty = Ty::new_adt(DbInterner::new_no_crate(db), parent.into(), args);
+                    write_ty(db, out, ty)?;
+                    let name = &parent.enum_variants(db).variant_name_by_id(it)?;
+                    write!(out, "::{}::{{{{constructor}}}}", name.as_str()).ok()?;
+                }
             }
-            CallableDefId::EnumVariantId(it) => {
-                let parent = it.lookup(db).parent;
-                write_ty(db, out, Ty::new_adt(DbInterner::new_no_crate(db), parent.into(), args))?;
-                let name = &parent.enum_variants(db).variant_name_by_id(it)?;
-                write!(out, "::{}::{{{{constructor}}}}", name.as_str()).ok()?;
-            }
-        },
+        }
         TyKind::Closure(id, args) => {
             let func = written_in(id.0.loc(db))?;
             write_closure(db, out, func.0, args.as_closure().parent_args(), func.1, Named::Kept)?;
@@ -1042,7 +1047,7 @@ impl MacroCalls {
         let mut calls = Vec::new();
         let mut file = source_map.expr_syntax(expr).ok().map(|it| it.file_id);
         while let Some(call) = file.and_then(|it| it.macro_file()) {
-            let node = call.call_node(db);
+            let node = call.call_node_view(db);
             calls.push(node.value.text_range().start().into());
             file = Some(node.file_id);
         }

@@ -6,6 +6,7 @@ mod macros;
 mod mod_resolution;
 mod paths;
 mod primitive_shadow;
+mod stale_ids;
 mod trait_imports;
 mod uses;
 mod worklist;
@@ -86,6 +87,52 @@ extern {
             - ext : value
         "#]],
     );
+}
+
+#[test]
+fn blaze_reassociate_is_an_inert_attribute_and_blaze_no_tool() {
+    use hir_expand::{
+        mod_path::{ModPath, PathKind},
+        name::Name,
+    };
+
+    compute_crate_def_map("//- /lib.rs\n#[blaze::reassociate]\nfn f() {}\n", |db, def_map| {
+        let path = |segments: &[&str]| {
+            ModPath::from_segments(PathKind::Plain, segments.iter().map(|it| Name::new_root(it)))
+        };
+        assert!(def_map.is_builtin_or_registered_attr(&path(&["blaze", "reassociate"])));
+        assert!(!def_map.is_builtin_or_registered_attr(&path(&["blaze", "cache"])));
+        assert!(!def_map.is_builtin_or_registered_attr(&path(&["blaze"])));
+        assert!(!def_map.is_builtin_or_registered_attr(&path(&["other", "reassociate"])));
+        assert!(def_map.diagnostics(db).is_empty(), "{:?}", def_map.diagnostics(db));
+    });
+}
+
+/// rustc's `builtin_attrs.rs` at the pinned nightly lists `sanitize` (feature `sanitize`) and
+/// not `no_sanitize`, which it removed in 1.91.
+#[test]
+fn sanitize_is_a_builtin_attribute_and_no_sanitize_is_not() {
+    use hir_expand::{
+        mod_path::{ModPath, PathKind},
+        name::Name,
+    };
+
+    let fixture = r#"
+//- /lib.rs
+#![feature(sanitize)]
+#[sanitize(address = "off", thread = "off")]
+fn f() {}
+#[sanitize(realtime = "nonblocking")]
+mod m {}
+"#;
+    compute_crate_def_map(fixture, |db, def_map| {
+        let path = |segments: &[&str]| {
+            ModPath::from_segments(PathKind::Plain, segments.iter().map(|it| Name::new_root(it)))
+        };
+        assert!(def_map.is_builtin_or_registered_attr(&path(&["sanitize"])));
+        assert!(!def_map.is_builtin_or_registered_attr(&path(&["no_sanitize"])));
+        assert!(def_map.diagnostics(db).is_empty(), "{:?}", def_map.diagnostics(db));
+    });
 }
 
 #[test]

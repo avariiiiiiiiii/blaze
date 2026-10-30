@@ -9,6 +9,7 @@
 //! `suggest_introducing_lifetime_filtered`) (MIT or Apache-2.0).
 
 use hir::InFile;
+use stdx::edit_distance::edit_distance;
 use syntax::{
     TextRange,
     view::{self as ast, AstNode, HasGenericParams as _, HasName as _, HasTypeBounds as _},
@@ -17,7 +18,6 @@ use syntax::{
 use super::{Signature, outer};
 use crate::{
     cx::Cx,
-    lints::edit_distance::edit_distance,
     lower::{Found, Phase},
     model::{Applicability, Diag},
 };

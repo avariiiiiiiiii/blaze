@@ -1403,6 +1403,24 @@ impl Printer<'_> {
                 w!(self, " is ");
                 self.print_pat(pat);
             }
+            TypeRef::UnsafeBinder { lifetimes, ty } => {
+                if lifetimes.is_empty() {
+                    w!(self, "unsafe ");
+                } else {
+                    w!(
+                        self,
+                        "unsafe<{}> ",
+                        self.store
+                            .names(lifetimes)
+                            .iter()
+                            .map(|it| it.display(self.db, self.edition))
+                            .format(", ")
+                            // alloc: printing, the edge; `w!` borrows `self` mutably.
+                            .to_string()
+                    );
+                }
+                self.print_type_ref(ty);
+            }
         }
     }
 

@@ -63,7 +63,7 @@ impl WirePart {
 }
 
 /// Why bytes are not a token tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum WireError {
     /// The bytes end at `at` where `needed` more were to come.
     Truncated { at: usize, needed: usize },
@@ -148,6 +148,23 @@ impl Tree {
         debug_assert_eq!(out.len(), base + 4 * words + symbol_bytes, "the rows are the words counted");
         out.resize(end_of_tree, 0);
     }
+}
+
+/// `bytes`, or a copy of them in `scratch` starting at a 4-byte boundary when they don't, as
+/// [`TopSubtree::read_wire`] takes them: a deserialized `Vec<u8>` or a value the store keeps
+/// need not start at a word. `scratch` is kept across reads, so a copy takes no new memory.
+pub fn aligned<'a>(bytes: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    if bytes.as_ptr().addr().is_multiple_of(4) {
+        return bytes;
+    }
+    scratch.clear();
+    // alloc: only for bytes off a word, into the caller's buffer, which it reuses.
+    scratch.resize(bytes.len() + 3, 0);
+    // Not `align_offset`, which may answer `usize::MAX`.
+    let at = scratch.as_ptr().addr().wrapping_neg() % 4;
+    scratch[at..at + bytes.len()].copy_from_slice(bytes);
+    let scratch: &'a [u8] = scratch;
+    &scratch[at..at + bytes.len()]
 }
 
 impl TopSubtree {
@@ -415,7 +432,7 @@ fn check_canonical(tree: Columns<'_>) -> Result<(), WireError> {
     let not = |what, at| Err(WireError::NotCanonical { what, at });
     let len = tree.nodes.len();
     let mut order = Order { parts: 0, wide: 0 };
-    let mut symbols = 0;
+    let mut symbols = 0usize;
     for (at, &row) in tree.nodes.iter().enumerate().skip(1) {
         let node = Node::from_row(row);
         order.span(tree, tree.span(at), at)?;

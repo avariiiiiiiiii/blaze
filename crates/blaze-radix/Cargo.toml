@@ -17,7 +17,8 @@ doctest = false
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-proptest.workspace = true
+blaze-rng.workspace = true
+hegeltest.workspace = true
 
 [lints]
 workspace = true

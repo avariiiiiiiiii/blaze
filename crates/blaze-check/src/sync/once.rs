@@ -125,6 +125,7 @@ impl<T> From<T> for OnceLock<T> {
 
 impl<T: Clone> Clone for OnceLock<T> {
     fn clone(&self) -> OnceLock<T> {
+        // clone: `OnceLock::clone` clones the value, as std's does
         OnceLock { id: Id::new(0), cell: self.cell.clone() }
     }
 }

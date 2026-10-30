@@ -24,7 +24,7 @@ use crate::{
     infer::{BreakableKind, ClosureData, Diverges, coerce::CoerceMany},
     next_solver::{
         AliasTy, Binder, ClauseKind, DbInterner, ErrorGuaranteed, FnSig, GenericArg, PolyFnSig,
-        PolyProjectionClause, Predicate, PredicateKind, SolverDefId, StoredFnSig, TermId, Ty,
+        PolyProjectionClause, Predicate, PredicateKind, StoredFnSig, TermId, Ty,
         TyKind, Unnormalized,
         abi::Safety,
         infer::{
@@ -583,7 +583,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         closure_kind: ClosureKind,
         projection: PolyProjectionClause<'db>,
     ) -> Option<PolyFnSig<'db>> {
-        let SolverDefId::TypeAliasId(def_id) = projection.item_def_id() else { unreachable!() };
+        let TermId::TypeAliasId(def_id) = projection.item_def_id().0 else { unreachable!() };
 
         // For now, we only do signature deduction based off of the `Fn` and `AsyncFn` traits,
         // for closures and async closures, respectively.

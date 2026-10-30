@@ -53,6 +53,8 @@ pub enum TableError {
     NotInTable(u32),
     /// A record of another binary: its slot count is not the table's.
     OtherBinary { record: u32, table: u32 },
+    /// A record hits a slot an incremental relink emptied (codegen's `ExecTable::EMPTY`).
+    EmptySlot { slot: u32 },
 }
 
 impl fmt::Display for TableError {
@@ -66,6 +68,9 @@ impl fmt::Display for TableError {
             TableError::NotInTable(at) => write!(f, "a test reaches function {at}, which the binary's table does not have"),
             TableError::OtherBinary { record, table } => {
                 write!(f, "the execution record has {record} slots and the binary {table}: it is of another binary")
+            }
+            TableError::EmptySlot { slot } => {
+                write!(f, "the execution record hits slot {slot}, which names no function in the binary")
             }
         }
     }
@@ -181,6 +186,9 @@ impl Image {
         // alloc: once per binary
         let mut logged = vec![false; fns.len()];
         for (slot, &function) in slot_fn.iter().enumerate() {
+            if function == NONE {
+                continue;
+            }
             let Some(it) = logged.get_mut(function as usize) else {
                 return Err(TableError::NoFunction { slot: slot as u32, function });
             };
@@ -287,6 +295,9 @@ impl Image {
             let Some(&function) = self.slot_fn.get(hit as usize) else {
                 return Err(TableError::OtherBinary { record: slots, table: self.slots() });
             };
+            if function == NONE {
+                return Err(TableError::EmptySlot { slot: hit });
+            }
             ranks.push(self.rank[function as usize]);
         }
         Ok(self.set_of_ranks(ranks))

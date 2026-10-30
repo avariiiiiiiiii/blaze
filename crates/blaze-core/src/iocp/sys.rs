@@ -19,7 +19,7 @@ use std::{
 use blaze_mem::{MemError, Region, Tag as MemTag};
 use windows_sys::Win32::{
     Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
-    Storage::FileSystem::GetFullPathNameW,
+    Storage::FileSystem::{GetFullPathNameW, SetFileCompletionNotificationModes},
     System::IO::{
         CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_0_0,
         OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
@@ -268,14 +268,31 @@ pub(super) fn check(ok: windows_sys::core::BOOL) -> io::Result<()> {
 }
 
 /// Ok where an overlapped call is in flight: it returned true, or false with
-/// `ERROR_IO_PENDING`. Either way its completion comes to the port, as no handle of the
-/// driver's skips the port on success.
+/// `ERROR_IO_PENDING`. Either way its completion comes to the port: for a handle that does not
+/// skip the port on success ([`Port::associate`]).
 pub(super) fn pending(ok: windows_sys::core::BOOL) -> io::Result<()> {
     match ok != 0 || last() == ERROR_IO_PENDING {
         true => Ok(()),
         false => Err(io::Error::last_os_error()),
     }
 }
+
+/// How an overlapped call on a handle that skips the port on success
+/// ([`Port::associate_skipping`]) started: `Ok(true)` where it ended at once, so no packet
+/// comes and how it ended is in its `OVERLAPPED` already ([`Head::result`]); `Ok(false)` where
+/// it is in flight and its packet comes.
+pub(super) fn started(ok: windows_sys::core::BOOL) -> io::Result<bool> {
+    if ok != 0 {
+        return Ok(true);
+    }
+    match last() {
+        ERROR_IO_PENDING => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE` (winbase.h).
+const SKIP_ON_SUCCESS: u8 = 1 | 2;
 
 /// The error code a call just set.
 pub(super) fn last() -> u32 {
@@ -331,10 +348,12 @@ impl Head {
         overlapped
     }
 
-    /// How the step ended, once its completion is dequeued: the bytes it moved, or the Win32
-    /// error its status (an `NTSTATUS`, in `Internal`) says.
+    /// How the step ended, once its completion is dequeued or its call ended it at once
+    /// ([`started`]): the bytes it moved, or the Win32 error its status (an `NTSTATUS`, in
+    /// `Internal`) says.
     pub(super) fn result(&self) -> Result<u32, u32> {
-        // SAFETY: the step's packet was dequeued, so the kernel writes the slot no more.
+        // SAFETY: the step's packet was dequeued, or its call returned having ended it on a
+        // handle that skips the port, so the kernel writes the slot no more.
         let overlapped = unsafe { &*self.overlapped() };
         let status = overlapped.Internal as i32;
         match status < 0 {
@@ -435,6 +454,16 @@ impl Port {
             true => Err(io::Error::last_os_error()),
             false => Ok(()),
         }
+    }
+
+    /// As [`Port::associate`], and a request on `handle` that its call ends at once (a read
+    /// the cache holds, a write it takes) posts no packet: [`started`] says so, and the driver
+    /// ends it where it asked. Only for handles whose every request is asked through
+    /// [`started`]: the files' (`Op::Read`, `Op::Write`).
+    pub(super) fn associate_skipping(&self, handle: HANDLE) -> io::Result<()> {
+        self.associate(handle)?;
+        // SAFETY: an open handle of the caller's, no request yet on it.
+        check(unsafe { SetFileCompletionNotificationModes(handle, SKIP_ON_SUCCESS) })
     }
 
     /// Posts a packet of `key`, whose `carried` is a number of the key's, never an address.

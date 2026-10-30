@@ -1,6 +1,8 @@
 //! The library format (write then read, every corruption refused, the perfect index) and the
 //! libraries blaze was built with.
 
+use blaze_ids::rng::SplitMix64;
+
 use super::{
     format::{FormatError, Writer},
     *,
@@ -117,12 +119,9 @@ fn the_index_finds_every_key_of_a_full_set_and_no_other() {
                 assert_eq!(reader.find(shape.key()), None, "{shape}");
             }
         }
-        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
         for _ in 0..100_000 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let key = x as u32;
+            let key = rng.next_u32();
             if !keys.contains(&key) {
                 assert_eq!(reader.find(key), None, "{key:#x}");
             }

@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-#[salsa::tracked(mem_tag = Infer)]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub fn destructor(db: &Db, adt: AdtId) -> Option<ImplId> {
     let module = match adt {
         AdtId::EnumId(id) => id.loc(db).container,
@@ -145,46 +145,41 @@ fn has_drop_glue_impl<'db>(
                     {
                         return DropGlue::None;
                     }
-                    db.field_types(id.into())
-                        .iter()
-                        .map(|(_, field)| {
-                            has_drop_glue_impl(
-                                infcx,
-                                field.ty().instantiate(infcx.interner, subst).skip_norm_wip(),
-                                env,
-                                visited,
-                            )
-                        })
-                        .max()
-                        .unwrap_or(DropGlue::None)
+                    most_glue(db.field_types(id.into()).iter().map(|(_, field)| {
+                        has_drop_glue_impl(
+                            infcx,
+                            field.ty().instantiate(infcx.interner, subst).skip_norm_wip(),
+                            env,
+                            visited,
+                        )
+                    }))
                 }
                 // Unions cannot have fields with destructors.
                 AdtId::UnionId(_) => DropGlue::None,
-                AdtId::EnumId(id) => enum_variant_ids(db, id)
-                    .iter()
-                    .map(|&variant| {
-                        db.field_types(variant.into())
-                            .iter()
-                            .map(|(_, field)| {
+                AdtId::EnumId(id) => {
+                    let mut most = DropGlue::None;
+                    for &variant in enum_variant_ids(db, id).iter() {
+                        most = most.max(most_glue(db.field_types(variant.into()).iter().map(
+                            |(_, field)| {
                                 has_drop_glue_impl(
                                     infcx,
                                     field.ty().instantiate(infcx.interner, subst).skip_norm_wip(),
                                     env,
                                     visited,
                                 )
-                            })
-                            .max()
-                            .unwrap_or(DropGlue::None)
-                    })
-                    .max()
-                    .unwrap_or(DropGlue::None),
+                            },
+                        )));
+                        if most == DropGlue::HasDropGlue {
+                            break;
+                        }
+                    }
+                    most
+                }
             }
         }
-        TyKind::Tuple(tys) => tys
-            .iter()
-            .map(|ty| has_drop_glue_impl(infcx, ty, env, visited))
-            .max()
-            .unwrap_or(DropGlue::None),
+        TyKind::Tuple(tys) => {
+            most_glue(tys.iter().map(|ty| has_drop_glue_impl(infcx, ty, env, visited)))
+        }
         TyKind::Array(ty, len) => {
             if consteval::try_const_usize(db, len) == Some(0) {
                 // Arrays of size 0 don't have drop glue.
@@ -236,5 +231,45 @@ fn has_drop_glue_impl<'db>(
         TyKind::Infer(..) => unreachable!("inference vars shouldn't exist out of inference"),
         TyKind::Pat(ty, _) => has_drop_glue_impl(infcx, ty, env, visited),
         TyKind::UnsafeBinder(ty) => has_drop_glue_impl(infcx, ty.skip_binder(), env, visited),
+    }
+}
+
+/// The most glue of `parts`, which stops at the first part with drop glue: no part after it
+/// can have more, so the rest are not walked.
+fn most_glue(parts: impl Iterator<Item = DropGlue>) -> DropGlue {
+    let mut most = DropGlue::None;
+    for glue in parts {
+        if glue == DropGlue::HasDropGlue {
+            return glue;
+        }
+        most = most.max(glue);
+    }
+    most
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DropGlue, most_glue};
+
+    #[test]
+    fn the_most_glue_is_the_max_of_every_part() {
+        let all = [DropGlue::None, DropGlue::DependOnParams, DropGlue::HasDropGlue];
+        for len in 0..5u32 {
+            for mut code in 0..3u32.pow(len) {
+                let parts: Vec<DropGlue> = (0..len)
+                    .map(|_| {
+                        let it = all[(code % 3) as usize];
+                        code /= 3;
+                        it
+                    })
+                    .collect();
+                let max = parts.iter().copied().max().unwrap_or(DropGlue::None);
+                assert_eq!(most_glue(parts.iter().copied()), max, "{parts:?}");
+                let walked = std::cell::Cell::new(0);
+                most_glue(parts.iter().inspect(|_| walked.set(walked.get() + 1)).copied());
+                let stop = parts.iter().position(|&it| it == DropGlue::HasDropGlue);
+                assert_eq!(walked.get(), stop.map_or(parts.len(), |at| at + 1), "{parts:?}");
+            }
+        }
     }
 }

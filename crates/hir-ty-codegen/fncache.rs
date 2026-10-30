@@ -46,7 +46,6 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 use salsa::plumbing::{AsId, FromId};
 
-use hir_def::CallableDefId;
 use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
@@ -94,22 +93,10 @@ fn is_codec(db: &Db, func: FunctionId) -> bool {
 /// The closure that `#[blaze::cache]` put the body of `func` in, when it is a cached
 /// function: the one it asks for the code of.
 pub(super) fn cached_closure(db: &Db, func: FunctionId) -> Option<salsa::Id> {
-    if !uses_cache(db, func.krate(db)) {
+    if !hir_ty::fn_cache::uses_fn_cache(db, func.krate(db)) {
         return None;
     }
     cached_closure_of(db, func).map(|it| it.as_id())
-}
-
-/// Whether `krate` can have cached functions: the attribute calls into the `blaze` crate, so
-/// a crate without it as a dependency has none, and costs nothing to look through.
-pub(super) fn uses_cache(db: &Db, krate: Crate) -> bool {
-    krate.data(db).dependencies.iter().any(|dep| {
-        dep.crate_id
-            .extra_data(db)
-            .display_name
-            .as_ref()
-            .is_some_and(|name| name.crate_name().symbol().as_str() == "blaze")
-    })
 }
 
 #[salsa::tracked]
@@ -122,27 +109,13 @@ fn cached_closure_of<'db>(
         let TerminatorKind::Call { func: callee, .. } = &block.terminator.as_ref()?.kind else {
             return None;
         };
-        let (callee, args) = fn_item(callee)?;
+        let (callee, args) = callee.fn_item()?;
         if !is_code(db, callee) {
             return None;
         }
         let TyKind::Closure(id, _) = args.type_at(0).kind() else { return None };
         Some(id.0)
     })
-}
-
-/// The function a constant operand names, with its generic arguments.
-fn fn_item<'db>(operand: &Operand) -> Option<(FunctionId, GenericArgs<'db>)> {
-    let ty: Ty<'db> = match &operand.kind {
-        OperandKind::Constant { ty, .. } => ty.as_ref(),
-        OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-        _ => return None,
-    };
-    let TyKind::FnDef(def, args) = ty.kind() else { return None };
-    match def.0 {
-        CallableDefId::FunctionId(func) => Some((func, args)),
-        _ => None,
-    }
 }
 
 /// The hash of the code of the closure a cached function keeps its body in and of all it
@@ -1742,7 +1715,7 @@ impl<'db> Walk<'db> {
             _ => return None,
         };
         let refers = |operand: &Operand| match (site, &operand.kind) {
-            (Site::Func(func), _) => fn_item(operand).is_some_and(|(it, _)| it == func),
+            (Site::Func(func), _) => operand.fn_item().is_some_and(|(it, _)| it == func),
             (Site::Static(id), OperandKind::Static(it)) => *it == id,
             _ => false,
         };
@@ -2299,7 +2272,7 @@ fn library_operand<'db>(
             }
         };
     }
-    let (func, args) = fn_item(operand)?;
+    let (func, args) = operand.fn_item()?;
     if diverges(db, func) {
         // A panic, the handler core declares as foreign among them: what it prints is no
         // result.

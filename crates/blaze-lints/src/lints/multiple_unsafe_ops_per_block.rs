@@ -114,12 +114,12 @@ impl<'t> Collector<'_, '_, 't> {
             ast::Expr::AsmExpr(_) => self.push("inline assembly used here", expr),
             // `&raw const u.field` reads no field: what the place is built from is walked.
             ast::Expr::RefExpr(reference) if reference.raw_token().is_some() => {
-                let mut inner = peel_parens(reference.expr()?);
+                let mut inner = reference.expr()?.peel_parens();
                 while let ast::Expr::FieldExpr(field) = inner
                     && let Some(prefix) = field.expr()
                     && cx.adjustments(prefix).is_none_or(|it| it.is_empty())
                 {
-                    inner = peel_parens(prefix);
+                    inner = prefix.peel_parens();
                 }
                 return Some(Some(inner.syntax()));
             }
@@ -160,7 +160,7 @@ impl<'t> Collector<'_, '_, 't> {
                 }
             }
             ast::Expr::BinExpr(bin) if matches!(bin.op_kind(), Some(BinaryOp::Assignment { .. })) => {
-                if bin.lhs().is_some_and(|it| is_static_mut(cx, peel_parens(it))) {
+                if bin.lhs().is_some_and(|it| is_static_mut(cx, it.peel_parens())) {
                     self.push("modification of a mutable static occurs here", expr);
                     return Some(bin.rhs().map(|it| it.syntax()));
                 }
@@ -174,17 +174,6 @@ impl<'t> Collector<'_, '_, 't> {
         let at = self.place(expr.syntax());
         self.ops.push((note, at));
     }
-}
-
-/// `expr` without the parentheses around it, which HIR does not have.
-fn peel_parens(expr: ast::Expr<'_>) -> ast::Expr<'_> {
-    let mut expr = expr;
-    while let ast::Expr::ParenExpr(paren) = expr
-        && let Some(inner) = paren.expr()
-    {
-        expr = inner;
-    }
-    expr
 }
 
 /// `expr` is a path naming a `static mut` (`DefKind::Static { mutability: Mut }`).

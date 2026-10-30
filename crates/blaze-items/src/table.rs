@@ -33,7 +33,7 @@ const _: () = {
 
 /// The hashes of a set of items, sorted by key, one column per hash kind. The items that have
 /// no hash are in a side table, by key with why.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default)]
 pub struct HashColumns {
     keys: Box<[ItemKey]>,
     kinds: Box<[ItemKind]>,
@@ -164,17 +164,29 @@ fn dense<T>(count: usize, values: impl Iterator<Item = T>) -> Box<[T]> {
 #[salsa::tracked(returns(ref))]
 pub fn crate_hashes(db: &Db, krate: Crate) -> HashColumns {
     frame::task(Tag::Other, |frame| {
-        let mut rows: Vec<(ItemKey, ItemHashes), &Frame> = Vec::new_in(frame);
+        let items = crate_items_by_key(db, krate);
+        let mut rows: Vec<(ItemKey, ItemHashes), &Frame> = Vec::with_capacity_in(items.len(), frame);
         let mut unhashable: Vec<(ItemKey, Unhashable), &Frame> = Vec::new_in(frame);
-        for id in key::crate_item_ids(db, krate) {
-            let key = key::item_key(db, id);
+        for &(key, id) in items.iter() {
             match hash::hashes(db, id) {
                 Ok(it) => rows.push((key, it)),
                 Err(it) => unhashable.push((key, it)),
             }
         }
+        // Already in key order: the sort in `new` is one pass that finds it so.
         HashColumns::new(&mut rows, &mut unhashable)
     })
+}
+
+/// Every item of `krate` with an [`crate::ItemId`] and its key, sorted by key. An edit that
+/// adds, removes, renames or moves no item leaves it as it was, so [`crate_hashes`] rebuilt
+/// after a body edit reads no key and sorts nothing.
+#[salsa::tracked(returns(deref))]
+fn crate_items_by_key(db: &Db, krate: Crate) -> Box<[(ItemKey, crate::ItemId)]> {
+    let mut items: Vec<(ItemKey, crate::ItemId)> =
+        key::crate_item_ids(db, krate).map(|id| (key::item_key(db, id), id)).collect(); // alloc: a memo's column.
+    items.sort_unstable_by_key(|&(key, _)| key);
+    items.into_boxed_slice()
 }
 
 const NO_OBJECT: u32 = u32::MAX;
@@ -188,7 +200,7 @@ const _: () = assert!(FACT_ROW_BYTES == 9);
 /// The facts a query read, distinct and sorted by `(kind, subject, object)`, as three columns
 /// over a sorted dictionary of the ids they name: every fact of one kind about one subject is
 /// one range, found by binary search.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default)]
 pub struct FactSet {
     ids: Box<[ContentId]>,
     kinds: Box<[u8]>,
@@ -224,7 +236,8 @@ fn split(fact: &Fact) -> (u8, ContentId, Object) {
         | Fact::Coherence(it)
         | Fact::Specializes(it)
         | Fact::DropCheck(it)
-        | Fact::Derive(it) => (tag, it.0, Object::None),
+        | Fact::Derive(it)
+        | Fact::HiddenTypes(it) => (tag, it.0, Object::None),
         Fact::Field { ty, field } => (tag, ty.0, Object::Field(field)),
         Fact::Method { self_ty, name } => (tag, self_ty.0, Object::Id(name.0)),
         Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {
@@ -266,6 +279,7 @@ fn joined(tag: u8, subject: ContentId, object: Object) -> Option<Fact> {
         kinds::DERIVE => return alone(Fact::Derive(item)),
         kinds::TARGET => return alone(Fact::Target(subject)),
         kinds::CRATE => return alone(Fact::Crate(subject)),
+        kinds::HIDDEN_TYPES => return alone(Fact::HiddenTypes(item)),
         _ => return None,
     })
 }

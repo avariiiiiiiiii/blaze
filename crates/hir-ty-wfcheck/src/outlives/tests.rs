@@ -283,6 +283,63 @@ fn well_formedness_leaves_out_only_what_holds_and_tells_nothing() {
     });
 }
 
+const TRAITS: &str = r#"
+//- minicore: sized, option
+trait Tr { type Out; }
+impl Tr for u8 { type Out = u16; }
+impl<'a, T: 'a> Tr for &'a T { type Out = T; }
+trait Marker {}
+impl<T: 'static> Marker for T {}
+struct NeedsTr<T: Tr>(T);
+struct NeedsMarker<T: Marker>(T);
+struct Uses<'a, T: 'a + Tr> {
+    a: NeedsTr<u8>,
+    b: NeedsMarker<u32>,
+    c: NeedsTr<&'a T>,
+    d: <u8 as Tr>::Out,
+    e: NeedsMarker<&'static str>,
+    f: NeedsTr<T>,
+    g: Option<NeedsMarker<Option<u8>>>,
+}
+"#;
+
+/// Global predicates answered by evaluation alone leave out only needs that hold and tell
+/// nothing, in order, and fail where proving them in a context fails.
+#[test]
+fn global_predicates_leave_out_only_what_holds() {
+    let (db, _) = TestDB::with_single_file(TRAITS);
+    hir_ty::attach_db(&db, || {
+        let mut globals = 0;
+        for (adt, ty) in field_tys(&db) {
+            blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+                let mut predicates = Vec::new_in(frame);
+                trait_predicates(&db, frame, ty, &mut predicates);
+                globals += predicates.iter().filter(|it| it.is_global()).count();
+                let mut expected = Vec::new();
+                prove_needs_reference(&Wfcx::new(frame, &db, adt.into()), &predicates, &mut expected);
+                let mut actual = Vec::new();
+                prove_needs(&Wfcx::new(frame, &db, adt.into()), &predicates, &mut actual);
+                let mut rest = expected.iter().copied();
+                for &need in &actual {
+                    loop {
+                        let next = rest.next().unwrap_or_else(|| {
+                            panic!("{ty:?}: {need:?} is not in {expected:?} in order")
+                        });
+                        if next == need {
+                            break;
+                        }
+                        assert!(is_trivial(next), "{ty:?}: left out {next:?}");
+                    }
+                }
+                for next in rest {
+                    assert!(is_trivial(next), "{ty:?}: left out {next:?}");
+                }
+            });
+        }
+        assert!(globals >= 4, "{globals}");
+    });
+}
+
 #[test]
 fn a_field_of_static_reference_to_a_parameter_needs_it_static() {
     let (db, _) = TestDB::with_single_file(FIXTURE);

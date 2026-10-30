@@ -68,6 +68,7 @@ pub use monomorphization::{monomorphized_args, monomorphized_const, monomorphize
 pub use monomorphization::monomorphized_promoted_mir_body_query;
 pub use monomorphization::opaque_of_impl;
 pub use monomorphization::erase_and_anonymize_regions;
+pub use monomorphization::normalize_or_keep;
 pub use optimize::{
     CallerLocation, caller_location, owner_of, passes_not_ported, set_interpreter_mir_opt_level,
     source_span, written_checked_at,

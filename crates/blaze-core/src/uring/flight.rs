@@ -27,8 +27,29 @@ pub(super) fn failed(res: i32) -> Option<Done> {
 }
 
 /// The descriptor of `fd`, or -1 for none.
-fn raw(fd: &Option<OwnedFd>) -> RawFd {
+pub(super) fn raw(fd: &Option<OwnedFd>) -> RawFd {
     fd.as_ref().map_or(-1, |it| it.as_raw_fd())
+}
+
+/// Where a read into `bytes` puts what it reads, and how much it may: the spare capacity after
+/// its length, which is never zeroed first (the kernel's copy is the one pass over the bytes).
+pub(super) fn spare_of(bytes: &[u8], capacity: usize) -> (u64, u32) {
+    let spare = capacity - bytes.len();
+    (bytes.as_ptr().wrapping_add(bytes.len()) as u64, spare.min(u32::MAX as usize) as u32)
+}
+
+/// `res` bytes the kernel read into `bytes`' spare capacity ([`spare_of`]) counted in its
+/// length; whether there is room for more.
+pub(super) fn filled(bytes: &mut Vec<u8>, res: i32) -> bool {
+    let spare = bytes.capacity() - bytes.len();
+    // The kernel's count, clamped to the room it was given, so a wrong one never counts bytes
+    // past the allocation.
+    let got = usize::try_from(res).unwrap_or(0).min(spare);
+    // SAFETY: the read was given the `spare` bytes after `bytes.len()` (`spare_of`) and its
+    // completion says the kernel wrote the first `res` of them; `got` is at most that and at
+    // most `spare`, so every byte now in the length is initialized and inside the allocation.
+    unsafe { bytes.set_len(bytes.len() + got) };
+    bytes.len() < bytes.capacity()
 }
 
 /// The completions the kernel still owes the request `hot`: one per link asked whose last
@@ -57,6 +78,7 @@ fn on_path(kind: Kind) -> bool {
             | Kind::Clone
             | Kind::Map
             | Kind::Stat
+            | Kind::Load
     )
 }
 
@@ -85,7 +107,7 @@ impl Uring {
     /// room (or for its kept file's open, the slots its opens fill, or, bypassing the page
     /// cache, a registered buffer).
     pub(super) fn queue(&mut self, id: Id) {
-        if !self.prepared(id) || !self.slotted(id) || !self.buffered(id) {
+        if !self.admitted(id) || !self.prepared(id) || !self.slotted(id) || !self.buffered(id) {
             return;
         }
         let mut sqes = [Sqe::default(); LINKS];
@@ -190,8 +212,9 @@ impl Uring {
         // what a request holds in them stays until it ends (`Uring::end`).
         sqes[0] = match hot.kind {
             Kind::Read => {
-                let ((fd, flags), (addr, len)) = (kept(), rest());
-                Sqe { opcode: OP_READ, flags, fd, off: cold.at + hot.done, addr, len, user_data, ..Sqe::default() }
+                let ((fd, flags), (addr, len)) = (kept(), spare_of(buf, buf.capacity()));
+                let off = cold.at + buf.len() as u64;
+                Sqe { opcode: OP_READ, flags, fd, off, addr, len, user_data, ..Sqe::default() }
             }
             Kind::Append => {
                 let ((fd, flags), (addr, len)) = (kept(), rest());
@@ -412,6 +435,7 @@ impl Uring {
         self.waiting.clear();
         self.on_open.clear();
         self.slot_waiting.clear();
+        self.load_waiting.clear();
         drop(self.lent.clear_waiting());
         self.ring.unsubmitted = 0;
     }
@@ -474,14 +498,11 @@ impl Uring {
                 if res < 0 {
                     return Step::Ends(failed(res));
                 }
-                let got = self.progress(id, res);
                 let bytes = self.ops.buf_mut(id);
-                if res > 0 && got < bytes.len() {
+                if res > 0 && filled(bytes, res) {
                     return Step::Again;
                 }
-                let mut bytes = mem::take(bytes);
-                bytes.truncate(got);
-                Step::Ends(Some(Done::Read(bytes)))
+                Step::Ends(Some(Done::Read(mem::take(bytes))))
             }
             Kind::Append => {
                 if res < 0 {
@@ -505,7 +526,8 @@ impl Uring {
             | Kind::Link
             | Kind::Clone
             | Kind::Map
-            | Kind::Stat => self.path_step(id, link, res),
+            | Kind::Stat
+            | Kind::Load => self.path_step(id, link, res),
             Kind::Truncate => unreachable!("a truncate is done as it is prepared"),
             Kind::Watch => self.watched(hot, res),
             Kind::Exit => {
@@ -852,7 +874,7 @@ impl Uring {
 
     pub(super) fn spawn(&mut self, tag: Tag, command: Box<Command>) -> io::Result<()> {
         let crate::process::Started { pid, pidfd, stdin, stdout, stderr, mut finish } =
-            crate::process::start(&self.root, command, self.confine.as_ref())?;
+            crate::process::start(&self.spawn_dirs, command, self.confine.as_ref())?;
         let input = mem::take(&mut finish.command.stdin);
         let parts = 3 + usize::from(stdin.is_some());
         let spawn = self.spawns.insert(Spawning {
@@ -1011,6 +1033,7 @@ impl Drop for Uring {
         self.waiting.clear();
         self.on_open.clear();
         self.slot_waiting.clear();
+        self.load_waiting.clear();
         drop(self.lent.clear_waiting());
         // alloc: drop, once.
         let mut owed: FxHashMap<Id, usize> = self.ops.iter().map(|(id, hot)| (id, owed(hot))).collect();

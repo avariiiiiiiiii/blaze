@@ -18,6 +18,7 @@ doctest = false
 fuzz = []
 
 [dependencies]
+blaze-bytes.workspace = true
 blaze-codegen.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true

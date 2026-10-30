@@ -39,8 +39,8 @@ use crate::{
         },
     },
     next_solver::{
-        DbInterner, StoredEarlyBinder, StoredTraitRef, TraitRef,
-        persist::{TyTableReader, TyTableWriter},
+        ConstExt, DbInterner, StoredEarlyBinder, StoredTraitRef, TraitRef,
+        persist::{TyTableReader, TyTableWriter, table_words},
     },
 };
 
@@ -252,10 +252,7 @@ impl ColdBatch {
         let mut out = Writer::new(TY_TABLE_SCHEMA);
         self.table_root = tys.write(&mut out);
         let bytes = out.finish(self.table_root);
-        self.table = bytes
-            .chunks_exact(size_of::<u128>())
-            .map(|chunk| u128::from_le_bytes(chunk.try_into().expect("a chunk of 16 bytes")))
-            .collect(); // alloc: a written batch's own column, once per crate, exact size
+        self.table = table_words(&bytes);
         self
     }
 
@@ -1304,7 +1301,7 @@ mod tests {
                 diagnostics: words,
                 anon_consts: vec![id(12).as_bits()],
             },
-            table: table.chunks_exact(16).map(|it| u128::from_le_bytes(it.try_into().unwrap())).collect(),
+            table: table_words(&table),
             table_root,
         }
     }

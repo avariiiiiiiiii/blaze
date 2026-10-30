@@ -5,7 +5,7 @@ use object::read::elf::{Dyn as _, FileHeader as _, Sym as _};
 
 use super::strings::Table;
 use super::{ENDIAN, Header};
-use crate::model::{Names, Shared, SharedSymbol};
+use crate::model::{Name, Names, Shared, SharedSymbol};
 
 /// Reads the shared object `data`, whose header [`super::read`] checked.
 pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
@@ -38,7 +38,7 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
     let mut names = Names::with_capacity(dynstr.size());
     let mut symbols = Vec::with_capacity(dynsym.len());
     // alloc: once per version the library defines, `Shared::versions`; empty allocates nothing
-    let mut versions: Vec<String> = Vec::new();
+    let mut versions: Vec<Name> = Vec::new();
     // By ELF version index (at most 0x7fff): its slot in `versions` once seen, `None` inside
     // for the local and global indexes, which name no version. Reserved whole, so it never
     // grows: untouched pages past the highest index seen are never written.
@@ -83,14 +83,16 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
                             Some(found) => {
                                 let found = super::utf8(name, "the version name", found.name())?;
                                 // Two indexes may name one version (a definition and a need).
-                                Some(match versions.iter().position(|it| it == found) {
+                                Some(match versions.iter().position(|it| names.at(*it) == found) {
                                     Some(slot) => slot as u16,
                                     None => {
                                         let slot = u16::try_from(versions.len()).map_err(|_| {
                                             // alloc: error path
                                             format!("{name}: more than 65,536 versions")
                                         })?;
-                                        versions.push(found.to_owned()); // alloc: once per version, `Shared::versions`
+                                        // alloc: error path
+                                        let at = names.push(found).map_err(|it| format!("{name}: {it}"))?;
+                                        versions.push(at);
                                         slot
                                     }
                                 })

@@ -12,7 +12,7 @@ use rustc_abi::{ExternAbi, Float, Integer, Size};
 use rustc_ast_ir::{Mutability, try_visit, visit::VisitorResult};
 use rustc_type_ir::{
     BoundVar, BoundVarIndexKind, ClosureKind, DebruijnIndex, FlagComputation, Flags, FloatTy,
-    FloatVid, GenericTypeVisitable, InferTy, IntTy, IntVid, Interner, IsRigid, PredicateProxy,
+    FloatVid, GenericTypeVisitable, InferTy, IntTy, IntVid, Interner, PredicateProxy,
     TyVid, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
     TypeVisitor, UintTy, Upcast,
     inherent::{
@@ -75,6 +75,50 @@ const _: () = assert!(size_of::<TyKind<'static>>() <= 48);
 
 impl_stored_interned!(Ty, StoredTy);
 impl_foldable_for_stored_type!(StoredTy);
+
+/// The salsa ids of the closures, coroutines and opaque types `ty` names at any depth: whose
+/// a query keyed by it is (`salsa::Zalsa::ids_of`, read by `crates/hir-firewall`).
+fn push_named_ids(ty: Ty<'_>, out: &mut Vec<salsa::Id>) {
+    use salsa::plumbing::AsId;
+    for arg in ty.walk() {
+        let Some(ty) = arg.ty() else { continue };
+        match ty.kind() {
+            TyKind::Closure(id, _) => out.push(id.0.as_id()),
+            TyKind::CoroutineClosure(id, _) => out.push(id.0.as_id()),
+            TyKind::Coroutine(id, _) | TyKind::CoroutineWitness(id, _) => out.push(id.0.as_id()),
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, .. }) => {
+                out.push(def_id.0.as_id())
+            }
+            _ => {}
+        }
+    }
+}
+
+impl salsa::plumbing::interned::NamesIds for Ty<'_> {
+    fn names_ids(&self, out: &mut Vec<salsa::Id>) {
+        push_named_ids(*self, out);
+    }
+}
+
+impl salsa::plumbing::interned::NamesIds for StoredTy {
+    fn names_ids(&self, out: &mut Vec<salsa::Id>) {
+        push_named_ids(self.as_ref(), out);
+    }
+}
+
+impl salsa::plumbing::interned::NamesIds for GenericArgs<'_> {
+    fn names_ids(&self, out: &mut Vec<salsa::Id>) {
+        for ty in self.iter().filter_map(|arg| arg.ty()) {
+            push_named_ids(ty, out);
+        }
+    }
+}
+
+impl salsa::plumbing::interned::NamesIds for super::StoredGenericArgs {
+    fn names_ids(&self, out: &mut Vec<salsa::Id>) {
+        self.as_ref().names_ids(out);
+    }
+}
 
 impl<'db> Ty<'db> {
     /// You should avoid using this if you can, since we want `Const` to be defined in `rustc_type_ir` and then this method

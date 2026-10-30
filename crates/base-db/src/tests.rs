@@ -28,6 +28,8 @@ use crate::{
     target::{Arch, TargetData},
 };
 
+mod memo_properties;
+
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
@@ -1037,7 +1039,7 @@ thread_local! {
 
 /// What a `#[path = "../../shared/m.rs"] mod m;` in `anchor` reads: the file and its text's
 /// length, as a def map would.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn shared_module(db: &Db, anchor: EditionedFileId) -> Option<(u32, u32)> {
     SHARED_MODULE_RUNS.with(|it| it.set(it.get() + 1));
     let (anchor, _) = anchor.unpack(db);
@@ -1246,4 +1248,301 @@ fn a_cache_hit_of_parse_allocates_nothing() {
     blaze_alloc_count::assert_at_most(0, "a cache hit of `parse` after a reparse", || {
         id.parse(&db).is_outline()
     });
+}
+
+/// Source root 0's files in order, with their paths.
+fn root_files(db: &Db) -> Vec<(FileId, VfsPath)> {
+    let root = db.source_root(SourceRootId(0)).source_root_ref(db);
+    root.iter().map(|id| (id, root.path_for_file(&id).unwrap().clone())).collect()
+}
+
+/// A view's files added and taken out are edited into its root's file set where it is, with
+/// no copy, and give the set made again from the old one's files in their order with the
+/// added ones after, as base-db made it before.
+#[test]
+fn a_view_edits_its_roots_files_in_place_as_making_them_again_does() {
+    let mut rng = Rng::new(11);
+    let mut db = Db::for_tests();
+    let (base, partition) = checkout(&mut db);
+    for step in 0..60 {
+        let view = seeded_view(&mut rng);
+        let before = root_files(&db);
+        let at_before = db.source_root(SourceRootId(0)).source_root_ref(&db) as *const SourceRoot;
+        let files: Vec<(&str, &[u8])> = view.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
+        let change = set_view(&mut db, &base, &partition, &files).unwrap();
+
+        let mut expected: Vec<(FileId, VfsPath)> =
+            before.into_iter().filter(|(id, _)| !change.removed.contains(id)).collect();
+        for (path, _) in &view {
+            let path = VfsPath::from(base.join(path));
+            let id = db.source_root(SourceRootId(0)).source_root_ref(&db).file_for_path(&path).copied();
+            if let Some(id) = id
+                && change.added.contains(&id)
+            {
+                expected.push((id, path));
+            }
+        }
+        assert_eq!(root_files(&db), expected, "step {step}");
+        let root = db.source_root(SourceRootId(0)).source_root_ref(&db);
+        assert_eq!(root.len(), expected.len());
+        for (id, path) in &expected {
+            assert_eq!(root.file_for_path(path), Some(id), "step {step}");
+        }
+        if !change.roots.is_empty() {
+            assert!(std::ptr::eq(at_before, root), "step {step}: the set was copied");
+        }
+    }
+}
+
+/// One crate of a drawn graph: the file it is rooted at, its cfg and env (by number, see
+/// [`drawn_cfg`] and [`drawn_env`]) and the crates before it it depends on.
+#[derive(Clone, Debug)]
+struct DrawnCrate {
+    root: usize,
+    cfg: usize,
+    env: usize,
+    deps: Vec<usize>,
+}
+
+fn drawn_cfg(at: usize) -> CfgOptions {
+    match at {
+        0 => CfgOptions::default(),
+        1 => cfg(&[flag("unix")]),
+        _ => cfg(&[key_value("feature", "x")]),
+    }
+}
+
+fn drawn_env(at: usize) -> Env {
+    match at {
+        0 => Env::default(),
+        n => [("KEY".to_owned(), n.to_string())].into_iter().collect(),
+    }
+}
+
+/// A crate on most of `files` files, each depending on some before it, and now and then a
+/// second crate on the first one's root file told apart by its cfg.
+fn draw_graph(rng: &mut Rng, files: usize) -> Vec<DrawnCrate> {
+    let mut crates: Vec<DrawnCrate> = Vec::new();
+    for root in 0..files {
+        if rng.below(10) < 2 {
+            continue;
+        }
+        let before = crates.len();
+        let deps = (0..before).filter(|_| rng.coin()).collect();
+        crates.push(DrawnCrate { root, cfg: rng.index(3), env: rng.index(3), deps });
+    }
+    if let Some(first) = crates.first().cloned()
+        && rng.one_in(3)
+    {
+        crates.push(DrawnCrate { cfg: (first.cfg + 1) % 3, deps: Vec::new(), ..first });
+    }
+    crates
+}
+
+fn build_graph(drawn: &[DrawnCrate], files: &[FileId]) -> CrateGraphBuilder {
+    let mut graph = CrateGraphBuilder::default();
+    let mut ids: Vec<CrateBuilderId> = Vec::new();
+    for krate in drawn {
+        let id = add(&mut graph, files[krate.root], drawn_cfg(krate.cfg), drawn_env(krate.env));
+        for &dep in &krate.deps {
+            depend(&mut graph, id, ids[dep], &format!("d{dep}"));
+        }
+        ids.push(id);
+    }
+    graph
+}
+
+/// Source root 0 with `files[i]` at `/p{i}/lib.rs`, or at `/moved/p{i}.rs` where `moved[i]`.
+fn root_at(db: &mut Db, files: &[FileId], moved: &[bool]) {
+    let mut set = FileSet::default();
+    for (at, (&file, &moved)) in files.iter().zip(moved).enumerate() {
+        let path = if moved { format!("/moved/p{at}.rs") } else { format!("/p{at}/lib.rs") };
+        set.insert(file, VfsPath::new_virtual_path(path));
+    }
+    let root = Arc::new(SourceRoot::new_local(set));
+    db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
+}
+
+/// Every crate of the graph has the content ID hashing its fields gives.
+fn assert_crates_fresh(db: &Db, what: &str) {
+    for &krate in crate::all_crates(db).iter() {
+        assert_eq!(krate.content(db), krate.content_from_fields(db), "{krate:?} after {what}");
+    }
+}
+
+/// The comparison that lets an unchanged crate keep its content ID unhashed gives what
+/// hashing every crate gave, over random sequences of graphs, setters and moved root files.
+#[test]
+fn a_crate_graph_set_keeps_every_content_id_what_hashing_gives() {
+    const FILES: usize = 6;
+    for seed in 0..16 {
+        let mut rng = Rng::new(seed);
+        let mut db = Db::for_tests();
+        let texts: Vec<(String, &str)> =
+            (0..FILES).map(|at| (format!("/p{at}/lib.rs"), "pub fn f() {}")).collect();
+        let texts: Vec<(&str, &str)> = texts.iter().map(|(path, text)| (path.as_str(), *text)).collect();
+        let files = load(&mut db, 0, &texts);
+        let mut moved = [false; FILES];
+        for step in 0..60 {
+            match rng.below(6) {
+                0 => {
+                    let at = rng.index(FILES);
+                    moved[at] = !moved[at];
+                    root_at(&mut db, &files, &moved);
+                }
+                1 => {
+                    let all = crate::all_crates(&db);
+                    if let Some(&krate) = rng.pick(&all) {
+                        krate.set_env(&mut db, drawn_env(rng.index(3)));
+                        assert_crates_fresh(&db, &format!("a setter, seed {seed} step {step}"));
+                    }
+                }
+                _ => {
+                    let drawn = draw_graph(&mut rng, FILES);
+                    build_graph(&drawn, &files).set_in_db(&mut db);
+                    assert_crates_fresh(&db, &format!("{drawn:?}, seed {seed} step {step}"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_equal_crate_graph_hashes_no_crate() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let drawn = vec![
+        DrawnCrate { root: 2, cfg: 1, env: 0, deps: Vec::new() },
+        DrawnCrate { root: 0, cfg: 0, env: 1, deps: vec![0] },
+    ];
+    build_graph(&drawn, &files).set_in_db(&mut db);
+    let (hashed, before) = (crate::input::crates_hashed(&db), revision(&db));
+    build_graph(&drawn, &files).set_in_db(&mut db);
+    assert_eq!(crate::input::crates_hashed(&db), hashed);
+    assert_eq!(revision(&db), before);
+
+    // The dependency changed: it and its dependent are hashed again, and only they.
+    let mut changed = drawn.clone();
+    changed[0].env = 2;
+    build_graph(&changed, &files).set_in_db(&mut db);
+    assert_eq!(crate::input::crates_hashed(&db), hashed + 2);
+    assert_crates_fresh(&db, "a changed dependency");
+}
+
+/// A crate left out of the graph while its dependency changed is hashed again when it comes
+/// back with the fields it had.
+#[test]
+fn a_crate_back_after_its_dependency_changed_is_hashed_again() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let dependency = |env| DrawnCrate { root: 2, cfg: 0, env, deps: Vec::new() };
+    let dependent = DrawnCrate { root: 0, cfg: 0, env: 0, deps: vec![0] };
+    build_graph(&[dependency(0), dependent.clone()], &files).set_in_db(&mut db);
+    build_graph(&[dependency(1)], &files).set_in_db(&mut db);
+    let hashed = crate::input::crates_hashed(&db);
+    build_graph(&[dependency(1), dependent], &files).set_in_db(&mut db);
+    assert_eq!(crate::input::crates_hashed(&db), hashed + 1, "the dependent alone");
+    assert_crates_fresh(&db, "the dependent's return");
+}
+
+/// The copies of a crate origin's hash that `Crate::content_of`, hir-def's dependency key and
+/// blaze-items' crate key each had before [`CrateOrigin::hash_into`].
+fn old_origin_hash(origin: &CrateOrigin) -> ContentId {
+    use crate::LangCrateOrigin;
+    use blaze_ids::Hasher;
+
+    fn opt<'h>(hasher: &'h mut Hasher, part: Option<&str>) -> &'h mut Hasher {
+        match part {
+            None => hasher.update(&[0]),
+            Some(part) => hasher.update(&[1]).part(part.as_bytes()),
+        }
+    }
+    let mut hasher = Hasher::new("blaze v2 test origin");
+    match origin {
+        CrateOrigin::Rustc { name } => hasher.update(&[0]).part(name.as_str().as_bytes()),
+        CrateOrigin::Local { repo, name } => {
+            hasher.update(&[1]);
+            opt(&mut hasher, repo.as_deref());
+            opt(&mut hasher, name.as_ref().map(|it| it.as_str()))
+        }
+        CrateOrigin::Library { repo, name } => {
+            hasher.update(&[2]);
+            opt(&mut hasher, repo.as_deref());
+            hasher.part(name.as_str().as_bytes())
+        }
+        CrateOrigin::Lang(lang) => hasher.update(&[
+            3,
+            match lang {
+                LangCrateOrigin::Alloc => 0,
+                LangCrateOrigin::Core => 1,
+                LangCrateOrigin::ProcMacro => 2,
+                LangCrateOrigin::Std => 3,
+                LangCrateOrigin::Test => 4,
+                LangCrateOrigin::Dependency => 5,
+                LangCrateOrigin::Other => 6,
+            },
+        ]),
+    };
+    hasher.finish()
+}
+
+#[test]
+fn an_origins_hash_is_the_old_copies() {
+    use crate::LangCrateOrigin;
+    use blaze_ids::Hasher;
+
+    let repos = [None, Some(String::new()), Some("https://github.com/a/b".to_owned())];
+    let names = [Symbol::intern(""), Symbol::intern("serde"), Symbol::intern("a-b")];
+    let mut origins = Vec::new();
+    for name in &names {
+        origins.push(CrateOrigin::Rustc { name: name.clone() });
+        for repo in &repos {
+            origins.push(CrateOrigin::Local { repo: repo.clone(), name: None });
+            origins.push(CrateOrigin::Local { repo: repo.clone(), name: Some(name.clone()) });
+            origins.push(CrateOrigin::Library { repo: repo.clone(), name: name.clone() });
+        }
+    }
+    origins.extend(
+        [
+            LangCrateOrigin::Alloc,
+            LangCrateOrigin::Core,
+            LangCrateOrigin::ProcMacro,
+            LangCrateOrigin::Std,
+            LangCrateOrigin::Test,
+            LangCrateOrigin::Dependency,
+            LangCrateOrigin::Other,
+        ]
+        .map(CrateOrigin::Lang),
+    );
+    for origin in &origins {
+        let mut hasher = Hasher::new("blaze v2 test origin");
+        origin.hash_into(&mut hasher);
+        assert_eq!(hasher.finish(), old_origin_hash(origin), "{origin:?}");
+    }
+}
+
+#[test]
+fn a_target_kinds_tag_is_the_old_match() {
+    let old = |kind: TargetKind| match kind {
+        TargetKind::Bin => 0,
+        TargetKind::Lib { is_proc_macro: false } => 1,
+        TargetKind::Lib { is_proc_macro: true } => 2,
+        TargetKind::Example => 3,
+        TargetKind::Test => 4,
+        TargetKind::Bench => 5,
+        TargetKind::BuildScript => 6,
+        TargetKind::Other => 7,
+    };
+    for kind in [
+        TargetKind::Bin,
+        TargetKind::Lib { is_proc_macro: false },
+        TargetKind::Lib { is_proc_macro: true },
+        TargetKind::Example,
+        TargetKind::Test,
+        TargetKind::Bench,
+        TargetKind::BuildScript,
+        TargetKind::Other,
+    ] {
+        assert_eq!(kind.tag(), old(kind), "{kind:?}");
+    }
 }

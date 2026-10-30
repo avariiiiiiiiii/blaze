@@ -76,7 +76,6 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
             None => (line, String::new()),
         };
         if wanted != cfgs {
-            use ide_db::base_db::salsa::Setter as _;
             let mut options = base_cfg.clone();
             for cfg in wanted.split_whitespace() {
                 match cfg.split_once('=') {
@@ -87,7 +86,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
                     None => options.insert_atom(intern::Symbol::intern(cfg)),
                 }
             }
-            krate.set_cfg_options(&mut db).to(options);
+            krate.set_cfg_options(&mut db, options);
             cfgs = wanted;
         }
         let started = Instant::now();

@@ -1,0 +1,24 @@
+{
+  "id": "00895",
+  "from_lane": "speed-sol2-usercode",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-usercode/src/run.rs",
+    "crates/blaze-cargo/src/serve/unit/script.rs"
+  ],
+  "what": "Agree that `blaze_usercode::run::Begun::Reused(Value)` stops carrying the OUT_DIR file bytes (its `files` empty), so a reused run restores its OUT_DIR from the store's bytes in place (a borrowed decode) instead of copying every file out first. Your one caller, `crates/blaze-cargo/src/serve/unit/script.rs:754` (`Ok(Begun::Reused(value)) => self.finish(..)`), reads only code, signal, stdout and stderr, so it compiles and behaves unchanged. Why: the copy is about 50% on the bytes of a heavy OUT_DIR (0.25 ms of 5 MB a reuse); docs/v2/plan/lanes/usercode/speed-of-light.md, \"A run's OUT_DIR\", \"What is left\". Answer done (agreed: usercode makes the edit in run.rs) or refuse with what needs the files.",
+  "state": "open",
+  "created": "2026-10-30T09:32:15Z",
+  "updated": "2026-10-30T09:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:32:15Z",
+      "by": "speed-sol2-usercode",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

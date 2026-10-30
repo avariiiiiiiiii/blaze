@@ -14,7 +14,7 @@ use std::{
     cmp::Ordering,
     collections::BTreeMap,
     ops::Bound,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use blaze_format::cursor::Put as _;
@@ -30,8 +30,54 @@ use crate::{
     Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError,
     image::Bytes,
     reader::Reader,
-    store::{Building, DIR, Entries, Shape, Table, Writer, mode_byte, mode_of, name_hash},
+    store::{Building, DIR, Entries, Shape, Table, Writer, adopt, mode_byte, mode_of, name_hash},
 };
+
+/// Runs `job(0..n)`, each once, on the caller's workers, returning once all have run: what the
+/// daemon's pool gives ([`crate::Vfs::hash_on`]), as `blaze_cargo`'s `on_pool` is.
+// dyn: one call per run of files hashed, each run at least `JOB_BYTES`.
+pub type Jobs = fn(n: usize, job: &(dyn Fn(usize) + Sync));
+
+/// A commit's new files are hashed on its [`Jobs`] from this many bytes; below it the
+/// hand-off costs more than the hashing (1 MiB is about 170 µs of one core's BLAKE3).
+const PARALLEL_BYTES: usize = 1 << 20;
+/// About how many bytes one job hashes: a file longer is a job alone.
+const JOB_BYTES: usize = 256 << 10;
+
+/// Each of `inputs`' content ID as a file, in order, into `out` (cleared first): every input
+/// at once, a SIMD lane each ([`ContentId::of_many_into`]), and in runs of about
+/// [`JOB_BYTES`] on `jobs` once they hold [`PARALLEL_BYTES`]. The same IDs either way.
+pub(crate) fn hash_files(inputs: &[&[u8]], out: &mut Vec<ContentId>, jobs: Option<Jobs>) {
+    let total: usize = inputs.iter().map(|it| it.len()).sum();
+    let Some(jobs) = jobs.filter(|_| total >= PARALLEL_BYTES && inputs.len() > 1) else {
+        ContentId::of_many_into(FILE_DOMAIN, inputs, out);
+        return;
+    };
+    // alloc: once per commit hashed in parallel, where each run starts.
+    let mut starts = vec![0];
+    let mut bytes = 0;
+    for (at, input) in inputs.iter().enumerate() {
+        if bytes >= JOB_BYTES {
+            starts.push(at);
+            bytes = 0;
+        }
+        bytes += input.len();
+    }
+    starts.push(inputs.len());
+    // alloc: once per commit hashed in parallel, a slot per file.
+    let slots: Vec<OnceLock<ContentId>> = (0..inputs.len()).map(|_| OnceLock::new()).collect();
+    jobs(starts.len() - 1, &|job| {
+        let (from, to) = (starts[job], starts[job + 1]);
+        // alloc: one per run of at least `JOB_BYTES` hashed, its IDs.
+        let mut ids = Vec::with_capacity(to - from);
+        ContentId::of_many_into(FILE_DOMAIN, &inputs[from..to], &mut ids);
+        for (slot, id) in slots[from..to].iter().zip(ids) {
+            slot.set(id).expect("each file is hashed by one run");
+        }
+    });
+    out.clear();
+    out.extend(slots.into_iter().map(|it| it.into_inner().expect("every run ran")));
+}
 
 /// A node of a [`Tree`]. Only meaningful for the tree that made it, and only until it collects.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -64,11 +110,12 @@ pub(crate) const DIR_MODE: u32 = 0o040000;
 const MAX_LINKS: usize = 40;
 
 /// A file a transaction puts at a path, with its mode: one the tree has (the base's, or one
-/// moved), kept as its node so it is never read or hashed again; or new bytes.
+/// moved), kept as its node so it is never read or hashed again; or new bytes, which become
+/// the file's own (an owned op's, or an edit's, without a copy).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Blob {
     Node(NodeId, Mode),
-    New(Arc<[u8]>, Mode),
+    New(Bytes, Mode),
 }
 
 impl Blob {
@@ -84,8 +131,11 @@ impl Blob {
 pub(crate) type Pending = BTreeMap<String, Option<Blob>>;
 
 /// A path [`Tree::apply`] changes, as the run `start..end` of its components in one column,
-/// and what it leaves there.
-type Staged<'a> = (usize, usize, &'a Option<Blob>);
+/// what it leaves there, and for new bytes where their ID is among the commit's hashed files
+/// ([`NOT_HASHED`] for none).
+type Staged<'a> = (usize, usize, &'a Option<Blob>, u32);
+
+const NOT_HASHED: u32 = u32::MAX;
 
 /// The paths an op reads or changes.
 pub(crate) fn op_paths(op: &Op) -> impl Iterator<Item = &str> {
@@ -141,6 +191,12 @@ pub(crate) struct Tree {
     columns: Vec<(u32, u32, u8)>,
     /// The entries of the directories a commit is rebuilding, outermost first, reused.
     rebuilt: Vec<Entry>,
+    /// A commit's new files' IDs, hashed together before it merges, reused.
+    hashed: Vec<ContentId>,
+    /// Where a commit's new files are hashed when they are many bytes; one thread without.
+    pub(crate) jobs: Option<Jobs>,
+    /// The nodes the last collection kept, or the tree had when it was made.
+    kept: usize,
 }
 
 impl Tree {
@@ -162,9 +218,20 @@ impl Tree {
             columns: Vec::new(),
             // alloc: empty, allocates nothing; grown once and reused by every commit.
             rebuilt: Vec::new(),
+            // alloc: empty, allocates nothing; grown once and reused by every commit.
+            hashed: Vec::new(),
+            jobs: None,
+            kept: 0,
         };
         tree.empty = tree.dir_sorted(&mut []);
+        tree.kept = tree.len();
         tree
+    }
+
+    /// Whether a collection is paid for: the tree made at least as many nodes since the last
+    /// one as it kept, so its walk and copy of what is kept cost no more than making them did.
+    pub(crate) fn collection_due(&self) -> bool {
+        self.len() - self.kept >= self.kept
     }
 
     /// A handle that reads every node from any thread.
@@ -262,8 +329,14 @@ impl Tree {
     /// The node of a file with these bytes. A node of the image with this ID whose page group
     /// failed its check is given these bytes ([`Tree::repair`]): writing a file again, as
     /// the watcher does when it finds one unreadable, mends it.
-    pub(crate) fn file(&mut self, bytes: Arc<[u8]>) -> NodeId {
+    pub(crate) fn file(&mut self, bytes: Bytes) -> NodeId {
         let id = ContentId::of(FILE_DOMAIN, &bytes);
+        self.file_with(id, bytes)
+    }
+
+    /// [`Tree::file`] of bytes already hashed: `id` is their [`FILE_DOMAIN`] content ID.
+    pub(crate) fn file_with(&mut self, id: ContentId, bytes: Bytes) -> NodeId {
+        debug_assert_eq!(id, ContentId::of(FILE_DOMAIN, &bytes));
         if let Some(node) = self.table().find(&id).map(NodeId) {
             if self.bytes(node).is_err() {
                 self.repair(node, bytes);
@@ -276,7 +349,7 @@ impl Tree {
     /// Publishes the table with every node where it is and `node`'s bytes `bytes` (which hash
     /// to its ID), in place of its range of the image: as a collection publishes, so readers
     /// move to it at once. Once per corrupt file, so the copy of the columns is rare.
-    fn repair(&mut self, node: NodeId, bytes: Arc<[u8]>) {
+    fn repair(&mut self, node: NodeId, bytes: Bytes) {
         let old = self.store.table();
         let len = old.len();
         let mut next = Building::after(old, len as usize);
@@ -392,7 +465,7 @@ impl Tree {
     fn staged_bytes<'a>(&'a self, blob: &'a Blob) -> Result<&'a [u8], Corrupt> {
         match blob {
             Blob::Node(node, _) => Ok(self.bytes(*node)?.expect("a staged node is a file")),
-            Blob::New(bytes, _) => Ok(bytes),
+            Blob::New(bytes, _) => Ok(&bytes[..]),
         }
     }
 
@@ -532,6 +605,16 @@ impl Tree {
     /// The root `ops` make of `base`, or why they can't. Each op sees what the ones before it
     /// did; `base` itself is never changed.
     pub(crate) fn apply(&mut self, base: NodeId, ops: &[Op]) -> Result<NodeId, OpError> {
+        self.apply_all(base, ops.iter().map(Cow::Borrowed))
+    }
+
+    /// [`Tree::apply`] of ops given each borrowed or owned: an owned write's bytes become the
+    /// file's with no copy.
+    pub(crate) fn apply_all<'o>(
+        &mut self,
+        base: NodeId,
+        ops: impl IntoIterator<Item = Cow<'o, Op>>,
+    ) -> Result<NodeId, OpError> {
         let mut pending = Pending::new();
         for op in ops {
             self.stage(base, &mut pending, op)?;
@@ -543,12 +626,27 @@ impl Tree {
         for (path, blob) in &pending {
             let start = parts.len();
             parts.extend(path.split('/'));
-            changes.push((start, parts.len(), blob));
+            changes.push((start, parts.len(), blob, NOT_HASHED));
         }
         changes.sort_unstable_by(|a, b| parts[a.0..a.1].cmp(&parts[b.0..b.1]));
+        // Every new file's ID at once, before the merge interns them in order.
+        let mut hashed = std::mem::take(&mut self.hashed);
+        {
+            // alloc: once per commit, a slice per new file.
+            let mut new: Vec<&[u8]> = Vec::new();
+            for change in &mut changes {
+                let blob: &Option<Blob> = change.2;
+                if let Some(Blob::New(bytes, _)) = blob {
+                    change.3 = u32::try_from(new.len()).expect("fewer than 2^32 files");
+                    new.push(&bytes[..]);
+                }
+            }
+            hash_files(&new, &mut hashed, self.jobs);
+        }
         let mut stack = std::mem::take(&mut self.rebuilt);
-        let root = self.rebuild(Some(base), &parts, &changes, 0, &mut stack);
+        let root = self.rebuild(Some(base), &parts, &changes, &hashed, 0, &mut stack);
         self.rebuilt = stack;
+        self.hashed = hashed;
         Ok(root.unwrap_or(self.empty))
     }
 
@@ -636,14 +734,15 @@ impl Tree {
         found
     }
 
-    /// Checks `op` against `base` with the ops staged before it in `pending`, and stages it.
+    /// Checks `op` against `base` with the ops staged before it in `pending`, and stages it. A
+    /// write's bytes are moved out of an owned op, copied once from a borrowed one.
     pub(crate) fn stage(
         &self,
         base: NodeId,
         pending: &mut Pending,
-        op: &Op,
+        op: Cow<'_, Op>,
     ) -> Result<(), OpError> {
-        for path in op_paths(op) {
+        for path in op_paths(&op) {
             check(path)?;
         }
         let file_at = |pending: &Pending, path: &str| -> Result<Option<Blob>, OpError> {
@@ -659,12 +758,24 @@ impl Tree {
             }
             Ok(())
         };
-        match op {
-            Op::Write { path, bytes, mode } => {
-                no_file_above(pending, path)?;
-                file_at(pending, path)?;
-                put(pending, path, Some(Blob::New(Arc::from(bytes.as_slice()), *mode)));
-            }
+        if let Op::Write { path, mode, .. } = &*op {
+            no_file_above(pending, path)?;
+            file_at(pending, path)?;
+            let mode = *mode;
+            let (path, bytes) = match op {
+                Cow::Owned(Op::Write { path, bytes, .. }) => (Cow::Owned(path), adopt(bytes)),
+                Cow::Borrowed(Op::Write { path, bytes, .. }) => {
+                    // alloc: a borrowed op's bytes, copied once; `Vfs::commit_owned` moves them.
+                    let bytes = Bytes::from(Arc::<[u8]>::from(bytes.as_slice()));
+                    (Cow::Borrowed(path.as_str()), bytes)
+                }
+                _ => unreachable!("a write, matched above"),
+            };
+            put_owned(pending, path, Some(Blob::New(bytes, mode)));
+            return Ok(());
+        }
+        match &*op {
+            Op::Write { .. } => unreachable!("staged above"),
             Op::Edit { path, at, len, bytes } => {
                 // clone: the error's path
                 let blob = file_at(pending, path)?.ok_or_else(|| OpError::NotFound(path.clone()))?;
@@ -680,7 +791,8 @@ impl Tree {
                     });
                 }
                 let (at, end) = (*at as usize, (*at + *len) as usize);
-                let new: Arc<[u8]> = [&old[..at], bytes, &old[end..]].concat().into();
+                // alloc: the edited file's bytes, made once and kept as they are.
+                let new = adopt([&old[..at], bytes, &old[end..]].concat());
                 put(pending, path, Some(Blob::New(new, mode)));
             }
             Op::Delete { path } => self.delete(base, pending, path)?,
@@ -750,6 +862,7 @@ impl Tree {
         dir: Option<NodeId>,
         parts: &[&str],
         changes: &[Staged<'_>],
+        hashed: &[ContentId],
         depth: usize,
         stack: &mut Vec<Entry>,
     ) -> Option<NodeId> {
@@ -780,22 +893,24 @@ impl Tree {
                 });
             // The change at this name itself sorts first in its group: its path is the shortest.
             let (here, deeper) = match group[0].1 - group[0].0 == depth + 1 {
-                true => (Some(group[0].2), &group[1..]),
+                true => (Some(&group[0]), &group[1..]),
                 false => (None, group),
             };
             let child = match here {
-                Some(here) if !deeper.iter().any(|it| it.2.is_some()) => {
-                    here.as_ref().map(|blob| match blob {
+                Some(&(_, _, blob, at)) if !deeper.iter().any(|it| it.2.is_some()) => {
+                    blob.as_ref().map(|blob| match blob {
                         Blob::Node(node, mode) => (*node, *mode),
-                        // clone: the store keeps the new file's bytes, as one more count of them.
-                        Blob::New(bytes, mode) => (self.file(bytes.clone()), *mode),
+                        Blob::New(bytes, mode) => {
+                            // clone: the store keeps the new file's bytes, as one more count.
+                            (self.file_with(hashed[at as usize], bytes.clone()), *mode)
+                        }
                     })
                 }
                 // A directory, made of what was there if that was one and nothing replaced it.
                 _ => {
                     let was =
                         existing.map(|it| it.1).filter(|it| here.is_none() && self.is_dir(*it));
-                    self.rebuild(was, parts, deeper, depth + 1, stack)
+                    self.rebuild(was, parts, deeper, hashed, depth + 1, stack)
                         .map(|dir| (dir, Mode::Regular))
                 }
             };
@@ -849,6 +964,36 @@ impl Tree {
             (Some(a), Some(b)) => match (self.entries(a.0), self.entries(b.0)) {
                 // clone: the change's path, the output
                 (None, None) => out.push(Change { path: path.clone(), kind: ChangeKind::Modified }),
+                // The same names in the same order, as when only contents changed: the node and
+                // mode columns are compared in place, 16 entries at a time, and only an entry
+                // that differs is looked at. Equal node numbers are one node, of one kind, so
+                // equal mode bytes are equal modes.
+                (Some(x), Some(y)) if x.0.names == y.0.names => {
+                    const RUN: usize = 16;
+                    for start in (0..x.len()).step_by(RUN) {
+                        let end = (start + RUN).min(x.len());
+                        if x.0.nodes[start..end] == y.0.nodes[start..end]
+                            && x.0.modes[start..end] == y.0.modes[start..end]
+                        {
+                            continue;
+                        }
+                        for at in start..end {
+                            if x.0.nodes[at] == y.0.nodes[at] && x.0.modes[at] == y.0.modes[at] {
+                                continue;
+                            }
+                            let (name, left, from_mode) = x.get(at);
+                            let (_, right, to_mode) = y.get(at);
+                            let len = path.len();
+                            if !path.is_empty() {
+                                path.push('/');
+                            }
+                            path.push_str(self.name_str(name));
+                            let (left, right) = (Some((left, from_mode)), Some((right, to_mode)));
+                            self.diff_into(left, right, path, out);
+                            path.truncate(len);
+                        }
+                    }
+                }
                 (Some(x), Some(y)) => {
                     let (mut i, mut j) = (0, 0);
                     while i < x.len() || j < y.len() {
@@ -943,6 +1088,7 @@ impl Tree {
             renumbered[at as usize] = Some(NodeId(node));
         }
         self.retired = self.store.replace(next);
+        self.kept = count;
         self.empty = renumbered[self.empty.0 as usize].expect("the empty root is kept");
         for root in live {
             *root = renumbered[root.0 as usize].expect("a live root is kept");
@@ -953,11 +1099,16 @@ impl Tree {
 
 /// Stages `blob` at `path`, making a key only for a path not staged before.
 fn put(pending: &mut Pending, path: &str, blob: Option<Blob>) {
-    match pending.get_mut(path) {
+    put_owned(pending, Cow::Borrowed(path), blob);
+}
+
+/// [`put`] of a path the op may own: an owned one becomes the key as it is.
+fn put_owned(pending: &mut Pending, path: Cow<'_, str>, blob: Option<Blob>) {
+    match pending.get_mut(&*path) {
         Some(slot) => *slot = blob,
         None => {
-            // alloc: a path staged for the first time becomes a key of `Pending`.
-            pending.insert(path.to_owned(), blob);
+            // alloc: a borrowed path staged for the first time becomes a key of `Pending`.
+            pending.insert(path.into_owned(), blob);
         }
     }
 }

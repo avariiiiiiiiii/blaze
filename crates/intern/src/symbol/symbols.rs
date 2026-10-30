@@ -22,11 +22,12 @@ impl Integer {
     }
 }
 
-/// The sum of the first `count` of `lens`.
-const fn sum_before(lens: &[usize], count: usize) -> usize {
+/// The sum of the first `lists_before` of `lens`. No binding here may be a symbol's name: each
+/// symbol is a constant of this module, so the binding would be a pattern matching it.
+const fn sum_before(lens: &[usize], lists_before: usize) -> usize {
     let mut sum = 0;
     let mut at = 0;
-    while at < count {
+    while at < lists_before {
         sum += lens[at];
         at += 1;
     }
@@ -105,6 +106,21 @@ macro_rules! define_symbols {
             $( Text::new($value), )*
             $( $( Text::new(concat!($list_prefix, $list_idx)), )* )*
         ];
+
+        /// [`TEXTS`]' texts, in its order: the keys of [`COMPILED`].
+        const NAMES: [&str; STATIC] = [
+            $( stringify!($name), )*
+            $( $value, )*
+            $( $( concat!($list_prefix, $list_idx), )* )*
+        ];
+
+        blaze_phf::name_phf_table! {
+            /// Every compiled-in text's index in [`TEXTS`], keyed by the interner's hash
+            /// ([`blaze_phf::name_hash`]), so interning one is its fixed ID from one lookup
+            /// and one compare, with no probe of the table: what rustc's `sym::` gives a
+            /// predefined symbol. Built when this crate compiles; a text named twice fails it.
+            pub(crate) static COMPILED = &NAMES;
+        }
         $(
             pub const $name: Symbol = Symbol::from_index(Declared::$name as usize);
         )*
@@ -720,6 +736,7 @@ define_symbols! {
     min_adt_const_params,
     const_precise_live_drops,
     sized_hierarchy,
+    forced_keywords,
     mut_ref,
     type_changing_struct_update,
     RangeMin,
@@ -814,7 +831,7 @@ define_symbols! {
     should_panic, automatically_derived, macro_escape, warn, expect, forbid, deny,
     must_not_suspend, crate_name, crate_id, link, link_name, no_link, link_section, used,
     link_ordinal, type_length_limit, move_size_limit, no_start, no_main, no_implicit_prelude,
-    windows_subsystem, panic_handler, no_builtins, track_caller, instruction_set, no_sanitize,
+    windows_subsystem, panic_handler, no_builtins, track_caller, instruction_set, sanitize,
     coverage, debugger_visualizer, naked, test_runner, reexport_test_harness_main, thread_local,
     optimize, ffi_pure, ffi_const, cmse_nonsecure_entry, const_trait, deprecated_safe,
     collapse_debuginfo, do_not_recommend, cfi_encoding, stable, rustc_const_unstable,
@@ -838,4 +855,46 @@ define_symbols! {
     rustc_dump_vtable, rustc_dummy, omit_gdb_pretty_printer_section,
     // fix-names: names code asked for by `Symbol::intern` of a literal.
     abort,
+    // Builtin attributes and lang items named nowhere above.
+    inline, cold, unsafe_unpin, global_alloc_ty, maybe_dangling,
+    panic_null_reference_constructed, panic_invalid_enum_construction, mem_size_const,
+    mem_align_const, rustc_diagnostic_item, try_as_dyn,
+    // The most frequent identifiers of `library/` and `harness/` (comments and literals left
+    // out, keywords and the names above skipped), most frequent first, so that each is a
+    // fixed ID found by `COMPILED` with no probe of the table. Not here, though common: the
+    // names this module binds (`at`, `sum`, `lens`, `idx`, `sym`) and those the derives on
+    // `Declared` bind (`f`, `other`, `state`), which a constant of the same name would turn
+    // into patterns.
+    a, b, c_int, r, u, target_arch, i, since, issue, assert_instr, T, assert_eq, e, c_long, x, c,
+    simd_test, v, pg, unwrap, o, k, op1, op2, src, ptr, R, mem, bytes, F, N, data, n, s, A, m, io,
+    buf, svbool_t, HvxVector, target_os, name, c_char, h, MAX, map, value, cast, __m128i, base,
+    __mmask8, t, vec, p, val, mix, inner, __m256i, size, take, IMM8, __m512i, ld, op, LANE, as_ptr,
+    c_ulong, get, total, out, K, Error, rustfmt, I, svint32_t, it, d, section,
+    static_assert_uimm_bits, push, y, tcflag_t, svint64_t, V, step, ty, ErrorCode, slice, mask,
+    write, c_uint, println, constants, svint16_t, ident, target_endian, read, as_signed, ZERO,
+    ret_val, size_t, endian, MIN, input, libc, always, w, is_x86_feature_detected, bases, B,
+    __m128, Sized, Value, storage, E, offsets, defined, svuint64_t, assert_eq_m128i, svint8_t, S,
+    U, loaded, svuint32_t, ROUNDING, __m128d, __m128h, _rt, rt, as_mut_ptr, i64x2, addr, vu, op3,
+    fd, collect, MaybeUninit, Endian, Duration, handle, id, __m512d, expected, Float, speed_t, S1,
+    int32x4_t, m256i, __m512, assert_eq_m256i, f0, symbol, U32, uint32x4_t, __mmask16, m128i,
+    entry, key, check, elf, kind, assert_eq_m512i, i64x4, nop, Formatter, Padding, int16x8_t, ptr0,
+    i32x4, rhs, z, as_inner, Allocator, expr, hf64, svuint16_t, insert, svfloat32_t, Path,
+    target_env, vv, svfloat64_t, int16x4_t, ret, MASKS, F32, dst, v128, NAN, int32x2_t, FnMut, P,
+    rs, F64, float32x4_t, sve_into, Arc, float32x2_t, HvxVectorPair, svuint8_t, float16x8_t, i16x8,
+    header, float16x4_t, int8x8_t, set, assert_eq_const_safe, uint8x16_t, i8x16, Type, INT,
+    uint8x8_t, SelfT, items, arg, min, join, S2, this, SAE, as_unsigned, Offset, int8x16_t,
+    NonZero, res, target_pointer_width, unit, Noisy, haystack, encoding, ctx, size_hint, s32, sys,
+    indices, raw, run, as_ref, status, uint16x8_t, fs, __m256, j, mem_addr, to_bits, Int, LE,
+    splat, xs, ffi, thread, tt, D, NonNull, Status, max, length, lock, pos, clippy, ok, __m512h,
+    unwrap_or, null_mut, time_t, uint16x4_t, layout, address, Rc, svsetffr, ErrorKind, svrdffr,
+    finish, uint32x2_t, int64x2_t, bits, Relaxed, _MM_FROUND_NO_EXC, load, INFINITY, s16, Send,
+    enumerate, PhantomData, float64x2_t, rss, OsStr, rng, rx, init, Bencher, Operation, s64, err,
+    f32x4, H, capacity, k1, c_ushort, c_short, version, buffer, v2, cases, EndianSlice, rest,
+    LittleEndian, sections, nl_item, AttributeValue, uint64x2_t, target, mode_t, arch, Acc, writer,
+    __m256d, reg, next_back, contains, pid_t, needle, _mm_setr_ph, cmd, Simd, table, PathBuf, IMM5,
+    borrow, from_bits, text, Layout, item, Elf, File, feed, Loud, object, _mm_set_ps, note,
+    debug_assert, output, static_assert, os, __mmask32, l, NEG_INFINITY, IMM2, matches, left,
+    u32x4, f1, first, written, reader, error, windows, Section, IMM_INDEX, tests, options,
+    vector_unsigned_int, _mm_set_pd, Sync, macho, HvxVectorPred, tx, Op, fold, ix, assert_eq_m128,
+    f64x2,
 }

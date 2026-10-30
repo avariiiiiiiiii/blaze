@@ -1,5 +1,8 @@
+#![forbid(unsafe_code)]
+
 use std::hint::black_box;
-use std::mem::transmute;
+
+use salsa::plumbing::{AsId, FromId};
 
 const MANY: usize = 256;
 
@@ -40,10 +43,7 @@ fn interned_field_read_many(bencher: divan::Bencher) {
             let interned_values = (0..MANY)
                 .map(|value| InternedValue::new(black_box(&db), black_box(value)))
                 .collect::<Vec<_>>();
-            // SAFETY: The interned values are returned together with the database they came from.
-            // The benchmark only uses them while that database is still alive.
-            let interned_values: Vec<InternedValue<'static>> =
-                unsafe { transmute(interned_values) };
+            let interned_values: Vec<InternedValue<'static>> = detach(interned_values);
             (db, interned_values)
         })
         .bench_local_refs(|(db, interned_values)| {
@@ -65,10 +65,8 @@ fn tracked_field_read_many(bencher: divan::Bencher) {
             let db = salsa::DatabaseImpl::default();
             warm_db(&db);
             let input = TrackedInput::new(black_box(&db), black_box(MANY));
-            // SAFETY: The tracked values are returned together with the database they came from.
-            // The benchmark only uses them while that database is still alive.
             let tracked_values: Vec<TrackedValue<'static>> =
-                unsafe { transmute(make_tracked_values(black_box(&db), black_box(input)).clone()) };
+                detach(make_tracked_values(black_box(&db), black_box(input)).iter().copied());
             (db, tracked_values)
         })
         .bench_local_refs(|(db, tracked_values)| {
@@ -90,10 +88,8 @@ fn untracked_field_read_many(bencher: divan::Bencher) {
             let db = salsa::DatabaseImpl::default();
             warm_db(&db);
             let input = TrackedInput::new(black_box(&db), black_box(MANY));
-            // SAFETY: The tracked values are returned together with the database they came from.
-            // The benchmark only uses them while that database is still alive.
             let tracked_values: Vec<TrackedValue<'static>> =
-                unsafe { transmute(make_tracked_values(black_box(&db), black_box(input)).clone()) };
+                detach(make_tracked_values(black_box(&db), black_box(input)).iter().copied());
             (db, tracked_values)
         })
         .bench_local_refs(|(db, tracked_values)| {
@@ -105,6 +101,13 @@ fn untracked_field_read_many(bencher: divan::Bencher) {
 
             assert_eq!(black_box(sum), expected_sum(MANY));
         });
+}
+
+/// The same IDs, no longer borrowing the database: each value is returned together with the
+/// database it came from, and is read only while that database lives.
+fn detach<T: AsId, U: FromId>(values: impl IntoIterator<Item = T>) -> Vec<U> {
+    // alloc: the bench's setup, outside the timed loop
+    values.into_iter().map(|value| U::from_id(value.as_id())).collect()
 }
 
 fn warm_db(db: &salsa::DatabaseImpl) {

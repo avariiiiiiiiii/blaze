@@ -27,7 +27,8 @@ empty home, store and target directory and its own daemon, the first pinned to t
 `cores_a` of the cores this script may run on and the second to the first `cores_b`; then
 `engine.outputs` of both (every program and library a build delivers, by its BLAKE3 digest). One
 outcome per (project, profile): pass when both builds delivered the same files with the same
-bytes; fail naming each file that differs and where (`engine.first_difference`), or that is in
+bytes; fail naming each file that differs and where (`engine.first_difference_by`, the
+`blaze-v2-proof` beside the blaze measured), or that is in
 one build only, or when a build failed or was not blaze's. `selftest` checks the comparison, the
 choice of cores and the fixture's workspace and environment without blaze, cargo or the network.
 """
@@ -166,7 +167,8 @@ def compare(eng: engine.Engine, rep: report.Report, subject: Subject, top: Path,
     if not found:
         rep.add(name, "pass", f"{len(a)} files the same on {len(cores_a)} and {len(cores_b)} cores", **numbers)
         return
-    lines = [f"{path}: {how}" + (f", first at {engine.first_difference(first / sub / path, second / sub / path)}"
+    proof = engine.proof_beside(str(eng.blaze))
+    lines = [f"{path}: {how}" + (f", first at {engine.first_difference_by(proof, first / sub / path, second / sub / path)}"
                                  if how == "differs" else "") for path, how in found[:SHOWN]]
     more = f"\n... and {len(found) - SHOWN} more" if len(found) > SHOWN else ""
     rep.add(name, "fail", f"{len(found)} of {len(a.keys() | b.keys())} files differ:\n" + "\n".join(lines) + more,

@@ -14,7 +14,6 @@ use std::{
 
 use anyhow::{Context, bail};
 use rustc_hash::FxHashSet;
-use serde_derive::Deserialize;
 
 use blaze_source::SourceId;
 
@@ -23,22 +22,7 @@ use crate::{
     http::{Http, HttpNotSuccessful, Response, Retry},
 };
 
-/// The `config.json` at the root of an index.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub struct RegistryConfig {
-    /// Where a `.crate` file is: a template of `{crate}`, `{version}`, `{prefix}`,
-    /// `{lowerprefix}` and `{sha256-checksum}`, or, with none of them, a URL that
-    /// `/{crate}/{version}/download` is added to.
-    pub dl: String,
-    pub api: Option<String>,
-    #[serde(default)]
-    pub auth_required: bool,
-}
-
-impl RegistryConfig {
-    pub const NAME: &str = "config.json";
-}
+pub use blaze_units::index::RegistryConfig;
 
 /// What reading an index file came to.
 #[derive(Clone, Debug, PartialEq, Eq)]

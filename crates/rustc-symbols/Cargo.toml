@@ -22,7 +22,7 @@ hir-def.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
-proptest.workspace = true
+hegeltest.workspace = true
 test-fixture.workspace = true
 
 [lints]

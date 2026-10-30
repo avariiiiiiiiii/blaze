@@ -66,6 +66,10 @@ where
         VerifyResult::changed_if(value.revisions[self.field_index] > revision)
     }
 
+    fn fixed_changed_at(&self, zalsa: &Zalsa, input: Id) -> Option<Revision> {
+        Some(<IngredientImpl<C>>::data(zalsa, input).revisions[self.field_index])
+    }
+
     unsafe fn collect_minimum_serialized_edges(
         &self,
         _zalsa: &Zalsa,
@@ -113,6 +117,10 @@ where
 
     fn read_kind(&self) -> crate::ingredient::ReadKind {
         crate::ingredient::ReadKind::Input
+    }
+
+    fn closure_class(&self) -> crate::graph::ClosureClass {
+        crate::graph::ClosureClass::Input
     }
 
     fn memo_table_types(&self) -> &Arc<MemoTableTypes> {

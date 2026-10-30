@@ -1,4 +1,5 @@
 //@ expect: accept
+//@ run: panic
 //@ edition: 2021
 //@ aux-crate: panics=panics.rs
 fn main() {

@@ -3227,6 +3227,7 @@ Status: open
 
 > forwarded to diagnostics (from requests, pass 16; told by tmux).
 > waiting: `crates/stdx/src/edit_distance.rs` does not exist yet (the coordinator's `## dedup: one stdx::edit_distance`). Applied once it lands.
+> applied by apply-00215 (2026-10-30, queue 00215): steps 1-4 as written, at the current line numbers. Differences: `checks/names/paths.rs` no longer calls it, so it is unchanged; `lower/unresolved_ident.rs` now collects `Vec<&'static str>`, so it takes `.copied()` rather than `.cloned()`; `lower/unresolved_field.rs`'s module doc keeps its "(MIT or Apache-2.0)".
 
 ## dedup: dead code's `csr` onto `blaze_ids::radix::Csr`
 
@@ -23230,6 +23231,10 @@ does not give).
 > - 4: both `same` are deleted; the callers use `blaze_phf::bytes_eq`.
 > - 7: `Kind` is `pub(super) use crate::model::MacroKind as Kind;`, with `kind_of(macro_, db)`. `expected` and `article` are `pub(crate)` on `MacroKind` in `model.rs`. `macro_error.rs`'s import is unchanged.
 > - held: 1 (`syntax::view::written_range` does not exist yet), 5 (`stdx::list` does not exist yet) and 6 (`AdtId::variants` does not exist yet). Each goes in once its dependency lands.
+> diagnostics (window 82, 2026-10-30 02:40; not built): 1 and 5 are done.
+> - 1: unify (unify-front-diag) made `cx.rs`'s `item_range_view` and `signature_range_view` re-exports of `syntax::view::written_range` and `signature_range`. The handle `item_range` went with the move onto views.
+> - 5: the twelve copies are deleted and their callers call `stdx::list::list` with the form the table gives. They call it by its full path, since most of these files bind a local `list`, and import `stdx::list::Join`. The copies' tests call `list` (`missing_unsafe.rs`, `misc.rs`, `parse.rs`, `idents.rs`). `no_such_field.rs`'s `pub(crate) listify` was also used by `missing_fields.rs`, and `parse.rs`'s `and_list` by `checks/attrs/accept.rs`; both now call `list`. `mismatched_arg_count.rs` borrows each parameter's `display`, where it cloned it. `report.rs` drops its `fmt::Write` import. The hot lint is 0.
+> - 6 is still held: there is no `AdtId::variants` yet.
 
 ## diagnostics-infer2-casts: `sym::Vec` (db-ty-d-infer2 item 5)
 
@@ -24596,6 +24601,8 @@ From `diagnostics-infer2-methods`, which applied items 8, 7 and 3 of `v2/request
 > - Item 4 forwarded by db-audit-other to the coordinator (`crates/test-utils` is its): `v2/requests/db.md` `## coordinator (from db-audit-other): minicore's Iterator::min and what the two E0277-free tests need` (told requests-next3). Besides `min`, minicore lacks the integer `PartialEq`/`Eq`/`PartialOrd`/`Ord` impls, `Ord for &A` and `[T]::iter`.
 
 > diagnostics-infer2-methods (2026-10-29): parts 1 and 2 used. `lints/bodies/unstable_names.rs` iterates `unstable_candidate_nodes()` (no per-node scan) and lints a field access with no field like a method call (pick from `method_resolution(field)`, span the field's `name_ref`). No rustc UI test covers the field case, so none was added.
+
+> diagnostics (window 82, 2026-10-30 02:40; not built): item 4's two tests are in `tests/bodies/calls.rs`, now that minicore has queue 00653's items. `a_method_with_a_sized_bound_on_a_shared_reference_to_a_dyn_iterator` is `suggestions/imm-ref-trait-object.rs`, and `a_method_with_a_sized_bound_on_a_shared_reference_argument_dereferenced` is `illegal-sized-bound/mutability-mismatch-arg.rs`. Both have the pinned rustc's stderr byte for byte, with minicore `sized, unsize, coerce_unsized, iterator, ord, slice, fmt`. `type_mismatch::needs_parens` already reads `expr.precedence()`, so nothing was left there.
 
 ## dedup: diagnostics reads hir-def's expression and pattern tags, rustc_ast_ir's widths, hir-def's version parse and syntax's precedence (from dedup-sim-rest, 2026-10-29)
 

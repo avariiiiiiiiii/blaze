@@ -1,9 +1,10 @@
 use std::borrow::Cow;
 
 use base_db::Db;
+use hegel::TestCase;
+use hegel::generators as gs;
 use hir::Crate;
 use hir_def::FunctionId;
-use proptest::prelude::*;
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 use test_fixture::WithFixture;
 
@@ -525,23 +526,29 @@ enum Node {
     Closure(Vec<Node>),
 }
 
-fn nodes() -> impl Strategy<Value = Vec<Node>> {
-    let leaf = prop_oneof![
-        Just(Node::Fn(Vec::new())),
-        Just(Node::Method(Vec::new())),
-        Just(Node::Closure(Vec::new())),
-    ];
-    let node = leaf.prop_recursive(4, 32, 4, |inner| {
-        let children = prop::collection::vec(inner, 0..4);
-        prop_oneof![
-            children.clone().prop_map(Node::Fn),
-            children.clone().prop_map(Node::Mod),
-            children.clone().prop_map(Node::Const),
-            children.clone().prop_map(Node::Method),
-            children.prop_map(Node::Closure),
-        ]
-    });
-    prop::collection::vec(node, 1..5)
+/// A node of at most `depth` levels, children four at most: a leaf as often as not.
+fn draw_node(tc: &TestCase, depth: u32) -> Node {
+    if depth == 0 || tc.draw(gs::booleans()) {
+        return tc.draw(gs::sampled_from(vec![
+            Node::Fn(Vec::new()),
+            Node::Method(Vec::new()),
+            Node::Closure(Vec::new()),
+        ]));
+    }
+    let len = tc.draw(gs::integers::<usize>().max_value(3));
+    let children = (0..len).map(|_| draw_node(tc, depth - 1)).collect();
+    match tc.draw(gs::integers::<u8>().max_value(4)) {
+        0 => Node::Fn(children),
+        1 => Node::Mod(children),
+        2 => Node::Const(children),
+        3 => Node::Method(children),
+        _ => Node::Closure(children),
+    }
+}
+
+fn draw_nodes(tc: &TestCase) -> Vec<Node> {
+    let len = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+    (0..len).map(|_| draw_node(tc, 4)).collect()
 }
 
 /// Writes `nodes` as items (`in_body` false) or as the statements of a body, each named apart
@@ -580,20 +587,17 @@ fn write(nodes: &[Node], in_body: bool, next: &mut u32, out: &mut String) {
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
-
-    /// Without macros or traits the old copy names every function as the shared paths do.
-    #[test]
-    fn the_shared_paths_name_generated_programs_as_the_old_copy_did(program in nodes()) {
-        let mut text = "//- /main.rs crate:app edition:2021\n".to_owned();
-        write(&program, false, &mut 0, &mut text);
-        for (name, shared, reference) in function_paths(&text) {
-            prop_assert_eq!(&shared, &reference, "{} in\n{}", name, text);
-            prop_assert!(shared.is_some(), "{} in\n{}", name, text);
-        }
-        for (shared, reference) in impl_types(&text) {
-            prop_assert_eq!(shared, reference);
-        }
+/// Without macros or traits the old copy names every function as the shared paths do.
+#[hegel::test(test_cases = 48)]
+fn the_shared_paths_name_generated_programs_as_the_old_copy_did(tc: TestCase) {
+    let program = draw_nodes(&tc);
+    let mut text = "//- /main.rs crate:app edition:2021\n".to_owned();
+    write(&program, false, &mut 0, &mut text);
+    for (name, shared, reference) in function_paths(&text) {
+        assert_eq!(&shared, &reference, "{} in\n{}", name, text);
+        assert!(shared.is_some(), "{} in\n{}", name, text);
+    }
+    for (shared, reference) in impl_types(&text) {
+        assert_eq!(shared, reference);
     }
 }

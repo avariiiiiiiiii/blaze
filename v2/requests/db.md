@@ -4054,6 +4054,8 @@ Status: open
 
 > applied by db-apply-def (21:20): the local `edit_distance` and its doc are deleted (now at ~1398) and `use stdx::edit_distance::edit_distance;` is in; difference: applied before the stdx module landed (db-next3 asked for it now), so hir-expand links once the coordinator's `## dedup: one stdx::edit_distance` does.
 
+> landed by apply-00215 (2026-10-30, queue 00215): `crates/stdx/src/edit_distance.rs` exists, so the import resolves; nothing else changed in hir-expand.
+
 
 ## dedup: `hir_def::test_items`, a fixture's items by name for the tests above hir-def
 

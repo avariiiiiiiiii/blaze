@@ -113,8 +113,6 @@ jobs:
       platform: linux-x64
       os: ubuntu-24.04
       tier: ${{ needs.changes.outputs.tier }}
-      borrowck: true
-      pinned-ui: true
       smoke: true
 
   # On a push to main alone: their caches, for the train's runs and the next push's.
@@ -141,7 +139,6 @@ jobs:
       platform: macos-arm64
       os: macos-15
       tier: warm
-      pinned-ui: true
 
   # The release .github/blaze-version names loads and checks blaze's whole workspace, as a
   # contributor's `blaze check --workspace` does: 0.20261028.7 could not load it, and no job ran

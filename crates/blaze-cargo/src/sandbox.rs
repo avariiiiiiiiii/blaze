@@ -26,6 +26,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_core::utf8::push_lossy;
 use blaze_usercode::trace::{self, Seen};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -1103,7 +1104,7 @@ fn tidy_into(path: &[u8], out: &mut String) {
         if !out.is_empty() && !out.ends_with('/') {
             out.push('/');
         }
-        push_lossy(part, out);
+        push_lossy(out, part);
     }
 }
 
@@ -1112,18 +1113,7 @@ fn tidy_into(path: &[u8], out: &mut String) {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn lossy_into(bytes: &[u8], out: &mut String) {
     out.clear();
-    push_lossy(bytes, out);
-}
-
-/// [`lossy_into`], after what `out` has.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn push_lossy(bytes: &[u8], out: &mut String) {
-    for chunk in bytes.utf8_chunks() {
-        out.push_str(chunk.valid());
-        if !chunk.invalid().is_empty() {
-            out.push(char::REPLACEMENT_CHARACTER);
-        }
-    }
+    push_lossy(out, bytes);
 }
 
 #[cfg(test)]

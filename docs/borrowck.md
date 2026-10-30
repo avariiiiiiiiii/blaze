@@ -20,12 +20,10 @@ rustc gives, so `cargo check` stays the final word.
 
 An edit with a borrow-check error fails its build, with the file, line and error, as an edit
 with a type error does; under `blaze`, cargo then runs and rustc reports it.
-`BLAZE_BORROWCK_REFUSE=0` in the daemon's environment turns this off.
 
 This is safe because the checker reports nothing on any test rustc accepts, nor on ripgrep,
 fd, bat, hyperfine, just, axum, nushell, helix or biome: a refused build is one rustc refuses too. A
-borrow-check error blaze reports where rustc reports none is a bug; `BLAZE_BORROWCK_REFUSE=0`
-works around it until it is fixed. What it does not do: it misses about a sixth of the
+borrow-check error blaze reports where rustc reports none is a bug. What it does not do: it misses about a sixth of the
 errors rustc gives (it accepts code rustc rejects, listed below), so code with such an error
 still builds and runs from memory.
 
@@ -459,12 +457,14 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   needs the `mut` of a captured variable when its body mutates it, and a name that starts
   with `_` is left alone, as rustc does. A body whose types have an error gets none, as
   rustc lints no body its type check failed. A source that denies it fails the build with it
-  ([no-rustc.md](no-rustc.md), step D), unless `BLAZE_BORROWCK_REFUSE=0`.
+  ([no-rustc.md](no-rustc.md), step D).
 
 ## How it is tested
 
-`harness/borrowck_ui.py <rust checkout>` scores it against rustc's own UI tests at the
-pinned nightly's commit: everything under `tests/ui/borrowck` and `tests/ui/nll`, every test
+It is proven by real crates checking clean and by its unit tests. Until 2026-10-30 a harness
+also scored it against rustc's own UI tests at the pinned nightly's commit (deleted with the
+other comparisons with rustc, [harness.md](harness.md)); what follows is how that scoring
+worked and its last result. It took everything under `tests/ui/borrowck` and `tests/ui/nll`, every test
 with a Polonius revision, and every other UI test whose expected output has a borrow-check
 error. Each revision of a test is a unit, read with the `--cfg`s rustc gets for it. What a
 unit should give is what the pinned nightly rustc gives on it, once with Polonius and once
@@ -500,19 +500,16 @@ With no borrow checker, the 246 units rustc accepts would pass. Now:
 | NLL | 1588 | 1585 (99.8%) | 227 of 227 | 1358 of 1361 |
 
 460 units are out of scope; 346 of them need a nightly feature (at 68be5dec, nightly-2026-10-27,
-rustc's tests at 12433c30). CI runs the scoring on Linux
-and fails below a floor a few units under the count there, on any error in a unit rustc
-accepts, and on any unit the checker panics on, as a panic hides every error in its file.
+rustc's tests at 12433c30).
 
-The other check is that it finds nothing in code rustc accepts.
+The check that stays is that it finds nothing in code rustc accepts.
 `blaze-engine borrowck --project DIR` checks a cargo workspace; its last line counts the files,
 errors and files it panicked on; a panic makes it fail. It refuses a workspace `cargo metadata`
 fails on: rust-analyzer would read it with `--no-deps`, whose crates have no dependencies, and
 every type of another crate would be an error the bodies using it do not show.
 `harness/borrowck_apps.py` runs it over every application of `apps/apps.json` at its pinned rev,
 with what `cargo metadata` needs that a clone lacks (bun's vendored crates, which its own build
-fetches), plus the harness's `corpus` and `mixfutures` crates (which CI checks too), and lists
-each app's errors and panics. At 68be5dec all 22 applications, `corpus` and `mixfutures` check
+fetches), and lists each app's errors and panics. At 68be5dec all 22 applications checked
 clean; at 47793534 nushell (53, E0716 in its tests), ruff (19, E0716 and "lifetime may not live
 long enough") and rust-analyzer (1, E0515) got errors rustc does not give.
 

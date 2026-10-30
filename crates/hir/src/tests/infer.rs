@@ -372,8 +372,7 @@ fn need<T: Copy + Tr>(_: T) where T: Clone {}
         let need = GenericDefId::FunctionId(need);
         let written = |index| match bound_source(&db, need, index) {
             Some(BoundSource::Written(ptr)) => {
-                let root = ptr.file_id.parse_or_expand(&db);
-                ptr.value.to_node(&root).syntax().text().to_string()
+                ptr.to_view(&db).to_string()
             }
             other => panic!("bound {index} is written, not {other:?}"),
         };

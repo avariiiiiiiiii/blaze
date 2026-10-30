@@ -16,7 +16,7 @@ struct Foo;
 #[derive(Copy)]
 struct Foo;
 
-impl <> $crate::marker::Copy for Foo< > where {}"#]],
+#[automatically_derived] impl <> $crate::marker::Copy for Foo< > where {}"#]],
     );
 }
 
@@ -40,7 +40,7 @@ macro Copy {}
 #[derive(Copy)]
 struct Foo;
 
-impl <> $crate::marker::Copy for Foo< > where {}"#]],
+#[automatically_derived] impl <> $crate::marker::Copy for Foo< > where {}"#]],
     );
 }
 
@@ -56,7 +56,7 @@ struct Foo<A, B>;
 #[derive(Copy)]
 struct Foo<A, B>;
 
-impl <A: $crate::marker::Copy, B: $crate::marker::Copy, > $crate::marker::Copy for Foo<A, B, > where {}"#]],
+#[automatically_derived] impl <A: $crate::marker::Copy, B: $crate::marker::Copy, > $crate::marker::Copy for Foo<A, B, > where {}"#]],
     );
 }
 
@@ -73,7 +73,7 @@ struct Foo<A, B, 'a, 'b>;
 #[derive(Copy)]
 struct Foo<A, B, 'a, 'b>;
 
-impl <'a, 'b, A: $crate::marker::Copy, B: $crate::marker::Copy, > $crate::marker::Copy for Foo<'a, 'b, A, B, > where {}"#]],
+#[automatically_derived] impl <'a, 'b, A: $crate::marker::Copy, B: $crate::marker::Copy, > $crate::marker::Copy for Foo<'a, 'b, A, B, > where {}"#]],
     );
 }
 
@@ -97,7 +97,7 @@ enum Command<A, B> {
     Jump,
 }
 
-impl <A: $crate::clone::Clone, B: $crate::clone::Clone, > $crate::clone::Clone for Command<A, B, > where {
+#[automatically_derived] impl <A: $crate::clone::Clone, B: $crate::clone::Clone, > $crate::clone::Clone for Command<A, B, > where {
     fn clone(&self ) -> Self {
         match self {
             Command::Move {
@@ -157,7 +157,7 @@ where
     generic: Vec<T::InGenericArg>,
 }
 
-impl <T: $crate::clone::Clone, > $crate::clone::Clone for Foo<T, > where <T as Trait>::InWc: Marker, T: Trait, T::InFieldShorthand: $crate::clone::Clone, T::InGenericArg: $crate::clone::Clone, {
+#[automatically_derived] impl <T: $crate::clone::Clone, > $crate::clone::Clone for Foo<T, > where <T as Trait>::InWc: Marker, T: Trait, T::InFieldShorthand: $crate::clone::Clone, T::InGenericArg: $crate::clone::Clone, {
     fn clone(&self ) -> Self {
         match self {
             Foo {
@@ -185,7 +185,7 @@ struct Foo<const X: usize, T>(u32);
 #[derive(Clone)]
 struct Foo<const X: usize, T>(u32);
 
-impl <const X: usize, T: $crate::clone::Clone, > $crate::clone::Clone for Foo<X, T, > where {
+#[automatically_derived] impl <const X: usize, T: $crate::clone::Clone, > $crate::clone::Clone for Foo<X, T, > where {
     fn clone(&self ) -> Self {
         match self {
             Foo(f0_self, )=>Foo($crate::clone::Clone::clone(f0_self), ),
@@ -225,14 +225,14 @@ enum Bar {
     Bar,
 }
 
-impl <> $crate::default::Default for Foo< > where {
+#[automatically_derived] impl <> $crate::default::Default for Foo< > where {
     fn default() -> Self {
         Foo {
             field1: $crate::default::Default::default(), field2: $crate::default::Default::default(),
         }
     }
 }
-impl <> $crate::default::Default for Bar< > where {
+#[automatically_derived] impl <> $crate::default::Default for Bar< > where {
     fn default() -> Self {
         Bar::Bar
     }
@@ -260,8 +260,8 @@ enum Command {
     Jump,
 }
 
-impl <> $crate::marker::StructuralPartialEq for Command< > where {}
-impl <> $crate::cmp::PartialEq for Command< > where {
+#[automatically_derived] impl <> $crate::marker::StructuralPartialEq for Command< > where {}
+#[automatically_derived] impl <> $crate::cmp::PartialEq for Command< > where {
     fn eq(&self , other: &Self ) -> bool {
         let __self_discr = $crate::intrinsics::discriminant_value(self );
         let __arg1_discr = $crate::intrinsics::discriminant_value(other);
@@ -276,7 +276,7 @@ impl <> $crate::cmp::PartialEq for Command< > where {
         }
     }
 }
-impl <> $crate::cmp::Eq for Command< > where {}"#]],
+#[automatically_derived] impl <> $crate::cmp::Eq for Command< > where {}"#]],
     );
 }
 
@@ -300,8 +300,8 @@ enum Token {
     Star,
 }
 
-impl <> $crate::marker::StructuralPartialEq for Token< > where {}
-impl <> $crate::cmp::PartialEq for Token< > where {
+#[automatically_derived] impl <> $crate::marker::StructuralPartialEq for Token< > where {}
+#[automatically_derived] impl <> $crate::cmp::PartialEq for Token< > where {
     fn eq(&self , other: &Self ) -> bool {
         let __self_discr = $crate::intrinsics::discriminant_value(self );
         let __arg1_discr = $crate::intrinsics::discriminant_value(other);
@@ -331,8 +331,8 @@ enum Command {
     Jump,
 }
 
-impl <> $crate::marker::StructuralPartialEq for Command< > where {}
-const impl <> $crate::cmp::PartialEq for Command< > where {
+#[automatically_derived] impl <> $crate::marker::StructuralPartialEq for Command< > where {}
+#[automatically_derived] const impl <> $crate::cmp::PartialEq for Command< > where {
     fn eq(&self , other: &Self ) -> bool {
         let __self_discr = $crate::intrinsics::discriminant_value(self );
         let __arg1_discr = $crate::intrinsics::discriminant_value(other);
@@ -347,7 +347,7 @@ const impl <> $crate::cmp::PartialEq for Command< > where {
         }
     }
 }
-const impl <> $crate::cmp::Eq for Command< > where {}"#]],
+#[automatically_derived] const impl <> $crate::cmp::Eq for Command< > where {}"#]],
     );
 }
 
@@ -371,7 +371,7 @@ enum Command {
     Jump,
 }
 
-impl <> $crate::cmp::PartialOrd for Command< > where {
+#[automatically_derived] impl <> $crate::cmp::PartialOrd for Command< > where {
     fn partial_cmp(&self , other: &Self ) -> $crate::option::Option<$crate::cmp::Ordering> {
         match $crate::cmp::PartialOrd::partial_cmp(&$crate::intrinsics::discriminant_value(self ), &$crate::intrinsics::discriminant_value(other)) {
             $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
@@ -406,7 +406,7 @@ impl <> $crate::cmp::PartialOrd for Command< > where {
         }
     }
 }
-impl <> $crate::cmp::Ord for Command< > where {
+#[automatically_derived] impl <> $crate::cmp::Ord for Command< > where {
     fn cmp(&self , other: &Self ) -> $crate::cmp::Ordering {
         match $crate::cmp::Ord::cmp(&$crate::intrinsics::discriminant_value(self ), &$crate::intrinsics::discriminant_value(other)) {
             $crate::cmp::Ordering::Equal=> {
@@ -468,7 +468,7 @@ struct Foo {
     z: (i32, u64),
 }
 
-impl <> $crate::hash::Hash for Foo< > where {
+#[automatically_derived] impl <> $crate::hash::Hash for Foo< > where {
     fn hash<H: $crate::hash::Hasher>(&self , ra_expand_state: &mut H) {
         match self {
             Foo {
@@ -506,7 +506,7 @@ enum Command {
     Jump,
 }
 
-impl <> $crate::hash::Hash for Command< > where {
+#[automatically_derived] impl <> $crate::hash::Hash for Command< > where {
     fn hash<H: $crate::hash::Hasher>(&self , ra_expand_state: &mut H) {
         $crate::hash::Hash::hash(&$crate::mem::discriminant(self ), ra_expand_state);
         match self {
@@ -552,7 +552,7 @@ enum Command {
     Jump,
 }
 
-impl <> $crate::fmt::Debug for Command< > where {
+#[automatically_derived] impl <> $crate::fmt::Debug for Command< > where {
     fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
         match self {
             Command::Move {
@@ -625,7 +625,7 @@ enum HideAndShowEnum {
     }
 }
 
-impl <> $crate::fmt::Debug for HideAndShow< > where {
+#[automatically_derived] impl <> $crate::fmt::Debug for HideAndShow< > where {
     fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
         match self {
             HideAndShow {
@@ -640,7 +640,7 @@ impl <> $crate::fmt::Debug for HideAndShow< > where {
         }
     }
 }
-impl <> $crate::fmt::Debug for HideAndShowEnum< > where {
+#[automatically_derived] impl <> $crate::fmt::Debug for HideAndShowEnum< > where {
     fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
         match self {
             HideAndShowEnum::AlwaysShow {
@@ -697,14 +697,14 @@ enum Bar {
     Bar,
 }
 
-impl <> $crate::default::Default for Foo< > where {
+#[automatically_derived] impl <> $crate::default::Default for Foo< > where {
     fn default() -> Self {
         Foo {
             field1: $crate::default::Default::default(), field4: $crate::default::Default::default(),
         }
     }
 }
-impl <> $crate::default::Default for Bar< > where {
+#[automatically_derived] impl <> $crate::default::Default for Bar< > where {
     fn default() -> Self {
         Bar::Bar
     }
@@ -738,8 +738,8 @@ pub trait Trait<T: ?Sized> {}
 pub struct Foo<'a, T: ?Sized + Trait<U>, #[pointee] U: ?Sized, const N: u32>(T)
 where
     U: Trait<U> + ToString;
-impl <'a, T, U, const N: u32, __S> $crate::ops::DispatchFromDyn<Foo<'a, T, __S, N>> for Foo<'a, T, U, N, > where U: Trait<U> +ToString, T: Trait<__S>, __S: ?Sized, __S: Trait<__S> +ToString, U: ::core::marker::Unsize<__S>, T:?Sized+Trait<U>, U:?Sized, {}
-impl <'a, T, U, const N: u32, __S> $crate::ops::CoerceUnsized<Foo<'a, T, __S, N>> for Foo<'a, T, U, N, > where U: Trait<U> +ToString, T: Trait<__S>, __S: ?Sized, __S: Trait<__S> +ToString, U: ::core::marker::Unsize<__S>, T:?Sized+Trait<U>, U:?Sized, {}"#]],
+#[automatically_derived] impl <'a, T, U, const N: u32, __S> $crate::ops::DispatchFromDyn<Foo<'a, T, __S, N>> for Foo<'a, T, U, N, > where U: Trait<U> +ToString, T: Trait<__S>, __S: ?Sized, __S: Trait<__S> +ToString, U: ::core::marker::Unsize<__S>, T:?Sized+Trait<U>, U:?Sized, {}
+#[automatically_derived] impl <'a, T, U, const N: u32, __S> $crate::ops::CoerceUnsized<Foo<'a, T, __S, N>> for Foo<'a, T, U, N, > where U: Trait<U> +ToString, T: Trait<__S>, __S: ?Sized, __S: Trait<__S> +ToString, U: ::core::marker::Unsize<__S>, T:?Sized+Trait<U>, U:?Sized, {}"#]],
     );
 }
 
@@ -832,7 +832,7 @@ where
     left: &'a mut T,
     right: &'b mut T,
 }
-impl <'a, 'b, T, const N: usize, > $crate::marker::Reborrow for Foo<'a, 'b, T, N, > where T:'a+'b, {}"#]],
+#[automatically_derived] impl <'a, 'b, T, const N: usize, > $crate::marker::Reborrow for Foo<'a, 'b, T, N, > where T:'a+'b, {}"#]],
     );
 }
 
@@ -866,7 +866,7 @@ mod shared {
 struct Foo<'a, 'b, T, const N: usize>(&'a mut T, &'b mut T)
 where
     T: 'a + 'b;
-impl <'a, 'b, T, const N: usize, > $crate::marker::CoerceShared<shared::Shared<'a, 'b, (T, u8), N>> for Foo<'a, 'b, T, N, > where T:'a+'b, {}"#]],
+#[automatically_derived] impl <'a, 'b, T, const N: usize, > $crate::marker::CoerceShared<shared::Shared<'a, 'b, (T, u8), N>> for Foo<'a, 'b, T, N, > where T:'a+'b, {}"#]],
     );
 }
 
@@ -886,7 +886,7 @@ use core::marker::ConstParamTy;
 
 #[derive(ConstParamTy)]
 enum Requirement<T> { Connected, Not(T) }
-impl <T: $crate::marker::ConstParamTy_, > $crate::marker::ConstParamTy_ for Requirement<T, > where {}"#]],
+#[automatically_derived] impl <T: $crate::marker::ConstParamTy_, > $crate::marker::ConstParamTy_ for Requirement<T, > where {}"#]],
     );
 }
 
@@ -912,12 +912,12 @@ struct Meters(u32);
 
 #[derive(From)]
 struct Named<'a, T: Clone, const N: usize> where T: Copy { inner: &'a [T; N] }
-impl <> $crate::convert::From<u32> for Meters< > where {
+#[automatically_derived] impl <> $crate::convert::From<u32> for Meters< > where {
     #[inline] fn from(value: u32) -> Self {
         Self (value)
     }
 }
-impl <'a, T, const N: usize, > $crate::convert::From<&'a[T;
+#[automatically_derived] impl <'a, T, const N: usize, > $crate::convert::From<&'a[T;
 N]> for Named<'a, T, N, > where T: Copy, T: Clone, {
     #[inline] fn from(value:&'a[T;
     N]) -> Self {
@@ -1056,7 +1056,7 @@ enum Foo<T> {
     Baz,
 }
 
-impl <T, > $crate::default::Default for Foo<T, > where {
+#[automatically_derived] impl <T, > $crate::default::Default for Foo<T, > where {
     fn default() -> Self {
         Foo::Baz
     }

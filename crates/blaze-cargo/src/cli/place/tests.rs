@@ -93,8 +93,8 @@ fn z_script() {
 
 #[test]
 fn paths_normalized_as_cargo_does() {
-    assert_eq!(normalize(Path::new("/w/./a/../b/Cargo.toml")), Path::new("/w/b/Cargo.toml"));
-    assert_eq!(normalize(Path::new("/w/a/..")), Path::new("/w"));
+    assert_eq!(normalize_path(Path::new("/w/./a/../b/Cargo.toml")), Path::new("/w/b/Cargo.toml"));
+    assert_eq!(normalize_path(Path::new("/w/a/..")), Path::new("/w"));
 }
 
 #[test]

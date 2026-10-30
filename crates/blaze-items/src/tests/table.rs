@@ -6,11 +6,21 @@ use test_fixture::WithFixture;
 
 use super::{edit, items, single};
 use crate::{
-    Fact, FactSet, ItemKey, NameHash, SimplifiedType, crate_hashes, hashes, item_key, kinds,
+    Fact, FactSet, HashColumns, ItemKey, NameHash, SimplifiedType, crate_hashes, hashes,
+    item_key, kinds,
 };
 
 fn id(n: u8) -> ContentId {
     ContentId([n; 32])
+}
+
+/// A copy of `columns` that outlives an edit of the database it came from, rebuilt from its
+/// rows.
+fn owned(columns: &HashColumns) -> HashColumns {
+    let mut rows: Vec<_> =
+        (0..columns.len()).map(|row| (columns.keys()[row], columns.row(row))).collect();
+    let mut unhashable = columns.unhashable().to_vec();
+    HashColumns::new(&mut rows, &mut unhashable)
 }
 
 /// A fact of each kind, two of fields.
@@ -36,6 +46,7 @@ pub(super) fn every_kind() -> Vec<Fact> {
         Fact::Derive(a),
         Fact::Target(id(6)),
         Fact::Crate(id(7)),
+        Fact::HiddenTypes(b),
     ]
 }
 
@@ -75,7 +86,8 @@ fn order(fact: &Fact) -> (u16, QueryOrder) {
         | Fact::Coherence(it)
         | Fact::Specializes(it)
         | Fact::DropCheck(it)
-        | Fact::Derive(it) => (it.0, None, None),
+        | Fact::Derive(it)
+        | Fact::HiddenTypes(it) => (it.0, None, None),
         Fact::Target(it) | Fact::Crate(it) => (it, None, None),
     };
     (fact.kind().0, parts)
@@ -113,7 +125,8 @@ fn g() { fn inner() {} }
 "#,
     );
     let krate = db.test_crate();
-    let columns = crate_hashes(&db, krate).clone();
+    let columns = owned(crate_hashes(&db, krate));
+    assert_eq!(&columns, crate_hashes(&db, krate));
     assert!(columns.unhashable().is_empty(), "{:?}", columns.unhashable());
     for id in items(&db) {
         let key = item_key(&db, id);
@@ -145,4 +158,32 @@ fn g() { fn inner() {} }
         assert!(!changed.contains(&named(path)), "`{path}` did not change");
     }
     assert!(now.changed_since(now).is_empty());
+}
+
+#[test]
+fn a_body_edit_rebuilds_the_columns_without_their_key_order() {
+    let (mut db, file) = single(
+        r#"
+pub struct S { x: u32 }
+pub fn f(s: &S) -> u32 { s.x }
+fn g() { fn inner() {} }
+"#,
+    );
+    let krate = db.test_crate();
+    let before = owned(crate_hashes(&db, krate));
+    edit(
+        &mut db,
+        file,
+        r#"
+pub struct S { x: u32 }
+pub fn f(s: &S) -> u32 { s.x + 1 }
+fn g() { fn inner() {} }
+"#,
+    );
+    let executed = db.log_executed(|| {
+        let now = crate_hashes(&db, krate);
+        assert_eq!(now.changed_since(&before), [item_key(&db, super::item(&db, "f"))]);
+    });
+    assert!(executed.iter().any(|it| it.contains("crate_hashes")), "{executed:#?}");
+    assert!(!executed.iter().any(|it| it.contains("crate_items_by_key")), "{executed:#?}");
 }

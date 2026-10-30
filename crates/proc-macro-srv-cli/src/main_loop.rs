@@ -662,8 +662,8 @@ mod tests {
                 file_id: EditionedFileId::new(FileId::from_raw(1), Edition::CURRENT),
                 ast_id: ROOT_ERASED_FILE_AST_ID,
             },
-            // SAFETY: no database; the context is carried and compared, never looked up.
-            ctx: unsafe { SyntaxContext::from_u32(0) },
+            // No database; the context is carried and compared, never looked up.
+            ctx: SyntaxContext::from_u32(0),
         }
     }
 

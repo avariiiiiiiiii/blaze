@@ -8,6 +8,8 @@
 //! first query to ask for it in a revision computes it in a capture, and every later one replays
 //! the capture.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
@@ -505,4 +507,39 @@ fn for_each_read_gives_each_read_with_its_kind_and_name_in_read_order() {
     if let Some(at) = interned {
         assert_eq!(at, 1, "the interned read comes between the two others: {log:?}");
     }
+}
+
+#[salsa::tracked(returns(copy))]
+fn added(db: &dyn Db, x: Number, by: u32) -> u32 {
+    x.value(db) + by
+}
+
+/// Captures a read of `added(x, 5)`, a tracked fn of two arguments, and reads its arguments back
+/// from the read's key: as `(Number, u32)`, and not as a tuple they are not.
+#[salsa::tracked(returns(copy))]
+fn reads_its_arguments(db: &dyn Db, x: Number) -> u32 {
+    let (value, reads) = salsa::capture_reads(db, || added(db, x, 5));
+    let reads = reads.expect("plain reads may be shared");
+    let mut found = 0;
+    let walked = reads.for_each_read(db, |key, kind, _| {
+        if kind == salsa::ReadKind::Query {
+            let key = key.key_index();
+            assert!(salsa::plumbing::interned_arguments::<(Number, u32)>(db, key) == Some((x, 5)));
+            assert!(salsa::plumbing::interned_arguments::<(u32, Number)>(db, key).is_none());
+            found += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    assert_eq!(walked, std::ops::ControlFlow::Continue(()));
+    assert_eq!(found, 1);
+    value
+}
+
+#[test]
+fn interned_arguments_reads_a_query_reads_arguments_back() {
+    let db = CaptureDb::default();
+    let x = Number::new(&db, 1);
+    assert_eq!(reads_its_arguments(&db, x), 6);
+    // A key of an input names no interned arguments.
+    assert!(salsa::plumbing::interned_arguments::<(Number, u32)>(&db, salsa::plumbing::AsId::as_id(&x)).is_none());
 }

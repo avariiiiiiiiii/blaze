@@ -12,6 +12,7 @@ use crate::{
     infer::PatAdjust,
     mir::{
         CastKind, FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place, PlaceTy,
+        normalize_or_keep,
         lower::{
             AssignTarget, Assigned, BasicBlockId, BinOp, BindingId, BorrowKind, Expr,
             MemoryMap, MirLowerCtx, MirLowerError, MirSpan, Pat, PatId, PlaceElem, ProjectionElem,
@@ -22,7 +23,7 @@ use crate::{
 };
 use crate::{
     method_resolution::CandidateId,
-    next_solver::{GenericArgs, infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt},
+    next_solver::{GenericArgs, RegionExt},
 };
 
 macro_rules! not_supported {
@@ -923,11 +924,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
         let ty = PlaceTy::from_ty(local)
             .multi_projection_ty(&self.infcx, self.env, place.projection.as_slice())
             .ty;
-        if !matches!(ty.kind(), TyKind::Alias(..)) {
-            return ty;
-        }
-        let mut ocx = ObligationCtxt::new(&self.infcx);
-        ocx.structurally_normalize_ty(&ObligationCause::dummy(), self.env, ty).unwrap_or(ty)
+        normalize_or_keep(&self.infcx, self.env, ty)
     }
 
     fn pattern_matching_variant(

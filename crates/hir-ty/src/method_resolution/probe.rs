@@ -16,10 +16,8 @@ use hir_def::{
 use hir_expand::name::Name;
 use intern::Symbol;
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
-    InferTy, TypeVisitableExt, Upcast, Variance,
-    elaborate::{self, supertrait_def_ids},
+    InferTy, TypeVisitableExt, Upcast, Variance, elaborate,
     fast_reject::{DeepRejectCtxt, TreatParams, simplify_type},
     inherent::{BoundExistentialPredicates as _, IntoKind, Ty as _},
 };
@@ -181,7 +179,7 @@ impl PickConstraintsForShadowed {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone)] // clone: the pick cache's hit copies it until queue 00949 hands it out by reference
 pub struct Pick<'db> {
     pub item: CandidateId,
     pub kind: PickKind<'db>,
@@ -258,7 +256,7 @@ pub struct CandidateStep<'db> {
     pub reachable_via_deref: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct MethodAutoderefStepsResult<'db> {
     /// The valid autoderef steps that could be found by following a chain
     /// of `Receiver<Target=T>` or `Deref<Target=T>` trait implementations.
@@ -2159,10 +2157,9 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
         else {
             return None;
         };
-        let mut supertraits: FxHashSet<_> =
-            supertrait_def_ids(self.interner(), child_trait.into()).collect(); // alloc: only when several candidates apply and the crate enables `supertrait_item_shadowing`
+        let mut supertraits = crate::utils::all_super_traits(self.db(), child_trait);
 
-        let mut remaining_candidates: Vec<_> = probes[1..].to_vec(); // alloc: as above
+        let mut remaining_candidates: Vec<_> = probes[1..].to_vec(); // alloc: only when several candidates apply and the crate enables `supertrait_item_shadowing`
         while !remaining_candidates.is_empty() {
             let mut made_progress = false;
             let mut next_round = vec![]; // alloc: none until a candidate is pushed, and as above
@@ -2173,7 +2170,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
                 else {
                     return None;
                 };
-                if supertraits.contains(&remaining_trait.into()) {
+                if supertraits.contains(&remaining_trait) {
                     made_progress = true;
                     continue;
                 }
@@ -2183,9 +2180,9 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
                 // If it is, then it must have been a subtrait of every
                 // other pick we've eliminated at this point. It will
                 // take over at this point.
-                let remaining_trait_supertraits: FxHashSet<_> =
-                    supertrait_def_ids(self.interner(), remaining_trait.into()).collect(); // alloc: as above
-                if remaining_trait_supertraits.contains(&child_trait.into()) {
+                let remaining_trait_supertraits =
+                    crate::utils::all_super_traits(self.db(), remaining_trait);
+                if remaining_trait_supertraits.contains(&child_trait) {
                     child_candidate = remaining_candidate;
                     child_trait = remaining_trait;
                     supertraits = remaining_trait_supertraits;

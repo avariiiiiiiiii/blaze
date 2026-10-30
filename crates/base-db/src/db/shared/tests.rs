@@ -10,7 +10,7 @@ use span::FileId;
 use super::Shared;
 use crate::{Db, FileText};
 
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn text_len(db: &Db, text: FileText) -> u32 {
     text.text(db).len() as u32
 }
@@ -98,14 +98,14 @@ mod stopped_mid_query {
     static OUTER_RUNS: AtomicU32 = AtomicU32::new(0);
     static OUTER_READ: AtomicBool = AtomicBool::new(false);
 
-    #[salsa::tracked]
+    #[salsa::tracked(returns(copy))]
     fn counted_len(db: &Db, text: FileText) -> u32 {
         INNER_RUNS.fetch_add(1, Ordering::Relaxed);
         text.text(db).len() as u32
     }
 
     /// Reads [`counted_len`], and on its first run waits to be stopped before it returns.
-    #[salsa::tracked]
+    #[salsa::tracked(returns(copy))]
     fn len_once_stopped(db: &Db, text: FileText) -> u32 {
         let first = OUTER_RUNS.fetch_add(1, Ordering::Relaxed) == 0;
         let len = counted_len(db, text);

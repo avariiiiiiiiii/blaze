@@ -16,7 +16,7 @@ use base_db::Db;
 use blaze_ids::bits::{BitMatrix, words_for};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
-    AdtId, DefWithBodyId, HasModule, ItemContainerId, Lookup, StaticId,
+    AdtId, DefWithBodyId, HasModule, StaticId,
     attrs::AttrFlags,
     expr_store::{Body, ExpressionStore},
     hir::{Expr, type_ref::Rawness},
@@ -29,12 +29,12 @@ use salsa::SalsaValue;
 
 use hir_ty::{
     InferBodyId,
-    db::{GeneralConstId, HirDatabase},
+    db::HirDatabase,
     drop::{DropGlue, has_drop_glue_in, is_freeze},
     effects::const_param_env,
     next_solver::{
-        Binder, ConstKind, DbInterner, ParamEnv, TraitRef, Ty, TyKind, TypingMode,
-        UnevaluatedConst,
+        AliasConstKind, AnonConstIdWrapper, Binder, ConstKind, DbInterner, FreeConstAliasId,
+        InherentAssocConstId, ParamEnv, TraitRef, Ty, TyKind, TypingMode,
         infer::{
             DbInternerInferExt, InferCtxt,
             traits::{Obligation, ObligationCause},
@@ -203,7 +203,7 @@ impl ConstQualifs {
         ConstQualifs { has_mut_interior: true, needs_drop: true, needs_non_const_drop: true };
 }
 
-#[salsa::tracked(cycle_result = const_qualifs_cycle_result)]
+#[salsa::tracked(cycle_result = const_qualifs_cycle_result, returns(copy))]
 fn const_qualifs<'db>(db: &'db Db, def: InferBodyId<'db>) -> ConstQualifs {
     // A constant whose MIR does not build is refused where it is lowered.
     let Ok(body) = db.mir_body(def) else { return ConstQualifs::BY_TYPE };
@@ -222,16 +222,17 @@ fn const_qualifs_cycle_result<'db>(
 
 /// The qualifs of the constant `item` when rustc peeks at its value: not of a trait's
 /// associated constant, whose value the impl picks.
-fn qualifs_of_item<'db>(db: &'db Db, item: GeneralConstId<'db>) -> Option<ConstQualifs> {
+fn qualifs_of_item<'db>(db: &'db Db, item: AliasConstKind<'db>) -> Option<ConstQualifs> {
     match item {
-        GeneralConstId::ConstId(it)
-            if matches!(it.lookup(db).container, ItemContainerId::TraitId(_)) =>
-        {
-            None
+        AliasConstKind::Projection { .. } => None,
+        AliasConstKind::InherentSelf { def_id: InherentAssocConstId(it) }
+        | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(it) }
+        | AliasConstKind::Free { def_id: FreeConstAliasId(it) } => {
+            Some(const_qualifs(db, it.into()))
         }
-        GeneralConstId::ConstId(it) => Some(const_qualifs(db, it.into())),
-        GeneralConstId::AnonConstId(it) => Some(const_qualifs(db, it.into())),
-        GeneralConstId::StaticId(_) => None,
+        AliasConstKind::Anon { def_id: AnonConstIdWrapper(it) } => {
+            Some(const_qualifs(db, it.into()))
+        }
     }
 }
 
@@ -391,8 +392,8 @@ where
             in_place(cx, q, in_local, place.local, place.projection.as_slice())
         }
         OperandKind::Constant { konst, ty } => {
-            if let ConstKind::Unevaluated(UnevaluatedConst { def, .. }) = konst.as_ref().kind()
-                && let Some(qualifs) = qualifs_of_item(cx.db, def.0)
+            if let ConstKind::Alias(_, alias) = konst.as_ref().kind()
+                && let Some(qualifs) = qualifs_of_item(cx.db, alias.kind)
                 && !q.of(qualifs)
             {
                 return false;

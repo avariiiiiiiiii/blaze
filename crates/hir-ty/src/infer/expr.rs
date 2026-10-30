@@ -357,14 +357,17 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, is_read), ret)]
     pub(super) fn infer_expr_inner(
         &mut self,
         tgt_expr: ExprId,
         expected: &Expectation<'db>,
         is_read: ExprIsRead,
     ) -> Ty<'db> {
-        self.db.unwind_if_revision_cancelled();
+        // Every expression is inferred and ids are dense, so one in 64 bounds how long a
+        // cancelled revision runs on, without two dependent loads per expression.
+        if tgt_expr.into_raw().into_u32() % 64 == 0 {
+            self.db.unwind_if_revision_cancelled();
+        }
         // An expression is inferred within the one it is in: rustc's 5,204-arm `else if`.
         crate::next_solver::ensure_sufficient_stack(|| {
             self.infer_expr_inner_here(tgt_expr, expected, is_read)
@@ -378,7 +381,6 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         is_read: ExprIsRead,
     ) -> Ty<'db> {
         let expr = self.store.expr(tgt_expr);
-        tracing::trace!(?expr);
         // Expressions after siblings that diverged; not inside `.await`'s desugaring, nor of a
         // `try` block's generated `Try::from_output(())`.
         if !matches!(expr, Expr::Await { .. }) && !self.is_try_block_output_of_unit(tgt_expr) {
@@ -2352,8 +2354,6 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let demand_compatible = |this: &mut InferenceContext<'db, 'f>, idx: usize, provided_arg: ExprId| {
             let formal_input_ty: Ty<'db> = formal_input_tys[idx];
             let expected_input_ty: Ty<'db> = expected_input_tys[idx];
-
-            debug!("checking argument {}: {:?} = {:?}", idx, provided_arg, formal_input_ty);
 
             // We're on the happy path here, so we'll do a more involved check and write back types
             // To check compatibility, we'll do 3 things:

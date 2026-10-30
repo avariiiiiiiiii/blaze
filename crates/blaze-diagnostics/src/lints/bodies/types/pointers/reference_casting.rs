@@ -12,7 +12,10 @@ use hir_def::{
     AdtId, HasModule, VariantId,
     hir::{BinaryOp, BindingId, Expr, ExprId, Pat, UnaryOp},
 };
-use hir_ty::next_solver::{DbInterner, Ty, TyKind};
+use hir_ty::{
+    db::HirDatabase as _,
+    next_solver::{DbInterner, Ty, TyKind},
+};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     Interner as _, Mutability,
@@ -46,7 +49,7 @@ impl LatePass for InvalidReferenceCasting {
     const EXPRS: ExprKinds =
         ExprKinds::of(&[ExprKind::Ref, ExprKind::Assignment, ExprKind::BinaryOp, ExprKind::Call]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some((e, pat)) = borrow_or_assign(b, expr) else { return };
         let inits = self.inits.of(b);
         let init = expr_or_init(b, inits, e);
@@ -97,7 +100,7 @@ impl LatePass for InvalidReferenceCasting {
 
 /// rustc's `borrow_or_assign`: the pointer `expr` borrows (`&(mut) *p`) or assigns through
 /// (`*p = ..`, `*p += ..`, `ptr::write(p, ..)` and its volatile and unaligned forms).
-fn borrow_or_assign(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<(ExprId, PatternKind)> {
+fn borrow_or_assign(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<(ExprId, PatternKind)> {
     let store = b.store();
     let deref_of = |place: ExprId| match store.expr(place) {
         Expr::UnaryOp { expr: pointer, op: UnaryOp::Deref } => Some(pointer),
@@ -126,7 +129,7 @@ fn borrow_or_assign(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<(ExprId, Pattern
         .then_some((*pointer, PatternKind::Assign))
 }
 
-fn is_invalid_cast_from_ref_to_mut_ptr(b: &BodyCx<'_, '_>, orig: ExprId, peel: &mut impl FnMut() -> ExprId) -> bool {
+fn is_invalid_cast_from_ref_to_mut_ptr(b: &BodyCx<'_, '_, '_>, orig: ExprId, peel: &mut impl FnMut() -> ExprId) -> bool {
     if !matches!(util::ty(b, orig).kind(), TyKind::RawPtr(_, Mutability::Mut)) {
         return false;
     }
@@ -151,7 +154,7 @@ struct Bigger {
 }
 
 fn is_cast_to_bigger_memory_layout(
-    b: &BodyCx<'_, '_>,
+    b: &BodyCx<'_, '_, '_>,
     inits: &FxHashMap<BindingId, ExprId>,
     orig: ExprId,
     peel: &mut impl FnMut() -> ExprId,
@@ -192,12 +195,12 @@ fn is_cast_to_bigger_memory_layout(
 /// rustc's `is_ty_fully_unsafe_celled`: every byte of `ty` that is not of a zero-sized part is
 /// in an `UnsafeCell`, as far as its fields show it (an enum, a type parameter or an alias is
 /// not).
-fn is_ty_fully_unsafe_celled<'db>(b: &BodyCx<'_, 'db>, ty: Ty<'db>) -> bool {
+fn is_ty_fully_unsafe_celled<'db>(b: &BodyCx<'_, '_, 'db>, ty: Ty<'db>) -> bool {
     let interner = DbInterner::new_with(b.db(), b.owner.krate(b.db()));
     fully_unsafe_celled(b, interner, ty, 0)
 }
 
-fn fully_unsafe_celled<'db>(b: &BodyCx<'_, 'db>, interner: DbInterner<'db>, ty: Ty<'db>, depth: usize) -> bool {
+fn fully_unsafe_celled<'db>(b: &BodyCx<'_, '_, 'db>, interner: DbInterner<'db>, ty: Ty<'db>, depth: usize) -> bool {
     if depth >= interner.recursion_limit() {
         return false;
     }

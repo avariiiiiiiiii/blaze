@@ -4,6 +4,8 @@
 //!
 //! * when we delete memoized data, also delete outputs from that data
 
+#![forbid(unsafe_code)]
+
 mod common;
 use common::LogDatabase;
 use expect_test::expect;

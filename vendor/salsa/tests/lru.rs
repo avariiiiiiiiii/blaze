@@ -3,6 +3,8 @@
 //! Test that a `tracked` fn with lru options
 //! compiles and executes successfully.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

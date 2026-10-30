@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use annotate_snippets::{AnnotationKind, Group, Patch, Renderer, Snippet};
 use blaze_ids::radix;
-use proptest::prelude::*;
+use hegel::TestCase;
+use hegel::generators as gs;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 
@@ -578,141 +579,122 @@ const FILE: &str = "src/lib.rs";
 const OTHER: &str = "src/other.rs";
 
 /// ASCII lines with `\n` ends, the last with or without one.
-fn text() -> impl Strategy<Value = String> {
-    (proptest::collection::vec("[ -~]{0,30}", 1..8), any::<bool>()).prop_map(|(lines, end)| {
-        let mut text = lines.join("\n");
-        if end {
-            text.push('\n');
-        }
-        text
-    })
+fn text(tc: &TestCase) -> String {
+    let lines: Vec<String> = tc.draw(gs::vecs(gs::from_regex("[ -~]{0,30}")).min_size(1).max_size(7));
+    let mut text = lines.join("\n");
+    if tc.draw(gs::booleans()) {
+        text.push('\n');
+    }
+    text
 }
 
-fn span(len: u32, other: u32) -> impl Strategy<Value = Span> {
-    (prop::bool::weighted(0.2), 0..=len, 0..=len, 0..=other, 0..=other).prop_map(|(in_other, a, b, c, d)| {
-        let (file, lo, hi) = match in_other {
-            false => (FILE, a.min(b), a.max(b)),
-            true => (OTHER, c.min(d), c.max(d)),
-        };
-        Span { file: file.to_owned(), lo, hi, expansion: None }
-    })
+fn span(tc: &TestCase, len: u32, other: u32) -> Span {
+    let in_other = tc.draw(gs::weighted_booleans(0.2));
+    let end = if in_other { other } else { len };
+    let (a, b): (u32, u32) = tc.draw(gs::tuples!(gs::integers().max_value(end), gs::integers().max_value(end)));
+    let file = if in_other { OTHER } else { FILE };
+    Span { file: file.to_owned(), lo: a.min(b), hi: a.max(b), expansion: None }
 }
 
-fn label() -> impl Strategy<Value = String> {
-    "[ -~\t]{0,20}"
+fn label(tc: &TestCase) -> String {
+    tc.draw(gs::from_regex("[ -~\t]{0,20}"))
+}
+
+/// Between `min` and `max` of `item`.
+fn some<T>(tc: &TestCase, min: usize, max: usize, mut item: impl FnMut() -> T) -> Vec<T> {
+    let count: usize = tc.draw(gs::integers().min_value(min).max_value(max));
+    (0..count).map(|_| item()).collect()
 }
 
 /// At least one primary span, some labels of their own and some on a primary span.
-fn multi(len: u32, other: u32) -> impl Strategy<Value = MultiSpan> {
-    (
-        proptest::collection::vec(span(len, other), 1..3),
-        proptest::collection::vec((span(len, other), label()), 0..3),
-        proptest::collection::vec((any::<prop::sample::Index>(), label()), 0..2),
-    )
-        .prop_map(|(primary, mut labels, on_primary)| {
-            for (at, label) in on_primary {
-                labels.push((at.get(&primary).clone(), label));
-            }
-            MultiSpan { primary, labels }
-        })
+fn multi(tc: &TestCase, len: u32, other: u32) -> MultiSpan {
+    let primary = some(tc, 1, 2, || span(tc, len, other));
+    let mut labels = some(tc, 0, 2, || (span(tc, len, other), label(tc)));
+    for _ in 0..tc.draw(gs::integers::<usize>().max_value(1)) {
+        let at: usize = tc.draw(gs::integers().max_value(primary.len() - 1));
+        labels.push((primary[at].clone(), label(tc)));
+    }
+    MultiSpan { primary, labels }
 }
 
-fn child(len: u32, other: u32) -> impl Strategy<Value = Child> {
-    let level = prop_oneof![Just(Sublevel::Note), Just(Sublevel::Help), Just(Sublevel::Warning)];
-    (level, "[ -~]{1,30}", prop::option::of(multi(len, other))).prop_map(|(level, message, span)| Child {
-        level,
-        message,
-        span: span.unwrap_or_default(),
-        once: false,
-    })
+fn child(tc: &TestCase, len: u32, other: u32) -> Child {
+    let level = match tc.draw(gs::integers::<u8>().max_value(2)) {
+        0 => Sublevel::Note,
+        1 => Sublevel::Help,
+        _ => Sublevel::Warning,
+    };
+    let message = tc.draw(gs::from_regex("[ -~]{1,30}"));
+    let span = if tc.draw(gs::booleans()) { multi(tc, len, other) } else { MultiSpan::default() };
+    Child { level, message, span, once: false }
 }
 
 /// Never empty: the JSON of an empty replacement of whole lines removes the line, as rustc's
 /// does and the reference's did not.
-fn replacement() -> impl Strategy<Value = String> {
-    prop_oneof!["[ -~]{1,12}", "[ -~]{1,6}\n[ -~]{0,6}", Just("#[inline]\n".to_owned())]
+fn replacement(tc: &TestCase) -> String {
+    match tc.draw(gs::integers::<u8>().max_value(2)) {
+        0 => tc.draw(gs::from_regex("[ -~]{1,12}")),
+        1 => tc.draw(gs::from_regex("[ -~]{1,6}\n[ -~]{0,6}")),
+        _ => "#[inline]\n".to_owned(),
+    }
 }
 
 /// One or two disjoint parts of the main file.
-fn substitution(len: u32) -> impl Strategy<Value = Vec<(Span, String)>> {
-    (proptest::collection::vec(0..=len, 4), replacement(), replacement(), any::<bool>()).prop_map(
-        |(mut at, first, second, two)| {
-            at.sort_unstable();
-            let at_file = |lo: u32, hi: u32| Span { file: FILE.to_owned(), lo, hi, expansion: None };
-            let mut parts = vec![(at_file(at[0], at[1]), first)];
-            if two && at[2] > at[1] {
-                parts.push((at_file(at[2], at[3]), second));
-            }
-            parts
-        },
-    )
-}
-
-fn suggestion(len: u32) -> impl Strategy<Value = Suggestion> {
-    let style = prop_oneof![
-        Just(SuggestionStyle::HideCodeInline),
-        Just(SuggestionStyle::HideCodeAlways),
-        Just(SuggestionStyle::CompletelyHidden),
-        Just(SuggestionStyle::ShowCode),
-        Just(SuggestionStyle::ShowAlways),
-    ];
-    let applicability = prop_oneof![
-        Just(Applicability::MachineApplicable),
-        Just(Applicability::MaybeIncorrect),
-        Just(Applicability::HasPlaceholders),
-        Just(Applicability::Unspecified),
-    ];
-    ("[a-z]{1,8}( [a-z]{1,8}){0,12}", proptest::collection::vec(substitution(len), 1..7), applicability, style)
-        .prop_map(|(message, substitutions, applicability, style)| Suggestion { message, substitutions, applicability, style })
-}
-
-fn diag(len: u32, other: u32) -> impl Strategy<Value = Diag> {
-    let level = prop_oneof![Just(Level::Error), Just(Level::Warning)];
-    (
-        level,
-        "[ -~]{1,40}",
-        multi(len, other),
-        proptest::collection::vec(child(len, other), 0..3),
-        proptest::collection::vec(suggestion(len), 0..3),
-        any::<bool>(),
-    )
-        .prop_map(|(level, message, span, children, suggestions, disabled)| {
-            let mut diag = Diag::new(level, Some(Code::Lint("clippy::needless_bool".to_owned())), message);
-            diag.span = span;
-            diag.children = children;
-            diag.suggestions = suggestions;
-            diag.suggestions_disabled = disabled;
-            diag
-        })
-}
-
-fn case() -> impl Strategy<Value = (String, String, Diag)> {
-    (text(), text()).prop_flat_map(|(main, other)| {
-        let diag = diag(main.len() as u32, other.len() as u32);
-        (Just(main), Just(other), diag)
-    })
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
-
-    #[test]
-    fn the_emitter_writes_what_the_reference_wrote(
-        (main, other, diag) in case(),
-        short in any::<bool>(),
-        ansi in any::<bool>(),
-        narrow in any::<bool>(),
-    ) {
-        let style = Style { short, ansi, width: if narrow { 40 } else { WIDTH }, ui_testing: false };
-        let files = [(FILE.to_owned(), main), (OTHER.to_owned(), other)];
-        let mut ours = super::Sources::of(files.clone());
-        let mut theirs = Sources::of(files);
-        let rendered = written(&diag, &mut theirs, style);
-        prop_assert_eq!(&super::written(&diag, &mut ours, style), &rendered);
-        let json: serde_json::Value = serde_json::from_str(&super::json(&diag, &mut ours, style)).unwrap();
-        let expected = serde_json::to_value(self::json(&diag, &mut theirs, rendered.clone())).unwrap();
-        prop_assert_eq!(&json, &expected);
-        let given: serde_json::Value = serde_json::from_str(&super::json_rendered(&diag, &mut ours, rendered)).unwrap();
-        prop_assert_eq!(given, json);
+fn substitution(tc: &TestCase, len: u32) -> Vec<(Span, String)> {
+    let mut at: [u32; 4] = tc.draw(gs::arrays(gs::integers().max_value(len)));
+    let (first, second, two) = (replacement(tc), replacement(tc), tc.draw(gs::booleans()));
+    at.sort_unstable();
+    let at_file = |lo: u32, hi: u32| Span { file: FILE.to_owned(), lo, hi, expansion: None };
+    let mut parts = vec![(at_file(at[0], at[1]), first)];
+    if two && at[2] > at[1] {
+        parts.push((at_file(at[2], at[3]), second));
     }
+    parts
+}
+
+fn suggestion(tc: &TestCase, len: u32) -> Suggestion {
+    let message = tc.draw(gs::from_regex("[a-z]{1,8}( [a-z]{1,8}){0,12}"));
+    let substitutions = some(tc, 1, 6, || substitution(tc, len));
+    let applicability = match tc.draw(gs::integers::<u8>().max_value(3)) {
+        0 => Applicability::MachineApplicable,
+        1 => Applicability::MaybeIncorrect,
+        2 => Applicability::HasPlaceholders,
+        _ => Applicability::Unspecified,
+    };
+    let style = match tc.draw(gs::integers::<u8>().max_value(4)) {
+        0 => SuggestionStyle::HideCodeInline,
+        1 => SuggestionStyle::HideCodeAlways,
+        2 => SuggestionStyle::CompletelyHidden,
+        3 => SuggestionStyle::ShowCode,
+        _ => SuggestionStyle::ShowAlways,
+    };
+    Suggestion { message, substitutions, applicability, style }
+}
+
+fn diag(tc: &TestCase, len: u32, other: u32) -> Diag {
+    let level = if tc.draw(gs::booleans()) { Level::Warning } else { Level::Error };
+    let message = tc.draw(gs::from_regex("[ -~]{1,40}"));
+    let mut diag = Diag::new(level, Some(Code::Lint("clippy::needless_bool".to_owned())), message);
+    diag.span = multi(tc, len, other);
+    diag.children = some(tc, 0, 2, || child(tc, len, other));
+    diag.suggestions = some(tc, 0, 2, || suggestion(tc, len));
+    diag.suggestions_disabled = tc.draw(gs::booleans());
+    diag
+}
+
+#[hegel::test(test_cases = 512)]
+fn the_emitter_writes_what_the_reference_wrote(tc: TestCase) {
+    let (main, other) = (text(&tc), text(&tc));
+    let diag = diag(&tc, main.len() as u32, other.len() as u32);
+    let (short, ansi, narrow) = tc.draw(gs::tuples!(gs::booleans(), gs::booleans(), gs::booleans()));
+    let style = Style { short, ansi, width: if narrow { 40 } else { WIDTH }, ui_testing: false };
+    let files = [(FILE.to_owned(), main), (OTHER.to_owned(), other)];
+    let mut ours = super::Sources::of(files.clone());
+    let mut theirs = Sources::of(files);
+    let rendered = written(&diag, &mut theirs, style);
+    assert_eq!(&super::written(&diag, &mut ours, style), &rendered);
+    let json: serde_json::Value = serde_json::from_str(&super::json(&diag, &mut ours, style)).unwrap();
+    let expected = serde_json::to_value(self::json(&diag, &mut theirs, rendered.clone())).unwrap();
+    assert_eq!(&json, &expected);
+    let given: serde_json::Value = serde_json::from_str(&super::json_rendered(&diag, &mut ours, rendered)).unwrap();
+    assert_eq!(given, json);
 }

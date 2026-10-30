@@ -213,7 +213,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplOrphan) -> Vec<Found> {
 /// rustc's `orphan_check_impl`: the `Proper` check, and when it fails the `Compat` one, whose
 /// error is reported; a failure only `Proper` finds is the `uncovered_param_in_projection`
 /// lint's.
-pub(crate) fn report(cx: &Cx<'_, '_>, at: &ImplAt<'_>) -> Vec<Found> {
+pub(crate) fn report<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>) -> Vec<Found> {
     // alloc: empty, allocates nothing
     let Err(proper) = orphan_check(cx, at.impl_, Mode::Proper) else { return Vec::new() };
     match orphan_check(cx, at.impl_, Mode::Compat) {
@@ -229,7 +229,7 @@ pub(crate) fn report(cx: &Cx<'_, '_>, at: &ImplAt<'_>) -> Vec<Found> {
 }
 
 /// E0117: `OnlyCurrentTraits`, with a label on each input type that is not local.
-pub(crate) fn non_local(cx: &Cx<'_, '_>, at: &ImplAt<'_>, tys: &[(hir::Type<'_>, bool)]) -> Diag {
+pub(crate) fn non_local<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, tys: &[(hir::Type<'db>, bool)]) -> Diag {
     let db = cx.db;
     let span = at.span(cx);
     let self_ty = at.impl_.self_ty(db);
@@ -312,11 +312,11 @@ pub(crate) fn non_local(cx: &Cx<'_, '_>, at: &ImplAt<'_>, tys: &[(hir::Type<'_>,
 
 /// E0210, one for each uncovered parameter (`UncoveredTyParam`); the lint
 /// `uncovered_param_in_projection` instead when only a projection leaves it uncovered.
-pub(crate) fn uncovered(
-    cx: &Cx<'_, '_>,
-    at: &ImplAt<'_>,
+pub(crate) fn uncovered<'db>(
+    cx: &Cx<'_, 'db>,
+    at: &ImplAt<'db>,
     params: &[hir::TypeParam],
-    local: Option<&hir::Type<'_>>,
+    local: Option<&hir::Type<'db>>,
     lint: bool,
 ) -> Vec<Found> {
     let note = "implementing a foreign trait is only possible if at least one of the types for which it is implemented is local";

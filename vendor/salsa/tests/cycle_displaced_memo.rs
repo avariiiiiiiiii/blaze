@@ -2,6 +2,8 @@
 
 //! Reject an interned value whose dependency was lost when validation displaced its memo.
 
+#![forbid(unsafe_code)]
+
 use salsa::{Database, Setter};
 
 #[salsa::input]

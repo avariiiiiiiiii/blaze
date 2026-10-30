@@ -372,6 +372,19 @@ fn views_answer_as_cursors() {
 }
 
 #[test]
+fn a_walk_with_ranges_gives_each_elements_text_range() {
+    for seed in 0..300 {
+        let tree = tree(seed);
+        let root = View::root(&tree);
+        for node in std::iter::once(root).chain(root.descendants()) {
+            let ranged: Vec<_> = node.descendants_with_ranges().collect();
+            let asked: Vec<_> = node.descendants_with_tokens().map(|it| (it, it.text_range())).collect();
+            assert_eq!(ranged, asked, "seed {seed}, from {node:?}");
+        }
+    }
+}
+
+#[test]
 fn a_lazy_node_is_entered_only_when_walked_into() {
     let tree = (0u64..)
         .map(tree)

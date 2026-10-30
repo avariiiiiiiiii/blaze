@@ -297,7 +297,23 @@ impl NotChecked {
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
 #[salsa::tracked(returns(ref))]
 pub fn borrowck<'db>(db: &'db Db, def: DefWithBodyId) -> BorrowckResult {
-    borrowck_in_mode(db, def, mode())
+    let mode = mode();
+    let Some(checker) = checker(mode) else { return borrowck_in_mode(db, def, mode) };
+    let (result, reads) = hir_ty::body_store::capture(db, || borrowck_in_mode(db, def, mode));
+    if gate::verdict(def, &result).is_ok() {
+        hir_ty::body_store::offer_passed(db, def, checker, reads);
+    }
+    result
+}
+
+/// The name the item store files `mode`'s verdicts under: each checker accepts other programs.
+/// None when no check runs, whose verdict is never stored.
+pub(crate) fn checker(mode: Mode) -> Option<&'static str> {
+    match mode {
+        Mode::Nll => Some("nll"),
+        Mode::Polonius => Some("polonius"),
+        Mode::Off => None,
+    }
 }
 
 /// [`borrowck`] in `mode`, not cached: for measuring the checker in each mode.

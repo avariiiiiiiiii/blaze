@@ -12,7 +12,7 @@ use serde::ser::{self, Serialize};
 
 use super::{
     ARRAY, BYTES, Error, FALSE, MAP, NEGATIVE, NULL, TEXT, TRUE, UNSIGNED, float, head, head_bytes,
-    key_order,
+    key_order, name_order,
 };
 
 /// The deterministic encoding of `value`.
@@ -439,6 +439,8 @@ pub(crate) struct Map<'a> {
     count: usize,
     /// The last key, where it is in the output, while every key so far came in order.
     last: (usize, usize),
+    /// The last key of a struct, by name.
+    last_name: &'static str,
     /// Where its entries' spans start in the scratch, once a key came out of order.
     spans: Option<usize>,
     /// A key came twice in a row.
@@ -460,6 +462,7 @@ impl<'a> Map<'a> {
             entries,
             count: 0,
             last: (entries, entries),
+            last_name: "",
             spans: None,
             twice: false,
         }
@@ -483,6 +486,25 @@ impl<'a> Map<'a> {
             }
         }
         Ok(())
+    }
+
+    /// A struct's field name as its key, ordered against the field before by the names
+    /// themselves: the same order as their encodings', with nothing read back from the output.
+    fn name(&mut self, name: &'static str) {
+        let start = self.out.len();
+        text(self.out, name);
+        let end = self.out.len();
+        self.count += 1;
+        match self.spans {
+            Some(_) => self.open(start, end),
+            None if self.count == 1 => {}
+            None => match name_order(self.last_name, name) {
+                Ordering::Less => {}
+                Ordering::Equal => self.twice = true,
+                Ordering::Greater => self.out_of_order(start, end),
+            },
+        }
+        self.last_name = name;
     }
 
     fn value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
@@ -568,7 +590,7 @@ impl ser::SerializeStruct for Map<'_> {
         key: &'static str,
         value: &T,
     ) -> Result<(), Error> {
-        self.key(key)?;
+        self.name(key);
         self.value(value)
     }
 
@@ -586,7 +608,7 @@ impl ser::SerializeStructVariant for Map<'_> {
         key: &'static str,
         value: &T,
     ) -> Result<(), Error> {
-        self.key(key)?;
+        self.name(key);
         self.value(value)
     }
 

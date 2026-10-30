@@ -110,8 +110,8 @@ size-class rounding, which #734 counts under memos, are gone. Matching rustc's 0
 variable width (3 bytes under 16M nodes), which an atomic word array can't express; it would
 come with the frozen, persisted graph, not the live one.
 
-**The 24-byte memo header.** `MemoHeader` is `verified_at` (8) and `QueryRevisions` (16), held
-by a `const` assertion:
+**The 24-byte memo header.** `MemoHeader` is `verified_at` (4 since revisions are `u32`, 10-30),
+its key's node (4, 10-30) and `QueryRevisions` (16), held by a `const` assertion:
 
 - one `AtomicU64` stamp: changed-at in the low 56 bits, durability in 2, and the
   `verified_final` and accumulated-inputs flags. Changed-at and durability are written only
@@ -155,6 +155,20 @@ page (rows by page, 20:40), so a hit computes the row from the page line and the
   memos live until the next reclaim.
 - **Eviction, LRU, compaction, persistence, memory usage** walk the struct pages in page and slot
   order as before (`for_each_memo_table_mut`, `map_memo`), so the LRU picks the same values.
+- **The LRU pass on every core (10-30, written blind).** `evict_least_recently_verified` splits
+  the function's pages into contiguous ranges, one per worker (at least 64 pages each, so a small
+  database starts no thread; `table/scan.rs`: `MemoPages`, `PageWalk`, `PageRange`, `run_split`).
+  Each worker collects its range's `verified_at` into a buffer kept between revisions; the
+  workers find the cutoff by a radix select over the buffers (8 bits a round over
+  `verified_at - min`, one round when the revisions span under 256, at most four, a barrier per
+  round), which replaces the serial `select_nth_unstable` (several ms on 1M rows); then each
+  range drops what is before the cutoff and its share of the at-cutoff ties, from a prefix sum
+  of the ranges' at-cutoff counts, fingerprinting on the worker. The values dropped are the
+  serial walk's for every worker count: `function/lru.rs`'s `parallel_matches_serial` checks it
+  against `EvictionCutoff::new` on random tables, `table/scan.rs`'s
+  `ranges_join_to_the_serial_walk` on a real table, and `tests/lru_parallel.rs` through an `lru`
+  function over 40K keys. A worker that panics before the last barrier still meets it, so a panic
+  is raised, not a hang. Bench: `benches/lru_scan.rs`.
 - **Invariant, checked in debug builds at every reclaim and at drop** (`Column::check_accounting`):
   every slab slot ever handed out is exactly one of a row's current memo, retired, or free and not
   yet taken. Also debug-checked: a retired memo lies in its own column's slab, slab slots are
@@ -175,6 +189,69 @@ page (rows by page, 20:40), so a hit computes the row from the page line and the
 Memo at rest: 24 + value + 4n bytes in the slab, plus 8 for its row pointer in its own column
 only, against 40 + value + 8n, a box, 8 per sibling function, and the 16-byte memo table every
 slot paid.
+
+**Claims as one word per row (10-30, written blind; sol-salsa-claim).** Each `Column` has a
+third region, `claims`: one `ClaimWord` (`usize`) per row at `8 * row`, kernel-zeroed (free),
+committed by the first claim at or past it, in the column's second line. `SyncTable::try_claim`
+finds it from the page as `get` finds the row pointer (`MemoTableWithTypes::claim`; the
+function's column in a struct's tables comes from a 4-entry cache keyed by struct ingredient,
+filled by one scan of `Zalsa::ingredient_index_for_memo`), so callers kept their signatures. The
+word is `FREE`, the claimer's token (its `ZalsaLocal`'s address, even) or `SLOW` (odd): claim is
+a CAS `FREE → token`, release a CAS back, with no mutex and no hash. Those two are the only
+changes made without the shard lock, and only on words that aren't `SLOW`. A contender, holding
+the lock, CASes the owner's token to `SLOW` and makes the entry from the task behind the token
+(the owner can't release until the contender drops the lock, so its `ZalsaLocal` is alive); a
+mark as transfer target, a transfer, a peek and a twice-claim do the same, and a reclaim of a
+released transfer puts the claimer's token back. So a `SLOW` word always has its entry, and
+blocking, `Reentrancy`, cycle detection, `transfer`, `peek_claim`, panics and cancellation run
+through the entry and the dependency graph exactly as before. Entries are keyed by `Id::index`,
+since a row serves every generation of its slot. Tests: `function/sync.rs` (the word's state
+machine: claim and release, a contended claim with a waiter, a contender losing to the release,
+transfer and reclaim, generations; a 20K-step differential against the old one-entry-per-claim
+table; threads racing on 2 rows and on 4096), `table/memo.rs`
+(`claim_words_sit_at_fixed_offsets_and_start_free`), `tests/parallel/claim_race.rs` (shuttle:
+three tasks fetching the same keys in two revisions run each key once). Under shuttle every word
+operation yields first, since the word is a plain atomic. Bench: `benches/claim.rs`
+(uncontended claim and release, bound ≈ 12 ns).
+
+**Node colors, nodes in memos, the page cache and 32-bit revisions (10-30, written blind;
+sol-salsa).**
+
+- **Revisions are `u32`** (`revision.rs`: `NonZeroU32`; `next()` panics before `u32::MAX`,
+  which stays the "never" sentinel). `verified_at` is 4 bytes; the stamp keeps its 56-bit
+  changed-at field. The header stays 24 bytes: the freed 4 bytes hold the memo's node (below).
+  `tests/memory-usage.rs`: `MyInput` 48 to 24, `MyTracked` 64 to 32.
+- **Colors** (`graph/colors.rs`, rustc's `DepNodeColorMap`): one `u64` per node beside its key
+  columns in `graph/nodes.rs`: verified-at in the high half, then an accumulated bit, then a
+  31-bit changed-at; all ones in the low half is "unknown". Written only by `fetch_max`, so
+  racing writers keep the highest and a color only rises. Every publish (`insert_memo`) and
+  every `mark_as_verified` paints its key's node from the memo (a provisional memo paints
+  "unknown"); taking a slot's memos (tracked struct deleted, interned value reused) paints
+  "unknown"; deep verify paints an input field's node with its changed-at
+  (`Ingredient::fixed_changed_at`, input fields only: a tracked struct's fields move when its
+  creator runs again). A reader trusts a color only to say "unchanged": verified in the current
+  revision, no accumulated values, changed-at at or before the reader's verified-at. Anything
+  else goes to the memo as before, so a late or missed color costs time, not correctness. The
+  claim-free walk (`walk_unclaimed`) now reads edge words, prefetches the colors 8 edges ahead,
+  and decodes an edge and finds its memo only when the color can't decide; the claimed
+  `deep_verify_edges` takes the same shortcut for input edges. Debug builds check every color
+  that said "unchanged" against the memo path (`check_color`). Tests: `graph/colors.rs`
+  (encoding, order, racing painters), `tests/deep_verify_colors.rs` (random edits against a
+  model with the exact set of re-runs, eight threads verifying the same memos, deleted tracked
+  structs, accumulated values). Bench: `benches/deep_verify.rs` (16384 readers × 16 edges into a
+  shared pool, target ≈ 2 ns an edge).
+- **A memo holds its node** (`MemoHeader::node`, set by `insert_memo`), so a read records
+  `QueryEdge::input_at(key, node)` (the node is not part of an edge's identity) and finishing the
+  query writes the word with no node lookup (`Graph::encode`). The frame's edge set is
+  `active_query::EdgeSet`, rustc's dedup: a scan of up to 8 edges, then a hash index built once.
+  Test: `edge_set_dedups_across_its_scan_limit`. Bench: `benches/record_read.rs`.
+- **The page cache** (`table/page_cache.rs`): 64 direct-mapped entries per task in
+  `ZalsaLocal`, each a copy of what a lookup reads from a table page (slots, slot vtable entry,
+  memo columns, first row, allocated count). `fetch_hot`, `fetch_unclaimed` and
+  `maybe_changed_after` use it (`get_memo_cached`), so a hit reads the entry, the column, the
+  row and the memo. A slot past the cached allocated count, or a cache used with another table,
+  reads the page again. Test: `cached_lookups_find_the_slots_own_memos`. Bench:
+  `benches/memo_hit.rs`.
 
 ## What is filed (v2/requests/db-salsa.md, "From speed-salsa")
 
@@ -231,7 +308,8 @@ cold fingerprints to `Edge::saw`.
 
 - **Node table** (`src/graph/nodes.rs`, one per database in `Zalsa`). A `DatabaseKeyIndex` gets a node the
   first time a finished query's edges name it, and keeps it for the life of the database (an edge
-  must never come to name another key, so nodes are not reused). Two columns, `id` (`u64`) and
+  must never come to name another key, so nodes are not reused; a compaction renumbers them all
+  at once, below). Two columns, `id` (`u64`) and
   `ingredient` (`u32`), in pages that grow by doubling and never move. The map from key to node
   is the SwissTable of `crates/intern/src/arena.rs`, sharded at four times the cores: groups of
   seven 4-byte node slots and a control word of tag bytes in 40 bytes, found with no lock and no
@@ -255,6 +333,37 @@ cold fingerprints to `Edge::saw`.
   One array for the database rather than one per memo table: rustc's `SerializedDepGraph` keeps
   one edge list for the whole graph; one array means one reservation per task (not one per
   function it ran), and one compaction pass.
+
+  **Settled edges are bit-packed** (sol-salsa-pack, 10-30, written blind). The compaction writes
+  the live ranges into a settled region at ⌈log2 nodes⌉ + 1 bits an edge (`word.rotate_left(1)`:
+  the node above the output bit, least significant bit first), one width for the whole region,
+  chosen from the node count when the compaction runs (25 bits at 10M nodes). The fresh array
+  after it starts at the position past the settled edges, so a span's start says which form it
+  is in and `EdgeSpan` stays 8 bytes, inline in the origin word as before. `EdgeWords::get` is one
+  8-byte load, a shift, a mask and a rotate; `iter` unpacks 8 at a time (8 edges are `width`
+  whole bytes, so each group of a span starts at the same bit and the lane offsets are set up
+  once per span): AVX2 (detected at run time) or NEON for spans of 32 edges or more, scalar
+  loads below that, under shuttle and miri, and on other targets; a test checks SIMD against the
+  scalar unpack at every width and first bit. Settled bytes are written only under the
+  compaction's `&mut Graph`, so readers use plain loads. Capture frames (`Reads`) live one
+  revision and are never settled; `raw_words` refuses a settled span. A settled-to-settled
+  compaction re-packs at the new width, so a node count crossing a power of two widens the next
+  region, never the current one. `benches/edges_at_rest.rs` measures bytes an edge and settled
+  against word iteration; `tests/edges_at_rest.rs` compacts a real database twice and checks
+  deep verify against a model. rustc's `SerializedDepGraph` stores its edges at 1 to 4 whole
+  bytes; this is within 1 bit of the bound instead of within 7.
+
+  **Nodes are renumbered in walk order at compaction** (sol-salsa-order, 10-30, written blind).
+  A node keeps its key between compactions, but not its number across one. The compaction
+  gathers each live memo's node and edges (`Ingredient::memo_edges`, `graph::LiveEdges`) and
+  numbers them in DFS preorder from the roots (`graph/order.rs`). In the same `&mut` pass it
+  renames every holder of a node: the key columns, the key table and the colors (moved, never
+  recomputed), the edge words as they are settled, `MemoHeader.node` and the filter column. A
+  task's node cache carries the `Nodes` epoch it was filled at and is emptied at its first use
+  at another, so no task can record an old number. This is rustc's `DepNodeIndex` order made
+  deliberate: rustc numbers nodes as it creates them and never reorders them. Deep verify then
+  reads the color column mostly in sequence, ≈ 1 ns an edge against ≈ 5.5 from DRAM
+  (speed-of-light.md, "verify walk layout"; `benches/verify_order.rs`, not run).
 - **Origin** (`zalsa_local.rs`, applied): one 8-byte word, a kind tag in its low bits and either
   the edge span inline or the address of a box (`WithExtra`) of the extra data and
   fingerprints with the span or an assigning query's key beside them. The extra is what most memos don't have: cycle heads, iteration

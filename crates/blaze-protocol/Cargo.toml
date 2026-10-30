@@ -25,6 +25,7 @@ serde = { workspace = true, features = ["derive"] }
 blaze-alloc-count.workspace = true
 blaze-fuzz.workspace = true
 blaze-ids.workspace = true
+hegeltest.workspace = true
 rustc-hash.workspace = true
 serde_json.workspace = true
 

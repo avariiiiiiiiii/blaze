@@ -4,7 +4,10 @@ use blaze_ids::ContentId;
 use blaze_query::{Database, MemTree};
 use blaze_vfs::View;
 
-use super::target::{CfgArgs, cargo_cfg_env, data_layout, file_name, target_cfg, target_facts};
+use super::target::{
+    CfgArgs, cargo_cfg_env, data_layout, file_name, split_debuginfo, target_cfg, target_cfg_told, target_facts,
+    target_spec_json,
+};
 use super::*;
 use crate::query::{StdGraph, StdKey, StdPlanned, StdUnits};
 use crate::schema::{Mode, Unit};
@@ -95,20 +98,82 @@ fn a_feature_of_no_cfg_changes_none() {
 }
 
 #[test]
-fn a_feature_set_is_its_bits() {
-    let mut bits = target::Bits::default();
-    for it in [0, 63, 64, 200, 255] {
-        bits.insert(it);
+fn the_features_that_change_no_cfg_are_told() {
+    let triple = "x86_64-unknown-linux-gnu";
+    let args = CfgArgs::from_flags(&["-Ctarget-feature=+blazeunlisted,+64bit,+avx2".to_owned()]).unwrap();
+    let (cfgs, skipped) = target_cfg_told(triple, &args).unwrap();
+    let avx2 = CfgArgs::from_flags(&["-Ctarget-feature=+avx2".to_owned()]).unwrap();
+    assert_eq!(cfgs, target_cfg(triple, &avx2).unwrap());
+    // `64bit` is LLVM's, which rustc warns of in words the data does not have.
+    assert_eq!(skipped.unknown, ["blazeunlisted"]);
+    assert_eq!(skipped.listed, ["64bit"]);
+    assert_eq!(target_cfg_told(triple, &avx2).unwrap().1, target::Skipped::default());
+    let warning = target::unknown_feature_warning("blazeunlisted").unwrap();
+    assert!(warning.contains("`blazeunlisted`") && !warning.contains("{feature}"), "{warning}");
+    assert!(warning.ends_with("\n\n"), "{warning:?}");
+}
+
+/// `RUSTC_BOOTSTRAP=-1`'s cfgs: `cfg` alone, `debug_assertions` but neither `ub_checks` nor
+/// `overflow_checks`.
+#[test]
+fn a_stable_rustc_prints_no_cfg_of_an_unstable_feature() {
+    let data = recorded();
+    let stable = CfgArgs { stable: true, ..CfgArgs::default() };
+    for triple in TRIPLES {
+        let target = &data["targets"][triple];
+        let mut want = strings(&target["cfg"]);
+        want.push("debug_assertions".to_owned());
+        want.push(format!("panic=\"{}\"", target["panic"].as_str().unwrap()));
+        want.sort();
+        assert_eq!(target_cfg(triple, &stable).unwrap(), want, "{triple}");
     }
-    assert_eq!(bits.iter().collect::<Vec<_>>(), [0, 63, 64, 200, 255]);
-    assert_eq!(bits.len(), 5);
-    bits.remove(64);
-    assert!(!bits.has(64) && bits.has(63));
-    let mut low = target::Bits::default();
-    low.insert(0);
-    assert!(low.within(&bits) && !bits.within(&low));
-    bits.subtract(&low);
-    assert_eq!(bits.intersection(&low), target::Bits::default());
+    let tuned = CfgArgs { target_features: vec![(true, "avx2".to_owned())], ..stable.clone() };
+    assert!(target_cfg("x86_64-unknown-linux-gnu", &tuned).unwrap_err().contains("nightly"));
+    let cpu = CfgArgs { target_cpu: Some("x86-64-v3".to_owned()), ..stable };
+    assert!(target_cfg("x86_64-unknown-linux-gnu", &cpu).is_err());
+}
+
+#[test]
+fn a_spec_the_hosts_agree_on_is_every_hosts() {
+    let data = recorded();
+    let wasm = target_spec_json("wasm32-wasip1", "x86_64-pc-windows-msvc").unwrap().expect("wasm32-wasip1's spec");
+    assert_eq!(Some(wasm), target_spec_json("wasm32-wasip1", "aarch64-apple-darwin").unwrap());
+    assert_eq!(wasm, data["targets"]["wasm32-wasip1"]["target_spec_json"]["aarch64-apple-darwin"].as_str().unwrap());
+    let linux = "x86_64-unknown-linux-gnu";
+    assert_eq!(target_spec_json(linux, "x86_64-pc-windows-msvc").unwrap(), None);
+    assert_eq!(
+        target_spec_json(linux, linux).unwrap(),
+        data["targets"][linux]["target_spec_json"][linux].as_str()
+    );
+    assert!(target_spec_json("riscv64gc-unknown-plan9", linux).is_err());
+    let split: Vec<&str> = split_debuginfo(linux).unwrap().iter().map(|it| &**it).collect();
+    assert_eq!(split, ["off", "packed", "unpacked"]);
+    assert!(target::known(linux).is_ok() && target::known("riscv64gc-unknown-plan9").is_err());
+}
+
+#[test]
+fn a_targets_facts_are_read_without_allocating() {
+    let linux = "x86_64-unknown-linux-gnu";
+    target::known(linux).unwrap();
+    let read = blaze_alloc_count::assert_at_most(0, "a target's lookups", || {
+        let split = split_debuginfo(linux).unwrap().len();
+        (target::known(linux).is_ok(), split, target_spec_json(linux, linux).unwrap().is_some())
+    });
+    assert_eq!(read, (true, 3, true));
+}
+
+/// `--cfg`s rustc prints back as given: a plain name of no builtin cfg, a value with nothing
+/// to escape.
+#[test]
+fn a_cfg_given_is_passed_on_when_plain() {
+    let triple = "x86_64-unknown-linux-gnu";
+    let given = |cfg: &str| target_cfg(triple, &CfgArgs { cfgs: vec![cfg.to_owned()], ..CfgArgs::default() });
+    for plain in ["foo", "feature=\"serde derive\""] {
+        assert!(given(plain).unwrap().iter().any(|it| it == plain), "{plain}");
+    }
+    for refused in ["feature=serde", "feature=\"a\\\"b\"", "debug_assertions", "target_os=\"linux\"", "sanitizer_cfi_generalize_pointers", "9lives"] {
+        assert!(given(refused).is_err(), "{refused}");
+    }
 }
 
 #[test]

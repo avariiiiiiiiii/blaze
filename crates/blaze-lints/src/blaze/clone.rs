@@ -10,7 +10,10 @@
 
 use hir::HirDisplay as _;
 use hir_def::{AdtId, HasModule as _, builtin_derive::BuiltinDeriveImplTrait};
-use hir_ty::next_solver::{GenericArg, GenericArgs};
+use hir_ty::{
+    db::HirDatabase as _,
+    next_solver::{GenericArg, GenericArgs},
+};
 
 use super::{Known, alloc};
 

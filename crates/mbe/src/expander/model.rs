@@ -69,12 +69,12 @@ pub(crate) fn expand_rules(
 
 /// A multi-mapping from metavariables to the fragments they matched, one level of `Nested` per
 /// repetition the metavariable is in.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone)] // clone: the `#[cfg(test)]` model of the old matcher, which copies bindings per fork
 struct Bindings<'a> {
     inner: FxHashMap<MetaVar, Binding<'a>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone)] // clone: as `Bindings`, test-only
 enum Binding<'a> {
     Fragment(Fragment<'a>),
     Nested(Vec<Binding<'a>>),

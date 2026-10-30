@@ -1,4 +1,5 @@
 #![cfg(feature = "inventory")]
+#![forbid(unsafe_code)]
 
 mod common;
 

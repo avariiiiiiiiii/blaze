@@ -1,14 +1,15 @@
 //! Defines [`EditionedFileId`], an interned wrapper around [`span::EditionedFileId`] that
 //! is interned (so queries can take it) and stores only the underlying `span::EditionedFileId`.
 
-use std::hash::Hash;
+use std::{hash::Hash, sync::Arc};
 
 use blaze_ids::ContentId;
+use blaze_mem::{Tag, tag};
 use span::Edition;
 use syntax::{SyntaxError, ast};
 use vfs::FileId;
 
-use crate::Db;
+use crate::{Db, trees::Trees};
 
 #[salsa::interned(debug, constructor = from_span_file_id, unsafe(no_lifetime), revisions = usize::MAX)]
 #[derive(PartialOrd, Ord)]
@@ -17,24 +18,83 @@ pub struct EditionedFileId {
     field: span::EditionedFileId,
 }
 
-#[salsa::tracked]
-impl EditionedFileId {
-    /// The file's tree, sharing its text. A file of a library source root (a dependency's) is an
-    /// outline, whose `fn` bodies are parsed when first walked into (#1294); every other file is
-    /// parsed in full. Decided by the source root, so a file two crates read gets one answer.
-    /// After an edit it is made from the file's last parse, when one is kept (see
-    /// [`Reparse`](crate::Reparse)): the same tree, in the time of the edited item's parse.
-    #[salsa::tracked(lru = 128, returns(ref))]
-    pub fn parse(self, db: &Db) -> syntax::Parse<ast::SourceFile> {
-        let _p = tracing::info_span!("parse", ?self).entered();
-        let (file_id, edition) = self.unpack(db);
-        let input = db.file_text(file_id);
-        input.reparse_field(db).parse(input.text(db), edition, self.is_library(db))
+/// [`EditionedFileId::parse`]. salsa keeps every file's parse ([`Db::admit_parses`] lowers that
+/// when the trees outgrow [`Tag::Parse`]'s budget), and the trees count against that tag.
+#[salsa::tracked(self_ty = EditionedFileId, lru = 0, mem_tag = Parse, returns(ref))]
+fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
+    let _p = tracing::info_span!("parse", ?file).entered();
+    let (file_id, edition) = file.unpack(db);
+    let input = db.file_text(file_id);
+    let stored = db.trees().map(|it| &**it);
+    let parse = input.reparse_field(db).parse(input.text(db), edition, file.is_library(db), stored);
+    parse.unwrap_or_else(|error| {
+        let root = db.source_root(db.file_source_root(file_id).source_root_id(db));
+        let path = root.source_root_ref(db).path_for_file(&file_id).cloned();
+        panic!("{error}, read for {file_id:?} at {path:?}: delete the daemon's image to store it again")
+    })
+}
+
+/// What a database keeps its files' parses by: salsa's capacity for them, which
+/// [`Db::admit_parses`] sets, and the stored trees read in place of parsing ([`Trees`]).
+pub(crate) struct Parses {
+    /// How many parses salsa keeps the values of past a revision; 0 keeps every one.
+    capacity: usize,
+    pub(crate) trees: Option<Arc<Trees>>,
+}
+
+impl Parses {
+    pub(crate) fn new(trees: Option<Arc<Trees>>) -> Parses {
+        Parses { capacity: 0, trees }
+    }
+}
+
+impl Db {
+    /// Sets how many files' parses salsa keeps past this revision by the bytes their trees
+    /// hold against [`Tag::Parse`]'s budget: every one while they fit; over it, as many as
+    /// fit at the bytes a parse holds now (with an eighth to spare), the ones read longest
+    /// ago let go at the next revision; under half of it again, twice as many, back to every
+    /// one. The build calls it once a revision, before it writes the revision's inputs. A
+    /// database with no budget set keeps every parse.
+    pub fn admit_parses(&mut self) {
+        let budget = tag::budget(Tag::Parse);
+        if budget == u64::MAX {
+            return;
+        }
+        let live = tag::snapshot().get(Tag::Parse).live;
+        let capacity = self.parses.capacity;
+        let next = if live > budget {
+            let parsed = self.files().texts().filter(|it| it.reparse_field(self).has_parse()).count();
+            let fit = parsed as u128 * u128::from(budget) * 7 / 8 / u128::from(live);
+            match capacity {
+                0 => (fit as usize).max(1),
+                held => (fit as usize).clamp(1, held),
+            }
+        } else if capacity != 0 && live < budget / 2 {
+            let files = self.files().texts().count();
+            match capacity.saturating_mul(2) {
+                more if more >= files => 0,
+                more => more,
+            }
+        } else {
+            capacity
+        };
+        if next != capacity {
+            self.parses.capacity = next;
+            parse_::set_lru_capacity(self, next);
+        }
     }
 
+    /// How many files' parses salsa keeps now ([`Db::admit_parses`]); 0 is every one.
+    pub fn parse_capacity(&self) -> usize {
+        self.parses.capacity
+    }
+}
+
+#[salsa::tracked]
+impl EditionedFileId {
     /// Whether the file is in a library source root: a firewall, so an edit to the root's set
     /// of files that keeps the answer re-parses none of them.
-    #[salsa::tracked]
+    #[salsa::tracked(returns(copy))]
     pub fn is_library(self, db: &Db) -> bool {
         let root = db.file_source_root(self.file_id(db)).source_root_id(db);
         db.source_root(root).source_root_ref(db).is_library
@@ -55,6 +115,18 @@ impl EditionedFileId {
 }
 
 impl EditionedFileId {
+    /// The file's tree, sharing its text. A file of a library source root (a dependency's) is an
+    /// outline, whose `fn` bodies are parsed when first walked into (#1294); every other file is
+    /// parsed in full. Decided by the source root, so a file two crates read gets one answer.
+    /// After an edit it is made from the file's last parse, when one is kept (see
+    /// [`Reparse`](crate::Reparse)): the same tree, in the time of the edited item's parse. A
+    /// library file whose outline the daemon's image stores is read from it in place
+    /// ([`Trees`]): the tree a parse makes, with the bodies walked before it was stored.
+    #[inline]
+    pub fn parse(self, db: &Db) -> &syntax::Parse<ast::SourceFile> {
+        parse_(db, self)
+    }
+
     #[inline]
     pub fn new(db: &Db, file_id: FileId, edition: Edition) -> Self {
         Self::from_span_file_id(db, span::EditionedFileId::new(file_id, edition))

@@ -23,9 +23,10 @@ a reboot, takes about as long as the same answer from a warm daemon, plus a few 
 - **Changed files come from the OS's journal**, not a rescan:
   - **macOS:** FSEvents with the last event ID saved in the image (`sinceWhen`).
   - **Windows:** the NTFS USN journal from the saved USN.
-  - **Linux:** no journal survives a restart, so one batched `statx` sweep over the tracked
-    paths through io_uring, compared on inode, size, mtime and ctime. That's about 50 ms for
-    100k files, then fanotify.
+  - **Linux:** no journal survives a restart, so one `statx` sweep over the tracked paths on
+    every core (io_uring's `STATX` is prepared serially on one thread, which is slower than the
+    calls themselves), compared on inode, size, mtime, ctime and mode. That's within 50 ms for
+    100k files, a few ms on 8 cores, then fanotify.
 
   Only files whose metadata moved are hashed.
 - **The daemon starts on demand.** It is socket-activated (launchd, systemd), so the first

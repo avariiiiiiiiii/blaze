@@ -370,7 +370,7 @@ fn static_of(body: &MirBody<'_>, operand: &Operand) -> Option<StaticId> {
 /// Whether `operand` is a function's address, as a function pointer or made into a pointer,
 /// by the locals it is copied through: never one a body is handed, nor one a call returns.
 fn fn_address(body: &MirBody<'_>, operand: &Operand, seen: &mut FxHashSet<LocalId>) -> bool {
-    if super::fn_item(operand).is_some() {
+    if operand.fn_item().is_some() {
         return true;
     }
     let Some(local) = whole_local(operand) else { return false };
@@ -485,7 +485,7 @@ fn whole_local(operand: &Operand) -> Option<LocalId> {
 
 /// Which of core's `AtomicPtr::new`, `load` and `store` an operand is the function of.
 fn atomic_ptr_method(db: &Db, func: &Operand) -> Option<&'static str> {
-    let (func, _) = super::fn_item(func)?;
+    let (func, _) = func.fn_item()?;
     if !matches!(
         func.krate(db).data(db).origin,
         base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::Core)

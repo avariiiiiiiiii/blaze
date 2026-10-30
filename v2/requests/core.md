@@ -275,7 +275,9 @@ step.
    to the caller's buffer." Why: the doc is `current`-kept by core and now says nothing of how
    the plane holds its state (see `docs/v2/plan/lanes/core/speed-runtime-plane.md`).
 
-> applied: lane core is DONE. 1: `crates/blaze-graph/src/machine.rs` `Machine` keeps `said: Vec<PlaneOutput>` and `step` drains `Plane::step_into` into it, mapped as before. > forwarded to speed: 2 (`exec.rs`) is speed-runtime-pool's, told by the requester. > forwarded to coordinator: 3, `docs/v2/plan/lanes/core/plane.md`, falls to the coordinator's `docs/v2/` with core DONE.
+> applied: lane core is DONE. 1: `crates/blaze-graph/src/machine.rs` `Machine` keeps `said: Vec<PlaneOutput>` and `step` drains `Plane::step_into` into it, mapped as before. > forwarded to speed: 2 (`exec.rs`) is speed-runtime-pool's, told by the requester.
+> Status (2): done by speed (2026-10-30; speed-runtime-pool and core-pool are DONE, so `exec.rs` was free). `Owner` keeps `said: Vec<PlaneOutput>`; `step` and `Msg::Cancel` take it out with `mem::take`, call `step_into`/`cancel_into`, and `outputs(request, Result<(), Error>, said)` drains it into `output` and puts it back (the larger buffer is kept when a step started from an output, such as a failed run, left its own). `Open`'s `release` passes the same buffer, so `Vec::new()` per open is gone too. Not compiled (common.md).
+> forwarded to coordinator: 3, `docs/v2/plan/lanes/core/plane.md`, falls to the coordinator's `docs/v2/` with core DONE.
 
 ## From speed-runtime-vfs: one effect to look at many paths, and the kind of a change (2026-10-29)
 

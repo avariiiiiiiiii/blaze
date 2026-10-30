@@ -4,6 +4,8 @@
 //!
 //! * entities not created in a revision are deleted, as is any memoized data keyed on them.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use salsa::{Database, Setter};

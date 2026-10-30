@@ -2,8 +2,6 @@
 //! so a macro that builds a `HashMap` is still kept. Every other source gives real random
 //! bytes and makes what it made one that can't be kept ([`Untraceable::Random`]).
 
-use std::hash::{BuildHasher as _, Hasher as _};
-
 use blaze_core::Untraceable;
 use blaze_usercode::trace::{Seen, untraceable_name};
 
@@ -48,7 +46,7 @@ impl<'a> Os<'a> {
         let mut at = 0;
         while at < len {
             let take = (len - at).min(chunk.len() as u64) as usize;
-            fill(&mut chunk[..take]);
+            stdx::rand::fill(&mut chunk[..take]);
             g.write(buf + at, &chunk[..take])?;
             at += take as u64;
         }
@@ -65,17 +63,5 @@ impl<'a> Os<'a> {
             return fail(t, g, ret, Errno::Io);
         }
         self.fill_random(g, ret, (buf, len), Some(0))
-    }
-}
-
-/// Fills `out` with random bytes: the keys of one fresh `RandomState`, which the standard
-/// library seeds from the system once per thread and steps per call, hashing the index of
-/// each eight bytes, as the wasm host's `fill_random` makes them.
-fn fill(out: &mut [u8]) {
-    let state = std::hash::RandomState::new();
-    for (index, chunk) in out.chunks_mut(8).enumerate() {
-        let mut hasher = state.build_hasher();
-        hasher.write_usize(index);
-        chunk.copy_from_slice(&hasher.finish().to_le_bytes()[..chunk.len()]);
     }
 }

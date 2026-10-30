@@ -358,12 +358,12 @@ impl<'db> BestObligation<'db> {
                 if candidates.len() > 1 {
                     candidates.retain(|candidate| {
                         goal.infcx().probe(|_| {
-                            !candidate.instantiate_nested_goals(self.span()).iter().any(
-                                |nested_goal| {
-                                    nested_goal.source() == GoalSource::Normalization
-                                        && nested_goal.result().is_err()
-                                },
-                            )
+                            !candidate
+                                .instantiate_nested_goals_from(self.span(), |source| {
+                                    source == GoalSource::Normalization
+                                })
+                                .iter()
+                                .any(|nested_goal| nested_goal.result().is_err())
                         })
                     });
                 }

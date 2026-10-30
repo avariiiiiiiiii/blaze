@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use base_db::{Crate, Db};
+use blaze_format::cursor::{Put, Reader};
 use blaze_ids::{ContentId, Hasher};
 use hir_expand::{HirFileId, MacroCallId, MacroDefKind, proc_macro::ExpansionReads};
 use rustc_hash::FxHashSet;
@@ -139,18 +140,15 @@ impl Reads {
             + self.macros.iter().map(|it| it.0.len() + 4).sum::<usize>();
         // alloc: one slot's bytes, once per crate imaged
         let mut out = Vec::with_capacity(len + 9);
-        out.push(VERSION);
-        fn framed(out: &mut Vec<u8>, bytes: &[u8]) {
-            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            out.extend_from_slice(bytes);
-        }
-        out.extend_from_slice(&(self.env.len() as u32).to_le_bytes());
+        let count = |len: usize| u32::try_from(len).expect("fewer than 2^32 reads");
+        out.put_u8(VERSION);
+        out.put_u32(count(self.env.len()));
         for name in &self.env {
-            framed(&mut out, name.as_bytes());
+            out.put_bytes_u32(name.as_bytes());
         }
-        out.extend_from_slice(&(self.macros.len() as u32).to_le_bytes());
+        out.put_u32(count(self.macros.len()));
         for (shape, _) in &self.macros {
-            framed(&mut out, shape);
+            out.put_bytes_u32(shape);
         }
         out
     }
@@ -158,36 +156,21 @@ impl Reads {
     /// What [`Reads::encode`] wrote, its lengths checked against the bytes, its order and its
     /// names checked: the bytes came from a store, which checked only their hash.
     pub fn decode(bytes: &[u8]) -> Result<Reads, &'static str> {
-        fn take<'b>(rest: &mut &'b [u8], len: usize) -> Result<&'b [u8], &'static str> {
-            if rest.len() < len {
-                return Err("reads shorter than their lengths");
-            }
-            let (taken, after) = rest.split_at(len);
-            *rest = after;
-            Ok(taken)
-        }
-        fn count(rest: &mut &[u8]) -> Result<usize, &'static str> {
-            let bytes = take(rest, 4)?;
-            Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")) as usize)
-        }
-        let mut rest = bytes;
-        if take(&mut rest, 1)? != [VERSION] {
+        let short = |_| "reads shorter than their lengths";
+        let mut read = Reader::new(bytes);
+        if read.u8().map_err(short)? != VERSION {
             return Err("reads of another version");
         }
         let mut reads = Reads::default();
-        for _ in 0..count(&mut rest)? {
-            let len = count(&mut rest)?;
-            let name =
-                std::str::from_utf8(take(&mut rest, len)?).map_err(|_| "a variable not UTF-8")?;
+        for _ in 0..read.count_u32(4).map_err(short)? {
+            let name = std::str::from_utf8(read.bytes_u32().map_err(short)?)
+                .map_err(|_| "a variable not UTF-8")?;
             reads.env.push(name.into()); // alloc: setup: a slot read, once per crate per session
         }
-        for _ in 0..count(&mut rest)? {
-            let len = count(&mut rest)?;
-            reads.macros.push((take(&mut rest, len)?.into(), None)); // alloc: setup, as above
+        for _ in 0..read.count_u32(4).map_err(short)? {
+            reads.macros.push((read.bytes_u32().map_err(short)?.into(), None)); // alloc: setup, as above
         }
-        if !rest.is_empty() {
-            return Err("bytes after the reads");
-        }
+        read.finish().map_err(|_| "bytes after the reads")?;
         if !reads.env.windows(2).all(|pair| pair[0] < pair[1]) {
             return Err("variables out of order");
         }
@@ -225,10 +208,7 @@ impl Reads {
         let mut hasher = Hasher::new(READS_DOMAIN);
         hasher.part(b"values");
         for name in &self.env {
-            match base_db::process_env_var(db, name) {
-                None => hasher.update(&[0]),
-                Some(value) => hasher.update(&[1]).part(value.as_bytes()),
-            };
+            hasher.opt_part(base_db::process_env_var(db, name));
         }
         for (shape, then) in &self.macros {
             hasher.id(&expansion(shape, *then)?);

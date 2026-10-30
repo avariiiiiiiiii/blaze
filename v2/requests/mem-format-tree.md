@@ -2144,3 +2144,6 @@ box. Validation's own errors move.)
 > `exact_errors_allocate_only_their_box` in `src/tests.rs` as written, plus the outline's exact
 > forms against `errors()`/`errors_with_bodies()`. The `base-db` callers
 > (`editioned_file_id.rs` L46, L57 -> `errors_exact()` / `errors_with_bodies_exact()`) are db's to apply.
+> frontend-tree-go-base (2026-10-30): applied in `crates/base-db/src/editioned_file_id.rs`:
+> `parse_errors` is `self.parse(db).errors_exact()`, `parse_errors_with_bodies` is
+> `self.parse(db).errors_with_bodies_exact()`; the `match` and `.into()` are gone.

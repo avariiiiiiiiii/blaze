@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use blaze_manifest::config::schema::{CargoResolverConfig, FeatureUnification};
+use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Files;
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
 use blaze_manifest::metadata::export_package;
@@ -27,7 +27,9 @@ use super::files::Snap;
 use super::source::{Index, Located, Sources};
 use super::{Select, Spec, Staged, load_error};
 use crate::query::{Fetch, LockWrite, LoadError};
-use crate::read::{self as summary, Package, Read, manifest_source, path_packages, rust_versions};
+use crate::read::{
+    self as summary, Package, Read, feature_unification, manifest_source, path_packages, rust_versions,
+};
 
 /// The workspace resolved, as the unit graph is made from it.
 pub(crate) struct Resolved<'a> {
@@ -138,11 +140,7 @@ pub(crate) fn resolved<'r, 'db, R>(
     let member_summaries: Vec<Summary> = member_ids.iter().map(|id| reads[id].summary.clone()).collect();
     let member_refs: Vec<&Summary> = member_summaries.iter().collect();
     let current = members.iter().position(|(path, _)| *path == ws.current_manifest()).map(|at| member_ids[at]);
-    let behavior = match ws.resolve_behavior() {
-        blaze_manifest::features::ResolveBehavior::V1 => ResolveBehavior::V1,
-        blaze_manifest::features::ResolveBehavior::V2 => ResolveBehavior::V2,
-        blaze_manifest::features::ResolveBehavior::V3 => ResolveBehavior::V3,
-    };
+    let behavior = ws.resolve_behavior();
     let new_cli_feature_behavior = behavior != ResolveBehavior::V1 || ws.is_virtual();
     let members_of = || Members { members: &member_refs, current, new_cli_feature_behavior };
     let member_rust_versions: Vec<RustVersion> = match members
@@ -476,15 +474,4 @@ fn feature_roots(
     };
     let found = members_with_features(members, resolved_for, cli_features)?;
     Ok(found.into_iter().map(|(summary, features)| (summary.clone(), features)).collect())
-}
-
-/// `resolver.feature-unification`, which nightly cargo reads only with `-Zfeature-unification`
-/// (`unstable.feature-unification`); `selected` otherwise.
-fn feature_unification(config: &blaze_manifest::Config<Snap>) -> anyhow::Result<FeatureUnification> {
-    let resolver = config.get::<CargoResolverConfig>("resolver")?;
-    let unstable = config.get::<Option<bool>>("unstable.feature-unification")?;
-    Ok(match (unstable, resolver.feature_unification) {
-        (Some(true), Some(it)) => it,
-        _ => FeatureUnification::Selected,
-    })
 }

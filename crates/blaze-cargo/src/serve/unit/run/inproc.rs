@@ -148,10 +148,11 @@ fn sessions_of(started: mpsc::Receiver<Result<Session, blaze_inproc::Error>>, pa
         match session {
             Ok(session) => {
                 let pid = session.pid;
-                let (patch, failures) = (patch.clone(), failures.clone());
+                // clone: two counts, once per run started
+                let (its_patch, its_failures) = (patch.clone(), failures.clone());
                 let spawned = std::thread::Builder::new()
                     .name("blaze dev run asks".to_owned())
-                    .spawn(move || serve(session, &patch, &failures));
+                    .spawn(move || serve(session, &its_patch, &its_failures));
                 if let Err(error) = spawned {
                     lock(&failures).push(format!("serving process {pid}'s asks: {error}"));
                 }

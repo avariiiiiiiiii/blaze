@@ -214,23 +214,7 @@ thread_local! {
 /// added when `f` returns or unwinds. Scopes do not nest; `f` must not call into the database,
 /// whose own buffers are never relocated.
 pub(crate) fn relocating<T>(table: &mut Relocation, f: impl FnOnce() -> T) -> T {
-    struct Scope<'t>(&'t mut Relocation);
-
-    impl Drop for Scope<'_> {
-        fn drop(&mut self) {
-            if let Some(table) = RELOCATION.with(|slot| slot.borrow_mut().take()) {
-                *self.0 = table;
-            }
-        }
-    }
-
-    RELOCATION.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        assert!(slot.is_none(), "relocating scopes do not nest");
-        *slot = Some(std::mem::take(table));
-    });
-    let _scope = Scope(table);
-    f()
+    stdx::lend(&RELOCATION, table, f)
 }
 
 /// The index of an id written in a [`relocating`] scope, `None` outside one.
@@ -924,19 +908,18 @@ impl Code for Edition {
 
 /// The syntax context `raw` names, as `into_u32` gave it; `None` for `u32::MAX`, which no
 /// context is.
+///
+/// The one place persisted contexts are trusted. `raw` is what `into_u32` gave in the database
+/// that wrote the buffer, which is the one reading it (the module's docs), or, inside
+/// `relocating`, a context the reader made in this database from the table's portable encoding
+/// (`crate::deps::signatures`). Store bytes reach a `read` only after their content hash is
+/// checked (`deps::serve::ImageStore::get`). Another value names another context or panics on
+/// use, never UB.
 pub(crate) fn syntax_context(raw: u32) -> Option<SyntaxContext> {
     if raw == u32::MAX {
         return None;
     }
-    // SAFETY: `from_u32` needs a context of this database. `raw` is what `into_u32` gave in
-    // the database that wrote the buffer, which is the one reading it (the module's docs), or,
-    // inside `relocating`, what `into_u32` gave of a context the reader's table holds, which
-    // the reader made in this database from the table's portable encoding before reading
-    // (`crate::deps::signatures`). Bytes from outside this process reach a `read` only through
-    // `blaze_format::read_verified`, which checks their content hash first, so a corrupted
-    // buffer is refused before any context is decoded. `u32::MAX`, which `from_u32` would turn
-    // into an overflow, is refused above.
-    Some(unsafe { SyntaxContext::from_u32(raw) })
+    Some(SyntaxContext::from_u32(raw))
 }
 
 impl Code for SyntaxContext {
@@ -1368,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "relocating scopes do not nest")]
+    #[should_panic(expected = "do not nest")]
     fn relocating_scopes_do_not_nest() {
         let (mut outer, mut inner) = (Relocation::new(), Relocation::new());
         relocating(&mut outer, || relocating(&mut inner, || ()));

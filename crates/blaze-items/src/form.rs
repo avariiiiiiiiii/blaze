@@ -116,7 +116,7 @@ impl Missed {
 
 /// A form, hashed: what every hash of an item reads of it. Its positions are apart, in
 /// [`Code::spans`].
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Sub {
     pub(crate) digest: ContentId,
     /// Distinct, in slot order: slot 0 is `refs[0]`.
@@ -129,13 +129,22 @@ const _: () = assert!(size_of::<Sub>() == 56);
 
 /// A body's form and the hash of the positions (MirSpans) of its code, in order: read by what
 /// fills positions in, never by a hash of the item.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Code {
     pub(crate) sub: Sub,
     pub(crate) spans: ContentId,
 }
 
 const _: () = assert!(size_of::<Code>() == 88);
+
+#[cfg(test)]
+impl Code {
+    /// A copy, for [`Cx::reference_ty`]'s cache.
+    fn copied(&self) -> Code {
+        let Sub { digest, ref refs, missed } = self.sub;
+        Code { sub: Sub { digest, refs: refs.clone(), missed }, spans: self.spans }
+    }
+}
 
 /// The spans hash of a form with no positions, which most are.
 static NO_SPANS: LazyLock<ContentId> = LazyLock::new(|| ContentId::of(SPANS_DOMAIN, &[]));
@@ -454,6 +463,8 @@ pub(crate) struct Cx<'db> {
     /// and no allocation, against salsa's interning of the key (a shard lock) and its memo
     /// lookup. A `Cx` lives inside one query, so a hit skips only a read that query recorded.
     seen: [Cell<Option<(Ty<'db>, &'db Code)>>; SEEN],
+    /// Writing signature forms ([`Cx::leak_free`]): [`LEAK`] in place of each leak.
+    leak_free: bool,
     #[cfg(test)]
     reference: Option<Reference<'db>>,
 }
@@ -475,6 +486,19 @@ fn ty_form_cycle(_: &Db, _: salsa::Id, _: StoredTy) -> Code {
     form.error(Missed::ErrorType);
     form.code()
 }
+
+/// A type's form as a signature form writes it: [`ty_form`]'s, with [`LEAK`] in place of a
+/// closure's captures and a coroutine's held locals, which are of the inference and MIR of
+/// the body the closure is written in.
+#[salsa::tracked(returns(ref), cycle_result = ty_form_cycle)]
+pub(crate) fn signature_ty_form(db: &Db, ty: StoredTy) -> Code {
+    let mut form = Form::new("ty");
+    Cx::leak_free(db).spell(&mut form, ty.as_ref());
+    form.code()
+}
+
+/// What a signature form writes in place of what a body leaks into an interface.
+const LEAK: u8 = 0xfe;
 
 /// The type forms as each `Cx` spelled them before [`ty_form`]: memoized for its lifetime,
 /// with a stack of the types being spelled to stop at one that contains itself. The tests
@@ -550,9 +574,18 @@ impl<'db> Cx<'db> {
         Cx {
             db,
             seen: [const { Cell::new(None) }; SEEN],
+            leak_free: false,
             #[cfg(test)]
             reference: None,
         }
+    }
+
+    /// A `Cx` that writes signature forms: an interface form with [`LEAK`] in place of each
+    /// leak of a body (a `const fn`'s, a constant's, an immutable static's and an explicit
+    /// discriminant's body, an opaque type's hidden type and auto traits, a closure's captures,
+    /// a coroutine's held locals), so that writing one infers no body.
+    pub(crate) fn leak_free(db: &'db Db) -> Cx<'db> {
+        Cx { leak_free: true, ..Cx::new(db) }
     }
 
     /// A `Cx` that spells types itself, as every `Cx` did before [`ty_form`].
@@ -566,7 +599,7 @@ impl<'db> Cx<'db> {
     pub(crate) fn reference_ty(&self, ty: Ty<'db>) -> Code {
         let reference = self.reference.as_ref().expect("a reference `Cx`");
         if let Some(known) = reference.tys.borrow().get(&ty) {
-            return known.clone();
+            return known.copied();
         }
         let mut form = Form::new("ty");
         if reference.spelling.borrow().contains(&ty) {
@@ -577,7 +610,7 @@ impl<'db> Cx<'db> {
         self.spell(&mut form, ty);
         reference.spelling.borrow_mut().pop();
         let code = form.code();
-        reference.tys.borrow_mut().insert(ty, code.clone());
+        reference.tys.borrow_mut().insert(ty, code.copied());
         code
     }
 
@@ -635,7 +668,17 @@ impl<'db> Cx<'db> {
 
     /// What the item's dependents see of it.
     pub(crate) fn interface(&self, id: ItemId) -> Sub {
-        let mut form = Form::new("interface");
+        self.item_form("interface", id)
+    }
+
+    /// The interface without what bodies leak into it; asked of a [`Cx::leak_free`].
+    pub(crate) fn signature(&self, id: ItemId) -> Sub {
+        debug_assert!(self.leak_free, "a signature form is written by a leak-free `Cx`");
+        self.item_form("signature", id)
+    }
+
+    fn item_form(&self, tag: &str, id: ItemId) -> Sub {
+        let mut form = Form::new(tag);
         let f = &mut form;
         match id {
             ItemId::Function(it) => {
@@ -732,6 +775,39 @@ impl<'db> Cx<'db> {
         self.auto_traits_form(owner, index).sub()
     }
 
+    /// The hidden type of each `impl Trait` of a function's return type or of a type alias, in
+    /// order, `0` for one its defining bodies gave none: what `rpit_hidden_types` and
+    /// `tait_hidden_types` give. Asked of a [`Cx::leak_free`], so that writing it infers no
+    /// body but the defining ones.
+    pub(crate) fn hidden_types(&self, owner: ItemId) -> Sub {
+        debug_assert!(self.leak_free, "hidden types are written by a leak-free `Cx`");
+        let db = self.db;
+        let count = match owner {
+            ItemId::Function(it) => SelfAndAssocBounds::return_type_impl_traits(db, it).len(),
+            ItemId::Alias(it) => SelfAndAssocBounds::type_alias_opaque_count(db, it),
+            ItemId::Adt(_)
+            | ItemId::Trait(_)
+            | ItemId::Impl(_)
+            | ItemId::Const(_)
+            | ItemId::Static(_)
+            | ItemId::Macro(_) => {
+                panic!("blaze-items: hidden types asked of {owner:?}, which has no opaque types")
+            }
+        };
+        let mut f = Form::new("hidden types");
+        f.len(count);
+        for index in 0..count as u32 {
+            match self.hidden(owner, index) {
+                Some(hidden) => {
+                    f.u8(1);
+                    self.ty_in(&mut f, hidden);
+                }
+                None => f.u8(0),
+            }
+        }
+        f.sub()
+    }
+
     fn auto_traits_form(&self, owner: ItemId, index: u32) -> Form {
         let db = self.db;
         let def = match owner {
@@ -807,7 +883,11 @@ impl<'db> Cx<'db> {
         {
             return code;
         }
-        let code = ty_form(self.db, ty.store());
+        let code = if self.leak_free {
+            signature_ty_form(self.db, ty.store())
+        } else {
+            ty_form(self.db, ty.store())
+        };
         entry.set(Some((ty, code)));
         code
     }
@@ -851,8 +931,12 @@ impl<'db> Cx<'db> {
         self.linked_name(f, linked, data.name.as_str());
         // A `const fn`'s body is what its callers' constants evaluate.
         if data.flags.contains(FnFlags::CONST) && data.has_body() {
-            f.u8(1);
-            self.nest(f, self.code_form(InferBodyId::DefWithBodyId(func.into())));
+            if self.leak_free {
+                f.u8(LEAK);
+            } else {
+                f.u8(1);
+                self.nest(f, self.code_form(InferBodyId::DefWithBodyId(func.into())));
+            }
         } else {
             f.u8(0);
         }
@@ -911,7 +995,9 @@ impl<'db> Cx<'db> {
                     self.attrs(f, variant.into());
                     self.fields(f, variant.into());
                     // An explicit discriminant is a body; a variant without one has none.
-                    if explicit {
+                    if explicit && self.leak_free {
+                        f.u8(LEAK);
+                    } else if explicit {
                         f.u8(1);
                         self.code_in(f, InferBodyId::DefWithBodyId(variant.into()));
                     } else {
@@ -1004,7 +1090,9 @@ impl<'db> Cx<'db> {
         f.u64(u64::from(data.flags.bits()));
         self.attrs(f, it.into());
         // A constant's value is what its users see: it is in their code.
-        if data.has_body() {
+        if data.has_body() && self.leak_free {
+            f.u8(LEAK);
+        } else if data.has_body() {
             f.u8(1);
             self.nest(f, self.code_form(InferBodyId::DefWithBodyId(it.into())));
         } else {
@@ -1025,8 +1113,11 @@ impl<'db> Cx<'db> {
             || matches!(loc.container, ItemContainerId::ExternBlockId(_));
         self.linked_name(f, linked, data.name.as_str());
         // What an immutable static holds is read where it is used.
-        if !data.flags.contains(StaticFlags::MUTABLE) && data.flags.contains(StaticFlags::HAS_BODY)
-        {
+        let holds = !data.flags.contains(StaticFlags::MUTABLE)
+            && data.flags.contains(StaticFlags::HAS_BODY);
+        if holds && self.leak_free {
+            f.u8(LEAK);
+        } else if holds {
             f.u8(1);
             self.nest(f, self.code_form(InferBodyId::DefWithBodyId(it.into())));
         } else {
@@ -1063,6 +1154,9 @@ impl<'db> Cx<'db> {
     /// see through to the auto traits it implements and its layout.
     fn opaque(&self, f: &mut Form, owner: ItemId, index: u32, opaque: InternedOpaqueTyId<'db>) {
         self.clauses(f, opaque.predicates(self.db).skip_binder().iter().copied());
+        if self.leak_free {
+            return f.u8(LEAK);
+        }
         match self.hidden(owner, index) {
             Some(hidden) => {
                 self.ty_in(f, hidden);
@@ -1416,21 +1510,21 @@ impl<'db> Cx<'db> {
                 f.u8(17);
                 let loc = id.0.loc(db);
                 self.closure_at(f, loc);
-                self.nest(f, self.captures_of(loc));
+                self.captures_in(f, loc);
                 self.args(f, args);
             }
             TyKind::CoroutineClosure(id, args) => {
                 f.u8(18);
                 let loc = id.0.loc(db);
                 self.closure_at(f, loc);
-                self.nest(f, self.captures_of(loc));
+                self.captures_in(f, loc);
                 self.args(f, args);
             }
             TyKind::Coroutine(id, args) => {
                 f.u8(19);
                 let loc = id.0.loc(db);
                 self.closure_at(f, loc);
-                self.nest(f, self.captures_of(loc));
+                self.captures_in(f, loc);
                 self.args(f, args);
                 self.held(f, id.0, args);
             }
@@ -1617,6 +1711,15 @@ impl<'db> Cx<'db> {
         }
     }
 
+    /// A closure's captures written into `f`, or [`LEAK`] in a signature form.
+    fn captures_in(&self, f: &mut Form, loc: InternedClosure<'db>) {
+        if self.leak_free {
+            f.u8(LEAK);
+        } else {
+            self.nest(f, self.captures_of(loc));
+        }
+    }
+
     fn captures_of(&self, loc: InternedClosure<'db>) -> Form {
         let mut form = Form::new("captures");
         let f = &mut form;
@@ -1684,6 +1787,9 @@ impl<'db> Cx<'db> {
     /// What a coroutine keeps across its yields, which its layout is of: the types of the
     /// locals held, which of them each yield keeps, and which may not share storage.
     fn held(&self, f: &mut Form, coroutine: InternedCoroutineId<'db>, args: GenericArgs<'db>) {
+        if self.leak_free {
+            return f.u8(LEAK);
+        }
         let db = self.db;
         let by_move = is_by_move_coroutine(db, coroutine, args.as_coroutine());
         f.bool(by_move);
@@ -1740,7 +1846,7 @@ impl<'db> Cx<'db> {
             }
             RegionKind::ReLateParam(param) => {
                 f.u8(2);
-                bound_region(f, param.bound_region);
+                bound_region(f, param.kind);
             }
             RegionKind::ReStatic => f.u8(3),
             RegionKind::ReVar(it) => {
@@ -2111,7 +2217,7 @@ impl<'db> Cx<'db> {
             }
             ClauseKind::UnstableFeature(feature) => {
                 f.u8(8);
-                f.str(feature.as_str());
+                f.str(feature.0.as_str());
             }
         }
     }

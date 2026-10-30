@@ -13,7 +13,7 @@ use either::Either;
 use hir::{Adt, BindingOrigin, ModuleDef, PathResolution, StructKind};
 use syntax::{
     TextRange,
-    view::{self as ast, AstNode as _},
+    view::{self as ast, AstNode as _, HasArgList as _},
 };
 
 use super::missing_match_arms::{DefinedHere, adt_fact, all_chars, const_like_binding, joined, plural};

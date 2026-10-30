@@ -19,13 +19,10 @@ pub(crate) fn stage_frame() -> Result<Frame, MemError> {
     Frame::with_reserve(STAGE_RESERVE, Tag::Link)
 }
 
-/// `items` collected into the frame: `bumpalo`'s `Vec::from_iter_in`.
+/// `items` collected into the frame: [`blaze_mem::frame::collect`], the frame last.
 #[inline]
 pub(crate) fn collect_in<'f, T>(items: impl IntoIterator<Item = T>, frame: &'f Frame) -> FrameVec<'f, T> {
-    let items = items.into_iter();
-    let mut out = Vec::with_capacity_in(items.size_hint().0, frame);
-    out.extend(items);
-    out
+    blaze_mem::frame::collect(frame, items)
 }
 
 #[cfg(test)]

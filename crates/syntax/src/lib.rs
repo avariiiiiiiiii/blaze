@@ -48,6 +48,7 @@ pub mod ast;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod hacks;
+pub mod image;
 pub mod syntax_editor;
 pub mod utils;
 pub mod view;
@@ -72,8 +73,8 @@ pub use parser::{Edition, LexedStr, SyntaxKind, T};
 pub use rustc_literal_escaper as unescape;
 pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 pub use syntax_tree::{
-    Direction, Expand, FlatTree, FlatTreeBuilder, NodeOrToken, SyntaxText, Text, TextRange,
-    TextSize, TokenAtOffset, WalkEvent, api::Preorder,
+    Direction, Expand, FlatTree, FlatTreeBuilder, IMAGE_LAYOUT, NodeOrToken, SyntaxText, Text,
+    TextRange, TextSize, TokenAtOffset, WalkEvent, api::Preorder,
 };
 
 /// `Parse` is the result of the parsing: a syntax tree and a collection of
@@ -274,8 +275,12 @@ impl<T: AstNode> Parse<T> {
 impl Parse<SyntaxNode> {
     pub fn cast<N: AstNode>(mut self) -> Option<Parse<N>> {
         if N::cast(self.syntax_node()).is_some() {
-            let Parse { tree, errors, outline, .. } = self.take();
-            Some(Parse { tree, errors, outline, _ty: PhantomData })
+            Some(Parse {
+                tree: self.tree.take(),
+                errors: self.errors.take(),
+                outline: self.outline,
+                _ty: PhantomData,
+            })
         } else {
             None
         }

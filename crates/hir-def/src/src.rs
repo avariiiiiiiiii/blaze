@@ -63,17 +63,7 @@ pub trait HasChildSourceView<ChildId> {
     ) -> InFile<Option<Self::Value<'db>>>;
 }
 
-/// Maps a `UseTree` contained in this import back to its AST node.
-pub fn use_tree_to_ast(
-    db: &Db,
-    use_ast_id: AstId<ast::Use>,
-    index: Idx<ast::UseTree>,
-) -> ast::UseTree {
-    let root = use_ast_id.file_id.parse_or_expand(db);
-    AstPtr::<ast::UseTree>::of(use_tree_to_view(db, use_ast_id, index)).to_node(&root)
-}
-
-/// [`use_tree_to_ast`] as a view of the database's tree: the same node.
+/// Maps a `UseTree` contained in this import back to its node, a view of the database's tree.
 pub fn use_tree_to_view<'db>(
     db: &'db Db,
     use_ast_id: AstId<ast::Use>,
@@ -251,7 +241,7 @@ fn variant_kind_view(db: &Db, variant: VariantId) -> (InFile<view::StructKind<'_
 }
 
 /// The fields of `variant` its crate's cfg keeps, in order: what the `LocalFieldId`s count.
-fn enabled_fields_view(
+pub fn enabled_fields_view(
     db: &Db,
     variant: VariantId,
 ) -> InFile<impl Iterator<Item = Either<view::TupleField<'_>, view::RecordField<'_>>> + use<'_>> {

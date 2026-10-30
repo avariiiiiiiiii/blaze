@@ -695,6 +695,99 @@ pub(crate) fn normal(path: &Path) -> Option<String> {
     Some(format!("/{}", parts.join("/")))
 }
 
+/// An absolute `/`-separated path without `.`, `..` or empty parts: `/a/b`, or `C:/a/b` with
+/// its drive kept. A `..` at the root stays at the root.
+pub fn normal_text(path: &str) -> String {
+    let (root, rest) = match path.strip_prefix('/') {
+        Some(rest) => ("", rest),
+        None => path.split_once('/').unwrap_or((path, "")),
+    };
+    let mut out = String::with_capacity(path.len() + 1);
+    out.push_str(root);
+    let base = out.len();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                let cut = out[base..].rfind('/').map_or(base, |at| base + at);
+                out.truncate(cut);
+            }
+            part => {
+                out.push('/');
+                out.push_str(part);
+            }
+        }
+    }
+    if out.len() == base {
+        out.push('/');
+    }
+    out
+}
+
+#[cfg(test)]
+mod normal_text_tests {
+    use super::normal_text;
+
+    /// load-cargo's `normalize` of `crates/load-cargo/src/v2/files.rs`, kept to check the one
+    /// that replaced it and blaze-units' `load/source/tree.rs` copy.
+    fn load_cargo(path: &str) -> String {
+        let (root, rest) = match path.strip_prefix('/') {
+            Some(rest) => ("", rest),
+            None => path.split_once('/').unwrap_or((path, "")),
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for part in rest.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                part => parts.push(part),
+            }
+        }
+        format!("{root}/{}", parts.join("/"))
+    }
+
+    /// `load/source/tree.rs`' `normalize`, which took absolute view paths only.
+    fn tree(path: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                part => parts.push(part),
+            }
+        }
+        format!("/{}", parts.join("/"))
+    }
+
+    /// Every path of up to five of these parts: absolute, with a drive, and neither.
+    #[test]
+    fn a_path_is_normal_as_both_old_copies_made_it() {
+        let parts = ["", ".", "..", "a", "bc", "C:"];
+        let mut paths = vec![String::new()];
+        let mut last = vec![String::new()];
+        for _ in 0..5 {
+            last = last.iter().flat_map(|it| parts.iter().map(move |part| format!("{it}/{part}"))).collect();
+            paths.extend(last.iter().cloned());
+        }
+        let more: Vec<String> = paths.iter().map(|it| format!("C:{it}")).chain(paths.iter().map(|it| format!("a{it}"))).collect();
+        paths.extend(more);
+        for path in &paths {
+            let new = normal_text(path);
+            assert_eq!(new, load_cargo(path), "`{path}`");
+            if path.starts_with('/') {
+                assert_eq!(new, tree(path), "`{path}`");
+            }
+        }
+        assert_eq!(normal_text("/a/./b/../c"), "/a/c");
+        assert_eq!(normal_text("C:/a/../.."), "C:/");
+        assert_eq!(normal_text("/"), "/");
+    }
+}
+
 /// [`normal`], borrowing a path that already is normal: the paths blaze-manifest asks for are.
 fn normal_ref(path: &Path) -> Option<Cow<'_, str>> {
     if let Some(text) = path.to_str()

@@ -481,3 +481,46 @@ fn a_status_line_without_a_reason_is_read() {
     let response = read_response(&mut &b"HTTP/1.1 299\r\nContent-Length: 0\r\n\r\n"[..], 1).unwrap();
     assert_eq!(response.status, 299);
 }
+
+/// The server's way in: each read fills the buffer the last `push_vec` left free. A request in
+/// two reads takes both ways through `push_vec` (adopted, then copied), and warm, neither
+/// allocates.
+#[test]
+fn a_warm_read_into_the_spare_allocates_nothing() {
+    let bytes = request("POST", "h", "/api", &[("Content-Type", "application/cbor")], &[1; 64]);
+    let (head, tail) = bytes.split_at(bytes.len() / 2);
+    let mut parser = RequestParser::new(1 << 20);
+    let round = |parser: &mut RequestParser| {
+        for piece in [head, tail] {
+            let mut into = parser.lend_spare();
+            assert!(into.is_empty());
+            into.reserve(READ);
+            into.extend_from_slice(piece);
+            parser.push_vec(into);
+        }
+        let request = parser.next_ref().unwrap().expect("a whole request");
+        (request.path.len(), request.body.len())
+    };
+    for _ in 0..2 {
+        round(&mut parser);
+    }
+    for _ in 0..10 {
+        let read = blaze_alloc_count::assert_at_most(0, "a warm read into the spare", || {
+            round(&mut parser)
+        });
+        assert_eq!(read, (4, 64));
+    }
+}
+
+/// What a broken parser is given is still left free for the next read.
+#[test]
+fn a_broken_parser_still_lends_its_spare() {
+    let mut parser = RequestParser::new(1 << 20);
+    parser.push(b"GET / HTTP/1.1\r\nContent-Length: x\r\n\r\n");
+    assert!(parser.next_ref().is_err());
+    let mut into = Vec::with_capacity(READ);
+    into.extend_from_slice(b"more");
+    parser.push_vec(into);
+    let spare = parser.lend_spare();
+    assert!(spare.is_empty() && spare.capacity() >= READ);
+}

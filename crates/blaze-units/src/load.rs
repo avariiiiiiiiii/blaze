@@ -41,6 +41,7 @@ use crate::query::{
 use crate::{Filter, Intent};
 
 pub use self::files::Snap;
+pub use self::files::normal_text;
 pub use crate::Read;
 pub use self::view::{ResolveAsk, Resolving, ViewResolved, platform_cfg, resolve_view};
 
@@ -177,7 +178,7 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         let (name, value) = flag.split_once('=').unwrap_or((flag.as_str(), ""));
         let list = || value.split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect::<Vec<_>>();
         match name {
-            "unstable-options" | "bindeps" => {}
+            "unstable-options" | "bindeps" | "codegen-backend" => {}
             "build-std" => build_std = Some(list()),
             "build-std-features" => build_std_features = Some(list()),
             _ => return Err(error(&format!("blaze does not read `-Z {name}` yet"))),

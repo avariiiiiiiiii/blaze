@@ -7,16 +7,150 @@ date: 2026-10-29
 
 The bar is "Within 10% of the theoretical maximum, everywhere" in
 [principles.md](../../goals/principles.md). Each component of lane format has a section here,
-written by the agent that owns it. Unless a section says otherwise, figures are for one core of
-the target machines (EPYC Turin, Graviton 5), from [hardware.md](../../design/hardware.md):
-- about 3.5 GHz, so figures in ns use 3.5 GHz;
-- an L1 hit in 4 to 5 cycles and L2 in about 14;
-- streaming reads from L2 at about 32 bytes a cycle, and from DRAM at about 20 to 30 GB/s;
-- about 2 instructions per cycle for branchy pointer code and about 4 for straight-line
-  integer code.
+written by the agent that owns it.
+
+## The machine
+
+The target machines are in [hardware.md](../../design/hardware.md): EPYC Turin, Graviton 5 and
+Apple M-series. Unless a section says otherwise, the figures are these, for one core, not yet
+measured:
+
+| what | figure |
+|---|---|
+| clock | 3.5 GHz (figures in ns use it) |
+| L1 hit, L2 hit | 4 to 5 cycles, about 14 |
+| L1 read, streaming | 64 B a cycle |
+| L2 read, streaming | 32 B a cycle (about 110 GB/s) |
+| one core from DRAM, streaming | about 25 GB/s |
+| IPC | about 2 instructions a cycle for branchy pointer code, about 4 for straight-line integer code |
+| vector ALU ports | 2 of 512 bits (Turin's Zen 5), 4 of 128 bits (Graviton 5's NEON) |
+| `crc32q` | 3 cycles latency, 1 a cycle |
+| BLAKE3, many inputs in lanes | about 26 cycles a block an input with AVX-512 (16 lanes) |
 
 None of this has been measured yet: nothing compiles until every lane is done. `proof`'s budgets
 measure each bound once it does.
+
+## Content IDs: `crates/blaze-ids` (speed-sol2-format)
+
+The BLAKE3 backends themselves (the fork's `hash_many`, the official crate) and their bounds are
+[blake3-servil's speed of light](../blake3-servil/speed-of-light.md). This section covers what
+blaze-ids builds around them. Estimates are ±50%, by counting instructions.
+
+### `ContentId::of` and `Hasher` over one block
+
+Work: find the domain's context key, then one compression of at most 64 bytes.
+- **The compression** is 7 rounds, each two half-rounds of 4 `G` in one register, and each half
+  is 8 dependent add, xor and rotate steps plus the diagonal shuffles. That is about 7 × 2 × 14 ≈
+  200 cycles on its dependency chain, with nothing beside it to overlap. **Bound: about 210
+  cycles (60 ns)** counting the input's load and the key.
+- **Before (speed-sol2-format, from the code):** the key table hashed the domain's text with FNV,
+  one dependent multiply a byte. Domains are 20 to 40 bytes, so that is 70 to 130 cycles before
+  the compression starts, **1.3× to 1.6× the bound**.
+- **Now:** the table is keyed by the domain's address and length (`home` in `lib.rs`): one
+  multiply, a shift, one load and a pointer compare, about 10 cycles, so **1.05×, within 10%**.
+  A slot compares by address and then by text, so one domain's text at two addresses takes two
+  slots with the same key. The model test `model_colliding_domains_keep_their_own_keys` covers
+  it.
+- **The `Hasher`** of the fork keeps its 16 KiB stage uninitialised (`MaybeUninit`), so
+  `Hasher::new` writes about 100 bytes, not 16 KiB. The official backend's `Hasher` is 1.9 KiB,
+  but it serves only the secondary targets.
+
+`proof` measures cycles a call to `ContentId::of` of 32 bytes in a known domain, and a cold
+first use of a domain.
+
+### `ContentId::of_many`: many short inputs (item hashes)
+
+Work: for each input, \(\lceil len/64 \rceil\) compressions, the reads of its bytes and a 32-byte
+store. Inputs are mostly under a chunk: item and key hashes of 8 to 200 bytes.
+- **Bound on Turin:** 16 lanes in a 512-bit register. Each compression is about 26 cycles a block
+  an input on the two vector ports, and a message transpose adds `log2(16)` × 16 / 2 = 32
+  interleaves of two shuffles over 16 inputs, about 4 cycles an input. Reading the block and
+  writing the ID are a few cycles more. **About 33 cycles a block an input, 9.5 ns.** On
+  Graviton 5 the lanes are 4 a register, and the bound is blake3-servil's.
+- **Before (from the code):** whole blocks went to the fork's `hash_many`, at 16 lanes with
+  AVX-512 on the servil targets. But every last block (the only block of a short input) went to
+  `compress_lanes::<8>` at the baseline features, SSE2 on x86-64: two registers a word and a
+  rotate in 3 instructions, about 100 cycles a block an input. Its message was scattered word by
+  word into the transposed array, and each block was copied into a zeroed stack block through a
+  `memcpy` call. Together that was **about 4× the bound** for inputs of one block.
+- **Now:**
+  - `last_blocks` dispatches on the CPU to 16 lanes with AVX-512 and 8 with AVX2, through
+    `#[target_feature]` wrappers.
+  - Group 0 starts from a splat of the key, not a transposed copy of it.
+  - Messages are transposed in registers (`columns`, `transpose`: `std::simd` interleaves), and
+    so are the outputs (`rows_of`).
+  - A last block is read 8 bytes at a time, ending on an overlapping read (`padded_words`).
+  
+  The estimate is about 40 cycles a block an input, **1.2×**. The rest is the variable-length
+  read, a load a word plus a branch on the length. A masked load (`vmovdqu8` with a length mask)
+  reads it in one instruction, but that needs an intrinsic and so `unsafe`, which
+  [unsafe.md](../../design/unsafe.md) allows only for a measured gain. `proof` measures it first.
+- **Tests** (`many/tests.rs`): register transposes in both directions against scalar ones at
+  widths 16, 8, 4 and 1. The word read against a zero-padded copy at every length and offset.
+  Every width and path (8, 16, dispatched, AVX-512, AVX2) alike over every group and member
+  count. One lane against `blake3` itself at lengths 0 to 64.
+
+`proof` measures cycles an input for `of_many` over 10⁵ inputs of 32, 64, 65 and 200 bytes, on
+Turin and on Graviton 5.
+
+### `crc32c` and `bits`
+
+- **`crc32c`** runs three interleaved `crc32q` streams (`crc32x` on ARMv8) and joins them with
+  a GF(2) shift by table, 32 lookups a block (`combine`). It is 24 bytes each 3 cycles, about 8 B a cycle (28 GB/s), at the instruction's bound and at
+  one core's DRAM stream. Within 10%.
+- **`bits`** is word loops over `u64` that LLVM vectorizes: popcount, and/or/xor of bit sets. It
+  is at L1 or L2 bandwidth. Within 10%.
+
+## Records, columns and tiers: `crates/blaze-format` (speed-sol2-format)
+
+\(S\) is a buffer's bytes and \(r\) the number of records and references (`Rel`, `Slice`) in it.
+
+### `open`, `get` and following a reference
+
+Work: `open` must check every byte it will hand out: alignment, bounds, enum tags, `bool`s,
+`char`s. That is a pass over the buffer, about \(r\) bounds checks and one tag check a narrow
+field, **bound about \(S / 32\) cycles plus 3 a reference**. After that a `get` or a `follow`
+needs only its own bounds check, **O(1), a few cycles**.
+- **Before (from the code):** `open` checked everything deeply, and so did every `follow`:
+  `raw::view` called `T::check`, which follows every reference reachable from the target. Reading
+  each reference of a tree of depth \(d\) once cost about \(d × S\), not \(S\). A `Slice<Node>` of
+  50 nodes, each with two references, re-checked all 100 leaves on `get` and again on each
+  follow.
+- **Now:** `Record` has `check_shallow` and `SHALLOW_PLAIN`. A follow checks only the target's
+  own bytes and the references in place, not what they point to. `open` stays deep, so every
+  reachable byte has been checked once before the first `get`. A record of plain fields and
+  references is `SHALLOW_PLAIN`, and a follow of it is a bounds and alignment check only.
+  **Within 10%.** The test `a_get_after_open_checks_only_what_it_reaches_directly` counts the
+  checks: 200 on `open`, 0 on `get`, and 200 to follow every reference once.
+
+`proof` measures `open` in bytes a cycle on a 1 MiB item-tree buffer, and `follow` in cycles.
+
+### The writer and `bytes_of_slice`
+
+`Writer::push`, `push_slice` and `push_rel` append to one `Vec<u8>` at its alignment, a store a
+word. `bytes_of_slice` (added for queue 00127) gives a slice of records as bytes in place, so
+hir-ty's column hashing takes no copy. The writer is at the store bound. Within 10%.
+
+### Tiers (`tiers.rs`, `tiers/buffer.rs`)
+
+- **Hot** columns are kept at the narrowest width that fits their values. A read is one load at
+  a known offset. At the bound.
+- **Warm** is SIMD-BP128 with frame of reference: 128 values a block, unpacked by shifts in
+  vector registers, about 1 to 2 cycles for 4 values. That is near the L1 stream bound and
+  within 10%.
+- **Cold** chooses runs, deltas or a dictionary by exact size, then zstd level 9 with a
+  per-kind dictionary. zstd's decode, about 1 to 1.5 GB/s, is all of the time. The column codec
+  sorts once with `blaze_ids::radix::sort`. The dictionary decode collected into a `Vec` of
+  unknown size through `Result`, which grew it about log₂ n times. It now fills one of
+  exact capacity (speed-sol2-format). Within 10% of zstd's own bound.
+
+### `leb` and `cursor`
+
+- **`leb`** decodes a one-byte value at once. A longer one is a single 8-byte load, finds the
+  stop bit with `trailing_zeros` and compacts the 7-bit groups. That is about 6 instructions
+  for values of up to 8 bytes, against a bound of a load and a compact. Within 10%.
+- **`cursor::Reader`** is one length compare and one load a read, with the error paths
+  `#[cold]`. That is its bound ([dedup's cursor.md](../dedup/cursor.md)).
 
 ## The HIR expression store: `hir-def` `hir/`, `expr_store/` (speed-hir-store)
 
@@ -49,6 +183,10 @@ Work: walk the body's syntax once and write one row per HIR node.
      10 instructions (a refcount, a parent pointer), it is the largest term. The fix is to
      lower from `(FlatTree, element index)` directly, with typed views over indices.
      Owners: speed-syntax (the views) and this lane (lowering).
+     **Corrected (speed-sol2-format, 2026-10-30): done.** `lower.rs` takes `ast::Expr<'_>` and
+     the other `ast` types as views, `Copy` over the flat tree and an element index, with no
+     refcount (frontend-tree's move). A step costs the view's child search, about 10 to 20
+     instructions, the bound's "find its children" term.
   2. `check_cfg` runs for every expression, statement, field and parameter. Since 2026-10-29
      it is one test when there is no attribute (`lower.rs` `may_have_attrs`: is the first child
      node an attribute? The grammar puts every `AnyAttr*` first). Before, it walked every
@@ -56,6 +194,11 @@ Work: walk the body's syntax once and write one row per HIR node.
   3. Interning a name hashes the token text again. The lexer could carry each identifier's
      hash, or a per-thread front cache could answer repeated names in a body without touching
      the shared table. Owner: the interner (format).
+     **Still so (speed-sol2-format, 2026-10-30).** `AsName` (`hir-expand/src/name.rs`) calls
+     `Name::new_root(text)`, which hashes again: about 6 instructions a word, small beside
+     the probe. The probe of a name that isn't compiled in is about 1.9× its bound (the
+     interner's section, "Interning a symbol"; queue 00934), so about 8 of the node's 40 are
+     about 16.
 
   Once it compiles, the first step is `proof` measuring cycles per HIR node on the corpus.
   Anything above 22 cycles a node is a bug against this bound.
@@ -128,11 +271,13 @@ Work: walk the body's syntax once and write one row per HIR node.
     over a large anchor, so about **70 µs** for the same file. A single-function anchor under
     1 KiB gains little (one chunk, about 1.5 cycles a byte).
   - Signatures hash their trees the same way, filed in `v2/requests/speed-hir.md`.
-- **What stands in the way:** every unchanged anchor is still hashed on every edit. The parse
-  could carry each node's subtree hash, computed bottom-up while the tree is built and kept for
-  unchanged subtrees by an incremental reparse. Then `tree_hash` is one load per anchor, and an
-  edit's cost is the reparse plus one body. Owner: speed-syntax (the flat tree), filed in
-  `v2/requests/format.md`. Until then an edit is \(O(|F|)\) and over its bound for large files.
+- **Carried hashes:** `FlatTree::subtree_hash` keeps the hash of every node that costs 4 KiB
+  or more to hash, made the first time it is asked for, and an incremental reparse carries it
+  for the subtrees the edit does not change. So an unchanged anchor's `tree_hash` (`body.rs`)
+  is one load (a popcount rank and a slot), and an edit costs the reparse plus hashing the
+  anchors it changed, each once. They are made when asked, not while the tree is built: a
+  parent's BLAKE3 pass is not made of its children's, so building them bottom-up would rehash
+  every ancestor of an edit up to the root, the whole file, on every edit.
 - **Source maps** are built only when something reads them. An IDE body read with its map is
   lowered twice, once by `Body::of` and once with the map. That is IDE-only, and within 2× of
   the bound for that body.
@@ -198,7 +343,19 @@ so 4.25 bytes a token. That is data.md's budget, and the parser reads it in this
     The rustc tree's 120 MB of `.rs` would take about 0.42 s on one core, and 4.4 ms on 96.
   - Interning identifiers is not the lexer's: it happens later, in lowering.
 
-### Where the design is
+**Corrected (speed-sol2-format, 2026-10-30, from the code).** This count leaves out three
+things the output needs, so it is too low:
+- the special tokens themselves: 8% of tokens at about 35 instructions, 0.8 a byte;
+- the mispredicts on the simple-or-special branch, about 0.2 cycles a byte;
+- the store of each token's start, which the checkpoints read, and the per-block window: about
+  0.3 a byte more than the 0.3 above.
+
+With them it is simd-lexer's count: **2.0 cycles a byte with AVX-512 VBMI**, 2.25 with AVX2 or
+NEON, per kernel in [simd-lexer's speed of light](../simd-lexer/speed-of-light.md#the-bound).
+That is the bound the benchmark `crates/parser/benches/lex.rs` holds the lexer to, and the one
+both docs use. The 1.26 is kept above as the first count.
+
+### Where the design is (2026-10-29; the next section has the code as of 2026-10-30)
 
 The benchmark is simdjson. Stage 1 classifies 64 bytes at a time into bitmaps. Stage 2 walks
 the structural bits with `trailing_zeros` and a cleared lowest bit, so the loop-carried chain
@@ -252,12 +409,61 @@ As of 2026-10-29 the lexer has both stages:
   That is about 13.6 instructions a byte, **about 3.4 cycles a byte, 2.7× the bound**. Each
   term is an estimate good to about ±50%.
 
+### Where the code is, 2026-10-30 (speed-sol2-format)
+
+Items 1 and 2 below are in the code, though this section still listed them as to do:
+- All five kernels and the scalar reference give the special-start bitmap (`classify.rs`,
+  `SPECIAL`), with differential tests per kernel.
+- `scan::simple` walks a block's start bits up to its first special start into a 64-token
+  window and adds the block's checkpoints once.
+- `scan::special` lexes numbers with fractions, exponents and suffixes, chars, escaped strings,
+  raw strings and comments. A test holds it to at least 99% of the special tokens of the
+  parser's sources.
+
+One cost was left in the driver. After each special token, `simple` returned to `lex_rest`,
+which lexed the token, pushed it through `LexedStr::push` and called `simple` again. The new
+call re-derived the block's bits, zeroed a new 64-token window and truncated it, about 45
+instructions on 8% of tokens. Now (speed-sol2-format) a special token that ends in its block
+goes into the open window and the walk goes on. Only one that ends past the block closes the
+window, goes through `LexedStr::push` and continues at the block it ends in. The test
+`special_tokens_lex_alike_at_every_offset_of_a_window` (`differential.rs`) covers it, beside
+the corpus, random and mutated differential tests. It lexes every kind of special token, alone
+and in a row, at each of 130 offsets after four fillers, in every edition, and checks the
+hashed lex's name hashes.
+
+The count from the code, per token:
+- **A simple token, about 15 instructions:** the bit scan, the add and the cleared bit (3), the
+  length (1), the first byte's bounds check and load and its `FIRST` kind (3), the `IDENT`
+  compare (1), pack (2), the window index and the two stores (3), the count (1) and the loop
+  (1).
+- **An identifier, about 20 more:** the length filter, `ident_window`, the `_` test and
+  `strict_by_window` (fix-names' keyword hash).
+- **A special token:** about 35, and 45 more for the 40% or so that end past their block.
+
+That is about 24 instructions a token, or 6.9 a byte. Adding 0.6 a byte for the block and 0.53
+for classification gives 8.0 instructions a byte. **That is about 2.2 cycles a byte on Turin,
+1.1× the bound,** at the 10% line by a count good to ±50%. Before this change it was about 2.3.
+
+What is left, about 3% to 5% each, in order of size:
+1. **The start store a token:** select the checkpoint's token start from the block's bits
+   instead. That is `pdep` and `tzcnt` on BMI2, or a broadword select elsewhere, about 4 a
+   block, and saves 1 instruction a token.
+2. **The first byte's bounds check:** read it from the block's 64 bytes, with a padded copy of
+   the last block, at one check a block, saving 1 a token. `ident_window` is fix-names', so
+   that is the only read this reaches.
+3. **A special token past its block:** keep the window open across the boundary by making it
+   hold the next block too.
+
+`proof` measures before any of them. The benchmark fails above 2.2 cycles a byte with AVX-512,
+which is 10% over the bound.
+
 ### What stands in the way, in the order to remove it once `proof` measures it
 
 The estimate's error is larger than the gap between items, so the first measurement decides
 the order. Anything above 1.4 cycles a byte on Turin (90% of the bound) is a bug against it.
 
-1. **Per-token work that belongs once a block, about 17 instructions a token.** This is
+1. **Done; found in the code by speed-sol2-format, 2026-10-30 (see the section above).**
+   **Per-token work that belongs once a block, about 17 instructions a token.** This is
    `push`'s bookkeeping, the per-token tests and the caller's tests. Fix: the block form
    above. Add the fifth bitmap (special starts) to the three vector kernels and the scalar
    reference, using simdjson's nibble-table lookup. Then, per block, walk the start bits that
@@ -273,8 +479,9 @@ the order. Anything above 1.4 cycles a byte on Turin (90% of the bound) is a bug
    are not building yet (common.md). The kernels must first pass the every-path-against-scalar
    test on AVX-512, AVX2 and NEON hardware, so this lands right after the first build. It is
    not stacked blind on top of the cursor change.
-2. **The tokens still lexed by `rustc_lexer`, about 1% of tokens: about 2.5 instructions a
-   token on average.** Escaped strings are now in `scan` (2026-10-29). Suffixed and floating
+2. **Done; found in the code by speed-sol2-format, 2026-10-30: `scan::number` and
+   `lifetime_or_char`.** **The tokens still lexed by `rustc_lexer`, about 1% of tokens: about
+   2.5 instructions a token on average.** Escaped strings are now in `scan` (2026-10-29). Suffixed and floating
    numbers and chars are what is left. Fix: a scalar scan of the fraction, the exponent and
    the suffix in `scan::special`, and a char's one code point or escape. Owner: format-lexer,
    with the first measurement of the mix.
@@ -448,6 +655,142 @@ The lexer looks up every identifier, about 30% of tokens (format-lexer's section
 - Contextual keywords (up to 15 bytes, looked up only by the parser's callers) keep
   `blaze_phf`.
 
+## Interning a symbol: `crates/intern` (speed-sol2-format)
+
+Counted by instructions from the code on 2026-10-30, ±50%, nothing measured. Layouts and their
+tests are in [speed-span.md](speed-span.md) and
+[speed-unsafe-front-intern.md](speed-unsafe-front-intern.md). The lexer hashes names while their
+bytes are in registers ([simd-lexer, "Hashing names for the interner"](../simd-lexer/speed-of-light.md#hashing-names-for-the-interner-lexedstrnew_hashed)),
+and the bridge passes that hash on (`syntax-bridge` `intern_name`), so "hash given" is the
+usual case. Not mine and left alone: the compiled-in name sets as enums (fix-names) and the
+symbol order keys (fix-orderkeys).
+
+- **The work:** given the hash, find the one entry whose bytes equal the name; on a miss, take
+  an ID and publish the bytes.
+- **The bound:** one probe of one index: a group load, a 7-tag SWAR match, the entry's load and
+  a compare of a short name. That is about 30 instructions and 3 dependent L1 or L2 loads.
+  `name_hash` itself is about 6 a word, when the caller hasn't hashed already.
+- **Today** (`Symbol::intern_hashed`, `Table::intern_hashed`, `arena::Store::find`):
+  - A compiled-in name takes about 28: the perfect hash `symbols::COMPILED` (fold, pilot load,
+    slot load, key compare). Within 10%.
+  - A name made at run time misses the perfect hash first (about 18). In a fresh process it
+    then finds the empty image index (3) and probes the arena (about 35): about 56, **1.9×**.
+  - In a process restored from an image, a name in the image probes the image index (about 40
+    through `get`'s range and liveness checks): about 58, **1.9×**. A name made since the
+    restore misses that index too (about 20) before the arena: about 75, **2.5×**.
+  - A miss inserts under the shard's lock (an uncontended acquire, a bump, a copy, a publish):
+    about 1.3× a lock-free claim. As [speed-span.md](speed-span.md) says, that is worth changing
+    only if `perf c2c` shows shard locks.
+- **The gap:** three structures, each probed in turn: the compiled-in set, then the image's
+  index read in place, then the run-time arena. The image index already holds the compiled-in
+  values (`Table::validate` refuses one without them), so in a restored process the perfect hash
+  in front pays only when most names are compiled in. Nobody has measured that share.
+- **What stands in the way:** `symbol.rs`'s neighbours (`symbols.rs`, `lib.rs`) are being edited
+  as this is written, and choosing an order needs that measurement. Queue 00934 asks for one
+  index answering all three (or a tag per perfect-hash slot, so a miss costs about 10), with a
+  model test against today's three over seeded names, fresh and restored.
+- **What `proof` should measure:** intern hits per second for compiled-in and run-time names,
+  fresh and restored, and the share of each in a real build's interning.
+
+### Reading a symbol's text (`Symbol::as_str`)
+
+- **Bound:** one load of a (pointer, length) by ID, about 5 instructions.
+- **Today:** a compiled-in symbol costs about 5 (a range check, then `TEXTS[id - 1]`), at its
+  bound. A run-time one costs about 20: the table's `OnceLock`, `Table::get`'s three ranges (the
+  compiled-in IDs, the image's, the arena's) and then `Records::get`'s ID column and header.
+  That is **4×**, though it is rarely on a hot path: `cmp_order` compares order keys first and
+  reads text only on a tie. Queue 00934 asks for a text column by ID as well.
+
+## Span maps and ast id maps: `crates/span` (speed-sol2-format)
+
+The layouts are [speed-span-ast.md](speed-span-ast.md)'s, checked against the code on 2026-10-30.
+Queue 00019 is done: every item is in `map.rs`.
+
+- **`SpanMap::span_at_from` and `RealSpanMap::span_for_range_from`** (one per token mapped back,
+  one per token of a macro input). The bound for an in-order walk is a compare with the hint's
+  end and one load of a 20-byte span. Galloping from the caller's hint makes it two compares
+  while tokens stay in one piece or move to the next: within 10%. A random lookup is a
+  branch-free binary search over 4-byte ends, 16 to a line, again within 10% for maps that fit
+  in L1.
+- **Building an expansion's map:** two pushes a token into columns sized once
+  (`with_capacity(parser_input.len())`), at the bound. `merge` is `O(n)` with no sort.
+- **Mapping down:** a binary search of the lazy `by_anchor` permutation and then the run, where
+  the bound is the same search. Within 10% once the permutation is built: `O(n log n)` once a
+  map, and only on the IDE's path.
+- **Ast id maps** (`ast_id.rs`): node to ID and ID to node are one multiply and two lines, the
+  bound for content-derived IDs. Building reads each item's name through an `ast` cursor node,
+  where the bound reads the flat arrays directly: not counted here, because
+  mem-format-expand-next1 holds the file. [speed-span-ast.md](speed-span-ast.md) gives what a
+  direct read would have to reproduce (`Impl::self_ty`, `trait_`, `MacroCall::path`).
+- **`SyntaxContext`:** one salsa interned read, which is db-salsa's.
+
+## Token trees: `crates/tt` (speed-sol2-format)
+
+The layout is [speed-span-tt.md](speed-span-tt.md)'s: 8-byte nodes, 8-byte packed spans,
+canonical tables.
+
+- **Reading:** `TtIter::next` loads a node, dispatches on its two tag bits and loads a span and
+  its part. That is about 15 instructions against a bound of about 12: within the count's error.
+  Skipping a subtree is one add.
+- **Building** (`finish`), per leaf: a node push, a span packed against the last-part cache
+  (one compare, usually a hit) and a push. A punct takes about 25, at its bound.
+  - **An ident or literal** also looks for its symbol among the last 16 (`Symbols::index`). That
+    was an early-exit scan from the newest entry: a repeat close by took about 6, but a symbol
+    new to the window scanned all 16, about 48. The ident took about 70 against a bound of about
+    30, **2.3×** for a tree of mostly new names.
+  - **Now** a full window is one 16-lane `std::simd` compare to a mask, and the highest set bit
+    is the index. That costs about 6 whether the symbol is found or not, so an ident takes about
+    35, within the count's error of its bound.
+  - A window never holds one ID twice, since an ID is added only when the window lacks it, so
+    the mask has at most one bit set and the numbering is exactly the scan's.
+  - Test: `the_symbol_window_numbers_as_its_scan_did`, 40 seeds against the old scan.
+- **A literal's suffix** (queue 00023): it is a `u32` in `Literal` and in the wire encoding. A
+  node holds up to `MAX_SUFFIX`, 2^18 − 1 bytes, so 256 or more is fine. A suffix of 256 KiB or
+  more still stops at `Node::literal`'s assert, which names the limit. The random tree tests now
+  make suffixes of 256 to 555 bytes.
+- **What `proof` should measure:** `finish` per leaf over the bridge's corpus, before and after
+  the window compare.
+
+## Syntax to token trees and back: `crates/syntax-bridge` (speed-sol2-format)
+
+- **Syntax to tree** (`syntax_node_to_token_tree*`), per token: an in-order step of the flat
+  tree (about 10; queue 00021 is done), `span_for` through the hint (about 6), interning an ident
+  with the lexer's hash where the tree kept it, and `tt`'s push (about 25 to 35). That is about
+  70 to 100 a token. The only part over its bound is interning, whose gap is the interner's
+  (queue 00934).
+- **Tree to syntax** (`token_tree_to_syntax_node`), per token:
+  - `to_parser_input` (about 15, with a last-context cache before its map; read in place when
+    the tree keeps its words);
+  - the parse;
+  - `TtTreeSink`: about 15 for text and span-map pushes into columns sized once, plus the tree
+    builder.
+  - The parse and the builder's gaps are the parse driver's and the flat tree's (queue 00927).
+    The bridge's own work is within 10%.
+
+## `macro_rules!`: `crates/mbe` (speed-sol2-format)
+
+The layouts and their differential tests are [speed-span-mbe.md](speed-span-mbe.md)'s.
+
+- **The matcher,** per step and position: the token is decoded once a step; a fork is a 24-byte
+  copy; binding pushes a 20-byte cell. The bound is about the same: rustc's matcher copies 16
+  bytes and bumps an `Rc`. Within 10%.
+- **A fragment** (`expect_fragment`):
+  - The parse reads a window of top-level trees, doubled until the parse provably read nothing
+    past it. That is at most twice the final window, and the first window (8 trees) holds most
+    fragments.
+  - The input words are read in place when the tree keeps them. Otherwise they are copied into
+    the thread's pooled `Input`, which allocates nothing when warm.
+  - The fragment's cost is the parser's (queue 00927).
+- **The transcriber:** a binding is one index into flat columns, and output goes straight into
+  a builder sized for the template. That is `tt`'s push per token, at its bound.
+- **What `proof` should measure:** `benchmark.rs`'s real-world macros, expansion time per output
+  token.
+
+## `const-ast` (speed-sol2-format)
+
+`Tree` borrows four arrays, and a view is two words. A step skips children by their subtree end,
+and nothing is copied per element: at its bound, nothing to change.
+
 ## Syntax validation (`crates/syntax/src/validation.rs`) (format-grammar)
 
 - **Bound:** every node's kind read once, and one dispatch to the check for it, if it has
@@ -460,6 +803,196 @@ The lexer looks up every identifier, about 30% of tokens (format-lexer's section
 - **What stands in the way:** the walk builds a `SyntaxNode` handle for every node, and a
   check casts with a cursor clone. Walking `(FlatTree, index)` directly is speed-syntax's
   typed views (`v2/requests/format.md`).
+- **Corrected (speed-sol2-format, 2026-10-30, from the code):** that is done. `validate` and
+  `validate_outline` walk `view::Node<'_>`, the tree and a number, with no handle a node, so
+  the walk is the step bound of the flat tree's section. `validate_outline` compares a range
+  only for a `BLOCK_EXPR`, after its kind. Within 10%.
+
+## The parse driver: input, events and the sink (speed-sol2-format)
+
+The passes from a file's tokens to the tree builder are `input.rs`, `event.rs`, `output.rs`,
+`shortcuts.rs` and `outline.rs`. \(T\) is every token, trivia included, and \(t\) a non-trivia
+token, as above. Counts are by instruction, ±50%, nothing measured.
+
+### Building the input: `LexedStr::to_input` (`shortcuts.rs`)
+
+Work: for each token, read its word, skip it if it is trivia, and write a 4-byte input word.
+An identifier also needs its contextual keyword.
+- **Bound:** about 6 instructions a token, plus about 15 an identifier with a window probe like
+  the strict keywords'. That is about 10.5 a \(T\).
+- **Before (from the code):** every token paid for `kind(i)` and `token_len(i)` (two index
+  checks and the kind's range assert) and a `&str` slice of its text with its char-boundary
+  checks, about 20 instructions. An identifier added about 50 for `keywords::contextual`'s
+  `blaze_phf` probe. That is about 35 a \(T\), **3.3×**.
+- **Now:** one pass over the token column (`LexedStr::kinds_and_lens`). Only an identifier's
+  text is sliced, and a float's last byte read, so a token is about 12 and the average about
+  27, **2.6×**. Test: `the_input_in_one_pass_is_the_input_token_by_token`, against the
+  token-by-token walk in every edition.
+- **What stands in the way:** the contextual probe is fix-names' (`keywords.rs`; queue
+  **00926**). With a window probe it is about 15 a \(T\), 1.4×. What is left after that is
+  `Input::push`'s capacity check a word, which `with_capacity` makes always predicted.
+
+### Events to `Output`, and `Output` to the sink (`event::process`, `intersperse_trivia_outline`)
+
+Work the output needs: none, beyond writing the tree's words, which is
+[syntax-tree's bound](#the-flat-tree-syntax-tree-speed-sol2-format).
+These are two passes over the parse that exist because the grammar writes preorder events with
+forward parents.
+- **`event::process`** is about 10 instructions an event (the load, the variant's dispatch, the
+  `TOMBSTONE` test and a `Vec::push`), at 3.1 events per \(t\): about 31 per \(t\), 8 cycles
+  at IPC 4.
+- **`intersperse_trivia_outline`** decodes each word (about 6) and steps the builder's state
+  (about 4). For each trivia token it reads its kind and length and slices its text, and it
+  calls the sink once a step. An item also scans its leading trivia for doc comments to attach
+  (`n_attached_trivias`).
+
+Together they make the parse from tokens to tree about **3×** the grammar's bound, beside the
+grammar's own 2.5×. **What stands in the way:** the grammar's postorder rewrite in
+[speed-syntax.md](speed-syntax.md), which writes the builder's words directly and patches
+forward parents in place. It rewrites `grammar/` (about 5,400 lines) and the sinks in `syntax`
+and `syntax-tree`, so `proof` measures first; queue **00927** (lane format). It is not done
+here: the estimate's ±50% is larger than the gap between its designs, and nothing can run.
+
+### Outlines: `TopEntryPoint::parse_outline` and `lazy_block_len` (`outline.rs`, frontend-deps')
+
+An outline parses items in full and skips each `fn` body after one scan of its tokens, for
+balance and the few error recoveries that take a brace. Bodies are most of a dependency
+crate's tokens.
+- **Bound:** a body token's kind tested against the 9 kinds the scan watches. With 16 kinds a
+  vector compare (`std::simd`), that is about 1 instruction a token; scalar it is about 5.
+- **Before (from the code):** every token went through the `match`, with the next token's kind
+  loaded and the attribute flag swapped, about 13 instructions.
+- **Now:** a `WATCHED` table skips a token no arm watches when no attribute is pending, about
+  9. The test `skipping_unwatched_tokens_keeps_every_answer` holds it to the old loop on random
+  sequences from every start.
+- **What stands in the way of the vector scan:** `Tokens` would have to expose its words as a
+  slice. That changes `input.rs`, which frontend-tokens shares, and takes the 16-at-a-time
+  loop's tests. It is next once `proof` shows outline bodies matter, at about 2× the scalar
+  bound now.
+
+### The reparser's parse (`Reparser`)
+
+`Reparser::for_node` and `top_level_item` parse a block's or an item's tokens with the full
+grammar and the same driver, so their cost per token is the sections above. The edit's bound,
+lexing and parsing only the block that changed, is the tree part's
+([syntax-tree and syntax](#reparsing-an-edit-syntaxsrcparsingreparsingrs-speed-sol2-format)).
+
+### `rustc_lexer`'s share
+
+`scan::special` decides at least 99% of the special tokens (its test), so `rustc_lexer` lexes
+about 0.1% of tokens: errors, edition-split forms and non-ASCII outside strings and comments.
+At about 250 instructions each that is about 0.25 a token, about 1% of the lexer. This is
+dispatch by token class: both paths give the same tokens, and the differential tests check it.
+
+## The flat tree: `syntax-tree` (speed-sol2-format)
+
+The layout is in `flat.rs`'s module doc. \(e\) is an element (a node or a token); Rust has a
+little over half tokens and about one element every two bytes. Counts are by instruction,
+±50%, nothing measured.
+
+### Memory per tree
+
+About **6.5 bytes an element**:
+- a word an element;
+- a parent `u32` a node;
+- a node bit and an eighth of a rank `u32`;
+- an eighth of a start;
+- side tables for the rare long or far values.
+
+A tree keeps no copy of the text. That is the budget [tree-store's
+speed of light](../tree-store/speed-of-light.md) and data.md's columns are held to, and the
+least for O(1) kind, parent, sibling and subtree size with arithmetic ranges. Within 10%.
+
+### Building: `FlatTreeBuilder` (`start_node`, `token`, `lazy`, `finish_node`, `finish`)
+
+- **Bound:** a word an element with its fields packed (about 6), a start every eighth, a parent
+  a node, and the node bits made once at `finish` (`node_bits`, a pass at L1 speed). That is
+  about 8 instructions an \(e\).
+- **The code:** about 38 instructions a token.
+  - `FlatTreeBuilder::push`: the mark test, the open parent and the tag `match`.
+  - `token`'s three asserts and its source check (a pointer compare when the text is the
+    source's own slice).
+  - `Packer::start`'s size assert and far-kind test.
+  - `leaf`'s long and far tests, and the `Vec` push.
+
+  A node costs about 45 over `start_node` and `finish_node`: two pushes and two pops, the size
+  and the `keeps` test. **About 4.5× by count.** A warm build allocates nothing beyond the
+  tree's block (the thread's `Buffers`).
+- **What stands in the way:** most of it is the checks that make a tree valid whatever its
+  caller sends, and they are cheap only when merged with the caller's. The builder's caller
+  is the parse's sink, so the fix is the postorder parse of queue **00927**. It writes these
+  words from the grammar, with the open stack and the starts as the grammar's own, so the
+  per-call asserts become one check per production. Tightening `token` alone (one open-stack
+  read for its assert and its parent) saves about 5 of the 38. That waits for 00927's shape.
+
+### A step: kind, parent, siblings, children, range, text (`flat.rs`, `view.rs`, `cursor.rs`)
+
+- **Kind and subtree end** are one load and a mask (plus a cold side-table search for the rare
+  long values).
+- **A token's parent** is a subtraction. A node's is a rank (one load and a popcount) and a
+  load.
+- **First child** is `at + 1` against the end. **Next sibling** is the end against the parent's
+  end.
+- **The range** is a mark and at most 7 lengths for the start, and the same again for a node's
+  end. **The text** is that slice of the shared source.
+
+Each is at its bound for this layout, within 10%:
+- `view::Node<'t>` is the tree and a number, so a step is the arithmetic above.
+- The handle API (`cursor::SyntaxNode`, `SyntaxToken`) adds a non-atomic count, increased on
+  clone and decreased on drop, and one pointer read to its root. That is about 3 instructions a
+  handle, and nothing is allocated.
+- A lazy node's part is parsed once when a cursor first enters it, by whichever thread comes
+  first (`OnceLock`).
+
+The step that is not O(1) is `prev_sibling` and `last_child`: `child_containing` walks up and
+across at once, which takes the fewer of the depth and the children before it.
+
+### `subtree_hash`
+
+- **Bound:** BLAKE3 over the subtree's text and its words, once a subtree, at BLAKE3's rate.
+- **The code:** that. A node over 4 KiB of text and words (`KEEP`) keeps its hash in a slot,
+  and an edit carries the slots of the subtrees it does not change (`kept_spliced`), so a
+  hash after an edit hashes only the changed subtrees. Smaller nodes hash again when asked,
+  at most four chunks, about 2 µs. Within 10%.
+
+### `ast` casts and accessors (`crates/syntax/src/ast`)
+
+A cast is one kind compare. An accessor (`ast::support::child`) walks the node's children to
+the first of a kind, the least without a per-kind index. The views
+(`syntax::view`) are the same walks on `(tree, number)` without a handle, at the step bound
+above.
+
+### Reparsing an edit (`syntax/src/parsing/reparsing.rs`) (speed-sol2-format)
+
+- **Bound:** lex and parse only the smallest piece that parses alone (a token, a body, a block
+  or an item), plus one copy of the tree's arrays with the piece's swapped in. The arrays must
+  be copied because a tree is immutable, at 6.5 bytes an element at memory bandwidth: for a
+  100 KB file about 260 KB, about 2.5 µs from L2.
+  [Frontend's speed of light](../frontend/speed-of-light.md) has the same bound.
+- **The code:** `FlatTree::splice_all` writes the new block in one pass.
+  - The words, node parents and node bits between the splices are copied by range (the parents
+    shifted by the elements added before them).
+  - The side tables are merged in order.
+  - The ancestors' sizes and the far parents a splice moves are patched after.
+
+  Each column is a pass at about memory speed, estimated within 1.5× of one `memcpy` of the
+  tree. Several edits at once (`reparse_all`) make one copy.
+- **A full parse** happens when no piece passes the checks. How often that is on real edits is
+  for `proof` to count: nothing counts it yet. It is the answer the incremental reparse is
+  checked against, not a slower path to the same output.
+- **What stands in the way of O(piece):** a tree in chunks (a rope of blocks), so an edit
+  copies one chunk and a spine. That is a layout change for tree-store's images and every
+  reader of `FlatTree`'s columns, against about 2.5 µs an edit now. It is not worth it until
+  `proof` shows edits of large files bound by the copy.
+
+### Tree blocks on huge pages (queue 00810)
+
+Each tree is one block from the global allocator (`flat/block.rs`), on base pages. A huge-page
+slab (size classes over `blaze_mem::Region::reserve_huge`, blocks returned to it when an edit
+replaces a tree) would cut the TLB misses of walks over many trees. `block.rs` holds tree-store's
+held mode, and tree-store is IN, so the slab waits for it. Queue 00810 stays open for lane
+format, with this note. A walk of one tree is sequential, so it gains little; the gain is for
+analyses that touch thousands of trees, which `proof` measures.
 
 ## The item tree: `hir-def` `item_tree*` (speed-hir-sol-items)
 
@@ -567,9 +1100,11 @@ is only tested for a leading `#!`.
   an item, plus 3 allocations, about 3%. The largest term is in `hir/persist.rs`, which is
   speed-hir-store's: `Words::name` allocates a `Box<str>` key for every distinct name, and both
   `name` and `symbol` look up and then insert, which hashes twice. At about 100 cycles a name
-  that is 50 000 cycles, so **encode is about 5 times its bound**. Filed in
-  `v2/requests/speed-hir-store.md`: one hash per name (the entry API, or a `hashbrown::HashTable`
-  of indexes into `text`) and no allocation per name.
+  that was 50 000 cycles, so encode was about 5 times its bound. Now `Words::name` hashes each
+  name once into a table of indexes into `text` (`by_hash`, with `same_hash` chaining
+  collisions) and allocates nothing a name: about 25 cycles a name, 12 500 cycles, so encode is
+  about 10 000 + 12 500 cycles, **about 2.2× its bound** (by count, sol-all 2026-10-30). The rest is the probe per name; names interned once per tree, kept as `u32`s in
+  the columns, would remove it.
 - **Decode bound:** verify the hash (the store's, 0.6 cycles a byte), check every id (about 1
   cycle a row), copy each column once (0.1 cycles a byte), and intern each distinct name once.
   That is about 1 cycle a byte plus 40 cycles a name, **about 10 µs** for the example.
@@ -579,6 +1114,10 @@ is only tested for a leading `#!`.
   - Off the bound: `kinds` and `macro_calls` are collected into a `Result<Box<[_]>, _>`, whose
     size hint is 0. They grow by doubling and shrink at the end, about \(\log_2 n + 2\)
     allocations each. Edit E collects them at their exact length.
+    **Corrected (speed-sol2-format, 2026-10-30): done, and further.** `decode` takes every
+    column's length first and builds the tree as one block (`ItemTree::try_build`), pushing
+    `kinds` and `macro_calls` into it with their checks. One allocation a tree, not one a
+    column.
   - `Read::seq` (`hir/persist.rs`) has the same doubling for the names, paths, visibilities,
     attributes and `cfg`s. `Code for ModPath` reads its segments into a `Vec` first, one
     allocation per path and per attribute path. Both are filed for speed-hir-store: an
@@ -650,3 +1189,98 @@ lowering above, plus that search. The expansion's parse costs more than its tree
 - **Budgets** (edit D): on a warm builder, lowering a file allocates at most once per non-empty
   column. An attribute with an input allocates its `Box<AttrInput>` too (hir-expand's; shared
   inputs are requested in `v2/requests/db-expand.md`), so the fixture has none.
+- **Corrected (speed-sol2-format, 2026-10-30):** edits A to D are in the code. A: no sort of
+  the attribute owners (`lower.rs`: they are pushed in order). B: `Scoped::seal` pops a table
+  much larger than its entries (`len * 16 < capacity`). C: `AttrBlock`, 16 bytes per 64 items.
+  D: `reading_a_tree_allocates_nothing`, the `Use::expand` budget and the warm-builder budget
+  in `item_tree/tests.rs`. E is in the decode note above. F stays frontend-deps' decision. So
+  the outline lowering is about 160 cycles an item, where the section's "with 1 and 2" puts it.
+  What is left is the cursor scans and attribute setup (its items 3 and 4) and interning (queue
+  00934).
+
+## hir-def: what the two sections above leave out (speed-sol2-format)
+
+Counted from the code on 2026-10-30, ±50%, nothing measured. When I read them, `lower.rs`,
+`path.rs` and `hir/type_ref.rs` had been modified in the last 20 minutes, so I changed nothing in
+them. `hir/persist.rs` is frontend-deps-sigs'. I left `expr_store/persist.rs` alone too, as the
+brief said item-hash-identity was live on it.
+
+### Signatures: generics, where clauses, type refs (`expr_store/lower/generics.rs`, `hir/type_ref.rs`)
+
+- **The work:** one row per generic parameter, bound, where clause and type ref, from the
+  signature's tokens.
+- **The bound:** as for a body's node, about 40 instructions a row, with a name interned for
+  about one row in two.
+- **The layout is at the bound:**
+  - a type ref is a 1-byte kind and a 4-byte data word (`TYPE_REF_BYTES`, 12 a line), plus
+    `extra` for the few kinds of several words;
+  - lists and bounds are CSR columns;
+  - paths are `PathColumns`: kind and data per path, `extra`, and rows of 20 bytes for generic
+    arguments and bindings, all `const`-asserted.
+- **The gap** is the body walk's: a view step a child, and interning. A signature is a few
+  dozen rows, so the fixed costs dominate: one salsa query, `finish`'s allocations (one slab
+  for the `Copy` columns, plus up to 12 boxes for the path columns: the store section's
+  "`finish`"), and hashing the tree (`subtree_hash`, filed in `v2/requests/speed-hir.md`).
+- **What `proof` should measure:** `ExpressionStore` lowering for signatures, per row and per
+  signature, on a crate with many small items.
+
+### Path columns: reading a path
+
+- A path's kind and data word is two loads. A `Normal` path's segments are a `ModPath` by
+  index, and their generic arguments are `slots` into `generic_args` and `args`.
+- **The bound:** two loads and then the rows read, which is what the readers do. At the bound.
+- What `finish` costs per store is in the store section's "`finish`": up to 12 boxes, because
+  lowering reads paths back through the frozen views.
+
+### Source maps (`expr_store/source_map.rs`)
+
+- **Built** only when read (`Body::relative`, `with_source_map`): the body is lowered again
+  with the map, then each table is sorted once at `finish`. No hash map anywhere.
+- **ID to syntax** (`BackMap::get`): a dense row by ID (a `u16` kind and a range of two
+  `u32`s), plus the file, which is one compare when the map has one run (almost every body)
+  and a `partition_point` over run starts otherwise. That is about 8 instructions, at the
+  bound.
+- **Syntax to ID** (`SourceTable::get`): a binary search over `(key, id)` pairs. The bound is
+  the same search over a column of keys alone; the pairs make the search's last steps cross
+  one cache line more. That is about 1.2× by count, within the count's error, and only on the
+  IDE's path. A split into two columns should wait until `proof` shows it matters.
+- **Lowering twice for the map** is the store section's "Source maps": IDE-only, within 2×.
+
+### A memo hit
+
+- `Body::of`, `ExprScopes::of` and `file_item_tree` return their memo's value by reference
+  (`returns(ref)`): no `Arc` count is written and nothing is cloned. Their cost is salsa's lookup
+  through the concrete `&Db`, which is lane db's. Its handle reads are filed as queue 00886.
+
+### An edit: `body_syntax` for every body of the file (queue 00845)
+
+- **The bound:** an edit inside body \(F\) reruns only \(F\)'s queries.
+- **Today:** `body_syntax(G)` reads its file's parse, span map and `AstIdMap`, so any edit
+  reruns it for every body \(G\) of the file. Each run does `def_syntax`, an anchor lookup,
+  two ancestor walks, `covering_element` and the per-anchor maps (built once an anchor and
+  shared). That is a few µs a body, about 1 to 2 ms an edit for a file of 500 bodies. It
+  backdates, so nothing downstream reruns.
+- **What stands in the way:** the fix is a per-file query that gives each item's position-free
+  syntax as a field of a tracked struct per item, as the item tree's per-item keys do
+  (`item_tree/items.rs`). That changes the query graph. `body.rs` was edited 45 minutes before
+  I looked, and the change can't be checked without a build: hir-firewall's
+  `an_edit_of_each_function_reaches_only_it` is its test. Queue 00845 stays open for format.
+
+### Reading persisted HIR (`hir/persist.rs`, frontend-deps-sigs')
+
+- `Read::seq` still collects through a `Result` (`(0..len).map(T::get).collect()`), whose size
+  hint is 0. So names, paths, visibilities, attributes and `cfg`s grow by doubling: about
+  \(\log_2 n + 2\) allocations each, where the bound is one. Every `Box<[T]>`, `Vec`, `ThinVec`
+  and `SmallVec` a persisted value holds is read through it (`Code` impls, `hir/persist.rs`
+  around :740). `len` is read first, but `seq` is generic over `C: FromIterator`, so the fix is
+  a `Vec`-specific path: `Vec::with_capacity(len)` and a push loop, which those four impls use
+  (`into_boxed_slice` at exact capacity doesn't reallocate). Queue 00935, for
+  frontend-deps-sigs, which holds `hir/persist.rs`.
+
+### Queue settled here
+
+- 00020: done. `SyntaxContext::from_u32` is safe, `id` checks the bound, and no `unsafe` is
+  left in the persist files.
+- 00570: done. `ScopeEntry::hygiene` is `pub`.
+- 00131: refused to db. `TraitItems` and `ImplItems` are in `nameres/assoc.rs`, not format's.
+- 00845: open, as above.

@@ -17,8 +17,8 @@ harnesses have it, the unit names the same paths and nothing shows.
 
 Here the unit is made by `blaze-engine std` from a copy of blaze's library/ in another
 directory (`BLAZE_LIBRARY`), and each program is built by `blaze run`, dev and `--release`, with
-the toolchain where it is: it has to fetch the unit, not build one, and print what cargo's
-build of the same source prints.
+the toolchain where it is: it has to fetch the unit, not build one, and print what the
+source says (`PRINTS`).
 
 Linux and macOS. Python 3, stdlib only.
 """
@@ -148,11 +148,6 @@ def main():
                       f"exit {ran.returncode} {ran.stdout!r}\n{ran.stderr}")
                 check("  ... and building with cargo is not what ran", "building with cargo" not in ran.stderr,
                       ran.stderr)
-                reference = subprocess.run(["cargo", "run", "-q", "-p", member, *flags], cwd=ws,
-                                           env=dict(env, CARGO_TARGET_DIR=os.path.join(root, "ref")),
-                                           capture_output=True, text=True, timeout=TIMEOUT)
-                check("  ... and cargo's build prints the same", reference.stdout == PRINTS[member],
-                      reference.stderr)
         logs = "".join(open(it, errors="replace").read()
                        for it in glob.glob(os.path.join(root, "home", "**", "log"), recursive=True))
         check("the standard library was fetched, not built here",

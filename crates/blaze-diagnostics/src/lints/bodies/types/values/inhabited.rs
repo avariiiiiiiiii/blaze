@@ -74,7 +74,7 @@ impl<'s, 'db> Preds<'s, 'db> {
             TyKind::Adt(def, _) if self.applicable_non_exhaustive(def.def_id()) => Pred::True,
             TyKind::Never => Pred::False,
             TyKind::Param(_) => Pred::GenericType(ty),
-            TyKind::Alias(AliasTy { kind, .. }) => match kind {
+            TyKind::Alias(_, AliasTy { kind, .. }) => match kind {
                 AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. } | AliasTyKind::Free { .. } => {
                     Pred::GenericType(ty)
                 }
@@ -266,7 +266,7 @@ impl<'s, 'db> Preds<'s, 'db> {
         let interner = self.interner();
         match pred {
             Pred::ConstIsZero(c) => {
-                let c = EarlyBinder::bind(c).instantiate(interner, args).skip_norm_wip();
+                let c = EarlyBinder::bind(interner, c).instantiate(interner, args).skip_norm_wip();
                 Some(match try_const_usize(self.db, c) {
                     Some(0) => Pred::True,
                     Some(_) => Pred::False,
@@ -274,7 +274,7 @@ impl<'s, 'db> Preds<'s, 'db> {
                 })
             }
             Pred::GenericType(t) => {
-                let t = EarlyBinder::bind(t).instantiate(interner, args).skip_norm_wip();
+                let t = EarlyBinder::bind(interner, t).instantiate(interner, args).skip_norm_wip();
                 Some(self.ty(t))
             }
             Pred::And(pair) => {

@@ -21,6 +21,7 @@ use syntax::{
 };
 
 use super::binary_operator_cannot_be_applied::{adt_def_span, code_fact};
+use stdx::list::Join;
 use crate::{
     cx::Cx,
     lower::{Found, Phase},
@@ -265,7 +266,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
                 // alloc: the error's text, for an error hir found
                 [one] => format!("auto trait {one}"),
                 // alloc: the error's text, for an error hir found
-                _ => format!("auto traits {}", symbol_list(&traits)),
+                _ => format!("auto traits {}", stdx::list::list(traits.iter(), Join::And, false)),
             };
             let mut diag = Diag::error(
                 Some("E0804"),
@@ -489,20 +490,6 @@ fn payload_free(cx: &Cx<'_, '_>, enum_: hir::Enum) -> bool {
 
 fn is_numeric(ty: &hir::Type<'_>) -> bool {
     ty.is_int_or_uint() || ty.is_float()
-}
-
-/// rustc's `DiagSymbolList`, as its English list formatter joins it: `a and b`, `a, b, and c`.
-fn symbol_list(items: &[String]) -> String {
-    match items {
-        // alloc: empty, allocates nothing
-        [] => String::new(),
-        // clone: the error's text, for an error hir found
-        [one] => one.clone(),
-        // alloc: the error's text, for an error hir found
-        [first, second] => format!("{first} and {second}"),
-        // alloc: the error's text, for an error hir found
-        [init @ .., last] => format!("{}, and {last}", init.join(", ")),
-    }
 }
 
 /// The trait `core::{module}::{name}`, as rustc's diagnostic items find it: core is the crate of

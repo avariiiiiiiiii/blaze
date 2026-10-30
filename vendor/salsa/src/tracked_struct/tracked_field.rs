@@ -119,6 +119,15 @@ where
         crate::ingredient::ReadKind::TrackedStruct
     }
 
+    fn closure_class(&self) -> crate::graph::ClosureClass {
+        // Field ingredients follow their struct's: `struct_index.successor(field_index)`.
+        crate::graph::ClosureClass::TrackedField {
+            struct_ingredient: IngredientIndex::new(
+                self.ingredient_index.as_u32() - 1 - self.field_index as u32,
+            ),
+        }
+    }
+
     fn memo_table_types(&self) -> &Arc<MemoTableTypes> {
         unreachable!("tracked field does not allocate pages")
     }

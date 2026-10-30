@@ -382,6 +382,32 @@ fn a_whole_section_is_a_checked_range_of_the_shared_bytes() {
     assert_eq!((failed.section, failed.group), (A, 2));
 }
 
+/// A section as `Bytes`: the checked bytes `whole` gives, 8-aligned, keeping the image alive
+/// after every other handle is gone; a corrupt group refuses them.
+#[test]
+fn whole_bytes_keep_the_image_and_are_the_section() {
+    use blaze_core::Mapping;
+    let contents = contents();
+    let file = build(12, &contents);
+    let image = Arc::new(Image::open(Mapping::copy(&file)).unwrap());
+    let kept: Vec<blaze_bytes::Bytes> = contents
+        .iter()
+        .map(|(id, _)| image.whole_bytes(&image.section(*id, schema_a()).unwrap()).unwrap())
+        .collect();
+    drop(image);
+    for ((_, bytes), kept) in contents.iter().zip(&kept) {
+        assert_eq!(&kept[..], &bytes[..]);
+        assert!(kept.is_empty() || kept.as_ptr().addr().is_multiple_of(8));
+    }
+
+    let mut corrupt = file;
+    let section = open(corrupt.clone()).section(A, schema_a()).unwrap();
+    corrupt[section.at as usize + 4096 + 1] ^= 1;
+    let image = Arc::new(Image::open(Mapping::copy(&corrupt)).unwrap());
+    let failed = image.whole_bytes(&image.section(A, schema_a()).unwrap()).unwrap_err();
+    assert_eq!((failed.section, failed.group), (A, 1));
+}
+
 /// CRCs computed on many workers give the image one core gives, byte for byte.
 #[test]
 fn an_image_finished_on_workers_is_the_serial_one() {

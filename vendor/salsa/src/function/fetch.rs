@@ -33,6 +33,7 @@ where
         let revisions = &memo.header.revisions;
         zalsa_local.report_tracked_read(
             database_key_index,
+            memo.header.node,
             revisions.durability(),
             revisions.changed_at(),
             revisions.value_fingerprint(),
@@ -60,11 +61,13 @@ where
             // Keep the hot and cold probes in distinct control-flow blocks. Using `or_else`
             // here can outline both into one function, making hot hits pay for the cold path's
             // stack frame.
-            if let Some(memo) = self.fetch_hot(zalsa, id, memo_ingredient_index) {
+            if let Some(memo) = self.fetch_hot(zalsa, zalsa_local, id, memo_ingredient_index) {
                 return memo;
             }
 
-            if let Some(memo) = self.fetch_unclaimed(zalsa, db, id, memo_ingredient_index) {
+            if let Some(memo) =
+                self.fetch_unclaimed(zalsa, zalsa_local, db, id, memo_ingredient_index)
+            {
                 return memo;
             }
 
@@ -78,10 +81,11 @@ where
     fn fetch_hot<'db>(
         &'db self,
         zalsa: &'db Zalsa,
+        zalsa_local: &ZalsaLocal,
         id: Id,
         memo_ingredient_index: MemoIngredientIndex,
     ) -> Option<&'db Memo<C>> {
-        let memo = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index)?;
+        let memo = self.get_memo_cached(zalsa, zalsa_local, id, memo_ingredient_index)?;
 
         memo.value.as_ref()?;
 
@@ -112,11 +116,12 @@ where
     fn fetch_unclaimed<'db>(
         &'db self,
         zalsa: &'db Zalsa,
+        zalsa_local: &ZalsaLocal,
         db: &'db C::DbView,
         id: Id,
         memo_ingredient_index: MemoIngredientIndex,
     ) -> Option<&'db Memo<C>> {
-        let memo = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index)?;
+        let memo = self.get_memo_cached(zalsa, zalsa_local, id, memo_ingredient_index)?;
         memo.value.as_ref()?;
         if !memo
             .header

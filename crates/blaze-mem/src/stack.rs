@@ -87,6 +87,76 @@ impl Stack {
         }
     }
 
+    /// Pushes `items` (none on any stack, held by the caller alone) with one compare-and-swap,
+    /// `items[0]` on top.
+    pub(crate) fn push_all(&self, items: &[u32], links: &impl Links) {
+        let Some((&last, _)) = items.split_last() else { return };
+        for pair in items.windows(2) {
+            debug_assert_ne!(pair[0], NONE);
+            links.link(pair[0]).store(pair[1], Ordering::Relaxed);
+        }
+        debug_assert_ne!(last, NONE);
+        let link = links.link(last);
+        let mut head = self.head.load(Ordering::Relaxed);
+        loop {
+            link.store(index(head), Ordering::Relaxed);
+            // Release: as for `push`, for every item of the chain.
+            match self.head.compare_exchange_weak(
+                head,
+                pack(tag(head).wrapping_add(1), items[0]),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(now) => head = now,
+            }
+        }
+    }
+
+    /// Pops up to `out.len()` items from the top with one compare-and-swap, top first, which
+    /// the caller then holds alone. How many it popped.
+    pub(crate) fn pop_some(&self, links: &impl Links, out: &mut [u32]) -> usize {
+        if out.is_empty() {
+            return 0;
+        }
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            let top = index(head);
+            if top == NONE {
+                return 0;
+            }
+            // A link only ever holds `NONE` or an index pushed before, so every one read here
+            // names a live link, stale or not; a stale walk leaves the tag moved, and the
+            // compare-and-swap below fails. `out.len()` bounds a walk through a stale cycle.
+            out[0] = top;
+            let mut taken = 1;
+            let mut next = links.link(top).load(Ordering::Relaxed);
+            while taken < out.len() && next != NONE {
+                out[taken] = next;
+                taken += 1;
+                next = links.link(next).load(Ordering::Relaxed);
+            }
+            match self.head.compare_exchange_weak(
+                head,
+                pack(tag(head).wrapping_add(1), next),
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return taken,
+                Err(now) => head = now,
+            }
+        }
+    }
+
+    /// Empties the stack and returns its top, the rest linked from it through `links` down to
+    /// [`NONE`]: with `&mut`, no other thread pushes or pops, so no compare-and-swap.
+    pub(crate) fn take_all(&mut self) -> u32 {
+        let head = self.head.get_mut();
+        let top = index(*head);
+        *head = pack(tag(*head).wrapping_add(1), NONE);
+        top
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         index(self.head.load(Ordering::Relaxed)) == NONE
     }

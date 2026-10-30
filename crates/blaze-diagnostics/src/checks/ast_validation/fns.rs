@@ -151,7 +151,7 @@ pub(super) fn inputs<'db>(v: &V<'_, '_, 'db>, list: Option<ast::ParamList<'db>>)
     if let Some(it) = list.self_param()
         && v.kept(it.syntax())
     {
-        let start = unattributed_start(it.syntax());
+        let start = ast::written_range(it.syntax()).start();
         let end = it.name().map_or(it.syntax().text_range().end(), |name| name.syntax().text_range().end());
         inputs.push(Input {
             node: InputNode::SelfParam(it),
@@ -167,22 +167,12 @@ pub(super) fn inputs<'db>(v: &V<'_, '_, 'db>, list: Option<ast::ParamList<'db>>)
         let is_self = param_is_self(param);
         let range = match param.pat() {
             Some(pat) if is_self && fn_ptr => pat.syntax().text_range(),
-            _ => TextRange::new(unattributed_start(param.syntax()), param.syntax().text_range().end()),
+            _ => ast::written_range(param.syntax()),
         };
         let variadic = param.dotdotdot_token().is_some();
         inputs.push(Input { node: InputNode::Param(param), range, variadic, is_self });
     }
     inputs
-}
-
-/// Where a node starts once its attributes and doc comments are left out.
-fn unattributed_start(node: ast::Node<'_>) -> TextSize {
-    node.children_with_tokens()
-        .find(|it| match it {
-            NodeOrToken::Node(node) => !matches!(node.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT),
-            NodeOrToken::Token(token) => !token.kind().is_trivia(),
-        })
-        .map_or(node.text_range().start(), |it| it.text_range().start())
 }
 
 /// `Param::is_self` of a parameter that is not blaze's `self` parameter: a closure's `self`

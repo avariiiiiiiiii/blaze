@@ -18,7 +18,7 @@ import os, re, shlex, shutil, statistics, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 sys.path.insert(0, HERE)
-from difftest import Fixture, BLAZE, RUNNER, sysroot_rlibs
+from mixed import Fixture, BLAZE, RUNNER, sysroot_rlibs
 
 UNITS = {"µs": 0.001, "ms": 1, "s": 1000}
 

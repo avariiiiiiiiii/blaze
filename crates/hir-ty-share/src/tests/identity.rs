@@ -8,6 +8,8 @@
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, coroutine_code, interface_hash, item_key, key, layout_hash};
+use hegel::TestCase;
+use hegel::generators as gs;
 use hir_def::{AdtId, CallableDefId, ModuleDefId};
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate, TyDefId,
@@ -20,7 +22,6 @@ use hir_ty::{
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
-use proptest::prelude::*;
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, BoundTyKind, BoundVarIndexKind, ExistentialPredicate, GenericArgKind, InferConst,
@@ -773,42 +774,45 @@ fn is_plain_data_is_the_code_generators() {
 
 /// A type written in the fixture's language: scalars, `P` and `Q` (one `u32` each), and what
 /// references, pointers, arrays, tuples, `W<_>` and function pointers make of them.
-fn ty_text() -> impl Strategy<Value = String> {
-    let leaf = prop::sample::select(vec!["u8", "u32", "i64", "bool", "char", "P", "Q", "()", "&'static str"])
-        .prop_map(str::to_owned);
-    leaf.prop_recursive(3, 24, 2, |inner| {
-        prop_oneof![
-            inner.clone().prop_map(|t| format!("&'static {t}")),
-            inner.clone().prop_map(|t| format!("&'static mut {t}")),
-            inner.clone().prop_map(|t| format!("*const {t}")),
-            (inner.clone(), 0usize..3).prop_map(|(t, n)| format!("[{t}; {n}]")),
-            (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a}, {b})")),
-            inner.clone().prop_map(|t| format!("W<{t}>")),
-            (inner.clone(), inner).prop_map(|(a, b)| format!("fn({a}) -> {b}")),
-        ]
-    })
+/// At most `depth` levels of nesting, half the time stopping at a scalar.
+fn ty_text(tc: &TestCase, depth: u32) -> String {
+    if depth == 0 || !tc.draw(gs::booleans()) {
+        let leaf = ["u8", "u32", "i64", "bool", "char", "P", "Q", "()", "&'static str"];
+        return tc.draw(gs::sampled_from(leaf.to_vec())).to_owned();
+    }
+    let inner = || ty_text(tc, depth - 1);
+    match tc.draw(gs::integers::<u8>().max_value(6)) {
+        0 => format!("&'static {}", inner()),
+        1 => format!("&'static mut {}", inner()),
+        2 => format!("*const {}", inner()),
+        3 => {
+            let t = inner();
+            format!("[{t}; {}]", tc.draw(gs::integers::<usize>().max_value(2)))
+        }
+        4 => format!("({}, {})", inner(), inner()),
+        5 => format!("W<{}>", inner()),
+        _ => format!("fn({}) -> {}", inner(), inner()),
+    }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
-
-    /// Random types, each written twice under two names, agree with both old spellings.
-    #[test]
-    fn random_types_agree_with_both_old_spellings(texts in prop::collection::vec(ty_text(), 1..10)) {
-        let mut program = String::from("pub struct P(pub u32);\npub struct Q(pub u32);\npub struct W<T>(pub T);\n");
-        for (at, text) in texts.iter().enumerate() {
-            program.push_str(&format!("pub type A{at} = {text};\npub type B{at} = {text};\n"));
-        }
-        let db = fixture(&program);
-        hir_ty::attach_db(&db, || {
-            let tys: Vec<Ty<'_>> = (0..texts.len())
-                .flat_map(|at| [format!("A{at}"), format!("B{at}")])
-                .map(|name| db.ty(TyDefId::TypeAliasId(alias(&db, &name))).skip_binder())
-                .collect();
-            all_agree(&db, &tys);
-            for pair in tys.chunks(2) {
-                assert_eq!(identity::ty(&db, pair[0]).ok(), identity::ty(&db, pair[1]).ok());
-            }
-        });
+/// Random types, each written twice under two names, agree with both old spellings.
+#[hegel::test(test_cases = 32)]
+fn random_types_agree_with_both_old_spellings(tc: TestCase) {
+    let len: usize = tc.draw(gs::integers().min_value(1).max_value(9));
+    let texts: Vec<String> = (0..len).map(|_| ty_text(&tc, 3)).collect();
+    let mut program = String::from("pub struct P(pub u32);\npub struct Q(pub u32);\npub struct W<T>(pub T);\n");
+    for (at, text) in texts.iter().enumerate() {
+        program.push_str(&format!("pub type A{at} = {text};\npub type B{at} = {text};\n"));
     }
+    let db = fixture(&program);
+    hir_ty::attach_db(&db, || {
+        let tys: Vec<Ty<'_>> = (0..texts.len())
+            .flat_map(|at| [format!("A{at}"), format!("B{at}")])
+            .map(|name| db.ty(TyDefId::TypeAliasId(alias(&db, &name))).skip_binder())
+            .collect();
+        all_agree(&db, &tys);
+        for pair in tys.chunks(2) {
+            assert_eq!(identity::ty(&db, pair[0]).ok(), identity::ty(&db, pair[1]).ok());
+        }
+    });
 }

@@ -5,7 +5,6 @@ use std::ops::ControlFlow;
 use base_db::{Db, Crate};
 use blaze_mem::Frame;
 use span::{Edition, Span, SyntaxContext};
-use stdx::TupleExt;
 use syntax::{
     ast,
     view::{self, AstNode as _, HasAttrs as _},
@@ -14,7 +13,6 @@ use syntax_bridge::DocCommentDesugarMode;
 
 use crate::{
     AstId, ExpandError, ExpandErrorKind, ExpandResult, HirFileId, Lookup, MacroCallId,
-    MacroCallStyle,
     attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr_view},
     hygiene::{MarkCache, Transparency, apply_mark},
     span_map::InOrder,
@@ -99,27 +97,6 @@ impl DeclarativeMacroExpander {
             s.ctx = marks.get_or_insert_with(s.ctx, |ctx| {
                 apply_mark(db, ctx, call_id.into(), self.transparency, self.edition)
             })
-        }
-    }
-
-    pub fn expand_unhygienic<'f>(
-        &self,
-        db: &Db,
-        frame: &'f Frame,
-        tt: &tt::TopSubtree,
-        call_style: MacroCallStyle,
-        call_site: Span,
-    ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-        match self.mac.err() {
-            Some(_) => ExpandResult::new(
-                tt::TopSubtree::empty_in(tt::DelimSpan { open: call_site, close: call_site }, frame),
-                ExpandError::new(call_site, ExpandErrorKind::MacroDefinition),
-            ),
-            None => self
-                .mac
-                .expand_in(frame, db, tt, |_| (), call_style, call_site)
-                .map(TupleExt::head)
-                .map_err(Into::into),
         }
     }
 }

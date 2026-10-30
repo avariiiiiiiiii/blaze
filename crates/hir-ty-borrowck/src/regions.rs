@@ -527,6 +527,7 @@ pub(super) fn build<'a, 'db>(
         opaque_bounds: Vec::new_in(frame),
         opaque_hidden: None,
         elided_output: None,
+        error_region: false,
         inferred: Default::default(),
         location: None,
         env_aliases: Vec::new_in(frame),
@@ -558,7 +559,28 @@ pub(super) fn build<'a, 'db>(
     }
     // Last, as annotations and turbofishes can name lifetimes the signature does not.
     builder.known_relations();
+    if ctx.closure_local.is_none()
+        && !ctx.inline_const
+        && let GenericDefId::FunctionId(function) = ctx.owner.generic_def(ctx.db)
+    {
+        builder.error_region |= signature_lifetime_error(ctx.db, function);
+    }
+    // rustc's `type_check`: a body that meets an error region has its outlives constraints
+    // and type tests dropped, so the E0106 is the one error, no lifetime error after it.
+    if builder.error_region {
+        builder.regions.outlives = Constraints::new(frame);
+        builder.regions.type_tests.clear();
+    }
     builder.regions
+}
+
+/// Whether the signature of `function` leaves out a lifetime with none to elide to (E0106,
+/// E0637), which rustc resolves to `LifetimeRes::Error` and lowers as an error region.
+fn signature_lifetime_error(db: &Db, function: hir_def::FunctionId) -> bool {
+    db.fn_sig_for_fn_with_diagnostics(function)
+        .diagnostics()
+        .iter()
+        .any(|it| matches!(it, hir_ty::TyLoweringDiagnostic::MissingLifetimes { .. }))
 }
 
 struct Builder<'c, 'a, 'db> {
@@ -597,6 +619,9 @@ struct Builder<'c, 'a, 'db> {
     opaque_hidden: Option<Ty<'db>>,
     /// The region lifetime elision gives the elided lifetimes of the return type.
     elided_output: Option<Region<'db>>,
+    /// The body's signature, or that of a function it calls or names, leaves out a lifetime
+    /// with none to elide to (E0106): an error region in rustc, its `encountered_re_error`.
+    error_region: bool,
     /// rustc's `inferred_outlives_of` the ADTs the body uses.
     inferred: hir_ty_wfcheck::Inferred<'db>,
     location: Option<Location>,
@@ -3796,7 +3821,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                     }),
                 );
                 let args = GenericArgs::new_from_slice(&args);
-                Some(Ty::new_fn_def(self.interner(), def, rustc_type_ir::Binder::dummy(args)))
+                Some(Ty::new_fn_def(self.interner(), def, args))
             }
             _ => None,
         }
@@ -4137,6 +4162,9 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             },
         };
         if let TyKind::FnDef(def, args) = ty.kind() {
+            if let CallableDefId::FunctionId(function) = def.0 {
+                self.error_region |= signature_lifetime_error(self.ctx.db, function);
+            }
             let args = args.no_bound_vars().unwrap();
             let span = operand.span().unwrap_or(span);
             self.callee_predicates(def.0, args, span);
@@ -5288,6 +5316,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                         let mut impl_self = None;
                         let (self_param, keep_static, returns_self, static_self) = match def {
                             CallableDefId::FunctionId(it) => {
+                                self.error_region |= signature_lifetime_error(self.ctx.db, it);
                                 let written = FunctionSignature::of(self.ctx.db, it);
                                 if let ItemContainerId::ImplId(impl_) =
                                     it.lookup(self.ctx.db).container
@@ -7331,6 +7360,9 @@ fn normalize_query(
         }
     })
 }
+
+#[cfg(test)]
+mod error_region_tests;
 
 #[cfg(test)]
 mod tests {

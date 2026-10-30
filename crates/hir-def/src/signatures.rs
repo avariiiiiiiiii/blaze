@@ -557,6 +557,15 @@ pub(crate) fn outline_root(db: &Db, file: EditionedFileId) -> syntax::view::Sour
     syntax::view::root(&file_outline(db, file).tree).expect("an outline's root is a file")
 }
 
+/// The root of `file`'s [`FileOutline`] and the outline's ast id map, whose ids are the file's.
+pub(crate) fn outline_with_ids(
+    db: &Db,
+    file: EditionedFileId,
+) -> (syntax::view::Node<'_>, &AstIdMap) {
+    let outline = file_outline(db, file);
+    (syntax::view::Node::root(&outline.tree), &outline.ast_id_map)
+}
+
 /// The [`SignatureSyntax`] of `def`'s signature, `None` for an item a macro writes.
 #[salsa::tracked(returns(ref), mem_tag = Nameres)]
 pub fn signature_syntax(db: &Db, def: GenericDefId) -> Option<SignatureSyntax> {
@@ -924,7 +933,7 @@ fn has_unsafe_field(fields: Option<ast::FieldList<'_>>, cfg_options: &CfgOptions
 /// Whether a field of a variant of `id` that its crate's cfg keeps is written `unsafe`. It
 /// reads the variants, which the enum's [`signature_syntax`] leaves out, so it is a query of
 /// its own: a variant edit runs it again, and the signature only when the answer changes.
-#[salsa::tracked(mem_tag = Nameres)]
+#[salsa::tracked(returns(copy), mem_tag = Nameres)]
 fn enum_has_unsafe_fields(db: &Db, id: EnumId) -> bool {
     let loc = id.lookup(db);
     let source = match variants_syntax(db, id) {
@@ -963,6 +972,8 @@ bitflags::bitflags! {
         const HAS_BODY = 1 << 1;
         /// Written `default const` (`specialization`).
         const IS_DEFAULT = 1 << 2;
+        /// Written `type const` (`min_generic_const_args`): rustc's `is_type_const`.
+        const TYPE_CONST = 1 << 3;
         const RUSTC_ALLOW_INCOHERENT_IMPL = 1 << 7;
     }
 }
@@ -995,8 +1006,10 @@ impl ConstSignature {
             RUSTC_ALLOW_INCOHERENT_IMPL => RUSTC_ALLOW_INCOHERENT_IMPL,
         });
         flags.set(ConstFlags::HAS_BODY, source.value.body().is_some());
-        let [default] = child_tokens(source.value.syntax(), [T![default]]);
+        let [default, type_const] =
+            child_tokens(source.value.syntax(), [T![default], T![type]]);
         flags.set(ConstFlags::IS_DEFAULT, default);
+        flags.set(ConstFlags::TYPE_CONST, type_const);
 
         let (store, source_map, type_ref) =
             lower_type_ref(db, module, source.map(|it| it.ty()), maps, lowering);
@@ -1008,6 +1021,10 @@ impl ConstSignature {
 impl ConstSignature {
     pub fn has_body(&self) -> bool {
         self.flags.contains(ConstFlags::HAS_BODY)
+    }
+
+    pub fn is_type_const(&self) -> bool {
+        self.flags.contains(ConstFlags::TYPE_CONST)
     }
 }
 
@@ -1712,7 +1729,7 @@ fn lower_fields<'t, Field: ast::HasAttrs<'t> + ast::HasVisibility<'t> + Copy>(
         ExprCollector::with_maps(db, module, fields.file_id, crate::LoweringMode::Analysis, maps);
     col.set_lowering(lowering);
     let override_visibility = override_visibility.map(|vis| {
-        LazyCell::new(|| {
+        LazyCell::new(move || {
             let span_map = match maps {
                 Some((span_map, _)) => SpanMap::RealSpanMap(span_map),
                 None => fields.file_id.span_map(db),
@@ -1818,7 +1835,8 @@ impl EnumVariants {
         blaze_mem::frame::current(|frame| {
             let loc = e.lookup(db);
             // The relative tree's ast ids are the file's: what a variant is interned by.
-            let (source, ast_id_map) = match variants_syntax(db, e) {
+            let syntax = variants_syntax(db, e);
+            let (source, ast_id_map) = match &syntax {
                 Some(syntax) => (syntax.node::<ast::Enum<'_>>(), &syntax.ast_id_map),
                 None => {
                     let source = loc.source_view(db);
@@ -2151,6 +2169,7 @@ trait Pl {}
 struct R { unsafe a: u8, b: u8, pub c: u8 }
 struct Q(pub u8, u8);
 impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; const D: u8 = 0; }
+type const E: u8 = 0;
 "#;
 
     #[test]
@@ -2162,6 +2181,7 @@ impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; co
         let mut seen_trait = [false; 3];
         let mut seen_unsafe_field = false;
         let mut seen_default = [false; 2];
+        let mut seen_type_const = false;
         fn or(seen: &mut [bool], found: &[bool]) {
             seen.iter_mut().zip(found).for_each(|(seen, found)| *seen |= *found)
         }
@@ -2221,9 +2241,14 @@ impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; co
                 assert_eq!(found, scanned, "{it}");
                 seen_unsafe_field |= found;
             } else if let Some(it) = ast::Const::cast(node) {
-                let found = child_tokens(it.syntax(), [T![default]]);
-                assert_eq!(found, [it.default_token().is_some()], "{it}");
+                let found = child_tokens(it.syntax(), [T![default], T![type]]);
+                assert_eq!(
+                    found,
+                    [it.default_token().is_some(), it.type_token().is_some()],
+                    "{it}"
+                );
                 seen_default[0] |= found[0];
+                seen_type_const |= found[1];
             } else if let Some(it) = ast::TypeAlias::cast(node) {
                 let found = child_tokens(it.syntax(), [T![default]]);
                 assert_eq!(found, [it.default_token().is_some()], "{it}");
@@ -2234,6 +2259,7 @@ impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; co
             }
         }
         assert_eq!(seen_default, [true; 2]);
+        assert!(seen_type_const);
         // `gen` is left out: whether `async gen fn` parses is the parser's.
         assert_eq!([seen_fn[0], seen_fn[1], seen_fn[3], seen_fn[4], seen_fn[5]], [true; 5]);
         assert_eq!(seen_static, [true; 3]);

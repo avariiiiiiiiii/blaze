@@ -25,22 +25,20 @@
 //! to 68 bytes of table a value, plus the value. A found value costs one acquire load of the
 //! table pointer, one of the group's control word (almost always the home group's), one pointer
 //! load from the same line and the caller's `Eq`.
+//!
+//! Safe code: the raw memory (the groups read from zeroed pages, the published tables, the
+//! chunks) is [`crate::space`]'s. Values are handed out as `NonNull<u8>`, which only
+//! [`crate::typed`] reads.
 
-use std::{
-    alloc::Layout,
-    ptr::{self, NonNull},
-    sync::OnceLock,
-};
+use std::{alloc::Layout, ptr::NonNull, sync::OnceLock};
 
 use self::lock::{InsertLock, Locked};
 use crate::{
-    space,
+    space::{self, GROUP, Group, Published},
     swiss::{self, Ctrl},
-    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
-/// Slots in a group: tag bytes 0 to 6 of the group's control word; byte 7 stays 0.
-const GROUP: usize = 7;
 const FIRST_GROUPS: usize = 2;
 
 /// Never fewer shards than this, so a small machine still spreads its writers.
@@ -67,7 +65,7 @@ pub(crate) struct Store {
     /// by the holder of `writers[i]` when the table grows. Packed: a pointer changes a few
     /// dozen times in a shard's life, so sharing a line with others' costs readers nearly
     /// nothing, and eight to a line keep the array in cache.
-    tables: Box<[AtomicPtr<Table>]>,
+    tables: Box<[Published<Table>]>,
     writers: Box<[InsertLock]>,
     bits: u32,
 }
@@ -78,21 +76,6 @@ struct State {
     len: usize,
     bump: Bump,
 }
-
-/// Seven slots and their tags in one cache line.
-///
-/// `ctrl` byte `i` (from the least significant) is slot `i`'s tag: 0 when empty, `0x80 | ` the
-/// hash's top seven bits when full. Only the holder of the shard's lock writes, and each slot
-/// once: its `value` first, then its tag into `ctrl` with `Release`. A reader that loads `ctrl`
-/// with `Acquire` and sees the tag sees the pointer and the value's bytes.
-#[repr(C, align(64))]
-struct Group {
-    ctrl: AtomicU64,
-    values: [AtomicPtr<u8>; GROUP],
-}
-
-#[cfg(not(blaze_check))]
-const _: () = assert!(size_of::<Group>() == 64);
 
 /// Region memory in a normal build; a model build keeps boxes, as the model checker's atomics
 /// are not plain words.
@@ -109,12 +92,11 @@ struct Table {
 }
 
 impl Table {
+    /// Read from fresh pages in place: a zero control word is every slot empty.
     #[cfg(not(blaze_check))]
     fn new(groups: usize) -> Table {
         debug_assert!(groups.is_power_of_two());
-        // SAFETY: All-zero bytes are a `Group` (a zero control word, every slot empty, and null
-        // pointers) and an `AtomicU64` of 0.
-        unsafe { Table { groups: space::zeroed(groups), hashes: space::zeroed(groups * GROUP) } }
+        Table { groups: space::zeroed(groups), hashes: space::zeroed(groups * GROUP) }
     }
 
     /// The checker's atomics are not plain words, so a model build makes each one.
@@ -123,7 +105,7 @@ impl Table {
         debug_assert!(groups.is_power_of_two());
         let group = |_| Group {
             ctrl: AtomicU64::new(0),
-            values: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+            values: std::array::from_fn(|_| crate::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
         };
         Table {
             // alloc: a shard's table, once a doubling, over the inserts that filled the last
@@ -172,7 +154,7 @@ pub(crate) enum Entry<'a> {
 }
 
 pub(crate) struct Vacant<'a> {
-    table: &'a AtomicPtr<Table>,
+    table: &'a Published<Table>,
     state: Locked<'a>,
     hash: u64,
 }
@@ -183,7 +165,7 @@ impl Store {
         let shards = 1usize << bits;
         Store {
             // alloc: the shard array, once a store
-            tables: (0..shards).map(|_| AtomicPtr::new(ptr::null_mut())).collect(),
+            tables: (0..shards).map(|_| Published::new()).collect(),
             writers: (0..shards)
                 .map(|_| InsertLock::new(State { len: 0, bump: Bump::new() }))
                 // alloc: as the tables
@@ -207,10 +189,7 @@ impl Store {
         hash: u64,
         matches: impl FnMut(NonNull<u8>) -> bool,
     ) -> Option<NonNull<u8>> {
-        let table = self.tables[self.shard(hash)].load(Ordering::Acquire);
-        // SAFETY: A published table is kept for good, never freed or written but to fill an empty
-        // slot (see `Group`).
-        unsafe { table.as_ref() }?.find(hash, matches)
+        self.tables[self.shard(hash)].load(Ordering::Acquire)?.find(hash, matches)
     }
 
     /// The value with `hash` that `matches`, or the shard locked to insert it. `matches` is
@@ -253,9 +232,9 @@ impl Vacant<'_> {
         at
     }
 
-    /// Publishes `value`, which must be initialized and live, unmoved, for the life of the
-    /// process, as everything [`Store::find`] hands out is.
-    pub(crate) fn publish(mut self, value: NonNull<u8>) {
+    /// Publishes `value`, initialized by `insert` and never moved or freed, as everything
+    /// [`Store::find`] hands out is.
+    fn publish(mut self, value: NonNull<u8>) {
         let table = self.table_for_one_more();
         table.put(self.hash, value.as_ptr(), Ordering::Release);
         self.state.len += 1;
@@ -264,8 +243,6 @@ impl Vacant<'_> {
     /// The table to insert one more value into, at most half full after it.
     fn table_for_one_more(&mut self) -> &'static Table {
         let current = self.table.load(Ordering::Acquire);
-        // SAFETY: As in `Store::find`; tables are never freed, so `'static`.
-        let current: Option<&'static Table> = unsafe { current.as_ref() };
         let capacity = current.map_or(0, Table::capacity);
         if let Some(table) = current
             && (self.state.len + 1) * 2 <= capacity
@@ -292,7 +269,7 @@ impl Vacant<'_> {
         let grown: &'static Table = space::place(grown);
         // Release: a reader that loads the new table sees its slots and, through the lock's
         // order, the values they point to.
-        self.table.store(ptr::from_ref(grown).cast_mut(), Ordering::Release);
+        self.table.store(grown, Ordering::Release);
         grown
     }
 }
@@ -346,23 +323,22 @@ mod lock {
     }
 }
 
-/// A bump allocator over chunks that are never freed or reused.
+/// A bump allocator over chunks that are never freed or reused. It keeps offsets into
+/// [`crate::space`]'s region, whose base is page-aligned, so an offset is aligned exactly when its
+/// address is, and the address comes from the region with its provenance: no raw pointer is
+/// held, so the allocator is `Send` and safe.
 struct Bump {
-    /// The next free byte of the current chunk; null before the first.
-    cursor: *mut u8,
+    /// The next free byte of the current chunk, from the region's base; 0 before the first.
+    cursor: usize,
     /// The bytes left in the current chunk from `cursor`.
     left: usize,
     /// The size of the next chunk.
     next: usize,
 }
 
-// SAFETY: `cursor` points into chunks owned by no thread (claimed, never freed), and is only used by the
-// holder of the shard's lock.
-unsafe impl Send for Bump {}
-
 impl Bump {
     fn new() -> Bump {
-        Bump { cursor: ptr::null_mut(), left: 0, next: FIRST_CHUNK }
+        Bump { cursor: 0, left: 0, next: FIRST_CHUNK }
     }
 
     /// `layout.size()` bytes (at least one, so every value has its own address) aligned to
@@ -373,24 +349,19 @@ impl Bump {
         if align > CHUNK_ALIGN || size > LAST_CHUNK / 4 {
             return space::claim(Layout::from_size_align(size, align).expect("a value's layout"));
         }
-        let addr = self.cursor.addr();
-        let mut pad = addr.next_multiple_of(align) - addr;
+        let mut pad = self.cursor.next_multiple_of(align) - self.cursor;
         if pad + size > self.left {
             let bytes = self.next.max(size.next_multiple_of(CHUNK_ALIGN));
             self.next = (self.next * 2).min(LAST_CHUNK);
             self.cursor =
-                space::claim(Layout::from_size_align(bytes, CHUNK_ALIGN).expect("a chunk's layout")).as_ptr();
+                space::claim_offset(Layout::from_size_align(bytes, CHUNK_ALIGN).expect("a chunk's layout"));
             self.left = bytes;
             pad = 0;
         }
-        // SAFETY: `pad + size <= left`, the bytes of the current chunk from `cursor`, so
-        // `cursor + pad` is in the chunk.
-        let at = unsafe { self.cursor.add(pad) };
-        // SAFETY: As for `at`: `at + size` is at most one past the chunk's last byte.
-        self.cursor = unsafe { at.add(size) };
+        let at = self.cursor + pad;
+        self.cursor = at + size;
         self.left -= pad + size;
-        // SAFETY: `at` is inside a chunk from `space::claim`, which is never null.
-        unsafe { NonNull::new_unchecked(at) }
+        space::at(at)
     }
 }
 
@@ -399,6 +370,7 @@ impl Bump {
 /// against a set: an insert is new exactly when the value was not there, a find sees what was
 /// inserted before it, and each value has one address and is read whole.
 #[cfg(all(test, blaze_check))]
+#[allow(unsafe_code, reason = "the model's values are `u64`s written and read through the store's raw pointers")]
 mod model {
     use std::sync::Arc;
 
@@ -548,6 +520,7 @@ mod model {
 }
 
 #[cfg(all(test, not(blaze_check)))]
+#[allow(unsafe_code, reason = "the tests' values are `u64`s written and read through the store's raw pointers")]
 mod tests {
     use std::collections::HashMap;
 

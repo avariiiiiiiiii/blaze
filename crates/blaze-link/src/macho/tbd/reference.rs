@@ -11,7 +11,7 @@ use crate::model::{Shared, SymbolKind};
 
 /// A symbol as the reader held it before names moved into the arena: the form the
 /// reference model gives and the tests compare in.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub(super) struct Owned {
     pub name: String,
     pub version: Option<String>,
@@ -338,7 +338,7 @@ fn v4_target(text: &str) -> Result<Target, String> {
     Ok(Target { arch: arch.to_owned(), platform })
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(PartialEq, Debug)]
 pub(super) enum Value {
     Scalar(String),
     Seq(Vec<Value>),
@@ -392,7 +392,7 @@ pub(super) fn documents(text: &str) -> Result<Vec<(Option<String>, Vec<(usize, &
     Ok(docs)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug)] // clone: the test and fuzz reference parser only, once per block
 struct Line {
     number: usize,
     indent: usize,

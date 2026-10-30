@@ -23,6 +23,8 @@ pub(super) use set::TypeSet;
 use set::{Of, Told};
 pub(super) use types::{ByEnv, Sets, described};
 
+use blaze_core::decimal::decimal;
+use blaze_format::leb;
 use cranelift_codegen::{
     binemit::CodeOffset,
     gimli::{
@@ -297,15 +299,14 @@ impl VariablePlace {
             // What `pointee_expression` makes of `DW_OP_fbreg`, written once into an
             // expression of its exact length.
             &VariablePlace::Frame(at) => {
-                let plus = if offset == 0 { 0 } else { 1 + uleb_size(offset) };
-                let mut pointee = Vec::with_capacity(1 + sleb_size(at) + 1 + plus);
+                let plus = if offset == 0 { 0 } else { 1 + leb::len_u64(offset.into()) };
+                let mut pointee = Vec::with_capacity(1 + leb::len_i64(at) + 1 + plus);
                 pointee.push(gimli::DW_OP_fbreg.0);
-                // Writing to a `Vec` cannot fail.
-                let _ = gimli::leb128::write::signed(&mut pointee, at);
+                leb::write_i64(&mut pointee, at);
                 pointee.push(gimli::DW_OP_deref.0);
                 if offset != 0 {
                     pointee.push(gimli::DW_OP_plus_uconst.0);
-                    let _ = gimli::leb128::write::unsigned(&mut pointee, u64::from(offset));
+                    leb::write_u64(&mut pointee, u64::from(offset));
                 }
                 // alloc: the one range the place keeps, as `VariablePlace::Ranges` has it
                 vec![(0, CodeOffset::MAX, pointee)]
@@ -322,22 +323,13 @@ impl VariablePlace {
     }
 }
 
-fn sleb_size(value: i64) -> usize {
-    let bits = 64 - if value < 0 { value.leading_ones() } else { value.leading_zeros() };
-    (bits as usize + 1).div_ceil(7)
-}
-
-fn uleb_size(value: u32) -> usize {
-    (32 - (value | 1).leading_zeros()).div_ceil(7) as usize
-}
-
 /// The expression of the memory `offset` bytes from an address, from the one of where the
 /// address is held: in a register, or in memory a single operation finds.
 fn pointee_expression(held: &[u8], offset: u32) -> Option<Vec<u8>> {
     let (&operation, operands) = held.split_first()?;
     let register = gimli::DW_OP_reg0.0..=gimli::DW_OP_reg31.0;
     let based = gimli::DW_OP_breg0.0..=gimli::DW_OP_breg31.0;
-    let plus = if offset == 0 { 0 } else { 1 + uleb_size(offset) };
+    let plus = if offset == 0 { 0 } else { 1 + leb::len_u64(offset.into()) };
     let mut pointee = if register.contains(&operation) && operands.is_empty() {
         let mut pointee = Vec::with_capacity(2 + plus);
         pointee.extend_from_slice(&[operation - gimli::DW_OP_reg0.0 + gimli::DW_OP_breg0.0, 0]);
@@ -358,7 +350,7 @@ fn pointee_expression(held: &[u8], offset: u32) -> Option<Vec<u8>> {
     };
     if offset != 0 {
         pointee.push(gimli::DW_OP_plus_uconst.0);
-        gimli::leb128::write::unsigned(&mut pointee, u64::from(offset)).ok()?;
+        leb::write_u64(&mut pointee, u64::from(offset));
     }
     Some(pointee)
 }
@@ -1592,21 +1584,6 @@ fn text_in(apart: bool, strings: &mut gimli::write::StringTable, text: &[u8]) ->
     }
 }
 
-/// `value` in decimal, as `Display` writes it, at the end of `buffer`.
-fn decimal(value: u64, buffer: &mut [u8; 20]) -> &str {
-    let mut at = buffer.len();
-    let mut left = value;
-    loop {
-        at -= 1;
-        buffer[at] = b'0' + (left % 10) as u8;
-        left /= 10;
-        if left == 0 {
-            break;
-        }
-    }
-    std::str::from_utf8(&buffer[at..]).expect("ASCII digits")
-}
-
 /// The address `by` bytes past `start`.
 fn past(start: Address, by: CodeOffset) -> Address {
     match start {
@@ -1732,13 +1709,8 @@ mod tests {
     use super::*;
 
     fn seeded(seed: u64) -> impl FnMut() -> u64 {
-        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-        move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        }
+        let mut rng = blaze_ids::rng::SplitMix64::new(seed);
+        move || rng.next_u64()
     }
 
     /// A slot is found by binary search where a linear search of the slots as they were told

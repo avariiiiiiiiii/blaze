@@ -20,7 +20,7 @@
 mod codes;
 mod ids;
 mod key;
-mod table;
+pub(crate) mod table;
 
 pub use self::ids::{BODY_KEY_DOMAIN, IdKind, PortableId, PortableIds, body_key};
 #[cfg(test)]

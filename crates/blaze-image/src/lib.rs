@@ -94,6 +94,10 @@ impl SectionId {
     pub const PLANE_HISTORY: SectionId = SectionId(0x0400);
     /// salsa's interned values, at their IDs (`salsa::image`).
     pub const SALSA_INTERNED: SectionId = SectionId(0x0500);
+    /// salsa's frozen query graph (`salsa::graph::frozen`).
+    pub const SALSA_GRAPH: SectionId = SectionId(0x0501);
+    /// The library files' parsed syntax trees (lane tree-store, `base_db::trees::SCHEMA`).
+    pub const SYNTAX_TREES: SectionId = SectionId(0x0600);
     /// The VFS's tree of nodes and names (`blaze-vfs`).
     pub const VFS_TREE: SectionId = SectionId::vfs(0);
     /// The VFS's file bytes.
@@ -125,6 +129,8 @@ impl SectionId {
             SectionId::SYMBOLS => "the symbol table",
             SectionId::PLANE_HISTORY => "the plane's history",
             SectionId::SALSA_INTERNED => "salsa's interned values",
+            SectionId::SALSA_GRAPH => "salsa query graph",
+            SectionId::SYNTAX_TREES => "the library syntax trees",
             SectionId(id) if id & !0xff == SectionId::VFS => "the VFS tree",
             SectionId(id) if id & !0xffff == SectionId::INTERNED => "an interned table",
             _ => "a section this blaze does not know",

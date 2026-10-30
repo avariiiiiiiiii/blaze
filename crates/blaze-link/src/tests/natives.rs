@@ -4,11 +4,12 @@
 
 use std::sync::Arc;
 
-use blaze_codegen::{Arch, Target};
+use blaze_codegen::{Arch, Init, Static, Target};
+use blaze_items::ItemKey;
 use object::write::{Object as Builder, Symbol as Def, SymbolSection};
 use object::{Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
 
-use super::{CALLER, Change, Image, Native, NativeKind, function, id, key, name, output, rel32, returns};
+use super::{CALLER, Change, Disk, Image, Native, NativeKind, function, id, key, name, output, rel32, returns};
 use crate::output::Platform;
 use crate::{Debug, Format, LinkError, Output, OutputKind};
 
@@ -224,6 +225,78 @@ fn nodefaultlib_takes_a_default_library_out() {
         .expect("another loaded object's /NODEFAULTLIB takes it out of the whole link");
     let error = pe(" /DEFAULTLIB:vcruntime /DEFAULTLIB:libcmt", &[vcruntime]).unwrap_err();
     assert!(error.what.contains("libcmt.lib") && error.what.contains("msvcrt.lib(crt.obj)"), "{}", error.what);
+}
+
+/// A COFF object laying out the TLS template as tlssup.obj does: `_tls_start` in `.tls`,
+/// `_tls_end` in `.tls$ZZZ`.
+fn tlssup() -> Vec<u8> {
+    let mut b = Builder::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    for (section, name) in [(".tls", "_tls_start"), (".tls$ZZZ", "_tls_end")] {
+        let id = b.add_section(Vec::new(), section.as_bytes().to_vec(), SectionKind::Tls);
+        let at = b.append_section_data(id, &[0; 8], 8);
+        b.add_symbol(Def {
+            name: name.as_bytes().to_vec(),
+            value: at,
+            size: 8,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(id),
+            flags: SymbolFlags::None,
+        });
+    }
+    b.write().unwrap()
+}
+
+fn thread_local(n: u8) -> Static {
+    Static {
+        item: ItemKey(id(n)),
+        instance: id(n + 100),
+        align: 8,
+        init: Init::Bytes { bytes: vec![n; 8], relocs: Vec::new().into() },
+        data: Vec::new(),
+        mutable: false,
+        thread_local: true,
+        section: None,
+        imports: Vec::new(),
+    }
+}
+
+/// An incremental PE link that adds a thread-local lays it out before `.tls$ZZZ`, as a full
+/// link would: the CRT's `_tls_used` ends the template at `_tls_end`, so one grown at the
+/// region's end would be outside every thread's block.
+#[test]
+fn a_new_thread_local_in_an_incremental_pe_link_is_before_the_tls_end() {
+    // `lea rax, [rip + _tls_start]; lea rcx, [rip + _tls_end]; ret`
+    let code = [0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x48, 0x8d, 0x0d, 0, 0, 0, 0, 0xc3];
+    let relocs = vec![rel32(3, Target::Extern("_tls_start".into())), rel32(10, Target::Extern("_tls_end".into()))];
+    let start = function(1, &code, relocs);
+    let tlssup: Arc<[u8]> = tlssup().into();
+    let (one, two) = (thread_local(10), thread_local(11));
+    let mut image = Image::new(name(super::TO), Output { incremental: true, ..windows() }).unwrap();
+    let mut disk = Disk::default();
+    let check = |image: &Image, statics: usize, what: &str| {
+        let state = &image.state;
+        let tls: Vec<_> = state.live_pieces().filter(|it| *it.class() == crate::model::Class::Tdata).collect();
+        let native = |it: &crate::state::PieceRef<'_>| matches!(it.what(), crate::state::What::Native { .. });
+        let natives: Vec<u64> = tls.iter().filter(|it| native(it)).map(|it| it.addr).collect();
+        let ours: Vec<(u64, u64)> = tls.iter().filter(|it| !native(it)).map(|it| (it.addr, it.size)).collect();
+        assert_eq!((natives.len(), ours.len()), (2, statics), "{what}: {natives:x?} {ours:x?}");
+        let (first, end) = (natives.iter().min().unwrap(), natives.iter().max().unwrap());
+        assert!(ours.iter().all(|(at, size)| at > first && at + size <= *end), "{what}: {first:#x} {ours:x?} {end:#x}");
+    };
+    let change = Change {
+        added: vec![&start],
+        statics: vec![&one],
+        names: vec![("mainCRTStartup".into(), Target::Direct(key(1)))],
+        debug_names: vec![(key(1), "start".into())],
+        natives: vec![Native { id: id(100), name: "tlssup.obj", bytes: &tlssup, kind: NativeKind::Object, order: 0 }],
+        ..Change::default()
+    };
+    disk.link(&mut image, change).unwrap();
+    check(&image, 1, "the first link");
+    disk.link(&mut image, Change { statics: vec![&two], ..Change::default() }).unwrap();
+    check(&image, 2, "a thread-local added");
 }
 
 fn macos() -> Output {

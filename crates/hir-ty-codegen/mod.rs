@@ -74,8 +74,9 @@ use hir_ty::{
     layout::{CoroutineFrame, Layout, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
-        Allocation, AllocationData, ConstKind, DbInterner, GenericArgs, Region, StoredGenericArgs,
-        StoredTy, TraitRef, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
+        AliasConst, AliasConstKind, Allocation, AllocationData, AnonConstIdWrapper, ConstKind,
+        DbInterner, FreeConstAliasId, GenericArgs, InherentAssocConstId, Region, RegionExt,
+        StoredGenericArgs, StoredTy, TraitAssocConstId, TraitRef, Ty, TyKind, TypingMode, ValTree,
         infer::{DbInternerInferExt, InferCtxt},
     },
     traits::StoredParamEnvAndCrate,
@@ -93,8 +94,8 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 pub use hir_ty_mir::mir::location::name_sources;
 use hir_ty_mir::mir::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CallerLocation, CastKind, FrameStorage,
-    LocalId, MirBody, MirEvalError, MirOptLevel, MirOptions, MirPhase, MirSpan,
-    Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
+    LocalId, MirBody, MirEvalError, MirOptLevel, MirOptions, MirOwner, MirPhase, MirSpan,
+    MirStage, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
     TerminatorKind, UnOp, caller_location, interpret_mir,
     location::{
         ConcatPart, concat_parts, line_and_column, located_concats, location_macros,
@@ -1950,6 +1951,27 @@ enum InstanceDef {
     },
 }
 
+impl InstanceDef {
+    /// Whose MIR the instance runs: `None` for a shim, which has none.
+    fn mir_owner<'db>(self) -> Option<MirOwner<'db>> {
+        match self {
+            InstanceDef::Fn(func) => Some(MirOwner::Body(func.into())),
+            InstanceDef::Closure(id) => Some(MirOwner::Closure(InternedClosureId::from_id(id))),
+            InstanceDef::Coroutine(id) => {
+                Some(MirOwner::Coroutine(InternedCoroutineId::from_id(id)))
+            }
+            InstanceDef::CoroutineByMove(id) => {
+                Some(MirOwner::CoroutineByMove(InternedCoroutineId::from_id(id)))
+            }
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::VtableShim(_)
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => None,
+        }
+    }
+}
+
 /// What a call transfers control to.
 enum Callee<'db> {
     Instance(InstanceDef, GenericArgs<'db>),
@@ -3693,11 +3715,6 @@ fn rustc_inlines(level: MirOptLevel, lang: bool, optimized: bool) -> bool {
     level == MirOptLevel::Release && (lang || optimized)
 }
 
-/// Whether `options` ask for nothing beyond the runtime body: no passes and no checks.
-fn is_runtime(options: MirOptions) -> bool {
-    options.level == MirOptLevel::Off && !options.ub_checks
-}
-
 /// What a body of `written` is asked with in a function compiled in `compiling`: what the v2
 /// unit's settings say ([`v2::build::Build::options`]) when `build` is a unit's, else what
 /// v1 reads of the crate and the environment ([`mir_options_of`]).
@@ -3710,46 +3727,6 @@ fn body_options(
     match build {
         Some(build) => build.options(db, written, compiling),
         None => mir_options_of(db, written),
-    }
-}
-
-/// The body the code generator compiles of `def`: the runtime body, optimized and checked as
-/// `options` ask ([`body_options`]).
-fn compiled_mir_body<'db>(
-    db: &'db Db,
-    def: InferBodyId<'db>,
-    options: MirOptions,
-) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
-    match options {
-        options if is_runtime(options) => db.runtime_mir_body(def),
-        options => db.optimized_mir_body(def, options),
-    }
-}
-
-fn compiled_mir_body_for_closure<'db>(
-    db: &'db Db,
-    closure: InternedClosureId<'db>,
-    options: MirOptions,
-) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
-    match options {
-        options if is_runtime(options) => db.runtime_mir_body_for_closure(closure),
-        options => db.optimized_mir_body_for_closure(closure, options),
-    }
-}
-
-/// The body of a coroutine (`by_move`: its by-move twin): the runtime body, with rustc's UB
-/// checks where `options` ask for them. Coroutines are not optimized further.
-fn compiled_mir_body_for_coroutine<'db>(
-    db: &'db Db,
-    coroutine: InternedCoroutineId<'db>,
-    by_move: bool,
-    options: MirOptions,
-) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
-    match (options.ub_checks, by_move) {
-        (false, false) => db.runtime_mir_body_for_coroutine(coroutine),
-        (false, true) => db.runtime_mir_body_for_coroutine_by_move(coroutine),
-        (true, false) => db.optimized_mir_body_for_coroutine(coroutine, options),
-        (true, true) => db.optimized_mir_body_for_coroutine_by_move(coroutine, options),
     }
 }
 
@@ -3773,57 +3750,23 @@ fn instance_body<'db>(
         tally.step(Step::Monomorphize, || monomorphized(db, body, args, env).map(Cow::Owned))
     };
     // The database keeps a monomorphized body of the runtime body only, which only
-    // `BLAZE_MIR_OPT=0` compiles.
-    let lean = *LEAN || mir_opt_level() != Some(MirOptLevel::Off);
-    let options =
-        |owner: InferBodyId<'db>| body_options(db, build, owner.module(db).krate(db), env.krate);
-    let closure = |id| InternedClosureId::from_id(id).loc(db).owner;
-    let coroutine = |id| InternedCoroutineId::from_id(id).loc(db).owner;
+    // `BLAZE_MIR_OPT=0` compiles; of a coroutine, only `BLAZE_LEAN=0`, whatever the level.
+    let Some(owner) = instance.def.mir_owner() else { unsupported!("the body of a shim") };
+    let lean = match owner {
+        MirOwner::Body(_) | MirOwner::Closure(_) => {
+            *LEAN || mir_opt_level() != Some(MirOptLevel::Off)
+        }
+        MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => *LEAN,
+    };
+    let written = owner.written_in(db).module(db).krate(db);
+    let options = body_options(db, build, written, env.krate);
     // A unit's body, or one with rustc's UB checks, is never the kept runtime one.
-    let asked = |owner| build.is_some() || !is_runtime(options(owner));
-    let body = match instance.def {
-        InstanceDef::Fn(func) if lean || asked(func.into()) => tally
-            .step(Step::Mir, || compiled_mir_body(db, func.into(), options(func.into())))
-            .and_then(|it| filled(it, &args, &env)),
-        InstanceDef::Closure(id) if lean || asked(closure(id)) => {
-            compiled_mir_body_for_closure(db, InternedClosureId::from_id(id), options(closure(id)))
-                .and_then(|it| filled(it, &args, &env))
-        }
-        InstanceDef::Coroutine(id) if *LEAN || asked(coroutine(id)) => {
-            let options = options(coroutine(id));
-            compiled_mir_body_for_coroutine(db, InternedCoroutineId::from_id(id), false, options)
-                .and_then(|it| filled(it, &args, &env))
-        }
-        InstanceDef::CoroutineByMove(id) if *LEAN || asked(coroutine(id)) => {
-            let options = options(coroutine(id));
-            compiled_mir_body_for_coroutine(db, InternedCoroutineId::from_id(id), true, options)
-                .and_then(|it| filled(it, &args, &env))
-        }
-        InstanceDef::Fn(func) => {
-            db.monomorphized_runtime_mir_body(func.into(), args, env).map(Cow::Borrowed)
-        }
-        InstanceDef::Closure(id) => db
-            .monomorphized_runtime_mir_body_for_closure(InternedClosureId::from_id(id), args, env)
-            .map(Cow::Borrowed),
-        InstanceDef::Coroutine(id) => db
-            .monomorphized_runtime_mir_body_for_coroutine(
-                InternedCoroutineId::from_id(id),
-                args,
-                env,
-            )
-            .map(Cow::Borrowed),
-        InstanceDef::CoroutineByMove(id) => db
-            .monomorphized_runtime_mir_body_for_coroutine_by_move(
-                InternedCoroutineId::from_id(id),
-                args,
-                env,
-            )
-            .map(Cow::Borrowed),
-        InstanceDef::DropGlue
-        | InstanceDef::CallOnceShim
-        | InstanceDef::VtableShim(_)
-        | InstanceDef::FnPointerShim
-        | InstanceDef::ReifyShim { .. } => unsupported!("the body of a shim"),
+    let body = if lean || build.is_some() || !options.is_runtime() {
+        tally
+            .step(Step::Mir, || db.mir(owner, MirStage::compiled(owner, options)))
+            .and_then(|it| filled(it, &args, &env))
+    } else {
+        db.monomorphized_mir(owner, MirStage::Runtime, args, env).map(Cow::Borrowed)
     };
     // alloc: the error's message
     let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
@@ -3982,7 +3925,7 @@ fn hands_out_opaque(db: &Db, func: FunctionId) -> bool {
         type Result = ();
 
         fn visit_ty(&mut self, ty: Ty<'db>) {
-            if let TyKind::Alias(rustc_type_ir::AliasTy {
+            if let TyKind::Alias(_, rustc_type_ir::AliasTy {
                 kind: rustc_type_ir::AliasTyKind::Opaque { .. },
                 ..
             }) = ty.kind()
@@ -4099,14 +4042,8 @@ fn held_blocks<'db>(
                     found.insert(id.0.as_id());
                     let args = args.as_coroutine();
                     let parent = GenericArgs::new_from_slice(args.parent_args()).store();
-                    match is_by_move_coroutine(db, id.0, args) {
-                        true => db.monomorphized_mir_body_for_coroutine_by_move(
-                            id.0,
-                            parent,
-                            env.store(),
-                        ),
-                        false => db.monomorphized_mir_body_for_coroutine(id.0, parent, env.store()),
-                    }
+                    let owner = MirOwner::coroutine(db, id.0, args);
+                    db.monomorphized_mir(owner, MirStage::Built, parent, env.store())
                 }
                 TyKind::CoroutineClosure(id, args) => {
                     let parent =
@@ -4143,7 +4080,7 @@ fn infers_a_future(db: &Db, func: FunctionId) -> bool {
             }
             match ty.kind() {
                 TyKind::Coroutine(..) | TyKind::CoroutineClosure(..) => self.found = true,
-                TyKind::Alias(rustc_type_ir::AliasTy {
+                TyKind::Alias(_, rustc_type_ir::AliasTy {
                     kind: rustc_type_ir::AliasTyKind::Opaque { def_id },
                     args,
                     ..
@@ -5421,7 +5358,7 @@ fn inlinable(
 /// is called, as LLVM's always-inliner puts it at every level rustc compiles at. `unit` is the
 /// v2 unit's settings it is built under (debug assertions, panic strategy, MIR options), part
 /// of the key; `None` in v1.
-#[salsa::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle, lru = 0)]
+#[salsa::tracked(returns(ref), no_eq, cycle_result = always_inlinable_cycle, lru = 0)]
 fn always_inlinable(
     db: &Db,
     instance: Instance,
@@ -5478,6 +5415,16 @@ fn inlinable_cycle(
     _: salsa::Id,
     _: Instance,
     _: StoredParamEnvAndCrate,
+) -> Option<fragment::Inlinable> {
+    None
+}
+
+fn always_inlinable_cycle(
+    _: &Db,
+    _: salsa::Id,
+    _: Instance,
+    _: StoredParamEnvAndCrate,
+    _: Option<v2::build::Build>,
 ) -> Option<fragment::Inlinable> {
     None
 }
@@ -5701,11 +5648,7 @@ fn emit_with(
         Ok(Ok(code)) => Ok(code),
         Ok(Err(e)) => Err(CodegenError::Backend(e)),
         Err(panic) => {
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown");
+            let message = stdx::panic_text(&*panic).unwrap_or("unknown");
             // alloc: the error's message
             Err(CodegenError::Backend(format!("backend panic: {message}")))
         }
@@ -5746,7 +5689,8 @@ fn root_body<'db>(
     // v1's alone (its callers are v1's, several of them queries): a v2 unit reads bodies
     // through `instance_body` with its own settings.
     let options = mir_options_of(db, krate);
-    let body = tally.step(Step::Mir, || compiled_mir_body(db, owner, options));
+    let stage = MirStage::compiled(MirOwner::Body(owner), options);
+    let body = tally.step(Step::Mir, || db.mir(MirOwner::Body(owner), stage));
     // alloc: the error's message
     let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
     // Not the function's own bounds: with nothing generic they are bounds on concrete
@@ -5762,11 +5706,8 @@ fn root_body<'db>(
     let body = if opaque {
         let args = GenericArgs::new_from_slice(&[]).store();
         tally
-            .step(Step::Monomorphize, || match options {
-                options if is_runtime(options) => {
-                    db.monomorphized_runtime_mir_body(owner, args, env.store())
-                }
-                options => db.monomorphized_optimized_mir_body(owner, options, args, env.store()),
+            .step(Step::Monomorphize, || {
+                db.monomorphized_mir(MirOwner::Body(owner), stage, args, env.store())
             })
             // alloc: the error's message
             .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?
@@ -6398,6 +6339,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         sig.returns.extend(returns.then(|| AbiParam::new(ptr())));
         let id = self
             .module
+            .declare_function(name, linkage, &sig)
             // alloc: the error's message
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
         let target = target.map(|it| self.import(it, &sig)).transpose()?;
@@ -8856,10 +8798,10 @@ struct FunctionCx<'cx, 'db> {
 }
 
 /// The layouts a function's build asked for, each asked of the database once and then lent
-/// out as `&Layout` for the whole build. Lending an `Arc` per lookup, as before, wrote the
-/// reference count salsa's memo shares with every other thread compiling a function that uses
-/// the type: a shared cache line written on a read. A lookup is now one `FxHash` probe of an
-/// interned `Ty` (a pointer) and no write outside the thread.
+/// out as `&Layout` for the whole build. A layout is hash-consed for the life of the process
+/// (`hir_ty::layout::InternedLayout`), so what is lent is the interned one itself, with no
+/// reference count to write. A lookup is one `FxHash` probe of an interned `Ty` (a pointer)
+/// and no write outside the thread.
 struct Layouts<'cx, 'db> {
     kept: &'cx KeptLayouts,
     of: std::cell::RefCell<FrameHashMap<'cx, Ty<'db>, &'cx Layout>>,
@@ -8872,25 +8814,24 @@ struct Layouts<'cx, 'db> {
     >,
 }
 
-/// What [`Layouts`] lends from, owned by `build` for the whole of it and freed after. Each
-/// layout stays salsa's (`Arc`) or the variant's own copy (`Box`), dropped at the end of the
-/// build; the two lists of pointers are the thread's ([`spare::layout_lists`]), given back
-/// emptied. They are not in the build's frame: lent from for `'cx` and dropped after it, a
-/// list whose allocator is `&'cx Frame` would still be borrowed when it drops.
+/// What [`Layouts`] lends a variant's layout from, owned by `build` for the whole of it and
+/// freed after: the variant's own copy (`Box`), dropped at the end of the build. A layout the
+/// database gives is interned and needs no keeping. The list of pointers is the thread's
+/// ([`spare::layout_list`]), given back emptied. It is not in the build's frame: lent from
+/// for `'cx` and dropped after it, a list whose allocator is `&'cx Frame` would still be
+/// borrowed when it drops.
 struct KeptLayouts {
-    asked: Lent<Arc<Layout>>,
     variants: Lent<Box<Layout>>,
 }
 
 impl KeptLayouts {
     fn new() -> Self {
-        let (asked, variants) = spare::layout_lists();
-        Self { asked: Lent::from_room(asked), variants: Lent::from_room(variants) }
+        Self { variants: Lent::from_room(spare::layout_list()) }
     }
 
-    /// Drops what it kept and gives its lists back to the thread.
+    /// Drops what it kept and gives its list back to the thread.
     fn keep(self) {
-        spare::keep_layout_lists(self.asked.into_room(), self.variants.into_room());
+        spare::keep_layout_list(self.variants.into_room());
     }
 }
 
@@ -9256,8 +9197,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
         }
         // What is laid out at the least vector length is stored for the largest.
-        let kept: &'cx KeptLayouts = self.layouts.kept;
-        let layout: &'cx Layout = kept.asked.alloc(sve::storage(layout));
+        let layout: &'cx Layout = sve::storage(layout.get());
         Ok(*self.layouts.of.borrow_mut().entry(ty).or_insert(layout))
     }
 
@@ -11118,20 +11058,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// Field types can still be projections such as `<str as ToOwned>::Owned`. Every place of
-    /// every statement asks this of its local and of each projection, and almost none is an
-    /// alias: one is given back as it is, as `structurally_normalize_ty` does, without making a
-    /// fulfillment context for it.
+    /// every statement asks this of its local and of each projection.
     fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
-        if !matches!(ty.kind(), TyKind::Alias(..)) {
-            return ty;
-        }
-        hir_ty::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
-            .structurally_normalize_ty(
-                &hir_ty::next_solver::infer::traits::ObligationCause::dummy(),
-                self.env.param_env,
-                ty,
-            )
-            .unwrap_or(ty)
+        hir_ty_mir::mir::normalize_or_keep(&self.infcx, self.env.param_env, ty)
     }
 
     /// The value of an integer, `bool` or `char` literal operand.
@@ -11179,7 +11108,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if to != place || !matches!(ty.as_ref().kind(), TyKind::Bool) {
             return None;
         }
-        let ConstKind::Unevaluated(unevaluated) = konst.as_ref().kind() else { return None };
+        let ConstKind::Alias(_, unevaluated) = konst.as_ref().kind() else { return None };
         let allocation = self.eval_const(unevaluated).ok()?;
         Some(*allocation.memory.first()? as u128)
     }
@@ -11578,7 +11507,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         }
                         self.valtree_blob(ty, value.value)?
                     }
-                    ConstKind::Unevaluated(unevaluated) => {
+                    ConstKind::Alias(_, unevaluated) => {
                         let allocation = self.eval_const(unevaluated)?;
                         self.allocation_blob(allocation, false)?
                     }
@@ -11698,7 +11627,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TyKind::Slice(element) => Some(element),
             _ => Some(pointee),
         };
-        if !element.is_none_or(|it| self.is_plain_data(it, 0)) {
+        let plain = |it: Ty<'db>| {
+            hir_ty_share::is_plain_data(self.cg.db, self.interner, &self.infcx, self.env.param_env, it)
+        };
+        if !element.is_none_or(plain) {
             return Ok(None);
         }
         let unique = match mutability {
@@ -11721,63 +11653,26 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(Some(fragment::Pointee { unique, frozen: mutability == Mutability::Not, size, align }))
     }
 
-    /// Whether `ty` is made of scalars, pointers and references only, through arrays, tuples
-    /// and the fields of structs and enums, `depth` deep in a type that is.
-    fn is_plain_data(&self, ty: Ty<'db>, depth: u32) -> bool {
-        if depth > 8 {
-            return false;
-        }
-        match self.normalize(ty).kind() {
-            TyKind::Bool
-            | TyKind::Char
-            | TyKind::Int(_)
-            | TyKind::Uint(_)
-            | TyKind::Float(_)
-            | TyKind::Never
-            | TyKind::RawPtr(..)
-            | TyKind::Ref(..)
-            | TyKind::FnPtr(..)
-            | TyKind::FnDef(..) => true,
-            TyKind::Array(element, _) | TyKind::Pat(element, _) => {
-                self.is_plain_data(element, depth + 1)
-            }
-            TyKind::Tuple(fields) => fields.iter().all(|it| self.is_plain_data(it, depth + 1)),
-            TyKind::Adt(def, args) => {
-                let plain = |variant: hir_def::VariantId| {
-                    self.cg.db.field_types(variant).iter().all(|(_, field)| {
-                        let ty = field.ty().instantiate(self.interner, args).skip_norm_wip();
-                        self.is_plain_data(ty, depth + 1)
-                    })
-                };
-                match def.def_id() {
-                    AdtId::StructId(id) => plain(id.into()),
-                    AdtId::EnumId(id) => {
-                        let variants = &id.enum_variants(self.cg.db).variants;
-                        variants.iter().all(|(_, it)| plain(it.0.into()))
-                    }
-                    AdtId::UnionId(_) => false,
-                }
-            }
-            _ => false,
-        }
-    }
-
-    fn eval_const(&mut self, unevaluated: UnevaluatedConst<'db>) -> Result<Allocation<'db>> {
+    fn eval_const(&mut self, unevaluated: AliasConst<'db>) -> Result<Allocation<'db>> {
         let db = self.cg.db;
-        let UnevaluatedConst { def, args } = unevaluated;
-        let frontend = |e: ConstEvalError<'db>| {
-            refused_const_eval(db, def.0, &e)
+        let args = unevaluated.args;
+        let frontend = |def: GeneralConstId<'db>, e: ConstEvalError<'db>| {
+            refused_const_eval(db, def, &e)
                 // alloc: the error's message
                 .unwrap_or_else(|| CodegenError::Frontend(format!("const eval: {e:?}")))
         };
-        match def.0 {
-            GeneralConstId::ConstId(id) => {
+        match unevaluated.kind {
+            AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
+            | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
+            | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => {
                 let (id, args) = lookup_impl_const(&self.infcx, self.env.param_env, id, args);
-                db.const_eval(id, args, Some(self.env)).map_err(frontend)
+                db.const_eval(id, args, Some(self.env)).map_err(|e| frontend(id.into(), e))
             }
-            GeneralConstId::StaticId(id) => db.const_eval_static(id).map_err(frontend),
-            GeneralConstId::AnonConstId(id) => {
-                db.anon_const_eval(id, args, Some(self.env)).map_err(frontend)
+            AliasConstKind::Anon { def_id: AnonConstIdWrapper(id) } => {
+                db.anon_const_eval(id, args, Some(self.env)).map_err(|e| frontend(id.into(), e))
+            }
+            AliasConstKind::InherentSelf { .. } => {
+                unsupported!("the inherent constant {unevaluated:?} in Self form after type check")
             }
         }
     }
@@ -12181,14 +12076,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
             }
             TyKind::Alias(..) => {
-                let normalized =
-                    hir_ty::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
-                        .structurally_normalize_ty(
-                            &hir_ty::next_solver::infer::traits::ObligationCause::dummy(),
-                            self.env.param_env,
-                            ty,
-                        )
-                        .unwrap_or(ty);
+                let normalized = self.normalize(ty);
                 if !matches!(normalized.kind(), TyKind::Alias(..)) {
                     self.relocate(blob, offset, normalized, map)?;
                 }
@@ -12456,7 +12344,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         }
                         OperandKind::Constant { konst, .. }
                             if matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_))
-                                && let ConstKind::Unevaluated(named) = konst.as_ref().kind() =>
+                                && let ConstKind::Alias(_, named) = konst.as_ref().kind() =>
                         {
                             let mut bytes = [0; 16];
                             let memory = &self.eval_const(named)?.memory;
@@ -12565,7 +12453,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mask = u128::MAX >> (128 - bits);
         match &operand.kind {
             OperandKind::Constant { konst, .. } => {
-                let ConstKind::Unevaluated(named) = konst.as_ref().kind() else {
+                let ConstKind::Alias(_, named) = konst.as_ref().kind() else {
                     return Ok(None);
                 };
                 let allocation = self.eval_const(named)?;
@@ -13114,6 +13002,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let TyKind::FnDef(def, generic_args) = fn_ty.kind() else {
             unsupported!("fn pointer to {fn_ty:?}");
         };
+        let generic_args = generic_args.skip_binder();
         let CallableDefId::FunctionId(func) = def.0 else {
             return self.reified(fn_ty, false);
         };
@@ -14169,6 +14058,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let TyKind::FnDef(def, generic_args) = fn_ty.kind() else {
             unsupported!("call of {fn_ty:?}");
         };
+        let generic_args = generic_args.skip_binder();
         let func = match def.0 {
             CallableDefId::FunctionId(func) => func,
             CallableDefId::StructId(id) => {
@@ -14224,6 +14114,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let TyKind::FnDef(runtime, runtime_args) = self.operand_ty(runtime)?.kind() else {
                 unsupported!("const_eval_select with a non-fn-item runtime function");
             };
+            let runtime_args = runtime_args.skip_binder();
             let CallableDefId::FunctionId(runtime) = runtime.0 else {
                 unsupported!("const_eval_select with a constructor");
             };
@@ -14470,7 +14361,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 if FunctionSignature::is_intrinsic(self.cg.db, func) {
                     unsupported!("intrinsic called through an Fn trait");
                 }
-                self.call_direct(func, generic_args, &values, dst, dst_ty)
+                self.call_direct(func, generic_args.skip_binder(), &values, dst, dst_ty)
             }
             TyKind::FnPtr(..) => {
                 let pointer = self.builder.ins().load(ptr(), MEM, addr, 0);
@@ -15096,6 +14987,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         match ty.kind() {
             TyKind::FnDef(def, generic_args) => match def.0 {
                 CallableDefId::FunctionId(func) => {
+                    let generic_args = generic_args.skip_binder();
                     if FunctionSignature::is_intrinsic(self.cg.db, func) {
                         unsupported!("shim for an intrinsic");
                     }
@@ -17916,7 +17808,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     blob = self.valtree_blob(ty.as_ref(), value.value)?.bytes;
                     &blob[..]
                 }
-                ConstKind::Unevaluated(named) => {
+                ConstKind::Alias(_, named) => {
                     evaluated = self.eval_const(named)?;
                     &evaluated.memory[..]
                 }
@@ -20232,7 +20124,7 @@ fn register_locals(body: &MirBody<'_>, forwarded: &FxHashMap<LocalId, LocalId>) 
         for statement in &block.statements {
             if let StatementKind::Assign(to, rvalue) = &statement.kind {
                 plain(to);
-                for operand in operands_of(rvalue) {
+                for operand in hir_ty_mir::mir::purity::operands(rvalue) {
                     read(operand, &mut plain);
                 }
             }
@@ -20568,21 +20460,6 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
 /// The lanes of a SIMD vector, each a value: inline up to 64, the lanes of 512 bits of bytes.
 type LaneValues = smallvec::SmallVec<[Value; 64]>;
 
-/// The operands an rvalue reads.
-fn operands_of(rvalue: &Rvalue) -> impl Iterator<Item = &Operand> {
-    let none: &[Operand] = &[];
-    let (fixed, rest) = match rvalue {
-        Rvalue::UnaryOp(_, it)
-        | Rvalue::Cast(_, it, _)
-        | Rvalue::Repeat(it, _)
-        | Rvalue::Use(it) => ([Some(it), None], none),
-        Rvalue::CheckedBinaryOp(_, left, right) => ([Some(left), Some(right)], none),
-        Rvalue::Aggregate(_, operands) => ([None, None], &operands[..]),
-        _ => ([None, None], none),
-    };
-    fixed.into_iter().flatten().chain(rest)
-}
-
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
@@ -20607,36 +20484,39 @@ mod tests {
         assert_eq!(Intrinsic::from_symbol(&intern::sym::check_language_ub), None);
     }
 
-    /// A layout kept for a build is the database's own, not a copy: lent from the `Arc` the
-    /// query gave, however many more the build keeps after it. Seeded layouts of every
-    /// integer width, enough for the list to grow many times.
+    /// A layout lent for a build is the database's own, not a copy: the interned layout the
+    /// query gave, and a variant's layout is the copy the build kept, however many more it
+    /// keeps after it. Seeded layouts of every integer width, enough for the list to grow many
+    /// times.
     #[test]
-    fn a_kept_layout_is_the_one_the_query_gave() {
-        use super::{Arc, KeptLayouts, Layout, Primitive, Scalar};
+    fn a_lent_layout_is_the_one_the_query_gave() {
+        use super::{KeptLayouts, Layout, Primitive, Scalar, sve};
+        use hir_ty::layout::intern_layout;
         use rustc_abi::Integer;
         let dl = rustc_abi::TargetDataLayout::default();
         let widths = [Integer::I8, Integer::I16, Integer::I32, Integer::I64, Integer::I128];
         let kept = KeptLayouts::new();
-        let mut given = Vec::new();
-        let mut lent = Vec::new();
-        let mut seed = 0x9e37_79b9_u32;
+        let mut asked = Vec::new();
+        let mut variants = Vec::new();
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9);
         for _ in 0..4096 {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
+            let seed = rng.next_u32();
             let int = widths[seed as usize % widths.len()];
             let scalar = Scalar::Union { value: Primitive::Int(int, seed & 1 == 0) };
-            let layout = Arc::new(Layout::scalar(&dl, scalar));
-            given.push(layout.clone());
-            let layout: &Layout = kept.asked.alloc(layout);
-            lent.push(layout);
+            let given = intern_layout(Layout::scalar(&dl, scalar)).get();
+            asked.push((sve::storage(given), given));
+            let copy = Box::new(Layout::scalar(&dl, scalar));
+            let at: *const Layout = &*copy;
+            variants.push((kept.variants.alloc(copy), at));
         }
-        for (layout, given) in lent.into_iter().zip(given.iter()) {
-            assert!(std::ptr::eq(layout, &**given));
-            assert_eq!(*layout, **given);
+        for (lent, given) in asked {
+            assert!(std::ptr::eq(lent, &given.0));
+        }
+        for (lent, at) in variants {
+            assert!(std::ptr::eq(lent, at));
         }
         kept.keep();
-        assert!(given.iter().all(|it| Arc::strong_count(it) == 1), "a kept list holds a layout past its build");
+        assert!(super::spare::layout_list().is_empty(), "a kept list holds a layout past its build");
     }
 
     /// The panic of each overflow check is named whole, as core declares it: `call_panic`

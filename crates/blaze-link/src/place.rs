@@ -22,7 +22,7 @@ use rustc_hash::FxHashSet;
 use crate::arena::{FrameVec, collect_in};
 use crate::{DevRun, Format, LinkError};
 use crate::cow::{CowBytes, IdSet};
-use crate::model::{Apply, Class, Counts, Prot, Region, Reserve, Sym, reserved};
+use crate::model::{Apply, Class, Counts, Prot, Region, Reserve, Sym, Writer, reserved};
 use crate::stage::{Stage, error, function_of};
 use crate::state::{ClassId, PieceId, PieceRef, Sort, Space, State, What, zeroed};
 use crate::symbols::{SymKey, Symbols};
@@ -351,7 +351,7 @@ impl<'a> Stage<'a> {
     /// it is defined in (`/EXPORT:name=symbol,DATA`).
     pub fn exports(&self) -> FrameVec<'a, (&str, &str, bool)> {
         let mut seen: FxHashSet<&str> = FxHashSet::default();
-        let mut out = Vec::new_in(self.arena);
+        let mut out: FrameVec<'a, (&str, &str, bool)> = Vec::new_in(self.arena);
         if let crate::OutputKind::Shared { exports, .. } = &self.output.kind {
             out.reserve(exports.len());
             for it in exports {
@@ -405,10 +405,13 @@ impl<'a> Stage<'a> {
         Ok(())
     }
 
-    /// Whether a class is laid out again whole when it changes: as [`ordered`], and the GOT
-    /// of an image whose GOT is its import address table, each DLL's cells together.
+    /// Whether a class is laid out again whole when it changes: as [`ordered`]; and in a PE
+    /// image (`got_by_library`) the GOT, which is its import address table, each DLL's cells
+    /// together, and the thread-locals, which the CRT's `_tls_used` bounds by `_tls_start` in
+    /// `.tls` and `_tls_end` in `.tls$ZZZ`: one grown at the end would be past `_tls_end`,
+    /// outside every thread's block.
     fn ordered(&self, class: &Class) -> bool {
-        ordered(class) || (self.plan.got_by_library && *class == Class::Got)
+        ordered(class) || (self.plan.got_by_library && matches!(class, Class::Got | Class::Tdata))
     }
 
     /// Where a GOT cell is in an image whose GOT is its import address table: the DLL, then

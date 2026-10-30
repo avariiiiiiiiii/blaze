@@ -9,12 +9,46 @@ use std::{
 };
 
 use blaze_core::{
-    Completion, Cursor, Done, Driver, Effect, FileName, Journaled, Lost, Mapping,
+    Completion, Cursor, Done, Driver, Effect, FileName, Journaled, Lost, Mapping, Stamp, Tag,
     sim::{Faults, Journal, Rng, Sim},
 };
 
-use super::{Watched, Watcher};
+use super::{Watched, Watcher, cmp_below, is_below, reference};
 use crate::{Mode, Vfs, disk::Disks, section::Section};
+
+/// A watcher under test: today's, or the reference it is held to.
+trait Watch {
+    fn new(head: &str, dir: FileName, tags: u64) -> Self;
+    fn start(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>);
+    fn owns(&self, tag: Tag) -> bool;
+    fn idle(&self) -> bool;
+    fn complete(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Watched>;
+}
+
+macro_rules! watch {
+    ($watcher:ty) => {
+        impl Watch for $watcher {
+            fn new(head: &str, dir: FileName, tags: u64) -> Self {
+                <$watcher>::new(head, dir, tags)
+            }
+            fn start(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>) {
+                <$watcher>::start(self, vfs, effects)
+            }
+            fn owns(&self, tag: Tag) -> bool {
+                <$watcher>::owns(self, tag)
+            }
+            fn idle(&self) -> bool {
+                <$watcher>::idle(self)
+            }
+            fn complete(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Watched> {
+                <$watcher>::complete(self, vfs, completion, effects)
+            }
+        }
+    };
+}
+
+watch!(Watcher);
+watch!(reference::Watcher);
 
 const KINDS: [Journal; 3] = [Journal::None, Journal::FsEvents, Journal::Usn];
 const TAGS: u64 = 1 << 40;
@@ -28,10 +62,10 @@ fn ws(path: &str) -> FileName {
 }
 
 /// The watcher, its head, the simulated machine, and what the watcher asked of it.
-struct Run {
+struct Run<W = Watcher> {
     sim: Sim,
     vfs: Vfs,
-    watcher: Watcher,
+    watcher: W,
     effects: Vec<Effect>,
     /// What the disk holds, as the test made it.
     disk: BTreeMap<String, Vec<u8>>,
@@ -39,21 +73,30 @@ struct Run {
     reads: Vec<String>,
     stamped: Vec<String>,
     out: Vec<Watched>,
+    /// Every effect handed to the machine, the watcher's and the VFS's, in order.
+    log: Vec<Effect>,
 }
 
 impl Run {
     fn new(seed: u64, kind: Journal, files: &[(&str, &str)]) -> Run {
+        Run::with(seed, kind, files)
+    }
+}
+
+impl<W: Watch> Run<W> {
+    fn with(seed: u64, kind: Journal, files: &[(&str, &str)]) -> Run<W> {
         let mut sim = Sim::new(seed, Faults::default());
         sim.set_journal(kind);
         let mut run = Run {
             sim,
             vfs: Vfs::recover(name("state/journal"), 0, &[]).0,
-            watcher: Watcher::new("disk", name("ws"), TAGS),
+            watcher: W::new("disk", name("ws"), TAGS),
             effects: Vec::new(),
             disk: BTreeMap::new(),
             reads: Vec::new(),
             stamped: Vec::new(),
             out: Vec::new(),
+            log: Vec::new(),
         };
         for (path, bytes) in files {
             run.write(path, bytes);
@@ -90,6 +133,7 @@ impl Run {
                     _ => {}
                 }
             }
+            self.log.extend(self.effects.iter().cloned());
             self.sim.submit(&mut self.effects);
             if self.sim.poll(&mut done, Duration::ZERO) == 0 && self.effects.is_empty() {
                 return;
@@ -109,7 +153,7 @@ impl Run {
     /// blaze stops: the machine keeps its disk and journal, the watch is gone, and the column
     /// goes through the image's bytes (encoded, then read in place). `down` changes the disk
     /// while nothing watches; then a new watcher starts from what was saved.
-    fn restart(&mut self, down: impl FnOnce(&mut Run)) {
+    fn restart(&mut self, down: impl FnOnce(&mut Run<W>)) {
         assert!(self.watcher.idle(), "stopped with looks in flight: {:?}", self.out);
         self.sim.crash();
         down(self);
@@ -118,7 +162,7 @@ impl Run {
         let len = bytes.len();
         let section = Section::new(Mapping::copy(&bytes), 0..len).expect("a section");
         self.vfs.disks = Disks::open(section).expect("the column reopens");
-        self.watcher = Watcher::new("disk", name("ws"), TAGS);
+        self.watcher = W::new("disk", name("ws"), TAGS);
         (self.reads.clear(), self.stamped.clear(), self.out.clear());
         self.watcher.start(&self.vfs, &mut self.effects);
         self.pump();
@@ -456,6 +500,188 @@ fn the_head_follows_the_disk_across_restarts() {
                     run.reads().into_iter().filter(|it| !touched.contains(*it)).collect();
                 assert_eq!(extra, Vec::<&str>::new(), "{what}: read but not changed");
             }
+        }
+    }
+}
+
+/// A change `act` makes: a delete (0), a rename to `arg` (1), a chmod (2) or a write of `arg` (3).
+type Step = (u8, String, String);
+
+/// Up to 8 random changes among `PATHS` to a disk holding `disk`, each only where the disk
+/// allows it.
+fn steps(rng: &mut Rng, disk: &BTreeMap<String, Vec<u8>>, mark: &str) -> Vec<Step> {
+    const PATHS: &[&str] = &["a", "b", "d/x", "d/y", "d/e/z", "f/g/h", "k", "src/old/one.rs", "src/new.rs"];
+    let clash = |disk: &BTreeMap<String, Vec<u8>>, path: &str| {
+        disk.keys().any(|k| is_below(path, k) || is_below(k, path))
+    };
+    let mut disk = disk.clone();
+    let mut steps = Vec::new();
+    for step in 0..1 + rng.below(8) {
+        let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+        let there = disk.contains_key(path);
+        match rng.below(4) {
+            0 if there => {
+                disk.remove(path);
+                steps.push((0, path.to_owned(), String::new()));
+            }
+            1 if there => {
+                let Some(to) = PATHS.iter().find(|it| !disk.contains_key(**it) && !clash(&disk, it)) else {
+                    continue;
+                };
+                let bytes = disk.remove(path).expect("there");
+                disk.insert((*to).to_owned(), bytes);
+                steps.push((1, path.to_owned(), (*to).to_owned()));
+            }
+            2 if there => steps.push((2, path.to_owned(), String::new())),
+            _ if !there && clash(&disk, path) => {}
+            _ => {
+                let bytes = format!("{mark}:{step}");
+                disk.insert(path.to_owned(), bytes.clone().into_bytes());
+                steps.push((3, path.to_owned(), bytes));
+            }
+        }
+    }
+    steps
+}
+
+/// Makes `steps` on `run`'s disk the way `how` says: live under the watch (0), while blaze is
+/// down (1), while down with the journal losing a subtree (2), or with the journal reset (3).
+fn act<W: Watch>(run: &mut Run<W>, steps: &[Step], how: u64, kind: Journal) {
+    let apply = |run: &mut Run<W>| {
+        for (op, path, arg) in steps {
+            match op {
+                0 => run.delete(path),
+                1 => run.rename(path, arg),
+                2 => run.sim.chmod(&ws(path), 0o600 + (run.log.len() as u32 % 2)),
+                _ => run.write(path, arg),
+            }
+        }
+    };
+    match how {
+        0 => {
+            apply(run);
+            run.pump();
+        }
+        1 => run.restart(apply),
+        2 if kind != Journal::None => run.restart(|run| {
+            apply(run);
+            run.sim.lose_changes(&ws("src"), Lost::Rescan);
+        }),
+        _ if kind != Journal::None => run.restart(|run| {
+            apply(run);
+            run.sim.reset_journal();
+        }),
+        _ => run.restart(apply),
+    }
+}
+
+/// Today's watcher, whose names are interned, and the reference it was rewritten from, each on
+/// its own machine with the same seed and told the same changes (live, across restarts, with a
+/// subtree lost or the journal reset): every effect either asks for, every output and every
+/// head is the same.
+#[test]
+fn the_watcher_does_what_the_reference_did() {
+    for kind in KINDS {
+        for seed in 0..30 {
+            let mut rng = Rng::new(seed ^ 0x7061_7468);
+            let mut new: Run = Run::with(seed, kind, TREE);
+            let mut old: Run<reference::Watcher> = Run::with(seed, kind, TREE);
+            for round in 0..8 {
+                let what = format!("{kind:?} seed {seed} round {round}");
+                assert_eq!(new.log, old.log, "{what}: the same effects, in order");
+                assert_eq!(new.out, old.out, "{what}: the same outputs");
+                assert_eq!(new.reads, old.reads, "{what}: the same reads");
+                assert_eq!(new.vfs.head("disk"), old.vfs.head("disk"), "{what}: the same head");
+                assert_eq!(new.disk, old.disk);
+                assert_eq!(new.watcher.idle(), old.watcher.idle(), "{what}");
+                (new.log.clear(), old.log.clear());
+                let steps = steps(&mut rng, &new.disk, &what);
+                let how = rng.below(4);
+                act(&mut new, &steps, how, kind);
+                act(&mut old, &steps, how, kind);
+            }
+        }
+    }
+}
+
+/// Once warm (its names' room, a spare batch and the stamp buffer the driver gave back kept), a
+/// batch the journal tells of files that did not change is stamped and settled with no
+/// allocation at all; one of files whose stamps moved allocates only the name each read hands
+/// the driver, which takes it owned.
+#[test]
+fn a_warm_batch_allocates_only_the_names_its_reads_hand_the_driver() {
+    use blaze_alloc_count::assert_at_most;
+
+    assert!(blaze_alloc_count::installed());
+    let mut run = Run::new(11, Journal::Usn, TREE);
+    run.check("start");
+    let told: Vec<FileName> = TREE.iter().map(|(path, _)| ws(path)).collect();
+    let journaled = |run: &Run| {
+        let cursor = run.vfs.disks.get("disk").expect("a disk").cursor;
+        let told = Journaled { files: told.clone(), lost: Vec::new(), cursor, caught_up: true };
+        Completion { tag: Tag(TAGS), done: Done::Journaled(Box::new(told)) }
+    };
+    // The stamps of the batch the watcher just asked for: what the column saved of each name,
+    // its mtime moved by `moved`. Its buffer is dropped, as a driver drops it once done.
+    let stamps = |run: &mut Run, moved: u64| {
+        let Some(Effect::Stamp { files, tag }) = run.effects.pop() else { panic!("{:?}", run.effects) };
+        assert!(run.effects.is_empty(), "{:?}", run.effects);
+        let disk = run.vfs.disks.get("disk").expect("a disk");
+        let stamps: Vec<Stamp> = files
+            .iter()
+            .map(|name| {
+                let saved = disk.get(name).expect("a file the column has");
+                Stamp { mtime_ns: saved.mtime_ns + moved, ..saved }
+            })
+            .collect();
+        drop(files);
+        Completion { tag, done: Done::Stamped(stamps) }
+    };
+    for round in 0..3u64 {
+        let budget = |warm: u64| if round == 0 { u64::MAX } else { warm };
+
+        // Nothing changed: stamped, settled, no read and no commit.
+        let completion = journaled(&run);
+        let out = assert_at_most(budget(0), "a batch of unchanged files told", || {
+            run.watcher.complete(&mut run.vfs, completion, &mut run.effects)
+        });
+        assert!(out.is_empty(), "{out:?}");
+        let completion = stamps(&mut run, 0);
+        let out = assert_at_most(budget(0), "their stamps settled", || {
+            run.watcher.complete(&mut run.vfs, completion, &mut run.effects)
+        });
+        assert!(out.is_empty(), "{out:?}");
+        assert!(run.effects.is_empty(), "nothing read or written: {:?}", run.effects);
+        assert!(run.watcher.idle());
+
+        // Every stamp moved (the same inode, a later mtime): each file is read.
+        let completion = journaled(&run);
+        assert_at_most(budget(0), "a batch of changed files told", || {
+            run.watcher.complete(&mut run.vfs, completion, &mut run.effects)
+        });
+        let completion = stamps(&mut run, 1);
+        let Done::Stamped(moved) = &completion.done else { unreachable!() };
+        let n = moved.len() as u64;
+        assert_at_most(budget(n), "their stamps, a read asked for each", || {
+            run.watcher.complete(&mut run.vfs, completion, &mut run.effects)
+        });
+        assert_eq!(run.effects.iter().filter(|it| matches!(it, Effect::ReadAll { .. })).count() as u64, n);
+        run.pump();
+        assert!(run.watcher.idle());
+        assert_eq!(run.head(), run.disk, "the same bytes read make no change");
+    }
+}
+
+/// `cmp_below` is the order of a name against a directory and a `/`, and `is_below` whether it
+/// is under it, as the strings made would say.
+#[test]
+fn a_name_compares_with_a_directory_as_the_joined_string_does() {
+    let names = ["", "a", "a-", "a.b", "a/", "a/b", "a0", "ab", "a/b/c", "b", "/", "a//", "\u{e9}", "a\u{e9}"];
+    for name in names {
+        for dir in names {
+            let joined = format!("{dir}/");
+            assert_eq!(cmp_below(name, dir), name.cmp(&joined), "{name:?} against {dir:?}/");
+            assert_eq!(is_below(name, dir), name.starts_with(&joined), "{name:?} under {dir:?}");
         }
     }
 }

@@ -1,4 +1,5 @@
 #![cfg(feature = "inventory")]
+#![forbid(unsafe_code)]
 
 #[salsa::interned(debug)]
 struct InternedStruct<'db> {

@@ -9,10 +9,15 @@
 use std::ops::Range;
 
 use blaze_format::cursor::{self, Put, Reader};
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
+
+use crate::model::View;
 
 /// A record's bytes and the places in it the core relocates.
 #[cfg(test)]
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Record {
     pub bytes: Vec<u8>,
     pub fixups: Fields,
@@ -331,6 +336,284 @@ pub(crate) fn fde_splits(placed: &crate::model::Placed<'_>, section: u64, len: u
     splits.sort_unstable();
     splits.dedup();
     splits
+}
+
+/// A record of an image's `.eh_frame` as [`scan`] reads it: a CIE's FDE pointer encoding, or
+/// the address an FDE covers from and how many bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Frame {
+    Cie(u8),
+    Fde { pc: u64, len: u64 },
+}
+
+/// What a read short of a record's fields says, as [`Reader`] says it.
+pub(crate) const EARLY: &str = "bytes that end early";
+
+const NO_CIE: &str = "its CIE pointer names no CIE";
+
+/// The record at `at`: where its body (the CIE ID or pointer) starts and where it ends; none
+/// for a zero length, which ends the section.
+pub(crate) fn entry(bytes: View<'_>, at: usize) -> Result<Option<(usize, usize)>, &'static str> {
+    let (length, body) = match bytes.u32(at).ok_or(EARLY)? {
+        0 => return Ok(None),
+        0xffff_fff0..=0xffff_fffe => return Err("a reserved initial length"),
+        0xffff_ffff => (bytes.u64(at + 4).ok_or(EARLY)?, at + 12),
+        length => (u64::from(length), at + 4),
+    };
+    let end = usize::try_from(length)
+        .ok()
+        .and_then(|it| body.checked_add(it))
+        .filter(|it| *it <= bytes.len())
+        .ok_or("longer than the section")?;
+    Ok(Some((body, end)))
+}
+
+/// The record at `at` of `.eh_frame` (`bytes`, at address `section`), whose body starts at
+/// `body` and which ends at `next` ([`entry`]), as gimli reads it: CIE versions 1, 3 and 4;
+/// the `z`, `L`, `P`, `R` and `S` augmentations; `pc_begin` in the CIE's FDE pointer encoding,
+/// absolute or relative to where it is, indirection ignored. Of an FDE only the CIE pointer,
+/// `pc_begin` and `pc_range` are read, of a CIE only what leads to its pointer encoding.
+/// `cie` gives the encoding of the CIE at the offset an FDE names, or why it names none. The
+/// record is read in place, or put together in `across` where it crosses a page.
+pub(crate) fn frame(
+    bytes: View<'_>,
+    at: usize,
+    (body, next): (usize, usize),
+    section: u64,
+    across: &mut Vec<u8>,
+    cie: impl FnOnce(usize) -> Result<u8, &'static str>,
+) -> Result<Frame, &'static str> {
+    // Positions in `reader` are from the record's start, at `base` in the address space.
+    let base = section + at as u64;
+    let held = bytes.read(at, next - at, across).ok_or(EARLY)?;
+    let mut reader = Reader::starting_at(held, body - at).map_err(cursor::Error::as_str)?;
+    let id = reader.u32().map_err(cursor::Error::as_str)?;
+    if id == 0 {
+        return cie_encoding(&mut reader, base).map(Frame::Cie);
+    }
+    let named = body.checked_sub(id as usize).ok_or("its CIE pointer is before the section")?;
+    let encoding = cie(named)?;
+    let pc = eh_pointer(&mut reader, encoding, base)?;
+    let len = eh_value(&mut reader, encoding)?;
+    Ok(Frame::Fde { pc, len })
+}
+
+/// The FDE pointer encoding of the CIE at `at`, which a walk of another piece met; `across`
+/// holds it where it crosses a page. Any error is the FDE's naming no CIE: a CIE there that
+/// reads wrong is an error of the piece holding it, which comes first.
+fn cie_at(bytes: View<'_>, at: usize, section: u64, across: &mut Vec<u8>) -> Result<u8, &'static str> {
+    let (body, end) = entry(bytes, at).ok().flatten().ok_or(NO_CIE)?;
+    let held = bytes.read(at, end - at, across).ok_or(NO_CIE)?;
+    let mut reader = Reader::starting_at(held, body - at).map_err(|_| NO_CIE)?;
+    if reader.u32().map_err(|_| NO_CIE)? != 0 {
+        return Err(NO_CIE);
+    }
+    cie_encoding(&mut reader, section + at as u64).map_err(|_| NO_CIE)
+}
+
+/// How a walk over a piece of `.eh_frame` ended.
+enum Stop {
+    /// At the piece's end, exactly.
+    End,
+    /// At a zero length, at this offset: the section ends here, whatever follows.
+    Terminator(usize),
+}
+
+/// What a walk over a piece met besides what it kept: the CIEs in it, in order; the CIEs
+/// before it its FDEs named, read where they are, each with its encoding and the first FDE
+/// naming it (each must be one a walk of the pieces before met); and how it ended.
+struct Walked {
+    cies: SmallVec<[(usize, u8); 16]>,
+    foreign: FxHashMap<usize, (u8, usize)>,
+    stop: Result<Stop, String>,
+}
+
+/// The records from `start` (a record's start) up to `end`, each given to `each` with its
+/// offset to keep what it needs onto `items`: an error when a record runs past `end` where
+/// `end` is not the section's. An FDE's CIE pointer must name a CIE met before it: one in
+/// this piece, in `known` (the CIEs before `start`, when a scan found them), or, without
+/// `known`, one [`Walked::foreign`] lists for the caller to check.
+fn walk<T, F: Fn(usize, Frame, &mut Vec<T>) -> Result<(), String>>(
+    bytes: View<'_>,
+    section: u64,
+    (start, end): (usize, usize),
+    known: Option<&[(usize, u8)]>,
+    each: &F,
+    items: &mut Vec<T>,
+) -> Walked {
+    let mut walked = Walked {
+        // alloc: past 16 CIEs in one piece (one per native object), growing by doubling
+        cies: SmallVec::new(),
+        // alloc: only for a CIE another piece holds, once each
+        foreign: FxHashMap::default(),
+        stop: Ok(Stop::End),
+    };
+    // The last CIE an FDE named: most FDEs name the one before's.
+    let mut last: Option<(usize, u8)> = None;
+    // alloc: only for a record across two pages, grown to the longest such record once per walk
+    let (mut across, mut cie_across) = (Vec::new(), Vec::new());
+    // alloc: error path
+    let bad = |at: usize, what: &str| format!("the entry at offset {at:#x}: {what}");
+    let mut at = start;
+    while at < end {
+        let record = at;
+        let found = match entry(bytes, record) {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                walked.stop = Ok(Stop::Terminator(record));
+                return walked;
+            }
+            Err(why) => {
+                walked.stop = Err(bad(record, why));
+                return walked;
+            }
+        };
+        if found.1 > end {
+            // alloc: error path
+            walked.stop = Err(format!("the record at offset {record:#x} runs past {end:#x}, where the core placed an FDE"));
+            return walked;
+        }
+        at = found.1;
+        let Walked { cies, foreign, .. } = &mut walked;
+        let lookup = |named: usize| -> Result<u8, &'static str> {
+            if let Some((offset, encoding)) = last
+                && offset == named
+            {
+                return Ok(encoding);
+            }
+            let encoding = if named >= start {
+                let found = cies.binary_search_by_key(&named, |it| it.0).map_err(|_| NO_CIE)?;
+                cies[found].1
+            } else if let Some(known) = known {
+                let found = known.binary_search_by_key(&named, |it| it.0).map_err(|_| NO_CIE)?;
+                known[found].1
+            } else if let Some(&(encoding, _)) = foreign.get(&named) {
+                encoding
+            } else {
+                let encoding = cie_at(bytes, named, section, &mut cie_across)?;
+                foreign.insert(named, (encoding, record));
+                encoding
+            };
+            last = Some((named, encoding));
+            Ok(encoding)
+        };
+        let frame = match frame(bytes, record, found, section, &mut across, lookup) {
+            Ok(frame) => frame,
+            Err(why) => {
+                walked.stop = Err(bad(record, why));
+                return walked;
+            }
+        };
+        if let Frame::Cie(encoding) = frame {
+            walked.cies.push((record, encoding));
+        }
+        if let Err(why) = each(record, frame, items) {
+            walked.stop = Err(why);
+            return walked;
+        }
+    }
+    walked
+}
+
+/// What [`scan`] read: what `each` kept of the records, in section order; the CIEs, (offset,
+/// FDE pointer encoding) in order; and where the walk stopped (a zero length's offset, or the
+/// section's end).
+pub(crate) struct Scan<T> {
+    pub items: Vec<T>,
+    pub cies: Vec<(usize, u8)>,
+    pub end: usize,
+}
+
+/// Every record of an image's `.eh_frame` (`bytes`, at address `section`), given in order to
+/// `each` with its offset ([`frame`] says how it is read), the walk ending at a zero length.
+/// An FDE's CIE pointer must name a CIE before it, as [`split`] holds every native section to.
+///
+/// The section is walked in pieces from 0 and from each of `splits` (record starts, sorted:
+/// [`fde_splits`]), in parallel; each piece must end exactly where the next starts. The answer
+/// is the one walk from 0 gives, its first error included, on any number of cores. An error
+/// `each` returns is the walk's at that record.
+pub(crate) fn scan<T: Copy + Default + Send + Sync>(
+    bytes: View<'_>,
+    section: u64,
+    splits: &[usize],
+    each: impl Fn(usize, Frame, &mut Vec<T>) -> Result<(), String> + Sync,
+) -> Result<Scan<T>, String> {
+    let piece = |nth: usize| {
+        let start = if nth == 0 { 0 } else { splits[nth - 1] };
+        let end = splits.get(nth).copied().unwrap_or(bytes.len());
+        // alloc: once per piece: compilers' records take 32 bytes or so, so it grows at most a
+        // few times
+        let mut items = Vec::with_capacity((end - start) / 32);
+        let walked = walk(bytes, section, (start, end), None, &each, &mut items);
+        (items, walked)
+    };
+    if splits.is_empty() {
+        let (items, walked) = piece(0);
+        let end = match walked.stop? {
+            Stop::End => bytes.len(),
+            Stop::Terminator(at) => at,
+        };
+        return Ok(Scan { items, cies: walked.cies.into_vec(), end });
+    }
+    // alloc: once per image, one result per piece
+    let mut pieces: Vec<(Vec<T>, Walked)> = (0..splits.len() + 1).into_par_iter().map(piece).collect();
+    // The pieces the one walk reaches: up to the first that ends the section or fails. A piece's
+    // first FDE naming no CIE met before is its first error: the walk went on past it.
+    // alloc: once per image, the CIEs
+    let mut cies: Vec<(usize, u8)> = Vec::with_capacity(pieces.iter().map(|it| it.1.cies.len()).sum());
+    let (mut kept, mut end) = (pieces.len(), bytes.len());
+    for (nth, (_, walked)) in pieces.iter_mut().enumerate() {
+        let met = |named: &usize| cies.binary_search_by_key(named, |it| it.0).is_ok();
+        let unmet = walked.foreign.iter().filter(|(named, _)| !met(named)).map(|(_, &(_, record))| record).min();
+        if let Some(record) = unmet {
+            // alloc: error path
+            return Err(format!("the entry at offset {record:#x}: {NO_CIE}"));
+        }
+        cies.extend_from_slice(&walked.cies);
+        match &mut walked.stop {
+            Ok(Stop::End) => {}
+            Ok(Stop::Terminator(at)) => {
+                (kept, end) = (nth + 1, *at);
+                break;
+            }
+            Err(why) => return Err(std::mem::take(why)),
+        }
+    }
+    // alloc: once per image, one slice per piece
+    let parts: Vec<&[T]> = pieces[..kept].iter().map(|it| &it.0[..]).collect();
+    Ok(Scan { items: concat(&parts), cies, end })
+}
+
+/// `parts` one after another, each copied in parallel at its place.
+pub(crate) fn concat<T: Copy + Default + Send + Sync>(parts: &[&[T]]) -> Vec<T> {
+    let len = parts.iter().map(|it| it.len()).sum();
+    // alloc: once per table, its exact length
+    let mut items: Vec<T> = Vec::with_capacity(len);
+    items.par_extend((0..len).into_par_iter().with_min_len(4096).map(|_| T::default()));
+    let mut rest = &mut items[..];
+    // alloc: once per table, one slice per part
+    let mut jobs = Vec::with_capacity(parts.len());
+    for &part in parts {
+        let (these, after) = std::mem::take(&mut rest).split_at_mut(part.len());
+        jobs.push((these, part));
+        rest = after;
+    }
+    jobs.into_par_iter().for_each(|(out, part)| out.copy_from_slice(part));
+    items
+}
+
+/// The records from `start` (a record's start) up to `end` given to `each` onto `items`, the
+/// CIEs before `start` found in `cies` (a [`scan`]'s): what a scan's walk from `start` reads,
+/// for a writer patching what it read last.
+pub(crate) fn rewalk<T>(
+    bytes: View<'_>,
+    section: u64,
+    (start, end): (usize, usize),
+    cies: &[(usize, u8)],
+    each: impl Fn(usize, Frame, &mut Vec<T>) -> Result<(), String>,
+    items: &mut Vec<T>,
+) -> Result<(), String> {
+    walk(bytes, section, (start, end), Some(cies), &each, items).stop.map(|_| ())
 }
 
 #[cfg(test)]

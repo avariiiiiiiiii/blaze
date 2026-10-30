@@ -4,15 +4,29 @@
 //! [`Mapped`] value's is a `u32` ID that means the same in every process restoring one image
 //! (docs/v2/plan/design/restore.md): written into it, opened in place, and freed only by its GC
 //! ([`Live`]), which never renumbers a value still named.
+//!
+//! Unsafe code lives in two modules with safe APIs (docs/v2/plan/design/unsafe.md): `space`, the
+//! raw region memory (claims, zeroed tables, placed values, published pointers, the ID column's
+//! words), and `typed`, the typed values of a store (a `T`, a header and items, a table's
+//! record). The symbol table's one view of its bytes as text is `symbol`'s `text` module.
+
+#![deny(unsafe_code)]
 
 mod arena;
+mod concat;
+#[cfg(feature = "fuzz")]
+#[allow(unsafe_code)]
+pub mod fuzz;
 mod intern;
 mod intern_slice;
 mod mapped;
+#[allow(unsafe_code)]
 mod space;
 mod symbol;
 mod sync;
 mod table;
+#[allow(unsafe_code)]
+mod typed;
 
 /// Counts allocations so the read paths' tests hold them to a budget.
 #[cfg(all(test, not(blaze_check)))]

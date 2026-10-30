@@ -56,9 +56,9 @@ enum Limit {
 
 /// `command` started: in its sandbox, made by `confine`, unless the sandbox is off; with its
 /// memory held where a limit is asked for. Its input is in `finish.command.stdin`, for the
-/// driver to write to `stdin`.
+/// driver to write to `stdin`. A sandboxed one gets a directory of its own under `spawns`.
 pub(crate) fn start(
-    root: &Path,
+    spawns: &Path,
     command: Box<Command>,
     // dyn: as `Finish::confine`.
     confine: Option<&Arc<dyn Confine>>,
@@ -79,7 +79,7 @@ pub(crate) fn start(
                 ));
             };
             // alloc: once per sandboxed spawn, its scratch directory, kept until it exits.
-            let scratch = root.join(".blaze-spawn").join(format!("{}-{n}", std::process::id()));
+            let scratch = spawns.join(format!("{}-{n}", std::process::id()));
             _ = std::fs::remove_dir_all(&scratch);
             std::fs::create_dir_all(&scratch)?;
             match confine.confine(&command, &scratch) {
@@ -194,7 +194,9 @@ impl Finish {
                 if let Some(scratch) = &self.scratch {
                     _ = std::fs::remove_dir_all(scratch);
                 }
-                return Err(error);
+                // alloc: an error path.
+                let why = format!("{}: {error}", self.command.program.display());
+                return Err(io::Error::new(error.kind(), why));
             }
         };
         let (code, signal) = match libc::WIFSIGNALED(status) {

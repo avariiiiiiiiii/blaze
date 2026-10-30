@@ -1,5 +1,6 @@
 pub(crate) use maybe_changed_after::VerifyResult;
 pub(crate) use memo::ErasedMemo;
+pub use sync::ClaimBench;
 pub(crate) use sync::{ClaimGuard, ClaimResult, Reentrancy, SyncGuard, SyncOwner, SyncTable};
 
 use std::any::Any;
@@ -10,7 +11,7 @@ use std::sync::atomic::Ordering;
 use crate::cycle::{CycleRecoveryStrategy, IterationStamp, ProvisionalStatus};
 use crate::database::RawDatabase;
 use crate::fingerprint::Fingerprint;
-use crate::graph::Relocation;
+use crate::graph::{EdgeWords, LiveEdges, Relocation};
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::ingredient::Ingredient;
 use crate::key::DatabaseKeyIndex;
@@ -19,6 +20,7 @@ use crate::salsa_struct::SalsaStructInDb;
 use crate::sync::Arc;
 use crate::table::Table;
 use crate::table::memo::{MemoSlot, MemoTableTypes};
+use crate::table::scan::{PageRange, workers_for};
 use crate::views::DatabaseDownCaster;
 use crate::zalsa::{IngredientIndex, JarKind, MemoIngredientIndex, Zalsa};
 use crate::zalsa_local::QueryEdge;
@@ -31,6 +33,7 @@ mod diff_outputs;
 mod eviction;
 mod execute;
 mod fetch;
+mod lru;
 mod maybe_changed_after;
 mod memo;
 mod specify;
@@ -285,41 +288,43 @@ pub struct IngredientImpl<C: Configuration> {
     /// dropped or a recomputed value is compared with a dropped one.
     value_hasher: Option<ValueHasher<C>>,
 
-    /// The verified-at revisions `evict_least_recently_verified` ranks, kept between revisions
-    /// so the ranking allocates once.
-    lru_scratch: Vec<Revision>,
+    /// The pages and per-worker buffers `evict_least_recently_verified` uses, kept between
+    /// revisions so the pass allocates only when the table outgrows them.
+    lru_scratch: lru::LruScratch,
 }
 
-/// Which values an LRU pass drops: those verified before `cutoff`, and the first `at_cutoff` (in
-/// slot order) of those verified in `cutoff` itself.
-struct EvictionCutoff {
-    cutoff: Revision,
-    at_cutoff: usize,
+/// One worker's pages of an LRU pass, over the memos of `C` whose values it may drop.
+struct LruPages<'w, C: Configuration> {
+    range: PageRange<'w>,
+    hasher: Option<ValueHasher<C>>,
 }
 
-impl EvictionCutoff {
-    /// The cutoff that keeps `capacity` of the values whose memos were verified at `verified`
-    /// (in slot order; reordered here), or `None` if they fit.
-    fn new(verified: &mut [Revision], capacity: usize) -> Option<Self> {
-        let excess = verified.len().checked_sub(capacity).filter(|&n| n > 0)?;
-        let cutoff = *verified.select_nth_unstable(excess - 1).1;
-        let below = verified.iter().filter(|&&at| at < cutoff).count();
-        Some(Self {
-            cutoff,
-            at_cutoff: excess - below,
-        })
+impl<C: Configuration> lru::Evictable for LruPages<'_, C> {
+    fn each_verified(&mut self, mut f: impl FnMut(Revision)) {
+        self.range.for_each_memo_table_mut(|memos, index| {
+            memos.map_memo(index, |memo: &mut Memo<C>| {
+                if memo.value.is_some() && memo.header.can_evict_value() {
+                    f(memo.header.verified_at.load());
+                }
+            });
+        });
     }
 
-    /// Whether the next value, in slot order, verified at `at` is dropped.
-    fn evicts(&mut self, at: Revision) -> bool {
-        if at < self.cutoff {
-            return true;
-        }
-        if at == self.cutoff && self.at_cutoff > 0 {
-            self.at_cutoff -= 1;
-            return true;
-        }
-        false
+    fn evict(&mut self, mut evicts: impl FnMut(Revision) -> bool) {
+        let hasher = self.hasher;
+        self.range.for_each_memo_table_mut(|memos, index| {
+            memos.map_memo(index, |memo: &mut Memo<C>| {
+                if memo.value.is_none() || !memo.header.can_evict_value() {
+                    return;
+                }
+                if evicts(memo.header.verified_at.load())
+                    && let Some(value) = memo.value.take()
+                {
+                    let fingerprint = IngredientImpl::<C>::fingerprint_with(hasher, &value);
+                    memo.header.revisions.set_value_fingerprint(fingerprint);
+                }
+            });
+        });
     }
 }
 
@@ -339,8 +344,8 @@ where
             view_caster: OnceLock::new(),
             sync_table: SyncTable::new(index),
             value_hasher: None,
-            // alloc: `Vec::new` allocates nothing; the LRU's scratch is reused every revision
-            lru_scratch: Vec::new(),
+            // alloc: allocates nothing; the LRU's scratch is reused every revision
+            lru_scratch: lru::LruScratch::default(),
         }
     }
 
@@ -440,35 +445,23 @@ where
 
     /// Drops the values of the memos verified longest ago until at most `capacity` hold one.
     /// Memos verified in the same revision go in slot order, so the choice is deterministic.
+    /// The table's pages are split between workers (`lru`), the values each drops being those
+    /// one walk in page and slot order would.
     fn evict_least_recently_verified(&mut self, table: &mut Table, capacity: usize) {
         let indices = &self.memo_ingredient_indices;
-        let memo_index = |struct_ingredient| indices.get_checked(struct_ingredient);
-        let mut verified = std::mem::take(&mut self.lru_scratch);
-        verified.clear();
-        table.for_each_memo_table_mut::<Memo<C>>(memo_index, |memos, index| {
-            memos.map_memo(index, |memo: &mut Memo<C>| {
-                if memo.value.is_some() && memo.header.can_evict_value() {
-                    verified.push(memo.header.verified_at.load());
-                }
-            });
-        });
-        if let Some(mut cutoff) = EvictionCutoff::new(&mut verified, capacity) {
-            let hasher = self.value_hasher;
-            table.for_each_memo_table_mut::<Memo<C>>(memo_index, |memos, index| {
-                memos.map_memo(index, |memo: &mut Memo<C>| {
-                    if memo.value.is_none() || !memo.header.can_evict_value() {
-                        return;
-                    }
-                    if cutoff.evicts(memo.header.verified_at.load())
-                        && let Some(value) = memo.value.take()
-                    {
-                        let fingerprint = Self::fingerprint_with(hasher, &value);
-                        memo.header.revisions.set_value_fingerprint(fingerprint);
-                    }
-                });
-            });
-        }
-        self.lru_scratch = verified;
+        let hasher = self.value_hasher;
+        let lru::LruScratch { pages, ranker } = &mut self.lru_scratch;
+        table.memo_pages::<Memo<C>>(
+            |struct_ingredient| indices.get_checked(struct_ingredient),
+            pages,
+        );
+        let workers = workers_for(pages.len());
+        let mut walk = table.page_walk(pages);
+        ranker.evict(
+            walk.ranges(workers)
+                .map(|range| LruPages::<C> { range, hasher }),
+            capacity,
+        );
     }
 
     /// Returns a reference to the memo value that lives as long as self.
@@ -496,13 +489,17 @@ where
         if let Some(tracked_struct_ids) = memo.header.revisions.tracked_struct_ids_mut() {
             tracked_struct_ids.shrink_to_fit();
         }
+        memo.header.node = zalsa.graph().node(self.database_key_index(id));
+        memo.header.publish_closure(zalsa);
 
         // The memo it replaces, if any, is retired: a reader may still borrow it, so it is
         // dropped at the next reclaim, when a new revision starts.
         let memo = self.insert_memo_into_table_for(zalsa, id, memo, memo_ingredient_index);
         // SAFETY: The memo has been inserted into the table, which keeps it until it is
         // replaced and then until the next reclaim, which needs `&mut Zalsa`.
-        unsafe { self.extend_memo_lifetime(memo.as_ref()) }
+        let memo = unsafe { self.extend_memo_lifetime(memo.as_ref()) };
+        memo.header.paint(zalsa);
+        memo
     }
 
     #[inline]
@@ -664,7 +661,24 @@ where
             |struct_ingredient| indices.get_checked(struct_ingredient),
             |memos, index| {
                 memos.map_memo(index, |memo: &mut Memo<C>| {
+                    memo.header.node = relocation.node(memo.header.node);
                     memo.header.revisions.relocate_edges(relocation);
+                });
+            },
+        );
+    }
+
+    fn memo_edges(&self, table: &mut Table, live: &mut LiveEdges<'_>) {
+        let indices = &self.memo_ingredient_indices;
+        let graph = live.graph();
+        table.for_each_memo_table_mut::<Memo<C>>(
+            |struct_ingredient| indices.get_checked(struct_ingredient),
+            |memos, index| {
+                memos.map_memo(index, |memo: &mut Memo<C>| {
+                    if let Some(node) = memo.header.node() {
+                        let words = memo.header.revisions.origin(graph).edges().words();
+                        live.push(node, words.unwrap_or(EdgeWords::EMPTY));
+                    }
                 });
             },
         );
@@ -680,6 +694,10 @@ where
 
     fn read_kind(&self) -> crate::ingredient::ReadKind {
         crate::ingredient::ReadKind::Query
+    }
+
+    fn closure_class(&self) -> crate::graph::ClosureClass {
+        crate::graph::ClosureClass::Query
     }
 
     fn memo_table_types(&self) -> &Arc<MemoTableTypes> {
@@ -1104,7 +1122,7 @@ mod persistence {
             let task = TaskGraph::default();
 
             while let Some((key, memo)) = access.next_entry::<&str, PersistedMemo<C>>()? {
-                let memo = memo.record(zalsa.graph(), &task);
+                let mut memo = memo.record(zalsa.graph(), &task);
                 let (ingredient_index, id) = key
                     .split_once(':')
                     .ok_or_else(|| de::Error::custom("invalid database key"))?;
@@ -1122,67 +1140,17 @@ mod persistence {
                 // before its memos, but its saved revision may differ from the current runtime.
                 let memo_table = unsafe { zalsa.table().dyn_memos_unchecked(id) };
 
-                memo_table.insert(memo_ingredient_index, memo);
+                memo.header.node = zalsa
+                    .graph()
+                    .node(DatabaseKeyIndex::new(ingredient_index, id));
+                memo.header.publish_closure(zalsa);
+                let memo = memo_table.insert(memo_ingredient_index, memo);
+                // SAFETY: the table keeps the memo it was given until a reclaim, which needs the
+                // `&mut` deserialization holds.
+                unsafe { memo.as_ref() }.header.paint(zalsa);
             }
 
             Ok(())
         }
-    }
-}
-
-#[cfg(test)]
-mod lru_tests {
-    use blaze_ids::rng::SplitMix64;
-
-    use super::EvictionCutoff;
-    use crate::Revision;
-
-    /// The safe reference: sort the slots by (verified-at, slot) and drop the first `excess`.
-    fn reference(verified: &[Revision], capacity: usize) -> Vec<bool> {
-        let mut order: Vec<usize> = (0..verified.len()).collect();
-        order.sort_by_key(|&slot| (verified[slot], slot));
-        let mut evicted = vec![false; verified.len()];
-        for &slot in order.iter().take(verified.len().saturating_sub(capacity)) {
-            evicted[slot] = true;
-        }
-        evicted
-    }
-
-    fn evicted(verified: &[Revision], capacity: usize) -> Vec<bool> {
-        let mut scratch = verified.to_vec();
-        match EvictionCutoff::new(&mut scratch, capacity) {
-            None => vec![false; verified.len()],
-            Some(mut cutoff) => verified.iter().map(|&at| cutoff.evicts(at)).collect(),
-        }
-    }
-
-    #[test]
-    fn cutoff_matches_sorted_reference() {
-        let mut rng = SplitMix64::new(0x5eed);
-        for _ in 0..2000 {
-            let len = rng.index(40);
-            let revisions = 1 + rng.below(6);
-            let capacity = 1 + rng.index(40);
-            let verified: Vec<Revision> = (0..len)
-                .map(|_| Revision::from(1 + rng.below(revisions) as usize))
-                .collect();
-            let got = evicted(&verified, capacity);
-            assert_eq!(got, reference(&verified, capacity), "{verified:?} cap {capacity}");
-            let kept = got.iter().filter(|&&e| !e).count();
-            assert_eq!(kept, len.min(capacity));
-            let newest_evicted = verified.iter().zip(&got).filter(|p| *p.1).map(|p| *p.0).max();
-            let oldest_kept = verified.iter().zip(&got).filter(|p| !*p.1).map(|p| *p.0).min();
-            if let (Some(evicted), Some(kept)) = (newest_evicted, oldest_kept) {
-                assert!(evicted <= kept);
-            }
-        }
-    }
-
-    #[test]
-    fn ties_go_in_slot_order() {
-        let r = Revision::from(3);
-        assert_eq!(evicted(&[r, r, r, r], 2), [true, true, false, false]);
-        let old = Revision::from(1);
-        assert_eq!(evicted(&[r, old, r, old], 3), [false, true, false, false]);
     }
 }

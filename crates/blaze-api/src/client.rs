@@ -354,7 +354,7 @@ impl Client {
         {
             link.waiting = None;
         }
-        Ok(envelope)
+        Ok(Some(envelope))
     }
 
     /// Reads more of the daemon's bytes into the frames; false once an HTTP response has

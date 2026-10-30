@@ -387,8 +387,7 @@ there wanted (`headerpad_ahead`), so it is not linked twice.
 
 An alternative wrapper exists in `stub.rs` (`BLAZE_WRAPS_RUSTC`), where rustc compiles only
 a stub for each workspace crate and all code is blaze's. It makes the first build faster,
-but a function blaze refuses then has no rustc copy to fall back on, so it is used by
-`harness/alone.py` and not by `blaze`.
+but a function blaze refuses then has no rustc copy to fall back on, so `blaze` does not use it.
 
 ## Debug info
 

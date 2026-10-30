@@ -207,19 +207,23 @@ pub fn vacant<const SLOTS: usize>(
     }
 }
 
-/// Slots in a group of an [`Index`]: a control word and eight `u32`s, 40 bytes.
-const INDEX_SLOTS: usize = 8;
+/// Slots in a group of an [`Index`]: a control word and six `u32`s, 32 bytes aligned to 32, so
+/// two groups fill a 64-byte line and none straddles two. Eight slots made a 40-byte group, half
+/// of which crossed a line: about a third of the slots a hit reads were a line away from their
+/// control word.
+const INDEX_SLOTS: usize = 6;
 /// Table `k` of an [`Index`] has `1 << k` groups: 31 levels hold more than `2^32` values at
-/// three quarters full.
+/// three quarters full (`2^30 × 6 × 3 / 4`).
 const LEVELS: usize = 31;
 
+#[repr(C, align(32))]
 struct Group {
     ctrl: AtomicU64,
     values: [AtomicU32; INDEX_SLOTS],
 }
 
 #[cfg(not(blaze_check))]
-const _: () = assert!(size_of::<Group>() == 40);
+const _: () = assert!(size_of::<Group>() == 32 && align_of::<Group>() == 32);
 
 fn new_table(len: usize) -> Box<[Group]> {
     (0..len)
@@ -232,12 +236,12 @@ fn new_table(len: usize) -> Box<[Group]> {
 /// the caller computed once: what an interner keyed by a dense index puts beside its arena.
 ///
 /// A [`Index::find`] takes no lock and writes nothing: an acquire load of the level, one of
-/// the home group's word (almost always the only one) and one slot from the same 40 bytes, then
-/// the caller's check, which reads its column only on a tag match (one in 128 for another
-/// value). Inserts are the caller's to serialize (its shard's lock). A table fills to three
+/// the home group's word (almost always the only one) and one slot from the same 32 bytes, one
+/// cache line, then the caller's check, which reads its column only on a tag match (one in 128
+/// for another value). Inserts are the caller's to serialize (its shard's lock). A table fills to three
 /// quarters, then the next level, twice its size, is filled from it and published with one
 /// release store; the levels it outgrew stay readable, as a reader may be probing one, until
-/// [`Index::release_outgrown`] frees them with `&mut`. A value costs 6.7 to 13.3 bytes of
+/// [`Index::release_outgrown`] frees them with `&mut`. A value costs 7.1 to 14.2 bytes of
 /// table, and nothing is stored of its hash: growing asks the caller for it.
 ///
 /// An index with no value has no table: [`Index::new`] allocates nothing.
@@ -339,7 +343,8 @@ fn put(groups: &[Group], hash: u64, value: u32, publish: Ordering) {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     use super::*;
 
@@ -423,48 +428,47 @@ mod tests {
         assert_eq!(word.full().collect::<Vec<_>>(), full);
     }
 
-    proptest! {
-        #[test]
-        fn words_agree_with_the_copies(bytes in any::<[u8; 8]>(), tag in 0x80u8..=0xff) {
-            agrees::<7>(bytes, tag);
-            agrees::<8>(bytes, tag);
-            agrees::<4>(bytes, tag);
-        }
+    #[hegel::test]
+    fn words_agree_with_the_copies(tc: TestCase) {
+        let bytes: [u8; 8] = tc.draw(gs::arrays(gs::integers()));
+        let tag: u8 = tc.draw(gs::integers().min_value(0x80));
+        agrees::<7>(bytes, tag);
+        agrees::<8>(bytes, tag);
+        agrees::<4>(bytes, tag);
+    }
 
-        /// `find` against the copies' loop, over tables a third to seven eighths full whose
-        /// keys share few hashes, and `vacant` against the group `find` stops at.
-        #[test]
-        fn probes_agree_with_the_copies(
-            seed in any::<u64>(),
-            log_groups in 0u32..6,
-            fill in 3u64..8,
-            hash in any::<u64>(),
-        ) {
-            const SLOTS: usize = 7;
-            let groups = 1usize << log_groups;
-            let mut next = seed;
-            let mut words = vec![0u64; groups];
-            let mut keys = vec![u64::MAX; groups * SLOTS];
-            let total = (groups * SLOTS) as u64 * fill / 8;
-            for _ in 0..total {
-                next = next.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let key = next >> 60;
-                let key_hash = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (key << 57);
-                let at = vacant::<SLOTS>(key_hash, groups, |g| Ctrl(words[g]));
-                words[at.group] = at.tagged(tag(key_hash)).0;
-                keys[at.index()] = key;
-            }
-            let key = hash >> 60;
-            let hash = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (key << 57);
-            let low = Ctrl::<SLOTS>::LOW;
-            let want = reference::find(&words, SLOTS, hash, u64::from(tag(hash)), low, |i| keys[i] == key);
-            let got = find::<SLOTS, usize>(hash, tag(hash), groups, |g| Ctrl(words[g]), |at| (keys[at.index()] == key).then_some(at.index()));
-            prop_assert_eq!(got, want);
-            if words.iter().any(|&w| Ctrl::<SLOTS>(w).empty().any()) {
-                let stop = vacant::<SLOTS>(hash, groups, |g| Ctrl(words[g]));
-                prop_assert!(Ctrl::<SLOTS>(words[stop.group]).empty().any());
-                prop_assert_eq!(stop.ctrl.0, words[stop.group]);
-            }
+    /// `find` against the copies' loop, over tables a third to seven eighths full whose
+    /// keys share few hashes, and `vacant` against the group `find` stops at.
+    #[hegel::test]
+    fn probes_agree_with_the_copies(tc: TestCase) {
+        let seed: u64 = tc.draw(gs::integers());
+        let log_groups: u32 = tc.draw(gs::integers().max_value(5));
+        let fill: u64 = tc.draw(gs::integers().min_value(3).max_value(7));
+        let hash: u64 = tc.draw(gs::integers());
+        const SLOTS: usize = 7;
+        let groups = 1usize << log_groups;
+        let mut next = seed;
+        let mut words = vec![0u64; groups];
+        let mut keys = vec![u64::MAX; groups * SLOTS];
+        let total = (groups * SLOTS) as u64 * fill / 8;
+        for _ in 0..total {
+            next = next.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let key = next >> 60;
+            let key_hash = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (key << 57);
+            let at = vacant::<SLOTS>(key_hash, groups, |g| Ctrl(words[g]));
+            words[at.group] = at.tagged(tag(key_hash)).0;
+            keys[at.index()] = key;
+        }
+        let key = hash >> 60;
+        let hash = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (key << 57);
+        let low = Ctrl::<SLOTS>::LOW;
+        let want = reference::find(&words, SLOTS, hash, u64::from(tag(hash)), low, |i| keys[i] == key);
+        let got = find::<SLOTS, usize>(hash, tag(hash), groups, |g| Ctrl(words[g]), |at| (keys[at.index()] == key).then_some(at.index()));
+        assert_eq!(got, want);
+        if words.iter().any(|&w| Ctrl::<SLOTS>(w).empty().any()) {
+            let stop = vacant::<SLOTS>(hash, groups, |g| Ctrl(words[g]));
+            assert!(Ctrl::<SLOTS>(words[stop.group]).empty().any());
+            assert_eq!(stop.ctrl.0, words[stop.group]);
         }
     }
 
@@ -614,6 +618,26 @@ mod tests {
         assert_eq!(*len.lock().unwrap(), KEYS / 2);
     }
 
+    /// A probe reads one line: every group of every level starts on a 32-byte boundary, so its
+    /// word and slots never cross a 64-byte line.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn index_groups_never_straddle_a_line() {
+        let index = Index::new();
+        let keys: Vec<u64> = (0..5_000).collect();
+        for (len, &key) in keys.iter().enumerate() {
+            index.insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]));
+        }
+        let levels = index.level.load(Ordering::Relaxed);
+        assert!(levels > 5);
+        for table in index.tables[..levels].iter().filter_map(OnceLock::get) {
+            for group in table.iter() {
+                let at = std::ptr::from_ref(group).addr();
+                assert_eq!(at / 64, (at + size_of::<Group>() - 1) / 64, "a group in one line");
+            }
+        }
+    }
+
     #[cfg(not(blaze_check))]
     #[test]
     fn an_index_allocates_only_to_grow() {
@@ -654,26 +678,28 @@ mod model {
     use super::*;
 
     /// Every value is its own key, all of one hash: one home group and one tag, so every probe
-    /// asks the caller and six values fill the first table to three quarters.
+    /// asks the caller and four values fill the first table (one group of six) to three
+    /// quarters.
     const HASH: u64 = 3;
 
     #[test]
     fn model_swiss_reader_races_growth() {
         blaze_check::model(|| {
             let index = Arc::new(Index::new());
-            for value in 0..6u32 {
+            for value in 0..4u32 {
                 index.insert(value as usize, HASH, value, |_| HASH);
             }
+            assert_eq!(index.capacity(), 4);
             let reader = {
                 let index = index.clone();
-                thread::spawn(move || (index.find(HASH, |it| it == 0), index.find(HASH, |it| it == 6)))
+                thread::spawn(move || (index.find(HASH, |it| it == 0), index.find(HASH, |it| it == 4)))
             };
-            index.insert(6, HASH, 6, |_| HASH);
-            index.insert(7, HASH, 7, |_| HASH);
-            let (zero, six) = reader.join().unwrap();
+            index.insert(4, HASH, 4, |_| HASH);
+            index.insert(5, HASH, 5, |_| HASH);
+            let (zero, four) = reader.join().unwrap();
             assert_eq!(zero, Some(0), "a value from before the growth is found");
-            assert!(six.is_none() || six == Some(6), "a value is found whole or not at all");
-            for value in 0..8 {
+            assert!(four.is_none() || four == Some(4), "a value is found whole or not at all");
+            for value in 0..6 {
                 assert_eq!(index.find(HASH, |it| it == value), Some(value), "kept across the growth");
             }
         });

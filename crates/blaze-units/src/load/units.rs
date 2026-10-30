@@ -14,8 +14,7 @@ use blaze_manifest::{Context, Workspace};
 use blaze_query::Cancelled;
 use blaze_resolve::resolver::{CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, PackageTargets};
 use blaze_resolve::{Cfg, InternedString, PackageId, Platform};
-use cargo_util_schemas::manifest::{TomlProfile, TomlProfiles};
-use cargo_util_schemas::restricted_names::ProfileName;
+use cargo_util_schemas::manifest::{ProfileName, TomlProfile, TomlProfiles};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::files::Snap;
@@ -524,10 +523,10 @@ fn artifact_refusal(graph: &schema::UnitGraph, packages: &BySpec<'_>, resolved: 
         }
         let script = unit.target.is_custom_build() && unit.mode != Mode::RunCustomBuild;
         let dev = matches!(unit.mode, Mode::Test) || unit.target.kind.iter().any(|it| matches!(it.as_str(), "test" | "bench" | "example"));
-        let used = |kind: blaze_resolve::DepKind| match kind {
-            blaze_resolve::DepKind::Build => script,
-            blaze_resolve::DepKind::Development => dev && !script,
-            blaze_resolve::DepKind::Normal => !script && unit.mode != Mode::RunCustomBuild,
+        let used = |kind: blaze_manifest::dependency::DepKind| match kind {
+            blaze_manifest::dependency::DepKind::Build => script,
+            blaze_manifest::dependency::DepKind::Development => dev && !script,
+            blaze_manifest::dependency::DepKind::Normal => !script && unit.mode != Mode::RunCustomBuild,
         };
         for dep in &package.manifest.dependencies {
             let Some(artifact) = &dep.artifact else { continue };

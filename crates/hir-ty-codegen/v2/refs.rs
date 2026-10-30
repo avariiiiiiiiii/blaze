@@ -27,7 +27,7 @@ use hir_ty::{
     drop::DropGlue,
     intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::is_dyn_method,
-    next_solver::{ConstKind, GenericArgs, ParamEnv, Region, Ty, TyKind},
+    next_solver::{ConstKind, GenericArgs, ParamEnv, Region, RegionExt, Ty, TyKind},
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::{
@@ -641,7 +641,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     ConstKind::Value(value) => {
                         self.recorded(|fx| fx.valtree_blob(ty, value.value))?;
                     }
-                    ConstKind::Unevaluated(unevaluated) => {
+                    ConstKind::Alias(_, unevaluated) => {
                         self.recorded(|fx| {
                             let allocation = fx.eval_const(unevaluated)?;
                             fx.allocation_blob(allocation, false)
@@ -1256,6 +1256,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             // alloc: the error's message
             return Err(format!("call of {fn_ty:?}"));
         };
+        let generic_args = generic_args.skip_binder();
         let func = match def.0 {
             CallableDefId::FunctionId(func) => func,
             CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => {
@@ -1296,6 +1297,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 // alloc: the error's message
                 return Err("const_eval_select with a non-fn-item runtime function".to_owned());
             };
+            let runtime_args = runtime_args.skip_binder();
             let CallableDefId::FunctionId(runtime) = runtime.0 else {
                 // alloc: the error's message
                 return Err("const_eval_select with a constructor".to_owned());
@@ -1395,7 +1397,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                         // alloc: the error's message
                         return Err(format!("intrinsic `{intrinsic}` called through an Fn trait"));
                     }
-                    self.call_direct(func, generic_args, &arg_tys, dst_ty)
+                    self.call_direct(func, generic_args.skip_binder(), &arg_tys, dst_ty)
                 }
                 CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => Ok(()),
             },
@@ -1524,7 +1526,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                         }
                         OperandKind::Constant { konst, .. }
                             if matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_))
-                                && let ConstKind::Unevaluated(named) = konst.as_ref().kind() =>
+                                && let ConstKind::Alias(_, named) = konst.as_ref().kind() =>
                         {
                             let mut bytes = [0; 16];
                             let memory = &self.fx.eval_const(named).map_err(told)?.memory;

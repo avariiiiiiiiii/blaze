@@ -90,6 +90,51 @@ fn crate_deps_are_memo_hits() {
     assert_eq!(used.allocations, 0, "crate deps, warm: {used:?}");
 }
 
+/// Setting a graph equal to the one set allocates the call's maps and nothing per crate: no
+/// crate's data is built and none is hashed.
+#[test]
+fn an_unchanged_crate_graph_allocates_a_constant() {
+    // `set_in_db`'s returned map, the crate list's two tables and the root files' set, each at
+    // the graph's size.
+    const PER_CALL: u64 = 4;
+    let cost = |n: u32| {
+        let mut db = Db::for_tests();
+        let files: Vec<FileId> = (0..n).map(FileId::from_raw).collect();
+        let mut set = FileSet::default();
+        for &file in &files {
+            db.set_file_text_with_durability(file, "fn f() {}\n", Durability::LOW);
+            db.set_file_source_root_with_durability(file, SourceRootId(0), Durability::MEDIUM);
+            set.insert(file, VfsPath::new_virtual_path(format!("/graph/c{}/lib.rs", file.index())));
+        }
+        let root = Arc::new(SourceRoot::new_local(set));
+        db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
+        // Each crate depends on the one before it.
+        let graph = || {
+            let mut graph = CrateGraphBuilder::default();
+            let mut before = None;
+            for &file in &files {
+                let id = lib_root(&mut graph, file);
+                if let Some(before) = before {
+                    let name = CrateName::new("before").unwrap();
+                    graph.add_dep(id, DependencyBuilder::new(name, before)).unwrap();
+                }
+                before = Some(id);
+            }
+            graph
+        };
+        graph().set_in_db(&mut db);
+        graph().set_in_db(&mut db);
+        let equal = graph();
+        let (ids, used) = blaze_alloc_count::measure(|| equal.set_in_db(&mut db));
+        assert_eq!(ids.len(), n as usize);
+        used.allocations
+    };
+    let few = cost(8);
+    let many = cost(256);
+    assert!(few <= PER_CALL, "an unchanged graph of 8 crates: {few} allocations");
+    assert_eq!(many, few, "an unchanged graph of 256 crates against 8");
+}
+
 /// Every read the brief names, of every file: its text, whether it has text, its source root
 /// and the root's file set, its crates and its parse.
 fn read_all(db: &Db, files: &[FileId]) -> usize {
@@ -184,6 +229,31 @@ fn an_unchanged_view_allocates_nothing() {
             );
         }
     }
+}
+
+/// A file taken out of a view, or put back, edits its root's file set and content where they
+/// are: what it allocates does not grow with the root.
+#[test]
+fn a_file_added_or_removed_costs_a_constant() {
+    let cost = |n: usize| {
+        let (mut db, base, partition) = checkout();
+        let files = texts(n, 0);
+        let view = view_files(&files);
+        set_view(&mut db, &base, &[], &partition, &view);
+        set_view(&mut db, &base, &[], &partition, &view[..n - 1]);
+        set_view(&mut db, &base, &[], &partition, &view);
+        let (gone, removed) = set_view(&mut db, &base, &[], &partition, &view[..n - 1]);
+        assert_eq!(gone.removed.len(), 1);
+        let (back, added) = set_view(&mut db, &base, &[], &partition, &view);
+        assert_eq!(back.added.len(), 1);
+        (removed.allocations, added.allocations)
+    };
+    let few = cost(64);
+    let many = cost(2048);
+    // Put back: its joined path, its key, the set's two copies of the path and the lists the
+    // call returns; taken out: the lists.
+    assert!(few.0 <= 6 && few.1 <= 12, "a file of 64 taken out and put back: {few:?} allocations");
+    assert!(many.0 <= few.0 && many.1 <= few.1, "of 2048: {many:?}, against {few:?} of 64");
 }
 
 #[test]

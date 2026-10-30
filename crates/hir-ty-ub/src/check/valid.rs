@@ -37,7 +37,6 @@ use rustc_type_ir::{
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, SliceLike as _, Ty as _},
 };
 use smallvec::SmallVec;
-use triomphe::Arc;
 
 use crate::{
     borrows::{self, Borrows, NewPermission, PtrKind},
@@ -265,7 +264,7 @@ pub(crate) struct Plans<'db> {
     cells: Vec<Span>,
     levels: Vec<(u64, u64)>,
     unions: Vec<(u64, u64)>,
-    layouts: FxHashMap<Ty<'db>, Arc<Layout>>,
+    layouts: FxHashMap<Ty<'db>, &'static Layout>,
     infcx: Option<(base_db::Crate, InferCtxt<'db>)>,
     // Scratch, reused by every copy.
     data: Vec<(u64, u64)>,
@@ -894,17 +893,16 @@ impl<'db> Run<'_, '_, '_, 'db> {
 
 impl<'db> Plans<'db> {
     /// For building a plan, once per type.
-    fn layout(&mut self, cx: &TypedCx<'_, 'db>, ty: Ty<'db>) -> R<Arc<Layout>> {
-        if let Some(it) = self.layouts.get(&ty) {
-            // clone: plan building, once per type and use; the per-copy path is `size_align`.
-            return Ok(it.clone());
+    fn layout(&mut self, cx: &TypedCx<'_, 'db>, ty: Ty<'db>) -> R<&'static Layout> {
+        if let Some(&it) = self.layouts.get(&ty) {
+            return Ok(it);
         }
         let layout = cx.db.layout_of_ty(ty.store(), cx.env.store()).map_err(|e| {
             // alloc: error path.
             Fail::Unsupported(format!("the layout of `{}`: {e:?}", type_name(cx.db, ty)))
         })?;
-        // clone: a layout's first use, the cache's copy.
-        self.layouts.insert(ty, layout.clone());
+        let layout = &layout.get().0;
+        self.layouts.insert(ty, layout);
         Ok(layout)
     }
 

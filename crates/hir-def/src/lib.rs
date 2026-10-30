@@ -9,6 +9,7 @@
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![feature(allocator_api)]
+#![deny(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_parse_format;
@@ -38,6 +39,7 @@ pub mod unstable_features;
 
 pub mod expr_store;
 pub mod hir;
+pub mod item_hash;
 pub mod resolver;
 pub mod upvars;
 
@@ -640,25 +642,26 @@ impl<'db> BlockIdLt<'db> {
         BlockIdLt::new_(db, ast_id, module)
     }
 
-    /// # Safety
+    /// The same id with its lifetime erased.
     ///
-    /// The caller must ensure that the `BlockId` is not leaked outside of query computations.
-    pub unsafe fn to_static(self) -> BlockId {
-        // SAFETY: `BlockIdLt<'db>` and `BlockId` are one type up to the lifetime: a salsa
-        // id with no data behind the lifetime, so the bits are the same. That the id is not
-        // read after `'db` ends is the caller's, per `# Safety` above.
-        unsafe { std::mem::transmute(self) }
+    /// # Contract
+    ///
+    /// The id is only meaningful in the revision it was read in. Read after a revision that
+    /// deleted it, salsa panics or gives the fields of another `BlockId`; it is never UB
+    /// (salsa's `FromId` is safe for every lifetime).
+    pub fn to_static(self) -> BlockId {
+        salsa::plumbing::FromId::from_id(salsa::plumbing::AsId::as_id(&self))
     }
 }
 impl BlockId {
-    /// # Safety
+    /// The same id bound to `_db`'s borrow.
     ///
-    /// The caller must ensure that the `BlockId` comes from the given database.
-    pub unsafe fn to_db<'db>(self, _db: &'db Db) -> BlockIdLt<'db> {
-        // SAFETY: `BlockId` and `BlockIdLt<'db>` are one type up to the lifetime: a salsa
-        // id with no data behind the lifetime, so the bits are the same. That it was made by
-        // `_db` is the caller's, per `# Safety` above.
-        unsafe { std::mem::transmute(self) }
+    /// # Contract
+    ///
+    /// The id must come from `_db`, and is only meaningful in the revision it was read in;
+    /// otherwise its fields are unspecified, never UB, as for [`BlockIdLt::to_static`].
+    pub fn to_db<'db>(self, _db: &'db Db) -> BlockIdLt<'db> {
+        salsa::plumbing::FromId::from_id(salsa::plumbing::AsId::as_id(&self))
     }
 }
 
@@ -675,6 +678,7 @@ pub struct ModuleIdLt<'db> {
     pub block: Option<BlockIdLt<'db>>,
     /// The parent module of this module, or `None` if this is the root module inside the def
     /// map (including for block def maps).
+    #[returns(copy)]
     pub containing_module_inside_def_map: Option<ModuleIdLt<'db>>,
     /// The name of this module, or [`sym::__empty`] for the root module.
     #[returns(clone)]
@@ -683,14 +687,15 @@ pub struct ModuleIdLt<'db> {
 pub type ModuleId = ModuleIdLt<'static>;
 
 impl<'db> ModuleIdLt<'db> {
-    /// # Safety
+    /// The same id with its lifetime erased.
     ///
-    /// The caller must ensure that the `ModuleId` is not leaked outside of query computations.
-    pub unsafe fn to_static(self) -> ModuleId {
-        // SAFETY: `ModuleIdLt<'db>` and `ModuleId` are one type up to the lifetime: a salsa
-        // id with no data behind the lifetime, so the bits are the same. That the id is not
-        // read after `'db` ends is the caller's, per `# Safety` above.
-        unsafe { std::mem::transmute(self) }
+    /// # Contract
+    ///
+    /// The id is only meaningful in the revision it was read in. Read after a revision that
+    /// deleted it, salsa panics or gives the fields of another `ModuleId`; it is never UB
+    /// (salsa's `FromId` is safe for every lifetime).
+    pub fn to_static(self) -> ModuleId {
+        salsa::plumbing::FromId::from_id(salsa::plumbing::AsId::as_id(&self))
     }
 
     pub fn def_map(self, db: &'db Db) -> &'db DefMap {
@@ -739,14 +744,14 @@ impl<'db> ModuleIdLt<'db> {
 }
 
 impl ModuleId {
-    /// # Safety
+    /// The same id bound to `_db`'s borrow.
     ///
-    /// The caller must ensure that the `ModuleId` comes from the given database.
-    pub unsafe fn to_db<'db>(self, _db: &'db Db) -> ModuleIdLt<'db> {
-        // SAFETY: `ModuleId` and `ModuleIdLt<'db>` are one type up to the lifetime: a salsa
-        // id with no data behind the lifetime, so the bits are the same. That it was made by
-        // `_db` is the caller's, per `# Safety` above.
-        unsafe { std::mem::transmute(self) }
+    /// # Contract
+    ///
+    /// The id must come from `_db`, and is only meaningful in the revision it was read in;
+    /// otherwise its fields are unspecified, never UB, as for [`ModuleIdLt::to_static`].
+    pub fn to_db<'db>(self, _db: &'db Db) -> ModuleIdLt<'db> {
+        salsa::plumbing::FromId::from_id(salsa::plumbing::AsId::as_id(&self))
     }
 
     /// The prelude a name not in scope in this module is looked up in, and the
@@ -1110,6 +1115,20 @@ impl DefWithBodyId {
             DefWithBodyId::VariantId(c) => c.lookup(db).parent.into(),
         }
     }
+
+    /// The file and erased id of the node `self` is written as: its function, constant, static
+    /// or enum variant.
+    pub fn erased_ast_id(self, db: &Db) -> InFile<span::ErasedFileAstId> {
+        fn erased<N: AstIdNode>(id: AstId<N>) -> InFile<span::ErasedFileAstId> {
+            InFile::new(id.file_id, id.value.erase())
+        }
+        match self {
+            DefWithBodyId::FunctionId(it) => erased(it.lookup(db).id),
+            DefWithBodyId::ConstId(it) => erased(it.lookup(db).id),
+            DefWithBodyId::StaticId(it) => erased(it.lookup(db).id),
+            DefWithBodyId::VariantId(it) => erased(it.lookup(db).id),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, salsa::Supertype)]
@@ -1171,6 +1190,19 @@ pub enum ExpressionStoreOwnerId {
     /// An enum variant's body is considered its discriminant initializer.
     Body(DefWithBodyId),
     VariantFields(VariantId),
+}
+
+/// The item whose store it is, for a query keyed by it (`salsa::Zalsa::ids_of`, read by
+/// `crates/hir-firewall`).
+impl salsa::plumbing::interned::NamesIds for ExpressionStoreOwnerId {
+    fn names_ids(&self, out: &mut Vec<salsa::Id>) {
+        use salsa::plumbing::AsId;
+        out.push(match *self {
+            ExpressionStoreOwnerId::Signature(it) => it.as_id(),
+            ExpressionStoreOwnerId::Body(it) => it.as_id(),
+            ExpressionStoreOwnerId::VariantFields(it) => it.as_id(),
+        });
+    }
 }
 
 impl ExpressionStoreOwnerId {

@@ -19,6 +19,7 @@
 //! generator; the table still refuses them until blaze's linker links an instrumented program.
 
 use blaze_codegen::settings::{Coverage, Sanitize, Sanitizers};
+use blaze_units::stdlib::target::{self, SANITIZERS, UNSANITIZED};
 
 /// What blaze does with one `-Z` flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,20 +421,8 @@ pub fn runtimes(sanitizers: Sanitizers, target: &str, sysroot: &std::path::Path)
     Ok(())
 }
 
-/// Sanitizers rustc has that blaze's code generator does not instrument with.
-const UNSANITIZED: &[&str] = &[
-    "cfi",
-    "dataflow",
-    "hwaddress",
-    "kcfi",
-    "kernel-address",
-    "kernel-hwaddress",
-    "leak",
-    "memtag",
-    "realtime",
-    "safestack",
-    "shadow-call-stack",
-];
+/// The set of each of [`SANITIZERS`], in its order.
+const SANITIZER_SETS: [Sanitizers; 3] = [Sanitizers::ADDRESS, Sanitizers::MEMORY, Sanitizers::THREAD];
 
 /// The pairs rustc refuses together (`SanitizerSet::MUTUALLY_EXCLUSIVE`), of those blaze has.
 const EXCLUSIVE: [(Sanitizers, Sanitizers); 3] = [
@@ -459,26 +448,17 @@ const COVERAGE_SWITCHES: &[(&str, u16)] = &[
     ("trace-stores", Coverage::TRACE_STORES),
 ];
 
+/// The name of one of [`SANITIZER_SETS`].
 fn sanitizer_name(one: Sanitizers) -> &'static str {
-    match one {
-        Sanitizers::ADDRESS => "address",
-        Sanitizers::THREAD => "thread",
-        _ => "memory",
+    match SANITIZER_SETS.iter().position(|it| *it == one) {
+        Some(at) => SANITIZERS[at],
+        None => unreachable!("a set of one of blaze's sanitizers"),
     }
 }
 
-/// A name of `-Z sanitizer`'s list as rustc reads it (`parse_sanitizers`): one blaze instruments
-/// with, else an error naming it.
+/// A name of `-Z sanitizer`'s list as rustc reads it ([`target::sanitizer`]).
 fn sanitizer(name: &str, given: &str) -> Result<Sanitizers, String> {
-    match name {
-        "address" => Ok(Sanitizers::ADDRESS),
-        "thread" => Ok(Sanitizers::THREAD),
-        "memory" => Ok(Sanitizers::MEMORY),
-        _ if UNSANITIZED.contains(&name) => {
-            Err(format!("-Z {given}: blaze's code generator does not instrument with the `{name}` sanitizer"))
-        }
-        _ => Err(format!("-Z {given}: rustc has no sanitizer `{name}`")),
-    }
+    target::sanitizer(name, given).map(|at| SANITIZER_SETS[at])
 }
 
 /// The comma-separated names of a list flag; rustc refuses one with no value.
@@ -740,6 +720,24 @@ mod tests {
         assert!(sanitize(&["-Zsanitizer-recover=nope"]).unwrap_err().contains("no sanitizer `nope`"));
         assert!(sanitize(&["-Zsanitizer"]).is_err());
         assert!(sanitize(&["-Zsanitizer-memory-track-origins=3"]).is_err());
+    }
+
+    /// blaze-units' list of sanitizers is this one's, against the match this read them by.
+    #[test]
+    fn each_sanitizer_is_blaze_units_one() {
+        let reference = |name: &str| match name {
+            "address" => Some(Sanitizers::ADDRESS),
+            "thread" => Some(Sanitizers::THREAD),
+            "memory" => Some(Sanitizers::MEMORY),
+            _ => None,
+        };
+        for name in ["address", "thread", "memory", "cfi", "leak", "shadow-call-stack", "nope", ""] {
+            assert_eq!(sanitizer(name, name).ok(), reference(name), "{name}");
+        }
+        for (at, name) in SANITIZERS.iter().enumerate() {
+            assert_eq!(sanitizer_name(SANITIZER_SETS[at]), *name);
+        }
+        assert!(sanitizer("leak", "sanitizer=leak").unwrap_err().contains("does not instrument"));
     }
 
     #[test]

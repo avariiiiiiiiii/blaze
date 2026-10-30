@@ -13,10 +13,8 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-hashbrown.workspace = true
 intern.workspace = true
 la-arena.workspace = true
-rustc-hash.workspace = true
 salsa.workspace = true
 smallvec.workspace = true
 

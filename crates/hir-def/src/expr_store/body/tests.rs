@@ -1,4 +1,4 @@
-//! [`BodySyntax::tree`] against [`BodySyntax::root`], and the thread's tree cache.
+//! [`BodySyntax::tree`] against the anchor it is of, and the thread's tree cache.
 
 use syntax::view;
 use test_fixture::WithFixture;
@@ -55,25 +55,22 @@ fn bodies(db: &TestDB) -> Vec<DefWithBodyId> {
     bodies
 }
 
+/// The tree is the anchor's: a root of the anchor's kind with its text from offset 0, in which
+/// the item's pointer finds a node of the item's kind and range.
 #[test]
-fn tree_viewed_is_root() {
+fn tree_is_the_anchor() {
     let db = TestDB::with_files(CODE);
     let bodies = bodies(&db);
     assert!(bodies.len() >= 6, "{bodies:?}");
     for def in bodies {
         let syntax = body_syntax(&db, def).as_ref().expect("a body written in a file");
         let tree = syntax.tree(&db);
-        let of_view: Vec<_> = view::Node::root(&tree)
-            .descendants_with_tokens()
-            .map(|it| (it.kind(), it.text_range()))
-            .collect();
-        let of_handle: Vec<_> = syntax
-            .root(&db)
-            .descendants_with_tokens()
-            .map(|it| (it.kind(), it.text_range()))
-            .collect();
-        assert_eq!(of_view, of_handle, "{def:?}");
-        assert_eq!(usize::from(view::Node::root(&tree).text_range().len()), syntax.text().len());
+        let root = view::Node::root(&tree);
+        assert_eq!(root.kind(), syntax.kind, "{def:?}");
+        assert_eq!(root.text(), syntax.text(), "{def:?}");
+        assert_eq!(root.text_range().start(), syntax::TextSize::new(0), "{def:?}");
+        let item = syntax::view::to_node(syntax.item, root);
+        assert_eq!((item.kind(), item.text_range()), (syntax.item.kind(), syntax.item.text_range()));
     }
 }
 

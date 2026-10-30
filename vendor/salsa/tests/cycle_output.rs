@@ -1,6 +1,8 @@
 #![cfg(feature = "inventory")]
 
 //! Test tracked struct output from a query in a cycle.
+
+#![forbid(unsafe_code)]
 mod common;
 use common::{HasLogger, LogDatabase, Logger};
 use expect_test::expect;

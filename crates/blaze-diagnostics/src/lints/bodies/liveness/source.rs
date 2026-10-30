@@ -16,6 +16,7 @@ use hir_ty::db::HirDatabase;
 use hir::{HasVisibility as _, InFile, ItemInNs};
 use hir_def::{
     AdtId, HasModule as _, ItemContainerId, Lookup as _,
+    attrs::AttrFlags,
     hir::{BindingAnnotation, BindingId, Expr, ExprId, ExprOrPatId, Literal, Pat, PatId, Statement},
     resolver::ValueNs,
     src::HasSource as _,
@@ -61,7 +62,7 @@ pub(super) struct Source {
 }
 
 impl Source {
-    pub(super) fn new(b: &BodyCx<'_, '_>) -> Source {
+    pub(super) fn new(b: &BodyCx<'_, '_, '_>) -> Source {
         let store = b.store();
         let mut source =
             Source { decls: FxHashMap::default(), assigns: FxHashMap::default(), assigned_by_value: FxHashMap::default() };
@@ -118,7 +119,7 @@ impl Source {
         source
     }
 
-    fn matched(&mut self, b: &BodyCx<'_, '_>, pat: PatId, span: MirSpan) {
+    fn matched(&mut self, b: &BodyCx<'_, '_, '_>, pat: PatId, span: MirSpan) {
         b.store().walk_bindings_in_pat(pat, |binding| {
             self.decls.entry(binding).or_insert(Decl::Matched(span));
         });
@@ -150,12 +151,12 @@ pub(super) struct Var {
 
 impl Var {
     /// rustc's `def_span`: where the first pattern binding it is.
-    pub(super) fn def(&self, b: &BodyCx<'_, '_>) -> Span {
+    pub(super) fn def(&self, b: &BodyCx<'_, '_, '_>) -> Span {
         introduction(b, self.node).0
     }
 
     /// Each pattern binding it, and whether it is a field's shorthand (`S { x }`).
-    pub(super) fn introductions(&self, b: &BodyCx<'_, '_>) -> Vec<(Span, bool)> {
+    pub(super) fn introductions(&self, b: &BodyCx<'_, '_, '_>) -> Vec<(Span, bool)> {
         let patterns = b.source_map.patterns_for_binding(self.binding);
         // alloc: a lint's spans, made only once the binding is reported
         patterns.iter().filter_map(|&pat| b.pat_node(pat)).map(|node| introduction(b, node)).collect()
@@ -164,7 +165,7 @@ impl Var {
 
 /// The binding as rustc's MIR building introduces it, unless it was made by lowering
 /// (`from_compiler_desugaring`) or is not named.
-pub(super) fn var(b: &BodyCx<'_, '_>, binding: BindingId) -> Option<Var> {
+pub(super) fn var(b: &BodyCx<'_, '_, '_>, binding: BindingId) -> Option<Var> {
     let data = &b.store()[binding];
     if data.name.is_missing() || data.name.is_generated() {
         return None;
@@ -175,7 +176,7 @@ pub(super) fn var(b: &BodyCx<'_, '_>, binding: BindingId) -> Option<Var> {
 
 /// The span of a binding's pattern as rustc's THIR has it: from its start to the end of its
 /// name (`ref mut x` of `ref mut x @ Some(_)`), and whether it is a field's shorthand.
-fn introduction(b: &BodyCx<'_, '_>, node: InFile<SyntaxNodePtr>) -> (Span, bool) {
+fn introduction(b: &BodyCx<'_, '_, '_>, node: InFile<SyntaxNodePtr>) -> (Span, bool) {
     let syntax = b.cx.syntax_view(node);
     let Some(pat) = ast::IdentPat::cast(syntax.value) else { return (b.cx.span_of(node), false) };
     let range = syntax.value.text_range();
@@ -191,7 +192,7 @@ fn introduction(b: &BodyCx<'_, '_>, node: InFile<SyntaxNodePtr>) -> (Span, bool)
 /// The span rustc's MIR has for `span` and the node its lint level is decided at: of a
 /// binding's pattern, where its name ends ([`introduction`]); of an expression, with the
 /// parentheses around it.
-pub(super) fn mir_span(b: &BodyCx<'_, '_>, span: MirSpan) -> Option<(Span, InFile<SyntaxNodePtr>)> {
+pub(super) fn mir_span(b: &BodyCx<'_, '_, '_>, span: MirSpan) -> Option<(Span, InFile<SyntaxNodePtr>)> {
     match span {
         MirSpan::ExprId(expr) => Some((util::span(b, expr)?, b.expr_node(expr)?)),
         MirSpan::PatId(pat) if matches!(b.store().pat(pat), Pat::Bind { .. }) => {
@@ -205,7 +206,7 @@ pub(super) fn mir_span(b: &BodyCx<'_, '_>, span: MirSpan) -> Option<(Span, InFil
 /// The span rustc gives the assignment `assign`, `place = value`: the whole assignment, or
 /// only its place when what the place holds is dropped first (`build_drop_and_replace`).
 pub(super) fn assignment_span(
-    b: &BodyCx<'_, '_>,
+    b: &BodyCx<'_, '_, '_>,
     assign: ExprId,
     place: MirSpan,
     drops: bool,
@@ -220,14 +221,14 @@ pub(super) fn assignment_span(
 
 /// Whether [`capture_name`] starts with `_`, without making it: a deref puts a `*` first,
 /// a field goes after the variable's name.
-pub(super) fn capture_underscored(b: &BodyCx<'_, '_>, capture: &CapturedPlace) -> bool {
+pub(super) fn capture_underscored(b: &BodyCx<'_, '_, '_>, capture: &CapturedPlace) -> bool {
     !capture.place.projections.iter().any(|it| matches!(it.kind, ProjectionKind::Deref))
         && b.store()[capture.captured_local()].name.display(b.db(), b.cx.edition).to_smolstr().starts_with('_')
 }
 
 /// rustc's `CapturedPlace::to_string`: the captured variable with what the capture
 /// projects out of it (`*x`, `x.field`, `x.0`).
-pub(super) fn capture_name(b: &BodyCx<'_, '_>, capture: &CapturedPlace) -> String {
+pub(super) fn capture_name(b: &BodyCx<'_, '_, '_>, capture: &CapturedPlace) -> String {
     let db = b.db();
     // alloc: for a lint's suggestion, once a lint is found
     let mut name = b.store()[capture.captured_local()].name.display(db, b.cx.edition).to_string();
@@ -263,7 +264,7 @@ pub(super) fn capture_name(b: &BodyCx<'_, '_>, capture: &CapturedPlace) -> Strin
 }
 
 /// rustc's `CapturedPlace::get_path_span`: the expression the captured path is written in.
-pub(super) fn capture_span(b: &BodyCx<'_, '_>, capture: &CapturedPlace) -> Option<Span> {
+pub(super) fn capture_span(b: &BodyCx<'_, '_, '_>, capture: &CapturedPlace) -> Option<Span> {
     match capture.info.sources.first()?.final_source().unpack() {
         ExprOrPatId::ExprId(expr) => util::span(b, expr),
         ExprOrPatId::PatId(pat) => b.pat_span(pat),
@@ -272,7 +273,7 @@ pub(super) fn capture_span(b: &BodyCx<'_, '_>, capture: &CapturedPlace) -> Optio
 
 /// The expressions of the body whose MIR is built from `root`, with neither the closures
 /// nor the inline consts in it, which have MIR of their own.
-fn own_exprs(b: &BodyCx<'_, '_>, root: ExprId, mut f: impl FnMut(ExprId, Expr<'_>)) {
+fn own_exprs(b: &BodyCx<'_, '_, '_>, root: ExprId, mut f: impl FnMut(ExprId, Expr<'_>)) {
     let store = b.store();
     // alloc: at most once per body, only once a binding no point reads is found
     let mut stack = vec![root];
@@ -288,7 +289,7 @@ fn own_exprs(b: &BodyCx<'_, '_>, root: ExprId, mut f: impl FnMut(ExprId, Expr<'_
 
 /// The string literals of the body built from `root`, in source order, with their values:
 /// rustc's string constants of the MIR (`LiteralFinder`).
-pub(super) fn string_literals(b: &BodyCx<'_, '_>, root: ExprId) -> Vec<(Span, String)> {
+pub(super) fn string_literals(b: &BodyCx<'_, '_, '_>, root: ExprId) -> Vec<(Span, String)> {
     // alloc: at most once per body, for an unused variable found
     let mut found = Vec::new();
     own_exprs(b, root, |expr, it| {
@@ -304,7 +305,7 @@ pub(super) fn string_literals(b: &BodyCx<'_, '_>, root: ExprId) -> Vec<(Span, St
 }
 
 /// The bindings a path of the body built from `root` names: rustc's `is_local_used_in_source`.
-pub(super) fn used_in_source(b: &BodyCx<'_, '_>, root: ExprId) -> FxHashSet<BindingId> {
+pub(super) fn used_in_source(b: &BodyCx<'_, '_, '_>, root: ExprId) -> FxHashSet<BindingId> {
     let mut used = FxHashSet::default();
     own_exprs(b, root, |expr, it| {
         if let Expr::Path(_) = it
@@ -319,7 +320,7 @@ pub(super) fn used_in_source(b: &BodyCx<'_, '_>, root: ExprId) -> FxHashSet<Bind
 /// The unit variant or constant a binding named `name` of type `ty` may have been meant to
 /// be: rustc's `maybe_suggest_unit_pattern_typo`, as the kind, the name and the path to write.
 pub(super) fn pattern_typo<'db>(
-    b: &BodyCx<'_, 'db>,
+    b: &BodyCx<'_, '_, 'db>,
     consts: &[(String, Ty<'db>, String)],
     name: &str,
     ty: Ty<'db>,
@@ -352,7 +353,7 @@ pub(super) fn pattern_typo<'db>(
         };
         // alloc: for a lint's suggestion, once a lint is found
         let names: Vec<&str> = units.iter().map(|(name, ..)| name.as_str()).collect();
-        if let Some(found) = crate::lints::edit_distance::find_best_match_for_name(&names, name, None)
+        if let Some(found) = stdx::edit_distance::find_best_match_for_name(&names, name, None).copied()
             && let Some((item, kind, def)) = units.iter().find(|(it, ..)| it == found)
             && let Some(path) = untrimmed_path(b, *def)
         {
@@ -364,7 +365,7 @@ pub(super) fn pattern_typo<'db>(
     let same: Vec<&(String, Ty<'db>, String)> = consts.iter().filter(|(_, it, _)| *it == ty).collect();
     // alloc: for a lint's suggestion, once a lint is found
     let names: Vec<&str> = same.iter().map(|(name, ..)| name.as_str()).collect();
-    let found = crate::lints::edit_distance::find_best_match_for_name(&names, name, None)?;
+    let found = stdx::edit_distance::find_best_match_for_name(&names, name, None).copied()?;
     let (item, _, path) = same.iter().find(|(it, ..)| it == found)?;
     // clone: for a lint's suggestion, once a lint is found
     Some(("constant", item.clone(), path.clone()))
@@ -372,7 +373,7 @@ pub(super) fn pattern_typo<'db>(
 
 /// The free constants of the crate the body can name, with their types and paths: what
 /// rustc's `maybe_suggest_unit_pattern_typo` looks through.
-pub(super) fn constants<'db>(b: &BodyCx<'_, 'db>) -> Vec<(String, Ty<'db>, String)> {
+pub(super) fn constants<'db>(b: &BodyCx<'_, '_, 'db>) -> Vec<(String, Ty<'db>, String)> {
     let db = b.db();
     let here = hir::Module::from(b.owner.module(db));
     // alloc: for a lint's suggestion, once a lint is found
@@ -395,7 +396,7 @@ pub(super) fn constants<'db>(b: &BodyCx<'_, 'db>) -> Vec<(String, Ty<'db>, Strin
 
 /// rustc's `with_no_trimmed_paths!(def_path_str(def))` of a variant, struct or constant: its
 /// path from the crate's root.
-fn untrimmed_path(b: &BodyCx<'_, '_>, def: hir::ModuleDef) -> Option<String> {
+fn untrimmed_path(b: &BodyCx<'_, '_, '_>, def: hir::ModuleDef) -> Option<String> {
     let db = b.db();
     let config = hir::FindPathConfig {
         prefer_no_std: false,
@@ -411,7 +412,7 @@ fn untrimmed_path(b: &BodyCx<'_, '_>, def: hir::ModuleDef) -> Option<String> {
 /// rustc's `annotate_mut_binding_to_immutable_binding`: the parts that make `mut a: &T`, whose
 /// dead assignment `a = &b` is `assign`, into `a: &mut T` and `*a = b`.
 pub(super) fn mut_reference_param(
-    b: &BodyCx<'_, '_>,
+    b: &BodyCx<'_, '_, '_>,
     param: PatId,
     assign: ExprId,
 ) -> Option<Vec<(Span, String)>> {
@@ -449,7 +450,7 @@ pub(super) fn mut_reference_param(
 
 /// rustc's checks that keep `check_liveness` from running on a body: an intrinsic, and a
 /// function of an `#[automatically_derived]` trait impl.
-pub(super) fn skipped(b: &BodyCx<'_, '_>) -> bool {
+pub(super) fn skipped(b: &BodyCx<'_, '_, '_>) -> bool {
     let db = b.db();
     let container = match b.owner {
         hir_def::DefWithBodyId::FunctionId(it) => {
@@ -462,7 +463,6 @@ pub(super) fn skipped(b: &BodyCx<'_, '_>) -> bool {
         hir_def::DefWithBodyId::StaticId(_) | hir_def::DefWithBodyId::VariantId(_) => return false,
     };
     let ItemContainerId::ImplId(impl_) = container else { return false };
-    let impl_ = impl_.lookup(db).source_view(db).value;
-    impl_.trait_().is_some()
-        && impl_.attrs().any(|it| it.as_simple_atom().is_some_and(|it| it == "automatically_derived"))
+    AttrFlags::query(db, impl_.into()).contains(AttrFlags::AUTOMATICALLY_DERIVED)
+        && impl_.lookup(db).source_view(db).value.trait_().is_some()
 }

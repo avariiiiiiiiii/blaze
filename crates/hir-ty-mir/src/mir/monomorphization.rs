@@ -18,15 +18,16 @@ use rustc_type_ir::{
 use crate::{
     InferBodyId, ParamEnvAndCrate,
     next_solver::{
-        Allocation, AllocationData, Const, ConstKind, Region, RegionKind, StoredConst,
-        StoredGenericArgs, StoredTy,
+        Allocation, AllocationData, Const, ConstExt, ConstKind, Region, RegionExt, RegionKind,
+        StoredConst, StoredGenericArgs, StoredTy,
     },
     traits::StoredParamEnvAndCrate,
 };
 use crate::{
     db::{HirDatabase, InternedOpaqueTyId},
     next_solver::{
-        AliasTyKind, Binder, DbInterner, GenericArgs, SolverDefId, Ty, TyKind, TypingMode,
+        AliasTyKind, Binder, DbInterner, GenericArgs, ParamEnv, SolverDefId, Ty, TyKind,
+        TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
         references_non_lt_error,
@@ -35,6 +36,16 @@ use crate::{
 };
 
 use super::{MirBody, MirLowerError, Operand, OperandKind, Rvalue, StatementKind, TerminatorKind};
+
+/// `ty` with a top-level alias normalized in `env`, or `ty` itself where the solver can't
+/// normalize it. Almost no type asked of a place or a field is an alias, and one that isn't
+/// is given back as the solver would, without a fulfillment context made for it.
+pub fn normalize_or_keep<'db>(infcx: &InferCtxt<'db>, env: ParamEnv<'db>, ty: Ty<'db>) -> Ty<'db> {
+    if !matches!(ty.kind(), TyKind::Alias(..)) {
+        return ty;
+    }
+    ObligationCtxt::new(infcx).structurally_normalize_ty(&ObligationCause::dummy(), env, ty).unwrap_or(ty)
+}
 
 struct Filler<'db> {
     infcx: InferCtxt<'db>,
@@ -160,7 +171,7 @@ impl<'db> Filler<'db> {
     /// The `impl Trait` a trait method returns is the one of the impl's method once the
     /// implementing type is known.
     fn impl_opaque(&self, ty: Ty<'db>) -> Ty<'db> {
-        let TyKind::Alias(alias) = ty.kind() else { return ty };
+        let TyKind::Alias(_, alias) = ty.kind() else { return ty };
         let AliasTyKind::Opaque { def_id } = alias.kind else { return ty };
         let SolverDefId::InternedOpaqueTyId(opaque) = def_id.into() else { return ty };
         opaque_of_impl(self.infcx.interner.db, self.trait_env, opaque, alias.args).unwrap_or(ty)
@@ -172,7 +183,7 @@ impl<'db> Filler<'db> {
     /// [`Self::impl_opaque`] finds: the solver reveals all of it at once and stops at the
     /// trait method's, which has no code.
     fn hidden_with_opaques(&self, ty: Ty<'db>) -> Option<Ty<'db>> {
-        let TyKind::Alias(alias) = ty.kind() else { return None };
+        let TyKind::Alias(_, alias) = ty.kind() else { return None };
         let AliasTyKind::Opaque { def_id } = alias.kind else { return None };
         let SolverDefId::InternedOpaqueTyId(opaque) = def_id.into() else { return None };
         let db = self.infcx.interner.db;
@@ -470,7 +481,7 @@ pub fn opaque_of_impl<'db>(
         Region::new_erased(interner)
     });
     let opaque_id = |ty: Ty<'db>| {
-        let TyKind::Alias(alias) = ty.kind() else { return None };
+        let TyKind::Alias(_, alias) = ty.kind() else { return None };
         let AliasTyKind::Opaque { def_id } = alias.kind else { return None };
         let SolverDefId::InternedOpaqueTyId(id) = def_id.into() else { return None };
         Some(id)

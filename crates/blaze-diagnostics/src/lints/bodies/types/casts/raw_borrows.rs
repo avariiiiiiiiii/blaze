@@ -34,7 +34,7 @@ impl LatePass for RawBorrowsViaReferences {
     const LINTS: LintSet = lint_set(["raw_borrows_via_references"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Cast]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();
         let Expr::Cast { expr: borrow, type_ref } = store.expr(expr) else { return };
         let Expr::Ref { expr: place, rawness: Rawness::Ref, mutability } = store.expr(borrow) else { return };
@@ -76,7 +76,7 @@ impl LatePass for RawBorrowsViaReferences {
 
 /// rustc's `Expr::is_syntactic_place_expr`: a path to a local or a static, a dereference, or a
 /// field or an index of anything.
-fn is_syntactic_place(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+fn is_syntactic_place(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     match b.store().expr(expr) {
         Expr::Path(_) => matches!(path_value(b, expr), Some(ValueNs::LocalBinding(_) | ValueNs::StaticId(_))),
         Expr::UnaryOp { op: UnaryOp::Deref, .. } | Expr::Field { .. } | Expr::Index { .. } => true,

@@ -39,7 +39,7 @@ os.environ.setdefault("RUSTUP_TOOLCHAIN", Path(HERE, "toolchain").read_text().st
 os.environ.update(BLAZE_STATS="1", RUSTD_TRACE="1", BLAZE_QUERIES="1")
 sys.path.insert(0, HERE)
 import genbig
-from difftest import BLAZE, Fixture, sysroot_rlibs
+from mixed import BLAZE, Fixture, sysroot_rlibs
 
 # Short names for the queries that tell how much was redone, by the name salsa gives them.
 QUERIES = {

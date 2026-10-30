@@ -23,6 +23,8 @@ pub enum Ub {
     Race(race::RaceError),
     /// A value invalid at its type (a `bool` of 2, a dangling reference, an uninhabited type).
     Value(check::ValueError),
+    /// `ptr_offset_from` of pointers it is undefined for (other allocations, out of bounds).
+    OffsetFrom(check::OffsetFromError),
     /// The main thread returned with memory never freed and reachable from no static.
     Leak(memory::Leaks),
     /// Every thread left is blocked.
@@ -47,6 +49,7 @@ impl fmt::Display for Ub {
             Ub::Aliasing(it) => write!(f, "Undefined Behavior: {it}"),
             Ub::Race(it) => write!(f, "Undefined Behavior: {it}"),
             Ub::Value(it) => write!(f, "Undefined Behavior: {it}"),
+            Ub::OffsetFrom(it) => write!(f, "Undefined Behavior: {it}"),
             Ub::Leak(it) => write!(f, "memory leaked: {it}"),
             Ub::Deadlock(it) => write!(f, "deadlock: {it}"),
             Ub::ThreadsLeft => {

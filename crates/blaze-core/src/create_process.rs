@@ -157,7 +157,8 @@ fn invalid(message: String) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use hegel::generators as gs;
+    use hegel::{PrintableGenerator, TestCase};
 
     use super::*;
 
@@ -361,39 +362,34 @@ mod tests {
     fn units(
         alphabet: &'static str,
         len: std::ops::Range<usize>,
-    ) -> impl Strategy<Value = Vec<u16>> {
-        prop::collection::vec(
-            prop::sample::select(alphabet.encode_utf16().collect::<Vec<_>>()),
-            len,
-        )
+    ) -> impl PrintableGenerator<Vec<u16>> {
+        gs::vecs(gs::sampled_from(alphabet.encode_utf16().collect::<Vec<_>>()))
+            .min_size(len.start)
+            .max_size(len.end - 1)
     }
 
-    proptest! {
-        #[test]
-        fn the_runtime_reads_back_the_arguments_as_the_reference_does(
-            args in prop::collection::vec(units("a \t\"\\\né", 0..8), 0..5),
-        ) {
-            let program = wide(r"C:\p q\a.exe");
-            let ours = wide_command_line(&program, &args).unwrap();
-            prop_assert_eq!(&split(&ours[..ours.len() - 1]), &args);
-            prop_assert_eq!(&split(&reference_line(&program, &args)), &args);
-        }
+    #[hegel::test]
+    fn the_runtime_reads_back_the_arguments_as_the_reference_does(tc: TestCase) {
+        let args = tc.draw(gs::vecs(units("a \t\"\\\né", 0..8)).max_size(4));
+        let program = wide(r"C:\p q\a.exe");
+        let ours = wide_command_line(&program, &args).unwrap();
+        assert_eq!(&split(&ours[..ours.len() - 1]), &args);
+        assert_eq!(&split(&reference_line(&program, &args)), &args);
+    }
 
-        #[test]
-        fn ascii_names_make_the_reference_block(
-            env in prop::collection::vec(
-                (any::<bool>(), units("aAbB_", 1..3), units("a=\\", 0..3)),
-                0..6,
-            ),
-        ) {
-            let env: Vec<(Vec<u16>, Vec<u16>)> = env
-                .into_iter()
-                .map(|(drive, name, value)| {
-                    let name = if drive { [vec![EQUALS], name].concat() } else { name };
-                    (name, value)
-                })
-                .collect();
-            prop_assert_eq!(wide_environment(env.clone()).unwrap(), reference_environment(&env));
-        }
+    #[hegel::test]
+    fn ascii_names_make_the_reference_block(tc: TestCase) {
+        let env = tc.draw(
+            gs::vecs(gs::tuples!(gs::booleans(), units("aAbB_", 1..3), units("a=\\", 0..3)))
+                .max_size(5),
+        );
+        let env: Vec<(Vec<u16>, Vec<u16>)> = env
+            .into_iter()
+            .map(|(drive, name, value)| {
+                let name = if drive { [vec![EQUALS], name].concat() } else { name };
+                (name, value)
+            })
+            .collect();
+        assert_eq!(wide_environment(env.clone()).unwrap(), reference_environment(&env));
     }
 }

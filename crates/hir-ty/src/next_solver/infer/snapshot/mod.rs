@@ -1,7 +1,6 @@
 //! Snapshotting in the infer ctxt of the next-trait-solver.
 
 use rustc_type_ir::UniverseIndex;
-use tracing::{debug, instrument};
 
 use super::InferCtxt;
 
@@ -45,14 +44,11 @@ impl<'db> InferCtxt<'db> {
     }
 
     pub fn start_snapshot(&self) -> CombinedSnapshot {
-        debug!("start_snapshot()");
-
         let mut inner = self.inner.borrow_mut();
 
         CombinedSnapshot { undo_snapshot: inner.start_snapshot(), universe: self.universe() }
     }
 
-    #[instrument(skip(self, snapshot), level = "debug")]
     pub fn rollback_to(&self, snapshot: CombinedSnapshot) {
         let CombinedSnapshot { undo_snapshot, universe } = snapshot;
 
@@ -61,7 +57,6 @@ impl<'db> InferCtxt<'db> {
         self.inner.borrow_mut().rollback_to(undo_snapshot);
     }
 
-    #[instrument(skip(self, snapshot), level = "debug")]
     pub fn commit_from(&self, snapshot: CombinedSnapshot) {
         let CombinedSnapshot { undo_snapshot, universe: _ } = snapshot;
 
@@ -69,14 +64,12 @@ impl<'db> InferCtxt<'db> {
     }
 
     /// Execute `f` and commit the bindings if closure `f` returns `Ok(_)`.
-    #[instrument(skip(self, f), level = "debug")]
     pub fn commit_if_ok<T, E, F>(&self, f: F) -> Result<T, E>
     where
         F: FnOnce(&CombinedSnapshot) -> Result<T, E>,
     {
         let snapshot = self.start_snapshot();
         let r = f(&snapshot);
-        debug!("commit_if_ok() -- r.is_ok() = {}", r.is_ok());
         match r {
             Ok(_) => {
                 self.commit_from(snapshot);
@@ -89,7 +82,6 @@ impl<'db> InferCtxt<'db> {
     }
 
     /// Execute `f` then unroll any bindings it creates.
-    #[instrument(skip(self, f), level = "debug")]
     pub fn probe<R, F>(&self, f: F) -> R
     where
         F: FnOnce(&CombinedSnapshot) -> R,

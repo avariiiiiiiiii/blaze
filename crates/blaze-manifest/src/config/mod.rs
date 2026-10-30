@@ -277,6 +277,8 @@ pub struct CliUnstable {
     pub bindeps: bool,
     pub build_std: Option<Vec<String>>,
     pub build_std_features: Option<Vec<String>>,
+    /// `-Zcodegen-backend`: a profile may set `codegen-backend` without `cargo-features`.
+    pub codegen_backend: bool,
 }
 
 impl CliUnstable {
@@ -293,6 +295,7 @@ impl CliUnstable {
             bindeps: table.bindeps.unwrap_or(false),
             build_std: table.build_std.map(list),
             build_std_features: table.build_std_features.map(list),
+            codegen_backend: table.codegen_backend.unwrap_or(false),
         }
     }
 
@@ -321,6 +324,7 @@ impl CliUnstable {
             "bindeps" => self.bindeps = bool_flag()?,
             "build-std" => self.build_std = Some(list()),
             "build-std-features" => self.build_std_features = Some(list()),
+            "codegen-backend" => self.codegen_backend = bool_flag()?,
             _ => bail!("blaze does not read `-Z {name}` yet"),
         }
         Ok(())

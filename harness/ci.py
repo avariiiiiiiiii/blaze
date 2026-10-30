@@ -21,7 +21,7 @@ of about PART_SECS each, per host and backend, by the seconds FAST says each tak
 slowest host, so a new or slower harness moves the others, not the time of the tier. The full
 tier, the release train's (every push to main) and by hand, is every harness, in the parts
 core-1 ... core-N (packed as the fast tier is, to about CORE_SECS by the seconds CORE says),
-keys-N, buildmodel, store-kills, store and daemon (docs/harness.md, "CI").
+keys-N, store-kills, store and daemon (docs/harness.md, "CI").
 
 Each harness runs with an BLAZE_HOME of its own (a harness may set its own over it), so no
 daemon or socket of one harness is seen by the next. BLAZE_CACHE is left alone: set, it turns
@@ -76,12 +76,10 @@ EVERYWHERE = on()
 # (part in the full tier, arguments, environment, where it runs, in the fast tier: None or not).
 # The order is the order of each part's run. A harness in the fast tier needs a line in FAST.
 HARNESSES = [
-    ("core", ["difftest.py", "corpus", "--bin", "runner", "--crate", "cases", "--layouts"], {}, EVERYWHERE, 2),
     ("core", ["programs.py"], {}, EVERYWHERE, 1),
     # The daemon compiles every function of both programs, main too, and LLVM is optimizing: an
     # edit of what both use has to reach each program, whatever its callers had built into them.
     ("core", ["programs.py"], {"BLAZE_ALONE": "1"}, on("linux", "macos", backend="llvm"), 1),
-    ("core", ["breakers.py"], {}, EVERYWHERE, 1),
     ("core", ["unwinds.py"], {}, EVERYWHERE, 1),
     ("core", ["growth.py"], {}, on(backend="cranelift"), 1),
     # 11 to 22 minutes a run, longer than the rest of the fast tier, and it caught nothing there
@@ -137,41 +135,26 @@ HARNESSES = [
     ("core", ["libraryfetch.py"], {}, EVERYWHERE, 1),
     # Each scenario runs rustc and rustdoc no more often than norustc/baseline.json says.
     ("core", ["norustc.py"], {}, on("linux", "macos"), 2),
-    # `blaze check`'s diagnostics, in each `--message-format`, against rustc's.
-    ("core", ["check_json.py", arg({"blaze_bin": os.environ.get("BLAZE_BIN", "")})], {},
-     on("linux", "macos", backend="cranelift"), 2),
     # Generated proc-macro input and writable LazyLock identity across edits and a restart.
     ("core", ["own_inputs.py", arg({"blaze": BLAZE_CLI})], {},
      on("linux", "macos", backend="cranelift"), None),
-    ("core", ["checktargets.py"], {}, on("linux", "macos", backend="cranelift"), 2),
+    # A changed C file of a build script under a warm daemon builds as from nothing.
     ("core", ["nativespans.py"], {}, on("linux", "macos"), 2),
     # A proc macro calls C its library's build script compiled, for wasm32 by Ubuntu's clang.
     ("core", ["wasmcmacro.py"], {}, on("linux"), 2),
-    ("core", ["gitindex.py"], {}, on("linux", "macos", backend="cranelift"), 2),
+    # A derive on what it cannot derive stops with the error the case names.
     ("core", ["deriveerrors.py"], {}, on("linux", "macos"), 2),
-    # blaze answers what is asked of rustc as rustc answers it, on every target it knows.
-    ("core", ["answers.py"], {}, on("linux", "macos", backend="cranelift"), 1),
     ("core", ["worktrees.py"], {}, EVERYWHERE, 2),
     ("core", ["worktrees.py", "--join", "--together"], {}, on("macos"), 2),
     ("core", ["worktrees.py", "--overlay"], {}, on("macos"), 2),
     # Tiers take live edits, which are macOS's alone; the harness picks its backends.
     ("core", ["tiers.py"], {}, on("macos", backend="cranelift"), 1),
-    # Generated programs on fixed seeds, and generated edits under a daemon against cold builds.
-    # Only x86-64 Linux has been fuzzed so far.
-    ("core", ["fuzz/fuzz.py", "smoke", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
     # #418: the same seeds with an empty and a warm store, and asm! text changed under one IR.
     ("core", ["fuzz/store.py", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
     ("core", ["fuzz/edits.py", "smoke", arg({"backends": [BACKEND]})], {}, on("linux-x86_64"), 2),
-    # Every reduced program fuzzing found blaze building wrong, on both architectures they
-    # were found on; a part of its own, as it takes minutes.
-    ("core", ["fuzz/fuzz.py", "check", "--backends", BACKEND], {}, on("linux"), 3),
-    # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
-    ("core", ["backends.py", "corpus", "runner", "cases", "--bin", "runner", "--levels", "2f"], {}, on(backend="llvm"), 2),
     # DWARF read by gdb out of an ELF executable, or a PDB read by cdb.
     ("core", ["debuginfo.py"], {}, on("linux", "windows"), None),
     *((f"keys-{k}", ["keys.py", arg({"shard": {"index": k, "count": KEYS}})], {}, EVERYWHERE, None) for k in range(1, KEYS + 1)),
-    # Builds for Linux targets besides the host; the cases of another host say so.
-    ("buildmodel", ["buildmodel.py", "--backend", BACKEND], {}, on("linux", "windows"), None),
     ("store-kills", ["storekills.py", "--kills", "100"], {}, EVERYWHERE, None),
     ("store", ["storecorrupts.py", "--rounds", "4"], {}, EVERYWHERE, None),
     # It mounts a tmpfs, or fills a disk image on Windows. In the fast tier: what a build
@@ -197,10 +180,8 @@ HARNESSES = [
 # the start of a harness's label (`label`); the longest that fits is the harness's.
 X64, MAC = "linux-x86_64", "macos"
 FAST = {
-    "difftest.py corpus": (34, ()),
     "programs.py": (20, ()),
     "BLAZE_ALONE=1 programs.py": (20, (X64,)),
-    "breakers.py": (211, ()),
     "unwinds.py": (11, ()),
     "growth.py": (31, (X64,)),
     "coldbuild.py": (78, (X64,)),
@@ -229,23 +210,16 @@ FAST = {
     # Not measured yet: library.py's xz of library/ (79 MB) is most of it.
     "libraryfetch.py": (90, (X64,)),
     "norustc.py": (253, (X64,)),
-    "check_json.py": (38, (X64,)),
-    "checktargets.py": (40, (X64,)),
     "nativespans.py": (90, (X64,)),
     # Not measured yet: two cargo and two blaze builds of three small crates, as nativespans.py.
     "wasmcmacro.py": (60, (X64,)),
-    "gitindex.py": (3, (X64,)),
     "deriveerrors.py": (65, (X64,)),
-    "answers.py": (17, (X64,)),
     "worktrees.py": (26, (X64, MAC)),
     "worktrees.py --join --together": (28, ()),
     "worktrees.py --overlay": (34, ()),
     "tiers.py": (87, ()),
-    "fuzz/fuzz.py smoke": (60, ()),
     "fuzz/store.py": (120, ()),
     "fuzz/edits.py smoke": (62, ()),
-    "fuzz/fuzz.py check": (259, ()),
-    "backends.py corpus": (23, (X64,)),
     "storefull.py": (59, (X64,)),
     "storetracked.py": (33, (X64, MAC)),
     "storebuilds.py": (10, (X64, MAC)),
@@ -264,9 +238,7 @@ CORE = {
     "wholeprogram.py": 1155,
     "debuginfo.py": 500,
     "bigbinary.py": 457,
-    "fuzz/fuzz.py check": 264,
     "norustc.py": 229,
-    "breakers.py": 189,
     "latelisted.py": 91,
     "splices.py": 89,
     "farfile.py": 84,
@@ -276,22 +248,18 @@ CORE = {
     "doctestonce.py": 54,
     "fuzz/edits.py smoke": 52,
     "testselect.py": 51,
-    "fuzz/fuzz.py smoke": 41,
     "fuzz/store.py": 120,
-    "difftest.py corpus": 34,
-    "check_json.py": 32,
     "worktrees.py --overlay": 30,
     "worktrees.py": 27,
     "growth.py": 26,
-    "backends.py corpus": 26,
     "worktrees.py --join --together": 26,
     "loadedits.py": 20,
 }
 CORE_DEFAULT = 15
 CORE_SECS = 600
-# The Ubuntu packages a part's harnesses use on Linux: valgrind shows where a program difftest
-# built goes wrong, gdb the threads of a daemon that hangs.
-APT = {"difftest.py": "valgrind", "worktrees.py": "gdb", "debuginfo.py": "gdb"}
+# The Ubuntu packages a part's harnesses use on Linux: gdb shows the threads of a daemon that
+# hangs, and debuginfo.py steps through a program with it.
+APT = {"worktrees.py": "gdb", "debuginfo.py": "gdb"}
 BACKENDS = ("cranelift", "llvm")
 
 

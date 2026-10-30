@@ -97,7 +97,7 @@ pub(super) type FeaturesSet = Rc<BTreeSet<InternedString>>;
 
 /// Resolver behavior, used to opt-in to new behavior that is
 /// backwards-incompatible via the `resolver` field in the manifest.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub enum ResolveBehavior {
     /// V1 is the original resolver behavior.
     V1,
@@ -120,13 +120,12 @@ impl ResolveBehavior {
         }
     }
 
-    pub fn to_manifest(&self) -> String {
+    pub fn to_manifest(&self) -> &'static str {
         match self {
             ResolveBehavior::V1 => "1",
             ResolveBehavior::V2 => "2",
             ResolveBehavior::V3 => "3",
         }
-        .to_owned()
     }
 }
 

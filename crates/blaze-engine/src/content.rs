@@ -13,8 +13,6 @@ use hir_ty_codegen::{CARGO_HOME, ContentId, LibrarySources, moved};
 use ide_db::{RootDatabase, RootDatabaseExt as _, base_db::Crate};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
-use triomphe::Arc;
-
 type Hash = [u8; 32];
 
 /// The crates of one build. An edit makes another crate of the one it is in and of every
@@ -350,7 +348,7 @@ enum Written {
 /// The hash of each file as it was last read, for as long as the daemon runs: a build hashes
 /// only what was edited since the one before.
 struct FileHashes {
-    files: FxHashMap<vfs::FileId, (Arc<str>, Hash)>,
+    files: FxHashMap<vfs::FileId, (syntax::Text, Hash)>,
 }
 
 impl FileHashes {
@@ -361,7 +359,7 @@ impl FileHashes {
         let mut hashes = hashes.lock().unwrap_or_else(|e| e.into_inner());
         // The text it was hashed from is kept, so no other text is ever where it is.
         if let Some((known, hash)) = hashes.files.get(&file)
-            && Arc::ptr_eq(known, text)
+            && known.ptr_eq(text)
         {
             return *hash;
         }

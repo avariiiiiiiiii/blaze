@@ -24,9 +24,9 @@ are in `v2/requests/db-ty-solver.md`.
 
 | part | blaze | rustc | |
 |---|---|---|---|
-| sharing across threads | one table of per-query caches; a slot is claimed by compare-and-swap, found by loads, and locked only by its own query's task | one `Lock` around the map | beats |
-| sharing across queries | none: a goal is reused only by the query that solved it (`Solved`) | every query, through dep-node replay | behind: needs request 4 |
-| goal and result storage | each goal a `u32` id, each distinct result interned once, a 24-byte hot row, nested goals off to the side (request 2) | a fat `HashMap` entry per goal, results stored per goal | beats once request 2 lands |
+| sharing across threads | lock-free tables: a lookup is plain and acquire loads, and a writer locks one shard or stripe only to insert | one `Lock` around the map | beats |
+| sharing across queries | `shared`: goals whose reads were captured (`salsa::capture_reads`), one cache per database, crate and region mode, a hit replaying the reads into the reader; `of_query` for the rest | every query, through dep-node replay | equal |
+| goal and result storage | each goal a `u32` id, each distinct result interned once, a 24-byte hot row, nested goals off to the side | a fat `HashMap` entry per goal, results stored per goal | beats |
 | hashing | FxHash once per insert, 32-bit hash kept for probing and growing | FxHash on every lookup and on every rehash | beats |
 | fulfillment rounds | obligations as columns, double-buffered: a round swaps two sets, so no round allocates once they have grown | two new `Vec`s per round | beats |
 | order of processing | rustc's, exactly | | equal |
@@ -34,11 +34,13 @@ are in `v2/requests/db-ty-solver.md`.
 
 ## Costs
 
-- A cache lookup:
-  - one virtual call for the database state (an atomic load of the revision);
-  - up to 16 loads from `keys` (two cache lines; the first is usually the hit);
-  - one uncontended lock on the slot's own 128-byte-aligned lines;
-  - the search graph's probe (request 2: one FxHash and about 1.5 slot reads at half load).
+- A cache lookup (the bound and its arithmetic are in
+  [speed-of-light-solver-cache.md](speed-of-light-solver-cache.md)):
+  - no call into the database: an `of_query` cache is found by its `Solved` number, and the
+    interner's borrow of the database keeps the revision from moving;
+  - an index from the key and two dependent loads (the slot's pointer, then the header that
+    confirms the key), with no lock;
+  - the search graph's probe: one FxHash and about 1.5 slot reads at half load.
   - A hit allocates nothing and writes no line another task reads.
 - A slot is at most 256 bytes (`const` assert). There are 512 slots.
 - A pending obligation is one row of five columns (cause, param env, predicate, depth,

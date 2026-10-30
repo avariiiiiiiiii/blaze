@@ -567,6 +567,57 @@ fn plain(a: u8) -> u8 { let b = a; b }
     });
 }
 
+/// The shortcuts of a body with nothing to analyze give what the scan and the walk they skip
+/// give, and a body the binding scan clears takes no allocation.
+#[test]
+fn shortcuts_match_the_walk() {
+    let (db, _) = TestDB::with_single_file(
+        r#"
+//- minicore: option, fn
+pub enum E { One, Two }
+pub enum Single { Only }
+struct S { a: u8 }
+
+fn plain(a: u8) -> u8 { let b = a; b }
+fn named(e: E, s: &Single) { let One = e; let Only = s; }
+fn named_param(One: E) {}
+fn closure() -> u8 { let f = |x: u8, _| x; f(1, 2) }
+fn closure_named() { let f = |Two: E| {}; }
+fn assign(mut s: S) { let x; x = 1; _ = x; s.a = 2; }
+fn with_match(o: Option<u8>) -> u8 { match o { Some(x) => x, None => 0 } }
+fn with_let(o: Option<u8>) { if let Some(_) = o {} }
+fn let_else() { let x = 1 else { return }; }
+fn refutable_param((1, _): (u8, u8)) {}
+"#,
+    );
+    hir_ty::attach_db(&db, || {
+        let hir_db: &Db = &db;
+        for &krate in all_crates(&db).iter() {
+            for (_, module) in crate_def_map(&db, krate).modules(&db) {
+                for def in module.scope(&db).declarations() {
+                    let ModuleDefId::FunctionId(it) = def else { continue };
+                    let def = DefWithBodyId::from(it);
+                    let body = Body::of(&db, def);
+                    let infer = hir_ty::InferenceResult::of(hir_db, def);
+                    let needs = super::visit::needs_analysis(&body, infer);
+                    assert_eq!(needs, super::visit::slow::needs_analysis(&body, infer), "{def:?}");
+                    if needs {
+                        continue;
+                    }
+                    let walked = super::visit::slow::walk(hir_db, def, infer);
+                    if !super::visit::may_name_a_variant(hir_db, &body, infer) {
+                        assert_eq!(walked, crate::MatchCheck::default(), "{def:?}");
+                        blaze_alloc_count::assert_at_most(0, "a body with nothing to check", || {
+                            assert_eq!(super::visit::check_body(hir_db, def, infer), walked);
+                        });
+                    }
+                    assert_eq!(super::visit::check_body(hir_db, def, infer), walked, "{def:?}");
+                }
+            }
+        }
+    });
+}
+
 #[test]
 fn erroneous_bodies_are_not_checked() {
     let (db, _) = TestDB::with_single_file(

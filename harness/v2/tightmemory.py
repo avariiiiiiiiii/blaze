@@ -21,7 +21,7 @@ The input is one JSON object (inline, a file's path, or `-`):
     keep       keep the work directory (false)
 
 For each project: cargo's cold build, whose peak (memory.run: the most its processes held at
-once) sets the limits, and what its program prints; then a cold blaze build with no limit; then
+once) sets the limits; then a cold blaze build with no limit, and what its program prints; then
 one under each factor. A blaze build is cold: an empty home, store and target directory. Each
 runs in a child of this script (`child`, a JSON input of its own) that drives it through
 `engine.Engine`, so the daemon it starts is the child's descendant and inside its limit. Under a
@@ -29,7 +29,8 @@ factor the child is in a cgroup with `memory.max` of factor × cargo's peak and 
 0 (swap is not budget), and `BLAZE_MEMORY_BUDGET` says the same size. The child's own Python is
 inside the limit too; the result says how much it held (`harness_mb`).
 
-A limited build passes when it finishes and its program prints what cargo's does, or, below the
+A limited build passes when it finishes and its program prints what the unlimited build's does
+(blaze's own cold build of the same source), or, below the
 factor 1.0 only, when it fails saying what it needed (docs/memory-budget.md section 6: "needs N GB
 ... may use M GB"). It fails when the OOM killer killed anything in its group (`memory.events`
 `oom_kill`), when anything of it ended by SIGKILL, when it hung past `timeout_s`, when its
@@ -181,7 +182,8 @@ def scope_argv(unit: str, limit_bytes: int, argv: list[str]) -> list[str]:
 class Ending:
     """How one build ended, as the parent saw it: the limit's factor (None: no limit), the child's
     exit status (None: it outlived its deadline and was killed), OOM kills in its group, what it
-    wrote, and whether its program prints what cargo's does (None: not run)."""
+    wrote, and whether its program prints what the unlimited build's does (None: not run, or
+    this is the unlimited build)."""
 
     factor: float | None
     status: int | None
@@ -209,7 +211,7 @@ def judge(e: Ending) -> tuple[report.Verdict, str]:
         if d.not_blazes is not None:
             return "fail", f"built by {d.not_blazes}, not blaze"
         if e.same is False:
-            return "fail", "the program blaze built says something else than cargo's"
+            return "fail", "the program says something else than the unlimited build's"
         return "pass", "finished"
     why = refusal(d.said)
     if why and e.factor is not None and e.factor < 1.0:
@@ -322,7 +324,8 @@ class Attempt:
 
 
 class Project:
-    """One project of bench.PROJECTS checked out under `work`, its cargo reference measured."""
+    """One project of bench.PROJECTS checked out under `work`, cargo's cold peak measured as the
+    limits' baseline."""
 
     def __init__(self, eng: engine.Engine, args: Input, work: Path, name: str):
         import budgets
@@ -345,10 +348,8 @@ class Project:
             raise engine.Failed(f"{name}: the cold cargo build failed:\n{(ran.stdout + ran.stderr)[-3000:]}")
         self.cargo_peak_mb = used["peak_mb"] or 0
         self.program_output = budgets.program_output
+        # What the unlimited build's program printed, once it ran.
         self.expected: tuple[int, str, str] | None = None
-        if self.run is not None:
-            self.expected = budgets.program_output(
-                engine.cargo(f"{name}: cargo run", ["run", *self.build, "--", *self.run], self.ws, cargo_env))
 
     def attempt(self, label: str, factor: float | None) -> Attempt:
         """A cold blaze build in a child, under `factor` times cargo's peak or with no limit."""
@@ -461,6 +462,9 @@ def project(eng: engine.Engine, rep: report.Report, args: Input, work: Path, nam
         rep.add(row, verdict, said, cargo_peak_mb=setup.cargo_peak_mb, cargo_s=round(setup.cargo_s, 2),
                 **numbers_of(base, None))
         unlimited = base.ending.done if verdict == "pass" else None
+        if unlimited is not None and unlimited.program_status is not None:
+            setup.expected = setup.program_output(engine.Ran((), 0.0, unlimited.program_status, unlimited.program_stdout,
+                                                             unlimited.program_stderr))
     for i, factor in enumerate(args.factors):
         mib, _ = limit_of(factor, setup.cargo_peak_mb)
         row = f"{name} under {factor:g} x cargo's peak ({mib} MiB)"

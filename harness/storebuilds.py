@@ -11,7 +11,7 @@ assertions are on, which `crates/blaze-engine/build.rs` takes.
 A daemon of BLAZE_BIN builds the stress workspace into an empty store and ends. A copy of the
 executable with other bytes, which is another build of the same sources, starts a daemon on
 that store: it has to find nearly everything the first one compiled, and the program has to
-print what cargo's does.
+print what blaze's build of it from nothing does.
 
     python3 storebuilds.py
 """

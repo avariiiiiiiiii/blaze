@@ -17,11 +17,12 @@ use std::{
     ptr,
     sync::{
         OnceLock,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 
 use base_db::Db;
+use blaze_ids::bits::AtomicBits;
 use blaze_mem::Tag;
 use hir_def::{
     AdtId, DefWithBodyId, GenericDefId, ModuleDefId, ModuleId,
@@ -371,9 +372,9 @@ struct Line(AtomicU32);
 /// one `fetch_or`, posted once by another, and the ring's places are written once each.
 struct Queue {
     /// A bit per body: some task has checked it or is checking it.
-    claimed: Box<[AtomicU64]>,
+    claimed: AtomicBits,
     /// A bit per body: it is in the ring, or was.
-    posted: Box<[AtomicU64]>,
+    posted: AtomicBits,
     /// The reached bodies, in the order posted: `NONE` until written. As long as the bodies,
     /// since each is posted at most once.
     reached: Box<[AtomicU32]>,
@@ -387,12 +388,9 @@ struct Queue {
 
 impl Queue {
     fn new(bodies: usize, tasks: usize) -> Queue {
-        let words = bodies.div_ceil(64);
         Queue {
-            // alloc: once a check, a bit per body
-            claimed: (0..words).map(|_| AtomicU64::new(0)).collect(),
-            // alloc: once a check, a bit per body
-            posted: (0..words).map(|_| AtomicU64::new(0)).collect(),
+            claimed: AtomicBits::new(bodies),
+            posted: AtomicBits::new(bodies),
             // alloc: once a check, a place per body
             reached: (0..bodies).map(|_| AtomicU32::new(NONE)).collect(),
             head: Line(AtomicU32::new(0)),
@@ -402,25 +400,16 @@ impl Queue {
         }
     }
 
-    /// Sets `at`'s bit of `bits`: whether this call set it.
-    fn set(bits: &[AtomicU64], at: u32) -> bool {
-        let bit = 1 << (at % 64);
-        bits[(at / 64) as usize].fetch_or(bit, Ordering::AcqRel) & bit == 0
-    }
-
-    fn is_set(bits: &[AtomicU64], at: u32) -> bool {
-        let bit = 1 << (at % 64);
-        bits[(at / 64) as usize].load(Ordering::Acquire) & bit != 0
-    }
-
     /// Whether this call claims body `at`: then the caller checks it, and no one else does.
     fn claim(&self, at: u32) -> bool {
-        Queue::set(&self.claimed, at)
+        self.claimed.insert(at as usize, Ordering::AcqRel)
     }
 
     /// Puts body `at` in the ring, unless it is claimed already or was put there before.
     fn post(&self, at: u32) {
-        if Queue::is_set(&self.claimed, at) || !Queue::set(&self.posted, at) {
+        if self.claimed.contains(at as usize, Ordering::Acquire)
+            || !self.posted.insert(at as usize, Ordering::AcqRel)
+        {
             return;
         }
         let place = self.tail.0.fetch_add(1, Ordering::Relaxed);

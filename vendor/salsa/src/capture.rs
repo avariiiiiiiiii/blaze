@@ -31,7 +31,6 @@ use crate::database::Database;
 use crate::durability::Durability;
 use crate::fingerprint::Fingerprint;
 use crate::graph::{EdgeSpan, Graph};
-use crate::hash::FxIndexSet;
 use crate::sync::atomic::Ordering;
 use crate::zalsa::{Zalsa, ZalsaDatabase};
 use crate::zalsa_local::{EdgeFingerprint, QueryEdge, ZalsaLocal};
@@ -125,7 +124,7 @@ impl Reads {
         &self,
         graph: &'g Graph,
     ) -> impl ExactSizeIterator<Item = (QueryEdge, Fingerprint)> + 'g {
-        let (edges, tail) = graph.words(self.span).split_at(self.edges as usize);
+        let (edges, tail) = graph.raw_words(self.span).split_at(self.edges as usize);
         let mut fingerprints = tail.chunks_exact(FINGERPRINT_WORDS).peekable();
         edges.iter().enumerate().map(move |(index, word)| {
             // Relaxed: the capturing task wrote these before the `Reads` reached this one by a
@@ -439,7 +438,7 @@ impl Captures {
         &mut self,
         zalsa: &Zalsa,
         zalsa_local: &ZalsaLocal,
-        edges: &FxIndexSet<QueryEdge>,
+        edges: &[QueryEdge],
         fingerprints: &[EdgeFingerprint],
     ) -> Option<Reads> {
         let mut inner = self
@@ -464,7 +463,7 @@ impl Captures {
                 zalsa,
                 inner.read.iter().map(|&position| {
                     *edges
-                        .get_index(position as usize)
+                        .get(position as usize)
                         .expect("salsa: a capture frame read a position past the query's edges")
                 }),
                 &self.tail,

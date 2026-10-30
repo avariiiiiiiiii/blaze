@@ -46,7 +46,8 @@ impl UnstableFeatures {
     /// Query unstable features for a crate.
     ///
     /// This is also available as `DefMap::features()`. Use that if you have a DefMap available.
-    /// Otherwise, use this, to not draw a dependency to the def map.
+    /// Otherwise, use this, to not draw a dependency to the def map. While the crate's own def
+    /// map is being built (a proc macro it calls), use [`UnstableFeatures::of_root`].
     #[salsa::tracked(returns(ref), mem_tag = Nameres)]
     pub fn query(db: &Db, krate: Crate) -> UnstableFeatures {
         // clone: once per def-map change of the crate; the copy lets its readers backdate
@@ -99,4 +100,5 @@ define_unstable_features! {
     gca_const_items,
     generic_const_exprs,
     sized_hierarchy,
+    forced_keywords,
 }

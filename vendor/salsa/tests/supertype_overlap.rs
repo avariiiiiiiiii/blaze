@@ -1,5 +1,6 @@
 //! Tests that overlapping variant types in supertype enums are detected.
 #![cfg(feature = "inventory")]
+#![forbid(unsafe_code)]
 
 use salsa::plumbing::ZalsaDatabase;
 

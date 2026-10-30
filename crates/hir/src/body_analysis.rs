@@ -27,7 +27,6 @@ use hir_def::{
         ConstSignature, EnumSignature, FunctionSignature, ImplSignature, StaticSignature,
         StructSignature, TraitSignature, TypeAliasSignature, UnionSignature, VariantFields,
     },
-    type_ref::Mutability,
 };
 use hir_expand::{
     AstId, HirFileId, InFile, MacroCallId,
@@ -48,8 +47,7 @@ use syntax::{
 };
 
 use crate::{
-    Adjust, Adjustment, AnyFunctionId, AutoBorrow, DefWithBody, Function, Local, Macro,
-    OverloadedDeref, Type,
+    Adjust, Adjustment, AnyFunctionId, DefWithBody, Function, Local, Macro, Type,
     db::HirDatabase,
     semantics::{PathResolution, TypeInfo},
     source_analyzer::{BodyOrSig, SourceAnalyzer, resolve_hir_path},
@@ -109,7 +107,7 @@ impl<'db> BodyAnalysis<'db> {
                 let relative = Body::relative(db, def).as_ref();
                 (relative.expect("a body with its syntax has a relative map"), syntax.file_id)
             }
-            None => (Body::with_source_map(db, def), def_ast_id(db, def).file_id),
+            None => (Body::with_source_map(db, def), def.erased_ast_id(db).file_id),
         };
         BodyAnalysis {
             db,
@@ -126,8 +124,8 @@ impl<'db> BodyAnalysis<'db> {
         }
     }
 
-    /// The tree every pointer is into, and its file: [`BodySyntax::root`] and its `file_id`,
-    /// or the expansion's root and its macro file.
+    /// The tree every pointer is into, and its file: the root of [`BodySyntax::tree`] and its
+    /// `file_id`, or the expansion's root and its macro file.
     pub fn tree(&self) -> (ast::Node<'_>, HirFileId) {
         let root = match self.syntax {
             Some(syntax) => ast::Node::root(self.anchor.get_or_init(|| syntax.tree(self.db))),
@@ -190,27 +188,10 @@ impl<'db> BodyAnalysis<'db> {
         let id = self.expr_id(expr)?;
         let infer = self.infer();
         let adjusts = infer.expr_adjustment(id.as_expr()?)?;
-        let mutability = |m| match m {
-            hir_ide::next_solver::Mutability::Not => Mutability::Shared,
-            hir_ide::next_solver::Mutability::Mut => Mutability::Mut,
-        };
         let mut source = self.ty(infer.expr_or_pat_ty(id));
         let adjustment = |adjust: &hir_ide::Adjustment| {
             let target = self.ty(adjust.target.as_ref());
-            let kind = match adjust.kind {
-                hir_ide::Adjust::NeverToAny => Adjust::NeverToAny,
-                hir_ide::Adjust::Deref(Some(hir_ide::OverloadedDeref(m))) => {
-                    Adjust::Deref(Some(OverloadedDeref(mutability(m))))
-                }
-                hir_ide::Adjust::Deref(None) => Adjust::Deref(None),
-                hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::RawPtr(m)) => {
-                    Adjust::Borrow(AutoBorrow::RawPtr(mutability(m)))
-                }
-                hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::Ref(m)) => {
-                    Adjust::Borrow(AutoBorrow::Ref(mutability(m.into())))
-                }
-                hir_ide::Adjust::Pointer(pc) => Adjust::Pointer(pc),
-            };
+            let kind = Adjust::from(adjust.kind);
             // clone: the next adjustment's source, as `Semantics::expr_adjustments` does
             let source = mem::replace(&mut source, target.clone());
             Adjustment { source, target, kind }
@@ -256,7 +237,7 @@ impl<'db> BodyAnalysis<'db> {
             Expr::MethodCall { .. } => infer.method_resolution(expr)?,
             Expr::Call { callee, .. } => match infer.type_of_expr_or_pat(callee.into())?.kind() {
                 TyKind::FnDef(def, args) => match def.0 {
-                    CallableDefId::FunctionId(func) => (func, args),
+                    CallableDefId::FunctionId(func) => (func, args.skip_binder()),
                     CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => return None,
                 },
                 _ => return None,
@@ -414,7 +395,7 @@ impl<'db> BodyAnalysis<'db> {
             Store::Body(def) => {
                 let (body, source_map) = match def == self.def {
                     true => (self.body, self.source_map),
-                    false => body_maps(db, def),
+                    false => Body::unmoved(db, def),
                 };
                 let scope = self.scope_in(&source_map.store, ExprScopes::of(db, def), file, node);
                 let infer = infer.then(|| match def == self.def {
@@ -558,7 +539,7 @@ impl<'db> BodyAnalysis<'db> {
         let at = match self.syntax {
             Some(syntax) => InFile::new(self.file_id, syntax.item),
             None => {
-                let id = def_ast_id(self.db, self.def);
+                let id = self.def.erased_ast_id(self.db);
                 self.key(id.file_id, id.value)?
             }
         };
@@ -714,18 +695,10 @@ fn store(
     }
 }
 
-/// A body's store and the source map of the tree it is written in: the anchor's for one
-/// written in a file, its expansion's for one a macro writes. An item nested in a body is
-/// anchored where the body is, so the two share the anchor's coordinates.
-fn body_maps(db: &Db, def: DefWithBodyId) -> (&Body, &BodySourceMap) {
-    let (body, source_map) = match Body::relative(db, def) {
-        Some(it) => it,
-        None => Body::with_source_map(db, def),
-    };
-    (&**body, source_map)
-}
-
-/// [`body_maps`] of a signature: [`GenericParams::with_source_map`] over the signature's
+/// [`Body::unmoved`] of a signature (a body's store and the source map of the tree it is
+/// written in: the anchor's for one written in a file, its expansion's for one a macro
+/// writes; an item nested in a body is anchored where the body is, so the two share the
+/// anchor's coordinates): [`GenericParams::with_source_map`] over the signature's
 /// relative map.
 fn signature_maps(db: &Db, def: GenericDefId) -> (&ExpressionStore, &ExpressionStoreSourceMap) {
     macro_rules! maps {
@@ -749,15 +722,6 @@ fn signature_maps(db: &Db, def: GenericDefId) -> (&ExpressionStore, &ExpressionS
         GenericDefId::StaticId(id) => maps!(StaticSignature, id),
         GenericDefId::TraitId(id) => maps!(TraitSignature, id),
         GenericDefId::TypeAliasId(id) => maps!(TypeAliasSignature, id),
-    }
-}
-
-fn def_ast_id(db: &Db, def: DefWithBodyId) -> InFile<ErasedFileAstId> {
-    match def {
-        DefWithBodyId::FunctionId(it) => erased(it.lookup(db).id),
-        DefWithBodyId::ConstId(it) => erased(it.lookup(db).id),
-        DefWithBodyId::StaticId(it) => erased(it.lookup(db).id),
-        DefWithBodyId::VariantId(it) => erased(it.lookup(db).id),
     }
 }
 

@@ -127,8 +127,8 @@ their own tasks (C1), so `frame` here holds only what `collect_crate` itself mak
 Everything from `let krate = module.krate(db);` (610) to the end goes inside
 `blaze_mem::frame::task(Tag::Nameres, |frame| { ... })`, and the call (620) becomes
 `facts::collect_block(db, frame, def_map, TreeId::new(ast_id.file_id, Some(block_id)), local_def_map.local(db))`.
-The two `unsafe { to_static() }` blocks, their SAFETY comments, `visibility` and `module_data`
-stay before the task. Under R10 the body becomes H2's, and `frame` travels inside the
+The two `to_static()` calls (safe fns now, speed-unsafe-front-def, 2026-10-30: no `unsafe`, no
+SAFETY), `visibility` and `module_data` stay before the task. Under R10 the body becomes H2's, and `frame` travels inside the
 `BuildingDefMap` instead of as an argument.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
@@ -1046,12 +1046,7 @@ use self::path_resolution::{DefMapRead, ExternPreludeRead};
 ```rust
 /// The id of the root module of a def map of `krate` (a block's, with `block`).
 fn root_module_of(db: &Db, krate: Crate, block: Option<BlockId>) -> ModuleId {
-    // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. This
-    // runs only inside the queries that build a def map (`crate_local_def_map`, with
-    // `frozen::served`'s decode within it, and `block_def_map`), and the root id goes only into
-    // the `DefMap` that query returns. Stored elsewhere, it could name a freed salsa slot in a
-    // later revision.
-    unsafe { ModuleIdLt::new(db, krate, block, None, Name::new_symbol_root(sym::__empty)).to_static() }
+    ModuleIdLt::new(db, krate, block, None, Name::new_symbol_root(sym::__empty)).to_static()
 }
 ```
 
@@ -1302,10 +1297,9 @@ pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
 
 #[salsa::tracked(returns(ref))]
 pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
-    // SAFETY: (unchanged, the two blocks at 593 to 601)
-    let block_id = unsafe { block_id.to_static() };
+    let block_id = block_id.to_static();
     let ast_id = block_id.ast_id(db);
-    let module = unsafe { block_id.module(db).to_static() };
+    let module = block_id.module(db).to_static();
     let visibility = Visibility::Module(module, VisibilityExplicitness::Implicit);
 
     blaze_mem::frame::task(Tag::Nameres, |frame| {

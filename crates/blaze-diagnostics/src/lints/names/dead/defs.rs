@@ -377,7 +377,7 @@ impl<'db> Walk<'_, '_, 'db> {
             }
             return;
         }
-        if self.cx.vsema.is_attr_macro_call(item.value) {
+        if self.cx.vsema.is_attr_macro_call(item) {
             if let Some(expansion) = self.cx.vsema.expand_attr_macro(item.value) {
                 self.expansion(expansion.value, container, parent);
             }

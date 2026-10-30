@@ -4178,7 +4178,8 @@ calling crate's `forced_keywords` (`psess.gated_spans`, checked after expansion)
 so a crate with `#![feature(forced_keywords)]` gets an error rustc does not give. With the query
 the server takes the bit (and the expansion's key gets it as a part).
 
-Status: open
+Status: done (frontend: `UnstableFeatures::of_root`, queue 00701; fastcompile-macros uses it in
+`expander.rs` `forced_keywords`, as the server's gate and a part of the key)
 
 > forwarded to frontend (requests, pass 42: hir-def's `unstable_features.rs`/`item_tree.rs` is lane frontend's to apply in lane db's crate; told by tmux)
 

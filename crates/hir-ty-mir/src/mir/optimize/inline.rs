@@ -46,7 +46,7 @@ use crate::{
         return_slot, transform::Ctx,
     },
     next_solver::{
-        Const, ConstKind, DbInterner, GenericArgs, Region, RegionKind, Ty, TyKind,
+        Const, ConstKind, DbInterner, GenericArgs, Region, RegionExt, RegionKind, Ty, TyKind,
         references_non_lt_error,
     },
     traits::ParamEnvAndCrate,
@@ -602,7 +602,7 @@ fn callee_options(
 /// whether other crates may build its body into theirs. rustc infers it for a small leaf
 /// function only where its inliner runs and the build is not incremental, which `inline`
 /// says.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn cross_crate_inlinable(db: &Db, func: FunctionId, options: MirOptions) -> bool {
     let attrs = Attrs::of_fn(db, func);
     if attrs.extern_indicator() {
@@ -707,7 +707,7 @@ pub(super) fn fn_def<'db>(
     };
     match ty.kind() {
         TyKind::FnDef(def, args) => match def.0 {
-            CallableDefId::FunctionId(func) => Some((func, args)),
+            CallableDefId::FunctionId(func) => Some((func, args.skip_binder())),
             _ => None,
         },
         _ => None,

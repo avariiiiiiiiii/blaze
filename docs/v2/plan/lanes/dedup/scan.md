@@ -26,6 +26,7 @@ Picked: rustc's `rustc_span::edit_distance`, ported whole (`edit_distance`,
 lowercased variant and `closest`/`closest_msg` in `stdx::edit_distance::cargo`. Generic over the
 candidate (`AsRef<str>`, or a projection with `_by`) so no caller copies names into a `Vec<&str>`.
 Tests: every copy's, plus proptests against rustc's code kept verbatim as the reference.
+Applied 2026-10-30 (queue request 00215): the six copies are deleted and every caller uses `stdx`.
 
 Speed of light: it runs on the error path only, O(n·m) in code points with one rotating row
 buffer of `3·(m+1)` and no other allocation; ASCII inputs take a byte path, and the

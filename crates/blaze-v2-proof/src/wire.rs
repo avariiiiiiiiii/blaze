@@ -236,6 +236,14 @@ impl Columns for View<'_> {
     fn saw(&self, e: usize) -> Fingerprint {
         Fingerprint(u128::from_le_bytes(self.saw[e]))
     }
+
+    fn has_word(&self, w: usize) -> u64 {
+        self.has.get(w).map_or(0, |word| u64::from_le_bytes(*word))
+    }
+
+    fn ran_word(&self, w: usize) -> u64 {
+        self.ran.get(w).map_or(0, |word| u64::from_le_bytes(*word))
+    }
 }
 
 /// `items` as `column`, each one's fixed-width little-endian bytes after the last's, written over
@@ -346,6 +354,9 @@ pub(crate) mod tests {
         }
         for e in 0..trace.reads.len() {
             assert_eq!((view.read(e), view.saw(e)), (trace.read(e), trace.saw(e)));
+        }
+        for w in 0..=blaze_ids::bits::words_for(trace.keys()) {
+            assert_eq!((view.has_word(w), view.ran_word(w)), (trace.has_word(w), trace.ran_word(w)), "word {w}");
         }
     }
 

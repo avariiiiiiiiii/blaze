@@ -17,13 +17,13 @@ use blaze_ids::rng::SplitMix64;
 
 use super::{Exempt, compare_fixture};
 
-const MODULE_NAMES: &[&str] = &["a", "b", "c", "d", "e"];
-const TYPE_NAMES: &[&str] = &["S", "T", "U"];
-const VALUE_NAMES: &[&str] = &["f", "g"];
+pub(in crate::nameres) const MODULE_NAMES: &[&str] = &["a", "b", "c", "d", "e"];
+pub(in crate::nameres) const TYPE_NAMES: &[&str] = &["S", "T", "U"];
+pub(in crate::nameres) const VALUE_NAMES: &[&str] = &["f", "g"];
 const EDITIONS: &[&str] = &["2015", "2018", "2021"];
 
 #[derive(Debug, Clone, PartialEq)]
-enum Vis {
+pub(in crate::nameres) enum Vis {
     Private,
     Pub,
     Crate,
@@ -33,7 +33,7 @@ enum Vis {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum UseTail {
+pub(in crate::nameres) enum UseTail {
     Glob,
     Name(&'static str),
     Alias(&'static str, &'static str),
@@ -41,7 +41,7 @@ enum UseTail {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Gen {
+pub(in crate::nameres) enum Gen {
     /// A child module, by its index in [`Model::modules`].
     Mod(usize),
     Struct { name: &'static str, vis: Vis },
@@ -56,7 +56,7 @@ enum Gen {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum MacroBody {
+pub(in crate::nameres) enum MacroBody {
     /// `pub struct <name>;`
     Item(&'static str),
     /// `pub mod <name> { pub struct G; pub use $crate::*; }`
@@ -68,21 +68,21 @@ enum MacroBody {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct Module {
-    parent: Option<usize>,
-    name: &'static str,
+pub(in crate::nameres) struct Module {
+    pub(in crate::nameres) parent: Option<usize>,
+    pub(in crate::nameres) name: &'static str,
     /// Written `mod name { .. }` rather than `mod name;` and a file of its own.
-    inline: bool,
+    pub(in crate::nameres) inline: bool,
     /// `#[macro_use]` on its declaration: its `macro_rules!` stay in scope after it.
-    macro_use: bool,
-    items: Vec<Gen>,
+    pub(in crate::nameres) macro_use: bool,
+    pub(in crate::nameres) items: Vec<Gen>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct Model {
-    edition: &'static str,
-    modules: Vec<Module>,
-    macros: Vec<MacroBody>,
+pub(in crate::nameres) struct Model {
+    pub(in crate::nameres) edition: &'static str,
+    pub(in crate::nameres) modules: Vec<Module>,
+    pub(in crate::nameres) macros: Vec<MacroBody>,
 }
 
 fn pick<T: Copy>(rng: &mut SplitMix64, from: &[T]) -> T {
@@ -90,7 +90,7 @@ fn pick<T: Copy>(rng: &mut SplitMix64, from: &[T]) -> T {
 }
 
 impl Model {
-    fn path(&self, mut module: usize) -> Vec<&'static str> {
+    pub(in crate::nameres) fn path(&self, mut module: usize) -> Vec<&'static str> {
         let mut out = Vec::new();
         while let Some(parent) = self.modules[module].parent {
             out.push(self.modules[module].name);
@@ -100,7 +100,7 @@ impl Model {
         out
     }
 
-    fn generate(rng: &mut SplitMix64) -> Model {
+    pub(in crate::nameres) fn generate(rng: &mut SplitMix64) -> Model {
         let mut model = Model {
             edition: pick(rng, EDITIONS),
             modules: vec![Module {
@@ -208,7 +208,7 @@ impl Model {
         }
     }
 
-    fn item(&self, rng: &mut SplitMix64, module: usize) -> Gen {
+    pub(in crate::nameres) fn item(&self, rng: &mut SplitMix64, module: usize) -> Gen {
         let item = match rng.below(10) {
             0 | 1 => Gen::Struct { name: pick(rng, TYPE_NAMES), vis: self.vis(rng, module) },
             2 => Gen::Fn { name: pick(rng, VALUE_NAMES), vis: self.vis(rng, module) },
@@ -243,7 +243,7 @@ impl Model {
     }
 
     /// The fixture: the root file, then one file per module written `mod name;`.
-    fn render(&self) -> String {
+    pub(in crate::nameres) fn render(&self) -> String {
         let mut files = Vec::new();
         let mut root = String::new();
         self.render_items(0, &mut root, &mut files);

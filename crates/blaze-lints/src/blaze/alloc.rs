@@ -101,7 +101,7 @@ pub(super) fn written_callee<'db>(
     let Expr::Call { callee, .. } = body.expr(id) else { return None };
     let TyKind::FnDef(def, args) = infer.expr_ty(callee).kind() else { return None };
     match def.0 {
-        hir_def::CallableDefId::FunctionId(f) => Some((f, args)),
+        hir_def::CallableDefId::FunctionId(f) => Some((f, args.skip_binder())),
         _ => None,
     }
 }
@@ -137,11 +137,24 @@ pub(super) fn instance_reaches<'db>(
 ) -> bool {
     match resolved {
         Resolved::Function(f, args) => {
-            let length: usize = args.types().map(|it| it.walk().count()).sum();
-            length <= LONGEST && reaches_alloc(db, env.store(), f, args.store())
+            fits(args.types().map(|it| it.walk()), LONGEST)
+                && reaches_alloc(db, env.store(), f, args.store())
         }
         Resolved::Derived(impl_, method, args) => derived_reaches(db, env, impl_, method, args),
     }
+}
+
+/// Whether the walks `types` step through at most `longest` nodes between them: stops at the
+/// first node past it, so a call is never charged more than `longest` steps before its memo.
+fn fits<I: Iterator>(types: impl Iterator<Item = I>, longest: usize) -> bool {
+    let mut left = longest;
+    for walk in types {
+        for _ in walk {
+            let Some(rest) = left.checked_sub(1) else { return false };
+            left = rest;
+        }
+    }
+    true
 }
 
 /// Whether a built-in derive's `clone` or `default` reaches the allocator: it calls the
@@ -218,4 +231,27 @@ fn is_place(body: &Body, mut expr: ExprId) -> bool {
 /// Whether `f` is a method of a trait, not of an impl.
 pub(super) fn in_trait(db: &Db, f: FunctionId) -> bool {
     matches!(f.loc(db).container, ItemContainerId::TraitId(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fits;
+
+    /// Stopping early answers as summing every walk did.
+    #[hegel::test]
+    fn fits_as_the_sum_of_the_walks_says(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let lengths: Vec<usize> = tc.draw(gs::vecs(gs::integers().max_value(79)).max_size(11));
+        let longest: usize = tc.draw(gs::integers().max_value(299));
+        let summed = lengths.iter().sum::<usize>() <= longest;
+        assert_eq!(fits(lengths.iter().map(|&it| 0..it), longest), summed);
+    }
+
+    #[test]
+    fn a_long_walk_is_left_at_the_first_node_past_the_limit() {
+        let mut stepped = 0;
+        let walk = std::iter::repeat(()).inspect(|()| stepped += 1);
+        assert!(!fits(std::iter::once(walk), 256));
+        assert_eq!(stepped, 257);
+    }
 }

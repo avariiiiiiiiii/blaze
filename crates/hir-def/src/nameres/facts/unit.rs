@@ -32,7 +32,7 @@ use span::Edition;
 use triomphe::Arc;
 
 use crate::{
-    AdtId, FxIndexMap, MacroId, ModuleDefId, ModuleId, UseId,
+    AdtId, FxIndexMap, Lookup, MacroId, ModuleDefId, ModuleId, UseId,
     item_scope::{
         GlobAmbiguity, GlobId, ImportId, ImportOrExternCrate, ImportOrGlob, ItemInNs,
         PerNsGlobImports, UnderscoreImport,
@@ -212,13 +212,20 @@ pub(crate) struct Unit<'db, 'f, A: Allocator + Clone = Global> {
     records: FrameVec<'f, DeclOp>,
     /// The diagnostics a block's collection made, in order, until the block's map takes them.
     diagnostics: FrameVec<'f, DefDiagnostic>,
+    /// Whether a macro directive of the crate (a block's, a region's) is still unexpanded, as
+    /// the driver last said ([`Unit::set_unexpanded`]).
+    unexpanded: bool,
 }
 
 /// The rows of a unit's view.
 fn own_rows(modules: &mut ModulesSlot) -> &mut ModulesMap {
     match modules {
-        ModulesSlot::Building(own) | ModulesSlot::Unit { own, .. } => own,
-        ModulesSlot::Collected(_) => panic!("nameres facts: a unit's view is a collected `DefMap`"),
+        ModulesSlot::Building(own)
+        | ModulesSlot::Unit { own, .. }
+        | ModulesSlot::Maintained { own, .. } => own,
+        ModulesSlot::Collected(_) | ModulesSlot::Published(_) => {
+            panic!("nameres facts: a unit's view is a collected `DefMap`")
+        }
     }
 }
 
@@ -233,6 +240,26 @@ fn row_of<'a>(
         Some(row) => row,
         None => panic!("nameres facts: an op writes {module:?}, which the unit does not hold"),
     }
+}
+
+/// Where glob `glob` is in its module's source, the order that ties two globs giving one name
+/// different items (docs/v2/plan/design/dbsp.md §6): its `use` item's range in the file the
+/// module's source is in (a macro's expansion at its call), then its range in its own file,
+/// then its use tree. Asked only on such a tie.
+fn glob_position(db: &Db, glob: GlobId) -> (span::TextSize, span::TextSize, u32) {
+    let id = glob.use_.lookup(db).id;
+    let range = id.to_range(db);
+    let original = hir_expand::InFile::new(id.file_id, range).original_node_file_range_rooted(db);
+    (original.range.start(), range.start(), u32::from(glob.idx.into_raw()))
+}
+
+/// Whether the type or value binding of `def`, an import's resolution, is a glob's of a
+/// module of `krate`, which an expansion there may still shadow. A macro binding is
+/// determined whatever brought it, as in rustc.
+fn through_glob_of(db: &Db, krate: base_db::Crate, def: &PerNs) -> bool {
+    let here = |glob: GlobId| glob.use_.lookup(db).container.krate(db) == krate;
+    matches!(def.types.and_then(|it| it.import), Some(ImportOrExternCrate::Glob(glob)) if here(glob))
+        || matches!(def.values.and_then(|it| it.import), Some(ImportOrGlob::Glob(glob)) if here(glob))
 }
 
 impl<'db, 'f> Unit<'db, 'f, &'f Frame> {
@@ -250,6 +277,33 @@ impl<'db, 'f> Unit<'db, 'f, &'f Frame> {
     /// The diagnostics the block's collection made, in order.
     pub(crate) fn take_diagnostics(&mut self) -> FrameVec<'f, DefDiagnostic> {
         mem::replace(&mut self.diagnostics, Vec::new_in(self.frame))
+    }
+
+    /// A run of the name resolution maintainer (`nameres::delta`): `def_map` is its
+    /// `ModulesSlot::Maintained` view, every module it holds a member, no partition check; paths
+    /// read the crate env `env`. Its state is in the frame.
+    pub(crate) fn region(
+        cx: &CollectCx<'db, 'f>,
+        def_map: DefMap,
+        env: &super::env::CrateEnv,
+    ) -> Unit<'db, 'f, &'f Frame> {
+        let mut def_map = def_map;
+        env.install(&mut def_map);
+        let state = UnitState::new_in(cx.frame);
+        Unit::new(cx.db, cx.frame, def_map, Local::Owned(env.local_def_map()), state, None)
+    }
+
+    /// The crate env changed under a run (the crate root's expansion made an `extern crate`,
+    /// a `#[macro_use]` or the std prelude): paths read the new one, and every import is
+    /// tried again.
+    pub(crate) fn set_env(&mut self, env: &super::env::CrateEnv) {
+        let prelude = self.def_map.prelude;
+        env.install(&mut self.def_map);
+        if self.state.prelude.is_some() {
+            self.def_map.prelude = prelude;
+        }
+        self.local = Local::Owned(env.local_def_map());
+        self.queues.wake_all(&self.state.imports);
     }
 }
 
@@ -277,6 +331,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             unresolved_extern_crates: set_in(frame),
             records: Vec::new_in(frame),
             diagnostics: Vec::new_in(frame),
+            unexpanded: false,
         }
     }
 }
@@ -324,6 +379,17 @@ impl<'db, 'f> Unit<'db, 'f> {
 }
 
 impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
+    /// Whether a macro directive that may still declare names is unexpanded, said by the driver
+    /// before each import fixed point. While one is, an import whose type or value binding came
+    /// through a glob of this crate is indeterminate, not resolved: rustc's glob determinacy
+    /// (`rustc_resolve` `DeclKind::determined`, `resolve_ident_in_module_globs_unadjusted`), so
+    /// it is retried and binds the name an expansion shadows the glob with. rustc asks only the
+    /// glob importers on the binding's chain; asking about any directive retries more often and
+    /// binds the same.
+    pub(crate) fn set_unexpanded(&mut self, unexpanded: bool) {
+        self.unexpanded = unexpanded;
+    }
+
     /// The import fixed point (`resolve_imports` until `ReachedFixedPoint::Yes`).
     pub(crate) fn resolve_imports(&mut self) {
         while self.resolve_imports_pass() == ReachedFixedPoint::No {}
@@ -412,7 +478,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     }
 
     /// Applies an op another query owns.
-    fn replay(&mut self, op: &DeclOp) {
+    pub(crate) fn replay(&mut self, op: &DeclOp) {
         let db = self.db;
         match op {
             DeclOp::Init { module, origin, visibility, parent, inherited } => {
@@ -561,6 +627,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     /// Retries unresolved import `at`; whether it recorded anything.
     fn retry_unresolved(&mut self, at: u32) -> bool {
         let i = at as usize;
+        let _reading = crate::nameres::delta::reads::reading(self.state.imports.directives[i].op.module);
         self.queues.attempt(at);
         let status = self.resolve_import(at);
         let imports = &mut self.state.imports;
@@ -591,6 +658,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     fn retry_indeterminate(&mut self, seq: u32) -> bool {
         let (at, settled) = self.state.imports.indeterminate[seq as usize];
         let i = at as usize;
+        let _reading = crate::nameres::delta::reads::reading(self.state.imports.directives[i].op.module);
         self.queues.attempt(at);
         let status = self.resolve_import(at);
         let imports = &mut self.state.imports;
@@ -620,6 +688,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     /// nothing, as that module's scope is final for the round.
     fn resolve_import(&mut self, at: u32) -> PartialResolvedImport {
         let db = self.db;
+        let unexpanded = self.unexpanded;
         let Unit { def_map, local, state, queues, check, .. } = self;
         let UnitState { imports, upstream, .. } = state;
         let (keys, keys_any) = (&mut queues.keys, &mut queues.keys_any);
@@ -678,7 +747,10 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
 
         // Check whether all namespaces are resolved.
         if resolved_def.is_full() {
-            PartialResolvedImport::Resolved(resolved_def)
+            match unexpanded && through_glob_of(db, krate, &resolved_def) {
+                true => PartialResolvedImport::Indeterminate(resolved_def),
+                false => PartialResolvedImport::Resolved(resolved_def),
+            }
         } else {
             PartialResolvedImport::Indeterminate(resolved_def)
         }
@@ -1168,10 +1240,18 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     defs.types = None;
                     self.scope_mut(module_id).update_def_types(name, def.def, def.vis);
                 } else if def.def != prev_def.def
-                    && let Some(ImportOrExternCrate::Glob(_)) = prev_def.import
+                    && let Some(ImportOrExternCrate::Glob(prev_glob)) = prev_def.import
                 {
-                    let other = ItemInNs::Types(def.def);
-                    self.push_glob_ambiguity(module_id, name, other, glob, def.vis);
+                    if glob_position(self.db, glob) < glob_position(self.db, prev_glob) {
+                        changed = true;
+                        defs.types = None;
+                        self.scope_mut(module_id).rebind_glob_types(name, def, glob);
+                        let other = ItemInNs::Types(prev_def.def);
+                        self.push_glob_ambiguity(module_id, name, other, prev_glob, prev_def.vis);
+                    } else {
+                        let other = ItemInNs::Types(def.def);
+                        self.push_glob_ambiguity(module_id, name, other, glob, def.vis);
+                    }
                 }
             }
 
@@ -1193,10 +1273,18 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     defs.values = None;
                     self.scope_mut(module_id).update_def_values(name, def.def, def.vis);
                 } else if def.def != prev_def.def
-                    && let Some(ImportOrGlob::Glob(_)) = prev_def.import
+                    && let Some(ImportOrGlob::Glob(prev_glob)) = prev_def.import
                 {
-                    let other = ItemInNs::Values(def.def);
-                    self.push_glob_ambiguity(module_id, name, other, glob, def.vis);
+                    if glob_position(self.db, glob) < glob_position(self.db, prev_glob) {
+                        changed = true;
+                        defs.values = None;
+                        self.scope_mut(module_id).rebind_glob_values(name, def, glob);
+                        let other = ItemInNs::Values(prev_def.def);
+                        self.push_glob_ambiguity(module_id, name, other, prev_glob, prev_def.vis);
+                    } else {
+                        let other = ItemInNs::Values(def.def);
+                        self.push_glob_ambiguity(module_id, name, other, glob, def.vis);
+                    }
                 }
             }
 
@@ -1216,10 +1304,18 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     defs.macros = None;
                     self.scope_mut(module_id).update_def_macros(name, def.def, def.vis);
                 } else if def.def != prev_def.def
-                    && let Some(ImportOrExternCrate::Glob(_)) = prev_def.import
+                    && let Some(ImportOrExternCrate::Glob(prev_glob)) = prev_def.import
                 {
-                    let other = ItemInNs::Macros(def.def);
-                    self.push_glob_ambiguity(module_id, name, other, glob, def.vis);
+                    if glob_position(self.db, glob) < glob_position(self.db, prev_glob) {
+                        changed = true;
+                        defs.macros = None;
+                        self.scope_mut(module_id).rebind_glob_macros(name, def, glob);
+                        let other = ItemInNs::Macros(prev_def.def);
+                        self.push_glob_ambiguity(module_id, name, other, prev_glob, prev_def.vis);
+                    } else {
+                        let other = ItemInNs::Macros(def.def);
+                        self.push_glob_ambiguity(module_id, name, other, glob, def.vis);
+                    }
                 }
             }
         }
@@ -1352,7 +1448,7 @@ pub(crate) fn local_scope(
 
 /// The round's `#[prelude_import]`: the index of the module that holds it. The graph puts that
 /// module's component upstream of every other.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn prelude_holder(db: &Db, round: RoundKey) -> Option<u32> {
     let shape = queries::import_shape(db, round);
     let at = shape.modules.iter().position(|it| it.imports.iter().any(|import| import.is_prelude))?;
@@ -1362,7 +1458,7 @@ fn prelude_holder(db: &Db, round: RoundKey) -> Option<u32> {
 /// The std prelude the round's `#[prelude_import]` resolved to, if one did: what every other
 /// component installs, from the holder's state at the last round its component ran.
 /// Backdates while it stays.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn round_prelude(db: &Db, round: RoundKey) -> Option<(ModuleId, Option<UseId>)> {
     let holder = prelude_holder(db, round)?;
     let krate = round.krate(db);
@@ -1560,6 +1656,7 @@ pub(crate) fn scc_state(db: &Db, frame: &Frame, key: SccKey) -> SccState {
             unit
         }
     };
+    unit.set_unexpanded(modules.pending != 0);
     unit.resolve_imports();
 
     let mut imports: Box<[(ImportOp, Option<PerNs>)]> = Box::default();

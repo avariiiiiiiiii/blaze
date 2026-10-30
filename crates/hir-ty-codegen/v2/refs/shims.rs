@@ -16,7 +16,7 @@ use hir_ty::{
     consteval::try_const_usize,
     drop::DropGlue,
     intrinsic::intrinsic_of,
-    next_solver::{GenericArgs, Region, Ty, TyKind},
+    next_solver::{GenericArgs, Region, RegionExt, Ty, TyKind},
 };
 use hir_ty_mir::mir::location::track_caller;
 use rustc_abi::ExternAbi;
@@ -357,7 +357,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
                     }
                     // A callee that tracks its caller is handed the place of its
                     // declaration, data of the shim's own.
-                    self.call_direct(func, generic_args, &arg_tys, dst_ty)
+                    self.call_direct(func, generic_args.skip_binder(), &arg_tys, dst_ty)
                 }
                 // The fields are written in place.
                 CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => {

@@ -4,6 +4,8 @@
 //! backdating, and many tasks verifying one chain at once give the same values and reruns as a
 //! claimed check.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Mutex;
 
 use salsa::Setter;

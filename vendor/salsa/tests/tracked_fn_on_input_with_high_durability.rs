@@ -1,5 +1,6 @@
 #![cfg(feature = "inventory")]
 #![allow(warnings)]
+#![forbid(unsafe_code)]
 
 use common::{EventLoggerDatabase, HasLogger, LogDatabase, Logger};
 use expect_test::expect;

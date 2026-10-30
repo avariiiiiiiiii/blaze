@@ -18,7 +18,7 @@ repository.workspace = true
 doctest = false
 
 # One binary per target; `targets/{cas_shared,hir_shared,hir_expr_shared,macro_wasm_guest,
-# proc_macro_shared}.rs` are modules of their targets.
+# proc_macro_shared,syntax_shared}.rs` are modules of their targets.
 [[bin]]
 name = "api_cbor"
 path = "targets/api_cbor.rs"
@@ -76,6 +76,10 @@ name = "codegen_asm"
 path = "targets/codegen_asm.rs"
 
 [[bin]]
+name = "codegen_blob"
+path = "targets/codegen_blob.rs"
+
+[[bin]]
 name = "hir_body"
 path = "targets/hir_body.rs"
 
@@ -94,6 +98,10 @@ path = "targets/hir_item_tree.rs"
 [[bin]]
 name = "hir_store_source_map"
 path = "targets/hir_store_source_map.rs"
+
+[[bin]]
+name = "intern_table"
+path = "targets/intern_table.rs"
 
 [[bin]]
 name = "link_coff_archive"
@@ -192,6 +200,14 @@ name = "proc_macro_tt_wire"
 path = "targets/proc_macro_tt_wire.rs"
 
 [[bin]]
+name = "syntax_parse"
+path = "targets/syntax_parse.rs"
+
+[[bin]]
+name = "syntax_reparse"
+path = "targets/syntax_reparse.rs"
+
+[[bin]]
 name = "usercode_index_shape"
 path = "targets/usercode_index_shape.rs"
 
@@ -241,11 +257,15 @@ path = "targets/vfs_journal_records.rs"
 
 [dependencies]
 base-db.workspace = true
+# The global allocator of every target, whose counts `blaze_fuzz::largest_allocation` reads.
+blaze-alloc-count.workspace = true
 blaze-api.workspace = true
 blaze-build-script.workspace = true
 blaze-cas.workspace = true
 blaze-codegen.workspace = true
 blaze-core.workspace = true
+# `bridge::wire`, the bytes a wasm module writes, which `macro_wasm_wire`'s seeds are.
+blaze-expand.workspace = true
 blaze-format.workspace = true
 blaze-fuzz.workspace = true
 blaze-ids.workspace = true
@@ -265,8 +285,12 @@ blaze-vfs.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty-codegen.workspace = true
+# `intern::fuzz`, a table section restored into a fresh table and the writer of one, which `intern_table` runs.
+intern = { workspace = true, features = ["fuzz"] }
 # The object-file targets build their seeds with `object::write`.
 object = { workspace = true, features = ["write"] }
+# `LexedStr::lexes_alike`, the fast lexer against `rustc_lexer` alone.
+parser = { workspace = true, features = ["fuzz"] }
 # `Utf8PathBuf`, the library path of the proc-macro targets' requests.
 paths.workspace = true
 proc-macro-api.workspace = true

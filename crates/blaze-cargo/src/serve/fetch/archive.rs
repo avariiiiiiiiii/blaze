@@ -5,8 +5,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::io::{self, Read};
+use std::io::Read as _;
 
+use blaze_registry::download::{LimitErrorReader, is_windows_reserved_path};
 use blaze_vfs::Mode;
 use rustc_hash::FxHashSet;
 use tar::{Archive, EntryType};
@@ -44,7 +45,7 @@ pub(super) fn unpack(tarball: &[u8], prefix: &str) -> Result<Vec<SourceFile>, St
         if inside.rsplit('/').next() == Some(PACKAGE_SOURCE_LOCK) {
             continue;
         }
-        if cfg!(windows) && is_windows_reserved_path(&inside) {
+        if cfg!(windows) && is_windows_reserved_path(std::path::Path::new(&inside)) {
             return Err(format!(
                 "`{shown}` appears to contain a reserved Windows path, it cannot be extracted on Windows"
             ));
@@ -148,36 +149,4 @@ impl Paths {
         }
         Ok(())
     }
-}
-
-/// A reader that fails once more than `left` bytes are read from it, as cargo's
-/// `LimitErrorReader`.
-struct LimitErrorReader<R> {
-    inner: R,
-    left: u64,
-}
-
-impl<R: Read> Read for LimitErrorReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let most =
-            buf.len().min(usize::try_from(self.left.saturating_add(1)).unwrap_or(usize::MAX));
-        let read = self.inner.read(&mut buf[..most])?;
-        if read as u64 > self.left {
-            return Err(io::Error::other("maximum limit reached when reading"));
-        }
-        self.left -= read as u64;
-        Ok(read)
-    }
-}
-
-/// Whether a path names one of Windows' devices, as cargo's `is_windows_reserved_path`.
-fn is_windows_reserved_path(path: &str) -> bool {
-    const RESERVED: [&str; 22] = [
-        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
-    ];
-    path.split('/').any(|component| {
-        let stem = component.split('.').next().unwrap_or(component);
-        RESERVED.contains(&stem.to_ascii_lowercase().as_str())
-    })
 }

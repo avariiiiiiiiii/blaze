@@ -353,6 +353,19 @@ impl<'t, L: Language> Node<'t, L> {
         DescendantsWithTokens { scan: Scan::new(self.place(), self.at), _l: PhantomData }
     }
 
+    /// [`Self::descendants_with_tokens`] with each element's range. The walk carries the
+    /// running offset, so a token's range is one add and a node's end at most a kept start and
+    /// seven lengths, where asking each element's `text_range` reads up to fifteen words.
+    #[inline]
+    pub fn descendants_with_ranges(self) -> DescendantsWithRanges<'t, L> {
+        DescendantsWithRanges {
+            scan: Scan::new(self.place(), self.at),
+            offset: self.tree.offset(self.at),
+            after_part: 0,
+            _l: PhantomData,
+        }
+    }
+
     #[inline]
     pub fn preorder(self) -> Preorder<'t, L> {
         Preorder { start: self, next: Some(WalkEvent::Enter(self)), skip_subtree: false }
@@ -967,6 +980,42 @@ impl<'t, L: Language> Iterator for DescendantsWithTokens<'t, L> {
     #[inline]
     fn next(&mut self) -> Option<Element<'t, L>> {
         self.scan.step(true).map(|(place, it)| place.element(it))
+    }
+}
+
+#[derive(Clone)]
+pub struct DescendantsWithRanges<'t, L: Language> {
+    scan: Scan<'t>,
+    /// Where the next element starts.
+    offset: u32,
+    /// Where the lazy node whose part the scan is in ends.
+    after_part: u32,
+    _l: PhantomData<L>,
+}
+
+impl<'t, L: Language> Iterator for DescendantsWithRanges<'t, L> {
+    type Item = (Element<'t, L>, TextRange);
+
+    #[inline]
+    fn next(&mut self) -> Option<(Element<'t, L>, TextRange)> {
+        let in_part = self.scan.place.part != NodeId::FILE;
+        let (place, it) = self.scan.step(true)?;
+        if in_part && place.part == NodeId::FILE {
+            self.offset = self.after_part;
+        }
+        let tree = place.tree;
+        let start = self.offset;
+        let end = if tree.is_token(it) {
+            self.offset += tree.text_len(it);
+            self.offset
+        } else if tree.is_lazy(it) {
+            // A part's elements index the file's source, so its children start where it does.
+            self.after_part = start + tree.text_len(it);
+            self.after_part
+        } else {
+            tree.node_end(it, start)
+        };
+        Some((place.element(it), TextRange::new(TextSize::from(start), TextSize::from(end))))
     }
 }
 

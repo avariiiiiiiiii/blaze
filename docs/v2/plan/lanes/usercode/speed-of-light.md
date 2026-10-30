@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: lane usercode's speed of light: the bound each component's work and the hardware set, the arithmetic, and how the design reaches 90% of it.
-date: 2026-10-29
+date: 2026-10-30
 ---
 # Lane usercode: speed of light
 
@@ -19,6 +19,43 @@ the target machines (EPYC Turin, Graviton 5, [hardware.md](../../design/hardware
 
 None of this has been measured yet: nothing compiles until every lane is done. `proof`'s budgets
 measure each bound once it does, and a component more than 10% above its bound is a bug.
+
+## The machine (speed-sol2-usercode)
+
+The second round's sections use these figures, those of
+[the link lane's speed of light](../link/speed-of-light.md), not yet measured:
+
+| what | figure |
+|---|---|
+| clock | 3.5 GHz |
+| L1 read, streaming | 64 B a cycle |
+| L2 read, streaming | 32 B a cycle (about 110 GB/s) |
+| one core from DRAM, streaming | about 25 GB/s |
+| page-cache copy (`read`, `write`) | about 10 GB/s a core |
+| system call on an open descriptor | 0.15 µs |
+| system call that resolves a path | 0.4 µs |
+| IPC | about 2 instructions a cycle for branchy code, about 4 for straight-line integer code |
+| BLAKE3 with AVX-512 | about 6 GB/s a core |
+
+Process figures, also estimates: `fork` of a small single-threaded process (a launcher of about
+10 MB resident) about 30 µs; `execve` of a dynamically linked program to its `main` 100 to
+300 µs, of blaze's own binary about 1 ms (its page faults); a new network namespace about
+0.1 ms, its teardown deferred to the kernel's workqueue; a mount namespace's copy about 1 µs a
+mount; a tmpfs or bind mount 5 to 10 µs, each under the kernel's global `namespace_sem`, so
+mounts of parallel runs serialize.
+
+## Where each component is (speed-sol2-usercode)
+
+| component | crates | section |
+|---|---|---|
+| a build script's output, environment, elision, rerun checks, begin and finish | `blaze-build-script` | "Build scripts" below |
+| a run's `OUT_DIR` read back and written again | `blaze-usercode` `run.rs` | "A run's `OUT_DIR`" below |
+| a sandboxed run's setup on Linux and macOS | `blaze-cargo/src/sandbox/` | "A sandboxed run's fixed cost" below |
+| tracing, the Windows sandbox | `blaze-cargo/src/sandbox/` | "The sandbox: tracing", "The Windows sandbox" below |
+| the test queue and fork server | `blaze-usercode` `test/` | "Tests" below, [speed-of-light-tests.md](speed-of-light-tests.md) |
+| finding a kept result, outside paths, assembling what was read | `blaze-usercode` `index.rs`, `inputs.rs`, `trace.rs` | the sections of those names below |
+| a proc-macro call, the token wire, the server, native expanders | `blaze-expand`, `proc-macro-api`, `proc-macro-srv` | [speed-of-light-macros.md](speed-of-light-macros.md) (speed-sol2-usercode-macros) |
+| wasm proc macros and the wasi runtime | `blaze-macro-wasm`, `blaze-wasi` | [speed-of-light-wasm.md](speed-of-light-wasm.md) (speed-sol2-usercode-wasm) |
 
 ## Build scripts: `crates/blaze-build-script/` (usercode-fast-scripts)
 
@@ -445,6 +482,9 @@ part is one record of each distinct read.
     program's exec.
   - It needs a spawn effect of the driver's (cargo's) that reaches the launcher. It is the
     next step for this lane and cargo.
+  - (speed-sol2-usercode) Two execs is not all of it: each Linux run also forks a probe of
+    user namespaces (about 0.1 ms) and makes every mount anew. The whole count, the bound and
+    what removes each part are in "A sandboxed run's fixed cost on Linux and macOS" below.
 
 ## The Windows sandbox: `crates/blaze-cargo/src/sandbox/windows.rs`
 
@@ -652,6 +692,169 @@ The design:
   trace record read with one `pread` (applied 2026-10-29).
 - **Change 20** moves this to fastcompile's evaluator. The keys, the store and the trace are the
   same (v2/requests/usercode-bridge.md).
+
+## A run's `OUT_DIR`: `run::collect`, `run::restore` (speed-sol2-usercode)
+
+**Workload.** A build script's `OUT_DIR` as it ends: typically 1 to 5 files of a few KB
+(generated Rust, a `cfg` probe's output), and for a heavy one (bindgen, a C library's objects)
+about 50 files and 5 directories, 5 MB. `collect` reads it back as a run ends, to keep it.
+`restore` writes it again when a kept run is reused, which is every build that finds one.
+
+**The work, and its bound.** Per file: its bytes once, and the calls that can't be merged.
+- **Reading one file:** open (resolving its path once), fstat for its mode and length, a read
+  of that length, the read that sees the end, close. That is 1 × 0.4 + 4 × 0.15 = **1.0 µs**,
+  plus its bytes at 10 GB/s. A directory costs its `getdents64`, and its entries' kinds come
+  from the listing (`d_type`), so no call per entry. A link costs a `realpath` to check that it
+  stays inside, and a stat of what it leads to.
+- **Writing one file:** open with create, write, close, and `fchmod` when executable:
+  0.4 + 2 × 0.15 = **0.7 µs**, plus its bytes. Each directory is one `mkdir`.
+- For the heavy workload: reading 50 × 1.0 + 5 × 0.5 ≈ 53 µs plus 5 MB at 10 GB/s, 500 µs:
+  **about 0.55 ms**. Writing about 50 × 0.7 + 5 × 0.4 = 37 µs plus 500 µs: **about 0.54 ms**.
+
+**Where the code was.**
+- `collect` stat'd every entry twice by its full path, once without following links and once
+  following, and then `std::fs::read` opened it by path again: 7 calls a file, 3 of them
+  resolving a path, about **1.8 µs**, 1.8 times the bound's calls.
+- `restore` called `create_dir_all` on each file's parent. The parent is already there for
+  every file but the first in a directory, so that is `mkdir` failing with `EEXIST` and a stat:
+  2 more path calls a file. `std::fs::write` and then `set_permissions` by path for an
+  executable gave 5 to 6 calls a file, 3 or 4 of them resolving a path, about **1.5 µs**, 2.1
+  times the bound's calls.
+- For the heavy workload, both stayed within 10% only because 5 MB of copying hides the calls.
+  For the typical one, where the calls are the work, they were about 2 times the bound.
+
+**What changed** (2026-10-30, `crates/blaze-usercode/src/run.rs`):
+- `collect` takes an entry's kind from the listing, follows a link only to check and stat what it
+  leads to, and opens each file once, reading its mode and length on the descriptor: 5 calls,
+  one path resolved.
+- `restore` keeps the directories it has made (a set lent from the value's paths). A
+  directory the value lists, or one made for an earlier file, is not made again. A file is
+  `File::create`, `write_all` and, when executable, `fchmod` on its descriptor.
+- The bytes, the order, the modes and the errors are what they were.
+- Test: `a_restore_makes_each_directory_once_and_collect_reads_it_back`. It covers a parent the
+  value lists after a file in it, an unlisted parent, an executable file's mode, a link to a
+  directory inside, which is kept as the directory and not walked, and a second restore over
+  what is there.
+
+**Where it is now:** at the bound's calls for both, so within 10% for either workload.
+
+**What is left.**
+- A reused run decodes its value (`Value::decode`), which copies every file's bytes out of the
+  store before `restore` writes them. That is one more pass over the bytes at about 20 GB/s,
+  against the write's 10 GB/s: about 50% on the bytes of a heavy `OUT_DIR`, 0.25 ms of 5 MB.
+- The only caller of `Begun::Reused` (`blaze-cargo/src/serve/unit/script.rs`) reads its code,
+  signal, stdout and stderr, never its files. So a value restored from the store's bytes in
+  place, with `Begun::Reused` carrying no file bytes, removes the copy. That changes what
+  `Begun::Reused` holds, which is an interface cargo's code builds against, so it is asked of
+  cargo in the queue rather than done here.
+- Beyond that, `copy_file_range` or a reflink from the store's file would make a restore
+  copy no bytes in the page cache at all. That needs the store to keep `OUT_DIR` files as files
+  of their own, which is lane store's design.
+
+**What `proof` measures:** system calls (strace's count) of `collect` and `restore` over the
+two workloads: at most 5 a file read, 4 a file written, 1 a directory. Also the wall time of
+`restore` of the heavy workload against `cp -r` of the same tree.
+
+## A sandboxed run's fixed cost on Linux and macOS (speed-sol2-usercode)
+
+What a build script or probe pays to run in the sandbox, beyond its own work and what tracing
+costs per call (that is "The sandbox: tracing", above). Counted from `blaze-usercode/src/confine.rs`
+and `blaze-cargo/src/sandbox/{v2,linux,macos}.rs`.
+
+**Workload.** A traced build script: R = 20 readable paths, W = 1 writable (`OUT_DIR`), on a
+machine with M = 40 mounts (a NixOS or container host has a few hundred), 16 to 64 scripts
+started in parallel at the start of a cold build.
+
+**The bound.** The program's own exec, plus the isolation itself: one fork from a warm process,
+the namespaces (user, mount copied from the host, network, IPC, PID), the binds that differ per
+run (W), the run's `/proc`, and a seccomp filter. Every other step is the same for every run and
+can be made once per launcher. That is the exec (100 to 300 µs) plus about 30 µs of fork, 0.1 ms
+of network namespace, M × 1 µs for the mount copy, W × 10 µs of binds and 20 µs of `/proc`:
+**the exec plus about 0.2 ms.**
+
+**Where the code is, on Linux** (each run, from the driver's spawn to the program's `main`):
+- the driver writes the spec (`Launcher::confine`): openat, write, close;
+- **the launcher's exec**, `blaze sandbox --v2 SPEC`, blaze's own binary: about 1 ms;
+- it reads and parses the spec, opens and writes the live record, fstats its three standard
+  descriptors (`given`): about 12 calls;
+- **a probe of user namespaces** (`linux::namespaces`), on every run: a fork, `unshare` of a
+  user namespace, three opens, writes and closes of its maps, the exit and the wait: about
+  **0.1 ms**, to decide between namespaces and the confined sandbox. The answer is the same for
+  every run of a launcher;
+- the interposer's file read whole and compared (`interposer`), and the spec cloned with its
+  directory: about 10 µs;
+- a fork of the sandbox's first process. It unshares user, mount, IPC and network namespaces,
+  writes the maps (9 calls), makes the mounts private, opens R + W descriptors, makes every mount
+  read-only (`mount_setattr`, O(M)), mounts 2 tmpfs for staging and up to 5 empty ones (`EMPTIED`,
+  each after an lstat), lists `/run` and remakes its links, binds R + W directories, each after a
+  `create_dir_all` (2 calls), brings up the loopback (3), unshares a PID namespace and forks;
+- the PID namespace's first process mounts `/proc` and forks the program's process, which
+  installs the filter, sends its descriptor and execs.
+
+That is the exec plus about 1.4 ms: 1 ms of the launcher's exec, 0.1 ms of probe, three forks
+(90 µs), about 30 mounts (R + W + 7 tmpfs, about 0.25 ms) and about 100 cheap calls. With an exec
+of 0.2 ms, that is **1.6 ms against 0.4 ms, about 4 times the bound**. Of the 1.2 ms over:
+- the launcher's exec is 1 ms;
+- the probe is 0.1 ms;
+- the R binds that are the same every run are about 0.2 ms, and they serialize across parallel
+  runs on `namespace_sem`;
+- the second fork (the PID namespace's first process apart from the sandbox's first) is 30 µs.
+
+**Where the code is, on macOS:** the launcher's exec (about 1 ms); the interposer library read
+whole and compared (`library`); the profile's text made and its parameters (the writable
+directories, the live record, the sockets, the services), a config file written; one fork, in
+which `sandbox_init_with_parameters` compiles the profile and applies it; the exec, with the
+interposer loaded by `DYLD_INSERT_LIBRARIES`. The profile's compile is in the bound while its
+parameters differ per run: Seatbelt binds parameters when it compiles. So what is over the bound
+is again the launcher's exec, about 1 ms.
+
+**What stands in the way, and what removes it.**
+1. **The launcher's exec, 1 ms a run on both.** A warm launcher, one per daemon, that forks a run
+   from itself: Windows has one (`--v2-serve`, "The Windows sandbox" above). On Unix, the
+   driver's side (a Unix socket, the run's descriptors passed with `SCM_RIGHTS`, `Handed`'s
+   Unix meaning already in `blaze-core`) is queue 00551, to cargo, open. The `uring` and
+   `kqueue` drivers do not ask `Confine::warm` yet. Until they do, `Launcher::warm` returns
+   `None` off Windows, and the launcher's side waits for that protocol.
+2. **The probe, 0.1 ms a run.** It moves into the warm launcher, asked once as it starts. In a
+   launcher per run there is nothing to keep it in. The driver can't ask it either: it is
+   multi-threaded and the probe forks. Deciding by trying the real `unshare` in the sandbox's
+   first process would need the supervisor's recorder, filter and directories to change after
+   the fork, so it is not done.
+3. **The binds that are the same every run.** With a warm launcher, a template mount namespace
+   made once (every mount read-only, the empty directories, the R binds of the build's
+   toolchain and registry) would leave a run to copy it (M µs), bind its own W and mount its
+   `/proc`. bubblewrap and nsjail make every mount per run; this is the zygote's design applied
+   to the mounts.
+4. **The second fork.** `clone3` with `CLONE_NEWPID` makes the sandbox's first process the
+   PID namespace's first too, 30 µs. The C library's fork handlers don't run for a raw
+   `clone3`, which is safe in the launcher's own single-threaded process.
+
+With 1 and 2 a run is the exec plus about 0.4 ms, 1.5 times the bound. With 3 and 4 it is the
+exec plus about 0.2 ms, within 10%. Items 2 to 4 are this lane's own once 1 lands.
+
+**State of the art:** buck2's forkserver and Android's zygote for the warm launcher; bubblewrap,
+nsjail and Bazel's `linux-sandbox` make every namespace and mount per run, which is where the
+code is today; Chromium's broker on Windows.
+
+**What `proof` measures:** the wall time from `Effect::Spawn` to the program's first instruction
+(a program that is `_exit(0)` in `_start`), against an `execve` of the same program outside any
+sandbox. The budget is the difference at most 1.1 × 0.2 ms with the warm launcher, and today's
+count meanwhile. Also the calls of the launcher per run (strace), and mounts per run.
+
+## What is left in `blaze-build-script` (speed-sol2-usercode)
+
+Two gaps the "Build scripts" section above records are still open after this round. Both are in
+free code of this lane, and are in the queue for it:
+- **Elision's lexer, 3.3 times its bound** (about 3.3n cycles a byte against 1.0n). A
+  `std::simd` stage 1 and a lexer at about 10 instructions a token, with a differential test
+  against `elide/lex/tests/reference.rs`, as that section says. Not done this round: it is a
+  rewrite of `elide/lex.rs` that must be proven against the reference, and this round had no
+  room for it. In absolute terms it is about 0.2 µs over, per edit of a 300-byte root file.
+- **The environment's sort, about 15% over.** It needs the fixed names as slots indexed by a
+  `const` sorted table at each `cmd.set` call (about 40), so that only the variable part
+  (`[env]`, features, cfgs, `DEP_*`) is sorted before one merge. That brings it to about 8%
+  over. It saves about 1,700 cycles a unit, behind the 6,000 cycles of allocations that queue
+  00209 (`Output` and `Env` as one buffer with spans) holds.
 
 ## What `proof` measures, for the sections above
 

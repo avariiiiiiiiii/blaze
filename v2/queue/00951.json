@@ -1,0 +1,26 @@
+{
+  "id": "00951",
+  "from_lane": "speed-clone-link",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/state.rs",
+    "crates/blaze-link/src/place.rs",
+    "crates/blaze-link/src/write.rs",
+    "crates/blaze-link/src/file.rs"
+  ],
+  "what": "blaze-link State::clone (once per Image::stage, lib.rs stage: `let mut new = self.state.clone()`) allocates once: the `spaces: Vec<Space>` copy (state.rs `State::spaces`). Make it zero on a stage that writes no region: hold `spaces` as `Arc<Vec<Space>>` (or a CowVec) and take `Arc::make_mut` at its writers (place.rs:284 and :580, write.rs:716, :879, :945, file.rs:379, :383; readers place.rs:771, premap.rs:671 unchanged). Then change state.rs `a_clone_allocates_the_regions_list_only` from `assert_eq!(used.allocations, 1)` to 0 and rename it. Why: the clone is per stage, and a stage that only moves slots or changes names writes no region.",
+  "state": "open",
+  "created": "2026-10-30T11:02:45Z",
+  "updated": "2026-10-30T11:02:45Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T11:02:45Z",
+      "by": "speed-clone-link",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

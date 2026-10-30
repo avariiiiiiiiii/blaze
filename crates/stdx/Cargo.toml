@@ -15,11 +15,12 @@ doctest = false
 [dependencies]
 backtrace = { version = "0.3.75", optional = true }
 jod-thread = "1.0.0"
-crossbeam-channel.workspace = true
 itertools.workspace = true
 tracing.workspace = true
-crossbeam-utils = "0.8.21"
 # Think twice before adding anything here
+
+[dev-dependencies]
+hegeltest.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 stacker = "0.1.17"

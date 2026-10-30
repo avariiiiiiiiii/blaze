@@ -30,6 +30,11 @@ Two more bugs in the same function, both found here:
 
 > forwarded to the coordinator: `tools/` is its; on requests' coordinator list with the other hot-sweep `in_test_module` requests.
 
+> done by hot-sweep (2026-10-30, in `tools/v2/hot_lint.py`, uncommitted): all three bugs above, plus
+> brace counting outside literals and `#[path]` test sources. blaze-cas, intern and blaze-ids now
+> report 0. Nothing left for the coordinator here. Same for the lint items in
+> `hot-sweep-{graph,mir,syntax,cg-v2llvm-fold}.md`.
+
 ## 2. `blaze-vfs` uses `smallvec` (workspace dependency, already in the root `Cargo.toml`)
 
 Added `smallvec.workspace = true` to `crates/blaze-vfs/Cargo.toml` (its own manifest);

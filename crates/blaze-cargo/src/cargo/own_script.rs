@@ -16,6 +16,7 @@ use std::{
     sync::{Condvar, Mutex, PoisonError},
 };
 
+use blaze_format::cursor::{Put as _, Reader};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};
 
@@ -525,24 +526,18 @@ impl Built {
     fn bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for field in [BUILDS.as_bytes(), &self.exe, &self.dep_info] {
-            out.extend((field.len() as u64).to_le_bytes());
-            out.extend(field);
+            out.put_bytes_u64(field);
         }
         out
     }
 
     fn read(bytes: &[u8]) -> Option<Built> {
-        let mut rest = bytes;
-        let mut take = || {
-            let len = usize::try_from(u64::from_le_bytes(rest.get(..8)?.try_into().ok()?)).ok()?;
-            let field = rest.get(8..8usize.checked_add(len)?)?;
-            rest = &rest[8 + len..];
-            Some(field)
-        };
-        if take()? != BUILDS.as_bytes() {
+        let mut rest = Reader::new(bytes);
+        if rest.bytes_u64().ok()? != BUILDS.as_bytes() {
             return None;
         }
-        Some(Built { exe: take()?.to_vec(), dep_info: take()?.to_vec() })
+        // alloc: the two files are written out from these, once per build script or macro built
+        Some(Built { exe: rest.bytes_u64().ok()?.to_vec(), dep_info: rest.bytes_u64().ok()?.to_vec() })
     }
 
     /// Writes it where `made` says, each file whole or not at all.

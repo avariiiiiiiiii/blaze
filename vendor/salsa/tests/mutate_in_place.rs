@@ -3,6 +3,8 @@
 //! Test that a setting a field on a `#[salsa::input]`
 //! overwrites and returns the old value.
 
+#![forbid(unsafe_code)]
+
 use salsa::Setter;
 use test_log::test;
 

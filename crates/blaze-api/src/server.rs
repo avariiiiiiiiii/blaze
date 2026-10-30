@@ -372,11 +372,16 @@ impl Server {
         }
         let tag = self.tag();
         self.pending.insert(tag, Pending::Recv(conn));
-        // alloc: the room the driver reserves, which the frames then keep (`push_vec`).
-        effects.push(Effect::Recv { conn, most, into: Vec::new(), tag });
-        if let Some(connection) = self.conns.get_mut(&conn) {
-            connection.receiving = Some(tag);
-        }
+        let Some(connection) = self.conns.get_mut(&conn) else { return };
+        let into = match &mut connection.reader {
+            // The frames' own buffer, given back by the read: a warm receive allocates nothing.
+            Reader::Unix(frames) => frames.lend(),
+            // The parser is read while a receive is in flight (a pipelined request, once a send
+            // ends), so it lends the buffer its last `push_vec` left free, not the one it holds.
+            Reader::Http { parser, .. } => parser.lend_spare(),
+        };
+        effects.push(Effect::Recv { conn, most, into, tag });
+        connection.receiving = Some(tag);
     }
 
     fn received(&mut self, conn: Conn, tag: Tag, done: Done, effects: &mut Vec<Effect>) {
@@ -385,19 +390,25 @@ impl Server {
             return;
         }
         connection.receiving = None;
-        let bytes = match done {
-            Done::Read(bytes) if !bytes.is_empty() => bytes,
-            _ => return self.gone(conn, effects),
-        };
-        if connection.closing {
-            return;
-        }
+        let Done::Read(bytes) = done else { return self.gone(conn, effects) };
+        let closing = connection.closing;
         match &mut connection.reader {
             Reader::Unix(frames) => {
-                frames.push_vec(bytes);
+                if !frames.give_back(bytes) {
+                    return self.gone(conn, effects);
+                }
+                if closing {
+                    return;
+                }
                 self.unix_items(conn, effects);
             }
             Reader::Http { parser, .. } => {
+                if bytes.is_empty() {
+                    return self.gone(conn, effects);
+                }
+                if closing {
+                    return;
+                }
                 parser.push_vec(bytes);
                 self.http_requests(conn, effects);
             }

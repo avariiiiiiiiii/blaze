@@ -76,12 +76,7 @@ impl Module {
 
     pub fn as_source_file_id(self, db: &Db) -> Option<EditionedFileId> {
         let def_map = self.id.def_map(db);
-        match def_map.module(db, self.id).origin {
-            ModuleOrigin::File { definition, .. } | ModuleOrigin::CrateRoot { definition, .. } => {
-                Some(definition)
-            }
-            _ => None,
-        }
+        def_map.module(db, self.id).origin.file_id()
     }
 
     pub fn is_inline(self, db: &Db) -> bool {

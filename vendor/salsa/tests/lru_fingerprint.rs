@@ -3,6 +3,8 @@
 //! A value an LRU cap dropped keeps its fingerprint: when an input edit makes it recompute to an
 //! equal value it is backdated, so what read it doesn't run again, unless its durability dropped.
 
+#![forbid(unsafe_code)]
+
 mod common;
 use common::LogDatabase;
 use expect_test::expect;

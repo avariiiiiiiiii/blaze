@@ -9,11 +9,11 @@
 //! `TraitImplMismatch` of `compiler/rustc_resolve/src/diagnostics/mod.rs` (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::view::{self as ast, AstNode as _};
 
 use crate::{
     cx::Cx,
-    lints::edit_distance::find_best_match_for_name,
     lower::{
         Found, Phase,
         incoherent_impl::{ImplAt, assoc_item_span, assoc_name_span, unresolved},
@@ -95,7 +95,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplRedundantAssocItems) -> V
                 // alloc: the error's parts, for an error hir found
                 .collect();
             if name != "_"
-                && let Some(candidate) = find_best_match_for_name(&candidates, name, None)
+                && let Some(candidate) = find_best_match_for_name(&candidates, name, None).copied()
                 && let Some(ident) = assoc_name_span(cx, item)
             {
                 diag.suggestion(ident, similar, candidate, Applicability::MaybeIncorrect);

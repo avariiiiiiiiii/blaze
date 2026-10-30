@@ -21,7 +21,7 @@ use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Domain, Hasher};
 use hir_def::{
     ConstId, HasModule,
-    deps::{Held as _, ImageStore, Mode},
+    deps::{Held as _, ImageStore, Mode, crate_name},
     nameres::frozen,
 };
 use rustc_hash::FxHashMap;
@@ -281,15 +281,6 @@ fn unreadable<'db>(
         crate_name(db, krate)
     );
     ConstEvalError::MirEvalError(MirEvalError::InternalError(said.into_boxed_str()))
-}
-
-fn crate_name(db: &Db, krate: Crate) -> String {
-    match &krate.extra_data(db).display_name {
-        // alloc: error text
-        Some(name) => name.to_string(),
-        // alloc: error text
-        None => format!("{krate:?}"),
-    }
 }
 
 /// What [`drain`] did.

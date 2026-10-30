@@ -12,6 +12,8 @@
 //! from a submodule is to use multiple crates, hence the existence
 //! of this crate.
 
+#![forbid(unsafe_code)]
+
 mod gate_accumulated;
 mod macro_if;
 mod maybe_default;

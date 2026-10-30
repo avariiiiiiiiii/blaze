@@ -1037,16 +1037,6 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-fn level_name(level: Level) -> &'static str {
-    match level {
-        Level::Error => "error",
-        Level::Warning => "warning",
-        Level::Note => "note",
-        Level::Help => "help",
-        Level::FailureNote => "failure-note",
-    }
-}
-
 /// How many bytes a rendering writes, counted without writing them, so the list it goes in
 /// grows once for it.
 struct Len(usize);
@@ -1061,7 +1051,7 @@ impl fmt::Write for Len {
 /// An error as rustc prints its first line, its other labelled places, its notes and the facts
 /// its query read, onto the end of `text`.
 fn render_diagnostic_into(text: &mut impl fmt::Write, diagnostic: &Diagnostic) -> fmt::Result {
-    text.write_str(level_name(diagnostic.level))?;
+    text.write_str(diagnostic.level.name())?;
     if let Some(code) = &diagnostic.code {
         write!(text, "[{code}]")?;
     }
@@ -1076,7 +1066,7 @@ fn render_diagnostic_into(text: &mut impl fmt::Write, diagnostic: &Diagnostic) -
         }
     }
     for child in &diagnostic.children {
-        write!(text, "\n  {}: {}", level_name(child.level), child.message)?;
+        write!(text, "\n  {}: {}", child.level.name(), child.message)?;
     }
     for fact in &diagnostic.facts {
         text.write_str("\n  read: ")?;

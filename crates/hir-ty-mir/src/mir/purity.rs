@@ -238,6 +238,7 @@ fn called(db: &Db, krate: base_db::Crate, callee: &Operand) -> Option<Impure> {
         return Some(unknown("calls a function pointer or a closure".to_owned()));
     };
     let CallableDefId::FunctionId(func) = def.0 else { return None };
+    let args = args.skip_binder();
     if FunctionSignature::is_intrinsic(db, func) || diverges(db, func) {
         // A panic: what it prints is no result.
         return None;

@@ -13,7 +13,9 @@
 //! [`inputs`] has what reads are checked against (a view and the machine); [`rule`] is cargo's
 //! rule for what can't be traced; [`run`] is a run as a state machine, from the store or a
 //! sandboxed spawn to a kept result; [`script`] and [`pool`] are build scripts and the warm
-//! processes proc macros run in; [`test`] selects and runs tests (docs/v2/plan/lanes/usercode/notes.md).
+//! processes proc macros run in; [`pure`] keeps a build script proved pure under a key that
+//! needs no compile (docs/v2/plan/lanes/pure-scripts/design.md); [`test`] selects and runs tests
+//! (docs/v2/plan/lanes/usercode/notes.md).
 
 #![feature(allocator_api)]
 #![forbid(unsafe_code)]
@@ -22,6 +24,7 @@ pub mod confine;
 pub mod index;
 pub mod inputs;
 pub mod pool;
+pub mod pure;
 pub mod rule;
 pub mod run;
 pub mod script;
@@ -140,11 +143,20 @@ impl Given {
     /// [`Given::vars`] don't name them.
     pub fn env_keyed<'a>(&mut self, vars: impl IntoIterator<Item = (&'a [u8], &'a [u8])>) -> &mut Given {
         let hash = blaze_mem::frame::task(blaze_mem::Tag::Usercode, |frame| {
-            let mut sorted: Vec<(&[u8], &[u8]), &blaze_mem::Frame> = Vec::new_in(frame);
-            sorted.extend(vars);
-            sorted.sort_by(|a, b| a.0.cmp(b.0));
+            // A name's first sixteen bytes, big-endian and padded with zeros, order as its bytes
+            // do, and most comparisons end there at one compare of two words; a tie goes to
+            // the bytes. The sort is stable, so the last value of a name is the one kept.
+            let order = |name: &[u8]| {
+                let mut first = [0u8; 16];
+                let len = name.len().min(16);
+                first[..len].copy_from_slice(&name[..len]);
+                u128::from_be_bytes(first)
+            };
+            let mut sorted: Vec<(u128, &[u8], &[u8]), &blaze_mem::Frame> = Vec::new_in(frame);
+            sorted.extend(vars.into_iter().map(|(name, value)| (order(name), name, value)));
+            sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
             sorted.dedup_by(|later, first| {
-                let same = later.0 == first.0;
+                let same = later.1 == first.1;
                 if same {
                     *first = *later;
                 }
@@ -152,9 +164,12 @@ impl Given {
             });
             let mut hasher = Hasher::new(Given::PART);
             hasher.update(&(sorted.len() as u64).to_le_bytes());
-            for (name, value) in &sorted {
-                hasher.part(name).part(value);
+            let mut batched = Batched { hasher: &mut hasher, batch: [0; Batched::LEN], len: 0 };
+            for (_, name, value) in &sorted {
+                batched.part(name);
+                batched.part(value);
             }
+            batched.flush();
             hasher.finish().0
         });
         self.hashed("env keyed", hash)
@@ -204,6 +219,42 @@ impl Given {
 
     pub fn vars(&self) -> impl Iterator<Item = (&OsString, &OsString)> {
         self.env.iter()
+    }
+}
+
+/// Length-prefixed parts gathered for one update of `hasher`, as [`trace::Keyer`] gathers a
+/// key's: BLAKE3 then hashes eight chunks at once, where an update per name and value compresses
+/// one block at a time. The bytes hashed are [`Hasher::part`]'s, so the hash is the same.
+struct Batched<'h> {
+    hasher: &'h mut Hasher,
+    batch: [u8; Batched::LEN],
+    len: usize,
+}
+
+impl Batched<'_> {
+    /// Eight BLAKE3 chunks: as many as AVX2 hashes at once.
+    const LEN: usize = 8 * 1024;
+
+    fn put(&mut self, bytes: &[u8]) {
+        if self.len + bytes.len() > Batched::LEN {
+            self.flush();
+            if bytes.len() > Batched::LEN {
+                self.hasher.update(bytes);
+                return;
+            }
+        }
+        self.batch[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+
+    fn part(&mut self, bytes: &[u8]) {
+        self.put(&(bytes.len() as u64).to_le_bytes());
+        self.put(bytes);
+    }
+
+    fn flush(&mut self) {
+        self.hasher.update(&self.batch[..self.len]);
+        self.len = 0;
     }
 }
 
@@ -278,6 +329,35 @@ mod tests {
         let mut passed = Given::new(RunKind::ProcMacro);
         passed.env_keyed([(b"A".as_slice(), b"1".as_slice())]);
         assert!(!passed.sets(OsStr::new("A")));
+    }
+
+    /// The batched hash of keyed variables is the hash of one [`Hasher::part`] per name and
+    /// value, across the batch's end and past its size.
+    #[test]
+    fn keyed_variables_batched_hash_as_one_part_each() {
+        let long = vec![b'x'; Batched::LEN + 3];
+        let edge = vec![b'y'; Batched::LEN - 20];
+        let names: Vec<String> = (0..200).map(|it| format!("VAR_{it:03}")).collect();
+        let mut vars: Vec<(&[u8], &[u8])> = names.iter().map(|it| (it.as_bytes(), b"value".as_slice())).collect();
+        vars.push((b"WIDE".as_slice(), long.as_slice()));
+        vars.push((b"ZEDGE".as_slice(), edge.as_slice()));
+        vars.push((b"ZZ".as_slice(), b"".as_slice()));
+        // Names that tie on their first sixteen bytes, one a prefix of others, and a short one
+        // that ties with a zero byte after it: ordered as their bytes are.
+        for name in [&b"CARGO_CFG_TARGET_OS"[..], b"CARGO_CFG_TARGET_ARCH", b"CARGO_CFG_TARGET_", b"A", b"A\0"] {
+            vars.push((name, b"v".as_slice()));
+        }
+        vars.sort_by(|a, b| a.0.cmp(b.0));
+        let mut by_piece = Hasher::new(Given::PART);
+        by_piece.update(&(vars.len() as u64).to_le_bytes());
+        for (name, value) in &vars {
+            by_piece.part(name).part(value);
+        }
+        let mut expected = Given::new(RunKind::ProcMacro);
+        expected.hashed("env keyed", by_piece.finish().0);
+        let mut given = Given::new(RunKind::ProcMacro);
+        given.env_keyed(vars.iter().rev().copied());
+        assert_eq!(given.finish(), expected.finish());
     }
 
     #[test]

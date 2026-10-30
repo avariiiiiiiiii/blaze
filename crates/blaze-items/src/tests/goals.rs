@@ -20,8 +20,8 @@ use test_fixture::WithFixture;
 use super::{TestDB, edit, item, items, single, table::every_kind};
 use crate::{
     Fact, ImplEntry, ImplIndexKey, ItemId, blanket_impls,
-    goals::{Goals, fact_of_read},
-    implements, impls,
+    goals::{FactRefKey, Goals, fact_of_read, fact_value},
+    hidden_types, implements, impls,
     index::impl_self_ty,
     item_key, key, kinds, specializes,
     table::{fact_of_ref, fact_ref},
@@ -38,7 +38,7 @@ fn a_fact_reads_back_from_its_parts() {
     let mut kinds: Vec<u16> = facts.iter().map(|it| it.kind().0).collect();
     kinds.sort_unstable();
     kinds.dedup();
-    assert_eq!(kinds.len(), 18, "one fact of each kind");
+    assert_eq!(kinds.len(), 19, "one fact of each kind");
     for fact in facts {
         let parts = fact_ref(&fact);
         assert_eq!(parts.kind, fact.kind());
@@ -388,6 +388,50 @@ fn a_facts_value_is_the_one_its_parts_read_back_to() {
 }
 
 #[test]
+fn a_read_of_hidden_types_stands_for_their_fact() {
+    let (db, _) = single(
+        r#"
+pub trait Tr {}
+impl Tr for u8 {}
+pub fn f() -> impl Tr { 0u8 }
+pub type T = u8;
+"#,
+    );
+    let ItemId::Function(f) = item(&db, "f") else { panic!("`f` is no fn") };
+    let ItemId::Alias(t) = item(&db, "T") else { panic!("`T` is no alias") };
+    let read = |name: &str, key: salsa::Id| fact_of_read(&db, name, key);
+    let rpit = read("rpit_hidden_types", f.as_id());
+    assert_eq!(rpit, Some(hidden_types(&db, ItemId::Function(f))));
+    assert_ne!(rpit, Some(Fact::Signature(item_key(&db, ItemId::Function(f)))));
+    assert_eq!(read("tait_hidden_types", t.as_id()), Some(hidden_types(&db, ItemId::Alias(t))));
+    assert_eq!(read("rpit_hidden_types", t.as_id()), None, "an alias is no fn");
+    assert_eq!(read("tait_hidden_types", f.as_id()), None, "a fn is no alias");
+    let fact = hidden_types(&db, ItemId::Function(f));
+    assert!(Goals.value(&db, fact_ref(&fact)).is_some());
+}
+
+#[test]
+fn a_facts_value_is_one_query() {
+    let (db, _) = single(ITEMS);
+    let Fixture { imp, f, .. } = fixture(&db);
+    let krate = db.test_crate();
+    for fact in [
+        Fact::Signature(item_key(&db, ItemId::Impl(imp))),
+        Fact::Signature(item_key(&db, ItemId::Function(f))),
+        crate::target(&db, krate),
+    ] {
+        let parts = fact_ref(&fact);
+        let key = FactRefKey::new(&db, parts);
+        assert_eq!(key, FactRefKey::new(&db, parts), "one key per fact");
+        assert_eq!(key.fact(&db), parts);
+        assert_eq!(fact_value(&db, key), value(&db, &fact).ok(), "{fact:?}");
+        assert_eq!(Goals.value(&db, parts), fact_value(&db, key), "{fact:?}");
+    }
+    let refused = FactRef { kind: kinds::HASHES, subject: id(1), object: FactObject::None };
+    assert_eq!(fact_value(&db, FactRefKey::new(&db, refused)), None);
+}
+
+#[test]
 fn a_warm_read_and_value_allocate_nothing() {
     let (db, _) = single(ITEMS);
     let Fixture { imp, .. } = fixture(&db);
@@ -398,4 +442,57 @@ fn a_warm_read_and_value_allocate_nothing() {
         std::hint::black_box((read(), Goals.value(&db, fact)))
     });
     assert!(warm.1.is_some());
+}
+
+const LANG_OF_EACH_KIND: &str = r#"
+#![feature(lang_items)]
+#[lang = "sized"]
+pub trait Sized {}
+#[lang = "owned_box"]
+pub struct Box<T>(T);
+pub enum Option<T> { None, #[lang = "Some"] Some(T) }
+pub trait Deref { #[lang = "deref_target"] type Target; }
+pub struct S;
+impl S { #[lang = "begin_panic"] pub fn begin() {} }
+#[lang = "drop_in_place"]
+pub fn drop_in_place() {}
+"#;
+
+/// The copies `goals.rs` and `blaze-item-hash`'s `values.rs` each had before the one in `key`.
+mod old {
+    use base_db::Db;
+    use hir_def::lang_item::LangItemTarget;
+    use hir_ty::next_solver::SolverDefId;
+
+    use crate::{ItemId, ItemKey, key};
+
+    pub(super) fn lang_item_key(db: &Db, target: LangItemTarget) -> ItemKey {
+        let def = match target {
+            LangItemTarget::EnumId(it) => SolverDefId::AdtId(it.into()),
+            LangItemTarget::StructId(it) => SolverDefId::AdtId(it.into()),
+            LangItemTarget::UnionId(it) => SolverDefId::AdtId(it.into()),
+            LangItemTarget::FunctionId(it) => SolverDefId::FunctionId(it),
+            LangItemTarget::ImplId(it) => SolverDefId::ImplId(it),
+            LangItemTarget::StaticId(it) => SolverDefId::StaticId(it),
+            LangItemTarget::TypeAliasId(it) => SolverDefId::TypeAliasId(it),
+            LangItemTarget::TraitId(it) => SolverDefId::TraitId(it),
+            LangItemTarget::EnumVariantId(it) => SolverDefId::EnumVariantId(it),
+            LangItemTarget::ConstId(it) => SolverDefId::ConstId(it),
+            LangItemTarget::MacroId(it) => return key::item_key(db, ItemId::Macro(it)),
+        };
+        key::def_key(db, def)
+    }
+}
+
+#[test]
+fn a_lang_items_key_is_the_one_each_old_copy_gave() {
+    let (db, _) = single(LANG_OF_EACH_KIND);
+    let lang = lang_items(&db, db.test_crate());
+    let mut seen = 0;
+    for item in hir_def::lang_item::LangItemEnum::ALL {
+        let Some(target) = item.from_lang_items(lang) else { continue };
+        assert_eq!(key::lang_item_key(&db, target), old::lang_item_key(&db, target), "{item:?}");
+        seen += 1;
+    }
+    assert!(seen >= 7, "a trait, struct, variant, alias and functions: {seen}");
 }

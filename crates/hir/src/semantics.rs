@@ -20,7 +20,6 @@ use hir_def::{
     hir::{BindingId, Expr, ExprId, ExprOrPatId, Unsafe},
     nameres::{ModuleOrigin, crate_def_map},
     resolver::{self, HasResolver, Resolver, TypeNs, ValueNs},
-    type_ref::Mutability,
 };
 use hir_expand::{
     EditionedFileId, ExpandResult, FileRange, HirFileId, InMacroFile, MacroCallId,
@@ -54,10 +53,10 @@ use syntax::{
 };
 
 use crate::{
-    Adjust, Adjustment, Adt, AnyFunctionId, AutoBorrow, BindingMode, BuiltinAttr, Callable, Const,
+    Adjust, Adjustment, Adt, AnyFunctionId, BindingMode, BuiltinAttr, Callable, Const,
     ConstParam, Crate, DeriveHelper, Enum, EnumVariant, ExpressionStoreOwner, Field, Function,
     GenericSubstitution, HasSource, Impl, InFile, InlineAsmOperand, ItemInNs, Label, LifetimeParam,
-    Local, Macro, Module, ModuleDef, Name, OverloadedDeref, ScopeDef, Static, Struct, ToolModule,
+    Local, Macro, Module, ModuleDef, Name, ScopeDef, Static, Struct, ToolModule,
     Trait, TupleField, Type, TypeAlias, TypeParam, Union, Variant,
     db::HirDatabase,
     scratch::{DescendCalls, DescendFirsts, DescendGroups, DescendTokens, LintAttrs},
@@ -706,7 +705,7 @@ impl<'db> SemanticsImpl<'db> {
 
     pub fn derive_helpers_in_scope(&self, adt: &ast::Adt) -> Option<Vec<(Symbol, Symbol)>> {
         let sa = self.analyze_no_infer(adt.syntax())?;
-        let id = sa.file_id.ast_id_map(self.db).ast_id(adt);
+        let id = sa.file_id.ast_id_map(self.db).ast_id_for_ptr(AstPtr::new(adt));
         let result = sa
             .resolver
             .def_map()
@@ -730,7 +729,7 @@ impl<'db> SemanticsImpl<'db> {
         })?;
         let attr_name = attr.path().and_then(|it| it.as_single_name_ref())?.as_name();
         let sa = self.analyze_no_infer(adt.syntax())?;
-        let id = sa.file_id.ast_id_map(self.db).ast_id(&adt);
+        let id = sa.file_id.ast_id_map(self.db).ast_id_for_ptr(AstPtr::new(&adt));
         let res: Vec<_> = sa
             .resolver
             .def_map()
@@ -746,58 +745,6 @@ impl<'db> SemanticsImpl<'db> {
 
     pub fn is_attr_macro_call(&self, item: InFile<&ast::Item>) -> bool {
         self.with_ctx(|ctx| ctx.item_to_macro_call(item).is_some())
-    }
-
-    /// Expand the macro call with a different token tree, mapping the `token_to_map` down into the
-    /// expansion. `token_to_map` should be a token from the `speculative args` node.
-    pub fn speculative_expand_macro_call(
-        &self,
-        actual_macro_call: &ast::MacroCall,
-        speculative_args: &ast::TokenTree,
-        token_to_map: SyntaxToken,
-    ) -> Option<(SyntaxNode, Vec<(SyntaxToken, u8)>)> {
-        let macro_file = self.to_def(actual_macro_call)?;
-        self.speculative_expand_raw(macro_file, speculative_args.syntax(), token_to_map)
-    }
-
-    pub fn speculative_expand_raw(
-        &self,
-        macro_file: MacroCallId,
-        speculative_args: &SyntaxNode,
-        token_to_map: SyntaxToken,
-    ) -> Option<(SyntaxNode, Vec<(SyntaxToken, u8)>)> {
-        macro_file.expand_speculative(self.db, speculative_args, token_to_map)
-    }
-
-    /// Expand the macro call with a different item as the input, mapping the `token_to_map` down into the
-    /// expansion. `token_to_map` should be a token from the `speculative args` node.
-    pub fn speculative_expand_attr_macro(
-        &self,
-        actual_macro_call: &ast::Item,
-        speculative_args: &ast::Item,
-        token_to_map: SyntaxToken,
-    ) -> Option<(SyntaxNode, Vec<(SyntaxToken, u8)>)> {
-        let macro_call = self.find_file(actual_macro_call.syntax()).with_value(actual_macro_call);
-        let macro_call_id = self.with_ctx(|ctx| ctx.item_to_macro_call(macro_call))?;
-        self.speculative_expand_raw(macro_call_id, speculative_args.syntax(), token_to_map)
-    }
-
-    pub fn speculative_expand_derive_as_pseudo_attr_macro(
-        &self,
-        actual_macro_call: &ast::Attr,
-        speculative_args: &ast::Attr,
-        token_to_map: SyntaxToken,
-    ) -> Option<(SyntaxNode, Vec<(SyntaxToken, u8)>)> {
-        let attr = self.find_file(actual_macro_call.syntax()).with_value(actual_macro_call);
-        let adt = actual_macro_call.syntax().parent().and_then(ast::Adt::cast)?;
-        let macro_call_id = self.with_ctx(|ctx| {
-            ctx.attr_to_derive_macro_call(
-                attr.with_value(&adt),
-                attr.with_value(&attr.value.meta()?),
-            )
-            .map(|(_, it, _)| it)
-        })?;
-        self.speculative_expand_raw(macro_call_id, speculative_args.syntax(), token_to_map)
     }
 
     /// Checks if renaming `renamed` to `new_name` may introduce conflicts with other locals,
@@ -1567,7 +1514,7 @@ impl<'db> SemanticsImpl<'db> {
                                     self.analyze_impl(InFile::new(expansion, &parent), None, false)
                                 })?
                                 .resolver;
-                            let id = expansion.ast_id_map(db).ast_id(&adt);
+                            let id = expansion.ast_id_map(db).ast_id_for_ptr(AstPtr::new(&adt));
                             let helpers = resolver
                                 .def_map()
                                 .derive_helpers_in_scope(db, InFile::new(expansion, id))?;
@@ -1814,11 +1761,6 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     pub fn expr_adjustments(&self, expr: &ast::Expr) -> Option<Vec<Adjustment<'db>>> {
-        let mutability = |m| match m {
-            hir_ide::next_solver::Mutability::Not => Mutability::Shared,
-            hir_ide::next_solver::Mutability::Mut => Mutability::Mut,
-        };
-
         let analyzer = self.analyze(expr.syntax())?;
 
         let (mut source_ty, _) = analyzer.type_of_expr(self.db, expr)?;
@@ -1827,22 +1769,7 @@ impl<'db> SemanticsImpl<'db> {
             it.iter()
                 .map(|adjust| {
                     let target = analyzer.ty(self.db, adjust.target.as_ref());
-                    let kind = match adjust.kind {
-                        hir_ide::Adjust::NeverToAny => Adjust::NeverToAny,
-                        hir_ide::Adjust::Deref(Some(hir_ide::OverloadedDeref(m))) => {
-                            // FIXME: Should we handle unknown mutability better?
-                            Adjust::Deref(Some(OverloadedDeref(mutability(m))))
-                        }
-                        hir_ide::Adjust::Deref(None) => Adjust::Deref(None),
-                        hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::RawPtr(m)) => {
-                            Adjust::Borrow(AutoBorrow::RawPtr(mutability(m)))
-                        }
-                        hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::Ref(m)) => {
-                            // FIXME: Handle lifetimes here
-                            Adjust::Borrow(AutoBorrow::Ref(mutability(m.into())))
-                        }
-                        hir_ide::Adjust::Pointer(pc) => Adjust::Pointer(pc),
-                    };
+                    let kind = Adjust::from(adjust.kind);
 
                     // Update `source_ty` for the next adjustment
                     let source = mem::replace(&mut source_ty, target);

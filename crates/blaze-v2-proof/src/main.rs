@@ -7,8 +7,17 @@
 //! fixture slot the edit moved, and `before`, the slot's case in [`blaze_v2_proof::nameres`] is
 //! checked too; a finding over or under exits 1 as well.
 //!
+//! `blaze-v2-proof '{"dbsp": "impl", "traits": 1, "buckets": 1, "before": "p.cbor", "after": "a.cbor"}'`
+//! holds the traces of the builds before and after one edit of `harness/v2/dbsp/edits.py` to
+//! the edit kind's case in [`blaze_v2_proof::dbsp`], given how many traits and buckets the edit
+//! touched, and prints `{"edit", "claim", "findings": [{"side", "detail"}]}`. A finding over
+//! exits 1; an unmeasured one does not.
+//!
 //! `blaze-v2-proof '{"first": "a", "second": "b"}'` compares two files byte for byte instead
 //! (`blaze_v2_proof::bytes`, by the CPU's SIMD) and prints where they first differ.
+//!
+//! `blaze-v2-proof '{"tree": "src", "skip": ["target"]}'` prints `{"digest": HEX}`, the tree's
+//! digest (`blaze_v2_proof::tree`) that `harness/v2/engine.py`'s `tree_digest` compares.
 //!
 //! `blaze-v2-proof '{"bench": "join"}'` times one of the reference workloads in `bench.rs` and
 //! prints `{"value": MS}`, for the bounds `harness/v2/bounds.py` reads.
@@ -27,7 +36,7 @@ use blaze_query::QueryKey;
 use blaze_v2_proof::{
     Stale,
     bytes::Mapped,
-    join,
+    dbsp, join,
     nameres::{self, Finding, Side},
     wire::View,
 };
@@ -37,8 +46,19 @@ use serde::{Deserialize, Serialize};
 #[serde(untagged)]
 enum Given {
     Traces(Input),
+    Dbsp(DbspInput),
     Files(Files),
+    Tree(Tree),
     Bench(Bench),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Tree {
+    tree: PathBuf,
+    /// Directories at the tree's top left out (build outputs).
+    #[serde(default)]
+    skip: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -64,6 +84,24 @@ struct Input {
     /// The fixture slot the edit moved; its `nameres` case, if it has one, is checked.
     #[serde(default)]
     slot: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DbspInput {
+    /// The edit kind, a case of [`dbsp::CASES`].
+    dbsp: String,
+    traits: u32,
+    buckets: u32,
+    before: PathBuf,
+    after: PathBuf,
+}
+
+#[derive(Serialize)]
+struct DbspOutput {
+    edit: &'static str,
+    claim: &'static str,
+    findings: Vec<NameresFound>,
 }
 
 #[derive(Serialize)]
@@ -124,6 +162,44 @@ fn nameres_found(finding: &Finding) -> NameresFound {
     NameresFound { side: finding.side(), detail }
 }
 
+fn dbsp_found(finding: &dbsp::Finding) -> NameresFound {
+    // alloc: each arm is the CLI's output, written once a finding.
+    let detail = match finding {
+        dbsp::Finding::Reran { what, reran, most, keys, .. } => {
+            // alloc: as above.
+            let keys: Vec<String> = keys.iter().take(8).map(name).collect();
+            // alloc: as above.
+            format!("{reran} {what} reran, the edit touched {most}: {}", keys.join(", "))
+        }
+        // alloc: as above.
+        dbsp::Finding::Unrecorded { what, kind } => format!("neither trace has {what} (kind {:#06x})", kind.0),
+        dbsp::Finding::Coarse { query, read } => {
+            // alloc: as above.
+            format!("{} read {}, a whole crate's table, so it reruns with every impl of it", name(query), name(read))
+        }
+        // alloc: as above.
+        dbsp::Finding::Unexplained { query } => format!("{} reran though nothing it read changed", name(query)),
+        // alloc: as above.
+        dbsp::Finding::Needless { query } => format!("{} reran, read and made what it did before", name(query)),
+    };
+    NameresFound { side: finding.side(), detail }
+}
+
+fn check_dbsp(input: &DbspInput) -> Result<DbspOutput, String> {
+    let Some(case) = dbsp::case(&input.dbsp) else {
+        // alloc: error path; the CLI exits 2.
+        let cases: Vec<&str> = dbsp::CASES.iter().map(|c| c.edit).collect();
+        // alloc: as above.
+        return Err(format!("no `dbsp` case `{}`; the cases are {}", input.dbsp, cases.join(", ")));
+    };
+    let (before, after) = (mapped(&input.before)?, mapped(&input.after)?);
+    let (before, after) = (view(&input.before, &before)?, view(&input.after, &after)?);
+    let touched = dbsp::Touched { traits: input.traits, buckets: input.buckets };
+    // alloc: the CLI's output, once a run.
+    let findings = dbsp::check(case, touched, &before, &after).iter().map(dbsp_found).collect();
+    Ok(DbspOutput { edit: case.edit, claim: case.claim, findings })
+}
+
 /// `kkkk:` and the first 8 bytes of the input in hex, written into one 21-byte string.
 fn name(key: &QueryKey) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -178,7 +254,10 @@ fn read_input(arg: &str) -> Result<Given, String> {
     };
     serde_json::from_str(&text).map_err(|e| {
         // alloc: error path; the CLI exits 2.
-        format!("the input: {{\"incremental\", \"scratch\", \"before\"?, \"slot\"?}} or {{\"first\", \"second\"}}: {e}")
+        format!(
+            "the input: {{\"incremental\", \"scratch\", \"before\"?, \"slot\"?}} or {{\"dbsp\", \"traits\", \
+             \"buckets\", \"before\", \"after\"}} or {{\"first\", \"second\"}} or {{\"tree\", \"skip\"?}}: {e}"
+        )
     })
 }
 
@@ -248,13 +327,31 @@ fn compare_files(files: &Files) -> ExitCode {
     }
 }
 
+fn tree_digest(tree: &Tree) -> ExitCode {
+    match blaze_v2_proof::tree::digest(&tree.tree, &tree.skip) {
+        Ok(hash) => {
+            // alloc: the CLI's output, once a run.
+            let mut digest = Vec::with_capacity(64);
+            blaze_v2_proof::tree::hex(&hash, &mut digest);
+            let digest = std::str::from_utf8(&digest).expect("hex digits are ASCII");
+            println!("{}", serde_json::json!({ "digest": digest }));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("blaze-v2-proof: the tree {}: {e}", tree.tree.display());
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     // alloc: the CLI's arguments, once a run.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [arg] = args.as_slice() else {
         eprintln!(
             "usage: blaze-v2-proof JSON (inline, a file's path, or -): {{\"incremental\", \"scratch\", \"before\"?, \"slot\"?}} \
-             or {{\"first\", \"second\"}} or {{\"bench\": \"first-difference\" or \"join\"}}"
+             or {{\"dbsp\", \"traits\", \"buckets\", \"before\", \"after\"}} or {{\"first\", \"second\"}} \
+             or {{\"tree\", \"skip\"?}} or {{\"bench\": \"first-difference\" or \"join\"}}"
         );
         return ExitCode::from(2);
     };
@@ -267,7 +364,21 @@ fn main() -> ExitCode {
     };
     let input = match given {
         Given::Traces(input) => input,
+        Given::Dbsp(input) => {
+            return match check_dbsp(&input) {
+                Ok(output) => {
+                    let over = output.findings.iter().any(|f| f.side != Side::Unmeasured);
+                    println!("{}", serde_json::to_string_pretty(&output).expect("the output is JSON"));
+                    if over { ExitCode::from(1) } else { ExitCode::SUCCESS }
+                }
+                Err(e) => {
+                    eprintln!("blaze-v2-proof: {e}");
+                    ExitCode::from(2)
+                }
+            };
+        }
         Given::Files(files) => return compare_files(&files),
+        Given::Tree(tree) => return tree_digest(&tree),
         Given::Bench(b) => {
             println!("{}", serde_json::json!({ "value": bench::run(b.bench) }));
             return ExitCode::SUCCESS;

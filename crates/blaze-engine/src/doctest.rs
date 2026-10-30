@@ -769,12 +769,11 @@ fn failure(ran: &std::process::Output) -> String {
 /// Has `krate` be read as rustdoc reads a crate whose examples it tests, with `cfg(doc)` and
 /// `cfg(doctest)`: documentation that is only there for them has examples too.
 fn document(db: &mut RootDatabase, krate: hir::Crate) {
-    use ide_db::base_db::salsa::Setter as _;
     let krate: ide_db::base_db::Crate = krate.into();
     let mut cfg = krate.cfg_options(db).clone();
     cfg.insert_atom(intern::Symbol::intern("doc"));
     cfg.insert_atom(intern::Symbol::intern("doctest"));
-    krate.set_cfg_options(db).to(cfg);
+    krate.set_cfg_options(db, cfg);
 }
 
 /// The examples of the library, each as the program rustdoc makes of it, and how many the
@@ -1076,6 +1075,7 @@ fn add_crates(
             origin: CrateOrigin::Local { repo: None, name: None },
             crate_attrs: Box::default(),
             target_kind: TargetKind::Bin,
+            crate_types: TargetKind::Bin.default_crate_types(),
             proc_macro_cwd: data.proc_macro_cwd.clone(),
         };
         let extra = ExtraCrateData {
@@ -1083,10 +1083,15 @@ fn add_crates(
             display_name: Some(CrateDisplayName::from_canonical_name(&name)),
             potential_cfg_options: None,
         };
-        let krate =
-            base_db::Crate::builder(data, extra, workspace.clone(), cfg.clone(), env.clone())
-                .durability(Durability::MEDIUM)
-                .new(db);
+        let krate = base_db::Crate::create(
+            db,
+            data,
+            extra,
+            workspace.clone(),
+            cfg.clone(),
+            env.clone(),
+            Durability::MEDIUM,
+        );
         crates.push(krate);
         added.push((at, Added { name, root_file: file }));
     }
@@ -1269,7 +1274,6 @@ fn run(
     target: &str,
     files: &mut Vec<vfs::FileId>,
 ) -> anyhow::Result<i32> {
-    use ide_db::base_db::salsa::Setter as _;
     let start = Instant::now();
     // The examples are taken out of the library as rustdoc reads it.
     let library: ide_db::base_db::Crate = krate.into();
@@ -1277,7 +1281,7 @@ fn run(
     document(db, krate);
     crate::prepare_macro_sessions(db);
     let (tests, left_out) = hir::attach_db(db, || tests(db, asked, krate));
-    library.set_cfg_options(db).to(cfg);
+    library.set_cfg_options(db, cfg);
     crate::prepare_macro_sessions(db);
     let built_from = built_from(db, library);
     let (plans, unit) = plan(db, building, asked, krate, &tests, target, files);

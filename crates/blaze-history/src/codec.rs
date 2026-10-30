@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_graph::admission::{self, Estimates, TaskKind};
 use blaze_ids::radix;
@@ -127,18 +128,6 @@ fn record_bytes(slot: usize, record: &Record) -> [u8; RECORD_BYTES] {
         bytes[48 + at * 4..52 + at * 4].copy_from_slice(&run.to_le_bytes());
     }
     bytes
-}
-
-fn u32_at(bytes: &[u8; RECORD_BYTES], at: usize) -> u32 {
-    let mut word = [0; 4];
-    word.copy_from_slice(&bytes[at..at + 4]);
-    u32::from_le_bytes(word)
-}
-
-fn u64_at(bytes: &[u8; RECORD_BYTES], at: usize) -> u64 {
-    let mut word = [0; 8];
-    word.copy_from_slice(&bytes[at..at + 8]);
-    u64::from_le_bytes(word)
 }
 
 /// The slot, the pad and the record of [`record_bytes`]' bytes.

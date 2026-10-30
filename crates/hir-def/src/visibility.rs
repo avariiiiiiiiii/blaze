@@ -5,10 +5,7 @@ use std::iter;
 use base_db::{Db, Crate};
 use hir_expand::{InFile, Lookup};
 use la_arena::ArenaMap;
-use syntax::{
-    AstPtr,
-    view::{self as ast, HasVisibility},
-};
+use syntax::view::{self as ast, HasVisibility};
 
 use crate::{
     AssocItemId, BlockIdLt, HasModule, ItemContainerId, LocalFieldId, ModuleId, ModuleIdLt, TraitId,
@@ -62,11 +59,8 @@ impl Visibility {
         from_module: ModuleIdLt<'db>,
     ) -> bool {
         let to_module = match self {
-            // SAFETY: `to_db` needs `m` to be an id of `db`. A `Visibility` is resolved against
-            // `db`'s def maps (`Visibility::resolve`, the collector) and asked only with the same
-            // database, so `m` is one of `db`'s modules, and the `'db` copy is read only during
-            // this call. A module of another database would name a slot of another table.
-            Visibility::Module(m, _) => unsafe { m.to_db(db) },
+            // A `Visibility` is resolved against `db`'s def maps and asked with the same `db`.
+            Visibility::Module(m, _) => m.to_db(db),
             Visibility::PubCrate(krate) => return from_module.krate(db) == krate,
             Visibility::Public => return true,
         };
@@ -307,19 +301,6 @@ impl VariantFields {
     }
 }
 
-/// [`visibility_from_ast_view`] of a handle: the view of the same node, in the database's tree
-/// the handle was read from.
-pub fn visibility_from_ast(
-    db: &Db,
-    has_resolver: impl HasResolver + HasModule,
-    ast_vis: InFile<Option<syntax::ast::Visibility>>,
-) -> Visibility {
-    let file_id = ast_vis.file_id;
-    let root = file_id.root(db);
-    let vis = ast_vis.value.map(|it| AstPtr::new(&it).to_view(root));
-    visibility_from_ast_view(db, has_resolver, InFile::new(file_id, vis))
-}
-
 pub fn visibility_from_ast_view(
     db: &Db,
     has_resolver: impl HasResolver + HasModule,
@@ -388,7 +369,7 @@ fn trait_visibility(db: &Db, def: TraitId) -> Visibility {
 
 #[cfg(test)]
 mod view_tests {
-    use syntax::ast::HasVisibility as _;
+    use syntax::view::HasName as _;
     use test_fixture::WithFixture;
 
     use super::*;
@@ -418,34 +399,49 @@ pub mod m {
 pub use m::*;
 "#;
 
-    /// The visibility each item's own syntax gives, read through the handle and through its view.
-    macro_rules! both {
-        ($db:ident, $id:expr) => {{
+    /// A visibility with its module named as `CODE` names it.
+    fn described(db: &TestDB, vis: Visibility) -> String {
+        let root = crate_def_map(db, db.fetch_test_crate()).root_module_id();
+        match vis {
+            Visibility::Public => "pub".to_owned(),
+            Visibility::PubCrate(_) => "pub(crate)".to_owned(),
+            Visibility::Module(module, explicitness) => {
+                let module = if module == root { "crate" } else { "m" };
+                format!("{module} {explicitness:?}")
+            }
+        }
+    }
+
+    /// The visibility an item's own syntax gives, by the item's name.
+    macro_rules! seen {
+        ($db:ident, $seen:ident, $id:expr) => {{
             let id = $id;
-            let loc = id.lookup(&$db);
-            let handle = visibility_from_ast(&$db, id, loc.source(&$db).map(|it| it.visibility()));
-            let view =
-                visibility_from_ast_view(&$db, id, loc.source_view(&$db).map(|it| it.visibility()));
-            assert_eq!(handle, view, "{id:?}");
+            let source = id.lookup(&$db).source_view(&$db);
+            let name = source.value.name().map_or("", |it| it.text()).to_owned();
+            let vis = visibility_from_ast_view(&$db, id, source.map(|it| it.visibility()));
+            $seen.push((name, described(&$db, vis)));
         }};
     }
 
-    /// `visibility_from_ast_view` is `visibility_from_ast`, item by item, for every function,
-    /// const, type alias and trait of `CODE`, the items of its traits and impls too.
+    /// `visibility_from_ast_view` of every function, const, type alias and trait of `CODE`, the
+    /// items of its traits and impls too: `pub(super)` is the crate, `pub(self)` and no
+    /// visibility are the item's module (explicit and not), and an item of a trait or impl reads
+    /// only its own syntax.
     #[test]
-    fn the_view_twin_is_the_handle_version() {
+    fn visibility_of_each_way_to_write_one() {
         let (db, _) = TestDB::with_single_file(CODE);
+        let mut seen = Vec::new();
         let mut items = Vec::new();
         let mut traits = 0;
         for (_, module) in crate_def_map(&db, db.fetch_test_crate()).modules(&db) {
             let scope = module.scope(&db);
             for decl in scope.declarations() {
                 match decl {
-                    ModuleDefId::FunctionId(it) => both!(db, it),
-                    ModuleDefId::ConstId(it) => both!(db, it),
-                    ModuleDefId::TypeAliasId(it) => both!(db, it),
+                    ModuleDefId::FunctionId(it) => seen!(db, seen, it),
+                    ModuleDefId::ConstId(it) => seen!(db, seen, it),
+                    ModuleDefId::TypeAliasId(it) => seen!(db, seen, it),
                     ModuleDefId::TraitId(it) => {
-                        both!(db, it);
+                        seen!(db, seen, it);
                         traits += 1;
                         items.extend(TraitItems::query(&db, it).items.iter().map(|&(_, it)| it));
                     }
@@ -460,10 +456,34 @@ pub use m::*;
         assert_eq!(items.len(), 9, "the trait and impl items of CODE");
         for item in items {
             match item {
-                AssocItemId::FunctionId(it) => both!(db, it),
-                AssocItemId::ConstId(it) => both!(db, it),
-                AssocItemId::TypeAliasId(it) => both!(db, it),
+                AssocItemId::FunctionId(it) => seen!(db, seen, it),
+                AssocItemId::ConstId(it) => seen!(db, seen, it),
+                AssocItemId::TypeAliasId(it) => seen!(db, seen, it),
             }
         }
+        let mut want: Vec<(String, String)> = [
+            ("a", "pub(crate)"),
+            ("B", "crate Explicit"),
+            ("C", "m Explicit"),
+            ("d", "m Explicit"),
+            ("e", "m Implicit"),
+            ("T", "pub"),
+            ("U", "pub(crate)"),
+            // `T`'s items, `impl T for S`'s, then `impl S`'s.
+            ("f", "m Implicit"),
+            ("G", "m Implicit"),
+            ("H", "m Implicit"),
+            ("f", "m Implicit"),
+            ("G", "m Implicit"),
+            ("H", "m Implicit"),
+            ("i", "pub"),
+            ("J", "pub(crate)"),
+            ("l", "m Implicit"),
+        ]
+        .map(|(name, vis)| (name.to_owned(), vis.to_owned()))
+        .into();
+        want.sort();
+        seen.sort();
+        assert_eq!(seen, want);
     }
 }

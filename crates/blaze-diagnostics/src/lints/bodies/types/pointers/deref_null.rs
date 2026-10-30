@@ -29,11 +29,11 @@ impl LatePass for DerefNullPtr {
     const HOOKS: Hooks = Hooks::BODY;
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Ref, ExprKind::UnaryOp]);
 
-    fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+    fn check_body(&mut self, _b: &BodyCx<'_, '_, '_>, _out: &mut Vec<Found>) {
         self.raw_borrowed.clear();
     }
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         match b.store().expr(expr) {
             Expr::Ref { expr: place, rawness: Rawness::RawPtr, .. } => {
                 self.raw_borrowed.insert(place);
@@ -54,7 +54,7 @@ impl LatePass for DerefNullPtr {
 
 /// rustc's `is_null_ptr`: `expr` is a raw pointer to a type that is not zero-sized, made by
 /// `ptr::null()` or `ptr::null_mut()`, or a cast to a raw pointer of `0` or of such a pointer.
-fn is_null_ptr(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+fn is_null_ptr(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     let TyKind::RawPtr(pointee, _) = util::ty(b, expr).kind() else { return false };
     if layout(b, pointee).is_some_and(|it| it.size == 0) {
         return false;

@@ -7,14 +7,14 @@ use crate::cycle::{
     CycleHeads, CycleHeadsIterator, IterationStamp, ProvisionalStatus, empty_cycle_heads,
 };
 use crate::function::{ClaimResult, Configuration, IngredientImpl, Reentrancy};
-use crate::graph::Graph;
+use crate::graph::{Color, Filter, Graph};
 use crate::key::DatabaseKeyIndex;
 use crate::revision::AtomicRevision;
 use crate::sync::atomic::Ordering;
 use crate::table::memo::{DummyMemo, MemoSlot, MemoTableWithTypesMut, ToDynMemo};
 use crate::task::TaskId;
 use crate::zalsa::{MemoIngredientIndex, Zalsa};
-use crate::zalsa_local::{QueryOriginRef, QueryRevisions};
+use crate::zalsa_local::{QueryEdge, QueryOriginRef, QueryRevisions, ZalsaLocal};
 use crate::{Cancelled, Event, EventKind, Id, Revision};
 
 impl<C: Configuration> IngredientImpl<C> {
@@ -43,6 +43,23 @@ impl<C: Configuration> IngredientImpl<C> {
     ) -> Option<&'db Memo<C>> {
         let memo = zalsa
             .memo_table_for::<C::SalsaStruct<'_>>(id)
+            .get(memo_ingredient_index)?;
+        // SAFETY: The memo table owns this allocation for at least `'db`.
+        Some(unsafe { memo.as_ref() })
+    }
+
+    /// [`Self::get_memo_from_table_for`] through the task's page cache
+    /// ([`Zalsa::memo_table_cached`]), for the hit path.
+    #[inline]
+    pub(super) fn get_memo_cached<'db>(
+        &self,
+        zalsa: &'db Zalsa,
+        zalsa_local: &ZalsaLocal,
+        id: Id,
+        memo_ingredient_index: MemoIngredientIndex,
+    ) -> Option<&'db Memo<C>> {
+        let memo = zalsa
+            .memo_table_cached(zalsa_local, id)
             .get(memo_ingredient_index)?;
         // SAFETY: The memo table owns this allocation for at least `'db`.
         Some(unsafe { memo.as_ref() })
@@ -221,11 +238,18 @@ pub(super) struct MemoHeader {
     /// as the current revision.
     pub(super) verified_at: AtomicRevision,
 
+    /// The graph node of the memo's key, set before the memo is published (`insert_memo`), so a
+    /// read records it and a verification paints its color without finding it by key.
+    /// [`QueryEdge::NO_NODE`] until then. A compaction that renumbers the nodes renames it
+    /// (`Ingredient::relocate_edges`, `graph::Relocation::node`).
+    pub(super) node: u32,
+
     /// Revision information
     pub(super) revisions: QueryRevisions,
 }
 
-/// data.md's memo budget: 24 bytes, plus 4 an edge in the graph's edge array.
+/// data.md's memo budget: 24 bytes, plus 4 an edge in the graph's edge array. The node fills
+/// the 4 bytes 32-bit revisions freed beside `verified_at`.
 #[cfg(all(not(feature = "shuttle"), target_pointer_width = "64"))]
 const _: () = assert!(size_of::<MemoHeader>() == 24);
 
@@ -237,8 +261,90 @@ impl MemoHeader {
         );
         Self {
             verified_at: AtomicRevision::from(revision_now),
+            node: QueryEdge::NO_NODE,
             revisions,
         }
+    }
+
+    /// The node of the memo's key, once published.
+    #[inline]
+    pub(super) fn node(&self) -> Option<u32> {
+        (self.node != QueryEdge::NO_NODE).then_some(self.node)
+    }
+
+    /// Raises the color of the memo's key to what this memo says (`graph::colors`): its
+    /// verified-at, changed-at and accumulated values when final, "unknown" when provisional.
+    #[inline]
+    pub(super) fn paint(&self, zalsa: &Zalsa) {
+        let Some(node) = self.node() else {
+            return;
+        };
+        let color = if self.may_be_provisional() {
+            Color::unknown(zalsa.current_revision())
+        } else {
+            Color::verified(
+                self.verified_at.load(),
+                self.revisions.changed_at(),
+                self.has_accumulated(),
+            )
+        };
+        zalsa.graph().paint(node, color);
+    }
+
+    /// This memo's input-closure filter (`graph::bloom`), made from its edges, all verified in
+    /// the current revision. Provisional, cycle, untracked and assigned memos: every bit.
+    fn closure(&self, zalsa: &Zalsa) -> Filter {
+        let eligible = !self.may_be_provisional() && !self.was_cycle_participant();
+        match self.origin(zalsa.graph()) {
+            QueryOriginRef::Derived(edges) => match edges.words() {
+                Some(words) => {
+                    zalsa.graph().closure_of(zalsa, eligible, words.iter(), zalsa.current_revision())
+                }
+                None => Filter::FULL,
+            },
+            QueryOriginRef::DerivedUntracked(_) | QueryOriginRef::Assigned(_) => Filter::FULL,
+        }
+    }
+
+    /// Stores this memo's filter at its node and names it the creator of the tracked structs it
+    /// made: before the memo is published, and again whenever a deep verify finds it unchanged.
+    pub(super) fn publish_closure(&self, zalsa: &Zalsa) {
+        let Some(node) = self.node() else {
+            return;
+        };
+        zalsa.graph().publish_closure(
+            node,
+            self.closure(zalsa),
+            self.revisions
+                .tracked_struct_ids()
+                .iter()
+                .map(|(identity, id)| (identity.ingredient_index(), *id)),
+        );
+    }
+
+    /// Whether this memo, verified in `verified_at`, read no input that changed since, by its
+    /// input-closure filter: then it is unchanged with no walk.
+    #[inline]
+    pub(super) fn closure_unchanged(&self, zalsa: &Zalsa, verified_at: Revision) -> bool {
+        self.node().is_some_and(|node| {
+            zalsa.graph().closure_unchanged(
+                node,
+                verified_at,
+                self.revisions.durability(),
+                zalsa.runtime().changes(),
+            )
+        })
+    }
+
+    /// Whether this memo or any of its inputs had accumulated values.
+    #[inline]
+    pub(super) fn has_accumulated(&self) -> bool {
+        #[cfg(not(feature = "accumulator"))]
+        let accumulated = false;
+        #[cfg(feature = "accumulator")]
+        let accumulated = self.revisions.accumulated().is_some()
+            || self.revisions.accumulated_inputs().is_any();
+        accumulated
     }
 
     #[inline]
@@ -296,6 +402,7 @@ impl MemoHeader {
         });
 
         self.verified_at.store(zalsa.current_revision());
+        self.paint(zalsa);
     }
 
     pub(super) fn mark_outputs_as_verified(
@@ -441,6 +548,7 @@ pub(super) mod persistence {
             let Memo { ref header, .. } = *self;
             let MemoHeader {
                 ref verified_at,
+                node: _,
                 ref revisions,
             } = *header;
 

@@ -36,7 +36,8 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     Done, FileName,
-    watch::{Batch, Span, Strings, Visit, Walker, is_under, push_lossy, valid},
+    utf8::push_lossy,
+    watch::{Batch, Span, Strings, Visit, Walker, is_under, valid},
 };
 
 const CLASS_NOTIF: u32 = 0x0;

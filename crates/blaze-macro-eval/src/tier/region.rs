@@ -28,6 +28,8 @@
 
 use std::{ops::Range, ptr::NonNull};
 
+use blaze_mem::vm as os;
+
 use crate::guest::Stop;
 
 const _: () = assert!(usize::BITS == 64, "the compiled tier needs a 64-bit address space");
@@ -149,7 +151,7 @@ impl Region {
     /// Reserves a region for `layout` and maps its header, image and stack, zeroed. The
     /// image is filled by [`Region::install`].
     pub(crate) fn new(layout: Layout) -> Result<Region, Stop> {
-        let base = os::reserve().map_err(|why| {
+        let base = os::reserve_aligned(RESERVED, SPAN as usize).map_err(|why| {
             // alloc: error path
             Stop(format!("could not reserve the compiled tier's 4 GiB of address space: {why}"))
         })?;
@@ -375,9 +377,10 @@ impl Region {
 
 impl Drop for Region {
     fn drop(&mut self) {
-        // SAFETY: `base` is the reservation `os::reserve` made, whole, and the region is
-        // gone: nothing reaches its memory again (code runs in it only under `&mut Region`).
-        unsafe { os::release(self.base) };
+        // SAFETY: `base` is the reservation of `RESERVED` bytes `os::reserve_aligned` made,
+        // whole, and the region is gone: nothing reaches its memory again (code runs in it
+        // only under `&mut Region`).
+        unsafe { os::release(self.base, RESERVED) };
     }
 }
 
@@ -405,209 +408,6 @@ fn outside(did: &str, at: u64, len: usize) -> Stop {
 
 /// The reservation's whole size.
 const RESERVED: usize = SPAN as usize + TAIL_GUARD;
-
-#[cfg(unix)]
-mod os {
-    use std::{io, ptr::NonNull};
-
-    use super::{RESERVED, SPAN};
-
-    /// [`RESERVED`] bytes of address space at an address aligned to [`SPAN`], inaccessible.
-    pub(super) fn reserve() -> io::Result<NonNull<u8>> {
-        let span = SPAN as usize;
-        let padded = RESERVED + span;
-        // SAFETY: a fresh anonymous mapping at an address the kernel picks: it overlaps
-        // nothing the program holds.
-        let raw = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                padded,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if raw == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let addr = raw as usize;
-        let aligned = addr.next_multiple_of(span);
-        let head = aligned - addr;
-        let tail = padded - head - RESERVED;
-        if head != 0 {
-            // SAFETY: `[raw, aligned)` is the front of the mapping just made, which nothing
-            // else knows of.
-            unsafe { libc::munmap(raw, head) };
-        }
-        if tail != 0 {
-            // SAFETY: `[aligned + RESERVED, raw + padded)` is the back of the same mapping.
-            unsafe { libc::munmap((aligned + RESERVED) as *mut libc::c_void, tail) };
-        }
-        NonNull::new(aligned as *mut u8).ok_or_else(|| io::Error::other("mmap gave address 0"))
-    }
-
-    /// Makes `[ptr, ptr + len)` readable and writable, zeroed where it was never mapped.
-    ///
-    /// # Safety
-    ///
-    /// The range is page-aligned and inside a live reservation of [`reserve`].
-    pub(super) unsafe fn commit(ptr: NonNull<u8>, len: usize) -> io::Result<()> {
-        // SAFETY: the caller says the range is inside our live reservation, which nothing else
-        // maps; changing its protection touches no other memory.
-        let rc = unsafe { libc::mprotect(ptr.as_ptr().cast(), len, libc::PROT_READ | libc::PROT_WRITE) };
-        if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-    }
-
-    /// Makes `[ptr, ptr + len)` read-only.
-    ///
-    /// # Safety
-    ///
-    /// As for [`commit`], and the range is mapped.
-    pub(super) unsafe fn protect_readonly(ptr: NonNull<u8>, len: usize) -> io::Result<()> {
-        // SAFETY: as for `commit`.
-        let rc = unsafe { libc::mprotect(ptr.as_ptr().cast(), len, libc::PROT_READ) };
-        if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-    }
-
-    /// Gives `[ptr, ptr + len)` back and makes it inaccessible; mapped again, it reads zeros.
-    ///
-    /// # Safety
-    ///
-    /// As for [`commit`], and nothing reads or writes the range until it is mapped again.
-    pub(super) unsafe fn decommit(ptr: NonNull<u8>, len: usize) -> io::Result<()> {
-        // SAFETY: the caller says the range is inside our live reservation and unused; a fixed
-        // mapping over it replaces only those pages.
-        let got = unsafe {
-            libc::mmap(
-                ptr.as_ptr().cast(),
-                len,
-                libc::PROT_NONE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if got == libc::MAP_FAILED { Err(io::Error::last_os_error()) } else { Ok(()) }
-    }
-
-    /// Releases a whole reservation.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` is what [`reserve`] gave, and nothing uses the range again.
-    pub(super) unsafe fn release(ptr: NonNull<u8>) {
-        // SAFETY: the caller hands over the whole reservation, which nothing uses any more.
-        unsafe { libc::munmap(ptr.as_ptr().cast(), RESERVED) };
-    }
-}
-
-#[cfg(windows)]
-mod os {
-    use std::{io, ptr::NonNull};
-
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY,
-        PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
-    };
-
-    use super::{RESERVED, SPAN};
-
-    /// How often another thread may take the aligned range between our release of the padded
-    /// reservation and our reservation of the range, before it is an error.
-    const TRIES: u32 = 16;
-
-    /// [`RESERVED`] bytes at an address aligned to [`SPAN`]: Windows can't release part of a
-    /// reservation, so a padded one finds the address, is released, and the aligned range is
-    /// reserved at it.
-    pub(super) fn reserve() -> io::Result<NonNull<u8>> {
-        let span = SPAN as usize;
-        for _ in 0..TRIES {
-            // SAFETY: a fresh reservation at an address the kernel picks.
-            let raw = unsafe { VirtualAlloc(std::ptr::null(), RESERVED + span, MEM_RESERVE, PAGE_NOACCESS) };
-            if raw.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            let aligned = (raw as usize).next_multiple_of(span);
-            // SAFETY: `raw` is the reservation just made, released whole and unused.
-            unsafe { VirtualFree(raw, 0, MEM_RELEASE) };
-            // SAFETY: a fresh reservation at an address no mapping of ours holds; the kernel
-            // refuses it if another thread took the range meanwhile.
-            let got = unsafe { VirtualAlloc(aligned as *const _, RESERVED, MEM_RESERVE, PAGE_NOACCESS) };
-            if let Some(got) = NonNull::new(got.cast::<u8>()) {
-                return Ok(got);
-            }
-        }
-        // alloc: error path
-        Err(io::Error::other(format!(
-            "another thread took the aligned address range {TRIES} times running"
-        )))
-    }
-
-    /// # Safety
-    ///
-    /// The range is page-aligned and inside a live reservation of [`reserve`].
-    pub(super) unsafe fn commit(ptr: NonNull<u8>, len: usize) -> io::Result<()> {
-        // SAFETY: the caller says the range is inside our live reservation; committing
-        // committed pages leaves them as they are.
-        let got = unsafe { VirtualAlloc(ptr.as_ptr().cast(), len, MEM_COMMIT, PAGE_READWRITE) };
-        if got.is_null() { Err(io::Error::last_os_error()) } else { Ok(()) }
-    }
-
-    /// # Safety
-    ///
-    /// As for [`commit`], and the range is committed.
-    pub(super) unsafe fn protect_readonly(ptr: NonNull<u8>, len: usize) -> io::Result<()> {
-        let mut old = 0;
-        // SAFETY: as for `commit`; `old` is a live local to write.
-        let ok = unsafe { VirtualProtect(ptr.as_ptr().cast(), len, PAGE_READONLY, &mut old) };
-        if ok != 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-    }
-
-    /// # Safety
-    ///
-    /// As for [`commit`], and nothing reads or writes the range until it is committed again.
-    pub(super) unsafe fn decommit(ptr: NonNull<u8>, len: usize) -> io::Result<()> {
-        // SAFETY: the caller says the range is inside our live reservation and unused.
-        let ok = unsafe { VirtualFree(ptr.as_ptr().cast(), len, MEM_DECOMMIT) };
-        if ok != 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-    }
-
-    /// # Safety
-    ///
-    /// `ptr` is what [`reserve`] gave, and nothing uses the range again.
-    pub(super) unsafe fn release(ptr: NonNull<u8>) {
-        // SAFETY: the caller hands over the whole reservation, which nothing uses any more.
-        unsafe { VirtualFree(ptr.as_ptr().cast(), 0, MEM_RELEASE) };
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-mod os {
-    use std::{io, ptr::NonNull};
-
-    fn none() -> io::Error {
-        io::Error::new(io::ErrorKind::Unsupported, "this target has no virtual memory to reserve 4 GiB of")
-    }
-
-    pub(super) fn reserve() -> io::Result<NonNull<u8>> {
-        Err(none())
-    }
-
-    pub(super) unsafe fn commit(_: NonNull<u8>, _: usize) -> io::Result<()> {
-        Err(none())
-    }
-
-    pub(super) unsafe fn protect_readonly(_: NonNull<u8>, _: usize) -> io::Result<()> {
-        Err(none())
-    }
-
-    pub(super) unsafe fn decommit(_: NonNull<u8>, _: usize) -> io::Result<()> {
-        Err(none())
-    }
-
-    pub(super) unsafe fn release(_: NonNull<u8>) {}
-}
 
 #[cfg(test)]
 mod tests;

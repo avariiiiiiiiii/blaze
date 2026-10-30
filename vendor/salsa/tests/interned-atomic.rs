@@ -2,6 +2,8 @@
 
 //! Readers must not see a reusable slot as valid until its old memos have been cleared.
 
+#![forbid(unsafe_code)]
+
 use std::hash::{Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};

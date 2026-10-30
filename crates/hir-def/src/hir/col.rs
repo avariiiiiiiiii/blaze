@@ -7,7 +7,8 @@
 //! its own box costs an allocation per non-empty column (8 to 20 a body, more than the copy for
 //! a body of a few dozen nodes); a slab makes the `Copy` columns (kinds, data words, `extra`, id
 //! lists, statement rows) one allocation together. A read is the same as a box's: a pointer and
-//! a length, loaded from the column.
+//! a length, loaded from the column. A borrowed column saves the copy of its elements out of a
+//! dependency image that a box would need, once per column per crate read.
 
 use std::{
     fmt,
@@ -50,7 +51,10 @@ enum Owner {
 ///   drop), and [`SlabWriter::take`] wrote them before it made this column and writes no byte
 ///   of them after;
 /// - or `owner` holds a count of the image they are in, `T` is `Copy`, and they lie inside its
-///   `bytes()`, which neither move nor change while a count lives ([`Held`]).
+///   `bytes()`, which neither move nor change while a count lives ([`Held`]). `Held` is a safe
+///   trait and needs no more: a borrow of what `bytes()` returns may last as long as any
+///   `&self`, so no sound impl frees or writes those bytes while the image is shared, and the
+///   count keeps it alive and shared.
 pub(crate) struct Col<T> {
     ptr: NonNull<T>,
     len: usize,
@@ -275,18 +279,17 @@ impl SlabWriter {
         let bytes = size_of_val(elements);
         assert!(at.checked_add(bytes).is_some_and(|end| end <= self.room), "a column past its slab");
         let slab = self.slab.as_ref().expect("a slab with room has an allocation");
-        // SAFETY: `at..at + bytes` is inside the slab's `room` bytes (asserted), which `base`
-        // points to the start of and was taken from while the slab was unique (`new`). No `Col`
-        // reads these bytes: every column made so far is below `self.at <= at`, and this one is
-        // made only below. `base` is `SLAB_ALIGN`-aligned and `at` a multiple of `align_of::<T>()`,
-        // which divides `SLAB_ALIGN` (the assert above), so `dst` is aligned for `T`. `elements`
-        // is not in the slab (nothing hands out a slab's bytes until its column is made, and then
-        // only to read), so the two don't overlap.
-        let dst = unsafe {
-            let dst = self.base.add(at).cast::<T>();
-            ptr::copy_nonoverlapping(elements.as_ptr(), dst, elements.len());
-            dst
-        };
+        // SAFETY: `at + bytes <= room` (asserted), and `base` is the start of the slab's `room`
+        // bytes (`new`), so `base + at` stays inside that allocation. Out of it, the offset is UB.
+        let dst = unsafe { self.base.add(at) }.cast::<T>();
+        // SAFETY: `dst..dst + bytes` is inside the slab (above), whose `base` was taken while the
+        // slab was unique (`new`). No `Col` reads these bytes: every column made so far is below
+        // `self.at <= at`, and this one is made only below. `base` is `SLAB_ALIGN`-aligned and
+        // `at` a multiple of `align_of::<T>()`, which divides `SLAB_ALIGN` (the const assert), so
+        // `dst` is aligned for `T`. `elements` is not in the slab (nothing hands out a slab's
+        // bytes until its column is made, and then only to read), so the two don't overlap. A
+        // column read while written, or overlapping its source, would read torn elements.
+        unsafe { ptr::copy_nonoverlapping(elements.as_ptr(), dst, elements.len()) };
         self.at = at + bytes;
         Col {
             ptr: NonNull::new(dst).expect("inside an allocation"),
@@ -389,8 +392,9 @@ mod tests {
         let words: Vec<u8> = (0..64u32).flat_map(|it| (it << 3).to_ne_bytes()).collect();
         let image: ImageBuf = Arc::new(blaze_format::Aligned::copy_from(&words));
         let (start, len) = (image.bytes().as_ptr(), image.bytes().len());
-        // SAFETY: the image's bytes start at a multiple of `blaze_format::ALIGN` ([`Held`]),
-        // which `u32` divides, and hold `len / 4` whole `u32`s, every bit pattern of which is one.
+        assert_eq!(start as usize % align_of::<u32>(), 0, "an image's bytes are aligned");
+        // SAFETY: `start` is aligned for `u32` (asserted), the image's bytes hold `len / 4` whole
+        // `u32`s, every bit pattern of which is one, and `image` outlives `all`.
         let all: &[u32] = unsafe { slice::from_raw_parts(start.cast::<u32>(), len / 4) };
         let col = Col::borrowed(&image, &all[3..9]).expect("inside the image");
         assert!(col.in_image() && !col.in_slab());

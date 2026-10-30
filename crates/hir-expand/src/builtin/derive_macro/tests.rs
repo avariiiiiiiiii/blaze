@@ -281,7 +281,7 @@ fn reference_from(
         _ => return refused(),
     };
     let Some(ty) = ty else { return refused() };
-    let field_ty = syntax_bridge::syntax_node_to_token_tree(
+    let field_ty = syntax_bridge::reference::syntax_node_to_token_tree(
         ty.syntax(),
         map,
         span,
@@ -414,7 +414,7 @@ fn joined_names() {
     assert_eq!(super::tuple_field_symbol(12345), intern::Symbol::intern("f12345"));
     assert_eq!(super::tuple_field_symbol(usize::MAX), intern::Symbol::intern(&format!("f{}", usize::MAX)));
     let long = "x".repeat(100);
-    assert_eq!(super::joined(&long, "_self"), intern::Symbol::intern(&format!("{long}_self")));
+    assert_eq!(intern::Symbol::intern_concat(&[&long, "_self"]), intern::Symbol::intern(&format!("{long}_self")));
 }
 
 #[test]
@@ -482,7 +482,7 @@ fn a_derive_allocates_nothing_per_field() {
 
 /// The derive's input as `macro_arg` gives it: the item's tokens, each with its own span.
 fn item_input(adt: &ast::Adt, map: &span::SpanMap) -> tt::TopSubtree {
-    syntax_bridge::syntax_node_to_token_tree(
+    syntax_bridge::reference::syntax_node_to_token_tree(
         adt.syntax(),
         map,
         call_site(),
@@ -858,6 +858,10 @@ fn coerce_pointee_substitutes_as_rustc() {
         ),
         ("#[repr(transparent)] struct Ptr<T: ?Sized>(Box<T>) where ::T: Tr<T>;", &[("::T:Tr<__S>,", 2)]),
         ("#[repr(transparent)] struct Ptr<r#T: ?Sized>(Box<T>) where T: Tr<r#T>;", &[("__S:Tr<__S>,", 2)]),
+        (
+            "#[repr(transparent)] struct Ptr<#[pointee] T: ?Sized, U: Tr<unsafe<'x> &'x T>>(Box<T>, U);",
+            &[("U:Tr<unsafe<'x>&'x__S>,", 2)],
+        ),
         ("#[repr(transparent)] struct Ptr<#[pointee(x)] T: ?Sized, U>(Box<T>, U);", &[]),
     ];
     for (text, expected) in cases {

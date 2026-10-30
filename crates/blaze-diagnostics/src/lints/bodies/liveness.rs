@@ -33,7 +33,10 @@ mod source;
 use hir_ty::db::HirDatabase;
 use blaze_ids::radix;
 use hir::InFile;
-use hir_def::hir::{BindingId, Expr, ExprId, Pat, PatId};
+use hir_def::{
+    attrs::AttrFlags,
+    hir::{BindingId, Expr, ExprId, Pat, PatId},
+};
 use hir_ty::{
     InferBodyId,
     closure_analysis::CapturedPlace,
@@ -67,17 +70,13 @@ use crate::{
 /// The lints this module gives: it runs only when one may fire.
 pub(super) const LINTS: super::LintSet = super::lint_set(["unused_variables", "unused_assignments"]);
 
-pub(super) fn lints<'db>(b: &BodyCx<'_, 'db>, pool: &mut Pool<'db>) -> Vec<Found> {
-    if b.mir_tainted() || source::skipped(b) {
+pub(super) fn lints<'db>(b: &BodyCx<'_, '_, 'db>, pool: &mut Pool<'db>) -> Vec<Found> {
+    if b.mir_tainted() || source::skipped(b) || is_naked(b) {
         // alloc: empty, allocates nothing
         return Vec::new();
     }
     // alloc: empty, allocates nothing
     let Some(mir) = b.mir() else { return Vec::new() };
-    if is_naked(mir) {
-        // alloc: empty, allocates nothing
-        return Vec::new();
-    }
     let mut liveness = Liveness::new(b, std::mem::take(pool));
     liveness.body(mir, None);
     if b.store().has_closures() {
@@ -104,11 +103,11 @@ struct Buffers<'db> {
     lists: Vec<SmallVec<[Assignment<'db>; 2]>>,
 }
 
-/// rustc's check that skips a `#[naked]` function, whose body is its `naked_asm!` alone.
-fn is_naked(mir: &MirBody<'_>) -> bool {
-    mir.basic_blocks.iter().any(|(_, data)| {
-        data.statements.iter().any(|it| matches!(&it.kind, StatementKind::InlineAsm(asm) if asm.naked))
-    })
+/// rustc's check that skips a `#[naked]` function, whose body is its `naked_asm!` alone: the
+/// attribute's bit (`#[naked]`, `#[unsafe(naked)]`, through `cfg_attr` too).
+fn is_naked(b: &BodyCx<'_, '_, '_>) -> bool {
+    matches!(b.owner, hir_def::DefWithBodyId::FunctionId(it)
+        if AttrFlags::query(b.db(), it.into()).contains(AttrFlags::NAKED))
 }
 
 /// A closure, `async` block or coroutine with MIR of its own.
@@ -162,7 +161,7 @@ enum Named<'db> {
 /// The analysis of a body and its closures, with the lints found in the order rustc emits
 /// them.
 struct Liveness<'b, 'a, 'db> {
-    b: &'b BodyCx<'a, 'db>,
+    b: &'b BodyCx<'b, 'a, 'db>,
     source: Source,
     infcx: InferCtxt<'db>,
     env: ParamEnv<'db>,
@@ -194,7 +193,7 @@ impl<'db> Liveness<'_, '_, 'db> {
 }
 
 impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
-    fn new(b: &'b BodyCx<'a, 'db>, pool: Pool<'db>) -> Self {
+    fn new(b: &'b BodyCx<'b, 'a, 'db>, pool: Pool<'db>) -> Self {
         let db = b.db();
         Liveness {
             b,
@@ -377,7 +376,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                         | TyKind::Dynamic(..)
                         | TyKind::Array(..)
                         | TyKind::Slice(..)
-                        | TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { .. }, .. })
+                        | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. })
                 ) && self.needs_drop(ty)
             }
         };
@@ -836,12 +835,12 @@ struct Report {
 }
 
 impl Report {
-    fn strings(&mut self, b: &BodyCx<'_, '_>) -> &[(Span, String)] {
+    fn strings(&mut self, b: &BodyCx<'_, '_, '_>) -> &[(Span, String)] {
         let root = self.root;
         self.strings.get_or_insert_with(|| source::string_literals(b, root))
     }
 
-    fn used(&mut self, b: &BodyCx<'_, '_>) -> &FxHashSet<BindingId> {
+    fn used(&mut self, b: &BodyCx<'_, '_, '_>) -> &FxHashSet<BindingId> {
         let root = self.root;
         self.used.get_or_insert_with(|| source::used_in_source(b, root))
     }

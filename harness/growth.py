@@ -14,7 +14,7 @@ Then the same of a `load` that fills a struct of FIELDS fields (default 200), ea
 while a value with a destructor is live, as x11-dl's `x11_link!` opens Xlib's 781 functions: every
 `?` leaves through what the fields before it hold. Leaving was a drop chain per `?` over every
 field before it, 3 blocks a field squared, and bevy's build with Xlib's took 364 GB. Every program
-is also run against cargo's.
+also has to print what its source says (`printed`, `fields_printed`).
 
 Both sizes are allocated by the single-pass register allocator. By default a function of more
 than SINGLE_PASS instructions (hir-ty-codegen) gets it and a smaller one the backtracking one,
@@ -28,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.environ["BLAZE_CACHE"] = "off"
 os.environ["BLAZE_REGALLOC"] = "single_pass"
-from difftest import Fixture
+from mixed import Fixture
 
 CARGO_TOML = """[package]
 name = "growth"
@@ -120,6 +120,11 @@ def program(arms):
             '    println!("{out}");\n}\n')
 
 
+def printed(arms):
+    """What `program(arms)` prints."""
+    return f"{{type:a/v0,}}{{type:a/v1,id:x,n:3,}}{{type:a/v{arms - 1},id:y,n:4,}}\n"
+
+
 FIELDS_HEAD = """pub struct OpenError(pub String);
 
 pub struct Lib(Vec<u8>);
@@ -159,6 +164,11 @@ def fields_program(fields):
             "        }\n    }\n}\n")
 
 
+def fields_printed(fields):
+    """What `fields_program(fields)` prints: the library is closed as each `load` leaves."""
+    return "closed 3\nerror not asked\nclosed 3\nerror missing\n"
+
+
 def code_size(shapes, function):
     """The bytes of the last `function` the shapes log has code for."""
     names, sizes = {}, {}
@@ -174,7 +184,7 @@ def code_size(shapes, function):
     return max(found)
 
 
-def build(source, function, what):
+def build(source, expected, function, what):
     ws = tempfile.mkdtemp(prefix="blaze-growth-")
     os.makedirs(os.path.join(ws, "src"))
     open(os.path.join(ws, "Cargo.toml"), "w").write(CARGO_TOML)
@@ -189,17 +199,17 @@ def build(source, function, what):
         fx.blaze_build()
     finally:
         del os.environ["BLAZE_SHAPES"]
-    expected, got = fx.behaviour(fx.reference), fx.behaviour(fx.binary)
-    if expected != got:
-        raise SystemExit(f"{what}: blaze's program differs from cargo's:\n  rustc: {expected}\n  blaze: {got}")
+    got = fx.behaviour(fx.binary)
+    if got != (0, expected.encode(), b""):
+        raise SystemExit(f"{what}: blaze's program differs from what its source says:\n  source: {expected!r}\n  blaze:  {got}")
     size = code_size(shapes, function)
     shutil.rmtree(ws, ignore_errors=True)
     return size
 
 
-def grows(function, unit, n, program, limit):
-    small = build(program(n), function, f"{n} {unit}s")
-    large = build(program(2 * n), function, f"{2 * n} {unit}s")
+def grows(function, unit, n, program, printed, limit):
+    small = build(program(n), printed(n), function, f"{n} {unit}s")
+    large = build(program(2 * n), printed(2 * n), function, f"{2 * n} {unit}s")
     ratio = large / small
     print(f"{function}: {small:,} bytes for {n} {unit}s, {large:,} for {2 * n}: x{ratio:.2f} "
           f"({small // n:,} and {large // (2 * n):,} bytes a {unit})")
@@ -211,8 +221,8 @@ def main():
     arms = int(sys.argv[1]) if sys.argv[1:] else 160
     fields = int(sys.argv[2]) if sys.argv[2:] else 200
     limit = float(os.environ.get("GROWTH_RATIO", "2.6"))
-    grows("serialize", "arm", arms, program, limit)
-    grows("load", "field", fields, fields_program, limit)
+    grows("serialize", "arm", arms, program, printed, limit)
+    grows("load", "field", fields, fields_program, fields_printed, limit)
     print("ok")
 
 

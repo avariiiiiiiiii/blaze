@@ -15,7 +15,9 @@
 //! grace has passed: no box per retirement and no list that grows in the warm loop.
 //!
 //! Cost: an allocation or free through a cache is an array push or pop and a write of the
-//! value; one compare-and-swap per 64 of them on the shared stacks.
+//! value; one compare-and-swap per 64 of them on the full stack. The batch's descriptor stays
+//! with the cache that emptied it and fills its next spill; descriptors move between caches
+//! four at a time, so the empty stack costs a quarter of a compare-and-swap per batch.
 
 use std::{
     fmt,
@@ -40,6 +42,15 @@ pub const BATCH: usize = 64;
 
 const CACHE: usize = 2 * BATCH;
 
+/// Empty batch descriptors a cache keeps, so moving a batch costs the one compare-and-swap of
+/// the full stack: a refill keeps the descriptor it emptied, a spill fills one it keeps.
+const STASH: usize = 8;
+
+/// Descriptors moved between a cache's stash and the pool's empty stack at once (one
+/// compare-and-swap): half the stash, so a cache that only refills or only spills touches the
+/// empty stack once per `MOVE` batches.
+const MOVE: usize = STASH / 2;
+
 /// A batch of free slot indices, one compare-and-swap to move.
 #[repr(C)]
 struct Batch {
@@ -47,8 +58,9 @@ struct Batch {
 }
 
 /// Descriptors beyond the most full batches the slots can make, for those in flight between a
-/// cache and a stack.
-const SPARE_BATCHES: u32 = 4096;
+/// cache and a stack and those caches keep empty ([`STASH`] each): room for 2,048 caches of a
+/// pool, 4 MB of address space, committed only as descriptors are made.
+const SPARE_BATCHES: u32 = 16_384;
 
 /// A slab of `T`s with free lists, shared by every worker; allocate through [`Pool::cache`].
 pub struct Pool<T> {
@@ -131,7 +143,13 @@ impl<T> Pool<T> {
 
     /// A worker's cache into this pool.
     pub fn cache(&self) -> Cache<'_, T> {
-        Cache { pool: self, items: [0; CACHE], len: 0 }
+        Cache { pool: self, items: [0; CACHE], len: 0, stash: [0; STASH], stashed: 0 }
+    }
+
+    /// Batch descriptors made so far.
+    #[cfg(test)]
+    pub(crate) fn descriptors_made(&self) -> u32 {
+        self.batches_carved.load(Ordering::Relaxed).min(self.max_batches)
     }
 
     fn slot(&self, index: u32) -> NonNull<T> {
@@ -164,11 +182,8 @@ impl<T> Pool<T> {
         Ok((start, end - start))
     }
 
-    /// A batch descriptor of the caller's own: an empty one, or a new one.
-    fn descriptor(&self) -> Result<u32, MemError> {
-        if let Some(index) = self.empty.pop(&self.batch_links) {
-            return Ok(index);
-        }
+    /// A new batch descriptor of the caller's own, when the empty stack has none.
+    fn new_descriptor(&self) -> Result<u32, MemError> {
         let index = self.batches_carved.fetch_add(1, Ordering::Relaxed);
         if index >= self.max_batches {
             self.batches_carved.fetch_min(self.max_batches, Ordering::Relaxed);
@@ -213,6 +228,9 @@ pub struct Cache<'p, T> {
     pool: &'p Pool<T>,
     items: [u32; CACHE],
     len: usize,
+    /// Empty batch descriptors this cache holds: `stash[..stashed]`.
+    stash: [u32; STASH],
+    stashed: usize,
 }
 
 impl<'p, T> Cache<'p, T> {
@@ -286,7 +304,7 @@ impl<'p, T> Cache<'p, T> {
             let items = unsafe { pool.batch(batch).as_ref() }.items;
             self.items[..BATCH].copy_from_slice(&items);
             self.len = BATCH;
-            pool.empty.push(batch, &pool.batch_links);
+            self.stash_descriptor(batch);
             return Ok(());
         }
         while self.len < BATCH {
@@ -309,10 +327,36 @@ impl<'p, T> Cache<'p, T> {
         Ok(())
     }
 
+    /// Keeps the empty descriptor `batch`; a full stash first gives [`MOVE`] of its own back
+    /// to the pool's empty stack, with one compare-and-swap.
+    fn stash_descriptor(&mut self, batch: u32) {
+        if self.stashed == STASH {
+            let pool = self.pool;
+            pool.empty.push_all(&self.stash[STASH - MOVE..], &pool.batch_links);
+            self.stashed = STASH - MOVE;
+        }
+        self.stash[self.stashed] = batch;
+        self.stashed += 1;
+    }
+
+    /// An empty descriptor of this cache's own: from its stash, refilled with up to [`MOVE`]
+    /// from the pool's empty stack in one compare-and-swap, else a new one.
+    fn take_descriptor(&mut self) -> Result<u32, MemError> {
+        if self.stashed == 0 {
+            let pool = self.pool;
+            self.stashed = pool.empty.pop_some(&pool.batch_links, &mut self.stash[..MOVE]);
+            if self.stashed == 0 {
+                return pool.new_descriptor();
+            }
+        }
+        self.stashed -= 1;
+        Ok(self.stash[self.stashed])
+    }
+
     #[cold]
     fn spill(&mut self) {
         let pool = self.pool;
-        match pool.descriptor() {
+        match self.take_descriptor() {
             Ok(batch) => {
                 let mut items = [0; BATCH];
                 items.copy_from_slice(&self.items[self.len - BATCH..self.len]);
@@ -341,6 +385,8 @@ impl<T> Drop for Cache<'_, T> {
             self.pool.give_one(index);
         }
         self.len = 0;
+        self.pool.empty.push_all(&self.stash[..self.stashed], &self.pool.batch_links);
+        self.stashed = 0;
     }
 }
 
@@ -484,12 +530,12 @@ impl<'p, E: Clone, const N: usize> Cache<'p, Counted<[E; N]>> {
         let mut written = Written { pool: self.pool, index, items, len: 0 };
         for item in head {
             // SAFETY: `written.len < head.len() <= N`: in the array, and nothing is there yet.
-            unsafe { items.add(written.len).write(item.clone()) };
+            unsafe { items.add(written.len).write(item.clone()) }; // clone: the copy into the slot is this call's work
             written.len += 1;
         }
         while written.len < N {
             // SAFETY: as above, `written.len < N`.
-            unsafe { items.add(written.len).write(fill.clone()) };
+            unsafe { items.add(written.len).write(fill.clone()) }; // clone: the copy into the slot is this call's work
             written.len += 1;
         }
         mem::forget(written);

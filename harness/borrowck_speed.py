@@ -4,8 +4,8 @@
 usage: borrowck_speed.py [NAME...] [--bin blaze-engine] [--apps-dir dir] [--modes polonius,nll]
                          [--jobs N] [--json out.json] [--md out.md] [--top 20]
 
-Runs `blaze-engine borrowck --project WS --timings OUT` on each app (those of apps/apps.json, the
-harness's corpus, and EXTRA below), which checks every body in both modes, and reports for each:
+Runs `blaze-engine borrowck --project WS --timings OUT` on each app (those of apps/apps.json and
+EXTRA below), which checks every body in both modes, and reports for each:
 the bodies, type inference's total, the checker's total with and without MIR lowering, the
 checker's time per body (p50, p99, max), where it goes by phase, and the slowest bodies with
 the sizes they had. Each run is one thread. Each body is inferred and checked once cold, paying
@@ -30,7 +30,7 @@ EXTRA = {
     "axum": {"repo": "https://github.com/tokio-rs/axum", "rev": "86aa6153e47b7862737acdcfe3a0eb3a162b939a"},
     "biome": {"repo": "https://github.com/biomejs/biome", "rev": "e2e5a36e1be8581419742a85268ad82f020da62e"},
 }
-DEFAULT = ["ripgrep", "fd", "bat", "hyperfine", "just", "axum", "nushell", "helix", "biome", "corpus"]
+DEFAULT = ["ripgrep", "fd", "bat", "hyperfine", "just", "axum", "nushell", "helix", "biome"]
 
 
 def pct(sorted_values, q):
@@ -76,10 +76,7 @@ async def measure(name, spec, modes, args, gate):
     async with gate:
         began = time.monotonic()
         try:
-            if name in borrowck_apps.LOCAL:
-                ws = borrowck_apps.LOCAL[name]
-            else:
-                ws = await borrowck_apps.checkout(name, spec, args.apps_dir)
+            ws = await borrowck_apps.checkout(name, spec, args.apps_dir)
             out = os.path.join(args.work, f"{name}.jsonl")
             env = dict(os.environ, RUST_BACKTRACE="0")
             argv = [args.bin, "borrowck", "--project", ws, "--timings", out]
@@ -109,8 +106,7 @@ async def rustc_profile_mode(name, spec, mode, args, gate):
     async with gate:
         began = time.monotonic()
         try:
-            ws = borrowck_apps.LOCAL[name] if name in borrowck_apps.LOCAL else await borrowck_apps.checkout(
-                name, spec, args.apps_dir)
+            ws = await borrowck_apps.checkout(name, spec, args.apps_dir)
             prof = os.path.join(args.work, f"rustc-{name}.{mode}")
             shutil.rmtree(prof, ignore_errors=True)
             os.makedirs(prof)
@@ -229,13 +225,11 @@ async def main():
     os.makedirs(args.work, exist_ok=True)
     specs = json.load(open(borrowck_apps.SPECS))
     specs.update(EXTRA)
-    specs.update({name: {} for name in borrowck_apps.LOCAL})
     names = args.names or DEFAULT
     modes = args.modes.split(",")
     # Check each app out once before the runs that share it.
     for name in names:
-        if name not in borrowck_apps.LOCAL:
-            await borrowck_apps.checkout(name, specs[name], args.apps_dir)
+        await borrowck_apps.checkout(name, specs[name], args.apps_dir)
     gate = asyncio.Semaphore(args.jobs)
     async with asyncio.TaskGroup() as group:
         run = rustc_profile if args.rustc else measure

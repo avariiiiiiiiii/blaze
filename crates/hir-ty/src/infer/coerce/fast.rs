@@ -26,7 +26,7 @@
 use rustc_hash::FxHasher;
 use rustc_type_ir::{
     Interner as _, TypeVisitableExt, fold_regions,
-    inherent::{IntoKind, Ty as _},
+    inherent::{Clause as _, IntoKind, Ty as _},
 };
 use std::hash::{Hash, Hasher};
 use tracing::debug;

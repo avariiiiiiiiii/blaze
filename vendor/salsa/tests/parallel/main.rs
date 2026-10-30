@@ -1,4 +1,5 @@
 #![cfg(feature = "inventory")]
+#![forbid(unsafe_code)]
 
 mod setup;
 mod signal;
@@ -7,6 +8,7 @@ mod cancellation_in_fixpoint;
 mod cancellation_token_cycle_nested;
 mod cancellation_token_multi_blocked;
 mod cancellation_token_recomputes;
+mod claim_race;
 mod cycle_a_t1_b_t2;
 mod cycle_a_t1_b_t2_fallback;
 mod cycle_ab_peeping_c;

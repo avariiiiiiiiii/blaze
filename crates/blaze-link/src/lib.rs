@@ -123,7 +123,7 @@ impl Staged {
 }
 
 /// Why a link failed: names the function and the relocation.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct LinkError {
     pub function: Option<InstanceKey>,
     pub what: String,
@@ -589,6 +589,11 @@ impl Image {
         self.state.tables()
     }
 
+    /// How many jump-table slots the image has given out: every [`Image::slot`] index is below it.
+    pub fn slots(&self) -> u32 {
+        self.state.slots
+    }
+
     pub fn slot(&self, function: &InstanceKey) -> Option<Slot> {
         let sym = self.symbols.find_slot(function)?;
         let (piece, offset) = self.state.home(sym)?;
@@ -711,12 +716,12 @@ fn lineage(stage: &Stage<'_>, to: &FileName) -> [u8; 16] {
         keys.push((start as u32, (bytes.len() - start) as u32));
     }
     let key = |it: &(u32, u32)| &bytes[it.0 as usize..(it.0 + it.1) as usize];
-    keys.sort_unstable_by(|a, b| key(a).cmp(key(b)));
+    let order = lineage_order(&keys, key);
     let mut hasher = Hasher::new("blaze v2 link lineage 2");
     // alloc: once per image, at its first full link
     hasher.part(to.as_str().as_bytes()).part(format!("{:?}", stage.output).as_bytes());
-    for it in &keys {
-        hasher.part(key(it));
+    for (_, at) in &order {
+        hasher.part(key(&keys[*at as usize]));
     }
     for input in stage.new.inputs.iter() {
         hasher.id(&input.id);
@@ -725,4 +730,29 @@ fn lineage(stage: &Stage<'_>, to: &FileName) -> [u8; 16] {
     let mut out = [0; 16];
     out.copy_from_slice(&id.0[..16]);
     out
+}
+
+/// `items` in the order of their byte strings `key(item)`, as `(prefix, index)`: a radix sort
+/// by each key's first 8 bytes, big-endian and zero-padded, then a comparison of whole keys
+/// only within a run of one prefix. A smaller prefix is a smaller key, so this is the order
+/// a comparison sort of the keys gives, at a radix pass's cost when the prefixes differ.
+fn lineage_order<'k, T>(items: &'k [T], key: impl Fn(&'k T) -> &'k [u8]) -> Vec<(u64, u32)> {
+    let prefix = |bytes: &[u8]| {
+        let mut word = [0u8; 8];
+        let len = bytes.len().min(8);
+        word[..len].copy_from_slice(&bytes[..len]);
+        u64::from_be_bytes(word)
+    };
+    // alloc: once per image, at its first full link
+    let mut order: Vec<(u64, u32)> = items.iter().enumerate().map(|(at, it)| (prefix(key(it)), at as u32)).collect();
+    blaze_ids::radix::sort_pairs(&mut order);
+    let mut from = 0;
+    while from < order.len() {
+        let to = from + order[from..].iter().take_while(|it| it.0 == order[from].0).count();
+        if to - from > 1 {
+            order[from..to].sort_unstable_by(|a, b| key(&items[a.1 as usize]).cmp(key(&items[b.1 as usize])));
+        }
+        from = to;
+    }
+    order
 }

@@ -24,7 +24,7 @@ use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId,
     GenericDefId, HasModule, ItemContainerId, Lookup, TraitId, VariantId,
     attrs::AttrFlags,
-    expr_store::{Body, ExpressionStore, path::Path},
+    expr_store::{Body, ExpressionStore, ExpressionStoreSourceMap, path::Path},
     hir::{
         Array, AsmOperand, BinaryOp, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked,
         InlineAsmKind, Pat, PatId, RecordSpread, Statement, UnaryOp, Unsafe,
@@ -32,7 +32,7 @@ use hir_def::{
     lang_item::lang_items,
     resolver::ValueNs,
     signatures::{FunctionSignature, StaticFlags, StaticSignature, VariantFields},
-    type_ref::{self, Rawness},
+    type_ref::Rawness,
 };
 use hir_ty::{
     Adjust, AutoBorrow, BindingMode, ByRef, ExplicitDropMethodUseKind, InferenceDiagnostic,
@@ -48,6 +48,7 @@ use hir_ty::{
     },
     target_feature_is_safe_in_target,
 };
+use hir_lint_levels::{Level, LintId};
 use rustc_type_ir::inherent::IntoKind;
 use span::Edition;
 
@@ -104,9 +105,10 @@ pub struct UnsafeOp {
     pub reason: UnsafetyReason,
     pub lint: UnsafeLint,
     /// rustc's `suggest_unsafe_block`: the first [`UnsafeLint::UnsafeOpInUnsafeFn`] of its
-    /// function, or of a closure or inline const where the function had none before it, when
-    /// `unsafe_op_in_unsafe_fn` is not allowed at any of them. rustc notes there that an
-    /// unsafe function restricts its caller.
+    /// function, or of a closure or inline const where the function had none before it, that
+    /// `unsafe_op_in_unsafe_fn` is not allowed at. One where it is allowed is not linted and
+    /// leaves the next one first. rustc notes there that an unsafe function restricts its
+    /// caller.
     pub first: bool,
     /// In the body of an `unsafe fn`, outside a block.
     pub in_unsafe_fn: bool,
@@ -274,6 +276,13 @@ struct Walker<'a, 'db, 'i, S> {
     edition: Edition,
     context: Context,
     suggest_unsafe_block: bool,
+    /// rustc's `hir_context`, where `unsafe_op_in_unsafe_fn`'s level is taken: the innermost
+    /// expression being walked that has syntax, `None` for the item. Kept only while
+    /// [`Walker::requires_unsafe`] can read it, in an `unsafe fn` with `suggest_unsafe_block`
+    /// set: inside an expression entered without both, neither comes back.
+    hir_context: Option<ExprId>,
+    /// The store's, once `hir_context` is first kept.
+    source_map: Option<&'db ExpressionStoreSourceMap>,
     /// rustc's `assignment_info`: the place being walked is the left side of a `=`.
     assigning: bool,
     in_union_destructure: bool,
@@ -316,6 +325,8 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             edition: krate.data(db).edition,
             context,
             suggest_unsafe_block: true,
+            hir_context: None,
+            source_map: None,
             assigning: false,
             in_union_destructure: false,
             inside_adt: false,
@@ -328,9 +339,14 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
     }
 
     /// rustc's `requires_unsafe` of an operation that is not a deprecated-safe call.
+    /// Where `unsafe_op_in_unsafe_fn` is allowed, rustc emits nothing and leaves the flag set.
     fn requires_unsafe(&mut self, node: impl Into<ExprOrPatIdPacked>, reason: UnsafetyReason) {
         let first = self.context == Context::UnsafeFn
-            && mem::replace(&mut self.suggest_unsafe_block, false);
+            && self.suggest_unsafe_block
+            && !self.unsafe_op_in_unsafe_fn_allowed();
+        if first {
+            self.suggest_unsafe_block = false;
+        }
         let event =
             Event { node: node.into(), reason, deprecated: false, context: self.context, first };
         self.sink.push(event);
@@ -345,6 +361,16 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             first: false,
         };
         self.sink.push(event);
+    }
+
+    /// rustc's `unsafe_op_in_unsafe_fn_allowed`: the lint's level at `hir_context` is `allow`
+    /// (`expect` is not).
+    fn unsafe_op_in_unsafe_fn_allowed(&self) -> bool {
+        const UNSAFE_OP_IN_UNSAFE_FN: LintId = LintId::named("unsafe_op_in_unsafe_fn");
+        let level =
+            hir_lint_levels::lint_level_at(self.db, self.owner, self.hir_context, UNSAFE_OP_IN_UNSAFE_FN)
+                .expect("`hir_context` is only ever an expression with syntax");
+        level == Level::Allow
     }
 
     fn in_context(&mut self, context: Context, f: impl FnOnce(&mut Self)) {
@@ -374,7 +400,25 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
         }
     }
 
+    /// rustc's `ExprKind::Scope`: an expression with syntax is the `hir_context` of what is in
+    /// it. A desugared one has none, and leaves the context of what it is in.
     fn walk_expr(&mut self, current: ExprId) {
+        if self.context != Context::UnsafeFn || !self.suggest_unsafe_block {
+            return self.walk_expr_in(current);
+        }
+        let (db, owner) = (self.db, self.owner);
+        let source_map = *self
+            .source_map
+            .get_or_insert_with(|| ExpressionStore::with_source_map(db, owner).1);
+        let outer = self.hir_context;
+        if source_map.expr_syntax(current).is_ok() {
+            self.hir_context = Some(current);
+        }
+        self.walk_expr_in(current);
+        self.hir_context = outer;
+    }
+
+    fn walk_expr_in(&mut self, current: ExprId) {
         // THIR wraps an adjusted expression in its adjustments, each of which is not a place
         // the assignment passes through.
         let assigning = mem::replace(&mut self.assigning, false)
@@ -464,10 +508,7 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             },
             Expr::Ref { expr, rawness: Rawness::Ref, mutability } => {
                 if self.is_layout_constrained_operand(expr) {
-                    let mutability = match mutability {
-                        type_ref::Mutability::Shared => Mutability::Not,
-                        type_ref::Mutability::Mut => Mutability::Mut,
-                    };
+                    let mutability = hir_ty::lower_mutability(mutability);
                     self.borrow_of_layout_constrained(current, mutability, self.adjusted_ty(expr));
                 }
                 self.walk_expr(expr);

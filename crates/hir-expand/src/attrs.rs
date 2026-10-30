@@ -600,19 +600,7 @@ impl AttrId {
         panic!("used an incorrect `AttrId`; crate={krate:?}, attr_id={self:?}");
     }
 
-    /// Returns the containing `ast::Attr` (note that it may contain other attributes as well due
-    /// to `cfg_attr`) and its [`ast::Meta`].
-    #[inline]
-    pub(crate) fn find_attr_range_with_source_opt(
-        self,
-        db: &Db,
-        krate: Crate,
-        owner: &impl ast::HasAttrs,
-    ) -> Option<(ast::Attr, ast::Meta)> {
-        self.find_attr_range_in(db, krate, ast::attrs_including_inner(owner))
-    }
-
-    /// [`AttrId::find_attr_range_with_source_opt`] of an owner's attributes, as
+    /// The containing `ast::Attr` and its [`ast::Meta`] of an owner's attributes, as
     /// [`ast::attrs_including_inner`] gives them: one instance for every kind of owner.
     fn find_attr_range_in(
         self,
@@ -663,7 +651,8 @@ impl AttrId {
             .unwrap_or_else(|| self.incorrect(krate))
     }
 
-    /// [`Self::find_attr_range_with_source_opt`] of a view of the owner.
+    /// The containing `Attr` (it may hold other attributes too, through `cfg_attr`) and its
+    /// `Meta`, of a view of the owner; `None` for an `AttrId` the owner has no attribute of.
     pub(crate) fn find_attr_range_with_source_opt_view<'t>(
         self,
         db: &Db,

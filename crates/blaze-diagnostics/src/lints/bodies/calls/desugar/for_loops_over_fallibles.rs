@@ -37,7 +37,7 @@ impl LatePass for ForLoopsOverFallibles {
     const LINTS: LintSet = lint_set(["for_loops_over_fallibles"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Match]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some(found) = for_loop(b, expr) else { return };
         let (pat, arg) = (found.pat, found.head);
         let ty = util::ty(b, arg);
@@ -132,7 +132,7 @@ impl LatePass for ForLoopsOverFallibles {
 /// of `arg`, a method call of `Iterator::next`, with its span and its text, when the receiver
 /// and what follows it in `arg` can be suggested on.
 fn next_receiver(
-    b: &BodyCx<'_, '_>,
+    b: &BodyCx<'_, '_, '_>,
     solver: &util::Solver<'_>,
     arg: ExprId,
     arg_span: &Span,
@@ -155,7 +155,7 @@ fn next_receiver(
 
 /// rustc's `suggest_question_mark`: the body's value is a `Result`, and what the loop's
 /// `Result` holds implements `IntoIterator`.
-fn suggest_question_mark<'db>(b: &BodyCx<'_, 'db>, solver: &util::Solver<'db>, args: GenericArgs<'db>) -> bool {
+fn suggest_question_mark<'db>(b: &BodyCx<'_, '_, 'db>, solver: &util::Solver<'db>, args: GenericArgs<'db>) -> bool {
     let lang_items = solver.interner().lang_items();
     let Some(into_iterator) = lang_items.IntoIterator else { return false };
     let result: Option<EnumId> = lang_items.ResultOk.map(|it| it.lookup(b.db()).parent);

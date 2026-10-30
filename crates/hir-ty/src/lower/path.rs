@@ -4,7 +4,8 @@ use base_db::Db;
 use blaze_mem::Frame;
 use either::Either;
 use hir_def::{
-    AdtId, AssocItemId, GenericDefId, GenericParamId, HasModule, Lookup, TraitId, TypeParamId,
+    AdtId, AssocItemId, GenericDefId, GenericParamId, HasModule, ImplId, Lookup, TraitId,
+    TypeAliasId, TypeParamId,
     expr_store::{
         ExpressionStore, HygieneId,
         path::{
@@ -189,9 +190,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         span: Span,
     ) -> (Ty<'db>, Option<TypeNs>) {
         let remaining_segments = self.segments.skip(self.current_segment_idx + 1);
-        tracing::debug!(?remaining_segments);
         let rem_seg_len = remaining_segments.len();
-        tracing::debug!(?rem_seg_len);
 
         let ty = match resolution {
             TypeNs::TraitId(trait_) => {
@@ -279,8 +278,6 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             }
         };
 
-        tracing::debug!(?ty);
-
         self.skip_resolved_segment();
         self.lower_ty_relative_path(ty, Some(resolution), infer_args, span)
     }
@@ -366,7 +363,6 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         Some(res)
     }
 
-    #[tracing::instrument(skip(self), ret)]
     pub(crate) fn resolve_path_in_type_ns(&mut self) -> Option<(TypeNs, Option<usize>)> {
         let db = self.ctx.db;
         let (resolution, remaining_index, _, prefix_info, _) =
@@ -605,29 +601,19 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
     fn inherent_associated_type(&self, ty: Ty<'db>, name: &Name) -> Option<Ty<'db>> {
         let (db, interner) = (self.ctx.db, self.ctx.interner);
         let (adt, args) = ty.as_adt()?;
-        let def_map = hir_def::nameres::crate_def_map(db, adt.module(db).krate(db));
-        for (_, module) in def_map.modules(db) {
-            for impl_ in module.scope(db).inherent_impls() {
-                let items = &impl_.impl_items(db).items;
-                let Some(alias) = items.iter().find_map(|(it, item)| match *item {
-                    AssocItemId::TypeAliasId(alias) if it == name => Some(alias),
-                    _ => None,
-                }) else {
-                    continue;
-                };
-                let own = GenericArgs::identity_for_item(interner, impl_.into());
-                let impl_args = match db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip()
-                {
-                    it if it == ty => own,
-                    it if it.as_adt() == Some((adt, own)) && own.len() == args.len() => args,
-                    _ => continue,
-                };
-                if GenericArgs::identity_for_item(interner, alias.into()).len() != impl_args.len() {
-                    continue;
-                }
-                let aliased = db.ty(alias.into()).instantiate(interner, impl_args).skip_norm_wip();
-                return Some(aliased);
+        let named = inherent_assoc_types(db, adt).iter().filter(|(it, _, _)| it == name);
+        for &(_, alias, impl_) in named {
+            let own = GenericArgs::identity_for_item(interner, impl_.into());
+            let impl_args = match db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip() {
+                it if it == ty => own,
+                it if it.as_adt() == Some((adt, own)) && own.len() == args.len() => args,
+                _ => continue,
+            };
+            if GenericArgs::identity_for_item(interner, alias.into()).len() != impl_args.len() {
+                continue;
             }
+            let aliased = db.ty(alias.into()).instantiate(interner, impl_args).skip_norm_wip();
+            return Some(aliased);
         }
         None
     }
@@ -1326,8 +1312,6 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
 ) -> GenericArgs<'db> {
     let interner = DbInterner::new_no_crate(db);
 
-    tracing::debug!(?args_and_bindings);
-
     // Order is
     // - Parent parameters
     // - Optional Self parameter
@@ -1608,4 +1592,31 @@ fn type_looks_like_const(
         TypeRef::Placeholder => Some(TypeLikeConst::Infer),
         _ => None,
     }
+}
+
+/// The associated type aliases of the inherent impls of `adt`, for
+/// [`PathLoweringContext::inherent_associated_type`]: in the order of its crate's modules and
+/// their impls, and only each impl's first alias of a name. One read per ADT, so a lowering that
+/// looks a name up depends on this list, not on every module scope of the crate.
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
+pub(crate) fn inherent_assoc_types(db: &Db, adt: AdtId) -> Box<[(Name, TypeAliasId, ImplId)]> {
+    let def_map = hir_def::nameres::crate_def_map(db, adt.module(db).krate(db));
+    let mut found = Vec::new(); // alloc: the memo's value, once per ADT
+    for (_, module) in def_map.modules(db) {
+        for impl_ in module.scope(db).inherent_impls() {
+            let self_ty = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
+            if self_ty.as_adt().map(|(it, _)| it) != Some(adt) {
+                continue;
+            }
+            let start = found.len();
+            for (name, item) in impl_.impl_items(db).items.iter() {
+                if let AssocItemId::TypeAliasId(alias) = *item
+                    && !found[start..].iter().any(|(it, _, _)| it == name)
+                {
+                    found.push((*name, alias, impl_));
+                }
+            }
+        }
+    }
+    found.into_boxed_slice()
 }

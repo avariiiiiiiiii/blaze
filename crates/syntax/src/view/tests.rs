@@ -231,8 +231,8 @@ fn an_untyped_parse_keeps_its_tree_and_casts_as_the_handle_does() {
     );
     assert_eq!(untyped.errors(), errors);
     let other = SourceFile::parse(SOURCE, Edition::CURRENT).into_untyped();
-    assert!(other.cast_view::<ast::Fn>().is_none());
-    let file = untyped.cast_view::<ast::SourceFile>().expect("the root is a source file");
+    assert!(other.cast::<ast::Fn>().is_none());
+    let file = untyped.cast::<ast::SourceFile>().expect("the root is a source file");
     assert_eq!(file.syntax_node(), handle);
     assert_eq!(vn(&file.view()), hn(&ast::SourceFile::cast(handle).unwrap()));
 }
@@ -277,6 +277,87 @@ fn an_items_written_range_leaves_out_its_attributes_and_comments() {
             h.children_with_tokens().map(|it| (it.kind(), it.text_range())),
         );
         assert_eq!(view::written_range(v), of_handle, "{:?}", v.kind());
+    }
+}
+
+/// blaze-diagnostics' and blaze-lints' `signature_range` before it moved here, on handles.
+fn signature_range_reference(item: &ast::Fn) -> TextRange {
+    let node = item.syntax();
+    let range = view::written_range_of(
+        node.text_range(),
+        node.children_with_tokens().map(|it| (it.kind(), it.text_range())),
+    );
+    let end = match item.body() {
+        Some(body) => {
+            let mut end = body.syntax().text_range().start();
+            let mut at = body.syntax().prev_sibling_or_token();
+            while let Some(it) = at {
+                if !it.kind().is_trivia() {
+                    end = it.text_range().end();
+                    break;
+                }
+                at = it.prev_sibling_or_token();
+            }
+            end
+        }
+        None => range.end(),
+    };
+    TextRange::new(range.start(), end.max(range.start()))
+}
+
+#[test]
+fn a_fns_signature_range_ends_before_its_body() {
+    let text = "/// d\n#[a]\npub fn f(x: u8) -> u8 /* c */ { x }\nfn g();";
+    let f = Fixture::new(text);
+    let fns = f.nodes::<ast::Fn, view::Fn<'_>>();
+    assert_eq!(fns.len(), 2);
+    let at = |s: &str| TextSize::try_from(text.find(s).unwrap()).unwrap();
+    let ret_end = at(" /* c */");
+    assert_eq!(view::signature_range(fns[0].1), TextRange::new(at("pub"), ret_end));
+    assert_eq!(view::signature_range(fns[1].1), fns[1].1.syntax().text_range());
+
+    for f in [Fixture::source(), f] {
+        for (h, v) in f.nodes::<ast::Fn, view::Fn<'_>>() {
+            assert_eq!(view::signature_range(v), signature_range_reference(&h), "{v:?}");
+        }
+    }
+}
+
+/// hir-expand's derive `type_param_span` before it moved here, on handles.
+fn type_param_span_reference(param: &ast::TypeParam) -> Option<TextRange> {
+    let name = param.name()?.syntax().text_range();
+    Some(match param.default_type() {
+        Some(ty) => name.cover(ty.syntax().text_range()),
+        None => name,
+    })
+}
+
+/// blaze-diagnostics' `type_param_range` before it moved here.
+fn type_param_range_reference(param: view::TypeParam<'_>) -> Option<TextRange> {
+    let name = param.name()?.syntax().text_range();
+    Some(match param.default_type() {
+        Some(default) => TextRange::new(name.start(), default.syntax().text_range().end()),
+        None => name,
+    })
+}
+
+#[test]
+fn a_type_params_span_is_its_name_to_the_end_of_its_default() {
+    let text = "struct S<#[a] T: Copy = u8, U, V = Vec<T>>(T, U, V);";
+    let f = Fixture::new(text);
+    let params = f.nodes::<ast::TypeParam, view::TypeParam<'_>>();
+    assert_eq!(params.len(), 3);
+    let at = |s: &str| TextSize::try_from(text.find(s).unwrap()).unwrap();
+    let range = |from: &str, to: &str| TextRange::new(at(from), at(to) + TextSize::of(to));
+    assert_eq!(view::type_param_span(params[0].1), Some(range("T: Copy", "u8")));
+    assert_eq!(view::type_param_span(params[1].1), Some(range("U,", "U")));
+    assert_eq!(view::type_param_span(params[2].1), Some(range("V =", "Vec<T>")));
+
+    for f in [Fixture::source(), f] {
+        for (h, v) in f.nodes::<ast::TypeParam, view::TypeParam<'_>>() {
+            assert_eq!(view::type_param_span(v), type_param_span_reference(&h), "{v:?}");
+            assert_eq!(view::type_param_span(v), type_param_range_reference(v), "{v:?}");
+        }
     }
 }
 

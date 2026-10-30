@@ -6,7 +6,7 @@ in a virtual disk, attached by an administrator), and a file next to it takes up
 each time: before it can say which format the store is of, when it opens its pack, in the
 middle of the records, and when it seals. Each time:
 
-  - the daemon has to build a program that prints what cargo's does, on its first build and
+  - the daemon has to build a program that prints what blaze's build from nothing does, on its first build and
     after an edit;
   - it has to say that it keeps nothing, and why;
   - `blaze-engine cache verify` has to find nothing in the store that is not what was written.

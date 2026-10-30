@@ -132,6 +132,21 @@ class Upstream:
         return Upstream(lines["nightly"], lines["commit"], lines["rustc"], url, sha256)
 
 
+# UPSTREAM from this line on is blaze's list of its changes to library/, kept through every rewrite.
+NOTES = "# blaze's changes to library/"
+
+
+def write_upstream(upstream):
+    """UPSTREAM for `upstream`, with the notes of the file it replaces."""
+    notes = ""
+    if os.path.isfile(UPSTREAM):
+        old = open(UPSTREAM).read()
+        at = old.find("\n" + NOTES)
+        if at >= 0:
+            notes = "#\n" + old[at + 1:]
+    open(UPSTREAM, "w").write(upstream.text() + notes)
+
+
 def of_nightly(date):
     """The standard library of the nightly of `date`, from its channel manifest."""
     manifest = tomllib.loads(get(f"{DIST}/{date}/channel-rust-nightly.toml").decode())
@@ -232,7 +247,7 @@ def do_import(args):
         shutil.move(fresh, LIBRARY)
     for name, data in kept.items():
         open(os.path.join(LIBRARY, name), "wb").write(data)
-    open(UPSTREAM, "w").write(upstream.text())
+    write_upstream(upstream)
     digest = write_digest()
     print(f"library/ is the standard library of {upstream.nightly} (rust-lang/rust {upstream.commit[:9]}), digest {digest[:12]}")
 
@@ -321,7 +336,7 @@ def do_merge(args):
     new = of_nightly(args.date or pinned_date())
     if new.commit == old.commit:
         print(f"library/ is already {new.nightly}'s ({new.commit[:9]})")
-        open(UPSTREAM, "w").write(new.text())
+        write_upstream(new)
         snapshot(new)
         write_digest()
         return
@@ -340,7 +355,7 @@ def do_merge(args):
                 f"changes to the standard library in: {', '.join(conflicted) or '(see below)'}. "
                 f"Resolve the conflict markers there, `git add` them and finish the bump; upstream's whole "
                 f"change is `git diff {base[:12]} {theirs[:12]}`. git apply said:\n{applied.stderr.decode()[-3000:]}")
-    open(UPSTREAM, "w").write(new.text())
+    write_upstream(new)
     write_digest()
     print(f"library/ merged {old.nightly} ({old.commit[:9]}) -> {new.nightly} ({new.commit[:9]}); "
           f"upstream/library is {theirs[:12]}: `git push origin upstream/library`")

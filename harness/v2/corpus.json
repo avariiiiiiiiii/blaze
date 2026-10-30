@@ -1,5 +1,5 @@
 {
- "about": "Top crates of crates.io for corpus.py: each pinned, fetched from static.crates.io as its .crate, checked against the sparse index's cksum, and its own tests run by `blaze test` and `cargo test`. Chosen so that no test needs the network, a service, trybuild or a rustc of its own; versions the newest unyanked release on 2026-10-29.",
+ "about": "Top crates of crates.io for corpus.py: each pinned, fetched from static.crates.io as its .crate, checked against the sparse index's cksum, and its own tests run by `blaze test` and judged by their own verdicts. Chosen so that no test needs the network, a service, trybuild or a rustc of its own; versions the newest unyanked release on 2026-10-29.",
  "crates": [
   {"name": "adler2", "version": "2.0.1"},
   {"name": "aho-corasick", "version": "1.1.5"},

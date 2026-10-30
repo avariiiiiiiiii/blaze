@@ -69,19 +69,13 @@ const fn has_valid_kinds(word: u32) -> bool {
 }
 
 /// The kind in the low [`KIND_BITS`] of `bits`, a kind field of a word of a [`Tokens`].
+///
+/// Checked: one compare, never taken, as every word of a `Tokens` holds two kinds (made by
+/// `word`, or checked by `has_valid_kinds` in `Input::extend_from_words` and `Tokens::new`);
+/// an unchecked transmute here would save that compare and rest on all of those.
 #[inline]
-#[allow(unsafe_code)]
 fn kind_of(bits: u32) -> SyntaxKind {
-    let raw = (bits & KIND_MASK) as u16;
-    debug_assert!(raw <= SyntaxKind::__LAST as u16);
-    // SAFETY: `SyntaxKind` is `#[repr(u16)]` with the values `0..=__LAST` (`syntax_kind.rs`).
-    // Every caller passes a kind field of a word of a `Tokens`, whose words are private and
-    // come either from an `Input` (`Input::tokens`; its words are made by `word` from two
-    // `SyntaxKind`s, which fit in KIND_BITS by the assertion above, or appended by
-    // `Input::extend_from_words`, which checks `has_valid_kinds` of each, and only `JOINT` and
-    // `FRAGMENT`, above both fields, are set after) or through `Tokens::new`, which checks
-    // `has_valid_kinds` of every word.
-    unsafe { std::mem::transmute::<u16, SyntaxKind>(raw) }
+    SyntaxKind::from((bits & KIND_MASK) as u16)
 }
 
 /// `pub` impl used by callers to create `Tokens`.

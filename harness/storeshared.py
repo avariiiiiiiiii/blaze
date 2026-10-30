@@ -9,7 +9,7 @@ seal packs side by side and read each other's.
 First with room for everything: afterwards a daemon that has compiled nothing has to find
 nearly all of its code in what the others sealed. Then with a store that is far too small,
 while `blaze-engine cache gc` evicts and merges in a loop and `blaze-engine cache verify` reads the store
-in a loop: every program has to print what cargo's does, and verify must never find a pack
+in a loop: every program has to print what blaze's build from nothing does, and verify must never find a pack
 that is not what was written.
 
     python3 storeshared.py [--daemons N] [--rounds N] [--seed N]
@@ -96,7 +96,7 @@ def main():
     work = scratch("blaze-storeshared-")
     store = os.path.join(work, "store")
     checkouts = [Checkout(work, f"checkout{n}") for n in range(DAEMONS + 1)]
-    # cargo's builds of every state, before anything runs at once.
+    # The builds from nothing of every state, before anything runs at once.
     for checkout in checkouts:
         for state in list(range(STATES)) + [0]:
             checkout.set(state)

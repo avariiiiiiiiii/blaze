@@ -3,6 +3,8 @@
 //! Test that a `tracked` fn on a `salsa::input`
 //! compiles and executes successfully.
 
+#![forbid(unsafe_code)]
+
 use expect_test::expect;
 mod common;
 use common::LogDatabase;

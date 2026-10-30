@@ -3,15 +3,15 @@
 //! way. A fatal error (an unterminated literal or block comment, a bad raw string) stops the
 //! lexer as rustc's `FatalError` does.
 
-use ra_ap_rustc_lexer::{self as rustc_lexer, Base, Cursor, DocStyle, FrontmatterAllowed, LiteralKind};
-use rustc_literal_escaper::{Mode, check_for_errors};
+use parser::cook::{self, doc_comment_errors, escaped_char};
+use ra_ap_rustc_lexer::{self as rustc_lexer, Cursor, DocStyle, FrontmatterAllowed, LiteralKind};
 use span::Edition;
 use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 
 use intern::Symbol;
 
 use super::unicode::{confusable, is_confusable};
-use super::{Emitted, Lint, unescape};
+use super::{Emitted, Lint};
 use crate::print::Op;
 use crate::stream::{Delimiter, DocKind, IdentKind, LitKind};
 
@@ -70,14 +70,6 @@ pub(super) fn nfc_normalize(string: &str) -> Symbol {
 /// `Symbol::can_be_raw`.
 pub(super) fn can_be_raw(sym: &str) -> bool {
     !matches!(sym, "" | "_" | "super" | "self" | "Self" | "crate" | "{{root}}" | "$crate")
-}
-
-/// `escaped_char`: a character as rustc's messages show it.
-pub(super) fn escaped_char(c: char, out: &mut String) {
-    match c {
-        '\u{20}'..='\u{7e}' => out.push(c),
-        _ => out.extend(c.escape_default()),
-    }
 }
 
 /// `contains_text_flow_control_chars`.
@@ -412,14 +404,8 @@ impl<'s, 'e> Lexer<'s, 'e> {
     }
 
     fn cook_doc_comment(&mut self, content: &str, kind: DocKind, doc_style: DocStyle) -> Kind {
-        for _ in content.bytes().filter(|&b| b == b'\r') {
-            self.error(
-                match kind {
-                    DocKind::Block => "bare CR not allowed in block doc-comment",
-                    DocKind::Line => "bare CR not allowed in doc-comment",
-                },
-            );
-        }
+        let errors = &mut self.emitted.errors;
+        doc_comment_errors(content, kind == DocKind::Block, |e| errors.push(e.message.into_owned()));
         Kind::Doc {
             kind,
             inner: doc_style == DocStyle::Inner,
@@ -427,144 +413,23 @@ impl<'s, 'e> Lexer<'s, 'e> {
         }
     }
 
+    /// `cook_lexer_literal`, a fatal error stopping the lexer.
     fn cook_lexer_literal(
         &mut self,
         start: u32,
         end: u32,
         kind: LiteralKind,
     ) -> Result<(LitKind, Symbol), Fatal> {
-        let unterminated = |lexer: &mut Self, terminated: bool, message: &str| match terminated {
-            true => Ok(()),
-            false => Err(lexer.fatal(message)),
-        };
-        Ok(match kind {
-            LiteralKind::Char { terminated } => {
-                unterminated(self, terminated, "unterminated character literal")?;
-                self.cook_quoted(LitKind::Char, Mode::Char, start, end, 1, 1)
-            }
-            LiteralKind::Byte { terminated } => {
-                unterminated(self, terminated, "unterminated byte constant")?;
-                self.cook_quoted(LitKind::Byte, Mode::Byte, start, end, 2, 1)
-            }
-            LiteralKind::Str { terminated } => {
-                unterminated(self, terminated, "unterminated double quote string")?;
-                self.cook_quoted(LitKind::Str, Mode::Str, start, end, 1, 1)
-            }
-            LiteralKind::ByteStr { terminated } => {
-                unterminated(self, terminated, "unterminated double quote byte string")?;
-                self.cook_quoted(LitKind::ByteStr, Mode::ByteStr, start, end, 2, 1)
-            }
-            LiteralKind::CStr { terminated } => {
-                unterminated(self, terminated, "unterminated C string")?;
-                self.cook_quoted(LitKind::CStr, Mode::CStr, start, end, 2, 1)
-            }
-            LiteralKind::RawStr { n_hashes } => match n_hashes {
-                Some(n) => {
-                    let n32 = u32::from(n);
-                    self.cook_quoted(LitKind::StrRaw(n), Mode::RawStr, start, end, 2 + n32, 1 + n32)
-                }
-                None => return Err(self.report_raw_str_error(start, 1)),
-            },
-            LiteralKind::RawByteStr { n_hashes } => match n_hashes {
-                Some(n) => {
-                    let n32 = u32::from(n);
-                    let kind = LitKind::ByteStrRaw(n);
-                    self.cook_quoted(kind, Mode::RawByteStr, start, end, 3 + n32, 1 + n32)
-                }
-                None => return Err(self.report_raw_str_error(start, 2)),
-            },
-            LiteralKind::RawCStr { n_hashes } => match n_hashes {
-                Some(n) => {
-                    let n32 = u32::from(n);
-                    self.cook_quoted(LitKind::CStrRaw(n), Mode::RawCStr, start, end, 3 + n32, 1 + n32)
-                }
-                None => return Err(self.report_raw_str_error(start, 2)),
-            },
-            LiteralKind::Int { base, empty_int } => {
-                let mut kind = LitKind::Integer;
-                if empty_int {
-                    self.error("no valid digits found for number");
-                    kind = LitKind::Err;
-                } else if matches!(base, Base::Binary | Base::Octal) {
-                    let radix = base as u32;
-                    let digits = self.str_from_to(start + 2, end);
-                    for c in digits.chars() {
-                        if c != '_' && c.to_digit(radix).is_none() {
-                            self.error(format!("invalid digit for a base {radix} literal")); // alloc: error path
-                            kind = LitKind::Err;
-                        }
-                    }
-                }
-                (kind, Symbol::intern(self.str_from_to(start, end)))
-            }
-            LiteralKind::Float { base, empty_exponent } => {
-                let mut kind = LitKind::Float;
-                if empty_exponent {
-                    self.error("expected at least one digit in exponent");
-                    kind = LitKind::Err;
-                }
-                let base = match base {
-                    Base::Hexadecimal => Some("hexadecimal"),
-                    Base::Octal => Some("octal"),
-                    Base::Binary => Some("binary"),
-                    Base::Decimal => None,
-                };
-                if let Some(base) = base {
-                    self.error(format!("{base} float literal is not supported")); // alloc: error path
-                    kind = LitKind::Err;
-                }
-                (kind, Symbol::intern(self.str_from_to(start, end)))
-            }
-        })
-    }
-
-    /// `report_raw_str_error`: always fatal.
-    fn report_raw_str_error(&mut self, start: u32, prefix_len: u32) -> Fatal {
-        let message = match rustc_lexer::validate_raw_str(&self.src[start as usize..], prefix_len) {
-            Err(rustc_lexer::RawStrError::InvalidStarter { bad_char }) => {
-                // alloc: error path
-                let mut message = String::from(
-                    "found invalid character; only `#` is allowed in raw string delimitation: ",
-                );
-                escaped_char(bad_char, &mut message);
-                message
-            }
-            Err(rustc_lexer::RawStrError::NoTerminator { .. }) => {
-                "unterminated raw string".to_owned() // alloc: error path
-            }
-            // alloc: error path
-            Err(rustc_lexer::RawStrError::TooManyDelimiters { found }) => format!(
-                "too many `#` symbols: raw strings may be delimited by up to 255 `#` symbols, but found {found}"
-            ),
-            Ok(()) => panic!("no error found for supposedly invalid raw string literal"),
-        };
-        self.fatal(message)
-    }
-
-    fn cook_quoted(
-        &mut self,
-        mut kind: LitKind,
-        mode: Mode,
-        start: u32,
-        end: u32,
-        prefix_len: u32,
-        postfix_len: u32,
-    ) -> (LitKind, Symbol) {
-        let lit_content = self.str_from_to(start + prefix_len, end - postfix_len);
+        let src: &'s str = self.src;
+        let rest = &src[start as usize..];
         let errors = &mut self.emitted.errors;
-        check_for_errors(lit_content, mode, |range, err| {
-            if let Some(message) = unescape::message(lit_content, mode, range, &err) {
-                debug_assert!(err.is_fatal());
-                errors.push(message);
-                kind = LitKind::Err;
-            }
+        let cooked = cook::cook_lexer_literal(rest, self.pos - start, end - start, kind, |e| {
+            errors.push(e.message.into_owned());
         });
-        // An error keeps the quotes in the symbol, as rustc's does.
-        let sym = match kind {
-            LitKind::Err => Symbol::intern(self.str_from_to(start, end)),
-            _ => Symbol::intern(lit_content),
-        };
-        (kind, sym)
+        match cooked {
+            Ok((kind, symbol)) => Ok((kind, Symbol::intern(symbol))),
+            Err(fatal) => Err(self.fatal(fatal.message.into_owned())),
+        }
     }
 
     fn lint_unicode_text_flow(&mut self, start: u32) {

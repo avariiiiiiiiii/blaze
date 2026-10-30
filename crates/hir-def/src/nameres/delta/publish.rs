@@ -1,0 +1,316 @@
+//! What the maintainer publishes (design §9): one [`ScopeInput`] per module, one
+//! [`CrateResolution`] per crate, and the singleton [`Resolutions`] that finds the latter. Each is
+//! set only when its content changed, so a query reads a change only when its slice changed. A
+//! read of a published scope during a maintainer run is noted (`reads`): another crate's, or
+//! one of this crate the run does not hold.
+
+use base_db::{Crate, Db};
+use hir_expand::name::Name;
+use rustc_hash::FxHashMap;
+use salsa::{Durability, Setter};
+use triomphe::Arc;
+
+use super::reads;
+use crate::{
+    ExternCrateId, FxIndexMap, MacroId, ModuleId, TraitId, UseId,
+    item_scope::ItemScope,
+    nameres::{
+        DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap, ModulesMap, ModulesSlot,
+        OwnedRecords, RecordsSlot, uses::NameRecords,
+    },
+    per_ns::PerNs,
+};
+
+/// One module's scope as the maintainer last built it: what `ScopeSlot::Input` reads.
+#[salsa::input]
+pub(in crate::nameres) struct ScopeInput {
+    #[returns(copy)]
+    pub(in crate::nameres) module: ModuleId,
+    #[returns(ref)]
+    pub(in crate::nameres) scope: ItemScope,
+    #[returns(ref)]
+    pub(in crate::nameres) children: FxIndexMap<Name, ModuleId>,
+}
+
+#[salsa::tracked]
+impl ScopeInput {
+    /// What one name means in the module. Adding or removing another item leaves this equal,
+    /// so a query that only looked names up is not run again.
+    #[salsa::tracked]
+    fn name(self, db: &Db, name: Name) -> PerNs {
+        self.scope(db).get(&name)
+    }
+
+    #[salsa::tracked(returns(ref))]
+    fn legacy_macro(self, db: &Db, name: Name) -> Option<Box<[MacroId]>> {
+        self.scope(db).get_legacy_macro(&name).map(Box::from)
+    }
+
+    #[salsa::tracked(returns(ref))]
+    fn traits(self, db: &Db) -> Box<[TraitId]> {
+        // alloc: the memo's value, once per module scope
+        self.scope(db).traits().collect()
+    }
+}
+
+/// A crate's resolution besides its modules' scopes. Set only when the module tree, the crate
+/// env, the crate data, the name records or the diagnostics change: an item added to a module
+/// leaves it as it is.
+#[salsa::input]
+pub(in crate::nameres) struct CrateResolution {
+    #[returns(copy)]
+    root: ModuleId,
+    #[returns(ref)]
+    modules: ModulesMap,
+    #[returns(ref)]
+    local: LocalDefMap,
+    #[returns(ref)]
+    data: Arc<DefMapCrateData>,
+    #[returns(copy)]
+    prelude: Option<(ModuleId, Option<UseId>)>,
+    #[returns(ref)]
+    macro_use_prelude: FxHashMap<Name, (MacroId, Option<ExternCrateId>)>,
+    #[returns(copy)]
+    session_macros: bool,
+    #[returns(ref)]
+    records: OwnedRecords,
+}
+
+/// Every maintained crate's [`CrateResolution`]: changes only when a crate gains or loses its
+/// state.
+#[salsa::input(singleton)]
+pub(in crate::nameres) struct Resolutions {
+    #[returns(ref)]
+    crates: FxHashMap<Crate, CrateResolution>,
+}
+
+fn scope_input(id: salsa::Id) -> ScopeInput {
+    <ScopeInput as salsa::plumbing::FromId>::from_id(id)
+}
+
+fn resolution(id: salsa::Id) -> CrateResolution {
+    <CrateResolution as salsa::plumbing::FromId>::from_id(id)
+}
+
+// What `nameres.rs` reads.
+
+pub(in crate::nameres) fn input_scope(db: &Db, id: salsa::Id) -> &ItemScope {
+    let input = scope_input(id);
+    if reads::on() {
+        reads::note(input.module(db), None);
+    }
+    input.scope(db)
+}
+
+pub(in crate::nameres) fn input_name(db: &Db, id: salsa::Id, name: Name) -> PerNs {
+    let input = scope_input(id);
+    if reads::on() {
+        reads::note(input.module(db), Some(name));
+    }
+    *input.name(db, name)
+}
+
+pub(in crate::nameres) fn input_legacy_macro(db: &Db, id: salsa::Id, name: Name) -> Option<&[MacroId]> {
+    let input = scope_input(id);
+    if reads::on() {
+        reads::note(input.module(db), None);
+    }
+    input.legacy_macro(db, name).as_deref()
+}
+
+pub(in crate::nameres) fn input_traits(db: &Db, id: salsa::Id) -> &[TraitId] {
+    let input = scope_input(id);
+    if reads::on() {
+        reads::note(input.module(db), None);
+    }
+    input.traits(db)
+}
+
+pub(in crate::nameres) fn input_children(db: &Db, id: salsa::Id) -> &FxIndexMap<Name, ModuleId> {
+    let input = scope_input(id);
+    if reads::on() {
+        reads::note(input.module(db), None);
+    }
+    input.children(db)
+}
+
+pub(in crate::nameres) fn published_modules(db: &Db, id: salsa::Id) -> &ModulesMap {
+    resolution(id).modules(db)
+}
+
+pub(in crate::nameres) fn published_records(db: &Db, id: salsa::Id) -> &OwnedRecords {
+    resolution(id).records(db)
+}
+
+/// The crate's def map as the maintainer published it, `None` when no maintainer ran for it.
+/// Depends on the crate's resolution minus its modules and records, which its readers read
+/// themselves.
+pub(in crate::nameres) fn published(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
+    let resolution = *Resolutions::try_get(db)?.crates(db).get(&krate)?;
+    let id = salsa::plumbing::AsId::as_id(&resolution);
+    let def_map = DefMap {
+        krate,
+        block: None,
+        root: resolution.root(db),
+        modules: ModulesSlot::Published(id),
+        prelude: resolution.prelude(db),
+        // clone: the crate's `macro_use` prelude, a handful of names, once per def map
+        macro_use_prelude: resolution.macro_use_prelude(db).clone(),
+        derive_helpers_in_scope: FxHashMap::default(),
+        session_macros: resolution.session_macros(db),
+        names: NameRecords::default(),
+        // alloc: empty, allocates nothing: the diagnostics are in the records
+        diagnostics: Vec::new(),
+        diagnostics_by_module: DiagnosticsByModule::default(),
+        records: Some(RecordsSlot::Published(id)),
+        // clone: one count of the crate's shared data
+        data: resolution.data(db).clone(),
+    };
+    // clone: the extern prelude, one entry per dependency, once per def map
+    let local = LocalDefMap { extern_prelude: resolution.local(db).extern_prelude.clone() };
+    Some((def_map, local))
+}
+
+// What the maintainer sets.
+
+/// A module's scope input after a run: made for a new module, set where the scope or the
+/// children changed. Whether it set anything.
+pub(super) fn set_scope(
+    db: &mut Db,
+    slot: &mut Option<ScopeInput>,
+    module: ModuleId,
+    scope: ItemScope,
+    children: FxIndexMap<Name, ModuleId>,
+) -> bool {
+    let Some(input) = *slot else {
+        *slot = Some(ScopeInput::new(db, module, scope, children));
+        return true;
+    };
+    let mut set = false;
+    if *input.scope(db) != scope {
+        input.set_scope(db).to(scope);
+        set = true;
+    }
+    if *input.children(db) != children {
+        input.set_children(db).to(children);
+        set = true;
+    }
+    set
+}
+
+pub(super) fn scope_id(input: ScopeInput) -> salsa::Id {
+    salsa::plumbing::AsId::as_id(&input)
+}
+
+/// Sets a module's scope alone, its children as they are, where it changed: whether it did.
+pub(super) fn set_scope_alone(db: &mut Db, input: ScopeInput, scope: ItemScope) -> bool {
+    if *input.scope(db) == scope {
+        return false;
+    }
+    input.set_scope(db).to(scope);
+    true
+}
+
+/// What a crate's [`CrateResolution`] holds, as the maintainer assembled it. `modules` and
+/// `records` are `None` where the write left them as published: they are the crate-sized
+/// fields, neither compared nor copied then.
+pub(super) struct Assembled {
+    pub(super) root: ModuleId,
+    pub(super) modules: Option<ModulesMap>,
+    pub(super) local: LocalDefMap,
+    pub(super) data: Arc<DefMapCrateData>,
+    pub(super) prelude: Option<(ModuleId, Option<UseId>)>,
+    pub(super) macro_use_prelude: FxHashMap<Name, (MacroId, Option<ExternCrateId>)>,
+    pub(super) session_macros: bool,
+    pub(super) records: Option<OwnedRecords>,
+}
+
+/// Sets each field of the crate's resolution that differs from `new` (makes the input for a
+/// crate first seen, and enters it in [`Resolutions`]); the number of fields set.
+pub(super) fn set_resolution(
+    db: &mut Db,
+    krate: Crate,
+    slot: &mut Option<CrateResolution>,
+    new: Assembled,
+) -> u64 {
+    let Assembled { root, modules, local, data, prelude, macro_use_prelude, session_macros, records } = new;
+    let Some(it) = *slot else {
+        let it = CrateResolution::new(
+            db,
+            root,
+            modules.expect("nameres delta: a crate's first resolution has its modules"),
+            local,
+            data,
+            prelude,
+            macro_use_prelude,
+            session_macros,
+            records.expect("nameres delta: a crate's first resolution has its records"),
+        );
+        *slot = Some(it);
+        enter(db, krate, Some(it));
+        return 1;
+    };
+    let mut set = 0;
+    if it.root(db) != root {
+        it.set_root(db).to(root);
+        set += 1;
+    }
+    if let Some(modules) = modules
+        && *it.modules(db) != modules
+    {
+        it.set_modules(db).to(modules);
+        set += 1;
+    }
+    if *it.local(db) != local {
+        it.set_local(db).to(local);
+        set += 1;
+    }
+    if *it.data(db) != data {
+        it.set_data(db).to(data);
+        set += 1;
+    }
+    if it.prelude(db) != prelude {
+        it.set_prelude(db).to(prelude);
+        set += 1;
+    }
+    if *it.macro_use_prelude(db) != macro_use_prelude {
+        it.set_macro_use_prelude(db).to(macro_use_prelude);
+        set += 1;
+    }
+    if it.session_macros(db) != session_macros {
+        it.set_session_macros(db).to(session_macros);
+        set += 1;
+    }
+    if let Some(records) = records
+        && *it.records(db) != records
+    {
+        it.set_records(db).to(records);
+        set += 1;
+    }
+    set
+}
+
+/// Enters `krate`'s resolution in [`Resolutions`] (`None` takes it out).
+pub(super) fn enter(db: &mut Db, krate: Crate, resolution: Option<CrateResolution>) {
+    match Resolutions::try_get(db) {
+        Some(all) => {
+            if all.crates(db).get(&krate).copied() == resolution {
+                return;
+            }
+            // clone: the crate -> input map, once per crate gained or lost
+            let mut crates = all.crates(db).clone();
+            match resolution {
+                Some(it) => crates.insert(krate, it),
+                None => crates.remove(&krate),
+            };
+            all.set_crates(db).to(crates);
+        }
+        None => {
+            let mut crates = FxHashMap::default();
+            if let Some(it) = resolution {
+                crates.insert(krate, it);
+            }
+            _ = Resolutions::builder(crates).durability(Durability::LOW).new(db);
+        }
+    }
+}

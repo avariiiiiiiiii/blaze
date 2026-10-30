@@ -10,7 +10,7 @@ use std::mem::offset_of;
 
 use base_db::{Crate, Db};
 use blaze_format::{
-    ALIGN, FormatError, HEADER_LEN, Part as SchemaPart, Persist, Record, SchemaHash, Slice,
+    ALIGN, FormatError, HEADER_LEN, Part as SchemaPart, Persist, Placed, Record, SchemaHash, Slice,
     Writer, open_as, schema_of,
 };
 use blaze_ids::ContentId;
@@ -33,7 +33,7 @@ use crate::{
 type R<T = ()> = Result<T, String>;
 
 /// The version of what [`super::ids`] writes of a body's ids.
-const IDS_VERSION: u64 = 1;
+const IDS_VERSION: u64 = ids::VERSION;
 
 blaze_format::record! {
     /// Where a body's buffer is in the part, from the part's start.
@@ -167,10 +167,10 @@ pub(crate) fn encode(
     }
     // alloc: the key column, written once per crate
     let keys: Vec<ContentId> = bodies.iter().map(|&(key, _)| key).collect();
-    let keys = column(&mut out, &keys);
-    let places = column(&mut out, &places);
-    let item_bytes = column(&mut out, &item_bytes);
-    let kinds = column(&mut out, &items.kinds);
+    let keys = Placed::push(&mut out, &keys);
+    let places = Placed::push(&mut out, &places);
+    let item_bytes = Placed::push(&mut out, &item_bytes);
+    let kinds = Placed::push(&mut out, &items.kinds);
     // alloc: the left-out columns, written once per crate
     let left_keys: Vec<ContentId> = left.iter().map(|&(key, _)| key).collect();
     // alloc: as above
@@ -181,9 +181,9 @@ pub(crate) fn encode(
         left_why.extend_from_slice(why.as_bytes());
         left_ends.push(place(left_why.len())?);
     }
-    let left_keys = column(&mut out, &left_keys);
-    let left_ends = column(&mut out, &left_ends);
-    let left_why = column(&mut out, &left_why);
+    let left_keys = Placed::push(&mut out, &left_keys);
+    let left_ends = Placed::push(&mut out, &left_ends);
+    let left_why = Placed::push(&mut out, &left_why);
     let at = out.next::<PartRoot>();
     let field = |offset: usize| at + offset as u64;
     let root = PartRoot {
@@ -199,29 +199,6 @@ pub(crate) fn encode(
     let written = out.push(&root);
     debug_assert_eq!(written, at, "`Writer::next` is not where `push` writes");
     Ok(out.finish(at))
-}
-
-/// Where a column was written: nowhere when it is empty.
-#[derive(Clone, Copy)]
-struct Column {
-    at: u64,
-    len: usize,
-}
-
-fn column<T: Record>(out: &mut Writer, values: &[T]) -> Column {
-    match values.is_empty() {
-        true => Column { at: 0, len: 0 },
-        false => Column { at: out.push_slice(values), len: values.len() },
-    }
-}
-
-impl Column {
-    fn slice<T>(self, field_at: u64) -> Slice<T> {
-        match self.len {
-            0 => Slice::EMPTY,
-            len => Slice::between(field_at, self.at, len),
-        }
-    }
 }
 
 /// The buffer of `def`'s body: its record written inside a relocating scope, then its ids.
@@ -240,7 +217,7 @@ fn body<'db>(
     let words = ids::write(db, krate, &mut table, &mut locs, items)?;
 
     let mut out = Writer::new(BODY_SCHEMA);
-    let words = column(&mut out, &words);
+    let words = Placed::push(&mut out, &words);
     // The record is a buffer of its own, read in place: at an aligned offset.
     let record_at = out.bytes.len().next_multiple_of(ALIGN);
     out.bytes.resize(record_at, 0);

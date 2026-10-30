@@ -17,6 +17,7 @@
 //! Only C++ exceptions are claimed, which is what a Rust panic is for MSVC. The object is
 //! moved as bytes, which is all a panic needs.
 
+use blaze_format::cursor::Put;
 use cranelift_codegen::{
     Context,
     ir::{
@@ -127,7 +128,7 @@ impl Pads {
     /// and go on at `pad` when they unwind.
     pub(in super::super) fn entered(&mut self, calls: std::ops::Range<u32>, pad: u32) {
         for word in [calls.start, calls.end, pad] {
-            self.0.extend_from_slice(&word.to_le_bytes());
+            self.0.put_u32(word);
         }
     }
 
@@ -394,7 +395,7 @@ impl Tables {
                 xdata[start] |= UNW_FLAG_EHANDLER << 3;
                 handlers.push(xdata.len());
                 xdata.extend_from_slice(&[0; 4]);
-                xdata.extend_from_slice(&((pads.len() / Pads::ENTRY) as u32).to_le_bytes());
+                xdata.put_u32((pads.len() / Pads::ENTRY) as u32);
                 xdata.extend_from_slice(pads);
             }
             pdata.extend_from_slice(&[0; 12]);
@@ -716,13 +717,8 @@ fn release(shim: &mut Shim<'_>) {
 
 #[test]
 fn ranges_find_what_a_search_of_all_of_them_finds() {
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = move |below: u32| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state % u64::from(below)) as u32
-    };
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+    let mut next = move |below: u32| rng.below(u64::from(below)) as u32;
     for _ in 0..200 {
         // alloc: a test's input
         let mut ranges = Vec::new();

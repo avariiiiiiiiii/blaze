@@ -42,6 +42,8 @@ pub type ChildrenWithTokens<'t> = syntax_tree::view::ChildrenWithTokens<'t, Rust
 pub type Descendants<'t> = syntax_tree::view::Descendants<'t, RustLanguage>;
 pub type DescendantsWithTokens<'t> =
     syntax_tree::view::DescendantsWithTokens<'t, RustLanguage>;
+pub type DescendantsWithRanges<'t> =
+    syntax_tree::view::DescendantsWithRanges<'t, RustLanguage>;
 pub type Preorder<'t> = syntax_tree::view::Preorder<'t, RustLanguage>;
 pub type PreorderWithTokens<'t> = syntax_tree::view::PreorderWithTokens<'t, RustLanguage>;
 
@@ -192,9 +194,11 @@ impl<T: Typed> Parse<T> {
     }
 }
 
-/// The tag of a parse whose root has no one kind (a macro expansion, a fragment): it has no view
-/// type of its own, so a `Parse<Untyped>` is walked from [`Parse::root`] or cast with
-/// [`Parse::cast_view`].
+/// The tag of a parse whose root has no one kind (a macro expansion, a token tree as a fragment,
+/// from [`crate::SyntaxTreeBuilder::finish_view`]): it has no view type of its own, so a
+/// `Parse<Untyped>` is walked from [`Parse::root`] or cast with [`Parse::cast`]. Not a handle:
+/// nothing of this type exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Untyped {}
 
 impl<T> Parse<T> {
@@ -212,7 +216,7 @@ impl<T> Parse<T> {
 
 impl Parse<Untyped> {
     /// The parse as a `T`, when its root is one.
-    pub fn cast_view<T: Typed>(mut self) -> Option<Parse<T>> {
+    pub fn cast<T: Typed>(mut self) -> Option<Parse<T>> {
         if !<T::Of<'_> as AstNode<'_>>::can_cast(self.root().kind()) {
             return None;
         }
@@ -260,6 +264,39 @@ pub fn written_range(node: Node<'_>) -> TextRange {
         node.text_range(),
         node.children_with_tokens().map(|it| (it.kind(), it.text_range())),
     )
+}
+
+/// rustc's span of a function's definition (`def_span`): its [`written_range`] up to the end of
+/// its signature, the last element before its body that is not trivia; all of it if it has no
+/// body.
+pub fn signature_range(item: Fn<'_>) -> TextRange {
+    let range = written_range(item.syntax());
+    let end = match item.body() {
+        Some(body) => {
+            let mut end = body.syntax().text_range().start();
+            let mut at = body.syntax().prev_sibling_or_token();
+            while let Some(it) = at {
+                if !it.kind().is_trivia() {
+                    end = it.text_range().end();
+                    break;
+                }
+                at = it.prev_sibling_or_token();
+            }
+            end
+        }
+        None => range.end(),
+    };
+    TextRange::new(range.start(), end.max(range.start()))
+}
+
+/// rustc's span of a type parameter (`GenericParam::span`, its `def_span`): its name, to the
+/// end of its default if it has one. None for a parameter without a name.
+pub fn type_param_span(param: TypeParam<'_>) -> Option<TextRange> {
+    let name = param.name()?.syntax().text_range();
+    Some(match param.default_type() {
+        Some(ty) => name.cover(ty.syntax().text_range()),
+        None => name,
+    })
 }
 
 /// The node `ptr` points at under `root`, found from the bottom up.

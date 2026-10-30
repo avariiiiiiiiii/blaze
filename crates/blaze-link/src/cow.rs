@@ -65,14 +65,14 @@ pub(crate) const LONG: usize = 1 << 33;
 pub(crate) const NODES: usize = 1 << 31;
 
 /// A static pool of `A`s, reserved on first use.
-pub(crate) struct Lazy<A: 'static> {
+pub(crate) struct LazyPool<A: 'static> {
     pool: OnceLock<Pool<Counted<A>>>,
     bytes: usize,
 }
 
-impl<A: Send + 'static> Lazy<A> {
-    pub(crate) const fn new(bytes: usize) -> Lazy<A> {
-        Lazy { pool: OnceLock::new(), bytes }
+impl<A: Send + 'static> LazyPool<A> {
+    pub(crate) const fn new(bytes: usize) -> LazyPool<A> {
+        LazyPool { pool: OnceLock::new(), bytes }
     }
 
     fn pool(&'static self) -> &'static Pool<Counted<A>> {
@@ -86,7 +86,7 @@ impl<A: Send + 'static> Lazy<A> {
     }
 }
 
-/// A thread's cache of a [`Lazy`] pool, made on its first use.
+/// A thread's cache of a [`LazyPool`], made on its first use.
 pub(crate) struct Local<A: 'static>(RefCell<Option<Cache<'static, Counted<A>>>>);
 
 impl<A: Send + 'static> Local<A> {
@@ -95,7 +95,7 @@ impl<A: Send + 'static> Local<A> {
     }
 
     #[inline]
-    pub(crate) fn with<R>(&self, pool: &'static Lazy<A>, f: impl FnOnce(&mut Cache<'static, Counted<A>>) -> R) -> R {
+    pub(crate) fn with<R>(&self, pool: &'static LazyPool<A>, f: impl FnOnce(&mut Cache<'static, Counted<A>>) -> R) -> R {
         let mut cache = self.0.borrow_mut();
         f(cache.get_or_insert_with(|| pool.pool().cache()))
     }
@@ -113,7 +113,7 @@ macro_rules! pool {
         impl $crate::cow::Pools<$slot> for $family {
             #[inline]
             fn with<R>(f: impl FnOnce(&mut ::blaze_mem::Cache<'static, ::blaze_mem::pool::Counted<$slot>>) -> R) -> R {
-                static POOL: $crate::cow::Lazy<$slot> = $crate::cow::Lazy::new($bytes);
+                static POOL: $crate::cow::LazyPool<$slot> = $crate::cow::LazyPool::new($bytes);
                 ::std::thread_local! {
                     static CACHE: $crate::cow::Local<$slot> = const { $crate::cow::Local::new() };
                 }
@@ -197,7 +197,7 @@ where
 /// The slot to write: first copied into a fresh one while other owners share it, which keep
 /// the old one (`Arc::make_mut`'s rule, the copy made in place rather than on the stack).
 #[inline]
-fn unique<P, E, const N: usize>(shared: &mut Shared<'static, [E; N]>) -> &mut [E; N]
+fn unique<'a, P, E, const N: usize>(shared: &'a mut Shared<'static, [E; N]>) -> &'a mut [E; N]
 where
     P: Pools<[E; N]>,
     E: Clone + 'static,
@@ -205,12 +205,12 @@ where
     if Shared::owners(shared) != 1 {
         *shared = share::<P, E, N>(&shared[..], &shared[0]);
     }
-    Shared::get_mut(shared).expect("a slot just copied has one owner")
+    Shared::<'static, [E; N]>::get_mut(shared).expect("a slot just copied has one owner")
 }
 
 /// [`unique`] for a chunk, whose element type is its family.
 #[inline]
-fn own<T, const N: usize>(chunk: &mut Shared<'static, [T; N]>) -> &mut [T; N]
+fn own<'a, T, const N: usize>(chunk: &'a mut Shared<'static, [T; N]>) -> &'a mut [T; N]
 where
     T: Pools<[T; N]> + Clone + 'static,
 {
@@ -228,7 +228,9 @@ fn split(at: usize) -> (usize, usize, usize) {
 
 /// The node in `slot` to write: made empty when there is none, copied while shared.
 #[inline]
-fn node_mut<P, X>(slot: &mut Option<Shared<'static, [Option<X>; FAN]>>) -> &mut [Option<X>; FAN]
+fn node_mut<'a, P, X>(
+    slot: &'a mut Option<Shared<'static, [Option<X>; FAN]>>,
+) -> &'a mut [Option<X>; FAN]
 where
     P: Pools<[Option<X>; FAN]>,
     X: Clone + 'static,
@@ -830,7 +832,7 @@ pool!(Bytes, Top<PageRef>, NODES);
 /// unwritten buffer or in one page borrows it. A clone is two reference counts: the page table
 /// is shared too, and its nodes on a written page's path are copied by the first write after
 /// the clone. At most 4 GiB.
-#[derive(Clone, Default)]
+#[derive(Clone, Default)] // clone: two reference counts, as above
 pub(crate) struct CowBytes {
     base: Arc<Vec<u8>>,
     /// How much of `base` is still the bytes there: a truncation shortens it, so growing

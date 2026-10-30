@@ -33,12 +33,15 @@ pub struct Used {
     pub allocations: u64,
     /// Bytes asked for by those calls (for `realloc`, the new size).
     pub bytes: u64,
+    /// The most bytes one of those calls asked for.
+    pub largest: u64,
 }
 
 thread_local! {
     static ON: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
     static BYTES: Cell<u64> = const { Cell::new(0) };
+    static LARGEST: Cell<u64> = const { Cell::new(0) };
 }
 
 #[inline]
@@ -47,6 +50,7 @@ fn record(size: usize) {
     if ON.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
         let _ = BYTES.try_with(|c| c.set(c.get() + size as u64));
+        let _ = LARGEST.try_with(|c| c.set(c.get().max(size as u64)));
     }
 }
 
@@ -86,11 +90,20 @@ unsafe impl GlobalAlloc for Counting {
 /// counts only its own closure, and the outer one includes it.
 pub fn measure<R>(f: impl FnOnce() -> R) -> (R, Used) {
     let was_on = ON.with(|on| on.replace(true));
+    let outer_largest = LARGEST.with(|c| c.replace(0));
     let before = (ALLOCATIONS.with(Cell::get), BYTES.with(Cell::get));
     let result = f();
     let after = (ALLOCATIONS.with(Cell::get), BYTES.with(Cell::get));
+    let largest = LARGEST.with(|c| c.replace(outer_largest.max(c.get())));
     ON.with(|on| on.set(was_on));
-    (result, Used { allocations: after.0 - before.0, bytes: after.1 - before.1 })
+    (result, Used { allocations: after.0 - before.0, bytes: after.1 - before.1, largest })
+}
+
+/// Whether this binary's global allocator is [`Counting`]: without it every measurement is
+/// zero, which a budget test must not read as a pass.
+pub fn installed() -> bool {
+    let (_, used) = measure(|| std::hint::black_box(Box::new(0u8)));
+    used.allocations == 1
 }
 
 /// Asserts `f` makes at most `max` allocations on this thread, naming `what` when it doesn't.
@@ -126,16 +139,33 @@ mod tests {
         assert_eq!(v.capacity(), 64);
         assert_eq!(used.allocations, 1);
         assert_eq!(used.bytes, 64);
+        assert_eq!(used.largest, 64);
     }
 
     #[test]
     fn nests() {
         let ((_, inner), outer) = measure(|| {
-            let _a = Box::new(1u64);
+            let _a = std::hint::black_box(Box::new([0u8; 100]));
             measure(|| Box::new(2u64))
         });
         assert_eq!(inner.allocations, 1);
+        assert_eq!(inner.largest, 8);
         assert_eq!(outer.allocations, 2);
+        assert_eq!(outer.largest, 100);
+    }
+
+    #[test]
+    fn an_inner_measure_keeps_the_outer_largest() {
+        let ((), outer) = measure(|| {
+            let _a = std::hint::black_box(Vec::<u8>::with_capacity(500));
+            let _ = measure(|| Box::new(1u8));
+        });
+        assert_eq!(outer.largest, 500);
+    }
+
+    #[test]
+    fn knows_it_is_installed() {
+        assert!(installed());
     }
 
     #[test]

@@ -48,7 +48,7 @@ sys.path.insert(0, HERE)
 # alone. Here it stays as the caller has it: without it the tests of every project are
 # cargo's, and that case is one of the flags.
 INCREMENTAL = os.environ.get("CARGO_INCREMENTAL")
-from difftest import host
+from mixed import host
 if INCREMENTAL is None:
     os.environ.pop("CARGO_INCREMENTAL", None)
 else:
@@ -172,6 +172,14 @@ STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Down
                     r"|^(?=[ \w-]{12} )\s+(Loading|Loaded|Fetching|Fetched|Resolving|Resolved|Compiled|Linking|Linked|Checked|Testing|Tested|Ran|Rebuilt|Finishing|Took|Slowest|Cache|Chain|Building|Built|Storing|Stored|Optimizing|Optimized) ")
 
 
+def write(at, path, text):
+    """Writes `text` to `path` under `at`, making the directories it is in."""
+    path = os.path.join(at, path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as file:
+        file.write(text)
+
+
 def base_env(home):
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never")
     # Every side's cargo lays out a build as stable cargo does, as a user's does and as blaze
@@ -284,6 +292,33 @@ class Side:
         return max(loads, default=(0, 0))[::-1]
 
 
+class Scratch(Side):
+    """`blaze` from nothing: every command in a home, a store and a target directory
+    (`target-scratch`) of its own, made for it and stopped after it, so nothing of an earlier
+    command is there to reuse. What a harness holds a warm daemon's build of the same source to:
+    the two differ only where an edit reached the daemon wrong."""
+
+    def __init__(self, ws, env):
+        super().__init__(ws, env, True)
+        self.count = 0
+
+    def cargo(self, command, *args, env=None, timeout=7200):
+        self.count += 1
+        # Under /tmp, short: a daemon's socket is under its home, and macOS allows 104 bytes.
+        home = tempfile.mkdtemp(prefix="bz-scratch-", dir="/tmp" if not WINDOWS else None)
+        target = os.path.join(self.ws, "target-scratch")
+        shutil.rmtree(target, ignore_errors=True)
+        fresh = dict(base_env(home), **{k: v for k, v in self.env.items() if k not in ("BLAZE_HOME", "BLAZE_CACHE")})
+        fresh.update(BLAZE_HOME=home, BLAZE_CACHE=os.path.join(home, "store"), CARGO_TARGET_DIR=target)
+        before, self.env = self.env, fresh
+        try:
+            return super().cargo(command, *args, env=env, timeout=timeout)
+        finally:
+            self.env = before
+            subprocess.run(["blaze", "stop"], cwd=self.ws, env=fresh, capture_output=True, timeout=120)
+            shutil.rmtree(home, ignore_errors=True)
+
+
 def by_rustc(stderr):
     """Whether cargo built any of it: blaze said it fell back, or cargo finished a build.
     `blaze build`, `run` and `test` say `Compiling` of each package themselves (the
@@ -312,7 +347,7 @@ def program_output(ran):
         lines = text.splitlines()
         running = [at for at, l in enumerate(lines) if re.match(r"^\s*Running `", l)]
         lines = [l for l in lines[running[-1] + 1 if running else 0:] if not STATUS.match(l)]
-        text = "\n".join(lines).replace("target-ref", "target")
+        text = "\n".join(lines).replace("target-ref", "target").replace("target-scratch", "target")
         # A panic message has the id of the thread, and a logger the time.
         text = re.sub(r"' \(\d+\) panicked", "' panicked", text)
         return re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?", "<time>", text)
@@ -335,7 +370,7 @@ def test_results(ran):
     # A doc test in a generated file is named by its path, in a directory cargo names
     # with a hash of how it was built (`build/<package>-<hash>/out` in cargo's first layout,
     # `build/<package>/<hash>/out` in its second).
-    names = re.sub(r"([-/])[0-9a-f]{16}/", r"\1HASH/", ran.stdout.replace("target-ref", "target"))
+    names = re.sub(r"([-/])[0-9a-f]{16}/", r"\1HASH/", ran.stdout.replace("target-ref", "target").replace("target-scratch", "target"))
     # A test's result is not always on the line of its name: what a program started by
     # another test prints lands between the two. So the names are read from the lines and
     # the failures from the list at the end, and the totals say the rest.
@@ -349,6 +384,29 @@ def test_results(ran):
     passed, failing, ignored, measured = (sum(int(it[at]) for it in ended) for at in range(1, 5))
     totals = (sum(it[0] != "ok" for it in ended), passed + len(kept), failing, ignored, measured)
     return ran.returncode, tests, totals
+
+
+def test_verdict(results, known=frozenset()):
+    """`None` when a test run, as `test_results` reads it, passed by its own tests: every test
+    that ran passed but those in `known` (by libtest's name), which failed. Else what is wrong:
+    a test that failed and is not in `known`; one in `known` that passed or did not run (take it
+    out); a run that exited other than 0 with no test failed (a test program did not build, or
+    crashed); a run in which nothing ran."""
+    code, tests, totals = results
+    failed = {name for name, outcome in tests if outcome == "FAILED"}
+    ran = {name for name, outcome in tests if outcome == "ran"} | failed
+    wrong = []
+    if new := sorted(failed - set(known)):
+        wrong.append(f"{len(new)} tests failed: {', '.join(new[:8])}")
+    if passed := sorted((set(known) & ran) - failed):
+        wrong.append(f"known to fail, and passed: {', '.join(passed[:8])}")
+    if gone := sorted(set(known) - ran):
+        wrong.append(f"known to fail, and did not run: {', '.join(gone[:8])}")
+    if code != 0 and not failed:
+        wrong.append(f"exited {code} with no test failed")
+    if not ran and not totals[1]:
+        wrong.append("no test ran")
+    return "; ".join(wrong) or None
 
 
 def difference(ours, theirs):

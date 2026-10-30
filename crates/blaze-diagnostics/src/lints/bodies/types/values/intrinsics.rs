@@ -25,7 +25,7 @@ impl LatePass for EnumIntrinsicsNonEnums {
     const LINTS: LintSet = lint_set(["enum_intrinsics_non_enums"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();
         let Expr::Call { callee, args } = store.expr(expr) else { return };
         // `mem::discriminant` takes one argument, `mem::variant_count` none.
@@ -43,7 +43,7 @@ impl LatePass for EnumIntrinsicsNonEnums {
             return;
         };
         let TyKind::FnDef(_, fn_args) = util::ty(b, callee).kind() else { return };
-        let ty_param = fn_args.type_at(0);
+        let ty_param = fn_args.skip_binder().type_at(0);
         if !is_non_enum(ty_param) {
             return;
         }

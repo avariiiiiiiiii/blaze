@@ -431,9 +431,18 @@ impl<T: Eq + Hash> Relocs<T> {
     where
         T: Clone,
     {
-        let rows: Vec<Relocation<T>> =
-            // clone: off the hot path, as above
-            self.iter().map(|it| Relocation { target: it.target.clone(), ..it }).chain([reloc]).collect();
+        let rows: Vec<Relocation<T>> = self
+            .iter()
+            .map(|it| Relocation {
+                at: it.at,
+                kind: it.kind,
+                // clone: off the hot path, as above
+                target: it.target.clone(),
+                addend: it.addend,
+            })
+            .chain([reloc])
+            // alloc: off the hot path, as above
+            .collect();
         // alloc: off the hot path, as above
         *self = rows.into_iter().collect();
     }

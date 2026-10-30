@@ -27,14 +27,14 @@ impl LatePass for ImplicitAutorefs {
     const LINTS: LintSet = lint_set(["dangerous_implicit_autorefs"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Ref, ExprKind::Index, ExprKind::MethodCall, ExprKind::Field]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         if let Some(found) = check(b, expr) {
             out.push(found);
         }
     }
 }
 
-fn check(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
+fn check(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Found> {
     let store = b.store();
     let mut is_coming_from_deref = false;
     let inner = match store.expr(expr) {
@@ -113,7 +113,7 @@ fn check(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
 
 /// rustc's `peel_place_mappers`: through field accesses and indexing to the place they
 /// project from.
-fn peel_place_mappers(b: &BodyCx<'_, '_>, mut expr: ExprId) -> ExprId {
+fn peel_place_mappers(b: &BodyCx<'_, '_, '_>, mut expr: ExprId) -> ExprId {
     loop {
         match b.store().expr(expr) {
             Expr::Index { base, .. } => expr = base,

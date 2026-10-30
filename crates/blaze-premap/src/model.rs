@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 
 use blaze_codegen::{CompiledFunction, Init, InstanceKey, RelocKind, Static, Target};
 use blaze_ids::ContentId;
-use blaze_inproc::TlsReserve;
 use blaze_items::ItemKey;
 use blaze_link::NativeKind;
 use rustc_hash::FxHashMap;
@@ -21,7 +20,7 @@ use crate::prelink::{
     StaticAt, Tls,
 };
 use crate::split::WorkspacePart;
-use crate::start::{self, Start, WorkspaceLink, workspace_tls_offset};
+use crate::start::{self, Start, TlsReserve, WorkspaceLink, workspace_tls_offset};
 use crate::table::{Def, Kind, Strength, SymbolId};
 
 /// Every host's mapping granule divides it, so the tests' images map on every host.
@@ -255,9 +254,9 @@ impl Prelink for Model {
     type Placed = Prelinked;
 
     fn prelink(&self, request: &Request<'_>) -> Result<Prelinked, PremapError> {
-        assert_eq!(request.tls_bias, RESERVE.bias, "the model's run keeps its thread-locals at its bias");
-        let mut layout = place(request.base, 0, request.functions, request.statics);
-        let names = layout.names(request.names)?;
+        assert_eq!(request.link.tls_bias, RESERVE.bias, "the model's run keeps its thread-locals at its bias");
+        let mut layout = place(request.link.base, 0, request.link.functions, request.link.statics);
+        let names = layout.names(request.link.names)?;
         let local = |target: &Target| layout.local(target).map(|it| it.0);
         let resolved: Vec<_> = layout.sites.iter().map(|it| (it.target.clone(), local(&it.target))).collect();
         layout.apply(&|target| resolved.iter().find(|it| it.0 == *target).and_then(|it| it.1))?;
@@ -274,7 +273,7 @@ impl Prelink for Model {
             statics: layout.statics,
             names: names.into_iter().map(|(name, def)| PlacedName { name, def }).collect(),
             binds,
-            libraries: libraries(request.natives),
+            libraries: libraries(request.link.natives),
             init: layout.init,
             fini: Vec::new(),
             tls: layout.tls,

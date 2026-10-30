@@ -131,7 +131,7 @@ impl Memo for NoMemo {
 }
 
 /// The memory the plane may grant, and what says so, for the error of a task that cannot fit.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] // clone: a plane's config, at setup and in tests
 pub struct Budget {
     pub bytes: u64,
     pub from: String,
@@ -149,7 +149,8 @@ pub struct PlaneConfig {
     pub starve_after: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))] // clone: the differential tests feed one input to two planes
 pub enum PlaneInput {
     /// A request begins. Its `weight` is its share of the threads against the others'; with
     /// `keep_going` false its first failure skips what of it has not started. An `idle`
@@ -218,7 +219,8 @@ impl PlaneInput {
 /// Nodes with the ids `first`, `first + 1`, and on, as columns: the names one string, the deps
 /// one array, each cut by offsets. Built by [`Nodes::push`], or read from a trace and checked,
 /// so the columns always agree.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))] // clone: inside `PlaneInput`, for the differential tests
 #[serde(try_from = "Columns")]
 pub struct Nodes {
     first: NodeId,

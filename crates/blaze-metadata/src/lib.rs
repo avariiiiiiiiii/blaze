@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use blaze_manifest::config::RegistryConfig;
-use blaze_manifest::config::schema::{CargoResolverConfig, FeatureUnification};
+use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
 use blaze_manifest::metadata::{SerializedPackage, export, export_package, root_manifest};
 use blaze_manifest::files::Disk;
@@ -672,11 +672,7 @@ fn resolving_with<R>(
     let members: Vec<&Summary> = member_summaries.iter().collect();
     let current =
         ws.members().position(|(path, _)| path == ws.current_manifest()).map(|at| member_ids[at]);
-    let behavior = match ws.resolve_behavior() {
-        blaze_manifest::features::ResolveBehavior::V1 => ResolveBehavior::V1,
-        blaze_manifest::features::ResolveBehavior::V2 => ResolveBehavior::V2,
-        blaze_manifest::features::ResolveBehavior::V3 => ResolveBehavior::V3,
-    };
+    let behavior = ws.resolve_behavior();
     let new_cli_feature_behavior = behavior != ResolveBehavior::V1 || ws.is_virtual();
     let members_of = || Members { members: &members, current, new_cli_feature_behavior };
     let member_rust_versions: Vec<RustVersion> = ws
@@ -711,7 +707,7 @@ fn resolving_with<R>(
         Some(build) if !build.dev_units => HasDevUnits::No,
         _ => HasDevUnits::Yes,
     };
-    let unification = feature_unification(&ctx.config)?;
+    let unification = summary::feature_unification(&ctx.config)?;
     let every_member: Vec<PackageIdSpec>;
     let resolved_for = match unification {
         FeatureUnification::Workspace => {
@@ -785,17 +781,6 @@ fn resolving_with<R>(
         config: &ctx.config,
     };
     then(resolved, serialized, &ids, &unused_patches)
-}
-
-/// `resolver.feature-unification`, which nightly cargo reads only with `-Zfeature-unification`
-/// (`unstable.feature-unification`); `selected` otherwise.
-fn feature_unification(config: &Config<Disk>) -> Result<FeatureUnification> {
-    let resolver = config.get::<CargoResolverConfig>("resolver")?;
-    let unstable = config.get::<Option<bool>>("unstable.feature-unification")?;
-    Ok(match (unstable, resolver.feature_unification) {
-        (Some(true), Some(it)) => it,
-        _ => FeatureUnification::Selected,
-    })
 }
 
 /// What `cargo metadata` prints of `resolved`, and what of it a build of its members reads.

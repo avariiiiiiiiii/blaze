@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+use blaze_format::cursor::Reader;
 use cranelift_codegen::{
     CompiledCode, Context, FinalizedMachExceptionHandler,
     gimli::{
@@ -563,22 +564,25 @@ pub(super) fn write_fde(
 /// Where the instructions of the FDE after the CIE in `written` are: after its length, its
 /// CIE pointer, and its 8-byte address and length.
 fn fde_instructions(written: &[u8]) -> Result<std::ops::Range<usize>, String> {
-    let length = |at: usize| -> Result<usize, String> {
-        let bytes = written.get(at..at + 4).ok_or("the entry ends early")?;
-        match u32::from_le_bytes(bytes.try_into().expect("four bytes")) {
-            // alloc: an error
-            u32::MAX => Err("a 64-bit entry".to_owned()),
-            length => Ok(at + 4 + length as usize),
-        }
-    };
-    let fde = length(0)?;
-    let end = length(fde)?;
-    let start = fde + 4 + 4 + 16;
-    if start > end || end != written.len() {
-        // alloc: an error
-        return Err("not one CIE and one FDE".to_owned());
+    let mut read = Reader::new(written);
+    eh_entry(&mut read)?;
+    let mut fde = eh_entry(&mut read)?;
+    let not_one = || "not one CIE and one FDE".to_owned(); // alloc: an error
+    fde.skip(4 + 16).map_err(|_| not_one())?;
+    if !read.is_done() {
+        return Err(not_one());
     }
-    Ok(start..end)
+    let end = read.at();
+    Ok(end - fde.left()..end)
+}
+
+/// The body of the `.eh_frame` entry whose 32-bit length is next.
+pub(crate) fn eh_entry<'a>(at: &mut Reader<'a>) -> Result<Reader<'a>, String> {
+    let length = at.u32()?;
+    if length == u32::MAX {
+        return Err("a 64-bit entry".to_owned()); // alloc: the error's message
+    }
+    Ok(Reader::new(at.take(length as usize)?))
 }
 
 /// A gimli writer that appends to a vector it borrows, little-endian as every target v2

@@ -3,7 +3,7 @@
 //! with no registration in the kernel. File calls block, so they run on threads of the
 //! driver's own; watches and journals are FSEvents streams on dispatch queues of their own.
 //! Both hand their completions back through a bounded channel and wake the kqueue with an
-//! `EVFILT_USER` trigger.
+//! `EVFILT_USER` trigger, fired once for all the hand-backs between two drains.
 //!
 //! Every registration carries a handle of the driver's in `udata`: the bits of a
 //! [`blaze_mem::Handle`] into a slab of what each names, so an event of a registration that
@@ -43,6 +43,7 @@ use crate::{
     Address, Command, Completion, Confine, Conn, Cursor, Done, Driver, Effect, FileName, IoError,
     Tag,
     fsevents::{self, Tell},
+    handoff::Wake,
     net, process,
     wheel::{self, Wheel},
 };
@@ -90,9 +91,15 @@ struct Notify {
     kq: OwnedFd,
     files: Sender<Completion>,
     watched: Sender<Completion>,
+    /// Whether a hand-back since the driver last drained the channels has fired the trigger:
+    /// a batch of them costs one `kevent`, not one each.
+    woke: Wake,
     /// What the file threads allocated doing their effects and handing them back.
     #[cfg(test)]
     file_allocations: std::sync::atomic::AtomicU64,
+    /// Triggers fired.
+    #[cfg(test)]
+    triggers: std::sync::atomic::AtomicU64,
 }
 
 impl Notify {
@@ -128,9 +135,15 @@ impl Notify {
         }
     }
 
-    /// Wakes the polling thread: a channel has completions.
+    /// After a hand-back into a channel: wakes the polling thread, unless one since its last
+    /// drain ([`Kqueue::take`]) has. The trigger fired stays pending until a wait takes it, and
+    /// every wait is followed by a drain before the next, so no hand-back is left unwoken.
     fn wake(&self) {
-        _ = self.change(TRIGGER as usize, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, TRIGGER);
+        if self.woke.wake() {
+            #[cfg(test)]
+            self.triggers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            _ = self.change(TRIGGER as usize, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, TRIGGER);
+        }
     }
 }
 
@@ -278,6 +291,9 @@ pub struct Kqueue {
     workers: Vec<JoinHandle<()>>,
     // dyn: the platform's sandbox, given once at setup and asked once per spawn.
     confine: Option<Arc<dyn Confine>>,
+    /// Where each sandboxed spawn's own directory is made: `root/.blaze-spawn` unless
+    /// [`Kqueue::scratch`] says otherwise.
+    spawn_dirs: PathBuf,
     /// Where a process's output is read into.
     buffer: Vec<u8>,
     /// Made with the next wait.
@@ -326,8 +342,11 @@ impl Kqueue {
             kq,
             files: files_done,
             watched: watched_done,
+            woke: Wake::new(),
             #[cfg(test)]
             file_allocations: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            triggers: std::sync::atomic::AtomicU64::new(0),
         });
         notify.change(
             TRIGGER as usize,
@@ -348,7 +367,10 @@ impl Kqueue {
             })
             // alloc: setup, once per driver.
             .collect::<io::Result<Vec<_>>>()?;
-        let tags = || FxHashMap::with_capacity_and_hasher(TAGS, Default::default());
+        fn tags<V>() -> FxHashMap<Tag, V> {
+            FxHashMap::with_capacity_and_hasher(TAGS, Default::default())
+        }
+        let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
         Ok(Kqueue {
             start: Instant::now(),
             root,
@@ -360,6 +382,7 @@ impl Kqueue {
             at_threads: 0,
             workers,
             confine: None,
+            spawn_dirs,
             buffer: vec![0; 64 << 10], // alloc: setup, once per driver.
             // alloc: setup, once per driver: the lists of a wait at their usual most.
             changes: Vec::with_capacity(EVENTS),
@@ -388,6 +411,14 @@ impl Kqueue {
     pub fn confined(mut self, confine: Arc<dyn Confine>) -> Kqueue {
         self.confine = Some(confine);
         self
+    }
+
+    /// The driver, making each sandboxed spawn's own directory under `dir`, made here.
+    pub fn scratch(mut self, dir: impl Into<PathBuf>) -> io::Result<Kqueue> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        self.spawn_dirs = dir;
+        Ok(self)
     }
 
     /// A change made with the next wait; a failure of it comes back as an event of `id`'s with
@@ -560,7 +591,7 @@ impl Kqueue {
 
     fn spawn(&mut self, command: Box<Command>, tag: Tag) -> io::Result<()> {
         let process::Started { pid, stdin, stdout, stderr, finish } =
-            process::start(&self.root, command, self.confine.as_ref())?;
+            process::start(&self.spawn_dirs, command, self.confine.as_ref())?;
         let spawn = self.spawns.insert(Spawned {
             tag,
             pid,
@@ -701,14 +732,15 @@ impl Kqueue {
             self.disown(id);
         }
         let Spawned { tag, pid, out, err, failed, finish, .. } = spawned;
-        // alloc: once per spawn, to name it in a failure; its exit allocates far more.
-        let program = finish.command.program.display().to_string();
+        // alloc: an error path; `exited` names the program in its own errors.
+        let failed = failed.map(|error| format!("{}: {error}", finish.command.program.display()));
         let ended = finish.exited(pid, out, err);
         let done = match (ended, failed) {
             // alloc: the exit's payload.
             (Ok(exit), None) => Done::Exited(Box::new(exit)),
             // alloc: an error path.
-            (Ok(_), Some(error)) | (Err(error), _) => Done::Failed(IoError(format!("{program}: {error}"))),
+            (Err(error), _) => Done::Failed(IoError(error.to_string())),
+            (Ok(_), Some(why)) => Done::Failed(IoError(why)),
         };
         self.ready.push(Completion { tag, done });
     }
@@ -1084,6 +1116,9 @@ impl Kqueue {
     /// (each making room at the threads for one from the backlog), then the watches'.
     fn take(&mut self, out: &mut Vec<Completion>) {
         out.append(&mut self.ready);
+        // Cleared before the channels are read: a hand-back that finds it set was made before
+        // this, so the reads below see it (`Wake`, model-checked in `handoff`).
+        self.notify.woke.drain();
         while let Ok(completion) = self.files.try_recv() {
             self.at_threads -= 1;
             out.push(completion);
@@ -1262,11 +1297,12 @@ fn no_connection(conn: Conn) -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, format!("no connection {conn:?}"))
 }
 
+/// `O_NONBLOCK` set on `fd`: one `FIONBIO`, which sets the flag `fcntl`'s `F_SETFL` would,
+/// where a read-modify-write of the flags is two calls.
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    // SAFETY: an open descriptor.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    // SAFETY: as above.
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+    let mut on: libc::c_int = 1;
+    // SAFETY: an open descriptor and an int the call reads.
+    if unsafe { libc::ioctl(fd, libc::FIONBIO, &raw mut on) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -1678,6 +1714,58 @@ mod tests {
         assert!(bytes == wanted, "appended out of order");
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// File effects the threads all hand back while the driver does not drain fire the
+    /// trigger once, not once each; the next batch, after a drain, once more; and every
+    /// completion is taken.
+    #[test]
+    fn a_batch_of_file_effects_wakes_the_driver_once() {
+        const N: usize = 64;
+        let root = dir("one-wake");
+        std::fs::write(root.join("f"), b"bytes").unwrap();
+        let mut driver = Kqueue::new(&root, 4).unwrap();
+        let file = name("f");
+        for batch in 1..=3u64 {
+            let mut effects: Vec<Effect> =
+                (0..N as u64).map(|at| Effect::Stat { file: file.clone(), tag: Tag(at) }).collect();
+            driver.submit(&mut effects);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while driver.files.len() < N {
+                assert!(Instant::now() < deadline, "the threads handed back {} of {N}", driver.files.len());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let triggers = driver.notify.triggers.load(Ordering::Relaxed);
+            assert_eq!(triggers, batch, "batch {batch}: {triggers} triggers in all for {N} hand-backs each");
+            let mut out = Vec::with_capacity(N);
+            poll_for(&mut driver, &mut out, N);
+            assert_eq!(out.len(), N);
+            assert!(out.iter().all(|it| matches!(it.done, Done::Stat(Some(_)))), "{out:?}");
+            assert_eq!(driver.in_flight(), 0);
+        }
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `FIONBIO` sets the flag `fcntl` reads back, on both ends of a pipe; a read of an empty
+    /// one then would block.
+    #[test]
+    fn a_descriptor_made_nonblocking_has_the_flag_fcntl_reads() {
+        use std::os::fd::AsRawFd;
+        let (read, write) = std::io::pipe().unwrap();
+        for fd in [read.as_raw_fd(), write.as_raw_fd()] {
+            // SAFETY: an open descriptor.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+            set_nonblocking(fd).unwrap();
+            // SAFETY: as above.
+            assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+        }
+        let mut byte = [0u8; 1];
+        // SAFETY: an open descriptor and a buffer of the length given.
+        let n = unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+        let error = io::Error::last_os_error();
+        assert_eq!((n, error.kind()), (-1, io::ErrorKind::WouldBlock));
+        drop(write);
     }
 
     #[test]

@@ -10,9 +10,14 @@
 use base_db::Db;
 use blaze_items::ItemId;
 use hir::{
-    Adt, AsAssocItem as _, AssocItem, AssocItemContainer, HasVisibility as _, InFile, ModuleDef, StructKind, Variant,
+    Adt, AsAssocItem as _, AssocItem, AssocItemContainer, HasAttrs as _, HasVisibility as _, InFile, ModuleDef,
+    StructKind, Variant,
 };
-use syntax::view::{self as ast, AstNode as _, HasGenericArgs as _, HasName as _, Node};
+use hir_def::attrs::stability::{DeprecationEntry, Stability};
+use syntax::{
+    SyntaxKind,
+    view::{self as ast, AstNode as _, HasGenericArgs as _, HasName as _, Node},
+};
 
 use crate::cx::Cx;
 
@@ -134,6 +139,25 @@ impl Def {
         visibility == hir::Visibility::Public
     }
 
+    /// rustc's `lookup_deprecation_entry` of `self`, as hir-def reads it: a constructor
+    /// inherits its variant's.
+    pub(super) fn deprecation(self, db: &Db) -> Option<DeprecationEntry<'_>> {
+        match self {
+            Def::Item(it) => it.deprecation(db),
+            Def::Field(it) => it.deprecation(db),
+            Def::Ctor(it) => it.deprecation(db),
+        }
+    }
+
+    /// rustc's `lookup_stability` of `self`, as hir-def reads it.
+    pub(super) fn stability(self, db: &Db) -> Option<&Stability> {
+        match self {
+            Def::Item(it) => it.stability(db),
+            Def::Field(it) => it.stability(db),
+            Def::Ctor(it) => it.stability(db),
+        }
+    }
+
     /// The item whose signature holds what `self` is declared with, for a fact.
     pub(super) fn item_id(self, db: &Db) -> Option<ItemId> {
         Some(match self.item(db) {
@@ -179,6 +203,73 @@ impl Def {
                 ModuleDef::Macro(it) => node(cx.vsema.source(it)),
                 ModuleDef::BuiltinType(_) => None,
             },
+        }
+    }
+}
+
+/// An item-like of this crate as hir reads its attributes: what a use is in
+/// (`hir_get_parent_item`).
+#[derive(Clone, Copy)]
+pub(super) enum ItemLike {
+    Def(ModuleDef),
+    Field(hir::Field),
+    Impl(hir::Impl),
+    Use(hir::UseDecl),
+    ExternBlock(hir::ExternBlock),
+    ExternCrate(hir::ExternCrateDecl),
+}
+
+impl ItemLike {
+    /// The item-like written at `node`: an item, an associated or foreign item, a field, or the
+    /// crate root's file. None for any other node.
+    pub(super) fn at<'db>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>) -> Option<ItemLike> {
+        macro_rules! def {
+            ($ast:ident) => {
+                cx.vsema.to_def2(node.with_value(ast::$ast::cast(node.value)?))?
+            };
+        }
+        Some(match node.value.kind() {
+            SyntaxKind::SOURCE_FILE => ItemLike::Def(ModuleDef::Module(def!(SourceFile))),
+            SyntaxKind::MODULE => ItemLike::Def(ModuleDef::Module(def!(Module))),
+            SyntaxKind::FN => ItemLike::Def(ModuleDef::Function(def!(Fn))),
+            SyntaxKind::STRUCT | SyntaxKind::ENUM | SyntaxKind::UNION => ItemLike::Def(ModuleDef::Adt(def!(Adt))),
+            SyntaxKind::VARIANT => ItemLike::Def(ModuleDef::EnumVariant(def!(Variant))),
+            SyntaxKind::CONST => ItemLike::Def(ModuleDef::Const(def!(Const))),
+            SyntaxKind::STATIC => ItemLike::Def(ModuleDef::Static(def!(Static))),
+            SyntaxKind::TRAIT => ItemLike::Def(ModuleDef::Trait(def!(Trait))),
+            SyntaxKind::TYPE_ALIAS => ItemLike::Def(ModuleDef::TypeAlias(def!(TypeAlias))),
+            SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => ItemLike::Def(ModuleDef::Macro(def!(Macro))),
+            SyntaxKind::RECORD_FIELD => ItemLike::Field(def!(RecordField)),
+            SyntaxKind::TUPLE_FIELD => ItemLike::Field(def!(TupleField)),
+            SyntaxKind::IMPL => ItemLike::Impl(def!(Impl)),
+            SyntaxKind::USE => ItemLike::Use(def!(Use)),
+            SyntaxKind::EXTERN_BLOCK => ItemLike::ExternBlock(def!(ExternBlock)),
+            SyntaxKind::EXTERN_CRATE => ItemLike::ExternCrate(def!(ExternCrate)),
+            _ => return None,
+        })
+    }
+
+    /// rustc's `lookup_deprecation_entry`, as hir-def reads it.
+    pub(super) fn deprecation(self, db: &Db) -> Option<DeprecationEntry<'_>> {
+        match self {
+            ItemLike::Def(it) => it.deprecation(db),
+            ItemLike::Field(it) => it.deprecation(db),
+            ItemLike::Impl(it) => it.deprecation(db),
+            ItemLike::Use(it) => it.deprecation(db),
+            ItemLike::ExternBlock(it) => it.deprecation(db),
+            ItemLike::ExternCrate(it) => it.deprecation(db),
+        }
+    }
+
+    /// rustc's `lookup_stability`, as hir-def reads it.
+    pub(super) fn stability(self, db: &Db) -> Option<&Stability> {
+        match self {
+            ItemLike::Def(it) => it.stability(db),
+            ItemLike::Field(it) => it.stability(db),
+            ItemLike::Impl(it) => it.stability(db),
+            ItemLike::Use(it) => it.stability(db),
+            ItemLike::ExternBlock(it) => it.stability(db),
+            ItemLike::ExternCrate(it) => it.stability(db),
         }
     }
 }
@@ -422,11 +513,6 @@ pub(super) fn is_def_parent(node: Node<'_>) -> bool {
 /// at the crate root.
 pub(super) fn def_parent<'db>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>) -> Option<InFile<Node<'db>>> {
     parent(cx, node, is_def_parent)
-}
-
-/// [`def_parent`], or the `extern` block in between: what deprecation is inherited from.
-pub(super) fn attr_parent<'db>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>) -> Option<InFile<Node<'db>>> {
-    parent(cx, node, |it| is_def_parent(it) || it.kind() == syntax::SyntaxKind::EXTERN_BLOCK)
 }
 
 fn parent<'db>(

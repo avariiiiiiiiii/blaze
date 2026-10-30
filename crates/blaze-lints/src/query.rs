@@ -16,9 +16,15 @@ use hir_def::{
     nameres::crate_def_map, visibility::Visibility,
 };
 use rustc_hash::FxHashSet;
-use syntax::TextRange;
+use syntax::{TextRange, TextSize};
 
-use crate::{blaze, check, conf::Conf, diag::Diag, lints};
+use crate::{
+    blaze, check,
+    conf::Conf,
+    diag::Diag,
+    famous::{self, Famous},
+    lints,
+};
 
 /// The lints a query runs, which may be above `allow` where it looks, and the configuration
 /// they read.
@@ -98,6 +104,72 @@ pub(crate) fn item_lints(
     set: LintSet,
 ) -> ItemLints {
     check::lint_items(db, file, krate, set.on(db), set.conf(db))
+}
+
+/// A lint name written in a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Named {
+    pub(crate) at: TextRange,
+    /// What the attribute it is written in is on; the name itself when it is in none.
+    pub(crate) owner: TextRange,
+    pub(crate) lints: lints::On,
+}
+
+/// The lint names a file's text writes, with every lint they name.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct FileNames {
+    pub(crate) names: Box<[Named]>,
+    /// The union of the names' lints.
+    pub(crate) on: lints::On,
+}
+
+/// The lint names `file` writes: one scan of its text, again only when the text changes.
+#[salsa::tracked(returns(ref))]
+pub(crate) fn lint_names(db: &Db, file: EditionedFileId) -> FileNames {
+    check::names_of(db, file)
+}
+
+/// A file of a crate's modules, as the driver reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModuleFile {
+    pub(crate) file: EditionedFileId,
+    /// The file and range of the `mod` item declaring its module, for all but the root.
+    pub(crate) declared: Option<(EditionedFileId, TextRange)>,
+}
+
+/// A body the driver lints, and where the tree of its query is in its file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BodyAt {
+    pub(crate) def: DefWithBodyId,
+    pub(crate) file: EditionedFileId,
+    /// Where the body's anchor starts in the file; 0 for a body a macro writes.
+    pub(crate) offset: TextSize,
+    /// Its item as written in the file, or the outermost macro call writing it.
+    pub(crate) item: TextRange,
+}
+
+/// What the driver walks of a crate: the files of its modules, each once, in the order of its
+/// modules, and its bodies in the order they are linted.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Plan {
+    pub(crate) files: Box<[ModuleFile]>,
+    pub(crate) bodies: Box<[BodyAt]>,
+}
+
+/// The [`Plan`] of `krate`: from its def map, the bodies' blocks and their anchors, so a run
+/// with nothing changed is one hit here, not several per body.
+#[salsa::tracked(returns(ref))]
+pub(crate) fn lint_plan(db: &Db, krate: base_db::Crate) -> Plan {
+    check::plan_of(db, krate)
+}
+
+/// What `krate` resolves each path of [`famous::KNOWN`] to, by index: once per crate, so a
+/// lint's lookup is a hash of its path and one load, not a walk of `std`'s scopes.
+#[salsa::tracked(returns(ref))]
+pub(crate) fn famous_defs(db: &Db, krate: base_db::Crate) -> Box<[Option<hir::ModuleDef>]> {
+    let famous = Famous::new(db, hir::Crate::from(krate));
+    // alloc: the query's value, once per crate
+    famous::KNOWN.iter().map(|path| famous.find(path)).collect()
 }
 
 /// What of a crate another crate can name: rustc's `effective_visibilities.is_exported`.

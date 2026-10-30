@@ -63,18 +63,21 @@ impl Inputs for World {
         Ok(None)
     }
 
-    fn env(&mut self, name: &OsStr) -> Option<OsString> {
-        self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+    fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+        self.env.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())
     }
 
-    fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-        let mut all = self.env.clone();
-        all.sort();
-        all
+    fn env_all(&mut self) -> &[(OsString, OsString)] {
+        self.env.sort();
+        &self.env
     }
 
-    fn names(&mut self, _: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
-        Ok(None)
+    fn names(&mut self, _: &Path, _: &mut blaze_usercode::trace::Names<'_>) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn entry(&mut self, _: &Path) -> Result<blaze_usercode::trace::Entry, String> {
+        Ok(blaze_usercode::trace::Entry::Missing)
     }
 }
 

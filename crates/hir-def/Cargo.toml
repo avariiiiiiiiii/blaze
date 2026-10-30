@@ -47,8 +47,10 @@ span.workspace = true
 thin-vec.workspace = true
 syntax-bridge.workspace = true
 blaze-format.workspace = true
+blaze-dbsp.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
+inventory.workspace = true
 blaze-phf.workspace = true
 blaze-query.workspace = true
 
@@ -60,7 +62,7 @@ unicode-ident.workspace = true
 blaze-alloc-count.workspace = true
 expect-test.workspace = true
 fst = { version = "0.4.7", default-features = false }
-proptest.workspace = true
+hegeltest.workspace = true
 
 # local deps
 test-utils.workspace = true

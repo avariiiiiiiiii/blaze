@@ -9,7 +9,6 @@
 //! own state ([`Writer`]), behind one lock that no query takes.
 
 use std::{
-    collections::BTreeMap,
     fmt,
     ops::Range,
     path::{Path, PathBuf},
@@ -26,7 +25,7 @@ use rustc_hash::FxHashMap;
 use salsa::{Durability, Setter};
 use smallvec::SmallVec;
 use triomphe::Arc;
-use vfs::{AbsPath, AbsPathBuf, FileId, VfsPath};
+use vfs::{AbsPath, AbsPathBuf, FileId, VfsPath, file_set::FileSet};
 
 use crate::{
     Crate, Db, FileSourceRootInput, FileText, IncludedFile, InputId, ReadError, SourceRoot,
@@ -36,6 +35,9 @@ use crate::{
     table::{Column, Log, Table, hash_of},
     view::ViewIndex,
 };
+
+#[cfg(test)]
+mod tests;
 
 /// The source roots a setter changed: one, or a few for a file several roots have.
 pub(crate) type Roots = SmallVec<[SourceRootId; 4]>;
@@ -112,9 +114,17 @@ pub(crate) struct Writer {
     pub(crate) views: FxHashMap<AbsPathBuf, ViewIndex>,
     /// `by_path` as queries read it, across source roots ([`crate::named`]).
     pub(crate) named: Named,
+    /// An empty source root, which a root's input holds while its own is edited out of it.
+    spare_root: Option<Arc<SourceRoot>>,
 }
 
 impl Writer {
+    pub(crate) fn spare_root(&mut self) -> Arc<SourceRoot> {
+        // alloc: once per database.
+        let spare = self.spare_root.get_or_insert_with(|| Arc::new(SourceRoot::new_local(FileSet::default())));
+        Arc::clone(spare)
+    }
+
     /// The source roots that have `file`.
     pub(crate) fn roots_of(&self, file: FileId) -> &[SourceRootId] {
         self.in_roots.get(file).map_or(&[], |it| it.as_slice())
@@ -216,6 +226,11 @@ impl fmt::Debug for Files {
 impl Files {
     pub(crate) fn lock(&self) -> MutexGuard<'_, Writer> {
         self.writer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Every file's text, by file ID.
+    pub(crate) fn texts(&self) -> impl Iterator<Item = FileText> + '_ {
+        self.text.iter().map(|(_, text)| text)
     }
 
     pub fn file_text(&self, file_id: FileId) -> FileText {
@@ -390,7 +405,7 @@ impl Files {
     }
 
     /// The content of the source root `id` as `root` has it, noting which of its files and
-    /// paths it has. Buckets whose files are what they were keep their hashes.
+    /// paths it has. Nodes whose files are what they were keep their hashes.
     fn index_root(
         &self,
         writer: &mut Writer,
@@ -401,14 +416,16 @@ impl Files {
     ) -> RootContent {
         let old = writer.root_contents.remove(&id);
         if let Some(old) = &old {
-            for file in old.keys.keys() {
-                if let Some(roots) = writer.in_roots.get_mut(*file) {
+            for file in old.files() {
+                if let Some(roots) = writer.in_roots.get_mut(file) {
                     roots.retain(|it| *it != id);
                 }
             }
         }
         let mut files = Vec::with_capacity_in(root.len(), frame);
+        let mut ids = 0;
         for file in root.iter() {
+            ids += 1;
             let Some(path) = root.path_for_file(&file) else { continue };
             // A path two files were given is the last one's.
             if root.file_for_path(path) != Some(&file) {
@@ -421,7 +438,11 @@ impl Files {
             }
             files.push((file, content::path_key(path), self.entry_content(db, file)));
         }
-        RootContent::new(root.is_library, files, old.as_ref(), frame)
+        // Every file whose path names it back, and as many paths as files.
+        let one_to_one = files.len() == ids && ids == root.len();
+        let mut content = RootContent::new(root.is_library, files, old.as_ref(), frame);
+        content.one_to_one = one_to_one;
+        content
     }
 
     /// Has the files under `base` read from where they are under `over` from now on, but for
@@ -536,7 +557,7 @@ impl Files {
         std::fs::read(self.on_disk(path.as_ref())).map(Into::into).map_err(|it| ReadError::of(&it))
     }
 
-    fn find_included(&self, path: &AbsPath) -> Option<IncludedFile> {
+    pub(crate) fn find_included(&self, path: &AbsPath) -> Option<IncludedFile> {
         let at = self.included.find(hash_of(path), |it| it.path.as_path() == path)?;
         Some(self.included.get(at).file)
     }
@@ -789,194 +810,538 @@ pub(crate) fn index_file(
     }
 }
 
-/// The files of one source root as its content ID is made of them (see [`SourceRoot::DOMAIN`]),
-/// with the hash of each bucket kept and only those a change touches hashed again.
+/// The files of one source root as its content ID is made of them (see [`SourceRoot::DOMAIN`]):
+/// a trie of [`SourceRoot::FANOUT`] ways by the hex digits of each path's
+/// [`SourceRoot::PATH_DOMAIN`] hash, with each node's hash kept, so a change hashes again its
+/// leaf and the nodes above it: `O(log n)` of a root of `n` files. Its shape is a function of
+/// its files alone (a node is a leaf while it has at most [`SourceRoot::LEAF`] files, or at the
+/// last digit), so equal files give an equal ID however they were edited in.
 #[derive(Debug)]
 pub(crate) struct RootContent {
     pub(crate) is_library: bool,
-    /// Each file's bucket and key (its path, encoded).
-    keys: FxHashMap<FileId, (u8, Box<[u8]>)>,
-    // BTreeMap: hashed in key order into the root's content ID, edited in place between hashes.
-    buckets: Vec<BTreeMap<Box<[u8]>, ContentId>>,
-    hashes: Vec<ContentId>,
-    /// The buckets whose hash is out of date, a bit each.
-    dirty: u64,
-    /// The root's content ID, when `dirty` is 0.
+    /// Whether the root's [`FileSet`] names each of its files at one path and each path for
+    /// one file, as every set a `vfs::Vfs` partition makes does: then a file is taken out of
+    /// it in place ([`Files::set_view_root`]).
+    pub(crate) one_to_one: bool,
+    /// Each file's entry in `entries`.
+    files: FxHashMap<FileId, u32>,
+    entries: Vec<Entry>,
+    /// Entries no file has, for the next file to take.
+    free_entries: Vec<u32>,
+    /// The trie; its root is node 0, which is never freed.
+    nodes: Vec<Node>,
+    free_nodes: Vec<u32>,
+    /// Whether `content` is out of date though node 0's hash may not be: `is_library` changed.
+    stale: bool,
+    /// The root's content ID, when neither `stale` nor node 0 is out of date.
     content: ContentId,
 }
 
-const _: () = assert!(SourceRoot::BUCKETS == u64::BITS as usize);
+#[derive(Debug)]
+struct Entry {
+    file: FileId,
+    /// Its path, encoded ([`content::path_key`]).
+    key: Box<[u8]>,
+    /// The key's [`SourceRoot::PATH_DOMAIN`] hash: its place in the trie.
+    path: ContentId,
+    content: ContentId,
+}
+
+#[derive(Debug)]
+struct Node {
+    /// Whether its files are `entries`; an inner node's are under `children`.
+    leaf: bool,
+    /// A leaf's entries, in no order: one past [`SourceRoot::LEAF`] fits, for the insert that
+    /// splits it.
+    entries: SmallVec<[u32; SourceRoot::LEAF + 1]>,
+    /// An inner node's children by the next digit, [`NO_NODE`] where it has no file.
+    children: [u32; SourceRoot::FANOUT],
+    /// How many files are under it.
+    count: u32,
+    /// Whether `hash` is out of date.
+    dirty: bool,
+    hash: ContentId,
+}
+
+const NO_NODE: u32 = u32::MAX;
+/// A path hash has 64 hex digits: a node that deep is a leaf whatever it holds.
+const MAX_DEPTH: usize = 64;
+
+const _: () = assert!(SourceRoot::FANOUT == 16, "a digit is half a byte");
+
+/// The digit of `path` that picks a child at `depth`.
+fn digit(path: &ContentId, depth: usize) -> usize {
+    let byte = path.0[depth / 2];
+    (if depth % 2 == 0 { byte >> 4 } else { byte & 0xf }) as usize
+}
+
+/// The hash of a leaf with no file, which a child with no node stands for.
+fn empty_leaf() -> ContentId {
+    static EMPTY: OnceLock<ContentId> = OnceLock::new();
+    *EMPTY.get_or_init(|| ContentId::of(SourceRoot::LEAF_DOMAIN, &0u64.to_le_bytes()))
+}
+
+impl Node {
+    fn leaf() -> Node {
+        Node {
+            leaf: true,
+            entries: SmallVec::new(),
+            children: [NO_NODE; SourceRoot::FANOUT],
+            count: 0,
+            dirty: true,
+            hash: ContentId::default(),
+        }
+    }
+}
 
 impl RootContent {
     fn empty(is_library: bool) -> RootContent {
         RootContent {
             is_library,
-            keys: FxHashMap::default(),
+            one_to_one: false,
+            files: FxHashMap::default(),
+            entries: Vec::new(), // alloc: none until a file is put in; grows with the root (setup).
+            free_entries: Vec::new(), // alloc: as above, with the files taken out.
             // alloc: once per source root set (setup).
-            buckets: vec![BTreeMap::new(); SourceRoot::BUCKETS],
-            // alloc: as above.
-            hashes: vec![ContentId::default(); SourceRoot::BUCKETS],
-            dirty: u64::MAX,
+            nodes: vec![Node::leaf()],
+            free_nodes: Vec::new(), // alloc: as above, with the nodes freed.
+            stale: true,
             content: ContentId::default(),
         }
     }
 
-    /// The content of a root of `files` (file, path key, content ID), each path once. The
-    /// buckets of `old` whose files are the same keep their hash, and each key whose file had
-    /// it in `old` keeps its bucket; the others' buckets are hashed in one batch.
+    /// The content of a root of `files` (file, path key, content ID), each path once. Each key
+    /// whose file had it in `old` keeps its path hash, the others are hashed in one batch, and
+    /// each node whose files are those of the node in its place in `old` keeps its hash.
     fn new(
         is_library: bool,
         files: Vec<(FileId, Box<[u8]>, ContentId), &Frame>,
         old: Option<&RootContent>,
         frame: &Frame,
     ) -> RootContent {
-        let mut buckets = Vec::with_capacity_in(files.len(), frame);
+        let mut paths = Vec::with_capacity_in(files.len(), frame);
         let mut hash = Vec::new_in(frame);
         for (at, (file, key, _)) in files.iter().enumerate() {
-            match old.and_then(|old| old.keys.get(file)) {
-                Some((bucket, known)) if **known == **key => buckets.push(*bucket),
-                _ => {
-                    buckets.push(0);
+            match old.and_then(|old| old.path_of(*file, key)) {
+                Some(path) => paths.push(path),
+                None => {
+                    paths.push(ContentId::default());
                     hash.push(at);
                 }
             }
         }
         let keys = frame.alloc_slice_from_iter(hash.iter().map(|&at| &*files[at].1));
         let hashes = content::hash_many(SourceRoot::PATH_DOMAIN, keys, frame);
-        for (&at, path) in hash.iter().zip(hashes) {
-            buckets[at] = RootContent::bucket(path);
+        for (&at, &path) in hash.iter().zip(hashes) {
+            paths[at] = path;
         }
         let mut content = RootContent::empty(is_library);
-        content.keys.reserve(files.len());
-        for ((file, key, id), bucket) in files.into_iter().zip(buckets) {
-            // clone: the bucket's copy of a key, per file of a root set (setup).
-            content.buckets[bucket as usize].insert(key.clone(), id);
-            content.keys.insert(file, (bucket, key));
+        content.files.reserve(files.len());
+        content.entries.reserve(files.len());
+        for ((file, key, id), path) in files.into_iter().zip(paths) {
+            content.insert(file, key, path, id);
         }
-        if let Some(old) = old
-            && old.is_library == is_library
-        {
-            for bucket in 0..SourceRoot::BUCKETS {
-                let bit = 1 << bucket;
-                if old.dirty & bit == 0 && old.buckets[bucket] == content.buckets[bucket] {
-                    content.hashes[bucket] = old.hashes[bucket];
-                    content.dirty &= !bit;
-                }
-            }
-            if content.dirty == 0 && old.dirty == 0 {
+        if let Some(old) = old {
+            content.adopt(0, old, 0);
+            if !content.nodes[0].dirty && !old.stale && old.is_library == is_library {
                 content.content = old.content;
+                content.stale = false;
             }
         }
         content
     }
 
-    /// The bucket of a path whose [`SourceRoot::PATH_DOMAIN`] hash is `path`.
-    pub(crate) fn bucket(path: &ContentId) -> u8 {
-        (path.0[0] as usize % SourceRoot::BUCKETS) as u8
+    /// The files the root has.
+    pub(crate) fn files(&self) -> impl Iterator<Item = FileId> + '_ {
+        self.files.keys().copied()
     }
 
-    /// Puts `file` in the root at `key` (its bucket `bucket`) with `content`: a file another
-    /// file's key had is taken from it.
-    pub(crate) fn insert(&mut self, file: FileId, key: Box<[u8]>, bucket: u8, content: ContentId) {
-        self.remove(file);
-        let map = &mut self.buckets[bucket as usize];
-        if map.contains_key(&key) {
-            self.keys.retain(|_, (at, known)| !(*at == bucket && **known == *key));
+    /// The path hash of `file`, if the root has it at `key`.
+    fn path_of(&self, file: FileId, key: &[u8]) -> Option<ContentId> {
+        let entry = &self.entries[*self.files.get(&file)? as usize];
+        (*entry.key == *key).then_some(entry.path)
+    }
+
+    /// Takes the hash of each node whose files are those of the node in its place in `old`
+    /// (`old_node`), where `old` has that hashed; whether `node`'s files are those. A node
+    /// `old` has out of date has its nodes above out of date too, so a hash is taken only
+    /// where all below it could be.
+    fn adopt(&mut self, node: u32, old: &RootContent, old_node: u32) -> bool {
+        let (new, was) = (&self.nodes[node as usize], &old.nodes[old_node as usize]);
+        let same = match (new.leaf, was.leaf) {
+            (true, true) => {
+                new.count == was.count
+                    && new.entries.iter().all(|&at| {
+                        let entry = &self.entries[at as usize];
+                        was.entries.iter().any(|&known| {
+                            let known = &old.entries[known as usize];
+                            known.path == entry.path
+                                && known.content == entry.content
+                                && known.key == entry.key
+                        })
+                    })
+            }
+            (false, false) => {
+                let (children, old_children) = (new.children, was.children);
+                let mut same = true;
+                for (child, old_child) in children.into_iter().zip(old_children) {
+                    // Every child is adopted, not only up to the first that differs.
+                    same &= match (child, old_child) {
+                        (NO_NODE, NO_NODE) => true,
+                        (NO_NODE, _) | (_, NO_NODE) => false,
+                        _ => self.adopt(child, old, old_child),
+                    };
+                }
+                same
+            }
+            (true, false) | (false, true) => false,
+        };
+        let was = &old.nodes[old_node as usize];
+        if same && !was.dirty {
+            let this = &mut self.nodes[node as usize];
+            this.hash = was.hash;
+            this.dirty = false;
         }
-        // clone: the bucket's copy of a key, per file a root gains.
-        map.insert(key.clone(), content);
-        self.keys.insert(file, (bucket, key));
-        self.dirty |= 1 << bucket;
+        same
     }
 
-    /// Takes `file` out of the root; whether it had it.
+    /// Puts `file` in the root at `key` (whose [`SourceRoot::PATH_DOMAIN`] hash is `path`) with
+    /// `content`: a file another file's key had is taken from it.
+    pub(crate) fn insert(&mut self, file: FileId, key: Box<[u8]>, path: ContentId, content: ContentId) {
+        self.remove(file);
+        if let Some(other) = self.find(&key, &path) {
+            self.remove(self.entries[other as usize].file);
+        }
+        let entry = Entry { file, key, path, content };
+        let at = match self.free_entries.pop() {
+            Some(at) => {
+                self.entries[at as usize] = entry;
+                at
+            }
+            None => {
+                self.entries.push(entry);
+                (self.entries.len() - 1) as u32
+            }
+        };
+        self.files.insert(file, at);
+        self.place(at);
+    }
+
+    /// The entry at `key` (whose hash is `path`), if the root has one.
+    fn find(&self, key: &[u8], path: &ContentId) -> Option<u32> {
+        let (mut node, mut depth) = (0, 0);
+        loop {
+            let this = &self.nodes[node as usize];
+            if this.leaf {
+                return this.entries.iter().copied().find(|&at| *self.entries[at as usize].key == *key);
+            }
+            node = this.children[digit(path, depth)];
+            if node == NO_NODE {
+                return None;
+            }
+            depth += 1;
+        }
+    }
+
+    fn new_node(&mut self) -> u32 {
+        match self.free_nodes.pop() {
+            Some(at) => {
+                self.nodes[at as usize] = Node::leaf();
+                at
+            }
+            None => {
+                self.nodes.push(Node::leaf());
+                (self.nodes.len() - 1) as u32
+            }
+        }
+    }
+
+    /// Puts entry `at` in the leaf its path leads to, made if there is none, and splits that
+    /// leaf if it grows past [`SourceRoot::LEAF`].
+    fn place(&mut self, at: u32) {
+        let path = self.entries[at as usize].path;
+        let (mut node, mut depth) = (0, 0);
+        loop {
+            let this = &mut self.nodes[node as usize];
+            this.count += 1;
+            this.dirty = true;
+            if this.leaf {
+                this.entries.push(at);
+                if this.entries.len() > SourceRoot::LEAF && depth < MAX_DEPTH {
+                    self.split(node, depth);
+                }
+                return;
+            }
+            let digit = digit(&path, depth);
+            node = match this.children[digit] {
+                NO_NODE => {
+                    let child = self.new_node();
+                    self.nodes[node as usize].children[digit] = child;
+                    child
+                }
+                child => child,
+            };
+            depth += 1;
+        }
+    }
+
+    /// Makes the leaf `node` at `depth` an inner node, its entries moved to new leaves by
+    /// their digit at `depth`; a leaf that still has too many is split again.
+    fn split(&mut self, node: u32, depth: usize) {
+        let entries = std::mem::take(&mut self.nodes[node as usize].entries);
+        self.nodes[node as usize].leaf = false;
+        for &at in &entries {
+            let digit = digit(&self.entries[at as usize].path, depth);
+            let child = match self.nodes[node as usize].children[digit] {
+                NO_NODE => {
+                    let child = self.new_node();
+                    self.nodes[node as usize].children[digit] = child;
+                    child
+                }
+                child => child,
+            };
+            let child = &mut self.nodes[child as usize];
+            child.entries.push(at);
+            child.count += 1;
+        }
+        if depth + 1 == MAX_DEPTH {
+            return;
+        }
+        for digit in 0..SourceRoot::FANOUT {
+            let child = self.nodes[node as usize].children[digit];
+            if child != NO_NODE && self.nodes[child as usize].count as usize > SourceRoot::LEAF {
+                self.split(child, depth + 1);
+            }
+        }
+    }
+
+    /// Takes `file` out of the root; whether it had it. The highest inner node left with at
+    /// most [`SourceRoot::LEAF`] files becomes a leaf, so the shape stays the one its files
+    /// give.
     pub(crate) fn remove(&mut self, file: FileId) -> bool {
-        let Some((bucket, key)) = self.keys.remove(&file) else { return false };
-        self.buckets[bucket as usize].remove(&key);
-        self.dirty |= 1 << bucket;
+        let Some(at) = self.files.remove(&file) else { return false };
+        let path = self.entries[at as usize].path;
+        // The nodes from the root to the entry's leaf.
+        let mut trail: SmallVec<[u32; 16]> = SmallVec::new();
+        let mut node = 0;
+        let mut depth = 0;
+        loop {
+            let this = &mut self.nodes[node as usize];
+            this.count -= 1;
+            this.dirty = true;
+            trail.push(node);
+            if this.leaf {
+                if let Some(place) = this.entries.iter().position(|&it| it == at) {
+                    this.entries.swap_remove(place);
+                }
+                break;
+            }
+            node = this.children[digit(&path, depth)];
+            depth += 1;
+        }
+        self.entries[at as usize].key = Box::default();
+        self.free_entries.push(at);
+        let collapse = trail.iter().copied().find(|&node| {
+            let node = &self.nodes[node as usize];
+            !node.leaf && node.count as usize <= SourceRoot::LEAF
+        });
+        match collapse {
+            Some(node) => self.collapse(node),
+            None => {
+                // A leaf left empty under a node that stays inner goes.
+                if let &[.., parent, leaf] = &trail[..]
+                    && self.nodes[leaf as usize].count == 0
+                {
+                    self.nodes[parent as usize].children[digit(&path, trail.len() - 2)] = NO_NODE;
+                    self.free_nodes.push(leaf);
+                }
+            }
+        }
         true
+    }
+
+    /// Makes the inner node `node` a leaf of every entry under it, the nodes below freed.
+    fn collapse(&mut self, node: u32) {
+        let mut entries = SmallVec::new();
+        let children = std::mem::replace(&mut self.nodes[node as usize].children, [NO_NODE; SourceRoot::FANOUT]);
+        for child in children {
+            if child != NO_NODE {
+                self.gather(child, &mut entries);
+            }
+        }
+        let this = &mut self.nodes[node as usize];
+        this.leaf = true;
+        this.entries = entries;
+        this.dirty = true;
+    }
+
+    fn gather(&mut self, node: u32, into: &mut SmallVec<[u32; SourceRoot::LEAF + 1]>) {
+        let this = &mut self.nodes[node as usize];
+        into.extend(this.entries.drain(..));
+        let children = this.children;
+        for child in children {
+            if child != NO_NODE {
+                self.gather(child, into);
+            }
+        }
+        self.free_nodes.push(node);
     }
 
     /// Sets the content ID of `file`, if the root has it; whether the root's changed.
     fn set(&mut self, file: FileId, content: ContentId) -> bool {
-        let Some((bucket, key)) = self.keys.get(&file) else { return false };
-        let bucket = *bucket;
-        let Some(slot) = self.buckets[bucket as usize].get_mut(key) else { return false };
-        if *slot == content {
+        let Some(&at) = self.files.get(&file) else { return false };
+        let entry = &mut self.entries[at as usize];
+        if entry.content == content {
             return false;
         }
-        *slot = content;
-        self.dirty |= 1 << bucket;
-        true
-    }
-
-    /// What [`SourceRoot::BUCKET_DOMAIN`] hashes of a bucket.
-    fn bucket_bytes(&self, bucket: usize, out: &mut Vec<u8>) {
-        let files = &self.buckets[bucket];
-        out.put_u64(files.len() as u64);
-        for (key, content) in files {
-            out.put_bytes_u64(key);
-            out.put_bytes(&content.0);
+        entry.content = content;
+        let path = entry.path;
+        let (mut node, mut depth) = (0, 0);
+        loop {
+            let this = &mut self.nodes[node as usize];
+            this.dirty = true;
+            if this.leaf {
+                return true;
+            }
+            node = this.children[digit(&path, depth)];
+            depth += 1;
         }
     }
 
-    /// Brings each of `roots`' content IDs up to date: every bucket out of date in any of them
-    /// hashed in one batch, then the roots in another.
+    /// What [`SourceRoot::LEAF_DOMAIN`] hashes of a leaf: its files sorted by key, each as its
+    /// key and content ID. `sorted` is room for the order.
+    fn leaf_bytes(&self, node: u32, sorted: &mut Vec<u32, &Frame>, out: &mut Vec<u8>) {
+        sorted.clear();
+        sorted.extend_from_slice(&self.nodes[node as usize].entries);
+        sorted.sort_unstable_by(|&a, &b| self.entries[a as usize].key.cmp(&self.entries[b as usize].key));
+        out.put_u64(sorted.len() as u64);
+        for &at in sorted.iter() {
+            let entry = &self.entries[at as usize];
+            out.put_bytes_u64(&entry.key);
+            out.put_bytes(&entry.content.0);
+        }
+    }
+
+    /// What [`SourceRoot::NODE_DOMAIN`] hashes of an inner node: its children's hashes in
+    /// digit order, a child with no node as [`empty_leaf`].
+    fn node_bytes(&self, node: u32, out: &mut Vec<u8>) {
+        for &child in &self.nodes[node as usize].children {
+            let hash = match child {
+                NO_NODE => empty_leaf(),
+                child => self.nodes[child as usize].hash,
+            };
+            out.put_bytes(&hash.0);
+        }
+    }
+
+    /// Adds the nodes out of date to `leaves` and `inner` (with their depths), from `node`
+    /// at `depth` down, and the greatest depth to `deepest`.
+    fn dirty_nodes(
+        &self,
+        root: SourceRootId,
+        node: u32,
+        depth: usize,
+        leaves: &mut Vec<(SourceRootId, u32), &Frame>,
+        inner: &mut Vec<(SourceRootId, u32, usize), &Frame>,
+        deepest: &mut usize,
+    ) {
+        let this = &self.nodes[node as usize];
+        if !this.dirty {
+            return;
+        }
+        if this.leaf {
+            leaves.push((root, node));
+            return;
+        }
+        inner.push((root, node, depth));
+        *deepest = (*deepest).max(depth);
+        for &child in &this.children {
+            if child != NO_NODE {
+                self.dirty_nodes(root, child, depth + 1, leaves, inner, deepest);
+            }
+        }
+    }
+
+    /// Brings each of `roots`' content IDs up to date: every leaf out of date in any of them
+    /// hashed in one batch, then the inner nodes a batch a depth, deepest first, then the
+    /// roots in one.
     pub(crate) fn refresh(
         contents: &mut FxHashMap<SourceRootId, RootContent>,
         roots: &[SourceRootId],
         frame: &Frame,
     ) {
-        let mut bytes = scratch::lend_bytes();
-        let mut ranges: Vec<Range<usize>, &Frame> = Vec::new_in(frame);
-        let mut places = Vec::new_in(frame);
-        for root in roots {
-            let Some(index) = contents.get(root) else { continue };
-            if places.iter().any(|(known, _)| known == root) {
+        let mut refreshed = Vec::new_in(frame);
+        let mut leaves = Vec::new_in(frame);
+        let mut inner = Vec::new_in(frame);
+        let mut deepest = 0;
+        for (place, root) in roots.iter().enumerate() {
+            if roots[..place].contains(root) {
                 continue;
             }
-            let mut dirty = index.dirty;
-            while dirty != 0 {
-                let bucket = dirty.trailing_zeros() as usize;
-                dirty &= dirty - 1;
-                let start = bytes.len();
-                index.bucket_bytes(bucket, &mut bytes);
-                ranges.push(start..bytes.len());
-                places.push((*root, bucket));
+            let Some(index) = contents.get_mut(root) else { continue };
+            index.stale |= index.nodes[0].dirty;
+            if index.stale {
+                refreshed.push(*root);
+                index.dirty_nodes(*root, 0, 0, &mut leaves, &mut inner, &mut deepest);
             }
         }
-        if places.is_empty() {
+        if refreshed.is_empty() {
             return;
         }
-        let hashes = content::hash_ranges(SourceRoot::BUCKET_DOMAIN, &bytes, &ranges, frame);
-        for (&(root, bucket), &hash) in places.iter().zip(hashes) {
-            if let Some(index) = contents.get_mut(&root) {
-                index.hashes[bucket] = hash;
+        fn of(contents: &FxHashMap<SourceRootId, RootContent>, root: SourceRootId) -> &RootContent {
+            contents.get(&root).expect("a root out of date has its content")
+        }
+        let mut bytes = scratch::lend_bytes();
+        let mut ranges: Vec<Range<usize>, &Frame> = Vec::new_in(frame);
+        let mut sorted = Vec::new_in(frame);
+        for &(root, node) in &leaves {
+            let start = bytes.len();
+            of(contents, root).leaf_bytes(node, &mut sorted, &mut bytes);
+            ranges.push(start..bytes.len());
+        }
+        let hashes = content::hash_ranges(SourceRoot::LEAF_DOMAIN, &bytes, &ranges, frame);
+        for (&(root, node), &hash) in leaves.iter().zip(hashes) {
+            let node = &mut contents.get_mut(&root).expect("as above").nodes[node as usize];
+            node.hash = hash;
+            node.dirty = false;
+        }
+
+        let mut level = Vec::new_in(frame);
+        for depth in (0..=deepest).rev() {
+            bytes.clear();
+            ranges.clear();
+            level.clear();
+            for &(root, node, at) in &inner {
+                if at != depth {
+                    continue;
+                }
+                let start = bytes.len();
+                of(contents, root).node_bytes(node, &mut bytes);
+                ranges.push(start..bytes.len());
+                level.push((root, node));
+            }
+            let hashes = content::hash_ranges(SourceRoot::NODE_DOMAIN, &bytes, &ranges, frame);
+            for (&(root, node), &hash) in level.iter().zip(hashes) {
+                let node = &mut contents.get_mut(&root).expect("as above").nodes[node as usize];
+                node.hash = hash;
+                node.dirty = false;
             }
         }
 
         bytes.clear();
         ranges.clear();
-        let mut refreshed = Vec::new_in(frame);
-        for root in roots {
-            let Some(index) = contents.get_mut(root) else { continue };
-            if index.dirty == 0 {
-                continue;
-            }
-            index.dirty = 0;
+        for &root in &refreshed {
+            let index = of(contents, root);
             let start = bytes.len();
             bytes.push(index.is_library as u8);
-            for hash in &index.hashes {
-                bytes.extend_from_slice(&hash.0);
-            }
+            bytes.extend_from_slice(&index.nodes[0].hash.0);
             ranges.push(start..bytes.len());
-            refreshed.push(*root);
         }
         let hashes = content::hash_ranges(SourceRoot::DOMAIN, &bytes, &ranges, frame);
-        for (root, &hash) in refreshed.into_iter().zip(hashes) {
-            if let Some(index) = contents.get_mut(&root) {
-                index.content = hash;
-            }
+        for (root, &hash) in refreshed.iter().zip(hashes) {
+            let index = contents.get_mut(root).expect("as above");
+            index.content = hash;
+            index.stale = false;
         }
     }
 }

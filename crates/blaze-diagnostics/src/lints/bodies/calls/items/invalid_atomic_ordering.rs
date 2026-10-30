@@ -53,7 +53,7 @@ impl LatePass for InvalidAtomicOrdering {
     const LINTS: LintSet = lint_set([LINT]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::MethodCall, ExprKind::Call]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         match b.store().expr(expr) {
             Expr::MethodCall { method_name, args, .. } => {
                 let method = method_name.as_str();
@@ -68,7 +68,7 @@ impl LatePass for InvalidAtomicOrdering {
 
 impl InvalidAtomicOrdering {
     /// rustc's `check_memory_fence`.
-    fn check_fence(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, args: &[ExprId], out: &mut Vec<Found>) {
+    fn check_fence(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, args: &[ExprId], out: &mut Vec<Found>) {
         let Some((def, _)) = util::called_fn(b, expr) else { return };
         if self.fences.of(b.db(), def).is_none() {
             return;
@@ -84,7 +84,7 @@ impl InvalidAtomicOrdering {
 }
 
 /// rustc's `check_atomic_load_store`.
-fn check_load_store(b: &BodyCx<'_, '_>, expr: ExprId, method: &str, args: &[ExprId], out: &mut Vec<Found>) {
+fn check_load_store(b: &BodyCx<'_, '_, '_>, expr: ExprId, method: &str, args: &[ExprId], out: &mut Vec<Found>) {
     let (index, invalid, message, help) = match method {
         "load" => (
             0,
@@ -112,7 +112,7 @@ fn check_load_store(b: &BodyCx<'_, '_>, expr: ExprId, method: &str, args: &[Expr
 }
 
 /// rustc's `check_atomic_compare_exchange`.
-fn check_compare_exchange(b: &BodyCx<'_, '_>, expr: ExprId, method: &str, args: &[ExprId], out: &mut Vec<Found>) {
+fn check_compare_exchange(b: &BodyCx<'_, '_, '_>, expr: ExprId, method: &str, args: &[ExprId], out: &mut Vec<Found>) {
     let index = match method {
         "update" | "try_update" | "fetch_update" => 1,
         "compare_exchange" | "compare_exchange_weak" => 3,
@@ -137,7 +137,7 @@ fn check_compare_exchange(b: &BodyCx<'_, '_>, expr: ExprId, method: &str, args: 
 
 /// rustc's `inherent_atomic_method_call`: the method `expr` calls, when it is of an inherent
 /// impl of `Atomic` (std's, not an extension trait's).
-fn inherent_atomic_method(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<FunctionId> {
+fn inherent_atomic_method(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<FunctionId> {
     let db = b.db();
     let def = util::method_fn(b, expr)?;
     let ItemContainerId::ImplId(impl_) = def.lookup(db).container else { return None };
@@ -153,7 +153,7 @@ fn inherent_atomic_method(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<FunctionId
 
 /// rustc's `match_ordering`: the variant of `Ordering` (std's diagnostic item `Ordering`) the
 /// path `expr` names.
-fn ordering(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Ordering> {
+fn ordering(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Ordering> {
     let Some(ValueNs::EnumVariantId(variant)) = util::path_value(b, expr) else { return None };
     let db = b.db();
     let loc = variant.lookup(db);
@@ -170,12 +170,12 @@ fn ordering(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Ordering> {
 }
 
 /// The lint at the ordering argument `arg`.
-fn diag(b: &BodyCx<'_, '_>, arg: ExprId, message: impl Into<String>) -> Option<Diag> {
+fn diag(b: &BodyCx<'_, '_, '_>, arg: ExprId, message: impl Into<String>) -> Option<Diag> {
     Some(Diag::lint(LINT, message, util::span(b, arg)?))
 }
 
 /// The lint found at the call `expr` of `def`.
-fn emit(b: &BodyCx<'_, '_>, expr: ExprId, def: FunctionId, mut diag: Diag, out: &mut Vec<Found>) {
+fn emit(b: &BodyCx<'_, '_, '_>, expr: ExprId, def: FunctionId, mut diag: Diag, out: &mut Vec<Found>) {
     let Some(at) = b.expr_node(expr) else { return };
     let called = b.cx.def_path(ModuleDefId::FunctionId(def).into());
     // alloc: the lint's diagnostic

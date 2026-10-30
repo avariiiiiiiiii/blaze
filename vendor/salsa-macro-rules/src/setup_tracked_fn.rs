@@ -242,6 +242,17 @@ macro_rules! setup_tracked_fn {
 
                         type Struct<$db_lt> = $InternedData<$db_lt>;
 
+                        #[allow(unused_parens)]
+                        fn ids(
+                            __salsa_fields: &Self::Fields<'_>,
+                            __salsa_ids: &mut ::std::vec::Vec<$zalsa::Id>,
+                        ) {
+                            #[allow(unused_imports)]
+                            use $zalsa::interned::{IdOfNamed as _, IdOfOther as _, IdOfSalsa as _};
+                            let ($($input_id),*) = __salsa_fields;
+                            $( (&&&$zalsa::interned::IdsOf($input_id)).push_ids(__salsa_ids); )*
+                        }
+
                         fn serialize<S: $zalsa::serde::Serializer>(
                             fields: &Self::Fields<'_>,
                             serializer: S,

@@ -326,7 +326,7 @@ fn encode_top_subtree(
 }
 
 /// A token tree in the old encoding.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash)]
 pub(super) struct VarintTree {
     buffer: Box<[u8]>,
     span_parts: Box<[CompressedSpanPart]>,

@@ -59,7 +59,7 @@ use smallvec::SmallVec;
 use span::{AstIdMap, RealSpanMap};
 use stdx::never;
 use syntax::{
-    SyntaxKind, SyntaxNode, TextRange, TextSize,
+    AstPtr, SyntaxKind, SyntaxNode, TextRange, TextSize,
     ast::{self, AstNode, RangeItem, RangeOp},
 };
 
@@ -1404,7 +1404,7 @@ impl<'db> SourceAnalyzer<'db> {
                             },
                         );
                     if let Some(adt) = adt {
-                        let ast_id = self.file_id.ast_id_map(db).ast_id(&adt);
+                        let ast_id = self.file_id.ast_id_map(db).ast_id_for_ptr(AstPtr::new(&adt));
                         if let Some(helpers) = self
                             .resolver
                             .def_map()

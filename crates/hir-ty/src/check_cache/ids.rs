@@ -11,6 +11,7 @@
 use std::cell::RefCell;
 
 use base_db::{Crate, Db};
+use blaze_format::cursor::{Put, Reader};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstId, DefWithBodyId, EnumId,
     EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, LoweringMode,
@@ -194,23 +195,7 @@ thread_local! {
 /// flags, which [`outside`] leaves the scope for; it has no path that writes or reads a
 /// persisted record of its own there (`evict.rs` drops values and computes them again).
 pub(crate) fn relocating<T>(table: &mut Table, f: impl FnOnce() -> T) -> T {
-    struct Scope<'t>(&'t mut Table);
-
-    impl Drop for Scope<'_> {
-        fn drop(&mut self) {
-            if let Some(table) = TABLE.with(|slot| slot.borrow_mut().take()) {
-                *self.0 = table;
-            }
-        }
-    }
-
-    TABLE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        assert!(slot.is_none(), "relocating scopes do not nest");
-        *slot = Some(std::mem::take(table));
-    });
-    let _scope = Scope(table);
-    f()
+    stdx::lend(&TABLE, table, f)
 }
 
 /// Runs `f` outside the [`relocating`] scope this thread is in, if any: what `f` writes or
@@ -280,6 +265,45 @@ pub(crate) struct Items {
     pub(crate) kinds: Vec<u8>,
 }
 
+/// The version of what [`write`] and [`write_with`] write of a body's ids.
+pub(crate) const VERSION: u64 = 1;
+
+/// Where a body's items go when its ids are written ([`write_with`]): each item is written as
+/// its index there.
+pub(crate) trait ItemSink {
+    /// Whether every item of the body (`items`, as `(kind, bits)`, in the table's order) has a
+    /// form here, asked before any is added: a body refused here adds nothing.
+    fn admit(&mut self, db: &Db, items: impl Iterator<Item = (IdKind, u64)>) -> R;
+
+    /// The index of the item `bits` of `kind`, added when it is new.
+    fn index(&mut self, kind: IdKind, bits: u64) -> R<u32>;
+}
+
+/// A crate's portable table ([`Items`]), as a bodies part writes its bodies' items.
+struct CrateItems<'i> {
+    krate: Crate,
+    items: &'i mut Items,
+}
+
+impl ItemSink for CrateItems<'_> {
+    fn admit(&mut self, db: &Db, items: impl Iterator<Item = (IdKind, u64)>) -> R {
+        // alloc: per body written, at store time
+        let mut own = PortableIds::new();
+        for (kind, bits) in items {
+            index_item(&mut own, kind, bits)?;
+        }
+        own.encode(db, self.krate).map(drop)
+    }
+
+    fn index(&mut self, kind: IdKind, bits: u64) -> R<u32> {
+        let index = index_item(&mut self.items.ids, kind, bits)?;
+        if index as usize == self.items.kinds.len() {
+            self.items.kinds.push(kind as u8);
+        }
+        Ok(index)
+    }
+}
+
 /// What an entry is in another process: where its id comes from. Entries name others by index.
 #[derive(Clone, Copy, Debug)]
 enum Loc {
@@ -302,14 +326,22 @@ pub(crate) fn write<'db>(
     locs: &mut TyTableWriter<'db>,
     items: &mut Items,
 ) -> R<Vec<u8>> {
+    write_with(db, table, locs, &mut CrateItems { krate, items })
+}
+
+/// [`write`], each item of the body written as its index in `items`.
+pub(crate) fn write_with<'db>(
+    db: &'db Db,
+    table: &mut Table,
+    locs: &mut TyTableWriter<'db>,
+    items: &mut impl ItemSink,
+) -> R<Vec<u8>> {
     if let Some(why) = table.refused {
         // alloc: the reason a body is left out
         return Err(why.to_owned());
     }
     // alloc: per body written, at store time
     let mut found = Vec::with_capacity(table.len());
-    // alloc: as above
-    let mut own = PortableIds::new();
     let mut at = 0;
     while at < table.len() {
         let (kind, bits) = table.entries[at];
@@ -323,7 +355,7 @@ pub(crate) fn write<'db>(
             | IdKind::Trait
             | IdKind::TypeAlias
             | IdKind::Impl
-            | IdKind::EnumVariant => Loc::Item(index_item(&mut own, kind, bits)?),
+            | IdKind::EnumVariant => Loc::Item(0),
             IdKind::BuiltinDeriveImpl => {
                 let BuiltinDeriveImplLoc { adt, trait_, derive_attr_id, derive_index } =
                     *BuiltinDeriveImplId::from_id(salsa::Id::from_bits(bits)).loc(db);
@@ -389,42 +421,37 @@ pub(crate) fn write<'db>(
     }
     // Checked alone first, so an item frozen's encoding refuses leaves this body out rather than
     // failing the crate's table.
-    own.encode(db, krate)?;
+    let body_items = table.entries.iter().zip(&found).filter(|(_, loc)| matches!(loc, Loc::Item(_)));
+    items.admit(db, body_items.map(|(&entry, _)| entry))?;
 
     // alloc: the body's words, kept in its part
     let mut out = Vec::with_capacity(table.len() * 8);
     for (&(kind, bits), loc) in table.entries.iter().zip(&found) {
         out.push(kind as u8);
         match *loc {
-            Loc::Item(_) => {
-                let index = index_item(&mut items.ids, kind, bits)?;
-                if index as usize == items.kinds.len() {
-                    items.kinds.push(kind as u8);
-                }
-                put_u32(&mut out, index);
-            }
+            Loc::Item(_) => out.put_u32(items.index(kind, bits)?),
             Loc::Derive { adt, trait_, attr, index } => {
-                put_u32(&mut out, adt);
+                out.put_u32(adt);
                 out.push(trait_);
-                put_u32(&mut out, attr);
-                put_u32(&mut out, index);
+                out.put_u32(attr);
+                out.put_u32(index);
             }
             Loc::Opaque { alias, def, idx } => {
                 out.push(u8::from(alias));
-                put_u32(&mut out, def);
-                put_u32(&mut out, idx);
+                out.put_u32(def);
+                out.put_u32(idx);
             }
             Loc::Closure { owner: (tag, owner), expr, kind } => {
                 out.push(tag);
-                put_u32(&mut out, owner);
-                put_u32(&mut out, expr);
+                out.put_u32(owner);
+                out.put_u32(expr);
                 out.extend_from_slice(&kind);
             }
             Loc::AnonConst { owner: (tag, owner), expr, ty, allow } => {
                 out.push(tag);
-                put_u32(&mut out, owner);
-                put_u32(&mut out, expr);
-                put_u32(&mut out, ty);
+                out.put_u32(owner);
+                out.put_u32(expr);
+                out.put_u32(ty);
                 out.push(u8::from(allow));
             }
         }
@@ -594,29 +621,6 @@ fn closure_kind_of([tag, a, b]: [u8; 3]) -> R<ClosureKind> {
     })
 }
 
-fn put_u32(out: &mut Vec<u8>, word: u32) {
-    out.extend_from_slice(&word.to_le_bytes());
-}
-
-/// The bytes [`write`] gave, read with every length checked.
-struct Bytes<'a> {
-    bytes: &'a [u8],
-}
-
-impl Bytes<'_> {
-    fn u8(&mut self) -> R<u8> {
-        let (&byte, rest) = self.bytes.split_first().ok_or("a body's ids cut short")?;
-        self.bytes = rest;
-        Ok(byte)
-    }
-
-    fn u32(&mut self) -> R<u32> {
-        let (word, rest) = self.bytes.split_first_chunk::<4>().ok_or("a body's ids cut short")?;
-        self.bytes = rest;
-        Ok(u32::from_le_bytes(*word))
-    }
-}
-
 /// The table of a body whose ids are `ids` (what [`write`] gave), each made in this database:
 /// items from `items`, the crate's portable table read as `(kind, bits)`; the types of its
 /// anonymous constants from the table at `locs` in `buffer`.
@@ -632,8 +636,8 @@ pub(crate) fn read<'db>(
     let mut entries = Vec::new();
     // alloc: as above
     let mut found = Vec::new();
-    let mut bytes = Bytes { bytes: ids };
-    while !bytes.bytes.is_empty() {
+    let mut bytes = Reader::new(ids);
+    while !bytes.is_done() {
         let kind = IdKind::of(bytes.u8()?).ok_or("an id of no kind")?;
         let loc = match kind {
             IdKind::Function

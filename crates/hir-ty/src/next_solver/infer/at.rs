@@ -208,6 +208,25 @@ pub trait ToTrace<'db>: Relate<DbInterner<'db>> {
 }
 
 impl<'a, 'db> At<'a, 'db> {
+    /// Makes `actual <: expected`. For example, if type-checking a
+    /// call like `foo(x)`, where `foo: fn(i32)`, you might have
+    /// `sup(i32, x)`, since the "expected" type is the type that
+    /// appears in the signature.
+    pub fn sup<T>(self, expected: T, actual: T) -> InferResult<'db, ()>
+    where
+        T: ToTrace<'db>,
+    {
+        self.infcx.sup_raw(self.cause, self.param_env, expected, actual)
+    }
+
+    /// Makes `expected <: actual`.
+    pub fn sub<T>(self, expected: T, actual: T) -> InferResult<'db, ()>
+    where
+        T: ToTrace<'db>,
+    {
+        self.infcx.sub_raw(self.cause, self.param_env, expected, actual)
+    }
+
     /// Makes `expected == actual`.
     pub fn eq<T>(self, expected: T, actual: T) -> InferResult<'db, ()>
     where

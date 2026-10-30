@@ -4,6 +4,8 @@
 //! Then mutate the values so that the tracked function re-executes.
 //! Check that we accumulate the appropriate, new values.
 
+#![forbid(unsafe_code)]
+
 use expect_test::expect;
 use salsa::{Accumulator, Setter};
 use test_log::test;

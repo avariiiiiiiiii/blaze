@@ -41,14 +41,14 @@ impl LatePass for MapUnitFn {
     const LINTS: LintSet = lint_set(["map_unit_fn"]);
     const HOOKS: Hooks = Hooks::STMT;
 
-    fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         if let Some(found) = map_unit_fn(b, block, index) {
             out.push(found);
         }
     }
 }
 
-fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found> {
+fn map_unit_fn(b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize) -> Option<Found> {
     let Expr::Block { statements, .. } = b.store().expr(block) else { return None };
     let Statement::Expr { expr, has_semi: true } = statements.get(index)? else { return None };
     let Expr::MethodCall { receiver, method_name, args: &[arg], .. } = b.store().expr(expr) else { return None };
@@ -118,7 +118,7 @@ fn returns_nothing(ty: Ty<'_>) -> bool {
 
 /// rustc's `is_impl_slice`: `receiver` is a method call of a method of an inherent impl on a
 /// slice (`<[T]>::iter_mut`).
-fn is_impl_slice(b: &BodyCx<'_, '_>, receiver: ExprId) -> bool {
+fn is_impl_slice(b: &BodyCx<'_, '_, '_>, receiver: ExprId) -> bool {
     let db = b.db();
     let Some(method) = method_fn(b, receiver) else { return false };
     let ItemContainerId::ImplId(impl_id) = method.lookup(db).container else { return false };
@@ -127,7 +127,7 @@ fn is_impl_slice(b: &BodyCx<'_, '_>, receiver: ExprId) -> bool {
 
 /// rustc's `span_of_impl` of a function: its `def_span` (its signature) when it is of this
 /// crate.
-fn fn_span(b: &BodyCx<'_, '_>, function: FunctionId) -> Option<Span> {
+fn fn_span(b: &BodyCx<'_, '_, '_>, function: FunctionId) -> Option<Span> {
     let db = b.db();
     if hir::Crate::from(function.krate(db)) != b.cx.krate {
         return None;
@@ -139,7 +139,7 @@ fn fn_span(b: &BodyCx<'_, '_>, function: FunctionId) -> Option<Span> {
 /// rustc's `span_of_impl` of a closure (always of this crate): its `def_span`, the closure's
 /// header from `move` (or its first token after its attributes) to its parameters' `|` or its
 /// return type.
-fn closure_span(b: &BodyCx<'_, '_>, closure: InternedClosure<'_>) -> Option<Span> {
+fn closure_span(b: &BodyCx<'_, '_, '_>, closure: InternedClosure<'_>) -> Option<Span> {
     let db = b.db();
     let ptr = match closure.owner {
         InferBodyId::DefWithBodyId(owner) if owner == b.owner => b.expr_node(closure.expr)?,

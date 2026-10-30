@@ -46,6 +46,19 @@ pub(crate) struct Schedule {
     threads: [Mark; MAX_THREADS],
     /// The schedule branch before this one.
     prev: Option<u32>,
+    /// The first schedule branch of the run this one is in: the latest at or before it, along
+    /// `prev`, that is the first or runs another thread than the one before it. Bounded DPOR
+    /// backtracks there; kept per branch so that is one load, not a walk back.
+    start: u32,
+}
+
+/// [`Schedule::start`] of a branch at `at` running `active`, after the schedule `prev`.
+fn run_start(branches: &[Branch], at: u32, active: Option<usize>, prev: Option<u32>) -> u32 {
+    let Some(prev) = prev else { return at };
+    match &branches[prev as usize] {
+        Branch::Schedule(before) if before.active() == active => before.start,
+        _ => at,
+    }
 }
 
 impl Schedule {
@@ -109,14 +122,17 @@ pub(crate) struct Pct {
 }
 
 impl Pct {
-    pub(crate) fn new(seed: u64, depth: usize, steps: u32) -> Pct {
+    /// A run's priorities and drops from `seed`, its drops kept in `drops` (a buffer reused
+    /// across runs).
+    pub(crate) fn new(seed: u64, depth: usize, steps: u32, mut drops: Vec<u32>) -> Pct {
         let mut rng = Rng::new(seed);
         let mut priority = [0; MAX_THREADS];
         for (at, it) in priority.iter_mut().enumerate() {
             *it = MAX_THREADS as u32 + at as u32;
         }
         rng.shuffle(&mut priority);
-        let drops = (1..depth.max(1)).map(|_| rng.below(u64::from(steps.max(1))) as u32).collect();
+        drops.clear();
+        drops.extend((1..depth.max(1)).map(|_| rng.below(u64::from(steps.max(1))) as u32));
         Pct { rng, priority, drops, steps: 0, lowest: MAX_THREADS as u32 }
     }
 }
@@ -146,6 +162,7 @@ impl Path {
 
     /// A path that replays `schedule` (as [`Path::trail`] wrote it).
     pub(crate) fn replay(schedule: &str, max: usize) -> Result<Path, String> {
+        // alloc: a replayed path, once per model
         let mut branches = Vec::new();
         let mut chars = schedule.chars().peekable();
         let mut prev = None;
@@ -157,12 +174,15 @@ impl Path {
                         threads[char as usize - '0' as usize] = Mark::Active;
                     }
                     let at = branches.len() as u32;
-                    let schedule = Schedule { preemptions: 0, initial: None, threads, prev };
+                    let active = threads.iter().position(|&it| it == Mark::Active);
+                    let start = run_start(&branches, at, active, prev);
+                    let schedule = Schedule { preemptions: 0, initial: None, threads, prev, start };
                     prev = Some(at);
                     Branch::Schedule(schedule)
                 }
                 'a'..='z' => Branch::Load { pos: char as u16 - 'a' as u16, len: 0 },
                 '{' => {
+                    // alloc: parsing a replayed path, once per model
                     let mut digits = String::new();
                     for char in chars.by_ref() {
                         if char == '}' {
@@ -172,16 +192,32 @@ impl Path {
                     }
                     let pos = digits
                         .parse()
+                        // alloc: a finding's or an error's text, made once, when the model stops
                         .map_err(|_| format!("`{{{digits}}}` in a schedule is not a load choice"))?;
                     Branch::Load { pos, len: 0 }
                 }
                 '+' => Branch::Spurious(true),
                 '-' => Branch::Spurious(false),
+                // alloc: a finding's or an error's text, made once, when the model stops
                 other => return Err(format!("`{other}` is not a branch of a schedule")),
             };
             branches.push(branch);
         }
         Ok(Path { mode: Mode::Replay, bound: None, max: max.max(branches.len()), pos: 0, branches })
+    }
+
+    /// Readies the path for the random run `seed`, keeping its buffers: the same run as a new
+    /// `Path::new(Mode::Random(Pct::new(seed, depth, steps, ..)), None, max)`.
+    pub(crate) fn random(&mut self, seed: u64, depth: usize, steps: u32) {
+        let drops = match &mut self.mode {
+            Mode::Random(pct) => std::mem::take(&mut pct.drops),
+            // alloc: the first random run's priority drops; later runs reuse them
+            _ => Vec::new(),
+        };
+        self.mode = Mode::Random(Pct::new(seed, depth, steps, drops));
+        self.bound = None;
+        self.pos = 0;
+        self.branches.clear();
     }
 
     pub(crate) fn pos(&self) -> usize {
@@ -255,7 +291,8 @@ impl Path {
                 initial = None;
             }
             let preemptions = prev.map_or(0, |prev| self.schedule(prev).preemptions());
-            self.push(Branch::Schedule(Schedule { preemptions, initial, threads, prev }))?;
+            let start = run_start(&self.branches, self.branches.len() as u32, active, prev);
+            self.push(Branch::Schedule(Schedule { preemptions, initial, threads, prev, start }))?;
         }
         let at = self.pos;
         self.pos += 1;
@@ -267,6 +304,7 @@ impl Path {
         match active {
             Some(thread) if !marks[thread].enabled() => {
                 if replaying {
+                    // alloc: a finding's or an error's text, made once, when the model stops
                     return Err(Stuck::BadReplay(at, format!("thread {thread} cannot run here")));
                 }
                 Err(Stuck::Nondeterministic(at, "the thread the path runs here cannot run"))
@@ -306,6 +344,7 @@ impl Path {
         match &mut self.branches[at] {
             Branch::Load { pos, len: known } if *known == 0 => {
                 if *pos >= len {
+                    // alloc: a finding's or an error's text, made once, when the model stops
                     let why = format!("load choice {pos} of {len} stores");
                     return Err(Stuck::BadReplay(at, why));
                 }
@@ -353,22 +392,11 @@ impl Path {
         if bound.is_none() {
             return;
         }
-        let Some(mut curr) = self.schedule(point).prev else { return };
-        loop {
-            match self.schedule(curr).prev {
-                Some(prev) => {
-                    if self.schedule(curr).active() != self.schedule(prev).active() {
-                        self.schedule_mut(curr).backtrack(thread, bound);
-                        return;
-                    }
-                    curr = prev;
-                }
-                None => {
-                    self.schedule_mut(curr).backtrack(thread, bound);
-                    return;
-                }
-            }
-        }
+        // Loom's walk back from `point`'s previous schedule to the first that is the first or
+        // runs another thread than the one before it: that branch's `start`.
+        let Some(prev) = self.schedule(point).prev else { return };
+        let start = self.schedule(prev).start;
+        self.schedule_mut(start).backtrack(thread, bound);
     }
 
     /// Readies the next execution: the deepest branch with an alternative left takes it and
@@ -392,6 +420,10 @@ impl Path {
                     if let Some(next) = schedule.threads.iter().position(|&it| it == Mark::Pending)
                     {
                         schedule.threads[next] = Mark::Active;
+                        let prev = schedule.prev;
+                        let at = self.branches.len() as u32 - 1;
+                        let start = run_start(&self.branches, at, Some(next), prev);
+                        self.schedule_mut(at).start = start;
                         return true;
                     }
                 }
@@ -425,6 +457,7 @@ impl Path {
                     None => out.push('.'),
                 },
                 Branch::Load { pos, .. } if *pos < 26 => out.push((b'a' + *pos as u8) as char),
+                // alloc: a finding's replayable trail, made once, when the model stops
                 Branch::Load { pos, .. } => out.push_str(&format!("{{{pos}}}")),
                 Branch::Spurious(spur) => out.push(if *spur { '+' } else { '-' }),
             }
@@ -452,4 +485,80 @@ fn pct_choose(pct: &mut Pct, threads: &[Mark; MAX_THREADS]) -> Option<Tid> {
         return best(pct);
     }
     Some(chosen)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Branch, Mark, Mode, Path};
+    use crate::{clock::MAX_THREADS, rng::Rng};
+
+    impl Path {
+        /// Loom's walk from schedule `at` back to the first schedule of its run: what
+        /// `Schedule::start` keeps.
+        fn walk_start(&self, at: u32) -> u32 {
+            let mut curr = at;
+            loop {
+                match self.schedule(curr).prev {
+                    Some(prev) if self.schedule(curr).active() == self.schedule(prev).active() => curr = prev,
+                    _ => return curr,
+                }
+            }
+        }
+
+        fn check_starts(&self) {
+            for (at, branch) in self.branches.iter().enumerate() {
+                if let Branch::Schedule(schedule) = branch {
+                    assert_eq!(schedule.start, self.walk_start(at as u32), "the start of schedule {at}");
+                }
+            }
+        }
+    }
+
+    /// The threads at branch `pos` of every execution: a function of the position, as a
+    /// deterministic model's are of the path before it.
+    fn marks(seed: u64, pos: usize) -> [Mark; MAX_THREADS] {
+        let mut rng = Rng::new(blaze_rng::mix(seed ^ (pos as u64) << 20));
+        let mut marks = [Mark::Disabled; MAX_THREADS];
+        for mark in &mut marks[..3] {
+            *mark = match rng.below(5) {
+                0 => Mark::Disabled,
+                1 => Mark::Yield,
+                _ => Mark::Skip,
+            };
+        }
+        let first = rng.below(3) as usize;
+        if let Some(at) = (0..3).map(|it| (first + it) % 3).find(|&it| marks[it] == Mark::Skip) {
+            marks[at] = Mark::Active;
+        }
+        marks
+    }
+
+    /// Every schedule's `start` is loom's walk, through branches, loads, backtracks and steps.
+    #[test]
+    fn a_schedule_keeps_the_start_of_its_run() {
+        for seed in 0..64 {
+            let mut path = Path::new(Mode::Explore, Some(2), 1000);
+            let mut rng = Rng::new(seed);
+            for _ in 0..200 {
+                for _ in 0..24 {
+                    let pos = path.pos();
+                    if path.branch_thread(marks(seed, pos)).is_err() {
+                        panic!("the path does not fit its marks at {pos}");
+                    }
+                    if blaze_rng::mix(seed ^ pos as u64) % 3 == 0 {
+                        assert!(path.branch_load(2).is_ok());
+                    }
+                    let point = rng.index(path.pos());
+                    if matches!(path.branches[point], Branch::Schedule(_)) {
+                        path.backtrack(point, rng.index(3));
+                    }
+                    path.check_starts();
+                }
+                if !path.step() {
+                    break;
+                }
+                path.check_starts();
+            }
+        }
+    }
 }

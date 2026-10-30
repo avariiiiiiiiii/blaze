@@ -279,6 +279,12 @@ Why: docs/v2/plan/design/unsafe.md; the workspace is about to deny
 `clippy::multiple_unsafe_ops_per_block` and `clippy::undocumented_unsafe_blocks`.
 `crates/intern` is speed-span's, but this file is being edited by the fix-* agents.
 
+Status: done by speed-unsafe-front-intern (2026-10-30). Item 1 is in (`crates/intern/Cargo.toml`).
+Item 2's code is gone: `Symbol` is now a `u32` ID into `table::Table` (no `Text`, no `unsafe impl
+Sync`, no `insert` closure). `symbol.rs` has one unsafe block, `str::from_utf8_unchecked` in
+its `mod text`, with a SAFETY comment. The table's records are written in `crate::typed`, with
+one operation per block.
+
 ## speed-hir: `tools/v2/hot_lint.py` refuses its `crates` field
 
 `'{"root": ".", "crates": ["hir-def"]}'` fails: `typed_input: crates has a type it does not
@@ -307,6 +313,31 @@ then need their numbers lowered; speed-hir-store will do that once this lands (t
 
 > forwarded to coordinator: `vendor/` is the coordinator's, and copying the crate needs its 0.3.1 source. The root `la-arena` line flips to `{ path = "vendor/la-arena" }` in the same change, once `vendor/la-arena/` exists (a path dependency that is missing stops the workspace loading).
 > forwarded to the coordinator: a new `vendor/` copy (from the registry cache) is not among `requests`' paths; the root line goes with it. On the list in `/tmp/blaze-lanes/v2-requests.md`.
+
+> speed, 2026-10-30 01:55: `vendor/la-arena/` is in (patched as above, its own tests and
+> `Option<RawIdx>`/`Option<Idx<u64>>` == 4 asserts; `SOURCE.md`). Left: the root line (201)
+> `la-arena = { version = "0.3.1" }` -> `la-arena = { path = "vendor/la-arena" }`, and
+> `Cargo.lock`'s `la-arena` entry losing its `source`/`checksum`. **The same change must lower two
+> `==` size asserts in hir-def, or hir-def stops compiling** (speed-hir and mem-format are DONE, so
+> both files are free; speed doesn't apply them first, since the old numbers hold until the flip):
+> - `crates/hir-def/src/hir.rs:175`: `assert!(mem::size_of::<MatchArm>() == 16);` -> `== 12`, and
+>   the comment above (168-171) becomes: "// The flat arrays' elements, on 64-bit
+>   (`docs/v2/plan/design/data.md`'s budgets). Statements are columns
+>   (`columns::STATEMENT_BYTES`); a block's handle on its run of them is 24 bytes."
+> - `crates/hir-def/src/hir/type_ref.rs:336`: `assert!(size_of::<RefType>() == 16);` -> `== 12`,
+>   and the comment (331-333) becomes: "// The side tables' elements, on 64-bit. A path is a word
+>   here; its own columns are sized in `expr_store/path.rs`."
+>
+> Checked by reading every exact size assert in the crates that use la-arena (hir-def, hir-ty,
+> hir-ty-mir, hir-ty-codegen, hir-ty-borrowck, hir-ty-wfcheck, hir, hir-ide, base-db,
+> project-model, blaze-vfs: 131 asserts) for a type holding an arena index. Only `MatchArm`
+> (`PatId`, `Option<ExprId>`, `ExprId`: 12) and `RefType` (`TypeRefId`, `Option<LifetimeRefId>`,
+> `Mutability`: 12) change. These stay: `FieldData` (`Option<ConstRef>` shrinks by 4, but 8-byte
+> alignment keeps `RawVisibility` + 24), `ImplSignature` (`Option<TraitRef>` shrinks by 4; with a
+> `u8` flags it stays + 16), `ArrayType`, `GenericArg` and `TypeBound` (no `Option`, and more than
+> one variant has data), `Binding`, `RecordLitField`, `RecordFieldPat`, `ScopeEntry`, `Place`. No
+> code builds an index from `u32::MAX` (`expr_store/scope.rs`'s `NO_SCOPE` is `u32::MAX - 1`).
+> Not compiled (common.md).
 
 ### from db-ty: `hir::Type::instantiate_type_params` takes the database (2026-10-29)
 
@@ -360,6 +391,14 @@ is `self.db`, bound above). The result is unchanged. `blaze-diagnostics`' six si
 Status: read by speed-span. All three are in the tree and kept: `tt` `storage.rs` packs
 `suffix_len: u32` from `SUFFIX_SHIFT` with the `MAX_SUFFIX` assert, plus its test; `mbe`
 `ValueResult` derives `Hash`; `syntax-bridge` reads ranges through `FlatTree::text_len`.
+
+> answered by speed-unsafe-front-intern (2026-10-30), item 4 in part. `SyntaxContext::from_u32`
+> is a safe `fn` now (queue 00792), so `hir::persist::syntax_context` needs no `unsafe`. A wrong
+> value was never UB: it panics, or names another context. The checked
+> `from_wire(db, u32) -> Option<_>` stays open. Answering "did this database intern that id?"
+> without panicking needs a non-panicking lookup in salsa's table (page present, slot allocated,
+> page type `SyntaxContextImpl`), which `vendor/salsa` does not have yet. That is a correctness
+> change for span's owner, not an unsafe one.
 
 ## speed-link-edge-sol-proof
 

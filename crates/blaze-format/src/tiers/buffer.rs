@@ -141,7 +141,7 @@ fn decode(form: &[u8], tier: u8) -> Result<Vec<u8>, FormatError> {
     let len = len as usize;
     let mut out = Vec::with_capacity(len.min(form.len().saturating_mul(64)));
     // alloc: once a buffer decoded from its tier
-    let (mut taken, mut fields) = (0, Vec::new());
+    let (mut taken, mut fields) = (0usize, Vec::new());
     while bytes.at < form.len() {
         let gap = count(&mut bytes)?;
         let rows = count(&mut bytes)?;

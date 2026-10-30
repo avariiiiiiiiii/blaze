@@ -8,17 +8,13 @@ use cfg::CfgExpr;
 use parser::T;
 use smallvec::SmallVec;
 use syntax::{
-    AstNode, NodeOrToken, PreorderWithTokens, SyntaxElement, SyntaxNode, SyntaxToken, WalkEvent,
-    ast::{self, HasAttrs},
+    NodeOrToken, WalkEvent,
     view::{self, AstNode as _, HasAttrs as _},
 };
 use syntax_bridge::{DocCommentDesugarMode, Inserted};
 
 use crate::{
-    attrs::{
-        AttrId, expand_cfg_attr, expand_cfg_attr_view, is_item_tree_filtered_attr,
-        with_one_segment, with_one_segment_view,
-    },
+    attrs::{AttrId, expand_cfg_attr_view, is_item_tree_filtered_attr, with_one_segment_view},
     fixup::{self, SyntaxFixupUndoInfo},
     span_map::{InOrder, SpanMap},
     tt::{self, DelimSpan, Span},
@@ -55,15 +51,13 @@ struct AstAttrToProcess {
 }
 
 /// The callback that strips `cfg`s and censored attributes from an attribute or derive macro's
-/// input, written once for both trees: [`macro_input_callback`] over views (every build's
-/// input), [`macro_input_callback_handle`] over the handles of an edited tree
-/// (`expand_speculative`, IDE only).
+/// input: [`macro_input_callback`], over views.
 macro_rules! macro_input_callback_impl {
     (
         $name:ident, $Preorder:ty, $Element:ty, $Token:ty, $ast:ident,
         $expand_cfg_attr:path, $parse_cfg:path, $with_one_segment:path
     ) => {
-        #[allow(clippy::clone_on_copy, reason = "a view is `Copy`, a handle is not: one body for both")]
+        #[allow(clippy::clone_on_copy, reason = "the body was written for handles too; a view is `Copy`")]
         fn $name(
             frame: &Frame,
             db: &Db,
@@ -106,7 +100,7 @@ macro_rules! macro_input_callback_impl {
                             return KEEP;
                         }
 
-                        if ast::Attr::can_cast(node.kind()) {
+                        if view::Attr::can_cast(node.kind()) {
                             in_attr = true;
                             let node_range = node.text_range();
                             while attrs
@@ -115,7 +109,7 @@ macro_rules! macro_input_callback_impl {
                             {
                                 attrs_idx += 1;
                             }
-                        } else if !in_attr && let Some(has_attrs) = $ast::AnyHasAttrs::cast(node.clone()) { // clone: a node handle, a non-atomic count; a view's copy
+                        } else if !in_attr && let Some(has_attrs) = $ast::AnyHasAttrs::cast(node.clone()) { // clone: a view's copy
                             // Attributes of the form `key = value` have `ast::Expr` in them, which returns `Some` for
                             // `AnyHasAttrs::cast()`, so we also need to check `in_attr`.
 
@@ -233,7 +227,7 @@ macro_rules! macro_input_callback_impl {
                         }
                     }
                     WalkEvent::Leave(NodeOrToken::Node(node)) => {
-                        if ast::Attr::can_cast(node.kind()) {
+                        if view::Attr::can_cast(node.kind()) {
                             in_attr = false;
                             attrs_idx += 1;
                         }
@@ -326,16 +320,6 @@ macro_input_callback_impl!(
     CfgExpr::parse_from_view,
     with_one_segment_view
 );
-macro_input_callback_impl!(
-    macro_input_callback_handle,
-    PreorderWithTokens,
-    SyntaxElement,
-    SyntaxToken,
-    ast,
-    expand_cfg_attr,
-    CfgExpr::parse_from_ast,
-    with_one_segment
-);
 
 /// An attribute or derive macro's input, read from a view of the item: `cfg`s and the attributes
 /// `censor_item_tree_attr_ids` names stripped, and syntax errors fixed up when `fix_errors`.
@@ -365,52 +349,6 @@ pub(crate) fn attr_macro_input_to_token_tree(
             span_map,
         );
         let tt = syntax_bridge::call_input_modified(
-            node,
-            InOrder::new(span_map),
-            fixups.append,
-            fixups.remove,
-            span,
-            DocCommentDesugarMode::ProcMacro,
-            callback,
-        );
-        (tt, fixups.undo_info)
-    })
-}
-
-/// [`attr_macro_input_to_token_tree`] of an edited tree's handle (`expand_speculative`), which
-/// no view reads.
-pub(crate) fn attr_macro_input_to_token_tree_handle(
-    db: &Db,
-    node: &SyntaxNode,
-    span_map: SpanMap<'_>,
-    span: Span,
-    is_derive: bool,
-    censor_item_tree_attr_ids: &[AttrId],
-    krate: Crate,
-    fix_errors: bool,
-) -> (tt::TopSubtree, SyntaxFixupUndoInfo) {
-    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-        let fixups = if fix_errors {
-            fixup::fixup_syntax_handle(
-                frame,
-                span_map,
-                node,
-                span,
-                DocCommentDesugarMode::ProcMacro,
-            )
-        } else {
-            fixup::SyntaxFixups::new_in(frame)
-        };
-        let callback = macro_input_callback_handle(
-            frame,
-            db,
-            is_derive,
-            censor_item_tree_attr_ids,
-            krate,
-            span,
-            span_map,
-        );
-        let tt = syntax_bridge::syntax_node_to_token_tree_modified(
             node,
             InOrder::new(span_map),
             fixups.append,

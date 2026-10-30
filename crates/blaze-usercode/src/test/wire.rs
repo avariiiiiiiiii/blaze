@@ -56,11 +56,11 @@ pub const LONGEST: u32 = 64 << 20;
 /// says so.
 pub const LONGEST_OUTPUT: usize = 16 << 20;
 
-/// The first bytes of an execution record's region (`blaze_testsel::record::MAGIC`).
+/// The first bytes of an execution record's region.
 pub const MAGIC: [u8; 8] = *b"blzexec1";
 
 /// An execution record's header: [`MAGIC`], the slot count and the slots armed, each a
-/// little-endian `u32`; slot `n`'s byte is at `HEADER + n` (`blaze_testsel::record::HEADER`).
+/// little-endian `u32`; slot `n`'s byte is at `HEADER + n`.
 pub const HEADER: usize = 16;
 
 /// What a server says a test executed when its binary has no slots.

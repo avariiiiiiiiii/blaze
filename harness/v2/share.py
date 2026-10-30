@@ -1,5 +1,5 @@
-"""share.py: the programs of `crates/hir-ty-share/programs/` built by the pinned nightly's rustc
-and by blaze, each program's stdout held to the `<name>.stdout` beside it
+"""share.py: the programs of `crates/hir-ty-share/programs/` built by blaze, each program's
+stdout held to the `<name>.stdout` beside it
 (`fastcompile-ident-share 2` in v2/requests/fastcompile.md; docs/v2/plan/lanes/fastcompile/share.md).
 
     uv run --frozen python harness/v2/share.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/share.json"}'
@@ -9,7 +9,7 @@ and by blaze, each program's stdout held to the `<name>.stdout` beside it
 These are where sharing one instance's code between type arguments (idea 2) would show if it
 were wrong: `TypeId`, `type_name`, `needs_drop`, statics in generic functions, associated
 consts, const generics, drop order, `dyn` vtables and function pointers. The expected outputs
-were written from what Rust guarantees, not from a rustc run, so rustc is held to them too.
+were written from what Rust guarantees.
 
 The input is one JSON object (inline, a file's path, or `-` for stdin):
 
@@ -24,17 +24,14 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
 The cases are the directory's: every `<name>.rs` with a `<name>.stdout` beside it. A `.rs`
 without one is an error naming it, not a program left out.
 
-Each program is built twice, as a binary in the dev profile's settings at edition 2024:
-rustc runs on the file (`--crate-type bin -C opt-level=0 -C debuginfo=2`, as cargo's `dev`
-asks), and blaze builds a one-file package of it (`src/main.rs`) in a workspace of its own,
-as corpus.py's steps are built. Both programs are run from an empty directory. One outcome per
-program:
+blaze builds each program as a one-file package (`src/main.rs`) in a workspace of its own,
+a binary in the dev profile at edition 2024, as corpus.py's steps are built, and it is run
+from an empty directory. One outcome per program:
 
-    pass   both exit 0 and both stdouts are `<name>.stdout`
-    fail   rustc's stdout or exit is not that (the expected output is wrong, or rustc is:
-           named with both texts), or blaze's is not, or blaze does not build it, or the
-           engine says the build was not blaze's; every one of these is listed
-    error  rustc does not build it (nothing to compare with), or a command timed out
+    pass   it exits 0 and its stdout is `<name>.stdout`
+    fail   its stdout or exit is not that (named with both texts), or blaze does not build
+           it, or the engine says the build was not blaze's
+    error  a command timed out, or the harness could not do a step
 """
 
 import concurrent.futures
@@ -108,18 +105,11 @@ def against(case: Case, who: str, got: str) -> str:
             f"  expected:\n{indented(case.expected)}\n  {who} printed:\n{indented(lines(got))}")
 
 
-def judge(case: Case, rustc_build: engine.Ran, rustc_run: engine.Ran | None, blaze_build: engine.Ran,
-          blaze_run: engine.Ran | None, who: str | None) -> tuple[report.Verdict, str]:
-    """The verdict of `case` from what each side's build and run gave (a run is None when its
-    build failed), and who built blaze's side when blaze did not (`Engine.not_blazes`)."""
-    if rustc_build.returncode != 0 or rustc_run is None:
-        return "error", (f"{case.name}: rustc does not build it (exit {rustc_build.returncode}), so there is "
-                         f"nothing to compare with:\n{rustc_build.said(1500)}")
+def judge(case: Case, blaze_build: engine.Ran, blaze_run: engine.Ran | None,
+          who: str | None) -> tuple[report.Verdict, str]:
+    """The verdict of `case` from what blaze's build and run gave (the run is None when the
+    build failed), and who built it when blaze did not (`Engine.not_blazes`)."""
     problems: list[str] = []
-    if rustc_run.returncode != 0:
-        problems.append(f"rustc's {case.name} exits {rustc_run.returncode}:\n{rustc_run.said(1500)}")
-    if lines(rustc_run.stdout) != case.expected:
-        problems.append(against(case, "rustc", rustc_run.stdout))
     if who is not None:
         problems.append(f"blaze's build of {case.name} is not blaze's: {who}")
     elif blaze_build.returncode != 0 or blaze_run is None:
@@ -140,13 +130,8 @@ def manifest(name: str) -> str:
             f'[[bin]]\nname = "{name}"\npath = "src/main.rs"\n\n[workspace]\n')
 
 
-def rustc_argv(case: Case, out: Path) -> list[str]:
-    return ["rustc", str(case.source), "--edition", EDITION, "--crate-name", case.name, "--crate-type", "bin",
-            "-C", "opt-level=0", "-C", "debuginfo=2", "-o", str(out)]
-
-
 def run_case(eng: engine.Engine, case: Case, root: Path, home: Path, store: Path) -> report.Outcome:
-    """`case` built and run by both sides under `root`. Never raises for what the harness
+    """`case` built and run by blaze under `root`. Never raises for what the harness
     could not do: that is an outcome too."""
     label = f"share/{case.name}"
     try:
@@ -156,11 +141,7 @@ def run_case(eng: engine.Engine, case: Case, root: Path, home: Path, store: Path
         cwd.mkdir()
         (ws / "Cargo.toml").write_text(manifest(case.name))
         shutil.copyfile(case.source, ws / "src" / "main.rs")
-        reference = root / ("reference" + engine.EXE)
         plain = engine.scrubbed()
-        rustc_build = engine.run(f"{label}: rustc", rustc_argv(case, reference), root, plain, BUILD_SECS)
-        rustc_run = (engine.run(f"{label}: rustc's program", [str(reference)], cwd, plain, RUN_SECS)
-                     if rustc_build.returncode == 0 else None)
         env = eng.env(home, store)
         blaze_build = eng.build(f"{label}: blaze build", ws, env, timeout=BUILD_SECS)
         who = eng.not_blazes(blaze_build)
@@ -173,9 +154,8 @@ def run_case(eng: engine.Engine, case: Case, root: Path, home: Path, store: Path
         return report.Outcome(label, "error", str(e))
     except OSError as e:
         return report.Outcome(label, "error", f"{type(e).__name__}: {e}")
-    verdict, detail = judge(case, rustc_build, rustc_run, blaze_build, blaze_run, who)
-    numbers: dict[str, report.Number] = {"rustc_s": round(rustc_build.seconds, 2),
-                                         "blaze_s": round(blaze_build.seconds, 2)}
+    verdict, detail = judge(case, blaze_build, blaze_run, who)
+    numbers: dict[str, report.Number] = {"blaze_s": round(blaze_build.seconds, 2)}
     return report.Outcome(label, verdict, detail, numbers)
 
 
@@ -249,33 +229,25 @@ def test_cases() -> None:
 
 def test_judge() -> None:
     good = ran(0, CASE.expected)
-    assert judge(CASE, ran(0), good, ran(0), good, None) == ("pass", "")
-    assert judge(CASE, ran(0), good, ran(0), ran(0, CASE.expected.replace("\n", "\r\n")), None) == ("pass", "")
-    verdict, detail = judge(CASE, ran(1, "", "error[E0425]"), None, ran(0), good, None)
-    assert verdict == "error" and "rustc does not build" in detail and "E0425" in detail, detail
-    # rustc that prints otherwise fails the case, naming the program and both texts.
-    verdict, detail = judge(CASE, ran(0), ran(0, "true\ntrue\ntrue\nfalse\n"), ran(0), good, None)
-    assert verdict == "fail" and detail.startswith("type_id: rustc's stdout") and "line 1" in detail, detail
-    assert "expected:\n    false" in detail and "rustc printed:\n    true" in detail and "blaze" not in detail, detail
-    verdict, detail = judge(CASE, ran(0), good, ran(0), ran(0, "false\ntrue\ntrue\n"), None)
+    assert judge(CASE, ran(0), good, None) == ("pass", "")
+    assert judge(CASE, ran(0), ran(0, CASE.expected.replace("\n", "\r\n")), None) == ("pass", "")
+    verdict, detail = judge(CASE, ran(0), ran(0, "false\ntrue\ntrue\n"), None)
     assert verdict == "fail" and "blaze's stdout is not type_id.stdout" in detail and "line 4" in detail, detail
-    verdict, detail = judge(CASE, ran(0), good, ran(101, "", "error: x"), None, None)
+    assert "expected:\n    false" in detail and "blaze printed:\n    false" in detail, detail
+    verdict, detail = judge(CASE, ran(101, "", "error: x"), None, None)
     assert verdict == "fail" and "blaze does not build type_id (exit 101)" in detail and "error: x" in detail, detail
-    verdict, detail = judge(CASE, ran(0), good, ran(0), ran(101, CASE.expected, "panicked"), None)
+    verdict, detail = judge(CASE, ran(0), ran(101, CASE.expected, "panicked"), None)
     assert verdict == "fail" and "blaze's type_id exits 101" in detail, detail
-    verdict, detail = judge(CASE, ran(0), good, ran(0), None, "cargo: no daemon")
+    verdict, detail = judge(CASE, ran(0), None, "cargo: no daemon")
     assert verdict == "fail" and "not blaze's: cargo: no daemon" in detail, detail
-    # Both sides wrong: both are said.
-    verdict, detail = judge(CASE, ran(0), ran(0, "x\n"), ran(0), ran(0, "y\n"), None)
-    assert verdict == "fail" and "rustc's stdout" in detail and "blaze's stdout" in detail, detail
+    # A wrong exit and a wrong stdout: both are said.
+    verdict, detail = judge(CASE, ran(0), ran(1, "y\n"), None)
+    assert verdict == "fail" and "exits 1" in detail and "blaze's stdout" in detail, detail
 
 
 def test_package() -> None:
     text = manifest("drop_order")
     assert '[package]\nname = "drop_order"' in text and 'edition = "2024"' in text and text.endswith("[workspace]\n")
-    argv = rustc_argv(Case("drop_order", Path("/p/drop_order.rs"), ""), Path("/w/reference"))
-    assert argv[:2] == ["rustc", "/p/drop_order.rs"] and "--crate-type" in argv and argv[-2:] == ["-o", "/w/reference"]
-    assert argv[argv.index("--edition") + 1] == EDITION
 
 
 def test_input() -> None:

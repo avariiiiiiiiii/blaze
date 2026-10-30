@@ -5,6 +5,7 @@
 use std::{fmt::Write as _, hash::BuildHasher, path::Path};
 
 use blaze_ids::rng::SplitMix64;
+use hegel::generators as gs;
 use rustc_hash::FxBuildHasher;
 use span::ErasedFileAstId;
 
@@ -105,10 +106,18 @@ impl Gen {
                     LitKind::CStrRaw(hashes),
                     LitKind::Err(()),
                 ][self.rng.below(11) as usize];
-                let len = self.rng.below(40) as usize;
+                // Now and then a suffix past a byte's 255, the length a `u8` once held (queue
+                // 00023): `1` and 256 or more letters is a literal rustc lexes.
+                let len = match self.rng.below(50) {
+                    0 => 256 + self.rng.below(300) as usize,
+                    _ => self.rng.below(40) as usize,
+                };
                 let text: String =
                     (0..len).map(|_| char::from(b'a' + self.rng.below(26) as u8)).collect();
-                let suffix_len = self.rng.below(len.min(30) as u64 + 1) as u32;
+                let suffix_len = match len > 255 {
+                    true => len as u32 - self.rng.below(2) as u32,
+                    false => self.rng.below(len.min(30) as u64 + 1) as u32,
+                };
                 Leaf::Literal(Literal { text_and_suffix: Symbol::intern(&text), span, kind, suffix_len })
             }
         }
@@ -425,6 +434,29 @@ fn check_wire(tree: &TopSubtree, damage: bool) {
             read.write_wire(&mut again);
             assert_eq!(again, damaged[..used], "byte {at} flipped");
         }
+    }
+}
+
+/// The window as one compare numbers symbols as the scan of the last [`SYMBOL_WINDOW`] did,
+/// over IDs that repeat at every distance around the window's edge.
+#[test]
+fn the_symbol_window_numbers_as_its_scan_did() {
+    for seed in 0..40 {
+        let mut rng = SplitMix64::new(seed);
+        let ids: Vec<u32> = (0..400).map(|_| 1 + rng.below(4 + seed * 3) as u32).collect();
+        let (mut symbols, mut scanned) = (Symbols::default(), Vec::<u32>::new());
+        for &id in &ids {
+            let from = scanned.len().saturating_sub(SYMBOL_WINDOW);
+            let expected = match scanned[from..].iter().rposition(|&it| it == id) {
+                Some(at) => (from + at) as u32,
+                None => {
+                    scanned.push(id);
+                    (scanned.len() - 1) as u32
+                }
+            };
+            assert_eq!(symbols.index(Symbol::from_held_id(id)), expected, "seed {seed}, id {id}");
+        }
+        assert_eq!(symbols.list, scanned, "seed {seed}");
     }
 }
 
@@ -919,37 +951,33 @@ fn a_framed_tree_is_the_global_tree_in_the_frame() {
     });
 }
 
-proptest::proptest! {
-    /// A tree built, written to the wire and read back has the very block it was built with,
-    /// and its header describes that block.
-    #[test]
-    fn a_tree_read_from_the_wire_has_the_built_block(
-        seed in proptest::num::u64::ANY,
-        parts in 1usize..12,
-        budget in 0u64..80,
-    ) {
-        let mut trees = Gen::new(seed, parts);
-        let tree = TopSubtree::from_serialized(trees.tree(budget));
-        proptest::prop_assert_eq!(Layout::of_header(tree.block()), Some(tree.layout));
-        let mut bytes = Vec::new();
-        tree.write_wire(&mut bytes);
-        let parts = wire::parts_of(&tree);
-        let mut resolve = |part: WirePart| {
-            parts
-                .iter()
-                .find(|(it, _)| *it == part)
-                .map(|&(_, it)| it)
-                .ok_or_else(|| "a part the tree didn't have".to_owned())
-        };
-        let (read, used) =
-            TopSubtree::read_wire(&bytes, &mut resolve).expect("a tree's own bytes");
-        proptest::prop_assert_eq!(used, bytes.len());
-        proptest::prop_assert_eq!(read.block(), tree.block());
-        proptest::prop_assert_eq!(read.layout, tree.layout);
-        proptest::prop_assert_eq!((read.top_open, read.top_close), (tree.top_open, tree.top_close));
-    }
+/// A tree built, written to the wire and read back has the very block it was built with,
+/// and its header describes that block.
+#[hegel::test]
+fn a_tree_read_from_the_wire_has_the_built_block(tc: hegel::TestCase) {
+    let seed: u64 = tc.draw(gs::integers());
+    let parts: usize = tc.draw(gs::integers().min_value(1).max_value(11));
+    let budget: u64 = tc.draw(gs::integers().max_value(79));
+    let mut trees = Gen::new(seed, parts);
+    let tree = TopSubtree::from_serialized(trees.tree(budget));
+    assert_eq!(Layout::of_header(tree.block()), Some(tree.layout));
+    let mut bytes = Vec::new();
+    tree.write_wire(&mut bytes);
+    let parts = wire::parts_of(&tree);
+    let mut resolve = |part: WirePart| {
+        parts
+            .iter()
+            .find(|(it, _)| *it == part)
+            .map(|&(_, it)| it)
+            .ok_or_else(|| "a part the tree didn't have".to_owned())
+    };
+    let (read, used) =
+        TopSubtree::read_wire(&bytes, &mut resolve).expect("a tree's own bytes");
+    assert_eq!(used, bytes.len());
+    assert_eq!(read.block(), tree.block());
+    assert_eq!(read.layout, tree.layout);
+    assert_eq!((read.top_open, read.top_close), (tree.top_open, tree.top_close));
 }
-
 
 /// Every kind, with 0, 1 and 255 `#`s for a raw one, comes back from its number.
 #[test]
@@ -1013,16 +1041,62 @@ fn old_lit_kind(code: u8, hashes: u8) -> LitKind {
     }
 }
 
-proptest::proptest! {
-    /// `code`, and a node's literal kind read back, are the old `match`es for any number and
-    /// count of `#`s.
-    #[test]
-    fn literal_codes_are_the_old_ones(code in 0u8..16, hashes in proptest::num::u8::ANY) {
-        let kind = old_lit_kind(code, hashes);
-        proptest::prop_assert_eq!(kind.code(), old_code(kind));
-        let node = Node::literal(kind, 0, 0);
-        proptest::prop_assert_eq!(node.lit_kind(), kind);
-        let head = LITERAL | u32::from(code) << 2 | u32::from(hashes) << 6;
-        proptest::prop_assert_eq!(Node { head, data: 0 }.lit_kind(), old_lit_kind(code, hashes));
+/// `code`, and a node's literal kind read back, are the old `match`es for any number and
+/// count of `#`s.
+#[hegel::test]
+fn literal_codes_are_the_old_ones(tc: hegel::TestCase) {
+    let code: u8 = tc.draw(gs::integers().max_value(15));
+    let hashes: u8 = tc.draw(gs::integers());
+    let kind = old_lit_kind(code, hashes);
+    assert_eq!(kind.code(), old_code(kind));
+    let node = Node::literal(kind, 0, 0);
+    assert_eq!(node.lit_kind(), kind);
+    let head = LITERAL | u32::from(code) << 2 | u32::from(hashes) << 6;
+    assert_eq!(Node { head, data: 0 }.lit_kind(), old_lit_kind(code, hashes));
+}
+
+/// The scan-then-map index blaze-expand's native `Parts::index` had, before it took
+/// [`IndexTable`].
+fn old_index(list: &mut Vec<u32>, map: &mut rustc_hash::FxHashMap<u32, u32>, value: u32) -> u32 {
+    if list.len() <= SCAN {
+        if let Some(at) = list.iter().position(|it| *it == value) {
+            return at as u32;
+        }
+        let at = list.len() as u32;
+        list.push(value);
+        if list.len() > SCAN {
+            map.extend(list.iter().enumerate().map(|(at, &it)| (it, at as u32)));
+        }
+        return at;
     }
+    let next = list.len() as u32;
+    *map.entry(value).or_insert_with(|| {
+        list.push(value);
+        next
+    })
+}
+
+#[hegel::test]
+fn index_table_numbers_as_the_old_parts_did(tc: hegel::TestCase) {
+    let values: Vec<u32> = tc.draw(gs::vecs(gs::integers().max_value(39)).max_size(199));
+    let mut table = IndexTable::default();
+    let (mut list, mut map) = (Vec::new(), rustc_hash::FxHashMap::default());
+    for &value in &values {
+        assert_eq!(table.index(value), old_index(&mut list, &mut map, value));
+    }
+    assert_eq!(table.list(), &list[..]);
+    table.clear();
+    assert!(table.list().is_empty());
+}
+
+#[hegel::test]
+fn aligned_bytes_are_the_bytes_at_a_word(tc: hegel::TestCase) {
+    let bytes: Vec<u8> = tc.draw(gs::binary().max_size(63));
+    let skip: usize = tc.draw(gs::integers().max_value(3));
+    let backing = [&[0u8; 4][..skip], &bytes].concat();
+    let given = &backing[skip..];
+    let mut scratch = Vec::new();
+    let out = aligned(given, &mut scratch);
+    assert_eq!(out, given);
+    assert!(out.as_ptr().addr().is_multiple_of(4));
 }

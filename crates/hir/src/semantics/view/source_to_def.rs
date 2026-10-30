@@ -9,8 +9,8 @@ use either::Either;
 use hir_def::{
     AdtId, BlockId, BuiltinDeriveImplId, ConstId, ConstParamId, DefWithBodyId, EnumId,
     EnumVariantId, ExpressionStoreOwnerId, ExternBlockId, ExternCrateId, FieldId, FunctionId,
-    GenericDefId, GenericParamId, ImplId, LifetimeParamId, MacroId, ModuleId, StaticId, StructId,
-    TraitId, TypeAliasId, TypeParamId, UnionId, UseId, VariantId,
+    GenericDefId, GenericParamId, HasModule as _, ImplId, LifetimeParamId, MacroId, ModuleId,
+    StaticId, StructId, TraitId, TypeAliasId, TypeParamId, UnionId, UseId, VariantId,
     dyn_map::{
         DynMap,
         keys::{self, Key},
@@ -40,6 +40,7 @@ use crate::{
     semantics::{
         LintAttr,
         child_by_source::ChildBySource,
+        kmerge2,
         source_to_def::{ChildContainer, SourceToDefCtx},
     },
 };
@@ -87,6 +88,7 @@ to_def_impls![
     (crate::ExternCrateDecl, ExternCrate, extern_crate_to_def),
     (crate::InlineAsmOperand, AsmOperandNamed, asm_operand_to_def),
     (crate::ExternBlock, ExternBlock, extern_block_to_def),
+    (crate::UseDecl, Use, use_to_def),
     (MacroCallId, MacroCall, macro_call_to_macro_call),
 ];
 
@@ -339,9 +341,10 @@ impl<'db> Semantics<'db> {
         node: Node<'db>,
         offset: syntax::TextSize,
     ) -> impl Iterator<Item = Node<'db>> + '_ {
-        node.token_at_offset(offset)
-            .map(|token| self.token_ancestors_with_macros(token))
-            .kmerge_by(|node1, node2| node1.text_range().len() < node2.text_range().len())
+        kmerge2(
+            node.token_at_offset(offset).map(|token| self.token_ancestors_with_macros(token)),
+            |node1, node2| node1.text_range().len() < node2.text_range().len(),
+        )
     }
 
     /// Attempts to map the node out of macro expanded files returning the original file range.
@@ -739,8 +742,9 @@ impl<'db> ViewCtx<'db, '_> {
         ID: Copy + 'static,
         keys::AstPtrPolicy<N, ID>: keys::Slot<N, ID>,
     {
+        let node = InFile::new(src.file_id, src.value.syntax());
         let ptr = AstPtr::<N>::of(src.value);
-        self.dyn_map(src.map(|it| it.syntax()))?[key].get(&ptr).copied()
+        self.dyn_map(node)?[key].get(&ptr).copied()
     }
 
     fn dyn_map(&mut self, src: InFile<Node<'db>>) -> Option<&DynMap> {

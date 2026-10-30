@@ -21,8 +21,7 @@ the blaze version instead.
 blaze compiles your code itself (Cranelift or LLVM, from rust-analyzer's MIR) and links it with
 code rustc compiled. The two must agree on how types are laid out, how functions are called,
 what a `TypeId` hashes, the names of symbols, libtest's entry point, the proc-macro bridge and
-what rustc answers about targets. blaze knows those facts for one toolchain, checked by the
-corpus difftest, and that toolchain is the base blaze replaces piece by piece
+what rustc answers about targets. blaze knows those facts for one toolchain, and that toolchain is the base blaze replaces piece by piece
 ([no-rustc.md](no-rustc.md): cargo, then rustc, then the standard library's build). Following
 each project's pin would mean knowing every release's facts and checking every release; the
 goal is the reverse, no rustc at all. So the toolchain is part of blaze, versioned with it, like
@@ -88,16 +87,14 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    bridge by hand), `Cargo.toml` and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into
-   `answers/rustc.json`.
+   `crates/blaze-units/src/stdlib/rustc.json`.
 3. The pull request `toolchain: pin nightly-YYYY-MM-DD` is opened, or updated when one is open,
    which runs the merge gate, and the release train is started on the branch and on
    `toolchain/base`, the main commit the branch is on, to compare with. (main's own trains are
    cancelled by the next merge more often than not, and an older one has red that main gained
    since.) The train is
-   what a bump needs beyond the gate: the corpus difftest with `--layouts` and every other
-   harness on four platforms, rustc's borrow-check UI tests in both modes against the new
-   nightly's own verdicts (at its commit, `--min-pass` as the floor) and
-   `blaze` on real projects.
+   what a bump needs beyond the gate: every harness on four platforms and `blaze` on real
+   projects.
 4. When the train finishes, `harness/stdcount.py` compiles the standard library with the bump's
    build and with `toolchain/base`'s (the same main commit, the old pin), each against its own
    `library/`, and counts the functions each refuses. Against main's newest build

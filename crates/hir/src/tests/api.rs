@@ -9,8 +9,8 @@ use test_fixture::WithFixture;
 
 use super::{db::TestDB, kinds};
 use crate::{
-    Adt, AssocItem, Crate, DisplayTarget, Function, HasAttrs, HasSource, HirDisplay, Impl,
-    ModuleDef, SignatureMismatchAt, Type,
+    Adt, AssocItem, Crate, DisplayTarget, Function, HasAttrs, HirDisplay, Impl, ModuleDef,
+    SignatureMismatchAt, Type, view::HasSourceView as _,
 };
 
 /// The item named `name` at the root of a crate of the fixture.
@@ -284,7 +284,7 @@ fn f() {
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
         let ty = infer.type_of_expr_or_pat(closure.into()).expect("the closure has a type");
         let ty = Type::new(&db, id.into(), ty);
-        let source = ty.as_closure().expect("a closure type").source(&db).expect("a source");
+        let source = ty.as_closure().expect("a closure type").source_view(&db).expect("a source");
         assert_eq!(source.value.to_string(), "|x: u8| x");
     });
 }
@@ -380,4 +380,58 @@ fn main() {
             .sum();
         assert_eq!(skipped, 1, "with no environment variable: {found:?}");
     });
+}
+
+/// `Adjust::from` gives what `Semantics::expr_adjustments` and the body analysis's did each
+/// on their own before it.
+#[test]
+fn adjustments_convert_as_before() {
+    use hir_def::type_ref::Mutability as Hir;
+    use hir_ide::{
+        PointerCast,
+        infer::{AllowTwoPhase, AutoBorrowMutability},
+        next_solver::Mutability as Ty,
+    };
+
+    use crate::{Adjust, AutoBorrow, OverloadedDeref};
+
+    let old = |adjust: hir_ide::Adjust| -> Adjust {
+        let mutability = |m| match m {
+            Ty::Not => Hir::Shared,
+            Ty::Mut => Hir::Mut,
+        };
+        match adjust {
+            hir_ide::Adjust::NeverToAny => Adjust::NeverToAny,
+            hir_ide::Adjust::Deref(Some(hir_ide::OverloadedDeref(m))) => {
+                Adjust::Deref(Some(OverloadedDeref(mutability(m))))
+            }
+            hir_ide::Adjust::Deref(None) => Adjust::Deref(None),
+            hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::RawPtr(m)) => {
+                Adjust::Borrow(AutoBorrow::RawPtr(mutability(m)))
+            }
+            hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::Ref(m)) => {
+                Adjust::Borrow(AutoBorrow::Ref(mutability(m.into())))
+            }
+            hir_ide::Adjust::Pointer(pc) => Adjust::Pointer(pc),
+        }
+    };
+    let mut cases = vec![
+        hir_ide::Adjust::NeverToAny,
+        hir_ide::Adjust::Deref(None),
+        hir_ide::Adjust::Pointer(PointerCast::ReifyFnPointer),
+        hir_ide::Adjust::Pointer(PointerCast::Unsize),
+        hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::Ref(AutoBorrowMutability::Not)),
+    ];
+    for two_phase in [AllowTwoPhase::Yes, AllowTwoPhase::No] {
+        cases.push(hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::Ref(AutoBorrowMutability::Mut {
+            allow_two_phase_borrow: two_phase,
+        })));
+    }
+    for m in [Ty::Not, Ty::Mut] {
+        cases.push(hir_ide::Adjust::Deref(Some(hir_ide::OverloadedDeref(m))));
+        cases.push(hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::RawPtr(m)));
+    }
+    for case in cases {
+        assert_eq!(Adjust::from(case), old(case), "{case:?}");
+    }
 }

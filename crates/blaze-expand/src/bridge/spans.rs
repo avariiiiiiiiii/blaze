@@ -4,9 +4,26 @@
 
 use load_cargo::{SubRequest, SubResponse};
 use span::{
-    ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor, SyntaxContext, TextRange,
-    TextSize,
+    EditionedFileId, ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor,
+    SyntaxContext, TextRange, TextSize,
 };
+
+/// `start..end`, an end before the start taken as the start.
+pub fn range(start: u32, end: u32) -> TextRange {
+    TextRange::new(TextSize::new(start), TextSize::new(end.max(start)))
+}
+
+/// The span of the raw fields the database answered (`SpanParentResult`, `SpanSourceResult`).
+pub fn spanned(file_id: u32, ast_id: u32, start: u32, end: u32, ctx: u32) -> Span {
+    let anchor = SpanAnchor {
+        file_id: EditionedFileId::from_raw(file_id),
+        ast_id: ErasedFileAstId::from_raw(ast_id),
+    };
+    // Every caller passes a `ctx` that `load_cargo::answer` read from the running expansion's
+    // database in this process; a wrong value panics in `from_u32` or in salsa's checked
+    // lookup, or names another context's hygiene.
+    Span { range: range(start, end), anchor, ctx: SyntaxContext::from_u32(ctx) }
+}
 
 /// The part of `span` between `start` and `end`, each a `Bound` as the module encodes one
 /// (`0` unbounded, `4 * n + 1` included, `4 * n + 3` excluded): `None` when it is not within
@@ -76,14 +93,12 @@ pub fn join(
             file_id: first.anchor.file_id,
             ast_id: ErasedFileAstId::from_raw(it.ast_id),
         };
-        // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts:
         // `it.ctx` is what `ask` answered for this join, which each host gets from
-        // `load_cargo::answer` of the running expansion's database, in this process. Memory
-        // safety doesn't rest on it: a wrong value panics in `from_u32` or in salsa's checked
-        // lookup, or names another context's hygiene.
-        let ctx = unsafe { SyntaxContext::from_u32(it.ctx) };
-        let range = TextRange::new(TextSize::new(it.start), TextSize::new(it.end.max(it.start)));
-        return Some(Span { range, anchor, ctx });
+        // `load_cargo::answer` of the running expansion's database, in this process; a wrong
+        // value panics in `from_u32` or in salsa's checked lookup, or names another context's
+        // hygiene.
+        let ctx = SyntaxContext::from_u32(it.ctx);
+        return Some(Span { range: range(it.start, it.end), anchor, ctx });
     }
     if first.ctx != second.ctx {
         return Some(first);

@@ -17,17 +17,19 @@
 use blaze_items::{Fact, ItemId};
 use either::Either;
 use hir::{HasAttrs as _, HasVisibility as _, HirFileId, InFile};
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     SyntaxKind, TextRange,
     view::{self as ast, AstNode as _, HasName as _},
 };
 
+use stdx::list::Join;
 use crate::{
     cx::{Cx, item_range_view as item_range},
     lints::code_fact,
     lower::{
         Found, Phase,
-        unresolved_field::{find_best_match_for_name, name_series_display},
+        unresolved_field::name_series_display,
     },
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -243,22 +245,6 @@ pub(crate) fn suggestable(cx: &Cx<'_, '_>, field: hir::Field, module: Option<hir
     visible && (local || (!attrs.is_doc_hidden() && !attrs.is_unstable()))
 }
 
-/// rustc's `listify` of names: "`a`", "`a` and `b`", "`a`, `b` and `c`".
-pub(crate) fn listify(names: &[&str]) -> String {
-    match names {
-        // alloc: the error's text, for an error hir found
-        [] => String::new(),
-        // alloc: the error's text, for an error hir found
-        [only] => format!("`{only}`"),
-        [others @ .., last] => {
-            // alloc: the error's text, for an error hir found
-            let others: Vec<String> = others.iter().map(|it| format!("`{it}`")).collect();
-            // alloc: the error's text, for an error hir found
-            format!("{} and `{last}`", others.join(", "))
-        }
-    }
-}
-
 fn adt_fact(cx: &Cx<'_, '_>, diag: &mut Diag, variant: hir::Variant) {
     let adt = variant.adt(cx.db);
     let name = variant_path(cx, variant);
@@ -348,6 +334,7 @@ fn unknown_field<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, variant
             // alloc: the error's parts, for an error hir found
             .collect();
         let similar = find_best_match_for_name(&available, name, None)
+            .cloned()
             .filter(|it| !(name.parse::<usize>().is_ok() && it.parse::<usize>().is_ok()));
         if let Some(similar) = similar {
             // clone: on the error path, for an error hir found
@@ -419,7 +406,7 @@ pub(crate) fn pat_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: h
     {
         // alloc: the error's text, for an error hir found
         let candidate = only.name(cx.db).as_str().to_owned();
-        similar = find_best_match_for_name(std::slice::from_ref(&candidate), &record.fields[last].name, None);
+        similar = find_best_match_for_name(std::slice::from_ref(&candidate), &record.fields[last].name, None).cloned();
         if similar.as_ref().is_some_and(|it| it.parse::<usize>().is_err()) {
             unmentioned.clear();
         }
@@ -636,7 +623,7 @@ fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, varian
     let descr = variant_descr(variant);
     let path = cx.def_path(hir::ModuleDef::Adt(adt));
     // alloc: the error's text, for an error hir found
-    let message = format!("{field_s} {} of {descr} `{path}` {is_are} private", listify(&names));
+    let message = format!("{field_s} {} of {descr} `{path}` {is_are} private", stdx::list::list(names.iter(), Join::AndNoSerialComma, true));
     let mut spans = failed.iter().map(|it| record.span(cx, it.1));
     let mut diag = Diag::error(Some("E0451"), message, spans.next()?);
     for span in spans {
@@ -666,7 +653,7 @@ fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, at: usize, varian
             diag.span_label(
                 record.span(cx, base.unwrap_or(rest)),
                 // alloc: the error's text, for an error hir found
-                format!("{field_s} {} {is_are} private", listify(&rest_names)),
+                format!("{field_s} {} {is_are} private", stdx::list::list(rest_names.iter(), Join::AndNoSerialComma, true)),
             );
         }
     }

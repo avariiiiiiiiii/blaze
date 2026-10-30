@@ -339,7 +339,7 @@ impl Ticket {
 }
 
 /// A value whose bytes are not what the store recorded.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Corrupt {
     pub key: Key,
     pub pack: FileName,
@@ -352,7 +352,7 @@ impl fmt::Display for Corrupt {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Config {
     /// The store's directory, under the driver's root.
     pub dir: FileName,
@@ -364,7 +364,7 @@ pub struct Config {
 
 /// Why a store stopped: it could not open, or its IO failed [`FAILURES_MOST`] times in a row.
 /// What it has mapped it still serves; nothing it is given is made durable.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Broken {
     pub file: FileName,
     pub what: String,
@@ -377,7 +377,7 @@ impl fmt::Display for Broken {
 }
 
 /// How a [`Store::fetch`] from the remote tier ended.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Fetched {
     /// Verified and kept, durable once its ticket is.
     Kept(Ticket),
@@ -388,7 +388,7 @@ pub enum Fetched {
 }
 
 /// How a [`Store::place`] ended.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Placed {
     /// The tag `place` returned.
     pub tag: Tag,
@@ -1058,7 +1058,7 @@ impl Store {
             settled.more = true;
             return settled;
         }
-        let mut spent = 0;
+        let mut spent: u64 = 0;
         let encodings = Arc::clone(&self.columns);
         let (mut demote, mut promote) = self.tier_moves();
         radix::sort_by_key(&mut demote, |(_, loc, _)| {
@@ -2020,13 +2020,12 @@ impl Store {
         if compact {
             // alloc: once per index written (every `INDEX_AFTER` records); empty unless a slot is not whole
             let mut bad = Vec::new();
-            let mut entries = self.index_entries(&mut bad);
+            let entries = self.index_entries(&mut bad);
             for (_, what) in bad {
                 self.problems
                     // alloc: a problem reported
                     .push(format!("a slot of {} left out of the next index: {what}", own.index_file()));
             }
-            entries.sort_unstable_by_key(|(key, _)| *key);
             let bytes = index::build_index(&entries);
             let slot = match own.head.index {
                 Some(it) => 1 - it.slot,
@@ -2401,11 +2400,12 @@ impl Store {
             }
             Mapped::External { content, batch } => {
                 if let Some(external) = tier.externals.get_mut(&content) {
-                    if len != external.len {
+                    let named = external.len;
+                    if len != named {
                         return self.fail(
                             file,
                             // alloc: the error that breaks the store
-                            format!("it is {len} bytes, not the {} its head names", external.len),
+                            format!("it is {len} bytes, not the {named} its head names"),
                         );
                     }
                     external.mapping = Some(mapping);

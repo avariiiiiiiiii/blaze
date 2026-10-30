@@ -28,11 +28,18 @@ winnow = { version = "0.7.13", default-features = false }
 expect-test = "1.5.1"
 
 blaze-alloc-count.workspace = true
+hegeltest.workspace = true
 stdx.workspace = true
+
+[[bench]]
+name = "lex"
+harness = false
 
 [features]
 default = []
 in-rust-tree = []
+# `LexedStr::lexes_alike`, the fast lexer against `rustc_lexer` alone, for the fuzz target.
+fuzz = []
 
 [lints]
 workspace = true

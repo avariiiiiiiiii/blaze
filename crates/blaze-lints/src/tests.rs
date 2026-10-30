@@ -73,8 +73,19 @@ pub(crate) fn lint(fixture: &str, flags: &str) -> String {
     lint_with(fixture, flags, Conf::default())
 }
 
-/// [`lint`] with the `clippy.toml` configuration `conf`.
+/// [`lint`] with the `clippy.toml` configuration `conf`. Each fixture is linted twice, on two
+/// databases, with the lints dispatched on the node's kind and as each cast the node for
+/// itself before ([`crate::lints::check_node_by_casts`]): the two write the same.
 pub(crate) fn lint_with(fixture: &str, flags: &str, conf: Conf) -> String {
+    let by_kind = lint_once(fixture, flags, conf.clone());
+    crate::lints::BY_CASTS.set(true);
+    let by_casts = lint_once(fixture, flags, conf);
+    crate::lints::BY_CASTS.set(false);
+    assert_eq!(by_kind, by_casts, "the dispatch on the kind finds what the casts found");
+    by_kind
+}
+
+fn lint_once(fixture: &str, flags: &str, conf: Conf) -> String {
     let db = Db::with_files(fixture);
     hir::attach_db(&db, || {
         let krate = main_crate(&db);

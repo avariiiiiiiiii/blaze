@@ -1015,3 +1015,23 @@ fn a_copied_mapping_reads_as_the_file_mapped() {
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// An asker names a file in each effect it makes of it (a journal's appends and syncs, the
+/// store's reads): a name's clone is a count of the one made, so those effects allocate nothing
+/// for their names.
+#[test]
+fn a_file_name_cloned_into_effects_allocates_nothing() {
+    assert!(blaze_alloc_count::installed());
+    let file = name("state/journal");
+    let mut effects = Vec::with_capacity(64);
+    blaze_alloc_count::assert_at_most(0, "a name in each of 64 effects", || {
+        for round in 0..32 {
+            effects.push(Effect::Sync { file: file.clone(), tag: Tag(2 * round) });
+            effects.push(Effect::ReadAll { file: file.clone(), tag: Tag(2 * round + 1) });
+        }
+        effects.clear();
+    });
+    let copy = file.clone();
+    assert_eq!(copy, file);
+    assert_eq!(copy.as_str().as_ptr(), file.as_str().as_ptr(), "one name, shared");
+}

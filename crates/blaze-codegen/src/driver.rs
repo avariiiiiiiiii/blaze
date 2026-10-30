@@ -977,8 +977,11 @@ impl<'a, B: Prepare> Build<'a, B> {
                 (*id, reach::Node { marks, refs: &node.refs })
             }),
         );
+        // Each instance's two hashes are its own: on every core, in key order.
         let versions = nodes
-            .values()
+            .values
+            .par_iter()
+            .with_min_len(256)
             .map(|node| {
                 let id = crate::exec::fn_id(node.described.identity, node.unit.instance.settings);
                 let item_of = |key: &InstanceKey| nodes.get(key).map(|it| it.unit.item);

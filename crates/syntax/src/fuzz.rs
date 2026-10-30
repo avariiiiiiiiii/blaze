@@ -64,6 +64,11 @@ impl CheckReparse {
                 );
             }
         }
+        assert_eq!(
+            new_parse.root().descendants().count(),
+            full_reparse.root().descendants().count(),
+            "the reparse and the full parse have as many nodes"
+        );
         // FIXME
         // assert_eq!(new_file.errors(), full_reparse.errors());
     }

@@ -3,6 +3,8 @@
 //! Test that a `tracked` fn on a `salsa::interned`
 //! compiles and executes successfully.
 
+#![forbid(unsafe_code)]
+
 #[salsa::interned(unsafe(no_lifetime), revisions = usize::MAX, debug)]
 struct Name {
     name: String,

@@ -3,11 +3,11 @@
 //! A one-chunk input's blocks before its last go through the backend's [`Leading`] (official
 //! BLAKE3's `hash_many`, or [`leading_lanes`] under `blake3-servil`, which exports no kernel
 //! that stops short of a root); each input's last block, of any length, through
-//! [`compress_lanes`], eight at a time. `compress_lanes` is ours: `of_many_is_of_for_each` and
+//! [`compress_lanes`], 16 at a time on AVX-512 and 8 elsewhere. `compress_lanes` is ours: `of_many_is_of_for_each` and
 //! the backends' differential test hold every path to the hasher at every length and grouping,
 //! so a change in any fails there and not in an ID.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, simd::Simd};
 
 use crate::{
     ContentId,
@@ -99,70 +99,202 @@ fn hash_into<L: Leading>(key: &ContextKey, inputs: &[&[u8]], out: &mut [ContentI
         if members.is_empty() {
             continue;
         }
-        cvs.clear();
-        if group == 0 {
-            cvs.resize(members.len(), words);
+        let start = if group == 0 {
+            Start::Key(&words)
         } else {
+            cvs.clear();
             L::leading_blocks(&words, inputs, members, group, cvs);
+            Start::After(cvs.as_slice())
+        };
+        last_blocks(inputs, members, start, group, out);
+    }
+}
+
+/// What a group's last blocks are compressed from: the context key itself, for inputs of at
+/// most one block, else each member's chaining value after its leading blocks.
+#[derive(Clone, Copy)]
+enum Start<'a> {
+    Key(&'a [u32; 8]),
+    After(&'a [[u32; 8]]),
+}
+
+/// Each of `members`' last block, the bytes from block `group` on, compressed from `start` as
+/// its chunk's end and the root, its content ID written to `out`: 16 lanes in AVX-512 registers
+/// and 8 in AVX2 ones where the CPU has them, else [`LANES`] at the target's baseline.
+fn last_blocks(inputs: &[&[u8]], members: &[u32], start: Start<'_>, group: usize, out: &mut [ContentId]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            return x86::last_blocks_avx512(inputs, members, start, group, out);
         }
-        let first = if group == 0 { CHUNK_START } else { 0 };
-        let flags = u32::from(DERIVE_KEY_MATERIAL | first | CHUNK_END | ROOT);
-        for (batch, batch_cvs) in members.chunks(LANES).zip(cvs.chunks(LANES)) {
-            let mut cv = [[0; LANES]; 8];
-            let mut message = [[0; LANES]; 16];
-            let mut block_len = [0; LANES];
-            for (lane, (&at, words)) in batch.iter().zip(batch_cvs).enumerate() {
-                let last = &inputs[at as usize][group * BLOCK_LEN..];
-                block_len[lane] = last.len() as u32;
-                for (word, &value) in words.iter().enumerate() {
-                    cv[word][lane] = value;
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return x86::last_blocks_avx2(inputs, members, start, group, out);
+        }
+    }
+    last_blocks_of::<LANES>(inputs, members, start, group, out);
+}
+
+/// [`last_blocks`] `N` members at a time. Always inlined, so it is vectorized for the features
+/// of the function it is inlined into.
+#[inline(always)]
+fn last_blocks_of<const N: usize>(
+    inputs: &[&[u8]],
+    members: &[u32],
+    start: Start<'_>,
+    group: usize,
+    out: &mut [ContentId],
+) {
+    let first = if group == 0 { CHUNK_START } else { 0 };
+    let flags = u32::from(DERIVE_KEY_MATERIAL | first | CHUNK_END | ROOT);
+    for (n, batch) in members.chunks(N).enumerate() {
+        let cv: [[u32; N]; 8] = match start {
+            Start::Key(key) => key.map(|word| [word; N]),
+            Start::After(cvs) => {
+                let mut cv = [[0; N]; 8];
+                for (lane, words) in cvs[n * N..n * N + batch.len()].iter().enumerate() {
+                    for (word, &value) in words.iter().enumerate() {
+                        cv[word][lane] = value;
+                    }
                 }
-                let mut block = [0; BLOCK_LEN];
-                block[..last.len()].copy_from_slice(last);
-                for (word, bytes) in block.chunks_exact(4).enumerate() {
-                    message[word][lane] = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                }
+                cv
             }
-            let root = compress_lanes(&cv, &message, block_len, flags);
-            for (lane, &at) in batch.iter().enumerate() {
-                let mut id = [0; 32];
-                for (word, bytes) in id.chunks_exact_mut(4).enumerate() {
-                    bytes.copy_from_slice(&root[word][lane].to_le_bytes());
-                }
-                out[at as usize] = ContentId(id);
-            }
+        };
+        let mut rows = [[0; 16]; N];
+        let mut block_len = [0; N];
+        for (lane, &at) in batch.iter().enumerate() {
+            let last = &inputs[at as usize][group * BLOCK_LEN..];
+            block_len[lane] = last.len() as u32;
+            rows[lane] = padded_words(last);
+        }
+        let ids = rows_of(&compress_lanes(&cv, &columns(&rows), block_len, flags));
+        for (lane, &at) in batch.iter().enumerate() {
+            out[at as usize] = ContentId(std::array::from_fn(|byte| (ids[lane][byte / 4] >> (8 * (byte % 4))) as u8));
         }
     }
 }
 
-/// Last blocks compressed together, a lane each: one AVX2 register of `u32`s, two NEON ones.
-const LANES: usize = 8;
+/// The sixteen words of a last block, `bytes` (at most 64 of them) and then zeros: read eight
+/// bytes at a time, the last word read overlapping the one before it and shifted, so a block
+/// costs a load a word, with no byte loop and no `memcpy` call into a zeroed block.
+#[inline(always)]
+fn padded_words(bytes: &[u8]) -> [u32; 16] {
+    assert!(bytes.len() <= BLOCK_LEN, "a last block of {} bytes", bytes.len());
+    let mut words = [0u64; BLOCK_LEN / 8];
+    for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(8)) {
+        *word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+    }
+    let rest = bytes.len() % 8;
+    if rest > 0 {
+        words[bytes.len() / 8] = last_bytes(bytes, rest);
+    }
+    std::array::from_fn(|word| (words[word / 2] >> (32 * (word % 2))) as u32)
+}
 
-type Lanes = [u32; LANES];
+/// The last `rest` bytes of `bytes` (1 to 7 of them), little-endian in the low bytes of a word:
+/// one load where eight bytes are there to read, else two that overlap, or three bytes.
+#[inline(always)]
+fn last_bytes(bytes: &[u8], rest: usize) -> u64 {
+    let len = bytes.len();
+    if len >= 8 {
+        return u64::from_le_bytes(bytes[len - 8..].try_into().expect("8 bytes")) >> (8 * (8 - rest));
+    }
+    if rest >= 4 {
+        let low = u64::from(u32::from_le_bytes(bytes[..4].try_into().expect("4 bytes")));
+        let high = u64::from(u32::from_le_bytes(bytes[rest - 4..rest].try_into().expect("4 bytes")));
+        return low | high << (8 * (rest - 4));
+    }
+    let (first, middle, last) = (u64::from(bytes[0]), u64::from(bytes[rest / 2]), u64::from(bytes[rest - 1]));
+    first | middle << (8 * (rest / 2)) | last << (8 * (rest - 1))
+}
+
+/// Eight words of `S` lanes (a compression's output) as each lane's eight words: [`columns`]'
+/// transpose the other way, in `S`-square registers (zero rows filling a square past the eight).
+#[inline(always)]
+fn rows_of<const S: usize>(columns: &[[u32; S]; 8]) -> [[u32; 8]; S] {
+    const { assert!(S.is_power_of_two() && S <= 16) };
+    let mut out = [[0; 8]; S];
+    for from in (0..8).step_by(S) {
+        let square = transpose(std::array::from_fn(|row| {
+            Simd::from_array(columns.get(from + row).copied().unwrap_or([0; S]))
+        }));
+        for (lane, row) in square.iter().enumerate() {
+            let row = row.to_array();
+            for word in 0..S.min(8) {
+                out[lane][from + word] = row[word];
+            }
+        }
+    }
+    out
+}
+
+/// A block's sixteen little-endian words.
+#[inline(always)]
+fn block_words(block: &[u8; BLOCK_LEN]) -> [u32; 16] {
+    std::array::from_fn(|word| {
+        u32::from_le_bytes([block[4 * word], block[4 * word + 1], block[4 * word + 2], block[4 * word + 3]])
+    })
+}
+
+/// Each lane's sixteen message words (`rows[lane]`) as sixteen columns of `S` lanes, the form
+/// [`compress_lanes`] takes: `16 / S` square transposes in registers, so a block goes from its
+/// bytes to the compression with no scattered store and reload.
+#[inline(always)]
+fn columns<const S: usize>(rows: &[[u32; 16]; S]) -> [[u32; S]; 16] {
+    const { assert!(S.is_power_of_two() && S <= 16) };
+    let mut out = [[0; S]; 16];
+    for from in (0..16).step_by(S) {
+        let square =
+            transpose(std::array::from_fn(|lane| Simd::from_array(std::array::from_fn(|word| rows[lane][from + word]))));
+        for (word, column) in square.iter().enumerate() {
+            out[from + word] = column.to_array();
+        }
+    }
+    out
+}
+
+/// An `S` by `S` transpose: interleaving row `i` with row `i + S / 2` into rows `2i` and `2i + 1`
+/// rotates each element's address (row bits, then column bits) left by one bit, so
+/// `log2(S)` rounds swap rows and columns. Each interleave is two shuffles (`vpermt2d` on
+/// AVX-512, `zip1`/`zip2` on NEON).
+#[inline(always)]
+fn transpose<const S: usize>(mut v: [Simd<u32, S>; S]) -> [Simd<u32, S>; S] {
+    for _ in 0..S.trailing_zeros() {
+        let mut next = v;
+        for i in 0..S / 2 {
+            (next[2 * i], next[2 * i + 1]) = v[i].interleave(v[i + S / 2]);
+        }
+        v = next;
+    }
+    v
+}
+
+/// Last blocks compressed together at the baseline, a lane each: one AVX2 register of `u32`s,
+/// two NEON ones.
+const LANES: usize = 8;
 
 const IV: [u32; 4] = [0x6A09_E667, 0xBB67_AE85, 0x3C6E_F372, 0xA54F_F53A];
 const SCHEDULE: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
 #[inline(always)]
-fn add(a: Lanes, b: Lanes) -> Lanes {
+fn add<const N: usize>(a: [u32; N], b: [u32; N]) -> [u32; N] {
     let mut out = a;
-    for lane in 0..LANES {
+    for lane in 0..N {
         out[lane] = out[lane].wrapping_add(b[lane]);
     }
     out
 }
 
 #[inline(always)]
-fn xor_rotate(a: Lanes, b: Lanes, by: u32) -> Lanes {
+fn xor_rotate<const N: usize>(a: [u32; N], b: [u32; N], by: u32) -> [u32; N] {
     let mut out = a;
-    for lane in 0..LANES {
+    for lane in 0..N {
         out[lane] = (out[lane] ^ b[lane]).rotate_right(by);
     }
     out
 }
 
 #[inline(always)]
-fn g(v: &mut [Lanes; 16], [a, b, c, d]: [usize; 4], x: Lanes, y: Lanes) {
+fn g<const N: usize>(v: &mut [[u32; N]; 16], [a, b, c, d]: [usize; 4], x: [u32; N], y: [u32; N]) {
     v[a] = add(add(v[a], v[b]), x);
     v[d] = xor_rotate(v[d], v[a], 16);
     v[c] = add(v[c], v[d]);
@@ -173,19 +305,27 @@ fn g(v: &mut [Lanes; 16], [a, b, c, d]: [usize; 4], x: Lanes, y: Lanes) {
     v[b] = xor_rotate(v[b], v[c], 7);
 }
 
-/// BLAKE3's compression of one block of chunk 0 in each of [`LANES`] lanes, each with its own
+/// BLAKE3's compression of one block of chunk 0 in each of `N` lanes, each with its own
 /// block length: what `hash_many` can't do, since it gives every lane full blocks. Transposed
 /// (`message[w]` is word `w` of every lane), so each step is one instruction over the lanes
 /// once LLVM vectorizes the loops; safe code, so no SIMD of our own to prove. Gives the
-/// chaining value, the first 32 bytes of the output when `flags` has `ROOT`.
-fn compress_lanes(cv: &[Lanes; 8], message: &[Lanes; 16], block_len: Lanes, flags: u32) -> [Lanes; 8] {
-    let mut v = [[0; LANES]; 16];
+/// chaining value, the first 32 bytes of the output when `flags` has `ROOT`. Always inlined, so
+/// a caller compiled with more vector features (`x86::leading_lanes_avx512`) vectorizes it
+/// with them.
+#[inline(always)]
+fn compress_lanes<const N: usize>(
+    cv: &[[u32; N]; 8],
+    message: &[[u32; N]; 16],
+    block_len: [u32; N],
+    flags: u32,
+) -> [[u32; N]; 8] {
+    let mut v = [[0; N]; 16];
     v[..8].copy_from_slice(cv);
     for (word, iv) in IV.iter().enumerate() {
-        v[8 + word] = [*iv; LANES];
+        v[8 + word] = [*iv; N];
     }
     v[14] = block_len;
-    v[15] = [flags; LANES];
+    v[15] = [flags; N];
     let mut m = *message;
     for round in 0..7 {
         g(&mut v, [0, 4, 8, 12], m[0], m[1]);
@@ -200,17 +340,18 @@ fn compress_lanes(cv: &[Lanes; 8], message: &[Lanes; 16], block_len: Lanes, flag
             m = SCHEDULE.map(|word| m[word]);
         }
     }
-    let mut out = [[0; LANES]; 8];
+    let mut out = [[0; N]; 8];
     for (word, lanes) in out.iter_mut().enumerate() {
-        for lane in 0..LANES {
+        for lane in 0..N {
             lanes[lane] = v[word][lane] ^ v[word + 8][lane];
         }
     }
     out
 }
 
-/// [`Leading::leading_blocks`] by [`compress_lanes`]: [`LANES`] members at a time, a block of
-/// each per compression, for a backend with no kernel that stops short of a chunk's root.
+/// [`Leading::leading_blocks`] by [`compress_lanes`], for a backend with no kernel that stops
+/// short of a chunk's root: 16 members at a time in AVX-512 registers where the CPU has them
+/// (x86-64 Linux, the fork's one x86 target), else [`LANES`].
 #[cfg_attr(
     not(all(
         target_endian = "little",
@@ -222,21 +363,137 @@ fn compress_lanes(cv: &[Lanes; 8], message: &[Lanes; 16], block_len: Lanes, flag
     expect(dead_code, reason = "blake3-servil's way alone, and it doesn't build for this target")
 )]
 pub(crate) fn leading_lanes(key: &[u32; 8], inputs: &[&[u8]], members: &[u32], blocks: usize, cvs: &mut Vec<[u32; 8]>) {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            return x86::leading_lanes_avx512(key, inputs, members, blocks, cvs);
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return x86::leading_lanes_avx2(key, inputs, members, blocks, cvs);
+        }
+    }
+    leading_lanes_of::<LANES>(key, inputs, members, blocks, cvs);
+}
+
+/// [`leading_lanes`] `N` members at a time, a block of each per compression. Always inlined, so
+/// it is vectorized for the features of the function it is inlined into.
+#[cfg_attr(
+    not(all(
+        target_endian = "little",
+        any(
+            all(target_arch = "x86_64", target_os = "linux"),
+            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
+        ),
+    )),
+    expect(dead_code, reason = "blake3-servil's way alone, and it doesn't build for this target")
+)]
+#[inline(always)]
+fn leading_lanes_of<const N: usize>(
+    key: &[u32; 8],
+    inputs: &[&[u8]],
+    members: &[u32],
+    blocks: usize,
+    cvs: &mut Vec<[u32; 8]>,
+) {
     let flags = u32::from(DERIVE_KEY_MATERIAL);
-    for batch in members.chunks(LANES) {
+    for batch in members.chunks(N) {
         // Lanes past the batch hash zeros; only `..batch.len()` is kept.
-        let mut cv: [Lanes; 8] = key.map(|word| [word; LANES]);
+        let mut cv: [[u32; N]; 8] = key.map(|word| [word; N]);
         for block in 0..blocks {
-            let mut message = [[0; LANES]; 16];
+            let mut rows = [[0; 16]; N];
             for (lane, &at) in batch.iter().enumerate() {
                 let bytes = &inputs[at as usize][block * BLOCK_LEN..(block + 1) * BLOCK_LEN];
-                for (word, value) in bytes.chunks_exact(4).enumerate() {
-                    message[word][lane] = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
-                }
+                rows[lane] = block_words(bytes.try_into().expect("a whole block"));
             }
             let first = if block == 0 { u32::from(CHUNK_START) } else { 0 };
-            cv = compress_lanes(&cv, &message, [BLOCK_LEN as u32; LANES], flags | first);
+            cv = compress_lanes(&cv, &columns(&rows), [BLOCK_LEN as u32; N], flags | first);
         }
         cvs.extend((0..batch.len()).map(|lane| std::array::from_fn(|word| cv[word][lane])));
     }
 }
+
+/// [`leading_lanes_of`] and [`last_blocks_of`] compiled for AVX-512F at 16 lanes (each word of
+/// the transposed state one 512-bit register, the rotates `vprord`) and for AVX2 at 8 (one
+/// 256-bit register a word), where the baseline would give them SSE2's two 128-bit registers
+/// a word and three instructions a rotate.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+mod x86 {
+    use super::Start;
+    use crate::ContentId;
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn leading_lanes_avx512(
+        key: &[u32; 8],
+        inputs: &[&[u8]],
+        members: &[u32],
+        blocks: usize,
+        cvs: &mut Vec<[u32; 8]>,
+    ) {
+        assert!(std::arch::is_x86_feature_detected!("avx512f"), "AVX-512F lanes on a CPU without it");
+        // SAFETY: the CPU has AVX-512F, asserted just above.
+        unsafe { leading_wide(key, inputs, members, blocks, cvs) }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn leading_lanes_avx2(
+        key: &[u32; 8],
+        inputs: &[&[u8]],
+        members: &[u32],
+        blocks: usize,
+        cvs: &mut Vec<[u32; 8]>,
+    ) {
+        assert!(std::arch::is_x86_feature_detected!("avx2"), "AVX2 lanes on a CPU without it");
+        // SAFETY: the CPU has AVX2, asserted just above.
+        unsafe { leading_narrow(key, inputs, members, blocks, cvs) }
+    }
+
+    pub(super) fn last_blocks_avx512(
+        inputs: &[&[u8]],
+        members: &[u32],
+        start: Start<'_>,
+        group: usize,
+        out: &mut [ContentId],
+    ) {
+        assert!(std::arch::is_x86_feature_detected!("avx512f"), "AVX-512F lanes on a CPU without it");
+        // SAFETY: the CPU has AVX-512F, asserted just above.
+        unsafe { last_wide(inputs, members, start, group, out) }
+    }
+
+    pub(super) fn last_blocks_avx2(
+        inputs: &[&[u8]],
+        members: &[u32],
+        start: Start<'_>,
+        group: usize,
+        out: &mut [ContentId],
+    ) {
+        assert!(std::arch::is_x86_feature_detected!("avx2"), "AVX2 lanes on a CPU without it");
+        // SAFETY: the CPU has AVX2, asserted just above.
+        unsafe { last_narrow(inputs, members, start, group, out) }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[target_feature(enable = "avx512f")]
+    fn leading_wide(key: &[u32; 8], inputs: &[&[u8]], members: &[u32], blocks: usize, cvs: &mut Vec<[u32; 8]>) {
+        super::leading_lanes_of::<16>(key, inputs, members, blocks, cvs);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[target_feature(enable = "avx2")]
+    fn leading_narrow(key: &[u32; 8], inputs: &[&[u8]], members: &[u32], blocks: usize, cvs: &mut Vec<[u32; 8]>) {
+        super::leading_lanes_of::<8>(key, inputs, members, blocks, cvs);
+    }
+
+    #[target_feature(enable = "avx512f")]
+    fn last_wide(inputs: &[&[u8]], members: &[u32], start: Start<'_>, group: usize, out: &mut [ContentId]) {
+        super::last_blocks_of::<16>(inputs, members, start, group, out);
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn last_narrow(inputs: &[&[u8]], members: &[u32], start: Start<'_>, group: usize, out: &mut [ContentId]) {
+        super::last_blocks_of::<8>(inputs, members, start, group, out);
+    }
+}
+
+#[cfg(test)]
+mod tests;

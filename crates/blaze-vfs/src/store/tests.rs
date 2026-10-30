@@ -100,7 +100,7 @@ fn a_slice_past_what_is_written_panics() {
 #[should_panic(expected = "a file has no entries")]
 fn a_file_shape_has_no_entries() {
     let mut writer = Writer::new();
-    let node = writer.file(ContentId::of("store test", b"f"), Arc::from(&b"f"[..]));
+    let node = writer.file(ContentId::of("store test", b"f"), Arc::<[u8]>::from(&b"f"[..]));
     let table = writer.table();
     let _ = table.entries(table.shape(node));
 }
@@ -183,12 +183,12 @@ fn names_read_back_as_interned() {
 fn a_snapshot_keeps_its_table_through_a_replace() {
     let mut writer = Writer::new();
     let old = ContentId::of("store test", b"a");
-    writer.file(old, Arc::from(&b"a"[..]));
+    writer.file(old, Arc::<[u8]>::from(&b"a"[..]));
     let shared = writer.shared();
     let snapshot = shared.read();
     let mut next = Building::new(1);
     let new = ContentId::of("store test", b"b");
-    next.file(new, Arc::from(&b"b"[..]));
+    next.file(new, Arc::<[u8]>::from(&b"b"[..]));
     assert_eq!(writer.replace(next), 1, "the old table waits for the snapshot's task");
     assert_eq!(snapshot.table().find(&old), Some(0));
     assert_eq!(snapshot.table().find(&new), None);
@@ -284,6 +284,34 @@ fn a_malformed_base_is_refused() {
     assert_eq!(parts.check(3), Err("node or entry columns of different lengths"));
 }
 
+/// Adopted bytes are the `Vec`'s own buffer, read back as an `Arc` copy of them reads, from the
+/// store and through every clone; the buffer lives until the last of them is dropped.
+#[test]
+fn adopted_bytes_are_the_vecs_own() {
+    let mut rng = Rng::new(11);
+    let mut writer = Writer::new();
+    for len in [0usize, 1, 7, 64, 1023, 1024, 1025, 1 << 16] {
+        let mut bytes: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
+        bytes.reserve(5);
+        let (ptr, copy) = (bytes.as_ptr(), Arc::<[u8]>::from(bytes.as_slice()));
+        let adopted = super::adopt(bytes);
+        assert_eq!(&*adopted, &*copy, "{len}");
+        if len > 0 {
+            assert_eq!(adopted.as_ptr(), ptr, "{len} bytes not copied");
+        }
+        let id = ContentId::of("store test adopt", &adopted);
+        let node = writer.file(id, adopted.clone());
+        let table = writer.table();
+        let lent = table.bytes(table.shape(node)).unwrap();
+        drop(adopted);
+        assert_eq!(&*lent, &*copy);
+        assert_eq!(table.blob(table.shape(node)).unwrap(), &*copy);
+        if len > 0 {
+            assert_eq!(lent.as_ptr(), ptr, "the store lends the adopted buffer");
+        }
+    }
+}
+
 /// A reader on another thread looks for a directory while the writer adds it and its child:
 /// under every interleaving and every value a load may read, it finds it whole or not at all.
 #[cfg(blaze_check)]
@@ -307,7 +335,7 @@ fn model_a_node_reads_whole_or_not_at_all() {
             })
         };
         // SAFETY: this thread is the table's one writer.
-        let child = unsafe { table.add_file(file, Arc::from(&b"f"[..])) };
+        let child = unsafe { table.add_file(file, super::Blob::Heap(Arc::<[u8]>::from(&b"f"[..]).into())) };
         // SAFETY: as above.
         unsafe { table.add_dir(dir, &[(0, child, 0)]) };
         reader.join().unwrap();

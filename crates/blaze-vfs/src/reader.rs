@@ -51,19 +51,14 @@ impl Reader {
         root: ContentId,
         path: &str,
     ) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
-        let pinned = self.pin();
-        let Some((node, mode)) = pinned.walk(root, path) else { return Ok(None) };
-        let table = pinned.snapshot.table();
-        let shape = table.shape(node);
-        if shape.is_dir() {
-            return Ok(None);
-        }
-        Ok(Some((*table.id(node), mode, table.bytes(shape)?)))
+        self.pin().held(root, path)
     }
 
     /// The names in the directory at `path` (`""` for the root), sorted, each with whether it
     /// is a directory; `None` for none, a file, or a root the tree does not have. Owned, as
-    /// they outlive the pin; [`Pinned::list`] lends them instead.
+    /// they outlive the pin: one allocation for the list and one per name, for a caller that
+    /// keeps them. Every hot reader (the database's `Tree`) lists through [`Pinned::list`],
+    /// which lends them and allocates nothing.
     pub fn list(&self, root: ContentId, path: &str) -> Option<std::vec::IntoIter<(String, bool)>> {
         let pinned = self.pin();
         let names: Vec<(String, bool)> =
@@ -97,6 +92,19 @@ impl Pinned<'_> {
             return Ok(None);
         }
         Ok(Some(File { id: *table.id(node), mode, bytes: table.blob(shape)? }))
+    }
+
+    /// [`Pinned::file`], its bytes held past the pin: the tree's own, with one count taken. A
+    /// walk of many directories reads each file this way under one pin, listing with
+    /// [`Pinned::list`].
+    pub fn held(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+        let Some((node, mode)) = self.walk(root, path) else { return Ok(None) };
+        let table = self.snapshot.table();
+        let shape = table.shape(node);
+        if shape.is_dir() {
+            return Ok(None);
+        }
+        Ok(Some((*table.id(node), mode, table.bytes(shape)?)))
     }
 
     /// The names in the directory at `path` (`""` for the root), sorted, each with whether it

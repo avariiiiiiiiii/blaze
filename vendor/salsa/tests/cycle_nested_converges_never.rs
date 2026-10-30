@@ -2,6 +2,8 @@
 
 //! A nested cycle where the inner cycle (`query_c`) never converges but `query_a` only depends on it in the first iteration.
 
+#![forbid(unsafe_code)]
+
 use crate::common::{ExecuteValidateLoggerDatabase, LogDatabase};
 use expect_test::expect;
 

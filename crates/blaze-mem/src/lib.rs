@@ -11,7 +11,7 @@
 //! | objects one owner names by ID (plane tasks, I/O operations, timers, watch slots) | [`Slab`] with generational [`Handle`]s: a stale handle is detected, not dereferenced |
 //! | chunks shared by several owners, copied on write | [`pool::Shared`]: a pooled `Arc`, the last owner returns the slot |
 //! | objects retired while readers may hold them | [`pool::Limbo`]: kept in their slots until their grace passes, then back to the pool |
-//! | tables, interners and columns | [`RegionVec`] (one owner), [`AppendVec`] (one writer, lock-free readers) and [`Column`] (any number of appenders): address space reserved up front, pages committed as they grow, never moved |
+//! | tables, interners and columns | [`RegionVec`] (one owner), [`AppendVec`] (one writer, lock-free readers) and [`Column`] (any number of appenders): address space reserved up front, pages committed as they grow, never moved; the big, randomly read ones on huge pages ([`huge`]) |
 //! | per-call scratch | [`scratch`]: buffers per worker, grown once to their high-water mark, lent for a closure or until dropped |
 //!
 //! Every allocator is tagged with its subsystem ([`Tag`]); [`tag`] keeps live bytes, the
@@ -27,7 +27,8 @@
 //! Rounding to power-of-two alignments is [`align`]'s, one copy for the whole tree; the
 //! SwissTable group probe every interner shares is [`swiss`]'s.
 //!
-//! Unsafe code is confined to [`os`] (the kernel's virtual memory) and the few lines in each
+//! Unsafe code is confined to [`os`] (the kernel's virtual memory), [`vm`] (that memory for a
+//! caller that lays out its own reservation, over `os`) and the few lines in each
 //! allocator that turn a committed address into a typed place; every block says which
 //! invariant holds and where it is upheld (docs/v2/plan/design/unsafe.md).
 
@@ -41,6 +42,7 @@ pub mod column;
 mod error;
 pub mod frame;
 pub mod handle;
+pub mod huge;
 mod os;
 pub mod pool;
 pub mod region;
@@ -51,6 +53,7 @@ mod stack;
 pub mod swiss;
 mod sync;
 pub mod tag;
+pub mod vm;
 
 pub use append::AppendVec;
 pub use arena::{Arena, ArenaLocal};
@@ -65,7 +68,8 @@ pub use revision::{Built, Revisions};
 pub use tag::Tag;
 
 /// The size of a huge page on the machines blaze targets (x86-64's and arm64's 2 MB pages
-/// with 4 KB base pages). Regions that ask for huge pages are reserved aligned to it.
+/// with 4 KB base pages). Every Unix reservation is aligned to it, and a region of huge pages
+/// commits whole ones past its first ([`huge`]).
 pub const HUGE_PAGE: usize = 2 << 20;
 
 /// The base page size of this machine (4 KB on x86-64 and most arm64 Linux, 16 KB on Apple

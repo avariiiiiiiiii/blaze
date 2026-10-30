@@ -53,7 +53,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     let krate = krate.context("--crate is needed")?;
     let asked = [project.clone(), "--crate".into(), krate.clone(), "--out".into(), "none".into()];
     let mut args = Args::parse(asked.into_iter())?;
-    process_wide();
+    process_wide()?;
     let (db, vfs, checkouts) = load(
         &[Path::new(&project)],
         &cargo_config(&args),

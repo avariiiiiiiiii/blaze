@@ -208,7 +208,7 @@ impl Steps for Real {
             let fresh = session.is_none();
             let mut session = match session {
                 Some(session) => session,
-                None => deps::session(&lowered, &input.store)?,
+                None => deps::session(&lowered, &input.store, &input.config.invocation.env)?,
             };
             let mut job = Job::new(input.clone(), lowered.crates().clone(), self.shared.clone());
             job._seeded = seeded;
@@ -324,9 +324,9 @@ pub(crate) struct UnitWriter {
     macros: Vec<(usize, ProcMacroLoadResult)>,
     /// What a front end freshly lowered was served with ([`deps::serve`]).
     deps: Option<deps::Kept>,
-    /// What storing the kept front end this one lowered into did with its goals
-    /// ([`deps::store`]); None when nothing was kept.
-    flushed: Option<hir_ty::next_solver::goal_store::Flushed>,
+    /// What storing the kept front end this one lowered into did with its goals and bodies'
+    /// steps ([`deps::store`]); None when nothing was kept.
+    flushed: Option<deps::Flushes>,
 }
 
 impl Writer<Real> for UnitWriter {
@@ -387,7 +387,8 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn finished(&mut self) -> Result<(), ApiError> {
-        self.deps.as_ref().map_or(Ok(()), deps::differences)
+        self.deps.as_ref().map_or(Ok(()), deps::differences)?;
+        deps::item_errors(&self.session)
     }
 
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {
@@ -395,7 +396,7 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {
-        self.flushed.as_ref().map(deps::flushed)
+        self.flushed.as_ref().map(deps::noted)
     }
 
     fn keep(mut self) -> Option<KeptLowered> {
@@ -525,6 +526,8 @@ pub(crate) struct Job {
     /// What each build script prints, by its compile unit, when it provably prints only
     /// constants; worked out once.
     pub(crate) inert: Box<[OnceLock<Option<blaze_usercode::run::Value>>]>,
+    /// What the pure path found of each build script, by its compile unit (script::pure), worked out once.
+    pub(crate) pure: Box<[OnceLock<script::pure::Purity>]>,
     /// How each unit's program is run, worked out once (the key and the artifact read it).
     pub(crate) runs: Box<[OnceLock<artifact::Runs>]>,
     /// Each build script run prepared by `fresh`, taken by `script`, so it is prepared once.
@@ -568,6 +571,7 @@ impl Job {
             runs: (0..slots).map(|_| OnceLock::new()).collect(),
             mounted,
             inert: (0..slots).map(|_| OnceLock::new()).collect(),
+            pure: (0..slots).map(|_| OnceLock::new()).collect(),
             starts: (0..slots).map(|_| Mutex::new(None)).collect(),
             build_time: OnceLock::new(),
             profiles: OnceLock::new(),

@@ -482,9 +482,9 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         }
         let base = into.len();
         let mut seen: Option<FxHashMap<RegionConstraint<'db>, usize>> = None;
-        for (constraint, visible) in self.0.query_region_constraints() {
+        self.0.for_each_query_region_constraint(|constraint, visible| {
             if says_nothing(constraint) {
-                continue;
+                return;
             }
             let found = match &mut seen {
                 Some(seen) => match seen.entry(constraint) {
@@ -515,7 +515,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                     }
                 }
             }
-        }
+        });
     }
 
     fn instantiate_canonical<V>(

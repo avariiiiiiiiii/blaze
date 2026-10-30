@@ -29,6 +29,8 @@ use blaze_ids::ContentId;
 use span::Edition;
 use syntax::{Parse, SourceFile, Text, TextRange, TextSize, WeakParse};
 
+use crate::trees::{TreeError, Trees};
+
 /// How many parses of one text a slot keeps: one per edition and kind it is parsed in, and
 /// again after salsa let one go. Past that, the file's next edit is a whole parse.
 const KEPT: usize = 4;
@@ -111,11 +113,18 @@ impl Reparse {
     }
 
     /// The parse of `text` (this one's text) in `edition`, an outline when `outline`, made from
-    /// the kept parse when there is one; kept for the next text.
-    pub(crate) fn parse(&self, text: &Text, edition: Edition, outline: bool) -> Parse<SourceFile> {
+    /// the kept parse when there is one, else read from `stored` when it has the text's
+    /// ([`Trees`]); kept for the next text. A stored parse that is not the text's is an error.
+    pub(crate) fn parse(
+        &self,
+        text: &Text,
+        edition: Edition,
+        outline: bool,
+        stored: Option<&Trees>,
+    ) -> Result<Parse<SourceFile>, TreeError> {
         debug_assert!(text.ptr_eq(&self.slot.text), "a reparse of another text");
         if let Some(own) = self.own(edition, outline) {
-            return own;
+            return Ok(own);
         }
         let parse = match self.previous(edition, outline) {
             Some((previous, delete)) => {
@@ -128,10 +137,36 @@ impl Reparse {
                 }
                 parse
             }
-            None => whole(text.clone(), edition, outline), // clone: a refcount, as above.
+            None => match stored {
+                Some(stored) => match stored.map(self.slot.id, text, edition, outline)? {
+                    Some(parse) => parse,
+                    None => whole(text.clone(), edition, outline), // clone: a refcount, as above.
+                },
+                None => whole(text.clone(), edition, outline), // clone: a refcount, as above.
+            },
         };
         self.keep(&parse, edition, outline);
-        parse
+        Ok(parse)
+    }
+
+    /// Whether a parse of this text is kept and alive.
+    pub(crate) fn has_parse(&self) -> bool {
+        self.slot.has_parse()
+    }
+
+    /// The blaze-vfs content ID of this text.
+    pub(crate) fn id(&self) -> ContentId {
+        self.slot.id
+    }
+
+    /// The live outlines of this text, by edition: what the image stores of a library file.
+    pub(crate) fn kept_outlines(&self) -> impl Iterator<Item = (Edition, Parse<SourceFile>)> + '_ {
+        self.slot
+            .kept
+            .iter()
+            .filter_map(OnceLock::get)
+            .filter(|kept| kept.outline)
+            .filter_map(|kept| Some((kept.edition, kept.parse.upgrade()?)))
     }
 
     /// Takes `parse`, a full parse its caller made of this text in `edition` (an edit's tree
@@ -212,7 +247,15 @@ thread_local! {
     pub(crate) static REPARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many whole parses (a lex and a parse of the whole text) this thread made.
+    pub(crate) static WHOLE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn whole(text: Text, edition: Edition, outline: bool) -> Parse<SourceFile> {
+    #[cfg(test)]
+    WHOLE.with(|it| it.set(it.get() + 1));
     match outline {
         true => SourceFile::parse_outline(text, edition),
         false => SourceFile::parse_shared(text, edition),

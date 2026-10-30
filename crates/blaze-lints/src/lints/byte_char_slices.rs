@@ -25,7 +25,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
         }
         _ => (false, expr),
     };
-    let ast::Expr::ArrayExpr(array) = strip_parens(inner) else { return };
+    let ast::Expr::ArrayExpr(array) = inner.peel_parens() else { return };
     // A borrowed array is linted with its borrow.
     if !has_ref
         && past_parens(expr)
@@ -87,12 +87,3 @@ fn past_parens(expr: ast::Expr<'_>) -> ast::Node<'_> {
     node
 }
 
-fn strip_parens(expr: ast::Expr<'_>) -> ast::Expr<'_> {
-    let mut expr = expr;
-    while let ast::Expr::ParenExpr(paren) = expr
-        && let Some(inner) = paren.expr()
-    {
-        expr = inner;
-    }
-    expr
-}

@@ -69,6 +69,18 @@ pub enum AtomicOrd {
     SeqCst,
 }
 
+impl AtomicOrd {
+    /// Whether an operation of this ordering acquires: Acquire, AcqRel or SeqCst.
+    pub fn acquires(self) -> bool {
+        matches!(self, AtomicOrd::Acquire | AtomicOrd::AcqRel | AtomicOrd::SeqCst)
+    }
+
+    /// Whether an operation of this ordering releases: Release, AcqRel or SeqCst.
+    pub fn releases(self) -> bool {
+        matches!(self, AtomicOrd::Release | AtomicOrd::AcqRel | AtomicOrd::SeqCst)
+    }
+}
+
 /// The retag a typed copy does (rustc_const_eval's `RetagMode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RetagMode {

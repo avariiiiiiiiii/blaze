@@ -97,7 +97,7 @@ jobs:
         with:
           ref: toolchain/bump
       - uses: ./.github/actions/toolchain
-      - run: python3 harness/answers.py --write && cp crates/blaze-cargo/src/answers/rustc.json "$RUNNER_TEMP/rustc-${{ matrix.platform }}.json"
+      - run: python3 harness/answers.py --write && cp crates/blaze-units/src/stdlib/rustc.json "$RUNNER_TEMP/rustc-${{ matrix.platform }}.json"
       - uses: actions/upload-artifact@v7
         with:
           name: answers-${{ matrix.platform }}
@@ -155,7 +155,7 @@ jobs:
     # main's scripts and toolchain; of the bump, only its build (the train's artifact) and its pin.
     steps:
       - uses: actions/checkout@v7
-      # The builds run with the flake's C library, as the train's borrowck job runs them.
+      # The builds run with the flake's C library, as the train's jobs run them.
       - uses: ./.github/actions/toolchain
         with:
           llvm: run

@@ -1153,35 +1153,43 @@ mod tests {
     }
 
     #[test]
-    fn the_views_give_the_handles_elements() {
-        use syntax::{AstNode as _, SourceFile, view::AstNode as _};
+    /// Each token tree's elements between its delimiters, trivia left out and a nested tree one
+    /// element, and whether it is in parentheses, in the order of the source.
+    #[test]
+    fn a_token_trees_elements_are_those_between_its_delimiters() {
+        use syntax::{SourceFile, view::AstNode as _};
 
         let text = "#[a(b = 1, c::d(e), -2 x, [f], m!(g))]\n#[h[i]]\n#[j{ k }]\n#[l()]\nfn f() {}\n";
         let parse = SourceFile::parse(text, Edition::Edition2021);
-        let handles: Vec<_> = parse.tree().syntax().descendants().filter_map(syntax::ast::TokenTree::cast).collect();
-        let views: Vec<_> = parse.root().descendants().filter_map(ast::TokenTree::cast).collect();
-        assert_eq!(handles.len(), views.len());
-        assert!(handles.len() >= 7);
-        for (handle, view) in handles.iter().zip(&views) {
-            let mut written: Vec<_> = handle
-                .syntax()
-                .children_with_tokens()
-                .filter(|it| !it.kind().is_trivia())
-                .map(|it| (it.kind(), it.text_range()))
-                .collect();
-            if written.first().is_some_and(|it| it.0.is_l_delimiter()) {
-                written.remove(0);
-            }
-            if written.last().is_some_and(|it| it.0.is_r_delimiter()) {
-                written.pop();
-            }
-            let inside: Vec<_> = inside(*view).iter().map(|it| (it.kind(), it.text_range())).collect();
-            assert_eq!(written, inside);
-            let children: Vec<_> = handle.syntax().children_with_tokens().map(|it| it.text_range()).collect();
-            assert_eq!(children.first().copied(), view.syntax().first_child_or_token().map(|it| it.text_range()));
-            assert_eq!(children.last().copied(), view.syntax().last_child_or_token().map(|it| it.text_range()));
-            assert_eq!(handle.l_paren_token().is_some(), is_paren(*view));
-        }
+        let trees: Vec<_> = parse
+            .root()
+            .descendants()
+            .filter_map(ast::TokenTree::cast)
+            .map(|tt| {
+                let elements = inside(tt);
+                let joined: String = elements
+                    .iter()
+                    .map(|it| match it {
+                        NodeOrToken::Token(token) => token.text(),
+                        NodeOrToken::Node(node) => node.text(),
+                    })
+                    .collect();
+                let nested = elements.iter().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE).count();
+                assert!(elements.iter().all(|it| !it.kind().is_trivia()));
+                (tt.syntax().text(), joined, nested, is_paren(tt))
+            })
+            .collect();
+        let expected = [
+            ("(b = 1, c::d(e), -2 x, [f], m!(g))", "b=1,c::d(e),-2x,[f],m!(g)", 3, true),
+            ("(e)", "e", 0, true),
+            ("[f]", "f", 0, false),
+            ("(g)", "g", 0, true),
+            ("[i]", "i", 0, false),
+            ("{ k }", "k", 0, false),
+            ("()", "", 0, true),
+        ];
+        let expected: Vec<_> = expected.iter().map(|&(tt, inside, nested, paren)| (tt, inside.to_owned(), nested, paren)).collect();
+        assert_eq!(trees, expected);
     }
 
     #[test]

@@ -7319,6 +7319,7 @@ needs:
 > - `signatures/alone_tests.rs:258` reads `source_view`, since it passes the source to `$Sig::lower`, which takes views now.
 >
 > Every query's value is unchanged. The trees, pointers and relative maps are the same, and `copy_without` shares a whole file's tree exactly where `clone_subtree` did. The new test is `relative_tests::walking_the_outline_allocates_nothing`.
+> checked by frontend-tree-go-def (2026-10-30 01:00): in the tree; `signatures.rs` has no `SyntaxNode`, `to_node`, `parse_or_expand`, `clone_subtree*` or handle `source` left (only `SyntaxNodePtr`s and the `FileAstId<syntax::ast::Variant>` tag).
 
 ## frontend-tree: hir-def macro_expansion_tests: onto views (1)
 
@@ -9804,6 +9805,7 @@ and the edit is one copy instead of a green-tree rewrite per call.
 > applied by db-expand (db-expand-views, 2026-10-29): already in `eager.rs`, every hunk. 5.1's import is as written; `expand_eager_macro_input_view`, `EagerInput`, `lazy_expand_view`, `eager_macro_recur_view` and `replace_calls` follow 5.2 step for step, with two later db-expand changes kept: every `eager_calls` is `&mut Vec<EagerCall, impl Allocator>`, and the argument's span map is the worker's pooled `ArgMap::take()` (read as `&*arg_map`) in place of `ExpansionSpanMap::empty()`, as the handle form has it. What it needs is in: `ExpandTo::of_call_site_view` (`lib.rs`), `ModPath::from_src_view`, `AstIdMap::ast_id_of_view`, `syntax_bridge::call_input`, `AstPtr::of`. hir-def's eager call site (`hir-def/src/lib.rs`) calls the view form; `view_tests.rs` still calls the handle form, so `expand_eager_macro_input` stays.
 > checked by db-audit-dbsub-expand (2026-10-29 22:44): in the tree at `crates/hir-expand/src/eager.rs`: `expand_eager_macro_input_view` (`:401`), `lazy_expand_view` (`:508`), `eager_macro_recur_view` (`:535`) and `replace_calls` (`:725`), on its needs `ExpandTo::of_call_site_view` (`lib.rs:1936`) and `ModPath::from_src_view` (`mod_path.rs:103`). hir-def's caller is on it (`hir-def/src/lib.rs:75` imports `expand_eager_macro_input_view`). The `view_tests.rs` comparison is request (6)'s and isn't declared as a module yet (see that heading).
 > note by db-expand-views (2026-10-29 23:02): applied by db-expand-macros at 22:10 (its word on handing over `hir-expand`), with E13's `ArgMap::take()` in the view form; db-expand-views found it in and changed nothing. `view_tests.rs` is declared now ((6), 6.12).
+> done by frontend-tree-go-expand (2026-10-30, not built): the handle form is deleted (`expand_eager_macro_input`, `lazy_expand`, `eager_macro_recur`, with `ExpandTo::of_call_site` and `ModPath::from_src`/`convert_path`, which only it called). `view_tests.rs` `an_eager_expansion_replaces_its_nested_calls` checks the view form against stored expectations: the nested calls in preorder (`stringify`, `line`, `concat`), `nope!` an error and kept as written, the replaced calls gone from the argument.
 
 ## db-expand-attrs: `outline_item`/`outline_root`, and the outline keeps a fn body an inner attribute may start (db-expand-sigs, `crates/hir-def/src/signatures.rs`)
 

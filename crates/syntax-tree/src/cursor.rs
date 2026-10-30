@@ -21,6 +21,16 @@
 // lazy node, so a cursor at it points at the lazy node in the file's tree (`flat_ref`), and
 // equal elements are equal cursors. Parts have no lazy nodes of their own (`FlatTree::part`
 // checks), so a part's root is always a file root's.
+//
+// The unsafe here: every `NonNull<FlatRoot>` this module holds or passes is a root that a
+// cursor the holder owns or borrows keeps alive (its own root's count, or its file root's for a
+// part's root), so `flat` reads it as a shared reference; roots are boxes freed only in
+// `Ref::drop` (a file's, at its last count) and `FlatRoot::drop` (its parts'). What the safe
+// version costs: `Rc` roots with the file's parts as `Weak`s (a part must not own its file
+// and be owned by it) free a part's root when its last cursor goes and allocate it again on
+// the next entry, an allocation per entry where this has one per part; a cursor naming its
+// part by its lazy node's index instead of a pointer finds its tree by a lookup through the
+// file's tree on every step, several dependent loads where this has one.
 
 use std::{
     cell::{Cell, RefCell},
@@ -52,7 +62,9 @@ struct FlatRoot {
 impl Drop for FlatRoot {
     fn drop(&mut self) {
         for (_, part) in self.parts.get_mut().drain() {
-            // SAFETY: a part's root is made by `part_root` from a box and freed only here.
+            // SAFETY: a part's root is made by `part_root` from a box and freed only here, once
+            // (`drain`), when no cursor counts its file's root, so none points into the part.
+            // Freeing it earlier would leave those cursors reading freed memory.
             drop(unsafe { Box::from_raw(part.as_ptr()) })
         }
     }
@@ -78,7 +90,8 @@ impl Drop for Ref {
         let owner = owner(self.root);
         if flat(&owner).dec_rc() {
             // SAFETY: a file's root is made by `new_flat_root` from a box, and this was the
-            // last cursor counting it.
+            // last cursor counting it (every cursor into its parts counts it too), so nothing
+            // reads it after. A count off by one would free it under a live cursor.
             drop(unsafe { Box::from_raw(owner.as_ptr()) })
         }
     }
@@ -86,8 +99,10 @@ impl Drop for Ref {
 
 #[inline]
 fn flat(root: &ptr::NonNull<FlatRoot>) -> &FlatRoot {
-    // SAFETY: a root lives while a cursor counts it (its own, or its file's for a part's),
-    // and the reference is borrowed from that cursor's `Ref`.
+    // SAFETY: a root lives while a cursor counts it (its own, or its file's for a part's), and
+    // every root this module passes is kept so by a cursor its holder has (the module's
+    // notes); the reference is borrowed from that pointer. Roots are only read through shared
+    // references (counts and parts are cells). A root freed early would be read after free.
     unsafe { root.as_ref() }
 }
 
@@ -115,9 +130,8 @@ impl FlatRoot {
             file: Some((this, at)),
             parts: RefCell::default(),
         };
-        // SAFETY: `Box::into_raw` is never null.
         // alloc: once per part, the first time a cursor enters it
-        let part = unsafe { ptr::NonNull::new_unchecked(Box::into_raw(Box::new(part))) };
+        let part = ptr::NonNull::from(Box::leak(Box::new(part)));
         self.parts.borrow_mut().insert(at, part);
         part
     }
@@ -180,18 +194,17 @@ fn up(root: ptr::NonNull<FlatRoot>, at: u32) -> Option<(ptr::NonNull<FlatRoot>, 
     })
 }
 
-/// [`flat`] for a root that is not borrowed from a cursor.
-///
-/// # Safety
-///
-/// The caller holds a cursor into `root`'s file, which keeps `root` alive (a part's root lives
-/// as long as its file's), for as long as `'a`.
-#[inline]
-unsafe fn flat_unbound<'a>(root: ptr::NonNull<FlatRoot>) -> &'a FlatRoot {
-    // SAFETY: the caller's precondition keeps `root` alive for `'a`: a `FlatRoot` made from a
-    // box by `new_flat_root` or `part_root`, freed only when the last cursor into its file
-    // drops, and only ever read through shared references.
-    unsafe { &*root.as_ptr() }
+impl Ref {
+    /// [`inner`] of this cursor, the tree borrowed from the cursor: where its children are.
+    #[inline]
+    fn inner_tree(&self) -> (&FlatTree, u32) {
+        let (root, at) = inner(self.root, self.at);
+        // SAFETY: `root` is this cursor's root or a part's root its file's root owns, and this
+        // cursor counts that file's root, so `root` lives while `self` is borrowed; it is only
+        // read through shared references. A part's root freed under a live cursor into its
+        // file would be read after free.
+        (&*unsafe { root.as_ref() }.tree, at)
+    }
 }
 
 /// What stepping down by `child_or_token_at_range` from element `at` of `root` finds first
@@ -291,9 +304,8 @@ impl SyntaxNode {
     pub fn new_flat_root(tree: Arc<FlatTree>) -> SyntaxNode {
         assert!(!tree.is_empty() && !tree.is_token(0), "a tree's root is a node");
         let root = FlatRoot { rc: Cell::new(1), tree, file: None, parts: RefCell::default() };
-        // SAFETY: `Box::into_raw` is never null.
         // alloc: once per tree, its root's count and parts
-        let root = unsafe { ptr::NonNull::new_unchecked(Box::into_raw(Box::new(root))) };
+        let root = ptr::NonNull::from(Box::leak(Box::new(root)));
         SyntaxNode(Ref { root, at: 0 })
     }
 
@@ -488,9 +500,7 @@ impl SyntaxNode {
     /// The text of the node's first child, when that is a token.
     #[inline]
     pub fn first_child_token_text(&self) -> Option<&str> {
-        let (root, at) = inner(self.0.root, self.0.at);
-        // SAFETY: `self` is a cursor into the file `root` is the tree or a part of.
-        let tree = &unsafe { flat_unbound(root) }.tree;
+        let (tree, at) = self.0.inner_tree();
         let first = tree.first_child_or_token(at).filter(|&it| tree.is_token(it))?;
         Some(tree.token_text(first))
     }
@@ -1148,3 +1158,63 @@ impl Iterator for PreorderWithTokens {
     }
 }
 // endregion
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::SyntaxNode;
+    use crate::{FlatTree, FlatTreeBuilder, SyntaxKind, Text, TextRange};
+
+    const FILE: SyntaxKind = SyntaxKind(1);
+    const BODY: SyntaxKind = SyntaxKind(2);
+    const WORD: SyntaxKind = SyntaxKind(3);
+    const STATEMENT: SyntaxKind = SyntaxKind(4);
+
+    /// A body's part: the body, one statement, its text one word.
+    fn expand(
+        kind: SyntaxKind,
+        source: &Text,
+        range: TextRange,
+        _: u32,
+    ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
+        let mut builder = FlatTreeBuilder::sourced_range(source.clone(), range);
+        builder.start_node(kind);
+        builder.start_node(STATEMENT);
+        builder.token(WORD, &source[range]);
+        builder.finish_node();
+        builder.finish_node();
+        (builder.finish(), Vec::new())
+    }
+
+    /// The counted roots: a cursor into a part keeps its file's root, and the part's, after
+    /// every other cursor is gone, and the last cursor frees both (each root holds its tree's
+    /// `Arc`, so the counts show which roots live).
+    #[test]
+    fn a_cursor_into_a_part_keeps_its_file_and_the_last_frees_both() {
+        let mut builder = FlatTreeBuilder::sourced(String::from("ab{cd}").into());
+        builder.start_node(FILE);
+        builder.token(WORD, "ab");
+        builder.lazy(BODY, 4);
+        builder.finish_node();
+        builder.expand_with(expand, 0);
+        let tree = Arc::new(builder.finish());
+        let root = SyntaxNode::new_flat_root(Arc::clone(&tree));
+        let body = root.first_child().unwrap();
+        assert_eq!((body.kind(), body.is_lazy()), (BODY, true));
+        let statement = body.first_child().unwrap();
+        let part = Arc::clone(tree.part(2));
+        assert_eq!(Arc::strong_count(&part), 3, "the tree's, the part's root's and this one");
+        drop((root, body));
+        assert_eq!(statement.kind(), STATEMENT);
+        assert_eq!(statement.text_range(), TextRange::new(2.into(), 6.into()));
+        let up = statement.parent().unwrap();
+        assert_eq!((up.kind(), up.parent().map(|it| it.kind())), (BODY, Some(FILE)));
+        assert_eq!(up.first_child_token_text(), None, "the body's first child is a statement");
+        assert_eq!(statement.first_child_token_text(), Some("{cd}"));
+        drop(up);
+        assert_eq!((Arc::strong_count(&tree), Arc::strong_count(&part)), (2, 3));
+        drop(statement);
+        assert_eq!((Arc::strong_count(&tree), Arc::strong_count(&part)), (1, 2));
+    }
+}

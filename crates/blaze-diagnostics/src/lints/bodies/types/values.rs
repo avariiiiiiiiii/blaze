@@ -24,7 +24,7 @@ use base_db::Db;
 use hir_def::{FunctionId, HasModule as _, hir::ExprId};
 use hir_ty::{
     intrinsic::{Intrinsic, intrinsic_of},
-    next_solver::{DbInterner, Region, Ty},
+    next_solver::{DbInterner, Region, RegionExt as _, Ty},
 };
 use syntax::view::AstNode as _;
 
@@ -44,13 +44,13 @@ fn erased<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
 
 /// rustc's printing of a type of the body with its regions erased, as it prints the types of
 /// its type checking results.
-fn print<'db>(b: &BodyCx<'_, 'db>, near: ExprId, ty: Ty<'db>) -> Option<String> {
+fn print<'db>(b: &BodyCx<'_, '_, 'db>, near: ExprId, ty: Ty<'db>) -> Option<String> {
     util::print_ty(b, near, erased(DbInterner::new_with(b.db(), b.owner.krate(b.db())), ty))
 }
 
 /// rustc's printing of `ty` under `with_no_trimmed_paths!`: every path in full
 /// (`std::ptr::NonNull<i32>`).
-fn print_untrimmed<'db>(b: &BodyCx<'_, 'db>, near: ExprId, ty: Ty<'db>) -> Option<String> {
+fn print_untrimmed<'db>(b: &BodyCx<'_, '_, 'db>, near: ExprId, ty: Ty<'db>) -> Option<String> {
     let node = util::syntax(b, near)?;
     let expr = syntax::view::Expr::cast(node.value)?;
     let of = b.cx.vsema.type_of_expr(expr)?.original;

@@ -4,21 +4,22 @@
 //! [`InternedSliceRef`] are essentially [`Interned<(Header, Box<[SliceType]>)>`][crate::Interned]
 //! and [`InternedRef`][crate::InternedRef] with the same types, but more optimized: the header,
 //! the length and the slice are stored once, together, and the pointer is thin.
+//!
+//! Safe code: the typed store, the value's layout and the handle's pointer are
+//! [`crate::typed`]'s.
 
 use std::{
-    alloc::Layout,
     fmt::{self, Debug},
     hash::{BuildHasher, Hash, Hasher},
     marker::PhantomData,
     ops::Deref,
-    ptr::{self, NonNull},
 };
 
 use rustc_hash::FxBuildHasher;
 
 use crate::{
-    arena::{Entry, Store},
     sync::OnceLock,
+    typed::{SlicePtr, Slices},
 };
 
 /// A header followed by a slice, laid out as one value.
@@ -37,25 +38,17 @@ pub struct HeaderWithLength<H> {
     pub length: usize,
 }
 
-type Pointee<T> = HeaderSlice<
-    HeaderWithLength<<T as SliceInternable>::Header>,
-    [<T as SliceInternable>::SliceType],
->;
+type Pointee<T> =
+    crate::typed::Pointee<<T as SliceInternable>::Header, <T as SliceInternable>::SliceType>;
 
+type Ptr<T> = SlicePtr<<T as SliceInternable>::Header, <T as SliceInternable>::SliceType>;
+
+/// `Send` and `Sync`, as its header and items are.
 pub struct InternedSlice<T: SliceInternable> {
-    /// # Invariant
-    ///
-    /// Points at the start of a `Pointee<T>` of `T::storage()`, never moved or freed.
-    ptr: NonNull<u8>,
-    _marker: PhantomData<&'static T>,
+    /// The start of a value of `T::storage()`, never moved or freed.
+    ptr: Ptr<T>,
+    _marker: PhantomData<fn() -> T>,
 }
-
-// SAFETY: An `InternedSlice` is a shared reference to a header and a slice of `Send + Sync`
-// types that live for the process.
-unsafe impl<T: SliceInternable> Send for InternedSlice<T> {}
-// SAFETY: As for `Send`: an `InternedSlice` is a shared reference to a header and items that are
-// `Send + Sync`, live for the process and are never written again.
-unsafe impl<T: SliceInternable> Sync for InternedSlice<T> {}
 
 impl<T: SliceInternable> InternedSlice<T> {
     #[inline]
@@ -63,23 +56,8 @@ impl<T: SliceInternable> InternedSlice<T> {
         header: T::Header,
         slice: &[T::SliceType],
     ) -> InternedSliceRef<'a, T> {
-        let store = T::storage().get();
         let hash = FxBuildHasher.hash_one((&header, slice));
-        let same = |at: NonNull<u8>| {
-            // SAFETY: Every value of `T`'s store is a published `Pointee<T>`.
-            let other = unsafe { pointee::<T>(at) };
-            other.header.header == header && other.slice == *slice
-        };
-        let ptr = match store.entry(hash, same) {
-            Entry::Found(at) => at,
-            Entry::Vacant(vacant) => {
-                vacant.insert(layout::<T>(slice.len()), |to| {
-                    // SAFETY: `to` is fresh memory of the layout of a `Pointee<T>` of
-                    // `slice.len()` elements; `SliceType: Copy`, so copying its bytes is a copy.
-                    unsafe { write::<T>(to, header, slice) }
-                })
-            }
-        };
+        let ptr = T::storage().get().intern(hash, header, slice);
         InternedSliceRef { ptr, _marker: PhantomData }
     }
 
@@ -87,54 +65,6 @@ impl<T: SliceInternable> InternedSlice<T> {
     pub fn as_ref(&self) -> InternedSliceRef<'_, T> {
         InternedSliceRef { ptr: self.ptr, _marker: PhantomData }
     }
-}
-
-/// The layout of a `Pointee<T>` of `len` elements, as `repr(C)` lays it out.
-fn layout<T: SliceInternable>(len: usize) -> Layout {
-    let (layout, _) = Layout::new::<HeaderWithLength<T::Header>>()
-        .extend(Layout::array::<T::SliceType>(len).expect("an interned slice's layout"))
-        .expect("an interned slice's layout");
-    layout.pad_to_align()
-}
-
-/// A fat pointer to the `Pointee<T>` at `at`, of `len` elements.
-fn fat<T: SliceInternable>(at: NonNull<u8>, len: usize) -> *mut Pointee<T> {
-    ptr::slice_from_raw_parts_mut(at.as_ptr().cast::<T::SliceType>(), len) as *mut Pointee<T>
-}
-
-/// # Safety
-///
-/// `to` is writable memory of `layout::<T>(slice.len())`.
-unsafe fn write<T: SliceInternable>(to: NonNull<u8>, header: T::Header, slice: &[T::SliceType]) {
-    let fat = fat::<T>(to, slice.len());
-    // SAFETY: `fat` points at writable memory of `layout::<T>(slice.len())` (the precondition),
-    // so its `header` field is in bounds and aligned (`repr(C)`); this takes the field's address
-    // without reading it.
-    let header_at = unsafe { &raw mut (*fat).header };
-    // SAFETY: `header_at` is in bounds, aligned and not initialized yet; `write` drops nothing.
-    unsafe { header_at.write(HeaderWithLength { header, length: slice.len() }) };
-    // SAFETY: As for `header_at`: the address of the `slice` field, `slice.len()` items long.
-    let items_at = unsafe { &raw mut (*fat).slice }.cast::<T::SliceType>();
-    // SAFETY: `items_at` has room for `slice.len()` items and is aligned for them, and it is
-    // fresh memory, so it cannot overlap `slice`; `SliceType: Copy`, so copying the bytes is a
-    // copy.
-    unsafe { items_at.copy_from_nonoverlapping(slice.as_ptr(), slice.len()) };
-}
-
-/// # Safety
-///
-/// `at` points at the start of a published `Pointee<T>` of `T::storage()`, which lives for the
-/// process.
-unsafe fn pointee<T: SliceInternable>(at: NonNull<u8>) -> &'static Pointee<T> {
-    let header = at.cast::<HeaderWithLength<T::Header>>().as_ptr();
-    // SAFETY: `at` starts a published `Pointee<T>` (the precondition), which starts with its
-    // initialized `HeaderWithLength`; this takes the `length` field's address.
-    let length_at = unsafe { &raw const (*header).length };
-    // SAFETY: `length_at` is the initialized `length` of a value never written again.
-    let length = unsafe { length_at.read() };
-    // SAFETY: `length` is the value's own slice length, so the fat pointer covers exactly the
-    // value, which lives for the process.
-    unsafe { &*fat::<T>(at, length) }
 }
 
 /// Compares interned `Ref`s using pointer equality.
@@ -150,7 +80,7 @@ impl<T: SliceInternable> Eq for InternedSlice<T> {}
 impl<T: SliceInternable> Hash for InternedSlice<T> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_usize(self.ptr.as_ptr().addr())
+        state.write_usize(self.ptr.addr())
     }
 }
 
@@ -159,8 +89,7 @@ impl<T: SliceInternable> Deref for InternedSlice<T> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        // SAFETY: `self.ptr`'s invariant.
-        unsafe { pointee::<T>(self.ptr) }
+        self.ptr.get()
     }
 }
 
@@ -184,20 +113,13 @@ where
     }
 }
 
+/// `Send` and `Sync`, as its header and items are.
 #[repr(transparent)]
-pub struct InternedSliceRef<'a, T> {
-    /// # Invariant
-    ///
-    /// Points at the start of a `Pointee<T>` of `T::storage()`, never moved or freed.
-    ptr: NonNull<u8>,
-    _marker: PhantomData<&'a T>,
+pub struct InternedSliceRef<'a, T: SliceInternable> {
+    /// The start of a value of `T::storage()`, never moved or freed.
+    ptr: Ptr<T>,
+    _marker: PhantomData<(fn() -> T, &'a ())>,
 }
-
-// SAFETY: As for `InternedSlice`: a shared reference to `Send + Sync` values that live for the
-// process.
-unsafe impl<T: Send + Sync> Send for InternedSliceRef<'_, T> {}
-// SAFETY: As for `Send`: a shared reference to `Send + Sync` values that live for the process.
-unsafe impl<T: Send + Sync> Sync for InternedSliceRef<'_, T> {}
 
 impl<'a, T: SliceInternable> InternedSliceRef<'a, T> {
     #[inline]
@@ -207,8 +129,7 @@ impl<'a, T: SliceInternable> InternedSliceRef<'a, T> {
 
     #[inline]
     pub fn get(self) -> &'a Pointee<T> {
-        // SAFETY: `self.ptr`'s invariant.
-        unsafe { pointee::<T>(self.ptr) }
+        self.ptr.get()
     }
 
     /// Changes the attached lifetime: interned values live for the process, so the lifetime is
@@ -219,19 +140,19 @@ impl<'a, T: SliceInternable> InternedSliceRef<'a, T> {
     }
 }
 
-impl<T> Clone for InternedSliceRef<'_, T> {
+impl<T: SliceInternable> Clone for InternedSliceRef<'_, T> {
     #[inline]
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T> Copy for InternedSliceRef<'_, T> {}
+impl<T: SliceInternable> Copy for InternedSliceRef<'_, T> {}
 
 impl<T: SliceInternable> Hash for InternedSliceRef<'_, T> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_usize(self.ptr.as_ptr().addr());
+        state.write_usize(self.ptr.addr());
     }
 }
 
@@ -265,8 +186,7 @@ where
 }
 
 pub struct InternSliceStorage<T: SliceInternable> {
-    store: OnceLock<Store>,
-    _of: PhantomData<fn() -> T>,
+    store: OnceLock<Slices<T::Header, T::SliceType>>,
 }
 
 #[allow(
@@ -275,13 +195,13 @@ pub struct InternSliceStorage<T: SliceInternable> {
 )]
 impl<T: SliceInternable> InternSliceStorage<T> {
     pub const fn new() -> Self {
-        Self { store: OnceLock::new(), _of: PhantomData }
+        Self { store: OnceLock::new() }
     }
 }
 
 impl<T: SliceInternable> InternSliceStorage<T> {
-    pub(crate) fn get(&self) -> &Store {
-        self.store.get_or_init(Store::new)
+    pub(crate) fn get(&self) -> &Slices<T::Header, T::SliceType> {
+        self.store.get_or_init(Slices::new)
     }
 }
 
@@ -433,10 +353,14 @@ mod tests {
 /// kept is the first intern's of each value, every other header is dropped once, equal slices
 /// get one handle, and a handle reads its header, length and items whole.
 #[cfg(all(test, blaze_check))]
+#[allow(unsafe_code, reason = "each execution's storage is reached through a pointer the test sets and clears")]
 mod model {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicPtr, Ordering::Relaxed},
+    use std::{
+        ptr,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicPtr, Ordering::Relaxed},
+        },
     };
 
     use blaze_check::{

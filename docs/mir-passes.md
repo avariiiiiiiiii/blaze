@@ -184,7 +184,7 @@ what a future keeps only where such a temporary lives across a yield, or a no-un
 changes which unwind paths there are.
 
 blaze mixes futures by default now; `BLAZE_SPLIT_FUTURES=1` keeps a future and everything
-that makes, polls or drops it on one side, until mixing is verified (`harness/mixfutures`).
+that makes, polls or drops it on one side.
 
 ## What the consumers do with it
 
@@ -222,8 +222,10 @@ body: `optimized_mir_body(def, level)`, `optimized_mir_body_for_closure` and the
 `monomorphized_optimized_*` variants, again separate salsa queries so nothing else computes
 them. `MirOptLevel` is rustc's `-Zmir-opt-level`: `Off` is the runtime body unchanged,
 `Debug` is level 1 (what `-Copt-level=0` gets), `Release` level 2 (above `-Copt-level=0`).
-blaze picks the level from `BLAZE_MIR_OPT` (0, the default, 1 or 2); the interpreter takes
-it from `set_interpreter_mir_opt_level`.
+The code generator takes rustc's level for each crate (`mir_opt_level_of` in
+`crates/hir-ty-codegen/mod.rs`: `Debug` at `-Copt-level=0`, `Release` above it and for the
+library's crates); `BLAZE_MIR_OPT` (0, 1 or 2) overrides it for every crate. The interpreter
+takes it from `set_interpreter_mir_opt_level`.
 
 - Level 1: `CleanupPostBorrowck` (fake reads, false edges, `CopyForDeref`; also the storage
   markers lowering gives parameters), `LowerSliceLenCalls`, `InstSimplify` (bool comparisons,
@@ -251,8 +253,7 @@ Where a port differs from rustc:
   and terminators in range), which names the pass that broke it.
 
 The interpreter's tests run every program at all three levels and require the same output
-(`hir-ide/src/tests/mir/eval.rs`, `tests/mir/optimize.rs`). `harness/mirparity.py` in blaze
-compares the result with rustc's `-Zunpretty=mir`.
+(`hir-ide/src/tests/mir/eval.rs`, `tests/mir/optimize.rs`).
 
 ## Not done yet
 

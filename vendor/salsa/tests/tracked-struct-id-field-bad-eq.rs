@@ -2,6 +2,8 @@
 
 //! Test an id field whose `PartialEq` impl is always true.
 
+#![forbid(unsafe_code)]
+
 use salsa::{Database, Setter};
 use test_log::test;
 

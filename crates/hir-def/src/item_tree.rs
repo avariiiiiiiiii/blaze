@@ -48,6 +48,8 @@
 //! (`block.rs`).
 
 mod attrs;
+// The raw allocator of a tree's columns: one allocation a tree, not one a column.
+#[allow(unsafe_code)]
 mod block;
 mod items;
 mod lower;
@@ -625,6 +627,14 @@ macro_rules! mod_items {
             fn column_len(&self, kind: ItemKind) -> usize {
                 match kind {
                     $( ItemKind::$typ => self.$column().len(), )+
+                }
+            }
+
+            /// Whether `ast_id` can be the id of an item of `kind`, which [`Self::index`]
+            /// downcasts it to.
+            fn ast_id_fits(kind: ItemKind, ast_id: FileAstId<ast::Item>) -> bool {
+                match kind {
+                    $( ItemKind::$typ => ast_id.erase().may_be::<$ast>(), )+
                 }
             }
         }

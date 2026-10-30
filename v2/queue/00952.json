@@ -1,0 +1,24 @@
+{
+  "id": "00952",
+  "from_lane": "speed-clone-front",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/signatures.rs",
+    "crates/hir-def/src/expr_store.rs"
+  ],
+  "what": "signatures.rs:1640 (VariantFields of a variant with no fields): replace `// clone: of the empty store, which allocates nothing` + `store: ExpressionStore::empty().clone(),` with `store: ExpressionStore::empty_owned(),` (written in expr_store.rs: the same empty store as a value). That is the one clone of an ExpressionStore in the workspace; then drop `Clone` from the derives of `ExpressionOnlyStore` (expr_store.rs:137) and `ExpressionStore` (expr_store.rs:204), whose `// clone:` comments name this id, and delete those comments. Nothing else needs either derive (no holder derives Clone, no returns(clone), no T: Clone use).",
+  "state": "open",
+  "created": "2026-10-30T11:16:52Z",
+  "updated": "2026-10-30T11:16:52Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T11:16:52Z",
+      "by": "speed-clone-front",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

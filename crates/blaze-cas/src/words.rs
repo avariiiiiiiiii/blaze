@@ -69,7 +69,7 @@ impl<A: Zeroed> Words<A> {
         let bytes = len.checked_mul(Self::SIZE).unwrap_or_else(|| {
             stop(MemError::TooLarge { tag: Tag::Store, what: "a table's words", wanted: len })
         });
-        match Region::reserve(bytes, Tag::Store) {
+        match Region::reserve_huge(bytes, Tag::Store) {
             Ok(region) => Words { region, len, _of: std::marker::PhantomData },
             Err(error) => stop(error),
         }

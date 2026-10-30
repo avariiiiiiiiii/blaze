@@ -11,21 +11,20 @@
 //! `CallToDeprecatedSafeFnRequiresUnsafe`), with `compiler/rustc_span/src/source_map.rs`
 //! (`guess_head_span`, `indentation_before`) (MIT or Apache-2.0).
 
-use std::cmp::Reverse;
-
 use blaze_items::{Fact, ItemId};
 use cfg::CfgAtom;
 use hir::{
-    AsAssocItem as _, AssocItemContainer, CallableKind, HirFileId, InFile, ItemInNs, ModuleDef,
-    PathResolution, UnsafeLint, UnsafetyReason,
+    AsAssocItem as _, AssocItemContainer, CallableKind, InFile, ItemInNs, ModuleDef, PathResolution,
+    UnsafeLint, UnsafetyReason,
 };
 use hir_def::{ItemContainerId, Lookup as _, attrs::AttrFlags, signatures::FunctionSignature};
 use intern::{Symbol, sym};
 use syntax::{
-    NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
+    NodeOrToken, SyntaxKind, SyntaxNodePtr,
     view::{self as ast, AstNode as _, AstToken as _, HasAttrs as _},
 };
 
+use stdx::list::Join;
 use crate::{
     checks::head_range_view as head_range,
     cx::{Cx, signature_range_view as signature_range},
@@ -64,7 +63,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingUnsafe) -> Vec<Found> {
         UnsafeLint::HardError => Found::new(requires_unsafe(cx, &op, node, span, ptr), Phase::Mir),
         UnsafeLint::UnsafeOpInUnsafeFn => {
             let mut diag = op.diag(cx, Some("unsafe_op_in_unsafe_fn"), "block", span);
-            unsafe_fn_note(cx, &mut diag, node);
+            if d.first {
+                unsafe_fn_note(cx, &mut diag, node);
+            }
             op.facts(cx, &mut diag);
             code_fact(cx, &mut diag, ptr);
             Found::lint(diag, Phase::Mir, lint_at(cx, node))
@@ -213,7 +214,7 @@ impl Op {
                 // alloc: the diagnostic's text, for an operation hir found unsafe
                 diag.help(format!(
                     "in order for the call to be safe, the context requires the following additional target {features}: {}",
-                    and_list(missing)
+                    stdx::list::list(missing.iter(), Join::And, false)
                 ));
                 if !build_enabled.is_empty() {
                     let (features, them) = match build_enabled.len() {
@@ -223,7 +224,7 @@ impl Op {
                     // alloc: the diagnostic's text, for an operation hir found unsafe
                     diag.note(format!(
                         "the {} target {features} being enabled in the build configuration does not remove the requirement to list {them} in `#[target_feature]`",
-                        and_list(build_enabled)
+                        stdx::list::list(build_enabled.iter(), Join::And, false)
                     ));
                 }
             }
@@ -370,13 +371,13 @@ fn is_unsafe(node: ast::Node<'_>) -> bool {
     }
 }
 
-/// rustc's `UnsafeNotInheritedLintNote` on the first operation it lints in the function (and
-/// in each closure and inline const it, from what it was where that starts): the function's
-/// signature, and the tool-only suggestion to wrap its body in an `unsafe` block.
+/// rustc's `UnsafeNotInheritedLintNote`, given on the operation hir marks `first` (rustc's
+/// `suggest_unsafe_block`, set by hir-ty-unsafeck in its one walk): the function's signature,
+/// and the tool-only suggestion to wrap its body in an `unsafe` block.
 fn unsafe_fn_note<'db>(cx: &Cx<'_, 'db>, diag: &mut Diag, node: InFile<ast::Node<'db>>) {
     let function = up(cx, node).find_map(|it| ast::Fn::cast(it.value).map(|f| it.with_value(f)));
     let Some(function) = function else { return };
-    if function.value.unsafe_token().is_none() || !first_in_function(cx, node, function) {
+    if function.value.unsafe_token().is_none() {
         return;
     }
     let signature = cx.span(function.with_value(signature_range(function.value)));
@@ -391,94 +392,6 @@ fn unsafe_fn_note<'db>(cx: &Cx<'_, 'db>, diag: &mut Diag, node: InFile<ast::Node
             SuggestionStyle::CompletelyHidden,
         );
     }
-}
-
-/// Whether rustc's `suggest_unsafe_block` is still set at the operation `node`: no operation
-/// outside an `unsafe` block comes before it in its closure (or inline const), or before that
-/// in what that is in, up to `function`. rustc checks a closure with a copy of the flag, so
-/// what is linted in one leaves the flag of what it is in set.
-///
-/// Each other operation is tested cheapest first: where it is (one comparison when it is in
-/// the same file or expansion), then the body it is checked in, a walk up with nothing
-/// allocated. hir's list of the body's operations is made again for each lint; hir giving
-/// the flag with the diagnostic would make this one read (v2/requests/diagnostics.md,
-/// diagnostics-lints-mir-unsafe and diagnostics-lints-mir-speed).
-fn first_in_function<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, function: InFile<ast::Fn<'db>>) -> bool {
-    let Some(def) = cx.vsema.to_def(function.value) else { return true };
-    // alloc: the diagnostic's parts, for an operation hir found unsafe
-    let mut chain = Vec::new();
-    if !scopes(cx, node, |scope| chain.push(scope)) {
-        return true;
-    }
-    let mut at = None;
-    let own = key(node);
-    let ops = cx.vsema.get_unsafe_ops(hir::DefWithBody::Function(def).into());
-    !ops.iter().any(|other| {
-        let other = cx.syntax_view(other.map(|it| it.syntax_node_ptr()));
-        if key(other) == own {
-            return false;
-        }
-        let before = match other.file_id == node.file_id {
-            true => order(other.value) < order(node.value),
-            false => position(cx, other) < *at.get_or_insert_with(|| position(cx, node)),
-        };
-        if !before {
-            return false;
-        }
-        let mut first = None;
-        scopes(cx, other, |scope| {
-            first.get_or_insert(scope);
-        }) && first.is_some_and(|scope| chain.contains(&scope))
-    })
-}
-
-/// Where a node is, to tell two apart across the trees of a file and its expansions.
-fn key(node: InFile<ast::Node<'_>>) -> (HirFileId, TextRange) {
-    (node.file_id, node.value.text_range())
-}
-
-/// Gives `scope` the bodies rustc checks `node` in, from its own: each closure and inline
-/// const around it, then the function. False when it is in an `unsafe` block, where rustc
-/// lints nothing.
-fn scopes<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, mut scope: impl FnMut((HirFileId, TextRange))) -> bool {
-    for it in up(cx, node).skip(1) {
-        if let Some(block) = ast::BlockExpr::cast(it.value) {
-            if block.unsafe_token().is_some() {
-                return false;
-            }
-            if block.const_token().is_some() {
-                scope(key(it));
-            }
-        } else if ast::ClosureExpr::can_cast(it.value.kind()) {
-            scope(key(it));
-        } else if ast::Fn::can_cast(it.value.kind()) {
-            scope(key(it));
-            return true;
-        }
-    }
-    true
-}
-
-/// [`position`] within one file or expansion.
-fn order(node: ast::Node<'_>) -> (TextSize, Reverse<TextSize>) {
-    let range = node.text_range();
-    (range.start(), Reverse(range.end()))
-}
-
-/// The order rustc visits operations in: by where each starts in the file and in each
-/// expansion down to it, one around another first.
-fn position<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Vec<(TextSize, Reverse<TextSize>)> {
-    let mut at = node;
-    // alloc: the diagnostic's parts, for an operation hir found unsafe
-    let mut position = Vec::new();
-    loop {
-        let range = at.value.text_range();
-        position.push((range.start(), Reverse(range.end())));
-        let Some(call) = at.file_id.macro_file() else { break };
-        at = call.loc(cx.db).to_node_view(cx.db);
-    }
-    position.reverse();
-    position
 }
 
 /// The callee of a call rustc lints as `deprecated_safe_2024`, and the string of its
@@ -686,36 +599,145 @@ fn full_path(cx: &Cx<'_, '_>, item: ItemInNs) -> Option<String> {
     }
 }
 
-/// rustc's `DiagArgValue::StrListSepByAnd` in English: `a`, `a and b`, `a, b, and c`.
-fn and_list(items: &[Symbol]) -> String {
-    match items {
-        // alloc: the diagnostic's text, for an operation hir found unsafe
-        [] => String::new(),
-        // alloc: the diagnostic's text, for an operation hir found unsafe
-        [one] => one.as_str().to_owned(),
-        // alloc: the diagnostic's text, for an operation hir found unsafe
-        [a, b] => format!("{} and {}", a.as_str(), b.as_str()),
-        [rest @ .., last] => {
-            // alloc: the diagnostic's text, for an operation hir found unsafe
-            let mut out = String::new();
-            for it in rest {
-                out.push_str(it.as_str());
-                out.push_str(", ");
-            }
-            out.push_str("and ");
-            out.push_str(last.as_str());
-            out
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use intern::Symbol;
-    use syntax::{Edition, SourceFile, TextRange, TextSize, view};
+    use std::cmp::Reverse;
 
-    use super::{and_list, head_range, is_unsafe};
-    use crate::cx::item_range_view as item_range;
+    use hir::{AnyDiagnostic, HirFileId, InFile, UnsafeLint};
+    use intern::Symbol;
+    use syntax::{
+        Edition, SourceFile, TextRange, TextSize, view,
+        view::{self as ast, AstNode as _},
+    };
+
+    use super::{head_range, is_unsafe};
+    use crate::{
+        cx::{Cx, item_range_view as item_range},
+        lower::break_outside_of_loop::{tests::with_file, up},
+    };
+
+    /// Unsafe operations in `unsafe fn`s: in a closure, a closure in a closure, an inline
+    /// const, an `unsafe` block, a macro's expansion, before and after one another.
+    const FIRSTS: &str = r#"
+unsafe fn unsf() {}
+const unsafe fn cu() -> usize { 0 }
+static mut S: i32 = 0;
+macro_rules! m { () => { unsf() } }
+pub unsafe fn a() { unsf(); unsf(); }
+pub unsafe fn b(x: *const i32) -> i32 { let _ = || { unsf(); unsf(); }; let y = *x; y + S }
+pub unsafe fn c() { unsafe { unsf(); } unsf(); let _ = || unsf(); }
+pub unsafe fn d() { let _ = const { cu() }; let _ = || { let _ = || unsf(); unsf(); }; m!(); m!(); }
+pub unsafe fn e() { m!(); let _ = || unsf(); unsf(); }
+pub unsafe fn f() { let _ = || unsf(); let _ = || unsf(); }
+fn main() {}
+"#;
+
+    /// hir's `first`, read by the lint's note, is what the note's old rule found by making the
+    /// function's operations again and comparing each with the operation's place.
+    #[test]
+    fn the_first_flag_is_that_of_the_plain_rule() {
+        with_file(FIRSTS, |cx, _| {
+            // alloc: a test's diagnostics
+            let mut acc = Vec::new();
+            cx.krate.root_module(cx.db).diagnostics(cx.db, &mut acc, false);
+            let (mut compared, mut firsts) = (0, 0);
+            for d in &acc {
+                let AnyDiagnostic::MissingUnsafe(d) = d else { continue };
+                if !matches!(d.lint, UnsafeLint::UnsafeOpInUnsafeFn) {
+                    continue;
+                }
+                let node = cx.syntax_view(d.node.map(|it| it.syntax_node_ptr()));
+                let function = up(cx, node)
+                    .find_map(|it| ast::Fn::cast(it.value).map(|f| it.with_value(f)))
+                    .expect("an `unsafe_op_in_unsafe_fn` is in a function");
+                assert_eq!(d.first, plain_first(cx, node, function), "at {:?}", node.value);
+                compared += 1;
+                firsts += usize::from(d.first);
+            }
+            assert!(compared >= 16, "the fixture has 18 linted operations: {compared}");
+            assert!(firsts >= 9, "11 of them first: {firsts}");
+        });
+    }
+
+    /// Whether rustc's `suggest_unsafe_block` is still set at the operation `node`: no operation
+    /// outside an `unsafe` block comes before it in its closure (or inline const), or before
+    /// that in what that is in, up to `function`. rustc checks a closure with a copy of the
+    /// flag, so what is linted in one leaves the flag of what it is in set.
+    fn plain_first<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, function: InFile<ast::Fn<'db>>) -> bool {
+        let Some(def) = cx.vsema.to_def(function.value) else { return true };
+        let mut chain = Vec::new();
+        if !scopes(cx, node, |scope| chain.push(scope)) {
+            return true;
+        }
+        let mut at = None;
+        let own = key(node);
+        let ops = cx.vsema.get_unsafe_ops(hir::DefWithBody::Function(def).into());
+        !ops.iter().any(|other| {
+            let other = cx.syntax_view(other.map(|it| it.syntax_node_ptr()));
+            if key(other) == own {
+                return false;
+            }
+            let before = match other.file_id == node.file_id {
+                true => order(other.value) < order(node.value),
+                false => position(cx, other) < *at.get_or_insert_with(|| position(cx, node)),
+            };
+            if !before {
+                return false;
+            }
+            let mut first = None;
+            scopes(cx, other, |scope| {
+                first.get_or_insert(scope);
+            }) && first.is_some_and(|scope| chain.contains(&scope))
+        })
+    }
+
+    /// Where a node is, to tell two apart across the trees of a file and its expansions.
+    fn key(node: InFile<ast::Node<'_>>) -> (HirFileId, TextRange) {
+        (node.file_id, node.value.text_range())
+    }
+
+    /// Gives `scope` the bodies rustc checks `node` in, from its own: each closure and inline
+    /// const around it, then the function. False when it is in an `unsafe` block, where rustc
+    /// lints nothing.
+    fn scopes<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, mut scope: impl FnMut((HirFileId, TextRange))) -> bool {
+        for it in up(cx, node).skip(1) {
+            if let Some(block) = ast::BlockExpr::cast(it.value) {
+                if block.unsafe_token().is_some() {
+                    return false;
+                }
+                if block.const_token().is_some() {
+                    scope(key(it));
+                }
+            } else if ast::ClosureExpr::can_cast(it.value.kind()) {
+                scope(key(it));
+            } else if ast::Fn::can_cast(it.value.kind()) {
+                scope(key(it));
+                return true;
+            }
+        }
+        true
+    }
+
+    /// [`position`] within one file or expansion.
+    fn order(node: ast::Node<'_>) -> (TextSize, Reverse<TextSize>) {
+        let range = node.text_range();
+        (range.start(), Reverse(range.end()))
+    }
+
+    /// The order rustc visits operations in: by where each starts in the file and in each
+    /// expansion down to it, one around another first.
+    fn position<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Vec<(TextSize, Reverse<TextSize>)> {
+        let mut at = node;
+        let mut position = Vec::new();
+        loop {
+            let range = at.value.text_range();
+            position.push((range.start(), Reverse(range.end())));
+            let Some(call) = at.file_id.macro_file() else { break };
+            at = call.loc(cx.db).to_node_view(cx.db);
+        }
+        position.reverse();
+        position
+    }
 
     /// [`head_range`] by the text: the node's text cut at its first `{` by `split`.
     fn plain_head_range(node: view::Node<'_>) -> TextRange {
@@ -757,7 +779,7 @@ fn five() { unsafe {} ; unsafe
 
     #[test]
     fn lists_are_joined_as_rustc_joins_them() {
-        let list = |items: &[&str]| and_list(&items.iter().map(|it| Symbol::intern(it)).collect::<Vec<_>>());
+        let list = |items: &[&str]| stdx::list::list(items.iter().map(|it| Symbol::intern(it)), stdx::list::Join::And, false);
         assert_eq!(list(&["avx"]), "avx");
         assert_eq!(list(&["avx", "bmi2"]), "avx and bmi2");
         assert_eq!(list(&["avx", "bmi2", "fma"]), "avx, bmi2, and fma");

@@ -4,6 +4,8 @@
 //!
 //! These test cases use a generic query setup that allows constructing arbitrary dependency
 //! graphs, and attempts to achieve good coverage of various cases.
+
+#![forbid(unsafe_code)]
 mod common;
 use common::{ExecuteValidateLoggerDatabase, LogDatabase};
 use expect_test::expect;

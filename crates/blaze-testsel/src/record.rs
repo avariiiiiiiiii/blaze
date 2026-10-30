@@ -14,19 +14,7 @@
 //! A record is whole only when the runtime armed every slot and the child exited: anything
 //! else is [`Record::Incomplete`], which no pass is ever kept by as executed.
 
-/// The first bytes of a record region.
-pub const MAGIC: [u8; 8] = *b"blzexec1";
-/// The region's header: [`MAGIC`], the slot count and the slots armed, each a little-endian
-/// `u32`; slot `n`'s byte is at `HEADER + n`.
-pub const HEADER: usize = 16;
-
-/// The header a server writes before the child arms: `armed` is zero.
-pub fn header(slots: u32) -> [u8; HEADER] {
-    let mut out = [0u8; HEADER];
-    out[..8].copy_from_slice(&MAGIC);
-    out[8..12].copy_from_slice(&slots.to_le_bytes());
-    out
-}
+pub use blaze_usercode::test::wire::{HEADER, MAGIC, header};
 
 /// What a runtime that armed every slot of `region` writes. `false` when the region's header
 /// is not one.

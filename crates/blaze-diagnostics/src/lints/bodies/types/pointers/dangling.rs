@@ -51,7 +51,7 @@ pub(crate) struct DanglingPointers {
 }
 
 impl DanglingPointers {
-    fn runs(&mut self, b: &BodyCx<'_, '_>) -> (bool, bool) {
+    fn runs(&mut self, b: &BodyCx<'_, '_, '_>) -> (bool, bool) {
         *self.runs.get_or_insert_with(|| {
             (b.cx.lint_may_fire(LintId::named(TEMPORARIES)), b.cx.lint_may_fire(LintId::named(LOCALS)))
         })
@@ -63,7 +63,7 @@ impl LatePass for DanglingPointers {
     const HOOKS: Hooks = Hooks::BODY;
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Closure]);
 
-    fn check_body(&mut self, b: &BodyCx<'_, '_>, out: &mut Vec<Found>) {
+    fn check_body(&mut self, b: &BodyCx<'_, '_, '_>, out: &mut Vec<Found>) {
         let DefWithBodyId::FunctionId(function) = b.owner else { return };
         let (temporaries, locals) = self.runs(b);
         let root = b.body.root_expr();
@@ -82,7 +82,7 @@ impl LatePass for DanglingPointers {
         Locals { b, inits, fn_ret: &fn_ret, owner: None }.check(root, out);
     }
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Closure { body, closure_kind, .. } = b.store().expr(expr) else { return };
         let (temporaries, locals) = self.runs(b);
         if temporaries {
@@ -101,7 +101,7 @@ impl LatePass for DanglingPointers {
 /// arguments (where the temporary lives until the call returns), but a block's statements
 /// even there; a closure's or an inline const's body is not of it.
 struct Searcher<'s, 'a, 'db> {
-    b: &'s BodyCx<'a, 'db>,
+    b: &'s BodyCx<'s, 'a, 'db>,
     inside_call_args: bool,
     out: &'s mut Vec<Found>,
 }
@@ -155,7 +155,7 @@ impl Searcher<'_, '_, '_> {
 
 /// rustc's `lint_expr`: `expr` calls a `#[rustc_as_ptr]` method on a temporary that owns an
 /// allocation.
-fn temporary(b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+fn temporary(b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
     let Expr::MethodCall { receiver, .. } = b.store().expr(expr) else { return };
     if !is_temporary_rvalue(b, receiver) || !owns_allocation(b, util::ty(b, receiver)) {
         return;
@@ -195,7 +195,7 @@ fn temporary(b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
 /// rustc's `is_temporary_rvalue`, of the expressions rustc's HIR has: a call, a binary
 /// operation, a block, `if`, `match`, a loop, `.await` (a `match` in rustc's HIR) or a struct
 /// expression.
-fn is_temporary_rvalue(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+fn is_temporary_rvalue(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     match b.store().expr(expr) {
         Expr::Call { .. } | Expr::MethodCall { .. } | Expr::RecordLit { .. } => true,
         Expr::BinaryOp { op, .. } => !matches!(op, None | Some(BinaryOp::Assignment { .. })),
@@ -230,7 +230,7 @@ fn is_temporary_rvalue(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
 
 /// rustc's `owns_allocation`: an array, `String`, `Vec`, `CString`, `MaybeUninit`, `Cell`,
 /// `UnsafeCell`, `SyncUnsafeCell`, or a `Box` of a slice, `str`, `CStr` or one of those.
-fn owns_allocation<'db>(b: &BodyCx<'_, 'db>, ty: Ty<'db>) -> bool {
+fn owns_allocation<'db>(b: &BodyCx<'_, '_, 'db>, ty: Ty<'db>) -> bool {
     if ty.is_array() {
         return true;
     }
@@ -258,7 +258,7 @@ struct FnRet {
 }
 
 /// The return of `function` when it is written as a raw pointer to a type that is not a 1-ZST.
-fn function_return(b: &BodyCx<'_, '_>, function: FunctionId) -> Option<FnRet> {
+fn function_return(b: &BodyCx<'_, '_, '_>, function: FunctionId) -> Option<FnRet> {
     let db = b.db();
     let sig = FunctionSignature::of(db, function);
     let ret = sig.ret_type?;
@@ -282,7 +282,7 @@ fn function_return(b: &BodyCx<'_, '_>, function: FunctionId) -> Option<FnRet> {
 
 /// The return of the closure `closure` when it is written as a raw pointer to a type that is
 /// not a 1-ZST.
-fn closure_return(b: &BodyCx<'_, '_>, closure: ExprId) -> Option<FnRet> {
+fn closure_return(b: &BodyCx<'_, '_, '_>, closure: ExprId) -> Option<FnRet> {
     let Expr::Closure { ret_type: Some(ret), .. } = b.store().expr(closure) else { return None };
     if !matches!(b.store().type_ref(ret), TypeRef::RawPtr(..)) {
         return None;
@@ -301,7 +301,7 @@ fn closure_return(b: &BodyCx<'_, '_>, closure: ExprId) -> Option<FnRet> {
 }
 
 /// `Some` when `ty` is a raw pointer whose pointee's layout is known and not a 1-ZST.
-fn pointee_not_1zst<'db>(b: &BodyCx<'_, 'db>, ty: Ty<'db>) -> Option<()> {
+fn pointee_not_1zst<'db>(b: &BodyCx<'_, '_, 'db>, ty: Ty<'db>) -> Option<()> {
     let TyKind::RawPtr(pointee, _) = ty.kind() else { return None };
     (!layout(b, pointee)?.is_1zst).then_some(())
 }
@@ -309,7 +309,7 @@ fn pointee_not_1zst<'db>(b: &BodyCx<'_, 'db>, ty: Ty<'db>) -> Option<()> {
 /// The returns of one function or closure that `lint_addr_of_local` checks: each `return`'s
 /// value, then the tail of its body's innermost block.
 struct Locals<'s, 'a, 'db> {
-    b: &'s BodyCx<'a, 'db>,
+    b: &'s BodyCx<'s, 'a, 'db>,
     inits: &'s FxHashMap<BindingId, ExprId>,
     fn_ret: &'s FnRet,
     /// The closure whose body it is, or `None` for the function's.

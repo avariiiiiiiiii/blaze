@@ -2,6 +2,8 @@
 
 //! Tests that code using the builder's durability methods compiles.
 
+#![forbid(unsafe_code)]
+
 use salsa::Durability;
 use test_log::test;
 

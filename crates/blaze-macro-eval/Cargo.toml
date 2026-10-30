@@ -17,14 +17,15 @@ doctest = false
 cranelift-codegen.workspace = true
 ra-ap-rustc_lexer.workspace = true
 rustc-hash.workspace = true
-rustc-literal-escaper.workspace = true
 unicode-normalization.workspace = true
 
 base-db.workspace = true
 blaze-cas.workspace = true
 blaze-core.workspace = true
 blaze-expand.workspace = true
+blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 blaze-usercode.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
@@ -32,15 +33,14 @@ hir-ty.workspace = true
 hir-ty-mir.workspace = true
 intern.workspace = true
 load-cargo.workspace = true
+parser.workspace = true
 salsa.workspace = true
 span.workspace = true
+stdx.workspace = true
 tt.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

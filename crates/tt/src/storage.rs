@@ -24,6 +24,7 @@ use std::{
     alloc::{Allocator, Global},
     cell::Cell,
     hash::Hash,
+    simd::{Simd, cmp::SimdPartialEq},
     sync::LazyLock,
 };
 
@@ -47,7 +48,7 @@ mod wire;
 
 pub use owned::{TopSubtree, Tree};
 
-pub use wire::{WireError, WirePart};
+pub use wire::{WireError, WirePart, aligned};
 mod columns;
 use columns::{CompressedSpanPart, Node, PackedSpan, WideSpan};
 mod words;
@@ -167,28 +168,36 @@ impl PackedSpan {
 /// Distinct entries in the order they are first asked for, each found by a scan while there are
 /// few and through a map after.
 #[derive(Debug)]
-struct Table<T> {
+pub struct IndexTable<T> {
     list: Vec<T>,
     map: FxHashMap<T, u32>,
 }
 
-impl<T> Default for Table<T> {
+impl<T> Default for IndexTable<T> {
     fn default() -> Self {
         // alloc: kept per thread with the builder's buffers, grown at the first parts.
-        Table { list: Vec::new(), map: FxHashMap::default() }
+        IndexTable { list: Vec::new(), map: FxHashMap::default() }
     }
 }
 
 const SCAN: usize = 8;
 
-impl<T: Copy + Eq + Hash> Table<T> {
-    fn clear(&mut self) {
+impl<T: Copy + Eq + Hash> IndexTable<T> {
+    /// Forgets every entry, keeping the room.
+    pub fn clear(&mut self) {
         self.list.clear();
         self.map.clear();
     }
 
+    /// The entries, each at its index.
     #[inline]
-    fn index(&mut self, value: T) -> u32 {
+    pub fn list(&self) -> &[T] {
+        &self.list
+    }
+
+    /// The index of `value`, the next one when it is new.
+    #[inline]
+    pub fn index(&mut self, value: T) -> u32 {
         if self.list.len() <= SCAN {
             if let Some(at) = self.list.iter().position(|it| *it == value) {
                 return at as u32;
@@ -224,15 +233,24 @@ struct Symbols {
 }
 
 impl Symbols {
+    /// A full window is one 16-lane compare, so a new symbol costs what a repeat does; a window
+    /// never holds one ID twice, as an ID is added only when the window lacks it.
     #[inline]
     fn index(&mut self, symbol: Symbol) -> u32 {
         let id = symbol.id();
-        let from = self.list.len().saturating_sub(SYMBOL_WINDOW);
-        if let Some(at) = self.list[from..].iter().rposition(|&it| it == id) {
-            return (from + at) as u32;
+        let len = self.list.len();
+        let found = match self.list.last_chunk::<SYMBOL_WINDOW>() {
+            Some(window) => {
+                let hits = Simd::from_array(*window).simd_eq(Simd::splat(id)).to_bitmask();
+                (hits != 0).then(|| len - SYMBOL_WINDOW + (u64::BITS - 1 - hits.leading_zeros()) as usize)
+            }
+            None => self.list.iter().rposition(|&it| it == id),
+        };
+        if let Some(at) = found {
+            return at as u32;
         }
         self.list.push(id);
-        (self.list.len() - 1) as u32
+        len as u32
     }
 }
 
@@ -249,7 +267,7 @@ fn symbol(id: u32) -> Symbol {
 struct Encoder {
     nodes: Vec<Node>,
     spans: Vec<PackedSpan>,
-    parts: Table<CompressedSpanPart>,
+    parts: IndexTable<CompressedSpanPart>,
     last_part: Option<(CompressedSpanPart, u32)>,
     wide: Vec<WideSpan>,
     symbols: Symbols,

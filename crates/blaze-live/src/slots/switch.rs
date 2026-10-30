@@ -236,6 +236,11 @@ pub(crate) trait Memory {
     fn cell(&self, cell: u64) -> u64;
     /// Checks that `range` is in the image, as the platform checks data.
     fn in_image(&self, range: &Range<u64>) -> Result<(), String>;
+    /// [`Memory::in_image`] of each of `spans`, sorted and none overlapping: a platform may
+    /// walk its mappings once, forward, for all of them.
+    fn in_image_all(&self, spans: &[Span]) -> Result<(), String> {
+        spans.iter().try_for_each(|it| self.in_image(&it.range()))
+    }
     /// The image's bytes at `range`, which the platform checks are in the image and
     /// readable: read-only data the linker wrote, such as the directory's name.
     fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String>;
@@ -447,8 +452,14 @@ impl Lasting {
         self.holds.ahead(more);
     }
 
-    /// The first lasting range `range` overlaps: a binary search.
+    /// The first lasting range `range` overlaps: a binary search, after one load of the last
+    /// end. The linker places each patch after every earlier one's code, so most writes start
+    /// past every lasting range, and the last end settles them without the search's cold
+    /// misses through a column of up to 8 MiB; any other write takes the search.
     fn hit(&self, range: &Range<u64>) -> Option<(Range<u64>, u64, Holds)> {
+        if self.end.last().is_none_or(|end| *end <= range.start) {
+            return None;
+        }
         let at = self.end.partition_point(|end| *end <= range.start);
         let start = *self.start.get(at).filter(|start| **start < range.end)?;
         Some((start..self.end[at], self.number[at], Holds::of(self.holds[at])))
@@ -548,14 +559,6 @@ pub(crate) struct Switch<M: Memory> {
     /// How many slots the last switch stored before its release store.
     #[cfg(test)]
     stored: usize,
-}
-
-impl<M: Memory> Drop for Switch<M> {
-    /// Leaks the pool's tables: the cell or a thread may point at one still, and
-    /// [`super::exec::publish`] writes them for the life of the program.
-    fn drop(&mut self) {
-        std::mem::forget(std::mem::take(&mut self.pool));
-    }
 }
 
 impl<M: Memory> Switch<M> {
@@ -772,9 +775,6 @@ impl<M: Memory> Switch<M> {
                 if let Some(hit) = self.lasting.hit(&placed.range()) {
                     return Err(over("data", hit, slide));
                 }
-                // The platform's `data` refuses the same while it writes, a span at a time:
-                // checked here, a bad span refuses the patch before any is written.
-                self.memory.in_image(&placed.range())?;
                 s.data.push(placed);
             }
         }
@@ -787,6 +787,9 @@ impl<M: Memory> Switch<M> {
                 return Err(format!("two writes at {:#x}", pair[1].at.wrapping_sub(slide)));
             }
         }
+        // The platform's `data` refuses the same while it writes, a span at a time: checked
+        // here, a bad span refuses the patch before any is written.
+        self.memory.in_image_all(&s.data)?;
         s.slots.clear();
         for (slot, _) in patch.cells() {
             if u64::from(slot) >= layout.slots {
@@ -1153,8 +1156,9 @@ impl<M: Memory> Switch<M> {
 }
 
 impl<M: Memory> Drop for Switch<M> {
+    /// Leaks the pool's tables: the cell or a thread may point at one still, and
+    /// [`super::exec::publish`] writes them for the life of the program.
     fn drop(&mut self) {
-        // The cell points at one of them and calls keep going through it: none is freed.
         for pooled in self.pool.drain(..) {
             Box::leak(pooled.table);
         }
@@ -1332,4 +1336,44 @@ pub(super) fn le64(bytes: &[u8]) -> u64 {
 fn hex(bytes: &[u8]) -> String {
     // alloc: error path
     bytes.iter().map(|it| format!("{it:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Lasting::hit`, with its look at the last end first, finds what a scan of every range
+    /// finds, over seeded ranges added in place and probes before, among and past them.
+    #[test]
+    fn a_lasting_hit_is_what_a_scan_finds() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let mut lasting = Lasting::new(4096).expect("reserved");
+        let mut model: Vec<(Range<u64>, u64, Holds)> = Vec::new();
+        for number in 1..400u64 {
+            let start = next(1 << 20);
+            let range = start..start + 1 + next(64);
+            if model.iter().any(|it| overlap(&it.0, &range)) {
+                continue;
+            }
+            let holds = if next(2) == 0 { Holds::Code } else { Holds::Unwind };
+            lasting.room(1).expect("room");
+            lasting.add(range.clone(), number, holds).expect("added");
+            model.push((range, number, holds));
+            model.sort_by_key(|it| it.0.start);
+            for _ in 0..8 {
+                let at = next((1 << 20) + 256);
+                let probe = at..at + 1 + next(128);
+                let scanned = model.iter().find(|it| overlap(&it.0, &probe)).cloned();
+                assert_eq!(lasting.hit(&probe), scanned, "{probe:x?}");
+            }
+            let past = model.last().map_or(0, |it| it.0.end);
+            assert_eq!(lasting.hit(&(past..past + 8)), None);
+        }
+    }
 }

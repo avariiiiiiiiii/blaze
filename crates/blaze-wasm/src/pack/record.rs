@@ -235,6 +235,7 @@ pub fn record(
             && let Ok(target) = &krate.workspace_data(&db).target
         {
             pack.data_layout = target.data_layout.to_string();
+            pack.tuple = target.tuple.as_str().to_owned();
         }
         let root = db.file_source_root(data.root_file_id).source_root_id(&db);
         if data.target_kind.is_proc_macro() {

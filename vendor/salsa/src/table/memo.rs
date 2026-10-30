@@ -12,6 +12,10 @@
 //! moved, so a row's pointer is at `8 * row` and a slot at `size * slot`. The slab fills from a
 //! bump counter and from the slots freed at the last revision boundary.
 //!
+//! A third region holds each row's claim word ([`ClaimWord`], at `row * size_of::<usize>()`): which
+//! task runs the row's key for the column's function, claimed with one CAS by
+//! `crate::function::sync`. It is zeroed by the kernel (a free claim) and committed as rows are.
+//!
 //! So a memo costs its own size in the slab (no heap allocation and no allocator rounding of its
 //! own) and an 8-byte row pointer in its function's column; a function with no memo for a range
 //! of rows allocates nothing for it. Before, a slot held a 16-byte table pointing at an array of
@@ -186,6 +190,12 @@ const ROW_BYTES: usize = mem::size_of::<RowPtr>();
 /// shuttle's atomics (objects of their own) are not.
 type RowPtr = std::sync::atomic::AtomicPtr<DummyMemo>;
 
+/// A row's claim word for the column's function (`crate::function::sync`). A plain atomic for the
+/// same reason as [`RowPtr`]: kernel-zeroed bits are a free claim.
+pub(crate) type ClaimWord = std::sync::atomic::AtomicUsize;
+
+const CLAIM_BYTES: usize = mem::size_of::<ClaimWord>();
+
 /// A memo pointer that the column owns: the current memo of a row, a retired one, or a free slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MemoPtr(NonNull<DummyMemo>);
@@ -213,6 +223,10 @@ struct Column {
     /// `type_.type_id`, beside `rows` for the hit's type check.
     type_id: TypeId,
 
+    /// Row `r`'s claim word at `r * CLAIM_BYTES`, zero (free) until claimed; committed by the
+    /// first claim at or past it. In the column's second line, which only claims read.
+    claims: Region,
+
     type_: MemoEntryType,
 
     /// The memos: slot `i` at `i * type_.layout.size()`.
@@ -238,6 +252,7 @@ struct Column {
 const _: () = {
     assert!(mem::offset_of!(Column, rows) == 0);
     assert!(mem::offset_of!(Column, type_id) + mem::size_of::<TypeId>() <= 64);
+    assert!(mem::offset_of!(Column, claims) + mem::size_of::<Region>() <= 128);
 };
 
 // SAFETY: `free` is only written by `reclaim` and `Drop`, which have exclusive access to the
@@ -260,13 +275,14 @@ impl Column {
         );
         let slab_max = MAX_MEMOS.min(MAX_SLAB_BYTES / size);
         let reserve = |bytes: usize, what: &str| {
-            Region::reserve(bytes, Tag::Query).unwrap_or_else(|err| {
+            Region::reserve_huge(bytes, Tag::Query).unwrap_or_else(|err| {
                 panic!("salsa: reserving the {what} of `{}`'s memo column: {err}", type_.type_name)
             })
         };
         Column {
             rows: reserve(MAX_ROWS * ROW_BYTES, "rows"),
             type_id: type_.type_id,
+            claims: reserve(MAX_ROWS * CLAIM_BYTES, "claim words"),
             type_,
             slab: reserve(slab_max * size, "slab"),
             slab_len: AtomicUsize::new(0),
@@ -301,6 +317,28 @@ impl Column {
             panic!("salsa: committing a row of `{}`'s memo column: {err}", self.type_.type_name)
         });
         self.row(row).expect("salsa: a row is committed once `ensure` returns")
+    }
+
+    /// The row's claim word, committing its page.
+    #[inline]
+    fn claim(&self, row: u32) -> &ClaimWord {
+        debug_assert!((row as usize) < MAX_ROWS);
+        let at = row as usize * CLAIM_BYTES;
+        if at + CLAIM_BYTES > self.claims.committed() {
+            self.commit_claims(at + CLAIM_BYTES);
+        }
+        // SAFETY: `[at, at + CLAIM_BYTES)` is committed, so readable and writable for the region's
+        // life, which is the column's; it holds zero or what was stored through a `ClaimWord`,
+        // both valid `AtomicUsize`s; and it is aligned, the base being page-aligned.
+        unsafe { self.claims.at(at).cast::<ClaimWord>().as_ref() }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn commit_claims(&self, end: usize) {
+        self.claims.ensure(end).unwrap_or_else(|err| {
+            panic!("salsa: committing a claim word of `{}`'s memo column: {err}", self.type_.type_name)
+        });
     }
 
     /// A slab slot for one memo, uninitialized and owned by the caller until it is published.
@@ -603,6 +641,26 @@ impl<'a> MemoSlot<'a> {
 }
 
 impl<'a> MemoTableWithTypes<'a> {
+    /// How many functions keep memos in this table's columns.
+    #[inline]
+    pub(crate) fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// The row's claim word for the function at `memo_ingredient_index`. It lives as long as the
+    /// column, whatever becomes of the row's slot or memos.
+    ///
+    /// # Panics
+    ///
+    /// If no function has the column `memo_ingredient_index`.
+    #[inline]
+    pub(crate) fn claim(self, memo_ingredient_index: MemoIngredientIndex) -> &'a ClaimWord {
+        match self.columns.get(memo_ingredient_index.as_usize()) {
+            Some(column) => column.claim(self.row),
+            None => missing_column(memo_ingredient_index),
+        }
+    }
+
     /// Stores `memo` as the row's memo and returns where it lives; the memo it replaces, if any,
     /// is retired and stays valid until the next reclaim.
     pub(crate) fn insert<M: Memo>(
@@ -763,6 +821,12 @@ fn type_assert_failed(memo_ingredient_index: MemoIngredientIndex) -> ! {
     panic!("inconsistent type-id for `{memo_ingredient_index:?}`")
 }
 
+#[cold]
+#[inline(never)]
+fn missing_column(memo_ingredient_index: MemoIngredientIndex) -> ! {
+    panic!("salsa: no memo column `{memo_ingredient_index:?}` to claim a row in")
+}
+
 impl std::fmt::Debug for MemoTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemoTable").finish_non_exhaustive()
@@ -775,7 +839,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{MAX_ROWS, Memo, MemoEntryType, MemoTable, MemoTableTypes, PAGE_LEN, ROW_BYTES};
+    use super::{
+        CLAIM_BYTES, MAX_ROWS, Memo, MemoEntryType, MemoTable, MemoTableTypes, PAGE_LEN, ROW_BYTES,
+    };
     use crate::DatabaseKeyIndex;
     use crate::zalsa::{MemoIngredientIndex, Zalsa};
 
@@ -912,6 +978,42 @@ mod tests {
         assert!(MAX_ROWS * ROW_BYTES <= column.rows.reserved());
         drop(types);
         assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn claim_words_sit_at_fixed_offsets_and_start_free() {
+        let types = types(2);
+        let rows = rows(&types, 5001);
+        // SAFETY: The rows were handed out by `types`.
+        let (first, last, other) = unsafe {
+            (
+                types.attach_memos(rows[0]).claim(FIRST),
+                types.attach_memos(rows[5000]).claim(FIRST),
+                types.attach_memos(rows[5000]).claim(SECOND),
+            )
+        };
+        let base = types.columns[0].claims.base().as_ptr() as usize;
+        assert_eq!(std::ptr::from_ref(first).addr(), base);
+        assert_eq!(std::ptr::from_ref(last).addr(), base + 5000 * CLAIM_BYTES);
+        assert_ne!(std::ptr::from_ref(last), std::ptr::from_ref(other));
+        assert_eq!((first.load(Ordering::Relaxed), last.load(Ordering::Relaxed)), (0, 0));
+        last.store(6, Ordering::Relaxed);
+        assert_eq!(other.load(Ordering::Relaxed), 0, "each function claims a row on its own");
+        // SAFETY: As above.
+        unsafe {
+            assert!(types.attach_memos(rows[5000]).get::<Counted>(FIRST).is_none());
+            assert_eq!(types.attach_memos(rows[5000]).claim(FIRST).load(Ordering::Relaxed), 6);
+        }
+        assert!(MAX_ROWS * CLAIM_BYTES <= types.columns[0].claims.reserved());
+    }
+
+    #[test]
+    #[should_panic(expected = "no memo column")]
+    fn claiming_a_missing_column_panics() {
+        let types = types(1);
+        let row = types.next_page_rows();
+        // SAFETY: The row was handed out by `types`.
+        unsafe { types.attach_memos(row).claim(SECOND) };
     }
 
     #[test]

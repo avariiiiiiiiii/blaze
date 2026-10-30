@@ -38,6 +38,7 @@ use hir_ty::{
     consteval::try_const_usize,
     infer::PatAdjust,
     method_resolution::CandidateId,
+    mir::{IsSigned, pad16},
     next_solver::{
         Allocation, AnyImplId, DbInterner, GenericArgs, StoredTy, Ty, TyKind,
         infer::traits::ObligationCause,
@@ -179,12 +180,7 @@ fn fields_of<'a, 'db>(pats: impl IntoIterator<Item = Pat<'a, 'db>>) -> Vec<Index
 }
 
 fn read_uint(bytes: &[u8]) -> Option<u128> {
-    if bytes.len() > 16 {
-        return None;
-    }
-    let mut buf = [0u8; 16];
-    buf[..bytes.len()].copy_from_slice(bytes);
-    Some(u128::from_le_bytes(buf))
+    (bytes.len() <= 16).then(|| u128::from_le_bytes(pad16(bytes, IsSigned::No)))
 }
 
 fn truncate(bits: u128, size: u64) -> u128 {
@@ -608,8 +604,10 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                             let args = infcx.fresh_args_for_item(Span::Dummy, id.into());
                             let trait_ref =
                                 trait_ref.instantiate(infcx.interner, args).skip_norm_wip();
-                            let at = infcx.at(&ObligationCause::dummy(), self.cx.env);
-                            at.eq(goal, trait_ref).is_ok()
+                            infcx
+                                .at(&ObligationCause::dummy(), self.cx.env)
+                                .eq(goal, trait_ref)
+                                .is_ok()
                         })
                     })
             }

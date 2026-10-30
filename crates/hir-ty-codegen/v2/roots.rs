@@ -150,6 +150,36 @@ impl HirFrontend<'_> {
         })
     }
 
+    /// Every function of `krate` compiled as a root of its own ([`compiled`]), public or
+    /// not, in modules and impls, in the def map's order: with the crate's roots, what reaches
+    /// every instance an edit of one of its bodies can change. For a harness that counts what
+    /// an edit compiles again (`crates/hir-firewall`); a build starts from [`Self::roots`].
+    pub fn every_function(&self, krate: Crate) -> Vec<HirInstance> {
+        self.with(|db, homes| {
+            let mut listed = Listed::default();
+            for (_, data) in crate_def_map(db, krate).modules(db) {
+                let scope = data.scope(db);
+                for def in scope.declarations() {
+                    if let ModuleDefId::FunctionId(func) = def
+                        && compiled(db, func)
+                    {
+                        listed.function(db, homes, func);
+                    }
+                }
+                for imp in scope.impls() {
+                    for &(_, item) in imp.impl_items(db).items.iter() {
+                        if let AssocItemId::FunctionId(func) = item
+                            && compiled(db, func)
+                        {
+                            listed.function(db, homes, func);
+                        }
+                    }
+                }
+            }
+            listed.roots
+        })
+    }
+
     /// The roots of a program of `krate` (an executable, a test harness, a `cdylib`): with
     /// `entry`, the C `main` of its `main`; the allocator shim; and what every crate of it
     /// keeps by name, as rustc's `linked_symbols` (C-level exports, `#[used]` statics, the

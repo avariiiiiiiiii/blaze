@@ -11,7 +11,8 @@ use crate::FileName;
 /// Many names under the driver's root in one buffer, for an effect over thousands of them:
 /// each is a [`FileName`]'s text and a NUL, so a driver hands it to the system as it is, with
 /// no allocation per name.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: a test stamps the same names twice; effects share them by `Arc`
 pub struct Names {
     bytes: Vec<u8>,
     /// Where each name starts in `bytes`; it ends at the NUL before the next start.
@@ -322,7 +323,8 @@ impl fmt::Display for Lost {
 }
 
 /// A batch of what an [`crate::Effect::Journal`] heard.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: inside `Done`, which only tests copy
 pub struct Journaled {
     /// Files and directories under the watched one the journal names as made, written,
     /// removed or renamed (from or to), each once, sorted.

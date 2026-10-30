@@ -7,7 +7,8 @@ usage: fncache.py            (BLAZE_BIN names the blaze built)
                               blaze and blaze-rustc are found next to BLAZE_BIN)
 
 A crate with cached functions is built by a daemon a step at a time, and each step runs the
-program the daemon linked and the one `cargo build` linked, which have to print the same.
+program the daemon linked and the one blaze builds of the same source from nothing
+(mixed.from_scratch, with a cache directory of its own), which have to print the same.
 `BLAZE_FN_CACHE_LOG` has the program say, for each cached function, whether a result was found
 in memory, found on disk or computed, and each step says which it has to be:
 
@@ -23,8 +24,7 @@ in memory, found on disk or computed, and each step says which it has to be:
 - `holders` reads an `Rc`'s count and `ordered` a `HashMap`'s order, and are refused;
 - `spelled` formats numbers, all of it in core, and is kept; `ticks` reads the cycle counter
   through a function of core known by its name, and is refused on x86-64;
-- a daemon started again finds what the first kept: the hash is the same in every process;
-- cargo's own build runs every call, and prints the same.
+- a daemon started again finds what the first kept: the hash is the same in every process.
 """
 import os, platform, re, shutil, subprocess, sys, tempfile, time
 
@@ -32,7 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from mixed import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, from_scratch, printed
 
 TOML = f"""[package]
 name = "fcache"
@@ -236,7 +236,7 @@ def main():
         open(os.path.join(ws, path), "w").write(text)
     work = tempfile.mkdtemp(prefix="blaze-fncache-out-")
     socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
-    reference, store = os.path.join(work, "reference"), os.path.join(work, "fn-cache")
+    store = os.path.join(work, "fn-cache")
     fx = Fixture(ws, ["fcache"], ["-p", "fcache"])
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"fcache.{n}") for n in ("o", "patch.o", "bin"))
@@ -265,11 +265,17 @@ def main():
         reply = subprocess.run([BLAZE, "sync", socket, *ask], capture_output=True, text=True, timeout=300)
         return (reply.stdout + reply.stderr).strip()
 
-    def cargo():
-        build = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
-                               env={**os.environ, "CARGO_TARGET_DIR": reference})
-        assert build.returncode == 0, build.stderr[-2000:]
-        return built(reference, "fcache")
+    def from_nothing():
+        """What blaze's build of the source as it is, from nothing, prints, run with a cache
+        directory nothing was kept in."""
+        were = os.environ.get("BLAZE_FN_CACHE_DIR")
+        os.environ["BLAZE_FN_CACHE_DIR"] = tempfile.mkdtemp(prefix="scratch-cache-", dir=work)
+        try:
+            return printed(from_scratch(ws, ["fcache"], ["-p", "fcache"]))
+        except SystemExit as error:
+            return f"did not build from nothing: {str(error)[:200]}"
+        finally:
+            os.environ.pop("BLAZE_FN_CACHE_DIR") if were is None else os.environ.__setitem__("BLAZE_FN_CACHE_DIR", were)
 
     wrong = made = 0
 
@@ -293,13 +299,13 @@ def main():
                 verdict(what, False, f"the daemon refused: {reply[:200]}")
                 continue
             ours, stderr, took = run(binary)
-            theirs, _, cargo_took = run(cargo(), {**os.environ, "BLAZE_FN_CACHE_LOG": "1"})
+            theirs = from_nothing()
             found = said(stderr)
             missed = {k: found.get(k) for k, v in wanted.items() if not found.get(k, "").startswith(v)}
-            times.append((what, took, cargo_took))
+            times.append((what, took))
             same = ours == theirs
             verdict(what, same and not missed,
-                    f"{took * 1000:6.0f} ms (cargo {cargo_took * 1000:.0f} ms)"
+                    f"{took * 1000:6.0f} ms"
                     + ("" if same else "  DIFFERENT OUTPUT") + (f"  said {missed}" if missed else ""))
         # The two instances of `width` have entries of their own, and give their own results.
         ours, stderr, _ = run(binary)
@@ -335,9 +341,6 @@ def main():
         verdict("the store lists each function, and forgets old code", bool(slow) and "older code" in before
                 and "older code" not in after and said(stderr).get("slow") == "found on disk",
                 f"{slow[0].strip() if slow else before[:120]!r}; {cleared.strip()}")
-        # Under cargo the attribute does nothing: every call runs, and nothing is kept.
-        theirs, stderr, cargo_took = run(cargo(), {**os.environ, "BLAZE_FN_CACHE_LOG": "1", "BLAZE_FN_CACHE_DIR": store})
-        verdict("cargo's build caches nothing", "blaze" not in stderr and theirs == ours, f"{cargo_took * 1000:.0f} ms")
     finally:
         daemon.kill()
     entries = sum(len(files) for _, _, files in os.walk(store))

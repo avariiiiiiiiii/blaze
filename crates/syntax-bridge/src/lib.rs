@@ -1,4 +1,5 @@
-//! Conversions between [`SyntaxNode`] and [`tt::TokenTree`].
+//! Conversions between syntax trees, read through their views (`syntax::view`), and
+//! [`tt::TokenTree`]s.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![forbid(unsafe_code)]
@@ -18,15 +19,16 @@ use smallvec::SmallVec;
 use span::{Edition, Span, SpanAnchor, SpanMap, SyntaxContext};
 use stdx::never;
 use syntax::{
-    FlatTree, Parse, PreorderWithTokens, SyntaxElement,
+    FlatTree, Parse,
     SyntaxKind::{self, *},
-    SyntaxNode, SyntaxToken, SyntaxTreeBuilder, T, TextRange, TextSize, WalkEvent, format_smolstr,
+    SyntaxTreeBuilder, T, TextRange, TextSize, WalkEvent, format_smolstr,
+    view::Untyped,
 };
 use tt::{Punct, buffer::Cursor, token_to_literal};
 
 /// The leaves a conversion's callback inserts at one event: at most three, inline.
 pub type Inserted = SmallVec<[tt::Leaf; 3]>;
-/// The leaves to append after an element (a `SyntaxElement`, or a view's `NodeId`), by element.
+/// The leaves to append after an element (a view's `NodeId`), by element.
 pub type Appended<K, A = Global> = hashbrown::HashMap<K, Inserted, rustc_hash::FxBuildHasher, A>;
 /// The elements to leave out.
 pub type Removed<K, A = Global> = hashbrown::HashSet<K, rustc_hash::FxBuildHasher, A>;
@@ -147,33 +149,6 @@ pub enum DocCommentDesugarMode {
     ProcMacro,
 }
 
-/// Converts a syntax tree to a [`tt::Subtree`] using the provided span map to populate the
-/// subtree's spans.
-///
-/// A node of a flat tree is read from its arrays, through the parts of the lazy nodes in it
-/// (a macro's input may hold a fn body an outline left unparsed); a node of a green tree, one
-/// being edited, through the cursor.
-pub fn syntax_node_to_token_tree<SpanMap>(
-    node: &SyntaxNode,
-    map: SpanMap,
-    span: Span,
-    mode: DocCommentDesugarMode,
-) -> tt::TopSubtree
-where
-    SpanMap: SpanMapper,
-{
-    if let Some((tree, at)) = node.flat() {
-        let mut c = FlatConverter::new(tree, at, map, span, mode);
-        let len = c.tokens.len_hint();
-        return convert_tokens_kept(&mut c, len);
-    }
-    let append = Appended::<SyntaxElement, Global>::default();
-    let remove = Removed::<SyntaxElement, Global>::default();
-    let mut c =
-        Converter::new(node, map, append, remove, span, mode, |_, _| (true, Inserted::new()));
-    convert_tokens_kept(&mut c, 0)
-}
-
 /// A macro's input, or any node's tokens as a token tree, from a view of the node
 /// (`syntax::view`, docs/v2/plan/lanes/frontend/tree.md): one pass over the flat tree's tokens
 /// in the node's range, through the parts of the lazy nodes in it (an attribute macro's `fn`
@@ -214,28 +189,8 @@ where
     convert_tokens(&mut c, len, alloc)
 }
 
-/// Converts a syntax tree to a [`tt::Subtree`] using the provided span map to populate the
-/// subtree's spans. Additionally using the append and remove parameters, the additional tokens can
-/// be injected or hidden from the output.
-pub fn syntax_node_to_token_tree_modified<SpanMap, OnEvent, A: Allocator + Clone>(
-    node: &SyntaxNode,
-    map: SpanMap,
-    append: Appended<SyntaxElement, A>,
-    remove: Removed<SyntaxElement, A>,
-    call_site: Span,
-    mode: DocCommentDesugarMode,
-    on_enter: OnEvent,
-) -> tt::TopSubtree
-where
-    SpanMap: SpanMapper,
-    OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Inserted),
-{
-    let mut c = Converter::new(node, map, append, remove, call_site, mode, on_enter);
-    convert_tokens_kept(&mut c, 0)
-}
-
-/// [`syntax_node_to_token_tree_modified`] on a view (cfg stripping and fixup of a macro's
-/// input): elements are removed and appended after by their [`syntax::view::NodeId`], which is
+/// [`call_input`] with leaves inserted and elements left out (cfg stripping and fixup of a
+/// macro's input): elements are removed and appended after by their [`syntax::view::NodeId`], which is
 /// unique within the file's tree `node` is in, and `on_event` sees the view's walk. No syntax
 /// handle is made and nothing is counted.
 pub fn call_input_modified<'t, SpanMap, OnEvent, A: Allocator + Clone>(
@@ -283,7 +238,7 @@ pub fn token_tree_to_syntax_node<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     tt: tt::SubtreeView<'_>,
     entry_point: parser::TopEntryPoint,
     span_to_edition: &mut F,
-) -> (Parse<SyntaxNode>, SpanMap) {
+) -> (Parse<Untyped>, SpanMap) {
     token_tree_to_syntax_node_in(tt, entry_point, span_to_edition, Global)
 }
 
@@ -296,7 +251,7 @@ pub fn token_tree_to_syntax_node_in<
     entry_point: parser::TopEntryPoint,
     span_to_edition: &mut F,
     alloc: A,
-) -> (Parse<SyntaxNode>, SpanMap<A>) {
+) -> (Parse<Untyped>, SpanMap<A>) {
     let buffer = tt.strip_invisible();
     let mut copy = parser::Input::with_capacity(0);
     let tokens = view_tokens(buffer, false, span_to_edition, &mut copy);
@@ -309,7 +264,7 @@ pub(crate) fn parse_tokens<A: Allocator + Clone>(
     entry_point: parser::TopEntryPoint,
     tokens: parser::Tokens<'_>,
     alloc: A,
-) -> (Parse<SyntaxNode>, SpanMap<A>) {
+) -> (Parse<Untyped>, SpanMap<A>) {
     // It matters what edition we parse with even when we escape all identifiers correctly.
     let parser_output = entry_point.parse(tokens);
     let mut tree_sink = TtTreeSink::new(buffer.cursor(), tokens.len());
@@ -338,7 +293,7 @@ pub fn parse_to_token_tree(
     ctx: SyntaxContext,
     text: &str,
 ) -> Option<tt::TopSubtree> {
-    let lexed = parser::LexedStr::new(edition, text);
+    let lexed = parser::LexedStr::new_hashed(edition, text);
     if lexed.errors().next().is_some() {
         return None;
     }
@@ -354,7 +309,7 @@ pub fn parse_to_token_tree_static_span(
     span: Span,
     text: &str,
 ) -> Option<tt::TopSubtree> {
-    let lexed = parser::LexedStr::new(edition, text);
+    let lexed = parser::LexedStr::new_hashed(edition, text);
     if lexed.errors().next().is_some() {
         return None;
     }
@@ -498,7 +453,7 @@ where
                         () => {
                             tt::Ident {
                                 span: conv.span_for(abs_range),
-                                sym: Symbol::intern(token.to_text(conv)),
+                                sym: intern_name(token.to_text(conv), token.name_hash(conv)),
                                 is_raw: tt::IdentIsRaw::No,
                             }
                             .into()
@@ -506,8 +461,9 @@ where
                     }
                     let leaf: tt::Leaf = match kind {
                         k if k.is_any_identifier() => {
-                            let text = token.to_text(conv);
-                            tt::Ident::new(text, conv.span_for(abs_range)).into()
+                            let (is_raw, name) = tt::IdentIsRaw::split_from_symbol(token.to_text(conv));
+                            let sym = intern_name(name, token.name_hash(conv));
+                            tt::Ident { sym, span: conv.span_for(abs_range), is_raw }.into()
                         }
                         UNDERSCORE => make_ident!(),
                         k if k.is_literal() => {
@@ -696,6 +652,21 @@ trait SrcToken<Ctx> {
     fn as_leaf(&self) -> Option<&tt::Leaf> {
         None
     }
+
+    /// The interner's hash of an identifier's name (its text without `r#`), when the lexer took
+    /// it ([`parser::LexedStr::new_hashed`]).
+    fn name_hash(&self, _ctx: &Ctx) -> Option<u64> {
+        None
+    }
+}
+
+/// `name` interned: by the hash the lexer took of it when there is one, so it is not hashed
+/// again.
+fn intern_name(name: &str, hash: Option<u64>) -> Symbol {
+    match hash {
+        Some(hash) => Symbol::intern_hashed(name, hash),
+        None => Symbol::intern(name),
+    }
 }
 
 trait TokenConverter: Sized {
@@ -722,11 +693,12 @@ trait TokenConverter: Sized {
     fn call_site(&self) -> Span;
 }
 
-/// A token of a lexed text: its kind and its text.
+/// A token of a lexed text: its kind, its text, and for a name the hash the lexer took of it.
 #[derive(Debug, Clone, Copy)]
 struct RawToken<'t> {
     kind: SyntaxKind,
     text: &'t str,
+    name_hash: Option<u64>,
 }
 
 impl<C> SrcToken<C> for RawToken<'_> {
@@ -741,22 +713,33 @@ impl<C> SrcToken<C> for RawToken<'_> {
     fn to_text<'a>(&'a self, _: &'a C) -> &'a str {
         self.text
     }
+
+    fn name_hash(&self, _: &C) -> Option<u64> {
+        self.name_hash
+    }
 }
 
 /// The tokens of a lexed text in order, read with a running offset: each token's start and
-/// text are one add and one slice, not a walk from the lexer's last checkpoint.
+/// text are one add and one slice, not a walk from the lexer's last checkpoint; and its name's
+/// hash the next of [`parser::LexedStr::name_hashes`], `name` counting them.
 struct LexedTokens<'t> {
     lexed: parser::LexedStr<'t>,
     text: &'t str,
     pos: usize,
     offset: usize,
+    name: usize,
 }
 
 impl<'t> LexedTokens<'t> {
-    /// The tokens of `lexed`, the lexing of `text`.
+    /// The tokens of `lexed`, the [`parser::LexedStr::new_hashed`] lexing of `text`.
     fn new(lexed: parser::LexedStr<'t>, text: &'t str) -> Self {
         debug_assert_eq!(lexed.as_str(), text);
-        LexedTokens { lexed, text, pos: 0, offset: 0 }
+        debug_assert_eq!(
+            lexed.name_hashes().len(),
+            (0..lexed.len()).filter(|&i| parser::LexedStr::has_name_hash(lexed.kind(i))).count(),
+            "lexed by `LexedStr::new_hashed`"
+        );
+        LexedTokens { lexed, text, pos: 0, offset: 0, name: 0 }
     }
 
     fn peek(&self) -> Option<RawToken<'t>> {
@@ -765,13 +748,16 @@ impl<'t> LexedTokens<'t> {
         }
         let len = self.lexed.text_len(self.pos);
         let text = &self.text[self.offset..self.offset + len];
-        Some(RawToken { kind: self.lexed.kind(self.pos), text })
+        let kind = self.lexed.kind(self.pos);
+        let name_hash = parser::LexedStr::has_name_hash(kind).then(|| self.lexed.name_hashes()[self.name]);
+        Some(RawToken { kind, text, name_hash })
     }
 
     fn bump(&mut self) -> Option<(RawToken<'t>, TextRange)> {
         let token = self.peek()?;
         let start = self.offset;
         self.pos += 1;
+        self.name += usize::from(token.name_hash.is_some());
         self.offset += token.text.len();
         let range = TextRange::new(
             TextSize::new(u32::try_from(start).ok()?),
@@ -838,235 +824,6 @@ impl<'t> TokenConverter for StaticRawConverter<'t> {
 
     fn call_site(&self) -> Span {
         self.span
-    }
-}
-
-struct Converter<SpanMap, OnEvent, A: Allocator + Clone> {
-    current: Option<SyntaxToken>,
-    current_leaves: SmallVec<[tt::Leaf; 4]>,
-    preorder: PreorderWithTokens,
-    range: TextRange,
-    punct_offset: Option<(SyntaxToken, TextSize)>,
-    /// Used to make the emitted text ranges in the spans relative to the span anchor.
-    map: SpanMap,
-    append: Appended<SyntaxElement, A>,
-    remove: Removed<SyntaxElement, A>,
-    call_site: Span,
-    mode: DocCommentDesugarMode,
-    on_event: OnEvent,
-}
-
-impl<SpanMap, OnEvent, A: Allocator + Clone> Converter<SpanMap, OnEvent, A>
-where
-    OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Inserted),
-{
-    fn new(
-        node: &SyntaxNode,
-        map: SpanMap,
-        append: Appended<SyntaxElement, A>,
-        remove: Removed<SyntaxElement, A>,
-        call_site: Span,
-        mode: DocCommentDesugarMode,
-        on_enter: OnEvent,
-    ) -> Self {
-        let mut converter = Converter {
-            current: None,
-            preorder: node.preorder_with_tokens(),
-            range: node.text_range(),
-            punct_offset: None,
-            map,
-            append,
-            remove,
-            call_site,
-            current_leaves: SmallVec::new(),
-            mode,
-            on_event: on_enter,
-        };
-        converter.current = converter.next_token();
-        converter
-    }
-
-    fn next_token(&mut self) -> Option<SyntaxToken> {
-        while let Some(ev) = self.preorder.next() {
-            let (keep_event, insert_leaves) = (self.on_event)(&mut self.preorder, &ev);
-            self.current_leaves.extend(insert_leaves);
-            if !keep_event {
-                continue;
-            }
-            match ev {
-                WalkEvent::Enter(token) => {
-                    if self.remove.contains(&token) {
-                        match token {
-                            syntax::NodeOrToken::Token(_) => {
-                                continue;
-                            }
-                            node => {
-                                self.preorder.skip_subtree();
-                                if let Some(v) = self.append.remove(&node) {
-                                    self.current_leaves.extend(v);
-                                    continue;
-                                }
-                            }
-                        }
-                    } else if let syntax::NodeOrToken::Token(token) = token {
-                        return Some(token);
-                    }
-                }
-                WalkEvent::Leave(ele) => {
-                    if let Some(v) = self.append.remove(&ele) {
-                        self.current_leaves.extend(v);
-                        continue;
-                    }
-                }
-            }
-        }
-        None
-    }
-}
-
-#[derive(Debug)]
-enum SynToken {
-    Ordinary(SyntaxToken),
-    Punct { token: SyntaxToken, offset: usize },
-    Leaf(tt::Leaf),
-}
-
-impl SynToken {
-    fn token(&self) -> &SyntaxToken {
-        match self {
-            SynToken::Ordinary(it) | SynToken::Punct { token: it, offset: _ } => it,
-            SynToken::Leaf(_) => unreachable!(),
-        }
-    }
-}
-
-impl<SpanMap, OnEvent, A: Allocator + Clone> SrcToken<Converter<SpanMap, OnEvent, A>>
-    for SynToken
-{
-    fn kind(&self, _ctx: &Converter<SpanMap, OnEvent, A>) -> SyntaxKind {
-        match self {
-            SynToken::Ordinary(token) => token.kind(),
-            SynToken::Punct { token, offset: i } => {
-                SyntaxKind::from_char(punct_char(token.text(), *i).unwrap()).unwrap()
-            }
-            SynToken::Leaf(_) => {
-                never!();
-                SyntaxKind::ERROR
-            }
-        }
-    }
-    fn to_char(&self, _ctx: &Converter<SpanMap, OnEvent, A>) -> Option<char> {
-        match self {
-            SynToken::Ordinary(_) => None,
-            SynToken::Punct { token: it, offset: i } => punct_char(it.text(), *i),
-            SynToken::Leaf(_) => None,
-        }
-    }
-    fn to_text<'a>(&'a self, _ctx: &'a Converter<SpanMap, OnEvent, A>) -> &'a str {
-        match self {
-            SynToken::Ordinary(token) | SynToken::Punct { token, offset: _ } => token.text(),
-            SynToken::Leaf(_) => {
-                never!();
-                ""
-            }
-        }
-    }
-    fn as_leaf(&self) -> Option<&tt::Leaf> {
-        match self {
-            SynToken::Ordinary(_) | SynToken::Punct { .. } => None,
-            SynToken::Leaf(it) => Some(it),
-        }
-    }
-}
-
-impl<SpanMap, OnEvent, A: Allocator + Clone> TokenConverter for Converter<SpanMap, OnEvent, A>
-where
-    SpanMap: SpanMapper,
-    OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Inserted),
-{
-    type Token = SynToken;
-    fn convert_doc_comment(
-        &self,
-        token: &Self::Token,
-        is_inner: bool,
-        span: Span,
-        builder: &mut tt::TopSubtreeBuilder,
-    ) {
-        convert_doc_comment(token.token().text(), is_inner, span, self.mode, builder);
-    }
-
-    fn bump(&mut self) -> Option<(Self::Token, TextRange)> {
-        if let Some((punct, offset)) = &mut self.punct_offset
-            && usize::from(*offset) + 1 < punct.text().len()
-        {
-            *offset += TextSize::of('.');
-            let range = TextRange::at(punct.text_range().start() + *offset, TextSize::of('.'));
-            let offset = u32::from(*offset) as usize;
-            // clone: a token handle, for the token returned as well as the one kept.
-            return Some((SynToken::Punct { token: punct.clone(), offset }, range));
-        }
-
-        if !self.current_leaves.is_empty() {
-            let leaf = self.current_leaves.remove(0);
-            return Some((SynToken::Leaf(leaf), TextRange::empty(TextSize::new(0))));
-        }
-
-        let curr = self.current.take()?;
-        if !self.range.contains_range(curr.text_range()) {
-            self.current = Some(curr);
-            return None;
-        }
-
-        self.current = self.next_token();
-        let token = if curr.kind().is_punct() {
-            // clone: a token handle, for the token returned as well as the one kept.
-            self.punct_offset = Some((curr.clone(), 0.into()));
-            let range = curr.text_range();
-            let range = TextRange::at(range.start(), TextSize::of('.'));
-            (SynToken::Punct { token: curr, offset: 0_usize }, range)
-        } else {
-            self.punct_offset = None;
-            let range = curr.text_range();
-            (SynToken::Ordinary(curr), range)
-        };
-
-        Some(token)
-    }
-
-    fn peek(&self) -> Option<Self::Token> {
-        if let Some((punct, offset)) = &self.punct_offset {
-            let offset = *offset + TextSize::of('.');
-            if usize::from(offset) < punct.text().len() {
-                let offset = usize::from(offset);
-                // clone: a token handle, for the token returned.
-                return Some(SynToken::Punct { token: punct.clone(), offset });
-            }
-        }
-
-        let curr = self.current.as_ref()?;
-        if !self.range.contains_range(curr.text_range()) {
-            return None;
-        }
-        // clone: a token handle, for the token returned.
-        let curr = curr.clone();
-
-        let token = if curr.kind().is_punct() {
-            SynToken::Punct { token: curr, offset: 0_usize }
-        } else {
-            SynToken::Ordinary(curr)
-        };
-        Some(token)
-    }
-
-    fn span_for(&self, range: TextRange) -> Span {
-        self.map.span_for(range)
-    }
-
-    fn fragment_bounds(&self, range: TextRange) -> FragmentBounds {
-        self.map.fragment_bounds(range)
-    }
-    fn call_site(&self) -> Span {
-        self.call_site
     }
 }
 
@@ -1262,7 +1019,7 @@ where
     }
 }
 
-/// [`Converter`] on a view: the same walk, removals and appends, keyed by element id.
+/// A node's walk as a view, with removals and appends keyed by element id.
 struct ViewConverter<'t, SpanMap, OnEvent, A: Allocator + Clone> {
     current: Option<syntax::view::Token<'t>>,
     current_leaves: SmallVec<[tt::Leaf; 4]>,
@@ -1527,7 +1284,7 @@ impl<'a> TtTreeSink<'a> {
 
     /// The tree, and the map copied out of the worker's into `alloc` at its length; the worker
     /// keeps its map for the next parse unless it grew past [`KEEP_MAP`].
-    fn finish<A: Allocator + Clone>(mut self, alloc: A) -> (Parse<SyntaxNode>, SpanMap<A>) {
+    fn finish<A: Allocator + Clone>(mut self, alloc: A) -> (Parse<Untyped>, SpanMap<A>) {
         while !self.open_fragments.is_empty() {
             self.close_fragment();
         }
@@ -1536,7 +1293,7 @@ impl<'a> TtTreeSink<'a> {
         if self.token_map.capacity() <= KEEP_MAP {
             SINK_MAP.set(Some(self.token_map));
         }
-        (self.inner.finish(), map)
+        (self.inner.finish_view(), map)
     }
 }
 

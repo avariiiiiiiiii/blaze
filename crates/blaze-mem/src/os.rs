@@ -6,12 +6,14 @@
 //!
 //! A reservation is `PROT_NONE` (`PAGE_NOACCESS`, `MEM_RESERVE`): it costs address space and a
 //! mapping, no memory. Committing makes a prefix readable and writable; Linux backs it with
-//! pages on first touch, macOS and Windows also charge it to the commit limit. On Linux a
-//! reservation that asks for huge pages is aligned to [`HUGE_PAGE`](crate::HUGE_PAGE) and
-//! advised `MADV_HUGEPAGE`, so the kernel backs it with 2 MB pages when transparent huge pages
-//! are on; macOS has no huge pages for anonymous memory on arm64, and Windows' large pages
-//! must be committed whole at reservation (`MEM_LARGE_PAGES`), which commit-on-growth cannot do,
-//! so there a reservation is made of base pages.
+//! pages on first touch, macOS and Windows also charge it to the commit limit. Every Unix
+//! reservation is aligned to [`HUGE_PAGE`](crate::HUGE_PAGE). On Linux one made of
+//! transparent huge pages is advised `MADV_HUGEPAGE`, so the kernel backs each 2 MB of it
+//! committed whole with one huge page; one made of the reserved pool commits its huge pages
+//! with `MAP_HUGETLB` ([`commit_reserved`]). macOS has no huge pages for anonymous memory on
+//! arm64, and Windows' large pages must be committed whole at reservation (`MEM_LARGE_PAGES`),
+//! which commit-on-growth cannot do, so there a reservation is made of base pages
+//! ([`crate::huge`]).
 //!
 //! A reservation can prefer a NUMA node for its pages ([`reserve_on`], [`bind`]): Linux's
 //! `mbind`, Windows' `VirtualAllocExNuma` at reservation; macOS has one memory node.
@@ -53,7 +55,7 @@ fn query_page_size() -> usize {
 
 /// Reserves `bytes` (a multiple of [`page_size`]) of address space, aligned to
 /// [`RESERVE_ALIGN`], none of it committed. With `huge`, the kernel is asked to back it with
-/// huge pages where it can.
+/// transparent huge pages where it can.
 #[cfg(unix)]
 pub(crate) fn reserve(bytes: usize, huge: bool) -> io::Result<NonNull<u8>> {
     let padded = bytes
@@ -282,6 +284,168 @@ pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
 pub(crate) unsafe fn commit(_ptr: NonNull<u8>, _bytes: usize) -> io::Result<()> {
     Ok(())
 }
+
+/// The sysfs file of the 2 MiB hugetlb pool's size.
+#[cfg(target_os = "linux")]
+const POOL: &str = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages";
+
+/// Whether Linux makes transparent huge pages for a region advised `MADV_HUGEPAGE`: the
+/// setting is `always` or `madvise`, not `never`, and the kernel has them at all.
+#[cfg(target_os = "linux")]
+pub(crate) fn transparent_offered() -> bool {
+    // alloc: the setting's few bytes, read once per process
+    match std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") {
+        Ok(setting) => !setting.contains("[never]"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn transparent_offered() -> bool {
+    false
+}
+
+/// Checks the 2 MiB hugetlb pool has pages: a commit takes them from it, and a pool of none
+/// would fail the first one.
+#[cfg(target_os = "linux")]
+pub(crate) fn reserved_pool() -> io::Result<()> {
+    // alloc: the pool's size, read once per process
+    let pages = std::fs::read_to_string(POOL).ok().and_then(|text| text.trim().parse::<u64>().ok());
+    if pages.is_some_and(|pages| pages > 0) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        // alloc: the error of a pool not set up, once
+        format!(
+            "{}=reserved, but the kernel reserves no 2 MiB pages ({POOL} is 0 or missing): \
+             reserve them first (`sysctl vm.nr_hugepages=4096` holds 8 GiB), or unset it for \
+             transparent huge pages",
+            crate::huge::VAR,
+        ),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn reserved_pool() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        // alloc: the error of a setting this system cannot honor, once
+        format!(
+            "{}=reserved: reserved huge pages (hugetlbfs) are Linux's, and {} has none for \
+             anonymous memory; unset it",
+            crate::huge::VAR,
+            std::env::consts::OS
+        ),
+    ))
+}
+
+/// Makes `[ptr, ptr + bytes)` readable and writable on 2 MiB pages of the reserved hugetlb
+/// pool, every page made now, preferred on NUMA node `node` when given. Errs, with the range
+/// given back to the reservation, when the pool has too few free pages: populating is what
+/// takes them, so no later touch can fault for want of one (`MADV_POPULATE_WRITE`, Linux 5.14).
+///
+/// The range is also `MADV_DONTFORK`: a child made by `fork` gets no copy of it, so a write
+/// after a fork never needs a page of the pool for copy-on-write. A child reaches none of the
+/// region before it `exec`s.
+///
+/// # Safety
+///
+/// The range is 2 MiB-aligned at both ends, inside one live reservation of [`reserve`], not
+/// committed, and reached by nothing until this returns; the caller makes no other commit of it
+/// at once.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn commit_reserved(ptr: NonNull<u8>, bytes: usize, node: Option<u32>) -> io::Result<()> {
+    /// `mman-common.h`'s `MADV_POPULATE_WRITE`.
+    const MADV_POPULATE_WRITE: libc::c_int = 23;
+    debug_assert!(ptr.as_ptr().addr() % crate::HUGE_PAGE == 0 && bytes % crate::HUGE_PAGE == 0);
+    // SAFETY: the caller says the range is uncommitted space of a live reservation of ours
+    // that nothing reaches; the fixed mapping replaces only it. `MAP_NORESERVE` defers the
+    // pool's pages to the populate below, which reports their want as an error.
+    let got = unsafe {
+        libc::mmap(
+            ptr.as_ptr().cast(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_FIXED
+                | libc::MAP_PRIVATE
+                | libc::MAP_ANONYMOUS
+                | libc::MAP_NORESERVE
+                | libc::MAP_HUGETLB
+                | libc::MAP_HUGE_2MB,
+            -1,
+            0,
+        )
+    };
+    if got == libc::MAP_FAILED {
+        return Err(on_reserved(bytes, "mapping", io::Error::last_os_error()));
+    }
+    let made = (|| {
+        // SAFETY: the range just mapped, ours alone; the advice changes what `fork` copies.
+        if unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_DONTFORK) } != 0 {
+            return Err(on_reserved(bytes, "excluding from fork", io::Error::last_os_error()));
+        }
+        if let Some(node) = node {
+            // SAFETY: the range just mapped, holding no page yet; the fresh mapping has the
+            // default policy, which this replaces before the populate below makes its pages.
+            unsafe { bind(ptr, bytes, node) }?;
+        }
+        // SAFETY: the range just mapped, readable and writable; populating writes zero pages
+        // that nothing has read.
+        if unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, MADV_POPULATE_WRITE) } != 0 {
+            return Err(on_reserved(bytes, "making the pages of", io::Error::last_os_error()));
+        }
+        Ok(())
+    })();
+    if let Err(why) = made {
+        // SAFETY: the same range, ours alone, whose contents nobody reads; this maps it back to
+        // reserved space and returns what pages it took to the pool.
+        unsafe { decommit(ptr, bytes, false) }?;
+        return Err(why);
+    }
+    Ok(())
+}
+
+/// Names a refused hugetlb step and what to do about it.
+#[cfg(target_os = "linux")]
+#[cold]
+fn on_reserved(bytes: usize, step: &str, why: io::Error) -> io::Error {
+    let hint = match why.raw_os_error() {
+        Some(libc::EINVAL) if step.starts_with("making") => {
+            "populating needs Linux 5.14 (`MADV_POPULATE_WRITE`)"
+        }
+        Some(libc::ENOMEM | libc::EFAULT) => {
+            "the pool has too few free 2 MiB pages: reserve more (`sysctl vm.nr_hugepages`)"
+        }
+        _ => "unset BLAZE_HUGE_PAGES for transparent huge pages",
+    };
+    // alloc: the error of a commit refused, once
+    io::Error::new(why.kind(), format!("{step} {bytes} bytes on reserved 2 MiB pages (MAP_HUGETLB): {why}; {hint}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) unsafe fn commit_reserved(_ptr: NonNull<u8>, _bytes: usize, _node: Option<u32>) -> io::Result<()> {
+    reserved_pool()
+}
+
+/// Asks Linux to make `[ptr, ptr + bytes)`, committed and partly touched while it was made of
+/// base pages, one huge page now, its contents kept (`MADV_COLLAPSE`, Linux 6.1). Advice: an
+/// older kernel or a refusal leaves base pages, which khugepaged may collapse later.
+///
+/// # Safety
+///
+/// The range is 2 MiB-aligned, committed, and inside one live reservation of [`reserve`].
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn collapse(ptr: NonNull<u8>, bytes: usize) {
+    /// `mman-common.h`'s `MADV_COLLAPSE`.
+    const MADV_COLLAPSE: libc::c_int = 25;
+    // SAFETY: the caller says the range is committed memory of ours; collapsing copies its
+    // pages into one, keeping every byte, while other threads may read and write it.
+    let _ = unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, MADV_COLLAPSE) };
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) unsafe fn collapse(_ptr: NonNull<u8>, _bytes: usize) {}
 
 /// Gives `[ptr, ptr + bytes)` back to the kernel and makes it inaccessible again, still
 /// reserved.

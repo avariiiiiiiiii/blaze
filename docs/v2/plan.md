@@ -68,7 +68,7 @@ plan/
 | [items](plan/lanes/items.md) | item hashes and facts: minimal invalidation |
 | [db](plan/lanes/db.md) | our own query database, types, trait solver, borrow check |
 | [store](plan/lanes/store.md) | the content-addressed store and its tiers |
-| [codegen](plan/lanes/codegen.md) | per-function codegen, instances, MIR |
+| [codegen](plan/lanes/codegen.md) | per-function codegen, instances, MIR; the lane's design: [v2-codegen.md](../v2-codegen.md) |
 | [link](plan/lanes/link.md) | parallel in-place linker, live patching |
 | [usercode](plan/lanes/usercode.md) | build scripts, proc macros, tests, sandboxes |
 | [ci](plan/lanes/ci.md) | the agent API and the VM as CI |

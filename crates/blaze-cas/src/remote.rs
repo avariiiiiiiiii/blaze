@@ -77,7 +77,7 @@ const COALESCE_MOST: usize = 1 << 20;
 const SHORT_ROOM: usize = 2 * (COALESCE_MOST + COALESCE);
 
 /// What the server says about one key.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Answer {
     /// The server's store has no value of `key`.
     Missing { key: Key },

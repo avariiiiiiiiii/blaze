@@ -104,6 +104,16 @@ impl DefMap {
             {
                 return true;
             }
+
+            // `#[blaze::reassociate]`, blaze's own inert attribute (`blaze::parallelizable` reads
+            // it from the item's syntax). `blaze` is no tool namespace: `#[blaze::cache]` stays
+            // the `blaze` crate's attribute macro.
+            if let [_, attr] = segments
+                && name.as_str() == "blaze"
+                && attr.symbol().as_str() == "reassociate"
+            {
+                return true;
+            }
         }
         false
     }

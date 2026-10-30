@@ -51,8 +51,7 @@ use hir_ty::{
         UnOp,
     },
     next_solver::{
-        Allocation, CallableIdWrapper, Const, ConstKind, DbInterner, GenericArgKind, GenericArgs, ParamEnv, Ty,
-        TyKind, TypingMode,
+        Allocation, Const, ConstKind, DbInterner, GenericArgKind, ParamEnv, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
     utils::detect_variant_from_bytes,
@@ -82,7 +81,7 @@ pub(super) const LINTS: super::LintSet = super::lint_set(["arithmetic_overflow",
 /// The known-panics lint of the body and of the closures in it, each closure after the body
 /// it is in, in the order they are written. None of a body rustc builds no runtime MIR of
 /// before it aborts, or whose type checking or borrow checking failed.
-pub(super) fn lints<'db>(b: &BodyCx<'_, 'db>) -> Vec<Found> {
+pub(super) fn lints<'db>(b: &BodyCx<'_, '_, 'db>) -> Vec<Found> {
     if b.mir_tainted() || !b.elaborated || borrowck_failed(b) {
         // alloc: empty, allocates nothing
         return Vec::new();
@@ -123,7 +122,7 @@ pub(super) fn lints<'db>(b: &BodyCx<'_, 'db>) -> Vec<Found> {
 
 /// `run_lint`'s kinds of body: functions, methods and associated constants. rustc leaves
 /// other constants, statics and discriminants to const evaluation.
-fn runs_on(b: &BodyCx<'_, '_>) -> bool {
+fn runs_on(b: &BodyCx<'_, '_, '_>) -> bool {
     match b.owner {
         DefWithBodyId::FunctionId(_) => true,
         DefWithBodyId::ConstId(it) => {
@@ -135,7 +134,7 @@ fn runs_on(b: &BodyCx<'_, '_>) -> bool {
 
 /// rustc's `tainted_by_errors` from borrow checking the body and its closures, and from what
 /// stops it before (const checking, a lowering error).
-fn borrowck_failed(b: &BodyCx<'_, '_>) -> bool {
+fn borrowck_failed(b: &BodyCx<'_, '_, '_>) -> bool {
     let result = hir_ty_borrowck::borrowck(b.db(), b.owner);
     result.diagnostics.iter().any(|it| it.is_error())
         || result.not_checked.is_some_and(|it| it.refuses() && it != NotChecked::TypeErrors)
@@ -154,22 +153,12 @@ fn has_checks(body: &MirBody<'_>) -> bool {
         operation
             || match block.terminator.as_ref().map(|it| &it.kind) {
                 Some(TerminatorKind::Assert { .. }) => true,
-                Some(TerminatorKind::Call { func, .. }) => fn_def(func)
+                Some(TerminatorKind::Call { func, .. }) => func
+                    .fn_def()
                     .is_some_and(|(_, args)| args.iter().any(|it| matches!(it.kind(), GenericArgKind::Const(_)))),
                 _ => false,
             }
     })
-}
-
-/// The function item a call's callee is, with its generic arguments.
-fn fn_def<'db>(func: &Operand) -> Option<(CallableDefId, GenericArgs<'db>)> {
-    let ty: Ty<'db> = match &func.kind {
-        OperandKind::Constant { ty, .. } => ty.as_ref(),
-        OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-        _ => return None,
-    };
-    let TyKind::FnDef(CallableIdWrapper(callable), args) = ty.kind() else { return None };
-    Some((callable, args))
 }
 
 /// Which lint a finding is of.
@@ -316,7 +305,7 @@ struct Owner<'db> {
 }
 
 impl<'db> Owner<'db> {
-    fn new(b: &BodyCx<'_, 'db>) -> Self {
+    fn new(b: &BodyCx<'_, '_, 'db>) -> Self {
         let db = b.db();
         let krate = b.cx.krate.base();
         Owner {
@@ -347,7 +336,7 @@ struct Scratch<'db> {
 
 /// rustc's `ConstPropagator` over one body.
 struct Propagator<'a, 'b, 'db> {
-    b: &'a BodyCx<'b, 'db>,
+    b: &'a BodyCx<'a, 'b, 'db>,
     db: &'db Db,
     owner: &'a Owner<'db>,
     body: &'db MirBody<'db>,
@@ -379,7 +368,7 @@ fn is_indirect(place: &StoredPlace) -> bool {
 
 impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
     fn new(
-        b: &'a BodyCx<'b, 'db>,
+        b: &'a BodyCx<'a, 'b, 'db>,
         owner: &'a Owner<'db>,
         s: &'a mut Scratch<'db>,
         body: &'db MirBody<'db>,
@@ -637,6 +626,11 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
             }
             AssertKind::BoundsCheck { len, index } => Panic::BoundsCheck { len: int(self, len), index: int(self, index) },
             AssertKind::Overflow(..) | AssertKind::OverflowNeg(_) => return,
+            // rustc's "need proper const propagator for these": never linted here.
+            AssertKind::MisalignedPointerDereference { .. }
+            | AssertKind::NullPointerDereference
+            | AssertKind::NullReferenceConstructed
+            | AssertKind::InvalidEnumConstruction(_) => return,
         };
         self.report(span, Lint::UnconditionalPanic, panic);
     }
@@ -757,7 +751,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
     /// `ConstNIsZero`: a call of a function with a `#[rustc_panics_when_zero]` const
     /// parameter, given 0. The callee's generics are read only for an argument of 0.
     fn check_const_params(&mut self, func: &Operand, span: MirSpan) {
-        let Some((callable, args)) = fn_def(func) else { return };
+        let Some((callable, args)) = func.fn_def() else { return };
         let db = self.db;
         let mut generics = None;
         for (at, arg) in args.iter().enumerate() {

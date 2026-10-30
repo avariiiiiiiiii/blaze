@@ -67,7 +67,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>) -> Vec<Fo
     {
         no_tail(cx, d, node, block, item, ret)
     } else {
-        let mut diag = mismatch(cx, d, node);
+        // alloc: empty, allocates nothing
+        let Some(mut diag) = mismatch(cx, d, node) else { return vec![] };
         if !super::missing_fields::last_field_mismatch(cx, node, &mut diag) {
             // alloc: empty, allocates nothing
             return vec![];
@@ -102,10 +103,21 @@ enum Call<'db> {
     Method(ast::MethodCallExpr<'db>),
 }
 
-fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast::Node<'db>>) -> Diag {
+/// The mismatch's "mismatched types", none for an argument of a call that has more than this
+/// error, which the call's `IncorrectArguments` reports.
+fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast::Node<'db>>) -> Option<Diag> {
     let span = cx.span(node.map(|it| it.text_range()));
     let outer = outer_of(node.value);
     let context = context(cx, outer, d.cause);
+    if let Context::Arg { call, .. } = &context {
+        let call = match *call {
+            Call::Call(it) => ast::Expr::CallExpr(it),
+            Call::Method(it) => ast::Expr::MethodCallExpr(it),
+        };
+        if !super::incorrect_arguments::single_mismatch(cx, node.file_id, call) {
+            return None;
+        }
+    }
     let message = match d.cause {
         hir::ObligationCauseCode::MatchExpressionArm { .. } => "`match` arms have incompatible types",
         hir::ObligationCauseCode::IfExpression => "`if` and `else` have incompatible types",
@@ -193,7 +205,7 @@ fn mismatch<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMismatch<'db>, node: InFile<ast:
     if let Some(expr) = ast::Expr::cast(node.value) {
         suggest(cx, node.with_value(expr), &d.expected, &d.actual, &mut diag);
     }
-    diag
+    Some(diag)
 }
 
 /// The two types of the mismatch as inference had them at the error, expected then found.
@@ -515,11 +527,11 @@ fn def_params(cx: &Cx<'_, '_>, callable: &hir::Callable<'_>) -> Option<(Span, Pa
 /// rustc's `suggest_missing_return_type` of a function with no return type whose tail is a
 /// value: "try adding a return type", or of `main` and trait methods the label "expected `()`
 /// because of default return type".
-fn missing_return_type(
-    cx: &Cx<'_, '_>,
+fn missing_return_type<'db>(
+    cx: &Cx<'_, 'db>,
     node: InFile<ast::Node<'_>>,
     item: ast::Fn<'_>,
-    found: &hir::Type<'_>,
+    found: &hir::Type<'db>,
     diag: &mut Diag,
 ) {
     let Some(params) = item.param_list() else { return };
@@ -649,7 +661,12 @@ fn collect_blocks<'db>(expr: ast::Expr<'db>, blocks: &mut Vec<ast::BlockExpr<'db
 
 /// E0317: an `if` with no `else` where a value of another type than `()` is expected. The
 /// front end reports `()` as what was expected, as rustc's `label_unit_as_expected` does.
-fn no_else(cx: &Cx<'_, '_>, d: &hir::TypeMismatch<'_>, node: InFile<ast::Node<'_>>, if_expr: ast::IfExpr<'_>) -> Diag {
+fn no_else<'db>(
+    cx: &Cx<'_, 'db>,
+    d: &hir::TypeMismatch<'db>,
+    node: InFile<ast::Node<'_>>,
+    if_expr: ast::IfExpr<'_>,
+) -> Diag {
     let in_file = |range: TextRange| cx.span(node.with_value(range));
     let span = in_file(if_expr.syntax().text_range());
     let (expected, found) = (&d.actual, &d.expected);
@@ -674,11 +691,11 @@ fn no_else(cx: &Cx<'_, '_>, d: &hir::TypeMismatch<'_>, node: InFile<ast::Node<'_
 
 /// rustc's `maybe_get_coercion_reason`: the return type of the function `node` is the body's
 /// value of, or the `let` it initializes with a type.
-fn coercion_reason(
-    cx: &Cx<'_, '_>,
+fn coercion_reason<'db>(
+    cx: &Cx<'_, 'db>,
     node: InFile<ast::Node<'_>>,
     expr: ast::Node<'_>,
-    expected: &hir::Type<'_>,
+    expected: &hir::Type<'db>,
 ) -> Option<(Span, String)> {
     let in_file = |range: TextRange| cx.span(node.with_value(range));
     let outer = outer_of(expr);
@@ -700,9 +717,9 @@ fn coercion_reason(
 }
 
 /// E0069: `return;` in a function whose return type is not `()`.
-fn return_no_value(
-    cx: &Cx<'_, '_>,
-    d: &hir::TypeMismatch<'_>,
+fn return_no_value<'db>(
+    cx: &Cx<'_, 'db>,
+    d: &hir::TypeMismatch<'db>,
     node: InFile<ast::Node<'_>>,
     ret: ast::ReturnExpr<'_>,
 ) -> Diag {
@@ -799,11 +816,11 @@ fn value_of(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
 /// rustc's suggestions for an expression of the wrong type: borrow it, dereference it, remove
 /// its borrow, convert it with `.to_string()`, or wrap it in the variant of the expected enum
 /// that holds its type.
-fn suggest<'t>(
-    cx: &Cx<'_, '_>,
+fn suggest<'db>(
+    cx: &Cx<'_, 'db>,
     expr: InFile<ast::Expr<'_>>,
-    expected: &hir::Type<'t>,
-    found: &hir::Type<'t>,
+    expected: &hir::Type<'db>,
+    found: &hir::Type<'db>,
     diag: &mut Diag,
 ) {
     let span = cx.span(expr.map(|it| it.syntax().text_range()));

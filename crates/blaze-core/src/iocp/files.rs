@@ -13,11 +13,11 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_END_OF_FILE_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileEndOfFileInfo, GetFileAttributesW,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileEndOfFileInfo, GetFileAttributesW,
         GetFileSizeEx, GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES,
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS,
-        OPEN_EXISTING, SetFileAttributesW, SetFileInformationByHandle, SetFileTime,
+        OPEN_EXISTING, ReadFile, SetFileAttributesW, SetFileInformationByHandle, SetFileTime,
     },
     System::{
         IO::DeviceIoControl,
@@ -68,6 +68,51 @@ pub(super) fn open(wide: &[u16], access: Access) -> io::Result<OwnedHandle> {
         )
     };
     sys::owned(handle)
+}
+
+/// The whole file at `wide` (NUL-terminated, as [`sys::Paths`] makes it), read on the calling
+/// thread: opened for reading alone (not overlapped, so each read returns once done), its
+/// length asked, and read into a buffer one byte longer than that, so the read that comes back
+/// short is the end: open, length, one read and close for a file that does not grow meanwhile.
+/// The error is the system's, unnamed: the caller names the file.
+pub(super) fn read_whole(wide: &[u16]) -> io::Result<Vec<u8>> {
+    debug_assert_eq!(wide.last(), Some(&0));
+    // SAFETY: a NUL-terminated path; no security attributes or template.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            std::ptr::null_mut(),
+        )
+    };
+    let handle = sys::owned(handle)?;
+    let raw = handle.as_raw_handle();
+    let size = usize::try_from(size(raw)?).unwrap_or(usize::MAX);
+    // alloc: the bytes read, `Done::Read`'s payload, which the reads write in place.
+    let mut bytes = Vec::with_capacity(size.saturating_add(1));
+    loop {
+        if bytes.len() == bytes.capacity() {
+            // alloc: the file grew after its length was asked.
+            bytes.reserve(bytes.capacity().max(4096));
+        }
+        let room = (bytes.capacity() - bytes.len()).min(u32::MAX as usize);
+        let mut got = 0u32;
+        // SAFETY: an open handle not opened for overlapped I/O, so the call returns once it has
+        // written at most `room` bytes into the `Vec`'s spare room, which is that long, and
+        // their count into `got`.
+        sys::check(unsafe {
+            ReadFile(raw, bytes.spare_capacity_mut().as_mut_ptr().cast(), room as u32, &mut got, std::ptr::null_mut())
+        })?;
+        // SAFETY: the call wrote `got` bytes, at most `room`, from the start of the spare room.
+        unsafe { bytes.set_len(bytes.len() + (got as usize).min(room)) };
+        if (got as usize) < room {
+            return Ok(bytes);
+        }
+    }
 }
 
 /// The length of the file open as `handle`.

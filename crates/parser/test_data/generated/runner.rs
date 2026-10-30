@@ -803,6 +803,10 @@ mod ok {
         run_and_expect_no_errors("test_data/parser/inline/ok/unsafe_binder_cast.rs");
     }
     #[test]
+    fn unsafe_binder_type() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/unsafe_binder_type.rs");
+    }
+    #[test]
     fn unsafe_mod() { run_and_expect_no_errors("test_data/parser/inline/ok/unsafe_mod.rs"); }
     #[test]
     fn use_item() { run_and_expect_no_errors("test_data/parser/inline/ok/use_item.rs"); }
@@ -918,6 +922,10 @@ mod err {
     #[test]
     fn fn_ret_recovery() {
         run_and_expect_errors("test_data/parser/inline/err/fn_ret_recovery.rs");
+    }
+    #[test]
+    fn for_type_unsafe_binder() {
+        run_and_expect_errors("test_data/parser/inline/err/for_type_unsafe_binder.rs");
     }
     #[test]
     fn function_ret_type_missing_arrow() {

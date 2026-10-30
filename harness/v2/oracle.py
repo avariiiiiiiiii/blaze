@@ -16,8 +16,7 @@ one slot at a time. Each step:
 - the incremental build: one daemon kept for the whole sequence, with its home and store,
   builds the edited source (`blaze build`, then `blaze test`);
 - the build from scratch: a daemon with an empty home and a store holding only the standard
-  library (`seed_std`), into an empty target directory, of the same source at the same path;
-- the reference (`reference`): cargo with the pinned nightly, of the same source.
+  library (`seed_std`), into an empty target directory, of the same source at the same path.
 
 A step fails when the incremental build and the one from scratch differ in anything: whether
 the source is refused and with which errors, what the program prints and its exit status, the
@@ -29,8 +28,9 @@ For a slot with a case in `blaze-v2-proof`'s `nameres` (the `nameres` regression
 the traces are also held to what the facts say that edit changes: more is `over`, less is stale.
 Apart from that:
 
-- `rustc/...` fails where the build from scratch differs from cargo's: not an invalidation bug
-  but a wrong compiler, found here first;
+- `refuses/...` fails where a state fixture.py marks as one the compiler must refuse
+  (`fixture.rejects`: a deleted `include_str!` file, a non-`Send` type sent) was built: both
+  builds have to refuse it;
 - `over/...` fails where an edit docs/v2/plan/goals/targets.md says compiles nothing (`fixture.Slot.budget_zero`:
   formatting, comments, a rename or move nothing reads, PATH) compiled something. What every
   other kind of edit compiled is measured and summed by kind in the result (`work_by_kind`).
@@ -49,7 +49,6 @@ Input (JSON inline, a file's path, or `-`):
     seed, first, rounds, steps, kinds, regressions    as above
     profiles      "dev" and/or "release" (release adds the inlining edges of section 6.1)
     tests         run `blaze test` too (default true)
-    reference     build each step with cargo too (default true)
     bytes         compare output files byte for byte (default: on for v2, off for v1, whose
                   incremental programs are spliced)
     seed_std      give each build from scratch a store with the standard library alone
@@ -77,7 +76,6 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
 
 import blaze_cli  # noqa: E402
-import check_apps  # noqa: E402
 import engine  # noqa: E402
 import fixture  # noqa: E402
 import report  # noqa: E402
@@ -106,7 +104,6 @@ class Input:
     regressions: tuple[str, ...] = tuple(fixture.REGRESSIONS)
     profiles: tuple[Profile, ...] = ("dev",)
     tests: bool = True
-    reference: bool = True
     bytes: bool | None = None
     seed_std: bool = True
     jobs: int = 1
@@ -123,7 +120,6 @@ class Replay:
     work: str = ""
     profiles: tuple[Profile, ...] = ("dev",)
     tests: bool = True
-    reference: bool = True
     bytes: bool | None = None
     seed_std: bool = True
     proof: str = ""
@@ -135,7 +131,6 @@ class Settings:
     spec: engine.EngineSpec
     profiles: tuple[Profile, ...]
     tests: bool
-    reference: bool
     bytes: bool
     # `blaze-v2-proof`, which compares the traces of two builds.
     proof: str
@@ -149,7 +144,6 @@ class Built:
 
     ok: bool = True
     errors: tuple[str, ...] = ()
-    codes: tuple[str, ...] = ()
     programs: dict[str, tuple[int, str, str]] = field(default_factory=dict[str, tuple[int, str, str]])
     tests: dict[str, object] = field(default_factory=dict[str, object])
     outputs: dict[str, dict[str, str]] = field(default_factory=dict[str, dict[str, str]])
@@ -173,7 +167,8 @@ class Step:
     reran: int | None = None
     needless: int | None = None
     link: str | None = None
-    rustc: str | None = None
+    # Which builds built a state fixture.py marks as refused.
+    refusal: str | None = None
     state: dict[str, int] = field(default_factory=dict[str, int])
     found: str | None = None
 
@@ -182,14 +177,33 @@ def profile_dir(profile: Profile) -> str:
     return "release" if profile == "release" else "debug"
 
 
-def errors_of(stdout: str, ws: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """The errors of a build's `--message-format=json`: each as its code (or the start of its
-    message when it has none), file and line; and the codes alone."""
-    diagnostics = cast(list[tuple[str, str | None, str, int, str]], check_apps.diagnostics(stdout, str(ws)))
-    found = [d for d in diagnostics if d[0] == "error"]
-    keyed = sorted({f"{code or message[:60]} {path}:{line}" for _, code, path, line, message in found})
-    codes = sorted({code or message[:60] for _, code, _, _, message in found})
-    return tuple(keyed), tuple(codes)
+def errors_of(stdout: str, ws: Path) -> tuple[str, ...]:
+    """The errors of a build's `--message-format=json` in the files of `ws`: each as its code
+    (or the start of its message when it has none), file and line."""
+    root = str(ws).rstrip("/") + "/"
+    keyed: set[str] = set()
+    for line in stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if m.get("reason") != "compiler-message" or m["message"]["level"] != "error":
+            continue
+        d = m["message"]
+        spans = [s for s in d["spans"] if s["is_primary"]] or d["spans"]
+        # A summary ("aborting due to") has no place.
+        if not spans:
+            continue
+        path = spans[0]["file_name"]
+        if os.path.isabs(path):
+            if not path.startswith(root):
+                continue
+            path = os.path.relpath(path, ws)
+        code = d["code"] and d["code"]["code"]
+        keyed.add(f"{code or d['message'][:60]} {path}:{spans[0]['line_start']}")
+    return tuple(sorted(keyed))
 
 
 def first_line_apart(a: str, b: str) -> str:
@@ -200,17 +214,15 @@ def first_line_apart(a: str, b: str) -> str:
     return f"one has {len(x)} lines, the other {len(y)}"
 
 
-def compare(a: Built, b: Built, names: tuple[str, str], whole: bool) -> list[str]:
-    """How `a` and `b` differ. `whole` compares everything (incremental against scratch); else
-    what two compilers have to agree on (blaze against rustc): refused or not, the error codes,
-    what the programs print and the tests' outcomes."""
+def compare(a: Built, b: Built, names: tuple[str, str]) -> list[str]:
+    """How `a` and `b` differ in anything: refused or not and with which errors, what the
+    programs print, the tests' outcomes, the output files and the codegen inputs."""
     la, lb = names
     if a.ok != b.ok:
         said = "".join(f"\n{side}: {x.said[-1500:]}" for side, x in ((la, a), (lb, b)) if not x.ok)
         return [f"{la} {'built' if a.ok else 'refused'} it, {lb} {'built' if b.ok else 'refused'} it{said}"]
     if not a.ok:
-        mine, theirs = (a.errors, b.errors) if whole else (a.codes, b.codes)
-        return [] if mine == theirs else [f"both refused it, with other errors: {la} {list(mine)}, {lb} {list(theirs)}"]
+        return [] if a.errors == b.errors else [f"both refused it, with other errors: {la} {list(a.errors)}, {lb} {list(b.errors)}"]
     out: list[str] = []
     for profile, program in a.programs.items():
         other = b.programs.get(profile)
@@ -225,33 +237,25 @@ def compare(a: Built, b: Built, names: tuple[str, str], whole: bool) -> list[str
         other = b.tests.get(profile)
         if other is not None and tests != other:
             out.append(f"{profile}: tests: {blaze_cli.difference(tests, other)}")
-    if whole:
-        for profile, files in a.outputs.items():
-            other = b.outputs.get(profile, {})
-            apart = sorted(n for n in set(files) | set(other) if files.get(n) != other.get(n))
-            if apart:
-                out.append(f"{profile}: output files not the same bytes: {', '.join(apart[:6])}")
-        if a.codegen is not None and b.codegen is not None and a.codegen != b.codegen:
-            keys = sorted(k for k in set(a.codegen) | set(b.codegen) if a.codegen.get(k) != b.codegen.get(k))
-            out.append(f"codegen inputs differ for {len(keys)} instances: {', '.join(keys[:8])}")
+    for profile, files in a.outputs.items():
+        other = b.outputs.get(profile, {})
+        apart = sorted(n for n in set(files) | set(other) if files.get(n) != other.get(n))
+        if apart:
+            out.append(f"{profile}: output files not the same bytes: {', '.join(apart[:6])}")
+    if a.codegen is not None and b.codegen is not None and a.codegen != b.codegen:
+        keys = sorted(k for k in set(a.codegen) | set(b.codegen) if a.codegen.get(k) != b.codegen.get(k))
+        out.append(f"codegen inputs differ for {len(keys)} instances: {', '.join(keys[:8])}")
     return out
 
 
-# cargo's build of a state is a function of the state (fixture.write, fixture.environment) and
-# of the profiles and tests built: random sequences, regressions, replays and reductions come
-# back to the same states, and build each with cargo once per run.
-REFERENCES: dict[tuple[tuple[str, ...], bool, tuple[tuple[str, int], ...]], Built] = {}
-
-
 class Round:
-    """One sequence's workspace and its incremental daemon; a build from scratch and cargo's
-    beside it at each step."""
+    """One sequence's workspace and its incremental daemon; a build from scratch beside it at
+    each step."""
 
     def __init__(self, eng: engine.Engine, it: Settings, work: Path, std_store: Path | None):
         self.eng, self.it, self.work, self.std_store = eng, it, work, std_store
         self.ws = work / "ws"
         self.inc_home, self.inc_store, self.inc_target = work / "hi", work / "si", work / "ti"
-        self.cargo_target = work / "tc"
         self.extra_dir = work / "path-extra"
         for path in (self.ws, self.extra_dir):
             path.mkdir(parents=True, exist_ok=True)
@@ -287,19 +291,16 @@ class Round:
         verdict: report.Verdict = "unmeasured" if isinstance(error, engine.Unmeasurable) else "error"
         return verdict, f"{which}: {error}"
 
-    def side(self, label: str, state: fixture.State, env: dict[str, str], target: Path, blaze: bool) -> Built:
+    def side(self, label: str, env: dict[str, str], target: Path) -> Built:
         built = Built()
         for profile in self.it.profiles:
             release = ["--release"] if profile == "release" else []
             step = f"{label} ({profile})"
-            if blaze:
-                ran = self.eng.build(f"{step}: build", self.ws, env, ["--message-format=json", *release], timeout=BUILD_SECS)
-                built.not_blazes = built.not_blazes or self.eng.not_blazes(ran)
-            else:
-                ran = engine.cargo(f"{step}: build", ["build", "--message-format=json", *release], self.ws, env, BUILD_SECS)
+            ran = self.eng.build(f"{step}: build", self.ws, env, ["--message-format=json", *release], timeout=BUILD_SECS)
+            built.not_blazes = built.not_blazes or self.eng.not_blazes(ran)
             if ran.returncode != 0:
                 built.ok, built.said = False, ran.said()
-                built.errors, built.codes = errors_of(ran.stdout, self.ws)
+                built.errors = errors_of(ran.stdout, self.ws)
                 return built
             program = target / profile_dir(profile) / "oracle_app"
             done = engine.run(f"{step}: the program", [str(program)], self.ws, engine.scrubbed(), RUN_SECS)
@@ -307,21 +308,17 @@ class Round:
             if self.it.bytes:
                 built.outputs[profile] = engine.outputs(target, profile_dir(profile))
             if self.it.tests:
-                built.tests[profile] = self.tests(step, env, target, release, blaze, built)
+                built.tests[profile] = self.tests(step, env, target, release, built)
         return built
 
-    def tests(self, step: str, env: dict[str, str], target: Path, release: list[str], blaze: bool, built: Built) -> object:
-        # JSON for blaze-work (engine.V2.work_since); for cargo too, so both print alike.
+    def tests(self, step: str, env: dict[str, str], target: Path, release: list[str], built: Built) -> object:
+        # JSON for blaze-work (engine.V2.work_since).
         args = ["--message-format=json", "--no-fail-fast", *release]
         kept_file = target / "blaze" / "tests.ndjson"
-        if blaze:
-            kept_file.unlink(missing_ok=True)
-            ran = self.eng.build(f"{step}: test", self.ws, env, args, command="test", timeout=BUILD_SECS)
-            built.not_blazes = built.not_blazes or self.eng.not_blazes(ran)
-            kept = cast(list[str], blaze_cli.kept_passes(str(kept_file)))
-        else:
-            ran = engine.cargo(f"{step}: test", ["test", *args], self.ws, env, BUILD_SECS)
-            kept: list[str] = []
+        kept_file.unlink(missing_ok=True)
+        ran = self.eng.build(f"{step}: test", self.ws, env, args, command="test", timeout=BUILD_SECS)
+        built.not_blazes = built.not_blazes or self.eng.not_blazes(ran)
+        kept = cast(list[str], blaze_cli.kept_passes(str(kept_file)))
         return cast(object, blaze_cli.test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout, kept=kept)))
 
     def codegen(self, env: dict[str, str]) -> dict[str, str] | None:
@@ -380,7 +377,7 @@ class Round:
                 mark = self.eng.mark(self.inc_home)
             except engine.Unmeasurable as e:
                 self.work_gap = self.gap("what a build did", e)
-        built = self.side("incremental", state, env, self.inc_target, True)
+        built = self.side("incremental", env, self.inc_target)
         work = None
         if mark is not None:
             try:
@@ -407,7 +404,7 @@ class Round:
             shutil.rmtree(target, ignore_errors=True)
         env = self.env_of(self.eng.env(home, store, target), state)
         try:
-            built = self.side("from scratch", state, env, target, True)
+            built = self.side("from scratch", env, target)
             if built.ok:
                 built.codegen = self.codegen(env)
                 built.trace = self.traced(env, "trace-s.cbor")
@@ -422,14 +419,6 @@ class Round:
                 if self.it.bytes:
                     os.rename(aside, self.inc_target)
 
-    def reference(self, state: fixture.State) -> Built:
-        key = (self.it.profiles, self.it.tests, tuple(sorted(state.items())))
-        if (known := REFERENCES.get(key)) is not None:
-            return known
-        env = self.env_of(engine.reference_env(self.cargo_target), state)
-        REFERENCES[key] = built = self.side("cargo", state, env, self.cargo_target, False)
-        return built
-
     def step(self, state: fixture.State, name: str, edit: fixture.Edit | None) -> Step:
         self.files = fixture.write(self.ws, state, self.files)
         slot = fixture.BY_NAME[edit.slot] if edit else None
@@ -439,7 +428,6 @@ class Round:
         try:
             inc, work = self.incremental(state)
             scratch = self.scratch(state)
-            cargo = self.reference(state) if self.it.reference else None
             stale: list[str] = []
             if inc.trace is not None and scratch.trace is not None:
                 stale, out.needless = self.compare_traces(inc.trace, scratch.trace, edit.slot if edit else "")
@@ -455,14 +443,13 @@ class Round:
             out.verdict = "unmeasured"
             out.detail = f"not blaze's: {inc.not_blazes or scratch.not_blazes}"
         else:
-            apart = compare(inc, scratch, ("the incremental build", "the build from scratch"), whole=True) + stale
+            apart = compare(inc, scratch, ("the incremental build", "the build from scratch")) + stale
             if apart:
                 out.verdict, out.detail = "fail", "\n".join(apart)
-        if cargo is not None:
-            apart = compare(scratch, cargo, ("blaze", "rustc"), whole=False)
-            out.rustc = "\n".join(apart) or None
-        elif out.rejects and scratch.ok:
-            out.rustc = "blaze built a program fixture.py marks as one rustc refuses"
+        if out.rejects:
+            built = [label for label, b in (("the incremental build", inc), ("the build from scratch", scratch)) if b.ok]
+            if built:
+                out.refusal = f"{' and '.join(built)} built a program fixture.py marks as refused"
         return out
 
     def close(self) -> None:
@@ -592,12 +579,12 @@ def std_seed(eng: engine.Engine, work: Path) -> Path:
     return store
 
 
-def settings(spec: engine.EngineSpec, profiles: tuple[Profile, ...], tests: bool, reference: bool,
+def settings(spec: engine.EngineSpec, profiles: tuple[Profile, ...], tests: bool,
              bytes_: bool | None, proof: str, keep: bool) -> Settings:
     if not profiles:
         fail(SCRIPT, "profiles: name at least one")
     proof_bin = Path(proof) if proof else Path(spec.blaze).parent / f"blaze-v2-proof{engine.EXE}"
-    return Settings(spec, profiles, tests, reference, spec.kind == "v2" if bytes_ is None else bytes_,
+    return Settings(spec, profiles, tests, spec.kind == "v2" if bytes_ is None else bytes_,
                     str(proof_bin.resolve()), keep)
 
 
@@ -609,15 +596,16 @@ def work_root(given: str) -> Path:
 
 
 def record(out: report.Report, ran: Ran, gaps: dict[str, tuple[report.Verdict, str]],
-           by_kind: dict[str, list[int]], rustc: list[Step]) -> None:
+           by_kind: dict[str, list[int]], refused: list[Step]) -> None:
     for step in ran.steps:
         numbers: dict[str, report.Number] = dict(kind=step.kind, compiled=step.compiled, reran=step.reran,
                                                  needless=step.needless, link=step.link)
         detail = step.edit + (f"\n{step.detail}" if step.detail else "") + (f"\nfiled: {step.found}" if step.found else "")
         out.add(f"oracle/{step.name}", step.verdict, detail.strip(), **numbers)
-        if step.rustc:
-            rustc.append(step)
-            out.add(f"rustc/{step.name}", "fail", f"{step.edit}\n{step.rustc}".strip(), kind=step.kind)
+        if step.rejects and step.verdict != "error":
+            refused.append(step)
+            out.add(f"refuses/{step.name}", "fail" if step.refusal else "pass",
+                    f"{step.edit}\n{step.refusal or 'both builds refused it'}".strip(), kind=step.kind)
         if step.kind != "start" and step.compiled is not None and step.verdict != "error" and not step.rejects:
             by_kind.setdefault(step.kind, []).append(step.compiled)
             if step.budget_zero and step.compiled > 0:
@@ -634,7 +622,7 @@ def run(it: Input) -> None:
     unknown = [k for k in it.kinds if k not in fixture.KINDS] + [r for r in it.regressions if r not in fixture.REGRESSIONS]
     if unknown:
         fail(SCRIPT, f"no kind or regression {unknown}: kinds {list(fixture.KINDS)}, regressions {list(fixture.REGRESSIONS)}")
-    s = settings(it.engine, it.profiles, it.tests, it.reference, it.bytes, it.proof, it.keep)
+    s = settings(it.engine, it.profiles, it.tests, it.bytes, it.proof, it.keep)
     out = report.Report(SCRIPT, it.engine, it.out)
     root = work_root(it.work)
     print(f"work: {root}", flush=True)
@@ -651,18 +639,18 @@ def run(it: Input) -> None:
                            steps=it.steps, kinds=it.kinds) for n in range(it.first, it.first + it.rounds)]
     gaps: dict[str, tuple[report.Verdict, str]] = {}
     by_kind: dict[str, list[int]] = {}
-    rustc: list[Step] = []
+    refused: list[Step] = []
     findings: list[Step] = []
     with concurrent.futures.ProcessPoolExecutor(it.jobs) as pool:
         futures = [pool.submit(run_sequence, eng, s, seq, root / f"q{at}", std_store, found_dir)
                    for at, seq in enumerate(sequences)]
         for future in futures:
             ran = future.result()
-            record(out, ran, gaps, by_kind, rustc)
+            record(out, ran, gaps, by_kind, refused)
             findings += [step for step in ran.steps if step.verdict == "fail" and step.found]
-    if s.reference:
-        out.add("rustc/all", "fail" if rustc else "pass",
-                f"{len(rustc)} steps where blaze's build from scratch and rustc's differ", steps=len(rustc))
+    built = sum(step.refusal is not None for step in refused)
+    out.add("refuses/all", "fail" if built else "pass",
+            f"{len(refused)} states fixture.py marks as refused, {built} built", steps=len(refused), built=built)
     for verdict, why in gaps.values():
         out.add(f"oracle/{why.split(':')[0]}", verdict, why)
     if not s.bytes:
@@ -691,7 +679,7 @@ def run(it: Input) -> None:
 
 
 def replay(it: Replay) -> None:
-    s = settings(it.engine, it.profiles, it.tests, it.reference, it.bytes, it.proof, it.keep)
+    s = settings(it.engine, it.profiles, it.tests, it.bytes, it.proof, it.keep)
     out = report.Report(SCRIPT, it.engine, it.out)
     found = json.loads(Path(it.found).read_text())
     states: list[dict[str, int]] = found.get("reduced") or found["history"]
@@ -714,18 +702,19 @@ def selftest() -> list[str]:
     wrong = fixture.selftest()
     a = Built(programs={"dev": (0, "x\ny\n", "")})
     b = Built(programs={"dev": (0, "x\nz\n", "")})
-    if not compare(a, b, ("a", "b"), True) or compare(a, a, ("a", "b"), True):
+    if not compare(a, b, ("a", "b")) or compare(a, a, ("a", "b")):
         wrong.append("compare does not tell two programs apart, or tells one from itself")
-    refused = Built(ok=False, errors=("E0277 app/src/main.rs:3",), codes=("E0277",))
-    moved = Built(ok=False, errors=("E0277 app/src/main.rs:4",), codes=("E0277",))
-    if compare(refused, moved, ("a", "b"), False) or not compare(refused, moved, ("a", "b"), True):
-        wrong.append("compare: errors on other lines are the same to rustc's comparison, not to scratch's")
-    if not compare(a, refused, ("a", "b"), False):
+    refused = Built(ok=False, errors=("E0277 app/src/main.rs:3",))
+    moved = Built(ok=False, errors=("E0277 app/src/main.rs:4",))
+    if not compare(refused, moved, ("a", "b")) or compare(refused, refused, ("a", "b")):
+        wrong.append("compare: errors on other lines are the same, or one refusal differs from itself")
+    if not compare(a, refused, ("a", "b")):
         wrong.append("compare: a program built and one refused are the same")
-    stdout = json.dumps({"reason": "compiler-message", "message": {
-        "level": "error", "code": {"code": "E0277"}, "message": "not Send",
-        "spans": [{"is_primary": True, "file_name": "app/src/main.rs", "line_start": 9}]}})
-    if errors_of(stdout, Path("/w")) != (("E0277 app/src/main.rs:9",), ("E0277",)):
+    stdout = "\n".join(json.dumps({"reason": "compiler-message", "message": {
+        "level": level, "code": {"code": "E0277"}, "message": "not Send",
+        "spans": [{"is_primary": True, "file_name": file, "line_start": 9}]}})
+        for level, file in (("error", "app/src/main.rs"), ("warning", "app/src/lib.rs"), ("error", "/elsewhere/x.rs")))
+    if errors_of(stdout, Path("/w")) != ("E0277 app/src/main.rs:9",):
         wrong.append(f"errors_of: {errors_of(stdout, Path('/w'))}")
     return wrong
 

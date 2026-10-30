@@ -102,7 +102,7 @@ pub fn crate_attr_owner(db: &Db, file: FileId) -> Option<Crate> {
 /// wrapped text `#![<attr>]` into token trees (a lexer error or an unbalanced delimiter stops
 /// it), parses one inner attribute off them (`parse_attribute`) and refuses any token after it
 /// (`unexpected`).
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub fn crate_attr_error(db: &Db, file: EditionedFileId) -> Option<CrateAttrError> {
     let (file_id, edition) = file.unpack(db);
     let text: &str = db.file_text(file_id).text(db);

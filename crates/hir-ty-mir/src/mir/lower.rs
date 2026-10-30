@@ -29,13 +29,13 @@ use rustc_apfloat::Float;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     CoroutineArgs, CoroutineArgsParts, TypeVisitableExt,
-    inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _},
+    inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
 use span::Edition;
 
 use crate::{
     Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, LoweringMode, ParamEnvAndCrate,
-    consteval::try_const_usize,
+    consteval::{mir_const_alias_kind, try_const_usize},
     db::{
         AnonConstId, AnonConstLoc, GeneralConstId, HirDatabase, InternedClosure, InternedClosureId,
     },
@@ -58,8 +58,8 @@ use crate::{
         Terminator, TerminatorKind, Ty, UnOp, VariantId, return_slot,
     },
     next_solver::{
-        Const, DbInterner, ParamConst, ParamEnv, Region, StoredEarlyBinder, TyKind, TypingMode,
-        UnevaluatedConst,
+        AliasConst, AliasConstKind, AnonConstIdWrapper, Const, ConstExt, DbInterner, IsRigid,
+        ParamConst, ParamEnv, Region, RegionExt, StoredEarlyBinder, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
@@ -1806,6 +1806,18 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.push_assignment(current, place, rvalue, expr_id.into());
                 Ok(Some(current))
             }
+            // An `unsafe<..> T` is laid out as `T`, the binder erased: rustc's
+            // `WrapUnsafeBinder` and an `UnwrapUnsafeBinder` read move or copy the operand
+            // and change only its type.
+            Expr::UnsafeBinderCast { kind: _, expr, ty: _ } => {
+                let Some((it, current)) = self.lower_expr_to_some_operand(expr, current)? else {
+                    return Ok(None);
+                };
+                let target_ty = self.expr_ty_without_adjust(expr_id);
+                let rvalue = Rvalue::Cast(CastKind::Transmute, it, target_ty.store());
+                self.push_assignment(current, place, rvalue, expr_id.into());
+                Ok(Some(current))
+            }
             Expr::Ref { expr, rawness: _, mutability } => {
                 let locals = self.local_count();
                 let Some((p, current)) = self.lower_expr_as_place(current, expr, true)? else {
@@ -2513,16 +2525,21 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         subst: GenericArgs<'db>,
         const_id: GeneralConstId<'db>,
     ) -> Result<'db, Operand> {
-        let konst = Const::new_unevaluated(
-            self.interner(),
-            UnevaluatedConst { def: const_id.into(), args: subst },
-        );
-        let ty = match const_id {
-            GeneralConstId::ConstId(id) => self.db.value_ty(id.into()).unwrap(),
-            GeneralConstId::StaticId(id) => self.db.value_ty(id.into()).unwrap(),
-            GeneralConstId::AnonConstId(id) => id.loc(self.db).ty.get(),
+        let interner = self.interner();
+        let (kind, ty) = match const_id {
+            GeneralConstId::ConstId(id) => {
+                (mir_const_alias_kind(self.db, id), self.db.value_ty(id.into()).unwrap())
+            }
+            GeneralConstId::AnonConstId(id) => {
+                (AliasConstKind::Anon { def_id: AnonConstIdWrapper(id) }, id.loc(self.db).ty.get())
+            }
+            GeneralConstId::StaticId(id) => {
+                not_supported!("the static {id:?} as a constant: a static is `Operand::Static`")
+            }
         };
-        let ty = ty.instantiate(self.interner(), subst).skip_norm_wip();
+        let konst =
+            Const::new_alias(interner, IsRigid::No, AliasConst::new(interner, kind, subst));
+        let ty = ty.instantiate(interner, subst).skip_norm_wip();
         Ok(Operand {
             kind: OperandKind::Constant { konst: konst.store(), ty: ty.store() },
             span: None,
@@ -3248,13 +3265,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     }
 
     fn expr_ty_after_adjustments(&self, e: ExprId) -> Ty<'db> {
-        let mut ty = None;
-        if let Some(it) = self.infer.expr_adjustments.get(&e)
-            && let Some(it) = it.last()
-        {
-            ty = Some(it.target.as_ref());
-        }
-        ty.unwrap_or_else(|| self.expr_ty_without_adjust(e))
+        self.infer.expr_ty_after_adjustments(e)
     }
 
     fn push_statement(&mut self, block: BasicBlockId, statement: Statement) {
@@ -4077,7 +4088,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         let interner = self.interner();
         let span = MirSpan::from(expr_id);
         let awaitee_ty = self.expr_ty_after_adjustments(awaitee);
-        let future_ty = Ty::new_projection(interner, future_alias.into(), [awaitee_ty]);
+        let future_ty = Ty::new_projection(interner, IsRigid::No, future_alias.into(), [awaitee_ty]);
         // rustc's `into_future(e)` writes to a temporary made before what `e` makes.
         let future = self.alloc_local(Local { ty: future_ty.store() });
         let Some((awaitee_value, current)) = self.lower_expr_to_some_operand(awaitee, current)?
@@ -4643,7 +4654,7 @@ pub fn inline_const_at<'db>(
         AnonConstLoc {
             owner: owner.expression_store_owner(db),
             expr,
-            ty: StoredEarlyBinder::bind(ty.store()),
+            ty: StoredEarlyBinder::bind(DbInterner::new_no_crate(db), ty.store()),
             allow_using_generic_params: true,
         },
         token,

@@ -631,6 +631,19 @@ pub enum Level {
     FailureNote,
 }
 
+impl Level {
+    /// As rustc's JSON and its rendered lines name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Error => "error",
+            Level::Warning => "warning",
+            Level::Note => "note",
+            Level::Help => "help",
+            Level::FailureNote => "failure-note",
+        }
+    }
+}
+
 /// A place in a file of the view, by 1-based line and column of characters.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Span {
@@ -937,6 +950,14 @@ pub struct Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The names blaze-cargo's `cli/json.rs` and blaze-ci's `service.rs` each wrote.
+    #[test]
+    fn levels_are_named_as_rustc_names_them() {
+        let all = [Level::Error, Level::Warning, Level::Note, Level::Help, Level::FailureNote];
+        let names = all.map(Level::name);
+        assert_eq!(names, ["error", "warning", "note", "help", "failure-note"]);
+    }
 
     #[test]
     fn a_request_round_trips_in_deterministic_cbor() {

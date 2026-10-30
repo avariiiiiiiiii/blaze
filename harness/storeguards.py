@@ -8,7 +8,7 @@ A daemon fills a store and ends. Then:
     path of the checkout in it: what one checkout kept is found by another, and read by
     whoever reads the remote;
   - a pack that other users can write to has to be removed, said so, and the program
-    built from the rest has to print what cargo's does;
+    built from the rest has to print what blaze's build from nothing does;
   - a store directory that other users can write to has to be refused by `blaze-engine cache`
     with the reason, and a daemon on it has to say it is not used, build the right
     program, and neither read nor write anything in it;
@@ -17,8 +17,9 @@ A daemon fills a store and ends. Then:
 
   - a crate cargo fetched from a registry is kept under `/cargo`, not under the cargo home
     of whoever built it: a second user with another cargo home has to find what the first
-    kept, the program has to print what that user's cargo's prints (the place of the file
-    under their own cargo home), and neither home may be in the store.
+    kept, the program has to print what blaze's build from nothing under that user's cargo
+    home prints (the place of the file under their own cargo home), and neither home may be
+    in the store.
 
     python3 storeguards.py
 """
@@ -27,7 +28,7 @@ import os, re, shutil, stat, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from storelib import Checkout, Daemon, cache, files, run, scratch, verify
-from difftest import Fixture
+from mixed import Fixture, from_scratch, printed
 import packs
 
 SEALS = {"BLAZE_CACHE_SEAL_AT": "1", "BLAZE_CACHE_MAX": "off"}
@@ -191,12 +192,13 @@ def built_with_home(ws, home, store):
         fx = Fixture(ws, ["dep", "app"], ["-p", "app"])
         fx.rustc_build()
         fx.blaze_build()
+        want = printed(from_scratch(ws, ["dep", "app"], ["-p", "app"]))
     finally:
         for name, value in were.items():
             os.environ.pop(name, None) if value is None else os.environ.__setitem__(name, value)
-    want, got = run(fx.reference), run(fx.binary)
+    got = run(fx.binary)
     if home not in want or got != want:
-        fail(f"with {home} as cargo's home the program prints\n{got}\nand cargo's\n{want}")
+        fail(f"with {home} as cargo's home the program prints\n{got}\nand blaze's build from nothing\n{want}")
     said = open(os.path.join(fx.work, "app.stderr")).read()
     counted = re.search(r"entries: (\d+) found, (\d+) added", said)
     if not counted:

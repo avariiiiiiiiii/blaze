@@ -1,11 +1,13 @@
 //! cargo's `compute_metadata` (`compiler/build_runner/compilation_files.rs`) and its inputs: the
 //! types cargo hashes, mirrored variant for variant so that their derived `Hash` writes what
-//! cargo's derived `Hash` writes, and `lto.rs`'s `generate`.
+//! cargo's derived `Hash` writes (`CrateType` and `TargetKind` are blaze-manifest's, which are
+//! cargo's variant for variant), and `lto.rs`'s `generate`.
 
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use blaze_ids::radix;
+use blaze_manifest::targets::{CrateType, TargetKind};
 use blaze_resolve::{PackageId, SourceId, SourceKind};
 
 use crate::query::LoadError;
@@ -21,138 +23,32 @@ fn error(what: String) -> LoadError {
     LoadError { what, at: None }
 }
 
-/// cargo's `CrateType`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum CrateType {
-    Bin,
-    Lib,
-    Rlib,
-    Dylib,
-    Cdylib,
-    Staticlib,
-    ProcMacro,
-    Other(String),
-}
-
-impl CrateType {
-    pub fn parse(name: &str) -> CrateType {
-        match name {
-            "bin" => CrateType::Bin,
-            "lib" => CrateType::Lib,
-            "rlib" => CrateType::Rlib,
-            "dylib" => CrateType::Dylib,
-            "cdylib" => CrateType::Cdylib,
-            "staticlib" => CrateType::Staticlib,
-            "proc-macro" => CrateType::ProcMacro,
-            other => CrateType::Other(other.to_owned()),
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            CrateType::Bin => "bin",
-            CrateType::Lib => "lib",
-            CrateType::Rlib => "rlib",
-            CrateType::Dylib => "dylib",
-            CrateType::Cdylib => "cdylib",
-            CrateType::Staticlib => "staticlib",
-            CrateType::ProcMacro => "proc-macro",
-            CrateType::Other(it) => it,
-        }
-    }
-
-    pub fn can_lto(&self) -> bool {
-        matches!(self, CrateType::Bin | CrateType::Staticlib | CrateType::Cdylib)
-    }
-
-    pub fn is_linkable(&self) -> bool {
-        matches!(self, CrateType::Lib | CrateType::Rlib | CrateType::Dylib | CrateType::ProcMacro)
-    }
-
-    pub fn is_dynamic(&self) -> bool {
-        matches!(self, CrateType::Dylib | CrateType::Cdylib | CrateType::ProcMacro)
-    }
-
-    pub fn requires_upstream_objects(&self) -> bool {
-        !matches!(self, CrateType::Lib | CrateType::Rlib)
+/// A crate type as the unit graph prints it (`proc-macro` with its `-`, which a manifest's
+/// `crate-type` spells `procmacro`).
+pub(super) fn crate_type(name: &str) -> CrateType {
+    match name {
+        "proc-macro" => CrateType::ProcMacro,
+        other => CrateType::parse(other),
     }
 }
 
-/// cargo's `TargetKind`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum TargetKind {
-    Lib(Vec<CrateType>),
-    Bin,
-    Test,
-    Bench,
-    ExampleLib(Vec<CrateType>),
-    ExampleBin,
-    CustomBuild,
-}
-
-impl TargetKind {
-    /// The kind a target of the unit graph prints as its `kind` and `crate_types` (cargo's
-    /// `Serialize for TargetKind`, and `example_target`'s choice of `ExampleBin`).
-    pub fn of(target: &schema::Target) -> TargetKind {
-        let types = |names: &[String]| names.iter().map(|it| CrateType::parse(it)).collect::<Vec<_>>();
-        match target.kind.first().map(String::as_str) {
-            Some("custom-build") => TargetKind::CustomBuild,
-            Some("bin") => TargetKind::Bin,
-            Some("test") => TargetKind::Test,
-            Some("bench") => TargetKind::Bench,
-            Some("example") => {
-                if target.crate_types.iter().all(|it| it == "bin") {
-                    TargetKind::ExampleBin
-                } else {
-                    TargetKind::ExampleLib(types(&target.crate_types))
-                }
+/// The kind a target of the unit graph prints as its `kind` and `crate_types` (cargo's
+/// `Serialize for TargetKind`, and `example_target`'s choice of `ExampleBin`).
+pub(super) fn target_kind(target: &schema::Target) -> TargetKind {
+    let types = |names: &[String]| names.iter().map(|it| crate_type(it)).collect::<Vec<_>>();
+    match target.kind.first().map(String::as_str) {
+        Some("custom-build") => TargetKind::CustomBuild,
+        Some("bin") => TargetKind::Bin,
+        Some("test") => TargetKind::Test,
+        Some("bench") => TargetKind::Bench,
+        Some("example") => {
+            if target.crate_types.iter().all(|it| it == "bin") {
+                TargetKind::ExampleBin
+            } else {
+                TargetKind::ExampleLib(types(&target.crate_types))
             }
-            _ => TargetKind::Lib(types(&target.kind)),
         }
-    }
-
-    pub fn rustc_crate_types(&self) -> &[CrateType] {
-        match self {
-            TargetKind::Lib(kinds) | TargetKind::ExampleLib(kinds) => kinds,
-            _ => &[CrateType::Bin],
-        }
-    }
-
-    pub fn is_bin(&self) -> bool {
-        matches!(self, TargetKind::Bin)
-    }
-
-    pub fn is_example(&self) -> bool {
-        matches!(self, TargetKind::ExampleLib(_) | TargetKind::ExampleBin)
-    }
-
-    pub fn is_executable(&self) -> bool {
-        matches!(self, TargetKind::Bin | TargetKind::ExampleBin)
-    }
-
-    pub fn is_custom_build(&self) -> bool {
-        matches!(self, TargetKind::CustomBuild)
-    }
-
-    pub fn is_test_or_bench(&self) -> bool {
-        matches!(self, TargetKind::Test | TargetKind::Bench)
-    }
-
-    fn lib_has(&self, crate_type: &CrateType) -> bool {
-        matches!(self, TargetKind::Lib(types) if types.contains(crate_type))
-    }
-
-    pub fn is_dylib(&self) -> bool {
-        self.lib_has(&CrateType::Dylib)
-    }
-
-    pub fn is_cdylib(&self) -> bool {
-        self.lib_has(&CrateType::Cdylib)
-    }
-
-    /// cargo's `Target::for_host`: a build script, or a library that is a proc macro.
-    pub fn for_host(&self) -> bool {
-        self.is_custom_build() || self.lib_has(&CrateType::ProcMacro)
+        _ => TargetKind::Lib(types(&target.kind)),
     }
 }
 

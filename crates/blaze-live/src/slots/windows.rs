@@ -2,7 +2,11 @@
 //!
 //! Pages are made writable for a write with `VirtualProtect` and given their protection
 //! back, once per run of pages of one protection that a patch writes; code stays runnable
-//! while written, for a thread running an older generation's code on the same pages.
+//! while written, for a thread running an older generation's code on the same pages. Pages
+//! already writable (a patch code section linked runnable and writable) are written in place
+//! with no system call. The image's regions and protections are read once, at start
+//! ([`Regions`]): every write gives pages back the protection they had, so they stay true,
+//! and checking a patch's writes takes no `VirtualQuery`.
 //! Unwinding goes by `RUNTIME_FUNCTION`s, added with `RtlAddFunctionTable`. Data is written
 //! with atomic stores ([`Writes::store`]), since other threads may read it meanwhile. Address
 //! space for the switch's columns is reserved and committed with `VirtualAlloc`
@@ -141,23 +145,26 @@ pub(super) fn in_image_of(range: &Range<u64>, near: u64) -> Result<(), String> {
 /// The image's bytes at `range`, checked to be committed, readable and of the image at
 /// `base`.
 fn readable(range: &Range<u64>, base: u64) -> Result<&'static [u8], String> {
-    regions(range, |piece, region| {
-        if region.allocation != base {
-            // alloc: error path
-            return Err(format!("{:#x}, outside the image at {base:#x}", piece.start));
-        }
-        let protect = region.protect & 0xff;
-        if protect == PAGE_NOACCESS || region.protect & PAGE_GUARD != 0 {
-            // alloc: error path
-            return Err(format!("{:#x}, in pages with no access", piece.start));
-        }
-        Ok(())
-    })?;
+    regions(range, |piece, region| checked_readable(&piece, region, base))?;
     // SAFETY: `range` is committed, readable memory of the image (checked above), which stays
     // loaded as long as its code, this, runs; it is data the linker wrote, which no patch
     // writes over (the switch refuses data over the descriptor's cell and table, and the
     // descriptor and the directory name are read-only data).
     Ok(unsafe { image::view(range.start, (range.end - range.start) as usize) })
+}
+
+/// Checks that `piece`, of `region`, is readable memory of the image at `base`.
+fn checked_readable(piece: &Range<u64>, region: Region, base: u64) -> Result<(), String> {
+    if region.allocation != base {
+        // alloc: error path
+        return Err(format!("{:#x}, outside the image at {base:#x}", piece.start));
+    }
+    let protect = region.protect & 0xff;
+    if protect == PAGE_NOACCESS || region.protect & PAGE_GUARD != 0 {
+        // alloc: error path
+        return Err(format!("{:#x}, in pages with no access", piece.start));
+    }
+    Ok(())
 }
 
 /// Pushes the code address of each frame of this thread's stack, newest first.
@@ -228,24 +235,25 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
 pub(super) struct Os {
     /// Where the image is loaded, which `RUNTIME_FUNCTION`s are relative to.
     base: u64,
+    regions: Regions,
 }
 
 impl Os {
     pub(super) fn new(layout: &Layout) -> Result<Os, String> {
         let base = module_of(layout.cell() as *const c_void)? as u64;
+        let regions = Regions::read(base)?;
         let code = layout.code_in_memory();
         if !code.is_empty() {
-            regions(&code, |_, _| Ok(()))?;
+            regions.each(&code, |_, _| Ok(()))?;
         }
-        Ok(Os { base })
+        Ok(Os { base, regions })
     }
 
     fn write(&mut self, writes: &Writes<'_>, kind: Kind) -> Result<(), String> {
         let base = self.base;
         let mut run: Option<(Range<u64>, Region)> = None;
-        let mut known = None;
         for span in writes.spans {
-            regions_from(&mut known, &span.range(), |piece, region| {
+            self.regions.each(&span.range(), |piece, region| {
                 if region.allocation != base {
                     // alloc: error path
                     return Err(format!(
@@ -259,10 +267,10 @@ impl Os {
                     return Err(format!("a write at {:#x}, in pages with no access", piece.start));
                 }
                 if protect & WRITABLE != 0 {
-                    // SAFETY: the piece is the image's, committed and writable (`regions` read
+                    // SAFETY: the piece is the image's, committed and writable (`Regions` read
                     // it), and stays committed.
                     unsafe { kind.write(writes, &piece) };
-                    if protect & EXECUTABLE != 0 {
+                    if protect & EXECUTABLE != 0 && kind.flushes() {
                         flush(&piece);
                     }
                     return Ok(());
@@ -300,6 +308,13 @@ enum Kind {
 }
 
 impl Kind {
+    /// Whether runnable pages written need `FlushInstructionCache`. x86-64 keeps instruction
+    /// fetch coherent with stores, and patch code is over bytes no thread ran (`Kind::Code`),
+    /// so it needs none, as on Linux; data written over runnable pages keeps the call.
+    fn flushes(self) -> bool {
+        matches!(self, Kind::Data)
+    }
+
     /// Writes what `writes` has within `range`.
     ///
     /// # Safety
@@ -327,11 +342,15 @@ impl Memory for Os {
     }
 
     fn in_image(&self, range: &Range<u64>) -> Result<(), String> {
-        readable(range, self.base).map(drop)
+        let base = self.base;
+        self.regions.each(range, |piece, region| checked_readable(&piece, region, base))
     }
 
     fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String> {
-        readable(range, self.base)
+        self.in_image(range)?;
+        // SAFETY: as in `readable`: committed, readable memory of the image (checked above)
+        // that no patch writes over.
+        Ok(unsafe { image::view(range.start, (range.end - range.start) as usize) })
     }
 
     fn loaders(&self, at: u64, slots: u64) -> &[AtomicU64] {
@@ -390,7 +409,7 @@ impl Memory for Os {
     fn publish(&mut self, cell: u64, table: u64) -> Result<(), String> {
         let range = cell..cell + 8;
         let (mut protect, mut count) = (0, 0);
-        regions(&range, |_, region| {
+        self.regions.each(&range, |_, region| {
             protect = region.protect & 0xff;
             count += 1;
             Ok(())
@@ -418,6 +437,74 @@ struct Region {
     allocation: u64,
     /// With its modifiers (`PAGE_GUARD` and the rest).
     protect: u32,
+}
+
+/// The image's committed regions and their protections, sorted, read once at start by
+/// walking `VirtualQuery` from the image's base for as long as the allocation is the
+/// image's: a lookup is a binary search where `VirtualQuery` is a system call.
+struct Regions(Vec<(u64, u64, Region)>);
+
+impl Regions {
+    fn read(base: u64) -> Result<Regions, String> {
+        // alloc: setup, the image's regions, read once at start
+        let mut regions = Vec::with_capacity(16);
+        let mut at = base;
+        loop {
+            let mut info = MemoryBasicInformation {
+                base: std::ptr::null_mut(),
+                allocation_base: std::ptr::null_mut(),
+                allocation_protect: 0,
+                partition: 0,
+                size: 0,
+                state: 0,
+                protect: 0,
+                kind: 0,
+            };
+            let len = size_of::<MemoryBasicInformation>();
+            // SAFETY: `info` is a whole MEMORY_BASIC_INFORMATION.
+            if unsafe { VirtualQuery(at as *const c_void, &mut info, len) } != len {
+                break;
+            }
+            let end = (info.base as u64).saturating_add(info.size as u64);
+            if info.allocation_base as u64 != base || end <= at {
+                break;
+            }
+            if info.state == MEM_COMMIT {
+                let region = Region { allocation: base, protect: info.protect };
+                regions.push((info.base as u64, end, region));
+            }
+            at = end;
+        }
+        if regions.is_empty() {
+            // alloc: error path, at start
+            return Err(format!("nothing of the image at {base:#x} is committed"));
+        }
+        Ok(Regions(regions))
+    }
+
+    /// Calls `f` with `range` in pieces of one region each, from a binary search for the
+    /// first; an error names the first address of it nothing is committed at.
+    fn each(
+        &self,
+        range: &Range<u64>,
+        mut f: impl FnMut(Range<u64>, Region) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut at = range.start;
+        let mut next = self.0.partition_point(|it| it.1 <= at);
+        while at < range.end {
+            match self.0.get(next) {
+                Some(&(start, end, region)) if start <= at => {
+                    let piece = at..end.min(range.end);
+                    at = piece.end;
+                    next += 1;
+                    f(piece, region)?;
+                }
+                // alloc: error path
+                _ => return Err(format!("nothing is committed at {at:#x}")),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Calls `f` with `range` in pieces of one region each; an error names the first address
@@ -491,7 +578,7 @@ fn protected(
     };
     // SAFETY: the pages are the image's, committed with `protect` (`regions` read it).
     unsafe { writable(pages, protect, put)? };
-    if protect & EXECUTABLE != 0 {
+    if protect & EXECUTABLE != 0 && kind.flushes() {
         flush(pages);
     }
     Ok(())
@@ -619,8 +706,46 @@ mod tests {
 
     use super::{
         super::column::{Column, STEP},
-        GetCurrentProcess, MEM_COMMIT, MEM_RESERVE, MemoryBasicInformation, PAGE, VirtualQuery,
+        GetCurrentProcess, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MemoryBasicInformation, PAGE,
+        PAGE_READWRITE, Regions, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
     };
+
+    /// The regions read once give, for every address of an allocation, the protection
+    /// `VirtualQuery` gives for it.
+    #[test]
+    fn regions_read_at_start_say_what_the_kernel_says() {
+        const PAGE_READONLY: u32 = 0x02;
+        let len = 3 * PAGE as usize;
+        // SAFETY: a new allocation anywhere, which only this test uses.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null_mut(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!at.is_null());
+        let base = at as u64;
+        let mut old = 0;
+        let middle = (base + PAGE) as *mut c_void;
+        // SAFETY: the middle page of the allocation above.
+        assert_ne!(unsafe { VirtualProtect(middle, PAGE as usize, PAGE_READONLY, &mut old) }, 0);
+        let regions = Regions::read(base).expect("read");
+        let mut pieces = Vec::new();
+        regions
+            .each(&(base..base + len as u64), |piece, region| {
+                pieces.push((piece, region.protect));
+                Ok(())
+            })
+            .expect("committed");
+        assert_eq!(
+            pieces,
+            vec![
+                (base..base + PAGE, PAGE_READWRITE),
+                (base + PAGE..base + 2 * PAGE, PAGE_READONLY),
+                (base + 2 * PAGE..base + 3 * PAGE, PAGE_READWRITE),
+            ]
+        );
+        assert!(regions.each(&(base..base + len as u64 + 1), |_, _| Ok(())).is_err());
+        // SAFETY: the allocation above, released whole.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+    }
 
     /// `PSAPI_WORKING_SET_EX_INFORMATION`: bit 0 of `attributes` is whether the page is in
     /// the working set.

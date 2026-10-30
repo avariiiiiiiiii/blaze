@@ -39,7 +39,7 @@ use super::{Built, DataPlace, Places};
 use crate::{
     ConstBlob,
     backend::{Optimization, Passes, Selection},
-    fragment::{DataRequest, FuncTarget, Hint, Requests, Wants},
+    fragment::{DataRequest, FuncTarget, Requests, Wants},
     llvm::{
         pgo,
         release::{self as llvm, Given, Prelinked},
@@ -156,13 +156,7 @@ pub(crate) fn summarize(
     let addressed = keys(unit, places, refs, facts.addressed.iter().copied().chain(in_data))?;
     // An instrumented body counts into counters of its own, which an importer's copy has not.
     let importable = requests.ordered() && spec.pgo != Pgo::Generate;
-    let hint = match function.hint {
-        _ if !importable => summary::Hint::Never,
-        Hint::None => summary::Hint::None,
-        Hint::Inline => summary::Hint::Inline,
-        Hint::Always => summary::Hint::Always,
-        Hint::Never => summary::Hint::Never,
-    };
+    let hint = if importable { function.hint } else { summary::Hint::Never };
     let summary = Summary {
         key: unit.instance.key(),
         size: u32::try_from(size).unwrap_or(u32::MAX),

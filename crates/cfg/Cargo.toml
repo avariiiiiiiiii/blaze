@@ -23,8 +23,7 @@ intern.workspace = true
 
 [dev-dependencies]
 expect-test = "1.5.1"
-oorandom = "11.1.5"
-arbitrary = { version = "1.4.1", features = ["derive"] }
+hegeltest.workspace = true
 
 # local deps
 syntax-bridge.workspace = true

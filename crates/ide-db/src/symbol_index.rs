@@ -483,7 +483,7 @@ impl<'db> SymbolIndex<'db> {
             lhs_chars.cmp(rhs_chars)
         }
 
-        symbols.par_sort_by(cmp);
+        symbols.sort_by(cmp);
 
         let mut builder = fst::MapBuilder::memory();
 

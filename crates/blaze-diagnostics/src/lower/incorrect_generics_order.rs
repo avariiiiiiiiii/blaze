@@ -14,7 +14,7 @@ use either::Either;
 use hir::{GenericArgKind, GenericDef, InFile, ModuleDef, PathResolution};
 use syntax::{
     TextRange,
-    view::{self as ast, AstNode as _, HasName as _},
+    view::{self as ast, AstNode as _},
 };
 
 use crate::{
@@ -212,15 +212,6 @@ fn mismatch(args: &[Arg], params: &[Param]) -> Option<Mismatch> {
     }
 }
 
-/// rustc's `def_span` of a type parameter: its name, to the end of its default.
-fn type_param_range(param: ast::TypeParam<'_>) -> Option<TextRange> {
-    let name = param.name()?.syntax().text_range();
-    Some(match param.default_type() {
-        Some(default) => TextRange::new(name.start(), default.syntax().text_range().end()),
-        None => name,
-    })
-}
-
 /// The function a const argument names, `{ f }`.
 fn const_arg_fn<'db>(cx: &Cx<'_, 'db>, arg: ast::ConstArg<'db>) -> Option<hir::Function> {
     let expr = match arg.expr()? {
@@ -307,7 +298,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
                             .source(src.merge())
                             .and_then(|it| match it.value {
                                 Either::Left(ast::TypeOrConstParam::Type(p)) => {
-                                    Some(it.with_value(type_param_range(p)?))
+                                    Some(it.with_value(ast::type_param_span(p)?))
                                 }
                                 _ => None,
                             });

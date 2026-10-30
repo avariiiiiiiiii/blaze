@@ -35,7 +35,7 @@ use hir_ty::{
     ParamEnvAndCrate, TyDefId, ValueTyDefId,
     consteval::try_const_usize,
     next_solver::{
-        AdtDef, AliasTy, CallableIdWrapper, DbInterner, FnSig, GenericArgs, ParamEnv, Pattern, Region, Ty,
+        AdtDef, AliasTy, CallableIdWrapper, DbInterner, FnSig, GenericArgs, ParamEnv, Pattern, Region, RegionExt as _, Ty,
         TyKind, TypingMode, ensure_sufficient_stack,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
     },
@@ -594,10 +594,10 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
                 self.visit_type(state.next_in_fnptr(FnPos::Ret), sig.output())
             }
             TyKind::Foreign(_) | TyKind::Never => FfiResult::Safe,
-            TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => {
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => {
                 unsafe_("opaque types have no C equivalent", None)
             }
-            TyKind::Param(_) | TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }, .. })
+            TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }, .. })
                 if state.can_expect_ty_params() =>
             {
                 FfiResult::Safe
@@ -610,7 +610,7 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
             // placeholders, errors and `fn` items, none of which an item's type has once it
             // has been checked.
             TyKind::Param(_)
-            | TyKind::Alias(_)
+            | TyKind::Alias(..)
             | TyKind::Infer(_)
             | TyKind::Bound(..)
             | TyKind::Placeholder(_)
@@ -624,7 +624,7 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
 fn opaque(ty: Ty<'_>) -> Option<Ty<'_>> {
     ty.walk()
         .filter_map(|it| it.ty())
-        .find(|it| matches!(it.kind(), TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { .. }, .. })))
+        .find(|it| matches!(it.kind(), TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. })))
 }
 
 fn is_mutable_ptr(ty: Ty<'_>) -> bool {
@@ -1108,8 +1108,8 @@ impl<'db> Same<'_, '_, '_, 'db> {
             (TyKind::RawPtr(a_ty, a_mut), TyKind::RawPtr(b_ty, b_mut)) => a_mut == b_mut && self.ty(a_ty, b_ty),
             (TyKind::Ref(_, a_ty, a_mut), TyKind::Ref(_, b_ty, b_mut)) => a_mut == b_mut && self.ty(a_ty, b_ty),
             (TyKind::FnDef(a_def, a_args), TyKind::FnDef(b_def, b_args)) => {
-                let a_sig = self.fn_def_sig(a_def, a_args);
-                let b_sig = self.fn_def_sig(b_def, b_args);
+                let a_sig = self.fn_def_sig(a_def, a_args.skip_binder());
+                let b_sig = self.fn_def_sig(b_def, b_args.skip_binder());
                 self.sigs(a_sig, b_sig)
             }
             (TyKind::Adt(..) | TyKind::Pat(..), _) if primitive_or_pointer(b) => {

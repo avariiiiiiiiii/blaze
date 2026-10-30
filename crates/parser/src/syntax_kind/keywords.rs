@@ -275,6 +275,45 @@ pub(super) fn strict_in(
     strict_window(window_in(text, start, len), len, edition)
 }
 
+/// The identifier `text[start..start + len]` (`len` 1 to 8) as one word, its bytes
+/// little-endian and zero above them: the window the strict keywords' hash reads, which the
+/// lexer also hashes for the interner ([`blaze_phf::name_hash`] of one word).
+#[inline(always)]
+pub(crate) fn ident_window(text: &[u8], start: usize, len: usize) -> u64 {
+    debug_assert!((1..=8).contains(&len));
+    match len {
+        1 => text[start] as u64,
+        _ => window_in(text, start, len),
+    }
+}
+
+/// [`SyntaxKind::from_keyword`] of an identifier of `len` bytes (1 to 8) whose window is
+/// `window` ([`ident_window`]).
+#[inline(always)]
+pub(crate) fn strict_by_window(window: u64, len: usize, edition: Edition) -> Option<SyntaxKind> {
+    if len < STRICT_LENGTHS.0 || len > STRICT_LENGTHS.1 {
+        return None;
+    }
+    strict_window(window, len, edition)
+}
+
+/// Whether `kind` is one of the strict or reserved keywords' kinds, in any edition: a kind the
+/// lexer gives an identifier.
+#[inline]
+pub(crate) fn is_strict_kind(kind: SyntaxKind) -> bool {
+    STRICT_KINDS.get(kind as u16 as usize).copied().unwrap_or(false)
+}
+
+static STRICT_KINDS: [bool; SyntaxKind::__LAST as usize + 1] = {
+    let mut kinds = [false; SyntaxKind::__LAST as usize + 1];
+    let mut i = 0;
+    while i < STRICT.len() {
+        kinds[STRICT[i].1 as u16 as usize] = true;
+        i += 1;
+    }
+    kinds
+};
+
 #[inline(always)]
 fn strict_window(window: u64, len: usize, edition: Edition) -> Option<SyntaxKind> {
     let entry = STRICT_ENTRIES[STRICT_SLOTS[strict_slot(window, len, STRICT_MULTIPLIER)] as usize];

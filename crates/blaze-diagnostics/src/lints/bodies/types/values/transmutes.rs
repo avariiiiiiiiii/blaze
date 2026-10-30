@@ -37,7 +37,7 @@ impl LatePass for MutableTransmutes {
     const LINTS: LintSet = lint_set(["mutable_transmutes"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Path]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some((from, to)) = transmute_types(b, expr) else { return };
         let (TyKind::Ref(_, _, from), TyKind::Ref(_, _, to)) = (from.kind(), to.kind()) else { return };
         if from >= to {
@@ -55,7 +55,7 @@ impl LatePass for MutableTransmutes {
 
 /// rustc's `get_transmute_from_to`: the types the path `path` transmutes from and to, when it
 /// names the intrinsic `transmute` (rustc's `qpath_res` of it is a `DefKind::Fn`).
-fn transmute_types<'db>(b: &BodyCx<'_, 'db>, path: ExprId) -> Option<(Ty<'db>, Ty<'db>)> {
+fn transmute_types<'db>(b: &BodyCx<'_, '_, 'db>, path: ExprId) -> Option<(Ty<'db>, Ty<'db>)> {
     let Expr::Path(_) = b.store().expr(path) else { return None };
     let TyKind::FnDef(CallableIdWrapper(callable), args) = util::ty(b, path).kind() else { return None };
     // The path's type names the function it can resolve to: test that before resolving it.
@@ -67,6 +67,7 @@ fn transmute_types<'db>(b: &BodyCx<'_, 'db>, path: ExprId) -> Option<(Ty<'db>, T
     if !super::is_transmute(b.db(), def) {
         return None;
     }
+    let args = args.skip_binder();
     Some((args.type_at(0), args.type_at(1)))
 }
 
@@ -98,7 +99,7 @@ struct ConstContext {
 }
 
 impl CheckTransmutes {
-    fn build(&mut self, b: &BodyCx<'_, '_>) {
+    fn build(&mut self, b: &BodyCx<'_, '_, '_>) {
         let store = b.store();
         self.built = true;
         self.inner.clear();
@@ -118,7 +119,7 @@ impl CheckTransmutes {
         }
     }
 
-    fn context(&mut self, b: &BodyCx<'_, '_>, expr: ExprId) -> ConstContext {
+    fn context(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId) -> ConstContext {
         if !self.built {
             self.build(b);
         }
@@ -150,11 +151,11 @@ impl LatePass for CheckTransmutes {
     const HOOKS: Hooks = Hooks::BODY;
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
 
-    fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+    fn check_body(&mut self, _b: &BodyCx<'_, '_, '_>, _out: &mut Vec<Found>) {
         self.built = false;
     }
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Call { callee, args: &[arg] } = b.store().expr(expr) else { return };
         let Some((src, dst)) = transmute_types(b, callee) else { return };
         let (Some(span), Some(node)) = (util::span(b, expr), b.expr_node(expr)) else { return };
@@ -197,7 +198,7 @@ fn primitive(ty: Ty<'_>) -> Option<&'static str> {
 /// rustc's `check_unnecessary_transmute`: a transmute std has a method or a cast for, with it
 /// suggested. `u8` to `bool` is left out, as rustc leaves it out.
 fn unnecessary_transmute(
-    b: &BodyCx<'_, '_>,
+    b: &BodyCx<'_, '_, '_>,
     span: &Span,
     callee: ExprId,
     arg: ExprId,
@@ -310,7 +311,7 @@ fn unnecessary_transmute(
 /// to a type that is not a 1-ZST, other than the literal `0` (`invalid_value` and
 /// `invalid_null_arguments` lint that).
 fn int_to_ptr_transmute<'db>(
-    b: &BodyCx<'_, 'db>,
+    b: &BodyCx<'_, '_, 'db>,
     expr: ExprId,
     span: &Span,
     arg: ExprId,

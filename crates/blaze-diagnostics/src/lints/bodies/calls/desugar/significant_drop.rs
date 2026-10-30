@@ -59,7 +59,7 @@ pub(super) struct SignificantDrops<'s, 'db> {
 }
 
 impl<'s, 'db> SignificantDrops<'s, 'db> {
-    pub(super) fn new(b: &BodyCx<'_, 'db>, solver: &'s Solver<'db>) -> SignificantDrops<'s, 'db> {
+    pub(super) fn new(b: &BodyCx<'_, '_, 'db>, solver: &'s Solver<'db>) -> SignificantDrops<'s, 'db> {
         let db = b.db();
         let limit = crate_def_map(db, b.cx.krate.into()).recursion_limit() as usize;
         // alloc: empty, pushed to only on the overflow error
@@ -346,7 +346,7 @@ fn insignificant_dtor(db: &Db, adt: AdtId) -> bool {
 /// is defined. The other types a part can be (a tuple, an array, a trait object, an alias, a
 /// parameter) have none; closures, coroutines and fn items are opened up or need no drop, so
 /// are never parts.
-pub(super) fn dtor_span(b: &BodyCx<'_, '_>, ty: Ty<'_>) -> Option<Span> {
+pub(super) fn dtor_span(b: &BodyCx<'_, '_, '_>, ty: Ty<'_>) -> Option<Span> {
     let TyKind::Adt(def, _) = ty.kind() else { return None };
     let db = b.db();
     let adt = def.def_id();

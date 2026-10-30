@@ -1053,7 +1053,7 @@ mod tests {
     /// The expansion map as it was kept before its ends and spans were columns: one
     /// `(end, span)` pair each, with its lookups and merge as they were.
     #[cfg(feature = "salsa")]
-    #[derive(Default, Clone)]
+    #[derive(Default)]
     struct Pairs(Vec<(TextSize, Span)>);
 
     #[cfg(feature = "salsa")]

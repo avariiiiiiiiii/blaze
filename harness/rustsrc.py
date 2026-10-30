@@ -11,7 +11,7 @@ import os, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import BLAZE
+from mixed import BLAZE
 
 TOML = """[package]
 name = "nosrc"

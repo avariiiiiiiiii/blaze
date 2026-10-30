@@ -21,6 +21,7 @@ use syntax::{
     view::{self as ast, AstNode as _, Node},
 };
 
+use stdx::list::Join;
 use crate::{
     cx::Cx,
     lower::{Found, Phase},
@@ -236,7 +237,7 @@ pub(super) fn useless(cx: &Cx<'_, '_>, attr: &Attribute, extern_types: bool) -> 
     let (applied, only) = applied(target, extern_types);
     let only = if only { "only " } else { "" };
     // alloc: the help of a `useless_deprecated` that fires
-    diag.help(format!("the `deprecated` attribute can {only}be applied to {}", and_list(&applied)));
+    diag.help(format!("the `deprecated` attribute can {only}be applied to {}", stdx::list::list(applied.iter(), Join::And, false)));
     diag.warn(
         "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!",
     );
@@ -289,16 +290,3 @@ fn applied(target: Target, extern_types: bool) -> (Names, bool) {
 /// The names [`applied`] gives: at most every allowed target and every group, inline.
 type Names = SmallVec<[&'static str; ALLOWED.len() + 5]>;
 
-/// `DiagArgValue::StrListSepByAnd`, for the help of a `useless_deprecated` that fires.
-fn and_list(items: &[&str]) -> String {
-    match items {
-        // alloc: empty, allocates nothing
-        [] => String::new(),
-        // alloc: the help of a diagnostic that fires
-        [one] => (*one).to_owned(),
-        // alloc: the help of a diagnostic that fires
-        [a, b] => format!("{a} and {b}"),
-        // alloc: the help of a diagnostic that fires
-        [init @ .., last] => format!("{}, and {last}", init.join(", ")),
-    }
-}

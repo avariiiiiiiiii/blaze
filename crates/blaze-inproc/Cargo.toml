@@ -26,6 +26,7 @@ test = false
 host = ["dep:blaze-core"]
 
 [dependencies]
+blaze-bytes.workspace = true
 blaze-core = { workspace = true, optional = true }
 blaze-mem.workspace = true
 
@@ -37,6 +38,7 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 blaze-ids.workspace = true
+blaze-radix.workspace = true
 
 [lints]
 workspace = true

@@ -8,6 +8,7 @@ use blaze_codegen::backend::FrontRef;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use cranelift_codegen::ir::{AbiParam, InstBuilder as _, Signature};
+use hir_def::HasModule as _;
 use hir_ty::{ParamEnvAndCrate, next_solver::{DbInterner, ParamEnv}};
 
 use super::{HirInstance, Kind, places::Ref};
@@ -36,7 +37,7 @@ const CODE_DOMAIN: &str = "blaze v2 allocator 1";
 pub(super) fn shim(
     db: &Db,
     krate: Crate,
-    root: impl Fn(hir_def::FunctionId) -> HirInstance,
+    mut root: impl FnMut(hir_def::FunctionId) -> HirInstance,
 ) -> Result<Vec<HirInstance>, String> {
     let Some(boxed) = DbInterner::new_with(db, krate).lang_items().OwnedBox else {
         return Ok(Vec::new()); // alloc: empty, allocates nothing

@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use blaze_ids::rng::SplitMix64;
-use proptest::prelude::*;
+use hegel::TestCase;
+use hegel::generators as gs;
 
 use super::{Advice, MapOptions, Mapped};
 
@@ -159,28 +160,23 @@ fn a_mapping_is_shared_across_threads() {
     });
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
-
-    /// The mapping against the safe reference, for any bytes and any options.
-    #[test]
-    fn a_mapping_is_the_file_read(
-        bytes in proptest::collection::vec(any::<u8>(), 0..40_000),
-        populate in any::<bool>(),
-        huge in any::<bool>(),
-        advice in 0..4usize,
-    ) {
-        let dir = std::env::temp_dir().join(format!("blaze-core-mapped-prop-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{:016x}", name_of(&bytes)));
-        std::fs::write(&path, &bytes).unwrap();
-        let options = MapOptions::new().populate(populate).huge_pages(huge).advise(ADVICE[advice]);
-        // SAFETY: the case's own file; cases run one at a time, and each drops its mapping
-        // before the next writes a file.
-        let mapped = unsafe { options.open(&path) }.unwrap();
-        prop_assert_eq!(mapped.bytes(), &reference(&path)[..]);
-        prop_assert_eq!(mapped.bytes(), &bytes[..]);
-    }
+/// The mapping against the safe reference, for any bytes and any options.
+#[hegel::test(test_cases = 64)]
+fn a_mapping_is_the_file_read(tc: TestCase) {
+    let bytes: Vec<u8> = tc.draw(gs::binary().max_size(39_999));
+    let populate = tc.draw(gs::booleans());
+    let huge = tc.draw(gs::booleans());
+    let advice: usize = tc.draw(gs::integers().max_value(3));
+    let dir = std::env::temp_dir().join(format!("blaze-core-mapped-prop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{:016x}", name_of(&bytes)));
+    std::fs::write(&path, &bytes).unwrap();
+    let options = MapOptions::new().populate(populate).huge_pages(huge).advise(ADVICE[advice]);
+    // SAFETY: the case's own file; cases run one at a time, and each drops its mapping
+    // before the next writes a file.
+    let mapped = unsafe { options.open(&path) }.unwrap();
+    assert_eq!(mapped.bytes(), &reference(&path)[..]);
+    assert_eq!(mapped.bytes(), &bytes[..]);
 }
 
 /// FNV-1a: a name for a case's file.

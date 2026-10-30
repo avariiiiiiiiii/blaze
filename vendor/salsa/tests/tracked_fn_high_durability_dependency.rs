@@ -1,5 +1,6 @@
 #![cfg(feature = "inventory")]
 #![allow(warnings)]
+#![forbid(unsafe_code)]
 
 use salsa::plumbing::HasStorage;
 use salsa::{Database, Durability, Setter};

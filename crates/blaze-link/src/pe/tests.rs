@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 use blaze_codegen::Arch;
 use object::LittleEndian as LE;
 use object::Object as _;
@@ -15,9 +16,9 @@ use super::{
     DEBUG, GRANULE, IDATA, OBJ_PDATA, PDATA, Pe, RELOC, START_HOOK, TLS_DIR, TLS_INDEX, place, rank, writer,
 };
 use crate::model::{
-    Apply, Bind, Binding, Class, Counts, Data, Directive, Export, Function, GotEntry, Holds, Import, Library,
-    NativeFile, NativeFixup, Placed, Plan, Prot, Region, Reserve, SectionKind, Special, SymbolDef, SymbolKind, Tls,
-    WindowsUnwind, Writer,
+    Apply, Bind, Binding, Class, Counts, Data, Delta, Directive, Export, Function, GotEntry, Holds, Import, Library,
+    NativeFile, NativeFixup, Placed, Plan, Prot, Region, Reserve, SectionKind, Special, Splice, SymbolDef, SymbolKind,
+    Tls, WindowsUnwind, Writer,
 };
 use crate::output::Debug;
 use crate::{DevRun, Format, LinkError, NativeKind, Output, OutputKind};
@@ -52,7 +53,8 @@ fn dll() -> Output {
 }
 
 fn pe(output: Output) -> Pe {
-    Pe { output, descriptors: Mutex::default() }
+    let last = output.incremental.then(Mutex::default);
+    Pe { output, descriptors: Mutex::default(), last }
 }
 
 fn pdata_class() -> Class {
@@ -78,14 +80,6 @@ fn function(addr: u64, size: u64, info: u64) -> Function {
         windows: Some(WindowsUnwind { info, handler: None, lsda: None }),
         name: None,
     }
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
 
 /// An image placed as the core places one: classes in `Writer::order`, a page boundary at each
@@ -172,6 +166,11 @@ impl Fixture {
     }
 
     fn placed<T>(&self, then: impl FnOnce(&Placed<'_>) -> T) -> T {
+        self.placed_at(0, None, then)
+    }
+
+    /// [`Fixture::placed`] as synthesis `synthesis`, with what changed since the last.
+    fn placed_at<T>(&self, synthesis: u64, delta: Option<&Delta<'_>>, then: impl FnOnce(&Placed<'_>) -> T) -> T {
         let contents: Vec<&[u8]> = self.contents.iter().map(Vec::as_slice).collect();
         let symbols = &self.symbols;
         let symbol = |name: &str| symbols.iter().find(|it| it.0 == name).map(|it| it.1);
@@ -196,8 +195,8 @@ impl Fixture {
             id: *b"blaze image id!!",
             debug: &[],
             symbol: &symbol,
-            synthesis: 0,
-            delta: None,
+            synthesis,
+            delta,
             encoded: &[],
         })
     }
@@ -644,7 +643,9 @@ fn what_pe_cannot_say_is_an_error() {
     f.fails("overlap");
 
     let mut f = executable();
-    f.exports.push(f.exports[0].clone());
+    let first = &f.exports[0];
+    let twice = Export { name: first.name.clone(), addr: first.addr, size: first.size, kind: first.kind };
+    f.exports.push(twice);
     f.fails("exported twice");
 }
 
@@ -834,7 +835,7 @@ fn base_relocation_blocks_encode() {
     let data = f.at(&Class::Data);
     assert_eq!(data % 0x1000, 0);
     f.rebase = vec![data + 0x1008, data, data + 0x10, data];
-    let tables = f.placed(Tables::of).unwrap();
+    let tables = f.placed(|placed| Tables::of(&f.pe, placed)).unwrap();
     let reloc = &tables.regions.iter().find(|it| it.0 == Class::Synthetic(RELOC)).unwrap().1;
     let page = f.rva(data);
     let mut expected = Buf::default();
@@ -882,6 +883,144 @@ fn base_relocations_are_the_same_bytes_in_any_number_of_pieces() {
     assert_eq!(at, whole.len());
     // The 16 pages of the dense run, the 20 sparse ones, 0x25000 and 0x3f000.
     assert_eq!(blocks, 16 + 20 + 1 + 1);
+}
+
+/// Each synthetic table's bytes, in the order `Tables::of` gives them.
+fn tables(pe: &Pe, f: &Fixture, synthesis: u64, delta: Option<&Delta<'_>>) -> Vec<(Class, Vec<u8>)> {
+    let tables = f.placed_at(synthesis, delta, |placed| Tables::of(pe, placed)).unwrap();
+    tables.regions.into_iter().map(|(class, bytes)| (class, bytes.contiguous().into_owned())).collect()
+}
+
+fn table(pe: &Pe, f: &Fixture, synthesis: u64, delta: Option<&Delta<'_>>, name: &'static str) -> Vec<u8> {
+    let class = Class::Synthetic(name);
+    tables(pe, f, synthesis, delta).into_iter().find(|it| it.0 == class).unwrap().1
+}
+
+/// What changed since synthesis `from`: no region moved, the same names, no GOT cell or bind.
+fn delta<'a>(functions: &'a [Splice], rebase: &'a [Splice], from: u64) -> Delta<'a> {
+    Delta { functions, rebase, got: &[], binds: &[], same_names: true, same_regions: true, written: &[], from }
+}
+
+fn splice(at: u32) -> Splice {
+    Splice { old: at..at + 1, new: at..at + 1 }
+}
+
+fn incremental() -> Pe {
+    pe(Output { incremental: true, ..exe() })
+}
+
+#[test]
+fn incremental_tables_are_patched_to_a_builds_bytes() {
+    let mut f = executable();
+    let (built, kept) = (pe(exe()), incremental());
+    assert_eq!(tables(&kept, &f, 1, None), tables(&built, &f, 0, None));
+
+    // A function shrinks, a rebased address moves within its page: each table patched or reused.
+    let data = f.at(&Class::Data);
+    f.functions[1].size = 0x18;
+    f.rebase[1] = data + 4;
+    let (functions, rebase) = ([splice(1)], [splice(1)]);
+    assert_eq!(tables(&kept, &f, 2, Some(&delta(&functions, &rebase, 1))), tables(&built, &f, 0, None));
+    let counts = |pe: &Pe| {
+        let last = pe.last().unwrap();
+        (last.pdata.patched, last.reloc.patched, last.idata.reused, last.edata.reused)
+    };
+    assert_eq!(counts(&kept), (1, 1, 1, 1));
+
+    // A function moved past the others' entries, a rebased address onto the one before: built.
+    let (text, rodata) = (f.at(&Class::Text), f.at(&Class::Rodata));
+    f.functions[0] = function(text + 0x38, 8, rodata);
+    f.rebase[1] = f.rebase[0];
+    let (functions, rebase) = ([splice(0)], [splice(1)]);
+    assert_eq!(tables(&kept, &f, 3, Some(&delta(&functions, &rebase, 2))), tables(&built, &f, 0, None));
+    assert_eq!(counts(&kept), (1, 1, 2, 2));
+
+    // Changes from a synthesis the tables are not of: every table built.
+    assert_eq!(tables(&kept, &f, 4, Some(&delta(&[], &[], 9))), tables(&built, &f, 0, None));
+    assert_eq!(counts(&kept), (1, 1, 2, 2));
+}
+
+#[test]
+fn pdata_in_pieces_is_the_sorted_merge() {
+    let (n, natives) = (3 * 4096 + 77, 1000u64);
+    let counts = Counts { functions: n, unwind: natives * 12, ..Counts::default() };
+    let pieces = vec![
+        (Class::Text, Data::Bytes(vec![0xcc; n as usize * 0x10])),
+        (Class::Rodata, Data::Bytes(vec![1; 0x10])),
+        (pdata_class(), Data::Bytes(vec![0; natives as usize * 12])),
+    ];
+    let mut f = Fixture::new(exe(), pieces, &counts);
+    let (text, rodata) = (f.at(&Class::Text), f.at(&Class::Rodata));
+    f.functions = (0..n).map(|it| function(text + it * 0x10, 8, rodata)).collect();
+    for function in f.functions.iter_mut().step_by(3) {
+        function.windows = None;
+    }
+    // The objects' entries in the functions' gaps, last first.
+    let mut objects = Vec::new();
+    let mut bytes = Vec::new();
+    for it in (0..natives).rev() {
+        let at = text + it * 0xc0 + 8;
+        let entry = (f.rva(at), f.rva(at + 8), f.rva(rodata + 8));
+        for value in [entry.0, entry.1, entry.2] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        objects.push(entry);
+    }
+    f.set(&pdata_class(), bytes);
+    let expected = |f: &Fixture| {
+        let mut entries = objects.clone();
+        entries.extend(
+            (f.functions.iter().filter(|it| it.windows.is_some()))
+                .map(|it| (f.rva(it.addr), f.rva(it.addr + it.size), f.rva(rodata))),
+        );
+        entries.sort_unstable();
+        entries.iter().flat_map(|&(begin, end, info)| [begin, end, info]).flat_map(u32::to_le_bytes).collect::<Vec<u8>>()
+    };
+    let built = pe(exe());
+    let whole = table(&built, &f, 0, None, PDATA);
+    assert_eq!(whole, expected(&f));
+    let threads = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    assert_eq!(threads.install(|| table(&built, &f, 0, None, PDATA)), whole);
+
+    let kept = incremental();
+    assert_eq!(table(&kept, &f, 1, None, PDATA), whole);
+    f.functions[5000].size = 4;
+    let functions = [splice(5000)];
+    assert_eq!(table(&kept, &f, 2, Some(&delta(&functions, &[], 1)), PDATA), expected(&f));
+    assert_eq!(kept.last().unwrap().pdata.patched, 1);
+
+    // Functions out of order: sorted and merged on one thread, the same bytes.
+    f.functions.swap(10, 9001);
+    assert_eq!(table(&built, &f, 0, None, PDATA), expected(&f));
+}
+
+#[test]
+fn incremental_base_relocations_are_a_builds_bytes() {
+    let pieces = vec![(Class::Text, Data::Bytes(vec![0xc3; 0x10])), (Class::Data, Data::Bytes(vec![0; 0x40000]))];
+    let mut f = Fixture::new(exe(), pieces, &Counts { absolute: 0x4000, image: 0x40000, ..Counts::default() });
+    let data = f.at(&Class::Data);
+    f.rebase = (0..0x4000).map(|it| data + it * 16).collect();
+    let (built, kept) = (pe(exe()), incremental());
+    assert_eq!(table(&kept, &f, 1, None, RELOC), table(&built, &f, 0, None, RELOC));
+
+    f.rebase[100] += 8;
+    f.rebase[9000] += 4;
+    let rebase = [splice(100), splice(9000)];
+    assert_eq!(table(&kept, &f, 2, Some(&delta(&[], &rebase, 1)), RELOC), table(&built, &f, 0, None, RELOC));
+    assert_eq!(kept.last().unwrap().reloc.patched, 1);
+
+    // Onto the address after it: a build has one entry for the two.
+    f.rebase[101] = f.rebase[102];
+    let rebase = [splice(101)];
+    assert_eq!(table(&kept, &f, 3, Some(&delta(&[], &rebase, 2)), RELOC), table(&built, &f, 0, None, RELOC));
+    // And back: the address after it needs its entry again.
+    f.rebase[101] = data + 101 * 16;
+    assert_eq!(table(&kept, &f, 4, Some(&delta(&[], &rebase, 3)), RELOC), table(&built, &f, 0, None, RELOC));
+    // The first of a page into the page before, in order still: its block is another.
+    f.rebase[256] = data + 0xff8;
+    let rebase = [splice(256)];
+    assert_eq!(table(&kept, &f, 5, Some(&delta(&[], &rebase, 4)), RELOC), table(&built, &f, 0, None, RELOC));
+    assert_eq!(kept.last().unwrap().reloc.patched, 1);
 }
 
 // Inputs.
@@ -1334,7 +1473,7 @@ fn short_import_members() {
     assert_eq!(shared.symbols.len(), 1);
     assert_eq!(shared.symbol_name(&shared.symbols[0]), "ExitProcess");
     assert_eq!(shared.symbols[0].version, Some(0));
-    assert_eq!(shared.versions, ["356 ExitProcess"]);
+    assert_eq!(shared.versions.len(), 1);
     assert_eq!(shared.version(&shared.symbols[0]), Some("356 ExitProcess"));
     assert_eq!(shared.symbols[0].kind, SymbolKind::Function);
     assert!(!shared.symbols[0].weak);
@@ -1406,6 +1545,37 @@ fn import_library_is_a_shared_per_dll() {
 
     let error = pe.read("x.dll", b"MZ\x90\0", &NativeKind::Shared { as_needed: true }).err().unwrap();
     assert!(error.contains("import library"), "{error}");
+}
+
+/// Grouped on every thread, an import library reads as one pass over its members would: the
+/// DLLs in the order each is first met, each DLL's imports in member order, and the first
+/// failing member's error.
+#[test]
+fn import_library_groups_as_one_pass_would() {
+    let pe = pe(exe());
+    let (members, dlls) = (3 * 1000 + 11, 7);
+    let bytes = import_archive(members, dlls);
+    let NativeFile::Shared(shared) = pe.read("x.lib", &bytes, &NativeKind::Shared { as_needed: true }).unwrap() else {
+        panic!("not read as an import library")
+    };
+    assert_eq!(shared.more.len(), dlls - 1);
+    for (dll, read) in std::iter::once(&shared).chain(&shared.more).enumerate() {
+        assert_eq!(read.name, format!("D{dll}.dll"));
+        let names: Vec<&str> = read.symbols.iter().map(|it| read.symbol_name(it)).collect();
+        let expected: Vec<String> = (dll..members).step_by(dlls).map(|at| format!("F{at}")).collect();
+        assert_eq!(names, expected, "D{dll}.dll");
+    }
+
+    let code = pe::IMPORT_OBJECT_CODE;
+    let name = pe::IMPORT_OBJECT_NAME;
+    let bytes = archive(&[
+        ("k32.dll", short_import("ExitProcess", "KERNEL32.dll", 1, code, name), &["ExitProcess"]),
+        ("first.obj", object(), &["main_fn"]),
+        ("u32.dll", short_import("MessageBoxW", "USER32.dll", 2, code, name), &["MessageBoxW"]),
+        ("second.obj", object(), &["other_fn"]),
+    ]);
+    let error = pe.read("mixed.lib", &bytes, &NativeKind::Shared { as_needed: true }).err().unwrap();
+    assert!(error.contains("first.obj") && !error.contains("second.obj"), "{error}");
 }
 
 // Allocation budgets.

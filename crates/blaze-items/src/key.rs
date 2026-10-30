@@ -20,9 +20,9 @@
 //! with equal keys, or keys with equal first 8 bytes, are an error [`resolve`] stops at.
 //!
 //! [`resolve`] goes back from a key to the item of the current database, by indexes over every
-//! crate's items: one of the items of its modules, impls and traits, one per body of the items
-//! of its blocks, its closures and its opaque types. A key it does not find names nothing that
-//! is still there.
+//! crate's items: one of the items of its modules, impls and traits (with their constructors),
+//! one per body of the items of its blocks, its closures, its anonymous constants and its
+//! opaque types. A key it does not find names nothing that is still there.
 //!
 //! A crate's two indexes are its largest tables that live for the session, so each is a
 //! [`KeyIndex`] over a reserved region ([`RegionVec`], [`Tag::Other`]: an item's identity is no
@@ -30,7 +30,8 @@
 
 use std::{fmt, mem};
 
-use base_db::{Db, Crate, CrateOrigin, LangCrateOrigin, TargetKind};
+use base_db::{Db, Crate, TargetKind};
+use blaze_format::cursor::Put;
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_mem::{Frame, MemError, RegionVec, Tag, frame, scratch};
 use hir_def::{
@@ -39,6 +40,8 @@ use hir_def::{
     ModuleIdLt, TraitId, VariantId,
     expr_store::ExpressionStore,
     hir::{ClosureKind, Expr, ExprId},
+    item_tree::FieldsShape,
+    lang_item::LangItemTarget,
     nameres::DefMap,
     signatures::{
         ConstSignature, EnumSignature, FunctionSignature, StaticSignature, StructSignature,
@@ -52,7 +55,7 @@ use hir_ty::{
         AnonConstId, ClosureKey, HirDatabase, InternedClosureId, InternedCoroutineClosureId,
         InternedCoroutineId, InternedOpaqueTyId,
     },
-    next_solver::SolverDefId,
+    next_solver::{Ctor, SolverDefId},
 };
 use span::ErasedFileAstId;
 use syntax::view::HasName;
@@ -76,36 +79,22 @@ pub enum Resolved {
     /// The `index`th `impl Trait` of the return type of a function or of a type alias.
     Opaque { owner: ItemId, index: u32 },
     BuiltinDerive(BuiltinDeriveImplId),
+    /// The constructor of a tuple or unit struct or variant ([`ctor_key`]).
+    Ctor(Ctor),
+    /// An anonymous constant: the root expression `expr` of the expression store of `store`
+    /// ([`anon_const_key`]). What it is interned as is made by the lowering of its store.
+    AnonConst { store: ExpressionStoreOwnerId, expr: ExprId },
 }
 
 /// The key of a crate: its content, never its id (see the module doc).
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
     let data = krate.data(db);
     let extra = krate.extra_data(db);
     let mut h = Hasher::new(CRATE_DOMAIN);
-    match &extra.display_name {
-        Some(name) => h.update(&[1]).part(name.canonical_name().as_str().as_bytes()),
-        None => h.update(&[0]),
-    };
-    match &extra.version {
-        Some(version) => h.update(&[1]).part(version.as_bytes()),
-        None => h.update(&[0]),
-    };
-    match &data.origin {
-        CrateOrigin::Rustc { name } => h.update(&[0]).part(name.as_str().as_bytes()),
-        CrateOrigin::Local { repo, name } => {
-            h.update(&[1]);
-            opt(&mut h, repo.as_deref());
-            opt(&mut h, name.as_ref().map(|it| it.as_str()))
-        }
-        CrateOrigin::Library { repo, name } => {
-            h.update(&[2]);
-            opt(&mut h, repo.as_deref());
-            h.part(name.as_str().as_bytes())
-        }
-        CrateOrigin::Lang(lang) => h.update(&[3, lang_tag(*lang)]),
-    };
+    h.opt_part(extra.display_name.as_ref().map(|name| name.canonical_name().as_str()))
+        .opt_part(extra.version.as_deref());
+    data.origin.hash_into(&mut h);
     match data.target_kind {
         TargetKind::Bin => h.update(&[0]),
         TargetKind::Lib { is_proc_macro } => h.update(&[1, is_proc_macro as u8]),
@@ -125,12 +114,12 @@ pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
                 match atom {
                     cfg::CfgAtom::Flag(name) => {
                         bytes.push(0);
-                        cfg_part(bytes, name.as_str());
+                        bytes.put_bytes_u64(name.as_str().as_bytes());
                     }
                     cfg::CfgAtom::KeyValue { key, value } => {
                         bytes.push(1);
-                        cfg_part(bytes, key.as_str());
-                        cfg_part(bytes, value.as_str());
+                        bytes.put_bytes_u64(key.as_str().as_bytes());
+                        bytes.put_bytes_u64(value.as_str().as_bytes());
                     }
                 }
                 let end = u32::try_from(bytes.len()).expect("blaze-items: a crate's cfg under 4 GiB");
@@ -146,30 +135,6 @@ pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
     h.finish()
 }
 
-fn lang_tag(lang: LangCrateOrigin) -> u8 {
-    match lang {
-        LangCrateOrigin::Alloc => 0,
-        LangCrateOrigin::Core => 1,
-        LangCrateOrigin::ProcMacro => 2,
-        LangCrateOrigin::Std => 3,
-        LangCrateOrigin::Test => 4,
-        LangCrateOrigin::Dependency => 5,
-        LangCrateOrigin::Other => 6,
-    }
-}
-
-fn cfg_part(bytes: &mut Vec<u8>, part: &str) {
-    bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(part.as_bytes());
-}
-
-fn opt<'h>(h: &'h mut Hasher, part: Option<&str>) -> &'h mut Hasher {
-    match part {
-        None => h.update(&[0]),
-        Some(part) => h.update(&[1]).part(part.as_bytes()),
-    }
-}
-
 /// A key's preimage: the bytes a [`Hasher`] would be given (`part` is length-prefixed, `id`
 /// the 32 bytes), kept so that many keys hash in one batch and come out as one at a time.
 #[derive(Default)]
@@ -177,12 +142,13 @@ struct Bytes(Vec<u8>);
 
 impl Bytes {
     fn update(&mut self, bytes: &[u8]) -> &mut Bytes {
-        self.0.extend_from_slice(bytes);
+        self.0.put_bytes(bytes);
         self
     }
 
     fn part(&mut self, bytes: &[u8]) -> &mut Bytes {
-        self.update(&(bytes.len() as u64).to_le_bytes()).update(bytes)
+        self.0.put_bytes_u64(bytes);
+        self
     }
 
     fn id(&mut self, id: &ContentId) -> &mut Bytes {
@@ -304,7 +270,7 @@ pub fn module_key(db: &Db, module: ModuleId) -> ItemKey {
     module_key_in(db, module)
 }
 
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn module_key_in<'db>(db: &'db Db, module: ModuleIdLt<'db>) -> ItemKey {
     // Each parent's key is had before the preimage is written, so the recursion up to the
     // crate's root holds no scratch buffer.
@@ -406,7 +372,7 @@ fn siblings(db: &Db, id: ItemId) -> Siblings {
 }
 
 /// The key of an item (see the module doc), hashed in one batch with its siblings'.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub fn item_key(db: &Db, id: ItemId) -> ItemKey {
     let batch = match siblings(db, id) {
         Siblings::Module(it) => module_item_keys(db, it),
@@ -643,10 +609,26 @@ pub fn store_key(db: &Db, store: ExpressionStoreOwnerId) -> ItemKey {
 /// root expression's index there.
 pub fn anon_const_key<'db>(db: &'db Db, anon: AnonConstId<'db>) -> ItemKey {
     let loc = anon.loc(db);
-    let parent = store_key(db, loc.owner);
+    anon_const_key_of(db, loc.owner, loc.expr)
+}
+
+pub(crate) fn anon_const_key_of(db: &Db, store: ExpressionStoreOwnerId, expr: ExprId) -> ItemKey {
+    let parent = store_key(db, store);
     let mut h = Hasher::new(KEY_DOMAIN);
-    h.id(&parent.0).part(b"anon const").update(&loc.expr.into_raw().into_u32().to_le_bytes());
+    h.id(&parent.0).part(b"anon const").update(&expr.into_raw().into_u32().to_le_bytes());
     under(&parent, true, h.finish())
+}
+
+/// The key of a tuple or unit struct's or variant's constructor: under its struct's or
+/// variant's.
+pub fn ctor_key(db: &Db, ctor: Ctor) -> ItemKey {
+    let of = match ctor {
+        Ctor::Struct(it) => item_key(db, ItemId::Adt(it.into())),
+        Ctor::Enum(it) => variant_key(db, it),
+    };
+    let mut h = Hasher::new(KEY_DOMAIN);
+    h.id(&of.0).part(b"ctor");
+    under(&of, false, h.finish())
 }
 
 fn closure_key_of(
@@ -741,16 +723,26 @@ pub fn def_key<'db>(db: &'db Db, def: SolverDefId<'db>) -> ItemKey {
         SolverDefId::InternedCoroutineClosureId(it) => coroutine_closure_key(db, it),
         SolverDefId::InternedOpaqueTyId(it) => opaque_ty_key(db, it),
         SolverDefId::EnumVariantId(it) => variant_key(db, it),
-        SolverDefId::Ctor(ctor) => {
-            let of = match ctor {
-                hir_ty::next_solver::Ctor::Struct(it) => item_key(db, ItemId::Adt(it.into())),
-                hir_ty::next_solver::Ctor::Enum(it) => variant_key(db, it),
-            };
-            let mut h = Hasher::new(KEY_DOMAIN);
-            h.id(&of.0).part(b"ctor");
-            under(&of, false, h.finish())
-        }
+        SolverDefId::Ctor(ctor) => ctor_key(db, ctor),
     }
+}
+
+/// A lang item's target by key: as the `SolverDefId` it is, a macro by its item key.
+pub fn lang_item_key(db: &Db, target: LangItemTarget) -> ItemKey {
+    let def = match target {
+        LangItemTarget::EnumId(it) => SolverDefId::AdtId(it.into()),
+        LangItemTarget::StructId(it) => SolverDefId::AdtId(it.into()),
+        LangItemTarget::UnionId(it) => SolverDefId::AdtId(it.into()),
+        LangItemTarget::FunctionId(it) => SolverDefId::FunctionId(it),
+        LangItemTarget::ImplId(it) => SolverDefId::ImplId(it),
+        LangItemTarget::StaticId(it) => SolverDefId::StaticId(it),
+        LangItemTarget::TypeAliasId(it) => SolverDefId::TypeAliasId(it),
+        LangItemTarget::TraitId(it) => SolverDefId::TraitId(it),
+        LangItemTarget::EnumVariantId(it) => SolverDefId::EnumVariantId(it),
+        LangItemTarget::ConstId(it) => SolverDefId::ConstId(it),
+        LangItemTarget::MacroId(it) => return item_key(db, ItemId::Macro(it)),
+    };
+    def_key(db, def)
 }
 
 pub fn name_hash(name: &str) -> NameHash {
@@ -1249,6 +1241,9 @@ fn inner_rows(db: &Db, inner: Inner, frame: &Frame) -> Box<[Row<Resolved>]> {
         }
         Inner::Store(store) => {
             let exprs = ExpressionStore::of(db, store);
+            for expr in exprs.expr_roots() {
+                items.add(anon_const_key_of(db, store, expr), Resolved::AnonConst { store, expr });
+            }
             let mut nth = 0u32;
             for (expr, it) in exprs.exprs() {
                 let Expr::Closure { closure_kind, .. } = it else { continue };
@@ -1328,6 +1323,11 @@ fn def_map_items(db: &Db, def_map: &DefMap, items: &mut impl Sink) {
     }
 }
 
+/// Whether a struct or variant has a constructor function: a tuple or unit one has.
+fn has_ctor(db: &Db, variant: VariantId) -> bool {
+    !matches!(variant.fields(db).shape, FieldsShape::Record)
+}
+
 /// An item, its enum's variants, and where to look inside it.
 fn item(db: &Db, id: ItemId, items: &mut impl Sink) {
     items.add(item_key(db, id), Resolved::Item(id));
@@ -1342,11 +1342,19 @@ fn item(db: &Db, id: ItemId, items: &mut impl Sink) {
         ItemId::Adt(AdtId::EnumId(it)) => {
             for (_, &(variant, _)) in &it.enum_variants(db).variants {
                 items.add(variant_key(db, variant), Resolved::Variant(variant));
+                if has_ctor(db, variant.into()) {
+                    let ctor = Ctor::Enum(variant);
+                    items.add(ctor_key(db, ctor), Resolved::Ctor(ctor));
+                }
                 items.inner(Inner::Store(ExpressionStoreOwnerId::Body(variant.into())));
                 items.inner(Inner::Store(ExpressionStoreOwnerId::VariantFields(variant.into())));
             }
         }
         ItemId::Adt(AdtId::StructId(it)) => {
+            if has_ctor(db, it.into()) {
+                let ctor = Ctor::Struct(it);
+                items.add(ctor_key(db, ctor), Resolved::Ctor(ctor));
+            }
             items.inner(Inner::Store(ExpressionStoreOwnerId::VariantFields(it.into())))
         }
         ItemId::Adt(AdtId::UnionId(it)) => {

@@ -170,6 +170,82 @@ fn an_output_is_written_against_its_calls_spans_and_read_back_in_another() {
     assert!(read(b"not an expansion", &spans).is_err());
 }
 
+fn derive<'a>(subtree: &'a tt::TopSubtree, attrs: Option<&'a tt::TopSubtree>, env: &'a Env, site: Span) -> Call<'a> {
+    Call {
+        name: "Serialize",
+        kind: ProcMacroKind::CustomDerive,
+        subtree,
+        attrs,
+        env,
+        def_site: site,
+        call_site: site,
+        mixed_site: site,
+        current_dir: "/",
+    }
+}
+
+/// A hit keys its call and reads the kept output back with no allocation but the output's
+/// tree: the columns, shapes and parts are the thread's, kept from the call before.
+#[test]
+fn a_hit_is_keyed_and_read_with_only_its_tree_allocated() {
+    let inputs = Inputs::new();
+    let toolchain = ContentId::of("test toolchain", b"nightly");
+    let call = derive(&inputs.subtree, None, &inputs.env, inputs.site);
+    let bytes = written(&tree("Impl", inputs.site), &given(&toolchain, &call).1).unwrap();
+    let mut hit = || {
+        let (given, spans) = given(&toolchain, &call);
+        (given.finish(), read(&bytes, &spans).unwrap())
+    };
+    let first = hit();
+    let again = blaze_alloc_count::assert_at_most(1, "a hit's key and read", &mut hit);
+    assert_eq!(first.0, again.0);
+    assert_eq!(format!("{:?}", first.1), format!("{:?}", again.1));
+}
+
+/// A site too wide to pack in a span word is still keyed by its range: two calls whose call
+/// sites differ only there are two keys.
+#[test]
+fn a_wide_site_is_keyed_by_its_range() {
+    let inputs = Inputs::new();
+    let toolchain = ContentId::of("test toolchain", b"nightly");
+    let key = |start: u32| {
+        let site = span(1, 0, start, start + (1 << 17));
+        given(&toolchain, &derive(&inputs.subtree, None, &inputs.env, site)).0.finish()
+    };
+    assert_eq!(key(0), key(0));
+    assert_ne!(key(0), key(3));
+}
+
+#[test]
+fn an_attribute_none_and_an_empty_one_are_other_calls() {
+    let inputs = Inputs::new();
+    let toolchain = ContentId::of("test toolchain", b"nightly");
+    let empty = tt::TopSubtree::empty(tt::DelimSpan::from_single(inputs.site));
+    let key = |attrs| given(&toolchain, &derive(&inputs.subtree, attrs, &inputs.env, inputs.site)).0.finish();
+    assert_ne!(key(None), key(Some(&empty)));
+}
+
+/// An output with a span part the call has not in another place, or a part twice, or bytes cut
+/// short, is refused by name rather than read as another tree.
+#[test]
+fn a_kept_value_that_is_not_one_is_refused() {
+    let inputs = Inputs::new();
+    let toolchain = ContentId::of("test toolchain", b"nightly");
+    let spans = given(&toolchain, &derive(&inputs.subtree, None, &inputs.env, inputs.site)).1;
+    let bytes = written(&tree("Impl", inputs.site), &spans).unwrap();
+    for cut in [0, 3, 4, bytes.len() - 1] {
+        assert!(read(&bytes[..cut], &spans).is_err(), "{cut}");
+    }
+    let mut twice = bytes[..bytes.len() - 4].to_vec();
+    twice.extend_from_slice(&bytes[bytes.len() - 12..bytes.len() - 4]);
+    twice.extend_from_slice(&2u32.to_le_bytes());
+    assert!(read(&twice, &spans).unwrap_err().contains("earlier one again"));
+    let mut elsewhere = bytes.clone();
+    let at = elsewhere.len() - 12;
+    elsewhere[at..at + 4].copy_from_slice(&5u32.to_le_bytes());
+    assert!(read(&elsewhere, &spans).unwrap_err().contains("anchor or context"));
+}
+
 #[test]
 fn the_cache_has_one_mode_besides_keeping() {
     assert_eq!(Mode::of(None), Ok(Mode::Keep));

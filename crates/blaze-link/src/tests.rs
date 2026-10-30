@@ -403,6 +403,66 @@ fn an_incremental_link_puts_the_new_function_in_the_old_slot_and_writes_little()
     assert_eq!(image.slot(&key(2)), Some(slot));
 }
 
+/// The lineage's order, a radix sort by 8-byte prefix then a comparison within a prefix,
+/// against a comparison sort of the keys: keys shorter than 8 bytes, keys ending in zero bytes
+/// (which pad alike), keys sharing long prefixes, and equal keys.
+#[test]
+fn the_lineage_order_is_the_keys_byte_order() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |below: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % below
+    };
+    for count in [0usize, 1, 2, 17, 1000, 20_000] {
+        let keys: Vec<Vec<u8>> = (0..count)
+            .map(|_| {
+                let len = next(24) as usize;
+                let shared = next(3) == 0;
+                (0..len).map(|at| if shared && at < 12 { 7 } else { next(3) as u8 }).collect()
+            })
+            .collect();
+        let order = crate::lineage_order(&keys, |it: &Vec<u8>| &it[..]);
+        let got: Vec<&[u8]> = order.iter().map(|(_, at)| &keys[*at as usize][..]).collect();
+        let mut want: Vec<&[u8]> = keys.iter().map(|it| &it[..]).collect();
+        want.sort_unstable();
+        assert_eq!(got, want, "{count} keys");
+    }
+}
+
+/// The cells piece's rebase list is every filled slot's cell after each kind of edit: a body
+/// moved into a filled slot (which keeps the list), a new function's slot filled and a slot
+/// emptied (which change it).
+#[test]
+fn the_cells_rebase_list_is_every_filled_slot_after_each_edit() {
+    let (start, g) = program(Target::Function);
+    let g2 = function(3, &returns(2), Vec::new());
+    let h = function(4, &returns(3), Vec::new());
+    let g3 = function(5, &returns(4), Vec::new());
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let mut disk = Disk::default();
+    let check = |image: &Image, what: &str| {
+        let state = &image.state;
+        let cells = image.symbols.find(crate::symbols::SymKey::Cells).expect("a cells symbol");
+        let crate::state::Def::Piece { piece, .. } = state.def(cells) else { panic!("the cells are a piece: {what}") };
+        let want: Vec<u64> = state.filled_cells().map(|(slot, _)| u64::from(slot) * 8).collect();
+        assert!(!want.is_empty(), "{what}");
+        assert_eq!(state.piece(piece).unwrap().rebase(), want, "{what}");
+    };
+    disk.link(&mut image, first(&start, &g)).unwrap();
+    check(&image, "the first link");
+    disk.link(&mut image, edit(&g2)).unwrap();
+    check(&image, "a body moved into a filled slot");
+    disk.link(&mut image, Change { added: vec![&h], ..Change::default() }).unwrap();
+    check(&image, "a new function's slot filled");
+    disk.link(&mut image, Change { removed: vec![key(4)], ..Change::default() }).unwrap();
+    check(&image, "a slot emptied");
+    let again = Change { added: vec![&g3], removed: vec![key(3)], slots: vec![(key(2), key(5))], ..Change::default() };
+    disk.link(&mut image, again).unwrap();
+    check(&image, "a body moved again");
+}
+
 #[test]
 fn a_rollback_gives_back_the_file_before_the_commit() {
     let (start, g) = program(Target::Function);
@@ -641,6 +701,8 @@ fn a_patch_puts_its_frames_and_literals_in_the_patch_regions_and_ends_its_frames
     let bytes = &Linked { words: message.words(), len: message.len as usize };
     let Message::Patch(patch) = Message::decode(bytes.bytes()).unwrap() else { panic!("not a patch") };
     let [(fde, len)] = patch.frames[..] else { panic!("one FDE: {:?}", patch.frames) };
+    assert!(patch.code.len() >= 3 && patch.code.windows(2).all(|it| it[0].0 < it[1].0), "code writes by address: {:?}", patch.code);
+    assert!(patch.data.windows(2).all(|it| it[0].0 < it[1].0), "data writes by address");
     assert!(code <= new && new < fde && fde + len + 4 <= code_end, "the FDE after the code, in the patch code region");
     assert_eq!(fde_starts(fde, b.at(fde, len as usize)), vec![new], "the FDE covers g2");
     let cie = fde + 4 - u64::from(b.u32_at(fde + 4));
@@ -950,6 +1012,68 @@ fn line_tables_are_written_from_the_span_tables() {
     assert!(!lines.data().unwrap().is_empty());
 }
 
+/// Line tables of more functions than one task of the debug pass makes rows for, their files
+/// met first in different tasks: read back with gimli, every row names its own file and line.
+#[test]
+fn line_tables_across_many_tasks_name_each_rows_file() {
+    let (a, b) = (id(71), id(72));
+    let table = |files: &[&str], spans: u32| {
+        SpanTable {
+            files: files.iter().map(|it| (*it).into()).collect(),
+            spans: (0..spans).map(|it| Position { file: it % files.len() as u32, line: it + 1, column: 1 }).collect(),
+        }
+        .encode()
+    };
+    let (a_files, b_files) = (["a0.rs", "a1.rs", "a2.rs"], ["b0.rs", "b1.rs"]);
+    let (a_spans, b_spans) = (table(&a_files, 9), table(&b_files, 4));
+    let count = 3 * 1024 + 7;
+    let functions: Vec<CompiledFunction> = (0..count)
+        .map(|n| {
+            let mut it = CompiledFunction { key: wide_key(n), ..function(1, &returns(0), Vec::new()) };
+            it.lines = vec![
+                Line { at: 0, span: SpanRef { anchor: a, index: n * 7 % 9 } },
+                Line { at: 3, span: SpanRef { anchor: b, index: n % 4 } },
+            ];
+            it
+        })
+        .collect();
+    let mut image = Image::new(name(TO), Output { debug: Debug::Lines, ..output(false) }).unwrap();
+    let mut disk = Disk::default();
+    let change = Change {
+        added: functions.iter().collect(),
+        names: vec![("_start".into(), Target::Direct(wide_key(0)))],
+        debug_names: (0..count).map(|n| (wide_key(n), format!("f{n}"))).collect(),
+        spans: vec![(a, &a_spans), (b, &b_spans)],
+        ..Change::default()
+    };
+    disk.link(&mut image, change).unwrap();
+    let linked = Linked::of(disk.file(TO));
+    let elf = linked.elf();
+    let get = |name: &str| elf.section_by_name(name).map_or(&[][..], |it| it.data().unwrap());
+    let dwarf = gimli::Dwarf::load(|id| -> Result<_, ()> { Ok(gimli::EndianSlice::new(get(id.name()), gimli::LittleEndian)) })
+        .unwrap();
+    let unit = dwarf.unit(dwarf.units().next().unwrap().unwrap()).unwrap();
+    let mut rows = unit.line_program.clone().unwrap().rows();
+    let mut seen: BTreeMap<u64, (String, u64)> = BTreeMap::new();
+    while let Some((header, row)) = rows.next_row().unwrap() {
+        if row.end_sequence() {
+            continue;
+        }
+        let file = header.file(row.file_index()).unwrap();
+        let path = dwarf.attr_string(&unit, file.path_name()).unwrap().to_string_lossy().into_owned();
+        seen.insert(row.address(), (path, row.line().unwrap().get()));
+    }
+    assert_eq!(seen.len(), 2 * count as usize);
+    for n in 0..count {
+        let at = linked.symbol(&format!("f{n}"));
+        let (first, second) = (n * 7 % 9, n % 4);
+        let want_first = (a_files[(first % 3) as usize].to_owned(), u64::from(first) + 1);
+        let want_second = (b_files[(second % 2) as usize].to_owned(), u64::from(second) + 1);
+        assert_eq!(seen.get(&at), Some(&want_first), "f{n}'s first row");
+        assert_eq!(seen.get(&(at + 3)), Some(&want_second), "f{n}'s second row");
+    }
+}
+
 /// What an incremental stage of a change to one function may allocate, whatever the image
 /// holds: the state's copied chunk tables and pages, arena chunks, the column and lists it
 /// rebuilds, and the writes it hands the commit.
@@ -1084,6 +1208,42 @@ fn slot_and_generation_allocate_nothing() {
     assert_eq!(none, None);
     let generation = blaze_alloc_count::assert_at_most(0, "Image::generation", || image.generation());
     assert_eq!(generation, 1);
+}
+
+/// The driver asks the image about every completion it polls: asking, and taking one of the
+/// image's into a caller's warm buffer, allocates nothing, the last one of the commit too.
+#[test]
+fn owning_and_completing_an_effect_allocate_nothing() {
+    assert!(blaze_alloc_count::installed());
+    let (start, g) = program(Target::Function);
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut image, first(&start, &g)).unwrap();
+    let foreign = blaze_core::Tag(2 << 32);
+    let owned = blaze_alloc_count::assert_at_most(0, "Image::owns of another's tag", || image.owns(foreign));
+    assert!(!owned);
+
+    let g2 = function(3, &returns(2), Vec::new());
+    let staged = image.stage(edit(&g2)).unwrap();
+    let mut effects = Vec::new();
+    image.commit(staged, &mut effects).unwrap();
+    let mut more = Vec::with_capacity(256);
+    let mut completions = 0;
+    let generation = loop {
+        let effect = effects.pop().expect("the commit ended or asked for more");
+        let completion = Completion { tag: effect.tag(), done: disk.done(&effect) };
+        let result = blaze_alloc_count::assert_at_most(0, "Image::owns and Image::complete", || {
+            assert!(image.owns(completion.tag));
+            image.complete(&completion, &mut more)
+        });
+        completions += 1;
+        if let Some(result) = result {
+            break result.unwrap();
+        }
+        effects.append(&mut more);
+    };
+    assert_eq!(generation, 2);
+    assert!(completions >= 6, "a commit's steps: {completions} completions");
 }
 
 mod ties;

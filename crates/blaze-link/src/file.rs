@@ -19,7 +19,7 @@ use smallvec::SmallVec;
 use crate::arena::{FrameVec, collect_in};
 use crate::LinkError;
 use crate::cow::CowBytes;
-use crate::model::{Class, Delta, Pages, Placed, Region};
+use crate::model::{Class, Delta, Pages, Placed, Region, Writer};
 use crate::stage::{Stage, error};
 use crate::state::{Space, State, What};
 use crate::write::{Changes, next_synthesis};
@@ -83,14 +83,14 @@ impl Part<'_> {
 
 impl<'s> Layout<'s> {
     fn of(state: &'s State) -> Layout<'s> {
-        let mut spaces = SmallVec::new();
+        let mut spaces: SmallVec<[_; 32]> = SmallVec::new();
         spaces.extend(state.spaces.iter().filter_map(|space| {
             let offset = space.offset.filter(|_| !space.zero)?;
             let len = space.region.size.min(space.bytes.len() as u64);
             (len > 0).then_some((offset, len, &space.bytes))
         }));
         radix::sort_by_key(&mut spaces, |it| it.0);
-        let mut parts = SmallVec::new();
+        let mut parts: SmallVec<[_; 16]> = SmallVec::new();
         parts.extend(file_parts(state).filter(|it| it.1.len() != 0));
         radix::sort_copy_by_key(&mut parts, |it| it.0);
         Layout { spaces, encoded: &state.encoded, parts }

@@ -536,7 +536,7 @@ impl<F: FnMut(Span) -> Edition> State<'_, F> {
                 self.p.word("}", self.out);
                 self.p.end();
             }
-            Delimiter::Parenthesis | Delimiter::Bracket | Delimiter::None => {
+            Delimiter::Parenthesis | Delimiter::Bracket | Delimiter::Invisible => {
                 let (open, close) = match delimiter {
                     Delimiter::Parenthesis => ("(", ")"),
                     Delimiter::Bracket => ("[", "]"),

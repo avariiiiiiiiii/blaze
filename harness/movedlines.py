@@ -6,7 +6,7 @@ A `core::panic::Location` is filled in when the object is stitched, from where t
 body is in its file now ([`places.rs`]), so moving a function changes no compiled code. The
 program panics in one function in every way that reports a place (`panic!`, `unwrap`, an index,
 a `#[track_caller]` function, `assert_eq!`, a closure, an overflow), and its panic hook prints
-each place. Every step is compared with what `cargo build` of the same source prints, and says
+each place. Every step is compared with what blaze's build of the same source from nothing prints, and says
 how many functions its build may compile.
 """
 from includes import follow

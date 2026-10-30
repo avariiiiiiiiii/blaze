@@ -17,7 +17,7 @@ use hir_def::{
     signatures::FunctionSignature, unstable_features::UnstableFeatures,
 };
 use hir_ty::next_solver::{
-    Binder, DbInterner, FnSig, ParamEnv, Region, Ty, TyKind, TypingMode,
+    Binder, DbInterner, FnSig, ParamEnv, Region, RegionExt as _, Ty, TyKind, TypingMode,
     infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
 };
 use intern::{Symbol, sym};

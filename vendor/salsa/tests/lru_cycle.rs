@@ -4,6 +4,8 @@
 //! a query that depends on it, is executed again when its value is asked for, not taken for a
 //! cycle head that panicked (blaze's patch to salsa 0.28.5, blaze #261).
 
+#![forbid(unsafe_code)]
+
 use salsa::{Database, Durability, Setter};
 
 #[salsa::input]

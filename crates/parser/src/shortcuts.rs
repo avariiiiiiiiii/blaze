@@ -53,19 +53,19 @@ impl LexedStr<'_> {
         res
     }
 
+    /// Only an identifier's text is sliced (for its contextual keyword) and a float's last byte
+    /// read: the other tokens cost their word alone.
     fn push_input(&self, res: &mut crate::Input, was_joint: &mut bool, edition: Edition) {
-        let mut start = 0;
-        for i in 0..self.len() {
-            let kind = self.kind(i);
-            let len = self.token_len(i);
-            let text = &self.as_str()[start..start + len];
-            start += len;
+        let text = self.as_str();
+        let mut end = 0;
+        for (kind, len) in self.kinds_and_lens() {
+            let start = end;
+            end += len;
             if kind.is_trivia() {
                 *was_joint = false
             } else if kind == SyntaxKind::IDENT {
-                let token_text = text;
                 res.push_ident(
-                    SyntaxKind::from_contextual_keyword(token_text, edition)
+                    SyntaxKind::from_contextual_keyword(&text[start..end], edition)
                         .unwrap_or(SyntaxKind::IDENT),
                     edition,
                 )
@@ -78,7 +78,8 @@ impl LexedStr<'_> {
                 // we use this jointness to inform the parser about what token split
                 // event to emit when we encounter a float literal in a field access
                 if kind == SyntaxKind::FLOAT_NUMBER {
-                    if !text.ends_with('.') {
+                    // A float is never empty, and a UTF-8 continuation byte is never `.`.
+                    if text.as_bytes()[end - 1] != b'.' {
                         res.was_joint();
                     } else {
                         *was_joint = false;

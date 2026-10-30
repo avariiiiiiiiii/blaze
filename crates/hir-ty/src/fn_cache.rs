@@ -5,7 +5,7 @@
 use base_db::{Crate, Db};
 
 /// Whether `krate` depends on the `blaze` crate, fn-cache's opt-in.
-#[salsa::tracked(mem_tag = Infer)]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub fn uses_fn_cache(db: &Db, krate: Crate) -> bool {
     krate.data(db).dependencies.iter().any(|dep| {
         dep.crate_id

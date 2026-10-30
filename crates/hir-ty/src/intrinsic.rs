@@ -282,7 +282,7 @@ impl Intrinsic {
     /// The intrinsic at `index` in the names in byte order.
     #[inline]
     pub fn from_index(index: u16) -> Option<Intrinsic> {
-        BY_INDEX.get(usize::from(index)).copied()
+        BY_INDEX.as_slice().get(usize::from(index)).copied()
     }
 
     /// The name's rank among the names in byte order: dense, below [`Self::COUNT`], so a
@@ -323,6 +323,9 @@ macro_rules! intrinsics {
             const fn entry(self) -> (u16, Symbol) {
                 match self {
                     $(Intrinsic::$variant $(($($data)*))? => ($index, sym::$name),)+
+                    Intrinsic::Atomic(..) => {
+                        panic!("an `Intrinsic::Atomic` whose operation and orderings no name has")
+                    }
                 }
             }
         }

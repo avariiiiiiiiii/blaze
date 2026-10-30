@@ -4,6 +4,8 @@
 //! interner hit and a field read allocate nothing. Each test warms the path first, so one-time
 //! setup (the thread's task state, a frame's first edge buffer) is outside the measured closure.
 
+#![forbid(unsafe_code)]
+
 use blaze_alloc_count::{Counting, assert_at_most, measure};
 use salsa::Setter;
 

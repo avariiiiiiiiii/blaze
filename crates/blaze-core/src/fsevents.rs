@@ -253,19 +253,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `n` in decimal in `digits`: a cookie's name, with no allocation.
-fn decimal(mut n: u64, digits: &mut [u8; 20]) -> &[u8] {
-    let mut at = digits.len();
-    loop {
-        at -= 1;
-        digits[at] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            return &digits[at..];
-        }
-    }
-}
-
 /// `dir` in a buffer with room for a cookie's name after it, for [`with_cookie`].
 fn cookie_buffer(dir: &Path) -> PathBuf {
     // alloc: setup, once per watch.
@@ -279,7 +266,7 @@ fn cookie_buffer(dir: &Path) -> PathBuf {
 /// std names a path this short to the system from the stack.
 fn with_cookie<R>(dir: &mut PathBuf, tag: Tag, f: impl FnOnce(&Path) -> R) -> R {
     let mut digits = [0; 20];
-    dir.push(OsStr::from_bytes(decimal(tag.0, &mut digits)));
+    dir.push(OsStr::from_bytes(crate::decimal::decimal(tag.0, &mut digits).as_bytes()));
     let result = f(dir);
     dir.pop();
     result

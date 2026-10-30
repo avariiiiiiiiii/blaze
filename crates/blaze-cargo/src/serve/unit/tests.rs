@@ -10,7 +10,7 @@ use blaze_api::{Artifact, ArtifactKind, Level, UnitProfile};
 use blaze_ids::ContentId;
 use blaze_units::{
     query::{PackagePlan, TestSandbox, UnitPlan, Units},
-    schema::{DebugInfo, Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
+    schema::{Mode, Profile, Target, Unit, UnitDep, UnitGraph},
 };
 use blaze_usercode::run::Value;
 
@@ -37,24 +37,7 @@ fn target(name: &str, kind: &str, src: &str) -> Target {
 }
 
 fn profile() -> Profile {
-    Profile {
-        name: "dev".to_owned(),
-        opt_level: "0".to_owned(),
-        lto: "false".to_owned(),
-        codegen_backend: None,
-        codegen_units: None,
-        debuginfo: DebugInfo::Level(2),
-        split_debuginfo: None,
-        debug_assertions: true,
-        overflow_checks: true,
-        rpath: false,
-        incremental: true,
-        panic: "unwind".to_owned(),
-        strip: Strip::Deferred(Stripped::None),
-        rustflags: Vec::new(),
-        trim_paths: None,
-        hint_mostly_unused: None,
-    }
+    Profile { incremental: true, ..Profile::dev() }
 }
 
 fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
@@ -469,6 +452,21 @@ fn a_dependencys_lints_are_capped_and_rustc_closing_lines_hidden() {
     assert!(compile::cargo_hides("aborting due to 2 previous errors; 1 warning emitted"));
     assert!(compile::cargo_hides("3 warnings emitted"));
     assert!(!compile::cargo_hides("For more information about this error, try `rustc --explain E0308`."));
+}
+
+#[test]
+fn only_what_programs_reach_is_built_of_the_crates_cargo_caps_the_lints_of() {
+    let registry = Some("(registry+https://github.com/rust-lang/crates.io-index)");
+    let git = Some("(https://github.com/a/b#0123)");
+    // The standard library, a registry and a git dependency: only what programs reach.
+    assert!(compile::capped(true, false, Some("(/toolchain/lib/rustlib/src/rust/library/std)")));
+    assert!(compile::capped(false, false, registry));
+    assert!(compile::capped(false, false, git));
+    assert!(compile::capped(false, false, None));
+    // A workspace member and a path package outside the workspace: checked and compiled whole.
+    assert!(!compile::capped(false, true, Some("(/w/p)")));
+    assert!(!compile::capped(false, true, None));
+    assert!(!compile::capped(false, false, Some("(/elsewhere/q)")));
 }
 
 #[test]

@@ -8,7 +8,9 @@
 //! at a fixed address (XNU refuses `MAP_JIT | MAP_FIXED`) such as the image's patch code
 //! region, where the linker resolved the patch's references, so it has no part here.
 //!
-//! The code region's protection and the table cell's are read once, at start. A patch's code
+//! The protections of the image's regions are read once, at start ([`Regions`]): a swap
+//! gives pages the protection they had, so they stay true, and checking a patch's writes
+//! takes no system call. A patch's code
 //! is one remap per run of pages it writes (runs closer than [`MERGE`] are one, the pages
 //! between copied as they are), its bytes copied straight from the message into the copy.
 //! Data in writable pages is written in place with atomic stores ([`Writes::store`]), since
@@ -122,6 +124,7 @@ pub(super) struct Os {
     cell: i32,
     /// Where the image is mapped, which every data write is checked to be in.
     segments: Segments,
+    regions: Regions,
 }
 
 impl Os {
@@ -152,7 +155,9 @@ impl Os {
         }
         let (_, cell) = region_at(layout.cell())?;
         let segments = Segments::of(layout.cell())?;
-        Ok(Os { code, protection: protection.unwrap_or(READ | EXECUTE), cell, segments })
+        let regions = Regions::read(&segments.hull())?;
+        let protection = protection.unwrap_or(READ | EXECUTE);
+        Ok(Os { code, protection, cell, segments, regions })
     }
 
     /// Where the image is mapped, from its first segment to its last, in memory.
@@ -173,7 +178,7 @@ impl Memory for Os {
         self.segments.check(range)?;
         let mut at = range.start;
         while at < range.end {
-            let (region, protection) = region_at(at)?;
+            let (region, protection) = self.regions.at(at)?;
             if protection & READ == 0 {
                 // alloc: error path
                 return Err(format!("{at:#x}, in pages with no access"));
@@ -212,24 +217,12 @@ impl Memory for Os {
     }
 
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
-        let mut region: Option<(Range<u64>, i32)> = None;
         let mut run: Option<(Range<u64>, i32)> = None;
         for span in writes.spans {
             self.segments.check(&span.range())?;
             let mut at = span.at;
             while at < span.end() {
-                let (found, protection) = match &region {
-                    Some((found, protection)) if found.contains(&at) => {
-                        // clone: a Range<u64> of two words; Range isn't Copy
-                        (found.clone(), *protection)
-                    }
-                    _ => {
-                        let looked = region_at(at)?;
-                        // clone: as above
-                        region = Some(looked.clone());
-                        looked
-                    }
-                };
+                let (found, protection) = self.regions.at(at)?;
                 let piece = at..found.end.min(span.end());
                 at = piece.end;
                 if protection & READ == 0 {
@@ -316,15 +309,58 @@ fn check(code: i32) -> Result<(), String> {
     if code == 0 { Ok(()) } else { Err(format!("kern_return {code}")) }
 }
 
+/// The image's mapped regions and their protections, sorted, read once at start: a lookup
+/// is a binary search where `mach_vm_region` is a trap.
+struct Regions(Vec<(u64, u64, i32)>);
+
+impl Regions {
+    /// The regions of `image`, cut to it.
+    fn read(image: &Range<u64>) -> Result<Regions, String> {
+        // alloc: setup, the image's regions, read once at start
+        let mut regions = Vec::with_capacity(16);
+        let mut at = image.start;
+        while at < image.end {
+            let Some((found, protection)) = next_region(at)? else { break };
+            if found.start >= image.end {
+                break;
+            }
+            regions.push((found.start.max(image.start), found.end.min(image.end), protection));
+            at = found.end;
+        }
+        Ok(Regions(regions))
+    }
+
+    /// The region that has `at`, and its protection.
+    fn at(&self, at: u64) -> Result<(Range<u64>, i32), String> {
+        let next = self.0.partition_point(|it| it.1 <= at);
+        match self.0.get(next) {
+            Some(&(start, end, protection)) if start <= at => Ok((start..end, protection)),
+            // alloc: error path
+            _ => Err(format!("nothing is mapped at {at:#x}")),
+        }
+    }
+}
+
 /// The mapped region at `address` and its protection.
 fn region_at(address: u64) -> Result<(Range<u64>, i32), String> {
+    match next_region(address)? {
+        Some((region, protection)) if region.contains(&address) => Ok((region, protection)),
+        // alloc: error path
+        _ => Err(format!("nothing is mapped at {address:#x}")),
+    }
+}
+
+/// The first mapped region that ends past `address`, and its protection; `None` when there
+/// is none.
+fn next_region(address: u64) -> Result<Option<(Range<u64>, i32)>, String> {
+    const KERN_INVALID_ADDRESS: i32 = 1;
     // SAFETY: it takes no pointer.
     let task = unsafe { mach_task_self() };
     let (mut start, mut size, mut object) = (address, 0u64, 0u32);
     let mut info = [0i32; 9];
     let mut count = info.len() as u32;
     // SAFETY: `info` is as large as the basic information of a region, in `int`s.
-    check(unsafe {
+    let code = unsafe {
         mach_vm_region(
             task,
             &mut start,
@@ -334,14 +370,13 @@ fn region_at(address: u64) -> Result<(Range<u64>, i32), String> {
             &mut count,
             &mut object,
         )
-    })
-    // alloc: error path
-    .map_err(|it| format!("reading the protection at {address:#x}: {it}"))?;
-    if start > address || start.saturating_add(size) <= address {
-        // alloc: error path
-        return Err(format!("nothing is mapped at {address:#x}"));
+    };
+    if code == KERN_INVALID_ADDRESS {
+        return Ok(None);
     }
-    Ok((start..start + size, info[0]))
+    // alloc: error path
+    check(code).map_err(|it| format!("reading the protection at {address:#x}: {it}"))?;
+    Ok(Some((start..start.saturating_add(size), info[0])))
 }
 
 /// Writes the whole pages `pages`, mapped with `protection`, by mapping a copy of them over
@@ -491,4 +526,38 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
         .map(drop)
         // alloc: error path
         .map_err(|it| format!("starting the thread that watches for patches: {it}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slots::unix::{mmap, mprotect, munmap};
+
+    /// The regions read once give, for every address, what `mach_vm_region` gives for it.
+    #[test]
+    fn regions_read_at_start_say_what_the_kernel_says() {
+        const MAP_PRIVATE: c_int = 2;
+        const MAP_ANONYMOUS: c_int = 0x1000;
+        let len = 3 * PAGE as usize;
+        // SAFETY: a new private mapping anywhere, which only this test uses.
+        let at =
+            unsafe { mmap(std::ptr::null_mut(), len, READ | WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+        assert_ne!(at, !0usize as *mut c_void);
+        let base = at as u64;
+        // SAFETY: the middle page of the mapping above.
+        assert_eq!(unsafe { mprotect((base + PAGE) as *mut c_void, PAGE as usize, READ) }, 0);
+        let image = base..base + len as u64;
+        let regions = Regions::read(&image).expect("read");
+        for at in (image.start..image.end).step_by(PAGE as usize / 4) {
+            let (found, protection) = regions.at(at).expect("mapped");
+            let (kernel, said) = region_at(at).expect("mapped");
+            assert_eq!(protection, said, "{at:#x}");
+            assert!(found.contains(&at) && found.start >= kernel.start.max(image.start));
+            assert!(found.end <= kernel.end.min(image.end));
+        }
+        assert_eq!(regions.at(base + PAGE + 8).expect("mapped").1 & WRITE, 0);
+        assert!(regions.at(image.end).is_err());
+        // SAFETY: the mapping above, which nothing borrows.
+        unsafe { munmap(at, len) };
+    }
 }

@@ -30,7 +30,7 @@ impl TokenStream<Span> {
         part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
         join: impl Fn(Span, Span) -> Span,
     ) -> Result<(TokenStream<Span>, usize), String> {
-        let bytes = aligned(bytes, scratch);
+        let bytes = tt::aligned(bytes, scratch);
         // alloc: error path.
         let (tree, used) = TopSubtree::read_wire(bytes, part).map_err(|error| error.to_string())?;
         let top = tree.top_subtree().delimiter;
@@ -132,20 +132,6 @@ fn push_literal(builder: &mut TopSubtreeBuilder, literal: &Literal<Span>) -> Res
     };
     builder.push(tt::Leaf::Literal(tt::Literal::new(text, literal.span, kind, suffix)));
     Ok(())
-}
-
-/// `bytes`, or a copy of them in `scratch` starting at a 4-byte boundary when they don't. The
-/// same as `proc_macro_api::wire::aligned`, which this crate can't name (that one depends on it).
-fn aligned<'a>(bytes: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
-    if bytes.as_ptr().addr().is_multiple_of(4) {
-        return bytes;
-    }
-    scratch.clear();
-    // alloc: only for bytes a deserializer left off a word, reused across requests.
-    scratch.resize(bytes.len() + 3, 0);
-    let at = scratch.as_ptr().align_offset(4);
-    scratch[at..at + bytes.len()].copy_from_slice(bytes);
-    &scratch[at..at + bytes.len()]
 }
 
 /// The trees `top` walks, each subtree a group. Every open group's trees wait in one list in
@@ -272,16 +258,15 @@ mod tests {
                 file_id: EditionedFileId::new(FileId::from_raw(1), span::Edition::CURRENT),
                 ast_id: ROOT_ERASED_FILE_AST_ID,
             },
-            // SAFETY: the server has no database; the context is carried and compared only.
-            ctx: unsafe { SyntaxContext::from_u32(ctx) },
+            // The server has no database; the context is carried and compared only.
+            ctx: SyntaxContext::from_u32(ctx),
         }
     }
 
     fn parts(tree: &TopSubtree) -> impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String> {
         let anchor = tree.top_subtree().delimiter.open.anchor;
         move |part| {
-            // SAFETY: as in `span`.
-            Ok((anchor, unsafe { SyntaxContext::from_u32(part.ctx) }))
+            Ok((anchor, SyntaxContext::from_u32(part.ctx)))
         }
     }
 

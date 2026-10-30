@@ -10,10 +10,8 @@ extern crate rustc_driver as _;
 use std::fmt::{self, Write};
 
 mod ast_id;
-// The one unsafe module: a `SyntaxContext` is a salsa id, made with `salsa::Id::from_index`.
-#[allow(unsafe_code)]
 mod hygiene;
-// Its `simd` module is the other unsafe one: the newline bitmap's vector loads.
+// Its `simd` module is the one unsafe module: the newline bitmap's vector loads.
 mod lines;
 mod map;
 

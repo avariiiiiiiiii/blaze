@@ -57,6 +57,7 @@ pub(crate) mod explicit_drop_method_use;
 pub(crate) mod fru_in_destructuring_assignment;
 pub(crate) mod fully_qualified_call_from_2018;
 pub(crate) mod functional_record_update_on_non_struct;
+pub(crate) mod incorrect_arguments;
 pub(crate) mod invalid_cast;
 pub(crate) mod invalid_lhs_of_assignment;
 pub(crate) mod invalid_range_pat_type;
@@ -90,6 +91,7 @@ pub(crate) mod unresolved_method_call;
 pub(crate) mod unresolved_path;
 pub(crate) mod unsafe_binder_cast_of_non_binder;
 
+pub(crate) mod async_coroutines_not_supported;
 pub(crate) mod await_outside_of_async;
 pub(crate) mod borrowck_error;
 pub(crate) mod borrowck_skipped;
@@ -105,6 +107,7 @@ pub(crate) mod non_exhaustive_let;
 pub(crate) mod pattern_complexity_limit;
 pub(crate) mod return_outside_function;
 pub(crate) mod undeclared_label;
+pub(crate) mod unlabeled_jump_in_labeled_block;
 pub(crate) mod unreachable_label;
 pub(crate) mod unused_must_use;
 pub(crate) mod val_tree_error;
@@ -230,6 +233,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::FunctionalRecordUpdateOnNonStruct(d) => {
             functional_record_update_on_non_struct::lower(cx, &d)
         }
+        AnyDiagnostic::IncorrectArguments(d) => incorrect_arguments::lower(cx, &d),
         AnyDiagnostic::InvalidCast(d) => invalid_cast::lower(cx, &d),
         AnyDiagnostic::InvalidLhsOfAssignment(d) => invalid_lhs_of_assignment::lower(cx, &d),
         AnyDiagnostic::InvalidRangePatType(d) => invalid_range_pat_type::lower(cx, &d),
@@ -270,6 +274,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::UnresolvedMethodCall(d) => unresolved_method_call::lower(cx, &d),
         AnyDiagnostic::UnresolvedPath(d) => unresolved_path::lower(cx, &d),
 
+        AnyDiagnostic::AsyncCoroutinesNotSupported(d) => async_coroutines_not_supported::lower(cx, &d),
         AnyDiagnostic::AwaitOutsideOfAsync(d) => await_outside_of_async::lower(cx, &d),
         AnyDiagnostic::BorrowckError(d) => borrowck_error::lower(cx, &d),
         AnyDiagnostic::BorrowckSkipped(d) => borrowck_skipped::lower(cx, &d),
@@ -286,6 +291,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::ReturnOutsideFunction(d) => return_outside_function::lower(cx, &d),
         AnyDiagnostic::UnsafeBinderCastOfNonBinder(d) => unsafe_binder_cast_of_non_binder::lower(cx, &d),
         AnyDiagnostic::UndeclaredLabel(d) => undeclared_label::lower(cx, &d),
+        AnyDiagnostic::UnlabeledJumpInLabeledBlock(d) => unlabeled_jump_in_labeled_block::lower(cx, &d),
         AnyDiagnostic::UnreachableLabel(d) => unreachable_label::lower(cx, &d),
         AnyDiagnostic::UnusedMustUse(d) => unused_must_use::lower(cx, &d),
         AnyDiagnostic::ValTreeError(d) => val_tree_error::lower(cx, &d),

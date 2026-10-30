@@ -42,7 +42,7 @@ use crate::patch::{
 };
 pub use exec::publish;
 use os::backtrace;
-use switch::{KEPT, Layout, Switch};
+use switch::{KEPT, Layout, Memory as _, Switch};
 
 mod column;
 pub mod exec;
@@ -95,6 +95,7 @@ mod os {
 
     impl Os {
         pub(super) fn new(_: &Layout) -> Result<Os, String> {
+            // alloc: error path, once at start on a platform it doesn't run on
             Err(PLATFORMS.to_owned())
         }
     }
@@ -141,14 +142,17 @@ mod os {
     }
 
     pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
+        // alloc: error path, on a platform it doesn't run on
         Err(PLATFORMS.to_owned())
     }
 
     pub(super) fn in_image_of(_: &Range<u64>, _: u64) -> Result<(), String> {
+        // alloc: error path, on a platform it doesn't run on
         Err(PLATFORMS.to_owned())
     }
 
     pub(super) fn watch(_: &Path, _: Arc<Events>) -> Result<(), String> {
+        // alloc: error path, on a platform it doesn't run on
         Err(PLATFORMS.to_owned())
     }
 

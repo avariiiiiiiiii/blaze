@@ -83,8 +83,21 @@ impl Rig {
     }
 
     fn deliver(&mut self, conn: Conn, bytes: &[u8]) {
+        let (tag, into) = self.received_into(conn, bytes);
+        self.complete(tag, Done::Read(into));
+    }
+
+    /// The receive in flight on `conn` taken out, its buffer with `bytes` appended, as the
+    /// driver appends them: after what it held, in room reserved for `most`.
+    fn received_into(&mut self, conn: Conn, bytes: &[u8]) -> (Tag, Vec<u8>) {
         let tag = self.receiving(conn).expect("a receive in flight");
-        self.complete(tag, Done::Read(bytes.to_vec()));
+        let at = self.in_flight.iter().position(|it| it.tag() == tag).expect("the receive");
+        let Effect::Recv { most, mut into, .. } = self.in_flight.remove(at) else {
+            unreachable!("found as a receive")
+        };
+        into.reserve(most.max(bytes.len()));
+        into.extend_from_slice(bytes);
+        (tag, into)
     }
 
     fn sends(&self, conn: Conn) -> Vec<(Tag, Vec<u8>)> {
@@ -757,7 +770,8 @@ fn any_split_of_an_http_stream_gives_the_same_arrivals_and_answers() {
 /// allocates nothing, and nor does its reply: the send buffer comes back with the send's end
 /// and is the next reply's. On an HTTP connection kept alive the request's read also writes the
 /// reply's head into a send buffer, and the reply is written while that send is in flight:
-/// one allocation each.
+/// one allocation each. On both, a warm receive is lent a buffer with room for what it reads,
+/// so the driver's read allocates nothing either.
 #[test]
 fn a_warm_request_and_its_reply_reuse_their_buffers() {
     for unix in [true, false] {
@@ -770,10 +784,18 @@ fn a_warm_request_and_its_reply_reuse_their_buffers() {
                 true => frame_of(id, Request::Cancel { id }),
                 false => authorized_post(id, Request::Cancel { id }),
             };
-            let tag = rig.receiving(conn).expect("a receive in flight");
-            rig.in_flight.retain(|it| it.tag() != tag);
+            if warm {
+                let lent = rig.in_flight.iter().find_map(|it| match it {
+                    Effect::Recv { conn: of, most, into, .. } if *of == conn => {
+                        Some(into.capacity() >= into.len() + most)
+                    }
+                    _ => None,
+                });
+                assert_eq!(lent, Some(true), "{unix}: a warm receive is given room for what it reads");
+            }
+            let (tag, into) = rig.received_into(conn, &bytes);
             let (_, read) = blaze_alloc_count::measure(|| {
-                rig.server.complete(Completion { tag, done: Done::Read(bytes) }, &mut effects, &mut arrived)
+                rig.server.complete(Completion { tag, done: Done::Read(into) }, &mut effects, &mut arrived)
             });
             let head = u64::from(!unix);
             assert!(!warm || read.allocations <= head, "{unix}: a warm request read: {read:?}");

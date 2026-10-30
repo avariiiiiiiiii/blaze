@@ -330,24 +330,6 @@ fn result(report: test::Report, executable: u32, outside: bool) -> TestResult {
     }
 }
 
-/// A test not run, as its pass is kept for the functions it executed and what it read: the
-/// pass that stands, as blaze-testsel's `api` marks it.
-fn cached(binary: &str, executable: u32, name: &str, kept: &blaze_testsel::Cached) -> TestResult {
-    TestResult {
-        // alloc: the message owns its names, once per result sent
-        binary: binary.to_owned(),
-        executable,
-        outside: false,
-        // alloc: the message owns its names, once per result sent
-        name: name.to_owned(),
-        cached: Some(blaze_testsel::api::to_api(kept)),
-        outcome: TestOutcome::Unreached,
-        // alloc: empty, allocates nothing
-        output: Vec::new(),
-        millis: 0,
-    }
-}
-
 /// One binary's tests as the queue and selection see them. Its tests are its unit's
 /// ([`listing`]), by place in the harness's order.
 struct Suited {
@@ -688,7 +670,7 @@ impl Runs<Real> for TestRun {
                     Subject { name: &test.name, attrs, outside: test.outside || !inside, reached: &table.tests[n].1 };
                 match selector.choose(store, &subject, self.all, &mut suite.disk) {
                     Ok(Choice::Cached(kept)) => {
-                        out.push(Response::TestResult(cached(&suite.name, at, &test.name, &kept)));
+                        out.push(Response::TestResult(blaze_testsel::api::result(&suite.name, at, &test.name, &kept)));
                     }
                     Ok(Choice::Run { expected, .. }) => binary.jobs.push(TestJob {
                         // clone: the queue owns its jobs' names, once per test run

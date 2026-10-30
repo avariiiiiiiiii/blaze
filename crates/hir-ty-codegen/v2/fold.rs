@@ -33,6 +33,7 @@ use blaze_codegen::{
     settings::Spec,
     template::Refs,
 };
+use blaze_format::cursor::Put;
 use blaze_ids::{ContentId, Hasher};
 use cranelift_codegen::{
     cursor::{Cursor as _, FuncCursor},
@@ -152,6 +153,10 @@ fn data_of(
         }
         DataPlace::Text(text) => {
             hasher.update(&[1]).part(text.as_bytes());
+        }
+        // Every one is the same `Location`, of no file (`convert`'s `nowhere`).
+        DataPlace::Nowhere => {
+            hasher.update(&[4]);
         }
         DataPlace::Own => {
             let (DataRequest::Blob { blob, identity: DataIdentity::Shared }
@@ -320,7 +325,7 @@ impl Canon<'_> {
     }
 
     fn u32(&mut self, it: u32) {
-        self.words.bytes.extend_from_slice(&it.to_le_bytes());
+        self.words.bytes.put_u32(it);
     }
 
     fn len(&mut self, len: usize) {
@@ -332,8 +337,7 @@ impl Canon<'_> {
     }
 
     fn bytes(&mut self, bytes: &[u8]) {
-        self.len(bytes.len());
-        self.words.bytes.extend_from_slice(bytes);
+        self.words.bytes.put_bytes_u32(bytes);
     }
 
     fn constant(&mut self, constant: Constant, site: Site) {

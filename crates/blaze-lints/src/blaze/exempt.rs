@@ -6,19 +6,21 @@ use syntax::TextRange;
 
 use super::Lint;
 
-/// The word of the comment that keeps `lint`'s cost.
-const fn tag(lint: Lint) -> &'static str {
+/// The word of the comment that keeps `lint`'s cost; none for the parallel lints, which say
+/// what a loop could be rather than what a line costs.
+const fn tag(lint: Lint) -> Option<&'static str> {
     match lint {
-        Lint::HotClone => "clone",
-        Lint::HotAlloc | Lint::StdHashmap => "alloc",
-        Lint::HotDyn => "dyn",
+        Lint::HotClone => Some("clone"),
+        Lint::HotAlloc | Lint::StdHashmap => Some("alloc"),
+        Lint::HotDyn => Some("dyn"),
+        Lint::Parallelizable | Lint::SerialDependence => None,
     }
 }
 
 /// Whether a finding of `lint` at `range` of `text` is kept by a comment: on one of the lines
 /// `range` covers, or on the line above its first.
 pub(super) fn exempt(text: &str, range: TextRange, lint: Lint) -> bool {
-    let tag = tag(lint);
+    let Some(tag) = tag(lint) else { return false };
     let start = (usize::from(range.start())).min(text.len());
     let end = (usize::from(range.end())).clamp(start, text.len());
     let first = line_start(text, start);

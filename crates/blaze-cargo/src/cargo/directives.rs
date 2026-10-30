@@ -26,27 +26,6 @@
 
 use std::path::{Path, PathBuf};
 
-/// The keys of the old syntax (`cargo:KEY=VALUE`) that are directives: any other is metadata.
-const RESERVED: [&str; 17] = [
-    "rustc-flags",
-    "rustc-link-lib",
-    "rustc-link-search",
-    "rustc-link-arg-cdylib",
-    "rustc-cdylib-link-arg",
-    "rustc-link-arg-bins",
-    "rustc-link-arg-bin",
-    "rustc-link-arg-tests",
-    "rustc-link-arg-benches",
-    "rustc-link-arg-examples",
-    "rustc-link-arg",
-    "rustc-cfg",
-    "rustc-check-cfg",
-    "rustc-env",
-    "warning",
-    "rerun-if-changed",
-    "rerun-if-env-changed",
-];
-
 /// The system's directories of libraries, which the linker searches anyway: naming one adds
 /// nothing a script could not link already. The Nix store is the closure a script's tools
 /// come from; Homebrew's prefixes and Apple's SDKs are where a Mac's libraries are.
@@ -279,9 +258,7 @@ pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<(String, String)> {
         let line = line.trim();
         let data = match (line.strip_prefix("cargo::"), line.strip_prefix("cargo:")) {
             (Some(data), _) => data,
-            (None, Some(data)) if RESERVED.iter().any(|it| data.starts_with(&format!("{it}="))) => {
-                data
-            }
+            (None, Some(data)) if blaze_build_script::output::has_reserved_prefix(data) => data,
             _ => continue,
         };
         let Some((key, value)) = data.split_once('=') else { continue };

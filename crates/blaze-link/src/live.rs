@@ -179,6 +179,12 @@ impl Stage<'_> {
             data.push((region.addr + region.size, &EH_FRAME_END));
         }
         radix::sort(&mut rebase);
+        // By address, as the runtime checks them: a sorted list is one pass of its sort on
+        // the switch's latency path, an unsorted one n log n compares. Ties keep piece order.
+        radix::sort_copy_by_key(&mut code, |it| it.0);
+        radix::sort_copy_by_key(&mut data, |it| it.0);
+        radix::sort_copy_by_key(&mut frames, |it| it.0);
+        radix::sort_copy_by_key(&mut windows, |it| it.0);
         let patch = PatchRef {
             id,
             generation,

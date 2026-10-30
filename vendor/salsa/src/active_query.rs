@@ -11,7 +11,7 @@ use crate::accumulator::{
 };
 use crate::fingerprint::Fingerprint;
 use crate::graph::Graph;
-use crate::hash::FxIndexSet;
+use rustc_hash::FxHashMap;
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
 use crate::tracked_struct::{Disambiguator, DisambiguatorMap, IdentityHash, IdentityMap};
@@ -42,7 +42,7 @@ pub(crate) struct ActiveQuery {
     ///
     /// * invocations of `specify`
     /// * accumulators pushed to
-    input_outputs: FxIndexSet<QueryEdge>,
+    input_outputs: EdgeSet,
 
     /// The value fingerprints of the inputs in `input_outputs` that were read with one, keyed by
     /// the input's position there. Kept by the stack slot across runs; the memo gets a copy at
@@ -123,6 +123,7 @@ impl ActiveQuery {
     pub(super) fn add_read(
         &mut self,
         input: DatabaseKeyIndex,
+        node: u32,
         durability: Durability,
         changed_at: Revision,
         fingerprint: Fingerprint,
@@ -146,7 +147,7 @@ impl ActiveQuery {
         #[cfg(feature = "accumulator")]
         let record_input = record_input || accumulated_inputs.is_any();
 
-        let recorded = record_input.then(|| self.insert_edge(QueryEdge::input(input)));
+        let recorded = record_input.then(|| self.insert_edge(QueryEdge::input_at(input, node)));
         if let Some((edge, inserted)) = recorded {
             if inserted && fingerprint.is_value() {
                 self.edge_fingerprints.push(EdgeFingerprint {
@@ -268,7 +269,7 @@ impl ActiveQuery {
         self.captures.close(
             zalsa,
             zalsa_local,
-            &self.input_outputs,
+            self.input_outputs.as_slice(),
             &self.edge_fingerprints,
         )
     }
@@ -315,7 +316,7 @@ impl ActiveQuery {
             database_key_index,
             durability: Durability::MAX,
             changed_at: Revision::start(),
-            input_outputs: FxIndexSet::default(),
+            input_outputs: EdgeSet::default(),
             // alloc: `Vec::new` allocates nothing; the slot's runs reuse the buffer
             edge_fingerprints: Vec::new(),
             untracked_read: false,
@@ -474,11 +475,109 @@ pub(crate) fn exact_thin_vec<T>(buffer: &mut Vec<T>) -> ThinVec<T> {
     exact
 }
 
-pub(crate) struct DetachedInputOutputs(FxIndexSet<QueryEdge>);
+pub(crate) struct DetachedInputOutputs(EdgeSet);
 
 impl DetachedInputOutputs {
-    pub(crate) fn input_outputs(&self) -> &FxIndexSet<QueryEdge> {
-        &self.0
+    pub(crate) fn input_outputs(&self) -> &[QueryEdge] {
+        self.0.as_slice()
+    }
+}
+
+/// A running query's edges in read order, each once: rustc's read dedup (`read_index`). While
+/// there are at most [`EdgeSet::SCAN`] edges a read finds a repeat by scanning them (one or two
+/// cache lines, no hashing); past that a hash index of edge to position is built once and kept.
+/// Most queries read a handful of keys, so most reads cost a short scan and a push of the edge,
+/// which carries its key's node ([`QueryEdge::node`]) so finishing the query looks nothing up.
+#[derive(Debug, Default)]
+pub(crate) struct EdgeSet {
+    edges: Vec<QueryEdge>,
+    /// Position of each edge; empty while `edges` holds at most `SCAN`.
+    index: FxHashMap<QueryEdge, u32>,
+}
+
+impl EdgeSet {
+    /// rustc's `EdgesVec` scans up to 8 reads before it hashes.
+    const SCAN: usize = 8;
+
+    /// Inserts `edge` if it is new: its position, and whether it was new.
+    #[inline]
+    pub(crate) fn insert_full(&mut self, edge: QueryEdge) -> (usize, bool) {
+        let len = self.edges.len();
+        if len <= Self::SCAN {
+            if let Some(position) = self.edges.iter().rposition(|seen| *seen == edge) {
+                return (position, false);
+            }
+            // alloc: the stack slot's buffer, kept across the queries it runs
+            self.edges.push(edge);
+            if len == Self::SCAN {
+                self.build_index();
+            }
+            return (len, true);
+        }
+        match self.index.entry(edge) {
+            std::collections::hash_map::Entry::Occupied(seen) => (*seen.get() as usize, false),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Self::position(len));
+                // alloc: the stack slot's buffer, kept across the queries it runs
+                self.edges.push(edge);
+                (len, true)
+            }
+        }
+    }
+
+    #[cold]
+    fn build_index(&mut self) {
+        debug_assert!(self.index.is_empty());
+        // alloc: the index of a query that read more than `SCAN` keys, kept by its stack slot
+        self.index.reserve(self.edges.len() * 2);
+        for (position, &edge) in self.edges.iter().enumerate() {
+            self.index.insert(edge, Self::position(position));
+        }
+    }
+
+    fn position(position: usize) -> u32 {
+        u32::try_from(position).expect("salsa: a query recorded more than 2^32 edges")
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[QueryEdge] {
+        &self.edges
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.edges.len()
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.edges.is_empty()
+    }
+
+    #[inline]
+    pub(crate) fn last(&self) -> Option<&QueryEdge> {
+        self.edges.last()
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, QueryEdge> {
+        self.edges.iter()
+    }
+
+    pub(crate) fn extend(&mut self, edges: impl IntoIterator<Item = QueryEdge>) {
+        for edge in edges {
+            self.insert_full(edge);
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.edges.clear();
+        self.index.clear();
+    }
+
+    /// Takes every edge out in order, leaving the set empty with its buffers.
+    pub(crate) fn drain(&mut self) -> std::vec::Drain<'_, QueryEdge> {
+        self.index.clear();
+        self.edges.drain(..)
     }
 }
 
@@ -548,7 +647,7 @@ impl QueryStack {
             push_len,
         );
         let completion = active_query.prepare_completion(iteration, false);
-        completion.finish(zalsa, zalsa_local, active_query.input_outputs.drain(..))
+        completion.finish(zalsa, zalsa_local, active_query.input_outputs.drain())
     }
 
     pub(crate) fn pop_detached_completion(
@@ -770,7 +869,7 @@ impl fmt::Display for Backtrace {
 
 #[cfg(test)]
 mod tests {
-    use super::ActiveQuery;
+    use super::{ActiveQuery, EdgeSet};
     use crate::cycle::CycleHeads;
     use crate::durability::Durability;
     use crate::fingerprint::Fingerprint;
@@ -786,6 +885,7 @@ mod tests {
     fn read(query: &mut ActiveQuery, input: DatabaseKeyIndex, fingerprint: Fingerprint) {
         query.add_read(
             input,
+            QueryEdge::NO_NODE,
             Durability::LOW,
             Revision::start(),
             fingerprint,
@@ -822,5 +922,31 @@ mod tests {
                 EdgeFingerprint { edge: 1, fingerprint: fb },
             ]
         );
+    }
+
+    /// The scan below `EdgeSet::SCAN` edges and the index past it find the same repeats, in
+    /// read order, and a read keeps the node it was given.
+    #[test]
+    fn edge_set_dedups_across_its_scan_limit() {
+        let mut set = EdgeSet::default();
+        let mut expected = Vec::new();
+        for round in 0..3u64 {
+            for i in 0..(EdgeSet::SCAN as u64 * 3) {
+                let edge = QueryEdge::input_at(key(i + 1), i as u32);
+                let (position, new) = set.insert_full(edge);
+                assert_eq!(position, i as usize);
+                assert_eq!(new, round == 0, "edge {i} in round {round}");
+                if round == 0 {
+                    expected.push(edge);
+                }
+                assert_eq!(set.insert_full(QueryEdge::input(key(i + 1))), (i as usize, false));
+            }
+        }
+        assert_eq!(set.as_slice(), expected.as_slice());
+        assert!(set.iter().enumerate().all(|(i, edge)| edge.node() == Some(i as u32)));
+        let drained: Vec<QueryEdge> = set.drain().collect();
+        assert_eq!(drained, expected);
+        assert!(set.is_empty());
+        assert_eq!(set.insert_full(QueryEdge::input(key(5))), (0, true));
     }
 }

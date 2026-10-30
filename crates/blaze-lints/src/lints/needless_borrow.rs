@@ -32,7 +32,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
         return;
     }
     let Some(sub) = borrow.expr() else { return };
-    if !cx.is_written(sub.syntax()) || is_ref_op(strip_parens(sub)) {
+    if !cx.is_written(sub.syntax()) || is_ref_op(sub.peel_parens()) {
         return;
     }
     // The node the borrow is used at, past the parentheses around it.
@@ -71,7 +71,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
         return;
     }
     // `&*p` of a raw pointer stays, as rustc's `dangerous_implicit_autorefs` wants it.
-    if let ast::Expr::PrefixExpr(prefix) = strip_parens(sub)
+    if let ast::Expr::PrefixExpr(prefix) = sub.peel_parens()
         && prefix.op_kind() == Some(ast::UnaryOp::Deref)
         && prefix.expr().and_then(|it| cx.adjusted_ty(it)).is_some_and(|it| it.is_raw_ptr())
     {
@@ -185,16 +185,6 @@ fn is_ref_op(expr: ast::Expr<'_>) -> bool {
     }
 }
 
-fn strip_parens(expr: ast::Expr<'_>) -> ast::Expr<'_> {
-    let mut expr = expr;
-    while let ast::Expr::ParenExpr(paren) = expr
-        && let Some(inner) = paren.expr()
-    {
-        expr = inner;
-    }
-    expr
-}
-
 /// clippy's `check_pat` and `check_local_usage`: `ref x` where `x` is bound to a `&&T`, used
 /// only where the compiler dereferences it twice, as a field's base or dereferenced.
 pub(super) fn check_ref_pat<'t>(cx: &mut Cx<'_, 't>, pat: ast::IdentPat<'t>) {
@@ -293,20 +283,7 @@ fn parent_expr(node: ast::Node<'_>) -> Option<ast::Expr<'_>> {
 /// Whether rustc's `ExprPrecedence` of `expr` is `Unambiguous`: an operand needs no
 /// parentheses around it.
 fn unambiguous(expr: ast::Expr<'_>) -> bool {
-    !matches!(
-        expr,
-        ast::Expr::BinExpr(_)
-            | ast::Expr::CastExpr(_)
-            | ast::Expr::PrefixExpr(_)
-            | ast::Expr::RefExpr(_)
-            | ast::Expr::ReturnExpr(_)
-            | ast::Expr::BreakExpr(_)
-            | ast::Expr::ContinueExpr(_)
-            | ast::Expr::YieldExpr(_)
-            | ast::Expr::BecomeExpr(_)
-            | ast::Expr::ClosureExpr(_)
-            | ast::Expr::LetExpr(_)
-    )
+    expr.precedence() >= ast::prec::ExprPrecedence::Postfix
 }
 
 fn past_parens(node: ast::Node<'_>) -> ast::Node<'_> {

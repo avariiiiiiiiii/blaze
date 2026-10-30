@@ -3,6 +3,7 @@
 //! Test that a `tracked` fn on a `salsa::input`
 //! compiles and executes successfully.
 #![allow(warnings)]
+#![forbid(unsafe_code)]
 
 #[salsa::input]
 struct MyInput {

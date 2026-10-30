@@ -265,6 +265,7 @@ where
             item.1 = u64::from(join(shard, it.get_or_insert(item.1, keys[item.0 as usize])));
         }
     });
+    drop(parts);
     let base = out.len();
     out.resize(base + keys.len(), wrap(0));
     for (at, it) in &hashed {

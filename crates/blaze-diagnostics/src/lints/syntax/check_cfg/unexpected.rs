@@ -24,7 +24,7 @@ use hir::{HirFileId, InFile, MacroCallId};
 use hir_expand::{MacroCallKind, MacroDefKind, builtin::BuiltinFnLikeExpander};
 use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     Edition, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange,
     view::{self as ast, AstNode as _, AstToken as _, HasLoopBody as _},
@@ -36,7 +36,6 @@ use super::{
 };
 use crate::{
     cx::{Cx, derive_paths_view},
-    lints::edit_distance::find_best_match_for_name,
     lower::Phase,
     model::{Applicability, Diag, MultiSpan, Span, Sublevel},
 };
@@ -468,7 +467,7 @@ impl<'db> Lints<'_, '_, 'db> {
                 boolean.to_string(),
                 Applicability::MachineApplicable,
             );
-        } else if let Some(best) = find_best_match_for_name(&expected.names, name, None) {
+        } else if let Some(best) = find_best_match_for_name(&expected.names, name, None).copied() {
             is_feature |= best == "feature";
             let shown = meta::shown(best, edition);
             let maybe = Applicability::MaybeIncorrect;
@@ -647,7 +646,7 @@ impl<'db> Lints<'_, '_, 'db> {
             diag.note(format!("expected values for `{name}` are: {none}{}{more}", listed(&sorted, |it| it)));
             match &value {
                 Some((value, value_span)) => {
-                    if let Some(best) = find_best_match_for_name(&possibilities, value, None) {
+                    if let Some(best) = find_best_match_for_name(&possibilities, value, None).copied() {
                         diag.suggestion(
                             // clone: the diagnostic's span
                             value_span.clone(),
@@ -958,17 +957,9 @@ fn atom_check(atom: ast::CfgAtom<'_>, prefix: Option<&str>) -> Option<Check> {
     };
     let range = atom.syntax().text_range();
     Some(match prefix {
-        Some(prefix) => Check { name: prefixed(prefix, name), raw, name_range: range, value, range },
+        Some(prefix) => Check { name: Symbol::intern_concat(&[prefix, name]), raw, name_range: range, value, range },
         None => Check { name: Symbol::intern(name), raw, name_range: ident.text_range(), value, range },
     })
-}
-
-/// `prefix` then `name`, interned: joined on the stack for a name of up to 64 bytes.
-fn prefixed(prefix: &str, name: &str) -> Symbol {
-    let mut text: SmallVec<[u8; 64]> = SmallVec::new();
-    text.extend_from_slice(prefix.as_bytes());
-    text.extend_from_slice(name.as_bytes());
-    Symbol::intern(std::str::from_utf8(&text).expect("two names joined"))
 }
 
 /// rustc's `parse_cfg_entry` of a predicate it parsed from tokens (`cfg_select!`'s).
@@ -991,7 +982,7 @@ fn meta_checks(inner: &meta::Inner<'_>, out: &mut Vec<Check>) {
                     }
                     let Some(value) = lit.value_str() else { continue };
                     out.push(Check {
-                        name: prefixed("target_", ident.name),
+                        name: Symbol::intern_concat(&["target_", ident.name]),
                         raw: ident.raw,
                         name_range: sub.range(),
                         value: Some((Symbol::intern(&value), lit.range)),

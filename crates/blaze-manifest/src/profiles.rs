@@ -1,5 +1,5 @@
 //! Profiles as the pinned nightly's cargo computes them (`src/workspace/profiles.rs` and
-//! `validate_profile` in its manifest parser), its `-Z` flags not read: the root manifest's `[profile]` tables with the
+//! `validate_profile` in its manifest parser): the root manifest's `[profile]` tables with the
 //! configuration's merged over them, the built-in ones, `inherits` chains, and the `Profile` of
 //! a unit from its package, whether it is built for the host and its target, serialized as
 //! `cargo build --unit-graph` prints it.
@@ -17,7 +17,7 @@ use cargo_util_schemas::manifest::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
-use crate::config::{CompileKind, Config};
+use crate::config::{CliUnstable, CompileKind, Config};
 use crate::files::Files;
 use crate::features::{Feature, Features};
 use crate::manifest::PackageId;
@@ -760,7 +760,7 @@ fn get_config_profile<F: Files>(
 ) -> anyhow::Result<Option<TomlProfile>> {
     let Some(profile) = config.config_profile(name)? else { return Ok(None) };
     let mut warnings = Vec::new();
-    validate_profile(&profile.val, name, features, &mut warnings).with_context(|| {
+    validate_profile(&profile.val, name, features, config.unstable(), &mut warnings).with_context(|| {
         format!("config profile `{name}` is not valid (defined in `{}`)", profile.definition)
     })?;
     for warning in warnings {
@@ -842,33 +842,36 @@ fn validate_packages_unmatched(
 pub fn validate_profiles(
     profiles: &TomlProfiles,
     features: &Features,
+    unstable: &CliUnstable,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     for (name, profile) in profiles.get_all() {
-        validate_profile(profile, name, features, warnings)?;
+        validate_profile(profile, name, features, unstable, warnings)?;
     }
     Ok(())
 }
 
 /// A profile checked as nightly cargo's `validate_profile` does, the unstable keys
 /// (`codegen-backend`, `rustflags`, `panic = "immediate-abort"`) refused unless the manifest's
-/// `cargo-features` list them. cargo also takes the matching `-Z` flag (`-Zprofile-rustflags`,
-/// or `[unstable]` in the configuration) in place of the manifest's; blaze does not read those.
+/// `cargo-features` list them. For `codegen-backend` cargo also takes `-Zcodegen-backend` (or
+/// `codegen-backend = true` under `[unstable]`) in place of the manifest's, and so does blaze; the
+/// other two `-Z` flags (`-Zprofile-rustflags`, `-Zpanic-immediate-abort`) it does not read yet.
 pub fn validate_profile(
     root: &TomlProfile,
     name: &str,
     features: &Features,
+    unstable: &CliUnstable,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<()> {
-    validate_profile_layer(root, features)?;
+    validate_profile_layer(root, features, unstable)?;
     if let Some(profile) = &root.build_override {
         validate_profile_override(profile, "build-override")?;
-        validate_profile_layer(profile, features)?;
+        validate_profile_layer(profile, features, unstable)?;
     }
     if let Some(packages) = &root.package {
         for profile in packages.values() {
             validate_profile_override(profile, "package")?;
-            validate_profile_layer(profile, features)?;
+            validate_profile_layer(profile, features, unstable)?;
         }
     }
     if let Some(dir_name) = &root.dir_name {
@@ -906,8 +909,12 @@ pub fn validate_profile(
     Ok(())
 }
 
-fn validate_profile_layer(profile: &TomlProfile, features: &Features) -> anyhow::Result<()> {
-    if profile.codegen_backend.is_some() {
+fn validate_profile_layer(
+    profile: &TomlProfile,
+    features: &Features,
+    unstable: &CliUnstable,
+) -> anyhow::Result<()> {
+    if profile.codegen_backend.is_some() && !unstable.codegen_backend {
         features.require(Feature::codegen_backend)?;
     }
     if profile.rustflags.is_some() {

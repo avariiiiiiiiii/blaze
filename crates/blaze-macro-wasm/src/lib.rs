@@ -47,7 +47,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, LazyLock, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::Ordering,
     },
     thread::ThreadId,
     time::{Duration, Instant},
@@ -58,10 +58,12 @@ use blaze_core::Traced;
 use blaze_expand::{
     Mode, Put,
     bridge::{
-        lex, spans,
+        lex,
+        spans::{self, range, spanned},
         wire::{self, NONE, Part, Parts, Tree},
     },
     tally::{Mine, Tally},
+    verdict::{STATEFUL, STATELESS, Seen, Verdict},
 };
 use blaze_ids::{ContentId, Hasher, Idx, Interner, Sharded};
 use blaze_usercode::{
@@ -79,13 +81,11 @@ use load_cargo::{SubRequest, SubResponse};
 use paths::AbsPath;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use span::{
-    EditionedFileId, ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor,
-    SyntaxContext, TextRange, TextSize,
-};
+use span::{FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor, SyntaxContext, TextRange};
 use wasmtime::{
-    Caller, Config, Engine, Extern, Instance, InstancePre, Linker, Memory, Module, Store,
-    StoreLimits, StoreLimitsBuilder, TypedFunc,
+    Caller, Config, Enabled, Engine, Extern, Instance, InstanceAllocationStrategy, InstancePre,
+    Linker, Memory, Module, ModuleExport, PoolingAllocationConfig, Store, StoreLimits,
+    StoreLimitsBuilder, TypedFunc,
 };
 
 #[cfg(test)]
@@ -124,9 +124,39 @@ const HOST_VERSION: &str = "blaze v2 wasm proc-macro host 2";
 /// The most memory one instance may have.
 const MEMORY: usize = 4 << 30;
 
+/// Where a module's instances come from. A fresh instance (an expansion of a module that keeps
+/// no state, or a run of its list) lives for one call, so it takes a slot of a pool: the slot's
+/// memory stays mapped between instances, and on Linux its pages stay resident and are reset
+/// in place, so an instance costs no `mmap`, no `munmap` and no page fault on what the last
+/// one touched. A session lives as long as its crate's revision, and a build can hold more of
+/// them than any pool has slots, so its instance is made on demand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Fresh = 0,
+    Session = 1,
+}
+
+impl Kind {
+    /// The kind the instances of a module of `verdict` are.
+    fn of(verdict: Verdict) -> Kind {
+        match verdict {
+            Verdict::Stateless => Kind::Fresh,
+            Verdict::Unseen | Verdict::Stateful => Kind::Session,
+        }
+    }
+}
+
+/// The engine sessions and tests use.
 fn engine() -> &'static Engine {
-    static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| {
+    engine_of(Kind::Session)
+}
+
+/// The engine of `kind`'s instances. The two differ only in how they allocate instances, which
+/// is not in what machine code must match to load (`Engine::precompile_compatibility_hash`), so
+/// a module's code in the store serves both.
+fn engine_of(kind: Kind) -> &'static Engine {
+    static ENGINES: [OnceLock<Engine>; 2] = [OnceLock::new(), OnceLock::new()];
+    ENGINES[kind as usize].get_or_init(|| {
         let mut config = Config::new();
         config.cranelift_nan_canonicalization(true);
         config.parallel_compilation(true);
@@ -140,8 +170,81 @@ fn engine() -> &'static Engine {
             // compiled with it, or (the return-address signing) what the host's ABI needs.
             unsafe { config.cranelift_flag_enable(flag) };
         }
+        if kind == Kind::Fresh {
+            config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool()));
+        }
         Engine::new(&config).expect("Wasmtime's configuration for proc macros")
     })
+}
+
+/// How many fresh instances may be live at once: each slot reserves its memory's 4 GiB and
+/// guard of address space, untouched until used, so about 4 TiB in all.
+const SLOTS: u32 = 1000;
+
+/// The most elements a fresh instance's table may have: a module's table holds each function
+/// whose address it takes, a few thousand for one built on syn.
+const TABLE_ELEMENTS: usize = 1 << 17;
+
+/// The most an instance's own metadata may take, which grows with its functions and imports.
+const INSTANCE_SIZE: usize = 8 << 20;
+
+/// What of a slot's memory stays resident between instances, reset in place: about what one
+/// expansion of a macro built on syn touches.
+const KEEP_RESIDENT: usize = 1 << 20;
+
+fn pool() -> PoolingAllocationConfig {
+    let mut pool = PoolingAllocationConfig::new();
+    pool.total_core_instances(SLOTS)
+        .total_memories(SLOTS)
+        .total_tables(2 * SLOTS)
+        .max_memories_per_module(1)
+        .max_tables_per_module(2)
+        .max_memory_size(MEMORY)
+        .table_elements(TABLE_ELEMENTS)
+        .max_core_instance_size(INSTANCE_SIZE)
+        .linear_memory_keep_resident(KEEP_RESIDENT)
+        .table_keep_resident(64 << 10)
+        // Linux 6.7's `PAGEMAP_SCAN` finds the pages an instance touched, so only those are
+        // reset; elsewhere the resident bytes are reset whole.
+        .pagemap_scan(Enabled::Auto);
+    pool
+}
+
+/// The pool's slots, counted here so that a thread that finds none free waits for one to be
+/// given back rather than Wasmtime refusing the instance: whether an expansion runs never
+/// depends on how many others run at once. The lock is held only to count.
+struct Slots {
+    free: Mutex<u32>,
+    given: Condvar,
+}
+
+static FREE: Slots = Slots { free: Mutex::new(SLOTS), given: Condvar::new() };
+
+/// A slot of the pool, taken for one fresh instance and given back when dropped, which its
+/// holder does after the instance's store.
+struct Slot(());
+
+impl Slot {
+    fn take() -> Slot {
+        let mut free = FREE.free.lock().unwrap_or_else(|it| it.into_inner());
+        while *free == 0 {
+            free = FREE.given.wait(free).unwrap_or_else(|it| it.into_inner());
+        }
+        *free -= 1;
+        Slot(())
+    }
+
+    /// A slot when `kind`'s instances take one.
+    fn for_kind(kind: Kind) -> Option<Slot> {
+        (kind == Kind::Fresh).then(Slot::take)
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        *FREE.free.lock().unwrap_or_else(|it| it.into_inner()) += 1;
+        FREE.given.notify_one();
+    }
 }
 
 /// The CPU features machine code is compiled for, the same on every host of an arch: on
@@ -174,7 +277,10 @@ pub(crate) struct State {
     sites: [u64; 3],
     files: wasi::Files,
     /// The module's environment, sorted by name ([`guest_env`]).
-    env: Vec<(OsString, OsString)>,
+    environ: Environ,
+    /// The instance's memory, found once it is made, before any of its code runs: a host
+    /// function reads it with no lookup by name.
+    memory: Option<Memory>,
     /// What a function that gives text or a stream back put there, for the module's `take`.
     buffer: Vec<u8>,
     /// What the module gave as its output, once [`State::gave`] says it did.
@@ -202,8 +308,8 @@ impl State {
             parts: Parts::default(),
             sites: [NONE; 3],
             files: wasi::Files::new(None),
-            // alloc: none, an empty list until the instance runs.
-            env: Vec::new(),
+            environ: Environ::default(),
+            memory: None,
             // alloc: none, an empty list until the instance runs.
             buffer: Vec::new(),
             // alloc: none, an empty list until the instance runs.
@@ -418,11 +524,44 @@ impl Value {
     }
 }
 
-fn memory(caller: &mut Caller<'_, State>) -> wasmtime::Result<Memory> {
-    match caller.get_export("memory") {
-        Some(Extern::Memory(memory)) => Ok(memory),
-        _ => Err(wasmtime::Error::msg("the module exports no memory")),
+/// The module's environment as WASI's `environ_get` hands it over: each variable `NAME=value`
+/// and a NUL, one after another, and where each starts. A copy and a table of pointers give it.
+#[derive(Default)]
+pub(crate) struct Environ {
+    pub(crate) text: Vec<u8>,
+    /// Where each variable starts in `text`: cargo sets fewer than this holds in place.
+    pub(crate) starts: SmallVec<[u32; 24]>,
+}
+
+impl Environ {
+    fn of(env: &[(&str, &str)]) -> Environ {
+        let len = env.iter().map(|(name, value)| name.len() + value.len() + 2).sum();
+        // alloc: setup, once an instance: the environment WASI hands the module, one buffer.
+        let mut text = Vec::with_capacity(len);
+        let mut starts = SmallVec::new();
+        for (name, value) in env {
+            starts.push(text.len() as u32);
+            text.extend_from_slice(name.as_bytes());
+            text.push(b'=');
+            text.extend_from_slice(value.as_bytes());
+            text.push(0);
+        }
+        Environ { text, starts }
     }
+}
+
+/// The memory of the instance `caller` runs in ([`State::memory`]).
+pub(crate) fn memory(caller: &mut Caller<'_, State>) -> wasmtime::Result<Memory> {
+    caller.data().memory.ok_or_else(|| wasmtime::Error::msg("the module exports no memory"))
+}
+
+/// The memory `instance` exports, which [`State::memory`] keeps.
+fn exported_memory(
+    instance: &Instance,
+    store: &mut Store<State>,
+    at: Option<&ModuleExport>,
+) -> Option<Memory> {
+    instance.get_module_export(&mut *store, at?)?.into_memory()
 }
 
 /// What a module that parses text outside an expansion (in a static's initializer or its list
@@ -454,22 +593,6 @@ fn guest_slice(data: &[u8], ptr: u32, len: u32) -> wasmtime::Result<&[u8]> {
 fn guest_text(bytes: &[u8]) -> Cow<'_, str> {
     // alloc: none for UTF-8, which every `&str` a module passes is: the text is lent.
     String::from_utf8_lossy(bytes)
-}
-
-fn range(start: u32, end: u32) -> TextRange {
-    TextRange::new(TextSize::new(start), TextSize::new(end.max(start)))
-}
-
-fn spanned(file_id: u32, ast_id: u32, start: u32, end: u32, ctx: u32) -> Span {
-    let anchor = SpanAnchor {
-        file_id: EditionedFileId::from_raw(file_id),
-        ast_id: ErasedFileAstId::from_raw(ast_id),
-    };
-    // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts: every
-    // caller passes a `ctx` that `load_cargo::answer` read from the running expansion's database
-    // in this process. Memory safety doesn't rest on it: a wrong value panics in `from_u32` or
-    // in salsa's checked lookup, or names another context's hygiene.
-    Span { range: range(start, end), anchor, ctx: unsafe { SyntaxContext::from_u32(ctx) } }
 }
 
 fn line_column(state: &mut State, span: Span) -> Option<(u32, u32)> {
@@ -739,7 +862,10 @@ pub struct Wasm {
     digest: [u8; 32],
     /// Source identity recorded with the module listing.
     identity: [u8; 32],
+    /// Which engine it is compiled for, so what its instances are.
+    kind: Kind,
     pre: InstancePre<State>,
+    exports: Exports,
     /// How long Cranelift took to compile it.
     pub compiled_in: Duration,
     /// Whether the store has its machine code.
@@ -749,6 +875,27 @@ pub struct Wasm {
 impl fmt::Debug for Wasm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Wasm").field("path", &self.path).finish_non_exhaustive()
+    }
+}
+
+/// Where the exports an instance is used by are in its module, each looked up by name once a
+/// module rather than once an instance.
+#[derive(Clone, Copy)]
+struct Exports {
+    memory: Option<ModuleExport>,
+    initialize: Option<ModuleExport>,
+    alloc: Option<ModuleExport>,
+    expand: Option<ModuleExport>,
+}
+
+impl Exports {
+    fn of(module: &Module) -> Exports {
+        Exports {
+            memory: module.get_export_index("memory"),
+            initialize: module.get_export_index("_initialize"),
+            alloc: module.get_export_index(exports::ALLOC),
+            expand: module.get_export_index(exports::EXPAND),
+        }
     }
 }
 
@@ -784,30 +931,40 @@ impl Wasm {
     /// under [`code_key`], which says the host it is for: unlike the module, the code is for
     /// one kind of host.
     pub fn at(path: &Path, store: Option<&blaze_store::Store>) -> Result<&'static Wasm, String> {
+        Wasm::at_kind(path, store, Kind::Session)
+    }
+
+    /// As [`Wasm::at`], for instances of `kind`.
+    fn at_kind(
+        path: &Path,
+        store: Option<&blaze_store::Store>,
+        kind: Kind,
+    ) -> Result<&'static Wasm, String> {
         // alloc: setup, once a module: its bytes, or the message of a file that can't be read.
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let known = Known { digest: keyed::sha256(&bytes), identity: None };
-        Wasm::known(path, known, Some(&bytes), store)
+        Wasm::known(path, known, Some(&bytes), store, kind)
     }
 
-    /// As [`Wasm::at`], of a module whose digest is known: its bytes are read only if its
-    /// machine code is not in the store. Found by its digest with no lock, no write and no
-    /// allocation once compiled; a module is kept for the process, as the expanders it gives
-    /// rust-analyzer are.
+    /// As [`Wasm::at`], of a module whose digest is known, for instances of `kind`: its bytes
+    /// are read only if its machine code is not in the store. Found by its digest with no lock,
+    /// no write and no allocation once compiled; a module is kept for the process, as the
+    /// expanders it gives rust-analyzer are.
     fn known(
         path: &Path,
         known: Known,
         bytes: Option<&[u8]>,
         store: Option<&blaze_store::Store>,
+        kind: Kind,
     ) -> Result<&'static Wasm, String> {
         // A module being compiled (`prepare_soon`) is waited for, not compiled again.
-        static COMPILED: LazyLock<Sharded<OnceLock<Result<Wasm, String>>>> =
-            LazyLock::new(Sharded::new);
-        let compiled: &'static Sharded<_> = &COMPILED;
+        static COMPILED: LazyLock<[Sharded<OnceLock<Result<Wasm, String>>>; 2]> =
+            LazyLock::new(|| [Sharded::new(), Sharded::new()]);
+        let compiled: &'static Sharded<_> = &COMPILED[kind as usize];
         // The digest is a SHA-256, which spreads over the shards as a content ID does.
         let at = compiled.intern(ContentId(known.digest), OnceLock::new);
         let once = compiled.get(at);
-        let wasm = once.get_or_init(|| Wasm::compile(path, known, bytes, store));
+        let wasm = once.get_or_init(|| Wasm::compile(path, known, bytes, store, kind));
         let wasm = wasm.as_ref().map_err(Clone::clone)?;
         wasm.keep_code(store);
         Ok(wasm)
@@ -818,13 +975,15 @@ impl Wasm {
         Known { digest, identity }: Known,
         given: Option<&[u8]>,
         store: Option<&blaze_store::Store>,
+        kind: Kind,
     ) -> Result<Wasm, String> {
         let start = Instant::now();
         // alloc: the message of a module that can't be compiled.
         let failed = |e: wasmtime::Error| format!("{}: {e:#}", path.display());
         let read = std::cell::OnceCell::new();
         let bytes = || module_bytes(path, &digest, given, &read);
-        let key = code_key(&digest);
+        let engine = engine_of(kind);
+        let key = code_key(&digest, engine);
         let stats = std::env::var_os("BLAZE_STATS").is_some();
         // Machine code is loaded only from the store, which checks what it gives against its
         // checksum: a file anyone can write is never run as code.
@@ -833,7 +992,7 @@ impl Wasm {
             // as it was read, and only `serialize` of this module on an engine of
             // `code_key`'s compatibility hash puts under `key`; Wasmtime refuses code of
             // another version, configuration or CPU. Other bytes would run as machine code.
-            unsafe { Module::deserialize(engine(), &code) }.map_err(|e| {
+            unsafe { Module::deserialize(engine, &code) }.map_err(|e| {
                 // alloc: the message of machine code refused.
                 format!(
                     "{}: the store's machine code of it, under a key of this engine's \
@@ -846,7 +1005,7 @@ impl Wasm {
         let (module, was_kept) = match kept {
             Some(module) => (module, true),
             None => {
-                let module = Module::new(engine(), bytes()?).map_err(failed)?;
+                let module = Module::new(engine, bytes()?).map_err(failed)?;
                 if stats {
                     eprintln!(
                         "blaze: Cranelift compiled the proc-macro module {} in {:.1?}",
@@ -863,6 +1022,7 @@ impl Wasm {
             }
         };
         let pre = linked(&module).map_err(failed)?;
+        let exports = Exports::of(&module);
         let identity = match identity {
             Some(identity) => identity,
             None => made_of(path, bytes()?).unwrap_or(digest),
@@ -870,7 +1030,8 @@ impl Wasm {
         let compiled_in = start.elapsed();
         let kept = was_kept.into();
         // alloc: setup, once a module: its path, for what it says of itself.
-        let wasm = Wasm { path: path.to_owned(), digest, identity, pre, compiled_in, kept };
+        let path = path.to_owned();
+        let wasm = Wasm { path, digest, identity, kind, pre, exports, compiled_in, kept };
         wasm.keep_code(store);
         count(Counted::Loaded, start.elapsed());
         Ok(wasm)
@@ -880,11 +1041,14 @@ impl Wasm {
     /// told the store the toolchain is kept once it has.
     fn keep_code(&self, store: Option<&blaze_store::Store>) {
         let Some(store) = store else { return };
-        if self.kept.swap(true, Ordering::Relaxed) {
+        // A plain load first: every lookup of a module passes here, and a swap would write
+        // the shared line each time.
+        if self.kept.load(Ordering::Relaxed) || self.kept.swap(true, Ordering::Relaxed) {
             return;
         }
-        if let Ok(code) = self.pre.module().serialize() {
-            store.insert_lasting(&code_key(&self.digest), &code);
+        let module = self.pre.module();
+        if let Ok(code) = module.serialize() {
+            store.insert_lasting(&code_key(&self.digest, module.engine()), &code);
             store.flush();
             if std::env::var_os("BLAZE_STATS").is_some() {
                 eprintln!("blaze: the store keeps the machine code of {}", self.path.display());
@@ -896,7 +1060,11 @@ impl Wasm {
     /// started by its `_initialize`.
     fn instance(&self, store: &mut Store<State>) -> wasmtime::Result<Instance> {
         let instance = self.pre.instantiate(&mut *store)?;
-        if let Ok(initialize) = instance.get_typed_func::<(), ()>(&mut *store, "_initialize") {
+        store.data_mut().memory = exported_memory(&instance, store, self.exports.memory.as_ref());
+        let initialize =
+            self.exports.initialize.and_then(|at| instance.get_module_export(&mut *store, &at));
+        let initialize = initialize.and_then(Extern::into_func).map(|it| it.typed::<(), ()>(&*store));
+        if let Some(Ok(initialize)) = initialize {
             initialize.call(&mut *store, ())?;
         }
         Ok(instance)
@@ -911,7 +1079,9 @@ impl Wasm {
     fn list(&self) -> Result<String, String> {
         // alloc: the message of a module whose list can't be had.
         let failed = |e: wasmtime::Error| format!("{e:#}");
-        let mut store = Store::new(engine(), State::empty());
+        // Given back after the store, which is dropped first.
+        let _slot = Slot::for_kind(self.kind);
+        let mut store = Store::new(self.pre.module().engine(), State::empty());
         store.limiter(|state| &mut state.limits);
         let instance = self.instance(&mut store).map_err(failed)?;
         let list = instance.get_typed_func::<(), ()>(&mut store, exports::LIST).map_err(failed)?;
@@ -950,8 +1120,11 @@ pub struct Session {
     instance: Instance,
     root: Option<PathBuf>,
     failed: bool,
-    /// The exports an expansion calls, found at the first.
+    /// The exports an expansion calls, found as the instance is made.
     calls: Option<Calls>,
+    /// The pool's slot a fresh instance is in, given back after `store` is dropped: fields
+    /// drop in the order they are declared.
+    _slot: Option<Slot>,
 }
 
 /// The module's exports an expansion calls.
@@ -973,6 +1146,18 @@ impl Calls {
         })?;
         Ok(Calls { alloc, expand, memory })
     }
+
+    /// The calls of `instance`, found where `exports` says they are with no lookup by name:
+    /// `None` when one is missing, which [`Calls::of`] then names.
+    fn known(instance: &Instance, store: &mut Store<State>, exports: &Exports) -> Option<Calls> {
+        let mut func = |at: Option<ModuleExport>| {
+            instance.get_module_export(&mut *store, &at?).and_then(Extern::into_func)
+        };
+        let (alloc, expand) = (func(exports.alloc)?, func(exports.expand)?);
+        let alloc: TypedFunc<u32, u32> = alloc.typed(&*store).ok()?;
+        let expand: TypedFunc<(u32, u32, u32, u32, u32), ()> = expand.typed(&*store).ok()?;
+        Some(Calls { alloc, expand, memory: store.data().memory? })
+    }
 }
 
 impl Wasm {
@@ -980,24 +1165,28 @@ impl Wasm {
         let (vars, root) = guest_env(env);
         let mut state = State::empty();
         state.files = wasi::Files::new(root);
-        state.env = owned_env(&vars);
+        state.environ = Environ::of(&vars);
         // alloc: setup, once a session: where its outputs name the package.
         self.instance_with(state, root.map(Path::to_path_buf))
     }
 
-    /// A fresh instance whose host side starts as `state`.
+    /// A fresh instance whose host side starts as `state`, in a slot of the pool when this
+    /// module's instances take one ([`Kind`]).
     fn instance_with(
         &self,
         state: State,
         root: Option<PathBuf>,
     ) -> Result<Session, ProcMacroExpansionError> {
-        let mut store = Store::new(engine(), state);
+        // Declared before the store, so dropped after it when the instance can't start.
+        let slot = Slot::for_kind(self.kind);
+        let mut store = Store::new(self.pre.module().engine(), state);
         store.limiter(|state| &mut state.limits);
         let instance = self
             .instance(&mut store)
             // alloc: the message of a module that can't be started.
             .map_err(|e| ProcMacroExpansionError::System(format!("{e:#}")))?;
-        Ok(Session { store, instance, root, failed: false, calls: None })
+        let calls = Calls::known(&instance, &mut store, &self.exports);
+        Ok(Session { store, instance, root, failed: false, calls, _slot: slot })
     }
 
     /// Expands the macro at `index` of [`Wasm::macros`] in a fresh instance: what is kept of
@@ -1141,8 +1330,8 @@ impl Session {
 /// and what Wasmtime says code must match to load (its version, its configuration, the
 /// target and the CPU features it compiled for, [`CPU_FEATURES`] rather than the host's),
 /// and nothing of the checkout, the build of blaze or the toolchain, so every checkout and
-/// every host of the same kind shares it.
-fn code_key(digest: &[u8; 32]) -> [u8; 32] {
+/// every host of the same kind shares it. `engine` is the one the code is for.
+fn code_key(digest: &[u8; 32], engine: &Engine) -> [u8; 32] {
     use std::hash::Hash as _;
     struct Fields<'a>(&'a mut keyed::Key);
     impl std::hash::Hasher for Fields<'_> {
@@ -1155,8 +1344,20 @@ fn code_key(digest: &[u8; 32]) -> [u8; 32] {
     }
     let mut key = keyed::Key::new("wasmtime machine code of a proc-macro module 2");
     key.field(digest).field(std::env::consts::ARCH.as_bytes());
-    engine().precompile_compatibility_hash().hash(&mut Fields(&mut key));
+    engine.precompile_compatibility_hash().hash(&mut Fields(&mut key));
     key.done()
+}
+
+/// The kind of the instances of the module of `digest` in this process, as a load decides it
+/// ([`Lazy::new`]): what readies it compiles it for the same engine, so the load waits for that
+/// compile rather than making another.
+fn kind_for(digest: &[u8; 32]) -> Kind {
+    Kind::of(verdict(digest))
+}
+
+/// Whether `store` has machine code of the module of `digest` for this process's engine.
+fn has_code(store: &blaze_store::Store, digest: &[u8; 32]) -> bool {
+    store.has_lasting(&code_key(digest, engine_of(kind_for(digest))))
 }
 
 /// Writes `bytes` to `path` whole or not at all: a process that reads it while it is written
@@ -1176,14 +1377,14 @@ fn write_whole(path: &Path, bytes: &[u8]) {
 pub fn prepare(path: &Path, store: Option<&blaze_store::Store>) -> Result<(), String> {
     let start = Instant::now();
     if let Some((known, _)) = listing(path)
-        && store.is_some_and(|it| it.has_lasting(&code_key(&known.digest)))
+        && store.is_some_and(|it| has_code(it, &known.digest))
     {
         return Ok(());
     }
     // alloc: setup, once a module: its bytes, or the message of a file that can't be read.
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let known = Known { digest: keyed::sha256(&bytes), identity: None };
-    let wasm = Wasm::known(path, known, Some(&bytes), store)?;
+    let wasm = Wasm::known(path, known, Some(&bytes), store, kind_for(&known.digest))?;
     list(path, wasm, &wasm.list()?);
     if std::env::var_os("BLAZE_STATS").is_some() {
         eprintln!(
@@ -1200,7 +1401,7 @@ pub fn prepare(path: &Path, store: Option<&blaze_store::Store>) -> Result<(), St
 /// expand in this process waits for the compile.
 pub fn prepare_soon(path: &Path, store: Option<&'static blaze_store::Store>) -> Result<(), String> {
     if let Some((known, _)) = listing(path)
-        && store.is_some_and(|it| it.has_lasting(&code_key(&known.digest)))
+        && store.is_some_and(|it| has_code(it, &known.digest))
     {
         return Ok(());
     }
@@ -1213,9 +1414,10 @@ pub fn prepare_soon(path: &Path, store: Option<&'static blaze_store::Store>) -> 
     // alloc: setup, once a module: its path, for the thread that compiles it.
     let path = path.to_owned();
     let known = Known { digest, identity: Some(identity) };
+    let kind = kind_for(&digest);
     std::thread::spawn(move || {
         let start = Instant::now();
-        let done = Wasm::known(&path, known, Some(&bytes), store);
+        let done = Wasm::known(&path, known, Some(&bytes), store, kind);
         if std::env::var_os("BLAZE_STATS").is_some() {
             // alloc: the edge: what the statistics print.
             let how = done.map_or_else(|e| format!("failed: {e}"), |_| "ready".to_owned());
@@ -1232,7 +1434,7 @@ pub fn prepare_soon(path: &Path, store: Option<&'static blaze_store::Store>) -> 
 /// `module` linked to the host: WASI preview 1, the proc-macro imports, and an error for each
 /// import it has that neither gives.
 fn linked(module: &Module) -> wasmtime::Result<InstancePre<State>> {
-    let mut linker = Linker::new(engine());
+    let mut linker = Linker::new(module.engine());
     wasi::add(&mut linker)?;
     add_host(&mut linker)?;
     wasi::rest(&mut linker, module)?;
@@ -1424,12 +1626,6 @@ fn guest_env(env: &Env) -> (GuestEnv<'_>, Option<&Path>) {
 /// Where a module's manifest is: [`wasi::PACKAGE`]'s `Cargo.toml`.
 const MANIFEST_PATH: &str = "/blaze/package/Cargo.toml";
 
-/// The environment a running module is given, of [`guest_env`]'s.
-fn owned_env(env: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
-    // alloc: setup, once an instance: the environment WASI hands the module, owned.
-    env.iter().map(|&(name, value)| (name.into(), value.into())).collect()
-}
-
 /// `tree` with the package's path where the module put [`wasi::PACKAGE`] in a string, as
 /// a path `include_str!` is to read: itself when no string has it.
 fn placed(tree: tt::TopSubtree, root: &Path) -> tt::TopSubtree {
@@ -1476,14 +1672,6 @@ struct Shapes {
     bytes: Vec<u8>,
 }
 
-fn position<T: PartialEq>(all: &mut Vec<T>, it: T) -> u32 {
-    let at = all.iter().position(|known| *known == it).unwrap_or_else(|| {
-        all.push(it);
-        all.len() - 1
-    });
-    at as u32
-}
-
 impl Shapes {
     #[cfg(test)]
     fn of(parts: &[Part], sites: [u64; 3]) -> Shapes {
@@ -1498,8 +1686,8 @@ impl Shapes {
         self.contexts.clear();
         self.bytes.clear();
         for &(anchor, ctx) in parts {
-            let anchor = position(&mut self.anchors, anchor);
-            let context = position(&mut self.contexts, ctx);
+            let anchor = blaze_expand::number(&mut self.anchors, anchor);
+            let context = blaze_expand::number(&mut self.contexts, ctx);
             for it in [anchor, context] {
                 self.bytes.extend_from_slice(&u32::to_le_bytes(it));
             }
@@ -1932,7 +2120,7 @@ fn expand<'a>(
         state.parts = std::mem::take(parts);
         state.sites = sites;
         state.files = wasi::Files::new(root);
-        state.env = owned_env(&env);
+        state.environ = Environ::of(&env);
         // Its output is placed by `restore`, not by the instance.
         let mut instance = wasm.instance_with(state, None)?;
         instance.run(index, db, &input, attr.as_deref())?;
@@ -1981,21 +2169,9 @@ fn expand<'a>(
     Ran { output, found: false, retained, took: start.elapsed() }
 }
 
-/// What blaze has seen of a module's expansions, kept in the store under the module's digest
-/// ([`verdict_key`]) for every process and machine that loads the same module.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Verdict {
-    /// None has run in any process that told the store.
-    Unseen,
-    /// Some ran, in a build, and none left what it allocated live.
-    Stateless,
-    /// One left what it allocated live, for a later one to find.
-    Stateful,
-}
-
-const STATELESS: &[u8] = b"stateless";
-const STATEFUL: &[u8] = b"stateful";
-
+/// The key a module's [`Verdict`] is kept under in the store, by the module's digest, for every
+/// process and machine that loads the same module. A stateful module is one an expansion of
+/// left what it allocated live, for a later one to find.
 fn verdict_key(digest: &[u8; 32]) -> [u8; 32] {
     let mut key = keyed::Key::new("whether a proc-macro module keeps state 1");
     key.field(digest);
@@ -2028,11 +2204,8 @@ struct Lazy {
     compiled: OnceLock<Result<&'static Wasm, String>>,
     /// What the store said of it when it was loaded, which decides for as long as it is:
     /// whether a macro needs a session is asked of the database's queries, which must not
-    /// see it change.
-    verdict: Verdict,
-    /// Whether one of its expansions ran in this process, and whether one left state.
-    ran: AtomicBool,
-    retained: AtomicBool,
+    /// see it change. And what its expansions in this process did since.
+    seen: Seen,
     /// Each crate's seat in each database, found with no lock by the hash of the two
     /// ([`seat_id`]): crates expand the library at once, and a crate's expansions take turns.
     seats: Sharded<Seat>,
@@ -2137,9 +2310,7 @@ impl Lazy {
             path: path.to_owned(),
             known,
             compiled: OnceLock::new(),
-            verdict: verdict(&known.digest),
-            ran: AtomicBool::new(false),
-            retained: AtomicBool::new(false),
+            seen: Seen::new(verdict(&known.digest)),
             seats: Sharded::new(),
             // alloc: none, an empty list until a crate expands in a session.
             made: Mutex::new(Vec::new()),
@@ -2201,8 +2372,9 @@ impl Lazy {
     }
 
     fn get(&self) -> Result<&'static Wasm, String> {
-        let compiled =
-            self.compiled.get_or_init(|| Wasm::known(&self.path, self.known, None, store()));
+        let compiled = self.compiled.get_or_init(|| {
+            Wasm::known(&self.path, self.known, None, store(), self.kind())
+        });
         let wasm = *compiled.as_ref().map_err(Clone::clone)?;
         wasm.keep_code(store());
         Ok(wasm)
@@ -2211,7 +2383,12 @@ impl Lazy {
     /// Whether its macros expand in a session: unless the store says none of its expansions
     /// left state.
     fn stateful(&self) -> bool {
-        self.verdict != Verdict::Stateless
+        self.seen.verdict() != Verdict::Stateless
+    }
+
+    /// What its instances are: fresh ones, pooled, unless its macros expand in a session.
+    fn kind(&self) -> Kind {
+        Kind::of(self.seen.verdict())
     }
 
     /// Notes what an expansion that ran did. One that left state is told the store at once;
@@ -2220,18 +2397,12 @@ impl Lazy {
         if ran.found || ran.output.is_err() {
             return;
         }
-        if !ran.retained {
-            self.ran.store(true, Ordering::Relaxed);
-            return;
-        }
-        if self.retained.swap(true, Ordering::Relaxed) || self.verdict == Verdict::Stateful {
-            return;
-        }
+        let Some(contradicted) = self.seen.saw(ran.retained) else { return };
         if let Some(store) = store() {
             store.insert_lasting(&verdict_key(&self.known.digest), STATEFUL);
             store.flush();
         }
-        if !self.stateful() {
+        if contradicted {
             eprintln!(
                 "blaze: the proc macros of {} keep state between expansions, which the store \
                  said they did not: they expand in a session from the next load",
@@ -2332,11 +2503,7 @@ pub fn flush() {
     modules.retain(|it| it.strong_count() != 0);
     for lazy in modules.iter().filter_map(std::sync::Weak::upgrade) {
         // Another process that saw one leave state may have told the store since the load.
-        if lazy.verdict == Verdict::Unseen
-            && lazy.ran.swap(false, Ordering::Relaxed)
-            && !lazy.retained.load(Ordering::Relaxed)
-            && verdict(&lazy.known.digest) == Verdict::Unseen
-        {
+        if lazy.seen.flush() && verdict(&lazy.known.digest) == Verdict::Unseen {
             store.insert_lasting(&verdict_key(&lazy.known.digest), STATELESS);
             told = true;
         }
@@ -2450,12 +2617,21 @@ pub fn load(path: &AbsPath) -> ProcMacroLoadResult {
     let (lazy, text) = match listing(path) {
         Some((known, text)) => (Lazy::new(path, known), text),
         None => {
-            let wasm = Wasm::at(path, store()).map_err(failed)?;
+            // alloc: setup, once a module: its bytes, or the message of a file that can't be read.
+            let bytes = std::fs::read(path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
+            let digest = keyed::sha256(&bytes);
+            let known = Known { digest, identity: None };
+            let wasm = Wasm::known(path, known, Some(&bytes), store(), kind_for(&digest))
+                .map_err(failed)?;
             let text = wasm.list().map_err(failed)?;
             list(path, wasm, &text);
             let known = Known { digest: wasm.digest, identity: Some(wasm.identity) };
             let lazy = Lazy::new(path, known);
-            _ = lazy.compiled.set(Ok(wasm));
+            // The load's own verdict, so the kind it was compiled for, unless the store was
+            // told otherwise meanwhile: then `get` compiles for the other.
+            if lazy.kind() == wasm.kind {
+                _ = lazy.compiled.set(Ok(wasm));
+            }
             (lazy, text)
         }
     };
@@ -2481,6 +2657,7 @@ pub fn load(path: &AbsPath) -> ProcMacroLoadResult {
 #[cfg(test)]
 mod tests {
     use blaze_core::Untraceable;
+    use span::{EditionedFileId, ErasedFileAstId};
 
     use super::*;
 
@@ -2707,8 +2884,9 @@ mod tests {
         assert_eq!(known.digest, keyed::sha256(&module));
         // Waits for the compile `prepare_soon` started, which keeps the code in the store, under
         // a key of no path, and nowhere beside the module.
-        Wasm::known(&path, known, None, Some(store)).unwrap();
-        let key = code_key(&known.digest);
+        let kind = kind_for(&known.digest);
+        Wasm::known(&path, known, None, Some(store), kind).unwrap();
+        let key = code_key(&known.digest, engine_of(kind));
         assert!(store.has_lasting(&key));
         let beside: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -2798,7 +2976,7 @@ mod tests {
             .unwrap()
             .map(|it| it.unwrap().file_name())
             .collect();
-        files.listed("src", &names);
+        files.listed("src", names.iter().map(OsString::as_os_str));
         assert!(files.unreadable.is_none());
         files.take_traced()
     }
@@ -2901,8 +3079,8 @@ mod tests {
         let traced = Traced { untraceable: vec![Untraceable::Random], ..Traced::default() };
         assert!(index::untraceable(&traced));
         let (mut one, mut two) = ([0u8; 13], [0u8; 13]);
-        wasi::fill_random(&mut one);
-        wasi::fill_random(&mut two);
+        stdx::rand::fill(&mut one);
+        stdx::rand::fill(&mut two);
         assert_ne!(one, two);
     }
 
@@ -3007,7 +3185,7 @@ mod tests {
         let path = dir.join("echo.wasm");
         let known = Known { digest: wasm.digest, identity: None };
         let again = blaze_alloc_count::assert_at_most(0, "a compiled module found by its digest", || {
-            Wasm::known(&path, known, None, None)
+            Wasm::known(&path, known, None, None, wasm.kind)
         });
         assert!(std::ptr::eq(again.unwrap(), wasm), "the module compiled once");
         _ = std::fs::remove_dir_all(&dir);
@@ -3040,6 +3218,44 @@ mod tests {
         });
         assert!(ran.output.unwrap() == input);
         assert!(!ran.found && !ran.retained);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A module whose expansions keep no state runs each in a fresh instance in a slot of the
+    /// pool: it gives what a session gives, finds its calls by index, and gives its slot back.
+    /// Its machine code is the session engine's, under the same key.
+    #[test]
+    fn a_fresh_instance_in_the_pool_expands_as_a_session_does() {
+        let dir = scratch("pooled");
+        let session = echo(&dir);
+        let fresh = Wasm::at_kind(&dir.join("echo.wasm"), None, Kind::Fresh).unwrap();
+        assert_eq!((session.kind, fresh.kind), (Kind::Session, Kind::Fresh));
+        assert_eq!(
+            code_key(&fresh.digest, engine_of(Kind::Fresh)),
+            code_key(&session.digest, engine_of(Kind::Session)),
+            "one machine code serves both engines"
+        );
+        let env = Env::default();
+        let listed = echoed();
+        let input = tokens("a + (b, 1) \"s\"", span(4, 18)).unwrap();
+        let call = Call {
+            subtree: &input,
+            attrs: None,
+            env: &env,
+            def_site: span(0, 1),
+            call_site: span(1, 2),
+            mixed_site: span(2, 3),
+        };
+        let mut kept = session.session(&env).unwrap();
+        assert!(kept.calls.is_some(), "a session's calls are found by index");
+        let want = kept.expand(0, &listed, None, &call).output.unwrap();
+        for _ in 0..3 {
+            let mut one = fresh.session(&env).unwrap();
+            assert!(one.calls.is_some(), "a fresh instance's calls are found by index");
+            let out = one.expand(0, &listed, None, &call).output.unwrap();
+            assert!(out == want, "{out} of a fresh instance, {want} of a session");
+        }
+        assert_eq!(*FREE.free.lock().unwrap(), SLOTS, "every slot is given back");
         _ = std::fs::remove_dir_all(&dir);
     }
 

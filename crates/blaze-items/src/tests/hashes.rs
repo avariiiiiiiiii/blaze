@@ -4,7 +4,11 @@ use hir_def::{AdtId, DefWithBodyId, expr_store::Body, hir::Expr};
 use hir_ty::db::{InternedClosure, InternedClosureId};
 
 use super::{TestDB, edit, item, single};
-use crate::{ItemHashes, ItemId, Resolved, hashes, item_key, key, layout_hash, resolve};
+use crate::{
+    ItemHashes, ItemId, Resolved,
+    hash::{self, Graph, Members},
+    hashes, item_key, key, layout_hash, resolve,
+};
 
 fn of(db: &TestDB, path: &str) -> ItemHashes {
     hashes(db, item(db, path)).unwrap_or_else(|err| panic!("{}", err.describe(db)))
@@ -279,6 +283,129 @@ struct C { a: *const A }
 "#,
     );
     assert_ne!(of(&db, "C").interface, b.interface, "an edit of one member is the whole cycle's");
+}
+
+fn members_of(db: &TestDB, graph: Graph, id: ItemId) -> Vec<ItemId> {
+    match hash::members(db, graph, id) {
+        Members::Alone => vec![id],
+        Members::Table(it) => it.to_vec(),
+        Members::Searched(it) => it,
+    }
+}
+
+#[test]
+fn the_crate_table_finds_each_search_s_component() {
+    let (db, _) = single(
+        r#"
+struct A { b: *const B, x: u8 }
+struct B { a: *const A, c: C }
+struct C { x: u32 }
+struct L { next: *const L }
+trait Tr { fn m(&self) -> Self where Self: Sized; fn n(&self) -> u8 { 0 } }
+impl Tr for C { fn m(&self) -> C { C { x: self.x } } }
+fn even(n: u32) -> bool { if n == 0 { true } else { odd(n - 1) } }
+fn odd(n: u32) -> bool { if n == 0 { false } else { even(n - 1) } }
+fn uses(a: &A) -> u8 { a.x }
+fn f() -> impl Sized {
+    struct Inner { s: *const Inner }
+    Inner { s: 0 as *const Inner }
+}
+"#,
+    );
+    let krate = db.test_crate();
+    let mut cycles = 0;
+    for graph in [Graph::Interface, Graph::Layout, Graph::Deep] {
+        let table = hash::find_components(&db, graph, krate);
+        for id in key::crate_item_ids(&db, krate) {
+            if !graph.node(id) {
+                continue;
+            }
+            let from_table = match table.get(id) {
+                None => panic!("{graph:?}: {id:?} was not searched"),
+                Some([]) => vec![id],
+                Some(members) => members.to_vec(),
+            };
+            let mut alone = hash::searched(&db, graph, krate, None, id);
+            alone.sort_unstable();
+            assert_eq!(from_table, alone, "{graph:?}: {id:?}");
+            assert_eq!(members_of(&db, graph, id), alone, "{graph:?}: {id:?}");
+            if alone.len() > 1 {
+                cycles += 1;
+            }
+        }
+    }
+    // A and B in the interface and layout graphs; even and odd in the deep one.
+    assert!(cycles >= 6, "{cycles}");
+}
+
+#[test]
+fn a_cycle_is_hashed_once_for_all_its_members() {
+    let (db, _) = single(
+        r#"
+struct A { b: *const B }
+struct B { c: *const C }
+struct C { a: *const A }
+"#,
+    );
+    let ids = ["A", "B", "C"].map(|name| item(&db, name));
+    let executed = db.log_executed(|| {
+        for id in ids {
+            crate::interface_hash(&db, id).unwrap();
+        }
+    });
+    let units = executed.iter().filter(|it| it.contains("interface_unit")).count();
+    assert_eq!(units, 1, "{executed:#?}");
+    let [a, b, c] = ids.map(|id| crate::interface_hash(&db, id).unwrap());
+    assert!(a != b && b != c && a != c, "each member has its own position");
+}
+
+#[test]
+fn a_body_edit_that_calls_nothing_new_keeps_the_deep_components() {
+    let (mut db, file) = single(
+        r#"
+fn f() -> u32 { g() + 1 }
+fn g() -> u32 { 2 }
+"#,
+    );
+    let before = crate::deep_hash(&db, item(&db, "f")).unwrap();
+    edit(
+        &mut db,
+        file,
+        r#"
+fn f() -> u32 { g() + 3 }
+fn g() -> u32 { 2 }
+"#,
+    );
+    let f = item(&db, "f");
+    let executed = db.log_executed(|| assert_ne!(crate::deep_hash(&db, f).unwrap(), before));
+    assert!(executed.iter().any(|it| it.contains("deep_refs")), "{executed:#?}");
+    assert!(!executed.iter().any(|it| it.contains("deep_components")), "{executed:#?}");
+}
+
+#[test]
+fn an_edit_that_closes_a_cycle_joins_its_members() {
+    let (mut db, file) = single(
+        r#"
+fn f() -> u32 { g() }
+fn g() -> u32 { 2 }
+"#,
+    );
+    let f = item(&db, "f");
+    assert_eq!(members_of(&db, Graph::Deep, f), vec![f]);
+    edit(
+        &mut db,
+        file,
+        r#"
+fn f() -> u32 { g() }
+fn g() -> u32 { if false { f() } else { 2 } }
+"#,
+    );
+    let (f, g) = (item(&db, "f"), item(&db, "g"));
+    let mut both = vec![f, g];
+    both.sort_unstable();
+    assert_eq!(members_of(&db, Graph::Deep, f), both);
+    assert_eq!(members_of(&db, Graph::Deep, g), both);
+    assert_ne!(crate::deep_hash(&db, f).unwrap(), crate::deep_hash(&db, g).unwrap());
 }
 
 #[test]
@@ -608,4 +735,81 @@ pub struct S;
         }
     }
     assert!(seen >= 3, "{seen}");
+}
+
+fn signature_of(db: &TestDB, path: &str) -> crate::SignatureHash {
+    let id = item(db, path);
+    crate::signature_hash(db, id).unwrap_or_else(|err| panic!("{}", err.describe(db)))
+}
+
+#[test]
+fn a_leak_changes_the_interface_hash_and_keeps_the_signature_hash() {
+    for (before, after, path) in [
+        ("fn g() -> impl Copy { 1u8 }", "fn g() -> impl Copy { 1u16 }", "g"),
+        ("const fn g() -> u8 { 1 }", "const fn g() -> u8 { 2 }", "g"),
+        ("const C: u8 = 1;", "const C: u8 = 2;", "C"),
+        ("static S: u8 = 1;", "static S: u8 = 2;", "S"),
+        ("enum E { A = 1, B }", "enum E { A = 2, B }", "E"),
+    ] {
+        let (mut db, file) = single(before);
+        let (interface, signature) = (of(&db, path).interface, signature_of(&db, path));
+        edit(&mut db, file, after);
+        assert_ne!(of(&db, path).interface, interface, "{before} -> {after}");
+        assert_eq!(signature_of(&db, path), signature, "{before} -> {after}");
+    }
+}
+
+#[test]
+fn a_signature_change_changes_the_signature_hash() {
+    for (before, after, path) in [
+        ("fn g() -> impl Copy { 1u8 }", "fn g() -> impl Clone { 1u8 }", "g"),
+        ("const fn g() -> u8 { 1 }", "fn g() -> u8 { 1 }", "g"),
+        ("const C: u8 = 1;", "const C: u16 = 1;", "C"),
+        ("static S: u8 = 1;", "static mut S: u8 = 1;", "S"),
+        ("enum E { A = 1, B }", "enum E { A, B }", "E"),
+        ("struct T; fn g(_: T) {}", "struct T(u8); fn g(_: T) {}", "g"),
+    ] {
+        let (mut db, file) = single(before);
+        let signature = signature_of(&db, path);
+        edit(&mut db, file, after);
+        assert_ne!(signature_of(&db, path), signature, "{before} -> {after}");
+    }
+}
+
+#[test]
+fn a_constructor_key_resolves_to_its_constructor() {
+    use hir_ty::next_solver::Ctor;
+    let (db, _) = single(
+        r#"
+struct T(u8);
+struct U;
+struct R { x: u8 }
+enum E { A(u8), B, C { x: u8 } }
+"#,
+    );
+    let structs = [("T", true), ("U", true), ("R", false)];
+    for (path, has) in structs {
+        let ItemId::Adt(AdtId::StructId(it)) = item(&db, path) else { panic!("`{path}`") };
+        let found = resolve(&db, key::ctor_key(&db, Ctor::Struct(it)));
+        assert_eq!(found, has.then_some(Resolved::Ctor(Ctor::Struct(it))), "{path}");
+    }
+    let AdtId::EnumId(e) = adt(&db, "E") else { panic!("`E` is an enum") };
+    let variants = &e.enum_variants(&db).variants;
+    for (at, (_, &(variant, _))) in variants.iter().enumerate() {
+        let found = resolve(&db, key::ctor_key(&db, Ctor::Enum(variant)));
+        assert_eq!(found, (at != 2).then_some(Resolved::Ctor(Ctor::Enum(variant))), "{at}");
+    }
+}
+
+#[test]
+fn an_anonymous_constant_key_resolves_to_its_root() {
+    let (db, _) = single("struct A([u8; 1 + 2]);\nfn f() -> [u8; 4] { [0; 4] }");
+    let ItemId::Adt(AdtId::StructId(it)) = item(&db, "A") else { panic!("`A` is a struct") };
+    let store = hir_def::ExpressionStoreOwnerId::VariantFields(it.into());
+    let roots: Vec<_> = hir_def::expr_store::ExpressionStore::of(&db, store).expr_roots().collect();
+    assert!(!roots.is_empty(), "the array length is a root of the fields' store");
+    for expr in roots {
+        let found = resolve(&db, key::anon_const_key_of(&db, store, expr));
+        assert_eq!(found, Some(Resolved::AnonConst { store, expr }));
+    }
 }

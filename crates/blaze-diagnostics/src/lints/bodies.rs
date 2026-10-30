@@ -210,8 +210,8 @@ pub(crate) struct Scratch {
 }
 
 /// One body being linted, with what it was lowered to and inferred as.
-pub(crate) struct BodyCx<'a, 'db> {
-    pub(crate) cx: &'a Cx<'a, 'db>,
+pub(crate) struct BodyCx<'a, 'c, 'db> {
+    pub(crate) cx: &'a Cx<'c, 'db>,
     pub(crate) owner: DefWithBodyId,
     pub(crate) body: &'db Body,
     pub(crate) source_map: &'db BodySourceMap,
@@ -233,10 +233,10 @@ pub(crate) struct BodyCx<'a, 'db> {
     scratch: Cell<Scratch>,
 }
 
-impl<'a, 'db> BodyCx<'a, 'db> {
+impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
     /// The body of `owner`, if it has one written (a variant has one only when its
     /// discriminant is).
-    pub(crate) fn new(cx: &'a Cx<'a, 'db>, owner: DefWithBodyId) -> Option<BodyCx<'a, 'db>> {
+    pub(crate) fn new(cx: &'a Cx<'c, 'db>, owner: DefWithBodyId) -> Option<BodyCx<'a, 'c, 'db>> {
         let db = cx.db;
         let (body, source_map) = Body::with_source_map(db, owner);
         let body: &'db Body = body;
@@ -630,15 +630,15 @@ pub(crate) trait LatePass: Default {
     /// The kinds of pattern `check_pat` is called at.
     const PATS: PatKinds = PatKinds::NONE;
     /// The body, before anything in it.
-    fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {}
-    fn check_expr(&mut self, _b: &BodyCx<'_, '_>, _expr: ExprId, _out: &mut Vec<Found>) {}
+    fn check_body(&mut self, _b: &BodyCx<'_, '_, '_>, _out: &mut Vec<Found>) {}
+    fn check_expr(&mut self, _b: &BodyCx<'_, '_, '_>, _expr: ExprId, _out: &mut Vec<Found>) {}
     /// Statement `index` of the block `block`, before what is in it.
-    fn check_stmt(&mut self, _b: &BodyCx<'_, '_>, _block: ExprId, _index: usize, _out: &mut Vec<Found>) {}
+    fn check_stmt(&mut self, _b: &BodyCx<'_, '_, '_>, _block: ExprId, _index: usize, _out: &mut Vec<Found>) {}
     /// The `let` statement `index` of the block `block`, after [`LatePass::check_stmt`] of it.
-    fn check_local(&mut self, _b: &BodyCx<'_, '_>, _block: ExprId, _index: usize, _out: &mut Vec<Found>) {}
+    fn check_local(&mut self, _b: &BodyCx<'_, '_, '_>, _block: ExprId, _index: usize, _out: &mut Vec<Found>) {}
     /// Arm `index` of the `match` `expr`, before its pattern.
-    fn check_arm(&mut self, _b: &BodyCx<'_, '_>, _expr: ExprId, _index: usize, _out: &mut Vec<Found>) {}
-    fn check_pat(&mut self, _b: &BodyCx<'_, '_>, _pat: PatId, _out: &mut Vec<Found>) {}
+    fn check_arm(&mut self, _b: &BodyCx<'_, '_, '_>, _expr: ExprId, _index: usize, _out: &mut Vec<Found>) {}
+    fn check_pat(&mut self, _b: &BodyCx<'_, '_, '_>, _pat: PatId, _out: &mut Vec<Found>) {}
 }
 
 /// Which of [`LatePass`]'s `check_body`, `check_stmt`, `check_local` and `check_arm` a pass
@@ -736,37 +736,37 @@ macro_rules! late_passes {
                 [$(Pass::$pass(<$ty>::default()),)*]
             }
 
-            fn check_body(&mut self, b: &BodyCx<'_, '_>, out: &mut Vec<Found>) {
+            fn check_body(&mut self, b: &BodyCx<'_, '_, '_>, out: &mut Vec<Found>) {
                 match self {
                     $(Pass::$pass(it) => it.check_body(b, out),)*
                 }
             }
 
-            fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+            fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
                 match self {
                     $(Pass::$pass(it) => it.check_expr(b, expr, out),)*
                 }
             }
 
-            fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+            fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
                 match self {
                     $(Pass::$pass(it) => it.check_stmt(b, block, index, out),)*
                 }
             }
 
-            fn check_local(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+            fn check_local(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
                 match self {
                     $(Pass::$pass(it) => it.check_local(b, block, index, out),)*
                 }
             }
 
-            fn check_arm(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, index: usize, out: &mut Vec<Found>) {
+            fn check_arm(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, index: usize, out: &mut Vec<Found>) {
                 match self {
                     $(Pass::$pass(it) => it.check_arm(b, expr, index, out),)*
                 }
             }
 
-            fn check_pat(&mut self, b: &BodyCx<'_, '_>, pat: PatId, out: &mut Vec<Found>) {
+            fn check_pat(&mut self, b: &BodyCx<'_, '_, '_>, pat: PatId, out: &mut Vec<Found>) {
                 match self {
                     $(Pass::$pass(it) => it.check_pat(b, pat, out),)*
                 }
@@ -895,7 +895,7 @@ impl Passes {
 /// rustc's `LateContextAndPass` over one body, in its visitor's order: at each node, the passes
 /// its tag's list names. Each node is decoded once, for its tag and its children.
 struct Late<'s, 'a, 'db> {
-    b: &'s BodyCx<'a, 'db>,
+    b: &'s BodyCx<'s, 'a, 'db>,
     passes: &'s mut Passes,
     out: &'s mut Vec<Found>,
 }

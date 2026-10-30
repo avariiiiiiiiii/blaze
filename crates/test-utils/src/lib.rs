@@ -420,6 +420,27 @@ pub fn project_root() -> Utf8PathBuf {
         .unwrap()
 }
 
+/// Every `.rs` file under `dir`, recursively, sorted. Panics on a directory it can't read.
+pub fn rust_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries =
+            fs::read_dir(&dir).unwrap_or_else(|err| panic!("can't read {}: {err}", dir.display()));
+        for entry in entries {
+            let path =
+                entry.unwrap_or_else(|err| panic!("can't read {}: {err}", dir.display())).path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|it| it == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 pub fn format_diff(chunks: Vec<dissimilar::Chunk<'_>>) -> String {
     let mut buf = String::new();
     for chunk in chunks {

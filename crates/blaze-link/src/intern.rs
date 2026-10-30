@@ -3,7 +3,8 @@
 //!
 //! Each of the 64 shards of [`crate::symbols::Symbols`]' three tables (symbol keys, names, ids) keeps its
 //! entries in [`RegionVec`]s tagged [`Tag::Link`] and finds them through an [`Index`]: an
-//! open-addressing table over a region of its own, each slot an entry's index beside the high
+//! open-addressing table over a region of its own (huge pages past its first 2 MiB, as it is
+//! probed at random), each slot an entry's index beside the high
 //! half of its hash, probed linearly from the hash's low bits and kept at most half full. A
 //! region grows by committing pages and the index doubles in place, rebuilt from the entries,
 //! so no table is ever moved or copied, and interning into a warm image makes no call to the
@@ -74,7 +75,7 @@ pub(crate) struct Index {
 
 impl Index {
     fn new() -> Result<Index, MemError> {
-        Ok(Index { slots: RegionVec::new(MAX_SLOTS, Tag::Link)? })
+        Ok(Index { slots: RegionVec::new_huge(MAX_SLOTS, Tag::Link)? })
     }
 
     #[inline]

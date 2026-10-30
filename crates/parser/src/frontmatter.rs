@@ -94,7 +94,7 @@ impl<'s> ScriptSource<'s> {
         };
         let info = input.next_slice(info_nl.start);
         let info = info.strip_suffix('\r').unwrap_or(info); // already excludes `\n`
-        let info = info.trim_matches(is_horizontal_whitespace);
+        let info = info.trim_matches(rustc_lexer::is_horizontal_whitespace);
         if !info.is_empty() {
             let info_start = info.offset_from(&raw);
             let info_end = info_start + info.len();
@@ -159,7 +159,7 @@ impl<'s> ScriptSource<'s> {
             .push_visible_span(open_start..open_end));
         } else {
             let after_closing_fence = strip_newline(after_closing_fence);
-            let after_closing_fence = after_closing_fence.trim_matches(is_horizontal_whitespace);
+            let after_closing_fence = after_closing_fence.trim_matches(rustc_lexer::is_horizontal_whitespace);
             if !after_closing_fence.is_empty() {
                 // extra characters beyond the original fence pattern
                 let after_start = after_closing_fence.offset_from(&raw);
@@ -249,30 +249,17 @@ impl<'s> ScriptSource<'s> {
     }
 }
 
-/// Returns the index after the shebang line, if present
+/// Returns the index after the shebang line and its newline, if present. Whether the line is
+/// one is rustc's rule (`rustc_lexer::strip_shebang`: a `[` after whitespace and comments makes
+/// it an inner attribute); the token takes the newline too, as cargo's does.
 pub fn strip_shebang(input: &str) -> Option<usize> {
-    // See rust-lang/rust's compiler/rustc_lexer/src/lib.rs's `strip_shebang`
-    // Shebang must start with `#!` literally, without any preceding whitespace.
-    // For simplicity we consider any line starting with `#!` a shebang,
-    // regardless of restrictions put on shebangs by specific platforms.
-    if let Some(rest) = input.strip_prefix("#!") {
-        // Ok, this is a shebang but if the next non-whitespace token is `[`,
-        // then it may be valid Rust code, so consider it Rust code.
-        //
-        // NOTE: rustc considers line and block comments to be whitespace but to avoid
-        // any more awareness of Rust grammar, we are excluding it.
-        if !rest.trim_start().starts_with('[') {
-            // No other choice than to consider this a shebang.
-            let newline_end = input.find('\n').map(|pos| pos + 1).unwrap_or(input.len());
-            return Some(newline_end);
-        }
-    }
-    None
+    rustc_lexer::strip_shebang(input)?;
+    Some(input.find('\n').map(|pos| pos + 1).unwrap_or(input.len()))
 }
 
 /// Returns the index after any lines with only whitespace, if present
 pub fn strip_ws_lines(input: &str) -> Option<usize> {
-    let ws_end = input.find(|c| !is_whitespace(c)).unwrap_or(input.len());
+    let ws_end = input.find(|c| !rustc_lexer::is_whitespace(c)).unwrap_or(input.len());
     if ws_end == 0 {
         return None;
     }
@@ -280,51 +267,6 @@ pub fn strip_ws_lines(input: &str) -> Option<usize> {
     let nl_start = input[0..ws_end].rfind('\n')?;
     let nl_end = nl_start + 1;
     Some(nl_end)
-}
-
-/// True if `c` is considered a whitespace according to Rust language definition.
-/// See [Rust language reference](https://doc.rust-lang.org/reference/whitespace.html)
-/// for definitions of these classes.
-pub(crate) fn is_whitespace(c: char) -> bool {
-    // This is Pattern_White_Space.
-    //
-    // Note that this set is stable (ie, it doesn't change with different
-    // Unicode versions), so it's ok to just hard-code the values.
-
-    matches!(
-        c,
-        // End-of-line characters
-        | '\u{000A}' // line feed (\n)
-        | '\u{000B}' // vertical tab
-        | '\u{000C}' // form feed
-        | '\u{000D}' // carriage return (\r)
-        | '\u{0085}' // next line (from latin1)
-        | '\u{2028}' // LINE SEPARATOR
-        | '\u{2029}' // PARAGRAPH SEPARATOR
-
-        // `Default_Ignorable_Code_Point` characters
-        | '\u{200E}' // LEFT-TO-RIGHT MARK
-        | '\u{200F}' // RIGHT-TO-LEFT MARK
-
-        // Horizontal space characters
-        | '\u{0009}'   // tab (\t)
-        | '\u{0020}' // space
-    )
-}
-
-/// True if `c` is considered horizontal whitespace according to Rust language definition.
-fn is_horizontal_whitespace(c: char) -> bool {
-    // This is Pattern_White_Space.
-    //
-    // Note that this set is stable (ie, it doesn't change with different
-    // Unicode versions), so it's ok to just hard-code the values.
-
-    matches!(
-        c,
-        // Horizontal space characters
-        '\u{0009}'   // tab (\t)
-        | '\u{0020}' // space
-    )
 }
 
 fn strip_newline(text: &str) -> &str {
@@ -370,3 +312,39 @@ impl std::fmt::Display for FrontmatterError {
 }
 
 impl std::error::Error for FrontmatterError {}
+
+#[cfg(test)]
+mod tests {
+    /// cargo's `strip_shebang`, which this file had: a `[` right after the `#!` and whitespace.
+    fn cargo_strip_shebang(input: &str) -> Option<usize> {
+        let rest = input.strip_prefix("#!")?;
+        if rest.trim_start().starts_with('[') {
+            return None;
+        }
+        Some(input.find('\n').map(|pos| pos + 1).unwrap_or(input.len()))
+    }
+
+    #[test]
+    fn shebangs_are_rustcs_with_their_newline() {
+        for text in ["#!/usr/bin/env cargo\nfn main() {}", "#!x", "#!x\r\nfn f() {}", "#![allow(x)]", "#! \n [a]", "fn f() {}", "#"] {
+            assert_eq!(super::strip_shebang(text), cargo_strip_shebang(text), "{text:?}");
+        }
+        // Only rustc counts comments as whitespace before the `[`.
+        for text in ["#! /* c */ [allow(x)]", "#!// c\n[allow(x)]"] {
+            assert_eq!(cargo_strip_shebang(text).map(|_| ()), Some(()), "{text:?}");
+            assert_eq!(super::strip_shebang(text), None, "{text:?}");
+        }
+    }
+
+    /// The `is_whitespace` and `is_horizontal_whitespace` this file had (Pattern_White_Space).
+    #[test]
+    fn whitespace_is_rustc_lexers() {
+        let old_ws = |c: char| {
+            matches!(c, '\u{A}' | '\u{B}' | '\u{C}' | '\u{D}' | '\u{85}' | '\u{2028}' | '\u{2029}' | '\u{200E}' | '\u{200F}' | '\t' | ' ')
+        };
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            assert_eq!(rustc_lexer::is_whitespace(c), old_ws(c), "{c:?}");
+            assert_eq!(rustc_lexer::is_horizontal_whitespace(c), matches!(c, '\t' | ' '), "{c:?}");
+        }
+    }
+}

@@ -1,13 +1,13 @@
 //! Trait solving using next trait solver.
 
-use std::{cell::OnceCell, hash::Hash};
+use std::{cell::OnceCell, fmt, hash::Hash};
 
 use base_db::{Db, Crate};
 use hir_def::{
     AdtId, AssocItemId, ExpressionStoreOwnerId, GenericDefId, HasModule, ImplId, Lookup, TraitId,
     expr_store::ExpressionStore,
     hir::generics::WherePredicate,
-    lang_item::LangItems,
+    lang_item::{LangItemEnum, LangItems},
     nameres::DefMap,
     resolver::Resolver,
     signatures::{
@@ -117,6 +117,35 @@ impl FnTrait {
             FnTrait::AsyncFnMut => lang_items.AsyncFnMut,
             FnTrait::AsyncFn => lang_items.AsyncFn,
         }
+    }
+
+    pub fn lang_item(self) -> LangItemEnum {
+        match self {
+            FnTrait::FnOnce => LangItemEnum::FnOnce,
+            FnTrait::FnMut => LangItemEnum::FnMut,
+            FnTrait::Fn => LangItemEnum::Fn,
+            FnTrait::AsyncFnOnce => LangItemEnum::AsyncFnOnce,
+            FnTrait::AsyncFnMut => LangItemEnum::AsyncFnMut,
+            FnTrait::AsyncFn => LangItemEnum::AsyncFn,
+        }
+    }
+
+    /// The trait's name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FnTrait::FnOnce => "FnOnce",
+            FnTrait::FnMut => "FnMut",
+            FnTrait::Fn => "Fn",
+            FnTrait::AsyncFnOnce => "AsyncFnOnce",
+            FnTrait::AsyncFnMut => "AsyncFnMut",
+            FnTrait::AsyncFn => "AsyncFn",
+        }
+    }
+}
+
+impl fmt::Display for FnTrait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -325,7 +354,7 @@ pub enum WherePredicateEvaluation {
 pub fn where_predicate_must_hold<'db>(
     db: &'db Db,
     resolver: &Resolver<'db>,
-    store: &'db ExpressionStore,
+    store: &ExpressionStore,
     def: ExpressionStoreOwnerId,
     generic_def: GenericDefId,
     env: ParamEnvAndCrate<'db>,
@@ -407,7 +436,7 @@ pub fn is_inherent_impl_coherent(db: &Db, def_map: &DefMap, impl_id: ImplId) -> 
     inherent_impl_coherent(db, impl_id, def_map.krate(), def_map.is_rustc_coherence_is_core())
 }
 
-#[salsa::tracked(mem_tag = Infer)]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 fn inherent_impl_coherent(
     db: &Db,
     impl_id: ImplId,
@@ -501,7 +530,7 @@ pub fn check_orphan_rules<'db>(db: &'db Db, impl_: ImplId) -> bool {
     orphan_rules_hold(db, impl_)
 }
 
-#[salsa::tracked(mem_tag = Infer)]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 fn orphan_rules_hold(db: &Db, impl_: ImplId) -> bool {
     check_orphan_rules_uncached(db, impl_)
 }
@@ -573,4 +602,40 @@ fn check_orphan_rules_uncached<'db>(db: &'db Db, impl_: ImplId) -> bool {
     });
     #[allow(clippy::let_and_return, reason = "the name clarifies the meaning of the boolean")]
     is_not_orphan
+}
+
+#[cfg(test)]
+mod fn_trait_tests {
+    use hir_def::lang_item::LangItemEnum;
+
+    use super::FnTrait;
+
+    /// `hir`'s own `FnTrait`, before it became this one: its `Display` and `lang_item`.
+    fn hir_copy(it: FnTrait) -> (&'static str, LangItemEnum) {
+        match it {
+            FnTrait::FnOnce => ("FnOnce", LangItemEnum::FnOnce),
+            FnTrait::FnMut => ("FnMut", LangItemEnum::FnMut),
+            FnTrait::Fn => ("Fn", LangItemEnum::Fn),
+            FnTrait::AsyncFnOnce => ("AsyncFnOnce", LangItemEnum::AsyncFnOnce),
+            FnTrait::AsyncFnMut => ("AsyncFnMut", LangItemEnum::AsyncFnMut),
+            FnTrait::AsyncFn => ("AsyncFn", LangItemEnum::AsyncFn),
+        }
+    }
+
+    #[test]
+    fn names_and_lang_items_are_hirs() {
+        for it in [
+            FnTrait::FnOnce,
+            FnTrait::FnMut,
+            FnTrait::Fn,
+            FnTrait::AsyncFnOnce,
+            FnTrait::AsyncFnMut,
+            FnTrait::AsyncFn,
+        ] {
+            let (name, lang) = hir_copy(it);
+            assert_eq!(it.to_string(), name);
+            assert_eq!(it.as_str(), name);
+            assert_eq!(it.lang_item(), lang);
+        }
+    }
 }

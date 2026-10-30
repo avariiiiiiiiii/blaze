@@ -67,7 +67,7 @@ impl LatePass for AsmLabels {
     const LINTS: LintSet = lint_set(["named_asm_labels", "binary_asm_labels"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::InlineAsm]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::InlineAsm(asm) = b.store().expr(expr) else { return };
         let naked = match asm.kind {
             InlineAsmKind::Asm => false,
@@ -114,7 +114,7 @@ struct Template<'db> {
 
 /// The template strings of the `asm!` written as `at`, those `cfg` removes left out; `None`
 /// when one is not a string, which rustc refuses before there is an `asm!` to lint.
-fn templates<'db>(b: &BodyCx<'_, 'db>, at: InFile<SyntaxNodePtr>) -> Option<SmallVec<[Template<'db>; 2]>> {
+fn templates<'db>(b: &BodyCx<'_, '_, 'db>, at: InFile<SyntaxNodePtr>) -> Option<SmallVec<[Template<'db>; 2]>> {
     let cx = b.cx;
     let node = cx.syntax_view(at);
     let asm = ast::AsmExpr::cast(node.value)?;
@@ -169,7 +169,7 @@ fn string_of<'db>(cx: &Cx<'_, 'db>, expr: ast::Expr<'db>) -> Option<String> {
 
 /// `generics_of(owner).requires_monomorphization()` for the item of the body: a type or const
 /// parameter of it or of its parent (a trait's `Self` too); lifetimes don't count.
-fn requires_monomorphization(b: &BodyCx<'_, '_>) -> bool {
+fn requires_monomorphization(b: &BodyCx<'_, '_, '_>) -> bool {
     let db = b.db();
     hir_ty::generics::generics(db, b.owner.generic_def(db))
         .iter(false)
@@ -177,7 +177,7 @@ fn requires_monomorphization(b: &BodyCx<'_, '_>) -> bool {
 }
 
 /// That a lint of a `naked_asm!` read the generics of its function.
-fn generics_fact(b: &BodyCx<'_, '_>, diag: &mut Diag) {
+fn generics_fact(b: &BodyCx<'_, '_, '_>, diag: &mut Diag) {
     let DefWithBodyId::FunctionId(it) = b.owner else { return };
     // alloc: the lint's diagnostic
     let what = format!("the signature of `{}`", b.cx.def_path(ModuleDefId::FunctionId(it).into()));

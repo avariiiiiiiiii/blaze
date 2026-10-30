@@ -385,16 +385,6 @@ fn shown_line(line: &str) -> Option<std::borrow::Cow<'_, str>> {
     }
 }
 
-/// `a`, `a or b`, `a, b, or c`.
-fn or_list(items: &[String]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => one.clone(),
-        [first, second] => format!("{first} or {second}"),
-        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
-    }
-}
-
 fn code_block(kind: &CodeBlockKind<'_>, text: &str) -> String {
     let lang = match kind {
         CodeBlockKind::Fenced(info) => LangString::parse(info),
@@ -418,7 +408,7 @@ fn code_block(kind: &CodeBlockKind<'_>, text: &str) -> String {
     let (wrap, tooltip) = if lang.ignore {
         (" ignore", Some("This example is not tested".to_owned()))
     } else if !lang.ignore_on.is_empty() {
-        (" ignore", Some(format!("This example is not tested on {}", or_list(&lang.ignore_on))))
+        (" ignore", Some(format!("This example is not tested on {}", stdx::list::list(&lang.ignore_on, stdx::list::Join::Or, false))))
     } else if lang.compile_fail {
         (" compile_fail", Some("This example deliberately fails to compile".to_owned()))
     } else if lang.should_panic {

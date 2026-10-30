@@ -30,7 +30,7 @@ use std::{
 use blaze_mem::RegionVec;
 
 use super::{
-    flight::{error, failed},
+    flight::{error, failed, filled, raw, spare_of},
     ops::{DIRECT, LINKS, MADE, MAKE, NO_SLOT, SECOND, WHOLE, arena_of},
     *,
 };
@@ -51,6 +51,23 @@ const INSTALLING: u8 = 5;
 const EMPTYING: u8 = 6;
 /// A whole file's read whose buffer is the file's size.
 pub(super) const SIZED: u8 = 1;
+/// A read of a file no request keeps, open, reading into its buffer.
+const READING: u8 = 7;
+/// A read of a file no request keeps, waiting for room among [`LOADS`].
+const QUEUED: u8 = 8;
+
+/// The most reads of files no request keeps that hold a descriptor at once (fewer where the
+/// table, sized to `RLIMIT_NOFILE`, is smaller): a batch of 50 000 opens whose reads wait
+/// behind them in the ring would otherwise hold 50 000 descriptors and fail with `EMFILE`.
+/// Each read is two trips through the ring of a few microseconds, so a thousand in flight is
+/// far more than the submission thread and the device keep busy.
+pub(super) const LOADS: usize = 1024;
+/// Reads in flight past which each one's open and read go to the kernel's workers
+/// (`IOSQE_ASYNC`) rather than run on the ring's one submission thread: in a batch that large
+/// what is waited for is the batch, and the path lookups and page-cache copies (~3 µs a file
+/// of 20 KiB) then run on every core instead of one. Below it a lone read keeps the shorter
+/// path, the ~2 µs hand-off to a worker costing more than it spreads.
+pub(super) const SPREAD_LEAST: usize = 64;
 
 /// `struct statx`'s size, and the mask of what [`Kind::Stat`] asks of it: the type, the mode,
 /// the modification time and the size.
@@ -383,6 +400,101 @@ impl Uring {
         Ok(())
     }
 
+    /// Starts [`Effect::Read`] (`len`) or, with `None`, [`Effect::ReadAll`] `tag` of `file`,
+    /// which no request keeps: a read of the file at its name now, open only while it reads.
+    pub(super) fn load(&mut self, tag: Tag, file: &FileName, at: u64, len: Option<usize>) -> io::Result<()> {
+        let mut hot = Hot::new(tag, Kind::Load, 0);
+        hot.phase = QUEUED;
+        let buf = match len {
+            // alloc: the read's result, handed to its asker.
+            Some(len) => Vec::with_capacity(len),
+            None => {
+                hot.flags |= WHOLE;
+                ops::NO_BYTES
+            }
+        };
+        let push = |path: &Path, names: &mut RegionVec<u8>, starts: &mut [u32; 5]| {
+            starts[0] = push_c(names, path.as_os_str().as_bytes())?;
+            Ok(())
+        };
+        self.named(hot, buf, Cold { at, ..Cold::EMPTY }, push, file)?;
+        Ok(())
+    }
+
+    /// The most reads of files no request keeps that may hold a descriptor at once.
+    pub(super) fn loads_most(&self) -> usize {
+        (self.table.ours as usize / 2).clamp(1, LOADS)
+    }
+
+    /// Whether the request `id` may be asked of the kernel as far as the reads holding
+    /// descriptors go: a read not yet among them joins them where there is room, or waits, in
+    /// the order asked, for one to end.
+    pub(super) fn admitted(&mut self, id: Id) -> bool {
+        let hot = self.ops.get(id).expect("a request in flight");
+        if hot.kind != Kind::Load || hot.phase != QUEUED {
+            return true;
+        }
+        if self.loading >= self.loads_most() {
+            // alloc: none until more reads wait than the ring holds, then amortized growth.
+            self.load_waiting.push_back(id);
+            return false;
+        }
+        self.loading += 1;
+        self.ops.get_mut(id).expect("in flight").phase = OPENING;
+        true
+    }
+
+    /// A read that held a descriptor ended: the one that has waited longest takes its room.
+    fn unload(&mut self) {
+        self.loading -= 1;
+        while let Some(id) = self.load_waiting.pop_front() {
+            if self.ops.contains(id) {
+                self.queue(id);
+                return;
+            }
+        }
+    }
+
+    /// The read of a file no request keeps `id` (`hot`): its open completed with `res`, or
+    /// its read did.
+    fn loaded(&mut self, id: Id, hot: Hot, res: i32) -> Step {
+        let whole = hot.flags & WHOLE != 0;
+        if hot.phase == OPENING {
+            // A file that is not there reads as empty, as a journal not yet written does.
+            if res == -libc::ENOENT && whole {
+                return Step::Ends(Some(Done::Read(ops::NO_BYTES)));
+            }
+            if res < 0 {
+                return self.failed_on(id, "opening", 0, res);
+            }
+            // SAFETY: the open's completion: a descriptor of the driver's, owned by no other.
+            let fd = unsafe { OwnedFd::from_raw_fd(res) };
+            // Its size as the file now open has it, so a rename over the name meanwhile never
+            // sizes the read of the file it replaced. No ring op `fstat`s a descriptor at 6.0.
+            if whole {
+                match size_of_file(fd.as_raw_fd()) {
+                    // alloc: the read's result, handed to its asker.
+                    Ok(size) => *self.ops.buf_mut(id) = Vec::with_capacity(size as usize),
+                    Err(error) => return Step::Ends(Some(Done::Failed(IoError(error.to_string())))), // alloc: an error.
+                }
+            }
+            self.ops.cold_mut(id).fds[0] = Some(fd);
+            if self.ops.buf(id).capacity() == 0 {
+                return Step::Ends(Some(Done::Read(mem::take(self.ops.buf_mut(id)))));
+            }
+            self.ops.get_mut(id).expect("in flight").phase = READING;
+            return Step::Again;
+        }
+        if res < 0 {
+            return Step::Ends(failed(res));
+        }
+        let bytes = self.ops.buf_mut(id);
+        if res > 0 && filled(bytes, res) {
+            return Step::Again;
+        }
+        Step::Ends(Some(Done::Read(mem::take(bytes))))
+    }
+
     /// Starts the open of the kept file `file`, named `name`, made if missing with `make`.
     pub(super) fn open(&mut self, file: Handle<Kept>, name: &FileName, make: bool) -> io::Result<()> {
         let mut hot = Hot::new(NOBODYS, Kind::Open, file.to_bits());
@@ -445,7 +557,7 @@ impl Uring {
                     Ok(0) => Done::Read(mem::take(self.ops.buf_mut(id))),
                     Ok(size) => {
                         // alloc: the read's result, handed to its asker.
-                        *self.ops.buf_mut(id) = vec![0; size as usize];
+                        *self.ops.buf_mut(id) = Vec::with_capacity(size as usize);
                         return true;
                     }
                     Err(error) => Done::Failed(IoError(error.to_string())), // alloc: an error.
@@ -691,6 +803,18 @@ impl Uring {
                 sqes[0] = statx(name(0), STATX_META, name(4), ud(0));
                 1
             }
+            (Kind::Load, phase) => {
+                let spread = if self.loading >= SPREAD_LEAST { SQE_ASYNC } else { 0 };
+                sqes[0] = match phase {
+                    OPENING => open(name(0), libc::O_RDONLY, 0, NO_SLOT, spread, ud(0)),
+                    _ => {
+                        let (addr, len) = spare_of(buf, buf.capacity());
+                        let (fd, off) = (raw(&cold.fds[0]), cold.at + buf.len() as u64);
+                        Sqe { opcode: OP_READ, flags: spread, fd, off, addr, len, user_data: ud(0), ..Sqe::default() }
+                    }
+                };
+                1
+            }
             (kind, _) => unreachable!("{kind:?} is not a request on a path"),
         }
     }
@@ -741,6 +865,7 @@ impl Uring {
             Kind::Clone => self.cloned(id, hot, results),
             Kind::Map => self.mapped(id, results[0]),
             Kind::Stat => self.statted(id, hot, results[0]),
+            Kind::Load => self.loaded(id, hot, results[0]),
             kind => unreachable!("{kind:?} is not a request on a path"),
         }
     }
@@ -1130,6 +1255,11 @@ impl Uring {
                 if hot.buffer != ops::NO_BUFFER {
                     self.unbuffer(hot.buffer);
                 }
+            }
+            Kind::Load if hot.phase != QUEUED => {
+                // Its descriptor closed before the next read takes its room.
+                drop(cold.fds[0].take());
+                self.unload();
             }
             _ => {}
         }

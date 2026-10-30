@@ -149,10 +149,10 @@ method gives the same node, token, text or value; `digits_value` is checked agai
   `relative_without_view(node, relative, elided: &[SyntaxNodePtr])`, plus
   `ast_id_of_view::<N>(N::Of<'_>)` and `ast_id_for_block_view(view::BlockExpr<'_>)`. The walks
   were already over `(tree, at)`: a view gives it as `flat()` with the shared tree
-  (`Node::shared_file`, or the parsed part's `Arc` for a node in a part), a cursor as `flat()`, so
-  both reach the same code. `from_source` makes the root's view and calls `from_view`;
-  `relative_to`/`relative_without` hand the cursors' `(tree, at)` to the same `relative`. They stay
-  until hir-def and hir-expand stop calling them.
+  (`Node::shared_file`, or the parsed part's `Arc` for a node in a part). The cursor entry points
+  (`from_source`, `relative_to`, `relative_without`) are deleted (frontend-tree-go-base): hir-def
+  and hir-expand call the view ones, and so are `ast_id_for_block` and `ast_id(&N)`: handle
+  callers write `ast_id_for_ptr(AstPtr::new(..))`.
 - Naming reads views, with no cursor per item: `ErasedFileAstId::ast_id_for`, `has_name_ast_id`,
   the `Impl`/`Use`/`ExternBlock`/`AsmExpr` ids and the `register_*` macros' names take a
   `view::Node`, cast with `use syntax::view as ast;`, and hash the same `&str`s (`Name::text`,
@@ -164,13 +164,16 @@ method gives the same node, token, text or value; `digits_value` is checked agai
   and five body columns when there are bodies.
 
 Proof, in `ast_id.rs`' tests, over every `crates/parser/test_data/**/*.rs` and `crates/span/src/*.rs`
-in full and outline parses: `a_views_map_is_the_handles_map` (the `from_view` map equals
-`from_source`'s, its entries, bodies and every id, bodies' too; and replaying the entries in the
-walk's order, each item named by its handle with the naming as it was before views, `handle_id`,
-gives the stored id); `a_views_relative_maps_are_the_handles` (for each item, `relative_to_view`
-equals `relative_to` on the item as a tree of its own, and `relative_without_view` equals
-`relative_without` with its fn bodies elided); `a_warm_view_build_allocates_only_its_map` (3
-allocations, or 8 with bodies).
+in full and outline parses: `a_views_map_names_items_as_the_handles_did` (the outline's map equals
+the full parse's, its entries and every id, bodies' too; and replaying the entries in the walk's
+order, each item named by its handle with the naming as it was before views, `handle_id`, gives
+the stored id: the handles are the reference until they go);
+`relative_maps_have_the_ids_under_their_node_moved` (for each item, `relative_to_view` on the item
+as a tree of its own has exactly the file map's ids of the item and the nodes under it, bodies'
+too, each moved to the item's tree; `relative_without_view` with its fn bodies elided has those
+outside the bodies, moved back by the lengths elided before them, and no body);
+`a_warm_view_build_allocates_only_its_map` (3 allocations, or 8 with bodies). The other tests of
+`ast_id.rs` build their maps with `from_view` and walk views.
 
 ## Moving the callers
 
@@ -199,9 +202,12 @@ types, `SyntaxNode`/`SyntaxToken`/`SyntaxElement`, `ptr.rs`'s `to_node`, `algo.r
   `ide_db::defs::Definition::usages`. It needs a build-path index of callers, not a syntax move.
 - The handle functions' own bodies in `hir-expand` (`files.rs`, `lib.rs`) and `hir`, which the
   requests delete as their last callers move.
-- Kind tags (`AstId<ast::Fn>`, `AstPtr<N>`, `FileAstId<N>`, `Parse<ast::SourceFile>`) and
-  `Parse<SyntaxNode>` for an untyped parse (`token_tree_to_syntax_node`, blaze-fmt
-  `stream.rs`). These need a tag type that is not a handle (a zero-sized `ast` kind marker
-  per node type, generated beside the views) before `SyntaxNode` can go.
+- Kind tags (`AstId<ast::Fn>`, `AstPtr<N>`, `FileAstId<N>`, `Parse<ast::SourceFile>`). These
+  need a tag type that is not a handle (a zero-sized `ast` kind marker per node type, generated
+  beside the views) before `SyntaxNode` can go. An untyped parse (`token_tree_to_syntax_node`,
+  blaze-fmt `stream.rs`) is `Parse<view::Untyped>`: walked from `Parse::root`, made by
+  `SyntaxTreeBuilder::finish_view` or `Parse::into_untyped`, and cast by
+  `Parse<Untyped>::cast`, the twin of `Parse<SyntaxNode>::cast`. `SyntaxTreeBuilder::finish`
+  (blaze-fmt `stream.rs`, syntax-bridge `prettify_macro_expansion.rs`) goes with `SyntaxNode`.
 - Tests that compare views against handles. After the deletion they compare against stored
   expectations.

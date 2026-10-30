@@ -4,6 +4,7 @@
 //! functions that depend on X re-execute, but those depending only on Y do not
 //! compiles and executes successfully.
 #![allow(dead_code)]
+#![forbid(unsafe_code)]
 
 mod common;
 use common::LogDatabase;

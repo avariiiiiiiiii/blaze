@@ -27,6 +27,10 @@ pub trait Columns: Sync {
     fn edges_of(&self, i: usize) -> Range<usize>;
     fn read(&self, e: usize) -> u32;
     fn saw(&self, e: usize) -> Fingerprint;
+    /// Word `w` of the `has` and `ran` bitsets (keys `64 w..64 w + 64`), so a walk over the keys a
+    /// build ran reads one word for 64 keys; 0 past the last word.
+    fn has_word(&self, w: usize) -> u64;
+    fn ran_word(&self, w: usize) -> u64;
 }
 
 impl Columns for Trace {
@@ -61,6 +65,50 @@ impl Columns for Trace {
     fn saw(&self, e: usize) -> Fingerprint {
         self.saw[e]
     }
+
+    fn has_word(&self, w: usize) -> u64 {
+        self.has.words().get(w).copied().unwrap_or(0)
+    }
+
+    fn ran_word(&self, w: usize) -> u64 {
+        self.ran.words().get(w).copied().unwrap_or(0)
+    }
+}
+
+/// The indices of `c`'s keys that this build ran and that have a result, ascending: one word of
+/// each bitset per 64 keys and a `trailing_zeros` per member, rather than two bit tests per key.
+/// Bits past the last key (a file may set them) are not members.
+pub(crate) fn ran_results<C: Columns>(c: &C) -> impl Iterator<Item = usize> + '_ {
+    let n = c.keys();
+    (0..blaze_ids::bits::words_for(n)).flat_map(move |w| {
+        let tail = if (w + 1) * 64 > n { (1u64 << (n % 64)) - 1 } else { !0 };
+        let mut live = c.ran_word(w) & c.has_word(w) & tail;
+        std::iter::from_fn(move || {
+            (live != 0).then(|| {
+                let i = w * 64 + live.trailing_zeros() as usize;
+                live &= live - 1;
+                i
+            })
+        })
+    })
+}
+
+/// The keys of `kind`, a contiguous run since keys sort by kind first: two binary searches.
+pub(crate) fn of_kind<C: Columns>(c: &C, kind: blaze_query::QueryKind) -> Range<usize> {
+    fn first<C: Columns>(c: &C, mut lo: usize, before: impl Fn(QueryKey) -> bool) -> usize {
+        let mut hi = c.keys();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if before(c.key(mid)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+    let start = first(c, 0, |k| k.kind < kind);
+    start..first(c, start, |k| k.kind == kind)
 }
 
 /// Below this many elements a piece is not worth a thread (its spawn, about 10 µs, is the time of
@@ -113,12 +161,12 @@ fn append<T>(all: &mut Vec<T>, mut piece: Vec<T>) {
     }
 }
 
-fn result<C: Columns>(c: &C, i: usize) -> Option<Fingerprint> {
+pub(crate) fn result<C: Columns>(c: &C, i: usize) -> Option<Fingerprint> {
     c.has(i).then(|| c.fingerprint(i))
 }
 
 /// The first index at or after `from` whose key is not below `key`: `crate::seek` on columns.
-fn seek<C: Columns>(c: &C, from: usize, key: &QueryKey) -> usize {
+pub(crate) fn seek<C: Columns>(c: &C, from: usize, key: &QueryKey) -> usize {
     let n = c.keys();
     let (mut lo, mut step) = (from, 1);
     while lo + step <= n && c.key(lo + step - 1) < *key {
@@ -137,7 +185,7 @@ fn seek<C: Columns>(c: &C, from: usize, key: &QueryKey) -> usize {
     lo
 }
 
-fn index_from<C: Columns>(c: &C, cursor: &mut usize, key: &QueryKey) -> Option<usize> {
+pub(crate) fn index_from<C: Columns>(c: &C, cursor: &mut usize, key: &QueryKey) -> Option<usize> {
     *cursor = seek(c, *cursor, key);
     (*cursor < c.keys() && c.key(*cursor) == *key).then_some(*cursor)
 }
@@ -147,7 +195,7 @@ fn start_in<A: Columns, B: Columns>(other: &A, of: &B, start: usize) -> usize {
     if start == 0 { 0 } else { seek(other, 0, &of.key(start)) }
 }
 
-fn same_edges<A: Columns, B: Columns>(a: &A, i: usize, b: &B, j: usize) -> bool {
+pub(crate) fn same_edges<A: Columns, B: Columns>(a: &A, i: usize, b: &B, j: usize) -> bool {
     let (x, y) = (a.edges_of(i), b.edges_of(j));
     x.len() == y.len()
         && x.zip(y).all(|(ea, eb)| a.saw(ea) == b.saw(eb) && a.key(a.read(ea) as usize) == b.key(b.read(eb) as usize))

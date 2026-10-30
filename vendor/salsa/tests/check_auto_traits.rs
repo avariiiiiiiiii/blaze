@@ -2,6 +2,8 @@
 
 //! Test that auto trait impls exist as expected.
 
+#![forbid(unsafe_code)]
+
 use std::panic::UnwindSafe;
 
 use salsa::Database;

@@ -17,6 +17,7 @@
 
 use std::fmt;
 
+use blaze_bytes::le::{get_u32 as u32_at, get_u64 as u64_at};
 use blaze_inproc::frame::{Kind, kinds};
 
 /// The longest reason a `Failed` frame carries.
@@ -190,12 +191,4 @@ fn floor(text: &str, most: usize) -> usize {
         return text.len();
     }
     (0..=most).rev().find(|it| text.is_char_boundary(*it)).unwrap_or(0)
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
 }

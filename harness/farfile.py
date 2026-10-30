@@ -7,12 +7,12 @@ The program is linked with an object of one section that is not loaded, 2.3 GB o
 its file ends further from its code than four bytes of distance reach. A splice added behind
 the file as far from it in memory as the program's frames are could not call into the program,
 nor the program jump to it, and each step was linked in full ("the program is too large").
-Each step is compared with what `cargo build` of the same source prints, and has to have been
+Each step is compared with what blaze's build of the same source from nothing prints, and has to have been
 spliced. Linux.
 """
 import os, struct, sys, tempfile
 
-from difftest import TARGET, host
+from mixed import TARGET, host
 from includes import follow
 
 FAR = 2300 << 20

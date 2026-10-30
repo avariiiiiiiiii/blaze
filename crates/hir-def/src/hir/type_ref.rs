@@ -20,6 +20,7 @@
 //! | `ImplTrait(bounds)`, `DynTrait(bounds)` | e | `[start, len]` into `bounds` |
 //! | `TypeParam(param)` | `type_params` t | |
 //! | `PatternType(ty, pat)` | e | `[ty, pat]` |
+//! | `UnsafeBinder { lifetimes, ty }` | e | `[ty, start, len]`, the lifetimes' run of names |
 //!
 //! `e` is the index in `extra` of the type ref's words, `t` an index into the side table named.
 //! `paths` is the store's [`PathColumns`] (`expr_store/path.rs`), which also hold the names and
@@ -122,7 +123,7 @@ pub struct TraitRef {
     pub path: PathId,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)] // clone: `TypeColumns::push`, once per lowered fn type
 pub struct FnType {
     pub binder: Option<Box<[Name]>>,
     pub params: Box<[(Option<Name>, TypeRefId)]>,
@@ -171,6 +172,12 @@ pub enum TypeRef<'a> {
     TypeParam(TypeParamId),
     PatternType(TypeRefId, PatId),
     Error,
+    /// `unsafe<'a, ..> ty`: the binder's lifetimes are a run of names in the store, read with
+    /// [`ExpressionStore::names`].
+    UnsafeBinder {
+        lifetimes: Names,
+        ty: TypeRefId,
+    },
 }
 
 pub type TypeRefId = Idx<TypeRef<'static>>;
@@ -250,11 +257,12 @@ pub(crate) enum TypeRefKind {
     TypeParam,
     PatternType,
     Error,
+    UnsafeBinder,
 }
 
 impl TypeRefKind {
     /// Every kind, at the index of its value.
-    pub(crate) const ALL: [TypeRefKind; 14] = {
+    pub(crate) const ALL: [TypeRefKind; 15] = {
         use TypeRefKind::*;
         [
             Never,
@@ -271,6 +279,7 @@ impl TypeRefKind {
             TypeParam,
             PatternType,
             Error,
+            UnsafeBinder,
         ]
     };
 
@@ -290,6 +299,7 @@ impl TypeRefKind {
             TypeRef::TypeParam(_) => TypeRefKind::TypeParam,
             TypeRef::PatternType(..) => TypeRefKind::PatternType,
             TypeRef::Error => TypeRefKind::Error,
+            TypeRef::UnsafeBinder { .. } => TypeRefKind::UnsafeBinder,
         }
     }
 }
@@ -315,7 +325,8 @@ pub(crate) struct TypeColumns<V: ColumnVec = Frozen> {
 
 /// The bytes of the columns of one type ref (`kind` and `data`): 5, one cache line holding 12
 /// type refs' kinds and data words; `extra`, the lists and the side tables are counted apart
-/// (two words of `extra` for `Tuple`, `ImplTrait`, `DynTrait` and `PatternType`).
+/// (two words of `extra` for `Tuple`, `ImplTrait`, `DynTrait` and `PatternType`, three for
+/// `UnsafeBinder`).
 pub(crate) const TYPE_REF_BYTES: usize = size_of::<u8>() + size_of::<u32>();
 
 const _: () = {
@@ -405,6 +416,15 @@ impl<V: ColumnVec> TypeColumns<V> {
     }
 
     #[inline]
+    fn triple(&self, at: u32) -> Checked<[u32; 3]> {
+        let at = at as usize;
+        match self.extra.get(at..at.wrapping_add(3)) {
+            Some(&[a, b, c]) => Ok([a, b, c]),
+            _ => Err(EXTRA),
+        }
+    }
+
+    #[inline]
     fn decode(&self, id: TypeRefId) -> Checked<TypeRef<'_>> {
         let at = raw(id) as usize;
         let (Some(&kind), Some(&d)) = (self.kind.get(at), self.data.get(at)) else {
@@ -442,6 +462,10 @@ impl<V: ColumnVec> TypeColumns<V> {
             TypeRefKind::PatternType => {
                 let [ty, pat] = self.pair(d)?;
                 TypeRef::PatternType(idx(ty), idx(pat))
+            }
+            TypeRefKind::UnsafeBinder => {
+                let [ty, start, len] = self.triple(d)?;
+                TypeRef::UnsafeBinder { lifetimes: Names { start, len }, ty: idx(ty) }
             }
         })
     }
@@ -499,6 +523,9 @@ impl TypeColumns<Growing> {
             }
             TypeRef::TypeParam(param) => push_one(&mut self.type_params, param),
             TypeRef::PatternType(ty, pat) => self.words([raw(ty), raw(pat)]),
+            TypeRef::UnsafeBinder { lifetimes, ty } => {
+                self.words([raw(ty), lifetimes.start, lifetimes.len])
+            }
         };
         self.node(kind, data)
     }
@@ -523,7 +550,7 @@ impl TypeColumns<Growing> {
         id
     }
 
-    fn words(&mut self, words: [u32; 2]) -> u32 {
+    fn words<const N: usize>(&mut self, words: [u32; N]) -> u32 {
         let at = len(self.extra.len());
         self.extra.extend_from_slice(&words);
         at
@@ -646,6 +673,10 @@ impl TypeColumns<Frozen> {
                     ty(inner)?;
                     below(raw(pat), pats, "a pattern id past its arena")?;
                 }
+                TypeRef::UnsafeBinder { lifetimes, ty: inner } => {
+                    ty(inner)?;
+                    self.paths.check_names(lifetimes)?;
+                }
             }
         }
         Ok(())
@@ -749,6 +780,8 @@ mod tests {
             TypeRef::TypeParam(type_param(3)),
             TypeRef::PatternType(t(0), idx(0)),
             TypeRef::Error,
+            TypeRef::UnsafeBinder { lifetimes: Names { start: 0, len: 1 }, ty: t(8) },
+            TypeRef::UnsafeBinder { lifetimes: Names::EMPTY, ty: t(0) },
         ]
     }
 
@@ -855,6 +888,13 @@ mod tests {
             columns_of(&[TypeRef::Path(Path::BarePath(&v.mod_paths[0])), TypeRef::ImplTrait(&binder)])
                 .freeze_into();
         assert_eq!(columns.check(0, 0, 0), Err("a name run past its table"));
+
+        let binder = TypeRef::UnsafeBinder { lifetimes: Names { start: 0, len: 2 }, ty: t(0) };
+        let columns = columns_of(&[TypeRef::Never, binder]).freeze_into();
+        assert_eq!(columns.check(0, 0, 0), Err("a name run past its table"));
+        let mut columns = columns_of(&[TypeRef::Never, binder]).freeze_into();
+        columns.data[1] = 1;
+        assert_eq!(columns.check(0, 0, 0), Err(EXTRA));
 
         let mut columns = columns_of(&[TypeRef::Path(Path::BarePath(&v.mod_paths[0]))]).freeze_into();
         columns.data[0] = 1;

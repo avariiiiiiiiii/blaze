@@ -11,7 +11,7 @@ use blaze_ids::ContentId;
 use blaze_query::MemTree;
 use blaze_units::{
     query::{BuildConfig, Command, Invocation, Mount, Origin, PackagePlan, TestSandbox, UnitPlan, Units},
-    schema::{DebugInfo, Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
+    schema::{Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
 };
 use cfg::CfgAtom;
 use intern::Symbol;
@@ -73,24 +73,7 @@ fn library(tree: &MemTree) -> ContentId {
 }
 
 fn profile() -> Profile {
-    Profile {
-        name: "dev".to_owned(),
-        opt_level: "0".to_owned(),
-        lto: "false".to_owned(),
-        codegen_backend: None,
-        codegen_units: None,
-        debuginfo: DebugInfo::Level(2),
-        split_debuginfo: None,
-        debug_assertions: true,
-        overflow_checks: true,
-        rpath: false,
-        incremental: true,
-        panic: "unwind".to_owned(),
-        strip: Strip::Resolved(Stripped::None),
-        rustflags: Vec::new(),
-        trim_paths: None,
-        hint_mostly_unused: None,
-    }
+    Profile { incremental: true, strip: Strip::Resolved(Stripped::None), ..Profile::dev() }
 }
 
 fn target(kind: &str, name: &str, src_path: &str, edition: &str) -> Target {

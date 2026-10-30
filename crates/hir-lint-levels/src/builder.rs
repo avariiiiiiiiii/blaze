@@ -24,7 +24,6 @@ use hir_def::unstable_features::UnstableFeatures;
 use hir_expand::{HirFileId, InFile};
 use intern::Symbol;
 use rustc_hash::{FxBuildHasher, FxHashMap};
-use smallvec::SmallVec;
 use span::Edition;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange,
@@ -527,7 +526,7 @@ impl<'db> Levels<'db> {
                 let checked = cx.store.check(&name, tool.map(|it| it.name()));
                 let named = match &checked {
                     Checked::Ok(_) => Some(Symbol::intern(path.last().map_or("", |it| it.name()))),
-                    Checked::Tool(_, None) => Some(tool.map_or_else(|| Symbol::intern(&name), |tool| joined(tool.name(), &name))),
+                    Checked::Tool(_, None) => Some(tool.map_or_else(|| Symbol::intern(&name), |tool| Symbol::intern_concat(&[tool.name(), "::", &name]))),
                     Checked::Tool(_, Some(new)) => Some(Symbol::intern(new)),
                     Checked::Renamed(new) => Some(Symbol::intern(new)),
                     Checked::MissingTool | Checked::NoTool | Checked::Removed(_) | Checked::NoLint { .. } => None,
@@ -746,15 +745,6 @@ pub fn reveal(lint: &'static Lint, raw: Option<Spec>, warnings: Option<Spec>, ed
         spec.level = spec.level.min(cap);
     }
     spec
-}
-
-/// `tool::name`, interned: joined on the stack for a name of up to 64 bytes.
-fn joined(tool: &str, name: &str) -> Symbol {
-    let mut text: SmallVec<[u8; 64]> = SmallVec::new();
-    text.extend_from_slice(tool.as_bytes());
-    text.extend_from_slice(b"::");
-    text.extend_from_slice(name.as_bytes());
-    Symbol::intern(std::str::from_utf8(&text).expect("two names joined by `::`"))
 }
 
 /// The last element of a lint attribute's list, which may be its `reason`.

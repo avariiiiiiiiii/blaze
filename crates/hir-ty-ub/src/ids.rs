@@ -107,27 +107,9 @@ pub enum AccessKind {
     Write,
 }
 
-/// The memory orderings of `core::sync::atomic::Ordering`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum AtomicOrd {
-    Relaxed,
-    Acquire,
-    Release,
-    AcqRel,
-    SeqCst,
-}
-
-impl AtomicOrd {
-    /// Whether an operation of this ordering acquires: Acquire, AcqRel or SeqCst.
-    pub fn acquires(self) -> bool {
-        matches!(self, AtomicOrd::Acquire | AtomicOrd::AcqRel | AtomicOrd::SeqCst)
-    }
-
-    /// Whether an operation of this ordering releases: Release, AcqRel or SeqCst.
-    pub fn releases(self) -> bool {
-        matches!(self, AtomicOrd::Release | AtomicOrd::AcqRel | AtomicOrd::SeqCst)
-    }
-}
+/// The memory orderings of `core::sync::atomic::Ordering`: the evaluator's, which hands them to
+/// the checker as they are.
+pub use hir_ty_mir::mir::AtomicOrd;
 
 /// A range of bytes of one allocation, as offsets from its start.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -151,5 +133,28 @@ impl Span {
 
     pub fn is_empty(self) -> bool {
         self.len == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AtomicOrd;
+
+    /// The checker's own orderings before it took the evaluator's: which acquire, which release.
+    fn old(ord: AtomicOrd) -> (bool, bool) {
+        match ord {
+            AtomicOrd::Relaxed => (false, false),
+            AtomicOrd::Acquire => (true, false),
+            AtomicOrd::Release => (false, true),
+            AtomicOrd::AcqRel | AtomicOrd::SeqCst => (true, true),
+        }
+    }
+
+    #[test]
+    fn the_evaluators_orderings_acquire_and_release_as_the_checkers_did() {
+        use AtomicOrd::*;
+        for ord in [Relaxed, Acquire, Release, AcqRel, SeqCst] {
+            assert_eq!((ord.acquires(), ord.releases()), old(ord), "{ord:?}");
+        }
     }
 }

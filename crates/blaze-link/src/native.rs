@@ -140,42 +140,51 @@ impl CowFlags {
     }
 }
 
-/// Names to `u32`s, open-addressed: a name is hashed once, compared only when the whole hash
-/// matches, and the first value given a name keeps it. The names live with the caller (`eq`
-/// compares a stored value's name with the one looked for).
+/// The high half of a name's hash: what a [`Table`] slot keeps of it.
+const HIGH: u64 = 0xffff_ffff_0000_0000;
+/// A [`Table`] slot that holds no value.
+const EMPTY: u64 = NONE as u64;
+
+/// Names to `u32`s, open-addressed: a name is hashed once, compared only when the high half of
+/// its hash matches, and the first value given a name keeps it. The names live with the
+/// caller (`eq` compares a stored value's name with the one looked for).
+///
+/// A slot is one `u64`, 8 bytes: the high 32 bits of the hash over the value ([`EMPTY`] for
+/// none), so a probe reads one cache line, and the table is at most half full: 16 to 32 bytes
+/// a name. The probe starts at the hash's high bits, which FxHash mixes best, and a table has
+/// at most 2^32 slots, so the high half alone places a slot again when the table grows.
 #[derive(Default, Debug)]
 pub(crate) struct Table {
-    hashes: Vec<u64>,
-    values: Vec<u32>,
+    slots: Vec<u64>,
     len: usize,
 }
 
 impl Table {
     fn with_capacity(len: usize) -> Table {
         let room = (len.max(4) * 2).next_power_of_two();
-        // alloc: its two columns, once per table (an archive's index, the exports, a build's groups)
-        Table { hashes: vec![0; room], values: vec![NONE; room], len: 0 }
+        // alloc: its one column, once per table (an archive's index, the exports, a build's groups)
+        Table { slots: vec![EMPTY; room], len: 0 }
     }
 
-    /// Where a hash starts probing: its high bits, which FxHash mixes best.
+    /// Where a hash starts probing: its high bits.
     #[inline]
     fn start(&self, hash: u64) -> usize {
-        (hash >> (64 - self.values.len().trailing_zeros())) as usize
+        (hash >> (64 - self.slots.len().trailing_zeros())) as usize
     }
 
     fn find(&self, hash: u64, mut eq: impl FnMut(u32) -> bool) -> Option<u32> {
-        if self.values.is_empty() {
+        if self.slots.is_empty() {
             return None;
         }
-        let mask = self.values.len() - 1;
+        let (mask, high) = (self.slots.len() - 1, hash & HIGH);
         let mut at = self.start(hash);
         loop {
-            let value = self.values[at];
-            if value == NONE {
+            let slot = self.slots[at];
+            if slot == EMPTY {
                 return None;
             }
-            if self.hashes[at] == hash && eq(value) {
-                return Some(value);
+            if slot & HIGH == high && eq(slot as u32) {
+                return Some(slot as u32);
             }
             at = (at + 1) & mask;
         }
@@ -184,41 +193,39 @@ impl Table {
     /// Gives the name `value` unless a value has it already: then that value.
     fn insert(&mut self, hash: u64, value: u32, mut eq: impl FnMut(u32) -> bool) -> Result<(), u32> {
         debug_assert_ne!(value, NONE);
-        if (self.len + 1) * 2 > self.values.len() {
+        if (self.len + 1) * 2 > self.slots.len() {
             self.grow();
         }
-        let mask = self.values.len() - 1;
+        let (mask, high) = (self.slots.len() - 1, hash & HIGH);
         let mut at = self.start(hash);
         loop {
-            let it = self.values[at];
-            if it == NONE {
-                self.values[at] = value;
-                self.hashes[at] = hash;
+            let slot = self.slots[at];
+            if slot == EMPTY {
+                self.slots[at] = high | u64::from(value);
                 self.len += 1;
                 return Ok(());
             }
-            if self.hashes[at] == hash && eq(it) {
-                return Err(it);
+            if slot & HIGH == high && eq(slot as u32) {
+                return Err(slot as u32);
             }
             at = (at + 1) & mask;
         }
     }
 
     fn grow(&mut self) {
-        let room = (self.values.len() * 2).max(8);
-        // alloc: doubling: amortized over the inserts, two columns per growth
-        let old = std::mem::replace(self, Table { hashes: vec![0; room], values: vec![NONE; room], len: 0 });
+        let room = (self.slots.len() * 2).max(8);
+        // alloc: doubling: amortized over the inserts, one column per growth
+        let old = std::mem::replace(self, Table { slots: vec![EMPTY; room], len: 0 });
         let mask = room - 1;
-        for (hash, value) in old.hashes.into_iter().zip(old.values) {
-            if value == NONE {
+        for slot in old.slots {
+            if slot == EMPTY {
                 continue;
             }
-            let mut at = self.start(hash);
-            while self.values[at] != NONE {
+            let mut at = self.start(slot);
+            while self.slots[at] != EMPTY {
                 at = (at + 1) & mask;
             }
-            self.values[at] = value;
-            self.hashes[at] = hash;
+            self.slots[at] = slot;
             self.len += 1;
         }
     }
@@ -234,9 +241,20 @@ fn archive_index(archive: &Archive) -> Table {
     table
 }
 
-/// The member an archive's index says defines `name`.
-fn archive_find(table: &Table, archive: &Archive, name: &str) -> Option<u32> {
-    table.find(hash(name), |it| archive.name(archive.index[it as usize].0) == name).map(|it| archive.index[it as usize].1)
+/// The member an archive's index says defines `name`, whose [`hash`] is `hashed`: a name
+/// looked for in every searched archive is hashed once for all of them.
+fn archive_find(table: &Table, archive: &Archive, hashed: u64, name: &str) -> Option<u32> {
+    table.find(hashed, |it| archive.name(archive.index[it as usize].0) == name).map(|it| archive.index[it as usize].1)
+}
+
+/// The first searched archive (in link-line order) whose index names `name`, and the member
+/// it says defines it: one hash of the name, one probe of each archive's index.
+fn search(archives: &[(u32, Arc<Table>)], inputs: &[Input], name: &str) -> Option<(u32, u32)> {
+    let hashed = hash(name);
+    archives.iter().find_map(|(input, table)| match &*inputs[*input as usize].file {
+        NativeFile::Archive(archive) => archive_find(table, archive, hashed, name).map(|member| (*input, member)),
+        _ => None,
+    })
 }
 
 /// Checks every index and range a reader gave, once, so that the rest reads them in place.
@@ -587,6 +605,8 @@ pub(crate) struct Parsed {
     syms: Vec<Sym>,
     sections_at: usize,
     frames_at: usize,
+    /// How many of its symbols are globals: the most slots it adds to a graph.
+    globals: usize,
     /// Of each section, the symbols its relocations refer to (and subtract), each once.
     refs: Csr<u32>,
     /// Of each section, the symbols defined in it.
@@ -754,12 +774,14 @@ impl Parsed {
         let sections_at = object.symbols.len();
         let frames_at = sections_at + sections;
         debug_assert_eq!(syms.len(), frames_at + frames.len());
+        let globals = object.symbols.iter().filter(|it| !is_local(it)).count();
         Parsed {
             obj,
             base,
             syms,
             sections_at,
             frames_at,
+            globals,
             refs,
             defs,
             group_of,
@@ -872,8 +894,10 @@ impl Exports {
         for (at, (shared, _)) in flat.iter().enumerate() {
             for symbol in &shared.symbols {
                 let name = shared.symbol_name(symbol);
-                let hashed = hash(name);
-                if table.find(hashed, |it| names.at(symbols[it as usize].name) == name).is_some() {
+                // One probe: the slot is taken for the export pushed next, unless an earlier
+                // library's symbol has the name.
+                let index = symbols.len() as u32;
+                if table.insert(hash(name), index, |it| names.at(symbols[it as usize].name) == name).is_err() {
                     continue;
                 }
                 let version = match shared.version(symbol) {
@@ -885,9 +909,7 @@ impl Exports {
                     }),
                 };
                 let stored = names.push(name)?;
-                let index = symbols.len() as u32;
                 symbols.push(Export { name: stored, library: canonical[at], version, kind: symbol.kind, weak: symbol.weak });
-                let _ = table.insert(hashed, index, |_| false);
             }
         }
         Ok(Exports { roots, libraries, orders, canonical, names, versions, symbols, table })
@@ -1563,7 +1585,7 @@ enum Decision {
 }
 
 /// What resolving the native inputs and the names gave, and what the next stage reuses.
-#[derive(Clone, Default)]
+#[derive(Clone, Default)] // clone: every field `Copy`, an `Arc` or copy-on-write: reference counts only
 pub(crate) struct Resolved {
     pub imports: Arc<Vec<Import>>,
     /// Each import's symbol.
@@ -1685,6 +1707,13 @@ impl Build {
 
     fn slot(&mut self, sym: Sym) -> u32 {
         self.graph.slot(sym)
+    }
+
+    /// Room for `slots` more slots: the slot map is sized once a pull round, never doubled
+    /// (and rehashed) while a round registers its objects.
+    fn reserve(&mut self, slots: usize) {
+        self.graph.slot_of.reserve(slots);
+        self.graph.slots.reserve(slots);
     }
 
     fn flag(&mut self, slot: u32, flags: u16) {
@@ -2682,11 +2711,7 @@ impl<'a> Stage<'a> {
                 }
                 if refs.class(sym) == 2 {
                     let name = symbols.name_of(sym).unwrap_or("");
-                    let pulls = graph.archives.iter().any(|(input, table)| match &*self.new.inputs[*input as usize].file {
-                        NativeFile::Archive(archive) => archive_find(table, archive, name).is_some(),
-                        _ => false,
-                    });
-                    if pulls {
+                    if search(&graph.archives, &self.new.inputs, name).is_some() {
                         return Ok(None);
                     }
                 }
@@ -2770,7 +2795,7 @@ impl<'a> Stage<'a> {
             match decision {
                 Decision::Special(special) => {
                     let at = self.new.specials.len() as u32;
-                    self.new.specials.push(special);
+                    Arc::make_mut(&mut self.new.specials).push(special);
                     self.define(sym, Def::Special(at));
                     next.defined.push(sym);
                 }
@@ -2883,6 +2908,9 @@ impl<'a> Stage<'a> {
         // clone: an `Arc`: Rust's names, read while the stage defines them
         let names = self.new.names.clone();
         let mut b = Build::new();
+        // Rust's names, the names it refers to, the entry, `_init` and `_fini`; the exports are
+        // few and grow it at most once.
+        b.reserve(names.len() + refs.names.len() + 3);
         let mut rust: Vec<(Sym, Sym)> = Vec::with_capacity(names.len());
         rust.extend(names.iter().map(|(name, target)| (self.symbols.intern(SymKey::Name(*name)), *target)));
         for (sym, _) in &rust {
@@ -2949,6 +2977,7 @@ impl<'a> Stage<'a> {
         let mut pulled = false;
         loop {
             let reads = self.read(&round)?;
+            b.reserve(reads.iter().map(|it| if let Read::Object(parsed) = it { parsed.globals } else { 0 }).sum());
             for (&(input, _), read) in round.iter().zip(reads) {
                 match read {
                     Read::Object(parsed) => self.register(&mut b, parsed, input, pulled)?,
@@ -2967,13 +2996,9 @@ impl<'a> Stage<'a> {
                 if O::ANY && outside.name(name).is_some() {
                     continue;
                 }
-                for (input, table) in &archives {
-                    let NativeFile::Archive(archive) = &*inputs[*input as usize].file else { continue };
-                    if let Some(member) = archive_find(table, archive, name) {
-                        if b.pulled.insert((*input, member)) {
-                            next.push((*input, member + 1));
-                        }
-                        break;
+                if let Some((input, member)) = search(&archives, &inputs, name) {
+                    if b.pulled.insert((input, member)) {
+                        next.push((input, member + 1));
                     }
                 }
             }
@@ -3281,10 +3306,14 @@ impl<'a> Stage<'a> {
             };
             outcomes.push((sym, kind | bits));
         }
-        self.new.specials.clear();
+        match Arc::get_mut(&mut self.new.specials) {
+            Some(list) => list.clear(),
+            // alloc: once per graph built while an older state shares the list, which it keeps
+            None => self.new.specials = Arc::default(),
+        }
         for (sym, special) in specials {
             let at = self.new.specials.len() as u32;
-            self.new.specials.push(special);
+            Arc::make_mut(&mut self.new.specials).push(special);
             self.define(sym, Def::Special(at));
             defined.push(sym);
         }
@@ -3459,6 +3488,74 @@ mod tests {
         }
         assert_eq!(table.find(hash("absent"), |_| true), None);
         assert_eq!(Table::default().find(hash("x"), |_| true), None);
+    }
+
+    /// A slot keeps only the high half of a hash: names whose hashes share it are told apart
+    /// by their names alone, across growth, and a hash differing only in its low half is
+    /// another probe of the same names.
+    #[test]
+    fn names_whose_hashes_share_the_high_half_are_told_apart_by_name() {
+        let shared = 0xdead_beef_0000_0000u64;
+        let mut table = Table::with_capacity(2);
+        for value in 0..300u32 {
+            assert_eq!(table.insert(shared | u64::from(value), value, |it| it == value), Ok(()));
+        }
+        for value in 0..300u32 {
+            assert_eq!(table.find(shared | 0xffff, |it| it == value), Some(value));
+            assert_eq!(table.insert(shared, value + 1000, |it| it == value), Err(value));
+        }
+        assert_eq!(table.find(shared, |it| it == 300), None);
+        assert_eq!(table.find(!shared & HIGH, |_| true), None, "no slot has another high half");
+        assert_eq!(table.len, 300);
+    }
+
+    #[test]
+    fn a_name_is_searched_for_in_line_order_as_a_scan_of_the_indexes_finds_it() {
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x5eed_a5c1);
+        let pool: Vec<String> = (0..64).map(|it| format!("name{it}")).collect();
+        for round in 0..200 {
+            let count = 1 + rng.below(5) as usize;
+            let mut inputs = Vec::with_capacity(count);
+            let mut written: Vec<Vec<(String, u32)>> = Vec::with_capacity(count);
+            for at in 0..count {
+                let mut names = Names::default();
+                let members: Vec<crate::model::Member> =
+                    (0..4).map(|it| crate::model::Member { name: names.push(&format!("m{it}.o")).unwrap(), bytes: 0..0 }).collect();
+                let entries = rng.below(24) as usize;
+                let (mut index, mut listed) = (Vec::with_capacity(entries), Vec::with_capacity(entries));
+                for _ in 0..entries {
+                    let name = &pool[rng.below(pool.len() as u64) as usize];
+                    let member = rng.below(4) as u32;
+                    index.push((names.push(name).unwrap(), member));
+                    listed.push((name.clone(), member));
+                }
+                written.push(listed);
+                inputs.push(Input {
+                    id: blaze_ids::ContentId([at as u8; 32]),
+                    name: format!("lib{round}_{at}.a").into(),
+                    kind: NativeKind::Archive { whole: false },
+                    order: at as u32,
+                    bytes: Arc::from(Vec::new()),
+                    file: Arc::new(NativeFile::Archive(Archive { members, index, names })),
+                });
+            }
+            let archives: Vec<(u32, Arc<Table>)> = inputs
+                .iter()
+                .enumerate()
+                .map(|(at, it)| {
+                    let NativeFile::Archive(archive) = &*it.file else { unreachable!("made as archives") };
+                    (at as u32, Arc::new(archive_index(archive)))
+                })
+                .collect();
+            for name in &pool {
+                let scanned = written
+                    .iter()
+                    .enumerate()
+                    .find_map(|(at, listed)| listed.iter().find(|it| it.0 == *name).map(|it| (at as u32, it.1)));
+                let found = blaze_alloc_count::assert_at_most(0, "a search of the archives", || search(&archives, &inputs, name));
+                assert_eq!(found, scanned, "{name}");
+            }
+        }
     }
 
     #[test]

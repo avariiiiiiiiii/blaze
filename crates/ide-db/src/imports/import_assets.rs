@@ -473,9 +473,9 @@ impl<'db> ImportAssets<'db> {
     }
 }
 
-fn path_applicable_imports(
-    db: &RootDatabase,
-    scope: &SemanticsScope<'_>,
+fn path_applicable_imports<'db>(
+    db: &'db RootDatabase,
+    scope: &SemanticsScope<'db>,
     current_crate: Crate,
     path_candidate: &PathImportCandidate,
     mod_path: impl Fn(ItemInNs) -> Option<ModPath> + Copy,
@@ -590,9 +590,9 @@ fn filter_by_definition_kind(
     }
 }
 
-fn filter_candidates_by_after_path(
-    db: &RootDatabase,
-    scope: &SemanticsScope<'_>,
+fn filter_candidates_by_after_path<'db>(
+    db: &'db RootDatabase,
+    scope: &SemanticsScope<'db>,
     path_candidate: &PathImportCandidate,
     imports: &mut FxIndexSet<LocatedImport>,
 ) {
@@ -622,7 +622,7 @@ fn filter_candidates_by_after_path(
                 .collect::<SmallVec<[_; 3]>>()
         };
         items.into_iter().any(|item| {
-            let has_last_method = |ty: hir::Type<'_>| {
+            let has_last_method = |ty: hir::Type<'db>| {
                 ty.iterate_path_candidates(db, scope, &traits_in_scope, Some(last_after), |_| {
                     Some(())
                 })
@@ -656,9 +656,9 @@ fn filter_candidates_by_after_path(
 
 /// Validates and builds an import for `resolved_qualifier` if the `unresolved_qualifier` appended
 /// to it resolves and there is a validate `candidate` after that.
-fn validate_resolvable(
-    db: &RootDatabase,
-    scope: &SemanticsScope<'_>,
+fn validate_resolvable<'db>(
+    db: &'db RootDatabase,
+    scope: &SemanticsScope<'db>,
     mod_path: impl Fn(ItemInNs) -> Option<ModPath>,
     scope_filter: impl Fn(ItemInNs) -> bool,
     candidate: &NameToImport,

@@ -3,6 +3,8 @@
 //! Demonstrates that accumulation is done in the order
 //! in which things were originally executed.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use expect_test::expect;

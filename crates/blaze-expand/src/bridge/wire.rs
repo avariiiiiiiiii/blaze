@@ -105,21 +105,6 @@ pub fn relative(tree: &TopSubtree, parts: &mut Parts, out: &mut Vec<u8>) {
     }
 }
 
-/// `bytes` at a 4-byte boundary, as `read_wire` takes them: themselves when they are, else a
-/// copy in `room`.
-fn aligned<'a>(bytes: &'a [u8], room: &'a mut Vec<u8>) -> &'a [u8] {
-    if bytes.as_ptr().addr().is_multiple_of(4) {
-        return bytes;
-    }
-    room.clear();
-    // alloc: a copy only of bytes off a 4-byte boundary, as a kept output in the store can be.
-    room.resize(bytes.len() + 3, 0);
-    let skip = room.as_ptr().addr().wrapping_neg() % 4;
-    room[skip..skip + bytes.len()].copy_from_slice(bytes);
-    let room: &'a [u8] = room;
-    &room[skip..skip + bytes.len()]
-}
-
 /// The tree of `bytes`, all of them, each span part it names one of `parts`: an error saying
 /// what is wrong with them otherwise.
 pub fn read(bytes: &[u8], parts: &Parts) -> Result<TopSubtree, String> {
@@ -130,7 +115,7 @@ pub fn read(bytes: &[u8], parts: &Parts) -> Result<TopSubtree, String> {
 /// [`read`], copying bytes off a 4-byte boundary into the caller's `room`, kept across
 /// reads, so a hit read from wherever the store has it takes no new memory for the copy.
 pub fn read_in(bytes: &[u8], parts: &Parts, room: &mut Vec<u8>) -> Result<TopSubtree, String> {
-    let bytes = aligned(bytes, room);
+    let bytes = tt::aligned(bytes, room);
     let (tree, used) = TopSubtree::read_wire(bytes, &mut |part| parts.named(part))
         // alloc: the message of a tree refused.
         .map_err(|e| e.to_string())?;

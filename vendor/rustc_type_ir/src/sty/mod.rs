@@ -310,6 +310,7 @@ impl<I: Interner> TypeFoldable<I> for Region<I> {
 }
 
 #[derive_where(Clone, Copy, PartialEq, Eq, Hash; I: Interner)]
+#[derive(GenericTypeVisitable)]
 #[cfg_attr(
     feature = "nightly",
     derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)

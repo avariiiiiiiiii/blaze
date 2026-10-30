@@ -47,7 +47,6 @@ impl fmt::Display for CfgAtom {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum CfgExpr {
     Invalid,
     Atom(CfgAtom),
@@ -273,18 +272,4 @@ fn next_cfg_expr(it: &mut tt::iter::TtIter<'_>) -> Option<CfgExpr> {
         it.next();
     }
     Some(ret)
-}
-
-#[cfg(test)]
-impl arbitrary::Arbitrary<'_> for CfgAtom {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        if u.arbitrary()? {
-            Ok(CfgAtom::Flag(Symbol::intern(<_>::arbitrary(u)?)))
-        } else {
-            Ok(CfgAtom::KeyValue {
-                key: Symbol::intern(<_>::arbitrary(u)?),
-                value: Symbol::intern(<_>::arbitrary(u)?),
-            })
-        }
-    }
 }

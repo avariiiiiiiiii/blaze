@@ -133,7 +133,8 @@ pub(crate) fn relocs_into<T>(hasher: &mut Hasher, relocs: &Relocs<T>, mut target
     }
 }
 
-pub(crate) fn target_into(hasher: &mut Hasher, target: &Target) {
+/// A relocation target into `hasher`: a tag byte per kind, then what names it.
+pub fn target_into(hasher: &mut Hasher, target: &Target) {
     match target {
         Target::Function(key) => hasher.update(&[0]).id(&key.0),
         Target::Direct(key) => hasher.update(&[1]).id(&key.0),
@@ -419,6 +420,30 @@ mod tests {
         let wider = function(&[0xe8, 0, 0, 0, 0], vec![reloc(1, 1 << 41)]);
         assert_ne!(code_id(&a), code_id(&wide));
         assert_ne!(code_id(&wide), code_id(&wider));
+    }
+
+    /// blaze-premap's image key hashes names' targets with [`target_into`] too: each kind,
+    /// even of the same name or ID, is a different input.
+    #[test]
+    fn every_kind_of_target_hashes_apart() {
+        let id = ContentId([1; 32]);
+        let key = InstanceKey(id);
+        let targets = [
+            Target::Function(key),
+            Target::Direct(key),
+            Target::Static { item: blaze_items::ItemKey(id), instance: id },
+            Target::Data(id),
+            Target::Extern("a".into()),
+            Target::Weak("a".into()),
+            Target::Position(SpanRef { anchor: id, index: 1 }),
+            Target::Coverage(1),
+            Target::Counter(key),
+            Target::ProfileCounters,
+        ];
+        let mut ids: Vec<ContentId> = targets.iter().map(target_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), targets.len());
     }
 
     #[test]

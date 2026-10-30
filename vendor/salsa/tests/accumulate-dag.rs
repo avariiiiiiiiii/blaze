@@ -1,4 +1,5 @@
 #![cfg(all(feature = "inventory", feature = "accumulator"))]
+#![forbid(unsafe_code)]
 
 mod common;
 

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Edits of the kinds people and agents make, thrown at one warm daemon, each checked against cargo.
+"""Edits of the kinds people and agents make, thrown at one warm daemon, each checked against
+blaze's build of the same source from nothing.
 
 usage: stress.py [--only TEXT] [--from N] [--keep]
 
 Copies harness/stress (three crates) to a scratch directory, starts the daemon on all of them, and
 applies STEPS in order. The edits stay: each step builds on the ones before. After each, `blaze
-sync` is asked for a build, the program is run, and `cargo build` of the same source is run and its
-program's output compared. A step marked broken is one cargo rejects: the daemon has to say
-so and survive it, and the first step after it that cargo builds has to be a patch: the text
+sync` is asked for a build, the program is run, and blaze's build of the same source from nothing
+(mixed.from_scratch) is run and its program's output compared. A step marked broken is one that is
+not Rust: the daemon has to say so and survive it, and the first step after it that is Rust again
+has to be a patch: the text
 refused leaves the build the next edit is a patch of as it was (issue #31). Writes STRESS.md,
 and exits 1 when a step is wrong.
 """
@@ -17,7 +19,7 @@ import socket as unix
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built, toolchain
+from mixed import Fixture, BLAZE, sysroot_rlibs, RUNNER, from_scratch, printed, toolchain
 
 BASE, SHAPES, STACK = "base/src/lib.rs", "base/src/shapes.rs", "base/src/stack.rs"
 MID, TEXT, TASKS = "mid/src/lib.rs", "mid/src/text.rs", "mid/src/tasks.rs"
@@ -181,7 +183,7 @@ STEPS = [
     step("#[inline(never)] and #[cold] added", sub(TEXT, "pub fn count_words(", "#[inline(never)]\n#[cold]\npub fn count_words(")),
     step("cfg(debug_assertions) branch", append(MID, "\npub fn mode() -> &'static str {\n    if cfg!(debug_assertions) {\n        \"debug\"\n    } else {\n        \"release\"\n    }\n}\n\n#[cfg(not(debug_assertions))]\npub fn only_release() {}\n"), probe("mode", "smid::mode()")),
     step("visibility narrowed and widened", sub(MID, "pub struct Evens {", "pub(crate) struct Evens2;\n\npub struct Evens {")),
-    # Things cargo rejects: the daemon has to survive and then recover.
+    # Text that is not Rust: the daemon has to survive and then recover.
     step("BROKEN: syntax error", sub(TEXT, "pub fn words(s: &str) -> Vec<&str> {", "pub fn words(s: &str -> Vec<&str> {"), broken=True),
     step("fixed again, with a body change", sub(TEXT, "pub fn words(s: &str -> Vec<&str> {\n    s.split_whitespace().collect()", "pub fn words(s: &str) -> Vec<&str> {\n    s.split(' ').collect()")),
     step("BROKEN: type error in a body", sub(MID, "    Ok(n + 1)", "    Ok(n + \"1\")"), broken=True),
@@ -223,13 +225,11 @@ def main():
     work = tempfile.mkdtemp(prefix="blaze-stress-out-")
     obj, patch, binary = (os.path.join(work, n) for n in ("blaze.o", "blaze.patch.o", "bin-blaze"))
     socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
-    # Cargo's reference build has its own directory: the daemon links against the rlibs of the
-    # build it started from.
-    reference = os.path.join(work, "reference")
+    scratch_runs = {}
     out = open(log_path, "a")
 
     def start():
-        """Builds the source as it is with cargo, then starts a daemon on top of that build."""
+        """Has cargo print the link line of the source as it is, then starts a daemon that links with it."""
         fx = Fixture(ws, crates, ["-p", "sapp"])
         fx.rustc_build()
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
@@ -257,6 +257,17 @@ def main():
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
+
+    def from_nothing():
+        """What blaze's build of the source as it is, from nothing, prints, by the state of the
+        source: going back and forth comes to states built before."""
+        state = tuple(sorted(files().items()))
+        if state not in scratch_runs:
+            try:
+                scratch_runs[state] = printed(from_scratch(ws, crates, ["-p", "sapp"]))
+            except SystemExit as error:
+                return f"did not build from nothing: {str(error)[:200]}"
+        return scratch_runs[state]
 
     def files():
         found = {}
@@ -349,10 +360,6 @@ def main():
             reply = "no reply in 120 s"
         took = (time.time() - asked) * 1000
         died = daemon.poll() is not None
-        cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
-                               env={**os.environ, "CARGO_TARGET_DIR": reference})
-        if (cargo.returncode != 0) != broken:
-            raise SystemExit(f"step {index} {name!r}: cargo {'failed' if cargo.returncode else 'passed'}:\n{cargo.stderr[-2000:]}")
         kind = "patch" if reply.startswith("ok patch") else "full" if reply.startswith("ok object") else "unchanged" if reply.startswith("ok unchanged") else "error"
         if died:
             verdict = "DAEMON DIED"
@@ -361,7 +368,7 @@ def main():
         elif kind == "error":
             verdict = "REFUSED: " + reply[:120].replace("|", "/").replace("\n", " ")
         else:
-            ours, theirs = run(binary), run(built(reference, "sapp"))
+            ours, theirs = run(binary), from_nothing()
             if ours == theirs and mended and kind != "patch" and not os.environ.get("BLAZE_PATCH_FIRST"):
                 verdict = "WRONG: not a patch, as if the refused text had been built"
             elif ours == theirs and meanwhile is not None and not meanwhile.startswith("ok"):
@@ -383,7 +390,7 @@ def main():
             try:
                 daemon = start()
             except BaseException as error:
-                print(f'    cargo cannot build this source: {str(error)[:200]}', flush=True)
+                print(f'    no daemon starts on this source: {str(error)[:200]}', flush=True)
             restarts += 1
     daemon.kill()
     good = sum(1 for r in rows if r[4] == "same" or r[4].startswith("said so"))

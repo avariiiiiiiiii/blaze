@@ -72,10 +72,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use blaze_core::Untraceable;
+use blaze_core::{Untraceable, utf8::push_lossy};
 use rustc_hash::FxHashMap;
 
-use super::{Also, Bind, MARK, Recorder, Scope, Spec, View, push_lossy, tidy, tidy_into};
+use super::{Also, Bind, MARK, Recorder, Scope, Spec, View, tidy, tidy_into};
 
 #[allow(unsafe_code, reason = "the Linux system calls, each behind a safe function")]
 mod raw;
@@ -2197,7 +2197,7 @@ fn noted(
         Some(Address::Abstract(name)) if confined || watch.network => {
             scratch.text.clear();
             scratch.text.push_str("unix:@");
-            push_lossy(&scratch.memory[name], &mut scratch.text);
+            push_lossy(&mut scratch.text, &scratch.memory[name]);
             recorder.refused_net(thread, &scratch.text);
             return Some(if to_unix { libc::ECONNREFUSED } else { libc::EACCES });
         }

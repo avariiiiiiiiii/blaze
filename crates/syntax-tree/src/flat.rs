@@ -42,6 +42,8 @@
 
 #[allow(unsafe_code)]
 mod block;
+mod budget;
+mod image;
 
 use std::{
     cell::Cell,
@@ -59,6 +61,7 @@ use blaze_ids::{
 };
 
 use self::block::{Block, Col};
+pub use self::image::{ImageError, IMAGE_LAYOUT};
 use crate::{SyntaxKind, Text, TextRange, TextSize};
 
 /// Every how many elements a start is kept.
@@ -1029,7 +1032,7 @@ impl FlatTree {
 
     /// Where element `at` starts; `len()` for where the last ends.
     #[inline]
-    fn offset(&self, at: u32) -> u32 {
+    pub(crate) fn offset(&self, at: u32) -> u32 {
         let mark = at / MARK;
         let mut offset = self.marks[mark as usize];
         for it in mark * MARK..at {
@@ -1052,6 +1055,17 @@ impl FlatTree {
             }
         };
         TextRange::new(TextSize::from(start), TextSize::from(end))
+    }
+
+    /// Where node `at` ends, given where it starts: [`Self::range`]'s end without counting its
+    /// start again.
+    #[inline]
+    pub(crate) fn node_end(&self, at: u32, start: u32) -> u32 {
+        let end = self.end(at);
+        match end / MARK == at / MARK {
+            true => (at..end).fold(start, |offset, it| offset + self.text_len(it)),
+            false => self.offset(end),
+        }
     }
 
     #[inline]
@@ -1383,6 +1397,7 @@ impl FlatTree {
     /// `from` in its own.
     fn moved(mut self, source: Text, from: u32, to: u32) -> FlatTree {
         debug_assert!(self.lazy.is_none());
+        assert!(!self.block.is_held(), "a tree read in place is copied before it is written");
         for mark in self.marks.iter_mut() {
             *mark = *mark - from + to;
         }
@@ -1917,7 +1932,9 @@ impl FlatTree {
     fn expand(&self, at: u32) -> Part {
         let lazy = self.lazy.as_deref().expect("a lazy node's tree has an expander");
         let (kind, range) = (self.kind(at), self.range(at));
-        let (part, errors) = (lazy.expand)(kind, &self.source, range, lazy.data);
+        let (part, errors) = budget::charging(self.block.tag(), || {
+            (lazy.expand)(kind, &self.source, range, lazy.data)
+        });
         let root = part.range(0);
         // Over the same source at the same range, the part's text is the node's: no compare.
         assert!(
@@ -2182,13 +2199,13 @@ mod tests {
     /// A tree to build each way: a node is its kind, its children and, when it is lazy in an
     /// outline, the number of its part in [`PARTS`].
     #[derive(Clone, Debug)]
-    enum Shape {
+    pub(super) enum Shape {
         Node(SyntaxKind, Vec<Shape>, Option<usize>),
         Token(SyntaxKind, String),
     }
 
     /// A tree from a seed: nodes up to five deep, some empty, tokens of zero to three bytes.
-    fn random_shape(seed: u64) -> Shape {
+    pub(super) fn random_shape(seed: u64) -> Shape {
         fn close(open: &mut Vec<(SyntaxKind, Vec<Shape>)>) {
             let (kind, children) = open.pop().unwrap();
             open.last_mut().unwrap().1.push(Shape::Node(kind, children, None));
@@ -2218,7 +2235,7 @@ mod tests {
     /// A tree past what an element's word holds: rows of 170 tokens with a token between
     /// them, so most of those are more than a thousand elements after their parent; a few
     /// tokens of more than a thousand bytes; and some kinds past the word's.
-    fn big_shape(seed: u64) -> Shape {
+    pub(super) fn big_shape(seed: u64) -> Shape {
         let mut rng = SplitMix64::new(seed);
         let mut rows = Vec::new();
         for row in 0..100u64 {
@@ -2256,7 +2273,7 @@ mod tests {
     }
 
     /// Makes some nodes below the root of `shape` lazy, none inside another.
-    fn make_lazy(shape: &mut Shape, rng: &mut SplitMix64) {
+    pub(super) fn make_lazy(shape: &mut Shape, rng: &mut SplitMix64) {
         let Shape::Node(_, children, _) = shape else { return };
         for child in children.iter_mut() {
             if let Shape::Node(kind, grandchildren, None) = child {
@@ -2271,7 +2288,7 @@ mod tests {
 
     /// The expander of the tests' outlines: the part kept in [`PARTS`], rebuilt over the
     /// source at `range`. Its error is the part's number, at the number.
-    fn expand(
+    pub(super) fn expand(
         kind: SyntaxKind,
         source: &Text,
         range: TextRange,
@@ -2527,7 +2544,7 @@ mod tests {
     }
 
     /// `shape` as a flat tree in full, appending its text or over its source.
-    fn build_flat(shape: &Shape, sourced: bool) -> FlatTree {
+    pub(super) fn build_flat(shape: &Shape, sourced: bool) -> FlatTree {
         let mut builder = match sourced {
             true => {
                 let mut text = String::new();
@@ -2541,7 +2558,7 @@ mod tests {
     }
 
     /// `shape` as an outline over its source.
-    fn build_outline(shape: &Shape, expand: Expand) -> Arc<FlatTree> {
+    pub(super) fn build_outline(shape: &Shape, expand: Expand) -> Arc<FlatTree> {
         let mut text = String::new();
         text_of(shape, &mut text);
         let mut builder = FlatTreeBuilder::sourced(text.into());
@@ -3100,7 +3117,7 @@ mod tests {
 
     /// `spliced`, made by copying around an edit, is `built`, the edited tree built anew, in
     /// every array, those equality leaves out too.
-    fn same_arrays(spliced: &FlatTree, built: &FlatTree, seed: u64) {
+    pub(super) fn same_arrays(spliced: &FlatTree, built: &FlatTree, seed: u64) {
         assert_eq!(spliced, built, "seed {seed}");
         assert_eq!(
             (&spliced.nodes, &spliced.ranks, &spliced.node_parents, &spliced.far, &spliced.marks),

@@ -11,7 +11,7 @@
 //! which lint levels do not change: the part's [`key`] is the image's and the borrow checker's
 //! mode.
 
-mod ids;
+pub(crate) mod ids;
 mod part;
 #[cfg(test)]
 mod tests;
@@ -22,7 +22,7 @@ use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Domain, Hasher};
 use hir_def::{
     DefWithBodyId, HasModule,
-    deps::{Held as _, ImageBuf, body_key},
+    deps::{Held as _, ImageBuf, body_key, crate_name},
 };
 use rustc_hash::FxHashMap;
 
@@ -221,15 +221,6 @@ fn served_body(db: &Db, def: DefWithBodyId) -> Option<(Crate, BodyRef<'_>)> {
     };
     let body = part::open_body(bytes).unwrap_or_else(|why| corrupt(db, krate, Some(def), &why));
     Some((krate, body))
-}
-
-fn crate_name(db: &Db, krate: Crate) -> String {
-    match &krate.extra_data(db).display_name {
-        // alloc: the name in a panic's message
-        Some(name) => name.to_string(),
-        // alloc: as above
-        None => format!("{krate:?}"),
-    }
 }
 
 #[cold]

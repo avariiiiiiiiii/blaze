@@ -134,6 +134,7 @@ impl Thread {
             yields: 0,
             token: false,
             unparked: Clock::ZERO,
+            // alloc: none until the thread's first `thread_local!` (`Vec::new` is free)
             locals: Vec::new(),
             dropping_locals: false,
             at: None,
@@ -196,10 +197,17 @@ pub(crate) struct Runtime {
     pub(crate) spawned: Vec<(Tid, coro::Job)>,
     pub(crate) finding: Option<String>,
     max_threads: usize,
+    /// Per thread, the path position plus one of the access its pending operation last asked
+    /// DPOR to backtrack to (0: none). Within an execution that call does the same thing each
+    /// time it is repeated (a past branch's marks and runs don't change), so it is made once.
+    backtracked: [u32; MAX_THREADS],
     /// A load's candidate stores, reused.
     pub(crate) candidates: Vec<u16>,
-    /// Store histories of ended executions, reused.
-    pub(crate) spare: Vec<std::collections::VecDeque<memory::Store>>,
+    /// Each atomic's stores in modification order, by object index. Kept across executions:
+    /// the object at an index is most often the same atomic in the next execution (they differ
+    /// only past the branch that changed), so its history's capacity is reused and a warm store
+    /// allocates nothing.
+    pub(crate) histories: Vec<std::collections::VecDeque<memory::Store>>,
     /// Raw bytes tracked by `cell::read`, `write` and `free`.
     pub(crate) bytes: memory::ByteMap,
 }
@@ -210,16 +218,20 @@ impl Runtime {
             threads: Vec::with_capacity(MAX_THREADS),
             active: None,
             running: false,
+            // alloc: none until used; kept across executions
             objects: Vec::new(),
             path,
             epoch: 0,
             last_sc_fence: Clock::ZERO,
             last_sc_write: Clock::ZERO,
+            // alloc: none until used; kept across executions
             spawned: Vec::new(),
             finding: None,
             max_threads: max_threads.clamp(1, MAX_THREADS),
-            candidates: Vec::new(),
-            spare: Vec::new(),
+            backtracked: [0; MAX_THREADS],
+            candidates: Vec::with_capacity(memory::HISTORY),
+            // alloc: none until used; kept across executions
+            histories: Vec::new(),
             bytes: memory::ByteMap::default(),
         }
     }
@@ -231,7 +243,7 @@ impl Runtime {
         self.threads.push(Thread::new());
         self.active = Some(0);
         self.running = true;
-        self.recycle();
+        self.objects.clear();
         let reserved = std::iter::once(Object::Fence).chain((0..MAX_THREADS).map(|_| Object::Park));
         for obj in reserved {
             self.objects.push(Entry { obj, last: None, last_store: None });
@@ -240,24 +252,15 @@ impl Runtime {
         self.last_sc_write = Clock::ZERO;
         self.spawned.clear();
         self.finding = None;
+        self.backtracked = [0; MAX_THREADS];
         self.bytes.clear();
     }
 
-    /// Ends an execution: what its objects hold is dropped or kept for the next.
+    /// Ends an execution. Its objects hold nothing on the heap (histories stay in
+    /// `histories`, cleared when their index is next made), so they go with the next `begin`.
     pub(crate) fn end(&mut self) {
         self.running = false;
         self.active = None;
-        self.recycle();
-    }
-
-    fn recycle(&mut self) {
-        for entry in self.objects.drain(..) {
-            if let Object::Atomic(atomic) = entry.obj {
-                let mut stores = atomic.stores;
-                stores.clear();
-                self.spare.push(stores);
-            }
-        }
     }
 
     pub(crate) fn current(&self) -> Tid {
@@ -293,15 +296,18 @@ impl Runtime {
 
     pub(crate) fn stuck(&self, stuck: Stuck) -> String {
         match stuck {
+            // alloc: a finding's or an error's text, made once, when the model stops
             Stuck::TooLong(max) => format!(
                 "an execution passed {max} branches: a loop that waits for another thread \
                  without `thread::yield_now` or `hint::spin_loop`, or a model too long for \
                  `max_branches`"
             ),
+            // alloc: a finding's or an error's text, made once, when the model stops
             Stuck::Nondeterministic(at, what) => format!(
                 "the model is not deterministic: at branch {at}, {what} (does it read a clock, \
                  a random number, or a static an earlier execution changed?)"
             ),
+            // alloc: a finding's or an error's text, made once, when the model stops
             Stuck::BadReplay(at, what) => format!("the replayed schedule does not fit: at branch {at}, {what}"),
         }
     }
@@ -315,7 +321,9 @@ impl Runtime {
             let Some(op) = th.op else { continue };
             if let Some(access) = self.objects[op.obj as usize].dependent(op.kind)
                 && !access.dpor.le(&th.dpor)
+                && self.backtracked[thread] != access.pos + 1
             {
+                self.backtracked[thread] = access.pos + 1;
                 self.path.backtrack(access.pos as usize, thread);
             }
         }
@@ -369,6 +377,7 @@ impl Runtime {
     }
 
     fn deadlock(&self) -> String {
+        // alloc: a finding's or an error's text, made once, when the model stops
         let mut out = String::from("deadlock: no thread can run and not every thread has ended");
         for (thread, th) in self.threads.iter().enumerate() {
             let state = match th.state {
@@ -379,6 +388,7 @@ impl Runtime {
                 State::Blocked(Wait::Park) => "is parked",
                 State::Runnable | State::Yield => "can run",
             };
+            // alloc: a finding's or an error's text, made once, when the model stops
             out.push_str(&format!("\n  {}: {state}", self.describe(thread)));
         }
         out
@@ -387,9 +397,12 @@ impl Runtime {
     /// A thread for reports: its index, its name, and its last operation and where.
     pub(crate) fn describe(&self, thread: Tid) -> String {
         let th = &self.threads[thread];
+        // alloc: a finding's or an error's text, made once, when the model stops
         let name = th.name.as_deref().map(|it| format!(" ({it})")).unwrap_or_default();
         match th.at {
+            // alloc: a finding's or an error's text, made once, when the model stops
             Some(at) => format!("thread {thread}{name}, last at {at} ({})", th.what),
+            // alloc: a finding's or an error's text, made once, when the model stops
             None => format!("thread {thread}{name}, before its first operation"),
         }
     }
@@ -451,10 +464,17 @@ pub(crate) fn stop(found: String) -> ! {
     unreachable!("blaze-check: a thread resumed after a finding")
 }
 
-/// Switches away if the schedule said so, or stops at a finding.
+/// Switches away if the schedule said so, or stops at a finding. When all the explorer would
+/// do is resume the thread the schedule picked (no new thread to start), the switch goes
+/// straight to it.
 fn go_on(switch: Result<bool, String>) {
     match switch {
-        Ok(true) => coro::suspend(),
+        Ok(true) => {
+            let next = with(|rt| if rt.spawned.is_empty() { rt.active } else { None }).flatten();
+            if !next.is_some_and(coro::switch_to) {
+                coro::suspend();
+            }
+        }
         Ok(false) => {}
         Err(found) => stop(found),
     }
@@ -530,6 +550,7 @@ pub(crate) fn spawn(at: At, name: Option<Arc<str>>, body: coro::Job) -> Option<(
         let parent = rt.current();
         let thread = rt.threads.len();
         if thread >= rt.max_threads {
+            // alloc: a finding's or an error's text, made once, when the model stops
             return Err(format!(
                 "{} spawns a thread past the model's {} (the most is {MAX_THREADS})",
                 rt.describe(parent),
@@ -665,6 +686,7 @@ pub(crate) fn current() -> Option<(Tid, u64)> {
 pub(crate) fn current_name() -> Option<Option<Arc<str>>> {
     with(|rt| {
         let thread = rt.current();
+        // clone: a reference count, for `thread::current().name()`
         rt.threads[thread].name.clone()
     })
 }

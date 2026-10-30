@@ -196,6 +196,12 @@ order. The bound is about 0.06 ms for 200,000 functions.
 > `.tbd` test and the differential against `tbd/reference.rs` must still pass, and
 > `tbd/reference.rs` is not to be touched. A8: both holders are DONE, so it makes A8 itself.
 
+> speed-sol2-link-writers (2026-10-30): A8 made, not yet built. The walk is `unwind.rs` `scan`
+> (with `entry`, `frame` and `rewalk`), and both `elf/dynamic.rs` and `macho/unwind.rs` `fdes`
+> call it. The `__unwind_info` merge and its regular pages are parallel; compressed pages stay
+> serial (O(native entries)). See "`__unwind_info` assembly" in
+> `docs/v2/plan/lanes/link/speed-of-light.md`.
+
 ## dedup: `macho/dylib.rs` LEB128 and RNG onto `blaze_format::leb` and `blaze_ids::rng`
 
 From `dedup-codec-leb` (report `/tmp/blaze-lanes/v2-dedup-codec-leb.md`); the rest of

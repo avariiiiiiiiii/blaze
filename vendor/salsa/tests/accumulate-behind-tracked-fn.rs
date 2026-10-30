@@ -6,6 +6,8 @@
 //! another tracked fn (which does the actual accumulating) is re-used
 //! without re-executing (its inputs haven't changed).
 
+#![forbid(unsafe_code)]
+
 use expect_test::expect;
 use salsa::{Accumulator, Setter};
 use test_log::test;

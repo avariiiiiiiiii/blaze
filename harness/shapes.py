@@ -13,7 +13,7 @@ from collections import Counter, defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-from difftest import Fixture, BLAZE, sysroot_rlibs
+from mixed import Fixture, BLAZE, sysroot_rlibs
 
 
 def load(path):

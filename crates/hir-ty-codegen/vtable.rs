@@ -12,7 +12,7 @@ use rustc_type_ir::{
 
 use hir_ty::{
     dyn_compatibility::generics_require_sized_self,
-    next_solver::{DbInterner, Region, TraitRef},
+    next_solver::{DbInterner, Region, RegionExt, TraitRef},
 };
 
 /// `drop_in_place`, size and align come before the slots.
@@ -99,7 +99,7 @@ impl<'db, P: Fn(TraitRef<'db>) -> TraitRef<'db>> Walk<'_, 'db, P> {
     fn visit(&mut self, trait_ref: TraitRef<'db>, vptr: bool) {
         let interner = self.interner;
         let supertraits: Vec<_> = interner
-            .explicit_super_predicates_of(trait_ref.def_id)
+            .explicit_super_clauses_of(trait_ref.def_id)
             .iter_instantiated(interner, trait_ref.args.as_slice())
             .filter_map(|clause| clause.skip_norm_wip().0.as_trait_clause())
             .map(|pred| interner.instantiate_bound_regions_with_erased(pred).trait_ref)

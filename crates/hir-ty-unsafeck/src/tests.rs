@@ -318,6 +318,68 @@ unsafe fn closures() {
     );
 }
 
+// rustc's `requires_unsafe`: where `unsafe_op_in_unsafe_fn` is allowed at the operation (its
+// level at the innermost expression, then the statements and items around it), nothing is
+// linted and `suggest_unsafe_block` stays set for the next one.
+#[test]
+fn an_allowed_operation_leaves_the_next_first() {
+    check(
+        r#"
+unsafe fn unsf() {}
+
+unsafe fn block(x: *const i32) -> i32 {
+    #[allow(unsafe_op_in_unsafe_fn)]
+    {
+        unsf();
+      //^^^^^^ unsafe_op_in_unsafe_fn: UnsafeFnCall
+    }
+    let y = *x;
+          //^^ unsafe_op_in_unsafe_fn: RawPtrDeref first
+    y + *x
+      //^^ unsafe_op_in_unsafe_fn: RawPtrDeref
+}
+
+unsafe fn statement(x: *const i32) -> i32 {
+    #[allow(unsafe_op_in_unsafe_fn)]
+    let y = *x;
+          //^^ unsafe_op_in_unsafe_fn: RawPtrDeref
+    #[expect(unsafe_op_in_unsafe_fn)]
+    let z = *x;
+          //^^ unsafe_op_in_unsafe_fn: RawPtrDeref first
+    y + z + *x
+          //^^ unsafe_op_in_unsafe_fn: RawPtrDeref
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn item() {
+    unsf();
+  //^^^^^^ unsafe_op_in_unsafe_fn: UnsafeFnCall
+    #[deny(unsafe_op_in_unsafe_fn)]
+    {
+        unsf();
+      //^^^^^^ unsafe_op_in_unsafe_fn: UnsafeFnCall first
+    }
+    unsf();
+  //^^^^^^ unsafe_op_in_unsafe_fn: UnsafeFnCall
+}
+
+unsafe fn closure() {
+    let f = || {
+        #[allow(unsafe_op_in_unsafe_fn)]
+        {
+            unsf();
+          //^^^^^^ unsafe_op_in_unsafe_fn: UnsafeFnCall
+        }
+        unsf();
+      //^^^^^^ unsafe_op_in_unsafe_fn: UnsafeFnCall first
+    };
+    unsf();
+  //^^^^^^ unsafe_op_in_unsafe_fn: UnsafeFnCall first
+}
+"#,
+    );
+}
+
 // tests/ui/asm/x86_64/goto.rs: a label block is safe, in an `unsafe fn` too.
 #[test]
 fn asm_label_is_safe_in_unsafe_fn() {
@@ -355,7 +417,7 @@ unsafe fn unsafe_fn() {
   //^^^^^^^^^^^^^^^^^ deprecated_safe_2024: UnsafeFnCall in_unsafe_fn
     if false {
         unsafe_fn();
-      //^^^^^^^^^^^ unsafe_op_in_unsafe_fn: UnsafeFnCall first
+      //^^^^^^^^^^^ unsafe_op_in_unsafe_fn: UnsafeFnCall
     }
 }
 

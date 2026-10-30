@@ -18,6 +18,7 @@ anyhow.workspace = true
 # The version cargo 1.99 renders its manifest diagnostics with, so that they read the same.
 annotate-snippets = "=0.12.16"
 blaze-ids.workspace = true
+blaze-resolve.workspace = true
 blaze-source.workspace = true
 cargo-platform = "0.3.3"
 # cargo 1.99's own schema of Cargo.toml, so that what deserializes and the messages of what does
@@ -32,6 +33,7 @@ serde_json.workspace = true
 serde-untagged = "0.1.9"
 # The versions cargo 1.99 prints `cargo config get` with.
 shell-escape = "=0.1.5"
+stdx.workspace = true
 toml_edit = { version = "=0.25.12", default-features = false, features = ["display"] }
 # `preserve_order`: `package.metadata` and `workspace.metadata` keep the manifest's order, as
 # cargo's do.
@@ -40,6 +42,7 @@ url.workspace = true
 
 [dev-dependencies]
 dunce = "1"
+hegeltest.workspace = true
 
 [lints]
 workspace = true

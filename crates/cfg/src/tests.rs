@@ -1,5 +1,6 @@
-use arbitrary::{Arbitrary, Unstructured};
 use expect_test::{Expect, expect};
+use hegel::TestCase;
+use hegel::generators as gs;
 use intern::Symbol;
 use syntax::{AstNode, Edition, SourceFile, ast, view, view::AstNode as _};
 use syntax_bridge::{
@@ -249,20 +250,28 @@ fn fold_answers_every_variant() {
     assert_eq!(under_all.fold(&|_| true), None);
 }
 
-#[test]
-fn proptest() {
-    const REPEATS: usize = 512;
+/// A name from few letters, so atoms repeat across an expression.
+fn name(tc: &TestCase) -> Symbol {
+    Symbol::intern(&tc.draw(gs::text().alphabet("abc").max_size(3)))
+}
 
-    let mut rng = oorandom::Rand32::new(123456789);
-    let mut buf = Vec::new();
-    for _ in 0..REPEATS {
-        buf.clear();
-        while buf.len() < 512 {
-            buf.extend(rng.rand_u32().to_ne_bytes());
-        }
-
-        let mut u = Unstructured::new(&buf);
-        let cfg = CfgExpr::arbitrary(&mut u).unwrap();
-        DnfExpr::new(&cfg);
+fn cfg_expr(tc: &TestCase, depth: u32) -> CfgExpr {
+    let pick: u8 = tc.draw(gs::integers().max_value(if depth == 0 { 1 } else { 4 }));
+    let exprs = || -> Box<[CfgExpr]> {
+        let len: usize = tc.draw(gs::integers().max_value(4));
+        (0..len).map(|_| cfg_expr(tc, depth - 1)).collect()
+    };
+    match pick {
+        0 => CfgExpr::Invalid,
+        1 if tc.draw(gs::booleans()) => CfgAtom::Flag(name(tc)).into(),
+        1 => CfgAtom::KeyValue { key: name(tc), value: name(tc) }.into(),
+        2 => CfgExpr::All(exprs()),
+        3 => CfgExpr::Any(exprs()),
+        _ => CfgExpr::Not(Box::new(cfg_expr(tc, depth - 1))),
     }
+}
+
+#[hegel::test(test_cases = 512)]
+fn any_expr_has_a_dnf(tc: TestCase) {
+    DnfExpr::new(&cfg_expr(&tc, 5));
 }

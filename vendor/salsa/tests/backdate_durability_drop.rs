@@ -4,6 +4,8 @@
 //! backdated, or a reader stays verified at the old, higher durability and a later edit of a
 //! less durable input never reaches it.
 
+#![forbid(unsafe_code)]
+
 mod common;
 use common::LogDatabase;
 use expect_test::expect;

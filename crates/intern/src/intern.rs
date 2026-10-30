@@ -9,21 +9,22 @@
 //!
 //! Interned values are never freed: memory is bounded by the database's reachability GC
 //! rebuilding what it keeps (docs/v2/plan/lanes/db.md).
+//!
+//! Safe code: the typed store and the handle's pointer are [`crate::typed`]'s.
 
 use std::{
-    alloc::Layout,
     fmt::{self, Debug, Display},
     hash::{BuildHasher, Hash, Hasher},
     marker::PhantomData,
     ops::Deref,
-    ptr::{self, NonNull},
+    ptr,
 };
 
 use rustc_hash::FxBuildHasher;
 
 use crate::{
-    arena::{Entry, Store},
     sync::OnceLock,
+    typed::{Ptr, Values},
 };
 
 pub struct Interned<T: Internable> {
@@ -43,16 +44,6 @@ impl<T: Internable> Interned<T> {
         Self::new(obj).as_ref_static()
     }
 
-    /// # Safety
-    ///
-    /// The pointer should originate from an `Interned` or an `InternedRef`.
-    #[inline]
-    pub unsafe fn from_raw(ptr: *const T) -> Self {
-        // SAFETY: Our precondition: it points at a value of `T::storage()`, live for the
-        // process.
-        Self { ptr: unsafe { &*ptr } }
-    }
-
     #[inline]
     pub fn as_ref(&self) -> InternedRef<'_, T> {
         self.as_ref_static()
@@ -60,26 +51,15 @@ impl<T: Internable> Interned<T> {
 
     #[inline]
     fn as_ref_static<'a>(self) -> InternedRef<'a, T> {
-        InternedRef { ptr: NonNull::from(self.ptr), _marker: PhantomData }
+        InternedRef { ptr: Ptr::new(self.ptr), _marker: PhantomData }
     }
 }
 
 /// The one copy of `obj` in `T::storage()`, interning it if it is not there.
 #[inline]
 fn intern<T: Internable>(obj: T) -> &'static T {
-    let store = T::storage().get();
     let hash = FxBuildHasher.hash_one(&obj);
-    // SAFETY: Every value of `T`'s store is a `T`, initialized before it was published.
-    let same = |at: NonNull<u8>| unsafe { *at.cast::<T>().as_ref() == obj };
-    let at = match store.entry(hash, same) {
-        Entry::Found(at) => at,
-        Entry::Vacant(vacant) => vacant.insert(Layout::new::<T>(), |to| {
-            // SAFETY: `to` is fresh memory of `T`'s layout.
-            unsafe { to.cast::<T>().write(obj) }
-        }),
-    };
-    // SAFETY: A value of the store is never moved or freed, so it lives for `'static`.
-    unsafe { at.cast::<T>().as_ref() }
+    T::storage().get().intern(hash, obj)
 }
 
 impl<T: Internable> Clone for Interned<T> {
@@ -136,20 +116,13 @@ impl<T: Display + Internable> Display for Interned<T> {
     }
 }
 
+/// `Send` and `Sync` where `T: Sync`, as `&T` is.
 #[repr(transparent)]
 pub struct InternedRef<'a, T> {
-    /// # Invariant
-    ///
-    /// Points at a value of an [`InternStorage`], never moved or freed.
-    ptr: NonNull<T>,
+    /// A value of an [`InternStorage`], never moved or freed.
+    ptr: Ptr<T>,
     _marker: PhantomData<&'a T>,
 }
-
-// SAFETY: An `InternedRef` is a shared reference to a value that lives for the process.
-unsafe impl<T: Sync> Send for InternedRef<'_, T> {}
-// SAFETY: As for `Send`: sharing an `InternedRef` shares only a `&T` to a value that lives for
-// the process, which `T: Sync` makes safe.
-unsafe impl<T: Sync> Sync for InternedRef<'_, T> {}
 
 impl<'a, T: Internable> InternedRef<'a, T> {
     #[inline]
@@ -157,25 +130,14 @@ impl<'a, T: Internable> InternedRef<'a, T> {
         self.ptr.as_ptr()
     }
 
-    /// # Safety
-    ///
-    /// The pointer needs to originate from `Interned` or `InternedRef`.
-    #[inline]
-    pub unsafe fn from_raw(ptr: *const T) -> Self {
-        // SAFETY: Our precondition: it is a value's pointer, so not null.
-        Self { ptr: unsafe { NonNull::new_unchecked(ptr.cast_mut()) }, _marker: PhantomData }
-    }
-
     #[inline]
     pub fn to_owned(self) -> Interned<T> {
-        // SAFETY: `self.ptr`'s invariant: the value lives for the process.
-        Interned { ptr: unsafe { self.ptr.as_ref() } }
+        Interned { ptr: self.ptr.get() }
     }
 
     #[inline]
     pub fn get(self) -> &'a T {
-        // SAFETY: `self.ptr`'s invariant.
-        unsafe { self.ptr.as_ref() }
+        self.ptr.get()
     }
 
     /// Changes the attached lifetime: interned values live for the process, so the lifetime is
@@ -205,7 +167,7 @@ impl<T: Hash> Hash for InternedRef<'_, T> {
 impl<T: PartialEq> PartialEq for InternedRef<'_, T> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.ptr == other.ptr
+        ptr::eq(self.ptr.as_ptr(), other.ptr.as_ptr())
     }
 }
 
@@ -216,8 +178,7 @@ impl<T> Deref for InternedRef<'_, T> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        // SAFETY: `self.ptr`'s invariant.
-        unsafe { self.ptr.as_ref() }
+        self.ptr.get()
     }
 }
 
@@ -234,8 +195,7 @@ impl<T: Display> Display for InternedRef<'_, T> {
 }
 
 pub struct InternStorage<T: ?Sized> {
-    store: OnceLock<Store>,
-    _of: PhantomData<fn() -> *const T>,
+    store: OnceLock<Values<T>>,
 }
 
 #[allow(
@@ -244,13 +204,13 @@ pub struct InternStorage<T: ?Sized> {
 )]
 impl<T: ?Sized> InternStorage<T> {
     pub const fn new() -> Self {
-        Self { store: OnceLock::new(), _of: PhantomData }
+        Self { store: OnceLock::new() }
     }
 }
 
 impl<T: Internable + ?Sized> InternStorage<T> {
-    pub(crate) fn get(&self) -> &Store {
-        self.store.get_or_init(Store::new)
+    pub(crate) fn get(&self) -> &Values<T> {
+        self.store.get_or_init(Values::new)
     }
 }
 
@@ -403,14 +363,34 @@ mod tests {
         assert_eq!(r.to_owned(), owned);
         assert_eq!(r, owned.as_ref());
         assert_eq!(r.get().0, "abc");
-        let raw = r.as_raw();
-        // SAFETY: The pointer is an `InternedRef`'s.
-        let back = unsafe { InternedRef::<GcString>::from_raw(raw) };
-        assert_eq!(back, r);
-        // SAFETY: As above.
-        assert_eq!(unsafe { Interned::from_raw(raw) }, owned);
+        assert!(ptr::eq(r.as_raw(), &*owned));
         let longer: InternedRef<'static, GcString> = r.change_lifetime();
         assert_eq!(longer, r);
+    }
+
+    #[derive(PartialEq, Eq, Hash, Debug)]
+    struct Keyed(Vec<u8>);
+    impl_internable!(Keyed);
+
+    /// Interning against an `FxHashMap` from value to the address of its first handle, over
+    /// seeded values that collide often: a value seen before gets that handle, a new one a
+    /// handle of its own, and every handle reads its value.
+    #[test]
+    fn interning_agrees_with_a_map_model() {
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x1a7e);
+        let mut model: rustc_hash::FxHashMap<Vec<u8>, *const Keyed> = rustc_hash::FxHashMap::default();
+        for _ in 0..20_000 {
+            let len = rng.index(24);
+            let bytes: Vec<u8> = (0..len).map(|_| b"ab\0"[rng.index(3)]).collect();
+            let handle = Interned::new(Keyed(bytes.clone()));
+            assert_eq!(handle.0, bytes);
+            let first = *model.entry(bytes).or_insert(ptr::from_ref(&*handle));
+            assert!(ptr::eq(first, &*handle), "one handle a value");
+        }
+        let mut addresses: Vec<_> = model.values().map(|&at| at.addr()).collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        assert_eq!(addresses.len(), model.len(), "a handle of its own for each value");
     }
 
     #[cfg(not(blaze_check))]
@@ -442,6 +422,7 @@ mod tests {
 /// the first intern's of each value, every other copy is dropped once, and equal values get one
 /// handle.
 #[cfg(all(test, blaze_check))]
+#[allow(unsafe_code, reason = "each execution's storage is reached through a pointer the test sets and clears")]
 mod model {
     use std::sync::{
         Arc,

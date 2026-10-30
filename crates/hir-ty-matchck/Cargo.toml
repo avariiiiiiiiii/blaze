@@ -29,6 +29,7 @@ intern.workspace = true
 stdx.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 # The tests' database links hir-ty-mir for the MIR providers the constants patterns name need.
 hir-ty-mir.workspace = true
 test-fixture.workspace = true

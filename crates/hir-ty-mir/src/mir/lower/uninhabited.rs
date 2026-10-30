@@ -13,6 +13,7 @@
 //! that never ends is still not built, where rustc builds it into a block nothing reaches.
 
 use blaze_mem::Frame;
+use hir_def::HasModule;
 
 use crate::mir::{
     BasicBlockId, MirSpan, OperandKind, Rvalue, StatementKind, TerminatorKind,

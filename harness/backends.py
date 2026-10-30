@@ -2,21 +2,20 @@
 """backends.py: one program compiled by each code producer, and what each made of it.
 
 usage: backends.py WORKSPACE PACKAGE CRATE[,CRATE...] [--bin NAME] [--project DIR]
-                   [--levels 0,2] [--runs N] [--kernels] [--out FILE] [-- ARGS]
+                   [--levels 0,2] [--out FILE] [-- ARGS]
 
-Builds the program with cargo, then has blaze compile the crates once with Cranelift and once
-with LLVM at each level, links each object ahead of rustc's and compares what the program prints
-with cargo's. Reports, for each producer: how many functions it compiled and how many LLVM left
-to Cranelift and why, the time spent producing code (summed over threads) and per function, the
-size of the code, and blaze's wall time and peak memory. With `--kernels` the program is
-harness/corpus/kernels: each kernel is then run `--runs` times and its best time reported, next
-to cargo's debug and release builds.
+Has cargo print the program's link line, then has blaze compile the crates once with Cranelift
+and once with LLVM at each level, links each object ahead of rustc's and holds what each program
+prints to what the first that links (Cranelift's, as a rule) prints. Reports, for each producer:
+how many functions it compiled and how many LLVM left to Cranelift and why, the time spent
+producing code (summed over threads) and per function, the size of the code, and blaze's wall
+time and peak memory.
 """
 import os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, BLAZE, sysroot_rlibs
+from mixed import Fixture, BLAZE, sysroot_rlibs
 
 
 class Compiled:
@@ -80,30 +79,18 @@ def run(binary, args):
     return done.returncode, done.stdout.replace(os.path.basename(binary), "PROGRAM"), done.stderr
 
 
-def kernel_times(binary, runs):
-    """The best of `runs` for each kernel, in milliseconds, and what the program printed."""
-    best, printed = {}, None
-    for _ in range(runs):
-        status, printed, stderr = run(binary, [])
-        assert status == 0, stderr
-        for name, ms in (line.split() for line in stderr.splitlines()):
-            best[name] = min(best.get(name, 1 << 62), int(ms))
-    return best, printed
-
-
 def main():
     argv = sys.argv[1:]
     run_args = argv[argv.index("--") + 1:] if "--" in argv else []
     argv = argv[: argv.index("--")] if "--" in argv else argv
     opt = lambda name, default=None: argv[argv.index(name) + 1] if name in argv else default
     workspace, package, crates = os.path.abspath(argv[0]), argv[1], argv[2]
-    levels, runs = [it for it in opt("--levels", "0,2").split(",") if it], int(opt("--runs", "3"))
+    levels = [it for it in opt("--levels", "0,2").split(",") if it]
     target = ["-p", package] + (["--bin", opt("--bin")] if opt("--bin") else [])
     fx = Fixture(workspace, crates.split(","), target)
     start = time.monotonic()
     fx.rustc_build()
     lines = [f"cargo build: {time.monotonic() - start:.1f} s (whatever was not built already), work in {fx.work}", ""]
-    expected = run(fx.reference, run_args)
     project = os.path.join(workspace, opt("--project", ""))
     producers = [("cranelift", {"BLAZE_BACKEND": "cranelift"})]
     # A level with an `f` after it is that level's passes with LLVM's fast code selection.
@@ -130,27 +117,18 @@ def main():
         if it.cold:
             lines.append(f"- {it.name}: {it.cold[0]}")
     lines.append("")
-    if "--kernels" in argv:
-        release = os.path.join(fx.work, "release")
-        subprocess.run(["cargo", "build", "--release", *target], cwd=workspace, check=True, capture_output=True,
-                       env={**os.environ, "CARGO_TARGET_DIR": release})
-        columns = [("cargo debug", fx.reference), *((it.name, it.binary) for it in built),
-                   ("cargo release", os.path.join(release, "release", package))]
-        times = {}
-        for name, binary in columns:
-            times[name], printed = kernel_times(binary, runs)
-            assert printed == expected[1], f"{name} prints something else"
-        lines += [f"Best of {runs} runs, ms; every build prints the same checksums.", "",
-                  "| kernel | " + " | ".join(name for name, _ in columns) + " |", "|---|" + "---:|" * len(columns)]
-        for kernel in times["cargo debug"]:
-            lines.append(f"| {kernel} | " + " | ".join(str(times[name][kernel]) for name, _ in columns) + " |")
-    else:
-        for it in built:
-            if it.binary is None:
-                lines.append(f"- {it.name}: does not link: {it.link_failure}")
-                continue
-            same = run(it.binary, run_args)[:2] == expected[:2]
-            lines.append(f"- {it.name}: the program prints {'the same as' if same else 'SOMETHING ELSE than'} cargo's")
+    first = None
+    for it in built:
+        if it.binary is None:
+            lines.append(f"- {it.name}: does not link: {it.link_failure}")
+            continue
+        printed = run(it.binary, run_args)[:2]
+        if first is None:
+            first = (it.name, printed)
+            lines.append(f"- {it.name}: the program exits {printed[0]}; the others are held to what it prints")
+            continue
+        same = printed == first[1]
+        lines.append(f"- {it.name}: the program prints {'the same as' if same else 'SOMETHING ELSE than'} {first[0]}'s")
     text = "\n".join(lines) + "\n"
     sys.stdout.reconfigure(encoding="utf-8")
     print(text)

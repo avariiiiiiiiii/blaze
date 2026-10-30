@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """asmedits.py: a daemon follows edits to `asm!` blocks and to the code around them.
 
-The blocks are written for the architecture of the target. Each step is compared with what `cargo build` of the same source prints.
+The blocks are written for the architecture of the target. Each step is compared with what blaze's build of the same source from nothing prints.
 """
-from difftest import TARGET, host
+from mixed import TARGET, host
 from includes import follow
 
 # The same blocks in the assembly of each architecture.
@@ -43,7 +43,7 @@ fn main() {
     println!("{} {}", scale(7), sum(3, 4));
 }
 """ % ASM
-# (what the step is, [(file, old, new)], whether cargo rejects it)
+# (what the step is, [(file, old, new)], whether it does not build)
 STEPS = [
     ("nothing edited", [], False),
     ("an instruction", [(MAIN, ASM["scale2"], ASM["scale4"])], False),

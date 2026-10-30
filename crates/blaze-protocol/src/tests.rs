@@ -813,3 +813,120 @@ fn plain_order(nodes: &[(u32, Vec<u32>)]) -> Vec<u32> {
     }
     order
 }
+
+/// One record of every event, each field set.
+fn every_event() -> Vec<crate::events::Record> {
+    use crate::events::{
+        Cache, Cause, CrateState, Event, Fns, Function, How, Level, NodeKind, NodeState, Record,
+        Slow, Step, Summary, Took,
+    };
+    let fns = Fns { total: 5353, done: 12, kept: 2 };
+    let slow = || vec![Slow { krate: "rg".into(), name: "rg::main".into(), ns: 300_000_000 }];
+    let cache = Cache { found: 7, fetched: 2, compiled: 1, cold: Some("no store".into()) };
+    let summary = Summary {
+        took_ns: 9_000_000_000,
+        crates: 31,
+        fns,
+        rebuilt: vec![("render".into(), Cause::Callee { name: "draw".into() })],
+        more: 4,
+        error: Some("anim failed".into()),
+        cache: Some(cache.clone()),
+        slowest: vec![Took { step: Step::Codegen, of: Some("anim".into()), took_ns: 5 }],
+    };
+    let function = |id: u32, how: How| Function {
+        id,
+        key: u64::from(id).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        krate: "anim".into(),
+        name: format!("anim::scene::render_{id}"),
+        calls: vec![id + 1, id / 2],
+        how,
+    };
+    let events = [
+        Event::Began { build: 3, command: "build".into(), root: "/w".into() },
+        Event::Started { step: Step::FrontEnd, of: Some("anim".into()) },
+        Event::Ended { step: Step::Link, of: None },
+        Event::Progress { step: Step::Check, done: 3, total: 14, longest: Some("a.rs".into()) },
+        Event::Crate { name: "anim".into(), state: CrateState::Running, fns },
+        Event::Rebuilt { name: "render".into(), krate: "anim".into(), cause: Cause::Body },
+        Event::Unlisted { count: 9 },
+        Event::Cache { cache },
+        Event::Refused { name: "asm".into(), why: "global_asm! of x86".into() },
+        Event::Said { level: Level::Warning, text: "unused".into() },
+        Event::Finished { ok: false, summary },
+        Event::Node { id: 1, kind: NodeKind::Std, name: "std".into(), deps: vec![0] },
+        Event::Nodes {
+            first: 2,
+            kinds: vec![NodeKind::Names, NodeKind::Bodies],
+            names: "animanim".into(),
+            name_at: vec![0, 4, 8],
+            deps: vec![1, 2],
+            deps_at: vec![0, 1, 2],
+        },
+        Event::Moved { id: 2, state: NodeState::Failed { why: "E0308".into() } },
+        Event::Critical { path: vec![0, 1, 3] },
+        Event::Cores { busy: 790, of: 8 },
+        Event::Compiling { functions: slow() },
+        Event::Slowest { functions: slow() },
+        Event::Functions {
+            object: 2,
+            whole: true,
+            functions: vec![
+                function(0, How::Compiled { ns: 125_000 }),
+                function(1, How::Unit),
+                function(2, How::Unchanged),
+                function(3, How::Stored),
+            ],
+        },
+    ];
+    events.into_iter().enumerate().map(|(at, event)| Record { at_ns: at as u64, event }).collect()
+}
+
+/// Every record is written as it comes, no map of it put in order, to the bytes the encoding
+/// gives any order of its fields; the same entries as JSON has.
+#[test]
+fn every_record_is_written_in_its_keys_order() {
+    let mut writer = crate::cbor::Writer::new();
+    let mut out = Vec::new();
+    for record in every_event() {
+        let message = Message::new(3, &record);
+        out.clear();
+        writer.append(&mut out, &message).unwrap();
+        assert_eq!(writer.permuted(), 0, "{record:?}");
+        assert_eq!(out, crate::cbor::reference::to_vec(&message).unwrap(), "{record:?}");
+        check(&out).unwrap();
+        let read: Message<crate::events::Record> = from_slice(&out).unwrap();
+        assert_eq!(read.body, record);
+        let entries: serde_json::Value = from_slice(&out).unwrap();
+        assert_eq!(entries, serde_json::to_value(&message).unwrap(), "{record:?}");
+    }
+}
+
+/// JSON shows the fields in the order the types declare them, as serde's derive wrote them.
+#[test]
+fn json_keeps_the_declared_order() {
+    use crate::events::{Event, Function, How, Summary};
+    let function = Function {
+        id: 1,
+        key: 2,
+        krate: "anim".into(),
+        name: "render".into(),
+        calls: vec![0],
+        how: How::Compiled { ns: 5 },
+    };
+    assert_eq!(
+        serde_json::to_string(&function).unwrap(),
+        r#"{"id":1,"key":2,"krate":"anim","name":"render","calls":[0],"how":{"Compiled":{"ns":5}}}"#
+    );
+    let began = Event::Began { build: 1, command: "build".into(), root: "/w".into() };
+    assert_eq!(
+        serde_json::to_string(&Message::new(4, &began)).unwrap(),
+        r#"{"schema":2,"id":4,"body":{"Began":{"build":1,"command":"build","root":"/w"}}}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&Summary::default()).unwrap(),
+        concat!(
+            r#"{"took_ns":0,"crates":0,"fns":{"total":0,"done":0,"kept":0},"rebuilt":[],"#,
+            r#""more":0,"error":null,"cache":null,"slowest":[]}"#
+        )
+    );
+}

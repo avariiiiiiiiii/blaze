@@ -69,6 +69,7 @@ pub struct CargoUnstableConfig {
     pub bindeps: Option<bool>,
     pub build_std: Option<Vec<String>>,
     pub build_std_features: Option<Vec<String>>,
+    pub codegen_backend: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -335,7 +335,10 @@ fn naked_compatible(fx: &mut Finalize<'_, '_, '_>, naked: usize) {
         }
         let session = fx.session;
         let allowed = with_path(attr, |path| {
-            path.first().is_some_and(|it| session.is_tool(it)) || matches!(path, [one] if ALLOW_LIST.contains(one))
+            path.first().is_some_and(|it| session.is_tool(it))
+                || matches!(path, [one] if ALLOW_LIST.contains(one))
+                // blaze's own inert tool attribute (`blaze::parallelizable` reads it), opt-in.
+                || matches!(path, ["blaze", "reassociate"])
         });
         if allowed {
             continue;

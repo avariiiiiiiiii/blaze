@@ -30,7 +30,7 @@ use crate::{
 
 /// rustc's span of the type of the cast `cast` (`ExprKind::Cast`'s `hir::Ty`), its parentheses
 /// left out as rustc's lowering leaves them.
-fn cast_ty_span(b: &BodyCx<'_, '_>, cast: ExprId) -> Option<Span> {
+fn cast_ty_span(b: &BodyCx<'_, '_, '_>, cast: ExprId) -> Option<Span> {
     let node = b.expr_node(cast)?;
     let InFile { file_id, value } = b.cx.syntax_view(node);
     let mut ty = ast::CastExpr::cast(value)?.ty()?;
@@ -62,7 +62,7 @@ fn ancestor_in_same_ctxt(span: &Span, other: &Span) -> Option<Span> {
 
 /// rustc's printing of the type type checking gave `expr`, before its adjustments
 /// (`typeck_results().expr_ty`).
-fn ty_text(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<String> {
+fn ty_text(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<String> {
     let node = b.expr_node(expr)?;
     let syntax = b.cx.syntax_view(node);
     let expr = ast::Expr::cast(syntax.value)?;

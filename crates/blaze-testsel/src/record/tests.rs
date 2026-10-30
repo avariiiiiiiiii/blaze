@@ -31,6 +31,21 @@ fn the_word_scan_finds_what_the_byte_scan_finds() {
 }
 
 #[test]
+fn the_header_is_the_copy_it_replaced() {
+    let kept = |slots: u32| {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(b"blzexec1");
+        out[8..12].copy_from_slice(&slots.to_le_bytes());
+        out
+    };
+    assert_eq!((MAGIC, HEADER), (*b"blzexec1", 16));
+    let mut rng = SplitMix64::new(3);
+    for slots in [0, 1, 255, 256, 65_536, u32::MAX].into_iter().chain((0..64).map(|_| rng.next_u64() as u32)) {
+        assert_eq!(header(slots), kept(slots), "{slots} slots");
+    }
+}
+
+#[test]
 fn a_region_is_whole_only_when_armed_and_ended() {
     let mut region = header(20).to_vec();
     region.resize(HEADER + 20, 0);

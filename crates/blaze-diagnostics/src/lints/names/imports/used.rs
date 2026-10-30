@@ -30,7 +30,7 @@ use blaze_mem::Frame;
 use hashbrown::HashTable;
 use hir::{AsAssocItem, HirFileId, InFile, ModuleDef, PathResolution};
 use hir_def::{
-    ExternCrateId, Lookup, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
+    ExternCrateId, Lookup as _, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
     item_scope::{GlobId, ImportId, ImportOrExternCrate, ImportOrGlob},
     per_ns::PerNs,
     resolver::HasResolver,
@@ -734,10 +734,11 @@ impl<'f, 'db> Uses<'f, 'db> {
                 }
             }
         }
+        let source = if tree_kind == TreeKind::Glob { entry(&self.lookup(cx, module, kind, names), Ns::Types).map(|it| it.def) } else { source };
         let tree = &mut self.items[item].trees[j];
         tree.name = name;
         tree.lexical = lexical;
-        tree.source = if tree_kind == TreeKind::Glob { entry(&self.lookup(cx, module, kind, names), Ns::Types).map(|it| it.def) } else { source };
+        tree.source = source;
         tree.imported = imported;
     }
 
@@ -1274,4 +1275,106 @@ fn has_value_item(cx: &Cx<'_, '_>, trait_: TraitId, name: &Name) -> bool {
     hir::Trait::from(trait_).items_iter(cx.db).any(|it| {
         matches!(it, hir::AssocItem::Function(_) | hir::AssocItem::Const(_)) && it.name(cx.db).as_ref() == Some(name)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use hir_def::{
+        Lookup as _,
+        item_scope::{GlobId, ImportId},
+        nameres::uses,
+        src::use_tree_to_view,
+    };
+
+    use super::{super::Places, Binding, Used, Uses};
+    use crate::lower::break_outside_of_loop::tests::with_file;
+
+    /// Single imports, `self` in a list, a glob, a re-export read on through, a
+    /// `#[macro_export]` macro, an import in a block, and trait imports a method call and a
+    /// type-relative path pick, one trait unused.
+    const USES: &str = r#"
+mod m {
+    pub struct S;
+    pub fn f() {}
+    pub mod inner { pub struct T; pub fn g() {} }
+    pub trait Method { fn method(&self) {} }
+    impl Method for u8 {}
+    pub trait Assoc { fn assoc() {} }
+    impl Assoc for u8 {}
+    pub trait Unused { fn other(&self) {} }
+    impl Unused for u8 {}
+    #[macro_export]
+    macro_rules! mac { () => {} }
+}
+mod globbed { pub struct G; pub struct H; }
+mod reexport { pub use crate::m::S as R; }
+use m::S;
+use m::f;
+use m::inner::{self, T};
+use m::{Method, Assoc, Unused};
+use globbed::*;
+use reexport::R;
+use crate::mac;
+fn sig(_: S) -> G { G }
+fn body() {
+    f();
+    inner::g();
+    let _: T;
+    let _ = R;
+    0u8.method();
+    u8::assoc();
+    mac!();
+    {
+        use m::inner::g;
+        g();
+    }
+}
+"#;
+
+    fn named(db: &base_db::Db, binding: Binding) -> String {
+        match binding {
+            Binding::Import(ImportId { use_, idx }) | Binding::Glob(GlobId { use_, idx }) => {
+                use_tree_to_view(db, use_.lookup(db).id, idx).to_string()
+            }
+            Binding::ExternCrate(it) => format!("{it:?}"),
+        }
+    }
+
+    /// The bindings this walk finds used, what type checking uses included, are those the front
+    /// end's `used_imports_with_traits` records, each as used: the condition for reading that
+    /// query here in place of resolving every path again.
+    #[test]
+    fn what_the_walk_finds_used_is_what_the_front_end_records() {
+        with_file(USES, |cx, _| {
+            let places = Places::of(cx);
+            let old = Uses::of(cx, cx.walk(), &places);
+            let mut used = old.used.clone();
+            for &binding in &old.typeck {
+                used.entry(binding).or_insert(Used::Other);
+            }
+            let mut old_used: Vec<(String, Used)> = used.iter().map(|(&it, &by)| (named(cx.db, it), by)).collect();
+            old_used.sort();
+            let front = hir_ty::used_imports_with_traits(cx.db, cx.krate.base());
+            let mut new_used: Vec<(String, Used)> = front
+                .imports()
+                .map(|(it, by)| {
+                    let by = match by {
+                        uses::Used::Scope => Used::Scope,
+                        uses::Used::Other => Used::Other,
+                    };
+                    (named(cx.db, it), by)
+                })
+                .collect();
+            new_used.sort();
+            assert_eq!(old_used, new_used);
+            assert!(old_used.len() >= 9, "{old_used:?}");
+            assert!(!old_used.iter().any(|(it, _)| it == "Unused"), "{old_used:?}");
+            let mut old_macro: Vec<String> = old.macro_uses.iter().map(|(it, _)| format!("{it:?}")).collect();
+            old_macro.sort();
+            old_macro.dedup();
+            let mut new_macro: Vec<String> = front.macro_uses().map(|(it, _)| format!("{it:?}")).collect();
+            new_macro.sort();
+            assert_eq!(old_macro, new_macro);
+        });
+    }
 }

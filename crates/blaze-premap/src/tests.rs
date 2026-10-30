@@ -423,15 +423,17 @@ fn part_of(fit: Fit<'_>) -> WorkspacePart<'_> {
 
 fn prelink_request<'a>(output: &'a Output, part: &'a crate::split::ImagePart<'a>) -> Request<'a> {
     Request {
-        output,
-        base: BASE,
-        tls_bias: RESERVE.bias,
-        functions: &part.functions,
-        statics: &part.statics,
-        names: &part.names,
-        debug_names: &part.debug_names,
-        natives: &part.natives,
-        spans: &[],
+        link: blaze_link::premap::Request {
+            output,
+            base: BASE,
+            tls_bias: RESERVE.bias,
+            functions: &part.functions,
+            statics: &part.statics,
+            names: &part.names,
+            debug_names: &part.debug_names,
+            natives: &part.natives,
+            spans: &[],
+        },
         function_digests: &part.function_digests,
         static_digests: &part.static_digests,
         debug_digests: &part.debug_digests,
@@ -749,8 +751,6 @@ fn an_image_is_the_outside_of_the_workspace_link_beside_it() {
     assert_eq!(Outside::tls_end(&image), 16);
     assert_eq!(Outside::end(&image), image.end());
     assert_eq!(Outside::name(&image, "not defined"), None);
-    let def = Def { value: 0x1000, size: 8, kind: Kind::Data, strength: Strength::Weak, order: 3 };
-    assert_eq!(prelink::def_of_link(prelink::link_def(def)), def);
 }
 
 #[test]
@@ -783,7 +783,8 @@ fn prelink_refuses_what_it_was_not_asked() {
     assert!(prelink::build(&Fixed(bind), &request, ImageKey(id(1))).is_err(), "a bind in code");
 
     let incremental = dev_output();
-    let request = Request { output: &incremental, ..prelink_request(&output, &part) };
+    let mut request = prelink_request(&output, &part);
+    request.link.output = &incremental;
     assert!(prelink::build(&Model, &request, ImageKey(id(1))).is_err(), "an incremental image");
 }
 
@@ -864,15 +865,17 @@ fn image_of(binds: Vec<Bind>, names: Vec<PlacedName>, init: Vec<InitEntry>, tls:
     };
     let output = prelink::output(&dev_output(), "blaze-premap-test");
     let request = Request {
-        output: &output,
-        base: BASE,
-        tls_bias: RESERVE.bias,
-        functions: &[],
-        statics: &[],
-        names: &[],
-        debug_names: &[],
-        natives: &[],
-        spans: &[],
+        link: blaze_link::premap::Request {
+            output: &output,
+            base: BASE,
+            tls_bias: RESERVE.bias,
+            functions: &[],
+            statics: &[],
+            names: &[],
+            debug_names: &[],
+            natives: &[],
+            spans: &[],
+        },
         function_digests: &[],
         static_digests: &[],
         debug_digests: &[],
@@ -977,7 +980,7 @@ fn start_runs_init_in_whole_link_order_and_places_thread_locals() {
     assert_eq!(start.tls.iter().map(|it| (it.template, it.offset)).collect::<Vec<_>>(), [(BASE + 128, 0), (0x9000, 32)]);
     workspace.tls_offset = Some(24);
     assert!(start::plan(&image, &workspace, &RESERVE).is_err(), "the workspace's thread-locals elsewhere");
-    let small = blaze_inproc::TlsReserve { bias: RESERVE.bias, size: 32, align: 64 };
+    let small = start::TlsReserve { bias: RESERVE.bias, size: 32, align: 64 };
     workspace.tls_offset = Some(offset);
     assert!(start::plan(&image, &workspace, &small).is_err(), "more thread-locals than the loader keeps");
 }

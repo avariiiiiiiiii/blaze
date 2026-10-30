@@ -9,14 +9,18 @@ use std::{
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{FormatError, Persist, Record, SchemaHash, Slice, Writer};
-use blaze_ids::{ContentId, Fingerprint, bits::BitSet};
+use blaze_ids::{
+    ContentId, Fingerprint,
+    bits::{BitSet, Bits},
+};
 use blaze_image::{Builder, Cause, Corrupt, Image, Refused, SectionId};
 use blaze_vfs::{Bytes, Mode, View, ViewId};
 use intern::Live;
 
 use crate::{
-    Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, MemTree, Names as Lent, Query,
-    QueryKey, QueryKind, Stored, Tree, kinds,
+    Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, Mark, MemTree, Names as Lent,
+    Query, QueryKey, QueryKind, Stored, Tree, kinds,
+    memo::MemoId,
     subtree::{Digest, Subtree, SubtreeKey},
     table::{Aligned, EdgeRecord},
 };
@@ -1146,6 +1150,219 @@ fn marks_are_a_bit_a_memo() {
     assert_eq!(marks.iter().collect::<Vec<_>>(), [3, 64, 200]);
 }
 
+const LAYERS: u32 = 6;
+const WIDTH: u32 = 400;
+
+/// The three children in the next layer of node `i` of `layer`, picked by a hash of the node.
+fn children(layer: u32, i: u32) -> impl Iterator<Item = (u32, u32)> {
+    let mut x = (u64::from(layer) << 32 | u64::from(i)).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..3).filter_map(move |_| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (layer + 1 < LAYERS).then_some((layer + 1, (x % u64::from(WIDTH)) as u32))
+    })
+}
+
+/// A node of a layered graph: its file's length plus its [`children`]'.
+struct Layered;
+
+impl Query for Layered {
+    const KIND: QueryKind = QueryKind(0x2f30);
+    const NAME: &'static str = "layered";
+    const PRODUCER: ContentId = ContentId([0x30; 32]);
+    type Key = (u32, u32);
+    type Value = Num;
+    fn input(&(layer, i): &(u32, u32)) -> ContentId {
+        key_id(&format!("{layer}.{i}"))
+    }
+    fn execute(cx: &mut Cx<'_>, &(layer, i): &(u32, u32)) -> Result<Num, Cancelled> {
+        let mut sum = cx.file(&format!("{layer}.{i}"))?.map_or(0, |file| file.bytes.len() as u64);
+        for child in children(layer, i) {
+            sum = sum.wrapping_add(cx.get::<Layered>(&child)?);
+        }
+        Ok(Num(sum))
+    }
+}
+
+/// A database of [`Layered`] asked from its first layer in three views whose files' lengths
+/// differ, so a key has up to three memos and an edge's fingerprint picks among them; the
+/// first two views are closed, their memos still held. With every memo it holds.
+fn layered() -> (Database, Vec<MemoId>) {
+    let (mut db, tree) = setup();
+    db.register::<Layered>();
+    let names: Vec<String> =
+        (0..LAYERS).flat_map(|layer| (0..WIDTH).map(move |i| format!("{layer}.{i}"))).collect();
+    for round in 0..3usize {
+        let texts: Vec<String> = (0..names.len()).map(|at| "x".repeat(1 + at * (round + 1) % 7)).collect();
+        let files: Vec<(&str, &str)> = names.iter().map(String::as_str).zip(texts.iter().map(String::as_str)).collect();
+        let one = view(&db, &tree, &files);
+        let pinned = db.pin();
+        for i in 0..WIDTH {
+            pinned.get::<Layered>(one, &(0, i)).expect("layered");
+        }
+        drop(pinned);
+        if round < 2 {
+            db.close(one);
+        }
+    }
+    let task = blaze_reclaim::enter();
+    let mut all = Vec::new();
+    db.slots.for_each(&task, |_, slot| all.extend_from_slice(slot.memos()));
+    drop(task);
+    (db, all)
+}
+
+/// What [`Database::mark`] reaches from `roots`, and from the open views' results when `views`,
+/// with marks made for `capacity` memos: the memos reached, ascending; those the results name;
+/// and the input keys, sorted.
+fn marked(db: &Database, views: bool, roots: &[MemoId], capacity: usize, how: Mark) -> (Vec<MemoId>, Vec<MemoId>, Vec<QueryKey>) {
+    let task = blaze_reclaim::enter();
+    blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+        let mut states = Vec::new_in(frame);
+        if views {
+            db.views.for_each(&task, |state| states.push(state));
+        }
+        let mut work = Vec::new_in(frame);
+        work.extend_from_slice(roots);
+        let (mut reached, mut hot) =
+            (Bits::<_, MemoId>::from_words(Vec::new_in(frame)), Bits::<_, MemoId>::from_words(Vec::new_in(frame)));
+        reached.grow(capacity);
+        hot.grow(capacity);
+        let mut inputs = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
+        db.mark(&task, frame, &states, &mut work, &mut reached, &mut hot, &mut inputs, how);
+        assert!(work.is_empty(), "a mark leaves no work");
+        let mut inputs: Vec<QueryKey> = inputs.iter().copied().collect();
+        inputs.sort_unstable();
+        (reached.iter().collect(), hot.iter().collect(), inputs)
+    })
+}
+
+/// Marking on the plane's workers reaches exactly what one thread's walk does, from random
+/// roots with and without the open view's results, at every batch size (1 hands off at every
+/// second memo), with marks too small for some memos (those finish on the caller, as memos
+/// made during a collection do) or for none.
+#[test]
+fn parallel_marking_reaches_what_serial_marking_does() {
+    let (db, all) = layered();
+    let end = db.store.end() as usize;
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let (mut reached_some, mut hot_some) = (false, false);
+    for round in 0..24u64 {
+        let roots: Vec<MemoId> = all
+            .iter()
+            .copied()
+            .filter(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                round % 4 != 0 && x % (round + 2) == 0
+            })
+            .collect();
+        let views = round % 2 == 1;
+        let serial = marked(&db, views, &roots, end, Mark::Serial);
+        reached_some |= !serial.0.is_empty();
+        hot_some |= !serial.1.is_empty();
+        let capacity = [end, end / 2, 0][(round % 3) as usize];
+        for batch in [1, 4, 64, crate::MARK_BATCH] {
+            assert_eq!(
+                marked(&db, views, &roots, capacity, Mark::Parallel { batch }),
+                serial,
+                "round {round}, views {views}, batch {batch}, marks for {capacity} of {end} memos"
+            );
+        }
+    }
+    assert!(reached_some && hot_some, "some round's roots reach memos, and the open view names some");
+}
+
+/// A parallel mark allocates nothing on the thread that asks it: its marks and what it keeps
+/// are in the caller's frame, and the workers' lists are their own, once each a collection.
+#[test]
+fn a_parallel_mark_allocates_nothing_on_its_caller() {
+    let (db, all) = layered();
+    let end = db.store.end() as usize;
+    let warm = marked(&db, true, &all, end, Mark::Parallel { batch: 64 });
+    let task = blaze_reclaim::enter();
+    let again = blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+        let mut states = Vec::new_in(frame);
+        db.views.for_each(&task, |state| states.push(state));
+        let mut work = Vec::new_in(frame);
+        work.extend_from_slice(&all);
+        let (mut reached, mut hot) =
+            (Bits::<_, MemoId>::from_words(Vec::new_in(frame)), Bits::<_, MemoId>::from_words(Vec::new_in(frame)));
+        reached.grow(end);
+        hot.grow(end);
+        let mut inputs = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
+        blaze_alloc_count::assert_at_most(0, "a parallel mark, on its caller", || {
+            db.mark(&task, frame, &states, &mut work, &mut reached, &mut hot, &mut inputs, Mark::Parallel { batch: 64 });
+        });
+        reached.count()
+    });
+    assert_eq!(again, warm.0.len());
+}
+
+/// The image's radix sort of keys orders them as a comparison sort does: random keys of a few
+/// kinds, with keys repeated and keys sharing their whole 8-byte prefix, at sizes on both sides
+/// of the radix sort's insertion and parallel cut-offs.
+#[test]
+fn keys_sort_for_the_image_as_by_comparison() {
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for len in [0usize, 1, 2, 63, 64, 65, 1000, 70_000, 150_000] {
+        let mut keys: Vec<QueryKey> = (0..len)
+            .map(|_| {
+                let mut input = [0u8; 32];
+                for chunk in input.chunks_mut(8) {
+                    chunk.copy_from_slice(&next().to_le_bytes());
+                }
+                QueryKey { kind: QueryKind((next() % 4) as u16), input: ContentId(input) }
+            })
+            .collect();
+        for at in 0..len / 10 {
+            let from = keys[(next() as usize) % len];
+            let to = (next() as usize) % len;
+            keys[to] = if at % 2 == 0 {
+                from
+            } else {
+                let mut shared = from;
+                shared.input.0[31] ^= 1;
+                shared
+            };
+        }
+        let mut expected = keys.clone();
+        expected.sort_unstable();
+        crate::sort_keys(&mut keys);
+        assert_eq!(keys, expected, "{len} keys");
+    }
+}
+
+/// A memo is stamped with the collection generation it was given in, in its cold row; an equal
+/// memo given later restamps the one its key keeps, and a stamp is never lowered.
+#[test]
+fn a_memo_is_born_in_the_generation_its_key_last_resolved_to_it() {
+    let db = Database::empty();
+    let task = blaze_reclaim::enter();
+    let key = QueryKey { kind: QueryKind(0x2f00), input: ContentId([4; 32]) };
+    let code = db.store.code(WORD, ContentId([1; 32]));
+    let first = db.store.make(key, Fingerprint(1), code, &[], &[]);
+    assert_eq!(db.add_memo(&task, key, first), first);
+    assert_eq!(db.store.born(&task, first), 0);
+    db.generation.store(3, Ordering::SeqCst);
+    let equal = db.store.make(key, Fingerprint(1), code, &[], &[]);
+    assert_eq!(db.add_memo(&task, key, equal), first, "the key keeps the equal memo it had");
+    assert_eq!(db.store.born(&task, first), 3, "restamped as its key resolved to it again");
+    let other = db.store.make(key, Fingerprint(2), code, &[], &[]);
+    assert_eq!(db.add_memo(&task, key, other), other);
+    assert_eq!(db.store.born(&task, other), 3);
+    db.store.reborn_in(&task, first, 2);
+    assert_eq!(db.store.born(&task, first), 3, "never lowered");
+}
+
 mod some_kinds {
     crate::query_kinds! {
         range: 0x7000..0x7004, owner: "the test";
@@ -1744,7 +1961,7 @@ fn a_query_reads_the_context_of_its_type_the_database_was_given() {
 }
 
 /// Model tests of the database's own lock-free state (docs/v2/plan/lanes/safety/model.md): the
-/// collection generation with each key's `born`, and the thread-local that marks a query
+/// collection generation with each memo's `born`, and the thread-local that marks a query
 /// running.
 #[cfg(blaze_check)]
 mod model {

@@ -163,7 +163,7 @@ impl std::fmt::Debug for DefaultAny<'_> {
 pub fn default_types<'db>() -> &'db DefaultAny<'db> {
     static TYPES: OnceLock<DefaultAny<'static>> = OnceLock::new();
 
-    TYPES.get_or_init(|| {
+    let types = TYPES.get_or_init(|| {
         let create_ty = Ty::new_without_interner;
         let create_const = Const::new_without_interner;
         let create_region = Region::new_without_interner;
@@ -255,5 +255,9 @@ pub fn default_types<'db>() -> &'db DefaultAny<'db> {
                 BoundVariableKind::Region(BoundRegionKind::ClosureEnv),
             ]),
         }
-    })
+    });
+    // SAFETY: `DefaultAny` is invariant in `'db` only because `Region` and `Const` name the
+    // interner's associated types; every field is a row index into a table that is never freed
+    // (see the note at the top of this module), so `'db` is a marker and any `'db` is valid.
+    unsafe { std::mem::transmute::<&'static DefaultAny<'static>, &'db DefaultAny<'db>>(types) }
 }

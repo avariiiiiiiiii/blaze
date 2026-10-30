@@ -1254,10 +1254,11 @@ mod tests {
         }
     }
 
-    /// The view `Semantics` expands every macro call of every tree the walk has, those `cfg`
-    /// removes included, as the handle one does: the same file and root, or `None` for both.
+    /// The view `Semantics` expands every macro call of every tree the walk has but those `cfg`
+    /// removes: into the call's own macro file, whose call is the node, at the root it hands
+    /// out for that file; a call `cfg` removes is `None`.
     #[test]
-    fn the_view_expansions_are_the_handles() {
+    fn the_view_expansions_are_the_calls_files() {
         const FIXTURE: &str = r#"
 //- /lib.rs crate:main edition:2021
 macro_rules! e { ($e:expr) => { ($e) }; }
@@ -1280,18 +1281,20 @@ pub fn f(x: t!()) -> u8 {
             for tree in &walk.trees {
                 for node in tree.root.descendants().filter(|it| it.kind() == SyntaxKind::MACRO_CALL) {
                     let call = ast::MacroCall::cast(node).expect("checked by kind");
-                    let handle = cx.syntax(tree.ptr(node)).value;
-                    let handle = <syntax::ast::MacroCall as syntax::AstNode>::cast(handle).expect("the same node");
-                    let views = cx.vsema.expand_macro_call(call).map(|it| (it.file_id, it.value.kind(), it.value.text_range()));
-                    let handles = cx
-                        .sema
-                        .expand_macro_call(&handle)
-                        .map(|it| (it.file_id, it.value.kind(), it.value.text_range()));
-                    assert_eq!(views, handles, "{:?} at {:?}", tree.file, node.text_range());
-                    match views {
-                        Some(_) => expanded += 1,
-                        None => not += 1,
-                    }
+                    let at = (tree.file, node.text_range());
+                    let views = cx.vsema.expand_macro_call(call);
+                    assert_eq!(views.is_none(), tree.skipped(node.text_range()), "{at:?}");
+                    let Some(expansion) = views else {
+                        not += 1;
+                        continue;
+                    };
+                    let file = expansion.file_id.macro_file().expect("an expansion is a macro's file");
+                    let called = file.loc(cx.db).to_node_view(cx.db);
+                    assert_eq!((called.file_id, called.value.kind(), called.value.text_range()), (tree.file, node.kind(), node.text_range()));
+                    let root = cx.root(expansion.file_id);
+                    assert_eq!((expansion.value.kind(), expansion.value.text_range()), (root.kind(), root.text_range()), "{at:?}");
+                    assert!(expansion.value.parent().is_none(), "{at:?}");
+                    expanded += 1;
                 }
             }
             assert!(expanded >= 8, "{expanded} calls expanded");

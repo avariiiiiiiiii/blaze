@@ -33,7 +33,7 @@ fn print(trees: &[Tree]) -> String {
 
 fn lex(text: &str) -> Stream {
     let mut emitted = Vec::new();
-    let stream = lex::stream(text, site(), Edition::Edition2021, &mut emitted).expect("lexes");
+    let stream = lex::stream(text, site(), Edition::Edition2021, false, &mut emitted).expect("lexes");
     assert!(emitted.is_empty(), "lexing {text:?} reported {emitted:?}");
     stream
 }
@@ -200,7 +200,7 @@ fn an_invisible_group_prints_only_its_tokens() {
     let span = site();
     let inner = given(lex("a + b").trees());
     let mut trees = vec![Tree::Group {
-        delimiter: Delimiter::None,
+        delimiter: Delimiter::Invisible,
         stream: Stream::of(inner),
         span: DelimSpan { open: span, close: span, entire: span },
         open: Spacing::Alone,

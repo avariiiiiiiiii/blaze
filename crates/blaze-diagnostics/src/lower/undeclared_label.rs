@@ -10,6 +10,7 @@
 
 use hir::{HirFileId, InFile};
 use span::SyntaxContext;
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     TextRange,
     view::{self as ast, AstNode as _, HasLoopBody as _},
@@ -17,7 +18,7 @@ use syntax::{
 
 use crate::{
     cx::Cx,
-    lints::{code_fact, edit_distance::find_best_match_for_name},
+    lints::code_fact,
     lower::{Found, Phase, break_outside_of_loop::edges, unreachable_label},
     model::{Applicability, Diag},
 };

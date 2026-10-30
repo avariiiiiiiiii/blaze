@@ -21,7 +21,7 @@ use hir_ty::{
         ImplWork, InherentImpls, SelfTyKey, TraitImpls, TraitValueItems, impl_work,
         trait_value_item,
     },
-    next_solver::{DbInterner, GenericArgs, SimplifiedType},
+    next_solver::{DbInterner, GenericArgs, SimplifiedType, Ty},
     traits::{implements_trait_unique, implements_traits_unique, is_inherent_impl_coherent},
 };
 use rustc_type_ir::inherent::GenericArgs as _;
@@ -219,7 +219,6 @@ fn an_impl_of_another_trait_leaves_the_impls_of_a_trait() {
 
     db.set_file_text(file, &format!("{SPECIALIZING}impl Other for S {{}}\n"));
     let warm = db.log_executed(|| assert_eq!(impls_of_trait(&db, tr), 2));
-    assert!(ran(&warm, "::in_module_for_trait"), "{warm:#?}");
     assert!(!ran(&warm, "::for_crate_and_trait"), "{warm:#?}");
     assert!(!ran(&warm, "::in_crate_for_trait"), "{warm:#?}");
     assert!(!ran(&warm, "::in_crate_and_deps_for_trait"), "{warm:#?}");
@@ -309,6 +308,103 @@ fn changing_a_field_type_reruns_the_layout() {
     db.set_file_text(file, "pub struct S {\n    a: u32,\n    b: u64,\n}\n");
     let warm = db.log_executed(|| assert_eq!(size_of_struct(&db, "S"), 16));
     assert!(ran(&warm, "layout_of_adt_query"), "{warm:#?}");
+}
+
+const LAYOUT_IN_ENVS: &str = "pub struct S {
+    a: u32,
+    b: u8,
+}
+pub fn g<T: Copy>(_: T) {}
+pub fn h<U: Clone>(_: U) {}
+";
+
+/// The size of the struct `name` asked under the environment of `function`.
+fn size_under(db: &TestDB, name: &str, function: &str) -> u64 {
+    let adt = AdtId::from(struct_named(db, name));
+    let function = function_named(db, function);
+    hir_ty::attach_db(db, || {
+        let interner = DbInterner::new_no_crate(db);
+        let ty = Ty::new_adt(interner, adt, GenericArgs::identity_for_item(interner, adt.into()));
+        let env = ParamEnvAndCrate {
+            param_env: db.trait_environment(GenericDefId::FunctionId(function)),
+            krate: krate(db),
+        };
+        db.layout_of_ty(ty.store(), env.store()).expect("a layout").get().size.bytes()
+    })
+}
+
+#[test]
+fn a_type_without_parameters_is_laid_out_once_for_every_environment() {
+    let (db, _) = single_file(LAYOUT_IN_ENVS);
+    let cold = db.log_executed(|| assert_eq!(size_under(&db, "S", "g"), 8));
+    assert!(ran(&cold, "layout_of_adt_query"), "{cold:#?}");
+
+    let warm = db.log_executed(|| assert_eq!(size_under(&db, "S", "h"), 8));
+    assert!(ran(&warm, "layout_of_ty_query"), "{warm:#?}");
+    assert!(!ran(&warm, "layout_of_adt_query"), "{warm:#?}");
+}
+
+const WARM: &str = "pub trait Tr {}
+pub struct S {
+    a: u32,
+    b: u8,
+}
+impl Tr for S {}
+impl S {}
+pub fn g<T: Copy>(_: T) {}
+pub fn r() -> impl Tr {
+    S { a: 0, b: 0 }
+}
+";
+
+/// What a body's inference and a fact's value ask of items once warm, each a memo hit that
+/// allocates nothing: an ADT's layout under its own environment and a type's under a
+/// function's, the ADT's destructor, both impls' coherence and a function's hidden types.
+#[test]
+fn warm_layouts_destructors_coherence_and_hidden_types_allocate_nothing() {
+    assert!(blaze_alloc_count::installed());
+    let (db, _) = single_file(WARM);
+    let adt = AdtId::from(struct_named(&db, "S"));
+    let g = function_named(&db, "g");
+    let r = function_named(&db, "r");
+    let tr = trait_named(&db, "Tr");
+    let (trait_impl, inherent) = (impl_of(&db, Some(tr)), impl_of(&db, None));
+    let krate = krate(&db);
+    hir_ty::attach_db(&db, || {
+        let db = &db;
+        let interner = DbInterner::new_no_crate(db);
+        let args = GenericArgs::identity_for_item(interner, adt.into());
+        let ty = Ty::new_adt(interner, adt, args);
+        let own = ParamEnvAndCrate {
+            param_env: db.trait_environment(GenericDefId::AdtId(adt)),
+            krate,
+        };
+        let under_g = ParamEnvAndCrate {
+            param_env: db.trait_environment(GenericDefId::FunctionId(g)),
+            krate,
+        };
+        let def_map = crate_def_map(db, krate);
+        let ask = || {
+            let of_adt = layout_of_adt_query(db, adt, args.store(), own.store()).expect("a layout");
+            let of_ty = db.layout_of_ty(ty.store(), under_g.store()).expect("a layout");
+            std::hint::black_box(hir_ty::rpit_hidden_types(db, r));
+            (
+                of_adt.size.bytes(),
+                of_ty.get().size.bytes(),
+                destructor(db, adt),
+                check_orphan_rules(db, trait_impl),
+                is_inherent_impl_coherent(db, def_map, inherent),
+            )
+        };
+        let warm = ask();
+        assert_eq!(warm, (8, 8, None, true, true));
+        let again = blaze_alloc_count::assert_at_most(
+            0,
+            "warm layouts, a destructor, coherence and hidden types",
+            || ask(),
+        );
+        assert_eq!(again, warm);
+    });
 }
 
 const ATPIT: &str = "pub trait Tr {
@@ -453,8 +549,9 @@ fn per_module_buckets_are_the_crate_tables() {
     });
 }
 
-/// An impl of `U` added to `a` reruns `U`'s bucket and what reads it; `T`'s bucket and the
-/// inherent ones are left unexecuted, though `a`'s own tables rerun.
+/// An impl of `U` added to `a` reruns `U`'s bucket and what reads it; `T`'s bucket, the
+/// inherent ones and every module's body tables are left unexecuted: which modules' bodies hold
+/// impls is the impls maintainer's, read off the slices.
 #[test]
 fn an_impl_in_one_module_reruns_only_its_trait_bucket() {
     let (mut db, a_file, _) = modules_db();
@@ -474,7 +571,9 @@ fn an_impl_in_one_module_reruns_only_its_trait_bucket() {
 
     db.set_file_text(a_file, &format!("{MODULE_A}impl crate::U for A {{}}\n"));
     let warm = db.log_executed(|| assert_eq!(read(&db), (0, 2, 1)));
-    assert!(ran(&warm, "::for_module"), "{warm:#?}");
+    for query in ["trait_bodies", "inherent_bodies", "body_part"] {
+        assert!(!ran(&warm, query), "{query} ran: {warm:#?}");
+    }
     assert!(ran(&warm, "::in_crate_for_trait"), "{warm:#?}");
     let buckets = warm.iter().filter(|it| it.contains("::for_crate_and_trait")).count();
     assert_eq!(buckets, 1, "only `U`'s bucket reruns: {warm:#?}");
@@ -502,12 +601,12 @@ fn an_item_that_is_no_impl_reruns_no_bucket() {
 
     db.set_file_text(a_file, &format!("{MODULE_A}pub fn added() {{}}\n"));
     let warm = db.log_executed(|| assert_eq!(read(&db), (1, 1)));
-    assert!(ran(&warm, "::for_module"), "{warm:#?}");
     for query in [
         "::for_crate",
         "::for_crate_and_trait",
-        "::modules_by_trait",
-        "::modules_by_self_ty",
+        "trait_bodies",
+        "inherent_bodies",
+        "body_part",
         "::in_crate_for_trait_and_self_ty",
         "::in_crate_for_self_ty",
     ] {
@@ -747,7 +846,7 @@ fn a_trait_method_of_another_name_leaves_the_lookup() {
     let added = TRAIT_DEF.replace("fn m(&self);", "fn m(&self);\n    fn n(&self) {}");
     db.set_file_text(trait_file, &added);
     let warm = db.log_executed(|| infer(&db, caller));
-    assert!(ran(&warm, "in_crate_trait_value_items"), "{warm:#?}");
+    assert!(!ran(&warm, "in_crate_trait_value_items"), "{warm:#?}");
     assert!(!ran(&warm, "::for_body"), "{warm:#?}");
 }
 

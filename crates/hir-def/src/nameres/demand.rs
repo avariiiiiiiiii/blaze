@@ -227,19 +227,14 @@ pub(crate) fn walk_bodies_saying<'db>(
 /// field's default) is in no body.
 pub fn block_owner(db: &Db, block: BlockId) -> Result<DefWithBodyId, String> {
     let item = owning_item(db, block.ast_id(db))?;
-    // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
-    // `module` and `outer` are locals of this walk, only asked for their def maps, scopes and
-    // blocks with `db` (where `DefMap::module` keys a query with one, only hashed and compared),
-    // and dropped before `block_owner` returns a `DefWithBodyId`; nothing else stores them.
-    let mut module = unsafe { block.module(db).to_static() };
+    let mut module = block.module(db).to_static();
     let owner = loop {
         if let Some(owner) = owner_in_module(db, module, item) {
             break owner;
         }
         // The module of a block in a block of the same body is the outer block's.
         let outer = match module.block(db) {
-            // SAFETY: as for `module` above: a local of this walk, never stored.
-            Some(outer) if module.is_block_module(db) => unsafe { outer.to_static() },
+            Some(outer) if module.is_block_module(db) => outer.to_static(),
             _ => {
                 // alloc: error path
                 return Err(format!(
@@ -248,8 +243,7 @@ pub fn block_owner(db: &Db, block: BlockId) -> Result<DefWithBodyId, String> {
                 ));
             }
         };
-        // SAFETY: as for `module` above: a local of this walk, never stored.
-        module = unsafe { outer.module(db).to_static() };
+        module = outer.module(db).to_static();
     };
     if !Body::of(db, owner).blocks(db).any(|(it, _)| it == block) {
         // alloc: error path

@@ -34,8 +34,6 @@ use hir_ty::{
     traits::{StoredParamEnvAndCrate, implements_trait_unique, structurally_normalize_ty},
 };
 use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind};
-use triomphe::Arc;
-
 use crate::{FACT_DOMAIN, Unshared, identity, layout};
 
 /// What a fact or a pointee summary is of: its first byte.
@@ -144,9 +142,10 @@ impl<'db> Cx<'db> {
         structurally_normalize_ty(&self.infcx, ty, self.env.param_env)
     }
 
-    pub(crate) fn layout(&self, ty: Ty<'db>) -> Result<Arc<Layout>, Unshared> {
+    pub(crate) fn layout(&self, ty: Ty<'db>) -> Result<&'static Layout, Unshared> {
         self.db
             .layout_of_ty(ty.store(), self.stored.clone()) // clone: the query's key, a reference count
+            .map(|layout| &layout.get().0)
             .map_err(|error| Unshared::NoLayout(format!("`{ty:?}`: {error:?}"))) // alloc: error path
     }
 
@@ -234,7 +233,7 @@ impl<'db> Cx<'db> {
                 let adt = def.def_id();
                 out.update(&[tag::ADT]);
                 out.id(identity::adt(db, adt).as_ref().map_err(Clone::clone)?);
-                layout::write(&self.layout(ty)?, out);
+                layout::write(self.layout(ty)?, out);
                 for variant in adt.variants(db) {
                     if let VariantId::EnumVariantId(variant) = variant {
                         let discriminant = db.const_eval_discriminant(variant).map_err(|error| {
@@ -250,14 +249,14 @@ impl<'db> Cx<'db> {
             }
             TyKind::Tuple(fields) => {
                 out.update(&[tag::TUPLE]);
-                layout::write(&self.layout(ty)?, out);
+                layout::write(self.layout(ty)?, out);
                 for field in fields.iter() {
                     out.update(&self.fact(field)?.0);
                 }
             }
             TyKind::Array(element, len) => {
                 out.update(&[tag::ARRAY]);
-                layout::write(&self.layout(ty)?, out);
+                layout::write(self.layout(ty)?, out);
                 out.update(&self.fact(element)?.0);
                 out.update(&identity::konst(db, len)?.0);
             }
@@ -277,7 +276,7 @@ impl<'db> Cx<'db> {
             }
             TyKind::Closure(_, args) => {
                 out.update(&[tag::CLOSURE]);
-                layout::write(&self.layout(ty)?, out);
+                layout::write(self.layout(ty)?, out);
                 out.update(&self.fact(args.as_closure().tupled_upvars_ty())?.0);
             }
             // A function item is a value of no size; a call of it, a cast of it to a pointer

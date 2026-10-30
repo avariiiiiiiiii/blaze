@@ -31,7 +31,7 @@ use crate::{
         Rvalue, Statement, StatementKind, StoredPlace, SwitchTargets, Terminator, TerminatorKind,
         framed::{bits_in, block_index},
     },
-    next_solver::{GenericArgs, Region, Ty, TyKind},
+    next_solver::{GenericArgs, Region, RegionExt, Ty, TyKind},
 };
 
 use super::{

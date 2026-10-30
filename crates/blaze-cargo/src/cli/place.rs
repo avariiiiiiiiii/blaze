@@ -6,10 +6,11 @@
 use std::{
     ffi::OsString,
     io,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use blaze_api::{Cargo, Targets};
+use blaze_manifest::paths::normalize_path;
 
 use super::args::Invocation;
 
@@ -29,7 +30,7 @@ pub struct Place {
 /// file or one without an extension is a manifest too.
 pub fn manifest(cwd: &Path, manifest_path: Option<&str>, script: bool) -> Result<PathBuf, String> {
     if let Some(typed) = manifest_path {
-        let path = normalize(&cwd.join(typed));
+        let path = normalize_path(&cwd.join(typed));
         let embedded = is_embedded(&path);
         if !path.ends_with("Cargo.toml") && !embedded {
             return Err("the manifest-path must be a path to a Cargo.toml file".to_owned());
@@ -61,22 +62,6 @@ pub fn manifest(cwd: &Path, manifest_path: Option<&str>, script: bool) -> Result
 fn is_embedded(path: &Path) -> bool {
     let ext = path.extension();
     (ext.is_none() || ext.is_some_and(|it| it == "rs")) && std::fs::metadata(path).is_ok_and(|it| it.is_file())
-}
-
-/// cargo-util's `paths::normalize_path`: `.` dropped and `..` taken back, without the disk.
-pub fn normalize(path: &Path) -> PathBuf {
-    let mut normal = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(..) | Component::RootDir => normal.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normal.pop();
-            }
-            Component::Normal(part) => normal.push(part),
-        }
-    }
-    normal
 }
 
 /// Whether `-Zscript` is among the arguments.
@@ -148,7 +133,7 @@ pub fn config_files(place: &Place, configs: &[String], cargo_home: Option<&Path>
         add(home.join("config.toml"))?;
     }
     for config in configs.iter().filter(|it| !it.is_empty()) {
-        add(normalize(&place.cwd.join(config)))?;
+        add(normalize_path(&place.cwd.join(config)))?;
     }
     Ok(files)
 }

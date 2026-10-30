@@ -28,6 +28,7 @@ mod unstable;
 use hir::InFile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     NodeOrToken, SyntaxKind, T, TextRange,
     view::{self as ast, AstNode as _, AstToken as _},
@@ -37,7 +38,6 @@ use super::{Features, crate_fact};
 use crate::{
     cx::Cx,
     lints::{
-        edit_distance::find_best_match_for_name,
         registry::LintId,
         syntax::{
             source_fact,
@@ -431,7 +431,7 @@ fn line_of(cx: &Cx<'_, '_>, span: &Span) -> Span {
 /// `Symbol::find_similar`: the name that is the feature in lower case, else the nearest one.
 fn similar<'a>(names: &[&'a str], feature: &str) -> Option<&'a str> {
     let lowercase = feature.to_lowercase();
-    names.iter().copied().find(|it| *it == lowercase).or_else(|| find_best_match_for_name(names, feature, None))
+    names.iter().copied().find(|it| *it == lowercase).or_else(|| find_best_match_for_name(names, feature, None).copied())
 }
 
 /// The crates rustc loads besides the crate (`tcx.crates(())`): its dependencies and theirs, each

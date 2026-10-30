@@ -59,19 +59,23 @@ impl Builder {
                 builder = builder.stack_size(size);
             }
             return builder.spawn(f).map(|handle| {
+                // clone: std's `Thread`, a reference count
                 let thread = Thread { inner: Inner::Std(handle.thread().clone()) };
                 JoinHandle { inner: Handle::Std(handle, thread) }
             });
         }
         let name: Option<Arc<str>> = self.name.map(Arc::from);
+        // alloc: the spawned thread's result, once per spawn, as std's `spawn`
         let result = Arc::new(std::sync::Mutex::new(None));
         let slot = Arc::clone(&result);
-        let body: coro::Job = Box::new(move || {
+        // alloc: the spawned thread's body, once per spawn, as std's `spawn`
+        let body = coro::Job::Spawned(Box::new(move || {
             let out = f();
             *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(out);
             drop(slot);
             rt::thread_end();
-        });
+        }));
+        // clone: the thread's name, a reference count
         let (tid, epoch) = rt::spawn(Location::caller(), name.clone(), body)
             .expect("blaze-check: a model thread spawns outside its model");
         let thread = Thread { inner: Inner::Model { tid, epoch, name } };
@@ -279,6 +283,7 @@ impl<T: 'static> LocalKey<T> {
                 value.downcast::<T>().unwrap_or_else(|_| unreachable!("a key's values have its type")),
             ),
             Some(Some(None)) => {
+                // alloc: a thread's `thread_local!` value, once per thread and key, as std's
                 let value = Rc::new((self.init)());
                 // dyn: see `rt::Thread::locals`.
                 let shared: Rc<dyn Any> = Rc::clone(&value) as Rc<dyn Any>;

@@ -300,8 +300,6 @@ pub mod __native {
     /// What a packed span's length and part each stay under.
     #[doc(hidden)]
     pub const NARROW: u32 = 0xFFFF;
-    /// How many parts are found by a scan before a map is built.
-    const SCAN: usize = 8;
 
     /// A span's anchor and context: what the spans of an expansion share.
     pub type Part = (SpanAnchor, SyntaxContext);
@@ -314,9 +312,7 @@ pub mod __native {
     /// equal spans have equal words.
     #[derive(Default)]
     pub struct Parts {
-        list: Vec<Part>,
-        /// Each part's index, once there are more than [`SCAN`].
-        map: FxHashMap<Part, u32>,
+        parts: tt::IndexTable<Part>,
         /// The part asked for last and its index: tokens near each other share one.
         last: Option<(Part, u32)>,
         wide: Vec<[u32; 3]>,
@@ -326,19 +322,18 @@ pub mod __native {
     impl Parts {
         /// Forgets every part and wide span, keeping the room, for the next expansion.
         pub fn clear(&mut self) {
-            self.list.clear();
-            self.map.clear();
+            self.parts.clear();
             self.last = None;
             self.wide.clear();
             self.wides.clear();
         }
 
         pub fn len(&self) -> usize {
-            self.list.len()
+            self.parts.list().len()
         }
 
         pub fn all(&self) -> &[Part] {
-            &self.list
+            self.parts.list()
         }
 
         /// The index of the part `(anchor, ctx)`, the next one when it is new.
@@ -350,30 +345,9 @@ pub mod __native {
             {
                 return index;
             }
-            let index = self.index(part);
+            let index = self.parts.index(part);
             self.last = Some((part, index));
             index
-        }
-
-        fn index(&mut self, part: Part) -> u32 {
-            if self.list.len() <= SCAN {
-                if let Some(at) = self.list.iter().position(|it| *it == part) {
-                    return at as u32;
-                }
-                let at = self.list.len() as u32;
-                self.list.push(part);
-                if self.list.len() > SCAN {
-                    self.map.reserve(4 * SCAN);
-                    self.map.extend(self.list.iter().enumerate().map(|(at, &it)| (it, at as u32)));
-                }
-                return at;
-            }
-            let next = self.list.len() as u32;
-            let list = &mut self.list;
-            *self.map.entry(part).or_insert_with(|| {
-                list.push(part);
-                next
-            })
         }
 
         /// The word of `span`.
@@ -406,7 +380,7 @@ pub mod __native {
         /// The word the module asks for of `start`, `len` and `part` (`span_pack`): [`NONE`] for a
         /// part it was never given or a span ending past 4 GiB.
         pub fn pack_fields(&mut self, start: u32, len: u32, part: u32) -> u64 {
-            if part as usize >= self.list.len() || start.checked_add(len).is_none() {
+            if part as usize >= self.len() || start.checked_add(len).is_none() {
                 return NONE;
             }
             self.word(start, len, part)
@@ -417,7 +391,7 @@ pub mod __native {
         #[inline]
         pub fn get(&self, word: u64) -> Option<span::Span> {
             let [start, len, part] = self.fields_of(word)?;
-            let (anchor, ctx) = *self.list.get(part as usize)?;
+            let (anchor, ctx) = *self.all().get(part as usize)?;
             let end = start.checked_add(len)?;
             let range = TextRange::new(TextSize::new(start), TextSize::new(end));
             Some(span::Span { range, anchor, ctx })
@@ -445,13 +419,13 @@ pub mod __native {
         /// index of this expansion's parts, and nothing else.
         pub fn named(&self, part: WirePart) -> Result<Part, String> {
             match part {
-                WirePart { file_id, ast_id: 0, ctx: 0 } if (file_id as usize) < self.list.len() => {
-                    Ok(self.list[file_id as usize])
+                WirePart { file_id, ast_id: 0, ctx: 0 } if (file_id as usize) < self.len() => {
+                    Ok(self.all()[file_id as usize])
                 }
                 // alloc: the message of a tree refused.
                 _ => Err(format!(
                     "the expansion has {} span parts, each named by its index alone",
-                    self.list.len()
+                    self.len()
                 )),
             }
         }
@@ -463,11 +437,10 @@ pub mod __native {
                 file_id: EditionedFileId::from_raw(file_id),
                 ast_id: ErasedFileAstId::from_raw(ast_id),
             };
-            // SAFETY: `from_u32` asks for a value `into_u32` gave of this process's contexts:
-            // `ctx` is what `write_wire` wrote of a part of a tree of this process the moment before
-            // (`relative`). Memory safety doesn't rest on it: a wrong value panics in `from_u32` or
-            // in salsa's checked lookup, or names another context's hygiene.
-            let ctx = unsafe { SyntaxContext::from_u32(ctx) };
+            // `ctx` is what `write_wire` wrote of a part of a tree of this process the moment
+            // before (`relative`); a wrong value panics in `from_u32` or in salsa's checked
+            // lookup, or names another context's hygiene.
+            let ctx = SyntaxContext::from_u32(ctx);
             self.part(anchor, ctx)
         }
     }

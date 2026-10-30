@@ -10,7 +10,7 @@ use base_db::Db;
 use hir_def::{FunctionId, HasModule, nameres::crate_def_map, signatures::FunctionSignature};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::GenericArgs as _;
-use salsa::{AsId, SalsaValue};
+use salsa::{SalsaValue, plumbing::AsId};
 use smallvec::SmallVec;
 
 use crate::{

@@ -2,7 +2,8 @@
 //! drivers so each is model-checked (docs/v2/plan/lanes/safety/model.md) on every platform, not
 //! only where its driver runs: [`Claims`], the chunks of one job claimed by many threads and
 //! completed by the last (the io_uring driver's stamp sweeps), and [`Wake`], one wake-up of a
-//! driver for any number of hand-backs since it last drained them (the IOCP driver's threads).
+//! driver for any number of hand-backs since it last drained them (the IOCP and kqueue drivers'
+//! threads).
 //! Safe code: what they promise is the memory ordering the unsafe code beside them relies on.
 
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -54,12 +55,18 @@ impl Claims {
 /// and each acquires what the one before released. A sender ordered after the driver's drain
 /// finds the flag clear and wakes the driver; one ordered before it is acquired by the drain,
 /// so its hand-back happens before the driver reads the channel.
-#[cfg_attr(not(windows), allow(dead_code, reason = "the IOCP driver's alone"))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos")),
+    allow(dead_code, reason = "the IOCP and kqueue drivers' alone")
+)]
 pub(crate) struct Wake {
     woken: AtomicBool,
 }
 
-#[cfg_attr(not(windows), allow(dead_code, reason = "the IOCP driver's alone"))]
+#[cfg_attr(
+    not(any(windows, target_os = "macos")),
+    allow(dead_code, reason = "the IOCP and kqueue drivers' alone")
+)]
 impl Wake {
     pub(crate) const fn new() -> Wake {
         Wake { woken: AtomicBool::new(false) }

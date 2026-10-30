@@ -49,6 +49,55 @@ fn a_settled_map_rehashes_without_allocating() {
     assert_eq!(map.get(&task, &key(7)), None);
 }
 
+/// An edit of every entry split among the plane's workers by shard leaves the map as one
+/// thread's does, and reports each edit made once, over random edits of random contents.
+#[test]
+#[cfg_attr(blaze_check, ignore = "the plane's workers: not the model checker's threads")]
+fn a_parallel_edit_of_every_entry_is_the_serial_one() {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for round in 0..8u64 {
+        let (serial, parallel): (Map<u64>, Map<u64>) = (Map::new(), Map::new());
+        let task = blaze_reclaim::enter();
+        for _ in 0..(round + 1) * 700 {
+            let (n, value) = (next() % 5000, next());
+            serial.insert(&task, key(n), value);
+            parallel.insert(&task, key(n), value);
+        }
+        let salt = next();
+        let decide = |value: u64| match (value ^ salt) % 3 {
+            0 => Edit::Remove,
+            1 => Edit::Replace(value.rotate_left(7)),
+            _ => Edit::Keep,
+        };
+        let mut said = Vec::new();
+        serial.edit_all_with(&task, |_, &value| decide(value), |&old, new| said.push((old, new.copied())));
+        let heard = std::sync::Mutex::new(Vec::new());
+        parallel.edit_all_parallel(
+            Vec::new,
+            |_, _, _, &value| decide(value),
+            |mine: &mut Vec<(u64, Option<u64>)>, &old, new| mine.push((old, new.copied())),
+            |mine| heard.lock().expect("the list").extend(mine),
+        );
+        let mut heard = heard.into_inner().expect("the list");
+        said.sort_unstable();
+        heard.sort_unstable();
+        assert_eq!(heard, said, "round {round}: the edits each made");
+        let contents = |map: &Map<u64>| {
+            let mut all = Vec::new();
+            map.for_each(&task, |key, &value| all.push((*key, value)));
+            all.sort_unstable();
+            all
+        };
+        assert_eq!(contents(&parallel), contents(&serial), "round {round}: what is left");
+    }
+}
+
 #[test]
 #[cfg_attr(blaze_check, ignore = "many threads, long loops: slow under the model checker's shims")]
 fn readers_see_every_published_entry_whole_while_tables_grow() {

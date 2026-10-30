@@ -1,4 +1,5 @@
 #![cfg(feature = "inventory")]
+#![forbid(unsafe_code)]
 
 /// Test that high durabilities can't cause "access tracked struct from previous revision" panic.
 ///

@@ -59,11 +59,29 @@ impl CrateType {
             CrateType::Other(s) => s,
         }
     }
+
+    pub fn can_lto(&self) -> bool {
+        matches!(self, CrateType::Bin | CrateType::Staticlib | CrateType::Cdylib)
+    }
+
+    pub fn is_linkable(&self) -> bool {
+        matches!(self, CrateType::Lib | CrateType::Rlib | CrateType::Dylib | CrateType::ProcMacro)
+    }
+
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, CrateType::Dylib | CrateType::Cdylib | CrateType::ProcMacro)
+    }
+
+    pub fn requires_upstream_objects(&self) -> bool {
+        !matches!(self, CrateType::Lib | CrateType::Rlib)
+    }
 }
 
-impl From<&String> for CrateType {
-    fn from(s: &String) -> CrateType {
-        match s.as_str() {
+impl CrateType {
+    /// A manifest's `crate-type` as cargo's `From<&String>` reads it: `procmacro`, which is
+    /// not what `as_str` writes.
+    pub fn parse(name: &str) -> CrateType {
+        match name {
             "bin" => CrateType::Bin,
             "lib" => CrateType::Lib,
             "rlib" => CrateType::Rlib,
@@ -71,8 +89,14 @@ impl From<&String> for CrateType {
             "cdylib" => CrateType::Cdylib,
             "staticlib" => CrateType::Staticlib,
             "procmacro" => CrateType::ProcMacro,
-            _ => CrateType::Other(s.clone()),
+            _ => CrateType::Other(name.to_owned()),
         }
+    }
+}
+
+impl From<&String> for CrateType {
+    fn from(s: &String) -> CrateType {
+        CrateType::parse(s)
     }
 }
 
@@ -111,15 +135,52 @@ impl TargetKind {
         }
     }
 
-    pub fn rustc_crate_types(&self) -> Vec<CrateType> {
+    pub fn rustc_crate_types(&self) -> &[CrateType] {
         match self {
-            TargetKind::Lib(kinds) | TargetKind::ExampleLib(kinds) => kinds.clone(),
+            TargetKind::Lib(kinds) | TargetKind::ExampleLib(kinds) => kinds,
             TargetKind::CustomBuild
             | TargetKind::Bench
             | TargetKind::Test
             | TargetKind::ExampleBin
-            | TargetKind::Bin => vec![CrateType::Bin],
+            | TargetKind::Bin => &[CrateType::Bin],
         }
+    }
+
+    pub fn is_bin(&self) -> bool {
+        matches!(self, TargetKind::Bin)
+    }
+
+    pub fn is_example(&self) -> bool {
+        matches!(self, TargetKind::ExampleLib(_) | TargetKind::ExampleBin)
+    }
+
+    pub fn is_executable(&self) -> bool {
+        matches!(self, TargetKind::Bin | TargetKind::ExampleBin)
+    }
+
+    pub fn is_custom_build(&self) -> bool {
+        matches!(self, TargetKind::CustomBuild)
+    }
+
+    pub fn is_test_or_bench(&self) -> bool {
+        matches!(self, TargetKind::Test | TargetKind::Bench)
+    }
+
+    fn lib_has(&self, crate_type: &CrateType) -> bool {
+        matches!(self, TargetKind::Lib(types) if types.contains(crate_type))
+    }
+
+    pub fn is_dylib(&self) -> bool {
+        self.lib_has(&CrateType::Dylib)
+    }
+
+    pub fn is_cdylib(&self) -> bool {
+        self.lib_has(&CrateType::Cdylib)
+    }
+
+    /// cargo's `Target::for_host`: a build script, or a library that is a proc macro.
+    pub fn for_host(&self) -> bool {
+        self.is_custom_build() || self.lib_has(&CrateType::ProcMacro)
     }
 }
 
@@ -288,7 +349,7 @@ impl Target {
     pub fn serialized(&self) -> Option<SerializedTarget<'_>> {
         Some(SerializedTarget {
             kind: &self.kind,
-            crate_types: self.kind.rustc_crate_types(),
+            crate_types: self.kind.rustc_crate_types().to_vec(),
             name: &self.name,
             src_path: self.src_path.as_ref()?,
             edition: self.edition.to_string(),

@@ -1,6 +1,7 @@
 //! The view twins of hir-expand's handle APIs against the handle functions, element by element,
 //! over a database: a real file, and the macro files of calls of builtin macros made by hand; the
-//! eager expansion on views against the one on handles; and the allocation budgets of the twins'
+//! eager expansion, what a call expands to and path lowering against stored expectations (their
+//! handle forms are deleted); and the allocation budgets of the twins'
 //! walks (docs/v2/plan/lanes/frontend/tree-move-expand.md).
 
 use std::ops::ControlFlow;
@@ -12,7 +13,7 @@ use base_db::{
 use cfg::CfgOptions;
 use span::{Edition, SyntaxContext};
 use syntax::{
-    AstNode, SourceFile, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, ast,
+    AstNode, AstPtr, SourceFile, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, ast,
     view::{self, AstNode as _},
 };
 use triomphe::Arc;
@@ -25,8 +26,8 @@ use crate::{
         collect_item_tree_attrs_view, expand_cfg_attr, expand_cfg_attr_view,
     },
     builtin::{BuiltinFnLikeExpander, EagerExpander},
-    eager::{expand_eager_macro_input, expand_eager_macro_input_view},
-    mod_path::ModPath,
+    eager::expand_eager_macro_input_view,
+    mod_path::{ModPath, PathKind},
     name::AsName,
 };
 
@@ -120,7 +121,10 @@ fn builtin(
         .filter_map(ast::MacroRules::cast)
         .find(|it| it.name().is_some_and(|it| it.to_string() == name))
         .expect("the macro's definition");
-    let ast_id = InFile::new(file, file.ast_id_map(&f.db).ast_id(&ast::Macro::MacroRules(rules)));
+    let ast_id = InFile::new(
+        file,
+        file.ast_id_map(&f.db).ast_id_for_ptr(AstPtr::new(&ast::Macro::MacroRules(rules))),
+    );
     MacroDefId {
         krate: f.krate,
         edition: Edition::CURRENT,
@@ -140,7 +144,7 @@ fn calls(f: &Fixture) -> Vec<(ast::MacroCall, AstId<ast::MacroCall>)> {
         .descendants()
         .filter_map(ast::MacroCall::cast)
         .map(|call| {
-            let ast_id = InFile::new(file, map.ast_id(&call));
+            let ast_id = InFile::new(file, map.ast_id_for_ptr(AstPtr::new(&call)));
             (call, ast_id)
         })
         .collect()
@@ -166,7 +170,8 @@ fn macro_files(f: &Fixture) -> Vec<MacroCallId> {
                 "line" => line,
                 _ => return None,
             };
-            let expand_to = ExpandTo::of_call_site(call).expect("a call in an expression");
+            let expand_to = ExpandTo::of_call_site_view(ast_id.to_view(&f.db))
+                .expect("a call in an expression");
             let kind = MacroCallKind::FnLike { ast_id: *ast_id, expand_to, eager: None };
             Some(def.make_call(&f.db, f.krate, kind, SyntaxContext::root(Edition::CURRENT), 0))
         })
@@ -372,18 +377,37 @@ fn calls_and_expansions_are_the_handles() {
 }
 
 #[test]
-fn what_a_call_expands_to_is_the_handles() {
+fn what_a_call_expands_to_in_every_position() {
+    use ExpandTo::*;
     let parse = SourceFile::parse(POSITIONS, Edition::CURRENT);
-    let tree = parse.tree();
-    let handles = tree.syntax().descendants().filter_map(ast::MacroCall::cast);
-    let views = parse.root().descendants().filter_map(view::MacroCall::cast);
-    let mut compared = 0;
-    for (handle, view) in handles.zip(views) {
-        assert_eq!(ExpandTo::of_call_site(&handle), ExpandTo::of_call_site_view(view), "{handle}");
-        compared += 1;
-    }
-    assert_eq!(compared, tree.syntax().descendants().filter_map(ast::MacroCall::cast).count());
-    assert!(compared >= 15, "{compared} calls");
+    let got: Vec<_> = parse
+        .root()
+        .descendants()
+        .filter_map(view::MacroCall::cast)
+        .map(ExpandTo::of_call_site_view)
+        .collect();
+    let expected = [
+        // `m!();` in the file
+        Items,
+        // `fn g`: a statement, a pattern and its initializer, a type, a tuple's and an array's
+        // element, a scrutinee, an arm's pattern and its body
+        Statements,
+        Pattern,
+        Expr,
+        Type,
+        Expr,
+        Expr,
+        Expr,
+        Pattern,
+        Expr,
+        // a tuple field's type, the impl's, trait's and extern block's items, an array length
+        Type,
+        Items,
+        Items,
+        Items,
+        Expr,
+    ];
+    assert_eq!(got, expected.map(Ok));
 }
 
 #[test]
@@ -411,11 +435,6 @@ fn names_and_paths_are_the_handles() {
             assert_eq!(field.map(|it| it.as_name()), field_view.map(|it| it.as_name()), "{h}");
         }
         if let (Some(h), Some(v)) = (ast::Path::cast(node.clone()), view::Path::cast(view)) {
-            assert_eq!(
-                ModPath::from_src(db, h.clone(), &mut root_ctxt),
-                ModPath::from_src_view(db, v, &mut root_ctxt),
-                "{h}"
-            );
             assert_eq!(h.is1("Clone"), v.is1("Clone"), "{h}");
             assert_eq!(h.as_one_segment(), v.as_one_segment(), "{h}");
             assert_eq!(h.as_up_to_two_segment(), v.as_up_to_two_segment(), "{h}");
@@ -426,6 +445,35 @@ fn names_and_paths_are_the_handles() {
             assert_eq!(h.value_string(), v.value_string(), "{h}");
         }
     }
+}
+
+#[test]
+fn paths_lower_to_mod_paths() {
+    let f = fixture();
+    let db = &f.db;
+    let lowered: Vec<_> = HirFileId::from(f.file)
+        .root(db)
+        .descendants()
+        .filter_map(view::Path::cast)
+        .filter(|it| it.syntax().parent().and_then(view::Path::cast).is_none())
+        .map(|it| {
+            let path = ModPath::from_src_view(db, it, &mut root_ctxt);
+            let path = path.map(|it| (it.kind, it.display_verbatim(db).to_string()));
+            (it.syntax().text().to_string(), path)
+        })
+        .collect();
+    for (text, kind, display) in [
+        ("self::h", PathKind::SELF, "self::h"),
+        ("super::k", PathKind::Super(1), "super::k"),
+        ("stringify", PathKind::Plain, "stringify"),
+        ("u32", PathKind::Plain, "u32"),
+    ] {
+        let want = (text.to_owned(), Some((kind, display.to_owned())));
+        assert!(lowered.contains(&want), "{text}: {lowered:?}");
+    }
+    let call = lowered.iter().find(|(text, _)| text.starts_with("crate::m::g::"));
+    let call = call.expect("the path of the call of `r#try`");
+    assert_eq!(call.1.as_ref().map(|it| it.0), Some(PathKind::Crate), "{call:?}");
 }
 
 #[test]
@@ -466,7 +514,7 @@ fn attributes_are_the_handles() {
         assert_eq!(result.is_some(), result_view.is_some(), "{handle}");
 
         if let Some(adt) = ast::Adt::cast(handle.syntax().clone()) {
-            let ast_id = InFile::new(file, file.ast_id_map(db).ast_id(&adt));
+            let ast_id = InFile::new(file, file.ast_id_map(db).ast_id_for_ptr(AstPtr::new(&adt)));
             let adt_view = ast_id.to_view(db);
             for index in 0..kept.len() as u32 {
                 let id = AttrId::from_item_tree_index(index);
@@ -492,7 +540,7 @@ fn attributes_are_the_handles() {
 }
 
 #[test]
-fn an_eager_expansion_is_the_handles() {
+fn an_eager_expansion_replaces_its_nested_calls() {
     let f = fixture();
     let db = &f.db;
     let stringify = fn_like(&f, "stringify", BuiltinFnLikeExpander::Stringify);
@@ -512,19 +560,24 @@ fn an_eager_expansion_is_the_handles() {
         if name_of(&call).as_deref() != Some("concat") {
             continue;
         }
-        let (mut nested, mut nested_view) = (Vec::new(), Vec::new());
-        let krate = f.krate;
-        let handle = expand_eager_macro_input(
-            db, krate, &call, ast_id, concat, ctxt, 0, 128, &resolver, &mut nested,
+        let mut nested = Vec::new();
+        let result = expand_eager_macro_input_view(
+            db, f.krate, view, ast_id, concat, ctxt, 0, 128, &resolver, &mut nested,
         );
-        let view = expand_eager_macro_input_view(
-            db, krate, view, ast_id, concat, ctxt, 0, 128, &resolver, &mut nested_view,
-        );
-        assert!(handle.value.is_some(), "the call expands");
-        assert_eq!(handle.value, view.value, "the same call, so the same argument and spans");
-        assert_eq!(handle.err.is_some(), view.err.is_some(), "`nope!` is an error of both");
-        assert_eq!(nested, nested_view, "the same nested calls, in the same order");
-        assert!(!nested.is_empty(), "the nested calls are expanded");
+        assert!(result.err.is_some(), "`nope!` is unresolved");
+        let id = result.value.expect("the call expands past the unresolved one");
+        let defs: Vec<_> = nested.iter().map(|(_, id)| id.loc(db).def).collect();
+        assert_eq!(defs, [stringify, line, concat], "the nested calls, in preorder");
+        let MacroCallKind::FnLike { eager: Some(info), .. } = &id.loc(db).kind else {
+            panic!("an eager call");
+        };
+        let arg = info.arg.to_string();
+        for kept in ["\"a\"", "\"b\"", "\"c1\"", "nope"] {
+            assert!(arg.contains(kept), "{kept} in {arg}");
+        }
+        for replaced in ["stringify", "line", "concat"] {
+            assert!(!arg.contains(replaced), "{replaced} in {arg}");
+        }
         expanded += 1;
     }
     assert_eq!(expanded, 1);

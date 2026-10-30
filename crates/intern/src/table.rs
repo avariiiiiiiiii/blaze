@@ -8,7 +8,7 @@
 //!   so an image is only restored by a blaze with the same one.
 //! - `first..base.end` with its live bit set: restored from the image, read in place.
 //! - any other below `next`: made by this process, in the overlay: an append-only arena behind
-//!   [`Store`]'s lock-free index, and a column from ID to record.
+//!   [`Records`]' lock-free index, and a column from ID to record.
 //!
 //! A lookup probes the mapped index (SwissTable groups of eight tag bytes beside eight IDs,
 //! read only), then the overlay's. A new value takes an ID the image's GC freed first, then the
@@ -24,18 +24,23 @@
 //! and 5 to 10 bytes of index. A lookup is one hash of the bytes, one probe of the mapped index
 //! (a control word, then the bytes compared) and, for a value not in the image, one of the
 //! overlay's. Reading a value's bytes is a range check, one live bit and two starts.
+//!
+//! Safe code: the overlay's records and ID column are [`crate::typed`]'s. The image's bytes are
+//! untrusted until [`Table::restore`] has checked them: every column is read through
+//! `blaze_image`'s bounds- and alignment-checked views, and [`Table::validate`] checks each
+//! entry against the others before any lookup reads one, so a damaged section is a
+//! [`RestoreError`] naming the byte that failed, never a panic or a read out of bounds.
 
-use std::{alloc::Layout, fmt, ptr::NonNull};
+use std::fmt;
 
 use blaze_format::SchemaHash;
 use blaze_ids::bits::{BitSet, BitSlice};
 use blaze_image::{Corrupt, Image, Refused, Section, SectionId, SectionWriter, Stable};
-use blaze_mem::{Region, Tag};
 
 use crate::{
-    arena::{Entry, Store},
     swiss::{self, Ctrl},
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    typed::{Record, Records},
 };
 
 /// What every table of one kind shares.
@@ -59,29 +64,15 @@ pub(crate) const MAX_ALIGN: usize = 16;
 /// Slots in a group of the mapped index: tag bytes 0 to 7 of its control word.
 const GROUP: usize = 8;
 
-/// The hash of a value's bytes, in every table, mapped or not. Defined here, not by a hasher
-/// crate, so an image's index means the same to every blaze that opens it: FxHash's
+/// The hash of a value's bytes, in every table, mapped or not: [`blaze_phf::name_hash`],
+/// fixed so an image's index means the same to every blaze that opens it. FxHash's
 /// multiply-rotate over 8-byte words, the length first, then murmur3's 64-bit finalizer so the
-/// tag (the top 7 bits) and the home group (the low ones) are both well mixed.
+/// tag (the top 7 bits) and the home group (the low ones) are both well mixed. It is
+/// `blaze_phf`'s so the compiled-in symbols' perfect hash is keyed by it too, and a caller that
+/// hashed a name already (the lexer) hands the hash over ([`Table::intern_hashed`]).
+#[inline]
 pub(crate) fn value_hash(bytes: &[u8]) -> u64 {
-    const K: u64 = 0xf135_7aea_2e62_a9c5;
-    let step = |h: u64, word: u64| (h ^ word).wrapping_mul(K).rotate_left(26);
-    let mut h = (bytes.len() as u64).wrapping_mul(K);
-    let mut words = bytes.chunks_exact(8);
-    for word in &mut words {
-        h = step(h, u64::from_le_bytes(word.try_into().expect("8 bytes")));
-    }
-    let rest = words.remainder();
-    if !rest.is_empty() {
-        let mut last = [0u8; 8];
-        last[..rest.len()].copy_from_slice(rest);
-        h = step(h, u64::from_le_bytes(last));
-    }
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    h ^ (h >> 33)
+    blaze_phf::name_hash(bytes)
 }
 
 blaze_format::record! {
@@ -141,80 +132,6 @@ impl Base {
     }
 }
 
-/// A value this process made: its header, then its bytes.
-#[repr(C, align(16))]
-struct Head {
-    key: u64,
-    id: u32,
-    len: u32,
-}
-
-const _: () = assert!(size_of::<Head>() == MAX_ALIGN);
-
-impl Head {
-    /// The header at `at`, a value of a table's store.
-    fn at(at: NonNull<u8>) -> &'static Head {
-        // SAFETY: every value of a table's `Store` is a `Head` followed by its bytes, written
-        // before it was published (`Table::insert`) and never moved or freed.
-        unsafe { at.cast::<Head>().as_ref() }
-    }
-
-    fn bytes(&'static self) -> &'static [u8] {
-        let after = std::ptr::from_ref(self).wrapping_add(1).cast::<u8>();
-        // SAFETY: `Table::insert` allocates `len` bytes right after the header, in the same
-        // allocation, and writes them before publishing; the arena never frees them.
-        unsafe { std::slice::from_raw_parts(after, self.len as usize) }
-    }
-}
-
-fn record_layout(len: usize) -> Layout {
-    Layout::from_size_align(size_of::<Head>() + len, MAX_ALIGN).expect("an interned value's layout")
-}
-
-/// ID to header for the values this process made: slot `id - first` over a region reserved
-/// for every `u32` (32 GiB of address space, committed as IDs are made, counted under
-/// [`Tag::Intern`]). A slot is set once, before the index publishes its value.
-///
-/// Region memory is plain words, so a slot is std's atomic in a model build too.
-struct Column {
-    slots: Region,
-}
-
-const SLOT: usize = size_of::<std::sync::atomic::AtomicPtr<Head>>();
-
-impl Column {
-    fn new() -> Column {
-        Column {
-            slots: Region::reserve(u32::MAX as usize * SLOT, Tag::Intern)
-                .unwrap_or_else(|error| panic!("intern: {error}")),
-        }
-    }
-
-    fn slot(&self, index: usize) -> Option<&std::sync::atomic::AtomicPtr<Head>> {
-        if (index + 1) * SLOT > self.slots.committed() {
-            return None;
-        }
-        // SAFETY: the slot is committed (checked just now) and aligned (a page-aligned base plus
-        // a multiple of 8); committed pages are zeroed by the kernel and never decommitted, and
-        // zero bytes are a null `AtomicPtr`; it lives as long as `self`.
-        Some(unsafe { self.slots.at(index * SLOT).cast::<std::sync::atomic::AtomicPtr<Head>>().as_ref() })
-    }
-
-    fn get(&self, index: usize) -> Option<&'static Head> {
-        let at = NonNull::new(self.slot(index)?.load(std::sync::atomic::Ordering::Acquire))?;
-        Some(Head::at(at.cast()))
-    }
-
-    fn set(&self, index: usize, head: NonNull<Head>) {
-        if let Err(error) = self.slots.ensure((index + 1) * SLOT) {
-            panic!("intern: {error}");
-        }
-        let slot = self.slot(index).expect("a slot committed just now");
-        // Release: a reader that loads the header sees it written.
-        slot.store(head.as_ptr(), std::sync::atomic::Ordering::Release);
-    }
-}
-
 /// The IDs the owners of an image's other sections still name, marked before the image is
 /// written: a value whose ID is not marked is not kept.
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -248,8 +165,9 @@ pub enum RestoreError {
     Refused(Refused),
     /// A group of the table's section failed its CRC: the whole table is dropped.
     Corrupt(Corrupt),
-    /// The section's bytes are not a table of this kind.
-    Invalid { section: SectionId, what: &'static str },
+    /// The section's bytes are not a table of this kind: `what` failed at byte `at` of the
+    /// section (the root's for its counts and shape, else the column entry's).
+    Invalid { section: SectionId, what: &'static str, at: u64 },
     /// Values were interned in this process before the restore, under IDs the image may hold.
     Started { section: SectionId },
 }
@@ -271,7 +189,9 @@ impl fmt::Display for RestoreError {
         match self {
             RestoreError::Refused(refused) => refused.fmt(f),
             RestoreError::Corrupt(corrupt) => corrupt.fmt(f),
-            RestoreError::Invalid { section, what } => write!(f, "{section} is not a table: {what}"),
+            RestoreError::Invalid { section, what, at } => {
+                write!(f, "{section} is not a table: {what}, at byte {at} of the section")
+            }
             RestoreError::Started { section } => {
                 write!(f, "{section} was restored after values were interned: restore it first")
             }
@@ -302,6 +222,7 @@ fn in_chunks<E: Send>(
     if n <= 1 {
         return check(0..total);
     }
+    #[allow(clippy::disallowed_types, reason = "taken only by a chunk that failed, an error path")]
     let failed = std::sync::Mutex::new(None::<(usize, E)>);
     jobs(n, &|job| {
         if let Err(error) = check(job * chunk..((job + 1) * chunk).min(total)) {
@@ -326,8 +247,8 @@ pub(crate) struct Table {
     next: AtomicU32,
     /// How many of `base.free` were taken.
     reused: AtomicUsize,
-    store: Store,
-    fresh: Column,
+    /// The values this process made, and their ID column.
+    records: Records,
 }
 
 impl Table {
@@ -339,17 +260,13 @@ impl Table {
             base: Base { end: first, ..Base::default() },
             next: AtomicU32::new(first),
             reused: AtomicUsize::new(0),
-            store: Store::new(),
-            fresh: Column::new(),
+            records: Records::new(first),
             shape,
         };
         for id in 1..first {
             let bytes = (table.shape.static_bytes)(id);
-            let same = |at: NonNull<u8>| Head::at(at).bytes() == bytes;
             // A value compiled in twice is the first.
-            if let Entry::Vacant(vacant) = table.store.entry(value_hash(bytes), same) {
-                table.insert(vacant, id, bytes);
-            }
+            table.records.intern(value_hash(bytes), bytes, || (id, (table.shape.key)(bytes)));
         }
         table
     }
@@ -366,16 +283,16 @@ impl Table {
         let groups = section.groups as usize;
         in_chunks(jobs, groups, CHUNK_GROUPS, |at| image.check(section, at.start as u32..at.end as u32))?;
         let root = *image.value::<Root>(section, 0)?;
-        let invalid = |what| RestoreError::Invalid { section: section.id, what };
+        let invalid = |(what, at)| RestoreError::Invalid { section: section.id, what, at };
         if root.statics != shape.statics || root.first != shape.statics + 1 || root.align as usize != shape.align {
-            return Err(invalid("a table of another shape"));
+            return Err(invalid(("a table of another shape", 0)));
         }
         let end = root.first.checked_add(root.count).filter(|&end| end < u32::MAX);
-        let end = end.ok_or(invalid("more IDs than a u32 holds"))?;
+        let end = end.ok_or(invalid(("more IDs than a u32 holds", 0)))?;
         let count = u64::from(root.count);
         let groups = u64::from(root.groups);
         if !groups.is_power_of_two() {
-            return Err(invalid("an index that is not a power of two of groups"));
+            return Err(invalid(("an index that is not a power of two of groups", 0)));
         }
         let base = Base {
             end,
@@ -392,11 +309,10 @@ impl Table {
             base,
             next: AtomicU32::new(end),
             reused: AtomicUsize::new(0),
-            store: Store::new(),
-            fresh: Column::new(),
+            records: Records::new(root.first),
             shape,
         };
-        table.validate(jobs).map_err(invalid)?;
+        table.validate(&root, jobs).map_err(invalid)?;
         Ok(table)
     }
 
@@ -422,32 +338,43 @@ impl Table {
     /// The checks that make every read of the restored columns in bounds, in O(IDs + slots)
     /// with no value hashed, each column split into chunks run by `jobs`. That the index
     /// reaches every live value under its own hash is the section's CRC's to guard: a slot that
-    /// does not costs a second ID for that value, never a wrong value.
-    fn validate(&self, jobs: Jobs<'_>) -> Result<(), &'static str> {
+    /// does not costs a second ID for that value, never a wrong value. An error is what failed
+    /// and the byte of the section it failed at (`root`'s column offsets, bounds-checked by the
+    /// views that read them).
+    fn validate(&self, root: &Root, jobs: Jobs<'_>) -> Result<(), (&'static str, u64)> {
         let base = &self.base;
         let count = (base.end - self.first) as usize;
         let align = self.shape.align;
+        let start_at = |index: usize| root.starts + 4 * index as u64;
         if !(base.bytes.as_ptr() as usize).is_multiple_of(align) {
-            return Err("values misaligned");
+            return Err(("values misaligned", root.bytes));
         }
-        if base.starts[0] != 0 || base.starts[count] as usize != base.bytes.len() {
-            return Err("starts that do not span the values");
+        if base.starts[0] != 0 {
+            return Err(("starts that do not begin at the values", start_at(0)));
         }
-        if base.live.first_in(count..base.live.capacity()).is_some() {
-            return Err("live bits past the last ID");
+        if base.starts[count] as usize != base.bytes.len() {
+            return Err(("starts that do not end with the values", start_at(count)));
+        }
+        if let Some(past) = base.live.first_in(count..base.live.capacity()) {
+            return Err(("live bits past the last ID", root.live + 8 * (past / 64) as u64));
         }
         in_chunks(jobs, count, CHUNK, |indices| {
             for index in indices {
                 let (start, end) = (base.starts[index] as usize, base.starts[index + 1] as usize);
-                if end < start || !start.is_multiple_of(align) || !(end - start).is_multiple_of(self.shape.size) {
-                    return Err("a value's bytes out of order or misaligned");
+                // `end <= len` here, not only through the order of every later start: the UTF-8
+                // check below slices the bytes before a later chunk has been checked.
+                if end < start || end > base.bytes.len() {
+                    return Err(("a value's bytes out of order or past the values", start_at(index + 1)));
+                }
+                if !start.is_multiple_of(align) || !(end - start).is_multiple_of(self.shape.size) {
+                    return Err(("a value's bytes misaligned", start_at(index + 1)));
                 }
                 match base.is_live(index) {
                     true if self.shape.text && std::str::from_utf8(&base.bytes[start..end]).is_err() => {
-                        return Err("a value that is not UTF-8");
+                        return Err(("a value that is not UTF-8", root.bytes + start as u64));
                     }
                     true => {}
-                    false if end != start => return Err("bytes for a free ID"),
+                    false if end != start => return Err(("bytes for a free ID", start_at(index + 1))),
                     false => {}
                 }
             }
@@ -459,7 +386,7 @@ impl Table {
                 let in_range = id >= self.first && id < base.end;
                 let ascending = at == 0 || base.free[at - 1] < id;
                 if !in_range || !ascending || base.is_live((id - self.first) as usize) {
-                    return Err("a free ID that is live, repeated or out of range");
+                    return Err(("a free ID that is live, repeated or out of range", root.free + 4 * at as u64));
                 }
             }
             Ok(())
@@ -474,11 +401,12 @@ impl Table {
                     if tag == 0 {
                         continue;
                     }
-                    let id = base.ids[group * GROUP + byte];
+                    let slot = group * GROUP + byte;
+                    let id = base.ids[slot];
                     let known = (1..self.first).contains(&id)
                         || (id >= self.first && id < base.end && base.is_live((id - self.first) as usize));
                     if tag & 0x80 == 0 || !known {
-                        return Err("an index slot that names no value");
+                        return Err(("an index slot that names no value", root.ids + 4 * slot as u64));
                     }
                     here += 1;
                 }
@@ -488,55 +416,34 @@ impl Table {
         })?;
         let full = full.into_inner();
         if full * 2 > base.ids.len() || (self.first > 1 && full == 0) {
-            return Err("an index more than half full, or without the compiled-in values");
+            return Err(("an index more than half full, or without the compiled-in values", root.ctrl));
         }
         Ok(())
     }
 
     /// The ID of `bytes`, made if it has none.
     pub(crate) fn intern(&self, bytes: &[u8]) -> u32 {
-        let hash = value_hash(bytes);
+        self.intern_hashed(value_hash(bytes), bytes)
+    }
+
+    /// [`Table::intern`] of `bytes` whose [`value_hash`] is `hash`.
+    pub(crate) fn intern_hashed(&self, hash: u64, bytes: &[u8]) -> u32 {
+        debug_assert_eq!(hash, value_hash(bytes), "the hash given is not the bytes' value_hash");
         if let Some(id) = self.base_find(hash, bytes) {
             return id;
         }
-        let same = |at: NonNull<u8>| Head::at(at).bytes() == bytes;
-        match self.store.entry(hash, same) {
-            Entry::Found(at) => Head::at(at).id,
-            Entry::Vacant(vacant) => {
-                let id = self.take_id();
-                self.insert(vacant, id, bytes);
-                id
-            }
-        }
+        self.records.intern(hash, bytes, || (self.take_id(), (self.shape.key)(bytes))).id()
     }
 
     /// The ID of `bytes`, if it has one.
     pub(crate) fn find(&self, bytes: &[u8]) -> Option<u32> {
-        let hash = value_hash(bytes);
-        self.base_find(hash, bytes).or_else(|| {
-            self.store.find(hash, |at| Head::at(at).bytes() == bytes).map(|at| Head::at(at).id)
-        })
+        self.find_hashed(value_hash(bytes), bytes)
     }
 
-    /// Writes `bytes` as value `id` into the overlay and publishes it. The column's slot is set
-    /// before the index publishes the value, so a reader that finds the ID finds its bytes.
-    fn insert(&self, vacant: crate::arena::Vacant<'_>, id: u32, bytes: &[u8]) {
-        let key = (self.shape.key)(bytes);
-        let len = u32::try_from(bytes.len()).expect("an interned value of 4 GiB or more");
-        let first = self.first;
-        vacant.insert(record_layout(bytes.len()), |to| {
-            let head = to.cast::<Head>();
-            // SAFETY: `to` is fresh memory of `record_layout(len)`: aligned for a `Head`, with
-            // room for it and `len` bytes after it.
-            unsafe { head.write(Head { key, id, len }) };
-            let after = head.as_ptr().wrapping_add(1).cast::<u8>();
-            // SAFETY: the `len` bytes after the header are in the allocation and fresh, so
-            // they cannot overlap `bytes`.
-            unsafe { after.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
-            if id >= first {
-                self.fresh.set((id - first) as usize, head);
-            }
-        });
+    /// [`Table::find`] of `bytes` whose [`value_hash`] is `hash`.
+    pub(crate) fn find_hashed(&self, hash: u64, bytes: &[u8]) -> Option<u32> {
+        debug_assert_eq!(hash, value_hash(bytes), "the hash given is not the bytes' value_hash");
+        self.base_find(hash, bytes).or_else(|| self.records.find(hash, bytes).map(Record::id))
     }
 
     fn take_id(&self) -> u32 {
@@ -578,7 +485,7 @@ impl Table {
         if id < base.end && base.is_live(index) {
             return Some(&base.bytes[base.starts[index] as usize..base.starts[index + 1] as usize]);
         }
-        self.fresh.get(index).map(Head::bytes)
+        self.records.get(id).map(Record::bytes)
     }
 
     /// [`Table::get`] of an ID a handle holds, which must name a value.
@@ -606,7 +513,7 @@ impl Table {
         if id < self.base.end && self.base.is_live(index) {
             return self.base.keys[index];
         }
-        self.fresh.get(index).map_or_else(|| self.lost(id), |head| head.key)
+        self.records.get(id).map_or_else(|| self.lost(id), Record::key)
     }
 
     /// One past the highest ID made so far.
@@ -692,5 +599,8 @@ impl Table {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(blaze_check)))]
 mod tests;
+
+#[cfg(all(test, blaze_check))]
+mod model;

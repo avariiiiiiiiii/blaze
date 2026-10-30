@@ -67,7 +67,7 @@ pub use facts::*;
 pub use form::observes_names;
 pub use hash::{
     Unhashable, closure_code, code_hash, coroutine_code, deep_hash, hashes, interface_hash,
-    layout_hash,
+    layout_hash, signature_hash,
 };
 pub use index::*;
 pub use key::{Resolved, item_key, resolve};
@@ -189,6 +189,14 @@ pub enum ItemKind {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct InterfaceHash(pub ContentId);
 
+/// The interface without what a body leaks into it: in place of each leak (a `const fn`'s, a
+/// constant's, an immutable static's and an explicit discriminant's body, an opaque type's
+/// hidden type and its auto traits, a closure's captures and a coroutine's held locals) a
+/// marker, each ref by its signature hash. Read by what a body's inference is keyed by, which
+/// may not depend on any body's inference: what a body reads of a leak is a fact of its own.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct SignatureHash(pub ContentId);
+
 /// A type's size, alignment, field offsets, niches and ABI, deep: its fields' layouts, `repr`
 /// and the target, transitively.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -232,7 +240,9 @@ pub type Scope = ItemKey;
 /// The narrowest thing a query read (docs/v2/plan/lanes/items.md section 6.2), and what invalidates it.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Fact {
-    /// F's interface hash: read by callers' type checking.
+    /// F's signature hash ([`SignatureHash`]): read by callers' type checking. What a body
+    /// leaks is a fact of its own ([`Fact::HiddenTypes`], [`Fact::AutoTraits`],
+    /// [`Fact::ConstValue`], [`Fact::Captures`]).
     Signature(ItemKey),
     /// T's layout hash: read by the codegen of everything that moves or stores a T.
     Layout(ItemKey),
@@ -249,7 +259,8 @@ pub enum Fact {
     Resolves { scope: Scope, name: NameHash },
     /// F's code hash: read by F's codegen, and by callers that inlined F (release).
     Code(ItemKey),
-    /// A const's evaluated value, not its expression.
+    /// The evaluated value, not its expression, of a const, a static's initializer (by the
+    /// static's key) or an enum variant's discriminant (by the variant's key).
     ConstValue(ItemKey),
     /// X's name and path, for what observes them: `type_name`, `module_path!`, mangling,
     /// `#[no_mangle]`, `#[export_name]`, `#[link_name]`.
@@ -272,6 +283,10 @@ pub enum Fact {
     /// depends on, their inputs and the files of their source roots. A dependency's items are
     /// lowered in batches of the whole crate, so a read of a batch stands for this.
     Crate(ContentId),
+    /// The hidden type of each `impl Trait` of a function's return type or of a type alias
+    /// (by the function's or alias's key): what `rpit_hidden_types` and `tait_hidden_types`
+    /// give, which the defining bodies' inference decides.
+    HiddenTypes(ItemKey),
 }
 
 /// The facts' query kinds, in [`blaze_query::kinds::FACTS`].
@@ -298,6 +313,9 @@ pub mod kinds {
     pub const HASHES: QueryKind = QueryKind(0x1010);
     pub const TARGET: QueryKind = QueryKind(0x1011);
     pub const CRATE: QueryKind = QueryKind(0x1012);
+    pub const HIDDEN_TYPES: QueryKind = QueryKind(0x1013);
+    // 0x1800..0x1810 are lane item-hash's (`blaze_item_hash::values`): facts lane items does
+    // not hash, listed in `blaze_item_hash::values::kinds`. None is defined here.
 }
 
 pub const FACT_DOMAIN: &str = "blaze v2 fact 1";
@@ -323,6 +341,7 @@ impl Fact {
             Fact::Derive(_) => kinds::DERIVE,
             Fact::Target(_) => kinds::TARGET,
             Fact::Crate(_) => kinds::CRATE,
+            Fact::HiddenTypes(_) => kinds::HIDDEN_TYPES,
         }
     }
 
@@ -341,7 +360,8 @@ impl Fact {
             | Fact::Coherence(it)
             | Fact::Specializes(it)
             | Fact::DropCheck(it)
-            | Fact::Derive(it) => hasher.id(&it.0),
+            | Fact::Derive(it)
+            | Fact::HiddenTypes(it) => hasher.id(&it.0),
             Fact::Field { ty, field } => hasher.id(&ty.0).update(&field.to_le_bytes()),
             Fact::Method { self_ty, name } => hasher.id(&self_ty.0).id(&name.0),
             Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {

@@ -40,7 +40,7 @@ triomphe.workspace = true
 blaze-alloc-count.workspace = true
 expect-test.workspace = true
 hir-ty-mir.workspace = true
-proptest.workspace = true
+hegeltest.workspace = true
 test-fixture.workspace = true
 
 [lints]

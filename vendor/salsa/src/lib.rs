@@ -295,45 +295,74 @@
 //! [tracked functions in the Salsa book]: https://salsa-rs.github.io/salsa/overview.html#tracked-functions
 //! [tracked structs in the Salsa book]: https://salsa-rs.github.io/salsa/overview.html#tracked-structs
 
+#![feature(portable_simd)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![forbid(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_code)]
 
 #[cfg(feature = "accumulator")]
+#[allow(unsafe_code)]
 mod accumulator;
 mod active_query;
+#[allow(unsafe_code)]
 mod attach;
 mod cancelled;
+#[allow(unsafe_code)]
 mod capture;
 mod cycle;
+#[allow(unsafe_code)]
 mod database;
+#[allow(unsafe_code)]
 mod database_impl;
 mod durability;
 mod event;
 mod fingerprint;
+#[allow(unsafe_code)]
 mod function;
+#[allow(unsafe_code)]
 mod graph;
 mod hash;
+#[allow(unsafe_code)]
 mod id;
+#[allow(unsafe_code)]
 pub mod image;
+#[allow(unsafe_code)]
 mod ingredient;
+#[allow(unsafe_code)]
 mod ingredient_cache;
+#[allow(unsafe_code)]
 mod input;
+#[allow(unsafe_code)]
 mod interned;
+#[allow(unsafe_code)]
 mod key;
+#[allow(unsafe_code)]
 mod memo_ingredient_indices;
 mod return_mode;
+#[allow(unsafe_code)]
 mod revision;
+#[allow(unsafe_code)]
 mod runtime;
+#[allow(unsafe_code)]
 mod salsa_struct;
+#[allow(unsafe_code)]
 mod salsa_value;
+#[allow(unsafe_code)]
 mod storage;
+#[allow(unsafe_code)]
 mod sync;
+#[allow(unsafe_code)]
 mod table;
+#[allow(unsafe_code)]
 mod task;
 mod tracing;
+#[allow(unsafe_code)]
 mod tracked_struct;
+#[allow(unsafe_code)]
 mod views;
+#[allow(unsafe_code)]
 mod zalsa;
+#[allow(unsafe_code)]
 mod zalsa_local;
 
 #[cfg(not(feature = "inventory"))]
@@ -373,6 +402,15 @@ pub use self::zalsa_local::CancellationToken;
 pub use crate::attach::{attach, attach_allow_change, with_attached_database};
 pub use crate::interned::{HashEqLike, Lookup};
 
+/// The graph's codecs and models, for `benches/graph_*.rs`: not an API.
+#[doc(hidden)]
+pub use self::graph::bench as graph_bench;
+
+/// Counts the lib tests' allocations, for the tests that check a hot path makes none.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 pub mod prelude {
     #[cfg(feature = "accumulator")]
     pub use crate::accumulator::Accumulator;
@@ -410,7 +448,7 @@ pub mod plumbing {
     pub use crate::id::{AsId, FromId, FromIdWithDb, Id};
     pub use crate::ingredient::{Ingredient, Jar, Location};
     pub use crate::ingredient_cache::IngredientCache;
-    pub use crate::interned::{HashEqLike, Lookup};
+    pub use crate::interned::{HashEqLike, Lookup, interned_arguments};
     pub use crate::key::DatabaseKeyIndex;
     pub use crate::memo_ingredient_indices::{
         IngredientIndices, MemoIngredientIndices, MemoIngredientMap, MemoIngredientSingletonIndex,
@@ -467,11 +505,18 @@ pub mod plumbing {
     }
 
     pub mod interned {
-        pub use crate::interned::{Configuration, IngredientImpl, JarImpl, Value};
+        pub use crate::interned::{
+            Configuration, IdOfNamed, IdOfOther, IdOfSalsa, IdsOf, IngredientImpl, JarImpl,
+            NamesIds, Value,
+        };
+    }
+
+    pub mod graph {
+        pub use crate::graph::{EdgesBench, edges_at_rest};
     }
 
     pub mod function {
-        pub use crate::function::{Configuration, IngredientImpl, Memo};
+        pub use crate::function::{ClaimBench, Configuration, IngredientImpl, Memo};
         pub use crate::function::{EvictionPolicy, HasCapacity, Lru, NoopEviction};
         pub use crate::table::memo::MemoEntryType;
     }

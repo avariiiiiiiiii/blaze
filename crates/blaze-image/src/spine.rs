@@ -22,6 +22,7 @@
 //! (`u64`), its first group (`u32`), its groups (`u32`). Then one `u32` CRC32C a CRC table
 //! group.
 
+use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 use blaze_format::{SchemaHash, schema};
 use blaze_ids::{ContentId, Hasher};
 
@@ -82,14 +83,6 @@ pub(crate) fn tops_for(groups: u32, shift: u32) -> u32 {
 
 pub(crate) fn spine_len(sections: usize, tops: u32) -> usize {
     (HEADER + sections * SECTION_ENTRY + tops as usize * 4).next_multiple_of(8)
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
 }
 
 fn id_at(bytes: &[u8], at: usize) -> ContentId {

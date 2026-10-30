@@ -23,7 +23,7 @@ use crate::mir::{
     StatementKind, StoredPlace, Terminator, TerminatorKind, UnOp,
     framed::{self, block_id, local_index},
 };
-use crate::next_solver::{Ty, TyKind};
+use crate::next_solver::{ConstExt, Ty, TyKind};
 
 use super::Ctx;
 

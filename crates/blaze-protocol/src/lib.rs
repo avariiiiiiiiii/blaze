@@ -10,10 +10,15 @@
 
 #![forbid(unsafe_code)]
 
+mod keyed;
+
 pub mod bytes;
 pub mod cbor;
 pub mod events;
 pub mod follow;
+
+#[doc(hidden)]
+pub use serde as __serde;
 
 #[cfg(test)]
 mod tests;
@@ -37,14 +42,17 @@ pub const SCHEMA: u32 = 2;
 /// The longest item a frame carries: a build names every file it read.
 pub const LONGEST_FRAME: u32 = 16 << 20;
 
-/// One frame's item: a body of [`SCHEMA`], answering or asking request `id`. Replies and
-/// events carry the id of the request they belong to, so a connection can carry several.
-// clone: two words and `T`, `Clone` only where `T` is; the daemon hands one to each subscriber.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct Message<T> {
-    pub schema: u32,
-    pub id: u64,
-    pub body: T,
+in_key_order! {
+    /// One frame's item: a body of [`SCHEMA`], answering or asking request `id`. Replies and
+    /// events carry the id of the request they belong to, so a connection can carry several.
+    // clone: two words and `T`, `Clone` only where `T` is; the daemon hands one to each subscriber.
+    #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub struct Message<T> {
+        pub schema: u32,
+        pub id: u64,
+        pub body: T,
+    }
+    keys [id, body, schema]
 }
 
 impl<T> Message<T> {

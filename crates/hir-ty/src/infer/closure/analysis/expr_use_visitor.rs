@@ -1618,7 +1618,7 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                     .cx
                     .result
                     .field_resolutions
-                    .get(&expr)
+                    .get(expr)
                     .map(|field| match *field {
                         Either::Left(field) => field.local_id.into_raw().into_u32(),
                         Either::Right(tuple_field) => tuple_field.index,

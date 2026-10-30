@@ -34,8 +34,9 @@
 //! [`measure`] says the most the calling thread's frames held at once while a closure ran, a
 //! nested task's on top of its enclosing task's, counted at task and measure boundaries only.
 //!
-//! Cost: an allocation is an align, an add, a compare against the block's end and two stores
-//! to the frame (no atomic, no shared line); about 2 ns. Freeing or growing the most recent
+//! Cost: an allocation is an align, an add, a compare against the block's end and one store
+//! of the cursor (no atomic, no shared line, and no peak: that is folded in where the cursor
+//! moves back); about 2 ns. Freeing or growing the most recent
 //! allocation happens in place, so a `Vec<T, &Frame>` pushed in a loop never copies while
 //! nothing else is allocated after it and it stays in its block (in a span, always).
 
@@ -254,7 +255,19 @@ impl Frame {
 
     /// The most bytes in use at once since the last reset.
     pub fn peak(&self) -> usize {
-        self.peak.get()
+        self.peak.get().max(self.used())
+    }
+
+    /// Folds the bytes in use into `peak`, before the cursor moves back. An allocation never
+    /// writes `peak`: `used()` only rises between the points that lower it (freeing or
+    /// shrinking the top allocation, a rollback, a reset), each of which folds first, so the
+    /// most it reached since the last fold is what it is when the next one runs.
+    #[inline]
+    fn fold_peak(&self) {
+        let used = self.used();
+        if used > self.peak.get() {
+            self.peak.set(used);
+        }
     }
 
     /// Bytes of the blocks it holds (whole chunks, spans' committed pages), in use or not.
@@ -293,10 +306,6 @@ impl Frame {
         match at.checked_add(layout.size()) {
             Some(end) if end <= self.end.get() => {
                 self.cursor.set(cursor.with_addr(end));
-                let used = end.wrapping_add(self.bias.get());
-                if used > self.peak.get() {
-                    self.peak.set(used);
-                }
                 // SAFETY: `at` is in `[cursor, end]`, within the current block's committed bytes,
                 // or `EMPTY` (not null) for a zero-sized value in a frame with no block.
                 Ok(unsafe { NonNull::new_unchecked(cursor.with_addr(at)) })
@@ -683,6 +692,7 @@ impl Frame {
     /// Moves the cursor back to address `at`, in the current block or one before it. Whether
     /// `at` was such a point.
     fn roll_back(&self, at: usize) -> bool {
+        self.fold_peak();
         let cursor = self.cursor.get();
         if (self.floor.get()..=cursor.addr()).contains(&at) {
             self.cursor.set(cursor.with_addr(at));
@@ -724,7 +734,7 @@ impl Frame {
     /// Frees everything, keeping its blocks for the next task. Counts the task's peak to its
     /// tag ([`tag::task_ended`]).
     pub fn reset(&mut self) {
-        tag::task_ended(self.tag.get(), self.peak.get());
+        tag::task_ended(self.tag.get(), self.peak());
         self.rewind();
         self.peak.set(0);
     }
@@ -888,6 +898,7 @@ unsafe impl Allocator for Frame {
     #[inline]
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         if self.is_top(ptr, layout.size()) {
+            self.fold_peak();
             self.cursor.set(self.cursor.get().with_addr(ptr.addr().get()));
         }
     }
@@ -943,6 +954,7 @@ unsafe impl Allocator for Frame {
             return Ok(NonNull::slice_from_raw_parts(to, new.size()));
         }
         if self.is_top(ptr, old.size()) {
+            self.fold_peak();
             self.cursor.set(self.cursor.get().with_addr(ptr.addr().get() + new.size()));
         }
         Ok(NonNull::slice_from_raw_parts(ptr, new.size()))
@@ -954,7 +966,7 @@ impl std::fmt::Debug for Frame {
         f.debug_struct("Frame")
             .field("tag", &self.tag.get())
             .field("used", &self.used())
-            .field("peak", &self.peak.get())
+            .field("peak", &self.peak())
             .field("committed", &self.committed())
             .field("reserved", &self.limit)
             .finish()
@@ -1290,7 +1302,7 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, usize) {
         fn drop(&mut self) {
             let top = self.top();
             if let Some(frame) = self.frame {
-                frame.peak.set(frame.peak.get().max(self.frame_peak));
+                frame.peak.set(frame.peak().max(self.frame_peak));
             }
             _ = STACK.try_with(|stack| stack.peak.set(top.max(self.thread_peak)));
         }
@@ -1300,7 +1312,11 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, usize) {
     let frame = unsafe { innermost() };
     let below = STACK.try_with(|stack| stack.below.get()).unwrap_or(0);
     let base = below + frame.map_or(0, Frame::used);
-    let frame_peak = frame.map_or(0, |frame| frame.peak.replace(frame.used()));
+    let frame_peak = frame.map_or(0, |frame| {
+        let peak = frame.peak();
+        frame.peak.set(frame.used());
+        peak
+    });
     let thread_peak = STACK.try_with(|stack| stack.peak.replace(base)).unwrap_or(0);
     let restore = Restore { frame, below, frame_peak, thread_peak };
     let result = f();
@@ -1323,6 +1339,16 @@ pub fn trim_spare(keep: usize) {
 /// Bytes the calling thread's task frames hold of the [`Cap`] now.
 pub fn capped() -> u64 {
     cap::thread_holding()
+}
+
+/// The items of `items` in a vector in `frame`, its room the iterator's lower bound to start:
+/// `bumpalo`'s `Vec::from_iter_in`.
+#[inline]
+pub fn collect<'f, T>(frame: &'f Frame, items: impl IntoIterator<Item = T>) -> Vec<T, &'f Frame> {
+    let items = items.into_iter();
+    let mut out = Vec::with_capacity_in(items.size_hint().0, frame);
+    out.extend(items);
+    out
 }
 
 const _: () = assert!(mem::size_of::<Marker>() == 16);

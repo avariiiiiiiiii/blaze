@@ -274,6 +274,7 @@ fn put4(code: &mut [u8], at: usize, it: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blaze_ids::rng::SplitMix64;
 
     /// Each form's bounds: the least and greatest value it takes, the step its values come in,
     /// and what reading the field back gives for a value it took.
@@ -406,12 +407,10 @@ mod tests {
 
     #[test]
     fn every_form_round_trips_a_spread_of_values() {
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         for Bounds { form, min, max, step, .. } in BOUNDS {
             for _ in 0..2000 {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
+                let x = rng.next_u64();
                 let span = (max as i128 - min as i128) / i128::from(step) + 1;
                 let value = min as i128 + (i128::from(x) % span) * i128::from(step);
                 round_trip(form, value as i64);

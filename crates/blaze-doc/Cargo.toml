@@ -28,6 +28,7 @@ rayon.workspace = true
 rustc-hash.workspace = true
 serde_json.workspace = true
 span.workspace = true
+stdx.workspace = true
 syntax.workspace = true
 vfs.workspace = true
 

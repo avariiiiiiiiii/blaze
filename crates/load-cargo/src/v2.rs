@@ -46,7 +46,7 @@ use blaze_units::{
     stdlib::target::HostCpu,
 };
 use cfg::{CfgAtom, CfgOptions};
-use hir_expand::proc_macro::{CrateProcMacros, ProcMacroLoadResult, ProcMacros};
+use hir_expand::proc_macro::{CrateProcMacros, ProcMacros};
 use rustc_hash::{FxHashMap, FxHashSet};
 use salsa::{Durability, Setter};
 use triomphe::Arc;
@@ -196,15 +196,14 @@ struct Applied {
     out_dir: String,
 }
 
-/// A build's database ([`Db::new`]) with the proc-macro input.
-fn build_db() -> Db {
-    let db = Db::new();
-    ProcMacros::init_default(&db, Durability::HIGH);
-    db
-}
-
 /// The crate graph, source roots and files of `lower.units` in a new database.
 pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
+    lower_into(Db::new(), lower)
+}
+
+/// [`lower`] into `db`, a build's database just made and never written ([`Db::new`], or
+/// [`Db::logged`] for a harness that counts what each request executes).
+pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
     let Lower { units, config, files, root, host_cpu } = lower;
     let unit_count = units.graph.units.len();
     if units.plans.len() != unit_count {
@@ -283,7 +282,8 @@ pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, Lower
     excluded.sort_unstable();
 
     let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files, read_view: Cell::new(false) };
-    let mut db = build_db();
+    let mut db = db;
+    ProcMacros::init_default(&db, Durability::HIGH);
     for (index, &is_library) in library.iter().enumerate() {
         let source_root = match is_library {
             true => SourceRoot::new_library(FileSet::default()),

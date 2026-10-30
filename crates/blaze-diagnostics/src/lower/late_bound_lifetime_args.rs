@@ -10,7 +10,7 @@
 
 use either::Either;
 use hir::GenericDef;
-use hir_def::{GenericDefId, generics::GenericParams};
+use hir_def::{GenericDefId, hir::generics::GenericParams};
 use syntax::{
     TextRange, WalkEvent,
     view::{self as ast, AstNode as _, HasGenericParams as _},

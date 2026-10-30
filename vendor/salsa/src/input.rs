@@ -207,6 +207,11 @@ impl<C: Configuration> IngredientImpl<C> {
             "never-changing inputs cannot be mutated"
         );
 
+        // At the durability before the write: the one the field's readers saw.
+        runtime.changes_mut().changed(
+            DatabaseKeyIndex::new(self.ingredient_index.successor(field_index), id),
+            data.durabilities[field_index],
+        );
         data.revisions[field_index] = runtime.current_revision();
 
         let field_durability = &mut data.durabilities[field_index];

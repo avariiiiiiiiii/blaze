@@ -24,7 +24,7 @@ use crate::{
 };
 
 /// The nodes of one build, numbered from the first id given.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Build {
     next: u32,
     specs: Vec<Spec>,

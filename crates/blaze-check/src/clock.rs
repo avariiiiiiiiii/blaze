@@ -36,10 +36,12 @@ impl Clock {
         }
     }
 
-    /// Everything `self` saw, `other` saw too: `self` happens before (or is) `other`.
+    /// Everything `self` saw, `other` saw too: `self` happens before (or is) `other`. Every lane
+    /// is compared, with no early exit, so it is one vector compare (DPOR asks it per waiting
+    /// thread per schedule point).
     #[inline]
     pub(crate) fn le(&self, other: &Clock) -> bool {
-        self.0.iter().zip(other.0).all(|(&mine, theirs)| mine <= theirs)
+        self.0.iter().zip(other.0).fold(true, |all, (&mine, theirs)| all & (mine <= theirs))
     }
 
     /// The first thread whose part of `other` is past `self`'s: an event of it in `other` that

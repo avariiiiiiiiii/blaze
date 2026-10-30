@@ -2,6 +2,8 @@
 
 //! Test that we don't get duplicate accumulated values
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use expect_test::expect;

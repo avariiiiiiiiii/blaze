@@ -74,7 +74,7 @@ impl Keyed for Val {
 }
 
 /// A table's sequential model: a map from key to value.
-#[derive(Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, PartialEq, Eq, Hash, Default)] // clone: the checker's `Spec` copies its model (tests)
 struct Map(BTreeMap<u64, u64>);
 
 #[derive(Debug)]

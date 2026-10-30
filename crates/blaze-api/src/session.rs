@@ -471,7 +471,7 @@ impl Session {
         };
         let head = std::mem::take(head);
         let over = match made {
-            Ok(Some(ops)) => match cx.vfs.commit(&head, base, &ops) {
+            Ok(Some(ops)) => match cx.vfs.commit_owned(&head, base, ops) {
                 Ok(commit) => {
                     self.intents.moved(cx.builder, &head, commit.root);
                     self.tickets.insert(commit.ticket, serial);
@@ -529,7 +529,7 @@ impl Session {
             Request::Commit { head, base, ops } => {
                 let commit = cx
                     .vfs
-                    .commit(&head, base, &ops)
+                    .commit_owned(&head, base, ops)
                     .map_err(|error| commit_error(&head, base, &error))?;
                 self.intents.moved(cx.builder, &head, commit.root);
                 let serial = self.begin(
@@ -1036,6 +1036,8 @@ fn op_path(error: &OpError) -> String {
         | OpError::BadLink { path, .. } => path.clone(),
         // alloc: error path, the root an op was given.
         OpError::UnknownRoot(root) => format!("root {root:x}"),
+        // alloc: error path, the image's group whose bytes failed their check.
+        OpError::Corrupt { section, group } => format!("image section {section} group {group}"),
     }
 }
 

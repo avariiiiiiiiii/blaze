@@ -38,7 +38,7 @@ pub(super) const LINTS: super::LintSet = super::lint_set([
     "non_contiguous_range_endpoints",
 ]);
 
-pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
+pub(super) fn lints(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
     if b.tainted() {
         // alloc: empty, allocates nothing
         return Vec::new();
@@ -57,7 +57,7 @@ pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
         .collect()
 }
 
-fn unreachable_pattern(b: &BodyCx<'_, '_>, d: &hir::UnreachablePattern<'_>) -> Option<Found> {
+fn unreachable_pattern<'db>(b: &BodyCx<'_, '_, 'db>, d: &hir::UnreachablePattern<'db>) -> Option<Found> {
     let cx = b.cx;
     let at = pat_node(d.pat);
     let pat = cx.span_of(at);
@@ -117,7 +117,7 @@ fn unreachable_pattern(b: &BodyCx<'_, '_>, d: &hir::UnreachablePattern<'_>) -> O
 }
 
 /// `find_fallback_pattern_typo`'s part of the lint.
-fn pattern_typo(b: &BodyCx<'_, '_>, diag: &mut Diag, pat: &Span, typo: &PatternTypo) {
+fn pattern_typo(b: &BodyCx<'_, '_, '_>, diag: &mut Diag, pat: &Span, typo: &PatternTypo) {
     let cx = b.cx;
     match typo {
         PatternTypo::WantedConstant { is_typo, const_name, const_path } => {
@@ -159,7 +159,7 @@ fn pattern_typo(b: &BodyCx<'_, '_>, diag: &mut Diag, pat: &Span, typo: &PatternT
 }
 
 /// rustc's `whole_arm_span`: the arm, from its pattern to its value, with the `,` after it.
-fn whole_arm(b: &BodyCx<'_, '_>, arm: InFile<AstPtr<syntax::ast::MatchArm>>) -> Option<Span> {
+fn whole_arm(b: &BodyCx<'_, '_, '_>, arm: InFile<AstPtr<syntax::ast::MatchArm>>) -> Option<Span> {
     let node = b.cx.node_view(arm);
     let start = node.value.pat()?.syntax().text_range().start();
     let end = match node.value.comma_token() {
@@ -169,7 +169,7 @@ fn whole_arm(b: &BodyCx<'_, '_>, arm: InFile<AstPtr<syntax::ast::MatchArm>>) -> 
     Some(b.cx.span(InFile::new(node.file_id, TextRange::new(start, end))))
 }
 
-fn irrefutable_let(b: &BodyCx<'_, '_>, d: &IrrefutableLet) -> Option<Found> {
+fn irrefutable_let(b: &BodyCx<'_, '_, '_>, d: &IrrefutableLet) -> Option<Found> {
     let cx = b.cx;
     let (message, note, help) = match d.source {
         LetSource::IfLet => (
@@ -195,7 +195,7 @@ fn irrefutable_let(b: &BodyCx<'_, '_>, d: &IrrefutableLet) -> Option<Found> {
 }
 
 /// `LetSource::LetElse`: at `else`, with the `let` labelled, unless the `let` is a macro's.
-fn let_else(b: &BodyCx<'_, '_>, d: &IrrefutableLet) -> Option<Found> {
+fn let_else(b: &BodyCx<'_, '_, '_>, d: &IrrefutableLet) -> Option<Found> {
     let cx = b.cx;
     let node = cx.syntax_view(d.at);
     let stmt = ast::LetStmt::cast(node.value)?;
@@ -233,7 +233,7 @@ fn let_else(b: &BodyCx<'_, '_>, d: &IrrefutableLet) -> Option<Found> {
     Some(b.lint(diag, Phase::Mir, d.at))
 }
 
-fn binding_with_variant_name(b: &BodyCx<'_, '_>, d: &hir::BindingWithVariantName) -> Option<Found> {
+fn binding_with_variant_name(b: &BodyCx<'_, '_, '_>, d: &hir::BindingWithVariantName) -> Option<Found> {
     let cx = b.cx;
     let at = d.pat.map(|it| it.syntax_node_ptr());
     // alloc: the lint's text, for a lint found
@@ -259,7 +259,7 @@ fn binding_with_variant_name(b: &BodyCx<'_, '_>, d: &hir::BindingWithVariantName
     Some(b.lint(diag, Phase::Mir, at))
 }
 
-fn overlapping_range_endpoints(b: &BodyCx<'_, '_>, d: &hir::OverlappingRangeEndpoints) -> Option<Found> {
+fn overlapping_range_endpoints(b: &BodyCx<'_, '_, '_>, d: &hir::OverlappingRangeEndpoints) -> Option<Found> {
     let cx = b.cx;
     let range = cx.span_of_ptr(d.pat);
     let message = "multiple patterns overlap on their endpoints";
@@ -275,7 +275,7 @@ fn overlapping_range_endpoints(b: &BodyCx<'_, '_>, d: &hir::OverlappingRangeEndp
 
 /// `ExclusiveRangeMissingMax` when no range starts at the gap (it is the type's maximum), else
 /// `ExclusiveRangeMissingGap`.
-fn non_contiguous_range_endpoints(b: &BodyCx<'_, '_>, d: &hir::NonContiguousRangeEndpoints) -> Option<Found> {
+fn non_contiguous_range_endpoints(b: &BodyCx<'_, '_, '_>, d: &hir::NonContiguousRangeEndpoints) -> Option<Found> {
     let cx = b.cx;
     let first_range = cx.span_of_ptr(d.pat);
     let gap = &d.gap;
@@ -305,7 +305,7 @@ fn non_contiguous_range_endpoints(b: &BodyCx<'_, '_>, d: &hir::NonContiguousRang
 
 /// rustc's `match_lint_level`: the `match`, `let` or parameter the pattern is part of, whose
 /// level the range lints take (an arm's own attributes don't count).
-fn match_level(b: &BodyCx<'_, '_>, pat: InFile<AstPtr<syntax::ast::Pat>>) -> InFile<SyntaxNodePtr> {
+fn match_level(b: &BodyCx<'_, '_, '_>, pat: InFile<AstPtr<syntax::ast::Pat>>) -> InFile<SyntaxNodePtr> {
     let node = b.cx.syntax_view(pat_node(pat));
     for ancestor in b.cx.vsema.ancestors_with_macros_file(node).skip(1) {
         match ancestor.value.kind() {

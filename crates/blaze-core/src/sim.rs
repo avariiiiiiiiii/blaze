@@ -58,7 +58,7 @@ const RESERVE: usize = 256;
 
 /// A change made under a watch that is ending is still told once in this many, as a system
 /// that queued it before it saw the unwatch: when it is due after the end, it is stale.
-const RACE_ONE_IN: u32 = 3;
+const RACE_ONE_IN: u64 = 3;
 
 type EndId = blaze_mem::Handle<End>;
 
@@ -82,42 +82,8 @@ struct End {
     peer_closed: bool,
 }
 
-/// SplitMix64, a copy of `blaze_ids::rng::SplitMix64` (the same stream from a seed): `blaze-core`
-/// stays below `blake3`, so it can't depend on `blaze-ids`.
-#[derive(Clone, Debug)]
-pub struct Rng(u64);
-
-impl Rng {
-    pub fn new(seed: u64) -> Rng {
-        Rng(seed)
-    }
-
-    pub fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform in `0..n`; 0 when `n` is 0.
-    pub fn below(&mut self, n: u64) -> u64 {
-        if n == 0 { 0 } else { self.next_u64() % n }
-    }
-
-    /// True once in `n` on average; never when `n` is 0.
-    pub fn one_in(&mut self, n: u32) -> bool {
-        n != 0 && self.below(u64::from(n)) == 0
-    }
-
-    /// The items of `items` in an order of the seed's.
-    pub fn shuffle<T>(&mut self, items: &mut [T]) {
-        for at in (1..items.len()).rev() {
-            let other = self.below(at as u64 + 1) as usize;
-            items.swap(at, other);
-        }
-    }
-}
+/// The simulation's random numbers: blaze's one seeded SplitMix64.
+pub use blaze_rng::SplitMix64 as Rng;
 
 /// How unkind the simulated machine is.
 #[derive(Clone, Debug)]
@@ -145,7 +111,7 @@ impl Default for Faults {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct SimFile {
     /// What survives a crash.
     durable: Vec<u8>,
@@ -196,7 +162,7 @@ impl SimFile {
 }
 
 /// A change to a file not yet synced.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum Op {
     Append(Vec<u8>),
     At(u64, Vec<u8>),
@@ -574,7 +540,7 @@ impl Sim {
             if watch.ending && !self.rng.one_in(RACE_ONE_IN) {
                 continue;
             }
-            let done = match self.rng.one_in(self.faults.lose_change_one_in) {
+            let done = match self.rng.one_in(u64::from(self.faults.lose_change_one_in)) {
                 // alloc: none, an empty list.
                 true => Done::Changed { files: Vec::new(), lost: true },
                 // alloc: the change's payload, the one name it tells.
@@ -592,7 +558,7 @@ impl Sim {
             if !watch.journal || watch.ending {
                 continue;
             }
-            let dropped = self.rng.one_in(self.faults.lose_change_one_in);
+            let dropped = self.rng.one_in(u64::from(self.faults.lose_change_one_in));
             if let Some(batch) = self.disk.live(&watch.dir, dropped) {
                 let at = self.now + latency(&mut self.rng, &self.faults);
                 let at = after_told(&self.told, at, tag, tag);
@@ -735,7 +701,7 @@ impl Sim {
     fn complete(&mut self, pending: Pending) -> Completion {
         let Pending { effect, covers, spawn } = pending;
         let tag = effect.tag();
-        if !matches!(effect, Effect::Timer { .. }) && self.rng.one_in(self.faults.fail_one_in) {
+        if !matches!(effect, Effect::Timer { .. }) && self.rng.one_in(u64::from(self.faults.fail_one_in)) {
             if let Some(spawn) = spawn {
                 self.spawns.remove_id(spawn);
             }
@@ -973,7 +939,7 @@ impl Driver for Sim {
                     let done = match self.watches.get(watch).is_some_and(|it| !it.ending) {
                         // alloc: an error path.
                         false => Done::Failed(IoError(format!("nothing is watched as {watch:?}"))),
-                        true if self.rng.one_in(self.faults.fail_one_in) => self.fail(tag).done,
+                        true if self.rng.one_in(u64::from(self.faults.fail_one_in)) => self.fail(tag).done,
                         true => Done::Flushed,
                     };
                     // Every change of the watch told by now is heard first.
@@ -1008,7 +974,7 @@ impl Driver for Sim {
                             Done::Failed(IoError(format!("{at:?}: another listen has it"))),
                             Of::Op,
                         ),
-                        None if self.rng.one_in(self.faults.fail_one_in) => {
+                        None if self.rng.one_in(u64::from(self.faults.fail_one_in)) => {
                             let done = self.fail(tag).done;
                             self.tell(tag, done, Of::Op);
                         }
@@ -1027,7 +993,7 @@ impl Driver for Sim {
                 }
                 Effect::Connect { at, tag } => {
                     let done = match self.listening_at(&at) {
-                        _ if self.rng.one_in(self.faults.fail_one_in) => self.fail(tag).done,
+                        _ if self.rng.one_in(u64::from(self.faults.fail_one_in)) => self.fail(tag).done,
                         // alloc: an error's message.
                         None => Done::Failed(IoError(format!(
                             "{at:?}: nothing listens there: connection refused"

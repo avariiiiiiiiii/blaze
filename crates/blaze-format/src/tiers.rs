@@ -839,10 +839,12 @@ fn decode_raw(raw: &[u8]) -> Result<Vec<u32>, FormatError> {
                 return Err(CORRUPT);
             }
             let indices = bytes.packed(len)?;
-            indices
-                .iter()
-                .map(|&index| distinct.get(index as usize).copied().ok_or(CORRUPT))
-                .collect::<Result<Vec<_>, _>>()?
+            // alloc: once a column decoded from its tier, at its length
+            let mut values = Vec::with_capacity(indices.len());
+            for &index in &indices {
+                values.push(distinct.get(index as usize).copied().ok_or(CORRUPT)?);
+            }
+            values
         }
     };
     match values.len() == len && bytes.at == raw.len() {

@@ -111,6 +111,23 @@ fn names(db: &TestDB, crates: &[Crate]) -> Vec<String> {
     names
 }
 
+/// hir-ty's two `crate_name`s before they called this one (blaze-diagnostics' was this one's
+/// copy). They named a crate with no display name by its ID, not its root file.
+fn crate_name_reference(db: &Db, krate: Crate) -> String {
+    match &krate.extra_data(db).display_name {
+        Some(name) => name.to_string(),
+        None => format!("{krate:?}"),
+    }
+}
+
+#[test]
+fn a_crate_is_named_in_an_error_as_every_old_copy_named_it() {
+    let db = TestDB::with_files(FIXTURE);
+    for krate in all(&db) {
+        assert_eq!(crate_name(&db, krate), crate_name_reference(&db, krate));
+    }
+}
+
 #[test]
 fn only_crates_outside_the_workspace_are_eligible() {
     let db = TestDB::with_files(FIXTURE);
@@ -541,6 +558,71 @@ fn reads_read_back_and_damaged_ones_do_not_panic() {
             assert_eq!(read.encode(), damaged, "what decodes encodes back to its bytes");
         }
         assert!(Reads::decode(&bytes[..at]).is_err(), "{at} bytes of {}", bytes.len());
+    }
+}
+
+/// The reads' own decoder before `blaze_format::cursor`: its names, or none where it refused.
+fn old_reads_names(bytes: &[u8]) -> Option<(Vec<Box<str>>, Vec<Box<[u8]>>)> {
+    fn take<'b>(rest: &mut &'b [u8], len: usize) -> Option<&'b [u8]> {
+        if rest.len() < len {
+            return None;
+        }
+        let (taken, after) = rest.split_at(len);
+        *rest = after;
+        Some(taken)
+    }
+    fn count(rest: &mut &[u8]) -> Option<usize> {
+        Some(u32::from_le_bytes(take(rest, 4)?.try_into().expect("four bytes")) as usize)
+    }
+    let mut rest = bytes;
+    if take(&mut rest, 1)? != [1] {
+        return None;
+    }
+    let (mut env, mut shapes) = (Vec::new(), Vec::new());
+    for _ in 0..count(&mut rest)? {
+        let len = count(&mut rest)?;
+        env.push(Box::<str>::from(std::str::from_utf8(take(&mut rest, len)?).ok()?));
+    }
+    for _ in 0..count(&mut rest)? {
+        let len = count(&mut rest)?;
+        shapes.push(Box::<[u8]>::from(take(&mut rest, len)?));
+    }
+    let sorted = env.windows(2).all(|pair| pair[0] < pair[1])
+        && shapes.windows(2).all(|pair| pair[0] < pair[1]);
+    (rest.is_empty() && sorted).then_some((env, shapes))
+}
+
+#[test]
+fn reads_decode_as_the_old_decoder_did() {
+    let samples = [
+        Reads::default(),
+        Reads::for_tests(&["A"], &[]),
+        Reads::for_tests(&[], &[(b"", ContentId([1; 32]))]),
+        Reads::for_tests(
+            &["", "PATH", "\u{e9}t\u{e9}"],
+            &[(b"one", ContentId([1; 32])), (b"two", ContentId([2; 32]))],
+        ),
+    ];
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x5eed_0f_4ead5);
+    for reads in &samples {
+        let bytes = reads.encode();
+        let mut inputs = vec![bytes.clone()];
+        for at in 0..=bytes.len() {
+            inputs.push(bytes[..at].to_vec());
+            if at < bytes.len() {
+                let mut damaged = bytes.clone();
+                damaged[at] ^= 1u8 << rng.below(8);
+                inputs.push(damaged);
+            }
+        }
+        inputs.push([&bytes[..], &[0]].concat());
+        for input in inputs {
+            let new = Reads::decode(&input).ok().map(|it| {
+                let (env, shapes) = it.names();
+                (env.to_vec(), shapes.map(Box::<[u8]>::from).collect::<Vec<_>>())
+            });
+            assert_eq!(new, old_reads_names(&input), "{input:?}");
+        }
     }
 }
 

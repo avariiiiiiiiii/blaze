@@ -4,6 +4,8 @@
 //! across revisions give the IDs and generations a model of the reuse sweep predicts, immortal
 //! and reusable, and threads racing to intern overlapping keys get one ID per key.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 

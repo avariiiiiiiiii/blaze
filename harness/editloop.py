@@ -16,7 +16,7 @@ import argparse, os, shlex, statistics, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture, BLAZE, sysroot_rlibs, AHEAD, TARGET_ARGS, command
+from mixed import Fixture, BLAZE, sysroot_rlibs, AHEAD, TARGET_ARGS, command
 
 
 def main():

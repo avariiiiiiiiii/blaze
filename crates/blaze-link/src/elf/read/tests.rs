@@ -852,7 +852,8 @@ fn reads_the_system_libc() {
         assert!(shared.symbols.iter().all(|it| !shared.symbol_name(it).is_empty()));
         // Each version once, and the arena no bigger than `.dynstr`.
         for (at, version) in shared.versions.iter().enumerate() {
-            assert!(!shared.versions[..at].contains(version), "{version} twice");
+            let version = shared.names.at(*version);
+            assert!(!shared.versions[..at].iter().any(|it| shared.names.at(*it) == version), "{version} twice");
         }
         assert!(shared.symbols.iter().all(|it| it.version.is_none_or(|it| usize::from(it) < shared.versions.len())));
         let file = object::read::elf::ElfFile64::<object::Endianness>::parse(&bytes[..]).unwrap();

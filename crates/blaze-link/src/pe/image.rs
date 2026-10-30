@@ -7,20 +7,29 @@
 //! base relocations; then the DOS header and stub, the PE and optional headers and the section
 //! table.
 //!
-//! Cost, per link (full or incremental: the core asks again after every patch): `.reloc` is one
-//! pass over `Placed::rebase` (sorted by the core; sorted here only if it isn't), 2 bytes per
-//! address, with a region cursor rather than a search per address, cut at page boundaries into
-//! pieces of 64Ki addresses written in parallel; `.pdata` is one pass over `Placed::functions`
-//! merged with the objects' entries, 12 bytes each. The two run in parallel with each other.
-//! The import and export tables are linear in imports and exports, plus a sort of each; each
-//! import's name is parsed once and borrowed, and nothing in them allocates per entry. `file`
-//! doesn't rebuild any table: it reads each directory's size from the bytes `synthesize`
-//! produced, which the core put in the regions and sized them to, so it costs the number of
-//! regions plus GOT cells.
+//! Cost of a build: `.reloc` is one pass over `Placed::rebase` (sorted by the core; sorted
+//! here only if it isn't), 2 bytes per address, with a region cursor rather than a search per
+//! address, cut at page boundaries into about four pieces a thread, written in parallel and
+//! copied in parallel into one zeroed buffer; `.pdata` is one pass over `Placed::functions` in
+//! pieces of 4096 on every thread, each piece then merged with the objects' entries that sort
+//! before the next piece into its place in the output, 12 bytes each. The two run in parallel
+//! with each other. The import and export tables are linear in imports and exports, plus a
+//! sort of each; each import's name is parsed once and borrowed, and nothing in them allocates
+//! per entry. `file` doesn't rebuild any table: it reads each directory's size from the bytes
+//! `synthesize` produced, which the core put in the regions and sized them to, so it costs the
+//! number of regions plus GOT cells.
+//!
+//! An incremental output keeps its last `.pdata`, `.reloc`, import and export directories
+//! ([`Last`]) and, for a [`Placed::delta`] from them with no region moved, patches them: the
+//! entries of the spliced functions and rebased addresses, each checked to sort strictly
+//! between its neighbours (so a build would make the same bytes), and the export directory's
+//! time stamp. The import directory is the same bytes when the imports, libraries and GOT are.
+//! Anything a patch can't show to be the build's bytes is built.
 
 use std::borrow::Cow;
 use std::ops::Range;
 
+use blaze_bytes::le::{u32 as u32_of, u64 as u64_of};
 use blaze_format::cursor::Put;
 use blaze_ids::radix;
 use object::pe;
@@ -33,7 +42,9 @@ use super::{
     error, place, zeroed,
 };
 use crate::cow::CowBytes;
-use crate::model::{Class, Counts, Export, File, Function, Holds, Pages, Placed, Prot, Region, SymbolKind, View};
+use crate::model::{
+    Class, Counts, Delta, Export, File, Function, Holds, Pages, Placed, Prot, Region, SymbolKind, View, WindowsUnwind,
+};
 use crate::{LinkError, OutputKind};
 
 /// Room for the image's file name, which the export directory and the CodeView entry hold
@@ -123,6 +134,7 @@ pub(super) struct Image<'a> {
     functions: &'a [Function],
     /// A dev run's: no base relocation may land in code.
     dev_run: bool,
+    synthesis: u64,
 }
 
 impl<'a> Image<'a> {
@@ -135,6 +147,50 @@ impl<'a> Image<'a> {
             rebase: placed.rebase,
             functions: placed.functions,
             dev_run: placed.output.dev_run.is_some(),
+            synthesis: placed.synthesis,
+        }
+    }
+
+    /// A function's `RUNTIME_FUNCTION`.
+    fn entry(self, function: &Function, windows: WindowsUnwind) -> Result<Entry, LinkError> {
+        let entry = (|| {
+            Some((self.rva_of(function.addr)?, self.rva_of(function.addr + function.size)?, self.rva_of(windows.info)?))
+        })();
+        entry.ok_or_else(|| {
+            let name = function.name.as_deref().unwrap_or("a function");
+            error(format_args!("{name} at {:#x} or its unwind info is outside the image", function.addr))
+        })
+    }
+
+    /// The region a rebased address at `addr` is checked against: the first reaching past its
+    /// 8 bytes (the regions are in address order, so their ends are too).
+    fn region_for(self, addr: u64) -> Option<&'a Region> {
+        let at = self.regions.partition_point(|it| it.addr + it.capacity.max(it.size) < addr + 8);
+        self.regions.get(at)
+    }
+
+    /// That the address at `addr`, in `region` ([`Image::region_for`]), may be rebased: it is
+    /// in the file, and not in a dev run's code.
+    fn rebased(self, region: Option<&Region>, addr: u64) -> Result<(), LinkError> {
+        match region {
+            Some(it) if it.addr <= addr && zeroed(&it.class) => {
+                Err(error(format_args!("a rebased address at {addr:#x} in {:?}, which is not in the file", it.class)))
+            }
+            Some(it) if it.addr <= addr && it.prot.exec && self.dev_run => {
+                let what = match self.code_at(addr) {
+                    // alloc: error path
+                    Some((name, offset)) => format!("in `{name}` (+{offset:#x})"),
+                    // alloc: error path
+                    None => format!("in {:?}", it.class),
+                };
+                Err(error(format_args!(
+                    "an absolute address at {addr:#x} {what}, which needs a base relocation into code: a dev run's \
+                     code is the same bytes at every load address, so code reaches addresses RIP-relative only \
+                     (an `IMAGE_REL_AMD64_ADDR64` belongs in data)"
+                )))
+            }
+            Some(it) if it.addr <= addr => Ok(()),
+            _ => Err(error(format_args!("a rebased address at {addr:#x} in no region"))),
         }
     }
 
@@ -176,14 +232,6 @@ fn bytes_at<const N: usize>(placed: &Placed<'_>, addr: u64, what: &str) -> Resul
         .ok_or_else(|| error(format_args!("{what} at {addr:#x} is not in the image's bytes")))
 }
 
-fn u32_of(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-}
-
-fn u64_of(bytes: &[u8], at: usize) -> u64 {
-    u64::from(u32_of(bytes, at)) | (u64::from(u32_of(bytes, at + 4)) << 32)
-}
-
 /// What the synthetic regions may need, from the counts alone.
 pub(super) fn synthetic(counts: &Counts, dev_run: bool) -> Vec<(Class, u64)> {
     let mut regions = Vec::with_capacity(7);
@@ -216,19 +264,92 @@ pub(super) fn synthetic(counts: &Counts, dev_run: bool) -> Vec<(Class, u64)> {
     regions
 }
 
-pub(super) fn synthesize(placed: &Placed<'_>) -> Result<Vec<(Class, CowBytes)>, LinkError> {
-    Ok(Tables::of(placed)?.regions)
+pub(super) fn synthesize(pe: &Pe, placed: &Placed<'_>) -> Result<Vec<(Class, CowBytes)>, LinkError> {
+    Ok(Tables::of(pe, placed)?.regions)
 }
 
-/// The synthetic regions' bytes. PE keeps no table across links: each is built whole and
-/// handed to the core as it is ([`CowBytes::from_vec`]).
+/// The tables an incremental output's writer made last, each with the [`Placed::synthesis`]
+/// it was made in (0 when it holds none: never made, or a build of it failed).
+#[derive(Default)]
+pub(crate) struct Last {
+    pub(super) pdata: KeptPdata,
+    pub(super) reloc: KeptReloc,
+    pub(super) idata: KeptTable,
+    pub(super) edata: KeptTable,
+}
+
+/// A table kept whole: the same bytes when what it is made of is the same.
+#[derive(Default)]
+pub(super) struct KeptTable {
+    synthesis: u64,
+    /// Its region's address: the table holds RVAs into itself, and a synthetic region may
+    /// move when no other does.
+    addr: u64,
+    bytes: CowBytes,
+    /// How many syntheses took it as it was.
+    #[cfg(test)]
+    pub(super) reused: u32,
+}
+
+impl KeptTable {
+    /// The kept table, when it is at `region` still and `same` says this synthesis would make
+    /// its bytes (`patch` then brings it up to date in place); else `build`'s, kept.
+    fn of(
+        &mut self,
+        placed: &Placed<'_>,
+        region: &Region,
+        same: impl FnOnce(&Delta<'_>, &CowBytes) -> bool,
+        patch: impl FnOnce(&mut CowBytes),
+        build: impl FnOnce() -> Result<Vec<u8>, LinkError>,
+    ) -> Result<CowBytes, LinkError> {
+        let last = std::mem::replace(&mut self.synthesis, 0);
+        if let Some(delta) = placed.delta
+            && last != 0
+            && self.addr == region.addr
+            && delta.patches(last, &[])
+            && same(delta, &self.bytes)
+        {
+            patch(&mut self.bytes);
+            self.synthesis = placed.synthesis;
+            #[cfg(test)]
+            {
+                self.reused += 1;
+            }
+            // clone: two reference counts, the table shared with the state that holds it
+            return Ok(self.bytes.clone());
+        }
+        let bytes = CowBytes::from_vec(build()?);
+        // clone: two reference counts, the table shared with the state that holds it
+        self.bytes = bytes.clone();
+        (self.synthesis, self.addr) = (placed.synthesis, region.addr);
+        Ok(bytes)
+    }
+}
+
+/// Whether the import directory is the last one's bytes: the same imports and libraries, and
+/// no GOT cell spliced (so each DLL's IAT is where it was).
+fn same_imports(delta: &Delta<'_>) -> bool {
+    delta.same_names && delta.got.is_empty()
+}
+
+/// The synthetic regions' bytes, each handed to the core as a [`CowBytes`]: a table built
+/// whole ([`CowBytes::from_vec`]), or an incremental output's kept one, patched.
 pub(super) struct Tables {
     pub(super) regions: Vec<(Class, CowBytes)>,
 }
 
 impl Tables {
-    pub(super) fn of(placed: &Placed<'_>) -> Result<Tables, LinkError> {
+    pub(super) fn of(pe: &Pe, placed: &Placed<'_>) -> Result<Tables, LinkError> {
         let mut tables = Tables { regions: Vec::with_capacity(7) };
+        let mut last = pe.last();
+        // The GOT, imports and binds the last synthesis checked, unchanged: checked again only
+        // when one may differ.
+        let checked = match (last.as_deref(), placed.delta) {
+            (Some(last), Some(delta)) => {
+                last.idata.synthesis != 0 && delta.from == last.idata.synthesis && same_imports(delta)
+            }
+            _ => false,
+        };
         if let Some(bind) = placed.binds.first() {
             let name = placed.imports.get(bind.import as usize).map_or("?", |it| it.name.as_str());
             return Err(error(format_args!(
@@ -237,14 +358,16 @@ impl Tables {
                 bind.addr
             )));
         }
-        if let Some(cell) = placed.got.iter().find(|it| !matches!(it.holds, Holds::Local(_) | Holds::Import(_))) {
+        if !checked
+            && let Some(cell) = placed.got.iter().find(|it| !matches!(it.holds, Holds::Local(_) | Holds::Import(_)))
+        {
             return Err(error(format_args!(
                 "the GOT cell at {:#x} holds {:?}: Windows reaches thread-locals through \
                  `_tls_index` and `SECREL`, never a GOT cell",
                 cell.addr, cell.holds
             )));
         }
-        for import in placed.imports {
+        for import in placed.imports.iter().filter(|_| !checked) {
             if import.library.is_none() {
                 return Err(error(format_args!(
                     "`{}` is imported from no DLL: PE has no weak or unresolved imports \
@@ -261,14 +384,34 @@ impl Tables {
         }
 
         match placed.region(&Class::Synthetic(IDATA)) {
-            Some((_, region)) => tables.push(placed, IDATA, imports(placed, region)?)?,
-            None if placed.got.iter().any(|it| matches!(it.holds, Holds::Import(_))) => {
+            Some((_, region)) => {
+                let bytes = match last.as_deref_mut() {
+                    Some(last) => {
+                        last.idata.of(placed, region, |it, _| same_imports(it), |_| {}, || imports(placed, region))?
+                    }
+                    None => CowBytes::from_vec(imports(placed, region)?),
+                };
+                tables.push_cow(placed, IDATA, bytes)?;
+            }
+            None if !checked && placed.got.iter().any(|it| matches!(it.holds, Holds::Import(_))) => {
                 return Err(error("an image with imports and no import directory region"));
             }
             None => {}
         }
         match placed.region(&Class::Synthetic(EDATA)) {
-            Some((_, region)) => tables.push(placed, EDATA, exports(placed, region)?)?,
+            Some((_, region)) => {
+                let bytes = match last.as_deref_mut() {
+                    Some(last) => last.edata.of(
+                        placed,
+                        region,
+                        |it, kept| it.same_names && same_export_name(placed, region, kept),
+                        |kept| kept.update(4, &stamp(placed).to_le_bytes()),
+                        || exports(placed, region),
+                    )?,
+                    None => CowBytes::from_vec(exports(placed, region)?),
+                };
+                tables.push_cow(placed, EDATA, bytes)?;
+            }
             None if !placed.exports.is_empty() => {
                 return Err(error("an image with exports and no export directory region"));
             }
@@ -291,17 +434,26 @@ impl Tables {
             tables.push(placed, TLS_INDEX, vec![0; 8])?;
         }
 
-        let image = Image::of(placed);
-        let (pdata, relocations) = rayon::join(|| pdata(image), || relocations(image, &extra, RELOC_PIECE));
+        let (image, delta) = (Image::of(placed), placed.delta);
+        let (pdata, relocations) = match last.as_deref_mut() {
+            Some(Last { pdata: kept_pdata, reloc: kept_reloc, .. }) => {
+                rayon::join(|| kept_pdata.of(image, delta), || kept_reloc.of(image, delta, &extra))
+            }
+            None => rayon::join(
+                || pdata(image, None).map(CowBytes::from_vec),
+                || relocations(image, &extra, reloc_piece(image.rebase.len())).map(CowBytes::from_vec),
+            ),
+        };
+        drop(last);
         match placed.region(&Class::Synthetic(PDATA)) {
-            Some(_) => tables.push(placed, PDATA, pdata?)?,
+            Some(_) => tables.push_cow(placed, PDATA, pdata?)?,
             None if placed.functions.iter().any(|it| it.windows.is_some()) => {
                 return Err(error("an image with unwind info and no `.pdata` region"));
             }
             None => {}
         }
         match placed.region(&Class::Synthetic(RELOC)) {
-            Some(_) => tables.push(placed, RELOC, relocations?)?,
+            Some(_) => tables.push_cow(placed, RELOC, relocations?)?,
             None if !placed.rebase.is_empty() || !extra.is_empty() => {
                 return Err(error("an image with rebased addresses and no `.reloc` region"));
             }
@@ -311,6 +463,10 @@ impl Tables {
     }
 
     fn push(&mut self, placed: &Placed<'_>, name: &'static str, bytes: Vec<u8>) -> Result<(), LinkError> {
+        self.push_cow(placed, name, CowBytes::from_vec(bytes))
+    }
+
+    fn push_cow(&mut self, placed: &Placed<'_>, name: &'static str, bytes: CowBytes) -> Result<(), LinkError> {
         let class = Class::Synthetic(name);
         let (_, region) =
             placed.region(&class).ok_or_else(|| error(format_args!("the {name} region was not placed")))?;
@@ -325,9 +481,26 @@ impl Tables {
                 region.addr
             )));
         }
-        self.regions.push((class, CowBytes::from_vec(bytes)));
+        self.regions.push((class, bytes));
         Ok(())
     }
+}
+
+/// Whether the kept export directory names the image as `placed` does: its name's RVA, which
+/// the directory states, is where the name is in its last bytes. With the same exports (and
+/// the region where it was), every byte but the time stamp is the build's.
+fn same_export_name(placed: &Placed<'_>, region: &Region, kept: &CowBytes) -> bool {
+    let name = placed.name.as_bytes();
+    let Some(at) = kept.len().checked_sub(name.len() + 1) else { return false };
+    if kept.len() < 16 {
+        return false;
+    }
+    let (mut stated, mut tail) = ([0; 4], [0; 1]);
+    kept.copy_to(12, &mut stated);
+    kept.copy_to(kept.len() - 1, &mut tail);
+    rva_of(placed, region.addr + at as u64) == Some(u32::from_le_bytes(stated))
+        && tail == [0]
+        && *kept.read(at, name.len()) == *name
 }
 
 /// Which TLS directory the image has.
@@ -703,24 +876,286 @@ fn debug(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
     Ok(out.0)
 }
 
+/// A `RUNTIME_FUNCTION`'s bytes, as in the file.
+fn entry_bytes((begin, end, info): Entry) -> [u8; RUNTIME_FUNCTION] {
+    let mut out = [0; RUNTIME_FUNCTION];
+    out[..4].copy_from_slice(&begin.to_le_bytes());
+    out[4..8].copy_from_slice(&end.to_le_bytes());
+    out[8..].copy_from_slice(&info.to_le_bytes());
+    out
+}
+
+fn read_entry(bytes: &[u8]) -> Entry {
+    (u32_of(bytes, 0), u32_of(bytes, 4), u32_of(bytes, 8))
+}
+
+/// An entry index or a byte offset that is none: a function with no unwind info, a rebased
+/// address repeating the one before.
+const NONE: u32 = u32::MAX;
+
+/// Functions per piece of `.pdata` staged on one thread.
+const PDATA_PIECE: usize = 1 << 12;
+
+/// A piece of the functions' entries, staged: how many, whether in order, the first and last.
+#[derive(Clone, Copy)]
+struct Staged {
+    count: u32,
+    sorted: bool,
+    first: Entry,
+    last: Entry,
+}
+
+/// The entries of `functions` with unwind info, one after another from the start of `out`;
+/// with `slots`, each function's index among them ([`NONE`] for one with none).
+fn stage(
+    image: Image<'_>,
+    functions: &[Function],
+    out: &mut [u8],
+    mut slots: Option<&mut [u32]>,
+) -> Result<Staged, LinkError> {
+    let mut staged = Staged { count: 0, sorted: true, first: (0, 0, 0), last: (0, 0, 0) };
+    for (at, function) in functions.iter().enumerate() {
+        let slot = match function.windows {
+            None => NONE,
+            Some(windows) => {
+                let entry = image.entry(function, windows)?;
+                if staged.count == 0 {
+                    staged.first = entry;
+                } else if entry < staged.last {
+                    staged.sorted = false;
+                }
+                out[staged.count as usize * RUNTIME_FUNCTION..][..RUNTIME_FUNCTION].copy_from_slice(&entry_bytes(entry));
+                staged.last = entry;
+                staged.count += 1;
+                staged.count - 1
+            }
+        };
+        if let Some(slots) = slots.as_deref_mut() {
+            slots[at] = slot;
+        }
+    }
+    Ok(staged)
+}
+
+/// One piece's staged entries merged with the objects' that sort before the next piece's, into
+/// `out`, whose first entry is the table's `first`; with `slots` (the piece's, as [`stage`]
+/// left them), each function's entry index in the table.
+fn merge(staged: &[u8], native: &[Entry], out: &mut [u8], first: u32, slots: Option<&mut [u32]>) {
+    let mut ours = staged.chunks_exact(RUNTIME_FUNCTION).map(read_entry).peekable();
+    let mut native = native.iter().copied().peekable();
+    let mut slots = slots.map(|it| it.iter_mut().filter(|it| **it != NONE));
+    for (at, to) in (first..).zip(out.chunks_exact_mut(RUNTIME_FUNCTION)) {
+        let entry = match (ours.peek(), native.peek()) {
+            (Some(x), Some(y)) if y < x => native.next(),
+            (Some(_), _) => {
+                if let Some(slot) = slots.as_mut().and_then(Iterator::next) {
+                    *slot = at;
+                }
+                ours.next()
+            }
+            (None, _) => native.next(),
+        };
+        let Some(entry) = entry else { break };
+        to.copy_from_slice(&entry_bytes(entry));
+    }
+}
+
+/// `slots` cut into `count` runs of `size`, one per piece (each none when `slots` is).
+fn chunks(slots: Option<&mut [u32]>, size: usize, count: usize) -> Vec<Option<&mut [u32]>> {
+    let mut out = Vec::with_capacity(count);
+    match slots {
+        Some(slots) => out.extend(slots.chunks_mut(size).map(Some)),
+        None => out.resize_with(count, || None),
+    }
+    out
+}
+
 /// `RUNTIME_FUNCTION`s: one per function codegen gave Windows unwind info (in address order, as
 /// the core gives them), merged with the native objects' `.pdata` entries (those of dropped
-/// functions read 0), sorted by start; an overlap is an error.
-fn pdata(image: Image<'_>) -> Result<Vec<u8>, LinkError> {
-    let mut ours: Vec<Entry> = Vec::with_capacity(image.functions.len());
-    for function in image.functions {
-        let Some(windows) = function.windows else { continue };
-        let entry = (|| {
-            Some((image.rva_of(function.addr)?, image.rva_of(function.addr + function.size)?, image.rva_of(windows.info)?))
-        })();
-        ours.push(entry.ok_or_else(|| {
-            let name = function.name.as_deref().unwrap_or("a function");
-            error(format_args!("{name} at {:#x} or its unwind info is outside the image", function.addr))
-        })?);
+/// functions read 0), sorted by start; an overlap is an error. Staged in pieces in parallel,
+/// then each piece merged into its place in parallel when the pieces are in order (they are
+/// when the functions are); else sorted and merged on one thread. With `slots` (a kept
+/// table's), each function's entry index in the table, when the pieces were in order; else
+/// `slots` is left empty.
+fn pdata(image: Image<'_>, mut slots: Option<&mut Vec<u32>>) -> Result<Vec<u8>, LinkError> {
+    let functions = image.functions;
+    let pieces = functions.len().div_ceil(PDATA_PIECE);
+    if let Some(slots) = slots.as_deref_mut() {
+        slots.resize(functions.len(), NONE);
     }
-    if !ours.is_sorted() {
+    // alloc: once per build, zeroed: each piece's pages are first touched by the thread staging it
+    let mut staged = vec![0u8; functions.len() * RUNTIME_FUNCTION];
+    let mut done: Vec<Result<Staged, LinkError>> = Vec::with_capacity(pieces);
+    staged
+        .par_chunks_mut(PDATA_PIECE * RUNTIME_FUNCTION)
+        .zip(functions.par_chunks(PDATA_PIECE))
+        .zip(chunks(slots.as_deref_mut().map(Vec::as_mut_slice), PDATA_PIECE, pieces))
+        .map(|((out, functions), slots)| stage(image, functions, out, slots))
+        .collect_into_vec(&mut done);
+    let done = done.into_iter().collect::<Result<Vec<Staged>, LinkError>>()?;
+    let native = native_pdata(image)?;
+    let count: usize = done.iter().map(|it| it.count as usize).sum();
+    let mut sorted = true;
+    let mut before: Option<Entry> = None;
+    for piece in done.iter().filter(|it| it.count > 0) {
+        sorted &= piece.sorted && before.is_none_or(|it| it <= piece.first);
+        before = Some(piece.last);
+    }
+    let staged_of = |at: usize, piece: &Staged| {
+        &staged[at * PDATA_PIECE * RUNTIME_FUNCTION..][..piece.count as usize * RUNTIME_FUNCTION]
+    };
+    if !sorted {
+        if let Some(slots) = slots {
+            slots.clear();
+        }
+        let mut ours: Vec<Entry> = Vec::with_capacity(count);
+        for (at, piece) in done.iter().enumerate() {
+            ours.extend(staged_of(at, piece).chunks_exact(RUNTIME_FUNCTION).map(read_entry));
+        }
         radix::sort_copy_by_key(&mut ours, entry_key);
+        return merge_serial(&ours, &native);
     }
+    let Some(first) = done.iter().position(|it| it.count > 0) else {
+        return merge_serial(&[], &native);
+    };
+    // Each piece's run of the objects' entries: those that sort before the next piece's first
+    // entry and not before its own; the first piece's from the first.
+    let mut ranges = Vec::with_capacity(done.len());
+    let mut end = native.len();
+    for piece in done.iter().rev() {
+        let start = if piece.count == 0 { end } else { native.partition_point(|it| *it < piece.first) };
+        ranges.push(start..end);
+        end = start;
+    }
+    ranges.reverse();
+    ranges[first].start = 0;
+    let total = count + native.len();
+    // alloc: the output buffer, `.pdata`'s bytes, zeroed: its pages are first touched by the merging threads
+    let mut out = vec![0u8; total * RUNTIME_FUNCTION];
+    {
+        let mut jobs = Vec::with_capacity(done.len());
+        let mut rest = &mut out[..];
+        let mut at = 0u32;
+        let slots = chunks(slots.as_deref_mut().map(Vec::as_mut_slice), PDATA_PIECE, done.len());
+        for (index, ((piece, range), slots)) in done.iter().zip(&ranges).zip(slots).enumerate() {
+            let len = piece.count as usize + range.len();
+            if len == 0 {
+                continue;
+            }
+            let (to, tail) = std::mem::take(&mut rest).split_at_mut(len * RUNTIME_FUNCTION);
+            rest = tail;
+            // clone: a `Range` of two `usize`s
+            jobs.push((to, staged_of(index, piece), &native[range.clone()], at, slots));
+            at += len as u32;
+        }
+        jobs.into_par_iter().for_each(|(to, staged, native, first, slots)| merge(staged, native, to, first, slots));
+    }
+    let read = |at: usize| read_entry(&out[at * RUNTIME_FUNCTION..][..RUNTIME_FUNCTION]);
+    if let Some(at) = (1..total).into_par_iter().find_first(|&at| read(at).0 < read(at - 1).1) {
+        let ((before, before_end, _), (begin, end, _)) = (read(at - 1), read(at));
+        return Err(error(format_args!(
+            "the unwind entries of RVAs {before:#x}..{before_end:#x} and {begin:#x}..{end:#x} overlap"
+        )));
+    }
+    Ok(out)
+}
+
+/// `.pdata` as [`pdata`] builds it, kept to patch the next.
+#[derive(Default)]
+pub(super) struct KeptPdata {
+    synthesis: u64,
+    bytes: CowBytes,
+    /// By function, its entry's index in `bytes` ([`NONE`] for one with no unwind info): kept
+    /// only when the functions' entries came in order.
+    slots: Vec<u32>,
+    /// The entries a patch wrote, reused.
+    touched: Vec<u32>,
+    /// How many syntheses were patches.
+    #[cfg(test)]
+    pub(super) patched: u32,
+}
+
+impl KeptPdata {
+    /// The table for `image`: the kept one patched, when `delta` is from it and every functions
+    /// splice keeps its length; else built (and kept when its entries came in order).
+    fn of(&mut self, image: Image<'_>, delta: Option<&Delta<'_>>) -> Result<CowBytes, LinkError> {
+        let last = std::mem::replace(&mut self.synthesis, 0);
+        if let Some(delta) = delta
+            && last != 0
+            && delta.patches(last, &[delta.functions])
+            && self.patch(image, delta)
+        {
+            self.synthesis = image.synthesis;
+            #[cfg(test)]
+            {
+                self.patched += 1;
+            }
+            // clone: two reference counts, the table shared with the state that holds it
+            return Ok(self.bytes.clone());
+        }
+        let bytes = CowBytes::from_vec(pdata(image, Some(&mut self.slots))?);
+        if self.slots.len() == image.functions.len() {
+            // clone: two reference counts, the table shared with the state that holds it
+            self.bytes = bytes.clone();
+            self.synthesis = image.synthesis;
+        }
+        Ok(bytes)
+    }
+
+    /// Writes the entries of the spliced functions into the kept table. False, with the table
+    /// left half patched, when that is not the table a build makes: a function that gained or
+    /// lost unwind info, an entry that no longer sorts strictly between its neighbours or
+    /// overlaps one, the objects' entries written, or one a build refuses (it gives the error).
+    fn patch(&mut self, image: Image<'_>, delta: &Delta<'_>) -> bool {
+        let functions = image.functions;
+        if self.slots.len() != functions.len() {
+            return false;
+        }
+        let written = |region: &Region| {
+            let end = region.addr + region.capacity.max(region.size);
+            delta.written.iter().any(|&(addr, len)| addr < end && region.addr < addr + len)
+        };
+        let mut objects =
+            image.regions.iter().filter(|it| matches!(&it.class, Class::Named { name, .. } if name == OBJ_PDATA));
+        if objects.any(written) {
+            return false;
+        }
+        let entries = self.bytes.len() / RUNTIME_FUNCTION;
+        self.touched.clear();
+        for splice in delta.functions {
+            let range = splice.new.start as usize..splice.new.end as usize;
+            // clone: a `Range` of two `usize`s
+            let (Some(functions), Some(slots)) = (functions.get(range.clone()), self.slots.get(range)) else {
+                return false;
+            };
+            for (function, &slot) in functions.iter().zip(slots) {
+                match (function.windows, slot) {
+                    (None, NONE) => {}
+                    (Some(windows), slot) if slot != NONE && (slot as usize) < entries => {
+                        let Ok(entry) = image.entry(function, windows) else { return false };
+                        self.bytes.update(slot as usize * RUNTIME_FUNCTION, &entry_bytes(entry));
+                        self.touched.push(slot);
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        let bytes = &self.bytes;
+        let read = |at: usize| {
+            let mut entry = [0; RUNTIME_FUNCTION];
+            bytes.copy_to(at * RUNTIME_FUNCTION, &mut entry);
+            read_entry(&entry)
+        };
+        let after = |before: Entry, it: Entry| before < it && before.1 <= it.0;
+        self.touched.iter().all(|&slot| {
+            let (slot, this) = (slot as usize, read(slot as usize));
+            (slot == 0 || after(read(slot - 1), this)) && (slot + 1 >= entries || after(this, read(slot + 1)))
+        })
+    }
+}
+
+/// The objects' `.pdata` entries but those of dropped functions (which read 0), sorted.
+fn native_pdata(image: Image<'_>) -> Result<Vec<Entry>, LinkError> {
     let objects = || {
         (image.regions.iter().enumerate())
             .filter(|(_, region)| matches!(&region.class, Class::Named { name, .. } if name == OBJ_PDATA))
@@ -746,6 +1181,11 @@ fn pdata(image: Image<'_>) -> Result<Vec<u8>, LinkError> {
     if !native.is_sorted() {
         radix::sort_copy_by_key(&mut native, entry_key);
     }
+    Ok(native)
+}
+
+/// `ours` and `native`, each sorted, merged on one thread; an overlap is an error.
+fn merge_serial(ours: &[Entry], native: &[Entry]) -> Result<Vec<u8>, LinkError> {
     let mut out = Vec::with_capacity((ours.len() + native.len()) * RUNTIME_FUNCTION);
     let (mut a, mut b) = (ours.iter().peekable(), native.iter().peekable());
     let mut last: Option<Entry> = None;
@@ -771,21 +1211,51 @@ fn pdata(image: Image<'_>) -> Result<Vec<u8>, LinkError> {
     Ok(out)
 }
 
-/// Rebased addresses per piece of `.reloc` written on one thread: below this a thread costs
-/// more than the 2 bytes per address it would write.
-const RELOC_PIECE: usize = 1 << 16;
+/// Rebased addresses per piece of `.reloc` written on one thread at least: below this a thread
+/// costs more than the 2 bytes per address it would write.
+const RELOC_PIECE: usize = 1 << 13;
+
+/// The rebased addresses per piece of `.reloc` for `addresses` of them: about four pieces a
+/// thread, so a slow thread holds the rest up by a quarter of its share at most.
+fn reloc_piece(addresses: usize) -> usize {
+    addresses.div_ceil(4 * rayon::current_num_threads()).max(RELOC_PIECE)
+}
 
 fn page_of(addr: u64) -> u64 {
     blaze_mem::align::align_down_u64(addr, PAGE)
 }
 
+/// A base relocation's entry: `DIR64` at the address's offset in its page.
+fn dir64(addr: u64) -> u16 {
+    (pe::IMAGE_REL_BASED_DIR64 << 12) | (addr & (PAGE - 1)) as u16
+}
+
+/// What a kept `.reloc` is patched by: by rebased address, its entry's byte offset ([`NONE`]
+/// for a repeat of the address before), and each block's byte offset, in order.
+#[derive(Default)]
+struct RelocIndex {
+    slots: Vec<u32>,
+    blocks: Vec<u32>,
+}
+
 /// The base relocations: a block per 4 KiB page, a `DIR64` entry per rebased address in it,
 /// padded to 4 bytes. The sorted addresses are cut at page boundaries into pieces of about
-/// `piece` addresses, each written on its own thread and joined in order: a block never spans
-/// two pieces, so the bytes are the same whatever the number of threads or the piece size.
-/// One piece's worth allocates only its bytes (and a sorted copy when the core's addresses
-/// aren't sorted).
+/// `piece` addresses, each written on its own thread and copied in parallel into its place: a
+/// block never spans two pieces, so the bytes are the same whatever the number of threads or
+/// the piece size. One piece's worth allocates only its bytes (and a sorted copy when the
+/// core's addresses aren't sorted).
 pub(super) fn relocations(image: Image<'_>, extra: &[u64], piece: usize) -> Result<Vec<u8>, LinkError> {
+    build_relocations(image, extra, piece, None)
+}
+
+/// [`relocations`], and with `index` (a kept table's) what patches it, when the core's
+/// addresses came sorted; else `index` is left empty.
+fn build_relocations(
+    image: Image<'_>,
+    extra: &[u64],
+    piece: usize,
+    index: Option<&mut RelocIndex>,
+) -> Result<Vec<u8>, LinkError> {
     let rebase: Cow<'_, [u64]> = if image.rebase.is_sorted() {
         Cow::Borrowed(image.rebase)
     } else {
@@ -794,15 +1264,97 @@ pub(super) fn relocations(image: Image<'_>, extra: &[u64], piece: usize) -> Resu
         radix::sort(&mut sorted);
         Cow::Owned(sorted)
     };
+    let (mut slots, mut starts) = match index {
+        Some(RelocIndex { slots, blocks }) => {
+            blocks.clear();
+            match &rebase {
+                Cow::Borrowed(_) => {
+                    slots.resize(rebase.len(), NONE);
+                    (Some(&mut slots[..]), Some(blocks))
+                }
+                Cow::Owned(_) => {
+                    slots.clear();
+                    (None, None)
+                }
+            }
+        }
+        None => (None, None),
+    };
     let mut extra = SmallVec::<[u64; 5]>::from_slice(extra);
     extra.sort_unstable();
     let piece = piece.max(1);
-    if rebase.len() <= piece {
+    // alloc: none for one piece: an empty `Vec` holds no buffer
+    let cuts = if rebase.len() > piece { page_cuts(&rebase, piece) } else { Vec::new() };
+    if cuts.is_empty() {
         let mut out = Vec::default();
-        blocks(image, &rebase, &extra, &mut out)?;
+        blocks(image, &rebase, &extra, &mut out, slots, starts)?;
         return Ok(out);
     }
-    // The first address of each piece but the first: the first of a page.
+    // Each piece's addresses and the extra ones in its pages.
+    let mut bounds: Vec<(Range<usize>, Range<usize>)> = Vec::with_capacity(cuts.len() + 1);
+    let (mut from, mut extra_from) = (0, 0);
+    for &cut in &cuts {
+        let page = page_of(rebase[cut]);
+        let extra_to = extra.partition_point(|it| page_of(*it) < page);
+        bounds.push((from..cut, extra_from..extra_to));
+        (from, extra_from) = (cut, extra_to);
+    }
+    bounds.push((from..rebase.len(), extra_from..extra.len()));
+    let keep = starts.is_some();
+    let mut written: Vec<Result<(Vec<u8>, Vec<u32>), LinkError>> = Vec::with_capacity(bounds.len());
+    bounds
+        .par_iter()
+        .zip(split(slots.as_deref_mut(), &bounds))
+        .map(|((addresses, extras), slots)| {
+            // alloc: one buffer a piece (and its block starts for a kept table)
+            let (mut out, mut piece_starts) = (Vec::default(), Vec::new());
+            let starts = keep.then_some(&mut piece_starts);
+            // clone: two `Range`s of two `usize`s
+            blocks(image, &rebase[addresses.clone()], &extra[extras.clone()], &mut out, slots, starts)
+                .map(|()| (out, piece_starts))
+        })
+        .collect_into_vec(&mut written);
+    let mut parts = Vec::with_capacity(written.len());
+    for piece in written {
+        parts.push(piece?);
+    }
+    let total: usize = parts.iter().map(|it| it.0.len()).sum();
+    // alloc: the output buffer, `.reloc`'s bytes, zeroed: its pages are first touched by the copying threads
+    let mut out = vec![0u8; total];
+    if let Some(starts) = starts.as_deref_mut() {
+        starts.resize(parts.iter().map(|it| it.1.len()).sum(), 0);
+    }
+    {
+        let mut jobs = Vec::with_capacity(parts.len());
+        let (mut rest, mut starts_rest) = (&mut out[..], starts.as_deref_mut().map(Vec::as_mut_slice));
+        let mut base = 0usize;
+        for ((bytes, piece_starts), slots) in parts.iter().zip(split(slots.as_deref_mut(), &bounds)) {
+            let (to, tail) = std::mem::take(&mut rest).split_at_mut(bytes.len());
+            rest = tail;
+            let starts_to = starts_rest.take().map(|it| {
+                let (head, tail) = it.split_at_mut(piece_starts.len());
+                starts_rest = Some(tail);
+                head
+            });
+            jobs.push((to, &bytes[..], slots, starts_to, &piece_starts[..], base as u32));
+            base += bytes.len();
+        }
+        jobs.into_par_iter().for_each(|(to, from, slots, starts_to, starts_from, base)| {
+            to.copy_from_slice(from);
+            for slot in slots.into_iter().flatten().filter(|it| **it != NONE) {
+                *slot += base;
+            }
+            for (to, from) in starts_to.into_iter().flatten().zip(starts_from) {
+                *to = from + base;
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// The first address of each piece but the first, about `piece` apart: each the first of its
+/// page, so no block spans two pieces.
+fn page_cuts(rebase: &[u64], piece: usize) -> Vec<usize> {
     let mut cuts = Vec::with_capacity(rebase.len() / piece + 1);
     let mut at = piece;
     while at < rebase.len() {
@@ -817,39 +1369,154 @@ pub(super) fn relocations(image: Image<'_>, extra: &[u64], piece: usize) -> Resu
         cuts.push(cut);
         at = cut + piece;
     }
-    if cuts.is_empty() {
-        let mut out = Vec::default();
-        blocks(image, &rebase, &extra, &mut out)?;
-        return Ok(out);
+    cuts
+}
+
+/// `slots` cut into the runs of `bounds`' addresses, one per piece (each none when `slots` is).
+fn split<'s>(
+    mut slots: Option<&'s mut [u32]>,
+    bounds: &[(Range<usize>, Range<usize>)],
+) -> Vec<Option<&'s mut [u32]>> {
+    let mut out = Vec::with_capacity(bounds.len());
+    for (addresses, _) in bounds {
+        out.push(slots.take().map(|it| {
+            let (head, tail) = it.split_at_mut(addresses.len());
+            slots = Some(tail);
+            head
+        }));
     }
-    // Each piece's addresses and the extra ones in its pages.
-    let mut pieces = Vec::with_capacity(cuts.len() + 1);
-    let (mut from, mut extra_from) = (0, 0);
-    for &cut in &cuts {
-        let page = page_of(rebase[cut]);
-        let extra_to = extra.partition_point(|it| page_of(*it) < page);
-        pieces.push((&rebase[from..cut], &extra[extra_from..extra_to]));
-        (from, extra_from) = (cut, extra_to);
+    out
+}
+
+/// Each synthetic region's address and room, in order.
+fn synthetic_layout(regions: &[Region]) -> SmallVec<[(u64, u64); 8]> {
+    regions
+        .iter()
+        .filter(|it| matches!(it.class, Class::Synthetic(_)))
+        .map(|it| (it.addr, it.capacity.max(it.size)))
+        // alloc: none: the writer's seven synthetic regions fit inline
+        .collect()
+}
+
+/// `.reloc` as [`relocations`] builds it, kept to patch the next.
+#[derive(Default)]
+pub(super) struct KeptReloc {
+    synthesis: u64,
+    bytes: CowBytes,
+    index: RelocIndex,
+    /// The writer's own addresses it holds (its TLS directory's), as `synthesize` gave them.
+    extra: SmallVec<[u64; 5]>,
+    /// The synthetic regions' places ([`synthetic_layout`]), which the addresses were checked
+    /// against and which may move when no other region does.
+    layout: SmallVec<[(u64, u64); 8]>,
+    /// (block, entry offset) of each entry a patch wrote, reused.
+    touched: Vec<(u32, u32)>,
+    /// How many syntheses were patches.
+    #[cfg(test)]
+    pub(super) patched: u32,
+}
+
+impl KeptReloc {
+    /// The table for `image`: the kept one patched, when `delta` is from it, every rebase
+    /// splice keeps its length and the writer's own addresses are the same; else built (and
+    /// kept when the core's addresses came sorted).
+    fn of(&mut self, image: Image<'_>, delta: Option<&Delta<'_>>, extra: &[u64]) -> Result<CowBytes, LinkError> {
+        let last = std::mem::replace(&mut self.synthesis, 0);
+        let layout = synthetic_layout(image.regions);
+        if let Some(delta) = delta
+            && last != 0
+            && self.extra[..] == *extra
+            && self.layout == layout
+            && delta.patches(last, &[delta.rebase])
+            && self.patch(image, delta)
+        {
+            self.synthesis = image.synthesis;
+            #[cfg(test)]
+            {
+                self.patched += 1;
+            }
+            // clone: two reference counts, the table shared with the state that holds it
+            return Ok(self.bytes.clone());
+        }
+        let built = build_relocations(image, extra, reloc_piece(image.rebase.len()), Some(&mut self.index))?;
+        let bytes = CowBytes::from_vec(built);
+        if self.index.slots.len() == image.rebase.len() {
+            // clone: two reference counts, the table shared with the state that holds it
+            self.bytes = bytes.clone();
+            (self.extra, self.layout) = (SmallVec::from_slice(extra), layout);
+            self.synthesis = image.synthesis;
+        }
+        Ok(bytes)
     }
-    pieces.push((&rebase[from..], &extra[extra_from..]));
-    let mut written: Vec<Result<Vec<u8>, LinkError>> = Vec::with_capacity(pieces.len());
-    pieces
-        .par_iter()
-        .map(|&(rebase, extra)| {
-            let mut out = Vec::default();
-            blocks(image, rebase, extra, &mut out).map(|()| out)
+
+    /// Writes the entries of the spliced rebased addresses into the kept table. False, with
+    /// the table left half patched, when that is not the table a build makes: an address that
+    /// left its page or its place in the order, a repeat, or one a build refuses (it gives the
+    /// error).
+    fn patch(&mut self, image: Image<'_>, delta: &Delta<'_>) -> bool {
+        let rebase = image.rebase;
+        let RelocIndex { slots, blocks } = &self.index;
+        if slots.len() != rebase.len() {
+            return false;
+        }
+        self.touched.clear();
+        for splice in delta.rebase {
+            let (start, end) = (splice.new.start as usize, splice.new.end as usize);
+            // The address after a splice repeating the one before has no entry of its own,
+            // which it needs when that one changed.
+            if end > rebase.len()
+                || !rebase[start.saturating_sub(1)..(end + 1).min(rebase.len())].is_sorted()
+                || slots.get(end) == Some(&NONE)
+            {
+                return false;
+            }
+            for at in start..end {
+                let (addr, slot) = (rebase[at], slots[at]);
+                if slot == NONE || image.rebased(image.region_for(addr), addr).is_err() {
+                    return false;
+                }
+                let Some(block) = blocks.partition_point(|&it| it <= slot).checked_sub(1) else { return false };
+                let mut page = [0; 4];
+                self.bytes.copy_to(blocks[block] as usize, &mut page);
+                if image.rva_of(page_of(addr)) != Some(u32::from_le_bytes(page)) {
+                    return false;
+                }
+                self.bytes.update(slot as usize, &dir64(addr).to_le_bytes());
+                self.touched.push((block as u32, slot));
+            }
+        }
+        // Each written entry is strictly between its neighbours in its block, as a build sorts
+        // and dedups them; a pad (type 0) ends a block.
+        let bytes = &self.bytes;
+        let entry = |at: usize| {
+            let mut it = [0; 2];
+            bytes.copy_to(at, &mut it);
+            u16::from_le_bytes(it)
+        };
+        self.touched.iter().all(|&(block, slot)| {
+            let (start, slot) = (blocks[block as usize] as usize, slot as usize);
+            let mut size = [0; 4];
+            bytes.copy_to(start + 4, &mut size);
+            let end = start + u32::from_le_bytes(size) as usize;
+            let this = entry(slot) & 0xfff;
+            let next = (slot + 2 < end).then(|| entry(slot + 2)).filter(|it| (it >> 12) == pe::IMAGE_REL_BASED_DIR64);
+            (slot < start + 10 || (entry(slot - 2) & 0xfff) < this) && next.is_none_or(|it| this < (it & 0xfff))
         })
-        .collect_into_vec(&mut written);
-    let mut out = Vec::with_capacity(written.iter().map(|it| it.as_ref().map_or(0, Vec::len)).sum());
-    for piece in written {
-        out.extend_from_slice(&piece?);
     }
-    Ok(out)
 }
 
 /// The blocks of sorted rebased addresses merged with sorted `extra`, appended to `out`: one
 /// pass, with a cursor over the regions checking each lies in a region with bytes in the file.
-fn blocks(image: Image<'_>, rebase: &[u64], extra: &[u64], out: &mut Vec<u8>) -> Result<(), LinkError> {
+/// With `slots`, each rebased address's entry offset in `out` ([`NONE`] for a repeat); with
+/// `starts`, each block's.
+fn blocks(
+    image: Image<'_>,
+    rebase: &[u64],
+    extra: &[u64],
+    out: &mut Vec<u8>,
+    mut slots: Option<&mut [u32]>,
+    mut starts: Option<&mut Vec<u32>>,
+) -> Result<(), LinkError> {
     let regions = image.regions;
     let count = rebase.len() + extra.len();
     let lowest = rebase.first().into_iter().chain(extra.first()).min();
@@ -864,58 +1531,49 @@ fn blocks(image: Image<'_>, rebase: &[u64], extra: &[u64], out: &mut Vec<u8>) ->
     let mut last = None;
     let mut block: Option<(u64, usize)> = None;
     loop {
-        let addr = match (rebase.get(i), extra.get(j)) {
+        // The address and, for one of `rebase`, its index there.
+        let (addr, from) = match (rebase.get(i), extra.get(j)) {
             (Some(&a), Some(&b)) if b < a => {
                 j += 1;
-                b
+                (b, usize::MAX)
             }
             (Some(&a), _) => {
                 i += 1;
-                a
+                (a, i - 1)
             }
             (None, Some(&b)) => {
                 j += 1;
-                b
+                (b, usize::MAX)
             }
             (None, None) => break,
         };
         if last == Some(addr) {
+            if let Some(slot) = slots.as_deref_mut().and_then(|it| it.get_mut(from)) {
+                *slot = NONE;
+            }
             continue;
         }
         last = Some(addr);
         while region < regions.len() && regions[region].addr + regions[region].capacity.max(regions[region].size) < addr + 8 {
             region += 1;
         }
-        match regions.get(region) {
-            Some(it) if it.addr <= addr && zeroed(&it.class) => {
-                return Err(error(format_args!("a rebased address at {addr:#x} in {:?}, which is not in the file", it.class)));
-            }
-            Some(it) if it.addr <= addr && it.prot.exec && image.dev_run => {
-                let what = match image.code_at(addr) {
-                    // alloc: error path
-                    Some((name, offset)) => format!("in `{name}` (+{offset:#x})"),
-                    // alloc: error path
-                    None => format!("in {:?}", it.class),
-                };
-                return Err(error(format_args!(
-                    "an absolute address at {addr:#x} {what}, which needs a base relocation into code: a dev run's \
-                     code is the same bytes at every load address, so code reaches addresses RIP-relative only \
-                     (an `IMAGE_REL_AMD64_ADDR64` belongs in data)"
-                )));
-            }
-            Some(it) if it.addr <= addr => {}
-            _ => return Err(error(format_args!("a rebased address at {addr:#x} in no region"))),
-        }
+        image.rebased(regions.get(region), addr)?;
         let page = page_of(addr);
         if block.map(|it| it.0) != Some(page) {
             if let Some((_, start)) = block {
                 close(out, start);
             }
             block = Some((page, out.len()));
+            if let Some(starts) = starts.as_deref_mut() {
+                starts.push(out.len() as u32);
+            }
             out.extend_from_slice(&image.rva(page, "a rebased page")?.to_le_bytes());
             out.extend_from_slice(&[0; 4]);
         }
-        out.extend_from_slice(&((pe::IMAGE_REL_BASED_DIR64 << 12) | (addr & (PAGE - 1)) as u16).to_le_bytes());
+        if let Some(slot) = slots.as_deref_mut().and_then(|it| it.get_mut(from)) {
+            *slot = out.len() as u32;
+        }
+        out.extend_from_slice(&dir64(addr).to_le_bytes());
     }
     if let Some((_, start)) = block {
         close(out, start);
@@ -946,9 +1604,10 @@ fn directories(placed: &Placed<'_>) -> Result<[(u32, u32); DIRECTORIES], LinkErr
         }
     };
     if let Some((index, at, _)) = filled(IDATA)? {
-        let count = placed
-            .bytes(index)
-            .chunks_exact(DESCRIPTOR as usize)
+        let view = placed.view(index);
+        let whole = view.len() - view.len() % DESCRIPTOR as usize;
+        let count = view
+            .arrays::<{ DESCRIPTOR as usize }>(0, whole)
             .position(|it| it.iter().all(|byte| *byte == 0))
             .ok_or_else(|| error("the import directory has no null descriptor: its bytes are not in place"))?;
         directories[pe::IMAGE_DIRECTORY_ENTRY_IMPORT] = (at, (count as u32 + 1) * DESCRIPTOR as u32);
@@ -969,7 +1628,7 @@ fn directories(placed: &Placed<'_>) -> Result<[(u32, u32); DIRECTORIES], LinkErr
         directories[pe::IMAGE_DIRECTORY_ENTRY_EXPORT] = (at, size);
     }
     if let Some((index, at, _)) = filled(DEBUG)? {
-        if placed.bytes(index).get(12..16) != Some(&pe::IMAGE_DEBUG_TYPE_CODEVIEW.to_le_bytes()[..]) {
+        if placed.view(index).u32(12) != Some(pe::IMAGE_DEBUG_TYPE_CODEVIEW) {
             return Err(error("the debug directory's bytes are not in place: `file` before `synthesize`"));
         }
         directories[pe::IMAGE_DIRECTORY_ENTRY_DEBUG] = (at, DEBUG_DIRECTORY as u32);

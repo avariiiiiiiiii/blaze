@@ -53,12 +53,14 @@ impl Placed {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     use super::Placed;
     use crate::{SchemaHash, Slice, Writer};
 
-    /// The copy `hir-ty`'s `consteval.rs`, `infer/persist.rs` and `lower/persist.rs` each had.
+    /// The copy `hir-ty`'s `consteval.rs`, `infer/persist.rs`, `lower/persist.rs`,
+    /// `body_store/infer.rs`, `body_store/mir.rs` and `check_cache/part.rs` each had.
     #[derive(Clone, Copy, PartialEq, Debug)]
     struct Reference {
         at: u64,
@@ -85,37 +87,33 @@ mod tests {
         Writer::new(SchemaHash(blaze_ids::ContentId([0; 32])))
     }
 
-    proptest! {
-        #[test]
-        fn placed_is_the_copies_it_replaced(
-            before in proptest::collection::vec(any::<u8>(), 0..9),
-            values in proptest::collection::vec(any::<u32>(), 0..64),
-            gap in 0u64..64,
-        ) {
-            let (mut ours, mut theirs) = (writer(), writer());
-            ours.push_slice(&before);
-            theirs.push_slice(&before);
-            let placed = Placed::push(&mut ours, &values);
-            let reference = Reference::push(&mut theirs, &values);
-            prop_assert_eq!(&ours.bytes, &theirs.bytes);
-            prop_assert_eq!((placed.at, placed.len), (reference.at, reference.len));
-            let field_at = ours.next::<Slice<u32>>() + gap;
-            prop_assert_eq!(placed.slice::<u32>(field_at), reference.slice::<u32>(field_at));
-        }
+    #[hegel::test]
+    fn placed_is_the_copies_it_replaced(tc: TestCase) {
+        let before: Vec<u8> = tc.draw(gs::binary().max_size(8));
+        let values: Vec<u32> = tc.draw(gs::vecs(gs::integers()).max_size(63));
+        let gap: u64 = tc.draw(gs::integers().max_value(63));
+        let (mut ours, mut theirs) = (writer(), writer());
+        ours.push_slice(&before);
+        theirs.push_slice(&before);
+        let placed = Placed::push(&mut ours, &values);
+        let reference = Reference::push(&mut theirs, &values);
+        assert_eq!(&ours.bytes, &theirs.bytes);
+        assert_eq!((placed.at, placed.len), (reference.at, reference.len));
+        let field_at = ours.next::<Slice<u32>>() + gap;
+        assert_eq!(placed.slice::<u32>(field_at), reference.slice::<u32>(field_at));
+    }
 
-        #[test]
-        fn push_each_writes_what_push_writes(
-            before in proptest::collection::vec(any::<u8>(), 0..9),
-            values in proptest::collection::vec(any::<u64>(), 0..64),
-        ) {
-            let (mut each, mut whole) = (writer(), writer());
-            each.push_slice(&before);
-            whole.push_slice(&before);
-            let a = Placed::push_each(&mut each, values.len(), values.iter().copied());
-            let b = Placed::push(&mut whole, &values);
-            prop_assert_eq!(a, b);
-            prop_assert_eq!(&each.bytes, &whole.bytes);
-        }
+    #[hegel::test]
+    fn push_each_writes_what_push_writes(tc: TestCase) {
+        let before: Vec<u8> = tc.draw(gs::binary().max_size(8));
+        let values: Vec<u64> = tc.draw(gs::vecs(gs::integers()).max_size(63));
+        let (mut each, mut whole) = (writer(), writer());
+        each.push_slice(&before);
+        whole.push_slice(&before);
+        let a = Placed::push_each(&mut each, values.len(), values.iter().copied());
+        let b = Placed::push(&mut whole, &values);
+        assert_eq!(a, b);
+        assert_eq!(&each.bytes, &whole.bytes);
     }
 
     #[test]

@@ -163,21 +163,17 @@ fn check(format: Format, found: Found, page: u64) -> Result<Layout, Error> {
     Ok(Layout { format, header, span, code, reserved })
 }
 
+// The images' offsets are the file's `u64`s: past `usize` is a short read, as past the end.
 pub(crate) fn u16_at(bytes: &[u8], at: u64) -> Option<u16> {
-    Some(u16::from_le_bytes(take(bytes, at)?))
+    blaze_bytes::le::get_u16(bytes, usize::try_from(at).ok()?)
 }
 
 pub(crate) fn u32_at(bytes: &[u8], at: u64) -> Option<u32> {
-    Some(u32::from_le_bytes(take(bytes, at)?))
+    blaze_bytes::le::get_u32(bytes, usize::try_from(at).ok()?)
 }
 
 pub(crate) fn u64_at(bytes: &[u8], at: u64) -> Option<u64> {
-    Some(u64::from_le_bytes(take(bytes, at)?))
-}
-
-fn take<const N: usize>(bytes: &[u8], at: u64) -> Option<[u8; N]> {
-    let at = usize::try_from(at).ok()?;
-    bytes.get(at..at.checked_add(N)?)?.try_into().ok()
+    blaze_bytes::le::get_u64(bytes, usize::try_from(at).ok()?)
 }
 
 /// `start..start + len`, or an error naming `what` when it overflows.

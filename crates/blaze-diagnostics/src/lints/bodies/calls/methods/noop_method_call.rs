@@ -13,7 +13,7 @@ use hir_def::{AdtId, AttrDefId, HasModule as _, ItemContainerId, Lookup as _, hi
 use hir_ty::{
     Adjust, ParamEnvAndCrate,
     db::HirDatabase,
-    next_solver::{DbInterner, Region, Ty, TyKind},
+    next_solver::{DbInterner, Region, RegionExt as _, Ty, TyKind},
 };
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::{
@@ -46,14 +46,14 @@ impl LatePass for NoopMethodCall {
     const LINTS: LintSet = lint_set(["noop_method_call", "suspicious_double_ref_op"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::MethodCall]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         if let Some(found) = noop_method_call(b, expr) {
             out.push(found);
         }
     }
 }
 
-fn noop_method_call(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
+fn noop_method_call(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Found> {
     let hir_def::hir::Expr::MethodCall { receiver, method_name, .. } = b.store().expr(expr) else { return None };
     let db = b.db();
     let (method, args) = b.infer.method_resolution(expr)?;
@@ -153,7 +153,7 @@ fn erased<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
 }
 
 /// rustc's `def_span` of an ADT: its header, from its visibility to its generics.
-fn adt_def_span(b: &BodyCx<'_, '_>, adt: AdtId) -> Span {
+fn adt_def_span(b: &BodyCx<'_, '_, '_>, adt: AdtId) -> Span {
     let db: &Db = b.db();
     let node: InFile<ast::Node<'_>> = match adt {
         AdtId::StructId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),
@@ -166,7 +166,7 @@ fn adt_def_span(b: &BodyCx<'_, '_>, adt: AdtId) -> Span {
 /// What the lint read: which method the call is on the receiver's type, and whether the type
 /// under the references implements the trait.
 fn facts<'db>(
-    b: &BodyCx<'_, 'db>,
+    b: &BodyCx<'_, '_, 'db>,
     diag: &mut Diag,
     receiver: ExprId,
     method_name: &str,

@@ -3,9 +3,9 @@
 //! columns as their bytes.
 //!
 //! `zerocopy`'s derives check the layouts (`repr(C)`, no padding, every bit pattern valid where
-//! a row is read from bytes) and emit the `unsafe impl`s of their traits. The one other unsafe
-//! is [`CompressedSpanPart::ctx`]'s, which says where a context's words are trusted.
-#![allow(unsafe_code)]
+//! a row is read from bytes) and emit the `unsafe impl`s of their traits. They are another
+//! crate's macro, which `unsafe_code` does not report, so the module needs no allow and has no
+//! unsafe of its own.
 
 use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -123,10 +123,9 @@ impl CompressedSpanPart {
 
     #[inline]
     pub(super) fn ctx(self) -> SyntaxContext {
-        // SAFETY: `self.ctx` is what `SyntaxContext::into_u32` gave for a context of this
-        // process: `new` writes it so, and `from_row` reads the words of a part (the type's
-        // doc). Memory safety doesn't rest on it either (`SyntaxContext::from_u32`'s doc).
-        unsafe { SyntaxContext::from_u32(self.ctx) }
+        // `self.ctx` is what `SyntaxContext::into_u32` gave for a context of this process: `new`
+        // writes it so, and `from_row` reads the words of a part (the type's doc).
+        SyntaxContext::from_u32(self.ctx)
     }
 
     #[inline]

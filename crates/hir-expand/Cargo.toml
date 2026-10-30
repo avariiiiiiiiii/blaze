@@ -42,6 +42,7 @@ blaze-mem.workspace = true
 [dev-dependencies]
 expect-test = "1.5.1"
 blaze-alloc-count.workspace = true
+syntax-bridge = { workspace = true, features = ["reference"] }
 
 [features]
 in-rust-tree = ["syntax/in-rust-tree"]

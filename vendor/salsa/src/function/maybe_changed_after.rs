@@ -9,11 +9,10 @@ use crate::function::{Configuration, IngredientImpl, Reentrancy, SyncTable};
 use crate::table::memo::MemoSlot;
 use std::sync::atomic::Ordering;
 
+use crate::graph::{Color, EdgeWords, Graph, OUTPUT};
 use crate::key::DatabaseKeyIndex;
 use crate::zalsa::{MemoIngredientIndex, Zalsa, ZalsaDatabase};
-use crate::zalsa_local::{
-    QueryEdgeIter, QueryEdgeKind, QueryEdges, QueryOriginRef, QueryRevisions, ZalsaLocal,
-};
+use crate::zalsa_local::{QueryEdgeKind, QueryEdges, QueryOriginRef, QueryRevisions, ZalsaLocal};
 use std::cell::Cell;
 use std::mem::ManuallyDrop;
 use crate::{Id, Revision};
@@ -109,7 +108,7 @@ where
             );
 
             // Check if we have a verified version: this is the hot path.
-            let memo_guard = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index);
+            let memo_guard = self.get_memo_cached(zalsa, zalsa_local, id, memo_ingredient_index);
             let Some(memo) = memo_guard else {
                 // No memo? Assume has changed.
                 return VerifyResult::changed();
@@ -284,11 +283,15 @@ where
     }
 }
 
+/// How many edges ahead the claim-free walk prefetches its dependencies' colors: enough to
+/// cover a miss to memory at a few nanoseconds an edge.
+const COLOR_LOOKAHEAD: usize = 8;
+
 /// A memo on the claim-free walk, and the part of its edges still to check.
 struct UnclaimedFrame<'db> {
     header: &'db MemoHeader,
     key: DatabaseKeyIndex,
-    edges: QueryEdgeIter<'db>,
+    edges: EdgeWords<'db>,
     /// The position in `edges` of the next edge.
     position: usize,
     verified_at: Revision,
@@ -297,7 +300,15 @@ struct UnclaimedFrame<'db> {
 }
 
 impl<'db> UnclaimedFrame<'db> {
-    fn new(header: &'db MemoHeader, key: DatabaseKeyIndex, edges: QueryEdgeIter<'db>) -> Self {
+    fn new(
+        graph: &Graph,
+        header: &'db MemoHeader,
+        key: DatabaseKeyIndex,
+        edges: EdgeWords<'db>,
+    ) -> Self {
+        for word in edges.iter().take(COLOR_LOOKAHEAD) {
+            graph.prefetch_color(word & !OUTPUT);
+        }
         UnclaimedFrame {
             header,
             key,
@@ -340,6 +351,7 @@ impl<'db> UnclaimedFrame<'db> {
     fn finish(&self, zalsa: &Zalsa) {
         #[cfg(feature = "accumulator")]
         self.header.revisions.store_accumulated_inputs(self.inputs);
+        self.header.publish_closure(zalsa);
         self.header.mark_as_verified(zalsa, self.key);
     }
 }
@@ -375,13 +387,21 @@ fn give_stack(mut stack: Vec<UnclaimedFrame<'_>>) {
 
 /// Walks `stack` (its bottom the memo checked) until that memo is verified (true) or only a
 /// claimed check can decide (false).
+///
+/// An edge costs one load when its dependency's color proves it unchanged (`graph::colors`), as
+/// rustc's `try_mark_green` reads `DepNodeColorMap`; the colors of the next
+/// [`COLOR_LOOKAHEAD`] edges are prefetched, so the loads of a memo's edges overlap. Only an
+/// edge the color can't decide finds its dependency's memo by key.
 fn walk_unclaimed<'db>(
     zalsa: &'db Zalsa,
     db: RawDatabase<'_>,
     stack: &mut Vec<UnclaimedFrame<'db>>,
 ) -> bool {
+    let graph = zalsa.graph();
+    let now = zalsa.current_revision();
     while let Some(frame) = stack.last_mut() {
-        let Some(edge) = frame.edges.next() else {
+        let position = frame.position;
+        let Some(word) = frame.edges.get(position) else {
             let done = stack.pop().expect("salsa: the walk's stack holds the memo it checks");
             done.finish(zalsa);
             let Some(parent) = stack.last_mut() else {
@@ -393,12 +413,21 @@ fn walk_unclaimed<'db>(
             }
             continue;
         };
-        let position = frame.position;
         frame.position += 1;
-        if edge.kind() == QueryEdgeKind::Output {
+        if let Some(ahead) = frame.edges.get(position + COLOR_LOOKAHEAD) {
+            graph.prefetch_color(ahead & !OUTPUT);
+        }
+        if word & OUTPUT != 0 {
             return false;
         }
-        let dependency = edge.key();
+        let color = graph.color(word);
+        if color.unchanged_since(now, frame.verified_at) {
+            #[cfg(debug_assertions)]
+            check_color(zalsa, db, word, color, frame.verified_at);
+            // Unchanged with no accumulated values: nothing to fold into the frame.
+            continue;
+        }
+        let dependency = graph.decode(word).key();
         let ingredient = zalsa.lookup_ingredient(dependency.ingredient_index());
         let result = match ingredient.as_function() {
             Some(function) => {
@@ -418,26 +447,62 @@ fn walk_unclaimed<'db>(
                         let Some(edges) = header.unclaimed_edges(zalsa) else {
                             return false;
                         };
-                        stack.push(UnclaimedFrame::new(header, dependency, edges));
+                        stack.push(UnclaimedFrame::new(graph, header, dependency, edges));
                         continue;
                     }
                 }
             }
-            // SAFETY: `db` is the database every ingredient of `zalsa` was created with.
-            None => unsafe {
-                ingredient.maybe_changed_after(
-                    zalsa,
-                    db,
-                    dependency.key_index(),
-                    frame.verified_at,
-                )
-            },
+            None => {
+                if let Some(changed_at) = ingredient.fixed_changed_at(zalsa, dependency.key_index())
+                {
+                    graph.paint(word, Color::verified(now, changed_at, false));
+                }
+                // SAFETY: `db` is the database every ingredient of `zalsa` was created with.
+                unsafe {
+                    ingredient.maybe_changed_after(
+                        zalsa,
+                        db,
+                        dependency.key_index(),
+                        frame.verified_at,
+                    )
+                }
+            }
         };
         if !frame.take(zalsa, position, dependency, result) {
             return false;
         }
     }
     unreachable!("salsa: the claim-free walk returns when it pops its first memo")
+}
+
+/// Checks a color that said "unchanged" against the memo path, which decides without colors:
+/// they agree, or the color changed since it was read (a memo of the key was replaced or removed
+/// meanwhile, a race either path may lose).
+#[cfg(debug_assertions)]
+fn check_color(zalsa: &Zalsa, db: RawDatabase<'_>, word: u32, color: Color, reader: Revision) {
+    let graph = zalsa.graph();
+    let now = zalsa.current_revision();
+    let dependency = graph.decode(word).key();
+    let ingredient = zalsa.lookup_ingredient(dependency.ingredient_index());
+    let agrees = match ingredient.as_function() {
+        Some(function) => function.memo(zalsa, dependency.key_index()).is_some_and(|memo| {
+            let header = memo.header();
+            header.verified_at.load() == now
+                && !header.may_be_provisional()
+                && !header.has_accumulated()
+                && header.revisions.changed_at() <= reader
+        }),
+        // SAFETY: `db` is the database every ingredient of `zalsa` was created with.
+        None => unsafe {
+            ingredient.maybe_changed_after(zalsa, db, dependency.key_index(), reader)
+        }
+        .is_unchanged(),
+    };
+    assert!(
+        agrees || graph.color(word) != color,
+        "salsa: the color of {dependency:?} ({color:?}) says it is unchanged since {reader:?} \
+         in {now:?}, but its memo disagrees"
+    );
 }
 
 impl MemoHeader {
@@ -453,17 +518,14 @@ impl MemoHeader {
 
     /// The edges of a memo the claim-free walk may verify: not (ever) part of a cycle, and
     /// derived from tracked reads only.
-    fn unclaimed_edges<'db>(&'db self, zalsa: &'db Zalsa) -> Option<QueryEdgeIter<'db>> {
+    fn unclaimed_edges<'db>(&'db self, zalsa: &'db Zalsa) -> Option<EdgeWords<'db>> {
         if self.may_be_provisional()
             || self.was_cycle_participant()
             || !self.cycle_heads().is_empty()
         {
             return None;
         }
-        match self.origin(zalsa.graph()) {
-            QueryOriginRef::Derived(edges) => Some(edges.iter()),
-            QueryOriginRef::DerivedUntracked(_) | QueryOriginRef::Assigned(_) => None,
-        }
+        self.revisions.derived_edge_words(zalsa.graph())
     }
 
     /// Verifies the memo by its edges with no claim (rustc's `try_mark_green`): true when every
@@ -488,7 +550,12 @@ impl MemoHeader {
             return false;
         };
         let mut stack = take_stack();
-        stack.push(UnclaimedFrame::new(self, database_key_index, edges));
+        stack.push(UnclaimedFrame::new(
+            zalsa.graph(),
+            self,
+            database_key_index,
+            edges,
+        ));
         let verified = walk_unclaimed(zalsa, db, &mut stack);
         give_stack(stack);
         verified
@@ -608,6 +675,10 @@ impl MemoHeader {
         );
         if last_changed <= verified_at {
             // No input of the suitable durability has changed since last verified.
+            ShallowUpdate::HigherDurability
+        } else if self.closure_unchanged(zalsa, verified_at) {
+            // No input it read, transitively, changed since (`graph::bloom`): what a deep verify
+            // would find, without the walk, so it is verified as the durability check verifies.
             ShallowUpdate::HigherDurability
         } else {
             ShallowUpdate::No
@@ -743,6 +814,7 @@ impl MemoHeader {
                 );
 
                 if result.is_unchanged() {
+                    self.publish_closure(zalsa);
                     self.mark_as_verified(zalsa, database_key_index);
                 }
 
@@ -819,9 +891,19 @@ fn deep_verify_edges(
     // they executed. It's possible that if the value of some input I0 is no longer
     // valid, then some later input I1 might never have executed at all, so verifying
     // it is still up to date is meaningless.
+    let graph = zalsa.graph();
+    let now = zalsa.current_revision();
     for (position, edge) in edges.into_iter().enumerate() {
         match edge.kind() {
             QueryEdgeKind::Input => {
+                if let Some(node) = edge.node() {
+                    let color = graph.color(node);
+                    if color.unchanged_since(now, old_verified_at) {
+                        #[cfg(debug_assertions)]
+                        check_color(zalsa, db, node, color, old_verified_at);
+                        continue;
+                    }
+                }
                 let dependency_index = edge.key();
                 let mut input_result =
                     dependency_index.maybe_changed_after(db, zalsa, old_verified_at);

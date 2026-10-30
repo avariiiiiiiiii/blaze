@@ -478,7 +478,7 @@ pub(crate) fn reloc_kind(kind: binemit::Reloc) -> Result<RelocKind, String> {
 /// The kind of a relocation whose ELF type the producer said.
 pub(crate) fn elf_kind(elf: u32) -> Result<RelocKind, String> {
     use cranelift_object::object::elf;
-    Ok(match elf {
+    Ok(match elf::RelocationType(elf) {
         elf::R_X86_64_64 | elf::R_AARCH64_ABS64 => RelocKind::Abs64,
         elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => RelocKind::PcRel32,
         elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX | elf::R_X86_64_REX_GOTPCRELX => {
@@ -506,7 +506,7 @@ pub(crate) fn elf_kind(elf: u32) -> Result<RelocKind, String> {
         elf::R_AARCH64_TLSLE_ADD_TPREL_HI12 => RelocKind::TpHi12,
         elf::R_AARCH64_TLSLE_ADD_TPREL_LO12_NC => RelocKind::TpLo12,
         // alloc: an error
-        other => return Err(format!("a relocation of ELF type {other}, which v2 has no kind for")),
+        other => return Err(format!("a relocation of ELF type {}, which v2 has no kind for", other.0)),
     })
 }
 

@@ -7,11 +7,13 @@
 
 use std::ops::Bound;
 
+use blaze_format::cursor::{self, Put as _};
+
 use crate::guest::Stop;
 
 /// A request, read from its start.
 pub(crate) struct Reader<'a> {
-    bytes: &'a [u8],
+    bytes: cursor::Reader<'a>,
 }
 
 fn short(what: &str) -> Stop {
@@ -26,24 +28,15 @@ fn bad(what: &str, value: u8) -> Stop {
 
 impl<'a> Reader<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Reader<'a> {
-        Reader { bytes }
+        Reader { bytes: cursor::Reader::new(bytes) }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    fn take(&mut self, len: usize, what: &str) -> Result<&'a [u8], Stop> {
-        if self.bytes.len() < len {
-            return Err(short(what));
-        }
-        let (taken, rest) = self.bytes.split_at(len);
-        self.bytes = rest;
-        Ok(taken)
+        self.bytes.is_done()
     }
 
     pub(crate) fn u8(&mut self) -> Result<u8, Stop> {
-        Ok(self.take(1, "a byte")?[0])
+        self.bytes.u8().map_err(|_| short("a byte"))
     }
 
     pub(crate) fn bool(&mut self) -> Result<bool, Stop> {
@@ -55,13 +48,11 @@ impl<'a> Reader<'a> {
     }
 
     pub(crate) fn u32(&mut self) -> Result<u32, Stop> {
-        let bytes = self.take(4, "a u32")?;
-        Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes were taken")))
+        self.bytes.u32().map_err(|_| short("a u32"))
     }
 
     pub(crate) fn usize(&mut self) -> Result<u64, Stop> {
-        let bytes = self.take(8, "a usize")?;
-        Ok(u64::from_le_bytes(bytes.try_into().expect("eight bytes were taken")))
+        self.bytes.u64().map_err(|_| short("a usize"))
     }
 
     pub(crate) fn handle(&mut self) -> Result<u32, Stop> {
@@ -74,7 +65,7 @@ impl<'a> Reader<'a> {
     pub(crate) fn str(&mut self) -> Result<&'a str, Stop> {
         let len = self.usize()?;
         let len = usize::try_from(len).map_err(|_| short("a string"))?;
-        let bytes = self.take(len, "a string")?;
+        let bytes = self.bytes.take(len).map_err(|_| short("a string"))?;
         std::str::from_utf8(bytes)
             .map_err(|_| Stop("sent the server a string that is not UTF-8".to_owned())) // alloc: error path
     }
@@ -102,7 +93,7 @@ impl<'a> Reader<'a> {
         let len = self.usize()?;
         // Each element is at least a byte: a length past the bytes left is no request.
         match usize::try_from(len) {
-            Ok(len) if len <= self.bytes.len() => Ok(len),
+            Ok(len) if len <= self.bytes.left() => Ok(len),
             _ => Err(short("a list")),
         }
     }
@@ -115,19 +106,19 @@ pub(crate) struct Writer<'a> {
 
 impl Writer<'_> {
     pub(crate) fn u8(&mut self, value: u8) {
-        self.out.push(value);
+        self.out.put_u8(value);
     }
 
     pub(crate) fn bool(&mut self, value: bool) {
-        self.out.push(value as u8);
+        self.out.put_u8(value as u8);
     }
 
     pub(crate) fn u32(&mut self, value: u32) {
-        self.out.extend_from_slice(&value.to_le_bytes());
+        self.out.put_u32(value);
     }
 
     pub(crate) fn usize(&mut self, value: u64) {
-        self.out.extend_from_slice(&value.to_le_bytes());
+        self.out.put_u64(value);
     }
 
     pub(crate) fn handle(&mut self, handle: u32) {
@@ -135,16 +126,15 @@ impl Writer<'_> {
     }
 
     pub(crate) fn str(&mut self, value: &str) {
-        self.usize(value.len() as u64);
-        self.out.extend_from_slice(value.as_bytes());
+        self.out.put_bytes_u64(value.as_bytes());
     }
 
     pub(crate) fn some(&mut self, some: bool) {
-        self.out.push(if some { 0 } else { 1 });
+        self.out.put_u8(if some { 0 } else { 1 });
     }
 
     pub(crate) fn ok(&mut self, ok: bool) {
-        self.out.push(if ok { 0 } else { 1 });
+        self.out.put_u8(if ok { 0 } else { 1 });
     }
 }
 

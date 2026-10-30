@@ -7,16 +7,28 @@
 //! its pointer, and the entry it held is retired to the table's limbo and freed once every task
 //! that may have loaded it has ended (`blaze_reclaim`). Lookups take no lock and write nothing
 //! but the use mark, once per sweep.
+//!
+//! The unsafe is the entry pointers: turning a published one back into a reference, and the box
+//! round trip that hands an unlinked entry to the limbo. The safe version, an `Arc` per entry
+//! or a lock per slot, costs a hit two read-modify-writes on a line every thread shares (or a
+//! lock), where this costs two loads. `model.rs` checks it under `blaze_check`.
 
-use std::{
-    ptr,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-    },
+use std::ptr;
+
+#[cfg(blaze_check)]
+use blaze_check::sync::{
+    Mutex,
+    atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+};
+use blaze_reclaim::{Guard, Limbo};
+#[cfg(not(blaze_check))]
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
 
-use blaze_reclaim::{Guard, Limbo};
+#[cfg(all(test, blaze_check))]
+mod model;
 
 /// A key of a [`Table`].
 pub(super) trait Key: Copy + Eq + Send + Sync + 'static {

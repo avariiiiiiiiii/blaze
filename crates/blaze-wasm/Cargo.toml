@@ -26,6 +26,7 @@ hir = { path = "../hir", version = "0.0.0" }
 hir-def = { path = "../hir-def", version = "0.0.0" }
 hir-ty = { path = "../hir-ty", version = "0.0.0" }
 hir-ty-codegen = { path = "../hir-ty-codegen", features = ["wasm"] }
+rustc-symbols = { path = "../rustc-symbols", version = "0.0.0" }
 ide-db = { path = "../ide-db", version = "0.0.0" }
 vfs = { path = "../vfs", version = "0.0.0" }
 cfg = { path = "../cfg", version = "0.0.0", features = ["tt", "syntax"] }

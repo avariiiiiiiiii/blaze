@@ -1,0 +1,24 @@
+{
+  "id": "00928",
+  "from_lane": "speed-sol2-usercode-wasm",
+  "owner": "store",
+  "paths": [
+    "crates/blaze-cas/src/",
+    "crates/blaze-store/src/lib.rs"
+  ],
+  "what": "A zero-copy load of machine code from the store. blaze-macro-wasm (lib.rs `Wasm::compile`, key `code_key`) and blaze-wasi (run.rs `compile_in`, key `code_key`) load Wasmtime machine code with `Store::get_lasting` (a pread into a fresh Vec, then a checksum pass) and `Module::deserialize`, which copies it again into its own executable mapping: two copies and a page fault per page of code, about 3 ms for a 10 MB module (a syn-based macro), against about 0.1 ms for a mapping (Wasmtime `Module::deserialize_open_file`, copy-on-write, pages faulted only as code runs). Asked: in blaze-cas (blaze-store is deleted at integration), a lasting value whose bytes start on a page boundary of a sealed pack and can be had as an open `File` (or a page-aligned read-only mapping that lives as long as the process), checked against its checksum once when the pack is opened or the value is first read, so blaze-macro-wasm and blaze-wasi pass it to `Module::deserialize_open_file` (or `deserialize_raw`). Also carry both callers over from blaze-store when it goes: they use `get_lasting`, `insert_lasting`, `has_lasting`, `flush`, `Store::global`, `toolchain`. Section `Loading a module (speed-sol2-usercode-wasm)` of docs/v2/plan/lanes/usercode/speed-of-light-wasm.md has the arithmetic.",
+  "state": "open",
+  "created": "2026-10-30T09:52:31Z",
+  "updated": "2026-10-30T09:52:31Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:52:31Z",
+      "by": "speed-sol2-usercode-wasm",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

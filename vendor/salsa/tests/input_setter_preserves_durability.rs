@@ -1,4 +1,5 @@
 #![cfg(feature = "inventory")]
+#![forbid(unsafe_code)]
 
 use salsa::plumbing::ZalsaDatabase;
 use salsa::{Durability, Setter};

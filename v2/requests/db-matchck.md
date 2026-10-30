@@ -52,6 +52,7 @@ three edits above are applied as written; the call shape matches `typo.rs` (both
 
 > forwarded to db (from requests, pass 16; told by tmux).
 > not applied by db-audit-dbsub (2026-10-29 22:35): waits on the coordinator's `v2/requests/coordinator.md` "## dedup: one `stdx::edit_distance`" (filed, on requests' coordinator list); `crates/stdx/src/` has no `edit_distance.rs` yet, so `distance.rs` stays until it lands, then the three edits above as written.
+> applied by apply-00215 (2026-10-30, queue 00215): the three edits above as written (`typo.rs`'s import is now on line 15), `src/distance.rs` deleted.
 
 ## 3. diagnostics (blaze-diagnostics, ide-diagnostics): the new match checking fields (db-matchck)
 

@@ -710,26 +710,14 @@ mod tests {
     }
 
     #[test]
-    fn a_traits_items_are_named_as_the_handles_name_them() {
-        use syntax::{AstNode as _, ast::HasName as _};
-
-        let parse = parse("trait T { fn a(); fn b() {} const C: u8; type D<X>; m!(); }");
+    fn a_traits_items_are_named_in_order_without_its_macro_calls() {
+        let text = "trait T { fn a(); fn b() {} const C: u8; type D<X>; m!(); }";
+        let parse = parse(text);
         let items = super::assoc_items(first(&parse));
-        let trait_: syntax::ast::Trait = parse.tree().syntax().descendants().find_map(syntax::ast::Trait::cast).unwrap();
-        let handles: Vec<_> = trait_
-            .assoc_item_list()
-            .into_iter()
-            .flat_map(|it| it.assoc_items())
-            .filter_map(|it| match it {
-                syntax::ast::AssocItem::Fn(it) => it.name(),
-                syntax::ast::AssocItem::Const(it) => it.name(),
-                syntax::ast::AssocItem::TypeAlias(it) => it.name(),
-                syntax::ast::AssocItem::MacroCall(_) => None,
-            })
-            .map(|it| it.text().to_string())
-            .collect();
         let names: Vec<_> = items.iter().map(|it| it.name).collect();
-        assert_eq!(names, handles);
+        assert_eq!(names, ["a", "b", "C", "D"]);
+        let spans: Vec<_> = items.iter().map(|it| &text[it.range]).collect();
+        assert_eq!(spans, ["fn a();", "fn b()", "const C: u8", "type D<X>"]);
         let functions: Vec<_> = items.iter().map(|it| it.function).collect();
         assert_eq!(functions, [Some(false), Some(true), None, None]);
     }

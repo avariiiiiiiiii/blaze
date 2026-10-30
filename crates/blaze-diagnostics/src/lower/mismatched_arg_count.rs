@@ -26,6 +26,7 @@ use syntax::{
 };
 
 use super::binary_operator_cannot_be_applied::code_fact;
+use stdx::list::Join;
 use crate::{
     cx::Cx,
     lower::{Found, Phase},
@@ -34,7 +35,8 @@ use crate::{
 
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::MismatchedArgCount) -> Vec<Found> {
     let node = cx.node_view(d.call_expr);
-    let Some(call) = node.value.left().and_then(|it| CallCx::new(cx, node.file_id, it, d)) else {
+    let inputs = Inputs::Count { expected: d.expected, is_fn_trait_call: d.is_fn_trait_call };
+    let Some(call) = node.value.left().and_then(|it| CallCx::new(cx, node.file_id, it, inputs)) else {
         let span = cx.span_of_ptr(d.call_expr);
         let mut diag = Diag::error(
             Some(if d.is_fn_trait_call { "E0057" } else { "E0061" }),
@@ -364,8 +366,19 @@ struct ParamInfo {
     display: String,
 }
 
+/// The inputs a call's arguments are checked against, as the front end's diagnostic says.
+#[derive(Clone, Copy)]
+pub(super) enum Inputs {
+    /// `MismatchedArgCount`: the number of inputs the callee takes, and whether the call goes
+    /// through a `Fn` trait, its arguments made a tuple.
+    Count { expected: usize, is_fn_trait_call: bool },
+    /// `IncorrectArguments`: as many as are given, a C-variadic callee's extra arguments left
+    /// out as rustc's `report_arg_errors` leaves them.
+    Fit,
+}
+
 /// What rustc's `CallCtxt`, `ArgsCtxt` and `ArgMatchingCtxt` know of a call.
-struct CallCx<'a, 'b, 'db> {
+pub(super) struct CallCx<'a, 'b, 'db> {
     cx: &'a Cx<'b, 'db>,
     file: HirFileId,
     callee_expr: Option<ast::Expr<'db>>,
@@ -385,11 +398,11 @@ struct CallCx<'a, 'b, 'db> {
 }
 
 impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
-    fn new(
+    pub(super) fn new(
         cx: &'a Cx<'b, 'db>,
         file: HirFileId,
         call: ast::Expr<'db>,
-        d: &hir::MismatchedArgCount,
+        inputs: Inputs,
     ) -> Option<CallCx<'a, 'b, 'db>> {
         let at = |range: TextRange| cx.span(InFile::new(file, range));
         let call_range = call.syntax().text_range();
@@ -419,7 +432,7 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
             }
             _ => return None,
         };
-        let provided = args
+        let mut provided = args
             .into_iter()
             .flat_map(|it| it.args())
             .map(|arg| {
@@ -435,16 +448,28 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
             Some(CallableKind::Function(f)) => f.is_varargs(cx.db),
             _ => false,
         };
-        let expected = if params.len() == d.expected {
+        let (expected_len, is_fn_trait_call) = match inputs {
+            Inputs::Count { expected, is_fn_trait_call } => (expected, is_fn_trait_call),
+            Inputs::Fit => {
+                if c_variadic {
+                    provided.truncate(params.len());
+                }
+                // Only a call of a value through the `Fn` traits has its arguments tupled
+                // (`TupleArgumentsFlag::TupleArguments`), never a method call.
+                let through_fn_trait = !is_method && matches!(callable.as_ref().map(|it| it.kind()), Some(CallableKind::FnImpl(_)));
+                (provided.len(), through_fn_trait)
+            }
+        };
+        let expected = if params.len() == expected_len {
             // alloc: the error's parts, for an error hir found
             params.into_iter().map(Some).collect()
         } else {
             // alloc: the error's parts, for an error hir found
-            vec![None; d.expected]
+            vec![None; expected_len]
         };
-        let code = if c_variadic && provided.len() < d.expected {
+        let code = if c_variadic && provided.len() < expected_len {
             "E0060"
-        } else if d.is_fn_trait_call {
+        } else if is_fn_trait_call {
             "E0057"
         } else {
             "E0061"
@@ -456,7 +481,7 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
             method_name,
             callable,
             is_method,
-            is_fn_trait_call: d.is_fn_trait_call,
+            is_fn_trait_call,
             call_name,
             full_call_span: at(full_call),
             error_span: at(error),
@@ -501,7 +526,16 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         }
     }
 
-    fn report(&self) -> Diag {
+    /// rustc's special case of `report_arg_errors`: the call's one error is an argument of the
+    /// wrong type, the types compared, which rustc reports as that argument's "mismatched types"
+    /// rather than as the call's error.
+    pub(super) fn single_mismatch(&self) -> bool {
+        let full = ArgMatrix::new(self.provided.len(), self.expected.len(), |p, e| self.compat(p, e));
+        let (errors, _) = full.find_errors();
+        matches!(errors[..], [ArgError::Invalid(_, _, Compat::Incompatible { compared: true })])
+    }
+
+    pub(super) fn report(&self) -> Diag {
         let full = ArgMatrix::new(self.provided.len(), self.expected.len(), |p, e| self.compat(p, e));
         // clone: on the error path, for an error hir found
         let (mut errors, matched) = full.clone().find_errors();
@@ -1168,8 +1202,8 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         for param in &mismatched {
             // clone: on the error path, for an error hir found
             let span = params[param.idx].span.clone();
-            // clone: on the error path, for an error hir found
-            match listify(&param.deps, |&dep| params[dep].display.clone()) {
+            let deps = param.deps.iter().map(|&dep| &params[dep].display);
+            match (!param.deps.is_empty()).then(|| stdx::list::list(deps, Join::AndNoSerialComma, false)) {
                 Some(deps) => spans
                     .labels
                     // alloc: the error's text, for an error hir found
@@ -1178,8 +1212,8 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
             }
         }
         for (idx, (param, deps)) in params.iter().zip(&dependants).enumerate() {
-            // clone: on the error path, for an error hir found
-            if let Some(list) = listify(deps, |&dep| params[mismatched[dep].idx].display.clone()) {
+            if !deps.is_empty() {
+                let list = stdx::list::list(deps.iter().map(|&dep| &params[mismatched[dep].idx].display), Join::AndNoSerialComma, false);
                 let s = if deps.len() != 1 { "s" } else { "" };
                 // alloc: clone: the error's parts, for an error hir found
                 spans.labels.push((param.span.clone(), format!("{list} need{s} to match the {} type of this parameter", sort(idx))));
@@ -1188,8 +1222,8 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         for ((span, name), uses) in generics.iter().zip(&mut generic_uses) {
             radix::sort(uses);
             uses.dedup();
-            // clone: on the error path, for an error hir found
-            if let Some(list) = listify(uses, |&idx| params[idx].display.clone()) {
+            if !uses.is_empty() {
+                let list = stdx::list::list(uses.iter().map(|&idx| &params[idx].display), Join::AndNoSerialComma, false);
                 let quantifier = if uses.len() == 2 { "both" } else { "all" };
                 // alloc: clone: the error's parts, for an error hir found
                 spans.labels.push((span.clone(), format!("{list} {quantifier} reference this parameter `{name}`")));
@@ -1294,14 +1328,3 @@ fn a_or_an(s: &str) -> &'static str {
     if ["a", "e", "i", "o", "u", "&"].contains(&first.to_lowercase().to_string().as_str()) { "an" } else { "a" }
 }
 
-/// rustc's `listify`: `a`, `a and b`, `a, b and c`.
-fn listify<T>(list: &[T], fmt: impl Fn(&T) -> String) -> Option<String> {
-    Some(match list {
-        [only] => fmt(only),
-        [others @ .., last] => {
-            // alloc: the error's text, for an error hir found
-            format!("{} and {}", others.iter().map(&fmt).collect::<Vec<_>>().join(", "), fmt(last))
-        }
-        [] => return None,
-    })
-}

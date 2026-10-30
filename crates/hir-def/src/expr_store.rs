@@ -55,7 +55,8 @@ pub(crate) use self::source_map::{Move, MoveTo};
 
 pub use self::body::{Body, BodySourceMap};
 pub use self::lower::{
-    hir_assoc_type_binding_to_ast, hir_generic_arg_to_ast, hir_segment_to_ast_segment,
+    hir_assoc_type_binding_to_ast_view, hir_generic_arg_to_ast_view,
+    hir_segment_to_ast_segment_view,
 };
 pub use self::source_map::ExpressionStoreSourceMap;
 
@@ -133,7 +134,7 @@ struct ExprRoot {
 
 // We split the store into types-only and expressions, because most stores (e.g. generics)
 // don't store any expressions and this saves memory. Same thing for the source map.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)] // clone: inside `ExpressionStore`, until queue 00952
 struct ExpressionOnlyStore {
     /// The expressions and patterns.
     columns: HirColumns<Frozen>,
@@ -200,7 +201,7 @@ fn kinds_of(expr_kind: &[u8]) -> u64 {
     expr_kind.iter().fold(0, |kinds, &kind| kinds | 1 << kind)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)] // clone: of the empty store only, cold, until queue 00952
 pub struct ExpressionStore {
     expr_only: Option<Box<ExpressionOnlyStore>>,
     /// The type refs ([`ExpressionStore::type_ref`]).
@@ -1269,14 +1270,19 @@ impl ExpressionStore {
     /// made in a `const`. Empty columns allocate nothing.
     #[inline]
     pub fn empty() -> &'static ExpressionStore {
-        static EMPTY: LazyLock<ExpressionStore> = LazyLock::new(|| ExpressionStore {
+        static EMPTY: LazyLock<ExpressionStore> = LazyLock::new(ExpressionStore::empty_owned);
+        &EMPTY
+    }
+
+    /// [`ExpressionStore::empty`] as a value of its own, for an owner with no store to lower.
+    pub fn empty_owned() -> ExpressionStore {
+        ExpressionStore {
             expr_only: None,
             types: TypeColumns::default(),
             lifetimes: Arena::new(),
             type_hygiene: None,
             macro_calls: ThinVec::new(),
-        });
-        &EMPTY
+        }
     }
 
     /// The type ref `id`, decoded from the store's columns.
@@ -1683,6 +1689,7 @@ impl ExpressionStore {
                 visitor.on_type(ty);
                 visitor.on_pat(pat)
             }
+            TypeRef::UnsafeBinder { lifetimes: _, ty } => visitor.on_type(ty),
             TypeRef::Tuple(types) => visitor.on_types(types),
             TypeRef::Path(path) => visitor.on_path(path),
             TypeRef::RawPtr(inner, _) | TypeRef::Slice(inner) => visitor.on_type(inner),
@@ -1793,6 +1800,25 @@ impl ExpressionStore {
     #[inline]
     pub fn has_closures(&self) -> bool {
         self.kinds_present() & (1 << columns::ExprKind::Closure as u32) != 0
+    }
+
+    /// The kind of expression `id`: one byte of the `expr_kind` column, with no row decoded.
+    #[inline]
+    pub fn expr_kind(&self, id: ExprId) -> columns::ExprKind {
+        self.assert_expr_only().columns.expr_kind_of(id)
+    }
+
+    /// Each `let` statement of the store, in row order, as its pattern and whether it has an
+    /// `else`, decoding only the `let` rows; none for a store without expressions.
+    ///
+    /// Every statement row is a row of exactly one `Expr::Block` of the store: lowering keeps
+    /// the statements it is collecting on a stack of its own and writes a block's rows into
+    /// the store only when it writes that block. So this is every `let` of every block of the
+    /// store, each once, the blocks lowering made and left unreferenced included. Only
+    /// replacing a block with [`ExpressionStoreBuilder::set_expr`], which lowering never does,
+    /// could leave rows of no block.
+    pub fn let_statements(&self) -> impl Iterator<Item = (PatId, bool)> + '_ {
+        self.expr_only.as_deref().into_iter().flat_map(|it| it.columns.let_statements())
     }
 
     /// Every macro call lowered into the store, in the order lowering met them: the calls of

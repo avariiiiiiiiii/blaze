@@ -19,7 +19,7 @@ import json, os, re, statistics, subprocess, sys, time
 # has to come from the rustc that copy was taken from.
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "toolchain")).read().strip())
 import linkline
-from difftest import Fixture, BLAZE, WINDOWS, sysroot_rlibs
+from mixed import Fixture, BLAZE, WINDOWS, sysroot_rlibs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPLICE = bool(os.environ.get("BLAZE_SPLICE"))

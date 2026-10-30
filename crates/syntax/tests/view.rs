@@ -4,6 +4,8 @@
 //! position searches, and every typed accessor the same (`accessors.rs`, generated). Then the
 //! budget: walking a whole parsed file through views allocates nothing.
 
+#![forbid(unsafe_code)]
+
 mod accessors;
 
 use std::{

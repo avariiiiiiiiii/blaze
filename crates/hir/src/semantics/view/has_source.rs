@@ -41,7 +41,7 @@ pub trait HasSourceView: Sized {
 }
 
 /// The node a def's location points at, as a view.
-fn loc_view<'db, L>(db: &'db Db, loc: L) -> InFile<<L::Value as Typed>::Of<'db>>
+fn loc_view<'db, L>(db: &'db Db, loc: &L) -> InFile<<L::Value as Typed>::Of<'db>>
 where
     L: hir_def::src::HasSource,
     L::Value: Typed,
@@ -230,35 +230,35 @@ impl Module {
 }
 
 impl EnumVariant {
-    /// [`EnumVariant::value`] over views.
+    /// The discriminant expression written for the variant.
     pub fn value_view(self, db: &Db) -> Option<ast::Expr<'_>> {
         self.source_view(db)?.value.const_arg()?.expr()
     }
 }
 
 impl Const {
-    /// [`Const::value`] over views.
+    /// The const's written body.
     pub fn value_view(self, db: &Db) -> Option<ast::Expr<'_>> {
         self.source_view(db)?.value.body()
     }
 }
 
 impl Static {
-    /// [`Static::value`] over views.
+    /// The static's written initializer.
     pub fn value_view(self, db: &Db) -> Option<ast::Expr<'_>> {
         self.source_view(db)?.value.body()
     }
 }
 
 impl<'db> Param<'db> {
-    /// [`Param::pattern_source`] over views.
+    /// The pattern of a non-`self` parameter.
     pub fn pattern_source_view<'v>(self, db: &'v Db) -> Option<ast::Pat<'v>> {
         self.source_view(db).and_then(|p| p.value.right()?.pat())
     }
 }
 
 impl UseDecl {
-    /// [`UseDecl::source`] over views.
+    /// The `use` item.
     pub fn source_view(self, db: &Db) -> InFile<ast::Use<'_>> {
         loc_view(db, self.id.lookup(db))
     }

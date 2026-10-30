@@ -2,8 +2,9 @@
 //!
 //! A [`DatabaseKeyIndex`] is 12 bytes; an edge names one in 4 by its node, a number given the first
 //! time a finished query's edges name the key and kept for the life of the database, so an edge
-//! never comes to name another key. Two columns map a node back to its key, in pages that double
-//! and never move: 12 bytes a key.
+//! never comes to name another key, except that a compaction may renumber every node at once,
+//! renaming every holder of one in the same `&mut` pass ([`Nodes::renumber`]). Two columns map a
+//! node back to its key, in pages that double and never move: 12 bytes a key.
 //!
 //! The map from a key to its node is a SwissTable probed with `blaze_mem::swiss`
 //! (docs/v2/plan/design/hardware.md, "interner and memo lookups"), its slots holding only the
@@ -78,10 +79,12 @@ struct Head {
 #[repr(align(128))]
 struct Writer(Mutex<usize>);
 
-/// The node to key columns of `1 << (FIRST_PAGE_BITS + p)` nodes.
+/// The node to key columns of `1 << (FIRST_PAGE_BITS + p)` nodes, and their colors
+/// ([`super::colors`]).
 struct KeyPage {
     ids: super::Words<AtomicU64>,
     ingredients: super::Words<AtomicU32>,
+    colors: super::Words<AtomicU64>,
 }
 
 pub(crate) struct Nodes {
@@ -90,13 +93,18 @@ pub(crate) struct Nodes {
     shard_bits: u32,
     pages: Box<[OnceLock<KeyPage>]>,
     next: AtomicU32,
+    /// How many times [`Nodes::renumber`] ran: a task's cache filled at another epoch names old
+    /// numbers. A `u64` never wraps.
+    epoch: u64,
 }
 
 /// A task's direct-mapped cache of key to node, so the keys a task reads again and again cost
-/// one line it alone writes.
+/// one line it alone writes. Its entries are of the [`Nodes`] epoch it holds, and are dropped on
+/// the first use at another.
 #[derive(Default)]
 pub(crate) struct NodeCache {
     entries: OnceCell<Box<[Cell<CacheEntry>]>>,
+    epoch: Cell<u64>,
 }
 
 #[derive(Copy, Clone)]
@@ -135,6 +143,28 @@ fn locate(node: u32) -> (usize, usize) {
     let x = node as usize + (1 << FIRST_PAGE_BITS);
     let bits = usize::BITS - 1 - x.leading_zeros();
     ((bits - FIRST_PAGE_BITS) as usize, x - (1 << bits))
+}
+
+impl KeyPage {
+    /// Page `page`, zeroed.
+    fn new(page: usize) -> KeyPage {
+        let len = 1usize << (FIRST_PAGE_BITS as usize + page);
+        KeyPage {
+            ids: super::zeroed_u64s(len),
+            ingredients: super::zeroed_u32s(len),
+            colors: super::zeroed_u64s(len),
+        }
+    }
+}
+
+/// Empties a task's cache of another epoch's nodes and moves it to `now`.
+#[cold]
+#[inline(never)]
+fn drop_stale(entries: &[Cell<CacheEntry>], epoch: &Cell<u64>, now: u64) {
+    for entry in entries {
+        entry.set(CacheEntry::EMPTY);
+    }
+    epoch.set(now);
 }
 
 impl Table {
@@ -221,6 +251,7 @@ impl Nodes {
             // alloc: setup, once per database
             pages: (0..PAGES).map(|_| OnceLock::new()).collect(),
             next: AtomicU32::new(0),
+            epoch: 0,
         }
     }
 
@@ -232,7 +263,7 @@ impl Nodes {
     }
 
     /// The node of `key`, if it has one, without a lock or a write.
-    #[cfg(test)]
+    #[inline]
     pub(crate) fn find(&self, key: DatabaseKeyIndex) -> Option<u32> {
         let (id, ingredient) = parts(key);
         let hash = hash_parts(id, ingredient);
@@ -266,6 +297,9 @@ impl Nodes {
                 // alloc: setup, once per task: its 1024-entry node cache
                 .collect()
         });
+        if cache.epoch.get() != self.epoch {
+            drop_stale(entries, &cache.epoch, self.epoch);
+        }
         let hash = hash_parts(id, ingredient);
         let entry = &entries[(hash >> 32) as usize & (CACHE - 1)];
         let cached = entry.get();
@@ -306,13 +340,7 @@ impl Nodes {
             "salsa: more than 2^31 distinct query keys were read; an edge has 31 bits to name one"
         );
         let (page, offset) = locate(node);
-        let page = self.pages[page].get_or_init(|| {
-            let len = 1usize << (FIRST_PAGE_BITS as usize + page);
-            KeyPage {
-                ids: super::zeroed_u64s(len),
-                ingredients: super::zeroed_u32s(len),
-            }
-        });
+        let page = self.pages[page].get_or_init(|| KeyPage::new(page));
         page.ids[offset].store(id, Ordering::Relaxed);
         page.ingredients[offset].store(ingredient, Ordering::Relaxed);
         self.table_for_one_more(shard, *len)
@@ -375,6 +403,16 @@ impl Nodes {
         )
     }
 
+    /// The color word of `node`, which an edge or [`Nodes::node`] gave ([`super::colors`]).
+    #[inline]
+    pub(crate) fn color(&self, node: u32) -> &AtomicU64 {
+        let (page, offset) = locate(node);
+        let page = self.pages[page]
+            .get()
+            .expect("salsa: an edge names a node whose key was never stored");
+        &page.colors[offset]
+    }
+
     /// Frees the tables each shard outgrew. With `&mut`, no reader is probing one.
     pub(crate) fn release_outgrown(&mut self) {
         for head in &mut self.heads {
@@ -386,9 +424,63 @@ impl Nodes {
     }
 
     /// How many keys have a node.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> u32 {
         self.next.load(Ordering::Relaxed)
+    }
+
+    /// Renumbers every node: node `old` becomes `new_of_old[old]` (`old_of_new` its inverse), its
+    /// key and color moving with it and the key table naming the new number. Each task's cache
+    /// of the old numbers is dropped on its next use ([`NodeCache`]), so no old number is ever
+    /// read from one. The key columns are written in new order from fresh pages (reads of the old
+    /// ones are independent, so they overlap); the table's slots are rewritten in place, since a
+    /// key's slot depends on its hash only.
+    pub(crate) fn renumber(&mut self, new_of_old: &[u32], old_of_new: &[u32]) {
+        let len = self.len();
+        assert!(
+            new_of_old.len() == len as usize && old_of_new.len() == len as usize,
+            "salsa: a renumbering of {} nodes for a graph of {len}",
+            new_of_old.len()
+        );
+        self.release_outgrown();
+        // Relaxed: `&mut self` orders these with every access before and after.
+        for head in self.heads.iter() {
+            let Some(table) = head.current(Ordering::Relaxed) else {
+                continue;
+            };
+            for group in &table.groups {
+                for slot in Ctrl::<GROUP>(group.ctrl.load(Ordering::Relaxed)).full() {
+                    let node = &group.nodes[slot];
+                    node.store(new_of_old[node.load(Ordering::Relaxed) as usize], Ordering::Relaxed);
+                }
+            }
+        }
+        // alloc: once per renumbering: the page directory of the new key columns
+        let pages: Box<[OnceLock<KeyPage>]> = (0..PAGES).map(|_| OnceLock::new()).collect();
+        let mut new = 0u32;
+        while new < len {
+            let (page, first) = locate(new);
+            debug_assert_eq!(first, 0);
+            let to = pages[page].get_or_init(|| KeyPage::new(page));
+            let end = len.min(new + to.ids.len() as u32);
+            for (offset, &old) in old_of_new[new as usize..end as usize].iter().enumerate() {
+                let (from_page, from_offset) = locate(old);
+                let from = self.pages[from_page]
+                    .get()
+                    .expect("salsa: a renumbered node's key was never stored");
+                to.ids[offset].store(from.ids[from_offset].load(Ordering::Relaxed), Ordering::Relaxed);
+                to.ingredients[offset].store(
+                    from.ingredients[from_offset].load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                to.colors[offset].store(
+                    from.colors[from_offset].load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+            }
+            new = end;
+        }
+        self.pages = pages;
+        self.epoch += 1;
     }
 }
 
@@ -468,6 +560,42 @@ mod tests {
             let level = head.level.load(std::sync::atomic::Ordering::Relaxed);
             assert!(head.tables[..level.saturating_sub(1)].iter().all(|t| t.get().is_none()));
         }
+    }
+
+    /// The safe reference is each key's node before: after a renumbering each key's node is its
+    /// old one's new number, found through the table, a cache filled before, or `node`, with its
+    /// color moved along; a key seen after gets the next number.
+    #[test]
+    fn renumbering_moves_keys_and_colors_and_drops_stale_caches() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut nodes = Nodes::new();
+        let cache = NodeCache::default();
+        let keys: Vec<DatabaseKeyIndex> = (0..5000).map(|i| key(i % 4, i, i % 2)).collect();
+        for (i, &k) in keys.iter().enumerate() {
+            let node = nodes.node_cached(&cache, k);
+            assert_eq!(node, i as u32);
+            nodes.color(node).store(i as u64 * 3 + 1, Relaxed);
+        }
+        let mut new_of_old: Vec<u32> = (0..keys.len() as u32).collect();
+        SplitMix64::new(11).shuffle(&mut new_of_old);
+        let old_of_new = crate::graph::order::invert(&new_of_old);
+        nodes.renumber(&new_of_old, &old_of_new);
+        assert_eq!(nodes.len() as usize, keys.len());
+        for (i, &k) in keys.iter().enumerate() {
+            let new = new_of_old[i];
+            assert_eq!(nodes.find(k), Some(new), "{k:?}");
+            assert_eq!(nodes.key(new), k);
+            assert_eq!(nodes.color(new).load(Relaxed), i as u64 * 3 + 1);
+            assert_eq!(nodes.node_cached(&cache, k), new, "a cache of the old numbers");
+            assert_eq!(nodes.node(k), new);
+        }
+        // A second renumbering, back to the first numbers, drops the cache again.
+        nodes.renumber(&old_of_new, &new_of_old);
+        for (i, &k) in keys.iter().enumerate().take(1000) {
+            assert_eq!(nodes.node_cached(&cache, k), i as u32);
+        }
+        assert_eq!(nodes.node(key(9, 1, 0)), keys.len() as u32);
     }
 
     #[test]

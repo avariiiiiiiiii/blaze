@@ -632,13 +632,14 @@ fn an_outline_has_the_arrays_of_a_full_parse() {
         let text: Arc<str> = std::fs::read_to_string(&file)
             .unwrap_or_else(|e| panic!("{}: {e}", file.display()))
             .into();
-        let full = AstFile::parse_shared(text.clone(), Edition::CURRENT).syntax_node();
-        let outline = AstFile::parse_outline(text, Edition::CURRENT).syntax_node();
-        let tree = flat(&outline);
+        let full = AstFile::parse_shared(text.clone(), Edition::CURRENT);
+        let outline = AstFile::parse_outline(text, Edition::CURRENT);
+        let tree = outline.root().shared_file();
         let unparsed = tree.lazies().filter(|&at| !tree.is_parsed(at)).count();
         assert_eq!(unparsed, tree.lazies().count(), "{}: bodies parsed early", file.display());
         lazies += unparsed;
-        assert!(Arrays::of(&tree) == Arrays::of(&flat(&full)), "{}", file.display());
+        let full = full.root().shared_file();
+        assert!(Arrays::of(tree) == Arrays::of(full), "{}", file.display());
     }
     assert!(lazies > 1000, "the corpus's outlines have {lazies} lazy bodies");
 }
@@ -647,8 +648,8 @@ fn an_outline_has_the_arrays_of_a_full_parse() {
 fn a_derive_reads_a_struct() {
     let text =
         "#[derive(Debug)] // a comment\npub struct A<'a, T: Copy = u8> { x: &'a T, y: [u8; 4] }";
-    let root = AstFile::parse(text, Edition::CURRENT).syntax_node().to_flat();
-    let arrays = Arrays::of(&flat(&root));
+    let parse = AstFile::parse(text, Edition::CURRENT);
+    let arrays = Arrays::of(parse.root().shared_file());
     let tree = arrays.tree();
     let strukt = tree.item().and_then(|it| it.as_struct()).expect("a struct");
     assert!(strukt.name().is_some_and(|it| it.is("A")));

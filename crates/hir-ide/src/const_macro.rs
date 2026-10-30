@@ -186,7 +186,7 @@ fn flat_input(
     sites: [Span; 3],
 ) -> Result<FlatInput, String> {
     let (parse, span_map) = syntax_bridge::token_tree_to_syntax_node(
-        subtree,
+        subtree.view(),
         parser::TopEntryPoint::MacroItems,
         &mut |_| edition,
     );

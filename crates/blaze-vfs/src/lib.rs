@@ -26,6 +26,7 @@ mod disk;
 mod image;
 mod journal;
 pub mod outside;
+mod paths;
 mod reader;
 mod rebase;
 mod section;
@@ -55,6 +56,7 @@ pub use crate::{
     reader::{Pinned, Reader},
     section::Section,
     text::{Text, TextFile, text_of},
+    tree::Jobs,
     watch::{Watched, Watcher},
 };
 
@@ -116,7 +118,7 @@ pub struct File<'a> {
 
 /// A change to a list of files, applied all together or not at all. Ops act on a symlink
 /// itself, never on what it points to.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)] // clone: in blaze-api's requests, the edge
 pub enum Op {
     // Each variant's fields in CBOR key order (shorter name first, then bytewise), so the
     // encoder writes the map as it comes.
@@ -141,7 +143,7 @@ pub enum Op {
     Rename { to: String, from: String },
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum OpError {
     /// Empty, absolute, or with an empty, `.` or `..` part.
     BadPath(String),
@@ -191,7 +193,7 @@ impl fmt::Display for OpError {
 }
 
 /// A file that differs between two roots. Ordered by path, then kind.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)] // clone: in blaze-api's responses, the edge
 pub struct Change {
     // In CBOR key order (shorter name first), so the encoder writes the map as it comes.
     pub kind: ChangeKind,
@@ -227,7 +229,7 @@ pub struct Commit {
     pub ticket: Ticket,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum CommitError {
     /// The base root is not one this tree has.
     UnknownBase(ContentId),
@@ -329,12 +331,41 @@ impl Vfs {
     ) -> Result<Commit, CommitError> {
         let base = self.root(base).ok_or(CommitError::UnknownBase(base))?;
         let at = self.heads.get(head).copied().unwrap_or(self.tree.empty());
-        let (ops, rebased) = if base == at {
-            (Cow::Borrowed(ops), false)
-        } else {
-            (Cow::Owned(rebase::rebase(&self.tree, base, at, ops)?), true)
-        };
-        let root = self.tree.apply(at, &ops)?;
+        if base == at {
+            return self.move_head(head, at, false, ops.iter().map(Cow::Borrowed));
+        }
+        let moved = rebase::rebase(&self.tree, base, at, ops)?;
+        let ops =
+            ops.iter().zip(moved).map(|(op, moved)| moved.map_or(Cow::Borrowed(op), Cow::Owned));
+        self.move_head(head, at, true, ops)
+    }
+
+    /// [`Vfs::commit`] of ops it may keep: each write's bytes become the file's own with no
+    /// copy, where `commit` copies them once.
+    pub fn commit_owned(
+        &mut self,
+        head: &str,
+        base: ContentId,
+        ops: Vec<Op>,
+    ) -> Result<Commit, CommitError> {
+        let base = self.root(base).ok_or(CommitError::UnknownBase(base))?;
+        let at = self.heads.get(head).copied().unwrap_or(self.tree.empty());
+        if base == at {
+            return self.move_head(head, at, false, ops.into_iter().map(Cow::Owned));
+        }
+        let moved = rebase::rebase(&self.tree, base, at, &ops)?;
+        let ops = ops.into_iter().zip(moved).map(|(op, moved)| Cow::Owned(moved.unwrap_or(op)));
+        self.move_head(head, at, true, ops)
+    }
+
+    fn move_head<'o>(
+        &mut self,
+        head: &str,
+        at: NodeId,
+        rebased: bool,
+        ops: impl IntoIterator<Item = Cow<'o, Op>>,
+    ) -> Result<Commit, CommitError> {
+        let root = self.tree.apply_all(at, ops)?;
         self.tree.reclaim();
         match self.heads.get_mut(head) {
             Some(node) => *node = root,
@@ -365,6 +396,22 @@ impl Vfs {
         let root = self.tree.apply(base, ops)?;
         self.tree.reclaim();
         Ok(self.tree.id(root))
+    }
+
+    /// [`Vfs::apply`] of ops it may keep, as [`Vfs::commit_owned`] is: a checkout's files become
+    /// the tree's with no copy.
+    pub fn apply_owned(&mut self, base: ContentId, ops: Vec<Op>) -> Result<ContentId, OpError> {
+        let base = self.root(base).ok_or(OpError::UnknownRoot(base))?;
+        let root = self.tree.apply_all(base, ops.into_iter().map(Cow::Owned))?;
+        self.tree.reclaim();
+        Ok(self.tree.id(root))
+    }
+
+    /// Hashes a commit's new files on `jobs` once they are many bytes (a checkout, a large
+    /// write): the daemon's pool, so a checkout hashes on every core. The IDs are the same
+    /// either way.
+    pub fn hash_on(&mut self, jobs: Jobs) {
+        self.tree.jobs = Some(jobs);
     }
 
     /// Opens `view`, in constant time. Its root and what it reaches are kept until it closes.
@@ -456,7 +503,8 @@ impl Vfs {
 
     /// Drops every node no head, open view or root in `keep` reaches. Readers move to the
     /// nodes kept at once; the old ones are freed once no reader pinned before is still
-    /// reading them. The next flush also rewrites the journal as just what the heads reach.
+    /// reading them. Once as much was appended to the journal since its last rewrite as that
+    /// rewrite held, the next flush also rewrites it as just what the heads reach.
     pub fn collect(&mut self, keep: &[ContentId]) {
         // alloc: once per collection, the heads' names.
         let names: Vec<Box<str>> = self.heads.keys().cloned().collect();
@@ -477,10 +525,22 @@ impl Vfs {
         }
         self.journal.collected(&renumbered, self.tree.len());
     }
+
+    /// [`Vfs::collect`] once it is paid for: once the tree made at least as many nodes since
+    /// the last collection as that one kept. A caller that collects after every job (the
+    /// daemon) then walks and copies what is kept a constant number of times per node made,
+    /// where `collect` does it every call. Whether it collected.
+    pub fn collect_if_due(&mut self, keep: &[ContentId]) -> bool {
+        let due = self.tree.collection_due();
+        if due {
+            self.collect(keep);
+        }
+        due
+    }
 }
 
 /// What recovering a journal found.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
 pub struct Recovered {
     pub records: usize,
     /// Bytes from the first record that was not whole, failed its checksum or was malformed, to

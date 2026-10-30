@@ -5,8 +5,8 @@ reaches.
 The program has 160 MB of zeroed static between its code and where a splice adds to it. On
 AArch64 a `b` or `bl` reaches 128 MB, so the jump from a function to its replacement is the
 long one, which blaze makes every function long enough for. On x86-64 every step is within
-reach. Each is spliced. Run with BLAZE_SPLICE=1; each step is compared with what `cargo build`
-of the same source prints, and with how the daemon is expected to have made the binary.
+reach. Each is spliced. Run with BLAZE_SPLICE=1; each step is compared with what blaze's build
+of the same source from nothing prints, and with how the daemon is expected to have made the binary.
 """
 from includes import follow
 

@@ -18,6 +18,9 @@ comments; step 0 left each body a lane writes as a panic naming the lane.
   only through a request: append what, where and why to `v2/requests/<lane>.md`; the
   coordinator changes it for every lane at once. The root `Cargo.toml` and `Cargo.lock` are
   the coordinator's too: a new workspace dependency is a request.
+- **A new crate's `src/lib.rs` comes first**, before its `Cargo.toml`, even as one doc
+  comment: a workspace member whose manifest has no library stops cargo loading the whole
+  workspace.
 - **IDs**: hashes, keys and outputs use [`ContentId`](../../../../crates/blaze-ids/src/lib.rs) only,
   each made with a domain string naming what it is and its schema version
   (`"blaze v2 <what> <n>"`). A dense `Idx<T>` never goes into a hash, a key or an output.
@@ -44,6 +47,7 @@ Each crate depends only on crates above it in this table (and on existing crates
 | `blaze-items` | item identity and content: `ItemKey`, `ItemKind`, `InterfaceHash`, `LayoutHash`, `CodeHash`, `DeepHash`, `ItemHashes`, `SimplifiedType`, `NameHash`, `Fact` (section 6.2's table and the cross-item rules) with `Fact::key`, the fact `kinds`, `ImplIndexKey`, `ScopeIndexKey`. A front-end crate: it gains `hir-ty` dependencies for the hashing (port blaze-next's `crates/blaze-items`) | items |
 | `blaze-cas` | the store: `Key`, `Kind`, `Entry`, `Ticket`, `Corrupt`, `Mismatch`, `Config`, `Store` (open, get verified, has, put, flush, verify, place, completions), the `Remote` tier | store |
 | `blaze-codegen` | the unit of codegen: `Instance`, `InstanceKey`, `Settings`, `Backend`, `Arch`, `Unit`, `CompiledFunction` with `Reloc`, `RelocKind`, `Target`, `Data`, `CodegenError`, the `Compile` trait | codegen |
+| `hir-ty-ub` | the checker of undefined behavior over hir-ty-mir's evaluator: `Checker`, `Config`, `Outcome`, `run_test`. A front-end crate | safety |
 | `blaze-link` | the in-place linker: `Slot`, `Change`, `Staged`, `LinkError`, `Image` (stage, commit, roll back) | link |
 | `blaze-usercode` | user code: `RunKind`, `RunKey` (code and given, then traced inputs), `Reached` (a test's code hashes) | usercode |
 | `blaze-api` | the agent API: `SCHEMA` (5), `Envelope`, `ViewRef`, `Targets` (with `Cargo`), `Request` (commit, check, build, test, run, open, close, reach, best-of, verify, snapshot, why, diff, status, cancel, codegen inputs, trace, tables), `Response`, `Diagnostic` (with `FactRead` facts and rustc's `rendered` text), `Level`, `Span`, `Artifact`, `TestResult`, `TestOutcome`, `Reach`, `Ranked`, `Mismatch`, `Worked`, `Status`, `ApiError`, in `blaze-protocol`'s deterministic CBOR and frames; the daemon's side `build::{Builder, Work, JobId, Opened}`; `session`, `server`, `http`, `client` | ci |
@@ -68,14 +72,15 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | core | `crates/blaze-core/`, `crates/blaze-graph/`, `docs/v2/plan/lanes/core/plane.md` |
 | vfs | `crates/blaze-vfs/`, `crates/vfs/`, `crates/vfs-notify/` |
 | format | `crates/blaze-ids/`, `crates/blaze-format/`, `crates/syntax-tree/`, `crates/syntax/`, `crates/parser/`, `crates/span/`, `crates/intern/`, `crates/tt/`, `crates/mbe/`, `crates/syntax-bridge/`, `crates/const-ast/`; in `crates/hir-def/src/`: `expr_store.rs`, `expr_store/`, `hir.rs`, `hir/`, `item_tree.rs`, `item_tree/` |
-| db | `crates/blaze-query/`, `vendor/salsa/`, `vendor/rustc_type_ir/`, `vendor/rustc_next_trait_solver/`, `vendor/salsa-macros/`, `vendor/salsa-macro-rules/`, `crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/` but format's files, `crates/hir-ty/` but items' files, `crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/` |
+| db | `crates/blaze-query/`, `vendor/salsa/`, `vendor/rustc_type_ir/`, `vendor/rustc_next_trait_solver/`, `vendor/salsa-macros/`, `vendor/salsa-macro-rules/`, `crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/` but format's files, `crates/hir-ty/` but items' and codegen's files, `crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/` |
 | items | `crates/blaze-items/`; in `crates/hir-ty/src/`: `method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs`, `layout.rs`, `layout/`, `drop.rs` |
 | store | `crates/blaze-cas/`, `crates/blaze-store/`, `crates/blaze-cargo/src/remote/`, `crates/blaze-cargo/src/remote.rs` |
-| codegen | `crates/blaze-codegen/`, `crates/hir-ty-codegen/`, `crates/hir-ty-mir/`, `crates/blaze-engine/`, `vendor/llvm-sys/` |
+| codegen | `crates/blaze-codegen/`, `crates/hir-ty-codegen/`, `crates/hir-ty-mir/`, `crates/blaze-engine/`, `vendor/llvm-sys/`; in `crates/hir-ty/src/`: `mir.rs`, `mir/` (the MIR types, whose layout is codegen's, [data.md](../design/data.md)) |
 | link | `crates/blaze-link/`, `crates/blaze-splice/`, `crates/blaze-live/`, `crates/blaze-in-place/`, `vendor/cranelift-object/` |
 | usercode | `crates/blaze-usercode/`, `crates/blaze-build-script/`, `crates/blaze-expand/`, `crates/blaze-macro-wasm/`, `crates/blaze-wasi/`, `crates/proc-macro-api/`, `crates/proc-macro-srv/`, `crates/blaze-cargo/src/sandbox.rs`, `crates/blaze-cargo/src/sandbox/` |
 | ci | `crates/blaze-api/`, `crates/blaze-ci/`, `crates/blaze-protocol/`, `crates/blaze-ui/`, `crates/blaze-web/` |
 | proof | `crates/blaze-v2-proof/`, `harness/v2/` |
+| safety | `crates/hir-ty-ub/`, `crates/blaze-check/`, `fuzz/` |
 
 Every other path (the cargo crate `blaze-new`; `cfg`,
 `edition`, `paths`, `stdx`, `profile`, `toolchain`, `macros`, `rustc_abi`, `test-utils`,
@@ -106,7 +111,7 @@ coordinator's: a change there is a request.
 | `hir-def` | changed: SoA HIR and outlines (format); signature and body split, parallel expansion (db) | format, db |
 | `hir-expand`, `base-db`, `hir` | changed: queries keyed by input hashes with fingerprints, inputs per view | db |
 | `vendor/salsa*` | changed: remade into blaze's query database behind `blaze-query` | db |
-| `hir-ty` | changed: facts recorded where they are read (items); queries split and fingerprinted (db) | items, db |
+| `hir-ty` | changed: facts recorded where they are read (items); queries split and fingerprinted (db); the MIR types' columnar layout (codegen) | items, db, codegen |
 | `hir-ty-borrowck`, `hir-ty-wfcheck` | changed only as `hir-ty` moves | db |
 | `blaze-protocol` | left: `blaze-api` uses its CBOR and frames; its `events` stay for the build view | ci |
 | `blaze-ui`, `blaze-web` | changed: clients of `blaze-api` | ci |

@@ -18,7 +18,7 @@ import json, os, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import BLAZE
+from mixed import BLAZE
 
 
 def main():

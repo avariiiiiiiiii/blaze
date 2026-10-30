@@ -768,7 +768,7 @@ impl<'a> Stage<'a> {
             };
             fixups.push(Fixup { at: u64::from(reloc.at), apply, target, addend, minus: None });
         }
-        weak.sort_unstable();
+        radix::sort_copy_by_key(&mut weak, |it: &Sym| it.0);
         weak.dedup();
         Ok((fixups.leak(), weak.leak()))
     }
@@ -1280,7 +1280,7 @@ impl<'a> Stage<'a> {
                 }
             }
         }
-        wanted.sort_unstable_by_key(|it| it.0);
+        radix::sort_copy_by_key(&mut wanted, |it| it.0.0);
         wanted.dedup_by_key(|it| it.0);
         let class = self.new.class_id(&Class::RelRo);
         for (sym, anchor, index) in wanted {
@@ -1308,7 +1308,7 @@ impl<'a> Stage<'a> {
         let arena = self.arena;
         let mut touched = std::mem::replace(&mut self.touched, Vec::new_in(arena));
         let mut fresh = collect_in(self.fresh.iter(), arena);
-        fresh.sort_unstable();
+        radix::sort(&mut fresh);
         let mut targets = std::mem::replace(&mut self.counted, Vec::new_in(arena));
         for id in fresh.iter() {
             let piece = self.new.piece(*id).expect("a fresh piece");
@@ -1341,7 +1341,7 @@ impl<'a> Stage<'a> {
                     }
                 }
             }
-            touched.sort_unstable();
+            radix::sort(&mut touched);
             touched.dedup();
             for id in std::mem::replace(&mut touched, Vec::new_in(arena)) {
                 let live = self.new.piece(id).is_some_and(|it| matches!(it.what(), What::Shared));

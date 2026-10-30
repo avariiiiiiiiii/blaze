@@ -25,7 +25,7 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
     let socket = args.socket.clone().context("--check needs --socket")?;
     crate::events::said_beside(&socket);
     crate::events::at(crate::events::Step::LoadWorkspace, None);
-    crate::process_wide();
+    crate::process_wide()?;
     let read_from = SystemTime::now();
     let cargo_config = crate::cargo_config(&args);
     let projects = [args.project.as_path()];
@@ -83,7 +83,7 @@ pub(crate) fn once(project: &Path, krate: &str) -> anyhow::Result<Option<crate::
     let out = std::env::temp_dir().join("unwritten.o").to_string_lossy().into_owned();
     let args = [project, "--crate".to_owned(), krate.to_owned(), "--out".to_owned(), out];
     let args = Args::parse(args.into_iter())?;
-    crate::process_wide();
+    crate::process_wide()?;
     let read_from = SystemTime::now();
     let cargo_config = crate::cargo_config(&args);
     let projects = [args.project.as_path()];

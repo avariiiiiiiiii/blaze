@@ -32,10 +32,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use rustc_type_ir::{
     AliasTyKind,
-    inherent::{GenericArgs as _, IntoKind, Region as _, SliceLike, Ty as _},
+    inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _},
 };
 use stdx::never;
 use triomphe::Arc;
+use blaze_hashcons::Interned;
 
 use crate::{
     CallableDefId, ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
@@ -45,11 +46,12 @@ use crate::{
     drop::{DropGlue, has_drop_glue, is_freeze},
     infer::PointerCast,
     intrinsic::Intrinsic,
-    layout::{Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
+    layout::{InternedLayout, Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
-        AliasTy, Allocation, AllocationData, Const, ConstKind, DbInterner, ErrorGuaranteed,
-        GenericArgs, Region, Ty, TyKind, TypingMode, UnevaluatedConst, ValTree,
+        AliasConstKind, AliasTy, Allocation, AllocationData, AnonConstIdWrapper, Const, ConstKind,
+        DbInterner, ErrorGuaranteed, FreeConstAliasId, GenericArgs, InherentAssocConstId, Region,
+        TraitAssocConstId, Ty, TyKind, TypingMode, ValTree,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
     },
@@ -205,7 +207,12 @@ type Running<'db> = (Option<FunctionId>, (MirSpan, InferBodyId<'db>));
 enum Ran<'db> {
     /// It called this frame, which runs next.
     Called(StackFrame<'db>),
+    /// It tail-called this frame (`become`), which runs next in its place: it is gone, its
+    /// stack freed and the machine told it returned.
+    TailCalled(StackFrame<'db>),
     Returned,
+    /// It tail-called what ran at once (a shim), and so returned, the machine already told.
+    TailReturned,
     /// Its cleanup ended in `UnwindResume`: the panic unwinds out of it.
     Resume,
     /// Its thread gives way: to this one, or (`None`) to the one the machine picks, as the
@@ -301,7 +308,7 @@ fn size_class(size: usize) -> usize {
 /// The layout of one variant of an ADT ([`Evaluator::layout_of_variant`]): the type's own,
 /// or one made for a variant of an enum with several.
 enum VariantLayout {
-    Shared(Arc<Layout>),
+    Shared(Interned<'static, InternedLayout>),
     Made(Layout),
 }
 
@@ -310,7 +317,7 @@ impl std::ops::Deref for VariantLayout {
 
     fn deref(&self) -> &Layout {
         match self {
-            VariantLayout::Shared(it) => it,
+            VariantLayout::Shared(it) => &it.0,
             VariantLayout::Made(it) => it,
         }
     }
@@ -423,7 +430,7 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     random_state: oorandom::Rand64,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    layout_cache: RefCell<FxHashMap<Ty<'db>, Arc<Layout>>>,
+    layout_cache: RefCell<FxHashMap<Ty<'db>, Interned<'static, InternedLayout>>>,
     projected_ty_cache: RefCell<FxHashMap<(PlaceTy<'db>, PlaceElem), PlaceTy<'db>>>,
     not_special_fn_cache: RefCell<FxHashSet<FunctionId>>,
     mir_or_dyn_index_cache: RefCell<FxHashMap<(FunctionId, GenericArgs<'db>), MirOrDynIndex<'db>>>,
@@ -1157,21 +1164,19 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
     }
 
-    fn layout(&self, ty: Ty<'db>) -> Result<'db, Arc<Layout>> {
+    fn layout(&self, ty: Ty<'db>) -> Result<'db, Interned<'static, InternedLayout>> {
         if let Some(x) = self.layout_cache.borrow().get(&ty) {
-            // clone: an `Arc`
-            return Ok(x.clone());
+            return Ok(*x);
         }
         let r = self
             .db
             .layout_of_ty(ty.store(), self.param_env.store())
             .map_err(|e| MirEvalError::LayoutError(e, ty.store()))?;
-        // clone: an `Arc`
-        self.layout_cache.borrow_mut().insert(ty, r.clone());
+        self.layout_cache.borrow_mut().insert(ty, r);
         Ok(r)
     }
 
-    fn layout_adt(&self, adt: AdtId, subst: GenericArgs<'db>) -> Result<'db, Arc<Layout>> {
+    fn layout_adt(&self, adt: AdtId, subst: GenericArgs<'db>) -> Result<'db, Interned<'static, InternedLayout>> {
         self.layout(Ty::new_adt(self.interner(), adt, subst))
     }
 
@@ -1296,7 +1301,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     self.code_stack.push(frame);
                     block = self.switch_thread(next, block)?;
                 }
+                // Takes no frame of the depth limit: the callee is in the caller's place.
+                Ok(Ran::TailCalled(callee)) => {
+                    block = callee.locals.body.start_block;
+                    let StackFrame { locals, .. } = frame;
+                    let owner = locals.body.owner;
+                    self.unused_locals_store.borrow_mut().entry(owner).or_default().push(locals);
+                    self.code_stack.push(callee);
+                }
                 Ok(Ran::Returned) => {
+                    self.machine.ret()?;
+                    if let Some(result) = self.returned(frame, &mut block)? {
+                        return Ok(result);
+                    }
+                }
+                Ok(Ran::TailReturned) => {
                     if let Some(result) = self.returned(frame, &mut block)? {
                         return Ok(result);
                     }
@@ -1416,6 +1435,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             TerminatorKind::UnwindResume => return Ok(Some(Ran::Resume)),
             TerminatorKind::Abort => return Err(unwind::abort(self.unwind_reason(locals.body))),
+            TerminatorKind::TailCall { func, args, fn_span: _ } => {
+                return self.exec_tail_call(func, args, terminator.span, frame).map(Some);
+            }
             _ => not_supported!("unknown terminator"),
         }
         Ok(None)
@@ -1475,7 +1497,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         def,
                         intrinsic,
                         &args_evaluated,
-                        generic_args,
+                        generic_args.skip_binder(),
                         locals,
                         destination_interval,
                         then,
@@ -1484,7 +1506,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
                 (TyKind::FnDef(def, generic_args), None) => self.exec_fn_def(
                     def.0,
-                    generic_args,
+                    generic_args.skip_binder(),
                     destination_interval,
                     &args_evaluated,
                     locals,
@@ -1523,14 +1545,121 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         ran
     }
 
-    /// `frame` returned; `block` is set to where its caller goes on. The result of the run
-    /// when `frame` is the bottom one of [`Self::interpret_mir`].
+    /// A `TailCall` terminator (`become`), rustc's `InterpCx::init_fn_tail_call`: the callee
+    /// and its arguments are read in `frame`, which is then popped (its drops came before the
+    /// terminator), and what it calls runs in its place, into its return place and on at its
+    /// `then`. The arguments go through a block of the evaluator's own, as `frame`'s stack,
+    /// where they were, is where the callee's frame is made. A chain of tail calls so runs in
+    /// constant stack, frames and depth.
+    fn exec_tail_call(
+        &mut self,
+        func: &'db Operand,
+        args: &'db [Operand],
+        span: MirSpan,
+        frame: &mut StackFrame<'db>,
+    ) -> Result<'db, Ran<'db>> {
+        let locals = &mut frame.locals;
+        let destination = locals.ptr[return_slot()];
+        let fn_ty = self.operand_ty(func, locals)?;
+        // A function pointer callee is the block's first word, each argument after it at its
+        // alignment.
+        let callee_bytes = match fn_ty.kind() {
+            TyKind::FnPtr(..) => Some(self.eval_operand(func, locals)?),
+            _ => None,
+        };
+        let (mut size, mut align) = match callee_bytes {
+            Some(bytes) => (bytes.size, self.ptr_size()),
+            None => (0, 1),
+        };
+        let mut callee_args: SmallVec<[IntervalAndTy<'db>; 4]> = SmallVec::new();
+        let mut offsets: SmallVec<[usize; 4]> = SmallVec::new();
+        for it in args.iter() {
+            let arg = self.operand_ty_and_eval(it, locals)?;
+            let arg_align = self.layout(arg.ty)?.align.abi.bytes() as usize;
+            let at = size.next_multiple_of(arg_align);
+            size = at + arg.interval.size;
+            align = align.max(arg_align);
+            callee_args.push(arg);
+            offsets.push(at);
+        }
+        let block = self.allocate(size, align, Origin::Machine, false)?;
+        let callee_bytes = match callee_bytes {
+            Some(bytes) => {
+                self.copy_from_interval(block, bytes)?;
+                Some(Interval::new(block, bytes.size))
+            }
+            None => None,
+        };
+        for (arg, &at) in callee_args.iter_mut().zip(&offsets) {
+            let to = block.offset(at);
+            self.copy_from_interval(to, arg.interval)?;
+            arg.interval = Interval::new(to, arg.interval.size);
+        }
+
+        // The caller's frame is gone: its stack is freed but for its return place, when that
+        // is in it (the bottom frame of `interpret_mir`'s), which the callee returns into.
+        self.machine.ret()?;
+        let mut keep = frame.prev_stack_ptr;
+        if destination.size != 0
+            && destination.addr.space == Space::Stack
+            && let Some(at) = destination.addr.offset.checked_sub(self.stack_base())
+            && at >= frame.prev_stack_ptr
+        {
+            keep = at + destination.size;
+        }
+        self.truncate_stack(keep)?;
+
+        // `Then::Diverges` only stands in for the caller's `then` while the callee's frame is
+        // made: with `Then::Nested` (the caller is a bottom frame) the call would run nested,
+        // and a chain of tail calls would grow the evaluator's own stack.
+        let stand_in = Then::Diverges;
+        self.moved_args.clear();
+        self.call_then = stand_in;
+        let called = match (fn_ty.kind(), callee_bytes) {
+            (TyKind::FnPtr(..), Some(bytes)) => {
+                let locals = &frame.locals;
+                self.exec_fn_pointer(bytes, destination, &callee_args, locals, stand_in, span)
+            }
+            (TyKind::FnDef(def, generic_args), _) => self.exec_fn_def(
+                def.0,
+                generic_args.skip_binder(),
+                destination,
+                &callee_args,
+                &frame.locals,
+                stand_in,
+                span,
+            ),
+            // alloc: error path
+            (it, _) => Err(MirEvalError::NotSupported(format!("tail call of a {it:?}"))),
+        };
+        self.call_then = Then::Nested;
+        let called = called.map(|it| it.or_else(|| self.pending.take()));
+        if size != 0 {
+            self.deallocate(block, Origin::Machine, "become")?;
+        }
+        let Some(mut callee) = called? else {
+            if self.waiting.is_some() {
+                not_supported!("a tail call of a function that blocks its thread");
+            }
+            return Ok(Ran::TailReturned);
+        };
+        if !callee.drops.is_empty() || callee.catch.is_some() {
+            not_supported!("a tail call of a drop or of `catch_unwind`");
+        }
+        callee.then = frame.then;
+        callee.prev_stack_ptr = frame.prev_stack_ptr;
+        callee.drops = mem::take(&mut frame.drops);
+        callee.catch = frame.catch.take();
+        Ok(Ran::TailCalled(callee))
+    }
+
+    /// `frame` returned, the machine told; `block` is set to where its caller goes on. The
+    /// result of the run when `frame` is the bottom one of [`Self::interpret_mir`].
     fn returned(
         &mut self,
         frame: StackFrame<'db>,
         block: &mut BasicBlockId,
     ) -> Result<'db, Option<Interval>> {
-        self.machine.ret()?;
         let return_interval = frame.locals.ptr[return_slot()];
         let returned_ty = frame.locals.body.locals[return_slot()].ty.as_ref();
         let StackFrame { locals, then, drops, prev_stack_ptr, .. } = frame;
@@ -3219,48 +3348,41 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, Interval> {
         match konst.kind() {
             ConstKind::Value(value) => self.allocate_valtree_in_heap(value.ty, value.value, locals),
-            ConstKind::Unevaluated(UnevaluatedConst { def: const_id, args: subst }) => {
-                let mut id = const_id.0;
-                let mut subst = subst;
-                if let GeneralConstId::ConstId(c) = id {
-                    let (c, s) = lookup_impl_const(&self.infcx, self.param_env.param_env, c, subst);
-                    id = GeneralConstId::ConstId(c);
-                    subst = s;
-                }
-                if let GeneralConstId::AnonConstId(konst) = id
-                    && konst.is_inline_const(self.db)
-                {
-                    return self.inline_const_in_heap(konst, subst, locals);
-                }
-                let allocation = match id {
-                    GeneralConstId::ConstId(const_id) => {
+            ConstKind::Alias(_, alias) => {
+                let subst = alias.args;
+                let allocation = match alias.kind {
+                    AliasConstKind::Projection { def_id: TraitAssocConstId(const_id) }
+                    | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(const_id) }
+                    | AliasConstKind::Free { def_id: FreeConstAliasId(const_id) } => {
+                        let (const_id, subst) = lookup_impl_const(
+                            &self.infcx,
+                            self.param_env.param_env,
+                            const_id,
+                            subst,
+                        );
                         self.db.const_eval(const_id, subst, Some(self.param_env)).map_err(|e| {
-                            let name = id.name(self.db);
+                            let name = GeneralConstId::ConstId(const_id).name(self.db);
                             // alloc: error path
                             MirEvalError::ConstEvalError(name, Box::new(e))
                         })?
                     }
-                    GeneralConstId::StaticId(static_id) => {
-                        self.db.const_eval_static(static_id).map_err(|e| {
-                            let name = id.name(self.db);
-                            // alloc: error path
-                            MirEvalError::ConstEvalError(name, Box::new(e))
-                        })?
+                    AliasConstKind::Anon { def_id: AnonConstIdWrapper(konst) } => {
+                        if konst.is_inline_const(self.db) {
+                            return self.inline_const_in_heap(konst, subst, locals);
+                        }
+                        self.db.anon_const_eval(konst, subst, Some(self.param_env)).map_err(
+                            |e| {
+                                let name = GeneralConstId::AnonConstId(konst).name(self.db);
+                                // alloc: error path
+                                MirEvalError::ConstEvalError(name, Box::new(e))
+                            },
+                        )?
                     }
-                    GeneralConstId::AnonConstId(anon_const_id) => self
-                        .db
-                        .anon_const_eval(anon_const_id, subst, Some(self.param_env))
-                        .map_err(|e| {
-                            let name = id.name(self.db);
-                            // alloc: error path
-                            MirEvalError::ConstEvalError(name, Box::new(e))
-                        })?,
+                    AliasConstKind::InherentSelf { .. } => {
+                        not_supported!("the inherent constant {alias:?} in Self form after type check")
+                    }
                 };
-                let mutability = match id {
-                    GeneralConstId::StaticId(static_id) => self.static_nested_mutability(static_id),
-                    GeneralConstId::ConstId(_) | GeneralConstId::AnonConstId(_) => Mutability::Not,
-                };
-                self.allocate_allocation_in_heap(locals, allocation, mutability)
+                self.allocate_allocation_in_heap(locals, allocation, Mutability::Not)
             }
             _ => not_supported!("evaluating unknown const"),
         }
@@ -3272,10 +3394,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn shares_one_copy(&self, konst: Const<'db>) -> bool {
         match konst.kind() {
             ConstKind::Value(_) => true,
-            ConstKind::Unevaluated(UnevaluatedConst { def, .. }) => match def.0 {
-                GeneralConstId::ConstId(_) | GeneralConstId::AnonConstId(_) => true,
-                GeneralConstId::StaticId(_) => false,
-            },
+            ConstKind::Alias(..) => true,
             _ => false,
         }
     }
@@ -4361,7 +4480,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         }
                     }
                 },
-                TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => {
+                TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => {
                     let mut ocx = ObligationCtxt::new(&this.infcx);
                     let ty = ocx
                         .structurally_normalize_ty(
@@ -4666,13 +4785,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             | TyKind::UnsafeBinder(_)
             | TyKind::CoroutineClosure(_, _) => (),
             TyKind::Alias(..) => {
-                let normalized = ObligationCtxt::new(&self.infcx)
-                    .structurally_normalize_ty(
-                        &ObligationCause::dummy(),
-                        self.param_env.param_env,
-                        ty,
-                    )
-                    .unwrap_or(ty);
+                let normalized =
+                    super::normalize_or_keep(&self.infcx, self.param_env.param_env, ty);
                 if !matches!(normalized.kind(), TyKind::Alias(..)) {
                     self.patch_addresses(patch_map, source, ty_of_bytes, addr, normalized, locals)?;
                 }
@@ -4695,7 +4809,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         use rustc_type_ir::TyKind;
         match next_ty.kind() {
             TyKind::FnDef(def, generic_args) => {
-                self.exec_fn_def(def.0, generic_args, destination, args, locals, then, span)
+                self.exec_fn_def(def.0, generic_args.skip_binder(), destination, args, locals, then, span)
             }
             TyKind::Closure(id, generic_args) => self.exec_closure(
                 id.0,
@@ -5059,7 +5173,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         match func_ty.kind() {
             TyKind::FnDef(def, subst) => {
-                self.exec_fn_def(def.0, subst, destination, &args[1..], locals, then, span)
+                self.exec_fn_def(def.0, subst.skip_binder(), destination, &args[1..], locals, then, span)
             }
             TyKind::FnPtr(..) => {
                 self.exec_fn_pointer(func_data, destination, &args[1..], locals, then, span)

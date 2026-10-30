@@ -120,7 +120,7 @@ fn expr<'t>(
     delim_span: DelimSpan,
 ) -> Result<Arg<'t>, ExpandError> {
     let at = iter.next_span().unwrap_or(delim_span.close);
-    let ExpandResult { value, err } =
+    let mbe::ValueResult { value, err } =
         expect_fragment(db, iter, parser::PrefixEntryPoint::Expr, delim_span);
     if let Some(err) = err {
         return Err(err.into());

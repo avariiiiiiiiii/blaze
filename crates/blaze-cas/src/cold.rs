@@ -3,10 +3,17 @@
 //! which a dictionary trained on them takes out of each. Long cold values instead get zstd's
 //! long-distance matching over a wide window, on several threads. Chunks of hot outputs: LZ4,
 //! which decompresses at memory speed.
+//!
+//! A value put or read is compressed or decompressed in its thread's zstd contexts, made once:
+//! a new context allocates and clears its tables at its first frame, which costs more than a
+//! small value's compression.
+
+use std::cell::RefCell;
 
 use zstd::{
     dict::{DecoderDictionary, EncoderDictionary},
     stream::raw::{CParameter, DParameter},
+    zstd_safe::{self, CCtx, DCtx, ResetDirective},
 };
 
 /// One level for every cold value: compression is deterministic for a level and a dictionary.
@@ -85,8 +92,54 @@ impl Prepared {
     }
 }
 
+/// A thread's zstd contexts.
+struct Contexts {
+    /// Between values it is as new: no dictionary, every parameter its default.
+    compress: CCtx<'static>,
+    /// Reads at most a [`WINDOW_LOG`] window; never given a dictionary to keep.
+    decompress: DCtx<'static>,
+}
+
+thread_local! {
+    static CONTEXTS: RefCell<Option<Contexts>> = const { RefCell::new(None) };
+}
+
+fn failed(what: &str, code: usize) -> String {
+    // alloc: the error's message
+    format!("{what}: {}", zstd_safe::get_error_name(code))
+}
+
+/// `f` with the thread's contexts, made at its first call.
+fn with_contexts<R>(f: impl FnOnce(&mut Contexts) -> Result<R, String>) -> Result<R, String> {
+    CONTEXTS.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.is_none() {
+            let compress = CCtx::try_create().ok_or("starting zstd failed: it made no context")?;
+            let mut decompress = DCtx::try_create().ok_or("starting zstd failed: it made no context")?;
+            decompress
+                .set_parameter(DParameter::WindowLogMax(WINDOW_LOG))
+                .map_err(|code| failed("starting zstd failed", code))?;
+            *cell = Some(Contexts { compress, decompress });
+        }
+        f(cell.as_mut().expect("made above"))
+    })
+}
+
+/// `raw` in zstd with `dictionary`: the bytes a fresh context makes ([`Batch::compress`]).
 pub(crate) fn compress(dictionary: &Prepared, raw: &[u8]) -> Result<Vec<u8>, String> {
-    Batch::new(Some(dictionary))?.compress(raw)
+    with_contexts(|contexts| {
+        let context = &mut contexts.compress;
+        // alloc: the compressed value, which the record keeps
+        let mut out = Vec::with_capacity(zstd_safe::compress_bound(raw.len()));
+        let done = context.ref_cdict(dictionary.encoder.as_cdict()).and_then(|_| context.compress2(&mut out, raw));
+        // The context outlives `dictionary`: it must not keep pointing at it, and the next value
+        // must start from a context as new.
+        let reset = context.reset(ResetDirective::SessionAndParameters);
+        // alloc: the error's message
+        done.map_err(|code| failed(&format!("compressing {} bytes failed", raw.len()), code))?;
+        reset.map_err(|code| failed("resetting zstd failed", code))?;
+        Ok(out)
+    })
 }
 
 /// One compressor for a batch of values of one kind. Without a dictionary its frames are read
@@ -152,24 +205,26 @@ fn zstd_length(stored: &[u8], raw: u64) -> Result<usize, String> {
 /// Exactly `raw` bytes, or why not.
 pub(crate) fn decompress(dictionary: &Prepared, stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
     let raw = zstd_length(stored, raw)?;
-    let bytes = zstd::bulk::Decompressor::with_prepared_dictionary(&dictionary.decoder)
-        .and_then(|mut decompressor| decompressor.decompress(stored, raw))
-        // alloc: the error's message
-        .map_err(|error| format!("it does not decompress: {error}"))?;
-    whole(bytes, raw)
+    with_contexts(|contexts| {
+        // alloc: the value made whole, kept in `Owned` and read in place after
+        let mut bytes = Vec::with_capacity(raw);
+        contexts
+            .decompress
+            .decompress_using_ddict(&mut bytes, stored, dictionary.decoder.as_ddict())
+            .map_err(|code| failed("it does not decompress", code))?;
+        whole(bytes, raw)
+    })
 }
 
 /// What [`compress_long`] made: exactly `raw` bytes, or why not.
 pub(crate) fn decompress_long(stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
     let raw = zstd_length(stored, raw)?;
-    let bytes = zstd::bulk::Decompressor::new()
-        .and_then(|mut decompressor| {
-            decompressor.set_parameter(DParameter::WindowLogMax(WINDOW_LOG))?;
-            decompressor.decompress(stored, raw)
-        })
-        // alloc: the error's message
-        .map_err(|error| format!("it does not decompress: {error}"))?;
-    whole(bytes, raw)
+    with_contexts(|contexts| {
+        // alloc: the value made whole, kept in `Owned` and read in place after
+        let mut bytes = Vec::with_capacity(raw);
+        contexts.decompress.decompress(&mut bytes, stored).map_err(|code| failed("it does not decompress", code))?;
+        whole(bytes, raw)
+    })
 }
 
 fn whole(bytes: Vec<u8>, raw: usize) -> Result<Vec<u8>, String> {
@@ -308,6 +363,71 @@ mod tests {
         let value = sample(8);
         let stored = plain.compress(&value).unwrap();
         assert_eq!(decompress_long(&stored, value.len() as u64).unwrap(), value);
+    }
+
+    /// The reference for the thread's contexts: a context made for the one value and dropped.
+    fn compress_fresh(dictionary: &Prepared, raw: &[u8]) -> Vec<u8> {
+        zstd::bulk::Compressor::with_prepared_dictionary(&dictionary.encoder).unwrap().compress(raw).unwrap()
+    }
+
+    fn decompress_fresh(dictionary: &Prepared, stored: &[u8], raw: usize) -> Vec<u8> {
+        zstd::bulk::Decompressor::with_prepared_dictionary(&dictionary.decoder).unwrap().decompress(stored, raw).unwrap()
+    }
+
+    fn two_dictionaries() -> (Prepared, Prepared) {
+        let first: Vec<Vec<u8>> = (0..200).map(sample).collect();
+        let second: Vec<Vec<u8>> = (0..200).map(|n| sample(n * 31 + 7).repeat(2)).collect();
+        let train_on = |samples: &[Vec<u8>]| {
+            let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
+            Prepared::new(train(&refs).unwrap())
+        };
+        (train_on(&first), train_on(&second))
+    }
+
+    /// A thread's contexts carry nothing from one value to the next: values of two dictionaries
+    /// and long frames, interleaved on one thread, give the bytes a fresh context gives each.
+    #[test]
+    fn reused_contexts_make_and_read_the_bytes_fresh_ones_do() {
+        let (first, second) = two_dictionaries();
+        let long = long_value();
+        let mut rng = blaze_ids::rng::SplitMix64::new(9);
+        for step in 0..60u64 {
+            let value = sample(rng.next_u64() as usize % 5000).repeat(1 + step as usize % 3);
+            let dictionary = if rng.next_u64() % 2 == 0 { &first } else { &second };
+            let stored = compress(dictionary, &value).unwrap();
+            assert_eq!(stored, compress_fresh(dictionary, &value), "step {step}");
+            assert_eq!(decompress(dictionary, &stored, value.len() as u64).unwrap(), value);
+            assert_eq!(decompress_fresh(dictionary, &stored, value.len()), value);
+            if step % 20 == 0 {
+                let stored = compress_long(&long).unwrap();
+                assert_eq!(decompress_long(&stored, long.len() as u64).unwrap(), long);
+            }
+            let other = if std::ptr::eq(dictionary, &first) { &second } else { &first };
+            assert!(decompress(other, &stored, value.len() as u64).is_err(), "step {step}: the wrong dictionary");
+        }
+    }
+
+    /// Each thread's contexts make the same bytes as every other's.
+    #[test]
+    #[cfg(not(blaze_check))]
+    fn every_threads_contexts_make_the_same_bytes() {
+        let (first, second) = two_dictionaries();
+        let values: Vec<Vec<u8>> = (0..40).map(|n| sample(n * 101).repeat(1 + n % 4)).collect();
+        let want: Vec<Vec<u8>> =
+            values.iter().enumerate().map(|(n, value)| compress_fresh([&first, &second][n % 2], value)).collect();
+        std::thread::scope(|scope| {
+            for t in 0..4 {
+                let (first, second, values, want) = (&first, &second, &values, &want);
+                scope.spawn(move || {
+                    for (n, value) in values.iter().enumerate().cycle().skip(t * 7).take(values.len() * 2) {
+                        let dictionary = [first, second][n % 2];
+                        let stored = compress(dictionary, value).unwrap();
+                        assert_eq!(stored, want[n], "thread {t}, value {n}");
+                        assert_eq!(&decompress(dictionary, &stored, value.len() as u64).unwrap(), value);
+                    }
+                });
+            }
+        });
     }
 
     #[test]

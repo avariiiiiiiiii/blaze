@@ -32,8 +32,8 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    runs outside by default. See
    [docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox](docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox).
 7. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
-   rustc's rule properly, and spend the effort on proving it right (differential tests against
-   rustc, fuzzing, real crates). See
+   rustc's rule properly, and spend the effort on proving it right: real crates' own test suites
+   passing under blaze, and fuzzing of blaze's own invariants. See
    [docs/contributing.md#rules-for-code](docs/contributing.md#rules-for-code).
 8. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
    eval, layout, code-identity hashes) go in the front end's salsa crates in `crates/` (`hir-ty`,
@@ -73,18 +73,18 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
 
 ## Code Review Rules
 
-These guide Codex code review on pull requests. They add to the rustc comparison harnesses and a
-maintainer's approval; they replace neither.
+These guide Codex code review on pull requests. They add to the harnesses and a maintainer's
+approval; they replace neither.
 
 ### Compiler correctness
 
 - Flag any change that can make a program built by blaze behave differently from the same program
   built by the pinned nightly rustc (`harness/toolchain`): layout, ABI, drop order, overflow and
   panic behavior, const eval, trait and method resolution, MIR passes, borrow checking, linking.
-  Safe path: port rustc's rule and add a differential test against rustc. The one allowed difference
-  is sandboxing build scripts and proc macros. Code that opts into a blaze extension is exempt: it
-  need not build under rustc, but enabling the extension must not change any program that doesn't
-  use it.
+  Safe path: port rustc's rule and add a test (a crate whose own tests exercise it, or a unit test).
+  The one allowed difference is sandboxing build scripts and proc macros. Code that opts into a
+  blaze extension is exempt: it need not build under rustc, but enabling the extension must not
+  change any program that doesn't use it.
 - Flag a fallback: a path that, when blaze can't do something, quietly takes another route (rustc or
   cargo, rustc's copy of a function or static, a whole rebuild in place of a refused patch, a slower
   backend, an older cached result). Safe path: stop with an error that names what and where.

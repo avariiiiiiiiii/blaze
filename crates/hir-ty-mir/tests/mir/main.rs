@@ -12,12 +12,15 @@ mod foreign;
 #[path = "../../src/mir/optimize/inline/fixtures.rs"]
 mod inline;
 mod machine;
+mod normalize;
+mod operands;
 mod references;
 mod scalar_names;
 mod source_maps;
 mod source_names;
 mod stages;
 mod storage;
+mod tail_call;
 mod threads;
 mod ub_checks;
 mod uninhabited;

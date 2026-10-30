@@ -166,7 +166,7 @@ pub struct Stored {
 }
 
 /// The name of `krate` in an error.
-pub(crate) fn crate_name(db: &Db, krate: Crate) -> String {
+pub fn crate_name(db: &Db, krate: Crate) -> String {
     match &krate.extra_data(db).display_name {
         // alloc: error text
         Some(name) => name.to_string(),

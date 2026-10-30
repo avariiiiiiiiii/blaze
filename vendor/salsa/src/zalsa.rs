@@ -165,6 +165,9 @@ pub struct Zalsa {
     /// Indices of ingredients that require reset when a new revision starts.
     ingredients_requiring_reset: Vec<IngredientIndex>,
 
+    /// Whether no function's values are evicted at a new revision ([`Zalsa::keep_every_value`]).
+    keep_values: bool,
+
     /// The runtime: revisions, the table of salsa structs and the graph of blocked tasks.
     runtime: Runtime,
 
@@ -196,6 +199,7 @@ impl Zalsa {
             ingredients_vec: Vec::new(),
             // alloc: setup: the ingredient list, filled when jars register
             ingredients_requiring_reset: Vec::new(),
+            keep_values: false,
             runtime: Runtime::default(),
             graph: Graph::default(),
             memo_ingredient_indices: Default::default(),
@@ -264,6 +268,22 @@ impl Zalsa {
     pub(crate) fn memo_table_for<T: SalsaStructInDb>(&self, id: Id) -> MemoTableWithTypes<'_> {
         // SAFETY: We are supplying the correct current revision.
         unsafe { T::memo_table(self, id, self.current_revision()) }
+    }
+
+    /// [`Zalsa::memo_table_for`] through the task's page cache, for the memo hit path: the page
+    /// is read on the task's first lookup in it only. The memo's type is still checked by its
+    /// column ([`MemoTableWithTypes::get`]).
+    #[inline]
+    pub(crate) fn memo_table_cached(
+        &self,
+        zalsa_local: &ZalsaLocal,
+        id: Id,
+    ) -> MemoTableWithTypes<'_> {
+        // SAFETY: We are supplying the correct current revision.
+        unsafe {
+            self.table()
+                .memos_cached(zalsa_local.page_cache(), id, self.current_revision())
+        }
     }
 
     /// Returns the ingredient at the given index, or panics if it is out-of-bounds.
@@ -477,10 +497,7 @@ impl Zalsa {
         #[cfg(feature = "detailed-trace")]
         let _span = crate::tracing::debug_span!("new_revision", ?new_revision).entered();
 
-        for ingredient in &self.ingredients_requiring_reset {
-            self.ingredients_vec[ingredient.as_u32() as usize]
-                .reset_for_new_revision(self.runtime.table_mut());
-        }
+        self.reset_ingredients();
         self.reclaim_memos();
         self.graph.release_outgrown_nodes();
         self.compact_edges_if_worth_it();
@@ -500,7 +517,9 @@ impl Zalsa {
 
     /// Copies the live edge ranges into a new array once dead ones (of replaced or dropped memos)
     /// outweigh them: O(live edges), at most once per doubling of the array. Runs after every
-    /// ingredient's reset, so no memo waiting to be freed still holds a range.
+    /// ingredient's reset, so no memo waiting to be freed still holds a range. In the same pass
+    /// the nodes are renumbered in the order deep verify walks them (`graph::order`), so a walk
+    /// reads the color column mostly in sequence (docs/v2/plan/lanes/db/graph.md, section 2).
     fn compact_edges_if_worth_it(&mut self) {
         if !self.graph.wants_compaction() {
             return;
@@ -512,11 +531,64 @@ impl Zalsa {
             ..
         } = self;
         let table = runtime.table_mut();
-        graph.compact(|relocation| {
-            for ingredient in ingredients_vec.iter_mut() {
+        fn relocate_all(
+            // dyn: once per ingredient per compaction
+            ingredients: &mut [Box<dyn Ingredient>],
+            table: &mut Table,
+            relocation: &mut crate::graph::Relocation<'_>,
+        ) {
+            for ingredient in ingredients {
                 ingredient.relocate_edges(table, relocation);
             }
+        }
+        if !graph.walk_order() {
+            graph.compact(|relocation| relocate_all(ingredients_vec, table, relocation));
+            return;
+        }
+        let renumbering = {
+            let mut live = graph.live_edges();
+            for ingredient in ingredients_vec.iter() {
+                ingredient.memo_edges(table, &mut live);
+            }
+            live.walk_order()
+        };
+        graph.compact_renumbered(&renumbering, |relocation| {
+            relocate_all(ingredients_vec, table, relocation)
         });
+    }
+
+    /// **NOT SEMVER STABLE**: turns the walk-order renumbering at compaction off or back on, for
+    /// benches and tests comparing the two.
+    #[doc(hidden)]
+    pub fn set_walk_order(&mut self, on: bool) {
+        self.graph.set_walk_order(on);
+    }
+
+    /// **NOT SEMVER STABLE**: makes every new revision compact the graph (and renumber it, with
+    /// the walk order on), however few of its edges are dead; for tests and benches.
+    #[doc(hidden)]
+    pub fn compact_every_revision(&mut self, on: bool) {
+        self.graph.set_compact_always(on);
+    }
+
+    /// **NOT SEMVER STABLE**: the live graph as the image's graph section
+    /// (`graph::frozen::write`), nodes in walk order: every live memo's node and edge words,
+    /// gathered by the same [`Ingredient::memo_edges`] a compaction uses.
+    #[doc(hidden)]
+    pub fn freeze_graph(&mut self) -> Result<Vec<u8>, crate::graph::frozen::FrozenError> {
+        let Zalsa {
+            graph,
+            ingredients_vec,
+            runtime,
+            ..
+        } = self;
+        let table = runtime.table_mut();
+        let mut live = graph.live_edges();
+        for ingredient in ingredients_vec.iter() {
+            ingredient.memo_edges(table, &mut live);
+        }
+        let renumbering = live.walk_order();
+        crate::graph::frozen::write(&live.by_node(), Some(renumbering.new_of_old()))
     }
 
     /// **NOT SEMVER STABLE**
@@ -524,9 +596,44 @@ impl Zalsa {
     pub fn evict_lru(&mut self) {
         #[cfg(feature = "detailed-trace")]
         let _span = crate::tracing::debug_span!("evict_lru").entered();
+        self.reset_ingredients();
+    }
+
+    /// Keeps every value across revisions when `keep`: no function's is evicted by its `lru`,
+    /// and no interned value's slot is reused for another however long it goes unread. For a
+    /// test that counts what an edit executes again: an eviction or a reuse executes again a
+    /// value none of whose inputs changed. A build never sets it.
+    pub fn keep_every_value(&mut self, keep: bool) {
+        self.keep_values = keep;
+    }
+
+    /// **NOT SEMVER STABLE**: turns the input-closure filters (`graph::bloom`) off, so every
+    /// memo is walked as without them, or back on; for tests and benches comparing the two.
+    #[doc(hidden)]
+    pub fn set_closure_filters(&mut self, on: bool) {
+        self.runtime.changes_mut().set_enabled(on);
+    }
+
+    /// Pushes the salsa `Id`s the value at `id` names: the fields of an interned struct or of
+    /// a tracked function's interned arguments that are salsa structs or supertypes, none for
+    /// any other. With [`Zalsa::keep_every_value`] on, so that no slot was reused.
+    pub fn ids_of(&self, id: Id, out: &mut Vec<Id>) {
+        self.lookup_ingredient(self.ingredient_index(id)).ids_of(self, id, out);
+    }
+
+    /// Whether [`Zalsa::keep_every_value`] is on.
+    #[inline]
+    pub(crate) fn keeps_every_value(&self) -> bool {
+        self.keep_values
+    }
+
+    fn reset_ingredients(&mut self) {
         for ingredient in &self.ingredients_requiring_reset {
-            self.ingredients_vec[ingredient.as_u32() as usize]
-                .reset_for_new_revision(self.runtime.table_mut());
+            let ingredient = &mut self.ingredients_vec[ingredient.as_u32() as usize];
+            if self.keep_values && ingredient.as_function().is_some() {
+                continue;
+            }
+            ingredient.reset_for_new_revision(self.runtime.table_mut());
         }
     }
 

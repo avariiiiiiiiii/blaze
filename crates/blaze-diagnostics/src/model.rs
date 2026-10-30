@@ -283,25 +283,8 @@ pub struct Child {
     pub once: bool,
 }
 
-/// How sure a suggestion is: rustc's `Applicability`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Applicability {
-    MachineApplicable,
-    MaybeIncorrect,
-    HasPlaceholders,
-    Unspecified,
-}
-
-impl Applicability {
-    pub fn name(self) -> &'static str {
-        match self {
-            Applicability::MachineApplicable => "MachineApplicable",
-            Applicability::MaybeIncorrect => "MaybeIncorrect",
-            Applicability::HasPlaceholders => "HasPlaceholders",
-            Applicability::Unspecified => "Unspecified",
-        }
-    }
-}
+/// How sure a suggestion is: rustc's `Applicability`, the agent API's type.
+pub use blaze_api::Applicability;
 
 /// How a suggestion is shown: rustc's `SuggestionStyle`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

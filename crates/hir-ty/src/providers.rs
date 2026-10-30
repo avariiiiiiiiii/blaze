@@ -208,7 +208,7 @@ pub fn monomorphized_mir_at<'db>(
 fn compute<'db>(db: &'db Db, owner: MirOwner<'db>, stage: MirStage) -> Built<'db> {
     let mir = mir();
     match stage {
-        MirStage::Built => (mir.build)(db, owner),
+        MirStage::Built => crate::body_store::built_mir(db, owner, || (mir.build)(db, owner)),
         MirStage::Runtime => {
             let built = mir_at(db, owner, MirStage::Built).map_err(Clone::clone)?;
             (mir.run_passes)(db, built)

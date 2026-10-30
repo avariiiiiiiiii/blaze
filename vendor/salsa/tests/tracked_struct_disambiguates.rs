@@ -3,6 +3,7 @@
 //! Test that disambiguation works, that is when we have a revision where we track multiple structs
 //! that have the same hash, we can still differentiate between them.
 #![allow(warnings)]
+#![forbid(unsafe_code)]
 
 use std::hash::Hash;
 

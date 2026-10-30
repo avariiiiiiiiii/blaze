@@ -44,6 +44,7 @@ use crate::{
 };
 
 mod held;
+pub(crate) mod persist;
 pub mod target;
 
 pub use held::{HeldLocals, YieldPoint};
@@ -146,6 +147,26 @@ impl<'db> Operand {
     /// The expression the operand was written as, where lowering kept one.
     pub fn span(&self) -> Option<MirSpan> {
         self.span
+    }
+
+    /// The function item, constructor or not, this operand is a value of, with its generic
+    /// arguments: a call's callee when it is named, not a pointer.
+    pub fn fn_def(&self) -> Option<(CallableDefId, GenericArgs<'db>)> {
+        let ty: Ty<'db> = match &self.kind {
+            OperandKind::Constant { ty, .. } => ty.as_ref(),
+            OperandKind::Allocation { allocation } => allocation.as_ref().ty,
+            _ => return None,
+        };
+        let TyKind::FnDef(callable, args) = ty.kind() else { return None };
+        Some((callable.0, args.skip_binder()))
+    }
+
+    /// [`Operand::fn_def`] when it is a function, not a constructor.
+    pub fn fn_item(&self) -> Option<(FunctionId, GenericArgs<'db>)> {
+        match self.fn_def()? {
+            (CallableDefId::FunctionId(func), args) => Some((func, args)),
+            _ => None,
+        }
     }
 }
 

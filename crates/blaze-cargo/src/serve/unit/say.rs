@@ -36,6 +36,12 @@ pub(crate) fn rendered(level: Level, message: &str, color: bool) -> String {
         Level::Warning => ("warning", WARN),
         Level::Note => ("note", BOLD),
         Level::Help => ("help", BOLD),
+        Level::FailureNote => {
+            return match color {
+                true => format!("{BOLD}{message}{RESET}\n"), // alloc: a diagnostic's text, once
+                false => format!("{message}\n"), // alloc: as above
+            };
+        }
     };
     match color {
         true => format!("{style}{status}{RESET}{BOLD}:{RESET} {message}\n"),

@@ -32,6 +32,9 @@ impl From<Arch> for target::Arch {
 pub struct TargetSpec {
     pub data_layout: String,
     pub arch: Arch,
+    /// rustc's spec JSON leaves out an option at its default, here false.
+    #[serde(default)]
+    pub has_thumb_interworking: bool,
 }
 
 /// Uses `rustc --print target-spec-json`.
@@ -42,13 +45,17 @@ pub fn get(
     version: Option<&semver::Version>,
 ) -> anyhow::Result<target::TargetData> {
     const RUSTC_ARGS: [&str; 2] = ["--print", "target-spec-json"];
+    let tuple = target.context("no target tuple was found to fetch the target data of")?;
+    let target = Some(tuple);
     let process = |output: String| {
         let target_spec = serde_json::from_str::<TargetSpec>(&output).map_err(|_| {
             anyhow::format_err!("could not parse target-spec-json from command output")
         })?;
         Ok(target::TargetData {
+            tuple: intern::Symbol::intern(tuple),
             arch: target_spec.arch.into(),
             data_layout: target_spec.data_layout.into_boxed_str(),
+            has_thumb_interworking: target_spec.has_thumb_interworking,
         })
     };
     let (sysroot, current_dir) = match config {
@@ -96,7 +103,9 @@ mod tests {
         let cfg = QueryConfig::Cargo(&sysroot, &manifest_path, &None);
         let extra_env = &FxHashMap::default();
         let Ok(version) = super::super::version::get(cfg, extra_env) else { return };
-        assert!(get(cfg, None, extra_env, version.as_ref()).is_ok());
+        let tuples = super::super::target_tuple::get(cfg, None, extra_env).unwrap();
+        let data = get(cfg, tuples.first().map(String::as_str), extra_env, version.as_ref()).unwrap();
+        assert_eq!(data.tuple.as_str(), tuples[0]);
     }
 
     #[test]
@@ -105,6 +114,8 @@ mod tests {
         let cfg = QueryConfig::Rustc(&sysroot, env!("CARGO_MANIFEST_DIR").as_ref());
         let extra_env = &FxHashMap::default();
         let Ok(version) = super::super::version::get(cfg, extra_env) else { return };
-        assert!(get(cfg, None, extra_env, version.as_ref()).is_ok());
+        let tuples = super::super::target_tuple::get(cfg, None, extra_env).unwrap();
+        let data = get(cfg, tuples.first().map(String::as_str), extra_env, version.as_ref()).unwrap();
+        assert_eq!(data.tuple.as_str(), tuples[0]);
     }
 }

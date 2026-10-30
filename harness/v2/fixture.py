@@ -9,7 +9,7 @@ formatting or comments, a cfg, a feature, a closure's captures, a file `include_
 whitespace in a literal, an environment variable), and every variant of every slot builds
 beside every variant of every other, so any state is a program: an edit is one slot moved to
 another variant, and a random sequence of them is a random sequence of edits. A variant marked
-`rejects` is a program rustc refuses (the file `include_str!` reads deleted, a non-`Send` type
+`rejects` is a program Rust refuses (the file `include_str!` reads deleted, a non-`Send` type
 leaking out of an `impl Trait`); both builds then have to refuse it the same way.
 
 The program prints one line for each thing an edit can change: values (bodies, constants,
@@ -36,7 +36,7 @@ type State = dict[str, int]
 @dataclass(frozen=True)
 class Variant:
     """What the slot's placeholders become (`@NAME@` in the templates), or what a file or an
-    environment variable is (`file`, `env`); `rejects` when rustc refuses the program."""
+    environment variable is (`file`, `env`); `rejects` when Rust refuses the program."""
 
     values: Mapping[str, str] = field(default_factory=dict[str, str])
     rejects: bool = False
@@ -827,7 +827,7 @@ def write(directory: Path, state: State, before: dict[str, str | None] | None = 
 
 
 def random_state(seed: str) -> State:
-    """A state of `seed` with no slot that makes rustc refuse it."""
+    """A state of `seed` with no slot that makes the program refused."""
     r = random.Random(f"{seed}/state")
     state = {slot.name: r.randrange(len(slot.variants)) for slot in SLOTS}
     for slot in SLOTS:

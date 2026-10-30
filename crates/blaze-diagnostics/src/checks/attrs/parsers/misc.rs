@@ -36,6 +36,7 @@ use syntax::{
 };
 
 use super::{Accepted, Finalize, GroupId, limit, no_args};
+use stdx::list::Join;
 use crate::{
     checks::attrs::{
         accept::Accept,
@@ -1165,7 +1166,7 @@ impl<'p, 'db> MetaParser<'p, '_, 'db> {
             diag.suggestion_verbose(found_span, "try using `=` instead", "=", Applicability::MachineApplicable);
             return diag;
         }
-        let list = tokens_to_string(&expected);
+        let list = stdx::list::list(expected.iter(), Join::Or, false);
         let actual = descr(found, self.edition);
         let (message, label) = match expected.len() {
             // alloc: the error's message and label
@@ -1223,20 +1224,6 @@ impl<'p, 'db> MetaParser<'p, '_, 'db> {
     fn invalid_eof(&self) -> Diag {
         let range = self.token_range();
         Diag::error(None, "expected unsuffixed literal, found `<eof>`", self.span(range))
-    }
-}
-
-/// rustc's `tokens_to_string`: "`a`", "`a` or `b`", "`a`, `b`, or `c`".
-fn tokens_to_string(tokens: &[&str]) -> String {
-    match tokens {
-        // alloc: empty, allocates nothing
-        [] => String::new(),
-        // alloc: an error's message
-        [one] => (*one).to_owned(),
-        // alloc: an error's message
-        [a, b] => format!("{a} or {b}"),
-        // alloc: an error's message
-        [init @ .., last] => format!("{}, or {last}", init.join(", ")),
     }
 }
 
@@ -1443,9 +1430,9 @@ mod tests {
 
     #[test]
     fn expected_tokens_are_listed_as_rustc_lists_them() {
-        assert_eq!(tokens_to_string(&["`,`"]), "`,`");
-        assert_eq!(tokens_to_string(&["`)`", "`,`"]), "`)` or `,`");
-        assert_eq!(tokens_to_string(&["`(`", "`,`", "`::`", "`=`"]), "`(`, `,`, `::`, or `=`");
+        assert_eq!(stdx::list::list(["`,`"], stdx::list::Join::Or, false), "`,`");
+        assert_eq!(stdx::list::list(["`)`", "`,`"], stdx::list::Join::Or, false), "`)` or `,`");
+        assert_eq!(stdx::list::list(["`(`", "`,`", "`::`", "`=`"], stdx::list::Join::Or, false), "`(`, `,`, `::`, or `=`");
     }
 
     #[test]

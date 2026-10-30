@@ -41,13 +41,13 @@ impl LatePass for ShadowedIntoIter {
     const HOOKS: Hooks = Hooks::BODY;
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Match, ExprKind::MethodCall]);
 
-    fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+    fn check_body(&mut self, b: &BodyCx<'_, '_, '_>, _out: &mut Vec<Found>) {
         self.for_heads.clear();
         let db = b.db();
         self.into_iter = lang_items(db, b.owner.krate(db)).IntoIterIntoIter;
     }
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some(into_iter) = self.into_iter else { return };
         if let Some(found) = for_loop(b, expr)
             && util::called_fn(b, found.into_iter).is_some_and(|(def, _)| def == into_iter)
@@ -142,7 +142,7 @@ fn is_ref_to_boxed_slice(ty: Ty<'_>) -> bool {
 }
 
 /// The span of the name of the method `expr` calls (rustc's `segment.ident.span`).
-fn method_name(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
+fn method_name(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Span> {
     let node = util::syntax(b, expr)?;
     // clone: a node or span, for the lint's diagnostic
     let call = ast::MethodCallExpr::cast(node.value)?;

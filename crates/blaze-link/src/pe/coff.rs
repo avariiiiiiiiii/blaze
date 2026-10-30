@@ -12,12 +12,15 @@
 //! section and leader); relocations and COMDAT members are runs of one column per object. So an
 //! object's read allocates a constant number of buffers whatever its size. What is still made
 //! is each import's `"<hint> <name>"` (its `Shared::versions` entry), one per import member.
+//! An import library read whole parses its members and groups the imports by DLL on every
+//! thread; walking the member headers stays one pass, in member order.
 
 use std::borrow::Cow;
-use std::collections::hash_map::Entry;
 use std::fmt::{self, Write as _};
 use std::sync::Mutex;
 
+use blaze_bytes::le::{get_u16 as u16_at, get_u32 as u32_at, get_u64 as u64_at};
+use blaze_core::decimal::decimal;
 use blaze_ids::radix;
 use blaze_mem::scratch::{self, Lent};
 use object::LittleEndian as LE;
@@ -25,6 +28,7 @@ use object::pe;
 use object::read::SymbolIndex;
 use object::read::archive::{ArchiveFile, ArchiveKind};
 use object::read::coff::{CoffHeader, ImageSymbol, SectionTable, SymbolTable};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::{OBJ_PDATA, Pe};
@@ -154,7 +158,8 @@ fn add(shared: &mut Shared, input: Input<'_>, import: Imported<'_>) -> Result<()
         fail(input, format_args!("more than 65,536 imports of {}, more than a DLL can export", shared.name))
     })?;
     let name = shared.names.push(&import.name).map_err(|e| fail(input, e))?;
-    shared.versions.push(import.version);
+    let export = shared.names.push(&import.version).map_err(|e| fail(input, e))?;
+    shared.versions.push(export);
     shared.symbols.push(SharedSymbol { name, version: Some(version), kind: import.kind, weak: false });
     Ok(())
 }
@@ -179,18 +184,6 @@ pub(super) fn read(pe: &Pe, name: &str, bytes: &[u8], kind: &NativeKind) -> Resu
         }
         NativeKind::Shared { .. } => import_library(pe, input, bytes).map(NativeFile::Shared),
     }
-}
-
-fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
 }
 
 /// A relocatable input: an object, or an import member of an archive, read where it is.
@@ -280,10 +273,10 @@ impl<'a> ImportName<'a> {
     /// The version [`ImportName::parse`] reads back: one allocation of its exact size, the
     /// `Shared::versions` entry of an import.
     pub(crate) fn version(self) -> String {
-        let mut digits = [0; 5];
+        let mut digits = [0; 20];
         let (prefix, number, name) = match self {
-            ImportName::Name { hint, name } => ("", decimal(hint, &mut digits), Some(name)),
-            ImportName::Ordinal(ordinal) => ("#", decimal(ordinal, &mut digits), None),
+            ImportName::Name { hint, name } => ("", decimal(u64::from(hint), &mut digits), Some(name)),
+            ImportName::Ordinal(ordinal) => ("#", decimal(u64::from(ordinal), &mut digits), None),
         };
         let mut out = String::with_capacity(prefix.len() + number.len() + name.map_or(0, |it| it.len() + 1));
         out.push_str(prefix);
@@ -294,20 +287,6 @@ impl<'a> ImportName<'a> {
         }
         out
     }
-}
-
-/// `value` in decimal, written at the end of `digits`.
-fn decimal(mut value: u16, digits: &mut [u8; 5]) -> &str {
-    let mut at = digits.len();
-    loop {
-        at -= 1;
-        digits[at] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    std::str::from_utf8(&digits[at..]).unwrap_or_default()
 }
 
 /// An archive's members and index, and the DLL each import descriptor member in it names. A
@@ -396,8 +375,9 @@ fn descriptor_dll(name: Input<'_>, data: &[u8]) -> Result<String, String> {
 }
 
 /// An import library linked as a shared library: every member an import of some DLL. The
-/// DLLs are found by name in a hash index (an umbrella library such as `windows.lib` has
-/// thousands of members of hundreds of DLLs), and a DLL's name is copied once.
+/// imports are sorted by DLL and member (an umbrella library such as `windows.lib` has
+/// thousands of members of hundreds of DLLs), each DLL built from its run, and a DLL's name is
+/// copied once.
 fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, String> {
     if !bytes.starts_with(b"!<arch>\n") {
         if bytes.starts_with(b"MZ") {
@@ -410,39 +390,84 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
         return Err(fail(name, "not an import library"));
     }
     let (archive, descriptors) = archive(name, bytes, true)?;
-    // An import library has a descriptor per DLL (short-format ones too), so these are sized.
-    let mut dlls: Vec<Shared> = Vec::with_capacity(descriptors.len().max(1));
-    let mut of: FxHashMap<Cow<'_, str>, u32> =
-        FxHashMap::with_capacity_and_hasher(descriptors.len().max(1), Default::default());
-    for it in &archive.members {
-        let input = Input { file: name.file, member: Some(archive.name(it.name)) };
-        let (dll, import) = match member(pe, Dlls::Library(&descriptors), input, &bytes[it.bytes.start..it.bytes.end])? {
-            Parsed::Import(dll, import) => (dll, import),
-            Parsed::Object(object) if object.sections.is_empty() => continue,
-            Parsed::Object(_) => {
-                return Err(fail(
+    // Every member parsed in place on every thread (each import's version made there), then
+    // grouped by DLL on every thread: the first error in member order is the one given.
+    let input_of = |it: &Member| Input { file: name.file, member: Some(archive.name(it.name)) };
+    let mut parsed: Vec<Result<Option<(Cow<'_, str>, Imported<'_>)>, String>> =
+        Vec::with_capacity(archive.members.len());
+    archive
+        .members
+        .par_iter()
+        .map(|it| {
+            let input = input_of(it);
+            match member(pe, Dlls::Library(&descriptors), input, &bytes[it.bytes.start..it.bytes.end])? {
+                Parsed::Import(dll, import) => Ok(Some((dll, import))),
+                Parsed::Object(object) if object.sections.is_empty() => Ok(None),
+                Parsed::Object(_) => Err(fail(
                     input,
                     "an object in a library linked as a DLL's import library; a library with \
                      objects is linked as an archive",
-                ));
+                )),
             }
-        };
-        let at = match of.entry(dll) {
-            Entry::Occupied(it) => *it.get() as usize,
-            Entry::Vacant(it) => {
-                // alloc: once per DLL: the name its `Shared` owns
-                dlls.push(shared((**it.key()).to_owned()));
-                it.insert(dlls.len() as u32 - 1);
-                dlls.len() - 1
+        })
+        .collect_into_vec(&mut parsed);
+    // The members before the first that fails to parse are added; its error is given unless
+    // adding one of them fails.
+    let failed = match parsed.par_iter().position_first(Result::is_err) {
+        Some(at) => {
+            let error = parsed.swap_remove(at).err();
+            parsed.truncate(at);
+            error
+        }
+        None => None,
+    };
+    // Each DLL's imports together, in member order.
+    let mut imports: Vec<(Cow<'_, str>, u32, Imported<'_>)> = parsed
+        .into_par_iter()
+        .enumerate()
+        .filter_map(|(at, it)| match it {
+            Ok(Some((dll, import))) => Some((dll, at as u32, import)),
+            _ => None,
+        })
+        // alloc: once per library: its imports, to sort
+        .collect();
+    imports.par_sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    // Each DLL's `Shared` built on its own thread, keyed by its first member; a failure keyed
+    // by the member that failed.
+    let mut built: Vec<(u32, Result<Shared, (u32, String)>)> = imports
+        .par_chunk_by_mut(|a, b| a.0 == b.0)
+        .map(|run| {
+            let first = run[0].1;
+            // alloc: once per DLL: the name its `Shared` owns
+            let mut dll = shared((*run[0].0).to_owned());
+            for (_, at, import) in run.iter_mut() {
+                let import = Imported {
+                    name: std::mem::take(&mut import.name),
+                    version: std::mem::take(&mut import.version),
+                    kind: import.kind,
+                };
+                if let Err(error) = add(&mut dll, input_of(&archive.members[*at as usize]), import) {
+                    return (first, Err((*at, error)));
+                }
             }
-        };
-        add(&mut dlls[at], input, import)?;
+            (first, Ok(dll))
+        })
+        // alloc: once per library: one entry per DLL
+        .collect();
+    if let Some((_, error)) = built.iter_mut().filter_map(|(_, it)| it.as_mut().err()).min_by_key(|it| it.0) {
+        return Err(std::mem::take(error));
     }
-    if dlls.is_empty() {
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    // The DLLs in the order each is first met in the library, as one pass numbers them.
+    built.par_sort_unstable_by_key(|it| it.0);
+    let mut dlls = built.into_iter().filter_map(|(_, it)| it.ok());
+    let Some(mut first) = dlls.next() else {
         return Err(fail(name, "an import library importing nothing"));
-    }
-    let mut first = dlls.remove(0);
-    first.more = dlls;
+    };
+    // alloc: once per library: its other DLLs
+    first.more = dlls.collect();
     Ok(first)
 }
 

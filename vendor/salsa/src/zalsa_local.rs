@@ -17,12 +17,12 @@ use crate::active_query::{CompletedQuery, DetachedInputOutputs, QueryCompletion,
 use crate::cycle::{AtomicIterationStamp, CycleHeads, IterationStamp, empty_cycle_heads};
 use crate::durability::Durability;
 use crate::fingerprint::Fingerprint;
-use crate::graph::{self, EdgeSpan, Graph, Relocation, TaskGraph};
+use crate::graph::{self, EdgeSpan, EdgeWordIter, EdgeWords, Graph, Relocation, TaskGraph};
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
 use crate::task::TaskId;
-use crate::sync::atomic::{AtomicU32, AtomicU64};
-use crate::table::{PageIndex, Slot};
+use crate::sync::atomic::AtomicU64;
+use crate::table::{PageCache, PageIndex, Slot};
 use crate::tracked_struct::{Disambiguator, Identity, IdentityHash};
 use crate::zalsa::{IngredientIndex, Zalsa};
 use crate::{Cancelled, Id, Revision};
@@ -46,6 +46,9 @@ pub struct ZalsaLocal {
 
     /// This task's cache of key to node and its reserved edge words ([`Graph::record`]).
     graph: TaskGraph,
+
+    /// This task's cache of the table pages its memo lookups read ([`PageCache`]).
+    pages: PageCache,
 
     cancelled: CancellationToken,
 
@@ -97,9 +100,16 @@ impl ZalsaLocal {
             query_stack: RefCell::new(QueryStack::default()),
             most_recent_pages: UnsafeCell::new(FxHashMap::default()),
             graph: TaskGraph::default(),
+            pages: PageCache::default(),
             cancelled: CancellationToken::default(),
             task,
         }
+    }
+
+    /// This task's page cache, for [`Zalsa::memo_table_cached`].
+    #[inline]
+    pub(crate) fn page_cache(&self) -> &PageCache {
+        &self.pages
     }
 
     /// The task this state belongs to, which is the task that owns its claims and blocks.
@@ -355,11 +365,13 @@ impl ZalsaLocal {
         }
     }
 
-    /// Register that currently active query reads the given input
+    /// Register that currently active query reads the given input, whose node in the graph is
+    /// `node` ([`QueryEdge::NO_NODE`] if the caller doesn't know it).
     #[inline(always)]
     pub(crate) fn report_tracked_read(
         &self,
         input: DatabaseKeyIndex,
+        node: u32,
         durability: Durability,
         changed_at: Revision,
         fingerprint: Fingerprint,
@@ -381,6 +393,7 @@ impl ZalsaLocal {
                 if let Some(top_query) = stack.last_mut() {
                     top_query.add_read(
                         input,
+                        node,
                         durability,
                         changed_at,
                         fingerprint,
@@ -749,6 +762,20 @@ impl QueryRevisions {
     #[inline]
     pub(crate) fn origin<'a>(&'a self, graph: &'a Graph) -> QueryOriginRef<'a> {
         self.origin_and_extra.origin(graph)
+    }
+
+    /// The edge words of a value derived from tracked reads only; `None` for an assigned or
+    /// untracked one.
+    #[inline]
+    pub(crate) fn derived_edge_words<'a>(&self, graph: &'a Graph) -> Option<EdgeWords<'a>> {
+        if self.origin_and_extra.kind() != QueryOriginKind::Derived {
+            return None;
+        }
+        let span = self
+            .origin_and_extra
+            .span()
+            .expect("salsa: a derived origin has an edge span");
+        Some(graph.edge_words(span))
     }
 
     /// Whether the value was derived by running the function (tracked or not), so it has edges.
@@ -1484,9 +1511,11 @@ impl<T> WithExtra<T> {
 /// An input or output query edge.
 ///
 /// This type stores the [`QueryEdgeKind`] as a tag on the `IngredientIndex` without
-/// increasing the size of the type. Its 12-byte size is meaningful because inputs and
-/// outputs are stored contiguously.
-#[derive(Copy, Clone, PartialEq, Eq)]
+/// increasing the size of the type. It may also carry the key's node in the graph, when the
+/// read already knew it (a memo holds its key's node), so finishing the query writes the edge
+/// word without looking the key up ([`crate::graph::Graph::record`]); the node is not part of
+/// the edge's identity (`Eq` and `Hash` ignore it).
+#[derive(Copy, Clone)]
 pub struct QueryEdge {
     // Store a normalized zero-based index rather than nesting an `Id`, whose index uses a
     // `NonZeroU32(index + 1)` representation. Packed origins unpack many transient
@@ -1495,11 +1524,27 @@ pub struct QueryEdge {
     index: u32,
     generation: u32,
     ingredient: IngredientIndex,
+    /// The key's node, or [`QueryEdge::NO_NODE`].
+    node: u32,
 }
 
-const _: [(); std::mem::size_of::<QueryEdge>()] = [(); 12];
+const _: [(); std::mem::size_of::<QueryEdge>()] = [(); 16];
+
+impl PartialEq for QueryEdge {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.generation == other.generation
+            && self.ingredient == other.ingredient
+    }
+}
+
+impl Eq for QueryEdge {}
 
 impl QueryEdge {
+    /// No node: nodes are below [`crate::graph::NODE_LIMIT`].
+    pub(crate) const NO_NODE: u32 = u32::MAX;
+
     /// Create an input query edge with the given index.
     pub const fn input(key: DatabaseKeyIndex) -> QueryEdge {
         let id = key.key_index();
@@ -1508,7 +1553,16 @@ impl QueryEdge {
             index: id.index(),
             generation: id.generation(),
             ingredient: key.ingredient_index(),
+            node: Self::NO_NODE,
         }
+    }
+
+    /// An input edge whose key has the node `node` in the database's graph.
+    #[inline]
+    pub(crate) const fn input_at(key: DatabaseKeyIndex, node: u32) -> QueryEdge {
+        let mut edge = Self::input(key);
+        edge.node = node;
+        edge
     }
 
     /// Create an output query edge with the given index.
@@ -1519,6 +1573,25 @@ impl QueryEdge {
             index: id.index(),
             generation: id.generation(),
             ingredient: key.ingredient_index().with_tag(true),
+            node: Self::NO_NODE,
+        }
+    }
+
+    /// An output edge whose key has the node `node`.
+    #[inline]
+    pub(crate) const fn output_at(key: DatabaseKeyIndex, node: u32) -> QueryEdge {
+        let mut edge = Self::output(key);
+        edge.node = node;
+        edge
+    }
+
+    /// The key's node, if the edge carries it.
+    #[inline]
+    pub(crate) const fn node(self) -> Option<u32> {
+        if self.node == Self::NO_NODE {
+            None
+        } else {
+            Some(self.node)
         }
     }
 
@@ -1549,6 +1622,7 @@ impl std::hash::Hash for QueryEdge {
             index,
             ingredient,
             generation: _,
+            node: _,
         } = self;
         // A query should never depend on the same ingredient and index at different generations:
         // advancing the generation replaces the previous identity. If this assumption is ever
@@ -1580,7 +1654,7 @@ pub struct QueryEdges<'a> {
 enum QueryEdgesData<'a> {
     Graph {
         graph: &'a Graph,
-        words: &'a [AtomicU32],
+        words: EdgeWords<'a>,
     },
     Wide(&'a [QueryEdge]),
 }
@@ -1591,7 +1665,7 @@ impl<'a> QueryEdges<'a> {
         QueryEdges {
             data: QueryEdgesData::Graph {
                 graph,
-                words: graph.words(span),
+                words: graph.edge_words(span),
             },
         }
     }
@@ -1603,10 +1677,19 @@ impl<'a> QueryEdges<'a> {
     }
 
     #[cfg(any(test, feature = "accumulator"))]
-    pub(crate) const fn len(self) -> usize {
+    pub(crate) fn len(self) -> usize {
         match self.data {
             QueryEdgesData::Graph { words, .. } => words.len(),
             QueryEdgesData::Wide(edges) => edges.len(),
+        }
+    }
+
+    /// The edge words, when the edges are in the graph (`None` for wide edges).
+    #[inline]
+    pub(crate) fn words(self) -> Option<EdgeWords<'a>> {
+        match self.data {
+            QueryEdgesData::Graph { words, .. } => Some(words),
+            QueryEdgesData::Wide(_) => None,
         }
     }
 
@@ -1637,7 +1720,7 @@ pub struct QueryEdgeIter<'a> {
 enum QueryEdgeIterData<'a> {
     Graph {
         graph: &'a Graph,
-        words: std::slice::Iter<'a, AtomicU32>,
+        words: EdgeWordIter<'a>,
     },
     Wide(std::slice::Iter<'a, QueryEdge>),
 }
@@ -1648,11 +1731,7 @@ impl Iterator for QueryEdgeIter<'_> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.data {
-            // Relaxed: the memo holding these edges was loaded with `Acquire`, and its edges
-            // were written before it was published.
-            QueryEdgeIterData::Graph { graph, words } => words
-                .next()
-                .map(|word| graph.decode(word.load(Ordering::Relaxed))),
+            QueryEdgeIterData::Graph { graph, words } => words.next().map(|word| graph.decode(word)),
             QueryEdgeIterData::Wide(edges) => edges.next().copied(),
         }
     }
@@ -1666,9 +1745,9 @@ impl Iterator for QueryEdgeIter<'_> {
 impl DoubleEndedIterator for QueryEdgeIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         match &mut self.data {
-            QueryEdgeIterData::Graph { graph, words } => words
-                .next_back()
-                .map(|word| graph.decode(word.load(Ordering::Relaxed))),
+            QueryEdgeIterData::Graph { graph, words } => {
+                words.next_back().map(|word| graph.decode(word))
+            }
             QueryEdgeIterData::Wide(edges) => edges.next_back().copied(),
         }
     }
@@ -1689,13 +1768,9 @@ impl std::iter::FusedIterator for QueryEdgeIter<'_> {}
 pub struct OutputEdgeIter<'a>(QueryEdgeIter<'a>);
 
 impl OutputEdgeIter<'_> {
-    fn next_word(
-        words: &mut std::slice::Iter<'_, AtomicU32>,
-        back: bool,
-    ) -> Option<u32> {
+    fn next_word(words: &mut EdgeWordIter<'_>, back: bool) -> Option<u32> {
         loop {
             let word = if back { words.next_back() } else { words.next() }?;
-            let word = word.load(Ordering::Relaxed);
             if word & graph::OUTPUT != 0 {
                 return Some(word);
             }
@@ -1897,7 +1972,7 @@ impl<'me> DetachedQuery<'me> {
         self.guard.local_state
     }
 
-    pub(crate) fn input_outputs(&self) -> &crate::hash::FxIndexSet<QueryEdge> {
+    pub(crate) fn input_outputs(&self) -> &[QueryEdge] {
         self.input_outputs.input_outputs()
     }
 
@@ -1993,6 +2068,7 @@ pub(crate) mod persistence {
                 index: id.index(),
                 generation: id.generation(),
                 ingredient: key.ingredient_index(),
+                node: QueryEdge::NO_NODE,
             })
         }
     }
@@ -2291,7 +2367,7 @@ mod tests {
     #[test]
     fn the_stamp_keeps_changed_at_durability_and_flags_apart() {
         let revisions = QueryRevisions::new(
-            Revision::from((1 << 56) - 1),
+            Revision::max(),
             Durability::NEVER_CHANGE,
             OriginAndExtra::derived(EdgeSpan::EMPTY, Default::default()),
             true,
@@ -2299,7 +2375,7 @@ mod tests {
             InputAccumulatedValues::Any,
             ThinVec::new(),
         );
-        assert_eq!(revisions.changed_at(), Revision::from((1 << 56) - 1));
+        assert_eq!(revisions.changed_at(), Revision::max());
         assert_eq!(revisions.durability(), Durability::NEVER_CHANGE);
         assert!(revisions.verified_final(Ordering::Relaxed));
         #[cfg(feature = "accumulator")]

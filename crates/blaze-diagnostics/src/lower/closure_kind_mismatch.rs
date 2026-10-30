@@ -8,7 +8,7 @@
 //! errors.rs` (`ClosureKindMismatch`, `ClosureFnOnceLabel`, `ClosureFnMutLabel`) and
 //! `compiler/rustc_hir_typeck/src/upvar.rs` (`closure_kind_origins`) (MIT or Apache-2.0).
 
-use hir::{FnTrait, LangItem};
+use hir::FnTrait;
 use syntax::view::{self as ast, AstNode as _};
 
 use crate::{
@@ -63,19 +63,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ClosureKindMismatch) -> Vec<Found>
     let label = format!("the requirement to implement `{expected}` derives from here");
     diag.span_label(cause.span.clone(), label); // clone: the label's span
     cause.label_call(&mut diag);
-    let trait_ = hir::Trait::lang(cx.db, cx.krate, lang_item(expected));
+    let trait_ = hir::Trait::lang(cx.db, cx.krate, expected.lang_item());
     obligation_cause::note(cx, &mut diag, d.cause, trait_);
     code_fact(cx, &mut diag, d.span.map(|it| it.syntax_node_ptr()));
     vec![Found::new(diag, Phase::Bodies)] // alloc: the error found
-}
-
-fn lang_item(kind: FnTrait) -> LangItem {
-    match kind {
-        FnTrait::Fn => LangItem::Fn,
-        FnTrait::FnMut => LangItem::FnMut,
-        FnTrait::FnOnce => LangItem::FnOnce,
-        FnTrait::AsyncFn => LangItem::AsyncFn,
-        FnTrait::AsyncFnMut => LangItem::AsyncFnMut,
-        FnTrait::AsyncFnOnce => LangItem::AsyncFnOnce,
-    }
 }

@@ -1,9 +1,11 @@
 //! Allocation budgets of the store's hot paths: reading a store, a memo hit of a body or its
-//! scopes, a scope lookup, and the syntax side of lowering's walk allocate nothing.
+//! scopes, a scope lookup, source map lookups both ways, and the syntax side of lowering's
+//! walk allocate nothing.
 
 use std::hint::black_box;
 
 use blaze_alloc_count::assert_at_most;
+use hir_expand::{HirFileId, InFile};
 use span::Edition;
 use syntax::{
     AstPtr, SourceFile,
@@ -99,6 +101,49 @@ fn a_scope_lookup_allocates_nothing() {
             }
         }
     });
+}
+
+/// A warm body's source map, both ways: each expression's, pattern's and type's syntax by id
+/// (the back maps), each binding's patterns (`BindingPats`), and each node's id by its syntax
+/// (`SourceTable`'s search).
+#[test]
+fn source_map_lookups_allocate_nothing() {
+    let (db, file) = TestDB::with_single_file(CODE);
+    let def = the_function(&db);
+    let (body, map) = Body::with_source_map(&db, def);
+    let root = file.parse(&db).root();
+    let file = HirFileId::from(file);
+    let lookups = || {
+        let mut found = 0;
+        for expr in body.expr_ids() {
+            found += usize::from(map.expr_syntax(expr).is_ok());
+        }
+        for pat in body.pat_ids() {
+            found += usize::from(map.pat_syntax(pat).is_ok());
+        }
+        for (id, _) in body.type_refs() {
+            found += usize::from(map.type_syntax(id).is_ok());
+        }
+        for (binding, _) in body.bindings() {
+            found += map.patterns_for_binding(binding).len();
+        }
+        for node in root.descendants() {
+            if let Some(expr) = ast::Expr::cast(node) {
+                found += usize::from(map.node_expr_view(InFile::new(file, expr)).is_some());
+            }
+            if let Some(pat) = ast::Pat::cast(node) {
+                found += usize::from(map.node_pat_view(InFile::new(file, pat)).is_some());
+            }
+            if let Some(ty) = ast::Type::cast(node) {
+                found += usize::from(map.node_type_view(InFile::new(file, ty)).is_some());
+            }
+        }
+        found
+    };
+    let warm = lookups();
+    assert!(warm > 40, "too few lookups found something: {warm}");
+    let again = assert_at_most(0, "source map lookups both ways", lookups);
+    assert_eq!(again, warm);
 }
 
 /// What lowering reads of the syntax at each node (the cfg fast path, the source map's

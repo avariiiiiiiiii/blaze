@@ -9,6 +9,9 @@
 //! include info about comments and whitespace.
 
 #[allow(unsafe_code)]
+mod classify;
+#[cfg(test)]
+mod differential;
 mod scan;
 
 use std::{borrow::Cow, ops};
@@ -46,6 +49,9 @@ pub struct LexedStr<'a> {
     // so the next lex takes each buffer back for the same column.
     checkpoints: Lent<Vec<u32>>,
     tokens: Lent<Vec<Token>>,
+    /// With [`LexedStr::new_hashed`], the [`blaze_phf::name_hash`] of each token
+    /// [`LexedStr::has_name_hash`] is true of, in order: the worker's `u64` scratch.
+    names: Option<Lent<Vec<u64>>>,
     long: Vec<(u32, u32)>,
     error: Vec<LexError>,
 }
@@ -69,17 +75,67 @@ struct LexError {
 }
 
 impl<'a> LexedStr<'a> {
+    /// The byte-class kernel this build lexes with, chosen by `target_feature` when the crate
+    /// is built: `avx512vbmi`, `avx2`, `sse2`, `neon` or `scalar`.
+    pub const KERNEL: &'static str = classify::KERNEL;
+
     pub fn new(edition: Edition, text: &'a str) -> LexedStr<'a> {
         Self::lex::<true>(edition, text)
     }
 
-    /// With `FAST`, the tokens [`scan::token`] decides from the byte classes are lexed there and
-    /// the rest by `rustc_lexer`; without, all by `rustc_lexer`. Both give the same tokens
-    /// (`fast_and_rustc_lexer_lex_alike`).
+    /// [`LexedStr::new`] that also hashes each identifier's name for the interner while the
+    /// scan has its bytes in a register ([`LexedStr::name_hashes`]): for a caller that interns
+    /// every identifier it lexes (`syntax_bridge`'s text to token trees), which then hands
+    /// each hash to `intern::Symbol::intern_hashed` and never hashes the name again. The
+    /// tokens are [`LexedStr::new`]'s.
+    pub fn new_hashed(edition: Edition, text: &'a str) -> LexedStr<'a> {
+        Self::lex_with::<true, true>(edition, text)
+    }
+
+    /// Whether a token of `kind` has a hash in [`LexedStr::name_hashes`]: the kinds the lexer
+    /// gives an identifier, `IDENT`, `_` and the strict and reserved keywords. A raw
+    /// identifier's is of its name without `r#`.
+    #[inline]
+    pub fn has_name_hash(kind: SyntaxKind) -> bool {
+        kind == IDENT || kind == UNDERSCORE || crate::syntax_kind::keywords::is_strict_kind(kind)
+    }
+
+    /// The [`blaze_phf::name_hash`] of each token [`LexedStr::has_name_hash`] is true of, in
+    /// token order; empty unless lexed by [`LexedStr::new_hashed`].
+    pub fn name_hashes(&self) -> &[u64] {
+        self.names.as_deref().map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether the fast path and `rustc_lexer` alone lex `text` alike: kinds, lengths,
+    /// checkpoints, long tokens and errors (`fast_and_rustc_lexer_lex_alike`), for the fuzz
+    /// target `syntax_parse`.
+    #[cfg(feature = "fuzz")]
+    pub fn lexes_alike(edition: Edition, text: &'a str) -> bool {
+        let (fast, slow) = (Self::lex::<true>(edition, text), Self::lex::<false>(edition, text));
+        fast.tokens == slow.tokens
+            && fast.checkpoints == slow.checkpoints
+            && fast.long == slow.long
+            && fast.errors().eq(slow.errors())
+    }
+
+    /// With `FAST`, the tokens [`scan`] decides from the byte classes ([`classify`]) are lexed
+    /// there and the rest by `rustc_lexer`; without, all by `rustc_lexer`. Both give the same
+    /// tokens (`fast_and_rustc_lexer_lex_alike`, `every_file_of_the_corpus_lexes_alike`).
     fn lex<const FAST: bool>(edition: Edition, text: &'a str) -> LexedStr<'a> {
+        Self::lex_with::<FAST, false>(edition, text)
+    }
+
+    /// [`LexedStr::lex`], with `HASH` each identifier's name hashed too.
+    fn lex_with<const FAST: bool, const HASH: bool>(edition: Edition, text: &'a str) -> LexedStr<'a> {
         let _p = tracing::info_span!("LexedStr::new").entered();
         assert!(text.len() <= u32::MAX as usize, "a text of 4 GiB or more");
         let mut conv = Converter::new(edition, text);
+        if HASH {
+            let mut names = scratch::lend_u64s();
+            // About one token in three is an identifier.
+            names.reserve(text.len() / 9);
+            conv.res.names = Some(names);
+        }
         if let Ok(script) = crate::frontmatter::ScriptSource::parse(text) {
             if let Some(shebang) = script.shebang_span() {
                 conv.push(SHEBANG, shebang.end - shebang.start);
@@ -95,11 +151,11 @@ impl<'a> LexedStr<'a> {
         if FAST {
             // The classes go in the worker's scratch, so a warm lex allocates nothing for them.
             blaze_mem::scratch::with_u64s(|words| {
-                let classes = scan::Classes::new(text.as_bytes(), words);
-                conv.lex_rest(Some(scan::Cursor::new(&classes, conv.offset)));
+                let classes = classify::Classes::new(text.as_bytes(), words);
+                conv.lex_rest::<HASH>(Some(&classes));
             });
         } else {
-            conv.lex_rest(None);
+            conv.lex_rest::<HASH>(None);
         }
         conv.finalize_with_eof()
     }
@@ -175,6 +231,17 @@ impl<'a> LexedStr<'a> {
         self.raw_len(i)
     }
 
+    /// Each token's kind and length, but the closing `EOF`, in order: one pass over the
+    /// token column, for walks that keep their own offset, with no index checked a token.
+    #[inline]
+    pub(crate) fn kinds_and_lens(&self) -> impl Iterator<Item = (SyntaxKind, usize)> + '_ {
+        self.tokens[..self.len()].iter().enumerate().map(|(i, &word)| {
+            let len = word >> KIND_BITS;
+            let len = if len < LONG { len as usize } else { self.raw_len(i) };
+            (SyntaxKind::from((word & KIND_MASK) as u16), len)
+        })
+    }
+
     #[inline]
     fn raw_kind(&self, i: usize) -> SyntaxKind {
         SyntaxKind::from((self.tokens[i] & KIND_MASK) as u16)
@@ -204,6 +271,14 @@ impl<'a> LexedStr<'a> {
     }
 
     fn push(&mut self, kind: SyntaxKind, start: usize, len: usize) {
+        if let Some(names) = self.names.as_deref_mut()
+            && LexedStr::has_name_hash(kind)
+        {
+            // An identifier `scan::simple` did not lex: raw, non-ASCII, or split by an edition.
+            let text = &self.text[start..start + len];
+            let name = text.strip_prefix("r#").unwrap_or(text);
+            names.push(blaze_phf::name_hash(name.as_bytes()));
+        }
         let at = self.tokens.len();
         if at.is_multiple_of(CHECKPOINT) {
             self.checkpoints.push(start as u32);
@@ -236,6 +311,7 @@ impl<'a> Converter<'a> {
                 text,
                 checkpoints,
                 tokens,
+                names: None,
                 // alloc: none until a token is 4 MiB or longer.
                 long: Vec::new(),
                 // alloc: none until the first error.
@@ -246,32 +322,31 @@ impl<'a> Converter<'a> {
         }
     }
 
-    /// Lexes the rest of the text: with a cursor, each token [`scan::token`] decides there and
-    /// the rest by `rustc_lexer`; without, all by `rustc_lexer`. Lexes from scratch at every
-    /// token `rustc_lexer` lexes, because some of its tokens are split as rustc splits them in
-    /// older editions: `GuardedStrPrefix` before 2024, a C string and a raw lifetime before 2021.
-    fn lex_rest(&mut self, mut cursor: Option<scan::Cursor<'_>>) {
+    /// Lexes the rest of the text: with classes, the simple tokens a block at a time
+    /// ([`scan::simple`]), each special one by [`scan::special`], and what neither decides by
+    /// `rustc_lexer`; without, all by `rustc_lexer`. Lexes from scratch at every token
+    /// `rustc_lexer` lexes, because some of its tokens are split as rustc splits them in older
+    /// editions: `GuardedStrPrefix` before 2024, a C string and a raw lifetime before 2021.
+    fn lex_rest<const HASH: bool>(&mut self, classes: Option<&classify::Classes<'_>>) {
         let text = self.res.text;
         while self.offset < text.len() {
-            let at = self.offset;
-            if let Some(cursor) = &mut cursor
-                && let Some((kind, len)) = scan::token(text, at, cursor)
-            {
-                let kind = match kind {
-                    IDENT => ident_kind(text, at, len, self.edition),
-                    kind => kind,
-                };
-                self.push(kind, len);
-                continue;
+            if let Some(classes) = classes {
+                if classify::is_simple_first(text.as_bytes()[self.offset]) {
+                    self.offset = scan::simple::<HASH>(&mut self.res, classes, self.edition, self.offset);
+                    if self.offset == text.len() {
+                        break;
+                    }
+                }
+                if let Some((kind, len)) = scan::special(text, self.offset, classes) {
+                    self.push(kind, len);
+                    continue;
+                }
             }
-            let rest = &text[at..];
+            let rest = &text[self.offset..];
             let token = rustc_lexer::tokenize(rest, rustc_lexer::FrontmatterAllowed::No)
                 .next()
                 .expect("a token where text is left");
             self.extend_token(&token.kind, &rest[..token.len as usize]);
-            if let Some(cursor) = &mut cursor {
-                cursor.seek(self.offset);
-            }
         }
     }
 
@@ -830,6 +905,49 @@ mod tests {
                 continue;
             }
             assert_eq!(input(&head.to_input_followed_by(&tail, edition)), expected, "split at {at}");
+        }
+    }
+
+    /// `to_input` from the column in one pass is the input token by token, `kind`, `text` and
+    /// all: trivia, contextual keywords in every edition, floats with and without a last `.`,
+    /// a token past the packed length, and the parser's own sources.
+    #[test]
+    fn the_input_in_one_pass_is_the_input_token_by_token() {
+        let mut texts = super::differential::parser_files();
+        texts.push("fn f() { x.0.1 + 1. + 1.5 + 1e3; union::default; dyn auto macro_rules! /* c */ }".to_owned());
+        texts.push(format!("fn f() {{ \"{}\" ; 2. }}", "s".repeat((1 << 22) + 3)));
+        for text in &texts {
+            for edition in Edition::iter() {
+                let lexed = LexedStr::new(edition, text);
+                let mut expected = crate::Input::with_capacity(lexed.len());
+                let mut was_joint = false;
+                for i in 0..lexed.len() {
+                    let (kind, text) = (lexed.kind(i), lexed.text(i));
+                    if kind.is_trivia() {
+                        was_joint = false;
+                    } else if kind == IDENT {
+                        expected.push_ident(SyntaxKind::from_contextual_keyword(text, edition).unwrap_or(IDENT), edition);
+                    } else {
+                        if was_joint {
+                            expected.was_joint();
+                        }
+                        expected.push(kind, edition);
+                        if kind != FLOAT_NUMBER {
+                            was_joint = true;
+                        } else if !text.ends_with('.') {
+                            expected.was_joint();
+                        } else {
+                            was_joint = false;
+                        }
+                    }
+                }
+                let got = lexed.to_input(edition);
+                assert_eq!(got.len(), expected.len(), "{edition:?}");
+                for i in 0..got.len() {
+                    let at = |it: &crate::Input| (it.kind(i), it.contextual_kind(i), it.is_joint(i));
+                    assert_eq!(at(&got), at(&expected), "token {i} in {edition:?}");
+                }
+            }
         }
     }
 }

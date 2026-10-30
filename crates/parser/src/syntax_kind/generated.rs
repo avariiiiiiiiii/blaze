@@ -347,6 +347,7 @@ pub enum SyntaxKind {
     UNWRAP_BINDER_KW,
     WRAP_BINDER_KW,
     UNSAFE_BINDER_CAST_EXPR,
+    UNSAFE_BINDER_TYPE,
     #[doc(hidden)]
     __LAST,
 }
@@ -464,6 +465,7 @@ impl SyntaxKind {
             | NOT_NULL
             | OFFSET_OF_EXPR
             | UNSAFE_BINDER_CAST_EXPR
+            | UNSAFE_BINDER_TYPE
             | OR_PAT
             | PARAM
             | PARAM_LIST

@@ -25,6 +25,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use blaze_bytes::le::{get_u32 as get, get_u64 as get64};
+
 use super::{
     KERN_SUCCESS, Kern, MACH_PORT_NULL, Object, Port, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, kern,
     mach_port_deallocate, mach_port_mod_refs, task,
@@ -138,14 +140,6 @@ impl Message {
 
 fn put(bytes: &mut [u8], at: usize, value: u32) {
     bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn get(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?))
-}
-
-fn get64(bytes: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.get(at..at.checked_add(8)?)?.try_into().ok()?))
 }
 
 fn bits(remote: u32, local: u32) -> u32 {

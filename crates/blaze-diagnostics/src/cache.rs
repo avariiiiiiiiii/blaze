@@ -34,8 +34,9 @@
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use base_db::{Crate, Db};
+use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_ids::{ContentId, Hasher};
-use hir_def::deps::{Held, ImageBuf, ImageStore};
+use hir_def::deps::{Held, ImageBuf, ImageStore, absolute, crate_name};
 use hir_ty_borrowck::Mode;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -340,15 +341,6 @@ fn replaced(text: &str, path: &str, marker: &str) -> Result<String, Refused> {
     Ok(out)
 }
 
-/// Whether `path` is absolute on some machine: `/..`, `C:\..`, `C:/..` or `\\..`.
-fn absolute(path: &str) -> bool {
-    match path.as_bytes() {
-        [b'/', ..] | [b'\\', b'\\', ..] => true,
-        [drive, b':', b'\\' | b'/', ..] => drive.is_ascii_alphabetic(),
-        _ => false,
-    }
-}
-
 /// What a string of a diagnostic is.
 #[derive(Clone, Copy)]
 enum Field {
@@ -424,30 +416,31 @@ pub fn encode(diags: &[Diag], paths: &Paths, root: &str) -> Result<Vec<u8>, Refu
     let flags = if diags.iter().any(Diag::is_error) { FAILED } else { 0 };
     // alloc: as above
     let mut out = Vec::with_capacity(HEADER + body.len());
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&flags.to_le_bytes());
-    out.extend_from_slice(&count.to_le_bytes());
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&body);
+    out.put_bytes(&MAGIC);
+    out.put_u32(flags);
+    out.put_u32(count);
+    out.put_u32(len);
+    out.put_bytes(&body);
     Ok(out)
 }
 
 /// The header of `bytes`: whether the check failed and how many diagnostics follow, its length
 /// checked against the bytes.
 fn header(bytes: &[u8]) -> Result<(bool, u32), &'static str> {
-    let Some((head, body)) = bytes.split_first_chunk::<HEADER>() else {
+    let short = |_: cursor::Error| "shorter than its header";
+    let mut read = Reader::new(bytes);
+    if read.left() < HEADER {
         return Err("shorter than its header");
-    };
-    let word = |at: usize| u32::from_le_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
-    if head[..4] != MAGIC {
+    }
+    if *read.array::<4>().map_err(short)? != MAGIC {
         return Err("not an outcome of this encoding");
     }
-    let flags = word(4);
+    let flags = read.u32().map_err(short)?;
     if flags & !FAILED != 0 {
         return Err("flags it does not know");
     }
-    let (count, len) = (word(8), word(12));
-    if len as usize != body.len() {
+    let (count, len) = (read.u32().map_err(short)?, read.u32().map_err(short)?);
+    if len as usize != read.left() {
         return Err("a body whose length is not its header's");
     }
     // Each diagnostic is a JSON object, more than one byte.
@@ -493,16 +486,6 @@ pub fn decode(bytes: &[u8], paths: impl FnOnce() -> Paths, root: &str) -> Result
         })?;
     }
     Ok(Outcome { failed, diags })
-}
-
-/// The name of `krate` in an error.
-fn crate_name(db: &Db, krate: Crate) -> String {
-    match &krate.extra_data(db).display_name {
-        // alloc: error text
-        Some(name) => name.to_string(),
-        // alloc: error text
-        None => format!("of root file {:?}", krate.data(db).root_file_id),
-    }
 }
 
 /// What [`serve`] found, over every call of a session: each adds to it.

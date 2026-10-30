@@ -9,6 +9,11 @@
 //! column holds. Its API is safe: a column is read only as the type it is declared with, a sink
 //! writes only within its column, a tree is made only full, and a fill that panics, fails or
 //! leaves a column short drops what it wrote and frees the block.
+//!
+//! The safe version, a `Box<[T]>` a column, costs an allocation and a free for each non-empty
+//! column of every tree (a dozen or more for an item tree) and two words a column in the tree
+//! itself, where this is one allocation and one pointer. [`columns!`]'s expansion is the one
+//! place outside this module that holds `unsafe`, each item marked `#[allow(unsafe_code)]`.
 
 use std::{
     alloc::{self, Layout},
@@ -398,8 +403,10 @@ macro_rules! columns {
         // SAFETY: a tree owns its columns' values as a `Box<[T]>` of each would, writes none
         // after it is made and lends only shared references to them, so it can be sent and
         // shared when every column's type can: the constant below checks they all are.
+        #[allow(unsafe_code)]
         unsafe impl Send for $Tree {}
         // SAFETY: as for `Send`.
+        #[allow(unsafe_code)]
         unsafe impl Sync for $Tree {}
         const _: () = {
             fn send_sync<T: Send + Sync>() {}
@@ -410,6 +417,7 @@ macro_rules! columns {
             $(
                 $(#[$col_attr])*
                 #[inline]
+                #[allow(unsafe_code)]
                 fn $col(&self) -> &[$T] {
                     // SAFETY: column `$Columns::$col` is `Shape::of::<$T>()`: `SHAPES` lists
                     // the columns' types in this same order.
@@ -465,6 +473,7 @@ macro_rules! columns {
             building: $crate::item_tree::block::Building<$Columns>,
         }
 
+        #[allow(unsafe_code)]
         impl $Sinks<'_> {
             fn new(lens: &$Lens) -> Self {
                 let building =

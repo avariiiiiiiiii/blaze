@@ -24,7 +24,7 @@ use syntax::{
 
 #[cfg(test)]
 thread_local! {
-    /// This is used to test `hir_segment_to_ast_segment()`. It's a hack, but it makes testing much easier.
+    /// This is used to test `hir_segment_to_ast_segment_view()`. It's a hack, but it makes testing much easier.
     pub(super) static SEGMENT_LOWERING_MAP: std::cell::RefCell<rustc_hash::FxHashMap<AstPtr<tag::PathSegment>, usize>> = std::cell::RefCell::default();
     /// Whether lowering fills `SEGMENT_LOWERING_MAP`: only for its tests, so that a budget
     /// test's lowering allocates what a build's does.
@@ -33,7 +33,7 @@ thread_local! {
 
 /// Converts an `ast::Path` to a path of the store's columns. Works with use trees.
 /// It correctly handles `$crate` based path from macro call.
-// If you modify the logic of the lowering, make sure to check if `hir_segment_to_ast_segment()`
+// If you modify the logic of the lowering, make sure to check if `hir_segment_to_ast_segment_view()`
 // also needs an update.
 pub(super) fn lower_path(
     collector: &mut ExprCollector<'_>,
@@ -368,7 +368,7 @@ impl ExprCollector<'_> {
         node: ast::GenericArgList<'_>,
         impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
     ) -> Option<GenericArgsIdx> {
-        // This needs to be kept in sync with `hir_generic_arg_to_ast()`.
+        // This needs to be kept in sync with `hir_generic_arg_to_ast_view()`.
         let args_base = self.stacks.generic_args.len();
         let bindings_base = self.stacks.assoc_bindings.len();
         for generic_arg in node.generic_args() {
@@ -378,7 +378,7 @@ impl ExprCollector<'_> {
                     self.stacks.generic_args.push(GenericArg::Type(type_ref));
                 }
                 ast::GenericArg::AssocTypeArg(assoc_type_arg) => {
-                    // This needs to be kept in sync with `hir_assoc_type_binding_to_ast()`.
+                    // This needs to be kept in sync with `hir_assoc_type_binding_to_ast_view()`.
                     if assoc_type_arg.param_list().is_some() {
                         // We currently ignore associated return type bounds.
                         continue;
@@ -477,38 +477,6 @@ pub fn hir_segment_to_ast_segment_view(
                 | None => false,
                 Some(ast::PathSegmentKind::Name(name)) => name.text() != "$crate",
                 Some(ast::PathSegmentKind::SelfTypeKw) => true,
-            })
-            .nth(segment_idx as usize)
-    }
-}
-
-/// [`hir_segment_to_ast_segment_view`] of a handle, for the callers outside the crate not yet on
-/// views.
-pub fn hir_segment_to_ast_segment(path: &tag::Path, segment_idx: u32) -> Option<tag::PathSegment> {
-    let mut segments = path.segments();
-    if let Some(tag::PathSegmentKind::Type { trait_ref: Some(trait_ref), .. }) =
-        segments.clone().next().and_then(|it| it.kind()) // clone: a syntax iterator, to peek
-    {
-        segments.next();
-        return find_segment(trait_ref.path()?.segments().chain(segments), segment_idx);
-    }
-    return find_segment(segments, segment_idx);
-
-    fn find_segment(
-        segments: impl Iterator<Item = tag::PathSegment>,
-        segment_idx: u32,
-    ) -> Option<tag::PathSegment> {
-        segments
-            .filter(|segment| match segment.kind() {
-                Some(
-                    tag::PathSegmentKind::CrateKw
-                    | tag::PathSegmentKind::SelfKw
-                    | tag::PathSegmentKind::SuperKw
-                    | tag::PathSegmentKind::Type { .. },
-                )
-                | None => false,
-                Some(tag::PathSegmentKind::Name(name)) => name.text() != "$crate",
-                Some(tag::PathSegmentKind::SelfTypeKw) => true,
             })
             .nth(segment_idx as usize)
     }

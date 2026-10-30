@@ -27,6 +27,7 @@
 use hir::InFile;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use stdx::edit_distance::find_best_match_for_name_with_substrings;
 use syntax::{
     NodeOrToken, SyntaxKind, T, TextRange,
     view::{self as ast, AstNode},
@@ -36,10 +37,10 @@ use super::{
     Args, Attr, AttrKind, Owner, Target, lint_at, parsed,
     table::{self, Allowed, Builtin, Kind, OnDuplicate, Policy, Safety, Targets},
 };
+use stdx::list::Join;
 use crate::{
     cx::{Cx, item_range_view},
     lints::{
-        edit_distance::find_best_match_for_name_with_substrings,
         registry::LintId,
         syntax::{Emitted, Walk, from_expansion, source_fact},
     },
@@ -439,7 +440,7 @@ fn unknown_crate_type(cx: &Cx<'_, '_>, attr: &Attr<'_>, value: Option<ast::Expr<
     let span = cx.span(attr.in_file(value_node.syntax().text_range()));
     // clone: the diagnostic's span
     let mut diag = Diag::lint("unknown_crate_types", "invalid `crate_type` value", span.clone());
-    if let Some(candidate) = find_best_match_for_name_with_substrings(STABLE, &text, Some(5)) {
+    if let Some(candidate) = find_best_match_for_name_with_substrings(STABLE, &text, Some(5)).copied() {
         // alloc: the diagnostic's text
         diag.suggestion(span, "did you mean", format!("\"{candidate}\""), Applicability::MaybeIncorrect);
     }
@@ -556,7 +557,7 @@ fn check_target(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner<'_>, attr: &Attr<'
     let (applied, only) = applied(krate, targets.allowed().collect(), owner.target);
     let only = if only { "only " } else { "" };
     // alloc: as above
-    diag.help(format!("the `{name}{args}` attribute can {only}be applied to {}", and_list(&applied)));
+    diag.help(format!("the `{name}{args}` attribute can {only}be applied to {}", stdx::list::list(applied.iter(), Join::And, false)));
     match (path.as_slice(), owner.target) {
         ([it], Target::Static) if it.as_str() == "link_name" => {
             let inner = cx.span(attr.in_file(attr.inner_range()));
@@ -749,7 +750,7 @@ fn ill_formed(cx: &Cx<'_, '_>, attr: &Attr<'_>, builtin: &Builtin, help: Option<
     let suggestions: Vec<String> =
         // alloc: the diagnostic's text, as is all of `ill_formed`'s
         builtin.template.suggestions(&attr.name(), attr.is_unsafe()).into_iter().map(|it| format!("`{it}`")).collect();
-    let list = and_list(&suggestions);
+    let list = stdx::list::list(suggestions.iter(), Join::And, false);
     let message = match suggestions.len() {
         // alloc: as above
         1 => format!("attribute must be of the form {list}"),
@@ -762,29 +763,6 @@ fn ill_formed(cx: &Cx<'_, '_>, attr: &Attr<'_>, builtin: &Builtin, help: Option<
         diag.help(format!("if you meant to silence a warning, consider using #![allow({lint})] or #![expect({lint})]"));
     }
     diag
-}
-
-/// rustc's `StrListSepByAnd`: `a`, `a and b`, `a, b, and c`.
-pub(crate) fn and_list<S: AsRef<str>>(items: &[S]) -> String {
-    match items {
-        // alloc: empty, allocates nothing
-        [] => String::new(),
-        // alloc: a diagnostic's text, as is all of `and_list`'s
-        [one] => one.as_ref().to_owned(),
-        // alloc: as above
-        [a, b] => format!("{} and {}", a.as_ref(), b.as_ref()),
-        [init @ .., last] => {
-            // alloc: as above
-            let mut out = String::new();
-            for it in init {
-                out.push_str(it.as_ref());
-                out.push_str(", ");
-            }
-            out.push_str("and ");
-            out.push_str(last.as_ref());
-            out
-        }
-    }
 }
 
 /// One item of an attribute's list: its elements, inline up to three.
@@ -863,9 +841,9 @@ mod tests {
 
     #[test]
     fn a_list_is_joined_with_and() {
-        assert_eq!(and_list(&["`a`"]), "`a`");
-        assert_eq!(and_list(&["`a`", "`b`"]), "`a` and `b`");
-        assert_eq!(and_list(&["`a`", "`b`", "`c`"]), "`a`, `b`, and `c`");
+        assert_eq!(stdx::list::list(["`a`"], stdx::list::Join::And, false), "`a`");
+        assert_eq!(stdx::list::list(["`a`", "`b`"], stdx::list::Join::And, false), "`a` and `b`");
+        assert_eq!(stdx::list::list(["`a`", "`b`", "`c`"], stdx::list::Join::And, false), "`a`, `b`, and `c`");
     }
 
     #[test]

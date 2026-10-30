@@ -33,9 +33,11 @@ pub(crate) fn comparing() -> bool {
 }
 
 /// Whether this process compares the servers: then nothing is kept, so that each call is
-/// expanded by both.
+/// expanded by both. Read once, as [`compare`] reads the server: every expansion asks, and a
+/// read of the environment takes the process's lock and scans it.
 pub(crate) fn enabled() -> bool {
-    std::env::var_os("BLAZE_PROC_MACRO_COMPARE").is_some()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BLAZE_PROC_MACRO_COMPARE").is_some())
 }
 
 struct Compare {

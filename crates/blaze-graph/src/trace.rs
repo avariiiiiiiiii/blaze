@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::machine::{Config, Error, Input, Machine, Output};
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Trace {
     pub config: Config,
     pub inputs: Vec<Input>,

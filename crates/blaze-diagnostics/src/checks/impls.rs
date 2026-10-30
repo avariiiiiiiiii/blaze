@@ -22,7 +22,7 @@ use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir_def::{BuiltinDeriveImplId, attrs::AttrFlags, lang_item::lang_items};
 use rustc_hash::FxHashMap;
-use syntax::view::{AstNode as _, HasAttrs as _, HasName as _};
+use syntax::view::{AstNode as _, HasName as _};
 
 use crate::{
     cx::Cx,
@@ -235,10 +235,7 @@ fn impls<'db>(cx: &Cx<'_, 'db>, scopes: &[hir::Module]) -> Vec<(hir::Impl, Origi
 
 /// Whether the trait is marked `#[rustc_deny_explicit_impl]`.
 fn denies_explicit_impls(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
-    let Some(source) = cx.vsema.source(trait_) else { return false };
-    source.value.attrs().any(|attr| {
-        attr.path().and_then(|path| path.as_single_name_ref()).is_some_and(|name| name.text() == "rustc_deny_explicit_impl")
-    })
+    AttrFlags::query(cx.db, hir_def::TraitId::from(trait_).into()).contains(AttrFlags::RUSTC_DENY_EXPLICIT_IMPL)
 }
 
 /// `enforce_trait_manually_implementable`: E0322 (E0328 for `Unsize`) for an impl of a trait
@@ -260,4 +257,37 @@ fn explicit_impl(cx: &Cx<'_, '_>, at: &ImplAt<'_>, trait_: hir::Trait) -> Vec<Fo
     diag.fact(at.coherence(cx), "the header of the impl");
     // alloc: the error
     vec![Found::new(diag, Phase::Items)]
+}
+
+#[cfg(test)]
+mod tests {
+    /// A trait is denied explicit impls by `#[rustc_deny_explicit_impl]`, written plainly or
+    /// through `cfg_attr` (rustc expands it first), and by nothing else.
+    #[test]
+    fn explicit_impls_of_a_denying_trait_are_errors() {
+        let checked = crate::tests::checked(
+            r#"//- /main.rs crate:main
+#![feature(rustc_attrs)]
+#[rustc_deny_explicit_impl]
+pub trait Denied {}
+#[cfg_attr(all(), rustc_deny_explicit_impl)]
+pub trait ByCfgAttr {}
+#[cfg_attr(any(), rustc_deny_explicit_impl)]
+pub trait Allowed {}
+pub struct S;
+impl Denied for S {}
+impl ByCfgAttr for S {}
+impl Allowed for S {}
+fn main() {}
+"#,
+        );
+        let errors: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("E0322: ")).collect();
+        assert_eq!(
+            errors,
+            [
+                "E0322: explicit impls for the `Denied` trait are not permitted",
+                "E0322: explicit impls for the `ByCfgAttr` trait are not permitted",
+            ]
+        );
+    }
 }

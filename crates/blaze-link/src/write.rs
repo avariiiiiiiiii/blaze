@@ -11,8 +11,8 @@
 //!
 //! The lists the writer reads (rebased addresses, binds, GOT cells, functions) are kept
 //! across links, sorted, with the piece each entry is of: an incremental link drops the
-//! entries of the pieces it wrote or removed and merges in their new ones in one pass, and
-//! the writer borrows them. The debug sections are made again only when a function or a
+//! entries of the pieces it wrote or removed and merges in their new ones (a plan from the
+//! changes, then a parallel copy of the kept runs), and the writer borrows them. The debug sections are made again only when a function or a
 //! span table changed.
 
 use std::ops::Range;
@@ -52,7 +52,7 @@ pub(crate) enum Value {
 }
 
 /// Why a symbol has no value; made into words only when an error is reported.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum Why {
     Undefined(Sym),
     Removed,
@@ -946,11 +946,24 @@ impl<'a> Stage<'a> {
         for (at, cell) in writes {
             bytes.write(at, &cell);
         }
-        if !self.dirty_cells.is_empty() || !self.emptied.is_empty() {
+        if self.filled_slots_changed(id) {
             let rebase = collect_in(self.new.filled_cells().map(|(slot, _)| u64::from(slot) * 8), self.arena);
             self.new.set_loader(id, &rebase, &[]);
         }
         Ok(())
+    }
+
+    /// Whether the cells piece `id`'s rebase list (every filled slot's cell, `filled_cells`)
+    /// may differ from the last link's: a slot this stage set or emptied went from empty to
+    /// filled or back, or the piece is new. A slot that held a body and holds another keeps
+    /// its entry, so the common edit (a body moved) costs its dirty slots, not every slot.
+    fn filled_slots_changed(&self, id: PieceId) -> bool {
+        let (old, new) = (self.old, &self.new);
+        if self.fresh.contains(id) || old.piece(id).is_none() {
+            return !self.dirty_cells.is_empty() || !self.emptied.is_empty();
+        }
+        let flipped = |slot: u32| old.cell(slot).is_some() != new.cell(slot).is_some();
+        self.dirty_cells.iter().any(flipped) || self.emptied.iter().any(|slot| flipped(*slot))
     }
 }
 
@@ -985,7 +998,7 @@ impl Addr for Function {
 
 /// A list the writer reads, in address order (ties by piece), and the piece each entry is
 /// of. Cloning it shares it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug)] // clone: two `Arc`s, reference counts only
 pub(crate) struct Owned<T> {
     pub items: Arc<Vec<T>>,
     owners: Arc<Vec<PieceId>>,
@@ -1005,14 +1018,69 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
         Owned { items: Arc::new(items), owners: Arc::new(owners) }
     }
 
-    /// The list without the entries of `drop`'s pieces, and with `entries`: one pass. Each run
-    /// it replaces is pushed to `runs`, unless the run's new entries equal its old ones.
+    /// The list without the entries of `drop`'s pieces, and with `entries`. Each run it
+    /// replaces is pushed to `runs`, unless the run's new entries equal its old ones.
+    ///
+    /// The plan costs the change: the dropped entries come from one parallel scan of the
+    /// owners, each new entry's place from a binary search. Then the kept entries between the
+    /// runs are copied in parallel. A one-function edit so costs a copy of the list at memory
+    /// bandwidth, where a serial walk cost about 5 ns an entry. Same lists and runs as
+    /// [`Owned::splice_serial`], the reference the tests hold it to.
     fn splice(&self, drop: &IdSet, mut entries: Vec<(PieceId, T)>, runs: &mut FrameVec<'_, Splice>) -> Owned<T>
     where
         T: PartialEq,
     {
         if drop.is_empty() && entries.is_empty() {
             // clone: two reference counts; the list is shared, not copied
+            return self.clone();
+        }
+        radix::sort_by_key(&mut entries, |(id, it)| radix::pack_64(it.addr(), u64::from(*id)));
+        let (old, old_owners) = (&self.items[..], &self.owners[..]);
+        // alloc: once per list a stage changes, the dropped entries' indexes
+        let dropped: Vec<u32> = if drop.is_empty() {
+            Vec::new() // alloc: empty, which allocates nothing
+        } else {
+            old_owners
+                .par_iter()
+                .enumerate()
+                .with_min_len(SPLICE_GRAIN)
+                .filter(|(_, owner)| drop.contains(**owner))
+                .map(|(at, _)| at as u32)
+                .collect() // alloc: as above
+        };
+        let gaps = gaps(old, old_owners, &dropped, &entries);
+        let len = old.len() - dropped.len() + entries.len();
+        let mut items = Vec::with_capacity(len);
+        let mut owners = Vec::with_capacity(len);
+        let mut entries = entries.into_iter();
+        let mut from = 0;
+        for gap in &gaps {
+            extend_par(&mut items, &old[from..gap.old.start]);
+            extend_par(&mut owners, &old_owners[from..gap.old.start]);
+            let at = items.len();
+            for (id, it) in entries.by_ref().take(gap.new) {
+                items.push(it);
+                owners.push(id);
+            }
+            // clone: a range, two words
+            run(&old[gap.old.clone()], &items[at..], gap.old.start, at, runs);
+            from = gap.old.end;
+        }
+        extend_par(&mut items, &old[from..]);
+        extend_par(&mut owners, &old_owners[from..]);
+        debug_assert_eq!(items.len(), len);
+        // alloc: once per list a stage changes; the state shares the list
+        Owned { items: Arc::new(items), owners: Arc::new(owners) }
+    }
+
+    /// [`Owned::splice`] as one serial pass: the reference its tests hold it to.
+    #[cfg(test)]
+    fn splice_serial(&self, drop: &IdSet, mut entries: Vec<(PieceId, T)>, runs: &mut FrameVec<'_, Splice>) -> Owned<T>
+    where
+        T: PartialEq,
+    {
+        if drop.is_empty() && entries.is_empty() {
+            // clone: two reference counts
             return self.clone();
         }
         radix::sort_by_key(&mut entries, |(id, it)| radix::pack_64(it.addr(), u64::from(*id)));
@@ -1046,9 +1114,106 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
         if let Some((old, from)) = open {
             run(&self.items[old..], &items[from..], old, from, runs);
         }
-        // alloc: once per list a stage changes; the state shares the list
+        // alloc: the two shared lists the writers and the next link borrow, once per splice
         Owned { items: Arc::new(items), owners: Arc::new(owners) }
     }
+}
+
+/// Below this many entries a list's scan or copy runs on one thread.
+const SPLICE_GRAIN: usize = 1 << 14;
+
+/// Functions a task of [`Stage::debug`] makes the rows of.
+const DEBUG_CHUNK: usize = 1024;
+
+/// `rows` cut before every [`DEBUG_CHUNK`]th function's first row, `starts` being where each
+/// function's rows start and, last, where they end.
+fn debug_chunks<'r>(mut rows: &'r mut [crate::dwarf::Row], starts: &[usize]) -> Vec<&'r mut [crate::dwarf::Row]> {
+    let functions = starts.len() - 1;
+    // alloc: once per stage that makes debug info, a slice per task
+    let mut out = Vec::with_capacity(functions.div_ceil(DEBUG_CHUNK));
+    for from in (0..functions).step_by(DEBUG_CHUNK) {
+        let to = (from + DEBUG_CHUNK).min(functions);
+        let (mine, rest) = std::mem::take(&mut rows).split_at_mut(starts[to] - starts[from]);
+        out.push(mine);
+        rows = rest;
+    }
+    out
+}
+
+/// `from` cloned onto `out`, in parallel when it is long: rayon writes an indexed iterator's
+/// items in place, in order.
+fn extend_par<T: Clone + Send + Sync>(out: &mut Vec<T>, from: &[T]) {
+    if from.len() < SPLICE_GRAIN {
+        out.extend_from_slice(from);
+    } else {
+        out.par_extend(from.par_iter().with_min_len(SPLICE_GRAIN / 4).cloned());
+    }
+}
+
+/// One run a splice replaces: `old` in the last list (its dropped entries, consecutive), and
+/// the next `new` of the sorted new entries, which go where it was.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Gap {
+    old: Range<usize>,
+    new: usize,
+}
+
+/// The runs a splice replaces, in order: each the dropped entries between two kept ones and
+/// the new entries whose (address, piece) falls between those two. `dropped` is sorted, and
+/// `entries` sorted by (address, piece); a new entry never ties a kept one, whose piece is
+/// not dropped. Costs the dropped entries plus a binary search per new one.
+fn gaps<T: Addr>(old: &[T], owners: &[PieceId], dropped: &[u32], entries: &[(PieceId, T)]) -> Vec<Gap> {
+    // The dropped entries as blocks of consecutive indexes; each block ends at a kept entry
+    // or the list's end.
+    // alloc: once per list a stage changes, O(dropped)
+    let mut blocks: Vec<Range<usize>> = Vec::new();
+    for &at in dropped {
+        let at = at as usize;
+        match blocks.last_mut() {
+            Some(last) if last.end == at => last.end += 1,
+            _ => blocks.push(at..at + 1),
+        }
+    }
+    let key = |at: usize| (old[at].addr(), owners[at]);
+    // alloc: once per list a stage changes, O(dropped + new)
+    let mut out: Vec<Gap> = Vec::with_capacity(blocks.len() + entries.len());
+    let mut block = 0;
+    for (id, it) in entries {
+        let want = (it.addr(), *id);
+        let (mut lo, mut hi) = (0, old.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if key(mid) < want {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // The kept entry it goes before: past a block of dropped ones it lands in.
+        while blocks.get(block).is_some_and(|it| it.end < lo) {
+            // clone: a range, two words
+            out.push(Gap { old: blocks[block].clone(), new: 0 });
+            block += 1;
+        }
+        let end = match blocks.get(block) {
+            Some(it) if it.start <= lo => it.end,
+            _ => lo,
+        };
+        match out.last_mut() {
+            Some(last) if last.old.end == end => last.new += 1,
+            _ => match blocks.get(block) {
+                Some(it) if it.end == end => {
+                    // clone: a range, two words
+                    out.push(Gap { old: it.clone(), new: 1 });
+                    block += 1;
+                }
+                _ => out.push(Gap { old: end..end, new: 1 }),
+            },
+        }
+    }
+    // clone: a range, two words
+    out.extend(blocks[block..].iter().map(|it| Gap { old: it.clone(), new: 0 }));
+    out
 }
 
 /// Pushes the run of `old` (from `old_at` in the last list) replaced by `new` (from `new_at`),
@@ -1086,7 +1251,7 @@ pub(crate) fn next_synthesis() -> u64 {
 
 /// The lists the writer reads, kept across links: [`State::lists`]. Each list is shared on
 /// its own, so a link that changes none of one keeps it.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug)] // clone: `Owned`s and an `Arc`, reference counts only
 pub(crate) struct Lists {
     pub rebase: Owned<u64>,
     pub binds: Owned<Bind>,
@@ -1324,20 +1489,33 @@ impl<'a> Stage<'a> {
             };
             let mut stale = IdSet::default();
             if !self.changed.is_empty() {
-                for owner in old.functions.owners.iter() {
-                    if affected.contains(*owner) {
-                        continue;
-                    }
-                    let Some(info) = self.new.piece(*owner).and_then(PieceRef::function) else { continue };
-                    let windows = info.windows.is_some_and(|(unwind, handler, lsda)| {
-                        self.changed.contains(unwind)
-                            || handler.is_some_and(|it| self.changed.contains(it))
-                            || lsda.is_some_and(|it| self.changed.contains(it))
-                    });
-                    if windows || info.fde.is_some_and(|it| self.changed.contains(it)) {
-                        stale.insert(*owner);
-                    }
-                }
+                // The changed symbols as a sorted slice the workers share (the set is in the
+                // stage's frame, which one thread owns); each function then costs a binary
+                // search of the few, in parallel.
+                let mut changed = collect_in(self.changed.iter(), arena);
+                radix::sort_copy_by_key(&mut changed, |it| it.0);
+                let (changed, state): (&[Sym], &State) = (&changed, &self.new);
+                let is = |sym: Sym| changed.binary_search(&sym).is_ok();
+                let affected = &affected;
+                // alloc: once per stage that changed a symbol, the functions it left stale
+                let found: Vec<PieceId> = old
+                    .functions
+                    .owners
+                    .par_iter()
+                    .with_min_len(SPLICE_GRAIN)
+                    .filter(|owner| {
+                        if affected.contains(**owner) {
+                            return false;
+                        }
+                        let Some(info) = state.piece(**owner).and_then(PieceRef::function) else { return false };
+                        let windows = info
+                            .windows
+                            .is_some_and(|(unwind, handler, lsda)| is(unwind) || handler.is_some_and(is) || lsda.is_some_and(is));
+                        windows || info.fde.is_some_and(is)
+                    })
+                    .copied()
+                    .collect(); // alloc: once per stage, the stale functions found in parallel
+                stale.extend(found);
             }
             let mut functions = batch.functions;
             if !stale.is_empty() {
@@ -1435,66 +1613,122 @@ impl<'a> Stage<'a> {
         Ok(Parts { regions, exports: out, entry, init, fini, id })
     }
 
-    /// The debug sections of every Rust function, in address order: one pass over their
-    /// lines into rows, then [`crate::dwarf::sections`].
+    /// The debug sections of every Rust function, in address order: their lines made into
+    /// rows, then [`crate::dwarf::sections`].
+    ///
+    /// The rows are made in parallel, [`DEBUG_CHUNK`] functions a task, each task numbering
+    /// the files in the order it first meets them. Those orders joined in function order are
+    /// the order one pass over every function meets them in, so the rows renumbered with
+    /// them, in parallel, are that pass's rows, and the first error in function order is the
+    /// one given.
     fn debug(&self, lists: &Lists) -> Result<[(&'static str, Vec<u8>); 4], LinkError> {
         let state = &self.new;
-        let arena = self.arena;
-        let count = lists.functions.items.len();
-        let mut functions = Vec::with_capacity_in(count, arena);
-        let mut infos = Vec::with_capacity_in(count, arena);
-        let mut rows_len = 0usize;
-        for (owner, function) in lists.functions.owners.iter().zip(lists.functions.items.iter()) {
-            let Some(info) = state.piece(*owner).and_then(PieceRef::function) else { continue };
-            rows_len += state.lines(info).len();
-            infos.push(info);
-            functions.push(function);
+        let symbols: &Symbols = self.symbols;
+        // alloc: once per stage that makes debug info: the Rust functions in list order
+        let functions: Vec<_> = lists
+            .functions
+            .owners
+            .par_iter()
+            .zip(lists.functions.items.par_iter())
+            .with_min_len(DEBUG_CHUNK)
+            .filter_map(|(owner, function)| Some((state.piece(*owner).and_then(PieceRef::function)?, function)))
+            .collect(); // alloc: as above
+        // alloc: as above, each function's line count, then where its rows start
+        let counts: Vec<usize> =
+            functions.par_iter().with_min_len(DEBUG_CHUNK).map(|(info, _)| state.lines(info).len()).collect(); // alloc: as above
+        let mut starts: Vec<usize> = Vec::with_capacity(functions.len() + 1);
+        let mut total = 0;
+        starts.push(0);
+        for count in counts {
+            total += count;
+            starts.push(total);
         }
-        let mut rows: FrameVec<'a, crate::dwarf::Row> = Vec::with_capacity_in(rows_len, arena);
-        let mut files: FrameVec<'_, &str> = Vec::new_in(arena);
-        let mut file_of: FxHashMap<(IdNo, u32), u32> = FxHashMap::default();
-        let mut views = Vec::with_capacity_in(functions.len(), arena);
-        let mut last: Option<(&blaze_ids::ContentId, IdNo, &crate::position::Spans)> = None;
-        for (info, function) in infos.into_iter().zip(functions) {
-            let start = rows.len() as u32;
-            for line in state.lines(info) {
-                let anchor = &line.span.anchor;
-                let (anchor_id, table) = match last {
-                    Some((at, id, table)) if at == anchor => (id, table),
-                    _ => {
-                        let found = self.symbols.find_id(anchor).and_then(|id| Some((id, state.span_table(id)?)));
-                        let (id, table) = found.ok_or_else(|| {
-                            // alloc: error path
-                            error(Some(info.key), format!("a line in {anchor:?}, whose span table the link was not given"))
-                        })?;
-                        last = Some((anchor, id, table));
-                        (id, table)
-                    }
-                };
-                let at = table.span(line.span.index).ok_or_else(|| {
-                    // alloc: error path
-                    error(Some(info.key), format!("span {} of {anchor:?}, past its table", line.span.index))
-                })?;
-                let next = files.len() as u32;
-                let file = *file_of.entry((anchor_id, at.file)).or_insert(next);
-                if file == next {
-                    files.push(table.file(at.file));
-                }
-                rows.push(crate::dwarf::Row { at: line.at, file, line: at.line, column: at.column });
-            }
-            views.push(crate::dwarf::DebugFunction {
+        // alloc: as above, a view per function
+        let views: Vec<crate::dwarf::DebugFunction<'_>> = functions
+            .par_iter()
+            .enumerate()
+            .with_min_len(DEBUG_CHUNK)
+            .map(|(at, (info, function))| crate::dwarf::DebugFunction {
                 addr: function.addr,
                 size: function.size,
-                name: state.debug_name(info.id).map(|it| self.symbols.str(it)),
-                lines: start..rows.len() as u32,
-            });
+                name: state.debug_name(info.id).map(|it| symbols.str(it)),
+                lines: starts[at] as u32..starts[at + 1] as u32,
+            })
+            .collect(); // alloc: as above
+        let rows: &mut [crate::dwarf::Row] =
+            self.arena.alloc_slice_fill_with(total, |_| crate::dwarf::Row { at: 0, file: 0, line: 0, column: 0 });
+        // Each task's files, (anchor, file in its table) and name, in the order it met them.
+        type Met<'s> = Vec<((IdNo, u32), &'s str)>;
+        let met: Vec<Result<Met<'_>, LinkError>> = debug_chunks(&mut *rows, &starts)
+            .into_par_iter()
+            .enumerate()
+            .map(|(chunk, out)| {
+                let from = chunk * DEBUG_CHUNK;
+                // alloc: once per task of DEBUG_CHUNK functions, its files (a few)
+                let mut met: Met<'_> = Vec::new();
+                let mut file_of: FxHashMap<(IdNo, u32), u32> = FxHashMap::default();
+                let mut last: Option<(&blaze_ids::ContentId, IdNo, &crate::position::Spans)> = None;
+                let mut at = 0;
+                for (info, _) in &functions[from..(from + DEBUG_CHUNK).min(functions.len())] {
+                    for line in state.lines(info) {
+                        let anchor = &line.span.anchor;
+                        let (anchor_id, table) = match last {
+                            Some((it, id, table)) if it == anchor => (id, table),
+                            _ => {
+                                let found = symbols.find_id(anchor).and_then(|id| Some((id, state.span_table(id)?)));
+                                let (id, table) = found.ok_or_else(|| {
+                                    // alloc: error path
+                                    error(Some(info.key), format!("a line in {anchor:?}, whose span table the link was not given"))
+                                })?;
+                                last = Some((anchor, id, table));
+                                (id, table)
+                            }
+                        };
+                        let span = table.span(line.span.index).ok_or_else(|| {
+                            // alloc: error path
+                            error(Some(info.key), format!("span {} of {anchor:?}, past its table", line.span.index))
+                        })?;
+                        let next = met.len() as u32;
+                        let file = *file_of.entry((anchor_id, span.file)).or_insert(next);
+                        if file == next {
+                            met.push(((anchor_id, span.file), table.file(span.file)));
+                        }
+                        out[at] = crate::dwarf::Row { at: line.at, file, line: span.line, column: span.column };
+                        at += 1;
+                    }
+                }
+                Ok(met)
+            })
+            .collect(); // alloc: once per stage that makes debug info, a result per task
+        // alloc: once per stage that makes debug info, the files and each task's numbers for its own
+        let mut files: Vec<&str> = Vec::new();
+        let mut file_of: FxHashMap<(IdNo, u32), u32> = FxHashMap::default();
+        let mut renumber: Vec<Vec<u32>> = Vec::with_capacity(met.len());
+        for met in met {
+            let numbers = met?
+                .into_iter()
+                .map(|(key, name)| {
+                    let next = files.len() as u32;
+                    let file = *file_of.entry(key).or_insert(next);
+                    if file == next {
+                        files.push(name);
+                    }
+                    file
+                })
+                .collect(); // alloc: as above, a task's numbers
+            renumber.push(numbers);
         }
+        debug_chunks(&mut *rows, &starts).into_par_iter().zip(renumber.par_iter()).for_each(|(out, numbers)| {
+            for row in out {
+                row.file = numbers[row.file as usize];
+            }
+        });
         let size = match self.output.arch {
             Arch::Wasm32 => 4,
             Arch::X86_64 | Arch::Aarch64 => 8,
         };
         // alloc: error path
-        crate::dwarf::sections(&views, &rows, &files, size).map_err(|it| error(None, format!("debug info: {it}")))
+        crate::dwarf::sections(&views, rows, &files, size).map_err(|it| error(None, format!("debug info: {it}")))
     }
 
     /// The address of a name the image defines, among `regions`: [`Placed::symbol`].
@@ -1582,13 +1816,64 @@ mod tests {
         let mut drop = IdSet::default();
         drop.extend((0..200).filter(|it| it % 7 == 0));
         let new: Vec<(PieceId, u64)> = (0..200u32).filter(|it| it % 7 == 0).map(|id| (id, u64::from(id) * 13 % 3000)).chain([(500, 0), (501, 9999)]).collect();
-        let spliced = list.splice(&drop, new.clone());
+        let frame = crate::arena::stage_frame().unwrap();
+        let mut runs = Vec::new_in(&frame);
+        let spliced = list.splice(&drop, new.clone(), &mut runs);
         let mut want: Vec<(PieceId, u64)> = old.into_iter().filter(|it| !drop.contains(it.0)).chain(new).collect();
         want.sort_by_key(|(id, at)| (*at, *id));
         assert_eq!(*spliced.items, want.iter().map(|it| it.1).collect::<Vec<_>>());
         assert_eq!(*spliced.owners, want.iter().map(|it| it.0).collect::<Vec<_>>());
-        let same = spliced.splice(&IdSet::default(), Vec::new());
+        assert!(!runs.is_empty());
+        runs.clear();
+        let same = spliced.splice(&IdSet::default(), Vec::new(), &mut runs);
         assert_eq!(*same.items, *spliced.items);
+        assert!(runs.is_empty(), "a splice of nothing replaces no run");
+    }
+
+    /// The planned, parallel splice against the serial pass, on seeded lists below and above
+    /// the parallel grain: pieces with several entries, entries sharing an address, dropped
+    /// pieces given new entries at their old addresses or elsewhere, new pieces, and drops
+    /// of none, some or all.
+    #[test]
+    fn a_planned_splice_gives_the_serial_lists_and_runs() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below.max(1)
+        };
+        let frame = crate::arena::stage_frame().unwrap();
+        for (round, pieces) in [0u32, 1, 3, 40, 500, 9_000, 30_000].into_iter().cycle().take(42).enumerate() {
+            let mut old: Vec<(PieceId, u64)> = Vec::new();
+            for id in 0..pieces {
+                let base = next(u64::from(pieces) * 64);
+                for _ in 0..1 + next(3) {
+                    old.push((id, base + next(4) * 8));
+                }
+            }
+            let list = Owned::build(old.clone());
+            let mut drop = IdSet::default();
+            let share = [0, 1, 7, 50, 100][round % 5];
+            drop.extend((0..pieces).filter(|_| next(100) < share));
+            let mut new: Vec<(PieceId, u64)> = Vec::new();
+            for (id, at) in &old {
+                if drop.contains(*id) && next(3) > 0 {
+                    new.push((*id, if next(2) == 0 { *at } else { next(u64::from(pieces) * 64 + 64) }));
+                }
+            }
+            for id in pieces..pieces + next(4) as u32 {
+                drop.insert(id);
+                new.push((id, next(u64::from(pieces) * 64 + 64)));
+            }
+            let (mut runs, mut serial_runs) = (Vec::new_in(&frame), Vec::new_in(&frame));
+            let planned = list.splice(&drop, new.clone(), &mut runs);
+            let serial = list.splice_serial(&drop, new, &mut serial_runs);
+            let what = format!("round {round}: {pieces} pieces, {share}% dropped");
+            assert_eq!(*planned.items, *serial.items, "{what}");
+            assert_eq!(*planned.owners, *serial.owners, "{what}");
+            assert_eq!(runs[..], serial_runs[..], "{what}");
+        }
     }
 
     /// The column gives back what was put in it, and nothing for a symbol it was not given.

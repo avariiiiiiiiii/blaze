@@ -23,13 +23,14 @@ use syntax::{
     view::{self as ast, AstNode as _, RangeItem as _},
 };
 
+use stdx::list::Join;
 use crate::{
     cx::Cx,
     lints::code_fact,
     lower::{
         Found, Phase,
         no_such_field::{
-            Record, RecordField, has_unmentioned_error, is_number, listify, pat_fields, suggestable, tuple_variant_as_struct,
+            Record, RecordField, has_unmentioned_error, is_number, pat_fields, suggestable, tuple_variant_as_struct,
             variant_path,
         },
         unresolved_method_call::inject_use_span,
@@ -194,9 +195,9 @@ pub(crate) fn last_field_mismatch<'db>(cx: &Cx<'_, 'db>, value: InFile<ast::Node
 
 /// `..` with no base: E0797, or with `#![feature(default_field_values)]` the fields without
 /// a default value, or the variant having no fields.
-fn default_fields(
-    cx: &Cx<'_, '_>,
-    record: &Record<'_>,
+fn default_fields<'db>(
+    cx: &Cx<'_, 'db>,
+    record: &Record<'db>,
     variant: hir::Variant,
     dots: TextRange,
     remaining: &[(String, hir::Field)],
@@ -250,7 +251,7 @@ fn default_fields(
     let s = if mandatory.len() == 1 { "" } else { "s" };
     let at = dots.shrink_to_lo();
     // alloc: clone: the error's parts, for an error hir found
-    let mut diag = Diag::error(None, format!("missing field{s} {} in initializer", listify(&mandatory)), at.clone());
+    let mut diag = Diag::error(None, format!("missing field{s} {} in initializer", stdx::list::list(mandatory.iter(), Join::AndNoSerialComma, true)), at.clone());
     diag.span_label(at, "fields that do not have a defaulted value must be provided explicitly");
     Some(diag)
 }
@@ -417,7 +418,7 @@ fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Var
                 // alloc: the error's parts, for an error hir found
                 let names: Vec<&str> = left_out.iter().map(String::as_str).collect();
                 // alloc: the error's text, for an error hir found
-                format!("{} ", listify(&names))
+                format!("{} ", stdx::list::list(names.iter(), Join::AndNoSerialComma, true))
             }
         };
         let and_other = if record.fields.is_empty() { "" } else { "...and other " };

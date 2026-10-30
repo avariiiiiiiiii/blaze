@@ -299,7 +299,12 @@ impl Compiler {
             ]);
         }
         let workspace = Arc::new(CrateWorkspaceData {
-            target: Ok(TargetData { data_layout: DATA_LAYOUT.into(), arch: Arch::Wasm32 }),
+            target: Ok(TargetData {
+                tuple: Symbol::intern("wasm32-unknown-unknown"),
+                data_layout: DATA_LAYOUT.into(),
+                arch: Arch::Wasm32,
+                has_thumb_interworking: false,
+            }),
             toolchain: None,
             const_eval: Default::default(),
         });
@@ -355,7 +360,9 @@ impl Compiler {
                 if !krate.data(db).origin.is_local() {
                     let functions = functions_of(db, krate.into());
                     named.extend(
-                        functions.into_iter().filter_map(|it| Some((names.function(it)?, it))),
+                        functions
+                            .into_iter()
+                            .filter_map(|it| Some((names.function(it)?.as_str().to_owned(), it))),
                     );
                 }
             }
@@ -381,7 +388,7 @@ impl Compiler {
         // dyn: `CodegenUnit::compile`'s resolver, one per build, chosen by whether there is a host.
         let resolver: &dyn SymbolResolver = match host {
             Some((_, table)) => {
-                rustc = names::Resolver { db, table };
+                rustc = names::Resolver { db, table, places: Default::default() };
                 &rustc
             }
             None => {
@@ -439,9 +446,10 @@ impl Compiler {
             .filter(|(_, why)| !why.no_symbol())
             .filter(|(func, _)| func.krate(db).data(db).origin.is_local())
             .map(|&(func, ref why)| {
-                let name = resolver
-                    .function(func)
-                    .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned());
+                let name = resolver.function(func).map_or_else(
+                    || FunctionSignature::of(db, func).name.as_str().to_owned(),
+                    |it| it.as_str().to_owned(),
+                );
                 (name, why.to_string())
             })
             .collect();
@@ -507,9 +515,9 @@ impl Names<'_> {
 }
 
 impl SymbolResolver for Names<'_> {
-    fn function(&self, func: FunctionId) -> Option<String> {
+    fn function(&self, func: FunctionId) -> Option<Symbol> {
         if let Some(symbol) = exported_symbol(self.db, func) {
-            return Some(symbol);
+            return Some(Symbol::intern(&symbol)); // alloc: wasm, per name
         }
         let generic = |def: hir::GenericDef| !def.type_or_const_params(self.db).is_empty();
         let function = hir::Function::from(func);
@@ -519,13 +527,15 @@ impl SymbolResolver for Names<'_> {
         let module = self.module_path(function.module(self.db))?;
         let name = function.name(self.db);
         match func.lookup(self.db).container {
-            ItemContainerId::ModuleId(_) => Some(format!("{module}::{}", name.as_str())),
+            // alloc: wasm, per name
+            ItemContainerId::ModuleId(_) => Some(Symbol::intern(&format!("{module}::{}", name.as_str()))),
             ItemContainerId::ImplId(imp) if !generic(hir::Impl::from(imp).into()) => {
                 // The `impl`s of a module are told apart by their place among its items.
                 let mut place = rustc_hash::FxHasher::default();
                 std::hash::Hash::hash(&imp.lookup(self.db).id, &mut place);
                 let place = std::hash::Hasher::finish(&place) as u32;
-                Some(format!("{module}::{{impl#{place:x}}}::{}", name.as_str()))
+                // alloc: wasm, per name
+                Some(Symbol::intern(&format!("{module}::{{impl#{place:x}}}::{}", name.as_str())))
             }
             ItemContainerId::ImplId(_)
             | ItemContainerId::TraitId(_)
@@ -533,13 +543,14 @@ impl SymbolResolver for Names<'_> {
         }
     }
 
-    fn static_(&self, id: StaticId) -> Option<String> {
+    fn static_(&self, id: StaticId) -> Option<Symbol> {
         let it = hir::Static::from(id);
-        Some(format!("{}::{}", self.module_path(it.module(self.db))?, it.name(self.db).as_str()))
+        let path = format!("{}::{}", self.module_path(it.module(self.db))?, it.name(self.db).as_str());
+        Some(Symbol::intern(&path)) // alloc: wasm, per name
     }
 
-    fn path(&self, path: &str) -> Option<String> {
-        self.library.contains_key(path).then(|| path.to_owned())
+    fn path(&self, path: &str) -> Option<&str> {
+        self.library.get_key_value(path).map(|(key, _)| key.as_str())
     }
 
     fn item(&self, item: ModuleDefId) -> Option<String> {
@@ -548,10 +559,10 @@ impl SymbolResolver for Names<'_> {
         Some(format!("{module}::{}", item.name(self.db)?.as_str()))
     }
 
-    fn source_path(&self, file: FileId) -> Option<String> {
+    fn source_path(&self, file: FileId) -> Option<Symbol> {
         let root = self.db.file_source_root(file).source_root_id(self.db);
         let root = self.db.source_root(root).source_root(self.db);
-        Some(root.path_for_file(&file)?.to_string())
+        Some(Symbol::intern(&root.path_for_file(&file)?.to_string())) // alloc: wasm, per name
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {

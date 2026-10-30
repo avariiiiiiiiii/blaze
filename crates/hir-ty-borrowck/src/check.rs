@@ -330,7 +330,7 @@ pub(super) fn check<'o, 'f, 'db>(
         in_scope: bits(frame, loans.loans.len()),
         dead_reported: mem::set(frame),
         reservation_reported: mem::set(frame),
-        static_muts: static_muts(ctx, body),
+        static_muts: static_muts(ctx, body, &decoded),
         mut_errors: mem::map(frame),
         requirements: Vec::new_in(out_frame),
         mut_upvars,
@@ -3399,7 +3399,7 @@ struct Guard<'f, 'b> {
 /// The [`Guard`]s of a body's `match` arms, and the index of the one of each expression and
 /// pattern in an arm's guard.
 fn guard_borrows<'f, 'b>(
-    ctx: &Ctx<'f, '_>,
+    ctx: &'f Ctx<'_, '_>,
     body: &'b MirBody<'_>,
 ) -> (FVec<'f, Guard<'f, 'b>>, FMap<'f, MirSpan, u32>) {
     use hir_def::hir::Expr;
@@ -3411,7 +3411,7 @@ fn guard_borrows<'f, 'b>(
     }
     let crate::scan::GuardedMatches { matches, tested_by, bound_by, guards: guarded } =
         &ctx.scan.guarded;
-    let frame = ctx.frame;
+    let frame: &'f Frame = ctx.frame;
     let mut out = mem::map(frame);
     if *matches == 0 {
         return (Vec::new_in(frame), out);
@@ -3697,22 +3697,11 @@ fn temporary_span(body: &MirBody<'_>, local: LocalId) -> Option<MirSpan> {
     None
 }
 
-fn static_muts<'f>(ctx: &Ctx<'f, '_>, body: &MirBody<'_>) -> BitSet<'f> {
+/// The locals a `static mut` is read into whole, in any block: the decode's constants.
+fn static_muts<'f>(ctx: &Ctx<'f, '_>, body: &MirBody<'_>, decoded: &Decoded<'_>) -> BitSet<'f> {
     let mut locals = bits(ctx.frame, body.locals.len());
-    for (_, block) in body.basic_blocks.iter() {
-        for statement in &block.statements {
-            if let StatementKind::Assign(
-                place,
-                Rvalue::Use(Operand { kind: OperandKind::Static(id), .. }),
-            ) = &statement.kind
-                && place.projection.as_slice().is_empty()
-                && hir_def::signatures::StaticSignature::of(ctx.db, *id)
-                    .flags
-                    .contains(hir_def::signatures::StaticFlags::MUTABLE)
-            {
-                locals.insert(raw(place.local));
-            }
-        }
+    for constant in decoded.constants.iter().filter(|it| it.mutable) {
+        locals.insert(raw(constant.local));
     }
     locals
 }

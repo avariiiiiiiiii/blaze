@@ -1,0 +1,195 @@
+//! A write as a delta of round-0 logs (design §5): which groups' logs changed, which groups are
+//! new or gone, and whether a change removed an op.
+//!
+//! A written file maps to the groups whose round-0 module it defines, and to their parents,
+//! whose logs read the head of a child's file (`#![cfg]`, `#![macro_use]`). Each such group's
+//! log is asked again under its stored key and compared with the stored copy. A changed list of
+//! round-0 children, a changed crate root key (the dependencies' roots), an added or removed
+//! file or a changed source root walks the whole round-0 tree instead, from `root_decl`: each
+//! module's key comes from its parent's new log, and a module no longer declared is gone with
+//! the group it heads.
+
+use base_db::{Crate, Db, Written};
+use hir_expand::HirFileId;
+use span::FileId;
+
+use super::state::{CrateState, Group, GroupOut, LogDiff, RecordShare, clone_op, diff_log};
+use crate::{
+    FxIndexMap, ModuleId,
+    nameres::facts::{
+        ops::DeclOp,
+        queries::{self, DeclKey},
+    },
+};
+
+/// What a write changed of a crate's round-0 logs.
+#[derive(Default)]
+pub(super) struct Delta {
+    /// The groups whose log changed or that are new, in group order.
+    pub(super) seeds: Vec<ModuleId>,
+    /// Of `seeds`, those whose change removed an op.
+    pub(super) removing: Vec<ModuleId>,
+    /// The groups whose change only inserted name-free ops (`state::is_name_free`), with
+    /// their places in the new log: applied to the group's scopes without a run.
+    pub(super) direct: Vec<(ModuleId, Vec<u32>)>,
+    /// The groups no longer declared, as they were.
+    pub(super) deleted: Vec<(ModuleId, Group)>,
+    /// The groups whose log was read again because a file of theirs was written.
+    pub(super) touched: Vec<ModuleId>,
+    /// Whether the crate root's share of a log (`#[macro_export]`) changed.
+    pub(super) root_ops: bool,
+    /// Whether the round-0 tree changed: groups came or went.
+    pub(super) tree: bool,
+    pub(super) ops: u64,
+}
+
+/// Reads the crate's round-0 logs that `written` may have changed into `state`'s groups.
+/// `cold`: the state is new, every group is a seed.
+pub(super) fn read(db: &Db, krate: Crate, state: &mut CrateState, written: &Written<'_>, cold: bool) -> Delta {
+    let mut delta = Delta::default();
+    let root_key = queries::root_decl(db, krate);
+    let full = cold
+        || !written.added.is_empty()
+        || !written.removed.is_empty()
+        || !written.roots.is_empty()
+        || state.groups.get(&state.root).is_none_or(|it| it.key != root_key);
+    if full || !incremental(db, state, written, &mut delta) {
+        delta = Delta::default();
+        walk(db, state, root_key, written, cold, &mut delta);
+    }
+    include_readers(state, written, &mut delta);
+    delta
+}
+
+/// The groups of the written files, their logs compared; `false` when a group's round-0
+/// children changed, which only a walk follows.
+fn incremental(db: &Db, state: &mut CrateState, written: &Written<'_>, delta: &mut Delta) -> bool {
+    let mut checked: Vec<ModuleId> = Vec::new(); // alloc: the groups of the written files, once per write
+    for file in written.set {
+        let Some(groups) = state.files.get(file) else { continue };
+        for &group in groups {
+            delta.touched.push(group);
+            checked.push(group);
+            if let Some(parent) = state.groups[&group].parent {
+                checked.push(state.group_of.get(&parent).copied().unwrap_or(parent));
+            }
+        }
+    }
+    checked.sort_by_key(|it| state.groups.get_index_of(it));
+    checked.dedup();
+    for group in checked {
+        let g = &mut state.groups[&group];
+        let decls = queries::module_decls(db, g.key);
+        if decls.children != g.children {
+            return false;
+        }
+        compare(state.root, group, g, &decls.ops.ops, delta);
+    }
+    true
+}
+
+/// The whole round-0 tree from `root_key`, in DFS preorder: the new group order.
+fn walk(db: &Db, state: &mut CrateState, root_key: DeclKey, written: &Written<'_>, cold: bool, delta: &mut Delta) {
+    delta.tree = true;
+    let mut old = std::mem::take(&mut state.groups);
+    let mut groups = FxIndexMap::default();
+    groups.reserve(old.len());
+    state.files.clear();
+    let mut stack = vec![root_key]; // alloc: the walk's stack, once per walk
+    while let Some(key) = stack.pop() {
+        let decl = key.decl(db);
+        let module = decl.module;
+        let decls = queries::module_decls(db, key);
+        let file = match decl.tree.file_id() {
+            HirFileId::FileId(file) => Some(file.file_id(db)),
+            HirFileId::MacroFile(_) => None,
+        };
+        let group = match old.swap_remove(&module) {
+            Some(mut group) if !cold => {
+                group.key = key;
+                group.file = file;
+                group.parent = decl.parent;
+                // clone: the keys of the round-0 children, once per walk
+                group.children = decls.children.clone();
+                compare(state.root, module, &mut group, &decls.ops.ops, delta);
+                if file.is_some_and(|it| written.set.contains(&it)) {
+                    delta.touched.push(module);
+                }
+                group
+            }
+            _ => {
+                delta.seeds.push(module);
+                delta.ops += decls.ops.ops.len() as u64;
+                delta.root_ops |= module != state.root && decls.ops.writes_elsewhere();
+                Group {
+                    key,
+                    // alloc: the state's copy of the log, once per log read
+                    log: decls.ops.iter().map(clone_op).collect(),
+                    file,
+                    parent: decl.parent,
+                    // clone: as above
+                    children: decls.children.clone(),
+                    modules: Vec::new(), // alloc: empty, the group's run fills it
+                    out: GroupOut::default(),
+                    records: RecordShare::default(),
+                }
+            }
+        };
+        if let Some(file) = file {
+            state.files.entry(file).or_default().push(module);
+        }
+        groups.insert(module, group);
+        stack.extend(decls.children.iter().rev().copied());
+    }
+    delta.deleted.extend(old.drain(..));
+    delta.root_ops |= delta.deleted.iter().any(|(_, it)| writes_root(state.root, &it.log));
+    state.groups = groups;
+}
+
+/// Compares the stored log of `group` with `new`, keeping a copy of `new` when they differ.
+fn compare(root: ModuleId, module: ModuleId, group: &mut Group, new: &[DeclOp], delta: &mut Delta) {
+    let LogDiff { changed, removed, ops, name_free } = diff_log(&group.log, new);
+    if !changed {
+        return;
+    }
+    delta.ops += ops;
+    match name_free {
+        Some(at) => delta.direct.push((module, at)),
+        None => {
+            delta.seeds.push(module);
+            if removed {
+                delta.removing.push(module);
+            }
+        }
+    }
+    if module != root && (writes_root(root, &group.log) || writes_root(root, new)) {
+        let old = group.log.iter().filter(|op| is_root_op(root, op));
+        delta.root_ops |= !old.eq(new.iter().filter(|op| is_root_op(root, op)));
+    }
+    // alloc: the state's copy of the log, once per changed log
+    group.log = new.iter().map(clone_op).collect();
+}
+
+fn is_root_op(root: ModuleId, op: &DeclOp) -> bool {
+    matches!(op, DeclOp::Declare { module, .. } | DeclOp::Update { module, .. } if *module == root)
+}
+
+fn writes_root(root: ModuleId, log: &[DeclOp]) -> bool {
+    log.iter().any(|op| is_root_op(root, op))
+}
+
+/// A written file that defines no module of the crate may be one an `include!` read, and an
+/// `include_str!` or `include_bytes!` file whose bytes changed (`Written::included`) is one
+/// such a call read: every group that expanded one is a seed, with a possible removal.
+fn include_readers(state: &CrateState, written: &Written<'_>, delta: &mut Delta) {
+    let unknown = |file: &FileId| !state.files.contains_key(file);
+    if !written.set.iter().any(unknown) && written.included.is_empty() {
+        return;
+    }
+    for (&group, g) in &state.groups {
+        if g.out.uses_include && !delta.seeds.contains(&group) {
+            delta.seeds.push(group);
+            delta.removing.push(group);
+        }
+    }
+}

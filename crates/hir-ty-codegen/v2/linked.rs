@@ -17,13 +17,10 @@ use hir_def::{
     expr_store::Body as BodyStore,
     nameres::crate_def_map,
     signatures::{FunctionSignature, StaticSignature},
-    src::HasSource,
 };
 use hir_ty_mir::mir::MirSpan;
 use hir_ty_share::code::{self, TABLES};
 use rustc_hash::{FxHashMap, FxHashSet};
-use syntax::AstNode;
-
 use super::{HashSource, Hashes, Kind, frontend::HirFrontend};
 
 /// What [`HirFrontend::link_inputs`] gives the link.
@@ -322,21 +319,13 @@ fn positions(db: &Db, owner: DefWithBodyId) -> Result<Positions, String> {
 /// Where a body's owner is declared.
 fn owner_location(db: &Db, owner: DefWithBodyId) -> Option<Row> {
     use hir_ty_mir::mir::location::{location_of, written_range};
-    match owner {
-        DefWithBodyId::FunctionId(func) => *crate::declaration_location(db, func),
-        DefWithBodyId::StaticId(it) => {
-            let source = it.lookup(db).source(db);
-            location_of(db, source.file_id, written_range(source.value.syntax()))
-        }
-        DefWithBodyId::ConstId(it) => {
-            let source = it.lookup(db).source(db);
-            location_of(db, source.file_id, written_range(source.value.syntax()))
-        }
-        DefWithBodyId::VariantId(it) => {
-            let source = it.lookup(db).source(db);
-            location_of(db, source.file_id, written_range(source.value.syntax()))
-        }
-    }
+    let source = match owner {
+        DefWithBodyId::FunctionId(func) => return *crate::declaration_location(db, func),
+        DefWithBodyId::StaticId(it) => crate::written_node(db, &it.lookup(db)),
+        DefWithBodyId::ConstId(it) => crate::written_node(db, &it.lookup(db)),
+        DefWithBodyId::VariantId(it) => crate::written_node(db, &it.lookup(db)),
+    };
+    location_of(db, source.file_id, written_range(source.value))
 }
 
 /// `rows` as the link's span table: the files named in the order first named, then each

@@ -25,11 +25,12 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
 
 use base_db::{Crate, Db, Nonce, ProcMacroLoadingError};
+use blaze_expand::verdict::{self as verdicts, STATEFUL, STATELESS, Verdict};
 use blaze_expand::{Call, Keeping, Mode, Put, checked, given, keeping, put, read, written};
 use blaze_ids::ContentId;
 use blaze_usercode::{
@@ -37,7 +38,7 @@ use blaze_usercode::{
     index::{self, FindError, Found},
     trace::{Seen, assemble_seen},
 };
-use hir_def::{FunctionId, StaticId, nameres::crate_def_map};
+use hir_def::{FunctionId, StaticId, nameres::crate_def_map, unstable_features::UnstableFeatures};
 use hir_expand::proc_macro::{
     ExpansionReads, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
     ProcMacroLoadResult, report_reads,
@@ -63,30 +64,13 @@ struct Library {
     code: code::Memo,
     /// Expansions run so far, for the tier's policy.
     runs: AtomicU64,
-    /// What the store said of the crate's state when it was loaded.
-    verdict: Verdict,
-    /// Whether an expansion ran (not found) since the last [`flush`].
-    ran: AtomicBool,
-    /// Whether an expansion left state.
-    retained: AtomicBool,
+    /// What the store said of the crate's state when it was loaded, and what its expansions
+    /// that ran (not found) did since.
+    seen: verdicts::Seen,
     /// Each calling crate's session, each held while a call that has state runs: its calls
     /// run in order.
     sessions: Mutex<FxHashMap<Crate, Arc<Mutex<Session>>>>,
 }
-
-/// What is known of whether a crate's expansions leave state.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Verdict {
-    /// None has run in a build that told the store.
-    Unseen,
-    /// Some ran, in a build, and none left state.
-    Stateless,
-    /// One left state.
-    Stateful,
-}
-
-const STATELESS: &[u8] = b"stateless";
-const STATEFUL: &[u8] = b"stateful";
 
 /// The run a verdict of the crate whose code is `code` is kept under, in the store expansions
 /// are kept in, with nothing read. Each verdict has its own key, so neither is ever put under a
@@ -156,11 +140,7 @@ pub fn flush() {
     libraries.retain(|it| it.strong_count() != 0);
     for library in libraries.iter().filter_map(Weak::upgrade) {
         // Another build that saw one leave state may have told the store since the load.
-        if library.verdict == Verdict::Unseen
-            && library.ran.swap(false, Ordering::Relaxed)
-            && !library.retained.load(Ordering::Relaxed)
-            && verdict(&library.loaded) == Ok(Verdict::Unseen)
-        {
+        if library.seen.flush() && verdict(&library.loaded) == Ok(Verdict::Unseen) {
             tell(&library, STATELESS);
         }
     }
@@ -169,15 +149,9 @@ pub fn flush() {
 impl Library {
     /// Notes what a run did: one that left state is told the store with the run's puts.
     fn saw(&self, ran: &Ran) {
-        if ran.statics.is_empty() {
-            self.ran.store(true, Ordering::Relaxed);
-            return;
-        }
-        if self.retained.swap(true, Ordering::Relaxed) || self.verdict == Verdict::Stateful {
-            return;
-        }
+        let Some(contradicted) = self.seen.saw(!ran.statics.is_empty()) else { return };
         tell(self, STATEFUL);
-        if self.verdict == Verdict::Stateless {
+        if contradicted {
             eprintln!(
                 "blaze: the proc macros of `{}` keep state between expansions, which the store \
                  said they did not: they expand in a session from the next load",
@@ -230,6 +204,7 @@ struct Kept {
     inputs: Vec<tt::TopSubtree>,
     sites: [span::Span; 3],
     edition: span::Edition,
+    forced_keywords: bool,
 }
 
 #[derive(Debug)]
@@ -249,7 +224,7 @@ fn refused(why: String) -> ProcMacroLoadingError {
 /// proc-macro crate, or its `proc_macro` is not the bridge blaze's server speaks.
 pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult {
     // alloc: once a proc-macro crate, the name its errors say
-    let name: Box<str> = match &krate.data(db).display_name {
+    let name: Box<str> = match &krate.extra_data(db).display_name {
         Some(name) => name.to_string().into(), // alloc: once a proc-macro crate, its name
         None => "<unnamed>".into(),
     };
@@ -274,9 +249,7 @@ pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult 
         loaded,
         code,
         runs: AtomicU64::new(0),
-        verdict,
-        ran: AtomicBool::new(false),
-        retained: AtomicBool::new(false),
+        seen: verdicts::Seen::new(verdict),
         sessions: Mutex::new(FxHashMap::default()),
     });
     LIBRARIES.lock().unwrap_or_else(|it| it.into_inner()).push(Arc::downgrade(&library));
@@ -294,6 +267,12 @@ pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult 
             disabled: false,
         })
         .collect()) // alloc: once a proc-macro crate, its macros
+}
+
+/// Whether `calling` enables `forced_keywords`, read without its def map: its proc macros
+/// expand while that is built.
+fn forced_keywords(db: &Db, calling: Crate) -> bool {
+    UnstableFeatures::of_root(db, calling).forced_keywords
 }
 
 fn system(why: impl fmt::Display) -> ProcMacroExpansionError {
@@ -334,6 +313,7 @@ impl Evaluated {
             inputs: self.inputs(call),
             sites: [call.def_site, call.call_site, call.mixed_site],
             edition: call.call_site.anchor.file_id.edition(),
+            forced_keywords: forced_keywords(db, calling),
         };
         let code = library.code.get(db, library.krate);
         let runs = library.runs.fetch_add(1, Ordering::Relaxed);
@@ -397,6 +377,7 @@ impl Evaluated {
                 inputs,
                 sites: it.sites,
                 edition: it.edition,
+                forced_keywords: it.forced_keywords,
             })
             .collect(); // alloc: once per run, the expansions it runs
         let library = &*self.library;
@@ -466,10 +447,12 @@ impl Evaluated {
         // The server lexes the text a macro parses in the call site's edition; the spans'
         // shapes number their anchors, which says no edition.
         given.part("edition", &[call.call_site.anchor.file_id.edition() as u8]);
+        // Whether each `k#` the macro lexes is gated, which the crate's attributes say.
+        given.part("forced_keywords", &[forced_keywords(db, calling) as u8]);
         let key = RunKey { code: library.code.get(db, library.krate), given: given.finish() };
         let mut inputs = Calling::new(call.env);
         let mut found = None;
-        if stateless && library.verdict == Verdict::Stateless {
+        if stateless && library.seen.verdict() == Verdict::Stateless {
             let guard = blaze_cas::enter();
             match index::find_reads(&keeping.expansions.store, &guard, &key, &mut inputs) {
                 Ok(Found::Hit { value, shape, values: Some(values), .. }) => {
@@ -517,7 +500,7 @@ impl Evaluated {
             unknown("it asked the database");
             return Ok(output);
         }
-        if !stateless || !ran.statics.is_empty() || library.verdict == Verdict::Stateful {
+        if !stateless || !ran.statics.is_empty() || library.seen.verdict() == Verdict::Stateful {
             unknown("it ran with state its calls before it left");
             return Ok(output);
         }
@@ -554,7 +537,7 @@ impl Evaluated {
 
 impl ProcMacroExpander for Evaluated {
     fn requires_session(&self) -> bool {
-        self.library.verdict != Verdict::Stateless
+        self.library.seen.verdict() != Verdict::Stateless
     }
 
     fn code(&self) -> Option<ContentId> {

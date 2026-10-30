@@ -6,7 +6,7 @@ bit flipped, the file cut short, bytes added to it, part of it zeroed or the who
 replaced) while no daemon runs or under a daemon that has already read it. Each time:
 
   - `blaze-engine cache verify` has to say so when a sealed pack was damaged;
-  - a daemon on the store has to build a program that prints what cargo's does, for a state
+  - a daemon on the store has to build a program that prints what blaze's build from nothing does, for a state
     of the workspace whose code was in the damaged store;
   - the daemon has to say it removed the pack;
   - `blaze-engine cache verify` has to find nothing wrong afterwards.

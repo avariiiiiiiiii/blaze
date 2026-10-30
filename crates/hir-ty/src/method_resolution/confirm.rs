@@ -60,7 +60,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         pick: &probe::Pick<'db>,
         unadjusted_self_ty: Ty<'db>,
         expr: ExprId,
-        generic_args: Option<&HirGenericArgs>,
+        generic_args: Option<HirGenericArgs<'_>>,
     ) -> ConfirmResult<'db, 'f> {
         debug!(
             "confirm(unadjusted_self_ty={:?}, pick={:?}, generic_args={:?})",
@@ -103,7 +103,7 @@ impl<'a, 'db, 'f> ConfirmContext<'a, 'db, 'f> {
         &mut self,
         unadjusted_self_ty: Ty<'db>,
         pick: &probe::Pick<'db>,
-        generic_args: Option<&HirGenericArgs>,
+        generic_args: Option<HirGenericArgs<'_>>,
     ) -> ConfirmResult<'db, 'f> {
         // Adjust the self expression the user provided and obtain the adjusted type.
         let (self_ty, adjustments) = self.adjust_self_ty(unadjusted_self_ty, pick);
@@ -347,7 +347,7 @@ impl<'a, 'db, 'f> ConfirmContext<'a, 'db, 'f> {
 
     fn instantiate_method_args(
         &mut self,
-        generic_args: Option<&HirGenericArgs>,
+        generic_args: Option<HirGenericArgs<'_>>,
         parent_args: GenericArgs<'db>,
     ) -> GenericArgs<'db> {
         struct LowererCtx<'a, 'db, 'f> {

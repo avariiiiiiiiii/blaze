@@ -637,7 +637,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     }
 
     // Returns a list of `Ty`s for each upvar.
-    fn final_upvar_tys(&self, closure_id: ExprId) -> &'f [Ty<'db>] {
+    fn final_upvar_tys(&self, closure_id: ExprId) -> &[Ty<'db>] {
         let frame = self.frame;
         frame.alloc_slice_from_iter(self.closure_min_captures_flattened(closure_id).iter().map(
             |captured_place| {

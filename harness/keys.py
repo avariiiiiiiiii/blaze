@@ -4,8 +4,8 @@
 
 The workspace in harness/keys has a function for each thing code can depend on that is not the
 text of its file. Each case builds the workspace with an empty store, changes one such thing,
-and builds again with the store the first build filled: the program has to print what cargo's
-does. "again" changes the checkout where it is, "elsewhere" changes a copy of it at another
+and builds again with the store the first build filled: the program has to print what blaze's
+build of the changed source from nothing does. "again" changes the checkout where it is, "elsewhere" changes a copy of it at another
 path, as a second worktree or another machine would have it.
 
 usage: keys.py '{}'
@@ -30,7 +30,7 @@ from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import Fixture
+from mixed import Fixture, from_scratch
 
 
 def write(path, text):
@@ -84,7 +84,7 @@ CASES = [
         replace(".cargo/config.toml", '"config"', '"config anew"'),
         "config_env",
     ),
-    # With the flag `difftest` sets, which this would otherwise take the place of: without it
+    # With the flag `mixed` sets, which this would otherwise take the place of: without it
     # rustc keeps to one object the functions nothing else calls, and those are left to rustc.
     ("a cfg of RUSTFLAGS", setenv("RUSTFLAGS", "-C link-dead-code --cfg keys_flag"), "flag_cfg"),
     # The crate's identity is in the TypeIds of its types (astral-experiments/blaze#56).
@@ -198,11 +198,13 @@ def size(directory):
 
 
 def build(ws, env, args):
-    """What cargo's program prints and what blaze's does, and the functions that were left to rustc."""
+    """What blaze's build from nothing prints and what blaze's build on the store does, and the
+    functions that were left to rustc."""
     saved = dict(os.environ)
     os.environ.update(env)
+    crates, target = ["kapp", "klib", "kdep"], ["-p", "kapp", *args]
     try:
-        fx = Fixture(ws, ["kapp", "klib", "kdep"], ["-p", "kapp", *args])
+        fx = Fixture(ws, crates, target)
         fx.blaze_args = list(args)
         fx.rustc_build()
         fx.blaze_build()
@@ -212,7 +214,7 @@ def build(ws, env, args):
             for row in rows
             if row[0] == "skipped" and "no rustc symbol" not in row[2]
         ]
-        return fx.behaviour(fx.reference), fx.behaviour(fx.binary), skipped
+        return from_scratch(ws, crates, target, blaze_args=args), fx.behaviour(fx.binary), skipped
     finally:
         os.environ.clear()
         os.environ.update(saved)
@@ -258,7 +260,7 @@ def main():
         if want != got:
             problems.append("the second build differs")
         if line and before == want:
-            problems.append("cargo's program is the same after the change")
+            problems.append("the program built from nothing is the same after the change")
         # Where the crates differ in overflow checks, blaze leaves to rustc a function that
         # calls a copy it cannot tell the checks of. The function the case is about has to
         # be blaze's all the same, or the case shows nothing.
@@ -281,10 +283,10 @@ def main():
             ours, theirs = (it[1].decode(errors="replace").splitlines() for it in (got, want))
             for a, b in zip(theirs, ours):
                 if a != b:
-                    print(f"    rustc: {a}\n    blaze: {b}")
+                    print(f"    from nothing: {a}\n    on the store: {b}")
             if len(ours) != len(theirs):
                 print(
-                    f"    blaze: status {got[0]}, {len(ours)} lines of {len(theirs)}; {got[2].decode(errors='replace').strip()[-300:]}"
+                    f"    on the store: status {got[0]}, {len(ours)} lines of {len(theirs)}; {got[2].decode(errors='replace').strip()[-300:]}"
                 )
     still = sum(1 for name, _, _, _ in runs if name in OPEN) - fixed
     print(

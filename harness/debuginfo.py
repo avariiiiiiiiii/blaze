@@ -30,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.environ.setdefault("CARGO_PROFILE_DEV_DEBUG", "true")
 import linkline
-from difftest import Fixture, BLAZE, WINDOWS, sysroot_rlibs, built
+from mixed import Fixture, BLAZE, WINDOWS, sysroot_rlibs, built
 
 LLVM = os.environ.get("BLAZE_BACKEND") == "llvm"
 # The pinned LLVM's, on PATH in the flake's dev shell and in CI.

@@ -9,6 +9,7 @@
 //! rustc's runtime body has had its `FakeRead`s removed (`CleanupPostBorrowck`); they are
 //! ignored here. No statement unwinds: what panics is an `Assert` before it.
 
+use blaze_ids::bits::{BitSliceMut, Bits, Ones, words_for};
 use blaze_mem::Frame;
 
 use super::{
@@ -55,7 +56,7 @@ impl HeldLocals {
     /// The locals the `a`th may need its storage at once with, by their index in
     /// [`HeldLocals::locals`], in order.
     pub fn conflicts_of(&self, a: usize) -> impl Iterator<Item = usize> + '_ {
-        bits(row(&self.conflicts, self.locals.len(), a))
+        Ones::<usize>::new(row(&self.conflicts, self.locals.len(), a))
     }
 }
 
@@ -65,101 +66,26 @@ fn row(conflicts: &[u64], n: usize, a: usize) -> &[u64] {
     &conflicts[a * words..(a + 1) * words]
 }
 
-/// The positions of the set bits of `words`, in order.
-fn bits(words: &[u64]) -> impl Iterator<Item = usize> + '_ {
-    words.iter().enumerate().flat_map(|(at, &word)| {
-        let mut rest = word;
-        std::iter::from_fn(move || {
-            if rest == 0 {
-                return None;
-            }
-            let bit = rest.trailing_zeros() as usize;
-            rest &= rest - 1;
-            Some(at * 64 + bit)
-        })
-    })
-}
-
-/// Sets the bits of `0..domain` in `words` and clears the rest.
-fn fill_to(words: &mut [u64], domain: usize) {
-    words.fill(!0);
-    if domain % 64 != 0
-        && let Some(last) = words.last_mut()
-    {
-        *last = (1u64 << (domain % 64)) - 1;
-    }
-}
-
 /// A set of locals, a bit each, its words in the run's frame: rustc's `DenseBitSet` without a
 /// heap block per set. Every set of a run keeps the domain it was made with, and its bits past
 /// the domain stay clear.
-struct Set<'f>(&'f mut [u64]);
+type Set<'f> = BitSliceMut<'f>;
 
-impl<'f> Set<'f> {
-    fn new_empty(frame: &'f Frame, domain: usize) -> Set<'f> {
-        Set(frame.alloc_slice_fill_with(domain.div_ceil(64), |_| 0))
-    }
-
-    fn new_filled(frame: &'f Frame, domain: usize) -> Set<'f> {
-        let words = frame.alloc_slice_fill_with(domain.div_ceil(64), |_| 0);
-        fill_to(words, domain);
-        Set(words)
-    }
-
-    /// A copy of the set in `frame`.
-    fn copy_in(&self, frame: &'f Frame) -> Set<'f> {
-        Set(frame.alloc_slice_copy(&self.0[..]))
-    }
-
-    fn insert(&mut self, at: usize) {
-        self.0[at / 64] |= 1u64 << (at % 64);
-    }
-
-    fn remove(&mut self, at: usize) {
-        self.0[at / 64] &= !(1u64 << (at % 64));
-    }
-
-    fn contains(&self, at: usize) -> bool {
-        (self.0[at / 64] >> (at % 64)) & 1 != 0
-    }
-
-    fn clear(&mut self) {
-        self.0.fill(0);
-    }
-
-    fn copy_from(&mut self, other: &Set<'_>) {
-        self.0.copy_from_slice(&other.0[..]);
-    }
-
-    /// Adds `other`'s members; says whether that added any.
-    fn union(&mut self, other: &Set<'_>) -> bool {
-        let mut added = 0;
-        for (mine, &theirs) in self.0.iter_mut().zip(other.0.iter()) {
-            added |= theirs & !*mine;
-            *mine |= theirs;
-        }
-        added != 0
-    }
-
-    fn intersect(&mut self, other: &Set<'_>) {
-        for (mine, &theirs) in self.0.iter_mut().zip(other.0.iter()) {
-            *mine &= theirs;
-        }
-    }
-
-    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        bits(&self.0[..])
-    }
-
-    fn count(&self) -> usize {
-        self.0.iter().map(|word| word.count_ones() as usize).sum()
-    }
+/// The empty set of `domain` locals in `frame`.
+fn empty_in(frame: &Frame, domain: usize) -> Set<'_> {
+    Bits::from_words(frame.alloc_slice_fill_with(words_for(domain), |_| 0))
 }
 
-impl PartialEq for Set<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0[..] == other.0[..]
-    }
+/// The set of all `domain` locals in `frame`.
+fn filled_in(frame: &Frame, domain: usize) -> Set<'_> {
+    let mut set = empty_in(frame, domain);
+    set.insert_range(0..domain);
+    set
+}
+
+/// A copy of `set` in `frame`.
+fn copy_in<'g>(set: &Set<'_>, frame: &'g Frame) -> Set<'g> {
+    Bits::from_words(frame.alloc_slice_copy(set.words()))
 }
 
 fn local_index(local: LocalId) -> usize {
@@ -330,9 +256,9 @@ fn load_one(known: &Option<Set<'_>>, into: &mut Set<'_>) {
 /// Joins `new` into the state an edge flows to; says whether that changed it.
 fn join<'f>(frame: &'f Frame, known: &mut Option<Set<'f>>, new: &Set<'_>) -> bool {
     match known {
-        Some(known) => known.union(new),
+        Some(known) => known.union_with(new),
         None => {
-            *known = Some(new.copy_in(frame));
+            *known = Some(copy_in(new, frame));
             true
         }
     }
@@ -373,10 +299,10 @@ impl MirBody<'_> {
         let live_out = self.liveness(frame, reached);
         let receiver = self.param_locals.first().copied().map(local_index);
 
-        let mut any = Set::new_empty(frame, count);
+        let mut any = empty_in(frame, count);
         let mut at_yields = Vec::new_in(frame);
-        let mut borrowed = Set::new_empty(frame, count);
-        let mut requires = Set::new_empty(frame, count);
+        let mut borrowed = empty_in(frame, count);
+        let mut requires = empty_in(frame, count);
         for (id, block) in self.basic_blocks.iter() {
             let Some(Terminator { kind: TerminatorKind::Yield { resume, drop, .. }, .. }) =
                 &block.terminator
@@ -390,11 +316,11 @@ impl MirBody<'_> {
             for statement in &block.statements {
                 self.storage_statement(statement, &mut borrowed, &mut requires, &mut |_| ());
             }
-            let mut live = live_out[block_index(id)].copy_in(frame);
+            let mut live = copy_in(&live_out[block_index(id)], frame);
             // An `async` block can't be moved once polled, so a borrow may outlive the use
             // of what it points at: a borrowed local is live until its storage ends.
-            live.union(&borrowed);
-            live.intersect(&requires);
+            live.union_with(&borrowed);
+            live.intersect_with(&requires);
             if let Some(receiver) = receiver {
                 live.remove(receiver);
             }
@@ -406,7 +332,7 @@ impl MirBody<'_> {
             for &local in &self.promoted_constants {
                 live.remove(local_index(local));
             }
-            any.union(&live);
+            any.union_with(&live);
             at_yields.push((*resume, *drop, live));
         }
 
@@ -435,7 +361,7 @@ impl MirBody<'_> {
 
     /// `always_storage_live_locals`: the locals no `StorageLive` or `StorageDead` mentions.
     fn always_storage_live<'f>(&self, frame: &'f Frame) -> Set<'f> {
-        let mut always = Set::new_filled(frame, self.locals.len());
+        let mut always = filled_in(frame, self.locals.len());
         for (_, block) in self.basic_blocks.iter() {
             for statement in &block.statements {
                 if let StatementKind::StorageLive(local) | StatementKind::StorageDead(local) =
@@ -469,7 +395,9 @@ impl MirBody<'_> {
             }
             _ => (),
         }
-        asm_outputs(kind, |output| requires.insert(local_index(output.local)));
+        asm_outputs(kind, |output| {
+            requires.insert(local_index(output.local));
+        });
         early(requires);
         // Primary effect: a local moved out of as a whole, and never borrowed before, needs
         // no storage after.
@@ -477,7 +405,9 @@ impl MirBody<'_> {
         if let StatementKind::Assign(place, _) = kind {
             requires.insert(local_index(place.local));
         }
-        asm_outputs(kind, |output| requires.insert(local_index(output.local)));
+        asm_outputs(kind, |output| {
+            requires.insert(local_index(output.local));
+        });
         borrow_statement(kind, borrowed);
     }
 
@@ -508,19 +438,19 @@ impl MirBody<'_> {
             borrowed: frame.alloc_slice_fill_with(blocks, |_| None),
             requires: frame.alloc_slice_fill_with(blocks, |_| None),
         };
-        let mut start_requires = Set::new_empty(frame, count);
+        let mut start_requires = empty_in(frame, count);
         for &param in self.param_locals.iter().skip(1) {
             start_requires.insert(local_index(param));
         }
         let start = block_index(self.start_block);
-        forward.borrowed[start] = Some(Set::new_empty(frame, count));
+        forward.borrowed[start] = Some(empty_in(frame, count));
         forward.requires[start] = Some(start_requires);
         let mut worklist = Vec::with_capacity_in(blocks, frame);
         worklist.push(self.start_block);
         // Scratch states, reused by every block and edge: no allocation per visit.
-        let mut borrowed = Set::new_empty(frame, count);
-        let mut requires = Set::new_empty(frame, count);
-        let mut edge_requires = Set::new_empty(frame, count);
+        let mut borrowed = empty_in(frame, count);
+        let mut requires = empty_in(frame, count);
+        let mut edge_requires = empty_in(frame, count);
         while let Some(id) = worklist.pop() {
             if !reached[block_index(id)] {
                 continue;
@@ -551,12 +481,12 @@ impl MirBody<'_> {
     fn liveness<'f>(&self, frame: &'f Frame, reached: &[bool]) -> &'f [Set<'f>] {
         let count = self.locals.len();
         let blocks = self.basic_blocks.len();
-        let live_in = frame.alloc_slice_fill_with(blocks, |_| Set::new_empty(frame, count));
-        let live_out = frame.alloc_slice_fill_with(blocks, |_| Set::new_empty(frame, count));
+        let live_in = frame.alloc_slice_fill_with(blocks, |_| empty_in(frame, count));
+        let live_out = frame.alloc_slice_fill_with(blocks, |_| empty_in(frame, count));
         // Scratch states, reused by every block and edge; a changed block's state is swapped
         // into `live_in` and its old one becomes the next scratch.
-        let mut state = Set::new_empty(frame, count);
-        let mut entry = Set::new_empty(frame, count);
+        let mut state = empty_in(frame, count);
+        let mut entry = empty_in(frame, count);
         let mut changed = true;
         while changed {
             changed = false;
@@ -568,20 +498,20 @@ impl MirBody<'_> {
                 if let Some(terminator) = &block.terminator {
                     edges(self, terminator, |edge| match edge {
                         Edge::Plain(to) => {
-                            state.union(&live_in[block_index(to)]);
+                            state.union_with(&live_in[block_index(to)]);
                         }
                         Edge::Returns(to, place) => {
                             entry.copy_from(&live_in[block_index(to)]);
                             if place.projection.as_slice().is_empty() {
                                 entry.remove(local_index(place.local));
                             }
-                            state.union(&entry);
+                            state.union_with(&entry);
                         }
                         Edge::Resumes(to, place) => {
                             entry.copy_from(&live_in[block_index(to)]);
                             def_use_write(place, &mut entry);
                             insert_all(&mut entry, index_locals(place));
-                            state.union(&entry);
+                            state.union_with(&entry);
                         }
                     });
                 }
@@ -616,8 +546,8 @@ impl MirBody<'_> {
         let count = self.locals.len();
         let mut matrix = Conflicts::new(frame, count, always_live, held, saved);
         let mut apply = |state: &Set<'_>| matrix.apply(state);
-        let mut borrowed = Set::new_empty(frame, count);
-        let mut requires = Set::new_empty(frame, count);
+        let mut borrowed = empty_in(frame, count);
+        let mut requires = empty_in(frame, count);
         for (id, block) in self.basic_blocks.iter() {
             if !reached[block_index(id)] {
                 continue;
@@ -662,35 +592,35 @@ impl<'a> Conflicts<'a> {
     ) -> Conflicts<'a> {
         let n = saved.len();
         let position = frame.alloc_slice_fill_with(count, |_| NOT_HELD);
-        let mut ineligible = Set::new_empty(frame, n);
+        let mut ineligible = empty_in(frame, n);
         for (at, &local) in saved.iter().enumerate() {
             position[local] = at as u32;
             if always_live.contains(local) {
                 ineligible.insert(at);
             }
         }
-        let together = frame.alloc_slice_fill_with(n, |_| ineligible.copy_in(frame));
+        let together = frame.alloc_slice_fill_with(n, |_| copy_in(&ineligible, frame));
         Conflicts {
             held,
             position,
             ineligible,
             together,
-            live_held: Set::new_empty(frame, count),
-            eligible: Set::new_empty(frame, n),
+            live_held: empty_in(frame, count),
+            eligible: empty_in(frame, n),
         }
     }
 
     /// The locals that need their storage at one point all conflict with each other.
     fn apply(&mut self, state: &Set<'_>) {
         self.live_held.copy_from(state);
-        self.live_held.intersect(self.held);
+        self.live_held.intersect_with(self.held);
         self.eligible.clear();
         for local in self.live_held.iter() {
             debug_assert_ne!(self.position[local], NOT_HELD);
             self.eligible.insert(self.position[local] as usize);
         }
         for at in self.eligible.iter() {
-            self.together[at].union(&self.eligible);
+            self.together[at].union_with(&self.eligible);
         }
     }
 
@@ -706,9 +636,9 @@ impl<'a> Conflicts<'a> {
         let mut conflicts = vec![0u64; n * words].into_boxed_slice();
         for (at, row) in conflicts.chunks_exact_mut(words).enumerate() {
             if self.ineligible.contains(at) {
-                fill_to(row, n);
+                BitSliceMut::<usize>::from_words(row).insert_range(0..n);
             } else {
-                row.copy_from_slice(&self.together[at].0[..]);
+                row.copy_from_slice(self.together[at].words());
             }
         }
         conflicts
@@ -801,7 +731,7 @@ mod tests {
     use blaze_mem::{Frame, Tag, frame};
     use rustc_index::bit_set::DenseBitSet;
 
-    use super::{Conflicts, Set, bits, row};
+    use super::{Conflicts, Ones, Set, empty_in, filled_in, row};
 
     fn dense(count: usize, members: &[usize]) -> DenseBitSet<usize> {
         let mut set = DenseBitSet::new_empty(count);
@@ -812,7 +742,7 @@ mod tests {
     }
 
     fn of<'f>(frame: &'f Frame, count: usize, members: &[usize]) -> Set<'f> {
-        let mut set = Set::new_empty(frame, count);
+        let mut set = empty_in(frame, count);
         for &it in members {
             set.insert(it);
         }
@@ -876,7 +806,7 @@ mod tests {
             let n = held.len();
             for a in 0..n {
                 let row = row(&got, n, a);
-                let listed: Vec<usize> = bits(row).collect();
+                let listed: Vec<usize> = Ones::<usize>::new(row).collect();
                 let wanted: Vec<usize> = (0..n).filter(|&b| expected[a * n + b]).collect();
                 assert_eq!(listed, wanted, "round {round}: {count} locals, {n} held, row {a}");
             }
@@ -895,14 +825,14 @@ mod tests {
             frame::task(Tag::Mir, |frame| {
                 let (mut x, y) = (of(frame, count, &a), of(frame, count, &b));
                 let (mut dx, dy) = (dense(count, &a), dense(count, &b));
-                assert_eq!(x.union(&y), dx.union(&dy), "round {round}");
+                assert_eq!(x.union_with(&y), dx.union(&dy), "round {round}");
                 assert_eq!(x.iter().collect::<Vec<_>>(), dx.iter().collect::<Vec<_>>(), "round {round}");
                 assert_eq!(x.count(), dx.count(), "round {round}");
-                x.intersect(&of(frame, count, &a));
+                x.intersect_with(&of(frame, count, &a));
                 dx.intersect(&dense(count, &a));
                 assert_eq!(x.iter().collect::<Vec<_>>(), dx.iter().collect::<Vec<_>>(), "round {round}");
                 assert_eq!(x == of(frame, count, &a), dx == dense(count, &a), "round {round}");
-                let filled = Set::new_filled(frame, count);
+                let filled = filled_in(frame, count);
                 assert_eq!(
                     filled.iter().collect::<Vec<_>>(),
                     DenseBitSet::<usize>::new_filled(count).iter().collect::<Vec<_>>(),

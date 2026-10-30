@@ -33,6 +33,7 @@ use syntax::{
 use self::meta::{Item, Lit, List, MetaArgs, MetaItem};
 use super::super::{Emitted, Pass, Walk, source_fact};
 use super::{Args, Attr, Owner, Target, checked, parsed};
+use stdx::list::Join;
 use crate::{
     cx::{Cx, def_range_view, item_range_view, signature_range_view},
     lower::Phase,
@@ -271,7 +272,7 @@ impl Parser<'_, '_, '_> {
         forms.push(format!("`{open}doc = \"string\"{close}`"));
         forms.sort_unstable();
         // alloc: as above
-        let message = format!("valid forms for the attribute are {}", and_list(&forms));
+        let message = format!("valid forms for the attribute are {}", stdx::list::list(forms.iter(), Join::And, false));
         let diag = self.diag(INVALID, message, attr.in_file(attr.inner_range()));
         self.emit(diag);
     }
@@ -725,16 +726,3 @@ fn inner_span(node: ast::Node<'_>) -> TextRange {
     first.text_range().cover(last.text_range())
 }
 
-/// rustc's `StrListSepByAnd`: `a`, `a and b`, `a, b, and c`.
-fn and_list(items: &[String]) -> String {
-    match items {
-        // alloc: empty, allocates nothing
-        [] => String::new(),
-        // clone: a diagnostic's text, as is all of `and_list`'s
-        [one] => one.clone(),
-        // alloc: as above
-        [a, b] => format!("{a} and {b}"),
-        // alloc: as above
-        [init @ .., last] => format!("{}, and {last}", init.join(", ")),
-    }
-}

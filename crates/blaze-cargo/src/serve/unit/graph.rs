@@ -13,6 +13,7 @@
 use std::hash::{Hash, Hasher};
 
 use blaze_build_script::apply::{GraphUnit, to_link_in};
+use blaze_ids::{bits::BitSet, radix::Csr};
 use blaze_units::{
     query::Units,
     schema::{Mode, Unit},
@@ -33,34 +34,6 @@ pub(crate) mod flag {
     pub(crate) const TEST: u8 = 16;
 }
 
-/// A set of units, one bit each.
-#[derive(Clone, Default)]
-pub(crate) struct Bits(Vec<u64>);
-
-impl Bits {
-    pub(crate) fn new(len: usize) -> Bits {
-        Bits(vec![0; len.div_ceil(64)])
-    }
-
-    /// Sets `at`; whether it was clear.
-    #[inline]
-    pub(crate) fn insert(&mut self, at: u32) -> bool {
-        let (word, bit) = (at as usize / 64, 1u64 << (at % 64));
-        let clear = self.0[word] & bit == 0;
-        self.0[word] |= bit;
-        clear
-    }
-
-    #[inline]
-    pub(crate) fn contains(&self, at: u32) -> bool {
-        self.0.get(at as usize / 64).is_some_and(|word| word >> (at % 64) & 1 == 1)
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.0.fill(0);
-    }
-}
-
 /// For each unit, how many build script runs of its closure are not applied yet: once none
 /// is, what its crate is made from is final. Kept by the writer, which alone applies runs.
 ///
@@ -73,7 +46,7 @@ pub(crate) struct Waits {
     /// unit that is no run.
     start: Vec<u32>,
     waiting: Vec<u32>,
-    applied: Bits,
+    applied: BitSet<u32>,
 }
 
 impl Waits {
@@ -82,7 +55,7 @@ impl Waits {
         let mut left = vec![0u32; count];
         let mut start = Vec::with_capacity(count + 1);
         let mut waiting = Vec::new();
-        let mut seen = Bits::new(count);
+        let mut seen = BitSet::<u32>::new(count);
         let mut pending = Vec::new();
         start.push(0);
         for run in 0..count as u32 {
@@ -102,7 +75,7 @@ impl Waits {
             }
             start.push(waiting.len() as u32);
         }
-        Waits { left, start, waiting, applied: Bits::new(count) }
+        Waits { left, start, waiting, applied: BitSet::<u32>::new(count) }
     }
 
     /// Whether `unit` waits on no run.
@@ -144,9 +117,9 @@ pub(crate) struct Graph {
     flags: Vec<u8>,
     /// The units compiled for build scripts and proc macros: all a script's compile or a proc
     /// macro depends on, and themselves.
-    build_time: Bits,
+    build_time: BitSet<u32>,
     /// The packages with a library target, by index into `Units::packages`.
-    lib_packages: Bits,
+    lib_packages: BitSet<u32>,
     /// Units by [`target_hash`] of what they build, each hash's units in order: how an artifact
     /// finds its unit with no string built.
     by_target: FxHashMap<u64, Vec<u32>>,
@@ -207,21 +180,13 @@ impl Graph {
             dep_start.push(deps.len() as u32);
         }
         // The dependents, by a counting sort of the edges on their dependency.
-        let mut up_start = vec![0u32; count + 1];
-        for &dep in &deps {
-            up_start[dep as usize + 1] += 1;
-        }
-        for at in 0..count {
-            up_start[at + 1] += up_start[at];
-        }
-        let mut next = up_start.clone();
-        let mut up = vec![0u32; deps.len()];
-        for from in 0..count {
-            for &dep in &deps[dep_start[from] as usize..dep_start[from + 1] as usize] {
-                up[next[dep as usize] as usize] = from as u32;
-                next[dep as usize] += 1;
-            }
-        }
+        let (up_start, up) = Csr::build(
+            count,
+            (0..count).flat_map(|from| {
+                deps[dep_start[from] as usize..dep_start[from + 1] as usize].iter().map(move |&dep| (dep, from as u32))
+            }),
+        )
+        .into_parts();
         let mut graph = Graph {
             dep_start,
             deps,
@@ -231,8 +196,8 @@ impl Graph {
             links: Vec::new(),
             package,
             flags,
-            build_time: Bits::new(count),
-            lib_packages: Bits::new(units.packages.len()),
+            build_time: BitSet::<u32>::new(count),
+            lib_packages: BitSet::<u32>::new(units.packages.len()),
             by_target: FxHashMap::default(),
         };
         for (at, unit) in all.iter().enumerate() {
@@ -259,7 +224,7 @@ impl Graph {
         graph.link_start = link_start;
         graph.links = links;
 
-        let mut build_time = Bits::new(count);
+        let mut build_time = BitSet::<u32>::new(count);
         let mut pending: Vec<u32> = (0..count as u32)
             .filter(|at| graph.flags[*at as usize] & flag::FOR_HOST != 0 && graph.flags[*at as usize] & flag::RUN == 0)
             .collect();
@@ -351,7 +316,7 @@ impl Graph {
     /// Every unit `unit` depends on, itself first, each once, each before its dependencies
     /// (what depends on a unit comes before it).
     pub(crate) fn closure(&self, unit: u32) -> Vec<u32> {
-        let mut seen = Bits::new(self.len());
+        let mut seen = BitSet::<u32>::new(self.len());
         let mut post = Vec::with_capacity(self.len().min(256));
         let mut stack = vec![(unit, false)];
         while let Some((at, expanded)) = stack.pop() {
@@ -376,7 +341,7 @@ impl Graph {
     /// The crates linked into `unit`'s image, in [`Graph::closure`]'s order: its own, and each
     /// library reached through libraries, not through a build script or proc macro.
     pub(crate) fn linked_in(&self, unit: u32) -> Vec<u32> {
-        let mut inside = Bits::new(self.len());
+        let mut inside = BitSet::<u32>::new(self.len());
         inside.insert(unit);
         let mut pending = vec![unit];
         while let Some(at) = pending.pop() {

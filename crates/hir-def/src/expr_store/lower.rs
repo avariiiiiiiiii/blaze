@@ -52,7 +52,9 @@ use crate::{
         TypePtr,
         body::Param,
         expander::Expander,
-        path::{BindingRow, GenericArg, GenericArgs, GenericArgsParentheses, Path, PathIdx, slot},
+        path::{
+            BindingRow, GenericArg, GenericArgs, GenericArgsParentheses, Names, Path, PathIdx, slot,
+        },
     },
     hir::{
         Array, Binding, BindingAnnotation, BindingId, BindingProblems, CaptureBy, ClosureKind,
@@ -73,7 +75,7 @@ use crate::{
 };
 
 pub use self::generics::ImplTraitLowering;
-pub use self::path::{hir_segment_to_ast_segment, hir_segment_to_ast_segment_view};
+pub use self::path::hir_segment_to_ast_segment_view;
 
 /// Which of a store's two lowerings this is: a body's ([`lower_body`]) or a signature's (the
 /// `lower_*` entry points).
@@ -1155,6 +1157,18 @@ impl<'db> ExprCollector<'db> {
                 let ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
                 let pat = self.collect_ty_pat_opt(inner.pat());
                 self.alloc_type_ref(TypeRef::PatternType(ty, pat), ptr)
+            }
+            ast::Type::UnsafeBinderType(inner) => {
+                let lifetimes = match inner.generic_param_list() {
+                    Some(params) => self.store.paths_mut().push_names(
+                        params
+                            .lifetime_params()
+                            .flat_map(|lp| lp.lifetime().map(|lt| Name::new_lifetime(lt.text()))),
+                    ),
+                    None => Names::EMPTY,
+                };
+                let ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
+                self.alloc_type_ref(TypeRef::UnsafeBinder { lifetimes, ty }, ptr)
             }
             ast::Type::MacroType(mt) => match mt.macro_call() {
                 Some(mcall) => {
@@ -2897,11 +2911,7 @@ impl<'db> ExprCollector<'db> {
             if !module.is_block_module(self.db) {
                 segments.push(module.name(self.db)?.symbol().as_str());
             }
-            // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
-            // `module` is a local of this loop, only read for names with `self.db`, and dropped
-            // before this function returns a `String`; nothing stores it. If it were stored, a
-            // later revision could read a freed salsa slot through it.
-            module = unsafe { parent.to_static() };
+            module = parent.to_static();
         }
         let krate = self.krate.extra_data(self.db).display_name.as_ref()?;
         segments.push(krate.crate_name().symbol().as_str());
@@ -3020,7 +3030,7 @@ impl<'db> ExprCollector<'db> {
 
     /// `in_expr_place` is whether rustc parses a call there in parentheses or brackets as an
     /// expression (`parse_stmt_mac`): with no `;` after it. The last call of a block is one
-    /// ([`hir_expand::ExpandTo::of_call_site`]) and expands to an expression.
+    /// ([`hir_expand::ExpandTo::of_call_site_view`]) and expands to an expression.
     fn collect_macro_as_stmt(
         &mut self,
         mac: ast::MacroExpr<'_>,
@@ -3200,15 +3210,9 @@ impl<'db> ExprCollector<'db> {
                 );
                 return Some(block);
             }
-            // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
-            // `token` exists only in `LoweringMode::Analysis` (`allow_tracked_structs`), which runs
-            // inside the lowering queries (`Body::of`, the signature queries); the id goes only
-            // into `store.block_scopes` and the block's `Expr::Block`, both part of that query's
-            // result, which salsa invalidates with it, and into the source-map lowering of the
-            // same body (`given_blocks`), whose queries read `Body::of` and so are invalidated
-            // with it too. IDE lowering gets no token and makes no id.
-            // A leaked id would name a freed salsa slot in a later revision.
-            Some(unsafe { BlockIdLt::new(self.db, ast_id, self.module, token).to_static() })
+            // The id goes only into this lowering query's result (`block_scopes`, the block's
+            // `Expr::Block`) and the source map of the same body, invalidated with it.
+            Some(BlockIdLt::new(self.db, ast_id, self.module, token).to_static())
         })();
 
         let (module, def_map) =
@@ -3525,7 +3529,7 @@ impl<'db> ExprCollector<'db> {
                 Pat::Deref { inner }
             }
             ast::Pat::NotNull(_) => Pat::NotNull,
-            ast::Pat::ConstBlockPat(_) => Pat::Missing,
+            ast::Pat::ConstBlockPat(_) | ast::Pat::GuardPat(_) => Pat::Missing,
             ast::Pat::CfgPredPat(p) => {
                 let enabled = Literal::Bool(self.check_cfg_pred(p.cfg_predicate()));
                 let expr_id = self.store.alloc_literal_expr(enabled);
@@ -4009,13 +4013,11 @@ impl<'db> ExprCollector<'db> {
         let root = f(self);
         self.store.inference_roots = inference_roots;
 
+        let exprs_end = end(self.store.expr_count());
+        let pats_end = end(self.store.pat_count());
+        let bindings_end = end(self.store.bindings.len());
         if let Some(inference_roots) = &mut self.store.inference_roots {
-            inference_roots.push(ExprRoot {
-                root,
-                exprs_end: end(self.store.expr_count()),
-                pats_end: end(self.store.pat_count()),
-                bindings_end: end(self.store.bindings.len()),
-            });
+            inference_roots.push(ExprRoot { root, exprs_end, pats_end, bindings_end });
         }
 
         return root;
@@ -4345,7 +4347,7 @@ pub(in crate::expr_store) fn comma_follows_token(t: Option<ast::Token<'_>>) -> b
     false
 }
 
-/// [`hir_assoc_type_binding_to_ast`] of a view.
+/// The syntax of the HIR's `AssociatedTypeBinding` number `binding_idx` of a segment's arguments.
 pub fn hir_assoc_type_binding_to_ast_view<'t>(
     segment_args: ast::GenericArgList<'t>,
     binding_idx: u32,
@@ -4360,7 +4362,8 @@ pub fn hir_assoc_type_binding_to_ast_view<'t>(
         .nth(binding_idx as usize)
 }
 
-/// [`hir_generic_arg_to_ast`] of a view.
+/// The syntax of the HIR's generic argument number `arg_idx`. Does not support the `Self`
+/// argument.
 pub fn hir_generic_arg_to_ast_view<'t>(
     args: ast::GenericArgList<'t>,
     arg_idx: u32,
@@ -4371,36 +4374,6 @@ pub fn hir_generic_arg_to_ast_view<'t>(
             ast::GenericArg::AssocTypeArg(_) => false,
             ast::GenericArg::LifetimeArg(arg) => arg.lifetime().is_some(),
             ast::GenericArg::ConstArg(_) | ast::GenericArg::TypeArg(_) => true,
-        })
-        .nth(arg_idx as usize - has_self_arg as usize)
-}
-
-/// This function find the AST fragment that corresponds to an `AssociatedTypeBinding` in the HIR.
-pub fn hir_assoc_type_binding_to_ast(
-    segment_args: &tag::GenericArgList,
-    binding_idx: u32,
-) -> Option<tag::AssocTypeArg> {
-    segment_args
-        .generic_args()
-        .filter_map(|arg| match arg {
-            tag::GenericArg::AssocTypeArg(it) => Some(it),
-            _ => None,
-        })
-        .filter(|binding| binding.param_list().is_none() && binding.name_ref().is_some())
-        .nth(binding_idx as usize)
-}
-
-/// This function find the AST generic argument from the one in the HIR. Does not support the `Self` argument.
-pub fn hir_generic_arg_to_ast(
-    args: &tag::GenericArgList,
-    arg_idx: u32,
-    has_self_arg: bool,
-) -> Option<tag::GenericArg> {
-    args.generic_args()
-        .filter(|arg| match arg {
-            tag::GenericArg::AssocTypeArg(_) => false,
-            tag::GenericArg::LifetimeArg(arg) => arg.lifetime().is_some(),
-            tag::GenericArg::ConstArg(_) | tag::GenericArg::TypeArg(_) => true,
         })
         .nth(arg_idx as usize - has_self_arg as usize)
 }

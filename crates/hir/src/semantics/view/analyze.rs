@@ -106,6 +106,11 @@ impl<'db> Semantics<'db> {
             .map(|(ty, coerced)| TypeInfo { original: ty, adjusted: coerced })
     }
 
+    /// The adjustments inference applied to `expr`, borrowed as inference stores them.
+    pub fn expr_adjustments(&self, expr: ast::Expr<'db>) -> Option<&'db [hir_ide::Adjustment]> {
+        self.analyze(expr.syntax())?.expr_adjustments_view(expr)
+    }
+
     pub fn type_of_pat(&self, pat: ast::Pat<'db>) -> Option<TypeInfo<'db>> {
         self.analyze(pat.syntax())?
             .type_of_pat_view(self.db, pat)

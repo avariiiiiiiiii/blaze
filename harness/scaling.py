@@ -17,7 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ["BLAZE_STATS"] = "1"
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs
+from mixed import Fixture, BLAZE, sysroot_rlibs
 
 MARK = "blaze-scaling-edit"
 MAIN = re.compile(r"fn main\(\)[^{;]*\{\n")

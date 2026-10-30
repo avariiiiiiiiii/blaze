@@ -52,6 +52,13 @@ fn key_order(a: &[u8], b: &[u8]) -> Ordering {
     }
 }
 
+/// The order of two text keys' encodings, from the text: a text head grows with its length,
+/// so a shorter key comes first and keys of one length go bytewise.
+#[inline]
+fn name_order(a: &str, b: &str) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+}
+
 /// Why a value has no encoding here, or bytes are no value.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {

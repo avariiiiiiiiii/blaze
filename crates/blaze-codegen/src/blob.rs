@@ -638,9 +638,9 @@ const MASKED_MAGIC: [u8; 4] = *b"BZM1";
 /// What a function is with its constants masked (#1292), or that it can't be folded: kept per
 /// instance, so a warm build groups without building any IR.
 pub fn encode_masked(masked: Option<&Masked>) -> Vec<u8> {
-    // The magic, the tag, the shape and its length, the size, the count, and at most 18 bytes
+    // The magic, the tag, the shape and its length, the size, the count, and at most 33 bytes
     // a constant.
-    let most = masked.map_or(0, |it| it.shape.len() + 18 * it.constants.len());
+    let most = masked.map_or(0, |it| it.shape.len() + 33 * it.constants.len());
     let mut out = Vec::with_capacity(MASKED_MAGIC.len() + 1 + 4 + 4 + 4 + most);
     out.put_bytes(&MASKED_MAGIC);
     let Some(masked) = masked else {
@@ -670,6 +670,10 @@ pub fn encode_masked(masked: Option<&Masked>) -> Vec<u8> {
                 out.put_u8(3);
                 out.put_u32(at);
             }
+            Constant::Data(id) => {
+                out.put_u8(4);
+                out.put_bytes(&id.0);
+            }
         }
     }
     out
@@ -695,6 +699,7 @@ pub fn decode_masked(bytes: &[u8]) -> Result<Option<Masked>, BlobError> {
             1 => Constant::F32(input.0.u32()?),
             2 => Constant::F64(input.0.u64()?),
             3 => Constant::Place(input.0.u32()?),
+            4 => Constant::Data(input.id()?),
             _ => return input.fail("no such constant"),
         });
     }
@@ -716,6 +721,7 @@ mod tests {
                 Constant::F32(0x3f80_0000),
                 Constant::F64(1),
                 Constant::Place(4),
+                Constant::Data(ContentId([9; 32])),
             ],
             size: 40,
         };

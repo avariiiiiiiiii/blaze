@@ -4,6 +4,8 @@
 //! This can our "last changed" data to be wrong
 //! but we *should* always reflect the final values.
 
+#![forbid(unsafe_code)]
+
 use salsa::{Database, Setter};
 use test_log::test;
 

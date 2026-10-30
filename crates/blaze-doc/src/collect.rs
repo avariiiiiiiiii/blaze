@@ -1197,15 +1197,13 @@ impl Builder<'_> {
             let not_ty = {
                 let base = auto.not.0.ty(db);
                 match auto.not.1 {
-                    Some(inner) => base.instantiate([inner.ty(db).instantiate([good.clone()])]),
-                    None => base.instantiate([good.clone()]),
+                    Some(inner) => base.instantiate(db, [inner.ty(db).instantiate(db, [good])]),
+                    None => base.instantiate(db, [good]),
                 }
             };
             let with = |bad: Option<usize>| {
-                let args: Vec<hir::Type<'_>> = (0..params.len())
-                    .map(|at| if Some(at) == bad { not_ty.clone() } else { good.clone() })
-                    .collect();
-                ty.instantiate_type_params(args.iter()).impls_trait(db, auto.trait_, &[])
+                let args = (0..params.len()).map(|at| if Some(at) == bad { not_ty } else { good });
+                ty.instantiate_type_params(db, args).impls_trait(db, auto.trait_, &[])
             };
             let holds = with(None);
             let needs: Vec<&String> = if holds {

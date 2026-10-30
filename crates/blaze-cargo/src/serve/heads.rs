@@ -23,7 +23,7 @@
 #![forbid(unsafe_code)]
 
 use blaze_api::{ApiError, Arrived, Reply, Request, RequestRef, Response, ViewRef};
-use blaze_core::{Completion, Conn, Done, Effect, FileName, Tag};
+use blaze_core::{Completion, Conn, Done, Effect, FileName, Tag, decimal::decimal};
 use blaze_ids::ContentId;
 use blaze_vfs::{Outside, Vfs, Watched, Watcher};
 use rustc_hash::FxHashMap;
@@ -275,12 +275,12 @@ impl Heads {
         self.next_cookie += 1;
         let mut path = String::with_capacity(checkout.cookie_prefix.len() + 20);
         path.push_str(&checkout.cookie_prefix);
-        path.push_str(itoa(number, &mut [0; 20]));
+        path.push_str(decimal(number, &mut [0; 20]));
         let file = FileName::new(&path).expect("a cookie's name is a name");
         let tag = Tag(self.tags + (number % (1 << 31)) * 2);
         self.writing.insert(tag, (slot, number));
         path.clear();
-        path.push_str(itoa(number, &mut [0; 20]));
+        path.push_str(decimal(number, &mut [0; 20]));
         path.push('\n');
         effects.push(Effect::Write { file: file.clone(), bytes: path.into_bytes(), tag });
         checkout.cookies.insert(number, Cookie { file, written: false, seen: false });
@@ -492,20 +492,6 @@ impl Heads {
     }
 }
 
-/// `number` in decimal, written into `buf`.
-fn itoa(mut number: u64, buf: &mut [u8; 20]) -> &str {
-    let mut at = buf.len();
-    loop {
-        at -= 1;
-        buf[at] = b'0' + (number % 10) as u8;
-        number /= 10;
-        if number == 0 {
-            break;
-        }
-    }
-    std::str::from_utf8(&buf[at..]).expect("digits are UTF-8")
-}
-
 fn answer(out: &mut Vec<Out>, to: RequestRef, error: Option<ApiError>, ok: bool) {
     if let Some(error) = error {
         out.push(Out::Answer(Reply { to, response: Response::Error(error) }));
@@ -538,13 +524,6 @@ mod tests {
         assert!(within("w/target", "w"));
         assert!(!within("w/target", "w/tar"));
         assert!(!within("w/target", "w/target/x"));
-    }
-
-    #[test]
-    fn numbers_are_written_in_decimal() {
-        for number in [0, 7, 10, 1234567890, u64::MAX] {
-            assert_eq!(itoa(number, &mut [0; 20]), number.to_string());
-        }
     }
 
     #[test]

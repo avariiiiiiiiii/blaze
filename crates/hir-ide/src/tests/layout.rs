@@ -26,13 +26,13 @@ use crate::{
 mod closure;
 
 fn current_machine_target_data() -> TargetData {
-    project_model::toolchain_info::target_data::get(
-        QueryConfig::Rustc(&Sysroot::empty(), &std::env::current_dir().unwrap()),
-        None,
-        &FxHashMap::default(),
-        None,
-    )
-    .unwrap()
+    let dir = std::env::current_dir().unwrap();
+    let sysroot = Sysroot::empty();
+    let config = QueryConfig::Rustc(&sysroot, &dir);
+    let env = FxHashMap::default();
+    let host = project_model::toolchain_info::target_tuple::get(config, None, &env).unwrap();
+    project_model::toolchain_info::target_data::get(config, host.first().map(String::as_str), &env, None)
+        .unwrap()
 }
 
 fn eval_goal(

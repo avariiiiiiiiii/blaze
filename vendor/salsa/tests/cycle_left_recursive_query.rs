@@ -1,4 +1,5 @@
 #![cfg(all(feature = "inventory", feature = "accumulator"))]
+#![forbid(unsafe_code)]
 
 use crate::common::{ExecuteValidateLoggerDatabase, LogDatabase};
 use expect_test::expect;

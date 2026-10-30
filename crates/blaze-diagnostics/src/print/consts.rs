@@ -112,7 +112,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                     hir_def::CallableDefId::StructId(it) => Def::Adt(AdtId::StructId(it)),
                     hir_def::CallableDefId::EnumVariantId(it) => Def::Variant(it),
                 };
-                self.print_value_path(def, args.as_slice());
+                self.print_value_path(def, args.skip_binder().as_slice());
             }
             (ValTreeKind::Branch(consts), _) if consts.as_slice().is_empty() => self.write_str("<ZST>"),
             (kind, _) => self.write_fmt(format_args!("{kind:?}")),
@@ -234,7 +234,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
 }
 
 /// `{value}{suffix}`, `_` between for one that is not finite: rustc's float printing.
-fn float<F: rustc_apfloat::Float + std::fmt::Display>(p: &mut Printer<'_, '_, '_, '_>, value: F, suffix: &str) {
+fn float<'db: 't, 't, F: rustc_apfloat::Float + std::fmt::Display>(p: &mut Printer<'_, '_, 'db, 't>, value: F, suffix: &str) {
     let sep = if value.is_finite() { "" } else { "_" };
     p.write_fmt(format_args!("{value}{sep}{suffix}"));
 }

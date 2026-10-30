@@ -22,8 +22,8 @@ use std::fmt;
 use base_db::{Crate, Db};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
-    CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, ModuleId,
-    TraitId,
+    CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
+    ModuleIdLt, TraitId,
     expr_store::Body,
     hir::generics::GenericParams,
     lang_item::LangItems,
@@ -561,7 +561,7 @@ impl<'a, 'db> Checker<'a, 'db> {
     /// last, of what would be reported: a body with nothing to report is checked without
     /// building its source map.
     fn written(&self, span: MirSpan) -> bool {
-        let source_map = || Body::with_source_map(self.db, self.def).1;
+        let source_map = || &Body::with_source_map(self.db, self.def).1;
         match span {
             MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map().expr_syntax(expr).is_ok(),
             MirSpan::PatId(pat) => source_map().pat_syntax(pat).is_ok(),
@@ -651,7 +651,7 @@ fn self_ty_name(db: &Db, ty: Ty<'_>) -> TypeName {
 
 /// rustc's `def_path_str` of the item `name` in `module`: its modules' names and its own,
 /// with the crate's name first when it is not `caller`.
-fn def_path(db: &Db, caller: Crate, mut module: ModuleId, name: &str) -> String {
+fn def_path<'db>(db: &'db Db, caller: Crate, mut module: ModuleIdLt<'db>, name: &str) -> String {
     // alloc: the text of a diagnostic, made when it is reported
     let mut segments = vec![name.to_owned()];
     loop {

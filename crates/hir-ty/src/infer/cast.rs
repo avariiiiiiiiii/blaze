@@ -8,7 +8,7 @@ use hir_def::{
 };
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{
-    InferTy, RegionKind, TypeVisitableExt, UintTy, elaborate,
+    InferTy, RegionKind, TypeVisitableExt, UintTy,
     error::TypeError,
     fold_regions,
     inherent::{BoundExistentialPredicates as _, IntoKind, Ty as _},
@@ -21,8 +21,8 @@ use crate::{
     drop::destructor,
     infer::{AllowTwoPhase, InferenceContext, expr::ExprIsRead},
     next_solver::{
-        AliasTy, BoundExistentialPredicates, ExistentialPredicate, ParamTy, Region, RegionExt, Ty,
-        TyKind, infer::traits::ObligationCause,
+        AliasTy, BoundExistentialPredicates, ExistentialPredicate, ParamTy, Region, RegionExt,
+        TraitIdWrapper, Ty, TyKind, infer::traits::ObligationCause,
     },
 };
 
@@ -486,13 +486,14 @@ impl<'db> CastCheck<'db> {
                         // Emit an FCW otherwise.
                         let mut src_auto = Vec::new_in(ctx.frame);
                         src_auto.extend(src_tty.auto_traits().into_iter().chain(
-                            elaborate::supertrait_def_ids(ctx.interner(), src_principal).filter(
-                                |trait_| {
-                                    TraitSignature::of(ctx.db, trait_.0)
+                            crate::utils::all_super_traits(ctx.db, src_principal.0)
+                                .iter()
+                                .filter(|&&trait_| {
+                                    TraitSignature::of(ctx.db, trait_)
                                         .flags
                                         .contains(TraitFlags::AUTO)
-                                },
-                            ),
+                                })
+                                .map(|&trait_| TraitIdWrapper(trait_)),
                         ));
 
                         let mut added = dst_tty

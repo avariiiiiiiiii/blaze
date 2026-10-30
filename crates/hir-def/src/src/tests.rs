@@ -188,7 +188,7 @@ fn child_source_view_is_child_source() {
 }
 
 #[test]
-fn use_tree_to_view_is_use_tree_to_ast() {
+fn use_tree_to_view_is_child_source() {
     let db = TestDB::with_files(FIXTURE);
     let mut seen = 0;
     for use_ in defs(&db).uses {
@@ -201,12 +201,10 @@ fn use_tree_to_view_is_use_tree_to_ast() {
         assert_eq!(views.value.iter().count(), map.value.iter().count());
         for (idx, tree) in trees.iter() {
             let index: Idx<ast::UseTree> = Idx::from_raw(idx.into_raw());
-            let handle = use_tree_to_ast(&db, id, index);
-            assert_eq!(of_view(view::AstNode::syntax(tree)), of_handle(handle.syntax()));
-            let view = use_tree_to_view(&db, id, index);
-            assert_eq!(of_view(view::AstNode::syntax(&view)), of_handle(handle.syntax()));
             let in_map = map.value.get(index).map(|it| of_handle(it.syntax()));
-            assert_eq!(in_map, Some(of_handle(handle.syntax())));
+            assert_eq!(Some(of_view(view::AstNode::syntax(tree))), in_map);
+            let view = use_tree_to_view(&db, id, index);
+            assert_eq!(Some(of_view(view::AstNode::syntax(&view))), in_map);
             let in_views = views.value.get(index).map(|&it| of_view(view::AstNode::syntax(&it)));
             assert_eq!(in_views, in_map);
             seen += 1;

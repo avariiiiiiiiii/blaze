@@ -37,7 +37,7 @@ pub struct Cpu {
     pub fast: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)] // clone: once per pool started, kept by it
 pub struct Topology {
     /// By id.
     pub cpus: Vec<Cpu>,

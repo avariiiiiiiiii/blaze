@@ -11,6 +11,7 @@ use crate::{
     MemoryMap, ParamEnvAndCrate, PointerAt, consteval,
     db::HirDatabase,
     layout::{InternedLayout, Layout},
+    mir::{IsSigned, pad16},
     next_solver::{
         Const, Consts, ErrorGuaranteed, TyKind, WorldExposer, ensure_sufficient_stack,
         interner::table,
@@ -483,9 +484,7 @@ fn scalar<'db>(
     if size.bytes() == 0 || bytes.len() as u64 != size.bytes() || bytes.len() > 16 {
         return Err(unreadable(ty, "a scalar of the wrong size"));
     }
-    let mut data = [0; 16];
-    data[..bytes.len()].copy_from_slice(bytes);
-    Ok(ScalarInt::raw(u128::from_le_bytes(data), size))
+    Ok(ScalarInt::raw(u128::from_le_bytes(pad16(bytes, IsSigned::No)), size))
 }
 
 impl<'db> rustc_type_ir::inherent::ValueConst<DbInterner<'db>> for ValueConst<'db> {

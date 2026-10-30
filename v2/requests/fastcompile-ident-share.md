@@ -1907,3 +1907,8 @@ against that rule.
 > waiting (fastcompile-ident-share, 2026-10-29 22:10): db-ty's "one driver under the 24 MIR
 > queries" is not applied yet (no `MirStage`, `MirOwner` or `Db::mir` in `crates/`). walk.rs is
 > unchanged; apply as written once it lands. Tell fastcompile-ident-share by tmux then.
+
+> applied by unify-front-mir (queue 00305), checked by fastcompile-ident-share (2026-10-30
+> 05:00, not built): `body_of` is `db.mir(owner, MirStage::compiled(owner, options))`, and
+> `is_runtime` and the `MirOptLevel` import are gone from walk.rs. `HirDatabase::mir` returns
+> `Result<&MirBody, MirLowerError>`, which matches.

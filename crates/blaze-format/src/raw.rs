@@ -46,31 +46,43 @@ pub(crate) fn bytes_of<T: Record>(values: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
 }
 
-/// `bytes`, a part of `buffer`, as a `T`, once [`Record::check`] accepts them.
-pub(crate) fn view<'a, T: Record>(bytes: &'a [u8], buffer: &[u8]) -> Result<&'a T, FormatError> {
+/// `bytes`, a part of `buffer`, as a `T`, once [`Record::check`] accepts them when `DEEP`
+/// (with all they reach: what [`crate::open`] runs), else [`Record::check_shallow`] (which
+/// a [`Record::SHALLOW_PLAIN`] `T` needs none of).
+pub(crate) fn view<'a, T: Record, const DEEP: bool>(bytes: &'a [u8], buffer: &[u8]) -> Result<&'a T, FormatError> {
     fits::<T>(bytes, 1, buffer)?;
-    T::check(bytes, buffer)?;
+    match DEEP {
+        true => T::check(bytes, buffer)?,
+        false if !T::SHALLOW_PLAIN => T::check_shallow(bytes, buffer)?,
+        false => {}
+    }
     // SAFETY: `fits` checked `bytes` is `size_of::<T>()` bytes at `T`'s alignment, and
-    // `T::check` accepted them, which `Record`'s contract makes a valid `T`; the reference
-    // borrows `bytes`.
+    // `T::check` or `T::check_shallow` accepted them, or `T::SHALLOW_PLAIN` makes any of them
+    // one, which `Record`'s contract makes a valid `T`; the reference borrows `bytes`.
     Ok(unsafe { &*bytes.as_ptr().cast::<T>() })
 }
 
-/// `bytes`, a part of `buffer`, as `len` `T`s, once [`Record::check`] accepts each (or at once
-/// for a [`Record::PLAIN`] `T`, which any bytes are).
-pub(crate) fn view_slice<'a, T: Record>(
+/// `bytes`, a part of `buffer`, as `len` `T`s, once each is checked as [`view`] checks one
+/// (or at once for a [`Record::PLAIN`] `T`, or one [`Record::SHALLOW_PLAIN`] when not `DEEP`,
+/// which any bytes are).
+pub(crate) fn view_slice<'a, T: Record, const DEEP: bool>(
     bytes: &'a [u8],
     len: usize,
     buffer: &[u8],
 ) -> Result<&'a [T], FormatError> {
     fits::<T>(bytes, len, buffer)?;
-    if !T::PLAIN {
-        let size = size_of::<T>();
-        (0..len).try_for_each(|i| crate::check_field::<T>(bytes, i * size, buffer))?;
+    let size = size_of::<T>();
+    match DEEP {
+        true if !T::PLAIN => (0..len).try_for_each(|i| crate::check_field::<T>(bytes, i * size, buffer))?,
+        false if !T::SHALLOW_PLAIN => {
+            (0..len).try_for_each(|i| crate::check_field_shallow::<T>(bytes, i * size, buffer))?
+        }
+        _ => {}
     }
     // SAFETY: `fits` checked `bytes` is `len` `T`s long, the first at `T`'s alignment and so
     // each (a size is a multiple of its alignment), and each is a valid `T`: checked above, or
-    // `T::PLAIN`. The slice borrows `bytes`.
+    // `T::PLAIN`, or `T::SHALLOW_PLAIN` (any bits, references unfollowed) when not `DEEP`. The
+    // slice borrows `bytes`.
     Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), len) })
 }
 
@@ -107,10 +119,12 @@ mod tests {
         assert_eq!(bytes, &le[..]);
         let buffer = Aligned::copy_from(bytes);
         for len in [0, 1, 7, 100] {
-            assert_eq!(view_slice::<u32>(&buffer[..4 * len], len, &buffer).unwrap(), &words(&buffer[..4 * len])[..]);
+            assert_eq!(view_slice::<u32, true>(&buffer[..4 * len], len, &buffer).unwrap(), &words(&buffer[..4 * len])[..]);
+            assert_eq!(view_slice::<u32, false>(&buffer[..4 * len], len, &buffer).unwrap(), &words(&buffer[..4 * len])[..]);
         }
-        assert_eq!(*view::<u32>(&buffer[8..12], &buffer).unwrap(), words(&buffer[8..12])[0]);
-        assert_eq!(*view::<u64>(&buffer[8..16], &buffer).unwrap(), u64::from_le_bytes(buffer[8..16].try_into().unwrap()));
+        assert_eq!(*view::<u32, true>(&buffer[8..12], &buffer).unwrap(), words(&buffer[8..12])[0]);
+        assert_eq!(*view::<u32, false>(&buffer[8..12], &buffer).unwrap(), words(&buffer[8..12])[0]);
+        assert_eq!(*view::<u64, true>(&buffer[8..16], &buffer).unwrap(), u64::from_le_bytes(buffer[8..16].try_into().unwrap()));
         let slice = in_place::<Slice<u32>>(&buffer[16..24], &buffer).unwrap();
         assert_eq!((slice.offset, slice.len), (words(&buffer[16..20])[0] as i32, words(&buffer[20..24])[0]));
     }
@@ -118,15 +132,18 @@ mod tests {
     #[test]
     fn a_view_of_the_wrong_size_or_alignment_is_refused() {
         let buffer = Aligned::copy_from(&[0; 64]);
-        assert!(view::<u32>(&buffer[1..5], &buffer).is_err());
-        assert!(view::<u32>(&buffer[0..3], &buffer).is_err());
-        assert!(view::<u64>(&buffer[4..12], &buffer).is_err());
-        assert!(view_slice::<u32>(&buffer[0..8], 3, &buffer).is_err());
-        assert!(view_slice::<u32>(&buffer[2..10], 2, &buffer).is_err());
-        assert!(view_slice::<u32>(&buffer[0..8], usize::MAX, &buffer).is_err());
+        assert!(view::<u32, true>(&buffer[1..5], &buffer).is_err());
+        assert!(view::<u32, false>(&buffer[1..5], &buffer).is_err());
+        assert!(view::<u32, true>(&buffer[0..3], &buffer).is_err());
+        assert!(view::<u64, false>(&buffer[4..12], &buffer).is_err());
+        assert!(view_slice::<u32, true>(&buffer[0..8], 3, &buffer).is_err());
+        assert!(view_slice::<u32, false>(&buffer[2..10], 2, &buffer).is_err());
+        assert!(view_slice::<u32, false>(&buffer[0..8], usize::MAX, &buffer).is_err());
+        assert!(view_slice::<Slice<u32>, false>(&buffer[2..10], 1, &buffer).is_err(), "a Slice off its alignment");
         assert!(in_place::<Rel<u32>>(&buffer[2..6], &buffer).is_err());
         let two = Aligned::copy_from(&[2]);
-        assert!(view::<bool>(&two, &two).is_err(), "a bool of 2");
+        assert!(view::<bool, true>(&two, &two).is_err(), "a bool of 2");
+        assert!(view::<bool, false>(&two, &two).is_err(), "a bool of 2, shallow");
     }
 
     #[test]

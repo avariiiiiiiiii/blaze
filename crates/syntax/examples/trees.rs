@@ -5,35 +5,45 @@
 //! an outline's bodies), the bytes held then, then every node alone, as an ast id map does, and
 //! one node in 16 found again from a pointer, as a diagnostic's span is.
 
+#![deny(unsafe_code)]
+
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicIsize, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 
 use syntax::{AstNode, Edition, SourceFile, SyntaxNodePtr, WalkEvent};
 
-struct Counting;
+use self::counting::{Counting, HELD};
 
-static HELD: AtomicIsize = AtomicIsize::new(0);
+/// The bytes held, counted by an allocator over the system's: implementing `GlobalAlloc` is
+/// unsafe, and only this module does.
+#[allow(unsafe_code)]
+mod counting {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        sync::atomic::{AtomicIsize, Ordering},
+    };
 
-// SAFETY: every call is passed on to the system's allocator, which is what holds the memory.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        HELD.fetch_add(layout.size() as isize, Ordering::Relaxed);
-        // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (a non-zero-sized
-        // `layout`), which is `System`'s too.
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        HELD.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-        // SAFETY: `ptr` came from `alloc` above with `layout`, which is `System.alloc`'s, so it
-        // is `System`'s to free with that layout.
-        unsafe { System.dealloc(ptr, layout) }
+    pub(super) struct Counting;
+
+    pub(super) static HELD: AtomicIsize = AtomicIsize::new(0);
+
+    // SAFETY: every call is passed on to the system's allocator, which is what holds the memory.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            HELD.fetch_add(layout.size() as isize, Ordering::Relaxed);
+            // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (a non-zero-sized
+            // `layout`), which is `System`'s too.
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            HELD.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+            // SAFETY: `ptr` came from `alloc` above with `layout`, which is `System.alloc`'s, so
+            // it is `System`'s to free with that layout.
+            unsafe { System.dealloc(ptr, layout) }
+        }
     }
 }
 

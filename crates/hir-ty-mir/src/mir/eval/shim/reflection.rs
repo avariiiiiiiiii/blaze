@@ -8,7 +8,6 @@
 
 use hir_ty::db::HirDatabase;
 use hir_def::{AttrDefId, EnumVariantId};
-use rustc_type_ir::inherent::Region as _;
 
 use crate::mir::eval::word_bytes;
 use crate::next_solver::{

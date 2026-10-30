@@ -494,47 +494,58 @@ impl Files {
         keys.extend(plan.added.iter().map(|(_, _, path)| content::path_key(path)));
         let key_bytes = frame.alloc_slice_from_iter(keys.iter().map(|key| &**key));
         let path_hashes = content::hash_many(SourceRoot::PATH_DOMAIN, key_bytes, frame);
-        let mut keys: Vec<Option<(Box<[u8]>, u8)>, &Frame> = {
+        let mut keys: Vec<Option<(Box<[u8]>, ContentId)>, &Frame> = {
             let mut placed = Vec::with_capacity_in(keys.len(), frame);
-            placed.extend(
-                keys.into_iter()
-                    .zip(path_hashes)
-                    .map(|(key, hash)| Some((key, RootContent::bucket(hash)))),
-            );
+            placed.extend(keys.into_iter().zip(path_hashes).map(|(key, &hash)| Some((key, hash))));
             placed
         };
 
         for &root in roots {
             let input = self.source_root(root);
-            let old = input.source_root(&*db);
             let mut gone: hashbrown::HashSet<FileId, FxBuildHasher, &Frame> =
                 hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
             gone.extend(plan.removed.iter().filter(|it| it.0 == root).map(|it| it.1));
-            let mut files = FileSet::default();
-            for id in old.iter() {
-                if gone.contains(&id) {
-                    continue;
-                }
-                if let Some(path) = old.path_for_file(&id) {
-                    // clone: `vfs::FileSet` has no remove, so a root that gains or loses a file is rebuilt (lane vfs).
-                    files.insert(id, path.clone());
-                }
-            }
+            // The root's set, taken out of its input to be edited where it is: no reader holds
+            // it by then (they read it by reference), so `make_mut` copies nothing.
+            let spare = writer.spare_root();
+            let mut source_root =
+                input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(spare);
             let index = writer
                 .root_contents
                 .get_mut(&root)
                 .expect("a source root's content is kept from when it is set");
+            let added = plan.added.iter().filter(|it| it.1 == root);
+            index.one_to_one = match index.one_to_one {
+                true => {
+                    // clone: only for a set a reader still holds (copy on write).
+                    let files = Arc::make_mut(&mut source_root);
+                    for &id in &gone {
+                        files.remove_file(id);
+                    }
+                    let mut one_to_one = true;
+                    for (id, _, path) in added {
+                        one_to_one &= files.path_for_file(id).is_none() && files.file_for_path(path).is_none();
+                        // clone: an added file's path in the set.
+                        files.insert_file(*id, path.clone());
+                    }
+                    one_to_one
+                }
+                false => {
+                    let (files, one_to_one) = rebuilt(&source_root, &gone, added);
+                    // alloc: the set made again, for a set that names a path for two files.
+                    source_root = Arc::new(files);
+                    one_to_one
+                }
+            };
             for &id in &gone {
                 index.remove(id);
             }
-            for (at, (id, added_root, path)) in plan.added.iter().enumerate() {
+            for (at, (id, added_root, _)) in plan.added.iter().enumerate() {
                 if *added_root != root {
                     continue;
                 }
-                // clone: an added file's path in the new set.
-                files.insert(*id, path.clone());
-                let (key, bucket) = keys[at].take().expect("an added file is put in one root");
-                index.insert(*id, key, bucket, self.entry_content(&*db, *id));
+                let (key, path) = keys[at].take().expect("an added file is put in one root");
+                index.insert(*id, key, path, self.entry_content(&*db, *id));
             }
             for &id in &gone {
                 if let Some(roots) = writer.in_roots.get_mut(id) {
@@ -551,17 +562,49 @@ impl Files {
                 }
                 writer.note_path(path, *id);
             }
-            let new = match old.is_library {
-                true => SourceRoot::new_library(files),
-                false => SourceRoot::new_local(files),
-            };
-            // alloc: the root's new file set, as above.
-            input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(Arc::new(new));
+            input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(source_root);
             if !changed.contains(&root) {
                 changed.push(root);
             }
         }
     }
+}
+
+/// `old` without `gone` and with `added`, made again from its files in their order: what a
+/// set that names a path for two files or a file at two paths is edited as, since there the
+/// file a path names after a removal depends on all of them. Whether the new set names each
+/// file at one path and each path for one file.
+fn rebuilt<'p>(
+    old: &SourceRoot,
+    gone: &hashbrown::HashSet<FileId, FxBuildHasher, &Frame>,
+    added: impl Iterator<Item = &'p (FileId, SourceRootId, VfsPath)>,
+) -> (SourceRoot, bool) {
+    let mut files = FileSet::default();
+    for id in old.iter() {
+        if gone.contains(&id) {
+            continue;
+        }
+        if let Some(path) = old.path_for_file(&id) {
+            // clone: the set made again, as above.
+            files.insert(id, path.clone());
+        }
+    }
+    for (id, _, path) in added {
+        // clone: an added file's path in the set.
+        files.insert(*id, path.clone());
+    }
+    let mut ids = 0;
+    let mut named_back = 0;
+    for id in files.iter() {
+        ids += 1;
+        named_back += usize::from(files.path_for_file(&id).and_then(|path| files.file_for_path(path)) == Some(&id));
+    }
+    let one_to_one = named_back == ids && ids == files.len();
+    let root = match old.is_library {
+        true => SourceRoot::new_library(files),
+        false => SourceRoot::new_local(files),
+    };
+    (root, one_to_one)
 }
 
 /// A path as blaze-vfs takes one.

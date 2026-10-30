@@ -11,6 +11,8 @@
 //! Database-owning benchmarks use single-iteration samples to avoid batching
 //! multiple databases, and 20 samples to keep their setup cost bounded.
 
+#![forbid(unsafe_code)]
+
 use std::hint::black_box;
 
 use salsa::Database as _;

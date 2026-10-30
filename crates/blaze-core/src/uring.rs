@@ -122,6 +122,8 @@ const SQ_THREAD_IDLE_MS: u32 = 50;
 
 const SQE_FIXED_FILE: u8 = 1 << 0;
 const SQE_IO_LINK: u8 = 1 << 2;
+/// Run by the kernel's workers (io-wq) rather than tried inline on the submission thread.
+const SQE_ASYNC: u8 = 1 << 4;
 const SQE_BUFFER_SELECT: u8 = 1 << 5;
 /// In an accept's `ioprio`: one request takes every connection until it is cancelled.
 const ACCEPT_MULTISHOT: u16 = 1 << 0;
@@ -1598,6 +1600,10 @@ pub struct Uring {
     on_open: Vec<Id>,
     /// Requests waiting for slots of the table for their opens, in the order they asked.
     slot_waiting: VecDeque<Id>,
+    /// Reads of files no request keeps that hold a descriptor ([`files::LOADS`]), and those
+    /// waiting for room among them, in the order they asked.
+    loading: usize,
+    load_waiting: VecDeque<Id>,
     /// Closes of slots in flight.
     closes: usize,
     /// Slots of the table requests on paths hold.
@@ -1628,6 +1634,9 @@ pub struct Uring {
     timers: Wheel<Tag>,
     // dyn: the embedder's sandbox, called once per spawn, which makes a process anyway.
     confine: Option<Arc<dyn Confine>>,
+    /// Where each sandboxed spawn's own directory is made: `root/.blaze-spawn` unless
+    /// [`Uring::scratch`] says otherwise.
+    spawn_dirs: PathBuf,
     /// Buffers of [`PIPE`] bytes, a watch's or a spawn's pipe's, kept from what ended for
     /// what starts next.
     buffers: Vec<Vec<u8>>,
@@ -1653,9 +1662,11 @@ impl Uring {
         fn slab<T>(max: u32) -> io::Result<Slab<T>> {
             Slab::new(max, MemTag::Io).map_err(io::Error::other)
         }
+        let root: Arc<Path> = Arc::from(root.into());
+        let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
         Ok(Uring {
             start: Instant::now(),
-            root: Arc::from(root.into()),
+            root,
             ring,
             table,
             registered,
@@ -1671,6 +1682,8 @@ impl Uring {
             // past that.
             on_open: Vec::with_capacity(ENTRIES as usize),
             slot_waiting: VecDeque::with_capacity(ENTRIES as usize), // alloc: setup, as above.
+            loading: 0,
+            load_waiting: VecDeque::with_capacity(ENTRIES as usize), // alloc: setup, as above.
             closes: 0,
             slots_held: 0,
             direct_writes: 0,
@@ -1686,6 +1699,7 @@ impl Uring {
             conns: slab(CONNS)?,
             timers: Wheel::new(),
             confine: None,
+            spawn_dirs,
             buffers: Vec::with_capacity(SPARES), // alloc: setup, once per driver.
             trees: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
             stampers: None,
@@ -1700,6 +1714,14 @@ impl Uring {
     pub fn confined(mut self, confine: Arc<dyn Confine>) -> Uring {
         self.confine = Some(confine);
         self
+    }
+
+    /// The driver, making each sandboxed spawn's own directory under `dir`, made here.
+    pub fn scratch(mut self, dir: impl Into<PathBuf>) -> io::Result<Uring> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        self.spawn_dirs = dir;
+        Ok(self)
     }
 
     /// Every timer due, fired in the order they were due.
@@ -2147,21 +2169,30 @@ impl Driver for Uring {
                 Effect::Unwatch { .. } | Effect::Unlisten { .. } | Effect::Kill { .. } => {
                     unreachable!("taken above")
                 }
-                // Its buffer is the file's size, once it is open (a missing file's, empty).
-                Effect::ReadAll { file, .. } => self.file(&file, false).map(|file| {
-                    let file = self.hold(file);
-                    let mut hot = Hot::new(tag, Kind::Read, file.to_bits());
-                    hot.flags |= ops::WHOLE;
-                    self.start(hot, ops::NO_BYTES, Cold::EMPTY);
-                    None
-                }),
-                Effect::Read { file, at, len, .. } => self.file(&file, false).map(|file| {
-                    let file = self.hold(file);
-                    let hot = Hot::new(tag, Kind::Read, file.to_bits());
-                    // alloc: the read's result, handed to its asker.
-                    self.start(hot, vec![0; len], Cold { at, ..Cold::EMPTY });
-                    None
-                }),
+                // Of a file kept for appending, through its descriptor, after what was asked
+                // of it before; of any other, the file at its name now, opened for the read
+                // alone. Its buffer is the file's size, once it is open (a missing file's,
+                // empty).
+                Effect::ReadAll { file, .. } => match self.names.contains_key(&file) {
+                    true => self.file(&file, false).map(|file| {
+                        let file = self.hold(file);
+                        let mut hot = Hot::new(tag, Kind::Read, file.to_bits());
+                        hot.flags |= ops::WHOLE;
+                        self.start(hot, ops::NO_BYTES, Cold::EMPTY);
+                        None
+                    }),
+                    false => self.load(tag, &file, 0, None).map(|()| None),
+                },
+                Effect::Read { file, at, len, .. } => match self.names.contains_key(&file) {
+                    true => self.file(&file, false).map(|file| {
+                        let file = self.hold(file);
+                        let hot = Hot::new(tag, Kind::Read, file.to_bits());
+                        // alloc: the read's result, handed to its asker.
+                        self.start(hot, Vec::with_capacity(len), Cold { at, ..Cold::EMPTY });
+                        None
+                    }),
+                    false => self.load(tag, &file, at, Some(len)).map(|()| None),
+                },
                 // An empty one too, so it answers once the file it makes is there.
                 Effect::Append { file, bytes, .. } => self.file(&file, true).map(|file| {
                     let file = self.hold(file);
@@ -3804,6 +3835,147 @@ mod tests {
         drop(driver);
         assert!(!root.join("missing").exists());
         assert_eq!(std::fs::read(root.join("plain")).unwrap(), b"x");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn read_all(driver: &mut Uring, mut effects: Vec<Effect>) -> BTreeMap<u64, Done> {
+        let mut seen = BTreeMap::new();
+        run_until_idle(driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
+        seen
+    }
+
+    /// A read of a file no request keeps is of the file at its name when it is asked, as the
+    /// threads driver's: after a new file is renamed over the name (an editor's save, a
+    /// checkout), the next read has the new bytes. The read keeps no descriptor, slot or name.
+    #[test]
+    fn a_read_is_of_the_file_at_its_name_now() {
+        let root = dir("uring-read-now");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("src.rs"), b"old").unwrap();
+        std::fs::write(root.join("empty"), b"").unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let free = driver.table.free.borrow().len();
+        let name = |it: &str| FileName::new(it).unwrap();
+        let seen = read_all(
+            &mut driver,
+            vec![
+                Effect::ReadAll { file: name("src.rs"), tag: Tag(1) },
+                Effect::Read { file: name("src.rs"), at: 1, len: 10, tag: Tag(2) },
+                Effect::Read { file: name("src.rs"), at: 9, len: 1, tag: Tag(3) },
+                Effect::ReadAll { file: name("missing"), tag: Tag(4) },
+                Effect::ReadAll { file: name("empty"), tag: Tag(5) },
+            ],
+        );
+        let reads = |seen: &BTreeMap<u64, Done>| -> Vec<Vec<u8>> {
+            seen.values()
+                .map(|it| match it {
+                    Done::Read(bytes) => bytes.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(reads(&seen), [&b"old"[..], b"ld", b"", b"", b""]);
+        std::fs::write(root.join("new"), b"new contents").unwrap();
+        std::fs::rename(root.join("new"), root.join("src.rs")).unwrap();
+        let seen = read_all(
+            &mut driver,
+            vec![
+                Effect::ReadAll { file: name("src.rs"), tag: Tag(1) },
+                Effect::Read { file: name("src.rs"), at: 4, len: 8, tag: Tag(2) },
+            ],
+        );
+        assert_eq!(reads(&seen), [&b"new contents"[..], b"contents"]);
+        assert_eq!(reads(&seen)[0], std::fs::read(root.join("src.rs")).unwrap());
+        assert!(driver.kept.is_empty() && driver.names.is_empty());
+        assert_eq!((driver.loading, driver.load_waiting.len()), (0, 0));
+        assert_eq!((driver.table.free.borrow().len(), driver.slots_held), (free, 0));
+        assert_eq!(driver.paths.held(), [0, 0]);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Reads of more files than may be open at once hold at most [`Uring::loads_most`]
+    /// descriptors, the rest waiting in the order asked; once [`files::SPREAD_LEAST`] are open
+    /// their opens go to the kernel's workers. Each read has what `std::fs::read` has.
+    #[test]
+    fn reads_of_many_files_hold_few_descriptors() {
+        let root = dir("uring-many-reads");
+        std::fs::create_dir_all(root.join("f")).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let most = driver.loads_most();
+        let count = 2 * most + 5;
+        for n in 0..count {
+            std::fs::write(root.join(format!("f/{n}")), n.to_string().repeat(n % 7)).unwrap();
+        }
+        let mut effects: Vec<Effect> = (0..count)
+            .map(|n| Effect::ReadAll { file: FileName::new(&format!("f/{n}")).unwrap(), tag: Tag(n as u64) })
+            .collect();
+        driver.submit(&mut effects);
+        assert_eq!((driver.loading, driver.load_waiting.len()), (most, count - most));
+        let open = (driver.ops.iter())
+            .find(|(id, hot)| hot.kind == Kind::Load && !driver.load_waiting.contains(id))
+            .map(|(id, _)| id)
+            .expect("an admitted read");
+        let mut sqes = [Sqe::default(); ops::LINKS];
+        driver.path_sqes(open, &mut sqes);
+        assert_eq!(sqes[0].flags & SQE_ASYNC != 0, most >= files::SPREAD_LEAST);
+        let (mut out, mut seen) = (Vec::new(), BTreeMap::new());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while driver.in_flight() > 0 && Instant::now() < deadline {
+            driver.poll(&mut out, Duration::from_millis(50));
+            assert!(driver.loading <= most, "{} reads open of {most}", driver.loading);
+            seen.extend(out.drain(..).map(|it| (it.tag.0 as usize, it.done)));
+        }
+        assert_eq!(seen.len(), count);
+        for (n, done) in seen {
+            assert_eq!(done, Done::Read(std::fs::read(root.join(format!("f/{n}"))).unwrap()), "f/{n}");
+        }
+        assert_eq!((driver.loading, driver.load_waiting.len()), (0, 0));
+        assert_eq!(driver.paths.held(), [0, 0]);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A warm read of a file no request keeps allocates its result alone and calls nothing on
+    /// a name on the driver's thread: the open is the ring's, the size an `fstat` of the
+    /// descriptor it opened.
+    #[test]
+    fn warm_reads_allocate_their_bytes_alone() {
+        let root = dir("uring-warm-reads");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/src.rs"), b"fn main() {}\n").unwrap();
+        let ours = root.clone();
+        std::thread::spawn(move || {
+            let mut driver = Uring::new(&ours).unwrap();
+            let file = FileName::new("d/src.rs").unwrap();
+            let mut out = Vec::with_capacity(16);
+            for round in 0..2 * WARM {
+                if round == WARM {
+                    path_calls::forbid();
+                }
+                let mut reads = Vec::with_capacity(2);
+                reads.push(Effect::ReadAll { file: file.clone(), tag: Tag(2 * round) });
+                reads.push(Effect::Read { file: file.clone(), at: 3, len: 4, tag: Tag(2 * round + 1) });
+                out.clear();
+                let calls = path_calls::count();
+                let ((), used) = blaze_alloc_count::measure(|| {
+                    driver.submit(&mut reads);
+                    poll_until(&mut driver, &mut out, |out| out.len() == 2);
+                });
+                let calls = path_calls::count() - calls;
+                out.sort_by_key(|it| it.tag.0);
+                let done: Vec<&Done> = out.iter().map(|it| &it.done).collect();
+                assert_eq!(done, [&Done::Read(b"fn main() {}\n".to_vec()), &Done::Read(b"main".to_vec())]);
+                if round >= WARM {
+                    assert!(used.allocations <= 2, "round {round}: {} allocations", used.allocations);
+                    assert_eq!(calls, 0, "round {round}: calls on names on the driver's thread");
+                }
+            }
+            assert!(driver.kept.is_empty());
+            assert_eq!((driver.paths.held(), driver.loading), ([0, 0], 0));
+        })
+        .join()
+        .unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -6,7 +6,6 @@
 //!   notes; the unknown, renamed and removed lint names; unfulfilled `expect`s.
 //! - [`registry`]: every builtin lint of the pinned nightly, its groups, renamed and removed
 //!   lints.
-//! - [`edit_distance`]: rustc's choice of a similar name to suggest.
 //! - `syntax`: what rustc's early lint pass, its expansion and its attribute checks find on
 //!   the source as written (`unused_parens`, `unexpected_cfgs`, `unused_attributes`, ..).
 //! - `names`: what name resolution, stability and the dead-code pass find of items and paths
@@ -15,7 +14,6 @@
 //!   lints find in bodies (`unreachable_code`, `unused_variables`, `arithmetic_overflow`, ..).
 
 mod bodies;
-pub mod edit_distance;
 mod levels;
 mod names;
 pub mod registry;

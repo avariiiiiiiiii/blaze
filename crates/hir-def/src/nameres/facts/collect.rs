@@ -858,12 +858,7 @@ fn find_key(
     module: ModuleId,
 ) -> Option<DeclKey> {
     let parent = module.containing_module_inside_def_map(db)?;
-    // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
-    // `parent` is the parent of a module of this crate's round-0 tree, made by the
-    // `module_decls` that declared it (nameres-core.md §3): it goes only into this query's
-    // comparisons, which are recomputed whenever the creating query is, as every value naming
-    // it is.
-    let parent = unsafe { parent.to_static() };
+    let parent = parent.to_static();
     if parent == decl.module {
         return queries::child_key(db, key, module);
     }
@@ -1683,24 +1678,17 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
             },
         };
 
-        // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
-        // The id goes only into values of this crate's resolver queries (`module_decls`,
-        // `macro_step`, the units and the driver) and the `DefMap` assembled from them. The
-        // creating query (`module_decls` of the parent, or the `macro_step` of the module whose
-        // expansion declares it, or a block's def-map query) is keyed by content that includes
-        // the parent and the declaration, so every revision in which any of those values is live
-        // re-creates the id with the same fields in the same query, and salsa keeps it; a value
-        // naming it is recomputed whenever the creating query is (nameres-core.md §3).
-        let module = unsafe {
-            crate::ModuleIdLt::new(
-                db,
-                self.cx.krate,
-                self.sink.def_map().block_id(),
-                Some(self.module_id),
-                name,
-            )
-            .to_static()
-        };
+        // The creating query is keyed by content including the parent and the declaration, so
+        // every revision in which a value naming this id is live re-creates it and salsa keeps it
+        // (nameres-core.md §3).
+        let module = crate::ModuleIdLt::new(
+            db,
+            self.cx.krate,
+            self.sink.def_map().block_id(),
+            Some(self.module_id),
+            name,
+        )
+        .to_static();
         let inherited = textual_scope(self.sink.def_map().module(db, self.module_id).scope(db));
         let parent = self.module_id;
         self.sink.apply(DeclOp::PushChild { parent, name, child: module });

@@ -302,7 +302,7 @@ fn written_call<'db>(
 }
 
 /// [`super::location_of`], in the anchor of the body where it can be: `range` is in the tree
-/// of [`BodySyntax::root`] when `file_id` is the body's file.
+/// of [`BodySyntax::tree`] when `file_id` is the body's file.
 fn place_of(
     db: &Db,
     owner: DefWithBodyId,

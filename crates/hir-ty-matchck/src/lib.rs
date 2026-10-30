@@ -14,7 +14,6 @@
 extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
 
 mod cx;
-mod distance;
 mod lower;
 mod print;
 mod typo;

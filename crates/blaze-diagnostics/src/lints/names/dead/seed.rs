@@ -172,9 +172,7 @@ impl<'db> Crate<'_, '_, 'db> {
         let used_like = codegen && (extern_indicator || flags.contains(AttrFlags::USED));
         let lang = flags.contains(AttrFlags::LANG_ITEM)
             || flags.contains(AttrFlags::PANIC_HANDLER)
-            || (d.foreign
-                && d.kind == Kind::Fn
-                && owner.is_some_and(|it| AttrFlags::has_word(db, it, "rustc_canonical_symbol")));
+            || (d.foreign && d.kind == Kind::Fn && flags.contains(AttrFlags::RUSTC_CANONICAL_SYMBOL));
         if used_like || lang { LANG } else { NEITHER }
     }
 
@@ -217,7 +215,7 @@ impl<'db> Crate<'_, '_, 'db> {
         let rustc_main = self.defs.modules.iter().flat_map(|it| &it.free).copied().find(|&def| {
             let d = &self.defs[def];
             match (d.kind, d.id) {
-                (Kind::Fn, Id::Fn(id)) => AttrFlags::has_word(db, id.into(), "rustc_main"),
+                (Kind::Fn, Id::Fn(id)) => AttrFlags::query(db, id.into()).contains(AttrFlags::RUSTC_MAIN),
                 _ => false,
             }
         });

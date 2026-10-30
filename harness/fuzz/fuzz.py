@@ -28,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import gen
-from difftest import Fixture, RUNNER, bucket, minimize
+from mixed import Fixture, RUNNER, bucket, minimize
 
 FOUND = os.path.join(HERE, "found")
 SMOKE = {"seed": "smoke", "rounds": 2, "cases": 25}

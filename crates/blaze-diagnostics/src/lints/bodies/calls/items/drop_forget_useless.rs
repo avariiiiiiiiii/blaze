@@ -63,12 +63,12 @@ impl LatePass for DropForgetUseless {
     const HOOKS: Hooks = Hooks::BODY.and(Hooks::STMT).and(Hooks::ARM);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
 
-    fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+    fn check_body(&mut self, _b: &BodyCx<'_, '_, '_>, _out: &mut Vec<Found>) {
         self.arm_values.clear();
         self.semi_stmt = None;
     }
 
-    fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, _out: &mut Vec<Found>) {
+    fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, _out: &mut Vec<Found>) {
         self.semi_stmt = match b.store().expr(block) {
             Expr::Block { statements, .. } => match statements.get(index) {
                 Some(Statement::Expr { expr, has_semi: true }) => Some(expr),
@@ -78,7 +78,7 @@ impl LatePass for DropForgetUseless {
         };
     }
 
-    fn check_arm(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, index: usize, _out: &mut Vec<Found>) {
+    fn check_arm(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, index: usize, _out: &mut Vec<Found>) {
         let store = b.store();
         // Only a call is looked up in `arm_values`.
         if let Expr::Match { arms, .. } = store.expr(expr)
@@ -89,7 +89,7 @@ impl LatePass for DropForgetUseless {
         }
     }
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some([arg]) = util::call_args(b, expr) else { return };
         let arg = *arg;
         let Some((def, _)) = util::called_fn(b, expr) else { return };
@@ -195,7 +195,7 @@ fn ancestor_inside_same_ctxt(span: &Span, outer: &Span) -> Option<Span> {
 
 /// rustc's `Expr::can_have_side_effects`, which takes paths, literals and what is built of
 /// them alone as having none (calls of tuple structs' and variants' constructors included).
-fn can_have_side_effects(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+fn can_have_side_effects(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     let any = |exprs: &[ExprId]| exprs.iter().any(|it| can_have_side_effects(b, *it));
     stdx::ensure_sufficient_stack(|| match b.store().expr(expr) {
         Expr::Path(_) | Expr::Literal(_) | Expr::OffsetOf(_) | Expr::IncludeBytes => false,
@@ -224,7 +224,7 @@ fn can_have_side_effects(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
 
 /// The callee is a path written without a type before it (rustc's `QPath::Resolved(None, ..)`)
 /// that names the constructor of a tuple struct or a tuple variant.
-fn is_fn_ctor(b: &BodyCx<'_, '_>, callee: ExprId) -> bool {
+fn is_fn_ctor(b: &BodyCx<'_, '_, '_>, callee: ExprId) -> bool {
     let Expr::Path(path) = b.store().expr(callee) else { return false };
     let type_relative =
         path.type_anchor().is_some() || path.segments().first().is_some_and(|it| it.name.as_str() == "Self");

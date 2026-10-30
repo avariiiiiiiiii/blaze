@@ -36,8 +36,7 @@ not, for the const checker (#860) to refuse; ordinary type checking does not pro
 it costs nothing outside const bodies. Tests: `crates/hir-ide/src/tests/const_effects.rs`.
 
 Tests: `crates/hir-ide/src/tests/consteval/const_traits.rs` (values from rustc on the same
-programs) and the corpus module `const_traits` (`harness/corpus`), which evaluates each of the
-above in a `const`, calls the same functions at run time and compares both with rustc's build.
+programs).
 
 ## Extensions (beyond the pinned nightly)
 

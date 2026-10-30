@@ -852,13 +852,10 @@ extern "C" {
         }
     }
 
-    /// The walk over views comes to the nodes a preorder over the handles of the same file comes
-    /// to, in the same order, and skips the same subtrees for `cfg`, `cfg_attr` included.
+    /// The walk comes to every node of a file in pre-order but the subtrees `cfg` removes,
+    /// `cfg_attr` included, and those are the ones rustc removes.
     #[test]
-    fn walk_matches_the_handle_walk() {
-        use std::ops::ControlFlow;
-        use syntax::ast::{self as handle, AstNode as _};
-
+    fn walk_skips_what_cfg_removes() {
         const FIXTURE: &str = r#"
 //- /main.rs crate:main
 #![allow(unused)]
@@ -883,45 +880,39 @@ fn body() {
     m!(1 + 2);
 }
 "#;
-        walked(FIXTURE, |cx, walk| {
-            for tree in walk.files() {
-                let root = cx.sema.parse_or_expand(tree.file);
-                let on = |owner: &handle::AnyHasAttrs| {
-                    hir_expand::attrs::expand_cfg_attr(
-                        handle::attrs_including_inner(owner),
-                        || walk.cfg,
-                        |meta, _| match meta {
-                            handle::Meta::CfgMeta(meta)
-                                if meta.cfg_predicate().is_some_and(|it| {
-                                    walk.cfg.check(&CfgExpr::parse_from_ast(it)) == Some(false)
-                                }) =>
-                            {
-                                ControlFlow::Break(())
-                            }
-                            _ => ControlFlow::Continue(()),
-                        },
-                    )
-                    .is_none()
-                };
-                let (mut nodes, mut off) = (Vec::new(), Vec::new());
-                let mut events = root.preorder();
-                while let Some(event) = events.next() {
-                    let WalkEvent::Enter(node) = event else { continue };
-                    if let Some(owner) = handle::AnyHasAttrs::cast(node.clone())
-                        && !on(&owner)
-                    {
-                        off.push(node.text_range());
-                        events.skip_subtree();
-                        continue;
-                    }
-                    nodes.push((node.kind(), node.text_range()));
+        walked(FIXTURE, |_, walk| {
+            let trees: Vec<_> = walk.files().collect();
+            assert_eq!(trees.len(), 1, "the fixture is one file");
+            let tree = trees[0];
+            let mut nodes = Vec::new();
+            let mut events = tree.root.preorder();
+            while let Some(event) = events.next() {
+                let WalkEvent::Enter(node) = event else { continue };
+                if tree.off.contains(&node) || tree.replaced.contains(&node) {
+                    events.skip_subtree();
+                    continue;
                 }
-                let viewed: Vec<_> = tree.nodes.iter().map(|it| (it.kind(), it.text_range())).collect();
-                assert_eq!(viewed, nodes);
-                let viewed_off: Vec<_> = tree.off.iter().map(|it| it.text_range()).collect();
-                assert_eq!(viewed_off, off);
-                assert_eq!(off.len(), 7, "{off:?}");
+                nodes.push(node);
             }
+            assert_eq!(tree.nodes, nodes);
+            let text = tree.root.text();
+            let off: Vec<_> = tree.off.iter().map(|it| &text[it.text_range()]).collect();
+            assert_eq!(
+                off,
+                [
+                    "#[cfg(any())]\nfn off() { let x = 1; }",
+                    "#[cfg_attr(all(), cfg(any()))]\nfn off_too() {}",
+                    "#[cfg_attr(all(), cfg_attr(all(), cfg(any())))]\nmod nested_off {}",
+                    "mod inner_off {\n    #![cfg(any())]\n    fn f() {}\n}",
+                    "#[cfg(any())] a: u8",
+                    "#[cfg(any())]\n    let y = 2;",
+                    "#[cfg(any())] 0 => 1,",
+                ]
+            );
+            let kept = |it: &str| tree.nodes.iter().any(|node| &text[node.text_range()] == it);
+            assert!(kept("#[cfg_attr(any(), cfg(any()))]\nfn kept() {}"));
+            assert!(kept("b: u8"));
+            assert!(kept("_ => 2"));
         });
     }
 

@@ -28,7 +28,7 @@ zerocopy.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-proptest.workspace = true
+hegeltest.workspace = true
 
 [features]
 in-rust-tree = []

@@ -38,14 +38,14 @@ pub(super) fn lex(text: &str, edition: Edition) -> Option<Vec<Tok<'_>>> {
         if kind == SyntaxKind::ERROR {
             return None;
         }
-        let text = lexed.text(i);
-        // An escape that is not one is an error of rustc's lexer.
-        if kind == SyntaxKind::STRING && text.starts_with('"') && text.ends_with('"') && text.len() > 1 {
-            unescaped(&text[1..text.len() - 1])?;
-        }
         let range = lexed.text_range(i);
+        let token = &text[range.start..range.end];
+        // An escape that is not one is an error of rustc's lexer.
+        if kind == SyntaxKind::STRING && token.starts_with('"') && token.ends_with('"') && token.len() > 1 {
+            unescaped(&token[1..token.len() - 1])?;
+        }
         let range = TextRange::new(TextSize::new(range.start as u32), TextSize::new(range.end as u32));
-        tokens.push(Tok { kind, text, range });
+        tokens.push(Tok { kind, text: token, range });
     }
     Some(tokens)
 }

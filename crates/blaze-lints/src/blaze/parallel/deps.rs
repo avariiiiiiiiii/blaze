@@ -31,6 +31,7 @@ use hir_def::{
 };
 use hir_ty::{
     ParamEnvAndCrate,
+    db::HirDatabase as _,
     mir::{
         BinOp, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem,
         Rvalue, StatementKind, StoredPlace, TerminatorKind,
@@ -792,7 +793,7 @@ impl<'db> Look<'_, '_, 'db> {
     /// element at their second argument.
     fn is_index(&self, func: &Operand) -> bool {
         let db = self.m.db;
-        let Some((f, _)) = effects::fn_item(func) else { return false };
+        let Some((f, _)) = func.fn_item() else { return false };
         let trait_ = match f.loc(db).container {
             ItemContainerId::TraitId(it) => Some(it),
             ItemContainerId::ImplId(it) => db.impl_trait(it).map(|it| it.skip_binder().def_id.0),
@@ -928,7 +929,7 @@ impl<'db> Look<'_, '_, 'db> {
                         }
                     }
                     tally.may_panic |= summary.has(effects::Effect::Panic);
-                    let len = effects::fn_item(func).is_some_and(|(f, _)| {
+                    let len = func.fn_item().is_some_and(|(f, _)| {
                         matches!(FunctionSignature::of(m.db, f).name.as_str(), "len" | "is_empty")
                     });
                     for arg in args.iter() {
@@ -1125,32 +1126,38 @@ impl<'db> Look<'_, '_, 'db> {
         let name = m.name(local);
         let carried = || Dependence::Carried { name: name.clone() };
         let sites = self.occurrences(local);
-        let bare = |operand: &Operand, of: LocalId| match &operand.kind {
-            OperandKind::Copy(place) | OperandKind::Move(place) => {
-                place.local == of && place.projection.as_slice().is_empty()
-            }
-            _ => false,
-        };
-        let assigned = |kind: &StatementKind, of: LocalId| match kind {
-            StatementKind::Assign(place, rvalue)
-                if place.local == of && place.projection.as_slice().is_empty() =>
-            {
-                Some(rvalue)
-            }
-            _ => None,
-        };
-        // `local = op(local, e)`, at once or through one temporary.
-        let binary = |rvalue: &Rvalue| match rvalue {
-            Rvalue::BinaryOp(op, a, b) | Rvalue::CheckedBinaryOp(op, a, b) => {
-                let checked = matches!(rvalue, Rvalue::CheckedBinaryOp(..));
-                match (bare(a, local), bare(b, local)) {
-                    (true, false) => Some((*op, b, checked)),
-                    (false, true) => Some((*op, a, checked)),
-                    _ => None,
+        fn bare(operand: &Operand, of: LocalId) -> bool {
+            match &operand.kind {
+                OperandKind::Copy(place) | OperandKind::Move(place) => {
+                    place.local == of && place.projection.as_slice().is_empty()
                 }
+                _ => false,
             }
-            _ => None,
-        };
+        }
+        fn assigned(kind: &StatementKind, of: LocalId) -> Option<&Rvalue> {
+            match kind {
+                StatementKind::Assign(place, rvalue)
+                    if place.local == of && place.projection.as_slice().is_empty() =>
+                {
+                    Some(rvalue)
+                }
+                _ => None,
+            }
+        }
+        // `local = op(local, e)`, at once or through one temporary.
+        fn binary(rvalue: &Rvalue, local: LocalId) -> Option<(&BinOp, &Operand, bool)> {
+            match rvalue {
+                Rvalue::BinaryOp(op, a, b) | Rvalue::CheckedBinaryOp(op, a, b) => {
+                    let checked = matches!(rvalue, Rvalue::CheckedBinaryOp(..));
+                    match (bare(a, local), bare(b, local)) {
+                        (true, false) => Some((op, b, checked)),
+                        (false, true) => Some((op, a, checked)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
         let statements: Vec<&StatementKind> = sites
             .iter()
             .filter_map(|&(block, at)| at.map(|at| self.statement(block, at)))
@@ -1158,11 +1165,12 @@ impl<'db> Look<'_, '_, 'db> {
         let terminators: Vec<usize> =
             sites.iter().filter(|it| it.1.is_none()).map(|it| it.0).collect();
         let op = match (statements.as_slice(), terminators.as_slice()) {
-            ([kind], []) => assigned(kind, local).and_then(binary),
-            ([first, second], []) => {
-                let via = |from: &StatementKind, to: &StatementKind| {
+            ([kind], []) => assigned(kind, local).and_then(|it| binary(it, local)),
+            ([_, _], []) => {
+                let via = |from: usize, to: usize| {
+                    let (from, to) = (statements[from], statements[to]);
                     let StatementKind::Assign(temp, rvalue) = from else { return None };
-                    let op = binary(rvalue)?;
+                    let op = binary(rvalue, local)?;
                     let Rvalue::Use(moved) = assigned(to, local)? else { return None };
                     let private = temp.projection.as_slice().is_empty()
                         && bare(moved, temp.local)
@@ -1170,7 +1178,7 @@ impl<'db> Look<'_, '_, 'db> {
                         && self.occurrences(temp.local).len() == 2;
                     private.then_some(op)
                 };
-                via(first, second).or_else(|| via(second, first))
+                via(0, 1).or_else(|| via(1, 0))
             }
             _ => None,
         };
@@ -1253,7 +1261,7 @@ impl<'db> Look<'_, '_, 'db> {
         if !first || args.iter().skip(1).any(|it| self.operand_names(it, borrow)) {
             return None;
         }
-        let (f, _) = effects::fn_item(func)?;
+        let (f, _) = func.fn_item()?;
         let unused = destination.projection.as_slice().is_empty()
             && target.is_none_or(|target| {
                 !m.live.live_in(region::block_index(target), destination.local)
@@ -1272,7 +1280,7 @@ impl<'db> Look<'_, '_, 'db> {
     /// or std's float methods.
     fn min_max(&self, func: &Operand) -> Option<Reduction> {
         let m = self.m;
-        let (f, _) = effects::fn_item(func)?;
+        let (f, _) = func.fn_item()?;
         let name = FunctionSignature::of(m.db, f).name.as_str().to_owned();
         let reduction = match name.as_str() {
             "min" => Reduction::Min,

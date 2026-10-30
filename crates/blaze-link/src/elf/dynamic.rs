@@ -10,12 +10,11 @@
 use std::collections::hash_map::Entry;
 
 use blaze_codegen::Arch;
-use blaze_format::cursor::{self, Put, Reader};
+use blaze_format::cursor::Put;
 use blaze_ids::radix;
 use object::elf;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 
 use super::{
     BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, Elf, GNU_HASH, INTERP, RELA_DYN, Segment, VERNEED,
@@ -23,7 +22,7 @@ use super::{
 };
 use crate::cow::CowBytes;
 use crate::model::{Class, Counts, Delta, Holds, Placed, Region, SymbolKind, Tls, View};
-use crate::unwind::{cie_encoding, eh_pointer, eh_value};
+use crate::unwind::Frame;
 use crate::{LinkError, Output, OutputKind};
 
 /// `.dynamic` entries besides `DT_NEEDED`: at most one of each tag [`Tables::of`] writes.
@@ -905,10 +904,11 @@ fn eh_frame_hdr(placed: &Placed<'_>, kept: Option<&mut KeptHdr>) -> Result<CowBy
         // clone: two reference counts, the table shared with the state that holds it
         return Ok(kept.bytes.clone());
     }
-    let (bytes, table, in_order) = build_hdr(placed, hdr)?;
+    let (bytes, table, cies, in_order) = build_hdr(placed, hdr)?;
     let bytes = CowBytes::from_vec(bytes);
     if in_order && fdes_start_records(placed, &table) {
         kept.table = table;
+        kept.cies = cies;
         // clone: two reference counts, the table shared with the state that holds it
         kept.bytes = bytes.clone();
         kept.synthesis = placed.synthesis;
@@ -923,6 +923,8 @@ pub(crate) struct KeptHdr {
     /// The table as (address covered, FDE), in section order, which was its address order
     /// (kept only then), so sorted both ways.
     table: Vec<(u64, u64)>,
+    /// `.eh_frame`'s CIEs as the build's scan met them: a patch walks from a kept FDE.
+    cies: Vec<(usize, u8)>,
     /// What the last link's state holds too.
     bytes: CowBytes,
     /// The FDEs of the records walked again, reused.
@@ -968,7 +970,7 @@ fn patch_hdr(placed: &Placed<'_>, delta: &Delta<'_>, hdr: u64, kept: &mut KeptHd
     let Some((index, region)) = placed.region(&Class::EhFrame) else { return true };
     let (bytes, section) = (placed.view(index), region.addr);
     let end = section + bytes.len() as u64;
-    let KeptHdr { table, bytes: out, scratch, .. } = kept;
+    let KeptHdr { table, cies, bytes: out, scratch, .. } = kept;
     if out.len() != 12 + 8 * table.len() {
         return false;
     }
@@ -990,7 +992,7 @@ fn patch_hdr(placed: &Placed<'_>, delta: &Delta<'_>, hdr: u64, kept: &mut KeptHd
             if at == bytes.len() {
                 break table.len();
             }
-            match entry(bytes, at) {
+            match crate::unwind::entry(bytes, at) {
                 Ok(Some((body, next))) => {
                     let cie = bytes.u32(body).is_none_or(|id| id == 0);
                     if at < e && next > s && cie {
@@ -1003,7 +1005,7 @@ fn patch_hdr(placed: &Placed<'_>, delta: &Delta<'_>, hdr: u64, kept: &mut KeptHd
             }
         };
         scratch.clear();
-        if walk(bytes, section, first, at, scratch).is_err() || scratch.len() != j - k {
+        if crate::unwind::rewalk(bytes, section, (first, at), &cies[..], fde_of(section), scratch).is_err() || scratch.len() != j - k {
             return false;
         }
         if scratch.iter().zip(&table[k..j]).any(|(new, old)| new.1 != old.1) {
@@ -1031,19 +1033,22 @@ fn patch_hdr(placed: &Placed<'_>, delta: &Delta<'_>, hdr: u64, kept: &mut KeptHd
 }
 
 /// `.eh_frame_hdr` built from `.eh_frame` and the FDEs outside it ([`outside`]): its bytes,
-/// its table, and whether the table came in address order and holds only `.eh_frame`'s FDEs
-/// (what [`patch_hdr`] can patch).
-fn build_hdr(placed: &Placed<'_>, hdr: u64) -> Result<(Vec<u8>, Vec<(u64, u64)>, bool), LinkError> {
+/// its table, `.eh_frame`'s CIEs, and whether the table came in address order and holds only
+/// `.eh_frame`'s FDEs (what [`patch_hdr`] can patch).
+#[allow(clippy::type_complexity)]
+fn build_hdr(placed: &Placed<'_>, hdr: u64) -> Result<(Vec<u8>, Vec<(u64, u64)>, Vec<(usize, u8)>, bool), LinkError> {
     let eh_frame = placed.region(&Class::EhFrame);
-    let mut table = match eh_frame {
+    let (mut table, cies) = match eh_frame {
         Some((index, region)) => {
             let bytes = placed.view(index);
             let starts = crate::unwind::fde_splits(placed, region.addr, bytes.len(), CHUNK);
-            // alloc: error path
-            fdes(bytes, region.addr, &starts).map_err(|it| error(format!("the image's .eh_frame at {:#x}: {it}", region.addr)))?
+            let scan = scan_fdes(bytes, region.addr, &starts)
+                // alloc: error path
+                .map_err(|it| error(format!("the image's .eh_frame at {:#x}: {it}", region.addr)))?;
+            (scan.items, scan.cies)
         }
         // alloc: empty, which allocates nothing
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
     let inside = table.len();
     table.extend(placed.functions.iter().filter_map(|f| f.fde.filter(|&fde| outside(placed, fde)).map(|fde| (f.addr, fde))));
@@ -1072,7 +1077,8 @@ fn build_hdr(placed: &Placed<'_>, hdr: u64) -> Result<(Vec<u8>, Vec<(u64, u64)>,
         })
         .collect(); // alloc: once per image, one result per chunk of FDEs
     first_error(results)?;
-    Ok((bytes, table, in_order && table.len() == inside))
+    let unchanged = in_order && table.len() == inside;
+    Ok((bytes, table, cies, unchanged))
 }
 
 /// Whether `fde` is outside `.eh_frame`: an incremental ELF patch's, placed in
@@ -1081,164 +1087,30 @@ fn outside(placed: &Placed<'_>, fde: u64) -> bool {
     placed.region(&Class::EhFrame).is_none_or(|(_, it)| !(it.addr..it.addr + it.size).contains(&fde))
 }
 
-/// How a walk over a piece of `.eh_frame` ended.
-enum Stop {
-    /// At the piece's end, exactly.
-    End,
-    /// At a zero length: the section ends here, whatever follows.
-    Terminator,
-}
-
 /// Every FDE of `.eh_frame` (`bytes`, at address `section`) as (the address it covers from,
-/// the address of the FDE), in section order, as gimli reads them: CIE versions 1, 3 and 4;
-/// the `z`, `L`, `P`, `R` and `S` augmentations; `pc_begin` in the CIE's FDE pointer encoding,
-/// absolute or relative to where it is, indirection ignored; the walk ending at a zero length.
-/// Of an FDE only the length, CIE pointer, `pc_begin` and `pc_range` are read, of a CIE only
-/// what leads to its pointer encoding; nothing else is checked, so a record malformed past
-/// those fields is read where gimli refused it.
-///
-/// The section is walked in pieces from 0 and from each of `splits` (record starts, sorted),
-/// in parallel; each piece must end exactly where the next starts. The answer is the one
-/// walk from 0 gives, its first error included, on any number of cores.
+/// the address of the FDE), in section order, and its CIEs: [`crate::unwind::scan`], in
+/// parallel pieces split at `splits`. Of an FDE only the length, CIE pointer, `pc_begin` and
+/// `pc_range` are read, of a CIE only what leads to its pointer encoding; nothing else is
+/// checked, so a record malformed past those fields is read where gimli refused it.
+fn scan_fdes(bytes: View<'_>, section: u64, splits: &[usize]) -> Result<crate::unwind::Scan<(u64, u64)>, String> {
+    crate::unwind::scan(bytes, section, splits, fde_of(section))
+}
+
+/// [`scan_fdes`]' table alone.
+#[cfg(test)]
 fn fdes(bytes: View<'_>, section: u64, splits: &[usize]) -> Result<Vec<(u64, u64)>, String> {
-    if splits.is_empty() {
-        // alloc: once per image, the table: compilers' FDEs take 32 bytes or so, so it grows
-        // at most a few times
-        let mut table = Vec::with_capacity(bytes.len() / 32);
-        walk(bytes, section, 0, bytes.len(), &mut table)?;
-        return Ok(table);
-    }
-    let piece = |nth: usize| {
-        let start = if nth == 0 { 0 } else { splits[nth - 1] };
-        let end = splits.get(nth).copied().unwrap_or(bytes.len());
-        // alloc: once per piece of CHUNK functions' FDEs
-        let mut table = Vec::with_capacity((end - start) / 32);
-        let stop = walk(bytes, section, start, end, &mut table);
-        (table, stop)
-    };
-    // alloc: once per image, one result per piece
-    let mut pieces: Vec<(Vec<(u64, u64)>, Result<Stop, String>)> = (0..splits.len() + 1).into_par_iter().map(piece).collect();
-    // The pieces the one walk reaches: up to the first that ends the section or fails.
-    let mut kept = pieces.len();
-    for (nth, (_, stop)) in pieces.iter_mut().enumerate() {
-        match stop {
-            Ok(Stop::End) => {}
-            Ok(Stop::Terminator) => {
-                kept = nth + 1;
-                break;
-            }
-            Err(why) => return Err(std::mem::take(why)),
-        }
-    }
-    let pieces = &pieces[..kept];
-    // alloc: once per image, the table, filled in parallel at each piece's place
-    let mut table = vec![(0u64, 0u64); pieces.iter().map(|it| it.0.len()).sum()];
-    let mut rest = &mut table[..];
-    // alloc: once per image, one slice per piece
-    let mut jobs = Vec::with_capacity(pieces.len());
-    for (part, _) in pieces {
-        let (these, after) = std::mem::take(&mut rest).split_at_mut(part.len());
-        jobs.push((these, &part[..]));
-        rest = after;
-    }
-    jobs.into_par_iter().for_each(|(out, part)| out.copy_from_slice(part));
-    Ok(table)
+    scan_fdes(bytes, section, splits).map(|it| it.items)
 }
 
-/// The FDEs of the records from `start` (a record's start) up to `end`, onto `table`: an
-/// error when a record runs past `end` where `end` is not the section's. Each record is read
-/// in place, or put together in a reused buffer where it crosses a page of `bytes`.
-fn walk(bytes: View<'_>, section: u64, start: usize, end: usize, table: &mut Vec<(u64, u64)>) -> Result<Stop, String> {
-    // The last CIE an FDE named, then those met in this piece (in order, so sorted), then
-    // those of other pieces, found where they are.
-    let mut last: Option<(usize, u8)> = None;
-    // alloc: past 16 CIEs in one piece (one per native object), growing by doubling
-    let mut met: SmallVec<[(usize, u8); 16]> = SmallVec::new();
-    // alloc: only for a CIE another piece holds, once each
-    let mut others: FxHashMap<usize, u8> = FxHashMap::default();
-    // alloc: only for a record across two pages, grown to the longest such record once per walk
-    let (mut across, mut cie_across) = (Vec::new(), Vec::new());
-    // alloc: error path
-    let bad = |at: usize, what: &str| format!("the entry at offset {at:#x}: {what}");
-    let mut at = start;
-    while at < end {
-        let record = at;
-        let Some((body, next)) = entry(bytes, record).map_err(|it| bad(record, it))? else {
-            return Ok(Stop::Terminator);
-        };
-        if next > end {
-            // alloc: error path
-            return Err(format!("the record at offset {record:#x} runs past {end:#x}, where the core placed an FDE"));
+/// What the table keeps of a record of `.eh_frame` at `section`: of an FDE, (the address it
+/// covers from, its own address).
+fn fde_of(section: u64) -> impl Fn(usize, Frame, &mut Vec<(u64, u64)>) -> Result<(), String> + Sync {
+    move |at: usize, frame: Frame, table: &mut Vec<(u64, u64)>| {
+        if let Frame::Fde { pc, .. } = frame {
+            table.push((pc, section + at as u64));
         }
-        at = next;
-        // Positions in `reader` are from the record's start, at `base` in the address space.
-        let base = section + record as u64;
-        let held = bytes.read(record, next - record, &mut across).ok_or_else(|| bad(record, EARLY))?;
-        let mut reader = Reader::starting_at(held, body - record).map_err(|it| bad(record, it.as_str()))?;
-        let id = reader.u32().map_err(|it| bad(record, it.as_str()))?;
-        if id == 0 {
-            let encoding = cie_encoding(&mut reader, base).map_err(|it| bad(record, it))?;
-            met.push((record, encoding));
-            continue;
-        }
-        let Some(cie) = body.checked_sub(id as usize) else {
-            return Err(bad(record, "its CIE pointer is before the section"));
-        };
-        let encoding = match last {
-            Some((offset, encoding)) if offset == cie => encoding,
-            _ => {
-                let encoding = match met.binary_search_by_key(&cie, |it| it.0) {
-                    Ok(found) => met[found].1,
-                    Err(_) => match others.get(&cie) {
-                        Some(&encoding) => encoding,
-                        None => {
-                            let encoding = cie_at(bytes, cie, section, &mut cie_across).map_err(|it| bad(record, it))?;
-                            others.insert(cie, encoding);
-                            encoding
-                        }
-                    },
-                };
-                last = Some((cie, encoding));
-                encoding
-            }
-        };
-        let pc = eh_pointer(&mut reader, encoding, base).map_err(|it| bad(record, it))?;
-        eh_value(&mut reader, encoding).map_err(|it| bad(record, it))?;
-        table.push((pc, section + record as u64));
+        Ok(())
     }
-    Ok(Stop::End)
-}
-
-/// What a read short of a record's fields says, as [`Reader`] says it.
-const EARLY: &str = "bytes that end early";
-
-/// The record at `at`: where its body (the CIE ID or pointer) starts and where it ends; none
-/// for a zero length, which ends the section.
-fn entry(bytes: View<'_>, at: usize) -> Result<Option<(usize, usize)>, &'static str> {
-    let (length, body) = match bytes.u32(at).ok_or(EARLY)? {
-        0 => return Ok(None),
-        0xffff_fff0..=0xffff_fffe => return Err("a reserved initial length"),
-        0xffff_ffff => (bytes.u64(at + 4).ok_or(EARLY)?, at + 12),
-        length => (u64::from(length), at + 4),
-    };
-    let end = usize::try_from(length)
-        .ok()
-        .and_then(|it| body.checked_add(it))
-        .filter(|it| *it <= bytes.len())
-        .ok_or("longer than the section")?;
-    Ok(Some((body, end)))
-}
-
-/// The FDE pointer encoding of the CIE at `at`, which another piece holds; `across` holds it
-/// where it crosses a page.
-fn cie_at(bytes: View<'_>, at: usize, section: u64, across: &mut Vec<u8>) -> Result<u8, &'static str> {
-    let (body, end) = entry(bytes, at)?.ok_or("its CIE pointer names the section's end")?;
-    let held = bytes.read(at, end - at, across).ok_or(EARLY)?;
-    let mut reader = Reader::starting_at(held, body - at).map_err(cursor::Error::as_str)?;
-    if reader.u32().map_err(cursor::Error::as_str)? != 0 {
-        return Err("its CIE pointer names an FDE");
-    }
-    cie_encoding(&mut reader, section + at as u64)
 }
 
 #[cfg(test)]
@@ -1490,5 +1362,24 @@ mod tests {
         // A record cut short.
         assert!(fdes(View::Slice(&bytes[..bytes.len() - 3]), base, &[]).is_err());
         assert!(reference(&bytes[..bytes.len() - 3], base).is_err());
+    }
+
+    /// An FDE whose CIE pointer names an FDE, or the middle of a record, of an earlier piece
+    /// names no CIE: the one walk's error, whichever piece reads it.
+    #[test]
+    fn a_cie_pointer_to_no_cie_is_one_error_in_any_piece() {
+        let mut rng = SplitMix64::new(91);
+        let base = 0x60_0000;
+        let (bytes, starts) = section(&mut rng, 300, base);
+        let at = starts[250];
+        for target in [starts[10], starts[10] + 4] {
+            let mut bad = bytes.clone();
+            bad[at + 4..at + 8].copy_from_slice(&((at + 4 - target) as u32).to_le_bytes());
+            let serial = fdes(View::Slice(&bad), base, &[]).unwrap_err();
+            assert!(serial.contains(&format!("offset {at:#x}: its CIE pointer names no CIE")), "{serial}");
+            for every in [1, 7, 64, 200] {
+                assert_eq!(fdes(View::Slice(&bad), base, &split_at(&starts, every)).unwrap_err(), serial, "every {every}");
+            }
+        }
     }
 }

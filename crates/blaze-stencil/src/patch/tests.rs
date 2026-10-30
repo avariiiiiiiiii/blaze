@@ -16,6 +16,7 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
+use blaze_bytes::le::u32 as u32_at;
 use super::{Kind, NONE, Plan, Sel, compile_in, slots::GLOBAL};
 use crate::{
     Cpu, Error, Os, Target, TlsModel,
@@ -307,10 +308,6 @@ enum Piece {
     Glue { at: u32, byte: u8 },
     Relay { bytes: u8, from: u32, to: u32 },
     Stencil(Decoded),
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
 /// The pieces of `code`'s first `end` bytes.

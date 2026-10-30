@@ -59,7 +59,7 @@ use blaze_graph::{
     machine::NodeId,
     plane::NodeRef,
 };
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::{ContentId, Hasher, bits::BitSet};
 use blaze_protocol::events::NodeKind;
 use blaze_query::{Database, QueryKey};
 use blaze_units::{
@@ -679,7 +679,7 @@ struct Build<S: Steps> {
     /// Each unit's package, by its place in the plan's packages; `u32::MAX` for none.
     package_of: Vec<u32>,
     /// The packages reported started, a bit each.
-    reported: Vec<u64>,
+    reported: BitSet<u32>,
     /// Each unit's outputs, as ids of [`Jobs::paths`].
     outputs: Arc<Outputs>,
     /// The checkout it is of, whose front end is kept for its next build.
@@ -1085,8 +1085,8 @@ impl<S: Steps> Jobs<S> {
         let key = Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&encoded).finish();
         let config = Arc::new(config); // alloc: once per view, shared with its tasks
         if reuses_plans(&job.work)
-            && let Some(root) = root
-            && let Some(Some(last)) = self.roots.plans.get(root as usize)
+            && let Some(at) = root
+            && let Some(Some(last)) = self.roots.plans.get(at as usize)
             && last.key == key
         {
             job.borrowed.push(last.queries);
@@ -1672,7 +1672,7 @@ impl<S: Steps> Jobs<S> {
             // alloc: once per build
             units.graph.units.iter().map(|unit| packages.get(unit.pkg_id.as_str()).copied().unwrap_or(u32::MAX)).collect()
         };
-        let reported = vec![0; units.packages.len().div_ceil(64)]; // alloc: once per build
+        let reported = BitSet::<u32>::new(units.packages.len()); // alloc: once per build
         let outputs = match root.and_then(|root| self.roots.outputs[root as usize].as_ref()) {
             Some(outputs) if Arc::ptr_eq(&outputs.units, units) => outputs.clone(), // clone: a refcount, once per build
             _ => {
@@ -1772,11 +1772,9 @@ impl<S: Steps> Jobs<S> {
         }
         let unit = &build.input.units.graph.units[at];
         let Some(package) = build.input.units.packages.get(build.package_of[at] as usize) else { return };
-        let (word, bit) = (build.package_of[at] as usize / 64, 1 << (build.package_of[at] % 64));
-        if build.reported[word] & bit != 0 {
+        if !build.reported.insert(build.package_of[at]) {
             return;
         }
-        build.reported[word] |= bit;
         let verb = match (fresh, build.input.goal, unit.mode) {
             (true, ..) => Verb::Fresh,
             (false, Goal::Check, _) | (false, _, UnitMode::Check) => Verb::Checking,

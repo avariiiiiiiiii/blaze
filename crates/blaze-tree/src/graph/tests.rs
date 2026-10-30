@@ -82,9 +82,9 @@ fn an_edge_keeps_its_node_and_whether_it_is_public() {
 #[test]
 fn bits_grow_and_forget() {
     let mut bits = Bits::new(3);
-    assert!(bits.insert(2));
-    assert!(!bits.insert(2));
-    assert!(bits.insert(130));
+    assert!(bits.insert_growing(2));
+    assert!(!bits.insert_growing(2));
+    assert!(bits.insert_growing(130));
     assert!(bits.contains(130) && bits.contains(2) && !bits.contains(1) && !bits.contains(1000));
     bits.remove(2);
     assert!(!bits.contains(2));

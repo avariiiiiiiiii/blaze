@@ -267,11 +267,7 @@ fn run_measured<W: Work>(
 
 // dyn: a panic payload, read once per panicked task
 fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
-    let what = panic
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("a panic with no message");
+    let what = stdx::panic_text(panic).unwrap_or("a panic with no message");
     format!("panicked: {what}")
 }
 
@@ -412,7 +408,7 @@ pub struct Plane<W: Work, P: Predict> {
     loops: BTreeMap<NodeId, u64>,
 }
 
-fn ns(at: Duration) -> u64 {
+pub(crate) fn ns(at: Duration) -> u64 {
     u64::try_from(at.as_nanos()).unwrap_or(u64::MAX)
 }
 

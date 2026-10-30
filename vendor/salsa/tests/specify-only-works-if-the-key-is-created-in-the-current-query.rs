@@ -3,6 +3,7 @@
 //! Test that `specify` only works if the key is a tracked struct created in the current query.
 //! compilation succeeds but execution panics
 #![allow(warnings)]
+#![forbid(unsafe_code)]
 
 #[salsa::input]
 struct MyInput {

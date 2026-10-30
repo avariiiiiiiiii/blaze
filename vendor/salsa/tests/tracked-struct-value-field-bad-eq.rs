@@ -4,6 +4,8 @@
 //! This can result in us getting different results than
 //! if we were to execute from scratch.
 
+#![forbid(unsafe_code)]
+
 use expect_test::expect;
 use salsa::{Database, Setter};
 mod common;

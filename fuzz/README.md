@@ -49,6 +49,10 @@ inputs through the writer side of its API (`Target::seeds`). Every target's `#[t
 the merge gate without coverage by `blaze test -p blaze-fuzzer`, feeds `check` the corpus files,
 the built seeds and 20000 deterministic changes of them (`BLAZE_FUZZ_RUNS` changes the count),
 spread over every core, so `check` must allow calls on several threads at once.
+A target whose invariants name several ways of reading an input (piece sizes, typed reads,
+arches, contexts) checks one way a run, `blaze_fuzzer::case` of the input's length and last
+byte, so no run repeats a whole read; its second `#[test]` (`blaze_fuzzer::every_case`) checks
+every way of each corpus file and built seed.
 To keep an input a fuzz run found, copy it from `fuzz/out/<target>/` into the target's corpus.
 
 ## The engine
@@ -111,8 +115,10 @@ Each target's file (`targets/<target>.rs`) begins with the invariants it checks.
 | `vfs_journal_model` | a program of commits on a simulated disk, cut, torn or damaged where the input says, then recovered | recovery gives the state after a prefix of the committed transactions (the whole sequence when nothing was damaged), and per head nothing that was not committed |
 | `macro_wasm_validate` | any bytes as a wasm proc-macro module file, through `Wasm::at` | validation and loading never panic; bounded |
 | `macro_wasm_host` | a fixed guest that calls every host and WASI import with pointers, lengths and numbers from the input | the host never panics and never reads or writes outside the guest's memory (every guest pointer and length is checked); bounded |
-| `macro_wasm_wire` | a fixed guest that outputs the input, decoded as the token-tree wire | never panics; bounded; at most two trees per 15 bytes |
+| `macro_wasm_wire` | a fixed guest that outputs the input, decoded as tt's columns (`wire::read`) | never panics; bounded; at most one token tree per 16 bytes |
 | `macro_wasm_lex` | `blaze_macro_wasm::tokens`, the host's lexer for `ts_from_str` | never panics; bounded; at most 2 trees per byte, plus one |
+| `syntax_parse` | `parser::LexedStr::new` and `syntax::SourceFile::parse` (source text, any edition, every lazy body parsed) | never panics or hangs; the lexer's tokens tile the text; the fast lexer lexes as `rustc_lexer` alone; the tree's tokens tile the text and every error, the bodies' included, is inside it; blocks balanced in the current edition; bounded |
+| `syntax_reparse` | `syntax::Parse::reparse` of one edit (`syntax::fuzz::CheckReparse`, the format of `crates/syntax/test_data/reparse/fuzz-failures`) | never panics or hangs; the reparsed tree's text is the edited text and its blocks are balanced; it has the full parse's nodes, kinds and ranges, in order, and as many |
 | `usercode_wire` | blaze-usercode's fork-server frames (`test::wire::Frames`, `Frame::decode`), what a test binary writes | pushed whole, a byte at a time, as `needed` asks and in the input's pieces, `pop` gives a plain walk's frames to the first error; a length past `LONGEST` is an error, never an allocation; decode is canonical; bounded |
 | `usercode_script_output` | `blaze_build_script::output::parse`, a build script's stdout | reads as its directives alone, by cargo's rule, and as its lines one at a time; kept texts are one line and never name a moved `OUT_DIR`; bounded |
 | `usercode_script_elide` | `blaze_build_script::elide`, a build script's source and its lexer | the lexer's tokens are the source's own text in order; what is elided verifies against itself and refuses anything appended; bounded |
@@ -125,7 +131,9 @@ Each target's file (`targets/<target>.rs`) begins with the invariants it checks.
 | `proc_macro_flat_tree` | a `FlatTree` and its span table, as the client resolves them (`deserialize_span_data_index_map`, `to_subtree_resolved`) | never panics; bounded by the input's length times a token tree's size; a tree read encodes and reads back the same |
 | `proc_macro_tt_wire` | `tt::TopSubtree::read_wire`, the token-tree wire | never panics; bounded; a tree read writes back to exactly the words it took and equals `from_serialized` of its trees; every strict prefix is `Truncated` |
 | `codegen_asm` | `hir_ty_codegen::Assembled::from_bytes`, assembled code kept in the store | `None`, or `to_bytes` is the input; at most `4 * len + 1 KiB` allocated at once |
+| `codegen_blob` | `blaze_codegen::blob`'s `decode`, `decode_view`, `decode_static` and `decode_masked`, templates kept in the store and the remote cache | `Err`, or a value whose encoding reads back as it; `decode_view` in a fresh frame agrees with `decode` |
 | `hir_item_tree`, `hir_expr_store`, `hir_body`, `hir_store_source_map`, `hir_body_source_map` | `Persist::read` then `decode()` of the persisted item tree, expression store, body and their source maps | `Err`, or a value written back the same (for column edits of a valid buffer, exactly the input); decoded syntax contexts are compared and dropped, never given to a database; bounded |
+| `intern_table` | an interner table's section, `Table::restore` and its `validate` (`intern::fuzz::restore`, into a fresh table of a small text shape), in an image whose CRCs are good | never panics; bounded; refused as `Invalid` at a byte of the section or `Corrupt` by a column's place; restored IDs ascend below the end, every compiled-in one there, every value UTF-8, `find` never another value's ID; written again it restores to the same IDs, bytes and end, `find` the first ID holding each value, and writes the same bytes |
 
 Several seed corpora hold inputs that show a bug their owner has not fixed yet (each listed in
 the owner's `v2/requests/<owner>.md`); those targets' `#[test]`s fail until it is fixed.

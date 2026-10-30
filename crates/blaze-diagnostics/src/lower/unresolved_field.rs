@@ -1,21 +1,18 @@
 //! E0609, E0610 and E0615: `x.f` where the type of `x` has no field `f`: no such field
 //! (E0609), a primitive type, which has no fields (E0610), or a method taken as a value
-//! (E0615). Also the "a field with a similar name exists" rule its siblings share: rustc's
-//! `find_best_match_for_name`.
+//! (E0615).
 //!
 //! Follows rustc's `compiler/rustc_hir_typeck/src/expr.rs` (`check_expr_field`,
 //! `ban_nonexisting_field`, `no_such_field_err`, `ban_take_value_of_method`,
 //! `maybe_suggest_array_indexing`, `suggest_first_deref_field`, `point_at_param_definition`,
 //! `get_field_candidates_considering_privacy_for_diag`,
 //! `check_for_nested_field_satisfying_condition_for_diag`, `name_series_display`,
-//! `expr_in_place`), `compiler/rustc_hir_typeck/src/method/mod.rs` (`suggest_method_call`),
-//! `compiler/rustc_hir_typeck/src/errors.rs` (`NoFieldOnType`) and
-//! `compiler/rustc_span/src/edit_distance.rs` (MIT or Apache-2.0).
-
-use std::{cmp, mem};
+//! `expr_in_place`), `compiler/rustc_hir_typeck/src/method/mod.rs` (`suggest_method_call`) and
+//! `compiler/rustc_hir_typeck/src/errors.rs` (`NoFieldOnType`) (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
 use hir::{HasVisibility as _, InFile};
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     TextRange,
     view::{self as ast, AstNode as _, FieldKind, HasName as _},
@@ -28,7 +25,7 @@ use crate::{
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedField<'_>) -> Vec<Found> {
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedField<'db>) -> Vec<Found> {
     let node = cx.node_view(d.expr);
     // alloc: the error's parts, for an error hir found
     let Some(ast::Expr::FieldExpr(field_expr)) = node.value.left() else { return vec![] };
@@ -267,9 +264,9 @@ pub(crate) fn in_place(expr: ast::Expr<'_>) -> bool {
 
 /// E0609 (`no_such_field_err`), without the label `ban_nonexisting_field` adds.
 #[allow(clippy::too_many_arguments)]
-fn no_such_field(
-    cx: &Cx<'_, '_>,
-    d: &hir::UnresolvedField<'_>,
+fn no_such_field<'db>(
+    cx: &Cx<'_, 'db>,
+    d: &hir::UnresolvedField<'db>,
     field_expr: ast::FieldExpr<'_>,
     base: ast::Expr<'_>,
     field: &str,
@@ -343,7 +340,7 @@ fn no_such_field(
             // alloc: the error's parts, for an error hir found
             .collect();
         paths.sort();
-        let similar = find_best_match_for_name(&names, field, None);
+        let similar = find_best_match_for_name(&names, field, None).cloned();
         if !paths.is_empty() && same_context {
             let (some, have) = match paths.len() > 1 {
                 true => ("some", "have"),
@@ -524,161 +521,4 @@ pub(crate) fn name_series_display(names: &[String]) -> String {
         display = format!("{} ... and {} others", display, names.len() - limit);
     }
     display
-}
-
-/// rustc's `find_best_match_for_name`: a candidate equal to `lookup` but for case, else the
-/// closest by [`edit_distance`] within `dist` (a third of `lookup`'s length, at least one, by
-/// default), else one with the same `_`-separated words in another order.
-pub(crate) fn find_best_match_for_name(
-    candidates: &[String],
-    lookup: &str,
-    dist: Option<usize>,
-) -> Option<String> {
-    find_best_match_for_name_impl(false, candidates, lookup, dist)
-}
-
-/// rustc's `find_best_match_for_name_with_substrings`: [`find_best_match_for_name`] scoring
-/// by [`edit_distance_with_substrings`], the closest ones then compared by edit distance.
-pub(crate) fn find_best_match_for_name_with_substrings(
-    candidates: &[String],
-    lookup: &str,
-    dist: Option<usize>,
-) -> Option<String> {
-    find_best_match_for_name_impl(true, candidates, lookup, dist)
-}
-
-fn find_best_match_for_name_impl(
-    use_substring_score: bool,
-    candidates: &[String],
-    lookup: &str,
-    dist: Option<usize>,
-) -> Option<String> {
-    let lookup_uppercase = lookup.to_uppercase();
-    if let Some(c) = candidates.iter().find(|c| c.to_uppercase() == lookup_uppercase) {
-        // clone: on the error path, for an error hir found
-        return Some(c.clone());
-    }
-    let lookup_len = lookup.chars().count();
-    let mut dist = dist.unwrap_or_else(|| cmp::max(lookup_len, 3) / 3);
-    let mut best = None;
-    // alloc: the error's parts, for an error hir found
-    let mut next_candidates = vec![];
-    for c in candidates {
-        let found = match use_substring_score {
-            true => edit_distance_with_substrings(lookup, c, dist),
-            false => edit_distance(lookup, c, dist),
-        };
-        match found {
-            // clone: on the error path, for an error hir found
-            Some(0) => return Some(c.clone()),
-            Some(d) => {
-                if use_substring_score {
-                    if d < dist {
-                        dist = d;
-                        next_candidates.clear();
-                    }
-                    // clone: on the error path, for an error hir found
-                    next_candidates.push(c.clone());
-                } else {
-                    dist = d - 1;
-                }
-                // clone: on the error path, for an error hir found
-                best = Some(c.clone());
-            }
-            None => {}
-        }
-    }
-    if next_candidates.len() > 1 {
-        best = find_best_match_for_name_impl(false, &next_candidates, lookup, Some(lookup.len()));
-    }
-    if best.is_some() {
-        return best;
-    }
-    let lookup_words = sort_by_words(lookup);
-    candidates.iter().fold(None, |result, candidate| match sort_by_words(candidate) == lookup_words {
-        // clone: on the error path, for an error hir found
-        true => Some(candidate.clone()),
-        false => result,
-    })
-}
-
-fn sort_by_words(name: &str) -> Vec<&str> {
-    // alloc: the error's parts, for an error hir found
-    let mut words: Vec<&str> = name.split('_').collect();
-    words.sort_unstable();
-    words
-}
-
-/// rustc's restricted Damerau-Levenshtein distance of `a` and `b`, or `None` if it is over
-/// `limit`.
-pub(crate) fn edit_distance(a: &str, b: &str, limit: usize) -> Option<usize> {
-    // alloc: the error's parts, for an error hir found
-    let a = a.chars().collect::<Vec<_>>();
-    // alloc: the error's parts, for an error hir found
-    let b = b.chars().collect::<Vec<_>>();
-    let mut a = &a[..];
-    let mut b = &b[..];
-    if a.len() < b.len() {
-        mem::swap(&mut a, &mut b);
-    }
-    let min_dist = a.len() - b.len();
-    if min_dist > limit {
-        return None;
-    }
-    while let Some(((b_char, b_rest), (a_char, a_rest))) = b.split_first().zip(a.split_first())
-        && a_char == b_char
-    {
-        a = a_rest;
-        b = b_rest;
-    }
-    while let Some(((b_char, b_rest), (a_char, a_rest))) = b.split_last().zip(a.split_last())
-        && a_char == b_char
-    {
-        a = a_rest;
-        b = b_rest;
-    }
-    if b.is_empty() {
-        return Some(min_dist);
-    }
-    // alloc: the error's parts, for an error hir found
-    let mut prev_prev = vec![usize::MAX; b.len() + 1];
-    // alloc: the error's parts, for an error hir found
-    let mut prev = (0..=b.len()).collect::<Vec<_>>();
-    // alloc: the error's parts, for an error hir found
-    let mut current = vec![0; b.len() + 1];
-    for i in 1..=a.len() {
-        current[0] = i;
-        let a_idx = i - 1;
-        for j in 1..=b.len() {
-            let b_idx = j - 1;
-            let substitution_cost = if a[a_idx] == b[b_idx] { 0 } else { 1 };
-            current[j] =
-                cmp::min(prev[j] + 1, cmp::min(current[j - 1] + 1, prev[j - 1] + substitution_cost));
-            if (i > 1) && (j > 1) && (a[a_idx] == b[b_idx - 1]) && (a[a_idx - 1] == b[b_idx]) {
-                current[j] = cmp::min(current[j], prev_prev[j - 2] + 1);
-            }
-        }
-        [prev_prev, prev, current] = [prev, current, prev_prev];
-    }
-    let distance = prev[b.len()];
-    (distance <= limit).then_some(distance)
-}
-
-/// rustc's `edit_distance_with_substrings`: [`edit_distance`] that scores a substring match
-/// low, so that `foo` is closer to `foobar` than to `bar`.
-pub(crate) fn edit_distance_with_substrings(a: &str, b: &str, limit: usize) -> Option<usize> {
-    let n = a.chars().count();
-    let m = b.chars().count();
-    let big_len_diff = (n * 2) < m || (m * 2) < n;
-    let len_diff = m.abs_diff(n);
-    let distance = edit_distance(a, b, limit + len_diff)?;
-    let score = distance - len_diff;
-    let score = if score == 0 && len_diff > 0 && !big_len_diff {
-        1
-    } else if !big_len_diff {
-        score + len_diff.div_ceil(2)
-    } else {
-        score + len_diff
-    };
-    (score <= limit).then_some(score)
 }

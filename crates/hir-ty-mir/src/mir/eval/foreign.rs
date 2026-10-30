@@ -10,6 +10,7 @@ use base_db::{ConstEvalBudget, Db};
 use hir_def::{FunctionId, StaticId, attrs::AttrFlags};
 use la_arena::ArenaMap;
 use rustc_hash::FxHashMap;
+use rustc_type_ir::inherent::IntoKind;
 use smallvec::SmallVec;
 
 use crate::{
@@ -380,7 +381,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             ),
             (None, TyKind::FnDef(def, generic_args)) => self.exec_fn_def(
                 def.0,
-                generic_args,
+                generic_args.skip_binder(),
                 destination,
                 &values,
                 &locals,
@@ -416,6 +417,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, (Option<&'db MirBody<'db>>, SmallVec<[Ty<'db>; 8]>, Ty<'db>)> {
         match callee.kind() {
             TyKind::FnDef(def, generic_args) => {
+                let generic_args = generic_args.skip_binder();
                 let sig = self
                     .db
                     .callable_item_signature(def.0)

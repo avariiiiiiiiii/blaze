@@ -1,12 +1,11 @@
 //! MIR lowering for places
 
-use hir_def::FunctionId;
-use rustc_type_ir::inherent::Region as _;
+use hir_def::{FunctionId, hir::UnsafeBinderCastKind};
 
 use super::*;
 use crate::{
     mir::{MutBorrowKind, Operand, OperandKind},
-    next_solver::Region,
+    next_solver::{Region, RegionExt},
 };
 
 impl<'db> MirLowerCtx<'_, '_, 'db> {
@@ -280,6 +279,12 @@ impl<'db> MirLowerCtx<'_, '_, 'db> {
                 };
                 p_base = p_base.project(ProjectionElem::Index(l_index));
                 Ok(Some((p_base, current)))
+            }
+            // rustc's `UnwrapUnsafeBinder` place: a temporary would be borrowed or written in
+            // place of the binder's value.
+            Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Unwrap, .. } => {
+                let what = "`unwrap_binder!` as a place: MIR has no `UnwrapUnsafeBinder` projection";
+                Err(MirLowerError::NotSupported(what.to_owned())) // alloc: error path
             }
             _ => try_rvalue(self),
         }

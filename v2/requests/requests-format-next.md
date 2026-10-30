@@ -186,3 +186,111 @@ Why: rustc_parse builds `ExprKind::UnsafeBinderCast(kind, expr, ty)` from `built
 `is_wrap()`, `expr()` and `ty()` (`crates/syntax/src/view/expr_ext.rs`, `view/generated/nodes.rs`).
 
 > forwarded to coordinator (requests, pass 38: `crates/blaze-fmt` is the coordinator's "every other path", not one of requests' paths; it lands with the view's `UnsafeBinderCastExpr`, which isn't generated yet; on the report's coordinator list)
+
+## 8. frontend-tree-move-def-lower-next2 (`crates/hir-def/src/expr_store/lower.rs`): lower `UnsafeBinderType` (db-ty.md, "frontend ...: the `unsafe<'a> T` type")
+
+What: the syntax `Type` (`ast::Type` in `lower_type_ref`, `lower.rs:~1028`) gains
+`UnsafeBinderType` (`unsafe` `GenericParamList` `Type`; view accessors `generic_param_list()`,
+`ty()`, `unsafe_token()`), and `hir_def::hir::type_ref::TypeRef` gains
+`UnsafeBinder { lifetimes: Names, ty: TypeRefId }` (the binder's lifetimes as a run of names,
+read with `ExpressionStore::names`, as `TypeBound::ForLifetime`'s). The match in
+`lower_type_ref` is exhaustive. After the `PatternType` arm:
+
+```rust
+            ast::Type::UnsafeBinderType(inner) => {
+                let lifetimes = match inner.generic_param_list() {
+                    Some(params) => self.store.paths_mut().push_names(
+                        params
+                            .lifetime_params()
+                            .flat_map(|lp| lp.lifetime().map(|lt| Name::new_lifetime(lt.text()))),
+                    ),
+                    None => Names::EMPTY,
+                };
+                let ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
+                self.alloc_type_ref(TypeRef::UnsafeBinder { lifetimes, ty }, ptr)
+            }
+```
+
+(with `Names` from `crate::expr_store::path` in the imports if it isn't there). Why: rustc's
+`TyKind::UnsafeBinder(UnsafeBinderTy { generic_params, inner_ty })`, lowered by
+`lower_ty` to `hir::TyKind::UnsafeBinder` with `lower_lifetime_binder` over its params; the
+lifetimes are bound by the binder, not the item, so they don't go in `for_type_binder` or the
+item's generics. Non-lifetime parameters are dropped here as `lower_for_binder` drops them;
+they are reported at the syntax (item 11).
+
+> applied (frontend-tree-move-def-lower-next2, 02:55): the arm as written after `PatternType` in `lower_type_ref`, and `Names` in the `expr_store::path::{..}` import. No other `TypeRef` match in `expr_store/lower*`, `expander.rs` or `expr_store/tests/**`. Not built.
+
+## 9. db (`crates/hir-ty/src/lower.rs` `lower_ty`, ~1054-1200): lower `TypeRef::UnsafeBinder`
+
+What: the exhaustive match in `lower_ty` gets the arm db-ty asked for: a binder over the inner
+type with one bound region per name of `store.names(lifetimes)` (as `TypeRef::Fn`'s `for<..>`
+binder is lowered), giving `TyKind::UnsafeBinder`. Also look at the wildcard arms that now see
+it: `input_lifetimes` (~4559, `_ => None`), `opaque_variances.rs:236` `nth_impl_trait`
+(an `impl Trait` inside the binder's type), and `hir-ty-borrowck/src/regions.rs`
+`writes_self`/`writes_elided`/`elided_lifetimes` (~6600-6714); each should walk into `ty` the
+way rustc's resolver and elision treat `TyKind::UnsafeBinder` (its lifetimes are bound by the
+binder, so they are neither inputs nor elided). Why: db-ty's request; without the arm hir-ty
+doesn't compile.
+
+> db-ty (2026-10-30 02:55): taken by db-ty, held by the coordinator's freeze, not started. It is in db-ty's Left list, for the same `lower.rs` pass as the others. Item 10 (`hir-expand`) is outside db-ty's paths and stays with lane db.
+> applied by db-ty (2026-10-30 03:10), not built: `lower_ty_ext` has a `TypeRef::UnsafeBinder { lifetimes, ty }` arm. It lowers `ty` inside `with_shifted_in(store.names(lifetimes))`, so the lifetimes are the binder's bound regions, with `LifetimeElisionKind::AnonymousReportError`: rustc's resolver refuses an elided lifetime inside `unsafe<..>`. It returns `Ty::new_unsafe_binder(Binder::bind_with_vars(inner, bound_vars))`. Test: hir `tests/lower.rs` `an_unsafe_binder_binds_its_lifetimes` (`unsafe<'a, 'b> &'a &'b u8` binds `a` and `b`, each reference's region the binder's var 0 and 1).
+> forwarded to db-ty (taken by it, 02:55, held by the coordinator's freeze); requests checks it each pass.
+
+## 10. db (`crates/hir-expand/src/builtin/derive_macro.rs:2210`, `derive_macro/editor.rs:~530`): two exhaustive `ast::Type` matches
+
+What: `pointee_paths` gets
+`ast::Type::UnsafeBinderType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),`
+and `substitute_type_in_bound` gets
+`ast::Type::UnsafeBinderType(ty) => ty.ty().is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),`.
+The binder's parameters are lifetimes and can't name the pointee type, so only the inner type
+is walked. Why: the syntax `Type` gains the variant; both matches are exhaustive.
+
+> forwarded to db-next8 (`hir-expand` is db's, not DONE); told by tmux (requests, pass 77).
+
+## 11. diagnostics (`crates/blaze-diagnostics/src/`): the `unsafe_binders` gate and one exhaustive match
+
+What:
+- `checks/features/gates/post.rs`, beside `SyntaxKind::PATTERN_TYPE`:
+  `SyntaxKind::UNSAFE_BINDER_TYPE => self.gate(file, node, "unsafe_binders", node.text_range(), "unsafe binder types are experimental", None),`.
+  rustc's parser gates it (`parse_unsafe_binder_ty`: `gated_spans.gate(sym::unsafe_binders, lo.to(inner_ty.span))`,
+  E0658 from `feature_gate.rs`'s `gate_all!(unsafe_binders, ...)`); without it blaze accepts
+  the type on a crate without the feature, which rustc refuses. Check the message against the
+  pinned nightly's `gate_all!` line.
+- What rustc gives for a non-lifetime parameter in the binder (`unsafe<T> T`): check against
+  the pinned nightly (resolve or ast validation) and report the same; `binder()` in `post.rs`
+  is `for<..>`'s `check_late_bound_lifetime_defs`, the closest model.
+- `lints/syntax/early/validation/pretty.rs:229` `ty` (exhaustive), as rustc_ast_pretty prints
+  `TyKind::UnsafeBinder` (`unsafe`, the params only when there are any, a space, the type):
+
+```rust
+            ast::Type::UnsafeBinderType(it) => {
+                self.word("unsafe");
+                if let Some(list) = it.generic_param_list() {
+                    let mut params = list.generic_params().peekable();
+                    if params.peek().is_some() {
+                        self.generic_params(params);
+                    }
+                }
+                self.word(" ");
+                self.opt_ty(it.ty());
+            }
+```
+
+> forwarded to diagnostics-next2 (both windows; diagnostics is not DONE); told by tmux (requests, pass 77).
+
+## 12. coordinator (`crates/blaze-fmt/src/parse/lower/ty.rs:~10-90`, `crates/blaze-doc/src/sig.rs:~100-210`, `crates/hir-ide/src/display.rs:~2430-2510`): three exhaustive matches
+
+What:
+- blaze-fmt `Lowerer::ty`: its AST has rustfmt's `TyKind::UnsafeBinder(Box<UnsafeBinderTy { generic_params, inner_ty }>)`
+  (formatted at `types.rs:1023`), so:
+  `ra::Type::UnsafeBinderType(t) => ast::TyKind::UnsafeBinder(Box::new(ast::UnsafeBinderTy { generic_params: t.generic_param_list().map(|l| l.generic_params().map(|g| self.generic_param(g)).collect()).unwrap_or_default(), inner_ty: self.opt_ty(t.ty(), span) })),`.
+- blaze-doc `Sig::ty` on `TypeRef::UnsafeBinder { lifetimes, ty }`: rustdoc prints it with
+  `print_higher_ranked_params_with_space(params, cx, "unsafe")` then the type, so
+  `unsafe<'a, 'b> ` (written as the `Fn` arm writes `for<..>`, names from
+  `store.names(lifetimes)`) only when there are lifetimes, then `self.ty(out, ty)`.
+- hir-ide `TypeRef::hir_fmt`: `unsafe<'a, ..> ` (or `unsafe ` with no lifetimes, as
+  hir-def's `pretty.rs` prints it), then `ty.hir_fmt(f, owner, store)?`.
+
+Why: the syntax `Type` and `TypeRef` gain the variants; each match is exhaustive.
+
+> applied, the hir-ide part (requests, pass 77): `TypeRef::hir_fmt` in `crates/hir-ide/src/display.rs` prints `TypeRef::UnsafeBinder` as `unsafe ` with no lifetimes, else `unsafe<'a, ..> ` from `store.names(lifetimes)` (as the `Fn` arm writes `for<..>` and hir-def's `pretty.rs` writes this one), then the type. No other exhaustive `TypeRef`/`ast::Type` match in hir-ide, ide-db or test-fixture. The blaze-fmt (`Lowerer::ty`) and blaze-doc (`Sig::ty`) arms are the coordinator's (crates.md: `blaze-fmt` and `blaze-doc` are its); on requests' coordinator list. Not built.

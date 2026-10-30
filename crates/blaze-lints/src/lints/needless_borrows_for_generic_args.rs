@@ -114,7 +114,7 @@ fn needless_borrow_count<'t>(
     // The type arguments of the bound being asked of, past its `Self`.
     let mut args = Vec::new();
     let mut holds = |referent: ast::Expr<'t>| -> bool {
-        let inner = peel_parens(referent);
+        let inner = referent.peel_parens();
         if let ast::Expr::FieldExpr(field) = inner
             && let Some(base) = field.expr().and_then(|it| cx.ty(it))
             && drop.is_some_and(|it| base.impls_trait(db, it, &[]))
@@ -167,15 +167,6 @@ fn has_ref_mut_self_method(db: &base_db::Db, trait_: hir::Trait) -> bool {
     })
 }
 
-fn peel_parens(expr: ast::Expr<'_>) -> ast::Expr<'_> {
-    let mut expr = expr;
-    while let ast::Expr::ParenExpr(paren) = expr {
-        let Some(inner) = paren.expr() else { break };
-        expr = inner;
-    }
-    expr
-}
-
 /// Whether `expr` is a call, or a macro call that expands to one, as `format!` does.
 fn is_call<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> bool {
     match expr {
@@ -184,7 +175,7 @@ fn is_call<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> bool {
             let Some(call) = mac.macro_call() else { return false };
             let Some(root) = cx.expand(call) else { return false };
             let expr = ast::Expr::cast(root).or_else(|| root.children().find_map(ast::Expr::cast));
-            expr.is_some_and(|it| is_call(cx, peel_parens(it)))
+            expr.is_some_and(|it| is_call(cx, it.peel_parens()))
         }
         _ => false,
     }

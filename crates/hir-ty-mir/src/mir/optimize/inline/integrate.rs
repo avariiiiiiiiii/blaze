@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashMap;
-use rustc_type_ir::inherent::IntoKind;
+use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use smallvec::SmallVec;
 
 use crate::{
@@ -16,7 +16,7 @@ use crate::{
         OperandKind, Place, ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace,
         Terminator, TerminatorKind, return_slot, transform::Ctx,
     },
-    next_solver::{Region, Ty, TyKind},
+    next_solver::{Region, RegionExt, Ty, TyKind},
 };
 
 use super::super::{block_id, block_index, local_index, map_place, successors_mut};

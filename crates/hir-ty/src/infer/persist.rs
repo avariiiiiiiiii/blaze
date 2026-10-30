@@ -17,13 +17,14 @@ use blaze_format::{
 use blaze_mem::{Frame, scratch};
 use hir_def::{
     AdtId, AssocItemId, ConstId, ConstParamId, EnumVariantId, FieldId, FunctionId, GenericDefId,
-    GenericParamId, LifetimeParamId, StructId, TraitId, TupleFieldId, TupleId, TypeOrConstParamId,
-    TypeParamId, UnionId, VariantId,
+    GenericParamId, ImplId, LifetimeParamId, StructId, TraitId, TupleFieldId, TupleId, TypeAliasId,
+    TypeOrConstParamId, TypeParamId, UnionId, VariantId,
+    builtin_type::{BuiltinFloat, BuiltinInt, BuiltinType, BuiltinUint},
     hir::{
         ArithOp, BinaryOp, BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, PatId, UnaryOp,
         UnsafeBinderCastKind,
     },
-    resolver::ValueNs,
+    resolver::{TypeNs, ValueNs},
 };
 use hir_expand::name::Name;
 use intern::Symbol;
@@ -63,7 +64,7 @@ use crate::{
         AnyImplId, StoredGenericArg,
         abi::Safety,
         infer::traits::ObligationCauseCode,
-        persist::{TyTableReader, TyTableWriter},
+        persist::{TyTableReader, TyTableWriter, table_words},
     },
     solver_errors::{SolverDiagnostic, SolverDiagnosticKind, StoredTraitPredicate},
     solver_errors::{
@@ -256,16 +257,6 @@ enum TableView<'a> {
     Words(&'a [u128]),
 }
 
-/// The type table's buffer as words, little-endian, to be placed with the columns at `u128`
-/// alignment.
-fn table_words(bytes: &[u8]) -> Vec<u128> {
-    assert!(bytes.len().is_multiple_of(ALIGN), "a finished buffer is padded to whole words");
-    bytes
-        .chunks_exact(size_of::<u128>())
-        .map(|chunk| u128::from_le_bytes(chunk.try_into().expect("a chunk of 16 bytes")))
-        .collect() // alloc: the record's type table, exact size, once per body persisted
-}
-
 /// The type table's buffer as the reader takes it, from [`table_words`]'s words: a copy, for
 /// a record that was never written.
 fn table_bytes(words: &[u128]) -> Aligned {
@@ -277,7 +268,7 @@ fn table_bytes(words: &[u128]) -> Aligned {
 }
 
 /// The bytes of `table`, a slice [`Slice::follow`] gave out of `buffer`.
-fn table_in(buffer: &[u8], table: &[u128]) -> &[u8] {
+fn table_in<'b>(buffer: &'b [u8], table: &[u128]) -> &'b [u8] {
     if table.is_empty() {
         return &[];
     }
@@ -332,6 +323,45 @@ fn variant_of(tag: u8, bits: u64) -> Option<VariantId> {
         0 => id_of::<EnumVariantId>(bits)?.into(),
         1 => id_of::<StructId>(bits)?.into(),
         2 => id_of::<UnionId>(bits)?.into(),
+        _ => return None,
+    })
+}
+
+const BUILTIN_INTS: [BuiltinInt; 6] = {
+    use BuiltinInt::*;
+    [Isize, I8, I16, I32, I64, I128]
+};
+const BUILTIN_UINTS: [BuiltinUint; 6] = {
+    use BuiltinUint::*;
+    [Usize, U8, U16, U32, U64, U128]
+};
+const BUILTIN_FLOATS: [BuiltinFloat; 4] = {
+    use BuiltinFloat::*;
+    [F16, F32, F64, F128]
+};
+
+/// `char`, `bool`, `str`, then the ints, uints and floats in the orders above.
+fn builtin_word(ty: BuiltinType) -> u32 {
+    let at = |at: Option<usize>| at.expect("every builtin number type is in its list") as u32;
+    match ty {
+        BuiltinType::Char => 0,
+        BuiltinType::Bool => 1,
+        BuiltinType::Str => 2,
+        BuiltinType::Int(it) => 3 + at(BUILTIN_INTS.iter().position(|&x| x == it)),
+        BuiltinType::Uint(it) => 9 + at(BUILTIN_UINTS.iter().position(|&x| x == it)),
+        BuiltinType::Float(it) => 15 + at(BUILTIN_FLOATS.iter().position(|&x| x == it)),
+    }
+}
+
+fn builtin_of(word: u32) -> Option<BuiltinType> {
+    let word = usize::try_from(word).ok()?;
+    Some(match word {
+        0 => BuiltinType::Char,
+        1 => BuiltinType::Bool,
+        2 => BuiltinType::Str,
+        3..9 => BuiltinType::Int(BUILTIN_INTS[word - 3]),
+        9..15 => BuiltinType::Uint(BUILTIN_UINTS[word - 9]),
+        15..19 => BuiltinType::Float(BUILTIN_FLOATS[word - 15]),
         _ => return None,
     })
 }
@@ -748,6 +778,7 @@ impl InferenceRecord {
             field_resolutions,
             variant_resolutions,
             value_resolutions,
+            qualifier_resolutions,
             unstable_candidates,
             assoc_resolutions,
             tuple_field_access_types,
@@ -873,6 +904,12 @@ impl InferenceRecord {
             words.node(node);
             words.value_ns(value);
         });
+        words.len(qualifier_resolutions.iter().count());
+        qualifier_resolutions.iter().for_each(|(node, &(ty, segments))| {
+            words.node(node);
+            words.type_ns(ty);
+            words.word(segments);
+        });
         words.len(unstable_candidates.iter().count());
         unstable_candidates.iter().for_each(|(node, candidates)| {
             words.node(node);
@@ -916,7 +953,7 @@ impl InferenceRecord {
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(17),
+        Part::U64(18),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -1287,6 +1324,15 @@ impl<'a> InferenceRecordRef<'a> {
             }
             map.freeze()
         };
+        let qualifier_resolutions = {
+            let mut map = ExprOrPatMap::new_in(frame);
+            for _ in 0..words.len()? {
+                let node = words.node()?;
+                let qualifier = (words.type_ns()?, words.word()?);
+                self.ensure(map.insert(node, qualifier).is_none(), "a node with two qualifier resolutions")?;
+            }
+            map.freeze()
+        };
         let unstable_candidates = {
             let mut map = ExprOrPatMap::new_in(frame);
             for _ in 0..words.len()? {
@@ -1323,6 +1369,7 @@ impl<'a> InferenceRecordRef<'a> {
             field_resolutions,
             variant_resolutions,
             value_resolutions,
+            qualifier_resolutions,
             unstable_candidates,
             assoc_resolutions,
             tuple_field_access_types,
@@ -1545,6 +1592,46 @@ impl Sink {
                 self.generic_def(it.parent());
                 self.word(local(it.local_id()));
             }
+        }
+    }
+
+    fn type_ns(&mut self, ty: TypeNs) {
+        match ty {
+            TypeNs::SelfType(it) => {
+                self.word(0);
+                self.id(it);
+            }
+            TypeNs::GenericParam(it) => {
+                self.word(1);
+                self.generic_def(it.parent());
+                self.word(local(it.local_id()));
+            }
+            TypeNs::AdtId(it) => {
+                self.word(2);
+                self.generic_def(it.into());
+            }
+            TypeNs::AdtSelfType(it) => {
+                self.word(3);
+                self.generic_def(it.into());
+            }
+            TypeNs::EnumVariantId(it) => {
+                self.word(4);
+                self.id(it);
+            }
+            TypeNs::TypeAliasId(it) => {
+                self.word(5);
+                self.id(it);
+            }
+            TypeNs::BuiltinType(it) => {
+                self.word(6);
+                self.word(builtin_word(it));
+            }
+            TypeNs::TraitId(it) => {
+                self.word(7);
+                self.id(it);
+            }
+            // hir-def's `resolve_path_in_value_ns` stops at a type, never at a module.
+            TypeNs::ModuleId(_) => unreachable!("a value path's qualifier resolved to a module"),
         }
     }
 
@@ -2528,6 +2615,34 @@ impl Source<'_> {
                 ValueNs::GenericParam(ConstParamId::from_unchecked(TypeOrConstParamId { parent, local_id }))
             }
             _ => return Err(self.invalid("a value path resolution of no kind")),
+        })
+    }
+
+    fn adt(&mut self) -> Result<AdtId, FormatError> {
+        match self.generic_def()? {
+            GenericDefId::AdtId(it) => Ok(it),
+            _ => Err(self.invalid("an ADT that is no ADT")),
+        }
+    }
+
+    fn type_ns(&mut self) -> Result<TypeNs, FormatError> {
+        Ok(match self.word()? {
+            0 => TypeNs::SelfType(self.id()?),
+            1 => {
+                let parent = self.generic_def()?;
+                let local_id = self.local()?;
+                TypeNs::GenericParam(TypeParamId::from_unchecked(TypeOrConstParamId { parent, local_id }))
+            }
+            2 => TypeNs::AdtId(self.adt()?),
+            3 => TypeNs::AdtSelfType(self.adt()?),
+            4 => TypeNs::EnumVariantId(self.id()?),
+            5 => TypeNs::TypeAliasId(self.id()?),
+            6 => {
+                let word = self.word()?;
+                TypeNs::BuiltinType(builtin_of(word).ok_or(self.invalid("a builtin type of no kind"))?)
+            }
+            7 => TypeNs::TraitId(self.id()?),
+            _ => return Err(self.invalid("a qualifier resolution of no kind")),
         })
     }
 
@@ -3935,6 +4050,21 @@ mod tests {
                 values.insert(expr(17).into(), ValueNs::GenericParam(ConstParamId::from_unchecked(param)));
                 values.freeze()
             },
+            qualifier_resolutions: {
+                let param = TypeOrConstParamId { parent: FunctionId::from_id(id(33)).into(), local_id: local_of(0) };
+                let enum_ = AdtId::EnumId(hir_def::EnumId::from_id(id(49)));
+                let mut qualifiers = ExprOrPatMap::new_in(frame);
+                qualifiers.insert(expr(14).into(), (TypeNs::AdtId(StructId::from_id(id(38)).into()), 1));
+                qualifiers.insert(expr(15).into(), (TypeNs::GenericParam(TypeParamId::from_unchecked(param)), 1));
+                qualifiers.insert(expr(16).into(), (TypeNs::SelfType(ImplId::from_id(id(34))), 1));
+                qualifiers.insert(expr(17).into(), (TypeNs::AdtSelfType(enum_), 1));
+                qualifiers.insert(expr(18).into(), (TypeNs::TraitId(TraitId::from_id(id(41))), 2));
+                qualifiers.insert(expr(19).into(), (TypeNs::TypeAliasId(TypeAliasId::from_id(id(6))), 3));
+                qualifiers.insert(expr(20).into(), (TypeNs::BuiltinType(BuiltinType::Uint(BuiltinUint::U128)), 1));
+                qualifiers.insert(expr(21).into(), (TypeNs::BuiltinType(BuiltinType::Char), 1));
+                qualifiers.insert(pat(6).into(), (TypeNs::EnumVariantId(EnumVariantId::from_id(id(39))), 0));
+                qualifiers.freeze()
+            },
             unstable_candidates: {
                 let mut candidates = ExprOrPatMap::new_in(frame);
                 let call: Box<[(CandidateId, Symbol)]> = Box::new([
@@ -4255,6 +4385,17 @@ mod tests {
         }
 
         assert!(decodes(&record, &model));
+    }
+
+    #[test]
+    fn every_builtin_type_has_a_word_of_its_own() {
+        let all = BuiltinType::all_builtin_types().map(|(_, ty)| ty);
+        let words = all.map(builtin_word);
+        for (ty, word) in all.into_iter().zip(words) {
+            assert_eq!(builtin_of(word), Some(ty), "{ty:?}");
+        }
+        assert_eq!(words, std::array::from_fn(|at| at as u32), "the words are 0..19 in order");
+        assert_eq!(builtin_of(19), None);
     }
 
     #[test]

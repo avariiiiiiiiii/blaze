@@ -10,7 +10,7 @@ each edit got linked, spliced or in full, is read from the daemon's log.
 import os, re, shlex, statistics, subprocess, time
 
 import linkline
-from difftest import BLAZE, sysroot_rlibs
+from mixed import BLAZE, sysroot_rlibs
 
 
 def peak_mb(pid):

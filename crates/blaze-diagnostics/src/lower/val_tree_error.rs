@@ -15,7 +15,7 @@ use crate::{
     model::Diag,
 };
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ValTreeError<'_>) -> Vec<Found> {
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ValTreeError<'db>) -> Vec<Found> {
     let node = cx.syntax_view(d.at);
     let span = cx.span(node.map(|it| it.text_range()));
     let konst = match d.konst {

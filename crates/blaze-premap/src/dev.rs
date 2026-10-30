@@ -120,15 +120,17 @@ impl Job<'_> {
         let name = format!("blaze-premap-{}", self.key.0); // alloc: setup, once per image made: its output's name
         let output = prelink::output(self.dev.graph.output, &name);
         let request = Request {
-            output: &output,
-            base: self.dev.graph.base,
-            tls_bias: self.dev.graph.tls_bias,
-            functions: &self.part.functions,
-            statics: &self.part.statics,
-            names: &self.part.names,
-            debug_names: &self.part.debug_names,
-            natives: &self.part.natives,
-            spans: self.dev.spans,
+            link: blaze_link::premap::Request {
+                output: &output,
+                base: self.dev.graph.base,
+                tls_bias: self.dev.graph.tls_bias,
+                functions: &self.part.functions,
+                statics: &self.part.statics,
+                names: &self.part.names,
+                debug_names: &self.part.debug_names,
+                natives: &self.part.natives,
+                spans: self.dev.spans,
+            },
             function_digests: &self.part.function_digests,
             static_digests: &self.part.static_digests,
             debug_digests: &self.part.debug_digests,

@@ -8,6 +8,7 @@
 //! The sections are those of GNU's extension of DWARF 4, which rustc writes too: an entry
 //! kept apart names no address, only the place of one in `.debug_addr`.
 
+use blaze_format::cursor::Reader;
 use cranelift_codegen::gimli::{
     self, DW_AT_GNU_addr_base, DW_AT_GNU_dwo_id, DW_AT_GNU_dwo_name, DW_AT_GNU_ranges_base,
     DW_AT_comp_dir, DW_AT_low_pc, DW_AT_ranges, DW_AT_stmt_list, DW_CHILDREN_no,
@@ -252,16 +253,16 @@ impl Split {
         // alloc: the error's message
         let short = || "a location list ends short".to_owned();
         let mut entries = 0;
-        let mut at = 0;
+        let mut read = Reader::new(bytes);
         let mut begins = true;
-        while at < bytes.len() {
+        while !read.is_done() {
+            let at = read.at();
             if begins {
                 self.lists.insert(at as i64, self.loc_apart.len());
                 begins = false;
             }
-            let ends = bytes.get(at..at + 2 * size).ok_or_else(short)?;
+            let ends = read.take(2 * size).map_err(|_| short())?;
             let (begin, end) = (reloc(at), reloc(at + size));
-            at += 2 * size;
             let (Some(begin), Some(end)) = (begin, end) else {
                 if begin.is_some() || end.is_some() || ends.iter().any(|&it| it != 0) {
                     // alloc: the error's message
@@ -290,11 +291,10 @@ impl Split {
                 };
                 self.loc_apart.write_uleb128(index).map_err(message)?;
             }
-            let len = bytes.get(at..at + 2).ok_or_else(short)?;
-            let len = usize::from(u16::from_le_bytes([len[0], len[1]]));
-            let expression = bytes.get(at..at + 2 + len).ok_or_else(short)?;
-            self.loc_apart.write(expression).map_err(message)?;
-            at += 2 + len;
+            let start = read.at();
+            let len = read.u16().map_err(|_| short())?;
+            read.skip(usize::from(len)).map_err(|_| short())?;
+            self.loc_apart.write(&bytes[start..read.at()]).map_err(message)?;
             entries += 1;
         }
         if loc.relocs.len() != 2 * entries {

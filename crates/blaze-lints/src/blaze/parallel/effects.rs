@@ -384,7 +384,7 @@ pub(crate) fn block_cost<'db>(
 
 /// The work a call of `func` runs past the call itself.
 pub(crate) fn call_cost<'db>(db: &'db Db, env: ParamEnvAndCrate<'db>, func: &Operand) -> u32 {
-    let Some((f, args)) = fn_item(func) else { return 1 };
+    let Some((f, args)) = func.fn_item() else { return 1 };
     if FunctionSignature::is_intrinsic(db, f) || is_foreign(db, f) || diverges(db, f) {
         return 1;
     }
@@ -394,20 +394,6 @@ pub(crate) fn call_cost<'db>(db: &'db Db, env: ParamEnvAndCrate<'db>, func: &Ope
         }
         Callee::Closure(id, parent) => closure_cost(db, env.store(), id, parent.store()),
         _ => 1,
-    }
-}
-
-/// The function a constant operand names, with its generic arguments.
-pub(crate) fn fn_item<'db>(operand: &Operand) -> Option<(FunctionId, GenericArgs<'db>)> {
-    let ty: Ty<'db> = match &operand.kind {
-        OperandKind::Constant { ty, .. } => ty.as_ref(),
-        OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-        _ => return None,
-    };
-    let TyKind::FnDef(def, args) = ty.kind() else { return None };
-    match def.0 {
-        CallableDefId::FunctionId(f) => Some((f, args)),
-        _ => None,
     }
 }
 
@@ -504,7 +490,7 @@ fn fn_trait_callee<'db>(
             GenericArgs::new_from_slice(closure_args.as_closure().parent_args()),
         ),
         TyKind::FnDef(def, fn_args) => match def.0 {
-            CallableDefId::FunctionId(g) => Callee::Function(g, fn_args),
+            CallableDefId::FunctionId(g) => Callee::Function(g, fn_args.skip_binder()),
             _ => Callee::Function(f, args),
         },
         TyKind::FnPtr(..) => Callee::FnPointer,
@@ -531,7 +517,7 @@ pub(crate) fn call_summary<'db>(
     func: &Operand,
     intrinsic: Option<Intrinsic>,
 ) -> (Effects, bool) {
-    let Some((f, args)) = fn_item(func) else {
+    let Some((f, args)) = func.fn_item() else {
         return (Effects::unknown(Culprit::FnPointer), false);
     };
     if let Some(intrinsic) = intrinsic {
@@ -622,8 +608,8 @@ fn intrinsic_effects<'db>(
             // tuple `args`, generic argument 2.
             let runtime = args.types().nth(2);
             match runtime.map(|it| it.kind()) {
-                Some(TyKind::FnDef(def, fn_args)) => match def.0 {
-                    CallableDefId::FunctionId(g) if short(fn_args) => {
+                Some(TyKind::FnDef(def, fn_args)) => match (def.0, fn_args.skip_binder()) {
+                    (CallableDefId::FunctionId(g), fn_args) if short(fn_args) => {
                         let summary = effects(db, env.store(), g, fn_args.store());
                         out.add_callee(&summary, Some(g));
                         let spread = |bits: u64| match bits & (DIRECT | DEEP) {

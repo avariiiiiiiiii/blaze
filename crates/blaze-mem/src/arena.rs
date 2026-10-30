@@ -215,9 +215,21 @@ impl Arena {
 
     /// Frees everything: its chunks go back to the cache, its large regions to the kernel.
     pub fn reset(&mut self) {
-        while let Some(index) = self.held.pop(&ChunkLinks) {
-            chunks::give(Chunk::from_index(index), self.tag);
+        // `&mut self`: no local takes a chunk meanwhile, so the held list is walked with plain
+        // loads and given back up to `GIVE_RUN` chunks per compare-and-swap.
+        let mut run = [NONE; chunks::GIVE_RUN];
+        let mut len = 0;
+        let mut next = self.held.take_all();
+        while next != NONE {
+            run[len] = next;
+            len += 1;
+            next = ChunkLinks.link(next).load(Ordering::Relaxed);
+            if len == run.len() {
+                chunks::give_all(&run, self.tag);
+                len = 0;
+            }
         }
+        chunks::give_all(&run[..len], self.tag);
         let mut node = *self.large.get_mut();
         *self.large.get_mut() = ptr::null_mut();
         while !node.is_null() {

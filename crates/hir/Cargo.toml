@@ -30,6 +30,7 @@ rustc_type_ir.workspace = true
 # local deps
 base-db.workspace = true
 blaze-hashcons.workspace = true
+blaze-ids.workspace = true
 blaze-mem.workspace = true
 cfg.workspace = true
 hir-def.workspace = true

@@ -102,6 +102,7 @@ pub(crate) fn resolve_round<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     let mut progress = false;
     let mut deferred_eager = false;
     for directive in macros {
+        let _reading = crate::nameres::delta::reads::reading(directive.module);
         let outcome = resolve_one(
             cx,
             sink,
@@ -130,6 +131,7 @@ pub(crate) fn resolve_round<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
 
     expand_round(cx, sink.def_map().recursion_limit(), &resolved);
     for (module, depth, container, call, attr_macro_item) in resolved {
+        let _reading = crate::nameres::delta::reads::reading(module);
         collect::collect_expansion(cx, sink, side, module, call, depth, container, attr_macro_item);
         sink.take_macros(pending);
     }
@@ -906,7 +908,7 @@ impl<'a> Carried<'a> {
             Some(side) => Arc::clone(side),
             None => {
                 let mut side = SideTables::default();
-                for op in self.log.iter() {
+                for op in self.log.into_iter().flat_map(OpLog::iter) {
                     if let &DeclOp::SetModDir { module, dir } = op
                         && module == self.module
                     {
@@ -1032,7 +1034,10 @@ impl<'db, 'f> StepSink<'db, 'f> {
     fn own(&self) -> &ModulesMap {
         match &self.def_map.modules {
             ModulesSlot::Unit { own, .. } => own,
-            ModulesSlot::Building(_) | ModulesSlot::Collected(_) => {
+            ModulesSlot::Building(_)
+            | ModulesSlot::Collected(_)
+            | ModulesSlot::Maintained { .. }
+            | ModulesSlot::Published(_) => {
                 unreachable!("a macro step's view is a resolver view")
             }
         }

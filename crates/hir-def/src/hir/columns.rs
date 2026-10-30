@@ -668,6 +668,29 @@ impl<V: ColumnVec> HirColumns<V> {
         Statements { rows: V::rows(self), start, len: end - start }
     }
 
+    /// The kind of expression `id`: its `expr_kind` byte, with no row decoded.
+    #[inline]
+    pub(crate) fn expr_kind_of(&self, id: ExprId) -> ExprKind {
+        let kind = self.expr_kind.get(raw(id) as usize);
+        match kind.and_then(|&kind| ExprKind::ALL.get(kind as usize)) {
+            Some(&kind) => kind,
+            None => bad_store(EXPR_ID, raw(id)),
+        }
+    }
+
+    /// Each `let` statement row in row order, as its pattern and whether it has an `else`:
+    /// read off the row's head word in `extra`, no other row decoded.
+    pub(crate) fn let_statements(&self) -> impl Iterator<Item = (PatId, bool)> + '_ {
+        let extra: &[u32] = &self.extra;
+        let rows = self.stmt_kind.iter().zip(self.stmt_data.iter());
+        (0u32..).zip(rows).filter(|&(_, (&kind, _))| kind == StatementKind::Let as u8).map(
+            move |(at, (_, &data))| match extra.get(data as usize) {
+                Some(&head) => (idx(head >> LET_BITS), head & LET_ELSE != 0),
+                None => bad_store(EXTRA, at),
+            },
+        )
+    }
+
     #[inline]
     fn decode_statement(&self, at: u32) -> Checked<Statement<'_>> {
         let row = at as usize;

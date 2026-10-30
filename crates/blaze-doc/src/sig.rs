@@ -64,7 +64,7 @@ impl<'a> Sig<'a> {
 
     pub(crate) fn ty(&self, out: &mut Code, ty: TypeRefId) {
         let db = self.db;
-        match &self.store[ty] {
+        match self.store.type_ref(ty) {
             TypeRef::Never => {
                 out.text("!");
             }
@@ -90,7 +90,7 @@ impl<'a> Sig<'a> {
                     Mutability::Shared => "*const ",
                     Mutability::Mut => "*mut ",
                 });
-                self.ty(out, *inner);
+                self.ty(out, inner);
             }
             TypeRef::Reference(reference) => {
                 out.text("&");
@@ -112,7 +112,7 @@ impl<'a> Sig<'a> {
             }
             TypeRef::Slice(inner) => {
                 out.text("[");
-                self.ty(out, *inner);
+                self.ty(out, inner);
                 out.text("]");
             }
             TypeRef::Fn(fn_) => {
@@ -147,13 +147,24 @@ impl<'a> Sig<'a> {
                         out.text(if params.is_empty() { "..." } else { ", ..." });
                     }
                     out.text(")");
-                    if !matches!(&self.store[*ret], TypeRef::Tuple(it) if it.is_empty()) {
+                    if !matches!(self.store.type_ref(*ret), TypeRef::Tuple(it) if it.is_empty()) {
                         out.text(" -> ");
                         self.ty(out, *ret);
                     }
                 } else {
                     out.text(")");
                 }
+            }
+            TypeRef::UnsafeBinder { lifetimes, ty } => {
+                out.kw("unsafe").text("<");
+                for (at, name) in self.store.names(lifetimes).iter().enumerate() {
+                    if at > 0 {
+                        out.text(", ");
+                    }
+                    out.push(Piece::Lifetime(lifetime_text(name.as_str())));
+                }
+                out.text("> ");
+                self.ty(out, ty);
             }
             TypeRef::ImplTrait(bounds) => {
                 out.kw("impl").text(" ");
@@ -164,7 +175,7 @@ impl<'a> Sig<'a> {
                 self.bounds(out, bounds);
             }
             TypeRef::TypeParam(param) => {
-                if let Some((_, code)) = self.places.subst.iter().find(|(it, _)| it == param) {
+                if let Some((_, code)) = self.places.subst.iter().find(|(it, _)| *it == param) {
                     out.extend(code.clone());
                     return;
                 }
@@ -187,7 +198,7 @@ impl<'a> Sig<'a> {
                             .iter()
                             .filter_map(|pred| match pred {
                                 WherePredicate::TypeBound { target, bound, .. }
-                                    if matches!(store[*target], TypeRef::TypeParam(id) if id == *param) =>
+                                    if matches!(store.type_ref(*target), TypeRef::TypeParam(id) if id == param) =>
                                 {
                                     Some(bound)
                                 }
@@ -203,7 +214,7 @@ impl<'a> Sig<'a> {
                     }
                 }
             }
-            TypeRef::PatternType(inner, _) => self.ty(out, *inner),
+            TypeRef::PatternType(inner, _) => self.ty(out, inner),
         }
     }
 
@@ -246,23 +257,23 @@ impl<'a> Sig<'a> {
                         out.text("[").kw("const").text("] ");
                     }
                 }
-                self.path(out, &self.store[*path]);
+                self.path(out, self.store.path(*path));
             }
             TypeBound::ForLifetime(names, path) => {
                 out.kw("for").text("<");
-                for (at, name) in names.iter().enumerate() {
+                for (at, name) in self.store.names(*names).iter().enumerate() {
                     if at > 0 {
                         out.text(", ");
                     }
                     out.push(Piece::Lifetime(lifetime_text(name.as_str())));
                 }
                 out.text("> ");
-                self.path(out, &self.store[*path]);
+                self.path(out, self.store.path(*path));
             }
             TypeBound::Lifetime(lifetime) => self.lifetime(out, *lifetime),
             TypeBound::Use(args) => {
                 out.kw("use").text("<");
-                for (at, arg) in args.iter().enumerate() {
+                for (at, arg) in self.store.use_args(*args).iter().enumerate() {
                     if at > 0 {
                         out.text(", ");
                     }
@@ -303,10 +314,10 @@ impl<'a> Sig<'a> {
         out.text(text);
     }
 
-    pub(crate) fn path(&self, out: &mut Code, path: &Path) {
+    pub(crate) fn path(&self, out: &mut Code, path: Path<'_>) {
         let db = self.db;
         if let Path::LangItem(target, name) = path {
-            let def: Option<ModuleDef> = match *target {
+            let def: Option<ModuleDef> = match target {
                 LangItemTarget::TraitId(it) => Some(ModuleDef::Trait(it.into())),
                 LangItemTarget::StructId(it) => Some(ModuleDef::Adt(hir::Adt::Struct(it.into()))),
                 LangItemTarget::EnumId(it) => Some(ModuleDef::Adt(hir::Adt::Enum(it.into()))),
@@ -397,7 +408,7 @@ impl<'a> Sig<'a> {
         }
     }
 
-    fn segment(&self, out: &mut Code, ns: TypeNs, name: &str, args: Option<&GenericArgs>) {
+    fn segment(&self, out: &mut Code, ns: TypeNs, name: &str, args: Option<GenericArgs<'_>>) {
         let db = self.db;
         let def: Option<ModuleDef> = match ns {
             TypeNs::AdtId(it) => Some(ModuleDef::Adt(it.into())),
@@ -454,12 +465,12 @@ impl<'a> Sig<'a> {
         }
     }
 
-    pub(crate) fn generic_args(&self, out: &mut Code, args: &GenericArgs) {
+    pub(crate) fn generic_args(&self, out: &mut Code, args: GenericArgs<'_>) {
         match args.parenthesized {
             GenericArgsParentheses::ParenSugar => {
                 out.text("(");
                 if let Some(GenericArg::Type(tuple)) = args.args.first() {
-                    match &self.store[*tuple] {
+                    match self.store.type_ref(*tuple) {
                         TypeRef::Tuple(items) => {
                             for (at, item) in items.iter().enumerate() {
                                 if at > 0 {
@@ -473,7 +484,7 @@ impl<'a> Sig<'a> {
                 }
                 out.text(")");
                 if let Some(ret) = args.bindings.first().and_then(|it| it.type_ref)
-                    && !matches!(&self.store[ret], TypeRef::Tuple(it) if it.is_empty())
+                    && !matches!(self.store.type_ref(ret), TypeRef::Tuple(it) if it.is_empty())
                 {
                     out.text(" -> ");
                     self.ty(out, ret);
@@ -510,7 +521,7 @@ impl<'a> Sig<'a> {
             }
             first = false;
             out.push(Piece::Plain(binding.name.as_str().to_owned()));
-            if let Some(args) = &binding.args {
+            if let Some(args) = binding.args {
                 self.generic_args(out, args);
             }
             if let Some(ty) = binding.type_ref {
@@ -619,7 +630,7 @@ impl<'a> Sig<'a> {
     }
 
     fn is_param(&self, target: TypeRefId, id: LocalTypeOrConstParamId) -> bool {
-        matches!(self.store[target], TypeRef::TypeParam(p) if p.local_id() == id)
+        matches!(self.store.type_ref(target), TypeRef::TypeParam(p) if p.local_id() == id)
     }
 
     /// The predicates that do not sit on a parameter, as `where` and one predicate to a line.
@@ -631,7 +642,7 @@ impl<'a> Sig<'a> {
             match pred {
                 WherePredicate::TypeBound { lifetimes, target, bound } => {
                     let inline = lifetimes.is_none()
-                        && match self.store[*target] {
+                        && match self.store.type_ref(*target) {
                             TypeRef::TypeParam(p) => {
                                 let data = &GenericParams::of(db, p.parent())[p.local_id()];
                                 // `impl Trait` arguments, trait `Self` and listed parameters
@@ -658,7 +669,7 @@ impl<'a> Sig<'a> {
                     let mut line = Code::default();
                     if let Some(lifetimes) = lifetimes {
                         line.kw("for").text("<");
-                        for (at, name) in lifetimes.iter().enumerate() {
+                        for (at, name) in self.store.names(*lifetimes).iter().enumerate() {
                             if at > 0 {
                                 line.text(", ");
                             }
@@ -809,7 +820,7 @@ pub(crate) fn function(
     }
     let mut ret = Code::default();
     if let Some(ret_ty) = return_type(data)
-        && !matches!(&data.store[ret_ty], TypeRef::Tuple(it) if it.is_empty())
+        && !matches!(data.store.type_ref(ret_ty), TypeRef::Tuple(it) if it.is_empty())
     {
         ret.text(" -> ");
         sig.ty(&mut ret, ret_ty);
@@ -846,9 +857,11 @@ fn return_type(data: &FunctionSignature) -> Option<TypeRefId> {
     if !data.is_async() && !data.is_gen() {
         return Some(ret);
     }
-    match &data.store[ret] {
+    match data.store.type_ref(ret) {
         TypeRef::ImplTrait(bounds) => match bounds.first() {
-            Some(TypeBound::Path(path, _)) => data.store[*path]
+            Some(TypeBound::Path(path, _)) => data
+                .store
+                .path(*path)
                 .segments()
                 .last()
                 .and_then(|it| it.args_and_bindings)
@@ -861,11 +874,11 @@ fn return_type(data: &FunctionSignature) -> Option<TypeRefId> {
 }
 
 fn self_param(sig: &Sig<'_>, out: &mut Code, ty: TypeRefId, store: &ExpressionStore) {
-    match &store[ty] {
+    match store.type_ref(ty) {
         TypeRef::Path(path) if path.is_self_type() => {
             out.kw("self");
         }
-        TypeRef::Reference(reference) if matches!(&store[reference.ty], TypeRef::Path(p) if p.is_self_type()) =>
+        TypeRef::Reference(reference) if matches!(store.type_ref(reference.ty), TypeRef::Path(p) if p.is_self_type()) =>
         {
             out.text("&");
             if let Some(lifetime) = reference.lifetime {
@@ -1194,7 +1207,7 @@ pub(crate) fn trait_header(
         .iter()
         .filter_map(|pred| match pred {
             WherePredicate::TypeBound { lifetimes: None, target, bound }
-                if matches!(data.store[*target], TypeRef::TypeParam(p)
+                if matches!(data.store.type_ref(*target), TypeRef::TypeParam(p)
                     if data.generic_params[p.local_id()].is_trait_self()) =>
             {
                 Some(bound)
@@ -1266,7 +1279,7 @@ pub(crate) fn aliased(
 ) -> Option<Aliased> {
     let id: TypeAliasId = it.into();
     let data = TypeAliasSignature::of(db, id);
-    let TypeRef::Path(path) = &data.store[data.ty?] else { return None };
+    let TypeRef::Path(path) = data.store.type_ref(data.ty?) else { return None };
     let sig = sig_of(db, places, &data.store, id.into());
     let TypeNs::AdtId(adt_id) = sig.resolver.resolve_path_in_type_ns_fully(db, path)? else {
         return None;
@@ -1432,7 +1445,7 @@ pub(crate) fn impl_header(db: &RootDatabase, places: Linking<'_>, it: hir::Impl)
         if data.is_negative() {
             out.text("!");
         }
-        sig.path(&mut out, &data.store[trait_ref.path]);
+        sig.path(&mut out, data.store.path(trait_ref.path));
         out.text(" ").kw("for").text(" ");
     }
     sig.ty(&mut out, data.self_ty);

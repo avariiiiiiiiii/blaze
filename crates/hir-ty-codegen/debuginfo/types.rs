@@ -40,15 +40,14 @@ use hir_ty::{
     layout::CoroutineFrame,
     layout::struct_tail_erasing_lifetimes,
     layout::{Layout, RustcFieldIdx},
-    mir::is_by_move_coroutine,
+    mir::{MirOwner, MirStage},
     next_solver::{
         DbInterner, GenericArgs, StoredTy, Ty, TyKind, TypingMode,
-        infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
-        obligation_ctxt::ObligationCtxt,
+        infer::{DbInternerInferExt, InferCtxt},
     },
     traits::StoredParamEnvAndCrate,
 };
-use hir_ty_mir::mir::type_name::rustc_debug_name;
+use hir_ty_mir::mir::{normalize_or_keep, type_name::rustc_debug_name};
 
 /// A type of the program, and how many more pointers are followed from it.
 pub(crate) type Key = (StoredTy, u32);
@@ -534,11 +533,7 @@ impl<'db> Types<'db> {
     /// The part of a type whose size is not known until the program runs: the type, or the
     /// last field of a struct or a tuple, down to one that is neither.
     fn tail(&self, of: Ty<'db>) -> Ty<'db> {
-        let normalize = |ty| {
-            ObligationCtxt::new(&self.infcx)
-                .structurally_normalize_ty(&ObligationCause::dummy(), self.env.param_env, ty)
-                .unwrap_or(ty)
-        };
+        let normalize = |ty| normalize_or_keep(&self.infcx, self.env.param_env, ty);
         struct_tail_erasing_lifetimes(self.db, of, &normalize)
     }
 
@@ -642,19 +637,11 @@ impl<'db> Types<'db> {
         let captured =
             self.captures(id.0.loc(self.db), args.tupled_upvars_ty(), offset_of, pointers);
         let parent_args = GenericArgs::new_from_slice(args.parent_args());
-        let body = match is_by_move_coroutine(self.db, id.0, args) {
-            true => self.db.monomorphized_runtime_mir_body_for_coroutine_by_move(
-                id.0,
-                parent_args.store(),
-                self.env.store(),
-            ),
-            false => self.db.monomorphized_runtime_mir_body_for_coroutine(
-                id.0,
-                parent_args.store(),
-                self.env.store(),
-            ),
-        }
-        .ok()?;
+        let owner = MirOwner::coroutine(self.db, id.0, args);
+        let body = self
+            .db
+            .monomorphized_mir(owner, MirStage::Runtime, parent_args.store(), self.env.store())
+            .ok()?;
         let held = body.locals_held_across_yields();
         let closure = id.0.loc(self.db);
         let store = ExpressionStore::of(self.db, closure.owner.expression_store_owner(self.db));
@@ -714,9 +701,7 @@ impl<'db> Types<'db> {
         if let Some(&normalized) = self.normalized.get(&ty) {
             return normalized;
         }
-        let normalized = ObligationCtxt::new(&self.infcx)
-            .structurally_normalize_ty(&ObligationCause::dummy(), self.env.param_env, ty)
-            .unwrap_or(ty);
+        let normalized = normalize_or_keep(&self.infcx, self.env.param_env, ty);
         self.normalized.insert(ty, normalized);
         normalized
     }

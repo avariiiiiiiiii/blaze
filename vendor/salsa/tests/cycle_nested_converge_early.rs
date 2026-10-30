@@ -2,6 +2,8 @@
 
 //! A nested cycle where the inner cycle (`query_b`) stops depending on the outer cycle (`query_a`) after one iteration.
 
+#![forbid(unsafe_code)]
+
 use crate::common::{ExecuteValidateLoggerDatabase, LogDatabase};
 use expect_test::expect;
 

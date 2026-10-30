@@ -11,9 +11,9 @@ the text of a span, which asks the database) is built by three daemons on one st
     `BLAZE_PROC_MACRO_CACHE=check`, which expands every call anyway: nothing may expand
     otherwise than it was kept.
 
-Each program has to print what cargo's does. The toolchain's proc-macro server answers no
-question of a macro (`source_text` is `None`, and nothing asked), so the program prints only
-that the text is not longer than rustc's `#`.
+Each program has to print what its source says (`printed`). The toolchain's proc-macro server
+answers no question of a macro (`source_text` is `None`, and nothing asked), so the program
+prints only that the text is not longer than the `#` it starts with.
 
     python3 expansions.py
 """
@@ -22,7 +22,7 @@ import os, re, shutil, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, TARGET_ARGS, built
+from mixed import Fixture, BLAZE, sysroot_rlibs, TARGET_ARGS
 from storelib import run, scratch
 
 STRUCTS = 40
@@ -122,6 +122,20 @@ def program():
     return "\n".join(lines)
 
 
+def printed(edited):
+    """What `program()` prints run with no arguments, before the edit `main` makes or after it."""
+    lines = []
+    for k in range(STRUCTS):
+        names = (["added"] if edited and k == 3 else []) + [f"f{j}" for j in range(k % 5 + 1)]
+        lines.append("[" + ", ".join(f'"{name}"' for name in names) + "]")
+    acc = 1
+    for k in range(TRACED):
+        lines.append(f"enter t{k}")
+        acc = acc * (7 if edited and k == 0 else k + 2) % 1_000_003
+    lines.append(f"{acc} true")
+    return "".join(line + "\n" for line in lines)
+
+
 def ran(binary):
     """What the program prints. Just linked, it can still be open in a process that forked as
     it was written (Linux says ETXTBSY), for a moment."""
@@ -155,17 +169,9 @@ def main():
     link = linkline.join(linkline.with_output(linkline.ahead(list(fx.link_args), [patch, obj], BLAZE), binary))
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     ask = ["--crate", "app", "--out", obj, "--patch", patch, "--link-cmd", link, "--binary", binary, *symbols]
-    reference = os.path.join(work, "reference")
-
-    def cargo():
-        build = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
-                               env={**os.environ, "CARGO_TARGET_DIR": reference})
-        assert build.returncode == 0, build.stderr[-2000:]
-        return run(built(reference, "app"))
-
-    def daemon(name, **env):
+    def daemon(name, edited=False, **env):
         log_path, socket = os.path.join(work, f"{name}.log"), os.path.join(work, f"{name}.sock")
-        want = cargo()
+        want = printed(edited)
         with open(log_path, "w") as out:
             proc = subprocess.Popen([BLAZE, ws, *TARGET_ARGS, "--socket", socket, *ask], stderr=out, stdout=out,
                                     env={**os.environ, "BLAZE_CACHE": store, **env})
@@ -177,7 +183,7 @@ def main():
             reply = subprocess.run([BLAZE, "sync", socket, *ask], capture_output=True, text=True, timeout=300)
             got = ran(binary)
             if got != want:
-                raise SystemExit(f"FAIL: the {name} daemon's program prints\n{got}\nand cargo's\n{want}\n"
+                raise SystemExit(f"FAIL: the {name} daemon's program prints\n{got}\nand the source says\n{want}\n"
                                  f"reply: {(reply.stdout + reply.stderr).strip()}\nlog: {log_path}")
         finally:
             proc.kill()
@@ -202,7 +208,7 @@ def main():
         text = open(main_rs).read()
         text = text.replace("struct S3 {\n", "struct S3 {\n    added: u8,\n", 1).replace("    x * 2\n", "    x * 7\n", 1)
         open(main_rs, "w").write(text)
-        third, _, found = daemon("third", BLAZE_PROC_MACRO_CACHE="check")
+        third, _, found = daemon("third", edited=True, BLAZE_PROC_MACRO_CACHE="check")
         if "expanded otherwise" in third or found < kept - 2:
             raise SystemExit(f"FAIL: under check, {found} were found again of {kept}, or one expanded otherwise "
                              f"than it was kept: {work}/third.log")

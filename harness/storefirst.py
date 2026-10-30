@@ -11,7 +11,7 @@ it has answered, it compiles all of that again by itself, while nothing waits. T
     compiles it again;
   - that build has to be over within a minute, with nobody asking for it;
   - the edit after it has to be spliced, not linked in full;
-  - the program has to print what cargo's does after the second daemon's first build, after
+  - the program has to print what blaze's build from nothing does after the second daemon's first build, after
     the build it did by itself, and after the edit.
 
     python3 storefirst.py

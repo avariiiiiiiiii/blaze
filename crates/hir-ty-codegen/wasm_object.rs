@@ -539,7 +539,7 @@ impl Writer {
     fn fixup(&mut self, fixup: Reloc) {
         let place = &mut self.code[fixup.offset as usize..][..INDEX_LEN];
         let value = if fixup.ty == RelocType::TypeIndexLeb { fixup.index } else { 0 };
-        write_padded(place, value);
+        place.copy_from_slice(&blaze_format::leb::padded_u32(value));
         self.code_relocs.push(fixup);
     }
 
@@ -645,15 +645,6 @@ fn flags(symbol: &object::Symbol<'_, '_>) -> u32 {
         flags |= VISIBILITY_HIDDEN;
     }
     flags
-}
-
-/// Writes `value` as a LEB128 that fills `place`.
-fn write_padded(place: &mut [u8], mut value: u32) {
-    let last = place.len() - 1;
-    for (at, byte) in place.iter_mut().enumerate() {
-        *byte = (value & 0x7f) as u8 | if at == last { 0 } else { 0x80 };
-        value >>= 7;
-    }
 }
 
 #[cfg(test)]

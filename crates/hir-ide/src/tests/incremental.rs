@@ -294,7 +294,7 @@ pub struct NewStruct {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 0), ("TraitImpls < 'db >::for_module_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 0), ("trait_bodies", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -369,7 +369,7 @@ pub enum SomeEnum {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 0), ("TraitImpls < 'db >::for_module_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 0), ("trait_bodies", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -441,7 +441,7 @@ fn bar() -> f32 {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 0), ("TraitImpls < 'db >::for_module_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 0), ("trait_bodies", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -526,7 +526,7 @@ impl SomeStruct {
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[("TraitImpls < 'db >::for_crate_", 0), ("TraitImpls < 'db >::for_module_", 1)],
+        &[("TraitImpls < 'db >::for_crate_", 0), ("trait_bodies", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",

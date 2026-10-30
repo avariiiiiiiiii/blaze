@@ -25,6 +25,7 @@ pub(super) use cleanup::remove_noop_landing_pads;
 use std::cell::RefCell;
 
 use base_db::{Db, Crate};
+use blaze_hashcons::Interned;
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{DefWithBodyId, HasModule, attrs::AttrFlags, expr_store::Body};
 use rustc_ast_ir::Mutability;
@@ -138,7 +139,10 @@ impl<'f, 'db> Ctx<'f, 'db> {
     }
 
     /// The layout of `ty`, if it is known where the body is generic.
-    pub(super) fn layout_of(&self, ty: Ty<'db>) -> Option<triomphe::Arc<crate::layout::Layout>> {
+    pub(super) fn layout_of(
+        &self,
+        ty: Ty<'db>,
+    ) -> Option<Interned<'static, crate::layout::InternedLayout>> {
         let env = ParamEnvAndCrate { param_env: self.env, krate: self.krate };
         self.db.layout_of_ty(ty.store(), env.store()).ok()
     }

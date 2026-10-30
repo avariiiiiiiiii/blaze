@@ -51,6 +51,7 @@
 
 use std::fmt;
 
+use blaze_bytes::le::{u16 as u16_at, u32 as u32_at};
 use blaze_ids::bits::BitSet;
 
 use crate::{enc::Form, shape::Shape};
@@ -276,20 +277,6 @@ impl<'a> Stencil<'a> {
         let code: &'a [u8] = self.code;
         &code[..code.len() - usize::from(self.tail)]
     }
-}
-
-#[inline]
-fn u16_at(bytes: &[u8], at: usize) -> u16 {
-    let mut half = [0; 2];
-    half.copy_from_slice(&bytes[at..at + 2]);
-    u16::from_le_bytes(half)
-}
-
-#[inline]
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    let mut word = [0; 4];
-    word.copy_from_slice(&bytes[at..at + 4]);
-    u32::from_le_bytes(word)
 }
 
 /// A stencil row's last word: its first fault (low 24 bits) and how many (high 8).

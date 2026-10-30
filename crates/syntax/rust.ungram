@@ -691,6 +691,7 @@ Type =
 | RefType
 | SliceType
 | TupleType
+| UnsafeBinderType
 
 ParenType =
   '(' Type ')'
@@ -727,6 +728,10 @@ FnPtrType =
 
 ForType =
   ForBinder Type
+
+// `unsafe<'a> T`, `#![feature(unsafe_binders)]`.
+UnsafeBinderType =
+  'unsafe' GenericParamList Type
 
 PatternType =
   'builtin' '#' 'pattern_type' '(' Type 'is' Pat ')'

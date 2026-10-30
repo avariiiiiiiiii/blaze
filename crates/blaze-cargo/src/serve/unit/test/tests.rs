@@ -167,14 +167,14 @@ fn a_kept_pass_is_reported_cached() {
     use blaze_api::{Basis, TestOutcome};
 
     let kept = Cached { took: Duration::from_micros(9_999), basis: blaze_testsel::Basis::Executed };
-    let result = super::cached("tests/parse", 3, "parse::nested", &kept);
+    let result = blaze_testsel::api::result("tests/parse", 3, "parse::nested", &kept);
     assert_eq!((result.outcome, result.millis, result.output.len()), (TestOutcome::Unreached, 0, 0));
     assert_eq!((result.executable, result.outside), (3, false));
     assert_eq!((result.binary.as_str(), result.name.as_str()), ("tests/parse", "parse::nested"));
     let cached = result.cached.expect("a kept pass is cached");
     assert_eq!((cached.outcome, cached.millis, cached.basis), (TestOutcome::Passed, 9, Basis::Executed));
     let reached = Cached { took: Duration::ZERO, basis: blaze_testsel::Basis::Reached { why: "killed".to_owned() } };
-    let cached = super::cached("a", 0, "b", &reached).cached.expect("a kept pass is cached");
+    let cached = blaze_testsel::api::result("a", 0, "b", &reached).cached.expect("a kept pass is cached");
     assert_eq!((cached.millis, cached.basis), (0, Basis::Reached { why: "killed".to_owned() }));
 }
 

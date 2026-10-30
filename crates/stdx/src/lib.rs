@@ -8,6 +8,9 @@ use std::{cmp::Ordering, ops, time::Instant};
 mod macros;
 
 pub mod assert;
+pub mod edit_distance;
+pub mod lend;
+pub mod list;
 pub mod non_empty_vec;
 pub mod panic_context;
 pub mod process;
@@ -18,6 +21,7 @@ pub mod time;
 pub mod variance;
 
 pub use itertools;
+pub use lend::lend;
 
 #[inline(always)]
 pub const fn is_ci() -> bool {
@@ -41,6 +45,16 @@ pub fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
 
 pub fn hash_once<Hasher: std::hash::Hasher + Default>(thing: impl std::hash::Hash) -> u64 {
     std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<Hasher>::default(), thing)
+}
+
+/// The text a panic was raised with, as `catch_unwind` or a joined thread hands its payload:
+/// `panic!`'s `&'static str` or formatted `String`. `None` for any other payload.
+// dyn: a panic's payload, read once per panic caught
+pub fn panic_text(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    match payload.downcast_ref::<&'static str>() {
+        Some(text) => Some(text),
+        None => payload.downcast_ref::<String>().map(String::as_str),
+    }
 }
 
 #[must_use]
@@ -474,5 +488,26 @@ mod tests {
         test_replace("a.b.c", '.', "😀😀", "a😀😀b😀😀c");
         test_replace(".a.b.c.", '.', "()", "()a()b()c()");
         test_replace(".a.b.c.", '.', "", "abc");
+    }
+
+    #[test]
+    fn panic_text_is_the_copies_it_replaced() {
+        // blaze-engine's and hir-ty-codegen's copy, which looked for a `String` first.
+        fn kept(panic: &(dyn std::any::Any + Send)) -> Option<&str> {
+            panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied())
+        }
+        let payloads: [Box<dyn std::any::Any + Send>; 6] = [
+            Box::new("static text"),
+            Box::new(String::from("formatted 7")),
+            Box::new(String::new()),
+            Box::new(7u32),
+            Box::new(Box::new("boxed") as Box<dyn std::any::Any + Send>),
+            Box::new(()),
+        ];
+        for payload in &payloads {
+            assert_eq!(panic_text(&**payload), kept(&**payload));
+        }
+        let caught = std::panic::catch_unwind(|| -> u8 { panic!("caught {}", 7) }).unwrap_err();
+        assert_eq!(panic_text(&*caught), Some("caught 7"));
     }
 }

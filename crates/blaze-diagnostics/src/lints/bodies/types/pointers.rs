@@ -49,14 +49,14 @@ pub(super) fn source_callsite(span: Span) -> Span {
 
 /// The type `expr` was inferred as, before and after its adjustments, as `hir` gives it to be
 /// printed.
-pub(super) fn type_info<'db>(b: &BodyCx<'_, 'db>, expr: ExprId) -> Option<hir::TypeInfo<'db>> {
+pub(super) fn type_info<'db>(b: &BodyCx<'_, '_, 'db>, expr: ExprId) -> Option<hir::TypeInfo<'db>> {
     let node = util::syntax(b, expr)?;
     let expr = ast::Expr::cast(node.value)?;
     b.cx.vsema.type_of_expr(expr)
 }
 
 /// rustc's printing of the type `expr` was inferred as (`expr_ty`).
-pub(super) fn ty_text(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<String> {
+pub(super) fn ty_text(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<String> {
     Some(b.cx.ty(&type_info(b, expr)?.original))
 }
 
@@ -75,7 +75,7 @@ pub(super) fn has_attr(db: &Db, def: FunctionId, name: &str) -> bool {
 }
 
 /// The diagnostic item of the method `expr` calls, if it is a method call of one.
-pub(super) fn method_item(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Symbol> {
+pub(super) fn method_item(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Symbol> {
     util::fn_item(b.db(), util::method_fn(b, expr)?)
 }
 
@@ -89,7 +89,7 @@ pub(super) struct LayoutFacts {
 }
 
 /// rustc's `layout_of` of `ty`, when it can be computed (not of a type parameter's size).
-pub(super) fn layout<'db>(b: &BodyCx<'_, 'db>, ty: Ty<'db>) -> Option<LayoutFacts> {
+pub(super) fn layout<'db>(b: &BodyCx<'_, '_, 'db>, ty: Ty<'db>) -> Option<LayoutFacts> {
     let db = b.db();
     let env = ParamEnvAndCrate { param_env: db.trait_environment(b.owner.generic_def(db)), krate: b.owner.krate(db) };
     let layout = db.layout_of_ty(ty.store(), env.store()).ok()?;
@@ -102,7 +102,7 @@ pub(super) fn layout<'db>(b: &BodyCx<'_, 'db>, ty: Ty<'db>) -> Option<LayoutFact
 }
 
 /// Whether `expr` is the integer literal `0` (rustc's `LitKind::Int(0, _)`).
-pub(super) fn is_zero(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+pub(super) fn is_zero(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     matches!(util::literal(b, expr), Some(Literal::Int(0, _) | Literal::Uint(0, _)))
 }
 
@@ -117,7 +117,7 @@ pub(super) struct Inits {
 }
 
 impl Inits {
-    pub(super) fn of(&mut self, b: &BodyCx<'_, '_>) -> &FxHashMap<BindingId, ExprId> {
+    pub(super) fn of(&mut self, b: &BodyCx<'_, '_, '_>) -> &FxHashMap<BindingId, ExprId> {
         if self.owner != Some(b.owner) {
             self.owner = Some(b.owner);
             self.map.clear();
@@ -152,7 +152,7 @@ impl Inits {
 
 /// rustc's `LateContext::expr_or_init`: through blocks, and from a path to a local binding to
 /// what initialized it, while there is one.
-pub(super) fn expr_or_init(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: ExprId) -> ExprId {
+pub(super) fn expr_or_init(b: &BodyCx<'_, '_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: ExprId) -> ExprId {
     let mut expr = util::peel_blocks(b, expr);
     while let Expr::Path(_) = b.store().expr(expr)
         && let Some(ValueNs::LocalBinding(id)) = util::path_value(b, expr)
@@ -166,7 +166,7 @@ pub(super) fn expr_or_init(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, Expr
 /// rustc's `peel_casts`: through blocks, `as` casts, `.cast()`, `.cast_mut()`, `.cast_const()`,
 /// `ptr::from_ref`, `UnsafeCell::raw_get`, `mem::transmute` and the initializers of local
 /// bindings, to the expression the pointer comes from.
-pub(super) fn peel_casts(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: ExprId) -> ExprId {
+pub(super) fn peel_casts(b: &BodyCx<'_, '_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: ExprId) -> ExprId {
     let mut e = expr;
     loop {
         e = util::peel_blocks(b, e);
@@ -204,7 +204,7 @@ pub(super) fn peel_casts(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, ExprId
 
 /// The diagnostic item the callee `callee` names when it is a path (rustc's `qpath_res` of
 /// it, `get_diagnostic_name`).
-pub(super) fn callee_item(b: &BodyCx<'_, '_>, callee: ExprId) -> Option<Symbol> {
+pub(super) fn callee_item(b: &BodyCx<'_, '_, '_>, callee: ExprId) -> Option<Symbol> {
     match b.store().expr(callee) {
         Expr::Path(_) => util::path_item(b, callee),
         _ => None,
@@ -212,7 +212,7 @@ pub(super) fn callee_item(b: &BodyCx<'_, '_>, callee: ExprId) -> Option<Symbol> 
 }
 
 /// The function the callee `callee` names when it is a path.
-pub(super) fn callee_fn(b: &BodyCx<'_, '_>, callee: ExprId) -> Option<FunctionId> {
+pub(super) fn callee_fn(b: &BodyCx<'_, '_, '_>, callee: ExprId) -> Option<FunctionId> {
     match b.store().expr(callee) {
         Expr::Path(_) => match util::path_value(b, callee)? {
             ValueNs::FunctionId(it) => Some(it),
@@ -223,7 +223,7 @@ pub(super) fn callee_fn(b: &BodyCx<'_, '_>, callee: ExprId) -> Option<FunctionId
 }
 
 /// rustc's `def_span` of a function: its signature, as rustc shows it.
-pub(super) fn fn_def_span(b: &BodyCx<'_, '_>, def: FunctionId) -> Span {
+pub(super) fn fn_def_span(b: &BodyCx<'_, '_, '_>, def: FunctionId) -> Span {
     let source = def.lookup(b.db()).source_view(b.db());
     let range = crate::cx::signature_range_view(source.value);
     b.cx.span(InFile::new(source.file_id, range))

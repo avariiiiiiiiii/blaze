@@ -12,8 +12,9 @@ use test_fixture::WithFixture;
 
 use super::{TestDB, edit, item, single};
 use crate::{
-    Fact, ItemId, ScopeEntry, ScopeIndexKey, captures, code, const_value, drop_check, implements,
-    item_key, key, method, name, scope, signature, value, vtable,
+    Fact, ItemId, ScopeEntry, ScopeIndexKey, captures, code, const_value, const_value_of_static,
+    discriminant, drop_check, hidden_types, implements, item_key, key, method, name, scope,
+    signature, value, vtable,
 };
 
 #[track_caller]
@@ -403,6 +404,78 @@ fn a_type_and_a_const_of_one_name_are_one_run() {
     assert!(items.is_sorted_by_key(|&(key, _)| key));
     assert!(matches!(at("f"), ScopeEntry::Assoc(items) if items.len() == 1));
     assert_eq!(at("g"), ScopeEntry::Nothing);
+}
+
+const HIDDEN: &str = r#"
+pub trait Tr {}
+pub struct A;
+pub struct B;
+impl Tr for A {}
+impl Tr for B {}
+pub fn f() -> impl Tr { A }
+"#;
+
+#[test]
+fn a_hidden_type_is_its_own_fact_and_not_the_signature() {
+    let (mut db, file) = single(HIDDEN);
+    let ItemId::Function(func) = item(&db, "f") else { panic!("`f` is no fn") };
+    let facts = [signature(&db, func), hidden_types(&db, ItemId::Function(func))];
+    let before = facts.map(|it| val(&db, it));
+    edit(&mut db, file, &HIDDEN.replace("{ A }", "{ let _x = 0u8; A }"));
+    assert_eq!(facts.map(|it| val(&db, it)), before, "the same hidden type");
+    edit(&mut db, file, &HIDDEN.replace("{ A }", "{ B }"));
+    let after = facts.map(|it| val(&db, it));
+    assert_eq!(after[0], before[0], "the signature leaves the hidden type out");
+    assert_ne!(after[1], before[1], "the hidden type is `B` now");
+}
+
+const LEAKS_OF_IMPLS: &str = r#"
+pub trait Tr { const C: u8; }
+pub struct A;
+impl Tr for A { const C: u8 = 1; }
+impl A { pub const fn m() -> u8 { 1 } }
+"#;
+
+#[test]
+fn what_an_impls_items_leak_keeps_its_impl_facts() {
+    let (mut db, file) = single(LEAKS_OF_IMPLS);
+    let ty = HirSimplifiedType::Adt(adt(&db, "A").into());
+    let m = hir_expand::name::Name::new_symbol_root(intern::Symbol::intern("m"));
+    let facts = [implements_of(&db, "Tr", "A"), method(&db, &ty, &m)];
+    let before = facts.map(|it| val(&db, it));
+    edit(&mut db, file, &LEAKS_OF_IMPLS.replace("= 1;", "= 2;").replace("{ 1 }", "{ 2 }"));
+    assert_eq!(facts.map(|it| val(&db, it)), before, "a const's and a const fn's bodies");
+    edit(&mut db, file, &LEAKS_OF_IMPLS.replace("-> u8 { 1 }", "-> u16 { 1 }"));
+    let after = facts.map(|it| val(&db, it));
+    assert_eq!(after[0], before[0], "`Tr for A` is what it was");
+    assert_ne!(after[1], before[1], "`m` returns another type");
+}
+
+const VALUES: &str = r#"
+pub static S: u32 = 1 + 1;
+pub enum E { A = 1 + 1, B }
+"#;
+
+#[test]
+fn a_statics_and_a_discriminants_value_is_a_const_value() {
+    let (mut db, file) = single(VALUES);
+    let ItemId::Static(it) = item(&db, "S") else { panic!("`S` is no static") };
+    let AdtId::EnumId(e) = adt(&db, "E") else { panic!("`E` is no enum") };
+    let variants: Vec<_> = e.enum_variants(&db).variants.values().map(|&(it, _)| it).collect();
+    let facts = [
+        const_value_of_static(&db, it),
+        discriminant(&db, variants[0]),
+        discriminant(&db, variants[1]),
+    ];
+    let before = facts.map(|it| val(&db, it));
+    assert_ne!(before[1], before[2], "`A` is 2, `B` is 3");
+    edit(&mut db, file, &VALUES.replace("1 + 1", "2"));
+    assert_eq!(facts.map(|it| val(&db, it)), before, "the same values");
+    edit(&mut db, file, &VALUES.replace("1 + 1", "5"));
+    let after = facts.map(|it| val(&db, it));
+    for at in 0..3 {
+        assert_ne!(after[at], before[at], "{:?}", facts[at]);
+    }
 }
 
 #[test]

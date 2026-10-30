@@ -2,6 +2,8 @@
 
 //! Test that debug and non-debug structs compile correctly
 
+#![forbid(unsafe_code)]
+
 #[derive(Ord, PartialOrd, Eq, PartialEq, Copy, Clone, Hash, salsa::SalsaValue)]
 struct NotDebug;
 #[derive(Ord, PartialOrd, Eq, PartialEq, Copy, Clone, Hash, Debug, salsa::SalsaValue)]

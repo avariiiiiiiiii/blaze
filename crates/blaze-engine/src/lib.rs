@@ -17,6 +17,7 @@ use blaze_cargo::{
 
 mod as_rustc;
 mod borrowck;
+mod callers;
 mod check;
 mod consteval;
 mod content;
@@ -3338,15 +3339,12 @@ fn harnesses<'a>(
 
 /// Gives the files the texts [`harnesses`] wrote. The files.
 fn write_harnesses(db: &mut RootDatabase, texts: Vec<(vfs::FileId, String)>) -> Vec<vfs::FileId> {
-    use ide_db::base_db::salsa::{Durability, Setter as _};
+    use ide_db::base_db::salsa::Durability;
     for (file, text) in &texts {
         db.set_file_text_with_durability(*file, text, Durability::LOW);
         // What the crate's `#![cfg]` leaves of a root it takes away.
         let module = test_harness::appended(text);
-        let input = db.file_text(*file);
-        if input.appended_root_module(db) != module {
-            input.set_appended_root_module(db).with_durability(Durability::LOW).to(module);
-        }
+        db.set_appended_root_module(*file, module, Durability::LOW);
     }
     prepare_macro_sessions(db);
     texts.into_iter().map(|it| it.0).collect()
@@ -3702,8 +3700,10 @@ fn home_in_rustcs(
         let found: Vec<_> = found
             .into_iter()
             .map(|(file, functions, statics)| {
-                let callers =
-                    if homing(file) { callers_of_generic(db, &functions) } else { vec![] };
+                let callers = match homing(file) {
+                    true => callers::callers_of_generic(db, &functions),
+                    false => vec![],
+                };
                 (file, functions, statics, callers)
             })
             .collect();
@@ -3735,64 +3735,6 @@ fn home_in_rustcs(
         }
     });
 }
-
-/// The functions written elsewhere that call the generic functions among `functions`, or call
-/// a generic one that does, as far as [`CALLERS_SEARCHED`] and [`CALLERS_COMPILED`] go: rustc
-/// copied those into them. A method of a trait's impl is called through the trait's method as
-/// well. A call outside a function's body is left out, as are the callers past the bound; the
-/// copies they have are then ones no patch is known to reach.
-fn callers_of_generic(db: &RootDatabase, functions: &[FunctionId]) -> Vec<FunctionId> {
-    let sema = hir::Semantics::new(db);
-    let of_trait = |func: FunctionId| {
-        let container = hir::Function::from(func).as_assoc_item(db).map(|it| it.container(db));
-        matches!(container, Some(hir::AssocItemContainer::Trait(_)))
-    };
-    let named = |func: FunctionId| {
-        let func = hir::Function::from(func);
-        let trait_ = func.as_assoc_item(db).and_then(|it| it.implemented_trait(db));
-        std::iter::once(func).chain(trait_.and_then(|it| it.function(db, func.name(db))))
-    };
-    let mut seen: FxHashSet<FunctionId> = functions.iter().copied().collect();
-    let mut queue: Vec<FunctionId> = functions
-        .iter()
-        .copied()
-        .filter(|&it| !of_trait(it) && hir_ty_codegen::copied_by_rustc(db, it))
-        .collect();
-    let (mut callers, mut searched) = (Vec::new(), 0);
-    while let Some(func) = queue.pop() {
-        searched += 1;
-        if searched > CALLERS_SEARCHED || callers.len() > CALLERS_COMPILED {
-            break;
-        }
-        let usages =
-            named(func).flat_map(|it| ide_db::defs::Definition::Function(it).usages(&sema).all());
-        for reference in usages.flat_map(|(_, references)| references) {
-            if reference.category.contains(ide_db::search::ReferenceCategory::IMPORT) {
-                continue;
-            }
-            let ide_db::search::FileReferenceNode::NameRef(name) = reference.name else { continue };
-            let name = syntax::AstNode::syntax(&name);
-            let caller = sema.ancestors_with_macros(name.clone()).find_map(syntax::ast::Fn::cast);
-            let caller = caller.and_then(|it| sema.to_def(&it));
-            let Some(caller) = caller.and_then(|it| FunctionId::try_from(it).ok()) else {
-                continue;
-            };
-            if !seen.insert(caller) {
-                continue;
-            }
-            callers.push(caller);
-            if hir_ty_codegen::copied_by_rustc(db, caller) {
-                queue.push(caller);
-            }
-        }
-    }
-    callers
-}
-
-/// How many generic functions [`callers_of_generic`] finds the callers of, and about how many
-/// callers it finds, which are compiled before the edit.
-const CALLERS_SEARCHED: usize = 16;
-const CALLERS_COMPILED: usize = 512;
 
 /// Whether the executable `program`'s edits patch has no copy of the functions written in
 /// `file` with one of the `names`, which rustc would have copied into each crate that calls
@@ -5798,8 +5740,8 @@ fn broken_in(
                             loop {
                                 let at = next.fetch_add(1, Ordering::Relaxed);
                                 let Some(&krate) = crates.get(at) else { break };
-                                let krate = hir::Crate::from(krate);
                                 counting.on(part, || crate_shown(db, krate));
+                                let krate = hir::Crate::from(krate);
                                 let diags = blaze_diagnostics::check_crate(db, krate, files, options);
                                 counting.done(part);
                                 done.push((at, diags));
@@ -5836,16 +5778,6 @@ fn broken_in(
     }
     let said = said_of(db, &by_crate, &paths, files);
     (!said.0.is_empty()).then_some(said)
-}
-
-/// How a crate is named while it is checked: its name, else its root file.
-fn crate_shown(db: &RootDatabase, krate: Crate) -> String {
-    match krate.display_name(db) {
-        // alloc: a line of progress a crate, only where more than one is checked
-        Some(name) => name.crate_name().to_string(),
-        // alloc: as above
-        None => format!("{:?}", krate.root_file(db)),
-    }
 }
 
 /// The errors of each crate's diagnostics, in order, as a verdict says them: rustc's text of
@@ -7732,7 +7664,7 @@ impl Held {
         let asked = ["--crate", "blaze_spare", "--out", "none"].map(str::to_owned);
         let asked = std::iter::once(dir.display().to_string()).chain(asked);
         let args = Args::parse(asked)?;
-        held_wide();
+        held_wide()?;
         // An empty package has no build script, and asking cargo for one waits for the lock
         // of the target directory, which a build that started beside this holds until it ends.
         let scriptless = LoadCargoConfig { load_out_dirs_from_check: false, ..load_config() };
@@ -8143,8 +8075,8 @@ fn spare(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// What is said once for the process about how every workspace is read.
-fn process_wide() {
-    held_wide();
+fn process_wide() -> anyhow::Result<()> {
+    held_wide()?;
     // Which proc-macro server expands is read from the build's variables, which a spare is
     // told after it loaded the library ([`held_wide`]), and is kept from then on.
     let server = cargo::own_macro::server();
@@ -8172,17 +8104,24 @@ fn process_wide() {
             made.into_iter().map(|it| it?.map(path).transpose()).collect()
         });
     }
+    Ok(())
 }
 
 /// What of [`process_wide`] a spare says before it is told its build: nothing that depends
 /// on the build's variables.
-fn held_wide() {
+fn held_wide() -> anyhow::Result<()> {
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
-    blaze_expand::install();
+    // Once a process, which a spare reaches twice: while it loads and when told its build.
+    static UNKEPT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    UNKEPT
+        .get_or_init(blaze_expand::install_unkept)
+        .as_ref()
+        .map_err(|why| anyhow::anyhow!("wrapping the proc-macro expanders: {why}"))?;
     load_cargo::wasm_macros_with(blaze_macro_wasm::load);
     // Every proc-macro server is started in the sandbox.
     macro_sandbox::install();
+    Ok(())
 }
 
 /// Loads the workspace `args` names and builds what they ask for, then serves it when they
@@ -8222,7 +8161,7 @@ fn run_holding(
     if backend != Backend::Cranelift {
         eprintln!("backend: {backend}");
     }
-    process_wide();
+    process_wide()?;
     if args.socket.is_some() || args.watch {
         hir_ty_codegen::builds_edits();
     }
@@ -10190,11 +10129,7 @@ struct Edit {
 /// What a panic said, from what it unwound with.
 // dyn: a panic payload
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
-    panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .unwrap_or("no message")
+    stdx::panic_text(panic).unwrap_or("no message")
 }
 
 impl Program {

@@ -1,8 +1,12 @@
 //! A mapped image, read in place: [`Image::open`] reads only the spine, and each group is checked
 //! by its CRC32C the first time a read reaches it.
 
-use std::{ops::Range, sync::atomic::Ordering::Relaxed};
+use std::{
+    ops::Range,
+    sync::{Arc, atomic::Ordering::Relaxed},
+};
 
+use blaze_bytes::Bytes;
 use blaze_format::{Record, SchemaHash};
 use blaze_ids::{ContentId, bits::AtomicBits, crc32c::crc32c};
 
@@ -234,6 +238,25 @@ impl<S: Stable> Image<S> {
         Ok(start..start + bytes.len())
     }
 
+    /// All of `section`, every group checked, as [`Bytes`] that keep the image alive: for an
+    /// owner that keeps a section's bytes past a borrow of the image (the library syntax trees,
+    /// salsa's graph), with no mapping layer of its own. They start 8-aligned, so 8-byte records
+    /// read in place; an owner whose bytes don't place them so is refused as `Misaligned`.
+    pub fn whole_bytes(self: &Arc<Self>, section: &Section) -> Result<Bytes, Corrupt> {
+        let whole = self.whole(section)?;
+        if whole.is_empty() {
+            return Ok(Bytes::default());
+        }
+        if !whole.as_ptr().addr().is_multiple_of(8) {
+            return Err(Corrupt { section: section.id, group: 0, cause: Cause::Misaligned { at: 0, align: 8 } });
+        }
+        let bytes: *const [u8] = whole;
+        // SAFETY: the bytes are `self.owner`'s, which `Stable` keeps at one address and
+        // unwritten for as long as the owner lives; the owner lives as long as the image, and
+        // the `Bytes` hold the image's `Arc` for as long as they lend them.
+        Ok(unsafe { Bytes::held(bytes, Arc::clone(self) as Arc<dyn Send + Sync>) })
+    }
+
     /// Every group of every section checked now: each one that fails, in order. On this thread:
     /// for tests and a check by hand. A whole-image check on the daemon's path is
     /// [`Image::check`] over chunks of groups on its pool.
@@ -263,12 +286,12 @@ impl<S: Stable> Image<S> {
         if self.checked.contains(bit_of(u64::from(section.first + group)), Relaxed) {
             return Ok(());
         }
-        self.check(section, group)
+        self.check_group(section, group)
     }
 
     #[cold]
     #[inline(never)]
-    fn check(&self, section: &Section, group: u32) -> Result<(), Corrupt> {
+    fn check_group(&self, section: &Section, group: u32) -> Result<(), Corrupt> {
         let global = section.first + group;
         let corrupt = |cause| Corrupt { section: section.id, group, cause };
         let wanted = self.table_entry(global).map_err(corrupt)?;

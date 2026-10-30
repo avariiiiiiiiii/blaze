@@ -51,6 +51,7 @@ pub mod assoc;
 pub mod attr_resolution;
 #[cfg(test)]
 mod collector;
+pub mod delta;
 pub mod demand;
 pub mod diagnostics;
 mod facts;
@@ -128,6 +129,7 @@ pub static EXPAND_BUILTIN_DERIVES: std::sync::atomic::AtomicBool =
 /// thread of the plane sees it, and setting it reruns what it changes.
 #[salsa::input(singleton, debug)]
 pub struct BuiltinDerives {
+    #[returns(copy)]
     pub expand: bool,
 }
 
@@ -257,7 +259,7 @@ pub struct DefMap {
     /// `derive_helpers_in_scope` move to when collection is done, leaving them empty: a `use` or a
     /// derive added changes the records and leaves this value equal, so what reads the `DefMap`
     /// (every resolver, every solver) is not run again for it.
-    records: Option<salsa::Id>,
+    records: Option<RecordsSlot>,
 
     /// The crate data that is shared between a crate's def map and all its block def maps.
     data: Arc<DefMapCrateData>,
@@ -274,6 +276,14 @@ struct HeldRecords<'db> {
     #[tracked]
     #[returns(ref)]
     records: OwnedRecords,
+}
+
+/// Where a handed-over def map's records are: a block's `HeldRecords`, or a crate's
+/// `delta::CrateResolution`, which the name resolution maintainer sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordsSlot {
+    Held(salsa::Id),
+    Published(salsa::Id),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -544,8 +554,10 @@ impl ModulesSlot {
     /// The modules of a `DefMap` that is being collected.
     fn building(&mut self) -> &mut ModulesMap {
         match self {
-            ModulesSlot::Building(modules) | ModulesSlot::Unit { own: modules, .. } => modules,
-            ModulesSlot::Collected(_) => {
+            ModulesSlot::Building(modules)
+            | ModulesSlot::Unit { own: modules, .. }
+            | ModulesSlot::Maintained { own: modules, .. } => modules,
+            ModulesSlot::Collected(_) | ModulesSlot::Published(_) => {
                 panic!("the modules of a collected `DefMap` are read-only")
             }
         }
@@ -561,6 +573,13 @@ enum ModulesSlot {
     /// A view of the per-module resolver (`facts`): the modules it holds, and every other
     /// module of its crate read through `facts::row` of `rows` (a `facts` `RowsKey`).
     Unit { own: ModulesMap, rows: salsa::Id },
+    /// A view of the name resolution maintainer (`delta`): the modules its run holds, and every
+    /// other module of the crate as the maintainer's state has it. Every read is noted
+    /// (`delta::reads`) with its reader: it is what wakes that reader again when the module
+    /// changes.
+    Maintained { own: ModulesMap, outside: ModulesMap },
+    /// A crate's modules as the maintainer published them: `delta::CrateResolution::modules`.
+    Published(salsa::Id),
 }
 
 /// The items of one module, held by the database on their own. A query that reads the scope of
@@ -615,13 +634,15 @@ enum ScopeSlot {
     Collected(salsa::Id),
     /// The `ModuleScope` a resolver fact names (a `facts` `ScopeRef`), looked up on first read.
     Fact(salsa::Id),
+    /// The module's scope as the name resolution maintainer published it (`delta::ScopeInput`).
+    Input(salsa::Id),
 }
 
 impl ScopeSlot {
     /// The `ModuleScope` of a handed-over or fact slot.
     fn handle(&self, db: &Db) -> Option<salsa::Id> {
         match self {
-            ScopeSlot::Building(_) => None,
+            ScopeSlot::Building(_) | ScopeSlot::Input(_) => None,
             ScopeSlot::Collected(id) => Some(*id),
             ScopeSlot::Fact(fact) => Some(facts::fact_scope(db, *fact)),
         }
@@ -637,7 +658,7 @@ pub fn crate_def_map(db: &Db, crate_id: Crate) -> &DefMap {
 
 /// The recursion limit of `krate` (`#![recursion_limit]`, 128 by default): what the solver
 /// reads of the def map, so that it depends on that alone.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub fn crate_recursion_limit(db: &Db, krate: Crate) -> u32 {
     crate_def_map(db, krate).recursion_limit()
 }
@@ -649,7 +670,7 @@ pub fn crate_recursion_limit(db: &Db, krate: Crate) -> u32 {
 /// that primitive type, unless a generic parameter or a block scope around the path has the
 /// name: blocks are not counted (each has its own def map), nor are generic parameters, so a
 /// caller checks those itself.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub fn crate_shadows_primitive_type(db: &Db, krate: Crate) -> bool {
     let pair = crate_local_def_map(db, krate);
     let def_map = pair.def_map(db);
@@ -685,27 +706,22 @@ pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
     )
     .entered();
 
-    blaze_mem::frame::task(Tag::Nameres, |frame| {
-        if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
-            return DefMapPair::new(db, def_map, local_def_map);
-        }
-        let (def_map, local_def_map) = facts::collect_crate(db, frame, crate_id);
-        frozen::check(db, crate_id, &def_map, &local_def_map);
-        DefMapPair::new(db, def_map, local_def_map)
-    })
+    if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
+        return DefMapPair::new(db, def_map, local_def_map);
+    }
+    let Some((def_map, local_def_map)) = delta::published(db, crate_id) else {
+        panic!("nameres: no maintained resolution for crate {crate_id:?}: no maintainer ran")
+    };
+    frozen::check(db, crate_id, &def_map, &local_def_map);
+    DefMapPair::new(db, def_map, local_def_map)
 }
 
 #[salsa::tracked(returns(ref))]
 pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
-    // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
-    // `block_id` is this query's own key, and the `'static` copy goes only into the `DefMap` this
-    // query returns and the modules it makes, which salsa invalidates with the key. Stored anywhere
-    // else, it could name a freed salsa slot in a later revision.
-    let block_id = unsafe { block_id.to_static() };
+    // The `'static` ids go only into the `DefMap` this query returns, invalidated with its key.
+    let block_id = block_id.to_static();
     let ast_id = block_id.ast_id(db);
-    // SAFETY: as for `block_id` above: the block's module goes only into the `DefMap` this query
-    // returns.
-    let module = unsafe { block_id.module(db).to_static() };
+    let module = block_id.module(db).to_static();
 
     let visibility = Visibility::Module(module, VisibilityExplicitness::Implicit);
     let module_data =
@@ -745,21 +761,16 @@ impl DefMap {
         block: Option<BlockInfo>,
     ) -> DefMap {
         let mut modules = ModulesMap::new();
-        // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
-        // `empty` runs only inside the queries that build a def map (`crate_local_def_map`, with
-        // `frozen::served`'s decode within it, and `block_def_map`), and the root id goes only into
-        // the `DefMap` that query returns. Stored elsewhere, it could name a freed salsa slot in a
-        // later revision.
-        let root = unsafe {
-            ModuleIdLt::new(
-                db,
-                krate,
-                block.map(|it| it.block),
-                None,
-                Name::new_symbol_root(sym::__empty),
-            )
-            .to_static()
-        };
+        // `empty` runs only inside the queries that build a def map, and the root id goes only
+        // into the `DefMap` that query returns.
+        let root = ModuleIdLt::new(
+            db,
+            krate,
+            block.map(|it| it.block),
+            None,
+            Name::new_symbol_root(sym::__empty),
+        )
+        .to_static();
         modules.insert(root, module_data);
 
         DefMap {
@@ -821,7 +832,7 @@ impl DefMap {
             derive_helpers_in_scope: std::mem::take(&mut self.derive_helpers_in_scope),
         };
         let held = HeldRecords::new(db, self.root, records);
-        self.records = Some(salsa::plumbing::AsId::as_id(&held));
+        self.records = Some(RecordsSlot::Held(salsa::plumbing::AsId::as_id(&held)));
         for (id, module) in modules.iter_mut() {
             if let ScopeSlot::Building(building) = &mut module.scope {
                 let BuildingScope { scope, children } = std::mem::take(&mut **building);
@@ -836,13 +847,22 @@ impl DefMap {
     /// What `name` means in module `id` of this `DefMap`; depends on that name only.
     pub(crate) fn name_in_module(&self, db: &Db, id: ModuleIdLt<'_>, name: &Name) -> PerNs {
         match &self.modules {
-            ModulesSlot::Building(_) | ModulesSlot::Unit { .. } => {
+            ModulesSlot::Building(_) | ModulesSlot::Unit { .. } | ModulesSlot::Published(_) => {
                 self.module(db, id).name_in_scope(db, name)
             }
+            ModulesSlot::Maintained { own, outside } => {
+                let id = id.to_static();
+                delta::reads::note(id, Some(*name));
+                if let Some(data) = own.get(&id) {
+                    return data.name_in_scope(db, name);
+                }
+                let Some(data) = outside.get(&id) else {
+                    panic!("ModuleId not found in ModulesMap {:#?}: {id:#?}", self.root)
+                };
+                data.name_in_scope(db, name)
+            }
             ModulesSlot::Collected(modules) => {
-                // SAFETY: as in `Self::module`: the `'static` copy is only the key of the
-                // `Modules::name` query, hashed and compared, never read through.
-                let id = unsafe { id.to_static() };
+                let id = id.to_static();
                 *<Modules<'_> as salsa::plumbing::FromId>::from_id(*modules).name(db, id, *name)
             }
         }
@@ -850,19 +870,20 @@ impl DefMap {
 
     /// One module of the `DefMap`; depends on that module only.
     pub fn module<'a>(&'a self, db: &'a Db, id: ModuleIdLt<'_>) -> &'a ModuleData {
-        // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. The
-        // `'static` copy keys the lookup in `self.modules`. In a collected map it is also the
-        // argument of the `Modules::module` query, whose key salsa keeps; there it is only hashed
-        // and compared with the table's ids, never read through, and a freed module's id (salsa
-        // ids carry a generation) matches no later one. Nothing else stores it. Read through after
-        // its revision, it would name a freed salsa slot.
-        let id = unsafe { id.to_static() };
+        // The `'static` copy only keys the lookup in `self.modules` (and in a collected map the
+        // `Modules::module` query); salsa ids carry a generation, so a freed one matches no later id.
+        let id = id.to_static();
         let found = match &self.modules {
             ModulesSlot::Building(modules) => modules.get(&id),
             ModulesSlot::Unit { own, rows } => match own.get(&id) {
                 Some(it) => Some(it),
                 None => facts::row(db, *rows, id),
             },
+            ModulesSlot::Maintained { own, outside } => {
+                delta::reads::note(id, None);
+                own.get(&id).or_else(|| outside.get(&id))
+            }
+            ModulesSlot::Published(resolution) => delta::published_modules(db, *resolution).get(&id),
             ModulesSlot::Collected(modules) => {
                 <Modules<'a> as salsa::plumbing::FromId>::from_id(*modules).module(db, id).as_ref()
             }
@@ -875,7 +896,10 @@ impl DefMap {
     fn table<'a>(&'a self, db: &'a Db) -> &'a ModulesMap {
         match &self.modules {
             ModulesSlot::Building(modules) => modules,
-            ModulesSlot::Unit { .. } => panic!("the modules of a resolver view are not listed"),
+            ModulesSlot::Unit { .. } | ModulesSlot::Maintained { .. } => {
+                panic!("the modules of a resolver view are not listed")
+            }
+            ModulesSlot::Published(resolution) => delta::published_modules(db, *resolution),
             ModulesSlot::Collected(id) => {
                 <Modules<'a> as salsa::plumbing::FromId>::from_id(*id).table(db)
             }
@@ -905,6 +929,13 @@ impl DefMap {
         self.table(db).iter()
     }
 
+    /// Where `module` is in [`DefMap::modules`]' order, in one probe: what a table merged from
+    /// per-module parts (hir-ty's maintained impl slices) orders its modules by.
+    pub fn module_rank(&self, db: &Db, module: ModuleId) -> Option<u32> {
+        let at = self.table(db).get_index_of(&module)?;
+        Some(u32::try_from(at).expect("more than 2^32 modules in a crate"))
+    }
+
     /// Returns all inline modules (mod name { ... }) in the crate that are associated with the given macro expansion.
     pub fn inline_modules_for_macro_file<'a>(
         &'a self,
@@ -927,8 +958,13 @@ impl DefMap {
     /// so that a read of them depends on them and not on the `DefMap`.
     pub fn records<'a>(&'a self, db: &'a Db) -> Records<'a> {
         match self.records {
-            Some(id) => {
-                let held = <HeldRecords<'a> as salsa::plumbing::FromId>::from_id(id).records(db);
+            Some(slot) => {
+                let held = match slot {
+                    RecordsSlot::Held(id) => {
+                        <HeldRecords<'a> as salsa::plumbing::FromId>::from_id(id).records(db)
+                    }
+                    RecordsSlot::Published(resolution) => delta::published_records(db, resolution),
+                };
                 Records {
                     names: &held.names,
                     diagnostics: &held.diagnostics,
@@ -1097,7 +1133,7 @@ impl DefMap {
         self.block.map(|block| block.block)
     }
 
-    pub(crate) fn prelude(&self) -> Option<(ModuleId, Option<UseId>)> {
+    pub fn prelude(&self) -> Option<(ModuleId, Option<UseId>)> {
         self.prelude
     }
 
@@ -1322,6 +1358,7 @@ impl ModuleData {
     pub fn scope<'a>(&'a self, db: &'a Db) -> &'a ItemScope {
         match &self.scope {
             ScopeSlot::Building(building) => &building.scope,
+            ScopeSlot::Input(input) => delta::input_scope(db, *input),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
                 <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(id).scope(db)
@@ -1333,6 +1370,7 @@ impl ModuleData {
     pub fn name_in_scope(&self, db: &Db, name: &Name) -> PerNs {
         match &self.scope {
             ScopeSlot::Building(building) => building.scope.get(name),
+            ScopeSlot::Input(input) => delta::input_name(db, *input, *name),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
                 *<ModuleScope<'_> as salsa::plumbing::FromId>::from_id(id).name(db, *name)
@@ -1347,6 +1385,7 @@ impl ModuleData {
     ) -> Option<&'a [MacroId]> {
         match &self.scope {
             ScopeSlot::Building(building) => building.scope.get_legacy_macro(name),
+            ScopeSlot::Input(input) => delta::input_legacy_macro(db, *input, *name),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
                 <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(id)
@@ -1363,6 +1402,9 @@ impl ModuleData {
     ) -> impl Iterator<Item = crate::TraitId> + 'a {
         let (building, collected) = match &self.scope {
             ScopeSlot::Building(building) => (Some(building.scope.traits()), None),
+            ScopeSlot::Input(input) => {
+                (None, Some(delta::input_traits(db, *input).iter().copied()))
+            }
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => (
                 None,
                 Some(
@@ -1380,6 +1422,7 @@ impl ModuleData {
     pub fn children<'a>(&'a self, db: &'a Db) -> &'a FxIndexMap<Name, ModuleId> {
         match &self.scope {
             ScopeSlot::Building(building) => &building.children,
+            ScopeSlot::Input(input) => delta::input_children(db, *input),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
                 <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(id).children(db)
@@ -1390,7 +1433,7 @@ impl ModuleData {
     pub(crate) fn children_mut(&mut self) -> &mut FxIndexMap<Name, ModuleId> {
         match &mut self.scope {
             ScopeSlot::Building(building) => &mut building.children,
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
+            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) | ScopeSlot::Input(_) => {
                 panic!("the children of a collected module are read-only")
             },
         }
@@ -1400,7 +1443,7 @@ impl ModuleData {
     pub(crate) fn scope_mut(&mut self) -> &mut ItemScope {
         match &mut self.scope {
             ScopeSlot::Building(building) => &mut building.scope,
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
+            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) | ScopeSlot::Input(_) => {
                 panic!("the scope of a collected module is read-only")
             },
         }
@@ -1599,9 +1642,7 @@ impl Index<ModuleIdLt<'_>> for ModulesMap {
 
     fn index(&self, id: ModuleIdLt<'_>) -> &ModuleData {
         self.inner
-            // SAFETY: as in `DefMap::module`: the `'static` copy only keys this lookup and is
-            // dropped when it returns.
-            .get(&unsafe { id.to_static() })
+            .get(&id.to_static())
             .unwrap_or_else(|| panic!("ModuleId not found in ModulesMap: {id:#?}"))
     }
 }

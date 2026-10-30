@@ -3,6 +3,8 @@
 //! One database shared by `&` across threads, and tasks pumped above a waiting task on the same
 //! thread (`Database::task_depth`).
 
+#![forbid(unsafe_code)]
+
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::sync::Mutex;

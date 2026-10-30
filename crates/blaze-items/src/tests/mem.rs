@@ -6,14 +6,16 @@ use std::collections::HashMap;
 
 use blaze_alloc_count::assert_at_most;
 use blaze_ids::{ContentId, bits::Ranked, rng::SplitMix64};
+use hir_ty::next_solver::goal_store::GoalFacts;
 use test_fixture::WithFixture;
 
 use super::{items, single};
 use crate::{
-    CodeHash, DeepHash, Fact, FactSet, InterfaceHash, ItemHashes, ItemKey, ItemKind, LayoutHash,
-    Unhashable, crate_hashes, item_key,
+    CodeHash, DeepHash, Fact, FactSet, InterfaceHash, ItemHashes, ItemId, ItemKey, ItemKind,
+    LayoutHash, Unhashable, crate_hashes, facts, goals::Goals, hashes, item_key,
     key::{self, KeyIndex, Row},
-    table::HashColumns,
+    signature_hash,
+    table::{HashColumns, fact_ref},
 };
 
 /// One crate's first 9 key bytes, and another's.
@@ -185,6 +187,58 @@ pub fn f(s: &S) -> u32 { let c = |y: u32| y + s.x; fn inner() {} c(1) }
     assert_at_most(0, "a warm hash column lookup", || {
         for &key in &keys {
             std::hint::black_box(columns.get(key));
+        }
+    });
+}
+
+/// What a warm build asks of every item and what a reused query's facts are checked with: the
+/// crate's columns, each item's key and hashes, and the value of each kind of fact about it,
+/// all memo hits once computed.
+#[test]
+fn warm_hashes_keys_and_fact_values_allocate_nothing() {
+    assert!(blaze_alloc_count::installed());
+    let (db, _) = single(
+        r#"
+pub struct S { x: u32 }
+pub enum E { A(S), B }
+pub trait Tr { fn m(&self) -> u32 { 0 } }
+impl Tr for S {}
+pub fn f(s: &S) -> u32 { let c = |y: u32| y + s.x; fn inner() {} c(1) }
+pub const C: u32 = 1;
+"#,
+    );
+    let krate = db.test_crate();
+    let ids = items(&db);
+    let mut about = Vec::new();
+    for &id in &ids {
+        about.push(Fact::Signature(item_key(&db, id)));
+        about.push(facts::name(&db, id));
+        about.push(facts::code(&db, id));
+        match id {
+            ItemId::Adt(adt) => about.push(facts::layout(&db, adt)),
+            ItemId::Impl(imp) => about.push(facts::coherence(&db, imp)),
+            _ => {}
+        }
+    }
+    let refs: Vec<_> = about.iter().map(fact_ref).collect();
+    let _ = crate_hashes(&db, krate);
+    for &id in &ids {
+        let _ = (hashes(&db, id), signature_hash(&db, id));
+    }
+    let warm: Vec<_> = refs.iter().map(|&fact| Goals.value(&db, fact)).collect();
+    assert!(warm.iter().any(Option::is_some));
+
+    assert_at_most(0, "a warm crate's hash columns", || {
+        std::hint::black_box(crate_hashes(&db, krate));
+    });
+    assert_at_most(0, "warm item keys and hashes", || {
+        for &id in &ids {
+            std::hint::black_box((item_key(&db, id), hashes(&db, id), signature_hash(&db, id)));
+        }
+    });
+    assert_at_most(0, "warm fact values", || {
+        for &fact in &refs {
+            std::hint::black_box(Goals.value(&db, fact));
         }
     });
 }

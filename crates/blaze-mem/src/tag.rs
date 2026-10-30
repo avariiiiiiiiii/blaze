@@ -171,7 +171,17 @@ pub fn add(tag: Tag, bytes: usize) {
     }
     let line = line(tag);
     let now = line.live.fetch_add(as_u64(bytes), Ordering::Relaxed) + as_u64(bytes);
-    line.high_water.fetch_max(now, Ordering::Relaxed);
+    raise(&line.high_water, now);
+}
+
+/// `high_water.fetch_max(now)`, with the read-modify-write only when `now` passes what it
+/// holds: the mark never falls, so a load that sees it at or past `now` is the same answer, and
+/// in steady state it costs a load of a line the caller's add just made its own.
+#[inline]
+fn raise(high_water: &AtomicU64, now: u64) {
+    if now > high_water.load(Ordering::Relaxed) {
+        high_water.fetch_max(now, Ordering::Relaxed);
+    }
 }
 
 /// `tag` holds `bytes` fewer.
@@ -254,7 +264,7 @@ pub fn task_ended(tag: Tag, peak: usize) {
 
 pub(crate) fn committed(bytes: usize) {
     let now = COMMITTED.now.fetch_add(as_u64(bytes), Ordering::Relaxed) + as_u64(bytes);
-    COMMITTED.high_water.fetch_max(now, Ordering::Relaxed);
+    raise(&COMMITTED.high_water, now);
 }
 
 pub(crate) fn decommitted(bytes: usize) {
@@ -281,6 +291,12 @@ pub fn over_budget(tag: Tag) -> bool {
 pub fn headroom(tag: Tag) -> u64 {
     let line = line(tag);
     line.budget.load(Ordering::Relaxed).saturating_sub(line.live.load(Ordering::Relaxed))
+}
+
+/// Bytes committed in every region now: [`Snapshot::committed`] without the rest of a
+/// snapshot, one load.
+pub fn committed_now() -> u64 {
+    COMMITTED.now.load(Ordering::Relaxed)
 }
 
 /// One tag's counters at one moment.

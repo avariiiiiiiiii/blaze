@@ -53,6 +53,17 @@ impl FileSet {
         self.paths.insert(file_id, path);
     }
 
+    /// Takes `file_id` out of the set and returns its path, the other files left in their
+    /// order: `O(n)` moves of the entries after it, and no allocation. A path that names
+    /// another file keeps naming it.
+    pub fn remove(&mut self, file_id: FileId) -> Option<VfsPath> {
+        let path = self.paths.shift_remove(&file_id)?;
+        if self.files.get(&path) == Some(&file_id) {
+            self.files.remove(&path);
+        }
+        Some(path)
+    }
+
     /// Iterate over this set's ids.
     pub fn iter(&self) -> impl Iterator<Item = FileId> + '_ {
         self.paths.keys().copied()

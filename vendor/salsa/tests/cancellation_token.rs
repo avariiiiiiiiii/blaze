@@ -1,6 +1,8 @@
 #![cfg(feature = "inventory")]
 //! Test that `DeriveWithDb` is correctly derived.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use std::{

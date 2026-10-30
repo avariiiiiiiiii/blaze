@@ -5,8 +5,6 @@
 //! back to its mark; the tables are independent, so the order they are undone in does not
 //! matter. Committing the outermost snapshot drops every undo row.
 
-use tracing::debug;
-
 use crate::next_solver::infer::InferCtxtInner;
 use crate::next_solver::infer::opaque_types::OpaqueTypeMark;
 use crate::next_solver::infer::region_constraints::RegionSnapshot;
@@ -62,7 +60,6 @@ impl<'db> InferCtxtInner<'db> {
     }
 
     pub fn rollback_to(&mut self, snapshot: Snapshot) {
-        debug!("rollback_to()");
         assert!(self.undo_log.num_open_snapshots > 0, "rolled back with no open snapshot");
 
         self.type_variable_storage.rollback_to(snapshot.type_variables);
@@ -94,7 +91,6 @@ impl<'db> InferCtxtInner<'db> {
     }
 
     pub fn commit(&mut self, snapshot: Snapshot) {
-        debug!("commit()");
         assert!(self.undo_log.num_open_snapshots > 0, "committed with no open snapshot");
         self.undo_log.num_open_snapshots -= 1;
         // The outermost snapshot: there is no snapshot further out that we might need to roll

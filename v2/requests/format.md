@@ -984,6 +984,11 @@ Status: done by speed-span for `arena.rs`, `intern.rs` and `intern_slice.rs` (as
 editing that file (`v2/requests/speed.md`, "speed-span" item 2). `mbe` now has
 `#![forbid(unsafe_code)]` (listed under "Left for lanes" in the audit report).
 
+> done by speed-unsafe-front-intern (2026-10-30): the `symbol.rs` items are moot. `Symbol` is a
+> table ID now, with one commented block (`from_utf8_unchecked`, in its `mod text`). All of
+> `intern`'s other unsafe is in `space` and `typed`. Those two are `#[allow(unsafe_code)]` modules
+> under a `#![deny(unsafe_code)]` root, with one operation per block.
+
 - `crates/intern/src/arena.rs:135` block (`Table::new`): 2 ops (two `zeroed` calls). Split:
   ```rust
   // SAFETY: all-zero bytes are a `Group`: a zero control word (every slot empty) and null pointers.
@@ -1058,11 +1063,26 @@ editing that file (`v2/requests/speed.md`, "speed-span" item 2). `mbe` now has
   ```
 - `crates/syntax-tree/src/cursor.rs:187` block (`&*root.as_ptr()`): no SAFETY. Proposed: `` // SAFETY: the caller's precondition keeps `root` alive for `'a`: a `FlatRoot` made from a box by `new_flat_root` or `part_root`, freed only when the last cursor into its file drops, and only ever read through shared references. ``
 
+> Status: done by speed-unsafe-front-syntax (2026-10-30). `[lints] workspace = true` is in
+> `crates/syntax-tree/Cargo.toml`. `flat_unbound` is gone: its one caller uses a safe
+> `Ref::inner_tree(&self)` whose lifetime is the cursor's borrow, one commented block. The two
+> `NonNull::new_unchecked(Box::into_raw(..))` are safe `NonNull::from(Box::leak(..))`. In
+> `flat/block.rs` every block is one op (`put_joined`, `fill` split; `Drop` uses the checked
+> `Layout::from_size_align`).
+
 ### syntax
 
 - `crates/syntax/examples/trees.rs:29` block (`System.alloc`): the comment `as the system allocator's own` names no invariant. Proposed: `` // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (a non-zero-sized `layout`), which is `System`'s too. ``
 - `crates/syntax/examples/trees.rs:34` block (`System.dealloc`): same. Proposed: `` // SAFETY: `ptr` came from `alloc` above with `layout`, which is `System.alloc`'s, so it is `System`'s to free with that layout. ``
 - `src/raw.rs` and the crate root (`deny(unsafe_code)` with `#[allow(unsafe_code)] mod raw`): ok.
+
+> Status: done by speed-unsafe-front-syntax (2026-10-30). Both comments were in already. The
+> example root now says `#![deny(unsafe_code)]` with its allocator in `#[allow(unsafe_code)] mod
+> counting`; `tests/view.rs` says `#![forbid(unsafe_code)]`. `raw.rs`'s copy is the safe
+> `write_copy_of_slice` (stable since 1.93), leaving two blocks. `crates/syntax/fuzz/`'s two
+> targets say `#![forbid(unsafe_code)]` (`fuzz_target!` is another crate's macro, and
+> `unsafe_code` is not reported in external macros); the package is superseded by the
+> `syntax_parse` target filed in `v2/requests/safety.md`.
 - `crates/syntax/fuzz/` is a package of its own (its own `[workspace]`, no workspace lints) with no unsafe; `#![forbid(unsafe_code)]` at the top of `fuzz_targets/parser.rs` and `reparse.rs` is optional, since libfuzzer's `fuzz_target!` expands outside them.
 
 ### blaze-ids, mbe (item 4)

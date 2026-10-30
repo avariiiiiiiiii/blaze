@@ -88,6 +88,54 @@ pub unsafe trait Configuration: Sized + 'static {
     /// How the daemon image keeps the values, at their IDs ([`crate::image`]); `None` if it
     /// does not keep them.
     const IMAGE: Option<crate::image::ImageCodec<Self::Fields<'static>>> = None;
+
+    /// Pushes the salsa `Id` of each field that is a salsa struct or supertype (`AsId`); a
+    /// field of another type pushes none. A tracked function's interned arguments list them, so
+    /// a test can tell whose a query's key is ([`Zalsa::ids_of`](crate::zalsa::Zalsa::ids_of)).
+    fn ids(_value: &Self::Fields<'_>, _out: &mut Vec<crate::Id>) {}
+}
+
+/// A value that is no salsa struct but names some (a type naming closures): what it pushes
+/// for [`Configuration::ids`] when it is a field of an interned value.
+pub trait NamesIds {
+    fn names_ids(&self, out: &mut Vec<crate::Id>);
+}
+
+/// A field of an interned value, for [`Configuration::ids`]: `(&&&IdsOf(field)).push_ids(out)`
+/// pushes the field's `Id` when it is `AsId` ([`IdOfSalsa`], found first: on the most
+/// references), what it names when it is [`NamesIds`] ([`IdOfNamed`]), and nothing otherwise
+/// ([`IdOfOther`], found last).
+pub struct IdsOf<'a, T>(pub &'a T);
+
+pub trait IdOfSalsa {
+    fn push_ids(&self, out: &mut Vec<crate::Id>);
+}
+
+impl<T: AsId> IdOfSalsa for &&IdsOf<'_, T> {
+    #[inline]
+    fn push_ids(&self, out: &mut Vec<crate::Id>) {
+        out.push(self.0.as_id());
+    }
+}
+
+pub trait IdOfNamed {
+    fn push_ids(&self, out: &mut Vec<crate::Id>);
+}
+
+impl<T: NamesIds> IdOfNamed for &IdsOf<'_, T> {
+    #[inline]
+    fn push_ids(&self, out: &mut Vec<crate::Id>) {
+        self.0.names_ids(out);
+    }
+}
+
+pub trait IdOfOther {
+    fn push_ids(&self, out: &mut Vec<crate::Id>);
+}
+
+impl<T> IdOfOther for IdsOf<'_, T> {
+    #[inline]
+    fn push_ids(&self, _out: &mut Vec<crate::Id>) {}
 }
 
 pub trait InternedData: Sized + Eq + Hash + Clone + Sync + Send {}
@@ -780,6 +828,7 @@ where
         // Fill up the table for the first few revisions without attempting garbage collection.
         if C::REVISIONS != IMMORTAL
             && self.revision_queue.is_primed()
+            && !zalsa.keeps_every_value()
             && let Some(claimed) = self.claim_stale(&mut shard, current_revision)
         {
             return self.reuse(
@@ -1048,6 +1097,7 @@ where
                         zalsa.ingredient_index_for_memo(ingredient_index, memo_ingredient_index);
 
                     let executor = DatabaseKeyIndex::new(ingredient_index, id);
+                    zalsa.graph().forget(executor, zalsa.current_revision());
 
                     zalsa.event(&|| Event::new(EventKind::DidDiscard { key: executor }));
 
@@ -1236,6 +1286,30 @@ where
     }
 }
 
+/// The arguments of a tracked fn of several arguments from the key of one of its reads (the
+/// `Id` of its interned arguments, as [`crate::Reads::for_each_read`]'s
+/// `DatabaseKeyIndex::key_index`): `Some` when the page of `key` holds interned values whose
+/// fields, the argument tuple with every database lifetime made `'static`, are `F`, as
+/// `interned_arguments::<(Crate, SelfTyKey<'static>)>(db, key)`; `None` for any other.
+///
+/// `F`'s lifetimes stand for `db`'s: its salsa structs are `db`'s and stay valid only while it
+/// is in the revision of the read.
+///
+/// # Panics
+///
+/// If the value at `key` was not interned or validated in `db`'s current revision.
+pub fn interned_arguments<F: Clone + 'static>(
+    // dyn: salsa's public database handle, one ingredient lookup per call
+    db: &dyn crate::Database,
+    key: Id,
+) -> Option<F> {
+    use crate::zalsa::ZalsaDatabase;
+    let zalsa = db.zalsa();
+    let ingredient = zalsa.lookup_ingredient(zalsa.ingredient_index(key));
+    // clone: the caller's own copy of the arguments, as a field getter of an interned struct gives
+    ingredient.interned_fields(zalsa, key)?.downcast_ref::<F>().cloned()
+}
+
 impl<C> Ingredient for IngredientImpl<C>
 where
     C: Configuration,
@@ -1246,6 +1320,29 @@ where
 
     fn ingredient_index(&self) -> IngredientIndex {
         self.ingredient_index
+    }
+
+    // dyn: see `Ingredient::interned_fields`
+    fn interned_fields<'z>(&'z self, zalsa: &'z Zalsa, id: Id) -> Option<&'z dyn std::any::Any> {
+        let value = zalsa.table().get::<Value<C>>(id);
+        value.assert_validated(zalsa.current_revision());
+        debug_assert_eq!(id, value.id.load(), "Interned ID for `{}` refers to a reused slot", C::DEBUG_NAME);
+        // SAFETY: as in `data`: a value validated in the current revision is not reused while
+        // `zalsa` is borrowed, and its fields are written once before it is published.
+        Some(unsafe { &*value.fields.get() })
+    }
+
+    fn ids_of(&self, zalsa: &Zalsa, id: Id, out: &mut Vec<Id>) {
+        assert!(
+            zalsa.keeps_every_value(),
+            "the ids of a `{}` read without `Zalsa::keep_every_value`, so its slot may be reused",
+            C::DEBUG_NAME
+        );
+        let value = zalsa.table().get::<Value<C>>(id);
+        // SAFETY: with `keep_every_value` on no slot is reused (`intern_locked`), so the fields
+        // at `id` are its value's, written once before the value was published and never after.
+        let fields = unsafe { Self::from_internal_data(&*value.fields.get()) };
+        C::ids(fields, out);
     }
 
     unsafe fn maybe_changed_after(

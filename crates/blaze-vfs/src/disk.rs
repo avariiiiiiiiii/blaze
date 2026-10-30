@@ -249,13 +249,12 @@ pub(crate) struct Disks {
 impl Disks {
     /// The disk of `head` watching `dir`: kept if it watched `dir`, else a new one.
     pub(crate) fn of(&mut self, head: &str, dir: &FileName) -> &mut Disk {
-        // clone: once per head.
-        let disk = self.by_head.entry(head.into()).or_insert_with(|| Disk::new(dir.clone()));
-        if disk.dir != *dir {
-            // clone: once per head.
-            *disk = Disk::new(dir.clone());
+        // Found before it is made: a head that has its disk allocates no key.
+        if !self.by_head.get(head).is_some_and(|it| it.dir == *dir) {
+            // clone: once per head, or per change of the directory it watches.
+            self.by_head.insert(head.into(), Disk::new(dir.clone()));
         }
-        disk
+        self.by_head.get_mut(head).expect("made above")
     }
 
     pub(crate) fn get(&self, head: &str) -> Option<&Disk> {

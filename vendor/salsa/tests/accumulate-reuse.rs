@@ -5,6 +5,8 @@
 //! Tests behavior when a query's only inputs
 //! are the accumulated values from another query.
 
+#![forbid(unsafe_code)]
+
 mod common;
 use common::{LogDatabase, LoggerDatabase};
 use expect_test::expect;

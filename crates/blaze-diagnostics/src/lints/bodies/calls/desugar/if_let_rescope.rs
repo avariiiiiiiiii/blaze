@@ -59,12 +59,12 @@ impl LatePass for IfLetRescope {
     const HOOKS: Hooks = Hooks::BODY;
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Block, ExprKind::Match, ExprKind::If, ExprKind::Loop]);
 
-    fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+    fn check_body(&mut self, _b: &BodyCx<'_, '_, '_>, _out: &mut Vec<Found>) {
         self.skip.clear();
         self.parents.clear();
     }
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();
         // An `if` is visited after its parent, which places it, whatever the parent's edition.
         let parents = &mut self.parents;
@@ -119,7 +119,7 @@ impl IfLetRescope {
     /// rustc's `probe_if_cascade`: the `if let`s of the chain `expr` starts, linted at the
     /// first whose scrutinee holds a significant destructor, with a `match` for every `if let`
     /// that can be rewritten.
-    fn probe_if_cascade(&mut self, b: &BodyCx<'_, '_>, mut expr: ExprId, out: &mut Vec<Found>) {
+    fn probe_if_cascade(&mut self, b: &BodyCx<'_, '_, '_>, mut expr: ExprId, out: &mut Vec<Found>) {
         if self.skip.contains(&expr) {
             return;
         }
@@ -297,7 +297,7 @@ impl IfLetRescope {
 
 /// rustc's `span_take_while(span, |c| c == '(' || c.is_whitespace())`: the parentheses and
 /// spaces `span` starts with.
-fn take_while_parens(b: &BodyCx<'_, '_>, span: &Span) -> Span {
+fn take_while_parens(b: &BodyCx<'_, '_, '_>, span: &Span) -> Span {
     let len = b.cx.snippet(span).map_or(0, |text| {
         text.char_indices().find(|&(_, c)| c != '(' && !c.is_whitespace()).map_or(text.len(), |(at, _)| at)
     });
@@ -308,7 +308,7 @@ fn take_while_parens(b: &BodyCx<'_, '_>, span: &Span) -> Span {
 /// temporary the `if let` keeps alive (the scrutinee itself, what is borrowed or autoborrowed,
 /// what a field or an index is taken of) and has significant destructors, with their types.
 struct FindSignificantDropper<'s, 'b, 'a, 'db> {
-    b: &'s BodyCx<'a, 'db>,
+    b: &'s BodyCx<'s, 'a, 'db>,
     drops: &'s mut SignificantDrops<'b, 'db>,
 }
 

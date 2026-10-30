@@ -30,6 +30,8 @@ pub use record::record;
 pub struct Pack {
     /// The file the program's crate starts at.
     pub main: u32,
+    /// The target's tuple and data layout, as the workspace was loaded for it.
+    pub tuple: String,
     pub data_layout: String,
     pub files: Vec<File>,
     pub roots: Vec<Root>,
@@ -203,7 +205,12 @@ impl Pack {
             .collect::<Result<Vec<_>, &str>>()?;
 
         let workspace = triomphe::Arc::new(CrateWorkspaceData {
-            target: Ok(TargetData { data_layout: self.data_layout.into(), arch: Arch::Wasm32 }),
+            target: Ok(TargetData {
+                tuple: Symbol::intern(&self.tuple),
+                data_layout: self.data_layout.into(),
+                arch: Arch::Wasm32,
+                has_thumb_interworking: false,
+            }),
             toolchain: None,
             const_eval: Default::default(),
         });

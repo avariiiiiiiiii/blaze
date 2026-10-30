@@ -79,7 +79,9 @@ pub(crate) struct CrateEnvKey {
 /// A round of a crate's collection.
 #[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
 pub(crate) struct RoundKey {
+    #[returns(copy)]
     pub(crate) krate: Crate,
+    #[returns(copy)]
     pub(crate) round: u32,
 }
 
@@ -88,8 +90,11 @@ pub(crate) struct RoundKey {
 /// round they last changed at (`fact_key`).
 #[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
 pub(crate) struct FactKey {
+    #[returns(copy)]
     pub(crate) module: ModuleId,
+    #[returns(copy)]
     pub(crate) krate: Crate,
+    #[returns(copy)]
     pub(crate) round: u32,
 }
 
@@ -97,8 +102,11 @@ pub(crate) struct FactKey {
 /// anchor, `Partition::anchor`), named by the module.
 #[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
 pub(crate) struct SccKey {
+    #[returns(copy)]
     pub(crate) anchor: ModuleId,
+    #[returns(copy)]
     pub(crate) krate: Crate,
+    #[returns(copy)]
     pub(crate) round: u32,
 }
 
@@ -114,6 +122,7 @@ pub(crate) enum Rows {
 
 #[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
 pub(crate) struct RowsKey {
+    #[returns(copy)]
     pub(crate) rows: Rows,
 }
 
@@ -128,6 +137,7 @@ pub(crate) enum Scope {
 
 #[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
 pub(crate) struct ScopeRef {
+    #[returns(copy)]
     pub(crate) scope: Scope,
 }
 
@@ -207,6 +217,9 @@ pub(crate) struct RoundModules {
     /// that round names them until its component runs again ([`NO_ROUND`]: declared at this
     /// round).
     pub(crate) since: Box<[u32]>,
+    /// How many modules have [`RoundModules::PENDING`]: while any does, an import bound
+    /// through a glob stays undetermined (`Unit::set_unexpanded`).
+    pub(crate) pending: u32,
 }
 
 impl RoundModules {
@@ -353,17 +366,12 @@ pub(crate) struct RoundOutcome {
 // Queries.
 
 /// The crate's root module id. Created here so every query of the crate shares it.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub(crate) fn crate_root(db: &Db, krate: Crate) -> ModuleId {
-    // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
-    // The id goes only into values computed from this query's (re-validated through salsa
-    // when it reruns): the keys and logs of this crate's resolver queries and the `DefMap`
-    // `crate_local_def_map` assembles from them. This query creates it with the same fields
-    // every time, so the id is the same for as long as the crate is.
-    unsafe {
-        crate::ModuleIdLt::new(db, krate, None, None, Name::new_symbol_root(intern::sym::__empty))
-            .to_static()
-    }
+    // This query creates it with the same fields every time, so the id is the same for as long
+    // as the crate is.
+    crate::ModuleIdLt::new(db, krate, None, None, Name::new_symbol_root(intern::sym::__empty))
+        .to_static()
 }
 
 /// The crate attributes of the root file (`seed_with_top_level`'s first part).
@@ -373,7 +381,7 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
 }
 
 /// The crate root's round-0 key: the extern prelude of the crate's dependencies.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub(crate) fn root_decl(db: &Db, krate: Crate) -> DeclKey {
     frame::task(Tag::Nameres, |frame| collect::root_decl(db, frame, krate))
 }
@@ -437,7 +445,7 @@ pub(crate) fn child_key(db: &Db, parent: DeclKey, child: ModuleId) -> Option<Dec
 }
 
 /// The module of `key`'s round-0 scope as a `ModuleScope`, for `Scope::Decl` reads.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub(crate) fn decl_handle(db: &Db, key: DeclKey) -> salsa::Id {
     let decl = key.decl(db);
     let ops = &module_decls(db, key).ops;
@@ -511,7 +519,7 @@ pub(crate) fn partition(db: &Db, round: RoundKey) -> Partition {
 
 /// The crate env the round's units and steps start from: the root's crate-level ops of every
 /// round before, and the injected std prelude.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub(crate) fn round_env(db: &Db, round: RoundKey) -> CrateEnvKey {
     driver::round_env(db, round)
 }
@@ -524,14 +532,14 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
 
 /// The round whose state `scc_state(key)` hands out: `key`'s round, or the last before it at
 /// which the component changed.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub(crate) fn latest(db: &Db, key: SccKey) -> u32 {
     scc_state(db, key).round
 }
 
 /// The module's `ModuleScope` after the round's import fixed point. Backdates while the
 /// component hands out the same one.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub(crate) fn fact_handle(db: &Db, key: FactKey) -> salsa::Id {
     unit::fact_handle(db, key)
 }
@@ -549,12 +557,12 @@ pub(crate) fn macro_step(db: &Db, key: FactKey) -> MacroStep {
     frame::task(Tag::Nameres, |frame| macros::macro_step(db, frame, key))
 }
 
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub(crate) fn round_progress(db: &Db, round: RoundKey) -> RoundOutcome {
     driver::round_progress(db, round)
 }
 
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub(crate) fn round_kind(db: &Db, round: RoundKey) -> RoundKind {
     driver::round_kind(db, round)
 }

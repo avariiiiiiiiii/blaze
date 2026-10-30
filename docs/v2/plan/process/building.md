@@ -59,7 +59,9 @@ Order:
   unchanged (superset-of-rust: users see cargo's behavior); the standard library as one more
   crate graph built through the same pipeline (no-rustc F, #86), its results in the shared base
   layer. Owns `crates/blaze-cargo/` but store's and usercode's paths, `crates/load-cargo/`,
-  `crates/project-model/`, `crates/blaze-units/`, `crates/blaze-tree/`, `library/`.
+  `crates/project-model/`, `crates/blaze-units/`, `crates/blaze-tree/`, `crates/blaze-manifest/`,
+  `crates/blaze-metadata/`, `crates/blaze-resolve/`, `crates/blaze-registry/`,
+  `crates/blaze-source/`, `library/`.
 - **`diagnostics`**: compile errors and warnings as rustc finds them (the same codes,
   lints and primary spans, in our own text, with cargo's `--message-format=json` schema), computed in the compiler from the queries that found
   them, with the facts they read (for the agent API). What builds need from `ide-diagnostics`
@@ -69,7 +71,7 @@ Order:
 - **`safety`**: proves the unsafe code sound without rustc (`plan/design/unsafe.md`): the
   undefined-behavior checker on the MIR evaluator (`crates/hir-ty-ub/`, new), fuzz targets for
   every parser of untrusted bytes (`fuzz/`, new), and the model checker for lock-free code
-  (`crates/blaze-graph/src/check/`, new). Sanitizer instrumentation goes to codegen by request.
+  (`crates/blaze-check/`, new). Sanitizer instrumentation goes to codegen by request.
 - **`fastcompile`**: the twelve changes in `plan/design/compile-time.md`, in new crates
   (`blaze-stencil`, `blaze-lazy`, `blaze-premap`, `blaze-intent`, `blaze-history`,
   `blaze-global`) and `tools/pgo/`, with hooks in other lanes' crates by request.

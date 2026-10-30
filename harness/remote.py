@@ -3,7 +3,7 @@
 
 Machine A builds a workspace, which sends its store to a bucket. Machine B, with another HOME,
 another checkout and an empty store, fetches it and builds: it has to compile nothing and
-print what cargo's build prints. Then the transfer is broken in every way the proxy of
+print what blaze's build of the same source from nothing prints. Then the transfer is broken in every way the proxy of
 s3fake.py knows, the objects are spoiled, and the lists are forged; each time B has to end
 with either the pack as A sent it or no pack, and a build that prints the same.
 
@@ -21,7 +21,7 @@ import argparse, hashlib, os, re, shlex, shutil, signal, subprocess, sys, tempfi
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import BLAZE, RUNNER, TARGET_ARGS, linker_line, sysroot_rlibs
+from mixed import BLAZE, RUNNER, TARGET_ARGS, from_scratch, linker_line, printed, sysroot_rlibs
 from s3fake import ACCESS, SECRET, Bucket, Proxy, Server, find
 
 from packs import FORMAT, sealed as pack_of, records as records_of
@@ -206,7 +206,6 @@ class Machine:
         if out.returncode != 0:
             raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
         self.link_args = [a for a in linker_line(out.stdout + out.stderr) if not a.endswith("symbols.o")]
-        self.reference = linkline.output_of(self.link_args)
         return time.time() - start
 
     def build(self, crates, env=None):
@@ -277,8 +276,9 @@ def round_trip(top, remote, name, crates, target, workspace):
         machine.checkout(workspace)
         machine.cargo(target)
     log, _ = a.build(crates, env={"BLAZE_REMOTE": address})
-    expected = a.run(a.reference)
-    check("A compiles and its program prints what cargo's does", compiled(log) and a.run() == expected, f"{compiled(log)} compiled")
+    expected = printed(from_scratch(a.ws, crates, target))
+    check("A compiles and its program prints what the build from nothing does", compiled(log) and a.run() == expected,
+          f"{compiled(log)} compiled")
     # A store too small to seal is sent by the next thing that finds it left open.
     out = a.blaze("cache", "push", address)
     objects = bucket.objects()
@@ -296,7 +296,7 @@ def round_trip(top, remote, name, crates, target, workspace):
     log, _ = b.build(crates, env={"BLAZE_REMOTE": address})
     check("B fetches and compiles nothing", compiled(log) == 0 and all(b.packs().values()) and set(a.packs()) <= set(b.packs()),
           f"{said_number(log, 'functions found')} found, {compiled(log)} compiled")
-    check("B's program prints what A's and cargo's do", b.run() == expected == b.run(b.reference))
+    check("B's program prints what A's and the build from nothing do", b.run() == expected)
     whole, numbers, said = b.cache("verify")
     check("B's store is whole after the pull and the build", whole and numbers.get("packs") == len(b.packs())
           and numbers.get("corrupt packs") == 0 and not b.partials(), f"{numbers.get('records')} records")
@@ -838,7 +838,7 @@ def kept(top, remote, crates, target, workspace):
           took is not None and unsent == before and ended == TOLD_TO_END and listed() == before + 1,
           f"{before}, {unsent}, then {listed()} packs listed")
     c = Machine(top, f"d-{remote.name}-c", remote)
-    c.ws, c.link_args, c.reference = a.ws, a.link_args, a.reference
+    c.ws, c.link_args = a.ws, a.link_args
     log, _ = c.build(crates, env={"BLAZE_REMOTE": address})
     check("another machine builds the edited program and compiles nothing", compiled(log) == 0 and "edited with no schedule" in c.run(),
           f"{compiled(log)} compiled")

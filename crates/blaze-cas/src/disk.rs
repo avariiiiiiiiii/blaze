@@ -35,13 +35,7 @@ pub fn content_of(bytes: &[u8]) -> ContentId {
     ContentId::of(VALUE_DOMAIN, bytes)
 }
 
-pub(crate) fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
-}
-
-pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
-}
+pub(crate) use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 
 pub(crate) fn id_at(bytes: &[u8], at: usize) -> ContentId {
     ContentId(bytes[at..at + 32].try_into().expect("32 bytes"))
@@ -325,7 +319,8 @@ pub(crate) struct ExternalRef {
 
 /// What a store is: written whole and at once (`Effect::Write`) after everything it names is
 /// durable, so a crash leaves the old head or the new, each naming only whole bytes.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: the tests tear copies of a head
 pub(crate) struct Head {
     pub generation: u64,
     pub index: Option<IndexRef>,

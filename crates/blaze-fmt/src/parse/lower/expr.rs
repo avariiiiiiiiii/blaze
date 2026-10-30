@@ -255,6 +255,14 @@ impl Lower<'_> {
                 ast::ExprKind::Tup(t.fields().map(|f| self.expr(f)).collect())
             }
             ra::Expr::UnderscoreExpr(_) => ast::ExprKind::Underscore,
+            ra::Expr::UnsafeBinderCastExpr(c) => {
+                let kind = if c.is_wrap() {
+                    ast::UnsafeBinderCastKind::Wrap
+                } else {
+                    ast::UnsafeBinderCastKind::Unwrap
+                };
+                ast::ExprKind::UnsafeBinderCast(kind, self.opt_expr(c.expr(), span), c.ty().map(|t| self.ty(t)))
+            }
             ra::Expr::WhileExpr(w) => {
                 let label = self.label(w.label());
                 let cond = self.opt_expr(w.condition(), span);
@@ -433,6 +441,16 @@ impl Lower<'_> {
         ast::ExprKind::If(cond, then, els)
     }
 
+    /// `if cond` of an arm or a guard pattern; `lo` stands in for a missing `if` or condition.
+    pub(crate) fn guard(&self, g: ra::MatchGuard<'_>, lo: Span) -> Box<ast::Guard> {
+        let if_span = g.if_token().map(|t| self.tsp(t)).unwrap_or(lo);
+        let cond = self.opt_expr(g.condition(), lo);
+        Box::new(ast::Guard {
+            span_with_leading_if: if_span.to(cond.span),
+            cond: *cond,
+        })
+    }
+
     /// rustc's `parse_arm`: from the pattern (after attributes, with a leading `|`) to the end
     /// of the body, leaving out the comma.
     fn arm(&self, arm: ra::MatchArm<'_>) -> ast::Arm {
@@ -446,14 +464,7 @@ impl Lower<'_> {
                 span: lo,
             }),
         };
-        let guard = arm.guard().map(|g| {
-            let if_span = g.if_token().map(|t| self.tsp(t)).unwrap_or(lo);
-            let cond = self.opt_expr(g.condition(), lo);
-            Box::new(ast::Guard {
-                span_with_leading_if: if_span.to(cond.span),
-                cond: *cond,
-            })
-        });
+        let guard = arm.guard().map(|g| self.guard(g, lo));
         let body = arm.expr().map(|e| self.expr(e));
         let hi = match (&body, &guard) {
             (Some(b), _) => b.span,

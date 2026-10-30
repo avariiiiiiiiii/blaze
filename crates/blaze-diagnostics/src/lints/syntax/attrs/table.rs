@@ -15,14 +15,13 @@ pub(crate) mod index;
 use span::Edition;
 
 use super::target::{GenericParamKind, MethodKind, Target};
-use Policy::{Allow, Error, Warn};
+use Policy::{Allow, AllowSilent, Error, Warn};
 
 /// What attribute parsing does with an attribute on a target: rustc's `Policy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Policy {
     Allow(Target),
     /// Allowed, and not named among the targets it can be applied to.
-    #[allow(dead_code)]
     AllowSilent(Target),
     /// `unused_attributes` (or `misplaced_diagnostic_attributes`), "previously accepted".
     Warn(Target),
@@ -55,12 +54,12 @@ impl Targets {
         let has = |list: &[Policy], policy: fn(Target) -> Policy| list.contains(&policy(target));
         match self {
             Targets::AllowList(list) => match () {
-                _ if has(list, Allow) || has(list, Policy::AllowSilent) => Allowed::Allowed,
+                _ if has(list, Allow) || has(list, AllowSilent) => Allowed::Allowed,
                 _ if has(list, Warn) => Allowed::Warn,
                 _ => Allowed::Error,
             },
             Targets::AllowListWarnRest(list) => match () {
-                _ if has(list, Allow) || has(list, Policy::AllowSilent) => Allowed::Allowed,
+                _ if has(list, Allow) || has(list, AllowSilent) => Allowed::Allowed,
                 _ if has(list, Error) => Allowed::Error,
                 _ => Allowed::Warn,
             },

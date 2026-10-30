@@ -54,6 +54,9 @@ pub trait Database: Send + Sync + ZalsaDatabase + AsDynDatabase {
         let zalsa_mut = self.zalsa_mut();
         zalsa_mut.new_revision();
         zalsa_mut.runtime_mut().report_tracked_write(durability);
+        // No field is named, so to the input-closure filters everything at or below
+        // `durability` changed: every memo that read anything is walked, as the write promises.
+        zalsa_mut.runtime_mut().changes_mut().changed_everything(durability);
     }
 
     /// Starts a new cancellation epoch, as a write does. No computation is outstanding: `&mut`

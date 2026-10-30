@@ -57,13 +57,12 @@ pub fn dyn_compatibility(
     db: &Db,
     trait_: TraitId,
 ) -> Option<DynCompatibilityViolation> {
-    let interner = DbInterner::new_no_crate(db);
-    for super_trait in elaborate::supertrait_def_ids(interner, trait_.into()) {
-        if let Some(v) = db.dyn_compatibility_of_trait(super_trait.0) {
-            return if super_trait.0 == trait_ {
+    for &super_trait in crate::utils::all_super_traits(db, trait_) {
+        if let Some(v) = db.dyn_compatibility_of_trait(super_trait) {
+            return if super_trait == trait_ {
                 Some(v)
             } else {
-                Some(DynCompatibilityViolation::HasNonCompatibleSuperTrait(super_trait.0))
+                Some(DynCompatibilityViolation::HasNonCompatibleSuperTrait(super_trait))
             };
         }
     }
@@ -79,10 +78,9 @@ pub fn dyn_compatibility_with_callback<F>(
 where
     F: FnMut(DynCompatibilityViolation) -> ControlFlow<()>,
 {
-    let interner = DbInterner::new_no_crate(db);
-    for super_trait in elaborate::supertrait_def_ids(interner, trait_.into()).skip(1) {
-        if db.dyn_compatibility_of_trait(super_trait.0).is_some() {
-            cb(DynCompatibilityViolation::HasNonCompatibleSuperTrait(super_trait.0))?;
+    for &super_trait in &crate::utils::all_super_traits(db, trait_)[1..] {
+        if db.dyn_compatibility_of_trait(super_trait).is_some() {
+            cb(DynCompatibilityViolation::HasNonCompatibleSuperTrait(super_trait))?;
         }
     }
 

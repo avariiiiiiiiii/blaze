@@ -9,8 +9,8 @@ use blaze_resolve::{Dependency, MemRegistry, PackageId, QueryKind as Matching, R
 use blaze_vfs::{View, ViewId};
 use serde::{Deserialize, Serialize};
 
-use super::index::{Status, crate_url, dep_path, index_path, parse_line};
 use super::{Index, Located, Sources};
+use crate::index::tests::{SERDE_LINE, SERDE_SHA256};
 use crate::load::files::{LoadDir, LoadFile, Mounts};
 use crate::load::invocation::Invocation as InvocationQuery;
 use crate::load::key_id;
@@ -22,10 +22,6 @@ const HOME: &str = "/home/u/.cargo";
 const CRATES_IO_SRC: &str = "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
 const CRATES_IO_INDEX: &str = "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
-const SERDE_SHA256: &str = "5f0e2c6ed6606019b4e29e69dbaba95b11854410e5347d525002456dbbb786b6";
-/// serde 1.0.219's line of `https://index.crates.io/se/rd/serde`.
-const SERDE_LINE: &str = r#"{"name":"serde","vers":"1.0.219","deps":[{"name":"serde_derive","req":"=1.0.219","features":[],"optional":true,"default_features":true,"target":null,"kind":"normal"},{"name":"serde_derive","req":"^1","features":[],"optional":false,"default_features":true,"target":"cfg(any())","kind":"normal"}],"cksum":"5f0e2c6ed6606019b4e29e69dbaba95b11854410e5347d525002456dbbb786b6","features":{"alloc":[],"default":["std"],"derive":["serde_derive"],"rc":[],"std":[],"unstable":[]},"yanked":false,"rust_version":"1.31"}"#;
-
 /// A package to locate, with the configuration the sources are made of.
 #[derive(Serialize, Deserialize, Clone)]
 struct Asked {
@@ -379,89 +375,4 @@ fn the_resolver_reads_the_index_files_mounted_and_asks_for_the_rest() {
     let file = format!("{SERDE_LINE}\n{yanked}\n{too_new}\nnot json\n");
     let read = versions(&[("serde-index", &file)], vec![mount(&index_file, "serde-index")], false);
     assert_eq!(read, Versions { found: vec!["1.0.219".to_owned(), "1.0.220 yanked".to_owned()], needs: Vec::new() });
-}
-
-#[test]
-fn a_line_of_serde_s_entry_reads_as_cargo_reads_it() {
-    let line = parse_line(SERDE_LINE.as_bytes()).unwrap();
-    assert_eq!(line.status, Status::Candidate);
-    let entry = &line.entry;
-    assert_eq!((entry.name.as_str(), entry.version.to_string()), ("serde", "1.0.219".to_owned()));
-    assert_eq!(entry.checksum, SERDE_SHA256);
-    assert_eq!(entry.rust_version.as_ref().map(ToString::to_string).as_deref(), Some("1.31"));
-    assert_eq!(entry.features["default"], ["std"]);
-    assert_eq!(entry.features["derive"], ["serde_derive"]);
-    let [optional, never] = &entry.deps[..] else { panic!("{:?}", entry.deps) };
-    assert!(optional.optional && optional.platform.is_none());
-    assert_eq!(optional.req.to_string(), "=1.0.219");
-    assert_eq!(never.platform.as_ref().map(ToString::to_string).as_deref(), Some("cfg(any())"));
-
-    let base = r#""name":"a","vers":"1.0.0","deps":[],"cksum":"00""#;
-    let status = |line: String| parse_line(line.as_bytes()).unwrap().status;
-    assert_eq!(status(format!("{{{base},\"yanked\":true}}")), Status::Yanked);
-    assert_eq!(status(format!("{{{base},\"v\":3}}")), Status::Unsupported(3));
-    assert_eq!(status(format!("{{{base},\"rust_version\":\"1.70-beta\"}}")), Status::Invalid);
-    let two = r#"{"name":"a","vers":"0.0.1","deps":[{"name":"b2","package":"b","req":"^1","features":["","x"],"kind":"build","registry":"sparse+https://example.com/index/"}],"cksum":"00","features":{"f":["b2/x"]},"features2":{"f":["dep:b2"]},"links":"a-sys","v":2}"#;
-    let line = parse_line(two.as_bytes()).unwrap();
-    assert_eq!(line.status, Status::Candidate);
-    assert_eq!(line.entry.features["f"], ["b2/x", "dep:b2"]);
-    assert_eq!(line.entry.links.as_deref(), Some("a-sys"));
-    let dep = &line.entry.deps[0];
-    assert_eq!((dep.name_in_toml.as_str(), dep.package.as_str()), ("b2", "b"));
-    assert_eq!(dep.features, ["x"]);
-    assert_eq!(dep.kind, blaze_resolve::DepKind::Build);
-    assert_eq!(dep.registry.map(|it| it.url().to_string()).as_deref(), Some("sparse+https://example.com/index/"));
-    assert!(parse_line(br#"{"name":"a","vers":"one"}"#).is_err());
-}
-
-#[test]
-fn a_file_s_lines_are_parsed_only_when_a_version_matches() {
-    let file = [
-        r#"{"name":"a","vers":"1.0.0","deps":[],"cksum":"01"}"#,
-        r#"{"name":"a","vers":"one"}"#,
-        "",
-        r#"{"vers":"1.1.0"}"#,
-        r#"{"name":"a","vers":"1.1.0","deps":"not a list","cksum":"02"}"#,
-        r#"{"name":"a","vers":"1.2.0","deps":[],"cksum":"03","yanked":true}"#,
-    ]
-    .join("\n");
-    let lines = super::index::Lines::new(file.into_bytes());
-    let parsed = |lines: &super::index::Lines| lines.parsed_count();
-    assert_eq!(parsed(&lines), 0);
-    let found = |min: &str| -> Vec<(String, Status)> {
-        let min = semver::Version::parse(min).unwrap();
-        lines.matching(|it| *it >= min).map(|it| (it.entry.version.to_string(), it.status)).collect()
-    };
-    assert_eq!(found("1.2.0"), [("1.2.0".to_owned(), Status::Yanked)]);
-    assert_eq!(parsed(&lines), 1);
-    assert_eq!(
-        found("0.0.0"),
-        [
-            ("1.0.0".to_owned(), Status::Candidate),
-            ("1.1.0".to_owned(), Status::Invalid),
-            ("1.2.0".to_owned(), Status::Yanked),
-        ]
-    );
-    assert_eq!(parsed(&lines), 3);
-}
-
-#[test]
-fn a_summary_s_features_are_in_name_order_whatever_the_line_s_order() {
-    let line = r#"{"name":"a","vers":"1.0.0","deps":[],"cksum":"00","features":{"zz":[],"b":["zz"],"a1":[]},"features2":{"m":[],"a0":[]}}"#;
-    let line = parse_line(line.as_bytes()).unwrap();
-    let summary = super::index::index_summary(&line, SourceId::crates_io()).unwrap();
-    let names: Vec<&str> = summary.summary().features().keys().map(|it| it.as_str()).collect();
-    assert_eq!(names, ["a0", "a1", "b", "m", "zz"]);
-}
-
-#[test]
-fn prefix_paths_are_cargos() {
-    assert_eq!(index_path("a"), "1/a");
-    assert_eq!(index_path("ab"), "2/ab");
-    assert_eq!(index_path("abc"), "3/a/abc");
-    assert_eq!(index_path("serde"), "se/rd/serde");
-    assert_eq!(index_path("Serde"), "se/rd/serde");
-    assert_eq!(dep_path("Serde", true), "Se/rd");
-    assert_eq!(dep_path("abc", true), "3/a");
-    assert_eq!(crate_url("https://x.example/{prefix}/{lowerprefix}/{crate}", "Serde", "1.0.0", ""), "https://x.example/Se/rd/se/rd/Serde");
 }

@@ -225,13 +225,13 @@ impl Writer for Wasm {
     }
 
     fn order(&self, classes: &mut Vec<Class>) {
-        let key = |class: &Class| {
+        fn key(class: &Class) -> (u8, &str) {
             let name = match class {
                 Class::Named { name, .. } => name.as_str(),
                 _ => "",
             };
             (place(class), name)
-        };
+        }
         classes.sort_by(|a, b| key(a).cmp(&key(b)));
         classes.dedup();
     }

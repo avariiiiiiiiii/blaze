@@ -698,7 +698,7 @@ impl Pen<'_> {
                     deps.push((krate(dep).busy_ns(now_ns), place as u32, dep));
                 }
             }
-            radix::sort_copy_by_key(&mut deps, |&(busy, place, _)| radix::pack_64(!busy, u64::from(place)));
+            radix::sort_copy_by_key(deps, |&(busy, place, _)| radix::pack_64(!busy, u64::from(place)));
             // Deeper than this, a chain goes on at the same indent.
             let indent = match last {
                 Some(last) if indent.depth < Indent::MOST => indent.with(last),

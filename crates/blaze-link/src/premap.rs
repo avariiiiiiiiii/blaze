@@ -15,9 +15,9 @@
 //!   wins, two strong ones are the duplicate symbol error), then archive members, pulled only
 //!   for what is still undefined. [`layout`] says what the run's start needs of it.
 //!
-//! These types mirror `blaze_premap::prelink` and `blaze_premap::start::WorkspaceLink` field
-//! for field: blaze-premap's `impl Prelink` and its outside are conversions of them (it
-//! depends on blaze-link, so blaze-link names none of its types).
+//! blaze-premap's prelink and table use these types as they are (it depends on blaze-link, so
+//! blaze-link names none of its types); its `Prelinked` adds the segments' bytes, and
+//! [`WorkspaceLayout`] is its `start::WorkspaceLink`, owned.
 //!
 //! Every thread-local reference of such an image is a fixed offset from the thread pointer
 //! ([`crate::state::State::tls_at`]): the initial-exec and local-exec models. A dynamic one
@@ -51,8 +51,8 @@ pub struct Request<'a> {
     pub tls_bias: i64,
     pub functions: &'a [&'a CompiledFunction],
     pub statics: &'a [&'a Static],
-    pub names: &'a [(String, Target)],
-    pub debug_names: &'a [(InstanceKey, String)],
+    pub names: &'a [&'a (String, Target)],
+    pub debug_names: &'a [&'a (InstanceKey, String)],
     pub natives: &'a [Native<'a>],
     pub spans: &'a [(ContentId, &'a [u8])],
 }
@@ -90,7 +90,8 @@ pub enum Kind {
     Function,
     /// A static or a native datum: `value` is its address.
     Data,
-    /// A thread-local: `value` is its offset from the thread pointer.
+    /// A thread-local: `value` is its offset from the thread pointer, as the image's code
+    /// reaches it (blaze-premap's `start::TlsBlock`: the image's block is the first).
     ThreadLocal,
 }
 
@@ -116,7 +117,7 @@ pub struct Def {
 
 /// A global name the image defines: Rust's (`#[no_mangle]`) and every global of a native
 /// object in it, so a workspace reference finds it here and never pulls a second copy.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: blaze-premap's `Prelinked` derives it, once per image made
 pub struct PlacedName {
     pub name: String,
     pub def: Def,
@@ -134,7 +135,7 @@ pub enum BindKind {
 /// An 8-byte cell (a GOT entry, a pointer in data) of a writable segment the run writes
 /// before anything runs: a name the image does not define, or defines only weakly (so a
 /// strong definition in the workspace wins, as in a whole link).
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: blaze-premap's `Prelinked` derives it, once per image made
 pub struct Bind {
     pub place: u64,
     pub name: String,
@@ -145,7 +146,7 @@ pub struct Bind {
 }
 
 /// A shared library the image imports from.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: blaze-premap's `Prelinked` derives it, once per image made
 pub struct Library {
     /// What the loader finds it by (`DT_SONAME`, install name, DLL name).
     pub name: String,
@@ -155,9 +156,11 @@ pub struct Library {
     pub as_needed: bool,
 }
 
-/// One piece of an init or fini array: `count` 8-byte function pointers at `at`, ordered by
-/// `rank`, then `order` (the input's place on the line, its member and its section;
-/// `u32::MAX` each for Rust's pieces), then `tie` (Rust's: the static's item and instance).
+/// One piece of an init or fini array: `count` 8-byte function pointers at `at`. A whole
+/// link orders pieces by `rank` (`.init_array.NNNNN`'s priority; 65536 for none), then
+/// by `order` (the input's place on the line, its member and its section; `u32::MAX` each
+/// for Rust's pieces, which go after natives), then by `tie` (Rust's: the static's item and
+/// instance); within a piece the pointers run in address order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct InitEntry {
     pub rank: u32,
@@ -165,6 +168,20 @@ pub struct InitEntry {
     pub tie: [u8; 64],
     pub at: u64,
     pub count: u32,
+}
+
+impl InitEntry {
+    pub fn sort_key(&self) -> (u32, [u32; 3], [u8; 64]) {
+        (self.rank, self.order, self.tie)
+    }
+
+    /// The tie of a Rust static's piece: its item's id, then its instance's.
+    pub fn tie_of(item: &ItemKey, instance: &ContentId) -> [u8; 64] {
+        let mut tie = [0; 64];
+        tie[..32].copy_from_slice(&item.0.0);
+        tie[32..].copy_from_slice(&instance.0);
+        tie
+    }
 }
 
 /// The thread-local template: initialized bytes at `template`, `init` long, then zeroes to
@@ -178,7 +195,7 @@ pub struct Tls {
 }
 
 /// What the prelink gives back.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
 pub struct Prelinked {
     /// Each function asked for: its key, address and size.
     pub functions: Vec<(InstanceKey, u64, u64)>,
@@ -203,7 +220,7 @@ pub struct Prelinked {
 
 /// What the workspace link made, as the run's start needs it: `WorkspaceLink`'s fields,
 /// owned.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
 pub struct WorkspaceLayout {
     /// The global names it defines, sorted by name, each once.
     pub names: Vec<(String, Def)>,
@@ -300,7 +317,7 @@ pub(crate) struct Place {
 
 /// The granule every segment is aligned to: the largest a system of the target maps a memory
 /// object by (16 KiB pages on Apple silicon, 64 KiB pages on AArch64 Linux kernels built so,
-/// Windows' 64 KiB allocation granularity).
+/// Windows' 64 KiB allocation granularity for a view's address and offset).
 pub fn page(format: Format, arch: Arch) -> u64 {
     match (format, arch) {
         (Format::MachO, Arch::Aarch64) => 16 << 10,
@@ -437,8 +454,8 @@ pub fn prelink_placed(request: &Request<'_>) -> Result<Placed, LinkError> {
     let change = Change {
         added: request.functions.to_vec(), // alloc: the change's lists, once per image
         statics: request.statics.to_vec(), // alloc: once per image
-        names: request.names.to_vec(), // alloc: once per image
-        debug_names: request.debug_names.to_vec(), // alloc: once per image
+        names: request.names.iter().map(|it| (*it).clone()).collect(), // clone: the change owns its names, once per image
+        debug_names: request.debug_names.iter().map(|it| (*it).clone()).collect(), // clone: as above
         natives: request.natives.to_vec(), // alloc: once per image
         spans: request.spans.to_vec(), // alloc: once per image
         ..Change::default()

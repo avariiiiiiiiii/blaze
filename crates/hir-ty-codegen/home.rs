@@ -15,7 +15,7 @@ use hir_def::{CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTy, AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitor,
-    inherent::{BoundExistentialPredicates as _, IntoKind, ParamEnv as _, SliceLike as _},
+    inherent::{BoundExistentialPredicates as _, IntoKind, SliceLike as _},
 };
 use salsa::plumbing::FromId as _;
 use smallvec::SmallVec;
@@ -232,7 +232,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
                     self.crates.insert(principal.skip_binder().def_id.0.krate(self.db));
                 }
             }
-            TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. })
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. })
                 if self.reveal =>
             {
                 let ImplTraitId::ReturnTypeImplTrait(of, _) = def_id.0.loc(self.db) else {
@@ -253,7 +253,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
                 self.revealing -= 1;
             }
             // What no `impl` gave a type is the type its name spells.
-            TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) if self.reveal => {}
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) if self.reveal => {}
             TyKind::Alias(..) | TyKind::Foreign(..) => self.opaque = true,
             _ => {}
         }
@@ -290,7 +290,7 @@ impl Homes {
         instance: &Instance,
         asked: &StoredParamEnvAndCrate,
     ) -> StoredParamEnvAndCrate {
-        if *NO_HOME || !asked.param_env(db).caller_bounds().is_empty()
+        if *NO_HOME || !asked.param_env(db).clauses().is_empty()
         {
             // clone: a refcount of the interned clauses; callers own the environment they get
             return asked.clone();

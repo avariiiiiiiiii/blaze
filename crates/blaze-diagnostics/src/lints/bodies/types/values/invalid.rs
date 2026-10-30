@@ -16,7 +16,7 @@ use hir_def::{
 use hir_ty::{
     ParamEnvAndCrate,
     consteval::try_const_usize,
-    next_solver::{EarlyBinder, GenericArgs, Ty, TyKind},
+    next_solver::{GenericArgs, Ty, TyKind},
 };
 use rustc_abi::BackendRepr;
 use rustc_type_ir::inherent::IntoKind as _;
@@ -66,7 +66,7 @@ impl LatePass for InvalidValue {
     const LINTS: LintSet = lint_set(["invalid_value"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call, ExprKind::MethodCall]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some(init) = dangerous_init(b, expr) else { return };
         let solver = util::Solver::of(b);
         let interner = solver.interner();
@@ -115,7 +115,7 @@ impl LatePass for InvalidValue {
 
 /// rustc's `is_dangerous_init`: `mem::zeroed()`, `mem::uninitialized()`, a transmute of zero, or
 /// `MaybeUninit::zeroed()` or `MaybeUninit::uninit()` with `assume_init` called on it.
-fn dangerous_init(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Init> {
+fn dangerous_init(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Init> {
     let store = b.store();
     match store.expr(expr) {
         // `mem::zeroed()` and `mem::uninitialized()` take no argument, `transmute` one.
@@ -154,7 +154,7 @@ fn dangerous_init(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Init> {
 }
 
 /// rustc's `is_zero`: an integer literal `0`, or a tuple of them.
-fn is_zero(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+fn is_zero(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     if let Some(literal) = util::literal(b, expr) {
         return matches!(literal, Literal::Int(0, _) | Literal::Uint(0, _));
     }
@@ -165,7 +165,7 @@ fn is_zero(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
 }
 
 struct InitCx<'s, 'a, 'db> {
-    b: &'s BodyCx<'a, 'db>,
+    b: &'s BodyCx<'s, 'a, 'db>,
     solver: &'s util::Solver<'db>,
     /// The expression the types are printed as types of the body near.
     near: ExprId,
@@ -266,7 +266,7 @@ impl<'db> InitCx<'_, '_, 'db> {
         let local = variant.krate(db) == b.cx.krate.base();
         let mut field_err = None;
         for (field, _) in variant.fields(db).fields().iter() {
-            let field_ty = EarlyBinder::bind(types[field].ty().skip_binder()).instantiate(interner, args).skip_norm_wip();
+            let field_ty = types[field].ty().instantiate(interner, args).skip_norm_wip();
             let Some(mut err) = self.ty_find_init_error(field_ty, init) else { continue };
             if local {
                 let source = variant.child_source_view(db, field);

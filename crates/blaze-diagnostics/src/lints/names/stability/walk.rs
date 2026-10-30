@@ -47,6 +47,7 @@ use std::ops::ControlFlow;
 use cfg::CfgOptions;
 use either::Either;
 use hir::{Adt, HasVisibility as _, HirFileId, InFile, ModuleDef, PathResolution, view::ModuleSourceView};
+use hir_def::attrs::stability::{DeprecatedSince, DeprecationEntry, Stability};
 use hir_expand::name::AsName as _;
 use intern::Symbol;
 use smallvec::SmallVec;
@@ -57,9 +58,9 @@ use syntax::{
 
 use super::{
     Site,
-    attr::{self, Stability},
-    def::{Def, trait_item},
-    lookup::{Id, Index},
+    attr,
+    def::{Def, ItemLike, trait_item},
+    lookup::Index,
     target::{self, Attribute, GenericParamKind, MethodKind, Target},
 };
 use crate::{
@@ -663,10 +664,11 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         if !self.index.staged(cx.krate) || !cx.lint_may_fire(INEFFECTIVE) {
             return;
         }
-        let Some((Stability::Unstable { feature, .. }, range)) = attr::stability_written(node, self.cfg) else {
+        let Some(range) = attr::stability_range(node, self.cfg) else { return };
+        let Some(stability) = ItemLike::at(cx, InFile::new(t.file, node)).and_then(|it| it.stability(cx.db)) else {
             return;
         };
-        if attr::unstable_feature_bound(node, self.cfg, &feature) {
+        if !stability.is_unstable() || attr::unstable_feature_bound(node, self.cfg, &stability.feature) {
             return;
         }
         let (Some(ast::Type::PathType(trait_ty)), Some(self_ty)) = (imp.trait_(), imp.self_ty()) else { return };
@@ -777,9 +779,7 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
             _ => {}
         }
         let def = Def::Item(trait_item(cx.db, def));
-        if let Some(id) = self.index.stability(def)
-            && self.index.stabilities[id as usize].is_unstable()
-        {
+        if self.index.stability(def).is_some_and(Stability::is_unstable) {
             header.stable = false;
             return;
         }
@@ -822,18 +822,23 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         let cx = self.cx;
         let site = Site { at, span, phase: Phase::Resolve };
         let mut text = None;
-        if let Some(id) = self.index.macro_stability(mac)
-            && self.index.macro_denied(id, span.file_id, span.value)
+        if let Some(stability) = self.index.macro_stability(mac)
+            && self.index.macro_denied(stability, span.file_id, span.value)
         {
             let path: &str = text.get_or_insert_with(&path);
             let def = Def::Item(ModuleDef::Macro(mac));
-            let found = super::unstable(cx, def, Some(path), &self.index.stabilities[id as usize], site);
+            let found = super::unstable(cx, def, Some(path), stability, site);
             self.reported.macro_unstable.extend(found);
         }
-        if !derive && let Some(id) = self.index.macro_deprecation(mac) {
-            let path: &str = text.get_or_insert_with(&path);
-            let found = super::deprecated_macro(cx, mac, &self.index.entries[id as usize].depr, path, site);
-            self.reported.macro_deprecated.push(found);
+        if !derive && let Some(depr) = self.index.macro_deprecation(mac) {
+            match super::in_effect(depr, self.index.current) {
+                Some(in_effect) => {
+                    let path: &str = text.get_or_insert_with(&path);
+                    let found = super::deprecated_macro(cx, mac, depr, in_effect, path, site);
+                    self.reported.macro_deprecated.push(found);
+                }
+                None => self.reported.missing.push(Found::new(super::unknown_current(cx, span), Phase::Resolve)),
+            }
         }
     }
 
@@ -898,23 +903,24 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         let cx = self.cx;
         if !used.stability_only
             && !used.derive
-            && let Some(id) = self.index.deprecation(used.def)
+            && let Some(entry) = self.index.deprecation(used.def)
         {
-            let mut report = self.index.entries[id as usize].depr.is_since_rustc_version();
+            let mut report = matches!(entry.deprecation.since, DeprecatedSince::RustcVersion(_));
             if !report {
                 let parent = self.owner_deprecation(used.owner);
-                report = !parent.is_some_and(|it| self.index.same_origin(id, it));
+                report = !parent.is_some_and(|it| entry.same_origin(&it));
             }
             if report {
                 let suggestion = used.expr.then(|| InFile::new(used.at.file_id, used.span));
-                let depr = &self.index.entries[id as usize].depr;
-                if let Some(found) = super::deprecated(cx, used.def, depr, used.site(used.span), suggestion) {
+                let current = self.index.current;
+                if let Some(found) =
+                    super::deprecated(cx, used.def, entry.deprecation, current, used.site(used.span), suggestion)
+                {
                     self.emit(used, found);
                 }
             }
         }
         let Some(stability) = self.unstable(used) else { return true };
-        let stability = &self.index.stabilities[stability as usize];
         if let Some(found) = super::unstable(cx, used.def, None, stability, used.site(used.whole)) {
             self.emit(used, found);
         }
@@ -922,7 +928,7 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
     }
 
     /// `lookup_deprecation_entry` of the item-like `owner`, as `hir_get_parent_item` of a use.
-    fn owner_deprecation(&mut self, owner: u32) -> Option<Id> {
+    fn owner_deprecation(&mut self, owner: u32) -> Option<DeprecationEntry<'db>> {
         let node = match owner {
             ROOT => self.root,
             it => self.owners[it as usize].node,
@@ -934,12 +940,12 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
     /// public definition of a dependency compiled with `#![feature(staged_api)]`, unstable,
     /// its feature not enabled nor allowed where it is used, nor the `use` it is in an
     /// unstable re-export.
-    fn unstable(&mut self, used: &Use) -> Option<Id> {
-        let id = self.index.foreign_stability(used.def)?;
-        if !self.index.denied(id, used.at.file_id, used.whole) || self.is_unstable_reexport(used.owner) {
+    fn unstable(&mut self, used: &Use) -> Option<&'db Stability> {
+        let stability = self.index.foreign_stability(used.def)?;
+        if !self.index.denied(stability, used.at.file_id, used.whole) || self.is_unstable_reexport(used.owner) {
             return None;
         }
-        Some(id)
+        Some(stability)
     }
 
     /// `is_unstable_reexport`: the item-like is a `use` that is itself unstable.
@@ -947,8 +953,7 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         if owner == ROOT || !self.owners[owner as usize].is_use || !self.index.staged(self.cx.krate) {
             return false;
         }
-        let stability = self.index.local_stability(self.owners[owner as usize].node);
-        stability.is_some_and(|it| self.index.stabilities[it as usize].is_unstable())
+        self.index.local_stability(self.owners[owner as usize].node).is_some_and(Stability::is_unstable)
     }
 
     /// Whether a use of `def` can be reported: it is deprecated or has a stability rustc
@@ -1047,7 +1052,7 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         qualifier: ast::Path<'db>,
         res: Option<PathResolution<'db>>,
         main: &Use,
-        through: Option<Id>,
+        through: Option<&'db Symbol>,
         ctx: Ctx,
     ) {
         let Some(PathResolution::Def(def)) = res else { return };
@@ -1070,14 +1075,9 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         };
         let Some(stability) = self.unstable(&used) else { return };
         let cx = self.cx;
-        let stabilities = &self.index.stabilities;
-        let message = through.and_then(|id| match &stabilities[id as usize] {
-            Stability::Stable { allowed_through_unstable_modules: Some(it) } => Some(it.as_str()),
-            _ => None,
-        });
-        let found = match message {
-            Some(message) => super::deprecated_through(cx, used.def, message, main.site(main.span)),
-            None => super::unstable(cx, used.def, None, &stabilities[stability as usize], used.site(range)),
+        let found = match through {
+            Some(message) => super::deprecated_through(cx, used.def, message, self.index.current, main.site(main.span)),
+            None => super::unstable(cx, used.def, None, stability, used.site(range)),
         };
         if let Some(found) = found {
             self.emit(&used, found);

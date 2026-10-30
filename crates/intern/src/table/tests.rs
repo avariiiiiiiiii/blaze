@@ -283,6 +283,103 @@ fn a_restore_never_accepts_a_table_it_cannot_read() {
     assert!(accepted > 0 && refused > 0, "{accepted} accepted, {refused} refused");
 }
 
+/// `section` with `patch` applied at byte `at`, as a restore sees it, and `section`'s root.
+fn patched(section: &[u8], at: impl FnOnce(&Root) -> u64, patch: &[u8]) -> (Result<Table, RestoreError>, Root) {
+    let image = image_of(section);
+    let root = *image.value::<Root>(&image.section(ID, SCHEMA).unwrap(), 0).unwrap();
+    let at = at(&root) as usize;
+    let mut bytes = section.to_vec();
+    bytes[at..at + patch.len()].copy_from_slice(patch);
+    let image = image_of(&bytes);
+    (Table::restore(shape(), image, &image.section(ID, SCHEMA).unwrap(), &serial), root)
+}
+
+/// A start past the values is refused, naming its byte, before the UTF-8 check could slice past
+/// them: a value's end is checked against the values' end, not only against the next start,
+/// which a later chunk checks.
+#[test]
+fn a_start_past_the_values_is_refused_where_it_is() {
+    let table = Table::new(shape());
+    let mut live = Live::new();
+    [&b"first value"[..], b"second", b"third"].iter().for_each(|value| live.mark_id(table.intern(value)));
+    let section = section_bytes(&table, &live);
+    let (restored, root) = patched(&section, |root| root.starts + 4, &u32::MAX.to_le_bytes());
+    let what = "a value's bytes out of order or past the values";
+    assert_eq!(restored.err(), Some(RestoreError::Invalid { section: ID, what, at: root.starts + 4 }));
+}
+
+/// A value that is not UTF-8 in a text table is refused at its first byte.
+#[test]
+fn a_value_that_is_not_text_is_refused_where_it_is() {
+    let table = Table::new(shape());
+    let mut live = Live::new();
+    live.mark_id(table.intern(b"text"));
+    let section = section_bytes(&table, &live);
+    let (restored, root) = patched(&section, |root| root.bytes, &[0xff]);
+    let what = "a value that is not UTF-8";
+    assert_eq!(restored.err(), Some(RestoreError::Invalid { section: ID, what, at: root.bytes }));
+    let error = RestoreError::Invalid { section: ID, what, at: root.bytes };
+    assert!(error.to_string().contains(&format!("at byte {}", root.bytes)), "{error}");
+}
+
+/// The table against an `FxHashMap<Vec<u8>, u32>` over seeded values, many sharing a hash tag,
+/// a home group or an order key: a value new to the map takes the next ID, a known one its own,
+/// and every ID reads back its bytes and key, in the overlay and again after a write and a
+/// restore (the mapped base), where new values continue from the same next ID.
+#[test]
+fn interning_agrees_with_a_map_model() {
+    for seed in 0..3 {
+        let mut rng = SplitMix64::new(0x5eed + seed);
+        let table = Table::new(shape());
+        let mut model: rustc_hash::FxHashMap<Vec<u8>, u32> = rustc_hash::FxHashMap::default();
+        let mut next = table.end();
+        // Text, as the shape's restore checks: short names, numbered ones, long runs, digits.
+        let value = |rng: &mut SplitMix64| -> Vec<u8> {
+            match rng.below(4) {
+                0 => name(rng).into_bytes(),
+                1 => format!("{}{}", name(rng), rng.below(50)).into_bytes(),
+                2 => "x".repeat(rng.index(300)).into_bytes(),
+                _ => {
+                    let digits = rng.next_u64().to_string();
+                    digits.as_bytes()[..rng.index(digits.len() + 1)].to_vec()
+                }
+            }
+        };
+        let check = |table: &Table, model: &mut rustc_hash::FxHashMap<Vec<u8>, u32>, next: &mut u32, bytes: Vec<u8>| {
+            let id = table.intern(&bytes);
+            let expect = match model.get(&bytes) {
+                Some(&id) => id,
+                None if STATICS.iter().any(|s| s.as_bytes() == bytes) => id,
+                None => {
+                    *next += 1;
+                    *next - 1
+                }
+            };
+            assert_eq!(id, expect, "seed {seed}: {bytes:?}");
+            model.insert(bytes.clone(), id);
+            assert_eq!(table.get(id), Some(&bytes[..]));
+            assert_eq!(table.find(&bytes), Some(id));
+            assert_eq!(table.key(id), order_key(&bytes));
+        };
+        for _ in 0..4_000 {
+            let bytes = value(&mut rng);
+            check(&table, &mut model, &mut next, bytes);
+        }
+        assert_eq!(table.end(), next);
+        let mut live = Live::new();
+        model.values().for_each(|&id| live.mark_id(id));
+        let restored = reopen(&table, &live).unwrap();
+        for (bytes, &id) in &model {
+            assert_eq!(restored.get(id), Some(&bytes[..]), "seed {seed}: restored {bytes:?}");
+            assert_eq!(restored.find(bytes), Some(id));
+        }
+        for _ in 0..1_000 {
+            let bytes = value(&mut rng);
+            check(&restored, &mut model, &mut next, bytes);
+        }
+    }
+}
+
 #[test]
 fn live_sets() {
     let mut live = Live::new();
@@ -317,6 +414,22 @@ fn value_hash_is_deterministic_and_spreads() {
     assert!(starts.iter().all(|&n| n < 60), "{:?}", starts.iter().max());
     assert_ne!(value_hash(b""), value_hash(b"\0"));
     assert_ne!(value_hash(b"ab"), value_hash(b"ba"));
+}
+
+/// The hash images' indices were written with, on fixed names (an independent port's values):
+/// moving it to `blaze_phf::name_hash` changed no image.
+#[test]
+fn value_hash_is_the_images() {
+    let pinned: [(&[u8], u64); 5] = [
+        (b"", 0x0000_0000_0000_0000),
+        (b"self", 0x8ee2_77cb_dda4_1080),
+        (b"iter_mut", 0x1968_ac94_8c10_92c0),
+        (b"core::fmt", 0x9520_d3d0_256e_a04e),
+        ("ünïcödé".as_bytes(), 0x5842_b22d_3dc8_f64d),
+    ];
+    for (bytes, hash) in pinned {
+        assert_eq!(value_hash(bytes), hash, "{bytes:?}");
+    }
 }
 
 /// Four workers taking every fourth job, in no fixed order.

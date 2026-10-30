@@ -38,3 +38,25 @@ fn done_renders_its_outcome() {
     let value: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(value["body"], json!({ "Done": { "ok": false } }));
 }
+
+/// Every character that is escaped, and those around them, is written as serde_json writes it,
+/// alone and in runs long enough for every step of a SIMD escape: at its start, its end and
+/// across one step into the next.
+#[test]
+fn escapes_are_the_bytes_serde_json_wrote() {
+    let every: String = (0u8..0x80).map(char::from).chain(['\u{e9}', '\u{2028}', '\u{1f525}']).collect();
+    let mut texts = vec![every.clone()];
+    for c in every.chars() {
+        for len in [1, 15, 16, 17, 31, 32, 33, 64] {
+            for at in [0, len / 2, len - 1] {
+                let mut text: String = "a".repeat(len);
+                text.replace_range(at..at + 1, c.encode_utf8(&mut [0; 4]));
+                texts.push(text);
+            }
+        }
+    }
+    for text in texts {
+        let envelope = Envelope::new(1, Response::Error(ApiError::new(text, None)));
+        assert_eq!(response(&envelope), serde_json::to_string(&envelope).unwrap());
+    }
+}

@@ -43,7 +43,7 @@ impl Tree {
     }
 
     pub fn root(&self) -> SyntaxNode {
-        SyntaxNode::new_flat_root(self.0.clone())
+        SyntaxNode::new_flat_root(self.0.clone()) // clone: a handle root's count; goes with the handles
     }
 
     pub fn flat(&self) -> &Arc<FlatTree> {
@@ -66,6 +66,7 @@ impl Default for SyntaxTreeBuilder {
     /// A builder that keeps the text its tokens are given, for trees not parsed from one text
     /// (macro expansions).
     fn default() -> SyntaxTreeBuilder {
+        // alloc: `Vec::new` allocates nothing until an error is pushed
         SyntaxTreeBuilder { errors: Vec::new(), inner: FlatTreeBuilder::new(), lazy: false }
     }
 }
@@ -74,7 +75,7 @@ impl SyntaxTreeBuilder {
     /// A builder whose tokens are consecutive slices of `range` of `source`, which the tree shares.
     pub(crate) fn sourced_range(source: Text, range: TextRange) -> SyntaxTreeBuilder {
         SyntaxTreeBuilder {
-            errors: Vec::new(),
+            errors: Vec::new(), // alloc: `Vec::new` allocates nothing until an error is pushed
             inner: FlatTreeBuilder::sourced_range(source, range),
             lazy: false,
         }
@@ -90,8 +91,17 @@ impl SyntaxTreeBuilder {
     }
 
     pub fn finish(self) -> Parse<SyntaxNode> {
+        self.finish_as()
+    }
+
+    /// [`SyntaxTreeBuilder::finish`] tagged [`crate::view::Untyped`], read through views.
+    pub fn finish_view(self) -> Parse<crate::view::Untyped> {
+        self.finish_as()
+    }
+
+    fn finish_as<T>(self) -> Parse<T> {
         let (tree, errors) = self.finish_raw(parser::Edition::CURRENT);
-        let tree = Tree(Arc::new(tree));
+        let tree = Tree(Arc::new(tree)); // alloc: the tree's one shared box, once per parse
         // Disable block validation, see https://github.com/rust-lang/rust-analyzer/pull/10357
         #[allow(clippy::overly_complex_bool_expr)]
         if cfg!(debug_assertions) && false {

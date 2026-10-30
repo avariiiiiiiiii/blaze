@@ -13,7 +13,7 @@
 use std::{convert::Infallible, marker::PhantomData, num::NonZeroU32};
 
 use blaze_format::{
-    FormatError, HEADER_LEN, Part, Record, SchemaHash, Slice, Writer, schema_of,
+    ALIGN, FormatError, Part, Record, SchemaHash, Slice, Writer, record_at, schema_of,
 };
 use hir_def::{AdtId, ConstParamId, GenericDefId, LifetimeParamId, TypeOrConstParamId, TypeParamId};
 use la_arena::{Idx, RawIdx};
@@ -1858,6 +1858,16 @@ impl<'db> TyTableWriter<'db> {
     }
 }
 
+/// A finished buffer holding a table [`TyTableWriter::write`] wrote, as little-endian words, to
+/// be placed with a record's columns at `u128` alignment.
+pub(crate) fn table_words(bytes: &[u8]) -> Vec<u128> {
+    assert!(bytes.len().is_multiple_of(ALIGN), "a finished buffer is padded to whole words");
+    bytes
+        .chunks_exact(size_of::<u128>())
+        .map(|chunk| u128::from_le_bytes(chunk.try_into().expect("a chunk of 16 bytes")))
+        .collect() // alloc: the record's type table, exact size, once per table persisted
+}
+
 /// The words of a node being written, onto the writer's `pending` stack above its parent's:
 /// its children are written first.
 struct Children<'w, 'db> {
@@ -1991,24 +2001,6 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
     }
 }
 
-/// The `T` at `at` in `buffer`, checked.
-fn record_at<T: Record>(buffer: &[u8], at: u64) -> Result<&T, FormatError> {
-    let bad = || FormatError::OutOfBounds { at };
-    let start = usize::try_from(at).map_err(|_| bad())?;
-    let end = start
-        .checked_add(size_of::<T>())
-        .filter(|&end| end <= buffer.len() && start >= HEADER_LEN)
-        .ok_or_else(bad)?;
-    if !(buffer.as_ptr() as usize).wrapping_add(start).is_multiple_of(align_of::<T>()) {
-        return Err(bad());
-    }
-    let bytes = &buffer[start..end];
-    T::check(bytes, buffer)?;
-    // SAFETY: `bytes` are in `buffer`, `size_of::<T>()` of them, aligned for `T`, and
-    // `T::check` accepted them, which `Record`'s contract makes a valid `T`.
-    Ok(unsafe { &*bytes.as_ptr().cast::<T>() })
-}
-
 /// The words of one value of a persisted table, its children among the values before it.
 struct Reading<'r, A> {
     values: &'r [(Kind, NonZeroU32)],
@@ -2070,7 +2062,7 @@ impl<'db, A: Fn(AdtId) -> AdtDef> Source<'db> for Reading<'_, A> {
 mod tests {
     use std::{collections::HashSet, sync::Barrier};
 
-    use blaze_format::{Aligned, Writer};
+    use blaze_format::{Aligned, HEADER_LEN, Writer};
     use hir_def::{CallableDefId, FunctionId, TypeAliasId};
     use rustc_type_ir::{FlagComputation, Flags, INNERMOST, TypeFlags};
     use salsa::plumbing::FromId;

@@ -7,6 +7,8 @@
 //! It's important that the creating query in the last iteration keeps *owning* the
 //! tracked struct from the previous iteration, otherwise Salsa will discard it
 //! and dereferencing the value panics.
+
+#![forbid(unsafe_code)]
 mod common;
 
 use crate::common::{EventLoggerDatabase, LogDatabase};

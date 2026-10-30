@@ -70,8 +70,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::TraitSolverError<'db>) -> Ve
         hir::TraitSolverErrorKind::Overflow { goal, suggest_increasing_limit } => {
             overflow(cx, goal, *suggest_increasing_limit, span)
         }
-        hir::TraitSolverErrorKind::ProjectionMismatch { goal, normalized } => {
-            projection_mismatch(cx, goal, normalized.as_ref(), span)
+        hir::TraitSolverErrorKind::ProjectionMismatch { goal, normalized, impl_ } => {
+            projection_mismatch(cx, goal, normalized.as_ref(), *impl_, span)
         }
         hir::TraitSolverErrorKind::TypesDiffer { expected, found } => {
             if let Some(expr_or_pat) = d.span.value.cast::<Either<ast::Expr, ast::Pat>>() {
@@ -255,6 +255,7 @@ fn projection_mismatch<'db>(
     cx: &Cx<'_, 'db>,
     goal: &hir::SolverGoal<'db>,
     normalized: Option<&Either<hir::Type<'db>, String>>,
+    impl_: Option<hir::Impl>,
     span: Span,
 ) -> Diag {
     let Some(text) = goal_text(cx, goal) else { return cannot_print(goal, span) };
@@ -272,13 +273,7 @@ fn projection_mismatch<'db>(
         (Some(projection), Some((expected, found))) => detailed(cx, projection, expected, found, &span),
         _ => None,
     };
-    let secondary = match &projection {
-        Some(projection) => match assoc_definition(cx, projection) {
-            Ok(it) => it,
-            Err(message) => return Diag::error(None, message, span),
-        },
-        None => None,
-    };
+    let secondary = projection.as_ref().and_then(|it| assoc_definition(cx, it, impl_?));
     let (message, at, closure) = match detailed {
         Some(it) => it,
         // clone: on the error path, for an error hir found
@@ -435,43 +430,25 @@ fn closure_head(closure: view::ClosureExpr<'_>) -> TextRange {
     TextRange::new(start, end)
 }
 
-/// rustc's secondary span of `report_projection_error`: the associated type's definition in the
-/// local impl the goal's trait ref selects (or the trait's default it uses). `None` where that impl
-/// is not in this crate; an error where blaze cannot tell which local impl applies.
-fn assoc_definition<'db>(cx: &Cx<'_, 'db>, projection: &Projection<'db>) -> Result<Option<Span>, String> {
-    let printed = cx.ty(&projection.self_ty);
-    let mut selected = None;
-    // clone: on the error path, for an error hir found
-    for impl_ in hir::Impl::all_for_type(cx.db, projection.self_ty.clone()) {
-        if impl_.trait_(cx.db) != Some(projection.trait_) || impl_.module(cx.db).krate(cx.db) != cx.krate {
-            continue;
-        }
-        let generic = !hir::GenericDef::Impl(impl_).type_or_const_params(cx.db).is_empty();
-        let applies = !generic && cx.ty(&impl_.self_ty(cx.db)) == printed;
-        if generic || (applies && selected.is_some()) {
-            // alloc: the error's text, for an error hir found
-            return Err(format!(
-                "blaze cannot tell which `impl` of `{}` for `{printed}` this requirement selected: the front end does not give it",
-                print::def_path(cx, ModuleDef::Trait(projection.trait_))
-            ));
-        }
-        if applies {
-            selected = Some(impl_);
-        }
-    }
-    let Some(impl_) = selected else { return Ok(None) };
+/// rustc's secondary span of `report_projection_error`: the associated type's definition in
+/// `impl_`, the user-written impl selection picks for the goal's trait ref, or the trait's
+/// default it uses (`specialization_graph::assoc_def`). `None` where that definition is not in
+/// this crate.
+fn assoc_definition<'db>(cx: &Cx<'_, 'db>, projection: &Projection<'db>, impl_: hir::Impl) -> Option<Span> {
     let name = projection.assoc.name(cx.db);
     let item = impl_.items(cx.db).into_iter().find_map(|it| match it {
         hir::AssocItem::TypeAlias(it) if it.name(cx.db) == name => Some(it),
         _ => None,
     });
-    let item = match item {
-        Some(it) => it,
-        None if projection.trait_.module(cx.db).krate(cx.db) == cx.krate => projection.assoc,
-        None => return Ok(None),
+    let (item, local) = match item {
+        Some(it) => (it, impl_.module(cx.db).krate(cx.db) == cx.krate),
+        None => (projection.assoc, projection.trait_.module(cx.db).krate(cx.db) == cx.krate),
     };
-    let Some(src) = cx.vsema.source(item) else { return Ok(None) };
-    Ok(src.value.ty().map(|ty| cx.span(src.with_value(ty.syntax().text_range()))))
+    if !local {
+        return None;
+    }
+    let src = cx.vsema.source(item)?;
+    src.value.ty().map(|ty| cx.span(src.with_value(ty.syntax().text_range())))
 }
 
 /// rustc's `suggest_new_overflow_limit`.

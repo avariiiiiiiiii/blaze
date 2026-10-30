@@ -15,6 +15,7 @@
 use blaze_codegen::InstanceKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
+pub use blaze_link::premap::{Def, Kind, Strength};
 
 use crate::PremapError;
 
@@ -41,37 +42,6 @@ impl SymbolId {
     pub fn name(name: &str) -> SymbolId {
         SymbolId(Hasher::new(NAME_SYMBOL_DOMAIN).part(name.as_bytes()).finish())
     }
-}
-
-/// What a symbol is.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Kind {
-    Function,
-    /// A static or a native datum: `value` is its address.
-    Data,
-    /// A thread-local: `value` is its offset from the thread pointer, as the image's code
-    /// reaches it ([`crate::start::TlsBlock`]: the image's block is the first).
-    ThreadLocal,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub enum Strength {
-    Strong,
-    /// A weak definition: a strong one elsewhere wins; of two weak ones the first on the
-    /// link line ([`Def::order`]).
-    Weak,
-}
-
-/// A symbol's definition.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Def {
-    pub value: u64,
-    pub size: u64,
-    pub kind: Kind,
-    pub strength: Strength,
-    /// Its input's place on the link line: `u32::MAX` for Rust's own pieces, which sort after
-    /// every native.
-    pub order: u32,
 }
 
 /// Where the image keeps what a slot's piece is beyond its address, each an index from 1 into

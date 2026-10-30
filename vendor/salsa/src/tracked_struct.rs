@@ -861,6 +861,7 @@ where
                     zalsa.ingredient_index_for_memo(self.ingredient_index, memo_ingredient_index);
 
                 let executor = DatabaseKeyIndex::new(ingredient_index, id);
+                zalsa.graph().forget(executor, zalsa.current_revision());
 
                 zalsa.event(&|| Event::new(EventKind::DidDiscard { key: executor }));
 

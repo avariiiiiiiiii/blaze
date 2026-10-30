@@ -14,7 +14,7 @@ use blaze_ids::{ContentId, Hasher};
 use hir_def::{
     AdtId, AttrDefId, EnumVariantId, GenericDefId, HasModule, ItemContainerId, Lookup,
     TypeAliasId, VariantId,
-    lang_item::{LangItemEnum, LangItemTarget, lang_items},
+    lang_item::{LangItemEnum, lang_items},
 };
 use hir_ty::{
     db::InternedOpaqueTyId,
@@ -55,22 +55,37 @@ impl GoalFacts for Goals {
     }
 
     fn value(&self, db: &Db, fact: FactRef) -> Option<ContentId> {
-        facts::value(db, &table::fact_of_ref(fact)?).ok()
+        fact_value(db, FactRefKey::new(db, fact))
     }
+}
+
+/// A fact as the goal store keeps it, interned: the key of [`fact_value`].
+#[salsa::interned(debug, revisions = usize::MAX)]
+pub struct FactRefKey<'db> {
+    #[returns(copy)]
+    pub fact: FactRef,
+}
+
+/// The value of a fact now, `None` for parts that are no fact or a fact that cannot be hashed.
+/// One query, so that a body step that asks a value reads `fact_value` of that fact, never the
+/// queries the value is computed from: a reader of the step's reads names the fact exactly.
+#[salsa::tracked(returns(copy))]
+pub fn fact_value<'db>(db: &'db Db, key: FactRefKey<'db>) -> Option<ContentId> {
+    facts::value(db, &table::fact_of_ref(key.fact(db))?).ok()
 }
 
 /// A crate's identity and its lang items by item key: what an interner of it reads when it
 /// is made, outside a goal's evaluation. Then the crates it loads, in order, by crate key:
 /// which crates' impls a `relevant_impls` read of it searches, which its `Implements` fact,
 /// covering every crate that can implement the trait, leaves out.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn goal_crate_key(db: &Db, krate: Crate) -> ContentId {
     let lang_items = lang_items(db, krate);
     let mut h = Hasher::new(GOAL_CRATE_DOMAIN);
     h.id(&key::crate_key(db, krate));
     for (at, item) in LangItemEnum::ALL.iter().enumerate() {
         let Some(target) = item.from_lang_items(lang_items) else { continue };
-        h.update(&(at as u32).to_le_bytes()).id(&lang_item_key(db, target).0);
+        h.update(&(at as u32).to_le_bytes()).id(&key::lang_item_key(db, target).0);
     }
     let loaded = loaded_crates(db, krate);
     h.part(b"loaded").update(&(loaded.len() as u64).to_le_bytes());
@@ -80,30 +95,18 @@ fn goal_crate_key(db: &Db, krate: Crate) -> ContentId {
     h.finish()
 }
 
-/// A lang item's target by key: as the `SolverDefId` it is, a macro by its item key.
-fn lang_item_key(db: &Db, target: LangItemTarget) -> ItemKey {
-    let def = match target {
-        LangItemTarget::EnumId(it) => SolverDefId::AdtId(it.into()),
-        LangItemTarget::StructId(it) => SolverDefId::AdtId(it.into()),
-        LangItemTarget::UnionId(it) => SolverDefId::AdtId(it.into()),
-        LangItemTarget::FunctionId(it) => SolverDefId::FunctionId(it),
-        LangItemTarget::ImplId(it) => SolverDefId::ImplId(it),
-        LangItemTarget::StaticId(it) => SolverDefId::StaticId(it),
-        LangItemTarget::TypeAliasId(it) => SolverDefId::TypeAliasId(it),
-        LangItemTarget::TraitId(it) => SolverDefId::TraitId(it),
-        LangItemTarget::EnumVariantId(it) => SolverDefId::EnumVariantId(it),
-        LangItemTarget::ConstId(it) => SolverDefId::ConstId(it),
-        LangItemTarget::MacroId(it) => return key::item_key(db, ItemId::Macro(it)),
-    };
-    key::def_key(db, def)
-}
-
 /// The fact a read of the query `name` (its ingredient's debug name) of `key` stands for. Each
 /// query here is keyed by one salsa struct, taken for one only when the key's page holds that
 /// struct, and returns part of an item's interface (its signature, bounds, fields, items,
-/// variances, attribute flags, an `impl Trait` return's hidden types: `crate::form`), the
-/// crate's target, the impls of one trait for one simplified self type, whether an impl may
-/// specialize and what it specializes, or a dependency's batch, which stands for its crate.
+/// variances, attribute flags: `crate::form`'s signature form), the hidden types of an item's
+/// `impl Trait`s, the crate's target, the impls of one trait for one simplified self type,
+/// whether an impl may specialize and what it specializes, or a dependency's batch, which
+/// stands for its crate.
+///
+/// `ImplItems::of` and `TraitItems::query_with_diagnostics` are read by name where the solver
+/// finds the impl item of a trait item (`fetch_eligible_assoc_item`): the impl's signature form
+/// writes, for each trait item in order, the impl item that name finds, so a rename that
+/// changes what it finds changes the impl's signature.
 pub(crate) fn fact_of_read(db: &Db, name: &str, key: Id) -> Option<Fact> {
     let signature = |id: ItemId| Some(Fact::Signature(key::item_key(db, id)));
     match name {
@@ -129,9 +132,10 @@ pub(crate) fn fact_of_read(db: &Db, name: &str, key: Id) -> Option<Fact> {
         | "TraitItems::query_with_diagnostics"
         | "supertraits_info"
         | "dyn_compatibility_of_trait_query" => signature(ItemId::Trait(arg(db, key)?)),
-        "FunctionSignature::kept" | "fn_sig_for_fn" | "rpit_hidden_types" => {
-            signature(ItemId::Function(arg(db, key)?))
-        }
+        "FunctionSignature::kept" | "fn_sig_for_fn" => signature(ItemId::Function(arg(db, key)?)),
+        // A hidden type is what its defining bodies leak, which the signature hash leaves out.
+        "rpit_hidden_types" => Some(facts::hidden_types(db, ItemId::Function(arg(db, key)?))),
+        "tait_hidden_types" => Some(facts::hidden_types(db, ItemId::Alias(arg(db, key)?))),
         "generic_predicates_of" | "variances_of_query" | "const_conditions_query" => {
             signature(key::generic_def_item(arg::<GenericDefId>(db, key)?))
         }

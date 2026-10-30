@@ -92,6 +92,7 @@ vfs.workspace = true
 triomphe.workspace = true
 paths.workspace = true
 syntax.workspace = true
+stdx.workspace = true
 tokio = { version = "1.47", features = ["rt-multi-thread", "fs", "io-util", "signal", "sync", "time"] }
 url.workspace = true
 # `blaze pin` writes the version into the manifest, its layout and comments kept (`versions.rs`).

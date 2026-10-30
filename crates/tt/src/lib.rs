@@ -5,6 +5,7 @@
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![feature(allocator_api)]
+#![feature(portable_simd)]
 #![deny(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]
@@ -36,7 +37,7 @@ pub use text_size::{TextRange, TextSize};
 
 pub use self::iter::{TtElement, TtIter};
 pub use self::storage::{
-    SubtreeBuilderRestorePoint, TopSubtree, TopSubtreeBuilder, Tree, TreeWords, ViewWords,
+    IndexTable, SubtreeBuilderRestorePoint, TopSubtree, aligned, TopSubtreeBuilder, Tree, TreeWords, ViewWords,
     WireError, WirePart,
 };
 

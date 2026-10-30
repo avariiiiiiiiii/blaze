@@ -400,7 +400,7 @@ pub(super) fn coerce_pointee_derive<'f>(
     // One span for them all.
     span_map.push(adt.syntax().text_range().end(), span);
 
-    let self_for_traits = syntax_bridge::syntax_node_to_token_tree(
+    let self_for_traits = syntax_bridge::reference::syntax_node_to_token_tree(
         self_for_traits.syntax(),
         &span_map,
         span,
@@ -549,6 +549,9 @@ pub(super) fn coerce_pointee_derive<'f>(
             ast::Type::PatternType(ty) => ty
                 .ty()
                 .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::UnsafeBinderType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
             ast::Type::InferType(_) | ast::Type::MacroType(_) | ast::Type::NeverType(_) => false,
         };
 
@@ -663,7 +666,7 @@ pub(super) fn parse_adt_from_handle(
     };
 
     let to_tt = |node: &syntax::SyntaxNode| {
-        syntax_bridge::syntax_node_to_token_tree(
+        syntax_bridge::reference::syntax_node_to_token_tree(
             node,
             tm,
             call_site,

@@ -50,6 +50,7 @@ stdx.workspace = true
 syntax.workspace = true
 
 blaze-codegen.workspace = true
+blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true

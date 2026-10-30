@@ -35,6 +35,7 @@ pub mod utils;
 mod variance;
 
 pub mod autoderef;
+pub mod body_store;
 pub mod check_cache;
 pub mod const_param_ty;
 pub mod const_valtree;
@@ -122,7 +123,7 @@ pub use lower::{
         Batch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits, SideTable,
     },
     diagnostics::*,
-    elided_lifetimes,
+    elided_lifetimes, hir_mutability, lower_mutability,
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
     predicate_sources, with_elided_regions,
 };
@@ -152,15 +153,15 @@ pub mod closure_analysis {
 }
 
 /// A map of a query run's temporaries, in its frame (docs/v2/plan/lanes/mem/db-infer.md, R3).
-pub(crate) type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
+pub type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
 /// A set of a query run's temporaries, in its frame.
-pub(crate) type FrameSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;
+pub type FrameSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;
 
-pub(crate) fn frame_map<K, V>(frame: &Frame) -> FrameMap<'_, K, V> {
+pub fn frame_map<K, V>(frame: &Frame) -> FrameMap<'_, K, V> {
     hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)
 }
 
-pub(crate) fn frame_set<T>(frame: &Frame) -> FrameSet<'_, T> {
+pub fn frame_set<T>(frame: &Frame) -> FrameSet<'_, T> {
     hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame)
 }
 

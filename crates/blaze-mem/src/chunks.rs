@@ -207,6 +207,29 @@ pub(crate) fn give(chunk: Chunk, owner: Tag) {
     space.warm.push(local_of(chunk.0), &space.links);
 }
 
+/// Chunks [`give_all`] moves to a space at once.
+pub(crate) const GIVE_RUN: usize = 64;
+
+/// As [`give`] for every chunk of `chunks` (at most [`GIVE_RUN`] of them): each run of one
+/// place goes back to its space with one compare-and-swap, its bytes counted with one transfer.
+pub(crate) fn give_all(chunks: &[u32], owner: Tag) {
+    debug_assert!(chunks.len() <= GIVE_RUN);
+    let mut locals = [0u32; GIVE_RUN];
+    let mut at = 0;
+    while at < chunks.len() {
+        let place = place_of(chunks[at]);
+        let mut run = 0;
+        while at < chunks.len() && place_of(chunks[at]) == place {
+            locals[run] = local_of(chunks[at]);
+            run += 1;
+            at += 1;
+        }
+        let space = made(place);
+        tag::transfer(owner, Tag::Chunks, run * CHUNK);
+        space.warm.push_all(&locals[..run], &space.links);
+    }
+}
+
 /// As [`give`], and lets the kernel take its pages first: for a chunk an owner trims after a
 /// burst rather than keeps warm.
 pub(crate) fn give_cold(chunk: Chunk, owner: Tag) {

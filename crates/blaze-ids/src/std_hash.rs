@@ -111,7 +111,8 @@ impl Hasher {
 mod tests {
     use std::hash::{Hash, Hasher as _};
 
-    use proptest::prelude::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     use crate::Hasher;
 
@@ -178,21 +179,27 @@ mod tests {
         assert_eq!(out.0, want);
     }
 
-    proptest! {
-        /// Against the reference: the hand-written forwarders `blaze-hashcons`, `hir-ty-share`,
-        /// `hir-ty-codegen` and salsa each carried, here as the bytes they wrote.
-        #[test]
-        fn matches_the_reference(a: u8, b: i16, c: u32, d: i64, e: u128, f: usize, g: isize, s: String) {
-            let mut want = vec![a];
-            want.extend(b.to_le_bytes());
-            want.extend(c.to_le_bytes());
-            want.extend(d.to_le_bytes());
-            want.extend(e.to_le_bytes());
-            want.extend((f as u64).to_le_bytes());
-            want.extend((g as i64 as u64).to_le_bytes());
-            want.extend(s.as_bytes());
-            want.push(0xff);
-            prop_assert_eq!(bytes(&(a, b, c, d, e, f, g, s.as_str())), want);
-        }
+    /// Against the reference: the hand-written forwarders `blaze-hashcons`, `hir-ty-share`,
+    /// `hir-ty-codegen` and salsa each carried, here as the bytes they wrote.
+    #[hegel::test]
+    fn matches_the_reference(tc: TestCase) {
+        let a: u8 = tc.draw(gs::integers());
+        let b: i16 = tc.draw(gs::integers());
+        let c: u32 = tc.draw(gs::integers());
+        let d: i64 = tc.draw(gs::integers());
+        let e: u128 = tc.draw(gs::integers());
+        let f: usize = tc.draw(gs::integers());
+        let g: isize = tc.draw(gs::integers());
+        let s: String = tc.draw(gs::text());
+        let mut want = vec![a];
+        want.extend(b.to_le_bytes());
+        want.extend(c.to_le_bytes());
+        want.extend(d.to_le_bytes());
+        want.extend(e.to_le_bytes());
+        want.extend((f as u64).to_le_bytes());
+        want.extend((g as i64 as u64).to_le_bytes());
+        want.extend(s.as_bytes());
+        want.push(0xff);
+        assert_eq!(bytes(&(a, b, c, d, e, f, g, s.as_str())), want);
     }
 }

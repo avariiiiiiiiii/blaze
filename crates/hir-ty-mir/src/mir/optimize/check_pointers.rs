@@ -23,7 +23,7 @@ use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use smallvec::SmallVec;
 
 use crate::{
-    db::GeneralConstId,
+    consteval::mir_const_alias_kind,
     intrinsic::Intrinsic,
     mir::{
         AssertKind, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind, FieldIndex, Local,
@@ -31,7 +31,7 @@ use crate::{
         ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, Terminator,
         TerminatorKind, UnOp, framed::block_id, transform::Ctx,
     },
-    next_solver::{Const, GenericArgs, Ty, TyKind, UnevaluatedConst},
+    next_solver::{AliasConst, Const, ConstExt, GenericArgs, IsRigid, Ty, TyKind},
 };
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
@@ -471,10 +471,9 @@ fn type_property<'db>(
         )));
     };
     let args = GenericArgs::new_from_slice(&[ty.into()]);
-    let konst = Const::new_unevaluated(
-        ctx.infcx.interner,
-        UnevaluatedConst { def: GeneralConstId::ConstId(item).into(), args },
-    );
+    let interner = ctx.infcx.interner;
+    let kind = mir_const_alias_kind(ctx.db, item);
+    let konst = Const::new_alias(interner, IsRigid::No, AliasConst::new(interner, kind, args));
     Ok(Operand {
         kind: OperandKind::Constant { konst: konst.store(), ty: consts.usize_ty.store() },
         span: None,

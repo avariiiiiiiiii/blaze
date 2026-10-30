@@ -350,7 +350,7 @@ pub struct TyLoweringContext<'db, 'a> {
     types: &'db crate::next_solver::DefaultAny<'db>,
     lang_items: &'db LangItems,
     resolver: &'a Resolver<'db>,
-    store: &'db ExpressionStore,
+    store: &'a ExpressionStore,
     def: ExpressionStoreOwnerId,
     generic_def: GenericDefId,
     generics: &'a OnceCell<Generics<'db>>,
@@ -400,7 +400,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     pub fn new(
         db: &'db Db,
         resolver: &'a Resolver<'db>,
-        store: &'db ExpressionStore,
+        store: &'a ExpressionStore,
         def: ExpressionStoreOwnerId,
         generic_def: GenericDefId,
         generics: &'a OnceCell<Generics<'db>>,
@@ -1019,12 +1019,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         }
     }
 
-    #[tracing::instrument(skip(self), ret)]
     pub fn lower_ty_ext(&mut self, type_ref_id: TypeRefId) -> (Ty<'db>, Option<TypeNs>) {
         let interner = self.interner;
         let mut res = None;
         let type_ref = self.store.type_ref(type_ref_id);
-        tracing::debug!(?type_ref);
         let ty = match type_ref {
             TypeRef::Never => self.types.types.never,
             TypeRef::Tuple(inner) => {
@@ -1198,6 +1196,18 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     return (self.types.types.error, res);
                 };
                 Ty::new_pat(self.interner, ty, pat)
+            }
+            TypeRef::UnsafeBinder { lifetimes, ty } => {
+                // rustc's resolver: the binder's lifetimes are late-bound, and an elided one
+                // inside is refused (`AnonymousReportError`).
+                let old_lifetime_elision = mem::replace(
+                    &mut self.lifetime_elision,
+                    LifetimeElisionKind::AnonymousReportError,
+                );
+                let (inner, bound_vars) =
+                    self.with_shifted_in(self.store.names(lifetimes), |ctx| ctx.lower_ty(ty));
+                self.lifetime_elision = old_lifetime_elision;
+                Ty::new_unsafe_binder(interner, Binder::bind_with_vars(inner, bound_vars))
             }
             TypeRef::Error => self.types.types.error,
         };
@@ -2179,10 +2189,18 @@ fn replace_dummy_self_with_error<'db, T: TypeFoldable<DbInterner<'db>>>(
     })
 }
 
-pub(crate) fn lower_mutability(m: hir_def::type_ref::Mutability) -> Mutability {
+pub fn lower_mutability(m: hir_def::type_ref::Mutability) -> Mutability {
     match m {
         hir_def::type_ref::Mutability::Shared => Mutability::Not,
         hir_def::type_ref::Mutability::Mut => Mutability::Mut,
+    }
+}
+
+/// [`lower_mutability`] back: the solver's mutability as the HIR writes it.
+pub fn hir_mutability(m: Mutability) -> hir_def::type_ref::Mutability {
+    match m {
+        Mutability::Not => hir_def::type_ref::Mutability::Shared,
+        Mutability::Mut => hir_def::type_ref::Mutability::Mut,
     }
 }
 
@@ -3944,7 +3962,7 @@ fn lower_generic_predicates<'db, 'f>(
 
     let generics = myself;
 
-    for (index, pred) in generics.where_predicates().iter().enumerate() {
+    for (index, pred) in generics.where_predicates().enumerate() {
         tracing::debug!(?pred);
         let written = PredicateSource::Written { def, index: index as u32 };
         for (pred, source) in ctx.lower_where_predicate(pred, false) {
@@ -4719,6 +4737,15 @@ mod tests {
 
     fn trait_id(index: u32) -> TraitId {
         TraitId::from_id(salsa::Id::from_bits(u64::from(index)))
+    }
+
+    #[test]
+    fn mutability_lowers_and_comes_back() {
+        use hir_def::type_ref::Mutability as Hir;
+        for (hir, ty) in [(Hir::Shared, Mutability::Not), (Hir::Mut, Mutability::Mut)] {
+            assert_eq!(lower_mutability(hir), ty);
+            assert_eq!(hir_mutability(ty), hir);
+        }
     }
 
     #[test]

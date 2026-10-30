@@ -17,10 +17,12 @@ mod db;
 mod editioned_file_id;
 mod files;
 mod input;
+pub mod maintain;
 mod named;
 mod reparse;
 mod table;
 pub mod target;
+pub mod trees;
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
@@ -46,6 +48,7 @@ pub use crate::{
         DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin, ProcMacroLoadingError,
         ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId, TargetKind, UniqueCrateData,
     },
+    maintain::{Maintained, Maintainer, Written},
     named::NAMED_PATHS_DOMAIN,
     reparse::Reparse,
     view::{ViewChange, ViewError, ViewFile, ViewRoot},
@@ -84,7 +87,6 @@ macro_rules! impl_intern_key {
 }
 
 pub const DEFAULT_FILE_TEXT_LRU_CAP: u16 = 16;
-pub const DEFAULT_PARSE_LRU_CAP: u16 = 128;
 pub const DEFAULT_BORROWCK_LRU_CAP: u16 = 2024;
 
 /// The set of roots for crates.io libraries.
@@ -135,18 +137,22 @@ pub fn process_env_var(db: &Db, key: &str) -> Option<String> {
 
 /// Has builds from here on be for a process with the variables `vars`.
 pub fn set_process_env(db: &mut Db, vars: Env) {
-    let content = InputId(vars.content());
-    match ProcessEnv::try_get(&*db) {
-        Some(env) => {
-            env.set_vars_field(db).to(vars);
-            if env.content_field(&*db) != content {
-                env.set_content_field(db).to(content);
+    db.batch(|db| {
+        let content = InputId(vars.content());
+        match ProcessEnv::try_get(&*db) {
+            Some(env) => {
+                env.set_vars_field(db).to(vars);
+                if env.content_field(&*db) != content {
+                    env.set_content_field(db).to(content);
+                    db.note(maintain::Note::Crates);
+                }
+            }
+            None => {
+                ProcessEnv::new(&*db, vars, content);
+                db.note(maintain::Note::Crates);
             }
         }
-        None => {
-            ProcessEnv::new(&*db, vars, content);
-        }
-    }
+    })
 }
 
 /// A file's text. Set only through [`Files`] (and the [`Db`] methods that call it),
@@ -199,8 +205,7 @@ impl FileText {
     /// [`FileText::content_of`] from the blaze-vfs ID of the text's bytes, without reading them.
     pub fn content_of_file(file: ContentId, appended_root_module: Option<&str>) -> ContentId {
         let mut hasher = Hasher::new(FileText::DOMAIN);
-        hasher.id(&file);
-        content::opt(&mut hasher, appended_root_module);
+        hasher.id(&file).opt_part(appended_root_module);
         hasher.finish()
     }
 
@@ -429,7 +434,7 @@ impl CrateWorkspaceData {
             // alloc: the error's text, once per workspace's content ID (setup, an error path).
             Err(error) => hasher.update(&[1]).part(error.to_string().as_bytes()),
         };
-        content::opt(&mut hasher, self.toolchain.as_ref().map(Version::to_string).as_deref());
+        hasher.opt_part(self.toolchain.as_ref().map(Version::to_string));
         hasher
             .update(&self.const_eval.steps.to_le_bytes())
             .update(&self.const_eval.memory.to_le_bytes())
@@ -496,16 +501,18 @@ pub fn set_all_crates_with_durability(
 ) {
     // alloc: the crate graph's list, once per set (setup).
     let crates: std::sync::Arc<[Crate]> = crates.into_iter().collect();
-    let content = InputId(crate_graph_content(&*db, &crates));
-    match AllCrates::try_get(&*db) {
-        Some(all) => {
-            all.set_crates(db).with_durability(durability).to(crates);
-            all.set_content(db).with_durability(durability).to(content);
+    db.write_crates(|db| {
+        let content = InputId(crate_graph_content(&*db, &crates));
+        match AllCrates::try_get(&*db) {
+            Some(all) => {
+                all.set_crates(db).with_durability(durability).to(crates);
+                all.set_content(db).with_durability(durability).to(content);
+            }
+            None => {
+                _ = AllCrates::builder(crates, content).durability(durability).new(&*db);
+            }
         }
-        None => {
-            _ = AllCrates::builder(crates, content).durability(durability).new(&*db);
-        }
-    }
+    })
 }
 
 /// Returns the crates in topological order.

@@ -15,7 +15,7 @@
 //! alone, as clippy leaves those it cannot place.
 
 use syntax::{
-    Direction, NodeOrToken, SyntaxKind, TextRange, TextSize,
+    Direction, TextRange, TextSize,
     view::{self as ast, AstNode as _, BinaryOp},
 };
 
@@ -192,13 +192,11 @@ pub(super) fn block_range(cx: &Cx<'_, '_>, block: ast::BlockExpr<'_>) -> Option<
 /// Where `node` starts in the tree's text: at its first child that is not whitespace or a
 /// comment, and with `with_attrs` false, not an attribute or a doc comment either.
 fn start_of(node: ast::Node<'_>, with_attrs: bool) -> TextSize {
+    if !with_attrs {
+        return ast::written_range(node).start();
+    }
     node.children_with_tokens()
-        .find(|it| match it {
-            NodeOrToken::Node(child) => {
-                with_attrs || !matches!(child.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
-            }
-            NodeOrToken::Token(token) => !token.kind().is_trivia(),
-        })
+        .find(|it| !it.kind().is_trivia())
         .map_or(node.text_range().start(), |it| it.text_range().start())
 }
 

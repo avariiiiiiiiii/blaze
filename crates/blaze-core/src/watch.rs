@@ -30,7 +30,7 @@ use std::{
 use blaze_mem::{RegionVec, Tag as MemTag};
 use rustc_hash::FxHashMap;
 
-use crate::{Done, FileName};
+use crate::{Done, FileName, utf8::push_lossy};
 
 const MASK: u32 = libc::IN_CREATE
     | libc::IN_DELETE
@@ -307,16 +307,6 @@ pub(crate) fn valid(name: &str) -> bool {
 /// Whether `name` is `dir` or under it, as [`FileName::is_under`] says.
 pub(crate) fn is_under(name: &str, dir: &str) -> bool {
     name == dir || name.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// `bytes` added to `into` as [`String::from_utf8_lossy`] reads them, with nothing allocated.
-pub(crate) fn push_lossy(into: &mut String, bytes: &[u8]) {
-    for chunk in bytes.utf8_chunks() {
-        into.push_str(chunk.valid());
-        if !chunk.invalid().is_empty() {
-            into.push(char::REPLACEMENT_CHARACTER);
-        }
-    }
 }
 
 /// What a walk does with a directory it reached.

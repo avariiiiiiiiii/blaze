@@ -3,6 +3,8 @@
 //! Test that creating a tracked struct outside of a
 //! tracked function panics with an assert message.
 
+#![forbid(unsafe_code)]
+
 #[salsa::tracked]
 struct MyTracked<'db> {
     #[returns(copy)]

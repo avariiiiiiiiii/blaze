@@ -21,7 +21,7 @@ use rustc_type_ir::{
     inherent::{IntoKind as _, Ty as _},
 };
 use span::Edition;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, trace};
 
 use crate::{
     db::HirDatabase,
@@ -298,7 +298,6 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     ///
     /// Outside of this module, `check_pat_top` should always be used.
     /// Conversely, inside this module, `check_pat_top` should never be used.
-    #[instrument(level = "debug", skip(self, pat_info))]
     fn infer_pat(&mut self, pat_id: PatId, expected: Ty<'db>, pat_info: PatInfo) {
         // For patterns containing paths, we need the path's resolution to determine whether to
         // implicitly dereference the scrutinee before matching.
@@ -1388,15 +1387,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     /// sure to apply any match-ergonomics adjustments, which we cannot
     /// determine from the HIR alone.
     pub(super) fn pat_has_ref_mut_binding(&self, pat: PatId) -> bool {
-        let mut has_ref_mut = false;
-        self.store.walk_pats(pat, &mut |pat| {
-            if let Some(BindingMode(ByRef::Yes(Mutability::Mut), _)) =
-                self.result.binding_modes.get(pat)
-            {
-                has_ref_mut = true;
-            }
-        });
-        has_ref_mut
+        crate::utils::pat_has_ref_mut_binding(self.store, pat, |pat| {
+            self.result.binding_modes.get(pat).copied()
+        })
     }
 
     // Precondition: Pat is Ref(inner)

@@ -9,7 +9,7 @@ combinators made one of 665 MB, and the store held 14.6 GB of copies of a few su
 A daemon builds a program of closures nested `DEPTH` deep with an empty store and ends; a
 second one on the same store builds it again:
 
-  - both programs have to print what cargo's does;
+  - both programs have to print what the source says (`printed`);
   - the store has to stay under `MOST` bytes;
   - the second daemon has to find in the store what the first put there.
 
@@ -20,7 +20,7 @@ import os, re, shutil, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, TARGET_ARGS, built
+from mixed import Fixture, BLAZE, sysroot_rlibs, TARGET_ARGS
 from storelib import run, scratch
 
 DEPTH = 20
@@ -56,6 +56,14 @@ def ran(binary):
     return got
 
 
+def printed():
+    """What the program prints run with no arguments: `f(1)` through every level of `wrap`."""
+    value = 1 + 1
+    for k in range(DEPTH):
+        value = (value * 3 + k) % (1 << 64)
+    return value
+
+
 def size(store):
     return sum(os.path.getsize(os.path.join(root, name)) for root, _, names in os.walk(store) for name in names)
 
@@ -73,11 +81,7 @@ def main():
     link = linkline.join(linkline.with_output(linkline.ahead(list(fx.link_args), [patch, obj], BLAZE), binary))
     symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
     ask = ["--crate", "deep", "--out", obj, "--patch", patch, "--link-cmd", link, "--binary", binary, *symbols]
-    reference = os.path.join(work, "reference")
-    cargo = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
-                           env={**os.environ, "CARGO_TARGET_DIR": reference})
-    assert cargo.returncode == 0, cargo.stderr[-2000:]
-    want = run(built(reference, "deep"))
+    want = f"{printed()}\n"
     passed = False
     try:
         logs = []
@@ -109,7 +113,7 @@ def main():
                     time.sleep(0.1)
                 got = ran(binary)
                 if got != want:
-                    raise SystemExit(f"FAIL: the {name} daemon's program prints\n{got}\nand cargo's\n{want}\n"
+                    raise SystemExit(f"FAIL: the {name} daemon's program prints\n{got}\nand the source says\n{want}\n"
                                      f"reply: {(reply.stdout + reply.stderr).strip()}\nlog: {log_path}")
             finally:
                 daemon.kill()

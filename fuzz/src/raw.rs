@@ -255,7 +255,11 @@ pub(crate) extern "C" fn __sanitizer_weak_hook_memcmp(
     unsafe { ptr::copy_nonoverlapping(s2.cast::<u8>(), b.as_mut_ptr(), len) };
     let shared = a[..len].iter().zip(&b[..len]).take_while(|(x, y)| x == y).count();
     value((caller as usize as u64).wrapping_mul(256).wrapping_add(shared as u64));
-    let slot = RECENT_WORDS_NEXT.fetch_add(1, Ordering::Relaxed) % TORC_WORDS * WORD_SLOT;
+    // A load and a store, not a locked `fetch_add`: two threads that take the same slot at once
+    // overwrite one comparison, as in `recent`'s table.
+    let next = RECENT_WORDS_NEXT.load(Ordering::Relaxed);
+    RECENT_WORDS_NEXT.store(next.wrapping_add(1), Ordering::Relaxed);
+    let slot = next % TORC_WORDS * WORD_SLOT;
     RECENT_WORDS[slot].store(len as u64, Ordering::Relaxed);
     for (i, (x, y)) in a.chunks_exact(8).zip(b.chunks_exact(8)).enumerate() {
         RECENT_WORDS[slot + 1 + i].store(u64::from_le_bytes(x.try_into().unwrap()), Ordering::Relaxed);
@@ -419,6 +423,28 @@ impl<'a> Coverage<'a> {
     pub(crate) fn run(&self, check: fn(&[u8]), data: &[u8], now: u64) -> bool {
         __sanitizer_blaze_fuzzer_run(self, check, data, now)
     }
+}
+
+/// The mutator's search for an operand it replaces ([`crate::mutate::find_from`]). Named
+/// `__sanitizer_*` and kept out of line so SanitizerCoverage leaves it alone, it adds no
+/// trace-cmp calls. It compares a byte at a time, in loops with no closure to be compiled out
+/// of line, because a slice `==` is a `memcmp`, whose operands an ASan build's hook keeps as
+/// dictionary words.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub(crate) fn __sanitizer_blaze_fuzzer_find(data: &[u8], from: &[u8], start: usize) -> Option<usize> {
+    let ends = data.len() - from.len() + 1;
+    for (low, end) in [(start, ends), (0, start)] {
+        'at: for at in low..end {
+            for (i, byte) in from.iter().enumerate() {
+                if data[at + i] != *byte {
+                    continue 'at;
+                }
+            }
+            return Some(at);
+        }
+    }
+    None
 }
 
 /// How many counter words [`__sanitizer_blaze_fuzzer_drain`] tests for zero at once: a cache

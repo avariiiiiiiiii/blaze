@@ -17,7 +17,7 @@ archiver llvm-ar, as cc-rs takes them for a wasm target.
 import os, shutil, subprocess, tempfile
 
 from blaze_cli import base_env
-from checktargets import write
+from blaze_cli import write
 
 C = r'''unsigned int csum(const unsigned char *bytes, __SIZE_TYPE__ len) {
     unsigned int hash = 2166136261u;

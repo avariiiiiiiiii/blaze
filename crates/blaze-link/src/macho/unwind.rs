@@ -20,15 +20,15 @@
 
 use std::borrow::Cow;
 
+use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 use blaze_codegen::Arch;
-use blaze_format::cursor::Reader;
 use blaze_ids::radix;
-use smallvec::SmallVec;
+use rayon::prelude::*;
 
 use crate::LinkError;
 use crate::cow::CowBytes;
 use crate::model::{Bind, Class, Delta, Function, Placed, Region, View};
-use crate::unwind::{cie_encoding, eh_pointer, eh_value};
+use crate::unwind::{Frame, concat, entry, fde_splits, frame, scan};
 
 const VERSION: u32 = 1;
 const HEADER: u64 = 28;
@@ -142,7 +142,7 @@ struct CompactRegion {
 
 /// A record of `__eh_frame`: its offset and, of an FDE, the range it covers (0..0 for a dead
 /// one); a CIE's `start` is past its `end`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Record {
     at: u64,
     start: u64,
@@ -208,11 +208,11 @@ fn full(
     let fdes = fdes(placed, keep.as_deref_mut())?;
     let Compact { mut covered, mut ends, personalities, bytes: compact_bytes } =
         compact(placed, dwarf_mode, &fdes, keep.as_deref_mut())?;
-    ends.extend(fdes.iter().map(|it| it.end));
+    ends.par_extend(fdes.par_iter().map(|it| it.end));
     if !covered.is_sorted_by_key(|it| it.addr) {
         radix::sort_copy_by_key(&mut covered, |it| it.addr);
     }
-    if !ends.is_sorted() {
+    if !ends.par_windows(2).all(|it| it[0] <= it[1]) {
         radix::sort(&mut ends);
     }
     let Rows { rows, lsdas, last: end, sorted } = rows(placed, dwarf_mode, &covered, &fdes, &ends)?;
@@ -226,8 +226,14 @@ fn full(
     }
 
     let mut encodings = Encodings::new(rows.len());
-    for row in rows.iter().filter(|it| it.encoding & MODE_MASK != dwarf_mode) {
-        encodings.count(row.encoding);
+    // A DWARF-mode row is never counted, and most of a Rust image's are: the others are found
+    // in parallel and counted in order.
+    // alloc: once per link, one list per piece of rows, empty (no buffer) where all are DWARF mode's
+    let counted: Vec<Vec<u32>> = (rows.par_chunks(CHUNK))
+        .map(|chunk| chunk.iter().filter(|it| it.encoding & MODE_MASK != dwarf_mode).map(|it| it.encoding).collect()) // alloc: per piece, none where all are DWARF mode's
+        .collect(); // alloc: once per link, one list per piece
+    for &encoding in counted.iter().flatten() {
+        encodings.count(encoding);
     }
     let mut common = Vec::with_capacity(encodings.len);
     encodings.common(&mut common);
@@ -300,15 +306,30 @@ fn full(
         out.u32(function);
         out.u32(lsda);
     }
+    debug_assert_eq!(out.at as u64, pages_at);
+    let mut rest = &mut bytes[pages_at as usize..];
+    // alloc: once per link, one slice per page
+    let mut slices: Vec<(&Page, &mut [u8])> = Vec::with_capacity(pages.len());
     for page in &pages {
-        write_page(&mut out, &rows, page, common.len(), &mut encodings, dwarf_mode);
+        let (these, after) = std::mem::take(&mut rest).split_at_mut(page.len() as usize);
+        slices.push((page, these));
+        rest = after;
     }
-    debug_assert_eq!(out.at as u64, len);
+    debug_assert!(rest.is_empty());
+    // A compressed page stamps the encodings' indexes of its own: those one after another, the
+    // regular pages in parallel.
+    for slot in slices.iter_mut().filter(|it| it.0.compressed) {
+        let page = slot.0;
+        write_page(&mut Out { bytes: &mut *slot.1, at: 0 }, &rows, page, common.len(), &mut encodings, dwarf_mode);
+    }
+    (slices.into_par_iter())
+        .filter(|it| !it.0.compressed)
+        .for_each(|(page, out)| write_regular(&mut Out { bytes: out, at: 0 }, &rows, page));
     if let Some(last) = keep {
         last.base = base;
         last.dwarf_mode = dwarf_mode;
         last.functions.clear();
-        last.functions.extend(placed.functions.iter().map(|it| (it.addr, it.size)));
+        last.functions.par_extend(placed.functions.par_iter().map(|it| (it.addr, it.size)));
         last.sorted = sorted;
         last.fdes = fdes;
         last.covered = covered;
@@ -335,17 +356,11 @@ fn write_page(
     encodings: &mut Encodings,
     dwarf_mode: u32,
 ) {
-    let rows = &rows[page.first..page.first + page.count];
     if !page.compressed {
-        out.u32(SECOND_LEVEL_REGULAR);
-        out.u16(PAGE_HEADER as u16);
-        out.u16(rows.len() as u16);
-        for row in rows {
-            out.u32(row.function);
-            out.u32(row.encoding);
-        }
+        write_regular(out, rows, page);
         return;
     }
+    let rows = &rows[page.first..page.first + page.count];
     let entries = COMPRESSED_ENTRY as usize * rows.len();
     out.u32(SECOND_LEVEL_COMPRESSED);
     out.u16(COMPRESSED_HEADER as u16);
@@ -367,6 +382,18 @@ fn write_page(
     }
     debug_assert_eq!(next - common, page.locals);
     out.at = locals_at + 4 * page.locals;
+}
+
+/// Writes the regular `page` of `rows` at `out.at`, and moves `out.at` past it.
+fn write_regular(out: &mut Out<'_>, rows: &[Row], page: &Page) {
+    let rows = &rows[page.first..page.first + page.count];
+    out.u32(SECOND_LEVEL_REGULAR);
+    out.u16(PAGE_HEADER as u16);
+    out.u16(rows.len() as u16);
+    for row in rows {
+        out.u32(row.function);
+        out.u32(row.encoding);
+    }
 }
 
 /// Patches `last`'s table into `placed`'s, which `delta` says how it differs from; `None` where
@@ -726,7 +753,7 @@ impl Last {
         let before = from.checked_sub(1).map(|at| self.rows[at]);
         self.window.clear();
         self.window_lsdas.clear();
-        merge(placed, dwarf_mode, columns, before, &mut self.window, &mut self.window_lsdas).ok()?;
+        merge(placed.plan.base, placed.functions, dwarf_mode, columns, before, &mut self.window, &mut self.window_lsdas).ok()?;
         if self.window.len() != to - from {
             return None;
         }
@@ -845,7 +872,7 @@ enum Kind {
 }
 
 /// An FDE of `__eh_frame`: 24 bytes, a column sorted by `addr`, one per address.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Fde {
     addr: u64,
     end: u64,
@@ -855,7 +882,7 @@ struct Fde {
 const _: () = assert!(size_of::<Fde>() == 24);
 
 /// A second-level entry, offsets from the image's base: 8 bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 struct Row {
     function: u32,
     encoding: u32,
@@ -994,18 +1021,41 @@ fn compact(
 
 /// Function starts in address order: [`Placed::functions`] as the core gives them, or their
 /// addresses sorted here when they are not.
+#[derive(Clone, Copy)]
 enum Starts<'a> {
     Placed(&'a [Function]),
-    Sorted(Vec<u64>),
+    Sorted(&'a [u64]),
 }
 
-impl Starts<'_> {
+impl<'a> Starts<'a> {
     fn get(&self, index: usize) -> Option<u64> {
         match self {
             Starts::Placed(functions) => functions.get(index).map(|it| it.addr),
             Starts::Sorted(starts) => starts.get(index).copied(),
         }
     }
+
+    fn len(&self) -> usize {
+        match self {
+            Starts::Placed(functions) => functions.len(),
+            Starts::Sorted(starts) => starts.len(),
+        }
+    }
+
+    fn between(self, lo: Option<u64>, hi: Option<u64>) -> Starts<'a> {
+        match self {
+            Starts::Placed(functions) => Starts::Placed(between(functions, lo, hi, |it| it.addr)),
+            Starts::Sorted(starts) => Starts::Sorted(between(starts, lo, hi, |it| *it)),
+        }
+    }
+}
+
+/// The part of the sorted `items` whose `key` is from `lo` (from the start: `None`) to below
+/// `hi` (to the end: `None`).
+fn between<T>(items: &[T], lo: Option<u64>, hi: Option<u64>, key: impl Fn(&T) -> u64) -> &[T] {
+    let from = lo.map_or(0, |lo| items.partition_point(|it| key(it) < lo));
+    let to = hi.map_or(items.len(), |hi| items.partition_point(|it| key(it) < hi));
+    &items[from..to.max(from)]
 }
 
 /// The second-level entries in address order, the LSDA index (function and LSDA offsets),
@@ -1018,6 +1068,7 @@ struct Rows {
 }
 
 /// The sorted columns [`merge`] reads.
+#[derive(Clone, Copy)]
 struct Columns<'c> {
     covered: &'c [Covered],
     fdes: &'c [Fde],
@@ -1025,7 +1076,60 @@ struct Columns<'c> {
     ends: &'c [u64],
 }
 
-/// The rows of every entry, by [`merge`].
+impl<'c> Columns<'c> {
+    /// The entries from `lo` to below `hi` ([`between`]).
+    fn between(&self, lo: Option<u64>, hi: Option<u64>) -> Columns<'c> {
+        Columns {
+            covered: between(self.covered, lo, hi, |it| it.addr),
+            fdes: between(self.fdes, lo, hi, |it| it.addr),
+            starts: self.starts.between(lo, hi),
+            ends: between(self.ends, lo, hi, |it| *it),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.covered.len() + self.fdes.len() + self.starts.len() + self.ends.len()
+    }
+
+    /// What [`merge`] needs of the row its walk of these columns leaves last: the encoding of
+    /// their greatest address (its compact entry's, its FDE's or 0), which the last row has
+    /// whether that address added one or not, as an entry adds none only with the encoding
+    /// before and no LSDA. None for no entries, or an FDE past DWARF mode's offsets (the
+    /// merge's error).
+    fn tail(&self, dwarf_mode: u32) -> Option<Row> {
+        let heads = [
+            self.covered.last().map(|it| it.addr),
+            self.fdes.last().map(|it| it.addr),
+            self.starts.get(self.starts.len().wrapping_sub(1)),
+            self.ends.last().copied(),
+        ];
+        let at = heads.into_iter().flatten().max()?;
+        let compact = self.covered.partition_point(|it| it.addr < at);
+        let encoding = match self.covered.get(compact).filter(|it| it.addr == at) {
+            Some(Covered { kind: Kind::Compact { encoding, .. }, .. }) => *encoding,
+            Some(Covered { kind: Kind::Dwarf { fde }, .. }) => dwarf_encoding(dwarf_mode, *fde)?,
+            None => match self.fdes.binary_search_by_key(&at, |it| it.addr) {
+                Ok(found) => dwarf_encoding(dwarf_mode, self.fdes[found].offset)?,
+                Err(_) => 0,
+            },
+        };
+        Some(Row { function: 0, encoding })
+    }
+}
+
+/// The DWARF-mode encoding naming the FDE at `fde` in `__eh_frame`: none past its 24 bits.
+fn dwarf_encoding(dwarf_mode: u32, fde: u64) -> Option<u32> {
+    u32::try_from(fde).ok().filter(|it| *it <= DWARF_OFFSET_MASK).map(|it| dwarf_mode | it)
+}
+
+/// Below two of this many function starts the merge is one; a piece covers at least a quarter
+/// of it.
+const MERGE: usize = 16 * 1024;
+
+/// The rows of every entry, by [`merge`]: in pieces cut at function starts, as many as the
+/// pool has threads (so every entry of an address is in one piece, and the bytes are the same
+/// on any number of threads), merged in parallel, each after the row the
+/// piece before leaves last ([`Columns::tail`]), and joined in order: the one merge's rows.
 fn rows(
     placed: &Placed<'_>,
     dwarf_mode: u32,
@@ -1034,45 +1138,81 @@ fn rows(
     ends: &[u64],
 ) -> Result<Rows, LinkError> {
     let base = placed.plan.base;
-    let mut last = base;
-    let mut sorted = true;
-    let mut previous = 0;
-    for function in placed.functions {
-        last = last.max(function.addr.saturating_add(function.size));
-        sorted &= previous <= function.addr;
-        previous = function.addr;
-    }
+    let functions = placed.functions;
+    let last = (functions.par_iter().with_min_len(CHUNK))
+        .map(|it| it.addr.saturating_add(it.size))
+        .reduce(|| base, u64::max);
+    let sorted = functions.par_windows(2).all(|it| it[0].addr <= it[1].addr);
+    // alloc: only for functions out of address order, which `Placed` lists in order
+    let mut held = Vec::new();
     let starts = if sorted {
-        Starts::Placed(placed.functions)
+        Starts::Placed(functions)
     } else {
-        let mut starts = Vec::with_capacity(placed.functions.len());
-        starts.extend(placed.functions.iter().map(|it| it.addr));
-        radix::sort(&mut starts);
-        Starts::Sorted(starts)
+        held.reserve_exact(functions.len());
+        held.extend(functions.iter().map(|it| it.addr));
+        radix::sort(&mut held);
+        Starts::Sorted(&held)
     };
-
-    let mut rows: Vec<Row> =
-        Vec::with_capacity(placed.functions.len() + covered.len() + fdes.len() + ends.len());
-    // An LSDA is a compact entry's: at most one each.
-    let mut lsdas = Vec::with_capacity(covered.len());
     let columns = Columns { covered, fdes, starts, ends };
-    let greatest = merge(placed, dwarf_mode, columns, None, &mut rows, &mut lsdas)?;
-    Ok(Rows { rows, lsdas, last: last.max(greatest), sorted })
+    if starts.len() < 2 * MERGE {
+        // alloc: once per link, the rows: at most one an entry of a column
+        let mut rows: Vec<Row> = Vec::with_capacity(columns.len());
+        // An LSDA is a compact entry's: at most one each.
+        let mut lsdas = Vec::with_capacity(covered.len());
+        let greatest = merge(base, functions, dwarf_mode, columns, None, &mut rows, &mut lsdas)?;
+        return Ok(Rows { rows, lsdas, last: last.max(greatest), sorted });
+    }
+    // alloc: once per link, one cut per piece
+    let every = (MERGE / 4).max(starts.len().div_ceil(rayon::current_num_threads().max(1)));
+    let mut cuts: Vec<u64> = Vec::with_capacity(starts.len() / every);
+    for k in (every..starts.len()).step_by(every) {
+        let at = starts.get(k).expect("a start below the count");
+        if cuts.last().is_none_or(|it| *it < at) {
+            cuts.push(at);
+        }
+    }
+    let piece = |nth: usize| -> Result<(Vec<Row>, Vec<(u32, u32)>, u64), LinkError> {
+        let lo = nth.checked_sub(1).map(|it| cuts[it]);
+        let these = columns.between(lo, cuts.get(nth).copied());
+        let before = match nth {
+            0 => None,
+            1 => columns.between(None, lo).tail(dwarf_mode),
+            _ => columns.between(Some(cuts[nth - 2]), lo).tail(dwarf_mode),
+        };
+        // alloc: once per piece, its rows and LSDAs
+        let (mut rows, mut lsdas) = (Vec::with_capacity(these.len()), Vec::with_capacity(these.covered.len()));
+        let greatest = merge(base, functions, dwarf_mode, these, before, &mut rows, &mut lsdas)?;
+        Ok((rows, lsdas, greatest))
+    };
+    // alloc: once per link, one result per piece
+    let pieces: Vec<Result<(Vec<Row>, Vec<(u32, u32)>, u64), LinkError>> =
+        (0..cuts.len() + 1).into_par_iter().map(piece).collect(); // alloc: once per link, one result per piece
+    // alloc: once per link, one entry per piece
+    let mut done = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        done.push(piece?);
+    }
+    let greatest = done.iter().map(|it| it.2).max().unwrap_or(0);
+    // alloc: once per link, one slice per piece of rows and of LSDAs
+    let rows: Vec<&[Row]> = done.iter().map(|it| &it.0[..]).collect(); // alloc: once per link, a slice per piece
+    let lsdas: Vec<&[(u32, u32)]> = done.iter().map(|it| &it.1[..]).collect(); // alloc: once per link, a slice per piece
+    Ok(Rows { rows: concat(&rows), lsdas: concat(&lsdas), last: last.max(greatest), sorted })
 }
 
 /// One merge of the sorted columns into `rows` and `lsdas`, after `before`, the row before
 /// them: of one address the compact entry wins, then the FDE, then a function without either
 /// (encoding 0), then the end of a covered range (encoding 0); an entry with the encoding of
 /// the one before and neither with an LSDA adds nothing (as ld64). The greatest address seen.
+/// `base` is the image's and `functions` [`Placed::functions`], for an error's names.
 fn merge(
-    placed: &Placed<'_>,
+    base: u64,
+    functions: &[Function],
     dwarf_mode: u32,
     columns: Columns<'_>,
     before: Option<Row>,
     rows: &mut Vec<Row>,
     lsdas: &mut Vec<(u32, u32)>,
 ) -> Result<u64, LinkError> {
-    let base = placed.plan.base;
     let Columns { covered, fdes, starts, ends } = columns;
     // The row before has an LSDA only as the entry just before: the next is never merged.
     let mut previous = before.map(|it| it.encoding);
@@ -1118,7 +1258,7 @@ fn merge(
                     return Err(error(format!(
                         "__unwind_info: the FDE of {} is at {fde:#x} in __eh_frame, past the 24 \
                          bits DWARF mode has for it",
-                        named(placed, at)
+                        named_in(functions, at)
                     )));
                 };
                 (dwarf_mode | fde, 0)
@@ -1270,7 +1410,10 @@ impl Encodings {
         let mut pages = Vec::with_capacity(rows.len() / PAGE_ENTRIES + 1);
         let mut i = 0;
         while i < rows.len() {
-            let page = self.page(rows, i, common, dwarf_mode);
+            let page = match dwarf_page(rows, i, common, dwarf_mode) {
+                Some(page) => page,
+                None => self.page(rows, i, common, dwarf_mode),
+            };
             i += page.count;
             pages.push(page);
         }
@@ -1307,6 +1450,24 @@ impl Encodings {
             Page { first, count, compressed: true, locals: next - common, at: 0 }
         }
     }
+}
+
+/// The page [`Encodings::page`] starts at `rows[first]` when a regular page's worth of rows
+/// from there are all DWARF mode's and more follow than a compressed page holds of them,
+/// found without walking them one by one: each takes 8 bytes and an index of its own, so a
+/// compressed page holds at most 510 by its bytes and `ENCODINGS_MAX - common` by its indexes,
+/// fewer than a regular page's 511, so the page is regular. None otherwise (the last page,
+/// whose 24-bit offsets [`Encodings::page`] checks, or one of other encodings).
+fn dwarf_page(rows: &[Row], first: usize, common: usize, dwarf_mode: u32) -> Option<Page> {
+    let left = rows.len() - first;
+    let most = (((PAGE - COMPRESSED_HEADER) / COMPRESSED_ENTRY / 2) as usize).min(ENCODINGS_MAX.saturating_sub(common));
+    if left <= most {
+        return None;
+    }
+    let window = &rows[first..first + PAGE_ENTRIES.min(left)];
+    // A fold, not an early exit, so it is vectorized: 4 KiB a page.
+    let other = window.iter().fold(0, |acc, it| acc | ((it.encoding & MODE_MASK) ^ dwarf_mode));
+    (other == 0).then_some(Page { first, count: PAGE_ENTRIES.min(left), compressed: false, locals: 0, at: 0 })
 }
 
 /// A second-level page: its rows, of a compressed one how many encodings of its own, and its
@@ -1357,10 +1518,8 @@ impl Out<'_> {
 }
 
 /// Every FDE of `__eh_frame`, sorted by the start of the function it covers; of two at one
-/// address, the first. One pass over the records, reading of a CIE only its FDE pointer
-/// encoding and of an FDE only `pc_begin` and `pc_range`, under gimli's rules for both (CIE
-/// versions 1, 3 and 4; `z`, `L`, `P`, `R`, `S` augmentations; pointers absolute or relative
-/// to where they are, indirection ignored); an FDE at 0 was of a dead function. Into `keep`,
+/// address, the first. One [`scan`] of the records (an FDE at 0 was of a dead function), in
+/// parallel pieces split where the core placed every [`CHUNK`]th function's FDE. Into `keep`,
 /// every record, the CIEs, where the scan stopped and whether two FDEs started at one address.
 fn fdes(placed: &Placed<'_>, mut keep: Option<&mut Last>) -> Result<Vec<Fde>, LinkError> {
     if let Some(last) = keep.as_deref_mut() {
@@ -1374,44 +1533,92 @@ fn fdes(placed: &Placed<'_>, mut keep: Option<&mut Last>) -> Result<Vec<Fde>, Li
         return Ok(Vec::new());
     };
     let bytes = region_bytes(placed, index, region, "__eh_frame")?;
-    // An FDE takes at least 10 bytes and the core's take 24 or more: this grows at most twice.
-    let mut fdes = Vec::with_capacity(bytes.len() / 32);
-    // A CIE per distinct one the core made and per native object's: on the stack up to 16.
-    let mut cies: SmallVec<[(usize, u8); 16]> = SmallVec::new();
-    // alloc: only for a record across two pages, grown to the longest such record once per build
-    let mut across = Vec::new();
-    let mut at = 0;
-    while at < bytes.len() {
-        let (parsed, next) = record(bytes, at, region.addr, &cies, &mut across)?;
-        let kept = match parsed {
-            Parsed::End => break,
-            Parsed::Cie(encoding) => {
-                cies.push((at, encoding));
-                Record { at: at as u64, start: u64::MAX, end: 0 }
-            }
-            Parsed::Fde { start, end } => {
-                if start != 0 {
-                    fdes.push(Fde { addr: start, end, offset: at as u64 });
+    let section = region.addr;
+    let splits = fde_splits(placed, section, bytes.len(), CHUNK);
+    // alloc: error path
+    let failed = |why: String| error(format!("__eh_frame at {section:#x}: {why}"));
+    let mut fdes = match keep.as_deref_mut() {
+        None => {
+            let each = |at: usize, frame: Frame, fdes: &mut Vec<Fde>| {
+                if let Frame::Fde { pc, len } = frame
+                    && pc != 0
+                {
+                    let (addr, end) = covers(at, pc, len)?;
+                    fdes.push(Fde { addr, end, offset: at as u64 });
                 }
-                Record { at: at as u64, start, end }
-            }
-        };
-        if let Some(last) = keep.as_deref_mut() {
-            last.records.push(kept);
+                Ok(())
+            };
+            scan(bytes, section, &splits, each).map_err(failed)?.items
         }
-        at = next;
-    }
-    if !fdes.is_sorted_by_key(|it| it.addr) {
+        Some(last) => {
+            let each = |at: usize, frame: Frame, records: &mut Vec<Record>| {
+                records.push(match frame {
+                    Frame::Cie(_) => Record { at: at as u64, start: u64::MAX, end: 0 },
+                    Frame::Fde { pc, len } => {
+                        let (start, end) = covers(at, pc, len)?;
+                        Record { at: at as u64, start, end }
+                    }
+                });
+                Ok(())
+            };
+            let scan = scan(bytes, section, &splits, each).map_err(failed)?;
+            last.records = scan.items;
+            last.cies = scan.cies;
+            last.eh_end = scan.end;
+            live_fdes(&last.records)
+        }
+    };
+    if !fdes.par_windows(2).all(|it| it[0].addr <= it[1].addr) {
         radix::sort_copy_by_key(&mut fdes, |it| it.addr);
     }
-    let found = fdes.len();
-    fdes.dedup_by_key(|it| it.addr);
+    let dups = fdes.par_windows(2).any(|it| it[0].addr == it[1].addr);
+    if dups {
+        fdes.dedup_by_key(|it| it.addr);
+    }
     if let Some(last) = keep {
-        last.cies.extend_from_slice(&cies);
-        last.eh_end = at;
-        last.dups = fdes.len() != found;
+        last.dups = dups;
     }
     Ok(fdes)
+}
+
+/// Functions a piece of the `__eh_frame` scan reads the FDEs of, and FDE records a piece of
+/// [`live_fdes`] turns into the column.
+const CHUNK: usize = 4096;
+
+/// The range an FDE at `at` covers from `pc`, `len` bytes: none (0..0) for a dead one.
+fn covers(at: usize, pc: u64, len: u64) -> Result<(u64, u64), String> {
+    if pc == 0 {
+        return Ok((0, 0));
+    }
+    // alloc: error path
+    let end = pc.checked_add(len).ok_or_else(|| format!("the FDE at offset {at:#x} covers past the end of the address space"))?;
+    Ok((pc, end))
+}
+
+/// The column of the FDEs of `records` that cover something, in order: counted, then filled
+/// at their place, a piece of [`CHUNK`] records a task.
+fn live_fdes(records: &[Record]) -> Vec<Fde> {
+    let live = |it: &&Record| !it.cie() && it.start != 0;
+    // alloc: once per link, a count per piece
+    let counts: Vec<usize> = records.par_chunks(CHUNK).map(|chunk| chunk.iter().filter(live).count()).collect();
+    let len = counts.iter().sum();
+    // alloc: once per link, the column, filled in parallel at each piece's place
+    let mut fdes: Vec<Fde> = Vec::with_capacity(len);
+    fdes.par_extend((0..len).into_par_iter().with_min_len(CHUNK).map(|_| Fde::default()));
+    let mut rest = &mut fdes[..];
+    // alloc: once per link, one slice per piece
+    let mut jobs = Vec::with_capacity(counts.len());
+    for (chunk, &count) in records.chunks(CHUNK).zip(&counts) {
+        let (these, after) = std::mem::take(&mut rest).split_at_mut(count);
+        jobs.push((these, chunk));
+        rest = after;
+    }
+    jobs.into_par_iter().for_each(|(out, chunk)| {
+        for (out, it) in out.iter_mut().zip(chunk.iter().filter(live)) {
+            *out = Fde { addr: it.start, end: it.end, offset: it.at };
+        }
+    });
+    fdes
 }
 
 /// A record of `__eh_frame`: the terminator, a CIE with its FDE pointer encoding, or an FDE
@@ -1422,9 +1629,9 @@ enum Parsed {
     Fde { start: u64, end: u64 },
 }
 
-/// The record at offset `record` of `__eh_frame` (`bytes`, at address `section`), and the
-/// offset after it; `cies` holds the CIEs before it, by offset. The record is read in place,
-/// or put together in `across` where it crosses a page.
+/// The record at offset `record` of `__eh_frame` (`bytes`, at address `section`), read as
+/// [`scan`] reads it, and the offset after it; `cies` holds the CIEs, by offset. The record is
+/// read in place, or put together in `across` where it crosses a page.
 fn record(
     bytes: View<'_>,
     record: usize,
@@ -1432,51 +1639,26 @@ fn record(
     cies: &[(usize, u8)],
     across: &mut Vec<u8>,
 ) -> Result<(Parsed, usize), LinkError> {
-    const EARLY: &str = "bytes that end early";
     let bad = |what: &str| {
         // alloc: error path
         error(format!("__eh_frame at {section:#x}: the entry at offset {record:#x}: {what}"))
     };
-    let (length, body) = match bytes.u32(record).ok_or_else(|| bad(EARLY))? {
-        0 => return Ok((Parsed::End, record)),
-        0xffff_fff0..=0xffff_fffe => return Err(bad("a reserved initial length")),
-        0xffff_ffff => (bytes.u64(record + 4).ok_or_else(|| bad(EARLY))?, record + 12),
-        length => (u64::from(length), record + 4),
+    let Some(found) = entry(bytes, record).map_err(bad)? else {
+        return Ok((Parsed::End, record));
     };
-    let end = usize::try_from(length)
-        .ok()
-        .and_then(|it| body.checked_add(it))
-        .filter(|it| *it <= bytes.len())
-        .ok_or_else(|| bad("longer than the section"))?;
-    // Positions in `reader` are from the record's start, at `base` in the address space.
-    let base = section + record as u64;
-    let held = bytes.read(record, end - record, across).ok_or_else(|| bad(EARLY))?;
-    let mut reader = Reader::starting_at(held, body - record).map_err(|it| bad(it.as_str()))?;
-    let id = reader.u32().map_err(|it| bad(it.as_str()))?;
-    if id == 0 {
-        let encoding = cie_encoding(&mut reader, base).map_err(bad)?;
-        return Ok((Parsed::Cie(encoding), end));
-    }
-    let Some(cie) = body.checked_sub(id as usize) else {
-        return Err(bad("its CIE pointer is before the section"));
+    let cie = |named: usize| -> Result<u8, &'static str> {
+        let found = cies.binary_search_by_key(&named, |it| it.0).map_err(|_| "its CIE pointer names no CIE")?;
+        Ok(cies[found].1)
     };
-    let Ok(found) = cies.binary_search_by_key(&cie, |it| it.0) else {
-        return Err(bad("its CIE pointer names no CIE"));
+    let parsed = match frame(bytes, record, found, section, across, cie).map_err(bad)? {
+        Frame::Cie(encoding) => Parsed::Cie(encoding),
+        Frame::Fde { pc, len } => {
+            // alloc: error path
+            let (start, end) = covers(record, pc, len).map_err(|it| error(format!("__eh_frame at {section:#x}: {it}")))?;
+            Parsed::Fde { start, end }
+        }
     };
-    let encoding = cies[found].1;
-    let start = eh_pointer(&mut reader, encoding, base).map_err(bad)?;
-    let len = eh_value(&mut reader, encoding).map_err(bad)?;
-    if start == 0 {
-        return Ok((Parsed::Fde { start: 0, end: 0 }, end));
-    }
-    let stop = start.checked_add(len).ok_or_else(|| {
-        // alloc: error path
-        error(format!(
-            "__eh_frame at {section:#x}: the FDE at offset {record:#x} covers past the end of the \
-             address space"
-        ))
-    })?;
-    Ok((Parsed::Fde { start, end: stop }, end))
+    Ok((parsed, found.1))
 }
 
 fn region_bytes<'p>(placed: &Placed<'p>, index: usize, region: &Region, name: &str) -> Result<View<'p>, LinkError> {
@@ -1505,20 +1687,17 @@ fn offset(base: u64, addr: u64, what: &str) -> Result<u32, LinkError> {
 
 /// The function at `addr`, for an error: called only to build one.
 fn named(placed: &Placed<'_>, addr: u64) -> String {
-    match placed.functions.iter().find(|it| it.addr == addr).and_then(|it| it.name.as_deref()) {
+    named_in(placed.functions, addr)
+}
+
+/// The function of `functions` at `addr`, for an error.
+fn named_in(functions: &[Function], addr: u64) -> String {
+    match functions.iter().find(|it| it.addr == addr).and_then(|it| it.name.as_deref()) {
         // alloc: error path
         Some(name) => format!("`{name}` at {addr:#x}"),
         // alloc: error path
         None => format!("the function at {addr:#x}"),
     }
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
 }
 
 fn error(what: String) -> LinkError {
@@ -2441,6 +2620,112 @@ mod tests {
             binds.reverse();
         }
         Case { arch, functions, fdes: frames.len() as u64, eh: section.0.into_vec(), cu, binds }
+    }
+
+    /// Columns of `n` functions 16 bytes apart: some covered by compact entries of a few
+    /// encodings (some with LSDAs), some by FDEs, ends short of the next function or at it,
+    /// long runs of plain functions whose rows the merge leaves out.
+    fn merge_columns(rng: &mut Rng, n: u64) -> (Vec<Function>, Vec<super::Covered>, Vec<super::Fde>, Vec<u64>) {
+        let (mut functions, mut covered, mut fdes, mut ends) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            let addr = TEXT + 16 * i;
+            functions.push(function(addr, 16, "f"));
+            let end = if rng.below(4) == 0 { addr + 8 } else { addr + 16 };
+            match rng.below(10) {
+                0..=2 => {
+                    let lsda = if rng.below(10) == 0 { LSDA + 8 * i } else { 0 };
+                    let encoding = 0x0200_0000 | ((rng.below(3) as u32) << 4) | if lsda != 0 { HAS_LSDA } else { 0 };
+                    covered.push(super::Covered { addr, kind: super::Kind::Compact { encoding, lsda } });
+                    ends.push(end);
+                }
+                3..=5 => {
+                    fdes.push(super::Fde { addr, end, offset: 32 * i });
+                    ends.push(end);
+                }
+                _ => {}
+            }
+        }
+        ends.sort_unstable();
+        (functions, covered, fdes, ends)
+    }
+
+    /// The rows merged in pieces are the one merge's, at cuts amid runs the merge leaves out.
+    #[test]
+    fn rows_merged_in_pieces_are_the_one_merges() {
+        // Sixteen threads, so the merge is cut into pieces on any machine.
+        rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap().install(|| {
+            for seed in [1u64, 2, 3] {
+                let mut rng = Rng::new(seed);
+                let n = 3 * super::MERGE as u64 + rng.below(5000);
+                let (functions, covered, fdes, ends) = merge_columns(&mut rng, n);
+                let output = output(Arch::Aarch64);
+                let plan = plan();
+                let placed = placed(&output, &plan, &[], &[], &functions, &[]);
+                let got = super::rows(&placed, ARM64_MODE_DWARF, &covered, &fdes, &ends).unwrap();
+                let columns = super::Columns { covered: &covered, fdes: &fdes, starts: super::Starts::Placed(&functions), ends: &ends };
+                let (mut rows, mut lsdas) = (Vec::new(), Vec::new());
+                let greatest = super::merge(BASE, &functions, ARM64_MODE_DWARF, columns, None, &mut rows, &mut lsdas).unwrap();
+                assert!(rows.len() < functions.len(), "seed {seed}: some entries add no row");
+                assert_eq!(got.rows, rows, "seed {seed}");
+                assert_eq!(got.lsdas, lsdas, "seed {seed}");
+                assert_eq!(got.last, greatest.max(TEXT + 16 * n), "seed {seed}");
+                assert!(got.sorted);
+            }
+        });
+    }
+
+    /// Pages split with the shortcut for runs of DWARF-mode rows are those the walk splits.
+    #[test]
+    fn dwarf_runs_split_into_the_pages_the_walk_makes() {
+        let mut rng = Rng::new(0x7061_6765);
+        for round in 0..6 {
+            let n = 2000 + rng.below(8000) as usize;
+            let rows: Vec<super::Row> = (0..n as u32)
+                .map(|i| {
+                    let dwarf = round % 2 == 0 || rng.below(50) != 0;
+                    let encoding = if dwarf { ARM64_MODE_DWARF | i } else { 0x0200_0000 | ((rng.below(4) as u32) << 4) };
+                    super::Row { function: 16 * i, encoding }
+                })
+                .collect();
+            let mut encodings = super::Encodings::new(rows.len());
+            for row in rows.iter().filter(|it| it.encoding & MODE_MASK != ARM64_MODE_DWARF) {
+                encodings.count(row.encoding);
+            }
+            let mut common = Vec::new();
+            encodings.common(&mut common);
+            let got = encodings.pages(&rows, common.len(), ARM64_MODE_DWARF);
+            let mut walked = Vec::new();
+            let mut i = 0;
+            while i < rows.len() {
+                let page = encodings.page(&rows, i, common.len(), ARM64_MODE_DWARF);
+                i += page.count;
+                walked.push(page);
+            }
+            let shape = |pages: &[super::Page]| pages.iter().map(|it| (it.first, it.count, it.compressed, it.locals)).collect::<Vec<_>>();
+            assert_eq!(shape(&got), shape(&walked), "round {round}");
+        }
+    }
+
+    /// The FDE column filled in pieces is the records' live FDEs in order.
+    #[test]
+    fn live_fdes_are_the_records_fdes_in_order() {
+        let mut rng = Rng::new(0x6c69_7665);
+        for n in [0, 1, super::CHUNK - 1, 3 * super::CHUNK + 17] {
+            let records: Vec<super::Record> = (0..n as u64)
+                .map(|at| match rng.below(4) {
+                    0 => super::Record { at, start: u64::MAX, end: 0 },
+                    1 => super::Record { at, start: 0, end: 0 },
+                    _ => super::Record { at, start: 0x1000 + at, end: 0x1010 + at },
+                })
+                .collect();
+            let want: Vec<(u64, u64, u64)> = (records.iter())
+                .filter(|it| !it.cie() && it.start != 0)
+                .map(|it| (it.start, it.end, it.at))
+                .collect();
+            let got: Vec<(u64, u64, u64)> =
+                super::live_fdes(&records).iter().map(|it| (it.addr, it.end, it.offset)).collect();
+            assert_eq!(got, want, "{n} records");
+        }
     }
 
     #[test]

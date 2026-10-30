@@ -8,7 +8,8 @@ use hir_def::ConstParamId;
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_type_ir::{
     DebruijnIndex, FlagComputation, GenericTypeVisitable, TypeFlags, TypeFoldable as _,
-    TypeVisitable as _, TypeVisitableExt, WithCachedTypeInfo, intern::Interned, relate::Relate,
+    TypeVisitable as _, TypeVisitableExt, WithCachedTypeInfo, inherent::IntoKind,
+    intern::Interned, relate::Relate,
 };
 
 use crate::{

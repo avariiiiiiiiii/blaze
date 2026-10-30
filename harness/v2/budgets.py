@@ -92,9 +92,11 @@ their pinned revisions, except blaze, which is the files of this checkout as the
 
 Each project's checkout has a blaze home and store of its own and a cargo target directory
 outside the checkout (engine.reference_env). A build blaze did not serve (`Engine.not_blazes`)
-or that fails is a fail. The cold program, and the program after the first of every edit's runs,
-has to print what cargo's build of the same source prints (blaze_cli.program_output): a fast
-wrong build passes nothing. Every edit is varied from run to run (bench.py's statement and
+or that fails is a fail. The program after the first of every edit's runs, and after a warm
+start, has to print what blaze's own build of the same source from nothing prints (a home, a
+store and a `target-scratch` of its own, removed after it; blaze_cli.program_output): a fast
+wrong build passes nothing. cargo is the baseline of the speed and memory rows alone, and in
+`dev-speed` and `release-speed` blaze's program has to exit 0. Every edit is varied from run to run (bench.py's statement and
 parameter with another value, blank lines and indentation by more, comments with another text,
 another name), so no run is a store's hit for the one before it. `selftest` checks the parts that
 need neither blaze nor cargo nor the network: edit generation, budget evaluation, /proc/stat.
@@ -270,8 +272,8 @@ TABLES = {row.key: row.key.removeprefix("layout-") for row in ROWS if row.budget
 
 
 class Wrong(Exception):
-    """A finding about the compiler: a build that failed or was not blaze's, a program that prints
-    something else than cargo's, a test that failed."""
+    """A finding about the compiler: a build that failed or was not blaze's, a warm program that
+    prints something else than blaze's build of it from nothing, a test that failed."""
 
 
 HARNESS_ERRORS = (AssertionError, OSError, ValueError, subprocess.SubprocessError)
@@ -761,6 +763,18 @@ def perf_counts(text: str) -> dict[str, int]:
     return counts
 
 
+FLOOR_RUNS = 9
+
+
+def harness_floor_ms(cwd: Path, env: dict[str, str]) -> float:
+    """The most of a timed command that is the harness's: the median `engine.run` of `true`, which
+    does nothing, so its time is the spawn, the pipes, the reap and `true`'s own exec."""
+    true = shutil.which("true")
+    if true is None:
+        raise engine.Failed("no `true` on PATH: the harness's own share of a timed command is timed on it")
+    return statistics.median(engine.run("the harness's floor", [true], cwd, env).seconds for _ in range(FLOOR_RUNS)) * 1000
+
+
 def served(eng: engine.Engine, step: str, ran: engine.Ran) -> engine.Ran:
     """`ran`, when it ended well and blaze served it; else a Wrong saying what happened."""
     if ran.returncode != 0:
@@ -844,36 +858,48 @@ class Lane:
         return Cold(took, used["peak_mb"] or 0, time.monotonic() - began, sampler.peak_mb)
 
     def build(self, step: str, count: bool, args: Sequence[str] | None = None) -> tuple[float, engine.Work | None]:
-        """`blaze build`, timed from before the command to its end; with `count`, what it did."""
+        """`blaze build`, timed from its spawn to its exit (`engine.Ran.seconds`), so decoding and
+        reading its output are not in the time; with `count`, what it did."""
         mark = self.eng.mark(self.home) if count else None
         given = list(self.build_args if args is None else args)
         # What a v2 build did is its `blaze-work` line, printed under JSON only (engine.V2.work_since).
         if count and "--message-format=json" not in given:
             given.append("--message-format=json")
-        began = time.monotonic()
         ran = self.eng.build(f"{self.name}: {step}", self.ws, self.env, given)
-        took = time.monotonic() - began
         served(self.eng, f"{self.name}: {step}", ran)
-        return took, None if mark is None else self.eng.work_since(self.home, mark)
+        return ran.seconds, None if mark is None else self.eng.work_since(self.home, mark)
 
     def wrong(self, step: str) -> str | None:
-        """None when the program blaze built prints what cargo's build of the same source prints."""
+        """None when the program the warm daemon built prints what blaze's build of the same
+        source from nothing prints: a home, a store and a target directory of its own, made for
+        it and removed after it."""
         if self.run_args is None:
             return None
-        self.cargo(f"{step}: cargo build", ["build", *self.build_args])
-        theirs = engine.cargo(f"{step}: cargo run", ["run", *self.build_args, "--", *self.run_args], self.ws,
-                              self.cargo_env)
-        mine = self.eng.build(f"{self.name}: {step}: blaze run", self.ws, self.env,
-                              [*self.build_args, "--", *self.run_args], "run")
-        ours, cargos = program_output(mine), program_output(theirs)
-        if ours == cargos:
+        argv = [*self.build_args, "--", *self.run_args]
+        mine = self.eng.build(f"{self.name}: {step}: blaze run", self.ws, self.env, argv, "run")
+        home, store, target = self.top / "scratch-home", self.top / "scratch-store", self.ws / "target-scratch"
+        for path in (home, store, target):
+            shutil.rmtree(path, ignore_errors=True)
+        env = self.eng.env(home, store, target, project_env(self.spec))
+        try:
+            fresh = self.eng.build(f"{self.name}: {step}: blaze run from nothing", self.ws, env, argv, "run")
+            served(self.eng, f"{self.name}: {step}: from nothing", fresh)
+        finally:
+            try:
+                self.eng.stop(self.ws, env)
+            finally:
+                for path in (home, store, target):
+                    shutil.rmtree(path, ignore_errors=True)
+        ours, scratch = program_output(mine), program_output(fresh)
+        if ours == scratch:
             return None
-        return f"{self.name}: {step}: the program blaze built says something else than cargo's: {difference(ours, cargos)}"
+        return (f"{self.name}: {step}: the warm program says something else than blaze's build of it from "
+                f"nothing: {difference(ours, scratch)}")
 
     def edits(self, step: str, apply: Apply, revert: Revert, count: bool, limit_ms: float | None = None) -> Edits:
         """The edit, a timed build (with `count`, what it compiled), and the edit taken back and
         built: `runs` times, or with `limit_ms` until the times settle it (`enough`). After the
-        first, the program is checked against cargo's."""
+        first, the program is checked against blaze's build of it from nothing (`wrong`)."""
         seconds: list[float] = []
         compiled: list[int] = []
         places = 0
@@ -939,7 +965,7 @@ class Lane:
         ms: list[float] = []
         while not enough(ms, limit_ms, self.args):
             ms.append(self.build(f"no-op build {len(ms) + 1}", False)[0] * 1000)
-        return timed(ms, "ms")
+        return timed(ms, "ms", harness_floor_ms=round(harness_floor_ms(self.ws, self.env), 3))
 
     def warm_start(self, limit_ms: float) -> Measured:
         ms: list[float] = []
@@ -955,7 +981,8 @@ class Lane:
         return timed(ms, "ms")
 
     def speed(self, profile: Literal["debug", "release"]) -> Measured:
-        """bench.py's `runtime` workload, blaze's program against cargo's of `profile`, in turns."""
+        """bench.py's `runtime` workload, blaze's program timed against cargo's of `profile`, in
+        turns; blaze's has to exit 0."""
         workload: dict[str, Any] = self.spec["runtime"]
         program = str(workload["bin"]) + engine.EXE
         args = [str(a).replace("{library}", library()) for a in workload["args"]]
@@ -978,9 +1005,8 @@ class Lane:
                     times[label].append(ran.seconds)
         if said["cargo"][0] != 0:
             raise engine.Failed(f"{self.name}: cargo's {profile} {program} exited {said['cargo'][0]}")
-        if said["blaze"] != said["cargo"]:
-            raise Wrong(f"{self.name}: blaze's {profile} {program} says something else than cargo's "
-                        f"(exit {said['blaze'][0]} against {said['cargo'][0]})")
+        if said["blaze"][0] != 0:
+            raise Wrong(f"{self.name}: blaze's {profile} {program} exited {said['blaze'][0]}")
         ours, cargos = statistics.median(times["blaze"]), statistics.median(times["cargo"])
         return Measured(ours / cargos, 1.0 + self.args.noise,
                         numbers=dict(blaze_median_s=round(ours, 4), cargo_median_s=round(cargos, 4),
@@ -1293,9 +1319,7 @@ def restart(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], how:
     a no-op `blaze check` timed from the command to its result."""
 
     def check(step: str) -> float:
-        began = time.monotonic()
-        served(eng, step, eng.build(step, ws, env, [], "check"))
-        return (time.monotonic() - began) * 1000
+        return served(eng, step, eng.build(step, ws, env, [], "check")).seconds * 1000
 
     def units(verb: str) -> None:
         eng.command(f"`blaze daemon {verb}`", "daemon", [verb], ws, env, 300).checked(f"`blaze daemon {verb}`")
@@ -1550,6 +1574,9 @@ def selftest() -> None:
     expect(enough([1.0, 1, 1, 1, 1, 2], 10.0, few), "an interval that leaves the budget out settles it")
     expect(not known([9.0, 11.0] * 5, 0.05, 6, 20) and known([10.0] * 6, 0.05, 6, 20),
            "a median known to 5% of itself")
+    expect(engine.text(b"a\r\nb\rc\n\xff") == "a\nb\nc\n\ufffd", "a pipe's bytes decoded as text=True decodes them")
+    floor = harness_floor_ms(Path.cwd(), engine.scrubbed())
+    expect(0 < floor < 1000, f"the harness's floor, `true` run through engine.run, is under a second: {floor} ms")
     got_runs = timed([10.0, 10.2, 9.8, 10.1, 9.9, 10.0], "ms").numbers
     expect(got_runs["runs"] == 6 and got_runs["runs_needed"] == 6, f"timed says the runs taken and needed: {got_runs}")
     try:

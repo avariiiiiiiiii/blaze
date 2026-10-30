@@ -17,15 +17,17 @@ use syntax::{
 use test_fixture::WithFixture;
 
 use super::{
-    AttrFlags, Completions, DocAtom, DocWord, LinkKey, LinkKind, LinkModifier, MacroStyle,
-    NativeLib, NativeLibKind, ReprWord, SkipDuringMethodDispatch, Tree, Word, attrs_source,
-    collect_attrs_in, extract_ra_completions, extract_ra_macro_style,
-    extract_rustc_skip_during_method_dispatch, for_each_field, link_cfg, match_attr_flags,
-    parse_link_tt, parse_repr_tt, symbol_attr, word,
+    AttrFlags, Completions, CrateAttrFlags, DocAtom, DocWord, LinkKey, LinkKind, LinkModifier,
+    MacroStyle, NativeLib, NativeLibKind, ReprWord, SkipDuringMethodDispatch, Tree, Word,
+    attrs_source, collect_attrs_in, column_flags, extract_ra_completions, extract_ra_macro_style,
+    extract_rustc_skip_during_method_dispatch, file_attr_flags, for_each_field, link_cfg,
+    match_attr_flags, parse_link_tt, parse_repr_tt, symbol_attr, walked_flags, word,
 };
 use crate::{
-    AdtId, AttrDefId, FieldId, FunctionId, ModuleDefId, VariantId, nameres::crate_def_map,
-    src::HasSource, test_db::{TestDB, TestDBExt},
+    AdtId, AssocItemId, AttrDefId, FieldId, FunctionId, ModuleDefId, VariantId,
+    nameres::{assoc::TraitItems, crate_def_map},
+    src::HasSource,
+    test_db::{TestDB, TestDBExt},
 };
 
 #[test]
@@ -1383,6 +1385,128 @@ fn a_body_edit_runs_no_attribute_query() {
     let attrs = |it: &&String| it.contains("AttrFlags::query") || it.contains("field_attr_flags");
     assert_eq!(log.iter().filter(attrs).count(), 0, "{log:#?}");
     assert_eq!(before, after);
+}
+
+/// Every attribute owner of the test crate: each module, what it declares, its impls, extern
+/// blocks, uses and extern crates, the items of each impl and trait, and each enum's variants.
+fn all_owners(db: &TestDB) -> Vec<AttrDefId> {
+    let def_map = crate_def_map(db, db.fetch_test_crate());
+    let mut owners = Vec::new();
+    let assoc = |owners: &mut Vec<AttrDefId>, items: &[(hir_expand::name::Name, AssocItemId)]| {
+        owners.extend(items.iter().map(|&(_, it)| AttrDefId::from(it)));
+    };
+    for (module, data) in def_map.modules(db) {
+        owners.push(AttrDefId::ModuleId(module));
+        let scope = data.scope(db);
+        for def in scope.declarations() {
+            match def {
+                ModuleDefId::FunctionId(it) => owners.push(it.into()),
+                ModuleDefId::AdtId(AdtId::EnumId(it)) => {
+                    owners.push(AdtId::EnumId(it).into());
+                    owners.extend(it.enum_variants(db).variants.values().map(|&(v, _)| v.into()));
+                }
+                ModuleDefId::AdtId(it) => owners.push(it.into()),
+                ModuleDefId::ConstId(it) => owners.push(it.into()),
+                ModuleDefId::StaticId(it) => owners.push(it.into()),
+                ModuleDefId::TraitId(it) => {
+                    owners.push(it.into());
+                    assoc(&mut owners, &TraitItems::query(db, it).items);
+                }
+                ModuleDefId::TypeAliasId(it) => owners.push(it.into()),
+                ModuleDefId::MacroId(it) => owners.push(it.into()),
+                ModuleDefId::ModuleId(_)
+                | ModuleDefId::EnumVariantId(_)
+                | ModuleDefId::BuiltinType(_) => {}
+            }
+        }
+        for it in scope.impls() {
+            owners.push(it.into());
+            assoc(&mut owners, &it.impl_items(db).items);
+        }
+        owners.extend(scope.extern_blocks().map(AttrDefId::ExternBlockId));
+        owners.extend(scope.use_decls().map(AttrDefId::from));
+        owners.extend(scope.extern_crate_decls().map(AttrDefId::from));
+    }
+    owners
+}
+
+const EVERY_OWNER: &str = r#"
+//- /lib.rs crate:test
+#![doc(hidden)]
+extern crate self as me;
+#[doc(hidden)] use core::marker;
+#[inline] pub fn a() -> u32 { 1 }
+pub fn inner() { #![rustc_nounwind] let _ = 2; }
+pub fn with_item() { #[rustc_nounwind] fn nested() {} nested(); }
+#[repr(C)] pub struct S { #[doc(hidden)] pub a: u8 }
+#[repr(C)] pub union U { a: u8 }
+#[non_exhaustive] pub enum E { #[default] A, #[deprecated] B(#[doc(hidden)] u8) }
+#[cfg_attr(all(), must_use)] pub const C: u8 = { 1 };
+#[cfg_attr(any(), must_use)] pub const D: () = { #[repr(C)] struct InBody; };
+#[used] pub static ST: u8 = 2;
+#[doc(hidden)] pub type T = u8;
+#[macro_export] macro_rules! m { () => {} }
+#[doc(hidden)] pub macro m2() {}
+#[marker] pub trait Tr { #[inline] fn f() {} #[doc(hidden)] type A; #[doc(hidden)] const K: u8; }
+#[automatically_derived] impl S { #[inline] pub fn method(&self) { let _ = 3; } }
+#[link(name = "c")] extern "C" { #[link_name = "x"] fn x(); #[used] static Y: u8; }
+macro_rules! written { () => { #[must_use] pub fn written() {} } }
+written!();
+pub mod inline { #![doc(hidden)] #[must_use] pub fn b() -> u8 { 0 } }
+mod file;
+//- /file.rs
+#[must_use] pub fn in_file() {}
+"#;
+
+/// The flags each owner's file's column gives are those walked off its syntax and off its
+/// file's parse, the cursor `crate_lang_items` reads gives the same, and every owner outside a
+/// body, a macro's expansion and the modules is in its column.
+#[test]
+fn column_flags_are_the_walked_flags() {
+    let db = TestDB::with_files(EVERY_OWNER);
+    let owners = all_owners(&db);
+    let mut cursor = CrateAttrFlags::new(&db);
+    let mut in_columns = 0;
+    for &owner in &owners {
+        let walked = walked_flags(&db, owner);
+        assert_eq!(AttrFlags::query(&db, owner), walked, "{owner:?}");
+        assert_eq!(live_flags(&db, owner), walked, "{owner:?}");
+        assert_eq!(cursor.of(owner), walked, "{owner:?}");
+        let mut column = |file, krate| file_attr_flags(&db, file, krate);
+        let in_column = column_flags(&db, owner, &mut column);
+        let written = match owner {
+            AttrDefId::FunctionId(it) => it.lookup(&db).id.file_id.is_macro(),
+            _ => false,
+        };
+        match owner {
+            AttrDefId::ModuleId(_) => assert_eq!(in_column, None),
+            _ if written => assert_eq!(in_column, None, "{owner:?}"),
+            _ => {
+                assert_eq!(in_column, Some(walked), "{owner:?}");
+                in_columns += 1;
+            }
+        }
+    }
+    // Every kind of owner a column holds, each at least once.
+    assert!(in_columns >= 25, "{in_columns} owners in columns of {owners:#?}");
+}
+
+/// A warm column read, through the query or the cursor, allocates nothing.
+#[test]
+fn warm_column_reads_allocate_nothing() {
+    let db = TestDB::with_files(EVERY_OWNER);
+    let owners = all_owners(&db);
+    let read = || {
+        let mut cursor = CrateAttrFlags::new(&db);
+        let mut flags = AttrFlags::empty();
+        for &owner in &owners {
+            flags |= AttrFlags::query(&db, owner) | cursor.of(owner);
+        }
+        flags
+    };
+    let warm = read();
+    let again = blaze_alloc_count::assert_at_most(0, "warm attribute-flag columns", read);
+    assert_eq!(warm, again);
 }
 
 /// The crate root's attributes, each with its file: rustc appends the crate attributes given

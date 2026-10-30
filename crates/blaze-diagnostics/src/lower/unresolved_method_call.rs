@@ -19,6 +19,7 @@
 use blaze_items::{Fact, ItemId};
 use hir::{AsAssocItem as _, HasVisibility as _, InFile};
 use rustc_hash::FxHashSet;
+use stdx::edit_distance::{edit_distance_with_substrings, find_best_match_for_name_with_substrings};
 use syntax::{
     SyntaxKind, T, TextRange,
     view::{self as ast, AstNode as _, HasArgList as _, HasName as _, HasTypeBounds as _},
@@ -29,15 +30,12 @@ use crate::{
     lints::code_fact,
     lower::{
         Found, Phase,
-        unresolved_field::{
-            edit_distance_with_substrings, find_best_match_for_name_with_substrings, fn_def_span,
-            type_param_span,
-        },
+        unresolved_field::{fn_def_span, type_param_span},
     },
     model::{Applicability, Diag, Span, Suggestion, SuggestionStyle},
 };
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedMethodCall<'_>) -> Vec<Found> {
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedMethodCall<'db>) -> Vec<Found> {
     let node = cx.node_view(d.expr);
     // alloc: the error's parts, for an error hir found
     let Some(ast::Expr::MethodCallExpr(call)) = node.value.left() else { return vec![] };
@@ -248,10 +246,10 @@ fn static_candidates(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>, found: Option<hir:
 
 /// rustc's `suggest_associated_call_syntax`: `T::f(args)` for `x.f(args)`, with `x` first when
 /// `f` takes the type as its first argument.
-fn associated_call_syntax(
-    cx: &Cx<'_, '_>,
+fn associated_call_syntax<'db>(
+    cx: &Cx<'_, 'db>,
     diag: &mut Diag,
-    no_match: &NoMatch<'_>,
+    no_match: &NoMatch<'db>,
     candidate: &Static,
     call: ast::MethodCallExpr<'_>,
     args: &[ast::Expr<'_>],
@@ -311,7 +309,7 @@ fn associated_call_syntax(
 }
 
 /// rustc's `ty_to_value_string`: a type as a path in an expression, `Foo::<u8>`.
-pub(crate) fn value_string(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
+pub(crate) fn value_string<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>) -> String {
     let printed = cx.ty(ty);
     match (ty.as_adt(), printed.find('<')) {
         // alloc: the error's text, for an error hir found
@@ -459,7 +457,7 @@ fn callable_descr(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<&'static str> {
 
 /// rustc's `set_not_found_span_label`: "method not found in `T`", and the types the method
 /// is on instead.
-pub(crate) fn not_found_label(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMatch<'_>, item_kind: &str) {
+pub(crate) fn not_found_label<'db>(cx: &Cx<'_, 'db>, diag: &mut Diag, no_match: &NoMatch<'db>, item_kind: &str) {
     let ty = cx.ty(&no_match.receiver);
     // alloc: the error's text, for an error hir found
     diag.span_label(no_match.name_span.clone(), format!("{item_kind} not found in `{ty}`"));
@@ -537,7 +535,7 @@ fn is_string(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> bool {
 
 /// rustc's `probe_for_similar_candidate`: the method (for a call) or associated function or
 /// constant (for a path) of the type, from its impls and every trait, whose name is closest.
-pub(crate) fn similar_candidate(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>) -> Option<hir::AssocItem> {
+pub(crate) fn similar_candidate<'db>(cx: &Cx<'_, 'db>, no_match: &NoMatch<'db>) -> Option<hir::AssocItem> {
     let scope = no_match.scope.as_ref()?;
     let lookup = no_match.name.as_str();
     let max_dist = std::cmp::max(lookup.len(), 3) / 3;
@@ -571,7 +569,7 @@ pub(crate) fn similar_candidate(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>) -> Opti
     found.sort_by(|a, b| a.name(cx.db).cmp(&b.name(cx.db)));
     // alloc: the error's text, for an error hir found
     let names: Vec<String> = found.iter().filter_map(|it| Some(it.name(cx.db)?.as_str().to_owned())).collect();
-    let best = find_best_match_for_name_with_substrings(&names, lookup, None)?;
+    let best = find_best_match_for_name_with_substrings(&names, lookup, None).cloned()?;
     found.into_iter().find(|it| it.name(cx.db).is_some_and(|name| name.as_str() == best))
 }
 
@@ -652,7 +650,7 @@ pub(crate) fn not_found_for_this(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &No
 
 /// rustc's `suggest_traits_to_import`: the traits not in scope that give the item (to
 /// import), else the traits that have an item of the name (to implement).
-pub(crate) fn traits_to_import(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMatch<'_>, statics: &[Static]) {
+pub(crate) fn traits_to_import<'db>(cx: &Cx<'_, 'db>, diag: &mut Diag, no_match: &NoMatch<'db>, statics: &[Static]) {
     let Some(scope) = &no_match.scope else { return };
     let all = all_traits(cx);
     let out_of_scope: Vec<hir::Trait> = all
@@ -821,7 +819,7 @@ fn restrict_param(
 }
 
 /// Whether the item looked for is found on the receiver through `t` alone.
-fn trait_applies(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>, scope: &hir::SemanticsScope<'_>, t: hir::Trait) -> bool {
+fn trait_applies<'db>(cx: &Cx<'_, 'db>, no_match: &NoMatch<'db>, scope: &hir::SemanticsScope<'db>, t: hir::Trait) -> bool {
     if !t.items_iter(cx.db).any(|it| it.name(cx.db).as_ref() == Some(&no_match.name)) {
         return false;
     }

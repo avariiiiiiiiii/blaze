@@ -2,6 +2,8 @@
 
 //! It's possible to call a Salsa query from within a cycle recovery fn.
 
+#![forbid(unsafe_code)]
+
 #[salsa::tracked(returns(copy))]
 fn fallback_value(_db: &dyn salsa::Database) -> u32 {
     10

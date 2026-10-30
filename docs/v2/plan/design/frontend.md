@@ -45,7 +45,10 @@ sense for the IDE and costs blaze, followed by what v2 does instead.
 9. **Cancellation is a panic.** salsa cancels by unwinding (`Cancelled`), so every query must
    be unwind-safe, and cancelling costs an unwind through deep stacks. v2 cancels
    cooperatively: the plane stops scheduling a cancelled request's tasks, and a running task
-   sees the flag at its next query call and returns.
+   sees the flag at its next query call and unwinds to its own task boundary, where it is
+   caught once (`base_db::Db::run_all`, `base_db::Shared`). Nothing is caught per query, and
+   a query never returns a `Result` for it: a cancel comes once per edit made during a build,
+   and a hit pays no branch for it.
 10. **Parallelism is bolted on.** salsa handles are per thread, and parallel work forks
     databases. v2's database is `Sync` and all parallel work is plane tasks (decided).
 11. **Interned values are never freed.** rust-analyzer's interners grow for the life of the

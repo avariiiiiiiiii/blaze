@@ -8,6 +8,7 @@
 //! behind each macro.
 
 #![recursion_limit = "256"]
+#![forbid(unsafe_code)]
 
 #[macro_use]
 extern crate quote;

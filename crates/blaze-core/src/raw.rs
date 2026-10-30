@@ -242,18 +242,18 @@ mod unix {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     use super::Aligned;
 
-    proptest! {
-        /// The aligned view against the safe reference, the bytes themselves.
-        #[test]
-        fn aligned_bytes_are_the_bytes_copied(bytes in proptest::collection::vec(any::<u8>(), 0..300)) {
-            let aligned = Aligned::copy(&bytes);
-            prop_assert_eq!(aligned.bytes(), &bytes[..]);
-            prop_assert_eq!(aligned.bytes().as_ptr() as usize % 16, 0);
-        }
+    /// The aligned view against the safe reference, the bytes themselves.
+    #[hegel::test]
+    fn aligned_bytes_are_the_bytes_copied(tc: TestCase) {
+        let bytes: Vec<u8> = tc.draw(gs::binary().max_size(299));
+        let aligned = Aligned::copy(&bytes);
+        assert_eq!(aligned.bytes(), &bytes[..]);
+        assert_eq!(aligned.bytes().as_ptr() as usize % 16, 0);
     }
 
     #[cfg(unix)]

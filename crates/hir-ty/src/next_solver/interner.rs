@@ -32,7 +32,9 @@ use rustc_type_ir::{
     TypeFlags, TypeVisitableExt, ValTreeKind, Variance, VisitorResult,
     error::TypeError,
     fast_reject,
-    inherent::{self, GenericsOf, IntoKind, SliceLike as _, Span as _, Ty as _},
+    inherent::{
+        self, GenericArgs as _, GenericsOf, IntoKind, SliceLike as _, Span as _, Ty as _,
+    },
     lang_items::{SolverAdtLangItem, SolverProjectionLangItem, SolverTraitLangItem},
     search_graph::RequiredDepth,
     solve::{AdtDestructorKind, QueryResult, SizedTraitKind},

@@ -13,14 +13,14 @@ use syntax::{
 
 use crate::hir::ExprId;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FormatArgs {
     pub template: Box<[FormatArgsPiece]>,
     pub arguments: FormatArguments,
     pub orphans: Vec<ExprId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FormatArguments {
     pub arguments: Box<[FormatArgument]>,
     pub num_unnamed_args: usize,
@@ -473,7 +473,7 @@ impl<'a> PendingLiteral<'a> {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct FormatArgumentsCollector {
     arguments: Vec<FormatArgument>,
     num_unnamed_args: usize,

@@ -13,7 +13,7 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::load::files::{Found, read_dir, read_file};
+use crate::load::files::{Found, normal_text as normalize, read_dir, read_file};
 
 /// A package of a checkout: its name, its version, and its directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,21 +266,6 @@ fn nested_paths(
         }
     }
     out
-}
-
-/// `/a/./b/../c` as `/a/c`, as cargo's `normalize_path`.
-fn normalize(path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            part => parts.push(part),
-        }
-    }
-    format!("/{}", parts.join("/"))
 }
 
 #[derive(Deserialize)]

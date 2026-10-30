@@ -52,6 +52,7 @@ use crate::{
     AssocItem, BuiltinAttr, Callable, DeriveHelper, EnumVariant, Field, Function,
     GenericSubstitution, Local, ModuleDef, SemanticsImpl, ToolModule, TupleField, Type,
     TypeOwnerId,
+    db::HirDatabase,
     semantics::{PathResolution, PathResolutionPerNs},
 };
 

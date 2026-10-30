@@ -15,10 +15,7 @@ use base_db::{Db, Crate};
 use intern::{InternedSlice, sym};
 use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
-use syntax::{
-    AstNode, ast,
-    view::{self, AstNode as _},
-};
+use syntax::view::{self, AstNode as _};
 
 intern::impl_slice_internable!(PathSegments, (), Name);
 
@@ -88,6 +85,18 @@ pub enum PathKind {
 
 impl PathKind {
     pub const SELF: PathKind = PathKind::Super(0);
+
+    /// The segments the kind stands for in [`ModPath::len`]: one a `super`, one for `crate` or
+    /// `$crate`, none for `self`, `::` or a plain path.
+    pub fn segment_count(self) -> usize {
+        match self {
+            PathKind::Plain => 0,
+            PathKind::Super(i) => i as usize,
+            PathKind::Crate => 1,
+            PathKind::Abs => 0,
+            PathKind::DollarCrate(_) => 1,
+        }
+    }
 }
 
 impl ModPath {
@@ -137,14 +146,7 @@ impl ModPath {
     /// Returns the number of segments in the path (counting special segments like `$crate` and
     /// `super`).
     pub fn len(&self) -> usize {
-        self.segments().len()
-            + match self.kind {
-                PathKind::Plain => 0,
-                PathKind::Super(i) => i as usize,
-                PathKind::Crate => 1,
-                PathKind::Abs => 0,
-                PathKind::DollarCrate(_) => 1,
-            }
+        self.segments().len() + self.kind.segment_count()
     }
 
     pub fn textual_len(&self) -> usize {
@@ -323,7 +325,10 @@ fn convert_path_view(
         names.push(name);
     }
 
-    // `local_inner_macros`, as `convert_path` handles it.
+    // handle local_inner_macros :
+    // Basically, even in rustc it is quite hacky:
+    // https://github.com/rust-lang/rust/blob/614f273e9388ddd7804d5cbc80b8865068a3744e/src/librustc_resolve/macros.rs#L456
+    // We follow what it did anyway :)
     if names.len() == 1
         && kind == PathKind::Plain
         && let Some(_macro_call) = path.syntax().parent().and_then(view::MacroCall::cast)
@@ -570,6 +575,23 @@ mod tests {
             format!("{:?}", ModPath::from_kind(PathKind::Crate)),
             "ModPath { kind: Crate, segments: [] }"
         );
+    }
+
+    #[test]
+    fn a_kinds_segment_count_is_the_old_len_match() {
+        let old = |kind: PathKind| match kind {
+            PathKind::Plain => 0,
+            PathKind::Super(i) => i as usize,
+            PathKind::Crate => 1,
+            PathKind::Abs => 0,
+            PathKind::DollarCrate(_) => 1,
+        };
+        let kinds = [PathKind::Plain, PathKind::Crate, PathKind::Abs]
+            .into_iter()
+            .chain((0..=u8::MAX).map(PathKind::Super));
+        for kind in kinds {
+            assert_eq!(kind.segment_count(), old(kind), "{kind:?}");
+        }
     }
 
     #[test]

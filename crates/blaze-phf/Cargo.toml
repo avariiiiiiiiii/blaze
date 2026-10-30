@@ -15,7 +15,7 @@ doctest = false
 
 [dev-dependencies]
 blaze-ids.workspace = true
-proptest.workspace = true
+hegeltest.workspace = true
 
 [lints]
 workspace = true

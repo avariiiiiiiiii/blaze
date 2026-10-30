@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: lane ci's speed of light: the bound each component's work and the hardware set, the arithmetic, and how the design reaches 90% of it.
-date: 2026-10-29
+date: 2026-10-30
 ---
 # Lane ci: speed of light
 
@@ -58,6 +58,9 @@ already met the "one pass, no copy" part of the bound. Two things did not:
   a byte string is due is refused, so each value keeps one encoding. blaze-api's `SCHEMA` went
   from 10 to 11 with `Response::Ran`'s stdout and stderr, `TestResult::output` and
   `Request::Cargo`'s files moved onto it.
+  `SCHEMA` 13 moved `Op::Write` and `Op::Edit`'s bytes, each `ContentId` and each `Fingerprint`
+  onto it too (34 bytes and one copy for a `ContentId`, where 32 integers took about 62 bytes
+  and 33 decoder steps).
   - Tests: `bytes/tests.rs` checks the exact bytes for each head length and that the array form
     is refused. It decodes 500 seeded values both ways against the reference codec, and checks
     that the JSON is unchanged. `lib.rs`'s `bytes_go_out_as_byte_strings` checks the API's exact
@@ -76,6 +79,14 @@ already met the "one pass, no copy" part of the bound. Two things did not:
   That derive would write each struct's sorted keys as one constant byte run, check their order
   when it is compiled, and match a key on its encoded bytes. It is the design to build next. A
   derive keeps the bytes, so the identity tests carry over unchanged.
+- **Correction (speed-sol2-ci).** The figure above held for blaze-api's envelopes, whose keys
+  `frames::item_into` writes by hand, but not for the event records. `Function`, `Summary`,
+  `Slow`, `Took`, `Fns`, `Cache`, most of `Event`'s variants and `blaze_protocol::Message` were
+  declared out of key order, so each such map took the permute path: its entries were rescanned
+  with `skip`, sorted as spans, and copied out to the scratch and back. That is about 250 more
+  cycles a `Function`. `Event::Functions` (`object`, `whole`, `functions`) put the whole function
+  array through the scratch twice, and a record over 1 MiB made a new scratch each time. The
+  section "CBOR against memory bandwidth (speed-sol2-ci)" below has the count and what changed.
 
 **What `proof` measures.**
 - The byte-heavy frame: decode and encode, each within 21 µs.
@@ -121,6 +132,11 @@ buffer it is given when nothing is held.
   50 to 100 ns) per read and per send. Requests K2 (`RecvInto`) and K3 in `v2/requests/core.md`
   are with the coordinator, since lane core is done. When core gives registered io_uring
   buffers, the bound drops to 0.05 µs per operation.
+  - **Correction (speed-sol2-ci).** K2 and K3 have landed: `Effect::Recv` takes the buffer it
+    appends to (`into`), and `Done::Sent` gives the send's buffer back, which the server keeps
+    for its next reply. The server still passed an empty `into` on every read, so the driver
+    allocated 64 KiB each time; it now lends a kept buffer (see "The API's request path, end to
+    end (speed-sol2-ci)").
 - **v1's `read_frame_into`.** It reads the length and then the body: 2 syscalls per frame on an
   unbuffered stream. Its callers are v1 blaze-cargo's.
 
@@ -154,7 +170,9 @@ it cancels them in is the order the `BTreeMap` gave.
 - **One `String` per text field on decode.** The owned API types allocate it, about 20 ns
   each. Borrowed mirror types (`&'a str` fields, decoded from the frame in place) would remove
   it, and the decoder already supports them.
-- **The core allocations** from the socket section, until K2 and K3 land.
+- **The core allocations** from the socket section, until K2 and K3 land. (Correction,
+  speed-sol2-ci: they have landed, and a warm Unix request now allocates nothing on its way in
+  or out; see "The API's request path, end to end (speed-sol2-ci)".)
 - **A one-item `views` vector per build request.** Left as noise next to a build.
 
 **What `proof` measures.**
@@ -203,6 +221,16 @@ against it.
   the bound. Reaching the bound needs a SIMD writer such as
   [sonic-rs](https://github.com/cloudwego/sonic-rs), a new workspace dependency for whoever owns
   that call.
+  - **Changed (speed-sol2-ci).** `json::line` and `line_into` write through `sonic_rs::to_writer`
+    (already a workspace dependency, used by blaze-ci's webhook), which finds escapes 16 or 32
+    bytes a step. Its escapes are serde_json's. The two write floats apart (zmij against ryu),
+    and the API's types hold no float. serde_json moved to blaze-api's dev-dependencies, where
+    the tests hold sonic-rs to it:
+    - `frames/identity.rs`, `json_is_the_bytes_serde_json_wrote`: 3,000 seeded requests and
+      responses of every kind give the same bytes from both writers.
+    - `json/tests.rs`, `escapes_are_the_bytes_serde_json_wrote`: every character below 0x80, plus
+      U+00E9, U+2028 and U+1F525, alone and in runs of 1 to 64 bytes at the start, the middle and
+      the end of a run, so each SIMD step's edge is crossed.
 - **`http::read_response`.** It allocates a 64 KiB buffer per call. It is the client side, once
   per request.
 
@@ -216,15 +244,12 @@ against it.
 
 These are what keep the wire from its bound, each with its owner:
 - **K2 and K3 in `v2/requests/core.md`**: reads into a kept buffer, and sends that hand the
-  buffer back. With the coordinator.
-- **`Op::Write` and `Op::Edit`'s bytes as byte strings**: `v2/requests/vfs.md`, to land inside
-  `SCHEMA` 11.
-- **`ContentId` and `Fingerprint` as byte strings**: `v2/requests/format.md`. At 32 and 16
-  integers today they are most of a trace's bytes: about 62 bytes and 33 decoder steps for a
-  `ContentId` where 34 bytes and one copy would do.
+  buffer back. With the coordinator. (Correction, speed-sol2-ci: both landed and are used.)
 - **A blaze derive for the API types**: one owner to name. It would write constant key runs and
-  borrowed mirror types, for item-heavy frames and allocation-free decode.
-- **A SIMD JSON writer**: a dependency decision for lane ci.
+  borrowed mirror types, for item-heavy frames and allocation-free decode. (speed-sol2-ci: the
+  new crate and its workspace dependencies are asked of the coordinator as queue item 00908.)
+- **A SIMD JSON writer**: a dependency decision for lane ci. (Correction, speed-sol2-ci: done,
+  with sonic-rs.)
 
 ## CI, the terminal view and the build page: `crates/blaze-ci/`, `crates/blaze-ui/`, `crates/blaze-web/` (speed-link-edge-sol-ci)
 
@@ -397,6 +422,9 @@ after 100 ms with no records, so after a burst the last frame can show up to 100
 also draws through `record` once per record, which makes a `String` for each. Both are asked of
 lane cargo in `v2/requests/cargo.md`: a read timeout of the shorter of the tick and `due_ns()`,
 and records handed over together through `records_into`.
+- **Correction (speed-sol2-ci).** Both are done. `blaze-cargo/src/cargo/say.rs` hands each batch
+  to `live.records_into(batch, now_ns, &mut out)` and reads with a timeout of `due_ns()` less
+  now, so the terminal path is at its bound end to end.
 
 **What `proof` measures.** For a replayed cold build's records at full speed, the `write`s per
 second at most 60 and the bytes per frame within 1.1 times the changed lines. Against the state
@@ -422,6 +450,10 @@ batch, the batch becomes one `Arc<[u8]>` frame shared by every page, and each pa
 sends it with one write. The two copies on the way (into the frame and the kernel's) cost
 under 1% of it. Nothing changed. This is uWebSockets' `publish` with corking: one message built,
 one syscall per socket.
+- **Correction (speed-sol2-ci).** The sending was at the bound, but the encoding was not. A
+  `Functions` record's maps were out of key order, so every function took the encoder's permute
+  path, about 250 cycles over its own cost (see "The CBOR codec" above). The encoding is now at
+  the codec's serde cost; "The web and UI streams per record (speed-sol2-ci)" below has the count.
 
 **What `proof` measures.** The time from a batch's last record to its last page's `write`,
 within 27 µs for three pages, and one write per page per batch.
@@ -497,7 +529,227 @@ precision on the GPU side until cosmos takes partial updates.
 
 ### What stands in the way
 
-- **The terminal caller's tick and batching**: `v2/requests/cargo.md`.
+- **The terminal caller's tick and batching**: `v2/requests/cargo.md`. (Correction,
+  speed-sol2-ci: done by lane cargo.)
 - **Partial uploads in cosmos.gl**: a patched build under `assets/vendor/build/`, with npm.
-- **`Request::Move` and `Op` byte strings** for the checkout's daemon side: blaze-api and
-  `v2/requests/vfs.md`.
+- **`Request::Move`** for the checkout's daemon side: blaze-api. (`Op`'s bytes are byte strings
+  since `SCHEMA` 13.)
+
+## The request path, CBOR against bandwidth, and the streams per record (speed-sol2-ci)
+
+A second pass over every component of lane ci's crates (`blaze-api`, `blaze-ci`,
+`blaze-protocol`, `blaze-ui`, `blaze-web`), read from the code as of 2026-10-30. Like the
+sections above, the figures are estimates from the instructions each path runs, using
+[link's machine figures](../link/speed-of-light.md#the-machine). Nothing was built or timed, so
+`proof` measures each one against its budget, which is the bound × 1.1.
+
+### The API's request path, end to end (speed-sol2-ci)
+
+**Workload.**
+- One small request (`Status`, `Cancel`) and its reply, alone on a Unix connection.
+- 100 such requests pipelined, so one read brings them all.
+- An HTTP keep-alive POST with a 300-byte head and a 200-byte CBOR body.
+
+**The work, counted per request.**
+- One `recv` per batch, and one `send` per batch of replies.
+- On Unix, the frame's length head and the cut of the item: about 5 cycles.
+- Decoding the envelope and body: about 15 fields.
+- Dispatch: one Fx hash lookup and one insert, about 30 cycles each.
+- Encoding the reply: the envelope's keys are one constant run, and the body is about 5 fields.
+
+**Bound.** For a batch of k requests, 2 × 0.15 µs ÷ k for the syscalls, plus about 100 cycles
+(30 ns) of codec and lookup:
+- k = 1: 0.30 µs + 0.03 µs = 0.33 µs, on top of the socket's 5 µs round trip. Budget: 0.36 µs.
+- k = 100: 3 ns + 30 ns = 33 ns. Budget: 36 ns.
+- HTTP: the head's 17 ns (see "HTTP and JSON at the edge") added to the k = 1 figure.
+
+No request should allocate on the way in or out.
+
+**Where it was.**
+- **Syscalls.** At the bound: one `recv` and one `send` per batch.
+- **Every read allocated.** The server passed `Effect::Recv` an empty `into`, so the driver
+  reserved 64 KiB for every read. That is a `malloc` and a `free`, about 50 to 100 ns. When part
+  of a frame was held, `Frames::push_vec` copied it, then dropped the read's buffer. HTTP did the
+  same.
+- **Session.** `Request::Commit` and the end of an edit cloned every `Op` into the VFS
+  (`commit`), file bytes included. That is a copy of each edit's bytes per commit.
+
+**What changed.**
+- **Unix.** `Frames::lend` moves what is held to the front of the frames' own buffer and lends
+  the whole buffer as the read's `into`. The driver appends after what is held, and
+  `Frames::give_back` takes it back. Nothing is copied or allocated once the buffer has grown,
+  and the room it keeps is capped at 1 MiB.
+- **HTTP.** `RequestParser::push_vec` either adopts the read's buffer and frees the one it held,
+  or copies the read and frees the read's buffer. Either way one buffer is free, and it is kept
+  as the parser's `spare`, emptied and capped at 1 MiB. `lend_spare` lends it to the next read.
+  The parser is still read while that read is in flight, which is why it lends the spare and
+  not the buffer it reads from.
+- **Session.** Both commit calls pass their ops by value (`Vfs::commit_owned`, queue item 00879
+  of lane vfs), so an edit's bytes are not copied again.
+- **Tests.**
+  - `frames/tests.rs`, `every_way_in_gives_what_the_old_frames_gave`: a fourth way in (lend,
+    append, give back) checked against the model.
+  - `frames/tests.rs`, `a_warm_lent_buffer_allocates_nothing`: a frame split over two reads, at
+    most 0 allocations over 100 rounds.
+  - `http/tests.rs`, `a_warm_read_into_the_spare_allocates_nothing`: a request over two reads,
+    so both the adopting and the copying way are taken, at most 0 allocations.
+  - `http/tests.rs`, `a_broken_parser_still_lends_its_spare`.
+  - `server/tests.rs`, `a_warm_request_and_its_reply_reuse_their_buffers`: on Unix and on HTTP,
+    a warm request's in-flight receive has room for all it may read, so the driver's read
+    allocates nothing either.
+
+**Where it is now.**
+- **Syscalls.** At the bound.
+- **Allocations.** A warm Unix request allocates nothing on its way in or out. `Status` makes
+  one, the `requests` list of the owned response, and that is made by whoever answers, not by
+  the path. An HTTP request allocates once, for the reply's head buffer while the previous send
+  is in flight.
+- **Codec.** About 10 to 16 cycles a field × 15 fields ≈ 150 to 240 cycles ≈ 45 to 70 ns a
+  request, plus about 20 ns for each text field's `String`.
+- **The gap.**
+  - k = 1: 0.30 + 0.07 + 0.02 ≈ 0.39 µs against 0.33 µs, about 1.2 times. It was about 1.5
+    times with the allocation per read.
+  - k = 100: 3 + 70 + 20 ≈ 93 ns against 33 ns, about 3 times.
+
+  Both gaps are the codec's: serde's per-field calls and the owned `String`s. What stands in
+  the way is the generated codec with borrowed mirror types, a new crate the coordinator owns:
+  queue item 00908.
+
+**What `proof` measures.**
+- In an ix VM, `strace -c` on the daemon: one `recvmsg` and one `sendmsg` per batch.
+- `blaze_alloc_count` over a warm request: 0 on Unix and 1 on HTTP. The tests above already
+  check this.
+- The time per request at k = 1 within 0.36 µs plus the socket, and at k = 100 within 36 ns.
+  Until 00908 lands, the k = 100 figure is reported as the open gap.
+
+### CBOR against memory bandwidth (speed-sol2-ci)
+
+**Workload.**
+- The byte-heavy frame above: `Response::Ran` with 1 MiB of stdout.
+- A cold build's `Functions` records, up to 1 MiB each. Each function is about 100 bytes with 9
+  fields counting nested ones (`id`, `how` and its variant, `key`, `name`, `calls` and its
+  items, `krate`).
+- v1 blaze-cargo's records, each sent through `blaze_protocol::send` as a `Message`.
+
+**Bound.** The larger of bytes ÷ bandwidth and items × 2 cycles a field:
+- **Byte-heavy.**
+  - In cache: 2 MiB through L2 at 32 B/cycle ≈ 19 µs.
+  - Cold from DRAM: 1 MiB read and 1 MiB written at 25 GB/s ≈ 84 µs.
+- **A function.** max(100 B ÷ 32 B/cycle ≈ 3 cycles, 9 × 2 = 18 cycles) = 18 cycles ≈ 5 ns.
+  Items set the bound, not bandwidth.
+- **A 1 MiB `Functions` record** (about 10,000 functions): 180,000 cycles ≈ 51 µs, against
+  9.5 µs for its bytes through L2.
+
+So item-heavy CBOR is about 5 times slower than memory bandwidth even at its bound.
+
+**Where it was.** The byte-heavy frame was at the bound, with one `memcpy` each way. The records
+were not:
+- **Each function went through the permute path.** `Function` declared its fields as `id`,
+  `key`, `krate`, `name`, … against key order `id`, `how`, `key`, `name`, `calls`, `krate`. When
+  `name` came after `krate`:
+  - the encoder rescanned the entries already written with `skip`, about 50 cycles;
+  - it kept a span for each of the 6 entries, about 30;
+  - it sorted them by comparing their bytes, about 100;
+  - it copied the map out to the scratch and back, about 70.
+
+  That is about 250 cycles on top of serde's 90 to 145. In all, about 350 to 400 cycles
+  ≈ 100 to 115 ns a function, about 20 times the bound.
+- **Whole records took the permute path too.** `Event::Functions` (`object`, `whole`,
+  `functions`) and `Message` (`schema`, `id`, `body`) were out of order at the top, so the whole
+  record went through the scratch twice. A record over `KEPT_SCRATCH` (1 MiB) made a new
+  scratch each time: about 256 first-touched pages × 0.25 µs ≈ 64 µs a record.
+- **Each key's order check read back the output.** It compared the key's encoded bytes with the
+  previous key's, which were already written.
+
+**What changed.**
+- **`blaze_protocol::in_key_order!`** (`keyed.rs`), a `macro_rules` that wraps a struct or an
+  enum of struct variants and is given its keys in CBOR order. Its `Serialize` writes the fields
+  in that order to CBOR (`is_human_readable` false), and in the declared order to JSON, so the
+  JSON is byte for byte unchanged. Deserialize stays derived.
+- **The wrapped types.** `Message`, every variant of `Event`, and `Slow`, `Function`, `Fns`,
+  `Summary`, `Cache` and `Took` are wrapped.
+- **Key order without reading the output.** Struct keys are `&'static str`, so `Map::name`
+  orders them by `cbor::name_order` (length, then bytes) against the last name, without reading
+  back what was written.
+- **Tests.**
+  - `cbor/tests.rs`, `names_are_ordered_as_their_encodings_are`: seeded names of 0 to 256 bytes
+    of ASCII and two-byte characters, ordered as their encodings are.
+  - `tests.rs`, `every_record_is_written_in_its_keys_order`: one record of every variant with
+    every field set. Each is written with `permuted() == 0`, in exactly the bytes of
+    `cbor::reference`, reads back to itself, and, decoded as a JSON value, equals serde_json's
+    value of it.
+  - `tests.rs`, `json_keeps_the_declared_order`: exact JSON for a `Function`, a `Message` of
+    `Began` and a default `Summary`.
+
+**Where it is now.**
+- **Byte-heavy.** At the bound.
+- **Item-heavy.** The permute path is never taken for a record, and the scratch is never used.
+  A function is serde's 90 to 145 cycles ≈ 26 to 41 ns, which is 5 to 8 times the bound, down
+  from about 20 times.
+- **Still out of order.**
+  - blaze-api's `Cargo`, which goes out once per build request.
+  - blaze-query's `Input::FileAt` and `Input::DirAt` (`root`, `path`), which go out only in a
+    `blaze why` answer.
+  - blaze-ci's own types, which are JSON only.
+
+  None is per record. The rest of the gap is serde's per-field calls. What stands in the way is
+  the generated codec, queue item 00908.
+
+**What `proof` measures.**
+- Encoding a 1 MiB `Functions` record, in cache, within 1.1 × 51 µs. Until 00908 lands, it is
+  reported against today's 5 to 8 times, and against the same record through the pre-change
+  types (permuted) as the before.
+- The byte-heavy frame within 21 µs in cache and 92 µs cold.
+- `Writer::permuted()` summed over a replayed cold build is 0.
+- minicbor's derive on the same records, the ceiling a generated codec reaches.
+
+### The web and UI streams per record (speed-sol2-ci)
+
+**Workload.** A cold build's records, thousands a second, to 1 to 5 pages and one terminal.
+
+**The work, counted.**
+- **To the page.**
+  - Each `Functions` record is encoded once into the batch, by a `Writer` kept across records.
+  - Any other record's bytes are copied from the encoding kept for it (`last_told`).
+  - A batch closes at 4,096 records or 1 MiB (`BATCH`, `FRAME`) and becomes one `Arc<[u8]>`.
+  - Each page's websocket writer makes one write per wake. A payload of 64 KiB or more goes out
+    in place with `writev`; smaller ones are gathered into up to 256 KiB first.
+
+  So a record costs 1/k frames and 1/k syscalls per page in a batch of k records, and its
+  encoded bytes, about 100 per function.
+- **To the terminal.** Each record is applied to `Live`. At most 60 writes a second go out, of
+  the changed lines only.
+
+**Bound.**
+- **Page.** Per record, its items × 2 cycles, encoded once for all pages, plus
+  (0.15 µs + batch bytes ÷ 10 GB/s) ÷ k per page. A 64 KiB batch of 600 functions to three
+  pages: 600 × 18 cycles ≈ 3.1 µs, plus 3 × 6.7 ≈ 20 µs. Budget: 25 µs.
+- **Terminal.** As in "A record on the terminal": about 130 µs a second.
+
+**Where it was.**
+- **Page.** Frames, syscalls and copies were at the bound. Encoding was about 20 times the
+  bound, through the permute path: about 600 × 375 cycles ≈ 64 µs a batch, which made the
+  batch about 3.4 times its budget.
+- **Terminal.** At the bound, once lane cargo's caller changes landed.
+
+**What changed.** The key-order change above, with nothing in blaze-web or blaze-ui itself.
+Every byte sent to a page is the same: the reference-codec test checks each record's exact
+bytes.
+
+**Where it is now.**
+- **Page.** Encoding is about 600 × 120 cycles ≈ 21 µs, so the batch is about 41 µs against
+  23 µs, about 1.8 times. The gap is the codec, queue item 00908. Frames and bytes per record
+  are at the bound: 1/k frames, one write per page per batch, and no byte written twice
+  except the one copy into the frame.
+- **Terminal.** At the bound.
+- **blaze-ci.** Webhooks, check runs and checkouts happen once per event and are not a stream.
+  They are as the sections above say, and unchanged.
+
+**What `proof` measures.**
+- Replay a cold build's records to three pages in an ix VM, and count:
+  - websocket frames per page per batch: 1;
+  - bytes per record against the record's encoded size: within 1.1 times;
+  - the time from a batch's last record to its last page's write: within 25 µs, reported
+    against today's estimated 41 µs until 00908.
+- For the terminal: at most 60 writes a second, and bytes per frame within 1.1 times the
+  changed lines.

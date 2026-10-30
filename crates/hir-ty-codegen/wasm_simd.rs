@@ -390,7 +390,7 @@ impl<'db> FunctionCx<'_, 'db> {
                     (blob.relocs.is_empty() && blob.fn_relocs.is_empty()).then_some(blob.bytes)
                 }
                 // alloc: once per `simd_shuffle`, its indices out of a const evaluated here
-                ConstKind::Unevaluated(named) => Some(self.eval_const(named)?.memory.to_vec()),
+                ConstKind::Alias(_, named) => Some(self.eval_const(named)?.memory.to_vec()),
                 _ => None,
             },
             // alloc: once per `simd_shuffle`, its indices

@@ -16,7 +16,7 @@ use blaze_resolve::resolver::{CliFeatures, CompileKind, FeaturesFor, ResolvedFea
 use blaze_resolve::{DepKind, Dependency, FeatureMap, FeatureValue, InternedString, PackageId, Resolve, Summary};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
-use super::bits::Bits;
+use blaze_ids::bits::BitSet as Bits;
 use super::packages::{Pkg, Table};
 use super::{Kinds, Options, Target};
 
@@ -463,13 +463,13 @@ impl<'a> Graph<'a> {
         let mut live = Bits::new(self.nodes.len());
         let mut stack: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
         for &root in roots {
-            if live.insert(root.index()) {
+            if live.insert_growing(root.index()) {
                 stack.push(root);
             }
         }
         while let Some(node) = stack.pop() {
             for &edge in &self.edges.targets[self.edges.range(node, 0..TAGS)] {
-                if live.insert(edge.node().index()) {
+                if live.insert_growing(edge.node().index()) {
                     stack.push(edge.node());
                 }
             }
@@ -801,7 +801,7 @@ impl<'g> Builder<'g, '_> {
             match *fv {
                 FeatureValue::Feature(feature) => {
                     let index = self.graph.add_feature(feature, None, FEATURE, to_package).1;
-                    self.graph.cli_features.insert(index.index());
+                    self.graph.cli_features.insert_growing(index.index());
                 }
                 // This is enforced by CliFeatures.
                 FeatureValue::Dep { .. } => panic!("unexpected cli dep feature {fv}"),
@@ -813,11 +813,11 @@ impl<'g> Builder<'g, '_> {
                         if optional {
                             // Activate the optional dep on self.
                             let index = self.graph.add_feature(dep_name, None, FEATURE, to_package).1;
-                            self.graph.cli_features.insert(index.index());
+                            self.graph.cli_features.insert_growing(index.index());
                         }
                         let dep_edge = Edge::new(dep_index, true);
                         let index = self.graph.add_feature(dep_feature, None, FEATURE, dep_edge).1;
-                        self.graph.cli_features.insert(index.index());
+                        self.graph.cli_features.insert_growing(index.index());
                     }
                 }
             }

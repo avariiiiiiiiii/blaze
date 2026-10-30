@@ -136,13 +136,35 @@ bound.
 
 | part | typical: today / bound | large: today / bound |
 |---|---|---|
-| fixpoint rows | 0.13 µs / ≈ 0 (L1), inside the composition's 1.7 µs | ≈ 10 ms / ≈ 0.7 ms of dense output, **≈ 15×** |
+| fixpoint rows | 0.13 µs / ≈ 0 (L1), inside the composition's 1.7 µs | ≈ 0.75 ms / ≈ 0.7 ms of output, **≈ 1.07×** (was ≈ 10 ms, then ≈ 1.65 ms) |
 | MIR passes | 9 / 1 (9 µs of a ≈ 200 µs body, 4%) | 0.9 ms / 0.1 ms |
 | loan kills | was 3× to 5× (depth 3 to 5), now at bound | same |
 | Polonius per-step lookups | was 2 hash probes, now 1 load | same |
-| place types | ≈ 4× on that part | ≈ 4× |
-| `is_copy` / `drop_glue` | one fold and re-intern per call | same |
+| place types | at bound: one projection per distinct place (`places.rs`), a probe per element to look up | same |
+| `is_copy` / `drop_glue` | at bound: the raw type is looked up before folding | same |
 | store scans | 7 / 1 (fixed by task 14) | 7 / 1 |
+
+Recounted 10-30 by sol-all-ty, from the code, nothing built:
+
+- **Fixpoint rows.** Sparse `(word, gen, kill)` effects, line-slotted rows (`rows.rs`) and
+  difference propagation (`dataflow.rs`) had landed, which took the ≈ 10 ms to its output plus
+  one fixed cost: every visit read every line of its pending row (a slot swap, a 64-byte copy
+  and a compare, ≈ 8 cycles), nothing pending or not. For the large body that is 5 200 visits ×
+  (20 + 20 + 3 × 12 + 4 = 80 lines over the six analyses) × 8 ≈ 3.3 M cycles, **≈ 0.95 ms**, on
+  top of ≈ 0.7 ms of output: ≈ 1.65 ms, 2.4×. Each block now keeps a bit per line that holds
+  unsent bits (`Marks`), and a visit reads only those, plus on its first visit the lines its
+  own and its edges' gens touch. What is left is one mask word per visit per analysis, 6 ×
+  5 200 × ≈ 5 cycles ≈ 0.05 ms: ≈ 0.75 ms against 0.7, **≈ 1.07×**.
+- **MIR passes.** The one decoding pass (`decode.rs`) landed, but the default path still
+  scans every statement in about nine more places, most matching only the kind's tag:
+  `regions::build` and its `aggregate_temps`, the walk, `capture_temps`, `index_spans`, the
+  assignment counts behind `rustc_move_indices`, `used_mut`'s temporaries, `coroutines` and
+  `inline_consts`. `static_muts` now reads the decode's constants (`Constant::mutable`)
+  instead of scanning. Each remaining scan still streams the 3 MB of a large body's MIR,
+  ≈ 0.1 ms, so the row stays ≈ 9×; folding the rest into `Decoded` is the fix, in files
+  db-mem-borrowck's windows are editing.
+- **Place types, `is_copy`, `drop_glue`.** Design 4 (`places.rs`, the place column) and design
+  5 (`Ctx::is_copy` and `Ctx::drop_glue` probe the raw type before `fold_regions`) landed.
 
 For a typical body the dataflow is within 10% of its bound because the composition dominates
 it. The gap is in the type work: recomputed place types and folding before the cache. For a

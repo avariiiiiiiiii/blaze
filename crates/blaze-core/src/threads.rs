@@ -884,8 +884,8 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Read(bytes))
         }
         Effect::Append { file, bytes, .. } => at(root, &file, |path| {
-            fs::make_parent(path)?;
-            OpenOptions::new().create(true).append(true).open(path)?.write_all(&bytes)?;
+            let open = || OpenOptions::new().create(true).append(true).open(path);
+            fs::making_parent(path, open)?.write_all(&bytes)?;
             Ok(Done::Appended)
         }),
         // `sync_all` is `F_FULLFSYNC` on Apple's systems, where `fsync` leaves the bytes in the
@@ -895,8 +895,8 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Synced)
         }),
         Effect::Truncate { file, len, .. } => at(root, &file, |path| {
-            fs::make_parent(path)?;
-            OpenOptions::new().write(true).create(true).truncate(false).open(path)?.set_len(len)?;
+            let open = || OpenOptions::new().write(true).create(true).truncate(false).open(path);
+            fs::making_parent(path, open)?.set_len(len)?;
             Ok(Done::Truncated)
         }),
         Effect::Write { file, bytes, .. } => at(root, &file, |path| {

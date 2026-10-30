@@ -20,6 +20,7 @@
 use either::Either;
 use hir::{HasAttrs as _, InFile, ModuleDef};
 use span::Edition;
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     SyntaxKind, TextRange,
     view::{self as ast, AstNode as _, AstToken as _, HasModuleItem as _, HasName as _},
@@ -28,7 +29,7 @@ use syntax::{
 use crate::{
     checks::head_range_view as head_range,
     cx::{Cx, item_range_view as item_range},
-    lints::{code_fact, edit_distance::find_best_match_for_name},
+    lints::code_fact,
     lower::{Found, Phase},
     model::{Applicability, Diag, MultiSpan, Span, SuggestionStyle},
 };
@@ -382,7 +383,7 @@ pub(crate) fn typo<'db>(
     candidates.sort_by(|a, b| a.0.symbol().cmp_order(b.0.symbol()));
     // alloc: the candidates' texts, borrowed from the interner
     let texts: Vec<&'static str> = candidates.iter().map(|it| it.0.symbol().as_str()).collect();
-    let Some(best) = find_best_match_for_name(&texts, name, None) else { return false };
+    let Some(best) = find_best_match_for_name(&texts, name, None).copied() else { return false };
     if best == name || best == "_" || exclude.iter().any(|it| it == best) {
         return false;
     }

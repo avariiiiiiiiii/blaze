@@ -73,6 +73,9 @@ pub(crate) fn check_body<'db>(
     if !needs_analysis(&body, infer) {
         // Every pattern is a binding or `_` where nothing can be refuted: only
         // `bindings_with_variant_name` can fire, and it needs no type context.
+        if !may_name_a_variant(db, &body, infer) {
+            return MatchCheck::default();
+        }
         let mut visitor = Visitor::new(db, &body, infer, None);
         visitor.run(def);
         return visitor.finish();
@@ -104,6 +107,39 @@ pub(crate) fn check_body<'db>(
     visitor.finish()
 }
 
+/// The walk [`check_body`] skips when [`may_name_a_variant`] finds nothing, and the scan
+/// `needs_analysis` makes without its shortcut: what the tests compare the fast paths with.
+#[cfg(test)]
+pub(crate) mod slow {
+    use super::*;
+
+    pub(crate) fn walk<'db>(
+        db: &'db Db,
+        def: DefWithBodyId,
+        infer: &'db InferenceResult<'db>,
+    ) -> MatchCheck {
+        let body = Body::of(db, def);
+        let mut visitor = Visitor::new(db, &body, infer, None);
+        visitor.run(def);
+        visitor.finish()
+    }
+
+    pub(crate) fn needs_analysis(body: &Body, infer: &InferenceResult<'_>) -> bool {
+        let trivial = |pat| is_trivial(body, infer, pat);
+        body.params.iter().any(|param| !trivial(param.user_written))
+            || body.exprs().any(|(_, expr)| match expr {
+                Expr::Match { .. } | Expr::Let { .. } => true,
+                Expr::Block { statements, .. } => statements.iter().any(|stmt| {
+                    matches!(stmt, Statement::Let { pat, else_branch, .. }
+                        if else_branch.is_some() || !trivial(pat))
+                }),
+                Expr::Closure { args, .. } => args.iter().any(|&arg| !trivial(arg)),
+                Expr::Assignment { target, .. } => !trivial(target),
+                _ => false,
+            })
+    }
+}
+
 /// A pattern that refutes nothing and that the analysis would report nothing of when it is
 /// irrefutable: a binding without a subpattern, `_`, or a destructuring assignment's place.
 fn is_trivial(body: &Body, infer: &InferenceResult<'_>, pat: PatId) -> bool {
@@ -114,18 +150,39 @@ fn is_trivial(body: &Body, infer: &InferenceResult<'_>, pat: PatId) -> bool {
 /// Whether the body has anything the analysis must run on: a `match`, a `let` expression or
 /// `let`-`else`, or a pattern that is not trivial where it must be irrefutable.
 pub(crate) fn needs_analysis(body: &Body, infer: &InferenceResult<'_>) -> bool {
+    use hir_def::hir::ExprKind;
+    const ANALYZED: u64 = (1 << ExprKind::Match as u32) | (1 << ExprKind::Let as u32);
+    const PATTERNED: u64 = (1 << ExprKind::Closure as u32) | (1 << ExprKind::Assignment as u32);
+    let kinds = body.kinds_present();
+    if kinds & ANALYZED != 0 {
+        return true;
+    }
     let trivial = |pat| is_trivial(body, infer, pat);
     body.params.iter().any(|param| !trivial(param.user_written))
-        || body.exprs().any(|(_, expr)| match expr {
-            Expr::Match { .. } | Expr::Let { .. } => true,
-            Expr::Block { statements, .. } => statements.iter().any(|stmt| {
-                matches!(stmt, Statement::Let { pat, else_branch, .. }
-                    if else_branch.is_some() || !trivial(pat))
-            }),
-            Expr::Closure { args, .. } => args.iter().any(|&arg| !trivial(arg)),
-            Expr::Assignment { target, .. } => !trivial(target),
-            _ => false,
-        })
+        || body.let_statements().any(|(pat, has_else)| has_else || !trivial(pat))
+        || kinds & PATTERNED != 0
+            && body.expr_ids().any(|id| match body.expr_kind(id) {
+                ExprKind::Closure | ExprKind::Assignment => match body.expr(id) {
+                    Expr::Closure { args, .. } => args.iter().any(|&arg| !trivial(arg)),
+                    Expr::Assignment { target, .. } => !trivial(target),
+                    _ => false,
+                },
+                _ => false,
+            })
+}
+
+/// Whether some binding of the body could be linted by `bindings_with_variant_name`: its type,
+/// through references, is an enum with a unit variant of its name. A superset of what
+/// [`Visitor::check_bindings_named_same_as_variants`] reports (it also asks the binding mode),
+/// so a body without one reports nothing and needs no walk.
+pub(crate) fn may_name_a_variant(db: &Db, body: &Body, infer: &InferenceResult<'_>) -> bool {
+    body.bindings().any(|(id, binding)| {
+        let TyKind::Adt(def, _) = infer.binding_ty(id).strip_references().kind() else {
+            return false;
+        };
+        let AdtId::EnumId(enum_) = def.def_id() else { return false };
+        matches!(enum_.enum_variants(db).variants.get(&binding.name), Some((_, FieldsShape::Unit)))
+    })
 }
 
 struct Visitor<'c, 'a, 'db> {

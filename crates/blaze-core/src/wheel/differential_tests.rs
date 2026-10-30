@@ -4,7 +4,8 @@
 //! copy's tests, moved.
 
 use blaze_ids::rng::SplitMix64;
-use proptest::prelude::*;
+use hegel::TestCase;
+use hegel::generators as gs;
 
 use super::{Handle, Wheel};
 
@@ -195,64 +196,71 @@ enum Op {
     Advance(u64),
 }
 
-fn op() -> impl Strategy<Value = Op> {
-    prop_oneof![
-        4 => prop_oneof![0..64u64, 0..70_000u64, 0..4_000_000u64, 0..(1u64 << 40)].prop_map(Op::Insert),
-        2 => any::<usize>().prop_map(Op::Cancel),
-        3 => prop_oneof![0..3u64, 0..5_000u64, 0..3_600_000u64, 0..(1u64 << 41)].prop_map(Op::Advance),
-    ]
+/// Below one of `ends`, picked evenly, so every wheel level is reached.
+fn below(tc: &TestCase, ends: [u64; 4]) -> u64 {
+    let end = ends[tc.draw(gs::integers::<usize>().max_value(3))];
+    tc.draw(gs::integers().max_value(end - 1))
 }
 
-proptest! {
-    /// From any start, over any inserts (due after the next tick, where the two agree on
-    /// when a timer is due), cancels and advances: both fire the same timers at each advance,
-    /// this wheel in deadline then insertion order; its soonest deadline is the earliest set,
-    /// at or past the queue wheel's next expiry.
-    #[test]
-    fn the_queue_wheel_and_this_one_fire_alike(start in 0..(1u64 << 42), ops in proptest::collection::vec(op(), 1..300)) {
-        let mut wheel: Wheel<u64> = starting_at(start);
-        let mut old: queue::Wheel<u64> = queue::Wheel::new(start);
-        let mut now = start;
-        let mut set: Vec<(Handle, u64, u64, u64)> = Vec::new();
-        for (step, op) in ops.into_iter().enumerate() {
-            let step = step as u64;
-            match op {
-                Op::Insert(after) => {
-                    let due = now.saturating_add(1).saturating_add(after);
-                    let handle = wheel.insert(due, step);
-                    set.push((handle, old.insert(due, step), due, step));
-                }
-                Op::Cancel(at) if !set.is_empty() => {
-                    let (handle, old_handle, _, step) = set.swap_remove(at % set.len());
-                    prop_assert_eq!(wheel.cancel(handle), Some(step));
-                    prop_assert_eq!(wheel.cancel(handle), None);
-                    old.remove(old_handle);
-                    old.remove(old_handle);
-                }
-                Op::Cancel(_) => {}
-                Op::Advance(by) => {
-                    now = now.saturating_add(by);
-                    let mut fired = Vec::new();
-                    wheel.advance(now, |deadline, step| fired.push((deadline, step)));
-                    let mut old_fired = Vec::new();
-                    old.advance(now, &mut old_fired);
-                    let mut due: Vec<(u64, u64)> = set.iter().filter(|it| it.2 <= now).map(|it| (it.2, it.3)).collect();
-                    due.sort_unstable();
-                    prop_assert_eq!(&fired, &due);
-                    old_fired.sort_unstable();
-                    prop_assert!(old_fired.iter().copied().eq(due.iter().map(|it| it.1)));
-                    set.retain(|it| it.2 > now);
-                }
+#[hegel::composite]
+fn op(tc: &TestCase) -> Op {
+    match tc.draw(gs::integers::<u8>().max_value(8)) {
+        0..4 => Op::Insert(below(tc, [64, 70_000, 4_000_000, 1 << 40])),
+        4..6 => Op::Cancel(tc.draw(gs::integers())),
+        _ => Op::Advance(below(tc, [3, 5_000, 3_600_000, 1 << 41])),
+    }
+}
+
+/// From any start, over any inserts (due after the next tick, where the two agree on
+/// when a timer is due), cancels and advances: both fire the same timers at each advance,
+/// this wheel in deadline then insertion order; its soonest deadline is the earliest set,
+/// at or past the queue wheel's next expiry.
+#[hegel::test]
+fn the_queue_wheel_and_this_one_fire_alike(tc: TestCase) {
+    let start: u64 = tc.draw(gs::integers().max_value((1 << 42) - 1));
+    let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(299));
+    let mut wheel: Wheel<u64> = starting_at(start);
+    let mut old: queue::Wheel<u64> = queue::Wheel::new(start);
+    let mut now = start;
+    let mut set: Vec<(Handle, u64, u64, u64)> = Vec::new();
+    for (step, op) in ops.into_iter().enumerate() {
+        let step = step as u64;
+        match op {
+            Op::Insert(after) => {
+                let due = now.saturating_add(1).saturating_add(after);
+                let handle = wheel.insert(due, step);
+                set.push((handle, old.insert(due, step), due, step));
             }
-            prop_assert_eq!(wheel.len(), set.len());
-            prop_assert_eq!(old.len(), set.len());
-            let earliest = set.iter().map(|it| it.2).min();
-            prop_assert_eq!(wheel.next_deadline(), earliest);
-            match (old.next(), earliest) {
-                (Some(expiry), Some(due)) => prop_assert!(expiry > now && expiry <= due, "{expiry} {now} {due}"),
-                (None, None) => {}
-                other => prop_assert!(false, "{other:?}"),
+            Op::Cancel(at) if !set.is_empty() => {
+                let (handle, old_handle, _, step) = set.swap_remove(at % set.len());
+                assert_eq!(wheel.cancel(handle), Some(step));
+                assert_eq!(wheel.cancel(handle), None);
+                old.remove(old_handle);
+                old.remove(old_handle);
             }
+            Op::Cancel(_) => {}
+            Op::Advance(by) => {
+                now = now.saturating_add(by);
+                let mut fired = Vec::new();
+                wheel.advance(now, |deadline, step| fired.push((deadline, step)));
+                let mut old_fired = Vec::new();
+                old.advance(now, &mut old_fired);
+                let mut due: Vec<(u64, u64)> = set.iter().filter(|it| it.2 <= now).map(|it| (it.2, it.3)).collect();
+                due.sort_unstable();
+                assert_eq!(&fired, &due);
+                old_fired.sort_unstable();
+                assert!(old_fired.iter().copied().eq(due.iter().map(|it| it.1)));
+                set.retain(|it| it.2 > now);
+            }
+        }
+        assert_eq!(wheel.len(), set.len());
+        assert_eq!(old.len(), set.len());
+        let earliest = set.iter().map(|it| it.2).min();
+        assert_eq!(wheel.next_deadline(), earliest);
+        match (old.next(), earliest) {
+            (Some(expiry), Some(due)) => assert!(expiry > now && expiry <= due, "{expiry} {now} {due}"),
+            (None, None) => {}
+            other => panic!("{other:?}"),
         }
     }
 }

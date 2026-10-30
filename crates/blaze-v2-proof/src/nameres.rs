@@ -187,7 +187,7 @@ impl Finding {
 }
 
 /// The indices of `trace`'s keys of `kind`: keys sort by kind first, so they are one run.
-fn of_kind(trace: &Trace, kind: QueryKind) -> std::ops::Range<usize> {
+pub(crate) fn of_kind(trace: &Trace, kind: QueryKind) -> std::ops::Range<usize> {
     let start = trace.keys.partition_point(|k| k.kind < kind);
     start..start + trace.keys[start..].partition_point(|k| k.kind == kind)
 }

@@ -3,6 +3,8 @@
 //! Tests that the durability correctly propagates
 //! to all cycle heads.
 
+#![forbid(unsafe_code)]
+
 use salsa::Setter as _;
 
 #[test_log::test]

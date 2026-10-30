@@ -87,7 +87,7 @@ use hir_def::{
     },
     src::HasSource as _,
     unstable_features::UnstableFeatures,
-    visibility::visibility_from_ast,
+    visibility::visibility_from_ast_view,
 };
 use hir_expand::{builtin::BuiltinDeriveExpander, proc_macro::ProcMacroKind};
 use hir_ide::{
@@ -124,8 +124,9 @@ use span::{AstIdNode, Edition, FileId};
 use stdx::{format_to, impl_from, never};
 use syntax::{
     AstNode, AstPtr, SmolStr, SyntaxNode, SyntaxNodePtr, TextRange, ToSmolStr,
-    ast::{self, HasName as _, HasVisibility as _},
+    ast::{self, HasName as _},
     format_smolstr,
+    view::{HasName as _, HasVisibility as _},
 };
 
 use crate::db::HirDatabase;
@@ -699,10 +700,7 @@ impl Module {
         while id.is_block_module(db) {
             id = id.containing_module(db).expect("block without parent module");
         }
-        // SAFETY: `hir`'s `Module` holds `'static` ids, as `self.id` already is. A salsa
-        // interned id is never freed (db-salsa: interned values are never collected), so the
-        // id names the same module for as long as the database lives, past any query.
-        Module { id: unsafe { id.to_static() } }
+        Module { id: id.to_static() }
     }
 
     pub fn path_to_root(self, db: &Db) -> Vec<Module> {
@@ -1078,8 +1076,8 @@ impl Struct {
 impl HasVisibility for Struct {
     fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
-        let source = loc.source(db);
-        visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
+        let source = loc.source_view(db);
+        visibility_from_ast_view(db, self.id, source.map(|src| src.visibility()))
     }
 }
 
@@ -1130,8 +1128,8 @@ impl Union {
 impl HasVisibility for Union {
     fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
-        let source = loc.source(db);
-        visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
+        let source = loc.source_view(db);
+        visibility_from_ast_view(db, self.id, source.map(|src| src.visibility()))
     }
 }
 
@@ -1225,8 +1223,8 @@ impl Enum {
 impl HasVisibility for Enum {
     fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
-        let source = loc.source(db);
-        visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
+        let source = loc.source_view(db);
+        visibility_from_ast_view(db, self.id, source.map(|src| src.visibility()))
     }
 }
 
@@ -1268,10 +1266,6 @@ impl EnumVariant {
             hir_def::item_tree::FieldsShape::Tuple => StructKind::Tuple,
             hir_def::item_tree::FieldsShape::Unit => StructKind::Unit,
         }
-    }
-
-    pub fn value(self, db: &Db) -> Option<ast::Expr> {
-        self.source(db)?.value.const_arg()?.expr()
     }
 
     pub fn eval(self, db: &Db) -> Result<i128, ConstEvalError<'_>> {
@@ -2220,10 +2214,6 @@ impl<'db> Param<'db> {
             _ => None,
         }
     }
-
-    pub fn pattern_source(self, db: &Db) -> Option<ast::Pat> {
-        self.source(db).and_then(|p| p.value.right()?.pat())
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2306,13 +2296,13 @@ impl ExternCrateDecl {
 
     pub fn name(self, db: &Db) -> Name {
         let loc = self.id.lookup(db);
-        let source = loc.source(db);
+        let source = loc.source_view(db);
         as_name_opt(source.value.name_ref())
     }
 
     pub fn alias(self, db: &Db) -> Option<ImportAlias> {
         let loc = self.id.lookup(db);
-        let source = loc.source(db);
+        let source = loc.source_view(db);
         let rename = source.value.rename()?;
         if let Some(name) = rename.name() {
             Some(ImportAlias::Alias(name.as_name()))
@@ -2336,8 +2326,8 @@ impl ExternCrateDecl {
 impl HasVisibility for ExternCrateDecl {
     fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
-        let source = loc.source(db);
-        visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
+        let source = loc.source_view(db);
+        visibility_from_ast_view(db, self.id, source.map(|src| src.visibility()))
     }
 }
 
@@ -2353,10 +2343,6 @@ impl Const {
 
     pub fn name(self, db: &Db) -> Option<Name> {
         ConstSignature::of(db, self.id).name
-    }
-
-    pub fn value(self, db: &Db) -> Option<ast::Expr> {
-        self.source(db)?.value.body()
     }
 
     pub fn ty(self, db: &Db) -> Type<'_> {
@@ -2434,10 +2420,6 @@ impl Static {
         StaticSignature::of(db, self.id).flags.contains(StaticFlags::MUTABLE)
     }
 
-    pub fn value(self, db: &Db) -> Option<ast::Expr> {
-        self.source(db)?.value.body()
-    }
-
     pub fn ty(self, db: &Db) -> Type<'_> {
         Type::from_value_def(db, self.id)
     }
@@ -2463,8 +2445,8 @@ impl Static {
 impl HasVisibility for Static {
     fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
-        let source = loc.source(db);
-        visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
+        let source = loc.source_view(db);
+        visibility_from_ast_view(db, self.id, source.map(|src| src.visibility()))
     }
 }
 
@@ -2596,8 +2578,8 @@ impl Trait {
 impl HasVisibility for Trait {
     fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
-        let source = loc.source(db);
-        visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
+        let source = loc.source_view(db);
+        visibility_from_ast_view(db, self.id, source.map(|src| src.visibility()))
     }
 }
 
@@ -2649,12 +2631,6 @@ impl ExternBlock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UseDecl {
     pub(crate) id: hir_def::UseId,
-}
-
-impl UseDecl {
-    pub fn source(self, db: &Db) -> InFile<ast::Use> {
-        self.id.lookup(db).source(db)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2764,17 +2740,17 @@ impl Macro {
         match self.id {
             MacroId::Macro2Id(id) => {
                 let loc = id.lookup(db);
-                let source = loc.source(db);
+                let source = loc.source_view(db);
                 as_name_opt(source.value.name())
             }
             MacroId::MacroRulesId(id) => {
                 let loc = id.lookup(db);
-                let source = loc.source(db);
+                let source = loc.source_view(db);
                 as_name_opt(source.value.name())
             }
             MacroId::ProcMacroId(id) => {
                 let loc = id.lookup(db);
-                let source = loc.source(db);
+                let source = loc.source_view(db);
                 match loc.kind {
                     ProcMacroKind::CustomDerive => AttrFlags::derive_info(db, self.id).map_or_else(
                         || as_name_opt(source.value.name()),
@@ -2899,8 +2875,8 @@ impl HasVisibility for Macro {
         match self.id {
             MacroId::Macro2Id(id) => {
                 let loc = id.lookup(db);
-                let source = loc.source(db);
-                visibility_from_ast(db, id, source.map(|src| src.visibility()))
+                let source = loc.source_view(db);
+                visibility_from_ast_view(db, id, source.map(|src| src.visibility()))
             }
             MacroId::MacroRulesId(id) => {
                 if AttrFlags::query(db, id.into()).contains(AttrFlags::IS_MACRO_EXPORT) {
@@ -4501,70 +4477,7 @@ fn captured_items<'db>(
         .collect() // alloc: editor edge, the owned capture list callers take
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FnTrait {
-    FnOnce,
-    FnMut,
-    Fn,
-
-    AsyncFnOnce,
-    AsyncFnMut,
-    AsyncFn,
-}
-
-impl From<traits::FnTrait> for FnTrait {
-    fn from(value: traits::FnTrait) -> Self {
-        match value {
-            traits::FnTrait::FnOnce => FnTrait::FnOnce,
-            traits::FnTrait::FnMut => FnTrait::FnMut,
-            traits::FnTrait::Fn => FnTrait::Fn,
-            traits::FnTrait::AsyncFnOnce => FnTrait::AsyncFnOnce,
-            traits::FnTrait::AsyncFnMut => FnTrait::AsyncFnMut,
-            traits::FnTrait::AsyncFn => FnTrait::AsyncFn,
-        }
-    }
-}
-
-impl fmt::Display for FnTrait {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FnTrait::FnOnce => write!(f, "FnOnce"),
-            FnTrait::FnMut => write!(f, "FnMut"),
-            FnTrait::Fn => write!(f, "Fn"),
-            FnTrait::AsyncFnOnce => write!(f, "AsyncFnOnce"),
-            FnTrait::AsyncFnMut => write!(f, "AsyncFnMut"),
-            FnTrait::AsyncFn => write!(f, "AsyncFn"),
-        }
-    }
-}
-
-impl FnTrait {
-    pub const fn function_name(&self) -> &'static str {
-        match self {
-            FnTrait::FnOnce => "call_once",
-            FnTrait::FnMut => "call_mut",
-            FnTrait::Fn => "call",
-            FnTrait::AsyncFnOnce => "async_call_once",
-            FnTrait::AsyncFnMut => "async_call_mut",
-            FnTrait::AsyncFn => "async_call",
-        }
-    }
-
-    pub fn lang_item(self) -> LangItem {
-        match self {
-            FnTrait::FnOnce => LangItem::FnOnce,
-            FnTrait::FnMut => LangItem::FnMut,
-            FnTrait::Fn => LangItem::Fn,
-            FnTrait::AsyncFnOnce => LangItem::AsyncFnOnce,
-            FnTrait::AsyncFnMut => LangItem::AsyncFnMut,
-            FnTrait::AsyncFn => LangItem::AsyncFn,
-        }
-    }
-
-    pub fn get_id(self, db: &Db, krate: Crate) -> Option<Trait> {
-        Trait::lang(db, krate, self.lang_item())
-    }
-}
+pub use hir_ide::traits::FnTrait;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClosureCapture<'db> {
@@ -5184,10 +5097,7 @@ impl<'db> Type<'db> {
 
     pub fn add_reference(&self, db: &'db Db, mutability: Mutability) -> Self {
         let interner = DbInterner::new_no_crate(db);
-        let ty_mutability = match mutability {
-            Mutability::Shared => hir_ide::next_solver::Mutability::Not,
-            Mutability::Mut => hir_ide::next_solver::Mutability::Mut,
-        };
+        let ty_mutability = hir_ide::lower_mutability(mutability);
         self.derived_with(
             interner,
             Ty::new_ref(interner, Region::error(interner), self.ty.skip_binder(), ty_mutability),
@@ -5198,10 +5108,7 @@ impl<'db> Type<'db> {
     /// `Ty::new_imm_ref(tcx, re_erased, ty)`; [`Type::add_reference`] gives an error region.
     pub fn ref_to(&self, db: &'db Db, mutability: Mutability) -> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
-        let ty_mutability = match mutability {
-            Mutability::Shared => hir_ide::next_solver::Mutability::Not,
-            Mutability::Mut => hir_ide::next_solver::Mutability::Mut,
-        };
+        let ty_mutability = hir_ide::lower_mutability(mutability);
         let region = Region::new_erased(interner);
         self.derived_with(interner, Ty::new_ref(interner, region, self.ty.skip_binder(), ty_mutability))
     }
@@ -5238,10 +5145,7 @@ impl<'db> Type<'db> {
     }
 
     pub fn as_slice(&self) -> Option<Type<'db>> {
-        match self.ty.skip_binder().kind() {
-            TyKind::Slice(ty) => Some(self.derived(ty)),
-            _ => None,
-        }
+        self.ty.skip_binder().as_slice().map(|ty| self.derived(ty))
     }
 
     pub fn strip_references(&self) -> Self {
@@ -5915,7 +5819,7 @@ impl<'db> Type<'db> {
     pub fn iterate_method_candidates_with_traits<T>(
         &self,
         db: &'db Db,
-        scope: &SemanticsScope<'_>,
+        scope: &SemanticsScope<'db>,
         traits_in_scope: &FxHashSet<TraitId>,
         name: Option<&Name>,
         mut callback: impl FnMut(Function) -> Option<T>,
@@ -5937,7 +5841,7 @@ impl<'db> Type<'db> {
     pub fn iterate_method_candidates<T>(
         &self,
         db: &'db Db,
-        scope: &SemanticsScope<'_>,
+        scope: &SemanticsScope<'db>,
         name: Option<&Name>,
         callback: impl FnMut(Function) -> Option<T>,
     ) -> Option<T> {
@@ -5996,7 +5900,7 @@ impl<'db> Type<'db> {
     pub fn iterate_method_candidates_split_inherent(
         &self,
         db: &'db Db,
-        scope: &SemanticsScope<'_>,
+        scope: &SemanticsScope<'db>,
         traits_in_scope: &FxHashSet<TraitId>,
         name: Option<&Name>,
         mut callback: impl MethodCandidateCallback,
@@ -6076,7 +5980,7 @@ impl<'db> Type<'db> {
     pub fn iterate_path_candidates<T>(
         &self,
         db: &'db Db,
-        scope: &SemanticsScope<'_>,
+        scope: &SemanticsScope<'db>,
         traits_in_scope: &FxHashSet<TraitId>,
         name: Option<&Name>,
         mut callback: impl FnMut(AssocItem) -> Option<T>,
@@ -6105,7 +6009,7 @@ impl<'db> Type<'db> {
     pub fn iterate_path_candidates_split_inherent(
         &self,
         db: &'db Db,
-        scope: &SemanticsScope<'_>,
+        scope: &SemanticsScope<'db>,
         traits_in_scope: &FxHashSet<TraitId>,
         name: Option<&Name>,
         mut callback: impl PathCandidateCallback,
@@ -6484,7 +6388,7 @@ impl<'db> Callable<'db> {
                 owner: self.ty.owner,
             }),
             Callee::FnPtr => CallableKind::FnPtr,
-            Callee::FnImpl(fn_) => CallableKind::FnImpl(fn_.into()),
+            Callee::FnImpl(fn_) => CallableKind::FnImpl(fn_),
         }
     }
 
@@ -6763,6 +6667,25 @@ pub enum AutoBorrow {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct OverloadedDeref(pub Mutability);
+
+impl From<hir_ide::Adjust> for Adjust {
+    fn from(adjust: hir_ide::Adjust) -> Adjust {
+        match adjust {
+            hir_ide::Adjust::NeverToAny => Adjust::NeverToAny,
+            hir_ide::Adjust::Deref(Some(hir_ide::OverloadedDeref(m))) => {
+                Adjust::Deref(Some(OverloadedDeref(hir_ide::hir_mutability(m))))
+            }
+            hir_ide::Adjust::Deref(None) => Adjust::Deref(None),
+            hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::RawPtr(m)) => {
+                Adjust::Borrow(AutoBorrow::RawPtr(hir_ide::hir_mutability(m)))
+            }
+            hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::Ref(m)) => {
+                Adjust::Borrow(AutoBorrow::Ref(hir_ide::hir_mutability(m.into())))
+            }
+            hir_ide::Adjust::Pointer(pc) => Adjust::Pointer(pc),
+        }
+    }
+}
 
 pub trait HasVisibility {
     fn visibility(&self, db: &Db) -> Visibility;

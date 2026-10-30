@@ -1,7 +1,7 @@
 //! Interned strings: symbols declared at compile time ([`symbols`]) and ones interned at
 //! runtime, as `u32` IDs that mean the same in every process that restores one image.
 //!
-//! A [`Symbol`] is an ID in the symbol [`Table`]: `1..=STATIC` are the compiled-in texts of
+//! A [`Symbol`] is an ID in the symbol table (`text`): `1..=STATIC` are the compiled-in texts of
 //! [`symbols::TEXTS`] (the declared symbols, then each list's), every other one a text interned
 //! at runtime or restored from an image ([`restore_symbols`]), read in place. The table holds
 //! the compiled-in texts first, so interning a declared symbol's text gives the declared
@@ -14,7 +14,9 @@ use blaze_format::SchemaHash;
 use blaze_ids::{ContentId, Hasher};
 use blaze_image::{Builder, Image, SectionId, Stable};
 
-use crate::table::{Jobs, Live, RestoreError, Shape, Table, serial};
+use crate::table::{Jobs, Live, RestoreError};
+#[cfg(test)]
+use crate::table::{Table, serial};
 
 pub mod symbols;
 
@@ -52,23 +54,84 @@ impl fmt::Debug for Symbol {
 const _: () = assert!(size_of::<Symbol>() == size_of::<u32>());
 const _: () = assert!(size_of::<Option<Symbol>>() == size_of::<u32>());
 
-static TABLE: OnceLock<Table> = OnceLock::new();
+/// The process's symbol table, every value of which is text. Only this module reaches it, so
+/// every value in it is a compiled-in `&str`, a copy of a `&str` interned, or bytes of an image
+/// that `Table::restore` checked to be UTF-8 (`shape().text`): reading one as a `str` needs
+/// no check. That is what its one unsafe operation buys: [`Symbol::as_str`] costs a range check
+/// and two loads, where checking the UTF-8 again would scan every byte of the name each time.
+#[allow(unsafe_code)]
+mod text {
+    use std::sync::OnceLock;
 
-fn shape() -> Shape {
-    Shape {
-        statics: symbols::STATIC as u32,
-        static_bytes: |id| symbols::TEXTS[id as usize - 1].str.as_bytes(),
-        key: order_key,
-        align: 1,
-        size: 1,
-        text: true,
+    use blaze_image::{Image, SectionId, SectionWriter, Stable};
+
+    use super::{order_key, symbols, symbols_schema};
+    use crate::table::{Jobs, Live, RestoreError, Shape, Table};
+
+    static TABLE: OnceLock<Table> = OnceLock::new();
+
+    /// The symbol table's shape: the compiled-in texts first, every value text.
+    pub(super) fn shape() -> Shape {
+        Shape {
+            statics: symbols::STATIC as u32,
+            static_bytes: |id| symbols::TEXTS[id as usize - 1].str.as_bytes(),
+            key: order_key,
+            align: 1,
+            size: 1,
+            text: true,
+        }
+    }
+
+    #[inline]
+    fn table() -> &'static Table {
+        TABLE.get_or_init(|| Table::new(shape()))
+    }
+
+    pub(super) fn intern_hashed(s: &str, hash: u64) -> u32 {
+        table().intern_hashed(hash, s.as_bytes())
+    }
+
+    pub(super) fn find_hashed(s: &str, hash: u64) -> Option<u32> {
+        table().find_hashed(hash, s.as_bytes())
+    }
+
+    /// Whether `id` names a symbol of this process.
+    pub(super) fn names(id: u32) -> bool {
+        table().get(id).is_some()
+    }
+
+    pub(super) fn key(id: u32) -> u64 {
+        table().key(id)
+    }
+
+    /// The text of `id`, which a held symbol names.
+    #[inline]
+    pub(super) fn str(id: u32) -> &'static str {
+        let bytes = table().bytes(id);
+        // SAFETY: every value of `TABLE` is text (the module's doc): its compiled-in values are
+        // `&str`s, `intern` copies a `&str`, and a restore checks every live value's UTF-8
+        // (`Table::validate`, as `shape().text` asks) before any is read. A value that was not
+        // would make a `&str` that is not UTF-8.
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    }
+
+    /// One past the highest ID made so far.
+    #[cfg(test)]
+    pub(super) fn end() -> u32 {
+        table().end()
+    }
+
+    pub(super) fn write(live: &Live, out: &mut SectionWriter<'_>) {
+        table().write(live, out);
+    }
+
+    pub(super) fn restore<S: Stable>(image: &'static Image<S>, jobs: Jobs<'_>) -> Result<(), RestoreError> {
+        Table::restore_into(&TABLE, shape(), image, SectionId::SYMBOLS, symbols_schema(), jobs)
     }
 }
 
-#[inline]
-fn table() -> &'static Table {
-    TABLE.get_or_init(|| Table::new(shape()))
-}
+#[cfg(test)]
+use self::text::shape;
 
 /// The schema of the symbol section: the table's layout and every compiled-in text, so an
 /// image is restored only by a blaze whose `STATIC` IDs are the same texts.
@@ -95,7 +158,7 @@ pub fn symbols_schema() -> SchemaHash {
 pub fn restore_symbols<S: Stable>(image: Arc<Image<S>>, jobs: Jobs<'_>) -> Result<(), RestoreError> {
     // alloc: once a restore, so the image outlives every symbol read from it
     let image: &'static Arc<Image<S>> = Box::leak(Box::new(image));
-    restore_into(&TABLE, image, jobs)?;
+    text::restore(image, jobs)?;
     RESTORED.set(image.hash()).expect("the symbol table is restored once");
     Ok(())
 }
@@ -109,6 +172,8 @@ pub fn restored_from() -> Option<ContentId> {
     RESTORED.get().copied()
 }
 
+/// A symbol table restored into `cell`, as [`restore_symbols`] restores the process's.
+#[cfg(test)]
 fn restore_into<S: Stable>(
     cell: &OnceLock<Table>,
     image: &'static Image<S>,
@@ -121,7 +186,7 @@ fn restore_into<S: Stable>(
 /// ID free for the next process. The symbols interned while this runs are not in it.
 pub fn write_symbols(live: &Live, builder: &mut Builder) {
     let mut out = builder.section(SectionId::SYMBOLS, symbols_schema());
-    table().write(live, &mut out);
+    text::write(live, &mut out);
 }
 
 impl Live {
@@ -142,13 +207,40 @@ impl Symbol {
         }
     }
 
+    #[inline]
     pub fn intern(s: &str) -> Self {
-        Symbol::from_table(table().intern(s.as_bytes()))
+        Symbol::intern_hashed(s, blaze_phf::name_hash(s.as_bytes()))
+    }
+
+    /// [`Symbol::intern`] of `s` whose [`blaze_phf::name_hash`] is `hash`, from a caller that
+    /// hashed it while its bytes were in registers. A compiled-in text ([`symbols::TEXTS`]: the
+    /// declared symbols, the common names among them, each list's) is its fixed symbol from
+    /// [`symbols::COMPILED`], one lookup with no probe of the table; any other is one probe of
+    /// the table under `hash`. Neither hashes `s` again.
+    #[inline]
+    pub fn intern_hashed(s: &str, hash: u64) -> Self {
+        debug_assert_eq!(hash, blaze_phf::name_hash(s.as_bytes()), "{s:?}: a hash not its name_hash");
+        match symbols::COMPILED.index_by_name_hash(hash, s.as_bytes()) {
+            Some(index) => Symbol::from_index(index),
+            None => Symbol::from_table(text::intern_hashed(s, hash)),
+        }
     }
 
     /// The symbol of `s`, if one was interned or restored.
+    #[inline]
     pub fn find(s: &str) -> Option<Symbol> {
-        table().find(s.as_bytes()).map(Symbol::from_table)
+        Symbol::find_hashed(s, blaze_phf::name_hash(s.as_bytes()))
+    }
+
+    /// [`Symbol::find`] of `s` whose [`blaze_phf::name_hash`] is `hash`, as
+    /// [`Symbol::intern_hashed`].
+    #[inline]
+    pub fn find_hashed(s: &str, hash: u64) -> Option<Symbol> {
+        debug_assert_eq!(hash, blaze_phf::name_hash(s.as_bytes()), "{s:?}: a hash not its name_hash");
+        match symbols::COMPILED.index_by_name_hash(hash, s.as_bytes()) {
+            Some(index) => Some(Symbol::from_index(index)),
+            None => text::find_hashed(s, hash).map(Symbol::from_table),
+        }
     }
 
     fn from_table(id: u32) -> Symbol {
@@ -166,7 +258,7 @@ impl Symbol {
     #[inline]
     pub fn from_id(id: u32) -> Option<Symbol> {
         let id = NonZeroU32::new(id)?;
-        let known = id.get() as usize <= symbols::STATIC || table().get(id.get()).is_some();
+        let known = id.get() as usize <= symbols::STATIC || text::names(id.get());
         known.then_some(Symbol { id })
     }
 
@@ -187,10 +279,7 @@ impl Symbol {
         if let Some(text) = self.text() {
             return text.str;
         }
-        let bytes = table().bytes(self.id());
-        // SAFETY: a symbol's bytes are a copy of the `&str` it was interned from, or were
-        // checked to be UTF-8 when the image holding them was restored (`Shape::text`).
-        unsafe { std::str::from_utf8_unchecked(bytes) }
+        text::str(self.id())
     }
 
     /// The symbol's [`order_key`], stored beside it when it was interned.
@@ -198,7 +287,7 @@ impl Symbol {
     pub fn order_key(&self) -> u64 {
         match self.text() {
             Some(text) => text.key,
-            None => table().key(self.id()),
+            None => text::key(self.id()),
         }
     }
 
@@ -297,7 +386,7 @@ mod tests {
         let q = Symbol::intern("?");
         assert_eq!(Symbol::intern("!"), bang);
         assert_eq!(Symbol::intern("hello"), hello);
-        assert!(table().end() as usize > symbols::STATIC + 1);
+        assert!(text::end() as usize > symbols::STATIC + 1);
         assert_ne!(hello, world);
         assert_ne!(bang, q);
         let default = Symbol::intern("default");
@@ -363,6 +452,48 @@ mod tests {
             assert_eq!(symbol.declared_index(), (at < sym::DECLARED).then_some(at as u16));
             assert_eq!(symbol.order_key(), order_key(text.str.as_bytes()));
         }
+    }
+
+    /// Every compiled-in text is its own index in `COMPILED`, by its bytes and by a hash
+    /// handed over, so interning one never probes the table.
+    #[test]
+    fn every_compiled_in_text_is_found_without_the_table() {
+        for (at, text) in symbols::TEXTS.iter().enumerate() {
+            let bytes = text.str.as_bytes();
+            assert_eq!(symbols::COMPILED.get(text.str), Some(at), "{:?}", text.str);
+            assert_eq!(symbols::COMPILED.index_by_name_hash(blaze_phf::name_hash(bytes), bytes), Some(at));
+        }
+        for other in ["selff", "Self_", "a new symbol", "ünïcödé", "256", "<ra@gennew>", "c_int "] {
+            let bytes = other.as_bytes();
+            assert_eq!(symbols::COMPILED.index_by_name_hash(blaze_phf::name_hash(bytes), bytes), None, "{other:?}");
+        }
+    }
+
+    /// The names the coordinator named, and the most frequent of `library/` and `harness/`,
+    /// are fixed symbols.
+    #[test]
+    fn common_names_are_compiled_in() {
+        for name in ["self", "Some", "Ok", "new", "iter", "std", "None", "Err", "a", "T", "unwrap", "len"] {
+            let symbol = Symbol::intern(name);
+            assert!(symbol.static_index().is_some(), "{name} is not compiled in");
+            assert!(symbol.declared_index().is_some(), "{name} is not declared");
+        }
+        assert_eq!(Symbol::intern("c_int"), sym::c_int);
+        assert_eq!(Symbol::intern("__m128i"), sym::__m128i);
+    }
+
+    #[test]
+    fn a_hash_handed_over_is_the_same_as_hashing() {
+        let mut names: Vec<String> = symbols::TEXTS.iter().map(|text| text.str.to_owned()).collect();
+        names.extend((0..500).map(|n| format!("hashed name {n}")));
+        names.extend(["", "x_", "ünïcödé", "a much longer name than one word"].map(String::from));
+        for name in &names {
+            let hash = blaze_phf::name_hash(name.as_bytes());
+            assert_eq!(Symbol::intern_hashed(name, hash), Symbol::intern(name), "{name:?}");
+            assert_eq!(Symbol::find_hashed(name, hash), Symbol::find(name), "{name:?}");
+            assert_eq!(Symbol::find_hashed(name, hash), Some(Symbol::intern(name)), "{name:?}");
+        }
+        assert_eq!(Symbol::find_hashed("never interned by any test", blaze_phf::name_hash(b"never interned by any test")), None);
     }
 
     #[test]

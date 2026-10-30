@@ -1078,6 +1078,10 @@ pub struct InferenceResult<'db> {
     /// For each value path, expression or pattern, what it resolves to (an associated item's
     /// path as its function or const, which [`Self::assoc_resolutions`] gives with arguments).
     pub(crate) value_resolutions: ExprOrPatColumn<ValueNs>,
+    /// For each type-relative value path (`Vec::new`, `T::default`), what its leading segments
+    /// resolved to in the type namespace and how many they are: rustc's `QPath::TypeRelative`
+    /// qualifier. A `<Type>::f` qualifier is a type, not a path, and is not here.
+    pub(crate) qualifier_resolutions: ExprOrPatColumn<(TypeNs, u32)>,
     /// For each method call or type-relative path, the unstable items its probe passed over and
     /// each one's feature, which a later toolchain may resolve it to instead.
     pub(crate) unstable_candidates: ExprOrPatColumn<Box<[(CandidateId, Symbol)]>>,
@@ -1187,6 +1191,7 @@ pub(crate) struct InferenceTables<'db, 'f> {
     field_resolutions: DenseMap<'f, ExprId, Either<FieldId, TupleFieldId>>,
     variant_resolutions: ExprOrPatMap<'f, VariantId>,
     value_resolutions: ExprOrPatMap<'f, ValueNs>,
+    qualifier_resolutions: ExprOrPatMap<'f, (TypeNs, u32)>,
     unstable_candidates: ExprOrPatMap<'f, Box<[(CandidateId, Symbol)]>>,
     assoc_resolutions: ExprOrPatMap<'f, (CandidateId, StoredGenericArgs)>,
     type_of_expr: DenseMap<'f, ExprId, StoredTy>,
@@ -1215,6 +1220,7 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
             field_resolutions: DenseMap::new_in(frame),
             variant_resolutions: ExprOrPatMap::new_in(frame),
             value_resolutions: ExprOrPatMap::new_in(frame),
+            qualifier_resolutions: ExprOrPatMap::new_in(frame),
             unstable_candidates: ExprOrPatMap::new_in(frame),
             assoc_resolutions: ExprOrPatMap::new_in(frame),
             type_of_expr: DenseMap::new_in(frame),
@@ -1294,9 +1300,20 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
         self.skipped_ref_pats.contains(&pat)
     }
 
+    pub(crate) fn method_resolution(&self, expr: ExprId) -> Option<(FunctionId, GenericArgs<'db>)> {
+        self.method_resolutions.get(expr).map(|(func, args)| (*func, args.as_ref()))
+    }
+
     pub(crate) fn assoc_resolutions_for_expr(
         &self,
         id: ExprId,
+    ) -> Option<(CandidateId, GenericArgs<'db>)> {
+        self.assoc_resolutions.get(id.into()).map(|(assoc, args)| (*assoc, args.as_ref()))
+    }
+
+    pub(crate) fn assoc_resolutions_for_pat(
+        &self,
+        id: PatId,
     ) -> Option<(CandidateId, GenericArgs<'db>)> {
         self.assoc_resolutions.get(id.into()).map(|(assoc, args)| (*assoc, args.as_ref()))
     }
@@ -1327,6 +1344,7 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
             field_resolutions,
             variant_resolutions,
             value_resolutions,
+            qualifier_resolutions,
             unstable_candidates,
             assoc_resolutions,
             mut type_of_expr,
@@ -1352,6 +1370,7 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
             field_resolutions: FieldColumn::from_dense(field_resolutions.slots()),
             variant_resolutions: variant_resolutions.freeze(),
             value_resolutions: value_resolutions.freeze(),
+            qualifier_resolutions: qualifier_resolutions.freeze(),
             unstable_candidates: unstable_candidates.freeze(),
             assoc_resolutions: assoc_resolutions.freeze(),
             tuple_field_access_types,
@@ -1395,6 +1414,15 @@ fn last_adjustment(adjustments: &[Adjustment]) -> Option<&Adjustment> {
             Adjustment { kind: Adjust::NeverToAny, target } if target.as_ref().is_never()
         )
     })
+}
+
+/// An expression's type after all its adjustments: the last one's target (a trailing
+/// `NeverToAny` included, unlike [`last_adjustment`]), or `unadjusted` when it has none.
+fn adjusted_ty<'a>(adjustments: Option<&[Adjustment]>, unadjusted: impl FnOnce() -> Ty<'a>) -> Ty<'a> {
+    match adjustments.and_then(<[Adjustment]>::last) {
+        Some(it) => it.target.as_ref(),
+        None => unadjusted(),
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
@@ -1754,7 +1782,7 @@ pub(crate) fn infer_body_query<'db>(
     if let Some(served) = crate::check_cache::served_inference(db, def) {
         return served;
     }
-    infer_query(db, def)
+    crate::body_store::inference(db, def, || infer_query(db, def))
 }
 
 /// Infer types for all const expressions in an item's signature.
@@ -1804,6 +1832,7 @@ impl<'db> InferenceResult<'db> {
             field_resolutions: Default::default(),
             variant_resolutions: Default::default(),
             value_resolutions: Default::default(),
+            qualifier_resolutions: Default::default(),
             unstable_candidates: Default::default(),
             assoc_resolutions: Default::default(),
             tuple_field_access_types: Default::default(),
@@ -1858,6 +1887,16 @@ impl<'db> InferenceResult<'db> {
             ExprOrPatId::PatId(id) => id.into(),
         };
         self.value_resolutions.get(node).copied()
+    }
+    /// What the leading segments of the type-relative value path `id` resolved to in the type
+    /// namespace, and how many they are: `(Vec, 1)` for `Vec::new`. The rest is resolved through
+    /// it, to [`Self::assoc_resolutions_for_expr_or_pat`] or a variant.
+    pub fn qualifier_resolution(&self, id: ExprOrPatId) -> Option<(TypeNs, u32)> {
+        let node = match id {
+            ExprOrPatId::ExprId(id) => id.into(),
+            ExprOrPatId::PatId(id) => id.into(),
+        };
+        self.qualifier_resolutions.get(node).copied()
     }
     /// The unstable items, with their features, that the probe of the method call or
     /// type-relative path `id` passed over: rustc's `Pick::unstable_candidates`.
@@ -1932,6 +1971,10 @@ impl<'db> InferenceResult<'db> {
             Some(adjustment) => Some(adjustment.target.as_ref()),
             None => self.type_of_expr.get(id).map(|it| it.as_ref()),
         }
+    }
+    /// The type `e` has after all its adjustments, a trailing `NeverToAny` included.
+    pub fn expr_ty_after_adjustments<'a>(&self, e: ExprId) -> Ty<'a> {
+        adjusted_ty(self.expr_adjustments.get(&e), || self.expr_ty(e))
     }
     pub fn type_of_pat_with_adjust<'a>(&self, id: PatId) -> Ty<'a> {
         match self.pat_adjustments.get(&id).and_then(|adjustments| adjustments.last()) {
@@ -2260,6 +2303,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             field_resolutions,
             variant_resolutions,
             value_resolutions,
+            qualifier_resolutions,
             unstable_candidates,
             assoc_resolutions,
             type_of_expr,
@@ -2288,6 +2332,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         for (node, value) in other.value_resolutions.iter() {
             debug_assert!(value_resolutions.get(node).is_none_or(|it| it == value));
             value_resolutions.insert(node, *value);
+        }
+        for (node, qualifier) in other.qualifier_resolutions.iter() {
+            debug_assert!(qualifier_resolutions.get(node).is_none_or(|it| it == qualifier));
+            qualifier_resolutions.insert(node, *qualifier);
         }
         for (node, candidates) in other.unstable_candidates.iter() {
             debug_assert!(unstable_candidates.get(node).is_none_or(|it| it == candidates));
@@ -2462,6 +2510,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             field_resolutions: _,
             variant_resolutions: _,
             value_resolutions: _,
+            qualifier_resolutions: _,
             unstable_candidates: _,
             assoc_resolutions,
             type_of_expr,
@@ -2744,7 +2793,6 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     fn write_value_resolution(&mut self, id: ExprOrPatIdPacked, value: ValueNs) {
         self.result.value_resolutions.insert(id, value);
     }
-
     pub(crate) fn write_unstable_candidates(&mut self, id: ExprOrPatIdPacked, pick: &Pick<'db>) {
         if !pick.unstable_candidates.is_empty() {
             self.result.unstable_candidates.insert(id, pick.unstable_candidates.as_slice().into());
@@ -3127,13 +3175,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     }
 
     fn expr_ty_after_adjustments(&self, e: ExprId) -> Ty<'db> {
-        let mut ty = None;
-        if let Some(it) = self.result.expr_adjustments.get(&e)
-            && let Some(it) = it.last()
-        {
-            ty = Some(it.target.as_ref());
-        }
-        ty.unwrap_or_else(|| self.expr_ty(e))
+        adjusted_ty(self.result.expr_adjustments.get(&e), || self.expr_ty(e))
     }
 
     fn resolve_variant(

@@ -84,8 +84,26 @@ relation, one cache hit, and snapshots costing a length capture each.
 
 | | bound | today | off |
 |---|---|---|---|
-| per-expression glue | ≈ 10 cycles | ≈ 45 | 4.5×, ≈ 35 cycles an expression |
-| a coercion (ref or ADT) | ≈ 150 cycles | ≈ 400–600 | ≈ 3× |
+| per-expression glue | ≈ 10 cycles | ≈ 31 (was 45) | ≈ 3.1× |
+| a coercion (ref or ADT) | ≈ 150 cycles | ≈ 340–540 (was 400–600) | ≈ 2.6× |
+
+Recounted 10-30 by sol-all-ty, from the code, nothing built:
+- **Per expression.** `infer_expr_inner`'s `#[instrument]` and `infer_expr_inner_here`'s
+  `trace!(?expr)` are gone, about 5 + 4 cycles. The cancellation check runs only for
+  expression ids divisible by 64, a test of about 1 cycle plus 10/64 for the check. Ids are
+  dense and every expression is inferred, so a cancelled revision still unwinds within 64
+  expressions, even in a block-free array literal. Against the 45 counted above, that is
+  45 − 5 (the `instrument`) − 10 (the check) + 1.2 ≈ **31 cycles**. The `trace!`, about 4
+  more, was not in that count, so it may be ≈ 27. What is left is
+  `ensure_sufficient_stack` (5) and the type write and never test (15). Both are rustc's.
+- **Per coercion.** Snapshots were already length captures of each storage
+  (`snapshot/undo_log.rs`). What they still paid was `tracing`. `start_snapshot`'s `debug!`,
+  the `instrument`s and `debug!`s of `rollback_to`, `commit_from`, `commit_if_ok` and `probe`,
+  `InferenceTable::rollback_to`'s `instrument`, `coerce`'s info-level `instrument` and its
+  `debug!`, and `coerce_unsized`'s `instrument` and `debug!` are gone. That is about 12
+  callsite checks of about 5 cycles per ref or ADT coercion, **≈ −60 cycles**. The workspace
+  sets no `tracing` `max_level` feature, which is a decision for Andrew. With one, the other
+  callsites in `hir-ty` go too.
 
 **What stands in the way.**
 - The tracing callsite checks: a compile-time level cap for release, requested.
@@ -297,11 +315,11 @@ Plus the record's `Vec`s growing. ≈ 2 µs, **≈ 1.25× off**.
 
 | component | bound | before | today | off today | removes the rest |
 |---|---|---|---|---|---|
-| per-expression glue | ≈ 3K cycles | ≈ 13K | ≈ 13K | 4.5× | tracing level cap (requested); the cancellation check once per block |
-| coercions (≈ 150 sites) | ≈ 22K cycles | ≈ 60K | ≈ 60K | ≈ 2.7× | cheaper snapshots in `next_solver/infer` (port-infer's) |
-| obligations and rounds | ≈ 7K cycles | ≈ 42K | ≈ 17K | ≈ 2.4× | watch lists (requested) |
+| per-expression glue | ≈ 3K cycles | ≈ 13K | ≈ 9.3K (10-30) | ≈ 3.1× | `ensure_sufficient_stack` and the `write_expr_ty` / never test, rustc's |
+| coercions (≈ 150 sites) | ≈ 22K cycles | ≈ 60K | ≈ 51K (10-30) | ≈ 2.3× | rustc's coercion algorithm: the `CoerceUnsized` probe and the `unify_raw` round |
+| obligations and rounds | ≈ 7K cycles | ≈ 42K | watch lists landed (`fulfill/watch.rs`), not recounted | needs `--timings` | — |
 | writeback | ≈ 4.4K cycles | ≈ 55K | ≈ 4.4K | 1× | — |
-| freeze | ≈ 2.8K cycles | ≈ 10K | ≈ 10K | 3.5× | dictionary-encode from the `ArenaMap` slots |
+| freeze | ≈ 2.8K cycles | ≈ 10K | ≈ 3.2K (dictionary-encoded from the slots, landed) | ≈ 1.15× | one frame-map probe per type |
 | record size | ≈ 2 KB | ≈ 10.8 KB | ≈ 5 KB | 2.7× | `u8` type places, field presences |
 | decode | ≈ 1.6 µs | ≈ 3.4 µs | ≈ 2.1 µs | 1.3× | arena-backed columns |
 | encode | ≈ 1.6 µs | ≈ 2 µs | ≈ 2 µs | 1.25× | the table written in place |

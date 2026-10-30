@@ -98,62 +98,52 @@ const SPANS: &str = "blaze v2 cargo test spans 1";
 /// (32 bytes), then each native input's BLAKE3 hash (32 bytes), its path's length (`u32` LE)
 /// and its path. The CBOR of [`Record`] follows.
 pub(crate) mod header {
+    use blaze_format::cursor::{Put as _, Reader};
+
     pub(crate) const MAGIC: &[u8; 4] = b"BZU1";
 
     pub(crate) fn write(out: &mut Vec<u8>, outputs: &[blaze_cas::Key], natives: &[(String, blaze_ids::ContentId)]) {
         let paths: usize = natives.iter().map(|it| it.0.len()).sum();
         out.reserve(12 + 32 * outputs.len() + 36 * natives.len() + paths);
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&(outputs.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(natives.len() as u32).to_le_bytes());
+        out.put_bytes(MAGIC);
+        out.put_u32(outputs.len() as u32);
+        out.put_u32(natives.len() as u32);
         for key in outputs {
-            out.extend_from_slice(&key.0.0);
+            out.put_bytes(&key.0.0);
         }
         for (path, hash) in natives {
-            out.extend_from_slice(&hash.0);
-            out.extend_from_slice(&(path.len() as u32).to_le_bytes());
-            out.extend_from_slice(path.as_bytes());
+            out.put_bytes(&hash.0);
+            out.put_bytes_u32(path.as_bytes());
         }
-    }
-
-    fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
-        let (head, rest) = bytes.split_at_checked(len)?;
-        *bytes = rest;
-        Some(head)
-    }
-
-    fn count(bytes: &mut &[u8]) -> Option<usize> {
-        Some(u32::from_le_bytes(take(bytes, 4)?.try_into().ok()?) as usize)
     }
 
     /// Whether every output is in the store and every native input is as it was, and where the
     /// CBOR body starts; `None` for a record that is not, or a header that is cut short.
     pub(crate) fn check(
-        mut bytes: &[u8],
+        bytes: &[u8],
         has: impl Fn(&blaze_cas::Key) -> bool,
         file: &mut impl FnMut(&std::path::Path) -> Option<[u8; 32]>,
     ) -> Option<usize> {
-        let whole = bytes.len();
-        if take(&mut bytes, 4)? != MAGIC {
+        let mut read = Reader::new(bytes);
+        if read.array::<4>().ok()? != MAGIC {
             return None;
         }
-        let outputs = count(&mut bytes)?;
-        let natives = count(&mut bytes)?;
+        let outputs = read.u32().ok()?;
+        let natives = read.u32().ok()?;
         for _ in 0..outputs {
-            let key = blaze_cas::Key(blaze_ids::ContentId(take(&mut bytes, 32)?.try_into().ok()?));
+            let key = blaze_cas::Key(blaze_ids::ContentId(*read.array().ok()?));
             if !has(&key) {
                 return None;
             }
         }
         for _ in 0..natives {
-            let hash: [u8; 32] = take(&mut bytes, 32)?.try_into().ok()?;
-            let len = count(&mut bytes)?;
-            let path = std::str::from_utf8(take(&mut bytes, len)?).ok()?;
+            let hash: [u8; 32] = *read.array().ok()?;
+            let path = read.str_u32().ok()?;
             if file(std::path::Path::new(path))? != hash {
                 return None;
             }
         }
-        Some(whole - bytes.len())
+        Some(read.at())
     }
 }
 
@@ -194,6 +184,7 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
     let runs = runs(job, unit);
     // An inert script's compile makes nothing, unless `BLAZE_ELIDE=verify` builds it to run it.
     let verified = u.target.is_custom_build() && script::verifies(job)? && script::inert(job, unit).is_some();
+    let reached = reached_only(job, u)?;
     let mut hasher = Hasher::new(RECORD);
     hasher.id(&identity);
     // The unit, its plan and its run environment, each encoded into one buffer kept per
@@ -203,7 +194,13 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
         hash_cbor(&mut hasher, scratch, plan, "plan", unit)?;
         hash_cbor(&mut hasher, scratch, &runs.env, "run environment", unit)
     })?;
-    hasher.id(&toolchain.id).update(&[goal, u8::from(job.input.color), u8::from(job.input.short), u8::from(verified)]);
+    hasher.id(&toolchain.id).update(&[
+        goal,
+        u8::from(job.input.color),
+        u8::from(job.input.short),
+        u8::from(verified),
+        u8::from(reached),
+    ]);
     // The flags name a profile by its path; its bytes are the input.
     if let Pgo::Use(profile) = codegen::unit_pgo(job, unit).map_err(|what| ApiError::new(what, Some(u.target.name.clone())))? {
         hasher.id(&profile);
@@ -218,6 +215,48 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
 fn elided_unbuilt(job: &Job, unit: usize) -> Result<bool, ApiError> {
     let custom_build = job.unit(unit)?.target.is_custom_build();
     Ok(custom_build && !script::verifies(job)? && script::inert(job, unit).is_some())
+}
+
+/// The variable that builds every dependency whole: `full`, for the differential run against a
+/// reachable-only build (`harness/v2/reachable.py`); unset, only what the build's programs reach.
+pub(crate) const DEPS: &str = "BLAZE_DEPS";
+
+/// Why a crate [`reached_only`] has no check outcome or bodies of its own in the store.
+pub(crate) const REACHED_ONLY: &str =
+    "only what the build's programs reach of it is type-checked and compiled (`BLAZE_DEPS=full` checks it whole)";
+
+/// Whether only what the build's programs reach of `unit`'s crate is type-checked and compiled
+/// (docs/v2/plan/lanes/cold-v2/notes.md): a crate of the standard library, or of a package
+/// cargo caps the lints of (a registry or git dependency), unless the job's [`DEPS`] is `full`.
+/// Such a library runs no check and compiles no roots of its own: a program's walk, from roots
+/// as complete as rustc's collector's, compiles what it reaches of it and type-checks those
+/// bodies on the way, and a body it reaches that does not type-check stops that walk with an
+/// error naming it. A workspace member and a path package are checked and compiled whole, as
+/// cargo shows their diagnostics. Any other value of [`DEPS`] is an error naming it.
+pub(crate) fn reached_only(job: &Job, unit: &Unit) -> Result<bool, ApiError> {
+    match job.input.config.invocation.env.iter().find(|(name, _)| name == DEPS).map(|(_, value)| value.as_str()) {
+        None => {}
+        Some("full") => return Ok(false),
+        Some(value) => {
+            return Err(ApiError::new(
+                // alloc: error path
+                format!(
+                    "{DEPS}={value} is not a value blaze takes: `full` checks and compiles every dependency whole, \
+                     unset only what the build's programs reach of each"
+                ),
+                None,
+            ));
+        }
+    }
+    let package = job.package(unit)?;
+    Ok(capped(unit.is_std, package.is_member, package.source.as_deref()))
+}
+
+/// Whether a unit's diagnostics are ones cargo never shows (lints capped, so only an error
+/// could be seen): the standard library's, and any package that is neither a workspace member
+/// nor at a path.
+pub(crate) fn capped(is_std: bool, is_member: bool, source: Option<&str>) -> bool {
+    is_std || !(is_member || local(source))
 }
 
 fn hash_cbor<T: Serialize + ?Sized>(
@@ -321,7 +360,7 @@ pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize, images: &mut 
     let key = record_key(job, unit)?;
     let Made2 { mut compiled, made, natives } = made;
     compiled.macros = macros(job, reader, unit, &compiled);
-    if let Some(key) = key {
+    if let Some(key) = key && !script::pure::built_nothing(job, unit) {
         let record = RecordRef {
             ok: compiled.ok,
             diagnostics: &compiled.diagnostics,
@@ -407,8 +446,11 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
     lints.check_cfg.cargo = true;
     let options = Options { lints, ..Options::default() };
     let db = reader.db();
-    let inert = elided_unbuilt(job, unit)?;
-    let builds_code = !inert && !checks_only(job.input.goal, u);
+    let inert = elided_unbuilt(job, unit)? || script::pure::unbuilt(job, reader, unit)?;
+    let reached = reached_only(job, u)?;
+    // A library compiled only as a program reaches it has no code of its own to build.
+    let library_reached = reached && codegen::makes(u).is_ok_and(|it| it == Makes::Library);
+    let builds_code = !inert && !checks_only(job.input.goal, u) && !library_reached;
     let served = blaze_diagnostics::cache::read(db, reader.checks(), krate, mounted.root());
     // Declared before `generated`: the build's front end borrows it until `generated` is dropped.
     let checking;
@@ -419,9 +461,20 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
         Some(Ok(outcome)) => {
             let generated = builds_code.then(|| {
                 let makes = codegen::makes(u)?;
-                Ok::<_, String>((makes, codegen::generate(job, reader, unit, &makes, mounted, None)))
+                let generated = codegen::generate(job, reader, unit, &makes, mounted, None);
+                Ok::<_, String>((makes, generated))
             });
             (outcome.diags, generated)
+        }
+        // No check: what a program reaches of the crate is type-checked by its walk.
+        None if reached => {
+            let generated = builds_code.then(|| {
+                let makes = codegen::makes(u)?;
+                let generated = codegen::generate(job, reader, unit, &makes, mounted, None);
+                Ok::<_, String>((makes, generated))
+            });
+            // alloc: none: an empty `Vec` holds no buffer
+            (Vec::new(), generated)
         }
         None => {
             checking = Checking::new(db, hir::Crate::from(krate));

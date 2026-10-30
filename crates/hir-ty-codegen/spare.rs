@@ -10,7 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{cell::RefCell, sync::Arc};
+use std::cell::RefCell;
 
 use cranelift_codegen::{Context, ir};
 use cranelift_frontend::FunctionBuilderContext;
@@ -28,9 +28,6 @@ const LARGEST: usize = super::SINGLE_PASS;
 /// kept, as a context of more than [`LARGEST`] instructions is.
 const LARGEST_ROWS: usize = 1 << 16;
 
-/// The lists of layouts a build asked for and of variants' layouts it made (`KeptLayouts`).
-type LayoutLists = (Vec<Arc<Layout>>, Vec<Box<Layout>>);
-
 thread_local! {
     // alloc: none, an empty shelf
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
@@ -41,7 +38,7 @@ thread_local! {
     // alloc: none, an empty shelf
     static LINES: RefCell<Vec<Vec<LineRow>>> = const { RefCell::new(Vec::new()) };
     // alloc: none, an empty shelf
-    static LAYOUT_LISTS: RefCell<Vec<LayoutLists>> = const { RefCell::new(Vec::new()) };
+    static LAYOUT_LISTS: RefCell<Vec<Vec<Box<Layout>>>> = const { RefCell::new(Vec::new()) };
     // alloc: none, an empty shelf
     static COPIES: RefCell<Vec<Vec<(intern::Symbol, u64)>>> = const { RefCell::new(Vec::new()) };
 }
@@ -133,22 +130,22 @@ pub(super) fn with_copies<R>(f: impl FnOnce(&mut Vec<(intern::Symbol, u64)>) -> 
     result
 }
 
-/// Empty lists for a build's layouts (`KeptLayouts`): ones the thread kept, or new ones.
-pub(super) fn layout_lists() -> LayoutLists {
+/// An empty list for the variants' layouts a build makes (`KeptLayouts`): one the thread
+/// kept, or a new one.
+pub(super) fn layout_list() -> Vec<Box<Layout>> {
     LAYOUT_LISTS.with_borrow_mut(Vec::pop).unwrap_or_default()
 }
 
-/// Keeps a build's lists of layouts for the thread's next build, emptied. Emptying them drops
-/// the layouts, so a kept list holds no `Arc` of salsa's past its build.
-pub(super) fn keep_layout_lists(mut asked: Vec<Arc<Layout>>, mut variants: Vec<Box<Layout>>) {
-    asked.clear();
+/// Keeps a build's list of variants' layouts for the thread's next build, emptied. Emptying
+/// it drops the layouts, so a kept list holds none past its build.
+pub(super) fn keep_layout_list(mut variants: Vec<Box<Layout>>) {
     variants.clear();
-    if asked.capacity().max(variants.capacity()) > LARGEST_ROWS {
+    if variants.capacity() > LARGEST_ROWS {
         return;
     }
     LAYOUT_LISTS.with_borrow_mut(|kept| {
         if kept.len() < KEPT {
-            kept.push((asked, variants));
+            kept.push(variants);
         }
     });
 }
@@ -281,28 +278,28 @@ mod tests {
         assert_eq!(held, 64);
     }
 
-    /// A build's layout lists come back empty with their room, holding none of the layouts the
-    /// build before kept, and filling them again to what they held takes nothing of the global
-    /// allocator.
+    /// A build's list of variants' layouts comes back empty with its room, holding none of the
+    /// layouts the build before kept, and filling it again to what it held takes nothing of
+    /// the global allocator.
     #[test]
-    fn kept_layout_lists_are_reused_whole() {
+    fn a_kept_layout_list_is_reused_whole() {
         LAYOUT_LISTS.with_borrow_mut(Vec::clear);
         let dl = rustc_abi::TargetDataLayout::default();
         let scalar = crate::Scalar::Union { value: crate::Primitive::Int(rustc_abi::Integer::I32, true) };
-        let arcs: Vec<Arc<Layout>> = (0..64).map(|_| Arc::new(Layout::scalar(&dl, scalar))).collect();
-        let fill = || {
-            let (mut asked, variants) = layout_lists();
-            assert!(asked.is_empty() && variants.is_empty());
-            asked.extend(arcs.iter().cloned());
-            let made = asked.len();
-            keep_layout_lists(asked, variants);
+        let stock = |n| -> Vec<Box<Layout>> { (0..n).map(|_| Box::new(Layout::scalar(&dl, scalar))).collect() };
+        let fill = |boxes: Vec<Box<Layout>>| {
+            let mut variants = layout_list();
+            assert!(variants.is_empty(), "a kept list holds a layout past its build");
+            variants.extend(boxes);
+            let made = variants.len();
+            keep_layout_list(variants);
             made
         };
-        let cold = fill();
-        assert!(arcs.iter().all(|it| Arc::strong_count(it) == 1));
-        let warm = blaze_alloc_count::assert_at_most(0, "a warm build's layout lists", fill);
+        let cold = fill(stock(64));
+        let warm_stock = stock(64);
+        let warm = blaze_alloc_count::assert_at_most(0, "a warm build's layout list", || fill(warm_stock));
         assert_eq!((cold, warm), (64, 64));
-        assert!(arcs.iter().all(|it| Arc::strong_count(it) == 1));
+        assert!(layout_list().is_empty());
     }
 
     #[test]

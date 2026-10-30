@@ -32,7 +32,7 @@ use hir_ty::{
     db::HirDatabase,
     drop::{DropGlue, has_drop_glue},
     infer::AutoBorrowMutability,
-    next_solver::{AliasTy, AliasTyKind, Ty, TyKind},
+    next_solver::{AliasTy, AliasTyKind, SolverDefId, Ty, TyKind},
 };
 use rustc_type_ir::{
     ClauseKind, Interner as _,
@@ -56,7 +56,7 @@ use crate::{
 };
 
 /// Statement `index` of the block `block`.
-fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<Statement<'db>> {
+fn statement<'db>(b: &BodyCx<'_, '_, 'db>, block: ExprId, index: usize) -> Option<Statement<'db>> {
     match b.store().expr(block) {
         Expr::Block { statements, .. } => statements.get(index),
         _ => None,
@@ -65,7 +65,7 @@ fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<St
 
 /// The expression of statement `index` of `block` when it ends with `;` (rustc's
 /// `StmtKind::Semi`).
-fn semi_expr(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<ExprId> {
+fn semi_expr(b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize) -> Option<ExprId> {
     match statement(b, block, index)? {
         Statement::Expr { expr, has_semi: true } => Some(expr),
         _ => None,
@@ -74,12 +74,12 @@ fn semi_expr(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<ExprId> 
 
 /// The span of a statement or a `let` as rustc gives it (`Stmt::span`): from its first token
 /// after its attributes to its `;`.
-fn stmt_span(b: &BodyCx<'_, '_>, node: &InFile<ast::Node<'_>>) -> Span {
+fn stmt_span(b: &BodyCx<'_, '_, '_>, node: &InFile<ast::Node<'_>>) -> Span {
     b.cx.span(node.with_value(item_range_view(node.value)))
 }
 
 /// The expression statement `expr` is the expression of, as written.
-fn expr_stmt<'db>(b: &BodyCx<'_, 'db>, expr: ExprId) -> Option<InFile<ast::Node<'db>>> {
+fn expr_stmt<'db>(b: &BodyCx<'_, '_, 'db>, expr: ExprId) -> Option<InFile<ast::Node<'db>>> {
     let node = b.cx.syntax_view(b.expr_node(expr)?);
     up(b.cx, node).find(|it| it.value.kind() == SyntaxKind::EXPR_STMT)
 }
@@ -115,7 +115,7 @@ fn items() -> &'static Items {
 
 /// Whether `id` is core's enum `name` (`Result`, `ControlFlow`): its diagnostic item, or the
 /// enum of its lang-item variant `variant` (`Ok`, `Continue`).
-fn is_enum(b: &BodyCx<'_, '_>, id: EnumId, name: Symbol, variant: Option<hir_def::EnumVariantId>) -> bool {
+fn is_enum(b: &BodyCx<'_, '_, '_>, id: EnumId, name: Symbol, variant: Option<hir_def::EnumVariantId>) -> bool {
     let db = b.db();
     variant.is_some_and(|it| it.lookup(db).parent == id)
         || diagnostic_item(db, AttrDefId::AdtId(AdtId::EnumId(id))) == Some(name)
@@ -133,7 +133,7 @@ impl LatePass for PathStatements {
     const LINTS: LintSet = lint_set(["path_statements"]);
     const HOOKS: Hooks = Hooks::STMT;
 
-    fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         let Some(expr) = semi_expr(b, block, index) else { return };
         let Expr::Path(_) = b.store().expr(expr) else { return };
         let (Some(stmt), Some(at)) = (expr_stmt(b, expr), b.expr_node(expr)) else { return };
@@ -180,14 +180,14 @@ struct Written {
 
 impl Local {
     /// The `let` statement `index` of `block`.
-    fn of_stmt(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Local> {
+    fn of_stmt(b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize) -> Option<Local> {
         let Statement::Let { pat, type_ref, initializer, .. } = statement(b, block, index)? else { return None };
         Some(Local { pat, init: initializer, typed: type_ref.is_some(), assign: None })
     }
 
     /// The `let` a destructuring assignment `expr` is lowered to (`(a, _) = ..`, `_ = ..`):
     /// one whose target is not a place expression (rustc's `is_ordinary`).
-    fn of_assignment(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Local> {
+    fn of_assignment(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Local> {
         let Expr::Assignment { target, value } = b.store().expr(expr) else { return None };
         if matches!(b.store().pat(target), Pat::Expr(_) | Pat::Missing) {
             return None;
@@ -197,7 +197,7 @@ impl Local {
 
     /// Where it is written; a `let` hir-def made (the moves of an `async fn`'s arguments,
     /// rustc's `LocalSource::AsyncFn`) is not.
-    fn written(&self, b: &BodyCx<'_, '_>) -> Option<Written> {
+    fn written(&self, b: &BodyCx<'_, '_, '_>) -> Option<Written> {
         if let Some(expr) = self.assign {
             return Some(Written { span: b.expr_span(expr)?, at: b.expr_node(expr)? });
         }
@@ -216,13 +216,13 @@ impl LatePass for LetUnderscore {
     const HOOKS: Hooks = Hooks::LOCAL;
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Assignment]);
 
-    fn check_local(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_local(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         if let Some(local) = Local::of_stmt(b, block, index) {
             let_underscore(b, &local, out);
         }
     }
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         if let Some(local) = Local::of_assignment(b, expr) {
             let_underscore(b, &local, out);
         }
@@ -231,7 +231,7 @@ impl LatePass for LetUnderscore {
 
 /// rustc's `LetUnderscore::check_local`: each `_` of the pattern, outermost first; a lock
 /// wherever it is, a value with a destructor only at the top.
-fn let_underscore(b: &BodyCx<'_, '_>, local: &Local, out: &mut Vec<Found>) {
+fn let_underscore(b: &BodyCx<'_, '_, '_>, local: &Local, out: &mut Vec<Found>) {
     let store = b.store();
     let mut wild: SmallVec<[(usize, PatId); 2]> = SmallVec::new();
     let mut index = 0;
@@ -332,7 +332,7 @@ impl LatePass for UnusedResults {
     const LINTS: LintSet = lint_set(["unused_results"]);
     const HOOKS: Hooks = Hooks::STMT;
 
-    fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         let Some(stmt_expr) = semi_expr(b, block, index) else { return };
         let store = b.store();
         let db = b.db();
@@ -375,9 +375,9 @@ impl LatePass for UnusedResults {
 
 /// `future.await` of the future an `async fn` that is `#[must_use]` returns: rustc gives
 /// `unused_must_use` of it and nothing else.
-fn awaits_must_use_async_fn(b: &BodyCx<'_, '_>, future: ExprId) -> bool {
+fn awaits_must_use_async_fn(b: &BodyCx<'_, '_, '_>, future: ExprId) -> bool {
     let db = b.db();
-    let TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { def_id }, .. }) = b.infer.expr_ty(future).kind() else {
+    let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, .. }) = b.infer.expr_ty(future).kind() else {
         return false;
     };
     let ImplTraitId::ReturnTypeImplTrait(function, _) = def_id.0.loc(db) else { return false };
@@ -386,7 +386,7 @@ fn awaits_must_use_async_fn(b: &BodyCx<'_, '_>, future: ExprId) -> bool {
 
 /// rustc's operators whose value is to be used (`UnusedResults::check_stmt`'s `must_use_op`):
 /// comparisons, arithmetic, logic, bit operations, borrows, unary operators and `offset_of!`.
-fn is_must_use_op(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+fn is_must_use_op(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     let store = b.store();
     match store.expr(expr) {
         Expr::BinaryOp { op: Some(op), .. } => !matches!(op, BinaryOp::Assignment { .. }),
@@ -401,7 +401,7 @@ fn is_must_use_op(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
 
 /// rustc's `is_ty_must_use` of `ty`, the type of `expr` (whose elements, when it is a tuple,
 /// are the elements' expressions).
-fn ty_must_use<'db>(b: &BodyCx<'_, 'db>, solver: &Solver<'db>, ty: Ty<'db>, expr: Option<ExprId>) -> MustUse {
+fn ty_must_use<'db>(b: &BodyCx<'_, '_, 'db>, solver: &Solver<'db>, ty: Ty<'db>, expr: Option<ExprId>) -> MustUse {
     if ty.is_unit() {
         return MustUse::Trivial;
     }
@@ -433,17 +433,19 @@ fn ty_must_use<'db>(b: &BodyCx<'_, 'db>, solver: &Solver<'db>, ty: Ty<'db>, expr
             }
             yes(is_must_use(db, AttrDefId::AdtId(adt)))
         }
-        TyKind::Alias(alias) => match alias.kind {
-            AliasTyKind::Opaque { .. } | AliasTyKind::Projection { .. } => {
-                let interner = solver.interner();
-                let bounds = interner.item_self_bounds(alias.kind.def_id()).skip_binder();
-                yes(elaborate(interner, bounds).filter_only_self().any(|clause| match clause.kind().skip_binder() {
-                    ClauseKind::Trait(pred) => is_must_use(db, AttrDefId::TraitId(pred.def_id().0)),
-                    _ => false,
-                }))
-            }
-            _ => MustUse::No,
-        },
+        TyKind::Alias(_, alias) => {
+            let def_id: SolverDefId<'_> = match alias.kind {
+                AliasTyKind::Opaque { def_id } => def_id.into(),
+                AliasTyKind::Projection { def_id } => def_id.into(),
+                _ => return MustUse::No,
+            };
+            let interner = solver.interner();
+            let bounds = interner.item_self_bounds(def_id).skip_binder();
+            yes(elaborate(interner, bounds).filter_only_self().any(|clause| match clause.kind().skip_binder() {
+                ClauseKind::Trait(pred) => is_must_use(db, AttrDefId::TraitId(pred.def_id().0)),
+                _ => false,
+            }))
+        }
         TyKind::Dynamic(predicates, _) => {
             yes(predicates.principal_def_id().is_some_and(|it| is_must_use(db, AttrDefId::TraitId(it.0))))
         }
@@ -490,20 +492,20 @@ impl LatePass for UnitBindings {
     const HOOKS: Hooks = Hooks::LOCAL;
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Assignment]);
 
-    fn check_local(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_local(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         if let Some(local) = Local::of_stmt(b, block, index) {
             unit_binding(b, &local, out);
         }
     }
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         if let Some(local) = Local::of_assignment(b, expr) {
             unit_binding(b, &local, out);
         }
     }
 }
 
-fn unit_binding(b: &BodyCx<'_, '_>, local: &Local, out: &mut Vec<Found>) {
+fn unit_binding(b: &BodyCx<'_, '_, '_>, local: &Local, out: &mut Vec<Found>) {
     let store = b.store();
     let Some(init) = local.init else { return };
     if local.typed || !b.infer.expr_ty(init).is_unit() || !b.infer.pat_ty(local.pat).is_unit() {
@@ -533,7 +535,7 @@ impl LatePass for NonShorthandFieldPatterns {
     const LINTS: LintSet = lint_set(["non_shorthand_field_patterns"]);
     const PATS: PatKinds = PatKinds::of(&[PatKind::Record]);
 
-    fn check_pat(&mut self, b: &BodyCx<'_, '_>, pat: PatId, out: &mut Vec<Found>) {
+    fn check_pat(&mut self, b: &BodyCx<'_, '_, '_>, pat: PatId, out: &mut Vec<Found>) {
         let store = b.store();
         let Pat::Record { args, .. } = store.pat(pat) else { return };
         if b.tainted() {
@@ -592,7 +594,7 @@ impl LatePass for UnusedAllocation {
     const LINTS: LintSet = lint_set(["unused_allocation"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Call { callee, args } = b.store().expr(expr) else { return };
         if args.len() != 1 {
             return;

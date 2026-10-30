@@ -524,6 +524,13 @@ impl<'db> Checker<'_, '_, 'db> {
                     None => self_ty,
                 }
             }
+            // rustc's anonymous `DefPathData::Use` segment, `{use}`, after its module's path.
+            Def::Use(_) => match module_of(cx, def) {
+                Some(module) if !module.is_crate_root(db) => {
+                    format!("{}::{{use}}", cx.def_path(ModuleDef::Module(module))) // alloc: a lint that fires
+                }
+                _ => "{use}".to_owned(), // alloc: a lint that fires
+            },
         }
     }
 }

@@ -195,12 +195,11 @@ fn is_sysroot(db: &RootDatabase, krate: Crate) -> bool {
 
 /// Sets `cfg(doc)` on the crates documented, as rustdoc does for the crate it documents.
 pub fn set_cfg_doc(db: &mut RootDatabase, crates: &[Documented]) {
-    use ide_db::base_db::salsa::Setter as _;
     for documented in crates {
         let krate: ide_db::base_db::Crate = documented.krate.into();
         let mut cfg = krate.cfg_options(db).clone();
         cfg.insert_atom(intern::Symbol::intern("doc"));
-        krate.set_cfg_options(db).to(cfg);
+        krate.set_cfg_options(db, cfg);
     }
 }
 

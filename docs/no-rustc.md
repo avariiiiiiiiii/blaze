@@ -66,10 +66,11 @@ Any of these, whoever starts the process:
 
 What it does not cover:
 
-- The harnesses' reference builds. rustc is the reference
-  ([contributing.md](contributing.md#rules-for-code), rule 1): the harnesses build with cargo
-  and rustc and compare. The oracle stays rustc's. What changes is every expectation that blaze
-  hands something to rustc or cargo.
+- How it is proven. rustc's behaviour is still the reference
+  ([contributing.md](contributing.md#rules-for-code), rule 1), but since 2026-10-30 no harness
+  builds with rustc to compare: real crates' own test suites passing under blaze, and tests
+  that state their expected result, are the bar ([harness.md](harness.md)). The harnesses that
+  did compare, named in the dated entries below, are deleted.
 - The platform's linker and C toolchain: `cc`, `ld`, `lld`, `link.exe`, and the C or C++ a
   build script compiles with the `cc` crate. They are not rustc. blaze runs the linker with a
   line it works out itself, not with rustc's.
@@ -246,7 +247,7 @@ What is left starts rustc only outside a user's build. `harness/rustcsites.py` c
 | `project-model/src/` (`toolchain_info/`, `cargo_workspace.rs`, `build_dependencies.rs`, `sysroot.rs`, `workspace.rs`, `cargo_config_file.rs`) | rust-analyzer's `cargo metadata`, `cargo check --compile-time-deps` and rustc's answers | a load into cargo's own target directory (the harness's reference builds) or with `BLAZE_PROC_MACRO_SERVER=off`; blaze's own loads answer these itself (B, I, J) |
 | `blaze-cargo/src/cargo/load_wrapper.rs` | `blaze-rustc` as the `RUSTC_WRAPPER` of such a load's cargo: answers rustc's questions, and has rustc build a build script or proc macro blaze does not | the same loads only; it refuses any other caller |
 | `blaze-cargo/src/plan.rs` `cargo_in`, `cargo/state.rs` `cargo_path` | cargo, with blaze answering its questions | the same loads |
-| `blaze-cargo/src/stub.rs` | blaze standing in for rustc for a whole build (`BLAZE_WRAPS_RUSTC`) | the harness's "alone" builds (`difftest.py`, `alone.py`, `wholeprogram.py`) |
+| `blaze-cargo/src/stub.rs` | blaze standing in for rustc for a whole build (`BLAZE_WRAPS_RUSTC`) | the harness's "alone" builds (`wholeprogram.py`) |
 | `blaze-cargo/src/cargo/own_macro.rs` | `rustup target add wasm32-wasip1` for the wasi-libc a proc macro's module links | a toolchain without it |
 
 ### How often
@@ -460,8 +461,8 @@ package turns on.
 its own targets, byte for byte as the pinned rustc answers them. rust-analyzer's `toolchain_info`
 asks blaze in process. `cargo metadata`, `cargo rustc --print` and `cargo build --unit-graph`
 run with `RUSTC` naming blaze, and a load asks them once, not once per worker and spare. Risk:
-a wrong `cfg` builds the wrong code without a word; the harness compares every answer with
-rustc's on every target blaze knows.
+a wrong `cfg` builds the wrong code without a word; the answers are rustc's own, written by
+`answers.py --write` from the pinned rustc on every target blaze knows.
 
 Done in part (the `no-rustc-abc` lane, [#100](https://github.com/indexable-inc/blaze/pull/100)):
 the answers are rustc's, asked once per toolchain and kept, not blaze's own.
@@ -494,7 +495,7 @@ rustc's `UnstableFeatures::from_environment` does), `-C panic`, `--cfg`, `proc_m
 the sysroot and target libdir from where the toolchain is. A question with anything it does not
 model (`-C target-cpu`, `-C target-feature`, other `-Z` flags, a deployment target or SDK in the
 environment, a JSON target, another release, a host whose target specs it lacks) is asked of rustc
-once per toolchain as before. `harness/answers.py`, in the fast tier on Linux and macOS, compares
+once per toolchain as before. `harness/answers.py` compared (until 2026-10-30, in the fast tier on Linux and macOS)
 238 questions with rustc's answers, byte for byte, on the toolchain rustup installed and on a copy
 laid out as norustc.py's; `--write` regenerates the data after a toolchain bump, on each of x86-64
 Linux, AArch64 Linux and arm64 macOS (written for 1.99.0 on 2026-10-23, for `nightly-2026-10-25`
@@ -680,8 +681,8 @@ system libraries and start files, `-C link-arg` and the linker cargo's configura
 the shims rustc adds (the allocator's, `main`). Nothing of rustc's is linked, so symbols.rs,
 weaken.rs, `Base::of_rustc` and the "ahead of rustc's rlibs" link go, and with them "no rustc
 symbol", ABI and mangling parity, and [#52](https://github.com/indexable-inc/blaze/issues/52).
-Risk: a link line that differs from rustc's on a platform; the harness links every bench app
-on Linux, macOS, Windows and wasm and compares the programs' behaviour.
+Risk: a link line that differs from rustc's on a platform; every bench app's own tests have to
+pass on Linux, macOS, Windows and wasm.
 
 The no-rustc-fg lane owns F and G. Where they are (2026-10-22, Linux x86-64): with no rustc
 symbols blaze compiles a program together with `std`, `core`, `alloc`, `compiler_builtins`,
@@ -808,7 +809,7 @@ scripts with `RUSTC` naming blaze, so that `autocfg`, `version_check`, `rustvers
 feature probes of `anyhow` and `proc-macro2` are answered by blaze (B for their questions, D's
 check for their test programs). rust-analyzer's `cargo check --compile-time-deps` is replaced by
 the daemon's own run. Risk: a probe answered differently from rustc turns a feature off
-silently; the harness compares every script's output with what it prints under rustc.
+silently; the crates' own tests are what catch it.
 
 First part done (the `no-rustc-l2` lane, 2026-10-23): when cargo asks rustc for a build script,
 blaze compiles and links it, and cargo runs it as it would rustc's. `crates/blaze-cargo/src/cargo/own_script.rs`
@@ -845,8 +846,7 @@ main 24be505), "cold": with a store that has the standard library's unit, ripgre
 the build scripts of the cold build: ripgrep 7 times before, 1 (crossbeam-utils, `include!`);
 nushell 50 before, 5 (crossbeam-utils and portable-atomic, `include!`; bigdecimal, `env!`;
 nu-cmd-lang and oem_cp, a proc macro). Done since (2026-10-27, the `ctdeps` lane): rust-analyzer's
-`cargo check --compile-time-deps` replaced, see K. Not done: the harness that compares every
-script's output with rustc's. For
+`cargo check --compile-time-deps` replaced, see K. For
 the F+G lane: the printed lines a library is linked with are where cargo keeps them
 (`cargo::script::printed`), whether blaze compiled the script or not, and a script blaze
 compiles is one more crate of a `rust-project.json`, so the standard library's scripts can take
@@ -894,7 +894,7 @@ Running scripts without cargo (the `blaze-scripts` lane, 2026-10-25, for K and
 `crates/blaze-build-script`, a crate that knows nothing of blaze and asks no cargo. Its
 `env` gives the whole environment cargo runs a script with, ported from cargo's
 `custom_build.rs` and `compilation.rs` at 5f94df478 (the commit `cargo 1.99.0 -vV` names, the
-pin then; `harness/scripts.py` holds it to the pinned nightly's cargo now):
+pin then):
 cargo's own environment with `OUT_DIR`, `TARGET`, `HOST`, `NUM_JOBS`, `OPT_LEVEL`, `DEBUG`,
 `PROFILE`, `RUSTC`, `RUSTDOC`, `RUSTC_LINKER`, the wrappers (the workspace's for members
 alone, taken away when cargo uses none), `CARGO`, `CARGO_MANIFEST_*`, `CARGO_PKG_*`,
@@ -935,7 +935,7 @@ caller's (`Client::configure`). `env::cargo_started` is cargo's environment once
 started: on Linux cargo's libgit2 sets `SSL_CERT_FILE` and `SSL_CERT_DIR` to the certificates
 openssl-probe finds, and every script inherits them.
 
-`harness/scripts.py` holds the crate to cargo. The pinned nightly's cargo checks each project with the
+Until 2026-10-30 `harness/scripts.py` held the crate to cargo. The pinned nightly's cargo checks each project with the
 harness as its `RUSTC_WRAPPER`, which puts the crate's program where rustc wrote each build
 script, so that cargo's run records what cargo gave it and then becomes the script. Each run
 is described from `cargo metadata`, `cargo check --unit-graph` and the configuration, and the

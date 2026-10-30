@@ -42,6 +42,7 @@ tracing-subscriber.workspace = true
 tracing-tree.workspace = true
 
 # local deps
+blaze-dbsp.workspace = true
 blaze-format.workspace = true
 blaze-hashcons.workspace = true
 blaze-ids.workspace = true
@@ -59,7 +60,11 @@ hir-expand.workspace = true
 base-db.workspace = true
 syntax.workspace = true
 span.workspace = true
+target-features.workspace = true
 thin-vec = "0.2.16"
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

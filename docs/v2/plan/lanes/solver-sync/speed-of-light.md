@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: speed of light for solver-sync's components (the type, region and constant tables and their handles, generic-argument packing, the persisted codec, goal evaluation in the vendored solver, and tools/v2/solver_sync.py), with the arithmetic, what the code costs today and what removes each gap.
-date: 2026-10-29
+date: 2026-10-30
 ---
 # Speed of light: solver-sync's components
 
@@ -17,7 +17,9 @@ covers the solver glue, the solver cache and type relations
 
 Machine figures are lane db's ([speed-of-light.md](../db/speed-of-light.md)): 3.5 GHz, an L1
 hit in about 4.5 cycles, DRAM about 110 ns, about 20 misses in flight per core, one core
-streaming about 30 GB/s. Nothing is measured. Costs are counted from the code as of
+streaming about 30 GB/s (the shared table is
+[link/speed-of-light.md](../link/speed-of-light.md)'s "The machine"; its 3.5 GHz and DRAM
+figures agree). Nothing is measured. Costs are counted from the code as of
 2026-10-29 20:20, and `proof`'s budgets measure them once the tree builds. A "line" is a
 dependent load. "Hot" means every line is in L1.
 
@@ -59,8 +61,15 @@ and every persisted value read back.
        address is then `base + row × size`, with `base` a constant of the `static`.
      - That removes line 3 and the 4 instructions of `locate`: about 24 + 9 ≈ 33 cycles,
        1.4× off.
-     - It needs the reservation in hir-ty (blaze-mem's regions do this for salsa's memos, and
-       hir-ty doesn't depend on blaze-mem yet). Request in `v2/requests/solver-sync.md`.
+     - It needs the reservation in hir-ty (blaze-mem's regions do this for salsa's memos), and
+       hir-ty now depends on blaze-mem (10-30, `crates/hir-ty/Cargo.toml`).
+     - Two things remain open, so this is not applied (sol-all-ty, 10-30). The column
+       statics are `const`, so a `Region` can't be their base. The base becomes one lazily
+       set `AtomicPtr` read relaxed, about 1 L1 hit, which is a smaller win than the 33 cycles
+       above: about 4 to 9 cycles, the `locate` chain. And reserving 2^30 rows for every
+       column is about 8 GB of address space per 8-byte column, a few hundred GB in all,
+       committed by touch. Whether that fits every host and sandbox (`RLIMIT_AS`, macOS) is a
+       decision for Andrew, and the saving needs a measurement.
   2. **The second mix of the hash.** Fx's high bits are well mixed but its low bits are not, so
      the finalizer is there for the slot index, which uses the low half. Taking the shard from
      bits 58 to 63 and the slot from bits 26 to 57 of the plain Fx hash drops the finalizer,
@@ -186,6 +195,43 @@ This runs once per nightly bump, off every build's path.
   `--filter=tree:0`. git then fetches each tree it needs lazily, one round trip each, which
   is slower over a network than taking all trees at once. 1 s once a day is not worth the
   complexity, so the script stays as it is. Named here, as the bar asks.
+
+### Correction (speed-sol2-small, 2026-10-30)
+
+The 0.5 to 1 s above is the first run only. `fetch` keeps its clone under the cache directory
+(`solver_sync.py` `fetch`, a `git init` only when there is none), so a daily bump fetches one
+new commit against yesterday's: git's negotiation sends yesterday's commit as a have, and the
+pack holds only the trees and blobs that changed under the sparse paths, plus one round trip for
+the checkout's missing blobs. That is the bound's 2 to 3 round trips and a pack of tens to
+hundreds of KB: **within 10% of the 0.2 s bound on a daily bump**, off it only on a cold cache,
+where the protocol (no path-filtered tree fetch) sets the floor.
+
+## Where each gap stands (speed-sol2-small, 2026-10-30)
+
+solver-sync is done, but every file above except `tools/v2/solver_sync.py` is also lane db's,
+and db is not done, so the changes are queued to db with the exact edit:
+
+| section | today | bound | gap | queue |
+|---|---|---|---|---|
+| 1. an intern hit | ~41 cycles | ~24 | 1.7× | 00149 (reserved column bases), 00887 (one mix of the hash) |
+| 2. a handle read | ~15 cycles | ~6 | 2.5× | 00886 (`at` unsafe, no per-read check), then 00149 |
+| 3. packing | ~2 cycles | ~2 | at the bound | none |
+| 4. a flag test | ~15 cycles | ~6 | 2.5× | 00886 |
+| 5. the persisted writer | ~30 cycles a value | ~10 | 3× | 00889 (a column by global row) |
+| 6. a cached root goal | several hundred ns (rustc's profiles) | ~30 ns | ~10× | 00888 (vendor patch: global cache before `EvalCtxt`) |
+| 7. `solver_sync.py` | 2 to 3 round trips daily | 0.2 s | within 10% daily | none |
+
+## What `proof` should measure (speed-sol2-small)
+
+- Section 1: per intern hit, cycles (target 26) and allocations (0), over the corpus's types
+  replayed into a fresh table, and the mean probe length (the check 00887 needs).
+- Sections 2 and 4: cycles per `Ty::kind` and per `has_type_flags` over a fold of a large type
+  (target 6 and 7 hot), and zero allocations.
+- Section 5: per value written, cycles (target 10) and bytes written per value, on the table of
+  a large inference result; per value read, one intern hit.
+- Section 6: time per cached root goal (target 30 ns) and allocations (0), the goal mix of a warm
+  `blaze check` of a large crate replayed.
+- Section 7: wall time and bytes received per daily bump, from git's trace (`GIT_TRACE_PACKET`).
 
 ## State of the art
 

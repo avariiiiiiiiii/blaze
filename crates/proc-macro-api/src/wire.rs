@@ -421,8 +421,54 @@ pub(crate) fn flat_answer(
 }
 
 /// Appends `subtree` to `out` as `write_wire` writes a tree, without the parentheses of the
-/// fragments it passes on, and notes each of its spans in `sent`.
+/// fragments it passes on, and notes each of its spans in `sent`. A whole tree that passes on
+/// none is written as its columns lie, one copy, and only its parts are noted: every tree is
+/// the builder's columns for its tokens, so that is what rebuilding it would write.
 pub(crate) fn write_tree(subtree: tt::SubtreeView<'_>, sent: &mut Sent, out: &mut Vec<u8>) {
+    let tree = subtree.as_token_trees().tree();
+    let whole = subtree.as_token_trees().len() == tree.view().as_token_trees().len();
+    if whole && !may_pass_on_a_fragment(subtree) {
+        let base = out.len();
+        tree.write_wire(out);
+        note_parts(&out[base..], sent);
+        return;
+    }
+    write_rebuilt(subtree, sent, out);
+}
+
+/// Whether `subtree` may hold a fragment passed on (`fragment_contents`): a subtree without
+/// delimiters whose first token tree is parenthesized. One pass over the nodes, no span read.
+fn may_pass_on_a_fragment(subtree: tt::SubtreeView<'_>) -> bool {
+    let (mut invisible, mut found) = (false, false);
+    subtree.as_token_trees().for_each_token(|token, _| {
+        found |= invisible && token == tt::FlatToken::Open(tt::DelimiterKind::Parenthesis);
+        invisible = token == tt::FlatToken::Open(tt::DelimiterKind::Invisible);
+    });
+    found
+}
+
+/// Notes in `sent` the parts of the one tree `write_wire` wrote as `bytes`: its parts' rows and
+/// its top subtree's two spans, found from the end, where the header's counts place them.
+fn note_parts(bytes: &[u8], sent: &mut Sent) {
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+    let (parts, symbols, text) = (word(12) as usize, word(16) as usize, word(20) as usize);
+    let tops = bytes.len() - text.next_multiple_of(4) - 40;
+    let start = tops - 4 * symbols - 12 * parts;
+    let rows = (0..parts).map(|row| start + 12 * row);
+    for at in rows.chain([tops + 8, tops + 28]) {
+        let (file_id, ast_id, ctx) = (word(at), word(at + 4), word(at + 8));
+        // The ids `write_wire` wrote of this process's own spans, turned back as they were made.
+        let anchor = SpanAnchor {
+            file_id: EditionedFileId::from_raw(file_id),
+            ast_id: ErasedFileAstId::from_raw(ast_id),
+        };
+        sent.anchors.insert((file_id, ast_id), anchor);
+        sent.contexts.insert(ctx, SyntaxContext::from_u32(ctx));
+    }
+}
+
+/// [`write_tree`] by rebuilding the tree token by token, which leaves the fragments out.
+fn write_rebuilt(subtree: tt::SubtreeView<'_>, sent: &mut Sent, out: &mut Vec<u8>) {
     let top = subtree.top_subtree();
     sent.span(&top.delimiter.open);
     sent.span(&top.delimiter.close);
@@ -466,7 +512,7 @@ pub fn read_tree(
     sent: &Sent,
     scratch: &mut Vec<u8>,
 ) -> Result<tt::TopSubtree, String> {
-    let bytes = aligned(bytes, scratch);
+    let bytes = tt::aligned(bytes, scratch);
     let (tree, used) = tt::TopSubtree::read_wire(bytes, &mut |part| sent.part(part))
         // alloc: error path.
         .map_err(|error| format!("the server's answer: {error}"))?;
@@ -478,19 +524,6 @@ pub fn read_tree(
         ));
     }
     Ok(tree)
-}
-
-/// `bytes`, or a copy of them in `scratch` starting at a 4-byte boundary when they don't.
-pub fn aligned<'a>(bytes: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
-    if bytes.as_ptr().addr().is_multiple_of(4) {
-        return bytes;
-    }
-    scratch.clear();
-    // alloc: only for bytes a deserializer left off a word, which a heap buffer is not.
-    scratch.resize(bytes.len() + 3, 0);
-    let at = scratch.as_ptr().align_offset(4);
-    scratch[at..at + bytes.len()].copy_from_slice(bytes);
-    &scratch[at..at + bytes.len()]
 }
 
 /// The anchor and context of raw ids, refused when they are no ids [`EditionedFileId::as_u32`]
@@ -522,11 +555,9 @@ pub(crate) fn raw_context(raw: u32) -> Result<SyntaxContext, String> {
         // alloc: error path, naming the id.
         return Err(format!("context {raw:#x} is none `into_u32` gives"));
     }
-    // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts. A server
-    // has no database and only carries contexts back; a client holds what it takes back to the
-    // contexts it sent (`Sent`) before using any. Memory safety doesn't rest on it either way:
-    // `from_u32` refuses only `u32::MAX`, checked above, and salsa's table checks every lookup.
-    Ok(unsafe { SyntaxContext::from_u32(raw) })
+    // A server has no database and only carries contexts back; a client holds what it takes
+    // back to the contexts it sent (`Sent`) before using any.
+    Ok(SyntaxContext::from_u32(raw))
 }
 
 #[cfg(test)]
@@ -546,8 +577,7 @@ mod tests {
                 file_id: EditionedFileId::new(FileId::from_raw(file), Edition::CURRENT),
                 ast_id: ROOT_ERASED_FILE_AST_ID,
             },
-            // SAFETY: no database; the context is compared, never looked up.
-            ctx: unsafe { SyntaxContext::from_u32(ctx) },
+            ctx: SyntaxContext::from_u32(ctx),
         }
     }
 
@@ -581,6 +611,58 @@ mod tests {
             write_tree(tree.view(), &mut sent, &mut bytes);
             assert_eq!(read_tree(&bytes, &sent, &mut Vec::new()), Ok(tree.copy()), "{files}");
         }
+    }
+
+    /// A whole tree with no fragment passed on is written as it lies: the same bytes as
+    /// rebuilding it token by token, and the same parts noted, so the same answers are taken.
+    #[test]
+    fn a_tree_written_as_it_lies_is_the_rebuilt_one() {
+        let mut trees: Vec<TopSubtree> = [0, 1, 3, 40].map(tree).into();
+        let mut grouped = TopSubtreeBuilder::new(Delimiter::invisible_spanned(span(2, 0, 2)));
+        grouped.open(DelimiterKind::Invisible, span(2, 1, 2));
+        grouped.push(punct('!', span(3, 2, 4)));
+        grouped.close(span(2, 3, 2));
+        grouped.open(DelimiterKind::Brace, span(5, 4, 5));
+        grouped.close(span(5, 5, 5));
+        trees.push(grouped.build());
+        for tree in &trees {
+            assert!(!may_pass_on_a_fragment(tree.view()));
+            let (mut fast, mut rebuilt) = (Sent::new(), Sent::new());
+            let (mut fast_bytes, mut rebuilt_bytes) = (vec![1, 2, 3, 4], vec![1, 2, 3, 4]);
+            write_tree(tree.view(), &mut fast, &mut fast_bytes);
+            write_rebuilt(tree.view(), &mut rebuilt, &mut rebuilt_bytes);
+            assert_eq!(fast_bytes, rebuilt_bytes);
+            assert_eq!(read_tree(&fast_bytes[4..], &fast, &mut Vec::new()), Ok(tree.copy()));
+            let parts = |sent: &Sent| {
+                let anchors = sent.anchors.map.iter().map(|(k, v)| (*k, *v));
+                let mut all: Vec<_> = sent.anchors.list.iter().copied().chain(anchors).collect();
+                all.sort_by_key(|it| it.0);
+                all.dedup();
+                let mut contexts: Vec<_> = sent.contexts.list.iter().map(|it| it.0).chain(sent.contexts.map.keys().copied()).collect();
+                contexts.sort();
+                contexts.dedup();
+                (all, contexts)
+            };
+            assert_eq!(parts(&fast), parts(&rebuilt));
+        }
+    }
+
+    #[test]
+    fn a_fragment_passed_on_is_rebuilt_without_its_parentheses() {
+        let at = span(1, 0, 1);
+        let mut builder = TopSubtreeBuilder::new(Delimiter::invisible_spanned(at));
+        builder.open(DelimiterKind::Invisible, at);
+        builder.open(DelimiterKind::Parenthesis, at);
+        builder.push(punct('!', span(1, 1, 1)));
+        builder.close(at);
+        builder.close(at);
+        let tree = builder.build();
+        assert!(may_pass_on_a_fragment(tree.view()));
+        let mut bytes = Vec::new();
+        write_tree(tree.view(), &mut Sent::new(), &mut bytes);
+        let mut as_is = Vec::new();
+        tree.write_wire(&mut as_is);
+        assert_ne!(bytes, as_is);
     }
 
     #[test]

@@ -199,7 +199,7 @@ pub(crate) fn command(args: &[String]) -> anyhow::Result<i32> {
     }
     args.extend(["--crate", "doc", "--out", "none"].map(str::to_owned));
     let args = crate::Args::parse(args.into_iter())?;
-    crate::process_wide();
+    crate::process_wide()?;
     let cargo_config = crate::cargo_config(&args);
     let (mut db, vfs, _checkouts) = crate::load(
         &[project.as_path()],

@@ -47,7 +47,7 @@ impl LatePass for InvalidFromUtf8 {
     const LINTS: LintSet = lint_set(["invalid_from_utf8", "invalid_from_utf8_unchecked"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some([arg]) = util::call_args(b, expr) else { return };
         let Some((def, _)) = util::called_fn(b, expr) else { return };
         let Some(item) = self.items.of(b.db(), def) else { return };
@@ -101,7 +101,7 @@ impl LatePass for InvalidFromUtf8 {
 
 /// The UTF-8 error of the bytes `expr` is as rustc reads them: a byte string literal, or an
 /// array of byte and integer literals (each integer cut to its low byte).
-fn invalid_bytes(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<std::str::Utf8Error> {
+fn invalid_bytes(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<std::str::Utf8Error> {
     let store = b.store();
     match store.expr(expr) {
         Expr::Literal(Literal::ByteString(bytes)) => std::str::from_utf8(bytes).err(),
@@ -123,23 +123,23 @@ fn invalid_bytes(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<std::str::Utf8Error
 /// Where rustc's `expr_or_init_with_outside_body` has got to from an argument: an expression of
 /// the body linted, or of the body of a `const` or `static` of the crate it read.
 struct Init<'s, 'a, 'db> {
-    linted: &'s BodyCx<'a, 'db>,
-    item: Option<BodyCx<'a, 'db>>,
+    linted: &'s BodyCx<'s, 'a, 'db>,
+    item: Option<BodyCx<'s, 'a, 'db>>,
     expr: ExprId,
     /// The `const`s and `static`s read, in order.
     read: Vec<(ItemId, ModuleDefId)>,
 }
 
 /// One step of `expr_or_init_with_outside_body` from a path.
-enum Step<'a, 'db> {
+enum Step<'s, 'a, 'db> {
     /// To the initializer of the `let` that binds the local the path names.
     Local(ExprId),
     /// To the value of the `const` or `static` the path names.
-    Item(BodyCx<'a, 'db>, ItemId, ModuleDefId),
+    Item(BodyCx<'s, 'a, 'db>, ItemId, ModuleDefId),
 }
 
 impl<'s, 'a, 'db> Init<'s, 'a, 'db> {
-    fn b(&self) -> &BodyCx<'a, 'db> {
+    fn b(&self) -> &BodyCx<'s, 'a, 'db> {
         self.item.as_ref().unwrap_or(self.linted)
     }
 
@@ -167,7 +167,7 @@ impl<'s, 'a, 'db> Init<'s, 'a, 'db> {
         }
     }
 
-    fn step(&self, expr: ExprId) -> Option<Step<'a, 'db>> {
+    fn step(&self, expr: ExprId) -> Option<Step<'s, 'a, 'db>> {
         let b = self.b();
         let Expr::Path(_) = b.store().expr(expr) else { return None };
         let db = b.db();
@@ -191,7 +191,7 @@ impl<'s, 'a, 'db> Init<'s, 'a, 'db> {
 /// The initializer of the `let` statement whose pattern is `binding` alone, written without
 /// `mut` or `ref` so that it is never assigned again (rustc's `LetStmt` parent of the
 /// binding's pattern, `BindingMode::NONE`).
-fn let_init(b: &BodyCx<'_, '_>, binding: BindingId) -> Option<ExprId> {
+fn let_init(b: &BodyCx<'_, '_, '_>, binding: BindingId) -> Option<ExprId> {
     let store = b.store();
     if store[binding].mode != BindingAnnotation::Unannotated {
         return None;

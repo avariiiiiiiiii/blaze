@@ -17,6 +17,10 @@ use crate::zalsa::MemoIngredientIndex;
 use crate::{Id, IngredientIndex, Revision};
 
 pub(crate) mod memo;
+mod page_cache;
+pub(crate) mod scan;
+
+pub(crate) use page_cache::PageCache;
 
 pub(crate) const PAGE_LEN_BITS: usize = 7;
 const PAGE_LEN_MASK: usize = PAGE_LEN - 1;
@@ -52,7 +56,7 @@ struct PageArena {
 impl PageArena {
     fn new(tag: Tag) -> PageArena {
         PageArena {
-            region: Region::reserve(SLOT_BYTES, tag).unwrap_or_else(|err| {
+            region: Region::reserve_huge(SLOT_BYTES, tag).unwrap_or_else(|err| {
                 panic!("salsa: reserving the table's `{tag}` slot pages: {err}")
             }),
             used: AtomicUsize::new(0),

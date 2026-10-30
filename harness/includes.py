@@ -4,7 +4,7 @@
 
 The file is not a `.rs` file, so nothing loads it until the macro is expanded. Each step edits
 it or the file that includes it, asks the daemon for the program and compares what it prints
-with what `cargo build` of the same source prints.
+with what blaze's build of the same source from nothing (mixed.from_scratch) prints.
 
 usage: includes.py '{}'
 
@@ -29,7 +29,7 @@ from typed_input import fail, parse
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import BLAZE, RUNNER, TARGET_ARGS, Fixture, built, sysroot_rlibs
+from mixed import BLAZE, RUNNER, TARGET_ARGS, Fixture, from_scratch, printed, sysroot_rlibs
 
 TOML = """[package]
 name = "sinc"
@@ -60,7 +60,7 @@ fn main() {
 """
 DATA, MAIN = "src/table.rs.data", "src/main.rs"
 LABEL, BYTES = "src/label.txt", "src/bytes.dat"
-# (what the step is, [(file, old, new)], whether cargo rejects it). An `old` of None makes the
+# (what the step is, [(file, old, new)], whether it does not build). An `old` of None makes the
 # file, a `new` of None removes it.
 STEPS = [
     ("nothing edited", [], False),
@@ -90,14 +90,14 @@ STEPS = [
 
 
 def follow(files, steps):
-    """Edits a crate called `sinc` a step at a time under a daemon, against cargo."""
+    """Edits a crate called `sinc` a step at a time under a daemon, against blaze's build of it
+    from nothing."""
     ws = tempfile.mkdtemp(prefix="blaze-includes-")
     os.makedirs(os.path.join(ws, "src"))
     for path, text in (("Cargo.toml", TOML), *files):
         Path(ws, path).write_text(text)
     work = tempfile.mkdtemp(prefix="blaze-includes-out-")
     socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
-    reference = os.path.join(work, "reference")
     fx = Fixture(ws, ["sinc"], ["-p", "sinc"])
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"sinc.{n}") for n in ("o", "patch.o", "bin"))
@@ -156,6 +156,13 @@ def follow(files, steps):
         reason = re.search(r"not spliced: (.*)", links[-1])
         return "full: " + (reason[1] if reason else "not asked to splice")
 
+    def from_nothing():
+        """What blaze's build of the source as it is, from nothing, prints."""
+        try:
+            return printed(from_scratch(ws, ["sinc"], ["-p", "sinc"]))
+        except SystemExit as error:
+            return f"did not build from nothing: {str(error)[:200]}"
+
     wrong = 0
     # A step may say after `broken` what the way the binary was made has to contain.
     for what, edits, broken, *how in steps:
@@ -179,15 +186,6 @@ def follow(files, steps):
         )
         took = (time.time() - began) * 1000
         reply = (reply.stdout + reply.stderr).strip()
-        cargo = subprocess.run(
-            ["cargo", "build", "-q", *TARGET_ARGS],
-            check=False,
-            cwd=ws,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "CARGO_TARGET_DIR": reference},
-        )
-        assert (cargo.returncode != 0) == broken, cargo.stderr[-2000:]
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon died: {log_path}")
         if broken:
@@ -195,7 +193,7 @@ def follow(files, steps):
         elif not reply.startswith("ok"):
             verdict = "REFUSED"
         else:
-            verdict = "same" if run(binary) == run(built(reference, "sinc")) else "DIFFERENT OUTPUT"
+            verdict = "same" if run(binary) == from_nothing() else "DIFFERENT OUTPUT"
         made, failed = linked(seen), verdict.isupper()
         # `compiled N` among what a step says: how many functions its builds may compile.
         limit = [int(it.split()[1]) for it in how if it.startswith("compiled ")]

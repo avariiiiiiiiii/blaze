@@ -21,36 +21,38 @@ pub struct Record {
     pub event: Event,
 }
 
+crate::in_key_order! {
 // clone: as `Record`, which holds it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A build began: the command that asked for it, in the workspace at `root`.
-    Began { build: u64, command: String, root: PathBuf },
+    Began { build: u64, command: String, root: PathBuf } keys [root, build, command],
     /// A step of the build began, of what when it is of one crate or program.
-    Started { step: Step, of: Option<String> },
+    Started { step: Step, of: Option<String> } keys [of, step],
     /// The step began last ended.
-    Ended { step: Step, of: Option<String> },
+    Ended { step: Step, of: Option<String> } keys [of, step],
     /// How far the step under way is: `done` of `total` of what it counts ([`Step::counts`]),
     /// `total` 0 while it is not known, and what of it has taken longest so far.
-    Progress { step: Step, done: u64, total: u64, longest: Option<String> },
+    Progress { step: Step, done: u64, total: u64, longest: Option<String> }
+        keys [done, step, total, longest],
     /// How far the build of a crate is.
-    Crate { name: String, state: CrateState, fns: Fns },
+    Crate { name: String, state: CrateState, fns: Fns } keys [fns, name, state],
     /// Why a unit or a function was compiled again rather than taken as it was.
-    Rebuilt { name: String, krate: String, cause: Cause },
+    Rebuilt { name: String, krate: String, cause: Cause } keys [name, cause, krate],
     /// How many more functions were compiled again than the [`Event::Rebuilt`] records name.
-    Unlisted { count: u64 },
+    Unlisted { count: u64 } keys [count],
     /// What the store had of the build's compile, and when it had little, why.
-    Cache { cache: Cache },
+    Cache { cache: Cache } keys [cache],
     /// What blaze does not build, which fails the build (docs/architecture.md, "Never
     /// guess; refuse visibly").
-    Refused { name: String, why: String },
+    Refused { name: String, why: String } keys [why, name],
     /// A line that is no step: a warning, a note.
-    Said { level: Level, text: String },
+    Said { level: Level, text: String } keys [text, level],
     /// The build is done.
-    Finished { ok: bool, summary: Summary },
+    Finished { ok: bool, summary: Summary } keys [ok, summary],
     /// A node of the build's graph (docs/driver.md), said once, before it first moves: what it
     /// is and the nodes it waits for.
-    Node { id: u32, kind: NodeKind, name: String, deps: Vec<u32> },
+    Node { id: u32, kind: NodeKind, name: String, deps: Vec<u32> } keys [id, deps, kind, name],
     /// Nodes of the graph said together, each as its [`Event::Node`] would say it, before any
     /// of them first moves: node `i` of the `kinds.len()` is `first + i`, of kind `kinds[i]`,
     /// named `names[name_at[i]..name_at[i + 1]]` (in bytes) and waiting for
@@ -66,26 +68,28 @@ pub enum Event {
         name_at: Vec<u32>,
         deps: Vec<u32>,
         deps_at: Vec<u32>,
-    },
+    } keys [deps, first, kinds, names, deps_at, name_at],
     /// A node of the graph is now in `state`.
-    Moved { id: u32, state: NodeState },
+    Moved { id: u32, state: NodeState } keys [id, state],
     /// What held the build up: each node of it is the one the next waited for last, from the
     /// first to the one that finished last.
-    Critical { path: Vec<u32> },
+    Critical { path: Vec<u32> } keys [path],
     /// How busy the process was since it said this last, while at a step: `busy` hundredths
     /// of a core, of the `of` cores it may run on. Said when it moved by a tenth of a core.
-    Cores { busy: u32, of: u32 },
+    Cores { busy: u32, of: u32 } keys [of, busy],
     /// The functions compiling for longer than a moment ([`SLOW_NS`]), longest first, each
     /// for `ns` by this record: said when which they are changes, and empty once none is.
-    Compiling { functions: Vec<Slow> },
+    Compiling { functions: Vec<Slow> } keys [functions],
     /// The functions the build took [`SLOW_NS`] or more to compile, longest first, each in
     /// `ns`: said once, as it ends.
-    Slowest { functions: Vec<Slow> },
+    Slowest { functions: Vec<Slow> } keys [functions],
     /// Functions put in object `object` of the process's builds, as they were put in it. An
     /// object is `whole`, all of the program, or a patch of the last whole one with what an
     /// edit compiled again. A function is in one record of an object. The daemon sends these
     /// to no command: a cold build's are some megabytes.
-    Functions { object: u32, whole: bool, functions: Vec<Function> },
+    Functions { object: u32, whole: bool, functions: Vec<Function> }
+        keys [whole, object, functions],
+}
 }
 
 impl Event {
@@ -327,17 +331,21 @@ impl<'a> NodeBatch<'a> {
 pub const SLOW_NS: u64 = 200_000_000;
 
 /// A function slow to compile, of crate `krate`: `ns` is how long it took, or has so far.
+crate::in_key_order! {
 // clone: as `Record`, whose `Event::Compiling` holds it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Slow {
     pub krate: String,
     pub name: String,
     pub ns: u64,
 }
+keys [ns, name, krate]
+}
 
+crate::in_key_order! {
 /// A function or instance of the program a build writes: what the build page draws.
 // clone: as `Record`, whose `Event::Functions` holds it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Function {
     /// Its number in its object, which the `calls` of the object's others name it by.
     pub id: u32,
@@ -353,6 +361,8 @@ pub struct Function {
     /// the object is code of another (rustc's, the base an edit patches).
     pub calls: Vec<u32>,
     pub how: How,
+}
+keys [id, how, key, name, calls, krate]
 }
 
 /// Where the code of a [`Function`] came from.
@@ -573,13 +583,16 @@ impl CrateState {
     }
 }
 
+crate::in_key_order! {
 /// The functions of a crate: how many the build has, how many are done, and of those how
 /// many came from the store or were unchanged rather than compiled.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Fns {
     pub total: u64,
     pub done: u64,
     pub kept: u64,
+}
+keys [done, kept, total]
 }
 
 impl Fns {
@@ -648,9 +661,10 @@ pub enum Level {
     Error,
 }
 
+crate::in_key_order! {
 /// What a finished build did, for its last line.
 // clone: as `Record`, whose `Event::Finished` holds it.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Summary {
     pub took_ns: u64,
     pub crates: u64,
@@ -665,11 +679,14 @@ pub struct Summary {
     /// The steps that took longest, longest first: why the build took as long as it did.
     pub slowest: Vec<Took>,
 }
+keys [fns, more, cache, error, crates, rebuilt, slowest, took_ns]
+}
 
+crate::in_key_order! {
 /// The entries of compiled code a build asked the store for: found on this machine, fetched
 /// from the remote store, or compiled because neither had them.
 // clone: as `Record`; the UI keeps the last one for the summary.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cache {
     pub found: u64,
     pub fetched: u64,
@@ -678,14 +695,19 @@ pub struct Cache {
     /// of another blaze whose entries are not this one's.
     pub cold: Option<String>,
 }
+keys [cold, found, fetched, compiled]
+}
 
+crate::in_key_order! {
 /// How long a step took, of what.
 // clone: as `Summary`, which holds it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Took {
     pub step: Step,
     pub of: Option<String>,
     pub took_ns: u64,
+}
+keys [of, step, took_ns]
 }
 
 /// What a client asks the daemon of builds.

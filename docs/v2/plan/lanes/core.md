@@ -64,6 +64,11 @@ A driver for Windows: IOCP for files, sockets and timers, `ReadDirectoryChangesW
 changes, job objects for children, alongside io_uring and kqueue. Its sandbox is usercode's
 (AppContainer and job objects, #1390).
 
+A child's end is heard from a thread-pool wait on the process (`RegisterWaitForSingleObject`),
+which posts it to the port; the job's messages, which Windows does not promise to deliver, only
+say that the job went past its memory, and the driver then kills it. A memory-limited job's peak
+is at most its limit: Windows refuses any commit past it.
+
 ## Done when
 
 - every driver (io_uring, kqueue, IOCP, simulation) implements every Effect

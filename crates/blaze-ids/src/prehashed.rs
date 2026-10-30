@@ -48,7 +48,8 @@ pub type ByHashSet<K> = std::collections::HashSet<K, BuildPrehashed>; // alloc: 
 mod tests {
     use std::hash::{BuildHasher as _, Hash, Hasher as _};
 
-    use proptest::prelude::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     use super::*;
     use crate::ContentId;
@@ -123,13 +124,13 @@ mod tests {
         });
     }
 
-    proptest! {
-        #[test]
-        fn hashes_as_the_copies_did(bytes in any::<[u8; 32]>(), word in any::<u64>()) {
-            prop_assert_eq!(hash_of(&ContentId(bytes)), reference_of(&ContentId(bytes)));
-            prop_assert_eq!(hash_of(&bytes), reference_of(&bytes));
-            prop_assert_eq!(hash_of(&word), word_reference(word));
-            prop_assert_eq!(hash_of(&word), reference_of(&word));
-        }
+    #[hegel::test]
+    fn hashes_as_the_copies_did(tc: TestCase) {
+        let bytes: [u8; 32] = tc.draw(gs::arrays(gs::integers()));
+        let word: u64 = tc.draw(gs::integers());
+        assert_eq!(hash_of(&ContentId(bytes)), reference_of(&ContentId(bytes)));
+        assert_eq!(hash_of(&bytes), reference_of(&bytes));
+        assert_eq!(hash_of(&word), word_reference(word));
+        assert_eq!(hash_of(&word), reference_of(&word));
     }
 }

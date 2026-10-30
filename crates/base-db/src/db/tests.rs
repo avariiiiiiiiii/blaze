@@ -11,7 +11,7 @@ const _: () = is_shared::<Db>();
 
 /// What a test query over `&Db` sees: a tracked function whose database is the concrete type,
 /// as every front-end query's is.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn text_len(db: &Db, text: FileText) -> u32 {
     text.text(db).len() as u32
 }
@@ -100,6 +100,21 @@ fn a_memo_hit_allocates_nothing() {
     let (len, used) = blaze_alloc_count::measure(|| base_db_memo_hit(&db, text));
     assert_eq!(len, 13);
     assert_eq!(used.allocations, 0, "a memo hit allocates nothing: {used:?}");
+}
+
+/// The log keeps only the events of a [`Db::log`]: a query run before it, outside, leaves
+/// nothing behind, and one run inside is kept.
+#[test]
+fn an_event_outside_log_is_not_kept() {
+    let (mut db, file) = db_with("abc");
+    let text = db.file_text(file);
+    assert_eq!(text_len(&db, text), 3);
+    db.set_file_text(file, "abcd");
+    let text = db.file_text(file);
+    let ran = db.log_executed(|| {});
+    assert!(ran.is_empty(), "nothing ran inside the log: {ran:?}");
+    let ran = db.log_executed(|| assert_eq!(text_len(&db, text), 4));
+    assert!(ran.iter().any(|name| name.contains("text_len")), "{ran:?}");
 }
 
 #[test]

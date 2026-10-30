@@ -1,6 +1,6 @@
 [package]
 name = "blaze-bytes"
-description = "blaze v2's held bytes and text: a heap Arc, a range of a mapped image or a static, checked UTF-8 once and lent as &str, never copied"
+description = "blaze v2's held bytes and text: a heap Arc, a range of a mapped image or a static, checked UTF-8 once and lent as &str, never copied; and the one copy of little-endian reads at an offset"
 publish = false
 
 version.workspace = true

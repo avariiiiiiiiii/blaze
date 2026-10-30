@@ -53,6 +53,59 @@ const fn fold(a: u64, b: u64) -> u64 {
     (wide as u64) ^ ((wide >> 64) as u64)
 }
 
+/// [`name_hash`]'s multiplier.
+pub const NAME_K: u64 = 0xf135_7aea_2e62_a9c5;
+
+/// [`name_hash`]'s state before the first word: the length.
+#[inline(always)]
+pub const fn name_hash_start(len: usize) -> u64 {
+    (len as u64).wrapping_mul(NAME_K)
+}
+
+/// [`name_hash`]'s state after one more 8-byte word, little-endian (the last zero above the
+/// name's end).
+#[inline(always)]
+pub const fn name_hash_word(h: u64, word: u64) -> u64 {
+    (h ^ word).wrapping_mul(NAME_K).rotate_left(26)
+}
+
+/// [`name_hash`] from its state after the last word: murmur3's 64-bit finalizer, so the top
+/// bits and the low ones are both well mixed.
+#[inline(always)]
+pub const fn name_hash_finish(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
+}
+
+/// The hash `intern`'s tables key a value's bytes by, and a [`Phf`] made with
+/// [`name_phf_table!`](crate::name_phf_table) its keys by: FxHash's multiply-rotate over 8-byte
+/// words, the length first, then [`name_hash_finish`]. An image's symbol index is laid out by
+/// it, so it never changes. It is here, where both reach it, so that one hash of a name finds it
+/// in a compiled-in set and, if it is not there, in the interner's table. A name of 1 to 8
+/// bytes is one word: `name_hash_finish(name_hash_word(name_hash_start(len), word))`.
+#[inline]
+pub const fn name_hash(bytes: &[u8]) -> u64 {
+    let mut h = name_hash_start(bytes.len());
+    let mut rest = bytes;
+    while let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
+        h = name_hash_word(h, u64::from_le_bytes(*chunk));
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        let mut last = 0u64;
+        let mut i = 0;
+        while i < rest.len() {
+            last |= (rest[i] as u64) << (8 * i);
+            i += 1;
+        }
+        h = name_hash_word(h, last);
+    }
+    name_hash_finish(h)
+}
+
 /// The hash of `bytes` under `seed`: the same at compile time and at run time.
 #[inline]
 pub const fn hash(bytes: &[u8], seed: u64) -> u64 {
@@ -97,8 +150,11 @@ pub const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// A perfect hash of the fixed set `keys`: each key's index in `keys` from its bytes. Declare
-/// one with [`phf_table!`](crate::phf_table), which sizes it.
-pub struct Phf<const SLOTS: usize, const BUCKETS: usize> {
+/// one with [`phf_table!`](crate::phf_table), which sizes it, or with
+/// [`name_phf_table!`](crate::name_phf_table) for one keyed by [`name_hash`] (`BY_NAME`), which a
+/// caller that already has a name's `name_hash` looks up with no second hash of its bytes
+/// ([`Phf::index_by_name_hash`]).
+pub struct Phf<const SLOTS: usize, const BUCKETS: usize, const BY_NAME: bool = false> {
     keys: &'static [&'static str],
     seed: u64,
     pilots: [u16; BUCKETS],
@@ -106,7 +162,23 @@ pub struct Phf<const SLOTS: usize, const BUCKETS: usize> {
     slots: [u16; SLOTS],
 }
 
-impl<const SLOTS: usize, const BUCKETS: usize> Phf<SLOTS, BUCKETS> {
+/// A [`name_hash`] mixed with a table's seed: a bijection of the hash for each seed, so two
+/// keys of one `name_hash` are in one slot under every seed, and the set is refused.
+#[inline(always)]
+const fn seeded(name_hash: u64, seed: u64) -> u64 {
+    fold(name_hash ^ seed ^ K0, K1)
+}
+
+impl<const SLOTS: usize, const BUCKETS: usize, const BY_NAME: bool> Phf<SLOTS, BUCKETS, BY_NAME> {
+    /// The hash a key's bucket and slot are found from.
+    #[inline(always)]
+    const fn key_hash(bytes: &[u8], seed: u64) -> u64 {
+        match BY_NAME {
+            true => seeded(name_hash(bytes), seed),
+            false => hash(bytes, seed),
+        }
+    }
+
     /// The table of `keys`. Panics, which in a `static` is a compile error, when a key is
     /// named twice or no seed of the first 64 gives a perfect hash.
     pub const fn new(keys: &'static [&'static str]) -> Self {
@@ -130,7 +202,7 @@ impl<const SLOTS: usize, const BUCKETS: usize> Phf<SLOTS, BUCKETS> {
         let mut sizes = [0u16; BUCKETS];
         let mut i = 0;
         while i < n {
-            let h = hash(keys[i].as_bytes(), seed);
+            let h = Self::key_hash(keys[i].as_bytes(), seed);
             hashes[i] = h;
             sizes[bucket(h, BUCKETS)] += 1;
             i += 1;
@@ -231,8 +303,22 @@ impl<const SLOTS: usize, const BUCKETS: usize> Phf<SLOTS, BUCKETS> {
 
     #[inline(always)]
     const fn candidate(&self, bytes: &[u8]) -> usize {
-        let h = hash(bytes, self.seed);
+        self.candidate_of(Self::key_hash(bytes, self.seed))
+    }
+
+    #[inline(always)]
+    const fn candidate_of(&self, h: u64) -> usize {
         self.slots[slot(h, self.pilots[bucket(h, BUCKETS)], SLOTS)] as usize
+    }
+
+    /// [`Phf::index`] of `bytes` whose [`name_hash`] is `name_hash`, for a table keyed by it:
+    /// the bytes are read only to compare them with the one key they can be.
+    #[inline]
+    pub fn index_by_name_hash(&self, name_hash: u64, bytes: &[u8]) -> Option<usize> {
+        const { assert!(BY_NAME, "a table keyed by name_hash (name_phf_table!)") };
+        let at = self.candidate_of(seeded(name_hash, self.seed));
+        let key = self.keys.get(at)?;
+        (key.as_bytes() == bytes).then_some(at)
     }
 
     /// The index in the keys of `bytes`, if it is one.
@@ -274,6 +360,20 @@ macro_rules! phf_table {
         $vis static $name: $crate::Phf<
             { $crate::slots($keys.len()) },
             { $crate::buckets($keys.len()) },
+        > = $crate::Phf::new($keys);
+    };
+}
+
+/// [`phf_table!`] keyed by [`name_hash`]: also looked up by a hash the caller already has
+/// ([`Phf::index_by_name_hash`]).
+#[macro_export]
+macro_rules! name_phf_table {
+    ($(#[$attr:meta])* $vis:vis static $name:ident = $keys:expr $(;)?) => {
+        $(#[$attr])*
+        $vis static $name: $crate::Phf<
+            { $crate::slots($keys.len()) },
+            { $crate::buckets($keys.len()) },
+            true,
         > = $crate::Phf::new($keys);
     };
 }
@@ -364,11 +464,80 @@ mod tests {
 
     const _: () = assert!(bytes_eq(b"lint", b"lint") && !bytes_eq(b"lint", b"lints") && bytes_eq(b"", b""));
 
-    proptest::proptest! {
-        #[test]
-        fn bytes_eq_is_slice_eq(a in proptest::collection::vec(0u8..4, 0..8), b in proptest::collection::vec(0u8..4, 0..8)) {
-            proptest::prop_assert_eq!(bytes_eq(&a, &b), a == b);
-            proptest::prop_assert!(bytes_eq(&a, &a));
+    crate::name_phf_table!(static BY_NAME = KEYWORDS;);
+
+    /// `intern`'s `value_hash` as it was written before it moved here, closures and all: the
+    /// hash images' symbol indices are laid out by.
+    fn value_hash_as_written(bytes: &[u8]) -> u64 {
+        const K: u64 = 0xf135_7aea_2e62_a9c5;
+        let step = |h: u64, word: u64| (h ^ word).wrapping_mul(K).rotate_left(26);
+        let mut h = (bytes.len() as u64).wrapping_mul(K);
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            h = step(h, u64::from_le_bytes(word.try_into().expect("8 bytes")));
         }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            h = step(h, u64::from_le_bytes(last));
+        }
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        h ^ (h >> 33)
+    }
+
+    #[test]
+    fn name_hash_is_the_interners() {
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x6e61_6d65_68);
+        for len in 0..80 {
+            for _ in 0..50 {
+                let bytes: Vec<u8> = (0..len).map(|_| rng.index(256) as u8).collect();
+                assert_eq!(name_hash(&bytes), value_hash_as_written(&bytes), "{bytes:?}");
+            }
+        }
+        for name in ["", "a", "self", "abcdefgh", "abcdefghi", "ünïcödé"] {
+            assert_eq!(name_hash(name.as_bytes()), value_hash_as_written(name.as_bytes()));
+        }
+        // A name of one word is one step from the length.
+        for name in ["a", "Ok", "self", "Some", "iter_mut", "abcdefgh"] {
+            let mut word = [0u8; 8];
+            word[..name.len()].copy_from_slice(name.as_bytes());
+            let one = name_hash_finish(name_hash_word(name_hash_start(name.len()), u64::from_le_bytes(word)));
+            assert_eq!(one, name_hash(name.as_bytes()), "{name}");
+        }
+        const AT_COMPILE_TIME: u64 = name_hash(b"iter");
+        assert_eq!(AT_COMPILE_TIME, value_hash_as_written(b"iter"));
+    }
+
+    #[test]
+    fn a_table_by_name_hash_finds_by_either() {
+        for (at, key) in KEYWORDS.iter().enumerate() {
+            assert_eq!(BY_NAME.get(key), Some(at), "{key:?}");
+            assert_eq!(BY_NAME.index_const(key.as_bytes()), Some(at), "{key:?}");
+            assert_eq!(BY_NAME.index_by_name_hash(name_hash(key.as_bytes()), key.as_bytes()), Some(at));
+        }
+        for other in ["", "f", "fnn", "Fn", "self_", "selfSelf", "unsafe ", "whil", "asyncawait"] {
+            assert_eq!(BY_NAME.get(other), None, "{other:?}");
+            assert_eq!(BY_NAME.index_by_name_hash(name_hash(other.as_bytes()), other.as_bytes()), None);
+        }
+        // A hash given for other bytes finds nothing: the key is compared.
+        assert_eq!(BY_NAME.index_by_name_hash(name_hash(b"fn"), b"let"), None);
+        let mut seen = vec![false; KEYWORDS.len()];
+        for at in BY_NAME.slots.iter().filter(|&&it| it != EMPTY) {
+            assert!(!std::mem::replace(&mut seen[*at as usize], true), "key {at} placed twice");
+        }
+        assert!(seen.iter().all(|&it| it), "every key placed");
+    }
+
+    #[hegel::test]
+    fn bytes_eq_is_slice_eq(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let a: Vec<u8> = tc.draw(gs::vecs(gs::integers().max_value(3)).max_size(7));
+        let b: Vec<u8> = tc.draw(gs::vecs(gs::integers().max_value(3)).max_size(7));
+        assert_eq!(bytes_eq(&a, &b), a == b);
+        assert!(bytes_eq(&a, &a));
     }
 }

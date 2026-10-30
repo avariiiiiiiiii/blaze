@@ -1,4 +1,5 @@
 #![cfg(feature = "inventory")]
+#![forbid(unsafe_code)]
 
 use salsa::{Database as Db, Setter};
 use test_log::test;

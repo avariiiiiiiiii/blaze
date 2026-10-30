@@ -6,7 +6,7 @@ date: 2026-10-29
 # blaze v2: the store, as written
 
 The design is the store lane file, [v2/plan/lanes/store.md](v2/plan/lanes/store.md); this is how `crates/blaze-cas` does it.
-`Store` is a sans-IO state machine: it maps, appends, syncs and writes through
+`Store` is a sans-IO state machine: it maps, writes, syncs and truncates through
 `blaze_core::Effect`s and is told how each went by `Store::complete`.
 
 ## On disk
@@ -43,28 +43,35 @@ when mapped and not again.
 
 ## A group commit (#1298)
 
-`put` only appends to memory: the value is readable at once and has a ticket. `flush` starts one
-commit for everything put since the last:
+Reads and writes take no lock ([v2/plan/lanes/concurrency/store.md](v2/plan/lanes/concurrency/store.md)).
+A `Reader` (`Store::reader()`, `Send + Sync + Clone`) reads through the published view with the
+task's guard. A worker puts through a `Writer` of its own (`Store::writer()`; `Store::put` is
+the owner's): it encodes the record into its own segment's chunk and publishes a spot (key,
+content, place, ticket) into the delta with one compare-and-swap, so the value is readable at
+once and has a ticket, `(segment << 40) | put`. `flush` starts one commit for everything put
+since the last, by the store and by every writer: it drains every segment into pack memory, then
 
-1. each pack written to is cut back to its committed length (`Truncate`), then appended to
-   (`Append`), then synced (`Sync`, asked only once the append has completed);
+1. each pack written to is cut back to its committed length (`Truncate`), then written at that
+   length (`WriteAt`, block aligned, so a driver may skip the page cache), then synced (`Sync`,
+   asked only once the write has completed);
 2. new files of their own are written (`Write`); and once the records the index table does
    not hold reach 65,536, a new table of all of them goes into the inactive slot (`Write`);
 3. once all of those are durable, the head is written, naming the new lengths and slot.
 
-Before step 1 each pack written to is padded with zeros to the next 4 KiB block, so the append
+Before step 1 each pack written to is padded with zeros to the next 4 KiB block, so the write
 starts and ends on a block; v2/requests/store.md asks the io_uring driver to write packs with
 `O_DIRECT` from registered buffers.
 
 The head's write is the flip: a crash before it leaves the old head, naming only bytes that were
 whole before; after it, everything it names is durable. Bytes past a pack's committed length
-(a torn append) are never read and are cut by the next commit. Any IO failure fails the whole
+(a torn write) are never read and are cut by the next commit. Any IO failure fails the whole
 commit, which starts again from the committed lengths; eight failures in a row break the store
 (`Store::broken`), which then serves what it has mapped and makes nothing durable. 77,481 puts
-are one commit: a few large appends, a sync per pack, one head.
+are one commit: a few large writes, a sync per pack, one head.
 
-After the flip the store maps each grown pack again and drops the bytes it held in memory that
-the new mapping covers; a mapping is never read past the length it was asked for.
+After the flip the store maps each grown pack again; once a batch's packs are mapped, each spot
+is retargeted to its pack with one swap and the segments' chunks are retired. A mapping is never
+read past the length it was asked for.
 
 ## Opening (#686)
 
@@ -219,17 +226,18 @@ leaves, warm or hot, must read element by element in place (`columns::reads_in_p
 ## Data-oriented (plan/design/data.md)
 
 - Per-record flags (checked, read and made this period and the one before, compression tried)
-  are bit columns indexed by the record's row (its index slot, or its number in the delta), not
-  sets of keys: a period's turn is a move of one column into the other. The columns are atomic
-  words, sized when a row is made, so a read takes no lock, and a flag already set is only
-  loaded, so a record read again writes no shared cache line.
+  are bits in words beside each table's slots (the index's and the delta's), not sets of keys:
+  a period's turn is a move of one column into the other. A flag is set with one relaxed
+  `fetch_or` only when not set, so a read takes no lock, and a record read again writes no
+  shared cache line.
 - Maps on keys and content IDs (the delta, files of their own, fetches) index by the BLAKE3
   hash's first eight bytes: a lookup hashes nothing.
 - The index's control column is the dense array probing runs over; the plan's row asks for keys
   and places in separate arrays, but a hit needs both, so they share one 64-byte row: one miss a
   hit, not two.
 - Settling batches by kind: one compressor and dictionary a kind, records in pack order.
-- Size budgets are const-asserted: `Key` 32 bytes, `Loc` 32, a delta entry 48, an index row 64,
+- Size budgets are const-asserted: `Key` 32 bytes, `Loc` 32 (a place in the delta and the
+  index), an index row 64,
   the head's fixed part 72 and a pack entry 32.
 - Column codecs (frame of reference, run lengths, deltas over a column) are format's, reached
   through `Columns`; the store keeps opaque values as before, raw or zstd.

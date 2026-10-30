@@ -14,6 +14,7 @@ use hir_def::{
     signatures::{FnFlags, FunctionSignature},
 };
 use hir_ty::{
+    db::HirDatabase,
     effects::{
         body_constness, const_call_error, const_param_env, fn_is_const, impl_is_const,
         trait_is_const,
@@ -60,7 +61,7 @@ impl<'db> Checker<'_, 'db> {
                 return;
             }
             Some(TyKind::FnDef(callee, fn_args)) => match callee.0 {
-                CallableDefId::FunctionId(callee) => (callee, fn_args),
+                CallableDefId::FunctionId(callee) => (callee, fn_args.skip_binder()),
                 _ => return,
             },
             _ => return,
@@ -195,7 +196,7 @@ impl<'db> Checker<'_, 'db> {
             it if it == lang.TryTraitFromOutput => Desugaring::TryBlockFromOutput,
             _ => return None,
         };
-        let source_map = hir_def::expr_store::Body::with_source_map(self.db, self.def).1;
+        let source_map = &hir_def::expr_store::Body::with_source_map(self.db, self.def).1;
         let (Ok(call), Ok(callee)) = (source_map.expr_syntax(expr), source_map.expr_syntax(path))
         else {
             return None;

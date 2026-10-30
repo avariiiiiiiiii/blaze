@@ -51,6 +51,16 @@ impl Lower<'_> {
                     }
                 }
             }
+            ra::Type::UnsafeBinderType(t) => {
+                let generic_params: ThinVec<ast::GenericParam> = t
+                    .generic_param_list()
+                    .map(|l| l.generic_params().map(|g| self.generic_param(g)).collect())
+                    .unwrap_or_default();
+                ast::TyKind::UnsafeBinder(Box::new(ast::UnsafeBinderTy {
+                    generic_params,
+                    inner_ty: self.opt_ty(t.ty(), span),
+                }))
+            }
             ra::Type::InferType(_) => ast::TyKind::Infer,
             ra::Type::MacroType(t) => match t.macro_call() {
                 Some(mc) => ast::TyKind::MacCall(self.mac_call(mc)),

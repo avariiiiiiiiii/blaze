@@ -4,6 +4,8 @@
 //!
 //! This test case is intended to simulate a (very simplified) version of a real dataflow analysis
 //! using fixpoint iteration.
+
+#![forbid(unsafe_code)]
 use std::collections::BTreeSet;
 use std::iter::IntoIterator;
 

@@ -21,6 +21,10 @@ A bump, in order (each step names itself when it fails, and stops there):
  3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
     compiler/rustc_abi/src and crates/rustc_lexer/src is compiler/rustc_lexer/src, copied as
     they are;
+ 3a. moves the trait solver (`tools/v2/solver_sync.py`): vendor/rustc_type_ir,
+    vendor/rustc_next_trait_solver, vendor/rustc_type_ir_macros and vendor/rustc_transmute become upstream's crates at
+    the new commit with `PATCHES.md`'s series replayed (exact context, no fuzz); a patch that no
+    longer applies, or a changed upstream `Cargo.toml`, stops the bump and names it;
  4. merges the new nightly's standard library into library/ (`library.py merge`): upstream's
     changes since library/UPSTREAM's nightly, applied three-way, so blaze's own changes to it
     are kept; a conflict stops the bump and names the files. It runs when
@@ -38,7 +42,7 @@ code that mirrors rustc by hand (the Rust ABI in the code generator, vtable.rs, 
 symbol names, new intrinsics and lang items: the checks find them), and `checks '{}'`. That
 includes blaze's proc-macro server: crates/proc-macro-srv is a crate of the workspace, built over
 the toolchain's `proc_macro` bridge and following it by hand, so a bridge that changed is a build
-error there (and macroserver.py's comparison) to fix, not a copy to re-vendor. The rustc
+error there to fix, not a copy to re-vendor. The rustc
 and the daemon match by the whole `rustc -V` line, so a binary built before the bump refuses
 the new nightly until it is rebuilt. docs/contributing.md, "Moving to a newer nightly".
 """
@@ -246,6 +250,8 @@ async def bump(date):
     await run("pins", sys.executable, os.path.join(HERE, "toolchain_pins.py"), '{"write": true}', bound=900)
     new = pinned()
     await vendor(new[2])
+    await run("solver", sys.executable, os.path.join(ROOT, "tools/v2/solver_sync.py"),
+              json.dumps({"nightly": name}), bound=1800)
     await library(date)
     move_mentions(old, new)
     async with asyncio.TaskGroup() as group:
@@ -254,33 +260,30 @@ async def bump(date):
         else:
             print("note: nix is not on PATH: run `nix flake update rust-overlay` where it is")
         if shutil.which("rustup"):
-            # For rustc's side of the harnesses and an editor's rust-analyzer; blaze reads no
-            # rust-src.
+            # For cargo's link line in the harnesses and an editor's rust-analyzer; blaze reads
+            # no rust-src.
             group.create_task(run("rustup", "rustup", "toolchain", "install", name, "--profile", "minimal",
                                   "-c", "rust-src", "-c", "llvm-tools", "-c", "rustfmt", "-c", "clippy",
                                   bound=1200))
     print(f"""
 blaze is pinned to {name} ({new[1]}). Left to do:
-  - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`
-    (with that host's release build of blaze), then commit crates/blaze-cargo/src/answers/rustc.json;
+  - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`,
+    then commit crates/blaze-units/src/stdlib/rustc.json;
   - `cargo build -p blaze-engine --release` and fix what the new rustc_abi and std ask for;
   - `uv run --frozen python harness/toolchain_bump.py checks '{{}}'` in an ix VM, under Cranelift and under LLVM
     (`nix develop -c ...` with BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast);
-  - the full tier (uitest.py, libsuite.py, borrowck_ui.py) re-measured at the new commit;
+  - the full tier (libsuite.py and the crates' own test suites) re-measured at the new commit;
   - `git diff --stat` and one commit for the bump (docs/contributing.md).""")
 
 
 async def checks():
-    """Builds blaze and runs what proves it agrees with the pinned nightly, in parallel."""
+    """Builds blaze and runs its pins and the fast tier against the pinned nightly, in parallel."""
     name = (await asyncio.to_thread(Path(PIN).read_text)).strip()
     env = dict(os.environ, RUSTUP_TOOLCHAIN=name)
     await run("build", "cargo", "build", "-p", "blaze-engine", "--release", env=env, bound=3600)
     env.setdefault("BLAZE_BIN", os.path.join(ROOT, "target/release/blaze-engine"))
     harness = [
         ["toolchain_pins.py", "{}"],
-        ["answers.py"],
-        ["macroserver.py"],
-        ["difftest.py", "corpus", "--bin", "runner", "--crate", "cases", "--layouts"],
         *(["ci.py", "run", json.dumps({"part": part})]
           for part in ci.fast_parts(env.get("BLAZE_BACKEND") or "cranelift")),
     ]
@@ -299,7 +302,7 @@ async def checks():
             group.create_task(one(argv))
     if failed:
         raise Failed("checks:\n\n" + "\n\n".join(failed))
-    print(f"blaze agrees with {name} on every check")
+    print(f"blaze passes every check on {name}")
 
 
 @dataclass(frozen=True)

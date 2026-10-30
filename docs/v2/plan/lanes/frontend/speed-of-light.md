@@ -262,9 +262,15 @@ so every later read is in bounds. A symbol is about 12 bytes of text, a 4-byte s
 - **What stands in the way.**
   1. The second probe for new symbols. One probe would need the mapped index to take inserts:
      copying it on the first one is O(index), which costs more.
-  2. The lexer's text is hashed again, as frontend-tokens' section 3 says. The lexer carrying
-     `value_hash` of each identifier (one more multiply-rotate a word while it reads the bytes
-     anyway) removes that half. Owner: frontend-image, with frontend-tokens' lexer.
+  2. The lexer's text is hashed again, as frontend-tokens' section 3 says. For text lexed into
+     token trees (`syntax_bridge::parse_to_token_tree*`) this is gone:
+     `LexedStr::new_hashed` hashes each name while it reads the bytes, and
+     `Symbol::intern_hashed` takes that hash. A compiled-in name (the declared symbols and the
+     most frequent names of `library/` and `harness/`) is a lookup in a perfect hash keyed by
+     the same hash, with no probe of the table
+     ([simd-lexer's speed of light](../simd-lexer/speed-of-light.md#hashing-names-for-the-interner-lexedstrnew_hashed)).
+     Lowering from the flat syntax tree still hashes each name. Owner: frontend-image, with
+     frontend-tokens' lexer.
 
 ### 5. Writing an image (`Builder::finish_on`, `intern::write_symbols`)
 
@@ -483,6 +489,10 @@ the changed ones, as two runs, and each changed item's rows.
   attribute is cloned: its `Box<AttrInput>` is an allocation, a copy of its literal or token
   tree, and a free, about 150 cycles. \(150A\) = 150 000 cycles, so the total is **about 45 µs,
   about 13% of the bound with shared attributes**.
+- **Applied (10-30, counted, not built):** `Attr::input` is `Option<triomphe::Arc<AttrInput>>`
+  (`hir-expand/src/attrs.rs`), so cloning an attribute is one reference count: the fill's
+  10 000 cycles plus \(A\) counts at about 15 cycles, about 25 000 cycles, **about 7 µs, about
+  85%**.
 - **In the way, and what removes it.**
   1. `Attr::input` is a `Box`. The request is in `v2/requests/db-expand.md` ("`Attr::input`
      shared, `Option<Arc<AttrInput>>`"). My side is ready: inputs are built with `.into()`.
@@ -496,9 +506,10 @@ the changed ones, as two runs, and each changed item's rows.
 Against a whole-file lowering on every edit (`lower_whole`: 29 µs today, about 11 µs at its
 bound by speed-hir-sol-items' count, then salsa comparing the equal tree to backdate it, about
 10 µs): a keystroke in a body is about 6 µs here, with the span slices applied, and lowers
-nothing; with the prefix and suffix placed as runs it is about 3 µs. A signature edit is
-6 + 0.35 + 45 µs today, worse than `lower_whole` until `Attr::input` is shared. Then it is
-about 13 µs, and about 6 µs with the runs placed and the attributes kept as shared slices.
+nothing; with the prefix and suffix placed as runs it is about 3 µs. A signature edit was
+6 + 0.35 + 45 µs, worse than `lower_whole` until `Attr::input` was shared. Now it is
+6 + 0.35 + 7, about 13 µs, and about 6 µs with the runs placed and the attributes kept as
+shared slices.
 
 Cold, a file is lowered whole (`lower_whole`) in one pass and keys nothing, so a file never
 edited (every dependency) never pays for keys. Its first edit lowers it whole again and keys
@@ -516,13 +527,17 @@ a body edit (most keystrokes) and, in brackets, one that changes an item's signa
 | Stage | Bound | Before | Now | With the removals |
 | --- | --- | --- | --- | --- |
 | edit | 0.9 µs | 4 µs | 1 µs | 1 µs |
-| splice | 3.5 µs | 170 µs | 170 µs | 40 µs, then under 1 µs shared |
+| splice | 3.5 µs | 170 µs | 40 µs (copy in runs, stage 3 step 1) | under 1 µs shared |
 | changed items (4) | 2 µs | 260 µs | 6 µs | 3 µs |
 | changed item lowered (5) | 0 (0.3 µs) | 0.9 µs | 0 (0.35 µs) | 0 (0.35 µs) |
-| assemble (6) | 0 (6 µs) | 45 µs | 0 (45 µs) | 0 (7 µs, then 2 µs) |
-| **total** | **6 µs (13 µs)** | **480 µs** | **177 µs (222 µs)** | **45 µs (51 µs), then 5 µs (7 µs) shared** |
+| assemble (6) | 0 (6 µs) | 45 µs | 0 (7 µs, `Attr::input` shared) | 0 (2 µs, attributes as shared slices) |
+| **total** | **6 µs (13 µs)** | **480 µs** | **47 µs (54 µs)** | **5 µs (7 µs), with the splice shared and attributes as slices** |
 
-The splice is the largest term left and is format's (stage 3). Nothing has been measured.
+The splice is the largest term left and is format's (stage 3). `Now` counts step 1 as applied
+(`FlatTree::splice_all` copies the arrays in runs and patches what the edit moves), about 7.8×
+the bound for a body edit. Step 2, sharing the unchanged items under a spine, is a layout change
+of the flat tree and its persisted form, for format and Andrew to decide. Nothing has been
+measured.
 `proof`'s budgets time each row once things compile.
 
 ## frontend-tree: borrowed views over the flat tree (frontend.md item 16)
@@ -557,10 +572,16 @@ That is about 3 times the bound before its allocations.
 
 **Gap.** `text_range()` on a view recomputes the start from the nearest of every eighth start,
 which reads up to 15 words: about 10 cycles, all L1 hits. A walk that asks every element's range
-pays that per element, about 10 times the walk itself. The fix is a walk that carries the
-running offset, so each element's start is one add (`descendants_with_ranges`). It is
-straightforward and goes in before callers that need every range move over. Until then, that
-use is at about 10 times the bound, not within 10%.
+pays that per element, about 10 times the walk itself. `Node::descendants_with_ranges`
+(sol-all, 2026-10-30) carries the running offset instead: a token's range is one add, and a
+node's end is `FlatTree::node_end`, a fold over its own words when its subtree ends in the same
+block of eight, else a kept start and up to seven lengths. Little over half the elements are
+tokens, so that is about 1 cycle a token and about 2.5 a node, **about 1.7 cycles an element,
+1.7× the bare walk** (estimated by count, not measured), against about 10× before. Its test
+checks every element's range against `text_range` from every node of 300 random trees with lazy
+nodes. What removes the rest: a node's end is the start of the element after its subtree, which
+an in-order walk reaches anyway, so a walk that gives each node's range at its leave event
+(`preorder_with_tokens` carrying the offset) is one add an element, at the bound.
 
 ### 2. Navigation (`parent`, `children`, siblings)
 

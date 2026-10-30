@@ -17,17 +17,28 @@ copies. Its children's notes, with each part's speed of light, are in
 |---|---|---|
 | bit sets, bit matrices | `blaze-ids` | `blaze_ids::bits` |
 | radix sort | `blaze-radix`, re-exported as `blaze_ids::radix` (already the one sort; it stays its own crate because `blaze-core` and `blaze-graph` use it without `blake3`) | `blaze_radix` |
-| CRC32C and other checksums, seeded test RNGs | `blaze-ids` | `blaze_ids::crc32c`, `blaze_ids::rng` |
+| CRC32C and other checksums | `blaze-ids` | `blaze_ids::crc32c` |
+| seeded RNGs (SplitMix64) | `blaze-rng`, re-exported as `blaze_ids::rng` (its own crate, no dependencies, because `blaze-core` and `blaze-check` sit below `blaze-ids`) | `blaze_rng` |
 | LEB128 and varints | `blaze-format` | `blaze_format::leb` |
+| little-endian integers at an offset (`u32_at` and friends, checked and panicking) | `blaze-bytes` (no dependencies, so the crates below `blaze-format` use it too) | `blaze_bytes::le` |
 | timing wheels | `blaze-core` | `blaze_core::wheel` |
 | file mapping | `blaze-core` | `blaze_core::fs` (its `Mapped`) |
 | object pools, arenas, `align_up` and friends | `blaze-mem` | `blaze_mem::{pool, arena, align}` |
 | interners and their hash-table probes | `intern` | `intern` |
 | edit distance and other small text helpers | `stdx` | `stdx::edit_distance` |
+| a panic payload's text | `stdx` | `stdx::panic_text` (each caller keeps its own fallback) |
+| frame vectors collected from an iterator | `blaze-mem` | `blaze_mem::frame::collect` |
+| an integer in decimal with no allocation | `blaze-core` | `blaze_core::decimal` |
+| bytes as lossy UTF-8 into a kept `String` | `blaze-core` | `blaze_core::utf8::push_lossy` |
+| a column written into a `blaze-format` buffer and its `Slice` | `blaze-format` | `blaze_format::Placed` |
+| the thread pool (a worker per CPU, work stealing) | `blaze-graph` | `blaze_graph::pool::Pool` (`stdx::thread::Pool` is gone) |
+| warm process pools (proc-macro servers, test fork servers) | `blaze-usercode` | `blaze_usercode::pool::Pool` |
+| work queues | none shared: each differs on purpose | `blaze-graph` `exec.rs` (a per-subsystem list in a slab), `blaze-usercode` `test/queue.rs` (the sans-IO test queue), `hir` `check/bodies.rs` (a lock-free claim ring), `blaze-macro-wasm` (a ticket lock), `blaze-dbsp` `Worklist` (single-threaded) |
+| deadline timers | `blaze-core` | `blaze_core::wheel` (`hir-ty-codegen/watch.rs`' and blaze-fmt's `Timer`s time spans, not deadlines) |
+| editions | none shared: three value sets | `edition` (the language's, `repr(u8)`), `blaze-manifest` `features.rs` (cargo's, with `future`), blaze-fmt (rustfmt's config values) |
 
-Thread pools (`stdx`, `blaze-graph`) and process pools (`proc-macro-api`, `blaze-usercode`)
-are not object pools: they hold running threads or children, not memory, and are compared
-only with each other.
+Thread pools and process pools are not object pools: they hold running threads or children,
+not memory, and are compared only with each other.
 
 ## Rules for every part
 

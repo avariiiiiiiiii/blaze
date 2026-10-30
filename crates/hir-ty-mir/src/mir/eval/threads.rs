@@ -307,7 +307,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let yielded = mem::take(&mut self.yielded);
         let mut runnable = self.runnable();
         if yielded && runnable.len() > 1 {
-            runnable.retain(|&it| it != self.thread);
+            runnable.retain(|it| *it != self.thread);
         }
         let next = self.machine.schedule(self.thread, &runnable)?;
         if next == self.thread {

@@ -3525,21 +3525,16 @@ impl<'db> ModCollector<'_, 'db> {
             },
         };
 
-        // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. The
-        // collector runs inside the def-map query (`crate_local_def_map`/`block_def_map`), and the
-        // id goes only into the `DefMap` it builds (`modules`, the parent's children, the scope),
-        // which salsa invalidates with that query. Stored elsewhere, it could name a freed salsa
-        // slot in a later revision.
-        let module = unsafe {
-            crate::ModuleIdLt::new(
-                self.def_collector.db,
-                self.def_collector.def_map.krate,
-                self.def_collector.def_map.block_id(),
-                Some(self.module_id),
-                name,
-            )
-            .to_static()
-        };
+        // The id goes only into the `DefMap` this def-map query builds, so it lives as long as the
+        // query's result.
+        let module = crate::ModuleIdLt::new(
+            self.def_collector.db,
+            self.def_collector.def_map.krate,
+            self.def_collector.def_map.block_id(),
+            Some(self.module_id),
+            name,
+        )
+        .to_static();
         let def_map = &mut self.def_collector.def_map;
         let modules = def_map.modules.building();
         let mut data = ModuleData::new(origin, vis, Some(self.module_id));

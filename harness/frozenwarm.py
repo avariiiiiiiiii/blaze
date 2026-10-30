@@ -9,7 +9,7 @@ A program calls those items and both exported macros, and an item of a second de
 its build script writes into `OUT_DIR`. blaze builds it, with nothing of rustc's, on one store:
 
   - cold: the def maps are frozen and written;
-  - warm, twice: they are served, and the program is built and prints what cargo's does
+  - warm, twice: they are served, and the program is built and prints what its source says
     (a def map served before the files it was read from were loaded broke on its
     `macro_rules!`, "Can't find ast id MacroRules");
   - warm with `BLAZE_FROZEN=check` and with `=verify`: what was frozen is what resolving finds,
@@ -18,7 +18,7 @@ its build script writes into `OUT_DIR`. blaze builds it, with nothing of rustc's
     own target directory, with the first's put away: it is served the def maps of as many
     crates as the first, read from what its own build script wrote (#105);
   - warm after `items.rs.data` changed at the same path: the frozen def map is not served, and
-    the program prints what cargo's new one does.
+    the program prints what the new source says.
 
     python3 frozenwarm.py
 """
@@ -26,7 +26,7 @@ import os, re, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from allblaze import linked, outcome, blaze, run
+from allblaze import linked, outcome, blaze
 from storelib import scratch
 
 LIB = 'include!("../data/mod.rs");\n'
@@ -96,11 +96,10 @@ def main():
         write(os.path.join(root, "src/main.rs"), MAIN)
         subprocess.run(["cargo", "generate-lockfile", "-q"], cwd=root, check=True)
         store = {"BLAZE_CACHE": os.path.join(work, "store")}
-        target = os.path.join(root, "target")
 
-        def cargo_says():
-            run(["cargo", "build", "-q", "--target-dir", target], root, "cargo build")
-            return outcome(os.path.join(target, "debug/app"), [], root)
+        def source_says(made):
+            """What the program prints with `made()` giving `made`."""
+            return 0, f"{made + 35} 6 frozen!\n5 11\n", ""
 
         lines = []
 
@@ -120,12 +119,12 @@ def main():
                 raise SystemExit(f"FAIL: {what}: {refused} frozen parts should not have fit: {frozen!r}")
             got = outcome(binary, [], at)
             if got != want:
-                raise SystemExit(f"FAIL: {what}: the program differs from cargo's:\n"
-                                 f"cargo:  {want}\nblaze: {got}")
+                raise SystemExit(f"FAIL: {what}: the program differs from what its source says:\n"
+                                 f"source: {want}\nblaze:  {got}")
             lines.append(f"{what}: {took:.2f} s, {frozen}")
             return int(re.search(r"def maps of (\d+)", frozen)[1])
 
-        want = cargo_says()
+        want = source_says(7)
         build("cold", served=False)
         served = build("warm", served=True)
         build("warm again", served=True)
@@ -143,7 +142,7 @@ def main():
         if elsewhere != served:
             raise SystemExit(f"FAIL: another checkout was served the def maps of {elsewhere} crates, the first of {served}")
         write(os.path.join(dep, "data/items.rs.data"), ITEMS.replace("made_by!(made, 7)", "made_by!(made, 8)"))
-        want = cargo_says()
+        want = source_says(8)
         build("warm, the included file changed", served=True, refused=1)
         print("\n".join(lines))
         print("PASS: frozen def maps of a crate whose items are included, served warm as resolved")

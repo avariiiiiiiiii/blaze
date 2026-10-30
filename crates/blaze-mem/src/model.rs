@@ -97,6 +97,39 @@ fn model_a_stale_top_does_not_link_a_popped_next() {
     });
 }
 
+/// A pop of up to three, racing a thread that pops two and pushes them back as one chain:
+/// the walk of a stale chain never commits, so every item is on the stack or held once.
+#[test]
+fn model_a_pop_of_some_racing_a_chain_push_holds_each_item_once() {
+    model(|| {
+        let links = table(4);
+        let stack = Arc::new(Stack::new());
+        stack.push_all(&[0, 1, 2, 3], &*links);
+        let popper = {
+            let (stack, links) = (Arc::clone(&stack), Arc::clone(&links));
+            thread::spawn(move || {
+                let mut out = [NONE; 3];
+                let n = stack.pop_some(&*links, &mut out);
+                out[..n].to_vec()
+            })
+        };
+        let shuffler = {
+            let (stack, links) = (Arc::clone(&stack), Arc::clone(&links));
+            thread::spawn(move || {
+                let first = stack.pop(&*links);
+                let second = stack.pop(&*links);
+                let back: Vec<u32> = second.into_iter().chain(first).collect();
+                stack.push_all(&back, &*links);
+            })
+        };
+        let mut held = popper.join().unwrap_or_default();
+        shuffler.join().unwrap_or(());
+        held.extend(drain(&stack, &links));
+        held.sort_unstable();
+        assert_eq!(held, vec![0, 1, 2, 3], "each item is on the stack or held by one thread");
+    });
+}
+
 /// What a pusher wrote before pushing (a batch's contents) is seen by the thread that pops it.
 #[test]
 fn model_a_pop_sees_what_its_pusher_wrote() {

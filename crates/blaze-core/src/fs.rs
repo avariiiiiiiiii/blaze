@@ -87,15 +87,27 @@ pub(crate) fn make_parent(path: &Path) -> io::Result<()> {
     }
 }
 
+/// What `make` makes at `path`, asked again once `path`'s directories are made where it
+/// failed for want of one: they are looked up only when missing, not before every call.
+pub(crate) fn making_parent<T>(path: &Path, mut make: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    match make() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            make_parent(path)?;
+            make()
+        }
+        other => other,
+    }
+}
+
 /// `bytes` as the whole of `path`: written to a temporary file next to it, synced, renamed over
 /// it, and the directory synced, so the new name survives a crash.
 #[cfg(unix)]
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    make_parent(path)?;
     blaze_mem::scratch::with_path(|temporary| {
         temporary_into(path, temporary);
         let written = (|| {
-            let mut file = OpenOptions::new().write(true).create_new(true).open(&*temporary)?;
+            let open = || OpenOptions::new().write(true).create_new(true).open(&*temporary);
+            let mut file = making_parent(path, open)?;
             file.write_all(bytes)?;
             file.sync_all()
         })();
@@ -121,8 +133,7 @@ pub(crate) fn commit_rename(from: &Path, to: &Path) -> io::Result<()> {
 /// rename fails.
 #[cfg(unix)]
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
-    make_parent(to)?;
-    std::fs::rename(from, to)?;
+    making_parent(to, || std::fs::rename(from, to))?;
     sync_dir_of(to)?;
     match (from.parent(), to.parent()) {
         (Some(was), Some(is)) if was != is => sync_dir_of(from),
@@ -253,11 +264,15 @@ pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Met
     Ok(found)
 }
 
+/// `path` gone, a file or symbolic link unlinked, an empty directory removed; one call for a
+/// file, the directory looked up only once its unlink fails.
 pub(crate) fn remove(path: &Path) -> io::Result<()> {
-    let removed = match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => std::fs::remove_dir(path),
-        Ok(_) => std::fs::remove_file(path),
-        Err(error) => Err(error),
+    let removed = match std::fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir(path),
+            _ => Err(error),
+        },
+        other => other,
     };
     match removed {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -266,15 +281,13 @@ pub(crate) fn remove(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn link(from: &Path, to: &Path) -> io::Result<()> {
-    make_parent(to)?;
-    std::fs::hard_link(from, to)
+    making_parent(to, || std::fs::hard_link(from, to))
 }
 
 /// `to` made sharing `from`'s blocks, or an error that says the file system cannot.
 #[cfg(unix)]
 pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
-    make_parent(to)?;
-    clone_file(from, to).map_err(|error| match error.raw_os_error() {
+    making_parent(to, || clone_file(from, to)).map_err(|error| match error.raw_os_error() {
         Some(code) if refuses_sharing(code) => io::Error::new(
             io::ErrorKind::Unsupported,
             // alloc: an error path.
@@ -360,9 +373,17 @@ fn stamp_at(dir: std::os::fd::BorrowedFd<'_>, name: &std::ffi::CStr) -> Stamp {
 #[cfg(unix)]
 const SWEEP_CHUNK: usize = 2048;
 
+/// How many threads stamp `names` names: one per [`SWEEP_CHUNK`] of them, at most one per core.
+/// A cached `fstatat` is some 0.4 µs, so a thread spawned for 2,048 of them (some 0.8 ms) costs
+/// it a few percent.
+#[cfg(unix)]
+fn sweepers(names: usize, cores: usize) -> usize {
+    names.div_ceil(SWEEP_CHUNK).clamp(1, cores.max(1))
+}
+
 /// Every name's stamp, in order: [`crate::Effect::Stamp`] where the system has no batched
-/// stat, as `fstatat`s relative to the root on up to 8 threads at once. Fails only when the
-/// root cannot be opened.
+/// stat, as `fstatat`s relative to the root on [`sweepers`] threads at once. Fails only when
+/// the root cannot be opened.
 #[cfg(unix)]
 pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
     use std::os::fd::AsFd as _;
@@ -370,8 +391,8 @@ pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
     let dir = dir.as_fd();
     // alloc: the batch's payload.
     let mut out = vec![Stamp::GONE; names.len()];
-    let threads = std::thread::available_parallelism().map_or(1, |it| it.get().min(8));
-    if names.len() <= SWEEP_CHUNK || threads == 1 {
+    let threads = sweepers(names.len(), std::thread::available_parallelism().map_or(1, |it| it.get()));
+    if threads == 1 {
         for (at, stamp) in out.iter_mut().enumerate() {
             *stamp = stamp_at(dir, names.c_str(at));
         }
@@ -416,4 +437,107 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn clone_file(_: &Path, _: &Path) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "no call that shares blocks on this system"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("blaze-fs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A write, rename or link whose directories are missing makes them and is done; one
+    /// whose directory is there is done as asked, and one that fails for another reason
+    /// fails as it would have, its directories made all the same.
+    #[test]
+    fn missing_directories_are_made_where_a_call_needs_them() {
+        let root = dir("parents");
+        write_atomically(&root.join("a/b/whole"), b"whole").unwrap();
+        assert_eq!(std::fs::read(root.join("a/b/whole")).unwrap(), b"whole");
+        write_atomically(&root.join("a/b/whole"), b"again").unwrap();
+        assert_eq!(std::fs::read(root.join("a/b/whole")).unwrap(), b"again");
+        rename(&root.join("a/b/whole"), &root.join("c/d/moved")).unwrap();
+        assert_eq!(std::fs::read(root.join("c/d/moved")).unwrap(), b"again");
+        link(&root.join("c/d/moved"), &root.join("e/linked")).unwrap();
+        assert_eq!(std::fs::read(root.join("e/linked")).unwrap(), b"again");
+        let missing = rename(&root.join("nothing"), &root.join("f/to")).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(root.join("f").is_dir());
+        let appended = root.join("g/h");
+        let opened = making_parent(&appended, || OpenOptions::new().create(true).append(true).open(&appended));
+        std::io::Write::write_all(&mut opened.unwrap(), b"line").unwrap();
+        assert_eq!(std::fs::read(root.join("g/h")).unwrap(), b"line");
+        let under_a_file = write_atomically(&root.join("e/linked/under"), b"x").unwrap_err();
+        assert_eq!(under_a_file.raw_os_error(), Some(libc::ENOTDIR));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A remove unlinks a file or symbolic link, removes an empty directory, is done when
+    /// nothing is there, and fails on a directory that is not empty, leaving it.
+    #[test]
+    fn a_remove_takes_files_links_and_empty_directories() {
+        let root = dir("remove");
+        std::fs::write(root.join("file"), b"x").unwrap();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("full/in")).unwrap();
+        std::os::unix::fs::symlink(root.join("full"), root.join("link")).unwrap();
+        for it in ["file", "empty", "link", "missing"] {
+            remove(&root.join(it)).unwrap();
+            assert!(std::fs::symlink_metadata(root.join(it)).is_err(), "{it}");
+        }
+        assert!(remove(&root.join("full")).is_err());
+        assert!(root.join("full/in").is_dir());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A sweep takes a thread per 2,048 names, never more than the cores and never none; the
+    /// chunks the threads take cover every name once.
+    #[test]
+    fn a_sweep_takes_a_thread_per_chunk_up_to_the_cores() {
+        assert_eq!(sweepers(0, 16), 1);
+        assert_eq!(sweepers(SWEEP_CHUNK, 16), 1);
+        assert_eq!(sweepers(SWEEP_CHUNK + 1, 16), 2);
+        assert_eq!(sweepers(50_000, 16), 16);
+        assert_eq!(sweepers(50_000, 64), 50_000usize.div_ceil(SWEEP_CHUNK));
+        assert_eq!(sweepers(50_000, 0), 1);
+        for names in [1, SWEEP_CHUNK, SWEEP_CHUNK + 1, 50_000, 1 << 20] {
+            for cores in [1, 3, 8, 16, 64, 256] {
+                let threads = sweepers(names, cores);
+                let each = names.div_ceil(threads);
+                assert!(threads <= cores.max(1) && (threads - 1) * each < names, "{names} {cores}");
+            }
+        }
+    }
+
+    /// A sweep over more names than one thread takes gives each name its own stamp, in order:
+    /// the files are there, the rest gone.
+    #[test]
+    fn a_sweep_on_many_threads_keeps_each_stamp_in_its_place() {
+        use std::os::fd::AsFd as _;
+        let root = dir("sweep");
+        let count = 3 * SWEEP_CHUNK + 5;
+        let mut names = Names::default();
+        for at in 0..count {
+            let name = format!("f{at}");
+            if at % 3 == 0 {
+                std::fs::write(root.join(&name), vec![b'x'; at % 7]).unwrap();
+            }
+            assert!(names.push_str(&name));
+        }
+        let swept = stamps(&root, &names).unwrap();
+        assert_eq!(swept.len(), count);
+        let one = open_dir(&root).unwrap();
+        for (at, stamp) in swept.iter().enumerate() {
+            assert_eq!(*stamp, stamp_at(one.as_fd(), names.c_str(at)), "name {at}");
+            match at % 3 {
+                0 => assert_eq!(stamp.size, (at % 7) as u64, "name {at}"),
+                _ => assert_eq!(*stamp, Stamp::GONE, "name {at}"),
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

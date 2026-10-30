@@ -125,7 +125,7 @@ impl fmt::Display for ImageError {
 impl std::error::Error for ImageError {}
 
 /// What [`Vfs::restore`] did with the image it was given.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
 pub enum ImageUse {
     /// None was given: the journal was loaded alone.
     #[default]

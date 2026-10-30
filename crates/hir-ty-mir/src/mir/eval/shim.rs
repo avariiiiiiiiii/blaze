@@ -21,15 +21,15 @@ use crate::{
     },
     mir::MirLowerError,
     mir::eval::{
-        Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, Interval,
-        IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
+        Address, AdtId, Evaluator, FunctionId, GenericArgs, HasModule, Interned, InternedLayout,
+        Interval, IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
         MirEvalError, MirSpan, Mutability, Origin, OwnedBytes, Result, Then, Ty, TyKind, TypeIdOf,
         VTableOfBytes,
         VariantId, from_bytes, not_supported, pad16, try_const_usize,
         machine::{Access, AtomicOrd, Machine, RetagMode, Shadow},
     },
     mir::location::{source_location_in_file, source_path, track_caller},
-    next_solver::Region,
+    next_solver::{Region, RegionExt},
 };
 
 mod arch;
@@ -239,7 +239,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn exec_clone_for_fields(
         &mut self,
         ty_iter: impl Iterator<Item = Ty<'db>>,
-        layout: Arc<Layout>,
+        layout: Interned<'static, InternedLayout>,
         addr: Address,
         def: FunctionId,
         locals: &Locals<'db>,

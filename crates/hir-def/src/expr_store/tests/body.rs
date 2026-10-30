@@ -402,6 +402,39 @@ fn every_variant_is_lowered() {
     assert!(expression_without_semi, "no expression statement without `;`");
 }
 
+/// The kind-only reads give what decoding gives: each expression's kind byte is its decoded
+/// variant's, and the `let` rows are the `let`s of the store's blocks, each once; neither
+/// allocates.
+#[test]
+fn kind_reads_are_the_decoded_rows() {
+    let (db, def) = lower(EVERY_VARIANT);
+    let store = &Body::of(&db, def).store;
+    for (id, expr) in store.exprs() {
+        assert_eq!(store.expr_kind(id), crate::hir::ExprKind::of(&expr), "{id:?}");
+    }
+    let mut decoded = Vec::new();
+    for (_, expr) in store.exprs() {
+        let Expr::Block { statements, .. } = expr else { continue };
+        for statement in statements {
+            if let Statement::Let { pat, else_branch, .. } = statement {
+                decoded.push((pat, else_branch.is_some()));
+            }
+        }
+    }
+    let mut read: Vec<_> = store.let_statements().collect();
+    decoded.sort_by_key(|&(pat, _)| pat.into_raw().into_u32());
+    read.sort_by_key(|&(pat, _)| pat.into_raw().into_u32());
+    assert!(read.iter().any(|&(_, has_else)| has_else), "no `let`-`else` in the fixture");
+    assert_eq!(read, decoded);
+    let ids = || (0..store.expr_count() as u32).map(|it| ExprId::from_raw(RawIdx::from_u32(it)));
+    let (kinds, lets) = blaze_alloc_count::assert_at_most(0, "kind-only reads", || {
+        let blocks = ids().filter(|&id| store.expr_kind(id) == crate::hir::ExprKind::Block);
+        (blocks.count(), store.let_statements().count())
+    });
+    assert!(kinds > 0);
+    assert_eq!(lets, decoded.len());
+}
+
 /// `docs/v2/plan/design/data.md`: a HIR expression takes at most 12 bytes of its own columns,
 /// with what it keeps in `extra` and the lists counted apart.
 #[test]
@@ -1145,17 +1178,14 @@ fn ids_are_the_ids_of_the_decoded_nodes() {
     assert_eq!(ExpressionStore::empty().pat_ids().len(), 0);
 }
 
-mod generic_arg_twins {
+mod generic_arg_views {
     use span::Edition;
     use syntax::{
-        AstNode as _, SourceFile, SyntaxNodePtr, ast as tag,
+        SourceFile,
         view::{self as ast, AstNode},
     };
 
-    use crate::expr_store::lower::{
-        hir_assoc_type_binding_to_ast, hir_assoc_type_binding_to_ast_view, hir_generic_arg_to_ast,
-        hir_generic_arg_to_ast_view,
-    };
+    use crate::expr_store::lower::{hir_assoc_type_binding_to_ast_view, hir_generic_arg_to_ast_view};
 
     /// Generic argument lists with every kind of argument: lifetimes (named and elided), types,
     /// consts (literal and block), bindings, bounds and return type notation.
@@ -1170,40 +1200,124 @@ fn f() {
 }
 "#;
 
-    /// Both twins pick the same argument, or both none, at every index of every list, with and
-    /// without a `Self` argument (which takes index 0, so there is no argument 0 to map then).
+    /// Each list of `CODE` in order, with the HIR's arguments (lifetimes, types and consts, not
+    /// bindings) and its bindings (every one with a name and no parameter list; `method(..)` is
+    /// return type notation, not a parameter list).
+    const WANT: &[(&str, &[&str], &[&str])] = &[
+        ("<u32>", &["u32"], &[]),
+        ("::<u32>", &["u32"], &[]),
+        ("<'a, K, V, 3, { N + 1 }>", &["'a", "K", "V", "3", "{ N + 1 }"], &[]),
+        (
+            "<Item = u32, Assoc<T> = u8, method(..): Send, Bounded: Copy>",
+            &[],
+            &["Item = u32", "Assoc<T> = u8", "method(..): Send", "Bounded: Copy"],
+        ),
+        ("<T>", &["T"], &[]),
+        ("<dyn Fn(u8) -> u8 + Send>", &["dyn Fn(u8) -> u8 + Send"], &[]),
+        (
+            "<'_, T, Assoc = (), 'static, [u8; 2]>",
+            &["'_", "T", "'static", "[u8; 2]"],
+            &["Assoc = ()"],
+        ),
+        ("::<'static, T, 1, Item = ()>", &["'static", "T", "1"], &["Item = ()"]),
+    ];
+
+    /// Each index of each list maps to the argument and binding `WANT` has there, or to none past
+    /// them, with and without a `Self` argument (which takes index 0, so that the HIR's argument
+    /// `idx` is the list's `idx - 1`).
     #[test]
-    fn handle_and_view_twins_agree() {
+    fn hir_indices_map_to_their_syntax() {
         let parse = SourceFile::parse(CODE, Edition::CURRENT);
-        let views: Vec<_> = parse.root().descendants().filter_map(ast::GenericArgList::cast).collect();
-        let handles: Vec<_> =
-            parse.tree().syntax().descendants().filter_map(tag::GenericArgList::cast).collect();
-        assert_eq!(views.len(), handles.len());
-        assert!(views.len() >= 7, "the fixture's lists, found {}", views.len());
-        let (mut args, mut bindings) = (0, 0);
-        for (view, handle) in views.into_iter().zip(&handles) {
-            assert_eq!(ast::ptr(view.syntax()), SyntaxNodePtr::new(handle.syntax()));
-            let len = view.generic_args().count() as u32;
+        let lists: Vec<_> = parse.root().descendants().filter_map(ast::GenericArgList::cast).collect();
+        let texts: Vec<_> = lists.iter().map(|it| it.syntax().text()).collect();
+        assert_eq!(texts, WANT.iter().map(|&(text, ..)| text).collect::<Vec<_>>());
+        for (&list, &(text, args, bindings)) in lists.iter().zip(WANT) {
+            let len = list.generic_args().count() as u32;
             for idx in 0..=len {
-                for has_self_arg in [false, true] {
-                    if has_self_arg && idx == 0 {
-                        continue;
-                    }
-                    let by_view = hir_generic_arg_to_ast_view(view, idx, has_self_arg)
-                        .map(|it| ast::ptr(it.syntax()));
-                    let by_handle = hir_generic_arg_to_ast(handle, idx, has_self_arg)
-                        .map(|it| SyntaxNodePtr::new(it.syntax()));
-                    assert_eq!(by_view, by_handle, "argument {idx} ({has_self_arg}) of `{view}`");
-                    args += usize::from(by_view.is_some());
+                let arg = hir_generic_arg_to_ast_view(list, idx, false).map(|it| it.syntax().text());
+                assert_eq!(arg, args.get(idx as usize).copied(), "argument {idx} of `{text}`");
+                if idx > 0 {
+                    let arg =
+                        hir_generic_arg_to_ast_view(list, idx, true).map(|it| it.syntax().text());
+                    let want = args.get(idx as usize - 1).copied();
+                    assert_eq!(arg, want, "argument {idx} after `Self` of `{text}`");
                 }
-                let by_view =
-                    hir_assoc_type_binding_to_ast_view(view, idx).map(|it| ast::ptr(it.syntax()));
-                let by_handle = hir_assoc_type_binding_to_ast(handle, idx)
-                    .map(|it| SyntaxNodePtr::new(it.syntax()));
-                assert_eq!(by_view, by_handle, "binding {idx} of `{view}`");
-                bindings += usize::from(by_view.is_some());
+                let binding =
+                    hir_assoc_type_binding_to_ast_view(list, idx).map(|it| it.syntax().text());
+                assert_eq!(binding, bindings.get(idx as usize).copied(), "binding {idx} of `{text}`");
             }
         }
-        assert!(args >= 15 && bindings >= 4, "{args} arguments and {bindings} bindings found");
     }
+}
+
+/// hir's and blaze-lints' `def_ast_id` before they called [`DefWithBodyId::erased_ast_id`].
+fn erased_ast_id_reference(
+    db: &TestDB,
+    def: DefWithBodyId,
+) -> (hir_expand::HirFileId, span::ErasedFileAstId) {
+    use crate::Lookup as _;
+
+    fn erased<N: span::AstIdNode>(
+        id: hir_expand::AstId<N>,
+    ) -> (hir_expand::HirFileId, span::ErasedFileAstId) {
+        (id.file_id, id.value.erase())
+    }
+    match def {
+        DefWithBodyId::FunctionId(it) => erased(it.lookup(db).id),
+        DefWithBodyId::ConstId(it) => erased(it.lookup(db).id),
+        DefWithBodyId::StaticId(it) => erased(it.lookup(db).id),
+        DefWithBodyId::VariantId(it) => erased(it.lookup(db).id),
+    }
+}
+
+#[test]
+fn a_bodys_ast_id_is_its_items_as_each_old_copy_gave() {
+    let db = TestDB::with_files(
+        r#"
+fn f() {}
+const C: u8 = 0;
+static S: u8 = 0;
+enum E { A = 1, B }
+macro_rules! m { () => { fn g() {} }; }
+m!();
+"#,
+    );
+    let def_map = crate_def_map(&db, db.fetch_test_crate());
+    let mut defs: Vec<DefWithBodyId> = Vec::new();
+    for (_, module) in def_map.modules(&db) {
+        for decl in module.scope(&db).declarations() {
+            match decl {
+                ModuleDefId::FunctionId(it) => defs.push(it.into()),
+                ModuleDefId::ConstId(it) => defs.push(it.into()),
+                ModuleDefId::StaticId(it) => defs.push(it.into()),
+                ModuleDefId::AdtId(crate::AdtId::EnumId(it)) => {
+                    defs.extend(crate::AdtId::EnumId(it).variants(&db).filter_map(|it| match it {
+                        crate::VariantId::EnumVariantId(it) => Some(DefWithBodyId::from(it)),
+                        _ => None,
+                    }))
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(defs.len(), 6, "{defs:?}");
+    assert!(defs.iter().any(|it| it.erased_ast_id(&db).file_id.macro_file().is_some()));
+    for &def in &defs {
+        let id = def.erased_ast_id(&db);
+        assert_eq!((id.file_id, id.value), erased_ast_id_reference(&db, def), "{def:?}");
+
+        let (body, source_map) = Body::unmoved(&db, def);
+        let (old_body, old_map) = body_maps_reference(&db, def);
+        assert!(std::ptr::eq(body, old_body) && std::ptr::eq(source_map, old_map), "{def:?}");
+        assert!(std::ptr::eq(Body::unmoved_source_map(&db, def), source_map), "{def:?}");
+    }
+}
+
+/// hir's `body_maps` before it called [`Body::unmoved`].
+fn body_maps_reference(db: &TestDB, def: DefWithBodyId) -> (&Body, &BodySourceMap) {
+    let (body, source_map) = match Body::relative(db, def) {
+        Some(it) => it,
+        None => Body::with_source_map(db, def),
+    };
+    (&**body, source_map)
 }

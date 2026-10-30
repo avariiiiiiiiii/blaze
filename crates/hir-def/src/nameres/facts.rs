@@ -7,18 +7,26 @@
 //! macro resolution is per module and round (`macro_step`); the crate's `DefMap` is assembled
 //! from the final round's `ModuleScope` handles.
 
-mod collect;
-mod driver;
-mod env;
+// The round schedule (`driver`, `graph`, the round queries) is the differential reference of
+// the name resolution maintainer (`nameres::delta`), which reuses the rules through `collect`,
+// `env`, `macros`, `ops` and `unit`.
+pub(in crate::nameres) mod collect;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::nameres) mod driver;
+pub(in crate::nameres) mod env;
+#[cfg_attr(not(test), allow(dead_code))]
 mod graph;
 pub(crate) mod impls;
 pub mod kinds;
-mod macros;
-mod ops;
-mod queries;
-mod unit;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::nameres) mod macros;
+pub(in crate::nameres) mod ops;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::nameres) mod queries;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::nameres) mod unit;
 #[cfg(test)]
-mod tests;
+pub(in crate::nameres) mod tests;
 
 use base_db::{Db, Crate};
 use blaze_mem::Frame;
@@ -28,7 +36,18 @@ use crate::{
     ModuleId,
     item_tree::TreeId,
     nameres::{DefMap, LocalDefMap, ModuleData},
+    unstable_features::UnstableFeatures,
 };
+
+impl UnstableFeatures {
+    /// The crate's `#![feature]`s as its collection reads them: the root file's item tree with
+    /// its `cfg_attr`s applied, then the `-Z crate-attr` files. Equal to
+    /// `crate_def_map(db, krate).features()` but never reads the def map, so a proc macro the
+    /// crate calls while its map is being built can read them without a cycle.
+    pub fn of_root(db: &Db, krate: Crate) -> &UnstableFeatures {
+        &queries::crate_data(db, krate).unstable_features
+    }
+}
 
 /// What a query keeps while it runs, in the frame its `frame::task` opened: all of it goes when
 /// the query returns, and what it returns is built from it at its exact size.
@@ -48,7 +67,8 @@ pub(crate) fn set_in<'f, K>(frame: &'f Frame) -> FrameSet<'f, K> {
 
 /// The crate's def map with every scope handed over (`ScopeSlot::Collected`), diagnostics
 /// grouped: what `crate_local_def_map` wraps in a `DefMapPair`. Runs inside that query only, in
-/// its frame.
+/// its frame. The differential reference of the maintained resolution (`nameres::delta`).
+#[cfg(test)]
 pub(super) fn collect_crate(db: &Db, frame: &Frame, krate: Crate) -> (DefMap, LocalDefMap) {
     driver::collect_crate(db, frame, krate)
 }

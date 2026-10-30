@@ -24,6 +24,7 @@ mod meta;
 
 use hir::{HirFileId, InFile, PathResolution};
 use span::Edition;
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     SyntaxKind, TextRange,
     view::{self as ast, AstNode, HasGenericParams, HasName},
@@ -34,7 +35,6 @@ use super::super::{Emitted, Pass, Walk, source_fact};
 use super::{Attr, Owner, Target, checked, lint_at, parsed};
 use crate::{
     cx::{Cx, def_range_view},
-    lints::edit_distance::find_best_match_for_name,
     lower::Phase,
     model::{Applicability, Diag, Span},
 };
@@ -275,7 +275,7 @@ fn unknown<'db>(
     } else {
         // alloc: as above
         let candidates: Vec<&str> = KNOWN.iter().zip(enabled).filter(|(_, on)| **on).map(|((it, _), _)| *it).collect();
-        if let Some(typo) = find_best_match_for_name(&candidates, name, None) {
+        if let Some(typo) = find_best_match_for_name(&candidates, name, None).copied() {
             let message = "an attribute with a similar name exists";
             diag.suggestion_verbose(span, message, typo, Applicability::MachineApplicable);
         }

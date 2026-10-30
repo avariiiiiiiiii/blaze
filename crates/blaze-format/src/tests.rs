@@ -15,6 +15,11 @@ fn plain_records_are_checked_by_their_bounds() {
     const { assert!(!<bool as Record>::PLAIN && !<[bool; 2] as Record>::PLAIN) };
     const { assert!(!<Leaf as Record>::PLAIN && !<Root as Record>::PLAIN) };
     const { assert!(!<Rel<u32> as Record>::PLAIN && !<Slice<u32> as Record>::PLAIN) };
+    const { assert!(<Rel<Leaf> as Record>::SHALLOW_PLAIN && <Slice<Leaf> as Record>::SHALLOW_PLAIN) };
+    const { assert!(<Root as Record>::SHALLOW_PLAIN && <[Rel<Leaf>; 2] as Record>::SHALLOW_PLAIN) };
+    const { assert!(<u32 as Record>::SHALLOW_PLAIN && <crate::RelSpan as Record>::SHALLOW_PLAIN) };
+    const { assert!(!<Leaf as Record>::SHALLOW_PLAIN && !<bool as Record>::SHALLOW_PLAIN) };
+    const { assert!(!<[Leaf; 2] as Record>::SHALLOW_PLAIN && !<Counted as Record>::SHALLOW_PLAIN) };
     let buffer = Aligned::copy_from(&written(1));
     let root = open::<Root>(&buffer).unwrap();
     assert_eq!(root.numbers.get(&buffer), &[1, 2, 3]);
@@ -115,6 +120,96 @@ fn a_buffer_reads_in_place() {
 #[test]
 fn equal_values_are_equal_bytes() {
     assert_eq!(written(1), written(1));
+}
+
+#[test]
+fn a_slice_of_records_is_its_little_endian_bytes() {
+    let words = [1u32, 0x0102_0304, u32::MAX];
+    let le: Vec<u8> = words.iter().flat_map(|it| it.to_le_bytes()).collect();
+    assert_eq!(crate::bytes_of_slice(&words), &le[..]);
+    let spans = [crate::RelSpan { start: 3, len: 4 }];
+    assert_eq!(crate::bytes_of_slice(&spans), &[3, 0, 0, 0, 4, 0, 0, 0]);
+    assert_eq!(crate::bytes_of_slice::<u64>(&[]), &[] as &[u8]);
+}
+
+std::thread_local! {
+    static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn checks() -> usize {
+    CHECKS.with(|it| it.replace(0))
+}
+
+/// A `u32` that counts its checks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+struct Counted(u32);
+
+// SAFETY: a `u32`: no padding, every bit pattern a value; `check` only counts and checks the size.
+unsafe impl Record for Counted {
+    const SCHEMA: crate::SchemaHash = schema("Counted");
+    fn check(bytes: &[u8], _: &[u8]) -> Result<(), FormatError> {
+        CHECKS.with(|it| it.set(it.get() + 1));
+        match bytes.len() == 4 {
+            true => Ok(()),
+            false => Err(FormatError::Invalid { at: 0, what: "not a Counted" }),
+        }
+    }
+}
+
+record! {
+    #[derive(Clone, Copy, Debug)]
+    struct Node: 1 {
+        leaf: Rel<Counted>,
+        more: Slice<Counted>,
+    }
+}
+
+record! {
+    #[derive(Clone, Copy, Debug)]
+    struct Nodes: 1 {
+        nodes: Slice<Node>,
+    }
+}
+
+/// `open` checks each record once; after it, following each reference of the buffer once
+/// checks each record once more, where each `get` used to check all its target reaches again.
+#[test]
+fn a_get_after_open_checks_only_what_it_reaches_directly() {
+    const NODES: usize = 50;
+    let mut out = Writer::new(Nodes::SCHEMA);
+    let parts: Vec<(u64, u64)> = (0..NODES as u32)
+        .map(|n| (out.push(&Counted(n)), out.push_slice(&[Counted(10 * n), Counted(10 * n + 1), Counted(10 * n + 2)])))
+        .collect();
+    let at = out.next::<Node>();
+    let nodes: Vec<Node> = parts
+        .iter()
+        .enumerate()
+        .map(|(n, &(leaf, more))| {
+            let node = at + (n * size_of::<Node>()) as u64;
+            Node {
+                leaf: Rel::between(node + offset_of!(Node, leaf) as u64, leaf),
+                more: Slice::between(node + offset_of!(Node, more) as u64, more, 3),
+            }
+        })
+        .collect();
+    assert_eq!(out.push_slice(&nodes), at);
+    let root_at = out.next::<Nodes>();
+    let root = Nodes { nodes: Slice::between(root_at + offset_of!(Nodes, nodes) as u64, at, NODES) };
+    assert_eq!(out.push(&root), root_at);
+    let buffer = Aligned::copy_from(&out.finish(root_at));
+
+    checks();
+    let root = open::<Nodes>(&buffer).unwrap();
+    assert_eq!(checks(), 4 * NODES, "open checks every Counted once");
+    let nodes = root.nodes.get(&buffer);
+    assert_eq!(checks(), 0, "a slice of records holding only references is followed in O(1)");
+    for (n, node) in nodes.iter().enumerate() {
+        let n = n as u32;
+        assert_eq!(node.leaf.get(&buffer), Some(&Counted(n)));
+        assert_eq!(node.more.get(&buffer), &[Counted(10 * n), Counted(10 * n + 1), Counted(10 * n + 2)]);
+    }
+    assert_eq!(checks(), 4 * NODES, "each Counted checked once more, where it is reached");
 }
 
 #[test]

@@ -10,7 +10,7 @@ use blaze_diagnostics::{
     emit::{self, Sources, Style},
     model::{Child, Diag},
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -75,17 +75,86 @@ pub struct Message {
     pub fixable: bool,
 }
 
+/// What each package's flags and `clippy.toml` make of its lints, kept between requests by
+/// whoever answers them: a request then parses no flags and reads no `clippy.toml` it has
+/// already. [`Setups::forget`] is called when a `clippy.toml` or `.clippy.toml` changes.
+#[derive(Debug, Default)]
+pub struct Setups {
+    /// By manifest directory: each setup made there, with what it was made of.
+    by_dir: FxHashMap<PathBuf, Vec<(SetupOf, Result<Setup, String>)>>,
+}
+
+/// What of a [`Package`] its [`Setup`] is made from, besides its manifest directory.
+#[derive(Debug, PartialEq, Eq)]
+struct SetupOf {
+    flags: Vec<String>,
+    conf_dir: Option<PathBuf>,
+    rust_version: Option<String>,
+}
+
+impl SetupOf {
+    fn is(&self, package: &Package) -> bool {
+        self.flags == package.flags
+            && self.conf_dir == package.conf_dir
+            && self.rust_version == package.rust_version
+    }
+}
+
+impl Setups {
+    /// Forgets every setup: a `clippy.toml` may have changed.
+    pub fn forget(&mut self) {
+        self.by_dir.clear();
+    }
+
+    /// Makes `package`'s setup unless one was made of the same.
+    fn load(&mut self, package: &Package) {
+        if self.by_dir.get(package.manifest_dir.as_path()).is_some_and(|it| it.iter().any(|(of, _)| of.is(package))) {
+            return;
+        }
+        let of = SetupOf {
+            // clone: what a setup was made of, once per package and change of it
+            flags: package.flags.clone(),
+            conf_dir: package.conf_dir.clone(),
+            rust_version: package.rust_version.clone(),
+        };
+        // clone: the key, once per package and change of it
+        self.by_dir.entry(package.manifest_dir.clone()).or_default().push((of, setup(package)));
+    }
+
+    /// The setup [`Setups::load`] made of `package`.
+    fn get(&self, package: &Package) -> &Result<Setup, String> {
+        self.by_dir
+            .get(package.manifest_dir.as_path())
+            .and_then(|it| it.iter().find(|(of, _)| of.is(package)))
+            .map(|(_, setup)| setup)
+            .expect("the package's setup is loaded")
+    }
+}
+
 /// Lints the crates of `crates` the packages of `ask` have. Files are named from `root`, the
 /// workspace's, when they are below it; `path_of` is where a file is.
-pub fn answer(
+pub fn answer<P: AsRef<Path>>(
     db: &Db,
     crates: &[Crate],
     root: &Path,
-    path_of: &impl Fn(FileId) -> Option<PathBuf>,
+    path_of: &impl Fn(FileId) -> Option<P>,
     ask: &Ask,
+) -> Answer {
+    answer_with(db, crates, root, path_of, ask, &mut Setups::default())
+}
+
+/// [`answer`], with the setups made for earlier requests.
+pub fn answer_with<P: AsRef<Path>>(
+    db: &Db,
+    crates: &[Crate],
+    root: &Path,
+    path_of: &impl Fn(FileId) -> Option<P>,
+    ask: &Ask,
+    setups: &mut Setups,
 ) -> Answer {
     let name_of = |file: FileId| -> Option<String> {
         let path = path_of(file)?;
+        let path = path.as_ref();
         Some(match path.strip_prefix(root) {
             Ok(relative) => relative.to_string_lossy().into_owned(),
             Err(_) => path.to_string_lossy().into_owned(),
@@ -95,13 +164,21 @@ pub fn answer(
     let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
     let mut sources = Sources::default();
     let mut answer = Answer::default();
-    let mut setups: Vec<Option<Setup>> = Vec::new();
     for package in &ask.packages {
-        match setup(package) {
-            Ok(setup) => setups.push(Some(setup)),
+        setups.load(package);
+    }
+    let setups = &*setups;
+    // alloc: a request's packages, once per request
+    let mut chosen: Vec<Option<&Setup>> = Vec::with_capacity(ask.packages.len());
+    let mut by_dir: FxHashMap<&Path, usize> = FxHashMap::default();
+    for (at, package) in ask.packages.iter().enumerate() {
+        by_dir.entry(package.manifest_dir.as_path()).or_insert(at);
+        match setups.get(package) {
+            Ok(setup) => chosen.push(Some(setup)),
             Err(why) => {
-                answer.failed.push((package.name.clone(), why));
-                setups.push(None);
+                // clone: a package's error, once per request it fails in
+                answer.failed.push((package.name.clone(), why.clone()));
+                chosen.push(None);
             }
         }
     }
@@ -124,12 +201,11 @@ pub fn answer(
         }
         let env = krate.env(db);
         let Some(dir) = env.get("CARGO_MANIFEST_DIR") else { continue };
-        let Some(at) = ask.packages.iter().position(|it| it.manifest_dir == Path::new(&dir)) else {
-            continue;
-        };
-        let Some(setup) = &setups[at] else { continue };
+        let Some(&at) = by_dir.get(Path::new(&dir)) else { continue };
+        let Some(setup) = chosen[at] else { continue };
         let hir_crate = hir::Crate::from(krate);
         let Some(root_path) = path_of(hir_crate.root_file(db)) else { continue };
+        let root_path = root_path.as_ref().to_path_buf();
         let found = crate::check(db, hir_crate, setup, &name_of);
         let plain: Vec<&Found> = found.iter().filter(|it| !it.test_only).collect();
         let test = has_tests.then(|| written(found.iter(), &mut sources, &read, style));
@@ -237,5 +313,43 @@ mod tests {
             r#""spans":[{"byte_start":0,"expansion":null,"file_name":"a.rs"}],"code":{"code":"clippy::x","explanation":null}}"#,
         );
         assert_eq!(cargo_order(line), expected);
+    }
+
+    /// A setup is made once per package and kept until forgotten: a second request reads no
+    /// `clippy.toml`, and one after [`Setups::forget`] reads it again.
+    #[test]
+    fn a_setup_is_kept_until_forgotten() {
+        let dir = std::env::temp_dir().join(format!("blaze-lints-setups-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("clippy.toml"), "msrv = \"1.60\"\n").unwrap();
+        let package = |flags: &[&str]| Package {
+            name: "p".to_owned(),
+            manifest_dir: dir.clone(),
+            flags: flags.iter().map(|it| (*it).to_owned()).collect(),
+            conf_dir: None,
+            rust_version: None,
+        };
+        let msrv = |setups: &Setups, package: &Package| {
+            setups.get(package).as_ref().map(|it| it.conf.msrv).map_err(String::clone)
+        };
+        let (plain, warned) = (package(&[]), package(&["-W", "clippy::all"]));
+        let mut setups = Setups::default();
+        setups.load(&plain);
+        setups.load(&warned);
+        let first = Ok(Some(crate::conf::Version(1, 60, 0)));
+        assert_eq!(msrv(&setups, &plain), first);
+        assert_eq!(msrv(&setups, &warned), first);
+        assert_eq!(setups.get(&plain).as_ref().unwrap().command_line.lints.opts, setup(&plain).unwrap().command_line.lints.opts);
+        assert_ne!(
+            setups.get(&warned).as_ref().unwrap().command_line.lints.opts,
+            setups.get(&plain).as_ref().unwrap().command_line.lints.opts,
+        );
+        std::fs::write(dir.join("clippy.toml"), "msrv = \"1.70\"\n").unwrap();
+        setups.load(&plain);
+        assert_eq!(msrv(&setups, &plain), first, "kept: the file is not read again");
+        setups.forget();
+        setups.load(&plain);
+        assert_eq!(msrv(&setups, &plain), Ok(Some(crate::conf::Version(1, 70, 0))));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -670,6 +670,12 @@ Held by T4.
 
 ## R9. `DynMap`: a struct of typed maps (`dyn_map.rs`, db-expand; hir change in R9h)
 
+> superseded in the tree (checked by mem-db-def, 2026-10-30 01:11): `dyn_map.rs` already is a
+> struct of typed `KeyMap` fields with no `transmute` (speed-unsafe-front-def), and hir-def is
+> `#![deny(unsafe_code)]`. Don't apply the file below: its `Index`/`IndexMut` `transmute`s
+> would bring back `unsafe`. Only R9h's hir side, if still open, is checked against today's
+> `dyn_map.rs`.
+
 Today a `DynMap` is an `stdx::anymap::Map`: each kind of child is a `Box<dyn Any>` holding an
 `FxHashMap`, looked up by `TypeId` hash, and each access downcasts. There are 25 keys, every
 `(AST, ID)` pair different, and the generic `Policy for (K, V)` (143 to 156) has no user.

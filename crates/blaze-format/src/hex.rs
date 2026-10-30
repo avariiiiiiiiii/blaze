@@ -91,7 +91,8 @@ fn decode_with<const N: usize>(table: &[u8; 256], text: &[u8]) -> Option<[u8; N]
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     use super::*;
 
@@ -176,27 +177,27 @@ mod tests {
         });
     }
 
-    proptest! {
-        #[test]
-        fn encodes_as_the_copies_did(bytes in proptest::collection::vec(any::<u8>(), 0..80)) {
-            let text = encode(&bytes);
-            prop_assert_eq!(&text, &encode_reference(&bytes));
-            prop_assert!(is_encoding(&text, &bytes));
-            let mut fixed = [0u8; 8];
-            let n = bytes.len().min(8);
-            fixed[..n].copy_from_slice(&bytes[..n]);
-            prop_assert_eq!(decode::<8>(encode(&fixed)), Some(fixed));
-            prop_assert_eq!(decode_lower::<8>(encode(&fixed)), Some(fixed));
-        }
+    #[hegel::test]
+    fn encodes_as_the_copies_did(tc: TestCase) {
+        let bytes: Vec<u8> = tc.draw(gs::binary().max_size(79));
+        let text = encode(&bytes);
+        assert_eq!(&text, &encode_reference(&bytes));
+        assert!(is_encoding(&text, &bytes));
+        let mut fixed = [0u8; 8];
+        let n = bytes.len().min(8);
+        fixed[..n].copy_from_slice(&bytes[..n]);
+        assert_eq!(decode::<8>(encode(&fixed)), Some(fixed));
+        assert_eq!(decode_lower::<8>(encode(&fixed)), Some(fixed));
+    }
 
-        #[test]
-        fn decodes_as_the_copies_did(text in proptest::collection::vec(prop_oneof![
-            Just(b'0'), Just(b'9'), Just(b'a'), Just(b'f'), Just(b'A'), Just(b'F'), Just(b'g'),
-            Just(b'+'), any::<u8>(),
-        ], 0..20)) {
-            prop_assert_eq!(decode::<8>(&text), decode_reference::<8>(&text));
-            prop_assert_eq!(decode_lower::<8>(&text), decode_lower_reference::<8>(&text));
-            prop_assert_eq!(decode::<4>(&text), decode_reference::<4>(&text));
-        }
+    #[hegel::test]
+    fn decodes_as_the_copies_did(tc: TestCase) {
+        let text: Vec<u8> = tc.draw(gs::vecs(hegel::one_of!(
+            gs::sampled_from(b"09afAFg+".to_vec()),
+            gs::integers::<u8>(),
+        )).max_size(19));
+        assert_eq!(decode::<8>(&text), decode_reference::<8>(&text));
+        assert_eq!(decode_lower::<8>(&text), decode_lower_reference::<8>(&text));
+        assert_eq!(decode::<4>(&text), decode_reference::<4>(&text));
     }
 }

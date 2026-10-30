@@ -1,25 +1,52 @@
 //! Stackful coroutines on the calling OS thread: a model's threads. [`Coroutine::resume`] runs
-//! one until it calls [`suspend`] or its job ends; only the explorer resumes, and only a
-//! coroutine suspends, so a switch is always between the explorer and one coroutine.
+//! one until a coroutine calls [`suspend`] or its job ends. While coroutines run, a coroutine
+//! may hand the OS thread straight to another one with a job ([`switch_to`]), so a thread
+//! change at a schedule point is one switch; the explorer gets the thread back only at a
+//! [`suspend`] (a finding, a new thread to start, the end of the execution) or a job's end.
 //!
 //! On x86-64 and aarch64 Unix a switch saves the callee-saved registers on the stack it leaves
 //! and loads them from the one it enters (a few instructions; [`switch`]), on stacks mapped with
 //! a guard page below them. On Windows a coroutine is a fiber. A coroutine runs one job after
 //! another on the same stack, so stacks are made once per model and reused by every execution.
 //!
-//! A job's panic is caught on its own stack and handed to the resumer: an unwind never crosses a
-//! switch. A coroutine left suspended in the middle of a job (the explorer stopped at a finding)
-//! is leaked whole, stack and all, so nothing its frames point to is freed under them.
+//! A job's panic is caught on its own stack and handed to the explorer: an unwind never crosses
+//! a switch. A coroutine left suspended in the middle of a job (the explorer stopped at a
+//! finding) is leaked whole, stack and all, so nothing its frames point to is freed under them.
+//!
+//! Every coroutine's [`Shared`] is touched only by the side that runs: the explorer while no
+//! coroutine runs, and the running coroutine (its own, and the one it switches to) otherwise.
+//! There is one OS thread, so that is one side at a time.
 
 use std::{
     any::Any,
     cell::Cell,
     panic::{self, AssertUnwindSafe},
     ptr,
+    rc::Rc,
 };
 
-// dyn: a modeled thread's body, any closure the test spawns, boxed once per spawn.
-pub(crate) type Job = Box<dyn FnOnce()>;
+use crate::clock::MAX_THREADS;
+
+/// What a coroutine runs.
+pub(crate) enum Job {
+    /// The model's closure, thread 0 of every execution: one `Rc` per model, so starting an
+    /// execution allocates nothing.
+    // dyn: the test's closure, made into this once per model.
+    Main(Rc<dyn Fn()>),
+    /// A spawned thread's body.
+    // dyn: any closure the test spawns, boxed once per spawn, as `std::thread::spawn` does.
+    Spawned(Box<dyn FnOnce()>),
+}
+
+impl Job {
+    fn run(self) {
+        match self {
+            Job::Main(main) => main(),
+            Job::Spawned(body) => body(),
+        }
+    }
+}
+
 // dyn: a panic's payload, as `catch_unwind` gives it.
 pub(crate) type Panic = Box<dyn Any + Send>;
 
@@ -31,84 +58,148 @@ pub(crate) enum Ran {
     Finished(Result<(), Panic>),
 }
 
-/// What a coroutine and its resumer share. Boxed, so its address is fixed for the coroutine's
-/// life; touched by one side at a time (the other is switched out).
+/// What a coroutine and the other sides share. Made by [`Coroutine::new`] with
+/// `Box::into_raw`, so its address is fixed for the coroutine's life.
 struct Shared {
     job: Option<Job>,
     ended: Option<Result<(), Panic>>,
     ctx: arch::Context,
+    /// Its index among the explorer's coroutines: the model thread it runs.
+    index: usize,
+    /// A job was started and has not ended: its frames are live on the stack, and it can be
+    /// switched to.
+    busy: bool,
 }
 
 thread_local! {
     /// The coroutine running on this OS thread, if one is.
     static RUNNING: Cell<*mut Shared> = const { Cell::new(ptr::null_mut()) };
+    /// The coroutines of the model running on this OS thread, by index, for [`switch_to`].
+    static ALL: [Cell<*mut Shared>; MAX_THREADS] =
+        const { [const { Cell::new(ptr::null_mut()) }; MAX_THREADS] };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Off: every thread change goes through the explorer, the reference the direct switches
+    /// are tested against.
+    pub(crate) static DIRECT: Cell<bool> = const { Cell::new(true) };
 }
 
 pub(crate) struct Coroutine {
-    shared: Box<Shared>,
+    /// Owned: freed by `drop` unless the coroutine is busy.
+    shared: *mut Shared,
     stack: arch::Stack,
-    /// A job was started and has not ended: its frames are live on the stack.
-    busy: bool,
 }
 
 impl Coroutine {
-    pub(crate) fn new(stack_size: usize) -> Coroutine {
-        let mut shared =
-            Box::new(Shared { job: None, ended: None, ctx: arch::Context::default() });
-        let at: *mut Shared = &mut *shared;
-        let stack = arch::Stack::new(stack_size, entry_point(), at.cast());
-        shared.ctx.prepare(&stack);
-        Coroutine { shared, stack, busy: false }
+    /// The coroutine that runs model thread `index`.
+    pub(crate) fn new(stack_size: usize, index: usize) -> Coroutine {
+        assert!(index < MAX_THREADS, "blaze-check: a coroutine past the {MAX_THREADS} a model has");
+        // alloc: a coroutine's shared state, once per model thread, kept across executions
+        let shared = Box::into_raw(Box::new(Shared {
+            job: None,
+            ended: None,
+            ctx: arch::Context::default(),
+            index,
+            busy: false,
+        }));
+        let stack = arch::Stack::new(stack_size, entry_point(), shared.cast());
+        // SAFETY: `shared` was just made and no coroutine runs on it yet.
+        unsafe { (*shared).ctx.prepare(&stack) };
+        ALL.with(|all| all[index].set(shared));
+        Coroutine { shared, stack }
     }
 
-    /// Gives an idle coroutine its next job; it starts at the next [`Coroutine::resume`].
+    /// Gives an idle coroutine its next job; it starts at the next [`Coroutine::resume`] or
+    /// [`switch_to`] of it.
     pub(crate) fn start(&mut self, job: Job) {
-        assert!(!self.busy, "blaze-check: a coroutine given a job while it runs one");
-        self.shared.job = Some(job);
-        self.busy = true;
+        // SAFETY: called by the explorer, so no coroutine runs (`Shared`'s rule); `shared` is
+        // this coroutine's, alive while it is.
+        let shared = unsafe { &mut *self.shared };
+        assert!(!shared.busy, "blaze-check: a coroutine given a job while it runs one");
+        shared.job = Some(job);
+        shared.busy = true;
     }
 
-    pub(crate) fn resume(&mut self) -> Ran {
-        assert!(self.busy, "blaze-check: a coroutine resumed with no job");
-        let shared: *mut Shared = &mut *self.shared;
+    /// Runs this coroutine until one of the model's coroutines suspends or ends its job: which
+    /// one (its index), and how.
+    pub(crate) fn resume(&mut self) -> (usize, Ran) {
+        let shared = self.shared;
+        // SAFETY: called by the explorer, so no coroutine runs; `shared` is alive.
+        assert!(unsafe { (*shared).busy }, "blaze-check: a coroutine resumed with no job");
         let outer = RUNNING.replace(shared);
         assert!(outer.is_null(), "blaze-check: a coroutine resumed from inside another");
         // SAFETY: `shared` is this coroutine's, alive as long as it is (`self` holds it);
-        // `ctx` holds the context it saved when it last suspended (or its first frame, made by
-        // `prepare` on `self.stack`), which is still mapped: `self` owns the stack.
+        // `ctx` holds the context it saved when it last switched out (or its first frame, made
+        // by `prepare` on `self.stack`), which is still mapped: `self` owns the stack.
         unsafe { arch::resume(shared) };
-        RUNNING.set(outer);
-        match self.shared.ended.take() {
+        let last = RUNNING.replace(outer);
+        // SAFETY: `last` is the coroutine that switched back to the explorer: `RUNNING` names
+        // the running coroutine, set by `resume` and by `switch_to`, which only switch to
+        // registered coroutines, alive while registered. It is switched out now.
+        let last = unsafe { &mut *last };
+        match last.ended.take() {
             Some(ended) => {
-                self.busy = false;
-                Ran::Finished(ended)
+                last.busy = false;
+                (last.index, Ran::Finished(ended))
             }
-            None => Ran::Suspended,
+            None => (last.index, Ran::Suspended),
         }
     }
 }
 
 impl Drop for Coroutine {
     fn drop(&mut self) {
-        if self.busy {
+        // SAFETY: dropped by the explorer, so no coroutine runs; `shared` is alive.
+        let (index, busy) = unsafe { ((*self.shared).index, (*self.shared).busy) };
+        ALL.with(|all| {
+            if all[index].get() == self.shared {
+                all[index].set(ptr::null_mut());
+            }
+        });
+        if busy {
             // Frames of the unfinished job are on the stack and may be pointed into: keep both.
-            let shared = std::mem::replace(
-                &mut self.shared,
-                Box::new(Shared { job: None, ended: None, ctx: arch::Context::default() }),
-            );
-            std::mem::forget(shared);
             self.stack.leak();
+            return;
         }
+        // SAFETY: made by `Box::into_raw` in `new` and freed only here; the coroutine is idle and
+        // no longer registered, so nothing reaches it again.
+        drop(unsafe { Box::from_raw(self.shared) });
     }
 }
 
-/// Switches from the running coroutine back to its resumer; returns when it is resumed.
+/// Switches from the running coroutine back to the explorer; returns when it runs again.
 pub(crate) fn suspend() {
     let shared = RUNNING.get();
     assert!(!shared.is_null(), "blaze-check: suspend outside a coroutine");
-    // SAFETY: `RUNNING` is the coroutine running on this stack, set by `resume`, whose frame
-    // waits in `arch::resume` for this switch.
+    // SAFETY: `RUNNING` is the coroutine running on this stack, set by `resume` or `switch_to`;
+    // the explorer's frame waits in `arch::resume` for a switch to its saved context.
     unsafe { arch::suspend(shared) };
+}
+
+/// Switches from the running coroutine straight to coroutine `to`, when it has a job and is
+/// not the running one, and returns when the running one runs again. `false`, having done
+/// nothing, otherwise. The explorer's saved context goes with the switch, so `to`'s next
+/// [`suspend`] reaches it as if the explorer had resumed `to` itself.
+pub(crate) fn switch_to(to: usize) -> bool {
+    #[cfg(test)]
+    if !DIRECT.get() {
+        return false;
+    }
+    let from = RUNNING.get();
+    assert!(!from.is_null(), "blaze-check: a switch outside a coroutine");
+    let target = ALL.with(|all| all.get(to).map_or(ptr::null_mut(), Cell::get));
+    // SAFETY: a registered coroutine is alive (`Coroutine::drop` removes it first), and the
+    // running coroutine may touch it (`Shared`'s rule).
+    if target.is_null() || target == from || !unsafe { (*target).busy } {
+        return false;
+    }
+    RUNNING.set(target);
+    // SAFETY: `from` runs on this stack; `target` is a live coroutine with a job, switched out,
+    // whose context is the one it saved or its first frame.
+    unsafe { arch::hand_over(from, target) };
+    true
 }
 
 /// Whether the caller runs on a coroutine.
@@ -116,17 +207,17 @@ pub(crate) fn inside() -> bool {
     !RUNNING.get().is_null()
 }
 
-/// The loop every coroutine runs: a job, then back to the resumer, then the next job.
+/// The loop every coroutine runs: a job, then back to the explorer, then the next job.
 ///
 /// # Safety
 ///
 /// `shared` is the coroutine's own [`Shared`], alive while the coroutine is.
 unsafe fn run_jobs(shared: *mut Shared) -> ! {
     loop {
-        // SAFETY: the resumer is switched out while this runs (`run_jobs`'s contract).
+        // SAFETY: this coroutine runs, so it may touch its own `Shared` (`Shared`'s rule).
         let job = unsafe { (*shared).job.take() };
         let job = job.expect("blaze-check: a coroutine resumed with no job");
-        let ended = panic::catch_unwind(AssertUnwindSafe(job));
+        let ended = panic::catch_unwind(AssertUnwindSafe(|| job.run()));
         // SAFETY: as above.
         unsafe { (*shared).ended = Some(ended) };
         // SAFETY: `shared` is the coroutine running here.
@@ -191,8 +282,20 @@ mod arch {
     ///
     /// `shared` is the coroutine running on this stack, resumed by `resume`.
     pub(super) unsafe fn suspend(shared: *mut Shared) {
-        // SAFETY: the caller's contract: `back` is the resumer's saved context.
+        // SAFETY: the caller's contract: `back` is the explorer's saved context.
         unsafe { switch(&raw mut (*shared).ctx.own, (*shared).ctx.back) }
+    }
+
+    /// # Safety
+    ///
+    /// `from` is the coroutine running on this stack; `to` is a live coroutine, switched out,
+    /// whose `own` is a context it saved or its first frame.
+    pub(super) unsafe fn hand_over(from: *mut Shared, to: *mut Shared) {
+        // SAFETY: the caller's contract: both are live, and only the running side touches
+        // them. `to` suspends to the context the explorer saved when it resumed `from`.
+        unsafe { (*to).ctx.back = (*from).ctx.back };
+        // SAFETY: the caller's contract: `to`'s `own` is a context to switch to.
+        unsafe { switch(&raw mut (*from).ctx.own, (*to).ctx.own) }
     }
 
     /// A mapped stack with an unmapped guard page below it.
@@ -425,6 +528,15 @@ mod arch {
     pub(super) unsafe fn suspend(_: *mut Shared) {
         // SAFETY: the host fiber is live while a model runs (`Host`).
         unsafe { SwitchToFiber(HOST.get()) }
+    }
+
+    /// # Safety
+    ///
+    /// Called on `from`'s fiber; `to` is a live coroutine, switched out.
+    pub(super) unsafe fn hand_over(_: *mut Shared, to: *mut Shared) {
+        // SAFETY: the caller's contract: `to`'s fiber is live and not running. It suspends to
+        // the host fiber, as `from` would have.
+        unsafe { SwitchToFiber((*to).ctx.fiber) }
     }
 
     pub(super) struct Stack {

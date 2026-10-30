@@ -4,7 +4,7 @@
 The stress workspace is copied COUNT times. The daemon is started in the first copy with the
 others as `--also`; each step edits files of some checkouts and asks for the program of some by
 `blaze sync SOCKET --project ...`. Every program asked for is run and compared with what
-`cargo build` of that checkout prints.
+blaze's build of that checkout from nothing (mixed.from_scratch) prints.
 
 With `--join` the daemon is started in the first copy alone, and the others join it when they
 are first asked for. With `--together` the programs of a step are asked for at once.
@@ -14,7 +14,7 @@ import os, shlex, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from mixed import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, from_scratch, printed
 
 COUNT = 3
 MID, APP = "mid/src/lib.rs", "app/src/main.rs"
@@ -27,7 +27,7 @@ MORE = "app/src/more.rs"
 SHARED = "shared.txt"
 # Not the same in any two runs either: with `BLAZE_CACHE` a run has what the last one compiled.
 RUN = os.getpid()
-# (what the step is, [(checkout, file, old or None to write it, new or None to remove it)], checkouts asked for in order, the ones cargo rejects)
+# (what the step is, [(checkout, file, old or None to write it, new or None to remove it)], checkouts asked for in order, the ones that are not Rust)
 STEPS = [
     ("nothing edited, the others asked for the first time", [], [1, 2, 0], []),
     ("nothing edited, all again", [], [0, 1, 2], []),
@@ -64,7 +64,7 @@ STEPS = [
     ("the manifest of one changed in what no crate reads",
      [(0, "app/Cargo.toml", "[package]", "[package.metadata]\nnote = 1\n\n[package]")], [1, 2, 0, 1], []),
 ]
-# Cargo may build that checkout another way now, so it can't be read as the first any more. A
+# That checkout may be built another way now, so it can't be read as the first any more. A
 # checkout that is loaded is turned down for it.
 if "--overlay" in sys.argv:
     STEPS += [
@@ -144,7 +144,7 @@ def main():
         link = linkline.with_output(linkline.ahead(link, [patch, obj], BLAZE), binary)
         symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
         checkouts.append({"ws": ws, "obj": obj, "patch": patch, "bin": binary, "link": linkline.join(link),
-                          "symbols": symbols, "reference": os.path.join(work, f"reference{at}")})
+                          "symbols": symbols})
     first = checkouts[0]
     out = open(log_path, "a")
     daemon = subprocess.Popen(
@@ -164,6 +164,24 @@ def main():
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
+
+    scratch_runs = {}
+
+    def from_nothing(checkout):
+        """What blaze's build of the checkout as it is, from nothing, prints, by the state of its
+        source: steps put checkouts back as they were."""
+        files = []
+        for root, dirs, names in os.walk(checkout["ws"]):
+            dirs[:] = sorted(d for d in dirs if not d.startswith("target"))
+            files += [(os.path.relpath(os.path.join(root, n), checkout["ws"]), open(os.path.join(root, n), "rb").read())
+                      for n in sorted(names)]
+        state = (checkout["ws"], tuple(files))
+        if state not in scratch_runs:
+            try:
+                scratch_runs[state] = printed(from_scratch(checkout["ws"], crates, ["-p", "sapp"]))
+            except SystemExit as error:
+                return f"did not build from nothing: {str(error)[:200]}"
+        return scratch_runs[state]
 
     wrong = asked = 0
     for what, edits, order, broken in STEPS:
@@ -203,9 +221,6 @@ def main():
                 unanswered(daemon, log_path, since)
                 raise
             took = (time.time() - began) * 1000
-            cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=checkout["ws"], capture_output=True,
-                                   text=True, env={**os.environ, "CARGO_TARGET_DIR": checkout["reference"]})
-            assert (cargo.returncode != 0) == (at in broken), cargo.stderr[-2000:]
             if daemon.poll() is not None:
                 verdict = "DAEMON DIED"
             elif at in broken:
@@ -213,7 +228,7 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                same = run(checkout["bin"]) == run(built(checkout["reference"], "sapp"))
+                same = run(checkout["bin"]) == from_nothing(checkout)
                 verdict = "same" if same else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()

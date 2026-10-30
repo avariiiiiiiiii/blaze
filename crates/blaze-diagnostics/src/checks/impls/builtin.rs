@@ -39,7 +39,7 @@ use crate::{
 /// The builtin traits' checks of a crate's impls, with what they share across impls.
 pub(super) struct Builtin<'a, 'b, 'db> {
     cx: &'a Cx<'b, 'db>,
-    lang: LangItems,
+    lang: &'db LangItems,
     /// The `Drop` impls of each type, found once.
     destructors: Option<Vec<(hir::Adt, hir::Impl)>>,
 }
@@ -206,7 +206,7 @@ fn infringing_fields_error<'db>(
     origin: &Origin<'db>,
     span: Span,
     adt: hir::Adt,
-    infringing: &[Infringing<'_>],
+    infringing: &[Infringing<'db>],
 ) -> Diag {
     let db = cx.db;
     let mut diag = Diag::error(Some("E0204"), "the trait `Copy` cannot be implemented for this type", span);

@@ -201,7 +201,12 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     let runner = plane::Runner::Threads(plane::Threads::new(options.io));
     let driver = blaze_core::native(std::path::Path::new("/"), threads)
         .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?;
-    run(driver.confined(confine).scratch(scratch), options, steps, runner)
+    let driver = driver
+        .confined(confine)
+        .scratch(&scratch)
+        // alloc: an error path
+        .with_context(|| format!("making {}, where each sandboxed spawn gets its directory", scratch.display()))?;
+    run(driver, options, steps, runner)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

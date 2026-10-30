@@ -28,6 +28,7 @@ pub mod busy;
 #[cfg(target_os = "linux")]
 mod cgroup;
 pub mod create_process;
+pub mod decimal;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the fanotify driver: its system calls and the events it reads")]
 mod fanotify;
@@ -63,6 +64,7 @@ pub mod uring;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the inotify driver: its system calls and the events it reads")]
 mod watch;
+pub mod utf8;
 pub mod wheel;
 
 use std::{fmt, time::Duration};
@@ -156,7 +158,7 @@ impl Answer {
 }
 
 /// The process a [`Confine`] starts for a command: its whole environment is this one.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: in blaze-cargo's Linux sandbox setup, once per spawn
 pub struct Confined {
     pub program: std::path::PathBuf,
     pub args: Vec<std::ffi::OsString>,
@@ -169,13 +171,17 @@ pub struct Confined {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Tag(pub u64);
 
-/// A file under the driver's root: `/`-separated, relative, without `.` or `..`.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct FileName(Box<str>);
+/// A file under the driver's root: `/`-separated, relative, without `.` or `..`. Shared, so
+/// the name an asker hands each [`Effect`] of a file is a count, never a copy: two words.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)] // clone: a refcount, no allocation
+pub struct FileName(std::sync::Arc<str>);
+
+const _: () = assert!(size_of::<FileName>() == 2 * size_of::<usize>());
 
 impl FileName {
     /// `None` for a name that would leave the driver's root or names nothing.
     pub fn new(name: &str) -> Option<FileName> {
+        // alloc: once per name made; its clones share it
         FileName::is_valid(name).then(|| FileName(name.into()))
     }
 
@@ -209,7 +215,7 @@ impl fmt::Display for FileName {
 pub const RECV_MOST: usize = 64 << 10;
 
 /// IO a state machine asks for.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: tests' logs of what was asked (blaze-vfs's); a driver takes each by value
 pub enum Effect {
     /// The whole file. A file that is not there reads as empty: a journal not yet written is
     /// one with no records.
@@ -403,7 +409,7 @@ pub struct Conn(pub u64);
 
 /// A process to run. Paths outside the driver's root (a toolchain's, the C compiler's) are
 /// absolute; everything the process may touch is in its [`Sandbox`].
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: in blaze-usercode's run `Spec`, once per spawn
 pub struct Command {
     pub program: std::path::PathBuf,
     pub args: Vec<std::ffi::OsString>,
@@ -420,7 +426,7 @@ pub struct Command {
 /// What a spawned process may see and do. User code (build scripts, proc macros, tests) runs
 /// in one always; [`Sandbox::Off`] is only for what `BLAZE_SANDBOX=off` or a documented
 /// manifest opt-out says.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: in a `Command` and blaze-usercode's confine `Spec`, once per spawn
 pub enum Sandbox {
     Off,
     On {
@@ -441,7 +447,7 @@ pub enum Sandbox {
 
 /// What a sandboxed process read, recorded by its sandbox: its result is keyed by exactly
 /// these (docs/v2/plan/lanes/usercode.md section 6.5), so the paths are as the process named them.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Default, PartialEq, Eq, Debug)] // clone: kept with a run's record (blaze-usercode, blaze-testsel, blaze-api), once per run
 pub struct Traced {
     /// Each file it opened to read, and the BLAKE3 hash of its bytes then; `None` for a file
     /// it looked for and did not find.
@@ -465,7 +471,7 @@ pub enum Untraceable {
 }
 
 /// How a spawned process ended.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: the simulator's programs and blaze-usercode's pool events, once per spawn
 pub struct Exit {
     /// Its exit code, or `None` when a signal ended it ([`Exit::signal`]).
     pub code: Option<i32>,
@@ -544,7 +550,8 @@ pub struct Meta {
 }
 
 /// How an [`Effect`] went.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: tests keep what they saw; a completion moves to its owner
 pub enum Done {
     /// Of an [`Effect::ReadAll`] or [`Effect::Read`], the bytes read; of an [`Effect::Recv`],
     /// its buffer with the bytes received appended.
@@ -610,7 +617,7 @@ impl Done {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub struct IoError(pub String);
 
 impl fmt::Display for IoError {
@@ -619,7 +626,8 @@ impl fmt::Display for IoError {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: as `Done`'s
 pub struct Completion {
     pub tag: Tag,
     pub done: Done,

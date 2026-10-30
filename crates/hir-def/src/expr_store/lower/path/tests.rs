@@ -1,7 +1,7 @@
 use expect_test::{Expect, expect};
 use span::Edition;
 use syntax::{
-    AstNode as _, AstPtr,
+    AstPtr,
     ast::{self as tag, make},
     view::{self as ast, AstNode as _},
 };
@@ -12,10 +12,7 @@ use crate::{
         ExpressionStore,
         lower::{
             ExprCollector, ImplTraitLowering,
-            path::{
-                RECORD_SEGMENTS, SEGMENT_LOWERING_MAP, hir_segment_to_ast_segment,
-                hir_segment_to_ast_segment_view,
-            },
+            path::{RECORD_SEGMENTS, SEGMENT_LOWERING_MAP, hir_segment_to_ast_segment_view},
             top_of, view_of,
         },
         path::PathIdx,
@@ -79,23 +76,6 @@ fn check_hir_to_ast(text: &str, ignore_segments: &[&str]) {
     });
 }
 
-/// The view twin of `hir_segment_to_ast_segment` gives, for every segment number, the node the
-/// handle function gives.
-#[track_caller]
-fn check_segment_twin(text: &str) {
-    let handle = make::path_from_text(text);
-    let top = top_of(&handle);
-    let view = view_of(&handle, &top);
-    let segments = handle.syntax().descendants().filter_map(tag::PathSegment::cast).count();
-    for segment_idx in 0..=segments as u32 {
-        assert_eq!(
-            hir_segment_to_ast_segment(&handle, segment_idx).map(|it| AstPtr::new(&it)),
-            hir_segment_to_ast_segment_view(view, segment_idx).map(AstPtr::<tag::PathSegment>::of),
-            "segment {segment_idx} of `{text}`"
-        );
-    }
-}
-
 /// The handle `lower_path` lowers a path as `lower_path_view` does.
 #[track_caller]
 fn check_lower_path_twin(text: &str) {
@@ -127,7 +107,7 @@ fn check_lower_path_twin(text: &str) {
 }
 
 #[test]
-fn segment_twin_gives_the_handles_segments() {
+fn lower_path_twin_lowers_as_the_view() {
     for text in [
         "<A as B::C::D>::E::F",
         "A::B::C::D::E::F",
@@ -139,7 +119,6 @@ fn segment_twin_gives_the_handles_segments() {
         "Fn::(A, B) -> C",
         "a::<B, C = D>::e",
     ] {
-        check_segment_twin(text);
         check_lower_path_twin(text);
     }
 }
@@ -200,6 +179,13 @@ fn hir_to_ast_type_anchor_path() {
 #[test]
 fn hir_to_ast_path_super_in_middle() {
     check_hir_to_ast("A::super::B::super::super::C::D", &[]);
+}
+
+/// The arguments' types are paths of their own, lowered with their own segment numbers.
+#[test]
+fn hir_to_ast_generic_args() {
+    check_hir_to_ast("Fn::(A, B) -> C", &["A", "B", "C"]);
+    check_hir_to_ast("a::<B, C = D>::e", &["B", "D"]);
 }
 
 #[track_caller]

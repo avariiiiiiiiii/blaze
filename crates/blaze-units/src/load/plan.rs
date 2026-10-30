@@ -17,12 +17,12 @@ use blaze_manifest::files::Files;
 use blaze_manifest::config::CompileKind;
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
-use blaze_manifest::targets::TargetKind as ManifestKind;
+use blaze_manifest::targets::TargetKind;
 use blaze_resolve::PackageId;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::flags::KindInfo;
-use self::hash::{CompileMode, HashedProfile, LtoUnit, Meta, MetaInput, RustcVersion, TargetKind, TrimPaths};
+use self::hash::{CompileMode, HashedProfile, LtoUnit, Meta, MetaInput, RustcVersion, TrimPaths};
 use self::outputs::{CompileFiles, Layout};
 use crate::load::load_error;
 use crate::query::{LoadError, UnitPlan};
@@ -190,13 +190,13 @@ fn use_metadata<F: Files>(shared: &Shared<'_, F>, facts: &Facts<'_>) -> (bool, b
 
 /// The target of the manifest a unit builds, for its `bin_name` and its kind.
 fn manifest_target<'a>(manifest: &'a Manifest, kind: &TargetKind, name: &str) -> Result<&'a blaze_manifest::targets::Target, LoadError> {
-    let same = |theirs: &ManifestKind| match (kind, theirs) {
-        (TargetKind::Lib(_), ManifestKind::Lib(_))
-        | (TargetKind::Bin, ManifestKind::Bin)
-        | (TargetKind::Test, ManifestKind::Test)
-        | (TargetKind::Bench, ManifestKind::Bench)
-        | (TargetKind::ExampleLib(_) | TargetKind::ExampleBin, ManifestKind::ExampleLib(_) | ManifestKind::ExampleBin)
-        | (TargetKind::CustomBuild, ManifestKind::CustomBuild) => true,
+    let same = |theirs: &TargetKind| match (kind, theirs) {
+        (TargetKind::Lib(_), TargetKind::Lib(_))
+        | (TargetKind::Bin, TargetKind::Bin)
+        | (TargetKind::Test, TargetKind::Test)
+        | (TargetKind::Bench, TargetKind::Bench)
+        | (TargetKind::ExampleLib(_) | TargetKind::ExampleBin, TargetKind::ExampleLib(_) | TargetKind::ExampleBin)
+        | (TargetKind::CustomBuild, TargetKind::CustomBuild) => true,
         _ => false,
     };
     manifest
@@ -309,7 +309,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             unit,
             pkg: Pkg { id: *id, manifest, manifest_path },
             kind,
-            target_kind: TargetKind::of(&unit.target),
+            target_kind: hash::target_kind(&unit.target),
             mode: CompileMode::of(unit)?,
             profile,
         }));

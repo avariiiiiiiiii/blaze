@@ -14,7 +14,7 @@ use hir::{DefWithBody, InFile};
 use hir_def::{
     CallableDefId, DefWithBodyId,
     expr_store::ExprOrPatSource,
-    hir::{AsmOperand, Expr, ExprId, Pat, PatId, Statement, Unsafe},
+    hir::{AsmOperand, Expr, ExprId, ExprKind, Pat, PatId, Statement, Unsafe},
 };
 use hir_ty::next_solver::{CallableIdWrapper, TyKind};
 use rustc_hash::FxHashSet;
@@ -34,10 +34,17 @@ use crate::{
 /// The lints this module gives: it runs only when one may fire.
 pub(super) const LINTS: super::LintSet = super::lint_set(["unused_unsafe"]);
 
-pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
+pub(super) fn lints(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
     // Only a written `unsafe` block can be unused: a body without one (most) is decided by a
-    // scan of the store's expression tags, before hir's set of unsafe operations is built.
-    let has_block = || b.store().exprs().any(|(_, it)| matches!(it, Expr::Block { unsafe_: Unsafe::Yes, .. }));
+    // scan of the store's kind bytes, decoding only the blocks, before hir's set of unsafe
+    // operations is built.
+    let has_block = || {
+        let store = b.store();
+        store
+            .expr_ids()
+            .filter(|&id| matches!(store.expr_kind(id), ExprKind::Block))
+            .any(|id| matches!(store.expr(id), Expr::Block { unsafe_: Unsafe::Yes, .. }))
+    };
     if !has_block() || b.tainted() {
         // alloc: empty, allocates nothing
         return Vec::new();
@@ -80,7 +87,7 @@ enum Context {
 }
 
 struct Visitor<'s, 'a, 'db> {
-    b: &'s BodyCx<'a, 'db>,
+    b: &'s BodyCx<'s, 'a, 'db>,
     ops: FxHashSet<ExprOrPatSource>,
     context: Context,
     /// Each block found unused, with the used block it is nested in when that is why.
@@ -209,7 +216,7 @@ impl Visitor<'_, '_, '_> {
 }
 
 /// The unsafe operations of the body, by where they are written.
-fn operations(b: &BodyCx<'_, '_>) -> FxHashSet<ExprOrPatSource> {
+fn operations(b: &BodyCx<'_, '_, '_>) -> FxHashSet<ExprOrPatSource> {
     let def = DefWithBody::from(b.owner);
     b.cx.vsema.get_unsafe_ops(def.into())
 }
@@ -217,7 +224,7 @@ fn operations(b: &BodyCx<'_, '_>) -> FxHashSet<ExprOrPatSource> {
 /// Whether `expr` calls a function that is unsafe to call in edition 2024: hir's operations
 /// leave out a call of one that is safe to call before, as a lint's and not an error's, but it
 /// uses the block it is in all the same.
-fn is_unsafe_call(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+fn is_unsafe_call(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     let db = b.db();
     let callee = match b.store().expr(expr) {
         Expr::Call { callee, .. } => match b.infer.expr_ty(callee).kind() {
@@ -251,13 +258,13 @@ struct Block {
 
 impl Block {
     /// Whether `expr`, an `unsafe` block, is written so, not made by lowering.
-    fn is_explicit(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+    fn is_explicit(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
         let Some(node) = b.expr_node(expr) else { return false };
         let node = b.cx.syntax_view(node);
         ast::BlockExpr::cast(node.value).is_some_and(|it| it.unsafe_token().is_some())
     }
 
-    fn of(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Block> {
+    fn of(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Block> {
         let node = b.expr_node(expr)?;
         let syntax = b.cx.syntax_view(node);
         let block = ast::BlockExpr::cast(syntax.value)?;

@@ -13,14 +13,14 @@ use blaze_codegen::{
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, FunctionId, GenericDefId, HasModule, Lookup,
+    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, Lookup,
     attrs::AttrFlags,
     expr_store::ExpressionStore,
 };
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
     db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
-    next_solver::{DbInterner, GenericArgs, ParamEnv, Region, Ty, TyKind},
+    next_solver::{DbInterner, GenericArgs, ParamEnv, Region, RegionExt, Ty, TyKind},
 };
 use hir_ty_mir::mir::{MirOptions, overflow::crate_checks_overflow};
 use hir_ty_share::{BodyOptions, OptionsSet, ShareDef, ShareInstance};
@@ -547,6 +547,51 @@ fn body_of(db: &Db, instance: &HirInstance) -> Option<DefWithBodyId> {
         },
         Kind::Start(main) => Some((*main).into()),
         Kind::Asm(_) | Kind::Allocator(_) => None,
+    }
+}
+
+impl HirInstance {
+    /// Whether an edit of `body` alone may change this instance's key: its code reads
+    /// `body`'s ([`code_of`]: `body` itself, a closure or coroutine written in it, the start
+    /// of a `main` that is it, a shim adapting it), or its type arguments name a closure or
+    /// coroutine written in it (`block_on::<its future>`, its drop glue). No other instance's
+    /// key reads a body (docs/v2/plan/lanes/firewall/notes.md).
+    pub fn of_body(&self, db: &Db, body: DefWithBodyId) -> bool {
+        let instance = match &self.0 {
+            Kind::Code(instance, _) => instance,
+            Kind::Start(main) => return DefWithBodyId::from(*main) == body,
+            Kind::Asm(_) | Kind::Allocator(_) => return false,
+        };
+        let is_body = |func: FunctionId| DefWithBodyId::from(func) == body;
+        // A closure or coroutine whose body is `owner` is written in `body`, or in an
+        // anonymous constant of its expressions.
+        let owned_by = |owner: InferBodyId<'_>| {
+            owner.expression_store_owner(db) == ExpressionStoreOwnerId::Body(body)
+        };
+        let own = match instance.def {
+            InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => is_body(func),
+            def @ (InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
+            | InstanceDef::CoroutineByMove(_)) => {
+                closure_loc(db, def).is_some_and(|loc| owned_by(loc.owner))
+            }
+            InstanceDef::ReifyShim { .. } => matches!(
+                instance.args.as_ref().type_at(0).kind(),
+                TyKind::FnDef(def, _) if matches!(def.0, CallableDefId::FunctionId(func) if is_body(func))
+            ),
+            InstanceDef::DropGlue | InstanceDef::CallOnceShim | InstanceDef::FnPointerShim => false,
+        };
+        own || (instance.args.as_ref().iter())
+            .flat_map(|arg| arg.walk())
+            .filter_map(|arg| arg.ty())
+            .any(|ty| match ty.kind() {
+                TyKind::Closure(id, _) => owned_by(id.0.loc(db).owner),
+                TyKind::CoroutineClosure(id, _) => owned_by(id.0.loc(db).owner),
+                TyKind::Coroutine(id, _) | TyKind::CoroutineWitness(id, _) => {
+                    owned_by(id.0.loc(db).owner)
+                }
+                _ => false,
+            })
     }
 }
 

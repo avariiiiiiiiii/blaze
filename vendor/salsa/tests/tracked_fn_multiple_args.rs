@@ -3,6 +3,8 @@
 //! Test that a `tracked` fn on multiple salsa struct args
 //! compiles and executes successfully.
 
+#![forbid(unsafe_code)]
+
 #[salsa::input]
 struct MyInput {
     #[returns(copy)]

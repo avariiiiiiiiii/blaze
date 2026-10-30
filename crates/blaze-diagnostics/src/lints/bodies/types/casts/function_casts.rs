@@ -23,7 +23,7 @@ impl LatePass for FunctionCastsAsInteger {
     const LINTS: LintSet = lint_set(["function_casts_as_integer"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Cast]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Cast { expr: from, .. } = b.store().expr(expr) else { return };
         if matches!(b.infer.expr_ty(expr).kind(), TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::RawPtr(..)) {
             return;

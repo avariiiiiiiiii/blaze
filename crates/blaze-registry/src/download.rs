@@ -15,7 +15,9 @@ use semver::Version;
 use sha2::{Digest, Sha256};
 use tar::{Archive, EntryType};
 
-use crate::{http::HttpNotSuccessful, index::dep_path, registry::Registry};
+use crate::{http::HttpNotSuccessful, registry::Registry};
+
+pub use blaze_units::index::crate_url;
 
 /// Marks a package unpacked whole. Not the `.cargo-ok` of a git checkout.
 const PACKAGE_SOURCE_LOCK: &str = ".cargo-ok";
@@ -55,22 +57,6 @@ pub enum From {
 /// The 32 bytes of a checksum written in hex.
 pub fn parse_checksum(hex: &str) -> Option<[u8; 32]> {
     blaze_format::hex::decode(hex)
-}
-
-/// The URL of a `.crate` file from a registry's `dl` template (cargo-util's `crate_url`).
-pub fn crate_url(template: &str, name: &str, version: &str, checksum: &str) -> String {
-    const MARKERS: [&str; 5] =
-        ["{crate}", "{version}", "{prefix}", "{lowerprefix}", "{sha256-checksum}"];
-    if !MARKERS.iter().any(|it| template.contains(it)) {
-        return format!("{template}/{name}/{version}/download");
-    }
-    let prefix = dep_path(name, true);
-    template
-        .replace("{crate}", name)
-        .replace("{version}", version)
-        .replace("{prefix}", &prefix)
-        .replace("{lowerprefix}", &prefix.to_lowercase())
-        .replace("{sha256-checksum}", checksum)
 }
 
 impl Registry {
@@ -311,9 +297,9 @@ fn unpack(tarball: &[u8], dst: &Path, include: impl Fn(&Path) -> bool) -> anyhow
 
 /// A reader that fails once more than `left` bytes are read from it, as cargo's
 /// `LimitErrorReader`.
-struct LimitErrorReader<R> {
-    inner: R,
-    left: u64,
+pub struct LimitErrorReader<R> {
+    pub inner: R,
+    pub left: u64,
 }
 
 impl<R: Read> Read for LimitErrorReader<R> {
@@ -344,8 +330,9 @@ fn umask() -> u32 {
     })
 }
 
-/// Whether a path names one of Windows' devices, as cargo's `is_windows_reserved_path`.
-fn is_windows_reserved_path(path: &Path) -> bool {
+/// Whether a path names one of Windows' devices, as cargo's `is_windows_reserved_path`: each
+/// of its components as `Path::iter` splits them (at `/`, and on Windows `\` too).
+pub fn is_windows_reserved_path(path: &Path) -> bool {
     const RESERVED: [&str; 22] = [
         "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
         "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
@@ -359,4 +346,49 @@ fn is_windows_reserved_path(path: &Path) -> bool {
 /// The sha256 of some bytes in hex, as an index's `cksum` writes it.
 pub fn checksum(bytes: &[u8]) -> String {
     blaze_format::hex::encode(&Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// blaze-cargo's copy (`serve/fetch/archive.rs`), which took a tarball's `/`-separated
+    /// entry path as text; kept to check this one agrees on such paths.
+    fn reserved_text(path: &str) -> bool {
+        const RESERVED: [&str; 22] = [
+            "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+            "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+        ];
+        path.split('/').any(|component| {
+            let stem = component.split('.').next().unwrap_or(component);
+            RESERVED.contains(&stem.to_ascii_lowercase().as_str())
+        })
+    }
+
+    #[test]
+    fn a_reserved_path_is_one_on_either_copy() {
+        let parts = ["a", "con", "CON.txt", "nul.tar.gz", "com1", "com10", "lpt9.rs", ".", "", "x.con"];
+        let mut paths = vec![String::new()];
+        for first in parts {
+            for second in parts {
+                paths.push(format!("{first}/{second}"));
+                paths.push(format!("pkg-1.0.0/{first}/{second}"));
+            }
+        }
+        for path in &paths {
+            assert_eq!(is_windows_reserved_path(Path::new(path)), reserved_text(path), "`{path}`");
+        }
+        assert!(is_windows_reserved_path(Path::new("pkg-1.0.0/src/aux.rs")));
+        assert!(!is_windows_reserved_path(Path::new("pkg-1.0.0/src/auxiliary.rs")));
+    }
+
+    #[test]
+    fn a_reader_fails_past_its_limit() {
+        let mut ok = LimitErrorReader { inner: &[1u8, 2, 3][..], left: 3 };
+        let mut out = Vec::new();
+        assert_eq!(ok.read_to_end(&mut out).unwrap(), 3);
+        let mut over = LimitErrorReader { inner: &[1u8, 2, 3][..], left: 2 };
+        let error = over.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), "maximum limit reached when reading");
+    }
 }

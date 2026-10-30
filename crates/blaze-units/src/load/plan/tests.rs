@@ -5,15 +5,16 @@ use blaze_manifest::Config;
 use blaze_manifest::files::Disk;
 use blaze_manifest::manifest::{Context, EitherManifest, Manifest, read_manifest};
 use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
+use blaze_manifest::targets::{CrateType, TargetKind};
 use blaze_resolve::{InternedString, PackageId, SourceId};
 use cargo_util_schemas::manifest::TomlManifest;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::hash::{self, CrateType, StableHasher, TargetKind};
+use super::hash::{self, StableHasher};
 use super::outputs::{self, CompileFiles, Layout};
 use super::{PlanInput, env, finished, flags, plan};
 use crate::query::UnitPlan;
-use crate::schema::{self, DebugInfo, Mode, Strip, Stripped, Unit, UnitDep};
+use crate::schema::{self, DebugInfo, Mode, Unit, UnitDep};
 use crate::stdlib::target::{self as platform, CfgArgs};
 use crate::{Intent, Package};
 
@@ -492,27 +493,6 @@ fn manifest(path: &Path, source: SourceId, config: Config<Disk>) -> Manifest {
     }
 }
 
-fn dev(debuginfo: u8) -> schema::Profile {
-    schema::Profile {
-        name: "dev".to_owned(),
-        opt_level: "0".to_owned(),
-        lto: "false".to_owned(),
-        codegen_backend: None,
-        codegen_units: None,
-        debuginfo: DebugInfo::Level(debuginfo),
-        split_debuginfo: None,
-        debug_assertions: true,
-        overflow_checks: true,
-        rpath: false,
-        incremental: false,
-        panic: "unwind".to_owned(),
-        strip: Strip::Deferred(Stripped::None),
-        rustflags: Vec::new(),
-        trim_paths: None,
-        hint_mostly_unused: None,
-    }
-}
-
 fn unit(pkg: &str, kind: &[&str], crate_types: &[&str], name: &str, platform: Option<&str>, mode: Mode, features: &[&str], deps: &[usize]) -> Unit {
     Unit {
         pkg_id: pkg.to_owned(),
@@ -529,7 +509,10 @@ fn unit(pkg: &str, kind: &[&str], crate_types: &[&str], name: &str, platform: Op
         },
         // A build script is compiled with `build-override`'s `debug = 0`, and run with the
         // profile of the library it is for.
-        profile: dev(if kind == ["custom-build"] && mode == Mode::Build { 0 } else { 2 }),
+        profile: schema::Profile {
+            debuginfo: DebugInfo::Level(if kind == ["custom-build"] && mode == Mode::Build { 0 } else { 2 }),
+            ..schema::Profile::dev()
+        },
         platform: platform.map(str::to_owned),
         mode,
         checked_as_test: false,

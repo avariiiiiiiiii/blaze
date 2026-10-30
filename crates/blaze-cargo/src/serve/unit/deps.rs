@@ -31,7 +31,7 @@ use blaze_cas::{Key, Kind};
 use blaze_diagnostics::{Diag, Options, cache};
 use blaze_ids::ContentId;
 use hir_def::deps::{Held, ImageBuf, ImageStore, Mode, Served};
-use hir_ty::next_solver::goal_store;
+use hir_ty::{body_store, next_solver::goal_store};
 use load_cargo::v2::Lowered;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -39,6 +39,7 @@ use super::{Job, compile, graph};
 use crate::serve::work::Put;
 
 pub(crate) const IMAGES: &str = "BLAZE_DEP_IMAGES";
+pub(crate) const ITEMS: &str = "BLAZE_ITEM_STORE";
 
 /// What the front end's images were served with, over every [`serve`] of it, kept with it
 /// until they are stored.
@@ -129,10 +130,12 @@ fn imaged(db: &Db, job: &Job, units: impl Iterator<Item = usize>) -> Result<Vec<
 }
 
 /// What a front end's database keeps of the store for its life: one adapter over it, its goal
-/// store ([`goal_store::install`]) and the dependencies' check outcomes it was served.
-/// Dropping it uninstalls the goal store.
+/// store ([`goal_store::install`]), its item store ([`body_store::install`], none under
+/// `BLAZE_ITEM_STORE=off`) and the dependencies' check outcomes it was served. Dropping it
+/// uninstalls both stores.
 pub(crate) struct Session {
     installed: goal_store::Installed,
+    items: Option<body_store::Installed>,
     images: Arc<Images>,
     checks: Arc<cache::Served>,
     /// Why [`hir_def::deps::store`] wrote no image of each crate it last refused, for the
@@ -140,9 +143,11 @@ pub(crate) struct Session {
     refused: FxHashMap<Crate, String>,
 }
 
-/// The session of `lowered`'s database over `store`, its goal store installed before any
-/// query of it solves: a database made freshly, once.
-pub(crate) fn session(lowered: &Lowered, store: &blaze_cas::Reader) -> Result<Session, ApiError> {
+/// The session of `lowered`'s database over `store`, its goal store and item store installed
+/// before any query of it solves, the item store as the job's `env` asks ([`items_in`]): a
+/// database made freshly, once.
+pub(crate) fn session(lowered: &Lowered, store: &blaze_cas::Reader, env: &[(String, String)]) -> Result<Session, ApiError> {
+    let items_mode = items_in(env)?;
     let images = Arc::new(Images::new(store.clone())); // alloc: setup, once per database; clone: an `Arc`
     // dyn: the goal store keeps both for the database's life; called once per database
     let adapter: Arc<dyn ImageStore + Send + Sync> = images.clone(); // clone: an `Arc`, once per database
@@ -150,8 +155,50 @@ pub(crate) fn session(lowered: &Lowered, store: &blaze_cas::Reader) -> Result<Se
     let facts: Arc<dyn goal_store::GoalFacts> = Arc::new(blaze_items::goals::Goals); // alloc: setup, once per database
     let installed = goal_store::install(lowered.db(), adapter, facts, build()?)
         .map_err(|why| ApiError::new(format!("the persistent goal cache: {why}"), None))?; // alloc: error path
+    let items = match items_mode {
+        None => None,
+        Some(mode) => {
+            // dyn: as the goal store's, kept by the item store for the database's life
+            let adapter: Arc<dyn ImageStore + Send + Sync> = images.clone(); // clone: an `Arc`, once per database
+            // dyn: hir-ty's item store takes its facts as `dyn` (blaze-item-hash depends on hir-ty); made once per database
+            let facts: Arc<dyn body_store::BodyFacts> = Arc::new(blaze_item_hash::Bodies); // alloc: setup, once per database
+            Some(body_store::install(lowered.db(), adapter, facts, build()?, mode).map_err(|why| {
+                ApiError::new(format!("the item store: {why}"), None) // alloc: error path
+            })?)
+        }
+    };
     let checks = Arc::new(cache::Served::default()); // alloc: setup, once per database
-    Ok(Session { installed, images, checks, refused: FxHashMap::default() })
+    Ok(Session { installed, items, images, checks, refused: FxHashMap::default() })
+}
+
+/// What the job's `BLAZE_ITEM_STORE` asks of the item store: unset serves what it holds,
+/// `verify` runs each step it holds as well and stops the build on a difference, `off`
+/// installs none; any other value is an error naming it.
+fn items_in(env: &[(String, String)]) -> Result<Option<body_store::Mode>, ApiError> {
+    match env.iter().find(|(name, _)| name == ITEMS).map(|(_, value)| value.as_str()) {
+        None => Ok(Some(body_store::Mode::Serve)),
+        Some("verify") => Ok(Some(body_store::Mode::Verify)),
+        Some("off") => Ok(None),
+        Some(value) => Err(ApiError::new(
+            // alloc: error path
+            format!(
+                "{ITEMS}={value} is not a value blaze takes: `verify` runs each body's inference, MIR and \
+                 borrow check the item store holds as well and fails on a difference, `off` uses no item \
+                 store, unset reads it"
+            ),
+            None,
+        )),
+    }
+}
+
+/// Once a build has ended: the first error the item store met in it (a record that does not
+/// open, a store that could not be read, under `verify` a stored result that differs), as the
+/// build's error.
+pub(crate) fn item_errors(session: &Session) -> Result<(), ApiError> {
+    match &session.items {
+        Some(items) => items.errors().map_err(|why| ApiError::new(why, None)),
+        None => Ok(()),
+    }
 }
 
 impl Session {
@@ -202,16 +249,16 @@ pub(crate) fn differences(kept: &Kept) -> Result<(), ApiError> {
 /// none of (a crate whose image would not cover every input is refused by
 /// [`hir_def::deps::store`] and resolved again in each build); the outcomes and checked bodies
 /// of the dependency crates it checked (`later`, their paths named from `root`), after their
-/// dependencies'; the constants' values they evaluated; the goals offered, with what their
-/// flush did ([`flushed`]). Called when the head's next build lowers into the front end, which
-/// no task reads then.
+/// dependencies'; the constants' values they evaluated; the goals and bodies' steps offered,
+/// with what their flushes did ([`noted`]). Called when the head's next build lowers into the
+/// front end, which no task reads then.
 pub(crate) fn store(
     lowered: &Lowered,
     kept: Option<Kept>,
     session: &mut Session,
     later: &[Later],
     root: &str,
-) -> Result<(Vec<Put>, goal_store::Flushed), ApiError> {
+) -> Result<(Vec<Put>, Flushes), ApiError> {
     let images = &*session.images;
     let stored = match &kept {
         Some(kept) => Some(lowered.store_deps(&kept.served, images).map_err(super::lower_error)?),
@@ -232,7 +279,8 @@ pub(crate) fn store(
     let mut bases = session.checks.keys.clone(); // clone: once per front end stored
     bases.extend(kept_checks.keys);
     hir_ty::consteval::deps::drain(db, &bases).map_err(error)?;
-    let flushed = session.installed.flush().map_err(|why| error(format!("the persistent goal cache: {why}")))?; // alloc: error path
+    let goals = session.installed.flush().map_err(|why| error(format!("the persistent goal cache: {why}")))?; // alloc: error path
+    let items = session.items.as_ref().map(body_store::Installed::flush).transpose().map_err(error)?;
     let puts = images.take_puts();
     if let Some(stored) = &stored {
         for krate in &stored.written {
@@ -241,7 +289,51 @@ pub(crate) fn store(
         // alloc: once per front end stored, one per crate refused an image
         session.refused.extend(stored.refused.iter().map(|(krate, why)| (*krate, why.to_string())));
     }
-    Ok((puts, flushed))
+    Ok((puts, Flushes { goals, items }))
+}
+
+/// What [`store`]'s flushes did: the goal store's, and the item store's when one is installed.
+pub(crate) struct Flushes {
+    pub(crate) goals: goal_store::Flushed,
+    pub(crate) items: Option<body_store::Flushed>,
+}
+
+/// The `-v` note of what [`store`]'s flushes did: the goals' ([`flushed`]), then the bodies'
+/// steps the head's last build offered, and why any were kept out.
+pub(crate) fn noted(flushes: &Flushes) -> Diagnostic {
+    let mut note = flushed(&flushes.goals);
+    let Some(items) = &flushes.items else { return note };
+    let body_store::Flushed {
+        written,
+        kept,
+        slots_full,
+        refused,
+        unhashable,
+        no_identity,
+        unshareable,
+        unencodable,
+        dropped,
+    } = items;
+    // alloc: under `-v`, once per build that stored a front end
+    let mut message = format!("; the item store: {written} written, {kept} kept, {slots_full} with every slot full");
+    if !refused.is_empty() {
+        let by: Vec<String> = refused.iter().map(|(read, count)| format!("`{read}` ({count})")).collect(); // alloc: as above
+        message.push_str(&format!("; steps kept out by reads of {}", by.join(", "))); // alloc: as above
+    }
+    for (count, why) in [
+        (unhashable, "with a fact that could not be hashed"),
+        (no_identity, "of bodies with no identity"),
+        (unshareable, "whose reads could not be captured"),
+        (unencodable, "with no stored form"),
+        (dropped, "dropped as their thread's buffer was full"),
+    ] {
+        if *count > 0 {
+            message.push_str(&format!("; {count} {why}")); // alloc: as above
+        }
+    }
+    note.message.push_str(&message);
+    note.rendered = format!("note: {}\n", note.message); // alloc: as above
+    note
 }
 
 /// The `-v` note of what [`store`]'s flush of the persistent goal cache did with the goals the
@@ -309,17 +401,27 @@ pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<Served
                 ServedCrate { package, outcome: ServedPart::Refused, bodies: ServedPart::Refused, why: Some(why) }
             }
             Some(_) => {
+                // What is not served of a crate built as its programs reach it is not checked either.
+                let reached = super::compile::reached_only(job, u)?;
+                let unserved = if reached { ServedPart::Refused } else { ServedPart::Checked };
                 let refused = outcomes.get(&krate).copied().flatten();
                 let outcome = match (session.checks.has(krate), refused) {
                     (true, _) => ServedPart::Served,
                     (false, Some(_)) => ServedPart::Refused,
-                    (false, None) => ServedPart::Checked,
+                    (false, None) => unserved,
                 };
                 let bodies = match session.checks.keys.contains_key(&krate) {
                     true => ServedPart::Served,
-                    false => ServedPart::Checked,
+                    false => unserved,
                 };
-                ServedCrate { package, outcome, bodies, why: refused.map(str::to_owned) }
+                let why = match refused {
+                    Some(why) => Some(why.to_owned()), // alloc: once per line refused
+                    None if reached && (outcome, bodies) != (ServedPart::Served, ServedPart::Served) => {
+                        Some(super::compile::REACHED_ONLY.to_owned()) // alloc: as above
+                    }
+                    None => None,
+                };
+                ServedCrate { package, outcome, bodies, why }
             }
         };
         lines.push(line);

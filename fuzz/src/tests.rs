@@ -221,6 +221,58 @@ fn recent_operands_replace_what_was_compared() {
 }
 
 #[test]
+fn finding_an_operand_agrees_with_a_search_at_every_offset() {
+    let linear = |data: &[u8], from: &[u8], start: usize| {
+        let last = data.len() - from.len();
+        (start..=last).chain(0..start).find(|&at| &data[at..at + from.len()] == from)
+    };
+    let mut random = Random::new(11);
+    let mut found = 0;
+    for _ in 0..20_000 {
+        // Two letters, so words are found often, and found again before where the search starts.
+        let data: Vec<u8> = (0..random.below(48)).map(|_| b'a' + random.below(2) as u8).collect();
+        let from: Vec<u8> = (0..1 + random.below(6)).map(|_| b'a' + random.below(2) as u8).collect();
+        if data.len() < from.len() {
+            continue;
+        }
+        let start = random.below(data.len() - from.len() + 1);
+        let want = linear(&data, &from, start);
+        assert_eq!(mutate::find_from(&data, &from, start), want, "{from:?} in {data:?} from {start}");
+        found += usize::from(want.is_some_and(|at| at < start));
+    }
+    assert!(found > 1000, "words found before the start only {found} times");
+}
+
+#[test]
+fn a_byte_comparison_that_differs_is_kept_for_the_dictionary() {
+    let a: [u8; raw::WORD] = std::array::from_fn(|i| 0x40 + i as u8);
+    let mut b = a;
+    b[raw::WORD - 1] ^= 0xff;
+    raw::__sanitizer_weak_hook_memcmp(std::ptr::null(), a.as_ptr().cast(), b.as_ptr().cast(), raw::WORD, -1);
+    assert!(
+        (0..raw::TORC_WORDS).any(|slot| raw::recent_bytes(slot) == (a, b, raw::WORD)),
+        "the operands' first {} bytes are in a slot",
+        raw::WORD
+    );
+}
+
+#[test]
+fn a_case_repeats_with_the_input_and_one_byte_reaches_every_case() {
+    for cases in [1, 2, 3, 5, 7, 14] {
+        let mut data = b"input".to_vec();
+        let mut reached = vec![false; cases];
+        for last in 0..=u8::MAX {
+            *data.last_mut().unwrap() = last;
+            let case = crate::case(&data, cases);
+            assert_eq!(crate::case(&data, cases), case, "the same input takes the same case");
+            reached[case] = true;
+        }
+        assert!(reached.iter().all(|it| *it), "every one of {cases} cases is reached");
+    }
+    assert_eq!(crate::case(&[], 3), 0);
+}
+
+#[test]
 fn decimal_digits_match_the_formatter() {
     let mut buffer = [0u8; 20];
     for value in [0u64, 1, 9, 10, 99, 100, 12345, u32::MAX as u64, u64::MAX] {

@@ -6,7 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::hash::{CompileMode, CrateType, TargetKind};
+use blaze_manifest::targets::{CrateType, TargetKind};
+
+use super::hash::CompileMode;
 use crate::query::LoadError;
 use crate::stdlib::target as platform;
 

@@ -146,6 +146,3 @@ What stands in the way, filed in `v2/requests/solver-sync-glue.md`:
 ## Left outside this file
 
 - The `SharedKey` precompute in `DbInterner`, above (`interner.rs`, solver-sync).
-- `docs/v2/plan/lanes/db/trait-solver.md`'s "Costs" still describes the old cache: "one
-  uncontended lock on the slot's own 128-byte-aligned lines" and "one virtual call for the
-  database state". It is now lock-free, with no database call per query lookup (lane db).

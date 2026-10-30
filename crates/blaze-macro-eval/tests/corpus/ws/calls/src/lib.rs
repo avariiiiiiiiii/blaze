@@ -1,5 +1,9 @@
 //! The calls the corpus expands (`crates/blaze-macro-eval/tests/corpus.rs`), each at item
-//! level, so that resolving the crate's names expands every one of them.
+//! level, so that resolving the crate's names expands every one of them. Its tests (`tests.rs`)
+//! say what each expansion has to do, built with the expansions the build made.
+
+#[cfg(test)]
+mod tests;
 
 use corpus_macros::{env_name, include_data, label, make_fn, Describe};
 use corpus_state::counter;

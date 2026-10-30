@@ -260,13 +260,18 @@ fn replace_or_put(r: &mut Random, data: &mut Vec<u8>, from: &[u8], to: &[u8], li
     if !from.is_empty() && data.len() >= from.len() {
         let last = data.len() - from.len();
         let start = r.below(last + 1);
-        let found = (start..=last).chain(0..start).find(|&at| &data[at..at + from.len()] == from);
-        if let Some(at) = found {
+        if let Some(at) = find_from(data, from, start) {
             data[at..at + to.len()].copy_from_slice(to);
             return true;
         }
     }
     put_word(r, data, to, limit)
+}
+
+/// Where `from` (not empty) first is in `data` at or after `start`, else first before it;
+/// `start` is at most `data.len() - from.len()`.
+pub(crate) fn find_from(data: &[u8], from: &[u8], start: usize) -> Option<usize> {
+    raw::__sanitizer_blaze_fuzzer_find(data, from, start)
 }
 
 /// `word` over bytes of `data`, or inserted into it.

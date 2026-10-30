@@ -65,7 +65,7 @@ use blaze_format::{FormatError, Persist, SchemaHash, Writer};
 use blaze_graph::pump::{self, Flights};
 use blaze_ids::{
     ContentId, Fingerprint, Hasher, Idx,
-    bits::{BitSet, Bits},
+    bits::{AtomicBitSlice, BitSet, BitSlice, Bits},
 };
 use blaze_image::{Builder, Corrupt, Image, Refused, SectionId};
 use blaze_protocol::cbor;
@@ -78,7 +78,7 @@ use crate::{
     memo::{MemoId, Shared, Slot, Store},
     segment::Span,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
         thread_local,
     },
     table::{Column, EdgeRecord, Edit, FxMap, FxSet, Map, Rows, ShortLock},
@@ -171,6 +171,21 @@ pub mod kinds {
     pub const FRONT: std::ops::Range<u16> = 0x2000..0x4000;
     /// Codegen and link: `0x4000..0x5000`.
     pub const BACK: std::ops::Range<u16> = 0x4000..0x5000;
+    /// The front end's syntax (parse), within [`FRONT`]: `0x2000..0x2200`. These sub-ranges are
+    /// how `blaze_graph::admission::tag_of` places a kind in its subsystem.
+    pub const SYNTAX: std::ops::Range<u16> = 0x2000..0x2200;
+    /// Names (resolve): `0x2200..0x2400`.
+    pub const NAMES: std::ops::Range<u16> = 0x2200..0x2400;
+    /// Signatures, bodies and inference: `0x2400..0x2c00`.
+    pub const INFER: std::ops::Range<u16> = 0x2400..0x2c00;
+    /// Macros (expand): `0x2c00..0x3000`.
+    pub const EXPAND: std::ops::Range<u16> = 0x2c00..0x3000;
+    /// MIR, its passes, borrow checking and const eval: `0x3000..0x4000`.
+    pub const MIR: std::ops::Range<u16> = 0x3000..0x4000;
+    /// Codegen, within [`BACK`]: `0x4000..0x4800`.
+    pub const CODEGEN: std::ops::Range<u16> = 0x4000..0x4800;
+    /// Link: `0x4800..0x5000`.
+    pub const LINK: std::ops::Range<u16> = 0x4800..0x5000;
     /// Build scripts, proc macros and tests: `0x5000..0x6000`.
     pub const USER: std::ops::Range<u16> = 0x5000..0x6000;
     /// The workspace load and the unit graph (lane cargo): `0x6000..0x6800`.
@@ -909,13 +924,204 @@ struct ViewState {
     reruns: Map<Rerun>,
 }
 
-/// How many edges ahead [`Database::verify`] starts a lookup: about the misses a core keeps in
-/// flight (20) over the two each lookup takes.
-const AHEAD: usize = 8;
+/// How many edges ahead [`Database::verify`] starts a lookup: the misses a core keeps in flight
+/// (20) over the two each lookup takes.
+const AHEAD: usize = 10;
 
 /// From how many memos [`Database::verify`] prefetches: 2^16 memos are about 8 MB of memo and
 /// result lines, past a core's L2, so lookups start to miss.
 const PREFETCH_FROM: u32 = 1 << 16;
+
+/// From how many memos [`Database::collect`] marks on the plane's workers: below it the walk
+/// stays in cache and takes less than the jobs' start and join (about 10 µs).
+const MARK_PARALLEL_FROM: u32 = 1 << 16;
+
+/// Memos a marking worker takes at a time, from the roots or from what another handed off; it
+/// hands off half its stack once that holds twice as many and a worker has none.
+const MARK_BATCH: usize = 1024;
+
+/// How [`Database::mark`] walks.
+#[derive(Clone, Copy, Debug)]
+enum Mark {
+    Serial,
+    Parallel { batch: usize },
+}
+
+/// A collection's marks, a bit a memo, in its frame.
+type Marks<'f> = Bits<Vec<u64, &'f blaze_mem::frame::Frame>, MemoId>;
+/// The input keys a collection keeps, in its frame.
+type KeptInputs<'f> = hashbrown::HashSet<QueryKey, rustc_hash::FxBuildHasher, &'f blaze_mem::frame::Frame>;
+
+/// What the workers of a parallel mark share.
+struct Marking<'a> {
+    roots: &'a [MemoId],
+    /// The first root no worker has taken.
+    next: std::sync::atomic::AtomicUsize,
+    /// The open views, whose results are roots too: taken a shard of one view's results at a
+    /// time, unit `u` being shard `u % shards` of view `u / shards`.
+    views: &'a [&'a ViewState],
+    shards: usize,
+    /// The first unit no worker has taken.
+    next_unit: std::sync::atomic::AtomicUsize,
+    batch: usize,
+    /// A bit a memo below its capacity; a memo past it (made while the walk ran) goes to `late`.
+    reached: AtomicBitSlice<'a>,
+    /// A bit for each memo a view's results name, as `reached`'s; one past it goes to `late_hot`.
+    hot: AtomicBitSlice<'a>,
+    late_hot: ShortLock<Vec<MemoId>>,
+    /// Memos a worker handed off for others to walk.
+    spill: ShortLock<Vec<MemoId>>,
+    /// `spill`'s length, written under its lock, read with none by workers looking for work.
+    spilled: std::sync::atomic::AtomicUsize,
+    /// Set by a worker with nothing to walk; cleared by the one that hands off.
+    hungry: std::sync::atomic::AtomicBool,
+    /// Workers holding memos to walk, or looking for some to take.
+    busy: std::sync::atomic::AtomicUsize,
+    /// The input keys the walk read, each worker's once.
+    inputs: ShortLock<Vec<QueryKey>>,
+    late: ShortLock<Vec<MemoId>>,
+}
+
+/// Runs `job` once on each of the plane's workers, at most `most` times, and returns once
+/// every run has ended; then the first panic of one goes on here. For a collection's passes,
+/// which split their work among the runs themselves.
+pub(crate) fn on_workers(most: usize, job: impl Fn() + Sync) {
+    let pool = blaze_graph::exec::shared();
+    // dyn: a panic's payload, as `catch_unwind` gives it
+    let mut panic: ShortLock<Option<Box<dyn Any + Send>>> = ShortLock::new(None);
+    pool.scope(|scope| {
+        for _ in 0..pool.workers().min(most) {
+            scope.submit(None, &job, |ran| {
+                if let Err(payload) = ran {
+                    panic.lock().get_or_insert(payload);
+                }
+            });
+        }
+    });
+    if let Some(payload) = panic.get_mut().take() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// A key's order in 8 bytes: its kind, then its input's first 6 bytes. Inputs are content
+/// hashes, so among 10M keys about one pair shares them.
+fn key_prefix(key: &QueryKey) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes[..2].copy_from_slice(&key.kind.0.to_be_bytes());
+    bytes[2..].copy_from_slice(&key.input.0[..6]);
+    u64::from_be_bytes(bytes)
+}
+
+/// Sorts `keys` ascending, as `sort_unstable` would: a radix sort of their [`key_prefix`]es on
+/// the plane's workers, then each run of keys sharing one (rare, and equal keys) by comparison.
+fn sort_keys(keys: &mut [QueryKey]) {
+    blaze_ids::radix::on(blaze_graph::exec::shared()).sort_by_key(keys, key_prefix);
+    for run in keys.chunk_by_mut(|a, b| key_prefix(a) == key_prefix(b)) {
+        if run.len() > 1 {
+            run.sort_unstable();
+        }
+    }
+}
+
+/// Adds to `unlinked` the memos of `old` that `new` (`None`: the slot was removed) no longer
+/// lists.
+fn unlinked_from<A: std::alloc::Allocator>(unlinked: &mut Vec<MemoId, A>, old: &Slot, new: Option<&Slot>) {
+    let still = new.map_or(&[][..], Slot::memos);
+    unlinked.extend(old.memos().iter().copied().filter(|memo| !still.contains(memo)));
+}
+
+/// A worker counted in [`Marking::busy`] until dropped, unwinding too, so a panic in one
+/// never leaves the others waiting for it.
+struct Busy<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> Busy<'a> {
+    fn enter(busy: &'a std::sync::atomic::AtomicUsize) -> Busy<'a> {
+        busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Busy(busy)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Marking<'_> {
+    fn units(&self) -> usize {
+        self.views.len() * self.shards
+    }
+
+    /// Moves the next batch of roots, else a shard of a view's results (marking each hot, or
+    /// adding it to `late_hot` past the marks), else of what was handed off, onto `stack`, if
+    /// any is left.
+    fn take(
+        &self,
+        task: &Guard,
+        stack: &mut Vec<MemoId, &blaze_mem::frame::Frame>,
+        late_hot: &mut Vec<MemoId, &blaze_mem::frame::Frame>,
+    ) {
+        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+        if self.next.load(SeqCst) < self.roots.len() {
+            let at = self.next.fetch_add(self.batch, SeqCst);
+            if at < self.roots.len() {
+                stack.extend_from_slice(&self.roots[at..(at + self.batch).min(self.roots.len())]);
+                return;
+            }
+        }
+        if self.next_unit.load(SeqCst) < self.units() {
+            let unit = self.next_unit.fetch_add(1, SeqCst);
+            if unit < self.units() {
+                self.views[unit / self.shards].results.for_each_in(task, unit % self.shards, |_, resolved| {
+                    let memo = resolved.memo;
+                    if (memo as usize) < self.hot.capacity() {
+                        self.hot.insert_if_clear(memo as usize, Relaxed);
+                    } else {
+                        late_hot.push(memo);
+                    }
+                    stack.push(memo);
+                });
+                return;
+            }
+        }
+        if self.spilled.load(SeqCst) == 0 {
+            return;
+        }
+        let mut spill = self.spill.lock();
+        let from = spill.len().saturating_sub(self.batch);
+        stack.extend(spill.drain(from..));
+        self.spilled.store(spill.len(), SeqCst);
+    }
+
+    /// Hands off the older half of `stack`, the memos nearer the roots, to the workers with none.
+    fn give(&self, stack: &mut Vec<MemoId, &blaze_mem::frame::Frame>) {
+        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+        let half = stack.len() / 2;
+        let mut spill = self.spill.lock();
+        spill.extend_from_slice(&stack[..half]);
+        self.spilled.store(spill.len(), SeqCst);
+        drop(spill);
+        stack.drain(..half);
+        self.hungry.store(false, Relaxed);
+    }
+
+    /// Whether roots, views' results or handed-off memos are left to take.
+    fn has_work(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.next.load(SeqCst) < self.roots.len()
+            || self.next_unit.load(SeqCst) < self.units()
+            || self.spilled.load(SeqCst) > 0
+    }
+
+    /// Whether every memo the walk reaches was walked, read by a worker holding none. `busy`
+    /// first: only a busy worker hands off, before it is counted out, so whoever then finds
+    /// `busy` at 0 sees the hand-off. A worker that enters `busy` after that read takes what
+    /// is left itself, and takes back what it hands off if no other worker is left to.
+    fn done(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.busy.load(SeqCst) == 0 && !self.has_work()
+    }
+}
 
 /// A key's memo in a view, with the memo's fingerprint beside it.
 #[derive(Clone, Copy)]
@@ -1124,11 +1330,12 @@ pub struct Database {
     /// views opened.
     spare_views: ShortLock<SpareViews>,
     /// Bumped by each collection; a key given a memo since one started is kept by it whole.
-    generation: AtomicU64,
-    /// The generation each key was last given a memo in: 48 bytes of row a key.
-    born: Map<u64>,
+    /// Each memo's cold row holds the generation its key last resolved to it in.
+    generation: AtomicU32,
     store: Store,
     image: Option<ImageMap>,
+    /// Every key of `image` has a slot ([`Database::slot_image_keys`] ran).
+    image_slotted: std::sync::atomic::AtomicBool,
     io: ShortLock<Io>,
 }
 
@@ -1179,10 +1386,10 @@ impl Database {
             contexts: FxMap::default(),
             flights: Flights::new(),
             spare_views: ShortLock::default(),
-            generation: AtomicU64::new(0),
-            born: Map::new(),
+            generation: AtomicU32::new(0),
             store: Store::new(),
             image: None,
+            image_slotted: std::sync::atomic::AtomicBool::new(false),
             io: ShortLock::default(),
         };
         db.register::<subtree::Subtree>();
@@ -1371,6 +1578,7 @@ impl Database {
     pub fn collect(&self, kept: &[QueryKey], effects: &mut Vec<Effect>) {
         let task = blaze_reclaim::enter();
         let started = self.generation.fetch_add(1, Ordering::SeqCst);
+        assert!(started < u32::MAX, "2^32 collections of one database");
         blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
             // Before the views are walked: a memo unlinked earlier is checked against what
             // they hold now (see `memo`'s comment).
@@ -1385,17 +1593,13 @@ impl Database {
             let (mut reached, mut hot) = (marks(), marks());
             let mut inputs_kept = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
             let mut work: Vec<MemoId, _> = Vec::new_in(frame);
+            let mut views: Vec<&ViewState, _> = Vec::new_in(frame);
             self.views.for_each(&task, |state| {
-                state.results.for_each(&task, |_, resolved| {
-                    let memo = resolved.memo;
-                    hot.insert_growing(memo);
-                    work.push(memo);
-                });
+                views.push(state);
                 state.inputs.for_each(&task, |key, _| {
                     inputs_kept.insert(*key);
                 });
             });
-            self.store.checked(&dying, |memo| hot.contains(memo));
             for key in kept {
                 if is_input(key.kind) {
                     inputs_kept.insert(*key);
@@ -1403,68 +1607,50 @@ impl Database {
                     work.extend_from_slice(slot.memos());
                 }
             }
-            while let Some(memo) = work.pop() {
-                if !reached.insert_growing(memo) {
-                    continue;
-                }
-                for edge in self.store.edges(&task, memo) {
-                    let read = edge.read();
-                    if is_input(read.kind) {
-                        inputs_kept.insert(read);
-                        continue;
-                    }
-                    if let Some(slot) = self.slot(&task, &read) {
-                        let saw = edge.saw();
-                        work.extend(
-                            slot.memos().iter().copied().filter(|&it| self.store.fingerprint(&task, it) == saw),
-                        );
-                    }
-                }
-            }
+            let how = if self.store.end() >= MARK_PARALLEL_FROM {
+                Mark::Parallel { batch: MARK_BATCH }
+            } else {
+                Mark::Serial
+            };
+            self.mark(&task, frame, &views, &mut work, &mut reached, &mut hot, &mut inputs_kept, how);
+            self.store.checked(&dying, |memo| hot.contains(memo));
 
-            let young = |key: &QueryKey| self.born.get(&task, key).is_some_and(|born| *born > started);
-            let mut unlinked: Vec<MemoId, _> = Vec::new_in(frame);
-            // Reused for every slot.
-            let mut live: Vec<MemoId, _> = Vec::new_in(frame);
-            self.slots.edit_all_with(
-                &task,
-                |key, slot| {
-                    let memos = slot.memos();
-                    if young(key) {
-                        for &memo in memos {
-                            for edge in self.store.edges(&task, memo) {
-                                if is_input(edge.read().kind) {
-                                    inputs_kept.insert(edge.read());
-                                }
-                            }
-                        }
-                        return Edit::Keep;
-                    }
-                    live.clear();
-                    live.extend(memos.iter().copied().filter(|&memo| reached.contains(memo)));
-                    if live.len() == memos.len() {
-                        Edit::Keep
-                    } else if !live.is_empty() {
-                        Edit::Replace(self.store.slot(slot.share_key(), &live))
-                    } else if self.image.as_ref().is_some_and(|image| !matches!(image.find(key), Ok(None))) {
-                        // Left empty, not removed, so the image's memos of the key stay dropped.
-                        Edit::Replace(self.store.slot(slot.share_key(), &[]))
-                    } else {
-                        Edit::Remove
-                    }
-                },
-                |old, new| {
-                    let still = new.map_or(&[][..], Slot::memos);
-                    unlinked.extend(old.memos().iter().copied().filter(|memo| !still.contains(memo)));
-                },
-            );
-            self.store.unlinked(&unlinked);
-            if let Some(image) = &self.image {
-                image.for_each_key(|key| {
-                    self.slots.get_or_insert_with(&task, key, Slot::empty);
-                });
+            let marks = reached.as_slice();
+            if matches!(how, Mark::Parallel { .. }) {
+                // alloc: a parallel collection's list of what young keys read, once a collection
+                let young_inputs: ShortLock<Vec<QueryKey>> = ShortLock::new(Vec::new());
+                self.slots.edit_all_parallel(
+                    || (blaze_mem::scratch::lend_u32s(), blaze_mem::scratch::lend_u32s()),
+                    |(live, _), task, key, slot| {
+                        self.sweep_slot(task, started, &marks, key, slot, &mut **live, |input| {
+                            young_inputs.lock().push(input);
+                        })
+                    },
+                    |(_, unlinked), old, new| unlinked_from(&mut **unlinked, old, new),
+                    |(_, unlinked)| self.store.unlinked(&unlinked),
+                );
+                inputs_kept.extend(young_inputs.lock().drain(..));
+            } else {
+                let mut unlinked: Vec<MemoId, _> = Vec::new_in(frame);
+                // Reused for every slot.
+                let mut live: Vec<MemoId, _> = Vec::new_in(frame);
+                self.slots.edit_all_with(
+                    &task,
+                    |key, slot| {
+                        self.sweep_slot(&task, started, &marks, key, slot, &mut live, |input| {
+                            inputs_kept.insert(input);
+                        })
+                    },
+                    |old, new| unlinked_from(&mut unlinked, old, new),
+                );
+                self.store.unlinked(&unlinked);
             }
-            self.born.retain(&task, |_, born| *born > started);
+            if let Some(image) = &self.image
+                && !self.image_slotted.load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.slot_image_keys(&task, image);
+                self.image_slotted.store(true, std::sync::atomic::Ordering::Release);
+            }
             self.inputs.retain(&task, |key, _| inputs_kept.contains(key));
 
             if self.config.dir.is_some() {
@@ -1479,6 +1665,258 @@ impl Database {
                 self.write_cold(&task, cold.into_iter().map(|(_, _, memo)| memo), effects);
             }
             self.collect_retired(&task);
+        });
+    }
+
+    /// Marks in `hot` every memo the results of `views` name, and in `reached` every memo of
+    /// those and of `work` and every memo their edges reach (a memo of the key an edge read
+    /// with the fingerprint it saw), and keeps in `inputs` each input key an edge read; `work`
+    /// is left empty. Both ways reach the same sets, `hot` the results' memos and `reached`
+    /// their closure with `work`'s under the edges: a memo is walked once, by whoever sets its
+    /// bit.
+    #[allow(clippy::too_many_arguments)]
+    fn mark<'f>(
+        &self,
+        task: &Guard,
+        frame: &'f blaze_mem::frame::Frame,
+        views: &[&ViewState],
+        work: &mut Vec<MemoId, &'f blaze_mem::frame::Frame>,
+        reached: &mut Marks<'f>,
+        hot: &mut Marks<'f>,
+        inputs: &mut KeptInputs<'f>,
+        how: Mark,
+    ) {
+        match how {
+            Mark::Parallel { batch } => self.mark_parallel(frame, views, work, reached, hot, inputs, batch),
+            Mark::Serial => {
+                for state in views {
+                    state.results.for_each(task, |_, resolved| {
+                        hot.insert_growing(resolved.memo);
+                        work.push(resolved.memo);
+                    });
+                }
+            }
+        }
+        while let Some(memo) = work.pop() {
+            if !reached.insert_growing(memo) {
+                continue;
+            }
+            self.mark_edges(task, memo, |key| {
+                inputs.insert(key);
+            }, |it| work.push(it));
+        }
+    }
+
+    /// `memo`'s edges, for marking: each input key it read to `input`, and each memo of a key it
+    /// read with the fingerprint it saw to `reach`.
+    #[inline]
+    fn mark_edges(&self, task: &Guard, memo: MemoId, mut input: impl FnMut(QueryKey), mut reach: impl FnMut(MemoId)) {
+        for edge in self.store.edges(task, memo) {
+            let read = edge.read();
+            if is_input(read.kind) {
+                input(read);
+                continue;
+            }
+            if let Some(slot) = self.slot(task, &read) {
+                let saw = edge.saw();
+                for &it in slot.memos() {
+                    if self.store.fingerprint(task, it) == saw {
+                        reach(it);
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Database::mark`] on every worker of the plane: each takes `batch` roots, or a shard
+    /// of a view's results, at a time and walks them depth first, setting each memo's bit with
+    /// one `fetch_or` (after a load finds it clear), so a memo is walked by one worker. A worker
+    /// whose stack outgrows two batches while another has none hands off half. Leaves in
+    /// `work` the memos past `reached`'s capacity it met, made while it ran, for the serial
+    /// walk to finish; `hot` grows to hold those the results name.
+    #[allow(clippy::too_many_arguments)]
+    fn mark_parallel<'f>(
+        &self,
+        frame: &'f blaze_mem::frame::Frame,
+        views: &[&ViewState],
+        work: &mut Vec<MemoId, &'f blaze_mem::frame::Frame>,
+        reached: &mut Marks<'f>,
+        hot: &mut Marks<'f>,
+        inputs: &mut KeptInputs<'f>,
+        batch: usize,
+    ) {
+        let atomic = |marks: &Marks<'f>| {
+            let mut words: Vec<std::sync::atomic::AtomicU64, _> = Vec::with_capacity_in(marks.words().len(), frame);
+            words.extend(marks.words().iter().map(|&word| std::sync::atomic::AtomicU64::new(word)));
+            words
+        };
+        let plain = |mut words: Vec<std::sync::atomic::AtomicU64, &'f blaze_mem::frame::Frame>| {
+            let mut marked = Vec::with_capacity_in(words.len(), frame);
+            marked.extend(words.iter_mut().map(|word| *word.get_mut()));
+            Bits::from_words(marked)
+        };
+        let (reached_words, hot_words) = (atomic(reached), atomic(hot));
+        let mut marking = Marking {
+            roots: work,
+            next: std::sync::atomic::AtomicUsize::new(0),
+            views,
+            shards: views.first().map_or(0, |state| state.results.shard_count()),
+            next_unit: std::sync::atomic::AtomicUsize::new(0),
+            batch: batch.max(1),
+            reached: AtomicBitSlice::from_words(&reached_words),
+            hot: AtomicBitSlice::from_words(&hot_words),
+            // alloc: here and below, a parallel collection's shared lists, once each a collection
+            late_hot: ShortLock::new(Vec::new()),
+            spill: ShortLock::new(Vec::new()), // alloc: see above
+            spilled: std::sync::atomic::AtomicUsize::new(0),
+            hungry: std::sync::atomic::AtomicBool::new(false),
+            busy: std::sync::atomic::AtomicUsize::new(0),
+            inputs: ShortLock::new(Vec::new()), // alloc: see above
+            late: ShortLock::new(Vec::new()),   // alloc: see above
+        };
+        on_workers(usize::MAX, || self.mark_job(&marking));
+        let found = std::mem::take(marking.inputs.get_mut());
+        let late = std::mem::take(marking.late.get_mut());
+        let late_hot = std::mem::take(marking.late_hot.get_mut());
+        drop(marking);
+        *reached = plain(reached_words);
+        *hot = plain(hot_words);
+        for &memo in &late_hot {
+            hot.insert_growing(memo);
+        }
+        inputs.extend(found);
+        work.clear();
+        work.extend_from_slice(&late);
+    }
+
+    /// One worker of [`Database::mark_parallel`]: walks what it takes until nothing is left to
+    /// take and no worker holds any.
+    fn mark_job(&self, marking: &Marking<'_>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let task = blaze_reclaim::enter();
+        blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+            let mut stack: Vec<MemoId, _> = Vec::new_in(frame);
+            let mut late: Vec<MemoId, _> = Vec::new_in(frame);
+            let mut late_hot: Vec<MemoId, _> = Vec::new_in(frame);
+            let mut inputs: KeptInputs<'_> = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
+            let reached = marking.reached;
+            let mut idle = 0u32;
+            loop {
+                if !marking.has_work() {
+                    if marking.done() {
+                        break;
+                    }
+                    marking.hungry.store(true, Relaxed);
+                    idle += 1;
+                    if idle < 64 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                    continue;
+                }
+                idle = 0;
+                let busy = Busy::enter(&marking.busy);
+                marking.take(&task, &mut stack, &mut late_hot);
+                while let Some(memo) = stack.pop() {
+                    if memo as usize >= reached.capacity() {
+                        late.push(memo);
+                        continue;
+                    }
+                    if !reached.insert_if_clear(memo as usize, Relaxed) {
+                        continue;
+                    }
+                    self.mark_edges(&task, memo, |key| {
+                        inputs.insert(key);
+                    }, |it| stack.push(it));
+                    if stack.len() >= 2 * marking.batch && marking.hungry.load(Relaxed) {
+                        marking.give(&mut stack);
+                    }
+                }
+                drop(busy);
+            }
+            if !inputs.is_empty() {
+                let mut all = marking.inputs.lock();
+                all.reserve(inputs.len());
+                all.extend(inputs.iter().copied());
+            }
+            if !late.is_empty() {
+                marking.late.lock().extend_from_slice(&late);
+            }
+            if !late_hot.is_empty() {
+                marking.late_hot.lock().extend_from_slice(&late_hot);
+            }
+        });
+    }
+
+    /// What a collection does to `key`'s slot, from what its walk `reached`. A key given a memo
+    /// since the collection began (`started`) is kept whole, and each input key its memos read
+    /// goes to `input`: the walk may have passed its views before it resolved. A key whose
+    /// memos were all reached is kept either way, their inputs kept by the walk, so only a key
+    /// with one unreached reads its memos' cold rows. `live` is scratch.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_slot<A: std::alloc::Allocator>(
+        &self,
+        task: &Guard,
+        started: u32,
+        reached: &BitSlice<'_, MemoId>,
+        key: &QueryKey,
+        slot: &Slot,
+        live: &mut Vec<MemoId, A>,
+        mut input: impl FnMut(QueryKey),
+    ) -> Edit<Slot> {
+        let memos = slot.memos();
+        if memos.iter().all(|&memo| reached.contains(memo)) {
+            return Edit::Keep;
+        }
+        if memos.iter().any(|&memo| self.store.born(task, memo) > started) {
+            for &memo in memos {
+                for edge in self.store.edges(task, memo) {
+                    if is_input(edge.read().kind) {
+                        input(edge.read());
+                    }
+                }
+            }
+            return Edit::Keep;
+        }
+        live.clear();
+        live.extend(memos.iter().copied().filter(|&memo| reached.contains(memo)));
+        if !live.is_empty() {
+            Edit::Replace(self.store.slot(slot.share_key(), &live[..]))
+        } else if self.image.as_ref().is_some_and(|image| !matches!(image.find(key), Ok(None))) {
+            // Left empty, not removed, so the image's memos of the key stay dropped.
+            Edit::Replace(self.store.slot(slot.share_key(), &[]))
+        } else {
+            Edit::Remove
+        }
+    }
+
+    /// Gives every key of the image a slot, empty if it has none: an image memo no slot took
+    /// in by now was reached by nothing, and is dropped. A sweep leaves an image key's slot
+    /// empty and never removes it, so once every key has one this has nothing left to do, and
+    /// [`Database::collect`] runs it once an image. A large table is split among the plane's
+    /// workers by groups, each key named by one slot of it.
+    fn slot_image_keys(&self, task: &Guard, image: &ImageMap) {
+        let len = image.table_len();
+        if len < MARK_PARALLEL_FROM as usize {
+            image.for_each_key(|key| {
+                self.slots.get_or_insert_with(task, key, Slot::empty);
+            });
+            return;
+        }
+        let chunk = image.slots_per_group().max(1) * 16;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        on_workers(len.div_ceil(chunk), || {
+            let task = blaze_reclaim::enter();
+            loop {
+                let from = next.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
+                if from >= len {
+                    break;
+                }
+                image.for_each_key_in(from..from + chunk, |key| {
+                    self.slots.get_or_insert_with(&task, key, Slot::empty);
+                });
+            }
         });
     }
 
@@ -1497,7 +1935,6 @@ impl Database {
         self.spare_views.lock().sweep();
         self.slots.sweep();
         self.inputs.sweep();
-        self.born.sweep();
         self.views.for_each(task, ViewState::sweep);
         self.store.sweep();
     }
@@ -1647,7 +2084,6 @@ impl Database {
         self.spare_views.get_mut().reclaim();
         self.slots.reclaim();
         self.inputs.reclaim();
-        self.born.reclaim();
         // alloc: one bitset a reclaim, 1 bit a memo.
         let mut held = BitSet::<MemoId>::new(self.store.end() as usize);
         {
@@ -1793,14 +2229,17 @@ impl Database {
     /// equal one it had already (then `made`, never published, is freed).
     fn add_memo(&self, task: &Guard, key: QueryKey, made: MemoId) -> MemoId {
         self.slot(task, &key);
-        // Only ever raised: a giver that loaded the generation before `collect` bumped it must
-        // not lower the stamp of one that loaded it after, or `collect` drops a young memo.
+        // Stamped before `made` is published, so a collection that finds it in the slot sees
+        // the stamp; an equal memo found instead is restamped, only ever raised: a giver that
+        // loaded the generation before `collect` bumped it must not lower the stamp of one that
+        // loaded it after, or `collect` drops a young memo.
         let now = self.generation.load(Ordering::SeqCst);
-        self.born.update(task, key, |born| born.is_none_or(|born| *born < now).then_some(now));
+        self.store.born_in(task, made, now);
         let kept = Cell::new(made);
         self.slots.update(task, key, |slot| {
             let memos = slot.map_or(&[][..], Slot::memos);
             if let Some(&same) = memos.iter().find(|&&it| self.store.same(task, it, &self.store, made)) {
+                self.store.reborn_in(task, same, now);
                 kept.set(same);
                 return None;
             }
@@ -2186,7 +2625,7 @@ impl Database {
         if let Some(image) = &self.image {
             image.for_each_key(|key| keys.push(key));
         }
-        keys.sort_unstable();
+        sort_keys(&mut keys);
         keys.dedup();
         // Reading a key's memos in from the image may add codes, so a code past the snapshot
         // takes a new one.

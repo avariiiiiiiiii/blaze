@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
+use blaze_format::cursor::{Put as _, Reader};
 use blaze_store::Store;
 use sha2::Digest as _;
 
@@ -76,36 +77,32 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        let bytes = |out: &mut Vec<u8>, bytes: &[u8]| {
-            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            out.extend_from_slice(bytes);
-        };
+        let mut out = Vec::new(); // alloc: the value kept, once per store path
         let path = |out: &mut Vec<u8>, path: &StorePath| {
-            bytes(out, path.path.as_bytes());
-            out.extend_from_slice(&path.nar_hash.0);
-            out.extend_from_slice(&path.nar_size.to_le_bytes());
+            out.put_bytes_u64(path.path.as_bytes());
+            out.put_bytes(&path.nar_hash.0);
+            out.put_u64(path.nar_size);
         };
-        bytes(&mut out, MANIFEST);
+        out.put_bytes_u64(MANIFEST);
         path(&mut out, &self.of);
-        out.extend_from_slice(&(self.references.len() as u64).to_le_bytes());
+        out.put_u64(self.references.len() as u64);
         for reference in &self.references {
             path(&mut out, reference);
         }
-        out.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
+        out.put_u64(self.entries.len() as u64);
         for entry in &self.entries {
-            bytes(&mut out, &entry.path);
+            out.put_bytes_u64(&entry.path);
             match &entry.kind {
-                Kind::Directory => out.push(0),
+                Kind::Directory => out.put_u8(0),
                 Kind::File { executable, size, pieces } => {
-                    out.push(if *executable { 2 } else { 1 });
-                    out.extend_from_slice(&size.to_le_bytes());
-                    out.extend_from_slice(&(pieces.len() as u64).to_le_bytes());
-                    pieces.iter().for_each(|it| out.extend_from_slice(it));
+                    out.put_u8(if *executable { 2 } else { 1 });
+                    out.put_u64(*size);
+                    out.put_u64(pieces.len() as u64);
+                    pieces.iter().for_each(|it| out.put_bytes(it));
                 }
                 Kind::Symlink { target } => {
-                    out.push(3);
-                    bytes(&mut out, target);
+                    out.put_u8(3);
+                    out.put_bytes_u64(target);
                 }
             }
         }
@@ -113,59 +110,40 @@ impl Manifest {
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Manifest> {
-        let mut at = Decoding { bytes };
-        if at.bytes()? != MANIFEST {
+        let mut at = Reader::new(bytes);
+        if at.bytes_u64().ok()? != MANIFEST {
             return None;
         }
-        let of = at.path()?;
-        let references = (0..at.number()?).map(|_| at.path()).collect::<Option<_>>()?;
-        let mut entries = Vec::new();
-        for _ in 0..at.number()? {
-            let path = at.bytes()?.to_vec();
-            let kind = match at.take(1)?[0] {
+        let of = store_path(&mut at)?;
+        // A store path is at least its length, hash and size; an entry its length and kind.
+        let references = (0..at.count_u64(48).ok()?).map(|_| store_path(&mut at)).collect::<Option<_>>()?;
+        let count = at.count_u64(9).ok()?;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            // alloc: the manifest owns its entries, read once per store path laid out
+            let path = at.bytes_u64().ok()?.to_vec();
+            let kind = match at.u8().ok()? {
                 0 => Kind::Directory,
                 kind @ (1 | 2) => {
-                    let size = at.number()?;
-                    let count = at.number()?;
-                    let pieces = (0..count).map(|_| at.take(32)?.try_into().ok());
+                    let size = at.u64().ok()?;
+                    let count = at.count_u64(32).ok()?;
+                    let pieces = (0..count).map(|_| at.array::<32>().ok().copied());
                     let pieces = pieces.collect::<Option<Vec<[u8; 32]>>>()?;
                     Kind::File { executable: kind == 2, size, pieces }
                 }
-                3 => Kind::Symlink { target: at.bytes()?.to_vec() },
+                3 => Kind::Symlink { target: at.bytes_u64().ok()?.to_vec() }, // alloc: as `path`
                 _ => return None,
             };
             entries.push(Entry { path, kind });
         }
-        at.bytes.is_empty().then_some(Manifest { of, references, entries })
+        at.is_done().then_some(Manifest { of, references, entries })
     }
 }
 
-struct Decoding<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> Decoding<'a> {
-    fn take(&mut self, len: u64) -> Option<&'a [u8]> {
-        let len = usize::try_from(len).ok().filter(|&it| it <= self.bytes.len())?;
-        let (taken, rest) = self.bytes.split_at(len);
-        self.bytes = rest;
-        Some(taken)
-    }
-
-    fn number(&mut self) -> Option<u64> {
-        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
-
-    fn bytes(&mut self) -> Option<&'a [u8]> {
-        let len = self.number()?;
-        self.take(len)
-    }
-
-    fn path(&mut self) -> Option<StorePath> {
-        let path = String::from_utf8(self.bytes()?.to_vec()).ok()?;
-        let nar_hash = Sha256(self.take(32)?.try_into().ok()?);
-        Some(StorePath { path, nar_hash, nar_size: self.number()? })
-    }
+fn store_path(at: &mut Reader<'_>) -> Option<StorePath> {
+    let path = at.str_u64().ok()?.to_owned(); // alloc: the manifest owns its paths
+    let nar_hash = Sha256(*at.array().ok()?);
+    Some(StorePath { path, nar_hash, nar_size: at.u64().ok()? })
 }
 
 /// Puts what a NAR holds into the store as it is read: each file's pieces as they come, and

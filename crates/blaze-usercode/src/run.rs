@@ -205,7 +205,7 @@ impl Run {
     ) -> Result<(Value, Traced, Vec<Ticket>), RunError<I::Error>> {
         assert_eq!(completion.tag, self.tag, "a run takes its own completion");
         let mut exit = match completion.done {
-            Done::Exited(exit) => exit,
+            Done::Exited(exit) => *exit,
             Done::Failed(error) => {
                 // alloc: error path
                 return Err(RunError::Spawn(format!("{}: {error}", self.spec.command.program.display())));
@@ -296,7 +296,13 @@ fn empty(dir: &Path) -> Result<(), String> {
 /// What `dir` holds: every file and directory below it, by path, sorted. A link is what it
 /// leads to when that is inside `dir`, and an error otherwise: what a later step reads
 /// through it would be read outside every trace.
+///
+/// An entry's kind is the listing's (`d_type`), so a directory costs no call of its own, and a
+/// file is opened once, its mode and length read on the descriptor: open, fstat, two reads and
+/// close, the path resolved once (docs/v2/plan/lanes/usercode/speed-of-light.md, "A run's
+/// `OUT_DIR`").
 pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
+    use std::io::Read as _;
     let top = std::fs::canonicalize(dir).map_err(|error| format!("{}: {error}", dir.display()))?; // alloc: error path
     let mut out = Vec::new(); // alloc: the files the value keeps, read once as a run ends
     let mut stack = vec![PathBuf::new()]; // alloc: once per OUT_DIR collected
@@ -310,10 +316,11 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
                 return Err(format!("{}: a name that is not UTF-8 ({name:?})", at.display())); // alloc: error path
             };
             let rel = rel.join(name);
-            let path = dir.join(&rel);
+            let path = entry.path();
             // alloc: error path
-            let link = std::fs::symlink_metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-            if link.file_type().is_symlink() {
+            let kind = entry.file_type().map_err(|error| format!("{}: {error}", path.display()))?;
+            let linked = kind.is_symlink();
+            if linked {
                 let target = std::fs::canonicalize(&path)
                     .map_err(|error| format!("{}: a link to nothing: {error}", path.display()))?; // alloc: error path
                 if !target.starts_with(&top) {
@@ -325,21 +332,33 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
                     ));
                 }
             }
-            let meta = std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?; // alloc: error path
+            let is_dir = match linked {
+                // alloc: error path
+                true => std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?.is_dir(),
+                false => kind.is_dir(),
+            };
             let name = rel_name(&rel);
-            match meta.is_dir() {
+            match is_dir {
                 true => {
                     out.push(OutFile { path: name, executable: false, bytes: None });
                     // A link to a directory inside is kept as what it leads to, but not
                     // walked twice.
-                    if !link.file_type().is_symlink() {
+                    if !linked {
                         stack.push(rel);
                     }
                 }
                 false => {
+                    let read = |path: &Path| -> std::io::Result<(bool, Vec<u8>)> {
+                        let mut file = std::fs::File::open(path)?;
+                        let meta = file.metadata()?;
+                        // alloc: the file's bytes the value keeps, at their length
+                        let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+                        file.read_to_end(&mut bytes)?;
+                        Ok((executable(&meta), bytes))
+                    };
                     // alloc: error path
-                    let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-                    out.push(OutFile { path: name, executable: executable(&meta), bytes: Some(bytes) });
+                    let (executable, bytes) = read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                    out.push(OutFile { path: name, executable, bytes: Some(bytes) });
                 }
             }
         }
@@ -373,8 +392,15 @@ fn executable(_: &std::fs::Metadata) -> bool {
 
 /// Writes `files` into `dir`, emptied first: the `OUT_DIR` a run reused left. Each path is
 /// checked to stay inside it; one that would not is the store's bytes being wrong.
+///
+/// A directory is made once: one the value lists (it does each, before what is in it) or one
+/// made for a file is not made again for the next file in it. A file is open, write, close,
+/// and `fchmod` on its descriptor when it is executable.
 pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
+    use std::io::Write as _;
     empty(dir)?;
+    // alloc: once per OUT_DIR restored, the directories made in it, lent from `files`
+    let mut made = rustc_hash::FxHashSet::<&str>::default();
     for file in files {
         let ok = !file.path.is_empty()
             && !file.path.starts_with('/')
@@ -384,20 +410,31 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
         }
         let path = dir.join(&file.path);
         match &file.bytes {
-            // alloc: error path
-            None => std::fs::create_dir_all(&path).map_err(|error| format!("{}: {error}", path.display()))?,
-            Some(bytes) => {
-                if let Some(parent) = path.parent() {
+            None => {
+                if made.insert(file.path.as_str()) {
                     // alloc: error path
-                    std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+                    std::fs::create_dir_all(&path).map_err(|error| format!("{}: {error}", path.display()))?;
                 }
-                std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?; // alloc: error path
-                #[cfg(unix)]
-                if file.executable {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|error| format!("{}: {error}", path.display()))?; // alloc: error path
+            }
+            Some(bytes) => {
+                if let Some((parent, _)) = file.path.rsplit_once('/')
+                    && made.insert(parent)
+                {
+                    let parent = dir.join(parent);
+                    // alloc: error path
+                    std::fs::create_dir_all(&parent).map_err(|error| format!("{}: {error}", parent.display()))?;
                 }
+                let write = || -> std::io::Result<()> {
+                    let mut out = std::fs::File::create(&path)?;
+                    out.write_all(bytes)?;
+                    #[cfg(unix)]
+                    if file.executable {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        out.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+                    }
+                    Ok(())
+                };
+                write().map_err(|error| format!("{}: {error}", path.display()))?; // alloc: error path
             }
         }
     }
@@ -647,6 +684,46 @@ mod tests {
             let files = collect(&dir).unwrap();
             assert!(files.iter().any(|it| it.path == "in" && it.bytes.as_deref() == Some(b"x".as_slice())));
         }
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Directories made once, whichever way the value lists them: a parent it does not list, a
+    /// directory listed after a file in it, and a file's mode set on its descriptor.
+    #[test]
+    fn a_restore_makes_each_directory_once_and_collect_reads_it_back() {
+        let dir = std::env::temp_dir().join(format!("blaze-out-dir-once-{}", std::process::id()));
+        let file = |path: &str, executable: bool, bytes: &[u8]| OutFile { path: path.into(), executable, bytes: Some(bytes.to_vec()) };
+        let listed = |path: &str| OutFile { path: path.into(), executable: false, bytes: None };
+        let given = [
+            file("a/b/deep.rs", false, b"deep"),
+            listed("a"),
+            file("a/one.rs", false, b"1"),
+            file("a/two.rs", false, b"2"),
+            listed("a/b"),
+            file("run.sh", true, b"#!/bin/sh\n"),
+            listed("empty"),
+            file("top.rs", false, b""),
+        ];
+        restore(&dir, &given).unwrap();
+        let mut expected = given.to_vec();
+        expected.sort_by(|a, b| a.path.cmp(&b.path));
+        #[cfg(not(unix))]
+        expected.iter_mut().for_each(|it| it.executable = false);
+        assert_eq!(collect(&dir).unwrap(), expected);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.join("run.sh")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+            std::os::unix::fs::symlink(dir.join("a/b"), dir.join("to-b")).unwrap();
+            let files = collect(&dir).unwrap();
+            let to_b = files.iter().find(|it| it.path == "to-b").unwrap();
+            assert_eq!(to_b.bytes, None, "a link to a directory inside is kept as the directory");
+            assert!(!files.iter().any(|it| it.path.starts_with("to-b/")), "and not walked twice");
+        }
+        // Restored again over what is there: emptied first, the same files.
+        restore(&dir, &expected).unwrap();
+        assert_eq!(collect(&dir).unwrap(), expected);
         _ = std::fs::remove_dir_all(&dir);
     }
 }

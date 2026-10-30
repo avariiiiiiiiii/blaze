@@ -24,7 +24,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::IfExpr<'t>) {
     }
     let Some(stmts) = then.stmt_list() else { return };
     let Some(inner) = expr_block(stmts) else { return };
-    let ast::Expr::IfExpr(inner_if) = peel_parens(inner) else { return };
+    let ast::Expr::IfExpr(inner_if) = inner.peel_parens() else { return };
     let Some(check_inner) = inner_if.condition() else { return };
     if inner_if.else_branch().is_some() || !eligible(cx, check_inner) {
         return;
@@ -81,22 +81,13 @@ fn expr_block(stmts: ast::StmtList<'_>) -> Option<ast::Expr<'_>> {
     }
 }
 
-fn peel_parens(mut expr: ast::Expr<'_>) -> ast::Expr<'_> {
-    while let ast::Expr::ParenExpr(paren) = expr
-        && let Some(inner) = paren.expr()
-    {
-        expr = inner;
-    }
-    expr
-}
-
 /// `(` and `)` around `expr` when it is an `||`, which `&&` would bind tighter than.
 fn parens_around(
     cx: &Cx<'_, '_>,
     expr: ast::Expr<'_>,
     parts: &mut Vec<(crate::diag::Span, String)>,
 ) {
-    let ast::Expr::BinExpr(bin) = peel_parens(expr) else { return };
+    let ast::Expr::BinExpr(bin) = expr.peel_parens() else { return };
     if bin.op_kind() != Some(ast::BinaryOp::LogicOp(ast::LogicOp::Or)) {
         return;
     }

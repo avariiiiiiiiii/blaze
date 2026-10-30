@@ -1211,8 +1211,7 @@ mod tests {
                 ),
                 ast_id: span::ROOT_ERASED_FILE_AST_ID,
             },
-            // SAFETY: no database; the context is compared, never looked up.
-            ctx: unsafe { span::SyntaxContext::from_u32(3) },
+            ctx: span::SyntaxContext::from_u32(3),
         };
         let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter {
             open: span(0),

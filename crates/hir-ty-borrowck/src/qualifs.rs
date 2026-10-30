@@ -52,7 +52,7 @@ impl Qualifs {
 }
 
 /// A body whose values are asked their qualifs: the one borrow checked, or a `const` item's.
-pub(crate) struct ValueCx<'a, 'db> {
+pub(crate) struct ValueCx<'a, 'f, 'db> {
     pub(crate) db: &'db Db,
     pub(crate) infcx: &'a InferCtxt<'db>,
     pub(crate) env: ParamEnv<'db>,
@@ -60,13 +60,13 @@ pub(crate) struct ValueCx<'a, 'db> {
     pub(crate) store: &'a ExpressionStore,
     pub(crate) infer: &'a InferenceResult<'db>,
     /// What each `const` item's value has, asked once as rustc's `mir_const_qualif` query.
-    pub(crate) consts: &'a RefCell<FMap<'a, ConstId, Qualifs>>,
+    pub(crate) consts: &'a RefCell<FMap<'f, ConstId, Qualifs>>,
 }
 
 /// rustc stops at no depth; this does where a value nests deeper than any real one.
 const MAX_DEPTH: usize = 32;
 
-impl<'db> ValueCx<'_, 'db> {
+impl<'db> ValueCx<'_, '_, 'db> {
     /// rustc's `in_any_value_of_ty`.
     fn of_ty(&self, ty: Ty<'db>) -> Qualifs {
         Qualifs {

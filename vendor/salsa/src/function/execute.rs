@@ -1021,7 +1021,7 @@ fn flattened_edge_fingerprints(
 /// or salsa structs (input, tracked, interned).
 fn flatten_cycle_dependencies(
     zalsa: &Zalsa,
-    direct_input_outputs: &FxIndexSet<QueryEdge>,
+    direct_input_outputs: &[QueryEdge],
     flattened: &mut FxIndexSet<QueryEdge>,
     seen: &mut FxHashSet<DatabaseKeyIndex>,
 ) {

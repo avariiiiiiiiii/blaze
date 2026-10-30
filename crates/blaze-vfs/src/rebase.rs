@@ -9,13 +9,14 @@ use crate::{
     tree::{NodeId, Tree, op_paths},
 };
 
-/// `ops`, made against `base`, moved onto `head`.
+/// `ops`, made against `base`, moved onto `head`: for each, `None` where it applies as it is
+/// (so its bytes are never copied) or the op moved to where its range is now.
 pub(crate) fn rebase(
     tree: &Tree,
     base: NodeId,
     head: NodeId,
     ops: &[Op],
-) -> Result<Vec<Op>, CommitError> {
+) -> Result<Vec<Option<Op>>, CommitError> {
     let mut touched: FxHashMap<&str, usize> = FxHashMap::default();
     for op in ops {
         for path in op_paths(op) {
@@ -25,11 +26,11 @@ pub(crate) fn rebase(
     // A path that resolves alike in both has the same directories above it in both; one a head
     // made unreachable fails as the op would on the head. A change of mode is a change.
     let changed = |path: &str| tree.entry(base, path) != tree.entry(head, path);
+    // alloc: only a transaction its head moved under is rebased, a slot per op.
     let mut moved = Vec::with_capacity(ops.len());
     for op in ops {
         let Some(path) = op_paths(op).find(|it| changed(it)) else {
-            // clone: only a transaction its head moved under is rebased, into ops of its own.
-            moved.push(op.clone());
+            moved.push(None);
             continue;
         };
         // alloc: the error's path
@@ -48,8 +49,8 @@ pub(crate) fn rebase(
             return Err(conflict());
         }
         let at = if *at >= to as u64 { *at + now.len() as u64 - was.len() as u64 } else { *at };
-        // clone: only a transaction its head moved under is rebased, into ops of its own.
-        moved.push(Op::Edit { path: path.clone(), at, len: *len, bytes: bytes.clone() });
+        // clone: only an edit moved past a change, into an op of its own.
+        moved.push(Some(Op::Edit { path: path.clone(), at, len: *len, bytes: bytes.clone() }));
     }
     Ok(moved)
 }

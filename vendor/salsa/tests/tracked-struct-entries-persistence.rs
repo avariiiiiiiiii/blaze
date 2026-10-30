@@ -1,4 +1,5 @@
 #![cfg(all(feature = "inventory", feature = "persistence"))]
+#![forbid(unsafe_code)]
 
 use salsa::Setter;
 

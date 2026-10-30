@@ -12,7 +12,7 @@ use std::cell::RefCell;
 
 use cranelift_codegen::{
     dominator_tree::DominatorTree,
-    entity::{EntityRef, EntitySet, PackedOption, SecondaryMap},
+    entity::{EntityRef, EntitySet, SecondaryMap, packed_option::PackedOption},
     flowgraph::ControlFlowGraph,
     ir::{self, InstructionData, Opcode, StackSlot, Value},
 };
@@ -125,7 +125,7 @@ fn promote_in(
         }
     }
     // Stable, so that the accesses of a part stay in the order of the layout.
-    blaze_ids::radix::sort_copy_by_key(&mut accesses, |it| {
+    blaze_ids::radix::sort_copy_by_key(accesses, |it| {
         blaze_ids::radix::pack_32(it.slot.as_u32(), blaze_ids::radix::signed_32(it.at))
     });
     let mut dominators = None;

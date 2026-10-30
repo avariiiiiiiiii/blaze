@@ -49,7 +49,7 @@ use super::{
 };
 
 /// The old loop's bound on expansion rounds (`collector::FIXED_POINT_LIMIT`).
-const FIXED_POINT_LIMIT: u32 = 8192;
+pub(crate) const FIXED_POINT_LIMIT: u32 = 8192;
 
 // The round queries.
 
@@ -88,6 +88,7 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
             stack.extend(decls.children.iter().rev().copied());
         }
         let n = order.len();
+        let pending = flags.iter().filter(|&&it| it & RoundModules::PENDING != 0).count() as u32;
         return RoundModules {
             // alloc: the round's columns, at exact size, once per crate.
             order: Box::from(&order[..]),
@@ -104,6 +105,7 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
             ran: vec![NO_ROUND; n].into_boxed_slice(),
             // alloc: as `active`.
             since: vec![NO_ROUND; n].into_boxed_slice(),
+            pending,
         };
     }
 
@@ -205,6 +207,7 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
     // alloc: the round's active modules, a few, at exact size.
     let mut active_list = Vec::with_capacity(active().count());
     active_list.extend(active());
+    let pending = flags.iter().filter(|&&it| it & RoundModules::PENDING != 0).count() as u32;
     RoundModules {
         // alloc: the round's columns, at exact size: `O(m)` per round.
         order: Box::from(&order[..]),
@@ -220,6 +223,7 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
         ran: Box::from(&ran[..]),
         // alloc: as `order`.
         since: Box::from(&since[..]),
+        pending,
     }
 }
 
@@ -605,6 +609,7 @@ pub(crate) fn round_row(db: &Db, round: RoundKey, module: ModuleId) -> Option<Mo
 /// round's handles, the crate-level ops of every log, the final steps' unresolved-macro
 /// diagnostics and the final units' unresolved imports (`collect` and `finish` of the old
 /// collector).
+#[cfg(test)]
 pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (DefMap, LocalDefMap) {
     let mut r = 0;
     while queries::round_kind(db, RoundKey::new(db, krate, r)) != RoundKind::Final {
@@ -768,7 +773,7 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
 /// What rustc's `finalize_imports` reports of `import`, resolved to `status` (`None` when it did
 /// not resolve): a trait's items imported without `import_trait_associated_functions`, or a glob
 /// of a trait whose items blaze cannot list (`DefMap::trait_item_import_reports`).
-fn trait_item_import_diagnostics(
+pub(crate) fn trait_item_import_diagnostics(
     db: &Db,
     def_map: &DefMap,
     import: &ImportOp,
@@ -821,7 +826,7 @@ impl CrateOps<'_> {
 
 /// `finish`'s rule: an import whose path starts with the name of an `extern crate` that did not
 /// resolve gets no diagnostic of its own.
-fn in_unresolved_extern_crate(path: &ModPath, unresolved: &FrameSet<'_, Name>) -> bool {
+pub(crate) fn in_unresolved_extern_crate(path: &ModPath, unresolved: &FrameSet<'_, Name>) -> bool {
     matches!(
         (path.segments().first(), &path.kind),
         (Some(krate), PathKind::Plain | PathKind::Abs) if unresolved.contains(krate)
@@ -830,7 +835,7 @@ fn in_unresolved_extern_crate(path: &ModPath, unresolved: &FrameSet<'_, Name>) -
 
 /// The ops `NameRecords` is built from (the old `resolved_macro_paths`, `derive_helper_uses`
 /// and `not_introducing`), in log order.
-struct Records<'f> {
+pub(crate) struct Records<'f> {
     macro_paths: FrameVec<'f, MacroPath>,
     derive_helpers: FrameVec<'f, DeriveHelperUse>,
     not_introducing: FrameVec<'f, ExternCrateId>,
@@ -846,7 +851,7 @@ struct MacroPath {
 }
 
 impl<'f> Records<'f> {
-    fn new_in(frame: &'f Frame) -> Self {
+    pub(crate) fn new_in(frame: &'f Frame) -> Self {
         Records {
             macro_paths: Vec::new_in(frame),
             derive_helpers: Vec::new_in(frame),
@@ -855,7 +860,7 @@ impl<'f> Records<'f> {
     }
 
     /// Keeps `op` if it is one of the three, and says whether it was.
-    fn take(&mut self, op: &DeclOp) -> bool {
+    pub(crate) fn take(&mut self, op: &DeclOp) -> bool {
         match *op {
             DeclOp::ResolvedMacroPath { module, path, bang, def, call } => {
                 let subns = if bang { MacroSubNs::Bang } else { MacroSubNs::Attr };
@@ -873,7 +878,7 @@ impl<'f> Records<'f> {
 /// collected, as rustc's `finalize_imports` and `finalize_macro_resolutions` do, into what
 /// they went through. `imports` is every import with what it resolved to, `None` while
 /// unresolved; `local` is the crate's `LocalDefMap`, a block's too.
-fn name_records<'a>(
+pub(crate) fn name_records<'a>(
     db: &Db,
     frame: &Frame,
     def_map: &DefMap,
@@ -967,7 +972,7 @@ fn owned_helpers(helpers: &FrameMap<'_, AstId<ast::Item>, FrameVec<'_, DeriveHel
 }
 
 /// A copy of a diagnostic of a log (a query value) for the def map, which owns its list.
-fn copy_diagnostic(diagnostic: &DefDiagnostic) -> DefDiagnostic {
+pub(crate) fn copy_diagnostic(diagnostic: &DefDiagnostic) -> DefDiagnostic {
     use DefDiagnosticKind as K;
     // clone: the diagnostic's own data (a cfg expression, a message), once per diagnostic.
     let kind = match &diagnostic.kind {
@@ -976,6 +981,7 @@ fn copy_diagnostic(diagnostic: &DefDiagnostic) -> DefDiagnostic {
         }
         K::UnresolvedExternCrate { ast } => K::UnresolvedExternCrate { ast: *ast },
         K::UnresolvedImport { id, index } => K::UnresolvedImport { id: *id, index: *index },
+        K::TraitItemImport { id, index, why } => K::TraitItemImport { id: *id, index: *index, why: *why },
         K::UnconfiguredCode { ast_id, cfg } => {
             K::UnconfiguredCode { ast_id: *ast_id, cfg: cfg.clone() } // clone: see above.
         }
@@ -1079,6 +1085,7 @@ pub(crate) fn collect_block<'db>(
     'resolve_attr: loop {
         'resolve_macros: loop {
             salsa::Database::unwind_if_revision_cancelled(db);
+            sink.unit.set_unexpanded(!pending.is_empty());
             sink.unit.resolve_imports();
             let result =
                 macros::resolve_round(&cx, &mut sink, &mut side, &mut pending, eager_with_errors);
@@ -1452,8 +1459,7 @@ fn f() {
         let body = Body::of(&db, DefWithBodyId::from(f));
         let blocks: Vec<_> = body.blocks(&db).map(|(block, _)| block).collect();
         assert_eq!(blocks.len(), 1);
-        // SAFETY: the block id was read from `db` in this revision and is used only while it is.
-        let block = unsafe { blocks[0].to_db(&db) };
+        let block = blocks[0].to_db(&db);
         let old = old_block_def_map(&db, block);
         let new = new_block_def_map(&db, block);
         let diff =

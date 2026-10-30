@@ -35,10 +35,15 @@ mod compare;
 pub mod native;
 pub mod puts;
 pub mod tally;
+pub mod verdict;
 
 use std::{
     any::Any,
-    sync::{Arc, Mutex, OnceLock},
+    cell::Cell,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -57,14 +62,14 @@ pub use puts::{Published, Put, publish, put, take_puts};
 use hir_expand::proc_macro::{
     ExpansionReads, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, report_reads,
 };
+use bridge::wire::{self, Parts};
 use paths::{AbsPath, AbsPathBuf};
 use proc_macro_api::{
-    legacy_protocol::msg::{FlatTree, SpanDataIndexMap},
     version::CURRENT_API_VERSION,
     warm::{self, Environment},
 };
 use rustc_hash::FxHashMap;
-use span::{Span, SpanAnchor, SyntaxContext, TextRange};
+use span::{Span, SpanAnchor, SyntaxContext};
 
 /// What the content ID of a macro's library is made with.
 pub const LIBRARY: &str = "blaze v2 proc-macro library 1";
@@ -195,11 +200,31 @@ pub fn install(expansions: Expansions) -> Result<(), String> {
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not UTF-8")), // alloc: error path
     };
     let mode = Mode::of(var(CACHE)?.as_deref())?;
-    let installed = Installed { expansions, mode };
+    wrapping()?;
     // alloc: error path
-    INSTALLED.set(installed).map_err(|_| "proc-macro expansions were installed twice".to_owned())?;
+    INSTALLED.set(Installed { expansions, mode }).map_err(|_| "proc-macro expansions were installed twice".to_owned())?;
     load_cargo::wrap_expanders(wrap);
     Ok(())
+}
+
+/// Stops every proc-macro expansion of the workspaces loaded from here on that failed for a
+/// reason that is not the macro's own ([`server_failed`]), as [`install`] does, for a process
+/// with no store to keep them in (the engine): nothing is kept or looked for, and
+/// [`keeping`] is `None`. Says why not when expansions were installed before.
+pub fn install_unkept() -> Result<(), String> {
+    wrapping()?;
+    load_cargo::wrap_expanders(wrap_unkept);
+    Ok(())
+}
+
+/// Takes the one wrapping of the process's expanders: `load_cargo` keeps the first silently,
+/// so a second, of either kind, is an error here.
+fn wrapping() -> Result<(), String> {
+    static WRAPPED: AtomicBool = AtomicBool::new(false);
+    match WRAPPED.swap(true, Ordering::AcqRel) {
+        false => Ok(()),
+        true => Err("proc-macro expansions were installed twice".to_owned()), // alloc: error path
+    }
 }
 
 fn installed() -> &'static Installed {
@@ -235,6 +260,69 @@ fn reads_in(passed: &[(String, String)], env: &Env, shape: &[u8]) -> Result<Cont
         Err(FindError::NotAShape { why, .. }) => Err(format!("a shape that does not read: {why}")), // alloc: error path
         Err(FindError::Inputs(unreadable)) => Err(format!("{unreadable}")), // alloc: error path
         Err(FindError::Corrupt(corrupt)) => Err(format!("{corrupt}")), // alloc: error path
+    }
+}
+
+fn wrap_unkept(
+    inner: Arc<dyn ProcMacroExpander>, // dyn: the database's expander, the edge, wrapped once per macro
+    dylib: &AbsPath,
+    name: &str,
+    _: ProcMacroKind,
+) -> Arc<dyn ProcMacroExpander> { // dyn: as above
+    Arc::new(Unkept { inner, dylib: dylib.to_path_buf(), name: name.into() }) // alloc: setup, once per macro loaded
+}
+
+/// An expander whose expansions are not kept ([`install_unkept`]): only a failure that is not
+/// the macro's own is told apart, as [`Kept`] tells it.
+#[derive(Debug)]
+struct Unkept {
+    inner: Arc<dyn ProcMacroExpander>, // dyn: the database's expander, the edge (`wrap_unkept`)
+    dylib: AbsPathBuf,
+    name: Box<str>,
+}
+
+impl ProcMacroExpander for Unkept {
+    fn requires_session(&self) -> bool {
+        self.inner.requires_session()
+    }
+
+    fn code(&self) -> Option<ContentId> {
+        self.inner.code()
+    }
+
+    fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+        failed(&self.name, &self.dylib, self.inner.expand(db, call))
+    }
+
+    fn expand_in(
+        &self,
+        db: &Db,
+        calling_crate: base_db::Crate,
+        call: ProcMacroCall<'_>,
+    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+        failed(&self.name, &self.dylib, self.inner.expand_in(db, calling_crate, call))
+    }
+
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: the database's expander trait, the edge
+        (other as &dyn Any) // dyn: as above, told apart by type
+            .downcast_ref::<Unkept>()
+            .is_some_and(|other| self.name == other.name && self.inner.eq_dyn(&*other.inner))
+    }
+}
+
+/// `expanded`, or the failure of the server of macro `name` of `dylib`, said once
+/// ([`server_failed`]), when it failed for a reason that is not the macro's own.
+fn failed(
+    name: &str,
+    dylib: &AbsPath,
+    expanded: Result<tt::TopSubtree, ProcMacroExpansionError>,
+) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+    match expanded {
+        Err(ProcMacroExpansionError::System(why)) => Err(system(format!( // alloc: error path
+            "the proc-macro server failed to expand `{name}` of {dylib}: {why}; what it did not \
+             expand is missing from the program, so nothing is built from it"
+        ))),
+        other => other,
     }
 }
 
@@ -289,47 +377,68 @@ struct Kept {
     kind: ProcMacroKind,
 }
 
-/// A span as a key or a value has it: its byte range, and the numbers of its anchor and its
-/// context among the call's.
-pub type Shape = [u32; 4];
-
-/// The anchors and syntax contexts of a call's spans, in the order they first appear: what
-/// its output is written against.
+/// The anchors and syntax contexts of a call's span parts, in the order they first appear: what
+/// its output is written against. Its room goes back to the thread's shelf when it is dropped,
+/// so the next call's takes no new memory.
 #[derive(Default, Debug)]
 pub struct Spans {
     anchors: Vec<SpanAnchor>,
     contexts: Vec<SyntaxContext>,
 }
 
+thread_local! {
+    /// The room of the last [`Spans`] dropped on this thread.
+    // alloc: none, an empty shelf; what it keeps is grown by the calls.
+    static SHELF: Cell<Option<(Vec<SpanAnchor>, Vec<SyntaxContext>)>> = const { Cell::new(None) };
+    /// What a key, a kept value and its reading reuse: taken for one of them, so a call made
+    /// inside another (an expansion answering a sub-request) gets fresh ones.
+    static SCRATCH: Cell<Option<Box<Scratch>>> = const { Cell::new(None) };
+}
+
 impl Spans {
-    fn number<T: PartialEq>(all: &mut Vec<T>, it: T) -> u32 {
-        let at = all.iter().position(|known| *known == it).unwrap_or_else(|| {
-            all.push(it);
-            all.len() - 1
-        });
-        at as u32
+    fn shelved() -> Spans {
+        let (mut anchors, mut contexts) = SHELF.take().unwrap_or_default();
+        anchors.clear();
+        contexts.clear();
+        Spans { anchors, contexts }
     }
+}
 
-    fn shape_new(&mut self, span: &Span) -> Shape {
-        let anchor = Self::number(&mut self.anchors, span.anchor);
-        let context = Self::number(&mut self.contexts, span.ctx);
-        [span.range.start().into(), span.range.end().into(), anchor, context]
+impl Drop for Spans {
+    fn drop(&mut self) {
+        let room = (std::mem::take(&mut self.anchors), std::mem::take(&mut self.contexts));
+        // A thread that is ending keeps nothing.
+        _ = SHELF.try_with(|shelf| shelf.set(Some(room)));
     }
+}
 
-    /// The shape of a span of the output, which has to have the call's anchors and contexts.
-    fn shape(&self, span: &Span) -> Option<Shape> {
-        let anchor = self.anchors.iter().position(|it| *it == span.anchor)?;
-        let context = self.contexts.iter().position(|it| *it == span.ctx)?;
-        Some([span.range.start().into(), span.range.end().into(), anchor as u32, context as u32])
-    }
+/// A call's span parts, its trees' relative columns and their shapes, and the room a kept tree
+/// off a word is copied into: each as long as the longest it held.
+#[derive(Default)]
+struct Scratch {
+    parts: Parts,
+    input: Vec<u8>,
+    attrs: Vec<u8>,
+    shapes: Vec<u8>,
+    room: Vec<u8>,
+}
 
-    fn span(&self, [start, end, anchor, context]: Shape) -> Option<Span> {
-        Some(Span {
-            range: TextRange::new(start.into(), end.max(start).into()),
-            anchor: *self.anchors.get(anchor as usize)?,
-            ctx: *self.contexts.get(context as usize)?,
-        })
-    }
+fn with_scratch<R>(f: impl FnOnce(&mut Scratch) -> R) -> R {
+    // alloc: the first call on a thread, or one inside another, makes its room.
+    let mut scratch = SCRATCH.take().unwrap_or_default();
+    let done = f(&mut scratch);
+    SCRATCH.set(Some(scratch));
+    done
+}
+
+/// The number of `it` among `all`, in the order first seen: a new one is pushed. A scan: a
+/// call's anchors and contexts are few.
+pub fn number<T: PartialEq>(all: &mut Vec<T>, it: T) -> u32 {
+    let at = all.iter().position(|known| *known == it).unwrap_or_else(|| {
+        all.push(it);
+        all.len() - 1
+    });
+    at as u32
 }
 
 /// One call of a macro, as its key is made of it.
@@ -353,41 +462,17 @@ fn kind_byte(kind: ProcMacroKind) -> u8 {
     }
 }
 
-fn encoded(value: &impl serde::Serialize) -> Vec<u8> {
-    postcard::to_allocvec(value).expect("a flat tree and a list of numbers encode")
-}
-
-thread_local! {
-    /// The buffer a call's parts are encoded into before [`Given::part`] takes them: one per
-    /// thread, grown to the largest call, so a key allocates no encoding.
-    static ENCODING: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, an empty buffer
-}
-
-fn part_encoded(given: &mut Given, name: &'static str, value: &impl serde::Serialize) {
-    ENCODING.with_borrow_mut(|buffer| {
-        buffer.clear();
-        let mut written = postcard::to_extend(value, std::mem::take(buffer))
-            .expect("a flat tree and a list of numbers encode");
-        given.part(name, &written);
-        written.clear();
-        *buffer = written;
-    });
-}
-
 /// What `call` gives the macro, for its [`RunKey::given`] with the toolchain `toolchain`, and
 /// the anchors and contexts its output is written against. A wasm macro's caller adds what
 /// else it gives a module.
+///
+/// The trees are hashed as their own columns made relative ([`wire::relative`]: each span
+/// part an index of the call's, the def, call and mixed sites' first), and the parts as the
+/// numbers of their anchors and contexts in the order they first appear, then each site's
+/// range and part, so the same tokens in another file or item have the same key. One pass over
+/// each tree's columns, into buffers kept per thread: a key allocates nothing.
 pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
-    let mut table = SpanDataIndexMap::default();
-    for span in [call.def_site, call.call_site, call.mixed_site] {
-        table.insert(span);
-    }
-    let input = FlatTree::from_subtree(call.subtree.view(), CURRENT_API_VERSION, &mut table);
-    let attrs =
-        call.attrs.map(|it| FlatTree::from_subtree(it.view(), CURRENT_API_VERSION, &mut table));
-    let mut spans = Spans::default();
-    // alloc: the call's span shapes, beside the flat trees proc-macro-api makes, as a key is made
-    let shapes: Vec<Shape> = table.iter().map(|span| spans.shape_new(span)).collect();
+    let mut spans = Spans::shelved();
     let mut given = Given::new(RunKind::ProcMacro);
     given
         .part("name", call.name.as_bytes())
@@ -395,31 +480,91 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
         .part("abi", &CURRENT_API_VERSION.to_le_bytes())
         .id("toolchain", toolchain)
         .part("dir", call.current_dir.as_bytes());
-    part_encoded(&mut given, "input", &input);
-    part_encoded(&mut given, "attrs", &attrs);
-    part_encoded(&mut given, "spans", &shapes);
+    with_scratch(|scratch| {
+        let Scratch { parts, input, attrs, shapes, .. } = scratch;
+        parts.clear();
+        input.clear();
+        attrs.clear();
+        shapes.clear();
+        let sites = [call.def_site, call.call_site, call.mixed_site].map(|site| {
+            let part = parts.part(site.anchor, site.ctx);
+            [site.range.start().into(), site.range.len().into(), part]
+        });
+        wire::relative(call.subtree, parts, input);
+        if let Some(it) = call.attrs {
+            wire::relative(it, parts, attrs);
+        }
+        for &(anchor, ctx) in parts.all() {
+            for it in [number(&mut spans.anchors, anchor), number(&mut spans.contexts, ctx)] {
+                shapes.extend_from_slice(&it.to_le_bytes());
+            }
+        }
+        for it in sites.as_flattened() {
+            shapes.extend_from_slice(&it.to_le_bytes());
+        }
+        let attrs: &[u8] = if call.attrs.is_some() { attrs } else { b"-" };
+        given
+            .part("input columns", input.as_slice())
+            .part("attrs columns", attrs)
+            .part("span parts", shapes.as_slice());
+    });
     given.env_keyed(call.env.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())));
     (given, spans)
 }
 
-/// The output with its spans as shapes of the call's, or `None` when it has an anchor or a
-/// context the call has not.
+/// The output as it is kept: its columns made relative ([`wire::relative`]), each span part an
+/// index of the output's own, then the numbers of each part's anchor and context among the
+/// call's `spans` (two words), then how many parts there are. `None` when it has an anchor or
+/// a context the call has not. The tree is first, so the value's start is its start.
 pub fn written(output: &tt::TopSubtree, spans: &Spans) -> Option<Vec<u8>> {
-    let mut table = SpanDataIndexMap::default();
-    let flat = FlatTree::from_subtree(output.view(), CURRENT_API_VERSION, &mut table);
-    let shapes: Option<Vec<Shape>> = table.iter().map(|span| spans.shape(span)).collect(); // alloc: once, as an expansion is kept
-    Some(encoded(&(shapes?, flat)))
+    with_scratch(|scratch| {
+        let parts = &mut scratch.parts;
+        parts.clear();
+        // alloc: the value kept, once as an expansion is kept.
+        let mut value = Vec::new();
+        wire::relative(output, parts, &mut value);
+        for &(anchor, ctx) in parts.all() {
+            let anchor = spans.anchors.iter().position(|it| *it == anchor)? as u32;
+            let context = spans.contexts.iter().position(|it| *it == ctx)? as u32;
+            for it in [anchor, context] {
+                value.extend_from_slice(&it.to_le_bytes());
+            }
+        }
+        value.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        Some(value)
+    })
 }
 
-/// What [`written`] wrote, against the call's `spans`.
+/// What [`written`] wrote, against the call's `spans`: one checked pass over the columns into
+/// the tree, its one allocation, with a tree off a word copied into the thread's room.
 pub fn read(bytes: &[u8], spans: &Spans) -> Result<tt::TopSubtree, String> {
-    let (shapes, flat): (Vec<Shape>, FlatTree) =
-        postcard::from_bytes(bytes).map_err(|error| format!("not a kept expansion: {error}"))?; // alloc: error path
-    // alloc: the span table the tree read back is resolved against, as proc-macro-api's reader takes it
-    let table: Option<SpanDataIndexMap> = shapes.into_iter().map(|it| spans.span(it)).collect();
-    let table = table.ok_or("a kept expansion has a span of an anchor or context its call has not")?;
-    // alloc: error path
-    flat.to_subtree_resolved(CURRENT_API_VERSION, &table).map_err(|error| format!("a kept expansion: {error}"))
+    // alloc: error path.
+    let cut = || "not a kept expansion: its table of span parts is cut short".to_owned();
+    let (rest, count) = bytes.split_last_chunk::<4>().ok_or_else(cut)?;
+    let table = (u32::from_le_bytes(*count) as usize)
+        .checked_mul(8)
+        .filter(|&len| len <= rest.len())
+        .ok_or_else(cut)?;
+    let (tree, table) = rest.split_at(rest.len() - table);
+    with_scratch(|scratch| {
+        let Scratch { parts, room, .. } = scratch;
+        parts.clear();
+        for (at, row) in table.as_chunks::<8>().0.iter().enumerate() {
+            let field = |i: usize| u32::from_le_bytes(row[i..i + 4].try_into().expect("four bytes"));
+            let anchor = spans.anchors.get(field(0) as usize);
+            let ctx = spans.contexts.get(field(4) as usize);
+            let Some((&anchor, &ctx)) = anchor.zip(ctx) else {
+                // alloc: error path.
+                return Err(format!("a kept expansion's span part {at} is of an anchor or context its call has not"));
+            };
+            if parts.part(anchor, ctx) as usize != at {
+                // alloc: error path.
+                return Err(format!("a kept expansion's span part {at} is an earlier one again"));
+            }
+        }
+        // alloc: error path.
+        wire::read_in(tree, parts, room).map_err(|error| format!("a kept expansion: {error}"))
+    })
 }
 
 /// The first expansion that failed for a reason that is not the macro's own (its server died,
@@ -446,14 +591,7 @@ impl Kept {
         &self,
         expanded: Result<tt::TopSubtree, ProcMacroExpansionError>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
-        match expanded {
-            Err(ProcMacroExpansionError::System(why)) => Err(system(format!( // alloc: error path
-                "the proc-macro server failed to expand `{}` of {}: {why}; what it did not \
-                 expand is missing from the program, so nothing is built from it",
-                self.name, self.dylib.path
-            ))),
-            other => other,
-        }
+        failed(&self.name, &self.dylib.path, expanded)
     }
 
     fn error(&self, why: impl std::fmt::Display) -> ProcMacroExpansionError {

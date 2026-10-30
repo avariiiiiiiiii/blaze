@@ -12,11 +12,11 @@
 use std::{fmt::Write as _, ops::Bound};
 
 use base_db::Db;
-use blaze_expand::bridge::spans;
+use blaze_expand::bridge::spans::{self, spanned};
 use intern::Symbol;
 use load_cargo::{SubRequest, SubResponse};
 use rustc_hash::FxHashMap;
-use span::{Edition, ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor, SyntaxContext, TextRange, TextSize};
+use span::{Edition, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, TextRange, TextSize};
 
 use crate::{
     guest::Stop,
@@ -47,6 +47,8 @@ pub(crate) struct Server {
     sites: [Span; 3],
     /// The calling crate's edition: what text the macro parses is lexed in.
     edition: Edition,
+    /// Whether the calling crate enables `forced_keywords`, which gates each `k#` it lexes.
+    forced_keywords: bool,
     /// Whether the expansion learned of a span what its key does not say.
     pub(crate) asked: bool,
     /// Paths given to `proc_macro::tracked_path::path`: inputs as much as files it read.
@@ -89,19 +91,10 @@ fn delimiter_of(n: u8) -> Result<Delimiter, Stop> {
         0 => Delimiter::Parenthesis,
         1 => Delimiter::Brace,
         2 => Delimiter::Bracket,
-        3 => Delimiter::None,
+        3 => Delimiter::Invisible,
         // alloc: error path
         other => return Err(Stop(format!("sent the server the delimiter {other}, which the pinned bridge never sends"))),
     })
-}
-
-fn delimiter_tag(delimiter: Delimiter) -> u8 {
-    match delimiter {
-        Delimiter::Parenthesis => 0,
-        Delimiter::Brace => 1,
-        Delimiter::Bracket => 2,
-        Delimiter::None => 3,
-    }
 }
 
 fn ident_kind_of(n: u8) -> Result<IdentKind, Stop> {
@@ -175,22 +168,10 @@ fn bound_word(bound: Bound<u64>) -> u64 {
     }
 }
 
-fn spanned(file_id: u32, ast_id: u32, start: u32, end: u32, ctx: u32) -> Span {
-    let anchor = SpanAnchor {
-        file_id: span::EditionedFileId::from_raw(file_id),
-        ast_id: ErasedFileAstId::from_raw(ast_id),
-    };
-    // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts: `ctx`
-    // is what `load_cargo::answer` read from this expansion's database. Memory safety doesn't
-    // rest on it: a wrong value panics in salsa's checked lookup.
-    #[allow(unsafe_code)]
-    let ctx = unsafe { SyntaxContext::from_u32(ctx) };
-    Span { range: TextRange::new(start.into(), end.max(start).into()), anchor, ctx }
-}
-
 impl Server {
-    /// The server of one expansion at `sites` (def, call, mixed), for a crate of `edition`.
-    pub(crate) fn new(sites: [Span; 3], edition: Edition) -> Server {
+    /// The server of one expansion at `sites` (def, call, mixed), for a crate of `edition`
+    /// that enables `forced_keywords` or not.
+    pub(crate) fn new(sites: [Span; 3], edition: Edition, forced_keywords: bool) -> Server {
         let mut server = Server {
             // alloc: once per expansion, its tables, which grow with what it builds
             streams: Vec::new(),
@@ -199,6 +180,7 @@ impl Server {
             saved: Vec::new(), // alloc: once per expansion, as above
             sites,
             edition,
+            forced_keywords,
             asked: false,
             tracked: Vec::new(), // alloc: once per expansion, as above
             emitted: Vec::new(), // alloc: once per expansion, as above
@@ -358,7 +340,7 @@ impl Server {
             Tree::Group { delimiter, stream, span, .. } => {
                 *count += 1;
                 w.u8(0);
-                w.u8(delimiter_tag(*delimiter));
+                w.u8(*delimiter as u8);
                 w.some(true);
                 // clone: a stream shares its trees, so this copies a pointer
                 let handle = self.stream_handle(stream.clone());
@@ -514,7 +496,7 @@ impl Server {
                 let text = r.str()?;
                 let call_site = self.sites[1];
                 self.lexed.clear();
-                let lexed = lex::literal(text, call_site, self.edition, &mut self.lexed);
+                let lexed = lex::literal(text, call_site, self.edition, self.forced_keywords, &mut self.lexed);
                 self.lexed_errors();
                 w.ok(true);
                 match lexed {
@@ -568,7 +550,7 @@ impl Server {
                 let text = r.str()?;
                 let call_site = self.sites[1];
                 self.lexed.clear();
-                let lexed = lex::stream(text, call_site, self.edition, &mut self.lexed);
+                let lexed = lex::stream(text, call_site, self.edition, self.forced_keywords, &mut self.lexed);
                 self.lexed_errors();
                 w.ok(true);
                 match lexed {

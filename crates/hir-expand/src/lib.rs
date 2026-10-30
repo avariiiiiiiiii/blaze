@@ -58,19 +58,19 @@ use syntax::{
     ast::{self, AstNode},
     view::{self, AstNode as _},
 };
-use syntax_bridge::{DocCommentDesugarMode, syntax_node_to_token_tree};
+use syntax_bridge::DocCommentDesugarMode;
 
 use crate::{
     attrs::AttrId,
     builtin::{
         BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander,
-        include_input_to_file_id, pseudo_derive_attr_expansion,
+        include_input_to_file_id,
     },
-    cfg_process::{attr_macro_input_to_token_tree, attr_macro_input_to_token_tree_handle},
+    cfg_process::attr_macro_input_to_token_tree,
     fixup::SyntaxFixupUndoInfo,
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt, span_with_mixed_site_ctxt},
     proc_macro::{CustomProcMacroExpander, ProcMacroKind, ProcMacros},
-    span_map::{ExpansionSpanMap, InOrder, MacroRulesArgs, RealSpanMap, SpanMap},
+    span_map::{ExpansionSpanMap, InOrder, MacroRulesArgs, SpanMap},
 };
 
 pub use crate::{
@@ -95,9 +95,8 @@ type MacroArgResult = (tt::TopSubtree, SyntaxFixupUndoInfo, Span);
 /// memo of `macro_arg`, or for an eager call from its interned location.
 pub type MacroArg<'db> = (&'db tt::TopSubtree, &'db SyntaxFixupUndoInfo, Span);
 
-/// A macro's expansion tree in one run of [`MacroCallId::parse_macro_expansion`] or
-/// [`MacroCallId::expand_speculative`]: a proc macro's tree or an eager call's input, read in
-/// place; or a tree built in the run's frame.
+/// A macro's expansion tree in one run of [`MacroCallId::parse_macro_expansion`]: a proc macro's
+/// tree or an eager call's input, read in place; or a tree built in the run's frame.
 pub(crate) enum Expansion<'db, 'f> {
     Borrowed(&'db tt::TopSubtree),
     Framed(tt::TopSubtree<&'f Frame>),
@@ -647,7 +646,7 @@ impl MacroCallId {
     pub fn parse_macro_expansion(
         self,
         db: &Db,
-    ) -> ExpandResult<(Parse<SyntaxNode>, ExpansionSpanMap)> {
+    ) -> ExpandResult<(Parse<view::Untyped>, ExpansionSpanMap)> {
         let _p = tracing::info_span!("parse_macro_expansion").entered();
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
             let loc = self.loc(db);
@@ -983,196 +982,6 @@ impl MacroCallId {
     pub fn expansion_reads(self, db: &Db) -> &proc_macro::ExpansionReads {
         &self.proc_macro_expansion(db).1
     }
-
-    /// This expands the given macro call, but with different arguments. This is
-    /// used for completion, where we want to see what 'would happen' if we insert a
-    /// token. The `token_to_map` mapped down into the expansion, with the mapped
-    /// token(s) returned with their priority.
-    pub fn expand_speculative(
-        self,
-        db: &Db,
-        speculative_args: &SyntaxNode,
-        token_to_map: SyntaxToken,
-    ) -> Option<(SyntaxNode, Vec<(SyntaxToken, u8)>)> {
-        let loc = self.loc(db);
-        let (_, _, span) = self.macro_arg_considering_derives(db, &loc.kind);
-
-        let span_map = RealSpanMap::absolute(span.anchor.file_id);
-        let span_map = SpanMap::RealSpanMap(&span_map);
-
-        // Build the subtree and token mapping for the speculative args
-        let (mut tt, undo_info) = match &loc.kind {
-            MacroCallKind::FnLike { .. } => (
-                syntax_bridge::syntax_node_to_token_tree(
-                    speculative_args,
-                    span_map,
-                    span,
-                    if loc.def.is_proc_macro() {
-                        DocCommentDesugarMode::ProcMacro
-                    } else {
-                        DocCommentDesugarMode::Mbe
-                    },
-                ),
-                SyntaxFixupUndoInfo::NONE,
-            ),
-            MacroCallKind::Attr { .. } if loc.def.is_attribute_derive() => (
-                syntax_bridge::syntax_node_to_token_tree(
-                    speculative_args,
-                    span_map,
-                    span,
-                    DocCommentDesugarMode::ProcMacro,
-                ),
-                SyntaxFixupUndoInfo::NONE,
-            ),
-            MacroCallKind::Derive { derive_macro_id, .. } => {
-                let MacroCallKind::Attr { censored_attr_ids: attr_ids, .. } =
-                    &derive_macro_id.loc(db).kind
-                else {
-                    unreachable!("`derive_macro_id` should be `MacroCallKind::Attr`");
-                };
-                attr_macro_input_to_token_tree_handle(
-                    db,
-                    speculative_args,
-                    span_map,
-                    span,
-                    true,
-                    attr_ids,
-                    loc.krate,
-                    true,
-                )
-            }
-            MacroCallKind::Attr { censored_attr_ids: attr_ids, .. } => {
-                attr_macro_input_to_token_tree_handle(
-                    db,
-                    speculative_args,
-                    span_map,
-                    span,
-                    false,
-                    attr_ids,
-                    loc.krate,
-                    true,
-                )
-            }
-        };
-
-        let attr_arg = match &loc.kind {
-            MacroCallKind::Attr { censored_attr_ids: attr_ids, .. } => {
-                if loc.def.is_attribute_derive() {
-                    // for pseudo-derive expansion we actually pass the attribute itself only
-                    ast::Attr::cast(speculative_args.clone()) // clone: a node handle; speculative expansion is IDE-only
-                        .and_then(|attr| {
-                            if let ast::Meta::TokenTreeMeta(meta) = attr.meta()? {
-                                meta.token_tree()
-                            } else {
-                                None
-                            }
-                        })
-                        .map(|token_tree| {
-                            let mut tree = syntax_node_to_token_tree(
-                                token_tree.syntax(),
-                                span_map,
-                                span,
-                                DocCommentDesugarMode::ProcMacro,
-                            );
-                            tree.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
-                            tree.set_top_subtree_delimiter_span(tt::DelimSpan::from_single(span));
-                            tree
-                        })
-                } else {
-                    // Attributes may have an input token tree, build the subtree and map for this as well
-                    // then try finding a token id for our token if it is inside this input subtree.
-                    let item = ast::Item::cast(speculative_args.clone())?; // clone: a node handle; speculative expansion is IDE-only
-                    let (_, meta) = attr_ids
-                        .invoc_attr()
-                        .find_attr_range_with_source_opt(db, loc.krate, &item)?;
-                    if let ast::Meta::TokenTreeMeta(meta) = meta
-                        && let Some(tt) = meta.token_tree()
-                    {
-                        let mut attr_arg = syntax_bridge::syntax_node_to_token_tree(
-                            tt.syntax(),
-                            span_map,
-                            span,
-                            DocCommentDesugarMode::ProcMacro,
-                        );
-                        attr_arg.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
-                        Some(attr_arg)
-                    } else {
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
-
-        let expand_to = loc.expand_to();
-        let (node, rev_tmap, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-            // Do the actual expansion, we need to directly expand the proc macro due to the attribute args
-            // Otherwise the expand query will fetch the non speculative attribute args and pass those instead.
-            let proc_macro_tree;
-            let mut speculative_expansion = match loc.def.kind {
-                MacroDefKind::ProcMacro(ast, expander, _) => {
-                    let span = proc_macro_span(db, ast);
-                    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
-                    tt.set_top_subtree_delimiter_span(tt::DelimSpan::from_single(span));
-                    proc_macro_tree = expander.expand(
-                        db,
-                        loc.def.krate,
-                        loc.krate,
-                        &tt,
-                        attr_arg.as_ref(),
-                        span_with_def_site_ctxt(db, span, self.into(), loc.def.edition),
-                        span_with_call_site_ctxt(db, span, self.into(), loc.def.edition),
-                        span_with_mixed_site_ctxt(db, span, self.into(), loc.def.edition),
-                    );
-                    proc_macro_tree.as_ref().map(Expansion::Borrowed)
-                }
-                MacroDefKind::BuiltInAttr(_, it) if it.is_derive() => {
-                    pseudo_derive_attr_expansion(frame, &tt, attr_arg.as_ref()?, span)
-                        .map(Expansion::Framed)
-                }
-                MacroDefKind::Declarative(it, _) => it
-                    .decl_macro_expander(db, loc.krate)
-                    .expand_unhygienic(db, frame, &tt, loc.kind.call_style(), span)
-                    .map(Expansion::Framed),
-                MacroDefKind::BuiltIn(_, it) => {
-                    it.expand(db, frame, self, &tt, span).map_err(Into::into).map(Expansion::Framed)
-                }
-                MacroDefKind::BuiltInDerive(_, it) => {
-                    it.expand(db, frame, self, &tt, span).map_err(Into::into).map(Expansion::Framed)
-                }
-                MacroDefKind::BuiltInEager(_, it) => {
-                    it.expand(db, frame, self, &tt, span).map_err(Into::into).map(Expansion::Framed)
-                }
-                MacroDefKind::BuiltInAttr(_, it) => {
-                    it.expand(db, frame, self, &tt, span).map(Expansion::Framed)
-                }
-                MacroDefKind::UnimplementedBuiltIn(_) => {
-                    expand_unimplemented_builtin_macro(frame, span).map(Expansion::Framed)
-                }
-            };
-            fixup::reverse_fixups_expansion(frame, &mut speculative_expansion.value, &undo_info);
-            let expansion = speculative_expansion.value.view();
-            Some(token_tree_to_syntax_node(db, frame, expansion, expand_to))
-        })?;
-
-        let syntax_node = node.syntax_node();
-        let token = rev_tmap
-            .ranges_with_span(span_map.span_for_range(token_to_map.text_range()))
-            .filter_map(|(range, ctx)| {
-                syntax_node.covering_element(range).into_token().zip(Some(ctx))
-            })
-            .map(|(t, ctx)| {
-                // prefer tokens of the same kind and text, as well as non opaque marked ones
-                // Note the inversion of the score here, as we want to prefer the first token in case
-                // of all tokens having the same score
-                let ranking = ctx.is_opaque(db) as u8
-                    + 2 * (t.kind() != token_to_map.kind()) as u8
-                    + 4 * ((t.text() != token_to_map.text()) as u8);
-                (t, ranking)
-            })
-            .collect(); // alloc: the mapped tokens; IDE-only
-        Some((node.syntax_node(), token))
-    }
 }
 
 fn expand_unimplemented_builtin_macro(
@@ -1209,7 +1018,7 @@ pub(crate) fn token_tree_to_syntax_node(
     frame: &Frame,
     tt: tt::SubtreeView<'_>,
     expand_to: ExpandTo,
-) -> (Parse<SyntaxNode>, ExpansionSpanMap, Option<Span>) {
+) -> (Parse<view::Untyped>, ExpansionSpanMap, Option<Span>) {
     let entry_point = match expand_to {
         ExpandTo::Statements => syntax_bridge::TopEntryPoint::MacroStmts,
         ExpandTo::Items => syntax_bridge::TopEntryPoint::MacroItems,
@@ -1610,36 +1419,51 @@ impl MacroCallKind {
 /// ExpansionInfo mainly describes how to map text range between src and expanded macro
 // FIXME: can be expensive to create, we should check the use sites and maybe replace them with
 // simpler function calls if the map is only used once
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ExpansionInfo<'db> {
-    expanded: InMacroFile<SyntaxNode>,
-    /// The argument TokenTree or item for attributes
-    arg: InFile<Option<SyntaxNode>>,
-    /// `expanded`'s root and `arg`, as views of the trees the database keeps.
+    db: &'db Db,
+    expanded_file: MacroCallId,
+    expanded_parse: &'db Parse<view::Untyped>,
+    /// The expansion's root and the argument TokenTree or item for attributes, as views of the
+    /// trees the database keeps.
     expanded_root: view::Node<'db>,
+    arg_file: HirFileId,
     arg_root: Option<view::Node<'db>>,
+    /// The argument's handle, made by the first [`Self::arg`]: only hir's handle `Semantics`
+    /// asks for it.
+    arg_handle: std::cell::OnceCell<Option<SyntaxNode>>,
     exp_map: &'db ExpansionSpanMap,
     arg_map: SpanMap<'db>,
     loc: &'db MacroCallLoc,
 }
 
+/// Every field is a function of the macro file.
+impl PartialEq for ExpansionInfo<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.expanded_file == other.expanded_file
+    }
+}
+
+impl Eq for ExpansionInfo<'_> {}
+
 impl<'db> ExpansionInfo<'db> {
     pub fn expanded(&self) -> InMacroFile<SyntaxNode> {
-        self.expanded.clone() // clone: a node handle, a non-atomic count
+        InMacroFile::new(self.expanded_file, self.expanded_parse.syntax_node())
     }
 
     pub fn arg(&self) -> InFile<Option<&SyntaxNode>> {
-        self.arg.as_ref().map(|it| it.as_ref())
+        let arg = self.arg_handle.get_or_init(|| self.loc.kind.arg(self.db).value);
+        InFile::new(self.arg_file, arg.as_ref())
     }
 
     /// [`Self::expanded`] as a view.
     pub fn expanded_view(&self) -> InMacroFile<view::Node<'db>> {
-        InMacroFile::new(self.expanded.file_id, self.expanded_root)
+        InMacroFile::new(self.expanded_file, self.expanded_root)
     }
 
     /// [`Self::arg`] as a view.
     pub fn arg_view(&self) -> InFile<Option<view::Node<'db>>> {
-        self.arg.with_value(self.arg_root)
+        InFile::new(self.arg_file, self.arg_root)
     }
 
     /// Maps `span` down into the expansion, to tokens of its view: only the ranges whose span is
@@ -1657,7 +1481,7 @@ impl<'db> ExpansionInfo<'db> {
             root.covering_element(range).into_token().zip(Some(ctx))
         });
 
-        Some(InMacroFile::new(self.expanded.file_id, tokens))
+        Some(InMacroFile::new(self.expanded_file, tokens))
     }
 
     /// [`Self::map_range_down`] to tokens of the view of the expansion.
@@ -1674,11 +1498,11 @@ impl<'db> ExpansionInfo<'db> {
             root.covering_element(range).into_token().zip(Some(ctx))
         });
 
-        Some(InMacroFile::new(self.expanded.file_id, tokens))
+        Some(InMacroFile::new(self.expanded_file, tokens))
     }
 
     pub fn call_file(&self) -> HirFileId {
-        self.arg.file_id
+        self.arg_file
     }
 
     pub fn is_attr(&self) -> bool {
@@ -1700,11 +1524,12 @@ impl<'db> ExpansionInfo<'db> {
             return None;
         }
 
+        let root = self.expanded_parse.syntax_node();
         let tokens = self.exp_map.ranges_with_span(span).flat_map(move |(range, ctx)| {
-            self.expanded.value.covering_element(range).into_token().zip(Some(ctx))
+            root.covering_element(range).into_token().zip(Some(ctx))
         });
 
-        Some(InMacroFile::new(self.expanded.file_id, tokens))
+        Some(InMacroFile::new(self.expanded_file, tokens))
     }
 
     /// Looks up the span at the given offset.
@@ -1745,11 +1570,11 @@ impl<'db> ExpansionInfo<'db> {
             }
             SpanMap::ExpansionSpanMap(arg_map) => {
                 let Some(arg_node) = self.arg_root else {
-                    return InFile::new(self.arg.file_id, smallvec::SmallVec::new());
+                    return InFile::new(self.arg_file, smallvec::SmallVec::new());
                 };
                 let arg_range = arg_node.text_range();
                 InFile::new(
-                    self.arg.file_id,
+                    self.arg_file,
                     arg_map
                         .ranges_with_span_exact(span)
                         .map(|(range, _)| range)
@@ -1764,19 +1589,20 @@ impl<'db> ExpansionInfo<'db> {
         let _p = tracing::info_span!("ExpansionInfo::new").entered();
         let loc = macro_file.loc(db);
 
-        let arg_tt = loc.kind.arg(db);
-        let arg_root = loc.kind.arg_view(db).value;
-        let arg_map = arg_tt.file_id.span_map(db);
+        let arg = loc.kind.arg_view(db);
+        let arg_map = arg.file_id.span_map(db);
 
         let (parse, exp_map) = &macro_file.parse_macro_expansion(db).value;
-        let expanded = InMacroFile { file_id: macro_file, value: parse.syntax_node() };
 
         ExpansionInfo {
-            expanded,
+            db,
+            expanded_file: macro_file,
+            expanded_parse: parse,
             expanded_root: parse.root(),
+            arg_file: arg.file_id,
+            arg_root: arg.value,
+            arg_handle: std::cell::OnceCell::new(),
             loc,
-            arg: arg_tt,
-            arg_root,
             exp_map,
             arg_map,
         }
@@ -1892,7 +1718,7 @@ pub enum ExpandTo {
 impl ExpandTo {
     /// What the macro call `call` expands to where it is; the kind of its parent if no macro
     /// call can be there.
-    pub fn of_call_site(call: &ast::MacroCall) -> Result<ExpandTo, syntax::SyntaxKind> {
+    pub fn of_call_site_view(call: view::MacroCall<'_>) -> Result<ExpandTo, syntax::SyntaxKind> {
         use syntax::SyntaxKind::*;
 
         let syn = call.syntax();
@@ -1911,34 +1737,6 @@ impl ExpandTo {
             // rustc's `parse_stmt_mac`: the last call of a block, not in braces and with no `;`
             // after it, is followed by the block's `}`, so it is an expression. The last call
             // of a statements expansion is followed by the end of its tokens: a statement.
-            let braced = call.token_tree().and_then(|it| it.l_curly_token()).is_some();
-            let is_tail = ast::StmtList::cast(grandparent)
-                .and_then(|list| list.tail_expr())
-                .is_some_and(|tail| tail.syntax() == &parent);
-            return Ok(if is_tail && !braced { ExpandTo::Expr } else { ExpandTo::Statements });
-        }
-
-        ExpandTo::of_parent_kind(parent.kind())
-    }
-
-    /// [`Self::of_call_site`] of a view.
-    pub fn of_call_site_view(call: view::MacroCall<'_>) -> Result<ExpandTo, syntax::SyntaxKind> {
-        use syntax::SyntaxKind::*;
-
-        let syn = call.syntax();
-
-        let parent = match syn.parent() {
-            Some(it) => it,
-            None => return Ok(ExpandTo::Statements),
-        };
-
-        // FIXME: macros in statement position are treated as expression statements, they should
-        // probably be their own statement kind. The *grand*parent indicates what's valid.
-        if parent.kind() == MACRO_EXPR
-            && let Some(grandparent) = parent.parent()
-            && matches!(grandparent.kind(), EXPR_STMT | STMT_LIST | MACRO_STMTS)
-        {
-            // rustc's `parse_stmt_mac`, as in `of_call_site`.
             let braced = call.token_tree().and_then(|it| it.l_curly_token()).is_some();
             let is_tail = view::StmtList::cast(grandparent)
                 .and_then(|list| list.tail_expr())

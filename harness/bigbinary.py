@@ -10,15 +10,15 @@ an object of farfile.py's kind: 4.2 GB of `.debug_abbrev`, so that the file ends
 its code than a debug build of bevy's does and the patch's DWARF says offsets four bytes can't.
 So on AArch64 a branch from the program's functions does not reach where a splice adds the
 patch, the tables of the unwinder are larger than a 24-bit offset says, and on Linux the file is
-further from the code than four bytes of distance reach. Each step is compared with what `cargo
-build` of the same source prints, and has to have been spliced: a function shorter than the long
+further from the code than four bytes of distance reach. Each step is compared with what blaze's
+build of the same source from nothing prints, and has to have been spliced: a function shorter than the long
 jump, one that panics through its replacement, and one added.
 
 usage: bigbinary.py   (BLAZE_BIN names the blaze built). About 20 GB of disk on Linux.
 """
 import os, sys, tempfile
 
-from difftest import TARGET, host
+from mixed import TARGET, host
 from farfile import far_object
 from includes import follow
 

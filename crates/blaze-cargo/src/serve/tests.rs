@@ -24,7 +24,7 @@ use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, DbError, Query, QueryKey, QueryKind};
 use blaze_units::{
     query::{BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LockWrite, Origin, PackagePlan, Planned, TestSandbox, UnitPlan, Units},
-    schema::{DebugInfo, Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
+    schema::{Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
 };
 use blaze_vfs::{Change, Op, ViewId};
 
@@ -158,24 +158,7 @@ impl Query for FakePlan {
 }
 
 fn profile() -> Profile {
-    Profile {
-        name: "dev".into(),
-        opt_level: "0".into(),
-        lto: "false".into(),
-        codegen_backend: None,
-        codegen_units: None,
-        debuginfo: DebugInfo::Level(2),
-        split_debuginfo: None,
-        debug_assertions: true,
-        overflow_checks: true,
-        rpath: false,
-        incremental: false,
-        panic: "unwind".into(),
-        strip: Strip::Resolved(Stripped::None),
-        rustflags: Vec::new(),
-        trim_paths: None,
-        hint_mostly_unused: None,
-    }
+    Profile { strip: Strip::Resolved(Stripped::None), ..Profile::dev() }
 }
 
 fn unit(pkg_id: &str, kind: &str, mode: Mode, deps: &[usize]) -> Unit {

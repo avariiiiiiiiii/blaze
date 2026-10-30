@@ -17,6 +17,7 @@ use std::{
     },
 };
 
+use blaze_format::cursor::{Put, Reader};
 use cranelift_codegen::binemit::Reloc;
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
 use object::{
@@ -1510,16 +1511,15 @@ impl Assembled {
     /// The bytes the store keeps.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(4 + self.code.len() + 21 * self.relocs.len());
-        bytes.extend_from_slice(&(self.code.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&self.code);
+        bytes.put_bytes_u32(&self.code);
         for named in &self.relocs {
             let kind = RELOCS.iter().position(|it| *it == named.kind);
             let kind = kind.expect("`Named::kind` gives only the relocations of `RELOCS`");
-            bytes.extend_from_slice(&named.offset.to_le_bytes());
-            bytes.push(kind as u8);
-            bytes.extend_from_slice(&named.elf_type.unwrap_or(0).to_le_bytes());
-            bytes.extend_from_slice(&named.operand.to_le_bytes());
-            bytes.extend_from_slice(&named.addend.to_le_bytes());
+            bytes.put_u32(named.offset);
+            bytes.put_u8(kind as u8);
+            bytes.put_u32(named.elf_type.unwrap_or(0));
+            bytes.put_u32(named.operand);
+            bytes.put_i64(named.addend);
         }
         bytes
     }
@@ -1527,25 +1527,22 @@ impl Assembled {
     /// Reads what [`Assembled::to_bytes`] wrote; `None` for any other bytes, which come from
     /// the store or another machine.
     pub fn from_bytes(bytes: &[u8]) -> Option<Assembled> {
-        let (len, rest) = bytes.split_first_chunk()?;
-        let (code, rest) = rest.split_at_checked(u32::from_le_bytes(*len) as usize)?;
-        let (records, []) = rest.as_chunks::<21>() else { return None };
-        let relocs = records.iter().map(|record| {
-            let (offset, rest) = record.split_first_chunk()?;
-            let (&kind, rest) = rest.split_first()?;
-            let (elf_type, rest) = rest.split_first_chunk()?;
-            let (operand, rest) = rest.split_first_chunk()?;
-            Some(Named {
-                offset: u32::from_le_bytes(*offset),
-                kind: *RELOCS.get(usize::from(kind))?,
+        let mut read = Reader::new(bytes);
+        let code = read.bytes_u32().ok()?;
+        // alloc: the relocations the process keeps, once per text read from the store
+        let mut relocs = Vec::with_capacity(read.left() / 21);
+        while !read.is_done() {
+            relocs.push(Named {
+                offset: read.u32().ok()?,
+                kind: *RELOCS.get(usize::from(read.u8().ok()?))?,
                 // No relocation that is read has the type 0.
-                elf_type: Some(u32::from_le_bytes(*elf_type)).filter(|it| *it != 0),
-                operand: u32::from_le_bytes(*operand),
-                addend: i64::from_le_bytes(rest.try_into().ok()?),
-            })
-        });
+                elf_type: Some(read.u32().ok()?).filter(|it| *it != 0),
+                operand: read.u32().ok()?,
+                addend: read.i64().ok()?,
+            });
+        }
         // alloc: the code the process keeps, once per text read from the store
-        Some(Assembled { code: code.to_vec(), relocs: relocs.collect::<Option<_>>()? })
+        Some(Assembled { code: code.to_vec(), relocs })
     }
 }
 

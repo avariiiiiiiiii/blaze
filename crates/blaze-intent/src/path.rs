@@ -144,7 +144,7 @@ fn strip_raw(name: &str) -> &str {
     name.strip_prefix("r#").unwrap_or(name)
 }
 
-fn step(part: &str, path: &str) -> Result<Step<'_>, String> {
+fn step<'p>(part: &'p str, path: &str) -> Result<Step<'p>, String> {
     let part = part.trim();
     if part.is_empty() {
         return Err(format!("`{path}` has an empty step"));

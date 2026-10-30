@@ -10868,7 +10868,7 @@ has three new fields, `owner`, `identity` and `bound`, which only the front end 
 
 > forwarded to codegen (codegen-next1) and fastcompile (fastcompile-next1), the owners it names; told by tmux (requests, pass 35).
 
-> answered by lane cargo (cargo-inbox-tests): item 2's table and image are done at `crates/blaze-cargo/src/serve/unit/test/image.rs:20` (`table`, an `ExecError` the run's error naming the binary) and `:36` (`image`), used by `serve/unit/test.rs` through one `Selector` per suite. cargo-inbox-exec applied the call after the link (`serve/unit/codegen.rs:806`) and `Output::exec_log` (`:706`); cargo-inbox-user applied `Made::table`. The call needs item 3's `Image::slots()`. The harness with `fork_server` is front-end input (the text of the test crate's root file), so it is asked of cargo-inbox (`/tmp/blaze-lanes/v2-cargo-inbox-tests.md`, "For cargo-inbox" item 3).
+> answered by lane cargo (cargo-inbox-tests): item 2's table and image are done at `crates/blaze-cargo/src/serve/unit/test/image.rs:20` (`table`, an `ExecError` the run's error naming the binary) and `:36` (`image`), used by `serve/unit/test.rs` through one `Selector` per suite. cargo-inbox-exec applied the call after the link (`serve/unit/codegen.rs:806`) and `Output::exec_log` (`:706`); cargo-inbox-user applied `Made::table`. The call needs item 3's `Image::slots()`. The harness with `fork_server` was already written by cargo-inbox, as front-end input: `serve/unit/harness.rs:65`, called at `serve/unit.rs:219` and `:369`.
 
 ## From codegen-fc-pgo (2026-10-29): `Policy::pgo` from RUSTFLAGS, the profile given to the build, and the link's half of `-Cprofile-generate` (to cargo, link)
 
@@ -11163,6 +11163,7 @@ Status: open
 > ```
 > Also give `libmimalloc-sys`'s `dependencies` `"cty"` (beside `"cc"`), and give blaze-cargo's `"libmimalloc-sys"`.
 > Without them a `--locked` build stops.
+> applied, checked by requests (04:40; `Cargo.lock` is the coordinator's, which requests doesn't edit): all three are in the lock already. `cty` 0.2.2 with checksum `b365fabc…1f35` (line ~2686), `"cty"` in `libmimalloc-sys`'s `dependencies` beside `"cc"`, and `"libmimalloc-sys"` in blaze-cargo's. The root's `libmimalloc-sys` line has `features = ["extended"]`. Nothing left.
 
 ## From codegen-fc-sol (2026-10-29): to fastcompile (premap), one hash of a static's definition (`crates/blaze-premap/src/key.rs`)
 

@@ -1,8 +1,6 @@
 //! The home of `HirDatabase`, the type inference-related queries as methods of the one
 //! database, `base_db::Db`.
 
-use std::sync::LazyLock;
-
 use arrayvec::ArrayVec;
 use base_db::{Crate, Db, target::TargetLoadError};
 use blaze_hashcons::Interned;
@@ -307,8 +305,6 @@ pub trait HirDatabase: sealed::Sealed {
     ) -> Result<Interned<'static, InternedLayout>, LayoutError>;
 
     fn target_data_layout(&self, krate: Crate) -> Result<&TargetDataLayout, TargetLoadError>;
-
-    fn target_data_layout_or_default(&self, krate: Crate) -> &TargetDataLayout;
 
     fn dyn_compatibility_of_trait(&self, trait_: TraitId) -> Option<DynCompatibilityViolation>;
 
@@ -777,12 +773,6 @@ impl HirDatabase for Db {
     fn target_data_layout(&self, krate: Crate) -> Result<&TargetDataLayout, TargetLoadError> {
         // clone: error path, an `Arc<str>` message
         crate::layout::target_data_layout_query(self, krate).map_err(|err| err.clone())
-    }
-
-    fn target_data_layout_or_default(&self, krate: Crate) -> &TargetDataLayout {
-        static DEFAULT: LazyLock<TargetDataLayout> = LazyLock::new(TargetDataLayout::default);
-
-        crate::layout::target_data_layout_query(self, krate).unwrap_or_else(|_| &*DEFAULT)
     }
 
     #[inline]
@@ -1317,6 +1307,7 @@ pub mod kinds {
         CRATE_IMPL_TRAITS = 0x2438, "crate_impl_traits";
         CRATE_IMPL_PREDICATES = 0x2439, "crate_impl_predicates";
         CONST_PARAM_TY_ERRORS = 0x243a, "const_param_ty_errors";
+        INHERENT_ASSOC_TYPES = 0x243b, "inherent_assoc_types";
 
         // Variance, dyn compatibility, representability.
         VARIANCES_OF = 0x2440, "variances_of_query";
@@ -1417,14 +1408,19 @@ pub mod kinds {
 
         // Per-module impl tables.
         INHERENT_IMPLS_FOR_MODULE = 0x24b0, "InherentImpls::for_module";
-        INHERENT_IMPLS_MODULES_BY_SELF_TY = 0x24b1, "InherentImpls::modules_by_self_ty";
-        INHERENT_IMPLS_MODULES_OF_SELF_TY = 0x24b2, "InherentImpls::modules_of_self_ty";
-        INHERENT_IMPLS_IN_MODULE_FOR_SELF_TY = 0x24b3, "InherentImpls::in_module_for_self_ty";
         TRAIT_IMPLS_FOR_MODULE = 0x24b4, "TraitImpls::for_module";
-        TRAIT_IMPLS_MODULES_BY_TRAIT = 0x24b5, "TraitImpls::modules_by_trait";
-        TRAIT_IMPLS_MODULES_OF_TRAIT = 0x24b6, "TraitImpls::modules_of_trait";
-        TRAIT_IMPLS_IN_MODULE_FOR_TRAIT = 0x24b7, "TraitImpls::in_module_for_trait";
         TRAIT_IMPLS_FOR_CRATE_AND_TRAIT = 0x24b8, "TraitImpls::for_crate_and_trait";
+
+        // Maintained impl tables and trait candidates (`method_resolution/delta`).
+        TRAIT_SLICE = 0x24d0, "trait_slice";
+        INHERENT_SLICE = 0x24d1, "inherent_slice";
+        CANDIDATE_SLICE = 0x24d2, "candidate_slice";
+        TRAIT_BODIES = 0x24d3, "trait_bodies";
+        INHERENT_BODIES = 0x24d6, "inherent_bodies";
+        BODY_IMPL_SET_HASH = 0x24da, "body_impl_set_hash";
+        IMPL_ROW_HASH = 0x24db, "impl_row_hash";
+        BLANKET_HASH = 0x24dc, "blanket_hash";
+        BODY_PART = 0x24dd, "body_part";
 
         // Imports.
         USED_IMPORTS_WITH_TRAITS = 0x24c0, "used_imports_with_traits";
@@ -1432,6 +1428,11 @@ pub mod kinds {
 
         // Inputs.
         FROZEN_IMPLS = 0x25e0, "FrozenImpls";
+        TRAIT_IMPLS_SLICE_INPUT = 0x25e1, "TraitImplsSlice";
+        INHERENT_SLICE_INPUT = 0x25e2, "InherentSlice";
+        CANDIDATE_SLICE_INPUT = 0x25e3, "CandidateSlice";
+        SLICE_DIRECTORY = 0x25e4, "SliceDirectory";
+        IMPL_SLICES = 0x25e5, "ImplSlices";
 
         // Interned ids.
         INTERNED_OPAQUE_TY = 0x25f0, "InternedOpaqueTyId";

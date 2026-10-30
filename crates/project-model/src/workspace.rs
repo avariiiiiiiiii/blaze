@@ -623,8 +623,12 @@ impl ProjectWorkspace {
         let targets = target_tuple::get(query_config, config.target.as_deref(), &config.extra_env)
             .unwrap_or_default();
         let rustc_cfg = rustc_cfg::get(query_config, None, &config.extra_env);
-        let target_data =
-            target_data::get(query_config, None, &config.extra_env, toolchain.as_ref());
+        let target_data = target_data::get(
+            query_config,
+            targets.first().map(Deref::deref),
+            &config.extra_env,
+            toolchain.as_ref(),
+        );
 
         let loaded_sysroot = sysroot.load_workspace(
             &RustSourceWorkspaceConfig::CargoMetadata(sysroot_metadata_config(

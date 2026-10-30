@@ -4,6 +4,8 @@
 //! `mem_tag` (`Query` by default): an execution, each fixpoint iteration, its cycle functions;
 //! and a run nested in another leaves the outer run's frame as it found it.
 
+#![forbid(unsafe_code)]
+
 use blaze_mem::{Tag, frame};
 
 #[salsa::input]

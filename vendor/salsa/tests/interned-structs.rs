@@ -3,6 +3,8 @@
 //! Test that a `tracked` fn on a `salsa::input`
 //! compiles and executes successfully.
 
+#![forbid(unsafe_code)]
+
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 

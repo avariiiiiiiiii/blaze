@@ -15,7 +15,6 @@
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-mod bits;
 mod format;
 mod graph;
 mod packages;
@@ -38,7 +37,7 @@ use rustc_hash::FxHashSet;
 
 pub use blaze_resolve::DepKind;
 pub use graph::EdgeKind;
-use bits::Bits;
+use blaze_ids::bits::BitSet as Bits;
 use graph::{BUILD, DEV, Edge, Graph, Kind, Node, NodeId, TAGS, Tag};
 use packages::{Reads, Table};
 
@@ -242,8 +241,6 @@ pub fn print_tree(
         // clone: the command line's, once per `cargo tree`.
         env: asked.env.clone(),
         platform: None,
-        // clone: as `env`.
-        store: asked.store.clone(),
         ..*asked
     };
     // alloc: the warnings of selecting the packages, said after the resolve.
@@ -584,7 +581,7 @@ impl Printer<'_, '_> {
 
     /// Prints a package and all of its dependencies.
     fn print_node(&mut self, node_index: NodeId, out: &mut String) {
-        let new = self.opts.no_dedupe || self.visited.insert(node_index.index());
+        let new = self.opts.no_dedupe || self.visited.insert_growing(node_index.index());
         let (symbols, color) = (self.symbols, self.opts.color);
         match self.opts.prefix {
             Prefix::Depth => {
@@ -618,7 +615,7 @@ impl Printer<'_, '_> {
         if !new || in_cycle {
             return;
         }
-        self.on_stack.insert(node_index.index());
+        self.on_stack.insert_growing(node_index.index());
         for tag in 0..TAGS as Tag {
             self.print_dependencies(node_index, tag, out);
         }

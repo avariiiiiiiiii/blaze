@@ -780,7 +780,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
                         self.item(out, it.krate(db), id.file_id, id.value.erase())?;
                     }
                 }
-                self.args(out, args)?;
+                self.args(out, args.skip_binder())?;
             }
             TyKind::FnPtr(signature, header) => {
                 write!(
@@ -850,14 +850,14 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 out.push(')');
             }
             // What was left of a projection that no `impl` in reach gives a type to.
-            TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { def_id }, args, .. }) => {
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id }, args, .. }) => {
                 let at = def_id.0.lookup(db).id;
                 out.push_str("alias ");
                 self.item(out, def_id.0.krate(db), at.file_id, at.value.erase())?;
                 self.args(out, args)?;
             }
             // An `impl Trait` nothing has told the type of, as in the drop glue of what holds one.
-            TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. }) => {
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. }) => {
                 let (at, index) = match def_id.0.loc(db) {
                     ImplTraitId::ReturnTypeImplTrait(of, index) => {
                         out.push_str("opaque fn ");

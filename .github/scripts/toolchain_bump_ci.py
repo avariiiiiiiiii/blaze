@@ -36,7 +36,7 @@ BRANCH = "toolchain/bump"
 BASE = "toolchain/base"
 PIN = os.path.join(ROOT, "harness/toolchain")
 PINS = os.path.join(ROOT, "crates/blaze-cargo/src/cargo/toolchain/pins.txt")
-ANSWERS = os.path.join(ROOT, "crates/blaze-cargo/src/answers/rustc.json")
+ANSWERS = os.path.join(ROOT, "crates/blaze-units/src/stdlib/rustc.json")
 # The issue is one for as long as the bump is blocked, retitled to the nightly it is on.
 TITLE = "Toolchain bump to {date} is blocked"
 TITLED = re.compile(r"^Toolchain bump to (\d{4}-\d{2}-\d{2}) is blocked$")

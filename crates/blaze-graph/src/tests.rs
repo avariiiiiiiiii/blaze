@@ -394,6 +394,105 @@ fn random_builds_keep_the_rules() {
     }
 }
 
+/// `step_into` appends exactly what `step` returns, refusals and the end included, over random
+/// builds finished in a random order.
+#[test]
+fn step_into_gives_what_step_gives() {
+    for seed in 0..200u64 {
+        let mut random = SplitMix64::new(seed);
+        let nodes = 1 + random.below(40) as u32;
+        let config = Config {
+            io: 1 + random.below(3) as usize,
+            work: 1 + random.below(4) as usize,
+            keep_going: random.below(2) == 0,
+        };
+        let mut specs = Vec::new();
+        for id in 0..nodes {
+            let deps: FxHashSet<u32> = (0..random.below(4))
+                .filter(|_| id > 0)
+                .map(|_| random.below(id.into()) as u32)
+                .collect();
+            let mut deps: Vec<u32> = deps.into_iter().collect();
+            deps.sort();
+            let pool = if random.below(3) == 0 { Pool::Io } else { Pool::Work };
+            specs.push(spec(id, NodeKind::Names, &deps, pool, random.below(10)));
+        }
+        let mut by_step = Machine::new(config).unwrap();
+        let mut by_into = Machine::new(config).unwrap();
+        // An output left in the buffer from before: `step_into` appends after it.
+        let mut out = vec![Output::Finished { ok: true }];
+        let mut machines = (&mut by_step, &mut by_into);
+        let added = both(seed, &mut machines, Input::Add { at_ns: 0, nodes: specs }, &mut out);
+        let mut running = runs(&added);
+        running.extend(runs(&both(seed, &mut machines, Input::Close { at_ns: 0 }, &mut out)));
+        let mut at = 0;
+        while !machines.1.is_over() {
+            assert!(!running.is_empty(), "seed {seed}: nothing runs and the build is not over");
+            at += 1 + random.below(5);
+            both(seed, &mut machines, done(at, u32::MAX, Outcome::Built), &mut out);
+            let id = running.swap_remove(random.below(running.len() as u64) as usize);
+            let outcome = match random.below(12) {
+                0 => Outcome::Failed { why: "no".to_owned() },
+                1 => Outcome::Cached { remote: false },
+                _ => Outcome::Built,
+            };
+            running.extend(runs(&both(seed, &mut machines, done(at, id, outcome), &mut out)));
+        }
+        assert!(machines.0.is_over(), "seed {seed}");
+        both(seed, &mut machines, Input::Close { at_ns: at }, &mut out);
+        assert_eq!(out, [Output::Finished { ok: true }], "seed {seed}");
+    }
+
+    /// `input` to both machines, the first by `step` and the second by `step_into` after what
+    /// `out` holds: the same outputs, or the same refusal with nothing appended. The outputs.
+    fn both(
+        seed: u64,
+        (by_step, by_into): &mut (&mut Machine, &mut Machine),
+        input: Input,
+        out: &mut Vec<Output>,
+    ) -> Vec<Output> {
+        let expected = by_step.step(input.clone());
+        let kept = out.len();
+        let got = by_into.step_into(input, out).map(|()| out[kept..].to_vec());
+        assert_eq!(got, expected, "seed {seed}");
+        assert!(got.is_ok() || out.len() == kept, "seed {seed}: a refused input appends nothing");
+        out.truncate(kept);
+        expected.unwrap_or_default()
+    }
+}
+
+/// Once the machine and the caller's buffer have grown, a `Done` that starts the next node of
+/// a chain calls the global allocator zero times.
+#[test]
+fn a_warm_done_through_step_into_allocates_nothing() {
+    assert!(blaze_alloc_count::installed(), "the tests count allocations");
+    let config = Config { io: 1, work: 1, keep_going: false };
+    let mut machine = Machine::new(config).unwrap();
+    let specs =
+        (0..300u32).map(|id| work(id, &[id.wrapping_sub(1)][..usize::from(id > 0)], 1)).collect();
+    let mut out = Vec::new();
+    machine.step_into(Input::Add { at_ns: 0, nodes: specs }, &mut out).unwrap();
+    machine.step_into(Input::Close { at_ns: 0 }, &mut out).unwrap();
+    let mut next = |id: u32, out: &mut Vec<Output>| {
+        out.clear();
+        machine.step_into(done(u64::from(id) + 1, id, Outcome::Built), out).unwrap();
+        let ran = out.iter().find_map(|it| match it {
+            Output::Run { id, .. } => Some(id.0),
+            _ => None,
+        });
+        assert_eq!(ran, Some(id + 1));
+    };
+    for id in 0..100 {
+        next(id, &mut out);
+    }
+    let inputs: Vec<u32> = (100..200).collect();
+    blaze_alloc_count::assert_at_most(0, "a warm `Done` through `step_into`", || {
+        for &id in &inputs {
+            next(id, &mut out);
+        }
+    });
+}
+
 #[test]
 fn the_executor_runs_every_ready_node_at_once() {
     // Four nodes that each wait until all four run: they finish only if they run together.

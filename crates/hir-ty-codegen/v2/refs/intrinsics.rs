@@ -1460,7 +1460,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let mask = u128::MAX >> (128 - bits);
         match &operand.kind {
             OperandKind::Constant { konst, .. } => {
-                let ConstKind::Unevaluated(named) = konst.as_ref().kind() else {
+                let ConstKind::Alias(_, named) = konst.as_ref().kind() else {
                     return Ok(None);
                 };
                 let allocation = self.recorded(|fx| fx.eval_const(named))?;
@@ -1503,7 +1503,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     blob = self.recorded(|fx| fx.valtree_blob(ty.as_ref(), value.value))?.bytes;
                     &blob[..]
                 }
-                ConstKind::Unevaluated(named) => {
+                ConstKind::Alias(_, named) => {
                     interned = self.recorded(|fx| fx.eval_const(named))?;
                     &interned.memory[..]
                 }
@@ -1725,7 +1725,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                                 false => None,
                             }
                         }
-                        ConstKind::Unevaluated(named) => {
+                        ConstKind::Alias(_, named) => {
                             interned = self.recorded(|fx| fx.eval_const(named))?;
                             Some(&interned.memory[..])
                         }

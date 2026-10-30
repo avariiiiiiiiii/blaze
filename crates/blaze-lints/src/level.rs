@@ -454,15 +454,17 @@ mod tests {
         })
     }
 
-    proptest::proptest! {
-        #[test]
-        fn levels_are_named_as_the_reference_named_them(
-            name in "(allow|expect|warn|force-warn|deny|forbid|[a-z-]{0,12})",
-        ) {
-            proptest::prop_assert_eq!(Level::of_attr(&name), reference_of_attr(&name));
-            let cap = reference_of_attr(&name).filter(|it| *it != Level::Expect);
-            proptest::prop_assert_eq!(Level::of_cap(&name), cap);
-        }
+    #[hegel::test]
+    fn levels_are_named_as_the_reference_named_them(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let names = ["allow", "expect", "warn", "force-warn", "deny", "forbid"].map(String::from);
+        let name: String = tc.draw(hegel::one_of!(
+            gs::sampled_from(names.to_vec()),
+            gs::text().alphabet("abcdefghijklmnopqrstuvwxyz-").max_size(12),
+        ));
+        assert_eq!(Level::of_attr(&name), reference_of_attr(&name));
+        let cap = reference_of_attr(&name).filter(|it| *it != Level::Expect);
+        assert_eq!(Level::of_cap(&name), cap);
     }
 
     #[test]

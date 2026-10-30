@@ -776,7 +776,7 @@ fn write_memory_map<'db>(
                 map.statics.iter().map(|it| StaticRec {
                     start: it.start as u64,
                     size: it.size as u64,
-                    id: salsa::plumbing::AsId::as_id(&it.id).as_bits(),
+                    id: crate::check_cache::id_bits(it.id),
                 }),
             );
             columns.vtable = Placed::push_each(
@@ -864,10 +864,8 @@ fn read_memory_map<'db>(
         map.aligns.push((word(align.address)?, word(align.align)?));
     }
     for it in statics {
-        if it.id as u32 == 0 {
-            return Err(invalid("a static of salsa id index 0"));
-        }
-        let id = salsa::plumbing::FromId::from_id(salsa::Id::from_bits(it.id));
+        let id = crate::check_cache::id_of::<StaticId>(it.id)
+            .ok_or_else(|| invalid("a static of salsa id index 0 or not in the table"))?;
         map.statics.push(StaticMemory { start: word(it.start)?, size: word(it.size)?, id });
     }
     let mut last = None;

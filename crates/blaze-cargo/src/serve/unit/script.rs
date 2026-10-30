@@ -459,9 +459,9 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     let Some(compile) = compile_of(units, run) else {
         return Err(ApiError::new(format!("the run of unit {run} has no build script compiled"), None));
     };
-    let verify = verifies(job)?;
+    let verify = verifies(job)? || pure::verifies(job)?;
     // clone: the run's own, kept with it until it ends; once per run of an inert script.
-    let elided = inert(job, run).cloned();
+    let elided = inert(job, run).or_else(|| pure::hit(job, run)).cloned();
     let program = match (&elided, verify) {
         // Never compiled: its program is named, not there.
         (Some(_), false) => None,
@@ -614,7 +614,7 @@ impl ScriptRun {
         let Value { stdout, stderr, files, .. } = value;
         let out_dir = start.unit.out_dir.to_string_lossy().into_owned();
         let files = match start.how {
-            How::Inert => Vec::new(),
+            How::Inert => out_files(files),
             How::Sandboxed(_) => out_files(files),
             How::Outside(_) => match walk(&start.unit.out_dir) {
                 Ok(it) => it,
@@ -638,7 +638,7 @@ impl ScriptRun {
         }
         match Writing::begin(&start.unit, stdout, stderr, began, self.tag, effects) {
             Ok(writing) => {
-                self.state = State::Writing(writing);
+                self.state = State::Writing(Box::new(writing)); // alloc: once per script run
                 None
             }
             Err(what) => self.error(what, out),
@@ -646,7 +646,7 @@ impl ScriptRun {
     }
 
     /// A completion of one of [`Writing`]'s effects: the run ends ok once none is left.
-    fn written(&mut self, mut writing: Writing, completion: Completion, effects: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
+    fn written(&mut self, mut writing: Box<Writing>, completion: Completion, effects: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
         match writing.step(self.tag, completion, effects) {
             Ok(true) => {
                 self.state = State::Done;
@@ -741,6 +741,10 @@ impl Runs<Real> for ScriptRun {
                     let what = format!("the build script of `{}` is inert, but elision said nothing of it", start.unit.package.descr());
                     return self.error(what, out);
                 };
+                if let Err(what) = blaze_usercode::run::restore(&start.unit.out_dir, &value.files) {
+                    let what = format!("the build script of `{}`: its OUT_DIR: {what}", start.unit.package.descr());
+                    return self.error(what, out);
+                }
                 self.finish(start, value, began, writer, effects, out)
             }
             How::Outside(command) => {
@@ -789,18 +793,28 @@ impl Runs<Real> for ScriptRun {
             // A run killed is no result: nothing of it is kept or applied.
             return Some(false);
         }
+        let (job, run_unit) = (self.job.clone(), self.unit);
         let Start { unit, env, disk, how, .. } = &mut *start;
         let value = match (run, &*how) {
             (Some(run), How::Sandboxed(prepared)) => {
+                let mut checked = None;
                 let completed = run.complete(
                     completion,
                     store,
                     disk,
                     |exit| script::cargo_rule(unit, env, exit),
-                    |traced| script::keyed(prepared, traced),
+                    |traced| {
+                        checked = pure::check(&job, run_unit, unit, traced);
+                        script::keyed(prepared, traced)
+                    },
                 );
                 match completed {
-                    Ok((value, _, _)) => value,
+                    Ok((value, _, _)) => {
+                        if let Err(what) = pure::keep(&job, run_unit, unit, checked, store, disk, &value) {
+                            return self.error(what, out);
+                        }
+                        value
+                    }
                     Err(error) => {
                         let what = format!("the build script of `{}`: {error}", unit.package.descr());
                         return self.error(what, out);
@@ -840,6 +854,8 @@ impl Runs<Real> for ScriptRun {
         }
     }
 }
+
+pub(crate) mod pure;
 
 #[cfg(test)]
 mod tests;

@@ -107,21 +107,21 @@ struct ToVarValues<'a, 'db> {
 
 impl<'db> BoundVarReplacerDelegate<DbInterner<'db>> for ToVarValues<'_, 'db> {
     fn replace_region(&mut self, br: BoundRegion<'db>) -> Region<'db> {
-        match self.var_values[br.var].kind() {
+        match self.var_values.var_values.as_slice()[br.var.as_usize()].kind() {
             GenericArgKind::Lifetime(l) => l,
             r => panic!("{br:?} is a region but value is {r:?}"),
         }
     }
 
     fn replace_ty(&mut self, bound_ty: BoundTy<'db>) -> Ty<'db> {
-        match self.var_values[bound_ty.var].kind() {
+        match self.var_values.var_values.as_slice()[bound_ty.var.as_usize()].kind() {
             GenericArgKind::Type(ty) => ty,
             r => panic!("{bound_ty:?} is a type but value is {r:?}"),
         }
     }
 
     fn replace_const(&mut self, bound_ct: BoundConst<'db>) -> Const<'db> {
-        match self.var_values[bound_ct.var].kind() {
+        match self.var_values.var_values.as_slice()[bound_ct.var.as_usize()].kind() {
             GenericArgKind::Const(ct) => ct,
             c => panic!("{bound_ct:?} is a const but value is {c:?}"),
         }
@@ -376,7 +376,8 @@ impl<'db> InferCtxt<'db> {
         let mut opt_values: IndexVec<BoundVar, Option<GenericArg<'db>>> =
             IndexVec::from_elem_n(None, query_response.var_kinds.len());
 
-        for (original_value, result_value) in iter::zip(&original_values.var_values, result_values)
+        for (original_value, result_value) in
+            iter::zip(&original_values.var_values, result_values.var_values)
         {
             match result_value.kind() {
                 GenericArgKind::Type(result_value) => {
@@ -485,8 +486,9 @@ impl<'db> InferCtxt<'db> {
         // `query_response.var_values` after applying the instantiation
         // by `result_args`.
         let instantiated_query_response = |index: BoundVar| -> GenericArg<'db> {
-            query_response
-                .instantiate_projected(self.interner, result_args, |v| v.var_values[index])
+            query_response.instantiate_projected(self.interner, result_args, |v| {
+                v.var_values.var_values.as_slice()[index.as_usize()]
+            })
         };
 
         // Unify the original value for each variable with the value

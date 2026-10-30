@@ -70,8 +70,7 @@ impl<A: Allocator> TopSubtree<A> {
         keeps_words: bool,
     ) -> Self {
         let (block, alloc) = Box::into_raw_with_allocator(block);
-        // SAFETY: a box's pointer is never null.
-        let block = unsafe { NonNull::new_unchecked(block) };
+        let block = NonNull::new(block).expect("a box's pointer is never null");
         let words = WordsCache::default();
         let tree = Tree { block, layout, top_open, top_close, words, keeps_words };
         TopSubtree { tree, alloc: ManuallyDrop::new(alloc) }

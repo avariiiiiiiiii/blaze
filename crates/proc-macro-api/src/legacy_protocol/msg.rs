@@ -212,11 +212,7 @@ mod tests {
     use super::*;
 
     fn make_ctx() -> SyntaxContext {
-        // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts;
-        // these tests have no database, so the context is never looked up in salsa. Memory
-        // safety doesn't rest on it either way: `from_u32` panics on `u32::MAX` and salsa's
-        // table checks every lookup.
-        unsafe { SyntaxContext::from_u32(0) }
+        SyntaxContext::from_u32(0)
     }
 
     fn fixture_token_tree_top_many_none() -> TopSubtree {

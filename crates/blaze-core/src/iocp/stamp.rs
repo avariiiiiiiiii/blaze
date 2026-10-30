@@ -166,8 +166,15 @@ fn stamp_name(prefix: &[u16], name: &str, path: &mut Vec<u16>) -> Stamp {
     }
 }
 
-/// Every name's stamp, in order, on up to 8 threads at once. Fails only when the root cannot be
-/// opened.
+/// How many threads stamp `names` names: one per [`CHUNK`] of them, at most one per core. A
+/// name costs an open, two queries and a close (some 20 µs, most of it the open), so a thread
+/// spawned for 2,048 of them (some 40 ms) costs it under 0.1%.
+fn sweepers(names: usize, cores: usize) -> usize {
+    names.div_ceil(CHUNK).clamp(1, cores.max(1))
+}
+
+/// Every name's stamp, in order, on [`sweepers`] threads at once. Fails only when the root
+/// cannot be opened.
 pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
     // alloc: an error path.
     let named = |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", root.display()));
@@ -176,8 +183,8 @@ pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
     trim(&mut prefix);
     // alloc: the stamps the sweep answers with, once per sweep.
     let mut out = vec![Stamp::GONE; names.len()];
-    let threads = std::thread::available_parallelism().map_or(1, |it| it.get().min(8));
-    if names.len() <= CHUNK || threads == 1 {
+    let threads = sweepers(names.len(), std::thread::available_parallelism().map_or(1, |it| it.get()));
+    if threads == 1 {
         let mut path = Vec::with_capacity(prefix.len() + 256);
         for (at, stamp) in out.iter_mut().enumerate() {
             *stamp = stamp_name(&prefix, names.get(at), &mut path);
@@ -334,6 +341,25 @@ mod tests {
         // The size of extended attributes is not a tag where there is no reparse point.
         let plain = listing_entry(0, "p", 0, symlink, 1);
         assert!(entry(&plain).unwrap().1.is_file());
+    }
+
+    /// A sweep takes a thread per 2,048 names, never more than the cores and never none; the
+    /// chunks the threads take cover every name once.
+    #[test]
+    fn a_sweep_takes_a_thread_per_chunk_up_to_the_cores() {
+        assert_eq!(sweepers(0, 16), 1);
+        assert_eq!(sweepers(CHUNK, 16), 1);
+        assert_eq!(sweepers(CHUNK + 1, 16), 2);
+        assert_eq!(sweepers(50_000, 16), 16);
+        assert_eq!(sweepers(50_000, 64), 50_000usize.div_ceil(CHUNK));
+        assert_eq!(sweepers(50_000, 0), 1);
+        for names in [1, CHUNK, CHUNK + 1, 50_000, 1 << 20] {
+            for cores in [1, 3, 8, 16, 64, 256] {
+                let threads = sweepers(names, cores);
+                let each = names.div_ceil(threads);
+                assert!(threads <= cores.max(1) && (threads - 1) * each < names, "{names} {cores}");
+            }
+        }
     }
 
     #[test]

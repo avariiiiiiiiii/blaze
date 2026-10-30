@@ -5,7 +5,10 @@
 //!   the node is made of, never its ID: loading interns it again, so a record is checked by
 //!   construction and a node is written once however many roots share it. A head record names a
 //!   head, the root it moved to and the journal's sequence number; a removal names a head and
-//!   a sequence number.
+//!   a sequence number. A file record's checksum is over its content ID, not its bytes: the
+//!   tree has the ID when it writes one and loading computes it to intern the file, so each
+//!   byte is hashed once either way, and the ID commits to every byte as a checksum over them
+//!   would.
 //! - **Group commit**: commits made while an append or a sync is in flight go out together in the
 //!   next append (its bytes moved into the effect, not copied), and one sync makes them all
 //!   durable.
@@ -21,9 +24,14 @@
 //!   node is made again; a torn record followed by new ones could also borrow their first bytes
 //!   and pass its checksum, hiding them. A head whose root's nodes are not there (only a forged
 //!   file has one) is dropped, and the file is rewritten as the heads recovered.
-//! - **Compaction**: after a collection, the next flush replaces the whole file, in one
-//!   [`Effect::Write`], with the nodes the heads reach and one record per head. Nothing is
-//!   appended while it is in flight; a failed one is made again from the state then.
+//! - **Compaction**: after a collection, once as many bytes were appended since the file was
+//!   last rewritten as that rewrite held, the next flush replaces the whole file, in one
+//!   [`Effect::Write`], with the nodes the heads reach and one record per head: each rewrite
+//!   is paid for by the appends before it, so a daemon that collects after every job writes
+//!   each byte a constant number of times, and the file stays within about twice what the
+//!   heads reach. Records of nodes a collection dropped stay in the file until then; each
+//!   still makes its node, and a head keeps its latest record. Nothing is appended while a
+//!   rewrite is in flight; a failed one is made again from the state then.
 //! - **An image** (docs/v2/plan/design/restore.md): once the daemon's image holding the tree is
 //!   durable ([`Journal::durable`]), the next flush rewrites the file to start with a base
 //!   record naming it (the hash of its tree and its node count), then only what the image does
@@ -33,20 +41,23 @@
 //!   of a node the image has or one the file makes, because an image is written only while no
 //!   node of the file's base was dropped since the file was last rewritten (`settled`).
 
+use std::sync::Arc;
+
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
 use blaze_format::cursor::{Put as _, Reader};
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Mode, Recovered, Ticket,
+    FILE_DOMAIN, Mode, Recovered, Ticket,
+    image::Bytes,
     tree::{DIR_MODE, NodeId, Tree, check},
 };
 
-const MAGIC: [u8; 4] = *b"BZJ3";
+const MAGIC: [u8; 4] = *b"BZJ4";
 pub(crate) const HEADER: usize = MAGIC.len() + 4 + 1;
 const CHECKSUM: usize = 8;
-const CHECKSUM_DOMAIN: &str = "blaze v2 vfs journal record 1";
+const CHECKSUM_DOMAIN: &str = "blaze v2 vfs journal record 2";
 
 const FILE: u8 = 1;
 const DIR: u8 = 2;
@@ -144,6 +155,12 @@ pub(crate) struct Journal {
     compact: bool,
     /// Something was appended since the file was last rewritten.
     dirty: bool,
+    /// Bytes appended since the file was last rewritten (a recovered file's, all of it).
+    appended: u64,
+    /// The length of the file's last rewrite, once it completed; 0 for none.
+    rewritten: u64,
+    /// The length of the rewrite in flight.
+    rewriting: u64,
     next_ticket: u64,
     /// The image the file starts with: its nodes are never recorded.
     base: Option<FileBase>,
@@ -198,17 +215,16 @@ impl Journal {
         let mut valid = 0;
         let mut lost_base = false;
         if base_of(bytes).is_some() {
-            let (_, _, len) = record(bytes).expect("a base record is a record");
-            valid = len;
+            valid = record(bytes).expect("a base record is a record").len;
             found.records += 1;
             lost_base = from.is_none();
         }
-        while let Some((kind, payload, len)) = record(&bytes[valid..]) {
-            if load(&mut tree, kind, payload, &mut moves, &mut sequence).is_none() {
+        while let Some(one) = record(&bytes[valid..]) {
+            if load(&mut tree, &one, &mut moves, &mut sequence).is_none() {
                 break;
             }
             found.records += 1;
-            valid += len;
+            valid += one.len;
         }
         found.skipped = bytes.len() - valid;
         let mut journal = Journal {
@@ -224,6 +240,9 @@ impl Journal {
             // below too if a head is dropped.
             compact: lost_base,
             dirty: !bytes.is_empty(),
+            appended: valid as u64,
+            rewritten: 0,
+            rewriting: 0,
             next_ticket: 0,
             base: None,
             staged: None,
@@ -356,6 +375,7 @@ impl Journal {
             // The rewrite replaces the whole file, the torn tail with it.
             self.cut = None;
             self.dirty = false;
+            self.appended = 0;
             let target = self.next.take();
             // alloc: the rewrite's bytes, moved into its effect; once per rewrite.
             let mut bytes = Vec::new();
@@ -387,6 +407,7 @@ impl Journal {
             frame(&mut bytes, SEQUENCE, |out| out.put_u64(self.sequence));
             // What was recorded and not appended is in the rewrite: the heads as they are now.
             let tickets = std::mem::take(&mut self.open).tickets;
+            self.rewriting = bytes.len() as u64;
             // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
             effects.push(Effect::Write { file: self.file.clone(), bytes, tag: self.tag(REWRITE) });
             self.flight = Flight::Rewriting(tickets);
@@ -402,6 +423,7 @@ impl Journal {
             return;
         }
         let Batch { bytes, tickets } = std::mem::take(&mut self.open);
+        self.appended += bytes.len() as u64;
         // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
         effects.push(Effect::Append { file: self.file.clone(), bytes, tag: self.tag(APPEND) });
         self.dirty = true;
@@ -447,6 +469,7 @@ impl Journal {
                     self.base = Some(base);
                 }
                 self.settled = self.rewrite_settles;
+                self.rewritten = self.rewriting;
                 durable = tickets;
             }
             // A failed rewrite left the file as it was. A failed append may have left part of
@@ -477,9 +500,9 @@ impl Journal {
     }
 
     /// Follows a collection: each node's new number, and a rewrite asked for if the file holds
-    /// anything the heads may no longer reach. A node of the file's base dropped leaves the
-    /// file naming a node the tree no longer has, so no image is written until it is
-    /// rewritten.
+    /// anything the heads may no longer reach and as many bytes were appended since the last
+    /// rewrite as it held. A node of the file's base dropped leaves the file naming a node the
+    /// tree no longer has, so then it is rewritten at once, and no image is written until it is.
     pub(crate) fn collected(&mut self, renumbered: &[Option<NodeId>], len: usize) {
         self.written = self::renumbered(&self.written, renumbered, len).0;
         let mut lost = false;
@@ -495,7 +518,7 @@ impl Journal {
             self.settled = false;
             self.rewrite_settles = false;
         }
-        self.compact |= self.dirty || lost;
+        self.compact |= lost || (self.dirty && self.appended >= self.rewritten);
     }
 }
 
@@ -527,8 +550,7 @@ fn write_node(
             panic!("the journal records a file of the image, which its base holds: {corrupt}")
         });
         if let Some(bytes) = bytes {
-            out.reserve(HEADER + bytes.len() + CHECKSUM);
-            frame(out, FILE, |out| out.extend_from_slice(bytes));
+            frame_file(out, &tree.id(node), bytes);
         } else if !children_done {
             stack.push((node, true));
             let entries = tree.entries(node).expect("a directory");
@@ -577,11 +599,26 @@ fn frame(out: &mut Vec<u8>, kind: u8, payload: impl FnOnce(&mut Vec<u8>)) {
     out.put_bytes(&sum);
 }
 
+/// Appends the record of a file whose content ID is `id`: its checksum is over the ID, so
+/// its bytes are copied and not hashed again.
+fn frame_file(out: &mut Vec<u8>, id: &ContentId, bytes: &[u8]) {
+    debug_assert_eq!(*id, ContentId::of(FILE_DOMAIN, bytes), "a file record's ID");
+    out.reserve(HEADER + bytes.len() + CHECKSUM);
+    out.put_bytes(&MAGIC);
+    out.put_u32(u32::try_from(bytes.len()).expect("a record under 4 GiB"));
+    out.put_u8(FILE);
+    out.put_bytes(bytes);
+    out.put_bytes(&checksum(FILE, &id.0));
+}
+
 /// One record of `kind` holding `payload`, framed with a good checksum: for tests that forge one.
 #[cfg(test)]
 pub(crate) fn framed(kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    frame(&mut out, kind, |out| out.extend_from_slice(payload));
+    match kind {
+        FILE => frame_file(&mut out, &ContentId::of(FILE_DOMAIN, payload), payload),
+        _ => frame(&mut out, kind, |out| out.extend_from_slice(payload)),
+    }
     out
 }
 
@@ -594,7 +631,7 @@ pub(crate) const BASE_KIND: u8 = BASE;
 /// The image a journal's file starts from, if its first record is a base record: the hash of
 /// the image's tree and its node count.
 pub(crate) fn base_of(bytes: &[u8]) -> Option<(ContentId, u64)> {
-    let (kind, payload, _) = record(bytes)?;
+    let Record { kind, payload, .. } = record(bytes)?;
     if kind != BASE || payload.len() != BASE_PAYLOAD {
         return None;
     }
@@ -603,9 +640,18 @@ pub(crate) fn base_of(bytes: &[u8]) -> Option<(ContentId, u64)> {
     Some((name, read.u64().ok()?))
 }
 
-/// The record at the start of `bytes`, its payload and its whole length, if it is a whole record
-/// with a good checksum.
-fn record(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
+/// A whole record with a good checksum.
+struct Record<'a> {
+    kind: u8,
+    payload: &'a [u8],
+    /// Its whole length, framing and all.
+    len: usize,
+    /// A file record's content ID, which its checksum is over.
+    file: Option<ContentId>,
+}
+
+/// The record at the start of `bytes`, if it is a whole record with a good checksum.
+fn record(bytes: &[u8]) -> Option<Record<'_>> {
     let mut read = Reader::new(bytes);
     if *read.array::<4>().ok()? != MAGIC {
         return None;
@@ -614,7 +660,12 @@ fn record(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
     let kind = read.u8().ok()?;
     let payload = read.take(len).ok()?;
     let sum = read.array::<CHECKSUM>().ok()?;
-    (checksum(kind, payload) == *sum).then_some((kind, payload, read.at()))
+    let file = (kind == FILE).then(|| ContentId::of(FILE_DOMAIN, payload));
+    let good = match &file {
+        Some(id) => checksum(FILE, &id.0),
+        None => checksum(kind, payload),
+    };
+    (good == *sum).then_some(Record { kind, payload, len: read.at(), file })
 }
 
 /// Loads one record; `None` when it names a node that is not there or is malformed (a
@@ -622,14 +673,16 @@ fn record(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
 /// [`SEQUENCES`]). `sequence` becomes the largest any record names.
 fn load(
     tree: &mut Tree,
-    kind: u8,
-    payload: &[u8],
+    record: &Record<'_>,
     moves: &mut FxHashMap<Box<str>, Vec<(u64, Option<ContentId>)>>,
     sequence: &mut u64,
 ) -> Option<()> {
-    match kind {
+    let payload = record.payload;
+    match record.kind {
         FILE => {
-            tree.file(std::sync::Arc::from(payload));
+            let id = record.file.expect("a file record's ID, computed to check it");
+            // alloc: recovery only, a file's bytes out of the journal's, which the caller keeps.
+            tree.file_with(id, Bytes::from(Arc::<[u8]>::from(payload)));
         }
         DIR => {
             // alloc: recovery only, one directory record's entries, which `Tree::dir` takes.

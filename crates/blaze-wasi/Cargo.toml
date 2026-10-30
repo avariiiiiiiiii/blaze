@@ -15,10 +15,12 @@ doctest = false
 
 [features]
 # The runner: Wasmtime, with WASI preview 1, and the host side of `blaze.run_tool`.
-run = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:anyhow"]
+run = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:anyhow", "dep:blaze-ids", "dep:blaze-store"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
+blaze-ids = { workspace = true, optional = true }
+blaze-store = { workspace = true, optional = true }
 # Wasmtime 49 is built on Cranelift 0.136, which hir-ty-codegen uses.
 wasmtime = { version = "49", optional = true, default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "parallel-compilation", "demangle"] }
 wasmtime-wasi = { version = "49", optional = true, default-features = false, features = ["p1"] }

@@ -328,8 +328,194 @@ pub(crate) fn in_calls(cx: &Cx<'_, '_>) -> bool {
     cx.on_any(!Implemented::EmptyEnums.bit())
 }
 
-/// Runs the lints of `node`'s kind on it.
+/// The method names some lint of a method call looks at; any other call is linted by none.
+const METHODS: [&str; 15] = [
+    "map",
+    "unwrap_or",
+    "unwrap_or_default",
+    "map_or",
+    "clone",
+    "get",
+    "push_str",
+    "insert_str",
+    "to_owned",
+    "to_string",
+    "to_os_string",
+    "to_path_buf",
+    "to_vec",
+    "into_owned",
+    "collect",
+];
+
+blaze_phf::phf_table!(static METHOD = &METHODS;);
+
+/// Runs the lints of `node`'s kind on it: one `match` on the kind, and for a method call one
+/// perfect hash of its name, to the lints that look at such a node, in the order
+/// [`check_node_by_casts`] runs them.
 pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
+    use syntax::SyntaxKind as K;
+    #[cfg(test)]
+    if BY_CASTS.get() {
+        return check_node_by_casts(cx, node);
+    }
+    if cx.expansion().is_some() {
+        if let Some(it) = ast::Enum::cast(node) {
+            empty_enums::check(cx, it);
+        }
+        return;
+    }
+    match node.kind() {
+        K::STRUCT | K::TRAIT => {
+            let Some(item) = ast::Item::cast(node) else { return };
+            upper_case_acronyms::check(cx, item);
+        }
+        K::TYPE_ALIAS => {
+            let Some(item) = ast::Item::cast(node) else { return };
+            upper_case_acronyms::check(cx, item);
+            box_collection::check(cx, node);
+        }
+        K::ENUM => {
+            let Some(item) = ast::Item::cast(node) else { return };
+            upper_case_acronyms::check(cx, item);
+            let Some(it) = ast::Enum::cast(node) else { return };
+            empty_enums::check(cx, it);
+            large_enum_variant::check(cx, node);
+        }
+        K::IMPL => {
+            let Some(it) = ast::Impl::cast(node) else { return };
+            new_without_default::check(cx, it);
+            undocumented_unsafe_blocks::check(cx, node);
+        }
+        K::FN => {
+            let Some(it) = ast::Fn::cast(node) else { return };
+            needless_return::check_fn(cx, it);
+            needless_pass_by_value::check(cx, node);
+            large_types_passed_by_value::check(cx, node);
+            box_collection::check(cx, node);
+        }
+        K::CONST => {
+            let Some(it) = ast::Const::cast(node) else { return };
+            redundant_static_lifetimes::check_const(cx, it);
+            box_collection::check(cx, node);
+        }
+        K::STATIC => {
+            let Some(it) = ast::Static::cast(node) else { return };
+            redundant_static_lifetimes::check_static(cx, it);
+            box_collection::check(cx, node);
+        }
+        K::RECORD_FIELD | K::TUPLE_FIELD => box_collection::check(cx, node),
+        K::MACRO_CALL => {
+            let Some(it) = ast::MacroCall::cast(node) else { return };
+            nonstandard_macro_braces::check_call(cx, it);
+            bool_assert_comparison::check(cx, it);
+            useless_borrows_in_formatting::check(cx, it);
+            useless_format::check(cx, it);
+            useless_vec::check(cx, it);
+            dbg_macro::check(cx, node);
+            todo::check(cx, node);
+            print_stdout::check(cx, node);
+            print_stderr::check(cx, node);
+        }
+        K::MACRO_RULES => {
+            let Some(it) = ast::MacroRules::cast(node) else { return };
+            nonstandard_macro_braces::check_rules(cx, it);
+            crate_in_macro_def::check(cx, it);
+        }
+        K::STMT_LIST => {
+            let Some(it) = ast::StmtList::cast(node) else { return };
+            needless_bool::check_block(cx, it);
+        }
+        K::IDENT_PAT => {
+            let Some(it) = ast::IdentPat::cast(node) else { return };
+            needless_borrow::check_ref_pat(cx, it);
+        }
+        K::IF_EXPR => {
+            let Some(ast::Expr::IfExpr(it)) = ast::Expr::cast(node) else { return };
+            needless_bool::check_if(cx, it);
+            collapsible_if::check(cx, it);
+            match_like_matches_macro::check_if_let(cx, it);
+        }
+        K::MATCH_EXPR => {
+            let Some(ast::Expr::MatchExpr(it)) = ast::Expr::cast(node) else { return };
+            match_like_matches_macro::check_match(cx, it);
+        }
+        K::CALL_EXPR => {
+            let Some(it) = ast::Expr::cast(node) else { return };
+            io_other_error::check(cx, it);
+        }
+        K::REF_EXPR => {
+            let Some(it) = ast::Expr::cast(node) else { return };
+            needless_borrow::check(cx, it);
+            needless_borrows_for_generic_args::check(cx, it);
+            byte_char_slices::check(cx, it);
+        }
+        K::ARRAY_EXPR | K::PAREN_EXPR => {
+            let Some(it) = ast::Expr::cast(node) else { return };
+            byte_char_slices::check(cx, it);
+        }
+        K::CLOSURE_EXPR => {
+            let Some(ast::Expr::ClosureExpr(closure)) = ast::Expr::cast(node) else { return };
+            needless_return::check_closure(cx, closure);
+        }
+        K::BLOCK_EXPR => {
+            undocumented_unsafe_blocks::check(cx, node);
+            multiple_unsafe_ops_per_block::check(cx, node);
+        }
+        K::METHOD_CALL_EXPR => check_method_call(cx, node),
+        _ => {}
+    }
+}
+
+/// The lints of a method call, by its name: those [`check_node_by_casts`] would run on it
+/// that do not stop at its name.
+fn check_method_call<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
+    let Some(method) = ast::MethodCallExpr::cast(node) else { return };
+    let Some(name) = method.name_ref() else { return };
+    let Some(index) = METHOD.get(name.text()) else { return };
+    let expr = ast::Expr::MethodCallExpr(method);
+    match index {
+        0 => map_clone::check(cx, expr),
+        1 | 2 => map_unwrap_or::check(cx, expr),
+        3 => unnecessary_map_or::check(cx, expr),
+        4 => {
+            clone_on_copy::check(cx, expr);
+            redundant_clone::check(cx, node);
+            clone_on_ref_ptr::check(cx, node);
+        }
+        5 => get_first::check(cx, expr),
+        6 | 7 => single_char_add_str::check(cx, expr),
+        8 => {
+            redundant_clone::check(cx, node);
+            implicit_clone::check(cx, node);
+            unnecessary_to_owned::check(cx, node);
+        }
+        9 => {
+            redundant_clone::check(cx, node);
+            unnecessary_to_owned::check(cx, node);
+            inefficient_to_string::check(cx, node);
+            str_to_string::check(cx, node);
+        }
+        10..=12 => {
+            implicit_clone::check(cx, node);
+            unnecessary_to_owned::check(cx, node);
+        }
+        13 => unnecessary_to_owned::check(cx, node),
+        14 => format_collect::check(cx, node),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether [`check_node`] runs [`check_node_by_casts`] instead, for the tests that compare
+    /// the two.
+    pub(crate) static BY_CASTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`check_node`] as it was before it dispatched on the kind: every lint asked, each casting
+/// the node for itself. The reference the dispatch is tested against.
+#[cfg(test)]
+pub(crate) fn check_node_by_casts<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if cx.expansion().is_some() {
         if let Some(it) = ast::Enum::cast(node) {
             empty_enums::check(cx, it);
@@ -424,6 +610,32 @@ mod tests {
             assert_eq!(Implemented::of(info.index()), None, "{}", info.name);
         }
         assert!(names().is_sorted());
+    }
+
+    #[test]
+    fn a_method_name_is_found_at_its_place_in_the_table() {
+        for (at, name) in METHODS.iter().enumerate() {
+            assert_eq!(METHOD.get(name), Some(at), "{name}");
+        }
+        for name in ["", "clon", "clones", "Clone", "r#clone", "to_str", "iter", "unwrap"] {
+            assert_eq!(METHOD.get(name), None, "{name}");
+        }
+    }
+
+    /// The walk scans a node's children for attributes once, through `AnyHasAttrs`, and takes
+    /// "none" to mean an item or ADT has none: so every item and ADT kind must be one.
+    #[test]
+    fn every_item_and_adt_kind_has_attrs() {
+        use syntax::{
+            SyntaxKind,
+            view::{AnyHasAttrs, AstNode as _},
+        };
+        for raw in 0..SyntaxKind::__LAST as u16 {
+            let kind = SyntaxKind::from(raw);
+            if ast::Item::can_cast(kind) || ast::Adt::can_cast(kind) {
+                assert!(AnyHasAttrs::can_cast(kind), "{kind:?}");
+            }
+        }
     }
 
     #[test]

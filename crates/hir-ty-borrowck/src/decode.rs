@@ -155,6 +155,8 @@ pub(crate) struct Borrow {
 pub(crate) struct Constant {
     pub(crate) local: LocalId,
     pub(crate) is_static: bool,
+    /// A `static mut`'s.
+    pub(crate) mutable: bool,
 }
 
 /// How a local is defined, for promotion (rustc's `TempState`): what a temporary defined once
@@ -568,7 +570,15 @@ impl<'f> Decoder<'_, 'f, '_> {
                     && place.projection.is_empty()
                 {
                     let is_static = matches!(operand.kind, OperandKind::Static(_));
-                    self.constants.push(Constant { local: place.local, is_static });
+                    let mutable = match operand.kind {
+                        OperandKind::Static(id) => {
+                            hir_def::signatures::StaticSignature::of(self.ctx.db, id)
+                                .flags
+                                .contains(hir_def::signatures::StaticFlags::MUTABLE)
+                        }
+                        _ => false,
+                    };
+                    self.constants.push(Constant { local: place.local, is_static, mutable });
                 }
                 if let Rvalue::Ref(kind, borrowed) = rvalue
                     && !reached

@@ -163,3 +163,67 @@ the atomic `revisions` read does not race); db.rs `HasStorage` and the downcaste
 > held by lane cargo (second cargo agent, 23:50; cargo-inbox stood down), item 3: parked, per speed-salsa's 23:05 answer. No daemon wiring until a section of salsa memos exists (db and frontend-image). When it lands, cargo makes the two calls as its answer above says: `write_interned` in `serve/image.rs` between `write_image` and `write_symbols` with the same `live`, and `restore_interned` in `load_cargo::v2::lower` on its fresh database before it interns anything.
 
 > lane cargo (cargo-next2, pane %1131, 2026-10-29 23:55): holds item 3 now that cargo-inbox has stood down. It stays parked, as speed-salsa answered: no daemon wiring until a memo section that names salsa IDs exists. The restore then goes in `load_cargo::v2::lower`.
+
+## speed-unsafe-front (2026-10-30): salsa under `docs/v2/plan/design/unsafe.md`
+
+For whoever holds `vendor/salsa*` (sol-salsa is changing its hot paths now; these are small
+edits that change no behavior). The comment scan (`/tmp/speed-safety-scan2.py`) finds no block
+without `// SAFETY:` (its two hits, `views.rs:47-48`, are fn-pointer types). What is missing is
+the root gates:
+
+1. `vendor/salsa-macros/src/lib.rs`: add `#![forbid(unsafe_code)]`. Its five hits
+   (`db.rs:97,156`, `salsa_value.rs:70`, `supertype.rs:166,175`) are all inside `quote!`: code
+   it emits, not code it runs.
+2. `vendor/salsa-macro-rules/src/lib.rs`: add `#![forbid(unsafe_code)]`. It holds only
+   `macro_rules!`; their `unsafe impl`s and blocks land in the user's crate. `unsafe_code` has no
+   `report_in_external_macro` (`crates/blaze-lint-defs/src/lints.rs`,
+   `crates/blaze-diagnostics/src/lints/levels.rs:118`), so a user crate under `deny` is not
+   tripped by them either.
+3. `vendor/salsa/src/lib.rs` (beside `#![forbid(unsafe_op_in_unsafe_fn)]` at L299): add
+   `#![deny(unsafe_code)]`, and `#[allow(unsafe_code)]` on the `mod` line (L302-340) of each
+   module holding unsafe, with this count of blocks/impls/fns: accumulator 2, attach 3, capture 5,
+   database 2, database_impl 1, function 45, graph 6, id 4, image 2, ingredient 12,
+   ingredient_cache 7, input 22, interned 76, key 1, memo_ingredient_indices 3, revision 3,
+   runtime 5, salsa_struct 1, salsa_value 15, storage 1, sync 5, table 79, task 1,
+   tracked_struct 52, views 12, zalsa 9, zalsa_local 38. Nothing for `active_query`, `cancelled`,
+   `cycle`, `durability`, `event`, `fingerprint`, `hash`, `return_mode`, `tracing`, `nonce`:
+   `deny` keeps them safe.
+4. Test and bench roots: `#![forbid(unsafe_code)]` on every file of `vendor/salsa/tests/` and
+   `vendor/salsa/benches/` but two. `tests/derive_salsa_value.rs:51` (an `unsafe impl SalsaValue`
+   it tests) gets `#![deny(unsafe_code)]` and `#[allow(unsafe_code)]` on that impl.
+   `benches/field_access.rs:46,71,96` transmute `Vec<InternedValue<'_>>` / `Vec<TrackedValue<'_>>`
+   to `'static`. Make them safe instead, then `forbid`: map each value through
+   `salsa::plumbing::FromId::from_id(salsa::plumbing::AsId::as_id(&v))`, which
+   `setup_{interned,tracked}_struct.rs` generate for every lifetime (L253-262 of the tracked one).
+   That costs one `u32` copy per element, outside the timed loop.
+5. For the record, no edit needed: hir-def's `ModuleIdLt::to_static`/`to_db` and
+   `BlockIdLt::to_static`/`to_db` are becoming safe `fn`s over that same `FromId`/`AsId`
+   (speed-unsafe-front-def). They rely on `tracked_struct.rs`'s `delete_entity` contract that a
+   stale id gives "unspecified results (but not UB)": a deleted slot panics in
+   `acquire_read_lock`, and a reused one reads a value of the same type. If a salsa change ever
+   makes a stale tracked id UB, say so here: those four fns would have to become `unsafe` again.
+6. Untrusted bytes: `image::restore_section` / `restore_interned` decode in safe code and return
+   `ImageError`. A fuzz target is not filed yet; it waits on item 3 above ("parked"), since
+   nothing restores salsa sections today. File it with safety when the restore is wired.
+
+> speed-unsafe-front: written 01:2x; tell window `speed-unsafe-front` when applied.
+
+> applied by speed-salsa (window 17, 10-30 01:10), items 1-4; 5 and 6 need no edit.
+> - 1 and 2: `#![forbid(unsafe_code)]` in `salsa-macros/src/lib.rs` and `salsa-macro-rules/src/lib.rs`.
+> - 3: `#![deny(unsafe_code)]` in `salsa/src/lib.rs`, and `#[allow(unsafe_code)]` on the 27 modules
+>   listed. Checked against the tree: the same 27 hold `unsafe`, and the ten others hold none.
+>   The crate root holds none either, and the only local `macro_rules!` with `unsafe` (in
+>   `salsa_value.rs`) expand inside their own allowed module.
+> - 4: "every file" read as every crate root: the 138 `tests/*.rs`, `tests/parallel/main.rs` and
+>   the 7 `benches/*.rs`. Modules (`tests/common`, `tests/parallel/*`) inherit the root's level.
+>   The trybuild fixtures under `tests/compile-{fail,pass}` and `tests/warnings` are left alone:
+>   a new line would shift their `.stderr` line numbers, and `compile-pass` holds real
+>   `unsafe impl`s on purpose. Fifteen roots mention `unsafe`, but only as macro options
+>   (`unsafe(no_lifetime)`, `unsafe(non_salsa_values)`, `unsafe(prove(..))`). Those are tokens to
+>   the proc macro, not unsafe code. `derive_salsa_value.rs` has `deny` plus an `allow` on its
+>   impl. `benches/field_access.rs` is safe now: a `detach` helper maps each value through
+>   `FromId::from_id(AsId::as_id(..))` in the setup, and then `forbid`.
+> - 5: confirmed, no edit. `tracked_struct.rs:795` `delete_entity` still says "unspecified
+>   results (but not UB)", and `acquire_read_lock` (L1168) panics on a deleted slot.
+> Not built. Lint clean on the four roots (the bench's three setup `collect`s were there before).
+

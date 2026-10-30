@@ -4,6 +4,7 @@
 //! the `new` method's name and `get` and `set`
 //! change the name of the getter and setter of the fields.
 #![allow(warnings)]
+#![forbid(unsafe_code)]
 
 use std::fmt::Display;
 

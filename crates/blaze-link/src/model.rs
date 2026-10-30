@@ -454,6 +454,30 @@ impl Names {
     pub fn bytes(&self) -> usize {
         self.0.len()
     }
+
+    /// Appends `other`'s names, returning the offset they start at here: a [`Name`] of `other`
+    /// [`Name::shifted`] by it names the same text in `self`. An error past 4 GiB.
+    pub fn append(&mut self, other: &Names) -> Result<u32, String> {
+        let at = u32::try_from(self.0.len()).ok();
+        let len = u32::try_from(other.0.len()).ok();
+        match (at, len) {
+            (Some(at), Some(len)) if at.checked_add(len).is_some() => {
+                self.0.push_str(&other.0);
+                Ok(at)
+            }
+            // alloc: error path
+            _ => Err("more than 4 GiB of names in one file".to_owned()),
+        }
+    }
+}
+
+impl Name {
+    /// The same name in the arena it was appended to: `by` is what [`Names::append`] returned
+    /// for the arena this name was made in. `other` is appended whole, so each of its character
+    /// boundaries is one of the arena's.
+    pub fn shifted(self, by: u32) -> Name {
+        Name { at: self.at + by, len: self.len }
+    }
 }
 
 /// A relocatable object (`.o`, `.obj`, a member of an archive).
@@ -732,8 +756,9 @@ pub(crate) struct Shared {
     pub symbols: Vec<SharedSymbol>,
     /// The symbols' names.
     pub names: Names,
-    /// The versions symbols are defined at, each once ([`SharedSymbol::version`]).
-    pub versions: Vec<String>,
+    /// The versions symbols are defined at, each once ([`SharedSymbol::version`]): names in
+    /// [`Shared::names`].
+    pub versions: Vec<Name>,
     /// More shared libraries it stands for: a linker script's `GROUP`, a `.tbd`'s
     /// re-exports, an import library's members of other DLLs.
     pub more: Vec<Shared>,
@@ -748,7 +773,7 @@ impl Shared {
     }
 
     pub fn version(&self, symbol: &SharedSymbol) -> Option<&str> {
-        symbol.version.map(|it| self.versions[it as usize].as_str())
+        symbol.version.map(|it| self.names.at(self.versions[it as usize]))
     }
 }
 
@@ -765,7 +790,7 @@ pub(crate) struct SharedSymbol {
 const _: () = assert!(std::mem::size_of::<SharedSymbol>() <= 16);
 
 /// A symbol the image imports from a shared library.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: per link, not per item: a stage that gains an import, a graph rebuilt
 pub(crate) struct Import {
     pub name: String,
     /// Index into [`Placed::libraries`]; `None` for a weak symbol no library defines,
@@ -811,7 +836,7 @@ pub(crate) struct Bind {
 
 /// A name the image defines for the loader and other modules: `main` of a PIE that a
 /// shared library calls back, every export of a shared library, the live descriptor.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Export {
     pub name: String,
     pub addr: u64,

@@ -226,7 +226,7 @@ impl StoredGoal {
             PredicateKind::ConstEquate(a, b) => StoredGoal::ConstEquate { a: arg(a.into()), b: arg(b.into()) },
             PredicateKind::DynCompatible(trait_) => StoredGoal::DynCompatible { trait_: trait_.0 },
             PredicateKind::Clause(ClauseKind::UnstableFeature(feature)) => {
-                StoredGoal::UnstableFeature { feature }
+                StoredGoal::UnstableFeature { feature: feature.0 }
             }
             PredicateKind::Clause(ClauseKind::RegionOutlives(outlives)) => {
                 StoredGoal::Outlives { a: arg(outlives.0.into()), b: arg(outlives.1.into()) }

@@ -27,7 +27,7 @@ mod image;
 mod tests;
 
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use blaze_codegen::Arch;
 use blaze_ids::radix;
@@ -95,8 +95,9 @@ pub(crate) fn writer(output: &Output) -> Result<Pe, LinkError> {
     if output.dev_run.is_some() && !matches!(output.kind, OutputKind::Executable { .. }) {
         return Err(error("a dev run of a DLL: only an executable has a start hook and a code memory"));
     }
+    let last = output.incremental.then(Mutex::default);
     // alloc: once per link: the writer's own copy of the output it makes
-    Ok(Pe { output: output.clone(), descriptors: Mutex::default() })
+    Ok(Pe { output: output.clone(), descriptors: Mutex::default(), last })
 }
 
 /// An error, formatted only when it is returned.
@@ -117,9 +118,25 @@ pub(crate) struct Pe {
     /// only the descriptor. Written once per archive that has descriptors; read once per long
     /// import member the core reads on its own (an import library read whole uses its own).
     pub(crate) descriptors: Mutex<coff::Descriptors>,
+    /// An incremental output's last tables, which the next synthesis patches when its
+    /// [`crate::model::Delta`] is from theirs.
+    pub(crate) last: Option<Mutex<image::Last>>,
 }
 
 impl Pe {
+    /// The last tables, when the output is incremental; a poisoned lock (a synthesis that
+    /// panicked) gives them empty, so the next synthesis builds every table.
+    pub(crate) fn last(&self) -> Option<MutexGuard<'_, image::Last>> {
+        self.last.as_ref().map(|it| match it.lock() {
+            Ok(last) => last,
+            Err(poisoned) => {
+                let mut last = poisoned.into_inner();
+                *last = image::Last::default();
+                last
+            }
+        })
+    }
+
     pub(crate) fn dll(&self) -> bool {
         matches!(self.output.kind, OutputKind::Shared { .. })
     }
@@ -357,7 +374,7 @@ impl Writer for Pe {
     }
 
     fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, crate::cow::CowBytes)>, LinkError> {
-        image::synthesize(placed)
+        image::synthesize(self, placed)
     }
 
     fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64> {

@@ -99,7 +99,7 @@ pub const fn share(tag: Tag) -> u64 {
     match tag {
         Tag::Infer | Tag::Codegen | Tag::Link | Tag::Frames => 32,
         Tag::Mir | Tag::Query => 24,
-        Tag::Nameres | Tag::Intern => 16,
+        Tag::Nameres | Tag::Intern | Tag::Diagnostics => 16,
         Tag::Parse | Tag::Expand | Tag::Store | Tag::Vfs | Tag::Chunks | Tag::Fuzz => 8,
         Tag::Usercode | Tag::Other => 4,
         Tag::Plane | Tag::Io | Tag::Api => 2,
@@ -166,7 +166,7 @@ impl Estimate {
 /// Each kind's [`Estimate`], learned as tasks finish. A predict or an observe is one Fx hash of
 /// the kind's `u32` and one probe; an observe of a kind seen before allocates nothing. Kinds
 /// are written in order of their numbers, by [`Estimates::encode`] and by serde alike.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct Estimates {
     #[serde(with = "in_order")]
     pub by_kind: FxHashMap<TaskKind, Estimate>,
@@ -610,7 +610,7 @@ mod tests {
             estimates.observe(TaskKind(random.below(5) as u32), peak(&mut random));
         }
         let bytes = estimates.encode();
-        assert_eq!(Estimates::decode(&bytes), Ok(estimates.clone()));
+        assert_eq!(Estimates::decode(&bytes).as_ref(), Ok(&estimates));
         assert_eq!(Estimates::decode(&Estimates::new(5).encode()), Ok(Estimates::new(5)));
         assert_eq!(Estimates::decode(b"blzest00"), Err(DecodeError::Version));
         assert_eq!(Estimates::decode(&bytes[..12]), Err(DecodeError::Short { at: 8 }));
@@ -688,5 +688,28 @@ mod tests {
         }
         assert_eq!(tag::budget(Tag::Infer), 32 << 30);
         assert_eq!(tag::budget(Tag::Plane), 2 << 30);
+    }
+
+    /// The plane predicts every node it admits and observes every task that ends: once each
+    /// kind has been seen, neither allocates.
+    #[test]
+    fn warm_predictions_and_observations_allocate_nothing() {
+        assert!(blaze_alloc_count::installed(), "the tests count allocations");
+        let mut estimates = Estimates::new(64);
+        let kinds: Vec<TaskKind> = (0..32).map(TaskKind).collect();
+        let mut random = SplitMix64::new(11);
+        for &kind in &kinds {
+            estimates.observe(kind, peak(&mut random));
+        }
+        let peaks: Vec<u64> = (0..1024).map(|_| peak(&mut random)).collect();
+        blaze_alloc_count::assert_at_most(0, "warm predictions and observations", || {
+            let mut held = 0u64;
+            for (at, &most) in peaks.iter().enumerate() {
+                let kind = kinds[at % kinds.len()];
+                held = held.wrapping_add(Predict::predict(&estimates, kind, None).peak);
+                Predict::observe(&mut estimates, kind, None, 0, most);
+            }
+            std::hint::black_box(held)
+        });
     }
 }

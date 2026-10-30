@@ -192,8 +192,8 @@ impl<'db> Body<'_, '_, 'db> {
             TyKind::FnDef(def, args) => {
                 let hir_def::CallableDefId::FunctionId(f) = def.0 else { return None };
                 (
-                    effects::effects(db, env.store(), f, args.store()),
-                    effects::cost(db, env.store(), f, args.store()),
+                    effects::effects(db, env.store(), f, args.skip_binder().store()),
+                    effects::cost(db, env.store(), f, args.skip_binder().store()),
                 )
             }
             _ => return None,
@@ -236,7 +236,7 @@ impl<'db> Body<'_, '_, 'db> {
             }
             TyKind::FnDef(def, args) => match def.0 {
                 hir_def::CallableDefId::FunctionId(f) => {
-                    effects::effects(db, env.store(), f, args.store()).returns
+                    effects::effects(db, env.store(), f, args.skip_binder().store()).returns
                 }
                 _ => return false,
             },

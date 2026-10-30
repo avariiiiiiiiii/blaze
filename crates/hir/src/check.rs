@@ -20,11 +20,11 @@
 pub mod bodies;
 
 use base_db::Db;
-use hir_def::nameres::crate_def_map;
+use hir_def::{DefWithBodyId, GenericDefId, Lookup, nameres::crate_def_map};
 
 use self::bodies::Plan;
 use crate::{
-    AnyDiagnostic, Crate, DefWithBody, Module, diagnostics::DiagnosticsCollector,
+    AnyDiagnostic, Crate, DefWithBody, Module, TypeOwnerId, diagnostics::DiagnosticsCollector,
 };
 
 /// The body filter of a check that asks for every body.
@@ -62,6 +62,22 @@ pub fn check_module<'db>(
     // alloc: the result; empty, so no allocation, unless a diagnostic is reported
     let mut acc = Vec::new();
     DiagnosticsCollector::collect(db, module.id, &mut acc, style_lints, bodies);
+    acc
+}
+
+/// The diagnostics of body `def` alone, as a [`Plan`]'s task for it checks it: inference,
+/// borrow, match and unsafety checks, without its module's item checks. An enum variant's
+/// discriminant is checked in the generics of its enum, as its module's check does.
+pub fn check_body(db: &Db, def: DefWithBodyId, style_lints: bool) -> Vec<AnyDiagnostic<'_>> {
+    let owner = match def {
+        DefWithBodyId::FunctionId(it) => GenericDefId::from(it),
+        DefWithBodyId::ConstId(it) => GenericDefId::from(it),
+        DefWithBodyId::StaticId(it) => GenericDefId::from(it),
+        DefWithBodyId::VariantId(it) => GenericDefId::from(it.lookup(db).parent),
+    };
+    // alloc: the result; empty, so no allocation, unless a diagnostic is reported
+    let mut acc = Vec::new();
+    DiagnosticsCollector::collect_body(db, def, TypeOwnerId::GenericDefId(owner), &mut acc, style_lints, &every_body);
     acc
 }
 

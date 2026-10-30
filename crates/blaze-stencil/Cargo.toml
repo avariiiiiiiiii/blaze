@@ -15,6 +15,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-bytes.workspace = true
 blaze-codegen.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
@@ -28,7 +29,8 @@ llvm-sys.workspace = true
 object.workspace = true
 # The library's id: the BLAKE3 hash of its bytes, which stencil units' settings carry.
 blake3.workspace = true
-# `src/table/format.rs`'s sets, as the patcher reads them.
+# `src/table/format.rs`'s sets and little-endian reads, as the patcher reads them.
+blaze-bytes.workspace = true
 blaze-ids.workspace = true
 
 [dev-dependencies]

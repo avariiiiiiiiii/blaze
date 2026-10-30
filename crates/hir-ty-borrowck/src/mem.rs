@@ -1,47 +1,15 @@
 //! The run's frame: every temporary of a borrow check is in it, and goes in one store when the
 //! task that runs the check ends. What a check returns to the database is owned instead.
 
-pub(crate) use blaze_mem::frame::Frame;
-use rustc_hash::FxBuildHasher;
+pub(crate) use hir_ty_wfcheck::mem::{FMap, FSet, FVec, Frame, collect, map, owned, set};
 
-pub(crate) type FVec<'f, T> = Vec<T, &'f Frame>;
-pub(crate) type FMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
-pub(crate) type FSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;
 pub(crate) type FDeque<'f, T> = std::collections::VecDeque<T, &'f Frame>;
-
-#[inline]
-pub(crate) fn map<'f, K, V>(frame: &'f Frame) -> FMap<'f, K, V> {
-    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)
-}
-
-#[inline]
-pub(crate) fn set<'f, T>(frame: &'f Frame) -> FSet<'f, T> {
-    hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame)
-}
 
 /// `len` copies of `value` in one allocation of exactly `len`.
 #[inline]
 pub(crate) fn filled<'f, T: Clone>(frame: &'f Frame, len: usize, value: T) -> FVec<'f, T> {
     let mut out = Vec::with_capacity_in(len, frame);
     out.resize(len, value);
-    out
-}
-
-/// The items of `iter` in a frame vector, its room the iterator's lower bound to start.
-#[inline]
-pub(crate) fn collect<'f, T>(frame: &'f Frame, iter: impl IntoIterator<Item = T>) -> FVec<'f, T> {
-    let iter = iter.into_iter();
-    let mut out = Vec::with_capacity_in(iter.size_hint().0, frame);
-    out.extend(iter);
-    out
-}
-
-/// The items of `iter`, which says its length, as an owned vector of exactly that length: a
-/// memoized result built from frame values.
-#[inline]
-pub(crate) fn owned<T>(iter: impl ExactSizeIterator<Item = T>) -> Vec<T> {
-    let mut out = Vec::with_capacity(iter.len()); // alloc: the memoized result, owned
-    out.extend(iter);
     out
 }
 

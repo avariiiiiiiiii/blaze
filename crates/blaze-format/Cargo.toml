@@ -22,7 +22,7 @@ zstd.workspace = true
 blake3.workspace = true
 blaze-alloc-count.workspace = true
 blaze-v2-proof.workspace = true
-proptest.workspace = true
+hegeltest.workspace = true
 
 [lints]
 workspace = true

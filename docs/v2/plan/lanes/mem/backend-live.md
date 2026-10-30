@@ -20,7 +20,7 @@ A child of [backend.md](backend.md), under lane mem's plan
 | the runs `Signature::of` rehashes | one Mach-O splice | a clone of every overwritten run's bytes | `(offset, len)` pairs from the addition itself |
 | the names `can_call` and the PE `__imp_` lookup build | one call | `format!` / `concat()` | `blaze_mem::scratch::with_bytes` |
 | `.eh_frame` frames counted for a patch | one call | a `Vec` built to take its `len()` | `Patch::each_frame`, a visitor |
-| `blaze-live` `Log` (ten columns per generation) and `Lasting` ranges | the program's life | `Vec`s doubling on the warm apply path | `RegionVec`s, `Tag::Link`, reserved to the `u32` bounds `Switch::apply` checks (requested) |
+| `blaze-live` `Log` (ten columns per generation) and `Lasting` ranges | the program's life | `Vec`s doubling on the warm apply path | `Vec`s, kept: refused, blaze-live takes no dependency (queue 00191) |
 | `blaze-lazy` `Fetcher` waiters | a function's compile | a `Vec<Waiter>` per function in flight | a `Slab<Waiting>` list per function, the map holding only first and last handle (requested) |
 
 `blaze-in-place` (wait for the daemon's write, copy with holes) holds no table and no per-call

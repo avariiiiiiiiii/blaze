@@ -6,6 +6,7 @@
 use std::fmt::Write;
 
 use base_db::Db;
+use blaze_mem::{Tag, frame};
 use hir_def::{Lookup, VariantId, expr_store::ExpressionStore, signatures::FunctionSignature};
 use rustc_type_ir::inherent::IntoKind;
 
@@ -23,21 +24,23 @@ use super::{
 
 /// `body` as rustc prints the MIR of the function `name`.
 pub fn print_mir_body<'db>(db: &'db Db, body: &MirBody<'db>, name: &str) -> String {
-    let ctx = Ctx::new(db, body.owner);
-    // alloc: printing MIR for people, the edge
-    let mut p = Printer { db, body, ctx: &ctx, out: String::new() };
-    p.body(name);
-    p.out
+    frame::task(Tag::Mir, |frame| {
+        let ctx = Ctx::new(db, body.owner, frame);
+        // alloc: printing MIR for people, the edge
+        let mut p = Printer { db, body, ctx: &ctx, out: String::new() };
+        p.body(name);
+        p.out
+    })
 }
 
-struct Printer<'a, 'db> {
+struct Printer<'a, 'f, 'db> {
     db: &'db Db,
     body: &'a MirBody<'db>,
-    ctx: &'a Ctx<'db>,
+    ctx: &'a Ctx<'f, 'db>,
     out: String,
 }
 
-impl<'db> Printer<'_, 'db> {
+impl<'db> Printer<'_, '_, 'db> {
     fn ty(&self, ty: Ty<'db>) -> String {
         rustc_type_name(self.db, ty).unwrap_or_else(|| match ty.kind() {
             // alloc: printing MIR for people, the edge

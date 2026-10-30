@@ -219,7 +219,7 @@ fn owners<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Owners<'db> {
 }
 
 /// rustc's `peel_parent_while` of modules and anonymous constants from `owners[0]`.
-fn peel<'db>(owners: &[Owner<'db>]) -> Option<&Owner<'db>> {
+fn peel<'o, 'db>(owners: &'o [Owner<'db>]) -> Option<&'o Owner<'db>> {
     owners.iter().find(|it| it.is_root() || !matches!(it.kind, Kind::Module | Kind::AnonConst))
 }
 

@@ -19,6 +19,7 @@ use std::hash::BuildHasher as _;
 use std::ops::Range;
 
 use blaze_codegen::Arch;
+use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::model::{Names, Shared, SharedSymbol, SymbolKind};
@@ -57,20 +58,7 @@ fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Shared, Strin
         // alloc: error path
         return Err("no document".to_owned());
     }
-    // alloc: the tape, once per file; `scratch` stays empty until a scalar is unescaped or wraps
-    let mut tape = Tape { nodes: Vec::with_capacity(text.len() / 16), scratch: String::new() };
-    // A document's logical lines and their pieces are at most its physical lines: sized once
-    // for the longest, and reused by every document.
-    let most = raw.iter().map(|it| it.count).max().unwrap_or(0);
-    let mut lines = Vec::with_capacity(most);
-    let mut pieces = Vec::with_capacity(most);
-    // alloc: once per file, reused by every document
-    let mut targets = Vec::new();
-    let mut docs = Vec::with_capacity(raw.len());
-    for doc in &raw {
-        let root = parse(text, doc, &mut tape, &mut lines, &mut pieces)?;
-        docs.push(Doc::new(&tape.view(text), doc, root, &mut targets)?);
-    }
+    let (tape, docs, targets) = parse_all(text, &raw, raw.len() > 1 && text.len() >= PARALLEL)?;
 
     let view = tape.view(text);
     let mut by_name = FxHashMap::default();
@@ -95,6 +83,100 @@ fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Shared, Strin
         // alloc: `Shared::inputs`: the re-exports outside the file, once per file
         inputs: plan.inputs.iter().map(|it| (*it).to_owned()).collect(),
     })
+}
+
+/// Below this many bytes of text a stream's documents are parsed on the calling thread: a
+/// parse of them all is then about as short as handing one to another core.
+const PARALLEL: usize = 64 << 10;
+
+/// Every document on one tape, each with its [`Doc`], and the targets they list.
+///
+/// In `parallel` (A6 of `v2/requests/requests-link-fuzz.md`), each document is parsed onto a
+/// tape of its own on a worker (libSystem's 40-odd documents on as many cores), then the tapes
+/// are joined in document order, each node's subtree end and scratch offset and each doc's
+/// and target's nodes moved by where its tape lands. The tape, docs, targets and first error
+/// are those of parsing the documents one after another.
+fn parse_all(text: &str, raw: &[RawDoc<'_>], parallel: bool) -> Result<(Tape, Vec<Doc>, Vec<Target>), String> {
+    // A document's logical lines and their pieces are at most its physical lines: sized once
+    // for the longest, and reused by every document a thread parses.
+    let most = raw.iter().map(|it| it.count).max().unwrap_or(0);
+    if !parallel {
+        // alloc: the tape, once per file; `scratch` stays empty until a scalar is unescaped or wraps
+        let mut tape = Tape { nodes: Vec::with_capacity(text.len() / 16), scratch: String::new() };
+        let mut lines = Vec::with_capacity(most);
+        let mut pieces = Vec::with_capacity(most);
+        // alloc: once per file, reused by every document
+        let mut targets = Vec::new();
+        let mut docs = Vec::with_capacity(raw.len());
+        for doc in raw {
+            let root = parse(text, doc, &mut tape, &mut lines, &mut pieces)?;
+            docs.push(Doc::new(&tape.view(text), doc, root, &mut targets)?);
+        }
+        return Ok((tape, docs, targets));
+    }
+    let mut parts: Vec<Result<(Tape, Doc, Vec<Target>), String>> = Vec::with_capacity(raw.len());
+    raw.par_iter()
+        .map_init(
+            || (Vec::<Line>::with_capacity(most), Vec::<Piece>::with_capacity(most)),
+            |(lines, pieces), one| -> Result<(Tape, Doc, Vec<Target>), String> {
+                let len = one.lines.end - one.lines.start;
+                // alloc: the document's own tape, once per document
+                let mut tape = Tape { nodes: Vec::with_capacity(len / 16), scratch: String::new() };
+                // alloc: none until the document lists a target, then once per document
+                let mut targets = Vec::new();
+                let root = parse(text, one, &mut tape, lines, pieces)?;
+                let doc = Doc::new(&tape.view(text), one, root, &mut targets)?;
+                Ok((tape, doc, targets))
+            },
+        )
+        .collect_into_vec(&mut parts);
+    // alloc: the documents' parses, once per file
+    let parts: Vec<(Tape, Doc, Vec<Target>)> = parts.into_iter().collect::<Result<_, _>>()?;
+
+    // Where each document's nodes, scratch and targets land.
+    let mut bases: Vec<(u32, u32, u32)> = Vec::with_capacity(parts.len());
+    let (mut nodes, mut held, mut listed) = (0usize, 0usize, 0usize);
+    for (part, _, targets) in &parts {
+        bases.push((nodes as u32, held as u32, listed as u32));
+        nodes += part.nodes.len();
+        held += part.scratch.len();
+        listed += targets.len();
+    }
+    let mut tape = Tape { nodes: Vec::with_capacity(nodes), scratch: String::with_capacity(held) };
+    tape.nodes.resize(nodes, Node { kind: Kind::Text, at: 0, len: 0 });
+    {
+        let mut chunks: Vec<&mut [Node]> = Vec::with_capacity(parts.len());
+        let mut rest = &mut tape.nodes[..];
+        for (part, _, _) in &parts {
+            let (chunk, tail) = std::mem::take(&mut rest).split_at_mut(part.nodes.len());
+            chunks.push(chunk);
+            rest = tail;
+        }
+        chunks.into_par_iter().zip(parts.par_iter()).zip(bases.par_iter()).for_each(|((chunk, part), &(base, offset, _))| {
+            for (out, node) in chunk.iter_mut().zip(&part.0.nodes) {
+                *out = match node.kind {
+                    Kind::Seq | Kind::Map => Node { at: node.at + base, ..*node },
+                    Kind::Scratch => Node { at: node.at + offset, ..*node },
+                    Kind::Text => *node,
+                };
+            }
+        });
+    }
+    let mut targets = Vec::with_capacity(listed);
+    let mut docs = Vec::with_capacity(parts.len());
+    for ((part, doc, its), (base, _, first)) in parts.iter().zip(bases) {
+        tape.scratch.push_str(&part.scratch);
+        targets.extend(its.iter().map(|it| Target { node: it.node + base, ..*it }));
+        docs.push(Doc {
+            version: doc.version,
+            map: doc.map.map(|it| it + base),
+            install_name: doc.install_name + base,
+            list: doc.list + base,
+            platform: doc.platform + base,
+            targets: doc.targets.start + first..doc.targets.end + first,
+        });
+    }
+    Ok((tape, docs, targets))
 }
 
 /// The documents and what they list, read; the lists the output's target selects are
@@ -2357,6 +2439,65 @@ e:
         }
         same(V4);
         same(V3);
+    }
+
+    type Shape = (Vec<(Kind, u32, u32)>, String, Vec<(u8, Option<u32>, u32, u32, u32, Range<u32>)>, Vec<(u32, u32, u32)>);
+
+    /// What a parse of every document gave, as plain values.
+    fn shape(parsed: Result<(Tape, Vec<Doc>, Vec<Target>), String>) -> Result<Shape, String> {
+        let (tape, docs, targets) = parsed?;
+        Ok((
+            tape.nodes.iter().map(|it| (it.kind, it.at, it.len)).collect(),
+            tape.scratch,
+            docs.iter().map(|it| (it.version, it.map, it.install_name, it.list, it.platform, it.targets.clone())).collect(),
+            targets.iter().map(|it| (it.node, it.len, it.platform)).collect(),
+        ))
+    }
+
+    /// The documents parsed on workers and joined give the tape, docs, targets and first
+    /// error of parsing them one after another (A6), over the seeded streams and their
+    /// mutations.
+    #[test]
+    fn documents_parse_alike_on_workers_and_in_turn() {
+        let mut rng = Rng(blaze_ids::rng::SplitMix64::new(0xa6_d0c5));
+        let mut joined = 0;
+        for _ in 0..600 {
+            let mut text = generate(&mut rng);
+            for _ in 0..rng.below(3) {
+                text.push_str(&generate(&mut rng));
+            }
+            let Ok(raw) = documents(&text) else { continue };
+            let (serial, parallel) = (shape(parse_all(&text, &raw, false)), shape(parse_all(&text, &raw, true)));
+            assert_eq!(serial, parallel, "{text}");
+            joined += usize::from(raw.len() > 1 && serial.is_ok());
+        }
+        assert!(joined > 50, "only {joined} streams of several documents parsed");
+        for text in [V4, V3] {
+            let raw = documents(text).unwrap();
+            assert_eq!(shape(parse_all(text, &raw, false)), shape(parse_all(text, &raw, true)));
+        }
+    }
+
+    /// A stream past [`PARALLEL`] of many documents re-exporting each other, its documents
+    /// parsed on workers, reads as the reference reads it.
+    #[test]
+    fn a_large_stream_reads_as_the_reference_does() {
+        let mut rng = Rng(blaze_ids::rng::SplitMix64::new(0x1a6e_d0c5));
+        for _ in 0..3 {
+            let mut text = String::new();
+            let mut index = 0;
+            while text.len() < 2 * PARALLEL {
+                if rng.one_in(3) {
+                    doc_v3(&mut rng, &mut text, "\n", index, 1000);
+                } else {
+                    doc_v4(&mut rng, &mut text, "\n", index, 1000);
+                }
+                text.push_str("...\n");
+                index += 1;
+            }
+            assert!(documents(&text).unwrap().len() > 1);
+            same(&text);
+        }
     }
 
     #[test]

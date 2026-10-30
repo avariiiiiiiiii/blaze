@@ -5,9 +5,13 @@
 //! written through the second, straight from its message, with no system call and no change
 //! of protection, so no TLB shootdown and no moment a page of the region can't run: what JITs
 //! that keep code W^X by mapping it twice do. The image's other mappings and their
-//! protections are read from /proc/self/maps once, at start; a data write to read-only pages
-//! makes each run of them writable once, writes and protects it again. Data is written
-//! with atomic stores ([`Writes::store`]), since other threads may read it meanwhile.
+//! protections are read from /proc/self/maps once, at start. Read-only pages are written the
+//! same way: the first write into one moves a window of its mapping ([`WINDOW`], within the
+//! mapping) onto a memory file mapped twice, with the protection it had ([`Aliases`]), so
+//! that write and every later one into the window are stores through the second mapping,
+//! with no system call and no TLB shootdown. The table cell's page, when read-only, gets its
+//! window at start. Data is written with atomic stores ([`Writes::store`]), since other
+//! threads may read it meanwhile.
 
 #![allow(unsafe_code, reason = "the jump table's executable memory, protections and unwind registration")]
 
@@ -25,8 +29,8 @@ use std::{
 pub(super) use super::unix::{GRAIN, Reserved, backtrace, descriptor, in_image_of};
 use super::{
     Events,
-    switch::{Dwarf, Layout, Memory, Writes},
-    unix::{__register_frame, Segments, load_cell, loaders, mmap, mprotect, munmap},
+    switch::{Dwarf, Layout, Memory, Span, Writes},
+    unix::{__register_frame, Segments, load_cell, loaders, mmap, munmap},
 };
 use crate::patch::MESSAGE_PREFIX;
 
@@ -69,9 +73,12 @@ const WATCHED: u32 = IN_CLOSE_WRITE | IN_MOVED_TO;
 const POLLIN: i16 = 1;
 /// How long the watching thread blocks before it looks whether to stop.
 const WAKE_EVERY_MS: i32 = 1000;
+/// What a window of read-only pages written through a second mapping is aligned to and at
+/// most as long as: the first write into it copies at most this much (about 0.2 ms at
+/// 10 GB/s, once), and a file-backed page in it costs a page of memory from then on.
+const WINDOW: u64 = 2 << 20;
 
 pub(super) struct Os {
-    page: u64,
     /// The protection of the table cell's page.
     cell: i32,
     /// The patch code region in memory, and where it is mapped writable.
@@ -80,6 +87,7 @@ pub(super) struct Os {
     maps: Maps,
     /// Where the image is mapped, which every data write is checked to be in.
     segments: Segments,
+    aliases: Aliases,
 }
 
 impl Os {
@@ -107,70 +115,130 @@ impl Os {
                 }
                 Ok(())
             })?;
-            map_twice(&code)?
+            map_twice(&code, PROT_READ | PROT_EXEC)?
         };
         let at = layout.cell();
-        let mut cell = 0;
-        maps.each(&(at..at + 8), |_, protection| {
-            cell = protection;
-            Ok(())
-        })?;
         let segments = Segments::of(at)?;
-        Ok(Os { page, cell, code, alias, maps, segments })
+        let (mapping, cell) = maps.mapping(at)?;
+        let mut aliases = Aliases::new();
+        if !code.is_empty() {
+            // The code region is mapped twice already: as a window, no window of read-only
+            // pages in the same mapping is cut over it.
+            aliases.windows.push((code.start, code.end, alias));
+        }
+        if cell & PROT_WRITE == 0 {
+            if cell & PROT_READ == 0 {
+                // alloc: error path, at start
+                return Err(format!("the table cell at {at:#x} is in pages with no access"));
+            }
+            segments.check(&(at..at + 8))?;
+            aliases.make(at, &mapping, cell)?;
+        }
+        Ok(Os { cell, code, alias, maps, segments, aliases })
+    }
+}
+
+/// Read-only pages of the image that patches write, each window of them moved onto a memory
+/// file mapped twice ([`map_twice`]): where the image has it, with the protection it had, and
+/// read and write at an address of its own. Sorted by address, none overlapping, each within
+/// one mapping of the image. A window is made once, at the first write into it, and kept for
+/// the life of the program. The patch code region is the first, put there at start: data is
+/// never written into it (the switch refuses that), but a window of the mapping around it
+/// must not be cut over it.
+struct Aliases {
+    /// Start and end in memory, and where the window is mapped writable.
+    windows: Vec<(u64, u64, u64)>,
+}
+
+impl Aliases {
+    fn new() -> Aliases {
+        // alloc: setup, once at start; an edit writes one or two windows, and a window is
+        // added at most once per `WINDOW` of read-only image the program's patches ever write
+        Aliases { windows: Vec::with_capacity(16) }
     }
 
-    fn pages(&self, range: &Range<u64>) -> Range<u64> {
-        range.start & !(self.page - 1)..range.end.next_multiple_of(self.page)
+    /// The window that has `at`: a binary search.
+    fn find(&self, at: u64) -> Option<usize> {
+        let next = self.windows.partition_point(|it| it.1 <= at);
+        self.windows.get(next).filter(|it| it.0 <= at).map(|_| next)
     }
 
-    /// Writes what `writes` has within `pages`, of mappings with `protection`, which isn't
-    /// writable: made writable for the write, then given it back.
-    fn protected(
-        &self,
+    /// Makes the window that `at`, in `mapping` (whole pages, read-only with `protection`),
+    /// falls in, and has no window yet: its index.
+    fn make(&mut self, at: u64, mapping: &Range<u64>, protection: i32) -> Result<usize, String> {
+        let next = self.windows.partition_point(|it| it.1 <= at);
+        let low = next.checked_sub(1).map_or(0, |it| self.windows[it].1);
+        let high = self.windows.get(next).map_or(u64::MAX, |it| it.0);
+        let window = window(at, mapping, low..high);
+        let alias = map_twice(&window, protection)?;
+        // alloc: once per window, the first write into it (see `Aliases::new`)
+        self.windows.insert(next, (window.start, window.end, alias));
+        Ok(next)
+    }
+
+    /// The address `at` is written at, in the window [`Aliases::make`] made or makes for
+    /// it, and where that window ends.
+    fn writable(
+        &mut self,
+        at: u64,
+        mapping: &Range<u64>,
+        protection: i32,
+    ) -> Result<(u64, u64), String> {
+        let index = match self.find(at) {
+            Some(index) => index,
+            None => self.make(at, mapping, protection)?,
+        };
+        let (start, end, alias) = self.windows[index];
+        Ok((alias + (at - start), end))
+    }
+
+    /// Writes what `writes` has within `piece`, read-only pages of `mapping` (one mapping
+    /// of the image, with `protection`), through the windows' second mappings.
+    fn store(
+        &mut self,
         writes: &Writes<'_>,
-        pages: &Range<u64>,
+        piece: &Range<u64>,
+        mapping: &Range<u64>,
         protection: i32,
     ) -> Result<(), String> {
-        let (start, len) = (pages.start as *mut c_void, (pages.end - pages.start) as usize);
-        // SAFETY: the pages are of the image's mappings with `protection` (read at start);
-        // adding write access changes no byte and keeps them readable and, if they were,
-        // runnable.
-        if unsafe { mprotect(start, len, protection | PROT_WRITE) } != 0 {
-            // alloc: error path
-            return Err(format!(
-                "making {:#x} writable: {}",
-                pages.start,
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: the pages are the image's (`data` checked) and writable now, and stay mapped;
-        // other threads may read the bytes meanwhile, which `store` allows.
-        unsafe { writes.store(pages, pages.start as *mut u8) };
-        // SAFETY: as for making them writable: their protection from before.
-        if unsafe { mprotect(start, len, protection) } != 0 {
-            // alloc: error path
-            return Err(format!(
-                "protecting {:#x} again: {}",
-                pages.start,
-                std::io::Error::last_os_error()
-            ));
-        }
-        if protection & PROT_EXEC != 0 {
-            flush(std::iter::once(pages.start..pages.end), 0);
+        let mut at = piece.start;
+        while at < piece.end {
+            let (to, end) = self.writable(at, mapping, protection)?;
+            let part = at..end.min(piece.end);
+            // SAFETY: `part` is in one window, which `to` maps writable at the same offsets
+            // for the life of the program; the pages are the image's (the caller checked),
+            // and other threads may read them meanwhile, which `store` allows.
+            unsafe { writes.store(&part, to as *mut u8) };
+            if protection & PROT_EXEC != 0 {
+                // clone: a Range<u64> of two words; Range isn't Copy
+                flush(std::iter::once(part.clone()), to.wrapping_sub(part.start));
+            }
+            at = part.end;
         }
         Ok(())
     }
 }
 
+/// The window of read-only pages that `at` falls in: [`WINDOW`]-aligned, within `mapping`
+/// (whole pages) and within `free`, the room between the windows made before it (`at` is in
+/// all three). Whole pages, since each of its bounds is.
+fn window(at: u64, mapping: &Range<u64>, free: Range<u64>) -> Range<u64> {
+    let start = (at & !(WINDOW - 1)).max(mapping.start).max(free.start);
+    let end = (at | (WINDOW - 1)).saturating_add(1).min(mapping.end).min(free.end);
+    start..end
+}
+
 // Not blaze-inproc's `View`: this crate links into the program with no dependencies, and
 // the region it maps over is live code that threads may be running.
-/// Puts a memory file under `code`, with the bytes it has, mapped read and run there; the
-/// address it is mapped read and write at.
-fn map_twice(code: &Range<u64>) -> Result<u64, String> {
+/// Puts a memory file under `range` (whole pages, mapped readable), with the bytes it has,
+/// mapped there with `protection`; the address it is mapped read and write at.
+fn map_twice(range: &Range<u64>, protection: i32) -> Result<u64, String> {
+    let code = range;
     let len = (code.end - code.start) as usize;
-    let error =
+    let error = |what: &str| {
         // alloc: error path
-        |what: &str| format!("{what} for the patch code: {}", std::io::Error::last_os_error());
+        format!("{what} for {:#x}..{:#x}: {}", code.start, code.end, std::io::Error::last_os_error())
+    };
     // SAFETY: the name ends in a zero.
     let fd = unsafe { memfd_create(c"blaze-live-code".as_ptr(), MFD_CLOEXEC) };
     if fd < 0 {
@@ -191,18 +259,18 @@ fn map_twice(code: &Range<u64>) -> Result<u64, String> {
         // of new memory; they don't overlap.
         unsafe { std::ptr::copy_nonoverlapping(code.start as *const u8, alias as *mut u8, len) };
         // SAFETY: as for `alias`.
-        let view =
-            unsafe { mmap(std::ptr::null_mut(), len, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0) };
+        let view = unsafe { mmap(std::ptr::null_mut(), len, protection, MAP_SHARED, fd, 0) };
         if view == MAP_FAILED {
-            let error = error("mapping a memory file runnable");
+            let error = error("mapping a memory file with the protection it replaces");
             // SAFETY: this function's mapping, which nothing refers to.
             unsafe { munmap(alias, len) };
             return Err(error);
         }
         let to = code.start as *mut c_void;
-        // SAFETY: `view` is this function's mapping of the bytes the region has; moving it
-        // over the region replaces it in one step, so a thread running code in it runs the
-        // same bytes before and after.
+        // SAFETY: `view` is this function's mapping of the bytes the region has, with its
+        // protection; moving it over the region replaces it in one step, so a thread reading
+        // or running it sees the same bytes before and after. Nothing writes the region
+        // meanwhile: it is the patch code region before any patch, or read-only pages.
         let moved = unsafe { mremap(view, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, to) };
         if moved != to {
             let error = error("moving a memory file over the region");
@@ -229,13 +297,17 @@ impl Memory for Os {
 
     fn in_image(&self, range: &Range<u64>) -> Result<(), String> {
         self.segments.check(range)?;
-        self.maps.each(range, |piece, protection| {
-            if protection & PROT_READ == 0 {
-                // alloc: error path
-                return Err(format!("{:#x}, in pages with no access", piece.start));
-            }
-            Ok(())
-        })
+        self.maps.each(range, readable)
+    }
+
+    fn in_image_all(&self, spans: &[Span]) -> Result<(), String> {
+        let (mut segment, mut map) = (0, 0);
+        for span in spans {
+            let range = span.range();
+            self.segments.check_from(&mut segment, &range)?;
+            self.maps.each_from(&mut map, &range, readable)?;
+        }
+        Ok(())
     }
 
     fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String> {
@@ -263,10 +335,14 @@ impl Memory for Os {
     }
 
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
-        let mut run: Option<(Range<u64>, i32)> = None;
+        let (mut segment, mut map) = (0, 0);
         for span in writes.spans {
-            self.segments.check(&span.range())?;
-            self.maps.each(&span.range(), |piece, protection| {
+            self.segments.check_from(&mut segment, &span.range())?;
+            let mut at = span.at;
+            while at < span.end() {
+                let (mapping, protection) = self.maps.mapping_from(&mut map, at)?;
+                let piece = at..mapping.end.min(span.end());
+                at = piece.end;
                 if protection & PROT_READ == 0 {
                     // alloc: error path
                     return Err(format!("data at {:#x}, in pages with no access", piece.start));
@@ -276,24 +352,10 @@ impl Memory for Os {
                     // (read at start); other threads may use the bytes meanwhile, which
                     // `store` allows.
                     unsafe { writes.store(&piece, piece.start as *mut u8) };
-                    return Ok(());
+                    continue;
                 }
-                let pages = self.pages(&piece);
-                match &mut run {
-                    Some((at, same)) if *same == protection && pages.start <= at.end => {
-                        at.end = at.end.max(pages.end);
-                    }
-                    _ => {
-                        if let Some((done, protection)) = run.replace((pages, protection)) {
-                            self.protected(writes, &done, protection)?;
-                        }
-                    }
-                }
-                Ok(())
-            })?;
-        }
-        if let Some((done, protection)) = run {
-            self.protected(writes, &done, protection)?;
+                self.aliases.store(writes, &piece, &mapping, protection)?;
+            }
         }
         Ok(())
     }
@@ -314,35 +376,27 @@ impl Memory for Os {
     }
 
     fn publish(&mut self, cell: u64, table: u64) -> Result<(), String> {
-        let store = || {
-            // SAFETY: the cell is 8-aligned in the image's data, and writable here.
-            unsafe { AtomicU64::from_ptr(cell as *mut u64) }.store(table, Ordering::Release);
+        let to = if self.cell & PROT_WRITE != 0 {
+            cell
+        } else {
+            let (mapping, protection) = self.maps.mapping(cell)?;
+            self.aliases.writable(cell, &mapping, protection)?.0
         };
-        if self.cell & PROT_WRITE != 0 {
-            store();
-            return Ok(());
-        }
-        let pages = self.pages(&(cell..cell + 8));
-        let (start, len) = (pages.start as *mut c_void, (pages.end - pages.start) as usize);
-        // SAFETY: the cell's page is the image's, mapped; it is writable only for the store.
-        if unsafe { mprotect(start, len, self.cell | PROT_WRITE) } != 0 {
-            // alloc: error path
-            return Err(format!(
-                "making the table cell at {cell:#x} writable: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        store();
-        // SAFETY: as above.
-        if unsafe { mprotect(start, len, self.cell) } != 0 {
-            // alloc: error path
-            return Err(format!(
-                "protecting the table cell at {cell:#x} again: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        // SAFETY: the cell is 8-aligned in the image's data, and `to` is it or where its
+        // window maps the same memory writable (the offset in a window keeps the alignment of
+        // the pages); a store through either is one the stubs' loads of the cell see.
+        unsafe { AtomicU64::from_ptr(to as *mut u64) }.store(table, Ordering::Release);
         Ok(())
     }
+}
+
+/// Refuses a piece of pages with no access.
+fn readable(piece: Range<u64>, protection: i32) -> Result<(), String> {
+    if protection & PROT_READ == 0 {
+        // alloc: error path
+        return Err(format!("{:#x}, in pages with no access", piece.start));
+    }
+    Ok(())
 }
 
 /// The mappings of the process, by address, with their protections.
@@ -377,16 +431,49 @@ impl Maps {
         Ok(Maps(maps))
     }
 
+    /// The mapping that has `at`, and its protection: a binary search.
+    fn mapping(&self, at: u64) -> Result<(Range<u64>, i32), String> {
+        let mut next = self.0.partition_point(|it| it.1 <= at);
+        self.mapping_from(&mut next, at)
+    }
+
+    /// [`Maps::mapping`] of addresses in order, from `next` (0 at first), which only moves
+    /// forward.
+    fn mapping_from(&self, next: &mut usize, at: u64) -> Result<(Range<u64>, i32), String> {
+        while self.0.get(*next).is_some_and(|it| it.1 <= at) {
+            *next += 1;
+        }
+        match self.0.get(*next) {
+            Some(&(start, end, protection)) if start <= at => Ok((start..end, protection)),
+            // alloc: error path
+            _ => Err(format!("nothing is mapped at {at:#x}")),
+        }
+    }
+
     /// Calls `f` with `range` in pieces of one mapping each, with their protections, from a
     /// binary search for the first; an error names the first address nothing maps.
     fn each(
         &self,
         range: &Range<u64>,
+        f: impl FnMut(Range<u64>, i32) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut first = self.0.partition_point(|it| it.1 <= range.start);
+        self.each_from(&mut first, range, f)
+    }
+
+    /// [`Maps::each`] of ranges sorted by address, one call each in order, from `next` (0 at
+    /// first), which only moves forward.
+    fn each_from(
+        &self,
+        next: &mut usize,
+        range: &Range<u64>,
         mut f: impl FnMut(Range<u64>, i32) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut at = range.start;
-        let first = self.0.partition_point(|it| it.1 <= at);
-        for &(start, end, protection) in &self.0[first..] {
+        while self.0.get(*next).is_some_and(|it| it.1 <= at) {
+            *next += 1;
+        }
+        for &(start, end, protection) in &self.0[*next..] {
             if at >= range.end || start > at {
                 break;
             }
@@ -547,6 +634,129 @@ fn flush(_: impl Iterator<Item = Range<u64>> + Clone, _: u64) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::slots::unix::mprotect;
+
+    /// Walking the mappings forward for ranges in order finds the pieces and refusals a binary
+    /// search for each finds.
+    #[test]
+    fn a_forward_walk_of_the_maps_is_a_search_for_each() {
+        let maps = Maps(vec![
+            (0x1000, 0x3000, PROT_READ),
+            (0x3000, 0x4000, PROT_READ | PROT_WRITE),
+            (0x6000, 0x9000, 0),
+            (0x9000, 0xa000, PROT_READ | PROT_EXEC),
+        ]);
+        let ranges = [
+            0x1000..0x1008,
+            0x2ff8..0x3008,
+            0x3100..0x3200,
+            0x3ff0..0x4010,
+            0x6100..0x6108,
+            0x9000..0x9ff8,
+            0xa000..0xa008,
+        ];
+        let mut next = 0;
+        for range in &ranges {
+            let (mut searched, mut walked) = (Vec::new(), Vec::new());
+            let by_search = maps.each(range, |piece, protection| {
+                searched.push((piece, protection));
+                readable(0..1, protection)
+            });
+            let by_walk = maps.each_from(&mut next, range, |piece, protection| {
+                walked.push((piece, protection));
+                readable(0..1, protection)
+            });
+            assert_eq!(searched, walked, "{range:x?}");
+            assert_eq!(by_search.is_ok(), by_walk.is_ok(), "{range:x?}");
+            let mut from = 0;
+            for at in [range.start, range.end - 1] {
+                assert_eq!(maps.mapping(at), maps.mapping_from(&mut from, at), "{at:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_is_aligned_and_within_its_mapping_and_the_room_left() {
+        let mapping = 0x30_0000 - 0x3000..0x50_0000 + 0x1000;
+        let all = 0..u64::MAX;
+        assert_eq!(window(0x30_0010, &mapping, all.clone()), 0x30_0000..0x40_0000);
+        assert_eq!(window(0x2f_f000, &mapping, all.clone()), mapping.start..0x30_0000);
+        assert_eq!(window(0x50_0800, &mapping, all), 0x50_0000..mapping.end);
+        assert_eq!(window(0x38_0000, &mapping, 0x34_0000..0x3c_0000), 0x34_0000..0x3c_0000);
+        for at in [mapping.start, 0x30_0000, 0x3f_ffff, 0x4a_b123, mapping.end - 1] {
+            let found = window(at, &mapping, 0..u64::MAX);
+            assert!(found.contains(&at), "{at:#x} in {found:x?}");
+            assert!(found.start >= mapping.start && found.end <= mapping.end);
+            assert!(found.end - found.start <= WINDOW);
+            assert!(found.start.is_multiple_of(0x1000) && found.end.is_multiple_of(0x1000));
+        }
+    }
+
+    /// Writes into read-only pages land where the program reads them, through windows made
+    /// once each, and leave the pages read-only.
+    #[test]
+    fn read_only_pages_are_written_through_a_window_and_stay_read_only() {
+        const MAP_PRIVATE: i32 = 2;
+        const MAP_ANONYMOUS: i32 = 0x20;
+        // SAFETY: it takes no pointer.
+        let page = unsafe { sysconf(SC_PAGESIZE) } as usize;
+        let len = 4 * page;
+        let flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        let prot = PROT_READ | PROT_WRITE;
+        // SAFETY: a new private mapping anywhere, which only this test uses.
+        let at = unsafe { mmap(std::ptr::null_mut(), len, prot, flags, -1, 0) };
+        assert_ne!(at, MAP_FAILED);
+        let base = at as u64;
+        let mut expected: Vec<u8> = (0..len).map(|it| (it * 7) as u8).collect();
+        // SAFETY: `len` bytes mapped writable above, which only this test uses.
+        unsafe { std::ptr::copy_nonoverlapping(expected.as_ptr(), at as *mut u8, len) };
+        // SAFETY: as above.
+        assert_eq!(unsafe { mprotect(at, len, PROT_READ) }, 0);
+        let mapping = base..base + len as u64;
+
+        let message: Vec<u8> = (0..64u8).map(|it| it ^ 0xa5).collect();
+        let (first, second) = (page + 4, 3 * page - 8);
+        let spans = [Span::new(base + first as u64, 0, 24), Span::new(base + second as u64, 24, 16)];
+        let writes = Writes::new(&message, &spans, &[], 0);
+        let mut aliases = Aliases::new();
+        for span in &spans {
+            aliases.store(&writes, &span.range(), &mapping, PROT_READ).expect("written");
+        }
+        let blocks = |at: u64, len: u64| [at / WINDOW, (at + len - 1) / WINDOW];
+        let mut touched: Vec<u64> = spans.iter().flat_map(|it| blocks(it.at, it.len as u64)).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        assert_eq!(aliases.windows.len(), touched.len(), "a window per block written, once");
+        expected[first..first + 24].copy_from_slice(&message[..24]);
+        expected[second..second + 16].copy_from_slice(&message[24..40]);
+        // SAFETY: the mapping is readable, and nothing writes it while this reads.
+        let now = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
+        assert_eq!(now, &expected[..]);
+
+        let again = [Span::new(base + first as u64 + 32, 40, 8)];
+        let writes = Writes::new(&message, &again, &[], 0);
+        aliases.store(&writes, &again[0].range(), &mapping, PROT_READ).expect("written");
+        assert_eq!(aliases.windows.len(), touched.len(), "a second write makes no window");
+        let (to, _) = aliases.writable(base + 8, &mapping, PROT_READ).expect("a window");
+        // SAFETY: 8-aligned (the window keeps the page offset), mapped writable for the test.
+        unsafe { AtomicU64::from_ptr(to as *mut u64) }.store(0x1234, Ordering::Release);
+        // SAFETY: the mapping is readable and 8-aligned at `base + 8`.
+        assert_eq!(unsafe { AtomicU64::from_ptr((base + 8) as *mut u64) }.load(Ordering::Acquire), 0x1234);
+
+        Maps::read()
+            .expect("this process's maps")
+            .each(&mapping, |piece, protection| {
+                assert_eq!(protection & (PROT_WRITE | PROT_EXEC), 0, "{piece:x?} stays read-only");
+                Ok(())
+            })
+            .expect("still mapped");
+        for &(start, end, alias) in &aliases.windows {
+            // SAFETY: the window's second mapping, which only this test uses.
+            unsafe { munmap(alias as *mut c_void, (end - start) as usize) };
+        }
+        // SAFETY: as above, the mapping the windows were moved over.
+        unsafe { munmap(at, len) };
+    }
 
     fn event(mask: u32, name: &[u8]) -> Vec<u8> {
         let len = name.len().next_multiple_of(4) + 4;

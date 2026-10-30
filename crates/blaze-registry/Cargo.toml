@@ -18,6 +18,8 @@ anyhow.workspace = true
 blaze-format.workspace = true
 blaze-resolve = { path = "../blaze-resolve" }
 blaze-source.workspace = true
+# The index's lines and `[source]` replacement, read as the load reads them.
+blaze-units.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
@@ -25,8 +27,6 @@ serde_json.workspace = true
 semver = { workspace = true, features = ["serde"] }
 url.workspace = true
 percent-encoding = "2"
-# The parser cargo 1.99 parses a dependency's `target` with: the same crate and version.
-cargo-platform = "0.3.3"
 sha2 = "0.10"
 flate2 = "1"
 tar = { version = "0.4.46", default-features = false }

@@ -45,7 +45,7 @@ use crate::{
 /// rustc's `diagnostic_width`, past which an explanation is a help and not a label.
 const DIAGNOSTIC_WIDTH: usize = 140;
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Found> {
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnimplementedTrait<'db>) -> Vec<Found> {
     let leaf = &d.trait_predicate;
     let root = d.parent_trait_predicates.last().unwrap_or(leaf);
     let leaf_ref = leaf.trait_ref();
@@ -153,7 +153,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
 
 /// rustc's `get_explanation_based_on_obligation`: "the trait `Trait` is not implemented for
 /// `T`".
-fn explanation(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> String {
+fn explanation<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>) -> String {
     let tr = pred.trait_ref();
     if pred.polarity() == hir::ClausePolarity::Negative {
         // alloc: the error's text, for an error hir found
@@ -243,9 +243,9 @@ impl Cause {
 /// the innermost out, "required for `X` to implement `Y`" (on a local impl's trait and self
 /// type, "unsatisfied trait bound introduced here" on its bound that did not hold), the steps
 /// of a trait already named counted as "N redundant requirements hidden".
-fn note_derived(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>, diag: &mut Diag) {
+fn note_derived<'db>(cx: &Cx<'_, 'db>, d: &hir::UnimplementedTrait<'db>, diag: &mut Diag) {
     let parents = &d.parent_trait_predicates;
-    let required = |pred: &hir::TraitClause<'_>| {
+    let required = |pred: &hir::TraitClause<'db>| {
         let tr = pred.trait_ref();
         let self_ty = tr.get_type_argument(0).map(|it| cx.ty(&it)).unwrap_or_default();
         // alloc: the error's text, for an error hir found
@@ -365,7 +365,7 @@ enum Meta {
 }
 
 /// rustc's `OnUnimplementedDirective::evaluate` of the attributes of the trait of `pred`.
-fn on_unimplemented(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>, direct: bool) -> Custom {
+fn on_unimplemented<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, direct: bool) -> Custom {
     let tr = pred.trait_ref();
     let trait_ = tr.trait_();
     let Some(src) = cx.vsema.source(trait_) else { return Custom::default() };
@@ -495,7 +495,7 @@ struct Args {
 }
 
 impl Args {
-    fn of(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> Args {
+    fn of<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>) -> Args {
         let tr = pred.trait_ref();
         let trait_ = tr.trait_();
         let self_ty = tr.get_type_argument(0);
@@ -720,7 +720,7 @@ fn can_suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> bool {
 }
 
 /// rustc's `suggest_derive`: "consider annotating `S` with `#[derive(Trait)]`".
-fn suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>, diag: &mut Diag) {
+fn suggest_derive<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, diag: &mut Diag) {
     let tr = pred.trait_ref();
     let Some(name) = derivable_name(cx, tr.trait_()) else { return };
     let Some(self_ty) = tr.get_type_argument(0) else { return };

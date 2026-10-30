@@ -320,7 +320,7 @@ fn trie_exports(
 /// An export as the reader held it before names moved into the arena: the form the tests
 /// and the reference walk compare in.
 #[cfg(any(test, feature = "fuzz"))]
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 struct Owned {
     name: String,
     kind: SymbolKind,

@@ -20,11 +20,10 @@ use hir_def::{
     src::HasSource,
     unstable_features::UnstableFeatures,
 };
-use hir_expand::{MacroDefKind, attrs::expand_cfg_attr_view};
+use hir_expand::{MacroCallId, MacroDefKind, attrs::expand_cfg_attr_view};
 use hir_ty::effects::trait_is_const;
 use intern::Symbol;
 use salsa::SalsaValue;
-use span::MacroCallId;
 use syntax::{
     NodeOrToken, SyntaxKind,
     view::{self, AstToken, HasAttrs, TokenTreeChildren},
@@ -147,11 +146,11 @@ pub(super) fn allows_unstable(
     expr: ExprId,
     feature: &Symbol,
 ) -> bool {
-    let source_map = Body::with_source_map(db, def).1;
+    let source_map = &Body::with_source_map(db, def).1;
     let Ok(source) = source_map.expr_syntax(expr) else { return false };
     let Some(file) = source.file_id.macro_file() else { return false };
     let ctxt = source.file_id.span_map(db).span_for_range(source.value.text_range()).ctx;
-    ctxt.outer_expn(db).is_some_and(|call| macro_allows(db, call, feature))
+    ctxt.outer_expn(db).is_some_and(|call| macro_allows(db, call.into(), feature))
         || macro_allows(db, file, feature)
 }
 

@@ -27,8 +27,9 @@ pub type ScopeId = Idx<ScopeData>;
 #[derive(Debug, PartialEq, Eq)]
 pub enum ScopeData {}
 
-/// The parent of a root scope, and the scope of an expression no scope was given.
-const NO_SCOPE: u32 = u32::MAX;
+/// The parent of a root scope, and the scope of an expression no scope was given. Not
+/// `u32::MAX`, which `RawIdx` can't hold.
+const NO_SCOPE: u32 = u32::MAX - 1;
 const UNSCOPED: ScopeId = ScopeId::from_raw(RawIdx::from_u32(NO_SCOPE));
 
 #[derive(Debug, PartialEq, Eq)]
@@ -83,7 +84,7 @@ impl ScopeEntry {
         &self.name
     }
 
-    pub(crate) fn hygiene(&self) -> HygieneId {
+    pub fn hygiene(&self) -> HygieneId {
         self.hygiene
     }
 

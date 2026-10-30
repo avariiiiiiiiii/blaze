@@ -21,6 +21,7 @@ rustc_type_ir.workspace = true
 # local deps
 base-db.workspace = true
 hir-def.workspace = true
+hir-lint-levels.workspace = true
 hir-ty.workspace = true
 span.workspace = true
 

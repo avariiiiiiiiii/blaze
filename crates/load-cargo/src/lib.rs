@@ -1018,12 +1018,9 @@ pub fn answer(db: &Db, req: SubRequest) -> SubResponse {
                         file_id: span::EditionedFileId::from_raw(file_id),
                         ast_id: span::ErasedFileAstId::from_raw(ast_id),
                     },
-                    // SAFETY: `from_u32` asks for a value `into_u32` gave for a context of this database,
-                    // which the proc-macro server echoes from the spans blaze sent it; a made-up value (a
-                    // buggy or hostile server) gives a panic or another context's hygiene data, never UB,
-                    // since `SyntaxContext::id` checks salsa's bound and salsa's table checks page, slot
-                    // and type.
-                    ctx: unsafe { SyntaxContext::from_u32(ctx) },
+                    // The server echoes the contexts blaze sent it; a made-up value (a buggy or
+                    // hostile server) gives a panic or another context's hygiene data.
+                    ctx: SyntaxContext::from_u32(ctx),
                 };
 
                 let mut current_span = span;
@@ -1068,12 +1065,9 @@ pub fn answer(db: &Db, req: SubRequest) -> SubResponse {
                         file_id: span::EditionedFileId::from_raw(file_id),
                         ast_id: span::ErasedFileAstId::from_raw(ast_id),
                     },
-                    // SAFETY: `from_u32` asks for a value `into_u32` gave for a context of this database,
-                    // which the proc-macro server echoes from the spans blaze sent it; a made-up value (a
-                    // buggy or hostile server) gives a panic or another context's hygiene data, never UB,
-                    // since `SyntaxContext::id` checks salsa's bound and salsa's table checks page, slot
-                    // and type.
-                    ctx: unsafe { SyntaxContext::from_u32(ctx) },
+                    // The server echoes the contexts blaze sent it; a made-up value (a buggy or
+                    // hostile server) gives a panic or another context's hygiene data.
+                    ctx: SyntaxContext::from_u32(ctx),
                 };
 
                 if let Some(macro_call_id) = span.ctx.outer_expn(db) {

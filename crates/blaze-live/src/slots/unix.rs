@@ -138,6 +138,21 @@ impl Segments {
         }
     }
 
+    /// [`Segments::check`] of ranges sorted by address, one call each in order: `next` starts
+    /// at 0 and only moves forward, so checking `n` ranges against `s` segments is `n + s`
+    /// steps where a binary search for each is `n log s` with a mispredicted branch or two.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn check_from(&self, next: &mut usize, range: &Range<u64>) -> Result<(), String> {
+        let last = range.end.saturating_sub(1).max(range.start);
+        let mut has = |at: u64| {
+            while self.ranges.get(*next).is_some_and(|it| it.end <= at) {
+                *next += 1;
+            }
+            self.ranges.get(*next).is_some_and(|it| it.start <= at)
+        };
+        if has(range.start) && has(last) { Ok(()) } else { Err(outside(range, self.base)) }
+    }
+
     /// Where the image is loaded.
     pub(super) fn base(&self) -> u64 {
         self.base
@@ -469,6 +484,29 @@ mod tests {
     use std::ffi::{c_int, c_void};
 
     use super::super::column::{Column, STEP};
+    use super::Segments;
+
+    /// Checking ranges in order with a cursor that moves forward refuses and accepts what
+    /// `check`'s searches do.
+    #[test]
+    fn a_forward_check_of_the_segments_is_a_search_for_each() {
+        let segments =
+            Segments::new(0x1000, vec![0x5000..0x6000, 0x1000..0x3000, 0x3000..0x4000]).expect("some");
+        let ranges = [
+            0x800..0x1008,
+            0x1000..0x1008,
+            0x2ff8..0x3008,
+            0x3ff8..0x4008,
+            0x4100..0x4108,
+            0x5000..0x5ff8,
+            0x5ff8..0x6008,
+        ];
+        let mut next = 0;
+        for range in &ranges {
+            let searched = segments.check(range).is_ok();
+            assert_eq!(segments.check_from(&mut next, range).is_ok(), searched, "{range:x?}");
+        }
+    }
 
     unsafe extern "C" {
         fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> c_int;

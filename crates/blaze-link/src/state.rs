@@ -431,7 +431,7 @@ impl Pairs {
 
 /// Every field is `Copy`, an `Arc`, or a copy-on-write container whose clone is a reference
 /// count, except `spaces` (a few dozen regions): see the module's comment for the cost.
-#[derive(Clone)]
+#[derive(Clone)] // clone: once per stage, one allocation (`spaces`): `a_clone_allocates_the_regions_list_only`
 pub(crate) struct State {
     pub generation: u64,
     /// Written only by resolution ([`crate::native`]), with `Arc::make_mut`.
@@ -1251,12 +1251,14 @@ mod tests {
 
     /// What `Image::stage` pays to stage on a copy, whatever the image's size: the spaces list.
     /// Every column, arena and region is shared, a `Class::Named` region's read name too.
+    /// Queue 00951 shares the list as well, taking this to 0.
     #[test]
     fn a_clone_allocates_the_regions_list_only() {
+        assert!(blaze_alloc_count::installed());
         for pieces in [10, 5000] {
             let state = image(pieces);
             let (copy, used) = blaze_alloc_count::measure(|| state.clone());
-            assert!(used.allocations <= 1, "{pieces} pieces: {used:?}");
+            assert_eq!(used.allocations, 1, "{pieces} pieces: {used:?}");
             assert_eq!(copy.piece_count(), pieces);
             assert!(Arc::ptr_eq(&copy.specials, &state.specials));
         }

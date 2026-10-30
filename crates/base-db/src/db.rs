@@ -14,7 +14,14 @@
 //! only once no reader holds `&Db`. A task that outlives a borrow holds a [`Reader`] of a
 //! [`Shared`] database, whose write stops it and waits for it to let go.
 
-use std::{cell::Cell, fmt, panic, sync::Mutex};
+use std::{
+    cell::Cell,
+    fmt, panic,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use blaze_mem::{Tag, frame, scratch};
 use salsa::Durability;
@@ -25,7 +32,10 @@ use vfs::AnchoredPath;
 use crate::{
     Crate, CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, IncludedFile,
     LibraryRoots, LocalRoots, Nonce, SourceRoot, SourceRootId, SourceRootInput, ViewChange,
-    ViewError, ViewRoot, set_all_crates_with_durability,
+    ViewError, ViewRoot,
+    editioned_file_id::Parses,
+    maintain::{Maintenance, Note},
+    set_all_crates_with_durability,
 };
 
 /// The front end's database. See the module.
@@ -43,6 +53,10 @@ pub struct Db {
     /// The events salsa reports, kept only while [`Db::log`] runs; `None` but in a database
     /// made by [`Db::for_tests`].
     log: Option<std::sync::Arc<EventLog>>,
+    /// The maintainers' state and the writes they have yet to see ([`crate::maintain`]).
+    pub(crate) maintenance: Maintenance,
+    /// What the files' parses are kept by and read from.
+    pub(crate) parses: Parses,
 }
 
 /// Where [`Db::run_all`] runs its tasks.
@@ -77,7 +91,23 @@ pub fn set_run_order(order: RunOrder) -> RunOrder {
     RUN_ORDER.replace(order)
 }
 
-type EventLog = Mutex<Option<Vec<salsa::Event>>>;
+/// The events a logged database keeps while [`Db::log`] runs. The hook reads `active` before
+/// it takes the lock, so an event outside `log` costs one relaxed load.
+#[derive(Default)]
+struct EventLog {
+    active: AtomicBool,
+    events: Mutex<Option<Vec<salsa::Event>>>,
+}
+
+impl EventLog {
+    fn record(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
+        *self.events.lock().unwrap_or_else(|it| it.into_inner()) = Some(Vec::new()); // alloc: tests only
+        self.active.store(true, Ordering::Release);
+        f();
+        self.active.store(false, Ordering::Release);
+        self.events.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default()
+    }
+}
 
 pub mod executions;
 mod shared;
@@ -92,6 +122,14 @@ impl Db {
     /// inputs, attribute expansion) they set on it, as `load-cargo` does.
     pub fn new() -> Db {
         Db::with(Run::Pool, None)
+    }
+
+    /// A build's database ([`Db::new`]) that keeps salsa's events while [`Db::log`] runs: for
+    /// a harness that counts what a request of a real build executes (`crates/hir-firewall`).
+    /// A build never makes one: each event takes a lock.
+    pub fn logged() -> Db {
+        let log = std::sync::Arc::new(EventLog::default()); // alloc: a logged database's setup
+        Db::with(Run::Pool, Some(log))
     }
 
     /// A database for tests: its batches run on the calling thread in this thread's
@@ -116,7 +154,9 @@ impl Db {
                     executions::record(&event);
                 }
                 if let Some(log) = &log
-                    && let Some(events) = &mut *log.lock().unwrap_or_else(|it| it.into_inner())
+                    && log.active.load(Ordering::Relaxed)
+                    && let Some(events) =
+                        &mut *log.events.lock().unwrap_or_else(|it| it.into_inner())
                 {
                     events.push(event);
                 }
@@ -129,6 +169,8 @@ impl Db {
             nonce: Nonce::new(),
             run,
             log,
+            maintenance: Maintenance::default(),
+            parses: Parses::new(crate::trees::installed().cloned()),
         };
         set_all_crates_with_durability(&mut db, std::iter::empty(), Durability::HIGH);
         db
@@ -159,7 +201,7 @@ impl Db {
 
     pub fn set_file_text(&mut self, file_id: FileId, text: &str) {
         let files = Arc::clone(&self.files);
-        files.set_file_text(self, file_id, text);
+        self.write_file(file_id, |db| files.set_file_text(db, file_id, text));
     }
 
     pub fn set_file_text_with_durability(
@@ -169,7 +211,9 @@ impl Db {
         durability: Durability,
     ) {
         let files = Arc::clone(&self.files);
-        files.set_file_text_with_durability(self, file_id, text, durability);
+        self.write_file(file_id, |db| {
+            files.set_file_text_with_durability(db, file_id, text, durability)
+        });
     }
 
     /// Contents of the source root.
@@ -187,7 +231,13 @@ impl Db {
     /// See [`Files::reload_included_file`].
     pub fn reload_included_file(&mut self, path: &vfs::AbsPath) -> bool {
         let files = Arc::clone(&self.files);
-        files.reload_included_file(self, path)
+        self.batch(|db| {
+            let changed = files.reload_included_file(db, path);
+            if changed && let Some(file) = files.find_included(path) {
+                db.note(Note::Included(file));
+            }
+            changed
+        })
     }
 
     pub fn set_file_source_root_with_durability(
@@ -197,7 +247,10 @@ impl Db {
         durability: Durability,
     ) {
         let files = Arc::clone(&self.files);
-        files.set_file_source_root_with_durability(self, id, source_root_id, durability);
+        self.batch(|db| {
+            files.set_file_source_root_with_durability(db, id, source_root_id, durability);
+            db.note(Note::Root(source_root_id));
+        });
     }
 
     pub fn set_source_root_with_durability(
@@ -207,7 +260,14 @@ impl Db {
         durability: Durability,
     ) {
         let files = Arc::clone(&self.files);
-        files.set_source_root_with_durability(self, source_root_id, source_root, durability);
+        self.batch(|db| {
+            let old = files
+                .has_source_root(source_root_id)
+                .then(|| db.source_root(source_root_id).source_root(&*db));
+            let new = Arc::clone(&source_root);
+            files.set_source_root_with_durability(db, source_root_id, source_root, durability);
+            db.note_root(source_root_id, old.as_deref(), &new);
+        });
     }
 
     /// See [`Files::set_appended_root_module`].
@@ -218,7 +278,9 @@ impl Db {
         durability: Durability,
     ) {
         let files = Arc::clone(&self.files);
-        files.set_appended_root_module(self, file_id, module, durability);
+        self.write_file(file_id, |db| {
+            files.set_appended_root_module(db, file_id, module, durability)
+        });
     }
 
     /// See [`Files::set_crate_attr_files`].
@@ -229,14 +291,23 @@ impl Db {
         durability: Option<Durability>,
     ) {
         let files = Arc::clone(&self.files);
-        files.set_crate_attr_files(self, krate, gone, durability);
+        self.write_crates(|db| files.set_crate_attr_files(db, krate, gone, durability));
     }
 
     /// Sets the inputs of one view's files, writing only those that changed: see
     /// [`Files::set_view_root`].
     pub fn set_view_root(&mut self, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
         let files = Arc::clone(&self.files);
-        files.set_view_root(self, view)
+        self.batch(|db| {
+            let change = files.set_view_root(db, view)?;
+            db.note(Note::View {
+                set: &change.set,
+                added: &change.added,
+                removed: &change.removed,
+                roots: &change.roots,
+            });
+            Ok(change)
+        })
     }
 
     /// The file of the VFS that `path` names relative to its anchor: in the anchor's source
@@ -369,12 +440,19 @@ impl Db {
     ///
     /// # Panics
     ///
-    /// On a database not made by [`Db::for_tests`]: a build's keeps no events.
+    /// On a database not made by [`Db::for_tests`] or [`Db::logged`]: a build's keeps no
+    /// events.
     pub fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
-        let log = self.log.as_ref().expect("`Db::log` on a database not made by `Db::for_tests`");
-        *log.lock().unwrap_or_else(|it| it.into_inner()) = Some(Vec::new()); // alloc: tests only
-        f();
-        log.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default()
+        let log = self.log.as_ref().expect("`Db::log` on a database made by neither `Db::for_tests` nor `Db::logged`");
+        log.record(f)
+    }
+
+    /// [`Db::log`] of a write: `f` gets the database to set inputs on, so the events include
+    /// what the write-side maintainers ran in it.
+    pub fn log_mut(&mut self, f: impl FnOnce(&mut Db)) -> Vec<salsa::Event> {
+        // clone: one count of the log, tests only, so `f` can borrow the database.
+        let log = self.log.clone().expect("`Db::log_mut` on a database made by neither `Db::for_tests` nor `Db::logged`");
+        log.record(|| f(self))
     }
 
     /// The names of the queries `f` executed, as salsa names them, in order.

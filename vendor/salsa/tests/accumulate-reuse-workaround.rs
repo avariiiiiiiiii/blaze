@@ -4,6 +4,8 @@
 //! `accumulated` in a tracked function to get better
 //! reuse.
 
+#![forbid(unsafe_code)]
+
 mod common;
 use common::{LogDatabase, LoggerDatabase};
 use expect_test::expect;

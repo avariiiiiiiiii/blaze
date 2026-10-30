@@ -16,7 +16,8 @@
 extern crate rustc_type_ir;
 
 mod compare;
-mod mem;
+#[doc(hidden)]
+pub mod mem;
 mod outlives;
 mod persist;
 

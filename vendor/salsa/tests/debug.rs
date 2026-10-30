@@ -2,6 +2,8 @@
 
 //! Test that `DeriveWithDb` is correctly derived.
 
+#![forbid(unsafe_code)]
+
 use expect_test::expect;
 use salsa::{Database, Setter};
 

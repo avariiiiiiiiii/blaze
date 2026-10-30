@@ -37,7 +37,7 @@ struct ForLoop {
 /// The `for` loop `expr` is the desugaring of, if it is one: rustc's `extract_for_loop`, a
 /// `match` of one arm over a call of one argument, whose arm is the loop (`LoopSource::ForLoop`)
 /// of the `match` on `Iterator::next` whose second arm's pattern is `Some(<pat>)`.
-fn for_loop(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ForLoop> {
+fn for_loop(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<ForLoop> {
     let store = b.store();
     let Expr::Match { expr: into_iter, arms: [arm] } = store.expr(expr) else { return None };
     let Expr::Call { args: [head], .. } = store.expr(into_iter) else { return None };
@@ -88,7 +88,7 @@ fn between(from: &Span, to: &Span) -> Span {
 
 /// rustc's `SourceMap::end_point`: the last character of `span` (of one byte when its text
 /// can't be read).
-fn end_point(b: &BodyCx<'_, '_>, span: &Span) -> Span {
+fn end_point(b: &BodyCx<'_, '_, '_>, span: &Span) -> Span {
     let width = b.cx.snippet(span).and_then(|it| it.chars().next_back()).map_or(1, char::len_utf8);
     let lo = span.hi.checked_sub(width as u32).unwrap_or(span.hi).max(span.lo);
     span.with_lo(lo)
@@ -96,7 +96,7 @@ fn end_point(b: &BodyCx<'_, '_>, span: &Span) -> Span {
 
 /// rustc's `Span::edition` of `expr`: the edition of the code that wrote it, the crate's or
 /// that of the macro whose expansion wrote it.
-fn edition(b: &BodyCx<'_, '_>, expr: ExprId) -> Edition {
+fn edition(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Edition {
     let Some(node) = b.expr_node(expr) else { return b.cx.edition };
     let Some(call) = node.file_id.macro_file() else { return b.cx.edition };
     let db = b.db();

@@ -483,3 +483,97 @@ fn fresh(db: &mut Db, crates: &[(Crate, Inputs<'_>)], store: &Memory) -> Served 
     serve(db, crates, store, &mut served).unwrap();
     served
 }
+
+/// [`header`] before it read with `blaze_format::cursor`.
+fn header_reference(bytes: &[u8]) -> Result<(bool, u32), &'static str> {
+    let Some((head, body)) = bytes.split_first_chunk::<HEADER>() else {
+        return Err("shorter than its header");
+    };
+    let word = |at: usize| u32::from_le_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
+    if head[..4] != MAGIC {
+        return Err("not an outcome of this encoding");
+    }
+    let flags = word(4);
+    if flags & !FAILED != 0 {
+        return Err("flags it does not know");
+    }
+    let (count, len) = (word(8), word(12));
+    if len as usize != body.len() {
+        return Err("a body whose length is not its header's");
+    }
+    if count > len {
+        return Err("more diagnostics than bytes");
+    }
+    Ok((flags & FAILED != 0, count))
+}
+
+#[test]
+fn the_header_reads_as_it_did_before_the_cursor() {
+    let paths = || Paths::new(Some("/reg/lib".into()), Some("/out".into()));
+    let diags = vec![diag_in("/reg/lib/src/lib.rs", "/out"), Diag::lint("dead_code", "unused", span("/reg/lib/a.rs", 1, 2))];
+    let bytes = encode(&diags, &paths(), "/w/root/a").unwrap();
+    let empty = encode(&[], &paths(), "/w").unwrap();
+    assert_eq!(&bytes[..HEADER], &header_bytes(&bytes)[..]);
+    for bytes in [&bytes, &empty] {
+        assert_eq!(header(bytes), header_reference(bytes));
+        for len in 0..bytes.len() {
+            assert_eq!(header(&bytes[..len]), header_reference(&bytes[..len]), "cut at {len}");
+        }
+        for at in 0..HEADER {
+            for bit in 0..8 {
+                let mut damaged = bytes.clone();
+                damaged[at] ^= 1 << bit;
+                assert_eq!(header(&damaged), header_reference(&damaged), "byte {at} bit {bit}");
+            }
+        }
+    }
+}
+
+/// The header [`encode`] wrote before it wrote with `blaze_format::cursor::Put`.
+fn header_bytes(bytes: &[u8]) -> Vec<u8> {
+    let (failed, count) = header_reference(bytes).unwrap();
+    let flags = if failed { FAILED } else { 0 };
+    let len = u32::try_from(bytes.len() - HEADER).unwrap();
+    let mut out = Vec::new();
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    out
+}
+
+#[hegel::test]
+fn any_bytes_read_as_before_the_cursor(tc: hegel::TestCase) {
+    let mut bytes = tc.draw(hegel::generators::binary().max_size(23));
+    let magic = tc.draw(hegel::generators::booleans());
+    if magic && bytes.len() >= 4 {
+        bytes[..4].copy_from_slice(&MAGIC);
+    }
+    assert_eq!(header(&bytes), header_reference(&bytes));
+}
+
+/// The copy of `absolute` this file had before it called hir-def's.
+fn absolute_reference(path: &str) -> bool {
+    match path.as_bytes() {
+        [b'/', ..] | [b'\\', b'\\', ..] => true,
+        [drive, b':', b'\\' | b'/', ..] => drive.is_ascii_alphabetic(),
+        _ => false,
+    }
+}
+
+#[test]
+fn a_path_is_absolute_as_the_old_copy_said() {
+    let paths = [
+        "", "/", "/home/a/src/lib.rs", "\\\\server\\share", "\\", "C:\\a", "c:/a", "C:", "C:a", "1:/a", "é:/a",
+        "src/lib.rs", "./a", "$DIR/a.rs", "~/a",
+    ];
+    for path in paths {
+        assert_eq!(hir_def::deps::absolute(path), absolute_reference(path), "{path:?}");
+    }
+}
+
+#[hegel::test]
+fn any_path_is_absolute_as_the_old_copy_said(tc: hegel::TestCase) {
+    let path = tc.draw(hegel::generators::from_regex("[/\\\\a-zA-Z0-9:._~é$]{0,6}"));
+    assert_eq!(hir_def::deps::absolute(&path), absolute_reference(&path));
+}

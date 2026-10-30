@@ -43,14 +43,40 @@ second time on another machine whose store pulled the first's, for the hit rate 
 `directives` checks what each run below `<work>/target` printed (`run/stdout`) against the rules
 of cargo/directives.rs, and their first, stricter form, into `<out>/directives.md`.
 """
-import collections, concurrent.futures, json, os, re, shutil, subprocess, sys, time
+import collections, concurrent.futures, json, os, re, shutil, subprocess, sys, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from resolve import BENCH_PROJECT, fetch_git, option  # noqa: E402
 
 RECORD = "blaze-record"
 RAN = "blaze-ran.json"
+# A project of bench.py's PROJECTS, by its name, repository and pinned commit.
+BENCH_PROJECT = re.compile(r'^    "([\w.-]+)": dict\(\s*repo="([^"]+)",[^\n]*?rev="([0-9a-f]{40})"', re.M)
+# A repository two projects share is fetched by one of them at a time.
+FETCH_LOCKS = collections.defaultdict(threading.Lock)
+
+
+def option(argv, name, default=None):
+    if name in argv:
+        i = argv.index(name)
+        value = argv[i + 1]
+        del argv[i : i + 2]
+        return value
+    return default
+
+
+def fetch_git(repo, rev, dest):
+    """`repo` of GitHub at commit `rev` in `dest`, fetched once."""
+    with FETCH_LOCKS[dest]:
+        if os.path.exists(os.path.join(dest, ".fetched")):
+            return
+        shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(dest)
+        git = lambda *a: subprocess.run(["git", "-C", dest, *a], check=True, capture_output=True)
+        git("init", "-q")
+        git("fetch", "-q", "--depth", "1", f"https://github.com/{repo}", rev)
+        git("-c", "advice.detachedHead=false", "checkout", "-q", "FETCH_HEAD")
+        open(os.path.join(dest, ".fetched"), "w").close()
 
 
 def projects():

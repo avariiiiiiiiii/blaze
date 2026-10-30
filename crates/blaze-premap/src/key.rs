@@ -15,7 +15,7 @@
 //! error here until it is hashed. Lists are hashed sorted and length-prefixed, so the order
 //! the caller found them in never changes a key.
 
-use blaze_codegen::content::arch_tag;
+use blaze_codegen::content::{arch_tag, target_into};
 use blaze_codegen::settings::{Coverage, Sanitize, Toolchain};
 use blaze_codegen::{CompiledFunction, InstanceKey, Settings, Target};
 use blaze_ids::{ContentId, Hasher};
@@ -117,7 +117,7 @@ impl GraphKey {
         let GraphInputs { units, toolchain, settings, linker, output, base, tls_bias, natives, spans } = inputs;
         let mut hasher = Hasher::new(GRAPH_DOMAIN);
 
-        let mut order = Vec::with_capacity_in(units.len(), frame);
+        let mut order: Vec<&DepUnit<'_>, _> = Vec::with_capacity_in(units.len(), frame);
         order.extend(units.iter());
         order.sort_unstable_by(|a, b| (a.package, a.target).cmp(&(b.package, b.target)));
         count(&mut hasher, units.len());
@@ -144,7 +144,7 @@ impl GraphKey {
         output_into(&mut hasher, output);
         hasher.update(&base.to_le_bytes()).update(&tls_bias.to_le_bytes());
 
-        let mut sorted = Vec::with_capacity_in(natives.len(), frame);
+        let mut sorted: Vec<&NativeInput, _> = Vec::with_capacity_in(natives.len(), frame);
         sorted.extend(natives.iter());
         sorted.sort_unstable_by_key(|it| it.order);
         count(&mut hasher, sorted.len());
@@ -157,7 +157,7 @@ impl GraphKey {
             };
         }
 
-        let mut sorted = Vec::with_capacity_in(spans.len(), frame);
+        let mut sorted: Vec<&(ContentId, ContentId), _> = Vec::with_capacity_in(spans.len(), frame);
         sorted.extend(spans.iter());
         sorted.sort_unstable();
         count(&mut hasher, sorted.len());
@@ -209,7 +209,7 @@ impl ImageKey {
         count(&mut hasher, flat.len());
         hasher.update(flat.as_flattened());
 
-        let mut sorted = Vec::with_capacity_in(names.len(), frame);
+        let mut sorted: Vec<&&(String, Target), _> = Vec::with_capacity_in(names.len(), frame);
         sorted.extend(names.iter());
         sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         count(&mut hasher, sorted.len());
@@ -218,7 +218,7 @@ impl ImageKey {
             target_into(&mut hasher, target);
         }
 
-        let mut sorted = Vec::with_capacity_in(debug_names.len(), frame);
+        let mut sorted: Vec<&&(InstanceKey, String), _> = Vec::with_capacity_in(debug_names.len(), frame);
         sorted.extend(debug_names.iter());
         sorted.sort_unstable();
         count(&mut hasher, sorted.len());
@@ -259,7 +259,7 @@ fn count(hasher: &mut Hasher, n: usize) {
 
 /// A set of strings, sorted and deduplicated.
 fn set(hasher: &mut Hasher, items: &[String], frame: &Frame) {
-    let mut sorted = Vec::with_capacity_in(items.len(), frame);
+    let mut sorted: Vec<&str, _> = Vec::with_capacity_in(items.len(), frame);
     sorted.extend(items.iter().map(String::as_str));
     sorted.sort_unstable();
     sorted.dedup();
@@ -272,7 +272,7 @@ fn set(hasher: &mut Hasher, items: &[String], frame: &Frame) {
 fn toolchain_into(hasher: &mut Hasher, toolchain: &Toolchain, frame: &Frame) {
     let Toolchain { id, target, arch, cpu, features, cranelift, llvm, stencils, frame_pointers, relocation } = toolchain;
     hasher.id(id).part(target.as_bytes()).update(&[arch_tag(*arch)]).part(cpu.as_bytes());
-    let mut sorted = Vec::with_capacity_in(features.len(), frame);
+    let mut sorted: Vec<&str, _> = Vec::with_capacity_in(features.len(), frame);
     sorted.extend(features.iter().map(String::as_str));
     sorted.sort_unstable();
     count(hasher, sorted.len());
@@ -363,21 +363,6 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
     for rpath in rpaths {
         hasher.part(rpath.as_bytes());
     }
-}
-
-fn target_into(hasher: &mut Hasher, target: &Target) {
-    match target {
-        Target::Function(key) => hasher.update(&[0]).id(&key.0),
-        Target::Direct(key) => hasher.update(&[1]).id(&key.0),
-        Target::Static { item, instance } => hasher.update(&[2]).id(&item.0).id(instance),
-        Target::Data(id) => hasher.update(&[3]).id(id),
-        Target::Extern(name) => hasher.update(&[4]).part(name.as_bytes()),
-        Target::Weak(name) => hasher.update(&[5]).part(name.as_bytes()),
-        Target::Position(span) => hasher.update(&[6]).id(&span.anchor).update(&span.index.to_le_bytes()),
-        Target::Coverage(array) => hasher.update(&[7]).update(&array.to_le_bytes()),
-        Target::Counter(key) => hasher.update(&[8]).id(&key.0),
-        Target::ProfileCounters => hasher.update(&[9]),
-    };
 }
 
 pub(crate) fn format_tag(format: Format) -> u8 {

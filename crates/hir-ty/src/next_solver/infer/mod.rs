@@ -48,8 +48,8 @@ use super::{
     AliasTerm, Binder, CanonicalQueryInput, CanonicalVarValues, Const, ConstKind, DbInterner,
     ErrorGuaranteed, GenericArg, GenericArgs, OpaqueTypeKey, ParamEnv, PolyCoercePredicate,
     PolyExistentialProjection, PolyExistentialTraitRef, PolyFnSig, PolyRegionOutlivesClause,
-    PolySubtypePredicate, Region, SolverDefId, SubtypePredicate, Term, TraitRef, Ty, TyKind,
-    TypingMode,
+    PolySubtypePredicate, Region, RegionConstraint, SolverDefId, SubtypePredicate, Term,
+    TraitRef, Ty, TyKind, TypingMode,
 };
 
 pub mod at;
@@ -1598,6 +1598,31 @@ impl<'db> InferCtxt<'db> {
         let assumptions = self.placeholder_assumptions.borrow();
         (range.start.index()..=range.last.index())
             .all(|u| assumptions.contains_key(&UniverseIndex::from_usize(u)))
+    }
+
+    /// rustc's `make_query_region_constraints`, given to `f` one at a time: each region
+    /// constraint `sub <= sup` as `sup: sub` with whether the leak check sees it, then each
+    /// registered type-outlives obligation, which it always sees. A reflexive `'a: 'a` says
+    /// nothing and is passed over. `f` runs with the tables borrowed, so it must not use `self`.
+    pub(crate) fn for_each_query_region_constraint(
+        &self,
+        mut f: impl FnMut(RegionConstraint<'db>, VisibleForLeakCheck),
+    ) {
+        let inner = self.inner.borrow();
+        let storage =
+            inner.region_constraint_storage.as_ref().expect("region constraints already solved");
+        for (constraint, visible) in storage.legacy_data.constraints.iter_with_visibility() {
+            let (sub, sup) = constraint.regions(self.interner);
+            if sub != sup {
+                f(RegionConstraint::Outlives(OutlivesClause(sup.into(), sub)), visible);
+            }
+        }
+        for it in inner.region_obligations() {
+            f(
+                RegionConstraint::Outlives(OutlivesClause(it.sup_type.into(), it.sub_region)),
+                VisibleForLeakCheck::Yes,
+            );
+        }
     }
 
     /// The region constraint the solver has built so far, with the span of each leaf.

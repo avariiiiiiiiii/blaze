@@ -19,6 +19,7 @@ use std::{
 };
 
 use anyhow::Context as _;
+use blaze_format::cursor::{Put as _, Reader};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -723,46 +724,35 @@ impl Kept {
 
     pub fn bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut put = |bytes: &[u8]| {
-            out.extend((bytes.len() as u64).to_le_bytes());
-            out.extend(bytes);
-        };
-        put(RUNS.as_bytes());
-        put(&self.stdout);
-        put(&self.stderr);
-        put(&(self.files.len() as u64).to_le_bytes());
+        out.put_bytes_u64(RUNS.as_bytes());
+        out.put_bytes_u64(&self.stdout);
+        out.put_bytes_u64(&self.stderr);
+        out.put_bytes_u64(&(self.files.len() as u64).to_le_bytes());
         for (name, executable, bytes) in &self.files {
-            put(name.as_bytes());
-            put(&[u8::from(*executable)]);
-            put(bytes);
+            out.put_bytes_u64(name.as_bytes());
+            out.put_bytes_u64(&[u8::from(*executable)]);
+            out.put_bytes_u64(bytes);
         }
         out
     }
 
     pub fn read(bytes: &[u8]) -> Option<Kept> {
-        let rest = &mut &*bytes;
-        let count = |it: &[u8]| Some(u64::from_le_bytes(it.try_into().ok()?) as usize);
-        let text = |it: &[u8]| String::from_utf8(it.to_vec()).ok();
-        if take(rest)? != RUNS.as_bytes() {
+        let mut rest = Reader::new(bytes);
+        if rest.bytes_u64().ok()? != RUNS.as_bytes() {
             return None;
         }
-        let (stdout, stderr) = (take(rest)?.to_vec(), take(rest)?.to_vec());
-        let mut files = Vec::new();
-        for _ in 0..count(take(rest)?)? {
-            let name = text(take(rest)?)?;
-            let executable = take(rest)? == [1];
-            files.push((name, executable, take(rest)?.to_vec()));
+        // alloc: `Kept` owns what the run printed and wrote, read once per run replayed
+        let (stdout, stderr) = (rest.bytes_u64().ok()?.to_vec(), rest.bytes_u64().ok()?.to_vec());
+        let count = u64::from_le_bytes(rest.bytes_u64().ok()?.try_into().ok()?);
+        let mut files = Vec::new(); // alloc: as `stdout`
+        for _ in 0..count {
+            // alloc: as `stdout`
+            let name = String::from_utf8(rest.bytes_u64().ok()?.to_vec()).ok()?;
+            let executable = rest.bytes_u64().ok()? == [1];
+            files.push((name, executable, rest.bytes_u64().ok()?.to_vec())); // alloc: as `stdout`
         }
         Some(Kept { stdout, stderr, files })
     }
-}
-
-/// The next field of `rest`, which is its length and then its bytes.
-fn take<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
-    let len = usize::try_from(u64::from_le_bytes(rest.get(..8)?.try_into().ok()?)).ok()?;
-    let field = rest.get(8..8usize.checked_add(len)?)?;
-    *rest = &rest[8 + len..];
-    Some(field)
 }
 
 #[cfg(unix)]

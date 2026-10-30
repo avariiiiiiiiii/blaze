@@ -2506,6 +2506,20 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
                 write!(f, " is ")?;
                 pat.hir_fmt(f, owner, store)?;
             }
+            TypeRef::UnsafeBinder { lifetimes, ty } => {
+                let lifetimes = store.names(lifetimes);
+                if lifetimes.is_empty() {
+                    write!(f, "unsafe ")?;
+                } else {
+                    let edition = f.edition();
+                    write!(
+                        f,
+                        "unsafe<{}> ",
+                        lifetimes.iter().map(|it| it.display(f.db, edition)).format(", ")
+                    )?;
+                }
+                ty.hir_fmt(f, owner, store)?;
+            }
             TypeRef::Error => write!(f, "{{error}}")?,
         }
         Ok(())

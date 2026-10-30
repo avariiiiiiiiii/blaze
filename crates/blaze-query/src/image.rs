@@ -26,6 +26,7 @@
 
 use std::{borrow::Cow, ops::Range, sync::Arc};
 
+use blaze_bytes::le::{self, u32 as u32_at, u64 as u64_at};
 use blaze_core::Mapping;
 use blaze_format::{SchemaHash, schema};
 use blaze_ids::{ContentId, Fingerprint};
@@ -251,15 +252,7 @@ fn id_at(bytes: &[u8], at: usize) -> ContentId {
 }
 
 fn key_at(bytes: &[u8], at: usize) -> QueryKey {
-    QueryKey { kind: QueryKind(u16::from_le_bytes([bytes[at], bytes[at + 1]])), input: id_at(bytes, at + 8) }
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+    QueryKey { kind: QueryKind(le::u16(bytes, at)), input: id_at(bytes, at + 8) }
 }
 
 /// One memo of the image, read in place: its edges and value stay in the mapping.
@@ -381,10 +374,28 @@ impl ImageMap {
 
     /// Calls `f` on every key with memos in the image whose table slot and first memo read
     /// whole; a corrupt group is noted and its keys skipped (they have no image memo).
-    pub(crate) fn for_each_key(&self, mut f: impl FnMut(QueryKey)) {
-        let per_group = (self.image.group_len() / 8) as usize;
-        let mut slot = 0;
-        while slot < self.table_len {
+    pub(crate) fn for_each_key(&self, f: impl FnMut(QueryKey)) {
+        self.for_each_key_in(0..self.table_len, f);
+    }
+
+    /// How many table slots a group holds: [`ImageMap::for_each_key_in`]'s ranges start and end
+    /// on a multiple of it.
+    pub(crate) fn slots_per_group(&self) -> usize {
+        (self.image.group_len() / 8) as usize
+    }
+
+    /// How many slots the image's table has.
+    pub(crate) fn table_len(&self) -> usize {
+        self.table_len
+    }
+
+    /// [`ImageMap::for_each_key`] of the keys whose first memo the table's `slots` name: ranges
+    /// on group boundaries split the table among workers, each key in one range.
+    pub(crate) fn for_each_key_in(&self, slots: Range<usize>, mut f: impl FnMut(QueryKey)) {
+        let per_group = self.slots_per_group();
+        let mut slot = slots.start;
+        let end = slots.end.min(self.table_len);
+        while slot < end {
             let first = match self.table_slot(slot) {
                 Ok(first) => first,
                 Err(corrupt) => {

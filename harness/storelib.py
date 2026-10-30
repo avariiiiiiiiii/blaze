@@ -1,7 +1,7 @@
 """storelib.py: a checkout of the stress workspace under a daemon that keeps a store.
 
 What storekills.py, storecorrupts.py, storefull.py and storeshared.py have in common: the
-checkout, cargo's build of it to compare with, the daemon and its store, and `blaze-engine cache`
+checkout, blaze's build of it from nothing to compare with, the daemon and its store, and `blaze-engine cache`
 on that store.
 """
 import os, shutil, subprocess, sys, tempfile, time
@@ -9,7 +9,7 @@ import os, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from mixed import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, from_scratch, printed
 
 CRATES = ["sapp", "sbase", "smid"]
 MID, APP = "mid/src/lib.rs", "app/src/main.rs"
@@ -60,7 +60,8 @@ def files(store, suffix):
 
 
 class Checkout:
-    """One copy of the stress workspace, with what cargo makes of it as the reference."""
+    """One copy of the stress workspace, with what blaze's build of it from nothing prints as the
+    reference."""
 
     def __init__(self, work, name="checkout"):
         self.work, self.ws = work, os.path.join(work, name)
@@ -71,7 +72,6 @@ class Checkout:
         link = linkline.with_output(linkline.ahead(list(fx.link_args), [self.patch, self.obj], BLAZE), self.bin)
         self.link = linkline.join(link)
         self.symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        self.reference = os.path.join(work, f"{name}.reference")
         self.value = 0
         self.outputs = {}
 
@@ -85,21 +85,18 @@ class Checkout:
         self.value = value
 
     def expected(self):
-        """What cargo's build of the checkout as it is now prints."""
+        """What blaze's build from nothing of the checkout as it is now prints."""
         if self.value not in self.outputs:
-            cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=self.ws,
-                                   capture_output=True, text=True,
-                                   env={**os.environ, "CARGO_TARGET_DIR": self.reference})
-            assert cargo.returncode == 0, cargo.stderr[-2000:]
-            self.outputs[self.value] = run(built(self.reference, "sapp"))
+            self.outputs[self.value] = printed(from_scratch(self.ws, CRATES, ["-p", "sapp"]))
         return self.outputs[self.value]
 
     def check(self, daemon, what):
-        """Asks the daemon for the program and compares what it prints with cargo's; returns the reply."""
+        """Asks the daemon for the program and compares what it prints with what blaze's build
+        from nothing prints; returns the reply."""
         reply = daemon.sync()
         got, want = run(self.bin), self.expected()
         if got != want:
-            raise SystemExit(f"FAIL {what}: the program prints\n{got}\nand cargo's\n{want}\n"
+            raise SystemExit(f"FAIL {what}: the program prints\n{got}\nand blaze's build from nothing\n{want}\n"
                              f"reply: {reply}\nlog: {daemon.log_path}")
         return reply
 

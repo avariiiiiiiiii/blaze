@@ -3,8 +3,8 @@
 
 usage: borrowck_apps.py [NAME...] [--bin blaze-engine] [--apps-dir dir] [--jobs N] [--json out.json]
 
-Every application there is code rustc accepts, so each borrow-check error the checker reports
-in one is a false one, and a file it panics on has none of its errors reported. Each app is
+Every application there is a real crate that builds, so each borrow-check error the checker
+reports in one is a false one, and a file it panics on has none of its errors reported. Each app is
 cloned at its `rev` (or taken from `apps/<source>`), given what `cargo metadata` needs that the
 clone lacks (its `prepare` module's `sources`), checked, and its errors and panics printed by
 app; `blaze-engine borrowck --project` refuses a workspace `cargo metadata` fails on. Exits 1 when any app has one, or could not be checked.
@@ -14,8 +14,6 @@ from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPECS = os.path.join(HERE, "apps", "apps.json")
-# Workspaces of the harness rustc accepts, checked as the apps are (CI checks them too).
-LOCAL = {"corpus": os.path.join(HERE, "corpus"), "mixfutures": os.path.join(HERE, "mixfutures")}
 
 
 class StepError(Exception):
@@ -68,7 +66,7 @@ async def check(name, spec, args, gate) -> dict[str, Any]:
     async with gate:
         began = time.monotonic()
         try:
-            ws = LOCAL[name] if name in LOCAL else await checkout(name, spec, args.apps_dir)
+            ws = await checkout(name, spec, args.apps_dir)
             env = dict(os.environ, RUST_BACKTRACE="0")
             code, out, err = await run([args.bin, "borrowck", "--project", ws], ws, args.timeout, env)
         except StepError as e:
@@ -101,7 +99,6 @@ async def main():
     args = ap.parse_args()
     args.bin = os.path.abspath(args.bin) if os.sep in args.bin else args.bin
     specs = json.load(open(SPECS))
-    specs.update({name: {} for name in LOCAL})
     names = args.names or [n for n in specs if n not in args.skip]
     gate = asyncio.Semaphore(args.jobs)
     async with asyncio.TaskGroup() as group:

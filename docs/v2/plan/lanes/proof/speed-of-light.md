@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: lane proof's speed of light: the bound of the oracle's comparisons and the harness, the arithmetic, and how the design reaches 90% of it.
-date: 2026-10-29
+date: 2026-10-30
 ---
 # Lane proof: speed of light
 
@@ -46,11 +46,16 @@ in every block and for both length orders.
 
 **Now.** About 3.3 to 3.6 ms on 16 cores: 2.7 ms streaming, 0.25 ms faults, and 16 thread spawns
 at about 15 µs each. That is within 25% of the bound. The rest is thread start-up, which a
-persistent pool would remove. One path is still slow: `harness/v2/engine.py`'s
-`first_difference` (Python `readinto` in 1 MiB pieces, then `memcmp`) runs at about 150 ms, 3× the
-one-core bound. It runs only after a check has already failed, to name the first differing byte.
-The fix is for `determinism.py` to call `blaze-v2-proof '{"first": …, "second": …}'`, which is
-this code.
+persistent pool would remove.
+
+Corrected by speed-sol2-proof (2026-10-30): the slow path named here is gone.
+`harness/v2/determinism.py` used `engine.first_difference` (Python `readinto` in 1 MiB pieces,
+then `memcmp`, about 150 ms for the pair, 3× the one-core bound). It now calls
+`engine.first_difference_by`, which runs `blaze-v2-proof '{"first": …, "second": …}'` (this code)
+and reads only the two bytes at the offset to word the answer as before. That costs about 5 ms:
+the 3.3 to 3.6 ms above plus one process start. `proof.py selftest PATH` holds it to the model
+of the old answer for every size and kind of difference. `engine.first_difference` stays only
+as `proof.py`'s model.
 
 **State of the art.** glibc's `memcmp` (AVX2/EVEX) and `cmp(1)` are one-core scans, about 43 ms
 here. The same loop across cores reaches the socket's bandwidth instead of one core's.
@@ -91,10 +96,20 @@ the largest file at about 250 ms, 8× off.
 
 **Now.** For outputs, about 35 ms: 31 ms hashing, with per-file Python overhead (about 8 µs a file
 holding the GIL, 8 ms in all) overlapping it. That is within 15% of the bound. For trees, Python's
-`os.walk` and `lstat` cost about 20 µs a file, 0.6 s for 30,000 files, 100× the bound. That is
-still under 0.1% of a corpus run, but it is the one component left far off. The fix is a walker
-in `blaze-v2-proof` (`getdents64` plus `statx` across cores, BLAKE3 in place), called the way the
-first difference is.
+`os.walk` and `lstat` cost about 20 µs a file, 0.6 s for 30,000 files, 100× the bound.
+
+**Trees now (sol-all, 2026-10-30; by count, not measured).** `engine.tree_digest` runs
+`blaze-v2-proof '{"tree": ..., "skip": [...]}'` (`crates/blaze-v2-proof/src/tree.rs`), found
+beside the blaze under test (`engine.proof_beside`). It lists each directory as a rayon task,
+takes each entry's type from the listing (`d_type`, no `stat`), and hashes files in tasks of up
+to 64: an open, an `fstat` for the mode and size, one read into a buffer the thread reuses (mapped
+from 1 MiB). Per file that is about 3 syscalls, about 2 µs, ÷ 16 cores ≈ 4 ms for 30,000 files,
+plus 300 MB of BLAKE3 across the cores (3 ms) and the process start (about 2 ms): **about 9 ms,
+1.5× the 6 ms bound**, against 100× before. What is left is the process start and the `fstat`
+(`statx` batched by io_uring would fold it into the open). The bytes hashed are the old walk's, so
+kept references still match; `proof.py selftest PATH` checks each digest against the old walk
+(`old_tree_digest`) after every kind of change. Where the old walk skipped an unreadable directory
+in silence, this one stops naming it.
 
 **State of the art.** `b3sum` maps each file and hashes it across cores with BLAKE3's tree mode.
 That is the same work done here, at about 6 GB/s a core. `sha256sum` is one core at 2 GB/s.
@@ -230,6 +245,123 @@ far tighter than the 10% slack the budgets allow, keep that from deciding a verd
 **State of the art.** hyperfine runs a fixed count (at least 10, or 3 s), reports the mean and
 standard deviation, and flags outliers. criterion.rs takes 100 samples and a bootstrap interval.
 Neither stops when the answer is known, nor sizes the run to the question.
+
+### dbsp's case check (`crates/blaze-v2-proof/src/dbsp.rs`) (speed-sol2-proof)
+
+**Workload.** `blaze-v2-proof '{"dbsp": KIND, …, "before": …, "after": …}'`, once for each edit
+of `harness/v2/dbsp/edits.py`: the traces of the builds before and after one edit, held to the
+edit kind's case. The worst case is nushell's size, n = 5 M keys and m = 50 M edges a trace. The
+build after an edit runs r keys, about 10³ for an impl edit, of which w are of a watched kind
+(the resolver's, the slices', and those the case counts).
+
+**Work, counted.**
+- Parsing and checking each trace in place (`View::parse`): the keys (34 B) and the reads
+  (4 B), checked across cores. That is 2 × (170 MB + 200 MB) ÷ 400 GB/s ≈ 1.9 ms.
+- Each of the case's 3 or 4 bounds and the 13 round bounds: two binary searches for the kind's
+  run in each trace (about 4 × 23 key compares), a scan of the run's `has` bits, and a merge of
+  the two runs. That is about 17 × 2 µs plus the runs' lengths, under 1 ms in all.
+- The sliced kinds' edges in `after`: one key load for each edge read, at most a few thousand.
+- The reruns: the `ran` and `has` bitsets of `after`, n ÷ 8 bytes each (1.25 MB, about 50 µs at
+  one core's 25 GB/s), and for each of the w watched reruns, a seek in `before` and one binary
+  search in `after` (about 23 probes, the first ~10 DRAM misses, about 1 µs) for each edge it
+  read before.
+
+**Bound.** About 2 ms of checking plus 3 ms for the reruns and their edges: **about 5 ms**, set
+by the trace check. An edit with no rerun costs that check and nothing else.
+
+**Was.** `main.rs` copied both views out (`View::to_trace`): 2 × 1.27 GB written and read, plus
+the page faults of 2.5 GB of fresh allocations. That is about 2 × (1.27 GB × 2 ÷ 10 GB/s) + 0.6 M
+faults × 0.25 µs ≈ 650 ms on one thread. Then the last pass tested `ran` and `has` bit by bit for
+all n keys (5 M iterations, about 5 ms). All told about 660 ms, **130× the bound**.
+
+**Changed.**
+- `dbsp::check` is generic over `join::Columns`, as `join::under` and `join::over` are. `main.rs`
+  passes the two `View`s of the mapped files, and no column is copied.
+- `Columns` gained `has_word` and `ran_word`. The reruns are found by `join::ran_results`, one
+  word of each bitset per 64 keys and a `trailing_zeros` per member, in the same ascending order.
+  It masks off bits a file sets past its last key, which `View::check` does not look at.
+- The kind runs (`join::of_kind`), seeks, results and edge comparisons are `join`'s, shared with
+  the cross-core join.
+- Tests: `a_check_in_place_answers_as_on_owned_traces` holds the check on views, and on one view
+  with one owned trace, to the check on owned traces, for every case and three `Touched`s over 24
+  seeded pairs. It also holds `ran_results` to a bit-by-bit walk.
+  `a_check_of_a_build_that_reran_nothing_allocates_nothing` holds the check of a settled build to
+  zero allocations; `the_view_answers_what_the_trace_does` checks the new words.
+
+**Now.** About 2 ms of checking plus the reruns: **within 10% of the bound**. The check of the
+traces is the same parallel pass `join` uses. What `proof` should measure: the `dbsp` command's
+wall time on a pair of nushell-sized traces (the join bench's trace, edited), against 5 ms.
+
+### Name resolution's case check (`crates/blaze-v2-proof/src/nameres.rs`) (speed-sol2-proof)
+
+**Workload.** `blaze-v2-proof '{"incremental", "scratch", "before", "slot"}'` for a fixture slot
+with a `nameres` case: three traces held to the slot's case.
+
+**Bound.** The same shape as dbsp's: the parallel check of three traces (about 3 ms at nushell's
+size), the kinds' runs, and the reruns' edges. About **5 ms**.
+
+**Now.** `main.rs`'s `compare` copies all three views (`to_trace`) before `nameres::check`. That
+is about 3.8 GB copied, roughly 1 s, **200× the bound**. It is not closed here: `nameres.rs` is
+held by lane frontend (window `frontend-next1`, extending its cases), so the exact edit (the
+same as dbsp's, with `join`'s helpers already `pub(crate)`) is queue item 00897.
+
+### The harness's own share of a timed command (`harness/v2/engine.py`, `budgets.py`) (speed-sol2-proof)
+
+**Workload.** Every timed budget times a `blaze` client command run by Python. The smallest
+limits are `noop` (5 ms, ripgrep), `body` (30 ms) and the restart budget's warm check (about
+12 ms).
+
+**Work, counted.** What the harness must do for a timed run: spawn the client (`vfork` and
+`exec`, inside the time because a user pays it too) and reap it. What it need not do inside the
+time: decode the output, translate newlines, parse `blaze-work` JSON lines, check who served
+the build.
+
+**Bound.** Python's `subprocess.run` with two pipes: building the environment array, the
+`vfork`/`exec` and the `poll` loop over the pipes, about 0.1 to 0.3 ms over the exec of the child
+itself. That is 2 to 6% of the 5 ms `noop` limit.
+
+**Was.**
+- `engine.run` decoded the output (text mode) before stopping its clock.
+- `Lane.build` timed around `engine.V2.build`, which also parses the `blaze-work` lines of
+  JSON output.
+- `restart`'s warm check timed `served(...)` too.
+- For a few kilobytes of output, the decode and parse cost about 0.05 to 0.5 ms. With the spawn,
+  the harness's share of a `noop` sample was up to about 0.8 ms, **16% of the limit**.
+
+**Changed.**
+- `engine.run` stops its clock (`perf_counter`) when the child is reaped, then decodes with
+  `engine.text`. That function is exactly what text mode did (UTF-8 with replacement, then
+  `\r\n` and `\r` to `\n`), and `budgets.py selftest` pins it.
+- `Lane.build` and the restart check take `Ran.seconds`, the child's time, rather than timing
+  their callers' work.
+- `noop` reports `harness_floor_ms`: the median `engine.run` time of `true`, nine runs. That is
+  the most of a sample that is the harness's own (it includes `true`'s exec).
+
+**Now.** The decode and parse are out of every timed sample, leaving the spawn's 0.1 to 0.3 ms:
+**within 10% of the bound for every budget at or above 3 ms**. What `proof` should measure:
+`harness_floor_ms` against 10% of the `noop` limit. If it is above 0.5 ms, the next step is
+spawning the client with `os.posix_spawn` and pipes the harness reads itself. That would need a
+working-directory action Python does not expose, or `blaze -C`.
+
+Whole builds are timed the same way elsewhere (`reachable.py`, `pure_scripts.py`, `determinism.py`,
+`share.py`, `oracle.py`, `corpus.py`). There the decode and parse are under 1% of a build of
+seconds, inside the bar, and `reachable.py` and `pure_scripts.py` are lanes cold-v2's and
+pure-scripts' now.
+
+### The rest of `harness/v2` (speed-sol2-proof)
+
+Each other script orchestrates builds, and its own work is that bound's 1% share: `corpus.py`
+measures that share as `harness_share`. The work it adds per step, counted from the code:
+- `oracle.py`: one `blaze-v2-proof` join per step (the trace join above);
+- `fixture.py` and `dbsp/edits.py`: writing a few files per edit, microseconds;
+- `share.py`: one build per program, `jobs` at once;
+- `tightmemory.py`: a cgroup settle poll (100 ms) between runs, outside any timing;
+- `macroeval_corpus.py`, `report.py`, `bounds.py`, `proof.py`: setup and output, once a run.
+
+None does per-byte or per-file work in Python on a timed path. The SHA-256 left (`corpus.py`'s
+crates.io check, `Kept`'s keys, `pure_scripts.py`'s lock digest) hashes kilobytes. `columns.rs` is
+test-only. `harness/v2/frontend/` and `rejections.py` were held by `frontend-fast-diff-next1`
+(live) and were not audited here.
 
 ### Bounds as budgets
 

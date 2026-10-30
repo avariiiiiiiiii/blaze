@@ -19,6 +19,7 @@ use syntax::{
     view::{self as ast, AstNode as _, HasGenericArgs as _, HasName as _},
 };
 
+use stdx::list::Join;
 use crate::{
     cx::{Cx, def_range_view as def_range},
     lower::{
@@ -237,14 +238,6 @@ fn what(cx: &Cx<'_, '_>, seg: &Seg<'_>, value_last: bool) -> String {
     }
 }
 
-fn listify(list: &[&str]) -> String {
-    match list {
-        [only] => (*only).to_owned(), // alloc: the error's message
-        [others @ .., last] => format!("{} and {last}", others.join(", ")), // alloc: the message
-        [] => String::new(), // alloc: empty, allocates nothing
-    }
-}
-
 /// From the end of the segment's name to the end of its arguments: `::<T>`, `<T>`, `(A)`.
 fn args_after_name(segment: ast::PathSegment<'_>) -> Option<TextRange> {
     let start = segment.name_ref()?.syntax().text_range().end();
@@ -341,9 +334,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
                 ArgKind::Infer => "generic",
             })
             .collect(); // alloc: for the error's message
-        let kind = listify(&kind_names);
+        let kind = stdx::list::list(kind_names.iter(), Join::AndNoSerialComma, false);
         // alloc: for the error's message
-        let this_type = listify(&types_and_spans.iter().map(|(it, _)| it.as_str()).collect::<Vec<_>>());
+        let this_type = stdx::list::list(types_and_spans.iter().map(|(it, _)| it.as_str()), Join::AndNoSerialComma, false);
         let mut diag = Diag::error(
             Some("E0109"),
             format!("{kind} arguments are not allowed on {this_type}"), // alloc: the error's message

@@ -127,7 +127,7 @@ no hash.
 
 | Table | Row | Per element | Lookup |
 | --- | --- | --- | --- |
-| A map on query keys (`table::Map`: slots, inputs, `born`, a view's results, inputs, reruns) | `Entry { key, value }` | the row (64 bytes, one line, for a view's result: the memo's ID and fingerprint), at most 16 bytes of places, a live byte | shard table pointer (its length in the top bits), ~1.5 place loads, one row read; no hash computed |
+| A map on query keys (`table::Map`: slots, inputs, a view's results, inputs, reruns) | `Entry { key, value }` | the row (64 bytes, one line, for a view's result: the memo's ID and fingerprint), at most 16 bytes of places, a live byte | shard table pointer (its length in the top bits), ~1.5 place loads, one row read; no hash computed |
 | Memo, hot (`memo::MemoHot`) | fingerprint, value word, a seqlocked copy of the value's address and length, edge range, code | 64 bytes, one line | one indexed load |
 | Memo, cold (`memo::MemoCold`) | key, the edge segment it holds | 48 bytes | one indexed load, writers only |
 | Value (`memo::ValueRow`) | bytes, length, segment, content ID | 64 bytes + 4 of generation + its bytes | one indexed load after the word |

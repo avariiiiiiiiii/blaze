@@ -18,7 +18,7 @@ use std::cell::RefCell;
 
 use base_db::{ConstEvalBudget, Crate, CrateOrigin, Db, Env};
 use hir_def::{
-    FunctionId, HasModule, ModuleDefId, StaticId, nameres::crate_def_map,
+    AssocItemId, FunctionId, HasModule, ModuleDefId, StaticId, nameres::crate_def_map,
 };
 use hir_expand::name::Name;
 use hir_ty::{
@@ -71,7 +71,12 @@ fn method(db: &Db, krate: Crate, path: &[&str], name: &str) -> Result<FunctionId
     let scope = def_map.module(db, module).scope(db);
     scope
         .impls()
-        .find_map(|it| it.impl_items(db).method_by_name(&name))
+        .find_map(|it| {
+            it.impl_items(db).items.iter().find_map(|(item_name, item)| match item {
+                AssocItemId::FunctionId(function) if *item_name == name => Some(*function),
+                _ => None,
+            })
+        })
         // alloc: error path
         .ok_or_else(|| format!("its `proc_macro` has no `{}::{}`", path.join("::"), name.as_str()))
 }
@@ -98,6 +103,8 @@ pub(crate) struct Expansion<'a> {
     /// The def, call and mixed sites.
     pub(crate) sites: [Span; 3],
     pub(crate) edition: Edition,
+    /// Whether the calling crate enables `forced_keywords`.
+    pub(crate) forced_keywords: bool,
 }
 
 /// What an expansion gave and what it did besides.
@@ -306,7 +313,7 @@ fn evaluate(
         return Err(Stop("was given nothing to expand".to_owned())); // alloc: error path
     };
     let state = RefCell::new(State {
-        server: Server::new(last.sites, last.edition),
+        server: Server::new(last.sites, last.edition, last.forced_keywords),
         os: Os::new(env),
         shims: FxHashMap::default(),
         stop: None,
@@ -367,7 +374,7 @@ fn on_evaluator<'db>(
     let mut config = Vec::new(); // alloc: once per run, as above
     for (at, expansion) in expansions.iter().enumerate() {
         if at > 0 {
-            state.borrow_mut().server = Server::new(expansion.sites, expansion.edition);
+            state.borrow_mut().server = Server::new(expansion.sites, expansion.edition, expansion.forced_keywords);
         }
         let expand = if expansion.attr { bridge.expand2 } else { bridge.expand1 };
         let macro_fn = Ty::new_fn_def(

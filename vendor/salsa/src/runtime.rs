@@ -1,6 +1,7 @@
 use self::dependency_graph::DependencyGraph;
 use crate::durability::Durability;
 use crate::function::{SyncGuard, SyncOwner};
+use crate::graph::ChangeLog;
 use crate::key::DatabaseKeyIndex;
 use crate::sync::Mutex;
 use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -43,6 +44,11 @@ pub struct Runtime {
     /// Data for instances
     #[cfg_attr(feature = "persistence", serde(skip))]
     table: Table,
+
+    /// The input fields set in recent revisions, for the input-closure filters
+    /// (`graph::bloom`). Not persisted: a deserialized log knows nothing before it.
+    #[cfg_attr(feature = "persistence", serde(skip))]
+    changes: ChangeLog,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -237,6 +243,7 @@ impl Default for Runtime {
             readers_stopped: Default::default(),
             dependency_graph: Default::default(),
             table: Default::default(),
+            changes: ChangeLog::new(Revision::start()),
         }
     }
 }
@@ -324,6 +331,16 @@ impl Runtime {
         &mut self.table
     }
 
+    /// The input fields set in recent revisions (`graph::bloom`).
+    #[inline]
+    pub(crate) fn changes(&self) -> &ChangeLog {
+        &self.changes
+    }
+
+    pub(crate) fn changes_mut(&mut self) -> &mut ChangeLog {
+        &mut self.changes
+    }
+
     /// Increments the "current revision" counter and resets
     /// the cancellation count.
     ///
@@ -332,6 +349,7 @@ impl Runtime {
         let r_old = self.current_revision();
         let r_new = r_old.next();
         self.revisions[0] = r_new;
+        self.changes.advance(r_new);
         *self.cancellation_count.get_mut() = 0;
         crate::tracing::info!("new_revision: {r_old:?} -> {r_new:?}");
         r_new
@@ -468,6 +486,11 @@ impl Runtime {
     pub(crate) fn deserialize_from(&mut self, other: &mut Runtime) {
         // The only field that is serialized is `revisions`.
         self.revisions = other.revisions;
+        // Writes made before the database was serialized are unknown: every filter is walked
+        // until the memos verify again under this log. A disabled log stays disabled.
+        let enabled = self.changes.enabled();
+        self.changes = ChangeLog::new(self.current_revision());
+        self.changes.set_enabled(enabled);
     }
 }
 

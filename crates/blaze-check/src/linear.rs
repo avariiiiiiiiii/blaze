@@ -13,9 +13,9 @@
 //! bookkeeping is `std`'s, invisible to the model: it adds no schedule point.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, hash_map::Entry},
     fmt::{self, Debug},
-    hash::Hash,
+    hash::{BuildHasher, Hash},
     panic::Location,
     sync::{
         Mutex, PoisonError,
@@ -96,6 +96,7 @@ impl<S: Spec> History<S> {
             (Some((thread, seen)), Some(returned)) => (thread as u8, Some((seen, returned))),
             _ => (0, None),
         };
+        // clone: an operation's return value, once per recorded operation
         let event = Event { thread, op, ret: ret.clone(), call, done, clocks };
         self.events.lock().unwrap_or_else(PoisonError::into_inner).push(event);
         ret
@@ -117,9 +118,12 @@ impl<S: Spec> History<S> {
             .map(|later| {
                 events.iter().enumerate().filter(|(_, it)| it.precedes(later)).fold(0u64, |set, (at, _)| set | 1 << at)
             })
+            // alloc: each operation's happens-before set, once per check
             .collect();
-        let mut memo = HashSet::with_hasher(FxBuildHasher);
-        if !linearizable(&events, &before, 0, init, &mut memo) {
+        // alloc: the memo, once per check
+        let mut memo = Memo { seen: Vec::new(), first: HashMap::with_hasher(FxBuildHasher) };
+        let root = memo.insert(0, init).expect("an empty memo holds nothing");
+        if !linearizable(&events, &before, 0, root, &mut memo) {
             panic!(
                 "blaze-check: not linearizable: no order of these operations, each placed after \
                  every one whose return happens before its call, gives these results on the \
@@ -137,15 +141,49 @@ impl<S: Spec> History<S> {
     }
 }
 
-/// Whether the operations not in `done` can follow in some order allowed by the run: `before`
-/// holds, per operation, the set of operations that must come before it.
-fn linearizable<S: Spec>(
-    events: &[Event<S>],
-    before: &[u64],
-    done: u64,
-    state: S,
-    memo: &mut HashSet<(u64, S), FxBuildHasher>,
-) -> bool {
+const NONE: u32 = u32::MAX;
+
+/// The (operations done, state) pairs the search has reached (Lowe's memo). Each state is
+/// stored once, moved in: `first` maps a pair's hash to the newest pair with that hash in
+/// `seen`, and pairs with one hash chain through their third field. The search reads a state by
+/// its index, so a step clones its parent's state once (to apply the operation to), where a set
+/// of pairs needs a second clone to keep one while the search goes on with the other.
+struct Memo<S> {
+    seen: Vec<(u64, S, u32)>,
+    first: HashMap<u64, u32, FxBuildHasher>,
+}
+
+impl<S: Spec> Memo<S> {
+    /// Adds the pair; its index, or `None` if it is there already.
+    fn insert(&mut self, done: u64, state: S) -> Option<u32> {
+        let hash = FxBuildHasher.hash_one((done, &state));
+        let at = u32::try_from(self.seen.len()).expect("a memo of fewer than 2^32 states");
+        match self.first.entry(hash) {
+            Entry::Occupied(mut head) => {
+                let mut cursor = *head.get();
+                while cursor != NONE {
+                    let (seen_done, seen_state, next) = &self.seen[cursor as usize];
+                    if *seen_done == done && *seen_state == state {
+                        return None;
+                    }
+                    cursor = *next;
+                }
+                self.seen.push((done, state, *head.get()));
+                head.insert(at);
+            }
+            Entry::Vacant(slot) => {
+                self.seen.push((done, state, NONE));
+                slot.insert(at);
+            }
+        }
+        Some(at)
+    }
+}
+
+/// Whether the operations not in `done` can follow in some order allowed by the run, from the
+/// state at `state` in `memo`: `before` holds, per operation, the set of operations that must
+/// come before it.
+fn linearizable<S: Spec>(events: &[Event<S>], before: &[u64], done: u64, state: u32, memo: &mut Memo<S>) -> bool {
     let all = if events.len() == MAX_OPS { u64::MAX } else { (1u64 << events.len()) - 1 };
     if done == all {
         return true;
@@ -154,12 +192,15 @@ fn linearizable<S: Spec>(
         if done & (1 << at) != 0 || before[at] & !done != 0 {
             continue;
         }
-        let mut next = state.clone();
+        // clone: a search node's state, one per child (the memo keeps the parent's)
+        let mut next = memo.seen[state as usize].1.clone();
         if next.apply(&event.op) != event.ret {
             continue;
         }
         let done = done | (1 << at);
-        if memo.insert((done, next.clone())) && linearizable(events, before, done, next, memo) {
+        if let Some(next) = memo.insert(done, next)
+            && linearizable(events, before, done, next, memo)
+        {
             return true;
         }
     }

@@ -22,14 +22,13 @@ pub mod keys {
 
     use either::Either;
     use hir_expand::{MacroCallId, attrs::AttrId};
-    use rustc_hash::FxHashMap;
     use syntax::{AstNode, AstPtr, ast};
 
     use crate::{
         BlockId, BuiltinDeriveImplId, ConstId, EnumId, EnumVariantId, ExternBlockId, ExternCrateId,
         FieldId, FunctionId, ImplId, LifetimeParamId, Macro2Id, MacroRulesId, ProcMacroId,
         StaticId, StructId, TraitId, TypeAliasId, TypeOrConstParamId, UnionId, UseId,
-        dyn_map::{DynMap, Policy},
+        dyn_map::{DynMap, KeyMap, Policy},
     };
 
     pub type Key<K, V> = crate::dyn_map::Key<AstPtr<K>, V, AstPtrPolicy<K, V>>;
@@ -47,14 +46,14 @@ pub mod keys {
             /// One map per key.
             #[derive(Default)]
             pub struct Maps {
-                $($field: FxHashMap<AstPtr<$ast>, $id>,)*
+                $($field: KeyMap<AstPtr<$ast>, $id>,)*
             }
 
             $(impl Slot<$ast, $id> for AstPtrPolicy<$ast, $id> {
-                fn slot(maps: &Maps) -> &FxHashMap<AstPtr<$ast>, $id> {
+                fn slot(maps: &Maps) -> &KeyMap<AstPtr<$ast>, $id> {
                     &maps.$field
                 }
-                fn slot_mut(maps: &mut Maps) -> &mut FxHashMap<AstPtr<$ast>, $id> {
+                fn slot_mut(maps: &mut Maps) -> &mut KeyMap<AstPtr<$ast>, $id> {
                     &mut maps.$field
                 }
             })*
@@ -93,8 +92,8 @@ pub mod keys {
 
     /// The field of [`Maps`] that a key's policy reads.
     pub trait Slot<AST, ID> {
-        fn slot(maps: &Maps) -> &FxHashMap<AstPtr<AST>, ID>;
-        fn slot_mut(maps: &mut Maps) -> &mut FxHashMap<AstPtr<AST>, ID>;
+        fn slot(maps: &Maps) -> &KeyMap<AstPtr<AST>, ID>;
+        fn slot_mut(maps: &mut Maps) -> &mut KeyMap<AstPtr<AST>, ID>;
     }
 
     /// XXX: AST Nodes and SyntaxNodes have identity equality semantics: nodes are
@@ -107,28 +106,28 @@ pub mod keys {
         _phantom: PhantomData<(AST, ID)>,
     }
 
-    impl<AST: AstNode, ID> Policy for AstPtrPolicy<AST, ID>
+    impl<AST: AstNode + 'static, ID: 'static> Policy for AstPtrPolicy<AST, ID>
     where
         Self: Slot<AST, ID>,
     {
         type K = AstPtr<AST>;
         type V = ID;
-        fn insert(map: &mut DynMap, key: AstPtr<AST>, value: ID) {
-            Self::slot_mut(&mut map.maps).insert(key, value);
+        fn map(map: &DynMap) -> &KeyMap<AstPtr<AST>, ID> {
+            <Self as Slot<AST, ID>>::slot(&map.maps)
         }
-        fn get<'a>(map: &'a DynMap, key: &AstPtr<AST>) -> Option<&'a ID> {
-            Self::slot(&map.maps).get(key)
-        }
-        fn is_empty(map: &DynMap) -> bool {
-            Self::slot(&map.maps).is_empty()
+        fn map_mut(map: &mut DynMap) -> &mut KeyMap<AstPtr<AST>, ID> {
+            <Self as Slot<AST, ID>>::slot_mut(&mut map.maps)
         }
     }
 }
 
 use std::{
+    hash::Hash,
     marker::PhantomData,
     ops::{Index, IndexMut},
 };
+
+use rustc_hash::FxHashMap;
 
 pub struct Key<K, V, P> {
     _phantom: PhantomData<(K, V, P)>,
@@ -152,9 +151,9 @@ pub trait Policy {
     type K;
     type V;
 
-    fn insert(map: &mut DynMap, key: Self::K, value: Self::V);
-    fn get<'a>(map: &'a DynMap, key: &Self::K) -> Option<&'a Self::V>;
-    fn is_empty(map: &DynMap) -> bool;
+    /// The key's own map, a field of [`keys::Maps`].
+    fn map(map: &DynMap) -> &KeyMap<Self::K, Self::V>;
+    fn map_mut(map: &mut DynMap) -> &mut KeyMap<Self::K, Self::V>;
 }
 
 #[derive(Default)]
@@ -162,38 +161,40 @@ pub struct DynMap {
     pub(crate) maps: keys::Maps,
 }
 
-#[repr(transparent)]
-pub struct KeyMap<KEY> {
-    map: DynMap,
-    _phantom: PhantomData<KEY>,
+/// The map of one key: indexing a [`DynMap`] by the key is a field access.
+pub struct KeyMap<K, V> {
+    map: FxHashMap<K, V>,
 }
 
-impl<P: Policy> KeyMap<Key<P::K, P::V, P>> {
-    pub fn insert(&mut self, key: P::K, value: P::V) {
-        P::insert(&mut self.map, key, value)
+impl<K, V> Default for KeyMap<K, V> {
+    fn default() -> Self {
+        KeyMap { map: FxHashMap::default() }
     }
-    pub fn get(&self, key: &P::K) -> Option<&P::V> {
-        P::get(&self.map, key)
+}
+
+impl<K: Hash + Eq, V> KeyMap<K, V> {
+    pub fn insert(&mut self, key: K, value: V) {
+        self.map.insert(key, value);
+    }
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.map.get(key)
     }
 
     pub fn is_empty(&self) -> bool {
-        P::is_empty(&self.map)
+        self.map.is_empty()
     }
 }
 
 impl<P: Policy> Index<Key<P::K, P::V, P>> for DynMap {
-    type Output = KeyMap<Key<P::K, P::V, P>>;
+    type Output = KeyMap<P::K, P::V>;
     fn index(&self, _key: Key<P::K, P::V, P>) -> &Self::Output {
-        // SAFETY: `KeyMap` is `#[repr(transparent)]` over a `DynMap` (its other field is a
-        // zero-sized `PhantomData`), so the two references have one layout and validity.
-        unsafe { std::mem::transmute::<&DynMap, &KeyMap<Key<P::K, P::V, P>>>(self) }
+        P::map(self)
     }
 }
 
 impl<P: Policy> IndexMut<Key<P::K, P::V, P>> for DynMap {
     fn index_mut(&mut self, _key: Key<P::K, P::V, P>) -> &mut Self::Output {
-        // SAFETY: as in `index`: `KeyMap` is `#[repr(transparent)]` over a `DynMap`.
-        unsafe { std::mem::transmute::<&mut DynMap, &mut KeyMap<Key<P::K, P::V, P>>>(self) }
+        P::map_mut(self)
     }
 }
 

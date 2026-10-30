@@ -8,6 +8,10 @@ exclude = [
     "harness",
     # The standard library's own workspace (docs/toolchain.md).
     "library",
+    # Hegel, built only as a dependency of blaze's tests (vendor/hegeltest/SOURCE.md).
+    "vendor/hegeltest",
+    "vendor/hegeltest-c",
+    "vendor/hegeltest-macros",
 ]
 resolver = "2"
 
@@ -88,6 +92,7 @@ hir-ty-borrowck = { path = "crates/hir-ty-borrowck", version = "0.0.0" }
 hir-ty-matchck = { path = "crates/hir-ty-matchck", version = "0.0.0" }
 hir-ty-unsafeck = { path = "crates/hir-ty-unsafeck", version = "0.0.0" }
 hir-ty-mir = { path = "crates/hir-ty-mir", version = "0.0.0" }
+hir-ty-pure = { path = "crates/hir-ty-pure", version = "0.0.0" }
 hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }
 hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }
 hir-ty-wfcheck = { path = "crates/hir-ty-wfcheck", version = "0.0.0" }
@@ -124,13 +129,16 @@ blaze-cas = { path = "crates/blaze-cas" }
 blaze-check = { path = "crates/blaze-check" }
 blaze-ci = { path = "crates/blaze-ci" }
 blaze-codegen = { path = "crates/blaze-codegen" }
+blaze-dbsp = { path = "crates/blaze-dbsp" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-ids = { path = "crates/blaze-ids" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
+blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
 blaze-items = { path = "crates/blaze-items" }
+blaze-item-hash = { path = "crates/blaze-item-hash" }
 blaze-link = { path = "crates/blaze-link" }
 blaze-phf = { path = "crates/blaze-phf", version = "0.0.0" }
 # fastcompile (docs/v2/plan/lanes/fastcompile/notes.md)
@@ -167,6 +175,7 @@ stdx = { path = "crates/stdx", version = "0.0.0" }
 syntax = { path = "crates/syntax", version = "0.0.0" }
 const-ast = { path = "crates/const-ast", version = "0.0.0" }
 syntax-bridge = { path = "crates/syntax-bridge", version = "0.0.0" }
+target-features = { path = "crates/target-features", version = "0.0.0" }
 test-fixture = { path = "crates/test-fixture", version = "0.0.0" }
 test-utils = { path = "crates/test-utils", version = "0.0.0" }
 toolchain = { path = "crates/toolchain", version = "0.0.0" }
@@ -190,6 +199,8 @@ rustc_apfloat = "0.2.3"
 rustc_type_ir = { path = "vendor/rustc_type_ir", version = "0.0.0", default-features = false }
 rustc_type_ir_macros = { path = "vendor/rustc_type_ir_macros", version = "0.0.0" }
 rustc_next_trait_solver = { path = "vendor/rustc_next_trait_solver", version = "0.0.0", default-features = false }
+# rustc's transmutability analysis, generic over the caller's layouts (vendor/rustc_transmute/PATCHES.md).
+rustc_transmute = { path = "vendor/rustc_transmute", version = "0.0.0" }
 
 # rust-analyzer's libraries, from crates.io
 line-index = { version = "0.1.2" }
@@ -238,8 +249,9 @@ object = { version = "0.37", default-features = false, features = ["read_core", 
 gimli = { version = "0.33", default-features = false, features = ["read", "write", "std"] }
 either = "1.15.0"
 expect-test = "1.5.1"
-# Property tests with shrinking (hir-def's name resolution tests); test-only.
-proptest = "1.5"
+# Property tests: Hegel, Hypothesis's engine, linked as a Rust crate; test-only, imported as `hegel`
+# (docs/contributing.md, vendor/hegeltest/SOURCE.md).
+hegeltest = { path = "vendor/hegeltest", default-features = false, features = ["static-engine"] }
 indexmap = { version = "2.9.0", features = ["serde"] }
 # hir-ty's MIR and display provider tables, which hir-ty-mir and hir-ide register into.
 inventory = "0.3.24"
@@ -248,8 +260,9 @@ libc = "0.2.172"
 memchr = "2.8.1"
 # The `blaze` binary's general-purpose allocator (docs/v2/plan/design/memory.md).
 mimalloc = { version = "0.1.52", default-features = false }
-# mimalloc's C side, for `mi_collect` when the daemon gives freed pages back.
-libmimalloc-sys = { version = "0.1.49", default-features = false }
+# mimalloc's C side, for `mi_collect` when the daemon gives freed pages back, and (`extended`) its
+# options for huge pages.
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
 nohash-hasher = "0.2.0"
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 pulldown-cmark = { version = "0.9.6", default-features = false }
@@ -272,6 +285,8 @@ serde_json = "1.0.140"
 sonic-rs = { version = "0.5", default-features = false }
 rustc-hash = "2.1.1"
 rustc-literal-escaper = "0.0.7"
+# blaze-macro-wasm's WASI host: `openat2` with no symlinks, one open per path a macro reads.
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 smallvec = { version = "1.15.1", features = [
     "const_new",
     "union",
@@ -280,7 +295,9 @@ smallvec = { version = "1.15.1", features = [
 smol_str = "0.3.2"
 text-size = "1.1.1"
 toml = "1.1.2"
-tracing = { version = "0.1.41", default-features = false, features = ["std"] }
+# Debug and trace callsites compile out of release builds: blaze's one subscriber there, the trace
+# recorder (crates/blaze-cargo/src/trace.rs), takes INFO and above.
+tracing = { version = "0.1.41", default-features = false, features = ["std", "release_max_level_info"] }
 tracing-tree = "0.4.0"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = [
     "registry",
@@ -297,12 +314,19 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_JobObjects",
+    # `CONTEXT` in `Win32_System_Diagnostics_Debug`.
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
@@ -326,7 +350,8 @@ unicode-security = "=0.1.2"
 unused_dependencies = "allow"
 
 [workspace.lints.rust]
-# remember to update RUSTFLAGS in ci.yml if you add something here
+# remember to update RUSTFLAGS in ci.yml if you add something here, and crates/blaze-live/Cargo.toml's
+# [lints], a written-out copy of these
 
 elided_lifetimes_in_paths = "warn"
 explicit_outlives_requirements = "warn"

@@ -33,7 +33,7 @@ use hir_ty::{
     next_solver::Ty,
 };
 use hir_ty_mir::mir::{
-    self as eval, Access, AtomicOrd as EvalOrd, EvalThread, MResult, Machine, MemKind, Ptr, RetagMode,
+    self as eval, Access, EvalThread, MResult, Machine, MemKind, Ptr, RetagMode,
     Site, Stop, TypedCx,
 };
 use rustc_hash::FxHashMap;
@@ -342,8 +342,8 @@ impl<'db> Checker<'db> {
         let span = Span::new(off, size);
         match access {
             Access::Plain => self.plain_access(alloc, prov, span, kind)?,
-            Access::Atomic { ord: o, rmw, cxchg_failed } => {
-                self.atomic_access(alloc, prov, span, kind, (ord(o), rmw, cxchg_failed))?
+            Access::Atomic { ord, rmw, cxchg_failed } => {
+                self.atomic_access(alloc, prov, span, kind, (ord, rmw, cxchg_failed))?
             }
         }
         Ok(Some((alloc, off)))
@@ -399,16 +399,6 @@ fn kind(kind: MemKind) -> Kind {
         MemKind::ConstHeap => Kind::ConstHeap,
         MemKind::Machine => Kind::Machine,
         MemKind::Mmap => Kind::Mmap,
-    }
-}
-
-fn ord(ord: EvalOrd) -> AtomicOrd {
-    match ord {
-        EvalOrd::Relaxed => AtomicOrd::Relaxed,
-        EvalOrd::Acquire => AtomicOrd::Acquire,
-        EvalOrd::Release => AtomicOrd::Release,
-        EvalOrd::AcqRel => AtomicOrd::AcqRel,
-        EvalOrd::SeqCst => AtomicOrd::SeqCst,
     }
 }
 
@@ -510,7 +500,7 @@ impl<'db> Machine<'db> for Checker<'db> {
 
     // Miri: concurrency/weak_memory.rs, `buffered_atomic_read`. A read-modify-write reads the
     // latest store (`buffered_atomic_rmw`), so only a load may read another.
-    fn atomic_load(&mut self, ptr: Ptr<Prov>, size: u64, _ord: EvalOrd, _latest: &[u8]) -> MResult<Option<Vec<u8>>> {
+    fn atomic_load(&mut self, ptr: Ptr<Prov>, size: u64, _ord: AtomicOrd, _latest: &[u8]) -> MResult<Option<Vec<u8>>> {
         let Some((alloc, off)) = self.locate(ptr, size)? else { return Ok(None) };
         let span = Span::new(off, size);
         if self.loaded.take() != Some((alloc, span)) {
@@ -524,19 +514,19 @@ impl<'db> Machine<'db> for Checker<'db> {
 
     // Miri: concurrency/weak_memory.rs, `buffered_atomic_write`: a location's first atomic
     // store keeps what it held before as the store before it (`None`: not all initialized).
-    fn atomic_store(&mut self, ptr: Ptr<Prov>, o: EvalOrd, bytes: &[u8], old: &[u8]) -> MResult<()> {
+    fn atomic_store(&mut self, ptr: Ptr<Prov>, ord: AtomicOrd, bytes: &[u8], old: &[u8]) -> MResult<()> {
         let size = bytes.len() as u64;
         let Some((alloc, off)) = self.locate(ptr, size)? else { return Ok(()) };
         let old = self.overwrote_init.then_some(old);
-        self.races.store_value(alloc, Span::new(off, size), ord(o), bytes, old);
+        self.races.store_value(alloc, Span::new(off, size), ord, bytes, old);
         Ok(())
     }
 
     // Miri: intrinsics/atomic.rs, `atomic_fence` and `compiler_fence` (a compiler fence does
     // nothing at run time).
-    fn fence(&mut self, o: EvalOrd, compiler_only: bool) -> MResult<()> {
+    fn fence(&mut self, ord: AtomicOrd, compiler_only: bool) -> MResult<()> {
         if !compiler_only {
-            self.races.fence(ord(o));
+            self.races.fence(ord);
         }
         Ok(())
     }

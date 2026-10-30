@@ -6,15 +6,12 @@ use std::time::Duration;
 
 use blaze_api::{TestOutcome, TestResult};
 
-use crate::select::{Basis, Cached};
+use crate::select::Cached;
 
 pub fn to_api(cached: &Cached) -> blaze_api::Cached {
     blaze_api::Cached {
-        basis: match &cached.basis {
-            Basis::Executed => blaze_api::Basis::Executed,
-            // clone: the message owns its reason, once per cached result sent
-            Basis::Reached { why } => blaze_api::Basis::Reached { why: why.clone() },
-        },
+        // clone: the message owns its reason, once per cached result sent
+        basis: cached.basis.clone(),
         millis: cached.took.as_millis().min(u128::from(u64::MAX)) as u64,
         // Only passes are kept: a failure runs again.
         outcome: TestOutcome::Passed,
@@ -30,16 +27,14 @@ pub fn of_api(cached: &blaze_api::Cached) -> Result<Cached, String> {
     }
     Ok(Cached {
         took: Duration::from_millis(cached.millis),
-        basis: match &cached.basis {
-            blaze_api::Basis::Executed => Basis::Executed,
-            // clone: the result owns its reason, once per cached result read
-            blaze_api::Basis::Reached { why } => Basis::Reached { why: why.clone() },
-        },
+        // clone: the result owns its reason, once per cached result read
+        basis: cached.basis.clone(),
     })
 }
 
 /// The result of a test not run: it took nothing now, and its run that stands is `cached`.
-pub fn result(binary: &str, name: &str, cached: &Cached) -> TestResult {
+/// `executable` is the daemon's index of `binary` among the request's test executables.
+pub fn result(binary: &str, executable: u32, name: &str, cached: &Cached) -> TestResult {
     TestResult {
         // alloc: the message owns its names, once per result sent
         name: name.to_owned(),
@@ -50,6 +45,8 @@ pub fn result(binary: &str, name: &str, cached: &Cached) -> TestResult {
         // alloc: empty, allocates nothing
         output: Vec::new(),
         outcome: TestOutcome::Unreached,
+        outside: false,
+        executable,
     }
 }
 
@@ -58,6 +55,7 @@ mod tests {
     use blaze_api::{Envelope, Response, SCHEMA};
 
     use super::*;
+    use crate::select::Basis;
 
     fn round_trip(result: &TestResult) -> TestResult {
         let message = Envelope::new(9, Response::TestResult(result.clone()));
@@ -75,7 +73,7 @@ mod tests {
     fn a_cached_pass_round_trips_with_its_outcome_duration_and_basis() {
         for basis in [Basis::Executed, Basis::Reached { why: "the test was killed after 60s".to_owned() }] {
             let cached = Cached { took: Duration::from_millis(1234), basis };
-            let sent = result("tests/parse", "parse::nested", &cached);
+            let sent = result("tests/parse", 3, "parse::nested", &cached);
             let back = round_trip(&sent);
             assert_eq!(back, sent);
             assert_eq!(back.outcome, TestOutcome::Unreached);
@@ -96,6 +94,8 @@ mod tests {
             millis: 7,
             output: b"ok".to_vec(),
             outcome: TestOutcome::Passed,
+            outside: false,
+            executable: 0,
         };
         assert_eq!(round_trip(&ran), ran);
     }

@@ -30,7 +30,8 @@
 //!
 //! Costs: a node is 32 bytes of ID plus an 8-byte [`Shape`], and 4 bytes of index place at
 //! most half full; a directory entry is 9 bytes (name, node, mode byte) in three columns; a
-//! file's bytes are one `Arc<[u8]>` shared with every reader, or a range of the image. Finding
+//! file's bytes are one allocation shared with every reader (an `Arc<[u8]>`, or the `Vec` the
+//! op that wrote them owned, never copied), or a range of the image. Finding
 //! a root is one probe of about 1.5 places (two when a base is there and the node is not in
 //! it); a path component is a binary search over the directory's name column. A base costs
 //! nothing in memory: it is the image's pages, read when something reads them.
@@ -55,6 +56,20 @@ use crate::{
         atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
     },
 };
+
+/// `bytes` held where they are: their `Vec` becomes what the lent slice is of, so a file written
+/// with bytes its op owned (or an edit made) is stored with no copy. One allocation, the `Arc`
+/// holding the `Vec`'s three words, whatever the length.
+pub(crate) fn adopt(bytes: Vec<u8>) -> Bytes {
+    // alloc: one per new file, the owner of its bytes; the bytes themselves are not copied.
+    let owner = Arc::new(bytes);
+    let lent: *const [u8] = owner.as_slice();
+    // SAFETY: a `Vec`'s buffer stays at one address, unwritten, until the `Vec` is grown, written
+    // or dropped. `owner` is moved into the `Bytes` as an `Arc<dyn Send + Sync>`, through which
+    // nothing can reach the `Vec` to grow or write it, and the `Bytes` hold it for as long as
+    // they lend the slice.
+    unsafe { Bytes::held(lent, owner) }
+}
 
 /// `len` bytes at `at` of `mapped`'s blobs section, once each page group they fall in matches
 /// its CRC32C.
@@ -648,10 +663,11 @@ impl Drop for Index {
     }
 }
 
-/// Where a file node made after the base keeps its bytes: its own, or the range of the
-/// image's blobs section a base file had before a collection renumbered it.
+/// Where a file node made after the base keeps its bytes: its own (an `Arc<[u8]>`, or the
+/// `Vec` an op wrote, [`adopt`]ed), or the range of the image's blobs section a base file had
+/// before a collection renumbered it.
 enum Blob {
-    Heap(Arc<[u8]>),
+    Heap(Bytes),
     Mapped { at: u64, len: u64 },
 }
 
@@ -834,8 +850,8 @@ impl Table {
                 // clone: one count of the image, which the bytes lend from.
                 mapped_bytes(self.mapped_ref().clone(), at, len)
             }
-            // clone: one count of the file's `Arc`, never its bytes.
-            BlobAt::Column(Blob::Heap(bytes)) => Ok(Bytes::from(bytes.clone())),
+            // clone: one count of the file's owner, never its bytes.
+            BlobAt::Column(Blob::Heap(bytes)) => Ok(bytes.clone()),
         }
     }
 
@@ -845,7 +861,7 @@ impl Table {
             BlobAt::Base(&at, &len) | BlobAt::Column(&Blob::Mapped { at, len }) => {
                 Source::Mapped { at, len }
             }
-            BlobAt::Column(Blob::Heap(bytes)) => Source::Heap(bytes),
+            BlobAt::Column(Blob::Heap(bytes)) => Source::Heap(&bytes[..]),
         }
     }
 
@@ -1090,9 +1106,9 @@ impl Writer {
     }
 
     /// The node of the file `id` with `bytes`, added if it is new.
-    pub(crate) fn file(&mut self, id: ContentId, bytes: Arc<[u8]>) -> u32 {
+    pub(crate) fn file(&mut self, id: ContentId, bytes: impl Into<Bytes>) -> u32 {
         // SAFETY: `&mut self`: the one writer.
-        unsafe { self.table().add_file(id, Blob::Heap(bytes)) }
+        unsafe { self.table().add_file(id, Blob::Heap(bytes.into())) }
     }
 
     /// The node of the directory `id` with `entries` (name, node, mode byte), added if new.
@@ -1142,9 +1158,9 @@ impl Building {
         Building(Table { names, mapped, ..Table::new(count) })
     }
 
-    pub(crate) fn file(&mut self, id: ContentId, bytes: Arc<[u8]>) -> u32 {
+    pub(crate) fn file(&mut self, id: ContentId, bytes: impl Into<Bytes>) -> u32 {
         // SAFETY: `&mut self` on a table nobody else has yet.
-        unsafe { self.0.add_file(id, Blob::Heap(bytes)) }
+        unsafe { self.0.add_file(id, Blob::Heap(bytes.into())) }
     }
 
     /// The file `id` whose bytes are those of the file `shape` of `from`, the table this one
@@ -1154,7 +1170,7 @@ impl Building {
             BlobAt::Base(&at, &len) | BlobAt::Column(&Blob::Mapped { at, len }) => {
                 Blob::Mapped { at, len }
             }
-            // clone: one count of the file's `Arc`, never its bytes.
+            // clone: one count of the file's owner, never its bytes.
             BlobAt::Column(Blob::Heap(bytes)) => Blob::Heap(bytes.clone()),
         };
         // SAFETY: as above.

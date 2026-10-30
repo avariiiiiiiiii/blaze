@@ -6,7 +6,7 @@ use base_db::Db;
 use hir_expand::{HirFileId, InFile, Lookup, span_map::SpanMap};
 use span::{AstIdMap, Edition, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
-    FlatTree, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
+    FlatTree, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self, AstNode as _},
 };
 use triomphe::Arc;
@@ -156,7 +156,7 @@ impl Body {
 
     /// The body lowered from [`body_syntax`] rather than from the whole file: what it is made of
     /// stays the same while edits elsewhere in the file move it, so it is lowered again only
-    /// when its own text changes. The source map is of the tree of [`BodySyntax::root`]. `None`
+    /// when its own text changes. The source map is of [`BodySyntax::tree`]. `None`
     /// when the body is not written in a file, but by a macro. Kept for more bodies than
     /// [`Body::with_source_map`] is: what is lowered again after it is let go of has changed
     /// to all that reads it. The body is [`Body::of`] lowered again for its map, with the same
@@ -208,10 +208,16 @@ impl Body {
     /// expansion each part is written in, and the macro calls, and not where in the file.
     /// It stays the same while edits elsewhere in the file move the body.
     pub fn unmoved_source_map(db: &Db, def: DefWithBodyId) -> &BodySourceMap {
-        match Self::relative(db, def) {
-            Some((_, source_map)) => source_map,
-            None => &Self::with_source_map(db, def).1,
-        }
+        Self::unmoved(db, def).1
+    }
+
+    /// [`Body::unmoved_source_map`] with the body it maps.
+    pub fn unmoved(db: &Db, def: DefWithBodyId) -> (&Body, &BodySourceMap) {
+        let (body, source_map) = match Self::relative(db, def) {
+            Some(it) => it,
+            None => Self::with_source_map(db, def),
+        };
+        (&**body, source_map)
     }
 }
 
@@ -316,7 +322,7 @@ fn lower_in_file(
 }
 
 /// Whether [`Body::with_source_map`] checks the source map of each body lowered alone, moved,
-/// against that of the same body lowered in its file, and [`BodySyntax::root`] parses every
+/// against that of the same body lowered in its file, and [`BodySyntax::tree`] parses every
 /// anchor again and prints the ones that parse differently alone (`RA_CHECK_RELATIVE_BODIES`).
 fn check_relative() -> bool {
     static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -330,7 +336,7 @@ fn check_relative() -> bool {
 /// lowered from this is lowered again only when this changes, not on every edit of the file.
 ///
 /// It holds no tree, so that a file's tree is let go of once nothing is parsing or lowering
-/// it: the tree of [`BodySyntax::root`] is parsed again from the text of the anchor when it
+/// it: the tree of [`BodySyntax::tree`] is parsed again from the text of the anchor when it
 /// is not among the last few made. It is the same as the one in the file, which it is
 /// compared by ([`tree_hash`]).
 pub struct BodySyntax {
@@ -345,7 +351,7 @@ pub struct BodySyntax {
     /// Whether the anchor holds a lazy node of an outline (#1294), and so is parsed again as an
     /// outline: a full parse of its text is a different tree.
     outline: bool,
-    /// The item in [`BodySyntax::root`].
+    /// The item in [`BodySyntax::tree`].
     pub item: SyntaxNodePtr,
     /// The maps of the anchor, the same for every body written in it, and so shared by them.
     pub ast_id_map: Arc<AstIdMap>,
@@ -396,11 +402,6 @@ impl BodySyntax {
         })
     }
 
-    /// The root of [`Self::tree`] as a handle.
-    pub fn root(&self, db: &Db) -> SyntaxNode {
-        SyntaxNode::new_flat_root(self.tree(db))
-    }
-
     /// The text of the anchor.
     pub fn text(&self) -> &str {
         &self.text[self.range]
@@ -430,7 +431,7 @@ impl BodySyntax {
     }
 
     /// Whether the anchor parsed alone is the tree it is in the file, so that
-    /// [`BodySyntax::root`] needs nothing of the file's tree.
+    /// [`BodySyntax::tree`] needs nothing of the file's tree.
     #[cfg(test)]
     pub(crate) fn reparses_alone(&self) -> bool {
         self.reparse().is_some()

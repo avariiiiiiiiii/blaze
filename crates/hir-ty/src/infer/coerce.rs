@@ -50,7 +50,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind, Safety as _, Ty as _},
     solve::{Certainty, NoSolution},
 };
-use tracing::{debug, instrument};
+use tracing::debug;
 
 use crate::{
     Adjust, Adjustment, AutoBorrow, ParamEnvAndCrate, PointerCast, Span, TargetFeatures,
@@ -224,12 +224,10 @@ where
         })
     }
 
-    #[instrument(skip(self))]
     fn coerce(&mut self, a: Ty<'db>, b: Ty<'db>) -> CoerceResult<'db, 'f> {
         // First, remove any resolved type variables (at the top level, at least):
         let a = self.infcx().shallow_resolve(a);
         let b = self.infcx().shallow_resolve(b);
-        debug!("Coerce.tys({:?} => {:?})", a, b);
         let head = self.head(a, b);
         self.coerce_head(a, b, head)
     }
@@ -478,10 +476,8 @@ where
     /// are successfully selected.
     ///
     /// [unsized coercion](https://doc.rust-lang.org/reference/type-coercions.html#unsized-coercions)
-    #[instrument(skip(self), level = "debug")]
     /// Called once `unsize_rejected_up_front` let the pair through.
     fn coerce_unsized(&mut self, source: Ty<'db>, target: Ty<'db>) -> UnsizeResult<'db, 'f> {
-        debug!(?source, ?target);
         debug_assert!(self.infcx().shallow_resolve(source) == source);
         debug_assert!(self.infcx().shallow_resolve(target) == target);
 

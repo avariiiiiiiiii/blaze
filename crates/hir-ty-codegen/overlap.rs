@@ -13,7 +13,7 @@
 #![forbid(unsafe_code)]
 
 use cranelift_codegen::{
-    entity::{EntitySet, PackedOption, SecondaryMap},
+    entity::{EntitySet, SecondaryMap, packed_option::PackedOption},
     ir::{self, InstructionData},
 };
 use blaze_ids::bits::{BitMatrix, BitSet};

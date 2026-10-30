@@ -14,8 +14,6 @@
 //! `ParentInfo`, `IgnoredDerivedImpls`, `ChangeFields`, `EnumVariantSameName`,
 //! `DeadCodePubInBinaryNote`) (MIT or Apache-2.0).
 
-use std::fmt::Write as _;
-
 use blaze_ids::radix;
 use hir::InFile;
 use hir_def::signatures::{StructFlags, StructSignature};
@@ -31,6 +29,7 @@ use super::{
     mark::{Live, Liveness},
     seed::Crate,
 };
+use stdx::list::Join;
 use crate::{
     lints::registry::Level,
     lower::{Found, Phase},
@@ -254,8 +253,8 @@ impl Report<'_, '_, '_, '_> {
         let names = || dead_codes.iter().map(|it| name(k, it.def));
         let message = match (num > 6, num) {
             (true, _) => format!("multiple {descr}s are never {participle}"), // alloc: the edge
-            (false, 1) => format!("{descr} {} is never {participle}", symbol_list(names())), // alloc: the edge
-            (false, _) => format!("{descr}s {} are never {participle}", symbol_list(names())), // alloc: the edge
+            (false, 1) => format!("{descr} {} is never {participle}", stdx::list::list(names(), Join::And, true)), // alloc: the edge
+            (false, _) => format!("{descr}s {} are never {participle}", stdx::list::list(names(), Join::And, true)), // alloc: the edge
         };
         let mut diag = Diag::lint(self.lint.name(), message, spans[0].clone()); // clone: the edge
         for span in &spans[1..] {
@@ -336,7 +335,7 @@ impl Report<'_, '_, '_, '_> {
             && let Some(encl_name) = &defs[encl].name
         {
             let encl_name = encl_name.as_str();
-            let list = symbol_list(traits.iter().copied());
+            let list = stdx::list::list(traits.iter().copied(), Join::And, true);
             let note = match traits.len() {
                 // alloc: the edge
                 1 => format!(
@@ -402,18 +401,3 @@ fn name<'k>(k: &'k Crate<'_, '_, '_>, def: DefIdx) -> &'k str {
     k.defs[def].name.as_ref().map_or("", |it| it.as_str())
 }
 
-/// rustc's `DiagSymbolList`: "`a`", "`a` and `b`", "`a`, `b`, and `c`".
-fn symbol_list<'s>(names: impl ExactSizeIterator<Item = &'s str>) -> String {
-    let len = names.len();
-    let mut out = String::new(); // alloc: the edge, a lint's text
-    for (at, name) in names.enumerate() {
-        let sep = match (at, len) {
-            (0, _) => "",
-            (1, 2) => " and ",
-            (at, _) if at + 1 == len => ", and ",
-            _ => ", ",
-        };
-        let _ = write!(out, "{sep}`{name}`");
-    }
-    out
-}

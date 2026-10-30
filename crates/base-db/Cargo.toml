@@ -22,11 +22,15 @@ triomphe.workspace = true
 semver.workspace = true
 tracing.workspace = true
 indexmap.workspace = true
+inventory.workspace = true
 
 # local deps
+blaze-bytes.workspace = true
+blaze-dbsp.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true
 blaze-ids.workspace = true
+blaze-lint-defs.workspace = true
 blaze-mem.workspace = true
 blaze-vfs.workspace = true
 cfg.workspace = true
@@ -37,6 +41,7 @@ intern.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+hegeltest.workspace = true
 
 [features]
 default = []

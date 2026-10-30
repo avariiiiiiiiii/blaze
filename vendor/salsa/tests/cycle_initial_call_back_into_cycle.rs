@@ -2,6 +2,8 @@
 
 //! Calling back into the same cycle from your cycle initial function will trigger another cycle.
 
+#![forbid(unsafe_code)]
+
 #[salsa::tracked(returns(copy))]
 fn initial_value(db: &dyn salsa::Database) -> u32 {
     query(db)

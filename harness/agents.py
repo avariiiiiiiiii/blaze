@@ -5,8 +5,8 @@ usage: agents.py WORKSPACE PACKAGE CRATE[,CRATE...] [--steps N] [--seed S] [--ta
                  [--noise FILE,FILE...] [-- RUN_ARG...]
 
 The workspace is copied. Each step changes the copy, asks the daemon for a build with
-`blaze sync`, builds the same source with cargo in a directory of its own and runs both programs:
-they have to print the same. A step is one of
+`blaze sync`, builds the same source with blaze from nothing (mixed.from_scratch) and runs both
+programs: they have to print the same. A step is one of
   - a unit added: a new module of the program (functions, a struct with derives, a trait with
     impls, generics, a macro, statics, closures, an `async fn`, collections, an enum, operators
     with `Drop` and associated types), with a line in `main` that prints what it computes;
@@ -29,7 +29,7 @@ import os, random, re, shlex, shutil, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, profile_dir
+from mixed import Fixture, BLAZE, sysroot_rlibs, RUNNER, from_scratch
 
 MAIN = re.compile(r"fn main\(\)[^{;]*\{\n")
 ITEM = re.compile(r"(use|mod|fn|pub|#\[|static|const|struct|enum|extern|type|macro_rules|impl|trait|async|unsafe)\b")
@@ -307,7 +307,7 @@ def main():
     shutil.copytree(workspace, ws, dirs_exist_ok=True, symlinks=True, ignore=shutil.ignore_patterns("target", "target-*", ".git"))
     work = tempfile.mkdtemp(prefix="blaze-agents-out-")
     obj, patch, binary = (os.path.join(work, n) for n in ("blaze.o", "blaze.patch.o", "bin-blaze"))
-    socket, log_path, reference = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log"), os.path.join(work, "reference")
+    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
     out = open(log_path, "a")
     fx = Fixture(ws, crates, ["-p", package])
     import json
@@ -347,6 +347,27 @@ def main():
         except Exception as error:
             return f"[{type(error).__name__}]"
 
+    def alike(text):
+        """What differs from run to run written alike, as `Fixture.behaviour` writes it."""
+        text = re.sub(r"' \(\d+\) (panicked|has overflowed)", r"' \1", text)
+        text = re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?", "<time>", text)
+        return re.sub(r"0x[0-9a-f]{12}\b", "<address>", text)
+
+    scratch_runs = {}
+
+    def from_nothing():
+        """What blaze's build of the source as it is, from nothing, prints, as `run` writes it,
+        by the state of the source: the steps go back to the first source and forward again."""
+        state = tuple(sorted(source.files().items()))
+        if state not in scratch_runs:
+            try:
+                status, stdout, stderr = from_scratch(ws, crates, fx.target_args, run_args)
+            except SystemExit as error:
+                return f"did not build from nothing: {str(error)[:200]}"
+            text = f"{stdout.decode(errors='replace')}\n--\n{stderr.decode(errors='replace')}\n[exit {status}]"
+            scratch_runs[state] = re.sub(r"[^\s'\"]*/bin-blaze\b", "BIN", text).replace("bin-blaze", bin_name)
+        return scratch_runs[state]
+
     def rss(daemon):
         return int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{daemon.pid}/status").read())[1]) // 1024
 
@@ -374,10 +395,6 @@ def main():
             reply = "no reply in 300 s"
         took = (time.time() - asked) * 1000
         died = daemon.poll() is not None
-        cargo = subprocess.run(["cargo", "build", "-q", "-p", package, "--bin", bin_name], cwd=ws, capture_output=True, text=True,
-                               env={**os.environ, "CARGO_TARGET_DIR": reference})
-        if (cargo.returncode == 0) != compiles:
-            raise SystemExit(f"step {index} {name!r}: cargo {'failed' if cargo.returncode else 'passed'}:\n{cargo.stderr[-3000:]}")
         kind = "patch" if reply.startswith("ok patch") else "full" if reply.startswith("ok object") else "unchanged" if reply.startswith("ok unchanged") else "error"
         if died:
             verdict = "DAEMON DIED"
@@ -386,7 +403,7 @@ def main():
         elif kind == "error":
             verdict = "REFUSED: " + reply[:300].replace("|", "/").replace("\n", " ")
         else:
-            ours, theirs = run(binary), run(os.path.join(profile_dir(reference), bin_name))
+            ours, theirs = alike(run(binary)), from_nothing()
             if ours == theirs:
                 verdict = "same"
             else:

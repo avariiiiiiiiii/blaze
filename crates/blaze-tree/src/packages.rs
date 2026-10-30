@@ -4,7 +4,7 @@
 use blaze_resolve::{InternedString, PackageId, PackageIdSpec, Resolve};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
-use super::bits::Bits;
+use blaze_ids::bits::BitSet as Bits;
 
 /// A package of the resolve, by its place in `PackageId` order, so that comparing two compares
 /// their ids.
@@ -122,7 +122,7 @@ impl<'a> Table<'a> {
         let mut bits = Bits::new(self.len());
         for (i, &id) in self.ids.iter().enumerate() {
             if specs.iter().any(|spec| spec.matches(id)) {
-                bits.insert(i);
+                bits.insert_growing(i);
             }
         }
         bits
@@ -133,7 +133,7 @@ impl<'a> Table<'a> {
         let mut bits = Bits::new(self.len());
         for id in ids {
             if let Some(pkg) = self.index.get(id) {
-                bits.insert(pkg.index());
+                bits.insert_growing(pkg.index());
             }
         }
         bits

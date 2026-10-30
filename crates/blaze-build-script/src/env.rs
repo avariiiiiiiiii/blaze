@@ -528,7 +528,9 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
     cmd.set("CARGO_PKG_VERSION_PRE", version.pre);
     cmd.set("CARGO_PKG_VERSION", &package.version);
     cmd.set("CARGO_PKG_NAME", &package.name);
-    let field = |it: &Option<String>| it.as_deref().unwrap_or("");
+    fn field(it: &Option<String>) -> &str {
+        it.as_deref().unwrap_or("")
+    }
     cmd.set("CARGO_PKG_DESCRIPTION", field(&package.description));
     cmd.set("CARGO_PKG_HOMEPAGE", field(&package.homepage));
     cmd.set("CARGO_PKG_REPOSITORY", field(&package.repository));

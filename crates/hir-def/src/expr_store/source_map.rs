@@ -35,12 +35,18 @@ use super::{
 
 /// A map from a store's own ids to values, as one column sorted by id and searched: what a
 /// finished store or source map keeps in place of a hash map keyed by its ids.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)] // clone: `ExpressionStoreSourceMap::moved`, per run
 pub(crate) struct IdTable<K, V>(Box<[(K, V)]>);
 
 impl<K, V> Default for IdTable<K, V> {
     fn default() -> Self {
         IdTable(Box::default())
+    }
+}
+
+impl<K, V> IdTable<K, V> {
+    pub(crate) fn entries(&self) -> &[(K, V)] {
+        &self.0
     }
 }
 
@@ -63,10 +69,6 @@ impl<K: Ord + Copy, V> IdTable<K, V> {
     pub(crate) fn get(&self, id: K) -> Option<&V> {
         let at = self.0.binary_search_by_key(&id, |&(it, _)| it).ok()?;
         Some(&self.0[at].1)
-    }
-
-    pub(crate) fn entries(&self) -> &[(K, V)] {
-        &self.0
     }
 
     /// The same ids, each value as `f` makes it of the old.
@@ -121,7 +123,7 @@ impl<N: AstNode> SourceKey for InFile<AstPtr<N>> {
 /// searched: what a source map keeps in place of a hash map. 24 bytes per entry for an
 /// `InFile<AstPtr<_>>` key and a `u32` value; a lookup is `log2(n)` key compares with no
 /// hashing, and iteration is in key order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SourceTable<K, V>(Box<[(K, V)]>);
 
 impl<K, V> Default for SourceTable<K, V> {
@@ -594,7 +596,7 @@ impl<T, N: AstNode> BackPushes<T, N> {
 /// The patterns that define each binding, as CSR: binding `b`'s are `pats[starts[b]..starts[b +
 /// 1]]`, in the order lowering added them. `starts` has one entry more than the store has
 /// bindings, and is empty when it has none.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)] // clone: as `IdTable`'s
 pub(crate) struct BindingPats {
     pub(in crate::expr_store) starts: Box<[u32]>,
     pub(in crate::expr_store) pats: Box<[PatId]>,

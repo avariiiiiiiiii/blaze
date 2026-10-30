@@ -7,9 +7,11 @@
 //! by its own ready bit, the length here is the whole truth, so [`AppendVec::as_slice`] is the
 //! published prefix in one load: for tables a scan reads whole (directory tables, path lists).
 //!
-//! Cost per append: an uncontended swap and store of the writer flag, the value's store and one
-//! release store of the length; a commit system call per quarter of growth. Per read: one
-//! acquire load and a bounds compare.
+//! Cost per append: the value's store and one release store of the length, plus, for an
+//! [`AppendVec::append`] on its own, an uncontended swap and store of the writer flag; a
+//! [`Writer`] takes the flag once for all its appends, and its bulk appends publish many values
+//! with one store. A commit system call per quarter of growth. Per read: one acquire load and a
+//! bounds compare.
 
 use std::{
     fmt,
@@ -92,41 +94,47 @@ impl<T> AppendVec<T> {
         self.len() == 0
     }
 
-    /// Appends `value` and returns its index, readable by every thread from now on. One writer
-    /// at a time: the caller serializes its appends (its own lock or a single owner); a second
-    /// append while one runs stops.
+    /// The column's one writer until it is dropped: appends through it take no atomic
+    /// read-modify-write, only the value's store and the length's release store. Stops when
+    /// another writer or append is running.
     #[track_caller]
-    pub fn try_append(&self, value: T) -> Result<u32, MemError> {
+    pub fn writer(&self) -> Writer<'_, T> {
         assert!(
             !self.writing.swap(true, Ordering::Acquire),
             "two threads appended to one AppendVec at once; its appends must be serialized"
         );
-        struct Done<'a>(&'a AtomicBool);
-        impl Drop for Done<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
+        Writer { column: self }
+    }
+
+    /// Appends `value` and returns its index, readable by every thread from now on. One writer
+    /// at a time: the caller serializes its appends (its own lock or a single owner); a second
+    /// append while one runs stops. Many appends in a row are cheaper through
+    /// [`AppendVec::writer`].
+    #[track_caller]
+    pub fn try_append(&self, value: T) -> Result<u32, MemError> {
+        self.writer().try_append(value)
+    }
+
+    /// Appends every value of `values` with one publish and returns the first one's index.
+    #[track_caller]
+    pub fn try_extend_from_slice(&self, values: &[T]) -> Result<u32, MemError>
+    where
+        T: Copy,
+    {
+        self.writer().try_extend_from_slice(values)
+    }
+
+    /// As [`AppendVec::try_extend_from_slice`]; stops when the reservation is used up or memory
+    /// cannot be had.
+    #[track_caller]
+    pub fn extend_from_slice(&self, values: &[T]) -> u32
+    where
+        T: Copy,
+    {
+        match self.try_extend_from_slice(values) {
+            Ok(first) => first,
+            Err(error) => fail(error),
         }
-        let _done = Done(&self.writing);
-        // Only the writer changes `len`, and the flag's acquire orders this after the last
-        // writer's store.
-        let len = self.len.load(Ordering::Relaxed);
-        if len >= self.max {
-            return Err(MemError::Exhausted {
-                tag: self.tag(),
-                reserved: self.region.reserved(),
-                wanted: (len + 1) * Self::SIZE,
-            });
-        }
-        self.region.ensure((len + 1) * Self::SIZE)?;
-        let slot = self.region.at(len * Self::SIZE).cast::<T>();
-        // SAFETY: the slot is committed (just ensured), aligned (a page-aligned base plus a
-        // multiple of `size_of::<T>()`), past the published length so no reader reaches it,
-        // and written by this writer alone (`writing`).
-        unsafe { slot.write(value) };
-        // Release: the value's bytes are seen by a reader that sees the length.
-        self.len.store(len + 1, Ordering::Release);
-        Ok(len as u32)
     }
 
     /// Appends `value` and returns its index; stops when the reservation is used up or memory
@@ -165,6 +173,117 @@ impl<T> AppendVec<T> {
         let len = *self.len.get_mut();
         // SAFETY: as for `as_slice`, and `&mut self` makes the borrow unique.
         unsafe { slice::from_raw_parts_mut(self.region.base().as_ptr().cast::<T>(), len) }
+    }
+}
+
+/// The one writer of an [`AppendVec`], from [`AppendVec::writer`] until dropped. It holds the
+/// column's writer flag, so its appends need no atomic read-modify-write each.
+pub struct Writer<'a, T> {
+    column: &'a AppendVec<T>,
+}
+
+impl<T> Writer<'_, T> {
+    /// Room for `count` more values past the published length, committed: its start.
+    fn room(&self, count: usize) -> Result<usize, MemError> {
+        let column = self.column;
+        // Only the writer changes `len`, and the flag's acquire ordered this after the last
+        // writer's store.
+        let len = column.len.load(Ordering::Relaxed);
+        let end = len.checked_add(count).filter(|&end| end <= column.max).ok_or_else(|| MemError::Exhausted {
+            tag: column.tag(),
+            reserved: column.region.reserved(),
+            wanted: len.saturating_add(count).saturating_mul(AppendVec::<T>::SIZE),
+        })?;
+        column.region.ensure(end * AppendVec::<T>::SIZE)?;
+        Ok(len)
+    }
+
+    fn slot(&self, index: usize) -> *mut T {
+        self.column.region.at(index * AppendVec::<T>::SIZE).cast::<T>().as_ptr()
+    }
+
+    fn publish(&self, len: usize) {
+        // Release: the values' bytes are seen by a reader that sees the length.
+        self.column.len.store(len, Ordering::Release);
+    }
+
+    /// Appends `value` and returns its index, readable by every thread from now on.
+    #[inline]
+    pub fn try_append(&mut self, value: T) -> Result<u32, MemError> {
+        let len = self.room(1)?;
+        // SAFETY: the slot is committed (`room`), aligned (a page-aligned base plus a multiple
+        // of `size_of::<T>()`), past the published length so no reader reaches it, and written
+        // by this writer alone (the column's flag).
+        unsafe { self.slot(len).write(value) };
+        self.publish(len + 1);
+        Ok(len as u32)
+    }
+
+    /// Appends `value` and returns its index; stops when the reservation is used up or memory
+    /// cannot be had.
+    #[inline]
+    #[track_caller]
+    pub fn append(&mut self, value: T) -> u32 {
+        match self.try_append(value) {
+            Ok(index) => index,
+            Err(error) => fail(error),
+        }
+    }
+
+    /// Appends every value of `values` with one copy and one publish; the first one's index.
+    pub fn try_extend_from_slice(&mut self, values: &[T]) -> Result<u32, MemError>
+    where
+        T: Copy,
+    {
+        let len = self.room(values.len())?;
+        // SAFETY: `[len, len + values.len())` is committed (`room`), aligned, past the published
+        // length and this writer's alone, so it overlaps neither `values` (a live borrow, so not
+        // unpublished room) nor anything a reader reaches.
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), self.slot(len), values.len()) };
+        self.publish(len + values.len());
+        Ok(len as u32)
+    }
+
+    /// As [`Writer::try_extend_from_slice`]; stops when the reservation is used up or memory
+    /// cannot be had.
+    #[track_caller]
+    pub fn extend_from_slice(&mut self, values: &[T]) -> u32
+    where
+        T: Copy,
+    {
+        match self.try_extend_from_slice(values) {
+            Ok(first) => first,
+            Err(error) => fail(error),
+        }
+    }
+
+    /// Appends `make(0)`, `make(1)`, ... `make(count - 1)` with one publish; the first one's
+    /// index. If `make` panics, none is published and those made so far are leaked (the next
+    /// append writes over them).
+    pub fn try_extend_with(&mut self, count: usize, mut make: impl FnMut(usize) -> T) -> Result<u32, MemError> {
+        let len = self.room(count)?;
+        for at in 0..count {
+            // SAFETY: as in `try_append`, for each slot of the room `room` committed.
+            unsafe { self.slot(len + at).write(make(at)) };
+        }
+        self.publish(len + count);
+        Ok(len as u32)
+    }
+
+    /// As [`Writer::try_extend_with`]; stops when the reservation is used up or memory cannot
+    /// be had.
+    #[track_caller]
+    pub fn extend_with(&mut self, count: usize, make: impl FnMut(usize) -> T) -> u32 {
+        match self.try_extend_with(count, make) {
+            Ok(first) => first,
+            Err(error) => fail(error),
+        }
+    }
+}
+
+impl<T> Drop for Writer<'_, T> {
+    fn drop(&mut self) {
+        self.column.writing.store(false, Ordering::Release);
     }
 }
 

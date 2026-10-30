@@ -7,7 +7,7 @@ use blaze_api::{Diagnostic, FactRead, UnitOf};
 
 use crate::{
     emit::{self, Sources, Style, codes},
-    model::{Applicability, Child, Diag, Level, MultiSpan, Sublevel, Suggestion},
+    model::{Child, Diag, Level, MultiSpan, Sublevel, Suggestion},
 };
 
 /// `diag` for the agent API, its `rendered` as rustc writes it in `style`, of `unit` when it is
@@ -82,7 +82,7 @@ fn suggestion(suggestion: &Suggestion, sources: &Sources) -> Diagnostic {
             let mut it = place(span, sources, true, None);
             // clone: the API's owned replacement, of a suggestion written
             it.replacement = Some(replacement.clone());
-            it.applicability = Some(applicability(suggestion.applicability));
+            it.applicability = Some(suggestion.applicability);
             it
         })
         .collect(); // alloc: the API's spans of a suggestion written
@@ -97,15 +97,6 @@ fn suggestion(suggestion: &Suggestion, sources: &Sources) -> Diagnostic {
         rendered: String::new(), // alloc: empty, allocates nothing
         unit: None,
         explanation: None,
-    }
-}
-
-fn applicability(applicability: Applicability) -> blaze_api::Applicability {
-    match applicability {
-        Applicability::MachineApplicable => blaze_api::Applicability::MachineApplicable,
-        Applicability::MaybeIncorrect => blaze_api::Applicability::MaybeIncorrect,
-        Applicability::HasPlaceholders => blaze_api::Applicability::HasPlaceholders,
-        Applicability::Unspecified => blaze_api::Applicability::Unspecified,
     }
 }
 
@@ -164,6 +155,16 @@ mod tests {
 
     fn sources() -> Sources {
         Sources::of([("src/main.rs".to_owned(), "fn main() {\n    let x: u32 = \"a\";\n}\n".to_owned())])
+    }
+
+    #[test]
+    fn applicability_names_and_writes_as_the_model_copy_did() {
+        let kept = ["MachineApplicable", "MaybeIncorrect", "HasPlaceholders", "Unspecified"];
+        for (it, name) in Applicability::ALL.into_iter().zip(kept) {
+            assert_eq!(it.name(), name);
+            assert_eq!(serde_json::to_string(&it).unwrap(), format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<Applicability>(&format!("\"{name}\"")).unwrap(), it);
+        }
     }
 
     #[test]

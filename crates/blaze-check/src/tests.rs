@@ -5,8 +5,8 @@
 use std::{
     cell::Cell as StdCell,
     collections::BTreeSet,
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc as StdArc, Mutex as StdMutex},
+    panic::{AssertUnwindSafe, Location, catch_unwind},
+    sync::{Arc as StdArc, Mutex as StdMutex, atomic::AtomicU64 as Id},
 };
 
 use crate::{
@@ -14,6 +14,8 @@ use crate::{
     cell::UnsafeCell,
     linear::{History, Spec},
     model,
+    path::{Mode, Path},
+    rt::{FENCE, Kind, Object, Op, Runtime, memory},
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering, fence},
@@ -898,4 +900,182 @@ fn a_schedule_reads_back_as_it_was_written() {
     let path = crate::path::Path::replay("01a0{30}+-.", 100).unwrap_or_else(|why| panic!("{why}"));
     assert_eq!(path.len(), 8);
     assert!(crate::path::Path::replay("01x", 100).is_err());
+}
+
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+/// One schedule point and the operation after it, on a runtime driven directly (thread 0, no
+/// coroutines), as `rt::op` does them.
+fn point(rt: &mut Runtime, obj: u32, kind: Kind) {
+    rt.threads[0].op = Some(Op { obj, kind });
+    assert_eq!(rt.schedule(), Ok(false));
+    rt.tick();
+}
+
+/// An execution of every kind of runtime operation: atomic stores, loads, RMWs, an SC fence, a
+/// mutex, a cell and tracked bytes; then the reset to the next execution.
+fn one_execution(rt: &mut Runtime, ids: &[Id; 3]) {
+    let at = Location::caller();
+    rt.begin();
+    let x = rt.atomic(&ids[0], 0);
+    let lock = rt.mutex(&ids[1]);
+    let cell = rt.object(&ids[2], |_| Object::Cell(memory::Cell::new()));
+    for round in 0..50 {
+        point(rt, x, Kind::Store);
+        assert!(rt.store(x, round, Release, at, 0).is_ok());
+        point(rt, x, Kind::Load);
+        assert!(rt.load(x, Acquire, at, 0).is_ok());
+        point(rt, x, Kind::Rmw);
+        assert!(rt.rmw(x, AcqRel, Acquire, at, 0, |old| Some(old + 1)).is_ok());
+        point(rt, FENCE, Kind::Rmw);
+        rt.fence(SeqCst);
+        point(rt, lock, Kind::Write);
+        assert!(rt.mutex_take(lock));
+        rt.mutex_release(lock);
+        rt.threads[0].op = None;
+        assert!(rt.cell_write(cell, at).is_ok());
+        assert!(rt.cell_read(cell, at).is_ok());
+        assert!(rt.bytes_access(0x2000, 16, at, memory::Bytes::Write).is_ok());
+        assert!(rt.bytes_access(0x2004, 8, at, memory::Bytes::Read).is_ok());
+    }
+    rt.end();
+    assert!(!rt.path.step(), "one thread leaves no other execution");
+}
+
+/// Once the first execution has sized the runtime's tables, an execution and the reset after
+/// it allocate nothing: no schedule point, store, lock, cell or byte access, and no reset.
+#[test]
+fn an_execution_and_its_reset_allocate_nothing_when_warm() {
+    assert!(blaze_alloc_count::installed());
+    let ids: [Id; 3] = std::array::from_fn(|_| Id::new(0));
+    let mut rt = Runtime::new(Path::new(Mode::Explore, Some(3), 10_000), 2);
+    one_execution(&mut rt, &ids);
+    let ((), used) = blaze_alloc_count::measure(|| one_execution(&mut rt, &ids));
+    assert_eq!(used.allocations, 0, "a warm execution allocated {} bytes", used.bytes);
+}
+
+/// The same inside a model, through the shims and the coroutine: once warm, a round of every
+/// shim operation allocates nothing.
+#[test]
+fn a_warm_scheduling_point_allocates_nothing() {
+    assert!(blaze_alloc_count::installed());
+    let mut builder = builder();
+    builder.max_branches = 10_000;
+    builder.check(|| {
+        static LOCK: Mutex<u32> = Mutex::new(0);
+        static RW: RwLock<u32> = RwLock::new(0);
+        static CONDVAR: Condvar = Condvar::new();
+        let x = AtomicU32::new(0);
+        let cell = UnsafeCell::new(0u32);
+        let once = OnceLock::new();
+        let round = || {
+            x.fetch_add(1, AcqRel);
+            x.store(x.load(Acquire) + 1, Release);
+            fence(SeqCst);
+            *LOCK.lock().unwrap() += 1;
+            *RW.write().unwrap() += 1;
+            assert!(*RW.read().unwrap() > 0);
+            CONDVAR.notify_one();
+            cell.with_mut(|_| ());
+            cell.with(|_| ());
+            assert_eq!(*once.get_or_init(|| 7), 7);
+            crate::cell::write(buffer(), 16);
+            crate::cell::read(buffer(), 8);
+            thread::yield_now();
+        };
+        for _ in 0..200 {
+            round();
+        }
+        let ((), used) = blaze_alloc_count::measure(|| {
+            for _ in 0..100 {
+                round();
+            }
+        });
+        assert_eq!(used.allocations, 0, "100 warm rounds allocated {} bytes", used.bytes);
+    });
+}
+
+/// The allocations of a random search of `runs` executions of one model.
+fn allocations_of(runs: u64) -> u64 {
+    let mut random = builder();
+    random.random = Some(runs);
+    random.seed = 3;
+    random.max_branches = 10_000;
+    let ((), used) = blaze_alloc_count::measure(|| {
+        random.check(|| {
+            static LOCK: Mutex<u32> = Mutex::new(0);
+            static FLAG: AtomicBool = AtomicBool::new(false);
+            let x = AtomicU32::new(0);
+            let cell = UnsafeCell::new(0u32);
+            for _ in 0..20 {
+                x.fetch_add(1, AcqRel);
+                FLAG.store(x.load(Acquire) % 2 == 0, Release);
+                *LOCK.lock().unwrap() += 1;
+                cell.with_mut(|_| ());
+                crate::cell::write(buffer(), 16);
+                crate::cell::read(buffer(), 8);
+            }
+        });
+    });
+    used.allocations
+}
+
+/// Executions after the first allocate nothing: the explorer's own work between them (the
+/// path's buffers, the main job, the runtime's tables) is reused.
+#[test]
+fn executions_after_the_first_allocate_nothing() {
+    assert!(blaze_alloc_count::installed());
+    allocations_of(2);
+    assert_eq!(allocations_of(50), allocations_of(2));
+}
+
+/// Every execution's order of steps, in the order the search ran them.
+fn interleavings() -> Vec<Vec<u8>> {
+    let log = StdArc::new(StdMutex::new(Vec::new()));
+    let runs = StdArc::new(StdMutex::new(Vec::new()));
+    let (into_log, into_runs) = (log.clone(), runs.clone());
+    let mut builder = builder();
+    builder.max_preemptions = Some(2);
+    builder.check(move || {
+        into_log.lock().unwrap().clear();
+        let lock = Arc::new(Mutex::new(0u32));
+        let x = Arc::new(AtomicU32::new(0));
+        let workers: Vec<_> = (1..3u8)
+            .map(|me| {
+                let (log, lock, x) = (into_log.clone(), lock.clone(), x.clone());
+                thread::spawn(move || {
+                    for _ in 0..2 {
+                        log.lock().unwrap().push(me);
+                        x.fetch_add(1, AcqRel);
+                        log.lock().unwrap().push(me);
+                        *lock.lock().unwrap() += 1;
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        into_log.lock().unwrap().push(0);
+        x.load(Acquire);
+        into_log.lock().unwrap().push(0);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let trace = into_log.lock().unwrap().clone();
+        into_runs.lock().unwrap().push(trace);
+    });
+    let runs = runs.lock().unwrap().clone();
+    runs
+}
+
+/// Threads that switch straight to each other run the same executions, in the same order, as
+/// when every switch goes through the explorer (the reference for `coro::switch_to`).
+#[test]
+fn threads_switching_to_each_other_explore_what_the_explorer_does() {
+    let direct = interleavings();
+    crate::coro::DIRECT.set(false);
+    let through = interleavings();
+    crate::coro::DIRECT.set(true);
+    assert!(direct.len() > 1, "the model has more than one execution");
+    assert_eq!(direct, through);
 }

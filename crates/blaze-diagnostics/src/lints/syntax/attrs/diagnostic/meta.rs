@@ -249,10 +249,7 @@ impl<'t, I: Iterator<Item = Tree<'t>>> Parser<'t, I> {
     }
 
     fn token(&self) -> Option<ast::Token<'t>> {
-        match self.get(0)? {
-            NodeOrToken::Token(token) => Some(token),
-            NodeOrToken::Node(_) => None,
-        }
+        self.get(0)?.into_token()
     }
 
     fn eat(&mut self, kind: SyntaxKind) -> Option<ast::Token<'t>> {

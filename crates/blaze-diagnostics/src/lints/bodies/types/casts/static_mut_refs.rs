@@ -19,7 +19,7 @@ use hir_def::{
     signatures::{StaticFlags, StaticSignature},
     src::HasSource as _,
 };
-use hir_ty::next_solver::TyKind;
+use hir_ty::{db::HirDatabase as _, next_solver::TyKind};
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
@@ -49,7 +49,7 @@ impl LatePass for StaticMutRefs {
     const HOOKS: Hooks = Hooks::STMT;
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Ref, ExprKind::MethodCall]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         match b.store().expr(expr) {
             Expr::Ref { expr: inner, rawness: Rawness::Ref, mutability } => {
                 let mutable = mutability == Mutability::Mut;
@@ -90,7 +90,7 @@ impl LatePass for StaticMutRefs {
         }
     }
 
-    fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         let Expr::Block { statements, .. } = b.store().expr(block) else { return };
         let Some(Statement::Let { pat, initializer: Some(init), .. }) = statements.get(index) else { return };
         let Pat::Bind { id, .. } = b.store().pat(pat) else { return };
@@ -106,7 +106,7 @@ impl LatePass for StaticMutRefs {
 }
 
 /// rustc's `path_is_static_mut`: the `static mut` that `expr`, through its fields, names.
-fn static_mut(b: &BodyCx<'_, '_>, mut expr: ExprId) -> Option<StaticId> {
+fn static_mut(b: &BodyCx<'_, '_, '_>, mut expr: ExprId) -> Option<StaticId> {
     while let Expr::Field { expr: base, .. } = b.store().expr(expr) {
         expr = base;
     }
@@ -119,7 +119,7 @@ fn static_mut(b: &BodyCx<'_, '_>, mut expr: ExprId) -> Option<StaticId> {
 
 /// Where `&` or `&mut ` is written before what the borrow `outer` borrows (`inner`), after the
 /// parentheses that open `outer`: what `&raw const ` or `&raw mut ` replaces.
-fn addr_of_span(b: &BodyCx<'_, '_>, outer: &Span, inner: &Span) -> Span {
+fn addr_of_span(b: &BodyCx<'_, '_, '_>, outer: &Span, inner: &Span) -> Span {
     let Some(snippet) = b.cx.snippet(outer) else { return outer.with_hi(inner.lo) };
     let exclude: usize =
         snippet.chars().take_while(|it| it.is_whitespace() || *it == '(').map(char::len_utf8).sum();
@@ -127,7 +127,7 @@ fn addr_of_span(b: &BodyCx<'_, '_>, outer: &Span, inner: &Span) -> Span {
 }
 
 /// The `let` statement the pattern `pat` is of: where rustc's `check_stmt` lints.
-fn let_node(b: &BodyCx<'_, '_>, pat: hir_def::hir::PatId) -> Option<InFile<SyntaxNodePtr>> {
+fn let_node(b: &BodyCx<'_, '_, '_>, pat: hir_def::hir::PatId) -> Option<InFile<SyntaxNodePtr>> {
     let node = b.pat_node(pat)?;
     let syntax = b.cx.syntax_view(node);
     let stmt = syntax.value.ancestors().find(|it| it.kind() == SyntaxKind::LET_STMT)?;
@@ -137,7 +137,7 @@ fn let_node(b: &BodyCx<'_, '_>, pat: hir_def::hir::PatId) -> Option<InFile<Synta
 /// rustc's `emit_static_mut_refs`: the lint at `span`, with the `&raw` suggestion at `sugg`
 /// when there is one (`suggest_addr_of`).
 fn emit(
-    b: &BodyCx<'_, '_>,
+    b: &BodyCx<'_, '_, '_>,
     at: InFile<SyntaxNodePtr>,
     span: Span,
     sugg: Option<Span>,
@@ -188,7 +188,7 @@ fn emit(
 /// rustc's `interior_mutability_suggestion`: whether to say to use a type with interior
 /// mutability, and where the `mut` of the static is when its type already has it and the
 /// reference is shared.
-fn interior_mutability(b: &BodyCx<'_, '_>, def: StaticId, mutable: bool, suggest_addr_of: bool) -> (bool, Option<Span>) {
+fn interior_mutability(b: &BodyCx<'_, '_, '_>, def: StaticId, mutable: bool, suggest_addr_of: bool) -> (bool, Option<Span>) {
     let ty = b.db().type_for_static(def).skip_binder();
     if Solver::of(b).is_freeze(ty) {
         return (!suggest_addr_of, None);
@@ -201,7 +201,7 @@ fn interior_mutability(b: &BodyCx<'_, '_>, def: StaticId, mutable: bool, suggest
 
 /// rustc's `static_mutability_span`: the `mut ` (and one space or tab after it) between the
 /// visibility and the name of the crate's own `static mut`, when it is written in a file.
-fn mutability_span(b: &BodyCx<'_, '_>, def: StaticId) -> Option<Span> {
+fn mutability_span(b: &BodyCx<'_, '_, '_>, def: StaticId) -> Option<Span> {
     let db = b.db();
     if hir::Crate::from(def.krate(db)) != b.cx.krate {
         return None;

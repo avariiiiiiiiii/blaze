@@ -12,7 +12,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use blaze_api::{
-    Applicability, Artifact, BuildScriptRanRef, CrateType, DiagnosticRef, Level, SpanRef, UnitOfRef, UnitTarget,
+    Applicability, Artifact, BuildScriptRanRef, CrateType, DiagnosticRef, SpanRef, UnitOfRef, UnitTarget,
     UnitTargetRef,
 };
 use rustc_hash::FxBuildHasher;
@@ -320,16 +320,6 @@ enum Order {
     Sorted,
 }
 
-fn level(level: Level) -> &'static str {
-    match level {
-        Level::Error => "error",
-        Level::Warning => "warning",
-        Level::Note => "note",
-        Level::Help => "help",
-        Level::FailureNote => "failure-note",
-    }
-}
-
 /// rustc's `DiagnosticCode`: the code and its long explanation (`Diagnostic::explanation`, rustc's
 /// markdown), `null` without one.
 fn code(out: &mut String, diagnostic: DiagnosticRef<'_>) {
@@ -378,7 +368,7 @@ fn diagnostic_json(out: &mut String, diagnostic: DiagnosticRef<'_>, outermost: b
             out.push_str(r#","code":"#);
             code(out, diagnostic);
             out.push_str(r#","level":""#);
-            out.push_str(level(diagnostic.level));
+            out.push_str(diagnostic.level.name());
             out.push_str(r#"","spans":"#);
             spans(out, sources);
             out.push_str(r#","children":"#);
@@ -396,7 +386,7 @@ fn diagnostic_json(out: &mut String, diagnostic: DiagnosticRef<'_>, outermost: b
             out.push_str(r#","$message_type":"diagnostic","children":"#);
             children(out, sources);
             out.push_str(r#","level":""#);
-            out.push_str(level(diagnostic.level));
+            out.push_str(diagnostic.level.name());
             out.push_str(r#"","message":"#);
             quote(out, diagnostic.message);
             out.push_str(r#","spans":"#);
@@ -411,7 +401,7 @@ fn diagnostic_json(out: &mut String, diagnostic: DiagnosticRef<'_>, outermost: b
             out.push_str(r#","code":"#);
             code(out, diagnostic);
             out.push_str(r#","level":""#);
-            out.push_str(level(diagnostic.level));
+            out.push_str(diagnostic.level.name());
             out.push_str(r#"","message":"#);
             quote(out, diagnostic.message);
             out.push_str(r#","rendered":null,"spans":"#);

@@ -8,12 +8,12 @@ use base_db::Db;
 use either::Either;
 use hir_expand::HirFileId;
 use span::AstIdNode;
-use syntax::{AstPtr, ast};
+use syntax::{AstPtr, ast, view};
 
 use hir_def::{
     AdtId, AssocItemId, AstIdLoc, AttrDefId, DefWithBodyId, EnumId, FieldId, GenericDefId, ImplId,
-    LifetimeParamId, Lookup, MacroId, ModuleDefId, ModuleId, TraitId, TypeOrConstParamId,
-    VariantId,
+    LifetimeParamId, LocalFieldId, Lookup, MacroId, ModuleDefId, ModuleId, TraitId,
+    TypeOrConstParamId, VariantId,
     attrs::{AttrFlags, Docs},
     dyn_map::{
         DynMap,
@@ -23,7 +23,7 @@ use hir_def::{
     hir::generics::GenericParams,
     item_scope::ItemScope,
     signatures::{EnumSignature, ImplSignature, TraitSignature},
-    src::{HasChildSource, HasSource},
+    src::{HasSource, enabled_fields_view},
 };
 
 pub(crate) trait ChildBySource {
@@ -148,13 +148,13 @@ impl ChildBySource for ItemScope {
         });
         self.derive_macro_invocs().filter(|(id, _)| id.file_id == file_id).for_each(
             |(ast_id, calls)| {
-                let adt = ast_id.to_node(db);
+                let adt = view::AnyHasAttrs::new(ast_id.to_view(db));
                 calls.for_each(|(attr_id, call_id, calls)| {
                     // FIXME: Is this the right crate?
                     let krate = call_id.lookup(db).krate;
-                    let (_, attr) = attr_id.find_attr_range_with_source(db, krate, &adt);
+                    let (_, meta) = attr_id.find_attr_range_with_source_view(db, krate, adt);
                     res[keys::DERIVE_MACRO_CALL]
-                        .insert(AstPtr::new(&attr), (attr_id, call_id, calls.into()));
+                        .insert(AstPtr::<ast::Meta>::of(meta), (attr_id, call_id, calls.into()));
                 });
             },
         );
@@ -204,14 +204,17 @@ impl ChildBySource for ItemScope {
 
 impl ChildBySource for VariantId {
     fn child_by_source_to(&self, db: &Db, res: &mut DynMap, file_id: HirFileId) {
-        let arena_map = self.child_source(db);
-        let arena_map = arena_map.as_ref();
         let parent = *self;
-        for (local_id, source) in arena_map.value.iter() {
+        for (idx, source) in enabled_fields_view(db, parent).value.enumerate() {
+            let local_id = LocalFieldId::from_raw(la_arena::RawIdx::from(idx as u32));
             let id = FieldId { parent, local_id };
             match source {
-                Either::Left(source) => res[keys::TUPLE_FIELD].insert(AstPtr::new(source), id),
-                Either::Right(source) => res[keys::RECORD_FIELD].insert(AstPtr::new(source), id),
+                Either::Left(source) => {
+                    res[keys::TUPLE_FIELD].insert(AstPtr::<ast::TupleField>::of(source), id)
+                }
+                Either::Right(source) => {
+                    res[keys::RECORD_FIELD].insert(AstPtr::<ast::RecordField>::of(source), id)
+                }
             }
         }
         let (_, sm) = self.fields_with_source_map(db);
@@ -269,7 +272,7 @@ impl ChildBySource for DefWithBodyId {
 
 impl ChildBySource for GenericDefId {
     fn child_by_source_to(&self, db: &Db, res: &mut DynMap, file_id: HirFileId) {
-        let (gfile_id, generic_params_list) = self.file_id_and_params_of(db);
+        let (gfile_id, generic_params_list) = self.file_id_and_params_of_view(db);
         if gfile_id != file_id {
             return;
         }
@@ -289,17 +292,17 @@ impl ChildBySource for GenericDefId {
             {
                 let id = TypeOrConstParamId { parent: *self, local_id };
                 match ast_param {
-                    ast::TypeOrConstParam::Type(a) => {
-                        res[keys::TYPE_PARAM].insert(AstPtr::new(&a), id)
+                    view::TypeOrConstParam::Type(a) => {
+                        res[keys::TYPE_PARAM].insert(AstPtr::<ast::TypeParam>::of(a), id)
                     }
-                    ast::TypeOrConstParam::Const(a) => {
-                        res[keys::CONST_PARAM].insert(AstPtr::new(&a), id)
+                    view::TypeOrConstParam::Const(a) => {
+                        res[keys::CONST_PARAM].insert(AstPtr::<ast::ConstParam>::of(a), id)
                     }
                 }
             }
             for (local_id, ast_param) in lts_idx_iter.zip(generic_params_list.lifetime_params()) {
                 let id = LifetimeParamId { parent: *self, local_id };
-                res[keys::LIFETIME_PARAM].insert(AstPtr::new(&ast_param), id);
+                res[keys::LIFETIME_PARAM].insert(AstPtr::<ast::LifetimeParam>::of(ast_param), id);
             }
         }
 

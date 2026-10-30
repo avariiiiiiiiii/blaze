@@ -14,8 +14,12 @@ use std::{
 use blaze_alloc_count::measure;
 
 use crate::{
-    AppendVec, Arena, Block, Built, Column, Frame, Handle, MemError, Pool, Region, RegionVec,
-    Revisions, Slab, Tag, chunks, frame, pool, revision::PublishError, scratch, tag,
+    AppendVec, Arena, Block, Built, Column, Frame, HUGE_PAGE, Handle, MemError, Pool, Region,
+    RegionVec, Revisions, Slab, Tag, chunks, frame,
+    huge::{self, Pages},
+    pool,
+    revision::PublishError,
+    scratch, tag,
 };
 
 /// xorshift64*: the tests' operations, the same on every run. Not `blaze_ids::rng`, since
@@ -114,6 +118,240 @@ fn regions_grow_from_many_threads_at_once() {
         thread.join().expect("grower");
     }
     assert!(region.committed() >= 8 * 64 * (256 << 10));
+}
+
+// Huge pages
+
+/// Writes byte `i % 251` at each offset `i` of `[from, to)` of `region`.
+fn fill(region: &Region, from: usize, to: usize) {
+    for i in from..to {
+        // SAFETY: the callers commit `[0, to)` first, and this test owns the region.
+        unsafe { region.at(i).as_ptr().write((i % 251) as u8) };
+    }
+}
+
+/// Whether every byte of `[from, to)` is what [`fill`] wrote.
+fn filled(region: &Region, from: usize, to: usize) -> bool {
+    // SAFETY: as for `fill`, and each byte was written there.
+    (from..to).all(|i| unsafe { region.at(i).as_ptr().read() } == (i % 251) as u8)
+}
+
+#[test]
+fn a_small_huge_region_commits_base_pages() {
+    let region = Region::reserve_pages(64 << 20, Pages::Transparent, Tag::Other).expect("reserve");
+    assert_eq!(region.base().as_ptr().addr() % HUGE_PAGE, 0, "a huge region starts on a huge page");
+    assert_eq!(region.reserved() % HUGE_PAGE, 0, "and ends on one");
+    region.ensure(100).expect("commit");
+    assert!(
+        region.committed() >= 100 && region.committed() < HUGE_PAGE,
+        "a small huge region is a few base pages, not a huge page: {}",
+        region.committed()
+    );
+}
+
+#[test]
+fn a_huge_region_past_one_huge_page_commits_whole_ones_and_keeps_its_bytes() {
+    for pages in [Pages::Base, Pages::Transparent] {
+        let mut region = Region::reserve_pages(64 << 20, pages, Tag::Other).expect("reserve");
+        region.ensure(100 << 10).expect("commit");
+        fill(&region, 0, 100 << 10);
+        for len in [HUGE_PAGE + 1, 5 << 20, 33 << 20] {
+            region.ensure(len).expect("commit more");
+            assert!(region.committed() >= len);
+            if pages.is_huge() {
+                assert_eq!(region.committed() % HUGE_PAGE, 0, "{pages:?}: {}", region.committed());
+            }
+        }
+        assert!(filled(&region, 0, 100 << 10), "{pages:?}: crossing a huge page kept the bytes");
+        fill(&region, 0, 33 << 20);
+        region.decommit_after(HUGE_PAGE + 1).expect("decommit");
+        if pages.is_huge() {
+            assert_eq!(region.committed(), 2 * HUGE_PAGE, "a decommit keeps whole huge pages");
+        }
+        assert!(filled(&region, 0, HUGE_PAGE + 1), "{pages:?}: the kept bytes stay");
+        region.decommit_after(1).expect("decommit to the first pages");
+        assert!(region.committed() < HUGE_PAGE);
+        region.ensure(3 << 20).expect("commit again");
+        // SAFETY: committed again just now; decommitted pages come back zeroed.
+        assert_eq!(unsafe { region.at((3 << 20) - 1).as_ptr().read() }, 0);
+    }
+}
+
+#[test]
+fn huge_regions_grow_from_many_threads_at_once() {
+    let region = Arc::new(Region::reserve_pages(256 << 20, Pages::Transparent, Tag::Other).expect("reserve"));
+    let threads: Vec<_> = (0..8)
+        .map(|t| {
+            let region = Arc::clone(&region);
+            thread::spawn(move || {
+                for step in 0..64 {
+                    let len = (t * 64 + step + 1) * (64 << 10);
+                    region.ensure(len).expect("commit");
+                    // SAFETY: the byte is committed; every thread writes 1 to it.
+                    unsafe { region.at(len - 1).as_ptr().write(1) };
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("grower");
+    }
+    assert!(region.committed() >= 8 * 64 * (64 << 10));
+    assert_eq!(region.committed() % HUGE_PAGE, 0);
+}
+
+#[test]
+fn a_huge_region_hit_allocates_nothing() {
+    let region = Region::reserve_pages(64 << 20, Pages::Transparent, Tag::Other).expect("reserve");
+    region.ensure(9 << 20).expect("commit");
+    let (_, used) = measure(|| {
+        for len in (1..=9 << 20).step_by(4093) {
+            region.ensure(len).expect("committed already");
+        }
+    });
+    assert_eq!(used.allocations, 0);
+}
+
+#[test]
+fn the_huge_pages_setting_is_read_or_named_in_its_error() {
+    use std::ffi::OsStr;
+    assert_eq!(huge::choose(Some(OsStr::new("off"))).expect("off"), Pages::Base);
+    let error = huge::choose(Some(OsStr::new("always"))).expect_err("not a setting");
+    assert!(error.to_string().contains("BLAZE_HUGE_PAGES=\"always\""), "{error}");
+    let default = huge::choose(None).expect("the default");
+    let offered = if crate::os::transparent_offered() { Pages::Transparent } else { Pages::Base };
+    assert_eq!(default, offered, "the default is what the system offers with no setup");
+    assert_eq!(huge::choose(Some(OsStr::new("transparent"))).expect("transparent"), default);
+}
+
+/// A number from a sysfs file, or 0 when it has none.
+#[cfg(target_os = "linux")]
+fn sysfs_number(path: &str) -> u64 {
+    std::fs::read_to_string(path).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0)
+}
+
+/// The `AnonHugePages` of the mapping holding `addr`, in KiB, from `/proc/self/smaps`.
+#[cfg(target_os = "linux")]
+fn anon_huge_kib(addr: usize) -> u64 {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps");
+    let mut inside = false;
+    for line in smaps.lines() {
+        let range = line.split_whitespace().next().and_then(|range| range.split_once('-'));
+        if let Some((start, end)) = range
+            && let (Ok(start), Ok(end)) = (usize::from_str_radix(start, 16), usize::from_str_radix(end, 16))
+        {
+            inside = (start..end).contains(&addr);
+        } else if inside && let Some(kib) = line.strip_prefix("AnonHugePages:") {
+            return kib.trim().trim_end_matches("kB").trim().parse().expect("a size in kB");
+        }
+    }
+    0
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_transparent_region_is_made_of_huge_pages_on_linux() {
+    if !crate::os::transparent_offered() {
+        assert_eq!(huge::choose(None).expect("the default"), Pages::Base, "no THP, base pages");
+        return;
+    }
+    let region = Region::reserve_pages(64 << 20, Pages::Transparent, Tag::Other).expect("reserve");
+    region.ensure(16 << 20).expect("commit");
+    // SAFETY: `[0, 16 MiB)` is committed and this test owns it.
+    unsafe { region.base().as_ptr().write_bytes(1, 16 << 20) };
+    let kib = anon_huge_kib(region.base().as_ptr().addr());
+    assert!(
+        kib >= 2 << 10,
+        "16 MiB of a transparent region touched, {kib} KiB on huge pages: the kernel made none \
+         (fragmented memory, or `defrag` set to `never`)"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reserved_region_takes_pool_pages_or_names_the_pool() {
+    let pool = "/sys/kernel/mm/hugepages/hugepages-2048kB";
+    let total = sysfs_number(&format!("{pool}/nr_hugepages"));
+    let free = sysfs_number(&format!("{pool}/free_hugepages"));
+    let mut region = match Region::reserve_pages(64 << 20, Pages::Reserved, Tag::Other) {
+        Ok(region) => region,
+        Err(error) => {
+            assert_eq!(total, 0, "a pool of {total} pages is there: {error}");
+            assert!(error.to_string().contains("nr_hugepages"), "the error names the pool: {error}");
+            return;
+        }
+    };
+    region.ensure(100 << 10).expect("the first pages are base pages, outside the pool");
+    fill(&region, 0, 100 << 10);
+    if free < 2 {
+        let error = region.ensure(3 * HUGE_PAGE).expect_err("the pool has too few free pages");
+        assert!(error.to_string().contains("MAP_HUGETLB"), "the error names the pool: {error}");
+        assert!(region.committed() < HUGE_PAGE, "a refused commit commits nothing");
+        assert!(filled(&region, 0, 100 << 10));
+        return;
+    }
+    region.ensure(3 * HUGE_PAGE).expect("two pages from the pool");
+    assert_eq!(region.committed(), 3 * HUGE_PAGE);
+    assert!(filled(&region, 0, 100 << 10), "the first pages kept their bytes");
+    fill(&region, 0, 3 * HUGE_PAGE);
+    assert!(filled(&region, 0, 3 * HUGE_PAGE));
+    region.decommit_after(HUGE_PAGE + 1).expect("give a pool page back");
+    assert_eq!(region.committed(), 2 * HUGE_PAGE);
+    region.ensure(3 * HUGE_PAGE).expect("take it again");
+    assert!(filled(&region, 0, 2 * HUGE_PAGE), "the kept pages kept their bytes");
+    // SAFETY: committed again just now.
+    assert_eq!(unsafe { region.at(2 * HUGE_PAGE + 5).as_ptr().read() }, 0, "a page made again is zeroed");
+    // SAFETY: nothing reads the purged range before writing it; pool pages are kept.
+    unsafe { region.purge(0, 3 * HUGE_PAGE) };
+    assert!(filled(&region, HUGE_PAGE, 2 * HUGE_PAGE), "a purge keeps the pool's pages");
+    region.decommit_after(0).expect("give everything back");
+    assert_eq!(region.committed(), 0);
+    let region = Arc::new(region);
+    let threads: Vec<_> = (0..4)
+        .map(|t| {
+            let region = Arc::clone(&region);
+            thread::spawn(move || {
+                for step in 0..8 {
+                    // Up to 32 × 192 KiB, three huge pages.
+                    let len = (t * 8 + step + 1) * (192 << 10);
+                    region.ensure(len).expect("commit");
+                    // SAFETY: committed; every thread writes 1 to it.
+                    unsafe { region.at(len - 1).as_ptr().write(1) };
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("grower");
+    }
+    // SAFETY: committed by the growers, who wrote it.
+    assert_eq!(unsafe { region.at(3 * HUGE_PAGE - 1).as_ptr().read() }, 1, "no grower mapped over another's");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn apple_silicon_has_no_superpages_for_anonymous_memory() {
+    // SAFETY: a fresh anonymous mapping at an address the kernel picks, unmapped below if made.
+    let at = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            HUGE_PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            libc::VM_FLAGS_SUPERPAGE_SIZE_2MB,
+            0,
+        )
+    };
+    if at != libc::MAP_FAILED {
+        // SAFETY: the mapping just made, which nothing else knows of.
+        unsafe { libc::munmap(at, HUGE_PAGE) };
+    }
+    assert_eq!(
+        at,
+        libc::MAP_FAILED,
+        "macOS made a 2 MiB superpage on arm64: blaze-mem's huge regions should use it (huge.rs)"
+    );
+    assert_eq!(huge::choose(None).expect("the default"), Pages::Base);
 }
 
 // RegionVec
@@ -298,6 +536,54 @@ fn column_get_mut_changes_a_published_value() {
     assert!(column.get_mut(index + 1).is_none());
 }
 
+/// Pushes, claims and fills in a seeded order against a `Vec<Option<_>>`: a ready byte per
+/// value makes exactly the filled indices readable, holes and indices past the end not, and
+/// pushing allocates nothing from the global allocator.
+#[test]
+fn column_matches_a_model_of_options() {
+    let column = Column::<u64>::new(1 << 14, Tag::Other).expect("reserve");
+    let mut model: Vec<Option<u64>> = Vec::with_capacity(1 << 14);
+    let mut blocks: Vec<Block> = Vec::with_capacity(64);
+    let mut rng = Xorshift64Star::new(31);
+    let ((), used) = measure(|| {
+        for _ in 0..4_000 {
+            let value = rng.next();
+            match rng.below(3) {
+                0 => {
+                    let index = column.push(value).expect("room");
+                    assert_eq!(index as usize, model.len());
+                    model.push(Some(value));
+                }
+                1 if blocks.len() < blocks.capacity() => {
+                    let count = 1 + rng.below(9) as u32;
+                    let block = column.claim(count).expect("room");
+                    model.extend((0..count).map(|_| None));
+                    blocks.push(block);
+                }
+                _ => {
+                    if let Some(block) = blocks.iter_mut().find(|block| !block.is_spent()) {
+                        let index = column.fill(block, value).expect("room");
+                        model[index as usize] = Some(value);
+                    }
+                }
+            }
+        }
+    });
+    assert_eq!(used.allocations, 0, "pushes, claims and fills allocate nothing");
+    assert_eq!(column.len(), model.len());
+    for (index, want) in model.iter().enumerate() {
+        assert_eq!(column.get(index as u32), want.as_ref(), "index {index}");
+    }
+    assert_eq!(column.get(model.len() as u32), None);
+    let published: Vec<(u32, u64)> = column.iter().map(|(index, &value)| (index, value)).collect();
+    let expected: Vec<(u32, u64)> = model
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| Some((index as u32, (*value)?)))
+        .collect();
+    assert_eq!(published, expected, "iteration is index order over the published values");
+}
+
 #[test]
 fn column_reads_allocate_nothing() {
     let column = Column::<u64>::new(1 << 16, Tag::Intern).expect("reserve");
@@ -387,6 +673,82 @@ fn append_vec_appends_and_reads_allocate_nothing() {
     assert_eq!(used.allocations, 0);
 }
 
+/// A writer's appends, slices and fills against a `Vec` on seeded operations: the same values
+/// at the same indices, each bulk append's first index the length before it, and growth never
+/// moving an element. Refused ones publish nothing.
+#[test]
+fn append_vec_writer_and_bulk_appends_match_vec() {
+    let mut rng = Xorshift64Star::new(23);
+    let column = AppendVec::<u32>::new(1 << 18, Tag::Vfs).expect("reserve");
+    let mut model: Vec<u32> = Vec::new();
+    let mut scratch: Vec<u32> = Vec::new();
+    let mut first = None;
+    for _ in 0..1_000 {
+        let mut writer = column.writer();
+        for _ in 0..rng.below(8) {
+            match rng.below(3) {
+                0 => {
+                    let value = rng.next() as u32;
+                    assert_eq!(writer.append(value) as usize, model.len());
+                    model.push(value);
+                }
+                1 => {
+                    scratch.clear();
+                    scratch.extend((0..rng.below(100)).map(|_| rng.next() as u32));
+                    assert_eq!(writer.extend_from_slice(&scratch) as usize, model.len());
+                    model.extend_from_slice(&scratch);
+                }
+                _ => {
+                    let count = rng.below(100) as usize;
+                    let base = rng.next() as u32;
+                    let at = writer.extend_with(count, |i| base ^ i as u32);
+                    assert_eq!(at as usize, model.len());
+                    model.extend((0..count).map(|i| base ^ i as u32));
+                }
+            }
+        }
+        drop(writer);
+        assert_eq!(column.extend_from_slice(&[7, 8]) as usize, model.len());
+        model.extend_from_slice(&[7, 8]);
+        first.get_or_insert(column.as_slice().as_ptr());
+    }
+    assert_eq!(column.as_slice(), model.as_slice());
+    assert_eq!(Some(column.as_slice().as_ptr()), first, "growth never moves an element");
+    let left = column.max_len() - model.len();
+    let mut writer = column.writer();
+    let refused = writer.try_extend_with(left + 1, |i| i as u32);
+    assert!(matches!(refused, Err(MemError::Exhausted { tag: Tag::Vfs, .. })));
+    assert!(writer.try_extend_from_slice(&vec![0; left + 1]).is_err());
+    drop(writer);
+    assert_eq!(column.len() as usize, model.len(), "a refused append publishes nothing");
+}
+
+#[test]
+#[should_panic(expected = "appends must be serialized")]
+fn append_vec_second_writer_at_once_stops() {
+    let column = AppendVec::<u64>::new(16, Tag::Vfs).expect("reserve");
+    let _writer = column.writer();
+    column.append(1);
+}
+
+#[test]
+fn append_vec_writer_appends_allocate_nothing() {
+    let column = AppendVec::<u64>::new(1 << 22, Tag::Vfs).expect("reserve");
+    let bytes = [3u64; 1000];
+    let (_, used) = measure(|| {
+        let mut writer = column.writer();
+        for i in 0..1_000_000 {
+            writer.append(i);
+        }
+        for _ in 0..1000 {
+            writer.extend_from_slice(&bytes);
+        }
+        writer.extend_with(1000, |i| i as u64);
+    });
+    assert_eq!(used.allocations, 0);
+    assert_eq!(column.len(), 2_001_000);
+}
+
 // Frame
 
 #[test]
@@ -414,6 +776,33 @@ fn frame_vec_matches_vec_and_grows_in_place() {
     }
     assert_eq!(vec.as_slice(), model.as_slice());
     assert_eq!(vec.as_ptr(), first, "the frame's top allocation grows in place");
+}
+
+#[test]
+fn frame_collect_is_the_copies_it_replaced() {
+    /// blaze-link's `arena::collect_in` and hir-ty-wfcheck's `mem::collect`.
+    fn kept<'f, T>(frame: &'f Frame, items: impl IntoIterator<Item = T>) -> Vec<T, &'f Frame> {
+        let items = items.into_iter();
+        let mut out = Vec::with_capacity_in(items.size_hint().0, frame);
+        out.extend(items);
+        out
+    }
+    let mut rng = Xorshift64Star::new(5);
+    let frame = Frame::new(Tag::Infer).expect("reserve");
+    for len in [0, 1, 7, 64, 1000] {
+        let values: Vec<u64> = (0..len).map(|_| rng.next()).collect();
+        let exact = frame::collect(&frame, values.iter().copied());
+        let reference = kept(&frame, values.iter().copied());
+        assert_eq!(exact.as_slice(), values.as_slice());
+        assert_eq!((exact.as_slice(), exact.capacity()), (reference.as_slice(), reference.capacity()));
+        let filtered = frame::collect(&frame, values.iter().copied().filter(|it| it % 3 == 0));
+        let reference = kept(&frame, values.iter().copied().filter(|it| it % 3 == 0));
+        assert_eq!((filtered.as_slice(), filtered.capacity()), (reference.as_slice(), reference.capacity()));
+    }
+    let warm = Frame::new(Tag::Infer).expect("reserve");
+    drop(frame::collect(&warm, 0..16u32));
+    let (_, used) = measure(|| drop(frame::collect(&warm, 0..16u32)));
+    assert_eq!(used.allocations, 0, "a frame vector calls no global allocator");
 }
 
 #[test]
@@ -785,6 +1174,81 @@ fn frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks() {
     }
 }
 
+/// The peak an allocation no longer writes is folded in where the cursor moves back: after
+/// every operation it equals what writing it on every allocation gave, the most `used()` was
+/// since the last reset.
+#[test]
+fn frame_peak_folded_lazily_is_the_most_used_after_every_operation() {
+    use std::{alloc::Allocator, ptr::NonNull};
+
+    let mut rng = Xorshift64Star::new(41);
+    let mut frame = Frame::with_reserve(1 << 30, Tag::Mir).expect("reserve");
+    let mut live: Vec<(NonNull<u8>, Layout)> = Vec::new();
+    let mut marks: Vec<(crate::Marker, usize)> = Vec::new();
+    let mut model = 0usize;
+    for _ in 0..20_000u64 {
+        match rng.below(16) {
+            0..=6 => {
+                let size = match rng.below(256) {
+                    0 => (600 << 10) + rng.below(2 << 20) as usize,
+                    _ => rng.below(3000) as usize,
+                };
+                let layout = Layout::from_size_align(size, 1 << rng.below(7)).expect("layout");
+                live.push((frame.allocate(layout).expect("within the reserve").cast(), layout));
+            }
+            7..=9 if !live.is_empty() => {
+                let n = live.len();
+                marks.retain(|&(_, count)| count < n);
+                let (ptr, old) = live.pop().expect("not empty");
+                let size = match rng.below(2) {
+                    0 => old.size() + rng.below(5000) as usize,
+                    _ => rng.below(old.size() as u64 + 1) as usize,
+                };
+                let new = Layout::from_size_align(size, old.align()).expect("layout");
+                let moved = match size >= old.size() {
+                    // SAFETY: `ptr` is a live allocation of the frame with layout `old`.
+                    true => unsafe { frame.grow(ptr, old, new) },
+                    // SAFETY: as above.
+                    false => unsafe { frame.shrink(ptr, old, new) },
+                };
+                live.push((moved.expect("within the reserve").cast(), new));
+            }
+            10..=11 if !live.is_empty() => {
+                let n = live.len();
+                marks.retain(|&(_, count)| count < n);
+                let (ptr, layout) = live.pop().expect("not empty");
+                // SAFETY: a live allocation of the frame, given back once.
+                unsafe { frame.deallocate(ptr, layout) };
+            }
+            12 => marks.push((frame.mark(), live.len())),
+            13 if !marks.is_empty() => {
+                let at = rng.below(marks.len() as u64) as usize;
+                let (marker, count) = marks[at];
+                marks.truncate(at + 1);
+                frame.reset_to(marker);
+                live.truncate(count);
+            }
+            14 => {
+                let mut inner = 0;
+                frame.scope(|frame| {
+                    frame.alloc_slice_fill_with(rng.below(4000) as usize, |i| i as u8);
+                    inner = frame.used();
+                });
+                model = model.max(inner);
+            }
+            15 if rng.below(32) == 0 => {
+                frame.reset();
+                live.clear();
+                marks.clear();
+                model = 0;
+            }
+            _ => {}
+        }
+        model = model.max(frame.used());
+        assert_eq!(frame.peak(), model);
+    }
+}
+
 #[test]
 fn frame_measure_counts_inner_tasks_on_top_of_outer_and_allocates_nothing() {
     let run = || {
@@ -997,6 +1461,42 @@ fn arena_gives_chunks_back_and_takes_them_again_warm() {
     assert!(values.iter().enumerate().all(|(i, &&v)| v == i as u64));
     assert_eq!(second.held(), held, "the same work holds the same chunks");
     assert!(chunks::carved_bytes() >= held);
+}
+
+/// A reset gives back more chunks than one `give_all` run moves: every one leaves the arena's
+/// tag, none is lost or given twice (a second arena takes them all again, each once), and the
+/// warm request allocates nothing from the global allocator.
+#[test]
+fn arena_reset_gives_back_every_chunk_in_runs() {
+    const HELD: usize = 2 * chunks::GIVE_RUN + 7;
+    let whole = Layout::from_size_align(chunks::CHUNK, 8).expect("layout");
+    let request = |arena: &Arena| {
+        let local = arena.local();
+        let mut starts = [0usize; HELD];
+        for start in &mut starts {
+            *start = local.alloc_layout(whole).as_ptr() as usize;
+        }
+        starts
+    };
+    let before = tag::snapshot().get(Tag::Diagnostics).live;
+    let mut arena = Arena::new(Tag::Diagnostics);
+    let mut first = request(&arena);
+    assert_eq!(arena.held(), HELD * chunks::CHUNK, "each whole-chunk allocation holds a chunk");
+    assert_eq!(tag::snapshot().get(Tag::Diagnostics).live, before + (HELD * chunks::CHUNK) as u64);
+    arena.reset();
+    assert_eq!(arena.held(), 0);
+    assert_eq!(tag::snapshot().get(Tag::Diagnostics).live, before, "every chunk left the tag");
+    let (_, used) = measure(|| {
+        let mut second = request(&arena);
+        first.sort_unstable();
+        second.sort_unstable();
+        assert!(second.windows(2).all(|pair| pair[0] != pair[1]), "no chunk handed out twice");
+        arena.reset();
+    });
+    assert_eq!(used.allocations, 0, "a warm request of whole chunks allocates nothing");
+    assert_eq!(arena.held(), 0);
+    assert_eq!(tag::snapshot().get(Tag::Diagnostics).live, before);
+    assert!(first.windows(2).all(|pair| pair[0] != pair[1]));
 }
 
 #[test]
@@ -1263,6 +1763,100 @@ fn pool_caches_on_many_threads_share_slots_in_batches() {
         }
     });
     assert!(pool.carved() <= 8 * (1000 + 2 * 128) + 64 * 8, "slots are reused across threads");
+}
+
+/// One cache only allocates and another only frees, on two threads: every batch crosses
+/// between them through the full stack, and the descriptors come back through the empty one
+/// four at a time. Every value arrives once, and the descriptors made stay those in flight.
+#[test]
+fn pool_a_producer_and_a_consumer_move_batches_and_reuse_descriptors() {
+    const ROUNDS: u64 = 400;
+    const EACH: u64 = 1000;
+    let pool = Pool::<u64>::new(1 << 20, Tag::Io).expect("reserve");
+    let (send, take) = std::sync::mpsc::sync_channel::<Vec<pool::Pooled<'_, u64>>>(4);
+    thread::scope(|scope| {
+        let pool = &pool;
+        scope.spawn(move || {
+            let mut cache = pool.cache();
+            for round in 0..ROUNDS {
+                let held: Vec<_> = (0..EACH).map(|i| cache.alloc(round * EACH + i)).collect();
+                send.send(held).expect("the consumer is there");
+            }
+        });
+        scope.spawn(move || {
+            let mut cache = pool.cache();
+            let mut next = 0;
+            for held in take.iter() {
+                for pooled in held {
+                    assert_eq!(*pooled, next, "every value arrives once, in order");
+                    next += 1;
+                    cache.recycle(pooled);
+                }
+            }
+            assert_eq!(next, ROUNDS * EACH);
+        });
+    });
+    // Every free slot in a full batch at once (at most the slots carved over 64), plus two
+    // stashes and the descriptors in a cache's hand.
+    let in_flight = (7 * EACH as u32 + 4 * 128) / pool::BATCH as u32 + 2 * 8 + 4;
+    assert!(pool.descriptors_made() <= in_flight, "{} descriptors made", pool.descriptors_made());
+    assert!(pool.carved() as u64 <= 7 * EACH + 4 * 128, "slots are reused across threads");
+}
+
+/// The chain push and the pop of some against a `Vec` as the stack, on seeded operations.
+#[test]
+fn stack_chain_pushes_and_pops_of_some_match_a_vec() {
+    use crate::{
+        stack::{Links, NONE, Stack},
+        sync::atomic::AtomicU32,
+    };
+
+    struct Table(Vec<AtomicU32>);
+    impl Links for Table {
+        fn link(&self, index: u32) -> &AtomicU32 {
+            &self.0[index as usize]
+        }
+    }
+
+    const ITEMS: u32 = 64;
+    let links = Table((0..ITEMS).map(|_| AtomicU32::new(NONE)).collect());
+    let stack = Stack::new();
+    let mut model: Vec<u32> = Vec::new();
+    let mut held: Vec<u32> = (0..ITEMS).collect();
+    let mut rng = Xorshift64Star::new(5);
+    for _ in 0..50_000 {
+        match rng.below(4) {
+            0 if !held.is_empty() => {
+                let item = held.swap_remove(rng.below(held.len() as u64) as usize);
+                stack.push(item, &links);
+                model.push(item);
+            }
+            1 if !held.is_empty() => {
+                let n = 1 + rng.below(held.len().min(9) as u64) as usize;
+                let chain: Vec<u32> = held.drain(held.len() - n..).collect();
+                stack.push_all(&chain, &links);
+                model.extend(chain.iter().rev());
+            }
+            2 => {
+                let got = stack.pop(&links);
+                assert_eq!(got, model.pop());
+                held.extend(got);
+            }
+            _ => {
+                let mut out = [NONE; 9];
+                let want = rng.below(10) as usize;
+                let n = stack.pop_some(&links, &mut out[..want]);
+                let expect: Vec<u32> = model.iter().rev().take(want).copied().collect();
+                assert_eq!(&out[..n], expect.as_slice());
+                model.truncate(model.len() - n);
+                held.extend_from_slice(&out[..n]);
+            }
+        }
+    }
+    let mut rest = [NONE; ITEMS as usize];
+    let n = stack.pop_some(&links, &mut rest);
+    assert_eq!(n, model.len());
+    assert!(stack.pop(&links).is_none());
 }
 
 #[test]

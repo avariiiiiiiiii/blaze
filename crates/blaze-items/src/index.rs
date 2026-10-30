@@ -14,9 +14,9 @@
 //!   [`inherent_modules_of`]) and one module's for one type ([`module_inherent_impls_of`]),
 //!   then every crate's for one self type ([`inherent_impls_of`]); a frozen crate's come from
 //!   its one frozen table ([`inherent_impls_in`]);
-//! - traits with an item of a name, for method candidates: one module's
-//!   ([`traits_in_module`]), one crate's ([`traits_in`]), then every crate's for one name
-//!   ([`traits_with`]);
+//! - traits with an item of a name, for method candidates: one crate's for one name, from
+//!   hir-ty's maintained candidate slice ([`traits_named`]), then every crate's
+//!   ([`traits_with`]); a frozen crate's per module ([`traits_in_module`], [`traits_in`]);
 //! - names: one scope's, all of them ([`scope_names`]), from which [`scope`] picks one.
 //!
 //! Impls are found as hir-ty's `TraitImpls` and `InherentImpls` find them, in every crate:
@@ -48,24 +48,25 @@ use hir_def::{
     signatures::VariantFields,
     visibility::Visibility,
 };
+use hir_expand::name::Name;
 use hir_ty::{
     db::HirDatabase,
-    method_resolution::{InherentImpls, TraitImpls, frozen},
+    method_resolution::{InherentImpls, TraitImpls, delta, frozen},
     next_solver::{DbInterner, SimplifiedType as HirSimplifiedType},
 };
 use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
 
 use crate::{
-    ImplIndexKey, InterfaceHash, ItemId, ItemKey, NAME_DOMAIN, NameHash, ScopeIndexKey,
+    ImplIndexKey, ItemId, ItemKey, NAME_DOMAIN, NameHash, ScopeIndexKey, SignatureHash,
     SimplifiedType,
     hash::{self, Unhashable},
     key::{self, KeyHashing, Resolved},
     table::column,
 };
 
-const IMPLS_DOMAIN: &str = "blaze v2 index impls 1";
+const IMPLS_DOMAIN: &str = "blaze v2 index impls 2";
 const SCOPE_DOMAIN: &str = "blaze v2 index scope 1";
-const BUILTIN_DERIVE_DOMAIN: &str = "blaze v2 builtin derive interface 1";
+const BUILTIN_DERIVE_DOMAIN: &str = "blaze v2 builtin derive signature 1";
 
 /// The hash of each of `names`, in order, as [`key::name_hash`] gives it, in one batched call.
 pub(crate) fn name_hashes<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<NameHash> {
@@ -79,7 +80,7 @@ pub(crate) fn name_hashes<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<N
 }
 
 /// The impls of `key.trait_` whose simplified self type is `key.self_ty`, by key and
-/// interface hash, sorted; empty is "no impl". Answers `Implements` both ways.
+/// signature hash, sorted; empty is "no impl". Answers `Implements` both ways.
 pub fn impls(db: &Db, key: ImplIndexKey) -> Result<ImplEntry, Unhashable> {
     match resolve_trait(db, key.trait_) {
         Some(trait_) => entry(db, impls_of(db, trait_, key.self_ty).iter()),
@@ -110,20 +111,22 @@ pub fn scope(db: &Db, key: ScopeIndexKey) -> Result<ScopeEntry, Unhashable> {
         Resolved::Item(_)
         | Resolved::Closure { .. }
         | Resolved::Opaque { .. }
-        | Resolved::BuiltinDerive(_) => {
+        | Resolved::BuiltinDerive(_)
+        | Resolved::Ctor(_)
+        | Resolved::AnonConst { .. } => {
             unreachable!("{key:?} names something that is not a scope")
         }
     };
     Ok(scope_names(db, owner, ()).get(key.name))
 }
 
-/// The impls an index holds for one question, by key with each one's interface hash.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// The impls an index holds for one question, by key with each one's signature hash.
+#[derive(PartialEq, Eq, Debug)]
 pub enum ImplEntry {
     /// The trait the question names no longer exists.
     TraitAbsent,
     /// Sorted by key; empty is "no impl".
-    Impls(Box<[(ItemKey, InterfaceHash)]>),
+    Impls(Box<[(ItemKey, SignatureHash)]>),
 }
 
 impl ImplEntry {
@@ -135,8 +138,8 @@ impl ImplEntry {
             }
             ImplEntry::Impls(impls) => {
                 hasher.part(b"impls").update(&(impls.len() as u64).to_le_bytes());
-                for (key, interface) in impls.iter() {
-                    hasher.id(&key.0).id(&interface.0);
+                for (key, signature) in impls.iter() {
+                    hasher.id(&key.0).id(&signature.0);
                 }
             }
         }
@@ -145,7 +148,7 @@ impl ImplEntry {
 }
 
 /// What a name is in a scope.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum ScopeEntry {
     /// The scope the question names no longer exists.
     ScopeAbsent,
@@ -287,24 +290,25 @@ pub(crate) enum AnyImpl {
 
 const _: () = assert!(size_of::<AnyImpl>() == 8);
 
-/// An impl's interface hash. A built-in derive impl has no item of its own: it is what the
-/// derive writes for its type, so it is its key (which names the trait) and the type's
-/// interface.
-pub(crate) fn impl_interface(
+/// An impl's signature hash: an impl fact's value is computed inside a body's inference, which
+/// an interface hash, holding what bodies leak, may reach. A built-in derive impl has no item
+/// of its own: it is what the derive writes for its type, so it is its key (which names the
+/// trait) and the type's signature.
+pub(crate) fn impl_signature(
     db: &Db,
     imp: AnyImpl,
-) -> Result<InterfaceHash, Unhashable> {
+) -> Result<SignatureHash, Unhashable> {
     match imp {
-        AnyImpl::Impl(it) => hash::interface_hash(db, ItemId::Impl(it)),
+        AnyImpl::Impl(it) => hash::signature_hash(db, ItemId::Impl(it)),
         AnyImpl::BuiltinDerive(it) => {
-            let adt = hash::interface_hash(db, ItemId::Adt(it.loc(db).adt))?;
+            let adt = hash::signature_hash(db, ItemId::Adt(it.loc(db).adt))?;
             let key = key::builtin_derive_key(db, it);
-            Ok(InterfaceHash(Hasher::new(BUILTIN_DERIVE_DOMAIN).id(&key.0).id(&adt.0).finish()))
+            Ok(SignatureHash(Hasher::new(BUILTIN_DERIVE_DOMAIN).id(&key.0).id(&adt.0).finish()))
         }
     }
 }
 
-/// `impls` with their interface hashes, in the order given.
+/// `impls` with their signature hashes, in the order given.
 pub(crate) fn entry<I>(db: &Db, impls: I) -> Result<ImplEntry, Unhashable>
 where
     I: IntoIterator<Item = (ItemKey, AnyImpl)>,
@@ -313,7 +317,7 @@ where
     let impls = impls.into_iter();
     let mut found = Vec::with_capacity(impls.len());
     for (key, imp) in impls {
-        found.push((key, impl_interface(db, imp)?));
+        found.push((key, impl_signature(db, imp)?));
     }
     Ok(ImplEntry::Impls(found.into_boxed_slice()))
 }
@@ -332,7 +336,7 @@ pub(crate) fn implements_value(
 
 /// The values of the impls of `trait_` for `self_ty` and of its blanket impls, hashed once
 /// for every fact that reads them.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn implements_entries(
     db: &Db,
     trait_: TraitId,
@@ -345,7 +349,7 @@ fn implements_entries(
 
 /// The value of every impl of `trait_`, in the order of [`trait_impls`]: what a blanket impl's
 /// coherence reads, hashed once per trait rather than once per blanket impl.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub(crate) fn all_impls_value(
     db: &Db,
     trait_: TraitId,
@@ -377,7 +381,7 @@ pub(crate) fn impl_self_ty(db: &Db, imp: ImplId) -> Option<SimplifiedType> {
 /// `starts[i]..starts[i + 1]` is the run of `searched[i]` in `keys` and `values`, and the
 /// rows before `starts[0]` have no searched value (a trait's blanket impls). `values` is
 /// read only after the search.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Runs<S, T> {
     searched: Box<[S]>,
     starts: Box<[u32]>,
@@ -460,7 +464,7 @@ impl<'a, T: Copy> Columns<'a, T> {
 }
 
 /// One question's rows, sorted by key, as two columns.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Keyed<T> {
     keys: Box<[ItemKey]>,
     values: Box<[T]>,
@@ -634,8 +638,9 @@ pub(crate) fn inherent_impls_of(
     })
 }
 
-/// The traits declared in `module`, by the hash of each name one of their items has, then
-/// key, each pair once: equal unless such a trait or the names of its items change.
+/// The traits declared in `module` of a frozen crate, by the hash of each name one of their
+/// items has, then key, each pair once: equal unless such a trait or the names of its items
+/// change. A maintained crate's are its candidate slices ([`traits_named`]).
 #[salsa::tracked(returns(deref))]
 fn traits_in_module(db: &Db, module: ModuleId) -> Box<[(NameHash, ItemKey, TraitId)]> {
     frame::task(Tag::Other, |frame| {
@@ -677,13 +682,54 @@ fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
     })
 }
 
+/// Every name a trait item of maintained `krate` has (hir-ty's candidate directory), by hash,
+/// then name: reruns only when the crate's traits gain a name never seen in it.
+#[salsa::tracked(returns(deref))]
+fn candidate_names(db: &Db, krate: Crate) -> Box<[(NameHash, Name)]> {
+    frame::task(Tag::Other, |frame| {
+        let mut names: Vec<Name, &Frame> = Vec::new_in(frame);
+        names.extend(delta::candidate_names(db, krate));
+        let hashes = name_hashes(names.iter().map(Name::as_str));
+        let mut rows: Vec<(NameHash, Name), &Frame> = Vec::with_capacity_in(names.len(), frame);
+        rows.extend(hashes.into_iter().zip(names.iter().copied()));
+        rows.sort_unstable();
+        column(rows.iter().copied())
+    })
+}
+
+/// The traits declared in maintained `krate`'s modules with an item whose name hashes to
+/// `name`, sorted by key: the candidate slice of that name alone, so a trait gaining an item of
+/// another name leaves this as it was.
+#[salsa::tracked(returns(ref))]
+fn traits_named(db: &Db, krate: Crate, name: NameHash) -> Keyed<TraitId> {
+    frame::task(Tag::Other, |frame| {
+        let names = candidate_names(db, krate);
+        let start = names.partition_point(|&(it, _)| it < name);
+        let mut rows: Vec<(ItemKey, TraitId), &Frame> = Vec::new_in(frame);
+        for &(_, named) in names[start..].iter().take_while(|&&(it, _)| it == name) {
+            rows.extend(
+                delta::candidate_traits(db, krate, named)
+                    .iter()
+                    .map(|&trait_| (key::item_key(db, ItemId::Trait(trait_)), trait_)),
+            );
+        }
+        rows.sort_unstable_by_key(|&(key, _)| key);
+        rows.dedup_by_key(|&mut (key, _)| key);
+        Keyed::of(rows.iter().copied())
+    })
+}
+
 /// The traits of every crate with an item whose name hashes to `name`, sorted by key.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn traits_with(db: &Db, name: NameHash, _: ()) -> Keyed<TraitId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
         for &krate in base_db::all_crates(db).iter() {
-            rows.extend(traits_in(db, krate).run(Some(name)).iter());
+            if frozen::served(db, krate) {
+                rows.extend(traits_in(db, krate).run(Some(name)).iter());
+            } else {
+                rows.extend(traits_named(db, krate, name).iter());
+            }
         }
         Keyed::sorted(&mut rows)
     })
@@ -701,7 +747,7 @@ pub(crate) enum ScopeOwner {
 
 /// One scope's names as columns: `names`, sorted, is all a lookup's binary search touches;
 /// what the name at a position is sits at that position in `entries`.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub(crate) struct ScopeNames {
     names: Box<[NameHash]>,
     entries: ScopeColumns,
@@ -709,7 +755,7 @@ pub(crate) struct ScopeNames {
 
 /// What each name of a scope is, one column per part (a scope's names are all of one kind).
 /// `starts[i]..starts[i + 1]` is name `i`'s run in the flat columns after it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 enum ScopeColumns {
     Module {
         types: Box<[Option<Binding>]>,

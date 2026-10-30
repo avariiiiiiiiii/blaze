@@ -54,15 +54,10 @@ pub struct Subject<'a> {
     pub reached: &'a [u32],
 }
 
-/// What set a pass is kept under.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Basis {
-    /// The functions the run executed, from its whole record.
-    Executed,
-    /// What codegen's walk says the test reaches, because the run's record was not whole,
-    /// and why.
-    Reached { why: String },
-}
+/// What set a pass is kept under: the functions the run executed, from its whole record, or
+/// what codegen's walk says the test reaches, because the run's record was not whole, and why.
+/// The agent API's type, so a cached result carries it as it is.
+pub use blaze_api::Basis;
 
 /// A test not run: its last pass stands.
 #[derive(Clone, PartialEq, Eq, Debug)]

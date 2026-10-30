@@ -48,8 +48,15 @@ const X86_STUB: [u8; 16] = [0x4c, 0x8b, 0x1d, 0, 0, 0, 0, 0x41, 0xff, 0xa3, 0, 0
 const X86_STUB_FIXUPS: [StubFixup; 1] = [StubFixup { at: 3, apply: Apply::Rel32, addend: -4 }];
 
 /// adrp x16, cell; ldr x16, [x16, :lo12:cell]; movz x17, #low; movk x17, #high, lsl #16;
-/// ldr x16, [x16, x17]; br x16.
+/// ldr x16, [x16, x17]; br x16: a slot from 2^21.
 const A64_STUB: [u32; 6] = [0x9000_0010, 0xf940_0210, 0xd280_0011, 0xf2a0_0011, 0xf871_6a10, 0xd61f_0200];
+/// `ldr x16, [x16, #imm12 * 8]`, the slot's entry loaded at an unsigned scaled offset.
+const A64_LDR_X16: u32 = 0xf940_0210;
+/// `add x16, x16, #imm12, lsl #12`.
+const A64_ADD_X16_LSL12: u32 = 0x9140_0210;
+const A64_BR_X16: u32 = 0xd61f_0200;
+/// `brk #0`: the stub's words past its `br`, never run.
+const A64_BRK: u32 = 0xd420_0000;
 const A64_PAGE_FIXUPS: [StubFixup; 2] = [
     StubFixup { at: 0, apply: Apply::A64Page21, addend: 0 },
     StubFixup { at: 4, apply: Apply::A64Lo12 { shift: 3 }, addend: 0 },
@@ -74,11 +81,23 @@ pub(crate) fn write_stub(arch: Arch, slot: u32, out: &mut [u8]) {
             out[10..14].copy_from_slice(&disp.to_le_bytes());
         }
         Arch::Aarch64 => {
-            let low = (offset & 0xffff) as u32;
-            let high = ((offset >> 16) & 0xffff) as u32;
-            let mut words = A64_STUB;
-            words[2] |= low << 5;
-            words[3] |= high << 5;
+            // The cell, then the slot's entry: two dependent loads in every form. Below 4096
+            // slots the entry's offset fits the load (4 instructions); below 2^21 one `add`
+            // takes its high 12 bits (5); past that `movz`/`movk` build it (6).
+            let [adrp, cell] = [A64_STUB[0], A64_STUB[1]];
+            let words = if offset < 1 << 15 {
+                let entry = A64_LDR_X16 | ((offset >> 3) as u32) << 10;
+                [adrp, cell, entry, A64_BR_X16, A64_BRK, A64_BRK]
+            } else if offset < 1 << 24 {
+                let page = A64_ADD_X16_LSL12 | ((offset >> 12) as u32) << 10;
+                let entry = A64_LDR_X16 | (((offset & 0xfff) >> 3) as u32) << 10;
+                [adrp, cell, page, entry, A64_BR_X16, A64_BRK]
+            } else {
+                let mut words = A64_STUB;
+                words[2] |= ((offset & 0xffff) as u32) << 5;
+                words[3] |= (((offset >> 16) & 0xffff) as u32) << 5;
+                words
+            };
             for (to, word) in out[..24].chunks_exact_mut(4).zip(words) {
                 to.copy_from_slice(&word.to_le_bytes());
             }
@@ -549,18 +568,43 @@ mod tests {
         assert_eq!(u32::from_le_bytes(code[10..14].try_into().unwrap()), 40);
     }
 
+    /// Each form of the AArch64 stub, run by a small interpreter of the instructions it uses:
+    /// it loads the cell, then the slot's entry of the table the cell holds, then branches
+    /// there, and nothing else. 4 instructions below 4096 slots, 5 below 2^21, 6 to 2^29.
     #[test]
     fn an_aarch64_stub_reaches_any_of_2_pow_29_slots() {
-        let slot = 0x1_2345;
-        let (mut code, fixups) = stub(Arch::Aarch64, slot);
-        assert_eq!(code.len() as u64, stub_size(Arch::Aarch64));
-        relocate(Arch::Aarch64, &mut code, &fixups, 0x10_0000, 0x40_0008);
-        let word = |at: usize| u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
-        let offset = u64::from(slot) * 8;
-        assert_eq!((word(8) >> 5) & 0xffff, (offset & 0xffff) as u32);
-        assert_eq!((word(12) >> 5) & 0xffff, (offset >> 16) as u32);
-        // The cell's low 12 bits, scaled for the 8-byte load.
-        assert_eq!((word(4) >> 10) & 0xfff, 8 >> 3);
+        let forms = [(0, 4), (1, 4), (4095, 4), (4096, 5), (0x1_2345, 5), ((1 << 21) - 1, 5)];
+        for (slot, run) in forms.into_iter().chain([(1 << 21, 6), ((1 << 29) - 1, 6)]) {
+            let (mut code, fixups) = stub(Arch::Aarch64, slot);
+            assert_eq!(code.len() as u64, stub_size(Arch::Aarch64));
+            relocate(Arch::Aarch64, &mut code, &fixups, 0x10_0000, 0x40_0008);
+            let word = |at: usize| u32::from_le_bytes(code[at * 4..at * 4 + 4].try_into().unwrap());
+            assert_eq!(word(0) & 0x9f00_001f, 0x9000_0010, "adrp x16");
+            // The cell's low 12 bits, scaled for the 8-byte load.
+            assert_eq!(word(1), A64_LDR_X16 | (8 >> 3) << 10, "ldr x16, [x16, :lo12:cell]");
+            let (imm12, imm16) = (|it: u32| (it >> 10) & 0xfff, |it: u32| (it >> 5) & 0xffff);
+            let table = 0x7000_0000u64;
+            let (mut x16, mut x17, mut loaded) = (table, 0u64, None);
+            let mut at = 2;
+            loop {
+                let it = word(at);
+                at += 1;
+                match it {
+                    A64_BR_X16 => break,
+                    _ if it & 0xffc0_03ff == A64_ADD_X16_LSL12 => x16 += u64::from(imm12(it)) << 12,
+                    _ if it & 0xffe0_001f == 0xd280_0011 => x17 = u64::from(imm16(it)),
+                    _ if it & 0xffe0_001f == 0xf2a0_0011 => x17 |= u64::from(imm16(it)) << 16,
+                    _ if it & 0xffc0_03ff == A64_LDR_X16 && loaded.is_none() => {
+                        loaded = Some(x16 + u64::from(imm12(it)) * 8);
+                    }
+                    0xf871_6a10 if loaded.is_none() => loaded = Some(x16 + x17),
+                    other => panic!("slot {slot}: {other:#010x} at word {}", at - 1),
+                }
+            }
+            assert_eq!(loaded, Some(table + u64::from(slot) * 8), "slot {slot} loads its entry");
+            assert_eq!(at, run, "slot {slot} runs {run} instructions");
+            assert!((at..6).all(|it| word(it) == A64_BRK), "slot {slot}: the words past `br` trap");
+        }
     }
 
     #[test]

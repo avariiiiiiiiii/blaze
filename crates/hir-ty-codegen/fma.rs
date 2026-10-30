@@ -138,7 +138,7 @@ fn callee_of(func: &Operand) -> Option<(FunctionId, bool)> {
     };
     let TyKind::FnDef(def, args) = ty.kind() else { return None };
     let CallableDefId::FunctionId(func) = def.0 else { return None };
-    Some((func, args.is_empty()))
+    Some((func, args.skip_binder().is_empty()))
 }
 
 /// Whether `intrinsic` is a fused multiply-add: `Some(true)` for one that always fuses,

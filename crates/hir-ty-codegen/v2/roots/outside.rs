@@ -8,11 +8,13 @@
 //! statics, so one walk of the graph of the program answers every test: the strongly
 //! connected components (Tarjan's), each outside if a member or a component it reaches is.
 
+use std::borrow::Cow;
+
 use base_db::Db;
 use rustc_hash::FxHashMap;
 
 use super::{
-    super::{HirFrontend, HirInstance, HirStatic, Kind, places::Ref, refs, statics},
+    super::{HirFrontend, HirInstance, Kind, places::Ref, refs, statics},
     RootTest,
 };
 use crate::{
@@ -20,34 +22,31 @@ use crate::{
     home::Homes,
 };
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum Node {
-    Function(HirInstance),
-    Static(HirStatic),
-}
-
-struct Visit {
+struct Visit<'db> {
     /// Its place in the order of the walk, which is its place in [`Graph::visits`].
     index: u32,
     low: u32,
     on_stack: bool,
     /// Whether it or what it reaches is outside: final once its component is done.
     outside: bool,
-    names: Vec<Node>,
+    /// What it names, as `refs::walked`'s memo holds it; its functions and statics are the
+    /// nodes it reaches.
+    names: Cow<'db, [Ref]>,
 }
 
-struct Graph<'a, 'db> {
-    frontend: &'a HirFrontend<'db>,
-    places: FxHashMap<Node, u32>,
-    visits: Vec<Visit>,
+struct Graph<'a, 'f, 'db> {
+    frontend: &'a HirFrontend<'f>,
+    /// Each node, a [`Ref::Function`] or [`Ref::Static`], by its place.
+    places: FxHashMap<Ref, u32>,
+    visits: Vec<Visit<'db>>,
     /// Tarjan's stack: the nodes of the components not yet done.
     stack: Vec<u32>,
 }
 
 /// For each of `tests`, whether what its function at its place in `roots` reaches is outside.
-pub(super) fn of(
+pub(super) fn of<'db>(
     frontend: &HirFrontend<'_>,
-    db: &Db,
+    db: &'db Db,
     homes: &mut Homes,
     roots: &[HirInstance],
     tests: &[RootTest],
@@ -65,16 +64,16 @@ pub(super) fn of(
         .iter()
         .map(|test| {
             // clone: once a test
-            let at = graph.visit(db, homes, Node::Function(roots[test.root].clone()))?;
+            let at = graph.visit(db, homes, Ref::Function(roots[test.root].clone()))?;
             Ok(graph.visits[at as usize].outside)
         })
         // alloc: once a harness, a flag a test
         .collect()
 }
 
-impl Graph<'_, '_> {
+impl<'db> Graph<'_, '_, 'db> {
     /// The place of `node`, once all it reaches is visited.
-    fn visit(&mut self, db: &Db, homes: &mut Homes, node: Node) -> Result<u32, String> {
+    fn visit(&mut self, db: &'db Db, homes: &mut Homes, node: Ref) -> Result<u32, String> {
         if let Some(&at) = self.places.get(&node) {
             return Ok(at);
         }
@@ -86,8 +85,11 @@ impl Graph<'_, '_> {
             let (at, next) = (frame.0, frame.1);
             if let Some(named) = self.visits[at as usize].names.get(next) {
                 frame.1 += 1;
+                if matches!(named, Ref::Extern(_) | Ref::Weak(_)) {
+                    continue;
+                }
                 let Some(&to) = self.places.get(named) else {
-                    let named = named.clone(); // clone: once a node of the program
+                    let named = named.clone(); // clone: once a node of the program, its key
                     let to = self.open(db, homes, named)?;
                     frames.push((to, 0));
                     continue;
@@ -105,8 +107,8 @@ impl Graph<'_, '_> {
             }
             frames.pop();
             let visit = &mut self.visits[at as usize];
-            // alloc: empty, which frees the names walked
-            visit.names = Vec::new();
+            // alloc: empty, which frees the names walked when they were the walk's own
+            visit.names = Cow::Borrowed(&[]);
             let (low, outside) = (visit.low, visit.outside);
             if low == at {
                 self.close(at);
@@ -132,8 +134,8 @@ impl Graph<'_, '_> {
         }
     }
 
-    /// Places `node` and reads what it names.
-    fn open(&mut self, db: &Db, homes: &mut Homes, node: Node) -> Result<u32, String> {
+    /// Places `node`, a function or a static, and reads what it names.
+    fn open(&mut self, db: &'db Db, homes: &mut Homes, node: Ref) -> Result<u32, String> {
         let at = u32::try_from(self.visits.len())
             // alloc: the error's message
             .map_err(|_| "a program of more than 2^32 functions and statics".to_owned())?;
@@ -144,35 +146,32 @@ impl Graph<'_, '_> {
         Ok(at)
     }
 
-    /// Whether `node` is outside itself, and the functions and statics it names.
+    /// Whether `node` is outside itself, and what it names.
     fn read(
         &self,
-        db: &Db,
+        db: &'db Db,
         homes: &mut Homes,
-        node: &Node,
-    ) -> Result<(bool, Vec<Node>), String> {
-        let refs: Vec<Ref> = match node {
-            Node::Function(instance) => match &instance.0 {
-                // alloc: empty, which allocates nothing
-                Kind::Asm(_) => return Ok((true, Vec::new())),
-                // alloc: once a node of the program; the walk without MIR inlining reaches
-                // what the one with does, through the callees it inlines
-                _ => refs::listed(db, instance, false)?.into_owned(),
+        node: &Ref,
+    ) -> Result<(bool, Cow<'db, [Ref]>), String> {
+        let names = match node {
+            Ref::Function(instance) => match &instance.0 {
+                Kind::Asm(_) => return Ok((true, Cow::Borrowed(&[]))),
+                // The walk without MIR inlining reaches what the one with does, through the
+                // callees it inlines.
+                _ => refs::listed(db, instance, false)?,
             },
-            Node::Static(value) => statics::value(db, homes, &self.frontend.hashes, value.0)?.refs,
-        };
-        let mut outside = false;
-        let mut names = Vec::with_capacity(refs.len());
-        for it in refs {
-            match it {
-                Ref::Function(it) => names.push(Node::Function(it)),
-                Ref::Static(it) => names.push(Node::Static(it)),
-                Ref::Extern(name) | Ref::Weak(name) => {
-                    let reads = fncache::outside(&name).map(|it| it.0);
-                    outside |= matches!(reads, Some(Reads::Net | Reads::Process));
-                }
+            // alloc: once a static of the program, the references its value gives
+            Ref::Static(value) => {
+                Cow::Owned(statics::value(db, homes, &self.frontend.hashes, value.0)?.refs)
             }
-        }
+            Ref::Extern(_) | Ref::Weak(_) => unreachable!("a symbol outside blaze's code is no node"),
+        };
+        let outside = names.iter().any(|it| match it {
+            Ref::Extern(name) | Ref::Weak(name) => {
+                matches!(fncache::outside(name).map(|it| it.0), Some(Reads::Net | Reads::Process))
+            }
+            Ref::Function(_) | Ref::Static(_) => false,
+        });
         Ok((outside, names))
     }
 }

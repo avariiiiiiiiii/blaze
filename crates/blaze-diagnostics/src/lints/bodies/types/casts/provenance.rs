@@ -29,7 +29,7 @@ impl LatePass for ImplicitProvenanceCasts {
     const LINTS: LintSet = lint_set(["implicit_provenance_casts"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Cast]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Cast { expr: from, .. } = b.store().expr(expr) else { return };
         let from_ty = b.infer.expr_ty(from);
         if from_ty.is_raw_ptr() {
@@ -49,7 +49,7 @@ fn is_integral(ty: Ty<'_>) -> bool {
 }
 
 /// rustc's `lint_ptr2int`.
-fn ptr2int(b: &BodyCx<'_, '_>, expr: ExprId, from: ExprId, to_ty: Ty<'_>, out: &mut Vec<Found>) {
+fn ptr2int(b: &BodyCx<'_, '_, '_>, expr: ExprId, from: ExprId, to_ty: Ty<'_>, out: &mut Vec<Found>) {
     let (Some(at), Some(span)) = (b.expr_node(expr), expr_span(b, expr)) else { return };
     let (Some(from_text), Some(to_text)) = (ty_text(b, from), ty_text(b, expr)) else { return };
     // alloc: the lint's text, for a lint found
@@ -85,7 +85,7 @@ fn ptr2int(b: &BodyCx<'_, '_>, expr: ExprId, from: ExprId, to_ty: Ty<'_>, out: &
 }
 
 /// rustc's `lint_int2ptr`.
-fn int2ptr(b: &BodyCx<'_, '_>, expr: ExprId, from: ExprId, out: &mut Vec<Found>) {
+fn int2ptr(b: &BodyCx<'_, '_, '_>, expr: ExprId, from: ExprId, out: &mut Vec<Found>) {
     let (Some(at), Some(span)) = (b.expr_node(expr), expr_span(b, expr)) else { return };
     let (Some(from_text), Some(to_text)) = (ty_text(b, from), ty_text(b, expr)) else { return };
     // alloc: the lint's text, for a lint found
@@ -118,7 +118,7 @@ fn int2ptr(b: &BodyCx<'_, '_>, expr: ExprId, from: ExprId, out: &mut Vec<Found>)
 /// `ExprPrecedence::Unambiguous`: it is not a jump, a binary operation, a cast, an assignment
 /// or a prefix operation, and no attribute is written on it. A range is a struct expression
 /// in rustc's HIR, and `?` and `.await` are matches, so they are unambiguous.
-fn unambiguous(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+fn unambiguous(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     match b.store().expr(expr) {
         Expr::Closure { ret_type: None, .. }
         | Expr::Break { .. }

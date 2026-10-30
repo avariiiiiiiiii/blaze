@@ -1195,6 +1195,13 @@ pub fn check(handle: &SyntaxNode, node: view::Node<'_>) {
         assert_eq!(h.unwrap_binder_token().map(|it| (it.kind(), it.text_range())), v.unwrap_binder_token().map(|it| (it.kind(), it.text_range())), "UnsafeBinderCastExpr::unwrap_binder_token");
         assert_eq!(h.wrap_binder_token().map(|it| (it.kind(), it.text_range())), v.wrap_binder_token().map(|it| (it.kind(), it.text_range())), "UnsafeBinderCastExpr::wrap_binder_token");
     }
+    assert_eq!(<ast::UnsafeBinderType>::can_cast(handle.kind()), <view::UnsafeBinderType<'_>>::can_cast(node.kind()));
+    if let (Some(h), Some(v)) = (ast::UnsafeBinderType::cast(handle.clone()), view::UnsafeBinderType::cast(node)) {
+        assert_eq!(range(h.syntax()), view_range(v.syntax()));
+        assert_eq!(h.generic_param_list().map(|it| range(it.syntax())), v.generic_param_list().map(|it| view_range(it.syntax())), "UnsafeBinderType::generic_param_list");
+        assert_eq!(h.ty().map(|it| range(it.syntax())), v.ty().map(|it| view_range(it.syntax())), "UnsafeBinderType::ty");
+        assert_eq!(h.unsafe_token().map(|it| (it.kind(), it.text_range())), v.unsafe_token().map(|it| (it.kind(), it.text_range())), "UnsafeBinderType::unsafe_token");
+    }
     assert_eq!(<ast::UnsafeMeta>::can_cast(handle.kind()), <view::UnsafeMeta<'_>>::can_cast(node.kind()));
     if let (Some(h), Some(v)) = (ast::UnsafeMeta::cast(handle.clone()), view::UnsafeMeta::cast(node)) {
         assert_eq!(range(h.syntax()), view_range(v.syntax()));

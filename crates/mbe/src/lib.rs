@@ -46,7 +46,7 @@ use crate::parser::{MetaTemplate, MetaVarKind, Op};
 
 pub use tt::{Delimiter, DelimiterKind, Punct};
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
     UnexpectedToken(Box<str>),
     Expected(Box<str>),
@@ -79,7 +79,7 @@ impl fmt::Display for ParseError {
 pub struct ExpandError {
     pub inner: Arc<(Span, ExpandErrorKind)>,
 }
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)] // clone: hir-expand's error kind holds it; one copy per error, on the error path
 pub enum ExpandErrorKind {
     BindingError(Box<Box<str>>),
     UnresolvedBinding(Box<Box<str>>),
@@ -96,7 +96,7 @@ pub enum ExpandErrorKind {
 /// keeps, the rule that got furthest into the input, and its missing-comma check. The error's
 /// span is the token the rule stopped at, or the closing delimiter of the input at its end
 /// (where rustc's span is the end of the last token, or the call when there is none).
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)] // clone: inside `ExpandErrorKind`, on the error path
 pub struct MatchFailure {
     /// The token the rule stopped at, as rustc's `token_descr` gives it (`` `x` ``, "keyword
     /// `fn`"); `None` at the end of the input.

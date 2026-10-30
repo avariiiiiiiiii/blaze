@@ -6,6 +6,144 @@ use hir_def::{ModuleDefId, ModuleId, lang_item::lang_items};
 use hir_expand::name::Name;
 use intern::Symbol;
 
+/// Every path of `core`, `alloc` and `std` a lint looks up ([`crate::check::Cx::std_def`]),
+/// written `crate:module:...:name`. A crate resolves them all once
+/// ([`crate::query::famous_defs`]); a lookup is one perfect hash of the path and one load.
+pub(crate) const KNOWN: &[&str] = &[
+    "alloc:borrow:Cow",
+    "alloc:borrow:ToOwned",
+    "alloc:collections:BTreeMap",
+    "alloc:collections:BTreeSet",
+    "alloc:collections:VecDeque",
+    "alloc:rc:Rc",
+    "alloc:rc:Weak",
+    "alloc:string:String",
+    "alloc:string:ToString",
+    "alloc:sync:Arc",
+    "alloc:sync:Weak",
+    "alloc:vec:IntoIter",
+    "alloc:vec:Vec",
+    "core:any:Any",
+    "core:array:IntoIter",
+    "core:cmp:Ord",
+    "core:cmp:max",
+    "core:cmp:min",
+    "core:convert:AsRef",
+    "core:fmt:Debug",
+    "core:fmt:Display",
+    "core:iter:Chain",
+    "core:iter:Cloned",
+    "core:iter:Copied",
+    "core:iter:Enumerate",
+    "core:iter:Filter",
+    "core:iter:FilterMap",
+    "core:iter:Iterator",
+    "core:iter:Map",
+    "core:iter:Rev",
+    "core:iter:Skip",
+    "core:iter:StepBy",
+    "core:iter:Take",
+    "core:iter:Zip",
+    "core:marker:Send",
+    "core:marker:Sync",
+    "core:mem:ManuallyDrop",
+    "core:ops:Deref",
+    "core:result:Result",
+    "core:slice:Chunks",
+    "core:slice:ChunksExact",
+    "core:slice:ChunksExactMut",
+    "core:slice:ChunksMut",
+    "core:slice:Iter",
+    "core:slice:IterMut",
+    "core:slice:Windows",
+    "std:array:IntoIter",
+    "std:cmp:Ord",
+    "std:cmp:max",
+    "std:cmp:min",
+    "std:collections:BTreeMap",
+    "std:collections:BTreeSet",
+    "std:collections:HashMap",
+    "std:collections:HashSet",
+    "std:collections:VecDeque",
+    "std:ffi:OsStr",
+    "std:hash:RandomState",
+    "std:io:Error",
+    "std:io:ErrorKind",
+    "std:iter:Chain",
+    "std:iter:Cloned",
+    "std:iter:Copied",
+    "std:iter:Enumerate",
+    "std:iter:Filter",
+    "std:iter:FilterMap",
+    "std:iter:Map",
+    "std:iter:Rev",
+    "std:iter:Skip",
+    "std:iter:StepBy",
+    "std:iter:Take",
+    "std:iter:Zip",
+    "std:marker:Send",
+    "std:marker:Sync",
+    "std:path:Path",
+    "std:slice:Chunks",
+    "std:slice:ChunksExact",
+    "std:slice:ChunksExactMut",
+    "std:slice:ChunksMut",
+    "std:slice:Iter",
+    "std:slice:IterMut",
+    "std:slice:Windows",
+    "std:string:String",
+    "std:vec:IntoIter",
+    "std:vec:Vec",
+];
+
+blaze_phf::phf_table!(static KNOWN_AT = KNOWN;);
+
+/// The length of the longest path of [`KNOWN`]: a longer path is none of them.
+const LONGEST: usize = {
+    let (mut longest, mut at) = (0, 0);
+    while at < KNOWN.len() {
+        if KNOWN[at].len() > longest {
+            longest = KNOWN[at].len();
+        }
+        at += 1;
+    }
+    longest
+};
+
+/// The index of `name` in [`KNOWN`]; a name not there fails to compile.
+const fn known_index(name: &str) -> usize {
+    let mut at = 0;
+    while at < KNOWN.len() {
+        if blaze_phf::bytes_eq(KNOWN[at].as_bytes(), name.as_bytes()) {
+            return at;
+        }
+        at += 1;
+    }
+    panic!("a path not in `KNOWN`");
+}
+
+const RESULT: usize = known_index("core:result:Result");
+
+/// The index in [`KNOWN`] of the path of segments `path`: joined by `:` in a buffer on the
+/// stack, then one perfect hash.
+pub(crate) fn known(path: &[&str]) -> Option<usize> {
+    let mut joined = [0u8; LONGEST];
+    let mut len = 0;
+    for (at, segment) in path.iter().enumerate() {
+        let start = len + usize::from(at > 0);
+        let end = start + segment.len();
+        if end > LONGEST {
+            return None;
+        }
+        if at > 0 {
+            joined[len] = b':';
+        }
+        joined[start..end].copy_from_slice(segment.as_bytes());
+        len = end;
+    }
+    KNOWN_AT.get(std::str::from_utf8(&joined[..len]).ok()?)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Famous<'db> {
     db: &'db Db,
@@ -35,7 +173,7 @@ impl<'db> Famous<'db> {
     }
 
     pub(crate) fn core_result_Result(&self) -> Option<hir::Enum> {
-        match self.find("core:result:Result")? {
+        match crate::query::famous_defs(self.db, self.krate)[RESULT]? {
             hir::ModuleDef::Adt(hir::Adt::Enum(it)) => Some(it),
             _ => None,
         }
@@ -93,5 +231,70 @@ impl<'db> Famous<'db> {
             .iter()
             .map(|dep| dep.crate_id)
             .find(|&dep| dep.data(self.db).origin == wanted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base_db::Db;
+    use test_fixture::WithFixture as _;
+
+    use super::{Famous, KNOWN, KNOWN_AT, LONGEST, known};
+
+    #[test]
+    fn a_path_is_found_by_its_segments_at_its_place() {
+        for (at, path) in KNOWN.iter().enumerate() {
+            assert_eq!(KNOWN_AT.get(path), Some(at), "{path}");
+            let segments: Vec<&str> = path.split(':').collect();
+            assert_eq!(known(&segments), Some(at), "{path}");
+        }
+        // As `Famous::find` reads a path: its segments joined by `:`, then the whole compared.
+        let long = "x".repeat(LONGEST);
+        for path in [
+            &["core", "iter"][..],
+            &["core", "iter", "Iterators"],
+            &["core:iter", "Iterator"],
+            &["core", "iter", "Iterator", "next"],
+            &["std", long.as_str()],
+            &[],
+        ] {
+            let joined = path.join(":");
+            assert_eq!(known(path), KNOWN.iter().position(|it| *it == joined), "{path:?}");
+        }
+        assert_eq!(known(&["core", "iter", "Iterators"]), None);
+        assert_eq!(known(&["std", long.as_str()]), None);
+    }
+
+    /// What a crate's table holds of each path is what resolving the path alone finds.
+    #[test]
+    fn the_crates_table_finds_what_each_path_alone_does() {
+        let fixture = format!(
+            r#"
+//- minicore: iterators, option, result, fmt, deref, as_ref, clone, copy
+//- /src/lib.rs crate:main deps:std
+fn f() {{}}
+{}"#,
+            crate::tests::STD
+        );
+        let db = Db::with_files(&fixture);
+        hir::attach_db(&db, || {
+            let krate = crate::tests::main_crate(&db);
+            let famous = Famous::new(&db, krate);
+            let table = crate::query::famous_defs(&db, krate.base());
+            assert_eq!(table.len(), KNOWN.len());
+            let mut found = 0;
+            for (at, path) in KNOWN.iter().enumerate() {
+                assert_eq!(table[at], famous.find(path), "{path}");
+                found += usize::from(table[at].is_some());
+            }
+            assert!(found > 0, "the fixture's `core` has some of them");
+            assert_eq!(
+                famous.core_result_Result(),
+                match famous.find("core:result:Result") {
+                    Some(hir::ModuleDef::Adt(hir::Adt::Enum(it))) => Some(it),
+                    _ => None,
+                }
+            );
+        });
     }
 }

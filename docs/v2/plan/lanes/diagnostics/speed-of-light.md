@@ -44,11 +44,11 @@ with nothing extra, which is also the most rustc can do.
 
 | Component | Work | Bound | Now |
 | --- | --- | --- | --- |
-| `Defs` | one visit per definition | about 0.6 ms | about 10 ms |
-| `level` | one lookup per owner | about 0.15 ms | about 1.4 ms |
+| `Defs` | one visit per definition | about 0.6 ms | about 7 ms (estimate by count; was about 10 ms) |
+| `level` | one lookup per owner | about 0.15 ms | about 1 ms (estimate by count; was about 1.4 ms) |
 | `reach` | one visit per definition and per type in a public signature | the same as `items` | computed once, shared with `items`; then one bit per definition |
-| `seed` | one attribute-bit test per definition | about 0.3 ms | about 0.6 ms |
-| `mark` (bodies) | one visit per body node and one read per resolution | about 5.6 ms | about 20 ms (was about 150 ms) |
+| `seed` | one attribute-bit test per definition | about 0.3 ms | at the bound: `rustc_main` and `rustc_canonical_symbol` are `AttrFlags` bits |
+| `mark` (bodies) | one visit per body node and one read per resolution | about 5.6 ms | about 9 ms (estimate by count; was about 20 ms, before that about 150 ms) |
 | `report` | one bit test per definition, text only for what fires | under 0.1 ms | at the bound, except that it runs when the lint can't fire |
 
 The arithmetic behind each row follows.
@@ -59,9 +59,12 @@ The arithmetic behind each row follows.
 read, well under a millisecond at DRAM bandwidth.
 
 The pass is not there yet. `Defs::of` finds definitions by walking all the syntax, because
-items in blocks and anonymous constants appear only there. That is 800,000 nodes at about 45
-cycles each (a rowan cursor allocated and freed, plus a `SyntaxKind` dispatch): 36 million
-cycles, about 10 ms, or 17 times the bound.
+items in blocks and anonymous constants appear only there. The walk is over the flat syntax
+view now, so no cursor is made: each of 800,000 nodes costs a children step and a kind
+dispatch, about 10 cycles, and each of the 400,000 attribute owners `enabled`'s scan of its
+children for a `cfg`, about 40 cycles. That is 8 + 16 = 24 million cycles, about 7 ms
+(estimate by count), 12 times the bound. The flat tree's attribute bit (queue 00808) takes
+the scans off owners without attributes, about 3 ms.
 
 What removes it: enumerate items from hir-def's `ItemTree`, which name resolution has
 already lowered, including each block's tree. Take anonymous constants and closures from the
@@ -74,9 +77,12 @@ that has none.
 That is 10,000 definitions plus the closures and anonymous constants `mark` asks about, at
 about 50 cycles each, about 0.15 ms.
 
-Now: levels are memoized per syntax node that has attributes. Each query walks up to the
-nearest memoized node, about 5 to 10 ancestors at about 50 cycles each, so about 500 cycles
-per query, 5 million cycles, about 1.4 ms. What removes it: a lint-level column keyed by
+Now: `hir_lint_levels::Levels::set_at` memoizes every node on the chain it walks, so a query
+walks up only to the nearest node seen before, usually its item's or its sibling's parent:
+one or two steps and probes, about 150 cycles. Each node is pushed once, with its
+attributes read, about 100 cycles. For about 15,000 queries over about 30,000 distinct nodes
+that is 2.3 + 3 million cycles, about 1 ms (estimate by count). What removes it: a lint-level
+column keyed by
 `AttrDefId` and computed once per crate, as `ShallowLintLevelMap` is. That is for the lane
 that owns `Cx`'s levels; this pass would read it unchanged through `Levels::at`.
 
@@ -96,10 +102,10 @@ definition, once per crate, and after that a bit test per question.
 **`seed`: the worklist's first entries.** The bound is one memoized `AttrFlags` read per
 definition at about 100 cycles: 10,000 of them is 1 million cycles, about 0.3 ms.
 
-Now: `rustc_main` and `rustc_canonical_symbol` still go through `AttrFlags::has_word`, which
-reads the source. That is about 3,000 functions at about 300 cycles each, another 0.3 ms,
-which puts this component at about half the bound. What removes it: the two `AttrFlags`
-bits requested of db. With them, `has_word` becomes a bit test and this code doesn't change.
+Now: at the bound. `rustc_main` and `rustc_canonical_symbol` are the `AttrFlags` bits
+`RUSTC_MAIN` and `RUSTC_CANONICAL_SYMBOL`, and `seed.rs` tests them directly (the canonical
+symbol on the flags it has already read for the definition), which is what `has_word` does
+for these two words, without the hash of the name.
 
 **`mark`: what bodies name.** This is the pass's main work, and the component this change
 rewrote.
@@ -137,24 +143,28 @@ Now (`mark/body.rs`), each body is walked over hir-def's `ExpressionStore` with 
 - **Methods, fields, associated items and variants** are read from what inference recorded:
   hash-map lookups at about 50 cycles each. For 60,000 of them that is 3 million cycles,
   about 0.9 ms.
-- **Value paths** (functions, statics, constants, unit structs, locals) are not recorded by
-  inference, so they still go through the resolver:
-  - `update_to_inner_scope` costs about 100 cycles per path: 120,000 paths is 12 million
-    cycles, about 3.4 ms.
-  - `resolve_path_in_value_ns_fully` scans the expression scopes, then the module's def
-    map, at about 300 cycles: 36 million cycles, about 10 ms.
+- **Value paths** (functions, statics, constants, unit structs, locals) are read from the
+  columns inference records (queue 00806): `InferenceResult::value_resolution` for a path
+  resolved whole, `qualifier_resolution` for the type a type-relative path (`S::new`,
+  `T::f`, `Alias::A`) goes through. A one-segment or type-relative path, about 80% of
+  120,000, is two column reads at about 10 cycles, about 0.3 ms. A qualified path resolved
+  whole (`m::f`, about 24,000) still asks the resolver for its qualifier's type
+  (`update_to_inner_scope` and `resolve_path_in_type_ns`, about 400 cycles): about 2.7 ms.
+  Before, every value path paid both lookups, about 13.4 ms.
 - **Per-body memo fetches** (3,000 of them) round to nothing.
 
-That totals about 20 ms. It is 7.5 times faster than before, but 28% of the bound.
+That totals about 9 ms (estimate by count; was about 20 ms), 62% of the bound.
+
+`recorded_value_paths_are_what_the_resolver_finds` (in `mark/body.rs`) checks that both
+columns match the resolver at each path's own scope. The walk kept its resolver at the
+enclosing block's scope, so where a `let` earlier in the block shadows an item
+(`let f = 1; f`), the recorded local is what rustc's `qpath_res` gives. There the walk no
+longer marks the item live.
 
 What stands in the way, and what removes it:
 
-- **Value-path resolutions are not recorded.** This is 13.4 ms of the 14.4 ms gap.
-  Inference already resolves every value path in order to type it, so recording the result
-  costs one store per path. Requested of db in `v2/requests/diagnostics.md`: a value-path
-  column in `InferenceResult` keyed by `ExprOrPatId`, as rustc's `qpath_res` reads it. With
-  it, `mark` would be about 5 + 0.9 + 0.2 ≈ 6.1 ms, 92% of the bound. `Walk::resolve`
-  already tries what inference recorded first, so the change here is one more read.
+- **A qualified path's module prefix is not recorded.** That is the 2.7 ms above (queue
+  00528, module-prefix segments). Type-ref paths in bodies are queue 00833 (db-ty).
 - **Recorded resolutions are hash maps, not columns.** This costs about 0.5 ms, under 10%
   once the column above lands. A dense column for methods and fields would close it.
 - **The pass runs on one core.** rustc's does too, so this is not behind the state of the
@@ -290,8 +300,8 @@ The bounds below are that design with nothing extra.
 | skip of allowed lints | one AND of a `LintSet` per pass | under 1 µs | at the bound: every pass gates on `cx.any_may_fire` / `lint_may_fire`; `stability` runs anyway for E0658 |
 | syntax walk | one pass over the crate's nodes, shared | about 0.5 ms | `imports` and `stability` read `cx.walk()`; `stability` scans its `kinds` column (about 0.5 ms) and reads only the nodes of the kinds it checks (about 2 ms) |
 | item walk | one pass over the items, shared | about 0.3 ms | at the bound: `cx.items()`, made once for both sides of the abort |
-| `imports` | one bit per import, then one visit per `use` tree | about 0.1 ms | about 150 ms: every path is resolved again |
-| `stability` | one table probe per resolved use | about 2.6 ms | about 150 ms: every path is resolved again |
+| `imports` | one bit per import, then one visit per `use` tree | about 0.1 ms | about 150 ms: every path is resolved again; about 25 ms once `used.rs` reads `used_imports_with_traits` (estimate by count) |
+| `stability` | one table probe per resolved use | about 2.6 ms | about 150 ms: every path is resolved again (value columns exist; type paths 00833, prefixes 00528, and a store walk here) |
 | `items`, after the abort | 17 checks at each of 10,000 items | about 2.4 ms | near the bound, plus on-demand path resolutions in five passes |
 | `effective` | one walk of each public interface per rise | the `dead` section's `reach` row | computed once, shared |
 
@@ -327,17 +337,34 @@ resolves every path again. Its own prefix lookups are memoized in one `HashTable
 100 cycles a hit: 180,000 paths cost 18 million cycles, about 5 ms. Each path is also checked
 against `sema.resolve_path`, whose `analyze_impl` (`find_container`, a `SourceAnalyzer` for
 the body, a source-map lookup, a resolver for the scope) costs about 3,000 cycles: 540
-million cycles, about 150 ms. That is three orders of magnitude over the bound. What removes
-it is in the front end: imports' request 1 (`used_imports`, recorded as nameres resolves) and
-the request "one table of a crate's path resolutions" in `v2/requests/diagnostics.md`. With
-both, the pass is a read of two tables.
+million cycles, about 150 ms. That is three orders of magnitude over the bound.
+
+The front end now has imports' request 1: `hir_ty::used_imports_with_traits(krate)` is
+rustc's `import_use_map`, `glob_map` and `#[macro_use]` uses, with the traits inference picked.
+Its walk (`hir_def::nameres::uses::crate_uses`) resolves each store's paths through one
+`Resolver` per scope, item-scope lookups at about 500 cycles a path: 180,000 paths is 90
+million cycles, about 25 ms (estimate by count), memoized per crate by salsa. `used.rs` does
+not read it yet. The test
+`lints::names::imports::used::tests::what_the_walk_finds_used_is_what_the_front_end_records`
+compares the two; once a build shows they agree, `used` and `typeck` come from the query
+and the per-path `sema.resolve_path` goes, taking `imports` to about 25 ms. What is left
+after that is the trait-import candidates of method calls and fields (`lookup_trait_item`,
+one `sema.scope` per call, which the query doesn't give), and the walk itself. The bound
+needs nameres and inference to record uses as they resolve: queue 00806 (path resolutions
+recorded by inference and type lowering) and 00528.
 
 **`stability`.** rustc's bound: for each use, one probe of the deprecation and stability
 index, which `stability/lookup.rs` already is: a `HashTable` hashed once, its 8-byte slots in
 `u32`-numbered arenas, at about 50 cycles a probe. 180,000 uses cost 9 million cycles, about
 2.6 ms. Now each use's resolution is a `sema.resolve_path`, or a `resolve_method_call` for
 method calls and fields, at about 3,000 cycles: about 150 ms, plus the 2.5 ms walk above. The
-same resolution table removes it. A name pre-filter (skip a path whose last segment names no
+same resolution table removes it. Its value half exists (queue 00806:
+`InferenceResult::value_resolution` and `qualifier_resolution`, which `mark` reads). For
+`stability` the rest is type paths (queue 00833) and module prefixes (00528). There is also a
+change in this pass: `stability/walk.rs` walks syntax, so it would walk each body's store, as
+`mark` does, to read the columns by `ExprOrPatId`. That rewrite needs a build.
+Until then a memo shared with `imports` saves little: `imports` resolves the last segment
+per namespace and `stability` the path as written, so they share only qualifiers. A name pre-filter (skip a path whose last segment names no
 deprecated or unstable definition) is not sound: `use old as new` renames, and std has
 deprecated items in every crate's scope.
 
@@ -359,10 +386,10 @@ Bound: about 6 ms for the 100,000-line crate on one core: the shared walks about
 `imports` 0.1 ms, `stability` 2.6 ms, `items` 2.4 ms. Now: about 310 ms, nearly all of it
 paths resolved again through `Semantics`, once by `imports` and once by `stability`.
 
-What stands in the way of the 90% mark is in the front end, not in these passes: hir-def
-recording which imports each resolution went through (imports' request 1), and one table of
-path resolutions recorded as lowering and inference make them (filed by
-`diagnostics-lints-names`). With both, `imports` and `stability` drop to their bounds without
+What stands in the way of the 90% mark is mostly in the front end: which imports each
+resolution went through (imports' request 1, now `used_imports_with_traits`, which `used.rs`
+reads once its comparison test passes), and one table of path resolutions recorded as
+lowering and inference make them (queue 00806 and 00528). With both, `imports` and `stability` drop to their bounds without
 changing their rules. `stability`'s walk now reads `cx.walk()` (about 10 ms to about 2.5 ms,
 estimated); what is left of it is its own scan of the `kinds` column and the nodes it checks.
 
@@ -539,8 +566,8 @@ operations in the code, using the costs of the `dead_code` section.
 | The late walk | one decode and one tag dispatch per node | about 2.5 ms | at the bound | about 130 ms |
 | The late passes at the nodes they look at | one shared callee per call, one compare per pass | about 6 ms | about 15 ms | about 19 ms |
 | A fully allowed pass | none | 0 | 0 | as if it fired |
-| Liveness | one dataflow over the MIR | about 7 ms | about 12 ms | about 12 ms |
-| `unused_unsafe` | one tag scan of a body without `unsafe` | about 1 ms | about 3 ms | about 3 ms |
+| Liveness | one dataflow over the MIR | about 7 ms | about 10.5 ms (estimate by count) | about 12 ms |
+| `unused_unsafe` | one tag scan of a body without `unsafe` | about 1 ms | about 2 ms (estimate by count): the pre-scan reads one kind byte per expression and decodes only blocks | about 3 ms |
 
 **The late walk.** The bound is one visit per node: a decode from the store's columns and a
 tag dispatch, about 15 cycles. 500,000 nodes is 7.5 million cycles, about 2.5 ms.
@@ -583,14 +610,19 @@ against its own lint. A crate that allows every body lint returns before it look
 
 **Liveness and the MIR lints.** The bound is one dataflow per body over MIR that is built
 once. Borrow checking builds that MIR, and `BodyCx::mir` and `runtime_mir` fetch it once per
-body for every pass. 1 million statements at about 20 cycles is about 7 ms. Now, before the
-dataflow, `is_naked` scans the statements and the guard scan scans them again. Liveness also
-builds an `InferCtxt` per body, about 5 µs, so 15 ms over 3,000 bodies; it is paid only by
-bodies with a variable to check. Together that is about 12 ms.
+body for every pass. 1 million statements at about 20 cycles is about 7 ms. `is_naked` is
+now the `AttrFlags::NAKED` bit, rustc's attribute test, where it scanned every statement
+(1 million at about 4 cycles, about 1 ms). `source::skipped` tests
+`AttrFlags::AUTOMATICALLY_DERIVED` before it reads the impl's source, where it read the
+source of the impl of every trait-impl method (about 3,000 at about 600 cycles, about
+0.5 ms). With `cfg_attr(.., automatically_derived)` it now follows rustc, which expands the
+`cfg_attr` first. The guard scan still reads the statements again. Liveness also builds an
+`InferCtxt` per body, about 5 µs, paid only by bodies with a variable to check. Together that
+is about 10.5 ms (estimate by count).
 
-The fastest technique is to fold `is_naked` into an attribute bit and to share one
-`InferCtxt` of `TypingMode::non_body_analysis` across the crate's bodies. Neither can be done
-inside this lane's paths (see the blockers below).
+The fastest technique left is to share one `InferCtxt` of `TypingMode::non_body_analysis`
+across the crate's bodies. That can't be done inside this lane's paths (see the blockers
+below).
 
 **Preorders and buffers.** `BodyCx::exprs` is built only when a pass asks for it: liveness,
 the pointer lints, `invalid_from_utf8` and literals. It is built in `Scratch` buffers handed
@@ -606,11 +638,12 @@ worked out when a pass first asks, no longer for every body up front.
 - `late_passes_per_crate`: `after_abort` makes no more allocations at 64 bodies than at 4.
 
 **What blocks the last 10%.**
-- hir-def keeps the kind byte of each expression as a column but does not expose it. A
-  `kinds_present() -> u64` per store would let a body skip the walk for passes whose kinds it
-  lacks, and let `unused_unsafe` and liveness's closure loop skip their scans. Request 1.
-- `#[naked]` and `#[automatically_derived]` are not in `AttrFlags`. `is_naked` scans MIR, and
-  `source::skipped` parses the impl's source for every method of a trait impl. Request 2.
+- Request 1 is done: `ExpressionStore::kinds_present`, `has_closures` and `expr_kind`.
+  Liveness's closure loop reads `has_closures`, and `unused_unsafe`'s pre-scan reads the kind
+  bytes. Not yet done: skipping the late walk for passes whose kinds a body lacks (a mask per
+  pass ANDed with `kinds_present`). That touches the dispatch tables and needs a build.
+- Request 2 is done: `#[naked]` and `#[automatically_derived]` are `AttrFlags` bits, which
+  `is_naked` and `source::skipped` read.
 - `body_owners` (each body's file rank and offset, then a radix sort) runs in both
   `before_abort` and `after_abort`. The parent could compute it once. Request 3.
 - A shared per-call callee fact needs the passes to take it from the walk. That is a rewrite
@@ -646,12 +679,12 @@ operations in the code, using the costs of the `dead_code` section.
 | The walk | one per check, shared with the early lints and the levels | about 3.5 ms, once | once | twice |
 | The AST passes | one kind dispatch per node | about 0.7 ms | about 1.5 ms (three scans) | about 1.5 ms |
 | Attribute parsing and `check_mod_attrs` | one lowering per attribute | about 2 ms | at the bound | two lowerings, two `Session`s |
-| Signature paths | one resolution per path that needs one | about 10 ms | about 14 ms | about 30 ms |
+| Signature paths | one resolution per path that needs one | about 10 ms | about 9 ms (estimate by count): at the bound, primitives ruled out by `crate_shadows_primitive_type` | about 30 ms |
 | Signature lifetimes | one ancestor walk per lifetime | about 0.5 ms | at the bound | a `Vec` and a node clone per binder |
 | Item scopes | one list per check | about 1 ms, once | once | four times |
 | Impls by trait | one hash probe per impl | under 0.1 ms | at the bound | a linear search and a `Vec` per trait |
 | Staged dependencies' features | one walk per dependency, only when needed | 0 for a crate with no library feature | 0 | every dependency, every check |
-| Missing stability (`staged_api` only) | one visit and two probes per definition | 0 outside `staged_api`; about 1 ms for std | 0 outside `staged_api`; about 30 to 60 ms for std | not checked |
+| Missing stability (`staged_api` only) | one visit and two probes per definition | 0 outside `staged_api`; about 1 ms for std | 0 outside `staged_api`; about 7 ms for std (estimate by count) | about 30 to 60 ms for std; before that not checked |
 
 **The walk.** `Walk::of` visits 800,000 nodes at about 15 cycles each (cursor arithmetic on the
 flat tree and a kind test), about 12 million cycles, about 3.5 ms. `checks::check` built its
@@ -683,14 +716,41 @@ bound.
 definition it does one lookup of its stability and one of its effective visibility, about 50
 cycles each. That is about 1 ms for std's roughly 60,000 definitions, and nothing for a crate
 without `#![feature(staged_api)]`: `crate_checks` returns before it walks. Here the pass scans
-the walk's `kinds` column, which is at the bound. For each definition it then:
+the walk's `kinds` column, which is at the bound. For each definition it used to:
 
-- walks the definition's ancestors twice, for `order_key` and `parent`, at depth 3 to 6;
-- maps the node to its `hir` definition through `Semantics::to_def2`, about 0.5 to 1 µs, to
+- walk the definition's ancestors two to four times (`order_key`, `lookup_stability`'s
+  inheritance, the annotation kind, each through `parent`), at depth 3 to 6;
+- map the node to its `hir` definition through `Semantics::to_def`, about 0.5 to 1 µs, to
   probe `Effective`.
 
-That is about 30 to 60 ms for std. Reaching the bound needs the walk to carry each definition
-node's ID and its parent's index as columns, so that both of those become array reads.
+That was about 30 to 60 ms for std. Now (`sol-all-diag`, 2026-10-30; not built, so an estimate
+by count like the rest of this section):
+
+- **Reachability is a probe.** The first time the check asks, it takes the crate's own
+  definitions that `Effective` marks reachable and puts each one's node (`Semantics::source`)
+  in a set. A node of a definition's kind is the source of exactly the definition `to_def`
+  gives it, so asking the set answers what `to_def` and `Effective` answered. The one trap is a
+  procedural macro, whose node is its function's, so only `macro_rules!` and `macro` nodes go in
+  for macros. Building the set: about 40,000 reachable definitions at about 400 cycles (an
+  interned lookup, the AST id map, a descent to the node) is 16 million cycles, about 4.6 ms.
+  Each question is then one FxHash probe, about 50 cycles, about 1 ms for 60,000 definitions.
+  `checks::attrs::parsers::stability::tests::reachable_by_node_is_reachable_by_to_def` checks
+  the set against the old `to_def` rule, kept in the tests, at every definition of a fixture
+  with each kind, private and public ones, a type reachable only through a signature, items in
+  a block, the three kinds of macro and `extern` items.
+- **Each definition's parent is walked once.** `Defs::parent` is memoized by the definition's
+  pointer, so the two to four walks per definition become one walk and one to three probes:
+  about 100 cycles saved per walk avoided, about 2.6 ms.
+
+That puts the pass at about 7 ms for std: the set 4.6 ms, the probes 1 ms, one ancestor walk
+per definition about 1.7 ms. That is still about 7 times the bound. What is left, and what
+removes it:
+- The set reads each definition's node by descending from the root. The AST id map already
+  holds the pointer (`AstId::to_ptr`), which would take the set to about 1 ms. That needs
+  `hir_def` ids for each `hir` definition kind (fields especially) in this pass. It is not done
+  blind.
+- The ancestor walk would go if the walk kept each node's parent index as a column (`Walk::add`
+  has its stack of open nodes for this already), plus the definition kind of each node.
 
 **Signature paths.** The work is to resolve each path that can fail. rustc resolves each path
 once, and a type parameter is found in the item's rib. Here, each `PathType` paid for:
@@ -716,10 +776,11 @@ The item key of a signature's fact is a query, and it is now asked only when a d
 fires. The signatures are visited as they are found instead of being collected. At about
 1,000 cycles per resolution, for the roughly 60% of the 40,000 paths that are not ruled out
 from the syntax, the cost is about 7 ms, plus about 2 ms for the syntax; the bound is about
-10 ms. The rest is primitive types (`u8`, `str`, `bool`), which still go to Semantics. They
-can't be ruled out from the syntax, because a module or import of that name changes what hir
-resolves them to. A per-crate fact "no name in the type namespace shadows a primitive" would
-rule them out with one bit test (request 2).
+10 ms. Primitive types (`u8`, `str`, `bool`) were the rest, about 5 ms. The syntax alone
+can't rule them out, because a module or import of that name changes what hir resolves them
+to. The per-crate fact (request 2, `hir_def::nameres::crate_shadows_primitive_type`, read
+as `Signature::primitives`) now rules them out with one bit test outside block modules and
+macro files. That puts the component at about 9 ms (estimate by count), at the bound.
 
 **Signature lifetimes.** A lifetime is almost always declared by a binder around it. That
 binder is now found by one ancestor walk with nothing collected. The binders are gathered
@@ -736,8 +797,9 @@ the grouping searched a `Vec` of traits linearly for every impl and kept a `Vec`
 asked each impl for its trait twice, and searched the incoherent traits linearly. Now there is
 one `FxHashMap` probe per impl. The impls of each trait are a CSR list built by counting
 sort, and the incoherent traits are a `bool` per trait slot, all in the check's frame. The
-per-module buffer of `impls` is reused. `denies_explicit_impls` still parses each implemented
-trait's source to read one attribute, std's traits included (request 3).
+per-module buffer of `impls` is reused. `denies_explicit_impls` reads the
+`AttrFlags::RUSTC_DENY_EXPLICIT_IMPL` bit of each implemented trait, where it parsed the
+trait's source, std's traits included (request 3, as an attribute bit).
 
 **Staged dependencies.** rustc reads `lib_features` per crate, once. `library::check` reads a
 dependency's library features (a full `Walk::of` of it) only when a feature the crate enables
@@ -761,11 +823,9 @@ dependency it loads.
 - `owners` is computed twice per check, once by `checks::check` and once by the attribute
   lints. A `Cx::owners()` cache next to `Cx::walk()` would make it once, saving about 0.6 ms
   (request 1).
-- Primitive types in signatures go to Semantics. A per-crate bit, "nothing shadows a
-  primitive in the type namespace", made once from the def maps, would rule them out
-  (request 2).
-- `#[rustc_deny_explicit_impl]` is not in `TraitFlags`, so the attribute is read by parsing
-  each trait's source (request 3).
+- Requests 2 and 3 are done: the primitive-shadowing bit, and `#[rustc_deny_explicit_impl]`
+  as an `AttrFlags` bit, which `denies_explicit_impls` reads (test
+  `checks::impls::tests::explicit_impls_of_a_denying_trait_are_errors`).
 - `hot_lint.py` still reports about 1,200 findings in `checks/`. The entry loops of every
   check were audited, and what they run before a diagnostic is certain is fixed above. The
   findings inside the checks' own helpers (`attrs/args.rs`, `ast_validation/*`, `defs/*`,
@@ -797,7 +857,7 @@ about 5,000 attributes, about 400 of them lint levels.
 | The set it reads (`levels::may_fire`) | one kind read per node, the names of each `ATTR` | about 0.4 ms | at the bound: one scan of the kind column |
 | `Cx::lint_level` | one probe per node asked about | about 50 cycles | at the bound after the first ask; zero allocations (budget test) |
 | Level maps of `decide` | one look at each node with an attribute | about 0.3 ms per map | at the bound: two columns read per node, the rest only where `Tree::attrs` is set |
-| The walk (`Walk::add`) | one visit per node | about 0.5 ms | about 10 ms: rowan's pre-order |
+| The walk (`Walk::add`) | one visit per node | about 0.5 ms | about 6 to 9 ms (estimate by count): the view's enter and leave events, and the attribute probe of each owner |
 | The early pass and the syntax passes | one kind read per node, a cast where a lint wants the kind | about 0.7 ms | about 2.5 ms: one scan of the columns per pass, about ten |
 | `check_cfg` | the `cfg`s of each node with an attribute | about 0.3 ms | at the bound: only nodes `Tree::attrs` marks are read |
 | The lexer's lints | one lex of each source that can fire | about 2 cycles a byte where it must | a SIMD ASCII scan, and no lex, where nothing can fire |
@@ -839,9 +899,19 @@ indexed alike: `nodes`, `kinds` (2 bytes), `attrs` (1 byte) and the trees' `off`
 `replaced` lists. Every syntax pass of this part, `names::imports` and `names::stability`
 read it through `cx.walk()`; nothing walks a tree again. The bound is a flat syntax store's
 pre-order at
-about 2 cycles a node, 0.5 ms. Now each node costs a rowan cursor, made and freed, at about
-45 cycles: 36 million cycles, about 10 ms. What removes it is in the front end: the flat
-syntax view (`syntax::view`), once the walk can be made over it without `SyntaxNode`s.
+about 2 cycles a node, 0.5 ms. The walk is now over the flat syntax view (`syntax::view`):
+no cursor is made or freed. What is left per node is two `Preorder` events (enter and leave,
+each a few steps of the tree's arrays, about 15 cycles together), and for each of the
+400,000 attribute owners `on()`'s scan of its children and its inner-attribute list for an
+`ATTR` (about 40 cycles), plus `Item::cast` and `attrs().next()` for each item. That is
+800,000 × 15 + 400,000 × 40 = 28 million cycles, about 6 to 9 ms (estimate by count). Two
+things take it to the bound:
+- A bit per node in the flat tree, set by the builder, for "has an `ATTR` child or an inner
+  attribute list with one": an owner without it skips `on()` and the attribute-macro probe.
+  The walk enters an owner before its attributes, so `Tree::attrs` can't serve here.
+  Requested from frontend-tree (queue 00808).
+- The walk as a scan of element numbers (`Node::descendants`), with subtree ends for
+  `skip_subtree` and the stack of open nodes, in place of enter and leave events.
 
 **The early pass and the syntax passes.** rustc's combined pass calls every early lint at
 each node of its type, enabled or not. Here the early pass is one loop over the columns,
@@ -933,7 +1003,7 @@ section adds is the shape of the lowerings past that gate:
 | Undeclared label | a walk up to the label, then rustc's typo search | `d` steps, plus one edit distance per label in scope | at the bound |
 | E0004, E0005 | print what hir found | the text of three witnesses, plus one source lookup per variant pointed at (five at most) | at the bound |
 | E0133, the block's head | read the head of an `unsafe` block in place | the head's tokens | at the bound |
-| `unsafe_op_in_unsafe_fn`, the first operation | which linted operation comes first in its function | one flag read | `k·n` for `k` linted operations in a body of `n` expressions (request 1) |
+| `unsafe_op_in_unsafe_fn`, the first operation | which linted operation comes first in its function | one flag read | at the bound: `MissingUnsafe::first`, set in hir-ty-unsafeck's one walk (was `k·n` for `k` linted operations in a body of `n` expressions) |
 | `unused_must_use` | is the type `Result` or `ControlFlow` | two lang-item field reads | at the bound, with one bit test when the lint is allowed everywhere |
 
 **Scope errors.** rustc's `rustc_passes::loops` (`CheckLoopVisitor`) keeps a stack of contexts
@@ -984,12 +1054,24 @@ walk finds the `break`s the old rule found. `the_first_yield_is_that_of_the_plai
 `the_head_read_in_place_is_the_texts` and `the_witnesses_are_joined_as_rustc_joins_them`
 check the rest.
 
+**The first `unsafe_op_in_unsafe_fn` of a function.** hir-ty-unsafeck's walker keeps rustc's
+`suggest_unsafe_block` as it walks (cleared at each operation it lints in an `unsafe fn`,
+copied into each closure and inline const and restored after), and hir hands it on as
+`MissingUnsafe::first`. The lowering reads that flag: one load. Before, it made the function's
+operations again (`get_unsafe_ops`, not a query) and compared each with the operation's place,
+`k·n`: about 100,000 node visits for an FFI wrapper with 50 linted operations. The old rule is
+kept in the tests as the reference, and
+`lower::missing_unsafe::tests::the_first_flag_is_that_of_the_plain_rule` checks the flag
+against it on closures, nested closures, an inline const, an `unsafe` block and a macro's
+expansion (`sol-all-diag`, 2026-10-30; not built).
+
+hir-ty-unsafeck's flag also follows rustc's `requires_unsafe` on the lint's level (queue
+00807): an operation where `unsafe_op_in_unsafe_fn` is allowed leaves the flag set for the next
+one, and in an edition where the lint is allowed by default no operation is first
+(test `an_allowed_operation_leaves_the_next_first` in hir-ty-unsafeck). The reference rule in
+this crate's test ignores levels, so its fixture allows nothing.
+
 **What stands in the way.**
-- The first `unsafe_op_in_unsafe_fn` of a function: hir doesn't say which it is, so the
-  lowering re-runs `get_unsafe_ops`, which is not a query, per diagnostic. Its cost is `k·n`,
-  about 100,000 node visits for an FFI wrapper with 50 linted operations, where it should be one
-  flag read (`v2/requests/diagnostics.md`, `diagnostics-lints-mir-speed` 1). rustc's
-  `UnsafetyVisitor` sets `suggest_unsafe_block` during its one walk.
 - `rustc_pattern_analysis` is crates.io's 0.166 snapshot, not the pinned nightly's (request 2).
   This doesn't affect speed, but it lets which matches compile drift from rustc's.
 
@@ -1021,7 +1103,7 @@ costs 10 to 50 times more, so these lowerings are not where a failing check spen
 | `borrowck_skipped` | about 1,400 cycles, plus the item's path when printed | at the bound | twice the item lookup, about 2,200 |
 | `const_check_error` | about 1,400, plus one call resolution for E0015 | about 1,500 | the same |
 | `const_impure`, lint allowed | one perfect-hash lookup and one bit test, about 40 cycles | at the bound | a scan of every dependency's name, about 1,500 |
-| `const_impure`, crate not opted in | 0 (hir should not look) | about 1,500: a scan of the direct dependencies' names | the same |
+| `const_impure`, crate not opted in | 0 (hir should not look) | 0 here: hir gives no `ConstImpure`, having read the memoized `uses_fn_cache` once per `const fn` body (about 30 cycles) | about 1,500: a scan of the direct dependencies' names |
 
 **What changed.** `borrowck_skipped` finds its item once, for both the message's path and
 the fact; before, `code_fact` walked and called `to_def2` a second time. `const_impure` tests
@@ -1035,13 +1117,15 @@ dependency cargo builds) it costs a bit test.
 about 100 cycles, which is 7% of the bound. One walk could give both the item and the phase,
 but that means changing `lints::body_item`, which is `diagnostics-speed-lints`'.
 
+**Purity where fn-cache is not used.** hir's `check_body` now asks
+`hir_ty::fn_cache::uses_fn_cache` (a salsa query per crate, so a memo read of about 30 cycles
+per `const fn` body after the first) before it runs `const_purity`. A crate that does not
+depend on `blaze` runs no purity analysis and gives no `ConstImpure`, which is the bound of 0
+for this lowering. The lowering's own scan of the dependencies' names (about 1,500 cycles) is
+gone: it reads the same query, one memo read, only for a diagnostic hir did give
+(`sol-all-diag`, 2026-10-30; not built, an estimate by count).
+
 **What stands in the way.**
-- hir runs `const_purity` on every `const fn` of every crate, and this lowering drops the
-  result unless the crate depends on `blaze`. The work's bound in a crate that has not opted
-  in is zero: the purity analysis should not run there at all. The fix belongs to db: gate
-  `ConstImpure` in `hir/src/diagnostics.rs` on fn-cache's `uses_cache`, which is then
-  computed once per crate (`v2/requests/diagnostics.md`, "diagnostics-lints: purity only
-  where fn-cache is used"). With it, the dependency scan here goes too.
 - The const checker's messages are matched as strings (`starts_with("cannot call non-const
   ")`), about 20 cycles per diagnostic. That is inside the bound, but it is a string dispatch on
   a fixed set, which the `ConstCheckKind` request removes.

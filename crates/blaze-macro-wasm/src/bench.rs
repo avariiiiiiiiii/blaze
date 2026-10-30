@@ -9,7 +9,8 @@
 //! ```
 //!
 //! What it prints, a line each, in milliseconds: the module's compile by Cranelift, its first
-//! expansion in a crate session and the median of `--runs` more; with `--native`,
+//! expansion in a crate session and the median of `--runs` more, the median of `--runs` in a
+//! fresh instance each (made from the pool, run and dropped); with `--native`,
 //! the server's start and load of the library, its first expansion and the median of more.
 
 use std::{
@@ -137,7 +138,7 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<(), String> {
     let code = code.map_err(|e| e.to_string())?;
     let wasm = Wasm::at(&args.module, code.as_ref())?;
     println!("wasm compile: {}", Ms(wasm.compiled_in));
-    if let Some(code) = code {
+    if let Some(code) = &code {
         code.flush();
     }
     let macros = wasm.macros()?;
@@ -162,6 +163,21 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<(), String> {
         runs.push(ran.took);
     }
     println!("wasm warm: {}", Ms(median(&mut runs)));
+    // As a module whose expansions keep no state runs: each in a fresh instance in a slot of
+    // the pool, made, run and dropped.
+    let fresh = Wasm::at_kind(&args.module, code.as_ref(), crate::Kind::Fresh)?;
+    runs.clear();
+    for _ in 0..args.runs {
+        let start = Instant::now();
+        // alloc: the message of an instance that can't start.
+        let mut instance = fresh.session(&env).map_err(|e| format!("{e:?}"))?;
+        let ran = instance.expand(index as u32, listed, None, &call);
+        drop(instance);
+        // alloc: the message of an expansion that failed.
+        ran.output.map_err(|e| format!("{e:?}"))?;
+        runs.push(start.elapsed());
+    }
+    println!("wasm fresh: {}", Ms(median(&mut runs)));
     // alloc: the edge: the output as the command prints and compares it.
     let wasm_text = output.to_string();
 

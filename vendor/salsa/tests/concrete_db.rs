@@ -5,6 +5,8 @@
 //! they memoize, invalidate and evict as the `dyn` ones do, share a storage with them, and read
 //! the task depth through the database's own `task_depth`.
 
+#![forbid(unsafe_code)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use salsa::Setter;

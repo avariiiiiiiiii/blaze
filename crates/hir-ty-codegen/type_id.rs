@@ -580,6 +580,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             }
             TyKind::FnDef(def, args) => {
                 hasher.write_isize(13);
+                let args = args.skip_binder();
                 let path = match def.0 {
                     CallableDefId::FunctionId(func) => {
                         // A lifetime of a function is mostly late bound, and then no argument
@@ -987,7 +988,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
 
     fn has_explicit_discriminant(&self, variant: EnumVariantId) -> bool {
         let loc = variant.lookup(self.db);
-        loc.source(self.db).value.const_arg().is_some()
+        loc.source_view(self.db).value.const_arg().is_some()
     }
 
     /// A `VariantDef`. `path` is the variant's own, which for a struct or union is the type's.

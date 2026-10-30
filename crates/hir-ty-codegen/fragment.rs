@@ -894,14 +894,8 @@ pub(super) struct Seen {
 }
 
 /// What a function's `#[inline]` asks of LLVM where its body is shown, as rustc asks it:
-/// `inlinehint`, `alwaysinline` or `noinline`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Hint {
-    None,
-    Inline,
-    Always,
-    Never,
-}
+/// `inlinehint`, `alwaysinline` or `noinline`. The summary an importer reads says the same.
+pub(super) use blaze_codegen::summary::Hint;
 
 /// The namespace of the names of callees that are built into their callers. No relocation
 /// has it, as no call of one is left when the caller is compiled.

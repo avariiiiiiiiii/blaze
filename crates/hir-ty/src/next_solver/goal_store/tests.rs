@@ -111,8 +111,11 @@ const KNOB: FactRef = FactRef { kind: QueryKind(0x1000), subject: ContentId([3; 
 /// read outside the capture, as a read the facts would miss.
 #[salsa::input]
 struct Knob {
+    #[returns(copy)]
     value: u32,
+    #[returns(copy)]
     holds: bool,
+    #[returns(copy)]
     krate: Crate,
 }
 
@@ -477,7 +480,7 @@ fn a_goal_reads_back_from_its_stable_form_and_its_record() {
 }
 
 /// Offers [`the_goal`] with the reads of reading the knob's value, answered by `holds`.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn offered(db: &Db, knob: Knob) -> u32 {
     let interner = DbInterner::new_with(db, knob.krate(db));
     let answer = if knob.holds(db) { Answer::Holds } else { Answer::Fails };
@@ -573,7 +576,7 @@ fn a_database_finds_only_its_own_store() {
 }
 
 /// Offers [`the_goal`] under [`assert_at_most`]: with no store, nothing is allocated.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 fn offered_with_no_store(db: &Db, knob: Knob) -> u32 {
     let interner = DbInterner::new_with(db, knob.krate(db));
     let goal = the_goal(interner);

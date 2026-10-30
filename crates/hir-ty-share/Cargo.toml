@@ -33,7 +33,7 @@ blaze-items.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-proptest.workspace = true
+hegeltest.workspace = true
 test-fixture.workspace = true
 
 [lints]

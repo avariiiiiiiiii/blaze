@@ -20,7 +20,7 @@ smallvec.workspace = true
 # The one `wasmtime` 49's Cranelift names its targets with.
 target-lexicon = "0.13"
 # The version whose Cranelift is the one hir-ty-codegen compiles with (`cranelift-codegen` 0.136).
-wasmtime = { version = "49", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std"] }
+wasmtime = { version = "49", default-features = false, features = ["cranelift", "parallel-compilation", "pooling-allocator", "runtime", "std"] }
 
 base-db.workspace = true
 blaze-cas.workspace = true
@@ -38,6 +38,7 @@ paths.workspace = true
 proc-macro-api.workspace = true
 blaze-store.workspace = true
 span.workspace = true
+stdx.workspace = true
 tt.workspace = true
 
 [dev-dependencies]

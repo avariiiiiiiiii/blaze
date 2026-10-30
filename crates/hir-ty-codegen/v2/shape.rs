@@ -11,6 +11,7 @@
 use std::hash::{Hash as _, Hasher};
 
 use blaze_codegen::{Unit, backend::Shape};
+use blaze_format::cursor::Put;
 use blaze_mem::Frame;
 use cranelift_codegen::ir::{self, UserExternalName};
 
@@ -208,11 +209,11 @@ impl Out<'_> {
     }
 
     fn u32(&mut self, it: u32) {
-        self.0.extend_from_slice(&it.to_le_bytes());
+        self.0.put_u32(it);
     }
 
     fn u64(&mut self, it: u64) {
-        self.0.extend_from_slice(&it.to_le_bytes());
+        self.0.put_u64(it);
     }
 
     fn raw(&mut self, bytes: &[u8]) {
@@ -220,8 +221,7 @@ impl Out<'_> {
     }
 
     fn bytes(&mut self, bytes: &[u8]) {
-        self.u64(bytes.len() as u64);
-        self.raw(bytes);
+        self.0.put_bytes_u64(bytes);
     }
 
     fn name(&mut self, name: UserExternalName) {

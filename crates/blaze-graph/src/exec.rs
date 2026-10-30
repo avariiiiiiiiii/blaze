@@ -50,7 +50,7 @@ pub fn ids(count: usize) -> u32 {
 }
 
 /// What a node's work came to, and the nodes it found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Did {
     pub outcome: Outcome,
     pub added: Vec<Spec>,
@@ -114,7 +114,10 @@ where
     let config = machine.config();
     let workers = Lent::take(config.work, "worker");
     let io = Lent::take(config.io, "IO");
-    let (done_tx, done_rx) = unbounded::<(NodeId, Did, u64)>();
+    // The machine runs at most `work + io` nodes at once and starts another only once it has
+    // taken a `Done`, so this many never fill it: a worker's send never waits, and no send
+    // allocates (an unbounded channel makes a block every 31).
+    let (done_tx, done_rx) = bounded::<(NodeId, Did, u64)>(config.work + config.io);
     // Taken only to keep a node's panic, once it has unwound.
     // dyn: a panic's payload, as `catch_unwind` gives it
     let first_panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
@@ -168,13 +171,16 @@ where
     N: Fn() -> u64,
     S: FnMut(&Record),
 {
+    // alloc: once per build; each step's outputs are drained from it
+    let mut outputs = Vec::new();
     let mut feed = |input: Input| -> Result<Option<bool>, Error> {
         if let Some(trace) = trace.as_deref_mut() {
             // clone: only when the caller asked for a trace, to replay the build
             trace.push(input.clone());
         }
         let mut over = None;
-        for output in machine.step(input)? {
+        machine.step_into(input, &mut outputs)?;
+        for output in outputs.drain(..) {
             match output {
                 Output::Said(record) => said(&record),
                 Output::Run { id, pool } => post(id, pool),
@@ -237,11 +243,7 @@ fn ns(start: Instant) -> u64 {
 
 // dyn: a panic's payload, read once per task that panicked
 fn panicked(panic: &(dyn Any + Send)) -> String {
-    let what = panic
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("a panic with no message");
+    let what = stdx::panic_text(panic).unwrap_or("a panic with no message");
     // alloc: the failure's message
     format!("panicked: {what}")
 }
@@ -274,7 +276,7 @@ pub struct Task<W> {
 }
 
 /// What a request's opener hears of it, in order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Heard {
     Said(Record),
     /// The last of a request: nothing more comes.
@@ -390,6 +392,11 @@ const RUNS: usize = blaze_mem::pool::BATCH;
 /// under way; every other message is a handle's, whose sender waits while it is full. The
 /// owner itself never sends to it ([`Owner::later`]), so it always drains.
 const MAILBOX: usize = 1 << 12;
+
+/// The most messages the owner takes, without waiting, between two readings of what blaze
+/// holds ([`arena::own`] reads every subsystem's counters, lines the workers keep writing): so
+/// a reading costs a run 1/64 of it, and a stream of messages never holds it back for long.
+const HELD_EVERY: usize = 64;
 
 /// A run under way in the owner's [`Table`]: its slot, and what holding it back needs.
 struct Slot<R: Runner> {
@@ -712,11 +719,13 @@ impl<W> Handle<W> {
 /// ends) inside [`arena::measure`] and [`blaze_mem::frame::measure`], and its `Done` gives the
 /// plane the peak it held in both and the group it ran on. With a budget, the frames grow
 /// under its [`admission::share`] for [`MemTag::Frames`] ([`blaze_mem::frame::Cap`]); a task
-/// the cap cancels is posted again, as one that gives way. After each `Done` the plane
-/// hears what blaze holds ([`arena::own`]). The scheduler's [`Predict`] gives each task
-/// added or found its cost and memory before the plane sees it, and learns the peak and own run
-/// time of each run that ends with a result (a run that gave way and one that panicked teach it
-/// nothing), under the task's kind and its spec's key. A task the plane says is on its request's
+/// the cap cancels is posted again, as one that gives way. With a budget, the plane hears
+/// what blaze holds ([`arena::own`]) after the `Done`s the owner took without waiting, at
+/// most [`HELD_EVERY`] messages apart, and before it waits again. The scheduler's
+/// [`Predict`] gives each task added or found its cost and memory before the plane sees it,
+/// and learns the peak and own run time of each run that ends with a result (a run that gave
+/// way and one that panicked teach it nothing), under the task's kind and its spec's key. A
+/// task the plane says is on its request's
 /// critical path runs on a fast group of the pool ([`Workers::submit_critical`]). Work that
 /// returns [`Cancelled`] is posted again (the plane still sees it running), behind what is
 /// ready on its group. The clock is read here, never by the plane.
@@ -825,6 +834,9 @@ impl<W: Send + 'static> Scheduler<W> {
             throttle,
             later: VecDeque::new(),
             io_threads,
+            said: Vec::new(), // alloc: none, empty; the owner's buffer, kept across steps
+            new: Vec::new(), // alloc: none, empty; the owner's buffer, kept across adds
+            held_due: false,
         };
         let owner = thread::Builder::new()
             // alloc: a thread's name, once per scheduler
@@ -899,6 +911,16 @@ struct Owner<R: Runner, P, M> {
     /// hand: never through its own mailbox, which could be full.
     later: VecDeque<Msg<R::Work>>,
     io_threads: usize,
+    /// The plane's outputs of a step, kept empty between steps so a step allocates nothing. A
+    /// step its outputs start (a run that fails) takes it while the outer step holds it out,
+    /// and works from a fresh one.
+    said: Vec<PlaneOutput>,
+    /// The nodes of an add whose work is new, kept empty between adds: an add the plane
+    /// refuses takes their work back out.
+    new: Vec<NodeId>,
+    /// A run ended since the plane last heard what blaze holds: with a budget, it hears before
+    /// the owner next waits. Without one the plane reads no holding, so it is never told.
+    held_due: bool,
 }
 
 impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
@@ -913,16 +935,24 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
             }
         }
         let _stop_io = StopIo(self.ctx, self.io_threads);
-        // The owner's one wait.
+        // The owner's one wait. What is already in the mailbox is taken before the plane hears
+        // what blaze holds, up to `HELD_EVERY` messages, and it hears before the next wait.
         'serve: while let Ok(msg) = rx.recv() {
-            if !self.take(msg) {
-                break;
-            }
-            while let Some(msg) = self.later.pop_front() {
+            let mut next = Some(msg);
+            let mut taken = 0;
+            while let Some(msg) = next {
                 if !self.take(msg) {
                     break 'serve;
                 }
+                while let Some(msg) = self.later.pop_front() {
+                    if !self.take(msg) {
+                        break 'serve;
+                    }
+                }
+                taken += 1;
+                next = if taken < HELD_EVERY { rx.try_recv().ok() } else { None };
             }
+            self.hear_held();
         }
         // A run held back is under way to the plane: it runs, its budget aside, so that the
         // table empties.
@@ -954,30 +984,32 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                     // Its room in the plane is given back once it finishes; after that a step
                     // naming it is refused as `UnknownRequest`.
                     let released = self.plane.release(request);
-                    // alloc: empty, allocates nothing
-                    self.outputs(request, released.map(|()| Vec::new()));
+                    let said = std::mem::take(&mut self.said);
+                    self.outputs(request, released, said);
                 } else {
                     self.heard.remove(&request);
                 }
             }
             Msg::Add { request, tasks } => {
+                // alloc: the plane's input, owned by it; `PlaneInput::AddNodes` is the columnar way
                 let mut nodes = Vec::with_capacity(tasks.len());
-                let mut new = Vec::with_capacity(tasks.len());
+                let mut new = std::mem::take(&mut self.new);
+                new.clear();
                 for Task { mut spec, kind, work } in tasks {
                     self.predict.predict(kind, spec.key).apply(&mut spec);
                     // A node added twice is refused by the plane: the first keeps its work.
-                    if !self.works.contains_key(&spec.id) {
-                        let entry = Entry { request, kind, key: spec.key, work: Some(work) };
-                        self.works.insert(spec.id, entry);
+                    if let std::collections::hash_map::Entry::Vacant(it) = self.works.entry(spec.id) {
+                        it.insert(Entry { request, kind, key: spec.key, work: Some(work) });
                         new.push(spec.id);
                     }
                     nodes.push(spec);
                 }
                 if !self.step(request, PlaneInput::Add { at_ns, request, nodes }) {
-                    for id in new {
+                    for id in new.drain(..) {
                         self.works.remove(&id);
                     }
                 }
+                self.new = new;
             }
             Msg::Found { request, works } => {
                 for FoundWork { id, key, kind, work } in works {
@@ -988,8 +1020,9 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
             }
             Msg::Close { request } => _ = self.step(request, PlaneInput::Close { at_ns, request }),
             Msg::Cancel { request } => {
-                let outputs = self.plane.cancel(at_ns, request);
-                self.outputs(request, outputs);
+                let mut said = std::mem::take(&mut self.said);
+                let taken = self.plane.cancel_into(at_ns, request, &mut said);
+                self.outputs(request, taken, said);
             }
             Msg::Done { at_ns, slot, id, request, kind, key, did, measure, group } => {
                 if let Some(slot) = slot {
@@ -1028,8 +1061,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                     let input = PlaneInput::Done { at_ns, id, outcome, added: Vec::new(), group, peak };
                     self.step(request, input);
                 }
-                let held = PlaneInput::Held { at_ns: ns(self.ctx.start), bytes: arena::own() };
-                self.step(request, held);
+                self.held_due = self.plane.config().budget.is_some();
                 while let Some(at) = self.throttle.next(blaze_mem::tag::over_budget) {
                     self.start(at);
                 }
@@ -1044,14 +1076,33 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
 
     /// Steps the plane; what it refuses goes to `request`'s opener. Whether it took it.
     fn step(&mut self, request: RequestId, input: PlaneInput) -> bool {
-        let outputs = self.plane.step(input);
-        self.outputs(request, outputs)
+        let mut said = std::mem::take(&mut self.said);
+        let taken = self.plane.step_into(input, &mut said);
+        self.outputs(request, taken, said)
     }
 
-    fn outputs(&mut self, request: RequestId, outputs: Result<Vec<PlaneOutput>, Error>) -> bool {
-        match outputs {
-            Ok(outputs) => {
-                for output in outputs {
+    /// Tells the plane what blaze holds now, if a run ended since it was last told. The plane
+    /// takes every `Held`, so no opener hears of it.
+    fn hear_held(&mut self) {
+        if !self.held_due {
+            return;
+        }
+        self.held_due = false;
+        let held = PlaneInput::Held { at_ns: ns(self.ctx.start), bytes: arena::own() };
+        self.step(RequestId(u32::MAX), held);
+    }
+
+    /// Hands on what the plane appended to `said` (nothing when it refused), then keeps `said`,
+    /// emptied, for the next step.
+    fn outputs(
+        &mut self,
+        request: RequestId,
+        taken: Result<(), Error>,
+        mut said: Vec<PlaneOutput>,
+    ) -> bool {
+        let took = match taken {
+            Ok(()) => {
+                for output in said.drain(..) {
                     self.output(output);
                 }
                 true
@@ -1062,7 +1113,12 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                 }
                 false
             }
+        };
+        // A step taken while this one drained left a buffer of its own; the larger is kept.
+        if said.capacity() >= self.said.capacity() {
+            self.said = said;
         }
+        took
     }
 
     fn output(&mut self, output: PlaneOutput) {

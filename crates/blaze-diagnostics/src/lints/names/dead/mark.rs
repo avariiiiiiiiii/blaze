@@ -26,7 +26,7 @@
 mod body;
 
 use either::Either;
-use hir::{Adjust, HirFileId, InFile, ModuleDef, PathResolution};
+use hir::{HirFileId, InFile, ModuleDef, PathResolution};
 use hir_def::{
     AdtId, AttrDefId, DefWithBodyId, FieldId, attrs::AttrFlags, builtin_derive::BuiltinDeriveImplTrait,
     expr_store::Body,
@@ -528,7 +528,10 @@ impl<'db> Mark<'_, '_, '_, 'db> {
     fn path(&mut self, path: ast::Path<'db>) -> Res {
         let cx = self.k.cx;
         let parent = path.syntax().parent().map(|it| it.kind());
-        if matches!(parent, Some(SyntaxKind::MACRO_CALL | SyntaxKind::META)) {
+        if matches!(
+            parent,
+            Some(SyntaxKind::MACRO_CALL | SyntaxKind::PATH_META | SyntaxKind::KEY_VALUE_META | SyntaxKind::TOKEN_TREE_META)
+        ) {
             return Res::None;
         }
         let Some(res) = cx.vsema.resolve_path(path) else { return Res::None };
@@ -759,7 +762,7 @@ impl<'db> Mark<'_, '_, '_, 'db> {
                 .cx
                 .vsema
                 .expr_adjustments(place)
-                .is_some_and(|it| it.iter().any(|it| matches!(it.kind, Adjust::Deref(_))));
+                .is_some_and(|it| it.iter().any(|it| matches!(it.kind, hir_ty::Adjust::Deref(_))));
         match place {
             ast::Expr::FieldExpr(field) if !derefs => {
                 if let Some(base) = field.expr() {

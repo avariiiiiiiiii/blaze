@@ -10,7 +10,9 @@
 use hir::{LangItem, PathResolution};
 use syntax::{
     TextRange,
-    view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
+    view::{
+        self as ast, AstNode as _, HasArgList as _, HasAttrs as _, HasGenericArgs as _, HasName as _,
+    },
 };
 
 use super::large_types_passed_by_value::{Owner, foreign_abi, owner};

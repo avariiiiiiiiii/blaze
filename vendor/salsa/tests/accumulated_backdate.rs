@@ -3,6 +3,8 @@
 //! Tests that accumulated values are correctly accounted for
 //! when backdating a value.
 
+#![forbid(unsafe_code)]
+
 mod common;
 use common::LogDatabase;
 use expect_test::expect;

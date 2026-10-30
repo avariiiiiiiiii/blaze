@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use blaze_manifest::config::schema::{CargoResolverConfig, IncompatibleRustVersions};
-use blaze_manifest::dependency::{DepKind as ManifestDepKind, SerializedDependency};
+use blaze_manifest::config::schema::{CargoResolverConfig, FeatureUnification, IncompatibleRustVersions};
+use blaze_manifest::dependency::SerializedDependency;
 use blaze_manifest::files::Files;
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
 use blaze_manifest::metadata::{SerializedPackage, export_package};
@@ -83,11 +83,7 @@ pub fn dependency(dep: &SerializedDependency<'_>) -> Result<Dependency> {
         req => Some(req),
     };
     let mut d = Dependency::parse(dep.name, req, source)?;
-    d.set_kind(match dep.kind {
-        ManifestDepKind::Normal => DepKind::Normal,
-        ManifestDepKind::Development => DepKind::Development,
-        ManifestDepKind::Build => DepKind::Build,
-    });
+    d.set_kind(dep.kind);
     if let Some(rename) = dep.rename {
         d.set_explicit_name_in_toml(rename);
     }
@@ -348,6 +344,17 @@ pub fn rust_versions<F: Files>(
     Ok(Some(members.iter().map(RustVersion::to_partial).collect())) // alloc: as above
 }
 
+/// `resolver.feature-unification`, which nightly cargo reads only with `-Zfeature-unification`
+/// (`unstable.feature-unification`); `selected` otherwise.
+pub fn feature_unification<F: Files>(config: &Config<F>) -> Result<FeatureUnification> {
+    let resolver = config.get::<CargoResolverConfig>("resolver")?;
+    let unstable = config.get::<Option<bool>>("unstable.feature-unification")?;
+    Ok(match (unstable, resolver.feature_unification) {
+        (Some(true), Some(it)) => it,
+        _ => FeatureUnification::Selected,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,7 +426,7 @@ mod tests {
         }
     }
 
-    fn dep<'a>(name: &'a str, req: &str, kind: ManifestDepKind) -> SerializedDependency<'a> {
+    fn dep<'a>(name: &'a str, req: &str, kind: DepKind) -> SerializedDependency<'a> {
         SerializedDependency {
             name,
             source: None,
@@ -451,9 +458,9 @@ mod tests {
         let required = ["cli".to_owned()];
         let feature_list = ["serde".to_owned()];
         let platform: blaze_resolve::Platform = "cfg(unix)".parse().unwrap();
-        let mut path_dep = dep("helper", "*", ManifestDepKind::Normal);
+        let mut path_dep = dep("helper", "*", DepKind::Normal);
         path_dep.path = Some(PathBuf::from("/w/m/../helper"));
-        let mut registry_dep = dep("serde_json", "^1.0", ManifestDepKind::Development);
+        let mut registry_dep = dep("serde_json", "^1.0", DepKind::Development);
         registry_dep.rename = Some("json");
         registry_dep.optional = true;
         registry_dep.uses_default_features = false;
@@ -467,7 +474,7 @@ mod tests {
             license_file: None,
             description: None,
             source: None,
-            dependencies: vec![path_dep, registry_dep, dep("cc", "^1", ManifestDepKind::Build)],
+            dependencies: vec![path_dep, registry_dep, dep("cc", "^1", DepKind::Build)],
             targets: vec![
                 target(&example, "ex", &src, None),
                 target(&lib, "my-macros", &src, None),
@@ -519,5 +526,21 @@ mod tests {
         let root = Root::new(Path::new("/w"), "[patch.crates-io]\na = { path = \"vendor/a\" }\nb = \"1\"\n").unwrap();
         assert_eq!(patch_paths(&root), vec![PathBuf::from("/w/vendor/a")]);
         assert_eq!(patch_tables(&root).unwrap()[0].1.len(), 2);
+    }
+
+    #[test]
+    fn feature_unification_is_read_only_when_unstable_allows_it() {
+        let unification = |env: &[(&str, &str)]| {
+            let mut env: Vec<(String, String)> = env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+            env.push(("CARGO_HOME".to_owned(), "/blaze-no-such-home".to_owned()));
+            let config = Config::load_with(Path::new("/blaze-no-such-dir"), env, blaze_manifest::files::Disk).unwrap();
+            feature_unification(&config).unwrap()
+        };
+        let asked = ("CARGO_RESOLVER_FEATURE_UNIFICATION", "workspace");
+        let allowed = ("CARGO_UNSTABLE_FEATURE_UNIFICATION", "true");
+        assert!(matches!(unification(&[]), FeatureUnification::Selected));
+        assert!(matches!(unification(&[asked]), FeatureUnification::Selected));
+        assert!(matches!(unification(&[allowed]), FeatureUnification::Selected));
+        assert!(matches!(unification(&[asked, allowed]), FeatureUnification::Workspace));
     }
 }

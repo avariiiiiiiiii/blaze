@@ -8,6 +8,8 @@
 //! ids are based on the *hash* of the untracked fields, ids are generational
 //! based on the field values.
 
+#![forbid(unsafe_code)]
+
 use salsa::{Database as Db, Setter};
 use test_log::test;
 

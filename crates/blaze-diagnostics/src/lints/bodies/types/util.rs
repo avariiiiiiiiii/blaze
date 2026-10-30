@@ -45,7 +45,7 @@ pub(crate) fn fn_item(db: &Db, def: FunctionId) -> Option<Symbol> {
 
 /// The function `call` calls when its callee is a path naming one (rustc's `qpath_res` of the
 /// callee, `opt_def_id`), and the callee.
-pub(crate) fn called_fn(b: &BodyCx<'_, '_>, call: ExprId) -> Option<(FunctionId, ExprId)> {
+pub(crate) fn called_fn(b: &BodyCx<'_, '_, '_>, call: ExprId) -> Option<(FunctionId, ExprId)> {
     let Expr::Call { callee, .. } = b.store().expr(call) else { return None };
     let Expr::Path(_) = b.store().expr(callee) else { return None };
     match b.infer.expr_ty(callee).kind() {
@@ -55,14 +55,14 @@ pub(crate) fn called_fn(b: &BodyCx<'_, '_>, call: ExprId) -> Option<(FunctionId,
 }
 
 /// The diagnostic item of the function `call` calls through a path, with its arguments.
-pub(crate) fn called_item<'a>(b: &'a BodyCx<'_, '_>, call: ExprId) -> Option<(Symbol, &'a [ExprId])> {
+pub(crate) fn called_item<'a>(b: &'a BodyCx<'_, '_, '_>, call: ExprId) -> Option<(Symbol, &'a [ExprId])> {
     let (def, _) = called_fn(b, call)?;
     let name = fn_item(b.db(), def)?;
     Some((name, call_args(b, call)?))
 }
 
 /// The arguments of the call `call`, if it is one.
-pub(crate) fn call_args<'a>(b: &'a BodyCx<'_, '_>, call: ExprId) -> Option<&'a [ExprId]> {
+pub(crate) fn call_args<'a>(b: &'a BodyCx<'_, '_, '_>, call: ExprId) -> Option<&'a [ExprId]> {
     match b.store().expr(call) {
         Expr::Call { args, .. } => Some(args),
         _ => None,
@@ -71,14 +71,14 @@ pub(crate) fn call_args<'a>(b: &'a BodyCx<'_, '_>, call: ExprId) -> Option<&'a [
 
 /// The function a method call resolved to (rustc's `type_dependent_def_id`): the trait's
 /// method for a method of a trait.
-pub(crate) fn method_fn(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<FunctionId> {
+pub(crate) fn method_fn(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<FunctionId> {
     let Expr::MethodCall { .. } = b.store().expr(expr) else { return None };
     b.infer.method_resolution(expr).map(|(def, _)| def)
 }
 
 /// What the path `expr` names in the value namespace (rustc's `qpath_res`): an associated item
 /// as type checking picked it, else what inference resolved the path to. Two table lookups.
-pub(crate) fn path_value(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ValueNs> {
+pub(crate) fn path_value(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<ValueNs> {
     let Expr::Path(_) = b.store().expr(expr) else { return None };
     if let Some((assoc, _)) = b.infer.assoc_resolutions_for_expr(expr) {
         return Some(match assoc {
@@ -90,7 +90,7 @@ pub(crate) fn path_value(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ValueNs> {
 }
 
 /// The diagnostic item the path `expr` names (`f32::NAN`, `std::ptr::null`).
-pub(crate) fn path_item(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Symbol> {
+pub(crate) fn path_item(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Symbol> {
     let def = match path_value(b, expr)? {
         ValueNs::FunctionId(it) => AttrDefId::FunctionId(it),
         ValueNs::ConstId(it) => AttrDefId::ConstId(it),
@@ -102,7 +102,7 @@ pub(crate) fn path_item(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Symbol> {
 }
 
 /// rustc's `Expr::peel_blocks`: through each block with a tail to its tail.
-pub(crate) fn peel_blocks(b: &BodyCx<'_, '_>, mut expr: ExprId) -> ExprId {
+pub(crate) fn peel_blocks(b: &BodyCx<'_, '_, '_>, mut expr: ExprId) -> ExprId {
     while let Expr::Block { tail: Some(tail), .. } = b.store().expr(expr) {
         expr = tail;
     }
@@ -110,7 +110,7 @@ pub(crate) fn peel_blocks(b: &BodyCx<'_, '_>, mut expr: ExprId) -> ExprId {
 }
 
 /// rustc's `Expr::peel_borrows`: through each `&`, `&mut` and `&raw` to what it borrows.
-pub(crate) fn peel_borrows(b: &BodyCx<'_, '_>, mut expr: ExprId) -> ExprId {
+pub(crate) fn peel_borrows(b: &BodyCx<'_, '_, '_>, mut expr: ExprId) -> ExprId {
     while let Expr::Ref { expr: inner, .. } = b.store().expr(expr) {
         expr = inner;
     }
@@ -118,7 +118,7 @@ pub(crate) fn peel_borrows(b: &BodyCx<'_, '_>, mut expr: ExprId) -> ExprId {
 }
 
 /// The literal `expr` is, if it is one.
-pub(crate) fn literal<'a>(b: &'a BodyCx<'_, '_>, expr: ExprId) -> Option<&'a Literal> {
+pub(crate) fn literal<'a>(b: &'a BodyCx<'_, '_, '_>, expr: ExprId) -> Option<&'a Literal> {
     match b.store().expr(expr) {
         Expr::Literal(it) => Some(it),
         _ => None,
@@ -126,28 +126,28 @@ pub(crate) fn literal<'a>(b: &'a BodyCx<'_, '_>, expr: ExprId) -> Option<&'a Lit
 }
 
 /// The type type checking gave `expr`, before its adjustments (rustc's `expr_ty`).
-pub(crate) fn ty<'db>(b: &BodyCx<'_, 'db>, expr: ExprId) -> Ty<'db> {
+pub(crate) fn ty<'db>(b: &BodyCx<'_, '_, 'db>, expr: ExprId) -> Ty<'db> {
     b.infer.expr_ty(expr)
 }
 
 /// The type of `expr` after its adjustments (rustc's `expr_ty_adjusted`).
-pub(crate) fn ty_adjusted<'db>(b: &BodyCx<'_, 'db>, expr: ExprId) -> Ty<'db> {
+pub(crate) fn ty_adjusted<'db>(b: &BodyCx<'_, '_, 'db>, expr: ExprId) -> Ty<'db> {
     b.infer.type_of_expr_with_adjust(expr).unwrap_or_else(|| b.infer.expr_ty(expr))
 }
 
 /// The syntax `expr` is written as, parsed or expanded.
-pub(crate) fn syntax<'db>(b: &BodyCx<'_, 'db>, expr: ExprId) -> Option<InFile<ast::Node<'db>>> {
+pub(crate) fn syntax<'db>(b: &BodyCx<'_, '_, 'db>, expr: ExprId) -> Option<InFile<ast::Node<'db>>> {
     Some(b.cx.syntax_view(b.expr_node(expr)?))
 }
 
 /// [`BodyCx::expr_span`], parentheses included.
-pub(crate) fn span(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
+pub(crate) fn span(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Span> {
     b.expr_span(expr)
 }
 
 /// rustc's printing of `ty`, a type of the body, as a type of the body's owner (that of the
 /// expression `near`, written in the body's source).
-pub(crate) fn print_ty<'db>(b: &BodyCx<'_, 'db>, near: ExprId, ty: Ty<'db>) -> Option<String> {
+pub(crate) fn print_ty<'db>(b: &BodyCx<'_, '_, 'db>, near: ExprId, ty: Ty<'db>) -> Option<String> {
     let node = syntax(b, near)?;
     let expr = ast::Expr::cast(node.value)?;
     let of = b.cx.vsema.type_of_expr(expr)?.original;
@@ -162,7 +162,7 @@ pub(crate) struct Solver<'db> {
 }
 
 impl<'db> Solver<'db> {
-    pub(crate) fn of(b: &BodyCx<'_, 'db>) -> Solver<'db> {
+    pub(crate) fn of(b: &BodyCx<'_, '_, 'db>) -> Solver<'db> {
         let db = b.db();
         let env = db.trait_environment(b.owner.generic_def(db));
         let interner = DbInterner::new_with(db, b.owner.krate(db));
@@ -210,7 +210,7 @@ pub(crate) fn from_expansion(span: &Span) -> bool {
 
 /// rustc's `in_external_macro` of where `expr` is written: in the expansion of a macro of
 /// another crate (std's `vec!`, `format_args!`), not handed to it by the caller.
-pub(crate) fn in_external_macro(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+pub(crate) fn in_external_macro(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     let Some(node) = b.expr_node(expr) else { return false };
     if !from_expansion(&b.cx.span_of(node)) {
         return false;

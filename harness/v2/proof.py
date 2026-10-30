@@ -8,14 +8,13 @@
 The checks, each a script of this directory run with the same `engine` (v1 now, v2 later):
 
     oracle        oracle.py: the incremental build equals one from scratch after every edit
-    corpus        corpus.py: real crates built, run and tested under blaze and rustc
-    rejections    rejections.py: rustc's compile-fail tests fail with the same error codes and spans
-    cases         frontend/cases.py: the front end's cases, each held to rustc then compared with it
-    fuzz          frontend/fuzz.py: generated programs compared with rustc, each mismatch shrunk to a case
-    share         share.py: the instance-sharing programs print what Rust guarantees under rustc and blaze
+    corpus        corpus.py: real crates built, run and tested by blaze, judged by their own tests
+    cases         frontend/cases.py: the front end's cases, each accepted or refused as its header says
+    dbsp          dbsp/edits.py: edit sequences of dbsp built incrementally by blaze
+    share         share.py: the instance-sharing programs print what Rust guarantees under blaze
     determinism   determinism.py: two builds on different core counts, byte for byte the same
     tightmemory   tightmemory.py: a build under a tight memory budget finishes, never OOMs
-    macroeval     macroeval_corpus.py: blaze-macro-eval's corpus expands as rustc's proc macros do
+    macroeval     macroeval_corpus.py: blaze-macro-eval's corpus of proc macros
     budgets       budgets.py: the targets of docs/v2/plan/goals/targets.md
 
 Each writes its result (report.py's shape) to `OUT/<check>.json` and what it printed to
@@ -52,14 +51,13 @@ import report  # noqa: E402
 from typed_input import fail, parse  # noqa: E402
 
 SCRIPT = "proof.py"
-type Name = Literal["oracle", "corpus", "rejections", "cases", "fuzz", "share", "determinism", "tightmemory",
-                    "macroeval", "budgets"]
+type Name = Literal["oracle", "corpus", "cases", "dbsp", "share", "determinism", "tightmemory", "macroeval",
+                    "budgets"]
 SCRIPTS: dict[str, tuple[str, ...]] = {
     "oracle": ("oracle.py", "run"),
     "corpus": ("corpus.py",),
-    "rejections": ("rejections.py",),
     "cases": ("frontend/cases.py",),
-    "fuzz": ("frontend/fuzz.py",),
+    "dbsp": ("dbsp/edits.py",),
     "share": ("share.py",),
     "determinism": ("determinism.py",),
     "tightmemory": ("tightmemory.py",),
@@ -188,7 +186,9 @@ def run(it: Input) -> None:
     whole.finish()
 
 
-def selftest() -> list[str]:
+def selftest(proof: Path | None) -> list[str]:
+    """`proof` is the `blaze-v2-proof` binary that `engine.tree_digest` runs; without it, that
+    check is one wrong line saying so."""
     wrong: list[str] = []
     if [verdict_of([{"verdict": v} for v in vs]) for vs in (["pass"], ["pass", "unmeasured"], ["error", "fail"], [])] != [
         "pass", "unmeasured", "fail", "pass"]:
@@ -211,7 +211,7 @@ def selftest() -> list[str]:
         {"name": "nushell body", "verdict": "fail", "detail": "took 80 ms", "numbers": {"ms": 80, "budget": 30}}]})])
     if "| nushell body | fail | ms=80  budget=30 | took 80 ms |" not in md:
         wrong.append(f"markdown has no row of the budget:\n{md}")
-    return wrong + v2_work_wrong() + files_wrong() + v1_logs_wrong()
+    return wrong + v2_work_wrong() + files_wrong(proof) + v1_logs_wrong()
 
 
 def old_outputs(target: Path, profile: str) -> dict[str, str]:
@@ -251,8 +251,40 @@ def old_first_difference(a: Path, b: Path) -> str:
             at += len(x)
 
 
-def files_wrong() -> list[str]:
-    """`engine.outputs`, `first_difference`, `tree_digest` and `Kept` against their models, on
+def old_tree_digest(root: Path, skip: tuple[str, ...]) -> str:
+    """`engine.tree_digest` as it was (`os.walk`, an `lstat` an entry, the files hashed in
+    Python): its model, whose digests runs before the change kept."""
+    import os
+    import stat
+
+    import blake3
+
+    files: list[tuple[str, Path, bool]] = []
+    links: list[tuple[str, str]] = []
+    for here, dirs, names in os.walk(root):
+        base = Path(here)
+        if base == root:
+            dirs[:] = [d for d in dirs if d not in skip]
+        for name in [*dirs, *names]:
+            path = base / name
+            info = path.lstat()
+            rel = path.relative_to(root).as_posix()
+            if stat.S_ISLNK(info.st_mode):
+                links.append((rel, os.readlink(path)))
+            elif stat.S_ISREG(info.st_mode):
+                files.append((rel, path, bool(info.st_mode & 0o111)))
+    files.sort()
+    links.sort()
+    h = blake3.blake3(b"blaze v2 proof tree 2\0")
+    for rel, path, executable in files:
+        h.update(f"f\0{rel}\0{int(executable)}\0{blake3.blake3(path.read_bytes()).hexdigest()}\n".encode())
+    for rel, to in links:
+        h.update(f"l\0{rel}\0{to}\n".encode())
+    return h.hexdigest()
+
+
+def files_wrong(proof: Path | None) -> list[str]:
+    """`engine.outputs`, `first_difference` and `tree_digest` against their models, on
     files made here: sizes across the megabyte buffers, every kind of entry `outputs` skips."""
     import os
     import random
@@ -295,41 +327,46 @@ def files_wrong() -> list[str]:
                 for first, second in ((a, b), (b, a)):
                     if (got_d := engine.first_difference(first, second)) != (want_d := old_first_difference(first, second)):
                         wrong.append(f"engine.first_difference, {size} bytes: {got_d!r}, not {want_d!r}")
+                    if proof is not None and (by := engine.first_difference_by(proof, first, second)) != want_d:
+                        wrong.append(f"engine.first_difference_by, {size} bytes: {by!r}, not {want_d!r}")
         src = root / "src"
         (src / "target").mkdir(parents=True)
         (src / "lib.rs").write_text("fn f() {}\n")
         (src / "target" / "out").write_text("built\n")
         (src / "build.sh").write_text("#!/bin/sh\n")
-        before = engine.tree_digest(src, ("target",))
-        (src / "target" / "out").write_text("built again\n")
-        if engine.tree_digest(src, ("target",)) != before:
-            wrong.append("engine.tree_digest reads a directory it skips")
-        for change in ("edit", "mode", "link", "rename"):
-            if change == "edit":
-                (src / "lib.rs").write_text("fn g() {}\n")
-            elif change == "mode":
-                (src / "build.sh").chmod(0o755)
-            elif change == "link":
-                os.symlink("lib.rs", src / "alias.rs")
-            else:
-                (src / "lib.rs").rename(src / "main.rs")
-            after = engine.tree_digest(src, ("target",))
-            if after == before:
-                wrong.append(f"engine.tree_digest misses a {change}")
-            before = after
-        kept = engine.Kept(str(root / "kept"), "test")
-        key = kept.key("a", "b")
-        if key == kept.key("a\0b") or key == engine.Kept("", "other").key("a", "b"):
-            wrong.append("engine.Kept.key: two inputs have one key")
-        if kept.get(key) is not None:
-            wrong.append("engine.Kept.get: an entry before it was put")
-        kept.put(key, {"returncode": 1, "stdout": "x"})
-        if kept.get(key) != {"returncode": 1, "stdout": "x"}:
-            wrong.append(f"engine.Kept: {kept.get(key)!r} came back")
-        off = engine.Kept("", "test")
-        off.put(key, 1)
-        if off.get(key) is not None:
-            wrong.append("engine.Kept with no root kept something")
+        (src / "deep" / "er").mkdir(parents=True)
+        for n in range(150):
+            (src / "deep" / "er" / f"m{n}.rs").write_text(f"fn m{n}() {{}}\n")
+        (src / "big.bin").write_bytes(rng.randbytes((1 << 20) + 5))
+
+        def tree(when: str) -> str:
+            if proof is None:
+                raise engine.Failed("no `blaze-v2-proof` given: `proof.py selftest PATH`")
+            got = engine.tree_digest(src, ("target",), proof)
+            if got != (want := old_tree_digest(src, ("target",))):
+                wrong.append(f"engine.tree_digest {when}: {got}, not the model's {want}")
+            return got
+
+        try:
+            before = tree("at first")
+            (src / "target" / "out").write_text("built again\n")
+            if tree("after a skipped write") != before:
+                wrong.append("engine.tree_digest reads a directory it skips")
+            for change in ("edit", "mode", "link", "rename"):
+                if change == "edit":
+                    (src / "lib.rs").write_text("fn g() {}\n")
+                elif change == "mode":
+                    (src / "build.sh").chmod(0o755)
+                elif change == "link":
+                    os.symlink("lib.rs", src / "alias.rs")
+                else:
+                    (src / "lib.rs").rename(src / "main.rs")
+                after = tree(f"after a {change}")
+                if after == before:
+                    wrong.append(f"engine.tree_digest misses a {change}")
+                before = after
+        except engine.Failed as e:
+            wrong.append(f"engine.tree_digest: {e}")
     return wrong
 
 
@@ -417,8 +454,8 @@ def v2_work_wrong() -> list[str]:
 
 def main() -> None:
     match sys.argv[1:]:
-        case ["selftest"] | ["selftest", _]:
-            wrong = selftest()
+        case ["selftest", *rest] if len(rest) <= 1:
+            wrong = selftest(Path(rest[0]) if rest else None)
             for line in wrong:
                 print(line)
             print(f"{SCRIPT} selftest: {len(wrong)} wrong")

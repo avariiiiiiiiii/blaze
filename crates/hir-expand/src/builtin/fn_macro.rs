@@ -276,7 +276,7 @@ fn place_expand<'f>(
 /// `expansion_cause`): the column in code points, as `column!` counts them.
 pub fn written_place(db: &Db, id: MacroCallId) -> Option<(u32, u32)> {
     let call = written_call(db, id);
-    let range = InFile::new(call.file_id, written_range(call.value));
+    let range = InFile::new(call.file_id, view::written_range(call.value));
     line_and_column(db, range.original_node_file_range_rooted(db))
 }
 
@@ -286,7 +286,7 @@ pub fn written_place(db: &Db, id: MacroCallId) -> Option<(u32, u32)> {
 fn written_call(db: &Db, id: MacroCallId) -> InFile<view::Node<'_>> {
     let mut call = id.loc(db).to_node_view(db);
     while let Some(outer) = call.file_id.macro_file() {
-        let start = TextRange::empty(written_range(call.value).start());
+        let start = TextRange::empty(view::written_range(call.value).start());
         if call.file_id.span_map(db).span_for_range(start).ctx.is_root() {
             break;
         }
@@ -299,7 +299,7 @@ fn written_call(db: &Db, id: MacroCallId) -> InFile<view::Node<'_>> {
 /// closing delimiter, in the context of `span`.
 fn call_span(db: &Db, id: MacroCallId, span: Span) -> Span {
     let call = id.loc(db).to_node_view(db);
-    let mut range = written_range(call.value);
+    let mut range = view::written_range(call.value);
     let map = call.file_id.span_map(db);
     // The `;` of a call in item position is the call's in the syntax tree, not in rustc's span.
     if let Some(args) = view::MacroCall::cast(call.value).and_then(|it| it.token_tree()) {
@@ -311,19 +311,6 @@ fn call_span(db: &Db, id: MacroCallId, span: Span) -> Span {
     };
     let last = map.span_for_range(TextRange::at(end, TextSize::new(1)));
     Span { ctx: span.ctx, ..first.cover(last) }
-}
-
-/// The range of a macro call without the attributes and comments on top of it, which rustc's
-/// span of it leaves out.
-fn written_range(node: view::Node<'_>) -> TextRange {
-    let start = node
-        .children_with_tokens()
-        .find(|it| {
-            !matches!(it.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
-                && !it.kind().is_trivia()
-        })
-        .map_or(node.text_range().start(), |it| it.text_range().start());
-    TextRange::new(start, node.text_range().end())
 }
 
 /// The line and column, from 1, where `range` begins, as rustc's source map counts them: a
@@ -1020,7 +1007,8 @@ fn concat_bytes_expand<'f>(
                                 array_element(db, &element, &mut err, &mut missing)
                             {
                                 let count = usize::try_from(count).unwrap_or(usize::MAX);
-                                bytes.resize(bytes.len().saturating_add(count), byte);
+                                let len = bytes.len().saturating_add(count);
+                                bytes.resize(len, byte);
                             }
                         }
                         None => {

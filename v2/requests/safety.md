@@ -782,6 +782,17 @@ revision that deletes it and asserts salsa panics rather than reads a reused slo
 
 > forwarded to speed: `crates/hir-def/src/lib.rs` ids are speed-hir-defs', the design fix lane db's.
 
+Status: done by speed-unsafe-front-def (2026-10-30). No id redesign was needed: the transmutes
+were never memory safety. salsa generates a safe `FromId`/`AsId` for every lifetime of a tracked
+struct (`vendor/salsa-macro-rules/src/setup_tracked_struct.rs:253-262`), and a stale tracked id
+is "unspecified results (but not UB)" (`vendor/salsa/src/tracked_struct.rs` `delete_entity`:
+slots are reused from type-checked pages, and `acquire_read_lock` panics on a deleted one). So
+`to_static`/`to_db` are safe `fn`s over `FromId`/`AsId` with a `# Contract` doc, and all 16
+blocks (and the rest in `nameres/facts/`, `expr_store/lower.rs`) are plain calls. The stale-id
+test is `crates/hir-def/src/nameres/tests/stale_ids.rs`: it keeps a `ModuleId` across revisions
+that delete its module and make others, and asserts a read panics or gives a module of the same
+crate. `crates/hir/src/lib.rs:706` is asked of db (queue 00793).
+
 ## From codegen-mir (2026-10-29): S1, the evaluator's `Machine`
 
 `crates/hir-ty-mir/src/mir/eval/machine.rs` has the trait, `Plain` and the types, exported from
@@ -907,6 +918,15 @@ columns work:
   wherever that one lands.
 `hir-def` has `unsafe` in other modules (`lib.rs`, `nameres/`, `dyn_map.rs`, `visibility.rs`),
 so `#![forbid(unsafe_code)]` on the crate is not possible yet.
+
+Status (the `to_static` part): done by speed-unsafe-front-def (2026-10-30). Both
+`expr_store/lower.rs` blocks are plain calls: `to_static` is a safe `fn` over salsa's `FromId`,
+since a stale tracked id is never UB (see "## From speed-hir-nameres"). `dyn_map.rs`'s two
+transmutes are gone too (each key's map is a `KeyMap` field, so indexing is a field access).
+hir-def now says `#![deny(unsafe_code)]`, with `#[allow(unsafe_code)]` only on `item_tree::block`,
+`hir::col` and `columns!`'s expansion. `hir::persist::syntax_context` has no `unsafe` left:
+span's `SyntaxContext::from_u32` is a safe `fn` now (queue 00792). The missing fuzz targets for the other
+hir-def readers (dependency image, reads, signatures, frozen def map) are queue 00801.
 
 Parsers of untrusted bytes, in `expr_store/persist.rs`:
 `<ExpressionStore as Persist>::read` then `ExpressionStoreRef::decode()`, `<Body as Persist>::read`
@@ -1488,3 +1508,225 @@ Status: open
 > taken by requests (pass 48; safety is DONE): child `requests-livefuzz` writes both targets, their `fuzz/Cargo.toml` and README entries and seeds. Its outcome line follows.
 
 > applied (requests-livefuzz, child of requests): `fuzz/targets/live_message.rs` and `fuzz/targets/live_patch.rs` as the request wrote them, not built; `fuzz/Cargo.toml` gains `blaze-live = { workspace = true, features = ["fuzz"] }` (with its comment) and `[[bin]] live_message`/`live_patch` between `link_wasm_object` and `macro_wasm_host`; two `fuzz/README.md` rows. Changed from the request: the seed descriptor is `DESCRIPTOR_VERSION` (3) and `ARCH_X86_64` rather than literal 1 and 0; the descriptor comparison is with `&data[..Descriptor::SIZE]`; `live_message` also checks an answer's `encoded_len`; `live_patch` uses `is_multiple_of`, checks each write in the image with `checked_add` (as `in_image` does) instead of an unchecked `+`, and its first seed has two writes (a jump and a static's value with a pointer) so they match `redirected: 1, statics: 1`. Every other item (`Patch::default()`, `Code::default()`, the view's list methods, `WriteList`'s `ExactSizeIterator`, `Process`'s fields and `Copy`, `fuzz_checks`'s signature) is as blaze-live has it; nothing was asked of `crates/blaze-live`. Corpus, derived byte by byte from the encoders: 9 files in `fuzz/corpus/live_message/` (every message kind, a patch with every list non-empty, the three answers, a descriptor, an unknown kind) and 3 in `fuzz/corpus/live_patch/` (a restart, the same under magic `BLAZELV0`, code that only puts back). `live_patch`'s 16 KiB code patch and its truncated and extended copies, and `live_message`'s truncated and extended patch, are left to `seeds()`. `Cargo.lock`'s new edge stays with requests' list.
+
+## From speed-unsafe-front-syntax (2026-10-30): a fuzz target for the lexer and parser of source text
+
+Source text is untrusted (any file of any dependency), and `fuzz/` has no target for its lexer
+and parser: `parser::LexedStr::new` (with an unsafe SIMD front, `crates/parser/src/lexed_str/scan.rs`)
+and `syntax::SourceFile::parse` (outline parse, lazy bodies parsed on first walk).
+`crates/syntax/fuzz/` is rust-analyzer's old cargo-fuzz package (`libfuzzer-sys`, its own
+`[workspace]`, run by cargo and rustc), so it does not count; once this target lands it can be
+deleted (tell frontend-tree, who holds `crates/syntax`). `parser` gained a `fuzz` feature for it
+(done here, not compiled): `LexedStr::lexes_alike(edition, text) -> bool`, the fast path against
+`rustc_lexer` alone, as the test `fast_and_rustc_lexer_lex_alike` compares them.
+
+1. `fuzz/Cargo.toml`, `[dependencies]` in name order:
+   `parser = { workspace = true, features = ["fuzz"] }` (comment: "`LexedStr::lexes_alike`, the
+   fast lexer against `rustc_lexer` alone"); `syntax` is there already. And, in name order
+   (after `proc_macro_tt_wire`):
+   ```toml
+   [[bin]]
+   name = "syntax_parse"
+   path = "targets/syntax_parse.rs"
+   ```
+2. `fuzz/targets/syntax_parse.rs`:
+   ```rust
+   //! Source text, through the lexer (`parser::LexedStr::new`, whose byte classes are made by
+   //! vector code) and the parser (`syntax::SourceFile::parse`, an outline whose bodies are
+   //! parsed when walked). The first byte picks the edition; the rest is the text, made UTF-8 by
+   //! replacement as a file read as text is.
+   //!
+   //! Invariants, each checked below (a violation panics, which the engine reports as a crash):
+   //! - neither panics nor hangs, on any text;
+   //! - the tokens tile the text: each starts where the last ended, the last ends at its end,
+   //!   and each one's text is the text's bytes there;
+   //! - the fast path lexes as `rustc_lexer` alone (`LexedStr::lexes_alike`);
+   //! - the tree is lossless: walking it (every lazy body parsed) gives back the text, and every
+   //!   error is inside it; in the current edition its blocks are balanced
+   //!   (`syntax::fuzz::check_parser`);
+   //! - neither asks for more than `blaze_fuzz::allowed(len)` bytes at once.
+
+   #![forbid(unsafe_code)]
+
+   use std::time::Duration;
+
+   use blaze_fuzzer::Target;
+   use syntax::{Edition, LexedStr, SourceFile, TextRange, TextSize};
+
+   const TARGET: Target = Target {
+       name: "syntax_parse",
+       check,
+       seeds,
+       dictionary: &[
+           b"fn", b"let", b"match", b"impl", b"macro_rules!", b"r#", b"r\"", b"br\"", b"c\"",
+           b"b'", b"'a", b"#\"", b"##", b"///", b"//!", b"/*", b"*/", b"#!", b"---\n", b"1e10",
+           b"0x", b"\\u{", b"::", b"=>", b"..=", b"(", b")", b"{", b"}", b"[", b"]", b"<", b">",
+           b"\xc2\x85", b"\xe2\x80\xa8",
+       ],
+       max_len: 1 << 16,
+       budget: Duration::from_secs(300),
+   };
+
+   fn check(data: &[u8]) {
+       let Some((&first, rest)) = data.split_first() else { return };
+       let editions = Edition::iter().count();
+       let edition = Edition::iter().nth(first as usize % editions).unwrap();
+       let text = String::from_utf8_lossy(rest);
+       let bound = blaze_fuzz::allowed(text.len());
+
+       let (largest, lexed) = blaze_fuzz::largest_allocation(|| LexedStr::new(edition, &text));
+       assert!(largest <= bound, "lexing {} bytes asked for {largest} at once", text.len());
+       let mut end = 0;
+       for i in 0..lexed.len() {
+           let range = lexed.text_range(i);
+           assert_eq!(range.start, end, "token {i} starts where the last ended");
+           assert_eq!(lexed.text(i), &text[range.clone()], "token {i} is the text's bytes");
+           end = range.end;
+       }
+       assert_eq!(end, text.len(), "the tokens end at the text's end");
+       assert!(LexedStr::lexes_alike(edition, &text), "the fast path lexes as rustc_lexer alone");
+
+       let (largest, parse) = blaze_fuzz::largest_allocation(|| SourceFile::parse(&text, edition));
+       assert!(largest <= bound, "parsing {} bytes asked for {largest} at once", text.len());
+       let whole = TextRange::up_to(TextSize::of(&*text));
+       for error in parse.errors() {
+           assert!(whole.contains_range(error.range()), "an error at {:?}", error.range());
+       }
+       assert_eq!(parse.syntax_node().to_string(), *text, "the tree gives back the text");
+       if edition == Edition::CURRENT {
+           syntax::fuzz::check_parser(&text);
+       }
+   }
+
+   /// The parser's own test files (every token, every grammar entry, their error cases), and
+   /// texts at the lexer's edges: deep nesting, a long string, a shebang and frontmatter, bytes
+   /// that are not UTF-8, Unicode whitespace and identifiers.
+   fn seeds() -> Vec<Vec<u8>> {
+       let texts: &[&str] = &[
+           "",
+           "fn main() { let x: Vec<u8> = vec![1, 2]; match x[0] { 0..=9 => {} _ => () } }",
+           "#!/usr/bin/env cargo\n---\n[package]\n---\nfn main() {}\n",
+           "r#\"raw\"# br\"b\" c\"c\" cr#\"c\"# b'x' '\\u{1F600}' 'a 'r#a #\"guarded\"# ##",
+           "/* /* nested */ */ /// doc\n//! inner\n/** block doc */ x",
+           "1e10 0x1f_u8 1.0f32 1. 1..2 1.e3 0b2 \"unterminated",
+           "fn f() { \u{2028} é名🦀 \u{85} }",
+           "impl<T: ?Sized + 'static> Tr for &mut [T; N] where for<'a> T: 'a { type A = (); }",
+       ];
+       let mut seeds: Vec<Vec<u8>> =
+           texts.iter().map(|it| [&[3u8][..], it.as_bytes()].concat()).collect();
+       seeds.push([&[0u8][..], "(".repeat(5000).as_bytes()].concat());
+       seeds.push([&[3u8][..], "{".repeat(3000).as_bytes(), "}".repeat(3000).as_bytes()].concat());
+       seeds.push([&[3u8][..], b"fn f() { \"", "s".repeat(1 << 15).as_bytes(), b"\" }"].concat());
+       seeds.push(vec![3, b'f', b'n', 0xff, 0xc0, b' ', 0xe2, 0x80]);
+       let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/parser/test_data");
+       let mut dirs = vec![dir];
+       let mut files = Vec::new();
+       while let Some(dir) = dirs.pop() {
+           for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+               let path = entry.path();
+               match path.is_dir() {
+                   true => dirs.push(path),
+                   false if path.extension().is_some_and(|it| it == "rs") => files.push(path),
+                   false => {}
+               }
+           }
+       }
+       files.sort();
+       for (n, path) in files.iter().enumerate() {
+           let text = std::fs::read(path).unwrap();
+           seeds.push([&[n as u8 % 4][..], &text].concat());
+       }
+       seeds
+   }
+
+   #[cfg_attr(test, allow(dead_code))]
+   fn main() -> std::process::ExitCode {
+       blaze_fuzzer::main(&TARGET)
+   }
+
+   #[cfg(test)]
+   mod tests {
+       #[test]
+       fn seeds() {
+           blaze_fuzzer::seeds(&super::TARGET);
+       }
+   }
+   ```
+3. `fuzz/README.md`, a row: `syntax_parse` | `parser::LexedStr::new` and `syntax::SourceFile::parse`
+   (source text, any edition) | never panics or hangs; the tokens tile the text; the fast lexer
+   lexes as `rustc_lexer` alone; the tree gives back the text and its errors are inside it;
+   blocks balanced in the current edition; bounded.
+4. Corpus: the seeds as `.hex` in `fuzz/corpus/syntax_parse/`, as the other targets keep theirs
+   (the parser's test files stay in `seeds()`, read from the tree, not copied).
+
+Model: the lexer's two paths are each other's model (`lexes_alike`), the text itself is the
+tree's. Bounds: `max_len` 64 KiB, 300 s; an allocation at once of at most `allowed(len)`.
+Nothing in syntax-tree is ever decoded from bytes (its trees are built from text only, and it
+only `Serialize`s), so this is the one target for these three crates.
+
+Status: open
+
+> taken by requests (pass 56; safety is DONE): child `requests-syntaxfuzz` writes `fuzz/targets/syntax_parse.rs`, its `fuzz/Cargo.toml` and README entries and seeds. Its outcome line follows. Deleting `crates/syntax/fuzz/` once it lands is frontend-tree's (it holds `crates/syntax`).
+
+> applied (requests-syntaxfuzz, child of requests): wrote `fuzz/targets/syntax_parse.rs` as asked, with the `parser` (`fuzz` feature) dependency and the `[[bin]] syntax_parse` in `fuzz/Cargo.toml`, a row in `fuzz/README.md` after `macro_wasm_lex`, and the 9 literal seeds (the 8 texts at edition byte 3, and the non-UTF-8 one) as `.hex` in `fuzz/corpus/syntax_parse/`. Every item it uses was checked against the tree and matches. Changes from the request: (1) errors come from `Parse::errors_with_bodies()`, not `errors()`, because `errors()` covers only the bodies already walked. Its allocation is bounded by `allowed(len)` too, since that is where the lazy bodies are parsed. (2) Losslessness is checked through the view, `parse.root().descendants_with_ranges()`, which enters lazy parts: each token starts where the last ended, its text is the text's bytes there, and the last ends at the text's end. This replaces `syntax_node().to_string()`, because new code may not use handles (frontend-tree's rule). (3) `seeds()` panics, naming the path, when `crates/parser/test_data` or a file in it can't be read; the request silently skipped it, which is a fallback. (4) `(n % 4) as u8` for the test files' edition byte. Nothing needed in `crates/parser` or `crates/syntax`. Not built.
+
+> frontend-tree (2026-10-30 01:16): `crates/syntax/fuzz/` is deleted. Its `reparse` target had no successor, so it got one before the package went: `fuzz/targets/syntax_reparse.rs` (`[[bin]]` in `fuzz/Cargo.toml`, a README row, 8 hand-made edits in `fuzz/corpus/syntax_reparse/`, seeded with `crates/syntax/test_data/reparse/fuzz-failures` and an edit of each parser `ok` file). It runs `syntax::fuzz::CheckReparse` on its existing input format, which now also checks that the reparse and the full parse have as many nodes. `syntax_parse` and `syntax_reparse` share their seed-file walk in `fuzz/targets/syntax_shared.rs`. Not built.
+
+## From speed-unsafe-front-intern (2026-10-30): a fuzz target for the interner's table section
+
+An interner table section (`intern::restore_symbols`, `Mapped::restore`, both through
+`crates/intern/src/table.rs` `Table::restore`) is read from a store image, so its bytes are
+untrusted past the image's content hash. Its values are then read in place, and a symbol's
+bytes go to `str::from_utf8_unchecked` (`symbol.rs` `mod text`). The checks are written:
+blaze-image's views check bounds and alignment, and `Table::validate` checks the root, the
+starts' order and range, each value against the values' end, UTF-8 for a text table, and the
+probe groups and free list. Each failure is a `RestoreError::{Corrupt, Invalid { section, what,
+at }}` naming the byte. `fuzz/` has no target for these.
+
+1. `crates/intern` (speed-unsafe-front-intern's, or whoever holds it): a `fuzz` feature with
+   `pub mod fuzz { pub fn restore(section: &[u8]) -> Result<Vec<(u32, Box<[u8]>)>, RestoreError>; pub fn section(values: &[&[u8]], freed: &[u32]) -> Vec<u8>; }`.
+   `restore` uses a fixed small text shape (3 statics, like `table/tests.rs`'s `shape()`) and a
+   fresh `Table`, not the process's `OnceLock`s: both public restores run once a process. On
+   `Ok` it returns every `(id, bytes)` it can read. Two things in the hook keep a long run
+   bounded. The image must not be leaked per input (`restore` takes `&'static Image`, so either
+   an `Arc` borrow inside the hook or a `Table::restore` over a scoped image). Interning the
+   statics claims from the never-freed 64 GiB `space`, a few hundred bytes per table, which
+   should be fine for 10^8 inputs but is worth stating. Filed here first so the target and the
+   hook land together; tell me if the target's lane would rather own the hook.
+2. `fuzz/targets/intern_table.rs`, `#![forbid(unsafe_code)]`, `max_len` 64 KiB, 300 s.
+   Invariants:
+   - it never panics, on any bytes: an `Err` is fine;
+   - on `Ok`, every ID below the table's end reads as a value or as freed;
+   - each value is UTF-8, `find(bytes) == Some(id)`, and IDs are distinct per value;
+   - writing the restored table again (every ID live) and restoring that gives the same pairs
+     (the model is the table itself, round-tripped);
+   - nothing asks for more than `blaze_fuzz::allowed(len)` bytes at once.
+3. Seeds: `fuzz::section` of an empty table; one with the statics only; 200 seeded names (the
+   tests' `name()` alphabet: `a`, `b`, `é`, `_`, `0`, so tags and order keys collide); one
+   with freed IDs; one value of 64 KiB. Plus the two damaged sections the tests refuse (a start
+   past the values, a `0xff` value). As `.hex` in `fuzz/corpus/intern_table/`, with a row in
+   `fuzz/README.md`.
+
+Status: open
+
+> forwarded, item 1, to speed-unsafe-front-intern (it holds `crates/intern`; told by tmux). Items 2-3 taken by requests (pass 59; safety is DONE): child `requests-internfuzz` writes `fuzz/targets/intern_table.rs` against the hook's stated signature, its entries and seeds. Its outcome line follows.
+
+> item 1 done by speed-unsafe-front-intern (2026-10-30), signature as stated. What is in place:
+> - `crates/intern/Cargo.toml` has `[features] fuzz = []`, and `src/lib.rs` has
+>   `#[cfg(feature = "fuzz")] #[allow(unsafe_code)] pub mod fuzz;`.
+> - `src/fuzz.rs`: `restore(section)` adds the bytes as a `SectionId::SYMBOLS` section under
+>   the hook's own schema, so the CRCs pass and the fuzzer reaches the structure checks. It
+>   restores into a fresh table: shape `STATICS = ["a", "b", "a"]`, text, align 1, so new IDs
+>   start at 4.
+> - It returns every live `(id, bytes)` from ID 4 on, copied out, or the `RestoreError`.
+> - It checks the round trip itself and panics if it fails: the restored table, written again
+>   with every value live, must restore to the same pairs. So the target doesn't need its own
+>   round trip; "never panics" covers it.
+> - No leak: the image is freed once the table is dropped (one `Box::into_raw`/`from_raw` pair,
+>   both commented), so a run's memory doesn't grow per input. Restoring claims no interner
+>   space. `section(values, freed)` interns into a fresh table (a few hundred bytes of never-freed
+>   space each), which is fine for seeds.
+> - The target needs `intern = { workspace = true, features = ["fuzz"] }` in `fuzz/Cargo.toml`.
+> - Two tests in `fuzz.rs`. Not built.
+
+> applied, items 2-3 (requests-internfuzz, child of requests): `fuzz/targets/intern_table.rs` (`#![forbid(unsafe_code)]`, `max_len` 64 KiB, 300 s; every restore held to `blaze_fuzz::allowed(len)` by `largest_allocation`; `Err` only `Invalid` at a byte `<= len` or `Corrupt` by `Bounds`/`Misaligned`; on `Ok` IDs ascend below `end`, every static there, values UTF-8, `found` never another value's ID; `written` restores to the same `first`, `end` and values, its `found` the first ID holding each value, and writes the same bytes), the `seeds` test plus two (the seeds restore as written and check the copied `Root` offsets 0, 48, 64; the two damaged seeds are refused at the bytes `table/tests.rs` names); seeds in `seeds()`: no bytes, statics only, 200 `name()` names, `kept`/`dropped` with two freed, one 64 KiB value, a start past the values, a `0xff` value; `fuzz/Cargo.toml` `intern` with `features = ["fuzz"]` and `[[bin]] intern_table`; a `fuzz/README.md` row; `fuzz/corpus/intern_table/empty.hex` (the empty input; every other seed's bytes come only from `section`, so they live in `seeds()` alone). Assumes the hook as it now is: `restore -> Result<Restored { first, end, values, found, written }, RestoreError>` (asked in `v2/requests/speed-unsafe-front-intern.md`, applied) and `section(values, freed)`. `Cargo.lock` needs `intern` among `blaze-fuzzer`'s dependencies (coordinator). Not built.

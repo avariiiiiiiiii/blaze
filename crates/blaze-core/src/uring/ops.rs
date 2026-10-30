@@ -26,8 +26,15 @@ use crate::{FileName, Tag};
 #[repr(u8)]
 pub(super) enum Kind {
     /// Into its buffer from [`Cold::at`], [`Hot::done`] of it read; [`Hot::of`] its kept file.
-    /// With [`WHOLE`] the whole file, its buffer sized once the file is open.
+    /// With [`WHOLE`] the whole file, its buffer sized once the file is open. The kernel reads
+    /// into the buffer's spare capacity, after its length, which counts what is read.
     Read,
+    /// A read of a file no request keeps, from [`Cold::at`] into its buffer's spare capacity:
+    /// the file named first opened through the ring to a descriptor of its own
+    /// ([`Cold::fds`] 0), with [`WHOLE`] sized by its `fstat`, read, and closed as it ends. So
+    /// a read sees the file at its name now, as [`crate::threads::Threads`] does, never one a
+    /// descriptor kept from before a rename over it still names.
+    Load,
     /// Its buffer at the end of its kept file ([`Hot::of`]).
     Append,
     /// Its buffer at [`Cold::at`] of the file named first, opened into a slot of its own
@@ -103,7 +110,8 @@ pub(super) const SECOND: u8 = 1 << 4;
 pub(super) const ZERO_COPY: u8 = 1 << 5;
 /// A zero-copy send whose last result is in, ended once its notifications are.
 pub(super) const FINISHED: u8 = 1 << 6;
-/// A read of the whole file (a [`Kind::Read`]'s; the bit an output's [`STDERR`] is).
+/// A read of the whole file (a [`Kind::Read`]'s or a [`Kind::Load`]'s; the bit an output's
+/// [`STDERR`] is).
 pub(super) const WHOLE: u8 = 1 << 3;
 /// A request on a path that makes the directories it is in where they are missing (the bit a
 /// send's [`ZERO_COPY`] is).

@@ -1,4 +1,5 @@
 #![cfg(all(feature = "inventory", feature = "persistence"))]
+#![forbid(unsafe_code)]
 
 #[rustversion::all(stable, since(1.90))]
 #[test]

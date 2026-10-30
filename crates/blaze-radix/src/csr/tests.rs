@@ -3,7 +3,8 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
-use proptest::prelude::*;
+use hegel::TestCase;
+use hegel::generators as gs;
 
 use super::*;
 
@@ -31,53 +32,59 @@ fn reference(rows: usize, pairs: &[(u32, u32)]) -> (Vec<u32>, Vec<u32>) {
 }
 
 /// Rows and pairs with every row below them, some rows empty and some with many pairs.
-fn rows_and_pairs() -> impl Strategy<Value = (usize, Vec<(u32, u32)>)> {
-    (1usize..80).prop_flat_map(|rows| {
-        (Just(rows), proptest::collection::vec((0..rows as u32, any::<u32>()), 0..400))
-    })
+#[hegel::composite]
+fn rows_and_pairs(tc: &TestCase) -> (usize, Vec<(u32, u32)>) {
+    let rows: usize = tc.draw(gs::integers().min_value(1).max_value(79));
+    let pairs = tc.draw(
+        gs::vecs(gs::tuples!(gs::integers::<u32>().max_value(rows as u32 - 1), gs::integers::<u32>()))
+            .max_size(399),
+    );
+    (rows, pairs)
 }
 
-proptest! {
-    #[test]
-    fn build_is_the_reference_counting_sort((rows, pairs) in rows_and_pairs()) {
-        let csr = Csr::build(rows, pairs.iter().copied());
-        let (starts, items) = reference(rows, &pairs);
-        prop_assert_eq!(csr.starts(), &starts[..]);
-        prop_assert_eq!(csr.items(), &items[..]);
-        prop_assert_eq!(csr.rows(), rows);
-        for row in 0..rows {
-            let want: Vec<u32> = pairs.iter().filter(|it| it.0 as usize == row).map(|it| it.1).collect();
-            prop_assert_eq!(csr.row(row), &want[..]);
-            prop_assert_eq!(csr.get(row), Some(&want[..]));
-        }
-        prop_assert_eq!(csr.get(rows), None);
+#[hegel::test]
+fn build_is_the_reference_counting_sort(tc: TestCase) {
+    let (rows, pairs) = tc.draw(rows_and_pairs());
+    let csr = Csr::build(rows, pairs.iter().copied());
+    let (starts, items) = reference(rows, &pairs);
+    assert_eq!(csr.starts(), &starts[..]);
+    assert_eq!(csr.items(), &items[..]);
+    assert_eq!(csr.rows(), rows);
+    for row in 0..rows {
+        let want: Vec<u32> = pairs.iter().filter(|it| it.0 as usize == row).map(|it| it.1).collect();
+        assert_eq!(csr.row(row), &want[..]);
+        assert_eq!(csr.get(row), Some(&want[..]));
     }
+    assert_eq!(csr.get(rows), None);
+}
 
-    #[test]
-    fn a_rebuild_is_a_build((rows, pairs) in rows_and_pairs(), (rows2, pairs2) in rows_and_pairs()) {
-        let mut csr = Csr::build(rows, pairs.iter().copied());
-        let mut cursors = Vec::new();
-        csr.rebuild(rows2, pairs2.iter().copied(), &mut cursors);
-        prop_assert_eq!(csr, Csr::build(rows2, pairs2.iter().copied()));
-    }
+#[hegel::test]
+fn a_rebuild_is_a_build(tc: TestCase) {
+    let (rows, pairs) = tc.draw(rows_and_pairs());
+    let (rows2, pairs2) = tc.draw(rows_and_pairs());
+    let mut csr = Csr::build(rows, pairs.iter().copied());
+    let mut cursors = Vec::new();
+    csr.rebuild(rows2, pairs2.iter().copied(), &mut cursors);
+    assert_eq!(csr, Csr::build(rows2, pairs2.iter().copied()));
+}
 
-    #[test]
-    fn a_graph_is_its_edges_sorted((nodes, pairs) in rows_and_pairs()) {
-        let edges: Vec<(u32, u32)> = pairs.iter().map(|&(s, t)| (s, t % nodes as u32)).collect();
-        let graph = Csr::graph(nodes, edges.iter().copied());
-        let mut sorted = edges.clone();
-        sorted.sort_unstable();
-        let (starts, _) = reference(nodes, &sorted);
-        prop_assert_eq!(graph.starts(), &starts[..]);
-        prop_assert!(graph.items().iter().eq(sorted.iter().map(|it| &it.1)));
+#[hegel::test]
+fn a_graph_is_its_edges_sorted(tc: TestCase) {
+    let (nodes, pairs) = tc.draw(rows_and_pairs());
+    let edges: Vec<(u32, u32)> = pairs.iter().map(|&(s, t)| (s, t % nodes as u32)).collect();
+    let graph = Csr::graph(nodes, edges.iter().copied());
+    let mut sorted = edges.clone();
+    sorted.sort_unstable();
+    let (starts, _) = reference(nodes, &sorted);
+    assert_eq!(graph.starts(), &starts[..]);
+    assert!(graph.items().iter().eq(sorted.iter().map(|it| &it.1)));
 
-        let mut set = graph;
-        set.dedup_rows();
-        sorted.dedup();
-        let (starts, _) = reference(nodes, &sorted);
-        prop_assert_eq!(set.starts(), &starts[..]);
-        prop_assert!(set.items().iter().eq(sorted.iter().map(|it| &it.1)));
-    }
+    let mut set = graph;
+    set.dedup_rows();
+    sorted.dedup();
+    let (starts, _) = reference(nodes, &sorted);
+    assert_eq!(set.starts(), &starts[..]);
+    assert!(set.items().iter().eq(sorted.iter().map(|it| &it.1)));
 }
 
 #[test]

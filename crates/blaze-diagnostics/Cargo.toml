@@ -33,6 +33,7 @@ unicode-security.workspace = true
 
 base-db.workspace = true
 blaze-api.workspace = true
+blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-lint-defs.workspace = true
@@ -55,9 +56,8 @@ syntax.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-blaze-format.workspace = true
 expect-test.workspace = true
-proptest.workspace = true
+hegeltest.workspace = true
 salsa.workspace = true
 test-fixture.workspace = true
 triomphe.workspace = true

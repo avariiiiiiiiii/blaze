@@ -10,8 +10,7 @@
 //! `ENOSYS`.
 
 use std::{
-    ffi::OsString,
-    hash::{BuildHasher as _, Hasher as _},
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     sync::OnceLock,
     time::{Instant, SystemTime},
@@ -22,9 +21,9 @@ use blaze_usercode::{
     inputs::{SPECIAL, hash_reader},
     trace::{self, DIRECTORY},
 };
-use wasmtime::{Caller, Extern, FuncType, Linker, Memory, Module, Val, ValType};
+use wasmtime::{Caller, FuncType, Linker, Module, Val, ValType};
 
-use crate::{State, keyed};
+use crate::{State, keyed, memory};
 
 /// Where the module sees its package: what `CARGO_MANIFEST_DIR` says to it. Not where the
 /// package is, so that what it makes of a path is the same on every machine.
@@ -61,13 +60,20 @@ const KEPT_OUTPUT: usize = 64 << 10;
 
 enum Open {
     Stdio,
-    Dir { rel: String },
+    /// A directory of the package, and what its last listing from the start found: each name
+    /// with its type, sorted, so a module that reads it in turns lists it once.
+    Dir { rel: String, listing: Vec<(OsString, u8)> },
     File { bytes: Vec<u8>, at: u64 },
 }
+
+/// What a `stat` of a path says.
+type Stat = std::io::Result<std::fs::Metadata>;
 
 /// The module's files: the package, read-only, and what of it was read.
 pub(crate) struct Files {
     root: PathBuf,
+    /// `root` with its links resolved, found the first time a path through a link is checked.
+    canonical: OnceLock<Option<PathBuf>>,
     fds: Vec<Option<Open>>,
     /// What the module read, by the paths it has under [`PACKAGE`], as it was when it read it.
     pub(crate) traced: Traced,
@@ -85,10 +91,12 @@ impl Files {
         let mut fds = Vec::with_capacity(8);
         fds.extend([Some(Open::Stdio), Some(Open::Stdio), Some(Open::Stdio)]);
         if root.is_some() {
-            fds.push(Some(Open::Dir { rel: String::default() }));
+            // alloc: none, an empty listing until the module reads the directory.
+            fds.push(Some(Open::Dir { rel: String::default(), listing: Vec::new() }));
         }
         Files {
             root: root.map(Path::to_path_buf).unwrap_or_default(),
+            canonical: OnceLock::new(),
             fds,
             traced: Traced::default(),
             unreadable: None,
@@ -133,31 +141,33 @@ impl Files {
     fn dir(&self, fd: i32) -> Result<&str, i32> {
         let open = usize::try_from(fd).ok().and_then(|at| self.fds.get(at)?.as_ref());
         match open {
-            Some(Open::Dir { rel }) => Ok(rel),
+            Some(Open::Dir { rel, .. }) => Ok(rel),
             Some(_) => Err(ENOTDIR),
             None => Err(EBADF),
         }
     }
 
-    /// The package's directory open at `fd`, taken out of its descriptor until
-    /// [`Files::give_dir`] puts it back.
-    fn take_dir(&mut self, fd: i32) -> Result<String, i32> {
+    /// The package's directory open at `fd` and its last listing, taken out of its descriptor
+    /// until [`Files::give_dir`] puts them back.
+    fn take_dir(&mut self, fd: i32) -> Result<(String, Vec<(OsString, u8)>), i32> {
         match self.get(fd) {
-            Some(Open::Dir { rel }) => Ok(std::mem::take(rel)),
+            Some(Open::Dir { rel, listing }) => Ok((std::mem::take(rel), std::mem::take(listing))),
             Some(_) => Err(ENOTDIR),
             None => Err(EBADF),
         }
     }
 
-    fn give_dir(&mut self, fd: i32, rel: String) {
-        if let Some(Open::Dir { rel: open }) = self.get(fd) {
+    fn give_dir(&mut self, fd: i32, (rel, listing): (String, Vec<(OsString, u8)>)) {
+        if let Some(Open::Dir { rel: open, listing: had }) = self.get(fd) {
             *open = rel;
+            *had = listing;
         }
     }
 
-    /// The package's path of `path` from the directory `rel`, or why the module may not
-    /// have it: it leaves the package, by `..` or by a link.
-    fn resolve(&self, rel: &str, path: &str) -> Result<(String, PathBuf), i32> {
+    /// The package's path of `path` from the directory `rel`, where that is on the machine, and
+    /// what a `stat` of it says when that is known already ([`Files::links`]); or why the module
+    /// may not have it: it leaves the package, by `..` or by a link.
+    fn resolve(&self, rel: &str, path: &str) -> Result<(String, PathBuf, Option<Stat>), i32> {
         if path.starts_with('/') {
             return Err(ENOTCAPABLE);
         }
@@ -178,19 +188,41 @@ impl Files {
         }
         let rel = out;
         let real = self.root.join(&rel);
-        // A link may point anywhere: what it leads to must be in the package.
-        if let Ok(found) = real.canonicalize() {
-            let root = self.root.canonicalize().map_err(|_| ENOENT)?;
-            if !found.starts_with(&root) {
+        let (linked, looked) = self.links(&rel, &real);
+        // A link may point anywhere: what it leads to must be in the package. With no link
+        // among its parts, the path is the package's own and is in it.
+        if linked && let Ok(found) = real.canonicalize() {
+            let root = self.canonical.get_or_init(|| self.root.canonicalize().ok());
+            let Some(root) = root else { return Err(ENOENT) };
+            if !found.starts_with(root) {
                 return Err(ENOTCAPABLE);
             }
         }
-        Ok((rel, real))
+        Ok((rel, real, looked))
+    }
+
+    /// Whether a part of `real`, the package's `rel`, is a link, each looked at without
+    /// following one: a `lstat` per part of `rel`, where resolving the whole path would look at
+    /// every part of the package's own path too. And, when none is a link, what a `stat` of it
+    /// would say, which `lstat` of the last part said.
+    fn links(&self, rel: &str, real: &Path) -> (bool, Option<Stat>) {
+        let parts = if rel.is_empty() { 0 } else { 1 + rel.matches('/').count() };
+        let mut looked = None;
+        for (at, part) in real.ancestors().take(parts).enumerate() {
+            let meta = std::fs::symlink_metadata(part);
+            if meta.as_ref().is_ok_and(|it| it.file_type().is_symlink()) {
+                return (true, None);
+            }
+            if at == 0 {
+                looked = Some(meta);
+            }
+        }
+        (false, looked)
     }
 
     #[cfg(test)]
     pub(crate) fn resolve_for_test(&self, rel: &str, path: &str) -> Result<String, i32> {
-        self.resolve(rel, path).map(|(rel, _)| rel)
+        self.resolve(rel, path).map(|(rel, ..)| rel)
     }
 
     /// Notes that the module found `found` at the package's `rel`: a file's hash, [`DIRECTORY`]
@@ -201,13 +233,18 @@ impl Files {
     }
 
     /// Notes that the module listed the package's directory `rel`, whose names are `names`.
-    pub(crate) fn listed(&mut self, rel: &str, names: &[OsString]) {
-        self.traced.dirs.push((placed(rel), trace::listing(names.iter().map(OsString::as_os_str))));
+    pub(crate) fn listed<'a>(&mut self, rel: &str, names: impl IntoIterator<Item = &'a OsStr>) {
+        self.traced.dirs.push((placed(rel), trace::listing(names)));
     }
 
     /// Notes what a look at `real`, the package's `rel`, finds, as [`Self::found`] has it.
     pub(crate) fn looked(&mut self, rel: &str, real: &Path) -> Option<std::fs::Metadata> {
-        match std::fs::metadata(real) {
+        self.looked_as(rel, real, std::fs::metadata(real))
+    }
+
+    /// As [`Files::looked`], of what a `stat` of `real` said.
+    fn looked_as(&mut self, rel: &str, real: &Path, stat: Stat) -> Option<std::fs::Metadata> {
+        match stat {
             Ok(meta) if meta.is_dir() => {
                 self.found(rel, Some(DIRECTORY));
                 Some(meta)
@@ -272,26 +309,6 @@ fn now(id: i32) -> u64 {
     }
 }
 
-/// Random bytes, from a hasher the standard library seeds from the system's randomness.
-/// Fills `out` with random bytes, in place: the keys of one fresh `RandomState`, which the
-/// standard library seeds from the system once per thread and steps per call, hashing the
-/// index of each eight bytes.
-pub(crate) fn fill_random(out: &mut [u8]) {
-    let state = std::hash::RandomState::new();
-    for (index, chunk) in out.chunks_mut(8).enumerate() {
-        let mut hasher = state.build_hasher();
-        hasher.write_usize(index);
-        chunk.copy_from_slice(&hasher.finish().to_le_bytes()[..chunk.len()]);
-    }
-}
-
-fn memory(caller: &mut Caller<'_, State>) -> wasmtime::Result<Memory> {
-    match caller.get_export("memory") {
-        Some(Extern::Memory(memory)) => Ok(memory),
-        _ => Err(wasmtime::Error::msg("the module exports no memory")),
-    }
-}
-
 fn bytes(mem: &[u8], ptr: i32, len: i32) -> Result<&[u8], i32> {
     let (ptr, len) = (ptr as u32 as usize, len as u32 as usize);
     mem.get(ptr..ptr.checked_add(len).ok_or(EINVAL)?).ok_or(EINVAL)
@@ -322,6 +339,33 @@ fn iovec(mem: &[u8], start: usize, index: usize) -> (i32, i32) {
     (word(at), word(at + 4))
 }
 
+/// WASI's `environ_get`: the variables' text copied to `buf` whole, then each one's pointer at
+/// `table`, nothing written unless both fit in memory. Guest pointers are `u32`s: past the top
+/// of memory is an error, never a wrap.
+pub(crate) fn environ_get(
+    mem: &mut [u8],
+    environ: &crate::Environ,
+    table: i32,
+    buf: i32,
+) -> Result<(), i32> {
+    if environ.starts.is_empty() {
+        return Ok(());
+    }
+    let base = buf as u32;
+    let len = u32::try_from(environ.text.len()).map_err(|_| EINVAL)?;
+    let text_end = base.checked_add(len).ok_or(EINVAL)? as usize;
+    let start = table as u32 as usize;
+    let end = start.checked_add(4 * environ.starts.len()).ok_or(EINVAL)?;
+    if text_end > mem.len() || end > mem.len() {
+        return Err(EINVAL);
+    }
+    put(mem, buf, &environ.text)?;
+    for (slot, &at) in mem[start..end].chunks_exact_mut(4).zip(&environ.starts) {
+        slot.copy_from_slice(&(base + at).to_le_bytes());
+    }
+    Ok(())
+}
+
 fn errno(result: Result<(), i32>) -> i32 {
     result.err().unwrap_or(SUCCESS)
 }
@@ -348,9 +392,11 @@ fn ino_of(parts: &[&[u8]]) -> u64 {
 }
 
 /// What the package has at `real`, as the module is told and as its read is recorded: a
-/// file's type and size are the file's, so a look at one is a read of all of it.
-fn stat(files: &mut Files, rel: &str, real: &Path) -> Result<[u8; 64], i32> {
-    match files.looked(rel, real) {
+/// file's type and size are the file's, so a look at one is a read of all of it. `looked` is
+/// what a `stat` of it said, when [`Files::resolve`] knows already.
+fn stat(files: &mut Files, rel: &str, real: &Path, looked: Option<Stat>) -> Result<[u8; 64], i32> {
+    let looked = looked.unwrap_or_else(|| std::fs::metadata(real));
+    match files.looked_as(rel, real, looked) {
         Some(meta) if meta.is_dir() => Ok(filestat(ino(rel), FILETYPE_DIRECTORY, 0)),
         Some(meta) => {
             let filetype = if meta.is_file() { FILETYPE_REGULAR_FILE } else { FILETYPE_UNKNOWN };
@@ -391,43 +437,18 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         |mut caller: Caller<'_, State>, count: i32, size: i32| {
             let memory = memory(&mut caller)?;
             let (mem, state) = memory.data_and_store_mut(&mut caller);
-            let total: usize = state.env.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
-            let counted = put(mem, count, &(state.env.len() as u32).to_le_bytes());
-            Ok(errno(counted.and(put(mem, size, &(total as u32).to_le_bytes()))))
+            let environ = &state.environ;
+            let counted = put(mem, count, &(environ.starts.len() as u32).to_le_bytes());
+            Ok(errno(counted.and(put(mem, size, &(environ.text.len() as u32).to_le_bytes()))))
         },
     )?;
     linker.func_wrap(
         MODULE,
         "environ_get",
-        |mut caller: Caller<'_, State>, environ: i32, buf: i32| {
+        |mut caller: Caller<'_, State>, table: i32, buf: i32| {
             let memory = memory(&mut caller)?;
             let (mem, state) = memory.data_and_store_mut(&mut caller);
-            // Guest pointers are `u32`s: past the top of memory is an error, never a wrap.
-            let (environ, mut at) = (environ as u32, buf as u32);
-            for (index, (key, value)) in state.env.iter().enumerate() {
-                let (key, value) = (key.as_encoded_bytes(), value.as_encoded_bytes());
-                let slot = u32::try_from(index).ok().and_then(|it| it.checked_mul(4));
-                let slot = slot.and_then(|it| it.checked_add(environ));
-                let equals = u32::try_from(key.len()).ok().and_then(|it| at.checked_add(it));
-                let value_at = equals.and_then(|it| it.checked_add(1));
-                let nul = value_at.and_then(|it| it.checked_add(u32::try_from(value.len()).ok()?));
-                let next = nul.and_then(|it| it.checked_add(1));
-                let (Some(slot), Some(equals), Some(value_at), Some(nul), Some(next)) =
-                    (slot, equals, value_at, nul, next)
-                else {
-                    return Ok(EINVAL);
-                };
-                let written = put(mem, slot as i32, &at.to_le_bytes())
-                    .and(put(mem, at as i32, key))
-                    .and(put(mem, equals as i32, b"="))
-                    .and(put(mem, value_at as i32, value))
-                    .and(put(mem, nul as i32, b"\0"));
-                if let Err(e) = written {
-                    return Ok(e);
-                }
-                at = next;
-            }
-            Ok(SUCCESS)
+            Ok(errno(environ_get(mem, &state.environ, table, buf)))
         },
     )?;
     linker.func_wrap(
@@ -459,7 +480,7 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             let end = start.checked_add(len as u32 as usize);
             let room = end.and_then(|end| mem.get_mut(start..end));
             let Some(room) = room else { return Ok(EINVAL) };
-            fill_random(room);
+            stdx::rand::fill(room);
             Ok(SUCCESS)
         },
     )?;
@@ -625,7 +646,7 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                 Some(Open::File { bytes, .. }) => {
                     filestat(1, FILETYPE_REGULAR_FILE, bytes.len() as u64)
                 }
-                Some(Open::Dir { rel }) => filestat(ino(rel), FILETYPE_DIRECTORY, 0),
+                Some(Open::Dir { rel, .. }) => filestat(ino(rel), FILETYPE_DIRECTORY, 0),
                 None => return Ok(EBADF),
             };
             Ok(errno(put(mem, out, &stat)))
@@ -677,11 +698,11 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             let opened = (|| {
                 let path = text(mem, ptr, len)?;
                 let dir = files.dir(dirfd)?;
-                let (rel, real) = files.resolve(&dir, &path)?;
+                let (rel, real, looked) = files.resolve(&dir, &path)?;
                 if oflags & (OFLAGS_CREAT | OFLAGS_TRUNC) != 0 || rights & RIGHTS_FD_WRITE != 0 {
                     return Err(EROFS);
                 }
-                let meta = match std::fs::metadata(&real) {
+                let meta = match looked.unwrap_or_else(|| std::fs::metadata(&real)) {
                     Ok(meta) => meta,
                     Err(error) if missing(&error) => {
                         files.found(&rel, None);
@@ -694,10 +715,11 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                 };
                 if meta.is_dir() {
                     files.found(&rel, Some(DIRECTORY));
-                    return Ok(files.insert(Open::Dir { rel }));
+                    // alloc: none, an empty listing until the module reads the directory.
+                    return Ok(files.insert(Open::Dir { rel, listing: Vec::new() }));
                 }
                 if oflags & OFLAGS_DIRECTORY != 0 {
-                    files.looked(&rel, &real);
+                    files.looked_as(&rel, &real, Ok(meta));
                     return Err(ENOTDIR);
                 }
                 if !meta.is_file() {
@@ -706,7 +728,7 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                     files.found(&rel, Some(SPECIAL));
                     return Err(ENOTCAPABLE);
                 }
-                let bytes = match std::fs::read(&real) {
+                let bytes = match read_whole(&real, meta.len()) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         files.cant(&real, error);
@@ -732,8 +754,8 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             let found = (|| {
                 let path = text(mem, ptr, len)?;
                 let dir = files.dir(dirfd)?;
-                let (rel, real) = files.resolve(&dir, &path)?;
-                stat(files, &rel, &real)
+                let (rel, real, looked) = files.resolve(&dir, &path)?;
+                stat(files, &rel, &real, looked)
             })();
             Ok(match found {
                 Ok(stat) => errno(put(mem, out, &stat)),
@@ -753,12 +775,12 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             let memory = memory(&mut caller)?;
             let (mem, state) = memory.data_and_store_mut(&mut caller);
             let files = &mut state.files;
-            let rel = match files.take_dir(fd) {
+            let (rel, mut listing) = match files.take_dir(fd) {
                 Ok(it) => it,
                 Err(e) => return Ok(e),
             };
-            let said = readdir(files, &rel, mem, [buf, len, used], cookie);
-            files.give_dir(fd, rel);
+            let said = readdir(files, &rel, &mut listing, mem, [buf, len, used], cookie);
+            files.give_dir(fd, (rel, listing));
             Ok(said)
         },
     )?;
@@ -767,45 +789,33 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
 
 /// `fd_readdir` of the package's directory `rel`: its entries from `cookie` on, sorted by
 /// name, into the module's `buf` of `len` bytes, and how many bytes they took at `used`.
-fn readdir(files: &mut Files, rel: &str, mem: &mut [u8], [buf, len, used]: [i32; 3], cookie: i64) -> i32 {
-    let real = files.root.join(rel);
-    // alloc: the edge: the names the system lists, which the module's trace keeps.
-    let mut all = Vec::with_capacity(16);
-    match std::fs::read_dir(&real) {
-        Ok(entries) => {
-            for entry in entries {
-                match entry {
-                    Ok(entry) => all.push(entry.file_name()),
-                    Err(error) => {
-                        files.cant(&real, error);
-                        return EIO;
-                    }
-                }
-            }
-        }
-        Err(error) => {
+/// `listing` is what the descriptor's last pass found: a pass starts at cookie 0 and lists
+/// the directory once, and the calls that go on from a later cookie read it from there.
+fn readdir(
+    files: &mut Files,
+    rel: &str,
+    listing: &mut Vec<(OsString, u8)>,
+    mem: &mut [u8],
+    [buf, len, used]: [i32; 3],
+    cookie: i64,
+) -> i32 {
+    if cookie == 0 || listing.is_empty() {
+        let real = files.root.join(rel);
+        listing.clear();
+        if let Err(error) = list(&real, listing) {
             files.cant(&real, error);
             return EIO;
         }
+        // Recorded with every name, as a native sandbox's listing is, though a name that is
+        // not UTF-8 can't be given to the module.
+        files.listed(rel, listing.iter().map(|(name, _)| name.as_os_str()));
+        // An `OsString` sorts by its bytes, as a `String` of the same text does.
+        listing.sort_unstable_by(|(one, _), (two, _)| one.cmp(two));
     }
-    // Recorded with every name, as a native sandbox's listing is, though a name that is not
-    // UTF-8 can't be given to the module.
-    files.listed(rel, &all);
-    // An `OsString` sorts by its bytes, as a `String` of the same text does.
-    all.sort_unstable();
     let len = len as u32 as usize;
     blaze_mem::scratch::with_bytes(|out| {
-        let mut child = blaze_mem::scratch::lend_path();
-        child.push(&real);
-        let names = all.iter().filter_map(|it| it.to_str());
-        for (index, name) in names.enumerate().skip(cookie as u64 as usize) {
-            child.push(name);
-            let filetype = match std::fs::metadata(&*child) {
-                Ok(meta) if meta.is_dir() => FILETYPE_DIRECTORY,
-                Ok(meta) if meta.is_file() => FILETYPE_REGULAR_FILE,
-                _ => FILETYPE_UNKNOWN,
-            };
-            child.pop();
+        let names = listing.iter().filter_map(|(name, filetype)| Some((name.to_str()?, *filetype)));
+        for (index, (name, filetype)) in names.enumerate().skip(cookie as u64 as usize) {
             let ino = match rel.is_empty() {
                 true => ino(name),
                 false => ino_of(&[rel.as_bytes(), b"/", name.as_bytes()]),
@@ -822,6 +832,55 @@ fn readdir(files: &mut Files, rel: &str, mem: &mut [u8], [buf, len, used]: [i32;
         out.truncate(len);
         errno(put(mem, buf, out).and(put(mem, used, &(out.len() as u32).to_le_bytes())))
     })
+}
+
+/// The entries of the directory at `real`, each name with the type of what it names, into
+/// `listing`, in the order the system gives them. The type is the listing's own (`d_type`),
+/// with no `stat` of the entry, but for a link, whose type is what it leads to.
+fn list(real: &Path, listing: &mut Vec<(OsString, u8)>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(real)? {
+        let entry = entry?;
+        let ty = match entry.file_type() {
+            Ok(ty) if ty.is_symlink() => std::fs::metadata(entry.path()).map(|it| it.file_type()),
+            ty => ty,
+        };
+        let filetype = match ty {
+            Ok(ty) if ty.is_dir() => FILETYPE_DIRECTORY,
+            Ok(ty) if ty.is_file() => FILETYPE_REGULAR_FILE,
+            _ => FILETYPE_UNKNOWN,
+        };
+        // alloc: the edge: the names the system lists, which the descriptor keeps for the
+        // rest of its pass.
+        listing.push((entry.file_name(), filetype));
+    }
+    Ok(())
+}
+
+/// The bytes of the file at `real`, which its `stat` said has `len`: one buffer of that size,
+/// read to its end, so an open, one read and the read that finds the end, with no second
+/// `stat` or seek as [`std::fs::read`] and `File::read_to_end` make. A file that grew since is
+/// still read whole.
+fn read_whole(real: &Path, len: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(real)?;
+    // One byte past the size, so the read that finds the end needs no more room.
+    let room = usize::try_from(len).unwrap_or(0).saturating_add(1);
+    // alloc: the edge: the file's bytes, which the descriptor keeps for the module's reads.
+    let mut bytes = vec![0u8; room];
+    let mut filled = 0;
+    loop {
+        if filled == bytes.len() {
+            bytes.resize(2 * filled, 0);
+        }
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
 }
 
 /// Adds to `linker`, for each function of WASI's that `module` imports and [`add`] does not
@@ -851,4 +910,211 @@ pub(crate) fn rest(linker: &mut Linker<State>, module: &Module) -> wasmtime::Res
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("blaze-wasi-{name}-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// What `resolve` said of a path of no `.` or `..` before it looked for links part by
+    /// part: the whole path resolved, and the package's own root resolved, each time.
+    fn resolve_by_realpath(root: &Path, path: &str) -> Result<String, i32> {
+        if let Ok(found) = root.join(path).canonicalize() {
+            let root = root.canonicalize().map_err(|_| ENOENT)?;
+            if !found.starts_with(&root) {
+                return Err(ENOTCAPABLE);
+            }
+        }
+        Ok(path.trim_end_matches('/').to_owned())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_is_in_the_package_as_resolving_all_of_it_says_with_its_stat_as_a_stats() {
+        use std::os::unix::fs::symlink;
+        let dir = temp("links");
+        let package = dir.join("package");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::create_dir_all(package.join("sub")).unwrap();
+        std::fs::write(package.join("a.txt"), "a").unwrap();
+        std::fs::write(package.join("src/lib.rs"), "fn f() {}").unwrap();
+        std::fs::write(package.join("sub/x.txt"), "x").unwrap();
+        std::fs::write(dir.join("outside.txt"), "o").unwrap();
+        symlink(package.join("a.txt"), package.join("in_file")).unwrap();
+        symlink("sub", package.join("in_dir")).unwrap();
+        symlink(dir.join("outside.txt"), package.join("out_file")).unwrap();
+        symlink(&dir, package.join("out_dir")).unwrap();
+        symlink(package.join("missing"), package.join("dangling")).unwrap();
+        symlink(&package, dir.join("package_link")).unwrap();
+        let paths = [
+            "", "a.txt", "src", "src/lib.rs", "missing", "src/missing", "a.txt/x", "in_file",
+            "in_dir", "in_dir/x.txt", "out_file", "out_dir", "out_dir/outside.txt", "dangling",
+        ];
+        // The package as it is, and through a link to it: its own path's links are its own.
+        for root in [package.clone(), dir.join("package_link")] {
+            let files = Files::new(Some(&root));
+            for path in paths {
+                let now = files.resolve("", path).map(|(rel, real, looked)| {
+                    if let Some(looked) = looked {
+                        match (looked, std::fs::metadata(&real)) {
+                            (Ok(one), Ok(two)) => assert_eq!(
+                                (one.is_dir(), one.is_file(), one.len()),
+                                (two.is_dir(), two.is_file(), two.len()),
+                                "{path}"
+                            ),
+                            (Err(one), Err(two)) => assert_eq!(one.kind(), two.kind(), "{path}"),
+                            (one, two) => panic!("{path}: {one:?} where a stat says {two:?}"),
+                        }
+                    }
+                    rel
+                });
+                assert_eq!(now, resolve_by_realpath(&root, path), "{path} from {}", root.display());
+            }
+        }
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What `fd_readdir` gave before a pass kept its listing: the directory listed, sorted and
+    /// each entry's type looked up, at every call.
+    fn readdir_per_call(root: &Path, rel: &str, cookie: usize, len: usize) -> Vec<u8> {
+        let real = root.join(rel);
+        let mut all: Vec<OsString> =
+            std::fs::read_dir(&real).unwrap().map(|it| it.unwrap().file_name()).collect();
+        all.sort_unstable();
+        let mut out = Vec::new();
+        for (index, name) in all.iter().filter_map(|it| it.to_str()).enumerate().skip(cookie) {
+            let filetype = match std::fs::metadata(real.join(name)) {
+                Ok(meta) if meta.is_dir() => FILETYPE_DIRECTORY,
+                Ok(meta) if meta.is_file() => FILETYPE_REGULAR_FILE,
+                _ => FILETYPE_UNKNOWN,
+            };
+            let ino = match rel.is_empty() {
+                true => ino(name),
+                false => ino_of(&[rel.as_bytes(), b"/", name.as_bytes()]),
+            };
+            out.extend_from_slice(&(index as u64 + 1).to_le_bytes());
+            out.extend_from_slice(&ino.to_le_bytes());
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(&[filetype, 0, 0, 0]);
+            out.extend_from_slice(name.as_bytes());
+            if out.len() >= len {
+                break;
+            }
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn a_pass_over_a_directory_lists_it_once_and_gives_what_a_listing_per_call_gave() {
+        let dir = temp("readdir");
+        let package = dir.join("package");
+        std::fs::create_dir_all(package.join("src/sub")).unwrap();
+        for name in ["b.rs", "a.rs", "c d.txt", "lib.rs"] {
+            std::fs::write(package.join("src").join(name), name).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("sub", package.join("src/link")).unwrap();
+            std::os::unix::fs::symlink("missing", package.join("src/dangling")).unwrap();
+        }
+        let mut files = Files::new(Some(&package));
+        let mut mem = vec![0u8; 4096];
+        let used = 4000;
+        let mut passes = 0;
+        for rel in ["src", ""] {
+            for len in [30, 70, 1000] {
+                let mut listing = Vec::new();
+                passes += 1;
+                for cookie in 0..8 {
+                    let said =
+                        readdir(&mut files, rel, &mut listing, &mut mem, [0, len, used], cookie);
+                    assert_eq!(said, SUCCESS);
+                    let at = used as usize;
+                    let n = u32::from_le_bytes(mem[at..at + 4].try_into().unwrap()) as usize;
+                    let want = readdir_per_call(&package, rel, cookie as usize, len as usize);
+                    assert_eq!(mem[..n], want[..], "{rel:?} from {cookie} into {len} bytes");
+                }
+                assert_eq!(files.traced.dirs.len(), passes, "a pass lists its directory once");
+            }
+        }
+        // A call that goes on from a later cookie reads the pass's listing and allocates nothing.
+        let mut listing = Vec::new();
+        readdir(&mut files, "src", &mut listing, &mut mem, [0, 30, used], 0);
+        let said = blaze_alloc_count::assert_at_most(0, "a readdir that goes on with its pass", || {
+            readdir(&mut files, "src", &mut listing, &mut mem, [0, 30, used], 2)
+        });
+        assert_eq!(said, SUCCESS);
+        assert!(files.unreadable.is_none());
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What `environ_get` wrote before the text was made once an instance: each variable's
+    /// pointer, name, `=`, value and NUL in turn.
+    fn environ_per_variable(mem: &mut [u8], env: &[(&str, &str)], table: i32, buf: i32) -> i32 {
+        let (table, mut at) = (table as u32, buf as u32);
+        for (index, (key, value)) in env.iter().enumerate() {
+            let slot = table + 4 * index as u32;
+            let (equals, value_at) = (at + key.len() as u32, at + key.len() as u32 + 1);
+            let nul = value_at + value.len() as u32;
+            let written = put(mem, slot as i32, &at.to_le_bytes())
+                .and(put(mem, at as i32, key.as_bytes()))
+                .and(put(mem, equals as i32, b"="))
+                .and(put(mem, value_at as i32, value.as_bytes()))
+                .and(put(mem, nul as i32, b"\0"));
+            if let Err(e) = written {
+                return e;
+            }
+            at = nul + 1;
+        }
+        SUCCESS
+    }
+
+    #[test]
+    fn the_environment_is_written_as_one_variable_at_a_time_wrote_it() {
+        let envs: [&[(&str, &str)]; 3] = [
+            &[],
+            &[("CARGO_MANIFEST_DIR", PACKAGE), ("CARGO_PKG_NAME", "pkg"), ("EMPTY", "")],
+            &[("OUT_DIR", OUT_DIR)],
+        ];
+        for env in envs {
+            let environ = crate::Environ::of(env);
+            let total: usize = env.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+            assert_eq!((environ.starts.len(), environ.text.len()), (env.len(), total));
+            for (table, buf) in [(0, 64), (400, 16), (100, 200), (510, 0), (0, 500), (-4, 0)] {
+                let (mut one, mut two) = (vec![0u8; 512], vec![0u8; 512]);
+                let want = environ_per_variable(&mut one, env, table, buf);
+                let got = errno(environ_get(&mut two, &environ, table, buf));
+                assert_eq!(got, want, "{env:?} at {table}, {buf}");
+                if want == SUCCESS {
+                    assert_eq!(one, two, "{env:?} at {table}, {buf}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_is_read_whole_in_one_buffer_whatever_its_stat_said() {
+        let dir = temp("read");
+        let path = dir.join("f");
+        for size in [0usize, 1, 31, 4096, 70_000] {
+            let bytes: Vec<u8> = (0..size).map(|it| (it * 7) as u8).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            let read = blaze_alloc_count::assert_at_most(1, "a file read whole", || {
+                read_whole(&path, size as u64)
+            });
+            assert_eq!(read.unwrap(), bytes);
+            for said in [0, size as u64 / 2, 2 * size as u64 + 1] {
+                assert_eq!(read_whole(&path, said).unwrap(), bytes, "{size} bytes, said {said}");
+            }
+        }
+        _ = std::fs::remove_dir_all(&dir);
+    }
 }

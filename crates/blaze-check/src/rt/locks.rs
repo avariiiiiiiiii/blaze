@@ -3,7 +3,7 @@
 //! is released; taking one acquires what its last release released.
 
 use super::{Kind, Object, Runtime, Wait};
-use crate::clock::Clock;
+use crate::clock::{Clock, MAX_THREADS};
 
 pub(crate) struct Mutex {
     holder: Option<u8>,
@@ -18,8 +18,10 @@ pub(crate) struct RwLock {
 }
 
 pub(crate) struct Condvar {
-    /// Waiting threads, first come first notified.
-    waiters: Vec<u8>,
+    /// Waiting threads, first come first notified: `waiters[..len]`. A thread waits at one
+    /// condvar at a time and leaves when notified, so there are at most `MAX_THREADS`.
+    waiters: [u8; MAX_THREADS],
+    len: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -58,7 +60,7 @@ impl Runtime {
     }
 
     pub(crate) fn condvar(&mut self, id: &std::sync::atomic::AtomicU64) -> u32 {
-        self.object(id, |_| Object::Condvar(Condvar { waiters: Vec::new() }))
+        self.object(id, |_| Object::Condvar(Condvar { waiters: [0; MAX_THREADS], len: 0 }))
     }
 
     pub(crate) fn once(&mut self, id: &std::sync::atomic::AtomicU64, set: bool) -> u32 {
@@ -97,6 +99,7 @@ impl Runtime {
         let me = self.current();
         match self.lock_mut(obj).holder {
             Some(holder) if holder as usize == me => {
+                // alloc: a finding's or an error's text, made once, when the model stops
                 Err(format!("{} locks a mutex it holds: a deadlock", self.describe(me)))
             }
             Some(_) => {
@@ -135,6 +138,7 @@ impl Runtime {
         let me = self.current();
         let lock = self.rw_mut(obj);
         if lock.writer == Some(me as u8) || (write && lock.readers & (1 << me) != 0) {
+            // alloc: a finding's or an error's text, made once, when the model stops
             return Err(format!("{} takes a lock it holds: a deadlock", self.describe(me)));
         }
         if lock.writer.is_some() || (write && lock.readers != 0) {
@@ -178,18 +182,25 @@ impl Runtime {
 
     pub(crate) fn condvar_enqueue(&mut self, obj: u32) {
         let me = self.current() as u8;
-        match &mut self.objects[obj as usize].obj {
-            Object::Condvar(it) => it.waiters.push(me),
-            _ => unreachable!("blaze-check: a condvar operation on another object"),
-        }
+        let Object::Condvar(condvar) = &mut self.objects[obj as usize].obj else {
+            unreachable!("blaze-check: a condvar operation on another object")
+        };
+        let len = usize::from(condvar.len);
+        assert!(len < MAX_THREADS, "blaze-check: a condvar with a waiter per thread already");
+        condvar.waiters[len] = me;
+        condvar.len += 1;
     }
 
     pub(crate) fn condvar_notify(&mut self, obj: u32, all: bool) {
         let Object::Condvar(condvar) = &mut self.objects[obj as usize].obj else {
             unreachable!("blaze-check: a condvar operation on another object")
         };
-        let woken = if all { condvar.waiters.len() } else { condvar.waiters.len().min(1) };
-        for thread in condvar.waiters.drain(..woken) {
+        let len = usize::from(condvar.len);
+        let woken = if all { len } else { len.min(1) };
+        let waiters = condvar.waiters;
+        condvar.waiters.copy_within(woken..len, 0);
+        condvar.len = (len - woken) as u8;
+        for &thread in &waiters[..woken] {
             let th = &mut self.threads[thread as usize];
             if th.state == super::State::Blocked(Wait::Notify(obj)) {
                 th.state = super::State::Runnable;
@@ -201,6 +212,7 @@ impl Runtime {
     pub(crate) fn once_wait(&mut self, obj: u32) -> Result<(), String> {
         let me = self.current();
         match self.once_mut(obj).state {
+            // alloc: a finding's or an error's text, made once, when the model stops
             OnceState::Running(by) if by as usize == me => Err(format!(
                 "{} initializes a once cell from inside its own initialization: a deadlock",
                 self.describe(me)

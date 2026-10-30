@@ -58,7 +58,7 @@ use smallvec::SmallVec;
 use crate::{Debug, Format, LinkError, Native, NativeKind, Output, OutputKind, Platform};
 
 /// A file of the link line, as [`locate`] found it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Located {
     pub path: PathBuf,
     /// Its path as the link line has it: what errors call it, and what a linker script that

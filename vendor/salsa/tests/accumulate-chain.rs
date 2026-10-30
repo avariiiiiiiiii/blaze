@@ -3,6 +3,8 @@
 //! Test that when having nested tracked functions
 //! we don't drop any values when accumulating.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use expect_test::expect;

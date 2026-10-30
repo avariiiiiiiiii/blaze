@@ -34,7 +34,7 @@ use crate::{
 /// The lints this module gives: it runs only when one may fire.
 pub(super) const LINTS: super::LintSet = super::lint_set(["unstable_name_collisions"]);
 
-pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
+pub(super) fn lints(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
     // alloc: the lints found, empty until one is
     let mut found: Vec<(u32, Found)> = Vec::new();
     let store = b.store();
@@ -74,7 +74,7 @@ enum Node {
 }
 
 /// The lint of `node`, with the position of the span it is at, for the order of the body's.
-fn lint(b: &BodyCx<'_, '_>, node: Node, candidates: &[(CandidateId, Symbol)]) -> Option<(u32, Found)> {
+fn lint(b: &BodyCx<'_, '_, '_>, node: Node, candidates: &[(CandidateId, Symbol)]) -> Option<(u32, Found)> {
     let db = b.db();
     let (item, args, at) = match node {
         Node::MethodCall(expr) => {
@@ -136,7 +136,7 @@ fn self_ty<'db>(args: GenericArgs<'db>) -> hir_ty::next_solver::Ty<'db> {
 
 /// rustc's `disabled_nightly_features`: on a nightly, for each item passed over, the
 /// suggestion to enable its feature at the top of the crate.
-fn disabled_nightly_features(b: &BodyCx<'_, '_>, diag: &mut Diag, candidates: &[(CandidateId, Symbol)]) {
+fn disabled_nightly_features(b: &BodyCx<'_, '_, '_>, diag: &mut Diag, candidates: &[(CandidateId, Symbol)]) {
     // `UnstableFeatures::from_environment(None).is_nightly_build()` of blaze's nightly, as
     // `checks::features` reads it: `RUSTC_BOOTSTRAP=-1` makes it a stable compiler.
     let bootstrap = b.cx.krate.base().env(b.db()).get("RUSTC_BOOTSTRAP");
@@ -166,7 +166,7 @@ fn disabled_nightly_features(b: &BodyCx<'_, '_>, diag: &mut Diag, candidates: &[
 
 /// The span of the name the method call or field access at `at` names (rustc's
 /// `segment.ident.span`, `field.span`).
-fn method_name(b: &BodyCx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<Span> {
+fn method_name(b: &BodyCx<'_, '_, '_>, at: InFile<SyntaxNodePtr>) -> Option<Span> {
     let node = b.cx.syntax_view(at);
     let name = match ast::Expr::cast(node.value)? {
         ast::Expr::MethodCallExpr(it) => it.name_ref()?,

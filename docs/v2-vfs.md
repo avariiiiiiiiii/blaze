@@ -45,7 +45,8 @@ v2 interface; what changed from it is below.
   depends on blaze-vfs). It follows docs/v2/plan/design/concurrency.md:
   - The tree and every reader share one store: append-only columns in chunks that never move
     (each node's ID and an 8-byte shape; each directory's entries as a `u32` name, a `u32`
-    node and a mode byte; each file's bytes as one `Arc<[u8]>`) and an open-addressed index
+    node and a mode byte; each file's bytes as one `Bytes`, the very buffer an owned write
+    gave) and an open-addressed index
     keyed by the content ID's bits, grown by adding a level.
   - The `Vfs` is the only writer. It writes each node, children first, and releases it
     before anything names it, so a node is readable before the call that gives its ID
@@ -60,13 +61,19 @@ v2 interface; what changed from it is below.
 ## The journal
 
 - Records: file, directory, head move, head removal, and sequence (below), each framed with
-  magic `BZJ3`, a length, a kind and an 8-byte checksum under `"blaze v2 vfs journal record 1"`.
-  A directory record gives each entry's git mode code (4 bytes) before its child's ID.
+  magic `BZJ4`, a length, a kind and an 8-byte checksum under `"blaze v2 vfs journal record 2"`.
+  A file record's checksum is over the kind and the file's content ID, not its bytes: writing
+  one hashes nothing (the tree has the ID) and loading hashes the bytes once, for the ID it
+  interns them by. A directory record gives each entry's git mode code (4 bytes) before its
+  child's ID. A file of an older magic is read as torn at its first record, as with `BZJ3`.
 - One effect in flight at a time (append, then sync; a cut; a rewrite), with commits made in
   between grouped into the next append, as in blaze-next.
-- **Compaction**: `collect` drops unreached nodes from memory and, if anything was appended
-  since the last rewrite, asks the next flush to replace the whole file in one `Effect::Write`
-  with the nodes the heads reach and one record per head. That write is atomic, so a crash
+- **Compaction**: `collect` drops unreached nodes from memory and, once as many bytes were
+  appended since the last rewrite as that rewrite held (or a node of the file's base image was
+  dropped), asks the next flush to replace the whole file in one `Effect::Write` with the nodes
+  the heads reach and one record per head. A daemon collects after every job, so this keeps
+  the rewrites' bytes within twice the appends' and the file within about twice what the
+  heads reach; records of dropped nodes wait in the file until then. That write is atomic, so a crash
   leaves the old file or the new. Nothing is appended while it is in flight. A failed one, or
   a failed append or sync, is made again as a rewrite from the state then, which holds every
   commit recorded since. The rewrite ends with a sequence record, so the numbers of removals

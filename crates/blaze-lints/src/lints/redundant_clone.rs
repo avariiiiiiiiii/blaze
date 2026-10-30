@@ -28,7 +28,7 @@
 use hir::{Adjust, AsAssocItem as _, AutoBorrow, Mutability};
 use syntax::{TextRange, TextSize, view as ast};
 
-use ast::{AstNode as _, HasName as _};
+use ast::{AstNode as _, HasArgList as _, HasName as _};
 
 use super::{
     implicit_clone::{STRING, TO_OWNED, TO_STRING, is_std_adt, of_trait, peel_refs},

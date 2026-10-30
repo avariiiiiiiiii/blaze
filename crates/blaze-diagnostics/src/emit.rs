@@ -127,7 +127,7 @@ impl File {
     fn norm(&self, read: u32) -> usize {
         let read = read.min(self.len);
         let taken = self.crs.partition_point(|(cr, _)| *cr < read) as u32;
-        floor(&self.text, (read.saturating_sub(self.bom) - taken) as usize)
+        self.text.floor_char_boundary((read.saturating_sub(self.bom) - taken) as usize)
     }
 
     /// rustc's `original_relative_byte_pos`: the byte of the file as read that byte `at` of
@@ -415,7 +415,7 @@ pub fn json_rendered(diag: &Diag, sources: &Sources, rendered: String) -> String
     json::line(diag, &placed, rendered)
 }
 
-fn write(diag: &Diag, placed: &Placed<'_>, style: Style) -> String {
+fn write<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
     let mut text = render(diag, placed, style);
     text.push('\n');
     if !style.short && diag.level != Level::FailureNote {
@@ -1011,15 +1011,6 @@ fn normalize_whitespace(text: Cow<'_, str>) -> Cow<'_, str> {
         }
         out
     }))
-}
-
-/// The last char boundary of `text` at or before `at`.
-fn floor(text: &str, at: usize) -> usize {
-    let mut at = at.min(text.len());
-    while !text.is_char_boundary(at) {
-        at -= 1;
-    }
-    at
 }
 
 #[cfg(test)]

@@ -234,9 +234,9 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
     ungated!(track_caller, Normal, template!(Word), WarnFollowing),
     ungated!(instruction_set, Normal, template!(List: "set"), ErrorPreceding),
     gated!(
-        no_sanitize, Normal,
-        template!(List: "address, kcfi, memory, thread"), DuplicatesOk,
-        experimental!(no_sanitize)
+        sanitize, Normal,
+        template!(List: r#"address = "on|off", kernel_address = "on|off", cfi = "on|off", hwaddress = "on|off", kernel_hwaddress = "on|off", kcfi = "on|off", memory = "on|off", memtag = "on|off", safestack = "on|off", shadow_call_stack = "on|off", thread = "on|off", realtime = "nonblocking|blocking|caller""#),
+        ErrorFollowing, sanitize, experimental!(sanitize)
     ),
     gated!(coverage, Normal, template!(Word, List: "on|off"), WarnFollowing, coverage_attribute, experimental!(coverage)),
 
@@ -568,6 +568,7 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
     BuiltinAttribute {
         // name: sym::rustc_diagnostic_item,
         name: "rustc_diagnostic_item",
+        declared: Declared::rustc_diagnostic_item,
         // FIXME: This can be `true` once we always use `tcx.is_diagnostic_item`.
         // only_local: false,
         // type_: Normal,
@@ -757,5 +758,17 @@ mod tests {
         assert_eq!(find_builtin_attr_idx(&sym::cfg), by_text(&sym::cfg));
         assert!(find_builtin_attr_idx(&sym::cfg).is_some());
         assert_eq!(find_builtin_attr_idx(&Symbol::intern("not_an_attribute")), None);
+    }
+
+    /// As rustc's `builtin_attrs.rs` and `SanitizeParser` at the pinned nightly: `sanitize` is
+    /// a list attribute, and `no_sanitize`, removed in 1.91, is not an attribute.
+    #[test]
+    fn sanitize_replaced_no_sanitize() {
+        let at = find_builtin_attr_idx(&Symbol::intern("sanitize")).expect("`sanitize` is builtin");
+        let sanitize = &INERT_ATTRIBUTES[at];
+        assert_eq!(sanitize.name, "sanitize");
+        assert!(!sanitize.template.word && sanitize.template.name_value_str.is_none());
+        assert!(sanitize.template.list.is_some_and(|it| it.contains(r#"address = "on|off""#)));
+        assert_eq!(find_builtin_attr_idx(&Symbol::intern("no_sanitize")), None);
     }
 }

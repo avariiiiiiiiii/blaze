@@ -6,7 +6,7 @@
 
 pub use blaze_lint_defs::*;
 
-use crate::lints::edit_distance;
+use stdx::edit_distance;
 
 /// What rustc suggests for an unknown lint `name` that [`Store::check`] found
 /// [`Checked::NoLint`] with `suggest`, written with `tool::` before it when `tool` is given:
@@ -37,7 +37,7 @@ fn no_lint_suggestion(store: &Store, name: &str, tool: &str) -> Option<(String, 
     if let Some(last) = lower.split("::").last() {
         lookups.push(last);
     }
-    let found = edit_distance::find_best_match_for_names(&names, &lookups, None);
+    let found = edit_distance::find_best_match_for_names(&names, &lookups, None).copied();
     found.map(|it| {
         let is_rustc = lower.contains("::") && !it.starts_with(tool);
         // alloc: as above

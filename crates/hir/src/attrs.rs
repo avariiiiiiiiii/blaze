@@ -425,9 +425,9 @@ fn resolve_doc_path_on_(
     }
 }
 
-fn resolve_assoc_or_field(
-    db: &Db,
-    resolver: Resolver<'_>,
+fn resolve_assoc_or_field<'db>(
+    db: &'db Db,
+    resolver: Resolver<'db>,
     path: ModPath,
     name: Name,
     ns: Option<Namespace>,
@@ -539,7 +539,7 @@ fn resolve_assoc_item<'db>(
 
 fn resolve_impl_trait_item<'db>(
     db: &'db Db,
-    resolver: Resolver<'_>,
+    resolver: Resolver<'db>,
     ty: &Type<'db>,
     name: &Name,
     ns: Option<Namespace>,

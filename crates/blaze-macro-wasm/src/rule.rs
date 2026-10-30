@@ -37,7 +37,9 @@ pub fn runs(name: &str, native: &[String], wasm: Option<&str>) -> Result<Runs, S
             return Err(format!("{WASM}={other}: it is `0` or `off` to run proc macros natively"));
         }
     }
-    let crate_name = |it: &str| it.bytes().map(|byte| if byte == b'-' { b'_' } else { byte });
+    fn crate_name(it: &str) -> impl Iterator<Item = u8> + '_ {
+        it.bytes().map(|byte| if byte == b'-' { b'_' } else { byte })
+    }
     if native.iter().any(|it| crate_name(it).eq(crate_name(name))) {
         return Ok(Runs::Native(Why::Listed));
     }

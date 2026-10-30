@@ -1,14 +1,15 @@
 ---
 status: current
-summary: Reading Cargo.toml and .cargo/config.toml as cargo does (blaze-manifest), compared with cargo by harness/resolve.py.
+summary: Reading Cargo.toml and .cargo/config.toml as cargo does (blaze-manifest), and how it measured against cargo.
 ---
 # Reading workspaces as cargo does
 
 blaze reads `Cargo.toml` and `.cargo/config.toml` itself, the way cargo reads them (ported
-from cargo 1.99.0, the pin then; `harness/resolve.py` now compares with the pinned nightly's
-cargo), and never runs cargo to do it. `crates/blaze-manifest` is that reader; cargo is only the oracle
-`harness/resolve.py` compares it with. Every manifest cargo accepts reads the same, and one
-cargo rejects is rejected with cargo's message. Part of the self-contained blaze
+from cargo 1.99.0, the pin then), and never runs cargo to do it. `crates/blaze-manifest` is
+that reader. Every manifest cargo accepts reads the same, and one cargo rejects is rejected
+with cargo's message. The harness that compared it with cargo (`resolve.py`) was deleted on
+2026-10-30 with the other comparisons ([harness.md](harness.md)); the parity below is its last
+run, and the committed fixtures are what holds it now. Part of the self-contained blaze
 ([#298](https://github.com/indexable-inc/blaze/issues/298)).
 
 ## What it reads
@@ -102,8 +103,8 @@ across files depends on the keys merged before it in `FxHashMap` order; blaze do
 
 ## Parity
 
-`python3 harness/resolve.py` on dev-aws-8, 2026-10-25, at commit 00a37aa505 of this branch:
-cargo 1.99.0 and blaze-manifest on every workspace of `harness/resolve/corpus.json` and the
+The comparison harness on dev-aws-8, 2026-10-25, at commit 00a37aa505 of this branch:
+cargo 1.99.0 and blaze-manifest on every workspace of its corpus and the
 projects of `harness/bench.py`, each from its root with a `CARGO_HOME` of the harness's own, the
 JSON compared as text with the root and `CARGO_HOME` replaced, key order included.
 
@@ -118,8 +119,8 @@ the same comparison over 226 local workspaces gave 202 equal and 24 that both re
 with cargo's error text (unstable `cargo-features` and `cargo-features` lists, templates that
 do not parse, members that are missing).
 
-The workspaces of `crates/blaze-manifest/tests/fixtures` are the fast tier: cargo's output for
-each is committed, and `cargo test -p blaze-manifest` compares without cargo or the network.
+The workspaces of `crates/blaze-manifest/tests/fixtures` are the fast tier: the expected output
+for each is committed, and `blaze test -p blaze-manifest` checks it without cargo or the network.
 
 The `config` part runs `cargo -Zunstable-options config get` (with `RUSTC_BOOTSTRAP=1`, the
 command being unstable) and the `config` example with the same arguments, seven ways each
@@ -135,8 +136,8 @@ the 18 trees, the 13 bench projects and the 72 workspace repositories, 47 of who
 a `.cargo/config` or `.cargo/config.toml` of their own. The other parts gave the same counts as
 above.
 
-The trees' runs and cargo's output for them are committed (`expected.json`, written by
-`resolve.py --fixtures`); `tests/config_get.rs` compares them offline, and
+The trees' runs and their expected output are committed (`expected.json`); `tests/config_get.rs`
+checks them offline, and
 `tests/config_typed.rs` checks the typed tables, the rustflags order and `[env]` values as
 `cargo build -v` and `cargo run` showed them.
 
@@ -199,7 +200,7 @@ get` as TOML with `--show-origin` and as JSON, `cargo rustc --print cfg -- -O` a
 target-spec-json` for the host and five other targets (and for `build.target`), comparing exit
 code and stdout as text, and, in a tree with a package, the flags cargo hands rustc for each
 target (seen by a `RUSTC_WRAPPER` that prints them) against those `plan.rs` reads
-(`cargo-answer --rustflags`). The trees: `harness/resolve/toolchain-fixtures` (`build.target`,
+(`cargo-answer --rustflags`). The trees: the harness's toolchain fixtures (`build.target`,
 `[target.'cfg(..)']` tables, `RUSTFLAGS` per target and a forced `[env] RUSTC_BOOTSTRAP=-1`,
 which cargo hands the rustc it asks, so the stable channel's cfgs print), the config fixtures,
 `harness/norustc/fixture` and the bench projects.
@@ -284,8 +285,4 @@ prints with the `toml_edit` (`=0.25.12`) and `shell-escape` (`=0.1.5`) cargo 1.9
 
 Git-index registries are read from their fetched tree without a checkout (#316). Cargo and
 blaze share the blob-versioned index cache; old commit-versioned caches are accepted too.
-`python3 harness/fetchdiff.py --git-index-only` compares a local two-package registry with
-Cargo and then tests offline cache exchange. `harness/gitindex.py` runs the same fixture
-through the `blaze fetch` CLI. Crates.io with `registries.crates-io.protocol = "git"` uses
-the same index implementation; `fetchdiff.py --git-index` selects it for the full corpus.
-Fetching the whole public index is not part of the local fixture.
+Crates.io with `registries.crates-io.protocol = "git"` uses the same index implementation.

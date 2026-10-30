@@ -20,6 +20,7 @@ default = ["daemon"]
 daemon = ["dep:blaze-codegen", "dep:blaze-ids", "dep:blaze-items", "dep:blaze-stencil", "dep:rustc-hash"]
 
 [dependencies]
+blaze-bytes.workspace = true
 blaze-inproc.workspace = true
 blaze-codegen = { workspace = true, optional = true }
 blaze-ids = { workspace = true, optional = true }

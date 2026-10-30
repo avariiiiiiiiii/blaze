@@ -10,13 +10,14 @@
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/lanes/items.md
 //!   section 6.2).
 
-#![feature(allocator_api)]
+#![feature(allocator_api, portable_simd)]
 #![deny(unsafe_code)]
 
 use std::{fmt, hash, marker::PhantomData};
 
 use blaze_mem::swiss::Index;
 
+#[allow(clippy::disallowed_types, reason = "`Mutex` is named only by `Shard::lock`, which allows it")]
 use crate::{
     b3::ContextKey,
     sync::{
@@ -33,7 +34,7 @@ mod many;
 pub mod names;
 pub mod prehashed;
 pub use blaze_radix as radix;
-pub mod rng;
+pub use blaze_rng as rng;
 mod std_hash;
 mod sync;
 mod wire;
@@ -134,20 +135,24 @@ impl Domain {
     }
 }
 
-/// How many distinct domain names [`Hasher::new`] keeps the context keys of.
-const DOMAIN_SLOTS: usize = 1024;
+/// How many domain names [`Hasher::new`] keeps the context keys of: about 500 literals name a
+/// domain in the workspace, and one name at two addresses takes two slots.
+const DOMAIN_SLOTS: usize = 2048;
 
-/// The context key of each domain name hashed so far, open-addressed by the name's text: a
-/// slot once set never changes, so a lookup is acquire loads and compares.
+/// The context key of each domain name hashed so far, open-addressed by the name's address:
+/// a slot once set never changes, so a lookup is acquire loads and compares.
 static DOMAIN_KEYS: DomainKeys = [const { OnceLock::new() }; DOMAIN_SLOTS];
 
 type DomainKeys = [OnceLock<(&'static str, ContextKey)>; DOMAIN_SLOTS];
 
-/// FNV-1a: domain names are a few dozen bytes, hashed once per [`Hasher::new`].
-fn name_hash(name: &str) -> usize {
-    name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-        (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3)
-    }) as usize
+/// A domain's first slot, from its address and length, so a lookup reads none of its text: a
+/// domain hashed millions of times is one literal, found by a pointer compare. Hashing the text
+/// (FNV-1a, a dependent multiply a byte) cost about 70 cycles per [`ContentId::of`], a third of
+/// a one-block hash. A name at a second address gets a slot of its own holding the same key, as
+/// the key is derived from the text.
+fn home(name: &str) -> usize {
+    let word = name.as_ptr().addr() as u64 ^ (name.len() as u64).rotate_right(16);
+    (word.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40) as usize & (DOMAIN_SLOTS - 1)
 }
 
 /// [`b3::context_key`]`(domain)`, derived once per name.
@@ -157,7 +162,7 @@ fn context_key(domain: &'static str) -> &'static ContextKey {
 
 /// [`context_key`] in the table `slots`, which a model test makes fresh for each execution.
 fn context_key_in<'a>(slots: &'a DomainKeys, domain: &'static str) -> &'a ContextKey {
-    let mut at = name_hash(domain) & (DOMAIN_SLOTS - 1);
+    let mut at = home(domain);
     for _ in 0..DOMAIN_SLOTS {
         let slot = &slots[at];
         let (name, key) = match slot.get() {
@@ -191,6 +196,14 @@ impl Hasher {
         self.0.update(&(bytes.len() as u64).to_le_bytes());
         self.0.update(bytes);
         self
+    }
+
+    /// An optional part: `0` for none, else `1` and the [`part`](Hasher::part).
+    pub fn opt_part(&mut self, part: Option<impl AsRef<[u8]>>) -> &mut Hasher {
+        match part {
+            None => self.update(&[0]),
+            Some(part) => self.update(&[1]).part(part.as_ref()),
+        }
     }
 
     pub fn id(&mut self, id: &ContentId) -> &mut Hasher {
@@ -343,6 +356,10 @@ struct Claimed {
 
 /// One cache line pair per shard, so writers to neighbouring shards don't share a line.
 #[repr(align(128))]
+#[allow(
+    clippy::disallowed_types,
+    reason = "the one lock of `Sharded`: held only to probe again, insert and claim a block, never across a call (docs/v2/plan/design/concurrency.md); a find never takes it"
+)]
 struct Shard {
     /// Held only to look again and insert.
     lock: Mutex<Claimed>,
@@ -368,6 +385,7 @@ fn chunk_of(raw: u32) -> (usize, usize) {
 }
 
 impl<T: Send + Sync> Sharded<T> {
+    #[allow(clippy::disallowed_types, reason = "makes `Shard::lock`, which allows it")]
     pub fn new() -> Sharded<T> {
         let count = shard_count();
         Sharded {
@@ -469,6 +487,29 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
 mod tests {
     use super::*;
 
+    /// The tag-then-part each caller (base-db's `input.rs` and `lib.rs`, hir-def's `deps`,
+    /// blaze-items' `key.rs`) wrote by hand before [`Hasher::opt_part`].
+    #[test]
+    fn an_optional_part_is_a_tag_then_the_part() {
+        for part in [None, Some(""), Some("1.2.3"), Some("a name of some length")] {
+            let mut by_hand = Hasher::new("blaze v2 a 1");
+            match part {
+                None => by_hand.update(&[0]),
+                Some(part) => by_hand.update(&[1]).part(part.as_bytes()),
+            };
+            let mut shared = Hasher::new("blaze v2 a 1");
+            shared.opt_part(part);
+            assert_eq!(shared.finish(), by_hand.finish(), "{part:?}");
+            let mut owned = Hasher::new("blaze v2 a 1");
+            owned.opt_part(part.map(str::to_owned));
+            assert_eq!(owned.finish(), by_hand.finish(), "{part:?}, owned");
+        }
+        let (mut none, mut empty) = (Hasher::new("blaze v2 a 1"), Hasher::new("blaze v2 a 1"));
+        none.opt_part(None::<&str>);
+        empty.opt_part(Some(""));
+        assert_ne!(none.finish(), empty.finish());
+    }
+
     #[test]
     fn domains_part_equal_bytes() {
         assert_ne!(ContentId::of("blaze v2 a 1", b"x"), ContentId::of("blaze v2 b 1", b"x"));
@@ -521,6 +562,22 @@ mod tests {
             ContentId::of_many_into("blaze v2 a 1", &inputs, &mut out);
         });
         assert_eq!(out, expected);
+    }
+
+    /// A warm [`Hasher::new`] finds its domain's key by address and allocates nothing, and
+    /// neither do short updates nor the finish.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn a_warm_hasher_allocates_nothing() {
+        let hash = || {
+            let mut hasher = Hasher::new("blaze v2 a 1");
+            for n in 0..40u8 {
+                hasher.update(&[n; 3]).part(b"ab");
+            }
+            hasher.finish()
+        };
+        let expected = hash();
+        assert_eq!(blaze_alloc_count::assert_at_most(0, "a warm Hasher", hash), expected);
     }
 
     #[test]
@@ -719,6 +776,7 @@ mod tests {
 /// returned before it, an index reads back its value and ID and is below `end`, and every value
 /// made is dropped once. And a [`Domain`]'s key derived by two threads at once.
 #[cfg(all(test, blaze_check))]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod model {
     use std::sync::{
         Arc,
@@ -965,10 +1023,10 @@ mod model {
     #[test]
     fn model_colliding_domains_keep_their_own_keys() {
         let first = "blaze v2 model a 1";
-        let home = name_hash(first) & (DOMAIN_SLOTS - 1);
+        let first_home = home(first);
         let second: &'static str = (0..)
             .map(|n| &*Box::leak(format!("blaze v2 model b {n}").into_boxed_str()))
-            .find(|name| name_hash(name) & (DOMAIN_SLOTS - 1) == home)
+            .find(|name| home(name) == first_home)
             .expect("a name of the same home slot");
         blaze_check::model(move || {
             let slots: Arc<DomainKeys> = Arc::new([const { OnceLock::new() }; DOMAIN_SLOTS]);

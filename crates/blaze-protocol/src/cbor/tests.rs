@@ -13,7 +13,9 @@ use serde::{
     },
 };
 
-use super::{Error, Writer, append, from_slice, key_order, reference, to_vec};
+use super::{Error, Writer, append, from_slice, key_order, name_order, reference, to_vec};
+
+mod properties;
 
 /// Shapes and bytes from a seed, the same in every run.
 struct Random(SplitMix64);
@@ -668,5 +670,24 @@ fn keys_are_ordered_as_their_bytes_are() {
         let a = key(&mut random);
         let b = if random.below(4) == 0 { a.clone() } else { key(&mut random) };
         assert_eq!(key_order(&a, &b), a.cmp(&b), "{a:02x?} {b:02x?}");
+    }
+}
+
+/// A struct's field names are ordered as their encodings are, by the names alone: of one
+/// length or two, across a head's widths, and with characters of more than a byte.
+#[test]
+fn names_are_ordered_as_their_encodings_are() {
+    let mut random = Random(SplitMix64::new(0x6e61_6d65));
+    let name = |random: &mut Random| -> String {
+        let len = [0, 1, 2, 11, 12, 23, 24, 25, 128, 255, 256][random.below(11) as usize];
+        (0..len).map(|_| ['a', 'b', '\u{e9}'][random.below(3) as usize]).collect()
+    };
+    for _ in 0..20_000 {
+        let a = name(&mut random);
+        let b = if random.below(4) == 0 { a.clone() } else { name(&mut random) };
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        append(&mut x, a.as_str()).unwrap();
+        append(&mut y, b.as_str()).unwrap();
+        assert_eq!(name_order(&a, &b), x.cmp(&y), "{a:?} {b:?}");
     }
 }

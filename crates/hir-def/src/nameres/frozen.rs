@@ -214,7 +214,7 @@ pub fn check_frozen(
 
 /// The frozen `DefMap` of `krate`, by value: a [`set`] that leaves it as it was is backdated
 /// here, so it runs none of the queries of `krate` again.
-#[salsa::tracked]
+#[salsa::tracked(returns(as_ref))]
 fn frozen_def_map(db: &Db, krate: Crate) -> Option<Frozen> {
     // clone: a count of the image the bytes are in, or of their own buffer
     FrozenDefMaps::try_get(db)?.maps(db).get(&krate).cloned()
@@ -238,6 +238,12 @@ pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
         }
     }
     Some((def_map, local))
+}
+
+/// Whether [`served`] gives `krate`'s `DefMap` from the image, without decoding it: the name
+/// resolution maintainer never maintains such a crate.
+pub(super) fn is_served(db: &Db, krate: Crate) -> bool {
+    frozen_def_map(db, krate).is_some_and(|it| it.mode != Mode::Check)
 }
 
 /// Records a difference between the `DefMap` resolving found and the frozen one, in
@@ -287,7 +293,7 @@ pub fn set_lang_items(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
 }
 
 /// The frozen lang items of `krate`, by value, as [`frozen_def_map`] is.
-#[salsa::tracked]
+#[salsa::tracked(returns(as_ref))]
 fn frozen_lang_items(db: &Db, krate: Crate) -> Option<Frozen> {
     // clone: a count of the image the bytes are in, or of their own buffer
     FrozenLangItems::try_get(db)?.maps(db).get(&krate).cloned()
@@ -1019,7 +1025,7 @@ impl Enc<'_> {
                     let (kind, hashes) = kind.code();
                     self.u8(kind);
                     self.u8(hashes);
-                    self.u8(suffix_len);
+                    self.u32(suffix_len);
                     self.span(span)?;
                 }
                 TokenTree::Leaf(Leaf::Punct(tt::Punct { char, spacing, span })) => {
@@ -1047,12 +1053,8 @@ impl Enc<'_> {
         let db = self.db;
         if let Some(block) = it.block(db) {
             // A block is made as its body is lowered: it is named by that body.
-            // SAFETY: `to_static` needs the id not to outlive the query computation it was made
-            // in. `block` finds its owner (`block_owner`, which caches it in this encoder's
-            // `block_owners`), its ast id and its def map; what gets written is the owner's path
-            // and indexes, never the id. The encoder is a local of one encoding and drops the
-            // cache with it, so no copy outlives the computation that read `it`.
-            let block = unsafe { block.to_static() };
+            // What gets written is the owner's path and indexes, never the id.
+            let block = block.to_static();
             let owner = self.block_owner(block)?;
             self.u8(1);
             self.body_owner(owner)?;
@@ -2525,7 +2527,7 @@ impl Dec<'_> {
                     let hashes = self.u8()?;
                     // alloc: error path
                     let kind = LitKind::from_code(kind, hashes).ok_or_else(|| format!("literal kind {kind}"))?;
-                    let suffix_len = self.u8()?;
+                    let suffix_len = self.u32()?;
                     let span = self.span()?;
                     TokenTree::Leaf(Leaf::Literal(tt::Literal {
                         text_and_suffix,
@@ -3295,13 +3297,8 @@ impl Dec<'_> {
             let parent = *self.own.get(parent).ok_or("a module before its parent")?;
             // clone: the decoded map's own storage, once per crate served
             let name = name.clone().ok_or("a module with no name")?;
-            let module =
-                // SAFETY: `to_static` needs the id not to outlive the query computation it was
-                // made in. The decode runs inside the def-map query that reads the frozen def map
-                // (`crate_local_def_map`, through `served`), and the ids go only into the `DefMap`
-                // it returns (`self.own`, then its modules), which salsa invalidates with that
-                // query.
-                unsafe { ModuleIdLt::new(db, krate, None, Some(parent), name).to_static() };
+            // The ids go only into the `DefMap` the def-map query reading this frozen map returns.
+            let module = ModuleIdLt::new(db, krate, None, Some(parent), name).to_static();
             self.own.push(module);
         }
         let mut table = super::ModulesMap::new();

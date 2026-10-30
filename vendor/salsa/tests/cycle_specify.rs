@@ -2,6 +2,8 @@
 
 //! A value specified by a fixpoint cycle remains provisional until the cycle converges.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::{ExecuteValidateLoggerDatabase, LogDatabase};

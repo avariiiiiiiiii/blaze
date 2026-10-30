@@ -40,6 +40,10 @@
 //! whole for those that have it open. The `lock` file only keeps two collections, or a
 //! collection and a change of format, from running at once.
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use std::{
     borrow::Cow,
     fs::{File, OpenOptions},

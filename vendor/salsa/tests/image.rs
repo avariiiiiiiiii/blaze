@@ -5,6 +5,8 @@
 //! generation, and every image that cannot be restored as written is refused with nothing
 //! restored.
 
+#![forbid(unsafe_code)]
+
 use blaze_format::FormatError;
 use blaze_image::{Builder, Image};
 use intern::Live;

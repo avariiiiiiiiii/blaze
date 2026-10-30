@@ -223,6 +223,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     (it, args)
                 }
                 ResolveValueResult::Partial(def, remaining_index) => {
+                    // `path_ctx` holds the rest of `self`.
+                    let segments = u32::try_from(remaining_index).expect("2^32 path segments");
+                    self.result.qualifier_resolutions.insert(id, (def, segments));
                     // there may be more intermediate segments between the resolved one and
                     // the end. Only the last segment needs to be resolved to a value; from
                     // the segments before that, we need to get either a type or a trait ref.

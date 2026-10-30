@@ -115,9 +115,15 @@ fn every_way_in_gives_what_the_old_frames_gave() {
         while at < stream.len() {
             let len = (rng.below(90) as usize).min(stream.len() - at);
             let piece = &stream[at..at + len];
-            match rng.below(3) {
+            match rng.below(4) {
                 0 => frames.push(piece),
                 1 => frames.push_vec(piece.to_vec()),
+                2 => {
+                    let mut into = frames.lend();
+                    assert_eq!(into.len(), model.bytes.len(), "seed {seed}");
+                    into.extend_from_slice(piece);
+                    assert_eq!(frames.give_back(into), !piece.is_empty(), "seed {seed}");
+                }
                 _ => {
                     let most = 1 + rng.below(200) as usize;
                     let mut from = Trickle { bytes: piece, most: 1 + rng.below(50) as usize };
@@ -157,6 +163,37 @@ fn a_warm_fill_allocates_nothing() {
         assert_eq!(read, frame.len());
         assert_eq!(frames.next_ref().unwrap(), Some(&frame[4..]));
     }
+}
+
+/// A buffer lent to each receive and given back with what it read is the frames' own from then
+/// on: once it has grown, a frame cut over two receives allocates nothing, its start kept at
+/// the buffer's front, and a receive that read nothing says the peer hung up.
+#[test]
+fn a_warm_lent_buffer_allocates_nothing() {
+    let frame = encode(&Envelope::new(4, Request::Cancel { id: 11 })).unwrap();
+    let (first, second) = frame.split_at(frame.len() / 2);
+    let mut frames = Frames::new();
+    let mut into = frames.lend();
+    into.reserve(64 << 10);
+    into.extend_from_slice(&frame);
+    assert!(frames.give_back(into));
+    assert_eq!(frames.next_ref().unwrap(), Some(&frame[4..]));
+    blaze_alloc_count::assert_at_most(0, "warm receives into a lent buffer", || {
+        for _ in 0..100 {
+            let mut into = frames.lend();
+            assert!(into.is_empty());
+            into.extend_from_slice(first);
+            assert!(frames.give_back(into));
+            assert_eq!(frames.next_ref().unwrap(), None);
+            let mut into = frames.lend();
+            assert_eq!(&into[..], first);
+            into.extend_from_slice(second);
+            assert!(frames.give_back(into));
+            assert_eq!(frames.next_ref().unwrap(), Some(&frame[4..]));
+        }
+    });
+    let into = frames.lend();
+    assert!(!frames.give_back(into));
 }
 
 /// The whole way of a request that owns nothing, warm: encoded onto a kept buffer by a kept

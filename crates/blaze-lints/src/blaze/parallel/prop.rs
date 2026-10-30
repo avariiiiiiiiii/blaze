@@ -11,7 +11,8 @@
 //! blaze reads as a carried value though any order gives the same; and a write of `out`
 //! another write overwrites, whose read is dead. Both are misses the notes name.
 
-use proptest::prelude::*;
+use hegel::generators::{self as gs, Generator as _};
+use hegel::TestCase;
 
 use super::tests::{FLAGS, MAIN, MINICORE, STD, conf, found};
 use crate::tests::lint_with;
@@ -186,7 +187,7 @@ impl Body {
     }
 }
 
-/// xorshift64: inputs and orders from a seed proptest shrinks.
+/// xorshift64: inputs and orders from a seed Hegel shrinks.
 struct Rng(u64);
 
 impl Rng {
@@ -198,30 +199,22 @@ impl Rng {
     }
 }
 
-fn reduce() -> impl Strategy<Value = Reduce> {
-    prop_oneof![
-        Just(Reduce::Add),
-        Just(Reduce::Mul),
-        Just(Reduce::Or),
-        Just(Reduce::And),
-        Just(Reduce::Xor),
-        Just(Reduce::Min),
-        Just(Reduce::Max),
-    ]
+fn draw_body(tc: &TestCase) -> Body {
+    let reduces = [Reduce::Add, Reduce::Mul, Reduce::Or, Reduce::And, Reduce::Xor, Reduce::Min, Reduce::Max];
+    let reduce = tc.draw(gs::vecs(gs::sampled_from(reduces.to_vec())).max_size(3));
+    let write = tc.draw(gs::optional(hegel::one_of!(
+        gs::integers::<u64>().min_value(1).max_value(15).map(Write::Own),
+        gs::just(Write::Next),
+    )));
+    let carry = tc.draw(gs::booleans());
+    let push = tc.draw(gs::booleans());
+    Body { reduce, write, carry, push }
 }
 
-fn body() -> impl Strategy<Value = Body> {
-    let write = prop_oneof![(1u64..16).prop_map(Write::Own), Just(Write::Next)];
-    (prop::collection::vec(reduce(), 0..4), prop::option::of(write), any::<bool>(), any::<bool>())
-        .prop_map(|(reduce, write, carry, push)| Body { reduce, write, carry, push })
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
-
-    #[test]
-    #[ignore = "a front end per case: run once compiling is allowed (lane lints-parallel)"]
-    fn any_order_gives_the_same_iff_the_loop_is_found(body in body(), seed in any::<u64>()) {
-        prop_assert_eq!(body.found(), body.order_free(seed), "{}", body.rendered().0);
-    }
+#[hegel::test(test_cases = 64)]
+#[ignore = "a front end per case: run once compiling is allowed (lane lints-parallel)"]
+fn any_order_gives_the_same_iff_the_loop_is_found(tc: TestCase) {
+    let body = draw_body(&tc);
+    let seed: u64 = tc.draw(gs::integers());
+    assert_eq!(body.found(), body.order_free(seed), "{}", body.rendered().0);
 }

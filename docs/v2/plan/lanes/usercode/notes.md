@@ -97,6 +97,9 @@ for longer than either rule would keep it.
 or a spawn in a sandbox that traces, its `OUT_DIR` given empty and read back with every path
 checked to stay inside (a link out of it is an error), kept when it succeeded. `run::Mode::Verify`
 runs anyway and fails naming the run when the result differs from the one kept.
+A build script proved pure (`hir_ty_pure`) is also kept under a key of its instance graph's
+identity alone, found before it is compiled (`pure`, lane pure-scripts:
+[design.md](../pure-scripts/design.md)).
 
 `script::prepare` makes a build script's run from `blaze_build_script::Unit`: a variable cargo
 sets from the unit (`Env::set_from_unit`) is given, one passed through from where the build

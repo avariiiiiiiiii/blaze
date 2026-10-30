@@ -837,13 +837,23 @@ impl<V: Send + Sync + 'static> Map<V> {
     /// Every entry, as of when each shard's table is loaded; one published meanwhile may be
     /// missed.
     pub(crate) fn for_each<'g>(&'g self, task: &'g Guard, mut f: impl FnMut(&'g QueryKey, &'g V)) {
-        for shard in self.shards.iter() {
-            let Some(table) = Self::table(shard, task) else { continue };
-            for place in table.iter() {
-                // SAFETY: loaded from a table of this map in the caller's task.
-                if let Some(entry) = unsafe { self.entry_at(place.load(Ordering::Acquire)) } {
-                    f(&entry.key, &entry.value);
-                }
+        for shard in 0..self.shards.len() {
+            self.for_each_in(task, shard, &mut f);
+        }
+    }
+
+    /// How many shards it has: [`Map::for_each_in`] takes one, to split a pass among workers.
+    pub(crate) fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// [`Map::for_each`] of the entries of shard `shard` (none past the last).
+    pub(crate) fn for_each_in<'g>(&'g self, task: &'g Guard, shard: usize, mut f: impl FnMut(&'g QueryKey, &'g V)) {
+        let Some(table) = self.shards.get(shard).and_then(|shard| Self::table(shard, task)) else { return };
+        for place in table.iter() {
+            // SAFETY: loaded from a table of this map in the caller's task.
+            if let Some(entry) = unsafe { self.entry_at(place.load(Ordering::Acquire)) } {
+                f(&entry.key, &entry.value);
             }
         }
     }
@@ -861,60 +871,117 @@ impl<V: Send + Sync + 'static> Map<V> {
             // Reused for every shard.
             let (mut edits, mut gone) = (Vec::new_in(frame), Vec::new_in(frame));
             for shard in self.shards.iter() {
-                let Some(table) = Self::table(shard, task) else { continue };
-                edits.clear();
-                for place in table.iter() {
-                    let place = place.load(Ordering::Acquire);
-                    // SAFETY: loaded from a table of this map in the caller's task.
-                    let Some(seen) = (unsafe { self.entry_at(place) }) else { continue };
-                    match edit(&seen.key, &seen.value) {
-                        Edit::Keep => {}
-                        other => edits.push((place, seen.key, other)),
-                    }
-                }
-                if edits.is_empty() {
-                    continue;
-                }
-                let mut writer = shard.writer.lock();
-                gone.clear();
-                for (seen, key, edit) in edits.drain(..) {
-                    let current = shard.table.load(Ordering::Acquire);
-                    // SAFETY: a table exists (`seen` was in one, and tables are only ever
-                    // replaced), and only this lock's holder unlinks it.
-                    let current = unsafe { places(current) };
-                    let Some((at, now, old)) = self.find(current, &key) else { continue };
-                    if now != seen {
-                        continue;
-                    }
-                    let Some(old_row) = row_of(now) else { continue };
-                    match edit {
-                        Edit::Keep => continue,
-                        Edit::Remove => {
-                            current[at].store(u64::from(TOMB), Ordering::Release);
-                            writer.live -= 1;
-                            applied(&old.value, None);
-                        }
-                        Edit::Replace(value) => {
-                            let row = self.ids.claim(&mut writer.free);
-                            // SAFETY: claimed just now, under the lock, and not yet published.
-                            unsafe { self.rows.put(row, Entry { key, value }) };
-                            current[at].store(place(tag(&key), row), Ordering::Release);
-                            // SAFETY: published just now under the lock; retired only by a later
-                            // writer, after which this lock's holder would have to see it again.
-                            applied(&old.value, Some(&unsafe { self.rows.get(row) }.value));
-                        }
-                    }
-                    gone.push(old_row);
-                }
-                if !gone.is_empty() {
-                    let grace = Grace::start();
-                    for row in gone.drain(..) {
-                        writer.free.retire(grace, row);
-                    }
-                    self.tidy(&mut writer);
-                }
+                self.edit_shard(
+                    shard,
+                    task,
+                    &mut edits,
+                    &mut gone,
+                    &mut (),
+                    |(), key, value| edit(key, value),
+                    |(), old, new| applied(old, new),
+                );
             }
         })
+    }
+
+    /// [`Map::edit_all_with`] with the shards split among the plane's workers, each shard
+    /// edited by one, in its own task. `edit` and `applied` run on many workers at once, each
+    /// call with the state `start` made for the worker making it, which `end` gets back once
+    /// no shard is left for that worker.
+    pub(crate) fn edit_all_parallel<S>(
+        &self,
+        start: impl Fn() -> S + Sync,
+        edit: impl Fn(&mut S, &Guard, &QueryKey, &V) -> Edit<V> + Sync,
+        applied: impl Fn(&mut S, &V, Option<&V>) + Sync,
+        end: impl Fn(S) + Sync,
+    ) {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        crate::on_workers(self.shards.len(), || {
+            let task = blaze_reclaim::enter();
+            let mut state = start();
+            blaze_mem::frame::task(Tag::Query, |frame| {
+                let (mut edits, mut gone) = (Vec::new_in(frame), Vec::new_in(frame));
+                while let Some(shard) = self.shards.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                    self.edit_shard(
+                        shard,
+                        &task,
+                        &mut edits,
+                        &mut gone,
+                        &mut state,
+                        |state, key, value| edit(state, &task, key, value),
+                        &applied,
+                    );
+                }
+            });
+            end(state);
+        });
+    }
+
+    /// One shard of [`Map::edit_all_with`]: `edit` decides without the lock, then each edit
+    /// still current is made under it. `edits` and `gone` are scratch, left empty.
+    #[allow(clippy::too_many_arguments)]
+    fn edit_shard<S, A: std::alloc::Allocator, B: std::alloc::Allocator>(
+        &self,
+        shard: &Shard,
+        task: &Guard,
+        edits: &mut Vec<(u64, QueryKey, Edit<V>), A>,
+        gone: &mut Vec<u32, B>,
+        state: &mut S,
+        mut edit: impl FnMut(&mut S, &QueryKey, &V) -> Edit<V>,
+        mut applied: impl FnMut(&mut S, &V, Option<&V>),
+    ) {
+        let Some(table) = Self::table(shard, task) else { return };
+        edits.clear();
+        for place in table.iter() {
+            let place = place.load(Ordering::Acquire);
+            // SAFETY: loaded from a table of this map in the caller's task.
+            let Some(seen) = (unsafe { self.entry_at(place) }) else { continue };
+            match edit(state, &seen.key, &seen.value) {
+                Edit::Keep => {}
+                other => edits.push((place, seen.key, other)),
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+        let mut writer = shard.writer.lock();
+        gone.clear();
+        for (seen, key, edit) in edits.drain(..) {
+            let current = shard.table.load(Ordering::Acquire);
+            // SAFETY: a table exists (`seen` was in one, and tables are only ever
+            // replaced), and only this lock's holder unlinks it.
+            let current = unsafe { places(current) };
+            let Some((at, now, old)) = self.find(current, &key) else { continue };
+            if now != seen {
+                continue;
+            }
+            let Some(old_row) = row_of(now) else { continue };
+            match edit {
+                Edit::Keep => continue,
+                Edit::Remove => {
+                    current[at].store(u64::from(TOMB), Ordering::Release);
+                    writer.live -= 1;
+                    applied(state, &old.value, None);
+                }
+                Edit::Replace(value) => {
+                    let row = self.ids.claim(&mut writer.free);
+                    // SAFETY: claimed just now, under the lock, and not yet published.
+                    unsafe { self.rows.put(row, Entry { key, value }) };
+                    current[at].store(place(tag(&key), row), Ordering::Release);
+                    // SAFETY: published just now under the lock; retired only by a later
+                    // writer, after which this lock's holder would have to see it again.
+                    applied(state, &old.value, Some(&unsafe { self.rows.get(row) }.value));
+                }
+            }
+            gone.push(old_row);
+        }
+        if !gone.is_empty() {
+            let grace = Grace::start();
+            for row in gone.drain(..) {
+                writer.free.retire(grace, row);
+            }
+            self.tidy(&mut writer);
+        }
     }
 
     pub(crate) fn edit_all(&self, task: &Guard, edit: impl FnMut(&QueryKey, &V) -> Edit<V>) {

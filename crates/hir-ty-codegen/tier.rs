@@ -727,23 +727,15 @@ pub(super) fn known_value(func: &ir::Function, value: ir::Value) -> Option<i64> 
         InstructionData::Unary { opcode: Opcode::Uextend | Opcode::Ireduce, arg } => {
             Some(wrapped(known_value(func, arg)?))
         }
-        InstructionData::Binary { opcode: opcode @ (Opcode::Iadd | Opcode::Imul), args: [l, r] } => {
+        InstructionData::Binary {
+            opcode: opcode @ (Opcode::Iadd | Opcode::Imul | Opcode::Ishl),
+            args: [l, r],
+        } => {
             let (l, r) = (known_value(func, l)?, known_value(func, r)?);
             Some(wrapped(match opcode {
                 Opcode::Iadd => l.wrapping_add(r),
-                _ => l.wrapping_mul(r),
-            }))
-        }
-        InstructionData::BinaryImm64 {
-            opcode: opcode @ (Opcode::IaddImm | Opcode::ImulImm | Opcode::IshlImm),
-            arg,
-            imm,
-        } => {
-            let (known, imm) = (known_value(func, arg)?, imm.bits());
-            Some(wrapped(match opcode {
-                Opcode::IaddImm => known.wrapping_add(imm),
-                Opcode::ImulImm => known.wrapping_mul(imm),
-                _ => known.wrapping_shl((imm as u32) & (bits - 1)),
+                Opcode::Imul => l.wrapping_mul(r),
+                _ => l.wrapping_shl((r as u32) & (bits - 1)),
             }))
         }
         InstructionData::IntCompare { opcode: Opcode::Icmp, cond, args: [l, r] } => {

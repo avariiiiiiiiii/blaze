@@ -346,7 +346,7 @@ impl AsName for base_db::BuiltDependency {
 #[cfg(test)]
 mod tests {
     use span::{EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor};
-    use syntax::{AstNode, SourceFile, TextRange, TextSize};
+    use syntax::{SourceFile, TextRange, TextSize, view::AstNode as _};
 
     use super::*;
 
@@ -388,16 +388,16 @@ mod tests {
             Edition::CURRENT,
         );
         let names: Vec<Name> = file
-            .syntax_node()
+            .root()
             .descendants()
-            .filter_map(ast::NameRef::cast)
+            .filter_map(view::NameRef::cast)
             .filter(|it| it.text() != "x")
             .map(|it| it.as_name())
             .collect();
         let old: Vec<Name> = file
-            .syntax_node()
+            .root()
             .descendants()
-            .filter_map(ast::NameRef::cast)
+            .filter_map(view::NameRef::cast)
             .filter(|it| it.text() != "x")
             .map(|it| match it.as_tuple_field() {
                 Some(idx) => Name::new_tuple_field(idx),

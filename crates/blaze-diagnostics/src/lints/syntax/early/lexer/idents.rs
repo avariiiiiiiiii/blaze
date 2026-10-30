@@ -25,6 +25,7 @@ use unicode_security::{
 };
 
 use super::{Order, Symbol};
+use stdx::list::Join;
 use crate::{
     cx::Cx,
     lints::syntax::{Emitted, Pass, source_fact},
@@ -199,7 +200,7 @@ fn uncommon_message(codepoints: &[char], kind: Uncommon) -> String {
     // alloc: the lint's text, for a lint found
     let listed: Vec<String> = codepoints.iter().map(|c| format!("{c:?}")).collect();
     // alloc: the lint's text, for a lint found
-    format!("identifier contains {what}: {}", and_list(&listed))
+    format!("identifier contains {what}: {}", stdx::list::list(listed.iter(), Join::And, false))
 }
 
 fn uncommon_note(n: usize, kind: Uncommon) -> String {
@@ -212,21 +213,6 @@ fn uncommon_note(n: usize, kind: Uncommon) -> String {
         Uncommon::Restricted => format!("{these} included in the Unicode general security profile"),
         // alloc: the lint's text, for a lint found
         _ => format!("{these} included in the {} Unicode general security profile", kind.name()),
-    }
-}
-
-/// A list as rustc's diagnostics write one (`StrListSepByAnd`, in English): "a", "a and b",
-/// "a, b, and c".
-fn and_list(items: &[String]) -> String {
-    match items {
-        // alloc: the lint's text, for a lint found
-        [] => String::new(),
-        // clone: the lint's text, for a lint found
-        [one] => one.clone(),
-        // alloc: the lint's text, for a lint found
-        [a, b] => format!("{a} and {b}"),
-        // alloc: the lint's text, for a lint found
-        [init @ .., last] => format!("{}, and {last}", init.join(", ")),
     }
 }
 
@@ -372,9 +358,9 @@ mod tests {
     #[test]
     fn lists_are_written_as_rustc_writes_them() {
         let items = |n: usize| (0..n).map(|it| it.to_string()).collect::<Vec<_>>();
-        assert_eq!(and_list(&items(1)), "0");
-        assert_eq!(and_list(&items(2)), "0 and 1");
-        assert_eq!(and_list(&items(3)), "0, 1, and 2");
+        assert_eq!(stdx::list::list(items(1), stdx::list::Join::And, false), "0");
+        assert_eq!(stdx::list::list(items(2), stdx::list::Join::And, false), "0 and 1");
+        assert_eq!(stdx::list::list(items(3), stdx::list::Join::And, false), "0, 1, and 2");
     }
 
     #[test]

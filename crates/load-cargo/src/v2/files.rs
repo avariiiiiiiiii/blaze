@@ -178,21 +178,4 @@ fn follow(link: &str, target: &str) -> String {
     normalize(&joined)
 }
 
-/// An absolute path without `.`, `..` or empty parts: `/a/b`, or `C:/a/b` with its drive kept.
-pub(crate) fn normalize(path: &str) -> String {
-    let (root, rest) = match path.strip_prefix('/') {
-        Some(rest) => ("", rest),
-        None => path.split_once('/').unwrap_or((path, "")),
-    };
-    let mut parts: Vec<&str> = Vec::new();
-    for part in rest.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            part => parts.push(part),
-        }
-    }
-    format!("{root}/{}", parts.join("/"))
-}
+pub(crate) use blaze_units::load::normal_text as normalize;

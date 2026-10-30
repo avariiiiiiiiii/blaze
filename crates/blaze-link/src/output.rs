@@ -18,7 +18,7 @@ pub enum Format {
 }
 
 /// What an image is linked as.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: setup: once per image and its writer, and per linker script read
 pub struct Output {
     pub format: Format,
     pub arch: Arch,
@@ -86,7 +86,7 @@ pub struct DevRun {
     pub fixed: u64,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: setup, as `Output`'s
 pub enum OutputKind {
     /// An executable entered at the symbol `entry` (`_start` from the C runtime's
     /// `Scrt1.o`; Mach-O's `main`; PE's `mainCRTStartup`).
@@ -111,7 +111,7 @@ pub enum Debug {
     Lines,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: setup, as `Output`'s
 pub struct Live {
     pub dir: FileName,
     pub path: String,

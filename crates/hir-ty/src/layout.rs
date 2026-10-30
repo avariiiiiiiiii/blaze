@@ -171,7 +171,7 @@ impl<F> From<LayoutCalculatorError<F>> for LayoutError {
 
 /// What a layout reads of a struct's signature: its flags. A rename, or a change to its
 /// generics or their bounds, leaves this equal.
-#[salsa::tracked(mem_tag = Infer)]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub fn struct_flags(db: &Db, id: StructId) -> StructFlags {
     StructSignature::of(db, id).flags
 }
@@ -180,7 +180,7 @@ pub fn struct_flags(db: &Db, id: StructId) -> StructFlags {
 /// stays last for all of them, so that unsizing the struct does not move it. The answer reads
 /// the struct's own declaration and the crate's `Sized`, never a layout's generic arguments, so
 /// it is asked once per struct and crate rather than once per instantiation.
-#[salsa::tracked(mem_tag = Infer)]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub fn struct_tail_may_be_unsized(db: &Db, id: StructId, krate: Crate) -> bool {
     variant_field_ids(db, id.into()).last().is_some_and(|&fd| {
         let interner = DbInterner::new_with(db, krate);
@@ -389,7 +389,23 @@ pub fn layout_of_ty_query(
     ty: StoredTy,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
+    if let Some(bare) = bare_env(db, ty, trait_env) {
+        return db.layout_of_ty(ty, bare);
+    }
     blaze_mem::frame::current(|frame| layout_of_ty_in(db, ty, trait_env, frame))
+}
+
+/// The crate's empty environment when `ty` has no parameter, inference variable or placeholder
+/// and every clause of `env` names one: no such clause can match a goal about `ty` or its
+/// fields, so the layout under the empty environment is the same, and a type is laid out once
+/// per crate rather than once per environment of the bodies that name it. `None` when the
+/// environment is already empty or a clause might apply.
+fn bare_env(db: &Db, ty: StoredTy, env: StoredParamEnvAndCrate) -> Option<StoredParamEnvAndCrate> {
+    let clauses = env.param_env(db).clauses;
+    if clauses.is_empty() || !ty.as_ref().is_global() || clauses.iter().any(|c| c.is_global()) {
+        return None;
+    }
+    Some(ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: env.krate }.store())
 }
 
 fn layout_of_ty_in(

@@ -26,7 +26,7 @@ use crate::{
 /// The lints this module gives: it runs only when one may fire.
 pub(super) const LINTS: super::LintSet = super::lint_set(["unreachable_code"]);
 
-pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
+pub(super) fn lints(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
     // alloc: the lints found, empty until one is
     b.infer.unreachable().iter().filter_map(|it| lint(b, it)).collect()
 }
@@ -34,7 +34,7 @@ pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
 /// `LintAndRemoveUninhabited`, in `mir_promoted`: what follows a call of a type that is
 /// uninhabited but not `!`, which type checking does not see (`MirBody::unreachable_after_calls`).
 /// None when the call is in a macro of another crate.
-pub(super) fn after_calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
+pub(super) fn after_calls(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
     if b.mir_tainted() {
         // alloc: empty, allocates nothing
         return Vec::new();
@@ -63,7 +63,7 @@ pub(super) fn after_calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
     found
 }
 
-fn lint(b: &BodyCx<'_, '_>, unreachable: &Unreachable) -> Option<Found> {
+fn lint(b: &BodyCx<'_, '_, '_>, unreachable: &Unreachable) -> Option<Found> {
     let (kind, span, at) = place(b, &unreachable.what)?;
     let after = match unreachable.after {
         ExprOrPatId::ExprId(expr) => b.expr_span(expr)?,
@@ -80,7 +80,7 @@ fn lint(b: &BodyCx<'_, '_>, unreachable: &Unreachable) -> Option<Found> {
 }
 
 /// What rustc calls what is unreachable, where it points and the node it lints at.
-fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span, InFile<SyntaxNodePtr>)> {
+fn place(b: &BodyCx<'_, '_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span, InFile<SyntaxNodePtr>)> {
     let store = b.store();
     Some(match *what {
         UnreachableAt::Expr(expr) => {
@@ -121,7 +121,7 @@ fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span
 }
 
 /// A statement as rustc spans it: an expression statement with its `;`, a `let` with its `;`.
-fn statement_node(b: &BodyCx<'_, '_>, statement: Statement<'_>) -> Option<InFile<SyntaxNodePtr>> {
+fn statement_node(b: &BodyCx<'_, '_, '_>, statement: Statement<'_>) -> Option<InFile<SyntaxNodePtr>> {
     let (node, is_let) = match statement {
         Statement::Expr { expr, .. } => (b.expr_node(expr)?, false),
         Statement::Let { pat, .. } => (b.pat_node(pat)?, true),

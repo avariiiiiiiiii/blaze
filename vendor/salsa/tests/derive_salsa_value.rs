@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 #[derive(salsa::SalsaValue)]
 struct StaticValue;
 
@@ -46,6 +48,7 @@ struct ContainsPhantomRef<'db> {
 
 struct Invariant<T>(std::marker::PhantomData<fn(T) -> T>);
 
+#[allow(unsafe_code)]
 // SAFETY: `Invariant` stores no values and only transfers the lifetime
 // relationship guaranteed by `T`.
 unsafe impl<T> salsa::SalsaValue for Invariant<T> where T: salsa::SalsaValue {}

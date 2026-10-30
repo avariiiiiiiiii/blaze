@@ -3,7 +3,6 @@
 * text=auto eol=lf
 
 # Committed with CRLF on purpose (CRLF source a test or a build reads as is); git leaves them as they are.
-harness/breakers/cases/src/crlf_literal.rs -text
 crates/hir-def/src/nameres/tests/imports.rs -text
 crates/proc-macro-srv/src/bridge.rs -text
 crates/test-utils/bench_data/** binary

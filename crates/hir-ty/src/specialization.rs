@@ -32,7 +32,9 @@ use crate::{
 /// The key of [`specializes_query`]: whether `specializing` specializes `parent`.
 #[salsa::interned(debug, revisions = usize::MAX)]
 pub struct ImplPair {
+    #[returns(copy)]
     pub specializing: ImplId,
+    #[returns(copy)]
     pub parent: ImplId,
 }
 

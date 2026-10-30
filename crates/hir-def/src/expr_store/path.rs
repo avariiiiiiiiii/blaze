@@ -225,7 +225,7 @@ impl PathTag {
 }
 
 /// Every column of a store's paths.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)] // clone: in `TypeColumns`; path.rs tests copy it
 pub(crate) struct PathColumns {
     /// [`PathTag`], by path.
     pub(crate) kind: Vec<u8>,
@@ -755,6 +755,11 @@ impl PathColumns {
             true => Ok(()),
             false => Err(SLOT),
         }
+    }
+
+    /// `names` a run in these columns.
+    pub(crate) fn check_names(&self, names: Names) -> Checked {
+        list(&self.names, names.start, names.len, NAMES).map(drop)
     }
 
     /// `bound`'s runs in these columns and its ids in range.

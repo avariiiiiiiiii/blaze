@@ -54,15 +54,28 @@ pub struct SchemaHash(pub ContentId);
 /// # Safety
 ///
 /// The implementor is `#[repr(C)]` (or a primitive) with no padding, no pointer, reference,
-/// `Box` or `Arc` in it, and every bit pattern [`Record::check`] accepts is a valid value:
-/// [`open`] hands out `&Self` over bytes it has only checked with it. [`record!`] writes this
-/// impl for a struct and asserts it has no padding.
+/// `Box` or `Arc` in it, and every bit pattern [`Record::check`] or [`Record::check_shallow`]
+/// accepts is a valid value, as is every one when [`Record::SHALLOW_PLAIN`] holds: [`open`] and
+/// [`Rel::get`] hand out `&Self` over bytes they have only checked with them. [`record!`]
+/// writes this impl for a struct and asserts it has no padding.
 pub unsafe trait Record: Copy + 'static {
     const SCHEMA: SchemaHash;
     /// Every `size_of::<Self>()` bytes are a valid value and hold no reference: `check`
     /// accepts anything at the right size and alignment, so a [`Slice`] of them is checked by
     /// its bounds alone, in O(1), however long it is.
     const PLAIN: bool = false;
+    /// Every `size_of::<Self>()` bytes are a valid value once the [`Rel`]s and [`Slice`]s in it
+    /// count as any bits (each is checked where it is followed): a view of one checks only
+    /// where it is, so [`Slice::get`] of them is O(1), as for a [`Record::PLAIN`] one. `PLAIN`
+    /// implies it; a record with a `bool` or an enum in its own bytes has it false.
+    const SHALLOW_PLAIN: bool = Self::PLAIN;
+    /// Whether `bytes`, as for [`Record::check`], are a valid value, the [`Rel`]s and [`Slice`]s
+    /// in it taken as they are and not followed: what [`Rel::get`] and [`Slice::get`] check of
+    /// what they reach, the buffer having been checked whole by [`open`]. `check` accepts no
+    /// more than this, so it is a sound default.
+    fn check_shallow(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        Self::check(bytes, buffer)
+    }
     /// Whether a [`WordTable`] may be reachable from a value (`true` when it may, `false` only
     /// when it can't): [`Record::columns`] walks only what may hold one.
     const COLUMNS: bool = false;
@@ -156,6 +169,12 @@ fn bytes_of<T: Record>(value: &T) -> &[u8] {
     raw::bytes_of(std::slice::from_ref(value))
 }
 
+/// The bytes of `values`, records, in place: what [`Writer::push_slice`] writes of them, so a
+/// reader that wants a column as bytes (to hash it, to hand it on) takes no copy.
+pub fn bytes_of_slice<T: Record>(values: &[T]) -> &[u8] {
+    raw::bytes_of(values)
+}
+
 /// [`Record::columns`] of the field of type `F` at `offset` in `record`, a checked record.
 pub fn field_columns<F: Record>(
     record: &[u8],
@@ -175,6 +194,25 @@ pub fn check_field<F: Record>(
     offset: usize,
     buffer: &[u8],
 ) -> Result<(), FormatError> {
+    F::check(field_bytes::<F>(record, offset, buffer)?, buffer)
+}
+
+/// [`check_field`] by [`Record::check_shallow`]: what a [`Record::check_shallow`] calls for
+/// each field that is not [`Record::SHALLOW_PLAIN`].
+pub fn check_field_shallow<F: Record>(
+    record: &[u8],
+    offset: usize,
+    buffer: &[u8],
+) -> Result<(), FormatError> {
+    let bytes = field_bytes::<F>(record, offset, buffer)?;
+    match F::SHALLOW_PLAIN {
+        true => Ok(()),
+        false => F::check_shallow(bytes, buffer),
+    }
+}
+
+/// The bytes of the field of type `F` at `offset` in `record`, inside it and aligned for `F`.
+fn field_bytes<'a, F: Record>(record: &'a [u8], offset: usize, buffer: &[u8]) -> Result<&'a [u8], FormatError> {
     let at = (record.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
     let at = at + offset as u64;
     let Some(end) = offset.checked_add(size_of::<F>()).filter(|&end| end <= record.len()) else {
@@ -184,7 +222,7 @@ pub fn check_field<F: Record>(
     if !(bytes.as_ptr() as usize).is_multiple_of(align_of::<F>()) {
         return Err(FormatError::OutOfBounds { at });
     }
-    F::check(bytes, buffer)
+    Ok(bytes)
 }
 
 /// Whether `bytes` are where a `T` can be read: its size, at its alignment.
@@ -236,12 +274,19 @@ unsafe impl<T: Record, const N: usize> Record for [T; N] {
     const SCHEMA: SchemaHash =
         schema_of(&[Part::Str("array"), Part::U64(N as u64), Part::Schema(T::SCHEMA)]);
     const PLAIN: bool = T::PLAIN;
+    const SHALLOW_PLAIN: bool = T::SHALLOW_PLAIN;
     const COLUMNS: bool = T::COLUMNS;
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
         if T::PLAIN {
             return fits::<[T; N]>(bytes, buffer);
         }
         (0..N).try_for_each(|i| check_field::<T>(bytes, i * size_of::<T>(), buffer))
+    }
+    fn check_shallow(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        if T::SHALLOW_PLAIN {
+            return fits::<[T; N]>(bytes, buffer);
+        }
+        (0..N).try_for_each(|i| check_field_shallow::<T>(bytes, i * size_of::<T>(), buffer))
     }
     fn columns(bytes: &[u8], buffer: &[u8], out: &mut Vec<WordTable>) {
         (0..N).for_each(|i| field_columns::<T>(bytes, i * size_of::<T>(), buffer, out));
@@ -336,13 +381,21 @@ impl<T: Record> Rel<T> {
         self.follow(buffer).unwrap_or_else(|error| panic!("{error}"))
     }
 
+    /// The `T` this points at, checked where it is and by [`Record::check_shallow`]: the
+    /// references in it are checked when they are followed in turn, so following each
+    /// reference of a buffer once costs what [`open`] did, not that times the depth.
     pub fn follow<'a>(&'a self, buffer: &'a [u8]) -> Result<Option<&'a T>, FormatError> {
+        self.follow_as::<false>(buffer)
+    }
+
+    /// [`Rel::follow`], the `T` checked with all it reaches when `DEEP`: [`Record::check`].
+    fn follow_as<'a, const DEEP: bool>(&'a self, buffer: &'a [u8]) -> Result<Option<&'a T>, FormatError> {
         if self.offset == 0 {
             return Ok(None);
         }
         let at = position(self, buffer)?;
         let target = target::<T>(at, self.offset, 1, buffer)?;
-        raw::view(&buffer[target..target + size_of::<T>()], buffer).map(Some)
+        raw::view::<T, DEEP>(&buffer[target..target + size_of::<T>()], buffer).map(Some)
     }
 }
 
@@ -367,14 +420,21 @@ impl<T: Record> Slice<T> {
         self.follow(buffer).unwrap_or_else(|error| panic!("{error}"))
     }
 
+    /// The `T`s this points at, checked as [`Rel::follow`] checks its `T`: in O(1) for a
+    /// [`Record::SHALLOW_PLAIN`] `T`, however long the slice.
     pub fn follow<'a>(&'a self, buffer: &'a [u8]) -> Result<&'a [T], FormatError> {
+        self.follow_as::<false>(buffer)
+    }
+
+    /// [`Slice::follow`], each `T` checked with all it reaches when `DEEP`: [`Record::check`].
+    fn follow_as<'a, const DEEP: bool>(&'a self, buffer: &'a [u8]) -> Result<&'a [T], FormatError> {
         if self.len == 0 {
             return Ok(&[]);
         }
         let at = position(self, buffer)?;
         let target = target::<T>(at, self.offset, self.len, buffer)?;
         let len = self.len as usize;
-        raw::view_slice(&buffer[target..target + size_of::<T>() * len], len, buffer)
+        raw::view_slice::<T, DEEP>(&buffer[target..target + size_of::<T>() * len], len, buffer)
     }
 }
 
@@ -393,8 +453,12 @@ impl Slice<u8> {
 // and checks the `T` it reaches.
 unsafe impl<T: Record> Record for Rel<T> {
     const SCHEMA: SchemaHash = schema_of(&[Part::Str("Rel"), Part::Schema(T::SCHEMA)]);
+    const SHALLOW_PLAIN: bool = true;
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
-        raw::in_place::<Rel<T>>(bytes, buffer)?.follow(buffer).map(|_| ())
+        raw::in_place::<Rel<T>>(bytes, buffer)?.follow_as::<true>(buffer).map(|_| ())
+    }
+    fn check_shallow(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        raw::in_place::<Rel<T>>(bytes, buffer).map(|_| ())
     }
     const COLUMNS: bool = !T::PLAIN;
     fn columns(bytes: &[u8], buffer: &[u8], out: &mut Vec<WordTable>) {
@@ -417,8 +481,12 @@ unsafe impl<T: Record> Record for Rel<T> {
 // follows it and checks each `T` it reaches.
 unsafe impl<T: Record> Record for Slice<T> {
     const SCHEMA: SchemaHash = schema_of(&[Part::Str("Slice"), Part::Schema(T::SCHEMA)]);
+    const SHALLOW_PLAIN: bool = true;
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
-        raw::in_place::<Slice<T>>(bytes, buffer)?.follow(buffer).map(|_| ())
+        raw::in_place::<Slice<T>>(bytes, buffer)?.follow_as::<true>(buffer).map(|_| ())
+    }
+    fn check_shallow(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        raw::in_place::<Slice<T>>(bytes, buffer).map(|_| ())
     }
     // `!T::PLAIN`, not `T::COLUMNS`: a record may hold slices of itself, and `PLAIN` never
     // refers back to the type.
@@ -488,7 +556,26 @@ macro_rules! record {
                 )*
             ]);
             const PLAIN: bool = true $( && <$ty as $crate::Record>::PLAIN )*;
+            const SHALLOW_PLAIN: bool = true $( && <$ty as $crate::Record>::SHALLOW_PLAIN )*;
             const COLUMNS: bool = false $( || <$ty as $crate::Record>::COLUMNS )*;
+
+            fn check_shallow(
+                bytes: &[u8],
+                buffer: &[u8],
+            ) -> ::core::result::Result<(), $crate::FormatError> {
+                if <Self as $crate::Record>::SHALLOW_PLAIN {
+                    return ::core::result::Result::Ok(());
+                }
+                $(
+                    $crate::check_field_shallow::<$ty>(
+                        bytes,
+                        ::core::mem::offset_of!($name, $field),
+                        buffer,
+                    )?;
+                )*
+                let _ = (bytes, buffer);
+                ::core::result::Result::Ok(())
+            }
 
             fn columns(
                 bytes: &[u8],
@@ -616,13 +703,23 @@ pub fn open_as<R: Record>(buffer: &[u8], schema: SchemaHash) -> Result<&R, Forma
     if header.schema != schema {
         return Err(FormatError::Schema { found: header.schema, wanted: schema });
     }
-    let root = header.root;
-    let end = root.checked_add(size_of::<R>() as u64).filter(|&end| end <= header.len);
-    let Some(end) = end.filter(|_| root >= HEADER_LEN as u64 && root.is_multiple_of(align_of::<R>() as u64))
-    else {
-        return Err(FormatError::OutOfBounds { at: root });
-    };
-    raw::view(&buffer[root as usize..end as usize], buffer)
+    record_at::<R>(buffer, header.root)
+}
+
+/// The `R` at `at` in `buffer`, checked: past the header, inside the buffer, aligned for `R`,
+/// and accepted by [`Record::check`]. A record found by an offset of the caller's (a table
+/// placed beside the root); [`open_as`] reads the root with it.
+pub fn record_at<R: Record>(buffer: &[u8], at: u64) -> Result<&R, FormatError> {
+    let bad = || FormatError::OutOfBounds { at };
+    let start = usize::try_from(at).map_err(|_| bad())?;
+    let end = start
+        .checked_add(size_of::<R>())
+        .filter(|&end| end <= buffer.len() && start >= HEADER_LEN)
+        .ok_or_else(bad)?;
+    if !(buffer.as_ptr() as usize).wrapping_add(start).is_multiple_of(align_of::<R>()) {
+        return Err(bad());
+    }
+    raw::view::<R, true>(&buffer[start..end], buffer)
 }
 
 /// The domain of a buffer's content ID ([`buffer_id`]).

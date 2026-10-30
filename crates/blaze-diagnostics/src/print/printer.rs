@@ -161,7 +161,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         }
         match kind {
             RegionKind::ReEarlyParam(p) => early_name(self.db, p).filter(|it| it.as_str() != "'_"),
-            RegionKind::ReLateParam(p) => late_name(self.db, p.bound_region),
+            RegionKind::ReLateParam(p) => late_name(self.db, p.kind),
             RegionKind::ReBound(BoundVarIndexKind::Bound(d), br) => self.bound_name(d, br),
             RegionKind::RePlaceholder(p) => late_name(self.db, p.bound),
             _ => None,
@@ -809,7 +809,7 @@ impl<'t> TypeVisitor<DbInterner<'t>> for UsedNames<'t, '_> {
     fn visit_region(&mut self, r: Region<'t>) {
         let name = match r.kind() {
             RegionKind::ReEarlyParam(p) => early_name(self.db, p).filter(|it| it.as_str() != "'_"),
-            RegionKind::ReLateParam(p) => late_name(self.db, p.bound_region),
+            RegionKind::ReLateParam(p) => late_name(self.db, p.kind),
             RegionKind::ReBound(BoundVarIndexKind::Bound(d), br) if self.signature && d == self.depth => {
                 late_name(self.db, br)
             }

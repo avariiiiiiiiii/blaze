@@ -129,6 +129,55 @@ fn fde_after(cie: &CommonInformationEntry, fde: FrameDescriptionEntry) -> Vec<u8
     bytes[fde + 24..end].to_vec()
 }
 
+/// `fde_instructions` as it was before the cursor, indexing the bytes by hand.
+fn fde_instructions_by_index(written: &[u8]) -> Option<std::ops::Range<usize>> {
+    let length = |at: usize| -> Option<usize> {
+        let bytes = written.get(at..at + 4)?;
+        match u32::from_le_bytes(bytes.try_into().unwrap()) {
+            u32::MAX => None,
+            length => Some(at + 4 + length as usize),
+        }
+    };
+    let fde = length(0)?;
+    let end = length(fde)?;
+    let start = fde + 4 + 4 + 16;
+    (start <= end && end == written.len()).then_some(start..end)
+}
+
+/// The FDE's instructions are where indexing by hand found them, in what gimli writes, in
+/// every prefix of it, with bytes after it, and in entries too short or 64-bit.
+#[test]
+fn fde_instructions_are_where_indexing_found_them() {
+    let isa = crate::target().unwrap();
+    let cie = isa.create_systemv_cie().expect("a DWARF ISA");
+    let mut inputs = Vec::new();
+    for len in [0, 16, 4096] {
+        let mut fde = FrameDescriptionEntry::new(Address::Constant(0), len);
+        fde.add_instruction(1, CallFrameInstruction::CfaOffset(16));
+        let mut table = FrameTable::default();
+        let id = table.add_cie(cie.clone());
+        table.add_fde(id, fde);
+        let mut eh_frame = EhFrame(EndianVec::new(RunTimeEndian::Little));
+        table.write_eh_frame(&mut eh_frame).unwrap();
+        let bytes = eh_frame.0.slice().to_vec();
+        for cut in 0..bytes.len() {
+            inputs.push(bytes[..cut].to_vec());
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        inputs.push(longer);
+        inputs.push(bytes);
+    }
+    let short_fde = [&[4, 0, 0, 0, 0, 0, 0, 0][..], &[10, 0, 0, 0], &[0; 10]].concat();
+    let wide = [&[4, 0, 0, 0, 0, 0, 0, 0][..], &[0xff; 4], &[0; 24]].concat();
+    let exact = [&[0, 0, 0, 0][..], &[24, 0, 0, 0], &[0; 24]].concat();
+    inputs.extend([short_fde, wide, exact]);
+    for input in &inputs {
+        assert_eq!(fde_instructions(input).ok(), fde_instructions_by_index(input), "{input:x?}");
+    }
+    assert!(inputs.iter().filter(|it| fde_instructions(it).is_ok()).count() >= 4);
+}
+
 /// What [`write_fde`] keeps of a function's entry is, byte for byte, what gimli writes of
 /// it after the CIE the ISA makes, with that CIE's instructions and return register: the FDE
 /// depends on the CIE's two factors alone. Rows of every rule, at every distance apart.

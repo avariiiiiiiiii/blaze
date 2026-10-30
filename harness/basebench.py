@@ -17,7 +17,7 @@ import json, os, re, resource, shutil, statistics, subprocess, sys, tempfile, ti
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 INCREMENTAL = os.environ.get("CARGO_INCREMENTAL")
-from difftest import Fixture, BLAZE, TARGET_ARGS, sysroot_rlibs
+from mixed import Fixture, BLAZE, TARGET_ARGS, sysroot_rlibs
 if INCREMENTAL is None:
     os.environ.pop("CARGO_INCREMENTAL", None)
 

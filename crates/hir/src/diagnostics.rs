@@ -14,7 +14,10 @@ use hir_def::{
     attrs::AttrFlags,
     expr_store::{
         Body, ExprOrPatPtr, ExpressionStore, ExpressionStoreDiagnostics, ExpressionStoreSourceMap,
-        hir_assoc_type_binding_to_ast, hir_generic_arg_to_ast, hir_segment_to_ast_segment,
+        lower::{
+            hir_assoc_type_binding_to_ast_view, hir_generic_arg_to_ast_view,
+            hir_segment_to_ast_segment_view,
+        },
     },
     hir::{ExprId, ExprOrPatId, PatId},
     nameres::{
@@ -26,7 +29,7 @@ use hir_def::{
         ConstSignature, FunctionSignature, ImplFlags, ImplSignature, TraitFlags, TraitSignature,
         TypeAliasSignature,
     },
-    src::HasChildSource as _,
+    src::HasChildSourceView as _,
     type_ref::TypeRefId,
     unstable_features::UnstableFeatures,
 };
@@ -55,9 +58,8 @@ use rustc_type_ir::inherent::IntoKind as _;
 use span::Edition;
 use stdx::{impl_from, never};
 use syntax::{
-    AstNode, AstPtr, SyntaxError, SyntaxNodePtr, TextRange,
-    ast::{self, HasGenericArgs, HasName},
-    match_ast, view,
+    AstNode, AstPtr, SyntaxError, SyntaxNodePtr, TextRange, ast, match_ast,
+    view::{self, AstNode as _, HasGenericArgs as _, HasName as _},
 };
 use triomphe::Arc;
 
@@ -557,8 +559,8 @@ fn borrowck_parts(
     use hir_ide::mir::MirSpan;
     use hir_ty_borrowck::PartSpan;
     let syntax = |node: InFile<SyntaxNodePtr>| {
-        let root = node.file_id.parse_or_expand(db);
-        node.map(|it| it.to_node(&root))
+        let root = node.file_id.root(db);
+        node.map(|it| view::to_node(it, root))
     };
     let expr = |expr| node_of(MirSpan::ExprId(expr));
     let range = |part: PartSpan| -> Option<InFile<TextRange>> {
@@ -594,7 +596,7 @@ fn borrowck_parts(
             }
             PartSpan::MethodName(call) => {
                 let node = syntax(expr(call)?);
-                let name = ast::MethodCallExpr::cast(node.value)?.name_ref()?;
+                let name = view::MethodCallExpr::cast(node.value)?.name_ref()?;
                 InFile::new(node.file_id, name.syntax().text_range())
             }
             // rustc's `fn_decl_span`: a closure through its parameters and return type, a
@@ -602,7 +604,7 @@ fn borrowck_parts(
             PartSpan::ClosureHead(closure) => {
                 let node = syntax(expr(closure)?);
                 let range = node.value.text_range();
-                let end = ast::ClosureExpr::cast(node.value).and_then(|it| {
+                let end = view::ClosureExpr::cast(node.value).and_then(|it| {
                     let ret = it.ret_type().map(|it| it.syntax().text_range().end());
                     ret.or_else(|| Some(it.param_list()?.syntax().text_range().end()))
                 });
@@ -614,16 +616,16 @@ fn borrowck_parts(
             PartSpan::Def(adt) => {
                 let (file_id, item) = match adt {
                     AdtId::StructId(it) => {
-                        let source = hir_def::src::HasSource::source(it.lookup(db), db);
-                        (source.file_id, ast::Adt::Struct(source.value))
+                        let source = hir_def::src::HasSource::source_view(it.lookup(db), db);
+                        (source.file_id, view::Adt::Struct(source.value))
                     }
                     AdtId::EnumId(it) => {
-                        let source = hir_def::src::HasSource::source(it.lookup(db), db);
-                        (source.file_id, ast::Adt::Enum(source.value))
+                        let source = hir_def::src::HasSource::source_view(it.lookup(db), db);
+                        (source.file_id, view::Adt::Enum(source.value))
                     }
                     AdtId::UnionId(it) => {
-                        let source = hir_def::src::HasSource::source(it.lookup(db), db);
-                        (source.file_id, ast::Adt::Union(source.value))
+                        let source = hir_def::src::HasSource::source_view(it.lookup(db), db);
+                        (source.file_id, view::Adt::Union(source.value))
                     }
                 };
                 let start = item
@@ -639,7 +641,7 @@ fn borrowck_parts(
                     })?
                     .text_range()
                     .start();
-                let end = match ast::HasGenericParams::generic_param_list(&item) {
+                let end = match view::HasGenericParams::generic_param_list(&item) {
                     Some(generics) => generics.syntax().text_range().end(),
                     None => item.name()?.syntax().text_range().end(),
                 };
@@ -693,6 +695,8 @@ pub struct ConstCheckError {
     pub node: InFile<SyntaxNodePtr>,
     pub code: &'static str,
     pub message: String,
+    pub kind: hir_ide::mir::const_check::ConstCheckKind,
+    pub context: hir_ide::mir::const_check::ConstContext,
 }
 
 /// A `const fn` whose result at run time depends on more than its arguments: "const fn reads
@@ -1485,17 +1489,17 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
                     ..
                 } => {
                     let ptr = source_map.type_syntax(path.type_ref()).ok()?;
-                    let root = ptr.file_id.parse_or_expand(db);
+                    let root = ptr.file_id.root(db);
                     ptr.map(|it| {
-                        it.to_node(&root).syntax().ancestors().find_map(ast::TypeBound::cast)
+                        it.to_view(root).syntax().ancestors().find_map(view::TypeBound::cast)
                     })
                 }
                 WherePredicate::TypeBound { bound: TypeBound::Lifetime(lifetime), .. }
                 | WherePredicate::Lifetime { bound: lifetime, .. } => {
                     let ptr = source_map.lifetime_syntax(lifetime).ok()?;
-                    let root = ptr.file_id.parse_or_expand(db);
+                    let root = ptr.file_id.root(db);
                     ptr.map(|it| {
-                        it.to_node(&root).syntax().ancestors().find_map(ast::TypeBound::cast)
+                        it.to_view(root).syntax().ancestors().find_map(view::TypeBound::cast)
                     })
                 }
                 WherePredicate::TypeBound { bound: TypeBound::Use(_) | TypeBound::Error, .. } => {
@@ -1503,7 +1507,7 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
                 }
             };
             let file_id = bound.file_id;
-            BoundSource::Written(InFile::new(file_id, AstPtr::new(&bound.value?)))
+            BoundSource::Written(InFile::new(file_id, AstPtr::of(bound.value?)))
         }
     })
 }
@@ -1564,15 +1568,15 @@ impl Trait {
 
 /// The name of an associated item.
 fn assoc_item_name(db: &Db, item: AssocItemId) -> Option<InFile<SyntaxNodePtr>> {
-    fn name<N: HasName>(source: InFile<N>) -> Option<InFile<SyntaxNodePtr>> {
+    fn name<'db, N: view::HasName<'db>>(source: InFile<N>) -> Option<InFile<SyntaxNodePtr>> {
         let name = source.value.name()?;
-        Some(source.with_value(SyntaxNodePtr::new(name.syntax())))
+        Some(source.with_value(view::ptr(name.syntax())))
     }
     use hir_def::src::HasSource;
     match item {
-        AssocItemId::FunctionId(id) => name(id.lookup(db).source(db)),
-        AssocItemId::ConstId(id) => name(id.lookup(db).source(db)),
-        AssocItemId::TypeAliasId(id) => name(id.lookup(db).source(db)),
+        AssocItemId::FunctionId(id) => name(id.lookup(db).source_view(db)),
+        AssocItemId::ConstId(id) => name(id.lookup(db).source_view(db)),
+        AssocItemId::TypeAliasId(id) => name(id.lookup(db).source_view(db)),
     }
 }
 
@@ -1588,9 +1592,9 @@ fn param_syntax(db: &Db, function: FunctionId, index: u32) -> Option<InFile<Synt
     if index != 0 || !signature.has_self_param() {
         return None;
     }
-    let source = hir_def::src::HasSource::source(function.lookup(db), db);
+    let source = hir_def::src::HasSource::source_view(function.lookup(db), db);
     let param = source.value.param_list()?.self_param()?;
-    Some(source.with_value(SyntaxNodePtr::new(param.syntax())))
+    Some(source.with_value(view::ptr(param.syntax())))
 }
 
 /// `function`'s written return type.
@@ -1753,7 +1757,7 @@ fn precise_macro_call_location(
     // - e.g. the full attribute for macro errors, but only the name for name resolution
     match ast {
         MacroCallKind::FnLike { ast_id, .. } => {
-            let node = ast_id.to_node(db);
+            let node = ast_id.to_view(db);
             let range = node
                 .path()
                 .and_then(|it| it.segment())
@@ -1767,8 +1771,12 @@ fn precise_macro_call_location(
             ast_id.with_value(range)
         }
         MacroCallKind::Attr { ast_id, censored_attr_ids: attr_ids, .. } => {
-            let attr_range =
-                attr_ids.invoc_attr().find_attr_range(db, krate, *ast_id).1.syntax().text_range();
+            let attr_range = attr_ids
+                .invoc_attr()
+                .find_attr_range_view(db, krate, *ast_id)
+                .1
+                .syntax()
+                .text_range();
             ast_id.with_value(attr_range)
         }
     }
@@ -1869,14 +1877,14 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             DefDiagnosticKind::UnresolvedImport { id, index } => {
                 let file_id = id.file_id;
 
-                let use_tree = hir_def::src::use_tree_to_ast(self.db, *id, *index);
+                let use_tree = hir_def::src::use_tree_to_view(self.db, *id, *index);
                 self.acc.push(
-                    UnresolvedImport { decl: InFile::new(file_id, AstPtr::new(&use_tree)) }.into(),
+                    UnresolvedImport { decl: InFile::new(file_id, AstPtr::of(use_tree)) }.into(),
                 );
             }
             DefDiagnosticKind::TraitItemImport { id, index, why } => {
-                let use_tree = hir_def::src::use_tree_to_ast(self.db, *id, *index);
-                let decl = InFile::new(id.file_id, AstPtr::new(&use_tree));
+                let use_tree = hir_def::src::use_tree_to_view(self.db, *id, *index);
+                let decl = InFile::new(id.file_id, AstPtr::of(use_tree));
                 self.acc.push(TraitItemImport { decl, why: *why }.into());
             }
 
@@ -1907,18 +1915,16 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 );
             }
             DefDiagnosticKind::UnimplementedBuiltinMacro { ast } => {
-                let node = ast.to_node(self.db);
+                let node = ast.to_view(self.db);
                 // Must have a name, otherwise we wouldn't emit it.
                 let name = node.name().expect("unimplemented builtin macro with no name");
                 self.acc.push(
-                    UnimplementedBuiltinMacro {
-                        node: ast.with_value(SyntaxNodePtr::from(AstPtr::new(&name))),
-                    }
-                    .into(),
+                    UnimplementedBuiltinMacro { node: ast.with_value(view::ptr(name.syntax())) }
+                        .into(),
                 );
             }
             DefDiagnosticKind::InvalidDeriveTarget { ast, id } => {
-                let (_, attr) = id.find_attr_range(self.db, self.krate, *ast);
+                let (_, attr) = id.find_attr_range_view(self.db, self.krate, *ast);
                 let derive = attr
                     .path()
                     .map(|path| path.syntax().text_range())
@@ -1926,14 +1932,15 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 self.acc.push(InvalidDeriveTarget { range: ast.with_value(derive) }.into());
             }
             DefDiagnosticKind::MalformedDerive { ast, id } => {
-                let derive = id.find_attr_range(self.db, self.krate, *ast).1.syntax().text_range();
+                let derive =
+                    id.find_attr_range_view(self.db, self.krate, *ast).1.syntax().text_range();
                 self.acc.push(MalformedDerive { range: ast.with_value(derive) }.into());
             }
             DefDiagnosticKind::MacroDefError { ast, message } => {
-                let node = ast.to_node(self.db);
+                let node = ast.to_view(self.db);
                 self.acc.push(
                     MacroDefError {
-                        node: InFile::new(ast.file_id, AstPtr::new(&node)),
+                        node: InFile::new(ast.file_id, AstPtr::of(node)),
                         name: node.name().map(|it| it.syntax().text_range()),
                         // clone: error path, a reported diagnostic
                         message: message.clone(),
@@ -2398,17 +2405,15 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         if errors.is_empty() {
             return;
         }
-        let sources = def.child_source(self.db);
         for error in errors {
-            let Some(Either::Left(ast::TypeOrConstParam::Const(param))) =
-                sources.value.get(error.param.local_id())
-            else {
+            let source = def.child_source_view(self.db, error.param.local_id());
+            let Some(Either::Left(view::TypeOrConstParam::Const(param))) = source.value else {
                 never!("{:?}: a const parameter with no `ast::ConstParam`", error.param);
                 continue;
             };
             self.acc.push(
                 ConstParamTyNotAllowed {
-                    param: InFile::new(sources.file_id, AstPtr::new(param)),
+                    param: InFile::new(source.file_id, AstPtr::of(param)),
                     ty: Type::new(self.db, def, error.ty.as_ref()),
                     reason: error.reason,
                 }
@@ -2478,9 +2483,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         // An `async fn`'s body is the future it makes, which rustc points at as its block.
         let block = || -> Option<InFile<SyntaxNodePtr>> {
             let DefWithBodyId::FunctionId(function) = def else { return None };
-            let source = hir_def::src::HasSource::source(function.lookup(self.db), self.db);
+            let source = hir_def::src::HasSource::source_view(function.lookup(self.db), self.db);
             let block = source.value.body()?;
-            Some(InFile::new(source.file_id, SyntaxNodePtr::new(syntax::AstNode::syntax(&block))))
+            Some(InFile::new(source.file_id, view::ptr(block.syntax())))
         };
         let node_of = |span: MirSpan| -> Option<InFile<SyntaxNodePtr>> {
             let source = match span {
@@ -2551,9 +2556,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         // rustc's span of a function's signature starts at `fn`, the line of its name.
         let signature = || -> Option<InFile<SyntaxNodePtr>> {
             let DefWithBodyId::FunctionId(function) = def else { return None };
-            let source = hir_def::src::HasSource::source(function.lookup(self.db), self.db);
+            let source = hir_def::src::HasSource::source_view(function.lookup(self.db), self.db);
             let name = source.value.name()?;
-            Some(InFile::new(source.file_id, SyntaxNodePtr::new(syntax::AstNode::syntax(&name))))
+            Some(InFile::new(source.file_id, view::ptr(name.syntax())))
         };
         for diagnostic in &result.diagnostics {
             let node = match diagnostic.at_signature {
@@ -2564,10 +2569,10 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             // A variable lowering declares `mut` itself, as an `async fn`'s argument, points
             // at what the user wrote, which has no `mut` to remove.
             if diagnostic.code == "unused_mut" {
-                let pat = node.value.to_node(&node.file_id.parse_or_expand(self.db));
-                let written = match ast::SelfParam::can_cast(pat.kind()) {
-                    true => ast::SelfParam::cast(pat).is_some_and(|it| it.mut_token().is_some()),
-                    false => ast::IdentPat::cast(pat).is_some_and(|it| it.mut_token().is_some()),
+                let pat = view::to_node(node.value, node.file_id.root(self.db));
+                let written = match view::SelfParam::can_cast(pat.kind()) {
+                    true => view::SelfParam::cast(pat).is_some_and(|it| it.mut_token().is_some()),
+                    false => view::IdentPat::cast(pat).is_some_and(|it| it.mut_token().is_some()),
                 };
                 if !written {
                     continue;
@@ -2597,6 +2602,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                     code: diagnostic.code,
                     // clone: error path, a reported const check error
                     message: diagnostic.message.clone(),
+                    // clone: error path, a reported const check error
+                    kind: diagnostic.kind.clone(),
+                    context: diagnostic.context,
                 }
                 .into(),
             );
@@ -2872,17 +2880,15 @@ impl<'db> AnyDiagnostic<'db> {
                     Either::Right(record_pat) => source_map.pat_syntax(record_pat).ok()?,
                 };
                 let file = record.file_id;
-                let root = record.file_syntax(db);
-                match record.value.to_node(&root) {
-                    Either::Left(ast::Expr::RecordExpr(record_expr))
+                match record.to_view(db) {
+                    Either::Left(view::Expr::RecordExpr(record_expr))
                         if record_expr.record_expr_field_list().is_some() =>
                     {
-                        let field_list_parent_path =
-                            record_expr.path().map(|path| AstPtr::new(&path));
+                        let field_list_parent_path = record_expr.path().map(AstPtr::of);
                         return Some(
                             MissingFields {
                                 file,
-                                field_list_parent: AstPtr::new(&Either::Left(record_expr)),
+                                field_list_parent: AstPtr::of(Either::Left(record_expr)),
                                 field_list_parent_path,
                                 variant: variant.into(),
                                 missed_fields,
@@ -2890,15 +2896,14 @@ impl<'db> AnyDiagnostic<'db> {
                             .into(),
                         );
                     }
-                    Either::Right(ast::Pat::RecordPat(record_pat))
+                    Either::Right(view::Pat::RecordPat(record_pat))
                         if record_pat.record_pat_field_list().is_some() =>
                     {
-                        let field_list_parent_path =
-                            record_pat.path().map(|path| AstPtr::new(&path));
+                        let field_list_parent_path = record_pat.path().map(AstPtr::of);
                         return Some(
                             MissingFields {
                                 file,
-                                field_list_parent: AstPtr::new(&Either::Right(record_pat)),
+                                field_list_parent: AstPtr::of(Either::Right(record_pat)),
                                 field_list_parent_path,
                                 variant: variant.into(),
                                 missed_fields,
@@ -3261,14 +3266,14 @@ impl<'db> AnyDiagnostic<'db> {
             }
             InferenceDiagnostic::PathDiagnostic { node, diag } => {
                 let source = expr_or_pat_syntax(node.unpack())?;
-                let syntax = source.value.to_node(&source.file_id.parse_or_expand(db));
+                let syntax = source.to_view(db);
                 let path = match_ast! {
                     match (syntax.syntax()) {
-                        ast::RecordExpr(it) => it.path()?,
-                        ast::RecordPat(it) => it.path()?,
-                        ast::TupleStructPat(it) => it.path()?,
-                        ast::PathExpr(it) => it.path()?,
-                        ast::PathPat(it) => it.path()?,
+                        view::RecordExpr(it) => it.path()?,
+                        view::RecordPat(it) => it.path()?,
+                        view::TupleStructPat(it) => it.path()?,
+                        view::PathExpr(it) => it.path()?,
+                        view::PathPat(it) => it.path()?,
                         _ => return None,
                     }
                 };
@@ -3284,12 +3289,12 @@ impl<'db> AnyDiagnostic<'db> {
                 let syntax = expr_syntax(expr)?;
                 let file_id = syntax.file_id;
                 let syntax =
-                    syntax.with_value(syntax.value.cast::<ast::MethodCallExpr>()?).to_node(db);
+                    syntax.with_value(syntax.value.cast::<ast::MethodCallExpr>()?).to_view(db);
                 let generics_or_name = syntax
                     .generic_arg_list()
                     .map(Either::Left)
                     .or_else(|| syntax.name_ref().map(Either::Right))?;
-                let generics_or_name = InFile::new(file_id, AstPtr::new(&generics_or_name));
+                let generics_or_name = InFile::new(file_id, AstPtr::of(generics_or_name));
                 IncorrectGenericsLen {
                     generics_or_segment: generics_or_name,
                     kind,
@@ -3308,10 +3313,10 @@ impl<'db> AnyDiagnostic<'db> {
                 let syntax = expr_syntax(expr)?;
                 let file_id = syntax.file_id;
                 let syntax =
-                    syntax.with_value(syntax.value.cast::<ast::MethodCallExpr>()?).to_node(db);
+                    syntax.with_value(syntax.value.cast::<ast::MethodCallExpr>()?).to_view(db);
                 let generic_args = syntax.generic_arg_list()?;
-                let provided_arg = hir_generic_arg_to_ast(&generic_args, arg_idx, has_self_arg)?;
-                let provided_arg = InFile::new(file_id, AstPtr::new(&provided_arg));
+                let provided_arg = hir_generic_arg_to_ast_view(generic_args, arg_idx, has_self_arg)?;
+                let provided_arg = InFile::new(file_id, AstPtr::of(provided_arg));
                 let expected_kind = GenericArgKind::from_id(param_id);
                 IncorrectGenericsOrder { provided_arg, expected_kind, param: param_id.into() }
                     .into()
@@ -3490,9 +3495,9 @@ impl<'db> AnyDiagnostic<'db> {
                         let syntax = expr_or_pat_syntax(path_expr_id.unpack())?;
                         let file_id = syntax.file_id;
                         let syntax =
-                            syntax.with_value(syntax.value.cast::<ast::PathExpr>()?).to_node(db);
+                            syntax.with_value(syntax.value.cast::<ast::PathExpr>()?).to_view(db);
                         let path = syntax.path()?;
-                        let path = InFile::new(file_id, AstPtr::new(&path));
+                        let path = InFile::new(file_id, AstPtr::of(path));
                         Either::Right(path)
                     }
                 };
@@ -3519,7 +3524,6 @@ impl<'db> AnyDiagnostic<'db> {
             &InferenceDiagnostic::RecordMissingFields { record, variant, ref missed_fields } => {
                 let record = expr_or_pat_syntax(record)?;
                 let file = record.file_id;
-                let root = record.file_syntax(db);
                 let variant_data = variant.fields(db);
                 let missed_fields = missed_fields
                     .iter()
@@ -3528,16 +3532,15 @@ impl<'db> AnyDiagnostic<'db> {
                     })
                     // alloc: error path, a reported diagnostic
                     .collect();
-                match record.value.to_node(&root) {
-                    Either::Left(ast::Expr::RecordExpr(record_expr))
+                match record.to_view(db) {
+                    Either::Left(view::Expr::RecordExpr(record_expr))
                         if record_expr.record_expr_field_list().is_some() =>
                     {
-                        let field_list_parent_path =
-                            record_expr.path().map(|path| AstPtr::new(&path));
+                        let field_list_parent_path = record_expr.path().map(AstPtr::of);
                         return Some(
                             MissingFields {
                                 file,
-                                field_list_parent: AstPtr::new(&Either::Left(record_expr)),
+                                field_list_parent: AstPtr::of(Either::Left(record_expr)),
                                 field_list_parent_path,
                                 variant: variant.into(),
                                 missed_fields,
@@ -3545,14 +3548,13 @@ impl<'db> AnyDiagnostic<'db> {
                             .into(),
                         );
                     }
-                    Either::Right(ast::Pat::RecordPat(record_pat))
+                    Either::Right(view::Pat::RecordPat(record_pat))
                         if record_pat.record_pat_field_list().is_some() =>
                     {
-                        let field_list_parent_path =
-                            record_pat.path().map(|path| AstPtr::new(&path));
+                        let field_list_parent_path = record_pat.path().map(AstPtr::of);
                         MissingFields {
                             file,
-                            field_list_parent: AstPtr::new(&Either::Right(record_pat)),
+                            field_list_parent: AstPtr::of(Either::Right(record_pat)),
                             field_list_parent_path,
                             variant: variant.into(),
                             missed_fields,
@@ -3788,7 +3790,7 @@ impl<'db> AnyDiagnostic<'db> {
 
     fn path_diagnostic(
         diag: &PathLoweringDiagnostic,
-        path: InFile<ast::Path>,
+        path: InFile<view::Path<'_>>,
         db: &'db Db,
     ) -> Option<AnyDiagnostic<'db>> {
         Some(match *diag {
@@ -3797,33 +3799,34 @@ impl<'db> AnyDiagnostic<'db> {
                 // alloc: an error's sites.
                 let mut all_args = Vec::with_capacity(segments.len());
                 for &segment in segments.iter() {
-                    let segment = hir_segment_to_ast_segment(&path.value, segment)?;
+                    let segment = hir_segment_to_ast_segment_view(path.value, segment)?;
                     if let Some(it) = segment.return_type_syntax() {
                         // RTN errors are emitted as `GenericArgsProhibited` or `ParenthesizedGenericArgsWithoutFnTrait`.
                         rtn.get_or_insert(it);
                         continue;
                     }
                     let args = if let Some(generics) = segment.generic_arg_list() {
-                        AstPtr::new(&generics).wrap_left()
+                        AstPtr::<ast::GenericArgList>::of(generics).wrap_left()
                     } else {
-                        AstPtr::new(&segment.parenthesized_arg_list()?).wrap_right()
+                        let list = segment.parenthesized_arg_list()?;
+                        AstPtr::<ast::ParenthesizedArgList>::of(list).wrap_right()
                     };
                     all_args.push(path.with_value(args));
                 }
                 let Some(&args) = all_args.first() else {
-                    return Some(BadRtn { rtn: path.with_value(AstPtr::new(&rtn?)) }.into());
+                    return Some(BadRtn { rtn: path.with_value(AstPtr::of(rtn?)) }.into());
                 };
                 GenericArgsProhibited { args, all_args: all_args.into_boxed_slice(), reason }.into()
             }
             PathLoweringDiagnostic::ParenthesizedGenericArgsWithoutFnTrait { segment } => {
-                let segment = hir_segment_to_ast_segment(&path.value, segment)?;
+                let segment = hir_segment_to_ast_segment_view(path.value, segment)?;
 
                 if let Some(rtn) = segment.return_type_syntax() {
                     // RTN errors are emitted as `GenericArgsProhibited` or `ParenthesizedGenericArgsWithoutFnTrait`.
-                    return Some(BadRtn { rtn: path.with_value(AstPtr::new(&rtn)) }.into());
+                    return Some(BadRtn { rtn: path.with_value(AstPtr::of(rtn)) }.into());
                 }
 
-                let args = AstPtr::new(&segment.parenthesized_arg_list()?);
+                let args = AstPtr::of(segment.parenthesized_arg_list()?);
                 let args = path.with_value(args);
                 ParenthesizedGenericArgsWithoutFnTrait { args }.into()
             }
@@ -3835,8 +3838,8 @@ impl<'db> AnyDiagnostic<'db> {
                 def,
             } => {
                 let generics_or_segment =
-                    path_generics_source_to_ast(&path.value, generics_source)?;
-                let generics_or_segment = path.with_value(AstPtr::new(&generics_or_segment));
+                    path_generics_source_to_ast(path.value, generics_source)?;
+                let generics_or_segment = path.with_value(AstPtr::of(generics_or_segment));
                 IncorrectGenericsLen {
                     generics_or_segment,
                     kind,
@@ -3853,9 +3856,9 @@ impl<'db> AnyDiagnostic<'db> {
                 has_self_arg,
             } => {
                 let generic_args =
-                    path_generics_source_to_ast(&path.value, generics_source)?.left()?;
-                let provided_arg = hir_generic_arg_to_ast(&generic_args, arg_idx, has_self_arg)?;
-                let provided_arg = path.with_value(AstPtr::new(&provided_arg));
+                    path_generics_source_to_ast(path.value, generics_source)?.left()?;
+                let provided_arg = hir_generic_arg_to_ast_view(generic_args, arg_idx, has_self_arg)?;
+                let provided_arg = path.with_value(AstPtr::of(provided_arg));
                 let expected_kind = GenericArgKind::from_id(param_id);
                 IncorrectGenericsOrder { provided_arg, expected_kind, param: param_id.into() }
                     .into()
@@ -3863,8 +3866,8 @@ impl<'db> AnyDiagnostic<'db> {
             PathLoweringDiagnostic::MissingLifetime { generics_source, expected_count, def }
             | PathLoweringDiagnostic::ElisionFailure { generics_source, expected_count, def } => {
                 let generics_or_segment =
-                    path_generics_source_to_ast(&path.value, generics_source)?;
-                let generics_or_segment = path.with_value(AstPtr::new(&generics_or_segment));
+                    path_generics_source_to_ast(path.value, generics_source)?;
+                let generics_or_segment = path.with_value(AstPtr::of(generics_or_segment));
                 let kind = match diag {
                     PathLoweringDiagnostic::ElisionFailure { .. } => {
                         MissingLifetimeKind::ElisionFailure
@@ -3881,8 +3884,8 @@ impl<'db> AnyDiagnostic<'db> {
             }
             PathLoweringDiagnostic::LateBoundLifetimeArgs { generics_source, def, hard_error } => {
                 let generics_or_segment =
-                    path_generics_source_to_ast(&path.value, generics_source)?;
-                let generics_or_segment = path.with_value(AstPtr::new(&generics_or_segment));
+                    path_generics_source_to_ast(path.value, generics_source)?;
+                let generics_or_segment = path.with_value(AstPtr::of(generics_or_segment));
                 LateBoundLifetimeArgs { generics_or_segment, def: def.into(), hard_error }.into()
             }
             PathLoweringDiagnostic::AmbiguousAssociatedItem { segment, variant, item, impl_ } => {
@@ -3891,7 +3894,7 @@ impl<'db> AnyDiagnostic<'db> {
                     return None;
                 };
                 AmbiguousAssociatedItem {
-                    path: path.map(|it| AstPtr::new(&it)),
+                    path: path.map(AstPtr::of),
                     variant: VariantId::from(variant).into(),
                     item: item.into(),
                     self_ty: crate::Impl::from(AnyImplId::ImplId(impl_)).self_ty(db),
@@ -3906,8 +3909,8 @@ impl<'db> AnyDiagnostic<'db> {
                 hard_error,
             } => {
                 let generics_or_segment =
-                    path_generics_source_to_ast(&path.value, generics_source)?;
-                let generics_or_segment = path.with_value(AstPtr::new(&generics_or_segment));
+                    path_generics_source_to_ast(path.value, generics_source)?;
+                let generics_or_segment = path.with_value(AstPtr::of(generics_or_segment));
                 ElidedLifetimesInPath {
                     generics_or_segment,
                     expected: expected_count,
@@ -3917,8 +3920,8 @@ impl<'db> AnyDiagnostic<'db> {
                 .into()
             }
             PathLoweringDiagnostic::GenericDefaultRefersToSelf { segment } => {
-                let segment = hir_segment_to_ast_segment(&path.value, segment)?;
-                let segment = path.with_value(AstPtr::new(&segment));
+                let segment = hir_segment_to_ast_segment_view(path.value, segment)?;
+                let segment = path.with_value(AstPtr::of(segment));
                 GenericDefaultRefersToSelf { segment }.into()
             }
         })
@@ -3983,8 +3986,7 @@ impl<'db> AnyDiagnostic<'db> {
         Some(match diag {
             TyLoweringDiagnostic::PathDiagnostic { source, diag } => {
                 let source = Self::type_syntax(*source, source_map)?;
-                let syntax = source.value.to_node(&source.file_id.parse_or_expand(db));
-                let ast::Type::PathType(syntax) = syntax else { return None };
+                let view::Type::PathType(syntax) = source.to_view(db) else { return None };
                 Self::path_diagnostic(diag, source.with_value(syntax.path()?), db)?
             }
             TyLoweringDiagnostic::InferVarsNotAllowed { sources } => {
@@ -4025,12 +4027,11 @@ impl<'db> AnyDiagnostic<'db> {
             }
             ElidedLifetimeSite::Path { source, generics_source, def, expected_count } => {
                 let source = Self::type_syntax(source, source_map)?;
-                let syntax = source.value.to_node(&source.file_id.parse_or_expand(db));
-                let ast::Type::PathType(syntax) = syntax else { return None };
+                let view::Type::PathType(syntax) = source.to_view(db) else { return None };
                 let generics_or_segment =
-                    path_generics_source_to_ast(&syntax.path()?, generics_source)?;
+                    path_generics_source_to_ast(syntax.path()?, generics_source)?;
                 MissingLifetimeSite::Path {
-                    generics_or_segment: source.with_value(AstPtr::new(&generics_or_segment)),
+                    generics_or_segment: source.with_value(AstPtr::of(generics_or_segment)),
                     expected: expected_count,
                     def: def.into(),
                 }
@@ -4039,22 +4040,22 @@ impl<'db> AnyDiagnostic<'db> {
     }
 }
 
-fn path_generics_source_to_ast(
-    path: &ast::Path,
+fn path_generics_source_to_ast<'t>(
+    path: view::Path<'t>,
     generics_source: PathGenericsSource,
-) -> Option<Either<ast::GenericArgList, ast::NameRef>> {
+) -> Option<Either<view::GenericArgList<'t>, view::NameRef<'t>>> {
     Some(match generics_source {
         PathGenericsSource::Segment(segment) => {
-            let segment = hir_segment_to_ast_segment(path, segment)?;
+            let segment = hir_segment_to_ast_segment_view(path, segment)?;
             segment
                 .generic_arg_list()
                 .map(Either::Left)
                 .or_else(|| segment.name_ref().map(Either::Right))?
         }
         PathGenericsSource::AssocType { segment, assoc_type } => {
-            let segment = hir_segment_to_ast_segment(path, segment)?;
+            let segment = hir_segment_to_ast_segment_view(path, segment)?;
             let segment_args = segment.generic_arg_list()?;
-            let assoc = hir_assoc_type_binding_to_ast(&segment_args, assoc_type)?;
+            let assoc = hir_assoc_type_binding_to_ast_view(segment_args, assoc_type)?;
             assoc
                 .generic_arg_list()
                 .map(Either::Left)

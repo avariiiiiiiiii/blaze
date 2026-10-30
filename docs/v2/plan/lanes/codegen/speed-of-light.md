@@ -222,7 +222,11 @@ for each whether it reaches a process, the network or assembly.
   syntax-tree lookup (about 1 µs), so 1 ms for a thousand tests. **Where the code is:**
   at the bound for the read; it runs twice a unit (`harness` writes the text, `roots` checks
   its digest), both on the same memoized syntax, so within 2× of it. Gap: a salsa query of
-  the listing would make the second free and a warm unchanged crate free; small, next.
+  the listing would make a warm unchanged crate free, but not the second listing of a cold
+  build: writing the harness changes the root file, so `roots` lists on a new revision, and
+  that listing is the check that the harness is the crate's (sol-all, 2026-10-30). A query per
+  module would leave only the root module listed twice. Either needs the test's file name from
+  the database: today it comes from `HirFrontend::hashes`, which a query can't read.
 - **`outside`.** Tarjan's over the program's reference graph, one visit a function or static
   and one hash probe an edge. Each node's references are `refs::walked`'s memo, the same walk
   the build does. **Bound:** the edges' count times a probe (about 25 cycles): for 50 000
@@ -233,9 +237,15 @@ for each whether it reaches a process, the network or assembly.
   the build's own walk answering it (`Built::reached` with the classifier as it places a
   symbol), which makes it free: the walk is paid once. That needs the driver's reached set
   (codegen-api-link's), so it is the next change after it lands.
+  **Update (sol-all, 2026-10-30, estimate, not measured):** the walk now keeps each function's
+  references as the memo's slice and keys its map by the reference itself, so it copies a
+  node's key once (its insert) and nothing on an edge. That leaves the hash of an instance per
+  probe, about 1.5× the bound. `Built::reach` has landed, but `roots` answers `outside` before
+  the build runs, so folding it in reorders roots and build: a change to the driver's API, for
+  codegen-api-link.
 
 STATUS of this section: the bounds are written; kept symbols are at the bound, the listing
-within 2×, `outside` 2 to 3× until it folds into the build's walk.
+within 2×, `outside` about 1.5× until it folds into the build's walk.
 
 ## codegen-fc-lazy: a lazy build (`crates/blaze-codegen/src/driver/later.rs`)
 
@@ -303,6 +313,17 @@ Counts are for 100 000 functions with 10 references each, not measured (not buil
 
 STATUS of this section: `ExecTable::new` at its bound; owners and versions each about 10× off
 theirs, with the fixes above, and both on one thread.
+
+**Update (sol-all, 2026-10-30; by count, not measured).** Both now run on every core.
+`owners::owners` collects the dependency's functions and statics (a key pair and a slice each,
+about 3 MB for 100 000) and checks their references in parallel, the refusals collected in key
+order as before (`refusals_across_cores_come_in_key_order`). On 16 cores the 10 ms of searches is
+about 0.7 ms plus the collect, **about 0.8 ms against the 1 ms one-thread bound**, at it without
+the owner column. `versions` is a parallel map over the nodes in key order: 10 to 20 ms on one
+thread is about 1 ms on 16, which is the bound of a test binary (its hashing spread across the
+cores). A build that is no test binary still pays that 1 ms against a bound of 0. Closing it
+needs `Build` to know it is one (a `Policy` field, about 40 constructors in 15 files, most of
+them other lanes' tests), or `ExecTable::new` making the versions from nodes `Built` keeps.
 
 ## codegen-rq-lower: a function's unwind entry and its variables' places (`crates/hir-ty-codegen/unwind.rs`, `debuginfo.rs`)
 

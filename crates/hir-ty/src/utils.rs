@@ -6,14 +6,15 @@ use std::{borrow::Cow, iter::Enumerate};
 use base_db::Db;
 use base_db::target::{self, TargetData};
 use hir_def::{
-    EnumId, EnumVariantId, FunctionId, Lookup, TraitId, lang_item::LangItems,
-    signatures::FunctionSignature,
+    EnumId, EnumVariantId, FunctionId, Lookup, TraitId, expr_store::ExpressionStore,
+    hir::PatId, lang_item::LangItems, signatures::FunctionSignature,
 };
 use rustc_abi::TargetDataLayout;
+use rustc_ast_ir::Mutability;
 use span::Edition;
 
 use crate::{
-    TargetFeatures,
+    BindingMode, ByRef, TargetFeatures,
     db::HirDatabase,
     layout::{Layout, RustcEnumVariantIdx, TagEncoding},
     lower::SupertraitsInfo,
@@ -32,6 +33,20 @@ pub fn direct_super_traits(db: &Db, trait_: TraitId) -> &[TraitId] {
 /// Returns the whole super trait hierarchy (including the trait itself).
 pub fn all_super_traits(db: &Db, trait_: TraitId) -> &[TraitId] {
     SupertraitsInfo::query(db, trait_).all_supertraits()
+}
+
+/// rustc's `pat_has_ref_mut_binding`: whether `pat` binds anything by `ref mut`, by the binding
+/// modes typeck gave (`mode`), so match ergonomics' adjustments count.
+pub fn pat_has_ref_mut_binding(
+    store: &ExpressionStore,
+    pat: PatId,
+    mode: impl Fn(PatId) -> Option<BindingMode>,
+) -> bool {
+    let mut found = false;
+    store.walk_pats(pat, &mut |pat| {
+        found |= matches!(mode(pat), Some(BindingMode(ByRef::Yes(Mutability::Mut), _)));
+    });
+    found
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

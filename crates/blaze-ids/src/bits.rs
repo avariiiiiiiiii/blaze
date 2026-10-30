@@ -1095,7 +1095,7 @@ pub fn rank_in(words: &[u64], ranks: &[u32], at: usize) -> usize {
 /// A fixed set of `len` bits that keeps, per word, how many members come before it, so a
 /// member's rank (where its value sits in a column of the members' values alone) is one
 /// popcount, as in Vigna's rank9 with a `u32` count a word: 1.5 bits a bit.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)] // clone: held by blaze-items' `HashColumns` and hir-ty's columns, which derive it
 pub struct Ranked {
     words: Box<[u64]>,
     ranks: Box<[u32]>,

@@ -17,7 +17,6 @@ use std::{fmt, marker::PhantomData};
 
 use base_db::Db;
 use hir_def::{DefWithBodyId, ExpressionStoreOwnerId};
-use hir_ty::{InferBodyId};
 use hir_ty_mir::mir::{MirBody, MirLowerError};
 
 use crate::{BorrowckDiagnostic, BorrowckResult, NotChecked, borrowck};
@@ -87,7 +86,7 @@ impl fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 /// What a borrow check result lets run: errors first, as they say the most.
-fn verdict(owner: DefWithBodyId, result: &BorrowckResult) -> Result<(), Refused> {
+pub(crate) fn verdict(owner: DefWithBodyId, result: &BorrowckResult) -> Result<(), Refused> {
     let errors: Vec<_> = result
         .diagnostics
         .iter()
@@ -112,19 +111,17 @@ fn verdict(owner: DefWithBodyId, result: &BorrowckResult) -> Result<(), Refused>
 /// The build path: `def`'s borrow check, which must pass before any of its code is compiled
 /// for a build or taken from the store into one.
 pub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {
-    if !hir_ty::check_cache::served_passed(db, def) {
+    if !hir_ty::check_cache::served_passed(db, def) && !stored_passed(db, def) {
         verdict(def, borrowck(db, def))?;
     }
     Ok(Checked { owner: def, _revision: PhantomData })
 }
 
-/// Whether MIR whose `owner` is this is of `def`'s body or of a closure, coroutine or `const`
-/// block in it, which its borrow check covers.
-fn belongs(db: &Db, owner: InferBodyId<'_>, def: DefWithBodyId) -> bool {
-    match owner {
-        InferBodyId::DefWithBodyId(it) => it == def,
-        InferBodyId::AnonConstId(it) => it.loc(db).owner == ExpressionStoreOwnerId::Body(def),
-    }
+/// Whether the item store holds a passing verdict of `def` by the checker in use, filed by
+/// [`borrowck`] when one passed.
+fn stored_passed(db: &Db, def: DefWithBodyId) -> bool {
+    let Some(checker) = crate::checker(crate::mode()) else { return false };
+    hir_ty::body_store::lookup_passed(db, def, checker, || verdict(def, borrowck(db, def)).is_ok())
 }
 
 fn mir_of<'db>(
@@ -136,7 +133,9 @@ fn mir_of<'db>(
         let error = format!("{error:?}"); // alloc: a refusal's message, on the error path
         Refused::Lowering { owner: def, error }
     })?;
-    if !belongs(db, body.owner, def) {
+    // MIR of `def`'s body or of a closure, coroutine or `const` block in it, which its borrow
+    // check covers.
+    if body.owner.expression_store_owner(db) != ExpressionStoreOwnerId::Body(def) {
         let mir_owner = format!("{:?}", body.owner); // alloc: a refusal's message, error path
         return Err(Refused::NotOf { owner: def, mir_owner });
     }

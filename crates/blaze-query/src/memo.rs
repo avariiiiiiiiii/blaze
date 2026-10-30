@@ -110,13 +110,17 @@ impl MemoHot {
     }
 }
 
-/// What only writers read of a memo. 48 bytes.
+/// What only writers and collection read of a memo. 48 bytes.
 struct MemoCold {
     key: QueryKey,
     /// The segment `MemoHot::edges` is in, with one hold on it; null for the image's.
     edges: *const Segment,
+    /// The collection generation its key last resolved to it in ([`Store::born`]): set before
+    /// it is published, then only raised.
+    born: AtomicU32,
 }
 
+#[cfg(not(blaze_check))]
 const _: () = assert!(size_of::<MemoCold>() == 48);
 
 // SAFETY: `edges` is only let go of, once, when the row is dropped.
@@ -439,7 +443,7 @@ impl Store {
                         code,
                     },
                 );
-                self.cold.put(memo, MemoCold { key, edges: segment });
+                self.cold.put(memo, MemoCold { key, edges: segment, born: AtomicU32::new(0) });
             }
             memo
         })
@@ -520,6 +524,29 @@ impl Store {
 
     pub(crate) fn key(&self, task: &Guard, memo: MemoId) -> QueryKey {
         self.cold(task, memo).key
+    }
+
+    /// The collection generation the memo's key last resolved to it in: [`crate::Database::collect`]
+    /// keeps whole a key with a memo born after it began. Read after the slot that names it,
+    /// which was published after the stamp.
+    pub(crate) fn born(&self, task: &Guard, memo: MemoId) -> u32 {
+        self.cold(task, memo).born.load(Ordering::Acquire)
+    }
+
+    /// Stamps `memo`, made by this thread and not yet published, born in `now`: a store into
+    /// the cold row it just wrote, with no read-modify-write.
+    pub(crate) fn born_in(&self, task: &Guard, memo: MemoId, now: u32) {
+        self.cold(task, memo).born.store(now, Ordering::Release);
+    }
+
+    /// Raises a published memo's stamp to `now`, as its key resolves to it again: never lowered,
+    /// so a giver that loaded the generation before a collection bumped it leaves the stamp of
+    /// one that loaded it after.
+    pub(crate) fn reborn_in(&self, task: &Guard, memo: MemoId, now: u32) {
+        let born = &self.cold(task, memo).born;
+        if born.load(Ordering::Relaxed) < now {
+            born.fetch_max(now, Ordering::AcqRel);
+        }
     }
 
     /// The memo's edges in the order they were read: one range, read in place.
@@ -726,8 +753,11 @@ impl Store {
         if memos.is_empty() {
             return;
         }
+        // Begun under the lock, so `unlinked` stays in the order its graces began when a
+        // parallel sweep's workers each add theirs.
+        let mut dying = self.dying.lock();
         let grace = Grace::start();
-        self.dying.lock().unlinked.extend(memos.iter().map(|&memo| (grace, memo)));
+        dying.unlinked.extend(memos.iter().map(|&memo| (grace, memo)));
     }
 
     /// The memos to check against the open views, before they are walked, added to `out`:

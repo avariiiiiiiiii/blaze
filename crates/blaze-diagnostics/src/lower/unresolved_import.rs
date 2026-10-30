@@ -18,6 +18,7 @@ use std::cell::OnceCell;
 use blaze_items::Fact;
 use hir::{HasVisibility as _, InFile, ItemInNs, ModPath, ModuleDef, Name, PathKind, StructKind};
 use span::Edition;
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     NodeOrToken, SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _},
@@ -25,7 +26,6 @@ use syntax::{
 
 use crate::{
     cx::Cx,
-    lints::edit_distance::find_best_match_for_name,
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
@@ -481,7 +481,7 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         let names = self.names_in(scope, &source.name);
         // alloc: the error's parts, for an error hir found
         let names: Vec<&str> = names.iter().map(Name::as_str).collect();
-        let suggestion = find_best_match_for_name(&names, &source.name, None).map(|it| Suggestion {
+        let suggestion = find_best_match_for_name(&names, &source.name, None).copied().map(|it| Suggestion {
             // alloc: the error's text, for an error hir found
             parts: vec![(self.span(source.range), it.to_owned())],
             // alloc: the error's text, for an error hir found
@@ -555,6 +555,7 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
             let candidate = with(first);
             if self.module(&candidate).is_some() {
                 let note = (first == "crate").then(|| {
+                    // alloc: the error's note, for an error hir found
                     "`use` statements changed in Rust 2018; read more at <https://doc.rust-lang.org/edition-guide/rust-2018/module-system/path-clarity.html>".to_owned()
                 });
                 return Some((candidate, note));
@@ -778,7 +779,7 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         candidates.dedup();
         // alloc: the error's parts, for an error hir found
         let candidates: Vec<&str> = candidates.iter().map(Name::as_str).collect();
-        find_best_match_for_name(&candidates, name, None).filter(|it| *it != name).map(str::to_owned)
+        find_best_match_for_name(&candidates, name, None).copied().filter(|it| *it != name).map(str::to_owned)
     }
 
     /// rustc's `current_crate_outer_attr_insert_span`: before the first token after the crate
@@ -942,64 +943,50 @@ mod tests {
         assert_eq!(import_path(&single, None), "foo");
     }
 
-    /// The handle walk [`nested_segments`] stands in for: the trees gathered from the leaf up,
-    /// then read outermost first.
-    fn handle_segments(tree: &syntax::ast::UseTree) -> (Vec<(String, TextRange)>, usize) {
-        use syntax::AstNode as _;
-        let mut trees = vec![tree.clone()];
-        let mut at = tree.clone();
-        while let Some(parent) = at.parent_use_tree_list().map(|it| it.parent_use_tree()) {
-            trees.push(parent.clone());
-            at = parent;
-        }
-        trees.reverse();
-        let mut out = Vec::new();
-        for tree in &trees {
-            match tree.path() {
-                Some(path) => {
-                    for (i, segment) in path.segments().enumerate() {
-                        if i == 0
-                            && let Some(token) = segment.coloncolon_token()
-                        {
-                            out.push((ROOT.to_owned(), token.text_range()));
-                        }
-                        if let Some(name) = segment.name_ref() {
-                            out.push((name.text().to_string(), name.syntax().text_range()));
-                        }
-                    }
-                }
-                None => {
-                    if let Some(token) = tree.coloncolon_token()
-                        && out.is_empty()
-                    {
-                        out.push((ROOT.to_owned(), token.text_range()));
-                    }
-                }
-            }
-        }
-        (out, trees.len())
-    }
-
+    /// Each use tree's segments, from the outermost tree it is in down to it, and how many trees
+    /// that is: a leading `::` is the root, where it is written, and only at the start.
     #[test]
-    fn the_view_walk_gives_the_handle_walks_segments() {
-        use syntax::{AstNode as _, view::AstNode as _};
+    fn a_use_trees_segments_are_those_of_the_trees_around_it() {
+        use syntax::view::AstNode as _;
         let text = "use ::a::{b, c::{self, d::e}, *};\nuse crate::{f::{g as h}, ::i};\n\
                     use {j, k::l};\nuse super::super::m;\nuse ::{n, o::{}};\n";
         let parse = syntax::SourceFile::parse(text, Edition::CURRENT);
-        let handles = parse.tree();
-        let mut compared = 0;
-        for (node, it) in handles.syntax().descendants().zip(parse.root().descendants()) {
-            assert_eq!((node.kind(), node.text_range()), (it.kind(), it.text_range()));
-            let (Some(handle), Some(view)) = (syntax::ast::UseTree::cast(node), ast::UseTree::cast(it)) else {
-                continue;
-            };
-            let mut segments = Vec::new();
-            let depth = nested_segments(view, &mut segments);
-            let segments: Vec<_> = segments.into_iter().map(|it| (it.name, it.range)).collect();
-            assert_eq!((segments, depth), handle_segments(&handle), "{}", &text[it.text_range()]);
-            compared += 1;
-        }
-        assert!(compared > 15, "the source has many use trees: {compared}");
+        let trees: Vec<_> = parse
+            .root()
+            .descendants()
+            .filter_map(ast::UseTree::cast)
+            .map(|tree| {
+                let mut segments = Vec::new();
+                let depth = nested_segments(tree, &mut segments);
+                for it in &segments {
+                    let written = if it.name == ROOT { "::" } else { it.name.as_str() };
+                    assert_eq!(&text[it.range], written, "in {}", &text[tree.syntax().text_range()]);
+                }
+                let names: Vec<_> = segments.into_iter().map(|it| it.name).collect();
+                (&text[tree.syntax().text_range()], names.join(" "), depth)
+            })
+            .collect();
+        let expected = [
+            ("::a::{b, c::{self, d::e}, *}", "{{root}} a", 1),
+            ("b", "{{root}} a b", 2),
+            ("c::{self, d::e}", "{{root}} a c", 2),
+            ("self", "{{root}} a c self", 3),
+            ("d::e", "{{root}} a c d e", 3),
+            ("*", "{{root}} a", 2),
+            ("crate::{f::{g as h}, ::i}", "crate", 1),
+            ("f::{g as h}", "crate f", 2),
+            ("g as h", "crate f g", 3),
+            ("::i", "crate {{root}} i", 2),
+            ("{j, k::l}", "", 1),
+            ("j", "j", 2),
+            ("k::l", "k l", 2),
+            ("super::super::m", "super super m", 1),
+            ("::{n, o::{}}", "{{root}}", 1),
+            ("n", "{{root}} n", 2),
+            ("o::{}", "{{root}} o", 2),
+        ];
+        let expected: Vec<_> = expected.iter().map(|&(tree, names, depth)| (tree, names.to_owned(), depth)).collect();
+        assert_eq!(trees, expected);
     }
 
     #[test]

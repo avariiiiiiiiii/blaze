@@ -25,7 +25,7 @@ use crate::{
     tt,
 };
 use syntax::{
-    Parse, SyntaxNode, TextRange, TextSize,
+    Parse, TextRange, TextSize,
     view::{
         self as ast, AstNode, FieldList, HasAttrs, HasGenericArgs, HasGenericParams,
         HasModuleItem, HasName, HasTypeBounds,
@@ -391,14 +391,6 @@ struct AdtParam {
     bounds: Option<tt::TopSubtree>,
 }
 
-/// `a` then `b`, interned, with no heap allocation for a name of up to 64 bytes.
-fn joined(a: &str, b: &str) -> Symbol {
-    let mut buf: SmallVec<[u8; 64]> = SmallVec::with_capacity(a.len() + b.len());
-    buf.extend_from_slice(a.as_bytes());
-    buf.extend_from_slice(b.as_bytes());
-    Symbol::intern(std::str::from_utf8(&buf).expect("two `str`s joined are one"))
-}
-
 /// `f{i}`, the name of tuple field `i`.
 fn tuple_field_symbol(i: usize) -> Symbol {
     let mut digits = [0u8; 20];
@@ -412,7 +404,7 @@ fn tuple_field_symbol(i: usize) -> Symbol {
             break;
         }
     }
-    joined("f", std::str::from_utf8(&digits[at..]).expect("ASCII digits"))
+    Symbol::intern_concat(&["f", std::str::from_utf8(&digits[at..]).expect("ASCII digits")])
 }
 
 /// Writes what `f` writes in an invisible group at `span`: what splicing a `quote!` at `span`
@@ -480,7 +472,7 @@ impl BasicAdtInfo {
     fn bindings(&self, suffix: &str) -> Vec<tt::Ident> {
         let mut out = Vec::with_capacity(self.shape.fields.len());
         out.extend(self.shape.fields.iter().map(|it| tt::Ident {
-            sym: joined(it.sym.as_str(), suffix),
+            sym: Symbol::intern_concat(&[it.sym.as_str(), suffix]),
             span: it.span,
             is_raw: tt::IdentIsRaw::No,
         }));
@@ -825,7 +817,7 @@ fn parse_adt_from_syntax(
 }
 
 /// The derive's item parsed from its token tree, and the span of each of its tokens.
-fn parse_item(db: &Db, tt: &tt::TopSubtree) -> (Parse<SyntaxNode>, span::SpanMap) {
+fn parse_item(db: &Db, tt: &tt::TopSubtree) -> (Parse<ast::Untyped>, span::SpanMap) {
     let (parsed, tm, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
         crate::token_tree_to_syntax_node(db, frame, tt.view(), crate::ExpandTo::Items)
     });
@@ -833,7 +825,7 @@ fn parse_item(db: &Db, tt: &tt::TopSubtree) -> (Parse<SyntaxNode>, span::SpanMap
 }
 
 /// The struct, enum or union [`parse_item`] parsed, read in place.
-fn adt_of(parsed: &Parse<SyntaxNode>, call_site: Span) -> Result<ast::Adt<'_>, ExpandError> {
+fn adt_of(parsed: &Parse<ast::Untyped>, call_site: Span) -> Result<ast::Adt<'_>, ExpandError> {
     let macro_items = ast::MacroItems::cast(parsed.root())
         .ok_or_else(|| ExpandError::other(call_site, "invalid item definition"))?;
     let item =
@@ -1896,16 +1888,6 @@ fn pointee_error(message: impl Into<Box<str>>) -> BuiltinError {
     BuiltinError::derive(message).code(802)
 }
 
-/// rustc's `GenericParam::span` of a type parameter: its name, to the end of its default if it
-/// has one.
-fn type_param_span(param: ast::TypeParam<'_>) -> Option<TextRange> {
-    let name = param.name()?.syntax().text_range();
-    Some(match param.default_type() {
-        Some(ty) => name.cover(ty.syntax().text_range()),
-        None => name,
-    })
-}
-
 /// An identifier's name: `r#T` and `T` are the same parameter, as rustc's `Ident`s are.
 fn unraw(text: &str) -> &str {
     text.strip_prefix("r#").unwrap_or(text)
@@ -2052,7 +2034,7 @@ fn coerce_pointee_derive<'f>(
                         "only one type parameter can be marked as `#[pointee]` \
                                 when deriving `CoercePointee` traits",
                     ),
-                    type_param_span(one).map_or(span, span_of),
+                    view::type_param_span(one).map_or(span, span_of),
                 );
             }
         }
@@ -2251,6 +2233,10 @@ fn pointee_paths(ty: ast::Type<'_>, pointee: &str, paths: &mut SmallVec<[TextRan
         ast::Type::SliceType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
         ast::Type::TupleType(ty) => all_pointee_paths(ty.fields(), pointee, paths),
         ast::Type::PatternType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
+        ast::Type::UnsafeBinderType(ty) => {
+            let binder = params_pointee_paths(ty.generic_param_list(), pointee, paths);
+            ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)) | binder
+        }
         ast::Type::InferType(_) | ast::Type::MacroType(_) | ast::Type::NeverType(_) => false,
     }
 }
@@ -2369,8 +2355,17 @@ fn binder_pointee_paths(
     pointee: &str,
     paths: &mut SmallVec<[TextRange; 4]>,
 ) -> bool {
+    params_pointee_paths(binder.and_then(|it| it.generic_param_list()), pointee, paths)
+}
+
+/// [`pointee_paths`] of the bounds and defaults of a binder's parameters (`for<..>`,
+/// `unsafe<..>`).
+fn params_pointee_paths(
+    params: Option<ast::GenericParamList<'_>>,
+    pointee: &str,
+    paths: &mut SmallVec<[TextRange; 4]>,
+) -> bool {
     let mut found = false;
-    let params = binder.and_then(|it| it.generic_param_list());
     for param in params.into_iter().flat_map(|it| it.generic_params()) {
         found |= match param {
             ast::GenericParam::TypeParam(param) => {

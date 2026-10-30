@@ -3,12 +3,16 @@
 //! and the `name` section.
 //!
 //! Written as mold and wild write an output: every size is known before a byte is written, so
-//! the code and data sections are laid out at their offsets in the one output buffer, and every
-//! function body and data segment is copied (and patched) there in parallel. A code piece's
-//! header is read in place ([`Header`], 48 bytes, nothing copied); each type is interned once by
-//! its encoded bytes (one FxHash of a few bytes each); per function the writer keeps only
-//! `u32` columns (its type, the CSR range of its fixups' types). Nothing is allocated per
-//! function but the output itself.
+//! the module is laid out as runs ([`Run`]) in one zeroed buffer of its exact size, and the
+//! function, element, code, data, custom and name sections' runs are written there in
+//! parallel. A code piece's header is read in place ([`Header`], 48 bytes, nothing copied). The
+//! functions are handled in pieces of 4096 on every thread: each piece interns its types by
+//! their encoded bytes (one FxHash of a few bytes each) and sizes its entries, and the pieces'
+//! types are then interned in order, a few per piece, so the indices are those of one pass.
+//! Per function the writer keeps only `u32` columns (its type, the CSR range of its fixups'
+//! types); the checks of the functions' placing are parallel too, the first error in order the
+//! one given. Nothing is allocated per function but the output itself; a set of columns per
+//! piece.
 
 use std::collections::hash_map::Entry;
 
@@ -18,7 +22,7 @@ use rustc_hash::FxHashMap;
 
 use super::code::{Header, NOTHING, Sig};
 use super::leb::{self, PADDED, padded_uleb};
-use super::reader::{MAGIC, Reader, Wasm};
+use super::reader::{MAGIC, Reader, Wasm as _};
 use super::{FUNCTIONS, HEAP, PAGE, STACK_POINTER, Wasm, heap_base, in_memory};
 use crate::model::{Class, Placed, Region, SymbolKind, View};
 use crate::output::OutputKind;
@@ -134,9 +138,27 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
     code.extend(placed.regions.iter().enumerate().filter(|(_, it)| is_code(it)));
     let is_ctors = |it: &&Region| it.class == Class::Synthetic(FUNCTIONS);
     let ctors = placed.regions.iter().filter(is_ctors).count();
+    // The code space's order without a sort when the core's functions are in it, strictly,
+    // and every `__wasm_call_ctors` comes before them (its region is placed first): those
+    // first, then the functions. Else sorted below, which makes the same order.
+    let ordered = {
+        let mut addrs = placed.regions.iter().filter(is_ctors).map(|it| it.addr);
+        let mut last = None;
+        let ctors_first = addrs.all(|addr| {
+            let before = last.is_none_or(|it| it < addr);
+            last = Some(addr);
+            before
+        });
+        let functions = placed.functions;
+        ctors_first
+            && last.zip(functions.first()).is_none_or(|(ctors, first)| ctors < first.addr)
+            && functions.par_windows(2).all(|it| it[0].addr < it[1].addr)
+    };
+    let lead = if ordered { ctors } else { 0 };
     // Each function's slot made first, filled in parallel: one exact allocation.
     let mut units: Vec<Unit<'a>> = Vec::with_capacity(placed.functions.len() + ctors);
-    units.resize(placed.functions.len(), Unit { addr: 0, name: None, header: None });
+    units.resize(lead, Unit { addr: 0, name: None, header: None });
+    units.par_extend(placed.functions.par_iter().map(|_| Unit { addr: 0, name: None, header: None }));
     // `Placed` is not `Sync` (its `symbol` lookup isn't): the closure takes its contents.
     let (contents, paged) = (placed.contents, placed.paged);
     // Where a function's bytes are: its region's view and its offset and length there.
@@ -169,7 +191,7 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
             // alloc: error path
             .map_err(|e| format!("the function {}: {e}", name.unwrap_or("?")))
     };
-    units.par_iter_mut().zip(placed.functions.par_iter()).try_for_each(|(unit, function)| {
+    units[lead..].par_iter_mut().zip(placed.functions.par_iter()).try_for_each(|(unit, function)| {
         let name = function.name.as_deref();
         let (bytes, at, size) = piece(function)?;
         *unit = Unit { addr: function.addr, name, header: None };
@@ -179,9 +201,9 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
         Ok::<(), String>(())
     })?;
     // The functions across pages: their bytes one after another in `across`, then their headers.
-    if units.iter().any(|it| it.header.is_none()) {
+    if units[lead..].par_iter().any(|it| it.header.is_none()) {
         across.clear();
-        for (_, function) in units.iter().zip(placed.functions).filter(|it| it.0.header.is_none()) {
+        for (_, function) in units[lead..].iter().zip(placed.functions).filter(|it| it.0.header.is_none()) {
             let (bytes, at, size) = piece(function)?;
             let start = across.len();
             // alloc: once per link with code in pages, the functions across their page boundaries
@@ -190,36 +212,52 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
         }
         let across: &'a [u8] = across;
         let mut start = 0;
-        for (unit, function) in units.iter_mut().zip(placed.functions).filter(|it| it.0.header.is_none()) {
+        for (unit, function) in units[lead..].iter_mut().zip(placed.functions).filter(|it| it.0.header.is_none()) {
             let size = function.size as usize;
             unit.header = Some(parse(&across[start..start + size], unit.name)?);
             start += size;
         }
     }
-    for region in placed.regions.iter().filter(is_ctors) {
-        units.push(Unit { addr: region.addr, name: Some("__wasm_call_ctors"), header: None });
-    }
-    radix::sort_copy_by_key(&mut units, |it| it.addr);
-    if let Some(pair) = units.windows(2).find(|it| it[0].addr == it[1].addr) {
-        // alloc: error path
-        return Err(format!("two functions at {} in the code space", pair[0].addr));
+    let ctors_units = placed.regions.iter().filter(is_ctors);
+    let ctors_units = ctors_units.map(|region| Unit { addr: region.addr, name: Some("__wasm_call_ctors"), header: None });
+    if ordered {
+        for (slot, unit) in units.iter_mut().zip(ctors_units) {
+            *slot = unit;
+        }
+    } else {
+        units.extend(ctors_units);
+        radix::sort_copy_by_key(&mut units, |it| it.addr);
+        if let Some(pair) = units.par_windows(2).find_first(|it| it[0].addr == it[1].addr) {
+            // alloc: error path
+            return Err(format!("two functions at {} in the code space", pair[0].addr));
+        }
     }
     // Every byte of code is some function's: a piece the core did not list would shift every
-    // index after it.
+    // index after it. Checked in parallel; the first error in address order is the one given.
     for &(index, region) in &code {
         let bytes = placed.view(index);
-        let mut end = 0usize;
         let first = units.partition_point(|it| it.addr < region.addr);
-        for unit in units[first..].iter().take_while(|it| it.addr < region.addr + region.size) {
-            let Some(header) = unit.header else { continue };
-            let at = (unit.addr - region.addr) as usize;
-            if at < end {
+        let len = units[first..].partition_point(|it| it.addr < region.addr + region.size);
+        let units = &units[first..first + len];
+        // Where the function before `at` (the last with a header) ends in the region.
+        let end_before = |at: usize| {
+            let mut before = units[..at].iter().rev().filter_map(|it| Some((it.addr, it.header?)));
+            before.next().map_or(0, |(addr, header)| (addr - region.addr) as usize + header.len())
+        };
+        let failed = (0..units.len()).into_par_iter().find_map_first(|at| {
+            let (unit, end) = (&units[at], end_before(at));
+            unit.header?;
+            let start = (unit.addr - region.addr) as usize;
+            if start < end {
                 // alloc: error path
-                return Err(format!("the function at {} overlaps the one before it", unit.addr));
+                return Some(format!("the function at {} overlaps the one before it", unit.addr));
             }
-            stray(bytes, end, at, region.addr + end as u64, &region.class)?;
-            end = at + header.len();
+            stray(bytes, end, start, region.addr + end as u64, &region.class).err()
+        });
+        if let Some(failed) = failed {
+            return Err(failed);
         }
+        let end = end_before(units.len());
         stray(bytes, end.min(bytes.len()), bytes.len(), region.addr + end as u64, &region.class)?;
     }
     Ok(units)
@@ -478,11 +516,242 @@ fn export<'n>(
     }
 }
 
-/// Copies each `(to, from)` pair, in parallel and in chunks of at most [`CHUNK`] bytes.
-fn copy_all(jobs: Vec<(&mut [u8], &[u8])>) {
-    jobs.into_par_iter()
-        .flat_map_iter(|(to, from)| to.chunks_mut(CHUNK).zip(from.chunks(CHUNK)))
-        .for_each(|(to, from)| to.copy_from_slice(from));
+/// Defined functions per piece the writer handles on one thread: their types, their entries
+/// of the function, code and name sections.
+const PIECE: usize = 1 << 12;
+/// Table slots per run of the element segment written on one thread.
+const ELEMENTS: u64 = 1 << 16;
+
+/// One piece of the defined functions as the module holds them: the types it meets, in the
+/// order it first meets them; each function's type and its fixups' types (indices into
+/// `types`, then, once [`write`] merged the pieces, the module's); and the bytes its entries
+/// take in the function, code and name sections.
+struct Piece<'a> {
+    types: Vec<Sig<'a>>,
+    function_types: Vec<u32>,
+    /// By function, where its run of `fixup_types` starts; one more at the end.
+    fixup_starts: Vec<u32>,
+    fixup_types: Vec<u32>,
+    function_bytes: usize,
+    code_bytes: usize,
+    name_bytes: usize,
+    names: u64,
+}
+
+/// A piece of `units` whose first is function `first` of the module, `ctors` the length of
+/// `__wasm_call_ctors`' body: what [`Piece`] holds, its types interned on its own. The checks
+/// and their order are those of one pass over the functions in order, so the first error of
+/// the first piece that has one is that pass's.
+fn piece<'a>(units: &[Unit<'a>], first: u32, ctors: usize) -> Result<Piece<'a>, String> {
+    let (mut most, mut fixups) = (0, 0);
+    for header in units.iter().filter_map(|it| it.header) {
+        let (types, count) = header.counts();
+        most = most.max(types);
+        fixups += count;
+    }
+    // alloc: one set of columns per piece of 4096 functions
+    let mut types = Types::with_capacity(64);
+    let mut scratch: Vec<Sig<'a>> = Vec::with_capacity(most);
+    let mut piece = Piece {
+        // alloc: none: an empty `Vec`, the piece's list of types replacing it at the end
+        types: Vec::new(),
+        function_types: Vec::with_capacity(units.len()),
+        fixup_starts: Vec::with_capacity(units.len() + 1),
+        fixup_types: Vec::with_capacity(fixups),
+        function_bytes: 0,
+        code_bytes: 0,
+        name_bytes: 0,
+        names: 0,
+    };
+    for (at, unit) in units.iter().enumerate() {
+        piece.fixup_starts.push(piece.fixup_types.len() as u32);
+        if let Some(name) = unit.name {
+            let index = u64::from(first + at as u32);
+            piece.name_bytes += leb::uleb_len(index) + leb::uleb_len(name.len() as u64) + name.len();
+            piece.names += 1;
+        }
+        let Some(header) = unit.header else {
+            piece.function_types.push(types.of(NOTHING));
+            piece.code_bytes += leb::uleb_len(ctors as u64) + ctors;
+            continue;
+        };
+        piece.function_types.push(types.of(header.ty()));
+        header.types(&mut scratch);
+        let len = header.body().len();
+        piece.code_bytes += leb::uleb_len(len as u64) + len;
+        for (at, which) in header.type_fixups() {
+            let ty = *scratch.get(which as usize).ok_or_else(|| {
+                // alloc: error path
+                format!("the function {}: no type {which}", unit.name.unwrap_or("?"))
+            })?;
+            fits(at, len, unit.name)?;
+            piece.fixup_types.push(types.of(ty));
+        }
+        for at in header.stack_pointer() {
+            fits(at, len, unit.name)?;
+        }
+    }
+    piece.fixup_starts.push(piece.fixup_types.len() as u32);
+    piece.types = types.list;
+    Ok(piece)
+}
+
+/// The bytes of the ULEBs of `0..n`: `k` bytes each from `2^(7(k-1))` to `2^(7k)`.
+fn ulebs_below(n: u64) -> usize {
+    let (mut total, mut from, mut bytes) = (0usize, 0u64, 1u32);
+    while from < n {
+        let to = 1u64.checked_shl(7 * bytes).unwrap_or(u64::MAX).min(n);
+        total += (to - from) as usize * bytes as usize;
+        (from, bytes) = (to, bytes + 1);
+    }
+    total
+}
+
+/// A run of the module's bytes, in order. Every run's size is known before the module is
+/// allocated; then each is written on its own thread.
+enum Run<'a> {
+    /// `head[range]`: the small sections and the big ones' headers, written in order.
+    Head(std::ops::Range<usize>),
+    /// At most [`CHUNK`] bytes of a data segment or a custom section.
+    Copy(&'a [u8]),
+    /// Bytes of a data segment or a custom section in no run of its pages, which are zeros.
+    Zeros(usize),
+    /// A piece's entries in the function section: its functions' type indices.
+    Functions(usize),
+    /// The element segment's table slots of these functions: each function's index.
+    Elements(std::ops::Range<u64>),
+    /// A piece's bodies, each patched.
+    Code(usize),
+    /// A piece's entries in the `name` section's function names.
+    Names(usize),
+}
+
+impl Run<'_> {
+    fn len(&self, pieces: &[Piece<'_>]) -> usize {
+        match self {
+            Run::Head(range) => range.len(),
+            Run::Copy(bytes) => bytes.len(),
+            Run::Zeros(len) => *len,
+            Run::Functions(at) => pieces[*at].function_bytes,
+            Run::Elements(range) => ulebs_below(range.end) - ulebs_below(range.start),
+            Run::Code(at) => pieces[*at].code_bytes,
+            Run::Names(at) => pieces[*at].name_bytes,
+        }
+    }
+}
+
+/// The runs of the module, made in order: the bytes written serially go to `head`, each big
+/// run between them is a [`Run`] of its own.
+struct Layout<'a> {
+    head: Vec<u8>,
+    runs: Vec<Run<'a>>,
+    /// Where the bytes of `head` not yet in a run start.
+    mark: usize,
+}
+
+impl<'a> Layout<'a> {
+    /// The bytes of `head` not yet in a run, as one.
+    fn flush(&mut self) {
+        if self.mark < self.head.len() {
+            self.runs.push(Run::Head(self.mark..self.head.len()));
+            self.mark = self.head.len();
+        }
+    }
+
+    fn run(&mut self, run: Run<'a>) {
+        self.flush();
+        self.runs.push(run);
+    }
+
+    /// `bytes` run by run, in chunks of at most [`CHUNK`], the bytes in no run zeros.
+    fn view(&mut self, bytes: View<'a>) {
+        let mut done = 0;
+        bytes.runs(|at, run| {
+            if at > done {
+                self.run(Run::Zeros(at - done));
+            }
+            for chunk in run.chunks(CHUNK) {
+                self.run(Run::Copy(chunk));
+            }
+            done = at + run.len();
+        });
+        if bytes.len() > done {
+            self.run(Run::Zeros(bytes.len() - done));
+        }
+    }
+
+    fn finish(mut self) -> (Vec<u8>, Vec<Run<'a>>) {
+        self.flush();
+        (self.head, self.runs)
+    }
+}
+
+/// A piece's bodies into `place`, its exact size: each one's size, then its bytes with every
+/// type fixup and stack pointer fixup written.
+fn code_piece(place: &mut [u8], units: &[Unit<'_>], piece: &Piece<'_>, ctors: &[u8]) {
+    let mut at = 0;
+    for (index, unit) in units.iter().enumerate() {
+        let len = unit.header.map_or(ctors.len(), |it| it.body().len());
+        at += leb::uleb_into(&mut place[at..], len as u64);
+        let body = &mut place[at..at + len];
+        at += len;
+        let Some(header) = unit.header else {
+            body.copy_from_slice(ctors);
+            continue;
+        };
+        body.copy_from_slice(header.body());
+        let types = &piece.fixup_types[piece.fixup_starts[index] as usize..piece.fixup_starts[index + 1] as usize];
+        for ((fixup, _), &ty) in header.type_fixups().zip(types) {
+            body[fixup as usize..][..PADDED].copy_from_slice(&padded_uleb(ty));
+        }
+        for fixup in header.stack_pointer() {
+            body[fixup as usize..][..PADDED].copy_from_slice(&padded_uleb(STACK_POINTER));
+        }
+    }
+}
+
+/// A piece's function names into `place`, its exact size: index and name of each named one,
+/// the first function `first` of the module.
+fn names_piece(place: &mut [u8], units: &[Unit<'_>], first: u32) {
+    let mut at = 0;
+    for (index, unit) in units.iter().enumerate() {
+        let Some(name) = unit.name else { continue };
+        at += leb::uleb_into(&mut place[at..], u64::from(first + index as u32));
+        at += leb::uleb_into(&mut place[at..], name.len() as u64);
+        place[at..at + name.len()].copy_from_slice(name.as_bytes());
+        at += name.len();
+    }
+}
+
+/// ULEBs of `values` one after another into `place`, its exact size.
+fn ulebs_into(place: &mut [u8], values: impl Iterator<Item = u64>) {
+    let mut at = 0;
+    for value in values {
+        at += leb::uleb_into(&mut place[at..], value);
+    }
+}
+
+/// `__wasm_call_ctors`' body, when the image has one: a call of each init function, each of
+/// which must be `fn()`.
+fn ctors(placed: &Placed<'_>, units: &[Unit<'_>], imports: &[Imported<'_>]) -> Result<Vec<u8>, String> {
+    if !placed.regions.iter().any(|it| it.class == Class::Synthetic(FUNCTIONS)) {
+        return Ok(ctors_body(&[]));
+    }
+    let ctors = init_functions(placed)?;
+    for &function in &ctors {
+        let ty = match (function as usize).checked_sub(imports.len()) {
+            None => imports.get(function as usize).map(|it| it.ty),
+            Some(at) => units.get(at).and_then(|it| it.header).map(|it| it.ty()),
+        };
+        if ty != Some(NOTHING) {
+            // alloc: error path
+            return Err(format!(
+                "the init function {function} takes or returns values (it must be `fn()`), or \
+                 is no function of the program's"
+            ));
+        }
+    }
+    Ok(ctors_body(&ctors))
 }
 
 /// The module of a placed image.
@@ -533,90 +802,60 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }
     let imports = imports(placed, &arena, &spans);
     // The core keeps one import per name: a function that says another must not call it.
-    let mut by_name: Option<FxHashMap<&str, Imported<'_>>> = None;
-    for unit in &units {
-        let Some(header) = unit.header else { continue };
-        for (name, module, field, ty) in header.imports() {
-            let by_name = by_name.get_or_insert_with(|| {
-                let names = placed.imports.iter().map(|it| it.name.as_str());
-                let mut map = FxHashMap::with_capacity_and_hasher(imports.len(), Default::default());
-                map.extend(names.zip(imports.iter().copied()));
-                map
-            });
-            if let Some(it) = by_name.get(name)
-                && (it.module, it.field, it.ty) != (module, field, ty)
-            {
-                // alloc: error path
-                return Err(format!(
-                    "`{name}` is imported as `{}.{}`, and the function {} says `{module}.{field}` \
-                     or another type",
-                    it.module,
-                    it.field,
-                    unit.name.unwrap_or("?")
-                ));
-            }
+    if units.par_iter().any(|it| it.header.is_some_and(|it| it.imports().next().is_some())) {
+        let names = placed.imports.iter().map(|it| it.name.as_str());
+        let mut by_name: FxHashMap<&str, Imported<'_>> =
+            FxHashMap::with_capacity_and_hasher(imports.len(), Default::default());
+        by_name.extend(names.zip(imports.iter().copied()));
+        let conflict = units.par_iter().find_map_first(|unit| {
+            unit.header?.imports().find_map(|(name, module, field, ty)| {
+                let it = by_name.get(name)?;
+                ((it.module, it.field, it.ty) != (module, field, ty)).then(|| {
+                    // alloc: error path
+                    format!(
+                        "`{name}` is imported as `{}.{}`, and the function {} says `{module}.{field}` \
+                         or another type",
+                        it.module,
+                        it.field,
+                        unit.name.unwrap_or("?")
+                    )
+                })
+            })
+        });
+        if let Some(conflict) = conflict {
+            return Err(conflict);
         }
     }
 
-    // Types and the columns of the function bodies: one serial pass over the headers.
+    // `__wasm_call_ctors`: what it calls must be `fn()`. Its error is the bodies' after.
+    let ctors = ctors(placed, &units, &imports);
+
+    // Types and the columns of the function bodies: each piece's on its own thread, then the
+    // pieces' types interned in order after the imports', so each type's index is where one
+    // pass over the imports and then the functions in order first meets it.
+    let ctors_len = ctors.as_ref().map_or(0, Vec::len);
+    let mut pieces: Vec<Result<Piece<'_>, String>> = Vec::with_capacity(units.len().div_ceil(PIECE));
+    units
+        .par_chunks(PIECE)
+        .enumerate()
+        .map(|(at, units)| piece(units, imported + (at * PIECE) as u32, ctors_len))
+        .collect_into_vec(&mut pieces);
+    let mut pieces = pieces.into_iter().collect::<Result<Vec<Piece<'_>>, String>>()?;
+    let ctors = ctors?;
     let mut types = Types::with_capacity(imports.len() + 64);
     let mut import_types: Vec<u32> = Vec::with_capacity(imports.len());
     import_types.extend(imports.iter().map(|it| types.of(it.ty)));
-    let mut function_types = Vec::with_capacity(units.len());
-    let mut fixup_starts = Vec::with_capacity(units.len() + 1);
-    // Sized from the headers' counts first, so neither grows.
-    let (mut most_types, mut all_fixups) = (0, 0);
-    for header in units.iter().filter_map(|it| it.header) {
-        let (types, fixups) = header.counts();
-        most_types = most_types.max(types);
-        all_fixups += fixups;
+    let mut remaps: Vec<Vec<u32>> = Vec::with_capacity(pieces.len());
+    for piece in &pieces {
+        // alloc: one per piece of 4096 functions, its distinct types' indices
+        remaps.push(piece.types.iter().map(|&it| types.of(it)).collect());
     }
-    let mut fixup_types: Vec<u32> = Vec::with_capacity(all_fixups);
-    let mut scratch: Vec<Sig<'_>> = Vec::with_capacity(most_types);
-    for unit in &units {
-        fixup_starts.push(fixup_types.len());
-        let Some(header) = unit.header else {
-            function_types.push(types.of(NOTHING));
-            continue;
-        };
-        function_types.push(types.of(header.ty()));
-        header.types(&mut scratch);
-        let len = header.body().len();
-        for (at, which) in header.type_fixups() {
-            let ty = *scratch.get(which as usize).ok_or_else(|| {
-                // alloc: error path
-                format!("the function {}: no type {which}", unit.name.unwrap_or("?"))
-            })?;
-            fits(at, len, unit.name)?;
-            fixup_types.push(types.of(ty));
+    pieces.par_iter_mut().zip(remaps.par_iter()).for_each(|(piece, remap)| {
+        for it in piece.function_types.iter_mut().chain(&mut piece.fixup_types) {
+            *it = remap[*it as usize];
         }
-        for at in header.stack_pointer() {
-            fits(at, len, unit.name)?;
-        }
-    }
-    fixup_starts.push(fixup_types.len());
-
-    // `__wasm_call_ctors`: what it calls must be `fn()`.
-    let ctors = match units.iter().any(|it| it.header.is_none()) {
-        true => Some(init_functions(placed)?),
-        false => None,
-    };
-    let ctors = ctors.as_deref().unwrap_or(&[]);
-    for &function in ctors {
-        let ty = match (function as usize).checked_sub(imports.len()) {
-            None => imports.get(function as usize).map(|it| it.ty),
-            Some(at) => units.get(at).and_then(|it| it.header).map(|it| it.ty()),
-        };
-        if ty != Some(NOTHING) {
-            // alloc: error path
-            return Err(format!(
-                "the init function {function} takes or returns values (it must be `fn()`), or \
-                 is no function of the program's"
-            ));
-        }
-    }
-    let ctors = ctors_body(ctors);
-    let body_len = |unit: &Unit<'_>| unit.header.map_or(ctors.len(), |it| it.body().len());
+        piece.function_bytes = piece.function_types.iter().map(|&it| leb::uleb_len(it.into())).sum();
+    });
 
     // Memory: the stack, the data, then the heap from `__heap_base`.
     if placed.region(&Class::Synthetic(HEAP)).is_none() {
@@ -692,10 +931,11 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
             }
         }
     }
-    for (at, unit) in units.iter().enumerate() {
-        if let Some(name) = unit.header.and_then(|it| it.export()) {
-            export(&mut named, &mut exports, name, EXPORT_FUNCTION, imported + at as u32, true)?;
-        }
+    let exported = units.par_iter().enumerate().filter_map(|(at, unit)| Some((at, unit.header?.export()?)));
+    // alloc: once per link, the functions whose headers export them, found in parallel
+    let exported: Vec<(usize, &str)> = exported.collect();
+    for (at, name) in exported {
+        export(&mut named, &mut exports, name, EXPORT_FUNCTION, imported + at as u32, true)?;
     }
 
     // Custom sections: each name a group, numbered as first met in address order, and its
@@ -725,8 +965,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     let runs = || parts.chunk_by(|a, b| a.0 == b.0).map(|run| (groups[run[0].0 as usize], run));
 
     // The sizes of the big sections, known before anything is written.
-    let code_bytes: usize =
-        units.iter().map(|it| leb::uleb_len(body_len(it) as u64) + body_len(it)).sum();
+    let code_bytes: usize = pieces.iter().map(|it| it.code_bytes).sum();
+    let function_bytes: usize = pieces.iter().map(|it| it.function_bytes).sum();
     // Each segment's header: flags 0, `i32.const addr; end`, the size.
     let mut segment_headers: Vec<([u8; 16], usize)> = Vec::with_capacity(segments.len());
     segment_headers.extend(segments.iter().map(|&(_, addr, bytes)| {
@@ -741,36 +981,58 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         segments.iter().zip(&segment_headers).map(|(it, header)| header.1 + it.2.len()).sum();
     let part_bytes =
         |run: &[(u32, usize)]| run.iter().map(|it| placed.len(it.1)).sum::<usize>();
-    let custom_bytes: usize = runs()
-        .filter(|((_, merged), _)| !merged)
-        .map(|((name, _), run)| 16 + name.len() + part_bytes(run))
-        .sum();
-    let names_estimate: usize = units.iter().map(|it| it.name.map_or(0, str::len) + 8).sum::<usize>()
-        + placed.imports.iter().map(|it| it.name.len() + 8).sum::<usize>();
 
-    let mut out = Vec::with_capacity(
-        MAGIC.len()
-            + 256
-            + types.list.iter().map(|it| it.len()).sum::<usize>()
-            + arena.len()
-            + 64 * imports.len()
-            + 5 * units.len()
-            + 64 * exports.len()
-            + 6 * count as usize
-            + 16 + code_bytes
-            + 16 + data_bytes
-            + custom_bytes
-            + names_estimate,
-    );
-    out.extend_from_slice(MAGIC);
+    // The merged custom sections' payloads, each made from its parts one after the other in
+    // one reused buffer, `producers` first.
+    let merged = || runs().filter(|((_, merged), _)| *merged);
+    let most = merged().map(|(_, run)| part_bytes(run)).max().unwrap_or(0);
+    let mut payloads = Vec::with_capacity(most);
+    let mut merged_sections: Vec<(&str, Vec<u8>)> = Vec::with_capacity(2);
+    for want in ["producers", "target_features"] {
+        for ((name, _), run) in merged().filter(|((name, _), _)| *name == want) {
+            payloads.clear();
+            for &(_, index) in run {
+                extend_with(&mut payloads, placed.view(index));
+            }
+            let payload = match name {
+                "producers" => producers(&payloads),
+                _ => target_features(&payloads),
+            };
+            // alloc: error path
+            let payload = payload.map_err(|e| format!("the {name} sections: {e}"))?;
+            merged_sections.push((name, payload));
+        }
+    }
+
+    // The module as runs: the small sections and every header written here, in order; the
+    // function, element, code and data sections, the custom sections' parts and the function
+    // names as runs written in parallel once one zeroed buffer holds them all.
+    let mut layout = Layout {
+        head: Vec::with_capacity(
+            MAGIC.len()
+                + 256
+                + types.list.iter().map(|it| it.len()).sum::<usize>()
+                + arena.len()
+                + 64 * imports.len()
+                + 64 * exports.len()
+                + 16 * (globals.len() + segments.len() + groups.len())
+                + 32 * pieces.len()
+                + 64 * placed.imports.len()
+                + merged_sections.iter().map(|it| 32 + it.1.len()).sum::<usize>(),
+        ),
+        runs: Vec::with_capacity(16 + 4 * pieces.len() + 4 * segments.len() + 2 * parts.len()),
+        mark: 0,
+    };
     let section = |out: &mut Vec<u8>, id: u8, len: usize| {
         out.push(id);
         leb::uleb(out, len as u64);
     };
+    let out = &mut layout.head;
+    out.extend_from_slice(MAGIC);
 
     let list = types.list.len() as u64;
-    section(&mut out, id::TYPE, leb::uleb_len(list) + types.list.iter().map(|it| it.len()).sum::<usize>());
-    leb::uleb(&mut out, list);
+    section(out, id::TYPE, leb::uleb_len(list) + types.list.iter().map(|it| it.len()).sum::<usize>());
+    leb::uleb(out, list);
     for ty in &types.list {
         out.extend_from_slice(ty);
     }
@@ -786,31 +1048,31 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
             contents.push(0);
             leb::uleb(&mut contents, ty.into());
         }
-        leb::section(&mut out, id::IMPORT, &contents);
+        leb::section(out, id::IMPORT, &contents);
     }
 
-    let function_bytes: usize = function_types.iter().map(|&it| leb::uleb_len(it.into())).sum();
-    section(&mut out, id::FUNCTION, leb::uleb_len(defined.into()) + function_bytes);
-    leb::uleb(&mut out, defined.into());
-    for &ty in &function_types {
-        leb::uleb(&mut out, ty.into());
+    section(out, id::FUNCTION, leb::uleb_len(defined.into()) + function_bytes);
+    leb::uleb(out, defined.into());
+    for at in 0..pieces.len() {
+        layout.run(Run::Functions(at));
     }
+    let out = &mut layout.head;
 
     // One table of funcrefs, its minimum and maximum the slots; one memory of `pages`.
-    section(&mut out, id::TABLE, 3 + 2 * leb::uleb_len(count + 1));
+    section(out, id::TABLE, 3 + 2 * leb::uleb_len(count + 1));
     out.extend([1, FUNCREF, 1]);
-    leb::uleb(&mut out, count + 1);
-    leb::uleb(&mut out, count + 1);
-    section(&mut out, id::MEMORY, 2 + leb::uleb_len(pages));
+    leb::uleb(out, count + 1);
+    leb::uleb(out, count + 1);
+    section(out, id::MEMORY, 2 + leb::uleb_len(pages));
     out.extend([1, 0]);
-    leb::uleb(&mut out, pages);
+    leb::uleb(out, pages);
     contents.clear();
     leb::uleb(&mut contents, globals.len() as u64);
     for &(_, mutable, value) in &globals {
         contents.extend([I32, u8::from(mutable)]);
         leb::i32_const(&mut contents, value as i32);
     }
-    leb::section(&mut out, id::GLOBAL, &contents);
+    leb::section(out, id::GLOBAL, &contents);
     contents.clear();
     leb::uleb(&mut contents, exports.len() as u64);
     for &(name, kind, index) in &exports {
@@ -818,125 +1080,110 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         contents.push(kind);
         leb::uleb(&mut contents, index.into());
     }
-    leb::section(&mut out, id::EXPORT, &contents);
+    leb::section(out, id::EXPORT, &contents);
 
     if count > 0 {
         // One active segment of table 0 (flags 0) putting every function at its slot, its
         // index + 1: what a function pointer is.
-        let indexes: usize = (0..count).map(leb::uleb_len).sum();
-        section(&mut out, id::ELEMENT, 2 + 3 + leb::uleb_len(count) + indexes);
+        section(out, id::ELEMENT, 2 + 3 + leb::uleb_len(count) + ulebs_below(count));
         out.extend([1, 0]);
-        leb::i32_const(&mut out, 1);
-        leb::uleb(&mut out, count);
-        for index in 0..count {
-            leb::uleb(&mut out, index);
+        leb::i32_const(out, 1);
+        leb::uleb(out, count);
+        for start in (0..count).step_by(ELEMENTS as usize) {
+            layout.run(Run::Elements(start..(start + ELEMENTS).min(count)));
         }
     }
 
-    // Code: each body copied to its place and patched there, in parallel.
-    section(&mut out, id::CODE, leb::uleb_len(defined.into()) + code_bytes);
-    leb::uleb(&mut out, defined.into());
-    let start = out.len();
-    out.resize(start + code_bytes, 0);
-    let mut rest = &mut out[start..];
-    let mut jobs = Vec::with_capacity(units.len());
-    for (at, unit) in units.iter().enumerate() {
-        let len = body_len(unit);
-        let (place, tail) = std::mem::take(&mut rest).split_at_mut(leb::uleb_len(len as u64) + len);
-        rest = tail;
-        jobs.push((at, place));
+    // Code: each piece's bodies copied to their place and patched there.
+    let out = &mut layout.head;
+    section(out, id::CODE, leb::uleb_len(defined.into()) + code_bytes);
+    leb::uleb(out, defined.into());
+    for at in 0..pieces.len() {
+        layout.run(Run::Code(at));
     }
-    jobs.into_par_iter().for_each(|(at, place)| {
-        let unit = &units[at];
-        let skip = leb::uleb_into(place, body_len(unit) as u64);
-        let body = &mut place[skip..];
-        let Some(header) = unit.header else {
-            body.copy_from_slice(&ctors);
-            return;
-        };
-        body.copy_from_slice(header.body());
-        let types = &fixup_types[fixup_starts[at]..fixup_starts[at + 1]];
-        for ((fixup, _), &ty) in header.type_fixups().zip(types) {
-            body[fixup as usize..][..PADDED].copy_from_slice(&padded_uleb(ty));
-        }
-        for fixup in header.stack_pointer() {
-            body[fixup as usize..][..PADDED].copy_from_slice(&padded_uleb(STACK_POINTER));
-        }
-    });
 
-    // Data: each segment's header, then its bytes copied in parallel chunks.
+    // Data: each segment's header, then its bytes copied in chunks.
     if !segments.is_empty() {
         let count = segments.len() as u64;
-        section(&mut out, id::DATA, leb::uleb_len(count) + data_bytes);
-        leb::uleb(&mut out, count);
-        let start = out.len();
-        out.resize(start + data_bytes, 0);
-        let mut rest = &mut out[start..];
-        let mut jobs = Vec::with_capacity(segments.len());
+        let out = &mut layout.head;
+        section(out, id::DATA, leb::uleb_len(count) + data_bytes);
+        leb::uleb(out, count);
         for (&(_, _, bytes), (header, len)) in segments.iter().zip(&segment_headers) {
-            let (place, tail) = std::mem::take(&mut rest).split_at_mut(len + bytes.len());
-            rest = tail;
-            let (head, mut place) = place.split_at_mut(*len);
-            head.copy_from_slice(&header[..*len]);
-            // Each run of the segment to its place; the bytes of no run stay the zeros there.
-            let mut done = 0;
-            bytes.runs(|at, run| {
-                let whole = std::mem::take(&mut place);
-                let (to, after) = whole[at - done..].split_at_mut(run.len());
-                jobs.push((to, run));
-                (place, done) = (after, at + run.len());
-            });
+            layout.head.extend_from_slice(&header[..*len]);
+            layout.view(bytes);
         }
-        copy_all(jobs);
     }
 
     for ((name, _), run) in runs().filter(|((_, merged), _)| !merged) {
-        section(&mut out, 0, leb::uleb_len(name.len() as u64) + name.len() + part_bytes(run));
-        leb::name(&mut out, name);
+        let out = &mut layout.head;
+        section(out, 0, leb::uleb_len(name.len() as u64) + name.len() + part_bytes(run));
+        leb::name(out, name);
         for &(_, index) in run {
-            extend_with(&mut out, placed.view(index));
+            layout.view(placed.view(index));
         }
     }
 
-    let mut names = Vec::with_capacity(names_estimate + 64);
-    let mut scratch = Vec::with_capacity(names_estimate);
-    let function_names = placed
-        .imports
-        .iter()
-        .enumerate()
-        .map(|(index, it)| (index as u32, it.name.as_str()))
-        .chain(
-            units
-                .iter()
-                .enumerate()
-                .filter_map(|(at, it)| Some((imported + at as u32, it.name?))),
-        );
-    name_map(&mut names, &mut scratch, 1, function_names);
+    // The name section: the functions' names (the defined ones' by piece), then the globals'
+    // and the segments'.
+    let mut small = Vec::with_capacity(16 * (globals.len() + segments.len()) + 64 * placed.imports.len());
+    let mut scratch = Vec::with_capacity(small.capacity());
+    let import_names = placed.imports.iter().enumerate().map(|(index, it)| (index as u32, it.name.as_str()));
+    for (index, name) in import_names {
+        leb::uleb(&mut scratch, index.into());
+        leb::name(&mut scratch, name);
+    }
+    let names = placed.imports.len() as u64 + pieces.iter().map(|it| it.names).sum::<u64>();
+    let entries = scratch.len() + pieces.iter().map(|it| it.name_bytes).sum::<usize>();
+    let names_payload = leb::uleb_len(names) + entries;
+    let function_names = if names == 0 { 0 } else { 1 + leb::uleb_len(names_payload as u64) + names_payload };
     let global_names = globals.iter().enumerate().map(|(at, it)| (at as u32, it.0));
-    name_map(&mut names, &mut scratch, 7, global_names);
+    let mut map_scratch = Vec::with_capacity(small.capacity());
+    name_map(&mut small, &mut map_scratch, 7, global_names);
     let segment_names = segments.iter().enumerate().map(|(at, it)| (at as u32, it.0));
-    name_map(&mut names, &mut scratch, 9, segment_names);
-    leb::custom(&mut out, "name", &names);
-
-    // Each merged section's parts one after the other in one reused buffer, `producers` first.
-    let merged = || runs().filter(|((_, merged), _)| *merged);
-    let most = merged().map(|(_, run)| part_bytes(run)).max().unwrap_or(0);
-    let mut payloads = Vec::with_capacity(most);
-    for want in ["producers", "target_features"] {
-        for ((name, _), run) in merged().filter(|((name, _), _)| *name == want) {
-            payloads.clear();
-            for &(_, index) in run {
-                extend_with(&mut payloads, placed.view(index));
+    name_map(&mut small, &mut map_scratch, 9, segment_names);
+    let out = &mut layout.head;
+    let payload = function_names + small.len();
+    out.push(0);
+    leb::uleb(out, (leb::uleb_len(4) + 4 + payload) as u64);
+    leb::name(out, "name");
+    if names > 0 {
+        out.push(1);
+        leb::uleb(out, names_payload as u64);
+        leb::uleb(out, names);
+        out.extend_from_slice(&scratch);
+        for (at, piece) in pieces.iter().enumerate() {
+            if piece.names > 0 {
+                layout.run(Run::Names(at));
             }
-            let payload = match name {
-                "producers" => producers(&payloads),
-                _ => target_features(&payloads),
-            };
-            // alloc: error path
-            let payload = payload.map_err(|e| format!("the {name} sections: {e}"))?;
-            leb::custom(&mut out, name, &payload);
         }
     }
+    let out = &mut layout.head;
+    out.extend_from_slice(&small);
+    for (name, payload) in &merged_sections {
+        leb::custom(out, name, payload);
+    }
+
+    let (head, runs) = layout.finish();
+    let total: usize = runs.iter().map(|it| it.len(&pieces)).sum();
+    // alloc: the module, zeroed: its pages are first touched by the threads writing its runs
+    let mut out = vec![0u8; total];
+    let mut rest = &mut out[..];
+    let mut jobs = Vec::with_capacity(runs.len());
+    for run in runs {
+        let (place, tail) = std::mem::take(&mut rest).split_at_mut(run.len(&pieces));
+        rest = tail;
+        jobs.push((place, run));
+    }
+    let piece_units = |at: usize| &units[at * PIECE..((at + 1) * PIECE).min(units.len())];
+    jobs.into_par_iter().for_each(|(place, run)| match run {
+        Run::Head(range) => place.copy_from_slice(&head[range]),
+        Run::Copy(bytes) => place.copy_from_slice(bytes),
+        Run::Zeros(_) => {}
+        Run::Functions(at) => ulebs_into(place, pieces[at].function_types.iter().map(|&it| it.into())),
+        Run::Elements(range) => ulebs_into(place, range),
+        Run::Code(at) => code_piece(place, piece_units(at), &pieces[at], &ctors),
+        Run::Names(at) => names_piece(place, piece_units(at), imported + (at * PIECE) as u32),
+    });
     Ok(out)
 }
 
@@ -1322,14 +1569,85 @@ mod tests {
             .enumerate()
             .map(|(at, &len)| (0..len).map(|it| (it * 7 + at) as u8).collect())
             .collect();
-        let copied = |threads| {
-            let mut out: Vec<Vec<u8>> = sources.iter().map(|it| vec![0; it.len()]).collect();
-            let jobs = out.iter_mut().map(Vec::as_mut_slice).zip(sources.iter().map(Vec::as_slice));
-            on_threads(threads, || copy_all(jobs.collect()));
-            out
+        for source in &sources {
+            let mut layout = Layout { head: Vec::new(), runs: Vec::new(), mark: 0 };
+            layout.view(View::Slice(source));
+            let (_, runs) = layout.finish();
+            let mut joined = Vec::new();
+            for run in &runs {
+                let Run::Copy(bytes) = run else { panic!("a slice is one run of bytes") };
+                assert!(bytes.len() <= CHUNK);
+                joined.extend_from_slice(bytes);
+            }
+            assert_eq!(&joined, source);
+        }
+    }
+
+    #[test]
+    fn uleb_runs_are_sized_exactly() {
+        for n in [0u64, 1, 127, 128, 129, 16_383, 16_384, 70_000, 2_097_152 + 3] {
+            assert_eq!(ulebs_below(n), (0..n).map(leb::uleb_len).sum::<usize>(), "{n}");
+        }
+        let mut place = vec![0; ulebs_below(300) - ulebs_below(100)];
+        ulebs_into(&mut place, 100..300);
+        let mut expected = Vec::new();
+        for it in 100..300 {
+            leb::uleb(&mut expected, it);
+        }
+        assert_eq!(place, expected);
+    }
+
+    /// Functions in several pieces: the command's module with each extra function's entries
+    /// after its own, as one pass over the functions in order writes them, on any number of
+    /// threads.
+    #[test]
+    fn many_pieces_write_what_one_pass_would() {
+        let extra = 3 * PIECE + 5;
+        let module = |threads| on_threads(threads, || with_functions(extra).module().unwrap());
+        let one = module(1);
+        assert_eq!(module(8), one);
+        let (sections, base) = (sections(&one), sections(&command().module().unwrap()));
+        let count = |bytes: &[u8]| Reader::new(bytes).count().unwrap() as usize;
+        let rest = |bytes: &[u8]| {
+            let mut r = Reader::new(bytes);
+            r.count().unwrap();
+            r.take_rest().to_vec()
         };
-        assert_eq!(copied(1), sources);
-        assert_eq!(copied(8), sources);
+        let (imported, defined) = (count(find(&base, 2, "")), count(find(&base, 3, "")));
+
+        // Each `fn()` is type 1, as in the command: the import's type, then `fn()`.
+        let mut expected = Vec::new();
+        leb::uleb(&mut expected, (defined + extra) as u64);
+        expected.extend(rest(find(&base, 3, "")));
+        expected.extend(std::iter::repeat_n(1, extra));
+        assert_eq!(find(&sections, 3, ""), expected);
+
+        let mut expected = Vec::new();
+        leb::uleb(&mut expected, (defined + extra) as u64);
+        expected.extend(rest(find(&base, 10, "")));
+        for _ in 0..extra {
+            expected.extend([2, 0x00, 0x0b]);
+        }
+        assert_eq!(find(&sections, 10, ""), expected);
+
+        let slots = (imported + defined + extra) as u64;
+        let mut expected = vec![1, 0];
+        leb::i32_const(&mut expected, 1);
+        leb::uleb(&mut expected, slots);
+        for it in 0..slots {
+            leb::uleb(&mut expected, it);
+        }
+        assert_eq!(find(&sections, 9, ""), expected);
+
+        let function_names = |name_section: &[u8]| {
+            let mut r = Reader::new(name_section);
+            assert_eq!(r.u8().unwrap(), 1);
+            let len = r.uleb32().unwrap() as usize;
+            names(&mut Reader::new(r.take(len).unwrap()))
+        };
+        let mut expected = function_names(find(&base, 0, "name"));
+        expected.extend((0..extra).map(|at| ((imported + defined + at) as u32, format!("f{at}"))));
+        assert_eq!(function_names(find(&sections, 0, "name")), expected);
     }
 
     /// [`command`] with `extra` more `fn()`s after `_start`, each named.
@@ -1366,9 +1684,9 @@ mod tests {
         };
         let ((small_ok, small), (large_ok, large)) = (used(100), used(2000));
         assert!(small_ok && large_ok);
-        // About 40: the columns `write` keeps, its maps of types, exports, imports and custom
-        // sections, a radix sort's scratch, the merged producers section and the output. None
-        // per function, segment or section.
+        // About 40: the columns `write` keeps (a set per piece of 4096 functions), its maps of
+        // types, exports, imports and custom sections, the merged producers section, the
+        // layout and the output. None per function, segment or section.
         assert!(small.allocations <= 64, "{small:?}");
         assert_eq!(large.allocations, small.allocations, "20 times the functions");
     }

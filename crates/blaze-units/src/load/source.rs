@@ -3,9 +3,8 @@
 //! never the disk or the network. What is not mounted yet is a [`Fetch`] the daemon makes and
 //! mounts where cargo keeps it; offline, it is cargo's error.
 //!
-//! - `[source]` replacement is cargo 1.99's `SourceConfigMap` (`src/sources/config.rs`), copied
-//!   from v1's `crates/blaze-registry/src/sources.rs` and read from the configuration as v1's
-//!   `crates/blaze-metadata/src/lib.rs` (`source_config`) read it.
+//! - `[source]` replacement is cargo 1.99's `SourceConfigMap` (`src/sources/config.rs`):
+//!   [`crate::sources::SourceMap`], made of blaze-manifest's reading of the configuration.
 //! - A registry package is its `.crate` unpacked at `$CARGO_HOME/registry/src/<dir>/<name>-<version>`
 //!   (cargo's `RegistrySource`); a sparse index file is at
 //!   `$CARGO_HOME/registry/index/<dir>/.cache/<prefix path>`, as served; a git package is in its
@@ -13,7 +12,6 @@
 //! - A `local-registry` and a `directory` source are read in place. A git index is not read:
 //!   blaze reads sparse indexes only.
 
-mod index;
 mod registry;
 #[cfg(all(test, unix))]
 mod tests;
@@ -24,13 +22,12 @@ use blaze_manifest::Config;
 use blaze_manifest::files::Files;
 use blaze_query::{Cancelled, Cx};
 use blaze_resolve::{CRATES_IO_REGISTRY, PackageId, SourceId, SourceKind};
-use rustc_hash::FxHashMap;
-use serde::Deserialize;
 
-use self::index::{crate_url, index_path};
+use crate::index::{self, RegistryConfig, crate_url, index_path};
 use crate::load::files::{Found, normal, read_dir, read_file};
 use crate::load::load_error;
 use crate::query::{Fetch, FetchKind, LoadError};
+use crate::sources::SourceMap;
 
 pub(crate) use self::registry::Index;
 
@@ -60,18 +57,6 @@ pub(crate) enum IndexFile {
     Failed(anyhow::Error),
 }
 
-/// The `config.json` at the root of a sparse index.
-#[derive(Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct RegistryConfig {
-    /// Where a `.crate` file is: a template of `{crate}`, `{version}`, `{prefix}`,
-    /// `{lowerprefix}` and `{sha256-checksum}`, or, with none of them, a URL that
-    /// `/{crate}/{version}/download` is added to.
-    dl: String,
-    #[serde(default)]
-    auth_required: bool,
-}
-
 impl Sources {
     /// From the configuration the workspace was read with: `[source]` replacements,
     /// `[registries]`, `registry.index`, `registries.crates-io.protocol` (sparse by default),
@@ -80,7 +65,7 @@ impl Sources {
     pub(crate) fn new<F: Files>(config: &Config<F>, offline: Option<&'static str>) -> anyhow::Result<Sources> {
         let home = normal(config.home())
             .ok_or_else(|| anyhow!("`$CARGO_HOME` (`{}`) is not an absolute path", config.home().display()))?;
-        Ok(Sources { map: SourceMap::new(config)?, home, offline })
+        Ok(Sources { map: source_map(config)?, home, offline })
     }
 
     /// A package the resolve pins that is not a path package: where cargo has its `Cargo.toml`,
@@ -342,27 +327,17 @@ impl Sources {
     /// The registry `id`'s packages come from, when `id` is a registry and what replaces it is
     /// one too.
     pub(crate) fn registry_of(&self, id: SourceId) -> anyhow::Result<Option<SourceId>> {
-        if !id.is_registry() {
-            return Ok(None);
-        }
-        let from = self.map.replacement(id)?;
-        Ok(from.is_registry().then_some(from))
+        self.map.registry_of(id)
     }
 
     /// As cargo's `ReplacedSource::describe`: the source read, and the one it replaces unless
     /// that is crates.io read over its sparse index.
     pub(crate) fn describe(&self, source: SourceId) -> String {
-        let from = self.map.replacement(source).unwrap_or(source);
-        if from == source || (from.is_crates_io() && source.is_crates_io()) {
-            describe(from)
-        } else {
-            format!("{} (which is replacing {source})", describe(from))
-        }
+        self.map.describe(source)
     }
 
     pub(crate) fn is_replaced(&self, source: SourceId) -> bool {
-        let from = self.map.replacement(source).unwrap_or(source);
-        from != source && !(from.is_crates_io() && source.is_crates_io())
+        self.map.is_replaced(source)
     }
 
     /// `$CARGO_HOME/registry/src/<dir>/<name>-<version>`.
@@ -409,153 +384,25 @@ fn local_path(id: SourceId) -> Option<String> {
     normal(&id.url().to_file_path().ok()?)
 }
 
-/// How cargo's sources describe themselves (each `Source::describe`).
-fn describe(id: SourceId) -> String {
-    match id.kind() {
-        SourceKind::Registry | SourceKind::SparseRegistry | SourceKind::LocalRegistry => {
-            id.display_index()
+/// The sources `config` names and which replaces which, as cargo's `SourceConfigMap::new`
+/// makes them: each `[source]` table, then each `[registries]` name a `replace-with` gives.
+fn source_map<F: Files>(config: &Config<F>) -> anyhow::Result<SourceMap> {
+    let crates_io = config.crates_io_maybe_sparse_http()?;
+    let mut map = SourceMap::new(crates_io);
+    for (name, def) in config.source_configs()? {
+        if name == CRATES_IO_REGISTRY && def.replace_with.is_none() {
+            continue;
         }
-        SourceKind::Directory => match id.url().to_file_path() {
-            Ok(path) => format!("directory source `{}`", path.display()),
-            Err(()) => id.to_string(),
-        },
-        SourceKind::Git(_) => format!("Git repository {id}"),
-        SourceKind::Path => match id.url().to_file_path() {
-            Ok(path) => path.display().to_string(),
-            Err(()) => id.to_string(),
-        },
-    }
-}
-
-/// A `[source]` table's location and what replaces it.
-#[derive(Clone)]
-struct Replacement {
-    id: SourceId,
-    /// The name of the source that replaces it and where that is defined.
-    with: Option<(String, String)>,
-}
-
-/// The sources cargo knows by name, and which of them replaces which (cargo's
-/// `SourceConfigMap`, v1's `SourceMap`).
-struct SourceMap {
-    by_name: FxHashMap<String, Replacement>,
-    names: FxHashMap<SourceId, String>,
-    /// The `[registries]` a `replace-with` names, as cargo's `SourceId::alt_registry` reads
-    /// them: one whose index is not configured is not here.
-    registries: FxHashMap<String, SourceId>,
-    crates_io: SourceId,
-}
-
-impl SourceMap {
-    fn new<F: Files>(config: &Config<F>) -> anyhow::Result<SourceMap> {
-        let crates_io = config.crates_io_maybe_sparse_http()?;
-        let mut map = SourceMap {
-            by_name: FxHashMap::default(),
-            names: FxHashMap::default(),
-            registries: FxHashMap::default(),
-            crates_io,
+        let id = match name.as_str() {
+            CRATES_IO_REGISTRY => crates_io,
+            _ => def.id,
         };
-        map.add(CRATES_IO_REGISTRY, Replacement { id: SourceId::crates_io(), with: None })?;
-        map.add(CRATES_IO_REGISTRY, Replacement { id: crates_io, with: None })?;
-        for (name, def) in config.source_configs()? {
-            if name == CRATES_IO_REGISTRY && def.replace_with.is_none() {
-                continue;
-            }
-            let id = match name.as_str() {
-                CRATES_IO_REGISTRY => crates_io,
-                _ => def.id,
-            };
-            map.add(&name, Replacement { id, with: def.replace_with })?;
-        }
-        let named: Vec<String> = map
-            .by_name
-            .values()
-            .filter_map(|it| it.with.as_ref().map(|(name, _)| name.clone()))
-            .filter(|name| !map.by_name.contains_key(name))
-            .collect();
-        for name in named {
-            if let Ok(id) = blaze_manifest::source::alt_registry(config, &name) {
-                map.registries.insert(name, id);
-            }
-        }
-        Ok(map)
+        map.add(&name, id, def.replace_with)?;
     }
-
-    fn add(&mut self, name: &str, replacement: Replacement) -> anyhow::Result<()> {
-        if let Some(old) = self.names.insert(replacement.id, name.to_owned())
-            && name != CRATES_IO_REGISTRY
-        {
-            bail!(
-                "source `{old}` defines source {}, but that source is already defined by `{name}`\n\
-                 note: Sources are not allowed to be defined multiple times.",
-                replacement.id
-            );
+    for name in map.unknown_replacements() {
+        if let Ok(id) = blaze_manifest::source::alt_registry(config, &name) {
+            map.add_registry(name, id);
         }
-        self.by_name.insert(name.to_owned(), replacement);
-        Ok(())
     }
-
-    /// The source the packages of `id` come from: `id` itself, or the end of its chain of
-    /// `replace-with`. A vendored replacement of a git source needs `id` to be pinned, as a
-    /// lock file pins it to a commit.
-    fn replacement(&self, id: SourceId) -> anyhow::Result<SourceId> {
-        let Some(original) = self.names.get(&id) else { return Ok(id) };
-        let mut name = original;
-        let mut at = "";
-        let replaced = loop {
-            let Some(replacement) = self.by_name.get(name) else {
-                if let Some(id) = self.registries.get(name) {
-                    break *id;
-                }
-                bail!(
-                    "could not find a configured source with the name `{name}` when attempting \
-                     to lookup `{original}` (configuration in `{at}`)"
-                );
-            };
-            match &replacement.with {
-                Some((with, definition)) => {
-                    name = with;
-                    at = definition;
-                }
-                None if replacement.id == id => return Ok(id),
-                None => break replacement.id,
-            }
-            if name == original {
-                bail!(
-                    "detected a cycle of `replace-with` sources, the source `{name}` is \
-                     eventually replaced with itself (configuration in `{at}`)"
-                );
-            }
-        };
-        if supports_checksums(id) && !supports_checksums(replaced) {
-            bail!(
-                "cannot replace `{original}` with `{name}`, the source `{original}` supports \
-                 checksums, but `{name}` does not\n\na lock file compatible with `{original}` \
-                 cannot be generated in this situation"
-            );
-        }
-        if requires_precise(id) && !id.has_precise() {
-            bail!(
-                "the source {original} requires a lock file to be present first before it can be\n\
-                 used against vendored source code\n\nremove the source replacement \
-                 configuration, generate a lock file, and then\nrestore the source replacement \
-                 configuration to continue the build"
-            );
-        }
-        Ok(replaced)
-    }
-}
-
-fn supports_checksums(id: SourceId) -> bool {
-    matches!(
-        id.kind(),
-        SourceKind::Registry
-            | SourceKind::SparseRegistry
-            | SourceKind::LocalRegistry
-            | SourceKind::Directory
-    )
-}
-
-fn requires_precise(id: SourceId) -> bool {
-    matches!(id.kind(), SourceKind::Git(_) | SourceKind::Directory)
+    Ok(map)
 }

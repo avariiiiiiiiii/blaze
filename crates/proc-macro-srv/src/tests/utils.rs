@@ -12,10 +12,7 @@ use crate::{
 };
 
 fn make_ctx() -> SyntaxContext {
-    // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts; these
-    // tests have no database, so the context is never looked up in salsa, and 0 is a valid
-    // `NonZeroU32` once `from_u32` adds 1. Memory safety doesn't rest on it either way.
-    unsafe { SyntaxContext::from_u32(0) }
+    SyntaxContext::from_u32(0)
 }
 
 fn parse_string(call_site: SpanId, src: &str) -> TokenStream<SpanId> {

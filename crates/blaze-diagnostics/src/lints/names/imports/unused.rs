@@ -38,6 +38,7 @@ use syntax::{
 };
 
 use super::used::{Binding, Entry, ExternCrate, Ns, SmallSet, Tree, TreeKind, UseItem, Used, Uses, entry};
+use stdx::list::Join;
 use crate::{
     cx::{Cx, item_range_view},
     lints::registry::LintId,
@@ -284,7 +285,7 @@ impl Unused {
         // alloc: the snippets of the message of a lint that fires
         let mut snippets: Vec<String> = spans.iter().filter_map(|it| cx.snippet(it)).map(|it| format!("`{it}`")).collect();
         snippets.sort();
-        let list = and_list(&snippets);
+        let list = stdx::list::list(snippets.iter(), Join::And, false);
         let message =
             // alloc: the message of a lint that fires
             if snippets.len() == 1 { format!("unused import: {list}") } else { format!("unused imports: {list}") };
@@ -691,21 +692,6 @@ fn with_attrs(node: Node<'_>) -> TextRange {
         })
         .map_or(node.text_range().start(), |it| it.text_range().start());
     TextRange::new(start, node.text_range().end())
-}
-
-/// rustc's `StrListSepByAnd`: `a`, `a and b`, `a, b, and c`, for the message of a lint that
-/// fires.
-fn and_list(items: &[String]) -> String {
-    match items {
-        // alloc: empty, it allocates nothing
-        [] => String::new(),
-        // clone: the message of a lint that fires
-        [one] => one.clone(),
-        // alloc: the message of a lint that fires
-        [a, b] => format!("{a} and {b}"),
-        // alloc: the message of a lint that fires
-        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
-    }
 }
 
 /// Where the help on a test module points, when the `use` item's nearest module that is not a

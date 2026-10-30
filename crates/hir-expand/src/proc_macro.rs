@@ -157,6 +157,7 @@ impl ProcMacrosBuilder {
             .set_by_crate(db)
             .with_durability(Durability::HIGH)
             .to(map);
+        db.note_crates_changed();
     }
 }
 

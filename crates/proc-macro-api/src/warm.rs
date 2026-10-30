@@ -456,7 +456,7 @@ impl Environment {
     /// by name, each once; owned, for a caller that keeps it. A warm expansion's trace looks
     /// each name up where it is instead ([`Seeing`]).
     pub fn seen<'a>(
-        passed: &[(String, String)],
+        passed: &'a [(String, String)],
         call: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Vec<(OsString, OsString)> {
         let passed = passed.iter().map(|(name, value)| (name.as_str(), value.as_str()));

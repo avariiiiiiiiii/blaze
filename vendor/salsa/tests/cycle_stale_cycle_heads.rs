@@ -3,6 +3,8 @@
 //! Test for stale cycle heads when nested cycles are discovered incrementally.
 //!
 //! Scenario from ty:
+
+#![forbid(unsafe_code)]
 /// ```txt
 /// E -> C -> D -> B -> A -> B (cycle)
 ///                     -- A completes, heads = [B]

@@ -3,7 +3,7 @@
 //! `#[track_caller]` and panics report. The evaluator of constants and the code generator
 //! both read them.
 
-use salsa::Database as _;
+use salsa::{Database as _, Setter as _};
 use base_db::Db;
 use hir_def::{
     DefWithBodyId, FunctionId, ItemContainerId, Lookup,
@@ -151,7 +151,7 @@ fn file_source_path<'db>(db: &'db Db, file: base_db::FileText) -> Option<String>
         db.report_untracked_read();
         return None;
     };
-    (names.rule(db).paths)(db, file.file_id(db))
+    (names.rule(db).paths)(db, *file.file_id(db))
 }
 
 /// The text of the literal `expr` of `owner` when it is what `file!()`, or a `concat!` with

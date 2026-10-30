@@ -13,6 +13,7 @@ use base_db::Db;
 use either::Either;
 use hir::{InFile, ModuleDef, ScopeDef};
 use hir_expand::inert_attr_macro::INERT_ATTRIBUTES;
+use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     NodeOrToken, SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _, HasName as _},
@@ -21,7 +22,6 @@ use syntax::{
 use super::unresolved_import::{ROOT, Segment, macro_path_error, path_segments};
 use crate::{
     cx::{Cx, item_range_view as item_range, signature_range_view as signature_range},
-    lints::edit_distance::find_best_match_for_name,
     lower::{Found, Phase},
     model::{Applicability, Diag, MultiSpan, Span},
 };
@@ -185,7 +185,7 @@ fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, kind: Kind, name: &str, span: Span, na
     }
     // alloc: the error's parts, for an error hir found
     let words: Vec<&str> = candidates.iter().map(|(it, _)| *it).collect();
-    let Some(best) = find_best_match_for_name(&words, name, None) else { return };
+    let Some(best) = find_best_match_for_name(&words, name, None).copied() else { return };
     if best == "_" {
         return;
     }
@@ -371,33 +371,42 @@ fn derive_segments(root: ast::Node<'_>, range: TextRange) -> Vec<Segment> {
 #[cfg(test)]
 mod tests {
     use span::Edition;
-    use syntax::{AstNode as _, SourceFile, algo};
+    use syntax::{SourceFile, TextSize};
 
     use super::*;
 
+    /// The attribute and the macro call around each range, innermost first, of the tree's
+    /// nodes: none where the range is outside every one.
     #[test]
-    fn the_view_finds_the_handles_node_at_each_range() {
+    fn the_node_at_a_range_is_the_innermost_holding_it() {
         let text = "#[derive(Debug, ::serde::Serialize)]\n#[inline]\nfn f() { m!(1); a::b!(); }\n\
                     #[cfg_attr(x, derive(Clone))]\nenum E { #[default] A }\n";
         let parse = SourceFile::parse(text, Edition::CURRENT);
-        let handles = parse.tree();
         let root = parse.root();
-        let mut compared = 0;
-        for (node, it) in handles.syntax().descendants().zip(root.descendants()) {
-            assert_eq!((node.kind(), node.text_range()), (it.kind(), it.text_range()));
-            let range = node.text_range();
-            let attr = algo::find_node_at_range::<syntax::ast::Attr>(handles.syntax(), range);
-            let call = algo::find_node_at_range::<syntax::ast::MacroCall>(handles.syntax(), range);
-            assert_eq!(
-                attr.map(|it| it.syntax().text_range()),
-                find_node_at_range::<ast::Attr<'_>>(root, range).map(|it| it.syntax().text_range()),
-            );
-            assert_eq!(
-                call.map(|it| it.syntax().text_range()),
-                find_node_at_range::<ast::MacroCall<'_>>(root, range).map(|it| it.syntax().text_range()),
-            );
-            compared += 1;
+        let at = |written: &str, skip: usize| {
+            let start = text.find(written).expect("in the text") + skip;
+            TextRange::at(TextSize::from(u32::try_from(start).unwrap()), TextSize::of(&written[skip..]))
+        };
+        let derive = "#[derive(Debug, ::serde::Serialize)]";
+        let cfg_attr = "#[cfg_attr(x, derive(Clone))]";
+        for (range, attr, call) in [
+            (at("Debug", 0), Some(derive), None),
+            (at("::serde::Serialize", 0), Some(derive), None),
+            (at("Serialize", 0), Some(derive), None),
+            (at("inline", 0), Some("#[inline]"), None),
+            (at("1", 0), None, Some("m!(1)")),
+            (at("b!", 0), None, Some("a::b!()")),
+            (at("x", 0), Some(cfg_attr), None),
+            (at("Clone", 0), Some(cfg_attr), None),
+            (at("default", 0), Some("#[default]"), None),
+            (at("] A", 2), None, None),
+            (at("fn f()", 0), None, None),
+            (root.text_range(), None, None),
+        ] {
+            let found_attr = find_node_at_range::<ast::Attr<'_>>(root, range).map(|it| &text[it.syntax().text_range()]);
+            let found_call = find_node_at_range::<ast::MacroCall<'_>>(root, range)
+                .map(|it| text[it.syntax().text_range()].trim_end_matches(';'));
+            assert_eq!((found_attr, found_call), (attr, call), "at {:?}", &text[range]);
         }
-        assert!(compared > 30, "the source has many nodes: {compared}");
     }
 }

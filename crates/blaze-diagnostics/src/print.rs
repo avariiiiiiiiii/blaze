@@ -116,7 +116,7 @@ fn builtin_derive_method(cx: &Cx<'_, '_>, def: hir::ModuleDef, mode: Mode) -> St
 }
 
 /// rustc's `TraitRef` printing: `<T as Trait<U>>`.
-pub fn trait_ref(cx: &Cx<'_, '_>, tr: &hir::TraitRef<'_>) -> String {
+pub fn trait_ref<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>) -> String {
     let tr = tr.to_next_solver();
     let mut p = Printer::new(cx, Mode::NORMAL, false);
     p.write_str("<");
@@ -128,7 +128,7 @@ pub fn trait_ref(cx: &Cx<'_, '_>, tr: &hir::TraitRef<'_>) -> String {
 }
 
 /// rustc's `print_only_trait_path`: `Trait<U>`, its own arguments without their defaults.
-pub fn trait_path(cx: &Cx<'_, '_>, tr: &hir::TraitRef<'_>) -> String {
+pub fn trait_path<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>) -> String {
     let mut p = Printer::new(cx, Mode::NORMAL, false);
     p.print_trait_path(tr.to_next_solver());
     p.finish()
@@ -136,7 +136,7 @@ pub fn trait_path(cx: &Cx<'_, '_>, tr: &hir::TraitRef<'_>) -> String {
 
 /// rustc's `print_modifiers_and_trait_path`: `!` for a negative bound, then the trait with
 /// `Fn(u8)` sugar for a parenthesized trait (`TraitRefPrintSugared`).
-pub fn trait_path_sugared(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> String {
+pub fn trait_path_sugared<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>) -> String {
     let pred = pred.to_next_solver();
     let mut p = Printer::new(cx, Mode::NORMAL, false);
     if pred.polarity == rustc_type_ir::ClausePolarity::Negative {
@@ -147,7 +147,7 @@ pub fn trait_path_sugared(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> Strin
 }
 
 /// rustc's `TraitPredicate` printing: `T: Trait<U>`, `T: !Trait`, `F: Fn(u8)`.
-pub fn predicate(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> String {
+pub fn predicate<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>) -> String {
     let pred = pred.to_next_solver();
     let mut p = Printer::new(cx, Mode::NORMAL, false);
     p.print_trait_predicate(pred);
@@ -155,7 +155,7 @@ pub fn predicate(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> String {
 }
 
 /// rustc's `HostEffectPredicate` printing: `T: [const] Trait` (`maybe_const`), `T: const Trait`.
-pub fn host_effect(cx: &Cx<'_, '_>, tr: &hir::TraitRef<'_>, maybe_const: bool) -> String {
+pub fn host_effect<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>, maybe_const: bool) -> String {
     let tr = tr.to_next_solver();
     let mut p = Printer::new(cx, Mode::NORMAL, false);
     p.print_type(tr.self_ty());
@@ -166,7 +166,7 @@ pub fn host_effect(cx: &Cx<'_, '_>, tr: &hir::TraitRef<'_>, maybe_const: bool) -
 
 /// rustc's `print_trait_sugared` of a trait reference: `Fn(u8)` for a parenthesized trait,
 /// else `Trait<U>`.
-pub fn trait_ref_sugared(cx: &Cx<'_, '_>, tr: &hir::TraitRef<'_>) -> String {
+pub fn trait_ref_sugared<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>) -> String {
     let mut p = Printer::new(cx, Mode::NORMAL, false);
     p.print_trait_sugared(tr.to_next_solver());
     p.finish()

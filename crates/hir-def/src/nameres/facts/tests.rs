@@ -8,8 +8,9 @@
 //! [`compare`] says, field by field, where two such forms differ.
 
 mod active;
-mod differential;
-mod generated;
+pub(in crate::nameres) mod differential;
+mod features;
+pub(in crate::nameres) mod generated;
 mod graph;
 mod impls;
 mod trace;
@@ -86,7 +87,7 @@ pub(super) fn old_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
 
 /// The crate's def map as the per-module resolver makes it, without `frozen`.
 #[salsa::tracked(returns(ref))]
-pub(super) fn new_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
+pub(in crate::nameres) fn new_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
     blaze_mem::frame::task(Tag::Nameres, |frame| {
         let (def_map, local_def_map) = super::collect_crate(db, frame, krate);
         DefMapPair::new(db, def_map, local_def_map)
@@ -95,13 +96,9 @@ pub(super) fn new_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
 
 /// The empty def map of `block` that `block_def_map` starts from, and the tree it collects.
 fn empty_block_def_map(db: &Db, block_id: BlockIdLt<'_>) -> (DefMap, TreeId) {
-    // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. Both
-    // callers are queries keyed by `block_id`, and the `'static` copies go only into the `DefMap`
-    // that query returns and the modules it makes, which salsa invalidates with the key.
-    let block_id = unsafe { block_id.to_static() };
+    let block_id = block_id.to_static();
     let ast_id = block_id.ast_id(db);
-    // SAFETY: as for `block_id` above.
-    let module = unsafe { block_id.module(db).to_static() };
+    let module = block_id.module(db).to_static();
     let visibility = Visibility::Module(module, VisibilityExplicitness::Implicit);
     let module_data =
         ModuleData::new(ModuleOrigin::BlockExpr { block: ast_id, id: block_id }, visibility, None);
@@ -333,7 +330,7 @@ pub(super) struct CCrateData<'a> {
 
 /// A `DefMap` (and, for a crate, its `LocalDefMap`) in canonical form.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct CDefMap<'a> {
+pub(in crate::nameres) struct CDefMap<'a> {
     pub(super) krate: Crate,
     pub(super) block: Option<BlockInfo>,
     pub(super) root: CModule,
@@ -355,13 +352,13 @@ pub(super) struct CDefMap<'a> {
 /// schedule, the names whose resolution does (in every module), and whether unresolved-import
 /// diagnostics do.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct Exempt {
-    pub(super) names: &'static [&'static str],
-    pub(super) unresolved_imports: bool,
+pub(in crate::nameres) struct Exempt {
+    pub(in crate::nameres) names: &'static [&'static str],
+    pub(in crate::nameres) unresolved_imports: bool,
 }
 
 impl Exempt {
-    pub(super) const NONE: Exempt = Exempt { names: &[], unresolved_imports: false };
+    pub(in crate::nameres) const NONE: Exempt = Exempt { names: &[], unresolved_imports: false };
 
     fn name(&self, name: &Name) -> bool {
         self.names.contains(&name.as_str())
@@ -864,7 +861,7 @@ impl<'a> Projector<'a> {
 }
 
 /// `def_map` (with `local` for a crate's map) in canonical form, leaving out what `exempt` names.
-pub(super) fn project<'a>(
+pub(in crate::nameres) fn project<'a>(
     db: &'a Db,
     def_map: &'a DefMap,
     local: Option<&'a LocalDefMap>,
@@ -1057,7 +1054,7 @@ fn compare_scope(out: &mut String, at: &str, old: &CScope, new: &CScope) {
 }
 
 /// Where `old` and `new` differ, one finding per line block; empty when they are equal.
-pub(super) fn compare(old: &CDefMap<'_>, new: &CDefMap<'_>) -> String {
+pub(in crate::nameres) fn compare(old: &CDefMap<'_>, new: &CDefMap<'_>) -> String {
     let mut out = String::new();
     let CDefMap {
         krate,
@@ -1158,7 +1155,7 @@ impl ProcMacroExpander for IdentityWhenValid {
     }
 }
 
-fn extra_proc_macros() -> Vec<(String, ProcMacro)> {
+pub(in crate::nameres) fn extra_proc_macros() -> Vec<(String, ProcMacro)> {
     vec![(
         r#"
 #[proc_macro_attribute]
@@ -1177,7 +1174,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
 }
 
 /// A database of `fixture`, which may mark a position (`$0`): the comparisons read none.
-pub(super) fn fixture_db(fixture: &str) -> TestDB {
+pub(in crate::nameres) fn fixture_db(fixture: &str) -> TestDB {
     let mut db = TestDB::for_tests();
     let change = ChangeFixture::parse_with_proc_macros(fixture, MiniCore::RAW_SOURCE, extra_proc_macros());
     change.change.apply(&mut db);
@@ -1186,7 +1183,7 @@ pub(super) fn fixture_db(fixture: &str) -> TestDB {
 
 /// Runs `f` with the builtin-derive fast path on or off (`ENABLE_BUILTIN_DERIVE_FAST_PATH`),
 /// putting the setting back after, also when `f` panics.
-pub(super) fn with_fast_path<R>(on: bool, f: impl FnOnce() -> R) -> R {
+pub(in crate::nameres) fn with_fast_path<R>(on: bool, f: impl FnOnce() -> R) -> R {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -1259,8 +1256,7 @@ pub(super) fn compare_db(db: &TestDB, name: &str, exempt: &Exempt, out: &mut Str
         while let Some(map) = maps.pop() {
             for body in bodies(db, map) {
                 for (block, real) in Body::of(db, body).blocks(db) {
-                    // SAFETY: `block` is read only while `db` is, in this revision.
-                    let block = unsafe { block.to_db(db) };
+                    let block = block.to_db(db);
                     let old = old_block_def_map(db, block);
                     let new = new_block_def_map(db, block);
                     assert_handed_over(db, new, name);

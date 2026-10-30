@@ -38,7 +38,7 @@ In order, each step one outcome, the run stopping at the first that does not pas
                 kept -- --ignored` in this repository, BLAZE_CACHE and BLAZE_PROC_MACRO_CACHE
                 unset; then one outcome per test of the two files, by libtest's name
 
-The server is the toolchain's own and is never built from `vendor/proc-macro-srv`: that one
+The server is the toolchain's own and is never built from `crates/proc-macro-srv-cli`: that one
 reads the list of macros blaze writes into the libraries it links (crates/blaze-engine/src/
 macro_list.rs) where the toolchain's reads rustc's metadata, so it cannot load the libraries
 rustc builds, which are the reference. A toolchain without the server is an error naming the

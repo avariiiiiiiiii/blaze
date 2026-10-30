@@ -49,6 +49,9 @@ of the inputs take one cheap shape. Those are the areas below.
   redesign here; frontend-fast adds only the rustc differential (section 9) for name resolution
   errors (E0425, E0432, E0433, E0659 and the rest) with their primary spans.
 - **Owner.** `frontend-nameres` (sibling).
+- **Maintained form.** Lane dbsp maintains this resolution, the impl tables and the trait
+  candidate sets by deltas on the write side, published one salsa input per slice
+  ([../../design/dbsp.md](../../design/dbsp.md)). `facts/` becomes its differential reference.
 
 ## 2. Trait goals
 

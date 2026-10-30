@@ -688,24 +688,6 @@ fn find_root_manifest_for_wd(path: &Path) -> Option<PathBuf> {
     path.ancestors().map(|it| it.join("Cargo.toml")).find(|it| it.exists())
 }
 
-/// `path` with `.` and `..` taken out, as cargo's `paths::normalize_path`.
-fn normalize_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(..) | Component::RootDir | Component::Normal(_) => {
-                out.push(component.as_os_str())
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-        }
-    }
-    out
-}
-
 fn mk(settings: &Settings<'_>, shell: &mut impl Shell, opts: &MkOptions<'_>) -> anyhow::Result<()> {
     let path = opts.path;
     let name = opts.name;
@@ -757,7 +739,7 @@ fn mk(settings: &Settings<'_>, shell: &mut impl Shell, opts: &MkOptions<'_>) -> 
         }
     }
 
-    let manifest_path = normalize_path(&path.join("Cargo.toml"));
+    let manifest_path = blaze_manifest::paths::normalize_path(&path.join("Cargo.toml"));
     if let Some(root_manifest_path) = find_root_manifest_for_wd(&manifest_path) {
         let root_manifest = std::fs::read_to_string(&root_manifest_path)
             .with_context(|| format!("failed to read `{}`", root_manifest_path.display()))?;

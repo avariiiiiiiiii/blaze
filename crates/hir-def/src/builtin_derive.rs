@@ -166,7 +166,7 @@ impl BuiltinDeriveImplLoc {
     /// `const impl`.
     pub fn is_const(&self, db: &Db) -> bool {
         let (adt_ast_id, module) = self.adt_source(db);
-        let (_, meta) = self.derive_attr_id.find_attr_range(db, module.krate(db), adt_ast_id);
+        let (_, meta) = self.derive_attr_id.find_attr_range_view(db, module.krate(db), adt_ast_id);
         meta.path()
             .and_then(|path| path.as_single_name_ref())
             .is_some_and(|name| name.text() == "derive_const")

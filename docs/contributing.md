@@ -31,7 +31,7 @@ you send them, including fixes you find here and want to upstream.
     crates/blaze-registry/    registries read and packages fetched as cargo does, with no cargo
     crates/blaze-wasm/        experiment: the compiler running in a web page (not in the workspace)
     harness/                  the test harnesses and their fixtures
-    demo/                     small projects the harnesses and the scoreboard build
+    demo/                     small projects the harnesses build
     docs/                     these documents
     docs/reports/             working reports, one per piece of work, as written at the time
     tools/                    what builds, releases and measures blaze: agents/ (the agent rules
@@ -116,7 +116,7 @@ one file; everything else reads it or is written from it:
 - What mirrors rustc, all from that commit: `crates/rustc_abi` (rustc's `compiler/rustc_abi`),
   `crates/proc-macro-srv` (blaze's proc-macro server, over the nightly's `proc_macro` bridge,
   which it follows by hand, and its `RUSTC_VERSION_STRING`), the answers to rustc's questions
-  (`crates/blaze-cargo/src/answers/rustc.json`), and the code written by hand to agree with rustc:
+  (`crates/blaze-units/src/stdlib/rustc.json`), and the code written by hand to agree with rustc:
   the Rust ABI in the code generator, `vtable.rs`, `type_id.rs`, symbol names (v0) in
   `symbols.rs`, the intrinsics and lang items, the test harness's call into libtest.
 - `install.sh`'s `TOOLCHAIN`, the flake (`rust-bin.nightly.<date>`, for the dev shells and the
@@ -141,9 +141,9 @@ installs the nightly with rustup. Each step names itself when it fails.
 
 What it leaves to a person, and prints at the end:
 
-1. `python3 harness/answers.py --write` on x86-64 Linux, AArch64 Linux and arm64 macOS, each
-   with that host's release build of blaze, since the target specs depend on the host rustc
-   was built for; commit `crates/blaze-cargo/src/answers/rustc.json`.
+1. `python3 harness/answers.py --write` on x86-64 Linux, AArch64 Linux and arm64 macOS, since
+   the target specs depend on the host rustc was built for; commit
+   `crates/blaze-units/src/stdlib/rustc.json`.
 2. `cargo build -p blaze-engine --release`, fixing what the new `rustc_abi` and standard library
    ask for, and mirroring by hand what changed in rustc: the Rust ABI, vtables, `TypeId`,
    symbol names, new intrinsics and lang items. The move to `nightly-2026-10-25` needed
@@ -152,11 +152,8 @@ What it leaves to a person, and prints at the end:
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
 3. `uv run --frozen python harness/toolchain_bump.py checks '{}'` in an ix VM, under Cranelift and under LLVM
    (in `nix develop`, with `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`). It builds
-   blaze and runs, in parallel, what proves blaze and the nightly agree: `toolchain_pins.py`,
-   `answers.py`, `macroserver.py`, the corpus with its `nightly` feature and `--layouts`, and
-   the gate's quick parts.
-4. The full tier re-measured at the new commit: `uitest.py`, `libsuite.py` and
-   `borrowck_ui.py` against rustc's own tests.
+   blaze and runs, in parallel, `toolchain_pins.py` and the gate's quick parts.
+4. The full tier re-measured at the new commit: `libsuite.py` and the crates' own test suites.
 5. One commit for the bump, landed like any other change.
 
 A blaze built before the bump refuses the new nightly until it is rebuilt, since the two
@@ -165,8 +162,10 @@ match by the whole version line.
 ## Rules for code
 
 1. **rustc is the reference.** If blaze's program behaves differently from rustc's, blaze
-   is wrong, even where rustc's behaviour looks like an accident. The harnesses run rustc to
-   compare with; blaze itself never does ([no-rustc.md](no-rustc.md)).
+   is wrong, even where rustc's behaviour looks like an accident. That is proven by real
+   crates' own test suites passing under blaze and by tests that state their expected result,
+   not by harnesses that run rustc to compare with (deleted on 2026-10-30); blaze itself never
+   runs rustc ([no-rustc.md](no-rustc.md)).
 2. **Never guess.** Input the code generator has no explicit lowering for is refused with a
    reason (`CodegenError`), not lowered on a best-effort basis. A refusal is visible and
    counted. A wrong guess is a miscompile nobody sees.
@@ -183,14 +182,14 @@ did about it in one line.
 
 ## What a change needs
 
-- A reduced case that fails before and passes after: a corpus function for a code
-  generator feature, a breaker for a bug found in real code, a step in the relevant edit
-  harness for a daemon bug. [harness.md](harness.md) says how to add each.
+- A test that fails before and passes after: the real crate's own tests for a bug found in
+  it, a unit test beside the code for one small enough to state, a step in the relevant edit
+  harness for a daemon bug ([harness.md](harness.md#adding-a-test)).
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
   you did not run. CI's merge gate is the build and the unit tests on Linux x86-64, and
   `blaze check --workspace` with the released blaze on Linux x86-64 and macOS; every
   harness on every platform, Windows too, and the slow ones (`wholeprogram.py`, `keys.py`,
-  `buildmodel.py`, the store, `blaze_cli.py` on real projects) run in the release train on
+  the store, `blaze_cli.py` on real projects) run in the release train on
   main after the merge, and a red train opens or adds to the issue "Release train is red",
   with the commits since the last green one ([harness.md](harness.md#ci)). The gate letting a
   change through is not the harnesses passing on it.
@@ -206,6 +205,18 @@ did about it in one line.
 
 When you report what you did, separate what you ran from what you inferred. The reports
 under `docs/reports/` do this and it is the reason they can be used.
+
+### Property tests
+
+A property test (a rule over generated inputs, with the failing case shrunk) uses Hegel:
+`hegeltest.workspace = true` under `[dev-dependencies]`, imported as `hegel`, and
+`#[hegel::test]` on a `fn(tc: hegel::TestCase)` that draws from `hegel::generators`. The
+engine is linked as a Rust crate ([vendor/hegeltest/SOURCE.md](../vendor/hegeltest/SOURCE.md)).
+Keep the default case count to seconds per crate (`#[hegel::test(test_cases = N)]`, 256 by
+default from `hegel.toml`) and run longer with `HEGEL_TEST_CASES`. Hegel applies that only
+to tests that set no count, so a test with its own count that is worth a long run reads it
+itself (`run_cases` in `crates/blaze-cas/src/tests/model_check.rs`). Fuzzing (`crates/blaze-fuzz`, `fuzz/`) is for parsers of hostile bytes.
+Never proptest, quickcheck, arbitrary or bolero.
 
 ## Documents
 

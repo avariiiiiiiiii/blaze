@@ -16,7 +16,7 @@ use blaze_format::cursor::{Put, Reader};
 use blaze_ids::ContentId;
 
 /// The span side table of one anchor, as [`crate::Change::spans`] carries it.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default)]
 pub struct SpanTable {
     /// The file names the spans are in, as the program observes them (`file!()`).
     pub files: Vec<String>,

@@ -54,7 +54,7 @@ use crate::{
     hir::generics::{GenericParams, LocalLifetimeParamId, LocalTypeOrConstParamId},
     nameres::ModuleOrigin,
     resolver::{HasResolver, Resolver},
-    src::HasChildSourceView,
+    src::HasSource,
 };
 
 pub mod docs;
@@ -114,6 +114,192 @@ fn any_has_attrs(node: ast::Node<'_>) -> ast::AnyHasAttrs<'_> {
     ast::AnyHasAttrs::cast(node).unwrap_or_else(|| {
         panic!("a {:?} at {:?} holds no attributes", node.kind(), node.text_range())
     })
+}
+
+/// The [`AttrFlags`] of the items of one file's outline ([`crate::signatures::file_outline`]),
+/// for one crate's cfg: each item outside the bodies the outline leaves out and outside every
+/// const's, static's and fn's expression, but modules, whose attributes are also their
+/// declaration's and the crate's ([`attrs_source`]). Built in one walk of the outline, so an
+/// item's flags cost one binary search of `ids` once the column is built, and a body edit,
+/// which leaves the outline the same, runs nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FileAttrFlags {
+    /// Each item's erased ast id, ascending.
+    ids: Box<[u32]>,
+    /// Each item's flags, in the order of `ids`.
+    flags: Box<[AttrFlags]>,
+}
+
+impl FileAttrFlags {
+    /// The flags of the item `id`, if the column holds it.
+    #[inline]
+    fn get(&self, id: span::ErasedFileAstId) -> Option<AttrFlags> {
+        let at = self.ids.binary_search(&id.into_raw()).ok()?;
+        Some(self.flags[at])
+    }
+}
+
+/// The [`FileAttrFlags`] of `file` for `krate`'s cfg.
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
+fn file_attr_flags(db: &Db, file: EditionedFileId, krate: Crate) -> FileAttrFlags {
+    blaze_mem::frame::current(|frame| {
+        let (root, ast_id_map) = crate::signatures::outline_with_ids(db, file);
+        let mut cfg_options = None;
+        let mut cfg = || *cfg_options.get_or_insert_with(|| krate.cfg_options(db));
+        let mut items = Vec::new_in(frame);
+        outline_attr_owners(root, &mut |item| {
+            let ptr = ast::ptr(item);
+            let id = if item.kind() == SyntaxKind::VARIANT {
+                let ptr = syntax::AstPtr::<syntax::ast::Variant>::try_from_raw(ptr);
+                ast_id_map.ast_id_for_ptr(ptr.expect("a VARIANT is a variant")).erase()
+            } else {
+                let ptr = syntax::AstPtr::<syntax::ast::Item>::try_from_raw(ptr);
+                ast_id_map.ast_id_for_ptr(ptr.expect("an owner walked is an item")).erase()
+            };
+            let mut attr_flags = AttrFlags::empty();
+            let attrs = ast::attrs_including_inner(&any_has_attrs(item));
+            expand_cfg_attr_view(attrs, &mut cfg, |attr, _| match_attr_flags(&mut attr_flags, attr));
+            items.push((id.into_raw(), attr_flags));
+        });
+        items.sort_unstable_by_key(|&(id, _)| id);
+        FileAttrFlags {
+            // alloc: the memo's ids, exact
+            ids: items.iter().map(|&(id, _)| id).collect(),
+            // alloc: the memo's flags, exact
+            flags: items.iter().map(|&(_, flags)| flags).collect(),
+        }
+    })
+}
+
+/// Builds the [`FileAttrFlags`] of each of `files` for `krate`, one task a file on the
+/// database's workers ([`Db::run_all`]), so a pass that then reads them in order
+/// ([`CrateAttrFlags`]) finds them built. A built column is a memo hit.
+pub(crate) fn build_columns(db: &Db, krate: Crate, files: &[EditionedFileId]) {
+    db.run_all(blaze_mem::Tag::Nameres, files.len(), |db, at| {
+        _ = file_attr_flags(db, files[at], krate);
+    });
+}
+
+/// Each attribute owner [`FileAttrFlags`] holds under `node` (a file, or an item list in it),
+/// in order: the items of the file and of each inline module, impl, trait and extern block,
+/// and each enum's variants. No body is walked, so nothing here parses one.
+fn outline_attr_owners<'t, F: FnMut(ast::Node<'t>)>(node: ast::Node<'t>, owner: &mut F) {
+    for item in node.children() {
+        let list = match item.kind() {
+            SyntaxKind::MODULE => {
+                if let Some(list) = item.child_where(|kind| kind == SyntaxKind::ITEM_LIST) {
+                    outline_attr_owners(list, owner);
+                }
+                continue;
+            }
+            SyntaxKind::IMPL | SyntaxKind::TRAIT => Some(SyntaxKind::ASSOC_ITEM_LIST),
+            SyntaxKind::ENUM => Some(SyntaxKind::VARIANT_LIST),
+            SyntaxKind::EXTERN_BLOCK => Some(SyntaxKind::EXTERN_ITEM_LIST),
+            SyntaxKind::FN
+            | SyntaxKind::STRUCT
+            | SyntaxKind::UNION
+            | SyntaxKind::CONST
+            | SyntaxKind::STATIC
+            | SyntaxKind::TYPE_ALIAS
+            | SyntaxKind::MACRO_RULES
+            | SyntaxKind::MACRO_DEF
+            | SyntaxKind::EXTERN_CRATE
+            | SyntaxKind::USE
+            | SyntaxKind::VARIANT => None,
+            _ => continue,
+        };
+        owner(item);
+        if let Some(list) = list
+            && let Some(list) = item.child_where(|kind| kind == list)
+        {
+            outline_attr_owners(list, owner);
+        }
+    }
+}
+
+/// [`AttrFlags::query`] of `owner` off its file's [`FileAttrFlags`], `column` giving the column
+/// of a file for a crate; `None` for an owner no column holds (a module, an item in a body or
+/// written by a macro).
+#[inline]
+fn column_flags<'db>(
+    db: &'db Db,
+    owner: AttrDefId,
+    column: &mut impl FnMut(EditionedFileId, Crate) -> &'db FileAttrFlags,
+) -> Option<AttrFlags> {
+    #[inline]
+    fn of<'db, N: AstIdNode>(
+        db: &'db Db,
+        lookup: impl Lookup<Data = impl AstIdLoc<Ast = N> + HasModule>,
+        column: &mut impl FnMut(EditionedFileId, Crate) -> &'db FileAttrFlags,
+    ) -> Option<AttrFlags> {
+        let loc = lookup.lookup(db);
+        let id = loc.ast_id();
+        let HirFileId::FileId(file) = id.file_id else { return None };
+        column(file, loc.krate(db)).get(id.value.erase())
+    }
+    match owner {
+        AttrDefId::ModuleId(_) => None,
+        AttrDefId::AdtId(AdtId::StructId(it)) => of(db, it, column),
+        AttrDefId::AdtId(AdtId::UnionId(it)) => of(db, it, column),
+        AttrDefId::AdtId(AdtId::EnumId(it)) => of(db, it, column),
+        AttrDefId::FunctionId(it) => of(db, it, column),
+        AttrDefId::EnumVariantId(it) => of(db, it, column),
+        AttrDefId::StaticId(it) => of(db, it, column),
+        AttrDefId::ConstId(it) => of(db, it, column),
+        AttrDefId::TraitId(it) => of(db, it, column),
+        AttrDefId::TypeAliasId(it) => of(db, it, column),
+        AttrDefId::MacroId(MacroId::MacroRulesId(it)) => of(db, it, column),
+        AttrDefId::MacroId(MacroId::Macro2Id(it)) => of(db, it, column),
+        AttrDefId::MacroId(MacroId::ProcMacroId(it)) => of(db, it, column),
+        AttrDefId::ImplId(it) => of(db, it, column),
+        AttrDefId::ExternBlockId(it) => of(db, it, column),
+        AttrDefId::ExternCrateId(it) => of(db, it, column),
+        AttrDefId::UseId(it) => of(db, it, column),
+    }
+}
+
+/// The flags of `owner` walked off its syntax ([`attrs_source`]): what [`AttrFlags::query`]
+/// answers for an owner no [`FileAttrFlags`] holds, and what a column's entry equals.
+fn walked_flags(db: &Db, owner: AttrDefId) -> AttrFlags {
+    let mut attr_flags = AttrFlags::empty();
+    collect_attrs(db, owner, |attr| match_attr_flags(&mut attr_flags, attr));
+    attr_flags
+}
+
+/// [`AttrFlags::query`] of many items of one crate, read off their files' columns: a pass over
+/// a crate's items (`crate_lang_items`) reads each file's column once for a run of items of the
+/// file, depends on the columns, and runs no item's query. An owner no column holds is asked of
+/// [`AttrFlags::query`].
+pub(crate) struct CrateAttrFlags<'db> {
+    db: &'db Db,
+    last: Option<(EditionedFileId, Crate, &'db FileAttrFlags)>,
+}
+
+impl<'db> CrateAttrFlags<'db> {
+    pub(crate) fn new(db: &'db Db) -> Self {
+        CrateAttrFlags { db, last: None }
+    }
+
+    pub(crate) fn of(&mut self, owner: AttrDefId) -> AttrFlags {
+        let db = self.db;
+        let last = &mut self.last;
+        let mut column = |file: EditionedFileId, krate: Crate| match *last {
+            Some((last_file, last_crate, column)) if last_file == file && last_crate == krate => {
+                column
+            }
+            _ => {
+                let column = file_attr_flags(db, file, krate);
+                *last = Some((file, krate, column));
+                column
+            }
+        };
+        column_flags(db, owner, &mut column).unwrap_or_else(|| AttrFlags::query(db, owner))
+    }
+
+    /// [`AttrFlags::lang_item`] of `owner`, its flags read as [`CrateAttrFlags::of`] reads them.
+    pub(crate) fn lang_item(&mut self, owner: AttrDefId) -> Option<Symbol> {
+        self.of(owner).lang_item_with_attrs(self.db, owner)
+    }
 }
 
 /// The flags of a `#[doc(...)]`: the atoms [`DocAtom::parse`] reads, stepped through the same
@@ -1302,9 +1488,8 @@ fn extract_cfgs(
 impl AttrFlags {
     #[salsa::tracked(returns(copy), mem_tag = Nameres)]
     pub fn query(db: &Db, owner: AttrDefId) -> AttrFlags {
-        let mut attr_flags = AttrFlags::empty();
-        collect_attrs(db, owner, |attr| match_attr_flags(&mut attr_flags, attr));
-        attr_flags
+        let mut column = |file: EditionedFileId, krate: Crate| file_attr_flags(db, file, krate);
+        column_flags(db, owner, &mut column).unwrap_or_else(|| walked_flags(db, owner))
     }
 
     #[inline]
@@ -1360,27 +1545,41 @@ impl AttrFlags {
                 let mut cfg_options =
                     || *cfg_options.get_or_insert_with(|| def.krate(db).cfg_options(db));
 
-                let mut lifetimes = Vec::new_in(frame);
-                let lifetimes_source =
-                    HasChildSourceView::<LocalLifetimeParamId>::child_source_view(&def, db);
-                for (lifetime_id, lifetime) in lifetimes_source.value.iter() {
+                let mut flags_of = |attrs: ast::AstChildren<'_, ast::Attr<'_>>| {
                     let mut attr_flags = AttrFlags::empty();
-                    expand_cfg_attr_view(lifetime.attrs(), &mut cfg_options, |attr, _| {
+                    expand_cfg_attr_view(attrs, &mut cfg_options, |attr, _| {
                         match_attr_flags(&mut attr_flags, attr)
                     });
+                    attr_flags
+                };
+                // One walk of the written params, each zipped with its id in order, as
+                // `HasChildSourceView` finds one of them.
+                let generic_params = GenericParams::of(db, def);
+                let (_, list) = def.file_id_and_params_of_view(db);
+
+                let mut lifetimes = Vec::new_in(frame);
+                let lifetime_params = list.into_iter().flat_map(|it| it.lifetime_params());
+                for ((lifetime_id, _), lifetime) in generic_params.iter_lt().zip(lifetime_params) {
+                    let attr_flags = flags_of(lifetime.attrs());
                     if !attr_flags.is_empty() {
                         lifetimes.push((lifetime_id, attr_flags));
                     }
                 }
 
                 let mut type_and_consts = Vec::new_in(frame);
-                let type_and_consts_source =
-                    HasChildSourceView::<LocalTypeOrConstParamId>::child_source_view(&def, db);
-                for (type_or_const_id, type_or_const) in type_and_consts_source.value.iter() {
-                    let mut attr_flags = AttrFlags::empty();
-                    expand_cfg_attr_view(type_or_const.attrs(), &mut cfg_options, |attr, _| {
-                        match_attr_flags(&mut attr_flags, attr)
-                    });
+                let mut ids = generic_params.iter_type_or_consts().map(|(id, _)| id);
+                // For traits the first type index is `Self`, the trait itself.
+                if let GenericDefId::TraitId(id) = def
+                    && let Some(self_id) = ids.next()
+                {
+                    let attr_flags = flags_of(id.lookup(db).source_view(db).value.attrs());
+                    if !attr_flags.is_empty() {
+                        type_and_consts.push((self_id, attr_flags));
+                    }
+                }
+                let type_or_const_params = list.into_iter().flat_map(|it| it.type_or_const_params());
+                for (type_or_const_id, type_or_const) in ids.zip(type_or_const_params) {
+                    let attr_flags = flags_of(type_or_const.attrs());
                     if !attr_flags.is_empty() {
                         type_and_consts.push((type_or_const_id, attr_flags));
                     }

@@ -143,6 +143,10 @@ impl Lower<'_> {
                 }
             }
             ra::Pat::OrPat(p) => ast::PatKind::Or(p.pats().map(|f| self.pat_val(f)).collect()),
+            ra::Pat::GuardPat(p) => match (p.pat(), p.guard()) {
+                (Some(inner), Some(guard)) => ast::PatKind::Guard(self.pat(inner), self.guard(guard, span)),
+                _ => self.pat_kind_err(span),
+            },
             ra::Pat::MacroPat(p) => match p.macro_call() {
                 Some(mc) => ast::PatKind::MacCall(self.mac_call(mc)),
                 None => self.pat_kind_err(span),

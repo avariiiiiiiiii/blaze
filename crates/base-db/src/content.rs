@@ -78,14 +78,7 @@ pub(crate) fn len(hasher: &mut Hasher, len: usize) {
     hasher.update(&(len as u64).to_le_bytes());
 }
 
-pub(crate) fn opt(hasher: &mut Hasher, part: Option<&str>) {
-    match part {
-        None => hasher.update(&[0]),
-        Some(part) => hasher.update(&[1]).part(part.as_bytes()),
-    };
-}
-
-/// What [`opt`] hashes, appended to `out`.
+/// What [`Hasher::opt_part`] hashes, appended to `out`.
 pub(crate) fn opt_bytes(out: &mut Vec<u8>, part: Option<&str>) {
     match part {
         None => out.push(0),

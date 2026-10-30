@@ -3,14 +3,15 @@
 
 The stress workspace gets a second binary. The daemon is started for the first; each step edits
 files and then asks for one program or both by `blaze sync SOCKET --crate ...`. Every program
-asked for is run and compared with what `cargo build` of the same source prints.
+asked for is run and compared with what blaze's build of the same source from nothing
+(mixed.from_scratch) prints.
 """
 import os, shlex, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from mixed import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, from_scratch, printed
 
 TOOL_TOML = """[package]
 name = "stool"
@@ -38,7 +39,7 @@ fn main() {
 """
 MID, TOOL, APP = "mid/src/lib.rs", "tool/src/main.rs", "app/src/main.rs"
 AREA = "sbase::square!(self.side)"
-# (what the step is, [(file, old, new)], programs asked for in order, whether cargo rejects it)
+# (what the step is, [(file, old, new)], programs asked for in order, whether it is not Rust)
 STEPS = [
     ("nothing edited, the second program asked for first time", [], ["stool"], False),
     ("nothing edited, both again", [], ["sapp", "stool", "stool"], False),
@@ -50,9 +51,9 @@ STEPS = [
     ("the second catches up", [(TOOL, "n * 5", "n * 7")], ["stool", "sapp"], False),
     ("broken code both use", [(MID, AREA + " + 3", AREA + ' + "x"')], ["sapp", "stool", "sapp"], True),
     ("mended", [(MID, AREA + ' + "x"', AREA + " + 4")], ["stool", "sapp"], False),
-    # rustc parses a parenthesized macro call with no `;` after it as an expression, so the outer
-    # call's expansion, two calls with nothing between, does not parse (#154).
-    ("a macro of several statements in the parentheses of another's call, which rustc rejects",
+    # A parenthesized macro call with no `;` after it is an expression, so the outer call's
+    # expansion, two calls with nothing between, does not parse (#154).
+    ("a macro of several statements in the parentheses of another's call, which does not parse",
      [(MID, "        " + AREA + " + 4\n",
        "        macro_rules! twice {\n            ($($body:tt)*) => { $($body)* $($body)* };\n        }\n"
        "        let mut n = 0;\n        twice!(twice!(n += 1;));\n        " + AREA + " + 4 + n\n")],
@@ -78,7 +79,6 @@ def main():
     open(manifest, "w").write(members)
     work = tempfile.mkdtemp(prefix="blaze-programs-out-")
     socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
-    reference = os.path.join(work, "reference")
     crates = ["sapp", "sbase", "smid", "stool"]
     programs = {}
     for name in ("sapp", "stool"):
@@ -106,8 +106,19 @@ def main():
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
 
+    scratch_runs = {}
+
+    def from_nothing(name, step):
+        """What blaze's build of program `name` from nothing prints at a step."""
+        if (name, step) not in scratch_runs:
+            try:
+                scratch_runs[name, step] = printed(from_scratch(ws, [name, "sbase", "smid"], ["-p", name]))
+            except SystemExit as error:
+                return f"did not build from nothing: {str(error)[:200]}"
+        return scratch_runs[name, step]
+
     wrong = asked = 0
-    for what, edits, order, broken in STEPS:
+    for step, (what, edits, order, broken) in enumerate(STEPS):
         for path, old, new in edits:
             text = open(os.path.join(ws, path)).read()
             assert old in text, (what, old)
@@ -122,9 +133,6 @@ def main():
                  "--link-cmd", program["link"], *splice(program), *program["symbols"]], capture_output=True, text=True, timeout=120)
             took = (time.time() - began) * 1000
             reply = (reply.stdout + reply.stderr).strip()
-            cargo = subprocess.run(["cargo", "build", "-q", "-p", name, *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
-                                   env={**os.environ, "CARGO_TARGET_DIR": reference})
-            assert (cargo.returncode != 0) == broken, cargo.stderr[-2000:]
             if daemon.poll() is not None:
                 verdict = "DAEMON DIED"
             elif broken:
@@ -132,7 +140,7 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                verdict = "same" if run(program["bin"]) == run(built(reference, name)) else "DIFFERENT OUTPUT"
+                verdict = "same" if run(program["bin"]) == from_nothing(name, step) else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()
             print(f"    {name:6} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)

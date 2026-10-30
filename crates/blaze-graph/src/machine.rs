@@ -40,7 +40,7 @@ pub enum Pool {
 }
 
 /// A node to add. Its `deps` are added with it, in the same input in any order, or before.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] // clone: in an `Input` an opt-in trace keeps, and tests
 pub struct Spec {
     pub id: NodeId,
     pub kind: NodeKind,
@@ -60,14 +60,14 @@ pub struct Spec {
 }
 
 /// What came of a node's work.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] // clone: a memo's copy, allocating only for `Failed`
 pub enum Outcome {
     Built,
     Cached { remote: bool },
     Failed { why: String },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] // clone: only into a trace the caller asked for, and tests
 pub enum Input {
     /// Nodes the build has besides those it had.
     Add { at_ns: u64, nodes: Vec<Spec> },
@@ -108,7 +108,7 @@ pub struct Config {
 }
 
 /// An input the machine cannot take. The machine is as it was before it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     NoThreads(Pool),
     Twice(NodeId),
@@ -198,6 +198,16 @@ impl Machine {
     }
 
     pub fn step(&mut self, input: Input) -> Result<Vec<Output>, Error> {
+        // alloc: the step's outputs, the API's payload; `step_into` takes a kept buffer
+        let mut out = Vec::new();
+        self.step_into(input, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Machine::step`], with its outputs appended to `out`: a caller that keeps one buffer and
+    /// drains it gets them with no allocation per step. An input refused appends nothing and
+    /// changes nothing.
+    pub fn step_into(&mut self, input: Input, out: &mut Vec<Output>) -> Result<(), Error> {
         if self.over {
             return Err(Error::Over);
         }
@@ -210,23 +220,21 @@ impl Machine {
         };
         let mut said = std::mem::take(&mut self.said);
         let taken = self.plane.step_into(input, &mut said);
-        let outputs = taken.map(|()| {
-            said.drain(..)
-                .map(|output| match output {
-                    PlaneOutput::Said { record, .. } => Output::Said(record),
-                    PlaneOutput::Run { id, pool, .. } => Output::Run { id, pool },
-                    PlaneOutput::Finished { ok, .. } => {
-                        self.over = true;
-                        Output::Finished { ok }
-                    }
-                    PlaneOutput::Yield { id } => {
-                        unreachable!("node {id} asked to give way: the machine opens no idle request")
-                    }
-                })
-                // alloc: the step's outputs, the API's payload; the plane's own buffer is kept
-                .collect()
-        });
+        if taken.is_ok() {
+            out.extend(said.drain(..).map(|output| match output {
+                PlaneOutput::Said { record, .. } => Output::Said(record),
+                PlaneOutput::Run { id, pool, .. } => Output::Run { id, pool },
+                PlaneOutput::Finished { ok, .. } => {
+                    self.over = true;
+                    Output::Finished { ok }
+                }
+                PlaneOutput::Yield { id } => {
+                    unreachable!("node {id} asked to give way: the machine opens no idle request")
+                }
+            }));
+        }
+        said.clear();
         self.said = said;
-        outputs
+        taken
     }
 }

@@ -792,3 +792,22 @@ fn changed_bytes_read_as_the_old_codec_read_them() {
         same_lent(&response);
     }
 }
+
+/// The JSON rendering is the bytes serde_json writes, for every request and response: the
+/// same escapes, numbers and order, and the same lines through `line_into`.
+#[test]
+fn json_is_the_bytes_serde_json_wrote() {
+    let mut g = Gen { rng: SplitMix64::new(0x6a73_6f6e), plain: false };
+    let mut out = Vec::new();
+    for _ in 0..3000 {
+        let request = Envelope::new(g.wide(), g.request());
+        let expected = serde_json::to_string(&request).unwrap();
+        assert_eq!(crate::json::request(&request), expected, "{request:?}");
+        let response = Envelope::new(g.wide(), g.response(0));
+        let expected = serde_json::to_string(&response).unwrap();
+        assert_eq!(crate::json::response(&response), expected, "{response:?}");
+        out.clear();
+        crate::json::line_into(&mut out, &response);
+        assert_eq!(out, expected.as_bytes(), "{response:?}");
+    }
+}

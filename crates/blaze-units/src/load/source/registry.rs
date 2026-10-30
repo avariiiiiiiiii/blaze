@@ -17,8 +17,8 @@ use blaze_resolve::{
 };
 use rustc_hash::FxHashMap;
 
-use super::index::{Lines, index_summary};
 use super::{IndexFile, Sources};
+use crate::index::{Lines, index_summary};
 use crate::query::Fetch;
 
 const CANCELLED: &str = "the load was cancelled";

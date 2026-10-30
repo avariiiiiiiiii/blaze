@@ -5,6 +5,7 @@
 use std::sync::OnceLock;
 
 use blaze_codegen::{Data, Relocs, Target, Unwind};
+use blaze_format::cursor::Reader;
 use cranelift_codegen::{
     gimli::{
         self, RunTimeEndian,
@@ -16,7 +17,7 @@ use cranelift_codegen::{
     isa::TargetIsa,
 };
 
-use crate::unwind::{FunctionUnwind, UnwindParts};
+use crate::unwind::{FunctionUnwind, UnwindParts, eh_entry as entry};
 
 /// `unwind` as v2 keeps it, with the data of its landing pads, if it has any. `personality`
 /// is the target of the routine that reads them.
@@ -125,109 +126,32 @@ impl Entry {
     /// The CIE and then the FDE of `bytes`, with no augmentation and absolute 8-byte
     /// addresses, as [`Entry::of`] writes them.
     fn read(bytes: &[u8]) -> Result<Entry, String> {
-        let mut at = Reader { bytes, at: 0 };
-        let cie_end = at.length()?;
-        if at.u32()? != 0 {
+        let mut at = Reader::new(bytes);
+        let mut cie = entry(&mut at)?;
+        if cie.u32()? != 0 {
             return Err("the first entry is no CIE".to_owned()); // alloc: the error's message
         }
-        if at.u8()? != 1 {
+        if cie.u8()? != 1 {
             return Err("a CIE of another version than 1".to_owned()); // alloc: the error's message
         }
-        if at.u8()? != 0 {
+        if cie.u8()? != 0 {
             return Err("a CIE with an augmentation".to_owned()); // alloc: the error's message
         }
         // alloc: the error's message
-        let code_align = u32::try_from(at.uleb()?).map_err(|e| e.to_string())?;
+        let code_align = u32::try_from(cie.uleb()?).map_err(|e| e.to_string())?;
         // alloc: the error's message
-        let data_align = i32::try_from(at.sleb()?).map_err(|e| e.to_string())?;
-        let return_address = u16::from(at.u8()?);
-        let cie = at.take(cie_end)?.to_vec(); // alloc: once per process, by `common`
-        let fde_end = at.length()?;
-        at.u32()?;
+        let data_align = i32::try_from(cie.sleb()?).map_err(|e| e.to_string())?;
+        let return_address = u16::from(cie.u8()?);
+        let cie = cie.take_rest().to_vec(); // alloc: once per process, by `common`
+        let mut fde = entry(&mut at)?;
+        fde.u32()?;
         // Where the function starts and how long it is: the linker's to write.
-        at.skip(16)?;
-        let fde = at.take(fde_end)?.to_vec(); // alloc: once per process, by `common`
-        if at.at != bytes.len() {
+        fde.skip(16)?;
+        let fde = fde.take_rest().to_vec(); // alloc: once per process, by `common`
+        if !at.is_done() {
             return Err("more than one CIE and one FDE".to_owned()); // alloc: the error's message
         }
         Ok(Entry { code_align, data_align, return_address, cie, fde })
-    }
-}
-
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl Reader<'_> {
-    fn u8(&mut self) -> Result<u8, String> {
-        let byte = *self.bytes.get(self.at).ok_or("the entry ends early")?;
-        self.at += 1;
-        Ok(byte)
-    }
-
-    fn u32(&mut self) -> Result<u32, String> {
-        let bytes = self.bytes.get(self.at..self.at + 4).ok_or("the entry ends early")?;
-        self.at += 4;
-        Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
-    }
-
-    /// The end of the entry whose length is next.
-    fn length(&mut self) -> Result<usize, String> {
-        let length = self.u32()?;
-        if length == u32::MAX {
-            return Err("a 64-bit entry".to_owned()); // alloc: the error's message
-        }
-        Ok(self.at + length as usize)
-    }
-
-    fn skip(&mut self, count: usize) -> Result<(), String> {
-        if self.at + count > self.bytes.len() {
-            return Err("the entry ends early".to_owned()); // alloc: the error's message
-        }
-        self.at += count;
-        Ok(())
-    }
-
-    fn take(&mut self, end: usize) -> Result<&[u8], String> {
-        let bytes = self.bytes.get(self.at..end).ok_or("the entry ends early")?;
-        self.at = end;
-        Ok(bytes)
-    }
-
-    fn uleb(&mut self) -> Result<u64, String> {
-        let (mut value, mut shift) = (0u64, 0u32);
-        loop {
-            let byte = self.u8()?;
-            if shift >= 64 {
-                // alloc: the error's message
-                return Err("a LEB128 of more than 64 bits".to_owned());
-            }
-            value |= u64::from(byte & 0x7f) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-        }
-    }
-
-    fn sleb(&mut self) -> Result<i64, String> {
-        let (mut value, mut shift) = (0i64, 0u32);
-        loop {
-            let byte = self.u8()?;
-            if shift >= 64 {
-                // alloc: the error's message
-                return Err("a LEB128 of more than 64 bits".to_owned());
-            }
-            value |= i64::from(byte & 0x7f) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                if shift < 64 && byte & 0x40 != 0 {
-                    value |= -1i64 << shift;
-                }
-                return Ok(value);
-            }
-        }
     }
 }
 

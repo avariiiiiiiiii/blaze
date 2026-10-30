@@ -10,6 +10,7 @@
 //! `rustc_mir_dataflow` reaches by joining whole sets (it is unique), at a cost of the bits
 //! that change, not the rows times the passes.
 
+use blaze_ids::bits::Ones;
 use hir_ty_mir::mir::BasicBlockId;
 
 use crate::{
@@ -52,6 +53,64 @@ impl<'f> WorkQueue<'f> {
         let it = self.queue.pop_front()?;
         self.queued[index(it)] = false;
         Some(it)
+    }
+}
+
+/// A bit per line of each block's pending row: the lines that may hold bits not yet sent, so a
+/// visit reads those lines and not the whole row.
+struct Marks<'f> {
+    per: usize,
+    bits: &'f mut [u64],
+}
+
+impl<'f> Marks<'f> {
+    fn new(frame: &'f Frame, rows: usize, lines: usize) -> Self {
+        let per = lines.div_ceil(64);
+        Marks { per, bits: frame.alloc_slice_fill_with(rows * per, |_| 0) }
+    }
+
+    #[inline]
+    fn mark(&mut self, row: usize, line: usize) {
+        self.bits[row * self.per + line / 64] |= 1 << (line % 64);
+    }
+
+    /// Moves row `row`'s marks into `into`, a row's length.
+    #[inline]
+    fn take(&mut self, row: usize, into: &mut [u64]) {
+        for (into, from) in into.iter_mut().zip(&mut self.bits[row * self.per..][..self.per]) {
+            *into = std::mem::take(from);
+        }
+    }
+}
+
+/// Marks in `into` the lines of the words of an effect row.
+#[inline]
+fn mark_lines(into: &mut [u64], words: &[u32]) {
+    for &word in words {
+        let line = word as usize / LINE;
+        into[line / 64] |= 1 << (line % 64);
+    }
+}
+
+/// The lines a visit of a block reads: those its pending row marks, and on its first visit
+/// also those its effect and its edges' effects gen in, which go once whatever arrives.
+#[inline]
+fn visit_lines<'e>(
+    marks: &mut Marks<'_>,
+    row: usize,
+    now: &mut [u64],
+    first: bool,
+    transfer: &Triples<'_>,
+    edges: &[(BasicBlockId, Along<'e>)],
+) {
+    marks.take(row, now);
+    if first {
+        mark_lines(now, transfer.words);
+        for (_, along) in edges {
+            if let Along::Effect(it) = along {
+                mark_lines(now, it.words);
+            }
+        }
     }
 }
 
@@ -152,10 +211,15 @@ pub(super) fn forward_in<'f, 'e, S: Store<'f>>(
         return entry;
     }
     let mut pending = S::new(frame, count, words);
+    let mut marks = Marks::new(frame, count, lines);
+    let now = frame.alloc_slice_fill_with(marks.per, |_| 0u64);
     for line in 0..lines {
         let bits = line_of(boundary, line);
-        entry.merge(index(start), line, &bits);
-        pending.merge(index(start), line, &bits);
+        if bits != ZERO_LINE {
+            entry.merge(index(start), line, &bits);
+            pending.merge(index(start), line, &bits);
+            marks.mark(index(start), line);
+        }
     }
     let visited = frame.alloc_slice_fill_with(count, |_| false);
     let mut out: FVec<'_, (BasicBlockId, Along<'e>)> = FVec::new_in(frame);
@@ -166,7 +230,8 @@ pub(super) fn forward_in<'f, 'e, S: Store<'f>>(
         out.extend(cfg.successors(at).iter().map(|&to| (to, Along::of(edge(at, to)))));
         let (words, bits) = blocks.of(index(at));
         let mut transfer = Triples { words, bits };
-        for line in 0..lines {
+        visit_lines(&mut marks, index(at), now, first, &transfer, &out);
+        for line in Ones::<usize>::new(&*now) {
             let mut sent = ZERO_LINE;
             pending.take(index(at), line, &mut sent);
             transfer.line(line, &mut sent, first);
@@ -179,6 +244,7 @@ pub(super) fn forward_in<'f, 'e, S: Store<'f>>(
                 let new = entry.merge(index(*to), line, &bits);
                 if new != ZERO_LINE {
                     pending.merge(index(*to), line, &new);
+                    marks.mark(index(*to), line);
                     queue.push(*to);
                 }
             }
@@ -218,6 +284,8 @@ pub(super) fn backward_in<'f, 'e, S: Store<'f>>(
     }
     // What has reached each block's exit and not yet been through it.
     let mut pending = S::new(frame, count, words);
+    let mut marks = Marks::new(frame, count, lines);
+    let now = frame.alloc_slice_fill_with(marks.per, |_| 0u64);
     let visited = frame.alloc_slice_fill_with(count, |_| false);
     let mut into: FVec<'_, (BasicBlockId, Along<'e>)> = FVec::new_in(frame);
     let mut queue = WorkQueue::new(frame, count, cfg.order.iter().rev().copied());
@@ -232,7 +300,8 @@ pub(super) fn backward_in<'f, 'e, S: Store<'f>>(
         );
         let (words, bits) = blocks.of(index(at));
         let mut transfer = Triples { words, bits };
-        for line in 0..lines {
+        visit_lines(&mut marks, index(at), now, first, &transfer, &into);
+        for line in Ones::<usize>::new(&*now) {
             let mut exit = ZERO_LINE;
             pending.take(index(at), line, &mut exit);
             transfer.line(line, &mut exit, first);
@@ -244,6 +313,7 @@ pub(super) fn backward_in<'f, 'e, S: Store<'f>>(
                 let mut bits = new;
                 along.line(line, &mut bits, first);
                 if pending.merge(index(*from), line, &bits) != ZERO_LINE {
+                    marks.mark(index(*from), line);
                     queue.push(*from);
                 }
             }
@@ -573,6 +643,31 @@ mod tests {
             let backward = naive_backward(case);
             assert_eq!(forward_case::<Lined<'_>>(frame, case), forward, "round {round}");
             assert_eq!(backward_case::<Lined<'_>>(frame, case), backward, "round {round}");
+        });
+    }
+
+    /// Both fixpoints over a large domain, rows lined and lines marked, take nothing from the
+    /// global allocator: every buffer is in the frame.
+    #[test]
+    fn a_fixpoint_takes_no_global_memory() {
+        rounds(0x6a09_e667_f3bc_c908, 20, 40, 3000, |frame, _, case| {
+            let blocks = composed(frame, case, false);
+            let back = composed(frame, case, true);
+            let words = blocks.words();
+            let edges = edges(frame, case, words);
+            let mut boundary = vec![0u64; words];
+            for &it in &case.boundary {
+                boundary[it / 64] |= 1 << (it % 64);
+            }
+            blaze_alloc_count::assert_at_most(0, "a forward and a backward fixpoint", || {
+                let _: Lined<'_> =
+                    forward_in(frame, &case.cfg, &blocks, block(0), &boundary, |from, to| {
+                        edge(case, &edges, index(from), index(to))
+                    });
+                let _: Lined<'_> = backward_in(frame, &case.cfg, &back, |from, to| {
+                    edge(case, &edges, index(from), index(to))
+                });
+            });
         });
     }
 

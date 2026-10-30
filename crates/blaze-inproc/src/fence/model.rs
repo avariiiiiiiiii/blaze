@@ -596,19 +596,7 @@ fn explore(config: Config) -> Result<Explored, String> {
 
     // Liveness: every state reaches one where the range is freed (backwards from those).
     let count = states.len();
-    let mut starts = vec![0u32; count + 1];
-    for &(_, to) in &edges {
-        starts[to as usize + 1] += 1;
-    }
-    for at in 0..count {
-        starts[at + 1] += starts[at];
-    }
-    let mut fill = starts.clone();
-    let mut from = vec![0u32; edges.len()];
-    for &(source, to) in &edges {
-        from[fill[to as usize] as usize] = source;
-        fill[to as usize] += 1;
-    }
+    let sources = blaze_radix::Csr::build(count, edges.iter().map(|&(source, to)| (to, source)));
     let mut reaches = vec![false; count];
     let mut work: Vec<u32> = Vec::new();
     for (at, state) in states.iter().enumerate() {
@@ -618,7 +606,7 @@ fn explore(config: Config) -> Result<Explored, String> {
         }
     }
     while let Some(at) = work.pop() {
-        for &source in &from[starts[at as usize] as usize..starts[at as usize + 1] as usize] {
+        for &source in sources.row(at as usize) {
             if !reaches[source as usize] {
                 reaches[source as usize] = true;
                 work.push(source);

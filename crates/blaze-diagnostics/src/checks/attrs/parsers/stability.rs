@@ -23,15 +23,19 @@
 //! `compiler/rustc_passes/src/diagnostics.rs`; and `compiler/rustc_ast/src/util/literal.rs`
 //! (`escape_string_symbol`, `LitKind`'s `Display`) (MIT or Apache-2.0).
 
-use std::num::{IntErrorKind, NonZeroU32};
+use std::{
+    cell::{OnceCell, RefCell},
+    num::{IntErrorKind, NonZeroU32},
+};
 
 use blaze_ids::radix;
 use cfg::CfgAtom;
+use either::Either;
 use hir::{HirFileId, InFile, ModuleDef};
 use hir_def::{Lookup as _, UseId};
 use hir_expand::MacroCallKind;
 use intern::sym;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self as ast, AstNode as _},
@@ -883,6 +887,10 @@ struct Missing<'a> {
     test: bool,
     effective: &'a Effective,
     uses: FxHashMap<(HirFileId, TextSize), UseId>,
+    /// The node of each of the crate's reachable definitions but its `use`s and its root, made
+    /// the first time [`Missing::reachable`] asks: one probe per question, where mapping each
+    /// node to its definition costs a `to_def`.
+    nodes: OnceCell<FxHashSet<InFile<SyntaxNodePtr>>>,
 }
 
 impl<'a> Missing<'a> {
@@ -896,7 +904,12 @@ impl<'a> Missing<'a> {
                 uses.insert((loc.id.file_id, loc.id.to_ptr(db).text_range().start()), use_);
             }
         }
-        Missing { test: cx.krate.cfg(db).check_atom(&CfgAtom::Flag(sym::test)), effective: cx.effective(), uses }
+        Missing {
+            test: cx.krate.cfg(db).check_atom(&CfgAtom::Flag(sym::test)),
+            effective: cx.effective(),
+            uses,
+            nodes: OnceCell::new(),
+        }
     }
 
     /// What rustc's visitor checks of `def`, in its order: `check_missing_stability` of every
@@ -972,35 +985,78 @@ impl<'a> Missing<'a> {
 
     /// rustc's `is_reachable` of `def`: another crate can name it or use it through what it can
     /// name. An `extern crate` and a global `asm!` have no effective visibility.
+    ///
+    /// A node of a definition's kind is the source of one definition, the one `to_def` gives,
+    /// so it is reachable when it is among [`Missing::nodes`]; a procedural macro's `fn` is the
+    /// function's node there, not the macro's, as `to_def` of an `ast::Fn` gives the function.
     fn reachable<'db>(&self, cx: &Cx<'_, 'db>, def: &Def<'db>) -> bool {
         let node = def.node;
-        macro_rules! def_of {
-            ($ast:ty) => {
-                <$ast>::cast(node.value).and_then(|it| cx.vsema.to_def(it))
-            };
+        match def.target {
+            Target::Crate => {
+                self.effective.is_reachable(EffectiveDef::Item(ModuleDef::Module(cx.krate.root_module(cx.db))))
+            }
+            Target::Use => (self.uses.get(&(node.file_id, node.value.text_range().start())))
+                .is_some_and(|&it| self.effective.is_reachable(EffectiveDef::Use(it))),
+            Target::Mod
+            | Target::Fn
+            | Target::Method(_)
+            | Target::ForeignFn
+            | Target::Struct
+            | Target::Enum
+            | Target::Union
+            | Target::Trait
+            | Target::TraitAlias
+            | Target::Const
+            | Target::AssocConst
+            | Target::Static
+            | Target::ForeignStatic
+            | Target::TyAlias
+            | Target::AssocTy
+            | Target::ForeignTy
+            | Target::Variant
+            | Target::Field
+            | Target::Impl { .. }
+            | Target::MacroDef => self.nodes.get_or_init(|| reachable_nodes(cx, self.effective)).contains(&def.ptr()),
+            _ => false,
         }
-        let found = match def.target {
-            Target::Crate => Some(EffectiveDef::Item(ModuleDef::Module(cx.krate.root_module(cx.db)))),
-            Target::Mod => def_of!(ast::Module).map(|it| EffectiveDef::Item(it.into())),
-            Target::Fn | Target::Method(_) | Target::ForeignFn => def_of!(ast::Fn).map(|it| EffectiveDef::Item(it.into())),
-            Target::Struct | Target::Enum | Target::Union => def_of!(ast::Adt).map(|it| EffectiveDef::Item(it.into())),
-            Target::Trait | Target::TraitAlias => def_of!(ast::Trait).map(|it| EffectiveDef::Item(it.into())),
-            Target::Const | Target::AssocConst => def_of!(ast::Const).map(|it| EffectiveDef::Item(it.into())),
-            Target::Static | Target::ForeignStatic => def_of!(ast::Static).map(|it| EffectiveDef::Item(it.into())),
-            Target::TyAlias | Target::AssocTy | Target::ForeignTy => {
-                def_of!(ast::TypeAlias).map(|it| EffectiveDef::Item(it.into()))
-            }
-            Target::Variant => def_of!(ast::Variant).map(|it| EffectiveDef::Item(ModuleDef::EnumVariant(it))),
-            Target::Field => def_of!(ast::RecordField).or_else(|| def_of!(ast::TupleField)).map(EffectiveDef::Field),
-            Target::Impl { .. } => def_of!(ast::Impl).map(EffectiveDef::Impl),
-            Target::MacroDef => def_of!(ast::Macro).map(|it| EffectiveDef::Item(ModuleDef::Macro(it))),
-            Target::Use => {
-                self.uses.get(&(node.file_id, node.value.text_range().start())).map(|&it| EffectiveDef::Use(it))
-            }
-            _ => None,
-        };
-        found.is_some_and(|it| self.effective.is_reachable(it))
     }
+}
+
+/// The node of each of the crate's reachable definitions, as `to_def` maps it back: a module's
+/// `mod` item, a macro's `macro_rules!` or `macro` (a procedural macro's `fn` is its
+/// function's), a field's declaration. A `use` and the crate's root are asked of [`Effective`]
+/// directly; a derive's impl has no node.
+fn reachable_nodes(cx: &Cx<'_, '_>, effective: &Effective) -> FxHashSet<InFile<SyntaxNodePtr>> {
+    fn ptr<'db, N: ast::AstNode<'db>>(it: Option<InFile<N>>) -> Option<InFile<SyntaxNodePtr>> {
+        it.map(|it| it.map(|it| ast::ptr(it.syntax())))
+    }
+    let db = cx.db;
+    // alloc: once per `staged_api` crate (the standard library), the reachable definitions
+    let mut nodes = FxHashSet::default();
+    for def in effective.reachable_local() {
+        let node = match def {
+            EffectiveDef::Item(item) => match item {
+                ModuleDef::Module(it) => ptr(it.declaration_source_view(db)),
+                ModuleDef::Function(it) => ptr(cx.vsema.source(it)),
+                ModuleDef::Adt(it) => ptr(cx.vsema.source(it)),
+                ModuleDef::EnumVariant(it) => ptr(cx.vsema.source(it)),
+                ModuleDef::Const(it) => ptr(cx.vsema.source(it)),
+                ModuleDef::Static(it) => ptr(cx.vsema.source(it)),
+                ModuleDef::Trait(it) => ptr(cx.vsema.source(it)),
+                ModuleDef::TypeAlias(it) => ptr(cx.vsema.source(it)),
+                ModuleDef::Macro(it) => match cx.vsema.source(it) {
+                    Some(InFile { file_id, value: Either::Left(mac) }) => ptr(Some(InFile::new(file_id, mac))),
+                    _ => None,
+                },
+                ModuleDef::BuiltinType(_) => None,
+            },
+            EffectiveDef::Field(it) => ptr(cx.vsema.source(it)),
+            EffectiveDef::Impl(it) => ptr(cx.vsema.source(it)),
+            EffectiveDef::Use(_) => None,
+        };
+        nodes.extend(node);
+    }
+    nodes
 }
 
 /// `MissingStabilityAttr`.
@@ -1151,6 +1207,9 @@ struct Defs<'a, 'c, 'db> {
     deprecation: FxHashMap<InFile<SyntaxNodePtr>, Option<usize>>,
     /// Each module, in the order its first definition comes.
     modules: FxHashMap<InFile<SyntaxNodePtr>, usize>,
+    /// [`Defs::parent`] of each definition asked about: `order_key`, the lookups and the
+    /// annotation kind each ask it, so each definition's ancestors are walked once.
+    parents: RefCell<FxHashMap<InFile<SyntaxNodePtr>, Option<Def<'db>>>>,
 }
 
 impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
@@ -1193,6 +1252,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             stability: FxHashMap::default(),
             deprecation: FxHashMap::default(),
             modules,
+            parents: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -1209,6 +1269,17 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
     /// declaration and through an expansion to where the macro is called. What a derive makes
     /// is beside the item it derives from, in that item's parent.
     fn parent(&self, def: &Def<'db>) -> Option<Def<'db>> {
+        let ptr = def.ptr();
+        if let Some(&parent) = self.parents.borrow().get(&ptr) {
+            return parent;
+        }
+        let parent = self.walk_to_parent(def);
+        self.parents.borrow_mut().insert(ptr, parent);
+        parent
+    }
+
+    /// [`Defs::parent`], found by walking up from `def`.
+    fn walk_to_parent(&self, def: &Def<'db>) -> Option<Def<'db>> {
         let mut file = def.node.file_id;
         if def.node.value.kind() == SyntaxKind::SOURCE_FILE
             && file != self.crate_root
@@ -1546,6 +1617,96 @@ mod tests {
         assert_eq!(&text[crate_range(parse.root())], "fn f() {}\n/// trailing");
         let parse = syntax::SourceFile::parse("// only\n", span::Edition::CURRENT);
         assert_eq!(crate_range(parse.root()), TextRange::empty(0.into()));
+    }
+
+    /// Every kind of definition the missing-stability check asks about, public and private,
+    /// reachable through a signature only, in a block, and of the three kinds of macro.
+    const DEFINITIONS: &str = r#"
+#![feature(staged_api, decl_macro, extern_types)]
+#![stable(feature = "s", since = "1.0.0")]
+pub fn unmarked() {}
+fn private() {}
+pub struct S { pub a: u8, b: u8 }
+pub struct T(pub u8, u8);
+struct Hidden;
+pub enum E { A, B(u8), C { x: u8 } }
+pub trait Tr { fn m(&self); type A; const C: u8; }
+impl Tr for S { fn m(&self) {} type A = u8; const C: u8 = 0; }
+impl S { pub fn new() -> S { S { a: 0, b: 0 } } fn p(&self) {} }
+impl Hidden { pub fn q() {} }
+pub mod m { pub fn f() {} pub(crate) fn g() {} mod inner { pub fn h() {} } }
+mod private_mod { pub struct Leak; pub fn unleaked() {} }
+pub fn leak() -> private_mod::Leak { private_mod::Leak }
+#[macro_export] macro_rules! mac { () => () }
+macro_rules! local { () => () }
+pub macro m2() {}
+pub type Alias = u8;
+pub static ST: u8 = 0;
+pub const CO: u8 = 0;
+extern "C" { pub fn ext(); pub static EXT: u8; pub type Opaque; }
+pub fn with_block() { fn inner() {} struct InBlock; }
+pub union U { pub a: u8 }
+pub trait Alias2 = Tr;
+"#;
+
+    /// `Missing::reachable` as it was: each node mapped to its definition by `to_def`, then
+    /// asked of `Effective`.
+    fn plain_reachable<'db>(cx: &Cx<'_, 'db>, missing: &Missing<'_>, def: &Def<'db>) -> bool {
+        let node = def.node;
+        macro_rules! def_of {
+            ($ast:ty) => {
+                <$ast>::cast(node.value).and_then(|it| cx.vsema.to_def(it))
+            };
+        }
+        let found = match def.target {
+            Target::Crate => Some(EffectiveDef::Item(ModuleDef::Module(cx.krate.root_module(cx.db)))),
+            Target::Mod => def_of!(ast::Module).map(|it| EffectiveDef::Item(it.into())),
+            Target::Fn | Target::Method(_) | Target::ForeignFn => def_of!(ast::Fn).map(|it| EffectiveDef::Item(it.into())),
+            Target::Struct | Target::Enum | Target::Union => def_of!(ast::Adt).map(|it| EffectiveDef::Item(it.into())),
+            Target::Trait | Target::TraitAlias => def_of!(ast::Trait).map(|it| EffectiveDef::Item(it.into())),
+            Target::Const | Target::AssocConst => def_of!(ast::Const).map(|it| EffectiveDef::Item(it.into())),
+            Target::Static | Target::ForeignStatic => def_of!(ast::Static).map(|it| EffectiveDef::Item(it.into())),
+            Target::TyAlias | Target::AssocTy | Target::ForeignTy => {
+                def_of!(ast::TypeAlias).map(|it| EffectiveDef::Item(it.into()))
+            }
+            Target::Variant => def_of!(ast::Variant).map(|it| EffectiveDef::Item(ModuleDef::EnumVariant(it))),
+            Target::Field => def_of!(ast::RecordField).or_else(|| def_of!(ast::TupleField)).map(EffectiveDef::Field),
+            Target::Impl { .. } => def_of!(ast::Impl).map(EffectiveDef::Impl),
+            Target::MacroDef => def_of!(ast::Macro).map(|it| EffectiveDef::Item(ModuleDef::Macro(it))),
+            Target::Use => {
+                missing.uses.get(&(node.file_id, node.value.text_range().start())).map(|&it| EffectiveDef::Use(it))
+            }
+            _ => None,
+        };
+        found.is_some_and(|it| missing.effective.is_reachable(it))
+    }
+
+    /// Asking a node's reachability of the set of reachable definitions' nodes gives what
+    /// `to_def` and `Effective` give, at every definition the check visits.
+    #[test]
+    fn reachable_by_node_is_reachable_by_to_def() {
+        crate::lower::break_outside_of_loop::tests::with_file(DEFINITIONS, |cx, _| {
+            let root = cx.krate.root_module(cx.db).as_source_file_id(cx.db).expect("the crate's root is a file");
+            let crate_root = HirFileId::from(root);
+            let missing = Missing::new(cx);
+            let (mut compared, mut reachable) = (0, 0);
+            for tree in &cx.walk().trees {
+                for node in tree.of_kind(is_def_kind) {
+                    let node = InFile::new(tree.file, node);
+                    let Some(target) = Target::of(cx, node, crate_root) else { continue };
+                    if !is_def(target) {
+                        continue;
+                    }
+                    let def = Def { node, target };
+                    let by_node = missing.reachable(cx, &def);
+                    assert_eq!(by_node, plain_reachable(cx, &missing, &def), "at {target:?} {:?}", node.value);
+                    compared += 1;
+                    reachable += usize::from(by_node);
+                }
+            }
+            assert!(compared >= 40, "the fixture has about 55 definitions: {compared}");
+            assert!(reachable >= 15, "and reachable ones among them: {reachable}");
+        });
     }
 
     #[test]

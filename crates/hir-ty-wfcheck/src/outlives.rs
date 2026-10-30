@@ -387,11 +387,23 @@ pub(crate) fn trait_needs<'db, A: Allocator>(
     ty: Ty<'db>,
     out: &mut Vec<Needs<'db>, A>,
 ) {
+    let mut predicates = Vec::new_in(wfcx.frame);
+    trait_predicates(db, wfcx.frame, ty, &mut predicates);
+    prove_needs(wfcx, &predicates, out);
+}
+
+/// The predicates [`trait_needs`] proves: the trait of each projection in `ty`, and the trait
+/// and projection predicates of each struct or enum, instantiated.
+pub(crate) fn trait_predicates<'db, A: Allocator>(
+    db: &'db Db,
+    frame: &Frame,
+    ty: Ty<'db>,
+    predicates: &mut Vec<hir_ty::next_solver::Predicate<'db>, A>,
+) {
     use rustc_type_ir::inherent::Clause as _;
     let interner = DbInterner::new_no_crate(db);
-    let mut tys = Vec::new_in(wfcx.frame);
+    let mut tys = Vec::new_in(frame);
     walk(ty, &mut tys);
-    let mut predicates = Vec::new_in(wfcx.frame);
     for it in tys {
         if it.has_escaping_bound_vars() || it.references_error() {
             continue;
@@ -419,7 +431,6 @@ pub(crate) fn trait_needs<'db, A: Allocator>(
             _ => (),
         }
     }
-    prove_needs(wfcx, &predicates, out);
 }
 
 fn trait_predicate<'db>(
@@ -595,6 +606,43 @@ fn prove_needs<'db, A: Allocator>(
     let (interner, infcx, env) = (wfcx.interner, wfcx.infcx(), wfcx.env());
     let (obligations_before, constraints_before) = wfcx.mark();
     for &predicate in predicates {
+        let obligation = Obligation::new(interner, ObligationCause::dummy(), env, predicate);
+        // A global predicate names none of the item's parameters or regions, so all its proof
+        // can need is that a global type or `'static` outlives `'static`, which holds: only
+        // whether it holds matters, which the solver's evaluation (its global cache) answers
+        // without a fulfillment context.
+        if predicate.is_global() {
+            if !infcx.predicate_must_hold_modulo_regions(&obligation) {
+                return;
+            }
+            continue;
+        }
+        let mut ocx = ObligationCtxt::new(infcx);
+        ocx.register_obligation(obligation);
+        if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
+            return;
+        }
+    }
+    wfcx.needs_since((obligations_before, constraints_before), out);
+}
+
+/// [`prove_needs`] as it was: every predicate proven in a fulfillment context of its own.
+#[cfg(test)]
+pub(crate) fn prove_needs_reference<'db, A: Allocator>(
+    wfcx: &Wfcx<'_, 'db>,
+    predicates: &[hir_ty::next_solver::Predicate<'db>],
+    out: &mut Vec<Needs<'db>, A>,
+) {
+    use hir_ty::next_solver::{
+        infer::traits::{Obligation, ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    };
+    if predicates.is_empty() {
+        return;
+    }
+    let (interner, infcx, env) = (wfcx.interner, wfcx.infcx(), wfcx.env());
+    let mark = wfcx.mark();
+    for &predicate in predicates {
         let mut ocx = ObligationCtxt::new(infcx);
         ocx.register_obligation(Obligation::new(
             interner,
@@ -606,7 +654,7 @@ fn prove_needs<'db, A: Allocator>(
             return;
         }
     }
-    wfcx.needs_since((obligations_before, constraints_before), out);
+    wfcx.needs_since(mark, out);
 }
 
 /// rustc's `inferred_outlives_of` the ADTs a check comes across: what each one's fields need

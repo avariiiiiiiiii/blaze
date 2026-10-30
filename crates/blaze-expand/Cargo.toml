@@ -14,10 +14,8 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-postcard.workspace = true
 ra-ap-rustc_lexer.workspace = true
 rustc-hash.workspace = true
-serde.workspace = true
 
 # The `proc_macro` of the in-process bridge (`src/native/proc_macro/`).
 native-proc-macro.workspace = true

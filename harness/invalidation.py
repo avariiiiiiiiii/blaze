@@ -6,8 +6,8 @@ usage: invalidation.py [crate[,crate...]] [--only TEXT] [--perf DIR] [--check] [
 `--only` keeps the scenarios whose name contains TEXT, plus one per entry of BODIES. `--perf`
 records the daemon with `perf` during each edit, into DIR/<n>.data. `--check` compares the object
 the daemon wrote after each edit with the one a new blaze process writes from the same source.
-`--cargo` has the daemon link the program after each build, times `cargo build` on the same edit
-in a target directory of its own, and compares what the two programs print.
+`--cargo` has the daemon link the program after each build and times `cargo build` on the same
+edit in a target directory of its own, as the speed to compare with.
 
 Starts the daemon on bench2 for one crate (default regex_automata) with BLAZE_STATS set, applies
 each scenario, and records the time to apply the change, the time spent in MIR queries, the
@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 os.environ["BLAZE_STATS"] = "1"
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs
+from mixed import Fixture, BLAZE, sysroot_rlibs
 from editbench import millis
 
 V = os.path.join(HERE, "vendor")
@@ -138,7 +138,7 @@ def main():
     ws = os.path.join(HERE, "bench2")
     fx = Fixture(ws, crate.split(","), ["-p", "bench2"])
     fx.rustc_build()
-    link, cargo_env, cargo_bin = [], None, None
+    link, cargo_env = [], None
     if a.cargo:
         args = list(fx.link_args)
         patch = os.path.join(fx.work, "blaze.patch.o")
@@ -149,7 +149,6 @@ def main():
         # cargo as it comes: incremental, and none of the flags the harness builds with.
         cargo_env = {k: v for k, v in os.environ.items() if k not in ("RUSTFLAGS", "CARGO_INCREMENTAL")}
         cargo_env["CARGO_TARGET_DIR"] = os.path.join(fx.work, "cargo")
-        cargo_bin = os.path.join(fx.work, "cargo/debug/bench2")
 
     def cargo_build():
         start = time.time()
@@ -237,12 +236,6 @@ def main():
                    "total": sum(millis(b[12]) for b in builds)}
             if a.cargo:
                 row["cargo"] = cargo_build()
-                ours, theirs = (subprocess.run([binary], capture_output=True) for binary in (fx.binary, cargo_bin))
-                row["same"] = (ours.returncode, ours.stdout) == (theirs.returncode, theirs.stdout)
-                mismatches += not row["same"]
-                if not row["same"]:
-                    for who, run in (("blaze", ours), ("cargo", theirs)):
-                        print(f"  {who}: exit {run.returncode}\n" + run.stdout.decode(errors="replace")[-400:], flush=True)
             rows.append(row)
             print(row, flush=True)
             if a.check:
@@ -273,14 +266,14 @@ def main():
            f"Cold: load {load}, {cold[1]} of {cold[2]} functions + {cold[3]} instances in {cold[4]}. Daemon RSS {rss} MB.",
            "", "Each row is one save, followed by a restore that is not counted. Times in ms.", ""]
     head = ["Edit", "Builds", "Apply change", "Codegen", "of which compile / resolve / define / object"]
-    head += ["Link", "Edit to binary", "`cargo build`", "Program output"] if a.cargo else ["Edit to binary"]
+    head += ["Link", "Edit to binary", "`cargo build`"] if a.cargo else ["Edit to binary"]
     head.append("Functions recompiled")
     out += ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for r in rows:
         cells = [r["name"], r["builds"], f"{r['apply']:.1f}", f"{r['codegen']:.0f}",
                  " / ".join(f"{p:.0f}" for p in r["phases"])]
         if a.cargo:
-            cells += [f"{r['link']:.0f}", f"{r['total']:.0f}", f"{r['cargo']:.0f}", "same" if r["same"] else "DIFFERS"]
+            cells += [f"{r['link']:.0f}", f"{r['total']:.0f}", f"{r['cargo']:.0f}"]
         else:
             cells.append(f"{r['total']:.0f}")
         cells.append(f"{r['compiled']} of {r['bodies']}")

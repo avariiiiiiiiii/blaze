@@ -19,7 +19,7 @@ GHz, an L1 hit in 4.5 cycles, 2 instructions a cycle on branchy code.
 | salsa memo hit | 5.4 ns | 18 ns | salsa section of speed-of-light.md |
 | salsa query execution (claim, reads, publish) | 35 ns | 140 ns | hir-def signatures section |
 | intern hit (hash 2 to 4 words, a group line and a value line) | 15 cycles, 4.5 ns | the same | salsa section ("Interning a hit") |
-| small heap allocation and its free | 0 | 20 ns | db-ty-port-infer-errors section |
+| small heap allocation and its free | 0 | 20 ns; ≈ 2 ns where it is now a frame bump (10-30: lowering's `substs`, `bound_vars`, predicate and field buffers are `Vec::with_capacity_in(.., frame)`; `hot_lint.py` finds none left in `hir-ty`) | db-ty-port-infer-errors section |
 | instantiating one clause that names a parameter (fold, about 3 interns) | 0 if not needed | 20 ns | 3 intern hits plus about 40 instructions |
 | flag test on an interned `Ty` (`ty.flags()` reads one column word) | 1 to 2 ns | the same | `next_solver/interner.rs`, `flags` column |
 
@@ -45,7 +45,11 @@ parameters of what it names, lower or default each argument, and intern the argu
 **Today:**
 - A ref that is not a path is about 12 ns: the store read and an intern, plus two `tracing`
   callsite checks (`#[tracing::instrument(skip(self), ret)]` and `debug!(?type_ref)`) of a
-  couple of ns each. That is **1.7× off**.
+  couple of ns each. That is **1.7× off**. *(10-30, sol-all-ty: both callsites are removed
+  from `lower_ty_ext`, as are `resolve_path_in_type_ns`'s `instrument` and the three `debug!`s
+  on the path path in `lower/path.rs`. The workspace sets no `tracing` `max_level` feature, so
+  each one cost its callsite's interest check on every call. A non-path ref is now about 7.5
+  ns, within 10%, and a path about 5 ns less.)*
 - A path is about 130 ns:
   - `at_path`'s hygiene lookup: 5 ns;
   - the resolver's walk of the scope stack: generic parameter scopes by linear name compare,
@@ -331,6 +335,28 @@ pointers, higher-ranked types, a projection and `'static`:
   - `hot_lint.py` lists these. The `&dyn HirDatabase` findings are the database interface
     every crate takes.
 
+**Recounted 10-30 (sol-all-ty), from the code, nothing built:**
+- **Buffers.** Every buffer of a check is now in the check's frame (`Vec::new_in(self.frame)`,
+  `blaze_mem`), a bump of about 2 ns, not a global allocation and free at 20 ns. For the 8
+  buffers that is 8 × 18 ≈ −145 ns. The example ADT is **≈ 445 ns, 3.6×**. With salsa at its
+  bound it is **≈ 155 ns, 1.24×**, and what is left is salsa's and `trait_environment`'s.
+- **Global predicates** (`prove_needs`, `outlives.rs`). A predicate that `is_global()` (no
+  parameter, inference variable, placeholder, or local or erased region) is answered by
+  `InferCtxt::predicate_must_hold_modulo_regions`. That is the solver's evaluation in a probe,
+  a global-cache hit after the first time, with no `ObligationCtxt`. A failure still drops the
+  batch, as before. What its proof would have needed can only be that a global type or
+  `'static` outlives `'static`, which holds and which `resolve` reports nothing for.
+  - Per global predicate: ≈ 0.15 µs down to ≈ 40 ns (a cache hit plus the probe).
+  - This runs on the impl-header and function-signature paths, which call `trait_needs`. The
+    example ADT doesn't, so its row doesn't change. A signature with `Vec<String>` asks
+    `String: Sized` and `Global: Allocator`, both global: ≈ −0.2 µs.
+  - Test: `global_predicates_leave_out_only_what_holds` (`outlives/tests.rs`) runs the old
+    prover (`prove_needs_reference`, every predicate in a context) and the new one on every
+    field type of a fixture with global trait, projection and `'static`-blanket-impl
+    predicates. It asserts the new needs are the old ones in order, with only trivial ones left
+    out. It is the old-versus-new test. A differential test against rustc for this is the
+    E0309/E0310 cases in the wfcheck fixtures, which keep their expected results.
+
 ## 7. `generics.rs`
 
 `generics(db, def)` is a stack `ArrayVec` view over hir-def's `GenericParams`, with no query
@@ -367,13 +393,13 @@ execution at their bounds.
 
 | operation | bound | before | after this pass and its requests | with salsa | what is left |
 |---|---|---|---|---|---|
-| a type ref, not a path | 7 ns | 12 ns | 12 ns | 12 ns | `tracing` callsite checks |
-| a type ref, path | 33 ns | 130 ns | 110 ns | 70 ns | resolution in hir-def's store, generics shape in the same row |
+| a type ref, not a path | 7 ns | 12 ns | ≈ 7.5 ns (10-30) | ≈ 7.5 ns | within 10%: the `tracing` callsites are gone |
+| a type ref, path | 33 ns | 130 ns | ≈ 105 ns (10-30) | ≈ 65 ns | resolution in hir-def's store, generics shape in the same row |
 | `fn_sig_for_fn` (example) | 170 ns | 660 ns | 575 ns | 320 ns | resolver per query, path costs |
 | `generic_predicates` (example) | 105 ns | 530 ns | 430 ns | 210 ns | resolver, path costs, parent predicates copied |
 | field types (example) | 225 ns | 820 ns | 740 ns | 450 ns | resolver, path costs |
 | variance (example) | 65 ns | 275 ns | 215 ns | 70 ns | within 10% |
-| wfcheck + inferred outlives (example ADT) | 125 ns | 1.2 µs | 590 ns | 300 ns | buffers per check, global predicates without fulfillment |
+| wfcheck + inferred outlives (example ADT) | 125 ns | 1.2 µs | ≈ 445 ns (10-30) | ≈ 155 ns | salsa; the resolver of `trait_environment` |
 | cold batch read | interns of the type table | same | same | same | in-place keys, once measured |
 
 ## State of the art

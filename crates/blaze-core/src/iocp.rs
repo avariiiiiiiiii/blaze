@@ -1,11 +1,13 @@
 //! The driver on Windows: one I/O completion port that everything ends on.
 //!
-//! Reads, appends and writes at offsets go to the port as overlapped requests on handles of
-//! the driver's (`FILE_FLAG_OVERLAPPED`), as do a watch's `ReadDirectoryChangesW`, a process's
-//! pipes and every socket call (`AcceptEx`, `ConnectEx`, `WSARecv`, `WSASend`). The calls
-//! Windows has no overlapped form of (a whole-file write, a rename, a clone, a stat, a listing,
-//! a sync's `FlushFileBuffers`, a mapping) run on the driver's threads, which post to the port
-//! when one is done. A process's end is posted by a wait of the thread pool's, its job's
+//! Reads at offsets, appends and writes at offsets go to the port as overlapped requests on
+//! handles of the driver's (`FILE_FLAG_OVERLAPPED`), which skip the port when their call ends
+//! at once (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`: a read the cache holds posts no packet), as
+//! do a watch's `ReadDirectoryChangesW`, a process's pipes and every socket call (`AcceptEx`,
+//! `ConnectEx`, `WSARecv`, `WSASend`), which always post. The calls Windows has no overlapped
+//! form of (an open, so a whole-file read, whose open is most of its cost; a whole-file write, a
+//! rename, a clone, a stat, a listing, a sync's `FlushFileBuffers`, a mapping) run on the
+//! driver's threads, which post one wake to the port for all they hand back between two drains. A process's end is posted by a wait of the thread pool's, its job's
 //! messages by the job; timers are the port's wait, ended at the next one due.
 //!
 //! A journal's reads of the volume's USN journal are on the port too ([`usn`]); what each read
@@ -14,7 +16,8 @@
 //!
 //! The rule every request keeps (see [`Request`]): what the kernel reads or writes for it (its
 //! `OVERLAPPED`, its bytes, the handle it is on) is the request's, in its entry of the driver's
-//! slab, which is let go only once its completion is taken from the port, never before. A
+//! slab, which is let go only once its completion is taken from the port (or, for a file's
+//! request its call ended at once, once the call has returned), never before. A
 //! packet names its request by the bits of the request's handle, so one naming a request that
 //! has ended (its slot holding another since) is stale: dropped and counted, never read
 //! through.
@@ -129,9 +132,9 @@ type WarmId = blaze_mem::Handle<Warm>;
 /// What a request in flight is doing.
 enum Op {
     /// `want` bytes from `at` into the spare room of `bytes`, which the kernel writes and the
-    /// completion carries as it is: all of them, or to the end of the file where `to_end`,
-    /// `want` growing. On `file`, whose handle `raw` is open while the request is on it.
-    Read { file: FileId, raw: HANDLE, bytes: Vec<u8>, at: u64, want: usize, to_end: bool },
+    /// completion carries as it is: all of them, or fewer at the end of the file. On `file`,
+    /// whose handle `raw` is open while the request is on it.
+    Read { file: FileId, raw: HANDLE, bytes: Vec<u8>, at: u64, want: usize },
     /// `bytes` written at `at`, or at the end where `None` (an append).
     Write { file: FileId, raw: HANDLE, bytes: Vec<u8>, at: Option<u64>, put: usize },
     Watch(watch::Watching),
@@ -184,10 +187,12 @@ struct Request {
 }
 
 impl Request {
-    /// Asks the kernel for the op's next step. Ok: its completion comes to the port.
-    fn ask(&mut self) -> io::Result<()> {
+    /// Asks the kernel for the op's next step. `Ok(false)`: its completion comes to the port.
+    /// `Ok(true)`: it ended as it was asked, on a file's handle, which skips the port on
+    /// success (`Port::associate_skipping`): no packet comes, and the caller ends it now.
+    fn ask(&mut self) -> io::Result<bool> {
         let Request { head, op, .. } = self;
-        match op {
+        let pending = match op {
             Op::Read { raw, bytes, at, want, .. } => {
                 let filled = bytes.len();
                 let rest = (*want - filled).min(bytes.capacity() - filled);
@@ -196,15 +201,18 @@ impl Request {
                 // SAFETY: an open overlapped handle (the file's, open while the request is on
                 // it), the `Vec`'s spare room of at least `rest` bytes, which the kernel only
                 // writes, and an `OVERLAPPED`, both in the request's entry, which is kept until
-                // the completion is taken (see `Request`).
-                sys::pending(unsafe { ReadFile(*raw, into, len(rest), std::ptr::null_mut(), overlapped) })
+                // the completion is taken, or, ended at once, until it is ended here (see
+                // `Request`).
+                return sys::started(unsafe { ReadFile(*raw, into, len(rest), std::ptr::null_mut(), overlapped) });
             }
             Op::Write { raw, bytes, at, put, .. } => {
                 let rest = &bytes[*put..];
                 // All ones: at the end of the file, wherever that is when it is written.
                 let overlapped = head.reset(at.map_or(u64::MAX, |at| at + *put as u64));
                 // SAFETY: as for a read; the bytes are only read.
-                sys::pending(unsafe { WriteFile(*raw, rest.as_ptr(), len(rest.len()), std::ptr::null_mut(), overlapped) })
+                return sys::started(unsafe {
+                    WriteFile(*raw, rest.as_ptr(), len(rest.len()), std::ptr::null_mut(), overlapped)
+                });
             }
             // SAFETY: the head made ready for this step, and the watch with its buffer in the
             // request's entry, which is kept in place until the completion is taken (`Request`).
@@ -239,7 +247,8 @@ impl Request {
             // SAFETY: as for a receive; the bytes are the op's, unwritten until it ends.
             Op::Send { socket, bytes, put, .. } => unsafe { net::send(*socket, &bytes[*put..], head.reset(0)) },
             Op::Connect { .. } => unreachable!("a connect is asked for once, as it is made"),
-        }
+        };
+        pending.map(|()| false)
     }
 
     /// Asks the kernel to end it early; its completion still comes, as cancelled or as it
@@ -446,6 +455,12 @@ pub struct Iocp {
     conns: Slab<Connection>,
     entries: [OVERLAPPED_ENTRY; ENTRIES],
     in_flight: usize,
+    /// What the threads allocated doing their file effects.
+    #[cfg(test)]
+    thread_allocations: Arc<std::sync::atomic::AtomicU64>,
+    /// Completions of requests the port handed back.
+    #[cfg(test)]
+    packets: u64,
 }
 
 // SAFETY: what is not `Send` in the driver is the raw handles and sockets its requests copy
@@ -470,14 +485,23 @@ impl Iocp {
         let (work, queue) = crossbeam_channel::bounded::<Work>(WORK);
         // alloc: setup, the flag the threads share.
         let woken = Arc::new(Wake::new());
+        #[cfg(test)]
+        let thread_allocations = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let workers = (0..threads.max(1))
             .map(|n| {
                 let (root, queue, port, sender) = (root.clone(), queue.clone(), port.clone(), sender.clone()); // clone: setup.
                 let woken = woken.clone(); // clone: setup, what each thread is given.
+                #[cfg(test)]
+                let counted = thread_allocations.clone();
                 std::thread::Builder::new()
                     // alloc: setup.
                     .name(format!("blaze-iocp-{n}"))
-                    .spawn(move || work_on(&root, &queue, &port, &sender, &woken))
+                    .spawn(move || {
+                        #[cfg(test)]
+                        work_on(&root, &queue, &port, &sender, &woken, &counted);
+                        #[cfg(not(test))]
+                        work_on(&root, &queue, &port, &sender, &woken);
+                    })
             })
             .collect::<io::Result<Vec<_>>>()?;
         let mem = io::Error::other;
@@ -526,6 +550,10 @@ impl Iocp {
             // SAFETY: all zeros is an entry of nothing, written over before it is read.
             entries: unsafe { std::mem::zeroed() },
             in_flight: 0,
+            #[cfg(test)]
+            thread_allocations,
+            #[cfg(test)]
+            packets: 0,
         })
     }
 
@@ -536,6 +564,14 @@ impl Iocp {
         self.warm = confine.warm();
         self.confine = Some(confine);
         self
+    }
+
+    /// The driver, making each sandboxed run's own directory under `dir`, made here.
+    pub fn scratch(mut self, dir: impl Into<PathBuf>) -> io::Result<Iocp> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        self.dirs = RunDirs::under(dir)?;
+        Ok(self)
     }
 
     /// Where the TCP listen `listen` listens, for one asked of port 0.
@@ -557,12 +593,18 @@ impl Iocp {
         self.requests.insert_with(|id| Request { tag, head: Head::new(id.to_bits()), op })
     }
 
-    /// The request `id` asked for its next step, kept until its completion; or, refused at
-    /// once, ended now.
+    /// The request `id` asked for its next step, kept until its completion; or, ended or
+    /// refused at once, ended now. A file's request that ends at once posts no packet: its next
+    /// step, if any, is asked for from here, at most a few deep (a step moves all it can).
     fn put(&mut self, id: Id) {
         let Some(request) = self.requests.get_mut(id) else { return };
-        if let Err(error) = request.ask() {
-            self.ended(id, Err(error));
+        match request.ask() {
+            Ok(false) => {}
+            Ok(true) => {
+                let result = request.head.result().map_err(|code| io::Error::from_raw_os_error(code as i32));
+                self.ended(id, result);
+            }
+            Err(error) => self.ended(id, Err(error)),
         }
     }
 
@@ -629,7 +671,7 @@ impl Iocp {
             return Ok((id, cached.handle.as_raw_handle()));
         }
         let handle = self.open(file, access)?;
-        self.port.associate(handle.as_raw_handle())?;
+        self.port.associate_skipping(handle.as_raw_handle())?;
         let names = match access {
             files::Access::Append => &mut self.appenders,
             _ => &mut self.readers,
@@ -648,8 +690,7 @@ impl Iocp {
 
     fn begin(&mut self, effect: Effect) -> io::Result<()> {
         match effect {
-            Effect::ReadAll { file, tag } => self.read(&file, 0, None, tag),
-            Effect::Read { file, at, len, tag } => self.read(&file, at, Some(len), tag),
+            Effect::Read { file, at, len, tag } => self.read(&file, at, len, tag),
             Effect::Append { file, bytes, tag } => {
                 let (id, raw) = self.cached(&file, files::Access::Append)?;
                 if bytes.is_empty() {
@@ -667,7 +708,7 @@ impl Iocp {
                     self.ready.push(Completion { tag, done: Done::Written });
                     return Ok(());
                 }
-                self.port.associate(handle.as_raw_handle())?;
+                self.port.associate_skipping(handle.as_raw_handle())?;
                 let raw = handle.as_raw_handle();
                 let id = self.files.insert(Cached { handle, users: 1, named: false });
                 let request = self.request(tag, Op::Write { file: id, raw, bytes, at: Some(at), put: 0 });
@@ -702,7 +743,8 @@ impl Iocp {
                 self.to_threads(Work::File(effect));
                 Ok(())
             }
-            effect @ (Effect::Sync { .. }
+            effect @ (Effect::ReadAll { .. }
+            | Effect::Sync { .. }
             | Effect::Truncate { .. }
             | Effect::Stat { .. }
             | Effect::List { .. }
@@ -797,36 +839,20 @@ impl Iocp {
         }
     }
 
-    fn read(&mut self, file: &FileName, at: u64, len: Option<usize>, tag: Tag) -> io::Result<()> {
-        let (id, raw) = match self.cached(file, files::Access::Read) {
-            Ok(it) => it,
-            // A file that is not there reads as empty, read whole.
-            Err(error) if error.kind() == io::ErrorKind::NotFound && len.is_none() => {
-                self.ready.push(Completion { tag, done: Done::Read(Vec::new()) }); // alloc: none, an empty `Vec`.
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let size = match len {
-            Some(len) => Ok(len),
-            // A byte past its length, so the read that fills it is the one that finds the end.
-            None => files::size(raw).map(|size| size as usize + 1),
-        };
-        let size = match size {
-            Ok(0) => {
-                release(&mut self.files, id);
-                self.ready.push(Completion { tag, done: Done::Read(Vec::new()) }); // alloc: none, an empty `Vec`.
-                return Ok(());
-            }
-            Ok(size) => size,
-            Err(error) => {
-                release(&mut self.files, id);
-                return Err(error);
-            }
-        };
+    /// `len` bytes at `at` of `file`, through its kept handle. A whole file is read on the
+    /// threads instead ([`files::read_whole`]): its open is most of its cost and has no
+    /// overlapped form, and a handle kept by its name would read a file replaced by another
+    /// process's rename as it was.
+    fn read(&mut self, file: &FileName, at: u64, len: usize, tag: Tag) -> io::Result<()> {
+        let (id, raw) = self.cached(file, files::Access::Read)?;
+        if len == 0 {
+            release(&mut self.files, id);
+            self.ready.push(Completion { tag, done: Done::Read(Vec::new()) }); // alloc: none, an empty `Vec`.
+            return Ok(());
+        }
         // alloc: the bytes read, `Done::Read`'s payload, which the kernel writes in place.
-        let bytes = Vec::with_capacity(size);
-        let request = self.request(tag, Op::Read { file: id, raw, bytes, at, want: size, to_end: len.is_none() });
+        let bytes = Vec::with_capacity(len);
+        let request = self.request(tag, Op::Read { file: id, raw, bytes, at, want: len });
         self.put(request);
         Ok(())
     }
@@ -1376,7 +1402,7 @@ impl Iocp {
         let code = result.as_ref().err().and_then(io::Error::raw_os_error).map(|it| it as u32);
         let after = 'step: {
             match &mut request.op {
-                Op::Read { bytes, want, to_end, .. } => {
+                Op::Read { bytes, want, .. } => {
                     let got = match result {
                         Ok(got) => got as usize,
                         Err(_) if code == Some(ERROR_HANDLE_EOF) => 0,
@@ -1386,15 +1412,11 @@ impl Iocp {
                         }
                     };
                     let filled = bytes.len() + got.min(*want - bytes.len());
-                    // SAFETY: the read's completion was taken: the kernel wrote `got` bytes from
+                    // SAFETY: the read's completion was taken, or its call ended it at once
+                    // (`Request::ask`): the kernel wrote `got` bytes from
                     // the start of the spare room it was given (at most `want` less what was
                     // there), and writes them no more.
                     unsafe { bytes.set_len(filled) };
-                    if got > 0 && *to_end && filled == *want {
-                        *want *= 2;
-                        // alloc: the file grew after its length was asked.
-                        bytes.reserve(*want - filled);
-                    }
                     if got > 0 && filled < *want {
                         break 'step After::Again;
                     }
@@ -1710,6 +1732,10 @@ impl Iocp {
                         self.stale += 1;
                         continue;
                     };
+                    #[cfg(test)]
+                    {
+                        self.packets += 1;
+                    }
                     let request = self.requests.get(id).expect("the packet's owner");
                     let result = request.head.result().map_err(|code| io::Error::from_raw_os_error(code as i32));
                     self.ended(id, result);
@@ -2000,16 +2026,40 @@ fn adopt(conns: &mut Slab<Connection>, socket: OwnedSocket) -> Conn {
     Conn(id.to_bits())
 }
 
-fn work_on(root: &Path, queue: &Receiver<Work>, port: &Port, back: &Sender<Back>, woken: &Wake) {
-    // alloc: setup, the paths this thread's file effects are joined in, grown to the longest.
-    let (mut at, mut to) = (PathBuf::with_capacity(512), PathBuf::with_capacity(512));
+/// What a thread keeps for its file effects, each grown once to the longest path.
+struct Kept {
+    at: PathBuf,
+    to: PathBuf,
+    /// Wide paths of names under the root, for the calls this thread makes on them itself.
+    paths: sys::Paths,
+}
+
+fn work_on(
+    root: &Path,
+    queue: &Receiver<Work>,
+    port: &Port,
+    back: &Sender<Back>,
+    woken: &Wake,
+    #[cfg(test)] counted: &std::sync::atomic::AtomicU64,
+) {
+    let mut kept = Kept {
+        // alloc: setup, the paths this thread's file effects are joined in, grown to the longest.
+        at: PathBuf::with_capacity(512),
+        to: PathBuf::with_capacity(512), // alloc: as above.
+        paths: sys::Paths::new(root),
+    };
     while let Ok(work) = queue.recv() {
         let sent = match work {
             Work::File(effect) => {
                 let tag = effect.tag();
-                let done = file(root, effect, &mut at, &mut to)
-                    // alloc: an error path.
-                    .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
+                #[cfg(test)]
+                let (done, used) = blaze_alloc_count::measure(|| file(root, effect, &mut kept));
+                #[cfg(test)]
+                counted.fetch_add(used.allocations, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(not(test))]
+                let done = file(root, effect, &mut kept);
+                // alloc: an error path.
+                let done = done.unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
                 back.send(Back::Done(Completion { tag, done }))
             }
             Work::Connect { tag, at } => {
@@ -2052,8 +2102,19 @@ fn joined<'a>(into: &'a mut PathBuf, root: &Path, file: &FileName) -> &'a Path {
 }
 
 /// A file effect that blocks, as Windows does it.
-fn file(root: &Path, effect: Effect, at: &mut PathBuf, to: &mut PathBuf) -> io::Result<Done> {
+fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
+    let Kept { at, to, paths } = kept;
     match effect {
+        Effect::ReadAll { file, .. } => match paths.of(&file).and_then(files::read_whole) {
+            Ok(bytes) => Ok(Done::Read(bytes)),
+            // A file that is not there reads as empty.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Done::Read(Vec::new())), // alloc: none, an empty `Vec`.
+            Err(error) => {
+                let path = joined(at, root, &file);
+                // alloc: an error path.
+                Err(io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+            }
+        },
         Effect::Write { file, bytes, .. } => {
             files::write_atomically(joined(at, root, &file), &bytes).map(|()| Done::Written)
         }
@@ -3076,6 +3137,105 @@ mod tests {
                 );
             }
         }
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn patterned(size: usize, salt: u8) -> Vec<u8> {
+        (0..size).map(|n| (n as u8).wrapping_mul(31) ^ (n >> 8) as u8 ^ salt).collect()
+    }
+
+    /// Whole reads, which run on the driver's threads, each opening the file it reads: every
+    /// byte of a file of any size, nothing of a missing one, and the file a rename put over the
+    /// name since, not the one a kept handle of the name's has open.
+    #[test]
+    fn whole_reads_are_exact_and_see_a_file_renamed_over_theirs() {
+        let root = dir("whole");
+        let sizes = [0, 1, 4096, (64 << 10) + 3];
+        for (n, &size) in sizes.iter().enumerate() {
+            std::fs::write(root.join(format!("f{n}")), patterned(size, 0)).unwrap();
+        }
+        let mut driver = Iocp::new(&root, 2).unwrap();
+        let mut asked: Vec<_> =
+            (0..sizes.len()).map(|n| Effect::ReadAll { file: name(&format!("f{n}")), tag: Tag(n as u64) }).collect();
+        asked.push(Effect::ReadAll { file: name("missing"), tag: Tag(99) });
+        let seen = run(&mut driver, asked);
+        for (n, &size) in sizes.iter().enumerate() {
+            assert_eq!(seen[&(n as u64)], Done::Read(patterned(size, 0)), "{size} bytes");
+        }
+        assert_eq!(seen[&99], Done::Read(Vec::new()));
+        let last = name(&format!("f{}", sizes.len() - 1));
+        let seen = run(&mut driver, vec![Effect::Read { file: last.clone(), at: 1, len: 2, tag: Tag(1) }]);
+        assert_eq!(seen[&1], Done::Read(patterned(3, 0)[1..].to_vec()));
+        assert!(driver.readers.contains_key(&last), "a read at an offset keeps its handle by name");
+        std::fs::write(root.join("new"), patterned(5000, 7)).unwrap();
+        std::fs::rename(root.join("new"), root.join(last.as_str())).unwrap();
+        let seen = run(&mut driver, vec![Effect::ReadAll { file: last, tag: Tag(2) }]);
+        assert_eq!(seen[&2], Done::Read(patterned(5000, 7)));
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A warm batch of whole reads: the driver's threads allocate at most each one's bytes,
+    /// the polling thread nothing.
+    #[test]
+    fn a_warm_batch_of_whole_reads_allocates_only_their_bytes() {
+        let root = dir("budget-whole");
+        const FILES: usize = 64;
+        for n in 0..FILES {
+            std::fs::write(root.join(format!("f{n}")), patterned(20 << 10, n as u8)).unwrap();
+        }
+        let files: Vec<_> = (0..FILES).map(|n| name(&format!("f{n}"))).collect();
+        let mut driver = Iocp::new(&root, 4).unwrap();
+        let mut effects = Vec::with_capacity(FILES);
+        let mut out = Vec::with_capacity(FILES);
+        for round in 0..4 {
+            let mut asked: Vec<_> = files
+                .iter()
+                .enumerate()
+                .map(|(n, file)| Effect::ReadAll { file: file.clone(), tag: Tag(n as u64) })
+                .collect();
+            out.clear();
+            let before = driver.thread_allocations.load(std::sync::atomic::Ordering::Relaxed);
+            let ((), used) = blaze_alloc_count::measure(|| {
+                effects.append(&mut asked);
+                driver.submit(&mut effects);
+                until(&mut driver, &mut out, FILES);
+            });
+            let threads = driver.thread_allocations.load(std::sync::atomic::Ordering::Relaxed) - before;
+            for done in &out {
+                assert_eq!(done.done, Done::Read(patterned(20 << 10, done.tag.0 as u8)));
+            }
+            if round > 0 {
+                assert_eq!(used.allocations, 0, "the polling thread, for {FILES} whole reads");
+                assert!(threads <= FILES as u64, "the threads made {threads} allocations for {FILES} whole reads");
+            }
+        }
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Reads at offsets of a file whose handle is kept, which the cache holds: their calls end
+    /// them at once, so they post no packet, and each still gives its bytes.
+    #[test]
+    fn cached_reads_that_end_at_once_post_no_packet() {
+        let root = dir("skip");
+        let whole = patterned(4096, 3);
+        std::fs::write(root.join("f"), &whole).unwrap();
+        let mut driver = Iocp::new(&root, 1).unwrap();
+        let file = name("f");
+        const READS: u64 = 64;
+        let asked = (0..READS).map(|n| Effect::Read { file: file.clone(), at: n * 61, len: 16, tag: Tag(n) }).collect();
+        let packets = driver.packets;
+        let seen = run(&mut driver, asked);
+        for n in 0..READS {
+            let at = (n * 61) as usize;
+            assert_eq!(seen[&n], Done::Read(whole[at..at + 16].to_vec()), "read {n}");
+        }
+        let posted = driver.packets - packets;
+        assert!(posted < READS / 2, "{posted} of {READS} cached reads posted a packet");
+        let at_end = run(&mut driver, vec![Effect::Read { file: file.clone(), at: 4090, len: 16, tag: Tag(0) }]);
+        assert_eq!(at_end[&0], Done::Read(whole[4090..].to_vec()));
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }

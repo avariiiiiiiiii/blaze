@@ -304,11 +304,11 @@ pub(crate) fn read_profile(root: &str, path: &str) -> Result<Profiled, String> {
         // alloc: an error
         format!("the flags for rustc have `-C profile-use={path}`, and `{}` can't be read: {error}", at.display())
     })?;
-    given(path, bytes)
+    profiled(path, bytes)
 }
 
 #[cfg(feature = "llvm")]
-fn given(path: &str, bytes: Vec<u8>) -> Result<Profiled, String> {
+fn profiled(path: &str, bytes: Vec<u8>) -> Result<Profiled, String> {
     let id = hir_ty_codegen::v2::profile_id(&bytes);
     let given = hir_ty_codegen::v2::give_profile(id, &bytes)
         // alloc: an error
@@ -317,7 +317,7 @@ fn given(path: &str, bytes: Vec<u8>) -> Result<Profiled, String> {
 }
 
 #[cfg(not(feature = "llvm"))]
-fn given(path: &str, _bytes: Vec<u8>) -> Result<Profiled, String> {
+fn profiled(path: &str, _bytes: Vec<u8>) -> Result<Profiled, String> {
     // alloc: an error
     Err(format!(
         "the flags for rustc have `-C profile-use={path}`, and this blaze is built without LLVM \
@@ -761,7 +761,8 @@ pub(crate) fn link(
     for (order, it) in located.iter().enumerate() {
         if added_natives.binary_search(&native_ids[order]).is_ok() {
             let bytes = std::fs::read(&it.path).map_err(|error| format!("{}: {error}", it.path.display()))?;
-            bytes_of.push((order, bytes));
+            // alloc: once per native input new to the image, which keeps it shared from here.
+            bytes_of.push((order, Arc::<[u8]>::from(bytes)));
         }
     }
 

@@ -22,8 +22,14 @@ pub struct Frames {
     /// Where the next frame starts in `bytes`.
     at: usize,
     end: usize,
+    /// How many bytes the buffer [`Frames::lend`] gave a receive held.
+    lent: usize,
     broken: Option<ApiError>,
 }
+
+/// The most room [`Frames::lend`] keeps past a frame: one long frame does not hold its size
+/// for the connection's life.
+const KEPT_ROOM: usize = 1 << 20;
 
 impl Frames {
     pub fn new() -> Frames {
@@ -55,6 +61,30 @@ impl Frames {
         } else {
             self.push(&bytes);
         }
+    }
+
+    /// The buffer, for a receive to append the stream's next bytes to ([`blaze_core`]'s
+    /// `Effect::Recv`): what it holds of the frame under way moved to its front, its room kept.
+    /// It holds nothing until [`Frames::give_back`], so a warm receive allocates nothing and
+    /// its bytes land where they are read.
+    pub(crate) fn lend(&mut self) -> Vec<u8> {
+        let held = self.held();
+        self.bytes.copy_within(self.at..self.end, 0);
+        self.bytes.truncate(held);
+        self.bytes.shrink_to(KEPT_ROOM);
+        self.at = 0;
+        self.end = 0;
+        self.lent = held;
+        std::mem::take(&mut self.bytes)
+    }
+
+    /// Takes back the buffer [`Frames::lend`] gave, with what the receive appended to it:
+    /// false when that was nothing, the peer having hung up.
+    pub(crate) fn give_back(&mut self, bytes: Vec<u8>) -> bool {
+        let appended = bytes.len() > self.lent;
+        self.lent = 0;
+        self.push_vec(bytes);
+        appended
     }
 
     /// The next whole item; `Ok(None)` until one is here. An error for a length over

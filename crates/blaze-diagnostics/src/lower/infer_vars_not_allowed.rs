@@ -9,7 +9,7 @@
 //! type_of.rs` (`type_of`, `infer_placeholder_type`) and `compiler/rustc_hir_analysis/src/
 //! diagnostics.rs` (`PlaceholderNotAllowedItemSignatures`) (MIT or Apache-2.0).
 
-use hir::{CallableKind, FnTrait, InFile, LangItem};
+use hir::{CallableKind, InFile, LangItem};
 use syntax::{
     TextRange,
     view::{self as ast, AstNode as _},
@@ -107,7 +107,7 @@ fn suggestable(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> bool {
 
 /// rustc's `suggest_impl_trait`: `impl Iterator<Item = T>`, `impl Future<Output = T>` or
 /// `impl Fn(A) -> B` for a type that cannot be named.
-fn impl_trait(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
+fn impl_trait<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>) -> Option<String> {
     let db = cx.db;
     let assoc = |lang: LangItem, assoc: &str| -> Option<String> {
         let trait_ = hir::Trait::lang(db, cx.krate, lang)?;
@@ -133,14 +133,7 @@ fn impl_trait(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
     }
     let callable = ty.as_callable(db)?;
     let trait_name = match callable.kind() {
-        CallableKind::Closure(closure) => match closure.fn_trait(db) {
-            FnTrait::AsyncFn => "AsyncFn",
-            FnTrait::AsyncFnMut => "AsyncFnMut",
-            FnTrait::AsyncFnOnce => "AsyncFnOnce",
-            FnTrait::Fn => "Fn",
-            FnTrait::FnMut => "FnMut",
-            FnTrait::FnOnce => "FnOnce",
-        },
+        CallableKind::Closure(closure) => closure.fn_trait(db).as_str(),
         CallableKind::Function(_) | CallableKind::TupleStruct(_) | CallableKind::TupleEnumVariant(_) => "Fn",
         _ => return None,
     };

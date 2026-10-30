@@ -10,7 +10,7 @@ A crate whose tests print something else in every run of rustc's own binary is U
 mismatch.
 """
 import argparse, json, os, re, subprocess, sys
-from difftest import Fixture, bucket, compare, discard, RUNNER
+from mixed import Fixture, bucket, compare, discard, RUNNER
 
 
 UNIT = "(unit tests)"

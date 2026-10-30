@@ -75,16 +75,15 @@ mod imp {
             self.0.get() - 1
         }
 
-        /// # Safety
+        /// # Contract
         ///
-        /// `u32` must be what [`SyntaxContext::into_u32`] gave for a context of this database.
+        /// `u32` is what [`SyntaxContext::into_u32`] gave for a context of this database.
         /// Memory safety doesn't rest on it ([`SyntaxContext::id`] checks the bound salsa needs,
         /// and salsa's table checks the page, slot and type of every lookup): another value
-        /// gives a panic, or another context's hygiene data. It stays `unsafe` so that decoders
-        /// of persisted or wire contexts (hir-def's `persist`, the proc-macro protocols) say
-        /// where they trust their bytes.
+        /// gives a panic, or another context's hygiene data. Panics on `u32::MAX`, which no
+        /// context has.
         #[inline]
-        pub unsafe fn from_u32(u32: u32) -> Self {
+        pub fn from_u32(u32: u32) -> Self {
             match u32.checked_add(1).and_then(NonZeroU32::new) {
                 Some(it) => Self(it),
                 None => panic!("invalid SyntaxContext({u32})"),
@@ -98,12 +97,10 @@ mod imp {
             }
             let index = self.0.get() - 1;
             assert!(index < salsa::Id::MAX_U32, "SyntaxContext({index}) is no root and no salsa id");
-            // SAFETY: `Id::from_index` needs `index < Id::MAX_U32`, checked just above, so a
-            // context decoded from bad bytes panics here rather than making an `Id` whose
-            // `NonZeroU32` is 0. Whether `index` is a `SyntaxContextImpl` is not a safety
-            // condition: salsa's table bounds-checks the page and slot and checks the page's
-            // type on lookup, and panics otherwise.
-            let id = unsafe { salsa::Id::from_index(index) };
+            // The id `Id::from_index(index)` would make (stored index `index + 1`, generation
+            // 0), with the bound checked instead of trusted. Whether it is a `SyntaxContextImpl`
+            // salsa's table checks on lookup (page, slot and the page's type), panicking if not.
+            let id = salsa::Id::from_bits(u64::from(index) + 1);
             Some(SyntaxContextImpl::from_id(id))
         }
 
@@ -320,12 +317,9 @@ mod imp {
             self.0.get() - 1
         }
 
-        /// # Safety
-        ///
-        /// None. This is always safe to call without the `salsa` feature; it is `unsafe` to
-        /// have the signature it has with it.
+        /// Panics on `u32::MAX`, which no context has.
         #[inline]
-        pub unsafe fn from_u32(u32: u32) -> Self {
+        pub fn from_u32(u32: u32) -> Self {
             match u32.checked_add(1).and_then(NonZeroU32::new) {
                 Some(it) => Self(it),
                 None => panic!("invalid SyntaxContext({u32})"),
@@ -419,9 +413,7 @@ mod tests {
     #[test]
     fn test_non_root_value_is_not_root() {
         for edition in Edition::iter() {
-            // SAFETY: `from_u32`'s contract is not a memory-safety one (see its `# Safety`), and
-            // the context made is only asked `is_root`, which reads no database.
-            let ctx = unsafe { SyntaxContext::from_u32(edition as u32 + 1) };
+            let ctx = SyntaxContext::from_u32(edition as u32 + 1);
             assert!(!ctx.is_root(), "{edition} root should be identified as root");
         }
     }
@@ -432,9 +424,8 @@ mod tests {
         let root = SyntaxContext::root(Edition::Edition2015);
         let ctx = SyntaxContext::new(
             &db,
-            // SAFETY: `from_index` needs `1 < Id::MAX_U32`, which holds; the id is stored as
-            // the expansion of the context and never looked up.
-            crate::MacroCallId(unsafe { salsa::Id::from_index(1) }),
+            // Stored as the expansion of the context and never looked up.
+            crate::MacroCallId(salsa::Id::from_bits(2)),
             Transparency::Opaque,
             Edition::Edition2021,
             root,
@@ -442,8 +433,7 @@ mod tests {
             Some(root),
         );
 
-        // SAFETY: The value was produced by `SyntaxContext::into_u32` above.
-        let round_tripped = unsafe { SyntaxContext::from_u32(ctx.into_u32()) };
+        let round_tripped = SyntaxContext::from_u32(ctx.into_u32());
         assert_eq!(round_tripped.edition(&db), Edition::Edition2021);
         assert_eq!(round_tripped.parent(&db), root);
     }
@@ -454,9 +444,7 @@ mod tests {
     #[should_panic(expected = "no root and no salsa id")]
     fn a_context_past_the_roots_panics() {
         let db = salsa::DatabaseImpl::new();
-        // SAFETY: `from_u32`'s contract is not a memory-safety one (see its `# Safety`); this
-        // checks that breaking it panics.
-        let ctx = unsafe { SyntaxContext::from_u32(u32::MAX - 1) };
+        let ctx = SyntaxContext::from_u32(u32::MAX - 1);
         assert!(!ctx.is_root());
         ctx.parent(&db);
     }
@@ -464,7 +452,54 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid SyntaxContext")]
     fn the_last_u32_is_no_context() {
-        // SAFETY: as above; `u32::MAX` has no `NonZeroU32` one past it, so this panics.
-        let _ = unsafe { SyntaxContext::from_u32(u32::MAX) };
+        let _ = SyntaxContext::from_u32(u32::MAX);
+    }
+
+    /// What name resolution asks of a context, warm: each part of its data, its marks walked
+    /// outward, and interning a context that exists again, none of which allocates.
+    #[test]
+    fn warm_context_reads_allocate_nothing() {
+        assert!(blaze_alloc_count::installed());
+        let db = salsa::DatabaseImpl::new();
+        let root = SyntaxContext::root(Edition::Edition2021);
+        let transparencies =
+            [Transparency::Opaque, Transparency::SemiOpaque, Transparency::Transparent];
+        let make = |n: u64, parent: SyntaxContext| {
+            SyntaxContext::new(
+                &db,
+                // Stored as the expansion of the context and never looked up.
+                crate::MacroCallId(salsa::Id::from_bits(n + 2)),
+                transparencies[n as usize % 3],
+                Edition::Edition2021,
+                parent,
+                Some(root),
+                Some(root),
+            )
+        };
+        let mut chain = vec![root];
+        for n in 0..8 {
+            let parent = *chain.last().unwrap();
+            chain.push(make(n, parent));
+        }
+        let read = || {
+            for &ctx in &chain {
+                std::hint::black_box((
+                    ctx.outer_mark(&db),
+                    ctx.edition(&db),
+                    ctx.parent(&db),
+                    ctx.opaque_and_opaque_and_semiopaque(&db),
+                    ctx.is_opaque(&db),
+                    ctx.marks_rev(&db).count(),
+                ));
+            }
+        };
+        read();
+        blaze_alloc_count::assert_at_most(0, "warm context reads", read);
+        let again =
+            blaze_alloc_count::assert_at_most(0, "interning a context that exists", || {
+                make(0, root)
+            });
+        assert_eq!(again, chain[1]);
+        assert_eq!(chain[8].marks_rev(&db).count(), 8);
     }
 }

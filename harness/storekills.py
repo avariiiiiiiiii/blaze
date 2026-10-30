@@ -17,7 +17,7 @@ Each worker has a checkout of the stress workspace and a store of its own. A kil
 The moment is random, SIGKILL is the signal, and the daemons are started with sizes that make
 them seal, merge and evict on nearly every build. After every kill `blaze-engine cache verify` has to
 find nothing in the store that is not what was written, and a new daemon on the same store
-has to build a program that prints what cargo's does.
+has to build a program that prints what blaze's build from nothing does.
 
     python3 storekills.py [--kills N] [--workers N] [--seed N]
 """
@@ -164,7 +164,7 @@ def main():
     print(f"seed {SEED}, {time.time() - start:.0f}s")
     if failures or done != KILLS:
         raise SystemExit("FAIL")
-    print(f"PASS: {done} kills, every store verified and every next build printed what cargo's does")
+    print(f"PASS: {done} kills, every store verified and every next build printed what the build from nothing does")
 
 
 if __name__ == "__main__":

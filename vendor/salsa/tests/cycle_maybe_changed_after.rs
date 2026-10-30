@@ -1,6 +1,8 @@
 #![cfg(feature = "inventory")]
 
 //! Tests for incremental validation for queries involved in a cycle.
+
+#![forbid(unsafe_code)]
 mod common;
 
 use crate::common::EventLoggerDatabase;

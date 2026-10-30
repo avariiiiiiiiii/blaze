@@ -8,6 +8,8 @@ use blaze_core::{
 use super::*;
 use crate::read::Found;
 
+mod model_check;
+
 fn name(it: &str) -> FileName {
     FileName::new(it).unwrap()
 }
@@ -1597,6 +1599,8 @@ fn hits_and_warm_puts_allocate_nothing() {
             for n in 0..count {
                 let entry = reader.get(&guard, &key(n)).unwrap().expect("put before");
                 assert!(entry.bytes == values[n as usize].as_slice(), "{what}: {n}");
+                let in_place = reader.get_in_place(&guard, &key(n)).unwrap();
+                assert!(in_place.is_some_and(|(_, it)| it.bytes == values[n as usize].as_slice()), "{what}: {n}");
                 assert!(store.has(&key(n)), "{what}: {n}");
             }
         });

@@ -3,24 +3,9 @@ use std::{
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
+use blaze_rng::SplitMix64 as Rng;
+
 use super::*;
-
-/// SplitMix64, a copy of `blaze_ids::rng::SplitMix64`: `blaze-ids` depends on this crate.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        if n == 0 { 0 } else { self.next() % n }
-    }
-}
 
 /// Says it has `self.0` threads and runs the jobs in turn: the parallel path on one thread.
 struct Pretend(usize);
@@ -68,10 +53,10 @@ unsafe impl Workers for Threads {
 /// some high bits set (skipped low digits), constant, in order, reversed, nearly in order.
 fn keys(rng: &mut Rng, n: usize, shape: u64) -> Vec<u64> {
     let mut keys: Vec<u64> = match shape {
-        0 => (0..n).map(|_| rng.next()).collect(),
+        0 => (0..n).map(|_| rng.next_u64()).collect(),
         1 => (0..n).map(|_| rng.below(7)).collect(),
         2 => (0..n).map(|_| rng.below(1 << 12) << 40).collect(),
-        3 => vec![rng.next(); n],
+        3 => vec![rng.next_u64(); n],
         4 => (0..n as u64).map(|it| it * 3).collect(),
         5 => (0..n as u64).rev().collect(),
         6 => (0..n).map(|_| rng.below(1 << 20) | (rng.below(4) << 62)).collect(),
@@ -108,7 +93,7 @@ fn stable(pairs: &[(u64, u32)]) -> Vec<(u64, u32)> {
 
 #[test]
 fn pairs_sort_as_the_standard_stable_sort() {
-    let mut rng = Rng(1);
+    let mut rng = Rng::new(1);
     for n in sizes() {
         for shape in 0..SHAPES {
             let pairs = pairs_of(&keys(&mut rng, n, shape));
@@ -121,7 +106,7 @@ fn pairs_sort_as_the_standard_stable_sort() {
 
 #[test]
 fn keys_of_every_width_sort_as_the_standard_sort() {
-    let mut rng = Rng(2);
+    let mut rng = Rng::new(2);
     for n in sizes() {
         for shape in 0..SHAPES {
             let wide = keys(&mut rng, n, shape);
@@ -147,7 +132,7 @@ fn keys_of_every_width_sort_as_the_standard_sort() {
 
 #[test]
 fn sort_by_key_moves_owned_items_stably_and_keys_each_once() {
-    let mut rng = Rng(3);
+    let mut rng = Rng::new(3);
     for n in [0, 1, 2, 5, SMALL, SMALL + 1, 1000, WIDE + 3] {
         for shape in 0..SHAPES {
             let items: Vec<(u64, String)> = keys(&mut rng, n, shape)
@@ -171,10 +156,10 @@ fn sort_by_key_moves_owned_items_stably_and_keys_each_once() {
 
 #[test]
 fn copy_by_key_sorts_by_a_packed_tuple() {
-    let mut rng = Rng(4);
+    let mut rng = Rng::new(4);
     for n in [3, 100, 5000] {
         let items: Vec<(u32, i32, u16)> = (0..n)
-            .map(|_| (rng.below(5) as u32, rng.next() as i32 % 9, rng.next() as u16))
+            .map(|_| (rng.below(5) as u32, rng.next_u64() as i32 % 9, rng.next_u64() as u16))
             .collect();
         let mut want = items.clone();
         want.sort_by_key(|it| (it.0, it.1));
@@ -186,7 +171,7 @@ fn copy_by_key_sorts_by_a_packed_tuple() {
 
 #[test]
 fn the_parallel_path_is_the_same_on_any_thread_count() {
-    let mut rng = Rng(5);
+    let mut rng = Rng::new(5);
     for n in [PARALLEL, PARALLEL + 12_345, 250_000] {
         for shape in [0, 1, 2, 5, 6, 7] {
             let pairs = pairs_of(&keys(&mut rng, n, shape));
@@ -209,7 +194,7 @@ fn the_parallel_path_is_the_same_on_any_thread_count() {
 
 #[test]
 fn one_thread_takes_the_serial_path_from_parallel_sizes() {
-    let mut rng = Rng(6);
+    let mut rng = Rng::new(6);
     let pairs = pairs_of(&keys(&mut rng, PARALLEL + 1, 0));
     let mut got = pairs.clone();
     on(&Serial).sort_pairs(&mut got);
@@ -228,7 +213,7 @@ fn three_threads(with: &mut dyn FnMut(&dyn Workers)) -> bool {
 #[test]
 fn a_large_sort_runs_on_the_ambient_workers() {
     set_ambient(three_threads);
-    let pairs = pairs_of(&keys(&mut Rng(8), PARALLEL + 5, 0));
+    let pairs = pairs_of(&keys(&mut Rng::new(8), PARALLEL + 5, 0));
     let mut got = pairs.clone();
     sort_pairs(&mut got);
     assert_eq!(got, stable(&pairs));
@@ -264,7 +249,7 @@ fn the_stack_counters_hold_every_plan_they_are_given() {
 
 #[test]
 fn sorting_in_a_given_scratch_is_the_same_sort() {
-    let mut rng = Rng(9);
+    let mut rng = Rng::new(9);
     let mut scratch = Vec::new();
     for n in sizes() {
         for shape in 0..SHAPES {
@@ -276,7 +261,7 @@ fn sorting_in_a_given_scratch_is_the_same_sort() {
         }
     }
     let wide: Vec<(u128, u32)> =
-        (0..WIDE as u32 + 7).map(|at| (((rng.next() as u128) << 64) | rng.next() as u128, at)).collect();
+        (0..WIDE as u32 + 7).map(|at| (((rng.next_u64() as u128) << 64) | rng.next_u64() as u128, at)).collect();
     let mut want = wide.clone();
     want.sort_by_key(|it| it.0);
     let mut got = wide;
@@ -288,7 +273,7 @@ fn sorting_in_a_given_scratch_is_the_same_sort() {
 /// by both.
 #[test]
 fn a_reused_scratch_sorts_the_same_on_workers() {
-    let mut rng = Rng(12);
+    let mut rng = Rng::new(12);
     let mut scratch = Vec::new();
     for n in [PARALLEL + 777, 5000, PARALLEL, SMALL + 1] {
         for shape in [0, 1, 6] {
@@ -308,7 +293,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 #[test]
 fn a_sort_in_a_scratch_with_room_allocates_nothing() {
-    let mut rng = Rng(10);
+    let mut rng = Rng::new(10);
     for n in [SMALL + 1, 5000, WIDE + 3] {
         let items: Vec<u64> = keys(&mut rng, n, 0);
         let mut scratch = Vec::with_capacity(n);
@@ -324,9 +309,9 @@ fn a_sort_in_a_scratch_with_room_allocates_nothing() {
 
 #[test]
 fn order_helpers_keep_order() {
-    let mut rng = Rng(7);
+    let mut rng = Rng::new(7);
     for _ in 0..10_000 {
-        let (a, b) = (rng.next() as i64, rng.next() as i64);
+        let (a, b) = (rng.next_u64() as i64, rng.next_u64() as i64);
         assert_eq!(a.cmp(&b), signed_64(a).cmp(&signed_64(b)));
         let (c, d) = (a as i32, b as i32);
         assert_eq!(c.cmp(&d), signed_32(c).cmp(&signed_32(d)));

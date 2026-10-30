@@ -8,6 +8,8 @@
 //! against the tag at once and reads a row only for a matching lane, so a hit is one cache line
 //! of rows.
 
+use blaze_ids::radix;
+
 use crate::{
     Key, Kind,
     disk::{Form, Loc, id_at, u32_at, u64_at},
@@ -38,18 +40,21 @@ pub(crate) type Matcher = fn(&[u8; GROUP], u8) -> u16;
 
 /// An index table of `entries`, whose bytes depend only on the set of entries. No key may
 /// repeat.
+///
+/// Entries are placed in the order of their first group, then of their key: each probe starts
+/// at or after the group the one before started at, so the control column and the rows are
+/// written front to back, where key order costs a cache miss an entry in each.
 pub(crate) fn build_index(entries: &[(Key, Loc)]) -> Vec<u8> {
-    // alloc: once per index table built (a settle), its entries sorted
-    let mut entries = entries.to_vec();
-    entries.sort_unstable_by_key(|(key, _)| *key);
-    assert!(
-        entries.windows(2).all(|pair| pair[0].0 != pair[1].0),
-        "an index table was given one key twice"
-    );
     let mut slots = LEAST_SLOTS;
     while (entries.len() as u64) * LOAD_DENOMINATOR > slots * LOAD_NUMERATOR {
         slots *= 2;
     }
+    let groups_mask = slots / GROUP as u64 - 1;
+    let order = placing_order(entries, groups_mask);
+    assert!(
+        order.windows(2).all(|pair| entries[pair[0].1 as usize].0 != entries[pair[1].1 as usize].0),
+        "an index table was given one key twice"
+    );
     // alloc: the table built is the output, written whole
     let mut out = vec![0; INDEX_HEADER + slots as usize * (1 + ROW)];
     out[..8].copy_from_slice(&INDEX_MAGIC);
@@ -59,8 +64,8 @@ pub(crate) fn build_index(entries: &[(Key, Loc)]) -> Vec<u8> {
     let (control, rows) = out[INDEX_HEADER..].split_at_mut(slots as usize);
     control.fill(EMPTY);
     let lanes = matcher();
-    let groups_mask = slots / GROUP as u64 - 1;
-    for (key, loc) in &entries {
+    for &(_, at) in &order {
+        let (key, loc) = &entries[at as usize];
         let slot = free_slot(control, groups_mask, key, lanes);
         control[slot] = tag(key);
         let row = &mut rows[slot * ROW..(slot + 1) * ROW];
@@ -73,6 +78,36 @@ pub(crate) fn build_index(entries: &[(Key, Loc)]) -> Vec<u8> {
         row[56..64].copy_from_slice(&loc.raw.to_le_bytes());
     }
     out
+}
+
+/// Each entry's [`placing`] value and number, by that value and then by key: radix passes over
+/// 8-byte pairs, the entries themselves only read. Equal values are rare, and a repeated key
+/// ends up next to its repeat.
+fn placing_order(entries: &[(Key, Loc)], groups_mask: u64) -> Vec<(u32, u32)> {
+    assert!(u32::try_from(entries.len()).is_ok(), "an index table of {} entries", entries.len());
+    assert!(groups_mask.count_ones() < 32, "an index table of {} groups", groups_mask + 1);
+    let placed = entries.iter().zip(0..).map(|((key, _), at)| (placing(key, groups_mask), at));
+    // alloc: once per index table built (a settle), 8 bytes an entry
+    let mut order: Vec<(u32, u32)> = placed.collect();
+    radix::sort_pairs(&mut order);
+    let mut from = 0;
+    while from < order.len() {
+        let value = order[from].0;
+        let to = from + order[from..].iter().take_while(|it| it.0 == value).count();
+        if to - from > 1 {
+            order[from..to].sort_unstable_by_key(|it| entries[it.1 as usize].0);
+        }
+        from = to;
+    }
+    order
+}
+
+/// `key`'s first group in the high bits, then the bits of key bytes 8..12 that fit below it.
+fn placing(key: &Key, groups_mask: u64) -> u32 {
+    let group_bits = groups_mask.count_ones();
+    let bytes = &key.0.0;
+    let rest = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    (((start(key) & groups_mask) as u32) << (32 - group_bits)) | (rest >> group_bits)
 }
 
 /// The lowest empty lane of the first group on `key`'s probe with one.
@@ -471,6 +506,103 @@ mod tests {
         }
         let reversed: Vec<(Key, Loc)> = entries.iter().rev().copied().collect();
         assert!(build_index(&reversed) == bytes);
+    }
+
+    /// The table placed in key order, as it was before entries were placed by group.
+    fn build_in_key_order(entries: &[(Key, Loc)]) -> Vec<u8> {
+        let mut entries = entries.to_vec();
+        entries.sort_unstable_by_key(|(key, _)| *key);
+        let mut slots = LEAST_SLOTS;
+        while (entries.len() as u64) * LOAD_DENOMINATOR > slots * LOAD_NUMERATOR {
+            slots *= 2;
+        }
+        let mut out = vec![0; INDEX_HEADER + slots as usize * (1 + ROW)];
+        out[..INDEX_HEADER].copy_from_slice(&build_index(&[])[..INDEX_HEADER]);
+        out[16..24].copy_from_slice(&slots.to_le_bytes());
+        out[24..32].copy_from_slice(&(entries.len() as u64).to_le_bytes());
+        let (control, rows) = out[INDEX_HEADER..].split_at_mut(slots as usize);
+        control.fill(EMPTY);
+        let groups_mask = slots / GROUP as u64 - 1;
+        for (key, loc) in &entries {
+            let slot = free_slot(control, groups_mask, key, lanes_portable);
+            control[slot] = tag(key);
+            let row = &mut rows[slot * ROW..(slot + 1) * ROW];
+            row[..32].copy_from_slice(&key.0.0);
+            row[32..36].copy_from_slice(&loc.pack.to_le_bytes());
+            row[36] = loc.kind.code();
+            row[37] = loc.form.code();
+            row[40..48].copy_from_slice(&loc.offset.to_le_bytes());
+            row[48..56].copy_from_slice(&loc.stored.to_le_bytes());
+            row[56..64].copy_from_slice(&loc.raw.to_le_bytes());
+        }
+        out
+    }
+
+    /// Placing by group answers every lookup as placing in key order did: the same header,
+    /// the same entries found, the same keys absent; only which slot holds an entry differs.
+    #[test]
+    fn placing_by_group_answers_as_placing_by_key_did() {
+        let mut rng = Rng::new(61);
+        let prefix = rng.next_u64();
+        let mut sets: Vec<Vec<(Key, Loc)>> =
+            [0, 1, 17, 896, 897, 5000, 60_000].into_iter().map(|count| random_entries(count, 60 + count as u64)).collect();
+        sets.push(with_locs((0..2000).map(|_| clustered_key(&mut rng, prefix)).collect()));
+        let absent: Vec<Key> = (0..2000).map(|_| random_key(&mut rng)).collect();
+        for entries in &sets {
+            let (new, old) = (build_index(entries), build_in_key_order(entries));
+            assert_eq!(new.len(), old.len());
+            assert_eq!(new[..INDEX_HEADER], old[..INDEX_HEADER]);
+            let (new, old) = (Table::new(&new).unwrap(), Table::new(&old).unwrap());
+            for (key, loc) in entries {
+                assert_eq!(new.get(key).map(|it| it.1), Some(Ok(*loc)));
+                assert_eq!(old.get(key).map(|it| it.1), Some(Ok(*loc)));
+            }
+            let neighbours: Vec<Key> = entries.iter().map(|(key, _)| neighbour(key)).collect();
+            for key in absent.iter().chain(&neighbours) {
+                assert_eq!(new.get(key).is_some(), old.get(key).is_some());
+            }
+        }
+    }
+
+    /// Entries are placed group by group, each once, in the order of the placing value and
+    /// then of the key.
+    #[test]
+    fn the_placing_order_never_goes_back_a_group() {
+        let entries = random_entries(20_000, 62);
+        let groups_mask = (32 << 10) / GROUP as u64 - 1;
+        let order = placing_order(&entries, groups_mask);
+        let mut seen: Vec<u32> = order.iter().map(|it| it.1).collect();
+        seen.sort_unstable();
+        assert!(seen.iter().copied().eq(0..entries.len() as u32));
+        let place = |it: &(u32, u32)| {
+            let key = entries[it.1 as usize].0;
+            assert_eq!(it.0, placing(&key, groups_mask));
+            (start(&key) & groups_mask, it.0, key)
+        };
+        assert!(order.windows(2).all(|pair| place(&pair[0]) < place(&pair[1])));
+    }
+
+    /// Keys alike in every byte the placing value reads are still placed by key, so the bytes
+    /// depend only on the set however they come.
+    #[test]
+    fn keys_tied_in_the_placing_value_are_placed_by_key() {
+        let mut rng = Rng::new(63);
+        let prefix = rng.next_u64();
+        let keys: Vec<Key> = (0..300)
+            .map(|_| {
+                let mut key = clustered_key(&mut rng, prefix);
+                key.0.0[8..12].copy_from_slice(&[1, 2, 3, 4]);
+                key
+            })
+            .collect();
+        let mut entries = with_locs(keys);
+        entries.extend(random_entries(500, 64));
+        let bytes = build_index(&entries);
+        for _ in 0..4 {
+            rng.shuffle(&mut entries);
+            assert!(build_index(&entries) == bytes);
+        }
+        finds_exactly(&entries, &[]);
     }
 
     #[test]

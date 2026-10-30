@@ -9,6 +9,7 @@
 //! The autoderef steps of a canonical receiver are stored the same way, by what
 //! `method_autoderef_steps` reads: rustc's `method_autoderef_steps` query.
 
+#[allow(unsafe_code)]
 mod table;
 #[cfg(test)]
 mod tests;
@@ -440,6 +441,10 @@ pub(super) fn with_steps<'db, R>(
 /// `PhantomData<&'db ()>`) and salsa ids; none is a reference into the database. A table entry
 /// is handed out only to a probe of the database its key's nonce names, in the revision its
 /// state names, so every handle in it was made by that database as it still is.
+///
+/// The safe version is a lift: a fold over every handle of the pick or of each step's canonical
+/// type, rebuilding the value on every insert and every hit, where this is a move or a borrow.
+#[allow(unsafe_code)]
 mod erase {
     use std::mem;
 

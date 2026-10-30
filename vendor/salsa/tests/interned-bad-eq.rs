@@ -2,6 +2,8 @@
 
 //! Equality that ignores an interned value can leave a caller holding an unvalidated ID.
 
+#![forbid(unsafe_code)]
+
 use salsa::plumbing::AsId;
 use salsa::{Database, Setter};
 

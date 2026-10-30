@@ -34,18 +34,13 @@ pub(crate) fn spliced(source: &str, edits: &[(TextRange, &str)]) -> Text {
 
 /// [`joined`] of `parts`, which are walked twice: for the length, then to copy.
 fn joined_from<'a>(parts: impl Iterator<Item = &'a str> + Clone) -> Text {
+    // clone: an iterator of borrowed parts, walked once for the length
     let len = parts.clone().map(|it| it.len()).sum();
     let mut bytes = Arc::<[u8]>::new_uninit_slice(len);
     let out = Arc::get_mut(&mut bytes).expect("a new Arc has no other owner");
     let mut at = 0;
     for part in parts {
-        let to = &mut out[at..at + part.len()];
-        // SAFETY: `to` is `part.len()` writable bytes (the bounds-checked slice above) and
-        // `part` is a borrowed `&str`, not this new allocation, so they do not overlap. A
-        // shorter `to` would write past `out`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(part.as_ptr(), to.as_mut_ptr().cast::<u8>(), to.len())
-        };
+        out[at..at + part.len()].write_copy_of_slice(part.as_bytes());
         at += part.len();
     }
     assert_eq!(at, len, "every byte of the text is written");

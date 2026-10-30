@@ -4,6 +4,8 @@
 //! are tracked on the cycle function and don't "leak" into the
 //! function calling the query with cycle handling.
 
+#![forbid(unsafe_code)]
+
 use expect_test::expect;
 use salsa::Setter as _;
 

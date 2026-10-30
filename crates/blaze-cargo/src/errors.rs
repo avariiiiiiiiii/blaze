@@ -65,8 +65,8 @@ pub fn at(
     text: &str,
     range: TextRange,
 ) -> Diagnostic {
-    let start = floor(text, usize::from(range.start()));
-    let end = floor(text, usize::from(range.end())).max(start);
+    let start = text.floor_char_boundary(usize::from(range.start()));
+    let end = text.floor_char_boundary(usize::from(range.end())).max(start);
     let (line_start, column_start) = position(text, start);
     let (line_end, column_end) = position(text, end);
     let first = text[..start].rfind('\n').map_or(0, |it| it + 1);
@@ -335,19 +335,28 @@ impl std::fmt::Display for Said {
     }
 }
 
-/// The last char boundary of `text` at or before `at`.
-fn floor(text: &str, at: usize) -> usize {
-    let mut at = at.min(text.len());
-    while !text.is_char_boundary(at) {
-        at -= 1;
-    }
-    at
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use syntax::TextSize;
+
+    /// This file's and blaze-diagnostics' `emit.rs`' copy, before both took std's.
+    fn kept_floor(text: &str, at: usize) -> usize {
+        let mut at = at.min(text.len());
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    #[test]
+    fn floor_char_boundary_is_the_copy_it_replaced() {
+        for text in ["", "a", "é", "aé€😀b", "😀😀", "\u{10ffff}x"] {
+            for at in (0..text.len() + 3).chain([usize::MAX]) {
+                assert_eq!(text.floor_char_boundary(at), kept_floor(text, at), "{text:?} at {at}");
+            }
+        }
+    }
 
     fn range(text: &str, of: &str) -> TextRange {
         let start = text.find(of).unwrap();

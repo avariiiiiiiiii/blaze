@@ -16,7 +16,7 @@ use hir_ty::{
     db::{InternedClosure, InternedOpaqueTyId},
     next_solver::{
         Binder, BoundExistentialPredicates, CallableIdWrapper, Clause, ClauseKind,
-        ExistentialProjection, FnSig, GenericArg, GenericArgs, ParamTy, Region, TermId, TermKind,
+        ExistentialProjection, FnSig, GenericArg, GenericArgs, ParamTy, Region, RegionExt as _, TermId, TermKind,
         Term, TraitClause, TraitIdWrapper, TraitRef, Ty, TyKind, Tys,
     },
 };
@@ -89,7 +89,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
             | TyKind::Coroutine(..)
             | TyKind::CoroutineWitness(..)
             | TyKind::Tuple(_)
-            | TyKind::Alias(_)
+            | TyKind::Alias(..)
             | TyKind::Param(_)
             | TyKind::Bound(..)
             | TyKind::Placeholder(_)
@@ -159,7 +159,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 self.print_type(ty);
                 self.write_str("]");
             }
-            TyKind::FnDef(def, args) => self.print_fn_def(def, args),
+            TyKind::FnDef(def, args) => self.print_fn_def(def, args.skip_binder()),
             TyKind::FnPtr(sig_tys, hdr) => {
                 self.wrap_binder(&sig_tys.with(hdr), BinderKind::ForAll, |p, sig| p.print_fn_sig(*sig))
             }
@@ -197,7 +197,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                     self.write_str(")");
                 }
             }
-            TyKind::Alias(alias) => match alias.kind {
+            TyKind::Alias(_, alias) => match alias.kind {
                 AliasTyKind::Projection { def_id } => {
                     self.print_def_path(Def::TypeAlias(def_id.0), alias.args.as_slice())
                 }
@@ -389,7 +389,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 let ty = self.db.ty(TyDefId::TypeAliasId(alias)).instantiate_identity().skip_normalization();
                 let is_alias = matches!(
                     ty.kind(),
-                    TyKind::Alias(it) if matches!(it.kind, AliasTyKind::Opaque { def_id } if def_id.0 == id)
+                    TyKind::Alias(_, it) if matches!(it.kind, AliasTyKind::Opaque { def_id } if def_id.0 == id)
                 );
                 self.print_def_path(Def::TypeAlias(alias), args.as_slice());
                 if !is_alias {
@@ -875,12 +875,12 @@ pub(super) fn sort_string(cx: &Cx<'_, '_>, ty: Ty<'_>, mode: Mode) -> String {
         // hir's types as inference had them at an error hold an undecided literal's as these.
         TyKind::Infer(InferTy::FreshIntTy(_)) => "integer",
         TyKind::Infer(InferTy::FreshFloatTy(_)) => "floating-point number",
-        TyKind::Alias(alias) if matches!(alias.kind, AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }) => {
+        TyKind::Alias(_, alias) if matches!(alias.kind, AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }) => {
             "associated type"
         }
         // alloc: a type's sort printed, the edge
         TyKind::Param(_) => return format!("type parameter `{}`", string(cx, ty, mode)),
-        TyKind::Alias(alias) if let AliasTyKind::Opaque { def_id } = alias.kind => {
+        TyKind::Alias(_, alias) if let AliasTyKind::Opaque { def_id } = alias.kind => {
             if is_future(cx, def_id.0) { "future" } else { "opaque type" }
         }
         TyKind::Error(_) => "type error",
@@ -934,7 +934,7 @@ pub(super) fn prefix_string(cx: &Cx<'_, '_>, ty: Ty<'_>) -> String {
         TyKind::Tuple(_) => "tuple",
         TyKind::Placeholder(_) => "higher-ranked type",
         TyKind::Bound(..) => "bound type variable",
-        TyKind::Alias(alias) => match alias.kind {
+        TyKind::Alias(_, alias) => match alias.kind {
             AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. } => "associated type",
             AliasTyKind::Free { .. } => "type alias",
             AliasTyKind::Opaque { .. } => "opaque type",

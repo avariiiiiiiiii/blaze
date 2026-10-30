@@ -289,6 +289,9 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
         if data >= tree.column_len(kind) {
             return Err("an item past the column of its kind");
         }
+        if !ItemTree::ast_id_fits(kind, tree.ast_ids()[at]) {
+            return Err("an item whose ast id is of another kind");
+        }
         let ok = match kind {
             ItemKind::Const => {
                 let it = &tree.consts()[data];

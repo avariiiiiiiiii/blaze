@@ -433,7 +433,6 @@ impl<'db> InferenceTable<'db> {
         self.infer_ctxt.start_snapshot()
     }
 
-    #[tracing::instrument(skip_all)]
     pub(crate) fn rollback_to(&mut self, snapshot: CombinedSnapshot) {
         self.infer_ctxt.rollback_to(snapshot);
     }

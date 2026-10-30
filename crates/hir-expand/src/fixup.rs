@@ -10,12 +10,8 @@ use span::{
 };
 use stdx::never;
 use syntax::{
-    SyntaxElement, SyntaxKind, SyntaxNode, TextRange, TextSize,
-    ast::{self, AstNode, HasLoopBody},
-    match_ast,
-    view::{
-        self, AstNode as _, HasLoopBody as _, NodeId,
-    },
+    SyntaxKind, TextRange, TextSize, match_ast,
+    view::{self, AstNode as _, HasLoopBody as _, NodeId},
 };
 use smallvec::smallvec;
 use syntax_bridge::{Appended, DocCommentDesugarMode, Removed};
@@ -31,8 +27,7 @@ use crate::{
 /// (appending to and replacing nodes), the information that is needed to
 /// reverse those changes afterwards, and a token map.
 ///
-/// `K` names an element: a view's [`NodeId`] for a build's input, a handle for the
-/// speculative input of an edited tree ([`fixup_syntax_handle`]).
+/// `K` names an element: a view's [`NodeId`].
 pub(crate) struct SyntaxFixups<'f, K = NodeId> {
     pub(crate) append: Appended<K, &'f Frame>,
     pub(crate) remove: Removed<K, &'f Frame>,
@@ -67,12 +62,11 @@ const FIXUP_DUMMY_RANGE: TextRange = TextRange::empty(TextSize::new(0));
 // `original` list in `SyntaxFixupUndoInfo`.
 const FIXUP_DUMMY_RANGE_END: TextSize = TextSize::new(!0);
 
-/// The fixups of the syntax errors under `node`, written once for both trees a macro input is
-/// read from: [`fixup_syntax`] over a view of the database's tree (every build's input), and
-/// [`fixup_syntax_handle`] over a handle of an edited tree (`expand_speculative`, IDE only).
+/// The fixups of the syntax errors under `node`: [`fixup_syntax`], over a view of the
+/// database's tree.
 macro_rules! fixup_syntax_impl {
     ($name:ident, $Node:ty, $Owned:ty, $Key:ty, $ast:ident, $key:ident, $to_tt:path) => {
-        #[allow(clippy::clone_on_copy, reason = "a view is `Copy`, a handle is not: one body for both")]
+        #[allow(clippy::clone_on_copy, reason = "the body was written for handles too; a view is `Copy`")]
         pub(crate) fn $name<'f>(
             frame: &'f Frame,
             span_map: SpanMap<'_>,
@@ -85,7 +79,7 @@ macro_rules! fixup_syntax_impl {
             }
 
             fn can_handle_error(node: &$Owned) -> bool {
-                ast::Expr::can_cast(node.kind())
+                view::Expr::can_cast(node.kind())
             }
 
             fn has_error_to_handle(node: &$Owned) -> bool {
@@ -387,12 +381,6 @@ macro_rules! view_key {
     };
 }
 
-macro_rules! handle_key {
-    ($element:expr) => {
-        SyntaxElement::from($element)
-    };
-}
-
 fn view_tree(
     node: &view::Node<'_>,
     map: SpanMap<'_>,
@@ -402,25 +390,7 @@ fn view_tree(
     syntax_bridge::call_input(*node, map, call_site, mode)
 }
 
-fn handle_tree(
-    node: &SyntaxNode,
-    map: SpanMap<'_>,
-    call_site: Span,
-    mode: DocCommentDesugarMode,
-) -> TopSubtree {
-    syntax_bridge::syntax_node_to_token_tree(node, map, call_site, mode)
-}
-
 fixup_syntax_impl!(fixup_syntax, view::Node<'_>, view::Node<'_>, NodeId, view, view_key, view_tree);
-fixup_syntax_impl!(
-    fixup_syntax_handle,
-    &SyntaxNode,
-    SyntaxNode,
-    SyntaxElement,
-    ast,
-    handle_key,
-    handle_tree
-);
 
 pub(crate) fn reverse_fixups<A: core::alloc::Allocator + Clone>(
     tt: &mut TopSubtree<A>,
@@ -446,26 +416,6 @@ pub(crate) fn reverse_fixups<A: core::alloc::Allocator + Clone>(
         });
     }
     reverse_fixups_(tt, undo_info);
-}
-
-/// [`reverse_fixups`] of an expansion: a borrowed tree is copied into `frame` first, only when
-/// there are fixups to undo.
-pub(crate) fn reverse_fixups_expansion<'f>(
-    frame: &'f Frame,
-    tt: &mut crate::Expansion<'_, 'f>,
-    undo_info: &SyntaxFixupUndoInfo,
-) {
-    if undo_info.original.is_none() {
-        return;
-    }
-    match tt {
-        crate::Expansion::Borrowed(it) => {
-            let mut copy = TopSubtree::from_subtree_in(it.view(), frame);
-            reverse_fixups(&mut copy, undo_info);
-            *tt = crate::Expansion::Framed(copy);
-        }
-        crate::Expansion::Framed(it) => reverse_fixups(it, undo_info),
-    }
 }
 
 fn reverse_fixups_<A: core::alloc::Allocator + Clone>(
@@ -573,26 +523,6 @@ mod tests {
             |_, _| (true, syntax_bridge::Inserted::new()),
         );
 
-        // The speculative input's handle version makes the same tree.
-        let handle_fixups = super::fixup_syntax_handle(
-            frame,
-            span_map,
-            &parsed.syntax_node(),
-            call_site,
-            DocCommentDesugarMode::Mbe,
-        );
-        assert_eq!(handle_fixups.undo_info, undo_info);
-        let handle_tt = syntax_bridge::syntax_node_to_token_tree_modified(
-            &parsed.syntax_node(),
-            span_map,
-            handle_fixups.append,
-            handle_fixups.remove,
-            call_site,
-            DocCommentDesugarMode::Mbe,
-            |_, _| (true, syntax_bridge::Inserted::new()),
-        );
-        assert_eq!(handle_tt, tt, "the view's and the handle's fixups differ");
-
         let actual = format!("{tt}\n");
 
         expect.indent(false);
@@ -607,7 +537,7 @@ mod tests {
         assert!(
             parse.errors().is_empty(),
             "parse has syntax errors. parse tree:\n{:#?}",
-            parse.syntax_node()
+            parse.root()
         );
 
         // the fixed-up tree should not contain braces as punct
@@ -625,8 +555,8 @@ mod tests {
 
         // the fixed-up + reversed version should be equivalent to the original input
         // modulo token IDs and `Punct`s' spacing.
-        let original_as_tt = syntax_bridge::syntax_node_to_token_tree(
-            &parsed.syntax_node(),
+        let original_as_tt = syntax_bridge::call_input(
+            parsed.root(),
             span_map,
             span_map.span_for_range(TextRange::empty(0.into())),
             DocCommentDesugarMode::Mbe,
@@ -654,14 +584,6 @@ mod tests {
             frame,
             span_map,
             parsed.root(),
-            call_site,
-            DocCommentDesugarMode::ProcMacro,
-        );
-        assert!(!fixups.append.is_empty());
-        let fixups = super::fixup_syntax_handle(
-            frame,
-            span_map,
-            &parsed.syntax_node(),
             call_site,
             DocCommentDesugarMode::ProcMacro,
         );

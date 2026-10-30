@@ -311,7 +311,7 @@ impl<'a> BindingsBuilder<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone)] // clone: the `#[cfg(test)]` model of the old matcher, which copies a state per fork
 struct MatchState<'t> {
     /// The position of the "dot" in this matcher
     dot: OpDelimitedIter<'t>,

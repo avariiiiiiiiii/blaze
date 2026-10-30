@@ -18,12 +18,21 @@
 //!   order, tie), each piece's pointers in address order; fini runs last to first.
 
 use blaze_ids::radix;
-use blaze_inproc::TlsReserve;
 
 use crate::PremapError;
 use crate::image::View;
 use crate::prelink::{BindKind, InitEntry, Library, Tls};
 use crate::table::{Def, Kind, Strength, SymbolId};
+
+/// The area the run's loader keeps aside in every thread's static block: a program's
+/// thread-locals are at `bias + offset` in it, from the thread pointer on ELF, from the start
+/// of the module's block on PE.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct TlsReserve {
+    pub bias: i64,
+    pub size: u64,
+    pub align: u64,
+}
 
 /// One part of the program's thread-local area: the template's bytes at `template`, `init`
 /// initialized and zeroes to `size`, copied to `offset` in the area.

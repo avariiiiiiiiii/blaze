@@ -85,13 +85,20 @@ pub(crate) fn workspace_data(
     const_eval: ConstEvalBudget,
 ) -> Result<Arc<CrateWorkspaceData>, LowerError> {
     let data_layout = target::data_layout(triple).map_err(|what| LowerError::at(what, triple))?;
+    let has_thumb_interworking =
+        target::has_thumb_interworking(triple).map_err(|what| LowerError::at(what, triple))?;
     let arch = match triple.split('-').next() {
         Some("wasm32") => Arch::Wasm32,
         Some("wasm64") => Arch::Wasm64,
         _ => Arch::Other,
     };
     Ok(Arc::new(CrateWorkspaceData {
-        target: Ok(TargetData { data_layout: data_layout.into_boxed_str(), arch }),
+        target: Ok(TargetData {
+            tuple: Symbol::intern(triple),
+            data_layout: data_layout.into_boxed_str(),
+            arch,
+            has_thumb_interworking,
+        }),
         toolchain: Some(toolchain.clone()),
         const_eval,
     }))

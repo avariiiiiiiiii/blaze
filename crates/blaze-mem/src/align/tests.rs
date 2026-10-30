@@ -1,4 +1,5 @@
-use proptest::prelude::*;
+use hegel::generators as gs;
+use hegel::{Generator, PrintableGenerator, TestCase};
 
 use super::*;
 
@@ -35,75 +36,82 @@ const _: () = {
     assert!(matches!(checked_align_up_u64(u64::MAX, 1), Some(u64::MAX)));
 };
 
-fn power_of_two(bits: u32) -> impl Strategy<Value = u64> {
-    (0..bits).prop_map(|shift| 1u64 << shift)
+fn power_of_two(bits: u32) -> impl PrintableGenerator<u64> {
+    gs::integers::<u32>().max_value(bits - 1).map(|shift| 1u64 << shift)
 }
 
-proptest! {
-    #[test]
-    fn up_matches_the_copies_and_std(value in any::<u64>(), align in power_of_two(64)) {
-        let checked = checked_align_up_u64(value, align);
-        prop_assert_eq!(checked, value.checked_next_multiple_of(align));
-        prop_assert_eq!(checked.map(|it| it as usize), reference::round_up(value as usize, align as usize));
-        if let Some(up) = checked {
-            prop_assert_eq!(align_up_u64(value, align), up);
-            prop_assert_eq!(reference::up(value, align), up);
-            prop_assert_eq!(align_up(value as usize, align as usize), up as usize);
-        }
-    }
-
-    #[test]
-    fn up_u32_matches_std(value in any::<u32>(), align in power_of_two(32)) {
-        let align = align as u32;
-        prop_assert_eq!(checked_align_up_u32(value, align), value.checked_next_multiple_of(align));
-        if let Some(up) = value.checked_next_multiple_of(align) {
-            prop_assert_eq!(align_up_u32(value, align), up);
-        }
-    }
-
-    #[test]
-    fn down_and_is_aligned_match_division(value in any::<u64>(), align in power_of_two(64)) {
-        let down = align_down_u64(value, align);
-        prop_assert_eq!(down, reference::down(value, align));
-        prop_assert!(down <= value && value - down < align);
-        prop_assert_eq!(is_aligned_u64(value, align), value % align == 0);
-        prop_assert!(is_aligned_u64(down, align));
-        prop_assert_eq!(align_down(value as usize, align as usize), down as usize);
-        prop_assert_eq!(is_aligned(value as usize, align as usize), value as usize % align as usize == 0);
-        if align <= 1 << 31 {
-            let (small, small_align) = (value as u32, align as u32);
-            prop_assert_eq!(align_down_u32(small, small_align), small - small % small_align);
-            prop_assert_eq!(is_aligned_u32(small, small_align), small % small_align == 0);
-        }
-    }
-
-    #[test]
-    fn padding_reaches_the_next_multiple(value in any::<u64>(), align in power_of_two(64)) {
-        let padding = padding_for_u64(value, align);
-        prop_assert_eq!(padding, reference::padding(value, align));
-        prop_assert!(padding < align);
-        if let Some(up) = checked_align_up_u64(value, align) {
-            prop_assert_eq!(value + padding, up);
-        }
-        prop_assert_eq!(padding_for(value as usize, align as usize), padding as usize);
-        if align <= 1 << 31 {
-            let (small, small_align) = (value as u32, align as u32);
-            prop_assert_eq!(padding_for_u32(small, small_align), (small_align - small % small_align) % small_align);
-        }
+#[hegel::test]
+fn up_matches_the_copies_and_std(tc: TestCase) {
+    let value: u64 = tc.draw(gs::integers());
+    let align = tc.draw(power_of_two(64));
+    let checked = checked_align_up_u64(value, align);
+    assert_eq!(checked, value.checked_next_multiple_of(align));
+    assert_eq!(checked.map(|it| it as usize), reference::round_up(value as usize, align as usize));
+    if let Some(up) = checked {
+        assert_eq!(align_up_u64(value, align), up);
+        assert_eq!(reference::up(value, align), up);
+        assert_eq!(align_up(value as usize, align as usize), up as usize);
     }
 }
 
-proptest! {
-    /// Against `blaze-live`'s `pages`, which `align_range_u64` replaced.
-    #[test]
-    fn range_covers_the_blocks_touched(start in 0..u64::MAX >> 1, len in 0..1u64 << 20, align in power_of_two(32)) {
-        let range = start..start + len;
-        let covered = align_range_u64(range.clone(), align);
-        prop_assert_eq!(covered.clone(), range.start & !(align - 1)..range.end.next_multiple_of(align));
-        prop_assert!(covered.start <= range.start && covered.end >= range.end);
-        prop_assert!(is_aligned_u64(covered.start, align) && is_aligned_u64(covered.end, align));
-        prop_assert_eq!(align_range(start as usize..(start + len) as usize, align as usize), covered.start as usize..covered.end as usize);
+#[hegel::test]
+fn up_u32_matches_std(tc: TestCase) {
+    let value: u32 = tc.draw(gs::integers());
+    let align = tc.draw(power_of_two(32));
+    let align = align as u32;
+    assert_eq!(checked_align_up_u32(value, align), value.checked_next_multiple_of(align));
+    if let Some(up) = value.checked_next_multiple_of(align) {
+        assert_eq!(align_up_u32(value, align), up);
     }
+}
+
+#[hegel::test]
+fn down_and_is_aligned_match_division(tc: TestCase) {
+    let value: u64 = tc.draw(gs::integers());
+    let align = tc.draw(power_of_two(64));
+    let down = align_down_u64(value, align);
+    assert_eq!(down, reference::down(value, align));
+    assert!(down <= value && value - down < align);
+    assert_eq!(is_aligned_u64(value, align), value % align == 0);
+    assert!(is_aligned_u64(down, align));
+    assert_eq!(align_down(value as usize, align as usize), down as usize);
+    assert_eq!(is_aligned(value as usize, align as usize), value as usize % align as usize == 0);
+    if align <= 1 << 31 {
+        let (small, small_align) = (value as u32, align as u32);
+        assert_eq!(align_down_u32(small, small_align), small - small % small_align);
+        assert_eq!(is_aligned_u32(small, small_align), small % small_align == 0);
+    }
+}
+
+#[hegel::test]
+fn padding_reaches_the_next_multiple(tc: TestCase) {
+    let value: u64 = tc.draw(gs::integers());
+    let align = tc.draw(power_of_two(64));
+    let padding = padding_for_u64(value, align);
+    assert_eq!(padding, reference::padding(value, align));
+    assert!(padding < align);
+    if let Some(up) = checked_align_up_u64(value, align) {
+        assert_eq!(value + padding, up);
+    }
+    assert_eq!(padding_for(value as usize, align as usize), padding as usize);
+    if align <= 1 << 31 {
+        let (small, small_align) = (value as u32, align as u32);
+        assert_eq!(padding_for_u32(small, small_align), (small_align - small % small_align) % small_align);
+    }
+}
+
+/// Against `blaze-live`'s `pages`, which `align_range_u64` replaced.
+#[hegel::test]
+fn range_covers_the_blocks_touched(tc: TestCase) {
+    let start: u64 = tc.draw(gs::integers().max_value((u64::MAX >> 1) - 1));
+    let len: u64 = tc.draw(gs::integers().max_value((1 << 20) - 1));
+    let align = tc.draw(power_of_two(32));
+    let range = start..start + len;
+    let covered = align_range_u64(range.clone(), align);
+    assert_eq!(covered.clone(), range.start & !(align - 1)..range.end.next_multiple_of(align));
+    assert!(covered.start <= range.start && covered.end >= range.end);
+    assert!(is_aligned_u64(covered.start, align) && is_aligned_u64(covered.end, align));
+    assert_eq!(align_range(start as usize..(start + len) as usize, align as usize), covered.start as usize..covered.end as usize);
 }
 
 #[test]

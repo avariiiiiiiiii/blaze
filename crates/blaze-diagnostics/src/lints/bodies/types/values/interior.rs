@@ -39,7 +39,7 @@ impl LatePass for InteriorMutableConsts {
     const LINTS: LintSet = lint_set(["const_item_interior_mutations"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::MethodCall, ExprKind::Call]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();
         let (callee, receiver) = match store.expr(expr) {
             Expr::MethodCall { receiver, .. } => (None, receiver),
@@ -123,7 +123,7 @@ fn should_not_be_called_on_const_items(db: &Db, method: FunctionId) -> bool {
 /// rustc's `ConstItemInteriorMutationsSuggestionStatic`: for a `const` item of the crate (not
 /// an associated one), `static` suggested in place of `const`, or said in words when the item
 /// is written by a macro.
-fn static_suggestion(b: &BodyCx<'_, '_>, diag: &mut Diag, konst: ConstId, const_name: &str) {
+fn static_suggestion(b: &BodyCx<'_, '_, '_>, diag: &mut Diag, konst: ConstId, const_name: &str) {
     let db = b.db();
     let loc = konst.lookup(db);
     if !matches!(loc.container, ItemContainerId::ModuleId(_)) || konst.krate(db) != b.cx.krate.base() {

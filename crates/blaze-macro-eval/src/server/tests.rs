@@ -19,7 +19,7 @@ fn at(start: u32, end: u32) -> Span {
 }
 
 fn server(_db: &Db) -> Server {
-    Server::new([at(0, 0), at(1, 1), at(2, 2)], Edition::CURRENT)
+    Server::new([at(0, 0), at(1, 1), at(2, 2)], Edition::CURRENT, false)
 }
 
 /// A request as the client writes it: its tag, then its arguments.

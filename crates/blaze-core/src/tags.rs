@@ -33,7 +33,8 @@ impl Tags {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use hegel::TestCase;
+    use hegel::generators as gs;
 
     use super::*;
 
@@ -72,17 +73,19 @@ mod tests {
         assert_eq!(tags.next(), Tag(5 << 32));
     }
 
-    proptest! {
-        #[test]
-        fn hands_out_what_the_copies_did(base in 0u64..(u64::MAX >> 1), start in any::<u64>(), asks in 1usize..64, probe in any::<u64>()) {
-            let mut tags = Tags { base, next: start };
-            let mut reference = Reference { base, next: start };
-            for _ in 0..asks {
-                let tag = tags.next();
-                prop_assert_eq!(tag, reference.next());
-                prop_assert!(tags.owns(tag));
-            }
-            prop_assert_eq!(tags.owns(Tag(probe)), reference.owns(Tag(probe)));
+    #[hegel::test]
+    fn hands_out_what_the_copies_did(tc: TestCase) {
+        let base: u64 = tc.draw(gs::integers().max_value((u64::MAX >> 1) - 1));
+        let start: u64 = tc.draw(gs::integers());
+        let asks: usize = tc.draw(gs::integers().min_value(1).max_value(63));
+        let probe: u64 = tc.draw(gs::integers());
+        let mut tags = Tags { base, next: start };
+        let mut reference = Reference { base, next: start };
+        for _ in 0..asks {
+            let tag = tags.next();
+            assert_eq!(tag, reference.next());
+            assert!(tags.owns(tag));
         }
+        assert_eq!(tags.owns(Tag(probe)), reference.owns(Tag(probe)));
     }
 }

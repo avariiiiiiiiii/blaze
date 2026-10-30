@@ -363,24 +363,39 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
             return Resolved { res, qualifier: Res::None, resolved: !anchored };
         }
         let need = inferred.is_none();
-        let (value, ty) = self.in_scope(|r| {
-            let mut value = None;
-            let mut ty = None;
-            if site == Site::Value {
-                if need {
-                    value = r.resolve_path_in_value_ns_fully(db, path, hygiene);
-                }
-                if qualified || (need && value.is_none()) {
+        // What inference recorded is what the resolver finds at the path's scope
+        // (`tests::recorded_value_paths_are_what_the_resolver_finds`): a value path resolved
+        // whole, or the type its leading segments name when it is type-relative.
+        let recorded = at.filter(|_| need && site == Site::Value);
+        let recorded_value = recorded.and_then(|at| self.infer.value_resolution(at));
+        let recorded_qualifier = match recorded_value {
+            None if qualified => recorded
+                .and_then(|at| self.infer.qualifier_resolution(at))
+                .map(|(ty, segments)| (ty, Some(segments as usize))),
+            _ => None,
+        };
+        let (value, ty) = match (recorded_value, recorded_qualifier) {
+            (Some(value), _) if !qualified => (Some(value), None),
+            (None, Some(ty)) => (None, Some(ty)),
+            _ => self.in_scope(|r| {
+                let mut value = None;
+                let mut ty = None;
+                if site == Site::Value {
+                    if need {
+                        value = recorded_value.or_else(|| r.resolve_path_in_value_ns_fully(db, path, hygiene));
+                    }
+                    if qualified || (need && value.is_none()) {
+                        ty = r.resolve_path_in_type_ns(db, path).map(|(it, remaining, _)| (it, remaining));
+                    }
+                } else {
                     ty = r.resolve_path_in_type_ns(db, path).map(|(it, remaining, _)| (it, remaining));
+                    if need && !matches!(ty, Some((_, None))) {
+                        value = r.resolve_path_in_value_ns_fully(db, path, hygiene);
+                    }
                 }
-            } else {
-                ty = r.resolve_path_in_type_ns(db, path).map(|(it, remaining, _)| (it, remaining));
-                if need && !matches!(ty, Some((_, None))) {
-                    value = r.resolve_path_in_value_ns_fully(db, path, hygiene);
-                }
-            }
-            (value, ty)
-        });
+                (value, ty)
+            }),
+        };
         let res = match inferred {
             Some(res) => res,
             None => self.full(site, value, ty, segments, self_ctor),
@@ -629,5 +644,84 @@ fn ident(path: Path<'_>) -> Option<&Name> {
     match path {
         Path::BarePath(it) => it.as_ident(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hir_def::{
+        expr_store::{ExpressionStore, scope::ExprScopes},
+        hir::{Expr, ExprOrPatId},
+        nameres::demand::crate_body_owners,
+        resolver::resolver_for_scope,
+    };
+    use hir_ty::{InferBodyId, InferenceResult};
+
+    use crate::lower::break_outside_of_loop::tests::with_file;
+
+    /// Value paths of each kind: locals, a closure's parameter and capture, a const parameter,
+    /// functions, constants, statics and constructors through a module, and type-relative paths
+    /// through a struct, a type parameter and an alias.
+    const PATHS: &str = r#"
+mod m { pub fn f() {} pub const C: u8 = 0; pub static S: u8 = 0; }
+pub struct Unit;
+pub struct Tuple(pub u8);
+pub struct S;
+impl S { pub fn new() -> S { S } pub const K: u8 = 1; }
+pub trait Tr { fn t() -> u8; }
+impl Tr for S { fn t() -> u8 { 0 } }
+pub enum E { A, B(u8) }
+type Alias = E;
+fn f() {}
+pub fn g<T: Tr, const N: usize>(x: u8) -> u8 {
+    let y = x;
+    let _ = m::f;
+    let _ = m::C + m::S;
+    let _ = Unit;
+    let _ = Tuple;
+    let _ = S::new;
+    let _ = S::K;
+    let _ = T::t;
+    let _ = Alias::A;
+    let _ = E::B;
+    let _ = N;
+    let f = 1;
+    let _ = f;
+    let c = |z: u8| z + y;
+    c(y)
+}
+"#;
+
+    /// What inference records of a value path, resolved whole or type-relative, is what the
+    /// resolver finds at the path's own scope: the condition for `Walk::resolve` to read it.
+    #[test]
+    fn recorded_value_paths_are_what_the_resolver_finds() {
+        with_file(PATHS, |cx, _| {
+            let db = cx.db;
+            let (mut values, mut qualifiers) = (0, 0);
+            for owner in crate_body_owners(db, cx.krate.base()) {
+                let infer = InferenceResult::of(db, InferBodyId::DefWithBodyId(owner));
+                let store = ExpressionStore::of(db, owner.into());
+                let scopes = ExprScopes::of(db, owner);
+                for (expr, it) in store.exprs() {
+                    let Expr::Path(path) = it else { continue };
+                    let resolver = resolver_for_scope(db, owner, scopes.scope_for(expr));
+                    let hygiene = store.expr_path_hygiene(expr);
+                    let at = ExprOrPatId::ExprId(expr);
+                    if let Some(value) = infer.value_resolution(at) {
+                        assert_eq!(Some(value), resolver.resolve_path_in_value_ns_fully(db, path, hygiene), "{expr:?}");
+                        values += 1;
+                    }
+                    if let Some((ty, segments)) = infer.qualifier_resolution(at) {
+                        assert_eq!(resolver.resolve_path_in_value_ns_fully(db, path, hygiene), None, "{expr:?}");
+                        let found = resolver.resolve_path_in_type_ns(db, path).map(|(it, remaining, _)| (it, remaining));
+                        assert_eq!(found, Some((ty, Some(segments as usize))), "{expr:?}");
+                        qualifiers += 1;
+                    }
+                }
+            }
+            assert!(values >= 10, "{values} value paths recorded");
+            assert!(qualifiers >= 3, "{qualifiers} type-relative paths recorded");
+        });
     }
 }

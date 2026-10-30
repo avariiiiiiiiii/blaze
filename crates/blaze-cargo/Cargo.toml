@@ -28,11 +28,13 @@ unsandboxed-tests = [
 fn-cache = { package = "blaze-cache", path = "../blaze-cache" }
 anyhow.workspace = true
 blaze-diagnostics.workspace = true
+blaze-item-hash.workspace = true
 blaze-items.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
 hir-ty-ub.workspace = true
+hir-ty-pure = { path = "../hir-ty-pure" }
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
@@ -92,6 +94,7 @@ vfs.workspace = true
 triomphe.workspace = true
 paths.workspace = true
 syntax.workspace = true
+stdx.workspace = true
 # Without the features that bring a second HTTP and TLS stack (`rustls`), a C library built
 # with cmake (`default-https-client`, which is aws-lc) and SigV4A. The client is hyper 1 over
 # rustls with ring, which is in the tree already.

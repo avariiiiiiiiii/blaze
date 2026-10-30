@@ -232,7 +232,7 @@ kinds! {
     /// Which [`type_ref::TypeRef`] variant a type of a buffer is, read in place.
     TypeRefKind {
         Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
-        TypeParam, PatternType, Error,
+        TypeParam, PatternType, Error, UnsafeBinder,
     }
 
     /// Which [`LifetimeRef`] variant a node of a buffer is, read in place.
@@ -250,7 +250,7 @@ kinds! {
 same_numbers! {
     TypeRefKind = type_ref::TypeRefKind {
         Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
-        TypeParam, PatternType, Error,
+        TypeParam, PatternType, Error, UnsafeBinder,
     }
     StatementKind = columns::StatementKind {
         Let, Expr, MacroDef, Item,
@@ -1481,7 +1481,7 @@ impl ExpressionStore {
 impl Persist for ExpressionStore {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ExpressionStore"),
-        Part::U64(7),
+        Part::U64(8),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1554,7 +1554,7 @@ impl Body {
 impl Persist for Body {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("Body"),
-        Part::U64(7),
+        Part::U64(8),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -2483,6 +2483,7 @@ mod tests {
             TypeRef::TypeParam(_) => TypeRefKind::TypeParam,
             TypeRef::PatternType(..) => TypeRefKind::PatternType,
             TypeRef::Error => TypeRefKind::Error,
+            TypeRef::UnsafeBinder { .. } => TypeRefKind::UnsafeBinder,
         }
     }
 

@@ -81,7 +81,7 @@ impl Std {
             _ => None,
         };
         let function = |path: &[&str]| match def(path) {
-            Some(hir::ModuleDef::Function(it)) => Some(FunctionId::from(it)),
+            Some(hir::ModuleDef::Function(it)) => FunctionId::try_from(it).ok(),
             _ => None,
         };
         let trait_ = |path: &[&str]| match def(path) {

@@ -27,7 +27,7 @@ use hir::{InFile, MacroCallId};
 use hir_expand::{ExpandTo, MacroCallKind, MacroCallLoc, MacroDefKind, builtin::BuiltinAttrExpander};
 use syntax::{
     NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextSize,
-    view::{self as ast, AstNode as _, AstToken as _, HasName as _},
+    view::{self as ast, AstNode as _, HasName as _},
 };
 
 use crate::{
@@ -206,10 +206,7 @@ fn next_token(root: ast::Node<'_>, offset: TextSize) -> Option<ast::Token<'_>> {
         if token.text_range().start() < offset {
             return false;
         }
-        match token.kind() {
-            SyntaxKind::COMMENT => ast::Comment::cast(*token).is_some_and(|it| it.kind().doc.is_some()),
-            kind => !kind.is_trivia(),
-        }
+        !token.kind().is_trivia()
     })
 }
 

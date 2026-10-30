@@ -21,7 +21,7 @@ use crate::{
 
 const SUPPORTED: &str = "the only supported types are integers, `bool`, and `char`";
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ConstParamTyNotAllowed<'_>) -> Vec<Found> {
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ConstParamTyNotAllowed<'db>) -> Vec<Found> {
     let at = d.param.map(|it| it.syntax_node_ptr());
     let node = cx.syntax_view(at);
     let param = cx.node_view(d.param);

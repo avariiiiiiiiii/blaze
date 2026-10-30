@@ -285,7 +285,7 @@ fn next_op(
                         let (kind, spec) = eat_fragment_kind(edition, src, mode)?;
                         let name = MetaVar::new(ident.sym, ident.span);
                         let id = ident.span;
-                        let decl = p.span.cover(spec.map_or(id, |it| it.span));
+                        let decl = p.span.cover(spec.as_ref().map_or(id, |it| it.span));
                         let spec = spec.map(|it| it.sym);
                         Op::Var { name, kind, id, binder: NO_BINDER, spec, decl }
                     }
@@ -293,7 +293,7 @@ fn next_op(
                         let (kind, spec) = eat_fragment_kind(edition, src, mode)?;
                         let name = MetaVar::new(lit.text_and_suffix, lit.span);
                         let id = lit.span;
-                        let decl = p.span.cover(spec.map_or(id, |it| it.span));
+                        let decl = p.span.cover(spec.as_ref().map_or(id, |it| it.span));
                         let spec = spec.map(|it| it.sym);
                         Op::Var { name, kind, id, binder: NO_BINDER, spec, decl }
                     }

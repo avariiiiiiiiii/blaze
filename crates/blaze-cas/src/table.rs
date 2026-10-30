@@ -122,7 +122,7 @@ impl<T> Values<T> {
         let bytes = max.checked_mul(Self::SIZE).unwrap_or_else(|| {
             stop(MemError::TooLarge { tag: Tag::Store, what: "a table's values", wanted: max })
         });
-        match Region::reserve(bytes, Tag::Store) {
+        match Region::reserve_huge(bytes, Tag::Store) {
             Ok(region) => Values { region, carved: AtomicUsize::new(0), max, _owns: PhantomData },
             Err(error) => stop(error),
         }

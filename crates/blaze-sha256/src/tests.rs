@@ -1,5 +1,6 @@
 use blaze_ids::rng::SplitMix64;
-use proptest::prelude::*;
+use hegel::TestCase;
+use hegel::generators as gs;
 
 use super::*;
 
@@ -209,19 +210,18 @@ fn hashing_allocates_nothing() {
     assert_eq!(got, want);
 }
 
-proptest! {
-    #[test]
-    fn matches_the_reference(bytes in proptest::collection::vec(any::<u8>(), 0..2000), cuts in proptest::collection::vec(any::<prop::sample::Index>(), 0..6)) {
-        let want = reference(&bytes);
-        prop_assert_eq!(digest(&bytes), want);
-        let mut cuts: Vec<usize> = cuts.iter().map(|it| it.index(bytes.len() + 1)).collect();
-        cuts.sort_unstable();
-        let mut hasher = Sha256::new();
-        let mut at = 0;
-        for cut in cuts.into_iter().chain([bytes.len()]) {
-            hasher.update(&bytes[at..cut]);
-            at = cut;
-        }
-        prop_assert_eq!(hasher.finish(), want);
+#[hegel::test]
+fn matches_the_reference(tc: TestCase) {
+    let bytes: Vec<u8> = tc.draw(gs::binary().max_size(1999));
+    let want = reference(&bytes);
+    assert_eq!(digest(&bytes), want);
+    let mut cuts: Vec<usize> = tc.draw(gs::vecs(gs::integers().max_value(bytes.len())).max_size(5));
+    cuts.sort_unstable();
+    let mut hasher = Sha256::new();
+    let mut at = 0;
+    for cut in cuts.into_iter().chain([bytes.len()]) {
+        hasher.update(&bytes[at..cut]);
+        at = cut;
     }
+    assert_eq!(hasher.finish(), want);
 }

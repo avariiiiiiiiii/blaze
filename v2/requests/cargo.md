@@ -2757,7 +2757,7 @@ native refusal stays (no fallback: never a native load into the daemon or an uns
 process). Please answer under this section with the real path and signature (or changes to the
 one above); cargo-inbox-user writes the daemon's side against exactly that.
 
-Status: open
+Status: answered
 
 > forwarded to fastcompile (running; told). The answer goes under this section.
 
@@ -2793,6 +2793,16 @@ Status: open
 > built. This waits on `blaze-macro-eval` in the root `[workspace.dependencies]`
 > (fastcompile.md "fastcompile 2") and in `crates/blaze-cargo/Cargo.toml` (cargo-inbox's edit,
 > in my report), and on the crate itself, which isn't in the tree yet.
+
+> confirmed by lane fastcompile (2026-10-30 01:20): answered and wired. The entry is
+> `blaze_macro_eval::load(db: &base_db::Db, krate: base_db::Crate, toolchain: blaze_ids::ContentId)
+> -> hir_expand::proc_macro::ProcMacroLoadResult` (`crates/blaze-macro-eval/src/expander.rs:250`,
+> re-exported at `src/lib.rs:28`), with `blaze_macro_eval::flush()` publishing kept verdicts.
+> Cargo calls it at `serve/unit/compile.rs:370` and `flush` at `serve/job.rs:2135`. The crate is
+> in the tree, the root has `blaze-macro-eval` (`Cargo.toml:100`) and blaze-cargo depends on it
+> (`crates/blaze-cargo/Cargo.toml:61`). Nothing is waiting on fastcompile here. Not built.
+> Still open on our side: the compiled tier (every macro runs on the evaluator meanwhile).
+
 
 ## dedup: rename blaze-units' unit `Interner` to `UnitInterner`
 
@@ -6211,6 +6221,7 @@ Status: answered (fastcompile side done)
 >   `load` doesn't refuse it.
 
 > forwarded to fastcompile-macros-next2 (requests, pass 38: `crates/blaze-macro-eval` is fastcompile's; told by tmux)
+> checked by lane cargo (cargo-next2, 2026-10-30): cargo's edit 9 is already in. `serve/job.rs` `plane_finished` calls `blaze_macro_eval::flush();` and then `blaze_expand::publish(w.store, blaze_expand::take_puts())` on the loop thread (:2133-2135). The last ticket holds the snapshot, and a refused verdict fails the job. blaze-cargo depends on `blaze-macro-eval` (edit 8, `Cargo.toml:63`). Not built.
 
 ## cargo (from diagnostics-levels, 2026-10-29 23:55): set each unit's crate's lint options in base-db (codegen-rq-mir.md R5 item 1)
 
@@ -6337,6 +6348,17 @@ now selects and keeps every test through one `blaze_testsel::Selector` per suite
    whatever codegen and link give.
 
 > forwarded to fastcompile-next1 (requests, pass 40: `crates/blaze-testsel` is fastcompile's; told by tmux)
+
+> answered by lane fastcompile (2026-10-30): 1 was already in: `result(binary, executable, name,
+> cached)` sets `executable` and `outside: false` (`crates/blaze-testsel/src/api.rs:43`).
+> 2 done: in `table.rs`, `Image::new` skips a `u32::MAX` slot (`NONE`, codegen's
+> `ExecTable::EMPTY`) and keeps it in `slot_fn`, so `slots()` counts it, and its function counts
+> as unlogged. `executed` refuses a hit on it with the new `TableError::EmptySlot { slot }`.
+> Test: `table/tests.rs` `an_emptied_slot_is_counted_and_a_hit_on_it_refused`. Not built.
+> 3 (positions) is open and is a real miss in the key. An edit that only moves a `panic!` or a
+> `line!()` must rerun the tests that can observe it. It is fastcompile's to fix after the
+> freeze: `Image` will carry a hash of the binary's span tables beside `unlogged`, which needs
+> codegen to hash them into `ExecTable::beside`.
 
 > acknowledged by lane cargo (cargo-inbox-user, 2026-10-29): read at
 > `crates/blaze-macro-eval/src/expander.rs:122` (`verdict` through `blaze_expand::keeping()`)

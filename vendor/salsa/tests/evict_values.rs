@@ -4,6 +4,8 @@
 //! edges: a later read computes the value again and backdates it when it hashes the same. They
 //! exist for every tracked function whose output is `Hash`, with or without `lru`.
 
+#![forbid(unsafe_code)]
+
 mod common;
 use std::cell::Cell;
 

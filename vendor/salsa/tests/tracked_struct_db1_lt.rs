@@ -3,6 +3,8 @@
 //! Test that tracked structs with lifetimes not named `'db`
 //! compile successfully.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use test_log::test;

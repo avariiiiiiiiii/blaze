@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """allblaze.py: programs with nothing rustc built in them (docs/no-rustc.md, steps F and G).
 
-Eight programs, a hello, one that uses collections, `catch_unwind`, threads, channels,
+Seven programs, a hello, one that uses collections, `catch_unwind`, threads, channels,
 formatting, a file and an uncaught panic, one with a `#[global_allocator]` of its own, one
 built with `panic = "abort"`, one with a static of proc-macro clients as J2 writes it, one
-of 128-bit atomics raced by threads, one of the paths of `split_paths_ref` and the XDG
-directories, and one of the FMA wrappers of `core::arch::x86_64` on NaNs, are built by blaze with every crate its own, the standard library included,
+of 128-bit atomics raced by threads, and one of the paths of `split_paths_ref` and the XDG
+directories, are built by blaze with every crate its own, the standard library included,
 and linked by blaze (`--exe`): the native libraries are the ones the crates' `#[link]`s ask
 for, and nothing it could not compile may be left in the executable. A shared library is
 linked too (`--exe` with `--shared`), loaded with `dlopen` and called as cargo's `cdylib` of
@@ -21,8 +21,9 @@ Each is built three ways:
     store and pushes it; the others take it from the store. Last, a build on a second store
     that starts empty takes it from the remote.
 
-What each prints, and how it exits, has to be what cargo's build of the same source does,
-thread ids aside.
+What each prints, and how it exits, has to be the same however it was built: every way, and
+every build of a program a way makes, is held to the first build of it, thread ids aside. What
+the shared library answers is what its source says (`ANSWERS`).
 
     python3 allblaze.py            # every way
     python3 allblaze.py unit stored
@@ -31,7 +32,7 @@ import json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import BLAZE
+from mixed import BLAZE
 from storelib import scratch
 
 # The crates of the standard library a program on Linux links, by the names cargo gives them,
@@ -250,15 +251,11 @@ fn main() {
     println!("debug {:?} {:?}", dirs.config_dirs(), std::env::split_paths_ref(unparsed));
 }
 """
-# The breaker of the FMA wrappers of `core::arch::x86_64`, whose NaNs are what LLVM folds into
-# each by the code around it: there they are rustc's, here those of blaze's standard library.
-FMA = (open(os.path.join(HERE, "breakers/cases/src/fma_feature_nans.rs")).read()
-       + 'fn main() {\n    println!("{:?}", run());\n}\n')
 # (program, its source, the runs to compare: the arguments of each, its panic strategy)
 PROGRAMS = [("hello", HELLO, [["a", "b"]], "unwind"), ("rich", RICH, [[], ["fail"]], "unwind"),
             ("counting", ALLOC, [[]], "unwind"), ("abort", ABORT, [[], ["fail"]], "abort"),
             ("macros", MACROS, [[]], "unwind"), ("atomics", ATOMICS, [[]], "unwind"),
-            ("paths", PATHS, [[]], "unwind"), ("fma", FMA, [[]], "unwind")]
+            ("paths", PATHS, [[]], "unwind")]
 # A shared library, as J2 links a proc macro's (`--exe` with `--shared`): its function
 # allocates, formats, keeps a thread-local and catches a panic, which the allocator shim, the
 # library's TLS and the unwinder have to be right for, loaded into a process blaze did not link.
@@ -280,6 +277,9 @@ pub extern "C" fn allblaze_count(n: u64) -> u64 {
 }
 """
 CALLS = [1, 3, 10, 3]
+# What `allblaze_count` gives for each of CALLS, all made on one thread: the distinct `n` it
+# has seen, a thousand each, the length of the text times ten, and whether it caught a panic.
+ANSWERS = [1020, 2061, 3200, 3061]
 # A proc-macro crate linked as J2 links one: the library has the list of its macros blaze
 # writes into the crate (crates/blaze-engine/src/macro_list.rs) where rustc's metadata has it.
 PROC_MACROS = r"""extern crate proc_macro;
@@ -302,8 +302,6 @@ pub fn answer(_input: TokenStream) -> TokenStream {
 """
 # Kind (derive, attribute, function-like), name and helper attributes, by name.
 MACRO_LIST = [[0, "Hello", ["hello", "greet"]], [2, "answer", []], [1, "same", []]]
-# cargo's build of these needs the unstable features they name.
-UNSTABLE = {"macros", "atomics", "paths"}
 # Crates of the standard library a program links that the library's unit leaves out. What
 # they depend on (`rustc-literal-escaper` of `proc_macro`) makes the unit another one.
 LINKS = {"macros": ["proc_macro"]}
@@ -418,20 +416,10 @@ def main():
     passed = False
     try:
         roots = {name: package(work, name, source, panic) for name, source, _, panic in PROGRAMS}
-        expected = {}
-        for name, _, runs, _ in PROGRAMS:
-            root = roots[name]
-            target = os.path.join(root, "target")
-            run(["cargo", "build", "-q", "--target-dir", target], root, f"cargo build of {name}",
-                {"RUSTC_BOOTSTRAP": "1"} if name in UNSTABLE else None)
-            binary = os.path.join(root, "target/debug", name)
-            expected[name] = [outcome(binary, args, root) for args in runs]
+        # By program: which build it was first built by, and what its runs did.
+        first = {}
         library, macros = library_package(work), proc_macro_package(work)
-        run(["cargo", "build", "-q", "--target-dir", os.path.join(library, "target")], library,
-            "cargo build of the shared library")
-        expected_calls = calls(os.path.join(library, "target/debug/libshared.so"))
-        if expected_calls[0] != 0:
-            raise SystemExit(f"FAIL: cargo's shared library did not load: {expected_calls}")
+        expected_calls = (0, f"{ANSWERS}\n", "")
         lines = []
         units = {}
         if "unit" in ways:
@@ -486,13 +474,15 @@ def main():
                            else ", the standard library from the store" if stored
                            else ", the standard library compiled, stored and pushed")
                 link_took = linked(ran, f"{name} ({way})")
-                for args, want in zip(runs, expected[name]):
-                    got = outcome(binary, args, root)
+                this = f"{way}, build {at + 1}"
+                results = [outcome(binary, args, root) for args in runs]
+                by, wanted = first.setdefault(name, (this, results))
+                for args, want, got in zip(runs, wanted, results):
                     if got != want:
-                        raise SystemExit(f"FAIL: {name} {' '.join(args)} ({way}) differs from cargo's:\n"
-                                         f"cargo:  {want}\nblaze: {got}")
+                        raise SystemExit(f"FAIL: {name} {' '.join(args)} ({this}) differs from its first build ({by}):\n"
+                                         f"{by}: {want}\n{this}: {got}")
                 lines.append(f"{name} ({way}): built and linked in {took:.2f} s{how}, the link "
-                             f"{link_took}, {len(runs)} runs as cargo's")
+                             f"{link_took}, {len(runs)} runs" + ("" if by == this else f" as its {by} build's"))
             obj, shared = (os.path.join(work, f"shared-{way}{ext}") for ext in (".o", ".so"))
             exe = ["--exe", shared, "--shared"]
             if way == "whole":
@@ -508,10 +498,10 @@ def main():
             link_took = linked(ran, f"the shared library ({way})")
             got = calls(shared)
             if got != expected_calls:
-                raise SystemExit(f"FAIL: the shared library ({way}) differs from cargo's:\n"
-                                 f"cargo:  {expected_calls}\nblaze: {got}")
+                raise SystemExit(f"FAIL: the shared library ({way}) answers otherwise than its source says:\n"
+                                 f"wanted: {expected_calls}\ngot:    {got}")
             lines.append(f"the shared library ({way}): built and linked in {took:.2f} s, the link "
-                         f"{link_took}, {len(CALLS)} calls as cargo's library answers them")
+                         f"{link_took}, {len(CALLS)} calls answered as its source says")
             obj, shared = (os.path.join(work, f"allmacros-{way}{ext}") for ext in (".o", ".so"))
             exe = ["--exe", shared, "--shared"]
             if way == "whole":

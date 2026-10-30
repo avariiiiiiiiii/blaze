@@ -3,14 +3,14 @@
 //!
 //! [`inputs`] gives the files of a corpus directory, the seeds a test builds, and changes of
 //! both, the same ones in every run. [`largest_allocation`] tells how much memory a read
-//! asked for at once, so that a length in the bytes is seen not to be believed. A test binary
-//! that links this crate allocates through its counting allocator: it is for tests alone.
+//! asked for at once, so that a length in the bytes is seen not to be believed. It counts
+//! through `blaze-alloc-count`, so a test binary that calls it installs
+//! `blaze_alloc_count::Counting` as its global allocator, as budget tests do: it is for tests
+//! alone.
 
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    cell::Cell,
-    path::Path,
-};
+#![forbid(unsafe_code)]
+
+use std::path::Path;
 
 use blaze_ids::rng::SplitMix64;
 
@@ -93,48 +93,15 @@ impl Random {
     }
 }
 
-/// Counts the memory the tests of this crate ask for, a thread at a time.
-struct Counting;
-
-thread_local! {
-    static LARGEST: Cell<usize> = const { Cell::new(0) };
-}
-
-// SAFETY: every request is the system allocator's to answer, as it was given.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        Counting::saw(layout.size());
-        // SAFETY: the caller's layout.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
-        // SAFETY: the caller's pointer and layout.
-        unsafe { System.dealloc(at, layout) }
-    }
-
-    unsafe fn realloc(&self, at: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        Counting::saw(size);
-        // SAFETY: the caller's pointer, layout and size.
-        unsafe { System.realloc(at, layout, size) }
-    }
-}
-
-impl Counting {
-    fn saw(size: usize) {
-        // A thread that is ending has nothing to count in.
-        _ = LARGEST.try_with(|largest| largest.set(largest.get().max(size)));
-    }
-}
-
-#[global_allocator]
-static COUNTING: Counting = Counting;
-
-/// The most bytes `read` asked for at once, and what it returned.
+/// The most bytes `read` asked for at once on this thread, and what it returned. Panics when
+/// the binary's allocator is not `blaze_alloc_count::Counting`, whose zero would pass any bound.
 pub fn largest_allocation<T>(read: impl FnOnce() -> T) -> (usize, T) {
-    LARGEST.set(0);
-    let read = read();
-    (LARGEST.get(), read)
+    assert!(
+        blaze_alloc_count::installed(),
+        "largest_allocation: this test binary's #[global_allocator] is not blaze_alloc_count::Counting"
+    );
+    let (read, used) = blaze_alloc_count::measure(read);
+    (used.largest as usize, read)
 }
 
 /// The most a read of `len` bytes may ask for at once: serde makes room for at most a

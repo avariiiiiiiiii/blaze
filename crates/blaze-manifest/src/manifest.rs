@@ -1354,7 +1354,7 @@ fn to_real_manifest<F: Files>(
     };
 
     if let Some(profiles) = &normalized_toml.profile {
-        validate_profiles(profiles, &features, warnings)?;
+        validate_profiles(profiles, &features, ctx.config.unstable(), warnings)?;
     }
 
     let version = normalized_package.normalized_version().expect("previously normalized");
@@ -1466,7 +1466,7 @@ fn to_virtual_manifest<F: Files>(
         (replace(&normalized_toml, &mut manifest_ctx)?, patch(&normalized_toml, &mut manifest_ctx)?)
     };
     if let Some(profiles) = &normalized_toml.profile {
-        validate_profiles(profiles, &features, &mut warnings)?;
+        validate_profiles(profiles, &features, ctx.config.unstable(), &mut warnings)?;
     }
     let resolve_behavior = normalized_toml
         .workspace

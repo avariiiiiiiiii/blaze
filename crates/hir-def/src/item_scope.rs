@@ -1365,7 +1365,11 @@ impl ItemScope {
     }
 
     /// The impls where `bits` is set (or, with `set` false, clear), in declaration order.
-    fn impls_where(&self, bits: &ListBits, set: bool) -> impl Iterator<Item = ImplId> + '_ {
+    fn impls_where<'a>(
+        &'a self,
+        bits: &'a ListBits,
+        set: bool,
+    ) -> impl Iterator<Item = ImplId> + 'a {
         self.impls
             .iter()
             .enumerate()
@@ -1448,7 +1452,7 @@ impl ItemScope {
 
     /// The import that binds `name` in `ns` here, with the binding's visibility: `None` where
     /// the scope declares the name or does not bind it in `ns`. Where in the source the import
-    /// is, `src::use_tree_to_ast` of its use tree says.
+    /// is, `src::use_tree_to_view` of its use tree says.
     pub fn import_of(
         &self,
         name: &Name,
@@ -2126,24 +2130,24 @@ impl ItemScope {
             macro_invocations,
             extern_blocks,
         } = self;
-        exact(&mut underscore_imports);
-        exact(&mut glob_ambiguities);
-        exact(&mut shadowed_imports);
-        exact(&mut extern_blocks);
+        exact(underscore_imports);
+        exact(glob_ambiguities);
+        exact(shadowed_imports);
+        exact(extern_blocks);
         exact(&mut types.entries);
         exact(&mut values.entries);
         exact(&mut macros.entries);
         use_imports_types.settle();
         use_imports_values.settle();
         use_imports_macros.settle();
-        exact(&mut unresolved);
-        exact(&mut declarations);
-        exact(&mut impls);
+        exact(unresolved);
+        exact(declarations);
+        exact(impls);
         trait_impl.shrink_to_fit();
         reservation_impl.shrink_to_fit();
-        exact(&mut builtin_derive_impls);
-        exact(&mut unnamed_consts);
-        exact(&mut unnamed_trait_imports);
+        exact(builtin_derive_impls);
+        exact(unnamed_consts);
+        exact(unnamed_trait_imports);
         for (_, macs) in legacy_macros.entries.iter_mut() {
             macs.shrink_to_fit();
         }
@@ -2153,8 +2157,8 @@ impl ItemScope {
         legacy_macros.settle();
         attr_macros.settle();
         derive_macros.settle();
-        exact(&mut extern_crate_decls);
-        exact(&mut use_decls);
+        exact(extern_crate_decls);
+        exact(use_decls);
         macro_invocations.settle();
         let unique = self.reindex(self.indexed_len());
         debug_assert!(unique, "a namespace of a scope with a name twice");
@@ -2203,6 +2207,38 @@ impl ItemScope {
         let entry = &mut self.macros.entries[pos];
         entry.set_def(def);
         entry.set_vis(vis);
+        self.by_def.take();
+    }
+
+    /// Binds `name` in the type namespace to `item` through glob `glob`, in place of the item
+    /// another glob bound it to: of two globs giving one name different items, the first in
+    /// position order binds it, whichever arrived first (docs/v2/plan/design/dbsp.md §6).
+    pub(crate) fn rebind_glob_types(&mut self, name: &Name, mut item: TypesItem, glob: GlobId) {
+        let pos = self.position(TYPES, name).expect("tried to rebind a non-existent type");
+        let import = ImportOrExternCrate::Glob(glob);
+        let prev = std::mem::replace(&mut item.import, Some(import));
+        self.use_imports_types.insert(import, prev.map_or(ImportOrDef::Def(item.def), Into::into));
+        self.types.entries[pos] = Entry::new(*name, item);
+        self.by_def.take();
+    }
+
+    /// [`Self::rebind_glob_types`] in the value namespace.
+    pub(crate) fn rebind_glob_values(&mut self, name: &Name, mut item: crate::per_ns::ValuesItem, glob: GlobId) {
+        let pos = self.position(VALUES, name).expect("tried to rebind a non-existent value");
+        let import = ImportOrGlob::Glob(glob);
+        let prev = std::mem::replace(&mut item.import, Some(import));
+        self.use_imports_values.insert(import, prev.map_or(ImportOrDef::Def(item.def), Into::into));
+        self.values.entries[pos] = Entry::new(*name, item);
+        self.by_def.take();
+    }
+
+    /// [`Self::rebind_glob_types`] in the macro namespace.
+    pub(crate) fn rebind_glob_macros(&mut self, name: &Name, mut item: crate::per_ns::MacrosItem, glob: GlobId) {
+        let pos = self.position(MACROS, name).expect("tried to rebind a non-existent macro");
+        let import = ImportOrExternCrate::Glob(glob);
+        let prev = std::mem::replace(&mut item.import, Some(import));
+        self.use_imports_macros.insert(import, prev.map_or_else(|| ImportOrDef::Def(item.def.into()), Into::into));
+        self.macros.entries[pos] = Entry::new(*name, item);
         self.by_def.take();
     }
 }

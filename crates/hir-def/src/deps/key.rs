@@ -34,7 +34,7 @@
 //! of `OUT_DIR`) is not in the key: the frozen def map names it with its text's hash, which
 //! [`crate::nameres::frozen::unreadable`] checks before the image is used.
 
-use base_db::{Crate, CrateOrigin, Db, ExtraCrateData, FileText, LangCrateOrigin, TargetKind};
+use base_db::{Crate, Db, ExtraCrateData, FileText, TargetKind};
 use blaze_ids::{ContentId, Hasher};
 use hir_expand::proc_macro::{ProcMacroKind, ProcMacros};
 use rustc_hash::FxHashMap;
@@ -207,48 +207,14 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Ha
             .part(dep.name.as_str().as_bytes())
             .update(&[dep.is_prelude() as u8, dep.is_sysroot() as u8, dep.is_private() as u8]);
     }
-    match origin {
-        CrateOrigin::Rustc { name } => hasher.update(&[0]).part(name.as_str().as_bytes()),
-        CrateOrigin::Local { repo, name } => {
-            hasher.update(&[1]);
-            opt(hasher, repo.as_deref());
-            opt(hasher, name.as_ref().map(|it| it.as_str()))
-        }
-        CrateOrigin::Library { repo, name } => {
-            hasher.update(&[2]);
-            opt(hasher, repo.as_deref());
-            hasher.part(name.as_str().as_bytes())
-        }
-        CrateOrigin::Lang(lang) => hasher.update(&[
-            3,
-            match lang {
-                LangCrateOrigin::Alloc => 0,
-                LangCrateOrigin::Core => 1,
-                LangCrateOrigin::ProcMacro => 2,
-                LangCrateOrigin::Std => 3,
-                LangCrateOrigin::Test => 4,
-                LangCrateOrigin::Dependency => 5,
-                LangCrateOrigin::Other => 6,
-            },
-        ]),
-    };
+    origin.hash_into(hasher);
     hasher.update(&(crate_attrs.len() as u64).to_le_bytes());
     for attr in crate_attrs.iter() {
         hasher.part(attr.as_bytes());
     }
-    let target_kind = match target_kind {
-        TargetKind::Bin => 0,
-        TargetKind::Lib { is_proc_macro: false } => 1,
-        TargetKind::Lib { is_proc_macro: true } => 2,
-        TargetKind::Example => 3,
-        TargetKind::Test => 4,
-        TargetKind::Bench => 5,
-        TargetKind::BuildScript => 6,
-        TargetKind::Other => 7,
-    };
-    hasher.update(&[target_kind, crate_types.bits()]);
+    hasher.update(&[target_kind.tag(), crate_types.bits()]);
     base.part(hasher, proc_macro_cwd.as_str());
-    opt(hasher, version.as_deref());
+    hasher.opt_part(version.as_deref());
     match display_name {
         None => hasher.update(&[0]),
         Some(name) => hasher
@@ -313,13 +279,6 @@ fn libraries(db: &Db, krate: Crate, hasher: &mut Hasher) {
         };
         let code = it.expander.code().expect("`walk` keys only crates whose libraries are known");
         hasher.part(it.name.as_str().as_bytes()).update(&[kind, it.disabled as u8]).id(&code);
-    }
-}
-
-fn opt<'h>(hasher: &'h mut Hasher, part: Option<&str>) -> &'h mut Hasher {
-    match part {
-        None => hasher.update(&[0]),
-        Some(part) => hasher.update(&[1]).part(part.as_bytes()),
     }
 }
 
@@ -437,7 +396,7 @@ impl Base {
 }
 
 /// Whether `value` is an absolute path on some machine: `/..`, `C:\..`, `C:/..` or `\\..`.
-fn absolute(value: &str) -> bool {
+pub fn absolute(value: &str) -> bool {
     let bytes = value.as_bytes();
     match bytes {
         [b'/', ..] => true,

@@ -5,6 +5,7 @@
 //!
 //! There is no `.debug$T`: a procedure has no type, and no variable is told of.
 
+use blaze_format::cursor::Put;
 use cranelift_module::FuncId;
 use cranelift_object::{
     ObjectProduct,
@@ -248,7 +249,7 @@ impl Section {
         out.u32(0);
         fill(out);
         let len = (out.bytes.len() - len_at - 4) as u32;
-        out.bytes[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
+        out.bytes.patch_u32(len_at, len);
         out.align();
     }
 }
@@ -263,16 +264,15 @@ struct Record {
 
 impl Record {
     fn u16(&mut self, value: u16) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.bytes.put_u16(value);
     }
 
     fn u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.bytes.put_u32(value);
     }
 
     fn text(&mut self, text: &str) {
-        self.bytes.extend_from_slice(text.as_bytes());
-        self.bytes.push(0);
+        self.bytes.put_cstr(text.as_bytes());
     }
 
     fn place(&mut self, func: FuncId) {

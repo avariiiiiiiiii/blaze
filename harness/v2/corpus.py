@@ -1,6 +1,5 @@
-"""corpus.py: real crates built, run and tested by blaze and by plain cargo with the pinned
-nightly, and what each program prints and how each test ends compared (docs/v2/plan/lanes/proof.md,
-"Differential against rustc").
+"""corpus.py: real crates built, run and tested by blaze, each judged by its own verdicts: the
+build succeeds, its programs run and exit 0, and its own tests pass (docs/v2/plan/lanes/proof.md).
 
     uv run --frozen python harness/v2/corpus.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/corpus.json"}'
     uv run --frozen python harness/v2/corpus.py '{"engine": {...}, "out": "...", "projects": ["crates.io"], "crates": ["itoa"]}'
@@ -15,13 +14,7 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
     crates    which crates of corpus.json the project `crates.io` runs, by name; empty: all
     commit    the commit of this repository the project `blaze` is (HEAD)
     jobs      how many projects run at once (2), each with a daemon and a home of its own
-    keep      keep each project's checkout and both target directories after it ran
-    cache     where cargo's `test` results are kept across runs ("~/.cache/blaze-v2-proof"; ""
-              keeps none), by everything they depend on: the toolchain (`rustc -vV`, `cargo
-              -vV`), the platform, the checkout's tree after `cargo fetch` (engine.tree_digest,
-              Cargo.lock in it), the step's arguments, cargo's configuration files outside the
-              checkout and the environment, the run's own paths in it written as `{ws}` and
-              `{root}`; a rerun runs cargo's tests only of what changed
+    keep      keep each project's checkout and target directory after it ran
     backends  the dev tier's backends to run every project at, two or more of "stencil" and
               "cranelift" (engine.EngineSpec.dev_backend, which is then "default"); empty:
               one run at the engine's own
@@ -38,33 +31,32 @@ The projects:
                the sha256 the sparse index (index.crates.io) lists for that version when it
                is fetched, unpacked, and its own tests run
 
-blaze does each step through the engine into the workspace's `target`; plain cargo, the
-reference, into `target-ref` (engine.reference_env). Each (project, step) is one outcome:
+blaze does each step through the engine into the workspace's `target`. Each (project, step) is
+one outcome:
 
-    pass   the same: a build's exit status; a program's exit status and what it printed
-           (blaze_cli.program_output); every test's outcome and the totals (blaze_cli.test_results)
-    fail   they differ, one side's build fails and the other's does not, or the engine says the
-           step was not blaze's (`not_blazes`)
-    error  the harness could not say: a fetch or a checksum failed, a command timed out, the
-           engine gave an answer it could not read, or the reference did not get
-           far enough to compare with (cargo's build or test build fails)
+    pass   a build exits 0; a program (`run`, `exec`) exits 0; in a test run every test that
+           ran passed but the project's known failures (OPEN), and it exited 0 or with only
+           those failed (blaze_cli.test_verdict)
+    fail   any of those does not hold, a test in OPEN passed or did not run (take it out), or
+           the engine says the step was not blaze's (`not_blazes`)
+    error  the harness could not say: a fetch or a checksum failed, a command timed out, or the
+           engine gave an answer it could not read
     unmeasured
            the engine has no answer to a step (`engine.Unmeasurable`)
 
 With `backends`, each project's steps run once per backend, in order, each run with a daemon
-home of its own and a clean `target` (cargo's side runs once and is compared with each). Each
-outcome above is named `<project> [<backend>]: <step>`, and each (project, step) that every
-backend ran is one more, `<project>: <step>: <first> against <other>`, for each backend after
-the first:
+home of its own and a clean `target`. Each outcome above is named `<project> [<backend>]:
+<step>`, and each (project, step) that every backend ran is one more, `<project>: <step>:
+<first> against <other>`, for each backend after the first:
 
     pass   the two blaze runs exit alike, panic alike (each `thread '…' panicked at` with its
            message, as a multiset: tests panic in any order) and gave the same output
-           (what each comparison with cargo reads, as above)
+           (blaze_cli.program_output, blaze_cli.test_results)
     fail   any of those differ, named with both backends
 
 A project stops at a build step that does not pass. Each project's dependencies resolve once,
-by `cargo fetch`, into the one `Cargo.lock` both sides build with; the result's
-`extra.locks` names its sha256 per project, so two runs that resolved differently show it.
+by `cargo fetch`, into the `Cargo.lock` every run builds with; the result's `extra.locks`
+names its sha256 per project, so two runs that resolved differently show it.
 `selftest` runs the checks of the parts that
 need neither blaze nor the network.
 """
@@ -77,7 +69,6 @@ import importlib
 import io
 import json
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -109,6 +100,10 @@ INDEX = "https://index.crates.io/"
 DOWNLOAD = "https://static.crates.io/crates/{name}/{name}-{version}.crate"
 FETCH_SECS = 120
 EXEC_SECS = 600
+# Tests of a project known to fail under blaze, by the project's name (`Program.name`, its
+# version in it) and libtest's name of the test, each with why: OPEN of unittests.py. One that
+# passes or no longer runs fails its step until it is taken out.
+OPEN: dict[str, dict[str, str]] = {}
 
 
 @dataclass(frozen=True)
@@ -135,7 +130,6 @@ class Input:
     commit: str = "HEAD"
     jobs: int = 2
     keep: bool = False
-    cache: str = "~/.cache/blaze-v2-proof"
     backends: tuple[Forced, ...] = ()
 
 
@@ -155,8 +149,8 @@ def refused_backends(args: Input) -> str | None:
 
 @dataclass(frozen=True)
 class Step:
-    """One command both sides run. `exec` runs a program the build made, `args` being its name
-    under `target*/debug` and its arguments."""
+    """One command blaze runs. `exec` runs a program the build made, `args` being its name
+    under `target/debug` and its arguments."""
 
     label: str
     command: Command
@@ -165,7 +159,7 @@ class Step:
 
 @dataclass(frozen=True)
 class Program:
-    """A workspace both sides build: `prepare` puts its checkout at the path it is given."""
+    """A workspace blaze builds: `prepare` puts its checkout at the path it is given."""
 
     name: str
     dir: str
@@ -253,7 +247,7 @@ def pinned_program(name: Name) -> Program:
             source = str(blaze_cli.fetch(name, spec))
         except (AssertionError, subprocess.CalledProcessError) as e:
             raise engine.Failed(f"{name}: fetching {spec['repo']} at {spec['tag']}: {e}") from None
-        shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref"))
+        shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target"))
 
     env = dict[str, str](spec.get("env") or {})
     return Program(f"{name}@{spec['tag']}", name, prepare, tuple(steps), env)
@@ -338,49 +332,31 @@ def crate_program(crate: Crate, cache: Path) -> Program:
                    lambda ws: unpack(fetch_crate(crate, cache), top, ws), (Step("test", "test"),))
 
 
-def judge(command: Command, ours: int, theirs: int, differs: str | None, who: str | None,
-          compared: bool) -> tuple[report.Verdict, str]:
-    """The verdict of a step from its exit statuses, the first difference between what the two
-    sides gave (None: none), who did blaze's side when blaze did not (`not_blazes`), and
-    whether cargo's side got far enough to compare with (its test programs built and ran)."""
+def judge(command: Command, ran: engine.Ran, said: object, who: str | None,
+          known: frozenset[str]) -> tuple[report.Verdict, str]:
+    """The verdict of a step by its own result: a build or a program exits 0; a test run passes
+    by its own tests (`blaze_cli.test_verdict`, `known` its known failures). A step blaze did
+    not do (`who`, from `not_blazes`) fails."""
     if who is not None:
         return "fail", f"not blaze's: {who}"
-    if command == "build":
-        if ours == 0 and theirs == 0:
-            return "pass", ""
-        if ours != 0 and theirs != 0:
-            return "error", f"cargo's build fails too (exit {theirs}): nothing to compare"
-        return "fail", (f"blaze's build exits {ours} and cargo's 0" if ours != 0
-                        else f"cargo's build exits {theirs} and blaze's 0")
-    if not compared:
-        return "error", f"cargo's {command} did not get to running anything (exit {theirs}): nothing to compare"
-    if differs is not None:
-        return "fail", differs
+    if command == "test":
+        wrong: str | None = blaze_cli.test_verdict(said, known)
+        return ("fail", f"{wrong}\n{ran.said(1500)}") if wrong else ("pass", "")
+    if ran.returncode != 0:
+        what = "build" if command == "build" else "program"
+        return "fail", f"the {what} exits {ran.returncode}\n{ran.said(1500)}"
     return "pass", ""
 
 
 @dataclass(frozen=True)
 class Outcome:
-    """What blaze's side of a step gave, as the backends are compared: its exit status, what
-    the comparison with cargo reads of it (`blaze_cli.program_output`, `test_results`, or a
-    build's status) and its panics (`panics`)."""
+    """What a step gave, as the backends are compared: its exit status, what it said
+    (`blaze_cli.program_output`, `test_results`, or a build's status) and its panics
+    (`panics`)."""
 
     status: int
     said: object
     panics: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class CargoSide:
-    """cargo's side of a step, run once and compared with each backend's run: what it ran,
-    what the comparison reads of it, whether it got far enough to compare with, and whether it
-    was kept from an earlier run."""
-
-    ran: engine.Ran
-    said: object
-    compared: bool
-    kept: bool
-
 
 # A panic as the pinned nightly's std prints it: `thread 'main' panicked at src/main.rs:2:5:`
 # then the message on the next line (a thread id in parentheses after the name since 1.88).
@@ -447,99 +423,16 @@ def compare_backends(project: str, steps: tuple[Step, ...],
     return found
 
 
-# Set by the shell for its session alone; no build or test reads them to decide anything.
-SESSION = frozenset({"PWD", "OLDPWD", "SHLVL", "_", "TERM_SESSION_ID", "TMUX", "TMUX_PANE", "WINDOWID", "STY",
-                     "SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY", "SSH_AUTH_SOCK", "XDG_SESSION_ID"})
-
-
-@dataclass(frozen=True)
-class Reference:
-    """What cargo's side of a step depends on beyond the step: the result cache, the
-    toolchain's identity and the checkout's tree digest (`engine.tree_digest`)."""
-
-    kept: engine.Kept
-    toolchain: str
-    tree: str
-
-
-def cargo_configs(ws: Path, env: dict[str, str]) -> str:
-    """The cargo configuration files outside the checkout that apply to a build in it (those
-    of every directory above it and of CARGO_HOME), each by its path and digest (`engine.digest`)."""
-    home = Path(env.get("CARGO_HOME") or Path.home() / ".cargo")
-    found: list[str] = []
-    for directory in (*[d / ".cargo" for d in ws.parents], home):
-        for name in ("config.toml", "config"):
-            path = directory / name
-            if path.is_file():
-                found.append(f"{path}={engine.digest(path)}")
-    return "\n".join(found)
-
-
-def environment_key(env: dict[str, str], ws: Path, root: Path) -> str:
-    """`env` as part of a key: sorted, without SESSION, the checkout's and the work directory's
-    paths written `{ws}` and `{root}` so that a rerun elsewhere has the same key."""
-    return "\n".join(f"{name}={env[name].replace(str(ws), '{ws}').replace(str(root), '{root}')}"
-                     for name in sorted(env) if name not in SESSION)
-
-
-def kept_ran(entry: object, argv: tuple[str, ...], where: str) -> engine.Ran | None:
-    """A kept result of cargo as an `engine.Ran`; None when there is none; a Failed when it is
-    not of the shape `cargo_test` writes."""
-    if entry is None:
-        return None
-    fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
-    code, stdout, seconds = fields.get("returncode"), fields.get("stdout"), fields.get("seconds")
-    if not (isinstance(code, int) and isinstance(stdout, str) and isinstance(seconds, (int, float))):
-        raise engine.Failed(f"the kept result of cargo {where} is not one corpus.py wrote: {entry!r:.300}")
-    return engine.Ran(argv, float(seconds), code, stdout, "")
-
-
-def cargo_test(name: str, args: tuple[str, ...], ws: Path, root: Path, env: dict[str, str],
-               reference: Reference) -> tuple[engine.Ran, bool]:
-    """cargo's `test ARGS` in `ws`: kept from an earlier run of the same inputs (see the input's
-    `cache`), else run and kept; and whether it was kept. A run that timed out raises, and is
-    never kept."""
-    argv = ("cargo", "test", *args)
-    kept = reference.kept
-    key = kept.key(reference.toolchain, sys.platform, platform.machine(), reference.tree, *argv,
-                   cargo_configs(ws, env), environment_key(env, ws, root))
-    if (known := kept_ran(kept.get(key), argv, str(kept.path(key)))) is not None:
-        return known, True
-    ran = engine.cargo(name, ["test", *args], ws, env)
-    kept.put(key, dict(returncode=ran.returncode, stdout=ran.stdout, seconds=ran.seconds))
-    return ran, False
-
-
-def cargo_side(name: str, step: Step, ws: Path, scratch: Path, theirs_env: dict[str, str],
-               reference: Reference) -> CargoSide:
-    """cargo's side of a build, run or test step (an `exec` is run by `step_of`)."""
-    if step.command == "test":
-        ran, was_kept = cargo_test(name, step.args, ws, scratch, theirs_env, reference)
-        said = blaze_cli.test_results(Tested(ran.returncode, ran.stdout, []))
-        return CargoSide(ran, said, "test result:" in ran.stdout, was_kept)
-    ran = engine.cargo(name, [step.command, *step.args], ws, theirs_env)
-    said = blaze_cli.program_output(ran) if step.command == "run" else (ran.returncode,)
-    return CargoSide(ran, said, True, False)
-
-
 def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch: Path,
-            ours_env: dict[str, str], theirs_env: dict[str, str], reference: Reference,
-            cargo_sides: dict[str, CargoSide], label: str) -> tuple[Found, Outcome]:
-    """The outcome of `step` named `label: <step>`, and what blaze's side gave. cargo's side
-    is taken from `cargo_sides` when an earlier run of the project (another backend's) ran it,
-    and kept there otherwise."""
+            ours_env: dict[str, str], label: str) -> tuple[Found, Outcome]:
+    """The outcome of `step` named `label: <step>`, and what it gave."""
     name = f"{label}: {step.label}"
-    theirs = cargo_sides.get(step.label)
     if step.command == "exec":
         program_name, *args = step.args
         cwd = scratch / "cwd"
         cwd.mkdir(exist_ok=True)
         env = {**engine.scrubbed(), **program.env, "BLAZE_HOME": str(scratch / "program-home")}
         ours = engine.run(name, [str(ws / "target" / "debug" / (program_name + engine.EXE)), *args], cwd, env, EXEC_SECS)
-        if theirs is None:
-            ran = engine.run(name, [str(ws / "target-ref" / "debug" / (program_name + engine.EXE)), *args], cwd, env,
-                             EXEC_SECS)
-            theirs = CargoSide(ran, blaze_cli.program_output(ran), True, False)
         who = None
         mine = blaze_cli.program_output(ours)
     else:
@@ -548,8 +441,6 @@ def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch:
             tests.unlink(missing_ok=True)
         ours = eng.build(name, ws, ours_env, step.args, command=step.command)
         who = eng.not_blazes(ours)
-        if theirs is None:
-            theirs = cargo_side(name, step, ws, scratch, theirs_env, reference)
         if step.command == "test":
             kept: list[str] = blaze_cli.kept_passes(str(tests))
             mine = blaze_cli.test_results(Tested(ours.returncode, ours.stdout, kept))
@@ -557,13 +448,8 @@ def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch:
             mine = blaze_cli.program_output(ours)
         else:
             mine = (ours.returncode,)
-    cargo_sides[step.label] = theirs
-    differs: str | None = blaze_cli.difference(mine, theirs.said)
-    verdict, detail = judge(step.command, ours.returncode, theirs.ran.returncode, differs, who, theirs.compared)
-    if verdict == "fail" and ours.returncode != 0 and theirs.ran.returncode == 0:
-        detail += "\n" + ours.said(1500)
-    found = Found(name, verdict, detail, {"blaze_s": round(ours.seconds, 2), "cargo_s": round(theirs.ran.seconds, 2),
-                                          "cargo_kept": theirs.kept})
+    verdict, detail = judge(step.command, ours, mine, who, frozenset(OPEN.get(program.name, {})))
+    found = Found(name, verdict, detail, {"blaze_s": round(ours.seconds, 2)})
     return found, Outcome(ours.returncode, mine, panics(ours.stdout + "\n" + ours.stderr))
 
 
@@ -577,10 +463,9 @@ def unfinished(label: str, doing: str, e: Exception) -> Found:
 
 
 def run_steps(eng: engine.Engine, program: Program, ws: Path, root: Path, home: Path, store: Path,
-              theirs_env: dict[str, str], reference: Reference, cargo_sides: dict[str, CargoSide],
               label: str) -> tuple[list[Found], dict[str, Outcome]]:
     """Every step of `program` through `eng` with its daemon at `home`, until a build step
-    that does not pass: their outcomes named `label: <step>`, and what blaze gave by step."""
+    that does not pass: their outcomes named `label: <step>`, and what each gave by step."""
     ours_env = eng.env(home, store, extra=program.env)
     found: list[Found] = []
     ran: dict[str, Outcome] = {}
@@ -588,7 +473,7 @@ def run_steps(eng: engine.Engine, program: Program, ws: Path, root: Path, home: 
     try:
         for step in program.steps:
             doing = step.label
-            done, outcome = step_of(eng, program, step, ws, root, ours_env, theirs_env, reference, cargo_sides, label)
+            done, outcome = step_of(eng, program, step, ws, root, ours_env, label)
             found.append(done)
             ran[step.label] = outcome
             if step.command == "build" and done.verdict != "pass":
@@ -605,9 +490,9 @@ def run_steps(eng: engine.Engine, program: Program, ws: Path, root: Path, home: 
 
 
 def run_program(engines: list[tuple[Forced | None, engine.Engine]], program: Program, root: Path, store: Path,
-                keep: bool, kept: engine.Kept, toolchain: str) -> tuple[list[Found], str]:
+                keep: bool) -> tuple[list[Found], str]:
     """Every outcome of `program`, built in `root` once per engine of `engines` (one per
-    backend, or one with None), and the sha256 of the `Cargo.lock` both sides built with (""
+    backend, or one with None), and the sha256 of the `Cargo.lock` every run built with (""
     when it never got that far). Never raises for what the harness could not do: that is an
     outcome too."""
     ws = root / "ws"
@@ -617,16 +502,14 @@ def run_program(engines: list[tuple[Forced | None, engine.Engine]], program: Pro
         program.prepare(ws)
     except (engine.Failed, OSError) as e:
         return [Found(f"{program.name}: fetch", "error", str(e))], ""
-    theirs_env = engine.reference_env(ws / "target-ref", program.env)
     found: list[Found] = []
     lock = ""
     doing = "cargo fetch"
     try:
-        engine.run(f"{program.name}: cargo fetch", ["cargo", "fetch"], ws, theirs_env, 1800, check=True)
+        fetch_env = engine.reference_env(root / "fetch-target", program.env)
+        engine.run(f"{program.name}: cargo fetch", ["cargo", "fetch"], ws, fetch_env, 1800, check=True)
         lock = hashlib.sha256((ws / "Cargo.lock").read_bytes()).hexdigest()
-        doing = "the checkout's tree digest"
-        reference = Reference(kept, toolchain, engine.tree_digest(ws, ("target", "target-ref")))
-        cargo_sides: dict[str, CargoSide] = {}
+        doing = "running it"
         runs: list[tuple[Forced, dict[str, Outcome]]] = []
         for at, (backend, eng) in enumerate(engines):
             if at:
@@ -634,7 +517,7 @@ def run_program(engines: list[tuple[Forced | None, engine.Engine]], program: Pro
                 shutil.rmtree(ws / "target", ignore_errors=True)
             home = root / ("h" if backend is None else f"h-{backend}")
             label = program.name if backend is None else f"{program.name} [{backend}]"
-            done, ran = run_steps(eng, program, ws, root, home, store, theirs_env, reference, cargo_sides, label)
+            done, ran = run_steps(eng, program, ws, root, home, store, label)
             found += done
             if backend is not None:
                 runs.append((backend, ran))
@@ -656,7 +539,7 @@ def largest_first(programs: list[Program]) -> list[int]:
 
 
 def overhead(before: os.times_result, after: os.times_result, wall_s: float) -> dict[str, float]:
-    """The harness's own CPU time over a run against its children's (cargo, rustc, blaze's
+    """The harness's own CPU time over a run against its children's (cargo fetching, blaze's
     command line, the programs), whose share is to stay under 1%. A daemon blaze detaches is no
     child, so its CPU time is left out: the share is an upper bound."""
     own = (after.user - before.user) + (after.system - before.system)
@@ -710,15 +593,10 @@ def main(args: Input) -> None:
     print(f"work: {work}", flush=True)
     store = work / "store"
     locks: dict[str, str] = {}
-    kept = engine.Kept(args.cache, "cargo-test")
-    try:
-        toolchain = engine.toolchain_identity(engine.scrubbed())
-    except engine.Failed as e:
-        fail(SCRIPT, str(e))
     began, wall = os.times(), time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        submitted = {i: pool.submit(run_program, engines, programs[i], work / programs[i].dir, store, args.keep, kept,
-                                    toolchain) for i in largest_first(programs)}
+        submitted = {i: pool.submit(run_program, engines, programs[i], work / programs[i].dir, store, args.keep)
+                     for i in largest_first(programs)}
         running = {submitted[i]: p.name for i, p in enumerate(programs)}
         # In the order of the projects, not the order they end in: one report for one input.
         for done, name in running.items():
@@ -788,14 +666,18 @@ def test_unpack() -> None:
 
 
 def test_judge() -> None:
-    assert judge("build", 0, 0, None, None, True) == ("pass", "")
-    assert judge("build", 101, 0, "(101,) for (0,)", None, True)[0] == "fail"
-    assert judge("build", 0, 101, "(0,) for (101,)", None, True)[0] == "fail"
-    assert judge("build", 101, 101, None, None, True)[0] == "error"
-    assert judge("build", 0, 0, None, "cargo: no daemon", True) == ("fail", "not blaze's: cargo: no daemon")
-    assert judge("test", 101, 101, None, None, False)[0] == "error"
-    assert judge("test", 0, 0, "tests differ", None, True) == ("fail", "tests differ")
-    assert judge("run", 1, 1, None, None, True) == ("pass", "")
+    none: frozenset[str] = frozenset()
+    assert judge("build", ran_with(0, ""), (0,), None, none) == ("pass", "")
+    assert judge("build", ran_with(101, ""), (101,), None, none)[0] == "fail"
+    assert judge("build", ran_with(0, ""), (0,), "cargo: no daemon", none) == ("fail", "not blaze's: cargo: no daemon")
+    assert judge("run", ran_with(1, ""), (1, "", ""), None, none)[0] == "fail"
+    assert judge("exec", ran_with(0, "hi"), (0, "hi", ""), None, none) == ("pass", "")
+    failing = blaze_cli.test_results(Tested(101, LIBTEST, []))
+    verdict, detail = judge("test", ran_with(101, LIBTEST), failing, None, none)
+    assert verdict == "fail" and "1 tests failed: b" in detail, detail
+    assert judge("test", ran_with(101, LIBTEST), failing, None, frozenset({"b"})) == ("pass", "")
+    passing = LIBTEST.replace("test b ... FAILED", "test b ... ok").replace("    b\n", "").replace("1 failed", "0 failed")
+    assert judge("test", ran_with(0, passing), blaze_cli.test_results(Tested(0, passing, [])), None, none) == ("pass", "")
 
 
 LIBTEST = """running 2 tests
@@ -815,13 +697,19 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
 
 
 def test_test_results() -> None:
-    cargo = blaze_cli.test_results(Tested(101, LIBTEST, []))
-    assert blaze_cli.difference(blaze_cli.test_results(Tested(101, LIBTEST, [])), cargo) is None
-    # `a` kept by blaze (passed as it is now) is the pass cargo ran.
+    verdict = blaze_cli.test_verdict
+    ran = blaze_cli.test_results(Tested(101, LIBTEST, []))
+    assert verdict(ran, {"b"}) is None, verdict(ran, {"b"})
+    # `a` kept by blaze (passed as it is now) ran and passed.
     kept = LIBTEST.replace("test a ... ok\n", "").replace("1 passed", "0 passed")
-    assert blaze_cli.difference(blaze_cli.test_results(Tested(101, kept, ["a"])), cargo) is None
+    assert verdict(blaze_cli.test_results(Tested(101, kept, ["a"])), {"b"}) is None
     worse = LIBTEST.replace("test a ... ok", "test a ... FAILED").replace("    b\n", "    a\n    b\n")
-    assert blaze_cli.difference(blaze_cli.test_results(Tested(101, worse, [])), cargo) is not None
+    said = verdict(blaze_cli.test_results(Tested(101, worse, [])), {"b"})
+    assert said is not None and "failed: a" in said, said
+    said = verdict(ran, {"b", "a", "c"})
+    assert said is not None and "passed: a" in said and "did not run: c" in said, said
+    said = verdict(blaze_cli.test_results(Tested(101, "error[E0425]: cannot find value `x`\n", [])))
+    assert said is not None and "exited 101" in said and "no test ran" in said, said
 
 
 def test_corpus() -> None:
@@ -841,39 +729,6 @@ def test_pinned() -> None:
         assert [s.command for s in program.steps][0] == "build" and program.steps[-1].command == "test", program
     helix = pinned_program("helix")
     assert helix.env.get("HELIX_DISABLE_AUTO_GRAMMAR_BUILD") == "1"
-
-
-def test_kept_cargo() -> None:
-    ws, root = Path("/w/root/ws"), Path("/w/root")
-    env = {"CARGO_TARGET_DIR": "/w/root/ws/target-ref", "HOME_ISH": "/w/root/h", "PWD": "/anywhere", "A": "1"}
-    key = environment_key(env, ws, root)
-    assert key == "A=1\nCARGO_TARGET_DIR={ws}/target-ref\nHOME_ISH={root}/h", key
-    assert environment_key({**env, "PWD": "/elsewhere"}, ws, root) == key, "a session variable is in the key"
-    assert environment_key({**env, "A": "2"}, ws, root) != key
-    elsewhere = {name: value.replace("/w/root", "/v/other") for name, value in env.items()}
-    assert environment_key(elsewhere, Path("/v/other/ws"), Path("/v/other")) == key, "a rerun elsewhere misses"
-    argv = ("cargo", "test")
-    ran = kept_ran({"returncode": 101, "stdout": "test result: FAILED.", "seconds": 2}, argv, "k")
-    assert ran is not None and (ran.returncode, ran.stdout, ran.seconds, ran.argv) == (101, "test result: FAILED.", 2.0, argv)
-    assert kept_ran(None, argv, "k") is None
-    for bad in ([], {"returncode": "0", "stdout": "", "seconds": 1}, {"returncode": 0, "stdout": ""}):
-        try:
-            kept_ran(bad, argv, "k")
-        except engine.Failed:
-            continue
-        raise AssertionError(f"a kept result of another shape was taken: {bad}")
-    with tempfile.TemporaryDirectory() as tmp:
-        top = Path(tmp)
-        (top / ".cargo").mkdir()
-        (top / "a" / "ws").mkdir(parents=True)
-        home = top / "cargo-home"
-        home.mkdir()
-        before = cargo_configs(top / "a" / "ws", {"CARGO_HOME": str(home)})
-        (top / ".cargo" / "config.toml").write_text("[build]\nrustflags = []\n")
-        after = cargo_configs(top / "a" / "ws", {"CARGO_HOME": str(home)})
-        assert before != after and str(top / ".cargo" / "config.toml") in after, after
-        (home / "config.toml").write_text("[net]\noffline = true\n")
-        assert cargo_configs(top / "a" / "ws", {"CARGO_HOME": str(home)}) != after, "CARGO_HOME's config is missed"
 
 
 def refused(fn: Callable[[], object]) -> str:
@@ -1003,7 +858,7 @@ def test_overhead() -> None:
     assert overhead(before, before, 0.0)["harness_share"] == 0.0
 
 
-SELFTESTS = (test_kept_cargo, test_index_path, test_listed_cksum, test_verified, test_unpack, test_judge, test_test_results, test_corpus,
+SELFTESTS = (test_index_path, test_listed_cksum, test_verified, test_unpack, test_judge, test_test_results, test_corpus,
              test_pinned, test_backends_input, test_dev_backend, test_panics, test_compare_backends, test_overhead,
              test_largest_first)
 

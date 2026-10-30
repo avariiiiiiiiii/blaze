@@ -23,6 +23,8 @@
 //! - [`join`]: [`under`] and [`over`] across cores, on owned traces or on [`wire::View`]s read in place.
 //! - [`wire`]: a trace as a file, one byte string per column, read in place by [`wire::View`].
 //! - [`nameres`]: the cases for name resolution and the impl buckets, per fixture slot.
+//! - [`dbsp`]: the cases for lane dbsp's maintained resolution and impl slices, per kind of edit.
+//! - [`tree`]: the digest of a source tree, its directories walked and files hashed on every core.
 //!
 //! A trace of nushell has millions of results and tens of millions of edges, so it is columns
 //! over `u32` indices (docs/v2/plan/design/data.md): keys sorted once, flags as bitsets, edges
@@ -32,8 +34,10 @@
 
 pub mod bytes;
 pub mod columns;
+pub mod dbsp;
 pub mod join;
 pub mod nameres;
+pub mod tree;
 pub mod wire;
 
 #[cfg(test)]

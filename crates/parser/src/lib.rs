@@ -29,6 +29,7 @@ extern crate rustc_driver as _;
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_lexer;
 
+pub mod cook;
 mod event;
 mod frontmatter;
 mod grammar;
@@ -63,7 +64,7 @@ pub use crate::{
 ///
 /// See <https://doc.rust-lang.org/reference/whitespace.html>.
 pub fn is_rust_whitespace(c: char) -> bool {
-    frontmatter::is_whitespace(c)
+    rustc_lexer::is_whitespace(c)
 }
 
 /// Parse the whole of the input as a given syntactic construct.

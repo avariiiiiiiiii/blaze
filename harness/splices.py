@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""splices.py: edits that are hard on the splice, a step at a time under a daemon, against cargo.
+"""splices.py: edits that are hard on the splice, a step at a time under a daemon, against blaze's
+build of the same source from nothing.
 
 The program has thread-locals, statics of every kind, vtables, tables of function pointers,
 closures, generics, recursion, panics and foreign calls, and the steps edit each. Some steps
 first do something to the linked binary (strip it, touch it, run it). After every step the
 binary is run as it is and with everything bound at once (LD_BIND_NOW, or DYLD_BIND_AT_LAUNCH
 on macOS), read by readelf (there: its signature verified and its fixups read by dyld_info), and compared with what
-`cargo build` of the same source prints. How each step got linked is counted, and where SPLICED
+blaze's build of the same source from nothing (mixed.from_scratch) prints. How each step got linked is counted, and where SPLICED
 has the target, the number of steps that were spliced has to be the one it says.
 
 BLAZE_SPLICE=0   link each edit in full (the same test of the full link)
@@ -18,7 +19,7 @@ import difflib, os, re, shlex, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, BINUTILS, toolchain, WINDOWS, TARGET, TARGET_ARGS, built, WASM, host
+from mixed import Fixture, BLAZE, sysroot_rlibs, RUNNER, BINUTILS, toolchain, WINDOWS, TARGET, TARGET_ARGS, WASM, from_scratch, host, printed
 
 # How many of the steps are spliced, by target: the rest link in full for the reasons printed,
 # or not at all where nothing was edited, and one more of them is a splice that got worse. A
@@ -468,7 +469,6 @@ def main():
         open(os.path.join(ws, path), "w").write(text)
     work = tempfile.mkdtemp(prefix="blaze-splices-out-")
     socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
-    reference = os.path.join(work, "reference")
     fx = Fixture(ws, ["sedge"], ["-p", "sedge"])
     fx.rustc_build()
     obj, patch, binary = (os.path.join(work, f"sedge.{n}") for n in ("o", "patch.o", "bin"))
@@ -492,6 +492,13 @@ def main():
         except Exception as error:
             return f"did not run: {error}"
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
+
+    def from_nothing():
+        """What blaze's build of the source as it is, from nothing, prints."""
+        try:
+            return printed(from_scratch(ws, ["sedge"], ["-p", "sedge"]))
+        except SystemExit as error:
+            return f"did not build from nothing: {str(error)[:200]}"
 
     def sync():
         seen = len(open(log_path).read())
@@ -541,12 +548,9 @@ def main():
         began = time.time()
         reply, how = sync()
         took = (time.time() - began) * 1000
-        cargo = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
-                               env={**os.environ, "CARGO_TARGET_DIR": reference})
-        assert cargo.returncode == 0, cargo.stderr[-2000:]
         if daemon.poll() is not None:
             raise SystemExit(f"the daemon died at {what!r}: {log_path}")
-        theirs = run(built(reference, "sedge"))
+        theirs = from_nothing()
         ours = None
         if not reply.startswith("ok"):
             verdict = "REFUSED: " + reply[:60]
@@ -566,12 +570,11 @@ def main():
         hows[how] = hows.get(how, 0) + 1
         print(f"{what:48} {verdict:16} {took:5.0f} ms  {how}", flush=True)
         if verdict.startswith("DIFFERENT OUTPUT"):
-            # Whether the binary prints the same again, and cargo's too, tells a wrong build
-            # from a program whose output changes from run to run.
+            # Whether the binary prints the same again tells a wrong build from a program whose
+            # output changes from run to run.
             again = run(binary, {BIND_NOW: "1"} if verdict.endswith("AT ONCE") else None) == ours
-            print(f"    blaze's prints {'the same' if again else 'otherwise'} when run again, cargo's "
-                  f"{'the same' if run(built(reference, 'sedge')) == theirs else 'otherwise'}")
-            for line in difflib.unified_diff(theirs.splitlines(), ours.splitlines(), "cargo's", "blaze's", n=0, lineterm=""):
+            print(f"    the daemon's prints {'the same' if again else 'otherwise'} when run again")
+            for line in difflib.unified_diff(theirs.splitlines(), ours.splitlines(), "from nothing", "the daemon's", n=0, lineterm=""):
                 print(f"    {line}")
 
     soak = int(os.environ.get("SPLICES_SOAK", "0"))
@@ -585,17 +588,15 @@ def main():
             reply, how = sync()
             times.append((time.time() - began) * 1000)
             spliced += how == "spliced"
-            printed = run(binary)
-            if not reply.startswith("ok") or f"soak {value}\n" not in printed or (turn % 50 == 49 and sound(binary)):
+            output = run(binary)
+            if not reply.startswith("ok") or f"soak {value}\n" not in output or (turn % 50 == 49 and sound(binary)):
                 soak_wrong += 1
-                print(f"soak {turn}: WRONG ({how}): {reply[:60]} {printed[-40:]!r}", flush=True)
-        cargo = subprocess.run(["cargo", "build", "-q", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
-                               env={**os.environ, "CARGO_TARGET_DIR": reference})
-        same = run(binary) == run(built(reference, "sedge"))
+                print(f"soak {turn}: WRONG ({how}): {reply[:60]} {output[-40:]!r}", flush=True)
+        same = run(binary) == from_nothing()
         soak_wrong += not same
         times.sort()
         print(f"soak: {soak - soak_wrong} of {soak} right, {spliced} spliced, median {times[len(times) // 2]:.0f} ms per request, "
-              f"binary {os.path.getsize(binary)} bytes, the last one {'same as' if same else 'DIFFERENT FROM'} cargo's")
+              f"binary {os.path.getsize(binary)} bytes, the last one {'same as' if same else 'DIFFERENT FROM'} the build from nothing")
     daemon.kill()
     for how, count in sorted(hows.items(), key=lambda it: -it[1]):
         print(f"  {count:3} {how}")

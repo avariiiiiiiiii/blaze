@@ -10,7 +10,7 @@ use anyhow::{Context as _, anyhow, bail};
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::{Context, Workspace};
 use blaze_manifest::files::Disk;
-use blaze_resolve::{PackageId, PackageIdSpec, SourceId, closest};
+use blaze_resolve::{FeatureValue, PackageId, PackageIdSpec, SourceId, closest};
 use toml_edit::{DocumentMut, Item};
 use url::Url;
 
@@ -405,7 +405,7 @@ impl Local {
             .iter()
             .filter_map(|(_, it)| it.as_value()?.as_array())
             .flat_map(|it| it.iter().filter_map(|v| v.as_str()))
-            .any(|it| matches!(FeatureValue::new(it), FeatureValue::Dep { dep_name } if dep_name == dep_key))
+            .any(|it| matches!(feature_value(it), FeatureValue::Dep { dep_name } if dep_name == dep_key))
     }
 
     fn dep_status(&self, dep_key: &str) -> Status {
@@ -433,26 +433,8 @@ enum Status {
 }
 
 /// A value of a feature, as cargo's `FeatureValue::new` reads it.
-enum FeatureValue<'a> {
-    Feature(&'a str),
-    Dep { dep_name: &'a str },
-    DepFeature { dep_name: &'a str, dep_feature: &'a str, weak: bool },
-}
-
-impl<'a> FeatureValue<'a> {
-    fn new(text: &'a str) -> FeatureValue<'a> {
-        match text.split_once('/') {
-            Some((dep, dep_feature)) => {
-                let weak = dep.ends_with('?');
-                let dep_name = dep.strip_suffix('?').unwrap_or(dep);
-                FeatureValue::DepFeature { dep_name, dep_feature, weak }
-            }
-            None => match text.strip_prefix("dep:") {
-                Some(dep_name) => FeatureValue::Dep { dep_name },
-                None => FeatureValue::Feature(text),
-            },
-        }
-    }
+fn feature_value(text: &str) -> FeatureValue {
+    FeatureValue::new(text.into())
 }
 
 fn fix_feature_activations(
@@ -465,7 +447,7 @@ fn fix_feature_activations(
         .iter()
         .enumerate()
         .filter_map(|(at, value)| Some((at, value.as_str()?)))
-        .filter(|(_, value)| match (status, FeatureValue::new(value)) {
+        .filter(|(_, value)| match (status, feature_value(value)) {
             (Status::None, FeatureValue::Feature(name)) => !explicit && name == dep_key,
             (
                 Status::None,
@@ -485,7 +467,7 @@ fn fix_feature_activations(
         for value in values.iter_mut() {
             let Some(text) = value.as_str() else { continue };
             if let FeatureValue::DepFeature { dep_name, dep_feature, weak: true } =
-                FeatureValue::new(text)
+                feature_value(text)
                 && dep_name == dep_key
             {
                 let mut new = toml_edit::Value::from(format!("{dep_name}/{dep_feature}"));
@@ -555,7 +537,7 @@ impl Dep {
             return Ok(dep);
         }
         dep.source = Some(if let Some(path) = text("path") {
-            let path = normalize(&crate_root.join(path));
+            let path = blaze_manifest::paths::normalize_path(&crate_root.join(path));
             Url::from_file_path(&path).map_err(|()| anyhow!("invalid path `{}`", path.display()))?
         } else if let Some(git) = text("git") {
             Url::parse(&git).with_context(|| format!("invalid url `{git}`"))?
@@ -579,21 +561,6 @@ fn registry_url(ctx: &Context<Disk>, name: &str) -> anyhow::Result<Url> {
     let index = index
         .with_context(|| format!("registry index was not found in any configuration: `{name}`"))?;
     Url::parse(&index).with_context(|| format!("invalid url `{index}`"))
-}
-
-/// `path` with its `.` and `..` resolved by the words alone, as cargo's `normalize_path`.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// Removes from the workspace's root manifest the `[workspace.dependencies]`,
@@ -712,7 +679,7 @@ fn gc_unused_patches(
 
 #[cfg(test)]
 mod tests {
-    use super::{FeatureValue, usage_line};
+    use super::{FeatureValue, feature_value, usage_line};
 
     fn words(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
@@ -729,13 +696,31 @@ mod tests {
         assert_eq!(line, "cargo remove --dev --target <TARGET> <DEP_ID>...");
     }
 
+    /// The parse this file had before it called blaze-resolve's, borrowing its text.
+    fn reference(text: &str) -> FeatureValue {
+        match text.split_once('/') {
+            Some((dep, dep_feature)) => {
+                let weak = dep.ends_with('?');
+                let dep_name = dep.strip_suffix('?').unwrap_or(dep);
+                FeatureValue::DepFeature { dep_name: dep_name.into(), dep_feature: dep_feature.into(), weak }
+            }
+            None => match text.strip_prefix("dep:") {
+                Some(dep_name) => FeatureValue::Dep { dep_name: dep_name.into() },
+                None => FeatureValue::Feature(text.into()),
+            },
+        }
+    }
+
     #[test]
     fn feature_values() {
-        assert!(matches!(FeatureValue::new("dep:c"), FeatureValue::Dep { dep_name: "c" }));
-        assert!(matches!(
-            FeatureValue::new("c?/x"),
-            FeatureValue::DepFeature { dep_name: "c", dep_feature: "x", weak: true }
-        ));
-        assert!(matches!(FeatureValue::new("c"), FeatureValue::Feature("c")));
+        assert_eq!(feature_value("dep:c"), FeatureValue::Dep { dep_name: "c".into() });
+        assert_eq!(
+            feature_value("c?/x"),
+            FeatureValue::DepFeature { dep_name: "c".into(), dep_feature: "x".into(), weak: true }
+        );
+        assert_eq!(feature_value("c"), FeatureValue::Feature("c".into()));
+        for text in ["", "c", "dep:", "dep:c", "c/x", "c?/x", "c??/x", "dep:c/x", "?/x", "c/x/y", "/", "c?"] {
+            assert_eq!(feature_value(text), reference(text), "{text:?}");
+        }
     }
 }

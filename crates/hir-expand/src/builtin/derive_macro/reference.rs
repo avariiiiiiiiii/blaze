@@ -342,7 +342,7 @@ pub(super) fn parse_adt_from_syntax(
     };
 
     let to_tt = |node: &syntax::SyntaxNode| {
-        syntax_bridge::syntax_node_to_token_tree(
+        syntax_bridge::reference::syntax_node_to_token_tree(
             node,
             tm,
             call_site,
@@ -364,7 +364,7 @@ pub(super) fn parse_adt_from_syntax(
                 match this {
                     Some(it) => {
                         param_type_set.insert(it.as_name());
-                        syntax_bridge::syntax_node_to_token_tree(
+                        syntax_bridge::reference::syntax_node_to_token_tree(
                             it.syntax(),
                             tm,
                             call_site,
@@ -378,7 +378,7 @@ pub(super) fn parse_adt_from_syntax(
             };
             let bounds = match &param {
                 ast::TypeOrConstParam::Type(it) => it.type_bound_list().map(|it| {
-                    syntax_bridge::syntax_node_to_token_tree(
+                    syntax_bridge::reference::syntax_node_to_token_tree(
                         it.syntax(),
                         tm,
                         call_site,
@@ -391,7 +391,7 @@ pub(super) fn parse_adt_from_syntax(
                 let ty = param
                     .ty()
                     .map(|ty| {
-                        syntax_bridge::syntax_node_to_token_tree(
+                        syntax_bridge::reference::syntax_node_to_token_tree(
                             ty.syntax(),
                             tm,
                             call_site,
@@ -412,7 +412,7 @@ pub(super) fn parse_adt_from_syntax(
     let where_clause = if let Some(w) = where_clause {
         w.predicates()
             .map(|it| {
-                syntax_bridge::syntax_node_to_token_tree(
+                syntax_bridge::reference::syntax_node_to_token_tree(
                     it.syntax(),
                     tm,
                     call_site,
@@ -449,7 +449,7 @@ pub(super) fn parse_adt_from_syntax(
             param_type_set.contains(&name).then_some(p)
         })
         .map(|it| {
-            syntax_bridge::syntax_node_to_token_tree(
+            syntax_bridge::reference::syntax_node_to_token_tree(
                 it.syntax(),
                 tm,
                 call_site,
@@ -1262,7 +1262,7 @@ pub(super) mod handle {
             None => {}
         }
         let field_ty = match &field_types[..] {
-            [Some(ty)] => syntax_bridge::syntax_node_to_token_tree(
+            [Some(ty)] => syntax_bridge::reference::syntax_node_to_token_tree(
                 ty.syntax(),
                 span_map,
                 span,
@@ -1325,7 +1325,7 @@ pub(super) mod handle {
         span_map.push(target_tokens.syntax().text_range().end(), span);
 
         let remove = syntax_bridge::Removed::<_>::from_iter([l_paren.into(), r_paren.into()]);
-        Some(syntax_bridge::syntax_node_to_token_tree_modified(
+        Some(syntax_bridge::reference::syntax_node_to_token_tree_modified(
             target_tokens.syntax(),
             &span_map,
             syntax_bridge::Appended::<_, std::alloc::Global>::default(),

@@ -430,7 +430,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let attr = self.attr_of(arg(0)?)?;
                 let state = self.uint_of(arg(1)?)?;
                 let target = self.target()?;
-                let Some(&state) = target.os.detach_states().iter().find(|&&it| u128::from(it) == state)
+                let Some(state) = target.os.detach_states().into_iter().find(|&it| u128::from(it) == state)
                 else {
                     return self.ret_int(destination, target.errno.inval.into()).map(|()| true);
                 };

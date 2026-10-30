@@ -40,7 +40,11 @@ pub(super) struct RunDirs {
 impl RunDirs {
     pub(super) fn new(root: &Path) -> io::Result<RunDirs> {
         // alloc: setup, once per driver.
-        let dir = root.join(".blaze-spawn");
+        RunDirs::under(root.join(".blaze-spawn"))
+    }
+
+    /// Each run's directory made in `dir` rather than `root/.blaze-spawn`.
+    pub(super) fn under(dir: PathBuf) -> io::Result<RunDirs> {
         let mut prefix = sys::path(&dir)?;
         prefix.pop();
         Ok(RunDirs {

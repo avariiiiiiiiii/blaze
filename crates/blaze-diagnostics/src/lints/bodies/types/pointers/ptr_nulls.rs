@@ -42,7 +42,7 @@ impl LatePass for PtrNullChecks {
     const LINTS: LintSet = lint_set(["useless_ptr_null_checks", "invalid_null_arguments"]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call, ExprKind::MethodCall, ExprKind::BinaryOp]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();
         match store.expr(expr) {
             Expr::Call { callee, args } => {
@@ -138,7 +138,7 @@ impl LatePass for PtrNullChecks {
     }
 }
 
-fn emit_useless(b: &BodyCx<'_, '_>, expr: ExprId, useless: Useless, out: &mut Vec<Found>) {
+fn emit_useless(b: &BodyCx<'_, '_, '_>, expr: ExprId, useless: Useless, out: &mut Vec<Found>) {
     let (Some(at), Some(span)) = (b.expr_node(expr), span(b, expr)) else { return };
     let diag = match useless {
         Useless::FnPtr { orig_ty, label } => {
@@ -175,7 +175,7 @@ fn emit_useless(b: &BodyCx<'_, '_>, expr: ExprId, useless: Useless, out: &mut Ve
 /// rustc's `useless_check`: `e` is, through casts to raw pointers and `.cast()`/`.cast_mut()`,
 /// a function pointer or a reference (after at least one cast), or a call of a function
 /// marked `#[rustc_never_returns_null_ptr]`.
-fn useless_check(b: &BodyCx<'_, '_>, mut e: ExprId) -> Option<Useless> {
+fn useless_check(b: &BodyCx<'_, '_, '_>, mut e: ExprId) -> Option<Useless> {
     let store = b.store();
     let mut had_at_least_one_cast = false;
     loop {
@@ -220,7 +220,7 @@ fn useless_check(b: &BodyCx<'_, '_>, mut e: ExprId) -> Option<Useless> {
 
 /// rustc's `is_null_ptr` of this pass: through `peel_casts`, a call of `ptr::null()` or
 /// `ptr::null_mut()`, or the literal `0`, with where it is.
-fn is_null_ptr(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: ExprId) -> Option<Span> {
+fn is_null_ptr(b: &BodyCx<'_, '_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: ExprId) -> Option<Span> {
     let expr = peel_casts(b, inits, expr);
     let is_null = match b.store().expr(expr) {
         Expr::Call { callee, args } if args.is_empty() => {

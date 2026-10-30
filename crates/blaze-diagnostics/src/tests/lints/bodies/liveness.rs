@@ -497,6 +497,29 @@ error: aborting due to 1 previous error
     assert_eq!(ui("invalid-sugg-for-unused-fn-arg-147303.rs", "2015", source), stderr);
 }
 
+/// rustc's `check_liveness` returns at once for a function with the `naked` attribute, written
+/// `#[unsafe(naked)]` or through `cfg_attr`, whatever its body is; another function's unused
+/// parameter is still linted.
+#[test]
+fn a_naked_function_is_not_checked() {
+    let source = r#"//- /main.rs crate:main edition:2024
+#![warn(unused_variables)]
+#[unsafe(naked)]
+pub extern "C" fn naked(a: u32) {}
+#[cfg_attr(all(), unsafe(naked))]
+pub extern "C" fn by_cfg_attr(b: u32) {}
+pub extern "C" fn plain(c: u32) {}
+fn main() {}
+"#;
+    let options = compiletest(Mode::Other, &Options::default());
+    let unused: Vec<String> = checked_with(source, "", &options)
+        .messages()
+        .into_iter()
+        .filter(|it| it.starts_with("unused_variables: "))
+        .collect();
+    assert_eq!(unused, ["unused_variables: unused variable: `c`"]);
+}
+
 #[test]
 fn an_automatically_derived_impl_is_not_checked() {
     // tests/ui/liveness/liveness-derive.rs

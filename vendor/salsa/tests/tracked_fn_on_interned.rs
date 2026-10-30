@@ -3,6 +3,8 @@
 //! Test that a `tracked` fn on a `salsa::interned`
 //! compiles and executes successfully.
 
+#![forbid(unsafe_code)]
+
 #[salsa::interned]
 struct Name<'db> {
     name: String,

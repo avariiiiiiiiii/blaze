@@ -198,7 +198,7 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
         tls_bias: BIAS,
         functions: &[&f1, &f2],
         statics: &[&pointers, &init, &local],
-        names: &[("dep_entry".into(), Target::Direct(key(2)))],
+        names: &[&("dep_entry".into(), Target::Direct(key(2)))],
         debug_names: &[],
         natives: &[Native { id: id(60), name: "hooked.o", bytes: &object, kind: NativeKind::Object, order: 0 }],
         spans: &[],

@@ -162,6 +162,13 @@ impl Effective {
         self.is_public_at(def, Level::Reachable)
     }
 
+    /// The crate's own definitions [`Effective::is_reachable`] holds of, in numbering order.
+    pub(crate) fn reachable_local(&self) -> impl Iterator<Item = Def> + '_ {
+        (self.defs.iter().zip(&self.ev).zip(&self.local))
+            .filter(|((_, ev), local)| **local && matches!(ev, Some(ev) if ev.at(Level::Reachable) == Vis::Public))
+            .map(|((def, _), _)| *def)
+    }
+
     /// `EffectiveVisibility::of_impl::<false>`: the least effective visibility of the local
     /// definitions its self type and trait name, arguments too.
     pub(super) fn of_impl(&self, cx: &Cx<'_, '_>, imp: hir::Impl) -> Ev {

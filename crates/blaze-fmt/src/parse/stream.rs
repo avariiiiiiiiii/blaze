@@ -531,10 +531,10 @@ pub(crate) fn parse_ra(
     text: &str,
     edition: syntax::Edition,
     entry: TopEntryPoint,
-) -> Result<Parse<syntax::SyntaxNode>, (usize, String)> {
+) -> Result<Parse<ra::Untyped>, (usize, String)> {
     let lexed = LexedStr::new(edition, text);
     if let Some((i, msg)) = lexed.errors().next() {
-        return Err((lexed.text_range(i).start, msg.to_owned()));
+        return Err((lexed.text_range(i).start, msg.to_owned())); // alloc: the one error, reported
     }
     let output = entry.parse(&lexed.to_input(edition));
     let mut builder = SyntaxTreeBuilder::default();
@@ -544,11 +544,11 @@ pub(crate) fn parse_ra(
         parser::StrStep::Enter { kind } => builder.start_node(kind),
         parser::StrStep::Exit => builder.finish_node(),
         parser::StrStep::Error { msg, pos } => {
-            error.get_or_insert_with(|| (pos, msg.to_owned()));
+            error.get_or_insert_with(|| (pos, msg.to_owned())); // alloc: the first error, reported
         }
     });
     match error {
         Some(error) => Err(error),
-        None => Ok(builder.finish()),
+        None => Ok(builder.finish_view()),
     }
 }

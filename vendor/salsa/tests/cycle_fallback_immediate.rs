@@ -3,6 +3,8 @@
 //! It is possible to omit the `cycle_fn`, only specifying `cycle_result` in which case
 //! an immediate fallback value is used as the cycle handling opposed to doing a fixpoint resolution.
 
+#![forbid(unsafe_code)]
+
 #[salsa::tracked(returns(copy), cycle_result=cycle_result)]
 fn one_o_one(db: &dyn salsa::Database) -> u32 {
     let val = one_o_one(db);

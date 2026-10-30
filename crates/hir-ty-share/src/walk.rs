@@ -43,7 +43,7 @@ use hir_ty::{
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::{is_dyn_method, lookup_impl_const},
-    mir::{MirOptLevel, MirOptions},
+    mir::{MirOptions, MirOwner, MirStage},
     next_solver::{
         AliasConst, AliasConstKind, AllocationData, Const, ConstKind, FreeConstAliasId,
         GenericArg, GenericArgs, InherentAssocConstId, StoredGenericArgs, TraitAssocConstId, Ty,
@@ -201,12 +201,6 @@ fn share_cycle(
 
 type Bodies<'db> = SmallVec<[(MirOptions, &'db MirBody<'db>); 4]>;
 
-/// Whether `options` ask for nothing beyond the runtime body: the code generator's
-/// `is_runtime`, which compiles the runtime body itself then.
-fn is_runtime(options: MirOptions) -> bool {
-    options.level == MirOptLevel::Off && !options.ub_checks
-}
-
 /// The generic bodies the code generator may compile `def` from, one per options, with what
 /// names the body hashed into `key`.
 fn bodies<'db>(
@@ -257,37 +251,19 @@ fn bodies<'db>(
     Ok(bodies)
 }
 
-/// The generic body the code generator compiles `def` from under `options`, as its
-/// `compiled_mir_body` picks it.
+/// The generic body the code generator compiles `def` from under `options`, as
+/// [`MirStage::compiled`] picks it for both.
 fn body_of<'db>(
     db: &'db Db,
     def: ShareDef,
     options: MirOptions,
 ) -> Result<&'db MirBody<'db>, Unshared> {
-    let body = match def {
-        ShareDef::Fn(func) => {
-            let owner = InferBodyId::DefWithBodyId(func.into());
-            match is_runtime(options) {
-                true => db.runtime_mir_body(owner),
-                false => db.optimized_mir_body(owner, options),
-            }
-        }
-        ShareDef::Closure(id) => {
-            let closure = InternedClosureId::from_id(id);
-            match is_runtime(options) {
-                true => db.runtime_mir_body_for_closure(closure),
-                false => db.optimized_mir_body_for_closure(closure, options),
-            }
-        }
-        // A coroutine's body is the runtime body, with the UB checks where they are asked for.
-        ShareDef::Coroutine(id) | ShareDef::CoroutineByMove(id) => {
-            let coroutine = InternedCoroutineId::from_id(id);
-            match (options.ub_checks, matches!(def, ShareDef::CoroutineByMove(_))) {
-                (false, false) => db.runtime_mir_body_for_coroutine(coroutine),
-                (false, true) => db.runtime_mir_body_for_coroutine_by_move(coroutine),
-                (true, false) => db.optimized_mir_body_for_coroutine(coroutine, options),
-                (true, true) => db.optimized_mir_body_for_coroutine_by_move(coroutine, options),
-            }
+    let owner = match def {
+        ShareDef::Fn(func) => MirOwner::Body(InferBodyId::DefWithBodyId(func.into())),
+        ShareDef::Closure(id) => MirOwner::Closure(InternedClosureId::from_id(id)),
+        ShareDef::Coroutine(id) => MirOwner::Coroutine(InternedCoroutineId::from_id(id)),
+        ShareDef::CoroutineByMove(id) => {
+            MirOwner::CoroutineByMove(InternedCoroutineId::from_id(id))
         }
         ShareDef::DropGlue
         | ShareDef::CallOnceShim
@@ -295,7 +271,8 @@ fn body_of<'db>(
         | ShareDef::FnPointerShim
         | ShareDef::ReifyShim { .. } => return Err(Unshared::Shim("a shim, which has no generic body")),
     };
-    body.map_err(|error| Unshared::NoMir(format!("{error:?}"))) // alloc: error path
+    db.mir(owner, MirStage::compiled(owner, options))
+        .map_err(|error| Unshared::NoMir(format!("{error:?}"))) // alloc: error path
 }
 
 /// What the instances of one generic body under one options read their records from.
@@ -882,7 +859,8 @@ impl<'a, 'db> Walk<'a, 'db> {
             | CastKind::FloatToInt
             | CastKind::FloatToFloat
             | CastKind::IntToFloat
-            | CastKind::FnPtrToPtr => false,
+            | CastKind::FnPtrToPtr
+            | CastKind::Transmute => false,
         };
         if coerces {
             let (from, to) = (identity::ty(self.db(), from)?, identity::ty(self.db(), to)?);

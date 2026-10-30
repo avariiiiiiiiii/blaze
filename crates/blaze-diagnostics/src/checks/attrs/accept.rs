@@ -14,12 +14,13 @@ use span::Edition;
 use syntax::{TextRange, TextSize};
 
 use super::args::{ArgParser, Ident, Lit, MetaItem, MetaItemOrLit, MetaList, NameValue};
+use stdx::list::Join;
 use crate::{
     checks::features::Features,
     cx::{Cx, item_range_view as item_range},
     lints::syntax::attrs::{
         Attr, Owner, Target,
-        parse::{Krate, and_list, applied, crate_level},
+        parse::{Krate, applied, crate_level},
         table::{Allowed, Builtin, Targets},
     },
     model::{Applicability, Diag, Span, SuggestionStyle},
@@ -692,7 +693,7 @@ pub(crate) fn target_error(
     let (applied, only) = applied(krate, targets.allowed().collect(), owner.target);
     let only = if only { "only " } else { "" };
     // alloc: the error's help
-    diag.help(format!("the `{name}{args}` attribute can {only}be applied to {}", and_list(&applied)));
+    diag.help(format!("the `{name}{args}` attribute can {only}be applied to {}", stdx::list::list(applied.iter(), Join::And, false)));
     match (path.as_slice(), owner.target) {
         ([it], Target::Static) if it == "link_name" => {
             let inner = cx.span(attr.in_file(attr.inner_range()));

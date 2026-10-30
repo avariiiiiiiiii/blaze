@@ -668,6 +668,69 @@ error: aborting due to 2 previous errors
     assert_eq!(ui_core("mutability-mismatch.rs", "sized, unsize, coerce_unsized", source), stderr);
 }
 
+/// minicore's flags for a `&dyn Iterator`'s `min`: `Iterator::min` and `Ord` (`ord`), `[T]::iter`
+/// (`slice`, `iterator`) and `Option::unwrap` (`fmt`).
+const MIN_OF_A_DYN_ITERATOR: &str = "sized, unsize, coerce_unsized, iterator, ord, slice, fmt";
+
+#[test]
+fn a_method_with_a_sized_bound_on_a_shared_reference_to_a_dyn_iterator() {
+    // tests/ui/suggestions/imm-ref-trait-object.rs
+    let source = r##"fn test(t: &dyn Iterator<Item=&u64>) -> u64 {
+     t.min().unwrap() //~ ERROR the `min` method cannot be invoked on `&dyn Iterator<Item = &u64>`
+}
+
+fn main() {
+     let array = [0u64];
+     test(&mut array.iter());
+}
+"##;
+    let stderr = r##"error: the `min` method cannot be invoked on `&dyn Iterator<Item = &u64>`
+  --> $DIR/imm-ref-trait-object.rs:2:8
+   |
+LL |      t.min().unwrap()
+   |        ^^^
+   |
+help: you need `&mut dyn Iterator<Item = &u64>` instead of `&dyn Iterator<Item = &u64>`
+   |
+LL | fn test(t: &mut dyn Iterator<Item=&u64>) -> u64 {
+   |             +++
+
+error: aborting due to 1 previous error
+
+"##;
+    assert_eq!(ui_core("imm-ref-trait-object.rs", MIN_OF_A_DYN_ITERATOR, source), stderr);
+}
+
+#[test]
+fn a_method_with_a_sized_bound_on_a_shared_reference_argument_dereferenced() {
+    // tests/ui/illegal-sized-bound/mutability-mismatch-arg.rs
+    let source = r##"//@ run-rustfix
+fn test(t: &dyn Iterator<Item=&u64>) -> u64 {
+     *t.min().unwrap() //~ ERROR the `min` method cannot be invoked on
+}
+
+fn main() {
+     let array = [0u64];
+     test(&mut array.iter());
+}
+"##;
+    let stderr = r##"error: the `min` method cannot be invoked on `&dyn Iterator<Item = &u64>`
+  --> $DIR/mutability-mismatch-arg.rs:3:9
+   |
+LL |      *t.min().unwrap()
+   |         ^^^
+   |
+help: you need `&mut dyn Iterator<Item = &u64>` instead of `&dyn Iterator<Item = &u64>`
+   |
+LL | fn test(t: &mut dyn Iterator<Item=&u64>) -> u64 {
+   |             +++
+
+error: aborting due to 1 previous error
+
+"##;
+    assert_eq!(ui_core("mutability-mismatch-arg.rs", MIN_OF_A_DYN_ITERATOR, source), stderr);
+}
+
 #[test]
 fn a_method_with_a_sized_bound_of_a_trait_not_in_scope() {
     // tests/ui/suggestions/trait-object-import-suggestion-on-method.rs, revision `unimported`

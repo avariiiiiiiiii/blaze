@@ -57,7 +57,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import gen
 import linkline
-from difftest import BLAZE, TARGET_ARGS, Fixture, built, minimize, sysroot_rlibs
+from mixed import BLAZE, TARGET_ARGS, Fixture, built, minimize, sysroot_rlibs
 from fuzz import BACKENDS, FOUND, MANIFEST, differences, edition_of, run
 
 EDITS = os.path.join(FOUND, "edits")

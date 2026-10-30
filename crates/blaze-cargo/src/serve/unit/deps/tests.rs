@@ -112,3 +112,36 @@ fn the_goal_note_names_every_count_that_kept_goals_out() {
          goals kept out by `impl_datum` (4), `crate_env` (2); 7 too long to keep"
     );
 }
+
+#[test]
+fn blaze_item_store_is_verify_off_or_unset() {
+    let env = |value: &str| vec![(ITEMS.to_owned(), value.to_owned())];
+    assert_eq!(items_in(&[]).unwrap(), Some(body_store::Mode::Serve));
+    assert_eq!(items_in(&env("verify")).unwrap(), Some(body_store::Mode::Verify));
+    assert_eq!(items_in(&env("off")).unwrap(), None);
+    let error = items_in(&env("check")).unwrap_err();
+    assert!(error.what.starts_with("BLAZE_ITEM_STORE=check is not a value blaze takes"), "{}", error.what);
+}
+
+#[test]
+fn the_note_adds_the_item_store_counts_after_the_goals() {
+    let goals = goal_store::Flushed { written: 3, kept: 5, ..goal_store::Flushed::default() };
+    let alone = noted(&Flushes { goals, items: None });
+    assert_eq!(alone.message, "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full");
+    let items = body_store::Flushed {
+        written: 2,
+        kept: 9,
+        refused: vec![("crate_env", 3)],
+        no_identity: 4,
+        ..body_store::Flushed::default()
+    };
+    let goals = goal_store::Flushed { written: 3, kept: 5, ..goal_store::Flushed::default() };
+    let note = noted(&Flushes { goals, items: Some(items) });
+    assert_eq!(
+        note.message,
+        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full; \
+         the item store: 2 written, 9 kept, 0 with every slot full; steps kept out by reads of \
+         `crate_env` (3); 4 of bodies with no identity"
+    );
+    assert_eq!(note.rendered, format!("note: {}\n", note.message));
+}

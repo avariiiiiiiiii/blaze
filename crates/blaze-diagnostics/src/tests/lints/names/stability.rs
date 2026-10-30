@@ -299,3 +299,44 @@ fn main() {
         ]
     );
 }
+
+/// A feature name is an identifier as rustc's `is_ident` has it (XID), not only letters.
+#[test]
+fn a_feature_named_with_any_xid_identifier_gates_its_item() {
+    let checked = checked(
+        r#"//- /dep.rs crate:dep edition:2021 library
+#![feature(staged_api)]
+#![stable(feature = "dep", since = "1.0.0")]
+#[unstable(feature = "fé", issue = "none")]
+pub fn f() {}
+//- /main.rs crate:main edition:2021 deps:dep
+fn main() {
+    dep::f();
+}
+"#,
+    );
+    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("E0658")).collect();
+    assert_eq!(messages, ["E0658: use of unstable library feature `fé`"]);
+}
+
+/// `since = "CURRENT_RUSTC_VERSION"` in a staged crate is the graph's toolchain release
+/// (`1.76.0` in a fixture), so the deprecation is in effect: `deprecated`, not
+/// `deprecated_in_future`.
+#[test]
+fn a_deprecation_since_the_current_rustc_version_is_in_effect() {
+    let checked = checked(
+        r#"//- /dep.rs crate:dep edition:2021 library
+#![feature(staged_api)]
+#![stable(feature = "dep", since = "1.0.0")]
+#[stable(feature = "a", since = "1.0.0")]
+#[deprecated(since = "CURRENT_RUSTC_VERSION", note = "n")]
+pub fn f() {}
+//- /main.rs crate:main edition:2021 deps:dep
+fn main() {
+    dep::f();
+}
+"#,
+    );
+    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
+    assert_eq!(messages, ["deprecated: use of deprecated function `dep::f`: n"]);
+}

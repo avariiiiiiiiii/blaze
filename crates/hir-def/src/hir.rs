@@ -14,6 +14,8 @@
 //!
 //! [`body`]: crate::expr_store::body
 
+// A store's columns in one slab or read in place in an image: no allocation a column.
+#[allow(unsafe_code)]
 pub(crate) mod col;
 pub(crate) mod columns;
 pub mod format_args;
@@ -227,7 +229,7 @@ impl fmt::Display for FloatTypeWrapper {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)] // clone: a borrowed expression pushed; lowering moves them
 pub enum Literal {
     String(Symbol),
     ByteString(Box<[u8]>),
@@ -524,13 +526,13 @@ pub enum UnsafeBinderCastKind {
     Unwrap,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)] // clone: as `Literal`'s
 pub struct OffsetOf {
     pub container: TypeRefId,
     pub fields: Box<[Name]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)] // clone: as `Literal`'s
 pub struct InlineAsm {
     pub operands: Box<[(Option<Name>, AsmOperand)]>,
     /// What to assemble, the template strings joined by newlines. `None` when a string could
@@ -545,7 +547,7 @@ pub struct InlineAsm {
     pub clobber_abi: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: MIR lowering, once per `asm!` block
 pub enum AsmPiece {
     Lit(Box<str>),
     /// The operand at `index`, written as its `modifier` says: `{0:e}`.

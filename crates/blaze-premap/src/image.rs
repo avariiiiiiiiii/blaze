@@ -15,6 +15,7 @@
 //! Everything before the segment bytes is the image's metadata ([`View::meta_len`]): an opened
 //! image keeps only that once its segments are in its memory object.
 
+use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 use blaze_codegen::content::{arch_of, arch_tag};
 use blaze_codegen::{Arch, InstanceKey};
 use blaze_ids::ContentId;
@@ -642,7 +643,7 @@ impl blaze_link::Outside for View<'_> {
     }
 
     fn name(&self, name: &str) -> Option<blaze_link::premap::Def> {
-        self.get(&SymbolId::name(name)).map(crate::prelink::link_def)
+        self.get(&SymbolId::name(name))
     }
 
     fn reached_directly(&self, name: &str) -> bool {
@@ -656,14 +657,6 @@ impl blaze_link::Outside for View<'_> {
     fn end(&self) -> u64 {
         View::end(self)
     }
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
 }
 
 fn prot_tag(prot: Prot) -> u8 {

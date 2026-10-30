@@ -26,30 +26,13 @@ pub(crate) enum Spacing {
     JointHidden,
 }
 
-/// In the bridge's order (`rpc_encode_decode!(enum Delimiter ..)`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Delimiter {
-    Parenthesis,
-    Brace,
-    Bracket,
-    None,
-}
+/// tt's kinds are the bridge's, numbered in its order (`rpc_encode_decode!(enum Delimiter ..)`),
+/// with `Invisible` its `None`.
+pub(crate) use tt::DelimiterKind as Delimiter;
 
-/// In the bridge's order (`rpc_encode_decode!(enum LitKind ..)`), each raw kind with its `#`s.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum LitKind {
-    Byte,
-    Char,
-    Integer,
-    Float,
-    Str,
-    StrRaw(u8),
-    ByteStr,
-    ByteStrRaw(u8),
-    CStr,
-    CStrRaw(u8),
-    Err,
-}
+/// In the bridge's order (`rpc_encode_decode!(enum LitKind ..)`), each raw kind with its `#`s:
+/// the lexer's own.
+pub(crate) use parser::cook::LitKind;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct DelimSpan {
@@ -158,7 +141,7 @@ impl Stream {
         if top.delimiter.kind == tt::DelimiterKind::Invisible {
             return Stream::of(trees);
         }
-        let delimiter = delimiter_of(top.delimiter.kind);
+        let delimiter = top.delimiter.kind;
         let span = DelimSpan {
             open: top.delimiter.open,
             close: top.delimiter.close,
@@ -195,24 +178,6 @@ impl CoverOrSelf for Span {
             true => Span { range: self.range.cover(other.range), ..self },
             false => self,
         }
-    }
-}
-
-fn delimiter_of(kind: tt::DelimiterKind) -> Delimiter {
-    match kind {
-        tt::DelimiterKind::Parenthesis => Delimiter::Parenthesis,
-        tt::DelimiterKind::Brace => Delimiter::Brace,
-        tt::DelimiterKind::Bracket => Delimiter::Bracket,
-        tt::DelimiterKind::Invisible => Delimiter::None,
-    }
-}
-
-fn kind_of(delimiter: Delimiter) -> tt::DelimiterKind {
-    match delimiter {
-        Delimiter::Parenthesis => tt::DelimiterKind::Parenthesis,
-        Delimiter::Brace => tt::DelimiterKind::Brace,
-        Delimiter::Bracket => tt::DelimiterKind::Bracket,
-        Delimiter::None => tt::DelimiterKind::Invisible,
     }
 }
 
@@ -261,7 +226,7 @@ fn trees_of(iter: &mut tt::iter::TtIter<'_>) -> Vec<Tree> {
                 let span = DelimSpan { open, close, entire: open.cover_or_self(close) };
                 let inner = trees_of(&mut inner);
                 Tree::Group {
-                    delimiter: delimiter_of(subtree.delimiter.kind),
+                    delimiter: subtree.delimiter.kind,
                     open: open_spacing(&span, &inner),
                     stream: Stream::of(inner),
                     span,
@@ -365,7 +330,7 @@ fn wire_into(trees: Vec<Tree>, out: &mut Vec<wire::Tree>) {
                 continue;
             }
             Tree::Group { delimiter, stream, span, .. } => wire::Tree::Group {
-                kind: kind_of(delimiter),
+                kind: delimiter,
                 open: span.open,
                 close: span.close,
                 entire: span.entire,

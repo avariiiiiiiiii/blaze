@@ -2,6 +2,8 @@
 
 //! Test that `PartialOrd` and `Ord` can be derived for tracked structs
 
+#![forbid(unsafe_code)]
+
 use salsa::{Database, DatabaseImpl};
 use test_log::test;
 

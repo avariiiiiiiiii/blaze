@@ -25,7 +25,7 @@ use hir_def::FunctionId;
 use hir_ty::{
     db::HirDatabase,
     intrinsic::{Intrinsic, SimdOp},
-    layout::Layout,
+    layout::{InternedLayout, Layout, intern_layout},
     mir::{Operand, OperandKind, Rvalue, StatementKind},
     next_solver::{ConstKind, DbInterner, GenericArgs, Ty, TyKind},
     traits::StoredParamEnvAndCrate,
@@ -34,7 +34,6 @@ use rustc_abi::{BackendRepr, Size};
 use rustc_type_ir::TypeVisitableExt;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
 use smallvec::SmallVec;
-use triomphe::Arc;
 
 use super::{CodegenError, FunctionCx, MEM, Result, ptr};
 
@@ -190,14 +189,15 @@ fn strip_decimal(s: &str, n: u64) -> Option<&str> {
 }
 
 /// The layout codegen gives a scalable type: rustc's, sized for its storage at the largest
-/// vector length rather than at the least.
-pub(super) fn storage(layout: Arc<Layout>) -> Arc<Layout> {
-    let Some(shape) = Shape::of(&layout) else { return layout };
+/// vector length rather than at the least. Interned as the database's are, so it lives as
+/// long as they do.
+pub(super) fn storage(layout: &'static InternedLayout) -> &'static Layout {
+    let Some(shape) = Shape::of(layout) else { return layout };
     // clone: a scalable type's layout only, once per type on the layout cache's miss
-    let mut storage = (*layout).clone();
+    let mut storage = layout.0.clone();
     storage.size = Size::from_bytes(shape.storage());
     // alloc: a scalable type's layout only, once per type on the layout cache's miss
-    Arc::new(storage)
+    intern_layout(storage).get()
 }
 
 /// What an operand of a stub is.
@@ -1586,7 +1586,7 @@ impl<'db> FunctionCx<'_, 'db> {
                             None
                         }
                     }
-                    ConstKind::Unevaluated(named) => read(&self.eval_const(named)?.memory),
+                    ConstKind::Alias(_, named) => read(&self.eval_const(named)?.memory),
                     _ => None,
                 },
                 OperandKind::Allocation { allocation } => read(&allocation.as_ref().memory),

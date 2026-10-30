@@ -25,6 +25,11 @@ mod raw;
 #[cfg(test)]
 mod tests;
 
+// Every target binary links this crate, and `blaze_fuzz::largest_allocation` reads this
+// allocator's counts (it refuses to measure without it).
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use std::{
     collections::HashSet,
     io::{Read as _, Write as _},
@@ -95,6 +100,40 @@ pub fn seeds(target: &Target) {
                 let _stop = StopOnPanic(&next, inputs.len());
                 while let Some(input) = inputs.get(next.fetch_add(1, Ordering::Relaxed)) {
                     (target.check)(input);
+                }
+            });
+        }
+    });
+}
+
+/// Which of `cases` ways to check an input (`cases` > 0) a target's run takes, when checking
+/// each way on every run would repeat a whole read: set by the input's length and last byte,
+/// so the same input takes the same way, and the engine's changes of it reach every way over
+/// many runs.
+pub fn case(data: &[u8], cases: usize) -> usize {
+    (data.len() + usize::from(data.last().copied().unwrap_or(0))) % cases
+}
+
+/// The plain `#[test]` of a target whose `check` is `check_case` at one [`case`] of `cases`:
+/// every case of each corpus file and of `seeds()`, so on them it checks what a `check` taking
+/// every case on every run would. On every core, as [`seeds`]. An input with fewer ways than
+/// `cases` is given the rest too, and checks only what every way does.
+pub fn every_case(target: &Target, cases: usize, check_case: fn(&[u8], usize)) {
+    let mut inputs = corpus::read_dir(&target.corpus()).unwrap_or_else(|e| panic!("{e}"));  // alloc: the plain test's inputs, setup
+    inputs.extend((target.seeds)());
+    let runs = inputs.len() * cases;
+    let threads = std::thread::available_parallelism().map_or(1, NonZero::get).min(runs).max(1);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let _stop = StopOnPanic(&next, runs);
+                loop {
+                    let run = next.fetch_add(1, Ordering::Relaxed);
+                    if run >= runs {
+                        break;
+                    }
+                    check_case(&inputs[run / cases], run % cases);
                 }
             });
         }

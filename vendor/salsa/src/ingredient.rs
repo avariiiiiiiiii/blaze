@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::database::RawDatabase;
 use crate::function::{FunctionIngredientRef, VerifyResult};
-use crate::graph::Relocation;
+use crate::graph::{LiveEdges, Relocation};
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::sync::Arc;
 use crate::table::Table;
@@ -57,6 +57,12 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
     /// What this ingredient holds, for telling its reads apart.
     fn read_kind(&self) -> ReadKind;
 
+    /// What a read of this ingredient's keys adds to the reader's input-closure filter
+    /// (`graph::bloom`): every bit unless the ingredient says otherwise.
+    fn closure_class(&self) -> crate::graph::ClosureClass {
+        crate::graph::ClosureClass::Opaque
+    }
+
     /// Has the value for `input` in this ingredient changed after `revision`?
     ///
     /// # Safety
@@ -69,6 +75,15 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
         input: Id,
         revision: Revision,
     ) -> VerifyResult;
+
+    /// When `input` last changed, if that can't move until the next revision (an input field:
+    /// setting one needs `&mut`), so deep verify may color its node with it for the rest of the
+    /// revision (`graph::colors`). `None` for anything else: memos color their own keys, and a
+    /// tracked struct's fields change when the query that made it runs again.
+    fn fixed_changed_at(&self, zalsa: &Zalsa, input: Id) -> Option<Revision> {
+        let _ = (zalsa, input);
+        None
+    }
 
     /// Collects the minimum edges necessary to serialize a given dependency edge on this ingredient,
     /// without necessarily serializing the dependency edge itself.
@@ -147,6 +162,14 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
         _ = (table, relocation);
     }
 
+    /// Gives `live` the node and edge words of every live memo this ingredient owns: what the
+    /// walk-order renumbering at a compaction and the frozen graph are made from
+    /// ([`LiveEdges`]). Only functions have memos. `&mut Table` because only `&mut` holds every
+    /// memo still.
+    fn memo_edges(&self, table: &mut Table, live: &mut LiveEdges<'_>) {
+        _ = (table, live);
+    }
+
     /// Drops the memos this struct ingredient's memo columns retired since the last reclaim and
     /// frees their slots ([`MemoTableTypes::reclaim`]). Only struct ingredients have memo columns.
     ///
@@ -161,6 +184,17 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
 
     fn fmt_index(&self, index: Id, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt_index(self.debug_name(), index, fmt)
+    }
+
+    /// Pushes the salsa `Id`s the value at `index` names: an interned struct's
+    /// ([`crate::interned::Configuration::ids`]); none for any other ingredient.
+    fn ids_of(&self, _zalsa: &crate::zalsa::Zalsa, _index: Id, _out: &mut Vec<Id>) {}
+
+    /// The fields of the interned value at `id`, every database lifetime made `'static`: an
+    /// interned ingredient's ([`crate::plumbing::interned_arguments`]); `None` for any other.
+    // dyn: the fields' type is the ingredient's own, told apart by its `TypeId`
+    fn interned_fields<'z>(&'z self, _zalsa: &'z Zalsa, _id: Id) -> Option<&'z dyn Any> {
+        None
     }
     /// Flattens the dependencies of a query with cycle handling that participates in a cycle.
     ///

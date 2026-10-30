@@ -68,7 +68,7 @@ impl LatePass for NonPanicFmt {
     const LINTS: LintSet = lint_set([LINT]);
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Call { callee, args: &[arg] } = b.store().expr(expr) else { return };
         let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(def)), _) = b.infer.expr_ty(callee).kind() else {
             return;
@@ -98,7 +98,7 @@ impl LatePass for NonPanicFmt {
 impl NonPanicFmt {
     /// rustc's `check_panic`: the call `call` of `f` made by a 2015 panic macro, with the
     /// message `arg`.
-    fn check_panic(&mut self, b: &BodyCx<'_, '_>, call: ExprId, f: &At, arg: ExprId, out: &mut Vec<Found>) {
+    fn check_panic(&mut self, b: &BodyCx<'_, '_, '_>, call: ExprId, f: &At, arg: ExprId, out: &mut Vec<Found>) {
         if let Some(Literal::String(fmt)) = util::literal(b, arg) {
             out.extend(check_panic_str(b, call, f, arg, fmt.as_str()));
             return;
@@ -126,7 +126,7 @@ impl NonPanicFmt {
 }
 
 /// rustc's `check_panic_str`: the message is the string literal `arg`, `fmt` unescaped.
-fn check_panic_str(b: &BodyCx<'_, '_>, call: ExprId, f: &At, arg: ExprId, fmt: &str) -> Option<Found> {
+fn check_panic_str(b: &BodyCx<'_, '_, '_>, call: ExprId, f: &At, arg: ExprId, fmt: &str) -> Option<Found> {
     if !fmt.contains(['{', '}']) {
         return None;
     }
@@ -217,7 +217,7 @@ struct NotLiteral<'s> {
 }
 
 impl NotLiteral<'_> {
-    fn diag(&self, b: &BodyCx<'_, '_>, traits: FmtTraits) -> Diag {
+    fn diag(&self, b: &BodyCx<'_, '_, '_>, traits: FmtTraits) -> Diag {
         let db = b.db();
         let NotLiteral { arg, ref arg_span, ref span, arg_macro, panic, symbol } = *self;
         let shown = show(b, arg_span);
@@ -311,7 +311,7 @@ impl NotLiteral<'_> {
 
 /// Records on `diag` whether the message's type implements each of the traits it was checked
 /// for.
-fn trait_facts<'db>(b: &BodyCx<'_, 'db>, diag: &mut Diag, arg: ExprId, ty: Ty<'db>, checked: &[(&str, TraitId)]) {
+fn trait_facts<'db>(b: &BodyCx<'_, '_, 'db>, diag: &mut Diag, arg: ExprId, ty: Ty<'db>, checked: &[(&str, TraitId)]) {
     if checked.is_empty() {
         return;
     }
@@ -329,7 +329,7 @@ fn trait_facts<'db>(b: &BodyCx<'_, 'db>, diag: &mut Diag, arg: ExprId, ty: Ty<'d
 impl FmtTraits {
     /// The traits of the crates the body's crate depends on (itself included) that are the
     /// diagnostic items `Display` and `Debug`.
-    fn of(b: &BodyCx<'_, '_>) -> FmtTraits {
+    fn of(b: &BodyCx<'_, '_, '_>) -> FmtTraits {
         let db = b.db();
         let mut traits = FmtTraits { display: None, debug: None };
         'crates: for krate in b.owner.krate(db).transitive_deps(db).iter().copied() {
@@ -379,7 +379,7 @@ impl At {
     }
 }
 
-fn at_ptr(b: &BodyCx<'_, '_>, ptr: InFile<SyntaxNodePtr>) -> Option<At> {
+fn at_ptr(b: &BodyCx<'_, '_, '_>, ptr: InFile<SyntaxNodePtr>) -> Option<At> {
     at(b, b.cx.syntax_view(ptr))
 }
 
@@ -388,7 +388,7 @@ fn at_ptr(b: &BodyCx<'_, '_>, ptr: InFile<SyntaxNodePtr>) -> Option<At> {
 /// is written in a file; else the first). The output of a built-in macro (but `include!`'s) is
 /// spanned at the macro's call, in its expansion, as rustc's built-in macros span what they
 /// make.
-fn at(b: &BodyCx<'_, '_>, node: InFile<ast::Node<'_>>) -> Option<At> {
+fn at(b: &BodyCx<'_, '_, '_>, node: InFile<ast::Node<'_>>) -> Option<At> {
     let db = b.db();
     let range = node.value.text_range();
     let Some(call) = node.file_id.macro_file() else {
@@ -449,13 +449,13 @@ fn is_builtin_output(db: &Db, call: MacroCallId, node: ast::Node<'_>) -> bool {
 }
 
 /// rustc's `outer_expn_data().call_site` of an expansion: the span of the macro call.
-fn call_site(b: &BodyCx<'_, '_>, call: MacroCallId) -> Option<At> {
+fn call_site(b: &BodyCx<'_, '_, '_>, call: MacroCallId) -> Option<At> {
     at(b, call.loc(b.db()).to_node_view(b.db()))
 }
 
 /// rustc's `Span::source_callsite`: the call of the outermost macro `at` came out of, written
 /// in a file, or `at` when it is.
-fn source_callsite(b: &BodyCx<'_, '_>, mut at: At) -> Option<At> {
+fn source_callsite(b: &BodyCx<'_, '_, '_>, mut at: At) -> Option<At> {
     while let Some(call) = at.expn {
         at = call_site(b, call)?;
     }
@@ -464,7 +464,7 @@ fn source_callsite(b: &BodyCx<'_, '_>, mut at: At) -> Option<At> {
 
 /// rustc's `Span::in_external_macro`: made by a bang macro of another crate (a built-in one
 /// included), or by an attribute or derive macro.
-fn in_external_macro(b: &BodyCx<'_, '_>, at: &At) -> bool {
+fn in_external_macro(b: &BodyCx<'_, '_, '_>, at: &At) -> bool {
     let Some(call) = at.expn else { return false };
     let loc = call.loc(b.db());
     match loc.kind {
@@ -477,7 +477,7 @@ fn in_external_macro(b: &BodyCx<'_, '_>, at: &At) -> bool {
 /// macros that made it (`panic!`, `assert!`, `debug_assert!`, `unreachable!`, which a 2015
 /// macro was likely expanded from): the span of the outermost call, its macro's diagnostic item
 /// and its name as called.
-fn panic_call(b: &BodyCx<'_, '_>, f: &At) -> Option<(At, Option<SmolStr>, String)> {
+fn panic_call(b: &BodyCx<'_, '_, '_>, f: &At) -> Option<(At, Option<SmolStr>, String)> {
     let db = b.db();
     let mut expn = f.expn?;
     let mut panic = None;
@@ -499,7 +499,7 @@ fn panic_call(b: &BodyCx<'_, '_>, f: &At) -> Option<(At, Option<SmolStr>, String
 
 /// rustc's `ExpnKind::Macro` name of an expansion: the path a bang macro is called by
 /// (`std::panic`), the name of an attribute or derive macro.
-fn macro_symbol(b: &BodyCx<'_, '_>, call: MacroCallId) -> String {
+fn macro_symbol(b: &BodyCx<'_, '_, '_>, call: MacroCallId) -> String {
     let db = b.db();
     let loc = call.loc(db);
     let name: Option<String> = match loc.kind {
@@ -543,7 +543,7 @@ fn is_arg_inside_call(arg: &At, call: &At) -> bool {
 
 /// rustc's `find_delimiters`: in the text of a macro call, where its first opening delimiter
 /// and its last closing one are, and which the opening one is.
-fn find_delimiters(b: &BodyCx<'_, '_>, call: &At) -> Option<(usize, usize, char)> {
+fn find_delimiters(b: &BodyCx<'_, '_, '_>, call: &At) -> Option<(usize, usize, char)> {
     let snippet = snippet(b, call)?;
     let (open, open_ch) = snippet.char_indices().find(|&(_, c)| "([{".contains(c))?;
     let close = snippet.rfind(|c| ")]}".contains(c))?;
@@ -551,13 +551,13 @@ fn find_delimiters(b: &BodyCx<'_, '_>, call: &At) -> Option<(usize, usize, char)
 }
 
 /// The text `at` is written as.
-fn snippet<'db>(b: &BodyCx<'_, 'db>, at: &At) -> Option<&'db str> {
+fn snippet<'db>(b: &BodyCx<'_, '_, 'db>, at: &At) -> Option<&'db str> {
     b.cx.file_text(at.file).get(usize::from(at.range.start())..usize::from(at.range.end()))
 }
 
 /// The span `at` is shown by: where it is written when it is in a file, else as
 /// [`crate::cx::Cx::span`] shows the expansion it is in.
-fn show(b: &BodyCx<'_, '_>, at: &At) -> Span {
+fn show(b: &BodyCx<'_, '_, '_>, at: &At) -> Span {
     match at.expn {
         None => b.cx.span_in_file(at.file, at.range),
         Some(_) => b.cx.span(at.shown),
@@ -567,7 +567,7 @@ fn show(b: &BodyCx<'_, '_>, at: &At) -> Span {
 /// rustc's `Span::from_inner`: bytes `start..end` of what `at` is written as, shown where `at`
 /// is; all of `at` when it is shown elsewhere than where it is written (at the call of another
 /// crate's macro).
-fn inner(b: &BodyCx<'_, '_>, at: &At, start: usize, end: usize) -> Span {
+fn inner(b: &BodyCx<'_, '_, '_>, at: &At, start: usize, end: usize) -> Span {
     let shown = show(b, at);
     if shown.hi - shown.lo != u32::from(at.range.len()) {
         return shown;

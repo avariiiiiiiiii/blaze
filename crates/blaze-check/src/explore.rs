@@ -13,7 +13,7 @@ use std::{
 use crate::{
     clock::MAX_THREADS,
     coro::{self, Coroutine, Ran},
-    path::{Mode, Path, Pct},
+    path::{Mode, Path},
     rng::Rng,
     rt::{self, Runtime},
 };
@@ -85,7 +85,11 @@ impl Builder {
             "blaze-check: `model` called inside a model"
         );
         let _one = MODELS.lock().unwrap_or_else(PoisonError::into_inner);
-        let f = Rc::new(f);
+        // dyn: the test's closure, once per model (`coro::Job::Main`).
+        let main: Rc<dyn Fn()> = Rc::new(move || {
+            f();
+            rt::thread_end();
+        });
         let _host = coro::Host::new();
         let mut threads: Vec<Coroutine> = Vec::with_capacity(self.max_threads);
         let (mode, mut seeds) = match (&self.replay, self.random) {
@@ -98,6 +102,7 @@ impl Builder {
                 .unwrap_or_else(|why| panic!("blaze-check: CHECK_REPLAY: {why}")),
             None => Path::new(Mode::Explore, self.max_preemptions, self.max_branches),
         };
+        // alloc: the runtime, once per model
         rt::explorer(|rt| *rt = Some(Box::new(Runtime::new(path, self.max_threads))));
         let _uninstall = Uninstall;
         let mut executions = 0u64;
@@ -109,20 +114,11 @@ impl Builder {
                     break;
                 }
                 run_seed = seeds.next_u64();
-                let pct = Pct::new(run_seed, self.pct_depth, steps);
-                let path = Path::new(Mode::Random(pct), None, self.max_branches);
-                rt::explorer(|rt| installed(rt).path = path);
+                let depth = self.pct_depth;
+                rt::explorer(|rt| installed(rt).path.random(run_seed, depth, steps));
             }
             executions += 1;
-            let main = Rc::clone(&f);
-            let found = execute(
-                &mut threads,
-                Box::new(move || {
-                    main();
-                    rt::thread_end();
-                }),
-                self.stack_size,
-            );
+            let found = execute(&mut threads, coro::Job::Main(Rc::clone(&main)), self.stack_size);
             if let Some(found) = found {
                 let report = rt::explorer(|rt| report(installed(rt), &found, executions, mode, run_seed));
                 panic!("{report}");
@@ -131,6 +127,7 @@ impl Builder {
                 let rt = installed(rt);
                 if matches!(rt.path.mode, Mode::Explore) && rt.path.pos() < rt.path.len() {
                     let (pos, len) = (rt.path.pos(), rt.path.len());
+                    // alloc: a finding's or an error's text, made once, when the model stops
                     return Err(format!(
                         "the model is not deterministic: execution {executions} ended after \
                          {pos} branches where the one before it had {len} (does it read a \
@@ -190,7 +187,7 @@ impl Drop for Uninstall {
 fn execute(threads: &mut Vec<Coroutine>, main: coro::Job, stack: usize) -> Option<String> {
     rt::explorer(|rt| installed(rt).begin());
     if threads.is_empty() {
-        threads.push(Coroutine::new(stack));
+        threads.push(Coroutine::new(stack, 0));
     }
     threads[0].start(main);
     loop {
@@ -201,7 +198,8 @@ fn execute(threads: &mut Vec<Coroutine>, main: coro::Job, stack: usize) -> Optio
             }
             for (thread, job) in rt.spawned.drain(..) {
                 while threads.len() <= thread {
-                    threads.push(Coroutine::new(stack));
+                    let index = threads.len();
+                    threads.push(Coroutine::new(stack, index));
                 }
                 threads[thread].start(job);
             }
@@ -212,10 +210,13 @@ fn execute(threads: &mut Vec<Coroutine>, main: coro::Job, stack: usize) -> Optio
             Ok(None) => return None,
             Err(found) => return Some(found),
         };
+        // The coroutine that comes back may be another than `active`: model threads switch
+        // to each other (`rt::go_on`).
         match threads[active].resume() {
-            Ran::Suspended | Ran::Finished(Ok(())) => {}
-            Ran::Finished(Err(panic)) => {
-                let thread = rt::explorer(|rt| installed(rt).describe(active));
+            (_, Ran::Suspended | Ran::Finished(Ok(()))) => {}
+            (last, Ran::Finished(Err(panic))) => {
+                let thread = rt::explorer(|rt| installed(rt).describe(last));
+                // alloc: a finding's or an error's text, made once, when the model stops
                 return Some(format!("{thread} panicked: {}", message(&*panic)));
             }
         }
@@ -232,11 +233,13 @@ fn message(panic: &(dyn Any + Send)) -> &str {
 
 fn report(rt: &Runtime, found: &str, execution: u64, mode: &str, seed: u64) -> String {
     let schedule = rt.path.trail();
+    // alloc: a finding's or an error's text, made once, when the model stops
     let mut out = format!("blaze-check found: {found}\n  in execution {execution} ({mode} search)");
     for thread in 0..rt.threads.len() {
         out.push_str("\n  ");
         out.push_str(&rt.describe(thread));
     }
+    // alloc: a finding's or an error's text, made once, when the model stops
     out.push_str(&format!(
         "\n  seed {seed}, schedule {schedule}\n  replay it with CHECK_REPLAY={schedule} \
          (a digit per thread switch, a letter per store a load reads, +/- per timed wait)"

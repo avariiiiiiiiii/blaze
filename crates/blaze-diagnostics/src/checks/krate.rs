@@ -433,53 +433,56 @@ impl Places {
 
 #[cfg(test)]
 mod tests {
-    use syntax::{AstNode as _, AstToken as _, Edition, SourceFile, SyntaxToken, ast as handle};
+    use syntax::{Edition, NodeOrToken, SourceFile};
 
     use super::*;
 
-    /// The rule on handles: a comment is trivia unless it is a doc comment.
-    fn is_rustc_trivia_handle(token: &SyntaxToken) -> bool {
-        match token.kind() {
-            SyntaxKind::WHITESPACE | SyntaxKind::SHEBANG | SyntaxKind::FRONTMATTER => true,
-            kind if handle::AnyComment::can_cast(kind) => {
-                handle::AnyComment::cast(token.clone()).is_some_and(|it| it.doc_kind().is_none())
-            }
-            _ => false,
-        }
-    }
-
-    /// Walking back from the last token, the view gives the handles' tokens and
-    /// [`is_rustc_trivia`] the handle rule at each, doc comments of every kind included.
+    /// Walking back from the last token comes to every token of the file, last first; a comment
+    /// is trivia unless it is a doc comment, of any kind, and the shebang and whitespace are.
     #[test]
-    fn trivia_on_views_is_the_handle_rule() {
+    fn trivia_is_what_rustcs_lexer_skips() {
+        let comment = |kind: SyntaxKind| {
+            matches!(
+                kind,
+                SyntaxKind::COMMENT | SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::SHEBANG
+            )
+        };
         let mut docs = 0;
-        for text in [
-            "#!/usr/bin/env rust\n// c\nfn main() {}\n/* b */\n",
-            "//! inner\n/// outer\nfn f() {}\n/** block outer */\nstruct S;\n// trailing\n",
-            "/*! inner block */\nfn g() {}\n/// last\n",
-            "// only a comment\n",
+        for (text, expected) in [
+            (
+                "#!/usr/bin/env rust\n// c\nfn main() {}\n/* b */\n",
+                &[("/* b */", true), ("// c", true), ("#!/usr/bin/env rust", true)][..],
+            ),
+            (
+                "//! inner\n/// outer\nfn f() {}\n/** block outer */\nstruct S;\n// trailing\n",
+                &[("// trailing", true), ("/** block outer */", false), ("/// outer", false), ("//! inner", false)],
+            ),
+            ("/*! inner block */\nfn g() {}\n/// last\n", &[("/// last", false), ("/*! inner block */", false)]),
+            ("// only a comment\n", &[("// only a comment", true)]),
         ] {
             let parse = SourceFile::parse(text, Edition::CURRENT);
-            let handles = parse.tree();
-            let mut handle = handles.syntax().last_token();
-            let mut view = parse.root().last_token();
-            loop {
-                match (handle, view) {
-                    (Some(h), Some(v)) => {
-                        assert_eq!((h.kind(), h.text_range()), (v.kind(), v.text_range()));
-                        assert_eq!(is_rustc_trivia_handle(&h), is_rustc_trivia(v), "{:?} in {text:?}", v.kind());
-                        if matches!(v.kind(), SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT) {
-                            docs += 1;
-                        }
-                        handle = h.prev_token();
-                        view = v.prev_token();
-                    }
-                    (h, v) => {
-                        assert!(h.is_none() && v.is_none(), "the walks end together in {text:?}");
-                        break;
-                    }
+            let mut forward: Vec<_> =
+                parse.root().descendants_with_tokens().filter_map(NodeOrToken::into_token).collect();
+            forward.reverse();
+            let mut back = Vec::new();
+            let mut at = parse.root().last_token();
+            while let Some(token) = at {
+                back.push(token);
+                at = token.prev_token();
+            }
+            assert_eq!(back, forward, "the walk back comes to every token in {text:?}");
+            let mut comments = Vec::new();
+            for token in back {
+                match token.kind() {
+                    kind if comment(kind) => comments.push((token.text(), is_rustc_trivia(token))),
+                    SyntaxKind::WHITESPACE => assert!(is_rustc_trivia(token)),
+                    kind => assert!(!is_rustc_trivia(token), "{kind:?} in {text:?}"),
+                }
+                if matches!(token.kind(), SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT) {
+                    docs += 1;
                 }
             }
+            assert_eq!(comments, expected, "in {text:?}");
         }
         assert_eq!(docs, 5, "each doc comment is a token of its own kind");
     }

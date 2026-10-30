@@ -38,6 +38,18 @@ fn a_table_that_is_not_one_is_refused() {
 }
 
 #[test]
+fn an_emptied_slot_is_counted_and_a_hit_on_it_refused() {
+    let fns = vec![version(0, 0), version(1, 0), version(2, 0)];
+    let image = Image::new(fns.clone(), vec![0, NONE, 1], ContentId::default()).unwrap();
+    assert_eq!(image.slots(), 3);
+    assert_eq!(image.executed(3, &[1]).err(), Some(TableError::EmptySlot { slot: 1 }));
+    assert_eq!(image.executed(3, &[2, 0]).unwrap().fns, image.executed(3, &[0, 2]).unwrap().fns);
+    assert_eq!(image.executed(3, &[0, 2]).unwrap().fns.len(), 2);
+    let whole = Image::new(fns.clone(), vec![0, 2, 1], ContentId::default()).unwrap();
+    assert_ne!(image.unlogged(), whole.unlogged(), "function 2 is in no slot once its slot is emptied");
+}
+
+#[test]
 fn the_unlogged_hash_is_of_what_has_no_slot_in_any_order() {
     let beside = ContentId::of("blaze v2 testsel test image 1", b"deps");
     let a = Image::new(vec![version(0, 0), version(1, 0), version(2, 0)], vec![0], beside).unwrap();

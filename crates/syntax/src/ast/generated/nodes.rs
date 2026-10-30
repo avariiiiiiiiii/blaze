@@ -2070,6 +2070,17 @@ impl UnsafeBinderCastExpr {
         support::token(&self.syntax, T![wrap_binder])
     }
 }
+pub struct UnsafeBinderType {
+    pub(crate) syntax: SyntaxNode,
+}
+impl UnsafeBinderType {
+    #[inline]
+    pub fn generic_param_list(&self) -> Option<GenericParamList> { support::child(&self.syntax) }
+    #[inline]
+    pub fn ty(&self) -> Option<Type> { support::child(&self.syntax) }
+    #[inline]
+    pub fn unsafe_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![unsafe]) }
+}
 pub struct UnsafeMeta {
     pub(crate) syntax: SyntaxNode,
 }
@@ -2445,6 +2456,7 @@ pub enum Type {
     RefType(RefType),
     SliceType(SliceType),
     TupleType(TupleType),
+    UnsafeBinderType(UnsafeBinderType),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -7631,6 +7643,38 @@ impl fmt::Debug for UnsafeBinderCastExpr {
         f.debug_struct("UnsafeBinderCastExpr").field("syntax", &self.syntax).finish()
     }
 }
+impl AstNode for UnsafeBinderType {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        UNSAFE_BINDER_TYPE
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == UNSAFE_BINDER_TYPE }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for UnsafeBinderType {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for UnsafeBinderType {}
+impl PartialEq for UnsafeBinderType {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for UnsafeBinderType {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for UnsafeBinderType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnsafeBinderType").field("syntax", &self.syntax).finish()
+    }
+}
 impl AstNode for UnsafeMeta {
     #[inline]
     fn kind() -> SyntaxKind
@@ -9188,6 +9232,10 @@ impl From<TupleType> for Type {
     #[inline]
     fn from(node: TupleType) -> Type { Type::TupleType(node) }
 }
+impl From<UnsafeBinderType> for Type {
+    #[inline]
+    fn from(node: UnsafeBinderType) -> Type { Type::UnsafeBinderType(node) }
+}
 impl AstNode for Type {
     #[inline]
     fn can_cast(kind: SyntaxKind) -> bool {
@@ -9208,6 +9256,7 @@ impl AstNode for Type {
                 | REF_TYPE
                 | SLICE_TYPE
                 | TUPLE_TYPE
+                | UNSAFE_BINDER_TYPE
         )
     }
     #[inline]
@@ -9228,6 +9277,7 @@ impl AstNode for Type {
             REF_TYPE => Type::RefType(RefType { syntax }),
             SLICE_TYPE => Type::SliceType(SliceType { syntax }),
             TUPLE_TYPE => Type::TupleType(TupleType { syntax }),
+            UNSAFE_BINDER_TYPE => Type::UnsafeBinderType(UnsafeBinderType { syntax }),
             _ => return None,
         };
         Some(res)
@@ -9250,6 +9300,7 @@ impl AstNode for Type {
             Type::RefType(it) => &it.syntax,
             Type::SliceType(it) => &it.syntax,
             Type::TupleType(it) => &it.syntax,
+            Type::UnsafeBinderType(it) => &it.syntax,
         }
     }
 }
@@ -11116,6 +11167,11 @@ impl std::fmt::Display for Union {
     }
 }
 impl std::fmt::Display for UnsafeBinderCastExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for UnsafeBinderType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self.syntax(), f)
     }

@@ -160,6 +160,7 @@ fn is_call(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
 /// `&FormatElement::Line(LineMode::Hard)` is promoted, though another variant holds a `Cow` or
 /// a `Box`, and `&[]` of any element type, `[Cell<u8>]` too.
 fn plain_value<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, expr: hir_def::hir::ExprId) -> bool {
+    let consts = std::cell::RefCell::new(mem::map(ctx.frame));
     let cx = super::qualifs::ValueCx {
         db: ctx.db,
         infcx: &ctx.infcx,
@@ -167,7 +168,7 @@ fn plain_value<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, expr: hir_def::hir:
         owner: body.owner,
         store: ctx.store,
         infer: ctx.infer,
-        consts: &std::cell::RefCell::new(mem::map(ctx.frame)),
+        consts: &consts,
     };
     cx.value(expr, 0).is_empty()
 }

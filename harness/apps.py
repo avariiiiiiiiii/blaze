@@ -28,8 +28,8 @@ import argparse, importlib, json, os, re, shlex, shutil, socket, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import difftest, linkline, memory
-from difftest import Fixture, BLAZE, bucket, host, sysroot_rlibs
+import mixed, linkline, memory
+from mixed import Fixture, BLAZE, bucket, host, sysroot_rlibs
 
 APPS_DIR = os.environ.get("APPS_DIR") or os.path.join(HERE, "vendor", "apps")
 SPECS = os.path.join(HERE, "apps", "apps.json")
@@ -341,7 +341,7 @@ def workload(fx, spec, debug, result):
             differing.append(name_of(run))
             tail = got[2].decode(errors="replace").strip().splitlines()[-2:]
             print(f"  DIFFERS `{name_of(run)}`: rustc status {want[0]}, blaze status {got[0]}: "
-                  f"{difftest.symptom(want, got)} {' | '.join(tail)[:300]}")
+                  f"{mixed.symptom(want, got)} {' | '.join(tail)[:300]}")
     result["workload"] = {"runs": len(spec["runs"]), "differing": differing}
     print(f"workload: {len(spec['runs']) - len(differing)} of {len(spec['runs'])} command lines the same")
 

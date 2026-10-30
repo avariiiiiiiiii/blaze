@@ -75,3 +75,37 @@ fn a_dependency_s_static_and_a_reference_to_a_workspace_static_are_checked() {
     let named: Vec<_> = errors.iter().map(|it| (it.unit, it.item)).collect();
     assert_eq!(named, [(key(2), item(2)), (key(9), item(9))]);
 }
+
+/// Checked on every core, the refusals are the ones a check in key order makes, in that order.
+#[test]
+fn refusals_across_cores_come_in_key_order() {
+    let numbered = |n: u32, tag: u8| {
+        let mut bytes = [tag; 32];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        ContentId(bytes)
+    };
+    let workspace = InstanceKey(numbered(u32::MAX, 0));
+    let calls_workspace = [Target::Direct(workspace)];
+    let none: [Target; 0] = [];
+    let functions: Vec<Function<'_>> = (0..3000u32)
+        .map(|n| Function {
+            key: InstanceKey(numbered(n, 0)),
+            item: ItemKey(numbered(n, 1)),
+            owner: Owner::Dependency,
+            code: CodeHash(numbered(n, 2)),
+            refs: if n % 3 == 1 { &calls_workspace } else { &none },
+        })
+        .chain(std::iter::once(Function {
+            key: workspace,
+            item: ItemKey(numbered(u32::MAX, 1)),
+            owner: Owner::Workspace,
+            code: CodeHash(numbered(u32::MAX, 2)),
+            refs: &none,
+        }))
+        .collect();
+    let mut errors = Vec::new();
+    owners(functions.iter().copied(), std::iter::empty(), &mut errors);
+    let named: Vec<_> = errors.iter().map(|it| it.unit).collect();
+    let expected: Vec<_> = (0..3000u32).filter(|n| n % 3 == 1).map(|n| InstanceKey(numbered(n, 0))).collect();
+    assert_eq!(named, expected);
+}

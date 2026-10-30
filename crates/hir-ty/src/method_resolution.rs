@@ -7,6 +7,7 @@
 //! [`rustc_hir_typeck/method/probe.rs`]: https://github.com/rust-lang/rust/blob/5503df87342a73d0c29126a7e08dc9c1255c46ad/compiler/rustc_hir_typeck/src/method/probe.rs
 
 mod confirm;
+pub mod delta;
 pub mod frozen;
 mod pick_cache;
 mod probe;
@@ -169,7 +170,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         &mut self,
         self_ty: Ty<'db>,
         name: Name,
-        generic_args: Option<&HirGenericArgs>,
+        generic_args: Option<HirGenericArgs<'_>>,
         receiver: ExprId,
         call_expr: ExprId,
     ) -> Result<(MethodCallee<'db>, bool), MethodError<'db>> {
@@ -196,7 +197,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         probe_for: ProbeFor,
         self_ty: Ty<'db>,
         name: Name,
-        generic_args: Option<&HirGenericArgs>,
+        generic_args: Option<HirGenericArgs<'_>>,
         receiver: ExprId,
         call_expr: ExprId,
     ) -> Result<(MethodCallee<'db>, bool), MethodError<'db>> {
@@ -594,13 +595,13 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
 /// The function or constant of `impl_` named `name`, the first if there are more: all that a
 /// lookup of `name` reads of the impl, so an item of another name added to it leaves the
 /// lookup as it was.
-#[salsa::tracked(mem_tag = Infer)]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub fn impl_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<CandidateId> {
     value_item_named(&impl_.impl_items(db).items, &name)
 }
 
 /// As [`impl_value_item`], of a trait.
-#[salsa::tracked(mem_tag = Infer)]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub fn trait_value_item(
     db: &Db,
     trait_: TraitId,
@@ -609,9 +610,9 @@ pub fn trait_value_item(
     value_item_named(&trait_.trait_items(db).items, &name)
 }
 
-/// For every trait declared in a module of `krate` (not in a block), what [`trait_value_item`]
-/// answers for each name its items have, sorted by name and then trait. Built once per crate,
-/// so a probe asks one query per crate of its traits in scope instead of one per trait.
+/// For every trait declared in a module of a frozen `krate` (not in a block), what
+/// [`trait_value_item`] answers for each name its items have, sorted by name and then trait.
+/// A maintained crate's are its candidate slices ([`delta::candidate_traits`]).
 #[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)]> {
     blaze_mem::frame::current(|frame| {
@@ -639,14 +640,24 @@ fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)
     })
 }
 
-/// The run of [`trait_value_items`] named `name`, sorted by trait: an item of another name
-/// added to a trait of `krate` leaves it as it was.
+/// What [`trait_value_item`] answers for `name` for each trait declared in a module of `krate`
+/// (not in a block), sorted by trait: the traits of the name's candidate slice, so an item of
+/// another name added to a trait of `krate` leaves it as it was. A frozen crate's are the run
+/// of [`trait_value_items`] named `name`.
 #[salsa::tracked(returns(deref), mem_tag = Infer)]
 pub(crate) fn in_crate_trait_value_items(
     db: &Db,
     krate: Crate,
     name: Name,
 ) -> Box<[(TraitId, CandidateId)]> {
+    if !frozen::served(db, krate) {
+        let traits = delta::candidate_traits(db, krate, name);
+        return traits
+            .iter()
+            .filter_map(|&trait_| Some((trait_, trait_value_item(db, trait_, name)?)))
+            // alloc: the memo's result, grown to at most the slice's length (none when empty)
+            .collect();
+    }
     let items = trait_value_items(db, krate);
     let start = items.partition_point(|&(it, _, _)| it < name);
     let end = items.partition_point(|&(it, _, _)| it <= name);
@@ -1536,12 +1547,7 @@ impl<'db> InherentImpls<'db> {
             if let Some(frozen) = frozen::inherent_impls(db, frame, krate) {
                 return frozen;
             }
-
-            let mut builder = InherentImplsBuilder::new(frame);
-            for (module, _) in crate_def_map(db, krate).modules(db) {
-                Self::for_module(db, module).merge_into(&mut builder);
-            }
-            builder.finish()
+            delta::read::inherent_impls_of_crate(db, frame, krate)
         })
     }
 
@@ -1558,49 +1564,10 @@ impl<'db> InherentImpls<'db> {
         })
     }
 
-    /// The modules of `krate` with an inherent impl for each simplified self type, in module
-    /// order. Equal unless a module gains its first impl for a type or loses its last.
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
-    fn modules_by_self_ty(db: &'db Db, krate: Crate) -> SelfTyModules<'db> {
-        blaze_mem::frame::current(|frame| {
-            let mut builder = SelfTyRunsBuilder::new(frame);
-            for (module, _) in crate_def_map(db, krate).modules(db) {
-                for (self_ty, _) in Self::for_module(db, module).iter() {
-                    let group = builder.group(*self_ty);
-                    builder.push(group, module);
-                }
-            }
-            let (self_tys, modules) = builder.columns();
-            SelfTyModules { self_tys, modules }
-        })
-    }
-
-    /// The modules of `krate` with an inherent impl for one type: equal unless that list
-    /// changes, whatever other types gain.
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
-    fn modules_of_self_ty(
-        db: &'db Db,
-        krate: Crate,
-        self_ty: SelfTyKey<'db>,
-    ) -> Box<[ModuleId]> {
-        Self::modules_by_self_ty(db, krate).of(&self_ty.0).into()
-    }
-
-    /// The inherent impls of `module` for one type: equal unless one for that type is added
-    /// there or removed.
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
-    fn in_module_for_self_ty(
-        db: &'db Db,
-        module: ModuleId,
-        self_ty: SelfTyKey<'db>,
-    ) -> Box<[ImplId]> {
-        Self::for_module(db, module).for_self_ty(&self_ty.0).into()
-    }
-
     /// The inherent impls of `krate` for one type, in the order [`Self::for_crate`] holds
-    /// them. Reads only the modules with impls for the type, so an impl added for another type,
-    /// or anything else added anywhere, leaves this as it was. A frozen crate's are read from
-    /// its frozen table.
+    /// them: the type's inherent slice and the bodies of the modules whose bodies hold impls
+    /// for it, so an impl added for another type, or anything else added anywhere, leaves this
+    /// as it was. A frozen crate's are read from its frozen table.
     #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_for_self_ty(
         db: &'db Db,
@@ -1610,18 +1577,7 @@ impl<'db> InherentImpls<'db> {
         if frozen::served(db, krate) {
             return Self::for_crate(db, krate).for_self_ty(&self_ty.0).into();
         }
-        let modules = Self::modules_of_self_ty(db, krate, self_ty);
-        if let &[module] = modules {
-            return Self::in_module_for_self_ty(db, module, self_ty).into();
-        }
-        blaze_mem::frame::current(|frame| {
-            let mut found = Vec::new_in(frame);
-            for &module in modules {
-                found.extend_from_slice(Self::in_module_for_self_ty(db, module, self_ty));
-            }
-            // alloc: the memo's value, once at its length.
-            found.iter().copied().collect()
-        })
+        delta::read::inherent_impls_for(db, krate, self_ty)
     }
 
     #[salsa::tracked(returns(ref), mem_tag = Infer)]
@@ -1665,6 +1621,12 @@ impl<'db> InherentImpls<'db> {
     /// Adds the inherent impls of `module` and of the blocks in the bodies it holds to
     /// `builder`.
     fn collect_module(db: &'db Db, module: ModuleId, builder: &mut InherentImplsBuilder<'db, '_>) {
+        Self::collect_own(db, module, builder);
+        Self::collect_bodies(db, module, builder);
+    }
+
+    /// Adds the inherent impls of `module`'s own scope ([`module_impls`]) to `builder`.
+    fn collect_own(db: &'db Db, module: ModuleId, builder: &mut InherentImplsBuilder<'db, '_>) {
         let interner = DbInterner::new_no_crate(db);
         for &impl_id in module_impls(db, module).inherent_impls.iter() {
             let self_ty = db.impl_self_ty(impl_id);
@@ -1676,7 +1638,10 @@ impl<'db> InherentImpls<'db> {
                 builder.push(group, impl_id);
             }
         }
+    }
 
+    /// Adds the inherent impls of the blocks in the bodies `module` holds to `builder`.
+    fn collect_bodies(db: &'db Db, module: ModuleId, builder: &mut InherentImplsBuilder<'db, '_>) {
         let scope = module.def_map(db).module(db, module).scope(db);
         for owner in impl_holders(db, builder.frame, module.krate(db), scope) {
             for (_, block_def_map) in Body::of(db, owner).blocks(db) {
@@ -1718,63 +1683,6 @@ impl<'db> InherentImpls<'db> {
         let blocks = std::iter::successors(block, |block| block.module(db).block(db));
         blocks.filter_map(|block| Self::for_block(db, block).as_deref()).for_each(&mut *for_each);
         for_each(Self::for_crate(db, krate));
-    }
-}
-
-/// Modules by simplified self type, as columns: the self types sorted by hash, each with its
-/// run of modules in module order.
-#[derive(Debug, PartialEq, Eq, SalsaValue)]
-struct SelfTyModules<'db> {
-    // SAFETY: as for `InherentImpls::self_tys`: salsa may keep this column past `'db` only if
-    // nothing in it borrows from the database. `SelfTys<'db>` holds `u64`s and
-    // `SimplifiedType<'db>`s, which are `fast_reject::SimplifiedType<SolverDefId<'db>>`
-    // (`next_solver/ty.rs`), whose variants (`vendor/rustc_type_ir/src/fast_reject.rs`) hold
-    // only plain data and `SolverDefId<'db>`, which is `SalsaValue`; no `&'db`.
-    #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))]
-    self_tys: SelfTys<'db>,
-    modules: Runs<ModuleId>,
-}
-
-impl<'db> SelfTyModules<'db> {
-    fn of(&self, self_ty: &SimplifiedType<'db>) -> &[ModuleId] {
-        match self.self_tys.find(0..self.self_tys.len(), self_ty) {
-            Some(i) => self.modules.run(i),
-            None => &[],
-        }
-    }
-}
-
-/// Modules by trait, as columns: the traits sorted as [`TraitImpls`] sorts them, each with its
-/// run of modules in module order.
-#[derive(Debug, PartialEq, Eq)]
-struct TraitModules {
-    traits: Box<[TraitId]>,
-    modules: Runs<ModuleId>,
-}
-
-impl TraitModules {
-    /// The modules of each trait, from `found`: each `(trait, module)` in module order.
-    fn from_found(frame: &Frame, found: impl IntoIterator<Item = (TraitId, ModuleId)>) -> Self {
-        let mut traits = crate::frame_map(frame);
-        let mut trait_ids = Vec::new_in(frame);
-        let mut modules = Vec::new_in(frame);
-        for (trait_, module) in found {
-            modules.push((trait_number(&mut traits, &mut trait_ids, trait_), module));
-        }
-        let order = order_by_trait_id(frame, &trait_ids);
-        let rank = ranks(frame, order);
-        TraitModules {
-            // alloc: the memo's column, once at its length.
-            traits: order.iter().map(|&t| trait_ids[t as usize]).collect(),
-            modules: Runs::from_groups(frame, rank, &modules),
-        }
-    }
-
-    fn of(&self, trait_: TraitId) -> &[ModuleId] {
-        match self.traits.binary_search(&trait_) {
-            Ok(t) => self.modules.run(t),
-            Err(_) => &[],
-        }
     }
 }
 
@@ -1928,13 +1836,8 @@ impl<'db> TraitImpls<'db> {
                 // alloc: the memo's handle, shared by `for_crate_and_deps`.
                 return Arc::new(frozen);
             }
-
-            let mut builder = TraitImplsBuilder::new(frame);
-            for (module, _) in crate_def_map(db, krate).modules(db) {
-                Self::for_module(db, module).merge_into(&mut builder);
-            }
             // alloc: the memo's handle, shared by `for_crate_and_deps`.
-            Arc::new(builder.finish())
+            Arc::new(delta::read::trait_impls_of_crate(db, frame, krate))
         })
     }
 
@@ -1952,44 +1855,11 @@ impl<'db> TraitImpls<'db> {
         })
     }
 
-    /// The modules of `krate` with an impl of each trait, in module order. Equal unless a
-    /// module gains its first impl of a trait or loses its last.
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
-    fn modules_by_trait(db: &'db Db, krate: Crate) -> TraitModules {
-        blaze_mem::frame::current(|frame| {
-            let found = crate_def_map(db, krate).modules(db).flat_map(|(module, _)| {
-                Self::for_module(db, module).traits.iter().map(move |&trait_| (trait_, module))
-            });
-            TraitModules::from_found(frame, found)
-        })
-    }
-
-    /// The modules of `krate` with an impl of `trait_`: equal unless that list changes,
-    /// whatever other traits gain.
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
-    fn modules_of_trait(db: &'db Db, krate: Crate, trait_: TraitId) -> Box<[ModuleId]> {
-        Self::modules_by_trait(db, krate).of(trait_).into()
-    }
-
-    /// The impls of `trait_` in `module`, as a table of that trait alone: equal unless one of
-    /// them is added, removed or changes its self type.
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
-    fn in_module_for_trait(
-        db: &'db Db,
-        module: ModuleId,
-        trait_: TraitId,
-    ) -> TraitImpls<'db> {
-        blaze_mem::frame::current(|frame| {
-            let mut builder = TraitImplsBuilder::new(frame);
-            Self::for_module(db, module).merge_trait_into(trait_, &mut builder);
-            builder.finish()
-        })
-    }
-
     /// The impls of `trait_` in `krate`, as a table of that trait alone, in the order
     /// [`Self::for_crate`] holds them: the bucket every narrow memo of one crate reads. Reads
-    /// only the modules with impls of `trait_`, so an impl of another trait, or anything else
-    /// added anywhere, leaves this as it was. A frozen crate's is read from its frozen table.
+    /// the trait's slice and the bodies of the modules whose bodies hold impls of it, so an
+    /// impl of another trait, or anything else added anywhere, leaves this as it was. A frozen
+    /// crate's is read from its frozen table.
     #[salsa::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_crate_and_trait(
         db: &'db Db,
@@ -2001,10 +1871,7 @@ impl<'db> TraitImpls<'db> {
             if frozen::served(db, krate) {
                 Self::for_crate(db, krate).merge_trait_into(trait_, &mut builder);
             } else {
-                for &module in Self::modules_of_trait(db, krate, trait_) {
-                    Self::in_module_for_trait(db, module, trait_)
-                        .merge_trait_into(trait_, &mut builder);
-                }
+                delta::read::trait_impls_into(db, krate, trait_, &mut builder);
             }
             builder.finish()
         })
@@ -2161,6 +2028,18 @@ impl<'db> TraitImpls<'db> {
         lang_items: &LangItems,
         builder: &mut TraitImplsBuilder<'db, '_>,
     ) {
+        Self::collect_own(db, module, lang_items, builder);
+        Self::collect_bodies(db, module, lang_items, builder);
+    }
+
+    /// Adds the trait impls and built-in derive impls of `module`'s own scope
+    /// ([`module_impls`]) to `builder`.
+    fn collect_own(
+        db: &'db Db,
+        module: ModuleId,
+        lang_items: &LangItems,
+        builder: &mut TraitImplsBuilder<'db, '_>,
+    ) {
         let impls = module_impls(db, module);
         for &impl_id in impls.trait_impls.iter() {
             let trait_ref = match db.impl_trait(impl_id) {
@@ -2201,7 +2080,15 @@ impl<'db> TraitImpls<'db> {
             let row = builder.row(t, SimplifiedType::Adt(loc.adt.into()));
             builder.push_derive(row, impl_id);
         }
+    }
 
+    /// Adds the trait impls of the blocks in the bodies `module` holds to `builder`.
+    fn collect_bodies(
+        db: &'db Db,
+        module: ModuleId,
+        lang_items: &LangItems,
+        builder: &mut TraitImplsBuilder<'db, '_>,
+    ) {
         let scope = module.def_map(db).module(db, module).scope(db);
         for owner in impl_holders(db, builder.frame, module.krate(db), scope) {
             for (_, block_def_map) in Body::of(db, owner).blocks(db) {
@@ -2385,8 +2272,11 @@ impl<'db> TraitImpls<'db> {
 /// simplifies to `self_ty`, or to nothing (a parameter, an alias, a placeholder) when `None`.
 #[salsa::interned(debug, revisions = usize::MAX)]
 pub struct RelevantImplsKey<'db> {
+    #[returns(copy)]
     pub krate: Crate,
+    #[returns(copy)]
     pub trait_: TraitId,
+    #[returns(copy)]
     pub self_ty: Option<SelfTyKey<'db>>,
 }
 

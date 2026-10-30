@@ -322,6 +322,7 @@ fn place(class: &Class) -> (Segment, u8) {
             Some(Segment::Text) => (Segment::Text, 5),
             Some(Segment::DataConst) => (Segment::DataConst, 4),
             Some(Segment::Data) | None => (Segment::Data, 3),
+            Some(reserve @ (Segment::Arena | Segment::Cells | Segment::Fixed)) => (reserve, 0),
         },
         Class::Rodata => (Segment::Text, 6),
         Class::Synthetic(_) => (Segment::Text, 7),
@@ -1307,7 +1308,7 @@ impl MachO {
             Some((_, len)) => room(out, len),
             None => {
                 // alloc: one buffer per link, of exactly the functions
-                let starts: Vec<u64> = placed.functions.iter().map(|it| it.addr).collect();
+                let starts: Vec<u64> = placed.functions.par_iter().map(|it| it.addr).collect();
                 linkedit::function_starts(base, &starts, out)
             }
         };
@@ -1368,7 +1369,7 @@ impl MachO {
             commands.put_u32(segment.sections.len() as u32);
             commands.put_u32(segment.flags);
             for section in &segment.sections {
-                commands.name16(&section.name);
+                commands.extend_from_slice(&section.name);
                 commands.name16(section.segment);
                 commands.put_u64(section.addr);
                 commands.put_u64(section.size);
@@ -2150,7 +2151,7 @@ fn written_since(placed: &Placed<'_>, kept: &Kept, debug_at: &[(u64, usize)]) ->
         out.extend(debug_at.iter().map(|&(at, nth)| (at, placed.debug[nth].1.len() as u64)));
     }
     radix::sort_copy_by_key(&mut out, |&(at, len)| radix::pack_64(at, len));
-    let mut merged = 0;
+    let mut merged = 0usize;
     for nth in 0..out.len() {
         let (at, len) = out[nth];
         match merged.checked_sub(1).map(|it| &mut out[it]) {

@@ -9,7 +9,7 @@
 //! Apache-2.0).
 
 use either::Either;
-use hir::{InFile, LangItem, PathResolution};
+use hir::{HasVisibility as _, InFile, LangItem, PathResolution};
 use syntax::{
     TextRange,
     view::{self as ast, AstNode as _, HasGenericParams as _, HasName as _, HasTypeBounds as _, PathSegmentKind, UnaryOp},

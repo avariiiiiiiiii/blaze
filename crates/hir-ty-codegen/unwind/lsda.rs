@@ -4,6 +4,7 @@
 //! backend writes for it with its tables of any shape (`gcc_except_table`, which the tests
 //! compare with).
 
+use blaze_format::leb::write_u64 as uleb;
 use cranelift_codegen::gimli::{DW_EH_PE_omit, DW_EH_PE_udata4, DW_EH_PE_uleb128};
 
 /// A row of the call-site table: the call that returns to `start + 1`, where it lands when it
@@ -66,19 +67,7 @@ fn row_size(row: CallEntry) -> u64 {
 }
 
 fn uleb_size(value: u64) -> u64 {
-    u64::from((64 - (value | 1).leading_zeros()).div_ceil(7))
-}
-
-fn uleb(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
+    blaze_format::leb::len_u64(value) as u64
 }
 
 #[cfg(test)]
@@ -119,13 +108,8 @@ mod tests {
 
     /// A seeded stream of rows, with offsets across every length of LEB128 a `u32` has.
     fn rows(seed: u64, count: usize) -> Vec<CallEntry> {
-        let mut state = seed | 1;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(seed);
+        let mut next = move || rng.next_u64();
         let mut start = 0u32;
         (0..count)
             .map(|_| {

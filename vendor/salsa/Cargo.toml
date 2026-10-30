@@ -265,6 +265,10 @@ name = "debug_db_contents"
 path = "tests/debug_db_contents.rs"
 
 [[test]]
+name = "deep_verify_colors"
+path = "tests/deep_verify_colors.rs"
+
+[[test]]
 name = "deletion"
 path = "tests/deletion.rs"
 
@@ -285,6 +289,10 @@ name = "durability"
 path = "tests/durability.rs"
 
 [[test]]
+name = "edges_at_rest"
+path = "tests/edges_at_rest.rs"
+
+[[test]]
 name = "elided-lifetime-in-tracked-fn"
 path = "tests/elided-lifetime-in-tracked-fn.rs"
 
@@ -299,6 +307,10 @@ path = "tests/expect_reuse_field_x_of_a_tracked_struct_changes_but_fn_depends_on
 [[test]]
 name = "expect_reuse_field_x_of_an_input_changes_but_fn_depends_on_field_y"
 path = "tests/expect_reuse_field_x_of_an_input_changes_but_fn_depends_on_field_y.rs"
+
+[[test]]
+name = "graph_filters"
+path = "tests/graph_filters.rs"
 
 [[test]]
 name = "hash_collision"
@@ -359,6 +371,10 @@ path = "tests/lru_cycle.rs"
 [[test]]
 name = "lru_fingerprint"
 path = "tests/lru_fingerprint.rs"
+
+[[test]]
+name = "lru_parallel"
+path = "tests/lru_parallel.rs"
 
 [[test]]
 name = "manual_registration"
@@ -451,6 +467,10 @@ path = "tests/task_sync.rs"
 [[test]]
 name = "unclaimed_verify"
 path = "tests/unclaimed_verify.rs"
+
+[[test]]
+name = "walk_order"
+path = "tests/walk_order.rs"
 
 [[test]]
 name = "tracked-struct-entries"
@@ -619,6 +639,11 @@ harness = false
 required-features = ["accumulator"]
 
 [[bench]]
+name = "claim"
+path = "benches/claim.rs"
+harness = false
+
+[[bench]]
 name = "creation"
 path = "benches/creation.rs"
 harness = false
@@ -626,6 +651,16 @@ harness = false
 [[bench]]
 name = "dataflow"
 path = "benches/dataflow.rs"
+harness = false
+
+[[bench]]
+name = "deep_verify"
+path = "benches/deep_verify.rs"
+harness = false
+
+[[bench]]
+name = "edges_at_rest"
+path = "benches/edges_at_rest.rs"
 harness = false
 
 [[bench]]
@@ -645,8 +680,48 @@ path = "benches/field_access.rs"
 harness = false
 
 [[bench]]
+name = "graph_bloom"
+path = "benches/graph_bloom.rs"
+harness = false
+
+[[bench]]
+name = "graph_frozen"
+path = "benches/graph_frozen.rs"
+harness = false
+
+[[bench]]
+name = "graph_varint"
+path = "benches/graph_varint.rs"
+harness = false
+
+[[bench]]
+name = "graph_walk"
+path = "benches/graph_walk.rs"
+harness = false
+
+[[bench]]
+name = "lru_scan"
+path = "benches/lru_scan.rs"
+harness = false
+
+[[bench]]
+name = "memo_hit"
+path = "benches/memo_hit.rs"
+harness = false
+
+[[bench]]
 name = "query_fetch"
 path = "benches/query_fetch.rs"
+harness = false
+
+[[bench]]
+name = "record_read"
+path = "benches/record_read.rs"
+harness = false
+
+[[bench]]
+name = "verify_order"
+path = "benches/verify_order.rs"
 harness = false
 
 [dependencies.blaze-format]

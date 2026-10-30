@@ -79,9 +79,9 @@ pub(super) fn type_alias<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, krate: &Krate)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bounds_lint(
-    cx: &Cx<'_, '_>,
-    item: &Item<'_>,
+fn bounds_lint<'db>(
+    cx: &Cx<'_, 'db>,
+    item: &Item<'db>,
     in_where_clause: bool,
     spans: Vec<Span>,
     removed: Vec<(Span, String)>,
@@ -172,7 +172,7 @@ fn shorthand_qselves<'db>(cx: &Cx<'_, 'db>, ty: ast::Node<'db>) -> impl Iterator
 /// `drop_bounds` of an item's bounds, then `dyn_drop` of its `dyn Drop` types.
 pub(super) fn drop<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, krate: &Krate) -> Vec<Found> {
     let Some(drop) = krate.drop else { return Vec::new() }; // alloc: empty, allocates nothing
-    let is_drop = |path: Option<ast::Path<'_>>| {
+    let is_drop = |path: Option<ast::Path<'db>>| {
         path.and_then(|it| cx.vsema.resolve_path(it)).is_some_and(|it| {
             matches!(it, PathResolution::Def(ModuleDef::Trait(t)) if hir_def::TraitId::from(t) == drop)
         })

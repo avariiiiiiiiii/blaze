@@ -708,6 +708,127 @@ fn pinned_list(reader: &Reader, root: ContentId, path: &str) -> Option<Vec<(Stri
     Some(reader.pin().list(root, path)?.map(|(name, dir)| (name.to_owned(), dir)).collect())
 }
 
+/// A tree of about `n` files, 1 to 4 directories deep, by `seed`, of names that sort around `/`
+/// (`a`, `a-b`, `a.rs`, `a0`): its VFS, its root, every directory (`""` first) and every file.
+fn listing_fixture(seed: u64, n: usize) -> (Vfs, ContentId, Vec<String>, Vec<String>) {
+    const PARTS: &[&str] = &["a", "a-b", "a.rs", "a0", "b", "src", "lib.rs", "z"];
+    let mut rng = Rng::new(seed);
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
+    for _ in 0..10 * n {
+        if files.len() == n {
+            break;
+        }
+        let depth = 1 + rng.below(4);
+        let parts: Vec<&str> = (0..depth).map(|_| PARTS[rng.below(PARTS.len() as u64) as usize]).collect();
+        let path = parts.join("/");
+        let clash = files
+            .keys()
+            .any(|it| it.starts_with(&format!("{path}/")) || path.starts_with(&format!("{it}/")));
+        if !clash {
+            files.insert(path.clone(), path);
+        }
+    }
+    let mut vfs = new_vfs();
+    let ops: Vec<Op> = files.iter().map(|(path, bytes)| write(path, bytes)).collect();
+    let empty = vfs.empty();
+    let root = vfs.commit("w", empty, &ops).unwrap().root;
+    let mut dirs: Vec<String> = vec![String::new()];
+    for path in files.keys() {
+        let mut at = 0;
+        while let Some(slash) = path[at..].find('/') {
+            at += slash;
+            dirs.push(path[..at].to_owned());
+            at += 1;
+        }
+    }
+    dirs[1..].sort_unstable();
+    dirs.dedup();
+    (vfs, root, dirs, files.into_keys().collect())
+}
+
+/// Every directory of a tree lists the same through a pin (names lent), through
+/// `Reader::list` (names owned) and through `Vfs::list` (the tree's own walk); a file, a path
+/// under a file and a missing path list as none through each.
+#[test]
+fn every_directory_lists_the_same_lent_owned_and_through_the_vfs() {
+    for seed in 0..8 {
+        let (mut vfs, root, dirs, files) = listing_fixture(seed, 120);
+        let view = vfs.open(View { root }).unwrap();
+        let reader = vfs.reader();
+        assert!(dirs.len() > 8, "seed {seed}: {dirs:?}");
+        for dir in &dirs {
+            let want = vfs.list(view, dir);
+            assert!(want.as_ref().is_some_and(|it| !it.is_empty()), "seed {seed}: {dir:?}");
+            assert_eq!(pinned_list(&reader, root, dir), want, "seed {seed}: {dir:?} lent");
+            assert_eq!(listed(&reader, root, dir), want, "seed {seed}: {dir:?} owned");
+        }
+        let under = files.iter().map(|it| format!("{it}/x"));
+        for path in files.iter().cloned().chain(under).chain(["nope".into(), "a/nope/x".into()]) {
+            assert_eq!(vfs.list(view, &path), None, "seed {seed}: {path:?}");
+            assert_eq!(pinned_list(&reader, root, &path), None, "seed {seed}: {path:?} lent");
+            assert_eq!(listed(&reader, root, &path), None, "seed {seed}: {path:?} owned");
+        }
+    }
+}
+
+/// A listing through a pin lends the tree's names in place: listing every directory of a tree,
+/// under one pin or a pin each, allocates nothing.
+#[test]
+fn a_pinned_listing_allocates_nothing() {
+    use blaze_alloc_count::assert_at_most;
+
+    assert!(blaze_alloc_count::installed());
+    let (mut vfs, root, dirs, _) = listing_fixture(3, 200);
+    let view = vfs.open(View { root }).unwrap();
+    let want: Vec<Vec<(String, bool)>> = dirs.iter().map(|it| vfs.list(view, it).expect("a directory")).collect();
+    let reader = vfs.reader();
+    // The first read registers this thread with the reclaimer; reads after it are measured.
+    let _ = reader.pin().list(root, "").map(Iterator::count);
+    assert_at_most(0, "every directory listed under one pin", || {
+        let pinned = reader.pin();
+        for (dir, want) in dirs.iter().zip(&want) {
+            let lent = pinned.list(root, dir).expect("a directory");
+            assert!(lent.eq(want.iter().map(|(name, is_dir)| (name.as_str(), *is_dir))), "{dir:?}");
+        }
+    });
+    let listed = assert_at_most(0, "every directory listed under a pin each", || {
+        dirs.iter().map(|dir| reader.pin().list(root, dir).map_or(0, Iterator::count)).sum::<usize>()
+    });
+    assert_eq!(listed, want.iter().map(Vec::len).sum::<usize>());
+}
+
+/// A file looked up by path is the tree's bytes, lent under a pin or held by one count of their
+/// owner: looking up every file of a tree, and paths that name a directory or nothing,
+/// allocates nothing.
+#[test]
+fn a_file_looked_up_allocates_nothing() {
+    use blaze_alloc_count::assert_at_most;
+
+    assert!(blaze_alloc_count::installed());
+    let (vfs, root, dirs, files) = listing_fixture(5, 200);
+    let reader = vfs.reader();
+    let missing: Vec<String> = files.iter().map(|it| format!("{it}/x")).chain(["nope".to_owned()]).collect();
+    // The first read registers this thread with the reclaimer; reads after it are measured.
+    let _ = reader.pin().file(root, &files[0]);
+    assert_at_most(0, "every file looked up under one pin", || {
+        let pinned = reader.pin();
+        for path in &files {
+            let file = pinned.file(root, path).unwrap().expect("a file");
+            assert_eq!(file.bytes, path.as_bytes(), "{path:?}");
+        }
+        for path in dirs.iter().chain(&missing) {
+            assert!(pinned.file(root, path).unwrap().is_none(), "{path:?}");
+        }
+    });
+    let held = assert_at_most(0, "every file held through the reader", || {
+        files
+            .iter()
+            .filter(|path| reader.file(root, path).unwrap().is_some_and(|(_, _, bytes)| &*bytes == path.as_bytes()))
+            .count()
+    });
+    assert_eq!(held, files.len());
+}
+
 #[cfg(not(blaze_check))] // many threads, long loops
 #[test]
 fn the_reader_reads_every_root_as_the_vfs_does() {
@@ -1298,5 +1419,208 @@ fn an_ops_bytes_are_one_byte_string() {
         let head = array.len() - 4;
         array[head] = 0x83;
         assert!(blaze_protocol::cbor::from_slice::<Op>(&array).is_err(), "{array:x?}");
+    }
+}
+
+/// A [`crate::Jobs`] that runs each job on a thread of its own, as a pool would.
+fn on_threads(n: usize, job: &(dyn Fn(usize) + Sync)) {
+    std::thread::scope(|scope| {
+        for at in 0..n {
+            scope.spawn(move || job(at));
+        }
+    });
+}
+
+/// Hashing a commit's files in runs on workers gives each file's own ID, as one call does,
+/// whatever the sizes (one file over a run, many under one, empty ones).
+#[test]
+fn files_hashed_on_workers_are_their_own_ids() {
+    let mut rng = Rng::new(31);
+    for round in 0..12 {
+        let files: Vec<Vec<u8>> = (0..1 + rng.below(120))
+            .map(|_| {
+                let len = match rng.below(8) {
+                    0 => 0,
+                    1 => rng.below(2 << 20) as usize,
+                    _ => rng.below(64 << 10) as usize,
+                };
+                let seed = rng.below(1 << 32) as u32;
+                let byte = |at: u32| (at.wrapping_mul(0x9e37_79b9) ^ seed).to_le_bytes()[3];
+                (0..len as u32).map(byte).collect()
+            })
+            .collect();
+        let inputs: Vec<&[u8]> = files.iter().map(Vec::as_slice).collect();
+        let want: Vec<ContentId> = inputs.iter().map(|it| ContentId::of(FILE_DOMAIN, it)).collect();
+        for jobs in [None, Some(on_threads as crate::Jobs)] {
+            let mut out = vec![ContentId::of("stale", b"")];
+            crate::tree::hash_files(&inputs, &mut out, jobs);
+            assert_eq!(out, want, "round {round}, on workers: {}", jobs.is_some());
+        }
+    }
+}
+
+/// A tree that hashes on workers makes the same roots as one that does not.
+#[test]
+fn a_vfs_hashing_on_workers_makes_the_same_roots() {
+    let mut rng = Rng::new(32);
+    let ops: Vec<Op> = (0..400)
+        .map(|at| {
+            let len = rng.below(16 << 10) as usize;
+            let bytes = (0..len).map(|_| rng.below(256) as u8).collect();
+            Op::Write { path: format!("d{}/f{at}", at % 7), bytes, mode: Mode::Regular }
+        })
+        .collect();
+    let (mut serial, mut parallel) = (new_vfs(), new_vfs());
+    parallel.hash_on(on_threads);
+    let one = serial.commit("w", serial.empty(), &ops).unwrap().root;
+    let two = parallel.commit_owned("w", parallel.empty(), ops.clone()).unwrap().root;
+    assert_eq!(one, two);
+    assert_eq!(contents(&serial, one), contents(&parallel, two));
+}
+
+/// An owned commit's bytes are the file's own: the store lends the very buffer the op held.
+/// A borrowed commit makes the same root.
+#[test]
+fn an_owned_commit_keeps_its_bytes_without_a_copy() {
+    let mut vfs = new_vfs();
+    let bytes: Vec<u8> = (0..100_000u32).map(|it| (it * 7) as u8).collect();
+    let at = bytes.as_ptr();
+    let ops = vec![Op::Write { path: "a/big".into(), bytes, mode: Mode::Executable }];
+    let borrowed = new_vfs().commit("w", vfs.empty(), &ops).unwrap().root;
+    let root = vfs.commit_owned("w", vfs.empty(), ops).unwrap().root;
+    assert_eq!(root, borrowed);
+    let view = vfs.open(View { root }).unwrap();
+    let file = vfs.read(view, "a/big").unwrap().expect("the file");
+    assert_eq!(file.bytes.as_ptr(), at, "the op's buffer, not a copy");
+    assert_eq!(file.mode, Mode::Executable);
+
+    // Rebased onto a head that moved, an untouched write is still taken whole.
+    let base = vfs.head("w").unwrap();
+    vfs.commit("w", base, &[write("other", "1")]).unwrap();
+    let bytes: Vec<u8> = (0..50_000u32).map(|it| (it * 13) as u8).collect();
+    let at = bytes.as_ptr();
+    let ops = vec![Op::Write { path: "b".into(), bytes, mode: Mode::Regular }];
+    let commit = vfs.commit_owned("w", base, ops).unwrap();
+    assert!(commit.rebased);
+    let view = vfs.open(View { root: commit.root }).unwrap();
+    assert_eq!(vfs.read(view, "b").unwrap().expect("the file").bytes.as_ptr(), at);
+    assert_eq!(text(&vfs, commit.root, "other").as_deref(), Some("1"));
+}
+
+/// A directory whose names stayed and whose contents changed is diffed column against column;
+/// it names what the model does, in its order.
+#[test]
+fn a_directory_whose_names_stayed_diffs_as_the_model() {
+    let mut rng = Rng::new(33);
+    let mut vfs = new_vfs();
+    let mut model = Model::new();
+    let ops: Vec<Op> = (0..500)
+        .map(|at| {
+            let path = format!("{}/{at:03}", ["a", "b/c", "d"][at % 3]);
+            model.insert(path.clone(), (Mode::Regular, at.to_string().into_bytes()));
+            Op::Write { path, bytes: at.to_string().into_bytes(), mode: Mode::Regular }
+        })
+        .collect();
+    let base = vfs.apply(vfs.empty(), &ops).unwrap();
+    for round in 0..40 {
+        let mut next = model.clone();
+        let mut ops = Vec::new();
+        for _ in 0..rng.below(20) {
+            let at = rng.below(500) as usize;
+            let path = format!("{}/{at:03}", ["a", "b/c", "d"][at % 3]);
+            let (mode, bytes) = match rng.below(3) {
+                0 => (Mode::Executable, at.to_string().into_bytes()),
+                _ => (Mode::Regular, format!("{at} {round}").into_bytes()),
+            };
+            next.insert(path.clone(), (mode, bytes.clone()));
+            ops.push(Op::Write { path, bytes, mode });
+        }
+        let after = vfs.apply(base, &ops).unwrap();
+        let paths: Vec<String> = vfs.diff(base, after).into_iter().map(|it| it.path).collect();
+        assert_eq!(paths, model_diff(&model, &next), "round {round}");
+        assert!(vfs.diff(base, after).iter().all(|it| it.kind == ChangeKind::Modified));
+    }
+}
+
+/// A daemon collects after every job: the journal is rewritten only once as much was appended
+/// since the last rewrite as it held, so rewrites are few and their bytes bounded by the
+/// appends', and every state still recovers.
+#[test]
+fn collecting_after_every_commit_rewrites_the_journal_amortized() {
+    let file = name("state/journal");
+    let mut sim = Sim::new(9, Faults::default());
+    let mut vfs = Vfs::recover(file.clone(), 0, &[]).0;
+    let mut root = vfs.empty();
+    let (mut appended, mut rewritten, mut rewrites) = (0, 0, 0);
+    for at in 0..300 {
+        // Directories of at most ten entries, so a commit appends about its new file.
+        let path = format!("{}/{}/f{at}", at / 100, at / 10 % 10);
+        let ops = [write(&path, &format!("{at:04}").repeat(500)), write("hot", &at.to_string())];
+        root = vfs.commit("w", root, &ops).unwrap().root;
+        vfs.collect(&[]);
+        let mut effects = Vec::new();
+        vfs.flush(&mut effects);
+        for effect in &effects {
+            match effect {
+                Effect::Append { bytes, .. } => appended += bytes.len(),
+                Effect::Write { bytes, .. } => {
+                    rewritten += bytes.len();
+                    rewrites += 1;
+                }
+                _ => {}
+            }
+        }
+        settle(&mut sim, &mut vfs, &mut effects);
+    }
+    // Live grows by about what each commit appends, so rewrites come at a constant ratio of
+    // growth (about 15 here), where rewriting after every collection is 300.
+    assert!(rewrites <= 30, "{rewrites} rewrites");
+    assert!(rewritten <= 2 * appended, "{rewritten} rewritten for {appended} appended");
+    let (back, found) = Vfs::recover(file, 0, &sim.contents(&name("state/journal")));
+    assert_eq!((found.skipped, found.heads_dropped), (0, 0));
+    assert_eq!(back.heads(), vec![("w", root)]);
+    assert_eq!(contents(&back, root), contents(&vfs, root));
+}
+
+/// A collection when due comes once as many nodes were made since the last as it kept, and
+/// then drops what `collect` would.
+#[test]
+fn a_collection_if_due_waits_until_it_is_paid_for() {
+    let mut vfs = new_vfs();
+    let mut root = vfs.empty();
+    let ops: Vec<Op> = (0..100).map(|at| write(&format!("d/f{at}"), &at.to_string())).collect();
+    root = vfs.commit("w", root, &ops).unwrap().root;
+    assert!(vfs.collect_if_due(&[]), "nothing was kept before");
+    let kept = vfs.tree.len();
+    let mut collected = 0;
+    for at in 0..400 {
+        let before = vfs.tree.len();
+        let gone = root;
+        root = vfs.commit("w", root, &[write("d/f0", &format!("x{at}"))]).unwrap().root;
+        let made = vfs.tree.len() - kept;
+        let due = made >= kept;
+        assert_eq!(vfs.collect_if_due(&[]), due, "at {at}: {made} made, {kept} kept");
+        if due {
+            collected += 1;
+            assert!(!vfs.has(gone) && vfs.has(root));
+            assert!(vfs.tree.len() < before + 4);
+            break;
+        }
+    }
+    assert_eq!(collected, 1, "a collection came once enough was made");
+}
+
+/// A file record's checksum is over its content ID: a flipped byte of its bytes, its checksum
+/// or its kind ends recovery there.
+#[test]
+fn a_damaged_file_record_is_refused() {
+    let (file, ..) = journal::KINDS;
+    let good = journal::framed(file, b"some bytes");
+    assert_eq!(Vfs::recover(name("j"), 0, &good).1.records, 1);
+    for at in [journal::HEADER - 1, journal::HEADER, journal::HEADER + 5, good.len() - 1] {
+        let mut bad = good.clone();
+        bad[at] ^= 1;
+        let (_, found) = Vfs::recover(name("j"), 0, &bad);
+        assert_eq!((found.records, found.skipped), (0, bad.len()), "byte {at}");
     }
 }

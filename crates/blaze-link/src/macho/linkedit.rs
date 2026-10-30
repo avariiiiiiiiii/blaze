@@ -5,6 +5,11 @@
 //! Each table is appended to one buffer, the `__LINKEDIT` being written, and padded to 8 bytes
 //! from where it started: [`capacity`] sizes that buffer for all four, so encoding them grows
 //! it never. Each returns how many bytes it appended, 0 for a table with nothing in it.
+//!
+//! The rebase opcodes and the function starts are each one stream whose next bytes depend on
+//! the cursor the bytes before left. Both are cut where that cursor follows from the one
+//! address before the cut alone ([`cuts`]), the pieces encoded in parallel and joined in
+//! order: the bytes the one stream gives.
 
 #![forbid(unsafe_code)]
 
@@ -12,6 +17,53 @@ use std::borrow::Cow;
 
 use blaze_ids::radix;
 use object::macho;
+use rayon::prelude::*;
+
+/// The fewest addresses a piece of a stream encodes: below two pieces' worth the stream is
+/// encoded whole.
+const CHUNK: usize = 16 * 1024;
+
+/// Where the pieces of a stream over `len` addresses start: 0, then the first index at or past
+/// each `every`th from the last cut where `fresh` holds (where the encoder's cursor follows from
+/// the address before). `every` is at least `CHUNK` and makes no more pieces than the pool has
+/// threads, so the pieces run in one round; the bytes are the same for any cuts.
+fn cuts(len: usize, fresh: impl Fn(usize) -> bool) -> Vec<usize> {
+    let every = CHUNK.max(len.div_ceil(rayon::current_num_threads().max(1)));
+    // alloc: once per table, one cut per piece
+    let mut cuts = Vec::with_capacity(len / every + 1);
+    cuts.push(0);
+    let mut at = every;
+    while at < len {
+        if fresh(at) {
+            cuts.push(at);
+            at += every;
+        } else {
+            at += 1;
+        }
+    }
+    cuts
+}
+
+/// Appends `pieces` to `out` in order, copied in parallel; the first error in order instead.
+fn join(out: &mut Vec<u8>, pieces: Vec<Result<Vec<u8>, String>>) -> Result<(), String> {
+    // alloc: once per table, one entry per piece
+    let mut done = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        done.push(piece?);
+    }
+    let at = out.len();
+    out.resize(at + done.iter().map(Vec::len).sum::<usize>(), 0);
+    let mut rest = &mut out[at..];
+    // alloc: once per table, one slice per piece
+    let mut jobs = Vec::with_capacity(done.len());
+    for piece in &done {
+        let (these, after) = std::mem::take(&mut rest).split_at_mut(piece.len());
+        jobs.push((these, &piece[..]));
+        rest = after;
+    }
+    jobs.into_par_iter().for_each(|(out, piece)| out.copy_from_slice(piece));
+    Ok(())
+}
 
 /// A segment, by its index among the image's `LC_SEGMENT_64`s.
 pub(super) struct Span {
@@ -101,9 +153,12 @@ fn segment_of(spans: &[Span], addr: u64, what: &str) -> Result<usize, String> {
 }
 
 /// Appends the rebase opcodes of `addrs`, each a pointer dyld adds the slide to.
+///
+/// Cut at gaps between pointers, where a run always starts: the cursor before one is the
+/// segment of the pointer before and 8 past it.
 pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Result<usize, String> {
     let addrs = sorted(addrs);
-    if let Some(twice) = addrs.windows(2).find(|it| it[0] == it[1]) {
+    if let Some(twice) = addrs.par_windows(2).find_first(|it| it[0] == it[1]) {
         // alloc: error path
         return Err(format!("the address {:#x} is to be slid twice", twice[0]));
     }
@@ -111,12 +166,37 @@ pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Resul
         return Ok(0);
     }
     let start = out.len();
-    // Runs of adjacent pointers take 2 to 3 bytes each; scattered ones about 3.
-    out.reserve(addrs.len() * 3 + 16);
     out.push(macho::REBASE_OPCODE_SET_TYPE_IMM | macho::REBASE_TYPE_POINTER);
-    // Where dyld's cursor is: its segment and address.
-    let mut cursor: Option<(usize, u64)> = None;
-    let mut rest = &addrs[..];
+    let cuts = cuts(addrs.len(), |at| addrs[at] != addrs[at - 1].wrapping_add(8));
+    if cuts.len() == 1 {
+        // Runs of adjacent pointers take 2 to 3 bytes each; scattered ones about 3.
+        out.reserve(addrs.len() * 3 + 16);
+        rebase_runs(&addrs, None, spans, out)?;
+    } else {
+        let pieces = (0..cuts.len())
+            .into_par_iter()
+            .map(|nth| {
+                let (from, to) = (cuts[nth], cuts.get(nth + 1).copied().unwrap_or(addrs.len()));
+                // A pointer in no segment before the cut is an error of the piece before.
+                let cursor = from.checked_sub(1).and_then(|before| {
+                    let addr = addrs[before];
+                    spans.iter().position(|it| (it.start..it.end).contains(&addr)).map(|segment| (segment, addr + 8))
+                });
+                // alloc: once per piece of CHUNK pointers
+                let mut piece = Vec::with_capacity((to - from) * 3 + 16);
+                rebase_runs(&addrs[from..to], cursor, spans, &mut piece).map(|()| piece)
+            })
+            .collect(); // alloc: once per table, one result per piece
+        join(out, pieces)?;
+    }
+    out.push(macho::REBASE_OPCODE_DONE);
+    Ok(finish(out, start))
+}
+
+/// The opcodes of the runs of `addrs` (sorted, distinct, starting a run), from dyld's cursor
+/// at `cursor` (its segment and address).
+fn rebase_runs(addrs: &[u64], mut cursor: Option<(usize, u64)>, spans: &[Span], out: &mut Vec<u8>) -> Result<(), String> {
+    let mut rest = addrs;
     while let Some(&first) = rest.first() {
         let segment = segment_of(spans, first, "a pointer to slide")?;
         let end = spans[segment].end;
@@ -145,8 +225,7 @@ pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Resul
         cursor = Some((segment, first + run as u64 * 8));
         rest = &rest[run..];
     }
-    out.push(macho::REBASE_OPCODE_DONE);
-    Ok(finish(out, start))
+    Ok(())
 }
 
 /// Appends the bind opcodes of `binds`, sorted here by symbol so each symbol is named once.
@@ -377,12 +456,40 @@ pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)], out: &mu
 
 /// Appends `LC_FUNCTION_STARTS`: the functions' addresses as ULEB distances, the first from
 /// `text`.
+///
+/// Cut anywhere: the distance after a cut is from the address before it, or from `text` when
+/// that is not past it.
 pub(super) fn function_starts(text: u64, addrs: &[u64], out: &mut Vec<u8>) -> usize {
     let addrs = sorted(addrs);
     let start = out.len();
-    // Most functions are less than 16 KiB apart: two bytes each.
-    out.reserve(addrs.len() * 2 + 8);
-    let mut last = text;
+    let cuts = cuts(addrs.len(), |_| true);
+    if cuts.len() == 1 {
+        // Most functions are less than 16 KiB apart: two bytes each.
+        out.reserve(addrs.len() * 2 + 8);
+        starts_from(text, text, &addrs, out);
+    } else {
+        let pieces = (0..cuts.len())
+            .into_par_iter()
+            .map(|nth| {
+                let (from, to) = (cuts[nth], cuts.get(nth + 1).copied().unwrap_or(addrs.len()));
+                let last = from.checked_sub(1).map(|before| addrs[before]).filter(|it| *it > text).unwrap_or(text);
+                // alloc: once per piece of CHUNK functions
+                let mut piece = Vec::with_capacity((to - from) * 2 + 8);
+                starts_from(text, last, &addrs[from..to], &mut piece);
+                Ok(piece)
+            })
+            .collect(); // alloc: once per table, one result per piece
+        join(out, pieces).expect("function starts have no error");
+    }
+    if out.len() == start {
+        return 0;
+    }
+    out.push(0);
+    finish(out, start)
+}
+
+/// The distances of `addrs` (sorted) past `text`, the first from `last`, the one before.
+fn starts_from(text: u64, mut last: u64, addrs: &[u64], out: &mut Vec<u8>) {
     // A distance of 0 ends the list: the headers are at `text`, never a function.
     for &addr in addrs.iter().filter(|it| **it > text) {
         if addr == last {
@@ -391,9 +498,210 @@ pub(super) fn function_starts(text: u64, addrs: &[u64], out: &mut Vec<u8>) -> us
         uleb(out, addr - last);
         last = addr;
     }
-    if out.len() == start {
-        return 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_ids::rng::SplitMix64;
+
+    use super::*;
+
+    /// The rebase opcodes as one stream, as they were written before the pieces.
+    fn rebases_serial(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Result<usize, String> {
+        let addrs = sorted(addrs);
+        if let Some(twice) = addrs.windows(2).find(|it| it[0] == it[1]) {
+            return Err(format!("the address {:#x} is to be slid twice", twice[0]));
+        }
+        if addrs.is_empty() {
+            return Ok(0);
+        }
+        let start = out.len();
+        out.push(macho::REBASE_OPCODE_SET_TYPE_IMM | macho::REBASE_TYPE_POINTER);
+        let mut cursor: Option<(usize, u64)> = None;
+        let mut rest = &addrs[..];
+        while let Some(&first) = rest.first() {
+            let segment = segment_of(spans, first, "a pointer to slide")?;
+            let end = spans[segment].end;
+            let run = (rest.iter().zip(0u64..))
+                .take_while(|(it, nth)| **it == first + nth * 8 && **it + 8 <= end)
+                .count()
+                .max(1);
+            match cursor {
+                Some((at, address)) if at == segment && first >= address => {
+                    if first > address {
+                        out.push(macho::REBASE_OPCODE_ADD_ADDR_ULEB);
+                        uleb(out, first - address);
+                    }
+                }
+                _ => {
+                    out.push(macho::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment as u8);
+                    uleb(out, first - spans[segment].start);
+                }
+            }
+            if run < 16 {
+                out.push(macho::REBASE_OPCODE_DO_REBASE_IMM_TIMES | run as u8);
+            } else {
+                out.push(macho::REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
+                uleb(out, run as u64);
+            }
+            cursor = Some((segment, first + run as u64 * 8));
+            rest = &rest[run..];
+        }
+        out.push(macho::REBASE_OPCODE_DONE);
+        Ok(finish(out, start))
     }
-    out.push(0);
-    finish(out, start)
+
+    /// The function starts as one stream, as they were written before the pieces.
+    fn starts_serial(text: u64, addrs: &[u64], out: &mut Vec<u8>) -> usize {
+        let addrs = sorted(addrs);
+        let start = out.len();
+        let mut last = text;
+        for &addr in addrs.iter().filter(|it| **it > text) {
+            if addr == last {
+                continue;
+            }
+            uleb(out, addr - last);
+            last = addr;
+        }
+        if out.len() == start {
+            return 0;
+        }
+        out.push(0);
+        finish(out, start)
+    }
+
+    const TEXT: u64 = 0x1_0000_0000;
+    const CONST: u64 = 0x1_0100_0000;
+    const DATA: u64 = 0x1_0200_0000;
+    const END: u64 = 0x1_0400_0000;
+
+    fn spans() -> [Span; 4] {
+        [
+            Span { name: "__PAGEZERO", start: 0, end: TEXT, writable: false },
+            Span { name: "__TEXT", start: TEXT, end: CONST, writable: false },
+            Span { name: "__DATA_CONST", start: CONST, end: DATA, writable: true },
+            Span { name: "__DATA", start: DATA, end: END, writable: true },
+        ]
+    }
+
+    /// About `n` sorted, distinct pointers from `from`: runs of 1 to 40, gaps of 4 (a pointer
+    /// off 8-byte alignment) to 4 KiB, and with `jump` a run up to the end of `__DATA_CONST`.
+    fn pointers(rng: &mut SplitMix64, n: usize, from: u64, jump: bool) -> Vec<u64> {
+        let mut addrs = Vec::with_capacity(n + 64);
+        let mut at = from;
+        while addrs.len() < n {
+            for _ in 0..rng.range(1..41) {
+                addrs.push(at);
+                at += 8;
+            }
+            at += if rng.one_in(16) { 4 } else { 8 * rng.range(1..512) };
+            if jump && at < DATA && rng.one_in(2000) {
+                at = at.max(DATA - 8 * rng.range(1..20));
+            }
+        }
+        addrs
+    }
+
+    fn both(addrs: &[u64], spans: &[Span]) -> (Result<Vec<u8>, String>, Result<Vec<u8>, String>) {
+        let (mut pieces, mut one) = (vec![0xaa; 5], vec![0xaa; 5]);
+        let pieces = rebases(addrs, spans, &mut pieces).map(|len| {
+            assert_eq!(pieces.len(), 5 + len);
+            pieces.split_off(5)
+        });
+        let one = rebases_serial(addrs, spans, &mut one).map(|len| {
+            assert_eq!(one.len(), 5 + len);
+            one.split_off(5)
+        });
+        (pieces, one)
+    }
+
+    fn sixteen() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap()
+    }
+
+    #[test]
+    fn rebases_in_pieces_are_the_one_streams_bytes() {
+        // Sixteen threads, so the inputs are cut into pieces on any machine.
+        sixteen().install(|| {
+            let spans = spans();
+            for seed in 0..12u64 {
+                let mut rng = SplitMix64::new(0x7265_6261_7365 ^ seed);
+                let n = [10, CHUNK - 1, 2 * CHUNK, 3 * CHUNK + 77, 5 * CHUNK][seed as usize % 5];
+                let mut addrs = pointers(&mut rng, n, CONST + 8 * rng.range(0..64), true);
+                if seed % 3 == 0 {
+                    rng.shuffle(&mut addrs);
+                }
+                let (pieces, one) = both(&addrs, &spans);
+                assert_eq!(pieces.unwrap(), one.unwrap(), "seed {seed}");
+            }
+            // One run longer than every piece: no gap to cut at.
+            let addrs: Vec<u64> = (0..3 * CHUNK as u64).map(|it| DATA + 8 * it).collect();
+            let (pieces, one) = both(&addrs, &spans);
+            assert_eq!(pieces.unwrap(), one.unwrap());
+        });
+    }
+
+    #[test]
+    fn a_rebase_error_is_the_first_in_order() {
+        // Sixteen threads, so the inputs are cut into pieces on any machine.
+        sixteen().install(|| {
+            // A segment dyld can't write amid the pointers, and a hole in none past it: the
+            // pointers reach both in later pieces.
+            const LOCKED: u64 = CONST + 0x40_0000;
+            const HOLE: u64 = CONST + 0x58_0000;
+            let spans = [
+                Span { name: "__TEXT", start: TEXT, end: CONST, writable: false },
+                Span { name: "__DATA_CONST", start: CONST, end: LOCKED, writable: true },
+                Span { name: "__LOCKED", start: LOCKED, end: LOCKED + 0x8_0000, writable: false },
+                Span { name: "__DATA", start: LOCKED + 0x8_0000, end: HOLE, writable: true },
+            ];
+            let mut rng = SplitMix64::new(11);
+            let mut addrs = pointers(&mut rng, 4 * CHUNK, CONST, false);
+            assert!(addrs[CHUNK] < LOCKED && *addrs.last().unwrap() > HOLE, "the pointers span the bad segments");
+            let (pieces, one) = both(&addrs, &spans);
+            let error = one.unwrap_err();
+            assert!(error.contains("__LOCKED"), "{error}");
+            assert_eq!(pieces.unwrap_err(), error);
+            // Without the locked segment, the first error is the hole's.
+            let mut open = spans;
+            open[2].writable = true;
+            let (pieces, one) = both(&addrs, &open);
+            let error = one.unwrap_err();
+            assert!(error.contains("in no segment"), "{error}");
+            assert_eq!(pieces.unwrap_err(), error);
+            // A pointer twice is an error before any segment's.
+            addrs[3 * CHUNK] = addrs[3 * CHUNK - 1];
+            let (pieces, one) = both(&addrs, &spans);
+            let error = one.unwrap_err();
+            assert!(error.contains("slid twice"), "{error}");
+            assert_eq!(pieces.unwrap_err(), error);
+        });
+    }
+
+    #[test]
+    fn function_starts_in_pieces_are_the_one_streams_bytes() {
+        // Sixteen threads, so the inputs are cut into pieces on any machine.
+        sixteen().install(|| {
+            for seed in 0..10u64 {
+                let mut rng = SplitMix64::new(0x7374_6172_7473 ^ seed);
+                let n = [0, 7, CHUNK, 2 * CHUNK + 1, 4 * CHUNK + 999][seed as usize % 5];
+                let mut addrs: Vec<u64> = Vec::with_capacity(n);
+                // Some at or below `text`, which add nothing, and repeats, which add nothing either.
+                let mut at = TEXT - 64;
+                for _ in 0..n {
+                    addrs.push(at);
+                    if !rng.one_in(50) {
+                        at += 4 * rng.range(1..2048);
+                    }
+                }
+                if seed % 2 == 1 {
+                    rng.shuffle(&mut addrs);
+                }
+                let (mut pieces, mut one) = (vec![0xaa; 3], vec![0xaa; 3]);
+                let len = function_starts(TEXT, &addrs, &mut pieces);
+                assert_eq!(len, starts_serial(TEXT, &addrs, &mut one), "seed {seed}");
+                assert_eq!(pieces, one, "seed {seed}");
+            }
+        });
+    }
 }

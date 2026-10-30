@@ -93,7 +93,7 @@ impl Default for TypeLimits {
 }
 
 impl TypeLimits {
-    fn crate_of(&mut self, b: &BodyCx<'_, '_>) {
+    fn crate_of(&mut self, b: &BodyCx<'_, '_, '_>) {
         let db = b.db();
         let krate = b.owner.krate(db);
         if self.krate != Some(krate) {
@@ -110,7 +110,7 @@ impl TypeLimits {
         self.names.cmpops.iter().find(|(name, _)| *name == item).map(|&(_, op)| op)
     }
 
-    fn is_non_null(&mut self, b: &BodyCx<'_, '_>, adt: AdtId) -> bool {
+    fn is_non_null(&mut self, b: &BodyCx<'_, '_, '_>, adt: AdtId) -> bool {
         let name = self.names.non_null;
         *self.non_null.entry(adt).or_insert_with(|| util::diagnostic_item(b.db(), adt.into()) == Some(name))
     }
@@ -216,14 +216,14 @@ impl LatePass for TypeLimits {
     ]);
     const PATS: PatKinds = PatKinds::of(&[PatKind::Lit, PatKind::Range]);
 
-    fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+    fn check_body(&mut self, b: &BodyCx<'_, '_, '_>, _out: &mut Vec<Found>) {
         self.crate_of(b);
         // Expression ids are of the body: one of the body before is no node of this one.
         self.last_negation = None;
         self.pat_lits = [None; 2];
     }
 
-    fn check_pat(&mut self, b: &BodyCx<'_, '_>, pat: PatId, _out: &mut Vec<Found>) {
+    fn check_pat(&mut self, b: &BodyCx<'_, '_, '_>, pat: PatId, _out: &mut Vec<Found>) {
         match b.store().pat(pat) {
             Pat::Lit(expr) => self.pat_lits = [Some(expr), None],
             Pat::Range { start, end, .. } => self.pat_lits = [start, end],
@@ -231,7 +231,7 @@ impl LatePass for TypeLimits {
         }
     }
 
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+    fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         match b.store().expr(expr) {
             Expr::Literal(lit) => {
                 let negation = match self.last_negation {
@@ -297,7 +297,7 @@ impl TypeLimits {
     #[allow(clippy::too_many_arguments)]
     fn pointers(
         &mut self,
-        b: &BodyCx<'_, '_>,
+        b: &BodyCx<'_, '_, '_>,
         e: ExprId,
         l: Operand,
         cmpop: ComparisonOp,
@@ -318,7 +318,7 @@ impl TypeLimits {
 /// the integer's type alone. It reads the lowered literal; only a comparison it would lint
 /// reads the source, to tell a byte literal (`b'a'`, lowered as `97u8`), which rustc's
 /// `LitKind::Byte` leaves alone, from an integer.
-fn check_limits(b: &BodyCx<'_, '_>, op: Cmp, l: ExprId, r: ExprId) -> bool {
+fn check_limits(b: &BodyCx<'_, '_, '_>, op: Cmp, l: ExprId, r: ExprId) -> bool {
     let store = b.store();
     let (lit_expr, lit, expr, swap) = match (store.expr(l), store.expr(r)) {
         (Expr::Literal(lit), _) => (l, lit, r, true),
@@ -347,7 +347,7 @@ fn check_limits(b: &BodyCx<'_, '_>, op: Cmp, l: ExprId, r: ExprId) -> bool {
 }
 
 /// Whether the literal `expr` is written as an integer (rustc's `LitKind::Int`).
-fn is_int_number(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+fn is_int_number(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     let Some(node) = util::syntax(b, expr) else { return false };
     let Some(lit) = ast::Literal::cast(node.value) else { return false };
     matches!(lit.kind(), ast::LiteralKind::IntNumber(_))
@@ -368,7 +368,7 @@ enum Nan {
 impl TypeLimits {
     /// rustc's `is_nan` of `lint_nan`: a path to `f32::NAN` and the rest, through blocks and
     /// borrows. A path is resolved only when it is one.
-    fn is_nan(&self, b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+    fn is_nan(&self, b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
         let expr = util::peel_borrows(b, util::peel_blocks(b, expr));
         if !matches!(b.store().expr(expr), Expr::Path(_)) {
             return false;
@@ -377,7 +377,7 @@ impl TypeLimits {
     }
 
     /// rustc's `lint_nan`.
-    fn lint_nan(&self, b: &BodyCx<'_, '_>, e: ExprId, op: Cmp, l: ExprId, r: ExprId) -> Option<Found> {
+    fn lint_nan(&self, b: &BodyCx<'_, '_, '_>, e: ExprId, op: Cmp, l: ExprId, r: ExprId) -> Option<Found> {
         let nan = match op {
             Cmp::Eq | Cmp::Ne if self.is_nan(b, l) => Nan::EqLeft,
             Cmp::Eq | Cmp::Ne if self.is_nan(b, r) => Nan::EqRight,
@@ -427,7 +427,7 @@ impl TypeLimits {
     /// `NonNull` to an unsized type, what gives its pointer, and whether the type is `dyn`.
     fn ptr_unsized<'db>(
         &mut self,
-        b: &BodyCx<'_, 'db>,
+        b: &BodyCx<'_, '_, 'db>,
         solver: &mut Option<Solver<'db>>,
         ty: Ty<'db>,
     ) -> Option<(usize, &'static str, bool)> {
@@ -444,7 +444,7 @@ impl TypeLimits {
     /// rustc's `lint_wide_pointer`.
     fn lint_wide_pointer<'db>(
         &mut self,
-        b: &BodyCx<'_, 'db>,
+        b: &BodyCx<'_, '_, 'db>,
         e: ExprId,
         cmpop: ComparisonOp,
         l: ExprId,
@@ -542,7 +542,7 @@ impl TypeLimits {
     /// rustc's `lint_fn_pointer`.
     fn lint_fn_pointer<'db>(
         &self,
-        b: &BodyCx<'_, 'db>,
+        b: &BodyCx<'_, '_, 'db>,
         e: ExprId,
         cmpop: ComparisonOp,
         l: ExprId,
@@ -620,6 +620,6 @@ impl TypeLimits {
     }
 }
 
-fn interner<'db>(b: &BodyCx<'_, 'db>) -> DbInterner<'db> {
+fn interner<'db>(b: &BodyCx<'_, '_, 'db>) -> DbInterner<'db> {
     DbInterner::new_with(b.db(), b.owner.krate(b.db()))
 }

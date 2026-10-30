@@ -16,9 +16,9 @@ use tt::{Leaf, Punct, Spacing, TopSubtreeBuilder, TtElement, buffer::Cursor};
 use crate::{
     Appended, DocCommentDesugarMode, Inserted, Removed, call_input,
     dummy_test_span_utils::{DUMMY, DummyTestSpanMap},
-    parse_to_token_tree_static_span, reference, syntax_node_to_token_tree,
-    syntax_node_to_token_tree_modified, to_matcher_input, to_parser_input,
-    token_tree_to_syntax_node,
+    parse_to_token_tree_static_span,
+    reference::{self, syntax_node_to_token_tree, syntax_node_to_token_tree_modified},
+    to_matcher_input, to_parser_input, token_tree_to_syntax_node,
 };
 
 fn check_punct_spacing(fixture: &str) {
@@ -767,6 +767,31 @@ fn lexing_then_parsing_gives_the_files_tree() {
         parsed += 1;
     }
     assert!(parsed > 200, "only {parsed} files parsed back");
+}
+
+/// An identifier interned by the hash the lexer took of it is the symbol interning its text
+/// gives, in every edition: keywords, `_`, raw identifiers, compiled-in names and names of 8
+/// bytes or fewer, longer and non-ASCII.
+#[test]
+fn identifiers_interned_by_the_lexers_hash_are_interned_text() {
+    let text = "fn r#fn(self, _: Self) -> Option<Some> { let r#a_much_longer_name = std::iter::new; \
+                crate::ünïcödé::exactly8 + async + gen + r#union + Ok + iter_mut + _x }";
+    for edition in Edition::iter() {
+        let tree = parse_to_token_tree_static_span(edition, DUMMY, text).expect("the text lexes");
+        let mut names = 0;
+        let mut cursor = Cursor::new(tree.as_token_trees());
+        while !cursor.eof() {
+            while let Some(token_tree) = cursor.token_tree() {
+                if let tt::TokenTree::Leaf(Leaf::Ident(ident)) = token_tree {
+                    assert_eq!(ident.sym, intern::Symbol::intern(ident.sym.as_str()), "{edition:?}");
+                    names += 1;
+                }
+                cursor.bump();
+            }
+            cursor.bump_or_end();
+        }
+        assert_eq!(names, 21, "{edition:?}");
+    }
 }
 
 /// Converting a tree into an input that was used before allocates nothing: the keywords' table

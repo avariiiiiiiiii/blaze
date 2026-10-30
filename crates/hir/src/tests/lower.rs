@@ -287,6 +287,47 @@ type F = for<'x, 'y> fn(&'x u8, &'y u8);
     });
 }
 
+/// rustc's `unsafe<'a> T`: `Ty::new_unsafe_binder` over `T`, with `'a` bound by the binder.
+#[test]
+fn an_unsafe_binder_binds_its_lifetimes() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+type U = unsafe<'a, 'b> &'a &'b u8;
+"#,
+    );
+    crate::attach_db(&db, || {
+        let (_, ModuleDefId::TypeAliasId(alias)) = type_item(&db, "U") else {
+            panic!("`U` is a type alias")
+        };
+        let ty = db.ty(TyDefId::TypeAliasId(alias)).skip_binder();
+        let TyKind::UnsafeBinder(binder) = ty.kind() else { panic!("an unsafe binder: {ty:?}") };
+        let names: Vec<_> = binder
+            .bound_vars()
+            .iter()
+            .map(|it| match it {
+                BoundVariableKind::Region(BoundRegionKind::NamedForPrinting(Symbol(name))) => {
+                    name.as_str().trim_start_matches('\'').to_owned()
+                }
+                it => panic!("an `unsafe<'a>` binds a named region, not {it:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+        let var = |ty: Ty<'_>| match ty.kind() {
+            TyKind::Ref(region, inner, _) => match region.kind() {
+                RegionKind::ReBound(BoundVarIndexKind::Bound(binder), it) => {
+                    ((binder.as_u32(), it.var.as_u32()), inner)
+                }
+                it => panic!("a bound region, not {it:?}"),
+            },
+            it => panic!("a reference, not {it:?}"),
+        };
+        let (outer, inner) = var(binder.skip_binder());
+        assert_eq!(outer, (0, 0), "`'a`");
+        assert_eq!(var(inner).0, (0, 1), "`'b`");
+    });
+}
+
 #[test]
 fn a_lifetime_is_the_innermost_binders_that_names_it() {
     let db = TestDB::with_files(
@@ -472,8 +513,8 @@ trait Bad: Sized + Sup<Self> {
                     .into_iter()
                     .map(|site| match site {
                         DynCompatibilitySite::Syntax(ptr) => {
-                            let root = ptr.file_id.parse_or_expand(&db);
-                            ptr.value.to_node(&root).text().to_string()
+                            let root = ptr.file_id.root(&db);
+                            syntax::view::to_node(ptr.value, root).text().to_owned()
                         }
                         DynCompatibilitySite::AssocTypeBound { alias, .. } => {
                             format!("bound of {}", alias.name(&db).as_str())

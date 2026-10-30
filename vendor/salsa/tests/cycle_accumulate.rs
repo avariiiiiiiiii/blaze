@@ -24,6 +24,8 @@
 //! in the dependency tree, so that the accumulator knows from which iteration
 //! to aggregate the accumulated values from.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashSet;
 
 mod common;

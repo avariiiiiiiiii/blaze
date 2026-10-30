@@ -9,6 +9,8 @@
 
 use std::{fmt, io};
 
+use blaze_core::decimal::decimal;
+
 /// The longest line of a head or of a chunk's size, without its CRLF.
 const LONGEST_LINE: usize = 8 << 10;
 /// The most header lines of a head, and of a chunked body's trailers.
@@ -132,6 +134,9 @@ pub struct RequestParser {
     state: RequestState,
     /// A chunked body, decoded; kept from request to request.
     chunked: Vec<u8>,
+    /// Empty, with the room of the last buffer `push_vec` left free (up to `KEPT`): what the
+    /// next read goes into.
+    spare: Vec<u8>,
     broken: Option<HttpError>,
 }
 
@@ -163,9 +168,9 @@ struct Whole {
 impl RequestParser {
     pub fn new(most_body: usize) -> RequestParser {
         // alloc: none until a push; the room then grows once and `reset` keeps it.
-        let (bytes, chunked) = (Vec::new(), Vec::new());
+        let (bytes, chunked, spare) = (Vec::new(), Vec::new(), Vec::new());
         let state = RequestState::Head(HeadScan::default());
-        RequestParser { most_body, bytes, end: 0, state, chunked, broken: None }
+        RequestParser { most_body, bytes, end: 0, state, chunked, spare, broken: None }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -223,19 +228,35 @@ impl RequestParser {
     }
 
     /// [`RequestParser::push`] of a buffer that is the caller's no more: kept as it is,
-    /// uncopied, when nothing is held before it.
+    /// uncopied, when nothing is held before it. The buffer this leaves free (the one the
+    /// parser held, or `bytes` once copied) is kept for [`RequestParser::lend_spare`].
     pub(crate) fn push_vec(&mut self, bytes: Vec<u8>) {
-        if self.broken.is_some() {
-            return;
-        }
-        self.release();
-        match self.end == 0 {
-            true => {
-                self.bytes = bytes;
-                self.end = self.bytes.len();
+        let free = match self.broken.is_some() {
+            true => bytes,
+            false => {
+                self.release();
+                match self.end == 0 {
+                    true => {
+                        let free = std::mem::replace(&mut self.bytes, bytes);
+                        self.end = self.bytes.len();
+                        free
+                    }
+                    false => {
+                        self.push(&bytes);
+                        bytes
+                    }
+                }
             }
-            false => self.push(&bytes),
-        }
+        };
+        self.spare = free;
+        self.spare.clear();
+        self.spare.shrink_to(KEPT);
+    }
+
+    /// An empty buffer with the room the last [`RequestParser::push_vec`] left free, for the
+    /// next read to fill and give back through `push_vec`: warm reads allocate nothing.
+    pub(crate) fn lend_spare(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.spare)
     }
 
     /// The next whole request (Content-Length or chunked body), `Ok(None)` until one is here.
@@ -870,24 +891,9 @@ fn head_into(
     out.extend_from_slice(b"\r\n");
 }
 
-/// `n` in decimal, as the digits it ends `digits` with.
-fn decimal(n: usize, digits: &mut [u8; 20]) -> &str {
-    let mut at = digits.len();
-    let mut n = n;
-    loop {
-        at -= 1;
-        digits[at] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    std::str::from_utf8(&digits[at..]).expect("decimal digits are UTF-8")
-}
-
 /// A response's start line, `HTTP/1.1 200 OK`, as the parts [`head_into`] writes.
 fn status_line(status: u16, digits: &mut [u8; 20]) -> [&str; 4] {
-    ["HTTP/1.1 ", decimal(usize::from(status), digits), " ", reason(status)]
+    ["HTTP/1.1 ", decimal(u64::from(status), digits), " ", reason(status)]
 }
 
 /// The most bytes of a head that are not its headers: the longest start line, the length or
@@ -911,7 +917,7 @@ pub fn response(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
 pub fn response_into(out: &mut Vec<u8>, status: u16, headers: &[(&str, &str)], body: &[u8]) {
     let (mut digits, mut len) = ([0; 20], [0; 20]);
     let start = status_line(status, &mut digits);
-    let length = ("Content-Length", decimal(body.len(), &mut len));
+    let length = ("Content-Length", decimal(body.len() as u64, &mut len));
     head_into(out, &start, None, headers, length);
     out.extend_from_slice(body);
 }
@@ -991,7 +997,7 @@ pub(crate) fn request_head_into(
 ) {
     let mut digits = [0; 20];
     let start = [method, " ", path, " HTTP/1.1"];
-    let length = ("Content-Length", decimal(len, &mut digits));
+    let length = ("Content-Length", decimal(len as u64, &mut digits));
     head_into(out, &start, Some(("Host", host)), headers, length);
 }
 

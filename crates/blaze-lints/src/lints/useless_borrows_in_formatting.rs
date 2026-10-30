@@ -21,7 +21,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, call: ast::MacroCall<'t>) {
     let Some(format) = format::of(cx, call) else { return };
     // Only a borrow written as an argument is peeled: one without asks for no type.
     let borrowed = (0..format.arg_count).any(|index| {
-        format.arg(index).is_some_and(|it| matches!(strip_parens(it), ast::Expr::RefExpr(_)))
+        format.arg(index).is_some_and(|it| matches!(it.peel_parens(), ast::Expr::RefExpr(_)))
     });
     if !borrowed {
         return;
@@ -70,7 +70,7 @@ fn peel<'t>(
     fmt_trait: hir::Trait,
     sized: hir::Trait,
 ) -> Option<(TextRange, &'t str, &'static str)> {
-    if !matches!(strip_parens(arg), ast::Expr::RefExpr(_)) {
+    if !matches!(arg.peel_parens(), ast::Expr::RefExpr(_)) {
         return None;
     }
     let range = cx.original_range(arg.syntax())?;
@@ -79,10 +79,10 @@ fn peel<'t>(
     let mut has_mutable = false;
     let mut peeled = arg;
     // rustc's HIR has no parentheses: `&(x)` is a borrow of `x` written `(x)`.
-    while let ast::Expr::RefExpr(borrow) = strip_parens(peeled)
+    while let ast::Expr::RefExpr(borrow) = peeled.peel_parens()
         && borrow.raw_token().is_none()
         && let Some(inner) = borrow.expr()
-        && let Some(ty) = cx.ty(strip_parens(inner))
+        && let Some(ty) = cx.ty(inner.peel_parens())
         && ty.impls_trait(db, sized, &[])
         && ty.impls_trait(db, fmt_trait, &[])
     {
@@ -105,11 +105,3 @@ fn peel<'t>(
     Some((range, peeled, message))
 }
 
-fn strip_parens(mut expr: ast::Expr<'_>) -> ast::Expr<'_> {
-    while let ast::Expr::ParenExpr(paren) = expr
-        && let Some(inner) = paren.expr()
-    {
-        expr = inner;
-    }
-    expr
-}

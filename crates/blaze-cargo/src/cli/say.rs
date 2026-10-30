@@ -460,35 +460,10 @@ impl Ended {
 /// `status_to_string`.
 pub fn ended(ended: Ended) -> String {
     match ended {
-        Ended::Signal(signal) => format!("signal: {signal}{}", signal_named(signal)),
+        // alloc: a message for the terminal, once per process that ended
+        Ended::Signal(signal) => format!("signal: {signal}{}", blaze_core::signal::described(signal)),
         Ended::Code(code) => code_named(code),
     }
-}
-
-#[cfg(unix)]
-fn signal_named(signal: i32) -> &'static str {
-    match signal {
-        libc::SIGABRT => ", SIGABRT: process abort signal",
-        libc::SIGALRM => ", SIGALRM: alarm clock",
-        libc::SIGFPE => ", SIGFPE: erroneous arithmetic operation",
-        libc::SIGHUP => ", SIGHUP: hangup",
-        libc::SIGILL => ", SIGILL: illegal instruction",
-        libc::SIGINT => ", SIGINT: terminal interrupt signal",
-        libc::SIGKILL => ", SIGKILL: kill",
-        libc::SIGPIPE => ", SIGPIPE: write on a pipe with no one to read",
-        libc::SIGQUIT => ", SIGQUIT: terminal quit signal",
-        libc::SIGSEGV => ", SIGSEGV: invalid memory reference",
-        libc::SIGTERM => ", SIGTERM: termination signal",
-        libc::SIGBUS => ", SIGBUS: access to undefined memory",
-        libc::SIGSYS => ", SIGSYS: bad system call",
-        libc::SIGTRAP => ", SIGTRAP: trace/breakpoint trap",
-        _ => "",
-    }
-}
-
-#[cfg(not(unix))]
-fn signal_named(_: i32) -> &'static str {
-    ""
 }
 
 #[cfg(not(windows))]

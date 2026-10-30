@@ -3,6 +3,8 @@
 //! Calling back into the same cycle from your cycle recovery function _can_ work out, as long as
 //! the overall cycle still converges.
 
+#![forbid(unsafe_code)]
+
 mod common;
 use common::{DatabaseWithValue, ValueDatabase};
 

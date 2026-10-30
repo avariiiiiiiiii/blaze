@@ -35,10 +35,13 @@ use crate::{
     Level, blaze,
     conf::Conf,
     diag::{self, Code, Diag, Expansion, MacroKind, MultiSpan, Span, Sublevel},
-    famous::Famous,
+    famous::{self, Famous},
     level::{CommandLine, Levels, Lint, Set, Source, Spec, Target},
     lints::{self, Implemented, On},
-    query::{self, Expect, Finding, Found as FoundLint, LintSet, Lints, Place},
+    query::{
+        self, BodyAt, Expect, FileNames, Finding, Found as FoundLint, LintSet, Lints, ModuleFile, Named,
+        Place, Plan,
+    },
 };
 
 /// What a crate's lints are run with.
@@ -75,26 +78,18 @@ pub fn check(db: &Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -> 
 }
 
 /// A file of the crate, as the driver reads it.
-struct File {
+struct File<'q> {
     id: EditionedFileId,
     name: String,
-    /// Where rustc's walks over the crate come to the file: at the `mod` item declaring it,
-    /// in the file that has that, and so on up to the root.
-    nesting: Vec<(u32, u32)>,
     /// The file and range of the `mod` item declaring it.
     declared: Option<(usize, TextRange)>,
+    /// Where rustc's walks come to the `mod` item declaring it, in the file that has that:
+    /// the last of its [`Driver::nesting`], which `declared`'s file's nesting comes before.
+    place: Option<(u32, u32)>,
     /// The lint names its text writes, with the range of what the attribute naming each is on.
-    names: Vec<Named>,
+    names: &'q FileNames,
     /// The lints named around the file's module, in the files declaring it.
     around: On,
-}
-
-/// A lint name written in a file.
-struct Named {
-    at: TextRange,
-    /// What the attribute it is written in is on; the name itself when it is in none.
-    owner: TextRange,
-    lints: On,
 }
 
 /// A lint found, before its level is known.
@@ -128,7 +123,7 @@ struct Driver<'q> {
     without_test: Option<CfgOptions>,
     name_of: NameOf<'q>,
     command_line: On,
-    files: Vec<File>,
+    files: Vec<File<'q>>,
     by_id: FxHashMap<EditionedFileId, usize>,
     sets: FxHashMap<On, LintSet>,
     pending: Vec<Pending>,
@@ -169,28 +164,23 @@ impl<'q> Driver<'q> {
 
     fn run(&mut self) {
         let db = self.db;
-        for module in self.krate.modules(db) {
-            let Some(file) = module.definition_source_file_id(db).file_id() else { continue };
-            if self.by_id.contains_key(&file) {
-                continue;
-            }
+        let base = self.krate.base();
+        let plan = query::lint_plan(db, base);
+        for &ModuleFile { file, declared } in plan.files.iter() {
             let Some(name) = (self.name_of)(file.file_id(db)) else { continue };
-            let mut nesting = Vec::new();
-            let mut declared = None;
-            if let Some(range) = module.declaration_source_range(db) {
-                let range = range.original_node_file_range_rooted(db);
-                if let Some(&parent) = self.by_id.get(&range.file_id) {
-                    nesting.clone_from(&self.files[parent].nesting);
-                    declared = Some((parent, range.range));
-                }
-                nesting.push((u32::from(range.range.start()), u32::MAX - u32::from(range.range.end())));
+            let mut place = None;
+            let mut parent_of = None;
+            if let Some((parent_file, range)) = declared {
+                parent_of = self.by_id.get(&parent_file).map(|&parent| (parent, range));
+                place = Some((u32::from(range.start()), u32::MAX - u32::from(range.end())));
             }
-            let names = names_of(db, file);
-            let around = match declared {
+            let names = query::lint_names(db, file);
+            let around = match parent_of {
                 Some((parent, range)) => {
                     let parent = &self.files[parent];
                     parent.around
                         | parent
+                            .names
                             .names
                             .iter()
                             .filter(|it| it.owner.contains_range(range))
@@ -199,72 +189,54 @@ impl<'q> Driver<'q> {
                 None => 0,
             };
             self.by_id.insert(file, self.files.len());
-            self.files.push(File { id: file, name, nesting, declared, names, around });
+            self.files.push(File { id: file, name, declared: parent_of, place, names, around });
         }
-        let base = self.krate.base();
         for at in 0..self.files.len() {
             let file = &self.files[at];
-            let on = self.command_line
-                | file.around
-                | file.names.iter().fold(0, |on, it| on | it.lints);
+            let id = file.id;
+            let on = self.command_line | file.around | file.names.on;
             if on == 0 {
                 continue;
             }
             let set = self.set(on);
-            let id = file.id;
             let lints = query::item_lints(db, id, base, set);
             self.take(at, 0, lints);
         }
-        let mut bodies = Vec::new();
-        let def_map = crate_def_map(db, base);
-        for (_, module) in def_map.modules(db) {
-            bodies_of(db, module.scope(db), &mut bodies);
-        }
-        let mut next = 0;
-        while let Some(&def) = bodies.get(next) {
-            next += 1;
-            for (_, block) in Body::of(db, def).blocks(db) {
-                for (_, module) in block.modules(db) {
-                    bodies_of(db, module.scope(db), &mut bodies);
-                }
-            }
-            self.lint_body(def);
+        for &body in plan.bodies.iter() {
+            self.lint_body(body);
         }
     }
 
-    fn lint_body(&mut self, def: DefWithBodyId) {
+    fn lint_body(&mut self, BodyAt { def, file, offset, item }: BodyAt) {
         let db = self.db;
-        let (file, offset, item) = match body_syntax(db, def) {
-            Some(syntax) => {
-                let Some(file) = syntax.file_id.file_id() else { return };
-                let Some(offset) = Body::anchor_offset(db, def) else { return };
-                (file, offset, syntax.item.text_range() + offset)
-            }
-            None => {
-                let (file_id, _) = def_ast_id(db, def);
-                let Some(call) = file_id.macro_file() else { return };
-                if matches!(call.loc(db).kind, MacroCallKind::Derive { .. }) {
-                    return;
-                }
-                let Some(outer) = file_id.original_call_node_view(db) else { return };
-                (outer.file_id, TextSize::new(0), outer.value.text_range())
-            }
-        };
         let Some(&at) = self.by_id.get(&file) else { return };
         let named = &self.files[at];
-        let on = self.command_line
-            | named.around
-            | named
+        let mut on = self.command_line | named.around;
+        // A name can only add lints when it names one not on already.
+        if named.names.on & !on != 0 {
+            on |= named
+                .names
                 .names
                 .iter()
                 .filter(|it| it.owner.contains_range(item) || item.contains_range(it.at))
                 .fold(0, |on, it| on | it.lints);
+        }
         if on == 0 {
             return;
         }
         let set = self.set(on);
         let lints = query::body_lints(db, def, set);
         self.take(at, u32::from(offset), lints);
+    }
+
+    /// Where rustc's walks over the crate come to file `at`: at the `mod` item declaring it,
+    /// in the file that has that, and so on up to the root; outermost first, into `out`.
+    fn nesting(&self, at: usize, out: &mut Vec<(u32, u32)>) {
+        let file = &self.files[at];
+        if let Some((parent, _)) = file.declared {
+            self.nesting(parent, out);
+        }
+        out.extend(file.place);
     }
 
     /// The interned set of `on` with the crate's configuration, made once per set.
@@ -298,8 +270,15 @@ impl<'q> Driver<'q> {
             // What clippy gathers to say after the late pass it says in the order of the
             // source map, which has the crate's files in the order rustc read them.
             let key = match phase {
+                // alloc: a finding's order key, once per finding
                 3 => vec![(u32::try_from(at).unwrap_or(u32::MAX), 0), place],
-                _ => file.nesting.iter().copied().chain([place]).collect(),
+                _ => {
+                    // alloc: a finding's order key, once per finding
+                    let mut key = Vec::new();
+                    self.nesting(at, &mut key);
+                    key.push(place);
+                    key
+                }
             };
             self.pending.push(Pending {
                 lint: *lint,
@@ -429,17 +408,78 @@ impl<'q> Driver<'q> {
     }
 }
 
-/// The lint names `file` writes, each with what the attribute it is in is on.
-fn names_of(db: &Db, file: EditionedFileId) -> Vec<Named> {
+/// The lint names `file` writes, each with what the attribute it is in is on:
+/// [`query::lint_names`].
+pub(crate) fn names_of(db: &Db, file: EditionedFileId) -> FileNames {
     let text = db.file_text(file.file_id(db)).text(db);
+    // alloc: the query's value, once per edit of the file
     let mut names = Vec::new();
+    let mut on = 0;
     let mut root = None;
     lints::names_in(text, |at, lints| {
         let root = *root.get_or_insert_with(|| file.parse(db).root());
         let owner = attr_owner(root, at).unwrap_or(at);
         names.push(Named { at, owner, lints });
+        on |= lints;
     });
-    names
+    FileNames { names: names.into_boxed_slice(), on }
+}
+
+/// The files and bodies the driver walks of `krate`: [`query::lint_plan`].
+pub(crate) fn plan_of(db: &Db, krate: base_db::Crate) -> Plan {
+    // alloc: the query's value and its worklist, once per crate and edit
+    let mut files: Vec<ModuleFile> = Vec::new();
+    let mut seen: FxHashSet<EditionedFileId> = FxHashSet::default();
+    for module in hir::Crate::from(krate).modules(db) {
+        let Some(file) = module.definition_source_file_id(db).file_id() else { continue };
+        if !seen.insert(file) {
+            continue;
+        }
+        let declared = module.declaration_source_range(db).map(|range| {
+            let range = range.original_node_file_range_rooted(db);
+            (range.file_id, range.range)
+        });
+        files.push(ModuleFile { file, declared });
+    }
+    // alloc: the bodies' worklist, once per crate and edit
+    let mut defs = Vec::new();
+    let def_map = crate_def_map(db, krate);
+    for (_, module) in def_map.modules(db) {
+        bodies_of(db, module.scope(db), &mut defs);
+    }
+    let mut bodies = Vec::with_capacity(defs.len());
+    let mut next = 0;
+    while let Some(&def) = defs.get(next) {
+        next += 1;
+        for (_, block) in Body::of(db, def).blocks(db) {
+            for (_, module) in block.modules(db) {
+                bodies_of(db, module.scope(db), &mut defs);
+            }
+        }
+        bodies.extend(body_at(db, def));
+    }
+    Plan { files: files.into_boxed_slice(), bodies: bodies.into_boxed_slice() }
+}
+
+/// Where `def`'s body is in the file the driver names it by.
+fn body_at(db: &Db, def: DefWithBodyId) -> Option<BodyAt> {
+    let (file, offset, item) = match body_syntax(db, def) {
+        Some(syntax) => {
+            let file = syntax.file_id.file_id()?;
+            let offset = Body::anchor_offset(db, def)?;
+            (file, offset, syntax.item.text_range() + offset)
+        }
+        None => {
+            let file_id = def.erased_ast_id(db).file_id;
+            let call = file_id.macro_file()?;
+            if matches!(call.loc(db).kind, MacroCallKind::Derive { .. }) {
+                return None;
+            }
+            let outer = file_id.original_call_node_view(db)?;
+            (outer.file_id, TextSize::new(0), outer.value.text_range())
+        }
+    };
+    Some(BodyAt { def, file, offset, item })
 }
 
 /// The range of what the attribute holding `at` is on, if `at` is in one.
@@ -501,16 +541,6 @@ fn bodies_of(db: &Db, scope: &ItemScope, out: &mut Vec<DefWithBodyId>) {
     }
 }
 
-/// The file and id of the node `def` is written as.
-fn def_ast_id(db: &Db, def: DefWithBodyId) -> (HirFileId, span::ErasedFileAstId) {
-    match def {
-        DefWithBodyId::FunctionId(it) => erased(it.lookup(db).id),
-        DefWithBodyId::ConstId(it) => erased(it.lookup(db).id),
-        DefWithBodyId::StaticId(it) => erased(it.lookup(db).id),
-        DefWithBodyId::VariantId(it) => erased(it.lookup(db).id),
-    }
-}
-
 fn erased<N>(id: AstId<N>) -> (HirFileId, span::ErasedFileAstId) {
     (id.file_id, id.value.erase())
 }
@@ -540,7 +570,7 @@ pub(crate) fn lint_body(db: &Db, def: DefWithBodyId, on: On, conf: &Conf) -> Lin
             cx.done()
         }
         None => {
-            let (file_id, ast_id) = def_ast_id(db, def);
+            let InFile { file_id, value: ast_id } = def.erased_ast_id(db);
             let HirFileId::MacroFile(call) = file_id else { return Lints::default() };
             let file = file_id.original_file(db);
             let file_root = file.parse(db).root();
@@ -645,7 +675,7 @@ struct Items {
 type Key = (HirFileId, SyntaxNodePtr);
 
 /// The context a lint is run in: what is linted, the tree walked and where the walk is.
-pub(crate) struct Cx<'q, 't> {
+pub(crate) struct Cx<'q: 't, 't> {
     db: &'q Db,
     krate: base_db::Crate,
     conf: &'q Conf,
@@ -659,6 +689,8 @@ pub(crate) struct Cx<'q, 't> {
     analysis: OnceCell<Option<hir::BodyAnalysis<'q>>>,
     sema: OnceCell<hir::view::Semantics<'q>>,
     items: OnceCell<Items>,
+    /// The crate's [`query::famous_defs`], read once per query.
+    famous_defs: OnceCell<&'q [Option<hir::ModuleDef>]>,
     /// The expansions read, with the call of each.
     trees: RefCell<Vec<(&'q FlatTree, MacroCallId)>>,
     walking: Walking,
@@ -666,7 +698,7 @@ pub(crate) struct Cx<'q, 't> {
     expects: Vec<Expect>,
 }
 
-impl<'q, 't> Cx<'q, 't> {
+impl<'q: 't, 't> Cx<'q, 't> {
     fn new(
         db: &'q Db,
         krate: base_db::Crate,
@@ -689,6 +721,7 @@ impl<'q, 't> Cx<'q, 't> {
             analysis: OnceCell::new(),
             sema: OnceCell::new(),
             items: OnceCell::new(),
+            famous_defs: OnceCell::new(),
             trees: RefCell::new(Vec::new()),
             walking: Walking::default(),
             found: Vec::new(),
@@ -972,19 +1005,19 @@ impl<'q, 't> Cx<'q, 't> {
         }
     }
 
-    /// The item at `path` in the crate `path[0]` (`core`, `alloc`, `std`).
+    /// The item at `path` in the crate `path[0]` (`core`, `alloc`, `std`): one perfect hash of
+    /// the path into what the crate resolved of [`famous::KNOWN`].
     pub(crate) fn std_def(&self, path: &[&str]) -> Option<hir::ModuleDef> {
-        let (krate, rest) = path.split_first()?;
+        let krate = path.first()?;
         if !matches!(*krate, "core" | "alloc" | "std") {
             return None;
         }
-        let mut joined = String::with_capacity(path.iter().map(|it| it.len() + 1).sum());
-        joined.push_str(krate);
-        for segment in rest {
-            joined.push(':');
-            joined.push_str(segment);
-        }
-        self.famous().find(&joined)
+        let Some(at) = famous::known(path) else {
+            // alloc: the message of a bug, a lint looking up a path left out of the table
+            panic!("`{}` is not in `famous::KNOWN`", path.join(":"));
+        };
+        let defs = self.famous_defs.get_or_init(|| &**query::famous_defs(self.db, self.krate));
+        defs[at]
     }
 
     /// The type `trait_`'s associated type `name` is for `ty`.
@@ -1237,7 +1270,13 @@ impl<'q, 't> Cx<'q, 't> {
                 events.skip_subtree();
                 continue;
             }
-            if let Some(owner) = ast::AnyHasAttrs::cast(node) {
+            // One scan of the children for attributes: every item and ADT can have them, so
+            // a node without is neither `cfg`'d out nor expanded by an attribute or derive.
+            let mut has_attrs = false;
+            if let Some(owner) = ast::AnyHasAttrs::cast(node)
+                && owner.attrs().next().is_some()
+            {
+                has_attrs = true;
                 if !self.enabled(owner) {
                     events.skip_subtree();
                     continue;
@@ -1248,7 +1287,8 @@ impl<'q, 't> Cx<'q, 't> {
             }
             // What an attribute macro such as `#[test]` makes of an item is what rustc lints,
             // the code written in it keeping its place.
-            if node != root
+            if has_attrs
+                && node != root
                 && let Some(item) = ast::Item::cast(node)
                 && self.walk_attr_expansion(item)
             {
@@ -1259,7 +1299,7 @@ impl<'q, 't> Cx<'q, 't> {
                 lints::check_node(self, node);
             }
             blaze::check_node(self, node);
-            if let Some(adt) = ast::Adt::cast(node) {
+            if has_attrs && let Some(adt) = ast::Adt::cast(node) {
                 self.walk_derives(adt);
             }
             if let Some(call) = ast::MacroCall::cast(node) {
@@ -1269,14 +1309,11 @@ impl<'q, 't> Cx<'q, 't> {
         }
     }
 
-    /// Walks what an attribute macro on `item` expands it to, if one does; says whether one
-    /// did.
+    /// Walks what an attribute macro on `item`, which has attributes, expands it to, if one
+    /// does; says whether one did.
     fn walk_attr_expansion(&mut self, item: ast::Item<'t>) -> bool {
         const DEEPEST: u32 = 8;
-        if self.walking.depth >= DEEPEST
-            || self.walking.expansion.is_some()
-            || item.attrs().next().is_none()
-        {
+        if self.walking.depth >= DEEPEST || self.walking.expansion.is_some() {
             return false;
         }
         let key = (self.file_of(item.syntax()), ast::ptr(item.syntax()));
@@ -1322,9 +1359,9 @@ impl<'q, 't> Cx<'q, 't> {
         self.walking.input = outer_input;
     }
 
-    /// Walks what the derives of `adt` expand to.
+    /// Walks what the derives of `adt`, which has attributes, expand to.
     fn walk_derives(&mut self, adt: ast::Adt<'t>) {
-        if !lints::in_derives(self) || adt.attrs().next().is_none() {
+        if !lints::in_derives(self) {
             return;
         }
         let key = (self.file_of(adt.syntax()), ast::ptr(adt.syntax()));
@@ -1335,7 +1372,7 @@ impl<'q, 't> Cx<'q, 't> {
             let paths = derive_paths(attr);
             for (call, (range, path)) in calls.iter().zip(paths) {
                 let Some(call) = *call else { continue };
-                let Some(expansion) = self.expansion_of(call, MacroKind::Derive, path, range) else {
+                let Some(expansion) = self.expansion_of(call, MacroKind::Derive, &path, range) else {
                     continue;
                 };
                 walks.push((call, expansion));
@@ -1564,7 +1601,7 @@ impl<'q, 't> Cx<'q, 't> {
             let mut items = Items::default();
             match self.def {
                 Some(def) => {
-                    let (file, id) = def_ast_id(db, def);
+                    let InFile { file_id: file, value: id } = def.erased_ast_id(db);
                     let defined = match def {
                         DefWithBodyId::FunctionId(it) => ModuleDefId::FunctionId(it),
                         DefWithBodyId::ConstId(it) => ModuleDefId::ConstId(it),
@@ -1711,32 +1748,7 @@ fn for_each_meta<'t>(
     attrs: impl Iterator<Item = ast::Attr<'t>>,
     mut f: impl FnMut(ast::Meta<'t>),
 ) {
-    let mut nested: Vec<ast::Meta<'t>> = Vec::new();
-    for attr in attrs {
-        let Some(meta) = attr.meta() else { continue };
-        let mut next = Some(meta);
-        while let Some(mut meta) = next.take().or_else(|| nested.pop()) {
-            while let ast::Meta::UnsafeMeta(it) = meta {
-                match it.meta() {
-                    Some(inner) => meta = inner,
-                    None => break,
-                }
-            }
-            match meta {
-                ast::Meta::UnsafeMeta(_) => {}
-                ast::Meta::CfgAttrMeta(meta) => {
-                    let Some(predicate) = meta.cfg_predicate() else { continue };
-                    if cfg.check(&CfgExpr::parse_from_view(predicate)) != Some(false) {
-                        let at = nested.len();
-                        // alloc: the metas of a `cfg_attr`, only where one is written
-                        nested.extend(meta.metas());
-                        nested[at..].reverse();
-                    }
-                }
-                meta => f(meta),
-            }
-        }
-    }
+    hir_expand::attrs::cfg_attrs_view(attrs, cfg).for_each(|(meta, _)| f(meta));
 }
 
 /// The level a diagnostic of a lint at `level` is written at.
@@ -1837,18 +1849,7 @@ fn derive_paths(attr: ast::Attr<'_>) -> Vec<(TextRange, String)> {
 
 /// Where rustc's span of an item starts: after its attributes, doc comments and the comments
 /// before it.
-pub(crate) fn item_range(node: ast::Node<'_>) -> TextRange {
-    let start = node
-        .children_with_tokens()
-        .find(|it| match it {
-            NodeOrToken::Node(node) => {
-                !matches!(node.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
-            }
-            NodeOrToken::Token(token) => !token.kind().is_trivia(),
-        })
-        .map_or(node.text_range().start(), |it| it.text_range().start());
-    TextRange::new(start, node.text_range().end())
-}
+pub(crate) use syntax::view::written_range as item_range;
 
 /// The path `name` is when written alone, as `SemanticsScope::speculative_resolve` reads a
 /// path of one segment.
@@ -1864,23 +1865,87 @@ fn one_segment_path(name: &str) -> hir::ModPath {
     hir::ModPath::from_segments(kind, segment)
 }
 
-/// The span rustc gives a function's definition: its signature, without its body.
-fn signature_range(item: ast::Fn<'_>) -> TextRange {
-    let range = item_range(item.syntax());
-    let end: TextSize = match item.body() {
-        Some(body) => {
-            let mut end = body.syntax().text_range().start();
-            let mut at = body.syntax().prev_sibling_or_token();
-            while let Some(it) = at {
-                if !it.kind().is_trivia() {
-                    end = it.text_range().end();
-                    break;
-                }
-                at = it.prev_sibling_or_token();
-            }
-            end
-        }
-        None => range.end(),
+use syntax::view::signature_range;
+
+#[cfg(test)]
+mod for_each_meta_tests {
+    use cfg::{CfgExpr, CfgOptions};
+    use intern::Symbol;
+    use span::Edition;
+    use syntax::{
+        SourceFile,
+        view::{self as ast, AstNode as _, HasAttrs as _},
     };
-    TextRange::new(range.start(), end.max(range.start()))
+
+    /// `for_each_meta` before it called `hir_expand::attrs::cfg_attrs_view`.
+    fn reference<'t>(
+        cfg: &CfgOptions,
+        attrs: impl Iterator<Item = ast::Attr<'t>>,
+        mut f: impl FnMut(ast::Meta<'t>),
+    ) {
+        let mut nested: Vec<ast::Meta<'t>> = Vec::new();
+        for attr in attrs {
+            let Some(meta) = attr.meta() else { continue };
+            let mut next = Some(meta);
+            while let Some(mut meta) = next.take().or_else(|| nested.pop()) {
+                while let ast::Meta::UnsafeMeta(it) = meta {
+                    match it.meta() {
+                        Some(inner) => meta = inner,
+                        None => break,
+                    }
+                }
+                match meta {
+                    ast::Meta::UnsafeMeta(_) => {}
+                    ast::Meta::CfgAttrMeta(meta) => {
+                        let Some(predicate) = meta.cfg_predicate() else { continue };
+                        if cfg.check(&CfgExpr::parse_from_view(predicate)) != Some(false) {
+                            let at = nested.len();
+                            nested.extend(meta.metas());
+                            nested[at..].reverse();
+                        }
+                    }
+                    meta => f(meta),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_metas_are_the_ones_cfg_attrs_view_leaves() {
+        let text = r#"
+#[cfg_attr(a, inline, cfg_attr(b, cold), must_use)]
+#[cfg_attr(not(a), deprecated)]
+#[unsafe(no_mangle)]
+#[cfg(test)]
+#[cfg_attr(a, unsafe(export_name = "x"), cfg_attr(not(b), doc = "y"))]
+#[cfg_attr()]
+fn f() {}
+#[cfg_attr(b, allow(dead_code))]
+mod m { #![cfg_attr(a, cfg(test))] }
+"#;
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        let mut cfg = CfgOptions::default();
+        cfg.insert_atom(Symbol::intern("a"));
+        let mut owners = 0;
+        for owner in parse.root().descendants().filter_map(ast::AnyHasAttrs::cast) {
+            for attrs in [true, false] {
+                let (mut old, mut new) = (Vec::new(), Vec::new());
+                if attrs {
+                    reference(&cfg, owner.attrs(), |it| old.push(it.syntax().text_range()));
+                    super::for_each_meta(&cfg, owner.attrs(), |it| new.push(it.syntax().text_range()));
+                } else {
+                    let inner = || ast::attrs_including_inner(&owner);
+                    reference(&cfg, inner(), |it| old.push(it.syntax().text_range()));
+                    super::for_each_meta(&cfg, inner(), |it| new.push(it.syntax().text_range()));
+                }
+                assert_eq!(old, new, "{owner:?}");
+            }
+            owners += 1;
+        }
+        assert!(owners >= 2);
+        let f = parse.root().descendants().find_map(ast::Fn::cast).unwrap();
+        let mut names = Vec::new();
+        super::for_each_meta(&cfg, f.attrs(), |it| names.push(it.syntax().to_string()));
+        assert_eq!(names[..3], ["inline", "must_use", "no_mangle"]);
+    }
 }

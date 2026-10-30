@@ -18,15 +18,15 @@ use crate::{
 };
 
 /// One fixture of a test file: where it is, and its text.
-pub(super) struct Fixture {
-    pub(super) name: String,
-    pub(super) text: &'static str,
+pub(in crate::nameres) struct Fixture {
+    pub(in crate::nameres) name: String,
+    pub(in crate::nameres) text: &'static str,
 }
 
 /// The raw string literals of `source`, each named `file::item#k` by the `fn`, `const` or
 /// `static` it is in. Comments, plain strings, char literals and `expect![...]` arguments are
 /// skipped, so a fixture that holds `#[test]` or a quote is read whole.
-pub(super) fn fixtures(file: &str, source: &'static str) -> Vec<Fixture> {
+pub(in crate::nameres) fn fixtures(file: &str, source: &'static str) -> Vec<Fixture> {
     let b = source.as_bytes();
     let ident = |at: usize| b[at].is_ascii_alphanumeric() || b[at] == b'_';
     let mut out = Vec::new();
@@ -139,7 +139,7 @@ macro_rules! sources {
 }
 
 /// The test files whose fixtures are compared, relative to `nameres/`.
-const NAMERES: &[(&str, &str)] = sources![
+pub(in crate::nameres) const NAMERES: &[(&str, &str)] = sources![
     "tests.rs",
     "tests/backdate.rs",
     "tests/batch_order.rs",
@@ -156,7 +156,7 @@ const NAMERES: &[(&str, &str)] = sources![
     "tests/worklist.rs",
 ];
 
-const MACRO_EXPANSION: &[(&str, &str)] = sources![
+pub(in crate::nameres) const MACRO_EXPANSION: &[(&str, &str)] = sources![
     "../macro_expansion_tests/mod.rs",
     "../macro_expansion_tests/builtin_derive_macro.rs",
     "../macro_expansion_tests/builtin_fn_macro.rs",
@@ -239,20 +239,21 @@ fn the_reader_finds_fixtures_and_skips_expectations() {
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures of the notes' §8: where the old collector's answer followed its schedule, on
-// programs rustc rejects. Compared on everything but what `exempt` names.
+// programs rustc rejects or (the third) resolves as the new resolver does. Compared on
+// everything but what `exempt` names.
 
-pub(super) struct OrderDependent {
+pub(in crate::nameres) struct OrderDependent {
     /// Our own name, or the name [`fixtures`] gives one of the test files' fixtures.
-    pub(super) name: &'static str,
+    pub(in crate::nameres) name: &'static str,
     /// What rustc (the pinned nightly) says of the program.
-    pub(super) rustc: &'static str,
+    pub(in crate::nameres) rustc: &'static str,
     /// The text; empty for a fixture of the test files, which is read from there.
-    pub(super) fixture: &'static str,
-    pub(super) exempt: Exempt,
+    pub(in crate::nameres) fixture: &'static str,
+    pub(in crate::nameres) exempt: Exempt,
 }
 
 impl OrderDependent {
-    fn text(&self) -> &'static str {
+    pub(in crate::nameres) fn text(&self) -> &'static str {
         if !self.fixture.is_empty() {
             return self.fixture;
         }
@@ -266,7 +267,7 @@ impl OrderDependent {
     }
 }
 
-pub(super) const ORDER_DEPENDENT: &[OrderDependent] = &[
+pub(in crate::nameres) const ORDER_DEPENDENT: &[OrderDependent] = &[
     OrderDependent {
         name: "two_globs_bring_one_name",
         rustc: "error[E0659]: `S` is ambiguous (glob import vs glob import in the same namespace)",
@@ -293,8 +294,10 @@ use p::T;
     },
     OrderDependent {
         name: "import_resolved_before_an_expansion_shadows_its_glob",
-        rustc: "error[E0659]: `T` is ambiguous (macro-expanded name vs less macro-expanded name \
-                from import or glob)",
+        // The old collector binds `x`'s `T`, resolving the import before `foo` expands; the
+        // new resolver waits, as rustc does (`Unit::set_unexpanded`).
+        rustc: "accepted: `use foo::T` binds the `T` that `make_t!` expands in `foo`; the glob \
+                binding is undetermined while `foo` has unexpanded macros",
         fixture: r#"
 //- /lib.rs crate:main deps:m
 mod x { pub struct T; }

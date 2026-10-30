@@ -19,7 +19,7 @@ fn site() -> Span {
 
 fn lex_in(text: &str, edition: Edition) -> (Result<Stream, String>, Vec<String>) {
     let mut emitted = Vec::new();
-    let stream = stream(text, site(), edition, &mut emitted);
+    let stream = stream(text, site(), edition, false, &mut emitted);
     (stream, emitted)
 }
 
@@ -93,6 +93,11 @@ fn raw_and_forced_keyword_idents() {
     let (forced, emitted) = lex_in("k#fn", Edition::Edition2021);
     assert_eq!(shape(forced.unwrap().trees()), ["k#fnA"]);
     assert_eq!(emitted, ["forced keywords are experimental"]);
+    // A crate that enables the feature gets no error.
+    let mut emitted = Vec::new();
+    let enabled = stream("k#fn", site(), Edition::Edition2021, true, &mut emitted);
+    assert_eq!(shape(enabled.unwrap().trees()), ["k#fnA"]);
+    assert!(emitted.is_empty());
     // Before 2021 it is `k`, `#`, `fn`.
     let (before, emitted) = lex_in("k#fn", Edition::Edition2018);
     assert!(emitted.is_empty());
@@ -157,7 +162,7 @@ fn every_token_is_at_the_call_site() {
 fn an_operator_as_long_as_the_call_site_gets_a_byte_of_it_per_character() {
     let call_site = Span { range: TextRange::new(20.into(), 22.into()), ..site() };
     let mut emitted = Vec::new();
-    let path = stream("a::b", call_site, Edition::Edition2021, &mut emitted).unwrap();
+    let path = stream("a::b", call_site, Edition::Edition2021, false, &mut emitted).unwrap();
     let spans: Vec<TextRange> = path
         .trees()
         .iter()
@@ -176,7 +181,7 @@ fn an_operator_as_long_as_the_call_site_gets_a_byte_of_it_per_character() {
         ]
     );
     // An operator of another length keeps the whole span.
-    let range = stream("..=", call_site, Edition::Edition2021, &mut emitted).unwrap();
+    let range = stream("..=", call_site, Edition::Edition2021, false, &mut emitted).unwrap();
     assert!(range.trees().iter().all(|tree| matches!(tree, Tree::Punct { span, .. } if span.range == call_site.range)));
 }
 
@@ -287,13 +292,13 @@ fn other_errors_are_emitted_and_the_stream_is_given() {
 #[test]
 fn emitted_keeps_what_was_there() {
     let mut emitted = vec!["earlier".to_owned()];
-    let _ = stream("'ab'", site(), Edition::Edition2021, &mut emitted);
+    let _ = stream("'ab'", site(), Edition::Edition2021, false, &mut emitted);
     assert_eq!(emitted, ["earlier", "character literal may only contain one codepoint"]);
 }
 
 fn literal_of(text: &str) -> Result<(LitKind, String, Option<String>), String> {
     let mut emitted = Vec::new();
-    let tree = literal(text, site(), Edition::Edition2021, &mut emitted)?;
+    let tree = literal(text, site(), Edition::Edition2021, false, &mut emitted)?;
     let Tree::Literal { kind, symbol, suffix, span, spacing } = tree else {
         panic!("not a literal: {tree:?}");
     };

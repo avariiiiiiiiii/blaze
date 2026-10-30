@@ -16,7 +16,7 @@ use base_db::Db;
 use blaze_ids::bits::BitSet;
 use either::Either;
 use hir::InFile;
-use hir_def::{CallableDefId, DefWithBodyId, FunctionId, GenericDefId, ItemContainerId, Lookup, generics::GenericParams};
+use hir_def::{CallableDefId, DefWithBodyId, FunctionId, GenericDefId, ItemContainerId, Lookup, hir::generics::GenericParams};
 use hir_ty::{
     ParamEnvAndCrate,
     db::HirDatabase,
@@ -43,7 +43,7 @@ use crate::{
 pub(super) const LINTS: super::LintSet = super::lint_set(["unconditional_recursion"]);
 
 /// `CheckCallRecursion`: the calls of the function to itself, in `mir_promoted`.
-pub(super) fn calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
+pub(super) fn calls(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
     // alloc: empty, allocates nothing
     let Some(func) = function(b) else { return Vec::new() };
     // alloc: empty, allocates nothing
@@ -61,7 +61,7 @@ pub(super) fn calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
 
 /// `CheckDropRecursion`: the drops of a value of the type a `Drop` impl's `drop` drops, after
 /// drop elaboration.
-pub(super) fn drops(b: &BodyCx<'_, '_>) -> Vec<Found> {
+pub(super) fn drops(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
     if !b.elaborated {
         // alloc: empty, allocates nothing
         return Vec::new();
@@ -90,7 +90,7 @@ fn has_terminator(mir: &MirBody<'_>, kind: impl Fn(&TerminatorKind) -> bool) -> 
 
 /// A function or method whose body type and match checked: rustc builds an error MIR of one
 /// that did not.
-fn function(b: &BodyCx<'_, '_>) -> Option<FunctionId> {
+fn function(b: &BodyCx<'_, '_, '_>) -> Option<FunctionId> {
     match b.owner {
         DefWithBodyId::FunctionId(it) if !b.mir_tainted() => Some(it),
         _ => None,
@@ -99,7 +99,7 @@ fn function(b: &BodyCx<'_, '_>) -> Option<FunctionId> {
 
 /// `check_recursion`: when no way through the body returns, the lint at the function's
 /// signature with the recursive call sites, in order.
-fn lint(b: &BodyCx<'_, '_>, calls: Option<Vec<MirSpan>>) -> Vec<Found> {
+fn lint(b: &BodyCx<'_, '_, '_>, calls: Option<Vec<MirSpan>>) -> Vec<Found> {
     // alloc: empty, allocates nothing
     let Some(calls) = calls.filter(|it| !it.is_empty()) else { return Vec::new() };
     // alloc: the lint's spans, for a lint found
@@ -199,7 +199,7 @@ struct Types<'db> {
 }
 
 impl<'db> Types<'db> {
-    fn new(b: &BodyCx<'_, 'db>, func: FunctionId) -> Types<'db> {
+    fn new(b: &BodyCx<'_, '_, 'db>, func: FunctionId) -> Types<'db> {
         let db = b.db();
         let krate = b.cx.krate.base();
         let interner = DbInterner::new_with(db, krate);
@@ -242,7 +242,7 @@ impl<'db> Types<'db> {
         let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(callee)), call_args) = ty.kind() else {
             return false;
         };
-        let (Either::Left(callee), call_args) = self.db.lookup_impl_method(self.env, callee, call_args) else {
+        let (Either::Left(callee), call_args) = self.db.lookup_impl_method(self.env, callee, call_args.skip_binder()) else {
             return false;
         };
         callee == self.func
@@ -264,7 +264,8 @@ impl<'db> Types<'db> {
         }
         let sig = self.db.callable_item_signature(CallableDefId::FunctionId(self.func));
         let sig = sig.instantiate_identity().skip_binder();
-        let [input] = sig.inputs().as_slice() else { return None };
+        let inputs = sig.inputs();
+        let [input] = inputs.as_slice() else { return None };
         let TyKind::Ref(_, dropped, _) = input.kind() else { return None };
         (!dropped.has_free_regions()).then_some(dropped)
     }

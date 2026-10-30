@@ -481,18 +481,7 @@ pub fn derive_path_tokens_view<'t>(attr: view::Attr<'t>, mut each: impl FnMut(Te
 
 /// Where rustc's span of an item starts: after its attributes, doc comments and the comments
 /// before it.
-pub fn item_range_view(node: view::Node<'_>) -> TextRange {
-    let start = node
-        .children_with_tokens()
-        .find(|it| match it {
-            NodeOrToken::Node(node) => {
-                !matches!(node.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
-            }
-            NodeOrToken::Token(token) => !token.kind().is_trivia(),
-        })
-        .map_or(node.text_range().start(), |it| it.text_range().start());
-    TextRange::new(start, node.text_range().end())
-}
+pub use syntax::view::written_range as item_range_view;
 
 /// rustc's `def_span` of a closure (`fn_decl_span`): from after its attributes to the end of
 /// its return type, else of its parameters; [`item_range_view`] of a node that is not a closure.
@@ -507,25 +496,7 @@ pub fn closure_decl_range_view(node: view::Node<'_>) -> TextRange {
 }
 
 /// The span rustc gives a function's definition (`def_span`): its signature, without its body.
-pub fn signature_range_view(item: view::Fn<'_>) -> TextRange {
-    let range = item_range_view(item.syntax());
-    let end: TextSize = match item.body() {
-        Some(body) => {
-            let mut end = body.syntax().text_range().start();
-            let mut at = body.syntax().prev_sibling_or_token();
-            while let Some(it) = at {
-                if !it.kind().is_trivia() {
-                    end = it.text_range().end();
-                    break;
-                }
-                at = it.prev_sibling_or_token();
-            }
-            end
-        }
-        None => range.end(),
-    };
-    TextRange::new(range.start(), end.max(range.start()))
-}
+pub use syntax::view::signature_range as signature_range_view;
 
 /// The span rustc gives an item's definition (`def_span`): a function's signature; of a type,
 /// a trait or an impl, from its first keyword to the end of its header, before `{` or `;`;

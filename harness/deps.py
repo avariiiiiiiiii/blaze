@@ -12,7 +12,7 @@ import os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from difftest import RUNNER, TARGET, profile_dir
+from mixed import RUNNER, TARGET, profile_dir
 BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(HERE, "..", "target", "release", "blaze-engine")
 LOCAL = ["app", "near"]
 

@@ -12,7 +12,6 @@
 //! rustc's does; the `Err` is what the client sees.
 
 mod cook;
-mod unescape;
 mod unicode;
 
 use std::borrow::Cow;
@@ -47,22 +46,25 @@ impl Emitted {
     }
 
     /// Gives the errors back, with what rustc reports after expansion: the buffered lints at
-    /// their default level and the feature gate of each forced keyword.
-    fn finish(self, emitted: &mut Vec<String>) {
+    /// their default level and, unless the calling crate enables `forced_keywords`
+    /// (`enabled`), the feature gate of each forced keyword.
+    fn finish(self, enabled: bool, emitted: &mut Vec<String>) {
         *emitted = self.errors;
         emitted.extend(self.lints.into_iter().map(|(_, message)| message));
-        for _ in 0..self.forced_keywords {
+        let gated = if enabled { 0 } else { self.forced_keywords };
+        for _ in 0..gated {
             emitted.push("forced keywords are experimental".to_owned()); // alloc: error path
         }
     }
 }
 
-/// `ts_from_str`: `text` as a stream, every token at `span`, lexed in `edition`. Errors rustc
-/// emits go to `emitted`.
+/// `ts_from_str`: `text` as a stream, every token at `span`, lexed in `edition`, for a crate
+/// that enables `forced_keywords` or not. Errors rustc emits go to `emitted`.
 pub(crate) fn stream(
     text: &str,
     span: Span,
     edition: Edition,
+    forced_keywords: bool,
     emitted: &mut Vec<String>,
 ) -> Result<Stream, String> {
     let source = normalize(text);
@@ -72,7 +74,7 @@ pub(crate) fn stream(
     }
     let mut out = Emitted::taking(emitted);
     let (read, _) = Reader::new(src, span, edition, &mut out).read();
-    out.finish(emitted);
+    out.finish(forced_keywords, emitted);
     match read {
         Ok(trees) => Ok(Stream::of(trees)),
         Err(Stop::Fatal) => Err("failed to parse to tokenstream".to_owned()), // alloc: error path
@@ -86,12 +88,13 @@ pub(crate) fn literal(
     text: &str,
     span: Span,
     edition: Edition,
+    forced_keywords: bool,
     emitted: &mut Vec<String>,
 ) -> Result<Tree, String> {
     let source = normalize(text);
     let mut out = Emitted::taking(emitted);
     let (read, firsts) = Reader::new(&source, span, edition, &mut out).read();
-    out.finish(emitted);
+    out.finish(forced_keywords, emitted);
     match read {
         Ok(_) => {}
         Err(Stop::Fatal) => return Err("failed to parse to literal".to_owned()), // alloc: error path
@@ -211,7 +214,7 @@ fn close_text(delimiter: Delimiter) -> &'static str {
         Delimiter::Parenthesis => ")",
         Delimiter::Brace => "}",
         Delimiter::Bracket => "]",
-        Delimiter::None => "",
+        Delimiter::Invisible => "",
     }
 }
 

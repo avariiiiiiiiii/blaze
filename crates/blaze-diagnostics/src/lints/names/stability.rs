@@ -35,12 +35,13 @@ mod walk;
 
 use blaze_items::Fact;
 use hir::{InFile, ModuleDef};
+use hir_def::attrs::stability::{
+    DeprecatedSince, Deprecation, RustcVersion, Stability, StabilityLevel, UnstableReason,
+};
+use intern::Symbol;
 use syntax::{SyntaxNodePtr, TextRange};
 
-use self::{
-    attr::{Deprecation, Since, Stability},
-    def::Def,
-};
+use self::def::Def;
 use crate::{
     cx::Cx,
     lints::{registry::LintId, syntax::source_fact},
@@ -67,10 +68,14 @@ fn deprecated(
     cx: &Cx<'_, '_>,
     def: Def,
     depr: &Deprecation,
+    current: Option<RustcVersion>,
     site: Site,
     suggestion: Option<InFile<TextRange>>,
 ) -> Option<Found> {
-    let lint = match depr.is_in_effect() {
+    let Some(in_effect) = in_effect(depr, current) else {
+        return Some(Found::new(unknown_current(cx, site.span), site.phase));
+    };
+    let lint = match in_effect {
         true => LintId::named("deprecated"),
         false => LintId::named("deprecated_in_future"),
     };
@@ -79,27 +84,61 @@ fn deprecated(
     }
     let kind = def.descr(cx.db);
     let path = def::path(cx, def)?;
-    let mut diag = deprecation_diag(cx, depr, kind, &path, site.span, suggestion);
+    let mut diag = deprecation_diag(cx, depr, in_effect, kind, &path, site.span, suggestion);
     // alloc: the fact of a deprecation that fires
     diag.fact_opt(definition_fact(cx, def), format!("the attributes of `{path}`"));
     source_fact(cx, &mut diag, site.at);
     Some(Found::lint(diag, site.phase, site.at))
 }
 
+/// `Deprecation::is_in_effect` with this crate's `RustcVersion::CURRENT`: none when `since`
+/// is a version and there is no current one to compare it with (any other `since` doesn't
+/// read it).
+pub(super) fn in_effect(depr: &Deprecation, current: Option<RustcVersion>) -> Option<bool> {
+    match (&depr.since, current) {
+        (DeprecatedSince::RustcVersion(_), None) => None,
+        (_, current) => Some(depr.is_in_effect(current.unwrap_or(RustcVersion { major: 0, minor: 0, patch: 0 }))),
+    }
+}
+
+/// The error of a deprecation whose `since` is a version, at `span`, in a crate graph that
+/// names no toolchain: whether it is `deprecated` or `deprecated_in_future` depends on the
+/// version of rustc, which there is none of.
+pub(super) fn unknown_current(cx: &Cx<'_, '_>, span: InFile<TextRange>) -> Diag {
+    Diag::error(
+        None,
+        "blaze can't tell whether this deprecation is in effect: its `since` is a version and the crate graph names no toolchain to compare it with",
+        cx.span(span),
+    )
+}
+
 /// `deprecated` of the parent segment `def` of a path to an item allowed through unstable
 /// modules, with the item's message (`Checker::visit_path`).
-fn deprecated_through(cx: &Cx<'_, '_>, def: Def, message: &str, site: Site) -> Option<Found> {
+fn deprecated_through(
+    cx: &Cx<'_, '_>,
+    def: Def,
+    message: &Symbol,
+    current: Option<RustcVersion>,
+    site: Site,
+) -> Option<Found> {
     if !cx.lint_may_fire(LintId::named("deprecated")) {
         return None;
     }
-    // alloc: the note of a deprecation that may fire, past the level test
-    let depr = Deprecation { since: Since::Unspecified, note: Some(message.to_owned()), suggestion: None };
-    deprecated(cx, def, &depr, site, None)
+    // clone: a refcount, on a deprecation that may fire, past the level test
+    let depr = Deprecation { since: DeprecatedSince::Unspecified, note: Some(message.clone()), suggestion: None };
+    deprecated(cx, def, &depr, current, site, None)
 }
 
 /// The macro deprecation of `early_report_macro_deprecation`: kind `macro`, the path as written.
-fn deprecated_macro(cx: &Cx<'_, '_>, mac: hir::Macro, depr: &Deprecation, path: &str, site: Site) -> Found {
-    let mut diag = deprecation_diag(cx, depr, "macro", path, site.span, Some(site.span));
+fn deprecated_macro(
+    cx: &Cx<'_, '_>,
+    mac: hir::Macro,
+    depr: &Deprecation,
+    in_effect: bool,
+    path: &str,
+    site: Site,
+) -> Found {
+    let mut diag = deprecation_diag(cx, depr, in_effect, "macro", path, site.span, Some(site.span));
     // alloc: the fact of a macro deprecation that fires
     diag.fact_opt(definition_fact(cx, Def::Item(ModuleDef::Macro(mac))), format!("the attributes of `{path}`"));
     source_fact(cx, &mut diag, site.at);
@@ -158,20 +197,24 @@ fn definition_fact(cx: &Cx<'_, '_>, def: Def) -> Option<Fact> {
 fn deprecation_diag(
     cx: &Cx<'_, '_>,
     depr: &Deprecation,
+    in_effect: bool,
     kind: &str,
     path: &str,
     span: InFile<TextRange>,
     suggestion: Option<InFile<TextRange>>,
 ) -> Diag {
     // alloc: the message of a deprecation that fires
-    let note = depr.note.as_ref().map(|it| format!(": {it}")).unwrap_or_default();
-    let (lint, message) = match (&depr.since, depr.is_in_effect()) {
+    let note = depr.note.as_ref().map(|it| format!(": {}", it.as_str())).unwrap_or_default();
+    let (lint, message) = match (&depr.since, in_effect) {
         // alloc: the message of a deprecation that fires
         (_, true) => ("deprecated", format!("use of deprecated {kind} `{path}`{note}")),
-        (Since::RustcVersion(version), false) => (
+        (DeprecatedSince::RustcVersion(v), false) => (
             "deprecated_in_future",
             // alloc: the message of a deprecation that fires
-            format!("use of {kind} `{path}` that will be deprecated in future version {version}{note}"),
+            format!(
+                "use of {kind} `{path}` that will be deprecated in future version {}.{}.{}{note}",
+                v.major, v.minor, v.patch
+            ),
         ),
         (_, false) => (
             "deprecated_in_future",
@@ -187,8 +230,8 @@ fn deprecation_diag(
             cx.span(at),
             // alloc: the suggestion of a deprecation that fires
             format!("replace the use of the deprecated {kind}"),
-            // clone: the replacement text the firing diagnostic's suggestion owns; the index keeps its own
-            replacement.clone(),
+            // alloc: the replacement text the firing diagnostic's suggestion owns
+            replacement.as_str().to_owned(),
             Applicability::MachineApplicable,
         );
     }
@@ -198,13 +241,17 @@ fn deprecation_diag(
 /// `report_unstable` through `feature_err_issue`: E0658 of a use of an unstable library
 /// feature, on a nightly compiler.
 fn unstable_diag(cx: &Cx<'_, '_>, stability: &Stability, span: InFile<TextRange>) -> Option<Diag> {
-    let Stability::Unstable { feature, reason, issue, .. } = stability else { return None };
-    let feature = feature.as_str();
+    let StabilityLevel::Unstable { reason, issue, .. } = &stability.level else { return None };
+    let feature = stability.feature.as_str();
     let message = match reason {
         // alloc: the message of an E0658 that fires
-        Some(reason) => format!("use of unstable library feature `{feature}`: {reason}"),
+        UnstableReason::Some(reason) => format!("use of unstable library feature `{feature}`: {}", reason.as_str()),
+        UnstableReason::Default => {
+            // alloc: the message of an E0658 that fires
+            format!("use of unstable library feature `{feature}`: {UNSTABLE_LOCATION_REASON_DEFAULT}")
+        }
         // alloc: the message of an E0658 that fires
-        None => format!("use of unstable library feature `{feature}`"),
+        UnstableReason::None => format!("use of unstable library feature `{feature}`"),
     };
     let mut diag = Diag::error(Some("E0658"), message, cx.span(span));
     if let Some(issue) = issue {
@@ -217,3 +264,7 @@ fn unstable_diag(cx: &Cx<'_, '_>, stability: &Stability, span: InFile<TextRange>
     diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
     Some(diag)
 }
+
+/// rustc's `sym::unstable_location_reason_default`: the reason of `UnstableReason::Default`, the
+/// stability `-Zforce-unstable-if-unmarked` gives.
+const UNSTABLE_LOCATION_REASON_DEFAULT: &str = "this crate is being loaded from the sysroot, an unstable location; did you mean to load this crate from crates.io via `Cargo.toml` instead?";

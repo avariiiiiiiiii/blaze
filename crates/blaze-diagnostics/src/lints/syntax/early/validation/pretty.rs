@@ -309,6 +309,14 @@ impl Printer<'_> {
                 }
             }
             ast::Type::MacroType(it) => self.source(it.syntax()),
+            ast::Type::UnsafeBinderType(it) => {
+                self.word("unsafe");
+                if let Some(list) = it.generic_param_list() {
+                    self.generic_params(list.generic_params());
+                }
+                self.word(" ");
+                self.opt_ty(it.ty());
+            }
         }
     }
 

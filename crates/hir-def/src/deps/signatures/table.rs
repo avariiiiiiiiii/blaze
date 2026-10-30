@@ -263,7 +263,7 @@ fn set_wide(bytes: &mut [u8], at: usize, value: u64) {
 
 /// Moves each id of the store buffer `bytes`, which this process wrote, to its index in
 /// `table`, adding those it lacks.
-pub(super) fn relocate_store(bytes: &mut [u8], table: &mut Relocation) {
+pub(crate) fn relocate_store(bytes: &mut [u8], table: &mut Relocation) {
     let sites = sites(&Aligned::copy_from(bytes)).expect("a store buffer just written reads");
     for at in sites.scopes {
         let index = table.index(Kind::Block, wide(bytes, at));

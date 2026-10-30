@@ -1,39 +1,36 @@
 ---
 status: current
-summary: The harnesses that compare blaze with rustc, what each checks, and how CI runs them.
+summary: The harnesses that test blaze (real crates' own tests, and blaze held to itself), what each checks, and how CI runs them.
 ---
 # The harnesses
 
-blaze is tested by comparison with rustc. Almost every script under `harness/` builds
-something with cargo and rustc, builds it again with blaze's code in place of rustc's for
-some crates, runs both, and compares standard output, standard error and exit status. A
-difference is a failure. So is a function blaze refused, in the harnesses that count them.
+blaze is held to real crates' own test suites and to itself, not to rustc. A crate's tests
+pass under blaze or they don't: `cratetest.py`, `libsuite.py`, the crate sweeps and
+`downstream.yaml` judge each test by its own verdict. The other harnesses check what blaze
+promises of itself: a warm daemon's build after an edit gives what blaze's own build of the same
+source from nothing gives (`mixed.from_scratch`, `blaze_cli.Scratch`), the store never hands a
+build something stale, two builds are the same byte for byte, the sandbox holds, and each check
+states the result it expects. No harness compares blaze's output with rustc's or cargo's: that
+was dropped on 2026-10-30 ("we use other ppl['s] test[s] [of] the other crates ... it
+over-constrains us", Andrew), so how a rule of rustc's is proven ported is a crate whose own
+tests exercise it, or a unit test ([AGENTS.md](../AGENTS.md), best-long-term-design). Benches
+may still time cargo as their baseline, and cargo with the pinned nightly still builds what the
+mixed model leaves to rustc (`harness/mixed.py`: the link line, and the crates blaze does not
+compile yet), which is build infrastructure, not an expected output.
 
 There are also Rust unit tests in `crates/blaze-engine` and in the code generator; the harnesses
 are what carries the weight.
 
-`checktargets.py` compares plain and explicit-test checks with cargo, using workspace and
-registry dev-dependencies (#634, #632). Errors in unselected tests, examples and benches must
-not fail a plain check; errors in libraries and binaries must, and an all-targets check must
-report the dev targets' errors. Each target flag must pick what cargo's does: `--tests` no
-example or bench, `--test NAME` the one test, `--lib` no unit tests, and a member only
-depended on its library alone.
+`nativespans.py`: A native proc macro asks for a span's source text, line, column, byte range and file; edits and a daemon restart must print what blaze's build of the same source from nothing prints, under native and wasm expansion (#823).
 
-`nativespans.py`: A native proc macro asks for a span's source text, line, column, byte range and file; edits and a daemon restart must agree with Cargo, under native and wasm expansion (#823).
-
-`gitindex.py`: A local git-index registry fetches two packages with Cargo-equal paths, source trees, archives and index cache bytes; each tool then reads the other's cache offline (#316).
-
-`deriveerrors.py`: Unused invalid built-in derives fail check and build as Cargo's do; a valid edit and a daemon restart preserve the verdict (#751).
+`deriveerrors.py`: Unused invalid built-in derives fail check and build with the error each case names; a valid edit and a daemon restart preserve the verdict (#751).
 
 ## Running them
 
 You need Python 3, the pinned nightly (`harness/toolchain`) with `rust-src`, a C compiler
-and linker, and a release build of blaze. `rust-src` is for rustc's side alone: a program
-rustc builds names a file of std it inlines (a panic's location) where `rust-src` installed
-it, as blaze names its own `library/`'s; blaze reads no toolchain's `rust-src`. Some harnesses need
-more: `debuginfo.py` needs gdb and `llvm-dwarfdump`,
-`buildmodel.py` needs the `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl`
-targets with their cross tools and qemu, `remote.py` needs a MinIO or SeaweedFS binary,
+and linker, and a release build of blaze. blaze reads no toolchain's `rust-src`; an editor's
+rust-analyzer does. Some harnesses need
+more: `debuginfo.py` needs gdb and `llvm-dwarfdump`, `remote.py` needs a MinIO or SeaweedFS binary,
 `storefull.py` needs passwordless `sudo` to mount a tmpfs.
 
     cargo +"$(cat harness/toolchain)" build -p blaze-engine --release
@@ -65,7 +62,7 @@ which hosts and under which backend.
 and each harness in the Python that runs it. A harness moved to one typed input (AGENTS.md,
 scripts-take-typed-input) reads it with the workspace's `typed_input`, so it runs the same way
 by hand: `uv run --frozen python harness/keys.py '{"cases": ["a feature"]}'`.
-`includes.py`, `keys.py`, `fuzz/edits.py`, `fnincr.py`, `check_json.py` and `ci.py` itself take their JSON so far; the
+`includes.py`, `keys.py`, `fuzz/edits.py`, `fnincr.py` and `ci.py` itself take their JSON so far; the
 fields are in each script's docstring.
 
 The flake's `scripts` shell supplies uv, Python 3.13 and Node for pyright, all from `flake.lock`:
@@ -75,16 +72,12 @@ select Nix's interpreter explicitly and disable Python downloads; uv's standalon
 does not use Nix's dynamic loader. CI installs uv 0.13.5 on every harness runner, Windows
 included, and `uv run --frozen --no-dev` installs the workspace helper without the lint tools.
 
-For diagnostics, `uv run --frozen python harness/check_json.py '{"cases": ["two_codes"], "keep": true}'`
-selects cases and keeps their scratch directory. An empty `cases` runs all cases; `blaze_bin`
-names the blaze-engine executable, defaulting to `target/release/blaze-engine`.
-
 The fast tier is the harnesses marked fast in `HARNESSES` that `FAST` (in `ci.py`) gives to
 this host: each line there has the harness's measured seconds on CI (the slowest median of
 2026-10-25 and 26) and the hosts it runs on. A harness whose result depends on the platform
 (the loader, the linker, signing, the daemon's sockets) runs on all three; one that checks
-generated code or the build model against rustc runs on Linux x86-64 alone in the fast tier and
-everywhere in the full tier. `ci.py` packs them into parts of about 240 seconds (`PART_SECS`,
+generated code or the build model runs on Linux x86-64 alone in the fast tier and everywhere in
+the full tier. `ci.py` packs them into parts of about 240 seconds (`PART_SECS`,
 longest first), so adding a harness adds a part rather than lengthening one; a fast harness
 with no `FAST` line is an error, and so is a `FAST` or `CORE` line that names no harness. Each
 harness runs with an `BLAZE_HOME` of its own under `/tmp/rj-ci-*` (not `BLAZE_CACHE`, which would turn the store on), and its daemon is stopped
@@ -130,56 +123,31 @@ with reasons. The daemon's log says `backend: llvm -O2 fast emit` when LLVM is i
 
 | Script | What it checks |
 |---|---|
-| `difftest.py <workspace> --bin <pkg> --crate <name>` | The base comparison. Builds the binary with cargo, compiles the named crates with blaze, links blaze's object ahead of rustc's rlibs, runs both. `--layouts` also compares the size and alignment of every type blaze laid out with rustc's `-Zprint-type-sizes`. `--bisect` links each blaze function in on its own to name the ones that change behaviour. `--mixed N` runs N builds with a random half of the functions left to rustc. `--memcheck` runs under valgrind |
-| `harness/corpus/` | The workspace `difftest.py corpus` runs: a library with one module per area of the code generator and a runner that calls every function and prints the result |
-| `wasm32.py [check...]` | The train's wasm32 job: harnesses run with `BLAZE_TARGET=wasm32-wasip1` (the corpus, `stress.py`) under wasmtime, each in a process of its own. `BLAZE_TARGET` takes any harness that builds a program there; see [reports/WASM32.md](reports/WASM32.md). Run in `nix develop .#wasm` |
-| `breakers.py` | Every reduction under `harness/breakers/`, each run on its own so a crash in one does not hide the others. These are minimal cases of bugs found in real crates, rustc's tests and the fuzzer |
+| `wasm32.py [check...]` | The train's wasm32 job: harnesses run with `BLAZE_TARGET=wasm32-wasip1` (`stress.py`) under wasmtime, and `allblaze_wasm.py`, each in a process of its own. `BLAZE_TARGET` takes any harness that builds a program there; see [reports/WASM32.md](reports/WASM32.md). Run in `nix develop .#wasm` |
 | `unwinds.py` | Edits to functions a panic unwinds through |
-| `wasmsections.py [target ...]` | That the custom sections of the wasm object blaze writes for `harness/wasmsections` are those of rustc's object of it, for wasm32-unknown-unknown and wasm32-wasip1: a `#[link_section]` static is a custom section of that name on wasm (what wasm-bindgen reads), those of one name joined in order; and `target_features`, which wasm-bindgen reads to turn on externref |
 | `growth.py` | That the code of one function grows in a straight line with its source: the `serialize` `#[derive(Serialize)]` gives an internally tagged enum, a `?` in every arm, at 160 and 320 arms (issue #5); and a `load` filling a struct of 200 and 400 fields, each a call's `?` while a value with a destructor is live, as x11-dl opens Xlib's 781 functions (the way out of each `?` once dropped every field before it on its own: 2,986,013 blocks, and 364 GB for bevy) |
 | `asmedits.py` | Edits to `asm!` blocks and the code around them; with `BLAZE_ASSEMBLER=cc`, assembled by the C compiler, as a build without LLVM does |
-| `wasmabi.py [target ...]` | That the wasm type of every `extern "C"` function blaze defines or imports in `harness/wasmabi` is that of rustc's object of it, for wasm32-unknown-unknown and wasm32-wasip1: an aggregate of one scalar (wasm-bindgen's `WasmRet<u32>`) goes as that scalar, a union or anything else in memory |
-| `answers.py` | That blaze's own answers to rustc's questions (`-vV`, `--print cfg`, cargo's probe of file names, `target-spec-json`) are rustc's, byte for byte, on every target blaze has them of; `'{"write": true}'` regenerates them from the pinned rustc ([no-rustc.md](no-rustc.md), step B) |
-| `scripts.py [name ...]` | Build scripts run by `crates/blaze-build-script` against the pinned nightly's cargo's runs of them, over the applications of `apps/apps.json` and `harness/scripts/` (openssl-sys, zstd-sys, libz-sys, libgit2-sys, ring, rustix and the scripts that read their metadata): for each run, the environment blaze computes against the one cargo gave, blaze's reading of cargo's output against cargo's own, and a run by blaze against cargo's. `--json` writes every difference ([no-rustc.md](no-rustc.md), step I) |
+| `answers.py --write` | Not a check: writes what the pinned rustc answers to the questions blaze answers in its place (`-vV`, `--print cfg`, cargo's probe of file names, `target-spec-json`) into `crates/blaze-units/src/stdlib/rustc.json`, after a toolchain bump, on each CI host ([no-rustc.md](no-rustc.md), step B) |
 | `bscache.py record [project ...]`, `bscache.py report` | What each build script of the projects of `bench.py` reaches in the sandbox: `record` runs `cargo check --compile-time-deps` through `blaze-rustc`, so every script runs under `blaze-engine build-script` in the sandbox, and collects the sandbox's records; `report` classes each line as one a hermetic sandbox allows (the package, OUT_DIR, the toolchain, the C compiler and pkg-config) or would deny (network, writes outside OUT_DIR, other executables, other reads) and writes the list (`bench/results/2026-10-27-bscache/`). Needs the network |
 | `toolchain_pins.py` | That the sha256 and size of each file of blaze's own Rust (`cargo/toolchain/pins.txt`) are what the release's manifest at static.rust-lang.org says, for every host blaze ships for; `'{"write": true}'` regenerates them when blaze moves to another release ([cargo.md](cargo.md)). Needs the network |
 | `nightly_features.py '{"dry_run": true}'` | Not a check: keeps the GitHub issue tree of the pinned nightly's unstable features (#967), so every `#![feature(..)]` blaze has to accept is tracked. Each language feature of rustc_feature's `unstable.rs` at library/UPSTREAM's commit is an issue labelled `nightly-feature` under a group of at most 100 sub-issues; the library features (the `#[unstable]` and `#[rustc_const_unstable]` attributes of the sysroot crates in library/) are one issue, #969, for what blaze has to do for all of them (`'{"library": true}'` makes one each). A rerun creates only what is missing (by a hidden marker in each body), links what is not under its group, and comments on and closes the issue of a feature stabilized or removed since. `'{}'` makes the changes, paced under GitHub's limits. Needs `gh` |
 | `norustc.py` | How often rustc and rustdoc run when `harness/norustc/fixture` is built, edited, tested, doctested and checked with `blaze`, through a copy of the toolchain that logs every run; a count above `norustc/baseline.json` fails ([no-rustc.md](no-rustc.md), step A). `--record` lowers the baseline |
-| `fuzz/fuzz.py` | Generated programs, see below |
-| `uitest.py <rust checkout>` | rustc's own `tests/ui` run-pass tests. Every file is either run or left out with a counted reason |
 | `libsuite.py <rust checkout> coretests\|alloctests\|stdtests` | The standard library's test suites, cut down to what builds on stable |
 | `cratetest.py <crate-dir>` | A crate's own integration tests: each test binary is relinked with blaze's objects and every test must report the same result |
 | `cratesweep.sh`, `vendor.sh`, `sweepreport.py` | `cratetest.py` over a list of crates.io releases, and a summary |
-| `bintest.py <name>` | A real program from `breakers/bins.json`: the same command lines given to cargo's binary and blaze's |
-| `alone.py` | A program whose workspace crates rustc compiles nothing of, so no refused function can hide behind rustc's copy |
 | `allblaze.py [whole] [unit] [stored]` | Programs with nothing rustc built in them, the standard library compiled by blaze ([no-rustc.md](no-rustc.md), steps F and G): a hello, one of collections, panics, threads and channels, one of 128-bit atomics raced by threads, and one of the paths of `split_paths_ref` and the XDG directories, each built with the library in the same build, over the library built alone (`--prebuilt`), and on a store and a remote that start empty, where the first build compiles and keeps the library and the later ones, one on a second store, take it. Each has to print and exit as cargo's build does. Linux |
-| `macroserver.py` | The release's proc-macro server (`blaze-proc-macro-srv` of `crates/proc-macro-srv-cli`) built by blaze, and the libraries blaze links of serde_derive, thiserror-impl, tokio-macros and clap_derive ([no-rustc.md](no-rustc.md), step J1): every call of a package's derives (with helper attributes), attributes and function-like macros is expanded by the toolchain's server with rustc's library and by blaze's with blaze's, and the outputs have to be equal, spans included; the package is then built whole with its proc macros by rustc and by blaze. `macroserver.py <app>` (or `all`) builds a bench app (fd, bat, hyperfine, just, nushell, helix) whole with `BLAZE_PROC_MACRO_SERVER`, so blaze links every proc macro, again into an empty target directory over that build's store (no library may be linked again), and again without, expanding every call by both servers; the counts, the calls not compared and why each proc macro was rustc's are printed, and both programs have to print the same. Needs crates.io. Linux |
 | `frozenwarm.py` | Frozen def maps (#40, #161) of a dependency whose items, and a `macro_rules!` it exports, are in files `include!` reads and the VFS does not load at first, as the icu `*_data` crates': built on one store cold, warm twice, warm with `BLAZE_FROZEN=check` and `=verify`, and warm after an included file changed at the same path, which has its def map refused. Each has to print what cargo's build does. Linux |
 | `freshwarm.py PROJECT` | What a build costs on a fresh machine whose only warm thing is the remote (#41): a seed builds on an empty store and `blaze-engine cache push`es it; then for each edit (`--edits none,body,signature`, `none2` for a second unchanged one) the checkout is copied again to the same path, the home emptied, `blaze-engine cache pull` run and the build timed. Prints pull and build seconds, the time to ready, peak memory, what was compiled and found, the steps and threads' time and the `manifest:` lines; an unchanged build's program has to print what the seed's does. `--env` sets a variable on every step and `--fresh-env` on the fresh ones only (a build configured otherwise). `PROJECT` is one of `bench.py`'s or `blaze` (`--source` the checkout). Not in CI |
 | `wholeprogram.py` | Programs blaze builds whole, with its own `main` (as `runbench.py` builds them): one on the default allocator, one with a `#[global_allocator]` of its own, one with a library's, one whose allocator is under a `#[cfg]` that is false. Each has to print and exit as cargo's build does, and a second build of it by blaze has to give the same object byte for byte ([#200](https://github.com/indexable-inc/blaze/issues/200)); `--release` builds both in the release profile |
-| `bun_repros.py` | Nightly fixtures, one per thing bun's whole-program build found blaze doing wrong (`harness/bun-repros/`: `adt_const_params`, `core::mem::type_info`, macros, exported statics, frame pointers, …). Each compares output with cargo's binary and checks the report's refusals against the case's. A case can set its own `rustflags` and `env` (the frame-pointer case runs LLVM), and `alone` builds it as runbench builds bun, the link taking only blaze's objects. It builds with the pinned nightly of `harness/toolchain`, as everything else does. |
 | `backends.py` | One program compiled by each code producer: counts, time per function, and what LLVM left to Cranelift |
-| `lints_ui.py <rust checkout>` | The lints rust-analyzer finds at the level a source denies them, against rustc's UI tests that `deny` or `forbid` one: for each lint, the errors (lint and line) blaze reports that rustc does too (right), that rustc does not (wrong) and that only rustc reports (missed). A lint blaze fails builds with (`DENIED` in main.rs) has none wrong; one in a macro's expansion is not counted, as it fails no build. It scores against the pinned nightly's rustc; `--toolchain nightly-YYYY-MM-DD` against another. `lints_ui.py harness/lints_probes` scores the units written for the lints with few UI tests, one for each place a lint applies. `--deny LINT` scores one lint on every UI test, each read with `#![deny(LINT)]` first, for a lint few tests deny (`unused_mut`) |
-| `borrowck_ui.py <rust checkout>` | The borrow checker ([borrowck.md](borrowck.md)) against rustc's borrow-check UI tests: each unit passes when blaze reports the errors (code and line) the pinned nightly rustc reports, under Polonius and NLL. `--min-pass N` fails below N Polonius passes; a panic, or an error on a unit rustc accepts, fails it too |
-| `consteval_ui.py CONFIG` | The const evaluator against rustc's `tests/ui/consts` and `tests/ui/const-generics` at the pinned nightly's commit. Each revision of a test is a unit: blaze evaluates its free constants and statics and the constants of its inherent impls (`blaze-engine consteval`), and the unit passes when the ones that fail are the ones rustc's `error[E0080]`s name (none, for a pass test). The run-pass tests also go through `uitest.py`. Units rustc's verdict cannot be compared with (an auxiliary crate, a `-Z` flag, another error, a generic or anonymous constant) are counted out of scope with a reason. Writes `summary.md`, with every difference by kind, and `units.json` to `out`. `min_evaluation` and `min_run_pass` are the floors the train holds; a panic fails it too. Results: `bench/results/*-consteval/` |
-| `check_apps.py [name ...]` | `blaze check` against `cargo check` on the applications of `apps/apps.json` (cloned and prepared as `borrowck_apps.py` does) and the corpus: both run `check --workspace --all-targets --message-format=json`, into target directories and daemon homes of their own, and the errors and warnings of the workspace's files are compared by file, line and code or lint. An error only blaze reports (invented: it fails a build rustc accepts) or only rustc does (missed) fails it; missed warnings are counted, as the checker writes errors only. Needs `blaze-proc-macro-srv` beside blaze (`.github/scripts/build_release.py --server-beside`); a cargo job compiles a build script with blaze in 1 to 2.5 GB, so a 16 GB VM takes `CARGO_BUILD_JOBS=4` |
-| `scoreboard.py` | Runs the targets in `targets.json` and fails when behaviour differs or coverage drops below the committed `scoreboard.json` |
-| `mirparity.py <workspace> --crate <name> [--level N] [--rustc-level 1\|2]` | blaze's MIR (`blaze-engine mir`, at `BLAZE_MIR_OPT` level N) against rustc's `-Zunpretty=mir`, function by function: the share that match in shape, statement counts, statements and types, and the most frequent differences. Not a gate: the numbers are in [research/mir-gap.md](research/mir-gap.md) |
 
 ### Reading the workspace as cargo does
-
-| Script | What it checks |
-|---|---|
-| `resolve.py [bench\|crates\|workspaces]` | `crates/blaze-manifest` against the pinned nightly's cargo (or `CARGO_ORACLE`) on `cargo metadata --no-deps --format-version 1`: the projects of `bench.py`, 300 crates.io crates and 72 workspace repositories at pinned commits (`resolve/corpus.json`), the JSON compared as text after the root and `CARGO_HOME` are replaced, key order included, and the error text when both refuse a workspace. Prints the first difference of each workspace and the counts per part; [resolve.md](resolve.md) has them. `resolve.py DIR...` compares the workspaces at DIR... only. Needs the network |
-| `resolve.py config` | The configuration as the pinned nightly's cargo merges it: `cargo -Zunstable-options config get` against blaze-manifest's `config` example, seven ways each, on the trees of `crates/blaze-manifest/tests/config-fixtures` and the root of every bench project and workspace repository; exit code, stdout and stderr compared as text |
-| `resolve.py profiles` | Profiles as the pinned nightly's cargo gives them to units: the `profile` of every unit of `cargo <command> --unit-graph -Zunstable-options` (`RUSTC_BOOTSTRAP=1`) against blaze-manifest's `profiles` example given the same graph, for `build`, `build --release`, `test`, `bench`, `check` and a `--target` that is not the host, on the trees of `crates/blaze-manifest/tests/profile-fixtures` and every bench project and workspace repository; the warnings about profiles and cargo's error when it refuses them compared too |
 
 The workspaces of `crates/blaze-manifest/tests/fixtures` (inheritance, members and targets
 discovered, a package outside its workspace's members, config and manifest errors), the
 config trees of `tests/config-fixtures` and the profile trees of `tests/profile-fixtures` (with
-the unit graphs cargo printed) have cargo's output committed next to them, so
-`cargo test -p blaze-manifest` checks them without cargo or the network; `resolve.py --fixtures`
-writes them again.
+the unit graphs cargo printed) have their expected output committed next to them, so
+`blaze test -p blaze-manifest` checks them without cargo or the network.
 
 ### The daemon following edits
 
@@ -210,7 +178,6 @@ writes them again.
 | `sandboxbench.py` | What the sandbox of a test costs: a trivial program bare and in `blaze sandbox` (with and without a record), and a generated 600-test library, opted into sandboxed tests, under `blaze test` with `BLAZE_SANDBOX=off`, sandboxed under `all` and `affected`, and as a process per test, bare and sandboxed; medians of alternated rounds, pinned to `--cpus`. Linux and macOS |
 | `doctestonce.py` | `blaze test --doc` on a workspace of three libraries against `cargo test --doc`: the workspace is loaded once for all of them, each library's results, `Doc-tests` line and cargo's lines of what failed are cargo's (every example passing, two failing with and without `--no-fail-fast`, one failing with it), and each example reads the directory, variables and dev-dependencies it has under rustdoc. Linux and macOS |
 | `movedlines.py` | A panic reports its new line after lines are added above its function (seven ways to panic, each against cargo), and moving a function compiles nothing |
-| `buildmodel.py` | One small cargo project per feature of cargo's build model, under both backends, with steps that change one input at a time |
 | `blaze_cli.py` | `blaze` against plain cargo on seven real projects, 22 flag combinations, and 11 daemon lifecycle checks. Needs the network and about 20 minutes; not in CI |
 | `debuginfo.py` | Backtraces, `llvm-dwarfdump --verify`, gdb stopping and stepping, locals |
 | `live_e2e.py` | Edits of a running program that links `blaze-live`, each applied as a patch; then another program built meanwhile, a start again from the executable, and a panic that unwinds through the patched code. Linux x86-64 and macOS AArch64 |
@@ -355,40 +322,18 @@ result's shape).
 
 ## The fuzzer
 
-`fuzz/fuzz.py` builds generated programs with cargo and with blaze under each backend and
-compares what they print. `fuzz/fuzz.py smoke` is part of the gate. How to run longer
-runs, what a finding is and what the fuzzer does not cover are in
-[fuzzing.md](fuzzing.md).
+`fuzz/edits.py` and `fuzz/store.py` generate programs (`fuzz/gen.py`) and edits of them, and
+hold what a warm daemon and a warm store build to what blaze builds of the same source from
+nothing. `fuzz/edits.py smoke` is part of the gate. How to run longer runs, what a finding is
+and what the fuzzers do not cover are in [fuzzing.md](fuzzing.md).
 
-## Adding a corpus case
+## Adding a test
 
-The corpus is for things the code generator must handle that are small enough to state as
-a function. Add a `pub fn` to the module for its area in
-`harness/corpus/cases/src/lib.rs`, or a new `pub mod`. Call it from
-`harness/corpus/runner/src/main.rs` inside `case!(...)`, which prints the expression and its
-value. The result has to be deterministic and `Debug`. Then run
-
-    python3 difftest.py corpus --bin runner --crate cases --layouts
-
-It must print `MATCH`, and the count of functions from blaze must go up by what you added,
-with none left to rustc.
-
-## Adding a breaker
-
-A breaker is the reduction of a bug found somewhere else. Add a file
-`harness/breakers/cases/src/<name>.rs` with a `//!` comment at the top that says where the
-bug was found and what the cause is, and a `pub fn run()` returning something `Debug`. Add
-`<name>` to the `cases![...]` list in `harness/breakers/cases/src/lib.rs`. Then
-
-    python3 breakers.py <name>
-
-A breaker should fail before the fix and pass after. If you are recording a difference you
-are not fixing, add the name to `OPEN` in `breakers.py`, or to `LEFT` if blaze refuses the
-function and says so. Both lists are the project's list of known wrong or missing
-behaviour, so keep the comment in the case honest about why it is open.
-
-A bug that only shows in a crate's own tests goes in `CRATES` in `breakers.py` as a small
-crate under `harness/breakers/`.
+A bug found in a real crate is proven fixed by that crate's own tests passing under blaze
+(`cratetest.py <crate-dir>`), or, where it is small enough to state, by a unit test beside the
+code that was wrong. A test states its expected result itself; none is "what rustc does". A
+bug of the daemon, the store or the splice goes in the harness of that area as a step whose
+warm build has to give what blaze's build from nothing gives.
 
 ## Reproducing a failure
 
@@ -399,20 +344,18 @@ and of the scratch copy of the source it was editing, for example
 
 and the stepwise ones take `--only TEXT`, `--from N` and `--keep` (see each docstring).
 
-For a difference in generated code:
+For wrong generated code:
 
-1. Run `difftest.py` on the workspace with `--bisect`. It names the functions whose blaze
-   version changes the output, with the first differing line.
-2. `blaze --report FILE.tsv` writes the outcome of every function (compiled, skipped and
+1. `blaze --report FILE.tsv` writes the outcome of every function (compiled, skipped and
    why). `--deny FILE` leaves the functions listed in a file to rustc, and `--isolate DIR`
    writes one object per function.
-3. `BLAZE_DUMP_MIR=<function name>` prints the MIR of functions with exactly that name
+2. `BLAZE_DUMP_MIR=<function name>` prints the MIR of functions with exactly that name
    (`{closure}` for closures). `BLAZE_DUMP_LLVM=1` prints the LLVM module of every function
    compiled, and `BLAZE_DUMP_CLIF=1` the Cranelift IR of drop glue.
-4. Reduce it to a function, add it as a breaker, and fix it there.
+3. Reduce it to a test ([Adding a test](#adding-a-test)), and fix it there.
 
-For a fuzzer finding, `fuzz.py repro SEED-ROUND` rebuilds the program and
-`fuzz.py check found/FILE.rs` runs a stored reduction.
+For a fuzzer finding, `fuzz/edits.py run` with the round's seed and `first` builds it again, and
+`fuzz/edits.py check` runs the stored sequences of `found/edits/`.
 
 For a CI failure, the last line of the harness step lists which scripts failed.
 
@@ -432,13 +375,13 @@ for each platform, each on a machine of its own kind.
 
 The build and the unit tests run only for a change that touches a file they read; any other
 change runs the two scripts alone. `.github/scripts/gate_changes.py` (the `changes` job) names
-those files, and why each: the crates (`crates/`, with their test data, the LLVM pin
-`crates/hir-ty-codegen/llvm.json` and the toolchain's `pins.txt`), the vendored crates
+those files, and why each: the crates (`crates/`, with their test data and the LLVM pin
+`crates/hir-ty-codegen/llvm.json`), the vendored crates
 (`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`, the
 pinned nightly (`harness/toolchain`), `harness/unittests.py`, `.github/scripts/llvm.py`
 (which fetches the pinned LLVM), the release of blaze that builds blaze (`.github/blaze-version`,
 `install.sh`), `blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`,
-`blaze`, `blaze-remote`, `rust-tests`); on a push to main, the smoke corpus too (`harness/smoke.py`,
+`blaze`, `blaze-remote`); on a push to main, the smoke corpus too (`harness/smoke.py`,
 `harness/smoke/`), which the `warm` tier runs. It names what is code rather than what is not,
 so a new directory of documents, benches or harnesses runs no build; a list of files that
 cannot be had (a run by hand, a comparison of 300 files or more, GitHub refusing) counts as
@@ -539,15 +482,9 @@ with the `llvm` feature, hands the binary to its other jobs, and runs:
 - every part of `ci.py parts` under each backend, a job each: `core-1` ... `core-N` (the
   harnesses of `core`, packed by the seconds `CORE` in ci.py says each takes, so that no part
   is longer than its longest harness, `wholeprogram.py` at 19 minutes on macOS), `keys-1..3`,
-  `buildmodel`, `store-kills`, `store` and `daemon`;
-- rustc's borrow-check tests with a floor under the passes (Linux x86-64), and the run-pass
-  tests of `harness/ui-pinned.txt` (Linux x86-64 and macOS), from rustc's `tests/ui` at the
-  pinned commit in the Actions cache (`.github/actions/rust-tests`, written by main's `warm`
-  runs; a miss fetches it from GitHub with retries, since the plain fetch was refused with HTTP
-  429 in 26 jobs in two days);
-- the Bun fixtures (Linux x86-64);
-- `harness/wasm32.py` (Linux x86-64, in the flake's `wasm` shell): the corpus and `stress.py`
-  built for `wasm32-wasip1` and run under wasmtime against cargo's build;
+  `store-kills`, `store` and `daemon`;
+- `harness/wasm32.py` (Linux x86-64, in the flake's `wasm` shell): `stress.py` built for
+  `wasm32-wasip1` and run under wasmtime, and `allblaze_wasm.py`;
 - `blaze_cli.py`: its checks, ripgrep and hyperfine, and fd (Linux x86-64 and macOS), and
   ripgrep, fd, bat, hyperfine, just, axum and nushell with each project's tests (Linux AArch64;
   axum and nushell not blocking, [#26](https://github.com/indexable-inc/blaze/issues/26) and
@@ -613,10 +550,7 @@ What is known to be wrong is written down, says why, and does not fail the run. 
 out right, it fails the run until it is taken off the list:
 
 - `OPEN` in `unittests.py`: Rust unit tests that fail;
-- `OPEN` and `LEFT` in `breakers.py`: breakers that differ from rustc or that blaze refuses;
 - `OPEN` in `debuginfo.py`: checks whose frames or variables are wrong;
-- `"open"` in a `buildmodel/*/case.json`: a case that comes out WRONG, on every host or by
-  host (`{"linux": "why"}`).
 
 ### The other workflows
 
@@ -624,8 +558,7 @@ out right, it fails the run until it is taken off the list:
 commits the tables and the README's numbers to main. It runs a platform only once the
 repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-machines)).
 `bench.yaml` (the store's microbenchmarks, two minutes) runs on pull requests and pushes too.
-`claims.yaml` (all of rustc's `tests/ui`, both backends, six hours, and the scoreboard),
-`fuzz.yaml` (a long differential fuzz run), `bench-bun.yaml` and `live-latency.yaml` keep
+`bench-bun.yaml` and `live-latency.yaml` keep
 schedules of their own: each takes hours or a dedicated machine, and the train would wait on
 them. On a pull request that changes the flake, `nix/` or the dependencies, `nix-live.yaml`
 checks only the unit graphs. The flake's `dist` passes `--nix` to `build_release.py`, which

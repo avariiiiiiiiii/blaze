@@ -97,7 +97,7 @@ pub(super) fn cfgs(profile_rustflags: &[String], features: &[String], rustflags:
 /// cargo's `check_cfg_args`: what follows each `--check-cfg`, the package's features (its
 /// summary's, the implicit ones of optional dependencies too) sorted by name.
 pub(super) fn check_cfg(manifest: &Manifest) -> Vec<String> {
-    check_cfg_of(manifest.features.keys().map(String::as_str))
+    check_cfg_of(manifest.features.keys().map(|it| it.as_str()))
 }
 
 pub(super) fn check_cfg_of<'a>(features: impl ExactSizeIterator<Item = &'a str>) -> Vec<String> {

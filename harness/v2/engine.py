@@ -21,22 +21,19 @@ the codegen inputs of a build, the critical path of a cold build) is a method he
 `Failed` is a step the harness could not do (a command that timed out, a daemon that did not
 come up): an error of the run, never a finding about the compiler.
 
-The cargo reference (`reference_env`) is plain cargo with the pinned nightly
-(`harness/toolchain`), no incremental compilation and no wrapper: what every comparison is
-against.
+`reference_env` is plain cargo with the pinned nightly (`harness/toolchain`), no incremental
+compilation and no wrapper: what a script fetches sources with (`cargo fetch`, `cargo vendor`,
+`cargo metadata`). Nothing blaze builds is compared with what cargo builds.
 """
 
 import concurrent.futures
-import hashlib
 import io
 import json
 import mmap
 import os
 import re
-import stat
 import subprocess
 import sys
-import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -173,19 +170,26 @@ class Mark:
     sizes: dict[str, int] = field(default_factory=dict[str, int])
 
 
+def text(data: bytes) -> str:
+    """What `subprocess.run(text=True, encoding="utf-8", errors="replace")` makes of a pipe's
+    bytes (its `_translate_newlines`), done after the clock stops."""
+    return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def run(step: str, argv: list[str], cwd: Path, env: dict[str, str], timeout: float = 3600, check: bool = False) -> Ran:
     """Runs `argv` to its end. A command that outlives `timeout`, or with `check` exits other
-    than 0, is a `Failed` naming the step."""
-    began = time.monotonic()
+    than 0, is a `Failed` naming the step. `Ran.seconds` is the spawn to the reaped exit: the
+    output is decoded after it, so a budget times the command and not the harness."""
+    began = time.perf_counter()
     try:
-        done = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
+        done = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as e:
         out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         raise Failed(f"{step}: `{' '.join(argv)}` in {cwd} took more than {timeout:.0f} s:\n{out[-3000:]}") from None
     except OSError as e:
         raise Failed(f"{step}: `{' '.join(argv)}` in {cwd} did not start: {e}") from None
-    ran = Ran(tuple(argv), time.monotonic() - began, done.returncode, done.stdout, done.stderr)
+    took = time.perf_counter() - began
+    ran = Ran(tuple(argv), took, done.returncode, text(done.stdout), text(done.stderr))
     if check and ran.returncode != 0:
         raise Failed(f"{step}: `{' '.join(argv)}` in {cwd} exited {ran.returncode}:\n{ran.said()}")
     return ran
@@ -201,7 +205,7 @@ def scrubbed() -> dict[str, str]:
 
 
 def reference_env(target: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Plain cargo with the pinned nightly into `target`: the reference of every comparison."""
+    """Plain cargo with the pinned nightly into `target`, to fetch and read sources with."""
     env = scrubbed()
     env.update(CARGO_TARGET_DIR=str(target), CARGO_INCREMENTAL="0", **(extra or {}))
     return env
@@ -341,82 +345,49 @@ def first_difference(a: Path, b: Path) -> str:
             at += nx
 
 
-def tree_digest(root: Path, skip: Sequence[str] = ()) -> str:
+def proof_beside(blaze: str) -> Path:
+    """The `blaze-v2-proof` binary built beside the blaze at `blaze`."""
+    return Path(blaze).parent / f"blaze-v2-proof{EXE}"
+
+
+def tree_digest(root: Path, skip: Sequence[str], proof: Path) -> str:
     """The BLAKE3 hash of a source tree: every file's path under `root`, whether it is
     executable and its digest, and every symbolic link's target, in path order; the directories
-    named in `skip` at the top are left out (build outputs)."""
-    files: list[tuple[str, Path, int, bool]] = []
-    links: list[tuple[str, str]] = []
-    for here, dirs, names in os.walk(root):
-        base = Path(here)
-        if base == root:
-            dirs[:] = [d for d in dirs if d not in skip]
-        for name in [*dirs, *names]:
-            path = base / name
-            info = path.lstat()
-            rel = path.relative_to(root).as_posix()
-            if stat.S_ISLNK(info.st_mode):
-                links.append((rel, os.readlink(path)))
-            elif stat.S_ISREG(info.st_mode):
-                files.append((rel, path, info.st_size, bool(info.st_mode & 0o111)))
-    files.sort()
-    links.sort()
-    h = blake3.blake3(b"blaze v2 proof tree 2\0")
-    for (rel, _, _, executable), sha in zip(files, digests([(path, size) for _, path, size, _ in files])):
-        h.update(f"f\0{rel}\0{int(executable)}\0{sha}\n".encode())
-    for rel, to in links:
-        h.update(f"l\0{rel}\0{to}\n".encode())
-    return h.hexdigest()
+    named in `skip` at the top are left out (build outputs). `blaze-v2-proof` at `proof` walks
+    the directories and hashes the files on every core (`blaze_v2_proof::tree`)."""
+    if not proof.is_file():
+        raise Failed(f"tree digest of {root}: no `blaze-v2-proof` at {proof}")
+    given = json.dumps({"tree": str(root), "skip": list(skip)})
+    ran = run(f"tree digest of {root}", [str(proof), given], root, scrubbed(), 600)
+    if ran.returncode != 0:
+        raise Failed(f"tree digest of {root}: `blaze-v2-proof` exited {ran.returncode}:\n{ran.said()}")
+    return cast(str, json.loads(ran.stdout)["digest"])
 
 
-class Kept:
-    """Reference results (rustc's, cargo's) kept on disk across runs under `root/<kind>`, each
-    a JSON file named by the sha256 of everything it depends on, which the caller gives
-    whole: a rerun does again only what changed. `root` empty keeps nothing. An entry is
-    written to a file of its own and renamed into place, so a reader never sees half of one."""
-
-    def __init__(self, root: str, kind: str):
-        self.dir = Path(root).expanduser() / kind if root else None
-        self.domain = f"blaze v2 proof {kind} 2"
-
-    def key(self, *parts: str) -> str:
-        # Each part by its length then its bytes: a part may hold any byte, NUL too.
-        h = hashlib.sha256(self.domain.encode())
-        for part in parts:
-            data = part.encode()
-            h.update(len(data).to_bytes(8, "little"))
-            h.update(data)
-        return h.hexdigest()
-
-    def path(self, key: str) -> Path | None:
-        return None if self.dir is None else self.dir / key[:2] / f"{key}.json"
-
-    def get(self, key: str) -> object | None:
-        path = self.path(key)
-        if path is None:
-            return None
-        try:
-            text = path.read_text()
-        except FileNotFoundError:
-            return None
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as e:
-            raise Failed(f"the kept result {path} is not JSON ({e}); delete it") from None
-
-    def put(self, key: str, value: object) -> None:
-        path = self.path(key)
-        if path is None:
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        part = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.part")
-        part.write_text(json.dumps(value, sort_keys=True))
-        part.replace(path)
+def first_difference_by(proof: Path, a: Path, b: Path) -> str:
+    """`first_difference`'s answer, worded as it words it, found by `blaze-v2-proof` at `proof`:
+    both files mapped and compared in place by SIMD, across cores from 64 MiB
+    (`blaze_v2_proof::bytes`), then the two bytes at that offset read."""
+    if not proof.is_file():
+        raise Failed(f"where {a} and {b} first differ: no `blaze-v2-proof` at {proof}")
+    given = json.dumps({"first": str(a), "second": str(b)})
+    ran = run(f"where {a} and {b} first differ", [str(proof), given], a.parent, scrubbed(), 600)
+    if ran.returncode not in (0, 1):
+        raise Failed(f"where {a} and {b} first differ: `blaze-v2-proof` exited {ran.returncode}:\n{ran.said()}")
+    at = json.loads(ran.stdout)["differs_at"]
+    if at is None:
+        return "the same"
+    with open(a, "rb", buffering=0) as fa, open(b, "rb", buffering=0) as fb:
+        fa.seek(at)
+        fb.seek(at)
+        x, y = fa.read(1), fb.read(1)
+    if x and y:
+        return f"byte {at:#x}: {x[0]:#04x} against {y[0]:#04x}"
+    return f"one ends at byte {at:#x}"
 
 
 def toolchain_identity(env: dict[str, str]) -> str:
-    """What the pinned toolchain says it is (`rustc -vV`, `cargo -vV`): part of the key of every
-    reference result kept."""
+    """What the pinned toolchain says it is (`rustc -vV`, `cargo -vV`), for a result to name."""
     said = [run(f"`{tool} -vV`", [tool, "-vV"], ROOT, env, 300, check=True).stdout for tool in ("rustc", "cargo")]
     return "\n".join(said)
 

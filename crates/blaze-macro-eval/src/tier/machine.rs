@@ -286,32 +286,6 @@ impl<'i> Running<'i> {
             Err(_) => Some(Escape::Stop(Stop(format!("stopped: blaze's shim of binding {id} panicked")))),
         }
     }
-}
-
-/// The function every stub calls: `dispatch(id, slots, fp)`, in the host's C convention.
-/// What the loader resolves the glue's dispatcher name to.
-pub(crate) fn dispatch_address() -> u64 {
-    dispatch as extern "C" fn(u64, u64, u64) as usize as u64
-}
-
-extern "C" fn dispatch(id: u64, slots: u64, fp: u64) {
-    let running = RUNNING.with(Cell::get);
-    // SAFETY: a stub runs only inside `Running::enter` on this thread, which set `RUNNING`
-    // to its run, borrowed for the entry.
-    let Some(running) = (unsafe { running.as_ref() }) else {
-        eprintln!("blaze: a compiled macro's stub ran outside an entry");
-        std::process::abort();
-    };
-    let Ok(id) = u32::try_from(id) else {
-        eprintln!("blaze: a compiled macro's stub passed binding {id}");
-        std::process::abort();
-    };
-    let Some((landing, payload)) = running.dispatched(id, slots, fp) else { return };
-    // SAFETY: what this frame and `dispatched`'s held is moved out or dropped by now (the
-    // escape is recorded in `running`), so abandoning them drops nothing; the landing comes
-    // from the walk up this thread's stack from the stub's frame, above this one.
-    unsafe { running.land(landing, payload) }
-}
 
     /// The landing of an escape that starts at the return address `ret` in the function
     /// whose frame pointer is `fp`.
@@ -378,6 +352,31 @@ extern "C" fn dispatch(id: u64, slots: u64, fp: u64) {
         self.fault.set(Some(Fault { signal, pc: regs.pc, trap }));
         Some(landing)
     }
+}
+
+/// The function every stub calls: `dispatch(id, slots, fp)`, in the host's C convention.
+/// What the loader resolves the glue's dispatcher name to.
+pub(crate) fn dispatch_address() -> u64 {
+    dispatch as extern "C" fn(u64, u64, u64) as usize as u64
+}
+
+extern "C" fn dispatch(id: u64, slots: u64, fp: u64) {
+    let running = RUNNING.with(Cell::get);
+    // SAFETY: a stub runs only inside `Running::enter` on this thread, which set `RUNNING`
+    // to its run, borrowed for the entry.
+    let Some(running) = (unsafe { running.as_ref() }) else {
+        eprintln!("blaze: a compiled macro's stub ran outside an entry");
+        std::process::abort();
+    };
+    let Ok(id) = u32::try_from(id) else {
+        eprintln!("blaze: a compiled macro's stub passed binding {id}");
+        std::process::abort();
+    };
+    let Some((landing, payload)) = running.dispatched(id, slots, fp) else { return };
+    // SAFETY: what this frame and `dispatched`'s held is moved out or dropped by now (the
+    // escape is recorded in `running`), so abandoning them drops nothing; the landing comes
+    // from the walk up this thread's stack from the stub's frame, above this one.
+    unsafe { running.land(landing, payload) }
 }
 
 /// The registers of an interrupted context the handler reads.

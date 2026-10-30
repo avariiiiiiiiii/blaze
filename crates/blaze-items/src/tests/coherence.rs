@@ -18,7 +18,10 @@ use hir_ty::{
     },
     tait_hidden_types,
 };
-use rustc_type_ir::{UintTy, inherent::IntoKind as _};
+use rustc_type_ir::{
+    UintTy,
+    inherent::{GenericArgs as _, IntoKind as _},
+};
 use hir_expand::fixture;
 
 use super::db::TestDB;

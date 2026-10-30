@@ -23,7 +23,10 @@ use blaze_core::{
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, DbError, Query, QueryKey, QueryKind};
 use blaze_units::{
-    query::{BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LockWrite, Origin, PackagePlan, Planned, TestSandbox, UnitPlan, Units},
+    query::{
+        BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LoadError, LockWrite, Origin, PackagePlan, Planned, TestSandbox,
+        UnitPlan, Units,
+    },
     schema::{Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
 };
 use blaze_vfs::{Change, Op, ViewId};
@@ -124,8 +127,9 @@ fn needed() -> Vec<Fetch> {
     ]
 }
 
-/// The load: the sources it lacks, else the units of the checkout's `app` on `dep`, with the
-/// checkout's manifest as a warning so a test sees what it read.
+/// The load: cargo's error for a manifest that starts with `fail`, else the sources it lacks,
+/// else the units of the checkout's `app` on `dep`, with the checkout's manifest as a warning
+/// so a test sees what it read.
 struct FakePlan;
 
 impl Query for FakePlan {
@@ -144,6 +148,10 @@ impl Query for FakePlan {
         let config = BuildConfig::decode(cx.config()?).expect("a view of the daemon has a build config");
         SAW.with(|it| it.borrow_mut().push(config.clone()));
         let manifest = cx.file("Cargo.toml")?.map(|it| String::from_utf8_lossy(it.bytes).into_owned()).unwrap_or_default();
+        if manifest.starts_with("fail") {
+            let at = Some(format!("{}/Cargo.toml", config.invocation.root));
+            return Ok(Cbor(Planned::Failed(LoadError { what: "error: the fake load refuses this manifest".into(), at })));
+        }
         let missing: Vec<Fetch> =
             needed().into_iter().filter(|fetch| !config.mounts.iter().any(|it| it.at == fetch.at)).collect();
         if !missing.is_empty() {
@@ -683,6 +691,20 @@ impl Client {
         id
     }
 
+    /// Sends `requests` in one write, so the daemon reads them in one turn, each taken before
+    /// anything of the ones before it runs; their ids, in order.
+    fn send_together(&mut self, daemon: &mut SimDaemon, requests: Vec<Request>) -> Vec<u64> {
+        let (mut bytes, mut ids) = (Vec::new(), Vec::new());
+        for body in requests {
+            let id = self.next;
+            self.next += 1;
+            bytes.extend(frames::encode(&Envelope { schema: SCHEMA, id, body }).unwrap());
+            ids.push(id);
+        }
+        daemon.driver().peer_send(self.conn, &bytes);
+        ids
+    }
+
     fn take(&mut self, daemon: &mut SimDaemon) {
         self.frames.push(&daemon.driver().peer_received(self.conn));
         while let Some(item) = self.frames.next().unwrap() {
@@ -1018,6 +1040,55 @@ fn tests_under_the_evaluator_are_each_evaluated_and_one_failing_fails_the_job() 
     let got = client.wait(&mut daemon, id);
     assert_eq!(results(&got), vec![("b::reads".to_owned(), TestOutcome::Passed)], "{got:#?}");
     assert_eq!(got.last(), Some(&Response::Done { ok: true }));
+}
+
+#[test]
+fn a_build_whose_load_fails_before_its_units_ends_not_ok_and_the_daemon_answers_the_next() {
+    let mut sim = Sim::new(42, Faults::default());
+    checkout(&mut sim, "fail\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 42);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let refused = got.iter().any(|it| matches!(it, Response::Error(error) if error.what.contains("refuses this manifest")));
+    assert!(refused, "the load's error is the build's: {got:#?}");
+    assert!(!got.iter().any(|it| matches!(it, Response::Built { .. })), "{got:#?}");
+
+    daemon.driver().change(&name("w/Cargo.toml"), b"[package]\n");
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+}
+
+#[test]
+fn a_build_cancelled_while_nothing_of_it_runs_ends_not_ok_and_the_daemon_answers_the_next() {
+    let sim = Sim::new(43, Faults::default());
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 43);
+    let mut client = dial(&mut daemon);
+    let base = daemon.vfs().empty();
+    let ops = vec![Op::Write { path: "Cargo.toml".into(), bytes: b"[package]\n".to_vec(), mode: blaze_vfs::Mode::Regular }];
+    let commit = client.send(&mut daemon, Request::Commit { head: "agents/one".into(), base, ops });
+    assert!(matches!(client.wait(&mut daemon, commit).first(), Some(Response::Committed { .. })));
+
+    // An agent's head waits for no watcher, so all three start in the turn they arrive: the
+    // second build's standard library node joins the first's task, and the cancel finds
+    // nothing of the second's request running.
+    let build = || Request::Build { view: ViewRef::Head("agents/one".into()), targets: agent() };
+    let (first, second) = (client.next, client.next + 1);
+    let ids = client.send_together(&mut daemon, vec![build(), build(), Request::Cancel { id: second }]);
+    let got = client.wait(&mut daemon, second);
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    assert!(!got.iter().any(|it| matches!(it, Response::Built { .. })), "{got:#?}");
+    assert_eq!(client.wait(&mut daemon, ids[2]), vec![Response::Done { ok: true }]);
+    let got = client.wait(&mut daemon, first);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+
+    let id = client.send(&mut daemon, build());
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
 }
 
 #[test]
